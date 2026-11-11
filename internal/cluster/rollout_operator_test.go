@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,4 +210,149 @@ func wireNode(r *upgradewire.Rollout, id string) upgradewire.RolloutNode {
 		}
 	}
 	return upgradewire.RolloutNode{}
+}
+
+// An images rollout (C13): only a Kubernetes-managed leader takes one, and
+// it names no files.
+func TestValidateApplyImagesSource(t *testing.T) {
+	k8s := &Cluster{cfg: config.Config{UpgradeDriver: config.UpgradeDriverOperator}}
+	vm := &Cluster{}
+	req := upgradewire.ApplyRequest{Version: "v9.9.9", Source: upgradewire.SourceImages}
+	if _, err := k8s.validateApply(req); err != nil {
+		t.Fatalf("images on a Kubernetes-managed leader = %v", err)
+	}
+	if _, err := vm.validateApply(req); err == nil || !strings.Contains(err.Error(), "SB_UPGRADE_DRIVER=operator") {
+		t.Fatalf("images on a VM leader = %v", err)
+	}
+	withFiles := req
+	withFiles.Files = map[string]string{"sandboxd": strings.Repeat("a", 64)}
+	if _, err := k8s.validateApply(withFiles); err == nil || !strings.Contains(err.Error(), "takes no files") {
+		t.Fatalf("images with files = %v", err)
+	}
+	if _, err := k8s.validateApply(upgradewire.ApplyRequest{Version: "v9.9.9", Source: upgradewire.SourceRelease}); err == nil || !strings.Contains(err.Error(), "files is empty") {
+		t.Fatalf("release without files = %v", err)
+	}
+}
+
+// In an images rollout every operator-driven node is walked as before; a
+// node that would stage files itself has none and is left to a person.
+func TestRolloutDriverImagesRollout(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.nodes.nodes["s1"].stageErr = operatorDriven()
+	g.nodes.nodes["w1"].stageErr = operatorDriven()
+	g.start(func(r *RolloutRecord) {
+		r.Source, r.Files, r.Hold, r.AllowDowntime = upgradewire.SourceImages, nil, true, true
+	})
+	for i := 0; i < 10 && g.host.rollout().Nodes["w1"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	r := g.host.rollout()
+	if n := r.Nodes["w2"]; n.State != upgradewire.NodeManual || !strings.Contains(n.Error, "not operator-driven") {
+		t.Fatalf("w2 (not operator-driven) = %+v", n)
+	}
+	if r.Nodes["w1"].State != upgradewire.NodeUpgrading || !r.Nodes["w1"].Operator {
+		t.Fatalf("w1 = %+v", r.Nodes["w1"])
+	}
+	g.operatorSwap("w1", "v2")
+	g.operatorSwap("w2", "v2")
+	g.operatorSwap("s1", "v2")
+	g.run(upgradewire.StateDone)
+}
+
+// --pause-after counts operator-driven workers like any other: the walk
+// pauses once that many are done, starts no operator turn while paused,
+// and goes on after a resume.
+func TestRolloutDriverPauseAfterWithOperatorNodes(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 3)
+	for _, id := range []string{"w1", "w2"} {
+		g.nodes.nodes[id].stageErr = operatorDriven()
+		g.nodes.nodes[id].applyErr = errors.New("the leader must not call an operator-driven node's upgrader")
+	}
+	g.start(func(r *RolloutRecord) { r.PauseAfter = 1; r.Batch = "1"; r.AllowDowntime = true; r.Hold = true })
+	for i := 0; i < 50 && g.host.rollout().Nodes["w1"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	g.operatorSwap("w1", "v2")
+	r := g.run(upgradewire.StatePaused)
+	if r.workersDone() != 1 || r.Nodes["w1"].State != upgradewire.NodeDone {
+		t.Fatalf("paused after %d workers: %s", r.workersDone(), describeNodes(r))
+	}
+	for i := 0; i < 5; i++ {
+		g.driver.tick(context.Background())
+	}
+	if r := g.host.rollout(); r.Nodes["w2"].State == upgradewire.NodeUpgrading || r.Nodes["w3"].State == upgradewire.NodeUpgrading {
+		t.Fatalf("an operator turn started while paused: %s", describeNodes(r))
+	}
+	if res, _ := g.host.event(context.Background(), RolloutCommand{Event: evResume, RolloutID: "r1"}); res.Rollout.State != upgradewire.StateRunning {
+		t.Fatalf("resume = %+v", res.Verdict)
+	}
+	for i := 0; i < 50 && g.host.rollout().Nodes["w2"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	g.operatorSwap("w2", "v2")
+	r = g.run(upgradewire.StateDone)
+	if r.workersDone() != 3 || g.nodes.nodes["w1"].applyCalls+g.nodes.nodes["w2"].applyCalls != 0 {
+		t.Fatalf("after resume %s", describeNodes(r))
+	}
+}
+
+// The leader changes while the operator swaps a node: the new leader's
+// driver starts with nothing in memory, reads the node's turn from the
+// rollout record, keeps its deadline, never calls its upgrader, and
+// finishes it once the node reports the target.
+func TestRolloutDriverOperatorTurnSurvivesALeaderChange(t *testing.T) {
+	g := newRolloutRig(t, 1, 0, 2)
+	g.nodes.nodes["w1"].stageErr = operatorDriven()
+	g.nodes.nodes["w1"].applyErr = errors.New("the leader must not call an operator-driven node's upgrader")
+	g.start(func(r *RolloutRecord) { r.Batch = "1"; r.AllowDowntime = true; r.Hold = true })
+	for i := 0; i < 50 && g.host.rollout().Nodes["w1"].State != upgradewire.NodeUpgrading; i++ {
+		g.driver.tick(context.Background())
+	}
+	before := g.host.rollout().Nodes["w1"]
+	if before.State != upgradewire.NodeUpgrading || !before.Operator {
+		t.Fatalf("w1 before the leader change = %+v", before)
+	}
+
+	// A new leader: a fresh driver over the same replicated record.
+	d := newRolloutDriver(g.host, g.nodes, nil)
+	d.inline = true
+	d.applyResendAfter = time.Hour
+	g.driver = d
+	for i := 0; i < 5; i++ {
+		g.driver.tick(context.Background())
+	}
+	after := g.host.rollout().Nodes["w1"]
+	if after.State != upgradewire.NodeUpgrading || !after.Operator || after.DeadlineUnixNano != before.DeadlineUnixNano || after.Op != before.Op {
+		t.Fatalf("w1 after the leader change = %+v, before %+v", after, before)
+	}
+	if r := g.host.rollout(); r.Nodes["w2"].State == upgradewire.NodeUpgrading {
+		t.Fatalf("the new leader started w2 while w1 was still the operator's: %s", describeNodes(r))
+	}
+	g.operatorSwap("w1", "v2")
+	r := g.run(upgradewire.StateDone)
+	if r.Nodes["w1"].State != upgradewire.NodeDone || g.nodes.nodes["w1"].applyCalls != 0 {
+		t.Fatalf("after the swap %s, %d apply calls", describeNodes(r), g.nodes.nodes["w1"].applyCalls)
+	}
+}
+
+// The live host's gate: operator steps need every Raft server new enough
+// to keep the operator flag in the rollout record.
+func TestClusterRolloutHostOperatorStepsAllowed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "ldr-opgate", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	h := clusterRolloutHost{c: c}
+	if !h.operatorStepsAllowed() {
+		t.Fatal("a cluster of this build refused operator steps")
+	}
+	// A server gossip has never heard from reports version 0: too old.
+	if err := c.raft.raft.AddNonvoter("old-server", "127.0.0.1:1", 0, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	if h.operatorStepsAllowed() {
+		t.Fatal("operator steps allowed with an old server in the configuration")
+	}
 }

@@ -318,11 +318,21 @@ func (c *Cluster) validateApply(req upgradewire.ApplyRequest) (*RolloutRecord, e
 	}
 	switch req.Source {
 	case upgradewire.SourceRelease, upgradewire.SourceUpload:
+		if len(req.Files) == 0 {
+			return nil, bad("files is empty: give every release file's SHA-256")
+		}
+	case upgradewire.SourceImages:
+		// Every node of a Kubernetes-managed cluster is operator-driven:
+		// nothing fetches a file, the images are signed and checked by
+		// their own digests (C13).
+		if !c.cfg.UpgradesByOperator() {
+			return nil, bad(fmt.Sprintf("source %q is for a cluster the Kubernetes operator upgrades (SB_UPGRADE_DRIVER=operator)", upgradewire.SourceImages))
+		}
+		if len(req.Files) > 0 {
+			return nil, bad(fmt.Sprintf("source %q takes no files", upgradewire.SourceImages))
+		}
 	default:
 		return nil, bad(fmt.Sprintf("source must be %q or %q", upgradewire.SourceRelease, upgradewire.SourceUpload))
-	}
-	if len(req.Files) == 0 {
-		return nil, bad("files is empty: give every release file's SHA-256")
 	}
 	for name, sum := range req.Files {
 		if !upgradewire.SHA256Re.MatchString(sum) {

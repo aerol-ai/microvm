@@ -97,6 +97,9 @@ type ErrorResponse struct {
 const (
 	SourceRelease = "release" // servers download from SB_RELEASE_URL
 	SourceUpload  = "upload"  // the CLI uploaded them to the leader (--from)
+	// SourceImages: on Kubernetes the operator swaps each pod's images, so
+	// no node fetches a release file and the apply names none (C13).
+	SourceImages = "images"
 )
 
 // ApplyRequest is the body of POST ClusterUpgradePath.

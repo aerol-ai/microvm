@@ -388,6 +388,12 @@ func (d *rolloutDriver) stage(ctx context.Context, r *RolloutRecord, n *RolloutN
 
 func (d *rolloutDriver) afterStage(ctx context.Context, rolloutID string, n RolloutNodeRecord, req UpgradeStepRequest, resp UpgradeStepResponse, err error) {
 	switch {
+	case err == nil && req.Source == upgradewire.SourceImages && resp.Version != req.Version:
+		// An images rollout carries no files, so a node that stages files
+		// itself has nothing to stage and nothing to run: it is upgraded
+		// by hand, and done once it reports the target.
+		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeManual, ExpectState: upgradewire.NodePending,
+			Error: "this rollout swaps images and this node is not operator-driven: upgrade it by hand"})
 	case err == nil && resp.Version == req.Version:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeDone, ExpectState: upgradewire.NodePending, Version: resp.Version, Arch: resp.Arch, ClearError: true})
 	case err == nil:
