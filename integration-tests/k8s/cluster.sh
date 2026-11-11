@@ -77,12 +77,43 @@ cmd_up() {
   echo "up: $name; kubeconfig $sd/kubeconfig"
 }
 
+# remove_leftovers deletes what the cluster's own add-ons made outside
+# Terraform and can leave behind: network interfaces the VPC CNI made for a
+# node ("aws-K8S-<instance>", tagged with the cluster's name), left
+# "available" when the node is terminated, and EKS's own cluster security
+# group, which EKS keeps while such an interface uses it. Either one holds
+# its subnet or VPC, and destroy waits 20 minutes and fails (N1's teardown).
+remove_leftovers() {
+  local name="$1" region="$2" id
+  for id in $(aws ec2 describe-network-interfaces --region "$region" \
+      --filters "Name=tag:cluster.k8s.amazonaws.com/name,Values=$name" Name=status,Values=available \
+      --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+    aws ec2 delete-network-interface --region "$region" --network-interface-id "$id" &&
+      echo "down: removed a network interface the VPC CNI left behind: $id"
+  done
+  [[ "${3:-}" == with-cluster-sg ]] || return 0
+  for id in $(aws ec2 describe-security-groups --region "$region" \
+      --filters "Name=tag:aws:eks:cluster-name,Values=$name" --query 'SecurityGroups[].GroupId' --output text); do
+    aws ec2 delete-security-group --region "$region" --group-id "$id" >/dev/null &&
+      echo "down: removed EKS's cluster security group $id"
+  done
+}
+
 cmd_down() {
   local name="${1:-}"; [[ -n "$name" ]] || usage
   local sd; sd="$(state_dir "$name")"
   [[ -f "$sd/terraform.tfstate" ]] || die "no state for $name in $sd"
+  local state=(-input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json")
+  local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region 2>/dev/null || echo "${AWS_REGION:-us-east-1}")"
   tf "$name" init -input=false -backend=false >/dev/null
-  tf "$name" destroy -input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json"
+  # Machines first, then what they left, then the rest.
+  tf "$name" destroy "${state[@]}" -target=aws_eks_node_group.worker -target=aws_eks_node_group.system
+  remove_leftovers "$name" "$region"
+  if ! tf "$name" destroy "${state[@]}"; then
+    echo "down: destroy failed; removing leftovers and trying once more" >&2
+    remove_leftovers "$name" "$region" with-cluster-sg
+    tf "$name" destroy "${state[@]}"
+  fi
   if [[ -f "$sd/started-at" ]]; then
     echo "down: $name; ran from $(cat "$sd/started-at") to $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
