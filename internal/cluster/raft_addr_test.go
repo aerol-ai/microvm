@@ -53,21 +53,11 @@ func TestRaftAdvertiseAddr(t *testing.T) {
 	}
 }
 
-func freeLoopbackPort(t *testing.T) int {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
-}
-
 // raftNodeNamed starts a Raft node bound on loopback and advertised as
 // localhost:<port>, a name, as a Kubernetes server pod would be.
 func raftNodeNamed(t *testing.T, id string, bootstrap, withTLS bool) (*raftNode, string) {
 	t.Helper()
-	port := freeLoopbackPort(t)
+	port := reserveTestPort(t, false)
 	name := fmt.Sprintf("localhost:%d", port)
 	cfg := raftSetupConfig{
 		NodeID:           id,

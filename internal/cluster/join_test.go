@@ -182,15 +182,13 @@ func dialBackListeners(t *testing.T, n int) []int {
 	return ports
 }
 
+// closedPort is a port nothing listens on, for the "unreachable" cases. A
+// ":0" pick would be an ephemeral port, which an outgoing connection could
+// be using by the time the preflight dials it; below the ephemeral range
+// nothing binds a port by itself, so it stays closed.
 func closedPort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return port
+	return reserveTestPort(t, false)
 }
 
 // joinClient talks to a join port as a new machine does before it trusts
