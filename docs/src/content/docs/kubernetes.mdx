@@ -49,6 +49,8 @@ make k8s-dev
 
 It builds the images from your checkout, starts a kind cluster named `aerolvm`, and installs the chart. Delete the cluster with `make k8s-dev-down`.
 
+To try [HTTPS sandbox links](#sandbox-links-over-https) too, run `AEROL_K8S_EDGE=1 make k8s-dev`. It also installs cert-manager with a self-signed issuer and uses the domain `aerolvm.test`.
+
 ## Install
 
 Make a namespace that allows privileged pods, then install the chart:
@@ -159,6 +161,34 @@ Then create a sandbox. This one uses gVisor, which adds a second kernel between 
   </TabItem>
 </Tabs>
 
+## Sandbox links over HTTPS
+
+Turn on the **edge** to give the API and every sandbox port a public HTTPS address, as on a server installed with a domain. The edge is a fourth container in the worker pod. It runs AerolVM's build of Caddy, a web server.
+
+- The API is `https://<domain>`.
+- Port 3000 of a sandbox is `https://<sandbox id>-3000.<domain>`. You get it when you [publish a port](/network-access/#who-can-reach-the-sandbox-from-outside).
+
+The certificate comes from [cert-manager](https://cert-manager.io), so install cert-manager first. Point it at your own certificate authority, or at Let's Encrypt with a DNS-01 issuer. With DNS-01, the DNS provider's token stays in cert-manager's namespace. No AerolVM pod ever holds it.
+
+```bash
+helm install aerolvm charts/aerolvm --namespace aerolvm \
+  --set edge.enabled=true \
+  --set edge.domain=sandboxes.example.com \
+  --set edge.certManager.issuerRef.name=letsencrypt-dns
+```
+
+Then point the domain and its wildcard (`sandboxes.example.com` and `*.sandboxes.example.com`) at the address of the `aerolvm-edge` Service:
+
+```bash
+kubectl -n aerolvm get svc aerolvm-edge
+```
+
+Good to know about the edge:
+
+- **Renewals need no restart.** cert-manager renews the certificate before it expires. The new one is served within about two minutes, and no container restarts.
+- **You can bring your own certificate.** Put it in a TLS Secret for the domain and its wildcard, and set `edge.existingTLSSecret` instead of an issuer.
+- **[Custom domains](/custom-domains/) work as on a server.** Their certificates are issued when first needed. They are kept in the pod, so they are issued again after the pod is replaced.
+
 ## Check the install
 
 `aerolvm k8s verify` checks a live install against the rules a security team asks about, and exits with 1 if any fails:
@@ -166,6 +196,7 @@ Then create a sandbox. This one uses gVisor, which adds a second kernel between 
 - every image is signed by the AerolVM release workflow (it needs `cosign`);
 - no pod mounts a folder from the node;
 - no pod holds a Kubernetes API credential;
+- no pod holds a DNS provider token: a pod may mount only a certificate, its key and its authority from a Secret, each named;
 - a runc and a gVisor sandbox cannot reach the worker pod's own ports or the Kubernetes API.
 
 It reads the cluster with your `kubectl`, and makes its two test sandboxes through the API you set up above. It deletes them when it is done.
@@ -195,6 +226,11 @@ Set these with `--set` or a values file.
 | `worker.containerdVolume` | Where images and sandbox files live. Use a local disk for real work. | an `emptyDir` |
 | `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. | none |
 | `apiToken.existingSecret` | Use your own token Secret (key `SB_PAT_TOKEN`) instead of the one the chart makes. | none |
+| `edge.enabled` | [Sandbox links over HTTPS](#sandbox-links-over-https). Needs `edge.domain` and a certificate. | `false` |
+| `edge.domain` | The API's host name. Sandbox links are under it. | none |
+| `edge.certManager.issuerRef` | The cert-manager issuer for the certificate, as `name` and `kind` (`ClusterIssuer` when you leave `kind` out). | none |
+| `edge.existingTLSSecret` | Your own TLS Secret for the domain and its wildcard, instead of an issuer. | none |
+| `edge.service.type` | How the edge is reached from outside the cluster. | `LoadBalancer` |
 | `image.tag` | The AerolVM version to run. | the chart's version |
 
 ## Good to know
