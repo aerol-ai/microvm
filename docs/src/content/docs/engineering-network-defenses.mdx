@@ -227,7 +227,7 @@ A server runs more than AerolVM: an EDR agent, a log shipper, a metrics exporter
 |---|---|
 | The egress gateway's DNS (53054) and proxy (15080) ports | The gateway runs on the server, and only for sandboxes with a name allow list, which are sent there. The gateway drops them for every other sandbox. |
 | DNS (53) on one server address | The resolver handed to sandboxes is that address. By default sandboxes get the server's upstream resolvers, which are not on the server. |
-| Web ports 80 and 443 | The server serves public URLs. They answer the internet anyway, so a sandbox can open its own public URL. |
+| Web ports 80 and 443 | The server serves public URLs. They answer the internet anyway, so a sandbox can open its own public URL. `SB_SANDBOX_NODE_INGRESS=false` keeps them closed, as the Kubernetes chart does: there the public URLs are reached through a Service, which a sandbox still reaches like any internet client. |
 | Ports the operator lists in `SB_SANDBOX_NODE_PORTS_ALLOW` | Only outside enterprise mode. |
 
 - **Replies still flow.** When the server opens a connection into a sandbox (AerolVM's agent, health checks), the sandbox's replies get through.
