@@ -84,14 +84,19 @@ type fakeK8s struct {
 	apiEndpoints string
 	namespaces   map[string]string
 	nodes        string
-	awsOut       string
-	awsErr       error
-	awsCalls     []string
-	cosignErr    map[string]error
-	probeOut     map[string]string
-	probeErr     error
-	commands     []string
-	signed       []string
+	// routes are the Gateway API route lists by resource; a resource that
+	// is not a key answers as a CRD that is not installed.
+	routes    map[string]string
+	routesErr map[string]error
+	gateways  map[string]string // "namespace/name" → Gateway
+	awsOut    string
+	awsErr    error
+	awsCalls  []string
+	cosignErr map[string]error
+	probeOut  map[string]string
+	probeErr  error
+	commands  []string
+	signed    []string
 }
 
 // goodK8s is a clean single-mode install: every check passes.
@@ -129,6 +134,17 @@ func (f *fakeK8s) env() k8sEnv {
 				return answer(f.namespaces[args[2]])
 			case args[0] == "get" && args[1] == "nodes":
 				return answer(f.nodes)
+			case args[0] == "get" && args[1] == "gateways.gateway.networking.k8s.io":
+				return answer(f.gateways[args[4]+"/"+args[2]])
+			case args[0] == "get" && strings.HasSuffix(args[1], "routes.gateway.networking.k8s.io"):
+				if err := f.routesErr[args[1]]; err != nil {
+					return nil, err
+				}
+				list, ok := f.routes[args[1]]
+				if !ok {
+					return nil, errors.New(`kubectl get: error: the server doesn't have a resource type "` + strings.Split(args[1], ".")[0] + `"`)
+				}
+				return []byte(list), nil
 			}
 			return nil, errors.New("unexpected kubectl " + strings.Join(args, " "))
 		},
@@ -165,7 +181,8 @@ func TestK8sVerifyPasses(t *testing.T) {
 			t.Fatalf("%s: %s %s", c.Name, c.Result, c.Detail)
 		}
 	}
-	// One namespace, so no release namespace check.
+	// No Gateway API in this cluster, so no route checks; one namespace, so
+	// no release namespace check.
 	if len(checks) != 11 {
 		t.Fatalf("%d checks, want 11: %+v", len(checks), checks)
 	}
@@ -331,13 +348,41 @@ const (
 	k8sClusterIMDS = `{"Reservations":[{"Instances":[{"InstanceId":"i-0w1","MetadataOptions":{"HttpTokens":"required","HttpPutResponseHopLimit":1,"HttpEndpoint":"enabled"}}]}]}`
 )
 
-// clusterK8s is a clean cluster-mode install.
+// The bank's Gateway in front (§7.1): the API host ends TLS, sandbox links
+// pass through, another app's TLS listener ends TLS, and SSH is plain TCP.
+const (
+	k8sBankGateway = `{"spec":{"listeners":[
+  {"name":"https","hostname":"api.example.com","port":443,"protocol":"HTTPS","tls":{"mode":"Terminate"}},
+  {"name":"links","hostname":"*.sbx.example.com","port":443,"protocol":"TLS","tls":{"mode":"Passthrough"}},
+  {"name":"other-app","hostname":"*.other.example.com","port":443,"protocol":"TLS"},
+  {"name":"ssh","port":22,"protocol":"TCP"}]}}`
+	k8sAccepted = `{"type":"Accepted","status":"True","reason":"Accepted"},{"type":"ResolvedRefs","status":"True","reason":"ResolvedRefs"}`
+
+	k8sHTTPRoutes = "httproutes.gateway.networking.k8s.io"
+	k8sTLSRoutes  = "tlsroutes.gateway.networking.k8s.io"
+	k8sTCPRoutes  = "tcproutes.gateway.networking.k8s.io"
+)
+
+// k8sRouteJSON is a route list with one route on one parent, as kubectl
+// prints it, with the given status conditions for that parent.
+func k8sRouteJSON(name, parent, hostnames, conditions string) string {
+	return `{"items":[{"metadata":{"name":"` + name + `","namespace":"aerolvm-system"},"spec":{"parentRefs":[` + parent + `],"hostnames":[` + hostnames + `]},` +
+		`"status":{"parents":[{"parentRef":` + parent + `,"controllerName":"example.com/gw","conditions":[` + conditions + `]}]}}]}`
+}
+
+// clusterK8s is a clean cluster-mode install behind the bank's Gateway.
 func clusterK8s() *fakeK8s {
 	f := goodK8s()
 	f.pods, f.workerPods, f.workerPolicy = k8sClusterPods, k8sClusterWorkers, k8sClusterWorkerPolicy
 	f.namespaces = map[string]string{"aerolvm-system": k8sNamespaceLabelled("restricted"), k8sWorkerNS: k8sNamespaceLabelled("privileged")}
 	f.nodes = "ip-10-0-2-7.eu-west-1.compute.internal\taws:///eu-west-1b/i-0w1\n"
 	f.awsOut = k8sClusterIMDS
+	f.routes = map[string]string{
+		k8sHTTPRoutes: k8sRouteJSON("prod-api", `{"name":"bank-gw","namespace":"infra","sectionName":"https"}`, `"api.example.com"`, k8sAccepted),
+		k8sTLSRoutes:  k8sRouteJSON("prod-links", `{"name":"bank-gw","namespace":"infra"}`, `"*.sbx.example.com"`, k8sAccepted),
+		k8sTCPRoutes:  k8sRouteJSON("prod-ssh", `{"name":"bank-gw","namespace":"infra","sectionName":"ssh"}`, ``, k8sAccepted),
+	}
+	f.gateways = map[string]string{"infra/bank-gw": k8sBankGateway}
 	return f
 }
 
@@ -353,7 +398,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		}
 	}
 	got := k8sResults(checks)
-	if len(checks) != 12 || got[k8sReleaseNSCheck] == "" {
+	if len(checks) != 14 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
 		t.Fatalf("%d checks: %+v", len(checks), checks)
 	}
 	for check, want := range map[string]string{
@@ -362,6 +407,8 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		k8sPrivilegedCheck:   "pass: 1 worker pod(s) in namespace aerolvm-workers",
 		k8sPolicyCheck:       "pass: prod-worker-a (prod-worker-egress)",
 		k8sIMDSCheck:         "pass: 1 EC2 instance(s)",
+		k8sRoutesAccepted:    "pass: HTTPRoute prod-api, TLSRoute prod-links, TCPRoute prod-ssh",
+		k8sLinksPassthrough:  "pass: Gateway infra/bank-gw listener links",
 		"images signed by the AerolVM release workflow": "pass: ghcr.io/aerol-ai/aerolvm-edge:v1, ghcr.io/aerol-ai/aerolvm-operator:v1",
 	} {
 		if !strings.HasPrefix(got[check], want) {

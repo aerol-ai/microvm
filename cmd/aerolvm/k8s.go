@@ -27,8 +27,9 @@ import (
 // limits the worker pod's egress, and a probe sandbox cannot reach the
 // worker's own ports, another pod or the Kubernetes API (C24). Phase 2
 // adds the cluster layout: privileged containers only in the worker
-// namespace, each namespace's Pod Security label, and the worker machines'
-// IMDS hop limit.
+// namespace, each namespace's Pod Security label, the worker machines' IMDS
+// hop limit, and, behind the bank's own Gateway, that the Gateway accepted
+// the routes and passes sandbox links through still encrypted.
 //
 // It reads the cluster with the kubectl, cosign and aws already on this
 // machine (so the CLI carries no Kubernetes or AWS client, and holds no
@@ -324,6 +325,7 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
 	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
 	checks = append(checks, k8sIMDS(ctx, env, pods))
+	checks = append(checks, k8sGatewayRoutes(ctx, env, o)...)
 	checks = append(checks, k8sProbe(ctx, env, pods, o)...)
 	return checks
 }
