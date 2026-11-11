@@ -74,6 +74,14 @@ type nodeMeta struct {
 	// and servers cache every type the fleet runs (§6.3, Codex eng finding
 	// 6). It rides the same two tiers as bv; an older peer sends none.
 	Arch string `json:"ar,omitempty"`
+	// Restarting is set on SIGTERM, just before the node leaves (C8): it
+	// is going down to come back, so peers wait the restart window
+	// (SB_CLUSTER_RESTART_WINDOW) before moving its sandboxes, and
+	// placement sends it nothing new meanwhile. It rides the same two
+	// fallback tiers as bv; a peer that never sees it treats the leave as
+	// before, which only fails over sooner. Omitted while false, so a
+	// running node's meta is byte for byte what it was.
+	Restarting bool `json:"rs,omitempty"`
 }
 
 // GossipPATScope is the value a node gossips for its SB_PAT_SCOPE: "host",
@@ -106,6 +114,8 @@ type gossipDelegate struct {
 	// what it was.
 	buildVersion string
 	arch         string
+	// restarting is gossiped as "rs" once announceRestart runs.
+	restarting bool
 }
 
 func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role, publicHost string, admitter *capacity.Admitter) *gossipDelegate {
@@ -140,11 +150,13 @@ func (d *gossipDelegate) setPATScope(scope string) {
 func (d *gossipDelegate) refreshMeta() {
 	d.mu.RLock()
 	patScope := d.patScope
+	restarting := d.restarting
 	d.mu.RUnlock()
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
 		FSMOpsVersion: fsmOpsVersion, PATScope: patScope, BuildVersion: d.buildVersion, Arch: d.arch,
+		Restarting: restarting,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -175,8 +187,8 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 			// raft/identity loss breaks voter join and cross-node routing.
 			// PATScope rides the first two tiers: dropping it only raises a
 			// false drift alert, never widens access.
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch, Restarting: d.selfMeta.Restarting},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope, BuildVersion: d.buildVersion, Arch: d.arch, Restarting: d.selfMeta.Restarting},
 			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, FSMOpsVersion: fsmOpsVersion},
@@ -980,6 +992,7 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.PATScope = meta.PATScope
 			m.Version = meta.BuildVersion
 			m.Arch = meta.Arch
+			m.Restarting = meta.Restarting
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -1016,6 +1029,7 @@ func (g *gossipNode) selfMember() Member {
 		PATScope:      meta.PATScope,
 		Version:       meta.BuildVersion,
 		Arch:          meta.Arch,
+		Restarting:    meta.Restarting,
 		Alive:         true,
 		Capacity:      snap,
 	}
@@ -1050,6 +1064,33 @@ func (g *gossipNode) peerInternalURL(nodeID string) string {
 		}
 	}
 	return ""
+}
+
+// restartAnnounceTimeout bounds how long announceRestart waits for the
+// "rs" update to go out before the leave follows it.
+const restartAnnounceTimeout = 2 * time.Second
+
+// announceRestart gossips "rs" (C8) and waits, at most timeout, for the
+// update to be sent, so the leave that follows reaches peers with it: each
+// peer's NotifyLeave carries the last meta it heard. Best effort: a peer
+// that missed it sees a plain leave and fails over after the grace, as
+// before. Idempotent.
+func (g *gossipNode) announceRestart(timeout time.Duration) error {
+	if g == nil || g.delegate == nil {
+		return nil
+	}
+	g.delegate.mu.Lock()
+	already := g.delegate.restarting
+	g.delegate.restarting = true
+	g.delegate.mu.Unlock()
+	if already {
+		return nil
+	}
+	g.delegate.refreshMeta()
+	if g.ml == nil {
+		return nil
+	}
+	return g.ml.UpdateNode(timeout)
 }
 
 func (g *gossipNode) Close() error {

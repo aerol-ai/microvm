@@ -645,6 +645,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.
+	var clusterShutdown cluster.ShutdownPreparer
 	if cfg.EnableCluster {
 		var (
 			clusterClient cluster.Client
@@ -663,6 +664,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				logger.Warn("cluster shutdown returned error", "error", err)
 			}
 		}()
+		clusterShutdown, _ = clusterClient.(cluster.ShutdownPreparer)
 		svc.AttachCluster(clusterClient)
 		// Fail closed on oversized ingress tiers without an explicit
 		// shard-aware router opt-in. Enterprise boots refuse to start;
@@ -1258,6 +1260,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	<-ctx.Done()
 	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
+	// First, while the listeners still serve: hand off Raft leadership and
+	// announce the restart (C8), so placement stops choosing this node
+	// during the drain below and the leader waits the restart window.
+	prepareClusterShutdown(clusterShutdown)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()

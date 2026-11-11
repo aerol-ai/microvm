@@ -1338,6 +1338,14 @@ type Config struct {
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// ClusterRestartWindow is how long the leader waits for a node that
+	// announced a restart on SIGTERM before it moves that node's sandboxes
+	// (SB_CLUSTER_RESTART_WINDOW, default 120s). A planned restart is not a
+	// death: without the notice a clean stop starts the dead-owner grace,
+	// and an agent upgrade that takes longer than it moves every sandbox.
+	// A crash sends no notice and still gets only the grace. 0 turns the
+	// wait off; a window no longer than the grace changes nothing.
+	ClusterRestartWindow time.Duration
 	// OwnershipLeaseFile is where a cluster worker writes its ownership lease
 	// for the runtime supervisor to enforce with sandboxd down
 	// (SB_OWNERSHIP_LEASE_FILE, internal/ownerlease; default empty: not
@@ -2386,6 +2394,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterRestartWindow:             getEnvDuration("SB_CLUSTER_RESTART_WINDOW", 120*time.Second),
 		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),

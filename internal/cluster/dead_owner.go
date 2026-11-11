@@ -34,15 +34,54 @@ func OwnershipLease(cfg config.Config) time.Duration {
 	return DeadOwnerGrace(cfg) / 2
 }
 
+// RestartWindow is how long the leader waits for a node that announced a
+// restart before it moves that node's sandboxes (SB_CLUSTER_RESTART_WINDOW,
+// C8). Zero or less turns the wait off. It runs from the leave, like the
+// grace, so it changes nothing unless it is longer than the grace. It takes
+// a pointer so the leave callback, which runs on gossip's goroutine, reads
+// this one setting and not a copy of the whole config.
+func RestartWindow(cfg *config.Config) time.Duration {
+	if cfg.ClusterRestartWindow <= 0 {
+		return 0
+	}
+	return cfg.ClusterRestartWindow
+}
+
 // deadOwnerTracker holds per-node "first observed dead at" timestamps so the
-// reconciler can decide which nodes have outlasted the grace period.
+// reconciler can decide which nodes have outlasted the grace period, and the
+// restart deadline of each node that left announcing a restart (C8).
 type deadOwnerTracker struct {
 	mu        sync.Mutex
 	firstSeen map[string]time.Time
+	// restartUntil is when a node that left with "rs" set stops counting as
+	// restarting. Every server keeps it from its own NotifyLeave, so a new
+	// leader has it too, unless it joined after the leave; then the node
+	// gets only the grace, which fails over sooner and never later.
+	restartUntil map[string]time.Time
 }
 
 func newDeadOwnerTracker() *deadOwnerTracker {
-	return &deadOwnerTracker{firstSeen: make(map[string]time.Time)}
+	return &deadOwnerTracker{firstSeen: make(map[string]time.Time), restartUntil: make(map[string]time.Time)}
+}
+
+// markRestarting records that nodeID left to restart and is not to be
+// judged dead before until. A second notice keeps the first deadline, so a
+// node cannot extend its own window by announcing again.
+func (t *deadOwnerTracker) markRestarting(nodeID string, until time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.restartUntil[nodeID]; ok {
+		return
+	}
+	t.restartUntil[nodeID] = until
+}
+
+// restarting reports nodeID's restart deadline, if it announced one.
+func (t *deadOwnerTracker) restarting(nodeID string) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	until, ok := t.restartUntil[nodeID]
+	return until, ok
 }
 
 // markDead records nodeID as dead-since-now if it isn't already tracked. Returns
@@ -62,6 +101,7 @@ func (t *deadOwnerTracker) clear(nodeID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.firstSeen, nodeID)
+	delete(t.restartUntil, nodeID)
 }
 
 func (t *deadOwnerTracker) snapshot() map[string]time.Time {
@@ -75,13 +115,18 @@ func (t *deadOwnerTracker) snapshot() map[string]time.Time {
 }
 
 // handleMemberLeave is invoked from the memberlist leave callback. It only
-// records the death timestamp; the periodic reconciler does the actual
-// orphaning + voter removal once the grace period elapses.
-func (c *Cluster) handleMemberLeave(nodeID string) {
+// records the death timestamp, and the restart deadline when the node left
+// announcing a restart (C8); the periodic reconciler does the actual
+// orphaning + voter removal once the grace period, or that deadline, passes.
+func (c *Cluster) handleMemberLeave(nodeID string, restarting bool) {
 	if nodeID == "" || nodeID == c.nodeID || c.deadOwners == nil {
 		return
 	}
-	c.deadOwners.markDead(nodeID, time.Now())
+	now := time.Now()
+	c.deadOwners.markDead(nodeID, now)
+	if window := RestartWindow(&c.cfg); restarting && window > 0 {
+		c.deadOwners.markRestarting(nodeID, now.Add(window))
+	}
 }
 
 // cancelDeadOwnerWatch is invoked from the join callback so a flapped node
@@ -135,8 +180,9 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 	grace := DeadOwnerGrace(c.cfg)
 
 	// Refresh the dead set from gossip: any tracked node that's actually
-	// alive should be cleared (covers events we missed during a leadership
-	// flap), and any non-alive node we don't yet track should be marked.
+	// alive is cleared (covers events we missed during a leadership flap).
+	// Nodes that are not alive are marked below, from the raft voters and
+	// from the placements' owners.
 	live := make(map[string]bool)
 	for _, m := range c.gossip.members() {
 		if m.NodeID == "" {
@@ -161,6 +207,18 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		}
 	}
 
+	// Every node that owns placements and gossip does not show alive. A
+	// server that was down when a worker died saw no leave event, and the
+	// worker may be gone from gossip too: its placements are then the only
+	// sign of it (the plan's "a restarted server may miss a dead worker").
+	// A mark only starts the grace; a node gossip shows alive by then is
+	// cleared above on the next tick.
+	for _, id := range c.fsm.ownerNodeIDs() {
+		if id != c.nodeID && !live[id] {
+			c.deadOwners.markDead(id, time.Now())
+		}
+	}
+
 	// A deleted node is out of the gossip view, so nothing above marks it.
 	// One that still owns placements (its delete failed after the deny
 	// record landed and was never retried) is evicted like a dead owner.
@@ -180,6 +238,12 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		// restart longer than the grace moves none of its sandboxes (§6.2,
 		// Codex eng finding 2). Past the deadline it is judged as before.
 		if deadline, upgrading := c.fsm.upgradingDeadline(nodeID); upgrading && now.Before(deadline) {
+			continue
+		}
+		// A node that announced a restart on SIGTERM (C8) gets the restart
+		// window, for a pod or kubelet restart outside a rollout. A deleted
+		// node never waits: it is not coming back.
+		if until, restarting := c.deadOwners.restarting(nodeID); restarting && now.Before(until) && !c.fsm.deniedNodeSet()[nodeID] {
 			continue
 		}
 		if live[nodeID] {

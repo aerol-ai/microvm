@@ -365,7 +365,9 @@ func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (Pla
 	found := false
 	labelMatched := false
 	for _, m := range all {
-		if !m.Alive {
+		// A node going down to restart (C8) is no failover target: the
+		// sandbox would move again when it leaves.
+		if !m.Alive || m.Restarting {
 			continue
 		}
 		if !CanOwnSandboxRole(m.Role) {

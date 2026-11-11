@@ -165,6 +165,12 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["dead"]++
 			continue
 		}
+		// It announced a restart on SIGTERM (C8) and is about to leave: a
+		// create forwarded there now would fail or be lost in the restart.
+		if m.Restarting {
+			rejects["restarting"]++
+			continue
+		}
 		if !CanOwnSandboxRole(m.Role) {
 			rejects["role"]++
 			continue
