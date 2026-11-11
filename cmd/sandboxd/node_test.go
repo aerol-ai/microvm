@@ -213,3 +213,30 @@ func TestNodeJoinCommand(t *testing.T) {
 		t.Fatalf("join-command --json = %d %s", code, out)
 	}
 }
+
+// F14: --files-only reaches init and join, and lets a user that is not root
+// write a node's files (a Kubernetes init container).
+func TestNodeCommandsFilesOnly(t *testing.T) {
+	p := withNodeSeams(t, false)
+	if err := os.WriteFile(filepath.Join(p.CgroupRoot, "cgroup.controllers"), []byte("cpu\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The server key goes where sandboxd.env says, as in a pod's volume.
+	env := "SB_PAT_TOKEN=p\nSB_CREDENTIAL_ENCRYPTION_KEY_PATH=" + filepath.Join(p.StateDir, "credential_encryption.key") + "\n"
+	if err := os.WriteFile(p.EnvFile, []byte(env), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runNode("init", "--files-only")
+	if code != 0 || !strings.Contains(out, "files written (--files-only)") {
+		t.Fatalf("init --files-only = %d\nout: %q\nerr: %q", code, out, errOut)
+	}
+	if _, err := os.Stat(p.DropIn); err == nil {
+		t.Fatal("init --files-only wrote the systemd drop-in")
+	}
+	// join reads the flag too; with no join server it stops at preflight,
+	// past the root check.
+	tok, _ := cluster.GenerateJoinToken()
+	if code, _, errOut := runNode("join", "https://127.0.0.1:1", "--token", tok, "--files-only"); code != 1 || !strings.Contains(errOut, "preflight failed") {
+		t.Fatalf("join --files-only against nothing = %d %s", code, errOut)
+	}
+}
