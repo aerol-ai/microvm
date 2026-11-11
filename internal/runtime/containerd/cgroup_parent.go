@@ -67,7 +67,9 @@ func (d *Driver) sandboxCgroupPath(id string) string {
 // markWholeOOMVictim makes a started sandbox the kernel's choice, whole,
 // when its pod runs out of memory (Kubernetes Phase 0, finding F10). It runs
 // right after each task start (create, restart and warm-pool park), since a
-// task's cgroup is made anew each time:
+// task's cgroup is made anew each time, and once more when the sandbox is
+// ready, for processes gVisor starts after task.Start returns. It writes
+// the same two values each time, so a second pass changes nothing else:
 //
 //   - memory.oom.group 1 on the sandbox's own group, so an out-of-memory
 //     kill takes every process in it at once. A gVisor sandbox's memory is

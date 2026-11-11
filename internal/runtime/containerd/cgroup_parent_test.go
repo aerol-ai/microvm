@@ -358,3 +358,119 @@ func TestStartMarksRestartedSandbox(t *testing.T) {
 		}
 	})
 }
+
+// gVisor starts some of its processes after task.Start returns (4 of 7,021
+// gvisor_sentry processes were missed in a 1,000-sandbox live run), so the
+// create marks the group again once the sandbox answers.
+func TestCreateMarksProcessesStartedAfterTaskStart(t *testing.T) {
+	stubToolboxProbe(t)
+	hostIPv6(t, true)
+	(&specCapture{}).install(t)
+	d := newTestDriver(t)
+	d.cfg.CgroupParent = testPodCgroup
+	const id = "sb-late"
+	group := testPodCgroup + "/" + id
+	cg, proc := fakeOOMTree(t, map[string][]int{group: {4100}}, []int{4100})
+	// The readiness wait is where the late process appears.
+	pollToolboxHealthFn = func(context.Context, string, int) error {
+		procs := filepath.Join(cg, filepath.FromSlash(group), "cgroup.procs")
+		f, err := os.OpenFile(procs, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := f.WriteString("4199\n"); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(proc, "4199", "oom_score_adj"), []byte("-999\n"), 0o644)
+	}
+	cgMkdir(t, filepath.Join(proc, "4199"))
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{
+		Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}, Runtime: models.RuntimeGvisor,
+	}, id, "tok", nil); err != nil {
+		t.Fatal(err)
+	}
+	assertWholeOOMVictim(t, cg, proc, group, 4100, 4199)
+}
+
+// A group that disappears between the two passes (the sandbox died while it
+// came up) fails the start, on every path.
+func TestSecondOOMMarkFailureFailsTheStart(t *testing.T) {
+	removeGroup := func(t *testing.T, cg, group string) {
+		t.Helper()
+		if err := os.RemoveAll(filepath.Join(cg, filepath.FromSlash(group))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("create", func(t *testing.T) {
+		stubToolboxProbe(t)
+		hostIPv6(t, true)
+		(&specCapture{}).install(t)
+		d := newTestDriver(t)
+		d.cfg.CgroupParent = testPodCgroup
+		group := testPodCgroup + "/sb-gone"
+		cg, _ := fakeOOMTree(t, map[string][]int{group: {4100}}, []int{4100})
+		pollToolboxHealthFn = func(context.Context, string, int) error { removeGroup(t, cg, group); return nil }
+		_, err := d.Create(context.Background(), models.CreateSandboxRequest{
+			Image: "alpine:3.20", ContainerCommand: []string{"sleep", "inf"}, Runtime: models.RuntimeGvisor,
+		}, "sb-gone", "tok", nil)
+		if err == nil || !strings.Contains(err.Error(), "set memory.oom.group") {
+			t.Fatalf("Create = %v, want the second marking error", err)
+		}
+	})
+	t.Run("restart", func(t *testing.T) {
+		stubToolboxProbe(t)
+		group := testPodCgroup + "/sb-stopped"
+		cg, _ := fakeOOMTree(t, map[string][]int{group: {4200}}, []int{4200})
+		task := &fakeTask{status: cntr.Stopped}
+		tr := newFakeTransport()
+		tr.containers["sb-stopped"] = &fakeContainer{
+			id: "sb-stopped", task: task,
+			specOverride: &oci.Spec{Linux: &specs.Linux{CgroupsPath: group}},
+		}
+		d := newTestDriver(t)
+		d.cfg.CgroupParent = testPodCgroup
+		d.SetClient(NewTestClient("aerolvm", tr))
+		// The address read-back runs between the two passes.
+		containerIPv4FromTaskFn = func(context.Context, cntr.Task) (string, error) {
+			removeGroup(t, cg, group)
+			return "10.88.0.9", nil
+		}
+		_, err := d.Start(context.Background(), "sb-stopped")
+		if err == nil || !strings.Contains(err.Error(), "set memory.oom.group") {
+			t.Fatalf("Start = %v, want the second marking error", err)
+		}
+		if task.killed == 0 {
+			t.Fatal("the restarted task was left running after the second mark failed")
+		}
+	})
+	t.Run("park", func(t *testing.T) {
+		stubToolboxProbe(t)
+		hostIPv6(t, true)
+		(&specCapture{}).install(t)
+		provider, img := newTestImageProvider(t)
+		tr := newFakeTransport()
+		tr.provider, tr.image = provider, img
+		tmp := t.TempDir()
+		toolbox := filepath.Join(tmp, "toolboxd")
+		if err := os.WriteFile(toolbox, []byte{0}, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		d := New(Config{
+			ToolboxBinaryPath: toolbox, ToolboxMountPath: "/.aerol/toolboxd", ToolboxPort: 2280,
+			ToolboxWaitTimeout: 2 * time.Second, LogDir: filepath.Join(tmp, "logs"), RunDir: filepath.Join(tmp, "run"),
+			ReadyEnabled: true, ReadyDir: shortReadyDir(t), NativeNetnsPool: true, CgroupParent: testPodCgroup,
+		}, nil, nil)
+		d.SetClient(NewTestClient("aerolvm", tr))
+		d.SetNetnsHandoff(&harnessNetns{path: "/run/netns/park-gone", ip: "10.88.0.81"})
+		group := testPodCgroup + "/park-gone"
+		cg, _ := fakeOOMTree(t, map[string][]int{group: {4300}}, []int{4300})
+		origWait := parkReadyWaitFn
+		parkReadyWaitFn = func(context.Context, *dockerpkg.ParkedListener) error { removeGroup(t, cg, group); return nil }
+		t.Cleanup(func() { parkReadyWaitFn = origWait })
+		_, err := d.parkContainer(context.Background(), "park-gone", containerdpool.Key{Image: "cfg:test", Runtime: models.RuntimeGvisor})
+		if err == nil || !strings.Contains(err.Error(), "set memory.oom.group") {
+			t.Fatalf("park = %v, want the second marking error", err)
+		}
+	})
+}

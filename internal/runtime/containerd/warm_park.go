@@ -289,6 +289,12 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if err := parkReadyWaitFn(waitCtx, pl); err != nil {
 		return nil, fmt.Errorf("park ready: %w", err)
 	}
+	// Again, for processes gVisor started after task.Start returned.
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(slotID)); err != nil {
+			return nil, fmt.Errorf("park: %w", err)
+		}
+	}
 
 	containerIP := strings.TrimSpace(prepaidIP)
 	if containerIP == "" {
