@@ -45,13 +45,16 @@ url_of() { sed -n "s/^$1 *= *\"\(.*\)\"$/\1/p" "$sd/urls.tfvars"; }
 # load_br_netfilter is the stand-in for finding F2: stock EKS nodes do not
 # load br_netfilter, and sandboxd refuses to start without it. modprobe runs
 # in a node debug pod against the host's /lib/modules (at /host), because
-# Bottlerocket's host has no shell to chroot into.
+# Bottlerocket's host has no shell to chroot into. The same pod is F7's
+# stand-in: Bottlerocket sets user.max_user_namespaces to 0, which stops
+# gVisor's gofer; a node at 0 gets 62775 (S1 did this by hand), and a node
+# with a value (AL2023) is left as it is.
 # An optional label selector picks the machines (S5's Karpenter machines).
 load_br_netfilter() {
   local sel="${1:-aerolvm.io/pool=phase0}" n d
   for n in $(kubectl get nodes -l "$sel" -o jsonpath='{.items[*].metadata.name}'); do
     kubectl debug "node/$n" --profile=sysadmin --image="$DEBUG_IMAGE" -- \
-      sh -c 'dnf -y -q install kmod >/dev/null && modprobe -d /host br_netfilter && echo "br_netfilter: $(grep -c ^br_netfilter /proc/modules) loaded"' >/dev/null 2>&1 || true
+      sh -c 'dnf -y -q install kmod >/dev/null && modprobe -d /host br_netfilter && echo "br_netfilter: $(grep -c ^br_netfilter /proc/modules) loaded"; if [ "$(cat /proc/sys/user/max_user_namespaces)" = 0 ]; then echo 62775 > /proc/sys/user/max_user_namespaces; fi; echo "user.max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces)"' >/dev/null 2>&1 || true
   done
   sleep 45
   for d in $(kubectl get pods -o name 2>/dev/null | grep node-debugger || true); do
