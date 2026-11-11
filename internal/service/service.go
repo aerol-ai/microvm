@@ -637,6 +637,9 @@ type Service struct {
 	// ownership is the worker's ownership lease and fence
 	// (ownership_lease.go). Zero value: not begun, fences nothing.
 	ownership ownershipLease
+	// ownershipFile writes that lease for the runtime supervisor
+	// (ownership_lease_file.go).
+	ownershipFile ownershipLeaseFile
 
 	// expectedStops tracks sandboxes whose stop was issued by sandboxd
 	// itself (manual API call or lifecycle sweep). The Docker /events
@@ -3337,6 +3340,12 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	}
 	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
 		return err
+	}
+	// A recreate-policy sandbox joins the lease file's fence now, not at the
+	// next read (T3). A channel send that never blocks; the file is written
+	// off this path.
+	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
+		s.kickOwnershipLeaseFile()
 	}
 	// The row is the authority from here on. Complete the lifecycle identity
 	// so audit stamps carry the tenant owner instead of the blank one the

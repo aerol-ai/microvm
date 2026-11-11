@@ -1325,6 +1325,12 @@ type Config struct {
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// OwnershipLeaseFile is where a cluster worker writes its ownership lease
+	// for the runtime supervisor to enforce with sandboxd down
+	// (SB_OWNERSHIP_LEASE_FILE, internal/ownerlease; default empty: not
+	// written). The Kubernetes worker pod sets it on a folder both the
+	// agent and the runtime container mount.
+	OwnershipLeaseFile string
 	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
 	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
 	// Required in cluster mode (Load() refuses to start otherwise). The escape
@@ -2365,6 +2371,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
 		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),

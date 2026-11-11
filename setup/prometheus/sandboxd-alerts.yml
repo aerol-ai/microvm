@@ -67,6 +67,16 @@ groups:
           description: "Workers are dropping out of the scheduler's fresh-capacity set."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
 
+      - alert: SandboxdOwnershipLeaseFileWriteFailing
+        expr: sum by (instance) (increase(aerolvm_ownership_lease_file_write_errors_total[2m])) > 0
+        labels:
+          severity: critical
+          component: cluster
+        annotations:
+          summary: "sandboxd cannot write its ownership lease file"
+          description: "The runtime supervisor freezes this worker's failover.policy=recreate sandboxes when the last lease written to SB_OWNERSHIP_LEASE_FILE runs out (15 s by default), though sandboxd can still reach the leader."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md#control-plane-checks"
+
   - name: sandboxd.create-and-capacity
     interval: 30s
     rules:
