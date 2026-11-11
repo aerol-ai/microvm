@@ -645,6 +645,16 @@ type Config struct {
 	OTELMetricsEnabled  bool
 	OTELMetricsEndpoint string
 	OTELMetricsInterval time.Duration
+	// UsageMetricsEnabled adds per-owner usage counters to /v1/metrics
+	// (plans/kubernetes-v2-architecture.md, C20): each running sandbox's CPU
+	// and memory limit times the time it ran (the charge), and the CPU and
+	// memory measured from its cgroup (shown, never billed). A bank's cost
+	// tool sees one machine-sized worker pod; these counters let it split
+	// that pod's cost by team. Off by default, because owner names become
+	// label values, which an operator should choose to publish; the
+	// Kubernetes chart turns it on. The counters stay on this node and are
+	// sent nowhere. SB_USAGE_METRICS_ENABLED.
+	UsageMetricsEnabled bool
 	// OTELTracesEnabled starts a native OTLP/HTTP trace exporter for API
 	// request spans. It is also enabled automatically when
 	// SB_OTEL_TRACES_ENDPOINT is set.
@@ -2347,6 +2357,7 @@ func load(keyTool bool) (Config, error) {
 		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
 		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		UsageMetricsEnabled:           getEnvBool("SB_USAGE_METRICS_ENABLED", false),
 		OTELTracesEnabled:             getEnvBool("SB_OTEL_TRACES_ENABLED", false),
 		OTELTracesEndpoint:            firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
 		OTELTracesSampleRatio:         getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),

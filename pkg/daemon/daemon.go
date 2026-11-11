@@ -946,6 +946,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// (managed build) and SB_FLEET_LIVE_SAMPLE_INTERVAL > 0; the reserved
 		// axes are emitted from the reconcile/event/netstats loops regardless.
 		svc.StartLiveUsageSampler(ctx)
+		// Per-owner usage counters on /v1/metrics (C20). No-op unless
+		// SB_USAGE_METRICS_ENABLED; sends nothing anywhere either way.
+		svc.StartUsageMetrics(ctx)
 		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
 		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
 		// enable knob is off; per-tick cancellation is wired off ctx like

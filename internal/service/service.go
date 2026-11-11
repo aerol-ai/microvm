@@ -35,6 +35,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/usagemetrics"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -603,6 +604,18 @@ type Service struct {
 	// cursor on the reconcile/event paths. nil/empty unless the live sampler runs.
 	liveMu     sync.Mutex
 	liveCursor map[string]liveSamplePoint
+
+	// usageMeter holds the per-owner usage counters /v1/metrics exports
+	// (usage_metrics.go, C20). nil unless SB_USAGE_METRICS_ENABLED, so the
+	// row-delete hook is one atomic load when the exporter is off. Separate
+	// from usageReporter: it ships nothing anywhere.
+	//
+	// usageCgroupRoot is the cgroup mount the exporter reads ("" is
+	// usagemetrics.DefaultCgroupRoot), and usageDockerStats replaces the
+	// Docker stats call (nil is dockerAux.ContainerStats). Both are for tests.
+	usageMeter       atomic.Pointer[usagemetrics.Meter]
+	usageCgroupRoot  string
+	usageDockerStats liveStatFunc
 
 	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
 	// owner-scoped (user-token) creates before any capacity is reserved. nil on
@@ -4209,6 +4222,9 @@ func (s *Service) deleteSandboxRowAndFenceAudit(ctx context.Context, sandboxID s
 	// part way must not leave a lease minted from the window either.
 	s.invalidateAuditIdentity(sandboxID)
 	s.invalidateAuditOwnershipLease(sandboxID)
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		s.closeUsageMetrics(sandboxID)
+	}
 	return err
 }
 
