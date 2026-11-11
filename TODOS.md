@@ -705,6 +705,95 @@ the skip.
 
 ---
 
+
+## Enforce the ownership lease when sandboxd is down on a VM (cluster correctness, P1)
+
+- **What:** a small host-side lease watchdog (its own systemd unit, outside
+  `sandboxd`'s cgroup) that stops this node's sandboxes when the ownership lease
+  expires without renewal, plus a regression test that keeps `sandboxd` down past
+  the lease and checks no sandbox runs twice.
+- **Why:** the ownership lease (invariant I1, one executor) is enforced only
+  inside `sandboxd` (`internal/service/ownership_lease.go:193-197`). containerd
+  sandboxes are not in `sandboxd`'s unit cgroup, so they outlive it. After 10
+  crashes in 5 minutes systemd stops restarting `sandboxd`
+  (`scripts/install.sh:2826-2827`), and failover then recreates its `recreate`
+  sandboxes elsewhere while the originals keep running. Found by the outside
+  voice in the 2026-11-10 CEO review of `plans/kubernetes-v2-architecture.md`,
+  whose C7 fixes the same hole for pods.
+- **Pros:** closes a real break of a shipped correctness rule; shares its design
+  with the plan's C7 (the `runtime` supervisor's lease check).
+- **Cons:** one more unit on every node; touches the fragile cluster path.
+- **Effort:** human M / CC S. **Priority:** P1.
+- **Depends on:** nothing. Can share code with C7 when the Kubernetes work starts.
+- **Start:** `internal/service/ownership_lease.go` (`StartOwnershipLease`) and
+  the systemd unit in `scripts/install.sh` (around line 2809).
+
+---
+
+## Design a pod mode for banks that refuse privileged pods (Kubernetes, P2)
+
+- **What:** a worker mode where each sandbox is its own Kubernetes pod, made
+  through the Kubernetes API or through agent-sandbox underneath, with
+  AerolVM's API, SDKs, sessions and audit on top.
+- **Why:** `plans/kubernetes-v2-architecture.md` §20 says a bank that refuses
+  privileged pods gets "No worker at all". Spike S9 (§8.7, the worker pod in a
+  Kubernetes user namespace) may remove the privileged pod. If it fails, pod
+  mode is the only way such a bank can run AerolVM.
+- **Pros:** no privileged pod; every Kubernetes tool sees each sandbox.
+- **Cons:** loses the speed and density the plan exists for (option A in §5:
+  seconds to start cold, etcd writes per sandbox, 110 pods per machine); rule
+  K5 does not hold in that mode; egress control needs a new home, because
+  there is no worker firewall.
+- **Effort:** design first, human M / CC S. **Priority:** P2.
+- **Depends on:** spike S9's result. Trigger: a bank refuses privileged pods
+  and S9 fails on its machine image.
+
+---
+
+## Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2)
+
+- **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
+  built, decide (1) where upstream `SandboxTemplate` and `SandboxWarmPool`
+  records live, and (2) which sandboxes `kubectl get sandboxes -n X` shows and
+  what deleting namespace X deletes.
+- **Why:** the 2026-11-10 CEO review (RQ10) moved the facade out of the
+  current phases and added no storage for those records, in Kubernetes or in
+  AerolVM. The founder rule "no facade-specific tables" rules out a
+  Kubernetes-only store inside AerolVM. Upstream puts `SandboxClaim` (one per
+  sandbox) in the same group-version as templates and pools, so the whole
+  group must be served by the aggregated API.
+- **Options seen so far:** internal CRDs in etcd written by the gateways; a new
+  AerolVM FSM kind (breaks the rule); serve only `Sandbox`. On namespaces:
+  show and delete only what was created through the Kubernetes API, or
+  everything the mapped owner has.
+- **Effort:** design only, human S / CC S. **Priority:** P2.
+- **Depends on:** Phase 3 of the Kubernetes plan being done.
+
+---
+
+## Propose a controller-class field upstream in agent-sandbox (Kubernetes, P2)
+
+- **What:** open an issue/KEP in `kubernetes-sigs/agent-sandbox` for a
+  `spec.controllerName` class field (precedent: IngressClass, GatewayClass) so
+  several backends can serve `agents.x-k8s.io` objects in one cluster.
+- **Why:** D5 (`plans/kubernetes-deployment.md`, kept by
+  `plans/kubernetes-v2-architecture.md` §16) makes AerolVM serve the
+  agents.x-k8s.io API in place of the upstream controller, and the chart refuses
+  to install next to it.
+  A customer therefore cannot run upstream gVisor sandboxes and AerolVM
+  sandboxes side by side. A class field removes that for every backend (Mitos
+  included) and puts AerolVM in the upstream conversation.
+- **Pros:** removes the main adoption caveat of the facade; SIG Apps visibility.
+- **Cons:** the upstream timeline is out of our control; design discussion, not code.
+- **Effort:** human S / CC S. **Priority:** P2.
+- **Depends on:** the agent-sandbox API (`plans/kubernetes-v2-architecture.md`,
+  C17, Phase 6, CEO review RQ10) existing, so the proposal can cite a real
+  second backend.
+- **Start:** the agent-sandbox issue tracker; cite GatewayClass
+  `controllerName` semantics.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
