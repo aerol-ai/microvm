@@ -17,9 +17,16 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-name="${1:?usage: s3.sh <name> [--pressure-only]}"
-pressure_only=0
-[[ "${2:-}" == "--pressure-only" ]] && pressure_only=1
+name="${1:?usage: s3.sh <name> [--pressure-only] [--no-keeper]}"
+pressure_only=0 keeper=1
+for a in "${@:2}"; do
+  case "$a" in
+    --pressure-only) pressure_only=1 ;;
+    # sandboxd, not the harness's loop, sets the sandboxes' OOM settings.
+    --no-keeper) keeper=0 ;;
+    *) echo "s3: unknown flag $a" >&2; exit 2 ;;
+  esac
+done
 if [[ "$pressure_only" == 1 ]]; then lib_init "$name" s3-pressure-report.txt; else lib_init "$name" s3-report.txt; fi
 STAGES=(100 500 1000)
 PARALLEL=20
@@ -31,9 +38,11 @@ load_br_netfilter
 # The H0 worker, sized to an m7i.4xlarge and with room for 1,200 network
 # namespaces (the default pool of 256 would otherwise be what S3 measures).
 manifest="$sd/worker-s3.yaml"
-python3 - "$LIB_DIR/manifests/worker-h0.yaml" "$manifest" <<'EOF'
+python3 - "$LIB_DIR/manifests/worker-h0.yaml" "$manifest" "$keeper" <<'EOF'
 import sys
 s = open(sys.argv[1]).read()
+if sys.argv[3] == "0":
+    s = s.replace('        - name: POD_NAME\n', '        - name: AEROL_KEEPER\n          value: "0"\n        - name: POD_NAME\n', 1)
 s = s.replace('requests: { cpu: "3", memory: 12Gi }', 'requests: { cpu: "15", memory: 54Gi }')
 s = s.replace('limits: { cpu: "3", memory: 12Gi }', 'limits: { cpu: "15", memory: 54Gi }')
 s = s.replace('        - name: POD_NAME\n', '        - name: SB_CONTAINERD_NETNS_POOL_SIZE\n          value: "1200"\n        - name: POD_NAME\n', 1)

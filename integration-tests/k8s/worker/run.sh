@@ -17,7 +17,13 @@ if [[ "${AEROL_C7_CGROUP_PARENT:-0}" == 1 ]]; then
   SB_CONTAINERD_CGROUP_PARENT="$(c7_setup)"
   export SB_CONTAINERD_CGROUP_PARENT
   echo "run: C7 on; sandboxes go under ${SB_CONTAINERD_CGROUP_PARENT}"
-  keep_sandboxes_first "/sys/fs/cgroup${SB_CONTAINERD_CGROUP_PARENT}" &
+  # AEROL_KEEPER=0 leaves the OOM settings to sandboxd (F10's fix in
+  # sandboxd, markWholeOOMVictim), to prove it does them alone.
+  if [[ "${AEROL_KEEPER:-1}" == 1 ]]; then
+    keep_sandboxes_first "/sys/fs/cgroup${SB_CONTAINERD_CGROUP_PARENT}" &
+  else
+    echo "run: keeper loop off; sandboxd sets each sandbox's OOM settings"
+  fi
 fi
 
 # S8: containerd's root on the local NVMe, XFS with project quotas.
