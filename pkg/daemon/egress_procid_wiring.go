@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -18,6 +19,43 @@ import (
 
 // lookupGatewayUser resolves the gateway's system user (a seam for tests).
 var lookupGatewayUser = user.Lookup
+
+// gatewayIDs resolves SB_EGRESS_GATEWAY_USER to the gateway's uid and gid.
+// A name is looked up in this machine's user database, where install.sh
+// creates it for the systemd unit. A gateway in its own container (a
+// Kubernetes pod, C6) runs as a user this container's /etc/passwd does not
+// name, so the setting may be the numbers instead: "uid" (the gid is the
+// same) or "uid:gid".
+func gatewayIDs(name string) (uint32, int, error) {
+	uidText, gidText, pair := strings.Cut(name, ":")
+	if _, err := strconv.ParseUint(uidText, 10, 32); err == nil || pair {
+		uid, err := strconv.ParseUint(uidText, 10, 32)
+		if err != nil {
+			return 0, 0, fmt.Errorf("uid %q is not a number", uidText)
+		}
+		if !pair {
+			gidText = uidText
+		}
+		gid, err := strconv.ParseUint(gidText, 10, 32)
+		if err != nil {
+			return 0, 0, fmt.Errorf("gid %q is not a number", gidText)
+		}
+		return uint32(uid), int(gid), nil
+	}
+	u, err := lookupGatewayUser(name)
+	if err != nil {
+		return 0, 0, err
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("uid %q: %w", u.Uid, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("gid %q: %w", u.Gid, err)
+	}
+	return uint32(uid), gid, nil
+}
 
 // startEgressProcid serves the gateway's executable lookups for per-binary
 // rules (P3-3). The gateway runs as an unprivileged user and can't read a
@@ -30,17 +68,9 @@ func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Serv
 	if cfg.EgressProcidSocket == "" {
 		return nil
 	}
-	u, err := lookupGatewayUser(cfg.EgressGatewayUser)
+	uid, gid, err := gatewayIDs(cfg.EgressGatewayUser)
 	if err != nil {
 		return fmt.Errorf("egress gateway user %q: %w", cfg.EgressGatewayUser, err)
-	}
-	uid, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return fmt.Errorf("egress gateway user %q: uid %q: %w", cfg.EgressGatewayUser, u.Uid, err)
-	}
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return fmt.Errorf("egress gateway user %q: gid %q: %w", cfg.EgressGatewayUser, u.Gid, err)
 	}
 	path := cfg.EgressProcidSocket
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -60,7 +90,7 @@ func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Serv
 		return fmt.Errorf("egress procid socket: %w", err)
 	}
 	srv := &procid.Server{
-		Peer: egress.UnixPeerCheck([]uint32{uint32(uid)}, ""),
+		Peer: egress.UnixPeerCheck([]uint32{uid}, ""),
 		Authorize: func(id string) (int, []string, error) {
 			return svc.EgressProcidAuthorize(ctx, id)
 		},

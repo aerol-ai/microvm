@@ -306,7 +306,8 @@ type Config struct {
 	// them off (the rules' flows are then refused).
 	EgressProcidSocket string
 	// EgressGatewayUser is the gateway's system user, the only peer the
-	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER): a name, or "uid" or
+	// "uid:gid" where the gateway runs in a container of its own (C6).
 	EgressGatewayUser string
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
