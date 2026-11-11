@@ -206,6 +206,87 @@ It reads the cluster with your `kubectl`, and makes its two test sandboxes throu
 aerolvm k8s verify --namespace aerolvm
 ```
 
+## Usage per team
+
+The worker pod asks Kubernetes for a whole machine. So a cost tool such as OpenCost or Kubecost sees one big pod, not which team used it. To fill that gap, the server adds four counters per owner to its [`/v1/metrics`](/dashboard/#collect-metrics-with-prometheus). An owner is the team a sandbox belongs to.
+
+| Counter | What it adds up | What it is for |
+|---|---|---|
+| `aerolvm_usage_reserved_cpu_seconds_total` | Each running sandbox's CPU limit, times the seconds it ran | The charge |
+| `aerolvm_usage_reserved_memory_mib_seconds_total` | Each running sandbox's memory limit in MiB, times the seconds it ran | The charge |
+| `aerolvm_usage_consumed_cpu_seconds_total` | The CPU time the sandboxes really used, read from their cgroups | A view only |
+| `aerolvm_usage_consumed_memory_mib_seconds_total` | The memory the sandboxes really held, in MiB, times the seconds | A view only |
+
+Each counter has two labels. `owner` is the team. It is empty for sandboxes made with the main API token. `incarnation` is new each time the server starts.
+
+**Reserved is the charge.** A sandbox's limits block that room on the machine for everyone else, used or not. **Consumed** sits next to it, so a team can see how much of its room it really uses. It never changes the bill.
+
+Good to know:
+
+- **Units, not money.** Your cost tool already knows what each worker pod costs. These counters only say how to split it.
+- **Nothing is sent anywhere.** The counters stay in the pod until your Prometheus reads them. The chart turns them on; set `worker.usageMetrics.enabled=false` to turn them off. A server installed without the chart has them off. Turn them on there with `SB_USAGE_METRICS_ENABLED=true`.
+- **Counters only go up.** When the server restarts, it starts new series with a new `incarnation`, instead of going back to zero.
+- **Only teams with a running sandbox show up.** A team's counters stay for an hour after its last sandbox on that worker stops, then go.
+- **The server samples every 15 seconds.** A sandbox that is deleted between two samples is charged up to the moment it was deleted.
+- **Consumed needs a cgroup per sandbox.** runc and gVisor sandboxes have one. Firecracker, WASM and isolate sandboxes are charged for what they reserve but show no consumed use.
+
+### Add them up in Prometheus
+
+Scrape `/v1/metrics` on every worker pod, as on a server (see [Collect metrics with Prometheus](/dashboard/#collect-metrics-with-prometheus)). Then add these rules. Each one adds up one counter across every worker and every restart. Because each worker keeps its own counters, a restart, a worker that leaves or a new cluster leader loses or double-counts nothing that was scraped.
+
+```yaml title="aerolvm-usage-rules.yml"
+groups:
+  - name: aerolvm-usage
+    rules:
+      # CPUs and MiB each team holds, on average over 5 minutes.
+      - record: owner:aerolvm_usage_reserved_cpu_seconds:rate5m
+        expr: sum by (owner) (rate(aerolvm_usage_reserved_cpu_seconds_total[5m]))
+      - record: owner:aerolvm_usage_reserved_memory_mib_seconds:rate5m
+        expr: sum by (owner) (rate(aerolvm_usage_reserved_memory_mib_seconds_total[5m]))
+      - record: owner:aerolvm_usage_consumed_cpu_seconds:rate5m
+        expr: sum by (owner) (rate(aerolvm_usage_consumed_cpu_seconds_total[5m]))
+      - record: owner:aerolvm_usage_consumed_memory_mib_seconds:rate5m
+        expr: sum by (owner) (rate(aerolvm_usage_consumed_memory_mib_seconds_total[5m]))
+      # A worker whose usage counters stopped moving for 10 minutes.
+      - alert: AerolVMUsageExporterStale
+        expr: time() - aerolvm_usage_last_sample_timestamp_seconds > 600
+        for: 5m
+```
+
+A rate of seconds per second is a count of CPUs (or MiB) held. A worker that Prometheus cannot reach drops out of the sums until it is back. When a team starts its first sandbox on a worker, up to one scrape of its use there can be missed, because `rate()` cannot count a new series' first value.
+
+With many workers and teams, the raw counters add up to many series. Keep the recorded sums for long-term storage, and the raw counters only as long as you need them.
+
+### Split a worker's cost by team
+
+Use this rule for each worker pod, over a window such as one day:
+
+1. **Find each team's CPU share.** Take the team's `aerolvm_usage_reserved_cpu_seconds_total` increase on that pod. Divide it by the larger of these two: the increase for all teams on that pod, or the pod's CPU request times the window's seconds.
+2. **Find each team's memory share** the same way, with `aerolvm_usage_reserved_memory_mib_seconds_total` and the pod's memory request in MiB.
+3. **Charge each team** the pod's CPU cost times its CPU share, plus the pod's memory cost times its memory share.
+4. **Book what is left as idle.** It is room no sandbox reserved, plus the server's own containers. Most cost tools already have an idle line for this; give it to the team that runs AerolVM.
+
+The shares never add up to more than one, so the pod's cost is counted once. The sandboxes are not pods of their own, so the cost tool does not count them a second time.
+
+Here is step 1 in PromQL, for the last day. The pod's request comes from kube-state-metrics, and the `pod` label on AerolVM's counters comes from your scrape setup:
+
+```text title="PromQL"
+# Each team's CPU share of each worker pod over the last day.
+sum by (pod, owner) (increase(aerolvm_usage_reserved_cpu_seconds_total[1d]))
+/ on (pod) group_left
+(
+  # The larger of: all teams' reserved CPU-seconds on the pod ...
+  (
+    sum by (pod) (increase(aerolvm_usage_reserved_cpu_seconds_total[1d]))
+    >= on (pod)
+    86400 * sum by (pod) (kube_pod_container_resource_requests{namespace="aerolvm", resource="cpu"})
+  )
+  # ... or the pod's CPU request times one day.
+  or on (pod)
+  86400 * sum by (pod) (kube_pod_container_resource_requests{namespace="aerolvm", resource="cpu"})
+)
+```
+
 ## Upgrade
 
 A chart upgrade never restarts the worker pod, because that would end every sandbox. To move the server to a new version, change the agent container's image in place. Only that container restarts, and the sandboxes keep running:
@@ -224,6 +305,7 @@ Set these with `--set` or a values file.
 | `worker.defaultRuntime` | The isolation a create gets when it names none: `docker` (runc) or `gvisor`. | runc |
 | `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. `"0"` turns it off. | `"0.10"` |
 | `worker.blockPrivateByDefault` | Sandboxes cannot reach private addresses unless a create allows them. | `true` |
+| `worker.usageMetrics.enabled` | [Usage per team](#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |
 | `worker.containerdVolume` | Where images and sandbox files live. Use a local disk for real work. | an `emptyDir` |
 | `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. | none |
 | `apiToken.existingSecret` | Use your own token Secret (key `SB_PAT_TOKEN`) instead of the one the chart makes. | none |

@@ -46,6 +46,15 @@ worker:
   # Sandboxes cannot reach private addresses unless a create allows them
   # (C24): a bank's network is not one connection away.
   blockPrivateByDefault: true
+  # Per-team usage on the agent's /v1/metrics (C20): each owner's reserved
+  # CPU and memory over time (the charge) and its measured use (shown,
+  # never billed). The worker pod asks for a whole machine, so a cost tool
+  # sees one big pod; Prometheus sums these by owner, and the cost tool
+  # splits the pod's cost by those shares. Nothing is sent anywhere: the
+  # numbers leave the pod only when Prometheus scrapes it. Owner names
+  # become label values; set false to keep them off /v1/metrics.
+  usageMetrics:
+    enabled: true
   # Any other sandboxd setting, as SB_NAME: value.
   extraEnv: {}
 

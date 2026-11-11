@@ -142,6 +142,9 @@ spec:
             - { name: SB_DOCKER_ENABLED, value: "false" }
             - { name: SB_DISK_FLOOR_RATIO, value: {{ .Values.worker.diskFloorRatio | quote }} }
             - { name: SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, value: {{ .Values.worker.blockPrivateByDefault | quote }} }
+            # Per-owner usage counters on /v1/metrics (C20), read from each
+            # sandbox's cgroup under SB_CONTAINERD_CGROUP_PARENT.
+            - { name: SB_USAGE_METRICS_ENABLED, value: {{ .Values.worker.usageMetrics.enabled | quote }} }
             # The egress container's user, by number (C6).
             - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
             {{- with .Values.worker.defaultRuntime }}
