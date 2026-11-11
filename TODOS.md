@@ -12,44 +12,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A partitioned node keeps serving: /health ignores cluster membership (readiness gap)
-
-- **What:** a node with no Raft leader, or that is not a Raft member, still
-  answers `/health` with 200, so the ingress keeps routing traffic to it and
-  every request that lands there fails.
-- **Status (2026-10-06):** still open. `handleHealth`
-  (`pkg/api/server.go:146`) answers 200 unless `Service.Health` errors.
-  `Service.Health` (`internal/service/service.go:4434`) only marks the body
-  `"degraded"` for runtime, Caddy, SSH or topology faults
-  (`clusterTopologyErrorFor`, `:4543-4555`), never for "no raft leader" or
-  "not a raft member". No `/ready` route exists anywhere in `pkg/`,
-  `internal/` or `cmd/`.
-- **Measured** (S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). node1 was
-  `active`, `NRestarts=0`, and `/health` = 200, while the cluster's member
-  list held only node2 and node3, node1's own list held only node1, and node1
-  was stuck `entering candidate state`. About one request in three failed
-  across the run (4 of 5 calls to S4's `/v1/audit/verify` returned 502),
-  mostly `cluster: reserve placement failed: cluster: not raft leader`.
-  That partition's cause was the restarted-seed bug, now fixed (see Done).
-  This gap is what turned it into user-visible errors, and it will do the
-  same for any other way a node falls out of the cluster.
-- **Why it matters most:** every one of those reds looks like a bug in
-  whatever test happened to run. A cluster that is degraded but advertising
-  itself as healthy costs the most debugging time per incident.
-- **The fix needs design, not a one-liner.** Failing `/health` when there is
-  no leader would take the whole cluster out of rotation during any routine
-  election. It needs readiness distinct from liveness, a grace period so
-  elections do not flap it, and a decision about whether a partitioned node
-  should still serve reads.
-- **Design exists, unmerged:** PR #522 (branch
-  `origin/plans/kubernetes-ceo-review`) designs `/ready` (decision D8, §5.4:
-  503 when not a Raft member, with an election grace window). The plan on
-  `main` (`plans/kubernetes-deployment.md:146-148`) still says `/health`
-  backs the readiness probe.
-- **Start:** `pkg/api/server.go` health handler, `cfg.EnableCluster` gating,
-  the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
-  PR #522 design.
-
 ## The snapshot list is node-local on a cluster (API)
 
 `GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
@@ -708,6 +670,30 @@ the skip.
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### A partitioned node keeps serving: /health ignores cluster membership (readiness gap) — FIXED
+
+- **Was:** a node with no raft leader, or not a raft member, still
+  answered `/health` with 200, so the ingress kept routing traffic to it
+  and every request that landed there failed (about one request in three
+  in S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). Failing `/health`
+  instead would have taken the whole cluster out of rotation during any
+  election.
+- **Fix:** a separate `GET /ready` (Kubernetes v2 plan C1, the first
+  plan's decision D8): `Service.Ready` (`internal/service/ready.go`) is
+  `Health` on a single node; in cluster mode it is 503 when this server is
+  not in the raft configuration or the node has had no proof of a working
+  control plane for longer than `SB_READY_LEADER_GRACE` (10 s, above an
+  election). The proof is `cluster.ControlPlaneContact`
+  (`internal/cluster/readiness.go`): the leader, a follower's last leader
+  contact, or an agent's last successful control-plane call (one shared
+  `Leader` probe when that is older than 6 s). `/health` is unchanged.
+- **Tests:** `TestClusterControlPlaneContact`,
+  `TestAgentControlPlaneContact`, `TestReadinessAgainstRealRaft` in
+  `internal/cluster/readiness_test.go`; `TestServiceReady`;
+  `TestReadyRoute`.
+- **Residual:** nothing probes `/ready` yet: the Kubernetes chart (P3) and
+  the VM installer's `--lb-health-port`, which still serves `/health`.
 
 ### L4 splice drops the response after a client half-close — FIXED (egress P1-0)
 
