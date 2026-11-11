@@ -6,9 +6,10 @@
 #
 # Built by scripts/build-images.sh: the context holds <arch>/aerolvm-supervisor
 # from the release build, and versions.env's pins arrive as build args.
-ARG DEBIAN_IMAGE
+# The base is pinned by its multi-arch index digest right here, where
+# Scorecard and Dependabot read it (a FROM ${ARG} hides the pin from both).
 
-FROM ${DEBIAN_IMAGE} AS fetch
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS fetch
 ARG TARGETARCH
 ARG CONTAINERD_VERSION
 ARG CONTAINERD_SHA256_AMD64
@@ -49,7 +50,7 @@ RUN set -eu; \
       find "$(dirname "$runsc")/gvisor-bin" -maxdepth 1 -type f -exec install -m 0755 {} /out/gvisor-bin/ \; ; \
     fi
 
-FROM ${DEBIAN_IMAGE}
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG TARGETARCH
 ARG VERSION=dev
 ARG REVISION=unknown

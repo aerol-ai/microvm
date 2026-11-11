@@ -13,8 +13,8 @@ import (
 // containerd, runc, gVisor and the CNI plugins at build time. A pin with a
 // hash for one CPU type only would build amd64 and fail arm64 at release
 // time, and an unpinned base image would change under a tag. These checks
-// keep packaging/images/versions.env, the Dockerfiles, the build script and
-// the release job in step.
+// keep packaging/images/versions.env, the Dockerfiles' pinned bases, the
+// build script and the release job in step.
 
 func readVersionsEnv(t *testing.T, root string) map[string]string {
 	t.Helper()
@@ -62,14 +62,13 @@ func TestKubernetesImagePins(t *testing.T) {
 			}
 		}
 	}
-	for _, base := range []string{"DEBIAN_IMAGE", "DISTROLESS_IMAGE"} {
-		if !regexp.MustCompile(`@sha256:[0-9a-f]{64}$`).MatchString(pins[base]) {
-			t.Errorf("%s = %q, want a reference pinned by digest", base, pins[base])
-		}
-	}
-
 	argRE := regexp.MustCompile(`(?m)^ARG ([A-Z0-9_]+)`)
 	fromRE := regexp.MustCompile(`(?m)^FROM (\S+)`)
+	// The base sits in the FROM line itself, pinned by its multi-arch index
+	// digest: Scorecard and Dependabot read FROM lines, and a FROM ${ARG}
+	// hides the pin from both. One base keeps one digest in every file.
+	pinnedRE := regexp.MustCompile(`^([a-z0-9./-]+:[A-Za-z0-9._-]+)@sha256:[0-9a-f]{64}$`)
+	digestOf := map[string]string{}
 	script, err := os.ReadFile(filepath.Join(root, "scripts", "build-images.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -93,9 +92,15 @@ func TestKubernetesImagePins(t *testing.T) {
 			}
 		}
 		for _, m := range fromRE.FindAllStringSubmatch(string(raw), -1) {
-			if m[1] != "${DEBIAN_IMAGE}" && m[1] != "${DISTROLESS_IMAGE}" {
-				t.Errorf("%s: FROM %s is not a pinned base from versions.env", file, m[1])
+			pin := pinnedRE.FindStringSubmatch(m[1])
+			if pin == nil {
+				t.Errorf("%s: FROM %s is not an image:tag pinned by digest", file, m[1])
+				continue
 			}
+			if prev, ok := digestOf[pin[1]]; ok && prev != m[1] {
+				t.Errorf("%s: FROM %s, but another image builds on %s", file, m[1], prev)
+			}
+			digestOf[pin[1]] = m[1]
 		}
 	}
 }

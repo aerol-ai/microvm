@@ -21,6 +21,9 @@ updates:
   - package-ecosystem: "docker"
     directories:
       - "/images/*"
+      # The Kubernetes images' bases (aerolvm, -runtime, -edge): each FROM
+      # is a tag pinned by digest, and Dependabot moves the digest.
+      - "/packaging/images"
     schedule:
       interval: "weekly"
     ignore:

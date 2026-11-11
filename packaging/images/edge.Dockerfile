@@ -6,9 +6,10 @@
 # connection. Static, so it runs on distroless as a non-root user.
 #
 # Built by scripts/build-images.sh from the release build's <arch>/caddy.
-ARG DISTROLESS_IMAGE
+# The base is pinned by its multi-arch index digest right here, where
+# Scorecard and Dependabot read it (a FROM ${ARG} hides the pin from both).
 
-FROM ${DISTROLESS_IMAGE}
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG TARGETARCH
 ARG VERSION=dev
 ARG REVISION=unknown
