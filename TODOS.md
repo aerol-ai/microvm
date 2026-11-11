@@ -12,44 +12,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A partitioned node keeps serving: /health ignores cluster membership (readiness gap)
-
-- **What:** a node with no Raft leader, or that is not a Raft member, still
-  answers `/health` with 200, so the ingress keeps routing traffic to it and
-  every request that lands there fails.
-- **Status (2026-10-06):** still open. `handleHealth`
-  (`pkg/api/server.go:146`) answers 200 unless `Service.Health` errors.
-  `Service.Health` (`internal/service/service.go:4434`) only marks the body
-  `"degraded"` for runtime, Caddy, SSH or topology faults
-  (`clusterTopologyErrorFor`, `:4543-4555`), never for "no raft leader" or
-  "not a raft member". No `/ready` route exists anywhere in `pkg/`,
-  `internal/` or `cmd/`.
-- **Measured** (S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). node1 was
-  `active`, `NRestarts=0`, and `/health` = 200, while the cluster's member
-  list held only node2 and node3, node1's own list held only node1, and node1
-  was stuck `entering candidate state`. About one request in three failed
-  across the run (4 of 5 calls to S4's `/v1/audit/verify` returned 502),
-  mostly `cluster: reserve placement failed: cluster: not raft leader`.
-  That partition's cause was the restarted-seed bug, now fixed (see Done).
-  This gap is what turned it into user-visible errors, and it will do the
-  same for any other way a node falls out of the cluster.
-- **Why it matters most:** every one of those reds looks like a bug in
-  whatever test happened to run. A cluster that is degraded but advertising
-  itself as healthy costs the most debugging time per incident.
-- **The fix needs design, not a one-liner.** Failing `/health` when there is
-  no leader would take the whole cluster out of rotation during any routine
-  election. It needs readiness distinct from liveness, a grace period so
-  elections do not flap it, and a decision about whether a partitioned node
-  should still serve reads.
-- **Design exists, unmerged:** PR #522 (branch
-  `origin/plans/kubernetes-ceo-review`) designs `/ready` (decision D8, §5.4:
-  503 when not a Raft member, with an election grace window). The plan on
-  `main` (`plans/kubernetes-deployment.md:146-148`) still says `/health`
-  backs the readiness probe.
-- **Start:** `pkg/api/server.go` health handler, `cfg.EnableCluster` gating,
-  the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
-  PR #522 design.
-
 ## The snapshot list is node-local on a cluster (API)
 
 `GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
@@ -705,9 +667,125 @@ the skip.
 
 ---
 
+
+## Enforce the ownership lease when sandboxd is down on a VM (cluster correctness, P1)
+
+- **What:** a small host-side lease watchdog (its own systemd unit, outside
+  `sandboxd`'s cgroup) that stops this node's sandboxes when the ownership lease
+  expires without renewal, plus a regression test that keeps `sandboxd` down past
+  the lease and checks no sandbox runs twice.
+- **Why:** the ownership lease (invariant I1, one executor) is enforced only
+  inside `sandboxd` (`internal/service/ownership_lease.go:193-197`). containerd
+  sandboxes are not in `sandboxd`'s unit cgroup, so they outlive it. After 10
+  crashes in 5 minutes systemd stops restarting `sandboxd`
+  (`scripts/install.sh:2826-2827`), and failover then recreates its `recreate`
+  sandboxes elsewhere while the originals keep running. Found by the outside
+  voice in the 2026-11-10 CEO review of `plans/kubernetes-v2-architecture.md`,
+  whose C7 fixes the same hole for pods.
+- **Pros:** closes a real break of a shipped correctness rule; shares its design
+  with the plan's C7 (the `runtime` supervisor's lease check).
+- **Cons:** one more unit on every node; touches the fragile cluster path.
+- **Effort:** human M / CC S. **Priority:** P1.
+- **Depends on:** nothing. Can share code with C7 when the Kubernetes work starts.
+- **Start:** `internal/service/ownership_lease.go` (`StartOwnershipLease`) and
+  the systemd unit in `scripts/install.sh` (around line 2809). C7's T3 built
+  the pod version to reuse: sandboxd writes `SB_OWNERSHIP_LEASE_FILE`
+  (`internal/ownerlease`), and `internal/supervisor/lease.go` (`LeaseGuard`)
+  freezes `<cgroup parent>/<ref>` when it runs out and thaws only on proof.
+
+---
+
+## Design a pod mode for banks that refuse privileged pods (Kubernetes, P2)
+
+- **What:** a worker mode where each sandbox is its own Kubernetes pod, made
+  through the Kubernetes API or through agent-sandbox underneath, with
+  AerolVM's API, SDKs, sessions and audit on top.
+- **Why:** `plans/kubernetes-v2-architecture.md` §20 says a bank that refuses
+  privileged pods gets "No worker at all". Spike S9 (§8.7, the worker pod in a
+  Kubernetes user namespace) may remove the privileged pod. If it fails, pod
+  mode is the only way such a bank can run AerolVM.
+- **Pros:** no privileged pod; every Kubernetes tool sees each sandbox.
+- **Cons:** loses the speed and density the plan exists for (option A in §5:
+  seconds to start cold, etcd writes per sandbox, 110 pods per machine); rule
+  K5 does not hold in that mode; egress control needs a new home, because
+  there is no worker firewall.
+- **Effort:** design first, human M / CC S. **Priority:** P2.
+- **Depends on:** spike S9's result. Trigger: a bank refuses privileged pods
+  and S9 fails on its machine image.
+
+---
+
+## Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2)
+
+- **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
+  built, decide (1) where upstream `SandboxTemplate` and `SandboxWarmPool`
+  records live, and (2) which sandboxes `kubectl get sandboxes -n X` shows and
+  what deleting namespace X deletes.
+- **Why:** the 2026-11-10 CEO review (RQ10) moved the facade out of the
+  current phases and added no storage for those records, in Kubernetes or in
+  AerolVM. The founder rule "no facade-specific tables" rules out a
+  Kubernetes-only store inside AerolVM. Upstream puts `SandboxClaim` (one per
+  sandbox) in the same group-version as templates and pools, so the whole
+  group must be served by the aggregated API.
+- **Options seen so far:** internal CRDs in etcd written by the gateways; a new
+  AerolVM FSM kind (breaks the rule); serve only `Sandbox`. On namespaces:
+  show and delete only what was created through the Kubernetes API, or
+  everything the mapped owner has.
+- **Effort:** design only, human S / CC S. **Priority:** P2.
+- **Depends on:** Phase 3 of the Kubernetes plan being done.
+
+---
+
+## Propose a controller-class field upstream in agent-sandbox (Kubernetes, P2)
+
+- **What:** open an issue/KEP in `kubernetes-sigs/agent-sandbox` for a
+  `spec.controllerName` class field (precedent: IngressClass, GatewayClass) so
+  several backends can serve `agents.x-k8s.io` objects in one cluster.
+- **Why:** D5 (`plans/kubernetes-deployment.md`, kept by
+  `plans/kubernetes-v2-architecture.md` §16) makes AerolVM serve the
+  agents.x-k8s.io API in place of the upstream controller, and the chart refuses
+  to install next to it.
+  A customer therefore cannot run upstream gVisor sandboxes and AerolVM
+  sandboxes side by side. A class field removes that for every backend (Mitos
+  included) and puts AerolVM in the upstream conversation.
+- **Pros:** removes the main adoption caveat of the facade; SIG Apps visibility.
+- **Cons:** the upstream timeline is out of our control; design discussion, not code.
+- **Effort:** human S / CC S. **Priority:** P2.
+- **Depends on:** the agent-sandbox API (`plans/kubernetes-v2-architecture.md`,
+  C17, Phase 6, CEO review RQ10) existing, so the proposal can cite a real
+  second backend.
+- **Start:** the agent-sandbox issue tracker; cite GatewayClass
+  `controllerName` semantics.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### A partitioned node keeps serving: /health ignores cluster membership (readiness gap) — FIXED
+
+- **Was:** a node with no raft leader, or not a raft member, still
+  answered `/health` with 200, so the ingress kept routing traffic to it
+  and every request that landed there failed (about one request in three
+  in S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). Failing `/health`
+  instead would have taken the whole cluster out of rotation during any
+  election.
+- **Fix:** a separate `GET /ready` (Kubernetes v2 plan C1, the first
+  plan's decision D8): `Service.Ready` (`internal/service/ready.go`) is
+  `Health` on a single node; in cluster mode it is 503 when this server is
+  not in the raft configuration or the node has had no proof of a working
+  control plane for longer than `SB_READY_LEADER_GRACE` (10 s, above an
+  election). The proof is `cluster.ControlPlaneContact`
+  (`internal/cluster/readiness.go`): the leader, a follower's last leader
+  contact, or an agent's last successful control-plane call (one shared
+  `Leader` probe when that is older than 6 s). `/health` is unchanged.
+- **Tests:** `TestClusterControlPlaneContact`,
+  `TestAgentControlPlaneContact`, `TestReadinessAgainstRealRaft` in
+  `internal/cluster/readiness_test.go`; `TestServiceReady`;
+  `TestReadyRoute`.
+- **Residual:** nothing probes `/ready` yet: the Kubernetes chart (P3) and
+  the VM installer's `--lb-health-port`, which still serves `/health`.
 
 ### L4 splice drops the response after a client half-close — FIXED (egress P1-0)
 

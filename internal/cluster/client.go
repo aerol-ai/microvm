@@ -44,6 +44,9 @@ type Cluster struct {
 	// leaderContactHook stands in for raft's state and last-leader-contact
 	// time in tests (stale_read.go). Always nil in production.
 	leaderContactHook func() (raft.RaftState, time.Time)
+	// raftMemberHook stands in for the raft configuration lookup in
+	// readiness tests (readiness.go). Always nil in production.
+	raftMemberHook func() bool
 
 	// patToken is the bearer this node's own peer calls carry:
 	// cfg.ClusterPeerPAT(), the operator PAT when the node holds it. A node

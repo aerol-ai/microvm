@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/internal/network/cni"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -35,6 +34,13 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		svc.SetEventsSource(dockerClient)
 		return nil, nil
 	}
+	// A configured cgroup parent must be able to hold sandboxes with their
+	// limits before any is created; refuse to start otherwise (plan C7).
+	if cfg.ContainerdCgroupParent != "" {
+		if err := cntr.CheckCgroupParent(cntr.CgroupRoot, cfg.ContainerdCgroupParent); err != nil {
+			return nil, fmt.Errorf("containerd cgroup parent: %w", err)
+		}
+	}
 	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
 	// never collide with the docker driver's DOCKER-USER rules on a
 	// mixed-engine (migrating) host. EnsureChain bootstraps the chain and
@@ -46,7 +52,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	// dockerd sets FORWARD policy to DROP and only ACCEPTs docker0; our aerolvm0
 	// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
 	// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
-	ctdRules.SetBridgeSubnet(cni.DefaultBridgeSubnet)
+	ctdRules.SetBridgeSubnet(containerdBridgeSubnet(cfg))
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
@@ -63,11 +69,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	warmPool := wireContainerdWarmPool(ctx, cfg, logger, driver, admitter)
 	svc.SetContainerdRuntime(driver)
-	if dockerClient != nil {
-		svc.SetEventsSource(newMultiEventsSource(logger, dockerClient, driver))
-	} else {
-		svc.SetEventsSource(driver)
-	}
+	svc.SetEventsSource(containerdEventsSource(cfg, logger, dockerClient, driver))
 	logger.Info("containerd engine enabled",
 		"socket", cfg.ContainerdSocket,
 		"namespace", cfg.ContainerdNamespace,
@@ -232,4 +234,16 @@ func (m *multiEventsSource) ContainerPID(ctx context.Context, containerRef strin
 	// running here" — never re-invoke a source (the old code double-called
 	// sources[0], doubling a failed RPC).
 	return 0, firstErr
+}
+
+// containerdEventsSource is the containerd engine's event source: Docker's
+// and containerd's streams together while both engines may own sandboxes on
+// the host, or containerd's alone when there is no Docker client or Docker
+// is off (SB_DOCKER_ENABLED=false, C2), where a Docker stream would only
+// fail and be retried forever.
+func containerdEventsSource(cfg config.Config, logger *slog.Logger, dockerClient *docker.Client, driver docker.EventsSource) docker.EventsSource {
+	if dockerClient != nil && !cfg.DockerDisabled {
+		return newMultiEventsSource(logger, dockerClient, driver)
+	}
+	return driver
 }

@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -184,6 +186,14 @@ type Config struct {
 	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
 	// mode). Sandboxes are default-denied from the node they run on.
 	SandboxNodePortsAllow []SandboxNodePort
+	// SandboxNodeIngressClosed keeps 80 and 443 closed to sandboxes on an
+	// ingress node (SB_SANDBOX_NODE_INGRESS=false; default open). On a
+	// server the internet reaches those ports on its own address anyway, so
+	// a sandbox may too. In a Kubernetes pod the internet reaches them
+	// through a Service, and a sandbox's own traffic to the public name
+	// leaves the pod; a direct path would skip the private-range block when
+	// that Service is internal (C24).
+	SandboxNodeIngressClosed bool
 	// DiskLimitCheckInterval is how often the disk watchdog checks each
 	// container sandbox's writable layer against its DiskGB
 	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
@@ -206,12 +216,26 @@ type Config struct {
 	// ContainerdRunDir is the host workdir for per-sandbox host files
 	// (resolv.conf, hosts, task logs). SB_CONTAINERD_RUN_DIR.
 	ContainerdRunDir string
+	// ContainerdCgroupParent, when set, is the cgroup (a path under the
+	// cgroup v2 root, e.g. a Kubernetes worker pod's own group) that every
+	// containerd-engine sandbox's cgroup is made under, as <parent>/<id>.
+	// Unset keeps containerd's default, /<namespace>/<id> at the root of the
+	// machine's tree. Inside a Kubernetes pod that default puts sandboxes
+	// outside the pod's CPU and memory box (plans/kubernetes-v2-architecture.md
+	// §8.3, C7; seen live in Phase 0 spike S1). SB_CONTAINERD_CGROUP_PARENT.
+	ContainerdCgroupParent string
 	// ContainerdLogDir overrides per-task log file placement; defaults to
 	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
 	ContainerdLogDir string
 	// ContainerdNativeNetnsPoolEnabled gates the CNI-backed native netns pool
 	// for containerd creates (Phase 2). Default off — dockerd path unchanged.
 	ContainerdNativeNetnsPoolEnabled bool
+	// ContainerdDiskQuota enforces each sandbox's DiskGB as an XFS project
+	// quota on its writable layer (C27 in plans/kubernetes-v2-architecture.md,
+	// proven by spike S8). containerd's snapshots must sit on XFS mounted with
+	// prjquota, on a volume nothing else uses project IDs on: a sandbox's
+	// project ID is its overlay snapshot's number. SB_CONTAINERD_DISK_QUOTA.
+	ContainerdDiskQuota bool
 	// ContainerdNetnsPoolDepth is the number of slots the refiller keeps
 	// pre-realized (CNI ADD done) for a fast warm-hit create. It is the WARM
 	// target, NOT the total capacity — see ContainerdNetnsPoolSize.
@@ -230,6 +254,12 @@ type Config struct {
 	ContainerdCNIPluginDir string
 	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
 	ContainerdCNIConfPath string
+	// ContainerdBridgeSubnet is the IPv4 range containerd sandboxes get
+	// their addresses from (C3: a bank network may already use 10.88.0.0/16).
+	// SB_CONTAINERD_BRIDGE_SUBNET. Empty here means "not set"; the daemon
+	// resolves it at boot against the conflist (resolveContainerdBridgeSubnet)
+	// and every user reads the resolved value.
+	ContainerdBridgeSubnet string
 	// ContainerdBuildKitAddr is the buildkitd control socket used for image
 	// builds on the containerd engine (buildctl --addr). The bootstrap installs
 	// buildkitd at the default socket with a containerd worker on the aerolvm
@@ -284,7 +314,8 @@ type Config struct {
 	// them off (the rules' flows are then refused).
 	EgressProcidSocket string
 	// EgressGatewayUser is the gateway's system user, the only peer the
-	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER): a name, or "uid" or
+	// "uid:gid" where the gateway runs in a container of its own (C6).
 	EgressGatewayUser string
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
@@ -360,6 +391,11 @@ type Config struct {
 	// TLSIssuer selects the on-demand policy's issuer (SB_TLS_ISSUER):
 	// "acme" (default) or "internal", Caddy's own CA, for labs.
 	TLSIssuer string
+	// TLSCertWatchFile is a certificate Caddy loads from a file, watched for
+	// changes so Caddy reloads it (SB_TLS_CERT_WATCH_FILE). On Kubernetes,
+	// cert-manager renews the sandbox-link wildcard into a mounted Secret
+	// and Caddy does not watch files (C25). Empty: no watch.
+	TLSCertWatchFile string
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's
 	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
@@ -522,6 +558,16 @@ type Config struct {
 	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
 	// SB_DOCKER_POOL_ENABLED.
 	DockerPoolEnabled bool
+	// DockerDisabled is true on a containerd-engine host with no Docker at
+	// all, such as a Kubernetes worker pod (SB_DOCKER_ENABLED=false; the
+	// default is enabled; Kubernetes v2 plan C2). Then sandboxd never
+	// pings, lists, watches or firewalls Docker: /health reports it
+	// "disabled" instead of degraded, reconcile and the egress floor leave
+	// it out, and the event stream is containerd's alone. Only valid with
+	// the containerd engine, and not with the Docker warm or
+	// network-namespace pools. Named for the off state so a Config built in
+	// code (tests) keeps Docker on.
+	DockerDisabled bool
 	// DockerPoolDepth is warm slots per image key. SB_DOCKER_POOL_DEPTH.
 	DockerPoolDepth int
 	// DockerPoolImages is a comma-separated list of pinned warm targets.
@@ -629,6 +675,14 @@ type Config struct {
 	// budget when the host filesystem is larger than the sandbox pool.
 	DiskReservationRatio float64
 	HostDiskGB           int
+	// DiskFloorRatio refuses new creates (503 + Retry-After) while the
+	// sandbox volume has less than this share of its space free, so one
+	// sandbox filling the disk cannot take the images, the database and
+	// every other sandbox down with it (C27 in
+	// plans/kubernetes-v2-architecture.md). 0 turns it off. DiskFloorPath
+	// names the volume; empty means the container engine's data folder.
+	DiskFloorRatio float64
+	DiskFloorPath  string
 	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
 	// Docker via nvidia-container-runtime / amdgpu / etc. Used by placement
 	// scheduling so a GPU sandbox is never forwarded to a GPU-less peer.
@@ -1156,6 +1210,18 @@ type Config struct {
 	// EnableCluster=false — single-node mode is implicitly "mixed".
 	NodeRole string
 	NodeID   string
+	// CellID is the cell this node's sandboxes belong to, 1 to 255
+	// (SB_CELL_ID, default 1). New sandbox IDs carry it in their first two
+	// hex digits, so once there is more than one cell a gateway can route
+	// an ID without a lookup (plans/kubernetes-v2-architecture.md §12.3,
+	// C12). Every node of one cluster is one cell and must share it.
+	CellID int
+	// ReadyLeaderGrace is how long a cluster node may go without proof of a
+	// working control plane before /ready answers 503 (SB_READY_LEADER_GRACE,
+	// default 10 s: above a normal raft election, so one does not take a
+	// node out of rotation). Kubernetes probes /ready to stop sending a
+	// cut-off node traffic (Kubernetes v2 plan C1).
+	ReadyLeaderGrace time.Duration
 	// NodeName is the operator-friendly label gossiped to peers and shown on
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
@@ -1272,6 +1338,12 @@ type Config struct {
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// OwnershipLeaseFile is where a cluster worker writes its ownership lease
+	// for the runtime supervisor to enforce with sandboxd down
+	// (SB_OWNERSHIP_LEASE_FILE, internal/ownerlease; default empty: not
+	// written). The Kubernetes worker pod sets it on a folder both the
+	// agent and the runtime container mount.
+	OwnershipLeaseFile string
 	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
 	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
 	// Required in cluster mode (Load() refuses to start otherwise). The escape
@@ -2137,18 +2209,21 @@ func load(keyTool bool) (Config, error) {
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
 		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		SandboxNodeIngressClosed:          !getEnvBool("SB_SANDBOX_NODE_INGRESS", true),
 		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
+		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
 		ContainerdNetnsPoolSize:           getEnvInt("SB_CONTAINERD_NETNS_POOL_SIZE", 256),
 		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
+		ContainerdBridgeSubnet:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
 		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
 		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
@@ -2184,6 +2259,7 @@ func load(keyTool bool) (Config, error) {
 		TLSACMECA:                         strings.TrimSpace(getEnv("SB_TLS_ACME_CA", "")),
 		TLSACMECARoot:                     strings.TrimSpace(getEnv("SB_TLS_ACME_CA_ROOT", "")),
 		TLSIssuer:                         strings.ToLower(strings.TrimSpace(getEnv("SB_TLS_ISSUER", TLSIssuerACME))),
+		TLSCertWatchFile:                  strings.TrimSpace(os.Getenv("SB_TLS_CERT_WATCH_FILE")),
 		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
 		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
 		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
@@ -2274,6 +2350,7 @@ func load(keyTool bool) (Config, error) {
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
 		DiskReservationRatio:      getEnvFloat("SB_DISK_RESERVATION_RATIO", 0),
 		HostDiskGB:                getEnvInt("SB_HOST_DISK_GB", 0),
+		DiskFloorPath:             strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_PATH")),
 		HostGPUCount:              getEnvInt("SB_HOST_GPU_COUNT", 0),
 		HostGPUVendor:             strings.ToLower(strings.TrimSpace(os.Getenv("SB_HOST_GPU_VENDOR"))),
 		HostSupportedRuntimes:     splitAndTrim(os.Getenv("SB_HOST_RUNTIMES"), ","),
@@ -2309,6 +2386,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
 		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
@@ -2583,6 +2661,11 @@ func load(keyTool bool) (Config, error) {
 	if cfg.ExecOutputMaxBytes > 0 && cfg.ExecOutputDefaultBytes > cfg.ExecOutputMaxBytes {
 		return Config{}, fmt.Errorf("SB_EXEC_OUTPUT_DEFAULT_BYTES (%d) must not exceed SB_EXEC_OUTPUT_MAX_BYTES (%d)", cfg.ExecOutputDefaultBytes, cfg.ExecOutputMaxBytes)
 	}
+	diskFloorRatio, err := loadDiskFloorRatio()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DiskFloorRatio = diskFloorRatio
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
 	}
@@ -2716,12 +2799,28 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)
 	}
 	cfg.ContainerEngine = resolvedEngine
+	if cfg.ContainerdDiskQuota, err = loadContainerdDiskQuota(cfg.ContainerEngine); err != nil {
+		return Config{}, err
+	}
+	if err := validateBridgeSubnet(cfg.ContainerdBridgeSubnet); err != nil {
+		return Config{}, err
+	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if strings.TrimSpace(cfg.ContainerdSocket) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_SOCKET is required when SB_CONTAINER_ENGINE=containerd")
 		}
 		if strings.TrimSpace(cfg.ContainerdNamespace) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_NAMESPACE is required when SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if p := cfg.ContainerdCgroupParent; p != "" {
+		// A relative or unclean path would be joined onto whatever the
+		// runtime treats as its base; refuse it rather than guess.
+		if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" {
+			return Config{}, fmt.Errorf("SB_CONTAINERD_CGROUP_PARENT must be a clean absolute cgroup path below the root, got %q", p)
+		}
+		if cfg.ContainerEngine != models.ContainerEngineContainerd {
+			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT needs SB_CONTAINER_ENGINE=containerd")
 		}
 	}
 
@@ -3145,6 +3244,15 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadCellID(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadReadyLeaderGrace(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadDockerEnabled(); err != nil {
 		return Config{}, err
 	}
 	if err := validateSandboxTokens(&cfg); err != nil {
@@ -3644,6 +3752,57 @@ func checkClusterCredentialKey(cfg Config) error {
 	return nil
 }
 
+// loadCellID reads SB_CELL_ID strictly: a value that is not a number from
+// 1 to 255 stops the boot. getEnvInt's quiet fall back to the default
+// would put a node with a typo in cell 1, and its IDs in the wrong cell.
+func (c *Config) loadCellID() error {
+	c.CellID = 1
+	v := strings.TrimSpace(os.Getenv("SB_CELL_ID"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 255 {
+		return fmt.Errorf("SB_CELL_ID must be a cell number from 1 to 255, got %q", v)
+	}
+	c.CellID = n
+	return nil
+}
+
+// loadDockerEnabled reads SB_DOCKER_ENABLED strictly and refuses the
+// settings that need Docker when it is off: the Docker engine itself, and
+// the Docker warm and network-namespace pools.
+func (c *Config) loadDockerEnabled() error {
+	c.DockerDisabled = false
+	v := strings.TrimSpace(os.Getenv("SB_DOCKER_ENABLED"))
+	if v == "" {
+		return nil
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("SB_DOCKER_ENABLED must be true or false, got %q", v)
+	}
+	c.DockerDisabled = !on
+	if on {
+		return nil
+	}
+	if models.ResolveContainerEngineOrDocker(c.ContainerEngine) != models.ContainerEngineContainerd {
+		return errors.New("SB_DOCKER_ENABLED=false needs SB_CONTAINER_ENGINE=containerd: the docker engine runs sandboxes in Docker")
+	}
+	for _, f := range []struct {
+		on   bool
+		name string
+	}{
+		{c.DockerPoolEnabled, "SB_DOCKER_POOL_ENABLED"},
+		{c.DockerNetnsPoolEnabled, "SB_DOCKER_NETNS_POOL_ENABLED"},
+	} {
+		if f.on {
+			return fmt.Errorf("%s=true needs Docker, and SB_DOCKER_ENABLED=false", f.name)
+		}
+	}
+	return nil
+}
+
 func getEnvInt(key string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -3680,6 +3839,43 @@ func getEnvBool(key string, fallback bool) bool {
 	return parsed
 }
 
+// loadDiskFloorRatio reads SB_DISK_FLOOR_RATIO. Like the exec output limits,
+// a value that does not parse refuses the boot instead of falling back to
+// the default: the default is off, so a typo such as "10%" would silently
+// drop the floor the operator asked for.
+func loadDiskFloorRatio() (float64, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_RATIO"))
+	if raw == "" {
+		return 0, nil
+	}
+	ratio, err := strconv.ParseFloat(raw, 64)
+	if err != nil || ratio < 0 || ratio >= 1 {
+		return 0, fmt.Errorf("SB_DISK_FLOOR_RATIO must be 0 (off) or a fraction below 1 such as 0.10, got %q", raw)
+	}
+	return ratio, nil
+}
+
+// validateBridgeSubnet checks SB_CONTAINERD_BRIDGE_SUBNET when set: an IPv4
+// network address (10.200.0.0/16, not 10.200.3.4/16, so the operator and
+// the firewall mean the same range) between /8 and /24. A /24 still holds
+// 253 sandboxes; anything smaller is a typo more often than a plan.
+func validateBridgeSubnet(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	p, err := netip.ParsePrefix(raw)
+	if err != nil || !p.Addr().Is4() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET must be an IPv4 range such as 10.200.0.0/16, got %q", raw)
+	}
+	if p != p.Masked() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q is not a network address; did you mean %s?", raw, p.Masked())
+	}
+	if p.Bits() < 8 || p.Bits() > 24 {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q must be between /8 and /24", raw)
+	}
+	return nil
+}
+
 func getEnvFloat(key string, fallback float64) float64 {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -3690,6 +3886,43 @@ func getEnvFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
+}
+
+// DefaultReadyLeaderGrace is ReadyLeaderGrace's default.
+const DefaultReadyLeaderGrace = 10 * time.Second
+
+// loadReadyLeaderGrace reads SB_READY_LEADER_GRACE strictly: a typo stops
+// the boot, rather than quietly fall back to the default.
+func (c *Config) loadReadyLeaderGrace() error {
+	c.ReadyLeaderGrace = DefaultReadyLeaderGrace
+	v := strings.TrimSpace(os.Getenv("SB_READY_LEADER_GRACE"))
+	if v == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("SB_READY_LEADER_GRACE must be a positive duration such as 10s, got %q", v)
+	}
+	c.ReadyLeaderGrace = d
+	return nil
+}
+
+// loadContainerdDiskQuota reads SB_CONTAINERD_DISK_QUOTA strictly: the
+// default is off, so a typo must not silently leave every sandbox's disk
+// unlimited, and only the containerd engine can enforce it.
+func loadContainerdDiskQuota(engine string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_CONTAINERD_DISK_QUOTA"))
+	if raw == "" {
+		return false, nil
+	}
+	on, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("SB_CONTAINERD_DISK_QUOTA must be true or false, got %q", raw)
+	}
+	if on && engine != models.ContainerEngineContainerd {
+		return false, errors.New("SB_CONTAINERD_DISK_QUOTA=true needs SB_CONTAINER_ENGINE=containerd")
+	}
+	return on, nil
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {

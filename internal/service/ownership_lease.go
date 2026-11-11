@@ -216,6 +216,9 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.startPeriodic(ctx, check, lease, func(c context.Context) {
 		s.enforceOwnershipLease(c, time.Now())
 	})
+	if s.ownershipLeaseFileOn() {
+		go s.runOwnershipLeaseFileWriter(ctx)
+	}
 }
 
 // beginOwnershipLease starts the lease clock at now: a node that has just
@@ -320,6 +323,9 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 	}
 
 	self := strings.TrimSpace(c.SelfNodeID())
+	// The file first, so the runtime supervisor thaws a group it froze
+	// before the thaws below resume the tasks in it.
+	s.recordOwnershipRead(ctx, sent, rows, placements, self)
 	s.ownership.mu.Lock()
 	if sent.After(s.ownership.confirmed) {
 		s.ownership.confirmed = sent

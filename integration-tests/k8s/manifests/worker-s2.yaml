@@ -1,0 +1,120 @@
+# S2 worker pod: plan §8.2's split. `runtime` holds containerd and every
+# sandbox; `agent` is sandboxd and is upgraded by changing its image in place.
+# Both mount the folders they hand each other at the same path. The ConfigMap
+# worker-boot and the Secret worker-urls are made by lib.sh (apply_worker).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aerolvm-workers
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker-0
+  namespace: aerolvm-workers
+  labels:
+    app: aerolvm-worker
+spec:
+  nodeSelector:
+    aerolvm.io/pool: phase0
+  tolerations:
+    - key: aerolvm.io/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # Never: a crash stays visible. A changed image still restarts its
+  # container whatever the policy (the kubelet restarts a container whose
+  # spec changed), which is what S2 relies on.
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 30
+  initContainers:
+    - name: fetch
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["bash", "/boot/fetch.sh"]
+      resources:
+        requests: { cpu: "1", memory: 1536Mi }
+        limits: { cpu: "1", memory: 1536Mi }
+      envFrom:
+        - secretRef:
+            name: worker-urls
+      volumeMounts:
+        - { name: bin, mountPath: /opt/aerolvm }
+        - { name: boot, mountPath: /boot }
+  containers:
+    - name: runtime
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["bash", "/boot/runtime.sh"]
+      securityContext:
+        privileged: true
+      # The sandboxes' budget: they live in this container's group (C7).
+      resources:
+        requests: { cpu: 2500m, memory: 11Gi }
+        limits: { cpu: 2500m, memory: 11Gi }
+      volumeMounts:
+        - { name: bin, mountPath: /opt/aerolvm }
+        - { name: boot, mountPath: /boot }
+        - { name: containerd, mountPath: /var/lib/containerd }
+        - { name: sandboxd-state, mountPath: /var/lib/sandboxd }
+        - { name: run-containerd, mountPath: /run/containerd }
+        - { name: run-aerolvm, mountPath: /run/aerolvm }
+        - { name: run-sandboxd, mountPath: /run/sandboxd }
+        # Network namespaces the agent makes must be visible here, where
+        # containerd starts the sandboxes in them.
+        - { name: netns, mountPath: /run/netns, mountPropagation: HostToContainer }
+    - name: agent
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["bash", "/boot/agent.sh"]
+      securityContext:
+        privileged: true
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SB_PAT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: worker-urls
+              key: SB_PAT_TOKEN
+      ports:
+        - { name: api, containerPort: 21212 }
+      readinessProbe:
+        tcpSocket: { port: api }
+        periodSeconds: 2
+        failureThreshold: 1
+      resources:
+        requests: { cpu: 500m, memory: 1Gi }
+        limits: { cpu: 500m, memory: 1Gi }
+      volumeMounts:
+        - { name: bin, mountPath: /opt/aerolvm }
+        - { name: boot, mountPath: /boot }
+        # containerd's root too: containerd's client library (oci.WithImageConfig,
+        # inside sandboxd) mounts an image's snapshot in the caller's own process
+        # to read its /etc/passwd and /etc/group. Without it, every create fails
+        # with "open /var/lib/containerd/.../snapshots/N/fs" (S2 run, 2026-11-10).
+        - { name: containerd, mountPath: /var/lib/containerd }
+        - { name: sandboxd-state, mountPath: /var/lib/sandboxd }
+        - { name: run-containerd, mountPath: /run/containerd }
+        - { name: run-aerolvm, mountPath: /run/aerolvm }
+        - { name: run-sandboxd, mountPath: /run/sandboxd }
+        - { name: recordings, mountPath: /var/lib/toolboxd/recordings }
+        # Bidirectional: the namespaces sandboxd mounts here must reach the
+        # runtime container. Kubernetes allows it only for privileged
+        # containers (plan §8.7).
+        - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+  volumes:
+    - { name: bin, emptyDir: {} }
+    - name: boot
+      configMap:
+        name: worker-boot
+        defaultMode: 0755
+    - { name: containerd, emptyDir: {} }
+    - { name: sandboxd-state, emptyDir: {} }
+    - { name: run-containerd, emptyDir: {} }
+    - { name: run-aerolvm, emptyDir: {} }
+    - { name: run-sandboxd, emptyDir: {} }
+    - { name: recordings, emptyDir: {} }
+    - { name: netns, emptyDir: {} }

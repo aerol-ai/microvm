@@ -342,6 +342,13 @@ Everything before `init` goes to `install.sh`; everything after it goes to
 `init` is safe to run again. The advertise address defaults to the source
 address of the default route; set `--advertise <ip>` when that is wrong.
 
+On a machine with no systemd, such as a Kubernetes pod's init container,
+`sandboxd init --files-only` (and `sandboxd join ... --files-only`) does
+steps 1 to 3 and writes `cluster.env`, then stops: no root, no drop-in, no
+restart. Start `sandboxd` with `sandboxd.env` and `cluster.env` in its
+environment yourself. After `init --files-only`, run `sandboxd init` again
+once that `sandboxd` is up: it does steps 5 and 6, without root.
+
 On your laptop, take the admin login:
 
 ```bash

@@ -69,7 +69,7 @@ What a container does not do:
 
 ## gVisor
 
-gVisor runs containers with `runsc`, a kernel written in Go that runs in user space. It answers the sandbox's system calls itself, so far fewer of them reach the server's kernel. It refuses privileged mode and GPUs. It does not enforce the disk limit.
+gVisor runs containers with `runsc`, a kernel written in Go that runs in user space. It answers the sandbox's system calls itself, so far fewer of them reach the server's kernel. It refuses privileged mode and GPUs. It does not enforce the disk limit itself; on the containerd engine with `SB_CONTAINERD_DISK_QUOTA=true`, the server does.
 
 ## Firecracker
 
@@ -269,7 +269,7 @@ This picture shows how the sizes become limits on the three Linux runtimes.
 flowchart TB
     Req["Create request"] --> Fill["Sizes you leave out are filled in<br/>1 CPU, 1 GB memory, 10 GB disk"]
     Fill --> D["Docker<br/>Linux limits CPU and memory,<br/>and disk where storage allows"]
-    Fill --> CG["containerd and gVisor<br/>Linux limits CPU and memory,<br/>disk is not limited"]
+    Fill --> CG["containerd and gVisor<br/>Linux limits CPU and memory,<br/>and disk with SB_CONTAINERD_DISK_QUOTA"]
     Fill --> F["Firecracker<br/>the virtual machine's own<br/>CPUs, memory and disk"]
 ```
 

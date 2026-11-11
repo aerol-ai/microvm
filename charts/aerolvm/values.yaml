@@ -1,0 +1,90 @@
+# AerolVM on Kubernetes (plans/kubernetes-v2-architecture.md, P3).
+#
+# mode: single runs AerolVM in one pod with no operator: a worker pod whose
+# runtime container holds containerd and every sandbox, and whose agent
+# container is sandboxd. For kind, laptops and small installs. Cluster mode
+# (gateways, servers and an operator) comes with the operator in Phase 2.
+mode: single
+
+image:
+  registry: ghcr.io/aerol-ai
+  # Empty: the chart's appVersion. Use a digest-pinned tag in production.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The API token every client sends (Authorization: Bearer). Empty makes one
+# on first install and keeps it across upgrades; or name a Secret you made,
+# with the token under the key SB_PAT_TOKEN.
+apiToken:
+  existingSecret: ""
+
+worker:
+  # The runtime container's budget is the sandboxes' budget: every sandbox
+  # runs in its cgroup (C7), capped below this limit with a reserve kept for
+  # containerd and the supervisor. Keep requests equal to limits (Guaranteed),
+  # so the kubelet never evicts the pod first under memory pressure (S3).
+  runtime:
+    resources:
+      requests: { cpu: "2", memory: 4Gi }
+      limits: { cpu: "2", memory: 4Gi }
+  agent:
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: 500m, memory: 1Gi }
+  egress:
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 100m, memory: 128Mi }
+
+  # Sandbox settings; each becomes an SB_* variable for sandboxd.
+  # defaultRuntime: the isolation a create gets when it names none
+  # ("docker" = runc, or "gvisor").
+  defaultRuntime: ""
+  # Refuse new sandboxes while the sandbox volume has less than this share
+  # free (C27). "0" turns it off.
+  diskFloorRatio: "0.10"
+  # Sandboxes cannot reach private addresses unless a create allows them
+  # (C24): a bank's network is not one connection away.
+  blockPrivateByDefault: true
+  # Any other sandboxd setting, as SB_NAME: value.
+  extraEnv: {}
+
+  # containerd's images and every sandbox's writable layer. An emptyDir is
+  # lost with the pod; production uses a local PersistentVolume or a host
+  # path on the machine's NVMe, and an XFS volume with prjquota allows a
+  # per-sandbox disk limit (SB_CONTAINERD_DISK_QUOTA, C27).
+  containerdVolume:
+    emptyDir: {}
+  # sandboxd's database.
+  stateVolume:
+    emptyDir: {}
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+service:
+  type: ClusterIP
+  port: 21212
+
+# Sandbox links and the API over HTTPS (C25): an edge container runs
+# AerolVM's Caddy, as on a domain install. The API is https://<domain> and
+# a sandbox's port is https://<id>-<port>.<domain>. The certificate comes
+# from cert-manager (a chart prerequisite when this is on): point
+# certManager.issuerRef at your issuer, or name a kubernetes.io/tls Secret
+# you keep yourself. No pod holds a DNS provider token. Point the domain and
+# its wildcard at edge.service.
+edge:
+  enabled: false
+  domain: ""
+  certManager:
+    # For example { name: letsencrypt-dns, kind: ClusterIssuer }.
+    issuerRef: {}
+  # A Secret with tls.crt and tls.key for <domain> and *.<domain>, instead
+  # of a cert-manager Certificate.
+  existingTLSSecret: ""
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+  service:
+    type: LoadBalancer

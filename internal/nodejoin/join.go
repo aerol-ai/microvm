@@ -28,6 +28,11 @@ type JoinOptions struct {
 	// WaitTimeout bounds the wait until the node is a member.
 	WaitTimeout  time.Duration
 	MinFreeBytes uint64
+	// FilesOnly writes the node's files and stops (finding F14): no root
+	// check, no systemd drop-in, no restart and no wait. It is for a
+	// machine with no systemd, such as a Kubernetes pod's init container;
+	// the pod's sandboxd loads cluster.env itself and joins as it starts.
+	FilesOnly bool
 }
 
 // Joiner runs a join on this machine.
@@ -63,7 +68,7 @@ type JoinResult struct {
 // success keeps the node key, so the join server answers it as a replay
 // and the files come out the same.
 func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
-	if !j.Host.IsRoot() {
+	if !o.FilesOnly && !j.Host.IsRoot() {
 		return JoinResult{}, errors.New("run sandboxd join as root (sudo)")
 	}
 	if err := installed(j.Paths); err != nil {
@@ -164,9 +169,14 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 	addr.NodeRole = nodeRole
 
 	journal := &fileJournal{}
-	if err := j.writeJoinFiles(journal, env, resp, nodeID, advertise, joinURL, addr); err != nil {
+	if err := j.writeJoinFiles(journal, env, resp, nodeID, advertise, joinURL, addr, o.FilesOnly); err != nil {
 		j.undo(journal, joinUndoNote)
 		return JoinResult{}, err
+	}
+	if o.FilesOnly {
+		j.printf("[join] files written (--files-only). Start sandboxd with %s and %s in its environment; it joins as it starts\n",
+			j.Paths.EnvFile, j.Paths.ClusterEnv)
+		return JoinResult{NodeID: nodeID, Role: resp.Role, Replay: resp.Replay}, nil
 	}
 	if journal.changed() {
 		j.printf("[join] files written; restarting sandboxd\n")
@@ -311,7 +321,7 @@ func custodyCheck(env nodeEnv) Check {
 }
 
 // writeJoinFiles writes everything the answer carries, through the journal.
-func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinResponse, nodeID, advertise, joinURL string, addr AddressOptions) error {
+func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinResponse, nodeID, advertise, joinURL string, addr AddressOptions, filesOnly bool) error {
 	tlsDir := env.tlsDir(j.Paths)
 	if err := jr.write(filepath.Join(tlsDir, "ca.crt"), []byte(resp.CACert), 0o644); err != nil {
 		return err
@@ -372,6 +382,9 @@ func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinR
 		if err := jr.mergeEnv(j.Paths.EnvFile, "", set); err != nil {
 			return err
 		}
+	}
+	if filesOnly {
+		return nil
 	}
 	return jr.write(j.Paths.DropIn, []byte(dropInBody), 0o644)
 }

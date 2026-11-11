@@ -96,7 +96,7 @@ func (s *Service) SandboxNodeAllowlist() []netrules.NodePort {
 			netrules.NodePort{Proto: "udp", Port: 53, Dst: ns},
 			netrules.NodePort{Proto: "tcp", Port: 53, Dst: ns})
 	}
-	if servesIngress(s.cfg) {
+	if sandboxesReachIngress(s.cfg) {
 		out = append(out, netrules.NodePort{Proto: "tcp", Port: 80}, netrules.NodePort{Proto: "tcp", Port: 443})
 	}
 	for _, p := range s.cfg.SandboxNodePortsAllow {
@@ -112,7 +112,7 @@ func (s *Service) SandboxNodeAllowlist() []netrules.NodePort {
 // process resolves names itself.
 func HostMediatedNodePorts(cfg config.Config) []uint16 {
 	var out []uint16
-	if servesIngress(cfg) {
+	if sandboxesReachIngress(cfg) {
 		out = append(out, 80, 443)
 	}
 	for _, p := range cfg.SandboxNodePortsAllow {
@@ -122,9 +122,13 @@ func HostMediatedNodePorts(cfg config.Config) []uint16 {
 	return slices.Compact(out)
 }
 
-// servesIngress reports whether Caddy on this node is the public front
-// door, so 80 and 443 here are what the internet reaches anyway.
-func servesIngress(cfg config.Config) bool { return cfg.IsIngress() && cfg.EnableCaddy }
+// sandboxesReachIngress reports whether sandboxes may reach 80 and 443 on
+// this node: Caddy here is the public front door, so those ports are what
+// the internet reaches anyway, unless SB_SANDBOX_NODE_INGRESS=false keeps
+// them closed (a pod behind a Service, C24).
+func sandboxesReachIngress(cfg config.Config) bool {
+	return cfg.IsIngress() && cfg.EnableCaddy && !cfg.SandboxNodeIngressClosed
+}
 
 // gatewayNodePorts are the ports the gateway reported listening on, or the
 // configured ones until it has.
@@ -211,11 +215,16 @@ type namedRuntime struct {
 // nodeGuardRuntimes are the runtimes whose sandboxes sit on a host bridge
 // or TAP subnet, by the name the create gate uses.
 func (s *Service) nodeGuardRuntimes() []namedRuntime {
-	return []namedRuntime{
-		{models.ContainerEngineDocker, s.docker},
-		{models.ContainerEngineContainerd, s.containerd},
-		{models.RuntimeFirecracker, s.firecracker},
+	out := make([]namedRuntime, 0, 3)
+	// No Docker floor or guard on a host without Docker (C2): installing
+	// one only fails, and logs an error, on every pass.
+	if !s.cfg.DockerDisabled {
+		out = append(out, namedRuntime{models.ContainerEngineDocker, s.docker})
 	}
+	return append(out,
+		namedRuntime{models.ContainerEngineContainerd, s.containerd},
+		namedRuntime{models.RuntimeFirecracker, s.firecracker},
+	)
 }
 
 // ApplyNodeGuard installs the guard on every runtime. The daemon calls it at

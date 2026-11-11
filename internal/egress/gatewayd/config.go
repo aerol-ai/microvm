@@ -34,7 +34,8 @@ type Config struct {
 	AuditBuffer        int
 	// InspectMaxBody caps an inspected request body (P3-1).
 	InspectMaxBody int64
-	// PeerUIDs and PeerCgroup gate the UDS (CEO D22).
+	// PeerUIDs and PeerCgroup gate the UDS (CEO D22). PeerCgroup is empty
+	// with SB_EGRESS_PEER_CGROUP=none (peerCgroupFromEnv).
 	PeerUIDs   []uint32
 	PeerCgroup string
 	// HeartbeatInterval paces table-loss checks and heartbeat events (D17).
@@ -78,7 +79,7 @@ func FromEnv() (Config, error) {
 		AuditBuffer:        egress.DefaultAuditBuffer,
 		InspectMaxBody:     proxy.DefaultInspectMaxBody,
 		PeerUIDs:           []uint32{0},
-		PeerCgroup:         envOr("SB_EGRESS_PEER_CGROUP", "sandboxd.service"),
+		PeerCgroup:         peerCgroupFromEnv(),
 		HeartbeatInterval:  5 * time.Second,
 		FlowReadInterval:   2 * time.Second,
 		SnapshotDebounce:   500 * time.Millisecond,
@@ -163,6 +164,21 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// peerCgroupFromEnv is the cgroup the control socket's peer must run in:
+// sandboxd's systemd unit by default. "none" turns the check off, for a
+// gateway in a container of its own (C6): there sandboxd runs in another
+// container's PID namespace, so its /proc entry cannot be read, and no
+// systemd unit names it. The uid check stays, and the socket sits on a
+// volume only the pod's own containers mount. (An empty value keeps the
+// default, as every SB_EGRESS_* setting does, so "none" is spelled out.)
+func peerCgroupFromEnv() string {
+	v := envOr("SB_EGRESS_PEER_CGROUP", "sandboxd.service")
+	if strings.EqualFold(v, "none") {
+		return ""
+	}
+	return v
 }
 
 func envOr(name, def string) string {

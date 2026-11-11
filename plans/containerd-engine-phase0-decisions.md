@@ -15,7 +15,7 @@ Spike harnesses live under `integration-tests/suite/containerd_phase0_*.go`
 | 0e-2 | config.toml-less runsc registration | DECIDED (default) | **No containerd config.toml edit** — shim on PATH + per-container runtime options + host-local `ensureRunscConfig` (`host-uds=open`). Live confirm Phase 0(c) still required. |
 | 0e-3 | AppArmor profile | DECIDED (default) | **Do not assert AppArmor** beyond dockerd baseline for flip; parity gate is CapEff/Seccomp/NoNewPrivs/masked paths via `security_spec_diff`. Overturn if live AppArmor delta is measured weaker. |
 | 0e-4 | containerd version pin | DECIDED (code) | Supported daemon majors **1.6–2.x** (`assertSupportedContainerdVersion`); Go client `v1.7.29`. `Connect` rejects out-of-range. Live confirm on Ubuntu LTS still needed. |
-| DiskGB | overlayfs disk quota parity | DECIDED (soft-ignore) | See **DiskGB follow-up** below. |
+| DiskGB | overlayfs disk quota parity | DECIDED (enforced with `SB_CONTAINERD_DISK_QUOTA`: option 1, XFS project quotas, C27; soft-ignore without it) | See **DiskGB follow-up** below. |
 
 ## How to run spikes
 
@@ -106,7 +106,9 @@ Pick one after measuring the soak hosts’ actual FS:
 
 - [ ] Inventory soak / prod node FS (`findmnt`, `xfs_info` / `tune2fs`) and
       record whether dockerd StorageOpt is actually enforced today.
-- [ ] Choose option (1)/(2)/(4) and land driver support + unit tests.
+- [x] Choose option (1)/(2)/(4) and land driver support + unit tests. Option 1,
+      XFS project quotas (`internal/runtime/containerd/disk_quota.go`), proven by
+      Kubernetes spike S8 on AL2023 and Bottlerocket.
 - [ ] Live probe: write past `DiskGB` inside a sandbox → ENOSPC (or documented
       non-enforcement if (4)).
 - [ ] Update `DiskGBEnforced` + this row to `DECIDED (enforced)` or

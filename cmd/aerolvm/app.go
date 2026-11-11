@@ -120,6 +120,7 @@ func (a *app) verbGroups() []verbGroup {
 			{"upgrade", "Plan, run and follow an upgrade of every node", upgradeHelp, runUpgrade},
 			{"release", "Download a release into one file for offline sites", releaseHelp, runRelease},
 			{"join-command", "Make a join token and print the command that adds a node", joinCommandHelp, runJoinCommand},
+			{"k8s", "Check a Kubernetes install against its security rules", k8sHelp, runK8s},
 		}},
 		// kubectl polish (plans/kubectl-style-cluster-ops.md Phase 4).
 		{"Resources", []verb{

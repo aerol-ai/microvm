@@ -99,6 +99,14 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 			"pool_size", poolSize, "bridge_port_limit", maxBridgePorts,
 			"hint", "keep SB_CONTAINERD_NETNS_POOL_SIZE at or below the bridge limit (setup/config-defaults.md)")
 	}
+	subnet := containerdBridgeSubnet(cfg)
+	if hosts := bridgeHosts(subnet); poolSize > hosts {
+		// host-local IPAM runs out of addresses before the pool runs out of
+		// slots; the slots past it fail CNI ADD.
+		logger.Warn("containerd netns pool is larger than the sandbox range holds; slots past it cannot be realized",
+			"pool_size", poolSize, "subnet", subnet, "addresses", hosts,
+			"hint", "use a larger SB_CONTAINERD_BRIDGE_SUBNET or a smaller SB_CONTAINERD_NETNS_POOL_SIZE")
+	}
 	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: poolSize}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)
 	}
@@ -109,6 +117,7 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err := cni.EnsureBridgeConflist(cfg.ContainerdCNIConfPath, cni.ConflistOptions{
 		Name:   "aerolvm",
 		Bridge: "aerolvm0",
+		Subnet: subnet,
 		MTU:    cni.UplinkMTU(),
 	}); err != nil {
 		return nil, fmt.Errorf("ensure cni conflist: %w", err)

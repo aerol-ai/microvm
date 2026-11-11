@@ -87,8 +87,10 @@ You do not need to set these yourself. They help when you read logs or fix probl
 | `SB_NODE_ROLE` | This node's jobs. See [Node roles](#node-roles). Any value but `mixed` needs `SB_ENABLE_CLUSTER=true`. | `mixed` |
 | `SB_NODE_ZONE` | This node's zone, such as `eu-west-1a`. A create can ask for a zone. See [Choose where a sandbox runs](/engineering-placement-failover/#choose-where-a-sandbox-runs). | Empty (no zone) |
 | `SB_NODE_LABELS` | This node's labels, as `key=value` pairs split by commas, such as `tier=pci,gpu=a10`. A create can ask for labels. At most 16 labels. A bad label stops the node from starting. | Empty (no labels) |
+| `SB_CELL_ID` | The cell this cluster belongs to, a number from 1 to 255. New sandbox IDs start with it as two hex digits (cell 7 gives `sb-07…`). Set the same number on every node of a cluster. Leave it at 1 unless you run more than one cell. A value outside 1 to 255 stops the node from starting. | `1` |
 | `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on every other node. Only a node whose role has `server`, or is `mixed`, can be the seed. | `false` |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that vote. Extra server nodes join as non-voters. `0` means no cap. | `5` |
+| `SB_READY_LEADER_GRACE` | How long a node may go without hearing from a working control plane before `GET /ready` answers 503, such as `10s`. Keep it above a normal leader election (a second or two) so one election does not take every node out of rotation. | `10s` |
 
 ### Addresses
 
@@ -107,7 +109,7 @@ The server nodes keep their records on disk, so the records survive restarts.
 | Setting | What it does | Default |
 |---|---|---|
 | `SB_RAFT_BIND_ADDR` | The address this node listens on for voting traffic. | `0.0.0.0:7000` |
-| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7000`. | The same as `SB_RAFT_BIND_ADDR` |
+| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7000`. A DNS name with a port (`server-0.aerolvm.svc:7000`) is kept as a name, so a server that moves to a new IP stays reachable: other nodes look the name up each time they connect. | The same as `SB_RAFT_BIND_ADDR` |
 | `SB_RAFT_DATA_DIR` | Where the node keeps its log of changes, and its snapshots (saved copies of the records). | `/var/lib/sandboxd/raft` (a `raft` folder next to `SB_DB_PATH`) |
 
 ### Node-finding settings (`SB_GOSSIP_*`)

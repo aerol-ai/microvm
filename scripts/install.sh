@@ -2618,7 +2618,7 @@ EOF
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
 ${tls_block}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource* /.well-known/openid-configuration /.well-known/jwks.json
+	@api path /health /ready /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource* /.well-known/openid-configuration /.well-known/jwks.json
 	handle @api {
 		# stream_close_delay: every admin-API change reloads Caddy, and a
 		# reload closes each WebSocket this proxy carries (exec streams,

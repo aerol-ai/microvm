@@ -1,0 +1,98 @@
+# S9 worker pod: H0's one-container worker, but in its own user namespace
+# (hostUsers: false) and NOT privileged. Root in this pod maps to an
+# unprivileged user on the machine, and the rights below apply only inside
+# the pod's namespaces (Kubernetes user namespaces, stable since v1.36).
+# The container runs s9-probe.sh first, then run.sh, so the report shows both
+# what is possible here and where the real worker stops.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aerolvm-workers
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: worker-0
+  namespace: aerolvm-workers
+  labels:
+    app: aerolvm-worker
+spec:
+  hostUsers: false
+  nodeSelector:
+    aerolvm.io/pool: phase0
+  tolerations:
+    - key: aerolvm.io/worker
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 30
+  initContainers:
+    - name: fetch
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["bash", "/boot/fetch.sh"]
+      resources:
+        requests: { cpu: "1", memory: 1536Mi }
+        limits: { cpu: "1", memory: 1536Mi }
+      envFrom:
+        - secretRef:
+            name: worker-urls
+      volumeMounts:
+        - { name: bin, mountPath: /opt/aerolvm }
+        - { name: boot, mountPath: /boot }
+  containers:
+    - name: worker
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["bash", "-c", "bash /boot/s9-probe.sh; exec bash /boot/run.sh"]
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: true
+        # Inside a user namespace these are the pod's own, not the machine's.
+        capabilities:
+          add: [SYS_ADMIN, NET_ADMIN, NET_RAW, SYS_CHROOT, SYS_PTRACE, SYS_RESOURCE, MKNOD, SETUID, SETGID, SETPCAP, DAC_OVERRIDE, FOWNER, CHOWN, KILL]
+        seccompProfile:
+          type: Unconfined
+        appArmorProfile:
+          type: Unconfined
+        procMount: Unmasked
+      env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SB_PAT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: worker-urls
+              key: SB_PAT_TOKEN
+        - name: AEROL_C7_CGROUP_PARENT
+          valueFrom:
+            secretKeyRef:
+              name: worker-urls
+              key: AEROL_C7_CGROUP_PARENT
+              optional: true
+      ports:
+        - { name: api, containerPort: 21212 }
+      readinessProbe:
+        tcpSocket: { port: api }
+        periodSeconds: 2
+        failureThreshold: 1
+      resources:
+        requests: { cpu: "3", memory: 12Gi }
+        limits: { cpu: "3", memory: 12Gi }
+      volumeMounts:
+        - { name: bin, mountPath: /opt/aerolvm }
+        - { name: boot, mountPath: /boot }
+        - { name: containerd, mountPath: /var/lib/containerd }
+        - { name: sandboxd, mountPath: /var/lib/sandboxd }
+  volumes:
+    - { name: bin, emptyDir: {} }
+    - name: boot
+      configMap:
+        name: worker-boot
+        defaultMode: 0755
+    - { name: containerd, emptyDir: {} }
+    - { name: sandboxd, emptyDir: {} }

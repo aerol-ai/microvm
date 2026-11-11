@@ -9,7 +9,6 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
-	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -22,6 +21,17 @@ const egressSuperviseInterval = 5 * time.Second
 // bridgeSource is the docker side of bridge discovery (*docker.Client).
 type bridgeSource interface {
 	SandboxBridge(ctx context.Context) (docker.SandboxNetwork, error)
+}
+
+// dockerBridgeSource is the Docker client as a bridgeSource, or a nil
+// interface on a host without Docker (C2), so its users go straight to the
+// containerd bridge instead of asking Docker first and logging the failure.
+// (A nil *docker.Client in the interface would not compare equal to nil.)
+func dockerBridgeSource(cfg config.Config, c *docker.Client) bridgeSource {
+	if c == nil || cfg.DockerDisabled {
+		return nil
+	}
+	return c
 }
 
 // wireEgressGateway connects sandboxd to the egress-gateway process when
@@ -49,8 +59,9 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 			}
 		}
 		if cfg.ContainerEngine == models.ContainerEngineContainerd {
-			if gw, ok := firstHost(cni.DefaultBridgeSubnet); ok {
-				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw, Subnet: netip.MustParsePrefix(cni.DefaultBridgeSubnet).Masked()})
+			subnet := containerdBridgeSubnet(cfg)
+			if gw, ok := firstHost(subnet); ok {
+				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw, Subnet: netip.MustParsePrefix(subnet).Masked()})
 			}
 		}
 		return out

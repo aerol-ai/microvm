@@ -1,7 +1,7 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
+.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd images k8s-dev k8s-dev-down docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
@@ -75,6 +75,24 @@ build-sandboxd:
 build-toolboxd:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 $(GO) build -ldflags "-s -w -X github.com/aerol-ai/microvm/internal/version.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o $(BIN_DIR)/toolboxd ./cmd/toolboxd
+
+# The Kubernetes images (aerolvm, aerolvm-runtime, aerolvm-edge) from Linux
+# binaries already in $(IMAGES_DIST), named as the release names them
+# (sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>,
+# caddy_linux_<arch>). Loads this machine's platform into the local Docker;
+# the release builds both CPU types and pushes (scripts/build-images.sh).
+IMAGES_DIST ?= dist
+IMAGES_VERSION ?= dev
+images:
+	scripts/build-images.sh --dist $(IMAGES_DIST) --version $(IMAGES_VERSION)
+
+# AerolVM in single mode on a local kind cluster, from this checkout
+# (scripts/k8s-dev.sh): build the images, start kind, install the chart.
+k8s-dev:
+	scripts/k8s-dev.sh
+
+k8s-dev-down:
+	scripts/k8s-dev.sh down
 
 docs-install:
 	cd docs && npm install

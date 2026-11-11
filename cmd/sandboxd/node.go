@@ -71,6 +71,10 @@ a join command and a login line. Run install.sh first. Safe to run again.
                               as cluster-init.sh's flags of the same names
   --installer-url <url>       the installer the printed join command fetches
   --wait-timeout <dur>        how long to wait for sandboxd to lead (default 3m)
+  --files-only                write the cluster's files and stop: no root,
+                              no systemd, no restart (a Kubernetes init
+                              container); run init again once sandboxd is
+                              up to admit this node and make join tokens
 `
 
 const joinUsage = `usage: sudo sandboxd join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>]
@@ -94,6 +98,9 @@ answer.
   --ingress-advertise-host <h>
                               as cluster-join.sh's flags of the same names
   --wait-timeout <dur>        how long to wait to be a member (default 3m)
+  --files-only                write this node's files and stop: no root,
+                              no systemd, no restart (a Kubernetes init
+                              container); sandboxd joins as it starts
 `
 
 const preflightUsage = `usage: sandboxd preflight [--join <url> --token <id.secret>] [--ca-cert-hash sha256:<hex>]
@@ -165,6 +172,7 @@ type nodeFlags struct {
 	yes                               bool
 	ttl                               string
 	reusable, json                    bool
+	filesOnly                         bool
 }
 
 func (f *nodeFlags) address() nodejoin.AddressOptions {
@@ -186,6 +194,7 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 		fs.StringVar(&f.dataPlane, "data-plane-advertise-host", "", "")
 		fs.StringVar(&f.ingressHost, "ingress-advertise-host", "", "")
 		fs.DurationVar(&f.waitTimeout, "wait-timeout", 0, "")
+		fs.BoolVar(&f.filesOnly, "files-only", false, "")
 	case preflightSubcommand:
 		fs.StringVar(&f.joinURL, "join", "", "")
 		fs.StringVar(&f.token, "token", "", "")
@@ -280,7 +289,7 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 			KeyTool: func(ctx context.Context, args []string) error { return nodeKeyTool(ctx, args, stdout) }}
 		_, err = in.Run(ctx, nodejoin.InitOptions{
 			NodeID: f.nodeID, Advertise: f.advertise, Address: f.address(), Tokens: specs, KeyCustody: f.custody,
-			GossipKey: f.gossipKey, WaitTimeout: f.waitTimeout, InstallerURL: f.installer,
+			GossipKey: f.gossipKey, WaitTimeout: f.waitTimeout, InstallerURL: f.installer, FilesOnly: f.filesOnly,
 		})
 	case joinSubcommand:
 		if strings.TrimSpace(f.token) == "" {
@@ -290,7 +299,7 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 		j := &nodejoin.Joiner{Paths: paths, Host: host, Version: version.Version, Printer: printer, LocalAPI: nodeLocalAPI}
 		_, err = j.Run(ctx, nodejoin.JoinOptions{
 			URL: positional[0], Token: f.token, CACertHash: f.caHash, NodeID: f.nodeID, Advertise: f.advertise,
-			Address: f.address(), WaitTimeout: f.waitTimeout,
+			Address: f.address(), WaitTimeout: f.waitTimeout, FilesOnly: f.filesOnly,
 		})
 	case adoptSubcommand:
 		a := &nodejoin.Adopter{Paths: paths, Host: host, Printer: printer, LocalAPI: nodeLocalAPI}

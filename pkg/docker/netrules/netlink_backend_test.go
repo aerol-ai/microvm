@@ -4,6 +4,7 @@ package netrules
 
 import (
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -23,6 +24,29 @@ type fakeNFT struct {
 	addedChain []*nftables.Chain
 	// flushedChains records FlushChain calls (the floor chain).
 	flushedChains []string
+	// tables are the tables that exist; addedTable records AddTable calls.
+	tables        []*nftables.Table
+	addedTable    []*nftables.Table
+	listTablesErr error
+}
+
+func (f *fakeNFT) ListTablesOfFamily(family nftables.TableFamily) ([]*nftables.Table, error) {
+	if f.listTablesErr != nil {
+		return nil, f.listTablesErr
+	}
+	var out []*nftables.Table
+	for _, t := range f.tables {
+		if t.Family == family {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeNFT) AddTable(t *nftables.Table) *nftables.Table {
+	f.addedTable = append(f.addedTable, t)
+	f.tables = append(f.tables, t)
+	return t
 }
 
 func (f *fakeNFT) GetRules(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error) {
@@ -105,6 +129,81 @@ func TestNetlinkEnsureUserChainIdempotent(t *testing.T) {
 	}
 	if len(fake.addedChain) != 1 {
 		t.Fatalf("chain must not be re-created when present: added=%d", len(fake.addedChain))
+	}
+}
+
+// Regression (Kubernetes Phase 0, finding F1): a fresh network namespace, as
+// in a worker pod, has no ip filter table, and adding the user chain to it
+// failed with ENOENT, so sandboxd exited. The table is created, in the same
+// batch as the chain, and only when it is missing.
+func TestNetlinkEnsureUserChainCreatesMissingFilterTable(t *testing.T) {
+	fake := &fakeNFT{}
+	b := testNetlinkBackend(fake)
+	if err := b.EnsureUserChain(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.addedTable) != 1 || fake.addedTable[0].Name != "filter" || fake.addedTable[0].Family != nftables.TableFamilyIPv4 {
+		t.Fatalf("added tables = %+v, want the ip filter table once", fake.addedTable)
+	}
+	if len(fake.addedChain) != 1 || fake.addedChain[0].Table.Name != "filter" {
+		t.Fatalf("added chains = %+v, want the user chain in filter", fake.addedChain)
+	}
+}
+
+func TestNetlinkEnsureChainsLeaveAnExistingTableAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ensure func(*netlinkBackend) error
+	}{
+		{"user chain", func(b *netlinkBackend) error { return b.EnsureUserChain(ChainAerolvmUser) }},
+		{"FORWARD base chain", func(b *netlinkBackend) error { return b.EnsureForwardJump(ChainAerolvmUser) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeNFT{tables: []*nftables.Table{
+				{Name: "filter", Family: nftables.TableFamilyIPv6},
+				{Name: "filter", Family: nftables.TableFamilyIPv4},
+			}}
+			if err := tc.ensure(testNetlinkBackend(fake)); err != nil {
+				t.Fatal(err)
+			}
+			if len(fake.addedTable) != 0 {
+				t.Fatalf("an existing table was added again: %+v", fake.addedTable)
+			}
+		})
+	}
+}
+
+func TestNetlinkEnsureForwardJumpCreatesMissingFilterTable(t *testing.T) {
+	fake := &fakeNFT{}
+	if err := testNetlinkBackend(fake).EnsureForwardJump(ChainAerolvmUser); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.addedTable) != 1 || fake.addedTable[0].Name != "filter" {
+		t.Fatalf("added tables = %+v, want the ip filter table once", fake.addedTable)
+	}
+	if len(fake.addedChain) != 1 || fake.addedChain[0].Name != "FORWARD" || fake.addedChain[0].Hooknum == nil {
+		t.Fatalf("added chains = %+v, want the FORWARD base chain", fake.addedChain)
+	}
+}
+
+func TestNetlinkEnsureChainsReportTableListingError(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ensure func(*netlinkBackend) error
+	}{
+		{"user chain", func(b *netlinkBackend) error { return b.EnsureUserChain(ChainAerolvmUser) }},
+		{"FORWARD base chain", func(b *netlinkBackend) error { return b.EnsureForwardJump(ChainAerolvmUser) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeNFT{listTablesErr: errors.New("netlink: permission denied")}
+			err := tc.ensure(testNetlinkBackend(fake))
+			if err == nil || !strings.Contains(err.Error(), "nft list tables") {
+				t.Fatalf("err = %v, want the table listing error", err)
+			}
+			if len(fake.addedChain) != 0 {
+				t.Fatalf("a chain was queued after the listing failed: %+v", fake.addedChain)
+			}
+		})
 	}
 }
 

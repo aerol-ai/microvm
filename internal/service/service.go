@@ -637,6 +637,9 @@ type Service struct {
 	// ownership is the worker's ownership lease and fence
 	// (ownership_lease.go). Zero value: not begun, fences nothing.
 	ownership ownershipLease
+	// ownershipFile writes that lease for the runtime supervisor
+	// (ownership_lease_file.go).
+	ownershipFile ownershipLeaseFile
 
 	// expectedStops tracks sandboxes whose stop was issued by sandboxd
 	// itself (manual API call or lifecycle sweep). The Docker /events
@@ -2455,7 +2458,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	sandboxID := idOverride
 	if sandboxID == "" {
 		var err error
-		sandboxID, err = generateSandboxID()
+		sandboxID, err = s.NewSandboxID()
 		if err != nil {
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
@@ -3014,7 +3017,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 
 	sandboxID := idOverride
 	if sandboxID == "" {
-		sandboxID, err = generateSandboxID()
+		sandboxID, err = s.NewSandboxID()
 		if err != nil {
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
@@ -3337,6 +3340,12 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	}
 	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
 		return err
+	}
+	// A recreate-policy sandbox joins the lease file's fence now, not at the
+	// next read (T3). A channel send that never blocks; the file is written
+	// off this path.
+	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
+		s.kickOwnershipLeaseFile()
 	}
 	// The row is the authority from here on. Complete the lifecycle identity
 	// so audit stamps carry the tenant owner instead of the blank one the
@@ -6262,9 +6271,14 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		return models.HealthStatus{}, err
 	}
 
-	dockerStatus := "ok"
-	if err := s.docker.Ping(ctx); err != nil {
-		dockerStatus = err.Error()
+	// A containerd host with no Docker (SB_DOCKER_ENABLED=false, C2) is not
+	// degraded by its absence.
+	dockerStatus := "disabled"
+	if !s.cfg.DockerDisabled {
+		dockerStatus = "ok"
+		if err := s.docker.Ping(ctx); err != nil {
+			dockerStatus = err.Error()
+		}
 	}
 
 	caddyStatus := "ok"
@@ -6346,7 +6360,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	}
 
 	status := "ok"
-	if dockerStatus != "ok" || caddyStatus != "ok" {
+	if (!s.cfg.DockerDisabled && dockerStatus != "ok") || caddyStatus != "ok" {
 		status = "degraded"
 	}
 	if s.cfg.EnableFirecracker && firecrackerStatus != "ok" {
@@ -6679,11 +6693,21 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// F12). What this pass cannot see, it leaves alone: rows that would be
 	// matched against Docker's list, and the stale-mount sweep, which would
 	// otherwise read "not listed" as "gone".
-	dockerManaged, dockerErr := s.docker.ListManaged(ctx)
-	dockerListed := dockerErr == nil
-	if !dockerListed {
-		s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
-		dockerManaged = map[string]*models.SandboxRuntimeState{}
+	//
+	// With Docker off (SB_DOCKER_ENABLED=false, C2) there is nothing to list
+	// and no warning to give: Docker-owned rows (there should be none) are
+	// left alone, and the mount sweep still runs, since no Docker sandbox
+	// can hold a mount here.
+	dockerManaged := map[string]*models.SandboxRuntimeState{}
+	dockerListed := false
+	if !s.cfg.DockerDisabled {
+		m, dockerErr := s.docker.ListManaged(ctx)
+		dockerListed = dockerErr == nil
+		if dockerListed {
+			dockerManaged = m
+		} else {
+			s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
+		}
 	}
 	containerdManaged := map[string]*models.SandboxRuntimeState{}
 	if s.containerd != nil {
@@ -7173,7 +7197,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 		}
 	}
-	removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+	if dockerListed {
+		removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+	}
 	if s.containerd != nil {
 		// containerd is the default engine on clusters. finalizeStaleLocalSandbox
 		// deletes the row before runtime Destroy and names this sweep as the
@@ -7220,7 +7246,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			keep[id] = struct{}{}
 		}
 	}
-	if dockerListed {
+	if dockerListed || s.cfg.DockerDisabled {
 		s.mounts.Sweep(keep)
 	}
 
@@ -8417,23 +8443,36 @@ func generateToolboxToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// GenerateSandboxID is the exported entry point for the cluster handler's
-// reservation-first create path: the router (Node A) needs to mint a sandbox
-// ID before opReserve so the chosen target (Node T) can accept the forward
-// with X-Cluster-Create-ID and run CreateSandboxWithID against the same
-// reservation. Routes through the package-private generateSandboxID so the
-// format stays in lockstep with the local create path.
-func GenerateSandboxID() (string, error) { return generateSandboxID() }
+// NewSandboxID mints a fresh sandbox ID in this node's cell: "sb-", two hex
+// digits of the cell number, then 14 random hex digits
+// (plans/kubernetes-v2-architecture.md §12.3, C12). The shape, "sb-" plus 16
+// lowercase hex, is unchanged: clients tell an ID from a name by it
+// (models.IsGeneratedSandboxID), and it is a valid container name. 56
+// random bits leave a clash at a million live sandboxes about 1 in 140,000,
+// and the create path refuses one anyway.
+//
+// The cluster handler's reservation-first create mints through this too, so
+// the router's ID and the local create's share one format. IDs derived from
+// a key (an idempotent create's, the facades') keep their hashed form for
+// now; like IDs made before cells, a router finds them by asking each cell.
+func (s *Service) NewSandboxID() (string, error) {
+	return newSandboxIDInCell(s.cfg.CellID)
+}
 
-// generateSandboxID returns a 16-hex-char sandbox identifier. It is used as
-// both the daemon's primary key for the sandbox and the Docker container's
-// name, so it must satisfy Docker's name restrictions ([a-zA-Z0-9_.-]).
-func generateSandboxID() (string, error) {
-	buf := make([]byte, 8)
+// newSandboxIDInCell is NewSandboxID for a given cell. A zero cell (a
+// Config not built by config.Load, as in tests) is cell 1, the default.
+func newSandboxIDInCell(cell int) (string, error) {
+	if cell == 0 {
+		cell = 1
+	}
+	if cell < 1 || cell > 255 {
+		return "", fmt.Errorf("sandbox id: cell %d is outside 1 to 255", cell)
+	}
+	buf := make([]byte, 7)
 	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		return "", err
 	}
-	return "sb-" + hex.EncodeToString(buf), nil
+	return fmt.Sprintf("sb-%02x%s", cell, hex.EncodeToString(buf)), nil
 }
 
 // imageStillReferenced reports whether any sandbox in the given slice still

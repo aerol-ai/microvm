@@ -281,6 +281,20 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/toolboxd_${{ matrix.suffix }} ./cmd/toolboxd
           chmod 0755 dist/toolboxd_${{ matrix.suffix }}
 
+      # The Kubernetes runtime container's first process (cmd/aerolvm-supervisor);
+      # the images job packs it into aerolvm-runtime. Static, like toolboxd.
+      - name: Build aerolvm-supervisor (Linux amd64 and arm64)
+        if: matrix.goos == 'linux' && (matrix.goarch == 'amd64' || matrix.goarch == 'arm64')
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/aerolvm-supervisor_${{ matrix.suffix }} ./cmd/aerolvm-supervisor
+          chmod 0755 dist/aerolvm-supervisor_${{ matrix.suffix }}
+
       - name: Build custom Caddy (Linux only)
         if: matrix.goos == 'linux'
         shell: bash
@@ -377,6 +391,86 @@ jobs:
         with:
           name: dist-aerolvm
           path: dist/
+
+  # The Kubernetes images (plans/kubernetes-v2-architecture.md P1): aerolvm,
+  # aerolvm-runtime and aerolvm-edge, built from this release's own Linux
+  # binaries (scripts/build-images.sh; nothing is compiled in the image) for
+  # amd64 and arm64, pushed to ghcr.io/aerol-ai with an SBOM and SLSA
+  # provenance attached by buildx, signed keyless with cosign, and attested
+  # with GitHub's provenance as the release files are. RELEASE-VERIFICATION.md
+  # says how to check them.
+  images:
+    name: Images
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      REGISTRY: ghcr.io/aerol-ai
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download the Linux binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-linux_{amd64,arm64}
+          merge-multiple: true
+          path: dist
+
+      - name: Set up QEMU (arm64 package installs)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: scripts/build-images.sh --dist dist --version "$VERSION" --registry "$REGISTRY" --push --metadata-dir image-meta
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign
+        run: |
+          for pair in aerolvm:AEROLVM_DIGEST aerolvm-runtime:RUNTIME_DIGEST aerolvm-edge:EDGE_DIGEST; do
+            image="${pair%%:*}" var="${pair#*:}"
+            digest="$(jq -r '."containerimage.digest"' "image-meta/$image.json")"
+            [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $image"; exit 1; }
+            cosign sign --yes "$REGISTRY/$image@$digest"
+            echo "$var=$digest" >> "$GITHUB_ENV"
+          done
+
+      - name: Attest aerolvm
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm
+          subject-digest: ${{ env.AEROLVM_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-runtime
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-runtime
+          subject-digest: ${{ env.RUNTIME_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-edge
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-edge
+          subject-digest: ${{ env.EDGE_DIGEST }}
+          push-to-registry: true
 
   release:
     name: Publish release
