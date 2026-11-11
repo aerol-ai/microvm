@@ -78,6 +78,24 @@ c7_setup() {
   echo 0 > "$cg/memory.oom.group" 2>/dev/null || true
   echo 0 > "$cg/sandboxes/memory.oom.group" 2>/dev/null || true
   [[ -n "$self" ]] && echo 0 > "/sys/fs/cgroup$(dirname "$self")/memory.oom.group" 2>/dev/null || true
+  # F10's full fix (fifth S3 run showed it is needed): with sandboxes and the
+  # machinery sharing the container's one limit, a pod at that limit starved
+  # sandboxd even after whole sandboxes were killed. So sandboxes/ gets its
+  # own cap, the container's limit minus a reserve (10%, between 1 and
+  # 4 GiB), and supervisor/ keeps memory.min of that reserve. An out-of-memory
+  # event then happens inside sandboxes/, where it can only kill a sandbox.
+  local max reserve
+  read -r max < "$cg/memory.max"
+  if [[ "$max" =~ ^[0-9]+$ ]]; then
+    reserve=$(( max / 10 ))
+    (( reserve < 1073741824 )) && reserve=1073741824
+    (( reserve > 4294967296 )) && reserve=4294967296
+    echo $(( max - reserve )) > "$cg/sandboxes/memory.max"
+    echo "$reserve" > "$cg/supervisor/memory.min" 2>/dev/null || true
+    echo "worker: sandboxes/ capped at $(( (max - reserve) / 1048576 )) MiB; ${reserve} bytes kept for the machinery" >&2
+  else
+    echo "worker: the container has no memory limit ($max); sandboxes/ is not capped" >&2
+  fi
   echo "${self}/sandboxes"
 }
 
@@ -112,6 +130,23 @@ keep_sandboxes_first() {
     done
     sleep 2
   done
+}
+
+# prepare_nvme (spike S8) formats the machine's local NVMe instance store as
+# XFS with project quotas and mounts it as containerd's root, so each
+# sandbox's writable layer can get its own disk limit (plan C27, eng review
+# D8). A privileged container sees the machine's devices; the instance store
+# is the NVMe disk whose model says so. The spike formats it every start:
+# whatever was there belonged to a previous worker pod.
+prepare_nvme() {
+  local dev="" b
+  for b in /sys/block/nvme*n1; do
+    if grep -q 'Instance Storage' "$b/device/model" 2>/dev/null; then dev="/dev/${b##*/}"; break; fi
+  done
+  [[ -n "$dev" ]] || { echo "worker: no NVMe instance store on this machine" >&2; return 1; }
+  mkfs.xfs -f -q "$dev"
+  mount -o prjquota "$dev" /var/lib/containerd
+  echo "worker: $dev ($(lsblk -no SIZE "$dev" | head -1)) is XFS with project quotas at /var/lib/containerd"
 }
 
 # protect_from_oom lowers the caller's OOM score; what it starts inherits it.

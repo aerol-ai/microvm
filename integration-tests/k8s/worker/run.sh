@@ -9,7 +9,7 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "$0")/common.sh"
 
-dnf -y -q install iproute iptables-nft nftables procps-ng util-linux >/dev/null
+dnf -y -q install iproute iptables-nft nftables procps-ng util-linux xfsprogs >/dev/null
 export PATH="/opt/aerolvm/bin:$PATH"
 
 # C7 prototype (spike S1): every sandbox goes under this pod's own cgroup.
@@ -18,6 +18,11 @@ if [[ "${AEROL_C7_CGROUP_PARENT:-0}" == 1 ]]; then
   export SB_CONTAINERD_CGROUP_PARENT
   echo "run: C7 on; sandboxes go under ${SB_CONTAINERD_CGROUP_PARENT}"
   keep_sandboxes_first "/sys/fs/cgroup${SB_CONTAINERD_CGROUP_PARENT}" &
+fi
+
+# S8: containerd's root on the local NVMe, XFS with project quotas.
+if [[ "${AEROL_S8_NVME:-0}" == 1 ]]; then
+  prepare_nvme
 fi
 
 # containerd's root is an emptyDir on the machine's disk (see the pod spec):

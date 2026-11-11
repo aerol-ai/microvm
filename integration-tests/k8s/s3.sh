@@ -86,7 +86,7 @@ if [[ "$pressure_only" == 0 ]]; then
 fi
 
 say "--- OOM settings before the pressure: memory.oom.group of the pod, the worker container and sandboxes/; OOM score by process"
-node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do echo \${d##*/} memory.oom.group=\$(cat \$d/memory.oom.group); done; echo sandbox groups with memory.oom.group=1: \$(cat /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/*/memory.oom.group 2>/dev/null | grep -c 1); for d in /proc/[0-9]*; do g=\$(cut -d: -f3 \$d/cgroup 2>/dev/null); case \$g in *pod${uid}*) echo \$(cat \$d/comm) oom_score_adj=\$(cat \$d/oom_score_adj);; esac; done | sort | uniq -c | sort -rn | head -12"
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do echo \${d##*/} memory.oom.group=\$(cat \$d/memory.oom.group); done; for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -d \$d ] && echo \${d##*/} memory.max=\$(cat \$d/memory.max) memory.min=\$(cat \$d/memory.min) memory.current=\$(cat \$d/memory.current); done; echo sandbox groups with memory.oom.group=1: \$(cat /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/*/memory.oom.group 2>/dev/null | grep -c 1); for d in /proc/[0-9]*; do g=\$(cut -d: -f3 \$d/cgroup 2>/dev/null); case \$g in *pod${uid}*) echo \$(cat \$d/comm) oom_score_adj=\$(cat \$d/oom_score_adj);; esac; done | sort | uniq -c | sort -rn | head -12"
 
 # Memory pressure: each sandbox writes 48 MB to its tmpfs at once. Within each
 # sandbox's own 64 MB limit, but together about 48 GB on top of the gVisor
@@ -120,5 +120,7 @@ if alive="$(count_sandboxes 2>/dev/null)"; then
 else
   say "sandboxd does not answer"
 fi
+say "--- memory of the groups after the pressure"
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -d \$d ] && echo \${d##*/} memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max) oom_kill=\$(grep oom_kill \$d/memory.events | head -1 | cut -d' ' -f2); done"
 measure "after pressure"
 say "--- done; report in $report"

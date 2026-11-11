@@ -1,0 +1,68 @@
+# N1: agent-sandbox's side. A namespace, gVisor in the machine's containerd on
+# the node labelled aerolvm.io/n1=agent-sandbox, the gvisor RuntimeClass, and
+# the bench pod's rights. The template and warm pool are in template.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: n1
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gvisor-node
+  namespace: n1
+spec:
+  selector: { matchLabels: { app: gvisor-node } }
+  template:
+    metadata: { labels: { app: gvisor-node } }
+    spec:
+      nodeSelector: { aerolvm.io/n1: agent-sandbox }
+      tolerations: [{ key: aerolvm.io/worker, operator: Exists, effect: NoSchedule }]
+      hostPID: true
+      containers:
+        - name: install
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          command: ["sh", "/scripts/gvisor-node.sh"]
+          securityContext: { privileged: true }
+          volumeMounts:
+            - { name: host, mountPath: /host }
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - { name: host, hostPath: { path: / } }
+        - { name: scripts, configMap: { name: n1-scripts } }
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+scheduling:
+  nodeSelector: { aerolvm.io/n1: agent-sandbox }
+  tolerations: [{ key: aerolvm.io/worker, operator: Exists, effect: NoSchedule }]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: n1-bench
+  namespace: n1
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: n1-bench
+rules:
+  - apiGroups: ["agents.x-k8s.io", "extensions.agents.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["pods", "events", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: n1-bench
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: n1-bench }
+subjects: [{ kind: ServiceAccount, name: n1-bench, namespace: n1 }]
