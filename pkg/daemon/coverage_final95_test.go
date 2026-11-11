@@ -95,7 +95,7 @@ func TestFinal95ReconcilerNilStoreGuards(t *testing.T) {
 
 func TestFinal95MultiEventsCancelDuringDrain(t *testing.T) {
 	src := &fakeEventsSource{prefix: "flood", n: 64}
-	mux := newMultiEventsSource(src)
+	mux := newMultiEventsSource(testLogger(), src)
 	ctx, cancel := context.WithCancel(context.Background())
 	out := make(chan docker.DockerEvent)
 	done := make(chan error, 1)

@@ -6671,9 +6671,19 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 
-	dockerManaged, err := s.docker.ListManaged(ctx)
-	if err != nil {
-		return err
+	// A failed Docker listing must not stop the pass for sandboxes that do
+	// not live in Docker. On a containerd-engine host where dockerd is
+	// stopped, or was never installed (the Kubernetes worker pod), it fails
+	// every time, and returning here left a containerd sandbox the kernel
+	// had killed listed as started for good (Kubernetes Phase 0, finding
+	// F12). What this pass cannot see, it leaves alone: rows that would be
+	// matched against Docker's list, and the stale-mount sweep, which would
+	// otherwise read "not listed" as "gone".
+	dockerManaged, dockerErr := s.docker.ListManaged(ctx)
+	dockerListed := dockerErr == nil
+	if !dockerListed {
+		s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
+		dockerManaged = map[string]*models.SandboxRuntimeState{}
 	}
 	containerdManaged := map[string]*models.SandboxRuntimeState{}
 	if s.containerd != nil {
@@ -6715,15 +6725,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
-		runtimeManaged := dockerManaged
+		runtimeManaged, inDocker := dockerManaged, true
 		if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd {
-			runtimeManaged = containerdManaged
+			runtimeManaged, inDocker = containerdManaged, false
 		}
 		if s.isFirecrackerSandbox(sandbox) {
-			runtimeManaged = firecrackerManaged
+			runtimeManaged, inDocker = firecrackerManaged, false
 		}
 		if s.isWasmSandbox(sandbox) {
-			runtimeManaged = wasmManaged
+			runtimeManaged, inDocker = wasmManaged, false
+		}
+		if inDocker && !dockerListed {
+			continue
 		}
 		state, ok := runtimeManaged[sandbox.ID]
 		if !ok {
@@ -7207,7 +7220,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			keep[id] = struct{}{}
 		}
 	}
-	s.mounts.Sweep(keep)
+	if dockerListed {
+		s.mounts.Sweep(keep)
+	}
 
 	// Reuse this sweep's already-loaded snapshot to emit one window of reserved
 	// usage (uptime + cpu/mem/disk/gpu). No-op on the open-source build (no
