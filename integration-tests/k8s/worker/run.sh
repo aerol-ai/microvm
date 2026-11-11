@@ -56,6 +56,24 @@ fi
 prepare_netfilter
 sandboxd_env
 
+# C6: the egress gateway with no systemd, as a pod would run it: its own
+# process, a numeric user no passwd file names, only CAP_NET_ADMIN and
+# CAP_NET_BIND_SERVICE, a socket it makes itself, and no sandboxd.service
+# cgroup to check its peer against.
+if [[ "${AEROL_EGRESS_GATEWAY:-0}" == 1 ]]; then
+  mkdir -p /run/aerolvm /var/lib/aerolvm-egress
+  chown 65532:65532 /var/lib/aerolvm-egress
+  # The gateway makes its own socket here; sandboxd (root) makes the lookup one.
+  chown 0:65532 /run/aerolvm && chmod 0775 /run/aerolvm
+  ( SB_EGRESS_PEER_CGROUP=none SB_EGRESS_STATE_DIR=/var/lib/aerolvm-egress \
+      setpriv --reuid=65532 --regid=65532 --clear-groups \
+        --inh-caps=-all,+net_admin,+net_bind_service --ambient-caps=-all,+net_admin,+net_bind_service \
+        --bounding-set=-all,+net_admin,+net_bind_service \
+        /opt/aerolvm/bin/sandboxd egress-gateway ) 2>&1 | sed -u 's/^/[gateway] /' &
+  export SB_EGRESS_GATEWAY_USER=65532
+  echo "run: egress gateway started as uid 65532 without systemd (C6)"
+fi
+
 echo "run: starting sandboxd"
 # Not exec: the pipe adds a log prefix, and pipefail makes the container exit
 # with sandboxd's status when it dies, so the pod shows the crash.

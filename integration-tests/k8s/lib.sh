@@ -29,9 +29,11 @@ ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
 # presigned URLs to $sd/urls.tfvars. Built from the last commit, not the
 # working tree: harness files do not go into sandboxd, so editing them must
 # not force a new build or upload.
+# AEROL_BUILD_REF builds sandboxd from another commit (a branch under test)
+# while the harness scripts stay this checkout's.
 publish_build() {
   local ref k
-  ref="$(git -C "$LIB_ROOT" rev-parse HEAD)"
+  ref="$(git -C "$LIB_ROOT" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
   "$LIB_ROOT/integration-tests/lib/build.sh" build --ref "$ref" --arch amd64 >&2
   "$LIB_ROOT/integration-tests/lib/build.sh" publish --ref "$ref" --ttl 6h --arch amd64 >&2
   "$LIB_ROOT/integration-tests/lib/build.sh" urls --ref "$ref" --ttl 6h --arch amd64 > "$sd/urls.tfvars"
