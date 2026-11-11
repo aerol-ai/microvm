@@ -629,6 +629,14 @@ type Config struct {
 	// budget when the host filesystem is larger than the sandbox pool.
 	DiskReservationRatio float64
 	HostDiskGB           int
+	// DiskFloorRatio refuses new creates (503 + Retry-After) while the
+	// sandbox volume has less than this share of its space free, so one
+	// sandbox filling the disk cannot take the images, the database and
+	// every other sandbox down with it (C27 in
+	// plans/kubernetes-v2-architecture.md). 0 turns it off. DiskFloorPath
+	// names the volume; empty means the container engine's data folder.
+	DiskFloorRatio float64
+	DiskFloorPath  string
 	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
 	// Docker via nvidia-container-runtime / amdgpu / etc. Used by placement
 	// scheduling so a GPU sandbox is never forwarded to a GPU-less peer.
@@ -2274,6 +2282,7 @@ func load(keyTool bool) (Config, error) {
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
 		DiskReservationRatio:      getEnvFloat("SB_DISK_RESERVATION_RATIO", 0),
 		HostDiskGB:                getEnvInt("SB_HOST_DISK_GB", 0),
+		DiskFloorPath:             strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_PATH")),
 		HostGPUCount:              getEnvInt("SB_HOST_GPU_COUNT", 0),
 		HostGPUVendor:             strings.ToLower(strings.TrimSpace(os.Getenv("SB_HOST_GPU_VENDOR"))),
 		HostSupportedRuntimes:     splitAndTrim(os.Getenv("SB_HOST_RUNTIMES"), ","),
@@ -2583,6 +2592,11 @@ func load(keyTool bool) (Config, error) {
 	if cfg.ExecOutputMaxBytes > 0 && cfg.ExecOutputDefaultBytes > cfg.ExecOutputMaxBytes {
 		return Config{}, fmt.Errorf("SB_EXEC_OUTPUT_DEFAULT_BYTES (%d) must not exceed SB_EXEC_OUTPUT_MAX_BYTES (%d)", cfg.ExecOutputDefaultBytes, cfg.ExecOutputMaxBytes)
 	}
+	diskFloorRatio, err := loadDiskFloorRatio()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DiskFloorRatio = diskFloorRatio
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
 	}
@@ -3678,6 +3692,22 @@ func getEnvBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+// loadDiskFloorRatio reads SB_DISK_FLOOR_RATIO. Like the exec output limits,
+// a value that does not parse refuses the boot instead of falling back to
+// the default: the default is off, so a typo such as "10%" would silently
+// drop the floor the operator asked for.
+func loadDiskFloorRatio() (float64, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_RATIO"))
+	if raw == "" {
+		return 0, nil
+	}
+	ratio, err := strconv.ParseFloat(raw, 64)
+	if err != nil || ratio < 0 || ratio >= 1 {
+		return 0, fmt.Errorf("SB_DISK_FLOOR_RATIO must be 0 (off) or a fraction below 1 such as 0.10, got %q", raw)
+	}
+	return ratio, nil
 }
 
 func getEnvFloat(key string, fallback float64) float64 {

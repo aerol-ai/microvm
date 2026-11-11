@@ -45,6 +45,13 @@ type Limits struct {
 	// because Docker's --storage-opt size is GB-granular and operators
 	// reason about disk in GB. 0 = unlimited.
 	DiskReservationRatio float64
+	// DiskFloorRatio refuses new sandboxes while the sandbox volume (the
+	// admitter's DiskProbe) has less than this share of its space free
+	// (e.g. 0.10 = refuse under 10% free). Unlike the reservation budget it
+	// reads the disk itself, because one sandbox can write far past its
+	// DiskGB where the runtime does not enforce it. 0 = no floor; without
+	// a DiskProbe there is nothing to read and the floor is off too.
+	DiskFloorRatio float64
 	// MemoryFloorRatio is the minimum live MemAvailable the host must retain
 	// after admitting the request, expressed as a fraction of total host
 	// memory (e.g. 0.05 = keep at least 5% of RAM free). Expressing this as a
@@ -163,6 +170,12 @@ type Snapshot struct {
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`
+	// DiskFloorRatio and the sandbox volume's live size and free space, read
+	// through the DiskProbe. Omitted on a host without one, so a peer reads
+	// "unknown", never "empty disk".
+	DiskFloorRatio     float64 `json:"disk_floor_ratio,omitempty"`
+	SandboxDiskTotalMB int     `json:"sandbox_disk_total_mb,omitempty"`
+	SandboxDiskFreeMB  int     `json:"sandbox_disk_free_mb,omitempty"`
 	// Phase 5 effective-memory axis. ActualRSSMB is the live aggregate
 	// from the per-VMM sampler; EffectiveMemoryFreeMB is the headroom
 	// admission actually decides against (HostMem - ActualRSSMB);
@@ -328,6 +341,10 @@ type Admitter struct {
 	limits Limits
 	probe  MemProbe
 	rss    RSSSource // Phase 5; nil disables the RSS-watermark axis
+
+	// disk reads the sandbox volume for DiskFloorRatio and the snapshot;
+	// nil until SetDiskProbe. Guarded by mu.
+	disk DiskProbe
 
 	mu           sync.Mutex
 	reservations map[string]Request
@@ -693,6 +710,15 @@ func (a *Admitter) admitOnce(sandboxID string, req Request, onlyNew bool) (int, 
 			))
 		}
 	}
+	// Only a new reservation (a create, a warm slot, a stopped sandbox
+	// starting) meets the disk floor. Re-admitting an ID that holds one is a
+	// resize or an idempotent retry of a sandbox already on the disk;
+	// refusing it would not stop one byte being written.
+	if !exists {
+		if reason := a.diskFloorReason(a.disk); reason != "" {
+			reasons = append(reasons, reason)
+		}
+	}
 
 	// Phase 5: effective-memory watermark. Gated on a non-nil sampler
 	// AND Ready() — a cold-start sampler returns 0, which under a
@@ -804,6 +830,7 @@ func (a *Admitter) Snapshot() Snapshot {
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
 	parkedCPU, parkedMem, parkedDisk, parkedSlots := a.parkedCPU, a.parkedMemMB, a.parkedDiskGB, a.parkedSlots
+	disk := a.disk
 	a.mu.Unlock()
 
 	free := 0
@@ -813,7 +840,15 @@ func (a *Admitter) Snapshot() Snapshot {
 		}
 	}
 	diskFree := a.host.DiskFreeGB
-	if _, v, err := detectDiskGB(defaultDiskPath()); err == nil {
+	var sandboxDiskTotalMB, sandboxDiskFreeMB int
+	if disk != nil {
+		// The probe names the sandbox volume, which is what HostDiskFreeGB
+		// means; one read serves both.
+		if total, avail, err := disk.DiskUsage(); err == nil {
+			sandboxDiskTotalMB, sandboxDiskFreeMB = bytesToMB(total), bytesToMB(avail)
+			diskFree = bytesToGB(avail)
+		}
+	} else if _, v, err := detectDiskGB(defaultDiskPath()); err == nil {
 		diskFree = v
 	}
 
@@ -857,6 +892,8 @@ func (a *Admitter) Snapshot() Snapshot {
 		CPUOverProvisionFactor:    a.cpuOverProvisionFactor(),
 		MemoryOverProvisionFactor: a.memOverProvisionFactor(),
 		MemoryFloorMB:             a.memoryFloorMB(),
+		SandboxDiskTotalMB:        sandboxDiskTotalMB,
+		SandboxDiskFreeMB:         sandboxDiskFreeMB,
 		CPUBudget:                 a.cpuBudget(),
 		MemoryBudgetMB:            a.memBudgetMB(),
 		DiskBudgetGB:              a.diskBudgetGB(),
@@ -874,6 +911,10 @@ func (a *Admitter) Snapshot() Snapshot {
 	// report CanAdmit=true even when the host is full. Parked slots do not
 	// count: Admit reclaims them for a real sandbox, so a host full of warm
 	// slots is still accepting, and placement must not skip it on this flag.
+	if disk != nil {
+		// Without a probe the floor is off whatever the ratio says.
+		snap.DiskFloorRatio = a.limits.DiskFloorRatio
+	}
 	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1}, true)
 	recordHostPressure(snap)
 	return snap
@@ -896,6 +937,7 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
 	slotLimit, slotHeld := a.slotLimit, a.slotUsed
+	disk := a.disk
 	if excludeParked {
 		totalCPU -= a.parkedCPU
 		totalMem -= a.parkedMemMB
@@ -943,6 +985,9 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 		if free, err := a.probe.FreeMB(); err == nil && free-req.MemoryMB < floor {
 			reasons = append(reasons, fmt.Sprintf("live memory floor breached (%d MB free, %d MB floor)", free, floor))
 		}
+	}
+	if reason := a.diskFloorReason(disk); reason != "" {
+		reasons = append(reasons, reason)
 	}
 	if watermark := a.rssWatermarkMB(); watermark > 0 && a.rss != nil && a.rss.Ready() {
 		effective := a.host.MemoryTotalMB - a.rss.TotalRSSMB()

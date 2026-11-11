@@ -47,6 +47,7 @@ image-pull storm if the signals point there.
 | `SandboxdRaftApplyStuck` | Stop new deploys; inspect leader CPU/disk/network. | in-flight apply remains > 5 minutes. |
 | `SandboxdWorkerLeaseStale` | Check worker health and mTLS/gossip connectivity. | stale age keeps rising or all workers stale. |
 | `SandboxdNoAdmitWorkers` | Check capacity, disk, and drains. | all creates fail or no workers can uncordon. |
+| `SandboxdSandboxDiskHigh` | Find what fills the node's sandbox volume ([Sandbox disk](#sandbox-disk)). | free space nears `SB_DISK_FLOOR_RATIO`, or several nodes fire at once. |
 | `SandboxdCreateQueueBacklog` | Determine if backlog is image, capacity, or Raft bound. | queue grows for > 10 minutes. |
 | `SandboxdIngressRouteLag` | Check Caddy admin errors and ingress CPU. | route lag increases while creates continue. |
 | `SandboxdCaddyAdminErrors` | Check Caddy service and admin endpoint. | public URLs fail or route lag grows. |
@@ -101,6 +102,22 @@ Mitigation:
 - Drain workers with stale leases only if they are flapping and causing
   placement retries.
 - Do not manually create sandboxes on server/ingress-only nodes.
+
+### Sandbox disk
+
+The node's sandbox volume holds image layers and every sandbox's own files.
+`aerolvm_host_pressure_sandbox_disk_free_mb` and `_total_mb` show it; the
+`sandbox volume` line in the boot log names its path. When free space drops
+below `SB_DISK_FLOOR_RATIO` of the volume, the node refuses new creates with
+`503` and `disk floor breached` in the reason, and placement sends creates to
+other nodes. Running sandboxes keep running and can still be resized; a
+stopped sandbox cannot start on that node until space is freed.
+
+- Find the largest sandboxes on the node and ask their owners to clean up,
+  or delete abandoned ones.
+- Remove images no sandbox uses (image GC, or the engine's prune).
+- Drain the node if one sandbox keeps writing; its files go with it.
+- Add disk or nodes if the fill is steady growth, not one runaway sandbox.
 
 ## Create Path Checks
 
