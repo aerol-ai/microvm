@@ -6,6 +6,7 @@
 #                          [--type m7i.xlarge] [--workers 1] [--version 1.36]
 #   cluster.sh down <name>
 #   cluster.sh kubeconfig <name>      # prints the kubeconfig path
+#   cluster.sh allow-ip <name>        # let this machine's current address in
 #
 # Each run keeps its Terraform state in .state/<name>/ (git-ignored), so two
 # runs never share state, and `down` removes exactly what `up` made. `up`
@@ -18,7 +19,7 @@ TF_DIR="$HERE/terraform"
 
 die() { echo "cluster.sh: $*" >&2; exit 1; }
 
-usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # ttl_from_now turns "3h" or "90m" into an RFC 3339 UTC time. macOS date and
 # GNU date spell the offset differently.
@@ -94,8 +95,34 @@ cmd_kubeconfig() {
   echo "$f"
 }
 
+# cmd_allow_ip adds this machine's current public address to the cluster
+# API's allow list. `up` allows only the address it ran from, and a home
+# connection's address can change mid-run (it did during S3's sixth run, and
+# every kubectl call then timed out). The saved inputs get it too, so `down`
+# does not try to take it away.
+cmd_allow_ip() {
+  local name="${1:-}"; [[ -n "$name" ]] || usage
+  local sd; sd="$(state_dir "$name")"
+  [[ -f "$sd/run.tfvars.json" ]] || die "no saved inputs for $name"
+  local ip; ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')"
+  [[ "$ip" =~ ^[0-9.]+$ ]] || die "could not learn this machine's public address"
+  if jq -e --arg c "${ip}/32" '.api_allowed_cidrs | index($c)' "$sd/run.tfvars.json" >/dev/null; then
+    echo "allow-ip: ${ip}/32 is already allowed"; return 0
+  fi
+  local cidrs; cidrs="$(jq -r --arg c "${ip}/32" '(.api_allowed_cidrs + [$c]) | join(",")' "$sd/run.tfvars.json")"
+  local id; id="$(aws eks update-cluster-config --name "$name" \
+    --resources-vpc-config "publicAccessCidrs=$cidrs" --query update.id --output text)"
+  while [[ "$(aws eks describe-update --name "$name" --update-id "$id" --query update.status --output text)" == InProgress ]]; do
+    sleep 15
+  done
+  jq --arg c "${ip}/32" '.api_allowed_cidrs += [$c]' "$sd/run.tfvars.json" > "$sd/run.tfvars.json.new"
+  mv "$sd/run.tfvars.json.new" "$sd/run.tfvars.json"
+  echo "allow-ip: $name now allows $cidrs"
+}
+
 case "${1:-}" in
   up) shift; cmd_up "$@" ;;
+  allow-ip) shift; cmd_allow_ip "$@" ;;
   down) shift; cmd_down "$@" ;;
   kubeconfig) shift; cmd_kubeconfig "$@" ;;
   *) usage ;;

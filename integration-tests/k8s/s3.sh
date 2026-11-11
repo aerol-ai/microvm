@@ -86,7 +86,7 @@ if [[ "$pressure_only" == 0 ]]; then
 fi
 
 say "--- OOM settings before the pressure: memory.oom.group of the pod, the worker container and sandboxes/; OOM score by process"
-node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do echo \${d##*/} memory.oom.group=\$(cat \$d/memory.oom.group); done; for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -d \$d ] && echo \${d##*/} memory.max=\$(cat \$d/memory.max) memory.min=\$(cat \$d/memory.min) memory.current=\$(cat \$d/memory.current); done; echo sandbox groups with memory.oom.group=1: \$(cat /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/*/memory.oom.group 2>/dev/null | grep -c 1); for d in /proc/[0-9]*; do g=\$(cut -d: -f3 \$d/cgroup 2>/dev/null); case \$g in *pod${uid}*) echo \$(cat \$d/comm) oom_score_adj=\$(cat \$d/oom_score_adj);; esac; done | sort | uniq -c | sort -rn | head -12"
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes; do echo \${d##*/} memory.oom.group=\$(cat \$d/memory.oom.group); done; for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/_runtime /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -d \$d ] && echo \${d##*/} memory.max=\$(cat \$d/memory.max) memory.min=\$(cat \$d/memory.min) memory.current=\$(cat \$d/memory.current); done; echo sandbox groups with memory.oom.group=1: \$(cat /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/*/memory.oom.group 2>/dev/null | grep -c 1); for d in /proc/[0-9]*; do g=\$(cut -d: -f3 \$d/cgroup 2>/dev/null); case \$g in *pod${uid}*) echo \$(cat \$d/comm) oom_score_adj=\$(cat \$d/oom_score_adj);; esac; done | sort | uniq -c | sort -rn | head -12"
 
 # Memory pressure: each sandbox writes 48 MB to its tmpfs at once. Within each
 # sandbox's own 64 MB limit, but together about 48 GB on top of the gVisor
@@ -111,16 +111,22 @@ say "node MemoryPressure: $(kubectl get node "$node" -o jsonpath='{.status.condi
 say "--- events in the worker namespace"
 kubectl -n "$NS" get events --sort-by=.lastTimestamp 2>/dev/null | grep -iE 'evict|oom|kill|memory' | tail -8 | cut -c1-200 | tee -a "$report" >/dev/null || true
 say "--- the kernel's OOM events and victims on the machine"
-node_debug "chroot /host journalctl -k --since '-20 min' --no-pager > /tmp/k.txt 2>/dev/null; echo oom-events: \$(grep -c 'oom-kill:constraint' /tmp/k.txt); grep -o 'oom_memcg=[^,]*' /tmp/k.txt | sed 's#.*kubepods-pod[^/]*##' | sort | uniq -c | sort -rn | head -4; echo victims:; grep -o 'Killed process [0-9]* ([^)]*)' /tmp/k.txt | sed 's/Killed process [0-9]* //' | sort | uniq -c | sort -rn | head -8"
+node_debug "chroot /host journalctl -k --since '-40 min' --no-pager > /tmp/k.txt 2>/dev/null; echo oom-events: \$(grep -c 'oom-kill:constraint' /tmp/k.txt); grep -o 'oom_memcg=[^,]*' /tmp/k.txt | sed 's#.*kubepods-pod[^/]*##' | sort | uniq -c | sort -rn | head -4; echo victims:; grep -o 'Killed process [0-9]* ([^)]*)' /tmp/k.txt | sed 's/Killed process [0-9]* //' | sort | uniq -c | sort -rn | head -8"
 forward
 sleep 60
 forward
 if alive="$(count_sandboxes 2>/dev/null)"; then
   say "sandboxd still answers; sandboxes listed: $alive"
+  t0=$(ms)
+  id="$(api /v1/sandboxes -X POST -d '{"image":"alpine:3.20","runtime":"gvisor","cpu":0.1,"memory_mb":64}' 2>/dev/null | jq -r '.id // empty')"
+  say "a new create after the pressure: $([[ -n "$id" ]] && echo "ok in $(( $(ms) - t0 )) ms" || echo failed)"
 else
   say "sandboxd does not answer"
 fi
 say "--- memory of the groups after the pressure"
-node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -d \$d ] && echo \${d##*/} memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max) oom_kill=\$(grep oom_kill \$d/memory.events | head -1 | cut -d' ' -f2); done"
+# memory.events counts this group and everything under it; .local counts
+# only the group's own limit. The container's own "max" events say whether
+# the pod's limit was hit, which is what the cap on sandboxes/ must prevent.
+node_debug "for d in /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/sandboxes/_runtime /sys/fs/cgroup/kubepods.slice/kubepods-pod${uid}.slice/cri-containerd-*.scope/supervisor; do [ -f \$d/memory.events ] && echo \${d##*/} memory.current=\$(cat \$d/memory.current) memory.max=\$(cat \$d/memory.max) events: \$(tr '\\n' ' ' < \$d/memory.events) local: \$(tr '\\n' ' ' < \$d/memory.events.local); done"
 measure "after pressure"
 say "--- done; report in $report"

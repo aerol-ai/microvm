@@ -30,7 +30,7 @@ fi
 mkdir -p /run/containerd /etc/containerd
 protect_from_oom $$
 containerd config default > /etc/containerd/config.toml
-containerd --config /etc/containerd/config.toml 2>&1 | sed -u 's/^/[containerd] /' &
+( in_runtime_group "${SB_CONTAINERD_CGROUP_PARENT:-}" containerd --config /etc/containerd/config.toml ) 2>&1 | sed -u 's/^/[containerd] /' &
 for _ in $(seq 1 60); do
   [[ -S /run/containerd/containerd.sock ]] && break
   sleep 1

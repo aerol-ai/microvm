@@ -42,6 +42,7 @@ open(sys.argv[2], "w").write(s)
 PY
   apply_worker "$manifest" 1
   wait_ready
+  wait_api
   kubectl -n "$NS" expose pod "$POD" --name worker-svc --port 21212 --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   say "AerolVM worker up, warm pool $([[ $pool == 1 ]] && echo 'on (depth 5)' || echo off)"
 }

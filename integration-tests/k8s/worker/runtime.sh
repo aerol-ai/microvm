@@ -23,7 +23,7 @@ keep_sandboxes_first "/sys/fs/cgroup${parent}" &
 protect_from_oom $$
 containerd config default > /etc/containerd/config.toml
 while true; do
-  containerd --config /etc/containerd/config.toml 2>&1 | sed -u 's/^/[containerd] /' || true
+  ( in_runtime_group "$parent" containerd --config /etc/containerd/config.toml ) 2>&1 | sed -u 's/^/[containerd] /' || true
   echo "runtime: containerd exited; starting it again in 2s"
   sleep 2
 done

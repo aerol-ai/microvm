@@ -84,6 +84,16 @@ c7_setup() {
   # own cap, the container's limit minus a reserve (10%, between 1 and
   # 4 GiB), and supervisor/ keeps memory.min of that reserve. An out-of-memory
   # event then happens inside sandboxes/, where it can only kill a sandbox.
+  #
+  # containerd runs in sandboxes/_runtime, inside the cap, not in
+  # supervisor/ (sixth S3 run): every sandbox's shim and runsc helpers are
+  # containerd's children and start in its group, about 8 MB a sandbox. In
+  # supervisor/ they grew it to 8 GB at 1,000 sandboxes, past the reserve,
+  # and the container's own limit was hit before the cap. They cannot be
+  # moved later (cgroup v2 leaves memory charged where it was used), and
+  # gVisor's shim ignores containerd's shim_cgroup option.
+  mkdir -p "$cg/sandboxes/_runtime"
+  echo 0 > "$cg/sandboxes/_runtime/memory.oom.group" 2>/dev/null || true
   local max reserve
   read -r max < "$cg/memory.max"
   if [[ "$max" =~ ^[0-9]+$ ]]; then
@@ -121,6 +131,8 @@ keep_sandboxes_first() {
   local dir="$1" d pid v
   while true; do
     for d in "$dir"/*/; do
+      # containerd and the shims: the machinery, never a victim.
+      [[ "$d" == */_runtime/ ]] && continue
       [[ -e "$d/memory.oom.group" ]] || continue
       { read -r v < "$d/memory.oom.group"; } 2>/dev/null && [[ "$v" == 1 ]] || echo 1 > "$d/memory.oom.group" 2>/dev/null
       while read -r pid; do
@@ -147,6 +159,17 @@ prepare_nvme() {
   mkfs.xfs -f -q "$dev"
   mount -o prjquota "$dev" /var/lib/containerd
   echo "worker: $dev ($(lsblk -no SIZE "$dev" | head -1)) is XFS with project quotas at /var/lib/containerd"
+}
+
+# in_runtime_group <cgroup parent> <command...> runs the command in
+# <parent>/_runtime (see c7_setup), so every process it starts is charged
+# inside the sandboxes/ cap from its first page. With no parent it just runs.
+in_runtime_group() {
+  local parent="$1"; shift
+  if [[ -n "$parent" ]]; then
+    echo "$BASHPID" > "/sys/fs/cgroup${parent}/_runtime/cgroup.procs"
+  fi
+  exec "$@"
 }
 
 # protect_from_oom lowers the caller's OOM score; what it starts inherits it.

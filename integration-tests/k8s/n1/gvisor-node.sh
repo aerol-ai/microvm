@@ -18,8 +18,12 @@ if [ -d "$(dirname "$runsc")/gvisor-bin" ]; then
   find "$(dirname "$runsc")/gvisor-bin" -maxdepth 1 -type f -exec install -m 0755 {} /host/usr/local/bin/gvisor-bin/ \;
 fi
 cfg=/host/etc/containerd/config.toml
+# containerd 2's config (version 3) and 1.7's (version 2) name the CRI
+# plugin differently.
+cri='io.containerd.grpc.v1.cri'
+grep -Eq '^version *= *3' "$cfg" && cri='io.containerd.cri.v1.runtime'
 if ! grep -q 'runtimes.runsc' "$cfg"; then
-  printf '\n[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runsc]\n  runtime_type = "io.containerd.runsc.v1"\n' >> "$cfg"
+  printf '\n[plugins."%s".containerd.runtimes.runsc]\n  runtime_type = "io.containerd.runsc.v1"\n' "$cri" >> "$cfg"
   nsenter -t 1 -m -u -i -n -p -- systemctl restart containerd
 fi
 echo "gvisor-node: runsc $(/host/usr/local/bin/runsc --version | head -1) in the machine's containerd"
