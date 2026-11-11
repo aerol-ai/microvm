@@ -849,6 +849,21 @@ jobs:
             echo "::error::the edge rendered with no certificate source"
             exit 1
           fi
+          # C24: the egress NetworkPolicy is on by default and off when
+          # asked; the cluster's addresses reach sandboxd and the gateway,
+          # and stay out of the policy's internet rule.
+          helm template t charts/aerolvm | grep -q 'kind: NetworkPolicy'
+          if helm template t charts/aerolvm --set networkPolicy.enabled=false | grep -q 'kind: NetworkPolicy'; then
+            echo "::error::networkPolicy.enabled=false still rendered a NetworkPolicy"
+            exit 1
+          fi
+          ranges="--set worker.egressDenyFloor={10.96.0.1} --set worker.egressPrivateRanges={10.244.0.0/16} --set networkPolicy.extraEgressCIDRs={10.50.0.0/16}"
+          out="$(helm template t charts/aerolvm $ranges)"
+          [ "$(grep -c 'SB_EGRESS_DENY_FLOOR_CIDRS, value: "10.96.0.1"' <<<"$out")" = 2 ]
+          [ "$(grep -c 'SB_EGRESS_PRIVATE_DEFAULT_CIDRS, value: "10.244.0.0/16"' <<<"$out")" = 2 ]
+          grep -q -- '- 10.96.0.1/32' <<<"$out"
+          grep -q -- '- 10.244.0.0/16' <<<"$out"
+          grep -q 'cidr: 10.50.0.0/16' <<<"$out"
 
       # kind's nodes share this runner's kernel, which has no br_netfilter
       # loaded; sandboxd refuses to start without it, since sandbox

@@ -55,6 +55,25 @@ worker:
   # become label values; set false to keep them off /v1/metrics.
   usageMetrics:
     enabled: true
+  # The cluster's own addresses (C24). Each entry is an address or a CIDR.
+  # In cluster mode the operator fills these in (Phase 2); in single mode
+  # you set them. Empty by default because the chart cannot know them.
+  #
+  # egressDenyFloor: addresses no sandbox can ever reach, whatever its
+  # egress profile says. Put the Kubernetes API server here: its Service
+  # address (kubectl get svc kubernetes -n default) and the addresses behind
+  # it (kubectl get endpointslices -n default -l
+  # kubernetes.io/service-name=kubernetes). Never the DNS Service address:
+  # sandboxes would lose DNS.
+  egressDenyFloor: []
+  # egressPrivateRanges: the cluster's pod, Service and node ranges.
+  # Sandboxes cannot reach them by default, like the private ranges, and an
+  # egress profile can open one on purpose. List them even when they sit
+  # inside 10.0.0.0/8: the NetworkPolicy below leaves them out too, and a
+  # range outside the private ranges (EKS custom networking uses
+  # 100.64.0.0/10 for pods, for example) needs it. Needs
+  # blockPrivateByDefault: true.
+  egressPrivateRanges: []
   # Any other sandboxd setting, as SB_NAME: value.
   extraEnv: {}
 
@@ -75,6 +94,32 @@ worker:
 service:
   type: ClusterIP
   port: 21212
+
+# An egress NetworkPolicy for the worker pod (C24): the second wall around
+# sandboxes, after AerolVM's own firewall inside the pod. Sandbox traffic
+# leaves with the pod's address, so this limits the whole pod: it may reach
+# the other AerolVM pods of this install, the cluster DNS, and the internet
+# without the private ranges (10/8, 172.16/12, 192.168/16, 100.64/10,
+# 169.254/16) and without worker.egressPrivateRanges and
+# worker.egressDenyFloor.
+#
+# On by default, because the chart's default is to keep sandboxes off the
+# bank's network (CEO review RQ14). A cluster whose network plugin does not
+# enforce NetworkPolicy ignores it. Turn it off only if your own policy
+# already limits the pod.
+networkPolicy:
+  enabled: true
+  # Where the cluster DNS runs; its pods get port 53.
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+  # Ranges the pod may reach on purpose. Two kinds go here:
+  #  - the one internal range a bank opens to sandboxes. Open it in AerolVM
+  #    too, with an egress profile, or sandboxes still cannot reach it;
+  #  - private addresses the pod itself needs: a private registry for
+  #    sandbox images, VPC endpoints for object storage or KMS, or the
+  #    NodeLocal DNSCache address (often 169.254.20.10/32).
+  extraEgressCIDRs: []
 
 # Sandbox links and the API over HTTPS (C25): an edge container runs
 # AerolVM's Caddy, as on a domain install. The API is https://<domain> and

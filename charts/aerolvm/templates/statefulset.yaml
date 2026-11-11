@@ -145,6 +145,7 @@ spec:
             # Per-owner usage counters on /v1/metrics (C20), read from each
             # sandbox's cgroup under SB_CONTAINERD_CGROUP_PARENT.
             - { name: SB_USAGE_METRICS_ENABLED, value: {{ .Values.worker.usageMetrics.enabled | quote }} }
+            {{- include "aerolvm.egressRangeEnv" . | nindent 12 }}
             # The egress container's user, by number (C6).
             - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
             {{- with .Values.worker.defaultRuntime }}
@@ -251,6 +252,9 @@ spec:
           env:
             - { name: SB_EGRESS_PEER_CGROUP, value: none }
             - { name: SB_EGRESS_STATE_DIR, value: /var/lib/aerolvm-egress }
+            # The gateway dials for sandboxes itself, so it must refuse the
+            # same addresses sandboxd's firewall does (C24).
+            {{- include "aerolvm.egressRangeEnv" . | nindent 12 }}
           securityContext:
             runAsUser: 0
             allowPrivilegeEscalation: false

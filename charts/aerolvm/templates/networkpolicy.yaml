@@ -1,0 +1,60 @@
+{{- if .Values.networkPolicy.enabled }}
+# What the worker pod may reach (plans/kubernetes-v2-architecture.md C24).
+# Sandbox traffic leaves with the pod's address, so the bank's rules cannot
+# tell it from AerolVM's own; this is the outer wall, around AerolVM's own
+# firewall inside the pod. Egress only: what may reach the pod is left to
+# the Services and the bank.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "aerolvm.name" . }}-worker-egress
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "aerolvm.selector" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    # The other AerolVM pods of this install, in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: aerolvm
+              app.kubernetes.io/instance: {{ .Release.Name }}
+    # The cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.podLabels | nindent 14 }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The internet: everything but the private ranges and the cluster's own
+    # addresses. IPv4 only; IPv6 stays shut, as sandboxes have none.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              {{- range concat .Values.worker.egressPrivateRanges .Values.worker.egressDenyFloor }}
+              {{- if not (contains ":" .) }}
+              - {{ include "aerolvm.cidr" . }}
+              {{- end }}
+              {{- end }}
+    {{- with .Values.networkPolicy.extraEgressCIDRs }}
+    # Ranges opened on purpose (networkPolicy.extraEgressCIDRs).
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ include "aerolvm.cidr" . }}
+        {{- end }}
+    {{- end }}
+{{- end }}
