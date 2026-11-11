@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,9 +21,10 @@ import (
 // evidence pack (P7) states, and exits 1 on any miss, so a bank can run it
 // instead of reading YAML. Phase 1 covers single mode: the images are
 // signed, the worker pod mounts nothing from the machine and holds no
-// Kubernetes API credential or DNS provider token (C25), and a probe
-// sandbox cannot reach the worker's own ports or the Kubernetes API (C24).
-// Phase 2 adds the full layout.
+// Kubernetes API credential or DNS provider token (C25), a NetworkPolicy
+// limits the worker pod's egress, and a probe sandbox cannot reach the
+// worker's own ports, another pod or the Kubernetes API (C24). Phase 2
+// adds the full layout.
 //
 // It reads the cluster with the kubectl and cosign already on this machine
 // (so the CLI carries no Kubernetes client), and probes through the AerolVM
@@ -83,7 +85,8 @@ type k8sPodList struct {
 
 type k8sPod struct {
 	Metadata struct {
-		Name string `json:"name"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
 		AutomountServiceAccountToken *bool `json:"automountServiceAccountToken"`
@@ -125,6 +128,137 @@ type k8sContainer struct {
 	} `json:"envFrom"`
 }
 
+// k8sNetworkPolicyList is the part of `kubectl get networkpolicies -o json`
+// verify reads.
+type k8sNetworkPolicyList struct {
+	Items []k8sNetworkPolicy `json:"items"`
+}
+
+type k8sNetworkPolicy struct {
+	Metadata struct {
+		Name string `json:"name"`
+	} `json:"metadata"`
+	Spec struct {
+		PodSelector k8sLabelSelector `json:"podSelector"`
+		PolicyTypes []string         `json:"policyTypes"`
+		Egress      []struct {
+			To []struct {
+				PodSelector       *k8sLabelSelector `json:"podSelector"`
+				NamespaceSelector *k8sLabelSelector `json:"namespaceSelector"`
+				IPBlock           *struct {
+					CIDR   string   `json:"cidr"`
+					Except []string `json:"except"`
+				} `json:"ipBlock"`
+			} `json:"to"`
+		} `json:"egress"`
+	} `json:"spec"`
+}
+
+type k8sLabelSelector struct {
+	MatchLabels      map[string]string `json:"matchLabels"`
+	MatchExpressions []struct {
+		Key      string   `json:"key"`
+		Operator string   `json:"operator"`
+		Values   []string `json:"values"`
+	} `json:"matchExpressions"`
+}
+
+// empty reports a selector that selects everything.
+func (s *k8sLabelSelector) empty() bool {
+	return s != nil && len(s.MatchLabels) == 0 && len(s.MatchExpressions) == 0
+}
+
+// matches applies the selector to a pod's labels, as Kubernetes does.
+func (s k8sLabelSelector) matches(labels map[string]string) bool {
+	for k, v := range s.MatchLabels {
+		if got, ok := labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	for _, e := range s.MatchExpressions {
+		v, ok := labels[e.Key]
+		switch e.Operator {
+		case "In":
+			if !ok || !slices.Contains(e.Values, v) {
+				return false
+			}
+		case "NotIn":
+			if ok && slices.Contains(e.Values, v) {
+				return false
+			}
+		case "Exists":
+			if !ok {
+				return false
+			}
+		case "DoesNotExist":
+			if ok {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// limitsEgress reports a policy that limits the egress of the pods it
+// selects. With no policyTypes, Kubernetes infers Egress from egress rules.
+func (np k8sNetworkPolicy) limitsEgress() bool {
+	if len(np.Spec.PolicyTypes) == 0 {
+		return len(np.Spec.Egress) > 0
+	}
+	return slices.Contains(np.Spec.PolicyTypes, "Egress")
+}
+
+// k8sBankRanges are the ranges a worker pod's egress must not open whole
+// (C24): the private ranges, where a bank's own network lives, and the
+// shared and link-local ranges, which clouds use for pods and their own
+// services. One range opened on purpose (a /16 inside 10.0.0.0/8) is fine.
+var k8sBankRanges = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fc00::/7"),
+}
+
+// opens names what one of the policy's rules lets every selected pod reach
+// that the wall is there to shut, or "" when nothing. NetworkPolicies add
+// up, so a single rule like that undoes every other policy on the pod.
+func (np k8sNetworkPolicy) opens() string {
+	for _, rule := range np.Spec.Egress {
+		if len(rule.To) == 0 {
+			return "lets the pod reach every address"
+		}
+		for _, peer := range rule.To {
+			if peer.NamespaceSelector.empty() && (peer.PodSelector == nil || peer.PodSelector.empty()) {
+				return "lets the pod reach every pod in the cluster"
+			}
+			if peer.IPBlock == nil {
+				continue
+			}
+			block, err := netip.ParsePrefix(peer.IPBlock.CIDR)
+			if err != nil {
+				continue // the API server refuses it; nothing to judge
+			}
+			for _, r := range k8sBankRanges {
+				if r.Addr().BitLen() != block.Addr().BitLen() || block.Bits() > r.Bits() || !block.Contains(r.Addr()) {
+					continue // the block does not hold this whole range
+				}
+				excepted := slices.ContainsFunc(peer.IPBlock.Except, func(e string) bool {
+					ep, err := netip.ParsePrefix(e)
+					return err == nil && ep.Bits() <= r.Bits() && ep.Contains(r.Addr())
+				})
+				if !excepted {
+					return fmt.Sprintf("lets the pod reach %s (ipBlock %s)", r, block)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // k8sSecretSource is a Secret volume, or a Secret in a projected volume:
 // SecretName is set on the first, Name on the second.
 type k8sSecretSource struct {
@@ -159,6 +293,7 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks := []k8sCheck{{Name: "AerolVM pods found", Result: k8sPass, Detail: strconv.Itoa(len(pods.Items)) + " pod(s)"}}
 	checks = append(checks, k8sImagesSigned(ctx, env, pods.Items, o.skipSignatures))
 	checks = append(checks, k8sNoHostMounts(pods.Items), k8sNoAPIRights(pods.Items), k8sNoDNSToken(pods.Items))
+	checks = append(checks, k8sEgressPolicy(ctx, env, pods.Items, o.namespace))
 	checks = append(checks, k8sProbe(ctx, env, pods.Items, o)...)
 	return checks
 }
@@ -286,9 +421,127 @@ func k8sNoDNSToken(pods []k8sPod) k8sCheck {
 	return k8sCheck{Name: name, Result: k8sPass}
 }
 
+// k8sEgressPolicy checks that a NetworkPolicy limits each worker pod's
+// egress (C24). Sandbox traffic leaves with the pod's address, so this is
+// the wall the bank's cluster sees, around AerolVM's own firewall in the
+// pod. A policy that selects the pod but opens a whole private range, every
+// address or every pod fails the check: policies add up, so one such rule
+// undoes the rest. Only worker pods are held to it; they are the ones that
+// carry sandbox traffic.
+func k8sEgressPolicy(ctx context.Context, env k8sEnv, pods []k8sPod, namespace string) k8sCheck {
+	const name = "a NetworkPolicy limits the worker pods' egress"
+	raw, err := env.kubectl(ctx, "get", "networkpolicies", "-n", namespace, "-o", "json")
+	if err != nil {
+		return k8sCheck{Name: name, Result: k8sFail, Detail: err.Error()}
+	}
+	var list k8sNetworkPolicyList
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return k8sCheck{Name: name, Result: k8sFail, Detail: "kubectl output: " + err.Error()}
+	}
+	var bad, ok []string
+	for _, p := range pods {
+		if p.Metadata.Labels["app.kubernetes.io/component"] != "worker" {
+			continue
+		}
+		var by []string
+		for _, np := range list.Items {
+			if !np.limitsEgress() || !np.Spec.PodSelector.matches(p.Metadata.Labels) {
+				continue
+			}
+			by = append(by, np.Metadata.Name)
+			if open := np.opens(); open != "" {
+				bad = append(bad, fmt.Sprintf("%s: NetworkPolicy %s %s", p.Metadata.Name, np.Metadata.Name, open))
+			}
+		}
+		if len(by) == 0 {
+			bad = append(bad, p.Metadata.Name+": no NetworkPolicy limits its egress (networkPolicy.enabled in the chart)")
+			continue
+		}
+		ok = append(ok, fmt.Sprintf("%s (%s)", p.Metadata.Name, strings.Join(by, ", ")))
+	}
+	switch {
+	case len(bad) > 0:
+		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(bad, "; ")}
+	case len(ok) == 0:
+		return k8sCheck{Name: name, Result: k8sFail, Detail: "no worker pod (label app.kubernetes.io/component=worker) to check"}
+	}
+	return k8sCheck{Name: name, Result: k8sPass, Detail: strings.Join(ok, "; ")}
+}
+
+// k8sEndpointSliceList is the part of `kubectl get endpointslices -o json`
+// verify reads: the addresses and ports behind a Service.
+type k8sEndpointSliceList struct {
+	Items []struct {
+		Endpoints []struct {
+			Addresses []string `json:"addresses"`
+		} `json:"endpoints"`
+		Ports []struct {
+			Port int `json:"port"`
+		} `json:"ports"`
+	} `json:"items"`
+}
+
+// k8sAPIServerTargets are the Kubernetes API server's own addresses, behind
+// its Service: a sandbox that cannot reach the Service address may still
+// try these directly, so the operator puts them on the deny floor too.
+func k8sAPIServerTargets(ctx context.Context, env k8sEnv) []string {
+	raw, err := env.kubectl(ctx, "get", "endpointslices", "-n", "default", "-l", "kubernetes.io/service-name=kubernetes", "-o", "json")
+	if err != nil {
+		return nil
+	}
+	var list k8sEndpointSliceList
+	if json.Unmarshal(raw, &list) != nil {
+		return nil
+	}
+	var out []string
+	for _, s := range list.Items {
+		for _, ep := range s.Endpoints {
+			for _, a := range ep.Addresses {
+				if !k8sIPv4(a) {
+					continue
+				}
+				for _, p := range s.Ports {
+					out = append(out, fmt.Sprintf("%s:%d", a, p.Port))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// k8sIPv4 reports an IPv4 address: the only kind a probe tries, since
+// container sandboxes have no IPv6 at all.
+func k8sIPv4(s string) bool {
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Is4()
+}
+
+// k8sOtherPodTargets are the cluster DNS pods' own addresses at port 53:
+// pods every cluster runs, outside AerolVM, and listening. A sandbox reaches
+// DNS through the DNS Service address, which its default leaves open, so
+// reaching a DNS pod directly means it can reach the pod network.
+func k8sOtherPodTargets(ctx context.Context, env k8sEnv) []string {
+	raw, err := env.kubectl(ctx, "get", "pods", "-n", "kube-system", "-l", "k8s-app=kube-dns", "-o", "json")
+	if err != nil {
+		return nil
+	}
+	var list k8sPodList
+	if json.Unmarshal(raw, &list) != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range list.Items {
+		if k8sIPv4(p.Status.PodIP) {
+			out = append(out, p.Status.PodIP+":53")
+		}
+	}
+	return out
+}
+
 // k8sProbe runs a sandbox of each runtime and has it try every address it
 // must not reach: the worker pod's ports on the pod's address and on the
-// sandbox bridge's gateway, and the Kubernetes API. Any that answers fails.
+// sandbox bridge's gateway, another pod's address, and the Kubernetes API
+// at its Service address and its own addresses. Any that answers fails.
 func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions) []k8sCheck {
 	var targets []string
 	for _, p := range pods {
@@ -325,10 +578,17 @@ func k8sProbe(ctx context.Context, env k8sEnv, pods []k8sPod, o k8sVerifyOptions
 	if raw, err := env.kubectl(ctx, "get", "svc", "kubernetes", "-n", "default", "-o", "jsonpath={.spec.clusterIP}"); err == nil && strings.TrimSpace(string(raw)) != "" {
 		targets = append(targets, strings.TrimSpace(string(raw))+":443")
 	}
-	command := "for t in " + strings.Join(targets, " ") + `; do nc -z -w 3 "${t%:*}" "${t#*:}" 2>/dev/null && echo "$t"; done; true`
+	targets = append(targets, k8sAPIServerTargets(ctx, env)...)
 	var checks []k8sCheck
+	other := k8sOtherPodTargets(ctx, env)
+	if len(other) == 0 {
+		// The probe still runs; say plainly that one wall went untested.
+		checks = append(checks, k8sCheck{Name: "another pod's address to probe", Result: k8sSkip, Detail: "no cluster DNS pod (kube-system, k8s-app=kube-dns) with an address"})
+	}
+	targets = append(targets, other...)
+	command := "for t in " + strings.Join(targets, " ") + `; do nc -z -w 3 "${t%:*}" "${t#*:}" 2>/dev/null && echo "$t"; done; true`
 	for _, rt := range o.probeRuntimes {
-		name := fmt.Sprintf("a %s sandbox cannot reach the worker or the Kubernetes API", rt)
+		name := fmt.Sprintf("a %s sandbox cannot reach the worker, another pod or the Kubernetes API", rt)
 		out, err := env.probe(ctx, o.probeImage, rt, command)
 		switch {
 		case err != nil:
@@ -459,8 +719,11 @@ Checks, and exits 1 if any fails:
   - no pod holds a Kubernetes API credential;
   - no pod holds a DNS provider token (Secret volumes may mount only
     tls.crt, tls.key and ca.crt, by name);
-  - a sandbox of each probe runtime cannot reach the worker pod's own ports
-    or the Kubernetes API.
+  - a NetworkPolicy limits each worker pod's egress, and none of the
+    policies on it opens a whole private range, every address or every pod;
+  - a sandbox of each probe runtime cannot reach the worker pod's own
+    ports, a cluster DNS pod's address, or the Kubernetes API at its
+    Service address and its own addresses.
 
 It reads the cluster with your kubectl, and creates the probe sandboxes
 through the AerolVM API you are logged in to (aerolvm login, or SB_API_URL

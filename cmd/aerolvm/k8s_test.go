@@ -17,7 +17,7 @@ func runtimeGOOS() string { return runtime.GOOS }
 // a sandbox range set by C3, the API token from its Secret, and the edge
 // certificate mounted by key (C25).
 const k8sGoodPods = `{"items":[{
-  "metadata":{"name":"aerolvm-0"},
+  "metadata":{"name":"aerolvm-0","labels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm","app.kubernetes.io/component":"worker"}},
   "spec":{
     "automountServiceAccountToken":false,
     "volumes":[{"name":"containerd","emptyDir":{}},{"name":"netns","emptyDir":{}},
@@ -31,25 +31,69 @@ const k8sGoodPods = `{"items":[{
       {"name":"egress","image":"ghcr.io/aerol-ai/aerolvm:v1"}]},
   "status":{"podIP":"10.244.0.12"}}]}`
 
+// The chart's egress NetworkPolicy as the API server returns it (C24),
+// with the range a bank opened on purpose, and another app's policy that
+// does not select the worker.
+const k8sGoodPolicies = `{"items":[{
+  "metadata":{"name":"aerolvm-worker-egress"},
+  "spec":{
+    "podSelector":{"matchLabels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm","app.kubernetes.io/component":"worker"}},
+    "policyTypes":["Egress"],
+    "egress":[
+      {"to":[{"podSelector":{"matchLabels":{"app.kubernetes.io/name":"aerolvm","app.kubernetes.io/instance":"aerolvm"}}}]},
+      {"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}],
+       "ports":[{"protocol":"UDP","port":53},{"protocol":"TCP","port":53}]},
+      {"to":[{"ipBlock":{"cidr":"0.0.0.0/0","except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","10.96.0.1/32"]}}]},
+      {"to":[{"ipBlock":{"cidr":"10.50.0.0/16"}},{"ipBlock":{"cidr":"not-a-cidr"}}]}]}},
+  {"metadata":{"name":"other-app"},"spec":{"podSelector":{"matchLabels":{"app":"other"}},"policyTypes":["Egress"],"egress":[{}]}}]}`
+
+// The cluster DNS pods, and the API server behind its Service.
+const (
+	k8sDNSPods      = `{"items":[{"metadata":{"name":"coredns-a"},"status":{"podIP":"10.244.0.3"}},{"metadata":{"name":"coredns-b"},"status":{"podIP":"fd00::3"}},{"metadata":{"name":"coredns-c"},"status":{"podIP":""}}]}`
+	k8sAPIEndpoints = `{"items":[{"endpoints":[{"addresses":["172.18.0.2"]},{"addresses":["fd00::2"]}],"ports":[{"port":6443}]}]}`
+)
+
 type fakeK8s struct {
-	pods      string
-	podsErr   error
-	apiIP     string
-	cosignErr map[string]error
-	probeOut  map[string]string
-	probeErr  error
-	commands  []string
-	signed    []string
+	pods         string
+	podsErr      error
+	apiIP        string
+	policies     string
+	policiesErr  error
+	dnsPods      string
+	apiEndpoints string
+	cosignErr    map[string]error
+	probeOut     map[string]string
+	probeErr     error
+	commands     []string
+	signed       []string
+}
+
+// goodK8s is a clean install: every check passes.
+func goodK8s() *fakeK8s {
+	return &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1", policies: k8sGoodPolicies, dnsPods: k8sDNSPods, apiEndpoints: k8sAPIEndpoints}
 }
 
 func (f *fakeK8s) env() k8sEnv {
+	// An empty fixture answers like a kubectl without the right to read it.
+	answer := func(fixture string) ([]byte, error) {
+		if fixture == "" {
+			return nil, errors.New("forbidden")
+		}
+		return []byte(fixture), nil
+	}
 	return k8sEnv{
 		kubectl: func(_ context.Context, args ...string) ([]byte, error) {
 			switch {
+			case args[0] == "get" && args[1] == "pods" && args[3] == "kube-system":
+				return answer(f.dnsPods)
 			case args[0] == "get" && args[1] == "pods":
 				return []byte(f.pods), f.podsErr
 			case args[0] == "get" && args[1] == "svc":
 				return []byte(f.apiIP), nil
+			case args[0] == "get" && args[1] == "networkpolicies":
+				return []byte(f.policies), f.policiesErr
+			case args[0] == "get" && args[1] == "endpointslices":
+				return answer(f.apiEndpoints)
 			}
 			return nil, errors.New("unexpected kubectl " + strings.Join(args, " "))
 		},
@@ -75,15 +119,15 @@ func k8sResults(checks []k8sCheck) map[string]string {
 var k8sOpts = k8sVerifyOptions{namespace: "aerolvm", release: "aerolvm", probeImage: "alpine:3.20", probeRuntimes: []string{"docker", "gvisor"}}
 
 func TestK8sVerifyPasses(t *testing.T) {
-	f := &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1"}
+	f := goodK8s()
 	checks := k8sVerify(context.Background(), f.env(), k8sOpts)
 	for _, c := range checks {
 		if c.Result != k8sPass {
 			t.Fatalf("%s: %s %s", c.Name, c.Result, c.Detail)
 		}
 	}
-	if len(checks) != 7 {
-		t.Fatalf("%d checks, want 7: %+v", len(checks), checks)
+	if len(checks) != 8 {
+		t.Fatalf("%d checks, want 8: %+v", len(checks), checks)
 	}
 	if strings.Join(f.signed, ",") != "ghcr.io/aerol-ai/aerolvm-runtime:v1,ghcr.io/aerol-ai/aerolvm:v1" {
 		t.Fatalf("signatures checked for %v, want each image once", f.signed)
@@ -91,7 +135,9 @@ func TestK8sVerifyPasses(t *testing.T) {
 	if len(f.commands) != 2 || !strings.HasPrefix(f.commands[0], "docker alpine:3.20 ") || !strings.HasPrefix(f.commands[1], "gvisor alpine:3.20 ") {
 		t.Fatalf("probes %v", f.commands)
 	}
-	for _, target := range []string{"10.244.0.12:2220", "10.244.0.12:21212", "10.200.0.1:2220", "10.200.0.1:21212", "10.96.0.1:443"} {
+	// The worker's ports, the API server at its Service address and at its
+	// own address, and a DNS pod's address.
+	for _, target := range []string{"10.244.0.12:2220", "10.244.0.12:21212", "10.200.0.1:2220", "10.200.0.1:21212", "10.96.0.1:443", "172.18.0.2:6443", "10.244.0.3:53"} {
 		if !strings.Contains(f.commands[0], target+" ") && !strings.Contains(f.commands[0], target+";") {
 			t.Errorf("the probe does not try %s: %s", target, f.commands[0])
 		}
@@ -99,10 +145,25 @@ func TestK8sVerifyPasses(t *testing.T) {
 	if strings.Contains(f.commands[0], "10.88.0.1") {
 		t.Error("the default range was probed although the pod sets its own")
 	}
+	// No sandbox has IPv6, and a pod with no address yet has nothing to try.
+	if strings.Contains(f.commands[0], "fd00::") || strings.Contains(f.commands[0], " :53") {
+		t.Errorf("an IPv6 or empty address was probed: %s", f.commands[0])
+	}
 }
+
+const k8sPolicyCheck = "a NetworkPolicy limits the worker pods' egress"
 
 func TestK8sVerifyFailures(t *testing.T) {
 	podsWith := func(edit func(string) string) string { return edit(k8sGoodPods) }
+	// with is a clean install with one thing changed.
+	with := func(edit func(*fakeK8s)) *fakeK8s {
+		f := goodK8s()
+		edit(f)
+		return f
+	}
+	policiesWith := func(old, repl string) *fakeK8s {
+		return with(func(f *fakeK8s) { f.policies = strings.Replace(k8sGoodPolicies, old, repl, 1) })
+	}
 	for _, tc := range []struct {
 		name  string
 		f     *fakeK8s
@@ -143,8 +204,27 @@ func TestK8sVerifyFailures(t *testing.T) {
 			return strings.Replace(s, `"containers":[`, `"initContainers":[{"name":"setup","image":"ghcr.io/x/setup:v1"}],"containers":[`, 1)
 		}), cosignErr: map[string]error{"ghcr.io/x/setup:v1": errors.New("no signatures found")}}, check: "images signed by the AerolVM release workflow", want: "fail: ghcr.io/x/setup:v1 (no signatures found)"},
 		{name: "an unsigned image", f: &fakeK8s{pods: k8sGoodPods, cosignErr: map[string]error{"ghcr.io/aerol-ai/aerolvm:v1": errors.New("no signatures found")}}, check: "images signed by the AerolVM release workflow", want: "fail: ghcr.io/aerol-ai/aerolvm:v1 (no signatures found)"},
-		{name: "a sandbox reaches the API", f: &fakeK8s{pods: k8sGoodPods, probeOut: map[string]string{"gvisor": "10.244.0.12:21212\n10.96.0.1:443\n"}}, check: "a gvisor sandbox cannot reach the worker or the Kubernetes API", want: "fail: reached 10.244.0.12:21212, 10.96.0.1:443"},
-		{name: "the probe cannot run", f: &fakeK8s{pods: k8sGoodPods, probeErr: errors.New("not logged in")}, check: "a docker sandbox cannot reach the worker or the Kubernetes API", want: "fail: probe: not logged in"},
+		{name: "a sandbox reaches the API", f: with(func(f *fakeK8s) { f.probeOut = map[string]string{"gvisor": "10.244.0.12:21212\n10.96.0.1:443\n"} }), check: "a gvisor sandbox cannot reach the worker, another pod or the Kubernetes API", want: "fail: reached 10.244.0.12:21212, 10.96.0.1:443"},
+		{name: "a sandbox reaches a pod", f: with(func(f *fakeK8s) { f.probeOut = map[string]string{"docker": "10.244.0.3:53\n"} }), check: "a docker sandbox cannot reach the worker, another pod or the Kubernetes API", want: "fail: reached 10.244.0.3:53"},
+		{name: "the probe cannot run", f: with(func(f *fakeK8s) { f.probeErr = errors.New("not logged in") }), check: "a docker sandbox cannot reach the worker, another pod or the Kubernetes API", want: "fail: probe: not logged in"},
+		{name: "no DNS pod to probe", f: with(func(f *fakeK8s) { f.dnsPods = "" }), check: "another pod's address to probe", want: "skip: no cluster DNS pod"},
+		{name: "DNS pods not JSON", f: with(func(f *fakeK8s) { f.dnsPods = "nope" }), check: "another pod's address to probe", want: "skip: no cluster DNS pod"},
+
+		// C24: the worker pod's egress NetworkPolicy.
+		{name: "policies cannot be listed", f: with(func(f *fakeK8s) { f.policiesErr = errors.New("forbidden") }), check: k8sPolicyCheck, want: "fail: forbidden"},
+		{name: "policies not JSON", f: with(func(f *fakeK8s) { f.policies = "nope" }), check: k8sPolicyCheck, want: "fail: kubectl output"},
+		{name: "no policy", f: with(func(f *fakeK8s) { f.policies = `{"items":[]}` }), check: k8sPolicyCheck, want: "fail: aerolvm-0: no NetworkPolicy limits its egress"},
+		{name: "a policy for other pods", f: policiesWith(`"app.kubernetes.io/component":"worker"}},`, `"app.kubernetes.io/component":"gateway"}},`), check: k8sPolicyCheck, want: "fail: aerolvm-0: no NetworkPolicy limits its egress"},
+		{name: "an ingress-only policy", f: policiesWith(`"policyTypes":["Egress"],`, `"policyTypes":["Ingress"],`), check: k8sPolicyCheck, want: "fail: aerolvm-0: no NetworkPolicy limits its egress"},
+		{name: "a rule open to every address", f: policiesWith(`{"to":[{"ipBlock":{"cidr":"10.50.0.0/16"}},`, `{"ports":[{"port":443}]},{"to":[`), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach every address"},
+		{name: "the internet rule with no except", f: policiesWith(`,"except":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","100.64.0.0/10","169.254.0.0/16","10.96.0.1/32"]`, ``), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach 10.0.0.0/8 (ipBlock 0.0.0.0/0)"},
+		{name: "the internet rule keeps a pod range open", f: policiesWith(`"100.64.0.0/10",`, ``), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach 100.64.0.0/10 (ipBlock 0.0.0.0/0)"},
+		{name: "a whole private range opened", f: policiesWith(`"cidr":"10.50.0.0/16"`, `"cidr":"172.16.0.0/12"`), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach 172.16.0.0/12 (ipBlock 172.16.0.0/12)"},
+		{name: "IPv6 opened with its private range", f: policiesWith(`"cidr":"10.50.0.0/16"`, `"cidr":"::/0"`), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach fc00::/7 (ipBlock ::/0)"},
+		{name: "every pod in the cluster", f: policiesWith(`{"ipBlock":{"cidr":"10.50.0.0/16"}}`, `{"namespaceSelector":{}}`), check: k8sPolicyCheck, want: "fail: aerolvm-0: NetworkPolicy aerolvm-worker-egress lets the pod reach every pod in the cluster"},
+		{name: "no worker pod", f: with(func(f *fakeK8s) {
+			f.pods = strings.Replace(k8sGoodPods, `,"app.kubernetes.io/component":"worker"`, ``, 1)
+		}), check: k8sPolicyCheck, want: "fail: no worker pod"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := k8sResults(k8sVerify(context.Background(), tc.f.env(), k8sOpts))[tc.check]
@@ -169,7 +249,7 @@ func TestK8sVerifySkipsSignatures(t *testing.T) {
 // through the CLI's real API path to the fake AerolVM server.
 func TestK8sVerifyCommand(t *testing.T) {
 	h := newHarness(t)
-	f := &fakeK8s{pods: k8sGoodPods, apiIP: "10.96.0.1"}
+	f := goodK8s()
 	orig := k8sEnvFor
 	t.Cleanup(func() { k8sEnvFor = orig })
 	var realProbe func(context.Context, string, string, string) (string, error)
@@ -190,7 +270,7 @@ func TestK8sVerifyCommand(t *testing.T) {
 		Checks []k8sCheck `json:"checks"`
 	}
 	h.jsonOut(&out)
-	if !out.OK || len(out.Checks) != 7 {
+	if !out.OK || len(out.Checks) != 8 {
 		t.Fatalf("%+v", out)
 	}
 
@@ -268,6 +348,16 @@ func TestK8sProbeEdges(t *testing.T) {
 	if !strings.Contains(f.commands[0], "10.200.0.1:21212") {
 		t.Fatalf("the bridge gateway was not probed: %s", f.commands[0])
 	}
+	// The API server's own addresses unreadable or not JSON: the probe
+	// still tries its Service address.
+	for _, endpoints := range []string{"", "nope"} {
+		f := goodK8s()
+		f.apiEndpoints = endpoints
+		k8sVerify(context.Background(), f.env(), k8sOpts)
+		if strings.Contains(f.commands[0], ":6443") || !strings.Contains(f.commands[0], "10.96.0.1:443") {
+			t.Fatalf("endpoints %q: %s", endpoints, f.commands[0])
+		}
+	}
 
 	h := newHarness(t)
 	delete(h.env, "SB_API_URL")
@@ -275,6 +365,46 @@ func TestK8sProbeEdges(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if _, err := k8sEnvFor(h.app, &commonFlags{}, "").probe(context.Background(), "alpine:3.20", "", "true"); err == nil {
 		t.Fatal("a probe ran without an AerolVM login")
+	}
+}
+
+// TestK8sPolicySelection: a policy selects the worker pod the way
+// Kubernetes does (labels and expressions), and with no policyTypes it
+// limits egress only when it has egress rules.
+func TestK8sPolicySelection(t *testing.T) {
+	worker := map[string]string{"app": "aerolvm", "tier": "worker"}
+	sel := func(raw string) k8sLabelSelector {
+		var s k8sLabelSelector
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	for raw, want := range map[string]bool{
+		`{}`:                                true,
+		`{"matchLabels":{"app":"aerolvm"}}`: true,
+		`{"matchLabels":{"app":"other"}}`:   false,
+		`{"matchLabels":{"zone":""}}`:       false, // a missing label is not an empty one
+		`{"matchExpressions":[{"key":"tier","operator":"In","values":["worker","gateway"]}]}`: true,
+		`{"matchExpressions":[{"key":"tier","operator":"In","values":["gateway"]}]}`:          false,
+		`{"matchExpressions":[{"key":"tier","operator":"NotIn","values":["gateway"]}]}`:       true,
+		`{"matchExpressions":[{"key":"tier","operator":"NotIn","values":["worker"]}]}`:        false,
+		`{"matchExpressions":[{"key":"app","operator":"Exists"}]}`:                            true,
+		`{"matchExpressions":[{"key":"zone","operator":"Exists"}]}`:                           false,
+		`{"matchExpressions":[{"key":"zone","operator":"DoesNotExist"}]}`:                     true,
+		`{"matchExpressions":[{"key":"app","operator":"DoesNotExist"}]}`:                      false,
+		`{"matchExpressions":[{"key":"app","operator":"Gt","values":["1"]}]}`:                 false,
+	} {
+		if got := sel(raw).matches(worker); got != want {
+			t.Errorf("%s matches = %v, want %v", raw, got, want)
+		}
+	}
+	var np k8sNetworkPolicy
+	if np.limitsEgress() {
+		t.Fatal("no types and no egress rules limits nothing")
+	}
+	if err := json.Unmarshal([]byte(`{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"10.50.0.0/16"}}]}]}}`), &np); err != nil || !np.limitsEgress() || np.opens() != "" {
+		t.Fatalf("egress rules with no types limit egress: %v %q", err, np.opens())
 	}
 }
 
