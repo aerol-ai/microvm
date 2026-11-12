@@ -1095,35 +1095,43 @@ func (g *gossipNode) selfMember() Member {
 	}
 }
 
-// peerByNodeID looks up a member's API URL by node ID. Returns "" if unknown.
-func (g *gossipNode) peerAPIURL(nodeID string) string {
-	for _, m := range g.members() {
+// memberByID is one member's record, read from the index by key. The peer
+// lookups below used to scan a copy of every member: at 500 workers the
+// owner lookup alone (OwnerOf, then peerInternalURL) was a tenth of the Raft
+// leader's CPU, and the copies much of its garbage (C18, bench-full-4).
+// Before the index exists, members() scans memberlist, and so does this.
+func (g *gossipNode) memberByID(nodeID string) (Member, bool) {
+	if g == nil || nodeID == "" {
+		return Member{}, false
+	}
+	if index := g.currentMemberIndex(); index != nil {
+		return index.get(nodeID)
+	}
+	for _, m := range g.scanMembers() {
 		if m.NodeID == nodeID {
-			return m.APIURL
+			return m, true
 		}
 	}
-	return ""
+	return Member{}, false
+}
+
+// peerAPIURL looks up a member's API URL by node ID. Returns "" if unknown.
+func (g *gossipNode) peerAPIURL(nodeID string) string {
+	m, _ := g.memberByID(nodeID)
+	return m.APIURL
 }
 
 func (g *gossipNode) peerDataPlaneHost(nodeID string) string {
-	for _, m := range g.members() {
-		if m.NodeID == nodeID {
-			return m.DataPlaneHost
-		}
-	}
-	return ""
+	m, _ := g.memberByID(nodeID)
+	return m.DataPlaneHost
 }
 
 // peerInternalURL returns the gossiped cluster-internal mTLS endpoint for
 // nodeID, or "" if the peer has not advertised one. Peer RPC callers treat an
 // empty value as unavailable and never downgrade to the public API.
 func (g *gossipNode) peerInternalURL(nodeID string) string {
-	for _, m := range g.members() {
-		if m.NodeID == nodeID {
-			return m.InternalURL
-		}
-	}
-	return ""
+	m, _ := g.memberByID(nodeID)
+	return m.InternalURL
 }
 
 // restartAnnounceTimeout bounds how long announceRestart waits for the
