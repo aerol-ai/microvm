@@ -91,6 +91,9 @@ type capacityLeaseCache struct {
 
 	mu     sync.RWMutex
 	leases map[string]capacityLease
+	// zones keeps each node's last reported zone past its lease (C10):
+	// failover needs a dead node's zone after its lease is dropped.
+	zones zoneMemory
 	// nextAttempt / failures schedule each peer INDEPENDENTLY, so one slow
 	// or dead endpoint cannot postpone a healthy peer's refresh.
 	nextAttempt map[string]time.Time
@@ -335,7 +338,43 @@ func (c *capacityLeaseCache) setReported(nodeID string, snap capacity.Snapshot, 
 		c.leases[nodeID] = capacityLease{snapshot: snap, updated: updated, mark: mark}
 	}
 	c.mu.Unlock()
+	c.zones.recordFact(nodeID, nodeFact{zone: memberZone(Member{Capacity: snap}), leaseFile: snap.OwnershipLeaseFile})
 	c.unreported.reported(nodeID, mark)
+}
+
+// forgetNode drops what this server kept about nodeID for its failover
+// (zoneMemory), once that failover is done.
+func (c *capacityLeaseCache) forgetNode(nodeID string) {
+	if c == nil {
+		return
+	}
+	c.zones.forget(nodeID)
+}
+
+// lastKnownLeaseFile reports whether nodeID's last heartbeat to this server
+// said its runtime enforces the ownership lease with sandboxd down (C19).
+func (c *capacityLeaseCache) lastKnownLeaseFile(nodeID string) bool {
+	if c == nil {
+		return false
+	}
+	return c.zones.leaseFileOf(nodeID)
+}
+
+// lastHeard is when nodeID's last heartbeat reached this server (C19).
+func (c *capacityLeaseCache) lastHeard(nodeID string) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	return c.zones.lastHeard(nodeID)
+}
+
+// lastKnownZone is the zone nodeID last reported to this server, or "" when
+// it never did (C10).
+func (c *capacityLeaseCache) lastKnownZone(nodeID string) string {
+	if c == nil {
+		return ""
+	}
+	return c.zones.zoneOf(nodeID)
 }
 
 // unreportedMark is the position a heartbeat requested now is measured

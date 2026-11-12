@@ -165,6 +165,7 @@ func (h *handlers) clusterApplyUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), rolloutWriteTimeout)
 	defer cancel()
+	ctx = cluster.WithUpgradeDriver(ctx, r.URL.Query().Get("driver"))
 	out, created, err := ro.ApplyRollout(ctx, upgradeCaller(r), req)
 	id := ""
 	if out != nil {
@@ -191,6 +192,7 @@ func (h *handlers) clusterUpgradeCommand(command string) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), rolloutWriteTimeout)
 		defer cancel()
+		ctx = cluster.WithUpgradeDriver(ctx, r.URL.Query().Get("driver"))
 		out, err := ro.RolloutCommand(ctx, upgradeCaller(r), command)
 		id := ""
 		if out != nil {

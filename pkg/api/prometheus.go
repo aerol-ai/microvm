@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/aerol-ai/microvm/internal/usagemetrics"
 )
 
 const prometheusContentType = "text/plain; version=0.0.4; charset=utf-8"
@@ -29,9 +31,53 @@ type prometheusLabel struct {
 func (s *Server) servePrometheusMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", prometheusContentType)
 	w.Header().Set("Cache-Control", "no-store")
-	if err := writePrometheusExpvars(w); err != nil {
+	err := writePrometheusExpvars(w)
+	if err == nil {
+		err = writeUsageMetrics(w, s.usageMeter())
+	}
+	if err != nil {
 		s.logger.Warn("prometheus metrics render failed", "error", err)
 	}
+}
+
+// usageMeter is the per-owner usage exporter's counters (C20), or nil when
+// it is off or there is no service (tests).
+func (s *Server) usageMeter() *usagemetrics.Meter {
+	if s.service == nil {
+		return nil
+	}
+	return s.service.UsageMeter()
+}
+
+// writeUsageMetrics prints the usage exporter's families after the expvar
+// ones. They are not expvars on purpose: an owner label needs a real label
+// name (expvar maps only give key, key2), and staying out of expvar keeps
+// owner names off /debug/vars and out of the OTEL exporter, so they leave
+// the node only when Prometheus scrapes this endpoint. A family with no
+// series is left out, so with the exporter off nothing is printed.
+func writeUsageMetrics(w io.Writer, m *usagemetrics.Meter) error {
+	if m == nil {
+		return nil
+	}
+	for _, f := range m.Collect() {
+		if len(f.Samples) == 0 {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", f.Name, f.Help, f.Name, f.Type); err != nil {
+			return err
+		}
+		for _, smp := range f.Samples {
+			labels := make([]prometheusLabel, 0, len(smp.Labels))
+			for _, l := range smp.Labels {
+				labels = append(labels, prometheusLabel{name: l.Name, value: l.Value})
+			}
+			if _, err := fmt.Fprintf(w, "%s%s %s\n", f.Name, prometheusLabelsString(labels),
+				strconv.FormatFloat(smp.Value, 'g', -1, 64)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func writePrometheusExpvars(w io.Writer) error {

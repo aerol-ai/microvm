@@ -35,6 +35,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/usagemetrics"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -604,6 +605,18 @@ type Service struct {
 	liveMu     sync.Mutex
 	liveCursor map[string]liveSamplePoint
 
+	// usageMeter holds the per-owner usage counters /v1/metrics exports
+	// (usage_metrics.go, C20). nil unless SB_USAGE_METRICS_ENABLED, so the
+	// row-delete hook is one atomic load when the exporter is off. Separate
+	// from usageReporter: it ships nothing anywhere.
+	//
+	// usageCgroupRoot is the cgroup mount the exporter reads ("" is
+	// usagemetrics.DefaultCgroupRoot), and usageDockerStats replaces the
+	// Docker stats call (nil is dockerAux.ContainerStats). Both are for tests.
+	usageMeter       atomic.Pointer[usagemetrics.Meter]
+	usageCgroupRoot  string
+	usageDockerStats liveStatFunc
+
 	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
 	// owner-scoped (user-token) creates before any capacity is reserved. nil on
 	// the open-source build (set only by the managed daemon via
@@ -637,6 +650,9 @@ type Service struct {
 	// ownership is the worker's ownership lease and fence
 	// (ownership_lease.go). Zero value: not begun, fences nothing.
 	ownership ownershipLease
+	// moves holds the sandboxes released for a decommission move (C9,
+	// decommission.go); OwnershipFenced folds them in.
+	moves moveFences
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
@@ -1754,13 +1770,14 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 			return true, leaseErr
 		}
 		defer release()
-		owned, err := s.failoverRecreateStillOwned(ctx, id, secrets)
+		owned, firstCreated, err := s.failoverRecreateStillOwned(ctx, id, secrets)
 		if err != nil {
 			return true, err
 		}
 		if !owned {
 			return false, nil
 		}
+		ctx = contextWithFailoverCreatedAt(ctx, firstCreated)
 	}
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
@@ -1950,6 +1967,26 @@ func isStoredSpecReplay(ctx context.Context) bool {
 	}
 	replay, _ := ctx.Value(storedSpecReplayKey{}).(bool)
 	return replay
+}
+
+// failoverCreatedAtKey carries into a failover recreate the time the cluster
+// first placed the sandbox, which persistSandboxCreate keeps as the new row's
+// created_at.
+type failoverCreatedAtKey struct{}
+
+func contextWithFailoverCreatedAt(ctx context.Context, at time.Time) context.Context {
+	if at.IsZero() {
+		return ctx
+	}
+	return context.WithValue(ctx, failoverCreatedAtKey{}, at)
+}
+
+func failoverCreatedAtFrom(ctx context.Context) time.Time {
+	if ctx == nil {
+		return time.Time{}
+	}
+	at, _ := ctx.Value(failoverCreatedAtKey{}).(time.Time)
+	return at
 }
 
 // validateCreateMounts applies the mount policy to a create request. The
@@ -3317,6 +3354,20 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
 		sandbox.CreateRequestDigest = digests[0]
 	}
+	// A failover recreate is the same sandbox on another node, so its row
+	// keeps the time the sandbox was first created. The age timers
+	// (StopAtAge, DestroyAtAge, and the E2B timeout, which is stored as an
+	// age) count from created_at and come back unchanged in the replicated
+	// spec, so a row stamped with the recreate time moved every deadline out
+	// by the sandbox's age. Billing still starts now: the usage cursor gets
+	// the time this node made the row, which the created_at fallback gave
+	// before (reconcileFallbackWindowStart).
+	madeAt := sandbox.CreatedAt
+	first := failoverCreatedAtFrom(ctx)
+	keepFirstCreated := !first.IsZero() && first.Before(madeAt)
+	if keepFirstCreated {
+		sandbox.CreatedAt = first.UTC()
+	}
 	// Every new row refuses the sandbox tokens issued before it. The
 	// not-before lives only in the owner's row, so a failover recreate (or
 	// a WASM recreate or migration) onto another node would otherwise come
@@ -3340,6 +3391,9 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	}
 	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
 		return err
+	}
+	if keepFirstCreated && s.usageEnabled() {
+		s.advanceUsageCursor(sandbox.ID, madeAt)
 	}
 	// A recreate-policy sandbox joins the lease file's fence now, not at the
 	// next read (T3). A channel send that never blocks; the file is written
@@ -4206,6 +4260,9 @@ func (s *Service) deleteSandboxRowAndFenceAudit(ctx context.Context, sandboxID s
 	// part way must not leave a lease minted from the window either.
 	s.invalidateAuditIdentity(sandboxID)
 	s.invalidateAuditOwnershipLease(sandboxID)
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		s.closeUsageMetrics(sandboxID)
+	}
 	return err
 }
 
@@ -6455,6 +6512,7 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	snap.OwnershipLeaseFile = s.cfg.EnableCluster && s.cfg.OwnershipLeaseFile != ""
 	// Warm-pool entry status: how GET /v1/warm-pools on any node reports
 	// this one, with no fan-out (W1).
 	snap.WarmPools = s.localWarmPoolStatus()

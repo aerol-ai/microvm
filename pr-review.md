@@ -120,8 +120,9 @@ behavior, single-node no-op, and leader-change replay safety.
   keep-alive can be called every few seconds per sandbox). Skip the write when
   nothing changed, or when nothing will read the field back: lifecycle, tags and
   facade state go through `replicateRecoverySpecPatch`, which writes only for
-  failover=recreate sandboxes. Count the writes in a test
-  (`TestSpecWriteThroughRaftWrites`, `TestE2BTimeoutRoutesRaftWrites`).
+  failover=recreate sandboxes. Count the writes in a test, per facade route
+  (`TestSpecWriteThroughRaftWrites`, `TestE2BTimeoutRoutesRaftWrites`,
+  `TestDaytonaRoutesRaftWrites`, `TestRunloopRoutesRaftWrites`).
 
 ### 7.1 Reference implementation — B7 local-only built images & per-host routing
 

@@ -387,6 +387,12 @@ func (u *upgradeNode) Step(ctx context.Context, caller string, req UpgradeStepRe
 				"leader", caller, "caller", ev.Caller, "result", ev.Result, "reason", ev.Reason)
 		}
 	}()
+	if req.Step != UpgradeStepFinalize && u.cfg.UpgradesByOperator() {
+		// The operator swaps this pod's agent image; nothing here fetches or
+		// runs a binary (C13). Checked before SB_REMOTE_UPGRADE, which a pod
+		// also sets off, so the leader learns who upgrades the node.
+		return resp, stepErr(http.StatusConflict, upgradewire.ErrCodeOperatorDriven, "the Kubernetes operator upgrades %s: change AerolCluster spec.version", u.nodeID)
+	}
 	if req.Step != UpgradeStepFinalize && !u.cfg.RemoteUpgradeEnabled() {
 		return resp, stepErr(http.StatusConflict, upgradewire.ErrCodeRemoteUpgradeDisabled, "SB_REMOTE_UPGRADE=false on %s: run the upgrade on the node", u.nodeID)
 	}

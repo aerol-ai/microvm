@@ -585,6 +585,10 @@ type Member struct {
 	// Arch is the peer's gossiped CPU type ("ar"). Empty for a peer on a
 	// build that predates the field.
 	Arch string `json:"arch,omitempty"`
+	// Restarting says the node announced a restart on SIGTERM ("rs", C8):
+	// placement sends it nothing new, and the leader waits the restart
+	// window, not only the grace, before moving its sandboxes.
+	Restarting bool `json:"restarting,omitempty"`
 	// Voter and Leader come from the Raft configuration and leadership, not
 	// gossip, so only a Raft server can fill them in (AnnotateRaftRoles).
 	// Both stay false for workers, ingress nodes and any member listed

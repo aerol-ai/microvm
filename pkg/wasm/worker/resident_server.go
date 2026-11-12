@@ -443,6 +443,8 @@ func RunCLIResident(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: --wasm-resident-host <socket-path>")
 	}
-	loadNodeAllowedPorts()
+	if err := loadWorkerGuards(); err != nil {
+		return err
+	}
 	return ServeSocketPathResident(args[0])
 }

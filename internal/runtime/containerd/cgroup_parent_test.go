@@ -12,10 +12,12 @@ import (
 
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -57,6 +59,36 @@ func TestCgroupSpecOpts(t *testing.T) {
 }
 
 func intPtr(v int) *int { return &v }
+
+// The usage exporter reads a sandbox's CPU and memory from the group this
+// names, so it must be the group the spec put the task in.
+func TestSandboxCgroup(t *testing.T) {
+	var _ sbruntime.CgroupLocator = (*Driver)(nil)
+	for _, tc := range []struct {
+		name, parent, namespace, want string
+	}{
+		{"with a parent, the group cgroupSpecOpts asks for", testPodCgroup, "aerolvm", testPodCgroup + "/sb-1"},
+		{"with no parent, containerd's default", "", "aerolvm", "/aerolvm/sb-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Driver{cfg: Config{CgroupParent: tc.parent, Namespace: tc.namespace}}
+			if got := d.SandboxCgroup("sb-1"); got != tc.want {
+				t.Fatalf("SandboxCgroup() = %q, want %q", got, tc.want)
+			}
+			if tc.parent == "" {
+				// containerd's own default spec, for the same namespace and id.
+				ctx := namespaces.WithNamespace(context.Background(), tc.namespace)
+				spec, err := oci.GenerateSpecWithPlatform(ctx, nil, "linux/amd64", &containers.Container{ID: "sb-1"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if spec.Linux.CgroupsPath != tc.want {
+					t.Fatalf("containerd's default CgroupsPath = %q, SandboxCgroup() = %q", spec.Linux.CgroupsPath, tc.want)
+				}
+			}
+		})
+	}
+}
 
 // The score lands on an existing process section without touching the rest.
 func TestWithOOMScoreAdjKeepsProcess(t *testing.T) {

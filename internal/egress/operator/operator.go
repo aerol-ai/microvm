@@ -273,14 +273,15 @@ func (o *Operator) IsolateGuard() egresspolicy.DialGuard {
 	return egresspolicy.DialGuard{Strict: true, Zone: o.zone, ZoneInStrict: o.file.InternalZone.Isolate, DenyFloor: o.DenyFloor()}
 }
 
-// DenyFloor returns the always-dropped CIDRs: the operator's deny_cidrs and
-// the cloud metadata endpoints, which no sandbox may reach on any node
-// (with no operator file, the metadata endpoints alone).
+// DenyFloor returns the always-dropped CIDRs: the operator's deny_cidrs, the
+// cloud metadata endpoints and the node's extra floor
+// (SB_EGRESS_DENY_FLOOR_CIDRS, the Kubernetes API server), which no sandbox
+// may reach on any node (with no operator file, the last two alone).
 func (o *Operator) DenyFloor() []netip.Prefix {
 	if o == nil {
-		return egresspolicy.WithMetadataFloor(nil)
+		return egresspolicy.WithFixedFloor(nil)
 	}
-	return egresspolicy.WithMetadataFloor(o.floor)
+	return egresspolicy.WithFixedFloor(o.floor)
 }
 
 // Ceiling returns the ceiling, or nil (no ceiling).

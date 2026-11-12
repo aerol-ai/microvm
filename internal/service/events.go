@@ -466,6 +466,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	if err := s.store.Delete(ctx, sandbox.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete sandbox: %w", err)
 	}
+	s.closeUsageMetrics(sandbox.ID)
 	s.runStarts.forget(sandbox.ID)
 	s.finishSandboxVolumeDeletes(ctx, sandbox.ID, dwsVolumes)
 	if s.admitter != nil {
