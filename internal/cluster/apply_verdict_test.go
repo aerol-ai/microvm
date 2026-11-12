@@ -52,6 +52,13 @@ func TestApplyVerdictCarriesReservationAndNameConflicts(t *testing.T) {
 			sentinel: ErrPlacementDeleted,
 		},
 		{
+			// A spec write based on an old copy (spec_version_fence.go).
+			name:     "spec version conflict",
+			err:      fmt.Errorf("cluster: fsm apply: %w: sb-x is at version 12, the write was based on 9", ErrSpecVersionConflict),
+			wantCode: http.StatusConflict,
+			sentinel: ErrSpecVersionConflict,
+		},
+		{
 			name:     "superseded still carried",
 			err:      fmt.Errorf("%w: template/worker-a", ErrArtifactCatalogSuperseded),
 			wantCode: http.StatusConflict,
@@ -76,7 +83,7 @@ func TestApplyVerdictCarriesReservationAndNameConflicts(t *testing.T) {
 			if tc.sentinel == nil {
 				// A generic failure must NOT be mistaken for any conflict
 				// sentinel — the caller retries it unchanged.
-				if errors.Is(round, ErrReservationConflict) || errors.Is(round, ErrNameConflict) || errors.Is(round, ErrArtifactCatalogSuperseded) || errors.Is(round, ErrIncarnationConflict) {
+				if errors.Is(round, ErrReservationConflict) || errors.Is(round, ErrNameConflict) || errors.Is(round, ErrArtifactCatalogSuperseded) || errors.Is(round, ErrIncarnationConflict) || errors.Is(round, ErrSpecVersionConflict) {
 					t.Fatalf("generic failure round-tripped into a conflict sentinel: %v", round)
 				}
 				return
@@ -111,6 +118,8 @@ func TestAgentControlPlaneCarriesReservationAndNameConflicts(t *testing.T) {
 		{"placement rule", "worker w1: " + ErrPlacementUnsatisfiable.Error() + ": no node has the labels zone=z", ErrPlacementUnsatisfiable},
 		// C2: a worker's ownership replay of a deleted lifecycle.
 		{"deleted lifecycle", "cluster: fsm apply: " + ErrPlacementDeleted.Error() + ": sb-x incarnation \"inc\"", ErrPlacementDeleted},
+		// A worker's spec write based on a copy a follower served late.
+		{"spec version", "cluster: fsm apply: " + ErrSpecVersionConflict.Error() + ": sb-x is at version 12, the write was based on 9", ErrSpecVersionConflict},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

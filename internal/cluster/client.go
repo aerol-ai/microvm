@@ -723,6 +723,12 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 // spec MUST be redacted; empty secrets preserves the previously replicated
 // handle (resize/lifecycle never change credentials).
 func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return c.upsertSpec(ctx, sandboxID, spec, secrets, 0)
+}
+
+// upsertSpec is UpsertSpec with opUpsertSpec's version check
+// (spec_version_fence.go); expectedVersion 0 asks for none.
+func (c *Cluster) upsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets, expectedVersion uint64) error {
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
@@ -742,15 +748,16 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 		}
 	}
 	cmd := command{
-		Op:                    opUpsertSpec,
-		SandboxID:             sandboxID,
-		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
-		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
+		Op:                       opUpsertSpec,
+		SandboxID:                sandboxID,
+		Spec:                     c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
+		SecretRef:                secrets.Ref,
+		SecretVersion:            secrets.Version,
+		SecretRecipients:         normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:     secrets.SealGeneration,
+		IncarnationID:            strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:    strings.TrimSpace(secrets.IncarnationID),
+		ExpectedPlacementVersion: expectedVersion,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -1591,6 +1598,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 			c.obligations.add(cmd.ObligationReports)
 			return nil
 		}
+		if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+			return err
+		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
@@ -1641,6 +1651,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil
+	}
+	if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+		return err
 	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)

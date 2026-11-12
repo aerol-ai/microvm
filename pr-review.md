@@ -125,6 +125,14 @@ behavior, single-node no-op, and leader-change replay safety.
   test, per facade route (`TestSpecWriteThroughRaftWrites`,
   `TestLifecycleKeepAliveRaftWrites`, `TestE2BTimeoutRoutesRaftWrites`,
   `TestDaytonaRoutesRaftWrites`, `TestRunloopRoutesRaftWrites`).
+- **Replicated spec writes read, change and write through
+  `writeReplicatedSpec`.** A spec write replaces the whole spec, and a worker
+  reads it from a random server, which can be a follower behind this node's
+  last write. A new `SpecOf` + `UpsertSpec` pair outside that helper can put
+  back a field another write just changed (a resize lost to a lifecycle
+  change, UC-706). Its edit function must be safe to run again on a fresh
+  copy; the helper re-reads after `cluster.ErrSpecVersionConflict`
+  (`TestWriteReplicatedSpecReadsPastStaleCopies`).
 
 ### 7.1 Reference implementation — B7 local-only built images & per-host routing
 

@@ -110,6 +110,13 @@ type command struct {
 	ExpectedOwnerNodeID    string `json:"expected_owner_node_id,omitempty"`
 	ExpectedOwnerNodeIDSet bool   `json:"expected_owner_node_id_set,omitempty"`
 	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
+	// ExpectedPlacementVersion is opUpsertSpec's compare-and-set: the
+	// Placement.Version of the spec the writer read and patched. Apply
+	// refuses the write (ErrSpecVersionConflict) when the placement has
+	// moved since. Zero asks for no check, which is every entry written
+	// before the fence and every one a proposer writes while an older server
+	// is still in the cluster (spec_version_fence.go).
+	ExpectedPlacementVersion uint64 `json:"expected_placement_version,omitempty"`
 	// OwnerRef is the control-plane tenant account.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
@@ -1634,6 +1641,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
 		if expectedIncarnationID == "" || strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
 			return fmt.Errorf("%w: spec update want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
+		}
+		if err := specVersionFence(cmd, existing.Version); err != nil {
+			return err
 		}
 		if cmd.hasSecretUpdate() {
 			if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {

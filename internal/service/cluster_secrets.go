@@ -58,26 +58,26 @@ func (s *Service) replicateSpecPatchUnless(ctx context.Context, id string, patch
 		return
 	}
 	defer unlock()
-	spec := c.SpecOf(id)
-	if spec == nil {
-		return
-	}
-	if current != nil && current(spec) {
-		return
-	}
-	// Compare what the command would carry: opUpsertSpec encodes the spec as
-	// JSON, so a field kept off the wire (json:"-") never reaches Raft and
-	// does not count. An encode error just means "write, as before".
-	before, beforeErr := json.Marshal(spec)
-	patch(spec)
-	if beforeErr == nil {
-		if after, err := json.Marshal(spec); err == nil && bytes.Equal(before, after) {
-			return
-		}
-	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil && s.logger != nil {
+	err = s.writeReplicatedSpec(commitCtx, c, id, func(spec *models.CreateSandboxRequest) (bool, error) {
+		if spec == nil || (current != nil && current(spec)) {
+			return false, nil
+		}
+		// Compare what the command would carry: opUpsertSpec encodes the
+		// spec as JSON, so a field kept off the wire (json:"-") never
+		// reaches Raft and does not count. An encode error just means
+		// "write, as before".
+		before, beforeErr := json.Marshal(spec)
+		patch(spec)
+		if beforeErr == nil {
+			if after, err := json.Marshal(spec); err == nil && bytes.Equal(before, after) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil && s.logger != nil {
 		s.logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}

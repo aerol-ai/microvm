@@ -538,24 +538,26 @@ func (s *Service) commitPolicySpec(ctx context.Context, id string, create *model
 		return fmt.Errorf("%w: %v", ErrEgressSpecCommitFailed, err)
 	}
 	defer unlock()
-	spec := c.SpecOf(id)
-	if spec == nil {
-		return nil
-	}
-	// Every egress field: a failover replays the spec, so one left behind
-	// would bring back the old profiles, mode or rules.
-	spec.NetworkBlockAll, spec.NetworkAllowOut, spec.NetworkDenyOut = create.NetworkBlockAll, create.NetworkAllowOut, create.NetworkDenyOut
-	spec.EgressProfiles, spec.NetworkEgressMode, spec.NetworkEgressRules = create.EgressProfiles, create.NetworkEgressMode, create.NetworkEgressRules
-	// Keys withheld at create stay withheld after their inject rule goes
-	// (P3-2).
-	for _, k := range withheld {
-		if !slices.Contains(spec.EgressWithheldEnv, k) {
-			spec.EgressWithheldEnv = append(spec.EgressWithheldEnv, k)
-		}
-	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil {
+	err = s.writeReplicatedSpec(commitCtx, c, id, func(spec *models.CreateSandboxRequest) (bool, error) {
+		if spec == nil {
+			return false, nil
+		}
+		// Every egress field: a failover replays the spec, so one left
+		// behind would bring back the old profiles, mode or rules.
+		spec.NetworkBlockAll, spec.NetworkAllowOut, spec.NetworkDenyOut = create.NetworkBlockAll, create.NetworkAllowOut, create.NetworkDenyOut
+		spec.EgressProfiles, spec.NetworkEgressMode, spec.NetworkEgressRules = create.EgressProfiles, create.NetworkEgressMode, create.NetworkEgressRules
+		// Keys withheld at create stay withheld after their inject rule
+		// goes (P3-2).
+		for _, k := range withheld {
+			if !slices.Contains(spec.EgressWithheldEnv, k) {
+				spec.EgressWithheldEnv = append(spec.EgressWithheldEnv, k)
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
 		if errors.Is(err, cluster.ErrRecoveryPayloadTooLarge) {
 			return fmt.Errorf("%w: sandbox spec too large to replicate: %v", egresspolicy.ErrInvalid, err)
 		}

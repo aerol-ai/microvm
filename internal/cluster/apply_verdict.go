@@ -65,6 +65,12 @@ func ApplyErrorStatus(err error) int {
 		// only works if the sentinel survives the hop; as a 500 the retry
 		// answered 503 (seen live on cluster-hetero-lite, UC-367).
 		return http.StatusConflict
+	case errors.Is(err, ErrSpecVersionConflict):
+		// A verdict: the spec moved on since the writer read it. The
+		// writer reads it again (spec_version_fence.go), which it can only
+		// do if the sentinel survives the hop; as a 500 the change was
+		// dropped with a warning.
+		return http.StatusConflict
 	case errors.Is(err, ErrPlacementDeleted):
 		// A verdict: the lifetime is deleted for good. As a 500 a returning
 		// node's ownership replay could not tell it from a transient fault
@@ -116,6 +122,8 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
 		case strings.Contains(message, ErrPlacementDeleted.Error()):
 			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
+		case strings.Contains(message, ErrSpecVersionConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrSpecVersionConflict, message)
 		}
 	case http.StatusForbidden:
 		// The leader's peer check does not see this node alive in gossip

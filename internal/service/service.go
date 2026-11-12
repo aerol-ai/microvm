@@ -545,6 +545,11 @@ type Service struct {
 	// size a team is charged for, that another has just changed. A sandbox's
 	// mutations run on its owner, so one node's lock covers them.
 	specLocks keyedLocks[string]
+	// specFloors is, per sandbox, the oldest spec version a read may return
+	// after this node's last spec write (writeReplicatedSpec): the lock
+	// orders the writes, and this keeps the next one from reading a copy
+	// from before the last.
+	specFloors specReadFloors
 	// identity is the cloud-identity issuer state: signing keys, the lazy
 	// bootstrap latch and in-flight token pushes (identity.go).
 	identity identityState
