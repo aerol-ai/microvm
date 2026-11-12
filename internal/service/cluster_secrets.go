@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,19 +19,24 @@ import (
 )
 
 // replicateSpecPatch keeps the FSM-replicated spec in sync after a local
-// mutation (resize, lifecycle update). It is a best-effort write-through that
+// mutation (resize, public traffic). It is a best-effort write-through that
 // mirrors the v1 wrapper of the same name: on failure it warns and returns
 // without surfacing the error to the caller, because the local sandbox is
 // already authoritative and the next mutation will refresh the FSM.
 //
 // No-op when the cluster doesn't carry a spec for this sandbox yet
-// (pre-cluster sandbox; Noop client in single-node mode also returns nil).
-// The read, patch and write run under the sandbox's spec lock, so two
+// (pre-cluster sandbox; Noop client in single-node mode also returns nil),
+// and when the patch changes nothing the Raft command would carry: the same
+// tags or facade state saved again would still be a log entry every server
+// syncs. The read, patch and write run under the sandbox's spec lock, so two
 // patches of the same sandbox on this node (a lifecycle update and a
 // resize, say) cannot each read the old spec and put back the field the
 // other changed. Before the lock a lifecycle write could put back a
 // sandbox's old size after a resize had recorded the new one, and its
 // team's quota then counted the old size.
+//
+// Fields that only a failover recreate reads back go through
+// replicateRecoverySpecPatch instead.
 func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
 	c := s.Cluster()
 	if c == nil {
@@ -48,13 +55,51 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 	if spec == nil {
 		return
 	}
+	// Compare what the command would carry: opUpsertSpec encodes the spec as
+	// JSON, so a field kept off the wire (json:"-") never reaches Raft and
+	// does not count. An encode error just means "write, as before".
+	before, beforeErr := json.Marshal(spec)
 	patch(spec)
+	if beforeErr == nil {
+		if after, err := json.Marshal(spec); err == nil && bytes.Equal(before, after) {
+			return
+		}
+	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil && s.logger != nil {
 		s.logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}
+}
+
+// replicateRecoverySpecPatch is replicateSpecPatch for the fields that only a
+// failover recreate reads back from the replicated spec: lifecycle, tags and
+// facade state. The owner watcher recreates a placement only when its spec
+// asks for failover=recreate (recreateOwnedPlacement), and nothing else in
+// the cluster reads these fields, so for any other sandbox the write buys
+// nothing. Deciding before SpecOf also skips the round trips a worker makes
+// to the servers to read and write the spec: an E2B setTimeout on a default
+// sandbox costs no Raft entry and no control-plane call.
+//
+// sb is the caller's local row when it has one; nil reads it. The row and the
+// replicated spec take their failover policy from the same create request,
+// and an ownership replay rebuilds the spec from the row
+// (specFromSandbox). If the row cannot be read, the write goes ahead as it
+// did before.
+func (s *Service) replicateRecoverySpecPatch(ctx context.Context, id string, sb *models.Sandbox, patch func(*models.CreateSandboxRequest)) {
+	if _, standalone := s.Cluster().(*cluster.Noop); standalone {
+		return
+	}
+	if sb == nil && s.store != nil {
+		if row, err := s.store.Get(ctx, id); err == nil {
+			sb = row
+		}
+	}
+	if sb != nil && (sb.Failover == nil || !sb.Failover.ShouldRecreate()) {
+		return
+	}
+	s.replicateSpecPatch(ctx, id, patch)
 }
 
 // lockSpec takes id's spec lock (specLocks) in a cluster. A single node has
