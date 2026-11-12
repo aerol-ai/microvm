@@ -44,8 +44,16 @@ func newInternalDialer() *net.Dialer {
 
 // newInternalTransport is the mTLS transport behind Cluster.internalClient
 // and Agent.internalClient — the follower→leader commit channel. Keep-alives
-// stay on and the idle pool is sized for concurrent promote fan-in so creates
-// don't re-handshake mTLS under burst (warm-create-latency Tier 1 Phase 4).
+// stay on and the idle pool is sized for concurrent fan-in so creates don't
+// re-handshake mTLS under burst (warm-create-latency Tier 1 Phase 4).
+//
+// Sizing (C18, bench-full-5): a gateway at its share of a 500-worker cell's
+// creates holds 40 to 170 requests at once to each server. With 16 idle
+// per host, every connection past the 16th was closed on return and the
+// next burst handshook again: 8% of a gateway's CPU, and 6% of the Raft
+// leader's for the server side. 128 per host keeps them. The total bounds
+// memory (an idle TLS connection is tens of KB, so about 50 MB at worst)
+// while a gateway also proxies to many workers, a few connections each.
 // New and NewAgent both build from here so the two call sites can't drift;
 // transport_pool_test.go pins the sizing.
 func newInternalTransport(tlsCfg *tls.Config) *http.Transport {
@@ -54,8 +62,13 @@ func newInternalTransport(tlsCfg *tls.Config) *http.Transport {
 		DialContext:         newInternalDialer().DialContext,
 		TLSHandshakeTimeout: internalTLSHandshakeTimeout,
 		DisableKeepAlives:   false,
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 16,
+		MaxIdleConns:        internalMaxIdleConns,
+		MaxIdleConnsPerHost: internalMaxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second,
 	}
 }
+
+const (
+	internalMaxIdleConns        = 1024
+	internalMaxIdleConnsPerHost = 128
+)
