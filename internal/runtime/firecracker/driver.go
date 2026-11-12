@@ -245,6 +245,10 @@ type Config struct {
 	// identity ("once", default). Only consulted when SnapshotVerifyOnLoad
 	// is true and the template has a persisted checksum.
 	SnapshotVerifyMode string
+	// VMMCgroupParent is the cgroup (a path under the cgroup v2 root) the
+	// VMs' cgroup is made under, so they outlive sandboxd; "" for the root.
+	// A worker pod sets the runtime container's sandboxes group (C14).
+	VMMCgroupParent string
 	// OverlayEnabled is the daemon-wide opt-out for the per-sandbox
 	// writable overlay drive. Mirrors
 	// internal/config.Config.FirecrackerOverlayEnabled. When false,
@@ -297,6 +301,7 @@ func FromDaemonConfig(c config.Config) Config {
 		Mkfs4Bin:             c.FirecrackerMkfs4Bin,
 		PostResumeTimeout:    c.FirecrackerSnapshotPostResumeTimeout,
 		ToolboxBinaryPath:    c.ToolboxBinaryPath,
+		VMMCgroupParent:      c.HostProcessCgroupParent,
 	}
 }
 
@@ -309,6 +314,8 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	parent := cfg.VMMCgroupParent
+	vmmCgroupParent.Store(&parent)
 	d := &Driver{
 		cfg:      cfg,
 		logger:   logger,

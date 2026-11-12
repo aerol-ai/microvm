@@ -3,6 +3,7 @@ package hostproc
 import (
 	"bytes"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -290,5 +291,134 @@ func TestOpenPIDMissing(t *testing.T) {
 	fakeProc(t, 42, "", "")
 	if _, _, err := OpenPID(42); !errors.Is(err, ErrGone) {
 		t.Fatalf("OpenPID of a pid with no stat = %v, want ErrGone", err)
+	}
+}
+
+// OwnsPIDNamespace: PID 1 in this process's cgroup, or below it, means this
+// container's end ends the PID namespace (C14).
+func TestOwnsPIDNamespace(t *testing.T) {
+	const pod = "/kubepods.slice/kubepods-pod1.slice"
+	for _, tc := range []struct {
+		name, self, first string
+		want              bool
+		wantErr           bool
+	}{
+		{name: "pod sharing one namespace: PID 1 is pause", self: pod + "/cri-containerd-agent.scope", first: pod + "/cri-containerd-pause.scope"},
+		{name: "pod not sharing: PID 1 is the agent's entrypoint", self: pod + "/cri-containerd-agent.scope", first: pod + "/cri-containerd-agent.scope", want: true},
+		{name: "PID 1 below this process's cgroup", self: "/agent", first: "/agent/init", want: true},
+		{name: "a sibling with a longer name is not below", self: "/a/agent", first: "/a/agent2"},
+		{name: "VM: PID 1 is systemd", self: "/system.slice/sandboxd.service", first: "/init.scope"},
+		{name: "own cgroup namespace, PID 1 outside it", self: "/", first: "/../cri-containerd-pause.scope"},
+		{name: "own cgroup namespace, PID 1 inside it", self: "/", first: "/", want: true},
+		{name: "no cgroup v2 line", self: "", first: "/init.scope", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			old := ProcRoot
+			ProcRoot = root
+			t.Cleanup(func() { ProcRoot = old })
+			for dir, path := range map[string]string{"self": tc.self, "1": tc.first} {
+				line := "0::" + path + "\n"
+				if path == "" {
+					line = "1:name=systemd:/x\n"
+				}
+				if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, dir, "cgroup"), []byte(line), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := OwnsPIDNamespace()
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("OwnsPIDNamespace() = %v, %v; want %v (error %v)", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+	t.Run("no procfs", func(t *testing.T) {
+		old := ProcRoot
+		ProcRoot = filepath.Join(t.TempDir(), "missing")
+		t.Cleanup(func() { ProcRoot = old })
+		if _, err := OwnsPIDNamespace(); err == nil {
+			t.Fatal("want an error without procfs")
+		}
+	})
+}
+
+// A process started to outlive sandboxd does not get sandboxd's own stdout
+// and stderr when a log file is set: in a container those are its log
+// pipes, and the container's stop waits for every holder to close them
+// (C14). Output it was given on purpose is left alone.
+func TestCgroupStartSendsOwnOutputToTheLogFile(t *testing.T) {
+	if !cgFDSupported() {
+		t.Skip("no CLONE_INTO_CGROUP here: processes start in sandboxd's cgroup")
+	}
+	cg := NewCgroup(slog.New(slog.NewTextHandler(new(bytes.Buffer), nil)), t.TempDir(), "aerolvm-test", "test workers")
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	cg.setup.Do(func() {})
+	cg.dir = dir
+	var got *exec.Cmd
+	old := startCmd
+	defer func() { startCmd = old }()
+	startCmd = func(cmd *exec.Cmd) error { got = cmd; return nil }
+	start := func(stdout, stderr io.Writer) *exec.Cmd {
+		t.Helper()
+		if _, err := cg.Start(func() (*exec.Cmd, error) {
+			c := exec.Command("true")
+			c.Stdout, c.Stderr = stdout, stderr
+			return c, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// No log file (a VM): sandboxd's own output, the journal, is kept.
+	if c := start(os.Stdout, os.Stderr); c.Stdout != os.Stdout || c.Stderr != os.Stderr {
+		t.Fatal("without a log file the output changed")
+	}
+
+	logPath := filepath.Join(t.TempDir(), "workers.log")
+	cg.SetLogFile(logPath)
+	c := start(os.Stdout, os.Stderr)
+	f, ok := c.Stdout.(*os.File)
+	if !ok || f.Name() != logPath || c.Stderr != c.Stdout {
+		t.Fatalf("stdout %v, stderr %v; want both the log file", c.Stdout, c.Stderr)
+	}
+	if st, err := os.Stat(logPath); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("log file: %v, %v; want it made 0600", st, err)
+	}
+	var mine bytes.Buffer
+	if c := start(&mine, os.Stderr); c.Stdout != &mine || c.Stderr != f {
+		t.Fatal("output given on purpose was replaced")
+	}
+
+	// Past the cap, the next start truncates it.
+	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), logFileCap+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start(os.Stdout, os.Stderr)
+	if st, _ := os.Stat(logPath); st.Size() != 0 {
+		t.Fatalf("log file is %d bytes after a start past the cap, want 0", st.Size())
+	}
+
+	// A log file that cannot be opened: /dev/null, never the pipes.
+	cg2 := NewCgroup(slog.New(slog.NewTextHandler(new(bytes.Buffer), nil)), t.TempDir(), "aerolvm-test2", "test workers")
+	cg2.setup.Do(func() {})
+	cg2.dir = dir
+	cg2.SetLogFile(filepath.Join(t.TempDir(), "missing", "workers.log"))
+	if _, err := cg2.Start(func() (*exec.Cmd, error) {
+		c := exec.Command("true")
+		c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		return c, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got.Stdout != nil || got.Stderr != nil {
+		t.Fatalf("stdout %v, stderr %v; want nil (/dev/null)", got.Stdout, got.Stderr)
 	}
 }

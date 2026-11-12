@@ -227,6 +227,18 @@ type Config struct {
 	// outside the pod's CPU and memory box (plans/kubernetes-v2-architecture.md
 	// §8.3, C7; seen live in Phase 0 spike S1). SB_CONTAINERD_CGROUP_PARENT.
 	ContainerdCgroupParent string
+	// HostProcessCgroupParent is the cgroup (a path under the cgroup v2
+	// root) that the sandboxes sandboxd starts itself are made under: WASM
+	// workers, V8-isolate group hosts and their jail, Firecracker VMs. They
+	// go there to outlive sandboxd, and the next one takes them over. Unset,
+	// they go at the root of the machine's tree, as on a VM. It defaults to
+	// SB_CONTAINERD_CGROUP_PARENT: in a Kubernetes worker pod that is the
+	// runtime container's sandboxes group, inside the pod's box and its
+	// sandbox memory cap (F10), and outside the agent container, whose
+	// restart would otherwise kill them (C14). With it set, a worker that
+	// runs these sandboxes needs a process namespace its own container does
+	// not own (CheckHostProcessesOutliveAgent). SB_HOST_PROCESS_CGROUP_PARENT.
+	HostProcessCgroupParent string
 	// ContainerdLogDir overrides per-task log file placement; defaults to
 	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
 	ContainerdLogDir string
@@ -2253,6 +2265,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
 		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
+		HostProcessCgroupParent:           strings.TrimSpace(os.Getenv("SB_HOST_PROCESS_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
@@ -2859,6 +2872,19 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ContainerEngine != models.ContainerEngineContainerd {
 			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT needs SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if cfg.HostProcessCgroupParent == "" {
+		cfg.HostProcessCgroupParent = cfg.ContainerdCgroupParent
+	}
+	if p := cfg.HostProcessCgroupParent; p != "" {
+		if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" {
+			return Config{}, fmt.Errorf("SB_HOST_PROCESS_CGROUP_PARENT must be a clean absolute cgroup path below the root, got %q", p)
+		}
+		// The V8 jail's group cgroups follow the hosts into the parent,
+		// unless the operator named their own place.
+		if strings.TrimSpace(os.Getenv("SB_ISOLATE_JAIL_CGROUP_ROOT")) == "" {
+			cfg.IsolateJailCgroupRoot = filepath.Join(cgroupV2Mount, p, "aerolvm-isolate")
 		}
 	}
 
@@ -3596,6 +3622,26 @@ func (c Config) IsServer() bool { return c.hasRole(NodeRoleServer) }
 // lifecycle sweep, image GC, reservation replay). Pure ingress/server nodes
 // return false; mixed and any hybrid that includes "worker" return true.
 func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
+
+// cgroupV2Mount is where cgroup v2 is mounted.
+const cgroupV2Mount = "/sys/fs/cgroup"
+
+// HostProcessCgroupRoot is the directory the cgroups of the sandboxes
+// sandboxd starts itself are made in: the HostProcessCgroupParent group,
+// or "" for the root of the cgroup v2 mount.
+func (c Config) HostProcessCgroupRoot() string {
+	if c.HostProcessCgroupParent == "" {
+		return ""
+	}
+	return filepath.Join(cgroupV2Mount, c.HostProcessCgroupParent)
+}
+
+// RunsHostProcessSandboxes reports whether this node starts sandboxes as
+// processes of its own (WASM, V8 isolates, Firecracker), which must outlive
+// sandboxd.
+func (c Config) RunsHostProcessSandboxes() bool {
+	return c.IsWorker() && (c.EnableWasm || c.EnableIsolate || c.EnableFirecracker)
+}
 
 // IsIngress reports whether this daemon installs owner-aware Caddy routes for
 // remote sandboxes. Pure server/worker nodes return false; mixed and any

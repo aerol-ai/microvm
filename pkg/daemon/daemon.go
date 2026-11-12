@@ -116,6 +116,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := identityBootGuard(cfg, cp); err != nil {
 		return err
 	}
+	if err := checkHostProcessesOutliveAgent(cfg); err != nil {
+		return err
+	}
 
 	// Derive a cancellable child so a fatal failure in a background server
 	// goroutine (HTTP/ingress ListenAndServe) can trigger graceful shutdown by

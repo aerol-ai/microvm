@@ -88,6 +88,77 @@ type Cgroup struct {
 	// number, and one descriptor for the process's life costs nothing.
 	dir *os.File
 	off bool
+
+	// logPath, when set, takes what the cgroup's processes would write to
+	// sandboxd's own stdout and stderr (SetLogFile).
+	logPath string
+	log     *os.File
+}
+
+// logFileCap is the size past which a start truncates the log file: its
+// processes write a line on a fatal error, so it stays small unless one of
+// them is chatty.
+const logFileCap = 32 << 20
+
+// SetLogFile makes the cgroup's processes write what they would send to
+// sandboxd's own stdout or stderr to path instead: appended, the file made
+// 0600 on first use and truncated by a start once it passes 32 MiB. In a
+// container those two are the container's log pipes, and the container
+// runtime counts the container stopped only once every holder has closed
+// them, so a process meant to outlive the container would hold its stop
+// forever (C14: an agent restart hung). A file is not tied to the
+// container. On a VM sandboxd's output is a journal stream, which a
+// process may keep; there this is not set.
+func (c *Cgroup) SetLogFile(path string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.logPath = path
+	c.mu.Unlock()
+}
+
+// redirectOwnOutput points cmd's stdout and stderr, where they are
+// sandboxd's own, at the log file, or at /dev/null when the file cannot be
+// opened: never at the container's pipes.
+func (c *Cgroup) redirectOwnOutput(cmd *exec.Cmd) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.logPath == "" {
+		return
+	}
+	own := func(w any) bool { return w == os.Stdout || w == os.Stderr }
+	if !own(cmd.Stdout) && !own(cmd.Stderr) {
+		return
+	}
+	if c.log != nil {
+		if st, err := c.log.Stat(); err == nil && st.Size() > logFileCap {
+			_ = c.log.Truncate(0)
+		}
+	} else {
+		f, err := os.OpenFile(c.logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+		if err != nil {
+			c.logger.Warn(c.what+": cannot open their log file; their output is dropped", "path", c.logPath, "error", err)
+		} else {
+			c.log = f
+		}
+	}
+	var out *os.File // nil: os/exec gives the process /dev/null
+	if c.log != nil {
+		out = c.log
+	}
+	if own(cmd.Stdout) {
+		cmd.Stdout = nil
+		if out != nil {
+			cmd.Stdout = out
+		}
+	}
+	if own(cmd.Stderr) {
+		cmd.Stderr = nil
+		if out != nil {
+			cmd.Stderr = out
+		}
+	}
 }
 
 // NewCgroup returns the cgroup name under root (CgroupRoot when empty).
@@ -172,6 +243,7 @@ func (c *Cgroup) Start(newCmd func() (*exec.Cmd, error)) (*exec.Cmd, error) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	setCgroupFD(cmd.SysProcAttr, fd)
+	c.redirectOwnOutput(cmd)
 	cgErr := startCmd(cmd)
 	if cgErr == nil {
 		return cmd, nil
@@ -288,4 +360,42 @@ func Stop(p Process, grace time.Duration) {
 		<-p.Done()
 	}
 	_ = p.Close()
+}
+
+// OwnsPIDNamespace reports whether the container this process runs in owns
+// its PID namespace: PID 1 is in this process's cgroup or below it. When
+// such a container ends, its PID 1 ends, and the kernel kills every process
+// in the namespace, whatever cgroup it is in, so nothing started here
+// outlives the container. A Kubernetes pod that shares one process
+// namespace has its pause process as PID 1, in a cgroup of its own; a VM
+// has systemd. Only the cgroup v2 line of /proc/<pid>/cgroup is read.
+func OwnsPIDNamespace() (bool, error) {
+	self, err := cgroupV2Path(filepath.Join(ProcRoot, "self", "cgroup"))
+	if err != nil {
+		return false, err
+	}
+	first, err := cgroupV2Path(filepath.Join(ProcRoot, "1", "cgroup"))
+	if err != nil {
+		return false, err
+	}
+	// In a cgroup namespace of its own, a container sees its group as "/"
+	// and a PID 1 outside it as "/../...".
+	if strings.HasPrefix(first, "/..") {
+		return false, nil
+	}
+	return first == self || strings.HasPrefix(first, strings.TrimSuffix(self, "/")+"/"), nil
+}
+
+// cgroupV2Path is the path on the "0::" line of a /proc/<pid>/cgroup file.
+func cgroupV2Path(file string) (string, error) {
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if p, ok := strings.CutPrefix(line, "0::"); ok {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s has no cgroup v2 line", file)
 }

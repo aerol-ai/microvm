@@ -62,6 +62,12 @@ func newWorkerdSupervisor(cfg Config, logger *slog.Logger) *workerdSupervisor {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	hostsCgroup := hostproc.NewCgroup(logger, cfg.HostsCgroupRoot, hostsCgroupName, "V8-isolate group hosts")
+	if cfg.HostsCgroupRoot != "" && cfg.RunDir != "" {
+		// In a worker pod, not the agent container's log pipes: a host
+		// holding them would hold the container's stop (C14).
+		hostsCgroup.SetLogFile(filepath.Join(cfg.RunDir, "hosts.log"))
+	}
 	return &workerdSupervisor{
 		workerdPath:    cfg.WorkerdPath,
 		runDir:         cfg.RunDir,
@@ -70,7 +76,7 @@ func newWorkerdSupervisor(cfg Config, logger *slog.Logger) *workerdSupervisor {
 		jailCgroupRoot: cfg.JailCgroupRoot,
 		jailChrootBase: cfg.JailChrootBase,
 		logger:         logger,
-		hostsCgroup:    hostproc.NewCgroup(logger, "", hostsCgroupName, "V8-isolate group hosts"),
+		hostsCgroup:    hostsCgroup,
 	}
 }
 

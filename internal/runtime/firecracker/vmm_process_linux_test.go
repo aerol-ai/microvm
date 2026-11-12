@@ -287,3 +287,35 @@ func TestProcCmdline(t *testing.T) {
 		t.Fatal("a missing process was read")
 	}
 }
+
+// In a worker pod the VMs' cgroup is under the runtime container's
+// sandboxes group (Config.VMMCgroupParent, C14): made, listed and matched
+// there, and a VM at the machine's root is no longer counted as one.
+func TestVMMCgroupUnderAParent(t *testing.T) {
+	root := withCgroupRoot(t, true)
+	const parent = "/kubepods.slice/pod1/sandboxes"
+	New(Config{VMMCgroupParent: parent}, nil)
+	t.Cleanup(func() { New(Config{}, nil) })
+	if err := os.MkdirAll(filepath.Join(root, parent), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	procs := filepath.Join(root, parent, vmmCgroupName, "cgroup.procs")
+	if err := os.MkdirAll(filepath.Dir(procs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(procs, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveToVMMCgroup(4343); err != nil {
+		t.Fatal(err)
+	}
+	if pids, err := vmmCgroupPIDs(); err != nil || !reflect.DeepEqual(pids, []int{4343}) {
+		t.Fatalf("pids = %v, %v; want [4343] from the parent's group", pids, err)
+	}
+	if !inVMMCgroup([]byte("0::" + parent + "/" + vmmCgroupName + "\n")) {
+		t.Fatal("a VM in the parent's group was not recognised")
+	}
+	if inVMMCgroup([]byte("0::/" + vmmCgroupName + "\n")) {
+		t.Fatal("a process in the machine's root group counted as one of this pod's VMs")
+	}
+}
