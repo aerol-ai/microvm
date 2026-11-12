@@ -87,30 +87,58 @@ func shareNetnsRoot(root string) error {
 
 // bindNewNetns creates a network namespace and binds it at path. The
 // unshare moves the calling OS thread into the new namespace, so it runs on
-// a locked thread of a goroutine of its own that never unlocks: a goroutine
-// that ends while locked takes its thread with it, and no other goroutine is
-// ever scheduled onto a thread left in a sandbox's namespace. (setns back
-// would keep the thread, but a failed setns back would then need this same
-// way out; one path is simpler, and a thread costs far less than the
-// namespace.)
+// a locked thread of a goroutine of its own, and that thread goes back to
+// the namespace it came from before it is unlocked.
+//
+// Letting the goroutine end while locked, and the runtime take the thread
+// with it, is not enough: Go never ends the process's main thread. A locked
+// goroutine that ends there wedges it instead, and it stays in the new
+// namespace for the life of the process. /proc/<pid>/ns/net names the main
+// thread's namespace, so sandboxd then looked, from outside, as if it ran
+// in one sandbox's network; and the gVisor address probe, whose task pid 1
+// is sandboxd itself in a worker pod, gave every later sandbox on that node
+// the wedged sandbox's address, and every create there failed (found on
+// kind: "sandbox came up at 10.88.0.6, not at its prepaid address").
+//
+// Only when the way back fails does the thread stay locked and end with
+// the goroutine: no other goroutine may run on a thread in a sandbox's
+// namespace.
 func bindNewNetns(path string) error {
 	errc := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
-			errc <- fmt.Errorf("unshare a new netns: %w", err)
-			return
+		home, err := bindNewNetnsOnThread(path)
+		if home {
+			runtime.UnlockOSThread()
 		}
-		// This thread's namespace. /proc/self/ns/net would name the main
-		// thread's, which is the host's.
-		self := fmt.Sprintf("/proc/self/task/%d/ns/net", unix.Gettid())
-		if err := unix.Mount(self, path, "none", unix.MS_BIND, ""); err != nil {
-			errc <- fmt.Errorf("bind %s -> %s: %w", self, path, err)
-			return
-		}
-		errc <- nil
+		errc <- err
 	}()
 	return <-errc
+}
+
+// bindNewNetnsOnThread is bindNewNetns on the calling thread, which the
+// caller has locked. home reports that the thread is back in the namespace
+// it started in (or never left it), so it may be unlocked.
+func bindNewNetnsOnThread(path string) (home bool, err error) {
+	orig, err := netns.Get()
+	if err != nil {
+		return true, fmt.Errorf("open this thread's netns: %w", err)
+	}
+	defer func() { _ = orig.Close() }()
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		return true, fmt.Errorf("unshare a new netns: %w", err)
+	}
+	// This thread's namespace. /proc/self/ns/net would name the main
+	// thread's.
+	self := fmt.Sprintf("/proc/self/task/%d/ns/net", unix.Gettid())
+	var bindErr error
+	if merr := unix.Mount(self, path, "none", unix.MS_BIND, ""); merr != nil {
+		bindErr = fmt.Errorf("bind %s -> %s: %w", self, path, merr)
+	}
+	if serr := netns.Set(orig); serr != nil {
+		return false, errors.Join(bindErr, fmt.Errorf("return to the original netns after binding %s: %w", path, serr))
+	}
+	return true, bindErr
 }
 
 // loopbackUpIn is `ip -n <name> link set lo up` for the netns at path, over
