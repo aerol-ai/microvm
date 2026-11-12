@@ -767,9 +767,9 @@ measure before and after each one.
 | E1 | **Group commit.** Many reserves and places share one Raft entry, using hashicorp/raft's batching and the unused `opReserveBatch`. | L-b | Done by raft's own batching once E2 shipped |
 | E2 | **Never wait for the disk while holding the reservation lock.** Check and hold the room in memory under the lock, release it, then commit. A failed commit gives the room back. | L-a | Shipped (#1024) |
 | E3 | **Route cache on gateways and workers**, filled from the placement change feed that already exists (`placement_changelog.go`). The owner answers "not here" to a stale guess. | L-d | Shipped behind `SB_CLUSTER_OWNER_CACHE` (#1018, #1042); the chart turns it on |
-| E4 | **Write the recovery file outside the table lock.** The file is named by its content hash, so it can be written before the commit and safely left behind if the commit fails. | L-c | Open Stale premise (eng review OV-E7): Put already defers fsync to snapshot time (`internal/cluster/recovery_store.go:91-98`), and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. Re-measure; drop unless the remaining I/O shows up. |
+| E4 | **Write the recovery file outside the table lock.** The file is named by its content hash, so it can be written before the commit and safely left behind if the commit fails. | L-c | Dropped in Phase 3 after measuring: 70 to 100 µs per apply under the lock, not a limit at G3 (`BenchmarkFSMApplyRecoveryStore`). Stale premise (eng review OV-E7): Put already defers fsync to snapshot time (`internal/cluster/recovery_store.go:91-98`), and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. |
 | E5 | **Capacity work grows with workers, not workers × servers.** Each worker pushes its numbers on change and every few seconds to the leader. Followers learn them from the leader. | L-e | Open |
-| E6 | **Pick from a sample, not the whole fleet.** Keep a list of fitting workers per runtime and zone, draw a few at random, and apply the power of two choices to them. | L-f | Open |
+| E6 | **Pick from a sample, not the whole fleet.** Keep a list of fitting workers per runtime and zone, draw a few at random, and apply the power of two choices to them. | L-f | Done in Phase 3: the index keeps the owners, a decision samples 48 (`placement_sampled.go`) |
 | E7 | **Failover in batches**, many sandboxes per Raft write, and keep going past a single error. | L-h | Open |
 | E8 | **"Restarting" is not "leaving"** (C8 in section 17). | L-i | Partly: rollouts only (`dead_owner.go:178`); C8 covers restarts outside a rollout |
 
@@ -2058,7 +2058,11 @@ the C18 fixes it is meant to measure.
   2,000. At G3 that is about 60% of a core and nearly 1 GB/s of garbage on
   the leader. Scoring already samples 16 per zone (`zoneSampleSize`); the
   cost is copying every member's record per decision and the GC that
-  follows. **Needed**, next.
+  follows. **Done**: the member index keeps the owners' IDs, and a fleet of
+  64 or more draws 48 of them at random and judges only those, with the
+  full scan still deciding small fleets, bound creates and any sample
+  without two takers (`internal/cluster/placement_sampled.go`). About 72 µs
+  and 96 KB per decision, flat from 100 to 2,000 workers.
 - E5 (pushed capacity) and E7 (batched failover): their cost is in many real
   peers and real commits, which the stand-in bench measures; decided from
   its numbers.
