@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -1633,7 +1634,7 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 		if firstErr == nil {
 			firstErr = err
 		}
-		if isStatus(err, http.StatusServiceUnavailable) || errors.Is(err, ErrNotLeader) {
+		if isStatus(err, http.StatusServiceUnavailable) || errors.Is(err, ErrNotLeader) || neverReachedPeer(err) {
 			continue
 		}
 		return err
@@ -1642,6 +1643,17 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 		return firstErr
 	}
 	return ErrNotLeader
+}
+
+// neverReachedPeer reports an error from opening the connection: the call
+// never left this node, so the next server can take it whatever it does,
+// writes included. Gossip takes seconds to see a server in a lost zone go;
+// until then it stays in the list, and before this one such server failed
+// every call that tried it first (Phase 3 zone-loss drill). An error after
+// the request went out stays final: the server may have applied it.
+func neverReachedPeer(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, publicPath, internalPath string, body []byte, out any) error {
