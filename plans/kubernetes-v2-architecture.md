@@ -768,10 +768,12 @@ measure before and after each one.
 | E2 | **Never wait for the disk while holding the reservation lock.** Check and hold the room in memory under the lock, release it, then commit. A failed commit gives the room back. | L-a | Shipped (#1024) |
 | E3 | **Route cache on gateways and workers**, filled from the placement change feed that already exists (`placement_changelog.go`). The owner answers "not here" to a stale guess. | L-d | Shipped behind `SB_CLUSTER_OWNER_CACHE` (#1018, #1042); the chart turns it on |
 | E4 | **Write the recovery file outside the table lock.** The file is named by its content hash, so it can be written before the commit and safely left behind if the commit fails. | L-c | Dropped in Phase 3 after measuring: 70 to 100 µs per apply under the lock, not a limit at G3 (`BenchmarkFSMApplyRecoveryStore`). Stale premise (eng review OV-E7): Put already defers fsync to snapshot time (`internal/cluster/recovery_store.go:91-98`), and moving Put before commit would break the GC assumption that Put and snapshot tracking share the FSM lock. |
-| E5 | **Capacity work grows with workers, not workers × servers.** Each worker pushes its numbers on change and every few seconds to the leader. Followers learn them from the leader. | L-e | Open |
+| E5 | **Capacity work grows with workers, not workers × servers.** Each worker pushes its numbers on change and every few seconds to the leader. Followers learn them from the leader. | L-e | Dropped in Phase 3 after the cell bench: with 500 workers, each server's whole idle cost (capacity polls, gossip) is about 6% of one core and 160 MB, so about a quarter of a core at 2,000. Not a limit at G3 |
 | E6 | **Pick from a sample, not the whole fleet.** Keep a list of fitting workers per runtime and zone, draw a few at random, and apply the power of two choices to them. | L-f | Done in Phase 3: the index keeps the owners, a decision samples 48 (`placement_sampled.go`) |
-| E7 | **Failover in batches**, many sandboxes per Raft write, and keep going past a single error. | L-h | Open |
+| E7 | **Failover in batches**, many sandboxes per Raft write, and keep going past a single error. | L-h | Dropped in Phase 3 after the cell bench: 1,000 sandboxes from one dead worker all moved within 50 s, none by 40 s, so the moves take under 10 s and noticing the death is the rest. More margin would come from detection (§9.6), not batching |
 | E8 | **"Restarting" is not "leaving"** (C8 in section 17). | L-i | Partly: rollouts only (`dead_owner.go:178`); C8 covers restarts outside a rollout |
+| E9 | **The leader reads the members it names.** Found by the cell bench: an owner lookup and the reservation check each copied every member's record to read one. | (as L-f) | Done in Phase 3 (#1217): a fifth of the leader's CPU and 85% of its allocations at 500 workers |
+| E10 | **Keep a burst's internal connections.** Found by the cell bench: the internal mTLS pool kept 16 idle per host, so a gateway under load re-did TLS handshakes. | none | Done in Phase 3 (#1217): 128 per host, 1,024 in all |
 
 L-g (full snapshots) stays for now. A cell's size is capped (section 9.5), so
 its snapshot is too. If Phase 0 shows restore is too slow at the cap, we
@@ -779,15 +781,15 @@ move the table to disk with incremental snapshots.
 
 ### 9.5 Targets for one cell after the fixes
 
-| Measure | Target |
-|---|---|
-| Creates per second, sustained | ≥ 1,000 |
-| Live sandboxes | ≥ 100,000 (about 72 MB of table per server) |
-| Workers | ≥ 500 |
-| Raft commit p99 under that load | ≤ 25 ms |
-| Owner lookups that reach a server | 0 on a cache hit |
-| Failover of 1,000 sandboxes from one dead worker | ≤ 60 s |
-| Server restart to caught up, at 100,000 sandboxes | ≤ 30 s |
+| Measure | Target | Measured in Phase 3 (cell bench, servers with 4 vCPUs) |
+|---|---|---|
+| Creates per second, sustained | ≥ 1,000 | 1,174 at 64 creates at once (p50 46 ms), 1,202 at 128 (p50 85 ms) |
+| Live sandboxes | ≥ 100,000 (about 72 MB of table per server) | not measured live: the bench deletes as it goes |
+| Workers | ≥ 500 | 500, joined in 20 to 40 s |
+| Raft commit p99 under that load | ≤ 25 ms | **missed**: 25 to 50 ms at 985 creates/s, 50 to 100 ms at 1,174, and 500 to 700 applies over 1 s per 2 minutes (F29) |
+| Owner lookups that reach a server | 0 on a cache hit | not measured: each sandbox is deleted before the cache has it |
+| Failover of 1,000 sandboxes from one dead worker | ≤ 60 s | all within 50 s |
+| Server restart to caught up, at 100,000 sandboxes | ≤ 30 s | not measured |
 
 These are **targets**. Phase 0 measures today's real numbers, and Phase 3
 publishes the final ones. If a cell cannot reach them, that does not block
@@ -2065,7 +2067,68 @@ the C18 fixes it is meant to measure.
   and 96 KB per decision, flat from 100 to 2,000 workers.
 - E5 (pushed capacity) and E7 (batched failover): their cost is in many real
   peers and real commits, which the stand-in bench measures; decided from
-  its numbers.
+  its numbers: **both dropped** (below).
+
+**The cell-ceiling bench** (2026-11-12, `integration-tests/k8s/cellbench.sh`,
+EC2 us-east-1a). Three real servers (m7i.xlarge: 4 vCPUs, 16 GB), 500 real
+`sandboxd` workers and 3 real gateways packed 50 to a machine on ten
+m7i.4xlarge machines, and a driver (m7i.2xlarge). Each stand-in worker has
+its own address, network namespace and data, runs only WASM, and its
+sandboxes are an empty module, so a worker costs about 110 MB; every join,
+gossip message, capacity poll, reservation, Raft write and failover is the
+real one. The driver creates through the gateways, as clients do, with
+`aerolvm-bench` (each sandbox deleted as soon as it exists), and takes CPU
+profiles of the servers and a gateway. About $20 in all, pilots included.
+
+| Run | Build | Creates per second (p50) at 32 / 64 / 128 / 512 at once | Failover of 1,000 |
+|---|---|---|---|
+| `bench-full-3` | `main` with E6 | 635 (51 ms) / - / 683 (181 ms) / 545 (818 ms) | all by 60 s, none by 30 s |
+| `bench-full-4` | same, profiled | - / - / 737 (171 ms) / - | none by 40 s, 161 by 50 s, all by 60 s |
+| `bench-full-5` | with F26's fix | 950 (33 ms) / - / 908 (102 ms) / 794 (632 ms) | none by 40 s, all by 50 s |
+| `bench-full-6` | with F26's and F27's | 985 (31 ms) / 1,174 (46 ms) / 1,202 (85 ms) / 691 (524 ms, 122 failed) | none by 40 s, all by 50 s |
+
+Before the fixes the Raft leader was out of CPU (about 2.9 of its 4 cores,
+load 5 to 6); the followers used about 1.5 cores. Idle, with 500 workers,
+each server used about 6% of one core and 160 MB (E5 above).
+
+- F26. The leader copied the fleet per request: an owner lookup
+  (`OwnerOf`, then `peerInternalURL`) scanned a copy of every member's
+  record to read one URL, and the reservation check copied every member
+  with its capacity lease to read each reservation's owner. At 500 workers
+  that was a fifth of the leader's CPU and 85% of the bytes it allocated,
+  and with them most of its GC. Both now read the members they name: 2.7
+  µs instead of 0.4 ms per check, 0.15 µs instead of 0.18 ms per lookup,
+  the same at 2,000 workers (#1217, E9).
+- F27. The internal mTLS pool kept 16 idle connections per host. A gateway
+  sends 40 to 170 requests at once to each server under this load, so the
+  rest were closed and the next burst re-did TLS handshakes: 8% of a
+  gateway's CPU and 6% of the leader's. It keeps 128 per host now (#1217,
+  E10).
+- F28 (open). Past the ceiling, creates time out instead of being turned
+  away: at 512 at once the cell did 691 creates a second, and 122 creates
+  failed after waiting on the leader ("reserve placement failed: ...
+  /internal/apply: context deadline exceeded"). Next: a bound on the
+  leader's applies in flight that answers at once with 503 and
+  Retry-After.
+- F29 (open). Raft apply p99 is over the 25 ms target: 25 to 50 ms at 985
+  creates a second, 50 to 100 ms above, with 500 to 700 applies over 1 s
+  in each 2-minute step (none at 985/s). The CPU profiles do not show
+  them, so they are pauses, not load; the snapshot (the recovery store
+  syncs its files then, §9.4 E4) is the first suspect. The bench now
+  records the snapshot metrics to settle it.
+- F30 (open). An owner lookup the cache misses reads the sandbox's
+  recovery file from disk (`fullPlacementLocked`, then
+  `resolveRecoveryRef`): 8% of the leader's CPU at 1,174 creates a
+  second. A lookup needs the owner, not the spec.
+- F31. The chart's server pods are limited to 2 CPUs, and the leader used
+  2 to 3 cores at 900 to 1,200 creates a second. The default suits a small
+  cell; `values.yaml` now says to give servers 4 CPUs for a cell at G3.
+- Harness: in one pilot (`bench-pilot-6`) a throughput step hung for two
+  hours with the cluster idle, and it did not happen again in five runs.
+  Each `aerolvm-bench` now runs under a time limit that makes it print
+  every goroutine's stack. Stand-ins share a machine's CPU, so per-create
+  latency on a worker is not a real worker's; the bench measures the
+  control plane.
 
 ## 19. Tests, drills and benchmarks
 
@@ -2109,7 +2172,8 @@ the C18 fixes it is meant to measure.
 
 ### Benchmarks
 
-- **Cell ceiling (Phase 0 S4, then Phase 3):** creates per second, live
+- **Cell ceiling (Phase 0 S4, then Phase 3; `integration-tests/k8s/cellbench.sh`,
+  results under "Phase 3 results"):** creates per second, live
   sandboxes, Raft apply p99, snapshot and restore time, gossip time to
   detect a dead worker. Published here, as G3's real number.
 - **Kubernetes load:** AerolVM's Kubernetes API calls per minute at 10, 100
