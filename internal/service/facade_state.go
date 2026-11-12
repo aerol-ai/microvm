@@ -21,9 +21,11 @@ func (s *Service) UpsertCompatState(ctx context.Context, sandboxID, facade, stat
 	}
 	// Carry facade state on the replicated spec so a failover recreate restores
 	// it — the sandbox_compat_state rows are node-local and would otherwise go
-	// with the dead owner (B11). Build a fresh map (never mutate the one the FSM
-	// deep-copy shares) merging this facade's entry over any others.
-	s.replicateSpecPatch(ctx, sandboxID, func(spec *models.CreateSandboxRequest) {
+	// with the dead owner (B11). Only a recreate reads it back, so a sandbox
+	// without failover=recreate skips the write. Build a fresh map (never
+	// mutate the one the FSM deep-copy shares) merging this facade's entry
+	// over any others.
+	s.replicateRecoverySpecPatch(ctx, sandboxID, nil, func(spec *models.CreateSandboxRequest) {
 		merged := make(map[string]string, len(spec.CompatState)+1)
 		for k, v := range spec.CompatState {
 			merged[k] = v
@@ -67,7 +69,8 @@ func (s *Service) ResolveSandboxIDByName(ctx context.Context, name string) (stri
 func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[string]string) error {
 	// Owner-scope the tag write: a user token may only retag its own sandbox;
 	// a cross-owner id reads as 404. Operator/internal callers pass through.
-	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
+	sb, err := s.scopedGet(ctx, sandboxID)
+	if err != nil {
 		return err
 	}
 	if err := s.store.UpdateTags(ctx, sandboxID, tags); err != nil {
@@ -75,12 +78,13 @@ func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[str
 	}
 	// Write the tags through to the replicated spec so a failover recreate
 	// restores the edited tags, not the create-time ones (B11). Tags are part
-	// of CreateSandboxRequest, so the recreate already applies spec.Tags.
+	// of CreateSandboxRequest, so the recreate already applies spec.Tags. Only
+	// a recreate reads them back, so other sandboxes skip the write.
 	replicated := make(map[string]string, len(tags))
 	for k, v := range tags {
 		replicated[k] = v
 	}
-	s.replicateSpecPatch(ctx, sandboxID, func(spec *models.CreateSandboxRequest) {
+	s.replicateRecoverySpecPatch(ctx, sandboxID, sb, func(spec *models.CreateSandboxRequest) {
 		spec.Tags = replicated
 	})
 	return nil

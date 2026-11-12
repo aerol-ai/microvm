@@ -60,6 +60,9 @@ var testPorts struct {
 	// twice (the lock alone covers that only when there is a lock dir).
 	claimed   map[int]bool
 	next, end int // the current block's next port and its end
+	// exhausted is set once no block is left (a long -count run, or
+	// several big runs at once): from then on the old pick serves.
+	exhausted bool
 	fallback  map[int]bool
 }
 
@@ -151,7 +154,7 @@ func reserveTestPort(t testing.TB, udp bool) int {
 	testPorts.mu.Lock()
 	defer testPorts.mu.Unlock()
 	low, high, ok := testPortRange()
-	if !ok {
+	if !ok || testPorts.exhausted {
 		return ephemeralTestPort(t, udp)
 	}
 	if testPorts.claimed == nil {
@@ -168,7 +171,13 @@ func reserveTestPort(t testing.TB, udp bool) int {
 		}
 		first, lock, ok := claimPortBlock(testPorts.lockDir, low, high, testPortStart((high-low)/testPortBlock), testPorts.claimed)
 		if !ok {
-			t.Fatalf("every block of loopback ports in [%d, %d) is used up or held by another test process", low, high)
+			// A process never gives a block back (its ports may be bound
+			// again by a restarted node), so a whole-package -count=11 or
+			// several big runs at once can use up all of them. The old pick
+			// is racy, but a rare flake beats a run that cannot go on.
+			testPorts.exhausted = true
+			t.Logf("every block of loopback ports in [%d, %d) is used up or held by another test process; picking ephemeral ports from here on", low, high)
+			return ephemeralTestPort(t, udp)
 		}
 		if lock != nil {
 			testPorts.held = append(testPorts.held, lock)
@@ -202,6 +211,12 @@ func ephemeralTestPort(t testing.TB, udp bool) int {
 	return 0
 }
 
+func blocksUsedUp() bool {
+	testPorts.mu.Lock()
+	defer testPorts.mu.Unlock()
+	return testPorts.exhausted
+}
+
 func loopbackPortFree(port int, udp bool) bool {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	l, err := net.Listen("tcp", addr)
@@ -233,6 +248,9 @@ func TestReserveTestPortStaysBelowTheEphemeralRangeAndNeverRepeats(t *testing.T)
 	for range 3 * testPortBlock {
 		port := reserveTestPort(t, true)
 		if port < low || port >= high {
+			if blocksUsedUp() {
+				t.Skip("this process used up every block (a long -count run); the fallback has its own test")
+			}
 			t.Fatalf("port %d outside [%d, %d)", port, low, high)
 		}
 		if seen[port] {
@@ -265,6 +283,46 @@ func TestReserveTestPortSkipsAPortSomethingHolds(t *testing.T) {
 		if port := reserveTestPort(t, false); held[port] {
 			t.Fatalf("port %d is held by a listener but was handed out", port)
 		}
+	}
+}
+
+func TestReserveTestPortFallsBackWhenNoBlockIsLeft(t *testing.T) {
+	low, high, ok := testPortRange()
+	if !ok {
+		t.Skip("no room below the ephemeral range")
+	}
+	// Use up every block as far as this process can tell, then put the
+	// real state back for the other tests.
+	testPorts.mu.Lock()
+	saved := struct {
+		claimed   map[int]bool
+		next, end int
+		exhausted bool
+	}{testPorts.claimed, testPorts.next, testPorts.end, testPorts.exhausted}
+	all := map[int]bool{}
+	for first := low; first+testPortBlock <= high; first += testPortBlock {
+		all[first] = true
+	}
+	testPorts.claimed, testPorts.next, testPorts.end = all, 0, 0
+	testPorts.mu.Unlock()
+	t.Cleanup(func() {
+		testPorts.mu.Lock()
+		testPorts.claimed, testPorts.next, testPorts.end, testPorts.exhausted = saved.claimed, saved.next, saved.end, saved.exhausted
+		testPorts.mu.Unlock()
+	})
+	seen := map[int]bool{}
+	for range 5 {
+		port := reserveTestPort(t, true)
+		if port >= low && port < high {
+			t.Fatalf("port %d came from a block although none was left", port)
+		}
+		if seen[port] || !loopbackPortFree(port, true) {
+			t.Fatalf("fallback port %d repeated or in use", port)
+		}
+		seen[port] = true
+	}
+	if !testPorts.exhausted {
+		t.Fatal("the picker did not record that the blocks ran out")
 	}
 }
 
@@ -337,8 +395,8 @@ func TestReserveTestPortTwoProcessesNeverShareAPort(t *testing.T) {
 		fmt.Println("PORTS " + strings.Join(out, ","))
 		return
 	}
-	if _, _, ok := testPortRange(); !ok || testPorts.lockDir == "" {
-		t.Skip("no room below the ephemeral range, or no lock directory")
+	if _, _, ok := testPortRange(); !ok || testPorts.lockDir == "" || blocksUsedUp() {
+		t.Skip("no room below the ephemeral range, no lock directory, or every block used up")
 	}
 	mine := map[int]bool{}
 	var last int
