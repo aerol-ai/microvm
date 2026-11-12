@@ -220,6 +220,18 @@ sandboxes() {
   python3 "$HERE/cell/load.py" --url http://127.0.0.1:21212 --token-file "$sd/token" --list-run "$1"
 }
 
+# node_setup loads br_netfilter on every worker machine, now and later,
+# through a DaemonSet (cell/node-setup.yaml) that stands in for a machine
+# image that loads it. A one-time load missed the machines a rotation adds,
+# and their workers then stayed Failed in preflight (rotation drill, run
+# p3-drills-2).
+node_setup() {
+  sed "s|@@IMAGE@@|$DEBUG_IMAGE|" "$HERE/cell/node-setup.yaml" | kubectl apply -f - >/dev/null
+  kubectl -n kube-system rollout status ds/aerolvm-cell-node-setup --timeout=5m >/dev/null ||
+    say "preflight: the node setup is not on every worker machine yet"
+  say "br_netfilter loaded on every worker machine, and on any added later (F2 stand-in)"
+}
+
 preflight() {
   local t0 failed reason i
   t0=$(date +%s)
@@ -245,7 +257,7 @@ preflight() {
     return 1
   fi
   say "preflight: $failed worker(s) Failed after $(( $(date +%s) - t0 ))s: $reason"
-  load_br_netfilter aerolvm.io/pool=phase0
+  node_setup
   wait_phase Ready 600
   wait_workers 3 900
   say "preflight: workers joined $(( $(date +%s) - t0 ))s after the first failure"

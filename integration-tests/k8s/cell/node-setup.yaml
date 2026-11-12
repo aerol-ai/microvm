@@ -1,0 +1,35 @@
+# The cell's stand-in for a worker machine image that loads br_netfilter
+# (F2; P10 checks for it). cell.sh preflight applies it once every worker
+# has failed its preflight on the missing module, so the check is still
+# proved. A DaemonSet, not a one-time load: machines a rotation adds later
+# (the rotation drill) get it too, as they would from their image.
+# No requests, so it never keeps a worker pod off its machine.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aerolvm-cell-node-setup
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: { app: aerolvm-cell-node-setup }
+  template:
+    metadata:
+      labels: { app: aerolvm-cell-node-setup }
+    spec:
+      nodeSelector: { aerolvm.io/pool: phase0 }
+      tolerations: [{ operator: Exists }]
+      containers:
+        - name: setup
+          image: @@IMAGE@@
+          securityContext: { privileged: true }
+          command: [sh, -c]
+          args:
+            - |
+              chroot /host modprobe br_netfilter || echo "modprobe br_netfilter failed"
+              if [ "$(cat /proc/sys/user/max_user_namespaces)" = 0 ]; then echo 62775 > /proc/sys/user/max_user_namespaces; fi
+              echo "br_netfilter: $(grep -c ^br_netfilter /proc/modules) loaded; user.max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces)"
+              exec sleep infinity
+          volumeMounts: [{ name: host, mountPath: /host }]
+      volumes:
+        - name: host
+          hostPath: { path: / }
