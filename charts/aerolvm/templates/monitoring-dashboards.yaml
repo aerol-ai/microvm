@@ -1,0 +1,18 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.grafanaDashboards }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+# A Grafana dashboard (P9). The Grafana sidecar loads every ConfigMap with
+# the grafana_dashboard label from the namespaces it watches.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-%s" (include "aerolvm.name" $) (base $path | trimSuffix ".json") | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $.Values.monitoring.dashboardsNamespace | default $.Release.Namespace }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- end }}

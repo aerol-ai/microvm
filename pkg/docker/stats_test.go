@@ -38,6 +38,11 @@ func TestContainerStatsParsesWorkingSet(t *testing.T) {
 	if !strings.Contains(gotQuery, "stream=false") {
 		t.Fatalf("query = %q, want stream=false (one-shot)", gotQuery)
 	}
+	// Without one-shot=true, Docker waits about a second per call for a
+	// second reading this never uses.
+	if !strings.Contains(gotQuery, "one-shot=true") {
+		t.Fatalf("query = %q, want one-shot=true", gotQuery)
+	}
 	if stat.CPUTotalNanos != 12345678901 {
 		t.Fatalf("CPUTotalNanos = %d, want 12345678901", stat.CPUTotalNanos)
 	}

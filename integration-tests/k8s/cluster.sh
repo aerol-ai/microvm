@@ -5,6 +5,9 @@
 #   cluster.sh up   <name> [--ttl 3h] [--ami AL2023_x86_64_STANDARD|BOTTLEROCKET_x86_64]
 #                          [--type m7i.xlarge] [--workers 1] [--version 1.36]
 #                          [--release 1.36.5-20261031] [--karpenter]
+#                          [--zones 2] [--system 1] [--system-type t3.medium]
+#                          [--imds-hop-limit 1] [--ebs-csi] [--ecr aerolvm,aerolvm-runtime]
+#                          [--network-policy]
 #   cluster.sh down <name>
 #   cluster.sh kubeconfig <name>      # prints the kubeconfig path
 #   cluster.sh allow-ip <name>        # let this machine's current address in
@@ -50,6 +53,8 @@ cmd_up() {
   local name="${1:-}"; [[ -n "$name" ]] || usage; shift
   local ttl="3h" ami="AL2023_x86_64_STANDARD" type="m7i.xlarge" workers=1 version="1.36"
   local release="" karpenter=false
+  # The Phase 2 cell (cell.sh); the defaults are the spikes' shape.
+  local zones=2 system=1 system_type="t3.medium" hop=0 ebs=false ecr="" netpol=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       # The worker node group's AMI release; S5 starts one behind to upgrade.
@@ -61,6 +66,13 @@ cmd_up() {
       --type) type="$2"; shift 2 ;;
       --workers) workers="$2"; shift 2 ;;
       --version) version="$2"; shift 2 ;;
+      --zones) zones="$2"; shift 2 ;;
+      --system) system="$2"; shift 2 ;;
+      --system-type) system_type="$2"; shift 2 ;;
+      --imds-hop-limit) hop="$2"; shift 2 ;;
+      --ebs-csi) ebs=true; shift ;;
+      --ecr) ecr="$2"; shift 2 ;;
+      --network-policy) netpol=true; shift ;;
       *) die "unknown flag $1" ;;
     esac
   done
@@ -74,9 +86,14 @@ cmd_up() {
   jq -n --arg name "$name" --arg ttl "$(ttl_from_now "$ttl")" --arg ami "$ami" \
     --arg type "$type" --argjson workers "$workers" --arg version "$version" --arg cidr "${ip}/32" \
     --arg release "$release" --argjson karpenter "$karpenter" \
+    --argjson zones "$zones" --argjson system "$system" --arg system_type "$system_type" \
+    --argjson hop "$hop" --argjson ebs "$ebs" --arg ecr "$ecr" --argjson netpol "$netpol" \
     '{name: $name, ttl: $ttl, worker_ami_type: $ami, worker_instance_type: $type,
       worker_count: $workers, kubernetes_version: $version, api_allowed_cidrs: [$cidr],
-      worker_release_version: $release, karpenter: $karpenter}' \
+      worker_release_version: $release, karpenter: $karpenter,
+      zone_count: $zones, system_count: $system, system_instance_type: $system_type,
+      worker_imds_hop_limit: $hop, ebs_csi: $ebs, network_policy: $netpol,
+      ecr_repos: ($ecr | split(",") | map(select(length > 0)))}' \
     > "$sd/run.tfvars.json"
   tf "$name" init -input=false -backend=false >/dev/null
   tf "$name" apply -input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json"

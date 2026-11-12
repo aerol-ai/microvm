@@ -507,7 +507,7 @@ Prints node/<name> uncordoned. Safe to repeat. Needs an admin.
 
 const drainHelp = `Cordon a node, then wait until it runs no sandboxes.
 
-Usage: aerolvm drain <name> [--timeout 10m] [--delete-sandboxes] [--migrate]
+Usage: aerolvm drain <name> [--timeout 10m] [--delete-sandboxes] [--migrate] [--evacuate]
 
 Without flags, drain waits for the node's own users to stop or destroy
 their sandboxes. It reads the node's counts each poll (GET
@@ -520,11 +520,15 @@ Flags:
                        stopped, and wait until it owns none
   --migrate            first move the node's WASM sandboxes to another ready
                        worker with live migration
-  --json               print {"node_id","cordoned","drained","migrated","deleted"}
+  --evacuate           move the node's failover.policy=recreate sandboxes to
+                       other workers (stop here, start there, same ID and
+                       link); the owners of the rest are told it is going
+  --json               print {"node_id","cordoned","drained","migrated","evacuated","deleted"}
 
 Examples:
   aerolvm drain wrk-2 --timeout 30m
   aerolvm drain wrk-2 --migrate --delete-sandboxes
+  aerolvm drain wrk-2 --evacuate --timeout 30m
 `
 
 const deleteHelp = `Delete sandboxes, snapshots, tokens, join tokens or nodes, like kubectl delete.

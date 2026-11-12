@@ -210,6 +210,13 @@ type Snapshot struct {
 	// creates, because landing one there means a 501 or a 503 instead of a
 	// filtered sandbox (plans/egress-domain-filtering.md CEO D20).
 	EgressGatewayReady bool `json:"egress_gateway_ready,omitempty"`
+	// OwnershipLeaseFile is true when this node writes its ownership lease
+	// for the runtime supervisor (SB_OWNERSHIP_LEASE_FILE), so its
+	// recreate-policy sandboxes freeze at the lease limit even with
+	// sandboxd down. Only such a node may be failed over early on the
+	// operator's "machine is gone" (C19); an older build omits it and
+	// waits the full grace.
+	OwnershipLeaseFile bool `json:"ownership_lease_file,omitempty"`
 	// MediatedEgress is true on builds whose WASM and isolate mediators
 	// enforce egress policies (block-all, lists, profiles, learn mode). An
 	// older build stored a WASM create's lists and ignored them, so, as for

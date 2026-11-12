@@ -145,13 +145,22 @@ func (a *app) clusterCall(ctx context.Context, c *commonFlags, method, path stri
 	}
 }
 
-// nodeMarkPost is a POST that only sets or clears a node's mark, so running
-// it twice leaves the same state as running it once.
+// nodeMarkPost is a POST that running twice leaves as running it once: it
+// sets or clears a node's mark, or runs an evacuate pass (C9), which is
+// safe to repeat: each move is a compare-and-swap on the old owner, a moved
+// sandbox is no longer the node's, and stops and notices are idempotent. A
+// leader change answers 503 with Retry-After, and `aerolvm drain
+// --evacuate` retries it instead of failing the whole drain.
 func nodeMarkPost(method, path string) bool {
 	if method != http.MethodPost || !strings.HasPrefix(path, "/v1/cluster/nodes/") {
 		return false
 	}
-	return strings.HasSuffix(path, "/cordon") || strings.HasSuffix(path, "/uncordon") || strings.HasSuffix(path, "/drain")
+	for _, suffix := range []string{"/cordon", "/uncordon", "/drain", "/evacuate"} {
+		if strings.HasSuffix(path, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // clusterReadRetryDelays bounds a read's retries: three more tries over about
@@ -447,10 +456,11 @@ func (a *app) cordon(ctx context.Context, c *commonFlags, name string, on bool) 
 
 func runDrain(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet("drain")
-	var deleteSandboxes, migrate bool
+	var deleteSandboxes, migrate, evacuate bool
 	timeout := 10 * time.Minute
 	fs.BoolVar(&deleteSandboxes, "delete-sandboxes", false, "")
 	fs.BoolVar(&migrate, "migrate", false, "")
+	fs.BoolVar(&evacuate, "evacuate", false, "")
 	fs.DurationVar(&timeout, "timeout", timeout, "")
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
@@ -480,7 +490,8 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 		}
 		result["migrated"] = moved
 	}
-	var deleted []string
+	var deleted, evacuated []string
+	movable := evacuate
 	waitCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -492,6 +503,26 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 		every = 2 * time.Second
 	}
 	for {
+		if movable {
+			// One decommission pass (C9): the leader moves up to a batch of
+			// the node's failover.policy=recreate sandboxes to other
+			// workers, stop then start, and tells the owners of the rest.
+			var res evacuateResult
+			if err := a.clusterCall(waitCtx, c, http.MethodPost, "/v1/cluster/nodes/"+url.PathEscape(name)+"/evacuate", nil, &res); err != nil {
+				if waitCtx.Err() != nil {
+					return a.fail(c, drainTimeout(name, timeout, -1), exitError)
+				}
+				return a.fail(c, err, exitError)
+			}
+			for _, id := range res.Moved {
+				evacuated = append(evacuated, id)
+				a.progress(c, "aerolvm: moved sandbox %s off %s", id, name)
+			}
+			for id, why := range res.Failed {
+				a.progress(c, "aerolvm: moving sandbox %s failed (retrying): %s", id, why)
+			}
+			movable = res.RemainingMovable > 0
+		}
 		n, err := a.getNode(waitCtx, c, name, idsIf(deleteSandboxes))
 		if err != nil {
 			if waitCtx.Err() != nil {
@@ -524,6 +555,9 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 		}
 	}
 	result["drained"] = true
+	if evacuate {
+		result["evacuated"] = append([]string{}, evacuated...)
+	}
 	if deleteSandboxes {
 		result["deleted"] = append([]string{}, deleted...)
 	}
@@ -533,6 +567,13 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 	}
 	fmt.Fprintf(a.stdout, "node/%s drained\n", name)
 	return exitOK
+}
+
+// evacuateResult is the part of an evacuate pass drain reads.
+type evacuateResult struct {
+	Moved            []string          `json:"moved"`
+	Failed           map[string]string `json:"failed"`
+	RemainingMovable int               `json:"remaining_movable"`
 }
 
 // progress is a note that --json leaves out, so stderr then carries only

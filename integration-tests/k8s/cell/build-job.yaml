@@ -1,0 +1,101 @@
+# The cell's images, built inside the cluster (cell.sh build). The source
+# arrives as a tarball from S3 (about 12 MB), so no binary or image ever
+# crosses the laptop's uplink: Go compiles here, BuildKit builds the images
+# from packaging/images/*.Dockerfile as the release does, and pushes them to
+# the run's ECR repositories. Placeholders in @@...@@ are filled by cell.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aerolvm-build
+  labels:
+    # BuildKit runs privileged; this namespace is the build's only.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: images-@@SHORT@@
+  namespace: aerolvm-build
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      # The system nodes: worker machines stay empty for worker pods.
+      tolerations: []
+      volumes:
+        - { name: work, emptyDir: {} }
+        - { name: gocache, emptyDir: {} }
+        - name: ecr
+          secret:
+            secretName: ecr-push
+            items: [{ key: .dockerconfigjson, path: config.json }]
+      initContainers:
+        - name: source
+          image: public.ecr.aws/docker/library/alpine:3.20
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /work/src
+              wget -q -O /work/src.tgz "$SOURCE_URL"
+              tar -xzf /work/src.tgz -C /work/src
+              echo "source: $(du -sh /work/src | cut -f1)"
+          env:
+            - { name: SOURCE_URL, value: "@@SOURCE_URL@@" }
+          volumeMounts: [{ name: work, mountPath: /work }]
+        - name: compile
+          image: public.ecr.aws/docker/library/golang:1.26
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              cd /work/src
+              out=/work/ctx/amd64
+              mkdir -p "$out"
+              export GOFLAGS=-buildvcs=false GOCACHE=/gocache
+              CGO_ENABLED=0 go build -trimpath -o "$out/toolboxd" ./cmd/toolboxd
+              CGO_ENABLED=0 go build -trimpath -o "$out/aerolvm-supervisor" ./cmd/aerolvm-supervisor
+              (cd operator && CGO_ENABLED=0 go build -trimpath -o "$out/aerolvm-operator" ./cmd/aerolvm-operator)
+              CGO_ENABLED=1 go build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=@@TAG@@" \
+                -o "$out/sandboxd" ./cmd/sandboxd
+              ls -la "$out"
+          resources:
+            requests: { cpu: "1", memory: 3Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: gocache, mountPath: /gocache }
+      containers:
+        - name: images
+          image: docker.io/moby/buildkit:v0.22.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cd /work/src
+              args="--opt build-arg:VERSION=@@TAG@@ --opt build-arg:REVISION=@@SHA@@"
+              while IFS='=' read -r k v; do
+                case "$k" in ''|\#*) continue ;; esac
+                args="$args --opt build-arg:$k=$v"
+              done < packaging/images/versions.env
+              for image in aerolvm aerolvm-runtime aerolvm-operator; do
+                file="${image#aerolvm-}.Dockerfile"
+                [ "$image" = aerolvm ] && file=aerolvm.Dockerfile
+                echo "images: @@REGISTRY@@/$image:@@TAG@@"
+                # shellcheck disable=SC2086
+                buildctl-daemonless.sh build --frontend dockerfile.v0 \
+                  --local context=/work/ctx --local dockerfile=packaging/images \
+                  --opt filename="$file" --opt platform=linux/amd64 $args \
+                  --output "type=image,name=@@REGISTRY@@/$image:@@TAG@@,push=true"
+              done
+              echo "images: done"
+          env:
+            - { name: DOCKER_CONFIG, value: /ecr }
+          securityContext:
+            privileged: true
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: ecr, mountPath: /ecr, readOnly: true }

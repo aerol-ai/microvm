@@ -1,0 +1,96 @@
+{{- if .Values.monitoring.enabled }}
+{{- $name := include "aerolvm.name" . }}
+{{- /* What Prometheus reads (P9). Single mode has one kind of pod, the
+worker. Cluster mode has four, with the workers in their own namespace. */}}
+{{- $api := dict "port" "api" "number" 21212 "path" "/v1/metrics" "token" true }}
+{{- $components := list (merge (dict "component" "worker" "namespace" .Release.Namespace) $api) }}
+{{- if ne .Values.mode "single" }}
+{{- $cluster := .Values.cluster | default dict }}
+{{- $components = list
+  (merge (dict "component" "server" "namespace" .Release.Namespace) $api)
+  (merge (dict "component" "gateway" "namespace" .Release.Namespace) $api)
+  (merge (dict "component" "worker" "namespace" ($cluster.workerNamespace | default "aerolvm-workers")) $api)
+  (dict "component" "operator" "namespace" .Release.Namespace "port" "metrics" "number" 8080 "path" "/metrics" "token" false) }}
+{{- end }}
+{{- range $components }}
+---
+# The {{ .component }} pods, for Prometheus only. Headless: no address of its
+# own, one endpoint per pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-%s-metrics" $name .component | trunc 63 | trimSuffix "-" }}
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+    aerolvm.io/metrics: {{ .component }}
+spec:
+  clusterIP: None
+  # A pod that is not ready is still read: a cut-off worker's numbers are
+  # the ones you need then, and AerolVMPodNotReady finds AerolVM's pods by
+  # these scrape targets.
+  publishNotReadyAddresses: true
+  # The release's pods only, in both modes (the operator stamps the release
+  # label on every pod it makes): two installs sharing a namespace must not
+  # read each other's pods, or the per-team sums double.
+  selector:
+    app.kubernetes.io/name: aerolvm
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ .component }}
+  ports:
+    - { name: {{ .port }}, port: {{ .number }}, targetPort: {{ .port }} }
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ printf "%s-%s" $name .component | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+    {{- with $.Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      aerolvm.io/metrics: {{ .component }}
+  endpoints:
+    - port: {{ .port }}
+      path: {{ .path }}
+      interval: {{ $.Values.monitoring.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.scrapeTimeout }}
+      {{- if .token }}
+      # The Secret must be in this namespace, the ServiceMonitor's.
+      authorization:
+        type: Bearer
+        credentials:
+          {{- if $.Values.monitoring.scrapeToken.existingSecret }}
+          name: {{ $.Values.monitoring.scrapeToken.existingSecret }}
+          key: {{ $.Values.monitoring.scrapeToken.key }}
+          {{- else }}
+          name: {{ include "aerolvm.tokenSecret" $ }}
+          key: SB_PAT_TOKEN
+          {{- end }}
+      {{- end }}
+      # The labels the rules and dashboards group by
+      # (charts/aerolvm/monitoring/rules.yaml): the same in both modes.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: aerolvm_component
+        # The cluster's name, or the release in single mode, which has no
+        # aerolvm.io/cluster label.
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+          targetLabel: aerolvm_cluster
+        - sourceLabels: [__meta_kubernetes_pod_label_aerolvm_io_cluster]
+          regex: (.+)
+          targetLabel: aerolvm_cluster
+        # Headroom is per zone when pods carry their zone.
+        - sourceLabels: [__meta_kubernetes_pod_label_topology_kubernetes_io_zone]
+          targetLabel: aerolvm_zone
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+{{- end }}
+{{- end }}

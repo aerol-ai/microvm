@@ -541,7 +541,11 @@ const (
 // on-demand, which is why the design never hit it.
 //
 // Stopping the daemon is also the fault these cases actually model: SWIM
-// marks the owner dead and placement reassigns. The box keeps answering
+// marks the owner dead and placement reassigns. Since C8 a stop announces a
+// restart, so the leader waits SB_CLUSTER_RESTART_WINDOW (120 s) instead of
+// the 30 s grace before it reassigns; the failover deadlines here are
+// minutes. A case that times the failover against the grace crashes the
+// daemon instead (CrashStopSandboxdScript, as chaosHardKill does). The box keeps answering
 // SSH, which is what makes the restore reliable — and a restore that works
 // is worth more here than fidelity to a power cut, because a node this
 // suite cannot bring back poisons every case after it.

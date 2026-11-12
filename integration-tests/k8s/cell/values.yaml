@@ -1,0 +1,41 @@
+# The cell's chart values (cell.sh install): cluster mode over three zones,
+# the bank preset's settings minus what a throwaway cluster cannot have (a
+# public domain for the edge, a Prometheus). Placeholders in @@...@@ are
+# filled by cell.sh.
+mode: cluster
+image:
+  registry: "@@REGISTRY@@"
+  tag: "@@TAG@@"
+  pullPolicy: IfNotPresent
+worker:
+  defaultRuntime: gvisor
+  blockPrivateByDefault: true
+networkPolicy:
+  enabled: true
+cluster:
+  name: aerolvm
+  version: "@@TAG@@"
+  cell: 1
+  zones: [@@ZONES@@]
+  servers:
+    count: 3
+    storage: { size: 10Gi, storageClassName: gp3 }
+  gateways:
+    minReplicas: 3
+    service: { type: ClusterIP }
+  workerPools:
+    - name: general
+      runtimes: [gvisor]
+      nodeSelector: { aerolvm.io/pool: phase0 }
+      tolerations: [{ key: aerolvm.io/worker, operator: Exists, effect: NoSchedule }]
+      # m7i.xlarge.
+      machine: { cpu: 4, memoryGiB: 16 }
+      minWorkers: 3
+      maxWorkers: 3
+      headroomPercent: 15
+      provisioner: eks-managed
+      decommission: { drainWindow: 1m, deadline: 10m }
+  createPolicy:
+    version: 1
+    runtimes: [gvisor]
+    limits: { max_cpu: 2, max_memory_mb: 4096 }

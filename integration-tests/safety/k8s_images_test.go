@@ -73,7 +73,7 @@ func TestKubernetesImagePins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, image := range []string{"aerolvm", "aerolvm-runtime", "aerolvm-edge"} {
+	for _, image := range []string{"aerolvm", "aerolvm-runtime", "aerolvm-edge", "aerolvm-operator"} {
 		if !strings.Contains(string(script), image) {
 			t.Errorf("build-images.sh does not build %s", image)
 		}

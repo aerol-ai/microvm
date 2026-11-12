@@ -362,6 +362,20 @@ func (f *placementFSM) ownedCount(nodeID string) int {
 	return 0
 }
 
+// ownerNodeIDs is every node that owns at least one placement: one entry
+// per worker, so the dead-owner tick reads it every pass.
+func (f *placementFSM) ownerNodeIDs() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make([]string, 0, len(f.ownerIndex))
+	for id, ids := range f.ownerIndex {
+		if ids != nil && ids.Len() > 0 {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // deniedNodeSet is the published deny set for one placement sweep. It is
 // shared, copy-on-write: callers read it and never write to it.
 func (f *placementFSM) deniedNodeSet() map[string]bool {

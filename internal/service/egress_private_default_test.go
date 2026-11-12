@@ -46,12 +46,12 @@ func TestPrivateDefaultResolverAllow(t *testing.T) {
 	} {
 		addrs = append(addrs, netip.MustParseAddr(s))
 	}
-	got := privateDefaultResolverAllow(addrs)
+	got := privateDefaultResolverAllow(addrs, privateDefaultDeny)
 	want := []string{"10.0.0.2/32", "169.254.169.253/32", "172.31.0.2/32", "192.168.1.1/32"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("allow = %v, want %v", got, want)
 	}
-	if privateDefaultResolverAllow(nil) != nil {
+	if privateDefaultResolverAllow(nil, privateDefaultDeny) != nil {
 		t.Fatal("no resolvers, no allow entries")
 	}
 }

@@ -278,6 +278,16 @@ The rules for labels:
 
 The cluster members list (`GET /v1/cluster/members`) shows each node's `zone` and `labels`, so you can see what a rule can target.
 
+### What zones do on their own
+
+Once nodes have zones, the cluster uses them even when a create asks for nothing:
+
+- **New sandboxes spread across zones by free room.** The leader picks two zones at random and takes the one with more free room on average. Then it picks a node in that zone as usual. So each zone keeps about the same headroom, and a zone loss leaves the others able to take its sandboxes.
+- **Failover never goes back into the zone that just lost a node,** unless no other zone has room. A zone outage takes its nodes one by one, so a sandbox moved to a neighbor in the same zone would likely move again.
+- **Sealed-secret backups go to other zones.** A `failover.policy="recreate"` sandbox keeps backup copies of its sealed secrets on other nodes. Those copies go to zones other than the owner's first, one per zone. So one zone loss cannot take the owner and every copy together.
+
+A cluster with no zones, or with every node in one zone, places exactly as before. On Kubernetes the operator sets `SB_NODE_ZONE` from the machine's `topology.kubernetes.io/zone` label.
+
 ### Ask for a node in the create
 
 Add `placement` to the create. Set `zone`, `labels`, or both:
@@ -689,6 +699,8 @@ These are the current limits of cluster mode. This page would be dishonest if it
 - **Capacity is pulled, not streamed.** A network blip between fetches does not lose membership, but it can mark capacity stale. A report expires after 3 intervals or 15 seconds, whichever is longer (the default interval is 5 seconds). A host that recovers quickly may take a tick or two to rejoin the placement set.
 - **Reservations expire on a timer.** A router that crashes between `opReserve` and starting the sandbox leaves a stray reservation. The cleanup loop runs every 5 seconds and the reservation TTL is 120 seconds. So at worst, the chosen owner's headroom looks too low for about 125 seconds.
 - **The dead-owner grace period is 30 seconds.** `ClusterDeadOwnerGrace` defaults to 30 seconds, and you can change it with `SB_DEAD_OWNER_GRACE`. Recreate-policy failover does not start until the dead-owner tracker has seen the node dead for that long without a break.
+- **A machine the operator says is gone can fail over sooner.** On Kubernetes the AerolVM operator calls `POST /v1/cluster/nodes/{id}/gone` when a machine leaves. The leader then may start that node's failover at its ownership lease limit, `lease + lease/15` after the last ownership read it answered for the node (16 seconds by default), instead of after the grace. Never sooner: a deleted machine object does not prove the machine stopped, and the lease is what stops the old copy. Only a node whose runtime freezes its sandboxes with sandboxd down (`SB_OWNERSHIP_LEASE_FILE`, the Kubernetes worker pod) gets this, and only while it renews its lease by reads: a worker asks the leader every 5 seconds while a recreate-policy sandbox runs on it, and renews on its own while none does, which the leader cannot see. Any other node, such as a plain VM or an idle worker, waits the grace. A node gossip sees again is not gone.
+- **A node that announced a restart gets the restart window instead.** On SIGTERM, sandboxd sets `rs` in its gossip metadata before it leaves (`gossipNode.announceRestart`). Every server records the deadline from its own leave callback, and the dead-owner loop skips the node until `SB_CLUSTER_RESTART_WINDOW` (120 seconds by default) has passed. Placement and the failover scan skip a node with `rs` set. A deleted node never waits. A leading server first hands Raft leadership to another voter (`Cluster.PrepareShutdown`), so the cluster does not wait out an election.
 - **`failover.policy = "recreate"` is best effort.** The new owner rebuilds from the spec. Anything kept only in the container's writable layer is gone; see [Durability and failover](/durability/) for the full table.
 - **Raft needs a majority.** Two server-role nodes cannot survive losing one; three can, so run an odd number of server-role nodes. Above 10 live nodes, `LargeClusterTopologyError` (in `topology.go`) also requires dedicated server, worker and ingress roles, and it caps the server tier at 7 nodes.
 

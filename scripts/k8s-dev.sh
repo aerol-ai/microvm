@@ -7,6 +7,10 @@
 #                                  # links on aerolvm.test, the certificate from
 #                                  # cert-manager with a self-signed issuer
 #   make k8s-dev-down              # delete the kind cluster
+#   AEROL_K8S_MODE=cluster make k8s-dev
+#                                  # cluster mode (P2): the operator, three
+#                                  # servers, gateways and a worker pool on a
+#                                  # kind cluster of three nodes, one per zone
 #
 # Needs Docker, kind, kubectl and Helm 3.8 or later (HELM names another).
 # sandboxd links glibc, so it is compiled in a golang container; toolboxd, the
@@ -15,9 +19,20 @@
 # build runs: the StatefulSet replaces its pod only when the pod is deleted.
 set -euo pipefail
 
-cluster="${AEROL_KIND_CLUSTER:-aerolvm}"
-namespace="${AEROL_NAMESPACE:-aerolvm}"
+mode="${AEROL_K8S_MODE:-single}"
+case "$mode" in
+  single) cluster="${AEROL_KIND_CLUSTER:-aerolvm}" namespace="${AEROL_NAMESPACE:-aerolvm}" ;;
+  cluster) cluster="${AEROL_KIND_CLUSTER:-aerolvm-cluster}" namespace="${AEROL_NAMESPACE:-aerolvm-system}" ;;
+  *) echo "k8s-dev: AEROL_K8S_MODE is single or cluster, got $mode" >&2; exit 2 ;;
+esac
 edge="${AEROL_K8S_EDGE:-0}"
+# The images' tag, and in cluster mode the version sandboxd reports: an
+# AerolCluster's version is a release tag, and the operator upgrades any
+# node that reports another (AEROL_K8S_VERSION=v0.0.0-dev.2 builds a
+# second version to upgrade to).
+tag="dev"
+[[ "$mode" == cluster ]] && tag="${AEROL_K8S_VERSION:-v0.0.0-dev.1}"
+ldflags="-X github.com/aerol-ai/microvm/internal/version.Version=$tag"
 helm="${HELM:-helm}"
 # cert-manager for the edge's certificate, pinned by checksum like Helm and
 # kind in CI.
@@ -37,6 +52,10 @@ mkdir -p "$dist"
 echo "k8s-dev: building linux/$arch binaries" >&2
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
+if [[ "$mode" == cluster ]]; then
+  # The operator is its own Go module (operator/).
+  (cd operator && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-operator_linux_$arch" ./cmd/aerolvm-operator)
+fi
 # As this user, not root: the module cache is this machine's, and folders
 # root makes in it stop a later `go install` here (CI's xcaddy step).
 # -buildvcs=false: the container's git refuses a checkout another user owns
@@ -44,7 +63,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-sup
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e GOPATH=/tmp/go -e GOMODCACHE=/go/pkg/mod \
   -e GOCACHE=/tmp/go-build -e GOTOOLCHAIN=auto -e CGO_ENABLED=1 \
   -v "$root":/src -v "$(go env GOMODCACHE)":/go/pkg/mod -v "$dist":/out -w /src \
-  golang:1.26 go build -buildvcs=false -trimpath -o "/out/sandboxd_linux_$arch" ./cmd/sandboxd
+  golang:1.26 go build -buildvcs=false -trimpath -ldflags "$ldflags" -o "/out/sandboxd_linux_$arch" ./cmd/sandboxd
 
 images="aerolvm,aerolvm-runtime"
 if [[ "$edge" == 1 ]]; then
@@ -60,15 +79,36 @@ if [[ "$edge" == 1 ]]; then
     --with "$(pin CADDY_STORAGE_S3_MODULE)"
   images="$images,aerolvm-edge"
 fi
-scripts/build-images.sh --dist "$dist" --version dev --platforms "linux/$arch" --images "$images"
+[[ "$mode" == cluster ]] && images="$images,aerolvm-operator"
+scripts/build-images.sh --dist "$dist" --version "$tag" --platforms "linux/$arch" --images "$images"
 
 if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
-  kind create cluster --name "$cluster"
+  if [[ "$mode" == cluster ]]; then
+    # Three nodes, one per zone, so the operator spreads servers, gateways
+    # and workers as it would across a cloud region's zones.
+    cat >"$dist/kind-cluster.yaml" <<'KIND'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    labels: { topology.kubernetes.io/zone: z-a }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: z-b }
+  - role: worker
+    labels: { topology.kubernetes.io/zone: z-c }
+KIND
+    kind create cluster --name "$cluster" --config "$dist/kind-cluster.yaml"
+  else
+    kind create cluster --name "$cluster"
+  fi
 fi
-kind load docker-image --name "$cluster" $(printf 'ghcr.io/aerol-ai/%s:dev ' ${images//,/ })
+kind load docker-image --name "$cluster" $(printf "ghcr.io/aerol-ai/%s:$tag " ${images//,/ })
 
 edge_flags=()
-if [[ "$edge" == 1 ]]; then
+if [[ "$edge" == 1 || "$mode" == cluster ]]; then
+  # cert-manager: the edge's certificate, and in cluster mode the
+  # operator's webhook certificate too.
   if ! kubectl --context "kind-$cluster" get crd certificates.cert-manager.io >/dev/null 2>&1; then
     curl -fsSL -o "$dist/cert-manager.yaml" \
       "https://github.com/cert-manager/cert-manager/releases/download/$cert_manager_version/cert-manager.yaml"
@@ -82,8 +122,56 @@ if [[ "$edge" == 1 ]]; then
       kubectl --context "kind-$cluster" apply -f - >/dev/null 2>&1 && break
     sleep 2
   done
-  edge_flags=(--set edge.enabled=true --set edge.domain=aerolvm.test
-    --set edge.certManager.issuerRef.name=aerolvm-dev --set edge.service.type=ClusterIP)
+  if [[ "$edge" == 1 ]]; then
+    edge_flags=(--set edge.enabled=true --set edge.domain=aerolvm.test
+      --set edge.certManager.issuerRef.name=aerolvm-dev --set edge.service.type=ClusterIP)
+  fi
+fi
+
+if [[ "$mode" == cluster ]]; then
+  # Small requests: kind's nodes all share this machine. Each node reports
+  # the whole machine, so the pods fit on paper; little runs in them.
+  cat >"$dist/cluster-values.yaml" <<'VALUES'
+mode: cluster
+cluster:
+  zones: [z-a, z-b, z-c]
+  servers:
+    count: 3
+    storage: { size: 1Gi }
+    resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+  gateways:
+    minReplicas: 3
+    resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { cpu: "1", memory: 1Gi } }
+    service: { type: ClusterIP }
+  workerPools:
+    - name: general
+      runtimes: [runc, gvisor]
+      machine: { cpu: 4, memoryGiB: 8 }
+      minWorkers: 3
+      maxWorkers: 6
+      headroomPercent: 15
+      decommission: { drainWindow: 30s, deadline: 5m }
+  operator:
+    replicas: 1
+VALUES
+  kubectl --context "kind-$cluster" create namespace "$namespace" --dry-run=client -o yaml | kubectl --context "kind-$cluster" apply -f - >/dev/null
+  # Servers, gateways and the operator run under `restricted` (C5).
+  kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null
+  "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
+    -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"}
+  # The operator replaces nothing a new image changes on its own: restart it
+  # so a rebuilt operator runs.
+  kubectl --context "kind-$cluster" -n "$namespace" rollout restart deployment/aerolvm-operator >/dev/null
+  echo "k8s-dev: waiting for the AerolCluster to be Ready (servers, gateways, workers)" >&2
+  for _ in $(seq 1 120); do
+    phase="$(kubectl --context "kind-$cluster" -n "$namespace" get aerolcluster aerolvm -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    [[ "$phase" == Ready ]] && break
+    sleep 5
+  done
+  kubectl --context "kind-$cluster" -n "$namespace" get aerolcluster,aerolnodes >&2
+  [[ "$phase" == Ready ]] || { echo "k8s-dev: the AerolCluster is $phase, not Ready" >&2; exit 1; }
+  echo "k8s-dev: ready. Next: kubectl -n $namespace port-forward svc/aerolvm-gateway 21212:21212" >&2
+  exit 0
 fi
 
 kubectl --context "kind-$cluster" create namespace "$namespace" --dry-run=client -o yaml | kubectl --context "kind-$cluster" apply -f - >/dev/null

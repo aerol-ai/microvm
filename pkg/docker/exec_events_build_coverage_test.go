@@ -606,3 +606,26 @@ func TestPullImageWrapper(t *testing.T) {
 
 // keep os import used even if all other refs change.
 var _ = os.WriteFile
+
+// PrepareImage (C9) pulls only an image that is not here.
+func TestPrepareImage(t *testing.T) {
+	present := true
+	d := &poolFakeDaemon{t: t, imageInspect: func() *http.Response {
+		if present {
+			return jsonResponse(http.StatusOK, map[string]any{"Id": "sha256:img1"})
+		}
+		return textResponse(http.StatusNotFound, "no such image")
+	}}
+	c := newPoolClient(t, d, func(c *Client) {
+		c.imageIDs = newImageIDCache(time.Minute)
+		c.pulls = make(map[string]*imagePull)
+		c.pullFailures = make(map[string]imagePullFailure)
+	})
+	if err := c.PrepareImage(context.Background(), "alpine:3.20"); err != nil || d.pullCalls != 0 {
+		t.Fatalf("present image: %v, %d pulls", err, d.pullCalls)
+	}
+	present = false
+	if err := c.PrepareImage(context.Background(), "alpine:3.21"); err != nil || d.pullCalls != 1 {
+		t.Fatalf("missing image: %v, %d pulls", err, d.pullCalls)
+	}
+}

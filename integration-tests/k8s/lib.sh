@@ -44,6 +44,31 @@ publish_build() {
 }
 url_of() { sed -n "s/^$1 *= *\"\(.*\)\"$/\1/p" "$sd/urls.tfvars"; }
 
+# artifact_bucket sets bucket, the harness's long-lived artifact bucket
+# (integration-tests/lib/build.sh), and bucket_region, where it lives: a
+# presigned URL is signed for one region, and S3 refuses it from another.
+artifact_bucket() {
+  bucket="aerol-itest-artifacts-$(aws sts get-caller-identity --query Account --output text)"
+  bucket_region="$(aws s3api get-bucket-location --bucket "$bucket" --query LocationConstraint --output text)"
+  # us-east-1 answers with no LocationConstraint.
+  if [[ -z "$bucket_region" || "$bucket_region" == None || "$bucket_region" == null ]]; then
+    bucket_region=us-east-1
+  fi
+}
+
+# source_tree <commit> echoes a clean copy of the commit's tree, made once
+# per run: what a run installs and runs comes from the commit its images
+# were built from, never from this checkout's working tree.
+source_tree() {
+  local dir="$sd/src-${1:0:12}"
+  if [[ ! -f "$dir/.complete" ]]; then
+    rm -rf "$dir" && mkdir -p "$dir"
+    git -C "$LIB_ROOT" archive --format=tar "$1" | tar -x -C "$dir"
+    touch "$dir/.complete"
+  fi
+  echo "$dir"
+}
+
 # load_br_netfilter is the stand-in for finding F2: stock EKS nodes do not
 # load br_netfilter, and sandboxd refuses to start without it. modprobe runs
 # in a node debug pod against the host's /lib/modules (at /host), because

@@ -72,6 +72,11 @@ func workerEnvironment() []string {
 		"SB_EGRESS_OPERATOR_FILE": {},
 		// The node ports host-mediated sandboxes may reach (node guard).
 		egresspolicy.NodePortsEnv: {},
+		// The private-range default and the node's extra deny floor and
+		// private ranges (C24): a worker without them would let a WASM
+		// sandbox reach what the host firewall keeps every container
+		// sandbox from.
+		egresspolicy.BlockPrivateEnv: {}, egresspolicy.DenyFloorEnv: {}, egresspolicy.PrivateRangesEnv: {},
 	}
 	out := make([]string, 0, len(allowed))
 	for _, entry := range os.Environ() {
@@ -305,6 +310,8 @@ func RunCLI(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: --wasm-worker <socket-path>")
 	}
-	loadNodeAllowedPorts()
+	if err := loadWorkerGuards(); err != nil {
+		return err
+	}
 	return ServeSocketPath(args[0])
 }
