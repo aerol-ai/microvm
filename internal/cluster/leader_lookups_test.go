@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/hashicorp/memberlist"
 )
 
 // The leader's per-request reads of one member (C18, bench-full-4): an owner
@@ -103,5 +105,26 @@ func TestReservationCheckReadsOnlyItsOwners(t *testing.T) {
 	}
 	if err := c.admitReservationCommand(reserveOn("sb-f", "worker-0006")); !errors.Is(err, ErrNoPlacementTarget) {
 		t.Fatalf("a stale lease = %v, want ErrNoPlacementTarget", err)
+	}
+}
+
+// Before the index exists, a lookup scans memberlist's own view, as
+// members() does: the peer's record from its gossiped meta, and this node's
+// from its delegate.
+func TestPeerLookupsBeforeTheIndex(t *testing.T) {
+	self := newGossipDelegate("n1", "", "http://n1:21212", "", "n1:7000", "https://n1:7002", config.NodeRoleServer, "", nil)
+	peer := newGossipDelegate("n2", "", "http://n2:21212", "", "n2:7000", "https://n2:7002", config.NodeRoleWorker, "", nil)
+	nodes := newGossipNodeTable()
+	nodes.put(&memberlist.Node{Name: "n1", State: memberlist.StateAlive, Meta: self.NodeMeta(memberlist.MetaMaxSize)})
+	nodes.put(&memberlist.Node{Name: "n2", State: memberlist.StateAlive, Meta: peer.NodeMeta(memberlist.MetaMaxSize)})
+	g := &gossipNode{delegate: self, nodes: nodes}
+	if got := g.peerInternalURL("n2"); got != "https://n2:7002" {
+		t.Fatalf("peer's internal URL = %q", got)
+	}
+	if got := g.peerAPIURL("n1"); got != "http://n1:21212" {
+		t.Fatalf("own API URL = %q", got)
+	}
+	if _, ok := g.memberByID("n3"); ok {
+		t.Fatal("a node memberlist does not know was found")
 	}
 }
