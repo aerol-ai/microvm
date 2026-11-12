@@ -367,6 +367,10 @@ type fakeTask struct {
 	pauses    int
 	resumes   int
 	resumeErr error
+	// deleteFn, when set, answers each Delete (given its option count);
+	// deletes counts the calls (stop_delete_test.go).
+	deleteFn func(opts int) error
+	deletes  int
 }
 
 func (t *fakeTask) Pid() uint32 { return 0 }
@@ -381,7 +385,13 @@ func (t *fakeTask) Start(context.Context) error {
 	}
 	return nil
 }
-func (t *fakeTask) Delete(context.Context, ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
+func (t *fakeTask) Delete(_ context.Context, opts ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
+	t.deletes++
+	if t.deleteFn != nil {
+		if err := t.deleteFn(len(opts)); err != nil {
+			return nil, err
+		}
+	}
 	t.status = cntr.Stopped
 	return &cntr.ExitStatus{}, nil
 }
