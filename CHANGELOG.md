@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 8 releases : v0.6.9 to v0.7.2
+    November 2026 : 9 releases : v0.6.9 to v0.7.3
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 3 | Nov 10, 2026 to Nov 12, 2026 | [v0.7.2](#v072-aerolvm-clusters-on-kubernetes) |
+| [0.7](#07-release-line) | 4 | Nov 10, 2026 to Nov 12, 2026 | [v0.7.3](#v073-kubernetes-upgrades-work-and-every-worker-takes-gvisor-sandboxes) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,32 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.3: Kubernetes upgrades work, and every worker takes gVisor sandboxes
+
+*November 12, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.3)
+
+This release fixes upgrades on Kubernetes, and a bug that could make one worker refuse every gVisor sandbox. In v0.7.2, the operator could not start any upgrade: changing the version did nothing but log a refusal. Now it upgrades the cluster node by node, as v0.7.2 promised.
+
+- **Kubernetes upgrades work.** Change `cluster.version` (or `spec.version` on the `AerolCluster`) and the operator upgrades the servers one at a time, then the gateways, then the workers in batches, swapping each node's AerolVM server in place. Sandboxes keep running. In v0.7.2 the leader refused every such upgrade with "files has no sandboxd for linux/<arch>", because it asked for release files that an image upgrade does not use.
+- **A refused upgrade says so.** When an upgrade cannot start, the `AerolCluster` gets a Warning event, `UpgradeNotStarted`, with the reason. Before, `kubectl describe` showed only "upgrading" while nothing moved.
+- **No more workers that refuse every gVisor sandbox.** Depending on timing when a worker started, every gVisor create on it could fail with "sandbox came up at <address>, not at its prepaid address", until the worker restarted. This hit Kubernetes worker pods. The cause was a thread of the AerolVM server left inside one sandbox's network; it now always goes back, and the address check no longer trusts the wrong source.
+- **No FailedMount warnings on gateway and worker pods.** Their join token volume is optional now, as a server's already was. A pod that has joined never needs the token again, and one that kubelet sets up again, for example after a machine restart, no longer needs the deleted token to start.
+- **A failover keeps the sandbox's create time.** A sandbox recreated on a new node after its node died keeps its first `created_at`.
+- **Keep-alives cost the cluster far less.** E2B clients that extend a failover sandbox's timeout every few seconds used to cost one cluster write per call. Now it is about one per minute per sandbox. After a failover, the sandbox stops at most a minute before the time the last keep-alive asked for, never later.
+- **A Pending node says why.** An `AerolNode` that waits for a machine shows the Kubernetes scheduler's reason, such as "Insufficient cpu".
+
+**Before you upgrade:**
+
+- **From v0.7.2 on Kubernetes in cluster mode,** the v0.7.2 servers still refuse the operator's upgrade, so move the three servers first:
+  1. `helm upgrade` to the v0.7.3 chart as usual. The `AerolCluster` then shows the `UpgradeNotStarted` warning.
+  2. Find the Raft leader with `aerolvm cluster-info`.
+  3. Move each server's `AerolNode` (`<cluster>-server-0`, `-1` and `-2`), the leader last, and wait until each one shows v0.7.3 in `kubectl get aerolnodes` before the next. For a cluster named `aerolvm` in `aerolvm-system`: `kubectl -n aerolvm-system annotate aerolnode aerolvm-server-1 aerolvm.io/agent-version=v0.7.3`.
+  4. Once the leader runs v0.7.3, the operator upgrades the gateways and workers by itself.
+
+  Tested on kind from the published v0.7.2: every node reached the new version and every running sandbox kept its session.
+- **System machines need 4 CPUs.** On Kubernetes, give each zone a machine with 4 or more CPUs for a server, a gateway and an operator replica. With 2 CPUs a server can stay Pending.
+- **Plain VM clusters and single nodes:** nothing to do.
 
 ### v0.7.2: AerolVM clusters on Kubernetes
 
