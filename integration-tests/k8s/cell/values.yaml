@@ -10,6 +10,11 @@ image:
 worker:
   defaultRuntime: gvisor
   blockPrivateByDefault: true
+  # The cell's sandbox volume is the machine's root disk (an emptyDir), where
+  # kubelet's default eviction lines (imagefs 15% free, nodefs 10%) sit at or
+  # above the chart's 0.10: eviction could come first. drills.sh's
+  # disk-floor drill fills to just under this floor instead.
+  diskFloorRatio: "0.30"
 networkPolicy:
   enabled: true
 cluster:

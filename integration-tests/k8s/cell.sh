@@ -3,7 +3,7 @@
 # §18, §19): a three-zone cell in cluster mode, its chaos step, and the full
 # `aerolvm k8s verify`.
 #
-#   cell.sh <name> [up|build|install|preflight|chaos|verify|down|all]
+#   cell.sh <name> [up|build|build2|install|preflight|chaos|verify|drills [drill...]|down|all]
 #
 # up        EKS over three zones: 3 system nodes with 4 CPUs (servers,
 #           gateways, operator; on 2-CPU nodes their requests and the
@@ -23,6 +23,9 @@
 #           worker pod are deleted. Passes with zero lost creates, zero
 #           duplicates and every recreate sandbox back.
 # verify    aerolvm k8s verify, every rule (signatures skipped: dev images).
+# build2    the same commit's images as <tag>.2: a second version to upgrade
+#           to, for the rollout drill.
+# drills    drills.sh's Phase 3 drills (§19) on this cell, or the named ones.
 # down      cluster.sh down.
 #
 # The images, the chart and the aerolvm CLI all come from one commit (HEAD,
@@ -57,7 +60,13 @@ up() {
 }
 
 if [[ "$step" == up || "$step" == all ]]; then up; fi
-if [[ "$step" == down ]]; then exec "$HERE/cluster.sh" down "$name"; fi
+if [[ "$step" == down ]]; then
+  # The commit's source copy (lib.sh source_tree) goes too: left in .state
+  # it holds every script of that commit, and the safety tests, which walk
+  # integration-tests/, then fail on the copies.
+  rm -rf "$HERE/.state/$name"/src-*
+  exec "$HERE/cluster.sh" down "$name"
+fi
 
 # shellcheck source=lib.sh
 source "$HERE/lib.sh"
@@ -78,11 +87,15 @@ fi
 ns=aerolvm-system
 workers=aerolvm-workers
 
+# build [tag short]: the commit's images as tag (default $tag), by a Job
+# named images-<short>. build2 builds the same commit as $tag.2, a second
+# version for the rollout drills.
 build() {
   if [[ -n "${AEROL_RELEASE:-}" ]]; then
     say "build: none, $AEROL_RELEASE's published images"
     return 0
   fi
+  local tag="${1:-$tag}" short="${2:-${sha:0:8}}"
   local key url t0
   t0=$(date +%s)
   artifact_bucket
@@ -100,8 +113,8 @@ build() {
   # In a sed replacement & means "what matched": the presigned URL's own
   # & signs must be escaped, or S3 refuses the mangled URL with 400.
   sed -e "s|@@SOURCE_URL@@|${url//&/\\&}|" -e "s|@@REGISTRY@@|$registry|g" -e "s|@@TAG@@|$tag|g" \
-    -e "s|@@SHA@@|$sha|g" -e "s|@@SHORT@@|${sha:0:8}|g" "$HERE/cell/build-job.yaml" | kubectl apply -f - >/dev/null
-  local job="job/images-${sha:0:8}" st=""
+    -e "s|@@SHA@@|$sha|g" -e "s|@@SHORT@@|$short|g" "$HERE/cell/build-job.yaml" | kubectl apply -f - >/dev/null
+  local job="job/images-$short" st=""
   for _ in $(seq 1 120); do
     st="$(kubectl -n aerolvm-build get "$job" -o jsonpath='{.status.succeeded}/{.status.failed}')"
     [[ "$st" == 1/* || "$st" == */1 ]] && break
@@ -207,6 +220,18 @@ sandboxes() {
   python3 "$HERE/cell/load.py" --url http://127.0.0.1:21212 --token-file "$sd/token" --list-run "$1"
 }
 
+# node_setup loads br_netfilter on every worker machine, now and later,
+# through a DaemonSet (cell/node-setup.yaml) that stands in for a machine
+# image that loads it. A one-time load missed the machines a rotation adds,
+# and their workers then stayed Failed in preflight (rotation drill, run
+# p3-drills-2).
+node_setup() {
+  sed "s|@@IMAGE@@|$DEBUG_IMAGE|" "$HERE/cell/node-setup.yaml" | kubectl apply -f - >/dev/null
+  kubectl -n kube-system rollout status ds/aerolvm-cell-node-setup --timeout=5m >/dev/null ||
+    say "preflight: the node setup is not on every worker machine yet"
+  say "br_netfilter loaded on every worker machine, and on any added later (F2 stand-in)"
+}
+
 preflight() {
   local t0 failed reason i
   t0=$(date +%s)
@@ -232,7 +257,7 @@ preflight() {
     return 1
   fi
   say "preflight: $failed worker(s) Failed after $(( $(date +%s) - t0 ))s: $reason"
-  load_br_netfilter aerolvm.io/pool=phase0
+  node_setup
   wait_phase Ready 600
   wait_workers 3 900
   say "preflight: workers joined $(( $(date +%s) - t0 ))s after the first failure"
@@ -361,6 +386,14 @@ verify() {
 case "$step" in
   up) ;;
   build) build ;;
+  build2) build "$tag.2" "${sha:0:8}-2" ;;
+  drills)
+    # drills.sh's drills on this cell (§19). The rollout drill needs build2.
+    gateway_forward >/dev/null || true
+    DRILL_EKS_CLUSTER="$(tfout -raw cluster_name)" DRILL_AWS_REGION="$region" \
+      DRILL_VERSION_B="$tag.2" AEROL_CHART="$(source_tree "$sha")/charts/aerolvm" HELM="$HELM" \
+      "$HERE/drills.sh" "$sd/drills" "${@:3}" 2>&1 | tee -a "$report"
+    exit "${PIPESTATUS[0]}" ;;
   install) install ;;
   preflight) preflight ;;
   chaos) chaos ;;
