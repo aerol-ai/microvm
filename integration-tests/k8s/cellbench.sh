@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# cellbench.sh: the Phase 3 cell-ceiling bench with stand-in workers
+# (plans/kubernetes-v2-architecture.md §9.5, §19 "Cell ceiling"; C18).
+#
+#   AEROL_BUILD_REF=<commit> cellbench.sh <name> [worker machines] [stand-ins per machine]
+#   # default 10 machines × 50 = 500 workers
+#
+# Three real servers, and many real sandboxd workers that run only WASM
+# sandboxes, so a worker costs tens of MB and a machine holds 50. Every
+# create, reservation, promote, gossip message, capacity poll and failover
+# is the real one; only the sandboxes are light (an empty WASM module).
+# Stand-ins get one IP each (join and gossip use fixed ports): every worker
+# machine takes four IPv4 /28 prefixes on its network interface, and each
+# stand-in runs in its own network namespace (ipvlan, an address from the
+# prefixes) and mount namespace (its own /etc/sandboxd and /var/lib/sandboxd).
+#
+# A driver machine then measures, and prints BENCH lines to its console:
+#   1. failover: every other worker cordoned, 1,000 recreate sandboxes on
+#      one victim, cordons lifted, the victim killed: how many are back
+#      after 30, 60 and 120 s, and when all are (§9.5: 1,000 in 60 s; E7);
+#   2. throughput: aerolvm-bench against s1 at rising concurrency
+#      (creates per second, p50, p99; §9.5: 1,000 per second);
+#   3. the leader's metrics around it (Raft, placement, capacity polls).
+# Servers and worker machines print LOAD lines (CPU and memory of their
+# sandboxd processes) every 30 s: the capacity polling's cost (E5).
+#
+# Nothing goes from this machine to a node directly: the binaries go through
+# the artifact bucket (presigned URLs). Machines talk to each other on the
+# private network only (tokens from s1, the kill signal from the driver).
+# Every resource carries aerol:ttl for reap.sh, and the run tears itself down.
+set -euo pipefail
+name="${1:?usage: cellbench.sh <name> [worker machines] [stand-ins per machine]}"
+machines="${2:-10}" per="${3:-50}"
+server_type="${AEROL_BENCH_SERVER_TYPE:-m7i.xlarge}"
+worker_type="${AEROL_BENCH_WORKER_TYPE:-m7i.4xlarge}"
+driver_type="${AEROL_BENCH_DRIVER_TYPE:-m7i.2xlarge}"
+victim_sandboxes="${AEROL_BENCH_VICTIM_SANDBOXES:-1000}"
+steps="${AEROL_BENCH_STEPS:-32 128 512}"
+step_seconds="${AEROL_BENCH_STEP_SECONDS:-120}"
+(( per <= 64 )) || { echo "cellbench: at most 64 stand-ins per machine (4 × /28)" >&2; exit 2; }
+(( machines <= 15 )) || { echo "cellbench: at most 15 worker machines (their prefixes sit in one /20)" >&2; exit 2; }
+region=us-east-1
+root="$(git rev-parse --show-toplevel)"
+sd="$root/integration-tests/k8s/.state/$name"
+mkdir -p "$sd"
+report="$sd/cellbench-report.txt"
+: > "$report"
+say() { echo "[$(date -u +%T)] $*" | tee -a "$report"; }
+aws() { command aws --region "$region" "$@"; }
+
+# AEROL_BENCH_DRY=1 writes the machines' user data with stand-in values to
+# the state folder and stops: no build, no AWS (checked with bash -n).
+dry="${AEROL_BENCH_DRY:-}"
+if [[ -n "$dry" ]]; then
+  bin_url=https://example.invalid/bench-bin.tgz s1=10.0.0.1 s2=10.0.0.2 s3=10.0.0.3 drv=10.0.0.4 admin=dry-admin cidr=10.0.0.0/20
+else
+# --- build -------------------------------------------------------------------
+ref="$(git -C "$root" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
+target="$(sed -n 's/^ZIG_TARGET_amd64="\(.*\)"/\1/p' "$root/integration-tests/lib/build.sh")"
+wt="$(mktemp -d)"
+git -C "$root" worktree add --detach --force "$wt" "$ref" >/dev/null 2>&1
+mkdir -p "$sd/bin"
+(cd "$wt" && CGO_ENABLED=1 GOOS=linux GOARCH=amd64 CC="zig cc -target $target" CXX="zig c++ -target $target" \
+  go build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=bench-${ref:0:12}" \
+  -o "$sd/bin/sandboxd" ./cmd/sandboxd &&
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$sd/bin/toolboxd" ./cmd/toolboxd &&
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$sd/bin/aerolvm-bench" ./cmd/aerolvm-bench)
+git -C "$root" worktree remove --force "$wt"
+# The smallest valid WASM module: the stand-ins' only "workload".
+printf '\x00asm\x01\x00\x00\x00' > "$sd/bin/bench.wasm"
+tar -C "$sd/bin" -czf "$sd/bench-bin.tgz" sandboxd toolboxd aerolvm-bench bench.wasm
+bucket="aerol-itest-artifacts-$(aws sts get-caller-identity --query Account --output text)"
+key="builds/cellbench-${ref:0:12}/bench-bin.tgz"
+aws s3 cp --only-show-errors "$sd/bench-bin.tgz" "s3://$bucket/$key"
+bin_url="$(aws s3 presign "s3://$bucket/$key" --expires-in 14400)"
+say "build ${ref:0:12}: binaries staged"
+
+# --- network -----------------------------------------------------------------
+vpc="$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
+read -r subnet cidr <<<"$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$vpc" Name=availability-zone,Values=${region}a \
+  --query 'Subnets[0].[SubnetId,CidrBlock]' --output text)"
+# Fixed addresses deep in the subnet for the servers and the driver.
+mapfile -t ips < <(python3 -c "import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); [print(n.network_address+i) for i in (2581,2582,2583,2584)]" "$cidr")
+s1="${ips[0]}" s2="${ips[1]}" s3="${ips[2]}" drv="${ips[3]}"
+ttl="$(date -u -v+4H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+4 hours' +%Y-%m-%dT%H:%M:%SZ)"
+tags="ResourceType=%s,Tags=[{Key=Name,Value=aerol-cellbench-$name},{Key=aerol:ttl,Value=$ttl},{Key=aerol:run,Value=$name}]"
+sg="$(aws ec2 create-security-group --group-name "aerol-cellbench-$name" --description "cell bench $name" --vpc-id "$vpc" \
+  --tag-specifications "$(printf "$tags" security-group)" --query GroupId --output text)"
+aws ec2 authorize-security-group-ingress --group-id "$sg" --ip-permissions "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$sg}]" >/dev/null
+instances=""
+cleanup() {
+  [[ -n "$instances" ]] && aws ec2 terminate-instances --instance-ids $instances >/dev/null 2>&1 &&
+    aws ec2 wait instance-terminated --instance-ids $instances 2>/dev/null || true
+  aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 || echo "cellbench: delete security group $sg by hand" >&2
+}
+trap cleanup EXIT
+ami="$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)"
+admin="$(openssl rand -hex 24)"
+fi
+
+# --- user data ---------------------------------------------------------------
+# Common to every machine: fetch and unpack the binaries, and a LOAD line
+# every 30 s (the sandboxd processes' summed CPU and memory).
+common() {
+  cat <<EOF
+#!/bin/bash
+exec > >(tee /var/log/bench.log /dev/console) 2>&1
+set -u
+dnf -y -q install jq >/dev/null 2>&1 || true
+mkdir -p /opt/bench && cd /opt/bench
+curl -fsSL --retry 8 -o bin.tgz '$bin_url' && tar xzf bin.tgz && install -m 0755 sandboxd toolboxd aerolvm-bench /usr/local/bin/
+load() { while :; do
+  read -r cpu rss n < <(ps -C sandboxd -o %cpu=,rss= | awk '{c+=\$1; r+=\$2; n++} END {printf "%.0f %.0f %d", c, r/1024, n}')
+  echo "LOAD \$1 \$(date -u +%T) sandboxd=\$n cpu=\${cpu}% rss=\${rss}MB loadavg=\$(cut -d' ' -f1 /proc/loadavg)"
+  sleep 30
+done; }
+start_sandboxd() { # start one sandboxd from /etc/sandboxd, as the chart's agent does
+  pod_env="\$(export -p)"; set -a; . /etc/sandboxd/sandboxd.env; [ -s /etc/sandboxd/cluster.env ] && . /etc/sandboxd/cluster.env; set +a; eval "\$pod_env"
+  exec sandboxd
+}
+EOF
+}
+server_env="SB_PAT_TOKEN=$admin SB_API_HOST=0.0.0.0 SB_API_PORT=21212 SB_DB_PATH=/var/lib/sandboxd/db/state.db \
+SB_CREDENTIAL_ENCRYPTION_KEY_PATH=/var/lib/sandboxd/credential_encryption.key SB_DOCKER_ENABLED=false \
+SB_ENABLE_NETWORK_RULES=false SB_ENABLE_CADDY=false SB_CONTAINER_ENGINE=containerd SB_CLUSTER_OWNER_CACHE=true \
+SB_TOOLBOX_BINARY_PATH=/usr/local/bin/toolboxd SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts SB_MOUNTS_CRED_DIR=/run/sandboxd"
+
+server_ud() { # <id> <ip>
+  common
+  cat <<EOF
+mkdir -p /etc/sandboxd /var/lib/sandboxd/db /var/lib/sandboxd/mounts /run/sandboxd /srv/www
+export $server_env
+env | grep '^SB_' > /etc/sandboxd/sandboxd.env
+if [ "$1" = s1 ]; then
+  sandboxd init --files-only --role server --node-id s1 --advertise $2
+else
+  until tok="\$(curl -fsS http://$s1:8080/token-$1)" && [ -n "\$tok" ]; do sleep 2; done
+  until sandboxd join https://$s1:7003 --token "\$tok" --role server --node-id $1 --advertise $2 --files-only; do sleep 5; done
+fi
+(start_sandboxd) > /var/log/sandboxd.log 2>&1 &
+until curl -fsS -o /dev/null http://127.0.0.1:21212/health; do sleep 1; done
+echo "BENCHNODE $1 up \$(date -u +%T)"
+if [ "$1" = s1 ]; then
+  # A token only once one comes back: right after /health the node may not
+  # lead yet (503), and an empty answer must never be published.
+  mint() { # <file> <body>
+    local out t
+    for try in \$(seq 1 120); do
+      out="\$(curl -sS -H "Authorization: Bearer $admin" -H 'Content-Type: application/json' -X POST \
+        http://127.0.0.1:21212/v1/cluster/join-tokens -d "\$2")"
+      t="\$(jq -r '.token // empty' <<<"\$out" 2>/dev/null)"
+      [ -n "\$t" ] && { echo "\$t" > /srv/www/\$1.tmp && mv /srv/www/\$1.tmp /srv/www/\$1; return 0; }
+      echo "BENCHNODE s1 mint \$1 try \$try: \$(head -c 200 <<<"\$out")"; sleep 2
+    done
+    return 1
+  }
+  mint token-s2 '{"role":"server","ttl":"4h","reusable":false,"created_by":"bench"}'
+  mint token-s3 '{"role":"server","ttl":"4h","reusable":false,"created_by":"bench"}'
+  mint token-worker '{"role":"worker","ttl":"4h","reusable":true,"created_by":"bench"}'
+  echo "BENCHNODE s1 tokens published \$(date -u +%T)"
+  (cd /srv/www && python3 -m http.server 8080 >/dev/null 2>&1 &)
+fi
+load $1
+EOF
+}
+
+# prefixes_of <machine number>: its four /28 prefixes, fixed and deep in the
+# subnet (offset 3072 on, 64 addresses a machine), so the launch assigns
+# them and the machine's script knows them without asking the metadata
+# service.
+prefixes_of() {
+  python3 -c "import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1]); b=3072+64*(int(sys.argv[2])-1); print(' '.join(f'{n.network_address+b+16*k}/28' for k in range(4)))" "$cidr" "$1"
+}
+
+worker_ud() { # <machine number>
+  local m prefixes; m=$(printf %02d "$1"); prefixes="$(prefixes_of "$1")"
+  common
+  cat <<EOF
+modprobe ipvlan
+# The mount points each stand-in binds its own folders over.
+mkdir -p /etc/sandboxd /var/lib/sandboxd /run/sandboxd
+tok=; until tok="\$(curl -fsS http://$s1:8080/token-worker)" && [ -n "\$tok" ]; do sleep 3; done
+prefixes="$prefixes"
+dev=\$(ip route show default | awk '{print \$5; exit}'); gw=\$(ip route show default | awk '{print \$3; exit}')
+plen=\$(ip -o -4 addr show dev \$dev | awk '{print \$4}' | head -1 | cut -d/ -f2)
+mapfile -t addrs < <(python3 -c 'import ipaddress,sys; [print(a) for p in sys.argv[1:] for a in ipaddress.ip_network(p)]' \$prefixes)
+zones=(z-a z-b z-c)
+for i in \$(seq 1 $per); do
+  n=\$(printf %02d \$i) ip=\${addrs[\$((i-1))]} ns=sb\$n d=/srv/sb\$n
+  mkdir -p \$d/etc \$d/lib/db \$d/lib/mounts \$d/lib/wasm/modules \$d/run
+  cp /opt/bench/bench.wasm \$d/lib/wasm/modules/bench.wasm
+  ip netns add \$ns
+  ip link add ipv\$n link \$dev type ipvlan mode l2
+  ip link set ipv\$n netns \$ns
+  ip netns exec \$ns ip addr add \$ip/\$plen dev ipv\$n
+  ip netns exec \$ns ip link set lo up
+  ip netns exec \$ns ip link set ipv\$n up
+  ip netns exec \$ns ip route add default via \$gw
+  cat > \$d/standin.sh <<STANDIN
+#!/bin/bash
+set -u
+mount --bind \$d/etc /etc/sandboxd && mount --bind \$d/lib /var/lib/sandboxd && mount --bind \$d/run /run/sandboxd || exit 1
+export SB_API_HOST=0.0.0.0 SB_API_PORT=21212 SB_DB_PATH=/var/lib/sandboxd/db/state.db \\\\
+  SB_CREDENTIAL_ENCRYPTION_KEY_PATH=/var/lib/sandboxd/credential_encryption.key SB_DOCKER_ENABLED=false \\\\
+  SB_ENABLE_NETWORK_RULES=false SB_ENABLE_CADDY=false SB_CONTAINER_ENGINE=containerd SB_ENABLE_SSH_GATEWAY=false \\\\
+  SB_ENABLE_WASM=true SB_HOST_RUNTIMES=wasm SB_WASM_MODULES_DIR=/var/lib/sandboxd/wasm/modules \\\\
+  SB_WASM_STANDARD_MODULES=bench=bench.wasm SB_NODE_ZONE=\${zones[\$(( (i-1) % 3 ))]} \\\\
+  SB_TOOLBOX_BINARY_PATH=/usr/local/bin/toolboxd SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts SB_MOUNTS_CRED_DIR=/run/sandboxd
+if [ ! -s /etc/sandboxd/cluster.env ]; then
+  env | grep '^SB_' > /etc/sandboxd/sandboxd.env
+  for try in 1 2 3 4 5 6 7 8 9 10; do
+    sandboxd join https://$s1:7003 --token \$tok --role worker --node-id w$m-\$n --advertise \$ip --files-only && break
+    sleep \\\$((try * 3))
+  done
+fi
+pod_env="\\\$(export -p)"; set -a; . /etc/sandboxd/sandboxd.env; [ -s /etc/sandboxd/cluster.env ] && . /etc/sandboxd/cluster.env; set +a; eval "\\\$pod_env"
+exec sandboxd
+STANDIN
+  chmod +x \$d/standin.sh
+  (ip netns exec \$ns unshare -m --propagation private \$d/standin.sh > \$d/sandboxd.log 2>&1 &)
+  sleep 0.3
+done
+echo "BENCHNODE m$m started $per stand-ins \$(date -u +%T)"
+if [ "$m" = 01 ]; then
+  ( until curl -fs -o /dev/null http://$drv:8080/kill 2>/dev/null; do sleep 1; done
+    pids=\$(ip netns pids sb01); kill -9 \$pids
+    echo "KILLED w01-01 \$(date -u +%s.%N) pids=\$pids" ) &
+fi
+# Every minute, one line per stand-in that is not up: the last line of its
+# log, so a failure shows on the console.
+( while :; do
+    sleep 60
+    for d in /srv/sb*; do
+      n=\${d##*/sb}
+      ip netns pids sb\$n 2>/dev/null | grep -q . && grep -q 'member joined' \$d/sandboxd.log 2>/dev/null && continue
+      echo "STANDIN m$m-\$n down: \$(grep -v 'request complete' \$d/sandboxd.log 2>/dev/null | tail -1 | cut -c1-220)"
+    done
+  done ) &
+load m$m
+EOF
+}
+
+driver_ud() {
+  common
+  cat <<EOF
+mkdir -p /srv/www && (cd /srv/www && python3 -m http.server 8080 >/dev/null 2>&1 &)
+api() { curl -fsS -m 30 -H "Authorization: Bearer $admin" -H 'Content-Type: application/json' "\$@"; }
+S=http://$s1:21212
+want=\$((3 + $machines * $per))
+t0=\$(date +%s)
+while :; do
+  n=\$(api \$S/v1/cluster/members 2>/dev/null | jq '[(.members // .)[] | select(.alive)] | length' 2>/dev/null || echo 0)
+  [ "\${n:-0}" -ge \$want ] && break
+  [ \$(( \$(date +%s) - t0 )) -gt 1800 ] && break
+  echo "BENCH members \$n of \$want \$(date -u +%T)"; sleep 20
+done
+echo "BENCH members \$n of \$want after \$(( \$(date +%s) - t0 ))s"
+metrics() { api \$S/v1/metrics | grep -E '^aerolvm_(raft|cluster_placement|scheduler|capacity_lease|cluster_capacity|go_goroutines|cluster_reserve|create)' | grep -v '^#' | sed "s/^/BENCH metric \$1 /"; }
+# A member is not a placement target until a server has its capacity
+# (polled every few seconds): wait for one create to go through.
+probe() { api -X POST \$S/v1/sandboxes -d '{"runtime":"wasm","module_ref":"bench","tags":{"bench":"probe"}}' 2>/dev/null | jq -r '.id // empty'; }
+for try in \$(seq 1 60); do id=\$(probe); [ -n "\$id" ] && break; sleep 5; done
+echo "BENCH placement ready after \$(( \$(date +%s) - t0 ))s (probe \${id:-none})"
+[ -n "\${id:-}" ] && api -X DELETE \$S/v1/sandboxes/\$id -o /dev/null
+metrics idle
+
+# 1. Failover of $victim_sandboxes sandboxes from one dead worker.
+workers=\$(api \$S/v1/cluster/members | jq -r '(.members // .)[] | select(.role=="worker") | .node_id')
+for w in \$workers; do [ "\$w" = w01-01 ] || echo \$w; done | xargs -P 32 -I{} curl -fsS -m 30 -o /dev/null -H "Authorization: Bearer $admin" -X POST \$S/v1/cluster/nodes/{}/cordon
+cat > /srv/create-one.sh <<'ONE'
+#!/bin/bash
+# One recreate sandbox, tried up to 5 times; the failure's answer on stderr.
+for try in 1 2 3 4 5; do
+  out=\$(curl -sS -m 60 -H "Authorization: Bearer \$ADMIN" -H 'Content-Type: application/json' -X POST "\$S/v1/sandboxes" \\
+    -d '{"runtime":"wasm","module_ref":"bench","cpu":0.1,"memory_mb":16,"failover":{"policy":"recreate"},"tags":{"bench":"failover"}}')
+  id=\$(jq -r '.id // empty' <<<"\$out" 2>/dev/null); [ -n "\$id" ] && { echo "\$id"; exit 0; }
+  sleep 2
+done
+echo "create failed: \$(head -c 200 <<<"\$out")" >&2
+ONE
+chmod +x /srv/create-one.sh
+export ADMIN=$admin S
+seq 1 $victim_sandboxes | xargs -P 32 -I{} /srv/create-one.sh 2> >(sort | uniq -c | head -3 | sed 's/^/BENCH failover-create-error /') > /srv/ids.txt
+for w in \$workers; do [ "\$w" = w01-01 ] || echo \$w; done | xargs -P 32 -I{} curl -fsS -m 30 -o /dev/null -H "Authorization: Bearer $admin" -X POST \$S/v1/cluster/nodes/{}/uncordon
+owners() { xargs -P 32 -I{} sh -c "curl -fsS -m 10 -H 'Authorization: Bearer $admin' \$S/v1/cluster/placements/{} | jq -r '.owner.node_id // .owner // \"none\"'" < /srv/ids.txt | sort | uniq -c | sort -rn | head -3 | tr '\n' ' '; }
+echo "BENCH failover created \$(grep -c . /srv/ids.txt) owners: \$(owners)"
+touch /srv/www/kill; tk=\$(date +%s)
+for at in 30 60 120 300; do
+  sleep \$(( tk + at - \$(date +%s) ))
+  away=\$(xargs -P 32 -I{} sh -c "curl -fsS -m 10 -H 'Authorization: Bearer $admin' \$S/v1/cluster/placements/{} | jq -r '.owner.node_id // .owner // \"none\"'" < /srv/ids.txt | grep -vc '^w01-01\$\|^none\$')
+  echo "BENCH failover \${at}s: \$away of \$(grep -c . /srv/ids.txt) owned by a live worker"
+done
+metrics after-failover
+xargs -P 32 -I{} curl -fsS -m 30 -o /dev/null -H "Authorization: Bearer $admin" -X DELETE \$S/v1/sandboxes/{} < /srv/ids.txt
+
+# 2. Throughput.
+for c in $steps; do
+  out=\$(aerolvm-bench -api \$S -token $admin -runtime wasm -image bench -concurrency \$c -duration ${step_seconds}s -json 2>/dev/null)
+  echo "BENCH throughput c=\$c \$(echo "\$out" | jq -c '{creates_per_second, ok: .creates.succeeded, failed: .creates.failed, lat: .create_latency_ms, errors}' 2>/dev/null || echo "\$out" | tail -c 400)"
+  metrics after-c\$c
+done
+echo "BENCH DONE"
+EOF
+}
+
+if [[ -n "$dry" ]]; then
+  for s in s1 s2 s3; do ip="${!s}"; server_ud "$s" "$ip" > "$sd/ud-$s.sh"; done
+  for m in $(seq 1 "$machines"); do worker_ud "$m" > "$sd/ud-m$m.sh"; done
+  driver_ud > "$sd/ud-driver.sh"
+  echo "cellbench: dry run, user data in $sd"; exit 0
+fi
+
+# --- launch ------------------------------------------------------------------
+run() { # <ud file> <type> <ip or ""> [prefixes]
+  local ni="DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true"
+  [[ -n "$3" ]] && ni+=",PrivateIpAddress=$3"
+  [[ -n "${4:-}" ]] && ni+=",Ipv4Prefixes=[$(for p in $4; do printf '{Ipv4Prefix=%s},' "$p"; done | sed 's/,$//')]"
+  aws ec2 run-instances --image-id "$ami" --instance-type "$2" --network-interfaces "$ni" \
+    --instance-initiated-shutdown-behavior terminate --user-data "file://$1" \
+    --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
+    --tag-specifications "$(printf "$tags" instance)" "$(printf "$tags" volume)" \
+    --query 'Instances[0].InstanceId' --output text
+}
+declare -A ids
+for s in s1 s2 s3; do
+  ip="${!s}"
+  server_ud "$s" "$ip" > "$sd/ud-$s.sh"
+  ids[$s]="$(run "$sd/ud-$s.sh" "$server_type" "$ip")"; instances+=" ${ids[$s]}"
+done
+for m in $(seq 1 "$machines"); do
+  worker_ud "$m" > "$sd/ud-m$m.sh"
+  ids[m$m]="$(run "$sd/ud-m$m.sh" "$worker_type" "" "$(prefixes_of "$m")")"; instances+=" ${ids[m$m]}"
+done
+driver_ud > "$sd/ud-driver.sh"
+ids[driver]="$(run "$sd/ud-driver.sh" "$driver_type" "$drv")"; instances+=" ${ids[driver]}"
+say "machines: 3 × $server_type, $machines × $worker_type ($per stand-ins each), driver $driver_type; $(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].Name' --output text)"
+
+# --- results -----------------------------------------------------------------
+console() { aws ec2 get-console-output --instance-id "$1" --latest --query Output --output text 2>/dev/null || true; }
+start=$(date +%s)
+while (( $(date +%s) - start < 7200 )); do
+  out="$(console "${ids[driver]}")"
+  grep -q 'BENCH DONE' <<<"$out" && break
+  sleep 60
+done
+# Each line reaches the console twice (as written, and through cloud-init's
+# log with a prefix): keep the bare ones.
+grep -E '^BENCH ' <<<"$out" | tee -a "$report"
+for s in s1 s2 s3 m1; do console "${ids[$s]}" | grep -E '^(LOAD|KILLED|BENCHNODE|STANDIN)' | tail -14 | sed "s/^/$s: /" >> "$report"; done
+grep -q 'BENCH DONE' "$report" || say "cellbench: the driver did not finish within two hours"
+say "--- done in $(( ($(date +%s) - start) / 60 )) min; report in $report"
