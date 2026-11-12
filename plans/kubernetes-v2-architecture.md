@@ -1939,8 +1939,28 @@ a 12 MB source tarball (370 s) and pushed to the run's ECR repositories.
   Identity once pods cannot reach IMDS; a presigned URL needs its `&` signs
   escaped for `sed`.
 
-Not yet: `verify` with signatures, which needs a release; external-CA mode
-(C23), which is refused with a reason until built.
+**`verify` with signatures, on the release: pass** (run `p2-sig-3`,
+2026-11-12, v0.7.2's published images from ghcr.io, `AEROL_RELEASE=v0.7.2`).
+Every rule passed, the four images' keyless signatures included (the
+release workflow's identity); 51 addresses refused to the probe sandbox.
+Two runs before it did not count:
+
+- `p2-sig-1`: every rule passed except signatures, because the machine
+  running `verify` had no `cosign` (`cell.sh` now refuses to start without
+  it when `AEROL_RELEASE` is set). The same four signatures verified with
+  cosign v3.1.4 run by hand. This laptop's Docker login to ghcr.io is
+  refused by ghcr.io, so cosign ran with an empty `DOCKER_CONFIG`.
+- `p2-sig-2`: `aerolvm-server-2` stayed Pending for 14 minutes, so the
+  AerolCluster stayed Degraded. The cluster was torn down with no pod
+  details kept, so the cause is not known. One candidate: on the 2-CPU
+  system nodes (about 1.9 CPUs to give out), a server (1 CPU), a gateway
+  (0.5) and the cluster's own pods come within about 0.3 CPU of full,
+  depending on where the DNS, operator and storage replicas land. Since then
+  `cell.sh` saves each stuck node's pod, logs and events before teardown,
+  its system nodes have 4 CPUs, the docs ask for 4 CPUs, and a Pending
+  `AerolNode` shows the scheduler's reason.
+
+Not yet: external-CA mode (C23), which is refused with a reason until built.
 
 ## 19. Tests, drills and benchmarks
 

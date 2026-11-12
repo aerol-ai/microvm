@@ -5,10 +5,12 @@
 #
 #   cell.sh <name> [up|build|install|preflight|chaos|verify|down|all]
 #
-# up        EKS over three zones: 3 system nodes (servers, gateways,
-#           operator), 3 worker machines with IMDSv2 and a hop limit of 1,
-#           the EBS CSI driver, the VPC CNI enforcing NetworkPolicies, and
-#           ECR repositories for this run.
+# up        EKS over three zones: 3 system nodes with 4 CPUs (servers,
+#           gateways, operator; on 2-CPU nodes their requests and the
+#           cluster's own pods come within 0.3 CPU of full, and p2-sig-2
+#           had a server Pending), 3 worker machines with IMDSv2 and a hop
+#           limit of 1, the EBS CSI driver, the VPC CNI enforcing
+#           NetworkPolicies, and ECR repositories for this run.
 # build     The commit's source (~12 MB) to S3; Go and BuildKit build the
 #           images inside the cluster and push them to ECR. No binary or
 #           image crosses this machine's uplink.
@@ -35,6 +37,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 name="${1:?usage: cell.sh <name> [up|build|install|preflight|chaos|verify|down|all]}"
 step="${2:-all}"
 HELM="${HELM:-helm}"
+# verify checks a release's image signatures with cosign: without it the run
+# makes a cluster only to fail at its last step.
+if [[ -n "${AEROL_RELEASE:-}" && "$step" != down ]] && ! command -v cosign >/dev/null; then
+  echo "cell.sh: AEROL_RELEASE needs cosign on PATH for verify's signature check" >&2
+  exit 2
+fi
 # The same cert-manager as `make k8s-dev`, checked by its digest.
 CERT_MANAGER_VERSION=v1.21.3
 CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
@@ -43,7 +51,7 @@ up() {
   # A release's images come from ghcr.io: no ECR repositories for it.
   local ecr=(--ecr aerolvm,aerolvm-runtime,aerolvm-operator)
   [[ -n "${AEROL_RELEASE:-}" ]] && ecr=()
-  "$HERE/cluster.sh" up "$name" --ttl "${AEROL_TTL:-4h}" --zones 3 --system 3 --system-type m7i.large \
+  "$HERE/cluster.sh" up "$name" --ttl "${AEROL_TTL:-4h}" --zones 3 --system 3 --system-type m7i.xlarge \
     --workers 3 --type m7i.xlarge --imds-hop-limit 1 --ebs-csi --network-policy \
     ${ecr[@]+"${ecr[@]}"}
 }
@@ -133,6 +141,34 @@ YAML
   say "install: chart $tag in $ns, zones $zones, in $(( $(date +%s) - t0 ))s"
 }
 
+# diagnose saves, before the cluster can be torn down, why each AerolNode
+# that is not Serving is stuck: the AerolNode, its pod and every container's
+# log (init containers too, and the previous run of each), its volume claim,
+# and the namespaces' recent events. The second signed-image run (p2-sig-2)
+# had a server Pending for 14 minutes and was destroyed with none of this.
+# Every command may fail (no pod yet, no previous run) under set -e, so
+# each one is allowed to.
+diagnose() {
+  local d="$sd/diag-$(date +%H%M%S)" n role pns c
+  mkdir -p "$d"
+  for n in $(kubectl -n "$ns" get aerolnodes -o json 2>/dev/null | jq -r '.items[] | select(.status.state != "Serving") | .metadata.name' || true); do
+    role="$(kubectl -n "$ns" get aerolnode "$n" -o jsonpath='{.spec.role}' 2>/dev/null || true)"
+    pns="$ns"; [[ "$role" == worker ]] && pns="$workers"
+    {
+      kubectl -n "$ns" describe aerolnode "$n" || true
+      kubectl -n "$pns" describe pod "$n" || true
+      kubectl -n "$pns" get pvc -o wide || true
+      for c in $(kubectl -n "$pns" get pod "$n" -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null || true); do
+        echo "--- $c"; kubectl -n "$pns" logs "$n" -c "$c" --tail=200 || true
+        echo "--- $c (previous)"; kubectl -n "$pns" logs "$n" -c "$c" --previous --tail=100 || true
+      done
+    } > "$d/$n.txt" 2>&1
+    say "diagnose: $n ($role) is $(kubectl -n "$ns" get aerolnode "$n" -o jsonpath='{.status.state}: {.status.reason}' 2>/dev/null || true); details in $d/$n.txt"
+  done
+  { kubectl get events -A --sort-by=.lastTimestamp 2>&1 || true; } | tail -80 > "$d/events.txt"
+  kubectl -n "$ns" logs deploy/aerolvm-operator --tail=300 > "$d/operator.txt" 2>&1 || true
+}
+
 # wait_phase <phase> <seconds>
 wait_phase() {
   local p="" i
@@ -143,6 +179,7 @@ wait_phase() {
   done
   say "the AerolCluster is ${p:-missing}, not $1, after $2s"
   kubectl -n "$ns" get aerolcluster,aerolnodes | tee -a "$report"
+  diagnose
   return 1
 }
 
@@ -158,6 +195,7 @@ wait_workers() {
   done
   say "$n of $1 workers Serving after $2s"
   kubectl -n "$ns" get aerolnodes | tee -a "$report"
+  diagnose
   return 1
 }
 
