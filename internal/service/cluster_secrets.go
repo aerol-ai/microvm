@@ -38,6 +38,13 @@ import (
 // Fields that only a failover recreate reads back go through
 // replicateRecoverySpecPatch instead.
 func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
+	s.replicateSpecPatchUnless(ctx, id, patch, nil)
+}
+
+// replicateSpecPatchUnless is replicateSpecPatch that also skips the write
+// when current, given the replicated spec before the patch, reports it close
+// enough to what the patch would write. It runs under the spec lock.
+func (s *Service) replicateSpecPatchUnless(ctx context.Context, id string, patch func(*models.CreateSandboxRequest), current func(*models.CreateSandboxRequest) bool) {
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -53,6 +60,9 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 	defer unlock()
 	spec := c.SpecOf(id)
 	if spec == nil {
+		return
+	}
+	if current != nil && current(spec) {
 		return
 	}
 	// Compare what the command would carry: opUpsertSpec encodes the spec as
@@ -75,7 +85,8 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 
 // replicateRecoverySpecPatch is replicateSpecPatch for the fields that only a
 // failover recreate reads back from the replicated spec: lifecycle, tags and
-// facade state. The owner watcher recreates a placement only when its spec
+// facade state (lifecycle through replicateRecoveryLifecycle, which also lets
+// the copy lag a keep-alive). The owner watcher recreates a placement only when its spec
 // asks for failover=recreate (recreateOwnedPlacement), and nothing else in
 // the cluster reads these fields, so for any other sandbox the write buys
 // nothing. Deciding before SpecOf also skips the round trips a worker makes
@@ -88,8 +99,17 @@ func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(
 // (specFromSandbox). If the row cannot be read, the write goes ahead as it
 // did before.
 func (s *Service) replicateRecoverySpecPatch(ctx context.Context, id string, sb *models.Sandbox, patch func(*models.CreateSandboxRequest)) {
+	if _, ok := s.recoverySpecWanted(ctx, id, sb); ok {
+		s.replicateSpecPatch(ctx, id, patch)
+	}
+}
+
+// recoverySpecWanted is replicateRecoverySpecPatch's guard: false when no
+// failover recreate will read the field back. It returns the local row it
+// decided on (sb, or the one it read; nil if unreadable).
+func (s *Service) recoverySpecWanted(ctx context.Context, id string, sb *models.Sandbox) (*models.Sandbox, bool) {
 	if _, standalone := s.Cluster().(*cluster.Noop); standalone {
-		return
+		return sb, false
 	}
 	if sb == nil && s.store != nil {
 		if row, err := s.store.Get(ctx, id); err == nil {
@@ -97,9 +117,9 @@ func (s *Service) replicateRecoverySpecPatch(ctx context.Context, id string, sb 
 		}
 	}
 	if sb != nil && (sb.Failover == nil || !sb.Failover.ShouldRecreate()) {
-		return
+		return sb, false
 	}
-	s.replicateSpecPatch(ctx, id, patch)
+	return sb, true
 }
 
 // lockSpec takes id's spec lock (specLocks) in a cluster. A single node has

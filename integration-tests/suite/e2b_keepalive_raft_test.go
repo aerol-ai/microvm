@@ -20,11 +20,13 @@ import (
 const e2bKeepAliveCalls = 100
 
 // UC-704 — an E2B keep-alive (setTimeout) costs no Raft write on a default
-// sandbox and one on a failover=recreate sandbox, the only kind whose
-// replicated lifecycle a failover recreate reads back. Before the fix every
-// call made two (the lifecycle, then a re-save of the E2B facade state that
-// held nothing new), so a fleet of keep-alives competed with creates for the
-// leader's commit pipeline.
+// sandbox, and on a failover=recreate sandbox (the only kind whose replicated
+// lifecycle a failover recreate reads back) about one a minute: the first
+// call, then one whenever the replicated deadline falls a minute behind.
+// Before #1172 every call made two (the lifecycle, then a re-save of the E2B
+// facade state that held nothing new), and before the lag one on a failover
+// sandbox, so a fleet of keep-alives competed with creates for the leader's
+// commit pipeline.
 //
 // The Raft count is aerolvm_raft_apply_total summed over every server: each
 // log entry is applied through the leader, forwarded or not, so the sum is
@@ -78,7 +80,7 @@ func TestE2BKeepAliveRaftCost(t *testing.T) {
 	time.Sleep(quiet)
 	backgroundPerSecond := (raftEntries() - q0) / quiet.Seconds()
 
-	measure := func(label, id string) (perCall float64, lat []time.Duration) {
+	measure := func(label, id string) (perCall float64, lat []time.Duration, elapsed time.Duration) {
 		t.Helper()
 		owner := resolvePlacementOwner(t, c, id)
 		node, ok := nodeForClusterID(t, c, targets, owner)
@@ -92,26 +94,30 @@ func TestE2BKeepAliveRaftCost(t *testing.T) {
 		before := raftEntries()
 		start := time.Now()
 		lat = keepAliveOnNode(t, target, id, e2bKeepAliveCalls)
-		elapsed := time.Since(start)
+		elapsed = time.Since(start)
 		entries := raftEntries() - before - backgroundPerSecond*elapsed.Seconds()
-		return entries / float64(e2bKeepAliveCalls), lat
+		return entries / float64(e2bKeepAliveCalls), lat, elapsed
 	}
 
-	defaultPerCall, defaultLat := measure("default sandbox", defaultID)
-	haPerCall, haLat := measure("failover=recreate sandbox", ha.ID)
+	defaultPerCall, defaultLat, _ := measure("default sandbox", defaultID)
+	haPerCall, haLat, haElapsed := measure("failover=recreate sandbox", ha.ID)
+	haEntries := haPerCall * e2bKeepAliveCalls
 
 	harness.ReportDetail(t, "%d E2B setTimeout calls each, on the owner's loopback, %d servers counted, background %.2f entries/s. "+
 		"Default sandbox: %.2f Raft entries per call, latency p50 %s p95 %s max %s. "+
-		"Failover=recreate sandbox: %.2f Raft entries per call, latency p50 %s p95 %s max %s.",
+		"Failover=recreate sandbox: %.1f Raft entries in %s (%.2f per call), latency p50 %s p95 %s max %s.",
 		e2bKeepAliveCalls, len(serverBases), backgroundPerSecond,
 		defaultPerCall, percentile(defaultLat, 50), percentile(defaultLat, 95), percentile(defaultLat, 100),
-		haPerCall, percentile(haLat, 50), percentile(haLat, 95), percentile(haLat, 100))
+		haEntries, haElapsed.Round(time.Second), haPerCall, percentile(haLat, 50), percentile(haLat, 95), percentile(haLat, 100))
 
 	if defaultPerCall > 0.2 {
 		t.Errorf("default sandbox: %.2f Raft entries per setTimeout, want 0 (nothing reads its replicated lifecycle back)", defaultPerCall)
 	}
-	if haPerCall < 0.8 || haPerCall > 1.2 {
-		t.Errorf("failover=recreate sandbox: %.2f Raft entries per setTimeout, want 1 (the lifecycle a recreate restores)", haPerCall)
+	// The first call replicates the new timer; after that at most one entry
+	// per minute of calls (lifecycleReplicationLag).
+	if maxEntries := 1.5 + haElapsed.Minutes(); haEntries < 0.5 || haEntries > maxEntries {
+		t.Errorf("failover=recreate sandbox: %.1f Raft entries for %d setTimeout calls in %s, want 1 to %.0f (the first, then about one a minute)",
+			haEntries, e2bKeepAliveCalls, haElapsed.Round(time.Second), maxEntries-0.5)
 	}
 }
 
