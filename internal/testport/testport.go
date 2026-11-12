@@ -80,21 +80,35 @@ var testPorts struct {
 // little room is left below it.
 func testPortRange() (low, high int, ok bool) {
 	if !testPorts.resolved {
-		testPorts.low, testPorts.high = testPortLow, testPortHigh
-		if start, found := ephemeralPortStart(); found && start < testPorts.high {
-			testPorts.high = start
-		}
+		testPorts.low, testPorts.high = pickingRange(ephemeralPortStart())
 		testPorts.lockDir = testPortLockDir()
 		testPorts.resolved = true
 	}
 	return testPorts.low, testPorts.high, testPorts.high-testPorts.low >= 8*testPortBlock
 }
 
+// pickingRange is [testPortLow, testPortHigh), ending early when the
+// ephemeral range (if known) starts below testPortHigh.
+func pickingRange(ephemeralStart int, known bool) (low, high int) {
+	high = testPortHigh
+	if known && ephemeralStart < high {
+		high = ephemeralStart
+	}
+	return testPortLow, high
+}
+
 // testPortLockDir is one directory for every test process of this user on
 // the machine. It is under /tmp, not os.TempDir: two sessions can have
 // different TMPDIRs and would then not see each other's locks.
 func testPortLockDir() string {
-	for _, base := range []string{"/tmp", os.TempDir()} {
+	return lockDirUnder("/tmp", os.TempDir())
+}
+
+// lockDirUnder makes the lock directory under the first base that allows
+// it, or returns "" (then only this process's own bookkeeping keeps ports
+// apart).
+func lockDirUnder(bases ...string) string {
+	for _, base := range bases {
 		dir := filepath.Join(base, fmt.Sprintf("%s-%d", testPortLockNS, os.Getuid()))
 		if err := os.MkdirAll(dir, 0o700); err == nil {
 			return dir
@@ -105,10 +119,14 @@ func testPortLockDir() string {
 
 // ephemeralPortStart reads where Linux starts handing out ephemeral ports.
 func ephemeralPortStart() (int, bool) {
-	if runtime.GOOS != "linux" {
+	return portRangeStartFrom(runtime.GOOS, "/proc/sys/net/ipv4/ip_local_port_range")
+}
+
+func portRangeStartFrom(goos, path string) (int, bool) {
+	if goos != "linux" {
 		return 0, false
 	}
-	raw, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}

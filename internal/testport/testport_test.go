@@ -233,3 +233,73 @@ func TestParsePortRangeStart(t *testing.T) {
 		}
 	}
 }
+
+func TestPickingRangeEndsAtALowEphemeralStart(t *testing.T) {
+	for _, tc := range []struct {
+		start    int
+		known    bool
+		wantHigh int
+	}{
+		{start: 32768, known: true, wantHigh: testPortHigh}, // Linux default
+		{start: 0, known: false, wantHigh: testPortHigh},    // macOS: not read
+		{start: 25000, known: true, wantHigh: 25000},        // a host tuned lower
+	} {
+		if low, high := pickingRange(tc.start, tc.known); low != testPortLow || high != tc.wantHigh {
+			t.Errorf("pickingRange(%d, %v) = [%d, %d), want [%d, %d)", tc.start, tc.known, low, high, testPortLow, tc.wantHigh)
+		}
+	}
+}
+
+func TestPortRangeStartFrom(t *testing.T) {
+	path := t.TempDir() + "/ip_local_port_range"
+	if err := os.WriteFile(path, []byte("32768\t60999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := portRangeStartFrom("linux", path); n != 32768 || !ok {
+		t.Fatalf("linux = %d %v, want 32768 true", n, ok)
+	}
+	if _, ok := portRangeStartFrom("darwin", path); ok {
+		t.Fatal("read a Linux-only file on darwin")
+	}
+	if _, ok := portRangeStartFrom("linux", path+".missing"); ok {
+		t.Fatal("a missing file gave a start")
+	}
+}
+
+func TestLockDirUnderSkipsABaseItCannotUse(t *testing.T) {
+	notADir := t.TempDir() + "/file"
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	good := t.TempDir()
+	if dir := lockDirUnder(notADir, good); !strings.HasPrefix(dir, good+"/") {
+		t.Fatalf("lockDirUnder = %q, want a dir under %s", dir, good)
+	}
+	if dir := lockDirUnder(notADir); dir != "" {
+		t.Fatalf("lockDirUnder with no usable base = %q, want \"\"", dir)
+	}
+}
+
+func TestLockPortBlockWithoutTheDirectory(t *testing.T) {
+	if f, ok := lockPortBlock(t.TempDir()+"/gone", 40000); ok {
+		_ = f.Close()
+		t.Fatal("took a block in a directory that does not exist")
+	}
+}
+
+// memberlist binds TCP and UDP on one port, so a port is free for it only
+// when both are.
+func TestLoopbackPortFreeNeedsUDPToo(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	if !loopbackPortFree(port, false) {
+		t.Skipf("port %d is also taken for TCP", port)
+	}
+	if loopbackPortFree(port, true) {
+		t.Fatalf("port %d is held for UDP but reported free for TCP and UDP", port)
+	}
+}
