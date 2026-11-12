@@ -490,7 +490,7 @@ Set these with `--set` or a values file.
 |---|---|---|
 | `worker.runtime.resources` | The sandboxes' budget. Every sandbox runs inside it, and a reserve is kept for containerd. Keep requests equal to limits. | 2 CPUs, 4 GiB |
 | `worker.defaultRuntime` | The isolation a create gets when it names none: `docker` (runc) or `gvisor`. | runc |
-| `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. `"0"` turns it off. | `"0.10"` |
+| `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. Sandboxes already running keep writing, so keep it well above the share where kubelet evicts pods (10% free on EKS) when the sandbox disk is the machine's own disk. `"0"` turns it off. | `"0.20"` |
 | `worker.blockPrivateByDefault` | Sandboxes cannot reach private addresses unless a create allows them. | `true` |
 | `worker.usageMetrics.enabled` | [Usage per team](#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |
 | `worker.egressDenyFloor` | [Addresses no sandbox can ever reach](#tell-aerolvm-your-clusters-addresses), such as the Kubernetes API server. | none |

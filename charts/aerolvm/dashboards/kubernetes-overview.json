@@ -575,7 +575,7 @@
     {
       "type": "timeseries",
       "title": "Sandbox disk used, per worker",
-      "description": "The disk that holds images and sandboxes (AerolVMWorkerDiskHigh at 80%).",
+      "description": "The disk that holds images and sandboxes (AerolVMWorkerDiskHigh at 70%).",
       "id": 13,
       "datasource": {
         "type": "prometheus",
