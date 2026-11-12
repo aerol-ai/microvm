@@ -362,7 +362,7 @@ func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	if pod.Spec.NodeName == "" {
-		r.setState(n, v1.StatePending, "waiting for a machine")
+		r.setState(n, v1.StatePending, waitingForMachine(pod))
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	if !agentReady(pod) {
@@ -432,6 +432,23 @@ func containerImage(pod *corev1.Pod, name string) (string, string) {
 // preflightFailed is the worker preflight's reason when its last run
 // failed: the last line of its termination message, which names each
 // failed check and its fix (sandboxd preflight --pod).
+// waitingForMachine is a Pending node's reason: the scheduler's own word
+// when it found no machine (a server that does not fit its zone's node
+// says "Insufficient cpu" here, on `kubectl get aerolnodes`, instead of
+// only in the pod's events).
+func waitingForMachine(pod *corev1.Pod) string {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable && c.Message != "" {
+			msg := c.Message
+			if len(msg) > 240 {
+				msg = msg[:240] + "..."
+			}
+			return "waiting for a machine: " + msg
+		}
+	}
+	return "waiting for a machine"
+}
+
 func preflightFailed(pod *corev1.Pod) string {
 	for _, cs := range pod.Status.InitContainerStatuses {
 		if cs.Name != PreflightContainer {

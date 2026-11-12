@@ -685,3 +685,30 @@ func TestNodePodMadeAgainKeepsItsVersion(t *testing.T) {
 		t.Fatalf("swapped to %s, state %s", got, g.node(held.Name).Status.State)
 	}
 }
+
+// A pod the scheduler cannot place says why on its AerolNode, so `kubectl
+// get aerolnodes` shows "Insufficient cpu" instead of a bare Pending.
+func TestNodePendingSaysWhy(t *testing.T) {
+	c := bootstrapped(testCluster())
+	g := newNodeRig(t, c, node("prod-general-jjjjj", v1.RoleWorker, "general", "z-a"))
+	g.reconcile("prod-general-jjjjj") // makes the pod
+	g.reconcile("prod-general-jjjjj")
+	if n := g.node("prod-general-jjjjj"); n.Status.State != v1.StatePending || n.Status.Reason != "waiting for a machine" {
+		t.Fatalf("before the scheduler says anything: %+v", n.Status)
+	}
+	p := g.pod(testWorkerNS, "prod-general-jjjjj")
+	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+		Message: "0/6 nodes are available: 1 Insufficient cpu, 5 node(s) didn't match Pod's node affinity/selector."}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile("prod-general-jjjjj")
+	if n := g.node("prod-general-jjjjj"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "Insufficient cpu") {
+		t.Fatalf("unschedulable pod: %+v", n.Status)
+	}
+	long := &corev1.Pod{Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+		Reason: corev1.PodReasonUnschedulable, Message: strings.Repeat("x", 500)}}}}
+	if got := waitingForMachine(long); len(got) > 300 || !strings.HasSuffix(got, "...") {
+		t.Fatalf("a long message is not cut: %d chars", len(got))
+	}
+}
