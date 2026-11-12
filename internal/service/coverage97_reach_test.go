@@ -161,7 +161,9 @@ func TestCoverage97SpecWriteThrough(t *testing.T) {
 		t.Fatalf("resize = %v", err)
 	}
 
-	cov97Seed(t, st, &models.Sandbox{ID: "sb-life", Image: "alpine", Status: models.SandboxStatusStopped})
+	// Failover=recreate: only such a sandbox writes its lifecycle through.
+	cov97Seed(t, st, &models.Sandbox{ID: "sb-life", Image: "alpine", Status: models.SandboxStatusStopped,
+		Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}})
 	svc.cluster = &cov97SpecCluster{Noop: &cluster.Noop{}, onUpsert: func() {
 		_ = st.Delete(ctx, "sb-life")
 	}}
