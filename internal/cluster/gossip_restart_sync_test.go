@@ -3,7 +3,6 @@ package cluster
 import (
 	"crypto/rand"
 	"fmt"
-	"net"
 	"testing"
 	"time"
 
@@ -16,22 +15,7 @@ import (
 // one, so ":0" will not do.
 func freeGossipPort(t *testing.T) int {
 	t.Helper()
-	for range 50 {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		port := l.Addr().(*net.TCPAddr).Port
-		_ = l.Close()
-		u, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
-		if err != nil {
-			continue
-		}
-		_ = u.Close()
-		return port
-	}
-	t.Fatal("no loopback port free for both TCP and UDP")
-	return 0
+	return reserveTestPort(t, true)
 }
 
 type restartGossipNode struct {
