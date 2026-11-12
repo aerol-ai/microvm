@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 7 releases : v0.6.9 to v0.7.1
+    November 2026 : 8 releases : v0.6.9 to v0.7.2
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 2 | Nov 10, 2026 to Nov 11, 2026 | [v0.7.1](#v071-aerolvm-on-kubernetes) |
+| [0.7](#07-release-line) | 3 | Nov 10, 2026 to Nov 12, 2026 | [v0.7.2](#v072-aerolvm-clusters-on-kubernetes) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,29 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.2: AerolVM clusters on Kubernetes
+
+*November 12, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.2)
+
+AerolVM can now run as a full cluster on Kubernetes: three servers across three zones, gateways, and worker pools that grow and shrink, all managed by the new AerolVM operator. This release also makes failover smarter on every cluster.
+
+- **Cluster mode on Kubernetes.** `helm install` with `mode: cluster` starts the AerolVM operator. It makes the servers, gateways and workers from an `AerolCluster`, replaces a worker whose machine is gone, and upgrades the cluster node by node when you change `spec.version`, with pause and rollback. See "Kubernetes cluster mode" in the docs.
+- **A planned restart is not a death.** A node that stops cleanly (a service restart, an upgrade, a pod restart) tells the cluster first. The cluster waits up to two minutes for it before moving its sandboxes, and a leading server hands the lead over before it stops. A crash still gets the usual 30 seconds.
+- **Zones.** New sandboxes spread across zones by free room, failover avoids the zone that just failed, and secret backups go to other zones than the owner's.
+- **Faster failover for a machine that is gone.** When the operator sees a worker's machine leave, the leader can start that worker's failover at its ownership lease limit (about 16 seconds) instead of after the grace, when it can prove the worker's sandboxes are frozen by then.
+- **Decommission a worker safely.** `aerolvm drain --evacuate` moves recreate-policy sandboxes off a worker before it goes, and tells the owners of the others.
+- **Per-team usage.** Each worker exports CPU and memory counters per owner (used and reserved) on `/v1/metrics`, with a dashboard for splitting the cost.
+- **Sandboxes stay off the cluster network.** On Kubernetes the operator keeps sandboxes away from the API server and the cluster's pod and Service ranges, and NetworkPolicies wall in the workers, servers, gateways and operator.
+- **Proof for audits.** `aerolvm k8s verify` checks every promise of a running install (privilege, Pod Security, network walls, the IMDS hop limit, egress, signatures), and the chart ships an evidence pack, alerts, runbooks and dashboards.
+- **Day-2 tools in a pod.** `sandboxd backup`, `restore` and `recover-quorum` work in a Kubernetes server pod held in maintenance mode.
+
+**Before you upgrade:**
+
+- **Plain VM clusters:** a planned stop of a node now waits up to two minutes (`SB_CLUSTER_RESTART_WINDOW`) before its sandboxes fail over. A crash is unchanged.
+- **Zone rules are on by default.** A cluster whose nodes have no zone, or all the same one, places sandboxes as before.
+- **Upgrade servers first.** Operator-driven upgrade steps and the new rollout record need every Raft server on this version; until then an operator-driven node is upgraded by hand, as before.
+- **Not built yet:** node certificates from your own CA through cert-manager (`security.externalCA` is refused with a reason).
 
 ### v0.7.1: AerolVM on Kubernetes
 
