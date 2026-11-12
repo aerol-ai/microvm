@@ -804,13 +804,14 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
-	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
-	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
-	now := time.Now().Unix()
 	owners := make([]string, 0, len(reservations))
 	for _, r := range reservations {
 		owners = append(owners, r.OwnerNodeID)
 	}
+	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
+	// Only the owners': the check reads no other member.
+	members := c.withCatalogueTemplateHolders(c.membersWithCapacityFor(owners), templateIDs...)
+	now := time.Now().Unix()
 	// Committed pending load plus the ledger's in-flight holds (E2), then the
 	// load promoted or failed over since the owner's last heartbeat (C7).
 	reserved, reservedRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())

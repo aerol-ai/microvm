@@ -51,3 +51,40 @@ func BenchmarkSelectPlacementFleet(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkAdmitReservationFleet times the leader's check of one
+// reservation at fleet sizes up to past G3's 500 workers. It read every
+// member and its capacity lease; it reads the owner's now, so the cost is
+// flat (C18, bench-full-4).
+//
+//	go test -run '^$' -bench BenchmarkAdmitReservationFleet ./internal/cluster/
+func BenchmarkAdmitReservationFleet(b *testing.B) {
+	for _, n := range []int{100, 500, 2000} {
+		b.Run(fmt.Sprintf("workers=%d", n), func(b *testing.B) {
+			c := sampledFleet(n, nil, nil)
+			cmd := reserveOn("sb-bench", "worker-0001")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := c.admitReservationCommand(cmd); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkOwnerLookupFleet times the member read behind every owner
+// lookup the leader answers (OwnerOf, then peerInternalURL).
+func BenchmarkOwnerLookupFleet(b *testing.B) {
+	for _, n := range []int{100, 500, 2000} {
+		b.Run(fmt.Sprintf("workers=%d", n), func(b *testing.B) {
+			c := sampledFleet(n, nil, nil)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_ = c.gossip.peerInternalURL("worker-0001")
+			}
+		})
+	}
+}
