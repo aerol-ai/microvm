@@ -35,6 +35,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 name="${1:?usage: cell.sh <name> [up|build|install|preflight|chaos|verify|down|all]}"
 step="${2:-all}"
 HELM="${HELM:-helm}"
+# verify checks a release's image signatures with cosign: without it the run
+# makes a cluster only to fail at its last step.
+if [[ -n "${AEROL_RELEASE:-}" && "$step" != down ]] && ! command -v cosign >/dev/null; then
+  echo "cell.sh: AEROL_RELEASE needs cosign on PATH for verify's signature check" >&2
+  exit 2
+fi
 # The same cert-manager as `make k8s-dev`, checked by its digest.
 CERT_MANAGER_VERSION=v1.21.3
 CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
