@@ -403,9 +403,12 @@ minutes. Clients get 503 with Retry-After, and the SDKs retry.
 
 ## AerolVMWorkerDiskHigh
 
-**What it means.** A worker has used over 80% of the disk that holds images
-and sandboxes. Below `worker.diskFloorRatio` free (10% by default), it
-refuses new sandboxes with 503.
+**What it means.** A worker has used over 70% of the disk that holds images
+and sandboxes. Below `worker.diskFloorRatio` free (20% by default), it
+refuses new sandboxes with 503. Sandboxes already running keep writing past
+that, up to their own disk size. If the disk is the machine's root disk (the
+default `emptyDir`), kubelet evicts pods below its own line (10% free on
+EKS), and the worker pod uses the most of it.
 
 **Check.**
 

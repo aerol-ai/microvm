@@ -225,17 +225,17 @@ groups:
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmcreatesrefusednoroom"
 
       # C27: a worker's sandbox volume is filling. At worker.diskFloorRatio
-      # free it refuses new creates; this fires well before.
+      # free (20% by default) it refuses new creates; this fires well before.
       - alert: AerolVMWorkerDiskHigh
         expr: |
-          (1 - aerolvm_host_pressure_sandbox_disk_free_mb{aerolvm_component="worker"} / aerolvm_host_pressure_sandbox_disk_total_mb{aerolvm_component="worker"}) > 0.8
+          (1 - aerolvm_host_pressure_sandbox_disk_free_mb{aerolvm_component="worker"} / aerolvm_host_pressure_sandbox_disk_total_mb{aerolvm_component="worker"}) > 0.7
           and aerolvm_host_pressure_sandbox_disk_total_mb{aerolvm_component="worker"} > 0
         for: 10m
         labels:
           severity: warning
           component: capacity
         annotations:
-          summary: "Worker {{ $labels.namespace }}/{{ $labels.pod }} has used over 80% of its sandbox disk"
+          summary: "Worker {{ $labels.namespace }}/{{ $labels.pod }} has used over 70% of its sandbox disk"
           description: "The disk that holds images and sandboxes is {{ $value | humanizePercentage }} full. Below worker.diskFloorRatio free, the worker refuses new sandboxes with 503."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmworkerdiskhigh"
 
