@@ -766,6 +766,11 @@ drill_rotation() {
   local run="rot-$RANDOM" ng lt latest new upd st t0
   api create --run "$run" --n 6 --recreate >/dev/null && api create --run "$run-p" --n 3 >/dev/null
   api wait --run "$run" --n 6 >/dev/null && api wait --run "$run-p" --n 3 >/dev/null || { result FAIL rotation "sandboxes did not start"; return; }
+  # The IDs before the rotation: one that is gone afterwards must count as
+  # gone, not drop out of a list made afterwards.
+  local recreate_ids plain_ids
+  recreate_ids="$(api list --run "$run" | jq -r '.[].id')"
+  plain_ids="$(api list --run "$run-p" | jq -r '.[].id')"
   ng="$(awsr eks list-nodegroups --cluster-name "$DRILL_EKS_CLUSTER" --query 'nodegroups[?starts_with(@, `worker-`)] | [0]' --output text)"
   local rel0
   rel0="$(awsr eks describe-nodegroup --cluster-name "$DRILL_EKS_CLUSTER" --nodegroup-name "$ng" --query nodegroup.releaseVersion --output text)"
@@ -800,11 +805,11 @@ drill_rotation() {
   # Every recreate sandbox moved and running; every other one stopped (its
   # owner was told), or gone with its machine; none just missing.
   local moved=0 kept_running=0 stopped=0 missing=0 id status
-  for id in $(api list --run "$run" | jq -r '.[].id'); do
+  for id in $recreate_ids; do
     status="$(api get "$id" | jq -r '.status // "missing"')"
     [[ "$status" == started ]] && moved=$((moved + 1))
   done
-  for id in $(api list --run "$run-p" | jq -r '.[].id'); do
+  for id in $plain_ids; do
     status="$(api get "$id" | jq -r '.status // "missing"')"
     case "$status" in stopped) stopped=$((stopped + 1)) ;; started) kept_running=$((kept_running + 1)) ;; *) missing=$((missing + 1)) ;; esac
   done
