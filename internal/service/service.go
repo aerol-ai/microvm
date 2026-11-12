@@ -5257,12 +5257,10 @@ func (s *Service) writeLifecycleLocked(ctx context.Context, id string, l models.
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
 		return nil, false, err
 	}
-	lc := l
 	// Only a failover recreate reads the replicated lifecycle back; a
-	// keep-alive (E2B setTimeout) on any other sandbox costs no Raft write.
-	s.replicateRecoverySpecPatch(ctx, id, priorSandbox, func(spec *models.CreateSandboxRequest) {
-		spec.Lifecycle = &lc
-	})
+	// keep-alive (E2B setTimeout) on any other sandbox costs no Raft write,
+	// and on a failover sandbox about one a minute.
+	s.replicateRecoveryLifecycle(ctx, id, priorSandbox, l)
 	updated, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, false, err
