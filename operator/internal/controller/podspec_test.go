@@ -174,6 +174,20 @@ func TestStampWorkerAndGateway(t *testing.T) {
 	if err != nil || env(gw.Spec.Containers[0], "SB_NODE_ROLE") != "ingress" {
 		t.Fatalf("gateway = %v %v", gw, err)
 	}
+	// The join Secret is deleted once the node serves: a required volume
+	// made kubelet report FailedMount for the pod's life, and a pod set up
+	// again (a machine restart) could not start. Every role's is optional.
+	for _, p := range []*corev1.Pod{pod, gw} {
+		var join *corev1.SecretVolumeSource
+		for _, v := range p.Spec.Volumes {
+			if v.Name == JoinVolume {
+				join = v.Secret
+			}
+		}
+		if join == nil || join.Optional == nil || !*join.Optional {
+			t.Fatalf("%s join volume = %+v, want optional", p.Name, join)
+		}
+	}
 	if _, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{Cluster: c, Node: node("x", "nope", "", "z-a"), Namespace: testNS}); err == nil {
 		t.Fatal("unknown role accepted")
 	}

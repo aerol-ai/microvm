@@ -205,6 +205,51 @@ func TestGatewayServicePorts(t *testing.T) {
 	}
 }
 
+// A leader that refuses the rollout: the AerolCluster gets a Warning with
+// its reason, and no "upgrading" event, until the rollout starts.
+func TestClusterUpgradeNotStartedSaysWhy(t *testing.T) {
+	c := bootstrapped(testCluster())
+	r, api, cl := clusterRig(t, c)
+	reconcileCluster(t, r) // makes the nodes
+	var list v1.AerolNodeList
+	if err := cl.List(context.Background(), &list); err != nil {
+		t.Fatal(err)
+	}
+	for i := range list.Items {
+		list.Items[i].Status.State, list.Items[i].Status.Version = v1.StateServing, "v0.7.1"
+		if err := cl.Status().Update(context.Background(), &list.Items[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := r.Recorder.(*record.FakeRecorder).Events
+	drain := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
+	drain()
+	api.applyErr = errors.New("aerolvm: 400 bad_request: files has no sandboxd for linux/arm64")
+	reconcileCluster(t, r)
+	got := strings.Join(drain(), "\n")
+	if !strings.Contains(got, "Warning UpgradeNotStarted the upgrade from v0.7.1 to v0.7.2 did not start: aerolvm: 400 bad_request: files has no sandboxd") {
+		t.Fatalf("events after a refusal:\n%s", got)
+	}
+	if strings.Contains(got, "Normal Upgrade ") {
+		t.Fatalf("an upgrading event for an upgrade that did not start:\n%s", got)
+	}
+	api.applyErr = nil
+	reconcileCluster(t, r)
+	if got := strings.Join(drain(), "\n"); !strings.Contains(got, "Normal Upgrade upgrading from v0.7.1 to v0.7.2") || strings.Contains(got, "UpgradeNotStarted") {
+		t.Fatalf("events once the rollout starts:\n%s", got)
+	}
+}
+
 // Upgrades: spec.version moves, the operator starts the images rollout,
 // marks each node's turn, and rolls back when the version goes back.
 func TestClusterUpgradeFlow(t *testing.T) {

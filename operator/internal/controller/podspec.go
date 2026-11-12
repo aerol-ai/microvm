@@ -328,10 +328,17 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		// By key, so the pod gets exactly the three things a join needs,
 		// and aerolvm k8s verify can see that (it cannot read Secrets).
 		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
-			// Optional for a server: one made again keeps its identity on
-			// its disk and its setup needs no token (createPod).
+			// Optional for every role. The Secret is deleted once the node
+			// serves (its token is single-use), and a pod that has joined
+			// never reads it again: setup stops at "cluster files already
+			// here". Required, kubelet failed to mount it every minute or
+			// so for the pod's whole life (FailedMount), and a pod it sets
+			// up again, after a machine restart, would wait for it forever.
+			// A server made again keeps its identity on its disk (createPod
+			// makes it without a token); any other pod is made only once
+			// its token's Secret exists.
 			Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(n.Name), DefaultMode: ptr[int32](0o400),
-				Optional: ptr(n.Spec.Role == v1.RoleServer),
+				Optional: ptr(true),
 				Items:    []corev1.KeyToPath{{Key: "join_url", Path: "join_url"}, {Key: "token", Path: "token"}, {Key: "ca_cert_hash", Path: "ca_cert_hash"}}},
 		}})
 	}

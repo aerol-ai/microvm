@@ -44,6 +44,7 @@ type fakeAPI struct {
 	deleteErr  error
 	rollout    *upgradewire.Rollout
 	rolloutErr error
+	applyErr   error
 	applied    []string
 	rolledBack int
 }
@@ -100,6 +101,9 @@ func (f *fakeAPI) Rollout(context.Context) (*upgradewire.Rollout, error) {
 }
 func (f *fakeAPI) ApplyImages(_ context.Context, v string, _ upgradewire.ApplyRequest) (*upgradewire.Rollout, error) {
 	f.applied = append(f.applied, v)
+	if f.applyErr != nil {
+		return nil, f.applyErr
+	}
 	return &upgradewire.Rollout{TargetVersion: v, State: upgradewire.StateRunning}, nil
 }
 func (f *fakeAPI) Rollback(context.Context) error {
