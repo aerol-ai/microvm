@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/hashicorp/memberlist"
 )
 
@@ -15,7 +16,7 @@ import (
 // one, so ":0" will not do.
 func freeGossipPort(t *testing.T) int {
 	t.Helper()
-	return reserveTestPort(t, true)
+	return testport.Reserve(t, true)
 }
 
 type restartGossipNode struct {

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -188,7 +189,7 @@ func dialBackListeners(t *testing.T, n int) []int {
 // nothing binds a port by itself, so it stays closed.
 func closedPort(t *testing.T) int {
 	t.Helper()
-	return reserveTestPort(t, false)
+	return testport.Reserve(t, false)
 }
 
 // joinClient talks to a join port as a new machine does before it trusts
