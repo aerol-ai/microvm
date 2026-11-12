@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 // TestDialL4UpstreamRetriesOnConnRefused: the kernel returns ECONNREFUSED
@@ -19,12 +21,7 @@ import (
 // sandbox is waking.
 func TestDialL4UpstreamRetriesOnConnRefused(t *testing.T) {
 	// Reserve a port without listening, so dials get ECONNREFUSED.
-	scout, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("scout listen: %v", err)
-	}
-	addr := scout.Addr().String()
-	_ = scout.Close()
+	addr := testport.Addr(t)
 
 	// Start the real listener ~150ms later, modelling the cold-start
 	// gap between Docker reporting "running" and the user's process
@@ -67,14 +64,9 @@ func TestDialL4UpstreamRetriesOnConnRefused(t *testing.T) {
 // ECONNREFUSED rather than swallow it as a deadline error so the
 // "dial l4 wake upstream failed" log line stays diagnostic.
 func TestDialL4UpstreamReturnsLastErrOnTimeout(t *testing.T) {
-	scout, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("scout: %v", err)
-	}
-	addr := scout.Addr().String()
-	_ = scout.Close()
+	addr := testport.Addr(t) // nothing listens here
 
-	_, err = dialL4Upstream(context.Background(), addr, 200*time.Millisecond)
+	_, err := dialL4Upstream(context.Background(), addr, 200*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -87,18 +79,13 @@ func TestDialL4UpstreamReturnsLastErrOnTimeout(t *testing.T) {
 // context must surface immediately — the readiness retry must not
 // keep dialling against a dead caller.
 func TestDialL4UpstreamBailsOnCancelledContext(t *testing.T) {
-	scout, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("scout: %v", err)
-	}
-	addr := scout.Addr().String()
-	_ = scout.Close()
+	addr := testport.Addr(t) // nothing listens here
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	start := time.Now()
-	_, err = dialL4Upstream(ctx, addr, 5*time.Second)
+	_, err := dialL4Upstream(ctx, addr, 5*time.Second)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

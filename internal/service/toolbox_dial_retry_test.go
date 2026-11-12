@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 // dialRetryToolbox is a toolbox port nothing listens on yet. start makes
@@ -29,13 +31,8 @@ type dialRetryToolbox struct {
 
 func newDialRetryToolbox(t *testing.T, handler http.Handler) *dialRetryToolbox {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
-	return &dialRetryToolbox{t: t, port: port, handler: handler}
+	// The toolbox binds this port later; testport keeps it free till then.
+	return &dialRetryToolbox{t: t, port: testport.Reserve(t, false), handler: handler}
 }
 
 func (tb *dialRetryToolbox) start() {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/hashicorp/raft"
 )
 
@@ -57,7 +58,7 @@ func TestRaftAdvertiseAddr(t *testing.T) {
 // localhost:<port>, a name, as a Kubernetes server pod would be.
 func raftNodeNamed(t *testing.T, id string, bootstrap, withTLS bool) (*raftNode, string) {
 	t.Helper()
-	port := reserveTestPort(t, false)
+	port := testport.Reserve(t, false)
 	name := fmt.Sprintf("localhost:%d", port)
 	cfg := raftSetupConfig{
 		NodeID:           id,

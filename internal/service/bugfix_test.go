@@ -18,6 +18,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -48,13 +49,9 @@ func TestProbeContainerPortSucceeds(t *testing.T) {
 // TestProbeContainerPortRefused verifies that connection refused is returned
 // when nothing is listening on the target port.
 func TestProbeContainerPortRefused(t *testing.T) {
-	// Bind then immediately close to guarantee the port is free.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
+	// A reserved port nothing binds. A ":0" port, closed again, could be
+	// taken by another socket before the probe dials it.
+	addr := testport.Addr(t)
 
 	host, portStr, _ := net.SplitHostPort(addr)
 	port, err := strconv.Atoi(portStr)

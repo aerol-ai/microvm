@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/hashicorp/raft"
 )
 
@@ -300,11 +301,11 @@ func newTestClusterFromConfig(t *testing.T, cfg config.Config) (*Cluster, func()
 }
 
 // pickFreeTCPPort returns an unused loopback port for the caller to bind
-// later. It comes from below the ephemeral range (reserveTestPort), so no
+// later. It comes from below the ephemeral range (testport.Reserve), so no
 // ":0" listener or outgoing connection takes it in between.
 func pickFreeTCPPort(t *testing.T) int {
 	t.Helper()
-	return reserveTestPort(t, false)
+	return testport.Reserve(t, false)
 }
 
 // waitForLeader blocks until the cluster reports a leader and its placement
