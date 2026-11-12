@@ -666,9 +666,11 @@ func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken
 }
 
 // stopGraceTimeout and stopPollInterval are test seams for Stop's SIGTERM→SIGKILL path.
+// stopDeleteTimeout bounds deleteExitedTask's retries.
 var (
-	stopGraceTimeout = 10 * time.Second
-	stopPollInterval = 100 * time.Millisecond
+	stopGraceTimeout  = 10 * time.Second
+	stopPollInterval  = 100 * time.Millisecond
+	stopDeleteTimeout = 5 * time.Second
 )
 
 func (d *Driver) Stop(ctx context.Context, containerRef string) error {
@@ -689,8 +691,7 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	for time.Now().Before(deadline) {
 		status, statusErr := task.Status(ctx)
 		if statusErr == nil && status.Status != cntr.Running {
-			_, err = task.Delete(ctx)
-			return err
+			return deleteExitedTask(ctx, task)
 		}
 		select {
 		case <-ctx.Done():
@@ -700,6 +701,38 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	}
 	_ = task.Kill(ctx, syscall.SIGKILL)
 	_, err = task.Delete(ctx, cntr.WithProcessKill)
+	return err
+}
+
+// deleteExitedTask deletes a task whose status already left Running. Under
+// gVisor that status can come before runsc has torn the sandbox down, and a
+// delete in between fails with "cannot delete a running container" (Phase 3
+// disk-full drill on EKS: a gVisor sandbox that had just written 3.6 GB). A
+// stop that answers that error fails although its SIGTERM worked: the
+// service then dropped the stop's reason, and the exit that followed was
+// recorded as the sandbox's own (program_exited instead of disk_limit). So
+// the delete is tried again until stopDeleteTimeout, a task already gone
+// counts as deleted, and the last try kills what is left.
+func deleteExitedTask(ctx context.Context, task cntr.Task) error {
+	deadline := time.Now().Add(stopDeleteTimeout)
+	for {
+		_, err := task.Delete(ctx)
+		if err == nil || errdefs.IsNotFound(err) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(stopPollInterval):
+		}
+	}
+	_, err := task.Delete(ctx, cntr.WithProcessKill)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
 	return err
 }
 
