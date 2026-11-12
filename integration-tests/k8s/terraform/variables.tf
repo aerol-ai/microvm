@@ -56,3 +56,48 @@ variable "karpenter" {
   type        = bool
   default     = false
 }
+
+# --- The Phase 2 cell (cell.sh): three zones, servers and gateways on the
+# system nodes, workers whose machines keep IMDS out of pods' reach. The
+# defaults keep the Phase 0 shape. ---------------------------------------
+
+variable "zone_count" {
+  description = "Zones to spread subnets and node groups over (2 for the spikes, 3 for the cell)."
+  type        = number
+  default     = 2
+}
+
+variable "system_count" {
+  description = "System nodes: CoreDNS for the spikes; the cell also puts its servers, gateways and operator there."
+  type        = number
+  default     = 1
+}
+
+variable "system_instance_type" {
+  type    = string
+  default = "t3.medium"
+}
+
+variable "worker_imds_hop_limit" {
+  description = "IMDS hop limit on worker machines, with IMDSv2 required; 0 keeps the node group's default. The cell sets 1, which aerolvm k8s verify checks (C24)."
+  type        = number
+  default     = 0
+}
+
+variable "ebs_csi" {
+  description = "Add the EBS CSI driver, for the cell's server disks."
+  type        = bool
+  default     = false
+}
+
+variable "ecr_repos" {
+  description = "ECR repositories for images built inside the cluster (the cell's dev images). Deleted with the cluster, images and all."
+  type        = list(string)
+  default     = []
+}
+
+variable "network_policy" {
+  description = "Manage the VPC CNI add-on with network policy turned on, so the chart's NetworkPolicies are enforced (the cell). Off, they are ignored."
+  type        = bool
+  default     = false
+}

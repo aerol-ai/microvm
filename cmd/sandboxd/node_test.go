@@ -41,6 +41,7 @@ func withNodeSeams(t *testing.T, root bool) nodejoin.Paths {
 		DropIn: filepath.Join(dir, "cluster.conf"), TLSDir: filepath.Join(dir, "tls"), CADir: filepath.Join(dir, "ca"),
 		RaftDir: filepath.Join(dir, "raft"), StateDir: dir, AdminContext: filepath.Join(dir, "admin-context.json"),
 		CgroupRoot: dir, KVMDevice: filepath.Join(dir, "kvm"),
+		OSRelease: filepath.Join(dir, "osrelease"), BridgeNF: filepath.Join(dir, "bridge-nf-call-iptables"),
 	}
 	if err := os.WriteFile(p.EnvFile, []byte("SB_PAT_TOKEN=p\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -88,6 +89,8 @@ func TestNodeCommandsUsage(t *testing.T) {
 		{"preflight", []string{"-o", "yaml"}, "-o must be text or json"},
 		{"preflight", []string{"--join", "https://x"}, "--join and --token go together"},
 		{"preflight", []string{"--role", "boss"}, "--role must be server, worker or ingress"},
+		{"preflight", []string{"--kvm"}, "--kvm goes with --pod"},
+		{"preflight", []string{"--pod", "--join", "https://x", "--token", "t"}, "leave out --join"},
 		{"reset", nil, "run it again with --yes"},
 		{"join-command", []string{"extra"}, "unexpected argument"},
 	}
@@ -114,6 +117,25 @@ func TestNodeCommandsRun(t *testing.T) {
 	}
 	if code != 0 || json.Unmarshal([]byte(out), &report) != nil || !report.OK {
 		t.Fatalf("preflight -o json = %d %s", code, out)
+	}
+	// --pod: the worker pod's checks. This machine has cgroup v2 but no
+	// kernel version file and no br_netfilter: exit 1, one summary line last.
+	code, out, _ = runNode("preflight", "--pod")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if last := lines[len(lines)-1]; code != 1 || !strings.HasPrefix(last, "preflight failed: kernel: ") || !strings.Contains(last, "br_netfilter: ") {
+		t.Fatalf("preflight --pod = %d\n%s", code, out)
+	}
+	if err := os.WriteFile(p.OSRelease, []byte("6.1.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.BridgeNF, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ = runNode("preflight", "--pod"); code != 0 || strings.Contains(out, "preflight failed") {
+		t.Fatalf("preflight --pod on a good machine = %d\n%s", code, out)
+	}
+	if code, out, _ = runNode("preflight", "--pod", "--kvm", "-o", "json"); code != 1 || !strings.Contains(out, `"ok": false`) {
+		t.Fatalf("preflight --pod --kvm with no /dev/kvm = %d\n%s", code, out)
 	}
 	// A join server that isn't there fails the check: exit 1.
 	tok, _ := cluster.GenerateJoinToken()

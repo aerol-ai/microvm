@@ -42,7 +42,12 @@ type containerStatsResponse struct {
 // is subtracted so page cache does not inflate the figure.
 func (c *Client) ContainerStats(ctx context.Context, containerRef string) (ContainerStat, error) {
 	var resp containerStatsResponse
-	query := url.Values{"stream": {"false"}}
+	// one-shot=true: with stream=false alone, Docker waits about a second
+	// to take a second reading for precpu_stats, which this never reads. The
+	// usage exporter (C20) calls this for every Docker sandbox on each
+	// sample, so a second per call would not fit. A Docker older than API
+	// 1.41 ignores the parameter and answers as before.
+	query := url.Values{"stream": {"false"}, "one-shot": {"true"}}
 	path := "/containers/" + url.PathEscape(containerRef) + "/stats"
 	if err := c.doJSON(ctx, http.MethodGet, path, query, nil, nil, &resp); err != nil {
 		return ContainerStat{}, err

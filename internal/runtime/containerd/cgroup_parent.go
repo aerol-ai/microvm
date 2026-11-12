@@ -64,6 +64,20 @@ func (d *Driver) sandboxCgroupPath(id string) string {
 	return path.Join(d.cfg.CgroupParent, id)
 }
 
+// SandboxCgroup names the cgroup a sandbox's task runs in, for the usage
+// exporter (runtime.CgroupLocator, C20). With a parent it is where
+// cgroupSpecOpts put it; with none it is containerd's default,
+// /<namespace>/<id>. containerRef is the containerd container id: for a
+// sandbox taken from the warm pool, that is its slot's id, the group it was
+// parked in. Naming it costs no call to containerd, so a sample of a
+// thousand sandboxes adds no load there.
+func (d *Driver) SandboxCgroup(containerRef string) string {
+	if d.cfg.CgroupParent != "" {
+		return d.sandboxCgroupPath(containerRef)
+	}
+	return path.Join("/", d.cfg.Namespace, containerRef)
+}
+
 // markWholeOOMVictim makes a started sandbox the kernel's choice, whole,
 // when its pod runs out of memory (Kubernetes Phase 0, finding F10). It runs
 // right after each task start (create, restart and warm-pool park), since a

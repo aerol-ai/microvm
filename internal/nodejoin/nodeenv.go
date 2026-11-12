@@ -153,12 +153,15 @@ func pickNodeID(h Host, asked string) (string, error) {
 }
 
 // pickAdvertise is --advertise, else the default route's source address.
+// A DNS name is allowed: a server pod on Kubernetes advertises the stable
+// name its headless Service gives it, since its IP changes when it moves
+// (C4). Raft keeps the name; gossip resolves it at each start.
 func pickAdvertise(h Host, asked string) (string, error) {
-	if ip := strings.TrimSpace(asked); ip != "" {
-		if net.ParseIP(ip) == nil {
-			return "", fmt.Errorf("--advertise %q is not an IP address", ip)
+	if addr := strings.TrimSpace(asked); addr != "" {
+		if net.ParseIP(addr) == nil && !validDNSName(addr) {
+			return "", fmt.Errorf("--advertise %q is not an IP address or a DNS name", addr)
 		}
-		return ip, nil
+		return addr, nil
 	}
 	ip, err := h.PrimaryIP()
 	if err != nil {
@@ -233,4 +236,24 @@ type AddressOptions struct {
 	APIAdvertiseURL        string
 	DataPlaneAdvertiseHost string
 	IngressAdvertiseHost   string
+}
+
+// validDNSName reports whether s is a lower-case DNS name (RFC 1123): dot
+// separated labels of letters, digits and '-', each 1-63 long and not
+// starting or ending with '-', 253 characters at most.
+func validDNSName(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }

@@ -1,3 +1,4 @@
+{{- if eq .Values.mode "single" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -28,4 +29,5 @@ spec:
   ports:
     - { name: https, port: 443, targetPort: https }
     - { name: http, port: 80, targetPort: http }
+{{- end }}
 {{- end }}

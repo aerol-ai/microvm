@@ -15,10 +15,21 @@
 # Custom domains keep Caddy's on-demand TLS: sandboxd installs that policy
 # over the admin API, as on a VM. Their certificates live in /data, an
 # emptyDir, so they are issued again after the pod is replaced.
+{{- $namespaces := list .Release.Namespace }}
+{{- if and (eq .Values.mode "cluster") (ne .Values.cluster.workerNamespace .Release.Namespace) }}
+{{- /* Worker pods mount it too, and a ConfigMap volume is namespaced. */}}
+{{- $namespaces = append $namespaces .Values.cluster.workerNamespace }}
+{{- end }}
+{{- range $i, $ns := $namespaces }}
+{{- with $ }}
+{{- if $i }}
+---
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "aerolvm.name" . }}-edge
+  namespace: {{ $ns }}
   labels:
     {{- include "aerolvm.labels" . | nindent 4 }}
 data:
@@ -49,4 +60,6 @@ data:
     		close
     	}
     }
+{{- end }}
+{{- end }}
 {{- end }}

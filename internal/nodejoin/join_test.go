@@ -320,7 +320,7 @@ func TestJoinArgumentsAndMachine(t *testing.T) {
 		{"a bad token", func(_ *joinRig, o *JoinOptions) { o.Token = "nope" }, "join token must look like"},
 		{"a bad node ID", func(_ *joinRig, o *JoinOptions) { o.NodeID = "-bad" }, "node ID"},
 		{"no host name", func(r *joinRig, _ *JoinOptions) { r.host.hostname = "" }, "--node-id"},
-		{"a bad advertise", func(_ *joinRig, o *JoinOptions) { o.Advertise = "nope" }, "not an IP"},
+		{"a bad advertise", func(_ *joinRig, o *JoinOptions) { o.Advertise = "no pe" }, "not an IP address or a DNS name"},
 		{"no address", func(r *joinRig, _ *JoinOptions) { r.host.ip = "" }, "--advertise"},
 		{"address lookup fails", func(r *joinRig, _ *JoinOptions) { r.host.ipErr = errors.New("no route") }, "no route"},
 		{"an unreadable node key", func(r *joinRig, _ *JoinOptions) { mustWrite(t, nodeKeyFile(r.paths.TLSDir), "garbage") }, "no PEM private key"},

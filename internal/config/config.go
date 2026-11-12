@@ -137,6 +137,9 @@ type Config struct {
 	// commands over the API. Default true, false in enterprise mode unless
 	// set (remote_upgrade.go).
 	RemoteUpgrade bool
+	// UpgradeDriver is SB_UPGRADE_DRIVER: empty, or "operator" when the
+	// Kubernetes operator upgrades this node (remote_upgrade.go).
+	UpgradeDriver string
 	// UpgradeServeMBPS is SB_UPGRADE_SERVE_MBPS: the cap, in MB/s, on the
 	// release-file copies one server serves to other nodes during a
 	// rollout (CEO D15). Default DefaultUpgradeServeMBPS.
@@ -327,6 +330,21 @@ type Config struct {
 	// (SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, plans/agent-sandbox-feature-parity.md
 	// T4). A create that sets any policy keeps its own. Off by default.
 	EgressBlockPrivateByDefault bool
+	// EgressDenyFloorCIDRs are addresses no sandbox may reach, whatever its
+	// policy or egress profile allows: they join the cloud metadata
+	// endpoints on the deny floor of every runtime (the host firewall, the
+	// egress gateway, and the WASM and isolate dial guards). On Kubernetes
+	// the API server's addresses go here (SB_EGRESS_DENY_FLOOR_CIDRS,
+	// plans/kubernetes-v2-architecture.md C24). Default empty.
+	EgressDenyFloorCIDRs []netip.Prefix
+	// EgressPrivateDefaultCIDRs are ranges treated like RFC 1918: a sandbox
+	// with no egress policy cannot reach them, and a policy opens one only
+	// with an allow entry for it, so a bank can open one range on purpose.
+	// On Kubernetes the cluster's pod, Service and node ranges go here; a
+	// cluster may use ranges outside RFC 1918
+	// (SB_EGRESS_PRIVATE_DEFAULT_CIDRS, C24). Needs
+	// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT. Default empty.
+	EgressPrivateDefaultCIDRs []netip.Prefix
 	// CreatePolicyFile is the operator's create policy
 	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
 	// registries and runtimes, size limits, non-root and GPU rules, checked
@@ -642,6 +660,16 @@ type Config struct {
 	OTELMetricsEnabled  bool
 	OTELMetricsEndpoint string
 	OTELMetricsInterval time.Duration
+	// UsageMetricsEnabled adds per-owner usage counters to /v1/metrics
+	// (plans/kubernetes-v2-architecture.md, C20): each running sandbox's CPU
+	// and memory limit times the time it ran (the charge), and the CPU and
+	// memory measured from its cgroup (shown, never billed). A bank's cost
+	// tool sees one machine-sized worker pod; these counters let it split
+	// that pod's cost by team. Off by default, because owner names become
+	// label values, which an operator should choose to publish; the
+	// Kubernetes chart turns it on. The counters stay on this node and are
+	// sent nowhere. SB_USAGE_METRICS_ENABLED.
+	UsageMetricsEnabled bool
 	// OTELTracesEnabled starts a native OTLP/HTTP trace exporter for API
 	// request spans. It is also enabled automatically when
 	// SB_OTEL_TRACES_ENDPOINT is set.
@@ -1338,6 +1366,14 @@ type Config struct {
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// ClusterRestartWindow is how long the leader waits for a node that
+	// announced a restart on SIGTERM before it moves that node's sandboxes
+	// (SB_CLUSTER_RESTART_WINDOW, default 120s). A planned restart is not a
+	// death: without the notice a clean stop starts the dead-owner grace,
+	// and an agent upgrade that takes longer than it moves every sandbox.
+	// A crash sends no notice and still gets only the grace. 0 turns the
+	// wait off; a window no longer than the grace changes nothing.
+	ClusterRestartWindow time.Duration
 	// OwnershipLeaseFile is where a cluster worker writes its ownership lease
 	// for the runtime supervisor to enforce with sandboxd down
 	// (SB_OWNERSHIP_LEASE_FILE, internal/ownerlease; default empty: not
@@ -2336,6 +2372,7 @@ func load(keyTool bool) (Config, error) {
 		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
 		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		UsageMetricsEnabled:           getEnvBool("SB_USAGE_METRICS_ENABLED", false),
 		OTELTracesEnabled:             getEnvBool("SB_OTEL_TRACES_ENABLED", false),
 		OTELTracesEndpoint:            firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
 		OTELTracesSampleRatio:         getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
@@ -2386,6 +2423,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterRestartWindow:             getEnvDuration("SB_CLUSTER_RESTART_WINDOW", 120*time.Second),
 		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
@@ -2996,6 +3034,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := loadEgressRanges(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {

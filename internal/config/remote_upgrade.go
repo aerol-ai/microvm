@@ -42,8 +42,29 @@ func (cfg *Config) loadRemoteUpgradeConfig() error {
 		mbps = n
 	}
 	cfg.UpgradeServeMBPS = mbps
+	switch d := strings.TrimSpace(os.Getenv("SB_UPGRADE_DRIVER")); d {
+	case "", UpgradeDriverOperator:
+		cfg.UpgradeDriver = d
+	default:
+		return fmt.Errorf("SB_UPGRADE_DRIVER must be empty or %q, got %q", UpgradeDriverOperator, d)
+	}
 	return nil
 }
+
+// UpgradeDriverOperator is SB_UPGRADE_DRIVER=operator: the Kubernetes
+// operator upgrades this node by changing its pod's agent image (C13,
+// plans/kubernetes-v2-architecture.md §13). The node answers the rollout's
+// stage and apply steps with operator_driven, so the leader's walk marks its
+// turn and waits for the operator instead of calling it. On a server it also
+// marks the cluster Kubernetes-managed: `aerolvm upgrade apply` and
+// `rollback` refuse there unless the operator sends them (eng review D6),
+// so AerolCluster.spec.version stays the one place that sets the version.
+// The operator sets it on every pod it makes.
+const UpgradeDriverOperator = "operator"
+
+// UpgradesByOperator reports whether the Kubernetes operator upgrades this
+// node (SB_UPGRADE_DRIVER=operator).
+func (c Config) UpgradesByOperator() bool { return c.UpgradeDriver == UpgradeDriverOperator }
 
 // DefaultUpgradeServeMBPS caps one server's release-file copies at 200 MB/s
 // (CEO D15): Raft keeps its 1-second heartbeat, so copies must never fill a

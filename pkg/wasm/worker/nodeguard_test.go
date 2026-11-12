@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -89,6 +91,83 @@ func TestWorkerNodeAllowedPorts(t *testing.T) {
 	loadNodeAllowedPorts()
 	if got := egresspolicy.NodeAllowedPorts(); len(got) != 0 {
 		t.Fatalf("unset allows none: %v", got)
+	}
+}
+
+// TestWorkerEgressRanges (C24): a worker takes the node's extra deny floor
+// and private ranges and the private-range default from the environment
+// sandboxd starts it with (all survive the allowlist); its decisions then
+// refuse them, for a sandbox with a policy and one with none; and a list it
+// cannot read stops the worker before it serves.
+func TestWorkerEgressRanges(t *testing.T) {
+	prevFloor, prevPrivate := egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges()
+	t.Cleanup(func() { egresspolicy.SetRanges(prevFloor, prevPrivate); blockPrivateNoPolicy.Store(false) })
+	t.Setenv(egresspolicy.DenyFloorEnv, "10.96.0.1")
+	t.Setenv(egresspolicy.PrivateRangesEnv, "198.18.0.0/15")
+	t.Setenv(egresspolicy.BlockPrivateEnv, "true")
+	env := workerEnvironment()
+	for _, name := range []string{egresspolicy.DenyFloorEnv, egresspolicy.PrivateRangesEnv, egresspolicy.BlockPrivateEnv} {
+		if !slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, name+"=") }) {
+			t.Fatalf("the worker environment must carry %s", name)
+		}
+	}
+	if err := loadWorkerGuards(); err != nil {
+		t.Fatal(err)
+	}
+	opened := mustPolicy(t, []string{"10.0.0.0/8", "198.18.4.0/24"}, nil)
+	for _, tc := range []struct {
+		name   string
+		policy *egresspolicy.Policy
+		addr   string
+		reason string // "" = allowed
+	}{
+		{"the floor, under a policy that allows its range", opened, "10.96.0.1:443", egresspolicy.DialReasonDenyFloor},
+		{"the floor, no policy", nil, "10.96.0.1:443", egresspolicy.DialReasonDenyFloor},
+		{"the rest of the range stays shut", opened, "198.18.9.9:443", egresspolicy.DialReasonPrivate},
+		{"the opened part", opened, "198.18.4.20:443", ""},
+		{"an extra range, no policy", nil, "198.18.9.9:443", egresspolicy.DialReasonPrivate},
+		{"RFC 1918, no policy", nil, "10.1.2.3:443", egresspolicy.DialReasonPrivate},
+		{"the internet, no policy", nil, "1.1.1.1:443", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := admission{policy: tc.policy, guard: egresspolicy.DialGuard{}}
+			d := connDest{host: netip.MustParseAddrPort(tc.addr).Addr().String(), port: netip.MustParseAddrPort(tc.addr).Port(), addr: netip.MustParseAddrPort(tc.addr)}
+			if got := admits(a, d); got != (tc.reason == "") {
+				t.Fatalf("admits = %v, want %v", got, tc.reason == "")
+			}
+			if tc.reason == "" {
+				return
+			}
+			var err error
+			if tc.policy == nil {
+				err = openCheck(a.guard, "", d.addr)
+			} else {
+				err = a.guard.Check(tc.policy, egresspolicy.DialTarget{Addr: d.addr})
+			}
+			var de *egresspolicy.DialError
+			if !errors.As(err, &de) || de.Reason != tc.reason {
+				t.Fatalf("err = %v, want %s", err, tc.reason)
+			}
+		})
+	}
+	// With the default off, a no-policy sandbox stays open to private
+	// ranges as before, the floor still shut.
+	t.Setenv(egresspolicy.BlockPrivateEnv, "false")
+	if err := loadWorkerGuards(); err != nil {
+		t.Fatal(err)
+	}
+	if err := openCheck(egresspolicy.DialGuard{}, "", netip.MustParseAddrPort("198.18.9.9:443")); err != nil {
+		t.Fatalf("default off: %v", err)
+	}
+	if err := openCheck(egresspolicy.DialGuard{}, "", netip.MustParseAddrPort("10.96.0.1:443")); err == nil {
+		t.Fatal("default off opened the floor")
+	}
+	t.Setenv(egresspolicy.DenyFloorEnv, "10.96.0.1/12")
+	if err := RunCLI([]string{filepath.Join(t.TempDir(), "w.sock")}); err == nil || !strings.Contains(err.Error(), egresspolicy.DenyFloorEnv) {
+		t.Fatalf("a worker with an unreadable floor: %v", err)
+	}
+	if err := RunCLIResident([]string{filepath.Join(t.TempDir(), "r.sock")}); err == nil || !strings.Contains(err.Error(), egresspolicy.DenyFloorEnv) {
+		t.Fatalf("a resident host with an unreadable floor: %v", err)
 	}
 }
 

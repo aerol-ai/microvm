@@ -295,6 +295,21 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/aerolvm-supervisor_${{ matrix.suffix }} ./cmd/aerolvm-supervisor
           chmod 0755 dist/aerolvm-supervisor_${{ matrix.suffix }}
 
+      # The Kubernetes operator (operator/, its own Go module, P2); the
+      # images job packs it into aerolvm-operator. Static.
+      - name: Build aerolvm-operator (Linux amd64 and arm64)
+        if: matrix.goos == 'linux' && (matrix.goarch == 'amd64' || matrix.goarch == 'arm64')
+        shell: bash
+        working-directory: operator
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p ../dist
+          go build -trimpath -ldflags "$LDFLAGS" -o ../dist/aerolvm-operator_${{ matrix.suffix }} ./cmd/aerolvm-operator
+          chmod 0755 ../dist/aerolvm-operator_${{ matrix.suffix }}
+
       - name: Build custom Caddy (Linux only)
         if: matrix.goos == 'linux'
         shell: bash
@@ -393,7 +408,7 @@ jobs:
           path: dist/
 
   # The Kubernetes images (plans/kubernetes-v2-architecture.md P1): aerolvm,
-  # aerolvm-runtime and aerolvm-edge, built from this release's own Linux
+  # aerolvm-runtime, aerolvm-edge and aerolvm-operator, built from this release's own Linux
   # binaries (scripts/build-images.sh; nothing is compiled in the image) for
   # amd64 and arm64, pushed to ghcr.io/aerol-ai with an SBOM and SLSA
   # provenance attached by buildx, signed keyless with cosign, and attested
@@ -443,7 +458,7 @@ jobs:
 
       - name: Sign
         run: |
-          for pair in aerolvm:AEROLVM_DIGEST aerolvm-runtime:RUNTIME_DIGEST aerolvm-edge:EDGE_DIGEST; do
+          for pair in aerolvm:AEROLVM_DIGEST aerolvm-runtime:RUNTIME_DIGEST aerolvm-edge:EDGE_DIGEST aerolvm-operator:OPERATOR_DIGEST; do
             image="${pair%%:*}" var="${pair#*:}"
             digest="$(jq -r '."containerimage.digest"' "image-meta/$image.json")"
             [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $image"; exit 1; }
@@ -470,6 +485,13 @@ jobs:
         with:
           subject-name: ghcr.io/aerol-ai/aerolvm-edge
           subject-digest: ${{ env.EDGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-operator
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-operator
+          subject-digest: ${{ env.OPERATOR_DIGEST }}
           push-to-registry: true
 
   release:

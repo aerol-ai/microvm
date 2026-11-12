@@ -37,6 +37,15 @@ type Host interface {
 
 var _ Host = (*nodeupgrade.SystemHost)(nil)
 
+// stopHint says how a person stops sandboxd on host: a Host may say
+// (PodHost does); otherwise it is the systemd unit.
+func stopHint(h Host) string {
+	if s, ok := h.(interface{ StopHint() string }); ok {
+		return s.StopHint()
+	}
+	return "sudo systemctl stop sandboxd"
+}
+
 const (
 	// DefaultConfigDir holds sandboxd.env and the cluster drop-in's
 	// cluster.env.

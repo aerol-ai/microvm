@@ -3,7 +3,6 @@ package nodeops
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -118,7 +117,7 @@ func RecoverQuorum(ctx context.Context, o QuorumOptions) (QuorumResult, error) {
 		return res, fmt.Errorf("no Raft data in %s; is this the right --raft-dir?", o.RaftDir)
 	}
 	if o.Host.UnitActive(ctx, sandboxdUnit) {
-		return res, errors.New("sandboxd is running here; stop sandboxd on every surviving server first (sudo systemctl stop sandboxd)")
+		return res, fmt.Errorf("sandboxd is running here; stop sandboxd on every surviving server first (%s)", stopHint(o.Host))
 	}
 	peers := filepath.Join(o.RaftDir, peersFile)
 	if exists(peers) && !o.Force {
@@ -153,7 +152,7 @@ func RecoverQuorum(ctx context.Context, o QuorumOptions) (QuorumResult, error) {
 	fmt.Fprintf(o.Out, "wrote %s: %s at %s is the only voter\n", peers, o.NodeID, o.RaftAddress)
 	if !o.Start {
 		fmt.Fprintln(o.Out, "start sandboxd on this node only; successful recovery renames the file to peers.json.applied.<unix>")
-		printRejoinSteps(o.Out)
+		printRejoinSteps(o.Out, o.Host)
 		return res, nil
 	}
 	started := o.now()
@@ -166,7 +165,7 @@ func RecoverQuorum(ctx context.Context, o QuorumOptions) (QuorumResult, error) {
 	}
 	res.Applied = applied
 	fmt.Fprintf(o.Out, "recovery applied (%s); this node leads a one-server cluster\n", filepath.Base(applied))
-	printRejoinSteps(o.Out)
+	printRejoinSteps(o.Out, o.Host)
 	return res, nil
 }
 
@@ -182,7 +181,7 @@ func rejoin(ctx context.Context, o QuorumOptions, node Node) (QuorumResult, erro
 		return res, fmt.Errorf("SB_CLUSTER_BOOTSTRAP=true in %s: with its Raft log moved aside this node would start a new cluster of its own; set SB_CLUSTER_BOOTSTRAP=false there first", node.ConfigDir)
 	}
 	if o.Host.UnitActive(ctx, sandboxdUnit) {
-		return res, errors.New("sandboxd is running here; stop it first (sudo systemctl stop sandboxd)")
+		return res, fmt.Errorf("sandboxd is running here; stop it first (%s)", stopHint(o.Host))
 	}
 	if exists(o.RaftDir) && !hasRaftState(o.RaftDir) && !emptyDir(o.RaftDir) {
 		// A wrong --raft-dir (the state directory itself) must never be
@@ -210,7 +209,15 @@ func rejoin(ctx context.Context, o QuorumOptions, node Node) (QuorumResult, erro
 	return res, err
 }
 
-func printRejoinSteps(out io.Writer) {
+func printRejoinSteps(out io.Writer, h Host) {
+	if _, pod := h.(*PodHost); pod {
+		fmt.Fprintln(out, `next, on every other server, one at a time and only once this node leads:
+  kubectl annotate aerolnode <server> aerolvm.io/maintenance=true
+  kubectl exec <server pod> -- sandboxd recover-quorum --rejoin
+  kubectl annotate aerolnode <server> aerolvm.io/maintenance-
+never start another server with its old Raft directory: it still counts the lost servers as voters`)
+		return
+	}
 	fmt.Fprintln(out, `next, on every other server, one at a time and only once this node leads:
   sudo systemctl stop sandboxd
   sudo sandboxd recover-quorum --rejoin --start

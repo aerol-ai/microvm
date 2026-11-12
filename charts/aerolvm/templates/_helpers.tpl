@@ -25,6 +25,46 @@ app.kubernetes.io/component: worker
 {{- .Values.edge.existingTLSSecret | default (printf "%s-edge-tls" (include "aerolvm.name" .)) -}}
 {{- end -}}
 
+{{- /* An address or a CIDR as a CIDR: a bare address is one host. */ -}}
+{{- define "aerolvm.cidr" -}}
+{{- if contains "/" . -}}
+{{- . -}}
+{{- else if contains ":" . -}}
+{{- printf "%s/128" . -}}
+{{- else -}}
+{{- printf "%s/32" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The cluster's own addresses (C24), for every container that guards
+sandbox traffic: sandboxd and the egress gateway read the same lists. */ -}}
+{{- define "aerolvm.egressRangeEnv" -}}
+{{- with .Values.worker.egressDenyFloor }}
+- { name: SB_EGRESS_DENY_FLOOR_CIDRS, value: {{ join "," . | quote }} }
+{{- end }}
+{{- with .Values.worker.egressPrivateRanges }}
+- { name: SB_EGRESS_PRIVATE_DEFAULT_CIDRS, value: {{ join "," . | quote }} }
+{{- end }}
+{{- end -}}
+
 {{- define "aerolvm.tokenSecret" -}}
 {{- .Values.apiToken.existingSecret | default (printf "%s-api-token" (include "aerolvm.name" .)) -}}
+{{- end -}}
+
+{{- /* NetworkPolicy peers: every pod of this install, the release
+namespace's (servers, gateways, the operator) and the workers. */ -}}
+{{- define "aerolvm.installPeers" -}}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Release.Namespace }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/instance: {{ .Release.Name }}
+- namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Values.cluster.workerNamespace }}
+  podSelector:
+    matchLabels:
+      {{- include "aerolvm.selector" . | nindent 6 }}
 {{- end -}}

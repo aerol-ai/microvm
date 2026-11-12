@@ -105,10 +105,15 @@ answer.
 
 const preflightUsage = `usage: sandboxd preflight [--join <url> --token <id.secret>] [--ca-cert-hash sha256:<hex>]
                           [--role server|worker|ingress] [--node-id <id>] [-o text|json]
+       sandboxd preflight --pod [--kvm] [-o text|json]
 
 Checks this machine, and with --join the network to the cluster, before init
 or join changes anything; prints a fix for each failure. With --join the
 join server dials this machine back on the ports its role needs.
+
+--pod checks the machine a Kubernetes worker pod landed on (its preflight
+init container): cgroup v2, the kernel version and br_netfilter, and with
+--kvm /dev/kvm. Its last line names every failure, for the operator.
 Exit status: 0 when nothing failed, 1 when a check failed, 2 for a usage error.
 `
 
@@ -173,6 +178,7 @@ type nodeFlags struct {
 	ttl                               string
 	reusable, json                    bool
 	filesOnly                         bool
+	pod, kvm                          bool
 }
 
 func (f *nodeFlags) address() nodejoin.AddressOptions {
@@ -203,6 +209,8 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 		fs.StringVar(&f.nodeID, "node-id", "", "")
 		fs.StringVar(&f.output, "o", "text", "")
 		fs.StringVar(&f.output, "output", "text", "")
+		fs.BoolVar(&f.pod, "pod", false, "")
+		fs.BoolVar(&f.kvm, "kvm", false, "")
 	case adoptSubcommand:
 		fs.StringVar(&f.caKey, "ca-key", "", "")
 	case resetSubcommand:
@@ -338,6 +346,27 @@ func runPreflight(ctx context.Context, f *nodeFlags, host nodejoin.Host, paths n
 	if (f.joinURL == "") != (f.token == "") {
 		fmt.Fprintf(stderr, "sandboxd preflight: --join and --token go together\n%s", usage)
 		return 2
+	}
+	if f.kvm && !f.pod {
+		fmt.Fprintf(stderr, "sandboxd preflight: --kvm goes with --pod\n%s", usage)
+		return 2
+	}
+	if f.pod {
+		if f.joinURL != "" {
+			fmt.Fprintf(stderr, "sandboxd preflight: --pod checks this machine only; leave out --join\n%s", usage)
+			return 2
+		}
+		report := nodejoin.PodPreflight(paths, f.kvm)
+		if f.output == "json" {
+			report.PrintJSON(stdout)
+		} else {
+			report.Print(stdout)
+			report.PrintPodSummary(stdout)
+		}
+		if !report.OK() {
+			return 1
+		}
+		return 0
 	}
 	pf := &nodejoin.Preflighter{Paths: paths, Host: host, Version: version.Version}
 	report, err := pf.Run(ctx, nodejoin.PreflightOptions{

@@ -175,6 +175,15 @@ type WritableLayerSizer interface {
 	WritableLayerBytes(ctx context.Context, containerRef string) (int64, error)
 }
 
+// CgroupLocator is a runtime that gives each sandbox its own cgroup v2
+// group and can name it without asking anyone: SandboxCgroup returns the
+// group's path below the cgroup mount, such as "/aerolvm/<id>". The usage
+// exporter reads CPU and memory there (C20). One reader then covers runc
+// and gVisor alike, since gVisor puts its sandbox kernel in that group.
+type CgroupLocator interface {
+	SandboxCgroup(containerRef string) string
+}
+
 type ContainerRuntime interface {
 	Runtime
 

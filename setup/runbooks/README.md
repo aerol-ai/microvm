@@ -20,6 +20,7 @@ Use them during incidents and during scheduled drills:
 | [cluster-ingress-topology.md](cluster-ingress-topology.md) | `SandboxdClusterTopologyViolation`: more than 10 ingress nodes without a shard-aware router, or mixed roles above 10 nodes. |
 | [identity-and-access.md](identity-and-access.md) | A `SandboxdBreakGlassPATUse`, `SandboxdPATScopeDrift` or `SandboxdIdentity*` alert fires; rotating the PAT or the scrape token; turning on `SB_PAT_SCOPE=host`; a PROXY-protocol mismatch breaks HTTPS. |
 | [cluster-upgrades.md](cluster-upgrades.md) | A `SandboxdRollout*` or `SandboxdMemberBelowActiveVersion` alert fires; a rollout failed, is stuck, or waits on a manual or skipped node. |
+| [kubernetes.md](kubernetes.md) | An `AerolVM*` alert from the Helm chart fires, or a pod, machine, zone or the operator fails on a Kubernetes install. |
 
 ## Incident Roles
 

@@ -43,16 +43,16 @@ else lib_init "$name" s3-report.txt; fi
 # publish_supervisor builds cmd/aerolvm-supervisor at the build's commit and
 # puts it in the artifact bucket; sets sup_url (presigned) and sup_sha.
 publish_supervisor() {
-  local ref wt bucket key
+  local ref wt key
   ref="$(git -C "$LIB_ROOT" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
   wt="$(mktemp -d)"
   git -C "$LIB_ROOT" worktree add --detach --force "$wt" "$ref" >/dev/null 2>&1
   (cd "$wt" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$sd/aerolvm-supervisor" ./cmd/aerolvm-supervisor)
   git -C "$LIB_ROOT" worktree remove --force "$wt"
-  bucket="aerol-itest-artifacts-$(aws sts get-caller-identity --query Account --output text)"
+  artifact_bucket
   key="builds/supervisor-${ref:0:12}/aerolvm-supervisor_linux_amd64"
-  aws s3 cp --only-show-errors --region us-east-1 "$sd/aerolvm-supervisor" "s3://$bucket/$key"
-  sup_url="$(aws s3 presign --region us-east-1 "s3://$bucket/$key" --expires-in 21600)"
+  aws s3 cp --only-show-errors --region "$bucket_region" "$sd/aerolvm-supervisor" "s3://$bucket/$key"
+  sup_url="$(aws s3 presign --region "$bucket_region" "s3://$bucket/$key" --expires-in 21600)"
   sup_sha="$(shasum -a 256 "$sd/aerolvm-supervisor" | cut -d' ' -f1)"
   say "supervisor built at ${ref:0:12} and published"
 }

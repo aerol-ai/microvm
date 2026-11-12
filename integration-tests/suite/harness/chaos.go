@@ -313,6 +313,14 @@ func ParseReconcileInterval(out string, def time.Duration) time.Duration {
 // recovery a real node gets; a stop would run the graceful path instead.
 const KillSandboxdScript = "sudo systemctl kill -s SIGKILL sandboxd && echo KILLED"
 
+// CrashStopSandboxdScript takes sandboxd down the way a dead machine does and
+// keeps it down: a SIGKILL, so no restart notice goes out (C8), then a stop,
+// which cancels systemd's pending restart (RestartSec=5 leaves the time).
+// Since C8 a plain `systemctl stop` is a planned restart: peers wait
+// SB_CLUSTER_RESTART_WINDOW (120 s) before failover, not only the grace, so
+// a case that models an owner's death and times its failover must use this.
+const CrashStopSandboxdScript = "sudo systemctl kill -s SIGKILL sandboxd; sudo systemctl stop sandboxd"
+
 // FailpointArmScript arms failpoint name on the node for sandbox names that
 // start with prefix (internal/failpoint), clearing a stale marker first so a
 // hit read later is this arm's.

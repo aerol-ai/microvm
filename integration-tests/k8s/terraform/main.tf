@@ -48,11 +48,11 @@ data "aws_ec2_instance_type_offerings" "worker" {
 }
 
 locals {
-  # Two zones that both offer the worker type, in a stable order.
+  # var.zone_count zones that offer the worker type, in a stable order.
   zones = slice(sort(tolist(setintersection(
     toset(data.aws_availability_zones.up.names),
     toset(data.aws_ec2_instance_type_offerings.worker.locations),
-  ))), 0, 2)
+  ))), 0, var.zone_count)
 }
 
 resource "aws_vpc" "this" {
@@ -68,7 +68,7 @@ resource "aws_internet_gateway" "this" {
 }
 
 resource "aws_subnet" "public" {
-  count                   = 2
+  count                   = var.zone_count
   vpc_id                  = aws_vpc.this.id
   availability_zone       = local.zones[count.index]
   cidr_block              = cidrsubnet(aws_vpc.this.cidr_block, 4, count.index)
@@ -92,7 +92,7 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  count          = 2
+  count          = var.zone_count
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
@@ -176,11 +176,11 @@ resource "aws_eks_node_group" "system" {
   node_role_arn   = aws_iam_role.node.arn
   subnet_ids      = aws_subnet.public[*].id
   ami_type        = "AL2023_x86_64_STANDARD"
-  instance_types  = ["t3.medium"]
+  instance_types  = [var.system_instance_type]
   scaling_config {
-    desired_size = 1
-    min_size     = 1
-    max_size     = 1
+    desired_size = var.system_count
+    min_size     = var.system_count
+    max_size     = var.system_count
   }
   depends_on = [aws_iam_role_policy_attachment.node]
 }
@@ -193,8 +193,15 @@ resource "aws_eks_node_group" "worker" {
   ami_type        = var.worker_ami_type
   release_version = var.worker_release_version == "" ? null : var.worker_release_version
   instance_types  = [var.worker_instance_type]
-  disk_size       = var.worker_disk_gib
+  disk_size       = var.worker_imds_hop_limit > 0 ? null : var.worker_disk_gib
   labels          = { "aerolvm.io/pool" = "phase0" }
+  dynamic "launch_template" {
+    for_each = var.worker_imds_hop_limit > 0 ? [1] : []
+    content {
+      id      = aws_launch_template.worker[0].id
+      version = aws_launch_template.worker[0].latest_version
+    }
+  }
   taint {
     key    = "aerolvm.io/worker"
     value  = "true"
@@ -206,4 +213,78 @@ resource "aws_eks_node_group" "worker" {
     max_size     = var.worker_count
   }
   depends_on = [aws_iam_role_policy_attachment.node]
+}
+
+# --- The Phase 2 cell --------------------------------------------------
+
+# Worker machines with IMDSv2 required and a hop limit of 1, so no pod (and
+# no sandbox) reaches the machine's IAM role. A launch template holds only
+# the metadata settings; EKS fills in the rest. The disk size moves here,
+# because a node group with a launch template may not set disk_size.
+resource "aws_launch_template" "worker" {
+  count = var.worker_imds_hop_limit > 0 ? 1 : 0
+  name  = "${var.name}-worker"
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = var.worker_imds_hop_limit
+  }
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.worker_disk_gib
+      volume_type = "gp3"
+    }
+  }
+}
+
+# The EBS CSI driver. Its controller is a pod, and with the IMDS hop limit
+# of 1 (every node here, the AL2023 default) no pod reaches the node role:
+# the first cell run's controller crash-looped on "get credentials". It gets
+# a role of its own through EKS Pod Identity, as Karpenter's does.
+resource "aws_iam_role" "ebs_csi" {
+  count              = var.ebs_csi ? 1 : 0
+  name               = "${var.name}-ebs-csi"
+  assume_role_policy = data.aws_iam_policy_document.karpenter_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi" {
+  count      = var.ebs_csi ? 1 : 0
+  role       = aws_iam_role.ebs_csi[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+resource "aws_eks_pod_identity_association" "ebs_csi" {
+  count           = var.ebs_csi ? 1 : 0
+  cluster_name    = aws_eks_cluster.this.name
+  namespace       = "kube-system"
+  service_account = "ebs-csi-controller-sa"
+  role_arn        = aws_iam_role.ebs_csi[0].arn
+  depends_on      = [aws_eks_addon.pod_identity]
+}
+
+resource "aws_eks_addon" "ebs_csi" {
+  count        = var.ebs_csi ? 1 : 0
+  cluster_name = aws_eks_cluster.this.name
+  addon_name   = "aws-ebs-csi-driver"
+  depends_on   = [aws_eks_node_group.system, aws_eks_pod_identity_association.ebs_csi]
+}
+
+resource "aws_ecr_repository" "dev" {
+  for_each             = toset(var.ecr_repos)
+  name                 = "${var.name}/${each.value}"
+  force_delete         = true
+  image_tag_mutability = "MUTABLE"
+}
+
+# The VPC CNI enforces NetworkPolicies only when told to. The cell turns it
+# on, so the chart's worker policies are real walls there, and a policy that
+# blocks something AerolVM needs shows up as a failure.
+resource "aws_eks_addon" "vpc_cni" {
+  count                       = var.network_policy ? 1 : 0
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "vpc-cni"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  configuration_values        = jsonencode({ enableNetworkPolicy = "true" })
 }

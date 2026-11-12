@@ -78,3 +78,38 @@ func TestUpgradeServeMBPSConfig(t *testing.T) {
 		}
 	}
 }
+
+// SB_UPGRADE_DRIVER (C13): empty by default, "operator" on a Kubernetes pod
+// the operator upgrades, and anything else is refused.
+func TestUpgradeDriverConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value    string
+		want     bool
+		wantErr  string
+		wantKeep string
+	}{
+		{value: "", want: false},
+		{value: "operator", want: true, wantKeep: "operator"},
+		{value: " operator ", want: true, wantKeep: "operator"},
+		{value: "helm", wantErr: `SB_UPGRADE_DRIVER must be empty or "operator"`},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("SB_UPGRADE_DRIVER", tc.value)
+			t.Setenv("SB_ENTERPRISE_MODE", "false")
+			t.Setenv("SB_PAT_TOKEN", "pat-token")
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.UpgradesByOperator() != tc.want || cfg.UpgradeDriver != tc.wantKeep {
+				t.Fatalf("UpgradeDriver = %q, UpgradesByOperator = %v, want %v", cfg.UpgradeDriver, cfg.UpgradesByOperator(), tc.want)
+			}
+		})
+	}
+}

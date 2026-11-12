@@ -2,8 +2,12 @@
 #
 # mode: single runs AerolVM in one pod with no operator: a worker pod whose
 # runtime container holds containerd and every sandbox, and whose agent
-# container is sandboxd. For kind, laptops and small installs. Cluster mode
-# (gateways, servers and an operator) comes with the operator in Phase 2.
+# container is sandboxd. For kind, laptops and small installs.
+#
+# mode: cluster installs the AerolVM operator and one AerolCluster (the
+# cluster block below): three or five servers, gateways in every zone, and
+# worker pools that grow and shrink with load (plans/kubernetes-v2-architecture.md
+# Phase 2). The worker block's container settings apply to every worker.
 mode: single
 
 image:
@@ -46,6 +50,37 @@ worker:
   # Sandboxes cannot reach private addresses unless a create allows them
   # (C24): a bank's network is not one connection away.
   blockPrivateByDefault: true
+  # Per-team usage on the agent's /v1/metrics (C20): each owner's reserved
+  # CPU and memory over time (the charge) and its measured use (shown,
+  # never billed). The worker pod asks for a whole machine, so a cost tool
+  # sees one big pod; Prometheus sums these by owner, and the cost tool
+  # splits the pod's cost by those shares. Nothing is sent anywhere: the
+  # numbers leave the pod only when Prometheus scrapes it. Owner names
+  # become label values; set false to keep them off /v1/metrics.
+  usageMetrics:
+    enabled: true
+  # The cluster's own addresses (C24). Each entry is an address or a CIDR.
+  # In cluster mode the operator adds the API server to the first and the
+  # pod and Service ranges to the second, for every new worker; you add
+  # only what the API cannot tell it, such as node ranges outside the
+  # private ranges. In single mode you set both. Empty by default because
+  # the chart cannot know them.
+  #
+  # egressDenyFloor: addresses no sandbox can ever reach, whatever its
+  # egress profile says. Put the Kubernetes API server here: its Service
+  # address (kubectl get svc kubernetes -n default) and the addresses behind
+  # it (kubectl get endpointslices -n default -l
+  # kubernetes.io/service-name=kubernetes). Never the DNS Service address:
+  # sandboxes would lose DNS.
+  egressDenyFloor: []
+  # egressPrivateRanges: the cluster's pod, Service and node ranges.
+  # Sandboxes cannot reach them by default, like the private ranges, and an
+  # egress profile can open one on purpose. List them even when they sit
+  # inside 10.0.0.0/8: the NetworkPolicy below leaves them out too, and a
+  # range outside the private ranges (EKS custom networking uses
+  # 100.64.0.0/10 for pods, for example) needs it. Needs
+  # blockPrivateByDefault: true.
+  egressPrivateRanges: []
   # Any other sandboxd setting, as SB_NAME: value.
   extraEnv: {}
 
@@ -66,6 +101,37 @@ worker:
 service:
   type: ClusterIP
   port: 21212
+
+# An egress NetworkPolicy for the worker pod (C24): the second wall around
+# sandboxes, after AerolVM's own firewall inside the pod. Sandbox traffic
+# leaves with the pod's address, so this limits the whole pod: it may reach
+# the other AerolVM pods of this install, the cluster DNS, and the internet
+# without the private ranges (10/8, 172.16/12, 192.168/16, 100.64/10,
+# 169.254/16) and without worker.egressPrivateRanges and
+# worker.egressDenyFloor.
+#
+# On by default, because the chart's default is to keep sandboxes off the
+# bank's network (CEO review RQ14). A cluster whose network plugin does not
+# enforce NetworkPolicy ignores it. Turn it off only if your own policy
+# already limits the pod.
+networkPolicy:
+  enabled: true
+  # Where the cluster DNS runs; its pods get port 53.
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+  # Ranges the pod may reach on purpose. Two kinds go here:
+  #  - the one internal range a bank opens to sandboxes. Open it in AerolVM
+  #    too, with an egress profile, or sandboxes still cannot reach it;
+  #  - private addresses the pod itself needs: a private registry for
+  #    sandbox images, VPC endpoints for object storage or KMS, or the
+  #    NodeLocal DNSCache address (often 169.254.20.10/32).
+  extraEgressCIDRs: []
+  # Cluster mode only: who else may reach a worker pod, as NetworkPolicy
+  # peers. The gateways, servers, other workers and (with monitoring on)
+  # Prometheus are already allowed; nothing else needs to. Workers only:
+  # the servers, gateways' cluster ports and operator take no extra peers.
+  extraIngressFrom: []
 
 # Sandbox links and the API over HTTPS (C25): an edge container runs
 # AerolVM's Caddy, as on a domain install. The API is https://<domain> and
@@ -88,3 +154,132 @@ edge:
     limits: { cpu: 250m, memory: 256Mi }
   service:
     type: LoadBalancer
+
+# Prometheus monitoring (plans/kubernetes-v2-architecture.md P6, P9): a
+# ServiceMonitor per kind of pod, a PrometheusRule with the alerts in
+# setup/runbooks/kubernetes.md and the per-team usage sums (C20), and
+# Grafana dashboards. Off by default: ServiceMonitor and PrometheusRule are
+# the Prometheus Operator's kinds, and an install on a cluster without its
+# CRDs would fail. Turn it on where kube-prometheus-stack (or the Prometheus
+# Operator) runs.
+#
+# Each ServiceMonitor reads its pods through a headless Service of its own,
+# so every pod is scraped exactly once: a pod behind two Services would be
+# counted twice, and the per-team sums with it. In cluster mode the
+# operator's metrics come from its port named metrics; every other pod's
+# from /v1/metrics on its port named api.
+monitoring:
+  enabled: false
+  # Labels for every monitoring object, so your Prometheus picks them up.
+  # kube-prometheus-stack reads only objects labelled with its own release
+  # name, for example { release: kube-prometheus-stack }.
+  labels: {}
+  # How often Prometheus reads each pod. The usage counters move every 15
+  # seconds, so a slower scrape loses detail, never usage.
+  interval: 30s
+  scrapeTimeout: 10s
+  # The namespace Prometheus runs in. In cluster mode the workers'
+  # NetworkPolicy lets it, and only it, read their metrics.
+  prometheusNamespace: monitoring
+  # /v1/metrics needs a token allowed to read metrics. Empty uses the API
+  # token, which can do everything. Better, with API tokens on
+  # (SB_IDENTITY_ENABLED): a token that can only read, `aerolvm token
+  # create --name prometheus --role viewer --team '*'`, kept in a Secret in
+  # this namespace and named here.
+  scrapeToken:
+    existingSecret: ""
+    key: token
+  prometheusRule:
+    enabled: true
+    # Alerts to leave out, by name. AerolVMPodNotReady,
+    # AerolVMRuntimeContainerRestarted and AerolVMPodImagePullStuck read pod
+    # status from kube-state-metrics (kube-prometheus-stack runs it); without
+    # it they never fire. The headroom alert's target is 15% free, the
+    # AerolCluster default; for another target, list AerolVMHeadroomLow here
+    # and copy it from charts/aerolvm/monitoring/rules.yaml with your number.
+    disabledAlerts: []
+  # Dashboards as ConfigMaps labelled grafana_dashboard: "1", which the
+  # Grafana sidecar in kube-prometheus-stack loads.
+  grafanaDashboards: true
+  # Where the dashboard ConfigMaps go. Empty: this release's namespace. The
+  # sidecar must watch it (kube-prometheus-stack:
+  # grafana.sidecar.dashboards.searchNamespace).
+  dashboardsNamespace: ""
+
+# Cluster mode (mode: cluster). The operator turns this into servers,
+# gateways and workers, and keeps them there.
+cluster:
+  # The AerolCluster's name; every node and Service is named after it.
+  name: aerolvm
+  # Worker pods run here: the one namespace where privileged pods are
+  # allowed (§8.7). The chart makes it, labelled for privileged pods,
+  # unless createWorkerNamespace is false (then make and label it first).
+  workerNamespace: aerolvm-workers
+  createWorkerNamespace: true
+  # The AerolVM release the cluster runs. Empty: the chart's appVersion.
+  # Changing it upgrades the cluster in order; setting it back rolls back.
+  version: ""
+  # This cluster's number, 1 to 255, in every new sandbox ID (C12).
+  cell: 1
+  # The zones to spread over, such as [eu-west-1a, eu-west-1b, eu-west-1c].
+  # Servers go one per zone; gateways and workers spread across them.
+  zones: []
+  servers:
+    count: 3
+    storage:
+      size: 20Gi
+      # A class that binds on first use (volumeBindingMode:
+      # WaitForFirstConsumer), so each server's disk lands in its zone.
+      storageClassName: ""
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { cpu: "2", memory: 4Gi }
+    nodeSelector: {}
+    tolerations: []
+  gateways:
+    minReplicas: 3
+    maxReplicas: 30
+    resources:
+      requests: { cpu: 500m, memory: 512Mi }
+      limits: { cpu: "1", memory: 1Gi }
+    service:
+      type: LoadBalancer
+      annotations: {}
+    # Put the gateways behind your own Gateway API Gateway instead of a
+    # load balancer (§7.1): { name: bank-gateway, namespace: gateways }.
+    # The chart writes an HTTPRoute for the API host, a TLSRoute in
+    # passthrough mode for the sandbox links and a TCPRoute for SSH.
+    gatewayRef: {}
+    nodeSelector: {}
+    tolerations: []
+  # One worker pod per machine, sized to the machine (§8.1). For example:
+  #   - name: gvisor-general
+  #     runtimes: [gvisor]
+  #     nodeSelector: { aerolvm.io/pool: gvisor-general }
+  #     tolerations: [{ key: aerolvm.io/pool, operator: Exists, effect: NoSchedule }]
+  #     machine: { cpu: 32, memoryGiB: 128 }
+  #     minWorkers: 3
+  #     maxWorkers: 300
+  #     headroomPercent: 15
+  #     provisioner: karpenter
+  #     decommission: { drainWindow: 15m }
+  #     # Replace machines older than this, one per zone at a time. Set it
+  #     # on Karpenter pools: their NodePool has expireAfter: Never.
+  #     maxMachineAge: 720h
+  workerPools: []
+  # The create policy every node holds new sandboxes to: which images,
+  # registries and runtimes, how big, root or not, GPU or not (docs: Limit
+  # what users can create). Empty allows everything. Every pod mounts it,
+  # so a change here reaches running nodes within a minute. For example:
+  #   version: 1
+  #   images: { allowed_registries: [registry.bank.example] }
+  #   runtimes: [gvisor]
+  #   limits: { max_cpu: 4, max_memory_mb: 8192, max_disk_gb: 50 }
+  createPolicy: {}
+  operator:
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+    nodeSelector: {}
+    tolerations: []
