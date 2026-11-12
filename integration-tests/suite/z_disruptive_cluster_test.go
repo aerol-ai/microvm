@@ -20,6 +20,14 @@ import (
 
 const heteroVictimWorker = "worker-x"
 
+// heteroWorkerTopology reports a role-separated cluster with four docker
+// workers: cluster-hetero, or cluster-hetero-lite (the same topology without
+// the bare-metal host). Cases that kill whichever worker owns a docker
+// sandbox run on either; cases that name worker-x/y/z need cluster-hetero.
+func heteroWorkerTopology() bool {
+	return sc.Name == "cluster-hetero" || sc.Name == "cluster-hetero-lite"
+}
+
 var heteroFailoverPeers = []string{"worker-y", "worker-z"}
 
 // UC-58 — Owner failover: a replica serves after the owner dies. Not implemented
@@ -47,8 +55,8 @@ func TestRecreateViaFailover(t *testing.T) {
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled (use default make integration-cluster-hetero, or drop --no-disruptive)")
 	}
-	if sc.Name != "cluster-hetero" {
-		t.Skip("recreate failover kill test requires the cluster-hetero worker topology")
+	if !heteroWorkerTopology() {
+		t.Skip("recreate failover kill test requires the cluster-hetero(-lite) worker topology")
 	}
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
@@ -81,7 +89,7 @@ func TestRecreateViaFailover(t *testing.T) {
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
 	newOwner := awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
-	waitRunning(t, sb)
+	awaitRecreated(t, c, sb, failoverOpenTimeout)
 	t.Logf("sandbox %s recreated under the same id on %s after killing %s", sb.ID, newOwner, owner)
 }
 
@@ -104,8 +112,8 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled (use default make integration-cluster-hetero, or drop --no-disruptive)")
 	}
-	if sc.Name != "cluster-hetero" {
-		t.Skip("snapshot-backed failover test requires the cluster-hetero worker topology")
+	if !heteroWorkerTopology() {
+		t.Skip("snapshot-backed failover test requires the cluster-hetero(-lite) worker topology")
 	}
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
@@ -157,7 +165,7 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
 	newOwner := awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
-	waitRunning(t, sb)
+	awaitRecreated(t, c, sb, failoverOpenTimeout)
 
 	// Observational only (not a guarantee this test pins): the catalogue is
 	// home-node-local, so after the owner dies the name may or may not still

@@ -61,11 +61,10 @@ func TestFailoverKeepsE2BDeadline(t *testing.T) {
 	killedAt := time.Now()
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
 	newOwner := awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
-	// Not waitRunning: sb still holds "started" from before the kill, so it
-	// would return at once. The reassign lands before the new owner has
-	// rebuilt the row, and until then a read there answers 404.
-	endAfter, createdAfter := awaitE2BDeadlineAndCreated(t, ctx, sb.ID)
+	awaitRecreated(t, c, sb, failoverOpenTimeout)
 	recreatedAfter := time.Since(createdBefore)
+
+	endAfter, createdAfter := e2bDeadlineAndCreated(t, ctx, sb.ID)
 	endShift, createdShift := endAfter.Sub(endBefore), createdAfter.Sub(createdBefore)
 	harness.ReportDetail(t, "Owner %s killed, recreated on %s %s after the kill (%s after the first create). "+
 		"E2B endAt moved %s (want within %s; the old recreate moved it by the time since the first create). created_at moved %s.",
@@ -77,23 +76,6 @@ func TestFailoverKeepsE2BDeadline(t *testing.T) {
 	}
 	if createdShift.Abs() > failoverDeadlineSlack {
 		t.Errorf("created_at moved %s across the failover (%s → %s), want within %s", createdShift, createdBefore, createdAfter, failoverDeadlineSlack)
-	}
-}
-
-// awaitE2BDeadlineAndCreated is e2bDeadlineAndCreated once the sandbox's
-// new owner serves it: a 404 there means the recreate has not written the
-// row yet.
-func awaitE2BDeadlineAndCreated(t *testing.T, ctx context.Context, id string) (endAt, createdAt time.Time) {
-	t.Helper()
-	for {
-		st, body := fcDo(t, ctx, http.MethodGet, "", "/e2b/sandboxes/"+id, nil, nil)
-		if st == http.StatusOK {
-			return e2bDeadlineAndCreated(t, ctx, id)
-		}
-		if st != http.StatusNotFound || ctx.Err() != nil {
-			t.Fatalf("E2B get %s after the failover = %d; body=%s", id, st, string(body))
-		}
-		time.Sleep(2 * time.Second)
 	}
 }
 
