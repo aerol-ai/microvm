@@ -25,7 +25,10 @@
 #
 # The images, the chart and the aerolvm CLI all come from one commit (HEAD,
 # or AEROL_BUILD_REF), copied out with git archive, never from the working
-# tree; the harness scripts stay this checkout's. The report goes to
+# tree; the harness scripts stay this checkout's. AEROL_RELEASE=vX.Y.Z tests
+# a published release instead: its signed images from ghcr.io (build does
+# nothing), its chart and CLI from its tag, and verify checks the images'
+# signatures. The report goes to
 # .state/<name>/cell-report.txt.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,9 +40,12 @@ CERT_MANAGER_VERSION=v1.21.3
 CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
 
 up() {
+  # A release's images come from ghcr.io: no ECR repositories for it.
+  local ecr=(--ecr aerolvm,aerolvm-runtime,aerolvm-operator)
+  [[ -n "${AEROL_RELEASE:-}" ]] && ecr=()
   "$HERE/cluster.sh" up "$name" --ttl "${AEROL_TTL:-4h}" --zones 3 --system 3 --system-type m7i.large \
     --workers 3 --type m7i.xlarge --imds-hop-limit 1 --ebs-csi --network-policy \
-    --ecr aerolvm,aerolvm-runtime,aerolvm-operator
+    ${ecr[@]+"${ecr[@]}"}
 }
 
 if [[ "$step" == up || "$step" == all ]]; then up; fi
@@ -52,13 +58,23 @@ exec > >(tee -a "$sd/cell-console.log") 2>&1
 # Terraform's plugins are per run, as cluster.sh keeps them.
 tfout() { TF_DATA_DIR="$sd/.terraform" terraform -chdir="$LIB_DIR/terraform" output -state="$sd/terraform.tfstate" "$@"; }
 region="$(tfout -raw region)"
-registry="$(tfout -raw ecr_registry)"
-sha="$(git -C "$LIB_ROOT" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
-tag="v0.0.0-cell.${sha:0:8}"
+if [[ -n "${AEROL_RELEASE:-}" ]]; then
+  registry=ghcr.io/aerol-ai
+  sha="$(git -C "$LIB_ROOT" rev-parse "$AEROL_RELEASE^{commit}")"
+  tag="$AEROL_RELEASE"
+else
+  registry="$(tfout -raw ecr_registry)"
+  sha="$(git -C "$LIB_ROOT" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
+  tag="v0.0.0-cell.${sha:0:8}"
+fi
 ns=aerolvm-system
 workers=aerolvm-workers
 
 build() {
+  if [[ -n "${AEROL_RELEASE:-}" ]]; then
+    say "build: none, $AEROL_RELEASE's published images"
+    return 0
+  fi
   local key url t0
   t0=$(date +%s)
   artifact_bucket
@@ -291,11 +307,14 @@ chaos() {
 
 verify() {
   local cli="$sd/aerolvm" rc=0
+  # Dev images are unsigned; a release's are signed by release.yml.
+  local sigs=(--skip-signatures)
+  [[ -n "${AEROL_RELEASE:-}" ]] && sigs=()
   (cd "$(source_tree "$sha")" && go build -o "$cli" ./cmd/aerolvm)
   token="$(kubectl -n "$ns" get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
   gateway_forward
   SB_API_URL=http://127.0.0.1:21212 SB_PAT_TOKEN="$token" "$cli" k8s verify --namespace "$ns" \
-    --worker-namespace "$workers" --release aerolvm --cluster aerolvm --skip-signatures \
+    --worker-namespace "$workers" --release aerolvm --cluster aerolvm ${sigs[@]+"${sigs[@]}"} \
     --probe-runtimes gvisor 2>&1 | tee -a "$report" || rc=$?
   say "verify: exit $rc"
   return "$rc"
