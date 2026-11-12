@@ -433,12 +433,12 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// The timeout lives only on the native lifecycle the patch just wrote; the
+	// E2B compat blob never stores it (compatBlob). So nothing is saved here:
+	// re-saving the blob wrote the same bytes and, since facade state rides
+	// the replicated spec (B11), cost a Raft write per reconnect.
 	if changed {
 		meta.TimeoutSeconds = req.Timeout
-		if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
 	}
 
 	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
@@ -488,14 +488,14 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 	// Reset the timeout timers, reading the current Lifecycle under the sandbox
 	// lock so a concurrent idle-timer change can't be clobbered (D7). OnTimeout
 	// is fixed at create, so reading meta outside the lock is safe.
+	//
+	// The native lifecycle is the only copy of the timeout: the E2B compat blob
+	// does not store it, and reads derive it from the lifecycle. Do not save
+	// the blob here; it would write the same bytes and, because facade state
+	// rides the replicated spec (B11), cost a second Raft write per call.
 	if _, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
 		return lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout), true, nil
 	}); err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	meta.TimeoutSeconds = req.Timeout
-	if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
