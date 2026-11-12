@@ -5220,7 +5220,9 @@ func (s *Service) writeLifecycleLocked(ctx context.Context, id string, l models.
 		return nil, false, err
 	}
 	lc := l
-	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
+	// Only a failover recreate reads the replicated lifecycle back; a
+	// keep-alive (E2B setTimeout) on any other sandbox costs no Raft write.
+	s.replicateRecoverySpecPatch(ctx, id, priorSandbox, func(spec *models.CreateSandboxRequest) {
 		spec.Lifecycle = &lc
 	})
 	updated, err := s.store.Get(ctx, id)

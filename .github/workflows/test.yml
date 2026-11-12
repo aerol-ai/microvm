@@ -10,7 +10,9 @@ on:
   # branch ran nothing, and OpenSSF Scorecard's CI-Tests check counted it
   # as merged untested (#626, merged into its parent's branch). `edited` is
   # listed so a pull request retargeted to main gets its checks without a
-  # new push; a title or body edit also fires it.
+  # new push. A title or body edit also fires it; that run tests nothing
+  # new, so `paths` turns every suite off and only DCO, baseline-tests and
+  # the gate run (they stay real, so an edit cannot turn a red gate green).
   pull_request:
     types: [opened, synchronize, reopened, edited]
   # The merge queue re-runs the required `changes` check on a temporary
@@ -20,9 +22,11 @@ on:
 
 # A new push to a pull request cancels that pull request's older run, so
 # a rebased stack doesn't queue a stale run per layer ahead of the current
-# one. Pushes to main and merge-queue runs are never cancelled.
+# one. Pushes to main and merge-queue runs are never cancelled. A title or
+# body edit gets its own group: in the shared one it cancelled the suites
+# running for the same commit, and its own run starts none of them.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -34,7 +38,8 @@ jobs:
     # A stacked layer (base is another branch) reports every suite as
     # unselected, so it runs only DCO, baseline-tests and the gate. The
     # suites are advisory, and they run on the stack's root pull request
-    # and on the push to main once the stack lands.
+    # and on the push to main once the stack lands. A title or body edit
+    # skips the filter step, and every output below falls back to 'false'.
     outputs:
       docs: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.docs || 'false' }}
       go_main: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_main || 'false' }}
@@ -78,8 +83,12 @@ jobs:
           done < <(git rev-list --no-merges "${BASE_SHA}..HEAD")
           exit "$missing"
 
+      # An edit that keeps the base re-tests a commit that already ran its
+      # suites: about 1 in 5 pull request runs (2026-11-09 to 11-12). A
+      # changed base still runs them, since the merge result is new.
       - name: Detect changed paths
         id: filter
+        if: github.event.action != 'edited' || github.event.changes.base
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         with:
           filters: |
@@ -268,9 +277,14 @@ jobs:
             ~/go/pkg/mod
           key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
 
+  # Pushes to main only. It is advisory and took 17% of the repo's runner
+  # time (2026-11-09 to 11-12), mostly on pull requests. The org's plan
+  # runs 20 jobs at once, so it made the required checks wait for a runner.
+  # A race now shows on the push run; on a pull request it never blocked
+  # the merge anyway.
   go-race:
     needs: paths
-    if: needs.paths.outputs.go_main == 'true'
+    if: github.event_name == 'push' && needs.paths.outputs.go_main == 'true'
     name: go-race (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -342,9 +356,12 @@ jobs:
   # that breaks a cross-compile fails here instead of at release time.
   # darwin also cross-compiles on Linux, with zig as the C toolchain
   # (.github/darwin-cross/setup.sh), because the org has no macOS runners.
+  # Pushes to main only: six runners per pull request were a quarter of the
+  # repo's runner time (2026-11-09 to 11-12), and a broken target still
+  # shows here before a release builds it.
   sandboxd-cgo-matrix:
     needs: paths
-    if: needs.paths.outputs.go_main == 'true'
+    if: github.event_name == 'push' && needs.paths.outputs.go_main == 'true'
     name: sandboxd cgo build - ${{ matrix.suffix }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -859,8 +876,9 @@ jobs:
 
   # Job id stays `changes` because ruleset 16186085 requires that check.
   # It gates the merge on the DCO sign-off (checked in `paths`) and the
-  # baseline suite only. The suites above still run on every pull request
-  # and report their own result, but they don't block the merge: waiting
+  # baseline suite only. The suites above (except go-race and the cgo
+  # matrix, which run only on the push to main) run on pull requests and report
+  # their own result, but they don't block the merge: waiting
   # ~25 min for go-tests and go-race, then again whenever main moved, made
   # every merge slow. A break they would have caught shows up on the
   # push-to-main run instead. It runs even when a dependency fails
