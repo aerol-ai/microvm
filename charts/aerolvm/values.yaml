@@ -235,6 +235,10 @@ cluster:
       # A class that binds on first use (volumeBindingMode:
       # WaitForFirstConsumer), so each server's disk lands in its zone.
       storageClassName: ""
+    # Enough for a small cell. A cell near G3 (500 workers, 1,000 creates a
+    # second) needs 4 CPUs on its servers: the Raft leader used 2 to 3 cores
+    # at 900 to 1,200 creates a second (plans/kubernetes-v2-architecture.md,
+    # "The cell-ceiling bench", F31).
     resources:
       requests: { cpu: "1", memory: 2Gi }
       limits: { cpu: "2", memory: 4Gi }
