@@ -153,8 +153,10 @@ func (r *NodeReconciler) decommission(ctx context.Context, c *v1.AerolCluster, n
 		}
 	}
 	if now.Before(d.DrainUntil.Time) && !d.NodeDeleted {
-		if node, err := api.GetNode(ctx, n.Name); err == nil && node.SandboxesOwned == 0 {
-			// Nothing to wait for.
+		if node, err := api.GetNode(ctx, n.Name); (err == nil && node.SandboxesOwned == 0) || aerolapi.IsStatus(err, http.StatusNotFound) {
+			// Nothing to wait for: it owns nothing, or it never joined
+			// (a worker whose pod never got a machine) and so owns
+			// nothing either.
 			d.DrainUntil = metav1.NewTime(now)
 		} else {
 			r.setState(n, v1.StateDraining, "drain window until "+d.DrainUntil.UTC().Format(time.RFC3339))

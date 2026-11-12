@@ -25,6 +25,11 @@ type zoneWorkers struct {
 	live    []v1.AerolNode // not ended, not decommissioning
 	pending int            // made but not serving yet
 	leaving int            // decommissioning
+	// failed counts workers held by a failed preflight: still on their
+	// machine, which can be fixed in place. unplaced names live workers
+	// whose pod has no machine yet.
+	failed   int
+	unplaced []string
 	// free and budget are summed over serving workers' heartbeats.
 	freeCPU, budgetCPU float64
 	freeMem, budgetMem int
@@ -56,20 +61,21 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 			if n.Spec.Role != v1.RoleWorker || n.Spec.Pool != pool.Name {
 				continue
 			}
+			zw := zones[n.Spec.Zone]
+			if zw == nil {
+				zw = &zoneWorkers{}
+				zones[n.Spec.Zone] = zw
+			}
 			if n.Status.State == v1.StateFailed && n.DeletionTimestamp == nil {
 				// A worker held by a failed preflight is no capacity, but
 				// its machine is still there: it counts toward the
 				// maximum, so a bad node image cannot buy machines
 				// without end.
 				total++
+				zw.failed++
 			}
 			if ended(n) {
 				continue
-			}
-			zw := zones[n.Spec.Zone]
-			if zw == nil {
-				zw = &zoneWorkers{}
-				zones[n.Spec.Zone] = zw
 			}
 			total++
 			if n.Annotations[v1.AnnotationDecommission] == "true" {
@@ -79,6 +85,9 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 			zw.live = append(zw.live, n)
 			if n.Status.State != v1.StateServing {
 				zw.pending++
+				if n.Status.NodeName == "" {
+					zw.unplaced = append(zw.unplaced, n.Name)
+				}
 				continue
 			}
 			if m, ok := byID[n.Name]; ok && !m.CapacityStale && m.Capacity.CPUBudget > 0 {
@@ -102,7 +111,7 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 			}
 		}
 		if want.remove != "" {
-			if err := r.markDecommission(ctx, c, want.remove, "scale-down: its zone has twice the room the pool keeps free"); err != nil {
+			if err := r.markDecommission(ctx, c, want.remove, want.why); err != nil {
 				return err
 			}
 			continue
@@ -169,7 +178,33 @@ func oldMachines(zoneOrder []string, zones map[string]*zoneWorkers, adding map[s
 type workerPlan struct {
 	add    map[string]int
 	remove string // a worker to decommission
+	why    string // why remove goes, for its decommission
 	calm   bool   // members known and no zone short: old machines may retire
+}
+
+// Reasons a worker is decommissioned by the scaler.
+const (
+	whyScaleDown = "scale-down: its zone has twice the room the pool keeps free"
+	whyUnplaced  = "never got a machine, and its zone has its workers and room again"
+)
+
+// floorOrder is the order the floor fills zones in: zones with no worker
+// held by a failed preflight first, spec order kept. When the pool's
+// maximum leaves fewer slots than zones need, a zone with nothing at all
+// gets one before a zone whose worker failed in place and may come back by
+// itself. Found by the rotation drill (Phase 3, run p3-drills-2): with
+// minWorkers = maxWorkers = 3, a failed worker's zone took the last slot
+// and another zone was left with no worker.
+func floorOrder(zoneOrder []string, zones map[string]*zoneWorkers) []string {
+	out := make([]string, 0, len(zoneOrder))
+	for _, failedFirst := range []bool{false, true} {
+		for _, z := range zoneOrder {
+			if (zones[z].failed > 0) == failedFirst {
+				out = append(out, z)
+			}
+		}
+	}
+	return out
 }
 
 // wantedWorkers decides one pass for a pool: the floor in every zone; one
@@ -180,13 +215,16 @@ func wantedWorkers(zoneOrder []string, pool *v1.WorkerPoolSpec, zones map[string
 	floor := ceilDiv(int(pool.MinWorkers), len(zoneOrder))
 	need := float64(pool.HeadroomPercent+pool.ZoneLossReservePercent) / 100
 	room := func() bool { return pool.MaxWorkers <= 0 || total < int(pool.MaxWorkers) }
-	short := false
-	for _, z := range zoneOrder {
+	for _, z := range floorOrder(zoneOrder, zones) {
 		zw := zones[z]
 		for len(zw.live)+plan.add[z] < floor && room() {
 			plan.add[z]++
 			total++
 		}
+	}
+	short := false
+	for _, z := range zoneOrder {
+		zw := zones[z]
 		if !haveMembers || zw.pending > 0 || plan.add[z] > 0 || !zw.known {
 			continue
 		}
@@ -199,6 +237,24 @@ func wantedWorkers(zoneOrder []string, pool *v1.WorkerPoolSpec, zones map[string
 		}
 	}
 	plan.calm = haveMembers && !short
+	// A worker whose pod never got a machine, in a zone whose serving
+	// workers make its floor with twice the room the pool keeps free: it
+	// is not needed, and it holds a slot of the pool's maximum. A failed
+	// worker that came back leaves one behind (it was the failed one's
+	// replacement), and without a cluster autoscaler it would wait for a
+	// machine forever while its slot kept another zone empty.
+	if haveMembers {
+		for _, z := range zoneOrder {
+			zw := zones[z]
+			if len(zw.unplaced) == 0 || !zw.known || plan.add[z] > 0 {
+				continue
+			}
+			if len(zw.live)-zw.pending >= floor && zw.freeShare() >= 2*need {
+				plan.remove, plan.why = zw.unplaced[0], whyUnplaced
+				return plan
+			}
+		}
+	}
 	if !plan.calm || need <= 0 {
 		return plan
 	}
@@ -223,7 +279,7 @@ func wantedWorkers(zoneOrder []string, pool *v1.WorkerPoolSpec, zones map[string
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Status.Sandboxes < cands[j].Status.Sandboxes })
 	for _, n := range cands {
 		if n.Status.State == v1.StateServing {
-			plan.remove = n.Name
+			plan.remove, plan.why = n.Name, whyScaleDown
 			break
 		}
 	}

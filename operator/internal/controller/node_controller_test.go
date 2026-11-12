@@ -392,6 +392,33 @@ func TestNodeDecommission(t *testing.T) {
 	}
 }
 
+// A worker whose pod never got a machine, decommissioned by the scaler (it
+// is not needed once its zone serves again): it never joined, so it owns
+// nothing and does not sit out the drain window.
+func TestDecommissionOfAWorkerThatNeverJoined(t *testing.T) {
+	c := bootstrapped(testCluster())
+	long := metav1.Duration{Duration: time.Hour}
+	c.Spec.WorkerPools[0].Decommission = v1.DecommissionSpec{DrainWindow: &long}
+	n := node("prod-general-ggggg", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n)
+	g.reconcile(n.Name) // its pod, which no machine takes
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("no pod")
+	}
+	got := g.node(n.Name)
+	got.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	if g.pod(testWorkerNS, n.Name) != nil {
+		t.Fatal("pod kept: the decommission waited out the drain window for a worker that owns nothing")
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved {
+		t.Fatalf("state = %s (%s), want Removed in one pass", got.Status.State, got.Status.Reason)
+	}
+}
+
 // The webhook's twin: deleting an AerolNode cleans up its worker pod and
 // token in the worker namespace, which owner references cannot reach.
 func TestNodeCleanupAcrossNamespaces(t *testing.T) {
