@@ -481,6 +481,12 @@ func (c *Cluster) buildRollout(caller string, spec *RolloutRecord, req upgradewi
 	for _, id := range sortedNodeIDs(spec.Nodes) {
 		n := spec.Nodes[id]
 		n.WasCordoned = drained[id]
+		// An images rollout carries no files: each node's new image is
+		// what it installs (C13). Checking files there refused every
+		// operator-driven upgrade (found by the rollout drill on kind).
+		if spec.Source == upgradewire.SourceImages {
+			continue
+		}
 		if err := checkNodeFiles(spec.Files, n.Arch); err != nil {
 			return nil, rolloutErr(http.StatusBadRequest, "bad_request",
 				fmt.Sprintf("%v (node %s runs linux/%s)", err, id, n.Arch), "give the files for every CPU type the cluster runs, one of each binary")
