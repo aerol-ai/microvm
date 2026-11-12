@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "github.com/aerol-ai/microvm/operator/api/v1alpha1"
 	"github.com/aerol-ai/microvm/operator/internal/aerolapi"
@@ -17,6 +18,27 @@ func serving(name string, sandboxes int32) v1.AerolNode {
 	n := *node(name, v1.RoleWorker, "general", "")
 	n.Status.State, n.Status.Sandboxes = v1.StateServing, sandboxes
 	return n
+}
+
+// waiting is a worker whose pod has no machine yet.
+func waiting(name string) v1.AerolNode {
+	n := *node(name, v1.RoleWorker, "general", "")
+	n.Status.State = v1.StatePending
+	return n
+}
+
+// withWaiting adds a worker with no machine to a zone.
+func withWaiting(z *zoneWorkers, name string) *zoneWorkers {
+	z.live = append(z.live, waiting(name))
+	z.pending++
+	z.unplaced = append(z.unplaced, name)
+	return z
+}
+
+// withFailed marks a zone as holding a worker stopped by its preflight.
+func withFailed(z *zoneWorkers) *zoneWorkers {
+	z.failed++
+	return z
 }
 
 // zw builds one zone's workers: serving ones with the given free share.
@@ -41,6 +63,7 @@ func TestWantedWorkers(t *testing.T) {
 		pool        *v1.WorkerPoolSpec
 		wantAdd     map[string]int
 		wantRemove  string
+		wantWhy     string
 	}{
 		{
 			name: "the floor, one per zone", zones: map[string]*zoneWorkers{"a": zw(0), "b": zw(0), "c": zw(0)},
@@ -65,7 +88,46 @@ func TestWantedWorkers(t *testing.T) {
 			name: "twice the room and above the floor: the emptiest goes",
 			zones: map[string]*zoneWorkers{"a": zw(0.2, serving("a1", 3)), "b": zw(0.9, serving("b1", 5), serving("b2", 1)),
 				"c": zw(0.2, serving("c1", 3))},
-			total: 4, haveMembers: true, wantAdd: map[string]int{}, wantRemove: "b2",
+			total: 4, haveMembers: true, wantAdd: map[string]int{}, wantRemove: "b2", wantWhy: whyScaleDown,
+		},
+		// Rotation drill, run p3-drills-2: minWorkers = maxWorkers = 3. z-a's
+		// replacement failed its preflight; z-b serves; z-c's worker left.
+		// The last slot goes to z-c, which has nothing, not to z-a, whose
+		// worker can come back in place.
+		{
+			name:  "the last slot goes to an empty zone before a zone whose worker failed",
+			zones: map[string]*zoneWorkers{"a": withFailed(zw(0)), "b": zw(0.5, serving("b1", 2)), "c": zw(0)},
+			total: 2, haveMembers: true, pool: &v1.WorkerPoolSpec{MinWorkers: 3, MaxWorkers: 3, HeadroomPercent: 15},
+			wantAdd: map[string]int{"c": 1},
+		},
+		{
+			name:  "with room for both, the failed worker's zone still gets one",
+			zones: map[string]*zoneWorkers{"a": withFailed(zw(0)), "b": zw(0.5, serving("b1", 2)), "c": zw(0)},
+			total: 2, haveMembers: true, wantAdd: map[string]int{"a": 1, "c": 1},
+		},
+		// The failed worker came back: the replacement made for it never got
+		// a machine and holds the pool's last slot.
+		{
+			name: "a worker with no machine goes once its zone has its workers and room",
+			zones: map[string]*zoneWorkers{"a": withWaiting(zw(0.9, serving("a1", 0)), "a2"), "b": zw(0.5, serving("b1", 2)),
+				"c": zw(0)},
+			total: 3, haveMembers: true, pool: &v1.WorkerPoolSpec{MinWorkers: 3, MaxWorkers: 3, HeadroomPercent: 15},
+			wantAdd: map[string]int{}, wantRemove: "a2", wantWhy: whyUnplaced,
+		},
+		{
+			name:  "a worker with no machine in a zone short of room stays",
+			zones: map[string]*zoneWorkers{"a": withWaiting(zw(0.05, serving("a1", 9)), "a2"), "b": zw(0.5, serving("b1", 2)), "c": zw(0.5, serving("c1", 2))},
+			total: 4, haveMembers: true, wantAdd: map[string]int{},
+		},
+		{
+			name:  "a worker with no machine that is its zone's only one stays",
+			zones: map[string]*zoneWorkers{"a": withWaiting(&zoneWorkers{}, "a1"), "b": zw(0.5, serving("b1", 2)), "c": zw(0.5, serving("c1", 2))},
+			total: 3, haveMembers: true, wantAdd: map[string]int{},
+		},
+		{
+			name:  "without the member list nothing is taken away",
+			zones: map[string]*zoneWorkers{"a": withWaiting(zw(0.9, serving("a1", 0)), "a2"), "b": zw(0.5, serving("b1", 2)), "c": zw(0.5, serving("c1", 2))},
+			total: 4, haveMembers: false, wantAdd: map[string]int{},
 		},
 		{
 			name: "no scale-down while another zone is short",
@@ -94,6 +156,9 @@ func TestWantedWorkers(t *testing.T) {
 			}
 			if got.remove != tc.wantRemove {
 				t.Fatalf("remove = %q, want %q", got.remove, tc.wantRemove)
+			}
+			if got.why != tc.wantWhy {
+				t.Fatalf("why = %q, want %q", got.why, tc.wantWhy)
 			}
 		})
 	}
@@ -222,5 +287,75 @@ func TestClusterCountsFailedWorkersTowardMax(t *testing.T) {
 	reconcileCluster(t, r)
 	if got := len(nodesByRole(t, cl)[v1.RoleWorker]); got != 4 {
 		t.Fatalf("workers = %d, want 3 failed + 1 new, at the maximum of 4", got)
+	}
+}
+
+// The rotation drill on EKS (Phase 3, run p3-drills-2), through the
+// reconciler: minWorkers = maxWorkers = 3, z-a's worker stopped by its
+// preflight, z-c's worker gone. The new worker goes to z-c. Then z-a's
+// failed worker comes back while a replacement made for it still has no
+// machine: that one is decommissioned, so its slot is free again.
+func TestClusterRotationKeepsEveryZoneServed(t *testing.T) {
+	c := bootstrapped(testCluster())
+	c.Spec.WorkerPools[0].MaxWorkers = 3
+	r, api, cl := clusterRig(t, c)
+	reconcileCluster(t, r)
+	ctx := context.Background()
+	byZone := func() map[string][]v1.AerolNode {
+		out := map[string][]v1.AerolNode{}
+		for _, n := range nodesByRole(t, cl)[v1.RoleWorker] {
+			out[n.Spec.Zone] = append(out[n.Spec.Zone], n)
+		}
+		return out
+	}
+	set := func(n v1.AerolNode, state, machine string) {
+		t.Helper()
+		n.Status.State, n.Status.NodeName = state, machine
+		if err := cl.Status().Update(ctx, &n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	member := func(name string) aerolapi.Node {
+		return aerolapi.Node{NodeID: name, Alive: true, Capacity: aerolapi.Capacity{CPUBudget: 30, MemoryBudgetMB: 1000}}
+	}
+	zones := byZone()
+	set(zones["z-a"][0], v1.StateFailed, "m-a")
+	set(zones["z-b"][0], v1.StateServing, "m-b")
+	api.members = []aerolapi.Node{member(zones["z-b"][0].Name)}
+	gone := zones["z-c"][0]
+	if err := cl.Delete(ctx, &gone); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCluster(t, r)
+	zones = byZone()
+	if len(zones["z-c"]) != 1 || len(zones["z-a"]) != 1 {
+		t.Fatalf("workers by zone: z-a %d, z-c %d; want z-c's new worker, nothing more in z-a", len(zones["z-a"]), len(zones["z-c"]))
+	}
+
+	// z-a's worker is fixed in place; a replacement made for it before the
+	// fix waits for a machine that will not come.
+	set(zones["z-a"][0], v1.StateServing, "m-a")
+	set(zones["z-c"][0], v1.StateServing, "m-c")
+	extra := &v1.AerolNode{}
+	if err := r.createNode(ctx, reconcileCluster(t, r), "prod-general-extra", v1.RoleWorker, "general", "z-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "prod-general-extra"}, extra); err != nil {
+		t.Fatal(err)
+	}
+	set(*extra, v1.StatePending, "")
+	api.members = []aerolapi.Node{member(zones["z-a"][0].Name), member(zones["z-b"][0].Name), member(zones["z-c"][0].Name)}
+	reconcileCluster(t, r)
+	var got v1.AerolNode
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: testNS, Name: extra.Name}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Annotations[v1.AnnotationDecommission] != "true" {
+		t.Fatalf("the worker with no machine was kept (annotations %v); want it decommissioned", got.Annotations)
+	}
+	for _, n := range nodesByRole(t, cl)[v1.RoleWorker] {
+		if n.Name != extra.Name && n.Annotations[v1.AnnotationDecommission] == "true" {
+			t.Fatalf("serving worker %s decommissioned", n.Name)
+		}
 	}
 }
