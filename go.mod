@@ -106,7 +106,7 @@ require (
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.177.0
+	github.com/daytonaio/daytona/libs/toolbox-api-client-go v0.190.0
 	github.com/fatih/color v1.13.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
