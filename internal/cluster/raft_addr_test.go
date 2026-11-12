@@ -103,17 +103,24 @@ func TestRaftOverDNSNames(t *testing.T) {
 				addr, id := b.raft.LeaderWithID()
 				return string(addr) == aName && id == "srv-a"
 			})
-			f := b.raft.GetConfiguration()
-			if err := f.Error(); err != nil {
-				t.Fatal(err)
-			}
-			got := map[string]string{}
-			for _, s := range f.Configuration().Servers {
-				got[string(s.ID)] = string(s.Address)
-			}
-			if got["srv-a"] != aName || got["srv-b"] != bName {
-				t.Fatalf("configuration %v, want the names %s and %s", got, aName, bName)
-			}
+			// Wait for it: AddVoter on a one-server cluster commits on the
+			// old configuration (raft's dispatchLogs counts the leader's own
+			// write before the new voter is in the count), so it returns
+			// before b has any log. b learns the leader from its first
+			// heartbeat, and the configuration only after a few more round
+			// trips of replication.
+			var got map[string]string
+			waitFor(t, 15*time.Second, "b's configuration to name both servers", func() bool {
+				f := b.raft.GetConfiguration()
+				if f.Error() != nil {
+					return false
+				}
+				got = map[string]string{}
+				for _, s := range f.Configuration().Servers {
+					got[string(s.ID)] = string(s.Address)
+				}
+				return got["srv-a"] == aName && got["srv-b"] == bName
+			})
 			// An entry the leader commits reaches the follower over the name.
 			if err := a.raft.Barrier(5 * time.Second).Error(); err != nil {
 				t.Fatal(err)
