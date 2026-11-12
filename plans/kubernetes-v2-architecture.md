@@ -2038,8 +2038,30 @@ Findings, each fixed before the next run:
   only turns new sandboxes away. The chart's default floor is now 0.20 and
   its disk alert fires at 70% used (#1212).
 
-Next in Phase 3: the 72-hour soak and the cell-ceiling bench (G3), each run
-only with the owner's go-ahead on its cost.
+**C18, measured first** (2026-11-12, Linux, offline benchmarks in
+`internal/cluster`). The owner's call on what comes next: the soak waits
+("skip for now"); the cell-ceiling bench runs with stand-in workers packed
+on about 10 machines, inside the account's 256-vCPU limit (about $30), after
+the C18 fixes it is meant to measure.
+
+- E4 (recovery file outside the table lock): `BenchmarkFSMApplyRecoveryStore`
+  applies placements with the real recovery file store against the in-memory
+  one: 80 to 110 µs against 10 to 12 µs per apply. So 70 to 100 µs of file
+  work runs under the write lock. At G3's 1,000 creates per second (2,000
+  applies) the apply loop is busy about a fifth of the time, and its ceiling
+  stays near 5,000 creates per second. Not a limit for G3, and the move has
+  the GC hazard eng review found (OV-E7): **dropped**, with the benchmark
+  kept to catch a change.
+- E6 (sample, not the whole fleet): `BenchmarkSelectPlacementFleet` times one
+  placement decision on the leader: 150 µs at 100 workers, 620 µs at 500,
+  1.9 ms at 2,000, allocating 0.9 MB and 3.6 MB per decision at 500 and
+  2,000. At G3 that is about 60% of a core and nearly 1 GB/s of garbage on
+  the leader. Scoring already samples 16 per zone (`zoneSampleSize`); the
+  cost is copying every member's record per decision and the GC that
+  follows. **Needed**, next.
+- E5 (pushed capacity) and E7 (batched failover): their cost is in many real
+  peers and real commits, which the stand-in bench measures; decided from
+  its numbers.
 
 ## 19. Tests, drills and benchmarks
 
