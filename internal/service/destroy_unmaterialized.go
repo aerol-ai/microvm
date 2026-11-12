@@ -151,19 +151,23 @@ func (s *Service) deletePlacementWithoutLocalRow(ctx context.Context, c cluster.
 // The caller holds the id's create lease and has found no local row; this
 // reads the placement again and answers whether this node should still
 // create it. Outside a cluster there is nothing to check.
-func (s *Service) failoverRecreateStillOwned(ctx context.Context, id string, secrets cluster.PlacementSecrets) (bool, error) {
+//
+// When it should, firstCreated is when the cluster first placed the sandbox
+// (Placement.CreatedUnix), zero if unknown: the recreate keeps it as the
+// row's created_at (persistSandboxCreate).
+func (s *Service) failoverRecreateStillOwned(ctx context.Context, id string, secrets cluster.PlacementSecrets) (owned bool, firstCreated time.Time, err error) {
 	if s == nil || !s.cfg.EnableCluster {
-		return true, nil
+		return true, time.Time{}, nil
 	}
 	c := s.Cluster()
 	if c == nil {
-		return true, nil
+		return true, time.Time{}, nil
 	}
 	readCtx, cancel := context.WithTimeout(ctx, unmaterializedDeleteTimeout)
 	placements, err := c.AuthoritativePlacementsByIDs(readCtx, []string{id})
 	cancel()
 	if err != nil {
-		return false, fmt.Errorf("recreate %s: confirm placement before recreate: %w", id, err)
+		return false, time.Time{}, fmt.Errorf("recreate %s: confirm placement before recreate: %w", id, err)
 	}
 	p, ok := placements[id]
 	reason := ""
@@ -177,10 +181,13 @@ func (s *Service) failoverRecreateStillOwned(ctx context.Context, id string, sec
 	case strings.TrimSpace(secrets.IncarnationID) != "" && strings.TrimSpace(p.IncarnationID) != strings.TrimSpace(secrets.IncarnationID):
 		reason = "placement belongs to a newer lifetime"
 	default:
-		return true, nil
+		if p.CreatedUnix > 0 {
+			firstCreated = time.Unix(p.CreatedUnix, 0).UTC()
+		}
+		return true, firstCreated, nil
 	}
 	if s.logger != nil {
 		s.logger.Info("cluster: failover recreate skipped", "sandbox_id", id, "reason", reason)
 	}
-	return false, nil
+	return false, time.Time{}, nil
 }

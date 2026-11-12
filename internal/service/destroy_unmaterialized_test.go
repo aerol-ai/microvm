@@ -497,7 +497,7 @@ func TestFailoverRecreateStillOwned(t *testing.T) {
 			fc.mu.Lock()
 			tc.edit(fc)
 			fc.mu.Unlock()
-			got, err := svc.failoverRecreateStillOwned(ctx, id, secrets)
+			got, _, err := svc.failoverRecreateStillOwned(ctx, id, secrets)
 			if err != nil || got != tc.want {
 				t.Fatalf("failoverRecreateStillOwned = %v, %v; want %v", got, err, tc.want)
 			}
@@ -507,7 +507,7 @@ func TestFailoverRecreateStillOwned(t *testing.T) {
 	t.Run("unreadable", func(t *testing.T) {
 		svc, _, rt, fc := newFailoverWindowHarness(t, id)
 		fc.readErr = errors.New("no leader")
-		if _, err := svc.failoverRecreateStillOwned(ctx, id, secrets); err == nil {
+		if _, _, err := svc.failoverRecreateStillOwned(ctx, id, secrets); err == nil {
 			t.Fatal("an unreadable placement was taken as owned")
 		}
 		// The watcher counts it as a failed attempt and retries next tick.
@@ -519,7 +519,7 @@ func TestFailoverRecreateStillOwned(t *testing.T) {
 
 	t.Run("single node", func(t *testing.T) {
 		svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-		if got, err := svc.failoverRecreateStillOwned(ctx, id, secrets); err != nil || !got {
+		if got, _, err := svc.failoverRecreateStillOwned(ctx, id, secrets); err != nil || !got {
 			t.Fatalf("single node = %v, %v; want true", got, err)
 		}
 		if err := svc.destroyUnmaterializedPlacement(ctx, id, store.ErrNotFound); !errors.Is(err, store.ErrNotFound) {

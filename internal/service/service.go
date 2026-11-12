@@ -1770,13 +1770,14 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 			return true, leaseErr
 		}
 		defer release()
-		owned, err := s.failoverRecreateStillOwned(ctx, id, secrets)
+		owned, firstCreated, err := s.failoverRecreateStillOwned(ctx, id, secrets)
 		if err != nil {
 			return true, err
 		}
 		if !owned {
 			return false, nil
 		}
+		ctx = contextWithFailoverCreatedAt(ctx, firstCreated)
 	}
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
@@ -1966,6 +1967,26 @@ func isStoredSpecReplay(ctx context.Context) bool {
 	}
 	replay, _ := ctx.Value(storedSpecReplayKey{}).(bool)
 	return replay
+}
+
+// failoverCreatedAtKey carries into a failover recreate the time the cluster
+// first placed the sandbox, which persistSandboxCreate keeps as the new row's
+// created_at.
+type failoverCreatedAtKey struct{}
+
+func contextWithFailoverCreatedAt(ctx context.Context, at time.Time) context.Context {
+	if at.IsZero() {
+		return ctx
+	}
+	return context.WithValue(ctx, failoverCreatedAtKey{}, at)
+}
+
+func failoverCreatedAtFrom(ctx context.Context) time.Time {
+	if ctx == nil {
+		return time.Time{}
+	}
+	at, _ := ctx.Value(failoverCreatedAtKey{}).(time.Time)
+	return at
 }
 
 // validateCreateMounts applies the mount policy to a create request. The
@@ -3333,6 +3354,20 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
 		sandbox.CreateRequestDigest = digests[0]
 	}
+	// A failover recreate is the same sandbox on another node, so its row
+	// keeps the time the sandbox was first created. The age timers
+	// (StopAtAge, DestroyAtAge, and the E2B timeout, which is stored as an
+	// age) count from created_at and come back unchanged in the replicated
+	// spec, so a row stamped with the recreate time moved every deadline out
+	// by the sandbox's age. Billing still starts now: the usage cursor gets
+	// the time this node made the row, which the created_at fallback gave
+	// before (reconcileFallbackWindowStart).
+	madeAt := sandbox.CreatedAt
+	first := failoverCreatedAtFrom(ctx)
+	keepFirstCreated := !first.IsZero() && first.Before(madeAt)
+	if keepFirstCreated {
+		sandbox.CreatedAt = first.UTC()
+	}
 	// Every new row refuses the sandbox tokens issued before it. The
 	// not-before lives only in the owner's row, so a failover recreate (or
 	// a WASM recreate or migration) onto another node would otherwise come
@@ -3356,6 +3391,9 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	}
 	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
 		return err
+	}
+	if keepFirstCreated && s.usageEnabled() {
+		s.advanceUsageCursor(sandbox.ID, madeAt)
 	}
 	// A recreate-policy sandbox joins the lease file's fence now, not at the
 	// next read (T3). A channel send that never blocks; the file is written
