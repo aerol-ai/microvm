@@ -289,3 +289,67 @@ func BenchmarkKernelNetnsRealize(b *testing.B) {
 		b.StartTimer()
 	}
 }
+
+// The thread that made a namespace is back in its own before it is
+// unlocked (bindNewNetnsOnThread reports home).
+func TestKernelHostBindReturnsTheThread(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root in a privileged container")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bound")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(path, unix.MNT_DETACH) })
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	before := nsInode(t, "/proc/thread-self/ns/net")
+	home, err := bindNewNetnsOnThread(path)
+	if err != nil || !home {
+		t.Fatalf("bind = home %v, %v", home, err)
+	}
+	if got := nsInode(t, "/proc/thread-self/ns/net"); got != before {
+		t.Fatal("the thread that made the namespace was left in it")
+	}
+	if nsInode(t, path) == before {
+		t.Fatal("the file is bound to the thread's own namespace, not a new one")
+	}
+}
+
+// Go never ends the main thread: a locked goroutine that ended there,
+// inside a new namespace, wedged it there for good, and /proc/<pid>/ns/net
+// (the main thread's) then named a sandbox's network. With one P, the
+// goroutine a create starts runs on the thread that started it, which here
+// is often the main thread; many creates must leave every thread of the
+// process in the namespace it started in.
+func TestKernelHostCreatesLeaveEveryThreadHome(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root in a privileged container")
+	}
+	host := nsInode(t, "/proc/self/ns/net")
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	root := t.TempDir()
+	// Cleanups run last first: the root's mount goes after its namespaces.
+	t.Cleanup(func() { _ = unix.Unmount(root, unix.MNT_DETACH) })
+	for i := 0; i < 40; i++ {
+		name := fmt.Sprintf("home-%d", i)
+		if err := createNamedNetns(root, name); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		t.Cleanup(func() { _ = deleteNamedNetns(root, name) })
+	}
+	tasks, err := filepath.Glob("/proc/self/task/*/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range tasks {
+		var st unix.Stat_t
+		if unix.Stat(p, &st) != nil {
+			continue // the thread ended meanwhile
+		}
+		if st.Ino != host {
+			t.Fatalf("%s is in another namespace after the creates (the main thread is task %d)", p, os.Getpid())
+		}
+	}
+}

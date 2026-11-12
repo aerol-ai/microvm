@@ -70,9 +70,15 @@ func (r *ClusterReconciler) reconcileUpgrade(ctx context.Context, c *v1.AerolClu
 		// was replaced meanwhile): its own pod gets the new image, below.
 		return r.carryOut(ctx, ro, nodes)
 	}
+	if _, err = api.ApplyImages(ctx, want, upgradewire.ApplyRequest{Batch: "1", NodeTimeout: "15m"}); err != nil {
+		// Say so where kubectl describe shows it. A leader that refuses (a
+		// v0.7.2 one refused every images rollout) otherwise left only an
+		// info line in this log, beside an "upgrading" event at each retry.
+		r.event(c, corev1.EventTypeWarning, "UpgradeNotStarted", fmt.Sprintf("the upgrade from %s to %s did not start: %v", running, want, err))
+		return err
+	}
 	r.event(c, corev1.EventTypeNormal, "Upgrade", fmt.Sprintf("upgrading from %s to %s", running, want))
-	_, err = api.ApplyImages(ctx, want, upgradewire.ApplyRequest{Batch: "1", NodeTimeout: "15m"})
-	return err
+	return nil
 }
 
 // carryOut marks each node whose turn the leader marked: the node

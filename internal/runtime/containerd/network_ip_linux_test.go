@@ -80,7 +80,10 @@ func TestContainerIPv4Errors(t *testing.T) {
 		{"no pids", ipLookupTask{specErr: errors.New("x")}, "no running pid"},
 		{"pids error", ipLookupTask{specErr: errors.New("x"), pidsErr: errors.New("boom")}, "no running pid"},
 		{"dead pid", ipLookupTask{specErr: errors.New("x"), pids: []cntr.ProcessInfo{{Pid: 1<<31 - 2}}}, "netns from pid"},
-		{"unopenable spec path falls back to pids", ipLookupTask{spec: netnsSpec("/nonexistent/netns"), pidsErr: errors.New("x")}, "no running pid"},
+		// A pinned netns is the only answer: its failure is the lookup's,
+		// never a cue to read the pids (under runsc they are the sandbox's
+		// own, and pid 1 named sandboxd).
+		{"unopenable spec path never falls back to pids", ipLookupTask{spec: netnsSpec("/nonexistent/netns"), pids: []cntr.ProcessInfo{{Pid: uint32(os.Getpid())}}}, "open the pinned netns /nonexistent/netns"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var task cntr.Task
@@ -92,5 +95,19 @@ func TestContainerIPv4Errors(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestSameNetns(t *testing.T) {
+	self, err := netns.Get()
+	if err != nil {
+		t.Skipf("no netns handle here: %v", err)
+	}
+	defer self.Close()
+	if !sameNetns(self, netns.Get) {
+		t.Fatal("this thread's netns is not the same as itself")
+	}
+	if sameNetns(self, func() (netns.NsHandle, error) { return netns.None(), errors.New("closed") }) {
+		t.Fatal("a namespace that could not be opened counted as the same")
 	}
 }

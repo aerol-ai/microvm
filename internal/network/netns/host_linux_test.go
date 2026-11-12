@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -97,4 +98,24 @@ func TestCreateNamedNetnsFailsCleanly(t *testing.T) {
 			t.Fatalf("failed create left a file behind: %v", err)
 		}
 	})
+}
+
+// Without CAP_SYS_ADMIN the unshare fails before the thread leaves its
+// namespace: it is home, so bindNewNetns unlocks it, and the error names
+// the step. (The way back after a real unshare is in
+// TestKernelHostBindReturnsTheThread.)
+func TestBindNewNetnsUnprivilegedStaysHome(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("as root the unshare succeeds: TestKernelHostBindReturnsTheThread covers it")
+	}
+	path := filepath.Join(t.TempDir(), "sb-1")
+	if err := bindNewNetns(path); err == nil || !strings.Contains(err.Error(), "unshare a new netns") {
+		t.Fatalf("unprivileged bind = %v, want the unshare error", err)
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	home, err := bindNewNetnsOnThread(path)
+	if !home || err == nil {
+		t.Fatalf("unprivileged bind on this thread = home %v, %v; want home with an error", home, err)
+	}
 }
