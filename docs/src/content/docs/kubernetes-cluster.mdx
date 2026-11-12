@@ -40,6 +40,7 @@ Servers, gateways and the operator run under the `restricted` pod security level
 - The `br_netfilter` kernel module loaded on the worker machines. Stock Amazon Linux 2023 does not load it: add `modprobe br_netfilter` to the node image or its user data, and list it in `/etc/modules-load.d`.
 - [cert-manager](https://cert-manager.io). The operator's webhook gets its certificate from it, and so do [sandbox links over HTTPS](/kubernetes/#sandbox-links-over-https).
 - A storage class that binds a disk when a pod first uses it (`volumeBindingMode: WaitForFirstConsumer`), so each server's disk lands in its own zone. EKS's `gp3` and AKS's `managed-csi` do.
+- In each zone, a machine for AerolVM's own pods with room for one server and one gateway: by default they ask for 1.5 CPU and 2.5 GiB, plus 0.1 CPU for an operator replica, next to the cluster's own pods (DNS, the network and storage drivers). Use machines with 4 or more CPUs there: a 2-CPU machine, such as `m7i.large`, has about 1.9 CPUs to give out, so a server may not fit beside the rest and stays Pending. `kubectl get aerolnodes` then shows the scheduler's reason, such as "Insufficient cpu".
 - Helm 3.8 or later, and `kubectl`.
 - For worker machines that come and go with load: Karpenter on EKS, or Node Auto Provisioning on AKS. Without them, add machines to the worker pool yourself.
 

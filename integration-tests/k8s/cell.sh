@@ -5,10 +5,12 @@
 #
 #   cell.sh <name> [up|build|install|preflight|chaos|verify|down|all]
 #
-# up        EKS over three zones: 3 system nodes (servers, gateways,
-#           operator), 3 worker machines with IMDSv2 and a hop limit of 1,
-#           the EBS CSI driver, the VPC CNI enforcing NetworkPolicies, and
-#           ECR repositories for this run.
+# up        EKS over three zones: 3 system nodes with 4 CPUs (servers,
+#           gateways, operator; on 2-CPU nodes their requests and the
+#           cluster's own pods come within 0.3 CPU of full, and p2-sig-2
+#           had a server Pending), 3 worker machines with IMDSv2 and a hop
+#           limit of 1, the EBS CSI driver, the VPC CNI enforcing
+#           NetworkPolicies, and ECR repositories for this run.
 # build     The commit's source (~12 MB) to S3; Go and BuildKit build the
 #           images inside the cluster and push them to ECR. No binary or
 #           image crosses this machine's uplink.
@@ -49,7 +51,7 @@ up() {
   # A release's images come from ghcr.io: no ECR repositories for it.
   local ecr=(--ecr aerolvm,aerolvm-runtime,aerolvm-operator)
   [[ -n "${AEROL_RELEASE:-}" ]] && ecr=()
-  "$HERE/cluster.sh" up "$name" --ttl "${AEROL_TTL:-4h}" --zones 3 --system 3 --system-type m7i.large \
+  "$HERE/cluster.sh" up "$name" --ttl "${AEROL_TTL:-4h}" --zones 3 --system 3 --system-type m7i.xlarge \
     --workers 3 --type m7i.xlarge --imds-hop-limit 1 --ebs-csi --network-policy \
     ${ecr[@]+"${ecr[@]}"}
 }
