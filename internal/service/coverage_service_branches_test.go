@@ -14,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -601,14 +602,8 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	}
 
 	// Health should surface degraded probes, including the SSH gateway.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
 	svc.cfg.EnableSSHGateway = true
-	svc.cfg.SSHListenAddr = addr
+	svc.cfg.SSHListenAddr = testport.Addr(t) // nothing listens here
 	svc.cfg.EnableFirecracker = true
 	svc.cfg.EnableWasm = true
 	svc.docker = &recordingRuntime{pingErr: errors.New("docker down")}

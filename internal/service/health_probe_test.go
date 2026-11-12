@@ -5,9 +5,9 @@ import (
 	"net"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 func TestProbeSSHGatewaySucceedsWhenListenerAccepts(t *testing.T) {
@@ -32,18 +32,8 @@ func TestProbeSSHGatewaySucceedsWhenListenerAccepts(t *testing.T) {
 }
 
 func TestProbeSSHGatewayFailsWhenNothingListening(t *testing.T) {
-	// Pick a port, close the listener, then probe — guaranteed connection refused.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-
-	// Give the kernel a beat to mark the port as not listening.
-	time.Sleep(50 * time.Millisecond)
-
-	err = probeSSHGateway(context.Background(), addr)
+	// A reserved port nothing binds, so the probe gets connection refused.
+	err := probeSSHGateway(context.Background(), testport.Addr(t))
 	if err == nil {
 		t.Fatal("expected probe to fail with no listener")
 	}
@@ -85,12 +75,7 @@ func TestHealthSSHGatewayFollowsNodeRole(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
-	gone, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	down := gone.Addr().String()
-	_ = gone.Close()
+	down := testport.Addr(t) // nothing listens here
 
 	cases := []struct {
 		name       string
