@@ -3,7 +3,7 @@
 HTTP helper as load.py. Each command prints one JSON value and exits 0 on
 success, 1 on an API error.
 
-  api.py --url U --token-file F create --run R --n 3 [--recreate] [--allow-out CIDR ...] [--tag k=v] [--disk-gb N] [--nonce X]
+  api.py --url U --token-file F create --run R --n 3 [--recreate] [--allow-out CIDR ...] [--tag k=v] [--disk-gb N] [--zone Z] [--nonce X]
   api.py ... exec ID -- sh -c 'echo hi'
   api.py ... get ID
   api.py ... list --run R
@@ -43,6 +43,8 @@ def main():
     c.add_argument("--profile", nargs="*", default=[])
     c.add_argument("--tag", nargs="*", default=[])
     c.add_argument("--disk-gb", type=int, default=0)
+    # --zone places the sandbox in that zone (a placement rule).
+    c.add_argument("--zone", default="")
     # The idempotency key is drill-<run>-<i>: a nonce makes a repeat of the
     # same run a new create instead of an answer from the first one.
     c.add_argument("--nonce", default="")
@@ -120,6 +122,8 @@ def main():
                 body["egress_profiles"] = a.profile
             if a.disk_gb:
                 body["disk_gb"] = a.disk_gb
+            if a.zone:
+                body["placement"] = {"zone": a.zone}
             key = f"drill-{a.run}-{a.nonce}-{i}" if a.nonce else f"drill-{a.run}-{i}"
             code, res = call(u, token, "POST", "/v1/sandboxes", body, key=key, timeout=180)
             if not 200 <= code < 300:

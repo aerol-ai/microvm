@@ -521,14 +521,23 @@ drill_zone_loss() {
 # machine's real evictionHard. It runs only when disk-own showed the
 # watchdog stops a writer, so a broken watchdog cannot fill the disk.
 
-# on_worker <run> <disk_gb> <worker>: one sandbox placed on that worker,
-# found by creating until one lands there.
+# on_worker <run> <disk_gb> <worker>: one sandbox placed on that worker.
+# The create names the worker's zone (the cell has one worker per zone);
+# placement would otherwise prefer emptier workers, and the drill's worker
+# already holds its neighbour (run p3-drills-3: 12 creates, none landed
+# there). Each failed create says why, in the drill log.
 on_worker() {
-  local i id
-  for i in $(seq 1 12); do
-    id="$(api create --run "$1-$i" --n 1 --disk-gb "$2" | jget 'd[0]')" || continue
-    api wait --run "$1-$i" --n 1 >/dev/null || continue
+  local i id out zone
+  zone="$(member_of "$3" | jq -r '.zone // empty')"
+  for i in $(seq 1 6); do
+    if ! out="$(api create --run "$1-$i" --n 1 --disk-gb "$2" ${zone:+--zone "$zone"} 2>&1)"; then
+      say "on_worker: create $i for $3 failed: $(head -c 300 <<<"$out")" >&2
+      continue
+    fi
+    id="$(jget 'd[0]' <<<"$out")" || continue
+    api wait --run "$1-$i" --n 1 >/dev/null || { say "on_worker: $id did not start" >&2; continue; }
     if [[ "$(api owner "$id" | jq -r .owner)" == "$3" ]]; then echo "$id"; return 0; fi
+    say "on_worker: $id landed on $(api owner "$id" | jq -r .owner), not $3" >&2
     api delete-run --run "$1-$i" >/dev/null || true
   done
   return 1
@@ -577,7 +586,7 @@ drill_disk_full() {
     api delete-run --run "$run-k" >/dev/null 2>&1 || true
   }
   # disk-own
-  writer="$(on_worker "$run-a" 2 "$w")" || { result FAIL disk-own "no sandbox landed on $w in 12 tries"; disk_cleanup; return; }
+  writer="$(on_worker "$run-a" 2 "$w")" || { result FAIL disk-own "no sandbox landed on $w"; evidence disk-own; disk_cleanup; return; }
   api session-start "$writer" -- sh -c 'dd if=/dev/zero of=/fill bs=1M; sleep 86400' >/dev/null
   local st reason secs
   read -r st reason secs < <(writer_stop "$writer" 360)
@@ -606,7 +615,7 @@ drill_disk_full() {
   node="$(kc -n "$workers" get pod "$w" -o jsonpath='{.spec.nodeName}')"
   evict="$(kc get --raw "/api/v1/nodes/$node/proxy/configz" 2>/dev/null | jq -c '.kubeletconfig.evictionHard' || echo unknown)"
   say "disk-floor: $w has $free of $total MB free, floor $floor: a writer with $gb GB; kubelet evictionHard on $node: $evict"
-  writer="$(on_worker "$run-b" "$gb" "$w")" || { result FAIL disk-floor "no sandbox landed on $w in 12 tries"; disk_cleanup; return; }
+  writer="$(on_worker "$run-b" "$gb" "$w")" || { result FAIL disk-floor "no sandbox landed on $w"; evidence disk-floor; disk_cleanup; return; }
   api session-start "$writer" -- sh -c 'dd if=/dev/zero of=/fill bs=1M; sleep 86400' >/dev/null
   local t0 refused=no low="" reasons=""
   t0=$(date +%s)
