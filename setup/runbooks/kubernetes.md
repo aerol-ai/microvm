@@ -329,12 +329,18 @@ forward: scaling, upgrades and decommissions all wait.
 
 - The operator's log: each error names the object and the reason.
 - Can the operator reach the Kubernetes API, and the AerolVM servers' API?
+  An operator pod that restarts again and again on its liveness probe, with
+  nothing in its log, cannot reach the API at all.
 - Did someone change its RBAC, or the AerolCluster, just before?
 
 **Fix.**
 
 - A Kubernetes API outage: nothing to do in AerolVM. It catches up when the
   API is back.
+- On EKS with network policies on: a pod that started while an egress
+  NetworkPolicy selected it can keep that policy's block after the policy
+  is deleted (seen with aws-network-policy-agent v1.4.0-eksbuild.4). Delete
+  the operator pods. The new ones start without the old block.
 - A refused AerolVM API call: check the admin credential Secret the operator
   uses.
 - An invalid AerolCluster change: undo it. `kubectl describe aerolcluster`

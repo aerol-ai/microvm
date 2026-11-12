@@ -1962,6 +1962,85 @@ Two runs before it did not count:
 
 Not yet: external-CA mode (C23), which is refused with a reason until built.
 
+### Phase 3 results
+
+**The §19 drills on EKS** (2026-11-12, `integration-tests/k8s/drills.sh` through
+`cell.sh <name> drills`; the Phase 2 cell: EKS 1.36, us-east-1a/b/c, 3 system
+nodes with 4 CPUs, 3 m7i.xlarge workers, gVisor, the VPC CNI enforcing
+NetworkPolicies, the disk floor at 0.30). Four runs: `p3-drills-1` ran every
+drill; `p3-drills-2`, `p3-drills-3` and `p3-drills-4` ran again the ones that
+failed, on builds with their fixes. Every drill passes. A failed drill now leaves evidence (AerolNodes, pods,
+events, every container's log) and, for zone loss and rotation, a timeline of
+one picture a minute.
+
+| Drill | Result | Measured |
+|---|---|---|
+| Kill the Raft leader and a worker during 50 creates | pass (run 1) | 50 of 50 started, none lost or doubled; the worker's 5 recreate sandboxes back in 17.8 to 21.2 s; leadership moved |
+| Sandbox probes the cluster network (C24) | pass (run 1) | no profile: nothing internal answers; a profile opening one range reaches only that range |
+| Bank network policy: deny all egress | pass (run 1) | an "allow all" sandbox reached the internet before, and was refused under the bank's policy; exec still worked |
+| Kill a gateway mid-stream | pass (run 1) | read 12 lines, killed the gateway, read 24 more through another, none missing |
+| Delete a worker pod (C26) | pass (run 1) | a plain delete refused; the forced one went through and was counted |
+| Kubernetes API cut off for 10 minutes | pass (run 1) | 39 create and exec rounds, 0 failed |
+| Mixed versions N and N-1 for one hour | pass (run 1) | 102 rounds, 0 failed |
+| Delete a worker pod during a rollout (C26) | pass (run 1) | refused |
+| Kill the operator and Raft leaders during a rollout (C13) | pass (run 1) | finalized, nodes in the leader's order, none stepped twice |
+| Upgrade during load (G8) | pass (run 1) | 9 sandboxes kept their sessions; no runtime container restarted |
+| Zone loss (G1) | pass (run 2, after F22) | 1 of 18 creates failed, longest gap 28 s; the zone's 4 recreate sandboxes all back in 46 s. Run 1: 55 s |
+| One sandbox fills its disk (C27) | pass (run 4, after F23) | a writer with a 2 GB disk stopped by the watchdog in 33 s (`disk_limit`); a writer allowed 40 GB took the volume under the 0.30 floor: the worker refused new sandboxes at 14.7 of 61.4 GB free, a create went to another worker, the writer stopped at its own limit, the neighbour sandbox and the agent kept working, the worker pod was not evicted, and it admitted again once the writer was gone |
+| Machine rotation (G8) | pass (run 3, after F24) | a new launch template version over the whole worker node group: 676 s; 3 workers serving 7 s after it; all 6 `recreate` sandboxes moved and running; the 3 without `recreate` ended with their machines (the API no longer has them); `verify` passed every rule afterwards |
+
+Findings, each fixed before the next run:
+
+- F21. Before the drills, the v0.7.2 upgrade test on kind found three bugs. On
+  Kubernetes, an images rollout asked for files it never needs, so upgrades
+  never started (#1205). The operator gave no reason when it could not start
+  one, and every gateway pod logged FailedMount warnings for its spent join
+  token (#1207). And on one worker every gVisor create was refused: a network
+  namespace build that ended on Go's main thread left that thread inside a
+  sandbox's namespace, and the address check then read the wrong one (#1206).
+  All shipped in v0.7.3.
+- F22. Zone loss: calls between AerolVM nodes had no connect timeout and no
+  way to notice a peer that vanished (a cut zone sends nothing back). A
+  control-plane call that met a server in the cut zone failed instead of
+  trying the next one. Creates stopped for 55 s on EKS; on kind one hung for
+  3 minutes. Now: 3 s connect, 5 s handshake, keepalive and
+  `TCP_USER_TIMEOUT` of 15 s, and a call that could not connect moves on
+  (#1209). Run 2: 28 s, inside the 30 s bar.
+- F23. The disk watchdog stopped a gVisor sandbox that had written 3.6 GB,
+  but the containerd stop deleted the task before runsc had torn it down
+  ("cannot delete a running container"). The stop counted as failed, and the
+  exit was recorded as the sandbox's own (`program_exited`, not
+  `disk_limit`). The delete is now retried for up to 5 s (#1210).
+- F24. Rotation, with `minWorkers` = `maxWorkers` = 3 and no cluster
+  autoscaler: one new worker failed its preflight, the floor gave the pool's
+  last slot to that zone again, and another zone was left with no worker. Its
+  extra worker then waited for a machine forever. The floor now fills zones
+  with nothing first, and a worker that never got a machine gives its slot
+  back once its zone serves again (#1211).
+- F25. EKS: after the API drill deleted its egress NetworkPolicy, the
+  operator pods that had started under it still could not reach the
+  Kubernetes API (aws-network-policy-agent v1.4.0-eksbuild.4); they restarted
+  on their liveness probe with empty logs. Deleting them fixed it. In the
+  runbook (`setup/runbooks/kubernetes.md`).
+- Harness: the cell loaded `br_netfilter` (F2) only on the machines there at
+  install, so a rotation's new machines failed preflight. A DaemonSet now
+  stands in for a machine image that loads it. The rotation drill counted its
+  sandboxes from a list made afterwards, so one that was gone did not count.
+  The disk-floor drill waited for its writer to land on one worker by chance,
+  but placement prefers emptier workers; the writer now names the worker's
+  zone.
+- The cell's sandbox volume is the machine's root disk, where kubelet's
+  default eviction lines (imagefs 15% free, nodefs 10%) sit at or above the
+  chart's disk floor of 0.10, so eviction could come before the floor. The
+  cell sets 0.30. Run 4 measured both sides: kubelet's `evictionHard` on the
+  AL2023 workers is `nodefs.available: 10%` (images share the disk), and the
+  writer went on 3.7 GB past the floor to its own limit, because the floor
+  only turns new sandboxes away. The chart's default floor is now 0.20 and
+  its disk alert fires at 70% used (#1212).
+
+Next in Phase 3: the 72-hour soak and the cell-ceiling bench (G3), each run
+only with the owner's go-ahead on its cost.
+
 ## 19. Tests, drills and benchmarks
 
 ### Offline (`make test`)
