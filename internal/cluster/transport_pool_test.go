@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,8 +19,8 @@ import (
 func TestInternalTransportPoolSizing(t *testing.T) {
 	t.Parallel()
 	tr := newInternalTransport(&tls.Config{}) //nolint:gosec // sizing test only
-	if tr.MaxIdleConns != 64 || tr.MaxIdleConnsPerHost != 16 {
-		t.Fatalf("internal pool = %d/%d, want 64/16 (Tier 1 Phase 4)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	if tr.MaxIdleConns != 1024 || tr.MaxIdleConnsPerHost != 128 {
+		t.Fatalf("internal pool = %d/%d, want 1024/128 (C18, bench-full-5)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
 	}
 	if tr.DisableKeepAlives {
 		t.Fatal("internal transport must keep keep-alives on")
@@ -64,6 +65,66 @@ func TestInternalTransportIdlePoolReuse(t *testing.T) {
 	}
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("dials = %d for %d sequential requests, want 1 (idle pool reuse)", got, n)
+	}
+}
+
+// A burst of concurrent calls to one peer keeps its connections for the next
+// burst: two bursts of 48 dial 48 times. With 16 idle per host they dialled
+// 80 times, each a TLS handshake (C18, bench-full-5: a gateway's 40 to 170
+// calls at once to a server).
+func TestInternalTransportKeepsABurstsConnections(t *testing.T) {
+	t.Parallel()
+	const burst = 48
+	var (
+		mu      sync.Mutex
+		arrived int
+		release chan struct{}
+	)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		wait := release
+		if arrived++; arrived%burst == 0 {
+			close(release)
+		}
+		mu.Unlock()
+		<-wait
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	tr := newInternalTransport(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test-only
+	var dials atomic.Int64
+	dialer := &net.Dialer{}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return dialer.DialContext(ctx, network, addr)
+	}
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	for round := range 2 {
+		// Every call of the burst is in flight at once: the handler holds
+		// each until the burst's last one arrives.
+		mu.Lock()
+		release = make(chan struct{})
+		mu.Unlock()
+		done := make(chan error, burst)
+		for range burst {
+			go func() {
+				resp, err := client.Get(srv.URL + "/ping")
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					err = resp.Body.Close()
+				}
+				done <- err
+			}()
+		}
+		for range burst {
+			if err := <-done; err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+	if got := dials.Load(); got != burst {
+		t.Fatalf("dials = %d for two bursts of %d, want %d: the second burst re-handshook", got, burst, burst)
 	}
 }
 

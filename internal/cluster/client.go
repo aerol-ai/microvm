@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1302,15 +1303,8 @@ func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bo
 }
 
 func (c *Cluster) memberAlive(nodeID string) bool {
-	if c.gossip == nil {
-		return false
-	}
-	for _, m := range c.gossip.members() {
-		if m.NodeID == nodeID {
-			return m.Alive
-		}
-	}
-	return false
+	m, ok := c.gossip.memberByID(nodeID)
+	return ok && m.Alive
 }
 
 func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string, force bool) error {
@@ -1976,6 +1970,27 @@ func (c *Cluster) membersWithCapacity() []Member {
 		return members
 	}
 	return c.capacityLeases.apply(members, time.Now())
+}
+
+// membersWithCapacityFor is membersWithCapacity for the named members only.
+// The leader's reservation check needs each reservation's owner, not the
+// fleet: the full copy and its lease overlay were a tenth of the leader's
+// CPU at 500 workers (C18, bench-full-4). A name the index does not hold is
+// left out, as the full list leaves out a member gossip no longer has.
+func (c *Cluster) membersWithCapacityFor(nodeIDs []string) []Member {
+	out := make([]Member, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		if slices.ContainsFunc(out, func(m Member) bool { return m.NodeID == id }) {
+			continue
+		}
+		if m, ok := c.gossip.memberByID(id); ok {
+			out = append(out, m)
+		}
+	}
+	if c.capacityLeases != nil {
+		c.capacityLeases.applyInPlace(out, time.Now())
+	}
+	return out
 }
 
 // pendingLoadByNode is the load placement adds to each node's last capacity
