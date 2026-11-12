@@ -64,7 +64,9 @@ func (c *specWriteCounter) counts() (writes, reads int) {
 //     failover=recreate, the one case that reads it back. A default sandbox's
 //     keep-alive costs nothing on the servers.
 //   - The timeout is stored as an age (elapsed time plus the new timeout), so
-//     on a failover sandbox each setTimeout changes it and writes once.
+//     each setTimeout moves it later. On a failover sandbox the replicated
+//     copy may lag by up to a minute (replicateRecoveryLifecycle): a repeat
+//     within the minute writes nothing, a jump of more than a minute writes.
 func TestE2BTimeoutRoutesRaftWrites(t *testing.T) {
 	type step struct {
 		name       string
@@ -87,7 +89,7 @@ func TestE2BTimeoutRoutesRaftWrites(t *testing.T) {
 		}},
 		{"failover=recreate sandbox", true, []step{
 			{"setTimeout", "/timeout", `{"timeout":300}`, http.StatusNoContent, 1, -1},
-			{"setTimeout again, same value", "/timeout", `{"timeout":300}`, http.StatusNoContent, 1, -1},
+			{"setTimeout again, same value", "/timeout", `{"timeout":300}`, http.StatusNoContent, 0, -1},
 			{"connect that extends the timeout", "/connect", `{"timeout":3600}`, http.StatusOK, 1, -1},
 			{"connect that does not extend it", "/connect", `{"timeout":1}`, http.StatusOK, 0, 0},
 		}},

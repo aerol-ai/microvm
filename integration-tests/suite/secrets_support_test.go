@@ -235,6 +235,44 @@ func awaitNewOwner(t *testing.T, c *harness.Client, sandboxID, previous string, 
 	return ""
 }
 
+// awaitRecreated waits, after awaitNewOwner, until the new owner serves the
+// sandbox and it runs there, then refreshes sb. The placement moves before the
+// owner watcher rebuilds the sandbox, and until then a read answers 404
+// "sandbox not found". waitRunning cannot wait for this: sb still says
+// "started" from before the kill, so it returns at once.
+func awaitRecreated(t *testing.T, c *harness.Client, sb *microvm.Sandbox, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	last := "no read yet"
+	for time.Now().Before(deadline) {
+		var view struct {
+			Status    string `json:"status"`
+			LastError string `json:"last_error"`
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := c.GetJSON(ctx, "/v1/sandboxes/"+sb.ID, &view)
+		cancel()
+		switch {
+		case err != nil:
+			last = err.Error()
+		case view.Status == "started":
+			rctx, rcancel := context.WithTimeout(context.Background(), 20*time.Second)
+			err := sb.Refresh(rctx)
+			rcancel()
+			if err != nil {
+				t.Fatalf("refresh %s after the recreate: %v", sb.ID, err)
+			}
+			return
+		case view.Status == "error":
+			t.Fatalf("sandbox %s was recreated in error state: %s", sb.ID, view.LastError)
+		default:
+			last = "status " + view.Status
+		}
+		time.Sleep(3 * time.Second)
+	}
+	t.Fatalf("sandbox %s was reassigned but not running on its new owner within %s: %s", sb.ID, timeout, last)
+}
+
 // execEnvValue reads one environment variable from INSIDE the sandbox.
 //
 // This is the difference between "the sandbox is running" and "its credentials
