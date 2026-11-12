@@ -195,6 +195,31 @@ func TestKubernetesManagedOnALiveLeader(t *testing.T) {
 	}
 }
 
+// The operator's own request, end to end through ApplyRollout: an images
+// rollout names no files, and a node of any CPU type takes it. The first
+// version refused it at the per-node files check, so no spec.version
+// change on Kubernetes ever started an upgrade.
+func TestApplyImagesRolloutOnALiveLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestClusterWithCfg(t, "ldr-img", true, nil, func(cfg *config.Config) {
+		cfg.UpgradeDriver = config.UpgradeDriverOperator
+	})
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := WithUpgradeDriver(context.Background(), "operator")
+	out, created, err := c.ApplyRollout(ctx, "operator", upgradewire.ApplyRequest{
+		Version: "v9.9.9", Source: upgradewire.SourceImages, Batch: "1", NodeTimeout: "15m", AllowDowntime: true,
+	})
+	if err != nil || out == nil || !created {
+		t.Fatalf("images rollout = %+v created %v: %v", out, created, err)
+	}
+	if out.Source != upgradewire.SourceImages || out.TargetVersion != "v9.9.9" {
+		t.Fatalf("rollout = %+v", out)
+	}
+}
+
 func rolloutCode(err error) string {
 	var re *RolloutError
 	if errors.As(err, &re) {
