@@ -31,6 +31,12 @@ const lifecycleReplicationLag = time.Minute
 // Ages count from created_at, and a failover recreate keeps the first create
 // time (persistSandboxCreate), so the replicated deadline is the same on
 // every node.
+//
+// On a worker the replicated spec is read from a random server, and a
+// follower serves it before it has applied the last write. So the call right
+// after a write can read the copy from before it and write again, with the
+// same content: a write is sometimes followed by one or two more, live
+// (UC-704) 2 entries for 100 calls in 5 s, against 100 before.
 func (s *Service) replicateRecoveryLifecycle(ctx context.Context, id string, sb *models.Sandbox, lc models.Lifecycle) {
 	sb, ok := s.recoverySpecWanted(ctx, id, sb)
 	if !ok {

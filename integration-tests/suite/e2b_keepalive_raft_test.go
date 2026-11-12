@@ -5,6 +5,7 @@ package suite
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -113,11 +114,14 @@ func TestE2BKeepAliveRaftCost(t *testing.T) {
 	if defaultPerCall > 0.2 {
 		t.Errorf("default sandbox: %.2f Raft entries per setTimeout, want 0 (nothing reads its replicated lifecycle back)", defaultPerCall)
 	}
-	// The first call replicates the new timer; after that at most one entry
-	// per minute of calls (lifecycleReplicationLag).
-	if maxEntries := 1.5 + haElapsed.Minutes(); haEntries < 0.5 || haEntries > maxEntries {
+	// The first call replicates the new timer, then about one entry a minute
+	// (lifecycleReplicationLag). A write can be followed by one or two more:
+	// the next call reads the spec from a random server, and a follower that
+	// has not applied the write yet returns the copy from before it. So allow
+	// up to 5 per started minute; one per call (before the lag) is 100.
+	if maxEntries := 5 * (1 + math.Floor(haElapsed.Minutes())); haEntries < 0.5 || haEntries > maxEntries {
 		t.Errorf("failover=recreate sandbox: %.1f Raft entries for %d setTimeout calls in %s, want 1 to %.0f (the first, then about one a minute)",
-			haEntries, e2bKeepAliveCalls, haElapsed.Round(time.Second), maxEntries-0.5)
+			haEntries, e2bKeepAliveCalls, haElapsed.Round(time.Second), maxEntries)
 	}
 }
 
