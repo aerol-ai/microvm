@@ -139,6 +139,34 @@ YAML
   say "install: chart $tag in $ns, zones $zones, in $(( $(date +%s) - t0 ))s"
 }
 
+# diagnose saves, before the cluster can be torn down, why each AerolNode
+# that is not Serving is stuck: the AerolNode, its pod and every container's
+# log (init containers too, and the previous run of each), its volume claim,
+# and the namespaces' recent events. The second signed-image run (p2-sig-2)
+# had a server Pending for 14 minutes and was destroyed with none of this.
+# Every command may fail (no pod yet, no previous run) under set -e, so
+# each one is allowed to.
+diagnose() {
+  local d="$sd/diag-$(date +%H%M%S)" n role pns c
+  mkdir -p "$d"
+  for n in $(kubectl -n "$ns" get aerolnodes -o json 2>/dev/null | jq -r '.items[] | select(.status.state != "Serving") | .metadata.name' || true); do
+    role="$(kubectl -n "$ns" get aerolnode "$n" -o jsonpath='{.spec.role}' 2>/dev/null || true)"
+    pns="$ns"; [[ "$role" == worker ]] && pns="$workers"
+    {
+      kubectl -n "$ns" describe aerolnode "$n" || true
+      kubectl -n "$pns" describe pod "$n" || true
+      kubectl -n "$pns" get pvc -o wide || true
+      for c in $(kubectl -n "$pns" get pod "$n" -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null || true); do
+        echo "--- $c"; kubectl -n "$pns" logs "$n" -c "$c" --tail=200 || true
+        echo "--- $c (previous)"; kubectl -n "$pns" logs "$n" -c "$c" --previous --tail=100 || true
+      done
+    } > "$d/$n.txt" 2>&1
+    say "diagnose: $n ($role) is $(kubectl -n "$ns" get aerolnode "$n" -o jsonpath='{.status.state}: {.status.reason}' 2>/dev/null || true); details in $d/$n.txt"
+  done
+  { kubectl get events -A --sort-by=.lastTimestamp 2>&1 || true; } | tail -80 > "$d/events.txt"
+  kubectl -n "$ns" logs deploy/aerolvm-operator --tail=300 > "$d/operator.txt" 2>&1 || true
+}
+
 # wait_phase <phase> <seconds>
 wait_phase() {
   local p="" i
@@ -149,6 +177,7 @@ wait_phase() {
   done
   say "the AerolCluster is ${p:-missing}, not $1, after $2s"
   kubectl -n "$ns" get aerolcluster,aerolnodes | tee -a "$report"
+  diagnose
   return 1
 }
 
@@ -164,6 +193,7 @@ wait_workers() {
   done
   say "$n of $1 workers Serving after $2s"
   kubectl -n "$ns" get aerolnodes | tee -a "$report"
+  diagnose
   return 1
 }
 
