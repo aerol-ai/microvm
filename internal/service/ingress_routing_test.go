@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/hostport"
 	"github.com/aerol-ai/microvm/internal/routedns"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -101,22 +102,11 @@ func (f *recordingHostPorts) Reconcile(desired map[int]hostport.Target) error {
 	return nil
 }
 
+// freeLoopbackPort is an address free for TCP and UDP that the test binds
+// later. testport keeps it from another socket in between.
 func freeLoopbackPort(t *testing.T) string {
 	t.Helper()
-	for i := 0; i < 20; i++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		if pc, err := net.ListenPacket("udp", addr); err == nil {
-			_ = pc.Close()
-			return addr
-		}
-	}
-	t.Fatal("no free loopback port for tcp+udp")
-	return ""
+	return testport.UDPAddr(t)
 }
 
 const baseCaddyConfig = `{"apps":{"http":{"servers":{"srv0":{"routes":[

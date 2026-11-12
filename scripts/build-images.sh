@@ -8,8 +8,8 @@
 #                           [--metadata-dir <dir>] [--images aerolvm,aerolvm-runtime]
 #
 # --dist holds the release build's files, named as release.yml names them:
-# sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>
-# and caddy_linux_<arch>, for each platform. Third-party pins and base images
+# sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>,
+# caddy_linux_<arch> and aerolvm-operator_linux_<arch>, for each platform. Third-party pins and base images
 # come from packaging/images/versions.env.
 #
 # With --push the images go to the registry with an SBOM and SLSA provenance
@@ -19,7 +19,7 @@
 # (single mode needs no aerolvm-edge, so `make k8s-dev` skips the Caddy build).
 set -euo pipefail
 
-dist="" version="" registry="ghcr.io/aerol-ai" platforms="" push=0 meta="" images="aerolvm,aerolvm-runtime,aerolvm-edge"
+dist="" version="" registry="ghcr.io/aerol-ai" platforms="" push=0 meta="" images="aerolvm,aerolvm-runtime,aerolvm-edge,aerolvm-operator"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dist) dist="$2"; shift 2 ;;
@@ -53,6 +53,7 @@ for platform in ${platforms//,/ }; do
   mkdir -p "$ctx/$arch"
   bins="sandboxd toolboxd aerolvm-supervisor"
   [[ ",$images," == *,aerolvm-edge,* ]] && bins="$bins caddy"
+  [[ ",$images," == *,aerolvm-operator,* ]] && bins="$bins aerolvm-operator"
   for bin in $bins; do
     src="$dist/${bin}_linux_${arch}"
     [[ -f "$src" ]] || { echo "build-images: missing $src" >&2; exit 1; }
@@ -67,7 +68,7 @@ while IFS='=' read -r key value; do
 done < "$root/packaging/images/versions.env"
 
 for image in ${images//,/ }; do
-  case "$image" in aerolvm|aerolvm-runtime|aerolvm-edge) ;; *) echo "build-images: unknown image $image" >&2; exit 2 ;; esac
+  case "$image" in aerolvm|aerolvm-runtime|aerolvm-edge|aerolvm-operator) ;; *) echo "build-images: unknown image $image" >&2; exit 2 ;; esac
   file="$root/packaging/images/${image#aerolvm-}.Dockerfile"
   [[ "$image" == aerolvm ]] && file="$root/packaging/images/aerolvm.Dockerfile"
   out=(--load)

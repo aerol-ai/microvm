@@ -41,6 +41,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_OTEL_METRICS_ENABLED",
 			"SB_OTEL_METRICS_ENDPOINT",
 			"SB_OTEL_METRICS_INTERVAL",
+			"SB_USAGE_METRICS_ENABLED",
 			"SB_OTEL_TRACES_ENABLED",
 			"SB_OTEL_TRACES_ENDPOINT",
 			"SB_OTEL_TRACES_SAMPLE_RATIO",
@@ -133,6 +134,11 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || cfg.OTELMetricsInterval != 30*time.Second || cfg.OTELTracesEnabled || cfg.OTELTracesEndpoint != "" || cfg.OTELTracesSampleRatio != 0.05 || cfg.OTELServiceName != "sandboxd" {
 					t.Fatalf("unexpected otel defaults: %+v", cfg)
+				}
+				// The usage exporter is off unless an operator (or the
+				// Kubernetes chart) turns it on: owner names become labels.
+				if cfg.UsageMetricsEnabled {
+					t.Fatalf("expected UsageMetricsEnabled off by default, got %+v", cfg)
 				}
 				if cfg.ImagePullMaxConcurrent != 4 || cfg.ImagePullFailureBackoff != 30*time.Second {
 					t.Fatalf("unexpected image pull defaults: %+v", cfg)
@@ -598,9 +604,13 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_IMAGE_PULL_MAX_CONCURRENT", "8")
 				t.Setenv("SB_IMAGE_PULL_FAILURE_BACKOFF", "2m")
 				t.Setenv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "ALWAYS")
+				t.Setenv("SB_USAGE_METRICS_ENABLED", "true")
 				cfg, err := Load()
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.UsageMetricsEnabled {
+					t.Fatalf("expected SB_USAGE_METRICS_ENABLED=true to turn the usage exporter on: %+v", cfg)
 				}
 				if cfg.APIHost != "127.0.0.1" || cfg.APIPort != 9001 || cfg.DBPath != "/tmp/test.db" {
 					t.Fatalf("unexpected override values: %+v", cfg)

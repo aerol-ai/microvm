@@ -44,7 +44,7 @@ func (d *voterAutoJoinDelegate) NotifyLeave(n *memberlist.Node) {
 	if d.c == nil || n == nil {
 		return
 	}
-	go d.c.handleMemberLeave(n.Name)
+	go d.c.handleMemberLeave(n.Name, memberFromMemberlistNode(n).Restarting)
 }
 
 func (d *voterAutoJoinDelegate) NotifyUpdate(*memberlist.Node) {}

@@ -89,6 +89,9 @@ func (c *Cluster) ApplyRollout(ctx context.Context, caller string, req upgradewi
 	if !c.IsLeader() {
 		return nil, false, ErrNotLeader
 	}
+	if err := c.refuseUnlessOperator(ctx); err != nil {
+		return nil, false, err
+	}
 	if err := c.raftServersRunAtLeast(rolloutFSMOpsVersion, "rollouts"); err != nil {
 		return nil, false, rolloutErr(http.StatusConflict, "cluster_version", err.Error(), "upgrade every server to a release with rollouts first (install.sh, once per node)")
 	}
@@ -153,6 +156,11 @@ func (c *Cluster) RolloutCommand(ctx context.Context, caller, command string) (*
 	case evStop, evResume, evFinalize, evRollback:
 	default:
 		return nil, rolloutErr(http.StatusBadRequest, "bad_request", "unknown rollout command "+command, "")
+	}
+	if command == evRollback {
+		if err := c.refuseUnlessOperator(ctx); err != nil {
+			return nil, err
+		}
 	}
 	cur, active := c.fsm.rolloutView()
 	v := decideRollout(cur, rolloutEvent{Kind: command})
@@ -310,11 +318,21 @@ func (c *Cluster) validateApply(req upgradewire.ApplyRequest) (*RolloutRecord, e
 	}
 	switch req.Source {
 	case upgradewire.SourceRelease, upgradewire.SourceUpload:
+		if len(req.Files) == 0 {
+			return nil, bad("files is empty: give every release file's SHA-256")
+		}
+	case upgradewire.SourceImages:
+		// Every node of a Kubernetes-managed cluster is operator-driven:
+		// nothing fetches a file, the images are signed and checked by
+		// their own digests (C13).
+		if !c.cfg.UpgradesByOperator() {
+			return nil, bad(fmt.Sprintf("source %q is for a cluster the Kubernetes operator upgrades (SB_UPGRADE_DRIVER=operator)", upgradewire.SourceImages))
+		}
+		if len(req.Files) > 0 {
+			return nil, bad(fmt.Sprintf("source %q takes no files", upgradewire.SourceImages))
+		}
 	default:
 		return nil, bad(fmt.Sprintf("source must be %q or %q", upgradewire.SourceRelease, upgradewire.SourceUpload))
-	}
-	if len(req.Files) == 0 {
-		return nil, bad("files is empty: give every release file's SHA-256")
 	}
 	for name, sum := range req.Files {
 		if !upgradewire.SHA256Re.MatchString(sum) {
@@ -463,6 +481,12 @@ func (c *Cluster) buildRollout(caller string, spec *RolloutRecord, req upgradewi
 	for _, id := range sortedNodeIDs(spec.Nodes) {
 		n := spec.Nodes[id]
 		n.WasCordoned = drained[id]
+		// An images rollout carries no files: each node's new image is
+		// what it installs (C13). Checking files there refused every
+		// operator-driven upgrade (found by the rollout drill on kind).
+		if spec.Source == upgradewire.SourceImages {
+			continue
+		}
 		if err := checkNodeFiles(spec.Files, n.Arch); err != nil {
 			return nil, rolloutErr(http.StatusBadRequest, "bad_request",
 				fmt.Sprintf("%v (node %s runs linux/%s)", err, id, n.Arch), "give the files for every CPU type the cluster runs, one of each binary")

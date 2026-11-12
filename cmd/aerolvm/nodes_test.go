@@ -43,6 +43,8 @@ type fakeCluster struct {
 	drainRunning  bool // each node GET lowers running by one
 	busy          map[string]bool
 	migrated      []string
+	movable       map[string][]string // node -> recreate-policy sandboxes evacuate moves
+	evacuations   int
 	badMember     bool
 	badNode       bool
 }
@@ -209,6 +211,21 @@ func (f *fakeCluster) serveNode(w http.ResponseWriter, r *http.Request, rest str
 	case r.Method == http.MethodPost && action == "uncordon":
 		delete(f.cordoned, id)
 		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && action == "evacuate":
+		// One pass moves one sandbox, so drain must call until none is left.
+		f.evacuations++
+		res := map[string]any{"node_id": id}
+		if left := f.movable[id]; len(left) > 0 {
+			moved := left[0]
+			f.movable[id] = left[1:]
+			f.owned[id] = without(f.owned[id], moved)
+			res["moved"] = []string{moved}
+			if len(left) > 1 {
+				res["failed"] = map[string]string{left[1]: "release on " + id + ": busy"}
+			}
+		}
+		res["remaining_movable"] = len(f.movable[id])
+		writeFakeJSON(w, http.StatusOK, res)
 	case r.Method == http.MethodDelete && action == "":
 		if f.busy[id] {
 			writeFakeJSON(w, http.StatusConflict, map[string]string{"error": "cluster: node is alive and still owns sandboxes"})
@@ -801,6 +818,7 @@ func TestNodeMarkPost(t *testing.T) {
 		{http.MethodPost, "/v1/cluster/nodes/wkr-1/cordon", true},
 		{http.MethodPost, "/v1/cluster/nodes/wkr-1/uncordon", true},
 		{http.MethodPost, "/v1/cluster/nodes/wkr-1/drain", true},
+		{http.MethodPost, "/v1/cluster/nodes/wkr-1/evacuate", true},
 		{http.MethodPost, "/v1/cluster/join-tokens", false},
 		{http.MethodPost, "/v1/cluster/wasm-migrate", false},
 		{http.MethodPost, "/v1/cluster/nodes/wkr-1/storage-retired", false},
@@ -820,5 +838,40 @@ func TestDrainTimeoutMessage(t *testing.T) {
 	}
 	if got := drainTimeout("wkr-1", time.Minute, -1).Error(); !strings.Contains(got, "node wkr-1 still has sandboxes after 1m0s") {
 		t.Fatalf("unknown count = %q", got)
+	}
+}
+
+func TestDrainEvacuate(t *testing.T) {
+	h, f := standardFleet(t)
+	f.owned["wkr-1"] = []string{"sb-r1", "sb-r2"}
+	f.movable = map[string][]string{"wkr-1": {"sb-r1", "sb-r2"}}
+	if code := h.run("drain", "wkr-1", "--evacuate", "--timeout", "1m"); code != exitOK {
+		t.Fatalf("drain = %d %q", code, h.stderr.String())
+	}
+	for _, want := range []string{"moved sandbox sb-r1 off wkr-1", "moving sandbox sb-r2 failed (retrying)", "moved sandbox sb-r2 off wkr-1"} {
+		if !strings.Contains(h.stderr.String(), want) {
+			t.Fatalf("output lacks %q: %q", want, h.stderr.String())
+		}
+	}
+	// Called until nothing movable is left, then never again.
+	if f.evacuations != 2 {
+		t.Fatalf("evacuate passes = %d, want 2", f.evacuations)
+	}
+	f.owned["wkr-1"] = []string{"sb-r3"}
+	f.movable["wkr-1"] = []string{"sb-r3"}
+	if code := h.run("drain", "wkr-1", "--evacuate", "--json"); code != exitOK {
+		t.Fatalf("drain --json = %d %q", code, h.stderr.String())
+	}
+	var res struct {
+		Evacuated []string `json:"evacuated"`
+	}
+	h.jsonOut(&res)
+	if strings.Join(res.Evacuated, ",") != "sb-r3" {
+		t.Fatalf("evacuated = %v", res.Evacuated)
+	}
+	// A refused pass (not cordoned, no leader) fails the drain.
+	f.fail["POST /v1/cluster/nodes/wkr-1/evacuate"] = 1
+	if code := h.run("drain", "wkr-1", "--evacuate"); code != exitError {
+		t.Fatalf("refused pass = %d", code)
 	}
 }

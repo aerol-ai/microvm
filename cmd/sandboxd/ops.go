@@ -91,8 +91,20 @@ starts. Entries only this server had become committed. Run as root.
 Exit status: 0 on success, 1 when it failed, 2 for a usage error.
 `
 
-// newOpsHost is the machine the commands act on; tests replace it.
-var newOpsHost = func() nodeops.Host { return newUpgradeHost() }
+// newOpsHost is the machine the commands act on; tests replace it. A
+// Kubernetes server pod in maintenance mode has no systemd, so there the
+// tools look for the daemon's process and leave stop and start to the
+// operator (C22, nodeops.PodHost).
+var newOpsHost = func() nodeops.Host { return opsHostFor(nodeops.InPod()) }
+
+func opsHostFor(inPod bool) nodeops.Host {
+	if inPod {
+		h := nodeops.NewPodHost()
+		h.IsDaemon = isDaemonArgv
+		return h
+	}
+	return newUpgradeHost()
+}
 
 // opsFlags is a flag set that reads --help itself and keeps quiet.
 func opsFlags(name string) *flag.FlagSet {

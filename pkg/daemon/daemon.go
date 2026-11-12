@@ -125,6 +125,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
 	configureHostMediatedNodeGuard(cfg, logger)
+	configureEgressRanges(cfg, logger)
 	// Before anything dials a toolbox: every toolbox connection is
 	// dialed with this bound.
 	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)
@@ -645,6 +646,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.
+	var clusterShutdown cluster.ShutdownPreparer
 	if cfg.EnableCluster {
 		var (
 			clusterClient cluster.Client
@@ -663,6 +665,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				logger.Warn("cluster shutdown returned error", "error", err)
 			}
 		}()
+		clusterShutdown, _ = clusterClient.(cluster.ShutdownPreparer)
 		svc.AttachCluster(clusterClient)
 		// Fail closed on oversized ingress tiers without an explicit
 		// shard-aware router opt-in. Enterprise boots refuse to start;
@@ -694,6 +697,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		} else {
 			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
 				"node_role", cfg.NodeRole)
+		}
+		// A server that also runs sandboxes (mixed role) is its own
+		// decommission source or target (C9); a worker agent serves the
+		// leader's move route straight from the service.
+		if withMoves, ok := clusterClient.(interface{ AttachMoveHandler(cluster.MoveHandler) }); ok {
+			withMoves.AttachMoveHandler(svc)
 		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
@@ -938,6 +947,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// (managed build) and SB_FLEET_LIVE_SAMPLE_INTERVAL > 0; the reserved
 		// axes are emitted from the reconcile/event/netstats loops regardless.
 		svc.StartLiveUsageSampler(ctx)
+		// Per-owner usage counters on /v1/metrics (C20). No-op unless
+		// SB_USAGE_METRICS_ENABLED; sends nothing anywhere either way.
+		svc.StartUsageMetrics(ctx)
 		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
 		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
 		// enable knob is off; per-tick cancellation is wired off ctx like
@@ -1258,6 +1270,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	<-ctx.Done()
 	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
+	// First, while the listeners still serve: hand off Raft leadership and
+	// announce the restart (C8), so placement stops choosing this node
+	// during the drain below and the leader waits the restart window.
+	prepareClusterShutdown(clusterShutdown)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()

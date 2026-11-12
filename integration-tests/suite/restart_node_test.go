@@ -49,6 +49,7 @@ func takesSandboxdDown(body string) bool {
 	return strings.Contains(body, "systemctl stop sandboxd") ||
 		strings.Contains(body, "systemctl restart sandboxd") ||
 		strings.Contains(body, "KillSandboxdScript") ||
+		strings.Contains(body, "CrashStopSandboxdScript") ||
 		strings.Contains(body, "KillNodeDaemon")
 }
 

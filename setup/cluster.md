@@ -1187,6 +1187,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_BOOTSTRAP_PEERS` | join only | Comma-separated gossip-advertise addresses. Empty on the seed. |
 | `SB_CLUSTER_BOOTSTRAP` | yes | `true` only on the seed; `false` on joiners. |
 | `SB_CLUSTER_MAX_AUTO_VOTERS` | no | Max gossip-discovered **server-role** nodes auto-promoted as raft voters. Default `5`; additional server nodes become non-voters that still replicate the full FSM. Set `0` for unlimited. Does not bound replica count — the live server tier is separately capped at 7 nodes. |
+| `SB_CLUSTER_RESTART_WINDOW` | no | How long the leader waits for a node that stopped cleanly (it announces "restarting" on SIGTERM) before it moves that node's sandboxes. Default `120s`; `0` turns it off. A crash sends no notice and gets only `SB_DEAD_OWNER_GRACE`. A leading server also hands off Raft leadership before it stops. |
 | `SB_DEAD_OWNER_GRACE` | no | Wait before reassigning a dead node's placements. Default `30s`. Workers also pause their `failover.policy=recreate` sandboxes after half this long without an answer from the leader, so set it the same on every node. |
 | `SB_OTEL_METRICS_ENDPOINT` | no | OTLP/HTTP metrics endpoint, for example `http://otel-collector:4318/v1/metrics`. Setting it enables OTEL metrics. |
 | `SB_OTEL_METRICS_ENABLED` | no | Enables OTEL metrics without an explicit endpoint; the OTEL exporter env defaults apply. |

@@ -35,6 +35,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/usagemetrics"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -604,6 +605,18 @@ type Service struct {
 	liveMu     sync.Mutex
 	liveCursor map[string]liveSamplePoint
 
+	// usageMeter holds the per-owner usage counters /v1/metrics exports
+	// (usage_metrics.go, C20). nil unless SB_USAGE_METRICS_ENABLED, so the
+	// row-delete hook is one atomic load when the exporter is off. Separate
+	// from usageReporter: it ships nothing anywhere.
+	//
+	// usageCgroupRoot is the cgroup mount the exporter reads ("" is
+	// usagemetrics.DefaultCgroupRoot), and usageDockerStats replaces the
+	// Docker stats call (nil is dockerAux.ContainerStats). Both are for tests.
+	usageMeter       atomic.Pointer[usagemetrics.Meter]
+	usageCgroupRoot  string
+	usageDockerStats liveStatFunc
+
 	// fleetAdmitter is the managed create-gate: consulted in createSandbox for
 	// owner-scoped (user-token) creates before any capacity is reserved. nil on
 	// the open-source build (set only by the managed daemon via
@@ -637,6 +650,9 @@ type Service struct {
 	// ownership is the worker's ownership lease and fence
 	// (ownership_lease.go). Zero value: not begun, fences nothing.
 	ownership ownershipLease
+	// moves holds the sandboxes released for a decommission move (C9,
+	// decommission.go); OwnershipFenced folds them in.
+	moves moveFences
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
@@ -4244,6 +4260,9 @@ func (s *Service) deleteSandboxRowAndFenceAudit(ctx context.Context, sandboxID s
 	// part way must not leave a lease minted from the window either.
 	s.invalidateAuditIdentity(sandboxID)
 	s.invalidateAuditOwnershipLease(sandboxID)
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		s.closeUsageMetrics(sandboxID)
+	}
 	return err
 }
 
@@ -6491,6 +6510,7 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	snap.OwnershipLeaseFile = s.cfg.EnableCluster && s.cfg.OwnershipLeaseFile != ""
 	// Warm-pool entry status: how GET /v1/warm-pools on any node reports
 	// this one, with no fan-out (W1).
 	snap.WarmPools = s.localWarmPoolStatus()

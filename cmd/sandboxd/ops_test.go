@@ -9,12 +9,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"github.com/aerol-ai/microvm/internal/nodeops"
 	"github.com/aerol-ai/microvm/pkg/daemon"
+	"github.com/aerol-ai/microvm/pkg/isolate"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
 )
 
 // opsHost is a stopped node for the backup, restore and recover-quorum
@@ -182,5 +186,72 @@ func TestMainRoutesOpsCommands(t *testing.T) {
 	main()
 	if code != 2 || booted {
 		t.Fatalf("restore with no input: exit %d, daemon booted %v", code, booted)
+	}
+}
+
+// In a pod (no systemd) the tools look for the daemon's process (C22).
+func TestOpsHostForPod(t *testing.T) {
+	if _, ok := opsHostFor(true).(*nodeops.PodHost); !ok {
+		t.Fatal("a pod did not get the pod host")
+	}
+	if _, ok := opsHostFor(false).(*nodeops.PodHost); ok {
+		t.Fatal("a systemd machine got the pod host")
+	}
+	if newOpsHost() == nil {
+		t.Fatal("no host")
+	}
+	if h := opsHostFor(true).(*nodeops.PodHost); h.IsDaemon == nil {
+		t.Fatal("the pod host does not know sandboxd's daemon command lines")
+	}
+}
+
+// isDaemonArgv answers false for every first argument main dispatches
+// elsewhere and true for anything that falls through to run(). It reads
+// main.go's own conditions, so a new subcommand there that this list lacks
+// fails here, not in a pod.
+func TestIsDaemonArgv(t *testing.T) {
+	known := map[string]string{
+		"upgradeSubcommand":    upgradeSubcommand,
+		"hostSubcommand":       hostSubcommand,
+		"keySubcommand":        keySubcommand,
+		"gatewayd.Subcommand":  gatewayd.Subcommand,
+		"isolate.JailShimFlag": isolate.JailShimFlag,
+		"pkcs11.HelperFlag":    pkcs11.HelperFlag,
+	}
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range regexp.MustCompile(`os\.Args\[1\] == ("[^"]+"|[A-Za-z0-9_.]+)`).FindAllStringSubmatch(string(src), -1) {
+		arg := strings.Trim(m[1], `"`)
+		if v, ok := known[m[1]]; ok {
+			arg = v
+		} else if !strings.HasPrefix(m[1], `"`) {
+			t.Fatalf("main.go dispatches on %s: add it to isDaemonArgv and to this test", m[1])
+		}
+		if isDaemonArgv([]string{"sandboxd", arg}) {
+			t.Errorf("%s (%q) read as the daemon", m[1], arg)
+		}
+	}
+	for _, f := range regexp.MustCompile(`([A-Za-z]+)\(os\.Args\[1\]\)|(opsCommands)\[os\.Args\[1\]\]`).FindAllStringSubmatch(string(src), -1) {
+		name := f[1] + f[2]
+		if name != "isVersionArg" && name != "isNodeCommand" && name != "opsCommands" {
+			t.Fatalf("main.go dispatches through %s: add it to isDaemonArgv and to this test", name)
+		}
+	}
+	for cmd := range opsCommands {
+		if isDaemonArgv([]string{"sandboxd", cmd}) {
+			t.Errorf("ops command %s read as the daemon", cmd)
+		}
+	}
+	for _, cmd := range []string{initSubcommand, joinSubcommand, preflightSubcommand, adoptSubcommand, resetSubcommand, tokenSubcommand, "version", "--version"} {
+		if isDaemonArgv([]string{"sandboxd", cmd}) {
+			t.Errorf("%s read as the daemon", cmd)
+		}
+	}
+	for _, argv := range [][]string{{"sandboxd"}, {"/usr/local/bin/sandboxd", "--log-json"}, {"sandboxd", "anything-else"}} {
+		if !isDaemonArgv(argv) {
+			t.Errorf("%v read as not the daemon (main runs it)", argv)
+		}
 	}
 }

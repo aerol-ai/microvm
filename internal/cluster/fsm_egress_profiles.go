@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 15
+	fsmOpsVersion              = 16
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -74,8 +74,9 @@ const (
 // (joinFSMOpsVersion in fsm_join.go); 14 is the active cluster version and
 // the rollout record (rolloutFSMOpsVersion in fsm_rollout.go); 15 is peer
 // calls by node cert alone, which lets a join leave the PAT out
-// (peerCertAuthFSMOpsVersion in peer_cert_auth.go, no FSM op). Versions 6
-// to 8 are the gates in the block above.
+// (peerCertAuthFSMOpsVersion in peer_cert_auth.go, no FSM op); 16 is the
+// rollout node's operator flag (rolloutOperatorFSMOpsVersion in
+// rollout_operator.go). Versions 6 to 8 are the gates in the block above.
 
 // FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
 // without a cluster: an operator compares it across nodes before and during

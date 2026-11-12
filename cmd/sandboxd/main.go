@@ -156,3 +156,24 @@ func main() {
 		osExit(1)
 	}
 }
+
+// isDaemonArgv reports whether a sandboxd command line runs the daemon:
+// main falls through to run() for any first argument none of its branches
+// takes. nodeops.PodHost uses it to find a live daemon in a server pod
+// (C22), so a daemon started with a flag still counts. A subcommand added
+// to main but not here reads as the daemon, and the day-2 tools then refuse
+// rather than race it; TestIsDaemonArgv lists every branch.
+func isDaemonArgv(argv []string) bool {
+	if len(argv) < 2 {
+		return true
+	}
+	switch a := argv[1]; {
+	case isVersionArg(a), isNodeCommand(a),
+		a == upgradeSubcommand, a == hostSubcommand, a == keySubcommand,
+		a == backupSubcommand, a == restoreSubcommand, a == recoverQuorumSubcommand,
+		a == "--wasm-worker", a == "--wasm-resident-host", a == pkcs11.HelperFlag,
+		a == isolate.JailShimFlag, a == gatewayd.Subcommand:
+		return false
+	}
+	return true
+}

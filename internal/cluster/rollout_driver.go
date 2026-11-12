@@ -82,6 +82,9 @@ type rolloutHost interface {
 	nodeUpdate(ctx context.Context, u RolloutNodeUpdate) (rolloutApplyResult, error)
 	event(ctx context.Context, rc RolloutCommand) (rolloutApplyResult, error)
 	finalizeTarget(r *RolloutRecord) (ActiveVersion, error)
+	// operatorStepsAllowed reports whether every Raft server keeps the
+	// rollout node's operator flag (C13).
+	operatorStepsAllowed() bool
 	now() time.Time
 }
 
@@ -385,12 +388,27 @@ func (d *rolloutDriver) stage(ctx context.Context, r *RolloutRecord, n *RolloutN
 
 func (d *rolloutDriver) afterStage(ctx context.Context, rolloutID string, n RolloutNodeRecord, req UpgradeStepRequest, resp UpgradeStepResponse, err error) {
 	switch {
+	case err == nil && req.Source == upgradewire.SourceImages && resp.Version != req.Version:
+		// An images rollout carries no files, so a node that stages files
+		// itself has nothing to stage and nothing to run: it is upgraded
+		// by hand, and done once it reports the target.
+		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeManual, ExpectState: upgradewire.NodePending,
+			Error: "this rollout swaps images and this node is not operator-driven: upgrade it by hand"})
 	case err == nil && resp.Version == req.Version:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeDone, ExpectState: upgradewire.NodePending, Version: resp.Version, Arch: resp.Arch, ClearError: true})
 	case err == nil:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeStaged, ExpectState: upgradewire.NodePending,
 			Version: resp.Version, Arch: resp.Arch, PrevFiles: prevFiles(resp.Installed, resp.Arch, req.Files), ClearError: true})
 		d.logf("cluster: rollout node staged", "rollout_id", rolloutID, "node_id", n.NodeID, "fetched", len(resp.Fetched), "bytes", resp.Bytes)
+	case stepCode(err) == upgradewire.ErrCodeOperatorDriven && d.host.operatorStepsAllowed():
+		// Staged as far as the walk goes: the operator pulls the image and
+		// swaps it when the node's turn comes (C13).
+		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeStaged, ExpectState: upgradewire.NodePending,
+			Operator: true, ClearError: true})
+		d.logf("cluster: rollout node is operator-driven", "rollout_id", rolloutID, "node_id", n.NodeID)
+	case stepCode(err) == upgradewire.ErrCodeOperatorDriven:
+		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeManual, ExpectState: upgradewire.NodePending,
+			Error: "the operator upgrades this node, but a Raft server is too old to wait for it in order: it is done once it reports the target version"})
 	case stepCode(err) == upgradewire.ErrCodeRemoteUpgradeDisabled:
 		d.update(ctx, RolloutNodeUpdate{RolloutID: rolloutID, NodeID: n.NodeID, State: upgradewire.NodeManual, ExpectState: upgradewire.NodePending,
 			ManualCommand: manualCommand(req), Error: "SB_REMOTE_UPGRADE=false: run the command on the node"})
@@ -729,6 +747,13 @@ func (d *rolloutDriver) startUpgrade(ctx context.Context, r *RolloutRecord, n *R
 		}
 		return
 	}
+	if n.Operator {
+		// Its turn is marked; the operator sees "upgrading" and swaps the
+		// image. watchUpgrading finishes it when the node reports the
+		// target, or fails it at the deadline (C13).
+		d.logf("cluster: rollout waiting for the operator to upgrade node", "rollout_id", r.ID, "node_id", n.NodeID, "op", op, "to", targetOf(r))
+		return
+	}
 	d.logf("cluster: rollout upgrading node", "rollout_id", r.ID, "node_id", n.NodeID, "op", op, "to", targetOf(r), "caller", r.Caller)
 	sent = true
 	d.spawn(n.NodeID, d.applyCall(ctx, r, *n, m, op))
@@ -885,7 +910,7 @@ func (d *rolloutDriver) followUpgrading(ctx context.Context, r *RolloutRecord, n
 			d.requeue(ctx, r, n)
 			return true
 		}
-	case idle && st.Version != target && since > d.applyResendAfter:
+	case idle && st.Version != target && since > d.applyResendAfter && !n.Operator:
 		// The op never started: the leader that marked the node died before
 		// its call, or the call was lost. The node's own state shows no op,
 		// so sending it again cannot start a second upgrade. It is a restart
@@ -1182,6 +1207,9 @@ func (h clusterRolloutHost) finalizeTarget(r *RolloutRecord) (ActiveVersion, err
 	return h.c.finalizeTarget(r)
 }
 func (h clusterRolloutHost) now() time.Time { return time.Now() }
+func (h clusterRolloutHost) operatorStepsAllowed() bool {
+	return h.c.raftServersRunAtLeast(rolloutOperatorFSMOpsVersion, "operator-driven rollout steps") == nil
+}
 
 // clusterNodeClient is rolloutNodeClient over the internal mTLS channel.
 // The leader's own steps (one-voter clusters) run in process.

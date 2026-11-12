@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -532,13 +533,7 @@ func TestStartL4WakeProxyIdempotentAndAcceptWave9(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableServerless = true
 	svc.cfg.EnableCaddy = true
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	svc.cfg.InternalL4WakeAddr = addr
+	svc.cfg.InternalL4WakeAddr = testport.Addr(t)
 	if err := svc.StartL4WakeProxy(ctx); err != nil {
 		t.Fatalf("StartL4WakeProxy: %v", err)
 	}

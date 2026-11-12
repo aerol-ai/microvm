@@ -1,0 +1,45 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheusRule.enabled }}
+{{- /* The rules live in a plain file so promtool and the Go tests read them
+as they are (setup/prometheus/k8s_chart_test.go); here they are only
+wrapped, less the alerts the values turn off. */}}
+{{- $file := .Files.Get "monitoring/rules.yaml" | fromYaml }}
+{{- if hasKey $file "Error" }}
+{{- fail (printf "monitoring/rules.yaml does not parse: %s" $file.Error) }}
+{{- end }}
+{{- $disabled := .Values.monitoring.prometheusRule.disabledAlerts | default list }}
+{{- $alerts := list }}
+{{- $groups := list }}
+{{- range $file.groups }}
+{{- $rules := list }}
+{{- range .rules }}
+{{- if .alert }}
+{{- $alerts = append $alerts .alert }}
+{{- end }}
+{{- if not (and .alert (has .alert $disabled)) }}
+{{- $rules = append $rules . }}
+{{- end }}
+{{- end }}
+{{- if $rules }}
+{{- $groups = append $groups (dict "name" .name "rules" $rules) }}
+{{- end }}
+{{- end }}
+{{- range $disabled }}
+{{- if not (has . $alerts) }}
+{{- fail (printf "monitoring.prometheusRule.disabledAlerts: no alert is named %s" .) }}
+{{- end }}
+{{- end }}
+# AerolVM's alerts and per-team usage sums (P6, P9). Each alert's runbook is
+# the heading of the same name in setup/runbooks/kubernetes.md.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "aerolvm.name" . }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $groups | nindent 4 }}
+{{- end }}

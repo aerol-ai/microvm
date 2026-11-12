@@ -75,6 +75,7 @@ This is a rebuild, not a live migration. Node B starts the sandbox again from it
 ### How long it takes
 
 - **The cluster waits 30 seconds first.** A node must be silent that long before anything moves, so a short network blip does not trigger a handoff. Operators can change this with `SB_DEAD_OWNER_GRACE`.
+- **A restart gets two minutes.** When sandboxd stops cleanly (a `systemctl restart`, an upgrade, a Kubernetes pod restart), it first tells the cluster "I am restarting". The cluster then waits up to 120 seconds for it to come back before anything moves, and sends it no new sandboxes meanwhile. A crash sends no notice, so it gets the 30 seconds above. Operators can change this with `SB_CLUSTER_RESTART_WINDOW` (`0` turns it off).
 - **Then the new node takes over within about 5 seconds** and rebuilds the sandbox. A rebuild takes as long as a normal create, or longer if the node must download the image first.
 - **If a rebuild keeps failing,** 5 times in a row (about 25 seconds), the cluster hands the sandbox to another node.
 - **Requests during the handoff fail.** A request that arrives while the sandbox is moving can get `503` with "Sandbox placement in flux". Retry it.

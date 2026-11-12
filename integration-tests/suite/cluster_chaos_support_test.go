@@ -685,7 +685,8 @@ func chaosPartition(t *testing.T, side, from []harness.IntegrationNode, deadman 
 	return heal
 }
 
-// chaosHardKill kills node the way a crashed machine dies: sandboxd stopped,
+// chaosHardKill kills node the way a crashed machine dies: sandboxd SIGKILLed
+// and kept down (no restart notice, C8),
 // every sandbox container SIGKILLed, the container engine stopped. Until now
 // the live failover cases only stopped sandboxd, which leaves the old copy
 // running, so none of them could check that it dies or stays dead. The
@@ -698,7 +699,7 @@ func chaosHardKill(t *testing.T, node harness.IntegrationNode, allowSeed bool) f
 		t.Skipf("%s is the seed; this case kills workers only", node.Name)
 	}
 	target, _ := harness.SSHTarget(node)
-	out, err := harness.SSHRun(t, target, "set -u\nsudo systemctl stop sandboxd\n"+harness.HardKillRuntimeScript)
+	out, err := harness.SSHRun(t, target, "set -u\n"+harness.CrashStopSandboxdScript+"\n"+harness.HardKillRuntimeScript)
 	harness.MarkNodeDown(node.PublicIP)
 	engine, remaining, perr := harness.ParseHardKill(out)
 	var once sync.Once

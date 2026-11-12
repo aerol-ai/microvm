@@ -12,6 +12,30 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## A worker's lease renewed without a read covers a sandbox started later (cluster)
+
+- **What:** a worker with no running `failover.policy=recreate` sandbox keeps
+  its ownership lease without asking the leader
+  (`internal/service/ownership_lease.go`, `confirmOwnership`: "nothing to
+  confirm"). If it is cut off from the servers and one of its recreate
+  sandboxes then starts there (a stopped one started again, or a create whose
+  image pull finishes), that sandbox runs on a lease the leader never saw, past
+  the grace, while the leader recreates it elsewhere: two copies.
+- **Why:** found while proving C19 live on kind (2026-11-12). C19's early
+  failover now refuses a node that was not reading until the leader last
+  heard from it, which closes it there except for a node whose recreate
+  sandboxes all stopped within one read interval (about 6 s) of being cut
+  off. The dead-owner grace path reaches it with no such limit, as on main
+  before Phase 2.
+- **Fix sketch:** a renewal without a read must not extend the lease; a
+  recreate sandbox that starts on a node whose lease is older than the lease
+  needs one authoritative read first (one leader round trip, only the first
+  start after the node was idle). That touches the boot path: use
+  `/touch-create-sandbox`.
+- **Effort:** human M / CC S. **Priority:** P1.
+
+---
+
 ## The snapshot list is node-local on a cluster (API)
 
 `GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the

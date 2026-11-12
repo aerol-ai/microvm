@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/ownerlease"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -209,6 +212,27 @@ func TestPersistSandboxCreateKicksTheLeaseFile(t *testing.T) {
 		}
 		if got := len(svc.ownershipFile.kicks()); got != tc.kicks {
 			t.Fatalf("%s: %d kicks queued, want %d", tc.id, got, tc.kicks)
+		}
+	}
+}
+
+// The capacity heartbeat says whether this node's runtime enforces the
+// ownership lease with sandboxd down, so the leader knows it may fail the
+// node over early on the operator's "machine is gone" (C19).
+func TestCapacityReportsOwnershipLeaseFile(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		cfg  config.Config
+		want bool
+	}{
+		{cfg: config.Config{}, want: false},
+		{cfg: config.Config{OwnershipLeaseFile: "/run/aerolvm/lease.json"}, want: false}, // not a cluster
+		{cfg: config.Config{EnableCluster: true}, want: false},
+		{cfg: config.Config{EnableCluster: true, OwnershipLeaseFile: "/run/aerolvm/lease.json"}, want: true},
+	} {
+		svc := New(tc.cfg, logger, nil, nil, nil, nil, nil, nil, nil)
+		if got := svc.Capacity().OwnershipLeaseFile; got != tc.want {
+			t.Fatalf("cfg %+v: OwnershipLeaseFile = %v, want %v", tc.cfg.OwnershipLeaseFile, got, tc.want)
 		}
 	}
 }

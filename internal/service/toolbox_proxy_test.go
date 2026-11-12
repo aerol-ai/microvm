@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -327,15 +327,7 @@ func TestToolboxProxyErrorBranchesMore(t *testing.T) {
 		t.Fatal("RoundTripToolbox should fail for missing sandbox")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
-		t.Fatalf("listener close: %v", err)
-	}
-	svc.cfg.ToolboxPort = port
+	svc.cfg.ToolboxPort = testport.Reserve(t, false) // nothing listens here
 	if err := svc.ServeToolboxReverseProxy(ctx, "sb-net-error", rec, req, "/foo"); err != nil {
 		t.Fatalf("ServeToolboxReverseProxy proxy error path: %v", err)
 	}

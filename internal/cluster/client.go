@@ -37,6 +37,12 @@ type Cluster struct {
 	raft   *raftNode
 	gossip *gossipNode
 
+	// gone is the leader's "machine is gone" state (C19, node_gone.go).
+	gone goneTracker
+	// moves is the decommission's worker-side hook and notice memory (C9,
+	// decommission.go).
+	moves moveHandlerHolder
+
 	// authoritativePlacementsHook stands in for AuthoritativePlacementsByIDs
 	// in tests that need a lagging local replica next to a live leader.
 	// Always nil in production.

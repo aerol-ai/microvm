@@ -220,7 +220,7 @@ func TestInitRefusals(t *testing.T) {
 		{"a bogus custody", func(_ *initRig, o *InitOptions) { o.KeyCustody = "hsm" }, "file or wrapped"},
 		{"a bad gossip key", func(_ *initRig, o *InitOptions) { o.GossipKey = "short" }, "--gossip-key"},
 		{"a bad node ID", func(_ *initRig, o *InitOptions) { o.NodeID = "a b" }, "node ID"},
-		{"a bad advertise", func(_ *initRig, o *InitOptions) { o.Advertise = "x" }, "not an IP"},
+		{"a bad advertise", func(_ *initRig, o *InitOptions) { o.Advertise = "bad_name" }, "not an IP address or a DNS name"},
 		{"another cluster's Raft data", func(r *initRig, _ *InitOptions) {
 			mustWrite(t, filepath.Join(r.paths.RaftDir, "raft.db"), "x")
 		}, ErrPreflight.Error()},

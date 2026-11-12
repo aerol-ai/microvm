@@ -277,6 +277,13 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	// The operator's "this node's machine is gone" (C19): the leader may
+	// fail it over at its ownership lease limit instead of after the grace.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/gone", op(http.HandlerFunc(h.clusterNodeGone)))
+	// One decommission pass over a cordoned node (C9): moves its
+	// recreate-policy sandboxes, tells the owners of the rest, and at the
+	// deadline stops them. The operator calls it until done.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/evacuate", op(http.HandlerFunc(h.clusterEvacuateNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
@@ -308,6 +315,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("HEAD "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
 	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.MoveSuffix, internalOp(http.HandlerFunc(h.clusterNodeMove)))
 	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStatus)))
 	mux.Handle("GET "+cluster.PublicInternalUpgradeFencePath, internalOp(http.HandlerFunc(h.clusterInternalUpgradeFence)))
 	mux.Handle("GET "+cluster.PublicInternalUpgradeFilesPath+"{sha256}", internalOp(http.HandlerFunc(h.clusterInternalUpgradeFile)))

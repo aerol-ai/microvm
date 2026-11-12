@@ -1,0 +1,44 @@
+# Refuse any AerolVM pod whose image was not signed by AerolVM's release
+# workflow (plans/kubernetes-v2-architecture.md §15.4, the evidence pack's
+# admission section). For Kyverno 1.15 or later; apply it before the chart.
+#
+# Tested on kind with Kyverno 1.15 (chart 3.5.2): a v0.7.1 release image is
+# admitted and pinned to its digest; an image that is not in the registry,
+# and a signed image checked against another signer, are refused.
+#
+# The release signs with cosign v3, in the Sigstore bundle format, hence
+# `type: SigstoreBundle`. Mirrored the images to your own registry? Copy
+# the signatures with them (`cosign copy`) and change imageReferences.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: aerolvm-signed-images
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+    timeoutSeconds: 30
+  rules:
+    - name: release-workflow-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # The release namespace and the worker namespace.
+              namespaces: [aerolvm-system, aerolvm-workers]
+      verifyImages:
+        - imageReferences: ["ghcr.io/aerol-ai/*"]
+          failureAction: Enforce
+          type: SigstoreBundle
+          # Run the image by the digest that was checked, never by a tag
+          # that could move after the check.
+          mutateDigest: true
+          verifyDigest: true
+          required: true
+          attestors:
+            - entries:
+                - keyless:
+                    subjectRegExp: "^https://github.com/aerol-ai/microvm/.github/workflows/release.yml@refs/tags/v"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev

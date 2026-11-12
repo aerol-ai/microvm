@@ -1785,7 +1785,66 @@ func (h *handlers) clusterInternalPlacementsByIDs(w http.ResponseWriter, r *http
 		minimizePlacementBatchRecord(&p)
 		out[id] = p
 	}
+	if r.URL.Query().Get("authoritative") == "true" {
+		// This answer renews the asking node's ownership lease: the leader
+		// keeps its time as that node's last proven contact (C19).
+		// withInternalMTLS put the verified peer there.
+		if rec, ok := c.(cluster.OwnershipContactRecorder); ok {
+			if peer, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string); peer != "" {
+				rec.NoteOwnershipContact(peer)
+			}
+		}
+	}
 	apihttp.WriteJSON(w, http.StatusOK, out)
+}
+
+// clusterNodeGoneLeaderHeader marks a "gone" already forwarded to the
+// leader, so a leader change mid-forward answers 503 instead of looping.
+const clusterNodeGoneLeaderHeader = "X-Cluster-Node-Gone-Leader"
+
+// clusterNodeGone takes the operator's word that {id}'s machine is gone
+// (C19, internal/cluster/node_gone.go). The leader keeps it; any other
+// server forwards it there. Idempotent.
+func (h *handlers) clusterNodeGone(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "node id required")
+		return
+	}
+	if m, isServer := c.(cluster.NodeGoneMarker); isServer && c.Leader() == c.SelfNodeID() {
+		res, err := m.MarkNodeGone(id)
+		switch {
+		case errors.Is(err, cluster.ErrNodeGoneSelf):
+			apihttp.WriteError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, cluster.ErrNotLeader):
+			w.Header().Set("Retry-After", "1")
+			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
+		case err != nil:
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		default:
+			apihttp.WriteJSON(w, http.StatusOK, res)
+		}
+		return
+	}
+	if r.Header.Get(clusterNodeGoneLeaderHeader) == "1" {
+		w.Header().Set("Retry-After", "1")
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "the leader changed while this call was forwarded; retry")
+		return
+	}
+	if !h.forwardTemplateToLeader(w, r, c, clusterNodeGoneLeaderHeader) {
+		// This node names itself the leader but keeps no Raft state: a
+		// single node, where there is no failover to start.
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: this node is not a cluster server")
+	}
 }
 
 // minimizePlacementBatchRecord keeps the 5k-ID internal batch comfortably
