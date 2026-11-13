@@ -1411,6 +1411,15 @@ type Config struct {
 	// unbounded image-pull/docker-create storm. 0 disables the cap.
 	// SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER.
 	ClusterCreateMaxPendingPerWorker int
+	// ClusterReserveApplyLimit bounds the create reservations the leader
+	// applies at once (F28). Past it a create is turned away at once with
+	// create backpressure (429, Retry-After) instead of queueing behind Raft
+	// until its caller's deadline: at 512 creates at once, 122 timed out
+	// that way. About 50 are in flight at 985 creates a second and over 100
+	// at a cell's ceiling (G3), so the default 256 leaves room for both.
+	// Only reservations are bounded, never heartbeats, deletes or repairs.
+	// 0 disables the bound. SB_CLUSTER_RESERVE_APPLY_LIMIT.
+	ClusterReserveApplyLimit int
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
 	// raft configuration. Long enough to absorb transient gossip flap
@@ -2479,6 +2488,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
+		ClusterReserveApplyLimit:         getEnvInt("SB_CLUSTER_RESERVE_APPLY_LIMIT", 256),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
 		ClusterRestartWindow:             getEnvDuration("SB_CLUSTER_RESTART_WINDOW", 120*time.Second),
 		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
@@ -3173,6 +3183,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ClusterCreateMaxPendingPerWorker < 0 {
 			return Config{}, errors.New("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0")
+		}
+		if cfg.ClusterReserveApplyLimit < 0 {
+			return Config{}, errors.New("SB_CLUSTER_RESERVE_APPLY_LIMIT must be >= 0")
 		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")

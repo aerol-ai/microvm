@@ -51,6 +51,7 @@ func TestLoadCases(t *testing.T) {
 			"OTEL_SERVICE_NAME",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
 			"SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER",
+			"SB_CLUSTER_RESERVE_APPLY_LIMIT",
 			"SB_IMAGE_PULL_MAX_CONCURRENT",
 			"SB_IMAGE_PULL_FAILURE_BACKOFF",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
@@ -128,6 +129,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ClusterMaxAutoVoters != 5 {
 					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
+				}
+				if cfg.ClusterReserveApplyLimit != 256 {
+					t.Fatalf("expected default ClusterReserveApplyLimit=256, got %d", cfg.ClusterReserveApplyLimit)
 				}
 				if cfg.ClusterCreateMaxPendingPerWorker != 32 {
 					t.Fatalf("expected default ClusterCreateMaxPendingPerWorker=32, got %d", cfg.ClusterCreateMaxPendingPerWorker)

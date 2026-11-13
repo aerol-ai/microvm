@@ -2177,12 +2177,16 @@ each server used about 6% of one core and 160 MB (E5 above).
   rest were closed and the next burst re-did TLS handshakes: 8% of a
   gateway's CPU and 6% of the leader's. It keeps 128 per host now (#1217,
   E10).
-- F28 (open). Past the ceiling, creates time out instead of being turned
+- F28 (fixed). Past the ceiling, creates timed out instead of being turned
   away: at 512 at once the cell did 691 creates a second, and 122 creates
   failed after waiting on the leader ("reserve placement failed: ...
-  /internal/apply: context deadline exceeded"). Next: a bound on the
-  leader's applies in flight that answers at once with 503 and
-  Retry-After.
+  /internal/apply: context deadline exceeded"). The leader now holds at
+  most `SB_CLUSTER_RESERVE_APPLY_LIMIT` reservations in flight (256) and
+  turns one more away at once with the create backpressure answer every
+  create path already handles: 429 with Retry-After, not a new 503. Only
+  reservations are bounded, never heartbeats, deletes or repairs
+  (`TestLeaderRefusesReservationsPastTheLimit`). A bench re-run at 512 at
+  once would show the timeouts become 429s.
 - F29 (open). Raft apply p99 is over the 25 ms target: 25 to 50 ms at 985
   creates a second, 50 to 100 ms above, with 500 to 700 applies over 1 s
   in each 2-minute step (none at 985/s). The CPU profiles do not show

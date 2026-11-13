@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,6 +38,11 @@ type Cluster struct {
 	fsm    *placementFSM
 	raft   *raftNode
 	gossip *gossipNode
+
+	// reserveSlots bounds the reservations this leader applies at once
+	// (cfg.ClusterReserveApplyLimit, F28); made on first use.
+	reserveSlotsOnce sync.Once
+	reserveSlots     chan struct{}
 
 	// gone is the leader's "machine is gone" state (C19, node_gone.go).
 	gone goneTracker
@@ -1664,6 +1670,11 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 // proposes it without holding the admission lock across the commit
 // (admission_ledger.go).
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
+	release, err := c.acquireReserveSlot()
+	if err != nil {
+		return err
+	}
+	defer release()
 	// Outside the admission lock: a lease this leader lacks is fetched from
 	// the owner first (capacity_lease_ondemand.go).
 	c.ensureOwnerLeases(ctx, cmd)
@@ -1673,6 +1684,35 @@ func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []by
 		}
 		return c.admitTeamQuotaCommand(cmd)
 	})
+}
+
+// reserveAppliesRefused counts creates the leader turned away because it was
+// applying its limit of reservations already (F28).
+var reserveAppliesRefused = expvar.NewInt("aerolvm_cluster_reserve_applies_refused_total")
+
+// acquireReserveSlot takes one of the leader's reservation slots, or answers
+// at once with create backpressure when they are all in use. Before, a
+// create past the cell's ceiling queued behind Raft until its caller's
+// deadline ran out (F28: at 512 at once, 122 failed after waiting); a quick
+// 429 with Retry-After sends it to another try instead. The bound is on the
+// leader, where every reservation is applied, and only on reservations:
+// heartbeats, deletes and repairs are never turned away.
+func (c *Cluster) acquireReserveSlot() (func(), error) {
+	c.reserveSlotsOnce.Do(func() {
+		if n := c.cfg.ClusterReserveApplyLimit; n > 0 {
+			c.reserveSlots = make(chan struct{}, n)
+		}
+	})
+	if c.reserveSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.reserveSlots <- struct{}{}:
+		return func() { <-c.reserveSlots }, nil
+	default:
+		reserveAppliesRefused.Add(1)
+		return nil, fmt.Errorf("%w: the leader is applying %d reservations already", ErrCreateBackpressure, cap(c.reserveSlots))
+	}
 }
 
 // applyEncodedLocal submits an already-encoded command to the local raft.
