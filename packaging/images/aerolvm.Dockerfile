@@ -4,7 +4,9 @@
 # toolboxd (bind-mounted into every sandbox) and the CNI plugins the agent
 # runs to build each sandbox's network, plus the tools those plugins and
 # sandboxd's firewall need, and workerd for V8-isolate sandboxes (Phase 5;
-# used only with SB_ENABLE_ISOLATE).
+# used only with SB_ENABLE_ISOLATE), and for Firecracker pools (used only
+# with SB_ENABLE_FIRECRACKER) firecracker, its jailer, a guest kernel and
+# the tools that turn an image into a VM's disk (skopeo, umoci, mkfs.ext4).
 #
 # Built by scripts/build-images.sh: the context holds <arch>/sandboxd and
 # <arch>/toolboxd from the release build, and versions.env's pins arrive as
@@ -21,6 +23,15 @@ ARG CNI_PLUGINS_SHA256_ARM64
 ARG WORKERD_VERSION
 ARG WORKERD_SHA256_AMD64
 ARG WORKERD_SHA256_ARM64
+ARG FIRECRACKER_VERSION
+ARG FIRECRACKER_SHA256_AMD64
+ARG FIRECRACKER_SHA256_ARM64
+ARG FIRECRACKER_KERNEL_CI_VERSION
+ARG FIRECRACKER_KERNEL_VERSION
+ARG FIRECRACKER_KERNEL_SHA256_AMD64
+ARG FIRECRACKER_KERNEL_SHA256_ARM64
+ARG FIRECRACKER_KERNEL_CONFIG_SHA256_AMD64
+ARG FIRECRACKER_KERNEL_CONFIG_SHA256_ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /fetch
@@ -46,6 +57,22 @@ RUN set -eu; \
     echo "$sum  workerd.gz" | sha256sum -c --quiet -; \
     gunzip -c workerd.gz > /out/workerd; \
     chmod 0755 /out/workerd
+# Firecracker names CPU types its own way (x86_64, aarch64).
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) arch=x86_64; fc="$FIRECRACKER_SHA256_AMD64"; k="$FIRECRACKER_KERNEL_SHA256_AMD64"; kc="$FIRECRACKER_KERNEL_CONFIG_SHA256_AMD64" ;; \
+      arm64) arch=aarch64; fc="$FIRECRACKER_SHA256_ARM64"; k="$FIRECRACKER_KERNEL_SHA256_ARM64"; kc="$FIRECRACKER_KERNEL_CONFIG_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    get() { curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 -o "$1" "$2"; echo "$3  $1" | sha256sum -c --quiet -; }; \
+    get fc.tgz "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${arch}.tgz" "$fc"; \
+    tar -xzf fc.tgz; \
+    mkdir -p /out/fc; \
+    install -m 0755 "release-${FIRECRACKER_VERSION}-${arch}/firecracker-${FIRECRACKER_VERSION}-${arch}" /out/fc/firecracker; \
+    install -m 0755 "release-${FIRECRACKER_VERSION}-${arch}/jailer-${FIRECRACKER_VERSION}-${arch}" /out/fc/jailer; \
+    kernel="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FIRECRACKER_KERNEL_CI_VERSION}/${arch}/vmlinux-${FIRECRACKER_KERNEL_VERSION}"; \
+    get /out/fc/vmlinux "$kernel" "$k"; \
+    get /out/fc/vmlinux.config "$kernel.config" "$kc"
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG TARGETARCH
@@ -61,9 +88,14 @@ LABEL org.opencontainers.image.title="aerolvm" \
 # per-sandbox rules (the Phase 0 agent installed the same, agent.sh).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates iproute2 iptables nftables procps \
+      skopeo umoci e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fetch /out/cni /opt/aerolvm/cni
 COPY --from=fetch /out/workerd /usr/local/bin/workerd
+COPY --from=fetch /out/fc/firecracker /out/fc/jailer /usr/local/bin/
+# Not under /var/lib/sandboxd, the worker pod's state volume, which would
+# hide it: the chart points SB_FIRECRACKER_KERNEL here.
+COPY --from=fetch /out/fc/vmlinux /out/fc/vmlinux.config /opt/aerolvm/firecracker/
 COPY ${TARGETARCH}/sandboxd ${TARGETARCH}/toolboxd /usr/local/bin/
 ENV SB_TOOLBOX_BINARY_PATH=/usr/local/bin/toolboxd \
     SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/aerolvm/cni

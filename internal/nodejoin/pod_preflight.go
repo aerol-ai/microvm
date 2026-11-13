@@ -22,15 +22,30 @@ import (
 // Bottlerocket ship 6.1, Azure Linux 6.6, Ubuntu 22.04 5.15.
 var MinKernel = [2]int{5, 10}
 
-// PodPreflight runs the worker pod's checks. kvm adds the /dev/kvm check,
-// for a Firecracker pool.
+// PodPreflight runs the worker pod's checks. kvm adds the kvm check, for a
+// Firecracker pool.
 func PodPreflight(p Paths, kvm bool) Report {
 	var r Report
 	r.add(checkCgroupRequired(p), checkKernel(p), checkBridgeNF(p))
 	if kvm {
-		r.add(checkKVM(p, true))
+		r.add(checkKVMSysfs(p))
 	}
 	return r
+}
+
+// checkKVMSysfs fails on a machine without the kvm device. The preflight
+// container is not privileged, so it has no /dev/kvm even on a machine that
+// does; it reads the machine's sysfs instead, and asks for no host folder
+// (the worker pod has none, EVIDENCE.md).
+func checkKVMSysfs(p Paths) Check {
+	c := Check{Name: "kvm", Status: StatusOK}
+	if _, err := os.Stat(p.KVMSysfs); err != nil {
+		c.Status, c.Detail = StatusFail, "this machine has no /dev/kvm ("+p.KVMSysfs+" is missing), and this worker pool runs Firecracker"
+		c.Fix = "use a metal machine or one with nested virtualization on (on EKS: m7i, c7i, r7i, m8i, c8i or r8i), or turn worker.firecracker off for this pool"
+		return c
+	}
+	c.Detail = "/dev/kvm is present (" + p.KVMSysfs + ")"
+	return c
 }
 
 // checkCgroupRequired fails without cgroup v2: every sandbox runs in a

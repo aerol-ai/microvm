@@ -46,6 +46,11 @@ type Paths struct {
 	AdminContext string // the login `aerolvm config import` reads
 	CgroupRoot   string
 	KVMDevice    string
+	// KVMSysfs is the kvm device's entry in sysfs (the pod preflight). An
+	// unprivileged container has no /dev/kvm, whatever the machine has,
+	// but sees the machine's sysfs read-only, where the device shows as
+	// soon as the kvm module made it.
+	KVMSysfs string
 	// OSRelease is the kernel's release string (the pod preflight).
 	OSRelease string
 	// BridgeNF is br_netfilter's sysctl: present only with the module
@@ -67,6 +72,7 @@ func DefaultPaths() Paths {
 		AdminContext: "/etc/sandboxd/admin-context.json",
 		CgroupRoot:   "/sys/fs/cgroup",
 		KVMDevice:    "/dev/kvm",
+		KVMSysfs:     "/sys/class/misc/kvm",
 		OSRelease:    "/proc/sys/kernel/osrelease",
 		BridgeNF:     "/proc/sys/net/bridge/bridge-nf-call-iptables",
 	}

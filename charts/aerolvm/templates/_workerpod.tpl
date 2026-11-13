@@ -13,10 +13,11 @@ and cluster mode's pod template, which the operator stamps per worker
 # No Kubernetes API rights (plan §8.7, wall 4).
 automountServiceAccountToken: false
 enableServiceLinks: false
-{{- if or $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled }}
-# WASM and V8-isolate sandboxes are processes sandboxd starts: with one
-# process namespace for the pod they outlive an agent restart, and the next
-# agent takes them over (C14). sandboxd refuses to start them without it.
+{{- if or $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled $root.Values.worker.firecracker.enabled }}
+# WASM, V8-isolate and Firecracker sandboxes are processes sandboxd starts:
+# with one process namespace for the pod they outlive an agent restart, and
+# the next agent takes them over (C14). sandboxd refuses to start them
+# without it.
 shareProcessNamespace: true
 {{- end }}
 {{- if $root.Values.edge.enabled }}
@@ -57,7 +58,7 @@ initContainers:
   - name: preflight
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
-    command: ["sandboxd", "preflight", "--pod"]
+    command: ["sandboxd", "preflight", "--pod"{{ if $root.Values.worker.firecracker.enabled }}, "--kvm"{{ end }}]
     terminationMessagePolicy: FallbackToLogsOnError
     securityContext:
       runAsUser: 65532
@@ -195,6 +196,7 @@ containers:
       {{- $runtimes := list "docker" "gvisor" }}
       {{- if $root.Values.worker.wasm.enabled }}{{ $runtimes = append $runtimes "wasm" }}{{ end }}
       {{- if $root.Values.worker.isolate.enabled }}{{ $runtimes = append $runtimes "isolate" }}{{ end }}
+      {{- if $root.Values.worker.firecracker.enabled }}{{ $runtimes = append $runtimes "firecracker" }}{{ end }}
       - { name: SB_HOST_RUNTIMES, value: {{ join "," $runtimes | quote }} }
       {{- if $root.Values.worker.wasm.enabled }}
       # WASM workers start under the runtime container's sandboxes group
@@ -208,6 +210,16 @@ containers:
       # restart, so a host the next agent takes over still has its root.
       - { name: SB_ENABLE_ISOLATE, value: "true" }
       - { name: SB_ISOLATE_JAIL_CHROOT_BASE, value: /var/lib/sandboxd/isolate-jail }
+      {{- end }}
+      {{- if $root.Values.worker.firecracker.enabled }}
+      # The image's guest kernel; the templates, the jailer's chroots and
+      # the run dir sit on the pod's volumes, so a VM the next agent takes
+      # over keeps its files. Each VM runs as jailerUID.
+      - { name: SB_ENABLE_FIRECRACKER, value: "true" }
+      - { name: SB_FIRECRACKER_KERNEL, value: /opt/aerolvm/firecracker/vmlinux }
+      - { name: SB_JAILER_CHROOT_BASE, value: /var/lib/sandboxd/jailer }
+      - { name: SB_JAILER_UID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
+      - { name: SB_JAILER_GID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
       {{- end }}
       - { name: SB_CONTAINER_ENGINE, value: containerd }
       - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }

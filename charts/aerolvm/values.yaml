@@ -81,6 +81,17 @@ worker:
   # process namespace so they outlive an agent restart.
   isolate:
     enabled: false
+  # Firecracker microVM sandboxes on workers (§8.9): only on machines with
+  # /dev/kvm, a metal instance or, on EKS, an m7i/c7i/r7i/m8i/c8i/r8i
+  # machine with nested virtualization on (spike S6). The worker's
+  # preflight then checks /dev/kvm, so a machine without it is refused with
+  # that reason. The agent image carries Firecracker, its jailer and a guest
+  # kernel. Like WASM, VMs are processes sandboxd starts: the pod shares one
+  # process namespace so they outlive an agent restart. jailerUID is the
+  # user each VM runs as (any unused number; nothing logs in as it).
+  firecracker:
+    enabled: false
+    jailerUID: 990
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
   # In cluster mode the operator adds the API server to the first and the
   # pod and Service ranges to the second, for every new worker; you add
