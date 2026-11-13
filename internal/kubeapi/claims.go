@@ -99,11 +99,17 @@ func (s *Server) claimRequest(ctx context.Context, ns string, body []byte) (mode
 	// through the same field table as a Sandbox create.
 	sandbox := map[string]any{
 		"metadata": map[string]any{"name": c.Metadata.Name, "generateName": c.Metadata.GenerateName},
-		"spec":     map[string]any{"podTemplate": mapAt(tpl, "spec")["podTemplate"]},
+		"spec":     blueprint(mapAt(tpl, "spec")),
 	}
 	if lc := c.Spec.Lifecycle; lc != nil {
 		sandbox["spec"].(map[string]any)["shutdownTime"] = lc.ShutdownTime
-		sandbox["spec"].(map[string]any)["shutdownPolicy"] = lc.ShutdownPolicy
+		policy := lc.ShutdownPolicy
+		if policy == "DeleteForeground" {
+			// A claim's own value (upstream: delete the claim, waiting for
+			// its sandbox). A claim is its sandbox, so it is Delete.
+			policy = ShutdownPolicyDelete
+		}
+		sandbox["spec"].(map[string]any)["shutdownPolicy"] = policy
 	}
 	probe, _ := json.Marshal(sandbox)
 	random := s.Random
@@ -120,7 +126,9 @@ func (s *Server) claimRequest(ctx context.Context, ns string, body []byte) (mode
 	c.Metadata.Name = made.Metadata.Name
 	if len(c.Spec.Env) > 0 {
 		policy, _ := mapAt(tpl, "spec")["envVarsInjectionPolicy"].(string)
-		if policy == "Disallowed" {
+		// Unset is Disallowed, as upstream: a template must opt in before a
+		// claim may set env on its sandboxes.
+		if policy == "" || policy == "Disallowed" {
 			return req, c, invalidClaim(c.Metadata.Name, []string{"spec.env: the template's envVarsInjectionPolicy is Disallowed"})
 		}
 		if req.Env == nil {

@@ -1334,10 +1334,20 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   after checking each write against the same field table as a create.
 - **A claim is its sandbox**, tagged `agents.x-k8s.io/claim` and
   `agents.x-k8s.io/warm-pool`; nothing per claim is stored.
+- **The pinned release and its gate.** The API follows agent-sandbox
+  v1.0.11 (commit `890de53a4dd18e35313173e6dc34d9559b1a9733`, in
+  `internal/kubeapi`). Its gate is the release's own examples: every
+  Sandbox, template, pool and claim in them, answered as the API answers
+  it, must match `internal/kubeapi/testdata/upstream-examples.txt`
+  (52 of 133 accepted; the rest name a refused field, most often volumes,
+  probes or a security context). The test fetches the release, so it runs
+  behind the `agentsandbox_examples` tag. Upstream's e2e tests check the
+  controller's own Pods and Services, which AerolVM does not make, so the
+  examples are the gate; the kind proof also runs upstream's hello-world
+  as written.
 - **Not built yet:** warm pools pre-starting sandboxes (a claim
   cold-starts; the plan is to sum `replicas` per image into the FSM's
-  warm-pool entries, next to the operator's own); the upstream release pin
-  with its e2e gate and golden examples; carrying the claim mark in the
+  warm-pool entries, next to the operator's own); carrying the claim mark in the
   placement row (a claim list reads every spec summary in the namespace);
   and a second `kubectl apply` of a Sandbox or a claim (annotations are
   not kept, so kubectl's own annotation makes the patch one that only

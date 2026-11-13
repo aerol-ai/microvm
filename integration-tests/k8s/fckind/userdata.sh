@@ -244,12 +244,26 @@ YAML
   $kk -n dev wait --for=condition=Ready sandbox/web --timeout=180s 2>&1 | sed 's/^/FCK wait re-created: /'
   say "re-created: uid $uid1 -> $($kk -n dev get sandbox web -o jsonpath='{.metadata.uid} {.spec.podTemplate.spec.containers[0].image}' 2>&1 | head -c 200)"
   say "re-created delete: $($kk -n dev delete sandbox web --timeout=120s 2>&1 | head -c 200)"
+  # Upstream's own hello-world, from the release the API follows, with a
+  # public image for its ${IMAGE}.
+  local up=890de53a4dd18e35313173e6dc34d9559b1a9733
+  if curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/$up/examples/hello-world-sandbox/hello-world.yaml" -o /root/hello-world.yaml; then
+    sed -i 's|\${IMAGE}|busybox:1.36|' /root/hello-world.yaml
+    say "upstream hello-world: $($kk -n dev apply -f /root/hello-world.yaml 2>&1 | tr '\n' ' ' | head -c 200)"
+    $kk -n dev wait --for=condition=Ready sandbox/hello-world --timeout=180s 2>&1 | sed 's/^/FCK wait hello-world: /'
+    say "hello-world delete: $($kk -n dev delete sandbox hello-world --timeout=120s 2>&1 | head -c 200)"
+  else
+    say "upstream hello-world: could not fetch it"
+  fi
   # The claim flow: a template, a warm pool, a claim that makes a sandbox.
   say "template and pool: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata: { name: python, namespace: dev }
 spec:
+  # Claims may set env only when the template says so (upstream's default
+  # is Disallowed; p6-kubeapi-7 showed the refusal).
+  envVarsInjectionPolicy: Allowed
   podTemplate:
     spec:
       runtimeClassName: gvisor

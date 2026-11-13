@@ -32,7 +32,7 @@ const claimBody = `{"apiVersion":"extensions.agents.x-k8s.io/v1beta1","kind":"Sa
 "spec":{"warmPoolRef":{"name":"pool"},"env":[{"name":"TASK","value":"t1"}],"additionalPodMetadata":{"labels":{"sandbox.users.io/x":"y"}}}}`
 
 func TestClaimCreateGetListDelete(t *testing.T) {
-	r := claimRig(t, "")
+	r := claimRig(t, "Allowed")
 	claims := ext + "/namespaces/a/sandboxclaims"
 	rr, out := r.call(t, http.MethodPost, claims, claimBody)
 	if rr.Code != http.StatusCreated || out["kind"] != SandboxClaimKind || out["status"].(map[string]any)["sandbox"].(map[string]any)["name"] != "job" ||
@@ -103,7 +103,25 @@ func TestClaimEnvPolicies(t *testing.T) {
 	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", claimBody); rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("Disallowed = %d", rr.Code)
 	}
+	// Unset is Disallowed, as upstream: a template opts in to claim env.
 	r = claimRig(t, "")
+	if rr, out := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", claimBody); rr.Code != http.StatusUnprocessableEntity || !strings.Contains(out["message"].(string), "Disallowed") {
+		t.Fatalf("an unset policy = %d %v", rr.Code, out["message"])
+	}
+	// A claim's DeleteForeground (upstream: delete the claim, waiting for
+	// its sandbox) is Delete: a claim is its sandbox.
+	fg := `{"metadata":{"name":"fg"},"spec":{"warmPoolRef":{"name":"pool"},"lifecycle":{"shutdownTime":"2099-01-01T00:00:00Z","shutdownPolicy":"DeleteForeground"}}}`
+	if rr, out := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", fg); rr.Code != http.StatusCreated {
+		t.Fatalf("DeleteForeground = %d %v", rr.Code, out["message"])
+	}
+	if lc := r.be.created[len(r.be.created)-1].Lifecycle; lc == nil || lc.DestroyAtAge <= 0 || lc.StopAtAge != 0 {
+		t.Fatalf("DeleteForeground made %+v, want a delete at the time", lc)
+	}
+	// A claim without env needs no policy.
+	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", `{"metadata":{"name":"bare"},"spec":{"warmPoolRef":{"name":"pool"}}}`); rr.Code != http.StatusCreated {
+		t.Fatalf("a claim without env, policy unset = %d", rr.Code)
+	}
+	r = claimRig(t, "Allowed")
 	nameless := `{"metadata":{"name":"n"},"spec":{"warmPoolRef":{"name":"pool"},"env":[{"value":"x"}]}}`
 	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", nameless); rr.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("a nameless env = %d", rr.Code)
@@ -111,7 +129,7 @@ func TestClaimEnvPolicies(t *testing.T) {
 }
 
 func TestClaimRefusals(t *testing.T) {
-	r := claimRig(t, "")
+	r := claimRig(t, "Allowed")
 	for name, tc := range map[string]struct {
 		body string
 		code int
@@ -153,7 +171,7 @@ func TestClaimRefusals(t *testing.T) {
 }
 
 func TestClaimWatch(t *testing.T) {
-	r := claimRig(t, "")
+	r := claimRig(t, "Allowed")
 	ts := httptest.NewServer(r.srv)
 	defer ts.Close()
 	for _, path := range []string{"/namespaces/a/sandboxclaims?watch=true&resourceVersion=50&timeoutSeconds=5", "/sandboxclaims?watch=true&timeoutSeconds=5"} {
@@ -217,7 +235,7 @@ func TestClaimWatch(t *testing.T) {
 // Claims honor a list's and a watch's selectors, as sandboxes do: kubectl
 // wait sandboxclaim/x lists and watches by fieldSelector metadata.name.
 func TestClaimSelectors(t *testing.T) {
-	r := claimRig(t, "")
+	r := claimRig(t, "Allowed")
 	claims := ext + "/namespaces/a/sandboxclaims"
 	for name, team := range map[string]string{"job": "ml", "other": "web"} {
 		body := strings.Replace(strings.Replace(claimBody, `"job"`, `"`+name+`"`, 1), `"ml"`, `"`+team+`"`, 1)
@@ -279,7 +297,7 @@ func TestClaimSelectors(t *testing.T) {
 // kubectl wait sandboxclaim/x asks for the initial list and waits for the
 // bookmark that ends it (p6-kubeapi-4 timed out without one).
 func TestClaimWatchInitialEvents(t *testing.T) {
-	r := claimRig(t, "")
+	r := claimRig(t, "Allowed")
 	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", claimBody); rr.Code != http.StatusCreated {
 		t.Fatalf("create = %d", rr.Code)
 	}

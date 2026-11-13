@@ -82,12 +82,12 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 		container.Image = spec.Image
 		container.Command = spec.Command
 		if spec.CPU > 0 || spec.MemoryMB > 0 {
-			limits := map[string]string{}
+			limits := map[string]Quantity{}
 			if spec.CPU > 0 {
-				limits["cpu"] = strconv.FormatFloat(spec.CPU, 'f', -1, 64)
+				limits["cpu"] = Quantity(strconv.FormatFloat(spec.CPU, 'f', -1, 64))
 			}
 			if spec.MemoryMB > 0 {
-				limits["memory"] = strconv.Itoa(spec.MemoryMB) + "Mi"
+				limits["memory"] = Quantity(strconv.Itoa(spec.MemoryMB) + "Mi")
 			}
 			container.Resources = &ResourceRequirements{Limits: limits}
 		}

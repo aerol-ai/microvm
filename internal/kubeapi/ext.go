@@ -34,9 +34,12 @@ var storedKinds = map[string]string{
 var templateTable = map[string]any{
 	"apiVersion": true, "kind": true, "metadata": "*", "status": "*",
 	"spec": map[string]any{
-		"podTemplate":             fieldTable["spec"].(map[string]any)["podTemplate"],
-		"envVarsInjectionPolicy":  true,
-		"networkPolicyManagement": true,
+		"podTemplate":                fieldTable["spec"].(map[string]any)["podTemplate"],
+		"service":                    true,
+		"failedPodPolicy":            true,
+		"envVarsInjectionPolicy":     true,
+		"networkPolicyManagement":    true,
+		"volumeClaimTemplatesPolicy": true,
 	},
 }
 
@@ -65,7 +68,7 @@ func validateStored(resource string, obj map[string]any) error {
 	case SandboxTemplatesResource:
 		refusedFields(obj, templateTable, "", &refused)
 		// The pod template must make a valid create, as a claim will.
-		probe, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": "template-check"}, "spec": map[string]any{"podTemplate": spec["podTemplate"]}})
+		probe, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": "template-check"}, "spec": blueprint(spec)})
 		if _, _, err := CreateFrom(probe, time.Now(), func() string { return "" }); err != nil {
 			if fe, ok := err.(*FieldError); ok {
 				refused = append(refused, fe.Fields...)
@@ -78,10 +81,21 @@ func validateStored(resource string, obj map[string]any) error {
 		default:
 			invalid("spec.envVarsInjectionPolicy: must be Allowed, Overrides or Disallowed")
 		}
-		switch spec["networkPolicyManagement"] {
-		case nil, "Unmanaged":
+		switch spec["volumeClaimTemplatesPolicy"] {
+		case nil, "Disallowed":
 		default:
-			invalid("spec.networkPolicyManagement: a sandbox is not a pod; only Unmanaged applies (use AerolVM's network rules)")
+			invalid("spec.volumeClaimTemplatesPolicy: only Disallowed applies; AerolVM sandboxes take no volume claims")
+		}
+		// Managed (upstream's default) with no rules of its own means the
+		// secure default: the public internet out, no private ranges or
+		// metadata, and only the router in. AerolVM's own walls are that
+		// already (the worker's egress NetworkPolicy, ingress only through
+		// the gateways), so both values stand; custom rules (networkPolicy)
+		// are refused by the table.
+		switch spec["networkPolicyManagement"] {
+		case nil, "Managed", "Unmanaged":
+		default:
+			invalid("spec.networkPolicyManagement: must be Managed or Unmanaged")
 		}
 	case SandboxWarmPoolsResource:
 		refusedFields(obj, warmPoolTable, "", &refused)
@@ -104,12 +118,34 @@ func validateStored(resource string, obj map[string]any) error {
 		}
 	}
 	if len(refused) > 0 {
+		// The table and the trial create can both name one field; say it once.
+		seen := map[string]bool{}
+		unique := refused[:0]
+		for _, f := range refused {
+			if !seen[f] {
+				seen[f] = true
+				unique = append(unique, f)
+			}
+		}
+		refused = unique
 		md, _ := obj["metadata"].(map[string]any)
 		name, _ := md["name"].(string)
 		return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid",
 			Message: fmt.Sprintf("%s %q is invalid: not supported by AerolVM: %s", kind, name, strings.Join(refused, "; "))}
 	}
 	return nil
+}
+
+// blueprint is the part of a template's spec a Sandbox shares (upstream
+// SandboxBlueprint): what a claim's sandbox is made from.
+func blueprint(spec map[string]any) map[string]any {
+	out := map[string]any{"podTemplate": spec["podTemplate"]}
+	for _, k := range []string{"service", "failedPodPolicy"} {
+		if v, ok := spec[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // mergePatch applies an RFC 7386 JSON merge patch.

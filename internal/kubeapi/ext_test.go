@@ -147,6 +147,10 @@ func TestExtensionsTemplatesAndPools(t *testing.T) {
 	if rr, out := r.call(t, http.MethodDelete, ext+"/namespaces/a/sandboxwarmpools/pool", ""); rr.Code != http.StatusOK || out["status"] != "Success" {
 		t.Fatalf("delete = %d %v", rr.Code, out)
 	}
+	// The table and the trial create both see a pod field: it is named once.
+	if _, out := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"podTemplate":{"spec":{"volumes":[],"containers":[{"name":"m","image":"x"}]}}}}`); strings.Count(out["message"].(string), "spec.podTemplate.spec.volumes") != 1 {
+		t.Fatalf("a refused field named more than once: %v", out["message"])
+	}
 	for name, tc := range map[string]struct {
 		method, path, body string
 		code               int
@@ -154,7 +158,12 @@ func TestExtensionsTemplatesAndPools(t *testing.T) {
 		"a pod field":         {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"podTemplate":{"spec":{"volumes":[],"containers":[{"name":"m","image":"x"}]}}}}`, 422},
 		"no image":            {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"podTemplate":{"spec":{"containers":[{"name":"m"}]}}}}`, 422},
 		"network policy":      {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"networkPolicy":{},"podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
-		"managed policy":      {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"networkPolicyManagement":"Managed","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
+		"unknown management":  {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"networkPolicyManagement":"Strict","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
+		"upstream defaults":   {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"defaults"},"spec":{"networkPolicyManagement":"Managed","envVarsInjectionPolicy":"Disallowed","volumeClaimTemplatesPolicy":"Disallowed","service":false,"failedPodPolicy":"Retain","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 201},
+		"volume claim policy": {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"volumeClaimTemplatesPolicy":"Allowed","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
+		"a service":           {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"service":true,"podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
+		"recreate":            {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"failedPodPolicy":"Recreate","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
+		"template volumes":    {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"volumeClaimTemplates":[],"podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
 		"env policy":          {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"envVarsInjectionPolicy":"Sometimes","podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
 		"wrong kind":          {http.MethodPost, "/namespaces/a/sandboxtemplates", `{"kind":"Pod","metadata":{"name":"x"},"spec":{"podTemplate":{"spec":{"containers":[{"name":"m","image":"x"}]}}}}`, 422},
 		"wrong version":       {http.MethodPost, "/namespaces/a/sandboxwarmpools", `{"apiVersion":"v1","metadata":{"name":"p"},"spec":{"sandboxTemplateRef":{"name":"t"}}}`, 422},
