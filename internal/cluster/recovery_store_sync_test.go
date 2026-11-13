@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -389,4 +391,133 @@ func containsString(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// fsSyncLog records recoveryStoreSyncFS's calls, and answers as told.
+type fsSyncLog struct {
+	mu        sync.Mutex
+	dirs      []string
+	supported bool
+	err       error
+}
+
+func countFSSyncs(t *testing.T, supported bool) *fsSyncLog {
+	t.Helper()
+	l := &fsSyncLog{supported: supported}
+	prev := recoveryStoreSyncFS
+	recoveryStoreSyncFS = func(dir string) (bool, error) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.dirs = append(l.dirs, dir)
+		if !l.supported {
+			return false, nil
+		}
+		return true, l.err
+	}
+	t.Cleanup(func() { recoveryStoreSyncFS = prev })
+	return l
+}
+
+func putMany(t *testing.T, store *placementRecoveryFileStore, n int) []string {
+	t.Helper()
+	paths := make([]string, 0, n)
+	for i := range n {
+		ref, err := store.Put("sb-"+strconv.Itoa(i), recoveryFor("img-"+strconv.Itoa(i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path, _ := store.pathForRef(ref)
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// F29: a snapshot's Sync of many blobs is one filesystem sync, not an fsync
+// each (the 500-worker bench measured 13 to 29 s of those per snapshot,
+// with Raft's own log fsyncs queued behind them). A few blobs, or no
+// filesystem sync on this platform, keep the fsyncs.
+func TestRecoveryFileStoreSyncManyBlobsSyncsTheFilesystemOnce(t *testing.T) {
+	for name, tc := range map[string]struct {
+		blobs     int
+		supported bool
+		fsSyncs   int
+		fsyncs    int // blobs and the directory
+	}{
+		"many blobs":                    {recoveryStoreSyncFSMin, true, 1, 0},
+		"a few blobs":                   {recoveryStoreSyncFSMin - 1, true, 0, recoveryStoreSyncFSMin},
+		"many, no filesystem sync here": {recoveryStoreSyncFSMin, false, 1, recoveryStoreSyncFSMin + 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fsyncs := countFsyncs(t)
+			fs := countFSSyncs(t, tc.supported)
+			store, err := newPlacementRecoveryFileStore(filepath.Join(t.TempDir(), "recovery"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			putMany(t, store, tc.blobs)
+			if err := store.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if len(fs.dirs) != tc.fsSyncs || (tc.fsSyncs > 0 && fs.dirs[0] != store.dir) {
+				t.Fatalf("filesystem syncs %v, want %d of %s", fs.dirs, tc.fsSyncs, store.dir)
+			}
+			if got := fsyncs.take(); len(got) != tc.fsyncs {
+				t.Fatalf("%d fsyncs, want %d", len(got), tc.fsyncs)
+			}
+			store.mu.Lock()
+			left := len(store.dirty)
+			store.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("%d blobs still dirty after a Sync that worked", left)
+			}
+		})
+	}
+}
+
+// A filesystem sync that fails leaves every blob dirty for the next Sync,
+// as a failed fsync does.
+func TestRecoveryFileStoreFilesystemSyncFailureKeepsBlobsDirty(t *testing.T) {
+	countFsyncs(t)
+	fs := countFSSyncs(t, true)
+	store, err := newPlacementRecoveryFileStore(filepath.Join(t.TempDir(), "recovery"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	putMany(t, store, recoveryStoreSyncFSMin+3)
+	fs.err = errors.New("EIO")
+	if err := store.Sync(); err == nil {
+		t.Fatal("Sync should fail when the filesystem sync fails")
+	}
+	store.mu.Lock()
+	left := len(store.dirty)
+	store.mu.Unlock()
+	if left != recoveryStoreSyncFSMin+3 {
+		t.Fatalf("%d blobs dirty after a failed filesystem sync, want all %d", left, recoveryStoreSyncFSMin+3)
+	}
+	fs.err = nil
+	if err := store.Sync(); err != nil || len(fs.dirs) != 2 {
+		t.Fatalf("the retry = %v, filesystem syncs %v", err, fs.dirs)
+	}
+}
+
+// The real syncFilesystem on this platform: on Linux one syncfs(2) that
+// works on a real directory; elsewhere it says it has none.
+func TestSyncFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "blob"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	supported, err := syncFilesystem(dir)
+	if runtime.GOOS == "linux" {
+		if !supported || err != nil {
+			t.Fatalf("syncfs = %v, %v", supported, err)
+		}
+		if _, err := syncFilesystem(filepath.Join(dir, "missing")); err == nil {
+			t.Fatal("syncfs of a missing directory worked")
+		}
+		return
+	}
+	if supported || err != nil {
+		t.Fatalf("off Linux = %v, %v; want unsupported", supported, err)
+	}
 }

@@ -235,9 +235,11 @@ func (s *placementRecoveryFileStore) markDirty(path string) {
 	s.dirty[path] = struct{}{}
 }
 
-// Sync fsyncs every blob Put since the last Sync, then the directory that
-// names them. A blob removed since (GC, Delete) is skipped. On failure the
-// blobs not yet synced stay dirty for the next Sync.
+// Sync makes every blob Put since the last Sync durable, and the directory
+// that names them. Many blobs take one filesystem sync (recoveryStoreSyncFS);
+// a few, or a platform without it, an fsync each. A blob removed since (GC,
+// Delete) is skipped. On failure the blobs not yet synced stay dirty for the
+// next Sync.
 func (s *placementRecoveryFileStore) Sync() error {
 	s.mu.Lock()
 	paths := make([]string, 0, len(s.dirty))
@@ -248,6 +250,17 @@ func (s *placementRecoveryFileStore) Sync() error {
 	s.mu.Unlock()
 	if len(paths) == 0 {
 		return nil
+	}
+	if len(paths) >= recoveryStoreSyncFSMin {
+		if supported, err := recoveryStoreSyncFS(s.dir); supported {
+			if err != nil {
+				for _, left := range paths {
+					s.markDirty(left)
+				}
+				return fmt.Errorf("placement recovery store: sync filesystem: %w", err)
+			}
+			return nil
+		}
 	}
 	if failed, err := fsyncEach(paths); err != nil {
 		for _, left := range failed {
@@ -285,14 +298,26 @@ func (s *placementRecoveryFileStore) SyncRef(ref string) error {
 // recoveryStoreFsync is syncFile; tests count the fsyncs through it.
 var recoveryStoreFsync = syncFile
 
-// recoveryStoreSyncWorkers bounds the fsyncs a snapshot runs at once. A
-// snapshot can follow up to raftSnapshotThreshold (8,192) entries, and each
-// placement write among them Put a blob: one after another at ~10 ms each
-// on a busy gp3 disk that is 80 s, and 16 at a time about 5 s, since
-// concurrent fsyncs on one filesystem share journal commits. Every blob is
-// synced once whatever the cadence; a bigger threshold only puts more of
-// them in one snapshot. Persist runs beside Apply, so that time delays log
-// compaction, never a create.
+// recoveryStoreSyncFS is syncFilesystem; tests replace it. It reports
+// whether the platform has a filesystem sync at all.
+var recoveryStoreSyncFS = syncFilesystem
+
+// recoveryStoreSyncFSMin is how many dirty blobs make one filesystem sync
+// cheaper than an fsync each. A snapshot under load has tens of thousands
+// (every create Puts a blob, and raft snapshots every 120 s): the 500-worker
+// bench (F29, run bench-f29-1) measured 12.9 s and 28.8 s of per-blob
+// fsyncs, 16 at a time, for one snapshot each, while Raft's own log fsyncs
+// queued behind them on the same disk and applies took up to 5 s. Each
+// fsync ends in its own device flush; syncfs writes the same pages back
+// and flushes once. It also flushes whatever else is dirty on that
+// filesystem, which the kernel would write within 30 s anyway, so below a
+// few dozen blobs the fsyncs stay.
+const recoveryStoreSyncFSMin = 64
+
+// recoveryStoreSyncWorkers bounds the fsyncs a Sync of a few blobs, or one
+// off Linux, runs at once: concurrent fsyncs on one filesystem share
+// journal commits. Persist runs beside Apply, so that time delays log
+// compaction, never a create directly.
 const recoveryStoreSyncWorkers = 16
 
 // fsyncEach fsyncs every path, recoveryStoreSyncWorkers at a time. It
