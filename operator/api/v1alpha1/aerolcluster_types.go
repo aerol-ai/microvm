@@ -253,8 +253,10 @@ type IssuerRef struct {
 // SecuritySpec holds identity and secret settings.
 type SecuritySpec struct {
 	// ExternalCA gets every pod's node certificate from the bank's issuer
-	// through cert-manager instead of a join token (R2). Not built yet: an
-	// AerolCluster that sets it is refused with a reason.
+	// through cert-manager instead of a join token (R2, C23), so no CA key
+	// is in the cluster. Set it before the cluster starts: once server 0
+	// has started it, turning it on or off is refused. A changed issuerRef
+	// applies to new nodes only, and its issuer must sign with the same CA.
 	// +optional
 	ExternalCA *ExternalCASpec `json:"externalCA,omitempty"`
 	// CreatePolicy names a ConfigMap in this namespace whose key
@@ -265,7 +267,8 @@ type SecuritySpec struct {
 	CreatePolicy *corev1.LocalObjectReference `json:"createPolicy,omitempty"`
 }
 
-// ExternalCASpec names the bank's issuer.
+// ExternalCASpec names the bank's issuer. It must return its CA as the
+// Secret's ca.crt: that CA is every node's trust.
 type ExternalCASpec struct {
 	IssuerRef IssuerRef `json:"issuerRef"`
 }

@@ -871,7 +871,7 @@ func TestInternalPortStillRequiresClientCert(t *testing.T) {
 	if got := leader.tls.serverConfig().ClientAuth; got != tls.RequireAndVerifyClientCert {
 		t.Fatalf("7002 client auth = %v", got)
 	}
-	if got := joinTLSConfig(leader.tls).ClientAuth; got != tls.NoClientCert {
+	if got := joinTLSConfig(leader.tls, false).ClientAuth; got != tls.NoClientCert {
 		t.Fatalf("7003 client auth = %v", got)
 	}
 	pool := x509.NewCertPool()

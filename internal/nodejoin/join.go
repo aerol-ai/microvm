@@ -33,6 +33,10 @@ type JoinOptions struct {
 	// machine with no systemd, such as a Kubernetes pod's init container;
 	// the pod's sandboxd loads cluster.env itself and joins as it starts.
 	FilesOnly bool
+	// ByCertificate joins by the certificate already in the TLS dir
+	// (external-CA mode, C23): no token, no CA hash, no key or CSR made
+	// here. The node ID and role are the certificate's.
+	ByCertificate bool
 }
 
 // Joiner runs a join on this machine.
@@ -68,6 +72,9 @@ type JoinResult struct {
 // success keeps the node key, so the join server answers it as a replay
 // and the files come out the same.
 func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
+	if o.ByCertificate {
+		return j.runByCert(ctx, o)
+	}
 	if !o.FilesOnly && !j.Host.IsRoot() {
 		return JoinResult{}, errors.New("run sandboxd join as root (sudo)")
 	}
@@ -161,6 +168,14 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 	if resp.CACert != d.info.CACert {
 		return JoinResult{}, errors.New("the join answer names another CA than cluster-info did")
 	}
+	return j.finish(ctx, o, env, resp, nodeID, advertise, joinURL, false)
+}
+
+// finish is what both joins share once the cluster answered: write the
+// files, then (unless files-only) restart sandboxd and wait until this node
+// is a member. byCert is a join by certificate: the certificate and CA are
+// the pod's Secret, so they are not written (writeJoinFiles).
+func (j *Joiner) finish(ctx context.Context, o JoinOptions, env nodeEnv, resp cluster.JoinResponse, nodeID, advertise, joinURL string, byCert bool) (JoinResult, error) {
 	nodeRole := o.Address.NodeRole
 	if nodeRole == "" {
 		nodeRole = resp.Role
@@ -169,7 +184,7 @@ func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
 	addr.NodeRole = nodeRole
 
 	journal := &fileJournal{}
-	if err := j.writeJoinFiles(journal, env, resp, nodeID, advertise, joinURL, addr, o.FilesOnly); err != nil {
+	if err := j.writeJoinFiles(journal, env, resp, nodeID, advertise, joinURL, addr, o.FilesOnly, byCert); err != nil {
 		j.undo(journal, joinUndoNote)
 		return JoinResult{}, err
 	}
@@ -321,22 +336,26 @@ func custodyCheck(env nodeEnv) Check {
 }
 
 // writeJoinFiles writes everything the answer carries, through the journal.
-func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinResponse, nodeID, advertise, joinURL string, addr AddressOptions, filesOnly bool) error {
+func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinResponse, nodeID, advertise, joinURL string, addr AddressOptions, filesOnly, byCert bool) error {
 	tlsDir := env.tlsDir(j.Paths)
-	if err := jr.write(filepath.Join(tlsDir, "ca.crt"), []byte(resp.CACert), 0o644); err != nil {
-		return err
-	}
-	// A re-run gets a freshly signed cert for the same key. While the one on
-	// disk is good and not yet due for renewal, keep it, so a re-run writes
-	// nothing new and needs no restart.
-	if !j.keepNodeCert(filepath.Join(tlsDir, "node.crt"), resp) {
-		if err := jr.write(filepath.Join(tlsDir, "node.crt"), []byte(resp.NodeCert), 0o644); err != nil {
+	// A join by certificate keeps the TLS dir as the pod's Secret made it
+	// (the bank's CA, the pod's certificate), and no CA key exists.
+	if !byCert {
+		if err := jr.write(filepath.Join(tlsDir, "ca.crt"), []byte(resp.CACert), 0o644); err != nil {
 			return err
+		}
+		// A re-run gets a freshly signed cert for the same key. While the
+		// one on disk is good and not yet due for renewal, keep it, so a
+		// re-run writes nothing new and needs no restart.
+		if !j.keepNodeCert(filepath.Join(tlsDir, "node.crt"), resp) {
+			if err := jr.write(filepath.Join(tlsDir, "node.crt"), []byte(resp.NodeCert), 0o644); err != nil {
+				return err
+			}
 		}
 	}
 	// Servers hold the CA key (D5); the join server sent it only because
 	// the token's role is server.
-	if resp.CAKey != "" {
+	if resp.CAKey != "" && !byCert {
 		if _, err := cluster.ParseClusterCA([]byte(resp.CACert), []byte(resp.CAKey)); err != nil {
 			return fmt.Errorf("the CA key in the join answer: %w", err)
 		}
@@ -351,6 +370,9 @@ func (j *Joiner) writeJoinFiles(jr *fileJournal, env nodeEnv, resp cluster.JoinR
 	var set envSet
 	addressSettings(&set, nodeID, advertise, env, j.Paths, addr)
 	set.set("SB_CLUSTER_BOOTSTRAP", "false")
+	if byCert {
+		set.set("SB_CLUSTER_EXTERNAL_CA", "true")
+	}
 	if resp.GossipKey != "" {
 		set.set("SB_GOSSIP_SECRET_KEY", resp.GossipKey)
 	}
