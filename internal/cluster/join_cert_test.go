@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -212,5 +214,63 @@ func TestJoinByCertOverTheJoinPort(t *testing.T) {
 	}
 	if _, ok := leader.fsm.admittedNode("rogue"); ok {
 		t.Fatal("a certificate from another CA was admitted")
+	}
+}
+
+// writeExternalCATLSDir writes a node's TLS dir as its cert-manager Secret
+// would in external-CA mode: the CA, and a certificate with node:<id> and
+// the role.
+func writeExternalCATLSDir(t *testing.T, nodeID, role string) string {
+	t.Helper()
+	_, pair := externalCALeaf(t, nodeID, role)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(pair.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "eca-tls")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		tlsCAFile:       sharedTestCAPEM,
+		tlsNodeCertFile: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]}),
+		tlsNodeKeyFile:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// In external-CA mode the seed has no CA key to adopt with: Adopt admits it
+// by the certificate it serves, and again changes nothing.
+func TestAdoptSelfByCert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a raft node")
+	}
+	tlsDir := writeExternalCATLSDir(t, "eca-adopt", JoinRoleServer)
+	leader, cleanup := newJoinTestCluster(t, "eca-adopt", true, nil, joinClusterOpts{
+		mutate: func(c *config.Config) { c.ClusterExternalCA, c.ClusterTLSDir = true, tlsDir },
+	})
+	defer cleanup()
+	waitForLeader(t, leader, 10*time.Second)
+	// Only the key this server serves with passes the live-member check for
+	// its own ID: another key for it is still refused.
+	if _, err := leader.WriteJoin(context.Background(), JoinWriteRequest{Kind: joinWriteAdmitByCert, Admit: &JoinAdmitCommand{
+		NodeID: "eca-adopt", Role: JoinRoleServer, KeyHash: testKey("not-mine"), NotAfterUnixNano: time.Now().Add(time.Hour).UnixNano(),
+	}}); !errors.Is(err, ErrNodeIDInUse) {
+		t.Fatalf("another key for the leader's own ID = %v", err)
+	}
+	out, err := leader.Adopt(context.Background(), AdoptRequest{})
+	if err != nil || len(out.Admitted) != 1 || out.Admitted[0] != "eca-adopt" || out.CASource != "external" || out.ClusterID == "" {
+		t.Fatalf("adopt = %+v, %v", out, err)
+	}
+	if rec, ok := leader.fsm.admittedNode("eca-adopt"); !ok || rec.Role != JoinRoleServer || rec.TokenID != "" {
+		t.Fatalf("admitted = %+v %v", rec, ok)
+	}
+	again, err := leader.Adopt(context.Background(), AdoptRequest{})
+	if err != nil || len(again.Already) != 1 || len(again.Admitted) != 0 {
+		t.Fatalf("adopt again = %+v, %v", again, err)
 	}
 }

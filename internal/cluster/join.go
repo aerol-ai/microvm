@@ -492,6 +492,11 @@ func (c *Cluster) liveMemberHoldsID(nodeID, keyHash string) error {
 	if rec, ok := c.fsm.admittedNode(nodeID); ok && rec.KeyHash == keyHash {
 		return nil
 	}
+	// The live member is this very server, admitting the key it serves
+	// with (external-CA mode: the seed admits itself by its certificate).
+	if nodeID == c.nodeID && keyHash != "" && keyHash == c.selfKeyHash() {
+		return nil
+	}
 	return fmt.Errorf("%w: %s is a live member", ErrNodeIDInUse, nodeID)
 }
 
@@ -1156,6 +1161,9 @@ type AdoptResponse struct {
 // node ID, current cert key and role as admitted, in one Raft op. Running
 // it again changes nothing.
 func (c *Cluster) Adopt(ctx context.Context, req AdoptRequest) (AdoptResponse, error) {
+	if c.cfg.ClusterExternalCA {
+		return c.adoptSelfByCert(ctx)
+	}
 	caCert, caPEM, err := c.clusterCACert()
 	if err != nil {
 		return AdoptResponse{}, err
