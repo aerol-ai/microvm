@@ -45,8 +45,12 @@ worker:
   # ("docker" = runc, or "gvisor").
   defaultRuntime: ""
   # Refuse new sandboxes while the sandbox volume has less than this share
-  # free (C27). "0" turns it off.
-  diskFloorRatio: "0.10"
+  # free (C27). "0" turns it off. It only turns new sandboxes away: the ones
+  # running keep writing up to their own disk size. On the default
+  # containerdVolume (an emptyDir, so the machine's root disk) kubelet evicts
+  # pods below 10% free (EKS, AL2023), the worker pod among them, so the
+  # floor sits 10 points above that. On a disk of its own, lower is fine.
+  diskFloorRatio: "0.20"
   # Sandboxes cannot reach private addresses unless a create allows them
   # (C24): a bank's network is not one connection away.
   blockPrivateByDefault: true
@@ -231,6 +235,10 @@ cluster:
       # A class that binds on first use (volumeBindingMode:
       # WaitForFirstConsumer), so each server's disk lands in its zone.
       storageClassName: ""
+    # Enough for a small cell. A cell near G3 (500 workers, 1,000 creates a
+    # second) needs 4 CPUs on its servers: the Raft leader used 2 to 3 cores
+    # at 900 to 1,200 creates a second (plans/kubernetes-v2-architecture.md,
+    # "The cell-ceiling bench", F31).
     resources:
       requests: { cpu: "1", memory: 2Gi }
       limits: { cpu: "2", memory: 4Gi }

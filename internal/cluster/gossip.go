@@ -258,6 +258,13 @@ type gossipMemberIndex struct {
 	// subset is small and changes only on membership churn, so it is kept
 	// alongside the map instead of being re-derived per call.
 	controlPlane []Member
+	// owners are the IDs of the alive members that can own sandboxes, and
+	// topologyErr the LargeClusterTopologyError of the whole membership,
+	// both rebuilt on membership churn. Sampled placement (E6,
+	// placement_sampled.go) draws its candidates from owners instead of
+	// copying every member on every create.
+	owners      []string
+	topologyErr error
 	// liveFloor is the lowest fv any alive member advertises and liveCount
 	// how many members are alive, both recomputed on membership churn. The
 	// audit caller gate reads them on every audit record, so they are
@@ -297,6 +304,55 @@ func (i *gossipMemberIndex) rebuildControlPlaneLocked() {
 		out = append(out, m)
 	}
 	i.controlPlane = out
+	i.rebuildOwnersLocked()
+}
+
+// rebuildOwnersLocked refreshes owners and topologyErr. Caller holds the
+// write lock; it runs with rebuildControlPlaneLocked, on churn only.
+func (i *gossipMemberIndex) rebuildOwnersLocked() {
+	owners := i.owners[:0]
+	all := make([]Member, 0, len(i.members))
+	for id, m := range i.members {
+		all = append(all, m)
+		if m.Alive && CanOwnSandboxRole(m.Role) {
+			owners = append(owners, id)
+		}
+	}
+	i.owners = owners
+	i.topologyErr = LargeClusterTopologyError(all)
+}
+
+// sampleOwners copies up to k distinct members drawn at random from owners,
+// with the owner count and the membership's topology error. It copies k
+// members, not the fleet: k is a few dozen however many workers there are.
+// pick(n) returns a random int in [0, n).
+func (i *gossipMemberIndex) sampleOwners(k int, pick func(int) int) (sample []Member, owners int, topologyErr error) {
+	if i == nil || k <= 0 {
+		return nil, 0, nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	owners, topologyErr = len(i.owners), i.topologyErr
+	if owners == 0 || topologyErr != nil {
+		return nil, owners, topologyErr
+	}
+	k = min(k, owners)
+	sample = make([]Member, 0, k)
+	seen := make(map[int]struct{}, k)
+	// Rejection sampling, with a bound on the draws: k is well below owners
+	// on the path that uses it (sampledPlacementMinOwners), so repeats are
+	// few, and a sample cut short only sends the decision to the full scan.
+	for draws := 0; len(sample) < k && draws < 8*k; draws++ {
+		j := pick(owners)
+		if _, dup := seen[j]; dup {
+			continue
+		}
+		seen[j] = struct{}{}
+		if m, ok := i.members[i.owners[j]]; ok {
+			sample = append(sample, m)
+		}
+	}
+	return sample, owners, nil
 }
 
 // controlPlaneSnapshot returns a copy of the maintained server subset.
@@ -1039,35 +1095,43 @@ func (g *gossipNode) selfMember() Member {
 	}
 }
 
-// peerByNodeID looks up a member's API URL by node ID. Returns "" if unknown.
-func (g *gossipNode) peerAPIURL(nodeID string) string {
-	for _, m := range g.members() {
+// memberByID is one member's record, read from the index by key. The peer
+// lookups below used to scan a copy of every member: at 500 workers the
+// owner lookup alone (OwnerOf, then peerInternalURL) was a tenth of the Raft
+// leader's CPU, and the copies much of its garbage (C18, bench-full-4).
+// Before the index exists, members() scans memberlist, and so does this.
+func (g *gossipNode) memberByID(nodeID string) (Member, bool) {
+	if g == nil || nodeID == "" {
+		return Member{}, false
+	}
+	if index := g.currentMemberIndex(); index != nil {
+		return index.get(nodeID)
+	}
+	for _, m := range g.scanMembers() {
 		if m.NodeID == nodeID {
-			return m.APIURL
+			return m, true
 		}
 	}
-	return ""
+	return Member{}, false
+}
+
+// peerAPIURL looks up a member's API URL by node ID. Returns "" if unknown.
+func (g *gossipNode) peerAPIURL(nodeID string) string {
+	m, _ := g.memberByID(nodeID)
+	return m.APIURL
 }
 
 func (g *gossipNode) peerDataPlaneHost(nodeID string) string {
-	for _, m := range g.members() {
-		if m.NodeID == nodeID {
-			return m.DataPlaneHost
-		}
-	}
-	return ""
+	m, _ := g.memberByID(nodeID)
+	return m.DataPlaneHost
 }
 
 // peerInternalURL returns the gossiped cluster-internal mTLS endpoint for
 // nodeID, or "" if the peer has not advertised one. Peer RPC callers treat an
 // empty value as unavailable and never downgrade to the public API.
 func (g *gossipNode) peerInternalURL(nodeID string) string {
-	for _, m := range g.members() {
-		if m.NodeID == nodeID {
-			return m.InternalURL
-		}
-	}
-	return ""
+	m, _ := g.memberByID(nodeID)
+	return m.InternalURL
 }
 
 // restartAnnounceTimeout bounds how long announceRestart waits for the

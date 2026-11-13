@@ -543,22 +543,39 @@ func (c *capacityLeaseCache) apply(members []Member, now time.Time) []Member {
 	defer c.mu.RUnlock()
 	out := make([]Member, 0, len(members))
 	for _, m := range members {
-		if !m.Alive || !CanOwnSandboxRole(m.Role) {
-			out = append(out, m)
-			continue
-		}
-		lease, ok := c.leases[m.NodeID]
-		if !ok {
-			m.CapacityStale = true
-			out = append(out, m)
-			continue
-		}
-		m.Capacity = lease.snapshot
-		m.CapacityUpdatedUnix = lease.updated.Unix()
-		m.CapacityStale = now.Sub(lease.updated) > c.ttl
+		c.applyOneLocked(&m, now)
 		out = append(out, m)
 	}
 	return out
+}
+
+// applyInPlace is apply on a slice the caller owns: sampled placement's few
+// members, which need no second copy.
+func (c *capacityLeaseCache) applyInPlace(members []Member, now time.Time) {
+	if c == nil {
+		return
+	}
+	c.refreshLocal(now)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i := range members {
+		c.applyOneLocked(&members[i], now)
+	}
+}
+
+// applyOneLocked gives one member its capacity lease. Caller holds c.mu.
+func (c *capacityLeaseCache) applyOneLocked(m *Member, now time.Time) {
+	if !m.Alive || !CanOwnSandboxRole(m.Role) {
+		return
+	}
+	lease, ok := c.leases[m.NodeID]
+	if !ok {
+		m.CapacityStale = true
+		return
+	}
+	m.Capacity = lease.snapshot
+	m.CapacityUpdatedUnix = lease.updated.Unix()
+	m.CapacityStale = now.Sub(lease.updated) > c.ttl
 }
 
 func (c *Cluster) startCapacityLeaseLoop(interval time.Duration) {

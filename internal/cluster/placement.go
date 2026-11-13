@@ -126,13 +126,6 @@ type placementOpts struct {
 }
 
 func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (PlacementTarget, []Member, error) {
-	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
-	rejects := make(map[string]int64)
-	if err := LargeClusterTopologyError(all); err != nil {
-		rejects["topology"] = 1
-		recordSchedulerDecision("invalid_topology", 0, rejects)
-		return PlacementTarget{}, nil, err
-	}
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
 	// reflect them) from each peer's headroom. Without this, two creates that
@@ -141,136 +134,52 @@ func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (Pla
 	// SelectPlacement on the same leader sees the first reservation here.
 	// Promoted and failed-over sandboxes the heartbeat does not show yet are
 	// counted too: that window is the same double-booking one step later.
-	pending := c.pendingLoadByNode(time.Now().Unix())
+	//
 	// Drained nodes are excluded from the candidate set entirely. Cheaper and
 	// clearer than threading the flag through nodeFits — drain is a hard
 	// admission rule (operator says "don't put more work here"), not a
 	// soft-scoring penalty. Self can be drained too; that's the intended way
 	// to roll a node out of rotation without restarting it.
-	drained := c.fsm.drainedNodesSnapshot()
+	//
 	// A deleted node is out of the gossip view within one refresh; until
 	// then the deny record keeps it out of the candidates.
-	denied := c.fsm.deniedNodeSet()
+	//
 	// A member below the active cluster version missed a finalize while it
 	// was down: it stays out of placement until it is upgraded (§6.5).
 	// Zero (never written) excludes nobody.
-	activeFV := c.fsm.activeFVValue()
-	candidates := make([]Member, 0, len(all))
-	// requiredReachable records whether the artifact-bound node, if any, was
-	// seen as a live capacity-reporting member. If it was and still produced
-	// no candidate, the failure is ordinary (capacity, drain); if it was not,
-	// the artifact itself is out of reach and the client must re-create it.
-	requiredReachable := false
-	// full records that a live, eligible worker able to run the request was
-	// turned away only for room (CPU, memory, disk, live memory, or a full
-	// network-slot pool). An empty candidate set with one is a cluster at
-	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
-	full := false
-	// labelMatched records that some live, role-eligible worker's last-known
-	// heartbeat carries every label the rule asks for. Without one the rule
-	// is unsatisfiable (409), not a capacity wait (503): no amount of waiting
-	// gives a node a label its operator did not set.
-	labelMatched := false
-	for _, m := range all {
-		if !m.Alive {
-			rejects["dead"]++
-			continue
-		}
-		// It announced a restart on SIGTERM (C8) and is about to leave: a
-		// create forwarded there now would fail or be lost in the restart.
-		if m.Restarting {
-			rejects["restarting"]++
-			continue
-		}
-		if !CanOwnSandboxRole(m.Role) {
-			rejects["role"]++
-			continue
-		}
-		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
-			rejects["artifact_affinity"]++
-			continue
-		}
-		// Only consider members that have advertised an APIURL — others may
-		// be partially-joined and forwarding to them would 502.
-		if m.APIURL == "" && m.NodeID != c.nodeID {
-			rejects["missing_api_url"]++
-			continue
-		}
-		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
-			// A stale lease still says what the node is: if its labels
-			// match, the rule is satisfiable and this is a heartbeat wait.
-			if len(req.Labels) > 0 && hasCapacitySnapshot(m.Capacity) && models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
-				labelMatched = true
-			}
-			rejects["capacity_heartbeat"]++
-			continue
-		}
-		if req.RequiredNodeID != "" && m.NodeID == req.RequiredNodeID {
-			requiredReachable = true
-		}
-		// Placement rules filter BEFORE power-of-two-choices (P1.4), and
-		// before drain and capacity so an empty set can tell "no node has
-		// these labels" from "the nodes that have them are busy".
-		if len(req.Labels) > 0 {
-			if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
-				rejects["placement_rule"]++
-				continue
-			}
-			labelMatched = true
-		}
-		if denied[m.NodeID] {
-			rejects["denied"]++
-			c.denyHits.hit(denyHitPlacement, m.NodeID)
-			continue
-		}
-		if drained[m.NodeID] {
-			rejects["drained"]++
-			continue
-		}
-		if activeFV > 0 && m.FSMOpsVersion > 0 && m.FSMOpsVersion < activeFV {
-			rejects["below_active_version"]++
-			continue
-		}
-		// A hard capability rule like drain, kept out of nodeFits so the
-		// empty-set error can name it: "no gateway" is not "cluster full".
-		if req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
-			rejects["egress_gateway"]++
-			continue
-		}
-		if req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
-			rejects["mediated_egress"]++
-			continue
-		}
-		extra, extraByRuntime := pending.of(m.NodeID)
-		switch nodeFitVerdict(m, req, extra) {
-		case fitIncompatible:
-			rejects["capacity"]++
-			continue
-		case fitNoRoom:
-			rejects["capacity"]++
-			full = true
-			continue
-		}
-		// A node with CPU and memory to spare is still full for this
-		// runtime when its network-slot pool is: the create would fail
-		// there with "no free slot" (bank density run, 2026-11-01).
-		if !slotsFit(m, req, extraByRuntime) {
-			rejects["network_slots"]++
-			full = true
-			continue
-		}
-		candidates = append(candidates, m)
+	f := placementFilter{
+		c: c, req: req,
+		drained:  c.fsm.drainedNodesSnapshot(),
+		denied:   c.fsm.deniedNodeSet(),
+		activeFV: c.fsm.activeFVValue(),
 	}
+	if target, candidates, ok := c.selectPlacementSampled(f, opts); ok {
+		return target, candidates, nil
+	}
+	placementFullScans.Add(1)
+	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
+	if err := LargeClusterTopologyError(all); err != nil {
+		recordSchedulerDecision("invalid_topology", 0, map[string]int64{"topology": 1})
+		return PlacementTarget{}, nil, err
+	}
+	f.pending = c.pendingLoadByNode(time.Now().Unix())
+	r := f.scan(all)
+	if len(r.candidates) == 0 {
+		recordSchedulerDecision("no_target", 0, r.rejects)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, r.requiredReachable, r.labelMatched, r.rejects["egress_gateway"] > 0, r.full)
+	}
+	return c.choosePlacement(f, opts, r)
+}
 
+// choosePlacement is the decision once the candidates are known: zone rules,
+// then the power of two choices. Shared by the full scan and the sampled
+// path (placement_sampled.go).
+func (c *Cluster) choosePlacement(f placementFilter, opts placementOpts, r candidateScan) (PlacementTarget, []Member, error) {
+	candidates := r.candidates
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
-	if len(candidates) == 0 {
-		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, labelMatched, rejects["egress_gateway"] > 0, full)
-	}
-
 	score := func(m Member) float64 {
-		extra, byRuntime := pending.of(m.NodeID)
-		return placementScore(m, req, extra, byRuntime)
+		extra, byRuntime := f.pending.of(m.NodeID)
+		return placementScore(m, f.req, extra, byRuntime)
 	}
 	// Zone rules (C10), on a pool so the full candidate set still goes back
 	// for the secret recipients: off the failed zone when another has
@@ -285,10 +194,10 @@ func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (Pla
 	}
 
 	if winner.NodeID == c.nodeID {
-		recordSchedulerDecision("self", len(candidates), rejects)
+		recordSchedulerDecision("self", len(candidates), r.rejects)
 		return self, candidates, nil
 	}
-	recordSchedulerDecision("remote", len(candidates), rejects)
+	recordSchedulerDecision("remote", len(candidates), r.rejects)
 	return PlacementTarget{
 		NodeID:        winner.NodeID,
 		APIURL:        winner.APIURL,
@@ -296,6 +205,136 @@ func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (Pla
 		InternalURL:   winner.InternalURL,
 		IsSelf:        false,
 	}, candidates, nil
+}
+
+// placementFilter is what one placement decision reads once and judges
+// every member against.
+type placementFilter struct {
+	c        *Cluster
+	req      capacity.Request
+	pending  pendingLoad
+	drained  map[string]bool
+	denied   map[string]bool
+	activeFV int
+}
+
+// candidateScan is what scan found: the members that can take the request,
+// why the others could not, and what an empty result means.
+type candidateScan struct {
+	candidates []Member
+	rejects    map[string]int64
+	// requiredReachable records whether the artifact-bound node, if any, was
+	// seen as a live capacity-reporting member. If it was and still produced
+	// no candidate, the failure is ordinary (capacity, drain); if it was not,
+	// the artifact itself is out of reach and the client must re-create it.
+	requiredReachable bool
+	// full records that a live, eligible worker able to run the request was
+	// turned away only for room (CPU, memory, disk, live memory, or a full
+	// network-slot pool). An empty candidate set with one is a cluster at
+	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
+	full bool
+	// labelMatched records that some live, role-eligible worker's last-known
+	// heartbeat carries every label the rule asks for. Without one the rule
+	// is unsatisfiable (409), not a capacity wait (503): no amount of waiting
+	// gives a node a label its operator did not set.
+	labelMatched bool
+}
+
+// scan judges members against the request: every hard rule, then room.
+func (f placementFilter) scan(members []Member) candidateScan {
+	r := candidateScan{candidates: make([]Member, 0, len(members)), rejects: make(map[string]int64)}
+	for _, m := range members {
+		if !m.Alive {
+			r.rejects["dead"]++
+			continue
+		}
+		// It announced a restart on SIGTERM (C8) and is about to leave: a
+		// create forwarded there now would fail or be lost in the restart.
+		if m.Restarting {
+			r.rejects["restarting"]++
+			continue
+		}
+		if !CanOwnSandboxRole(m.Role) {
+			r.rejects["role"]++
+			continue
+		}
+		if f.req.RequiredNodeID != "" && m.NodeID != f.req.RequiredNodeID {
+			r.rejects["artifact_affinity"]++
+			continue
+		}
+		// Only consider members that have advertised an APIURL — others may
+		// be partially-joined and forwarding to them would 502.
+		if m.APIURL == "" && m.NodeID != f.c.nodeID {
+			r.rejects["missing_api_url"]++
+			continue
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			// A stale lease still says what the node is: if its labels
+			// match, the rule is satisfiable and this is a heartbeat wait.
+			if len(f.req.Labels) > 0 && hasCapacitySnapshot(m.Capacity) && models.LabelsSatisfy(m.Capacity.Labels, f.req.Labels) {
+				r.labelMatched = true
+			}
+			r.rejects["capacity_heartbeat"]++
+			continue
+		}
+		if f.req.RequiredNodeID != "" && m.NodeID == f.req.RequiredNodeID {
+			r.requiredReachable = true
+		}
+		// Placement rules filter BEFORE power-of-two-choices (P1.4), and
+		// before drain and capacity so an empty set can tell "no node has
+		// these labels" from "the nodes that have them are busy".
+		if len(f.req.Labels) > 0 {
+			if !models.LabelsSatisfy(m.Capacity.Labels, f.req.Labels) {
+				r.rejects["placement_rule"]++
+				continue
+			}
+			r.labelMatched = true
+		}
+		if f.denied[m.NodeID] {
+			r.rejects["denied"]++
+			f.c.denyHits.hit(denyHitPlacement, m.NodeID)
+			continue
+		}
+		if f.drained[m.NodeID] {
+			r.rejects["drained"]++
+			continue
+		}
+		if f.activeFV > 0 && m.FSMOpsVersion > 0 && m.FSMOpsVersion < f.activeFV {
+			r.rejects["below_active_version"]++
+			continue
+		}
+		// A hard capability rule like drain, kept out of nodeFits so the
+		// empty-set error can name it: "no gateway" is not "cluster full".
+		if f.req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
+			r.rejects["egress_gateway"]++
+			continue
+		}
+		if f.req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
+			r.rejects["mediated_egress"]++
+			continue
+		}
+		extra, extraByRuntime := f.pending.of(m.NodeID)
+		switch nodeFitVerdict(m, f.req, extra) {
+		case fitIncompatible:
+			r.rejects["capacity"]++
+			continue
+		case fitNoRoom:
+			r.rejects["capacity"]++
+			r.full = true
+			continue
+		}
+		// A node with CPU and memory to spare is still full for this
+		// runtime when its network-slot pool is: the create would fail
+		// there with "no free slot" (bank density run, 2026-11-01).
+		if !slotsFit(m, f.req, extraByRuntime) {
+			r.rejects["network_slots"]++
+			r.full = true
+			continue
+		}
+		r.candidates = append(r.candidates, m)
+	}
+
+	return r
 }
 
 func normalizeSecretRecipientIDs(ids []string) []string {
@@ -765,13 +804,14 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
-	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
-	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
-	now := time.Now().Unix()
 	owners := make([]string, 0, len(reservations))
 	for _, r := range reservations {
 		owners = append(owners, r.OwnerNodeID)
 	}
+	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
+	// Only the owners': the check reads no other member.
+	members := c.withCatalogueTemplateHolders(c.membersWithCapacityFor(owners), templateIDs...)
+	now := time.Now().Unix()
 	// Committed pending load plus the ledger's in-flight holds (E2), then the
 	// load promoted or failed over since the owner's last heartbeat (C7).
 	reserved, reservedRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())
