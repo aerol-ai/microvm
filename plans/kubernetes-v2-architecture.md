@@ -2189,10 +2189,12 @@ each server used about 6% of one core and 160 MB (E5 above).
   them, so they are pauses, not load; the snapshot (the recovery store
   syncs its files then, §9.4 E4) is the first suspect. The bench now
   records the snapshot metrics to settle it.
-- F30 (open). An owner lookup the cache misses reads the sandbox's
+- F30 (fixed). An owner lookup the cache misses read the sandbox's
   recovery file from disk (`fullPlacementLocked`, then
   `resolveRecoveryRef`): 8% of the leader's CPU at 1,174 creates a
-  second. A lookup needs the owner, not the spec.
+  second. A lookup needs the owner, not the spec: `OwnerOf` and the
+  incarnation read now take the hot row (`placementFSM.getHot`), and
+  `TestOwnerLookupsReadNoRecoveryPayload` pins it.
 - F31. The chart's server pods are limited to 2 CPUs, and the leader used
   2 to 3 cores at 900 to 1,200 creates a second. The default suits a small
   cell; `values.yaml` now says to give servers 4 CPUs for a cell at G3.
