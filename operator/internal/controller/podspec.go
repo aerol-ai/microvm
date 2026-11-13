@@ -45,6 +45,16 @@ const (
 	EtcVolume = "etc"
 	// StateVolume holds /var/lib/sandboxd.
 	StateVolume = "state"
+	// RaftLogVolume holds a server's Raft log when servers.logStorage gave
+	// it a disk of its own.
+	RaftLogVolume = "raft-log"
+	// raftLogMount is where that disk is, outside /var/lib/sandboxd: a
+	// mount inside the state volume would need its parent made by the
+	// container runtime, as root, where sandboxd's user writes.
+	raftLogMount = "/var/lib/aerolvm-raft-log"
+	// raftLogDir is SB_RAFT_WAL_DIR: a folder on the disk, not its mount
+	// point, so recover-quorum --rejoin can move the log aside.
+	raftLogDir = raftLogMount + "/raft-wal"
 	// JoinVolume holds the pod's join token Secret.
 	JoinVolume = "join"
 	// CreatePolicyVolume holds the operator's create policy, when the
@@ -167,6 +177,9 @@ type StampInput struct {
 	Pool *v1.WorkerPoolSpec
 	// PVC is a server's volume claim.
 	PVC string
+	// LogPVC is a server's Raft log claim, as its data claim names it
+	// (AnnotationLogClaim); "" for none.
+	LogPVC string
 	// Addresses are the cluster's own, kept from sandboxes (C24): a
 	// worker's only.
 	Addresses clusterAddresses
@@ -229,6 +242,9 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 			return nil, fmt.Errorf("server %s has no volume claim", n.Name)
 		}
 		usePVC(&pod.Spec, in.PVC)
+		if in.LogPVC != "" {
+			useLogPVC(&pod.Spec, in.LogPVC)
+		}
 	case v1.RoleGateway:
 		mergeSelector(&pod.Spec, c.Spec.Gateways.NodeSelector)
 		pod.Spec.Tolerations = append(pod.Spec.Tolerations, c.Spec.Gateways.Tolerations...)
@@ -625,6 +641,22 @@ func setEnv(spec *corev1.PodSpec, name string, env []corev1.EnvVar) {
 			c.Env = append(c.Env, e)
 		}
 	}
+}
+
+// useLogPVC mounts the server's Raft log claim into sandboxd's container,
+// where maintenance runs its tools too (holdServer), and points sandboxd at
+// it. The setup container does not need it: init and join write no log.
+func useLogPVC(spec *corev1.PodSpec, claim string) {
+	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: RaftLogVolume, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+	}})
+	i := containerIndex(spec.Containers, AgentContainer)
+	if i < 0 {
+		return
+	}
+	c := &spec.Containers[i]
+	c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: RaftLogVolume, MountPath: raftLogMount})
+	setEnv(spec, AgentContainer, []corev1.EnvVar{{Name: "SB_RAFT_WAL_DIR", Value: raftLogDir}})
 }
 
 // usePVC puts the server's claim behind its etc and state volumes, so its

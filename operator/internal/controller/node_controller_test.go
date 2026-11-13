@@ -32,6 +32,19 @@ type nodeRig struct {
 func newNodeRig(t *testing.T, c *v1.AerolCluster, objs ...client.Object) *nodeRig {
 	t.Helper()
 	all := append([]client.Object{c, adminSecret(), templates(t)}, objs...)
+	// A server's data claim, as the cluster controller makes it before the
+	// server's AerolNode (ensurePVC), unless the test brings its own.
+	claims := map[string]bool{}
+	for _, o := range objs {
+		if pvc, ok := o.(*corev1.PersistentVolumeClaim); ok {
+			claims[pvc.Name] = true
+		}
+	}
+	for _, o := range objs {
+		if n, ok := o.(*v1.AerolNode); ok && n.Spec.Role == v1.RoleServer && !claims[PVCName(n.Name)] {
+			all = append(all, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: PVCName(n.Name)}})
+		}
+	}
 	cl := newFakeClient(t, all...)
 	api := newFakeAPI()
 	g := &nodeRig{t: t, api: api, cl: cl, now: time.Unix(2_000_000_000, 0)}

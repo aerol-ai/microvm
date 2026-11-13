@@ -507,6 +507,11 @@ func (in *SecuritySpec) DeepCopy() *SecuritySpec {
 func (in *ServerSpec) DeepCopyInto(out *ServerSpec) {
 	*out = *in
 	in.Storage.DeepCopyInto(&out.Storage)
+	if in.LogStorage != nil {
+		in, out := &in.LogStorage, &out.LogStorage
+		*out = new(StorageSpec)
+		(*in).DeepCopyInto(*out)
+	}
 	in.Resources.DeepCopyInto(&out.Resources)
 	if in.NodeSelector != nil {
 		in, out := &in.NodeSelector, &out.NodeSelector
