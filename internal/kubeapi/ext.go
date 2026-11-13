@@ -118,6 +118,16 @@ func validateStored(resource string, obj map[string]any) error {
 		}
 	}
 	if len(refused) > 0 {
+		// The table and the trial create can both name one field; say it once.
+		seen := map[string]bool{}
+		unique := refused[:0]
+		for _, f := range refused {
+			if !seen[f] {
+				seen[f] = true
+				unique = append(unique, f)
+			}
+		}
+		refused = unique
 		md, _ := obj["metadata"].(map[string]any)
 		name, _ := md["name"].(string)
 		return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid",

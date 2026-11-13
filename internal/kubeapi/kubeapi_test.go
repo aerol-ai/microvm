@@ -117,6 +117,18 @@ func TestCreateFrom(t *testing.T) {
 	if strings.Join(req.ContainerCommand, " ") != "python -m http.server" || req.Env["MODE"] != "dev" || req.Tags["app"] != "agent" {
 		t.Fatalf("req = %+v", req)
 	}
+	// The common pod fields upstream's examples carry: declared ports,
+	// IfNotPresent, no service account token, a disk, and quantities written
+	// as plain numbers.
+	common := `{"metadata":{"name":"common"},"spec":{"podTemplate":{"spec":{"automountServiceAccountToken":false,"restartPolicy":"Never","containers":[{"name":"m","image":"alpine","imagePullPolicy":"IfNotPresent",
+"ports":[{"name":"http","containerPort":8080,"protocol":"TCP"}],"resources":{"limits":{"cpu":2,"memory":"1Gi","ephemeral-storage":"10Gi"},"requests":{"ephemeral-storage":"1Gi"}}}]}}}}`
+	if req, _, err := CreateFrom([]byte(common), now, fixed); err != nil || req.CPU != 2 || req.MemoryMB != 1024 || req.DiskGB != 10 {
+		t.Fatalf("common fields = %+v, %v", req, err)
+	}
+	half := strings.Replace(common, `"ephemeral-storage":"10Gi"`, `"ephemeral-storage":"1500Mi"`, 1)
+	if req, _, err := CreateFrom([]byte(half), now, fixed); err != nil || req.DiskGB != 2 {
+		t.Fatalf("a disk of 1500Mi = %d GiB, %v, want 2 (rounded up)", req.DiskGB, err)
+	}
 	// Upstream's defaults, spelled out, are accepted (v1.0.11).
 	defaults := strings.Replace(goodCreate, `"shutdownTime"`, `"service": false, "failedPodPolicy": "Retain", "shutdownTime"`, 1)
 	if _, _, err := CreateFrom([]byte(defaults), now, fixed); err != nil {
@@ -165,6 +177,12 @@ func TestCreateFromRefuses(t *testing.T) {
 		{"bad memory", container(`,"resources":{"limits":{"memory":"-1Gi"}}`), "resources.limits.memory"},
 		{"other resource", container(`,"resources":{"limits":{"nvidia.com/gpu":"1"}}`), "resources.limits.nvidia.com/gpu"},
 		{"runtime", `{"metadata":{"name":"web"},"spec":{"podTemplate":{"spec":{"runtimeClassName":"kata","containers":[{"name":"a","image":"x"}]}}}}`, "runtimeClassName"},
+		{"restart on failure", `{"metadata":{"name":"web"},"spec":{"podTemplate":{"spec":{"restartPolicy":"OnFailure","containers":[{"name":"a","image":"x"}]}}}}`, "only Never"},
+		{"a host port", container(`,"ports":[{"containerPort":80,"hostPort":80}]`), "ports[0].hostPort"},
+		{"pull always", container(`,"imagePullPolicy":"Always"`), "only IfNotPresent"},
+		{"a token", `{"metadata":{"name":"web"},"spec":{"podTemplate":{"spec":{"automountServiceAccountToken":true,"containers":[{"name":"a","image":"x"}]}}}}`, "automountServiceAccountToken"},
+		{"bad disk", container(`,"resources":{"limits":{"ephemeral-storage":"lots"}}`), "resources.limits.ephemeral-storage"},
+		{"a quantity that is neither", container(`,"resources":{"limits":{"cpu":true}}`), "body"},
 		{"a service", `{"metadata":{"name":"web"},"spec":{"service":true,"podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "spec.service"},
 		{"recreate on failure", `{"metadata":{"name":"web"},"spec":{"failedPodPolicy":"Recreate","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "only Retain"},
 		{"unknown failure policy", `{"metadata":{"name":"web"},"spec":{"failedPodPolicy":"Restart","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "must be Retain"},
