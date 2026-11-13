@@ -144,6 +144,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, &StatusError{Code: http.StatusUnauthorized, Reason: "Unauthorized", Message: err.Error()})
 		return
 	}
+	r = r.WithContext(ContextWithUser(r.Context(), u))
 	switch path {
 	case "/apis":
 		writeJSON(w, http.StatusOK, apiGroupList())

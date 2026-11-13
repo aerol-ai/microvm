@@ -51,6 +51,20 @@ type Authorizer interface {
 	Authorize(ctx context.Context, u User, a Attributes) (allowed bool, reason string, err error)
 }
 
+type userKey struct{}
+
+// ContextWithUser carries the authenticated Kubernetes caller to the
+// Backend, which names it in the audit record of each write.
+func ContextWithUser(ctx context.Context, u User) context.Context {
+	return context.WithValue(ctx, userKey{}, u)
+}
+
+// UserFromContext is the caller ContextWithUser set.
+func UserFromContext(ctx context.Context) (User, bool) {
+	u, ok := ctx.Value(userKey{}).(User)
+	return u, ok
+}
+
 // ErrUnauthenticated is a request without a front-proxy certificate the
 // server trusts.
 var ErrUnauthenticated = errors.New("kubeapi: the request did not come through the Kubernetes API server")
