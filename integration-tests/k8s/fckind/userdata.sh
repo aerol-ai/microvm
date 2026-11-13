@@ -336,6 +336,15 @@ metadata: { name: quick-pool, namespace: dev }
 spec: { replicas: 1, sandboxTemplateRef: { name: quick } }
 YAML
 )"
+  # What a worker is running with, and what it reports.
+  local w0
+  w0=$($kw get pods -l app.kubernetes.io/component=worker -o name | head -1)
+  say "warm worker ${w0#pod/} env: $($kw exec "$w0" -c agent -- sh -c 'tr "\0" "\n" < /proc/$(pgrep -x sandboxd | head -1)/environ | grep -E "^SB_(CONTAINERD_POOL|CONTAINER_RUNTIME|DOCKER_READY|CONTAINER_ENGINE)" | sort' 2>&1 | tr '\n' ' ')"
+  $kw port-forward "$w0" $port:21212 >/dev/null 2>&1 & pf=$!
+  sleep 2
+  say "warm worker metrics: HTTP $(curl -s -m 5 -o /root/wm.txt -w '%{http_code}' -H "Authorization: Bearer $tok" http://127.0.0.1:$port/v1/metrics); $(grep -E '^aerolvm_containerd_pool_(parked|hits_total|misses_total|spawn_fails_total)' /root/wm.txt | tr '\n' ' ')"
+  kill $pf 2>/dev/null; wait $pf 2>/dev/null
+  $kw logs "$w0" -c agent 2>&1 | grep -iE 'warm|park|pool' | tail -6 | cut -c1-260 | sed "s|^|FCK   warm log: |"
   local parked=0
   for i in $(seq 1 24); do
     parked=$(pool_metric aerolvm_containerd_pool_parked)
@@ -358,6 +367,7 @@ YAML
   $kk -n dev wait --for=condition=Ready sandboxclaim/fast --timeout=120s 2>&1 | sed 's/^/FCK wait warm claim: /'
   say "warm claim ready in $(( ($(date +%s%N) - t0) / 1000000 )) ms (with kubectl's own round trips)"
   after=$(pool_metric aerolvm_containerd_pool_hits_total)
+  $kw logs "$w0" -c agent 2>&1 | grep -iE 'warm|park|pool' | tail -6 | cut -c1-260 | sed "s|^|FCK   warm log after: |"
   if [ "$parked" -ge 1 ] && [ "$after" -gt "$before" ]; then
     say "RESULT PASS: warm pool: the claim took a parked slot (pool hits $before -> $after)"
   else

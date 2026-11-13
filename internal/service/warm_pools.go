@@ -324,6 +324,11 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 	for _, reg := range pools {
 		reg.pool.SetConfigured(configuredFor(reg.runtime, entries, kube))
 	}
+	if s.logger != nil {
+		// Only on a change (ok): which pools park what is otherwise
+		// invisible on a worker.
+		s.logger.Info("warm pool entries applied", "entries", len(entries), "agent_sandbox_depths", len(kube), "pools", len(pools))
+	}
 	return nil
 }
 
