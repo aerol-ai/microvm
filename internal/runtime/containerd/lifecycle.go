@@ -264,7 +264,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
 		if restore {
-			specOpts = append(specOpts, d.restoreSpecOpt(sandboxID))
+			opt, err := d.restoreSpecOpt(sandboxID)
+			if err != nil {
+				return nil, err
+			}
+			specOpts = append(specOpts, opt)
 		}
 	}
 
@@ -454,7 +458,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if restore {
 		// Used: a later start of this container boots it, and the wrapper
 		// then passes the start through.
-		_ = os.RemoveAll(d.moveDir(moveIn, sandboxID))
+		if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
+			_ = os.RemoveAll(dir)
+		}
 	}
 	committed = true
 	return state, nil
@@ -548,8 +554,8 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		return nil, fmt.Errorf("load container: %w", err)
 	}
 	// A move's checkpoint of this sandbox is stale once it runs here again.
-	if validateSandboxID(containerRef) == nil {
-		_ = os.RemoveAll(d.moveDir(moveOut, containerRef))
+	if dir, err := d.moveDir(moveOut, containerRef); err == nil {
+		_ = os.RemoveAll(dir)
 	}
 	task, err := container.Task(ctx, nil)
 	if err == nil {

@@ -29,6 +29,8 @@ func TestArgs(t *testing.T) {
 		{"a spec that is not JSON", with("start", "sb-1"), []byte("{"), yes, with("start", "sb-1")},
 		{"a relative directory is refused", with("start", "sb-1"),
 			[]byte(`{"annotations":{"` + RestoreAnnotation + `":"moves/in/sb-1"}}`), yes, with("start", "sb-1")},
+		{"a directory with .. is refused", with("start", "sb-1"),
+			[]byte(`{"annotations":{"` + RestoreAnnotation + `":"/var/lib/x/../../etc"}}`), yes, with("start", "sb-1")},
 		{"create passes through", with("create", "--bundle", "/b", "sb-1"), spec, yes, with("create", "--bundle", "/b", "sb-1")},
 		{"wait passes through", with("wait", "sb-1"), spec, yes, with("wait", "sb-1")},
 		{"exec of a command named start passes through", with("exec", "--detach", "sb-1", "start", "x"), spec, yes,

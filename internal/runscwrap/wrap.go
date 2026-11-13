@@ -69,11 +69,13 @@ func restoreDir(spec []byte) string {
 	if len(spec) == 0 || json.Unmarshal(spec, &s) != nil {
 		return ""
 	}
-	dir := filepath.Clean(strings.TrimSpace(s.Annotations[RestoreAnnotation]))
-	if !filepath.IsAbs(dir) {
+	// Our driver writes a clean absolute path; anything else is refused
+	// (the ".." test is also the one code scanning recognizes).
+	raw := strings.TrimSpace(s.Annotations[RestoreAnnotation])
+	if raw == "" || strings.Contains(raw, "..") || !filepath.IsAbs(raw) {
 		return ""
 	}
-	return dir
+	return filepath.Clean(raw)
 }
 
 // HasCheckpoint reports whether dir holds a checkpoint.
