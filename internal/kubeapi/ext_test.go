@@ -99,7 +99,7 @@ func TestExtensionsTemplatesAndPools(t *testing.T) {
 	r := newRig(t)
 	store := &memStore{}
 	r.srv.Store = store
-	if _, res := r.call(t, http.MethodGet, ext, ""); len(res["resources"].([]any)) != 2 {
+	if _, res := r.call(t, http.MethodGet, ext, ""); len(res["resources"].([]any)) != 3 {
 		t.Fatalf("discovery = %v", res)
 	}
 	if _, g := r.call(t, http.MethodGet, "/apis/extensions.agents.x-k8s.io", ""); g["name"] != ExtensionsGroup {
@@ -164,7 +164,7 @@ func TestExtensionsTemplatesAndPools(t *testing.T) {
 		"bad strategy":        {http.MethodPost, "/namespaces/a/sandboxwarmpools", `{"metadata":{"name":"p"},"spec":{"sandboxTemplateRef":{"name":"t"},"updateStrategy":{"type":"Rolling"}}}`, 422},
 		"namespace mismatch":  {http.MethodPost, "/namespaces/a/sandboxwarmpools", `{"metadata":{"name":"p","namespace":"b"},"spec":{"sandboxTemplateRef":{"name":"t"}}}`, 400},
 		"not JSON":            {http.MethodPost, "/namespaces/a/sandboxwarmpools", `x`, 400},
-		"not served":          {http.MethodGet, "/namespaces/a/sandboxclaims", ``, 404},
+		"not served":          {http.MethodGet, "/namespaces/a/sandboxthings", ``, 404},
 		"PUT on the core API": {http.MethodPut, "/namespaces/a/sandboxtemplates", `{}`, 405},
 	} {
 		path := ext + tc.path

@@ -56,6 +56,7 @@ type fakeBackend struct {
 	keys     []string
 	deleted  []string
 	running  map[string]bool
+	tags     map[string]map[string]string
 	err      error
 	noFeed   bool
 	specless bool
@@ -70,6 +71,10 @@ func (b *fakeBackend) Create(_ context.Context, owner string, req models.CreateS
 	b.created, b.keys = append(b.created, req), append(b.keys, key)
 	b.next++
 	id := fmt.Sprintf("sb-new%d", b.next)
+	if b.tags == nil {
+		b.tags = map[string]map[string]string{}
+	}
+	b.tags[id] = req.Tags
 	if !b.noFeed {
 		p := cluster.Placement{SandboxID: id, Name: req.Name, OwnerRef: owner, OwnerNodeID: "w1", Version: 100 + b.next}
 		b.hub.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{{SandboxID: id, Index: p.Version, Placement: &p}}, Next: p.Version})
@@ -105,8 +110,10 @@ func (b *fakeBackend) Specs(_ context.Context, ids []string) map[string]SpecSumm
 	if b.specless {
 		return out
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, id := range ids {
-		out[id] = SpecSummary{Image: "img-" + id}
+		out[id] = SpecSummary{Image: "img-" + id, Tags: b.tags[id]}
 	}
 	return out
 }
@@ -594,5 +601,25 @@ func TestWriteStatusFallsBackTo500(t *testing.T) {
 	body, _ := io.ReadAll(rr.Body)
 	if rr.Code != http.StatusInternalServerError || !strings.Contains(string(body), "InternalError") {
 		t.Fatalf("%d %s", rr.Code, body)
+	}
+}
+
+// A watch answers its headers at once, before any event: a quiet namespace
+// must not leave kubectl waiting for a response.
+func TestServerWatchSendsHeadersAtOnce(t *testing.T) {
+	r := newRig(t)
+	r.srv.Store = &memStore{}
+	ts := httptest.NewServer(r.srv)
+	defer ts.Close()
+	for _, path := range []string{base + "/namespaces/a/sandboxes?watch=true", ext + "/namespaces/a/sandboxclaims?watch=true", ext + "/namespaces/a/sandboxtemplates?watch=true"} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path+"&timeoutSeconds=30", nil)
+		req.Header.Set("X-Test-User", "alice")
+		client := &http.Client{Timeout: 2 * time.Second}
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK || time.Since(start) > time.Second {
+			t.Fatalf("%s: headers after %s: %v", path, time.Since(start), err)
+		}
+		resp.Body.Close()
 	}
 }

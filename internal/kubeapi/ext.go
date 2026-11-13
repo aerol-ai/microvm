@@ -205,6 +205,9 @@ func (s *Server) serveStored(w http.ResponseWriter, r *http.Request, verb, resou
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
 		buf := make([]byte, 32<<10)
 		for {
 			n, rerr := stream.Read(buf)
@@ -241,6 +244,8 @@ func extensionsResourceList() APIResourceList {
 		APIResources: []APIResource{
 			{Name: SandboxTemplatesResource, SingularName: "sandboxtemplate", Namespaced: true, Kind: SandboxTemplateKind, Verbs: verbs, ShortNames: []string{"sandboxtemplate"}},
 			{Name: SandboxWarmPoolsResource, SingularName: "sandboxwarmpool", Namespaced: true, Kind: SandboxWarmPoolKind, Verbs: verbs, ShortNames: []string{"swp"}},
+			{Name: SandboxClaimsResource, SingularName: "sandboxclaim", Namespaced: true, Kind: SandboxClaimKind,
+				Verbs: []string{"create", "delete", "get", "list", "watch"}, ShortNames: []string{"sandboxclaim"}},
 		},
 	}
 }

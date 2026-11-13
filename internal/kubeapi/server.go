@@ -199,6 +199,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, &StatusError{Code: http.StatusForbidden, Reason: "Forbidden", Message: msg})
 		return
 	}
+	if group == ExtensionsGroup && resource == SandboxClaimsResource {
+		if err := s.serveClaims(w, r, verb, ns, name); err != nil {
+			writeStatus(w, err)
+		}
+		return
+	}
 	if group == ExtensionsGroup {
 		if err := s.serveStored(w, r, verb, resource, ns, name); err != nil {
 			writeStatus(w, err)
@@ -251,6 +257,7 @@ func parseResourcePath(path string) (group, resource, ns, name, sub string, ok b
 	served := resource == SandboxesResource
 	if group == ExtensionsGroup {
 		_, served = storedKinds[resource]
+		served = served || resource == SandboxClaimsResource
 	}
 	if !served {
 		return "", "", "", "", "", false
@@ -746,6 +753,11 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, ns string, q map[
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		// Headers now: a quiet watch must not leave the client waiting for
+		// its response.
+		flusher.Flush()
+	}
 	enc := json.NewEncoder(w)
 	send := func(ev WatchEvent) bool {
 		if err := enc.Encode(ev); err != nil {

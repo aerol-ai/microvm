@@ -20,6 +20,8 @@ type SpecSummary struct {
 	CPU      float64
 	MemoryMB int
 	Command  []string
+	// Tags are the object's labels.
+	Tags map[string]string
 }
 
 // dnsSubdomain is the Kubernetes object-name rule (RFC 1123 subdomain).
@@ -67,6 +69,7 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 	}
 	container := Container{Name: "sandbox"}
 	var runtimeClassName string
+	var labels map[string]string
 	if spec != nil {
 		container.Image = spec.Image
 		container.Command = spec.Command
@@ -81,6 +84,7 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 			container.Resources = &ResourceRequirements{Limits: limits}
 		}
 		runtimeClassName = runtimeClass(spec.Runtime)
+		labels = spec.Tags
 		if spec.Runtime != "" {
 			annotations[AnnotationRuntime] = spec.Runtime
 		}
@@ -95,6 +99,7 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 			ResourceVersion:   strconv.FormatUint(item.RV, 10),
 			Generation:        1,
 			CreationTimestamp: created,
+			Labels:            labels,
 			Annotations:       annotations,
 		},
 		Spec: SandboxSpec{

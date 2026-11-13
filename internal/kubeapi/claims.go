@@ -1,0 +1,387 @@
+package kubeapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/kubeview"
+	"github.com/aerol-ai/microvm/pkg/models"
+)
+
+// SandboxClaims (extensions.agents.x-k8s.io/v1beta1): a claim takes a
+// sandbox from a warm pool, whose template says what to run. Upstream keeps
+// one claim object per sandbox in etcd; here a claim is the sandbox it
+// made, marked by two tags, so nothing per sandbox is stored in etcd (K5).
+//
+//	POST claim ──▶ warm pool (store) ──▶ template (store) ──▶ create from the
+//	               template's podTemplate + the claim's env and labels, named
+//	               after the claim, tagged as a claim ──▶ Backend.Create
+//	GET / LIST / WATCH claims ──▶ the hub's sandboxes whose tags mark a claim
+
+const (
+	SandboxClaimsResource = "sandboxclaims"
+	SandboxClaimKind      = "SandboxClaim"
+	// TagClaim and TagWarmPool mark a sandbox made by a claim.
+	TagClaim    = "agents.x-k8s.io/claim"
+	TagWarmPool = "agents.x-k8s.io/warm-pool"
+)
+
+var claimTable = map[string]any{
+	"apiVersion": true, "kind": true, "status": "*",
+	"metadata": map[string]any{"name": true, "generateName": true, "namespace": true, "labels": "*", "annotations": "*"},
+	"spec": map[string]any{
+		"warmPoolRef": map[string]any{"name": true},
+		"lifecycle":   map[string]any{"shutdownTime": true, "shutdownPolicy": true},
+		"env":         []any{map[string]any{"name": true, "value": true, "containerName": true}},
+		"additionalPodMetadata": map[string]any{
+			"labels": "*", "annotations": "*",
+		},
+	},
+}
+
+// claimSpec is the part of a claim this server reads.
+type claimSpec struct {
+	Metadata ObjectMeta `json:"metadata"`
+	Spec     struct {
+		WarmPoolRef struct {
+			Name string `json:"name"`
+		} `json:"warmPoolRef"`
+		Lifecycle *struct {
+			ShutdownTime   string `json:"shutdownTime"`
+			ShutdownPolicy string `json:"shutdownPolicy"`
+		} `json:"lifecycle"`
+		Env                   []EnvVar    `json:"env"`
+		AdditionalPodMetadata PodMetadata `json:"additionalPodMetadata"`
+	} `json:"spec"`
+}
+
+// claimFromStore builds the create a claim asks for, from its warm pool's
+// template.
+func (s *Server) claimRequest(ctx context.Context, ns string, body []byte) (models.CreateSandboxRequest, claimSpec, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return models.CreateSandboxRequest{}, claimSpec{}, &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "the body is not a JSON object"}
+	}
+	var c claimSpec
+	_ = json.Unmarshal(body, &c)
+	var refused []string
+	refusedFields(raw, claimTable, "", &refused)
+	if k, _ := raw["kind"].(string); k != "" && k != SandboxClaimKind {
+		refused = append(refused, "kind: must be "+SandboxClaimKind)
+	}
+	pool := strings.TrimSpace(c.Spec.WarmPoolRef.Name)
+	if pool == "" {
+		refused = append(refused, "spec.warmPoolRef.name: required")
+	}
+	if c.Metadata.Namespace != "" && c.Metadata.Namespace != ns {
+		return models.CreateSandboxRequest{}, c, &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "metadata.namespace does not match the request's namespace"}
+	}
+	if len(refused) > 0 {
+		return models.CreateSandboxRequest{}, c, invalidClaim(c.Metadata.Name, refused)
+	}
+	wp, err := s.Store.Get(ctx, SandboxWarmPoolsResource, ns, pool)
+	if err != nil {
+		return models.CreateSandboxRequest{}, c, notFoundAs(err, "the warm pool "+pool)
+	}
+	ref, _ := mapAt(wp, "spec", "sandboxTemplateRef")["name"].(string)
+	tpl, err := s.Store.Get(ctx, SandboxTemplatesResource, ns, ref)
+	if err != nil {
+		return models.CreateSandboxRequest{}, c, notFoundAs(err, "the template "+ref+" of the warm pool "+pool)
+	}
+	// The template's pod template, under the claim's name and lifecycle,
+	// through the same field table as a Sandbox create.
+	sandbox := map[string]any{
+		"metadata": map[string]any{"name": c.Metadata.Name, "generateName": c.Metadata.GenerateName},
+		"spec":     map[string]any{"podTemplate": mapAt(tpl, "spec")["podTemplate"]},
+	}
+	if lc := c.Spec.Lifecycle; lc != nil {
+		sandbox["spec"].(map[string]any)["shutdownTime"] = lc.ShutdownTime
+		sandbox["spec"].(map[string]any)["shutdownPolicy"] = lc.ShutdownPolicy
+	}
+	probe, _ := json.Marshal(sandbox)
+	random := s.Random
+	if random == nil {
+		random = randomSuffix
+	}
+	req, made, err := CreateFrom(probe, s.now(), random)
+	var fe *FieldError
+	if errors.As(err, &fe) {
+		return req, c, invalidClaim(c.Metadata.Name, fe.Fields)
+	} else if err != nil {
+		return req, c, err
+	}
+	c.Metadata.Name = made.Metadata.Name
+	if len(c.Spec.Env) > 0 {
+		policy, _ := mapAt(tpl, "spec")["envVarsInjectionPolicy"].(string)
+		if policy == "Disallowed" {
+			return req, c, invalidClaim(c.Metadata.Name, []string{"spec.env: the template's envVarsInjectionPolicy is Disallowed"})
+		}
+		if req.Env == nil {
+			req.Env = map[string]string{}
+		}
+		for i, e := range c.Spec.Env {
+			if strings.TrimSpace(e.Name) == "" {
+				return req, c, invalidClaim(c.Metadata.Name, []string{fmt.Sprintf("spec.env[%d].name: required", i)})
+			}
+			if _, set := req.Env[e.Name]; set && policy != "Overrides" {
+				return req, c, invalidClaim(c.Metadata.Name, []string{fmt.Sprintf("spec.env[%d]: %q is the template's; its envVarsInjectionPolicy is not Overrides", i, e.Name)})
+			}
+			req.Env[e.Name] = e.Value
+		}
+	}
+	tags := map[string]string{}
+	for k, v := range req.Tags {
+		tags[k] = v
+	}
+	for k, v := range c.Spec.AdditionalPodMetadata.Labels {
+		tags[k] = v
+	}
+	for k, v := range c.Metadata.Labels {
+		tags[k] = v
+	}
+	tags[TagClaim], tags[TagWarmPool] = "true", pool
+	req.Tags = tags
+	return req, c, nil
+}
+
+func invalidClaim(name string, fields []string) error {
+	return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid",
+		Message: fmt.Sprintf("SandboxClaim %q is invalid: not supported by AerolVM: %s", name, strings.Join(fields, "; "))}
+}
+
+// notFoundAs names what a claim referred to when the store has no such
+// object.
+func notFoundAs(err error, what string) error {
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid", Message: what + " does not exist"}
+	}
+	return err
+}
+
+func mapAt(m map[string]any, keys ...string) map[string]any {
+	for _, k := range keys {
+		next, _ := m[k].(map[string]any)
+		m = next
+	}
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+// claimFrom renders a claim-made sandbox as its claim.
+func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
+	sb := SandboxFrom(it, ns, spec)
+	pool := ""
+	if spec != nil {
+		pool = spec.Tags[TagWarmPool]
+	}
+	return map[string]any{
+		"apiVersion": ExtensionsAPIVersion(),
+		"kind":       SandboxClaimKind,
+		"metadata": map[string]any{
+			"name": sb.Metadata.Name, "namespace": ns, "uid": sb.Metadata.UID, "resourceVersion": sb.Metadata.ResourceVersion,
+			"generation": 1, "creationTimestamp": sb.Metadata.CreationTimestamp, "annotations": sb.Metadata.Annotations,
+		},
+		"spec": map[string]any{"warmPoolRef": map[string]any{"name": pool}},
+		"status": map[string]any{
+			"conditions": sb.Status.Conditions,
+			"sandbox":    map[string]any{"name": sb.Metadata.Name},
+		},
+	}
+}
+
+func isClaim(spec SpecSummary, ok bool) bool { return ok && spec.Tags[TagClaim] == "true" }
+
+// claims are owner's claim-made sandboxes, in name order.
+func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any, uint64, error) {
+	items, pos, _, err := s.Hub.List(owner, "", 0)
+	if err != nil {
+		return nil, 0, hubError(err)
+	}
+	var out []map[string]any
+	for i := 0; i < len(items); i += maxPageLimit {
+		chunk := items[i:min(i+maxPageLimit, len(items))]
+		ids := make([]string, len(chunk))
+		for j, it := range chunk {
+			ids[j] = it.Placement.SandboxID
+		}
+		specs := s.Backend.Specs(ctx, ids)
+		for _, it := range chunk {
+			sp, ok := specs[it.Placement.SandboxID]
+			if isClaim(sp, ok) {
+				out = append(out, claimFrom(it, ns, &sp))
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i]["metadata"].(map[string]any)["name"].(string) < out[j]["metadata"].(map[string]any)["name"].(string)
+	})
+	return out, pos, nil
+}
+
+// serveClaims answers a verb on claims.
+func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, name string) error {
+	ctx := r.Context()
+	if ns == "" && verb != "list" && verb != "watch" {
+		return errNoNamespace
+	}
+	owners, err := s.owned(ns)
+	if err != nil {
+		return err
+	}
+	switch verb {
+	case "list":
+		items := []any{}
+		var pos uint64
+		var names []string
+		for o := range owners {
+			names = append(names, o)
+		}
+		sort.Strings(names)
+		for _, o := range names {
+			cs, p, err := s.claims(ctx, o, owners[o])
+			if err != nil {
+				return err
+			}
+			pos = max(pos, p)
+			for _, c := range cs {
+				items = append(items, c)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"apiVersion": ExtensionsAPIVersion(), "kind": "SandboxClaimList",
+			"metadata": map[string]any{"resourceVersion": strconv.FormatUint(pos, 10)}, "items": items})
+		return nil
+	case "get", "delete":
+		owner := firstKey(owners)
+		it, err := s.find(owner, name)
+		if err != nil {
+			return err
+		}
+		sp, ok := s.Backend.Specs(ctx, []string{it.Placement.SandboxID})[it.Placement.SandboxID]
+		if !isClaim(sp, ok) {
+			return &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
+		}
+		if verb == "delete" {
+			if err := s.Backend.Delete(ctx, owner, it.Placement.SandboxID); err != nil {
+				return err
+			}
+			writeJSON(w, http.StatusOK, Status{TypeMeta: TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success", Code: http.StatusOK,
+				Message: fmt.Sprintf("sandboxclaims.%s %q deleted", ExtensionsGroup, name)})
+			return nil
+		}
+		writeJSON(w, http.StatusOK, claimFrom(it, ns, &sp))
+		return nil
+	case "create":
+		owner := firstKey(owners)
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: err.Error()}
+		}
+		req, c, err := s.claimRequest(ctx, ns, body)
+		if err != nil {
+			return err
+		}
+		if _, err := s.find(owner, req.Name); err == nil {
+			return &StatusError{Code: http.StatusConflict, Reason: "AlreadyExists", Message: fmt.Sprintf("sandboxclaims.%s %q already exists", ExtensionsGroup, req.Name)}
+		}
+		id, err := s.Backend.Create(ctx, owner, req, "kubeapi-claim/"+ns+"/"+req.Name)
+		if err != nil {
+			return err
+		}
+		it, seen := s.waitFor(ctx, owner, id)
+		if !seen {
+			pos, _ := s.Hub.Position()
+			it = kubeview.Item{RV: pos}
+			it.Placement.SandboxID, it.Placement.Name, it.Placement.OwnerRef = id, req.Name, owner
+			it.Placement.CreatedUnix = s.now().Unix()
+		}
+		sp := SpecSummary{Image: req.Image, Runtime: req.Runtime, Tags: req.Tags}
+		_ = c
+		writeJSON(w, http.StatusCreated, claimFrom(it, ns, &sp))
+		return nil
+	case "watch":
+		return s.watchClaims(w, r, ns, owners)
+	}
+	return &StatusError{Code: http.StatusMethodNotAllowed, Reason: "MethodNotAllowed", Message: verb + " is not supported on sandboxclaims"}
+}
+
+func firstKey(m map[string]string) string {
+	for k := range m {
+		return k
+	}
+	return ""
+}
+
+// watchClaims streams claim events: the sandbox watch, kept to claim-made
+// sandboxes and rendered as claims.
+func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, owners map[string]string) error {
+	owner := kubeview.AllOwners
+	if ns != "" {
+		owner = firstKey(owners)
+	}
+	q := r.URL.Query()
+	var from uint64
+	if rv := firstOf(q["resourceVersion"]); rv != "" && rv != "0" {
+		var err error
+		if from, err = strconv.ParseUint(rv, 10, 64); err != nil {
+			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "resourceVersion: not a number"}
+		}
+	}
+	length := defaultWatchLength
+	if v := firstOf(q["timeoutSeconds"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			length = time.Duration(n) * time.Second
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), length)
+	defer cancel()
+	events, err := s.Hub.Watch(ctx, owner, from)
+	if err != nil {
+		return hubError(err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		// Headers now: a quiet watch must not leave the client waiting for
+		// its response.
+		flusher.Flush()
+	}
+	enc := json.NewEncoder(w)
+	for ev := range events {
+		if ev.Type == kubeview.Closed {
+			if se, ok := hubError(ev.Err).(*StatusError); ok {
+				_ = enc.Encode(WatchEvent{Type: "ERROR", Object: statusOf(se)})
+			}
+			return nil
+		}
+		n := ns
+		if n == "" {
+			n, _ = s.Owners.Namespace(ev.Item.Placement.OwnerRef)
+		}
+		if n == "" {
+			continue
+		}
+		sp, ok := s.Backend.Specs(ctx, []string{ev.Item.Placement.SandboxID})[ev.Item.Placement.SandboxID]
+		if !isClaim(sp, ok) {
+			continue
+		}
+		if err := enc.Encode(WatchEvent{Type: string(ev.Type), Object: claimFrom(ev.Item, n, &sp)}); err != nil {
+			return nil
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	return nil
+}

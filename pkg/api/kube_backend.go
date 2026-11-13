@@ -194,7 +194,7 @@ func (b *KubeBackend) Specs(ctx context.Context, ids []string) map[string]kubeap
 			b.cache = map[string]cachedSpec{}
 		}
 		for id, s := range got {
-			sum := kubeapi.SpecSummary{Image: s.Image, Runtime: s.Runtime, CPU: s.CPU, MemoryMB: s.MemoryMB, Command: s.Command}
+			sum := kubeapi.SpecSummary{Image: s.Image, Runtime: s.Runtime, CPU: s.CPU, MemoryMB: s.MemoryMB, Command: s.Command, Tags: s.Tags}
 			b.cache[id] = cachedSpec{summary: sum, at: now}
 			out[id] = sum
 		}
