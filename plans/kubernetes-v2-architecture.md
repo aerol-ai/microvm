@@ -1239,6 +1239,54 @@ Each row is a drill in section 19.
   AerolVM owner by namespace (D10). Normal SDK callers use AerolVM's own keys,
   SSO and roles, as today.
 
+#### 15.2.1 External-CA mode: the design (C23)
+
+The default mode is built (a join token per pod). This is how the
+external-CA mode is built on top of it, in the order of its PRs.
+
+```
+operator ─► Certificate per pod (bank's issuer, cert-manager) ─► Secret, mounted in that pod only
+pod start ─► sandboxd: TLS dir = that Secret (ca.crt, tls.crt, tls.key)
+          ─► POST join-by-certificate over mTLS (no token)
+server   ─► chain to the CA? node:<id> and role in the certificate? key not tombstoned?
+          ─► opAdmitNode (key pinned) ─► a server becomes a voter ─► the bundle, without a certificate or CA key
+cert-manager renews ─► sandboxd reloads it per handshake (internal/cluster/tls.go)
+```
+
+- **Trust.** `SB_CLUSTER_EXTERNAL_CA=true`. The cluster TLS directory is the
+  pod's cert-manager Secret: `ca.crt` is the bank's CA, `tls.crt` and
+  `tls.key` the pod's certificate. No server holds a CA key (D11), so every
+  path that signs a node certificate (join by token, the renewal in
+  `internal/cluster/cert_renew.go`, `aerolvm join-command`) is refused in
+  this mode with a reason; cert-manager renews instead.
+- **The certificate.** One cert-manager `Certificate` per pod, made by the
+  operator: the issuer from `spec.security.externalCA.issuerRef`, the URI
+  SANs `node:<id>` and `aerolvm-role:<role>`, the DNS names the cluster's
+  server name and the pod's own (lesson L7). It is mounted only into that
+  pod's `agent` container.
+- **Join by certificate.** A new mTLS-only join route. The caller's
+  certificate must chain to the CA and carry `node:<id>` and one role; that
+  role is the only one it can join as. The server admits its key
+  (`opAdmitNode`, pinned, so a second key for the ID is refused until the
+  node is deleted), adds a server as a voter, and answers the usual bundle
+  without a node certificate or a CA key. The first server initialises the
+  cluster with its certificate.
+- **Who may get a certificate.** Only the operator creates `Certificate`
+  objects (its RBAC). What the bank's issuer will sign is the bank's
+  policy; the docs show a cert-manager approver-policy that limits these
+  URI SANs to the operator's ServiceAccount.
+- **Failure.** Issuer slow or down: `AerolNode` condition
+  `CertificatePending`, an alert after 10 minutes; running nodes keep
+  working, since their certificates are still valid (§14).
+- **Tests.** Unit (SAN parsing; join-by-certificate refusals: another CA,
+  no role, a second role, a tombstoned key, a second key for the ID),
+  envtest (the operator makes, mounts and waits for the `Certificate`),
+  and live on kind with a cert-manager CA `Issuer` standing in for the
+  bank's issuer (`AEROL_FCKIND_PROOF=externalca`).
+- **Settled while building:** which parts of the bundle still travel in
+  this mode (the gossip key and key custody do; the PAT follows the
+  default mode's rule).
+
 ### 15.3 Network walls
 
 | From | To | Allowed |
