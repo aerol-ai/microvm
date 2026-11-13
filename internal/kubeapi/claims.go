@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/kubeview"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -191,6 +190,7 @@ func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
 		"metadata": map[string]any{
 			"name": sb.Metadata.Name, "namespace": ns, "uid": sb.Metadata.UID, "resourceVersion": sb.Metadata.ResourceVersion,
 			"generation": 1, "creationTimestamp": sb.Metadata.CreationTimestamp, "annotations": sb.Metadata.Annotations,
+			"labels": sb.Metadata.Labels,
 		},
 		"spec": map[string]any{"warmPoolRef": map[string]any{"name": pool}},
 		"status": map[string]any{
@@ -202,8 +202,18 @@ func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
 
 func isClaim(spec SpecSummary, ok bool) bool { return ok && spec.Tags[TagClaim] == "true" }
 
-// claims are owner's claim-made sandboxes, in name order.
-func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any, uint64, error) {
+// keepClaim applies a list's or watch's selectors to a rendered claim, as
+// keep does to a sandbox: kubectl wait finds its one object by
+// fieldSelector metadata.name.
+func (lq listQuery) keepClaim(c map[string]any) bool {
+	md, _ := c["metadata"].(map[string]any)
+	name, _ := md["name"].(string)
+	labels, _ := md["labels"].(map[string]string)
+	return (lq.name == "" || name == lq.name) && lq.labels.matches(labels)
+}
+
+// claims are owner's claim-made sandboxes that lq keeps, in name order.
+func (s *Server) claims(ctx context.Context, owner, ns string, lq listQuery) ([]map[string]any, uint64, error) {
 	items, pos, _, err := s.Hub.List(owner, "", 0)
 	if err != nil {
 		return nil, 0, hubError(err)
@@ -211,15 +221,14 @@ func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any
 	var out []map[string]any
 	for i := 0; i < len(items); i += maxPageLimit {
 		chunk := items[i:min(i+maxPageLimit, len(items))]
-		ids := make([]string, len(chunk))
-		for j, it := range chunk {
-			ids[j] = it.Placement.SandboxID
-		}
-		specs := s.Backend.Specs(ctx, ids)
+		specs := s.Backend.Specs(ctx, specRefs(chunk...))
 		for _, it := range chunk {
 			sp, ok := specs[it.Placement.SandboxID]
-			if isClaim(sp, ok) {
-				out = append(out, claimFrom(it, ns, &sp))
+			if !isClaim(sp, ok) {
+				continue
+			}
+			if c := claimFrom(it, ns, &sp); lq.keepClaim(c) {
+				out = append(out, c)
 			}
 		}
 	}
@@ -241,6 +250,10 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 	}
 	switch verb {
 	case "list":
+		lq, err := parseListQuery(r.URL.Query())
+		if err != nil {
+			return err
+		}
 		items := []any{}
 		var pos uint64
 		var names []string
@@ -249,7 +262,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		}
 		sort.Strings(names)
 		for _, o := range names {
-			cs, p, err := s.claims(ctx, o, owners[o])
+			cs, p, err := s.claims(ctx, o, owners[o], lq)
 			if err != nil {
 				return err
 			}
@@ -263,13 +276,17 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		return nil
 	case "get", "delete":
 		owner := firstKey(owners)
+		claimNotFound := &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
 		it, err := s.find(owner, name)
-		if err != nil {
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return claimNotFound
+		} else if err != nil {
 			return err
 		}
-		sp, ok := s.Backend.Specs(ctx, []string{it.Placement.SandboxID})[it.Placement.SandboxID]
+		sp, ok := s.Backend.Specs(ctx, specRefs(it))[it.Placement.SandboxID]
 		if !isClaim(sp, ok) {
-			return &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
+			return claimNotFound
 		}
 		if verb == "delete" {
 			if err := s.Backend.Delete(ctx, owner, it.Placement.SandboxID); err != nil {
@@ -287,7 +304,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		if err != nil {
 			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: err.Error()}
 		}
-		req, c, err := s.claimRequest(ctx, ns, body)
+		req, _, err := s.claimRequest(ctx, ns, body)
 		if err != nil {
 			return err
 		}
@@ -306,7 +323,6 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 			it.Placement.CreatedUnix = s.now().Unix()
 		}
 		sp := SpecSummary{Image: req.Image, Runtime: req.Runtime, Tags: req.Tags}
-		_ = c
 		writeJSON(w, http.StatusCreated, claimFrom(it, ns, &sp))
 		return nil
 	case "watch":
@@ -330,58 +346,31 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 		owner = firstKey(owners)
 	}
 	q := r.URL.Query()
-	var from uint64
-	if rv := firstOf(q["resourceVersion"]); rv != "" && rv != "0" {
-		var err error
-		if from, err = strconv.ParseUint(rv, 10, 64); err != nil {
-			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "resourceVersion: not a number"}
-		}
-	}
-	length := defaultWatchLength
-	if v := firstOf(q["timeoutSeconds"]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			length = time.Duration(n) * time.Second
-		}
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), length)
-	defer cancel()
-	events, err := s.Hub.Watch(ctx, owner, from)
+	lq, err := parseListQuery(q)
 	if err != nil {
-		return hubError(err)
+		return err
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-	if flusher != nil {
-		// Headers now: a quiet watch must not leave the client waiting for
-		// its response.
-		flusher.Flush()
-	}
-	enc := json.NewEncoder(w)
-	for ev := range events {
-		if ev.Type == kubeview.Closed {
-			if se, ok := hubError(ev.Err).(*StatusError); ok {
-				_ = enc.Encode(WatchEvent{Type: "ERROR", Object: statusOf(se)})
-			}
-			return nil
-		}
+	return s.streamWatch(w, r, owner, q, func(ctx context.Context, ev kubeview.Event) any {
 		n := ns
 		if n == "" {
 			n, _ = s.Owners.Namespace(ev.Item.Placement.OwnerRef)
 		}
 		if n == "" {
-			continue
-		}
-		sp, ok := s.Backend.Specs(ctx, []string{ev.Item.Placement.SandboxID})[ev.Item.Placement.SandboxID]
-		if !isClaim(sp, ok) {
-			continue
-		}
-		if err := enc.Encode(WatchEvent{Type: string(ev.Type), Object: claimFrom(ev.Item, n, &sp)}); err != nil {
 			return nil
 		}
-		if flusher != nil {
-			flusher.Flush()
+		sp, ok := s.Backend.Specs(ctx, specRefs(ev.Item))[ev.Item.Placement.SandboxID]
+		if !isClaim(sp, ok) {
+			return nil
 		}
-	}
-	return nil
+		if c := claimFrom(ev.Item, n, &sp); lq.keepClaim(c) {
+			return c
+		}
+		return nil
+	}, func(rv uint64, end bool) any {
+		md := map[string]any{"resourceVersion": strconv.FormatUint(rv, 10)}
+		if end {
+			md["annotations"] = map[string]string{initialEventsEnd: "true"}
+		}
+		return map[string]any{"apiVersion": ExtensionsAPIVersion(), "kind": SandboxClaimKind, "metadata": md}
+	})
 }

@@ -103,7 +103,9 @@ spec:
 # Templates and warm pools live in etcd as AerolVM's own CRDs (decision
 # C17): they change rarely. The gateways are their only writer, and these
 # two kinds are the only thing they may write. Claims and sandboxes are
-# never stored in etcd.
+# never stored in etcd. Helm keeps the CRDs when the API is turned off:
+# deleting a CRD deletes every object of its kind, so turning the API off
+# and on again would otherwise lose every template and warm pool.
 {{- range $kind := list "SandboxTemplate" "SandboxWarmPool" }}
 {{- $plural := printf "%ss" (lower $kind) }}
 ---
@@ -113,6 +115,8 @@ metadata:
   name: {{ $plural }}.k8s.aerolvm.io
   labels:
     {{- include "aerolvm.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
 spec:
   group: k8s.aerolvm.io
   scope: Namespaced

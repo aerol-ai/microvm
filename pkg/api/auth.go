@@ -362,7 +362,29 @@ func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
 	if isForwarded(r) && r.Header.Get(cluster.HeaderCaller) != cluster.CallerNode {
 		return controlplane.Access{}, false
 	}
+	if onBehalf := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOf)); onBehalf != "" {
+		return onBehalfAccess(r, peer, onBehalf)
+	}
 	return controlplane.NodeAccess(peer), true
+}
+
+// onBehalfAccess is a forward the edge spoke for on behalf of a caller it
+// authenticated itself (cluster.HeaderOnBehalfOf: the agent-sandbox API's
+// Kubernetes user, C17). The call gets that caller's access, one owner with
+// the runner role, never the node's own: the stamp can only narrow what the
+// edge, a node, could already do. Anything malformed is a 401.
+func onBehalfAccess(r *http.Request, peer, onBehalf string) (controlplane.Access, bool) {
+	owner := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOwner))
+	name, isKube := strings.CutPrefix(onBehalf, "kubernetes:")
+	if !isForwarded(r) || owner == "" || !isKube || strings.TrimSpace(name) == "" {
+		return controlplane.Access{}, false
+	}
+	return controlplane.Access{
+		Identity:  controlplane.Identity{OwnerRef: owner, Role: controlplane.RoleRunner, Name: name},
+		Role:      controlplane.RoleRunner,
+		Principal: controlplane.Principal{Kind: controlplane.PrincipalKubernetes, ID: onBehalf, Name: name},
+		Via:       peer,
+	}, true
 }
 
 // isForwarded reports whether a peer reverse-proxied this request on a

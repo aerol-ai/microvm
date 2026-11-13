@@ -52,8 +52,8 @@ func TestClaimCreateGetListDelete(t *testing.T) {
 	if rr, _ := r.call(t, http.MethodGet, claims+"/plain", ""); rr.Code != http.StatusNotFound {
 		t.Fatalf("a plain sandbox as a claim = %d", rr.Code)
 	}
-	if rr, _ := r.call(t, http.MethodGet, claims+"/nope", ""); rr.Code != http.StatusNotFound {
-		t.Fatal("an unknown claim")
+	if rr, out := r.call(t, http.MethodGet, claims+"/nope", ""); rr.Code != http.StatusNotFound || !strings.Contains(out["message"].(string), "sandboxclaims") {
+		t.Fatalf("an unknown claim = %d %v", rr.Code, out["message"])
 	}
 	for _, path := range []string{claims, ext + "/sandboxclaims"} {
 		_, out := r.call(t, http.MethodGet, path, "")
@@ -212,4 +212,106 @@ func TestClaimWatch(t *testing.T) {
 		}
 	}
 	t.Fatal("no 410 after a resync")
+}
+
+// Claims honor a list's and a watch's selectors, as sandboxes do: kubectl
+// wait sandboxclaim/x lists and watches by fieldSelector metadata.name.
+func TestClaimSelectors(t *testing.T) {
+	r := claimRig(t, "")
+	claims := ext + "/namespaces/a/sandboxclaims"
+	for name, team := range map[string]string{"job": "ml", "other": "web"} {
+		body := strings.Replace(strings.Replace(claimBody, `"job"`, `"`+name+`"`, 1), `"ml"`, `"`+team+`"`, 1)
+		if rr, _ := r.call(t, http.MethodPost, claims, body); rr.Code != http.StatusCreated {
+			t.Fatalf("create %s = %d", name, rr.Code)
+		}
+	}
+	names := func(out map[string]any) []string {
+		var got []string
+		for _, it := range out["items"].([]any) {
+			got = append(got, it.(map[string]any)["metadata"].(map[string]any)["name"].(string))
+		}
+		return got
+	}
+	for q, want := range map[string]string{
+		"":                                       "job,other",
+		"?fieldSelector=metadata.name%3Djob":     "job",
+		"?labelSelector=team%3Dweb":              "other",
+		"?labelSelector=team%3Dweb,team%21%3Dml": "other",
+		"?labelSelector=team%3Dnone":             "",
+	} {
+		rr, out := r.call(t, http.MethodGet, claims+q, "")
+		if got := strings.Join(names(out), ","); rr.Code != http.StatusOK || got != want {
+			t.Errorf("list%s = %d %q, want %q", q, rr.Code, got, want)
+		}
+	}
+	// A claim shows the labels it was made with.
+	if _, out := r.call(t, http.MethodGet, claims+"/job", ""); out["metadata"].(map[string]any)["labels"].(map[string]any)["team"] != "ml" {
+		t.Fatalf("claim labels = %v", out["metadata"])
+	}
+	for _, q := range []string{"?fieldSelector=status.phase%3DRunning", "?watch=true&fieldSelector=status.phase%3DRunning"} {
+		if rr, _ := r.call(t, http.MethodGet, claims+q, ""); rr.Code != http.StatusBadRequest {
+			t.Errorf("list%s = %d, want 400", q, rr.Code)
+		}
+	}
+
+	ts := httptest.NewServer(r.srv)
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+claims+"?watch=true&fieldSelector=metadata.name%3Dother&timeoutSeconds=1", nil)
+	req.Header.Set("X-Test-User", "alice")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got []string
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		var ev map[string]any
+		if json.Unmarshal(sc.Bytes(), &ev) == nil && ev["type"] != "BOOKMARK" {
+			got = append(got, objName(ev))
+		}
+	}
+	if strings.Join(got, ",") != "other" {
+		t.Fatalf("a watch for other saw %v", got)
+	}
+}
+
+// kubectl wait sandboxclaim/x asks for the initial list and waits for the
+// bookmark that ends it (p6-kubeapi-4 timed out without one).
+func TestClaimWatchInitialEvents(t *testing.T) {
+	r := claimRig(t, "")
+	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", claimBody); rr.Code != http.StatusCreated {
+		t.Fatalf("create = %d", rr.Code)
+	}
+	ts := httptest.NewServer(r.srv)
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+ext+"/namespaces/a/sandboxclaims?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Djob&timeoutSeconds=5", nil)
+	req.Header.Set("X-Test-User", "alice")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var seen []string
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		var ev map[string]any
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+		obj := ev["object"].(map[string]any)
+		if ev["type"] == "BOOKMARK" {
+			md := obj["metadata"].(map[string]any)
+			ann, _ := md["annotations"].(map[string]any)
+			if obj["kind"] != SandboxClaimKind || ann[initialEventsEnd] != "true" {
+				t.Fatalf("bookmark = %v", obj)
+			}
+			if strings.Join(seen, ",") != "ADDED job" {
+				t.Fatalf("before the end of the initial list: %v", seen)
+			}
+			return
+		}
+		seen = append(seen, ev["type"].(string)+" "+objName(ev))
+	}
+	t.Fatalf("no end of the initial list; saw %v", seen)
 }
