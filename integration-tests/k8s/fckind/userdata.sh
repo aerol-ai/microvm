@@ -64,11 +64,29 @@ for line in sys.stdin:
         print((d.get("AerolNode") or d.get("AerolCluster") or {}).get("name", "?"), d.get("error", "")[:240])' | sort | uniq -c | tail -8 | sed 's/^/FCK   operator error: /'
     return
   fi
-  local out id owner owner2 i
-  out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
-  id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
-  say "create: $(head -c 240 <<<"$out")"
-  [ -n "$id" ] || return
+  local out id="" owner owner2
+  # A worker that just joined has not reported its capacity yet: the
+  # create waits for one that has.
+  for i in $(seq 1 18); do
+    out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
+    id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
+    [ -n "$id" ] && break
+    grep -q "no worker placement target" <<<"$out" || break
+    sleep 10
+  done
+  say "create (try $i): $(head -c 240 <<<"$out")"
+  if [ -z "$id" ]; then
+    api http://127.0.0.1:$port/v1/cluster/members | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for m in d.get("members", d):
+    if m.get("role") != "worker":
+        continue
+    c = m.get("capacity") or {}
+    print(m["node_id"], "alive" if m.get("alive") else "dead", "stale" if m.get("capacity_stale") else "fresh",
+          "can_admit=%s" % c.get("can_admit"), "runtimes=%s" % c.get("supported_runtimes"), "labels=%s" % c.get("labels"))' | sed 's/^/FCK   worker: /'
+    return
+  fi
   ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute \
     -d "$(python3 -c 'import json, sys; print(json.dumps({"command": sys.argv[1]}))' "$1")" | head -c 300; }
   # A process that counts on, to show it kept running across the move.
