@@ -374,6 +374,29 @@ spec:
                     - 5
                     format: int32
                     type: integer
+                  logStorage:
+                    description: |-
+                      LogStorage, when set, is a second disk for each server that holds
+                      only its Raft log (sandboxd's SB_RAFT_WAL_DIR). A commit waits for a
+                      log write on the leader and then on a follower, so the log's disk
+                      sets the commit time; on the cell bench, a log on a disk of its own
+                      brought Raft apply p99 under 25 ms at 1,354 creates a second
+                      (plans/kubernetes-v2-architecture.md §9.5). A server keeps the layout
+                      it was made with: setting or clearing this changes only servers made
+                      after it, because a new disk laid over a log would hide it.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 20Gi
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        type: string
+                    required:
+                    - size
+                    type: object
                   nodeSelector:
                     additionalProperties:
                       type: string

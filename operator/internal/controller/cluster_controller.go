@@ -374,28 +374,98 @@ func anyMaintenance(nodes []v1.AerolNode) bool {
 // PVCName is server node's volume claim.
 func PVCName(node string) string { return "data-" + node }
 
-// ensurePVC makes server node's volume. It lands in the server's zone
-// because the server pod is pinned there and the storage class binds on
-// first use (WaitForFirstConsumer, which the chart's docs require).
+// LogPVCName is server node's Raft log claim (servers.logStorage).
+func LogPVCName(node string) string { return "raftlog-" + node }
+
+// AnnotationLogClaim, on a server's data claim, names its Raft log claim.
+// It is written once, with the data claim, and the server's pods mount what
+// it names from then on, whatever servers.logStorage says later: a log
+// claim laid over a log already on the data disk would hide it, and
+// dropping one would hide the log on it. sandboxd refuses either too
+// (internal/raftlogdir); this keeps a server from ever being asked to.
+const AnnotationLogClaim = "aerolvm.io/raft-log-claim"
+
+// ensurePVC makes server node's volume, and its Raft log volume when
+// servers.logStorage asks for one. They land in the server's zone because
+// the server pod is pinned there and the storage class binds on first use
+// (WaitForFirstConsumer, which the chart's docs require). A data claim that
+// exists already keeps the layout it was made with.
+//
+// The data claim is made first, naming its log claim, and the log claim
+// after: a log claim with no data claim can then only be a server's old
+// log, kept when a person deleted the data claim to start the server
+// afresh. A new server must not take it, and the operator never deletes a
+// disk, so that is refused. A data claim whose log claim was not made yet
+// (the operator stopped in between) gets it on the next pass.
 func (r *ClusterReconciler) ensurePVC(ctx context.Context, c *v1.AerolCluster, node string) error {
+	ls := c.Spec.Servers.LogStorage
 	var pvc corev1.PersistentVolumeClaim
 	err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: PVCName(node)}, &pvc)
+	switch {
+	case err == nil:
+		name := pvc.Annotations[AnnotationLogClaim]
+		if name == "" {
+			return nil
+		}
+		return r.ensureLogPVC(ctx, c, node, name)
+	case !apierrors.IsNotFound(err):
+		return err
+	}
+	pvc = serverClaim(c, PVCName(node), c.Spec.Servers.Storage)
+	if ls != nil {
+		var old corev1.PersistentVolumeClaim
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: LogPVCName(node)}, &old)
+		if err == nil {
+			return fmt.Errorf("server %s: claim %s holds an old Raft log and %s is gone; delete %s too to make the server afresh", node, LogPVCName(node), PVCName(node), LogPVCName(node))
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		pvc.Annotations = map[string]string{AnnotationLogClaim: LogPVCName(node)}
+	}
+	if err := r.Create(ctx, &pvc); err != nil {
+		return err
+	}
+	if ls == nil {
+		return nil
+	}
+	return r.ensureLogPVC(ctx, c, node, LogPVCName(node))
+}
+
+// ensureLogPVC makes the log claim a server's data claim names, if it is
+// not there. Its size and class come from servers.logStorage; with that
+// cleared, a missing one cannot be made, and the server waits for it.
+func (r *ClusterReconciler) ensureLogPVC(ctx context.Context, c *v1.AerolCluster, node, name string) error {
+	var pvc corev1.PersistentVolumeClaim
+	err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pvc)
 	if err == nil || !apierrors.IsNotFound(err) {
 		return err
 	}
-	pvc = corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: PVCName(node), Namespace: c.Namespace, Labels: clusterLabels(c)},
+	ls := c.Spec.Servers.LogStorage
+	if ls == nil {
+		return fmt.Errorf("server %s: its data claim names Raft log claim %s, which is gone, and servers.logStorage is not set to make it again", node, name)
+	}
+	pvc = serverClaim(c, name, *ls)
+	if err := r.Create(ctx, &pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
+
+// serverClaim is one of a server's claims. No owner reference: a server's
+// disk outlives everything but a person deleting it, deleting the
+// AerolCluster included.
+func serverClaim(c *v1.AerolCluster, name string, s v1.StorageSpec) corev1.PersistentVolumeClaim {
+	return corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace, Labels: clusterLabels(c)},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			StorageClassName: c.Spec.Servers.Storage.StorageClassName,
+			StorageClassName: s.StorageClassName,
 			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: c.Spec.Servers.Storage.Size},
+				Requests: corev1.ResourceList{corev1.ResourceStorage: s.Size},
 			},
 		},
 	}
-	// No owner reference: a server's disk outlives everything but a person
-	// deleting it, deleting the AerolCluster included.
-	return r.Create(ctx, &pvc)
 }
 
 func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, name, role, pool, zone string) error {

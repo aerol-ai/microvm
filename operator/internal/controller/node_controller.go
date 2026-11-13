@@ -279,6 +279,19 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: version, Bootstrap: bootstrap, Maintenance: maint}
 	if n.Spec.Role == v1.RoleServer {
 		in.PVC = PVCName(n.Name)
+		// The data claim says whether this server has a log claim
+		// (AnnotationLogClaim). Read past the cache: a server pod made
+		// before its claim showed would put the log on the data disk, and
+		// every pod after would lay the log claim over it.
+		var data corev1.PersistentVolumeClaim
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: in.PVC}, &data); err != nil {
+			if apierrors.IsNotFound(err) {
+				r.setState(n, v1.StatePending, "waiting for volume claim "+in.PVC)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		in.LogPVC = data.Annotations[AnnotationLogClaim]
 	}
 	if n.Spec.Role == v1.RoleWorker {
 		in.Pool = poolOf(c, n.Spec.Pool)

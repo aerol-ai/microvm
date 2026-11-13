@@ -786,7 +786,7 @@ move the table to disk with incremental snapshots.
 | Creates per second, sustained | ≥ 1,000 | 1,174 at 64 creates at once (p50 46 ms), 1,202 at 128 (p50 85 ms) |
 | Live sandboxes | ≥ 100,000 (about 72 MB of table per server) | not measured live: the bench deletes as it goes |
 | Workers | ≥ 500 | 500, joined in 20 to 40 s |
-| Raft commit p99 under that load | ≤ 25 ms | **just missed**: 25 to 50 ms at 996 creates/s (98.8% ≤ 25 ms); the 1 s pauses were the servers' disks, and with 16,000 IOPS there are none (F29) |
+| Raft commit p99 under that load | ≤ 25 ms | **met with the Raft log on its own io2 disk**: 99.8% to 99.9% of commits within 25 ms at 1,304 to 1,354 creates/s; whole applies (queue, commit and FSM) 98.9% to 99.2% (F37, `servers.logStorage`). On gp3, shared or not, applies 98.3% at about 1,000 |
 | Owner lookups that reach a server | 0 on a cache hit | not measured: each sandbox is deleted before the cache has it |
 | Failover of 1,000 sandboxes from one dead worker | ≤ 60 s | all within 50 s |
 | Server restart to caught up, at 100,000 sandboxes | ≤ 30 s | not measured |
@@ -2278,7 +2278,7 @@ each server used about 6% of one core and 160 MB (E5 above).
     cell did 1,283 creates a second at 64 at once (p99 188 ms) and 1,317 at
     128. The chart's values and docs now say so.
   Raft apply p99 at about 1,000 creates a second is still just over the
-  target: 98.8% of applies took 25 ms or less at 32 at once.
+  target: 98.8% of applies took 25 ms or less at 32 at once. Met in F37.
 - F30 (fixed). An owner lookup the cache misses read the sandbox's
   recovery file from disk (`fullPlacementLocked`, then
   `resolveRecoveryRef`): 8% of the leader's CPU at 1,174 creates a
@@ -2288,6 +2288,34 @@ each server used about 6% of one core and 160 MB (E5 above).
 - F31. The chart's server pods are limited to 2 CPUs, and the leader used
   2 to 3 cores at 900 to 1,200 creates a second. The default suits a small
   cell; `values.yaml` now says to give servers 4 CPUs for a cell at G3.
+- F37 (fixed: the Raft log on its own io2 disk). Raft apply p99 stayed just
+  over 25 ms at about 1,000 creates a second. New timings split an apply
+  into its steps (`aerolvm_raft_apply_wait_latency`, `_fsm_latency`, and
+  hashicorp/raft's own: `aerolvm_raft_leader_store_latency`,
+  `_append_rpc_latency`, `_follower_store_latency`, `_commit_latency`):
+  - The FSM is never the tail: p99 under 5 ms at every step.
+  - A commit is two log writes in a row, because hashicorp/raft writes the
+    leader's log before it sends the entries on: the leader's, then a
+    follower's. On gp3 each took 2 to 5 ms under load, and the commit
+    median was 10 ms.
+  - The disk type sets it, not sharing the disk. Runs `bench-p99-1` to
+    `-6`, 3 servers with 16,000 IOPS root disks, at 32 creates at once:
+
+    | The Raft log on | A leader log write under load | Applies within 25 ms |
+    |---|---|---|
+    | the gp3 root disk | 2 to 5 ms (18% within 2 ms) | 98.4% at 1,001 creates/s |
+    | a gp3 disk of its own (3,000 IOPS) | 2 to 5 ms (9% within 2 ms) | 98.3% at 996 |
+    | an io2 disk of its own (6,000 IOPS) | about 1 ms (97% within 2 ms) | **99.2% at 1,354** |
+    | the same, through `SB_RAFT_WAL_DIR` (`bench-p99-7`) | 95% within 2 ms | 98.9% at 1,304; commits 99.8% |
+
+  The fix keeps the bulk on gp3 and puts only the log on io2: sandboxd's
+  `SB_RAFT_WAL_DIR` (internal/raftlogdir) and the chart's
+  `cluster.servers.logStorage`. A node records where its log is and
+  refuses to start on any other place, so a log is never left behind or
+  hidden; the operator fixes a server's layout when it makes its claims.
+  Runs 3 and 4 measured nothing: the bench linked the log under the
+  directory `SB_DB_PATH` implies, but `init` and `join` write
+  `SB_RAFT_DATA_DIR=/var/lib/sandboxd/raft`.
 - Harness: in one pilot (`bench-pilot-6`) a throughput step hung for two
   hours with the cluster idle, and it did not happen again in five runs.
   Each `aerolvm-bench` now runs under a time limit that makes it print
