@@ -765,3 +765,69 @@ func TestKubernetesChartOperatorMetricsRegistered(t *testing.T) {
 		}
 	}
 }
+
+// The agent-sandbox API (C17): off by default; on, the APIService and its
+// Service, certificate and two RBAC bindings render, every role's template
+// carries the setting, and only the gateway's has a service account, the
+// API port and the serving pair.
+func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	docs, err := renderChart(t, root, helm, cluster...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(docsOfKind(docs, "APIService")); n != 0 {
+		t.Fatalf("the API is off by default, but %d APIService rendered", n)
+	}
+	docs, err = renderChart(t, root, helm, append(cluster, "cluster.agentSandboxAPI.enabled=true", "cluster.agentSandboxAPI.namespaces.acct=acct:k1")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := docsOfKind(docs, "APIService")
+	if len(api) != 1 || dig(api[0], "spec", "group") != "agents.x-k8s.io" || dig(api[0], "spec", "service", "name") != "aerolvm-agent-sandbox-api" ||
+		dig(api[0], "metadata", "annotations", "cert-manager.io/inject-ca-from") != "aerolvm/aerolvm-agent-sandbox-api" {
+		t.Fatalf("APIService = %v", api)
+	}
+	roles := map[string]bool{}
+	for _, b := range append(docsOfKind(docs, "ClusterRoleBinding"), docsOfKind(docs, "RoleBinding")...) {
+		if dig(b, "subjects", 0, "name") == "aerolvm-gateway" {
+			roles[dig(b, "roleRef", "name").(string)] = true
+		}
+	}
+	if !roles["system:auth-delegator"] || !roles["extension-apiserver-authentication-reader"] || len(roles) != 2 {
+		t.Fatalf("the gateway's roles = %v", roles)
+	}
+	if n := len(docsOfKind(docs, "Certificate")); n < 1 {
+		t.Fatal("no serving certificate")
+	}
+	var templates map[string]any
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		if d, ok := cm["data"].(map[string]any); ok && d["gateway"] != nil && d["worker"] != nil {
+			templates = d
+		}
+	}
+	if templates == nil {
+		t.Fatal("no pod-template ConfigMap")
+	}
+	for role, want := range map[string][]string{
+		"gateway": {"SB_AGENT_SANDBOX_API", "acct=acct:k1", "serviceAccountName: aerolvm-gateway", "automountServiceAccountToken: true", "containerPort: 9443", "aerolvm-agent-sandbox-api-tls"},
+		"server":  {"SB_AGENT_SANDBOX_API", "automountServiceAccountToken: false"},
+		"worker":  {"SB_AGENT_SANDBOX_API"},
+	} {
+		body, _ := templates[role].(string)
+		for _, w := range want {
+			if !strings.Contains(body, w) {
+				t.Errorf("the %s template lacks %q", role, w)
+			}
+		}
+	}
+	if strings.Contains(templates["server"].(string), "serviceAccountName") {
+		t.Error("a server got a service account")
+	}
+}

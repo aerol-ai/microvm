@@ -1,0 +1,100 @@
+{{- if and (eq .Values.mode "cluster") .Values.cluster.agentSandboxAPI.enabled }}
+{{- $name := .Values.cluster.name }}
+{{- $ns := .Release.Namespace }}
+{{- $svc := printf "%s-agent-sandbox-api" $name }}
+# The Kubernetes agent-sandbox API (plans/kubernetes-v2-architecture.md §16,
+# C17): the gateways serve agents.x-k8s.io/v1beta1 through an APIService, so
+# nothing is stored in etcd per sandbox. The gateways get exactly two
+# Kubernetes rights: ask who may do what (SubjectAccessReview, through
+# system:auth-delegator) and read the front-proxy CA.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-gateway
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-gateway-auth-delegator
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - { kind: ServiceAccount, name: {{ $name }}-gateway, namespace: {{ $ns }} }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-gateway-auth-reader
+  namespace: kube-system
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - { kind: ServiceAccount, name: {{ $name }}-gateway, namespace: {{ $ns }} }
+---
+# The APIService's backend: every gateway's API listener.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: aerolvm
+    app.kubernetes.io/component: gateway
+    aerolvm.io/cluster: {{ $name }}
+  ports:
+    - { name: https, port: 443, targetPort: agent-sandbox }
+---
+# Its serving certificate, from a self-signed CA cert-manager also injects
+# into the APIService, so the kube-apiserver trusts exactly this one.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $svc }}-selfsigned
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $svc }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $svc }}-tls
+  dnsNames:
+    - {{ $svc }}.{{ $ns }}.svc
+    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+  issuerRef: { kind: Issuer, name: {{ $svc }}-selfsigned }
+  duration: 8760h
+  renewBefore: 720h
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.agents.x-k8s.io
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ $ns }}/{{ $svc }}
+spec:
+  group: agents.x-k8s.io
+  version: v1beta1
+  service: { name: {{ $svc }}, namespace: {{ $ns }}, port: 443 }
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+{{- end }}
