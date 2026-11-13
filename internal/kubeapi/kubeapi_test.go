@@ -30,6 +30,15 @@ func TestValidNameAndObjectName(t *testing.T) {
 	if got := ObjectName(cluster.Placement{SandboxID: "sb-1", Name: "My App"}); got != "sb-1" {
 		t.Fatalf("an invalid name = %q", got)
 	}
+	// A cluster stores names qualified with their owner (p6-kubeapi-3 showed
+	// every sandbox under its ID until this was decoded).
+	if got := ObjectName(cluster.Placement{SandboxID: "sb-1", Name: cluster.QualifiedSandboxName("team:a", "web")}); got != "web" {
+		t.Fatalf("a qualified name = %q", got)
+	}
+	q := SandboxFrom(kubeview.Item{Placement: cluster.Placement{SandboxID: "sb-1", Name: cluster.QualifiedSandboxName("team:a", "My App")}}, "a", nil)
+	if q.Metadata.Name != "sb-1" || q.Metadata.Annotations[AnnotationName] != "My App" {
+		t.Fatalf("a qualified invalid name = %+v", q.Metadata)
+	}
 }
 
 func TestSandboxFrom(t *testing.T) {
@@ -107,6 +116,14 @@ func TestCreateFrom(t *testing.T) {
 	}
 	if strings.Join(req.ContainerCommand, " ") != "python -m http.server" || req.Env["MODE"] != "dev" || req.Tags["app"] != "agent" {
 		t.Fatalf("req = %+v", req)
+	}
+	// The pod template's labels are tags too; the sandbox's own win.
+	if req.Tags["x"] != "y" || len(req.Tags) != 2 {
+		t.Fatalf("tags = %v, want the pod template's label x too", req.Tags)
+	}
+	clash := strings.Replace(goodCreate, `{"labels": {"x": "y"}}`, `{"labels": {"x": "y", "app": "pod"}}`, 1)
+	if req, _, err := CreateFrom([]byte(clash), now, fixed); err != nil || req.Tags["app"] != "agent" || req.Tags["x"] != "y" {
+		t.Fatalf("a clash = %v %v, want the sandbox's own label", req.Tags, err)
 	}
 	if req.Lifecycle == nil || req.Lifecycle.DestroyAtAge != time.Hour || sb.Metadata.Name != "web" {
 		t.Fatalf("lifecycle = %+v", req.Lifecycle)

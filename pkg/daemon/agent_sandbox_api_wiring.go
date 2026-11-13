@@ -148,7 +148,7 @@ func startAgentSandboxAPI(ctx context.Context, cfg config.Config, c cluster.Clie
 	}
 	hub := kubeview.New(kubeview.Options{})
 	if !hub.Follow(ctx, feed) {
-		return nil, errors.New("agent-sandbox API: the placement feed is off (SB_INGRESS_PROXY_ROUTING=false)")
+		return nil, errors.New("agent-sandbox API: this node runs no placement feed")
 	}
 	fp := &frontProxyHolder{}
 	go fp.load(ctx, kc, logger)

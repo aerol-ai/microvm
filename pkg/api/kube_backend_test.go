@@ -142,7 +142,7 @@ func TestKubeBackendThroughTheRealAPI(t *testing.T) {
 	if !errors.As(err, &se) || se.Code != http.StatusNotFound {
 		t.Fatalf("another team's delete = %#v", err)
 	}
-	if got := b.Specs(kubeCtx(), []string{"sb-00000000000000aa"}); len(got) != 0 {
+	if got := b.Specs(kubeCtx(), []kubeapi.SpecRef{{ID: "sb-00000000000000aa"}}); len(got) != 0 {
 		t.Fatalf("specs on a single node = %v", got)
 	}
 }
@@ -168,12 +168,13 @@ func TestKubeBackendSpecs(t *testing.T) {
 	r := &fakeSpecReader{}
 	clock := time.Unix(1000, 0)
 	b := &KubeBackend{specs: func() cluster.SpecSummaryReader { return r }, now: func() time.Time { return clock }}
-	ids := make([]string, cluster.MaxSpecSummaryBatch+1)
+	ids := make([]kubeapi.SpecRef, cluster.MaxSpecSummaryBatch+1)
 	for i := range ids {
-		ids[i] = "sb-" + string(rune('a'+i%26)) + string(rune('a'+i/26%26)) + string(rune('a'+i/676))
+		id := "sb-" + string(rune('a'+i%26)) + string(rune('a'+i/26%26)) + string(rune('a'+i/676))
+		ids[i] = kubeapi.SpecRef{ID: id, Incarnation: "inc-1"}
 	}
 	got := b.Specs(context.Background(), ids)
-	if len(got) != len(ids) || r.calls != 2 || got[ids[0]].Image != "img-"+ids[0] {
+	if len(got) != len(ids) || r.calls != 2 || got[ids[0].ID].Image != "img-"+ids[0].ID {
 		t.Fatalf("%d summaries in %d calls", len(got), r.calls)
 	}
 	// Cached for a minute.
@@ -181,13 +182,21 @@ func TestKubeBackendSpecs(t *testing.T) {
 	if r.calls != 2 {
 		t.Fatalf("not cached: %d calls", r.calls)
 	}
+	// The same ID made again (a keyed create after a delete) is another
+	// sandbox: read again, not shown with the deleted one's spec.
+	if b.Specs(context.Background(), []kubeapi.SpecRef{{ID: ids[0].ID, Incarnation: "inc-2"}}); r.calls != 3 {
+		t.Fatalf("a new incarnation answered from the cache: %d calls", r.calls)
+	}
+	if b.Specs(context.Background(), []kubeapi.SpecRef{{ID: ids[0].ID, Incarnation: "inc-2"}}); r.calls != 3 {
+		t.Fatalf("the new incarnation is not cached: %d calls", r.calls)
+	}
 	clock = clock.Add(2 * time.Minute)
 	r.err = errors.New("servers away")
-	if got := b.Specs(context.Background(), ids[:3]); len(got) != 0 || r.calls != 3 {
+	if got := b.Specs(context.Background(), ids[:3]); len(got) != 0 || r.calls != 4 {
 		t.Fatalf("a failed read = %v, %d calls", got, r.calls)
 	}
 	none := &KubeBackend{specs: func() cluster.SpecSummaryReader { return nil }, now: time.Now}
-	if got := none.Specs(context.Background(), []string{"sb-a"}); len(got) != 0 {
+	if got := none.Specs(context.Background(), []kubeapi.SpecRef{{ID: "sb-a"}}); len(got) != 0 {
 		t.Fatalf("no reader = %v", got)
 	}
 }

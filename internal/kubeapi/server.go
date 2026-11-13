@@ -38,9 +38,27 @@ type Backend interface {
 	Delete(ctx context.Context, owner, sandboxID string) error
 	// SetRunning starts (true) or stops (false) a sandbox.
 	SetRunning(ctx context.Context, owner, sandboxID string, running bool) error
-	// Specs summarizes the given sandboxes' specs; missing ones render
-	// without a spec.
-	Specs(ctx context.Context, ids []string) map[string]SpecSummary
+	// Specs summarizes the given sandboxes' specs, by sandbox ID; missing
+	// ones render without a spec.
+	Specs(ctx context.Context, refs []SpecRef) map[string]SpecSummary
+}
+
+// SpecRef names one lifetime of a sandbox. An Idempotency-Key create after
+// a delete (kubectl delete, then create again) makes the same ID again, so
+// a spec cached by ID alone would show the deleted sandbox's image and
+// labels; the incarnation tells the two apart.
+type SpecRef struct {
+	ID          string
+	Incarnation string
+}
+
+// specRefs names the items' sandboxes.
+func specRefs(items ...kubeview.Item) []SpecRef {
+	refs := make([]SpecRef, len(items))
+	for i, it := range items {
+		refs[i] = SpecRef{ID: it.Placement.SandboxID, Incarnation: it.Placement.IncarnationID}
+	}
+	return refs
 }
 
 // StatusError is an error with the Kubernetes status to answer it with. A
@@ -65,15 +83,23 @@ type OwnerMap struct {
 
 var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
-// Owner is a namespace's owner.
+// Owner is a namespace's owner. An owner has one namespace: once the map
+// gives team:x another namespace, the namespace x no longer reaches it, so
+// RBAC on the mapped namespace is the only way to that team's sandboxes.
 func (m OwnerMap) Owner(ns string) (string, bool) {
 	if o, ok := m.Explicit[ns]; ok {
 		return o, true
 	}
-	if len(ns) <= 63 && dnsLabel.MatchString(ns) {
-		return "team:" + ns, true
+	if len(ns) > 63 || !dnsLabel.MatchString(ns) {
+		return "", false
 	}
-	return "", false
+	owner := "team:" + ns
+	for _, o := range m.Explicit {
+		if o == owner {
+			return "", false
+		}
+	}
+	return owner, true
 }
 
 // Namespace is an owner's namespace.
@@ -143,7 +169,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.Auth.Authenticate(r)
-	if err != nil {
+	if err != nil && !(errors.Is(err, ErrNoUser) && discoveryPath(path)) {
 		writeStatus(w, &StatusError{Code: http.StatusUnauthorized, Reason: "Unauthorized", Message: err.Error()})
 		return
 	}
@@ -199,6 +225,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, &StatusError{Code: http.StatusForbidden, Reason: "Forbidden", Message: msg})
 		return
 	}
+	if group == ExtensionsGroup && resource == SandboxClaimsResource {
+		if err := s.serveClaims(w, r, verb, ns, name); err != nil {
+			writeStatus(w, err)
+		}
+		return
+	}
 	if group == ExtensionsGroup {
 		if err := s.serveStored(w, r, verb, resource, ns, name); err != nil {
 			writeStatus(w, err)
@@ -251,6 +283,7 @@ func parseResourcePath(path string) (group, resource, ns, name, sub string, ok b
 	served := resource == SandboxesResource
 	if group == ExtensionsGroup {
 		_, served = storedKinds[resource]
+		served = served || resource == SandboxClaimsResource
 	}
 	if !served {
 		return "", "", "", "", "", false
@@ -429,13 +462,9 @@ func (s *Server) owned(ns string) (map[string]string, error) {
 // render turns hub items into objects, with spec summaries from the
 // backend.
 func (s *Server) render(ctx context.Context, items []kubeview.Item, nsOf func(owner string) string) []Sandbox {
-	ids := make([]string, len(items))
-	for i, it := range items {
-		ids[i] = it.Placement.SandboxID
-	}
 	specs := map[string]SpecSummary{}
-	if len(ids) > 0 {
-		specs = s.Backend.Specs(ctx, ids)
+	if len(items) > 0 {
+		specs = s.Backend.Specs(ctx, specRefs(items...))
 	}
 	out := make([]Sandbox, 0, len(items))
 	for _, it := range items {
@@ -723,9 +752,34 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, ns string, q map[
 	} else {
 		nsOf = func(o string) string { n, _ := s.Owners.Namespace(o); return n }
 	}
-	var from uint64
+	return s.streamWatch(w, r, owner, q, func(ctx context.Context, ev kubeview.Event) any {
+		sb := s.render(ctx, []kubeview.Item{ev.Item}, nsOf)[0]
+		if sb.Metadata.Namespace == "" || !lq.keep(sb) {
+			return nil
+		}
+		return sb
+	}, func(rv uint64, end bool) any {
+		obj := Sandbox{TypeMeta: TypeMeta{APIVersion: GroupVersion(), Kind: SandboxKind}, Metadata: ObjectMeta{ResourceVersion: strconv.FormatUint(rv, 10)}}
+		if end {
+			obj.Metadata.Annotations = map[string]string{initialEventsEnd: "true"}
+		}
+		return obj
+	})
+}
+
+// streamWatch serves one watch of owner's sandboxes from the hub, one JSON
+// WatchEvent per line. object renders an event (nil skips it); mark makes a
+// bookmark's object at a version, end marking the end of the initial list.
+// With sendInitialEvents the hub replays every sandbox from 0, then a
+// Bookmark where its replay ends: that is the end bookmark client-go waits
+// for (kubectl wait), sent exactly there, never guessed from a quiet spell
+// that a busy cluster might never leave.
+func (s *Server) streamWatch(w http.ResponseWriter, r *http.Request, owner string, q map[string][]string,
+	object func(ctx context.Context, ev kubeview.Event) any, mark func(rv uint64, end bool) any) error {
 	initial := firstOf(q["sendInitialEvents"]) == "true"
+	var from uint64
 	if rv := firstOf(q["resourceVersion"]); rv != "" && rv != "0" && !initial {
+		var err error
 		if from, err = strconv.ParseUint(rv, 10, 64); err != nil {
 			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "resourceVersion: not a number"}
 		}
@@ -746,6 +800,11 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, ns string, q map[
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		// Headers now: a quiet watch must not leave the client waiting for
+		// its response.
+		flusher.Flush()
+	}
 	enc := json.NewEncoder(w)
 	send := func(ev WatchEvent) bool {
 		if err := enc.Encode(ev); err != nil {
@@ -763,61 +822,36 @@ func (s *Server) watch(w http.ResponseWriter, r *http.Request, ns string, q map[
 	}
 	tick := time.NewTicker(every)
 	defer tick.Stop()
-	pendingInitial := initial
-	bookmark := func(end bool) bool {
-		pos, err := s.Hub.Position()
-		if err != nil {
-			return true
-		}
-		obj := Sandbox{TypeMeta: TypeMeta{APIVersion: GroupVersion(), Kind: SandboxKind}, Metadata: ObjectMeta{ResourceVersion: strconv.FormatUint(pos, 10)}}
-		if end {
-			obj.Metadata.Annotations = map[string]string{initialEventsEnd: "true"}
-		}
-		return send(WatchEvent{Type: "BOOKMARK", Object: obj})
-	}
 	for {
 		var ev kubeview.Event
 		var ok bool
-		if pendingInitial {
-			// With sendInitialEvents the backlog (every sandbox, from 0)
-			// is followed by a bookmark marking its end.
-			select {
-			case ev, ok = <-events:
-			case <-time.After(10 * time.Millisecond):
-				pendingInitial = false
-				if !bookmark(true) {
-					return nil
-				}
+		select {
+		case ev, ok = <-events:
+		case <-tick.C:
+			if !bookmarks {
 				continue
 			}
-		} else {
-			select {
-			case ev, ok = <-events:
-			case <-tick.C:
-				if bookmarks && !bookmark(false) {
-					return nil
-				}
-				continue
+			if pos, err := s.Hub.Position(); err == nil && !send(WatchEvent{Type: "BOOKMARK", Object: mark(pos, false)}) {
+				return nil
 			}
+			continue
 		}
 		if !ok {
 			return nil
 		}
 		switch ev.Type {
 		case kubeview.Closed:
-			st := hubError(ev.Err)
-			se, isStatus := st.(*StatusError)
-			if !isStatus {
+			if se, isStatus := hubError(ev.Err).(*StatusError); isStatus {
+				send(WatchEvent{Type: "ERROR", Object: statusOf(se)})
+			}
+			return nil
+		case kubeview.Bookmark:
+			// The end of the hub's replay from 0.
+			if initial && !send(WatchEvent{Type: "BOOKMARK", Object: mark(ev.RV, true)}) {
 				return nil
 			}
-			send(WatchEvent{Type: "ERROR", Object: statusOf(se)})
-			return nil
 		case kubeview.Added, kubeview.Modified, kubeview.Deleted:
-			sb := s.render(ctx, []kubeview.Item{ev.Item}, nsOf)[0]
-			if sb.Metadata.Namespace == "" || !lq.keep(sb) {
-				continue
-			}
-			if !send(WatchEvent{Type: string(ev.Type), Object: sb}) {
+			if obj := object(ctx, ev); obj != nil && !send(WatchEvent{Type: string(ev.Type), Object: obj}) {
 				return nil
 			}
 		}
@@ -891,4 +925,17 @@ func randomSuffix() string {
 		b[i] = suffixAlphabet[int(b[i])%len(suffixAlphabet)]
 	}
 	return string(b)
+}
+
+// discoveryPath is a discovery or OpenAPI document: what the
+// kube-apiserver's health check of the APIService reads, sent with its
+// front-proxy certificate and no user.
+func discoveryPath(path string) bool {
+	switch path {
+	case "/apis", "/apis/" + Group, "/apis/" + Group + "/" + Version,
+		"/apis/" + ExtensionsGroup, "/apis/" + ExtensionsGroup + "/" + Version,
+		"/openapi/v2", "/openapi/v3":
+		return true
+	}
+	return false
 }
