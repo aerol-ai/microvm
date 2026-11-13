@@ -191,6 +191,7 @@ func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
 		"metadata": map[string]any{
 			"name": sb.Metadata.Name, "namespace": ns, "uid": sb.Metadata.UID, "resourceVersion": sb.Metadata.ResourceVersion,
 			"generation": 1, "creationTimestamp": sb.Metadata.CreationTimestamp, "annotations": sb.Metadata.Annotations,
+			"labels": sb.Metadata.Labels,
 		},
 		"spec": map[string]any{"warmPoolRef": map[string]any{"name": pool}},
 		"status": map[string]any{
@@ -202,8 +203,18 @@ func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
 
 func isClaim(spec SpecSummary, ok bool) bool { return ok && spec.Tags[TagClaim] == "true" }
 
-// claims are owner's claim-made sandboxes, in name order.
-func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any, uint64, error) {
+// keepClaim applies a list's or watch's selectors to a rendered claim, as
+// keep does to a sandbox: kubectl wait finds its one object by
+// fieldSelector metadata.name.
+func (lq listQuery) keepClaim(c map[string]any) bool {
+	md, _ := c["metadata"].(map[string]any)
+	name, _ := md["name"].(string)
+	labels, _ := md["labels"].(map[string]string)
+	return (lq.name == "" || name == lq.name) && lq.labels.matches(labels)
+}
+
+// claims are owner's claim-made sandboxes that lq keeps, in name order.
+func (s *Server) claims(ctx context.Context, owner, ns string, lq listQuery) ([]map[string]any, uint64, error) {
 	items, pos, _, err := s.Hub.List(owner, "", 0)
 	if err != nil {
 		return nil, 0, hubError(err)
@@ -214,8 +225,11 @@ func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any
 		specs := s.Backend.Specs(ctx, specRefs(chunk...))
 		for _, it := range chunk {
 			sp, ok := specs[it.Placement.SandboxID]
-			if isClaim(sp, ok) {
-				out = append(out, claimFrom(it, ns, &sp))
+			if !isClaim(sp, ok) {
+				continue
+			}
+			if c := claimFrom(it, ns, &sp); lq.keepClaim(c) {
+				out = append(out, c)
 			}
 		}
 	}
@@ -237,6 +251,10 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 	}
 	switch verb {
 	case "list":
+		lq, err := parseListQuery(r.URL.Query())
+		if err != nil {
+			return err
+		}
 		items := []any{}
 		var pos uint64
 		var names []string
@@ -245,7 +263,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		}
 		sort.Strings(names)
 		for _, o := range names {
-			cs, p, err := s.claims(ctx, o, owners[o])
+			cs, p, err := s.claims(ctx, o, owners[o], lq)
 			if err != nil {
 				return err
 			}
@@ -283,7 +301,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		if err != nil {
 			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: err.Error()}
 		}
-		req, c, err := s.claimRequest(ctx, ns, body)
+		req, _, err := s.claimRequest(ctx, ns, body)
 		if err != nil {
 			return err
 		}
@@ -302,7 +320,6 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 			it.Placement.CreatedUnix = s.now().Unix()
 		}
 		sp := SpecSummary{Image: req.Image, Runtime: req.Runtime, Tags: req.Tags}
-		_ = c
 		writeJSON(w, http.StatusCreated, claimFrom(it, ns, &sp))
 		return nil
 	case "watch":
@@ -326,9 +343,12 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 		owner = firstKey(owners)
 	}
 	q := r.URL.Query()
+	lq, err := parseListQuery(q)
+	if err != nil {
+		return err
+	}
 	var from uint64
 	if rv := firstOf(q["resourceVersion"]); rv != "" && rv != "0" {
-		var err error
 		if from, err = strconv.ParseUint(rv, 10, 64); err != nil {
 			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "resourceVersion: not a number"}
 		}
@@ -372,7 +392,11 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 		if !isClaim(sp, ok) {
 			continue
 		}
-		if err := enc.Encode(WatchEvent{Type: string(ev.Type), Object: claimFrom(ev.Item, n, &sp)}); err != nil {
+		c := claimFrom(ev.Item, n, &sp)
+		if !lq.keepClaim(c) {
+			continue
+		}
+		if err := enc.Encode(WatchEvent{Type: string(ev.Type), Object: c}); err != nil {
 			return nil
 		}
 		if flusher != nil {
