@@ -739,24 +739,24 @@ the skip.
 
 ---
 
-## Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2)
+## A forwarded control-plane 4xx reaches the API caller as 500 (API)
 
-- **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
-  built, decide (1) where upstream `SandboxTemplate` and `SandboxWarmPool`
-  records live, and (2) which sandboxes `kubectl get sandboxes -n X` shows and
-  what deleting namespace X deletes.
-- **Why:** the 2026-11-10 CEO review (RQ10) moved the facade out of the
-  current phases and added no storage for those records, in Kubernetes or in
-  AerolVM. The founder rule "no facade-specific tables" rules out a
-  Kubernetes-only store inside AerolVM. Upstream puts `SandboxClaim` (one per
-  sandbox) in the same group-version as templates and pools, so the whole
-  group must be served by the aggregated API.
-- **Options seen so far:** internal CRDs in etcd written by the gateways; a new
-  AerolVM FSM kind (breaks the rule); serve only `Sandbox`. On namespaces:
-  show and delete only what was created through the Kubernetes API, or
-  everything the mapped owner has.
-- **Effort:** design only, human S / CC S. **Priority:** P2.
-- **Depends on:** Phase 3 of the Kubernetes plan being done.
+- **What:** when a gateway or worker forwards a control-plane call to a
+  server and the server refuses it with a 4xx, the caller gets HTTP 500
+  with the server's status in the message: "cluster control-plane request
+  failed with status 412: …" (`internal/cluster/agent.go`, `statusError`;
+  the API's error writer does not know that type, so it answers 500).
+- **Why:** seen live in run `c23-extca-3` (2026-11-13): a join-token
+  request in external-CA mode is refused with 412 by the server, and the
+  caller saw 500. The message is right; only the status is wrong, so a
+  client cannot tell a refusal from a fault.
+- **Caveat:** not every forwarded 4xx is the caller's: a 403 "cluster peer
+  not in membership" is between nodes and must stay a 5xx (retryable) to
+  the caller. Pass through only refusals about the request itself (400,
+  404, 409, 412), and keep the rest as they are.
+- **Where to start:** `statusError` in `internal/cluster/agent.go`, and
+  `apihttp.WriteStoreAwareError`, which maps error types to statuses.
+- **Effort:** S. **Priority:** P3.
 
 ---
 
@@ -786,6 +786,28 @@ the skip.
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2) — DECIDED and BUILT
+
+- **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
+  built, decide (1) where upstream `SandboxTemplate` and `SandboxWarmPool`
+  records live, and (2) which sandboxes `kubectl get sandboxes -n X` shows and
+  what deleting namespace X deletes.
+- **Why:** the 2026-11-10 CEO review (RQ10) moved the facade out of the
+  current phases and added no storage for those records, in Kubernetes or in
+  AerolVM. The founder rule "no facade-specific tables" rules out a
+  Kubernetes-only store inside AerolVM. Upstream puts `SandboxClaim` (one per
+  sandbox) in the same group-version as templates and pools, so the whole
+  group must be served by the aggregated API.
+- **Options seen so far:** internal CRDs in etcd written by the gateways; a new
+  AerolVM FSM kind (breaks the rule); serve only `Sandbox`. On namespaces:
+  show and delete only what was created through the Kubernetes API, or
+  everything the mapped owner has.
+- **Effort:** design only, human S / CC S. **Priority:** P2.
+- **Depends on:** Phase 3 of the Kubernetes plan being done.
+- **Decided** (the user, 2026-11-13): templates and warm pools are
+  Kubernetes CRDs; a namespace shows, and deleting it deletes, all of its
+  owner's sandboxes. Built as C17 (#1233 to #1246); see the plan's §16.1.
 
 ### A partitioned node keeps serving: /health ignores cluster membership (readiness gap) — FIXED
 
