@@ -271,6 +271,14 @@ cluster:
   federation:
     idKeySecret: ""
     cells: {}
+  # The Kubernetes agent-sandbox API (C17; docs: Kubernetes API): the
+  # gateways serve agents.x-k8s.io/v1beta1 Sandbox, so `kubectl get
+  # sandboxes` and agent-sandbox clients work against AerolVM. Namespace N
+  # is team N; namespaces maps any other namespace to an owner. Deleting a
+  # namespace deletes every sandbox of its owner. Needs cert-manager.
+  agentSandboxAPI:
+    enabled: false
+    namespaces: {}
   # The zones to spread over, such as [eu-west-1a, eu-west-1b, eu-west-1c].
   # Servers go one per zone; gateways and workers spread across them.
   zones: []

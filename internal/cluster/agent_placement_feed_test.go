@@ -214,19 +214,19 @@ func TestAgentPlacementFeedOffByDefault(t *testing.T) {
 func TestAgentApplyPlacementChangesMergeRules(t *testing.T) {
 	agent := &Agent{}
 	f := &agentPlacementFeed{rows: map[string]Placement{"sb": {SandboxID: "sb", Version: 10}}}
-	if agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 11, Changes: []PlacementChange{
+	if len(agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 11, Changes: []PlacementChange{
 		{Index: 5, SandboxID: "sb", Placement: &Placement{SandboxID: "sb", Version: 5}},
-	}}) {
+	}})) > 0 {
 		t.Fatal("an older version replaced a newer row")
 	}
-	if agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 12, Changes: []PlacementChange{
+	if len(agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 12, Changes: []PlacementChange{
 		{Index: 9, SandboxID: "sb", Deleted: true},
-	}}) || f.rows["sb"].Version != 10 {
+	}})) > 0 || f.rows["sb"].Version != 10 {
 		t.Fatal("a delete older than the row removed it")
 	}
-	if !agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 13, Changes: []PlacementChange{
+	if len(agent.applyPlacementChanges(f, PlacementChangesResponse{Next: 13, Changes: []PlacementChange{
 		{Index: 12, SandboxID: "sb", Deleted: true},
-	}}) || len(f.rows) != 0 {
+	}})) == 0 || len(f.rows) != 0 {
 		t.Fatal("a newer delete did not remove the row")
 	}
 	if f.cursor != 13 {

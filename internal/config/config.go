@@ -686,6 +686,18 @@ type Config struct {
 	// sandboxes reports their run state through Raft so the API can show
 	// it. Off by default: off, a cluster writes no run-state entries.
 	AgentSandboxAPI bool
+	// AgentSandboxAPIAddr is where a gateway serves it, over TLS
+	// (SB_AGENT_SANDBOX_API_ADDR, default :9443); the Kubernetes
+	// APIService points here.
+	AgentSandboxAPIAddr string
+	// AgentSandboxAPICertFile and AgentSandboxAPIKeyFile are its serving
+	// pair (SB_AGENT_SANDBOX_API_TLS_CERT, SB_AGENT_SANDBOX_API_TLS_KEY),
+	// reloaded when they change on disk (cert-manager renews them).
+	AgentSandboxAPICertFile string
+	AgentSandboxAPIKeyFile  string
+	// AgentSandboxAPINamespaces maps namespaces to owners that are not
+	// team:<namespace> (SB_AGENT_SANDBOX_API_NAMESPACES, "ns=owner,...").
+	AgentSandboxAPINamespaces map[string]string
 	// UsageMetricsEnabled adds per-owner usage counters to /v1/metrics
 	// (plans/kubernetes-v2-architecture.md, C20): each running sandbox's CPU
 	// and memory limit times the time it ran (the charge), and the CPU and
@@ -2415,6 +2427,9 @@ func load(keyTool bool) (Config, error) {
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
 		UsageMetricsEnabled:           getEnvBool("SB_USAGE_METRICS_ENABLED", false),
 		AgentSandboxAPI:               getEnvBool("SB_AGENT_SANDBOX_API", false),
+		AgentSandboxAPIAddr:           getEnv("SB_AGENT_SANDBOX_API_ADDR", ":9443"),
+		AgentSandboxAPICertFile:       getEnv("SB_AGENT_SANDBOX_API_TLS_CERT", "/etc/aerolvm/agent-sandbox-api/tls.crt"),
+		AgentSandboxAPIKeyFile:        getEnv("SB_AGENT_SANDBOX_API_TLS_KEY", "/etc/aerolvm/agent-sandbox-api/tls.key"),
 		OTELTracesEnabled:             getEnvBool("SB_OTEL_TRACES_ENABLED", false),
 		OTELTracesEndpoint:            firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
 		OTELTracesSampleRatio:         getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
@@ -3346,6 +3361,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadCellRouting(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAgentSandboxAPINamespaces(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadReadyLeaderGrace(); err != nil {
@@ -4398,3 +4416,29 @@ func validateTLSIssuer(cfg Config) error {
 	}
 	return nil
 }
+
+// loadAgentSandboxAPINamespaces reads SB_AGENT_SANDBOX_API_NAMESPACES
+// strictly: a wrong pair would show one owner's sandboxes in another's
+// namespace.
+func (c *Config) loadAgentSandboxAPINamespaces() error {
+	v := strings.TrimSpace(os.Getenv("SB_AGENT_SANDBOX_API_NAMESPACES"))
+	if v == "" {
+		return nil
+	}
+	c.AgentSandboxAPINamespaces = map[string]string{}
+	owners := map[string]bool{}
+	for _, part := range strings.Split(v, ",") {
+		ns, owner, ok := strings.Cut(strings.TrimSpace(part), "=")
+		ns, owner = strings.TrimSpace(ns), strings.TrimSpace(owner)
+		if !ok || ns == "" || owner == "" || len(ns) > 63 || !agentSandboxNamespace.MatchString(ns) {
+			return fmt.Errorf("SB_AGENT_SANDBOX_API_NAMESPACES: %q is not <namespace>=<owner>", part)
+		}
+		if _, dup := c.AgentSandboxAPINamespaces[ns]; dup || owners[owner] {
+			return fmt.Errorf("SB_AGENT_SANDBOX_API_NAMESPACES: %q maps a namespace or an owner twice", part)
+		}
+		c.AgentSandboxAPINamespaces[ns], owners[owner] = owner, true
+	}
+	return nil
+}
+
+var agentSandboxNamespace = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)

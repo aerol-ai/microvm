@@ -153,11 +153,11 @@ func TestAgentFeedMergesRunStates(t *testing.T) {
 	a := &Agent{}
 	f := &agentPlacementFeed{rows: map[string]Placement{"sb-a": {SandboxID: "sb-a", Version: 5, RunState: RunStateRunning, RunStateIndex: 6}}}
 	stopped := Placement{SandboxID: "sb-a", Version: 5, RunState: RunStateSuspended, RunStateIndex: 8}
-	if !a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 8, Placement: &stopped}}, Next: 8}) {
+	if len(a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 8, Placement: &stopped}}, Next: 8})) == 0 {
 		t.Fatal("a stop at the same version was not merged")
 	}
 	stale := Placement{SandboxID: "sb-a", Version: 5, RunState: RunStateRunning, RunStateIndex: 6}
-	if a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 6, Placement: &stale}}, Next: 9}) {
+	if len(a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 6, Placement: &stale}}, Next: 9})) > 0 {
 		t.Fatal("an older run state replaced a newer one")
 	}
 	if got := f.rows["sb-a"]; got.RunState != RunStateSuspended {
@@ -200,6 +200,11 @@ func TestSetRunStatesThroughRaftAndTheGate(t *testing.T) {
 	}
 	if p, _ := c.fsm.get("sb-a"); p.RunState != RunStateSuspended || p.RunStateIndex == 0 {
 		t.Fatalf("row = %+v", p)
+	}
+	// The leader refuses a bad batch before it reaches Raft, as a follower
+	// and an Agent do.
+	if _, err := c.SetRunStates(ctx, []RunStateReport{{SandboxID: "sb-a"}}); !errors.Is(err, ErrBadRunStateBatch) {
+		t.Fatalf("a bad batch on the leader = %v", err)
 	}
 	if err := c.raft.raft.AddNonvoter("rs-gate-b", "127.0.0.1:1", 0, 0).Error(); err != nil {
 		t.Fatal(err)
