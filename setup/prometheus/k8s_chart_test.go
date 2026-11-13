@@ -770,6 +770,34 @@ func TestKubernetesChartOperatorMetricsRegistered(t *testing.T) {
 // Service, certificate and two RBAC bindings render, every role's template
 // carries the setting, and only the gateway's has a service account, the
 // API port and the serving pair.
+// gatewayOpenPorts is the gateways' ports anyone may reach: the ports of
+// the gateway-ingress policy's rules that name no peer.
+func gatewayOpenPorts(t *testing.T, docs []map[string]any) map[int]bool {
+	t.Helper()
+	for _, np := range docsOfKind(docs, "NetworkPolicy") {
+		if name, _ := dig(np, "metadata", "name").(string); !strings.HasSuffix(name, "-gateway-ingress") {
+			continue
+		}
+		open := map[int]bool{}
+		rules, _ := dig(np, "spec", "ingress").([]any)
+		for _, r := range rules {
+			rule, _ := r.(map[string]any)
+			if rule["from"] != nil {
+				continue
+			}
+			ports, _ := rule["ports"].([]any)
+			for _, p := range ports {
+				if n, ok := dig(p.(map[string]any), "port").(int); ok {
+					open[n] = true
+				}
+			}
+		}
+		return open
+	}
+	t.Fatal("no gateway-ingress NetworkPolicy")
+	return nil
+}
+
 func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 	root := repoRoot(t)
 	helm := chartTool(t, "HELM", "helm")
@@ -785,14 +813,41 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 	if n := len(docsOfKind(docs, "APIService")); n != 0 {
 		t.Fatalf("the API is off by default, but %d APIService rendered", n)
 	}
+	if gatewayOpenPorts(t, docs)[9443] {
+		t.Fatal("the gateways' port 9443 is open with the API off")
+	}
 	docs, err = renderChart(t, root, helm, append(cluster, "cluster.agentSandboxAPI.enabled=true", "cluster.agentSandboxAPI.namespaces.acct=acct:k1")...)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The kube-apiserver is no pod of the install: without its port open to
+	// all, every call to the APIService times out (p6-kubeapi-2).
+	if open := gatewayOpenPorts(t, docs); !open[9443] || !open[443] {
+		t.Fatalf("the gateways' ports open to all = %v, want 9443 among them", open)
+	}
 	api := docsOfKind(docs, "APIService")
-	if len(api) != 1 || dig(api[0], "spec", "group") != "agents.x-k8s.io" || dig(api[0], "spec", "service", "name") != "aerolvm-agent-sandbox-api" ||
-		dig(api[0], "metadata", "annotations", "cert-manager.io/inject-ca-from") != "aerolvm/aerolvm-agent-sandbox-api" {
-		t.Fatalf("APIService = %v", api)
+	groups := map[any]bool{}
+	for _, a := range api {
+		groups[dig(a, "spec", "group")] = true
+		if dig(a, "spec", "service", "name") != "aerolvm-agent-sandbox-api" ||
+			dig(a, "metadata", "annotations", "cert-manager.io/inject-ca-from") != "aerolvm/aerolvm-agent-sandbox-api" {
+			t.Fatalf("APIService = %v", a)
+		}
+	}
+	if len(api) != 2 || !groups["agents.x-k8s.io"] || !groups["extensions.agents.x-k8s.io"] {
+		t.Fatalf("APIServices = %v", groups)
+	}
+	crds := map[any]bool{}
+	for _, c := range docsOfKind(docs, "CustomResourceDefinition") {
+		crds[dig(c, "metadata", "name")] = true
+		// Without keep, turning the API off deletes the CRDs, and with
+		// them every stored template and warm pool.
+		if dig(c, "metadata", "annotations", "helm.sh/resource-policy") != "keep" {
+			t.Fatalf("CRD %v is not kept by helm", dig(c, "metadata", "name"))
+		}
+	}
+	if !crds["sandboxtemplates.k8s.aerolvm.io"] || !crds["sandboxwarmpools.k8s.aerolvm.io"] {
+		t.Fatalf("internal CRDs = %v", crds)
 	}
 	roles := map[string]bool{}
 	for _, b := range append(docsOfKind(docs, "ClusterRoleBinding"), docsOfKind(docs, "RoleBinding")...) {
@@ -800,7 +855,7 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 			roles[dig(b, "roleRef", "name").(string)] = true
 		}
 	}
-	if !roles["system:auth-delegator"] || !roles["extension-apiserver-authentication-reader"] || len(roles) != 2 {
+	if !roles["system:auth-delegator"] || !roles["extension-apiserver-authentication-reader"] || !roles["aerolvm-gateway-store"] || len(roles) != 3 {
 		t.Fatalf("the gateway's roles = %v", roles)
 	}
 	if n := len(docsOfKind(docs, "Certificate")); n < 1 {

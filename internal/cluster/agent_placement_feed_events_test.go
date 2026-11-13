@@ -190,3 +190,28 @@ func TestNotifyWatchersKeepsTheLegacyCalls(t *testing.T) {
 		t.Fatalf("legacy calls = %s", got)
 	}
 }
+
+// The feed runs for proxy routing, and for the agent-sandbox API on an
+// ingress node whether that node serves sandbox links or not (C17; found
+// live: without an edge, proxy routing is off, and the API had no feed).
+func TestPlacementFeedWanted(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg  config.Config
+		want bool
+	}{
+		"proxy routing":         {config.Config{IngressProxyRouting: true}, true},
+		"the API on an ingress": {config.Config{AgentSandboxAPI: true, NodeRole: config.NodeRoleIngress}, true},
+		"the API on a worker":   {config.Config{AgentSandboxAPI: true, NodeRole: config.NodeRoleWorker}, false},
+		"neither":               {config.Config{NodeRole: config.NodeRoleIngress}, false},
+	} {
+		if got := placementFeedWanted(tc.cfg); got != tc.want {
+			t.Errorf("%s = %v, want %v", name, got, tc.want)
+		}
+	}
+	a := &Agent{cfg: config.Config{AgentSandboxAPI: true, NodeRole: config.NodeRoleIngress}}
+	a.startPlacementFeed()
+	defer a.stopPlacementFeed()
+	if a.feed == nil {
+		t.Fatal("no feed for the agent-sandbox API without proxy routing")
+	}
+}

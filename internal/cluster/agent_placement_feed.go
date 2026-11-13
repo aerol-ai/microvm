@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // Agent half of the placement delta feed (plans/ingress-proxy-routing.md
@@ -88,10 +90,18 @@ var (
 	feedBackoffMax = 30 * time.Second
 )
 
+// placementFeedWanted: the feed runs for proxy routing (which needs Caddy
+// and a domain, IngressProxyRoutingApplies) and for the agent-sandbox API
+// on an ingress node (C17), whose hub needs it whether the node serves
+// sandbox links or not.
+func placementFeedWanted(cfg config.Config) bool {
+	return cfg.IngressProxyRouting || (cfg.AgentSandboxAPI && cfg.IsIngress())
+}
+
 // startPlacementFeed launches the feed when the node routes without
 // per-sandbox Caddy writes. It is idempotent.
 func (a *Agent) startPlacementFeed() {
-	if a == nil || !a.cfg.IngressProxyRouting || a.feed != nil {
+	if a == nil || !placementFeedWanted(a.cfg) || a.feed != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())

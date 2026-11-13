@@ -239,7 +239,7 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	} else {
 		out.Header.Del(HeaderOwnerEpoch)
 	}
-	stampCaller(out)
+	stampCaller(out, access)
 	auditlog.MarkForwarded(out.Context())
 }
 
