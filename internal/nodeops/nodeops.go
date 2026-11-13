@@ -62,9 +62,12 @@ const (
 // the paths the tools work on and the cluster identity recover-quorum
 // writes.
 type Node struct {
-	ConfigDir  string
-	StateDB    string
-	RaftDir    string
+	ConfigDir string
+	StateDB   string
+	RaftDir   string
+	// RaftWALDir is SB_RAFT_WAL_DIR as configured. The log's real place is
+	// what the Raft directory records (raftlogdir.Dir).
+	RaftWALDir string
 	KeyFile    string
 	KeyRing    string
 	WrappedKey string
@@ -101,6 +104,7 @@ func ReadNode(configDir string) (Node, error) {
 	n := Node{
 		ConfigDir:  configDir,
 		StateDB:    get("SB_DB_PATH", defaultDBPath),
+		RaftWALDir: get("SB_RAFT_WAL_DIR", ""),
 		KeyFile:    get("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", defaultKeyFile),
 		WrappedKey: get("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", defaultWrappedKey),
 		Custody:    strings.ToLower(get("SB_CREDENTIAL_KEY_CUSTODY", "")),

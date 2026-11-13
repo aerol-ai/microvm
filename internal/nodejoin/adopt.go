@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // AdoptOptions is `sandboxd adopt`.
@@ -160,6 +161,19 @@ func (r *Resetter) Run(ctx context.Context, o ResetOptions) error {
 		case !errors.Is(err, os.ErrNotExist):
 			return err
 		}
+	}
+	// A log SB_RAFT_WAL_DIR put on a disk of its own goes too, first: left
+	// behind, the next start would find a log its Raft directory does not
+	// name, and refuse it.
+	walDir, err := raftlogdir.Recorded(raftDir)
+	if err != nil {
+		return err
+	}
+	if walDir != "" && dirHasEntries(walDir) {
+		if err := removeTree(walDir); err != nil {
+			return err
+		}
+		removed = append(removed, walDir)
 	}
 	if dirHasEntries(raftDir) {
 		if err := removeTree(raftDir); err != nil {

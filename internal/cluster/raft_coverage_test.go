@@ -44,7 +44,7 @@ func TestMaybeRecoverRaftClusterSuccessPath(t *testing.T) {
 	if err := os.WriteFile(path, []byte(peers), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	logStore, err := openRaftLogStore(dir, logger)
+	logStore, err := openRaftLogStore(dir, "", logger)
 	if err != nil {
 		t.Fatal(err)
 	}

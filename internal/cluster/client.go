@@ -251,6 +251,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		BindAddr:         cfg.RaftBindAddr,
 		AdvertiseAddr:    cfg.RaftAdvertiseAddr,
 		DataDir:          cfg.RaftDataDir,
+		WALDir:           cfg.RaftWALDir,
 		BootstrapCluster: cfg.ClusterBootstrap,
 		TLS:              clusterTLS,
 	}, fsm, logger)

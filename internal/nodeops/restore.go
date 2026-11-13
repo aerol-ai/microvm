@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // RestoreOptions is one `sandboxd restore`.
@@ -151,6 +153,12 @@ func Restore(ctx context.Context, o RestoreOptions) (RestoreResult, error) {
 	if p := r.path(key(ringName)); exists(p) {
 		_ = os.Chmod(p, 0o600)
 		fmt.Fprintf(o.Out, "the server key was rotated: the ring at %s holds it; keep it with SB_CREDENTIAL_KEY_RING_PATH unset or pointing there\n", p)
+	}
+	if node, err := ReadNode(r.path(archiveConfig)); err == nil && node.RaftWALDir != "" && idx.hasTree(archiveRaft) {
+		// An archive holds the log at raft/raft-wal (Backup), and sandboxd
+		// will not leave a log there behind for SB_RAFT_WAL_DIR.
+		fmt.Fprintf(o.Err, "WARNING: the restored Raft log is in %s; sandboxd refuses to start while SB_RAFT_WAL_DIR=%s is set in %s: remove that line\n",
+			r.path(archiveRaft+"/"+raftlogdir.DefaultName), node.RaftWALDir, r.path(archiveConfig))
 	}
 	if !(o.Start && live) {
 		fmt.Fprintln(o.Out, "verify ownership/modes, then start sandboxd")
