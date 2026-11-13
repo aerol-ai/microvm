@@ -200,6 +200,17 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0",
 		},
 		{
+			name: "cluster negative reserve apply limit",
+			env: map[string]string{
+				"SB_ENABLE_CLUSTER":               "true",
+				"SB_CLUSTER_BOOTSTRAP":            "true",
+				"SB_CLUSTER_INSECURE_GOSSIP":      "true",
+				"SB_CLUSTER_INSECURE_CREDENTIALS": "true",
+				"SB_CLUSTER_RESERVE_APPLY_LIMIT":  "-1",
+			},
+			want: "SB_CLUSTER_RESERVE_APPLY_LIMIT must be >= 0",
+		},
+		{
 			name: "auto import reconcile interval must be positive",
 			env: map[string]string{
 				"SB_AUTO_IMPORT_ENABLED":            "true",
