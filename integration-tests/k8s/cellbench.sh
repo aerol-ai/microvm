@@ -47,8 +47,8 @@ steps="${AEROL_BENCH_STEPS:-32 128 512}"
 step_seconds="${AEROL_BENCH_STEP_SECONDS:-120}"
 profile_step="${AEROL_BENCH_PROFILE_STEP:-}"
 # AEROL_BENCH_SERVER_WAL_DISK: a second volume on each server holding only
-# the Raft log, to tell the log's own fsyncs from the other writes on the
-# root disk (snapshots, recovery blobs). "1" is gp3 like the root volume;
+# the Raft log (SB_RAFT_WAL_DIR), to tell the log's own fsyncs from the
+# other writes on the root disk (snapshots, recovery blobs). "1" is gp3 like the root volume;
 # "gp3:<iops>" is gp3 with that many IOPS at its floor's 125 MB/s;
 # "io2:<iops>" is an io2 volume (EBS's low-latency type) of that many IOPS.
 wal_disk=""
@@ -220,15 +220,14 @@ raft_dir=\$(. /etc/sandboxd/sandboxd.env; [ -s /etc/sandboxd/cluster.env ] && . 
 EOF
   [[ -n "$wal_disk" ]] && cat <<EOF
 # The Raft log on its own volume (AEROL_BENCH_SERVER_WAL_DISK): the launch's
-# second disk, linked in as raft-wal before sandboxd first opens the log.
+# second disk, named by SB_RAFT_WAL_DIR before sandboxd first opens the log.
 root_disk=\$(lsblk -no PKNAME "\$(findmnt -no SOURCE /)")
 for try in \$(seq 1 60); do
   dev=\$(lsblk -dpno NAME,TYPE | awk -v r="/dev/\$root_disk" '\$2 == "disk" && \$1 != r {print \$1; exit}')
   [ -n "\$dev" ] && break; sleep 1
 done
-rmdir "\$raft_dir/raft-wal" 2>/dev/null
 if [ -n "\$dev" ] && mkfs.ext4 -q "\$dev" && mkdir -p /mnt/wal && mount -o noatime "\$dev" /mnt/wal \\
-   && mkdir -p /mnt/wal/raft-wal "\$raft_dir" && ln -s /mnt/wal/raft-wal "\$raft_dir/raft-wal"; then
+   && mkdir -p /mnt/wal/raft-wal && echo SB_RAFT_WAL_DIR=/mnt/wal/raft-wal >> /etc/sandboxd/cluster.env; then
   echo "BENCHNODE $1 raft log on \$dev"
 else
   echo "BENCHNODE $1 raft log disk FAILED (\${dev:-no second disk})"
@@ -237,7 +236,9 @@ EOF
   cat <<EOF
 (start_sandboxd) > /var/log/sandboxd.log 2>&1 &
 until curl -fsS -o /dev/null http://127.0.0.1:21212/health; do sleep 1; done
-echo "BENCHNODE $1 up \$(date -u +%T); raft-wal in \$raft_dir on \$(df --output=source "\$raft_dir/raft-wal/" | tail -1), \$(ls "\$raft_dir/raft-wal/" | wc -l) files"
+# With SB_RAFT_WAL_DIR, raft-wal is a file naming the log's directory.
+wal="\$raft_dir/raft-wal"; [ -f "\$wal" ] && wal=\$(cat "\$wal")
+echo "BENCHNODE $1 up \$(date -u +%T); raft-wal in \$wal on \$(df --output=source "\$wal/" | tail -1), \$(ls "\$wal/" | wc -l) files"
 if [ "$1" = s1 ]; then
   # A token only once one comes back: right after /health the node may not
   # lead yet (503), and an empty answer must never be published.
