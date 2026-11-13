@@ -1273,8 +1273,12 @@ cert-manager renews ─► sandboxd reloads it per handshake (internal/cluster/t
   cluster with its certificate.
 - **Who may get a certificate.** Only the operator creates `Certificate`
   objects (its RBAC). What the bank's issuer will sign is the bank's
-  policy; the docs show a cert-manager approver-policy that limits these
-  URI SANs to the operator's ServiceAccount.
+  policy. The docs show a cert-manager approver-policy that limits these
+  URI SANs to AerolVM's two namespaces
+  (`charts/aerolvm/examples/approver-policy-external-ca.yaml`). It cannot
+  name the operator's ServiceAccount: cert-manager itself makes the request
+  for a `Certificate`, so the policy is bound to cert-manager's controller
+  and selects by namespace.
 - **Failure.** Issuer slow or down: `AerolNode` condition
   `CertificatePending`, an alert after 10 minutes; running nodes keep
   working, since their certificates are still valid (§14).
@@ -1283,9 +1287,21 @@ cert-manager renews ─► sandboxd reloads it per handshake (internal/cluster/t
   envtest (the operator makes, mounts and waits for the `Certificate`),
   and live on kind with a cert-manager CA `Issuer` standing in for the
   bank's issuer (`AEROL_FCKIND_PROOF=externalca`).
-- **Settled while building:** which parts of the bundle still travel in
-  this mode (the gossip key and key custody do; the PAT follows the
-  default mode's rule).
+- **Settled while building** (the C23 stack, #1252 onward):
+  - The bundle still carries the gossip key and the credential keys; the
+    PAT follows the default mode's rule.
+  - The `Certificate` keeps its key across renewals (`rotationPolicy:
+    Never`): the cluster pins the first key, and cert-manager's default
+    since v1.18 is a new key on every renewal.
+  - The pod's TLS dir is the Secret mounted at /var/run/aerolvm-tls
+    (`SB_CLUSTER_TLS_DIR`), not under /etc/sandboxd, which a server keeps
+    on its disk.
+  - Pods join through the servers' headless Service, so a server that is
+    down costs a refused dial, not the join.
+  - The mode is recorded on the `AerolCluster` (condition `ExternalCA`)
+    when server 0 starts it; turning it on or off later is refused.
+  - The chart grants the operator `Certificate` rights only in this mode.
+  - The alert reads `aerolvm_operator_node_certificates_pending`.
 
 ### 15.3 Network walls
 
