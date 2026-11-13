@@ -269,3 +269,16 @@ func TestMoveEntryRefusesBadRanges(t *testing.T) {
 		t.Fatalf("size %d", st.Size())
 	}
 }
+
+// A name that would leave its folder is refused before any file is made.
+func TestInside(t *testing.T) {
+	dir := t.TempDir()
+	if p, err := inside(dir, "snapshot.memory"); err != nil || p != filepath.Join(dir, "snapshot.memory") {
+		t.Fatalf("inside = %q, %v", p, err)
+	}
+	for _, name := range []string{"../x", "..", ".", "", "a/../../x"} {
+		if _, err := inside(dir, name); err == nil {
+			t.Errorf("%q was taken as a name inside %s", name, dir)
+		}
+	}
+}

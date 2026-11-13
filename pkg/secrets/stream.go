@@ -48,8 +48,7 @@ func streamKeyAAD(aad []byte) []byte {
 }
 
 func streamChunkAAD(aad []byte, counter uint64, last bool) []byte {
-	out := make([]byte, 0, len(aad)+9)
-	out = append(out, aad...)
+	out := append([]byte(nil), aad...)
 	out = binary.BigEndian.AppendUint64(out, counter)
 	if last {
 		return append(out, 1)
