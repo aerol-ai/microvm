@@ -600,3 +600,25 @@ func TestClusterWarmPoolSyncCarriesTheAgentSandboxDepths(t *testing.T) {
 		t.Fatalf("applied = %+v", last)
 	}
 }
+
+// A worker logs a warm-pool apply when what it applies changes, not on
+// every poll of a cluster that never had an entry (it answers in full).
+func TestWarmPoolApplyLogsOnlyAChange(t *testing.T) {
+	svc, c := newClusterWarmPoolService(t)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.RegisterWarmPool(newFakeWarmPool(), "gvisor")
+	empty := &cluster.WarmPoolReadResponse{Version: 0, Authoritative: true}
+	for range 3 {
+		c.answer = empty
+		svc.syncWarmPoolsLogged(context.Background())
+	}
+	if n := strings.Count(logs.String(), "warm pool entries applied"); n != 1 {
+		t.Fatalf("logged %d times for the same empty set", n)
+	}
+	c.answer = &cluster.WarmPoolReadResponse{Version: 5, Authoritative: true, Kube: []cluster.KubeWarmDepth{{Image: "a", Runtime: "gvisor", Depth: 1}}}
+	svc.syncWarmPoolsLogged(context.Background())
+	if n := strings.Count(logs.String(), "warm pool entries applied"); n != 2 {
+		t.Fatalf("a change was not logged (%d)", n)
+	}
+}

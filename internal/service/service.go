@@ -564,8 +564,11 @@ type Service struct {
 	warmPoolSyncVersion uint64
 	warmPoolSyncBehind  int
 	warmPoolSyncFailing bool
-	warmPoolKick        chan struct{}
-	warmPoolKickOnce    sync.Once
+	// warmPoolApplied is what the last warm-pool sync applied, so a sync
+	// that applies the same again logs nothing.
+	warmPoolApplied  string
+	warmPoolKick     chan struct{}
+	warmPoolKickOnce sync.Once
 
 	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
 	// index the request path reads; apiTokenMirror is the token copy on a

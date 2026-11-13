@@ -324,9 +324,16 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 	for _, reg := range pools {
 		reg.pool.SetConfigured(configuredFor(reg.runtime, entries, kube))
 	}
-	if s.logger != nil {
-		// Only on a change (ok): which pools park what is otherwise
-		// invisible on a worker.
+	// Logged when what is applied changes: which pools park what is
+	// otherwise invisible on a worker. A cluster that never had an entry
+	// answers every poll in full (version 0), so the answer alone is no
+	// sign of a change.
+	applied := fmt.Sprint(entries, kube)
+	s.warmPoolMu.Lock()
+	changed := applied != s.warmPoolApplied
+	s.warmPoolApplied = applied
+	s.warmPoolMu.Unlock()
+	if changed && s.logger != nil {
 		s.logger.Info("warm pool entries applied", "entries", len(entries), "agent_sandbox_depths", len(kube), "pools", len(pools))
 	}
 	return nil
