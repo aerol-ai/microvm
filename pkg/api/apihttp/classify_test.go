@@ -231,3 +231,20 @@ func TestClassifyIdempotencyKeyReusedMessage(t *testing.T) {
 		})
 	}
 }
+
+// fwdErr stands in for a server's refusal of a forwarded call
+// (cluster.statusError).
+type fwdErr struct{ status int }
+
+func (e fwdErr) Error() string        { return "cluster control-plane request failed" }
+func (e fwdErr) ForwardedStatus() int { return e.status }
+
+// A server's refusal of a call this node forwarded keeps its status.
+func TestClassifyForwardedRefusal(t *testing.T) {
+	if c := Classify(fmt.Errorf("join token: %w", fwdErr{412})); c.Status != http.StatusPreconditionFailed {
+		t.Fatalf("a forwarded 412 = %d", c.Status)
+	}
+	if c := Classify(fwdErr{0}); c.Status != http.StatusBadRequest || c.Kind != ErrKindUnclassified {
+		t.Fatalf("a forwarded error with no request status = %+v", c)
+	}
+}

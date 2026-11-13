@@ -1967,6 +1967,34 @@ func (e statusError) Is(target error) bool {
 	return false
 }
 
+// ForwardedStatus returns the 4xx a server answered a forwarded call with
+// when that refusal is about the request itself, so the caller gets the
+// server's status and not a 500; 0 otherwise. Any error in err's chain
+// with a ForwardedStatus method answers it (statusError does).
+func ForwardedStatus(err error) int {
+	var f interface{ ForwardedStatus() int }
+	if errors.As(err, &f) {
+		return f.ForwardedStatus()
+	}
+	return 0
+}
+
+// ForwardedStatus is e's status when it refuses the request itself (400,
+// 404, 409, 412, 422, 429). A refusal between nodes is left out: a 401 or
+// 403 on the peer's own credentials, or "peer not in membership"
+// (ErrMembershipPending), is not the caller's to fix.
+func (e statusError) ForwardedStatus() int {
+	if e.Is(ErrMembershipPending) {
+		return 0
+	}
+	switch e.status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusPreconditionFailed,
+		http.StatusUnprocessableEntity, http.StatusTooManyRequests:
+		return e.status
+	}
+	return 0
+}
+
 func isStatus(err error, status int) bool {
 	var se statusError
 	return errors.As(err, &se) && se.status == status
