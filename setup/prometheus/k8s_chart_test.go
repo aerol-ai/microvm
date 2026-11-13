@@ -804,6 +804,11 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 	crds := map[any]bool{}
 	for _, c := range docsOfKind(docs, "CustomResourceDefinition") {
 		crds[dig(c, "metadata", "name")] = true
+		// Without keep, turning the API off deletes the CRDs, and with
+		// them every stored template and warm pool.
+		if dig(c, "metadata", "annotations", "helm.sh/resource-policy") != "keep" {
+			t.Fatalf("CRD %v is not kept by helm", dig(c, "metadata", "name"))
+		}
 	}
 	if !crds["sandboxtemplates.k8s.aerolvm.io"] || !crds["sandboxwarmpools.k8s.aerolvm.io"] {
 		t.Fatalf("internal CRDs = %v", crds)
