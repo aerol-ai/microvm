@@ -201,6 +201,11 @@ func TestSetRunStatesThroughRaftAndTheGate(t *testing.T) {
 	if p, _ := c.fsm.get("sb-a"); p.RunState != RunStateSuspended || p.RunStateIndex == 0 {
 		t.Fatalf("row = %+v", p)
 	}
+	// The leader refuses a bad batch before it reaches Raft, as a follower
+	// and an Agent do.
+	if _, err := c.SetRunStates(ctx, []RunStateReport{{SandboxID: "sb-a"}}); !errors.Is(err, ErrBadRunStateBatch) {
+		t.Fatalf("a bad batch on the leader = %v", err)
+	}
 	if err := c.raft.raft.AddNonvoter("rs-gate-b", "127.0.0.1:1", 0, 0).Error(); err != nil {
 		t.Fatal(err)
 	}

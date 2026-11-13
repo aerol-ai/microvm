@@ -21,6 +21,10 @@ const (
 	PrincipalToken PrincipalKind = "token"
 	// PrincipalOIDC is an identity provider's signed token (task T6).
 	PrincipalOIDC PrincipalKind = "oidc"
+	// PrincipalKubernetes is a Kubernetes user the agent-sandbox API
+	// authenticated (front-proxy certificate) and Kubernetes RBAC allowed
+	// (C17); its id is "kubernetes:<user>".
+	PrincipalKubernetes PrincipalKind = "kubernetes"
 	// PrincipalControlPlane is a caller the managed provider's Validator
 	// resolved.
 	PrincipalControlPlane PrincipalKind = "controlplane"
