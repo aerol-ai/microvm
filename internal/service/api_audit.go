@@ -259,6 +259,7 @@ const (
 	systemActionRuntimeRemoved    = "runtime.removed"
 	systemActionFoundStopped      = "reconcile.found_stopped"
 	systemActionFailoverRecreated = "failover.recreated"
+	systemActionMoveRestored      = "move.restored"
 	systemActionFleetSuspend      = "fleet.suspend"
 	systemActionFleetDelete       = "fleet.delete"
 	systemActionMethod            = "SYSTEM"

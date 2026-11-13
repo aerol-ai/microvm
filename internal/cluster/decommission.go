@@ -124,6 +124,10 @@ type MoveAction struct {
 	Target string `json:"target,omitempty"`
 	// Source is import's: the node to pull the bundle from.
 	Source string `json:"source,omitempty"`
+	// Recreate is start-moved's: what the target rebuilds a gVisor sandbox
+	// from, out of the leader's full placement (a worker's placement reads
+	// carry no spec).
+	Recreate *MoveRecreate `json:"recreate,omitempty"`
 }
 
 // MoveActionResult answers a move action.
@@ -236,6 +240,9 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 	if !ok || !source.Alive {
 		return res, ErrNodeNotAlive
 	}
+	// Its capacity, labels included, comes in its heartbeats, not with
+	// gossip: whether it moves gVisor sandboxes is a label (checkpointMover).
+	source.Capacity = c.heartbeatCapacity(source)
 	limit := req.Max
 	if limit <= 0 {
 		limit = defaultEvacuateMoves
@@ -253,7 +260,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID || p.IsDeleting() {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p) {
+		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p, source) {
 			movable = append(movable, p)
 		} else {
 			others = append(others, id)
@@ -275,7 +282,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		go func(p Placement) {
 			defer wg.Done()
 			move := c.moveOne
-			if placementWantsSnapshotMove(p) {
+			if placementWantsSnapshotMove(p, source) {
 				move = c.moveSnapshotOne
 			}
 			results <- outcome{id: p.SandboxID, err: move(ctx, p, source)}
@@ -323,7 +330,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p) {
+		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p, source) {
 			res.RemainingMovable++
 		} else {
 			res.Remaining++
