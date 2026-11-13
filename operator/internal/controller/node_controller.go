@@ -74,7 +74,9 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups="",namespace=default,resources=services,resourceNames=kubernetes,verbs=get
 // +kubebuilder:rbac:groups=discovery.k8s.io,namespace=default,resources=endpointslices,resourceNames=kubernetes,verbs=get
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=servicecidrs,verbs=list
-// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;create;delete
+// The operator's client caches unstructured reads (main.go), so reading a
+// Certificate starts an informer: list and watch, in its two namespaces.
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;delete
 
 func (r *NodeReconciler) podNamespace(role string) string {
 	if role == v1.RoleWorker && r.WorkerNamespace != "" {

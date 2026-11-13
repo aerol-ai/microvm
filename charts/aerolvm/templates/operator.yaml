@@ -101,11 +101,12 @@ rules:
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
   {{- if $.Values.cluster.externalCA.issuerRef.name }}
-  # External-CA mode (C23): one Certificate per node pod. Only then: a
-  # Certificate can ask the bank's issuer to sign any name.
+  # External-CA mode (C23): one Certificate per node pod, read through the
+  # operator's cache (list, watch). Only then: a Certificate can ask the
+  # bank's issuer to sign any name.
   - apiGroups: [cert-manager.io]
     resources: [certificates]
-    verbs: [get, create, delete]
+    verbs: [get, list, watch, create, delete]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
