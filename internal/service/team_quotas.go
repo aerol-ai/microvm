@@ -331,8 +331,36 @@ func (s *Service) admitTeamQuotaResize(ctx context.Context, sandbox *models.Sand
 		return nil, fmt.Errorf("%w: record the new size: %v", ErrTeamQuotaUnavailable, err)
 	}
 	defer unlock()
-	spec := c.SpecOf(sandbox.ID)
-	if spec == nil {
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var (
+		held    *teamQuotaResize
+		missing bool
+	)
+	// edit runs again on a fresh copy if the leader refuses a write based on
+	// an old one (writeReplicatedSpec), so it decides from scratch each time.
+	err = s.writeReplicatedSpec(cluster.WithTeamQuotaAdmission(commitCtx), c, sandbox.ID, func(spec *models.CreateSandboxRequest) (bool, error) {
+		held, missing = nil, spec == nil
+		if spec == nil {
+			return false, nil
+		}
+		oldCPU, oldMem := models.QuotaSize(spec.CPU, spec.MemoryMB)
+		if req.CPU <= oldCPU && req.MemoryMB <= oldMem {
+			return false, nil
+		}
+		held = &teamQuotaResize{s: s, sandboxID: sandbox.ID, oldCPU: spec.CPU, oldMem: spec.MemoryMB}
+		// Each dimension holds the larger size; one that does not grow
+		// keeps the spec's own value, so a default stays a default.
+		if req.CPU > oldCPU {
+			spec.CPU = req.CPU
+		}
+		if req.MemoryMB > oldMem {
+			spec.MemoryMB = req.MemoryMB
+		}
+		held.wroteCPU, held.wroteMem = spec.CPU, spec.MemoryMB
+		return true, nil
+	})
+	if missing {
 		if req.CPU <= sandbox.CPU && req.MemoryMB <= sandbox.MemoryMB {
 			return nil, nil
 		}
@@ -342,23 +370,7 @@ func (s *Service) admitTeamQuotaResize(ctx context.Context, sandbox *models.Sand
 		// under: refuse unless the team has no quota at all.
 		return nil, s.refuseUnadmittableGrowth(ctx, team, sandbox.ID)
 	}
-	oldCPU, oldMem := models.QuotaSize(spec.CPU, spec.MemoryMB)
-	if req.CPU <= oldCPU && req.MemoryMB <= oldMem {
-		return nil, nil
-	}
-	held := &teamQuotaResize{s: s, sandboxID: sandbox.ID, oldCPU: spec.CPU, oldMem: spec.MemoryMB}
-	// Each dimension holds the larger size; one that does not grow keeps the
-	// spec's own value, so a default stays a default.
-	if req.CPU > oldCPU {
-		spec.CPU = req.CPU
-	}
-	if req.MemoryMB > oldMem {
-		spec.MemoryMB = req.MemoryMB
-	}
-	held.wroteCPU, held.wroteMem = spec.CPU, spec.MemoryMB
-	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := c.UpsertSpec(cluster.WithTeamQuotaAdmission(commitCtx), sandbox.ID, spec, cluster.PlacementSecrets{}); err != nil {
+	if err != nil {
 		if errors.Is(err, ErrTeamQuotaExceeded) {
 			return nil, err
 		}
@@ -406,12 +418,14 @@ func (s *Service) unwriteResizeSpec(r *teamQuotaResize) {
 		return
 	}
 	defer unlock()
-	spec := c.SpecOf(r.sandboxID)
-	if spec == nil || spec.CPU != r.wroteCPU || spec.MemoryMB != r.wroteMem {
-		return
-	}
-	spec.CPU, spec.MemoryMB = r.oldCPU, r.oldMem
-	if err := c.UpsertSpec(rbCtx, r.sandboxID, spec, cluster.PlacementSecrets{}); err != nil {
+	err = s.writeReplicatedSpec(rbCtx, c, r.sandboxID, func(spec *models.CreateSandboxRequest) (bool, error) {
+		if spec == nil || spec.CPU != r.wroteCPU || spec.MemoryMB != r.wroteMem {
+			return false, nil
+		}
+		spec.CPU, spec.MemoryMB = r.oldCPU, r.oldMem
+		return true, nil
+	})
+	if err != nil {
 		s.warnResizeSpecUndo(r.sandboxID, err)
 	}
 }

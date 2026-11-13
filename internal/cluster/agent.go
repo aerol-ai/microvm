@@ -652,6 +652,12 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 }
 
 func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return a.upsertSpec(ctx, sandboxID, spec, secrets, 0)
+}
+
+// upsertSpec is UpsertSpec with opUpsertSpec's version check
+// (spec_version_fence.go); expectedVersion 0 asks for none.
+func (a *Agent) upsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets, expectedVersion uint64) error {
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
@@ -678,15 +684,16 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		}
 	}
 	return a.applyCommand(ctx, command{
-		Op:                    opUpsertSpec,
-		SandboxID:             sandboxID,
-		Spec:                  QualifySpecName(spec, nameOwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
-		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
+		Op:                       opUpsertSpec,
+		SandboxID:                sandboxID,
+		Spec:                     QualifySpecName(spec, nameOwnerRef),
+		SecretRef:                secrets.Ref,
+		SecretVersion:            secrets.Version,
+		SecretRecipients:         normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:     secrets.SealGeneration,
+		IncarnationID:            strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:    strings.TrimSpace(secrets.IncarnationID),
+		ExpectedPlacementVersion: expectedVersion,
 	})
 }
 
@@ -1810,6 +1817,11 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// Idempotency-Key retry's re-reserve that hits it is routed to
 			// the reservation's owner, which keys off errors.Is.
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrSpecVersionConflict.Error()) {
+			// The spec version check across the same hop: the writer keys
+			// off errors.Is to read the spec again and redo its change.
+			return fmt.Errorf("%w: %s", ErrSpecVersionConflict, message)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementDeleted.Error()) {
 			// The deleted-lifecycle fence across the same hop: a worker's

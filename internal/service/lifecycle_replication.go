@@ -32,11 +32,10 @@ const lifecycleReplicationLag = time.Minute
 // time (persistSandboxCreate), so the replicated deadline is the same on
 // every node.
 //
-// On a worker the replicated spec is read from a random server, and a
-// follower serves it before it has applied the last write. So the call right
-// after a write can read the copy from before it and write again, with the
-// same content: a write is sometimes followed by one or two more, live
-// (UC-704) 2 entries for 100 calls in 5 s, against 100 before.
+// The decision is made on a copy no older than this node's last spec write
+// (writeReplicatedSpec). Before that, on a worker, the call right after a
+// write could read a follower's copy from before it and write again: live
+// (UC-704) 2 entries for 100 calls in 5 s instead of 1.
 func (s *Service) replicateRecoveryLifecycle(ctx context.Context, id string, sb *models.Sandbox, lc models.Lifecycle) {
 	sb, ok := s.recoverySpecWanted(ctx, id, sb)
 	if !ok {

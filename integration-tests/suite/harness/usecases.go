@@ -1222,6 +1222,7 @@ var Registry = []UseCase{
 	{ID: "UC-703", Title: "aerolvm upgrade plan <B> --from says WASM and isolate sandboxes keep running, and aerolvm upgrade apply <B> --from --wait on a single node keeps an ephemeral and a passivatable WASM sandbox and a jailed isolate running with their state (counter 3 then 4); then rollback puts A back", Requires: []Capability{CapWasm, CapIsolate, CapDocker}, Excludes: []Capability{CapCluster}, Implemented: true},
 	{ID: "UC-704", Title: "An E2B setTimeout keep-alive costs no Raft entry on a default sandbox and about one a minute on a failover=recreate sandbox (100 calls each on the owner's loopback, entries summed over every server, latency reported)", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-705", Title: "A failover recreate keeps the sandbox's E2B deadline and created_at (owner daemon killed; endAt and created_at read back on the new owner within 3 s)", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	{ID: "UC-706", Title: "Two changes to one sandbox's spec made back to back both stick: 20 resize-then-lifecycle pairs on a failover=recreate team sandbox, run on the owner's loopback, each leave the team charged for the new size (the lifecycle write no longer reads a follower's copy from before the resize and writes the old size back)", Requires: []Capability{CapCluster, CapDocker, CapIdentity}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
