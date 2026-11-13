@@ -82,8 +82,9 @@ func TestCertReloader(t *testing.T) {
 }
 
 type fakeKube struct {
-	fails int
-	calls int
+	kubeapi.ObjectStore // the store is not called here
+	fails               int
+	calls               int
 }
 
 func (k *fakeKube) FrontProxyConfig(context.Context) (*kubeapi.FrontProxy, error) {
@@ -150,7 +151,7 @@ func (nopBackend) Create(context.Context, string, models.CreateSandboxRequest, s
 }
 func (nopBackend) Delete(context.Context, string, string) error           { return nil }
 func (nopBackend) SetRunning(context.Context, string, string, bool) error { return nil }
-func (nopBackend) Specs(context.Context, []string) map[string]kubeapi.SpecSummary {
+func (nopBackend) Specs(context.Context, []kubeapi.SpecRef) map[string]kubeapi.SpecSummary {
 	return nil
 }
 

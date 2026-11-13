@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"slices"
 
@@ -35,7 +36,9 @@ type SpecSummary struct {
 	CPU      float64  `json:"cpu,omitempty"`
 	MemoryMB int      `json:"memory_mb,omitempty"`
 	Command  []string `json:"command,omitempty"`
-	Version  uint64   `json:"version"`
+	// Tags are shown as the object's labels; a claim's tags mark it as one.
+	Tags    map[string]string `json:"tags,omitempty"`
+	Version uint64            `json:"version"`
 }
 
 // SpecSummariesRequest names the sandboxes.
@@ -56,7 +59,7 @@ type SpecSummaryReader interface {
 
 func summarizeSpec(spec *models.CreateSandboxRequest, version uint64) SpecSummary {
 	return SpecSummary{Image: spec.Image, Runtime: spec.Runtime, CPU: spec.CPU, MemoryMB: spec.MemoryMB,
-		Command: slices.Clone(spec.ContainerCommand), Version: version}
+		Command: slices.Clone(spec.ContainerCommand), Tags: maps.Clone(spec.Tags), Version: version}
 }
 
 func validSpecSummaryBatch(ids []string) error {

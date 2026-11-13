@@ -35,6 +35,8 @@ import (
 type kubeClient interface {
 	FrontProxyConfig(ctx context.Context) (*kubeapi.FrontProxy, error)
 	SubjectAccessReview(ctx context.Context, u kubeapi.User, a kubeapi.Attributes) (bool, string, error)
+	// The templates and warm pools, kept in the internal CRDs.
+	kubeapi.ObjectStore
 }
 
 // newKubeClient is the in-cluster client; tests replace it.
@@ -146,7 +148,7 @@ func startAgentSandboxAPI(ctx context.Context, cfg config.Config, c cluster.Clie
 	}
 	hub := kubeview.New(kubeview.Options{})
 	if !hub.Follow(ctx, feed) {
-		return nil, errors.New("agent-sandbox API: the placement feed is off (SB_INGRESS_PROXY_ROUTING=false)")
+		return nil, errors.New("agent-sandbox API: this node runs no placement feed")
 	}
 	fp := &frontProxyHolder{}
 	go fp.load(ctx, kc, logger)
@@ -157,6 +159,7 @@ func startAgentSandboxAPI(ctx context.Context, cfg config.Config, c cluster.Clie
 			Auth:    fp,
 			Authz:   &kubeapi.CachedAuthorizer{Next: kubeapi.AuthorizerFunc(kc.SubjectAccessReview), TTL: 10 * time.Second},
 			Backend: backend,
+			Store:   kc,
 			Owners:  kubeapi.OwnerMap{Explicit: cfg.AgentSandboxAPINamespaces},
 		},
 		TLSConfig:         agentSandboxTLS(&certReloader{certFile: cfg.AgentSandboxAPICertFile, keyFile: cfg.AgentSandboxAPIKeyFile}, fp),
