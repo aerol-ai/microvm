@@ -652,3 +652,47 @@ func TestDiscoveryWithoutAUser(t *testing.T) {
 		t.Fatalf("a resource without a user = %d", rr.Code)
 	}
 }
+
+// The end of the initial list comes where the hub's replay ends, even while
+// changes keep arriving: a quiet spell never has to happen first (the old
+// guess waited for 10 ms without an event, which a busy cluster may never
+// give).
+func TestServerWatchInitialEndUnderChurn(t *testing.T) {
+	r := newRig(t, p("sb-1", "web", "team:a", 3))
+	stopChurn := make(chan struct{})
+	churned := make(chan struct{})
+	go func() {
+		defer close(churned)
+		for v := uint64(100); ; v++ {
+			select {
+			case <-stopChurn:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			row := p("sb-1", "web", "team:a", v)
+			r.hub.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{{SandboxID: "sb-1", Index: v, Placement: &row}}, Next: v})
+		}
+	}()
+	defer func() { close(stopChurn); <-churned }()
+	time.Sleep(20 * time.Millisecond)
+	ch, stop := watchLines(t, r, "/sandboxes?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true")
+	defer stop()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatal("the watch ended before the end of the initial list")
+			}
+			if ev["type"] != "BOOKMARK" {
+				continue
+			}
+			md := ev["object"].(map[string]any)["metadata"].(map[string]any)
+			if ann, _ := md["annotations"].(map[string]any); ann[initialEventsEnd] == "true" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no end of the initial list while changes kept arriving")
+		}
+	}
+}

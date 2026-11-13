@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/kubeview"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -351,61 +350,27 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 	if err != nil {
 		return err
 	}
-	var from uint64
-	if rv := firstOf(q["resourceVersion"]); rv != "" && rv != "0" {
-		if from, err = strconv.ParseUint(rv, 10, 64); err != nil {
-			return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "resourceVersion: not a number"}
-		}
-	}
-	length := defaultWatchLength
-	if v := firstOf(q["timeoutSeconds"]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			length = time.Duration(n) * time.Second
-		}
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), length)
-	defer cancel()
-	events, err := s.Hub.Watch(ctx, owner, from)
-	if err != nil {
-		return hubError(err)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-	if flusher != nil {
-		// Headers now: a quiet watch must not leave the client waiting for
-		// its response.
-		flusher.Flush()
-	}
-	enc := json.NewEncoder(w)
-	for ev := range events {
-		if ev.Type == kubeview.Closed {
-			if se, ok := hubError(ev.Err).(*StatusError); ok {
-				_ = enc.Encode(WatchEvent{Type: "ERROR", Object: statusOf(se)})
-			}
-			return nil
-		}
+	return s.streamWatch(w, r, owner, q, func(ctx context.Context, ev kubeview.Event) any {
 		n := ns
 		if n == "" {
 			n, _ = s.Owners.Namespace(ev.Item.Placement.OwnerRef)
 		}
 		if n == "" {
-			continue
+			return nil
 		}
 		sp, ok := s.Backend.Specs(ctx, specRefs(ev.Item))[ev.Item.Placement.SandboxID]
 		if !isClaim(sp, ok) {
-			continue
-		}
-		c := claimFrom(ev.Item, n, &sp)
-		if !lq.keepClaim(c) {
-			continue
-		}
-		if err := enc.Encode(WatchEvent{Type: string(ev.Type), Object: c}); err != nil {
 			return nil
 		}
-		if flusher != nil {
-			flusher.Flush()
+		if c := claimFrom(ev.Item, n, &sp); lq.keepClaim(c) {
+			return c
 		}
-	}
-	return nil
+		return nil
+	}, func(rv uint64, end bool) any {
+		md := map[string]any{"resourceVersion": strconv.FormatUint(rv, 10)}
+		if end {
+			md["annotations"] = map[string]string{initialEventsEnd: "true"}
+		}
+		return map[string]any{"apiVersion": ExtensionsAPIVersion(), "kind": SandboxClaimKind, "metadata": md}
+	})
 }

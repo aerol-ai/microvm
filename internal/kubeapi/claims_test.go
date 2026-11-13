@@ -275,3 +275,43 @@ func TestClaimSelectors(t *testing.T) {
 		t.Fatalf("a watch for other saw %v", got)
 	}
 }
+
+// kubectl wait sandboxclaim/x asks for the initial list and waits for the
+// bookmark that ends it (p6-kubeapi-4 timed out without one).
+func TestClaimWatchInitialEvents(t *testing.T) {
+	r := claimRig(t, "")
+	if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", claimBody); rr.Code != http.StatusCreated {
+		t.Fatalf("create = %d", rr.Code)
+	}
+	ts := httptest.NewServer(r.srv)
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+ext+"/namespaces/a/sandboxclaims?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Djob&timeoutSeconds=5", nil)
+	req.Header.Set("X-Test-User", "alice")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var seen []string
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		var ev map[string]any
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+		obj := ev["object"].(map[string]any)
+		if ev["type"] == "BOOKMARK" {
+			md := obj["metadata"].(map[string]any)
+			ann, _ := md["annotations"].(map[string]any)
+			if obj["kind"] != SandboxClaimKind || ann[initialEventsEnd] != "true" {
+				t.Fatalf("bookmark = %v", obj)
+			}
+			if strings.Join(seen, ",") != "ADDED job" {
+				t.Fatalf("before the end of the initial list: %v", seen)
+			}
+			return
+		}
+		seen = append(seen, ev["type"].(string)+" "+objName(ev))
+	}
+	t.Fatalf("no end of the initial list; saw %v", seen)
+}
