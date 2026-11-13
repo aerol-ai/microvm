@@ -212,7 +212,7 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	f.mu.Lock()
 	next := make(map[string]Placement, len(walked))
 	for _, p := range walked {
-		if cur, ok := next[p.SandboxID]; !ok || p.Version >= cur.Version {
+		if cur, ok := next[p.SandboxID]; !ok || placementAtLeast(p, cur) {
 			next[p.SandboxID] = p
 		}
 	}
@@ -267,7 +267,8 @@ func (a *Agent) fetchPlacementChanges(ctx context.Context, since uint64, wait ti
 }
 
 // applyPlacementChanges merges one delta and reports whether anything
-// changed. Merge rule: keep the higher Version. A delete removes the row
+// changed. Merge rule: keep the higher Version, and at the same Version the
+// later run state (placementAtLeast). A delete removes the row
 // only if the row is not newer than the delete (a delete older than a
 // re-create cannot remove it).
 func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChangesResponse) bool {
@@ -283,7 +284,7 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 				changed = true
 			}
 		case ch.Placement != nil:
-			if !ok || ch.Placement.Version >= cur.Version {
+			if !ok || placementAtLeast(*ch.Placement, cur) {
 				f.rows[ch.SandboxID] = *ch.Placement
 				seen = append(seen, *ch.Placement)
 				changed = true

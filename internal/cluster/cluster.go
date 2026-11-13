@@ -523,6 +523,13 @@ type Placement struct {
 	// cancels expired reservations and completes abandoned exact-lifecycle
 	// deletes after their finalization lease expires.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// RunState is the run state the owner last reported (opSetRunStates,
+	// fsm_run_state.go); empty until it reports one. RunStateIndex is the
+	// Raft index of that report. Neither moves Version: merge two copies of
+	// a row with placementAtLeast.
+	RunState       RunState `json:"run_state,omitempty"`
+	RunStateReason string   `json:"run_state_reason,omitempty"`
+	RunStateIndex  uint64   `json:"run_state_index,omitempty"`
 }
 
 // AuditACL is the minimal post-delete existence/authorization and evidence-node

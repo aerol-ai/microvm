@@ -264,3 +264,51 @@ func TestCapacityHidesWarmPoolsFromNonAdmins(t *testing.T) {
 		}
 	}
 }
+
+// runStateStubCluster records the batch an owner sends.
+type runStateStubCluster struct {
+	*cluster.Noop
+	got []cluster.RunStateReport
+	err error
+}
+
+func (s *runStateStubCluster) SetRunStates(_ context.Context, reports []cluster.RunStateReport) (int, error) {
+	s.got = reports
+	return len(reports), s.err
+}
+
+func TestClusterInternalRunStates(t *testing.T) {
+	stub := &runStateStubCluster{Noop: cluster.NewNoop("srv", "http://srv", "")}
+	h := newOwnedRecoveryHandlers(t, stub)
+	call := func(h *handlers, body string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		h.clusterInternalRunStates(rr, withPeer(httptest.NewRequest(http.MethodPost, cluster.PublicInternalRunStatesPath, strings.NewReader(body)), "wrk-a"))
+		return rr
+	}
+	batch := `{"reports":[{"sandbox_id":"sb-a","incarnation_id":"inc-a","owner_node_id":"wrk-a","state":"suspended"}]}`
+	rr := call(h, batch)
+	var out cluster.RunStateWriteResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if rr.Code != http.StatusOK || out.Applied != 1 || len(stub.got) != 1 || stub.got[0].State != cluster.RunStateSuspended {
+		t.Fatalf("batch = %d %+v %+v", rr.Code, out, stub.got)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		body string
+		want int
+	}{
+		{"bad JSON", nil, "x", http.StatusBadRequest},
+		{"bad batch", cluster.ErrBadRunStateBatch, batch, http.StatusBadRequest},
+		{"transient", errors.New("raft apply timed out"), batch, http.StatusServiceUnavailable},
+	} {
+		stub.err = tc.err
+		if rr := call(h, tc.body); rr.Code != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, rr.Code, tc.want)
+		}
+	}
+	stateless := newOwnedRecoveryHandlers(t, cluster.NewNoop("srv", "http://srv", ""))
+	if rr := call(stateless, batch); rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stateless = %d", rr.Code)
+	}
+}
