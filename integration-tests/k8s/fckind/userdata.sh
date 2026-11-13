@@ -28,7 +28,25 @@ proof_move() {
     curl -fsS -m 3 -o /dev/null http://127.0.0.1:$port/health 2>/dev/null && break
   done
   api() { curl -sS -m 900 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
-  say "members: $(api http://127.0.0.1:$port/v1/cluster/members | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("members", d); print(" ".join(x["node_id"]+"/"+x.get("role","")+("/alive" if x.get("alive") else "") for x in m))')"
+  members() { api http://127.0.0.1:$port/v1/cluster/members | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("members", d); print(" ".join(x["node_id"]+"/"+x.get("role","")+("/alive" if x.get("alive") else "") for x in m))'; }
+  # The AerolCluster is Ready before every worker has joined gossip: a
+  # move needs two.
+  local m="" n=0
+  for _ in $(seq 1 60); do
+    m=$(members 2>/dev/null)
+    n=$(tr ' ' '\n' <<<"$m" | grep -c '/worker/alive')
+    [ "$n" -ge 2 ] && break
+    sleep 5
+  done
+  say "members: $m"
+  if [ "$n" -lt 2 ]; then
+    $kc get aerolnodes,pods -o wide 2>&1 | sed 's/^/FCK   /'
+    for w in $($kc get pods -o name | grep worker | head -2); do
+      $kc logs $w -c preflight 2>&1 | tail -5 | sed "s|^|FCK   ${w#pod/} preflight: |"
+      $kc logs $w -c agent 2>&1 | tail -10 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent: |"
+    done
+    return
+  fi
   local out id owner owner2 i
   out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
   id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
@@ -96,6 +114,10 @@ s = re.sub(r'(?m)^  diskFloorRatio: "[0-9.]+"', '  diskFloorRatio: "0"', s, coun
 open(p, "w").write(s)
 PY
   grep -A1 '^  firecracker:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
+  # The dev pool advertises its runtimes (SB_HOST_RUNTIMES); placement
+  # sends a Firecracker create only to a pool that names it.
+  sed -i 's/runtimes: \[runc, gvisor\]/runtimes: [runc, gvisor, firecracker]/' scripts/k8s-dev.sh
+  grep 'runtimes:' scripts/k8s-dev.sh | sed 's/^/FCK pool: /'
   export AEROL_K8S_MODE=cluster
 fi
 git init -q && git add -A >/dev/null 2>&1 && git -c user.email=fck@localhost -c user.name=fck commit -qm src >/dev/null 2>&1
