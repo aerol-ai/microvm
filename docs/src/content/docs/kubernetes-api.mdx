@@ -233,10 +233,16 @@ The claim makes a sandbox with the claim's name, here `job-42`. Deleting the cla
 
 A sandbox is not a pod. AerolVM refuses a field it cannot honor, and names the field in the error, instead of quietly ignoring it. Anything not listed here is refused. The list follows agent-sandbox v1.0.11; a field's upstream default is always accepted when written out.
 
+Of the 133 objects in agent-sandbox v1.0.11's own examples, 52 work as written, `hello-world` among them. The rest use a refused field, most often volumes, probes or a security context.
+
 | Kind | Field | Supported |
 |---|---|---|
 | Sandbox, Template | `metadata.name`, `generateName`, `labels`, `annotations` | Yes. Labels become the sandbox's [tags](/sandbox-tags/). Annotations are accepted and not kept. |
-| Sandbox, Template | `podTemplate.spec.containers` | Exactly one container: `name`, `image`, `command`, `args`, `env` (name and value), and `resources` (`cpu` and `memory`, from limits or requests). |
+| Sandbox, Template | `podTemplate.spec.containers` | Exactly one container: `name`, `image`, `command`, `args`, `env` (name and value), and `resources`: `cpu`, `memory`, and `ephemeral-storage` (the sandbox's disk, rounded up to whole GiB), from limits or requests, as strings or plain numbers. |
+| Sandbox, Template | `containers[].ports` | `name`, `containerPort`, `protocol`. They are information, as in Kubernetes. A `hostPort` is refused. |
+| Sandbox, Template | `containers[].imagePullPolicy` | Unset or `IfNotPresent`: AerolVM pulls an image the machine does not have. |
+| Sandbox, Template | `podTemplate.spec.restartPolicy` | Unset or `Never`. AerolVM runs the command once and never restarts it; the sandbox stays up after the command exits. |
+| Sandbox, Template | `podTemplate.spec.automountServiceAccountToken` | Unset or `false`. A sandbox never gets a Kubernetes token. |
 | Sandbox, Template | `podTemplate.spec.runtimeClassName` | `gvisor` (or `runsc`), `firecracker`, `docker` (or `runc`). |
 | Sandbox, Template | `podTemplate.metadata` | `labels` become tags too; the sandbox's own labels win a clash. `annotations` are accepted and not kept. |
 | Sandbox | `spec.operatingMode` | `Running` or `Suspended`. A sandbox is created `Running`. |

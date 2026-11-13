@@ -38,11 +38,18 @@ var fieldTable = map[string]any{
 					"name": true, "image": true, "command": true, "args": true,
 					"env": []any{map[string]any{"name": true, "value": true}},
 					"resources": map[string]any{
-						"limits":   map[string]any{"cpu": true, "memory": true},
-						"requests": map[string]any{"cpu": true, "memory": true},
+						"limits":   map[string]any{"cpu": true, "memory": true, "ephemeral-storage": true},
+						"requests": map[string]any{"cpu": true, "memory": true, "ephemeral-storage": true},
 					},
+					// Declared ports are information, in Kubernetes too: a
+					// port not listed is still reachable. A hostPort would
+					// bind the machine, and is refused.
+					"ports":           []any{map[string]any{"name": true, "containerPort": true, "protocol": true}},
+					"imagePullPolicy": true,
 				}},
-				"runtimeClassName": true,
+				"runtimeClassName":             true,
+				"automountServiceAccountToken": true,
+				"restartPolicy":                true,
 			},
 		},
 		"shutdownTime":    true,
@@ -188,10 +195,10 @@ func createRequest(sb *Sandbox, now time.Time, random func() string) (models.Cre
 	if r := c.Resources; r != nil {
 		pick := func(key string) (string, string) {
 			if v, ok := r.Limits[key]; ok {
-				return v, "limits." + key
+				return string(v), "limits." + key
 			}
 			if v, ok := r.Requests[key]; ok {
-				return v, "requests." + key
+				return string(v), "requests." + key
 			}
 			return "", ""
 		}
@@ -209,6 +216,32 @@ func createRequest(sb *Sandbox, now time.Time, random func() string) (models.Cre
 			}
 			req.MemoryMB = mb
 		}
+		if v, at := pick("ephemeral-storage"); v != "" {
+			mb, err := ParseMemoryMB(v)
+			if err != nil {
+				bad("spec.podTemplate.spec.containers[0].resources.%s: %v", at, err)
+			}
+			// The sandbox's disk, in whole GiB, rounded up.
+			req.DiskGB = (mb + 1023) / 1024
+		}
+	}
+	// AerolVM pulls an image when the machine does not have it: that is
+	// IfNotPresent. Always and Never would ask for something else.
+	switch c.ImagePullPolicy {
+	case "", "IfNotPresent":
+	default:
+		bad("spec.podTemplate.spec.containers[0].imagePullPolicy: only IfNotPresent is supported (AerolVM pulls an image the machine does not have)")
+	}
+	// The sandbox's agent (toolboxd) starts the command once and never
+	// restarts it; the sandbox stays up after it exits. That is Never.
+	switch sb.Spec.PodTemplate.Spec.RestartPolicy {
+	case "", "Never":
+	default:
+		bad("spec.podTemplate.spec.restartPolicy: only Never is supported (AerolVM runs the command once; the sandbox stays up after it exits)")
+	}
+	// A sandbox never gets a Kubernetes service account token.
+	if t := sb.Spec.PodTemplate.Spec.AutomountServiceAccountToken; t != nil && *t {
+		bad("spec.podTemplate.spec.automountServiceAccountToken: a sandbox gets no Kubernetes service account; use AerolVM's cloud identity")
 	}
 	runtime, err := RuntimeFor(sb.Spec.PodTemplate.Spec.RuntimeClassName)
 	if err != nil {

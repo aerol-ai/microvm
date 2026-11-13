@@ -10,6 +10,11 @@
 // client library would pull hundreds of packages into every sandboxd.
 package kubeapi
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // The upstream group versions this API serves.
 const (
 	Group             = "agents.x-k8s.io"
@@ -79,24 +84,46 @@ type EnvVar struct {
 
 // ResourceRequirements is corev1.ResourceRequirements for cpu and memory.
 type ResourceRequirements struct {
-	Limits   map[string]string `json:"limits,omitempty"`
-	Requests map[string]string `json:"requests,omitempty"`
+	Limits   map[string]Quantity `json:"limits,omitempty"`
+	Requests map[string]Quantity `json:"requests,omitempty"`
+}
+
+// Quantity is a Kubernetes resource quantity. A manifest may write it as a
+// string ("500m", "1Gi") or a plain number (2), as Kubernetes accepts.
+type Quantity string
+
+// UnmarshalJSON takes a string or a number.
+func (q *Quantity) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*q = Quantity(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("a quantity is a string or a number, not %s", b)
+	}
+	*q = Quantity(n.String())
+	return nil
 }
 
 // Container is the subset of corev1.Container this API accepts and shows.
 type Container struct {
-	Name      string                `json:"name"`
-	Image     string                `json:"image,omitempty"`
-	Command   []string              `json:"command,omitempty"`
-	Args      []string              `json:"args,omitempty"`
-	Env       []EnvVar              `json:"env,omitempty"`
-	Resources *ResourceRequirements `json:"resources,omitempty"`
+	Name            string                `json:"name"`
+	Image           string                `json:"image,omitempty"`
+	ImagePullPolicy string                `json:"imagePullPolicy,omitempty"`
+	Command         []string              `json:"command,omitempty"`
+	Args            []string              `json:"args,omitempty"`
+	Env             []EnvVar              `json:"env,omitempty"`
+	Resources       *ResourceRequirements `json:"resources,omitempty"`
 }
 
 // PodSpec is the subset of corev1.PodSpec this API accepts and shows.
 type PodSpec struct {
-	Containers       []Container `json:"containers"`
-	RuntimeClassName string      `json:"runtimeClassName,omitempty"`
+	Containers                   []Container `json:"containers"`
+	RuntimeClassName             string      `json:"runtimeClassName,omitempty"`
+	AutomountServiceAccountToken *bool       `json:"automountServiceAccountToken,omitempty"`
+	RestartPolicy                string      `json:"restartPolicy,omitempty"`
 }
 
 // PodMetadata is the upstream PodMetadata.

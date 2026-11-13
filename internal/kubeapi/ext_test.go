@@ -147,6 +147,10 @@ func TestExtensionsTemplatesAndPools(t *testing.T) {
 	if rr, out := r.call(t, http.MethodDelete, ext+"/namespaces/a/sandboxwarmpools/pool", ""); rr.Code != http.StatusOK || out["status"] != "Success" {
 		t.Fatalf("delete = %d %v", rr.Code, out)
 	}
+	// The table and the trial create both see a pod field: it is named once.
+	if _, out := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxtemplates", `{"metadata":{"name":"x"},"spec":{"podTemplate":{"spec":{"volumes":[],"containers":[{"name":"m","image":"x"}]}}}}`); strings.Count(out["message"].(string), "spec.podTemplate.spec.volumes") != 1 {
+		t.Fatalf("a refused field named more than once: %v", out["message"])
+	}
 	for name, tc := range map[string]struct {
 		method, path, body string
 		code               int
