@@ -327,9 +327,13 @@ proof_externalca() {
   local s0=aerolvm-server-0
   say "server 0 TLS dir: $($kc exec $s0 -c agent -- ls /var/run/aerolvm-tls 2>&1 | tr '\n' ' ')"
   say "server 0 settings: $($kc exec $s0 -c agent -- sh -c 'grep -h "^SB_CLUSTER_EXTERNAL_CA\|^SB_CLUSTER_TLS_DIR" /etc/sandboxd/*.env' 2>&1 | sort -u | tr '\n' ' ')"
-  local cakeys=0 p
+  # Counted in the pod, which always prints one number: arithmetic on
+  # anything else would make bash drop the rest of this proof.
+  local cakeys=0 p c
   for p in $($kc get pods -l app.kubernetes.io/component=server -o name); do
-    cakeys=$((cakeys + $($kc exec ${p#pod/} -c agent -- sh -c 'ls -R /etc/sandboxd /var/lib/sandboxd /var/run/aerolvm-tls 2>/dev/null | grep -c "^ca\.key$"' 2>/dev/null || echo 0)))
+    c=$($kc exec ${p#pod/} -c agent -- sh -c 'ls -R /etc/sandboxd /var/lib/sandboxd /var/run/aerolvm-tls 2>/dev/null | grep -c "^ca\.key$"; true' 2>/dev/null | head -1)
+    [[ "$c" =~ ^[0-9]+$ ]] || { bad "could not look for a CA key in ${p#pod/}"; c=0; }
+    cakeys=$((cakeys + c))
   done
   [ "$cakeys" -eq 0 ] && ok "no CA key on any server" || bad "$cakeys ca.key files on the servers"
   local w
@@ -502,7 +506,7 @@ dump_externalca() {
 if [ -e /dev/kvm ]; then say "machine: /dev/kvm present, $(grep -c -w vmx /proc/cpuinfo) cpus with vmx, kernel $(uname -r)"; else say "machine: /dev/kvm ABSENT"; finish; fi
 
 say "installing docker and the tools"
-dnf -y -q install docker git tar gzip iptables perl-Digest-SHA >/dev/null 2>&1 || say "dnf install failed"
+dnf -y -q install docker git tar gzip iptables perl-Digest-SHA openssl >/dev/null 2>&1 || say "dnf install failed"
 systemctl start docker || { say "docker did not start"; finish; }
 pinned() { # <file> <url> <sha256>
   curl -fsSL --retry 5 -o "$1" "$2" && echo "$3  $1" | sha256sum -c --quiet - || { say "download failed or checksum wrong: $2"; finish; }
@@ -575,6 +579,9 @@ say "built and installed in $(( $(date +%s) - t0 ))s"
 [ "$proof" = gmove ] && { proof_move gvisor; finish; }
 [ "$proof" = kubeapi ] && { proof_kubeapi; finish; }
 [ "$proof" = externalca ] && { proof_externalca; finish; }
+# A proof that stops part way (bash drops the rest of a command on an
+# expansion error) must not run on into the pod proof below.
+[ "$proof" = pod ] || { say "the $proof proof stopped part way"; finish; }
 
 k() { kubectl --context kind-aerolvm -n aerolvm "$@"; }
 pod=aerolvm-0
