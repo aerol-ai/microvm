@@ -238,6 +238,8 @@ type command struct {
 	// WarmPool carries the entry for opPutWarmPool, and its image for
 	// opDeleteWarmPool (fsm_warm_pools.go).
 	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
+	// KubeWarm carries opSetKubeWarmDepths' whole set (fsm_kube_warm.go).
+	KubeWarm []KubeWarmDepth `json:"kube_warm,omitempty"`
 	// RunStates carries opSetRunStates' batch (fsm_run_state.go).
 	RunStates []RunStateReport `json:"run_states,omitempty"`
 	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
@@ -639,6 +641,10 @@ type placementFSM struct {
 	// of the last change to them, the cursor workers poll with.
 	warmPools        map[string]*WarmPoolRecord
 	warmPoolsVersion uint64
+	// kubeWarm is the agent-sandbox API's warm-pool depths, by image and
+	// runtime (fsm_kube_warm.go, snapshotted). A change to it moves
+	// warmPoolsVersion too: workers read both in one poll.
+	kubeWarm []KubeWarmDepth
 	// identity is the cloud-identity signing keys and role allow lists
 	// (fsm_identity.go, snapshotted). nil until the first write.
 	identity *identityState
@@ -2064,6 +2070,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return nil
+	case opSetKubeWarmDepths:
+		result, err := f.applySetKubeWarmDepthsLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
 	case opSetRunStates:
 		result, err := f.applySetRunStatesLocked(cmd)
 		if err != nil {
@@ -4070,6 +4082,10 @@ type fsmSnapshotPayload struct {
 	// because no entry can be written until every server runs a build with
 	// it (warmPoolFSMOpsVersion).
 	WarmPools []WarmPoolRecord
+	// KubeWarm is the agent-sandbox API's warm-pool depths. Optional, as
+	// WarmPools; nothing is written until every server applies
+	// opSetKubeWarmDepths (kubeWarmFSMOpsVersion).
+	KubeWarm []KubeWarmDepth
 	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
 	// (sealed) and role allow lists. Optional; an older snapshot decodes
 	// them as nil, which reads as "no keys, no roles".
@@ -4188,6 +4204,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
 		warmPools:          f.warmPoolsSnapshotLocked(),
+		kubeWarm:           f.kubeWarmSnapshotLocked(),
 		identityKeys:       identityKeys,
 		identityRoles:      identityRoles,
 		deniedNodes:        f.deniedNodesSnapshotLocked(),
@@ -4296,6 +4313,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.restoreTeamQuotasLocked(payload.TeamQuotas)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
+	f.restoreKubeWarmLocked(payload.KubeWarm)
 	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
 	f.restoreJoinStateLocked(payload.JoinTokens, payload.AdmittedNodes, payload.RevokedKeys)
 	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version, len(payload.RevokedKeys) > 0)
@@ -4455,6 +4473,7 @@ type fsmSnapshot struct {
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
 	warmPools          []WarmPoolRecord
+	kubeWarm           []KubeWarmDepth
 	identityKeys       *cloudidentity.KeySet
 	identityRoles      []IdentityRoleRecord
 	teamQuotas         []TeamQuotaRecord
@@ -4504,6 +4523,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,
 		WarmPools:          s.warmPools,
+		KubeWarm:           s.kubeWarm,
 		IdentityKeys:       s.identityKeys,
 		IdentityRoles:      s.identityRoles,
 		TeamQuotas:         s.teamQuotas,

@@ -1409,9 +1409,13 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   controller's own Pods and Services, which AerolVM does not make, so the
   examples are the gate; the kind proof also runs upstream's hello-world
   as written.
-- **Not built yet:** warm pools pre-starting sandboxes (a claim
-  cold-starts; the plan is to sum `replicas` per image into the FSM's
-  warm-pool entries, next to the operator's own).
+- **Warm pools pre-start sandboxes** (a follow-up): the gateways sum
+  `replicas` per template image and runtime and write the set to the FSM
+  (`opSetKubeWarmDepths`, fv 20), next to the operator's own entries and
+  never among them; each worker of that runtime parks that many slots.
+  `replicas` is per worker, as AerolVM's warm pools are (upstream counts
+  the cluster); only templates on the image's own entrypoint are parked,
+  since a parked slot cannot run another command.
 - **The claim mark rides the placement row** (a follow-up):
   `Placement.KubeClaim`, derived from the spec's claim tag wherever the hot
   row is, so a claim list and watch read the spec of claims only, not of
@@ -1423,6 +1427,7 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   refused; env, disk and shutdown time are not shown, so they are not
   compared, and a `Warning` says so. Env is never hashed to compare it:
   no server holds it in the clear.
+- Every item §16.1 listed as not built is now built.
 
 ---
 

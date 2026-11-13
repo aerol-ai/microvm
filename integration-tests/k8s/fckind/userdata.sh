@@ -293,8 +293,84 @@ YAML
   say "its sandbox: $($kk -n dev get sandbox job -o jsonpath='{.metadata.labels}' 2>&1 | head -c 300)"
   say "templates and pools: $($kk -n dev get sandboxtemplates,sandboxwarmpools --no-headers 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
   say "claim delete: $($kk -n dev delete sandboxclaim job --timeout=120s 2>&1 | head -c 200)"
+  proof_kubewarm
   [ "$ok" = 1 ] || return
   dumpapi
+}
+
+# proof_kubewarm: a warm pool keeps sandboxes ready (C17 follow-up). Its
+# template runs the image's own entrypoint, on the workers' default runtime
+# (runc in k8s-dev's pool); each worker parks replicas slots, and a claim
+# takes one: the workers' containerd pool hits go up.
+proof_kubewarm() {
+  local kk="kubectl --context kind-aerolvm-cluster" i
+  local kc="$kk -n aerolvm-system" kw="$kk -n aerolvm-workers"
+  local tok port=21296 pf
+  tok="$($kc get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+  pool_metric() { # <metric>: summed over the worker pods
+    local sum=0 w v
+    for w in $($kw get pods -l app.kubernetes.io/component=worker -o name); do
+      $kw port-forward "$w" $port:21212 >/dev/null 2>&1 & pf=$!
+      sleep 2
+      v=$(curl -s -m 5 -H "Authorization: Bearer $tok" http://127.0.0.1:$port/v1/metrics | awk -v m="$1" 'index($1, m) == 1 {s += $2} END {print s + 0}')
+      kill $pf 2>/dev/null; wait $pf 2>/dev/null
+      [[ "$v" =~ ^[0-9]+$ ]] && sum=$((sum + v))
+    done
+    echo $sum
+  }
+  say "warm template and pool: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata: { name: quick, namespace: dev }
+spec:
+  envVarsInjectionPolicy: Allowed
+  podTemplate:
+    spec:
+      runtimeClassName: runc
+      containers:
+        - { name: main, image: "alpine:3.20" }
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata: { name: quick-pool, namespace: dev }
+spec: { replicas: 1, sandboxTemplateRef: { name: quick } }
+YAML
+)"
+  local parked=0
+  for i in $(seq 1 24); do
+    parked=$(pool_metric aerolvm_containerd_pool_parked)
+    [ "$parked" -ge 1 ] && break
+    sleep 10
+  done
+  say "warm: $parked slots parked on the workers after $((i * 10))s"
+  local before after t0
+  before=$(pool_metric aerolvm_containerd_pool_hits_total)
+  t0=$(date +%s%N)
+  say "warm claim: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata: { name: fast, namespace: dev }
+spec:
+  warmPoolRef: { name: quick-pool }
+  env: [{ name: TASK, value: warm }]
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandboxclaim/fast --timeout=120s 2>&1 | sed 's/^/FCK wait warm claim: /'
+  say "warm claim ready in $(( ($(date +%s%N) - t0) / 1000000 )) ms (with kubectl's own round trips)"
+  after=$(pool_metric aerolvm_containerd_pool_hits_total)
+  if [ "$parked" -ge 1 ] && [ "$after" -gt "$before" ]; then
+    say "RESULT PASS: warm pool: the claim took a parked slot (pool hits $before -> $after)"
+  else
+    say "RESULT FAIL: warm pool: parked $parked, pool hits $before -> $after"
+    $kc logs deploy/aerolvm-operator >/dev/null 2>&1
+    for g in $($kc get pods -l app.kubernetes.io/component=gateway -o name | head -1); do
+      $kc logs $g -c agent 2>&1 | grep -iE 'warm' | tail -5 | cut -c1-300 | sed "s|^|FCK   ${g#pod/}: |"
+    done
+    for w in $($kw get pods -l app.kubernetes.io/component=worker -o name | head -1); do
+      $kw logs $w -c agent 2>&1 | grep -iE 'warm|pool|park' | tail -8 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
+    done
+  fi
+  $kk -n dev delete sandboxclaim fast --timeout=120s >/dev/null 2>&1
 }
 
 # External-CA mode (C23, plan §15.2.1): every node's certificate comes from

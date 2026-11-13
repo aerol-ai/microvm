@@ -35,10 +35,17 @@ const (
 )
 
 // WarmPoolWriteRequest puts (Delete false) or deletes one entry. A delete
-// needs only the image.
+// needs only the image. With Kube set it instead replaces the
+// agent-sandbox API's whole depth set (fsm_kube_warm.go); Pool is unused.
 type WarmPoolWriteRequest struct {
 	Delete bool           `json:"delete,omitempty"`
 	Pool   WarmPoolRecord `json:"pool"`
+	Kube   *KubeWarmSet   `json:"kube,omitempty"`
+}
+
+// KubeWarmSet is opSetKubeWarmDepths' payload: the whole set.
+type KubeWarmSet struct {
+	Depths []KubeWarmDepth `json:"depths"`
 }
 
 // WarmPoolWriteResponse is the outcome. Code is set, and Pool empty, when
@@ -63,6 +70,10 @@ type WarmPoolReadResponse struct {
 	Unchanged     bool             `json:"unchanged,omitempty"`
 	Pools         []WarmPoolRecord `json:"pools,omitempty"`
 	Authoritative bool             `json:"authoritative"`
+	// Kube is the agent-sandbox API's warm-pool depths (fsm_kube_warm.go),
+	// read with the entries. An older server leaves it out; an older
+	// worker ignores it.
+	Kube []KubeWarmDepth `json:"kube,omitempty"`
 }
 
 // WarmPoolWriteOutcome turns a write error into the body a peer gets, and
@@ -106,6 +117,9 @@ func (c *Cluster) WriteWarmPool(ctx context.Context, req WarmPoolWriteRequest) (
 		}
 		return out, out.err()
 	}
+	if req.Kube != nil {
+		return c.writeKubeWarm(ctx, *req.Kube)
+	}
 	if err := c.raftServersSupport(warmPoolFSMOpsVersion, "warm pools"); err != nil {
 		return WarmPoolWriteResponse{}, err
 	}
@@ -126,6 +140,29 @@ func (c *Cluster) WriteWarmPool(ctx context.Context, req WarmPoolWriteRequest) (
 		return WarmPoolWriteResponse{Pool: applied.Pool, Changed: applied.Changed}, nil
 	}
 	return WarmPoolWriteResponse{}, nil
+}
+
+// writeKubeWarm replaces the agent-sandbox API's depth set, on the leader,
+// once every Raft server applies the op. The set is checked here too, so a
+// bad one is refused before it is proposed.
+func (c *Cluster) writeKubeWarm(ctx context.Context, set KubeWarmSet) (WarmPoolWriteResponse, error) {
+	if err := c.raftServersSupport(kubeWarmFSMOpsVersion, "agent-sandbox warm pools"); err != nil {
+		return WarmPoolWriteResponse{}, err
+	}
+	depths, err := NormalizeKubeWarmDepths(set.Depths)
+	if err != nil {
+		return WarmPoolWriteResponse{}, err
+	}
+	payload, err := encodeCommand(command{Op: opSetKubeWarmDepths, KubeWarm: depths, StampUnixNano: time.Now().UnixNano()})
+	if err != nil {
+		return WarmPoolWriteResponse{}, fmt.Errorf("cluster: encode command: %w", err)
+	}
+	result, err := c.applyEncodedLocalResult(ctx, payload)
+	if err != nil {
+		return WarmPoolWriteResponse{}, err
+	}
+	applied, _ := result.(kubeWarmApplyResult)
+	return WarmPoolWriteResponse{Changed: applied.Changed}, nil
 }
 
 // ReadWarmPools answers from this server's FSM.

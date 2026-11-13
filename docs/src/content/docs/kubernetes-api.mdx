@@ -183,7 +183,12 @@ spec:
 A claim asks for a sandbox from a warm pool. The pool names a template, and the template says what to run.
 
 <Aside>
-These warm pools do not start sandboxes ahead of time yet. A claim starts a new sandbox, which takes about as long as any create. The pool's `replicas` is stored and checked, ready for when pre-starting is built. AerolVM's own [warm pools](/warm-pools/) are a different feature, set up by an operator for an image.
+A warm pool keeps sandboxes started ahead of time, so a claim takes one that is ready instead of starting a new one. Two things differ from upstream agent-sandbox:
+
+- **`replicas` is per worker.** Each worker that runs the template's runtime keeps that many ready, as AerolVM's own [warm pools](/warm-pools/) do. Upstream counts the whole cluster. Start with `replicas: 1`.
+- **Only templates that run the image's own entrypoint are kept ready.** A ready sandbox has already started its image, so it cannot run another command. A template that sets `command` or `args` still works, but each claim on it starts a new sandbox. A claim's `env` is fine: it is handed to the ready sandbox when the claim takes it.
+
+A new or changed pool takes effect within about half a minute.
 </Aside>
 
 Save this as `claim.yaml`:

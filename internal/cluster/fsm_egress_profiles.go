@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 19
+	fsmOpsVersion              = 20
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -79,8 +79,9 @@ const (
 // rollout_operator.go); 17 is opUpsertSpec's version check
 // (specVersionFenceFSMOpsVersion in spec_version_fence.go); 18 is
 // opSetRunStates (runStateFSMOpsVersion in fsm_run_state.go); 19 is
-// opAdmitNodeByCert (externalCAFSMOpsVersion in fsm_join.go). Versions 6 to
-// 8 are the gates in the block above.
+// opAdmitNodeByCert (externalCAFSMOpsVersion in fsm_join.go); 20 is
+// opSetKubeWarmDepths (kubeWarmFSMOpsVersion in fsm_kube_warm.go). Versions
+// 6 to 8 are the gates in the block above.
 
 // FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
 // without a cluster: an operator compares it across nodes before and during
