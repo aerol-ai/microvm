@@ -362,6 +362,11 @@ func (h *Host) Start(ctx context.Context) error {
 		// and die with every restart; it starts in the hosts' cgroup.
 		cmd, startErr = h.cfg.Cgroup.Start(func() (*exec.Cmd, error) { return newCmd(), nil })
 	} else {
+		// Jailed, workerd starts in its group's own cgroup (applyJail),
+		// outside sandboxd's, and outlives it the same way: it must not keep
+		// sandboxd's output either, which in a worker pod is the container's
+		// log pipes (C14, F32).
+		h.cfg.Cgroup.RedirectOwnOutput(cmd)
 		startErr = cmd.Start()
 	}
 	if startErr != nil {

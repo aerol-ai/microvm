@@ -692,7 +692,7 @@ them over (`pkg/hostproc`; `internal/runtime/wasm/adopt.go`,
 `internal/runtime/isolate/adopt.go`). In the pod, the same code must target the
 `runtime` container's cgroup, and the pod must share one process namespace, or
 an `agent` restart kills them with the container (C14). They come in
-Phase 5, after gVisor works: WASM first ("Phase 5 results").
+Phase 5, after gVisor works: WASM and V8 isolates first ("Phase 5 results").
 
 ## 9. The control plane inside one cell
 
@@ -2159,9 +2159,23 @@ not already carry):
   it would send there to a log file in its run directory (`workers.log`,
   `hosts.log`; 0600, truncated by a start past 32 MiB). On a VM it keeps
   the journal, as before.
-- Left in Phase 5: V8 isolates need `workerd` in the agent image;
-  Firecracker needs its binaries and kernel there and a machine with
-  `/dev/kvm` (the Firecracker pools item, nested virtualization from S6).
+- **V8 isolates on kind**, the same day (`worker.isolate.enabled=true`):
+  the agent image now ships `workerd` (the release `install.sh` pins). A
+  fetch handler answered; the kubelet's stop of the agent took under a
+  second; the group host holding the sandbox was taken over by the next
+  `sandboxd` and answered again (the empty warm hosts are replaced by the
+  new pool, as on a VM). Two more fixes: the jail starts `workerd` outside
+  `hostproc`, so it kept the container's log pipes too (F32 again); and
+  the jail mounts a tmpfs on each group's `run` and `tmp` folders in the
+  agent's mount namespace, which a restarted agent could not see, so it
+  could not reach the host's control socket and rebuilt the sandbox
+  instead. The jail's chroots now have their own volume, mounted
+  Bidirectional like the network namespaces, and the runtime container's
+  supervisor unmounts them when the pod ends; deleting the pod took 3 s
+  and left no mount on the node.
+- Left in Phase 5: Firecracker needs its binaries and kernel in the agent
+  image and a machine with `/dev/kvm` (the Firecracker pools item, nested
+  virtualization from S6).
 
 ## 19. Tests, drills and benchmarks
 

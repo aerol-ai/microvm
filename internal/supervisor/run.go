@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,11 @@ type Settings struct {
 	// LeaseFile is sandboxd's ownership lease (SB_OWNERSHIP_LEASE_FILE,
 	// cluster mode); empty turns the LeaseGuard off.
 	LeaseFile string
+	// IsolateJailDir is the V8-isolate jail's chroot base when the worker
+	// runs V8 isolates (SB_ISOLATE_JAIL_DIR): the agent mounts a tmpfs in
+	// each group's chroot, Bidirectional like the network namespaces, and
+	// they are unmounted when the supervisor stops (UnmountUnder).
+	IsolateJailDir string
 }
 
 // leaseCheckInterval paces the LeaseGuard: well under sandboxd's own
@@ -50,6 +57,7 @@ func SettingsFromEnv() Settings {
 		ParentFile:       get("SB_CGROUP_PARENT_FILE", "/run/aerolvm/cgroup-parent"),
 		NetnsDir:         get("SB_NETNS_DIR", "/run/netns"),
 		LeaseFile:        get("SB_OWNERSHIP_LEASE_FILE", ""),
+		IsolateJailDir:   get("SB_ISOLATE_JAIL_DIR", ""),
 	}
 }
 
@@ -164,7 +172,68 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	k.Run(ctx)
 	<-guardDone
 	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
+	if s.IsolateJailDir != "" {
+		if raw, err := sys.ReadFile("/proc/self/mountinfo"); err != nil {
+			log.Warn("supervisor: could not read the mount table to unmount the V8 jail's mounts", "error", err)
+		} else {
+			UnmountUnder(s.IsolateJailDir, raw, sys.Unmount, log)
+		}
+	}
 	return nil
+}
+
+// UnmountUnder removes every mount below dir as the pod ends, deepest
+// first, reading the mount points from a /proc/<pid>/mountinfo table. The
+// V8 jail mounts a tmpfs on each group's run and tmp folders; in the worker
+// pod its chroot base is mounted Bidirectional, so a restarted agent finds
+// them and takes the group over (C14), which also puts them in the
+// machine's mount table: left there, the pod stays in Terminating, as the
+// network namespaces did (F8).
+func UnmountUnder(dir string, mountinfo []byte, unmount func(string) error, log *slog.Logger) {
+	dir = filepath.Clean(dir)
+	var points []string
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		// Field 5 is the mount point, with space, tab, newline and
+		// backslash escaped in octal.
+		p := filepath.Clean(unescapeMountinfo(fields[4]))
+		if strings.HasPrefix(p, dir+"/") {
+			points = append(points, p)
+		}
+	}
+	sort.Slice(points, func(i, j int) bool { return len(points[i]) > len(points[j]) })
+	n := 0
+	for _, p := range points {
+		if err := unmount(p); err != nil {
+			log.Warn("supervisor: could not unmount a V8 jail mount", "path", p, "error", err)
+			continue
+		}
+		n++
+	}
+	if len(points) > 0 {
+		log.Info("supervisor: V8 jail mounts unmounted", "count", n)
+	}
+}
+
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // UnmountNamespaces removes the network-namespace mounts in dir as the pod

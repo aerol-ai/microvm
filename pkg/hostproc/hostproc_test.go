@@ -422,3 +422,24 @@ func TestCgroupStartSendsOwnOutputToTheLogFile(t *testing.T) {
 		t.Fatalf("stdout %v, stderr %v; want nil (/dev/null)", got.Stdout, got.Stderr)
 	}
 }
+
+// The V8 jail starts workerd itself, in a cgroup of its own, and calls
+// RedirectOwnOutput first: the same rule as Start, and a nil cgroup (no
+// hosts' cgroup configured) changes nothing.
+func TestRedirectOwnOutputForAStartElsewhere(t *testing.T) {
+	cmd := exec.Command("true")
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	var none *Cgroup
+	none.RedirectOwnOutput(cmd)
+	if cmd.Stdout != os.Stderr || cmd.Stderr != os.Stderr {
+		t.Fatal("a nil cgroup changed the output")
+	}
+	cg := NewCgroup(slog.New(slog.NewTextHandler(new(bytes.Buffer), nil)), t.TempDir(), "aerolvm-test", "test hosts")
+	logPath := filepath.Join(t.TempDir(), "hosts.log")
+	cg.SetLogFile(logPath)
+	cg.RedirectOwnOutput(cmd)
+	f, ok := cmd.Stdout.(*os.File)
+	if !ok || f.Name() != logPath || cmd.Stderr != cmd.Stdout {
+		t.Fatalf("stdout %v, stderr %v; want the log file", cmd.Stdout, cmd.Stderr)
+	}
+}
