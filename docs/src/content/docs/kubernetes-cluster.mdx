@@ -371,6 +371,7 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.workerNamespace` | Where worker pods run. | `aerolvm-workers` |
 | `cluster.version` | The AerolVM version to run. Change it to upgrade. | the chart's version |
 | `cluster.cell` | This cluster's number, 1 to 255, in every new sandbox ID. | `1` |
+| `cluster.federation` | This cell as one of several: `idKeySecret` (a Secret whose key `key` holds the shared ID key) and `cells` (the other cells' addresses by number). See [Many cells](/cells/). | none |
 | `cluster.zones` | The zones to spread over. | none (required) |
 | `cluster.servers.count` | 3 or 5. | `3` |
 | `cluster.servers.storage` | Each server's disk: `size` and `storageClassName`. | `20Gi` |
