@@ -20,7 +20,7 @@ func TestClusterSpecSummaries(t *testing.T) {
 	ctx := context.Background()
 	cmd := place("sb-a", "w1")
 	cmd.Spec = &models.CreateSandboxRequest{Image: "python:3.12", Runtime: models.RuntimeGvisor, CPU: 0.5, MemoryMB: 512,
-		ContainerCommand: []string{"sleep", "inf"}, Env: map[string]string{"TOKEN": "secret"}}
+		ContainerCommand: []string{"sleep", "inf"}, Env: map[string]string{"TOKEN": "secret"}, Tags: map[string]string{"app": "agent"}}
 	if err := c.applyCommand(ctx, cmd); err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestClusterSpecSummaries(t *testing.T) {
 	}
 	s, ok := got["sb-a"]
 	if !ok || len(got) != 1 || s.Image != "python:3.12" || s.Runtime != models.RuntimeGvisor || s.CPU != 0.5 || s.MemoryMB != 512 ||
-		strings.Join(s.Command, " ") != "sleep inf" || s.Version == 0 {
+		strings.Join(s.Command, " ") != "sleep inf" || s.Tags["app"] != "agent" || s.Version == 0 {
 		t.Fatalf("summaries = %+v", got)
 	}
 	raw, _ := json.Marshal(got)

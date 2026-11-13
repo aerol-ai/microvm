@@ -149,6 +149,140 @@ for m in d.get("members", d):
   done
 }
 
+# The agent-sandbox API (C17): with cluster.agentSandboxAPI on, kubectl
+# reaches the gateways through the APIService: create a Sandbox, wait for
+# Ready, watch it stop and start again (the workers' run-state reports),
+# check RBAC refuses a viewer's delete, delete it.
+proof_kubeapi() {
+  local kk="kubectl --context kind-aerolvm-cluster"
+  local kc="$kk -n aerolvm-system"
+  local ok=1 i
+  dumpapi() {
+    $kk get apiservice v1beta1.agents.x-k8s.io -o yaml 2>&1 | sed -n '/^status:/,$p' | head -20 | sed 's/^/FCK   apiservice: /'
+    $kc get certificate,secret 2>&1 | grep -i agent-sandbox | sed 's/^/FCK   cert: /'
+    for g in $($kc get pods -l app.kubernetes.io/component=gateway -o name); do
+      $kc logs $g -c agent 2>&1 | grep -iE 'agent-sandbox|kubeapi|front-proxy|subjectaccess' | tail -8 | cut -c1-300 | sed "s|^|FCK   ${g#pod/}: |"
+    done
+  }
+  for i in $(seq 1 60); do
+    [ "$($kk get apiservice v1beta1.agents.x-k8s.io -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null)" = True ] && break
+    sleep 5
+  done
+  say "APIService available after $((i * 5))s: $($kk get apiservice v1beta1.agents.x-k8s.io --no-headers 2>&1 | head -1)"
+  say "api-resources: $($kk api-resources --api-group=agents.x-k8s.io --no-headers 2>&1 | tr -s ' ' | head -3 | tr '\n' ';')"
+  $kk create namespace dev >/dev/null 2>&1
+  # A worker that just joined has not reported its capacity yet: retry the
+  # create (the API answers what AerolVM's create answers).
+  local out
+  for i in $(seq 1 18); do
+    out=$($kk apply -f - 2>&1 <<'YAML'
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata: { name: web, namespace: dev, labels: { app: proof } }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: main
+          image: alpine:3.20
+          command: ["sleep", "infinity"]
+          resources: { limits: { cpu: "1", memory: 512Mi } }
+YAML
+)
+    grep -q created <<<"$out" && break
+    sleep 10
+  done
+  say "create (try $i): $(tr '\n' ' ' <<<"$out" | head -c 300)"
+  grep -q created <<<"$out" || { ok=0; dumpapi; }
+  $kk -n dev wait --for=condition=Ready sandbox/web --timeout=180s 2>&1 | sed 's/^/FCK wait ready: /'
+  say "get: $($kk -n dev get sandboxes -o wide 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 400)"
+  say "all namespaces: $($kk get sandboxes -A --no-headers 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  # Watch while it stops and starts again.
+  timeout 120 $kk -n dev get sandboxes --watch -o custom-columns=NAME:.metadata.name,RV:.metadata.resourceVersion,MODE:.spec.operatingMode,READY:'.status.conditions[?(@.type=="Ready")].status' > /root/watch.log 2>&1 &
+  local wpid=$!
+  sleep 3
+  say "suspend: $($kk -n dev patch sandbox web --type merge -p '{"spec":{"operatingMode":"Suspended"}}' 2>&1 | head -c 200)"
+  $kk -n dev wait --for=condition=Suspended sandbox/web --timeout=120s 2>&1 | sed 's/^/FCK wait suspended: /'
+  say "resume: $($kk -n dev patch sandbox web --type merge -p '{"spec":{"operatingMode":"Running"}}' 2>&1 | head -c 200)"
+  $kk -n dev wait --for=condition=Ready sandbox/web --timeout=120s 2>&1 | sed 's/^/FCK wait ready again: /'
+  sleep 3
+  kill $wpid 2>/dev/null
+  sed 's/^/FCK watch: /' /root/watch.log | head -20
+  # RBAC: a viewer may read, not delete.
+  $kk -n dev create serviceaccount viewer >/dev/null 2>&1
+  $kk -n dev create role sandbox-viewer --verb=get,list,watch --resource=sandboxes.agents.x-k8s.io >/dev/null 2>&1
+  $kk -n dev create rolebinding viewer --role=sandbox-viewer --serviceaccount=dev:viewer >/dev/null 2>&1
+  sleep 2
+  say "viewer get: $($kk -n dev --as=system:serviceaccount:dev:viewer get sandbox web --no-headers 2>&1 | tr -s ' ' | head -c 200)"
+  say "viewer delete: $($kk -n dev --as=system:serviceaccount:dev:viewer delete sandbox web 2>&1 | head -c 250)"
+  # Another team's namespace sees nothing of dev's.
+  $kk create namespace other >/dev/null 2>&1
+  say "other namespace: $($kk -n other get sandboxes 2>&1 | head -c 200)"
+  local uid1
+  uid1=$($kk -n dev get sandbox web -o jsonpath='{.metadata.uid}' 2>/dev/null)
+  say "delete: $($kk -n dev delete sandbox web --timeout=120s 2>&1 | head -c 200)"
+  for i in $(seq 1 24); do
+    $kk -n dev get sandbox web >/dev/null 2>&1 || break
+    sleep 5
+  done
+  say "after delete: $($kk -n dev get sandboxes 2>&1 | head -c 200)"
+  # The same name again with another image (kubectl delete, then create):
+  # the same sandbox ID, a new incarnation, shown with its own image.
+  say "re-create: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata: { name: web, namespace: dev }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - { name: main, image: "busybox:1.36", command: ["sleep", "infinity"] }
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandbox/web --timeout=180s 2>&1 | sed 's/^/FCK wait re-created: /'
+  say "re-created: uid $uid1 -> $($kk -n dev get sandbox web -o jsonpath='{.metadata.uid} {.spec.podTemplate.spec.containers[0].image}' 2>&1 | head -c 200)"
+  say "re-created delete: $($kk -n dev delete sandbox web --timeout=120s 2>&1 | head -c 200)"
+  # The claim flow: a template, a warm pool, a claim that makes a sandbox.
+  say "template and pool: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata: { name: python, namespace: dev }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: main
+          image: python:3.12-alpine
+          command: ["sleep", "infinity"]
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata: { name: pool, namespace: dev }
+spec: { replicas: 1, sandboxTemplateRef: { name: python } }
+YAML
+)"
+  say "claim: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata: { name: job, namespace: dev }
+spec:
+  warmPoolRef: { name: pool }
+  env: [{ name: TASK, value: proof }]
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandboxclaim/job --timeout=240s 2>&1 | sed 's/^/FCK wait claim: /'
+  say "claims: $($kk -n dev get sandboxclaims 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  say "claims by name: $($kk -n dev get sandboxclaims --field-selector metadata.name=nope --no-headers 2>&1 | head -c 200)"
+  say "its sandbox: $($kk -n dev get sandbox job -o jsonpath='{.metadata.labels}' 2>&1 | head -c 300)"
+  say "templates and pools: $($kk -n dev get sandboxtemplates,sandboxwarmpools --no-headers 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  say "claim delete: $($kk -n dev delete sandboxclaim job --timeout=120s 2>&1 | head -c 200)"
+  [ "$ok" = 1 ] || return
+  dumpapi
+}
+
 [ -e /dev/kvm ] || modprobe kvm_intel 2>/dev/null
 if [ -e /dev/kvm ]; then say "machine: /dev/kvm present, $(grep -c -w vmx /proc/cpuinfo) cpus with vmx, kernel $(uname -r)"; else say "machine: /dev/kvm ABSENT"; finish; fi
 
@@ -179,6 +313,17 @@ if [ "$proof" = gmove ]; then
   grep -A1 '^  gvisor:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
   export AEROL_K8S_MODE=cluster
 fi
+if [ "$proof" = kubeapi ]; then
+  # C17: cluster mode with the agent-sandbox API on, in this copy only.
+  python3 - <<'PY'
+p = "charts/aerolvm/values.yaml"
+s = open(p).read()
+s = s.replace("  agentSandboxAPI:\n    enabled: false", "  agentSandboxAPI:\n    enabled: true", 1)
+open(p, "w").write(s)
+PY
+  grep -A1 '^  agentSandboxAPI:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
+  export AEROL_K8S_MODE=cluster
+fi
 if [ "$proof" = move ]; then
   # Cluster mode, every worker a Firecracker worker: this machine is one
   # KVM pool. The chart's defaults change in this copy only.
@@ -204,6 +349,7 @@ if ! scripts/k8s-dev.sh > /root/k8s-dev.log 2>&1; then say "k8s-dev failed:"; ta
 say "built and installed in $(( $(date +%s) - t0 ))s"
 [ "$proof" = move ] && { proof_move firecracker; finish; }
 [ "$proof" = gmove ] && { proof_move gvisor; finish; }
+[ "$proof" = kubeapi ] && { proof_kubeapi; finish; }
 
 k() { kubectl --context kind-aerolvm -n aerolvm "$@"; }
 pod=aerolvm-0

@@ -165,7 +165,7 @@ func createRequest(sb *Sandbox, now time.Time, random func() string) (models.Cre
 		return models.CreateSandboxRequest{}, problems
 	}
 	c := containers[0]
-	req := models.CreateSandboxRequest{Name: name, Image: strings.TrimSpace(c.Image), Tags: sb.Metadata.Labels}
+	req := models.CreateSandboxRequest{Name: name, Image: strings.TrimSpace(c.Image), Tags: sandboxTags(sb)}
 	if req.Image == "" {
 		bad("spec.podTemplate.spec.containers[0].image: required")
 	}
@@ -242,6 +242,24 @@ func createRequest(sb *Sandbox, now time.Time, random func() string) (models.Cre
 		bad("spec.shutdownPolicy: must be Delete or Retain")
 	}
 	return req, problems
+}
+
+// sandboxTags are the sandbox's tags: its pod template's labels (where an
+// upstream template often puts them), then its own, which win. A sandbox is
+// one object, so both sets describe it.
+func sandboxTags(sb *Sandbox) map[string]string {
+	pod, own := sb.Spec.PodTemplate.Metadata.Labels, sb.Metadata.Labels
+	if len(pod) == 0 {
+		return own
+	}
+	tags := make(map[string]string, len(pod))
+	for k, v := range pod {
+		tags[k] = v
+	}
+	for k, v := range own {
+		tags[k] = v
+	}
+	return tags
 }
 
 // RuntimeFor maps a RuntimeClass name onto an AerolVM runtime. The names

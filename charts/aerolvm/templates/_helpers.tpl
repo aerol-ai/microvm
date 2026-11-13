@@ -77,3 +77,18 @@ namespace's (servers, gateways, the operator) and the workers. */ -}}
     matchLabels:
       {{- include "aerolvm.selector" . | nindent 6 }}
 {{- end -}}
+
+{{/*
+The agent-sandbox API's settings (C17), on every node: gateways serve it,
+nodes with sandboxes report their run state.
+*/}}
+{{- define "aerolvm.agentSandboxEnv" -}}
+- { name: SB_AGENT_SANDBOX_API, value: "true" }
+{{- with .Values.cluster.agentSandboxAPI.namespaces }}
+{{- $pairs := list }}
+{{- range $ns, $owner := . }}
+{{- $pairs = append $pairs (printf "%s=%s" $ns $owner) }}
+{{- end }}
+- { name: SB_AGENT_SANDBOX_API_NAMESPACES, value: {{ join "," $pairs | quote }} }
+{{- end }}
+{{- end -}}

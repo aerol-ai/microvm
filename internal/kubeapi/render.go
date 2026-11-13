@@ -20,6 +20,8 @@ type SpecSummary struct {
 	CPU      float64
 	MemoryMB int
 	Command  []string
+	// Tags are the object's labels.
+	Tags map[string]string
 }
 
 // dnsSubdomain is the Kubernetes object-name rule (RFC 1123 subdomain).
@@ -33,10 +35,18 @@ func ValidName(s string) bool {
 // ObjectName is the name a sandbox has in Kubernetes: its AerolVM name when
 // that is a valid object name, else its ID (which always is).
 func ObjectName(p cluster.Placement) string {
-	if ValidName(p.Name) {
-		return p.Name
+	if name := userName(p); ValidName(name) {
+		return name
 	}
 	return p.SandboxID
+}
+
+// userName is the name the sandbox was given. A cluster keeps names unique
+// per owner by storing them qualified with it ("owner:<owner>/<name>",
+// cluster.QualifiedSandboxName), which is never a valid object name.
+func userName(p cluster.Placement) string {
+	_, name, _ := cluster.DecodeSandboxNameKey(p.Name)
+	return name
 }
 
 func rfc3339(unix int64) string {
@@ -62,11 +72,12 @@ func runtimeClass(runtime string) string {
 func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 	p := item.Placement
 	annotations := map[string]string{AnnotationSandboxID: p.SandboxID}
-	if p.Name != "" && !ValidName(p.Name) {
-		annotations[AnnotationName] = p.Name
+	if name := userName(p); name != "" && !ValidName(name) {
+		annotations[AnnotationName] = name
 	}
 	container := Container{Name: "sandbox"}
 	var runtimeClassName string
+	var labels map[string]string
 	if spec != nil {
 		container.Image = spec.Image
 		container.Command = spec.Command
@@ -81,6 +92,7 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 			container.Resources = &ResourceRequirements{Limits: limits}
 		}
 		runtimeClassName = runtimeClass(spec.Runtime)
+		labels = spec.Tags
 		if spec.Runtime != "" {
 			annotations[AnnotationRuntime] = spec.Runtime
 		}
@@ -95,6 +107,7 @@ func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 			ResourceVersion:   strconv.FormatUint(item.RV, 10),
 			Generation:        1,
 			CreationTimestamp: created,
+			Labels:            labels,
 			Annotations:       annotations,
 		},
 		Spec: SandboxSpec{
