@@ -72,8 +72,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, err
 	}
+	// A move's recreate resumes a gVisor sandbox from the checkpoint staged
+	// here (gvisor_move.go), never from the warm pool.
+	restore := sbruntime.RestoreRequested(ctx)
+	if restore && (ociRuntime != "runsc" || !d.staged(sandboxID)) {
+		return nil, fmt.Errorf("containerd runtime: no gVisor checkpoint is staged for %s", sandboxID)
+	}
 
-	if d.warmPool != nil {
+	if d.warmPool != nil && !restore {
 		if warm, warmErr := d.tryWarmAdopt(ctx, req, sandboxID, toolboxToken, hostMounts, effectiveRuntime); warmErr == nil {
 			return warm, nil
 		} else if errors.Is(warmErr, dockerpkg.ErrSandboxContainerExists) {
@@ -257,6 +263,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
+		if restore {
+			specOpts = append(specOpts, d.restoreSpecOpt(sandboxID))
+		}
 	}
 
 	if d.cfg.ReadyEnabled {
@@ -296,7 +305,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cntr.WithContainerLabels(containerLabels),
 	}
 	if ociRuntime != "" {
-		opt, err := d.runtimeContainerOpt(ociRuntime)
+		opt, err := d.runtimeContainerOptFor(ociRuntime, restore)
 		if err != nil {
 			return nil, err
 		}
@@ -393,7 +402,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// header carries no readiness source on containerd hosts (UC-11).
 	readyStart := time.Now()
 	readinessSource := "health"
-	if d.cfg.ReadyEnabled && readyListener != nil {
+	if restore {
+		// The restored toolbox said its hello at its first boot; it
+		// answers health, at the address it has here.
+		if err := d.waitToolboxHTTP(ctx, state.ContainerIP, toolboxToken); err != nil {
+			return nil, err
+		}
+		keepReadySocket = readySocketCreated
+	} else if d.cfg.ReadyEnabled && readyListener != nil {
 		readinessSource = "socket"
 		if err := createReadyWaitFn(ctx, readyListener); err != nil {
 			return nil, fmt.Errorf("ready socket: %w", err)
@@ -435,6 +451,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
+	if restore {
+		// Used: a later start of this container boots it, and the wrapper
+		// then passes the start through.
+		_ = os.RemoveAll(d.moveDir(moveIn, sandboxID))
+	}
 	committed = true
 	return state, nil
 }
@@ -525,6 +546,10 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	container, err := client.LoadContainer(ctx, containerRef)
 	if err != nil {
 		return nil, fmt.Errorf("load container: %w", err)
+	}
+	// A move's checkpoint of this sandbox is stale once it runs here again.
+	if validateSandboxID(containerRef) == nil {
+		_ = os.RemoveAll(d.moveDir(moveOut, containerRef))
 	}
 	task, err := container.Task(ctx, nil)
 	if err == nil {
@@ -683,8 +708,20 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 		return fmt.Errorf("load container: %w", err)
 	}
 	task, err := container.Task(ctx, nil)
+	checkpoint := sbruntime.CheckpointRequested(ctx)
 	if err != nil {
+		if checkpoint {
+			return errNotCheckpointable
+		}
 		return nil
+	}
+	if checkpoint {
+		if err := d.checkpointForMove(ctx, client, container, task); err != nil {
+			return err
+		}
+		// runsc ended the sandbox once it was saved: reap the task as a
+		// stop does.
+		return deleteExitedTask(ctx, task)
 	}
 	_ = task.Kill(ctx, syscall.SIGTERM)
 	deadline := time.Now().Add(stopGraceTimeout)
@@ -1500,6 +1537,7 @@ func (d *Driver) removeContainerFiles(key string) {
 	}
 	_ = d.removeHostFiles(key)
 	_ = d.removeTaskLog(key)
+	d.removeMoveFiles(key)
 	if IsParkedSandboxID(key) && strings.TrimSpace(d.cfg.ReadyDir) != "" {
 		dockerpkg.RemoveParkSocket(filepath.Join(d.cfg.ReadyDir, key+".sock"))
 	}

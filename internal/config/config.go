@@ -251,6 +251,14 @@ type Config struct {
 	// prjquota, on a volume nothing else uses project IDs on: a sandbox's
 	// project ID is its overlay snapshot's number. SB_CONTAINERD_DISK_QUOTA.
 	ContainerdDiskQuota bool
+	// GvisorCheckpointMoves lets a decommission move a running gVisor
+	// sandbox to another worker with its memory (C21 in
+	// plans/kubernetes-v2-architecture.md): the source saves it with runsc
+	// checkpoint, the target restores it through aerolvm-runsc, which only
+	// the Kubernetes worker's runtime image installs. Off here; the chart
+	// turns it on for workers, and off again is the kill switch (D-1): the
+	// sandbox then takes the next §10.5 row. SB_GVISOR_CHECKPOINT_MOVES.
+	GvisorCheckpointMoves bool
 	// ContainerdNetnsPoolDepth is the number of slots the refiller keeps
 	// pre-realized (CNI ADD done) for a fast warm-hit create. It is the WARM
 	// target, NOT the total capacity — see ContainerdNetnsPoolSize.
@@ -2265,6 +2273,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
 		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
+		GvisorCheckpointMoves:             getEnvBool("SB_GVISOR_CHECKPOINT_MOVES", false),
 		HostProcessCgroupParent:           strings.TrimSpace(os.Getenv("SB_HOST_PROCESS_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),

@@ -663,6 +663,7 @@ type Service struct {
 	// by one until the placement names this node (snapshot_move.go).
 	moveTargets moveTargets
 	movesIn     moveFences
+	movedRows   checkpointRows
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
@@ -1765,8 +1766,14 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 // (raiseTokensNotBeforeToTakeover).
 func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute, ownerSinceUnixNano int64) (bool, error) {
 	// The owner watcher calls this for a placement that failed over to us;
-	// no request is behind it.
-	ctx = withAuditSubsystem(ctx, auditSubsystemFailover)
+	// no request is behind it. A gVisor move's target calls it too, after
+	// the swap (C21), and is logged as the move it is.
+	moved := movedIdentityFrom(ctx) != nil
+	if moved {
+		ctx = withAuditSubsystem(ctx, auditSubsystemMove)
+	} else {
+		ctx = withAuditSubsystem(ctx, auditSubsystemFailover)
+	}
 	// The replicated spec holds the owner-qualified name key; the local row
 	// gets the user's name back (names are unique per owner in the store).
 	// A malformed legacy "owner:" name decodes to itself and never fails.
@@ -1857,12 +1864,19 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		return true, err
 	}
 	s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
-	s.recordFailoverReason(ctx, id)
+	if moved {
+		s.recordMovedIn(ctx, id)
+	} else {
+		s.recordFailoverReason(ctx, id)
+	}
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
 		return true, err
 	}
-	s.logger.Info("cluster: recreated sandbox after failover",
-		"sandbox_id", id, "replayed_ports", len(exposedPorts))
+	msg := "cluster: recreated sandbox after failover"
+	if moved {
+		msg = "cluster: a sandbox moved here with its memory"
+	}
+	s.logger.Info(msg, "sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return true, nil
 }
 
@@ -2501,6 +2515,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err != nil {
 		return nil, fmt.Errorf("generate ssh keypair: %w", err)
 	}
+	// A sandbox moving here with its memory (C21) keeps what its programs
+	// and its users already hold: the token its running toolbox checks and
+	// the SSH key its users log in with. A context read, nothing more, on
+	// every other create.
+	moved := movedIdentityFrom(ctx)
+	if moved != nil {
+		toolboxToken, authorizedKey, privateKeyPEM = moved.ToolboxToken, moved.Sandbox.SSHPublicKey, ""
+	}
 
 	// Choose the sandbox ID up-front so we have stable host paths to bind
 	// before docker.Create runs. The ID also becomes the container's name.
@@ -2798,6 +2820,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 		Durability:           req.Durability,
+	}
+	if moved != nil {
+		// Tokens issued for it before the move stay good; those revoked
+		// on the source stay revoked (persistSandboxCreate keeps it).
+		sandbox.TokensNotBefore = moved.TokensNotBefore
 	}
 	// Populate the in-memory CustomDomains slice so the initial route
 	// matcher sees the full hostname union. Status is pending_dns until
@@ -3389,7 +3416,10 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	// back with none and revive tokens revoked on the old owner; the same
 	// holds for an id reused after a delete. Set in the INSERT itself, so
 	// no request ever sees the row without it. A clock read, no I/O.
-	if notBefore := sandboxtoken.NotBeforeAt(sandboxTokenNow()); sandbox.TokensNotBefore < notBefore {
+	// A sandbox moved here with its memory (C21) keeps its source row's
+	// not-before instead: the move is planned and its bundle authenticated,
+	// so the tokens that row refuses are exactly the ones to refuse.
+	if notBefore := sandboxtoken.NotBeforeAt(sandboxTokenNow()); sandbox.TokensNotBefore < notBefore && movedIdentityFrom(ctx) == nil {
 		sandbox.TokensNotBefore = notBefore
 	}
 	if strings.TrimSpace(sandbox.AuditIncarnationID) == "" {

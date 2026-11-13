@@ -152,6 +152,18 @@ func refusedForCapacity(err error) bool {
 	return errors.Is(err, capacity.ErrCapacityExceeded)
 }
 
+// RecreateInputs is what rebuilding p's sandbox on its owner takes: its
+// spec, its secret provider handle, passed through unchanged (only the
+// service resolves and merges credentials), and its exposed ports. ok is
+// false for a placement without a spec. The owner watcher's failover
+// recreate and a gVisor move's target (C21) both rebuild from it.
+func RecreateInputs(p Placement) (spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute, ok bool) {
+	if p.Spec == nil {
+		return models.CreateSandboxRequest{}, PlacementSecrets{}, nil, false
+	}
+	return *p.Spec, secretsFromPlacement(p), exposedPortRoutesForPlacement(p), true
+}
+
 func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id string, p Placement) {
 	if deps.recreator == nil {
 		return
@@ -162,23 +174,20 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 	if deps.failures != nil && deps.failures.isPermanent(id) {
 		return
 	}
-	if p.Spec == nil {
+	spec, sealed, ports, ok := RecreateInputs(p)
+	if !ok {
 		// Pre-cluster sandbox or never-replicated spec. Without a spec we
 		// can't reconstruct the container; leave it unhandled. The
 		// dead-owner reconciler still won't reassign such placements
 		// because there's no way to recover them.
 		return
 	}
-	spec := *p.Spec
-	ports := exposedPortRoutesForPlacement(p)
-	// Pass the secret provider handle through unchanged — only the service
-	// is allowed to resolve and merge credentials.
 	attempted := true
 	var err error
 	if reporter, ok := deps.recreator.(SandboxRecreateReporter); ok {
-		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports, p.OwnerSinceUnixNano)
+		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, sealed, ports, p.OwnerSinceUnixNano)
 	} else {
-		err = deps.recreator.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
+		err = deps.recreator.RecreateSandbox(ctx, id, spec, sealed, ports)
 	}
 	if attempted || err != nil {
 		recordFailoverRecreate(err)

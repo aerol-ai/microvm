@@ -221,6 +221,8 @@ containers:
       - { name: SB_JAILER_UID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
       - { name: SB_JAILER_GID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
       {{- end }}
+      # The runtime image's aerolvm-runsc restores a moved gVisor sandbox.
+      - { name: SB_GVISOR_CHECKPOINT_MOVES, value: {{ $root.Values.worker.gvisor.checkpointMoves | quote }} }
       - { name: SB_CONTAINER_ENGINE, value: containerd }
       - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
       - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }

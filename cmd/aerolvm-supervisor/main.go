@@ -10,12 +10,19 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
+	"github.com/aerol-ai/microvm/internal/runscwrap"
 	"github.com/aerol-ai/microvm/internal/supervisor"
 )
 
 func main() {
+	// Run as aerolvm-runsc (the runtime image links that name here), it is
+	// the runsc a moved gVisor sandbox's shim runs, not the supervisor.
+	if filepath.Base(os.Args[0]) == runscwrap.CommandName {
+		os.Exit(runscwrap.Main(os.Args))
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

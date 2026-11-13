@@ -280,8 +280,9 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 // checkMoveEntry), but they arrive from another worker, and this is the
 // check code scanning recognizes (go/path-injection, go/zipslip).
 func inside(dir, name string) (string, error) {
-	p := filepath.Join(dir, name)
-	if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)+string(filepath.Separator)) {
+	// The checked value is the one returned: code scanning trusts only it.
+	p := filepath.Clean(filepath.Join(dir, name))
+	if !strings.HasPrefix(p, filepath.Clean(dir)+string(filepath.Separator)) {
 		return "", fmt.Errorf("%q is not a name inside %s", name, dir)
 	}
 	return p, nil

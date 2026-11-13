@@ -237,7 +237,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Sandbox lifecycle events per second (plans/agent-sandbox-feature-parity.md O1): stops by status reason (user_stop, idle, max_age, out_of_memory, disk_limit, crashed, program_exited, reconcile), starts by kind (requested, restarted, failover), deletes by the timer that fired (idle, max_age, program_exited) and main programs that ended (success, failure). A rise in crashed or out_of_memory stops with restarted starts is a crash loop.",
+      "description": "Sandbox lifecycle events per second (plans/agent-sandbox-feature-parity.md O1): stops by status reason (user_stop, idle, max_age, out_of_memory, disk_limit, crashed, program_exited, reconcile), starts by kind (requested, restarted, failover, moved), deletes by the timer that fired (idle, max_age, program_exited) and main programs that ended (success, failure). A rise in crashed or out_of_memory stops with restarted starts is a crash loop.",
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
       "id": 7,

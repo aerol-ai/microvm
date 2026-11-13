@@ -17,7 +17,10 @@ cd /root
 # The snapshot move (plan §10.5): a Firecracker VM on a worker that is
 # decommissioned moves to another worker with its memory: the same guest
 # boot ID answers there.
+# proof_move <runtime>: a sandbox of that runtime (firecracker, or gvisor
+# for C21) moves to another worker with its memory during a decommission.
 proof_move() {
+  local runtime="$1"
   local kc="kubectl --context kind-aerolvm-cluster -n aerolvm-system"
   # Worker pods run in their own namespace (k8s-dev's cluster values).
   local kw="kubectl --context kind-aerolvm-cluster -n aerolvm-workers"
@@ -68,7 +71,7 @@ for line in sys.stdin:
   # A worker that just joined has not reported its capacity yet: the
   # create waits for one that has.
   for i in $(seq 1 18); do
-    out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
+    out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"'"$runtime"'","image":"alpine:3.20","cpu":1,"memory_mb":512}')
     id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
     [ -n "$id" ] && break
     grep -q "no worker placement target" <<<"$out" || break
@@ -90,9 +93,13 @@ for m in d.get("members", d):
   ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute \
     -d "$(python3 -c 'import json, sys; print(json.dumps({"command": sys.argv[1]}))' "$1")" | head -c 300; }
   # A process that counts on, to show it kept running across the move.
-  ex 'nohup sh -c "i=0; while true; do i=\$((i+1)); echo \$i > /tmp/counter; sleep 1; done" >/dev/null 2>&1 &' >/dev/null
+  # setsid: out of the exec's session, so nothing that ends the exec's
+  # process group ends the counter.
+  ex 'setsid nohup sh -c "i=0; while true; do i=\$((i+1)); echo \$i > /tmp/counter; sleep 1; done" </dev/null >/dev/null 2>&1 &' >/dev/null
   sleep 3
   say "before: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
+  sleep 3
+  say "before, 3 s on: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
   owner=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
   say "owner before: $owner"
   say "cordon: $(api -X POST http://127.0.0.1:$port/v1/cluster/nodes/$owner/cordon | head -c 200)"
@@ -105,7 +112,9 @@ for m in d.get("members", d):
   done
   say "move took $(( $(date +%s) - t0 ))s"
   # What a move carries: each snapshot file's allocated and full size.
-  $kw exec "$owner" -c agent -- sh -c "ls -ls /var/lib/sandboxd/firecracker/templates/_sandboxes/$id/ 2>&1" 2>&1 | tail -6 | sed 's/^/FCK   source files: /'
+  local dir=/var/lib/sandboxd/firecracker/templates/_sandboxes/$id
+  [ "$runtime" = gvisor ] && dir=/var/lib/sandboxd/containerd/moves/out/$id
+  $kw exec "$owner" -c agent -- sh -c "ls -ls $dir/ 2>&1" 2>&1 | tail -6 | sed 's/^/FCK   source files: /'
   owner2=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
   say "owner after: $owner2"
   local after
@@ -128,13 +137,15 @@ for m in d.get("members", d):
     sleep 2
   done
   say "after (try $i): $res"
+  sleep 3
+  say "after, 3 s on: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
   if ! grep -q '"exit_code":0' <<<"$res"; then
     for w in $($kw get pods -o name); do
       $kw logs $w -c agent 2>&1 | grep -iE 'restore|resume|toolbox|firecracker|snapshot|move' | grep -v 'request complete' | tail -6 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
     done
   fi
   for w in $($kw get pods -o name); do
-    $kw logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
+    $kw logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved|restore|checkpoint' | tail -4 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
   done
 }
 
@@ -162,6 +173,12 @@ say "tools ready: $(go version | cut -d' ' -f3), helm $(helm version --short), k
 mkdir -p src && curl -fsSL --retry 5 '@SRC_URL@' | tar -xz -C src || { say "source download failed"; finish; }
 cd src
 proof='@PROOF@'
+if [ "$proof" = gmove ]; then
+  # C21: gVisor is in the dev pool already, and the chart turns
+  # checkpoint moves on; the image runs on this machine as on any other.
+  grep -A1 '^  gvisor:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
+  export AEROL_K8S_MODE=cluster
+fi
 if [ "$proof" = move ]; then
   # Cluster mode, every worker a Firecracker worker: this machine is one
   # KVM pool. The chart's defaults change in this copy only.
@@ -185,7 +202,8 @@ say "building the images and starting kind ($proof)"
 t0=$(date +%s)
 if ! scripts/k8s-dev.sh > /root/k8s-dev.log 2>&1; then say "k8s-dev failed:"; tail -20 /root/k8s-dev.log | sed 's/^/FCK   /'; finish; fi
 say "built and installed in $(( $(date +%s) - t0 ))s"
-[ "$proof" = move ] && { proof_move; finish; }
+[ "$proof" = move ] && { proof_move firecracker; finish; }
+[ "$proof" = gmove ] && { proof_move gvisor; finish; }
 
 k() { kubectl --context kind-aerolvm -n aerolvm "$@"; }
 pod=aerolvm-0

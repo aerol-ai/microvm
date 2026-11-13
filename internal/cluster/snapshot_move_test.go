@@ -46,8 +46,12 @@ func (f *fakeSnapshotMoves) DropMove(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id string) error {
-	f.note("start " + id)
+func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id string, rc *MoveRecreate) error {
+	if rc == nil {
+		f.note("start " + id + " without a spec")
+		return nil
+	}
+	f.note("start " + id + " from " + rc.Spec.Image)
 	return nil
 }
 
@@ -102,7 +106,81 @@ func TestEvacuateNodeMovesAFirecrackerSandboxBySnapshot(t *testing.T) {
 	if got := strings.Join(source.calls, "; "); got != "release sb-vm for wkr-b" {
 		t.Fatalf("source calls: %s", got)
 	}
-	if got := strings.Join(target.calls, "; "); got != "import sb-vm from "+c.nodeID+"; start sb-vm" {
+	if got := strings.Join(target.calls, "; "); got != "import sb-vm from "+c.nodeID+"; start sb-vm from alpine" {
+		t.Fatalf("target calls: %s", got)
+	}
+}
+
+// A gVisor sandbox moves with its memory (C21) the way a Firecracker one
+// does, between workers that both report CheckpointMovesLabel. From a
+// worker without it, its gVisor sandboxes are not movable: they count as
+// the decommission's to stop, as before.
+func TestEvacuateNodeMovesAGvisorSandboxWithItsMemory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestClusterWithCfg(t, "ldr-ckpt", true, nil, func(cfg *config.Config) { cfg.NodeRole = config.NodeRoleMixed })
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	source, target := &fakeSnapshotMoves{}, &fakeSnapshotMoves{}
+	c.AttachMoveHandler(source)
+	c.moves.mu.Lock()
+	c.moves.peers = map[string]MoveHandler{"wkr-b": target}
+	c.moves.mu.Unlock()
+	moves := map[string]string{CheckpointMovesLabel: "true"}
+	room := capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384, CPUBudget: 8, MemoryBudgetMB: 16384, CanAdmit: true,
+		SupportedRuntimes: []string{models.RuntimeGvisor}}
+	self, _ := c.gossip.lookupMember(c.nodeID)
+	self.Role = config.NodeRoleMixed
+	self.Capacity = room
+	worker := Member{NodeID: "wkr-b", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://wkr-b", Capacity: room, Arch: self.Arch, Version: self.Version}
+	// The label rides the capacity heartbeats only, as in production:
+	// gossip members carry none (p5-gmove-1 never moved its sandbox).
+	labelled := func(ms ...Member) []Member {
+		out := make([]Member, len(ms))
+		for i, m := range ms {
+			m.Capacity.Labels = moves
+			out[i] = m
+		}
+		return out
+	}
+	seedGossipView(t, c, []Member{self, worker})
+	seedCapacityHeartbeats(c, labelled(self, worker))
+	gvisor := models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 128, Runtime: models.RuntimeGvisor}
+	raw, err := encodeCommand(command{Op: opPlace, SandboxID: "sb-g", OwnerNodeID: c.nodeID, OwnerAPIURL: "http://" + c.nodeID, IncarnationID: "inc-sb-g", Spec: &gvisor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.raft.raft.Apply(raw, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	applyDrain(t, c, c.nodeID)
+
+	// The source with the switch off: nothing to move.
+	seedCapacityHeartbeats(c, []Member{self})
+	res, err := c.EvacuateNode(context.Background(), c.nodeID, EvacuateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Moved) != 0 || res.Remaining != 1 || res.RemainingMovable != 0 || len(source.calls) != 0 {
+		t.Fatalf("pass with the switch off = %+v, calls %v", res, source.calls)
+	}
+
+	seedCapacityHeartbeats(c, labelled(self))
+	res, err = c.EvacuateNode(context.Background(), c.nodeID, EvacuateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.Moved, ",") != "sb-g" || res.Remaining != 0 || res.RemainingMovable != 0 {
+		t.Fatalf("pass = %+v", res)
+	}
+	if owner, err := c.OwnerOf("sb-g"); err != nil || owner.NodeID != "wkr-b" {
+		t.Fatalf("sb-g owner = %+v %v", owner, err)
+	}
+	if got := strings.Join(source.calls, "; "); got != "release sb-g for wkr-b" {
+		t.Fatalf("source calls: %s", got)
+	}
+	if got := strings.Join(target.calls, "; "); got != "import sb-g from "+c.nodeID+"; start sb-g from alpine" {
 		t.Fatalf("target calls: %s", got)
 	}
 }
@@ -157,28 +235,44 @@ func TestPlacementWantsSnapshotMove(t *testing.T) {
 		}
 		return Placement{SandboxID: "sb", Spec: spec}
 	}
+	gvisor := Placement{SandboxID: "sb", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeGvisor}}
+	mover := Member{NodeID: "a", Capacity: capacity.Snapshot{Labels: map[string]string{CheckpointMovesLabel: "true"}}}
+	plain := Member{NodeID: "a"}
 	for _, tc := range []struct {
-		name string
-		p    Placement
-		want bool
+		name   string
+		p      Placement
+		source Member
+		want   bool
 	}{
-		{"a Firecracker sandbox", fc(nil), true},
-		{"with mounts", fc(func(s *models.CreateSandboxRequest) { s.Mounts = []models.MountSpec{{Type: "s3"}} }), false},
+		{"a Firecracker sandbox", fc(nil), plain, true},
+		{"with mounts", fc(func(s *models.CreateSandboxRequest) { s.Mounts = []models.MountSpec{{Type: "s3"}} }), plain, false},
 		{"with the recreate policy: recreate decides", fc(func(s *models.CreateSandboxRequest) {
 			s.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
-		}), false},
-		{"gVisor", Placement{SandboxID: "sb", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeGvisor}}, false},
-		{"no spec", Placement{SandboxID: "sb"}, false},
+		}), plain, false},
+		{"gVisor on a worker that moves them (C21)", gvisor, mover, true},
+		{"gVisor on a worker with the switch off", gvisor, plain, false},
+		{"runc", Placement{SandboxID: "sb", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeDocker}}, mover, false},
+		{"no spec", Placement{SandboxID: "sb"}, mover, false},
 	} {
-		if got := placementWantsSnapshotMove(tc.p); got != tc.want {
+		if got := placementWantsSnapshotMove(tc.p, tc.source); got != tc.want {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
 		}
 	}
-	if why := snapshotTargetFits(Member{Arch: "amd64"}, Member{NodeID: "b", Arch: "arm64"}); !strings.Contains(why, "arm64") {
+	if why := snapshotTargetFits(fc(nil), Member{Arch: "amd64"}, Member{NodeID: "b", Arch: "arm64"}); !strings.Contains(why, "arm64") {
 		t.Fatalf("another architecture: %q", why)
 	}
-	if why := snapshotTargetFits(Member{Arch: "amd64", Version: "v1"}, Member{Arch: "amd64", Version: "v1"}); why != "" {
+	if why := snapshotTargetFits(fc(nil), Member{Arch: "amd64", Version: "v1"}, Member{Arch: "amd64", Version: "v2"}); !strings.Contains(why, "v2") {
+		t.Fatalf("another build: %q", why)
+	}
+	if why := snapshotTargetFits(fc(nil), Member{Arch: "amd64", Version: "v1"}, Member{Arch: "amd64", Version: "v1"}); why != "" {
 		t.Fatalf("the same build refused: %q", why)
+	}
+	// A gVisor checkpoint goes only to a worker that restores them.
+	if why := snapshotTargetFits(gvisor, mover, Member{NodeID: "b"}); !strings.Contains(why, "gVisor") {
+		t.Fatalf("a target without the switch: %q", why)
+	}
+	if why := snapshotTargetFits(gvisor, mover, mover); why != "" {
+		t.Fatalf("a target that restores them refused: %q", why)
 	}
 }
 
@@ -191,13 +285,13 @@ func TestRunSnapshotMoveAction(t *testing.T) {
 		{Action: "release-snapshot", IDs: []string{"sb"}, Target: "b"},
 		{Action: "import", IDs: []string{"sb"}, Source: "a"},
 		{Action: "drop", IDs: []string{"sb"}},
-		{Action: "start-moved", IDs: []string{"sb"}},
+		{Action: "start-moved", IDs: []string{"sb"}, Recreate: &MoveRecreate{Spec: models.CreateSandboxRequest{Image: "alpine"}}},
 	} {
 		if _, err := RunMoveAction(ctx, h, a); err != nil {
 			t.Fatalf("%s: %v", a.Action, err)
 		}
 	}
-	if got := strings.Join(h.calls, "; "); got != "release sb for b; import sb from a; drop sb; start sb" {
+	if got := strings.Join(h.calls, "; "); got != "release sb for b; import sb from a; drop sb; start sb from alpine" {
 		t.Fatalf("calls: %s", got)
 	}
 	for _, a := range []MoveAction{
@@ -268,5 +362,25 @@ func TestFetchMoveBundleOutlastsTheClientTimeout(t *testing.T) {
 	defer cancel()
 	if err := FetchMoveBundle(ctx, peer, "worker-a", "sb-1", &bytes.Buffer{}); err == nil {
 		t.Fatal("the move's deadline did not end the pull")
+	}
+}
+
+// RecreateInputs is what the owner watcher and a gVisor move's target
+// rebuild a sandbox from: its spec, its secrets handle, its ports.
+func TestRecreateInputs(t *testing.T) {
+	if _, _, _, ok := RecreateInputs(Placement{SandboxID: "sb"}); ok {
+		t.Fatal("a placement without a spec gave inputs")
+	}
+	spec := models.CreateSandboxRequest{Image: "alpine", Runtime: models.RuntimeGvisor}
+	p := Placement{SandboxID: "sb", Spec: &spec, IncarnationID: "inc-1", SecretRef: "ref-1", OwnerRef: "acct",
+		ExposedPorts: map[int]string{8080: "http"}}
+	got, sealed, ports, ok := RecreateInputs(p)
+	if !ok || got.Image != "alpine" || sealed.IncarnationID != "inc-1" || sealed.Ref != "ref-1" || sealed.OwnerRef != "acct" ||
+		ports[8080].Protocol != "http" {
+		t.Fatalf("inputs: %+v %+v %+v %v", got, sealed, ports, ok)
+	}
+	got.Image = "changed"
+	if p.Spec.Image != "alpine" {
+		t.Fatal("the inputs share the placement's spec")
 	}
 }

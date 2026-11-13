@@ -52,7 +52,7 @@ func TestRuntimeContainerOptRunsc(t *testing.T) {
 // create with "type with url ...: not found" on the shim.
 func TestRunscRuntimeOptsWireType(t *testing.T) {
 	d := New(Config{RunDir: t.TempDir()}, nil, nil)
-	v, err := d.runscRuntimeOpts()
+	v, err := d.runscRuntimeOpts(false)
 	if err != nil {
 		t.Fatal(err)
 	}

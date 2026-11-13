@@ -42,6 +42,8 @@ const (
 	startKindRequested = "requested"
 	startKindRestarted = "restarted"
 	startKindFailover  = "failover"
+	// startKindMoved: a decommission moved it here with its memory (C21).
+	startKindMoved = "moved"
 )
 
 // metricReason keeps a label inside the fixed reason set: anything else is

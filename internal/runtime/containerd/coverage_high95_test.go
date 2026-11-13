@@ -750,7 +750,7 @@ func TestEnsureRunscConfigReadError(t *testing.T) {
 
 func TestRunscRuntimeOptsNilDriverHigh95(t *testing.T) {
 	var d *Driver
-	if _, err := d.runscRuntimeOpts(); err == nil {
+	if _, err := d.runscRuntimeOpts(false); err == nil {
 		t.Fatal("want error from nil driver")
 	}
 }

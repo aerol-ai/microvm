@@ -66,4 +66,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fetch /out/ /usr/local/bin/
 COPY ${TARGETARCH}/aerolvm-supervisor /usr/local/bin/aerolvm-supervisor
+# aerolvm-runsc is the supervisor under another name: the runsc the gVisor
+# shim runs for a sandbox moved here with its memory (internal/runscwrap).
+RUN ln -s aerolvm-supervisor /usr/local/bin/aerolvm-runsc
 ENTRYPOINT ["/usr/local/bin/aerolvm-supervisor"]

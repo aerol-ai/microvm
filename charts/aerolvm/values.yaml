@@ -92,6 +92,12 @@ worker:
   firecracker:
     enabled: false
     jailerUID: 990
+  # A decommission moves a running gVisor sandbox to another worker with its
+  # memory: its programs keep running, its open connections drop (C21).
+  # false is the kill switch: such a sandbox is then rebuilt or stopped as
+  # its failover policy says.
+  gvisor:
+    checkpointMoves: true
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
   # In cluster mode the operator adds the API server to the first and the
   # pod and Service ranges to the second, for every new worker; you add

@@ -282,7 +282,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
-	host.Labels = cfg.NodeLabels
+	host.Labels = hostLabels(cfg)
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -2381,4 +2381,20 @@ func firecrackerTapHost(cfg config.Config) *tap.Host {
 		h.Owner = &tap.Owner{UID: cfg.JailerUID, GID: cfg.JailerGID}
 	}
 	return h
+}
+
+// hostLabels are the labels this node's capacity reports: its placement
+// labels, and on a worker that moves gVisor sandboxes with their memory
+// (C21), the label the decommission leader looks for on both ends of such
+// a move.
+func hostLabels(cfg config.Config) map[string]string {
+	if !cfg.GvisorCheckpointMoves || cfg.ContainerEngine != models.ContainerEngineContainerd {
+		return cfg.NodeLabels
+	}
+	out := make(map[string]string, len(cfg.NodeLabels)+1)
+	for k, v := range cfg.NodeLabels {
+		out[k] = v
+	}
+	out[cluster.CheckpointMovesLabel] = "true"
+	return out
 }

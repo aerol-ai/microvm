@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // A worker pod whose agent container owns its PID namespace would kill every
@@ -59,5 +62,32 @@ func TestFirecrackerTapHost(t *testing.T) {
 	}
 	if h := firecrackerTapHost(config.Config{}); h.Owner != nil {
 		t.Fatalf("no jailer: owner %+v", h.Owner)
+	}
+}
+
+// A worker that moves gVisor sandboxes with their memory says so in its
+// capacity labels, which the decommission leader reads on both ends of a
+// move (C21); the operator's own labels stay, and nothing else changes.
+func TestHostLabels(t *testing.T) {
+	pool := map[string]string{"aerolvm.io/pool": "general"}
+	for _, tc := range []struct {
+		name   string
+		cfg    config.Config
+		labels map[string]string
+	}{
+		{"switch off", config.Config{NodeLabels: pool, ContainerEngine: models.ContainerEngineContainerd}, pool},
+		{"switch on, Docker engine", config.Config{NodeLabels: pool, GvisorCheckpointMoves: true, ContainerEngine: models.ContainerEngineDocker}, pool},
+		{"switch on, containerd", config.Config{NodeLabels: pool, GvisorCheckpointMoves: true, ContainerEngine: models.ContainerEngineContainerd},
+			map[string]string{"aerolvm.io/pool": "general", cluster.CheckpointMovesLabel: "true"}},
+		{"switch on, no labels of its own", config.Config{GvisorCheckpointMoves: true, ContainerEngine: models.ContainerEngineContainerd},
+			map[string]string{cluster.CheckpointMovesLabel: "true"}},
+	} {
+		got := hostLabels(tc.cfg)
+		if !maps.Equal(got, tc.labels) {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.labels)
+		}
+	}
+	if pool[cluster.CheckpointMovesLabel] != "" {
+		t.Fatal("hostLabels wrote into the config's own map")
 	}
 }

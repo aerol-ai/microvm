@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -35,6 +36,12 @@ import (
 // lapses into a start from its own snapshot (resumeLapsedMove), so the
 // sandbox loses nothing but the time the move took. A failed start leaves
 // the sandbox stopped on the target, where its next start restores it.
+//
+// A gVisor sandbox moves the same way (C21) between workers that both
+// carry CheckpointMovesLabel: the source's stop saves it with runsc, and
+// the target rebuilds it after the swap, restoring that checkpoint. Its
+// steps before the swap get checkpointMoveBudget; a failed one lapses the
+// source into a start from its image (its memory is lost, as before C21).
 
 const (
 	// PublicInternalMovePath prefixes the source's per-sandbox bundle route.
@@ -47,6 +54,13 @@ const (
 	// moveStartTimeout bounds the target's start after the swap: a restore
 	// that copies the sandbox's disk into place first.
 	moveStartTimeout = 5 * time.Minute
+	// checkpointMoveBudget bounds a gVisor move's steps before the swap:
+	// the save and the pull (plan C21: 60 s per sandbox, so a node's
+	// decommission deadline fits its moves).
+	checkpointMoveBudget = 60 * time.Second
+	// CheckpointMovesLabel is the label a worker that moves gVisor
+	// sandboxes with their memory carries (SB_GVISOR_CHECKPOINT_MOVES).
+	CheckpointMovesLabel = "aerolvm.io/gvisor-checkpoint-moves"
 )
 
 // SnapshotMoveHandler is the worker's half of a snapshot move. It is
@@ -59,8 +73,27 @@ type SnapshotMoveHandler interface {
 	ImportMove(ctx context.Context, id, source string) error
 	// DropMove undoes ImportMove when the move does not happen.
 	DropMove(ctx context.Context, id string) error
-	// StartMoved starts id once the placement names this node.
-	StartMoved(ctx context.Context, id string) error
+	// StartMoved starts id once the placement names this node. rc is what
+	// to rebuild it from, for a runtime that rebuilds rather than restarts.
+	StartMoved(ctx context.Context, id string, rc *MoveRecreate) error
+}
+
+// MoveRecreate is RecreateInputs of a moved sandbox's placement, as the
+// leader read it: what the target needs to rebuild the sandbox.
+type MoveRecreate struct {
+	Spec               models.CreateSandboxRequest `json:"spec"`
+	Secrets            PlacementSecrets            `json:"secrets"`
+	Ports              map[int]ExposedPortRoute    `json:"ports,omitempty"`
+	OwnerSinceUnixNano int64                       `json:"owner_since_unix_nano,omitempty"`
+}
+
+// moveRecreateFor is p's MoveRecreate, or nil without a spec.
+func moveRecreateFor(p Placement) *MoveRecreate {
+	spec, sealed, ports, ok := RecreateInputs(p)
+	if !ok {
+		return nil
+	}
+	return &MoveRecreate{Spec: spec, Secrets: sealed, Ports: ports, OwnerSinceUnixNano: p.OwnerSinceUnixNano}
 }
 
 // MoveBundlePath is the source's route for id's bundle.
@@ -74,23 +107,49 @@ func MoveBundleAAD(id, incarnationID, target string) []byte {
 	return []byte("aerolvm-move-v1|" + id + "|" + incarnationID + "|" + target)
 }
 
-// placementWantsSnapshotMove reports whether p moves by snapshot: a
-// Firecracker sandbox (memory and all) without the recreate policy, which
-// decides first, and with no external-storage mounts, whose re-attach on
-// the target is not designed (as for C21).
-func placementWantsSnapshotMove(p Placement) bool {
-	if p.IsDeleting() || p.Spec == nil || placementWantsFailoverRecreate(p) {
+// placementWantsSnapshotMove reports whether p moves off source with its
+// memory: a Firecracker sandbox, or a gVisor one on a source that moves
+// those (checkpointMover), without the recreate policy, which decides
+// first, and with no external-storage mounts, whose re-attach on the
+// target is not designed (C21).
+func placementWantsSnapshotMove(p Placement, source Member) bool {
+	if p.IsDeleting() || p.Spec == nil || placementWantsFailoverRecreate(p) || len(p.Spec.Mounts) > 0 {
 		return false
 	}
-	return strings.TrimSpace(p.Spec.Runtime) == models.RuntimeFirecracker && len(p.Spec.Mounts) == 0
+	switch strings.TrimSpace(p.Spec.Runtime) {
+	case models.RuntimeFirecracker:
+		return true
+	case models.RuntimeGvisor:
+		return checkpointMover(source)
+	}
+	return false
+}
+
+// heartbeatCapacity is m's capacity as its last heartbeat reported it (the
+// placement view), or what m already carries when there is none.
+func (c *Cluster) heartbeatCapacity(m Member) capacity.Snapshot {
+	if got := c.membersWithCapacityFor([]string{m.NodeID}); len(got) == 1 && hasCapacitySnapshot(got[0].Capacity) {
+		return got[0].Capacity
+	}
+	return m.Capacity
+}
+
+// checkpointMover reports whether m moves gVisor sandboxes with their
+// memory: its capacity reports CheckpointMovesLabel. A worker with the
+// switch off (or a build before C21) does not, and its gVisor sandboxes
+// take the next §10.5 row.
+func checkpointMover(m Member) bool {
+	return m.Capacity.Labels[CheckpointMovesLabel] == "true"
 }
 
 // snapshotTargetFits reports why target cannot restore a VM snapshotted on
 // source, or "" when it can: Firecracker restores a snapshot only on the
 // same CPU type and Firecracker version, which the same build on the same
 // architecture stands for here (a pool is one machine type).
-func snapshotTargetFits(source, target Member) string {
+func snapshotTargetFits(p Placement, source, target Member) string {
 	switch {
+	case p.Spec != nil && strings.TrimSpace(p.Spec.Runtime) == models.RuntimeGvisor && !checkpointMover(target):
+		return fmt.Sprintf("target %s does not restore gVisor checkpoints", target.NodeID)
 	case source.Arch != "" && target.Arch != source.Arch:
 		return fmt.Sprintf("target %s is %s, the source %s", target.NodeID, target.Arch, source.Arch)
 	case source.Version != "" && target.Version != source.Version:
@@ -101,6 +160,14 @@ func snapshotTargetFits(source, target Member) string {
 
 // moveSnapshotOne moves p off source by snapshot.
 func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Member) error {
+	importTimeout := importMoveTimeout
+	pre := ctx
+	if p.Spec != nil && strings.TrimSpace(p.Spec.Runtime) == models.RuntimeGvisor {
+		var cancel context.CancelFunc
+		pre, cancel = context.WithTimeout(ctx, checkpointMoveBudget)
+		defer cancel()
+		importTimeout = checkpointMoveBudget
+	}
 	target, err := c.selectRecreationTargetAvoiding(p, c.lastKnownZone(source.NodeID), source.NodeID)
 	if err != nil {
 		return err
@@ -112,10 +179,11 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	if !ok {
 		return fmt.Errorf("target %s is not a member", target.NodeID)
 	}
-	if why := snapshotTargetFits(source, tm); why != "" {
+	tm.Capacity = c.heartbeatCapacity(tm)
+	if why := snapshotTargetFits(p, source, tm); why != "" {
 		return errors.New("snapshot move: " + why)
 	}
-	rctx, cancel := context.WithTimeout(ctx, moveStepTimeout)
+	rctx, cancel := context.WithTimeout(pre, moveStepTimeout)
 	out, err := c.moveCall(rctx, source, MoveAction{Action: "release-snapshot", IDs: []string{p.SandboxID}, Target: target.NodeID})
 	cancel()
 	if err != nil {
@@ -132,7 +200,7 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		}
 		return why
 	}
-	ictx, cancel := context.WithTimeout(ctx, importMoveTimeout)
+	ictx, cancel := context.WithTimeout(pre, importTimeout)
 	out, err = c.moveCall(ictx, tm, MoveAction{Action: "import", IDs: []string{p.SandboxID}, Source: source.NodeID})
 	cancel()
 	if err == nil && out.Error != "" {
@@ -154,8 +222,9 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	}); err != nil {
 		return drop(err)
 	}
+	// After the swap: not cut short by a gVisor move's budget.
 	sctx, cancel := context.WithTimeout(ctx, moveStartTimeout)
-	out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}})
+	out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}, Recreate: moveRecreateFor(p)})
 	cancel()
 	if err == nil && out.Error != "" {
 		err = errors.New(out.Error)
@@ -194,7 +263,7 @@ func runSnapshotMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (Mo
 	case "drop":
 		err = sh.DropMove(ctx, id)
 	case "start-moved":
-		err = sh.StartMoved(ctx, id)
+		err = sh.StartMoved(ctx, id, a.Recreate)
 	}
 	if err != nil {
 		return MoveActionResult{Error: err.Error()}, nil

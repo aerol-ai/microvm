@@ -25,7 +25,10 @@ const (
 	auditSubsystemReconcile   = "reconcile"
 	auditSubsystemLifecycle   = "lifecycle"
 	auditSubsystemFailover    = "failover"
-	auditSubsystemImageGC     = "image-gc"
+	// auditSubsystemMove: a decommission moved the sandbox here with its
+	// memory (C21).
+	auditSubsystemMove    = "move"
+	auditSubsystemImageGC = "image-gc"
 	// auditSubsystemWake is a sandbox started by traffic to one of its
 	// routes (HTTP or L4 wake), not by an API call.
 	auditSubsystemWake = "wake"
