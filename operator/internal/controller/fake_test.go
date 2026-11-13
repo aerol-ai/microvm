@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -116,6 +117,10 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(v1.AddToScheme(s))
+	// cert-manager's Certificate, which the operator reads and writes
+	// unstructured (external-CA mode, C23).
+	s.AddKnownTypeWithName(certificateGVK, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(certificateGVK.GroupVersion().WithKind("CertificateList"), &unstructured.UnstructuredList{})
 	return s
 }
 
