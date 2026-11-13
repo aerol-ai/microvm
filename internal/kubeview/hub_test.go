@@ -185,6 +185,15 @@ func TestHubResume(t *testing.T) {
 			t.Fatalf("from 0 = %+v, want %s", ev, id)
 		}
 	}
+	// Then the end of the initial list, at the position it was read at.
+	if ev, pos := next(t, all), h.position; ev.Type != Bookmark || ev.RV != pos {
+		t.Fatalf("after the replay = %+v, want a Bookmark at %d", ev, pos)
+	}
+	// A watch from a version replays changes only: no such marker.
+	h.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{upsert(row("sb5", "team:a", 17), 17)}, Next: 17})
+	if ev := next(t, ch); ev.Type != Modified {
+		t.Fatalf("a watch from a version = %+v", ev)
+	}
 }
 
 func TestHubExpiredAndTooNew(t *testing.T) {
@@ -323,5 +332,37 @@ func TestHubReadyOnAnEmptyView(t *testing.T) {
 	h.Apply(cluster.PlacementFeedEvent{View: true, Next: 4})
 	if rv, err := h.Position(); err != nil || rv != 4 {
 		t.Fatalf("Position = %d %v", rv, err)
+	}
+}
+
+// AllOwners watches every owner at once: the backlog and live events of
+// each.
+func TestHubWatchAllOwners(t *testing.T) {
+	h := readyHub(t, Options{}, row("sb1", "team:a", 3), row("sb2", "team:b", 4))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	all, err := h.Watch(ctx, AllOwners, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	got[next(t, all).Item.Placement.SandboxID] = true
+	got[next(t, all).Item.Placement.SandboxID] = true
+	if !got["sb1"] || !got["sb2"] {
+		t.Fatalf("backlog = %v", got)
+	}
+	if ev := next(t, all); ev.Type != Bookmark {
+		t.Fatalf("after the backlog = %+v, want its end", ev)
+	}
+	h.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{upsert(row("sb3", "team:c", 11), 11)}, Next: 11})
+	if ev := next(t, all); ev.Item.Placement.SandboxID != "sb3" {
+		t.Fatalf("live = %+v", ev)
+	}
+	resumed, err := h.Watch(ctx, AllOwners, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := next(t, resumed); ev.Type != Added || ev.Item.Placement.SandboxID != "sb3" {
+		t.Fatalf("resumed = %+v", ev)
 	}
 }
