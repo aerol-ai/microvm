@@ -786,7 +786,7 @@ move the table to disk with incremental snapshots.
 | Creates per second, sustained | ≥ 1,000 | 1,174 at 64 creates at once (p50 46 ms), 1,202 at 128 (p50 85 ms) |
 | Live sandboxes | ≥ 100,000 (about 72 MB of table per server) | not measured live: the bench deletes as it goes |
 | Workers | ≥ 500 | 500, joined in 20 to 40 s |
-| Raft commit p99 under that load | ≤ 25 ms | **missed**: 25 to 50 ms at 985 creates/s, 50 to 100 ms at 1,174, and 500 to 700 applies over 1 s per 2 minutes (F29) |
+| Raft commit p99 under that load | ≤ 25 ms | **just missed**: 25 to 50 ms at 996 creates/s (98.8% ≤ 25 ms); the 1 s pauses were the servers' disks, and with 16,000 IOPS there are none (F29) |
 | Owner lookups that reach a server | 0 on a cache hit | not measured: each sandbox is deleted before the cache has it |
 | Failover of 1,000 sandboxes from one dead worker | ≤ 60 s | all within 50 s |
 | Server restart to caught up, at 100,000 sandboxes | ≤ 30 s | not measured |
@@ -2254,12 +2254,22 @@ each server used about 6% of one core and 160 MB (E5 above).
   reservations are bounded, never heartbeats, deletes or repairs
   (`TestLeaderRefusesReservationsPastTheLimit`). A bench re-run at 512 at
   once would show the timeouts become 429s.
-- F29 (open). Raft apply p99 is over the 25 ms target: 25 to 50 ms at 985
-  creates a second, 50 to 100 ms above, with 500 to 700 applies over 1 s
-  in each 2-minute step (none at 985/s). The CPU profiles do not show
-  them, so they are pauses, not load; the snapshot (the recovery store
-  syncs its files then, §9.4 E4) is the first suspect. The bench now
-  records the snapshot metrics to settle it.
+- F29 (settled: the servers' disks). Raft apply p99 was over the 25 ms
+  target, with 500 to 700 applies over 1 s in a 2-minute step. The bench's
+  snapshot metrics placed them: each snapshot (every 120 s) fsynced every
+  recovery blob written since the last, and took 12.9 s and 28.8 s for
+  snapshots of 584 and 125 placements (`bench-f29-1`), while Raft's log
+  fsyncs and the FSM's own blob writes queued behind them on a gp3 disk
+  at its floor (3,000 IOPS, 125 MB/s). Two changes:
+  - The store syncs many blobs with one `syncfs` (`recoveryStoreSyncFS`):
+    20,000 blobs in 0.35 s instead of 4.9 s offline; snapshots of 5.2 s and
+    11.5 s on the same disk (`bench-f29-2`). On that disk the pauses stayed.
+  - With server disks of 16,000 IOPS and 1,000 MB/s (`bench-f29-3`), no
+    apply took over 1 s in any step below the 512-at-once overload, and the
+    cell did 1,283 creates a second at 64 at once (p99 188 ms) and 1,317 at
+    128. The chart's values and docs now say so.
+  Raft apply p99 at about 1,000 creates a second is still just over the
+  target: 98.8% of applies took 25 ms or less at 32 at once.
 - F30 (fixed). An owner lookup the cache misses read the sandbox's
   recovery file from disk (`fullPlacementLocked`, then
   `resolveRecoveryRef`): 8% of the leader's CPU at 1,174 creates a

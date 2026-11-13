@@ -431,21 +431,27 @@ if [[ -n "$dry" ]]; then
 fi
 
 # --- launch ------------------------------------------------------------------
-run() { # <ud file> <type> <ip or ""> [prefixes]
+run() { # <ud file> <type> <ip or ""> [prefixes] [disk]
   local ni="DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true"
   [[ -n "$3" ]] && ni+=",PrivateIpAddress=$3"
   [[ -n "${4:-}" ]] && ni+=",Ipv4Prefixes=[$(for p in $4; do printf '{Ipv4Prefix=%s},' "$p"; done | sed 's/,$//')]"
   aws ec2 run-instances --image-id "$ami" --instance-type "$2" --network-interfaces "$ni" \
     --instance-initiated-shutdown-behavior terminate --user-data "file://$1" \
-    --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
+    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true${5:-}}" \
     --tag-specifications "$(printf "$tags" instance)" "$(printf "$tags" volume)" \
     --query 'Instances[0].InstanceId' --output text
 }
 declare -A ids
+# AEROL_BENCH_SERVER_IOPS: the servers' gp3 IOPS and MB/s (3000/125 is
+# gp3's floor), to tell a disk limit from the code's (F29).
+server_disk=""
+if [[ -n "${AEROL_BENCH_SERVER_IOPS:-}" ]]; then
+  server_disk=",Iops=$AEROL_BENCH_SERVER_IOPS,Throughput=${AEROL_BENCH_SERVER_MBPS:-1000}"
+fi
 for s in s1 s2 s3; do
   ip="${!s}"
   server_ud "$s" "$ip" > "$sd/ud-$s.sh"
-  ids[$s]="$(run "$sd/ud-$s.sh" "$server_type" "$ip")"; instances+=" ${ids[$s]}"
+  ids[$s]="$(run "$sd/ud-$s.sh" "$server_type" "$ip" "" "$server_disk")"; instances+=" ${ids[$s]}"
 done
 for m in $(seq 1 "$machines"); do
   worker_ud "$m" > "$sd/ud-m$m.sh"
@@ -453,7 +459,7 @@ for m in $(seq 1 "$machines"); do
 done
 driver_ud > "$sd/ud-driver.sh"
 ids[driver]="$(run "$sd/ud-driver.sh" "$driver_type" "$drv")"; instances+=" ${ids[driver]}"
-say "machines: 3 × $server_type, $machines × $worker_type ($per stand-ins each), driver $driver_type; $(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].Name' --output text)"
+say "machines: 3 × $server_type${server_disk:+ (gp3$server_disk)}, $machines × $worker_type ($per stand-ins each), driver $driver_type; $(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].Name' --output text)"
 
 # --- results -----------------------------------------------------------------
 console() { aws ec2 get-console-output --instance-id "$1" --latest --query Output --output text 2>/dev/null || true; }

@@ -288,6 +288,10 @@ cluster:
       size: 20Gi
       # A class that binds on first use (volumeBindingMode:
       # WaitForFirstConsumer), so each server's disk lands in its zone.
+      # A cell near G3 (1,000 creates a second) needs fast server disks:
+      # on gp3's floor (3,000 IOPS) Raft applies paused for 1 to 5 s every
+      # 2 minutes, and with 16,000 IOPS and 1,000 MB/s none did (F29). On
+      # EKS, a gp3 StorageClass with parameters iops and throughput.
       storageClassName: ""
     # Enough for a small cell. A cell near G3 (500 workers, 1,000 creates a
     # second) needs 4 CPUs on its servers: the Raft leader used 2 to 3 cores
