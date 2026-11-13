@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -422,4 +424,32 @@ func gvisorRecreate(c *moveStubCluster) *cluster.MoveRecreate {
 	p, _ := c.PlacementOf("sb-g")
 	spec, sealed, ports, _ := cluster.RecreateInputs(p)
 	return &cluster.MoveRecreate{Spec: spec, Secrets: sealed, Ports: ports}
+}
+
+// A bundle goes out once: of many pulls at the same moment, exactly one
+// claims it, and a pull by another node neither gets it nor uses it up.
+func TestMoveTargetsTakeOnce(t *testing.T) {
+	var m moveTargets
+	m.set("sb", "worker-b")
+	if m.take("sb", "worker-c") || m.get("sb") != "worker-b" {
+		t.Fatal("another node claimed, or used up, the bundle")
+	}
+	var won atomic.Int32
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if m.take("sb", "worker-b") {
+				won.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if won.Load() != 1 || m.get("sb") != "" {
+		t.Fatalf("%d pulls claimed the bundle; target left %q", won.Load(), m.get("sb"))
+	}
+	if m.take("missing", "worker-b") {
+		t.Fatal("a sandbox never released was claimed")
+	}
 }

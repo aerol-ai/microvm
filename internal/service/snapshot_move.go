@@ -102,6 +102,19 @@ func (m *moveTargets) clear(id string) {
 	delete(m.target, id)
 }
 
+// take claims id's bundle for peer: true, and the target gone, only when
+// peer is the target the release named. One lock for the check and the
+// claim, so two pulls never both pass.
+func (m *moveTargets) take(id, peer string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t := m.target[id]; t == "" || t != peer {
+		return false
+	}
+	delete(m.target, id)
+	return true
+}
+
 // checkpointRows holds, per gVisor sandbox imported here, the row its
 // bundle carried, until its start after the swap or a drop. It is not
 // stored: until the swap this node does not own the sandbox, and a restart
@@ -207,11 +220,14 @@ func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target string)
 // release named may have it, and only while the sandbox is released here.
 func (s *Service) ExportMove(ctx context.Context, id, peer string, w io.Writer) error {
 	id = strings.TrimSpace(id)
-	target := s.moveTargets.get(id)
-	if target == "" || target != strings.TrimSpace(peer) || !s.moveFenced(id) {
+	target := strings.TrimSpace(peer)
+	// A bundle goes out once, so the target is claimed here, before a byte
+	// is written. Cleared at the end instead, the importer could finish
+	// reading before the export returned, and a second pull right after it
+	// still found the target and got the bundle again.
+	if !s.moveFenced(id) || !s.moveTargets.take(id, target) {
 		return ErrMoveNotForThisNode
 	}
-	defer s.moveTargets.clear(id)
 	inc, err := s.ownedIncarnation(ctx, id)
 	if err != nil {
 		return err
