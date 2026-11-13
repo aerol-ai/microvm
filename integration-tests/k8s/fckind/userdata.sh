@@ -297,11 +297,304 @@ YAML
   dumpapi
 }
 
+# External-CA mode (C23, plan §15.2.1): every node's certificate comes from
+# a cert-manager CA issuer standing in for the bank's; no CA key and no
+# join token anywhere. The cluster works on those certificates, a renewal
+# keeps the key, and the join port refuses a second key for a node, a
+# certificate with no role and one from another CA.
+proof_externalca() {
+  local kk="kubectl --context kind-aerolvm-cluster"
+  local kc="$kk -n aerolvm-system" kw="$kk -n aerolvm-workers"
+  local pass=1 i
+  ok() { say "OK $*"; }
+  bad() { say "BAD $*"; pass=0; }
+  local mode
+  mode=$($kc get aerolcluster aerolvm -o jsonpath='{.status.conditions[?(@.type=="ExternalCA")].status} {.status.conditions[?(@.type=="ExternalCA")].message}')
+  [ "${mode%% *}" = True ] && ok "mode recorded: $mode" || bad "mode not recorded: $mode"
+  say "nodes: $($kc get aerolnodes --no-headers 2>&1 | awk '{printf "%s/%s/%s ", $1, $2, $4}')"
+  local nodes certs ready
+  nodes=$($kc get aerolnodes --no-headers 2>/dev/null | wc -l)
+  certs=$($kk get certificates -A -l app.kubernetes.io/managed-by=aerolvm-operator --no-headers 2>/dev/null | wc -l)
+  ready=$($kk get certificates -A -l app.kubernetes.io/managed-by=aerolvm-operator --no-headers 2>/dev/null | awk '$3 == "True"' | wc -l)
+  [ "$certs" -eq "$nodes" ] && [ "$ready" -eq "$nodes" ] && ok "certificates: $ready of $nodes nodes, all ready" || bad "certificates: $certs made, $ready ready, $nodes nodes"
+  local waited
+  waited=$($kc get events --field-selector involvedObject.kind=AerolNode -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null | grep -c 'waiting for its certificate')
+  say "nodes that waited for their certificate (events): $waited"
+  local joins tokvols
+  joins=$($kk get secrets -A --no-headers 2>/dev/null | awk '$2 ~ /-join$/' | wc -l)
+  tokvols=$({ $kc get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; $kw get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; } 2>/dev/null | grep -cx join)
+  [ "$joins" -eq 0 ] && [ "$tokvols" -eq 0 ] && ok "no join token: no -join Secret, no pod with a join volume" || bad "join tokens: $joins Secrets, $tokvols pod volumes"
+  local s0=aerolvm-server-0
+  say "server 0 TLS dir: $($kc exec $s0 -c agent -- ls /var/run/aerolvm-tls 2>&1 | tr '\n' ' ')"
+  say "server 0 settings: $($kc exec $s0 -c agent -- sh -c 'grep -h "^SB_CLUSTER_EXTERNAL_CA\|^SB_CLUSTER_TLS_DIR" /etc/sandboxd/*.env' 2>&1 | sort -u | tr '\n' ' ')"
+  # Counted in the pod, which always prints one number: arithmetic on
+  # anything else would make bash drop the rest of this proof.
+  local cakeys=0 p c
+  for p in $($kc get pods -l app.kubernetes.io/component=server -o name); do
+    c=$($kc exec ${p#pod/} -c agent -- sh -c 'ls -R /etc/sandboxd /var/lib/sandboxd /var/run/aerolvm-tls 2>/dev/null | grep -c "^ca\.key$"; true' 2>/dev/null | head -1)
+    [[ "$c" =~ ^[0-9]+$ ]] || { bad "could not look for a CA key in ${p#pod/}"; c=0; }
+    cakeys=$((cakeys + c))
+  done
+  [ "$cakeys" -eq 0 ] && ok "no CA key on any server" || bad "$cakeys ca.key files on the servers"
+  local w
+  w=$($kw get pods -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')
+  crt() { $kw get secret "$w-cert" -o jsonpath='{.data.tls\.crt}' | base64 -d; }
+  say "worker $w certificate: $(crt | openssl x509 -noout -issuer -serial -ext subjectAltName 2>&1 | tr -s ' \n' ' ' | head -c 400)"
+
+  # The cluster works on these certificates: members, and a create through
+  # a gateway to a worker (gateway-worker mutual TLS).
+  local tok port=21297 pf=""
+  tok="$($kc get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+  for _ in $(seq 1 30); do
+    [ -n "$pf" ] && kill $pf 2>/dev/null
+    $kc port-forward svc/aerolvm-gateway $port:21212 >/dev/null 2>&1 & pf=$!
+    sleep 2
+    curl -fsS -m 3 -o /dev/null http://127.0.0.1:$port/health 2>/dev/null && break
+  done
+  api() { curl -sS -m 300 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
+  members() { api http://127.0.0.1:$port/v1/cluster/members | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("members", d); print(" ".join(x["node_id"]+"/"+x.get("role","")+("/alive" if x.get("alive") else "") for x in m))'; }
+  local m n
+  for i in $(seq 1 60); do
+    m=$(members 2>/dev/null); n=$(tr ' ' '\n' <<<"$m" | grep -c '/alive$')
+    [ "$n" -ge "$nodes" ] && break
+    sleep 5
+  done
+  [ "$n" -ge "$nodes" ] && ok "members: $n alive" || bad "members: $n alive of $nodes: $m"
+  create() { # prints the new sandbox's ID, or nothing
+    local out id
+    for i in $(seq 1 18); do
+      out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"gvisor","image":"alpine:3.20","cpu":1,"memory_mb":256}')
+      id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
+      [ -n "$id" ] && break
+      sleep 10
+    done
+    [ -n "$id" ] || say "create failed: $(head -c 300 <<<"$out")" >&2
+    echo "$id"
+  }
+  exec_in() { api -X POST "http://127.0.0.1:$port/v1/sandboxes/$1/toolbox/process/execute" -d '{"command":"echo hello-from-$(hostname)"}' | head -c 200; }
+  local id
+  id=$(create)
+  if [ -n "$id" ]; then
+    local e; e=$(exec_in "$id")
+    grep -q hello-from <<<"$e" && ok "create and exec through a gateway: $e" || bad "exec: $e"
+    api -X DELETE "http://127.0.0.1:$port/v1/sandboxes/$id" >/dev/null
+  else
+    bad "no sandbox"
+  fi
+  local tj
+  local tj
+  tj=$(api -o /root/tj.out -w '%{http_code}' -X POST http://127.0.0.1:$port/v1/cluster/join-tokens -d '{"role":"worker","ttl":"10m","reusable":false}')
+  [[ "$tj" != 20* ]] && ok "a join token is refused: HTTP $tj $(head -c 160 /root/tj.out)" || bad "a join token was made: HTTP $tj"
+
+  # A renewal keeps the key; the pod sees the new certificate; the node
+  # stays a live member.
+  local serial1 key1 serial2 key2 now
+  serial1=$(crt | openssl x509 -noout -serial); key1=$(crt | openssl x509 -noout -pubkey | sha256sum | cut -c1-16)
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  $kw patch certificate "$w-cert" --subresource=status --type=json \
+    -p '[{"op":"add","path":"/status/conditions/-","value":{"type":"Issuing","status":"True","reason":"ManuallyTriggered","message":"proof renewal","lastTransitionTime":"'"$now"'"}}]' 2>&1 | sed 's/^/FCK renew: /'
+  for i in $(seq 1 30); do
+    serial2=$(crt | openssl x509 -noout -serial); [ "$serial2" != "$serial1" ] && break; sleep 4
+  done
+  key2=$(crt | openssl x509 -noout -pubkey | sha256sum | cut -c1-16)
+  [ "$serial2" != "$serial1" ] && [ "$key1" = "$key2" ] && ok "renewed: $serial1 -> $serial2, key $key1 kept" || bad "renewal: $serial1 -> $serial2, key $key1 -> $key2"
+  local want got
+  want=$(crt | sha256sum | cut -c1-16)
+  for i in $(seq 1 45); do
+    got=$($kw exec "$w" -c agent -- cat /var/run/aerolvm-tls/node.crt 2>/dev/null | sha256sum | cut -c1-16)
+    [ "$got" = "$want" ] && break; sleep 4
+  done
+  [ "$got" = "$want" ] && ok "the pod reads the renewed certificate after $((i * 4))s" || bad "the pod still has the old certificate"
+  sleep 20
+  m=$(members 2>/dev/null)
+  grep -q "$w/worker/alive" <<<"$m" && ok "$w is still a live member after its renewal" || bad "$w after renewal: $m"
+  id=$(create)
+  if [ -n "$id" ]; then ok "a create after the renewal: $(exec_in "$id")"; api -X DELETE "http://127.0.0.1:$port/v1/sandboxes/$id" >/dev/null; else bad "no create after the renewal"; fi
+  kill $pf 2>/dev/null
+
+  # The join port, straight to server 0: the worker's own certificate is a
+  # replay; a second key for that node, a certificate with no role and one
+  # from another CA are refused.
+  $kk create namespace probe >/dev/null 2>&1
+  $kk -n probe apply -f - >/dev/null <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: second-key }
+spec:
+  secretName: second-key
+  commonName: $w
+  uris: ["node:$w", "aerolvm-role:worker"]
+  usages: [digital signature, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: no-role }
+spec:
+  secretName: no-role
+  commonName: probe-no-role
+  uris: ["node:probe-no-role"]
+  usages: [digital signature, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: other-ca }
+spec:
+  secretName: other-ca
+  commonName: probe-other-ca
+  uris: ["node:probe-other-ca", "aerolvm-role:worker"]
+  usages: [digital signature, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev }
+YAML
+  $kk -n probe wait --for=condition=Ready certificate --all --timeout=120s >/dev/null 2>&1
+  mkdir -p /root/probe && cd /root/probe
+  $kk -n cert-manager get secret aerolvm-dev-bank-ca -o jsonpath='{.data.ca\.crt}' 2>/dev/null | base64 -d > ca.crt
+  [ -s ca.crt ] || $kw get secret "$w-cert" -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
+  $kw get secret "$w-cert" -o jsonpath='{.data.tls\.crt}' | base64 -d > own.crt
+  $kw get secret "$w-cert" -o jsonpath='{.data.tls\.key}' | base64 -d > own.key
+  for c in second-key no-role other-ca; do
+    $kk -n probe get secret $c -o jsonpath='{.data.tls\.crt}' | base64 -d > $c.crt
+    $kk -n probe get secret $c -o jsonpath='{.data.tls\.key}' | base64 -d > $c.key
+  done
+  $kc port-forward pod/$s0 17003:7003 >/dev/null 2>&1 & pf=$!
+  sleep 3
+  # The version the cluster runs, so a refusal is never the version's.
+  local ver
+  ver=$($kc get aerolcluster aerolvm -o jsonpath='{.spec.version}')
+  join() { # <name>: HTTP status and the start of the answer (never the bundle)
+    curl -sS -m 30 --cacert ca.crt --cert $1.crt --key $1.key --resolve aerolvm-cluster-node:17003:127.0.0.1 \
+      -H 'Content-Type: application/json' -d '{"version":"'"$ver"'","fv":19}' -o $1.out -w '%{http_code}' \
+      https://aerolvm-cluster-node:17003/v1/join/by-certificate 2>$1.err
+    echo " $(python3 -c 'import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("replay=%s node=%s" % (d.get("replay"), d.get("node_id")) if "node_id" in d else json.dumps(d)[:200])
+except Exception:
+    print(open(sys.argv[1]).read()[:200])' $1.out 2>/dev/null) $(head -c 160 $1.err)"
+  }
+  local r
+  r=$(join own); [[ "$r" == 200* && "$r" == *replay=True* ]] && ok "its own certificate: a replay ($r)" || bad "its own certificate: $r"
+  r=$(join second-key); [[ "$r" != 200* ]] && ok "a second key for $w: refused ($r)" || bad "a second key for $w was admitted: $r"
+  r=$(join no-role); [[ "$r" == 4* ]] && ok "no role: refused ($r)" || bad "no role: $r"
+  r=$(join other-ca); [[ "$r" != 200* ]] && ok "another CA: refused ($r)" || bad "another CA was admitted: $r"
+  kill $pf 2>/dev/null
+  cd /root/src
+  [ "$pass" = 1 ] && say "RESULT PASS: external-CA mode" || say "RESULT FAIL: external-CA mode"
+}
+
+# The docs' approver-policy example (charts/aerolvm/examples), live: with
+# cert-manager's own approval off, it approves AerolVM's node certificates
+# in its two namespaces (a worker's and a server's renewal) and nothing
+# else: a request for those names from another namespace waits unsigned,
+# and one in AerolVM's namespace that names something else is denied.
+proof_externalca_policy() {
+  local kk="kubectl --context kind-aerolvm-cluster"
+  local kc="$kk -n aerolvm-system" kw="$kk -n aerolvm-workers"
+  local pass=1 i v out
+  ok() { say "OK $*"; }
+  bad() { say "BAD $*"; pass=0; }
+  # Installed first, so the cert-manager change below never leaves a
+  # request with no approver at all.
+  for v in v0.29.0 0.29.0; do
+    out=$(helm --kube-context kind-aerolvm-cluster upgrade --install cert-manager-approver-policy \
+      oci://quay.io/jetstack/charts/cert-manager-approver-policy --version $v -n cert-manager --wait --timeout 5m 2>&1) && break
+  done
+  say "approver-policy $v: $(tail -1 <<<"$out" | head -c 200)"
+  $kk -n cert-manager patch deployment cert-manager --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--controllers=*,-certificaterequests-approver"}]' >/dev/null
+  $kk -n cert-manager rollout status deployment cert-manager --timeout=3m 2>&1 | tail -1 | sed 's/^/FCK cert-manager: /'
+  sed 's/name: bank-ca$/name: aerolvm-dev-bank-ca/' charts/aerolvm/examples/approver-policy-external-ca.yaml | $kk apply -f - 2>&1 | tr '\n' ' ' | sed 's/^/FCK policy: /'; echo
+  sleep 5
+  crstate() { # <namespace> <certificate>: its newest request's verdict
+    $kk -n "$1" get certificaterequests -o json 2>/dev/null | python3 -c '
+import json, sys
+items = [i for i in json.load(sys.stdin)["items"]
+         if i["metadata"].get("annotations", {}).get("cert-manager.io/certificate-name") == sys.argv[1]]
+items.sort(key=lambda i: i["metadata"]["creationTimestamp"])
+if not items:
+    print("none"); sys.exit()
+c = {x["type"]: x for x in items[-1].get("status", {}).get("conditions", [])}
+for t in ("Denied", "Approved"):
+    if c.get(t, {}).get("status") == "True":
+        print(t + ": " + c[t].get("message", "")[:160]); sys.exit()
+print("pending")' "$2"
+  }
+  renew() { # <namespace> <certificate>
+    $kk -n "$1" patch certificate "$2" --subresource=status --type=json \
+      -p '[{"op":"add","path":"/status/conditions/-","value":{"type":"Issuing","status":"True","reason":"ManuallyTriggered","message":"policy proof","lastTransitionTime":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}]' >/dev/null
+  }
+  serial() { $kk -n "$1" get secret "$2" -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -serial; }
+  local w s1 ns c before st
+  w=$($kw get pods -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')
+  for c in "aerolvm-workers $w-cert" "aerolvm-system aerolvm-server-1-cert"; do
+    ns=${c% *}; c=${c#* }
+    before=$(serial $ns $c)
+    renew $ns $c
+    for i in $(seq 1 30); do
+      st=$(crstate $ns $c); [[ "$st" == Approved* || "$st" == Denied* ]] && [ "$(serial $ns $c)" != "$before" ] && break
+      sleep 4
+    done
+    [[ "$st" == Approved* ]] && [ "$(serial $ns $c)" != "$before" ] && ok "$c renewed under the policy: $st" || bad "$c: $st, serial $before -> $(serial $ns $c)"
+  done
+  $kk create namespace outside >/dev/null 2>&1
+  $kk -n outside apply -f - >/dev/null <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: pretend-worker }
+spec:
+  secretName: pretend-worker
+  commonName: pretend-worker
+  uris: ["node:pretend-worker", "aerolvm-role:worker"]
+  usages: [digital signature, server auth, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+YAML
+  $kw apply -f - >/dev/null <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: stray }
+spec:
+  secretName: stray
+  commonName: stray
+  uris: ["spiffe://elsewhere/stray"]
+  usages: [digital signature, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+YAML
+  sleep 45
+  st=$(crstate outside pretend-worker)
+  [ "$st" = pending ] && [ -z "$($kk -n outside get secret pretend-worker -o name 2>/dev/null)" ] && ok "node names from another namespace: unsigned ($st)" || bad "another namespace: $st"
+  st=$(crstate aerolvm-workers stray)
+  [[ "$st" == Denied* ]] && ok "other names in AerolVM's namespace: $st" || bad "stray in aerolvm-workers: $st"
+  $kw delete certificate stray >/dev/null 2>&1; $kw delete secret stray >/dev/null 2>&1
+  [ "$pass" = 1 ] && say "RESULT PASS: the approver-policy example" || say "RESULT FAIL: the approver-policy example"
+}
+
+# dump_externalca: why the AerolCluster did not get Ready.
+dump_externalca() {
+  local kk="kubectl --context kind-aerolvm-cluster"
+  local kc="$kk -n aerolvm-system" kw="$kk -n aerolvm-workers"
+  $kc get aerolcluster,aerolnodes 2>&1 | sed 's/^/FCK   /'
+  $kk get certificates -A 2>&1 | sed 's/^/FCK   cert: /'
+  $kc get aerolnodes -o jsonpath='{range .items[*]}{.metadata.name}: {.status.reason}{"\n"}{end}' 2>&1 | sed 's/^/FCK   reason: /'
+  local p
+  for p in $($kc get pods -l app.kubernetes.io/component=server -o name | head -2) $($kw get pods -o name | head -1); do
+    local k="$kc"; [[ "$($kw get $p -o name 2>/dev/null)" ]] && k="$kw"
+    { $k logs $p -c setup 2>&1; $k logs $p -c setup --previous 2>&1; } | tail -10 | cut -c1-300 | sed "s|^|FCK   ${p#pod/} setup: |"
+    $k logs $p -c agent 2>&1 | grep -iE 'error|refus|join|tls|cert' | tail -10 | cut -c1-300 | sed "s|^|FCK   ${p#pod/} agent: |"
+  done
+  $kc logs deploy/aerolvm-operator 2>&1 | grep -iE '"level":"error"|certificate' | tail -8 | cut -c1-300 | sed 's/^/FCK   operator: /'
+}
+
 [ -e /dev/kvm ] || modprobe kvm_intel 2>/dev/null
 if [ -e /dev/kvm ]; then say "machine: /dev/kvm present, $(grep -c -w vmx /proc/cpuinfo) cpus with vmx, kernel $(uname -r)"; else say "machine: /dev/kvm ABSENT"; finish; fi
 
 say "installing docker and the tools"
-dnf -y -q install docker git tar gzip iptables perl-Digest-SHA >/dev/null 2>&1 || say "dnf install failed"
+dnf -y -q install docker git tar gzip iptables perl-Digest-SHA openssl >/dev/null 2>&1 || say "dnf install failed"
 systemctl start docker || { say "docker did not start"; finish; }
 pinned() { # <file> <url> <sha256>
   curl -fsSL --retry 5 -o "$1" "$2" && echo "$3  $1" | sha256sum -c --quiet - || { say "download failed or checksum wrong: $2"; finish; }
@@ -338,6 +631,11 @@ PY
   grep -A1 '^  agentSandboxAPI:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
   export AEROL_K8S_MODE=cluster
 fi
+if [ "$proof" = externalca ]; then
+  # C23: cluster mode in external-CA mode, a cert-manager CA issuer
+  # standing in for the bank's.
+  export AEROL_K8S_MODE=cluster AEROL_K8S_EXTERNAL_CA=1
+fi
 if [ "$proof" = move ]; then
   # Cluster mode, every worker a Firecracker worker: this machine is one
   # KVM pool. The chart's defaults change in this copy only.
@@ -359,11 +657,19 @@ fi
 git init -q && git add -A >/dev/null 2>&1 && git -c user.email=fck@localhost -c user.name=fck commit -qm src >/dev/null 2>&1
 say "building the images and starting kind ($proof)"
 t0=$(date +%s)
-if ! scripts/k8s-dev.sh > /root/k8s-dev.log 2>&1; then say "k8s-dev failed:"; tail -20 /root/k8s-dev.log | sed 's/^/FCK   /'; finish; fi
+if ! scripts/k8s-dev.sh > /root/k8s-dev.log 2>&1; then
+  say "k8s-dev failed:"; tail -20 /root/k8s-dev.log | sed 's/^/FCK   /'
+  [ "$proof" = externalca ] && dump_externalca
+  finish
+fi
 say "built and installed in $(( $(date +%s) - t0 ))s"
 [ "$proof" = move ] && { proof_move firecracker; finish; }
 [ "$proof" = gmove ] && { proof_move gvisor; finish; }
 [ "$proof" = kubeapi ] && { proof_kubeapi; finish; }
+[ "$proof" = externalca ] && { proof_externalca; proof_externalca_policy; finish; }
+# A proof that stops part way (bash drops the rest of a command on an
+# expansion error) must not run on into the pod proof below.
+[ "$proof" = pod ] || { say "the $proof proof stopped part way"; finish; }
 
 k() { kubectl --context kind-aerolvm -n aerolvm "$@"; }
 pod=aerolvm-0
