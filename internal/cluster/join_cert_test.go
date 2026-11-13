@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -272,5 +273,128 @@ func TestAdoptSelfByCert(t *testing.T) {
 	again, err := leader.Adopt(context.Background(), AdoptRequest{})
 	if err != nil || len(again.Already) != 1 || len(again.Admitted) != 0 {
 		t.Fatalf("adopt again = %+v, %v", again, err)
+	}
+}
+
+// The refusals before the admit: a certificate with no role, a port out of
+// range, and a node whose ports do not answer the dial-back. None of them
+// admits anything.
+func TestJoinByCertRefusedBeforeTheAdmit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a raft node")
+	}
+	leader, cleanup := newJoinTestCluster(t, "eca-refuse", true, nil, joinClusterOpts{
+		mutate: func(c *config.Config) { c.ClusterExternalCA = true },
+	})
+	defer cleanup()
+	waitForLeader(t, leader, 10*time.Second)
+	src := netip.MustParseAddr("127.0.0.1")
+	ports := dialBackListeners(t, 2)
+	ok := &JoinPorts{Gossip: ports[0], Internal: ports[1]}
+	noRole, _ := externalCALeaf(t, "eca-norole")
+	if _, err := leader.JoinByCert(context.Background(), noRole, JoinByCertRequest{Version: version.Version, Ports: ok}, src); !errors.Is(err, ErrJoinBadRequest) {
+		t.Fatalf("no role = %v", err)
+	}
+	leaf, _ := externalCALeaf(t, "eca-ports", JoinRoleWorker)
+	if _, err := leader.JoinByCert(context.Background(), leaf, JoinByCertRequest{Version: version.Version, Ports: &JoinPorts{Gossip: 70000}}, src); !errors.Is(err, ErrJoinBadRequest) {
+		t.Fatalf("a port out of range = %v", err)
+	}
+	// The node's ports do not answer: the dial-back fails, with its results.
+	leader.joinDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+	_, err := leader.JoinByCert(context.Background(), leaf, JoinByCertRequest{Version: version.Version, Ports: ok}, src)
+	var dbe *JoinDialBackError
+	if !errors.As(err, &dbe) || len(dbe.Results) == 0 || JoinErrorStatus(err) != http.StatusPreconditionFailed {
+		t.Fatalf("dial-back = %v", err)
+	}
+	for _, id := range []string{"eca-norole", "eca-ports"} {
+		if _, ok := leader.fsm.admittedNode(id); ok {
+			t.Fatalf("%s admitted after a refusal", id)
+		}
+	}
+}
+
+// Over the join port: a body that is not JSON, a refusal from the cluster
+// (with the dial-back's results), and a retry that is a replay.
+func TestJoinByCertOverTheJoinPortAnswers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts a raft node")
+	}
+	leader, cleanup := newJoinTestCluster(t, "eca-answers", true, nil, joinClusterOpts{
+		joinAddr: "127.0.0.1:0",
+		mutate:   func(c *config.Config) { c.ClusterExternalCA = true },
+	})
+	defer cleanup()
+	waitForLeader(t, leader, 10*time.Second)
+	ports := dialBackListeners(t, 2)
+	good, _ := json.Marshal(JoinByCertRequest{Version: version.Version, Ports: &JoinPorts{Gossip: ports[0], Internal: ports[1]}, FSMOpsVersion: fsmOpsVersion})
+	post := func(pair tls.Certificate, body []byte) (int, map[string]any) {
+		t.Helper()
+		client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, Certificates: []tls.Certificate{pair},
+		}}}
+		resp, err := client.Post("https://"+leader.joinServer.Addr()+JoinByCertPath, "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	_, pair := externalCALeaf(t, "wkr-answers", JoinRoleWorker)
+	if code, out := post(pair, []byte("not json")); code != http.StatusBadRequest {
+		t.Fatalf("not JSON = %d %v", code, out)
+	}
+	_, noRole := externalCALeaf(t, "wkr-norole")
+	if code, out := post(noRole, good); code != http.StatusBadRequest || out["reason"] != "bad_request" {
+		t.Fatalf("no role = %d %v", code, out)
+	}
+	if code, out := post(pair, good); code != http.StatusOK || out["node_id"] != "wkr-answers" || out["replay"] == true {
+		t.Fatalf("join = %d %v", code, out)
+	}
+	if code, out := post(pair, good); code != http.StatusOK || out["replay"] != true {
+		t.Fatalf("retry = %d %v", code, out)
+	}
+	leader.joinDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("connection refused")
+	}
+	_, other := externalCALeaf(t, "wkr-unreachable", JoinRoleWorker)
+	if code, out := post(other, good); code != http.StatusPreconditionFailed || out["dial_back"] == nil {
+		t.Fatalf("dial-back = %d %v", code, out)
+	}
+}
+
+// Without a TLS dir there is no certificate to name the cluster or to
+// admit the seed with.
+func TestExternalCAWithoutTLS(t *testing.T) {
+	c := &Cluster{}
+	if c.externalCAClusterID() != "" || c.selfKeyHash() != "" {
+		t.Fatal("an ID or key hash with no TLS")
+	}
+	if _, err := c.adoptSelfByCert(context.Background()); !errors.Is(err, ErrJoinCertRequired) {
+		t.Fatalf("adopt with no TLS = %v", err)
+	}
+	c.tls = &ClusterTLS{caPEM: []byte("not a certificate")}
+	if c.externalCAClusterID() != "" {
+		t.Fatal("an ID from a ca.crt with no PEM")
+	}
+	c.tls.caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")})
+	if c.externalCAClusterID() != "" {
+		t.Fatal("an ID from a ca.crt that does not parse")
+	}
+	// A seed whose certificate names no role cannot admit itself.
+	tlsDir := writeExternalCATLSDir(t, "eca-seed-norole", "")
+	ct, err := loadClusterTLS(tlsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.tls = ct
+	if _, err := c.adoptSelfByCert(context.Background()); !errors.Is(err, ErrJoinBadRequest) {
+		t.Fatalf("adopt with no role = %v", err)
+	}
+	if c.selfKeyHash() == "" {
+		t.Fatal("no key hash for a served certificate")
 	}
 }

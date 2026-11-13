@@ -172,6 +172,8 @@ type fakeJoinServer struct {
 	// patFree answers a worker or ingress join without the PAT, the way a
 	// server answers once every member takes cert-only calls.
 	patFree bool
+	// certAnswer changes a join by certificate's answer before it is sent.
+	certAnswer func(*cluster.JoinResponse)
 }
 
 type joinRefuseSpec struct {
@@ -473,9 +475,13 @@ func (f *fakeJoinServer) joinByCert(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.joins++
 	f.mu.Unlock()
-	_ = json.NewEncoder(w).Encode(cluster.JoinResponse{
+	resp := cluster.JoinResponse{
 		NodeID: cluster.ExtractPeerNodeID(leaf), Role: roles[0], ClusterID: cluster.CACertHash(f.ca.Certificate()),
 		GossipKey: "Z29zc2lwLWtleS0xNi1ieXRlcw==", BootstrapPeers: []string{"10.0.0.5:7001"}, JoinURLs: []string{f.url},
 		Credentials: f.custody, NotAfter: leaf.NotAfter, Version: f.version, PATToken: f.pat,
-	})
+	}
+	if f.certAnswer != nil {
+		f.certAnswer(&resp)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }

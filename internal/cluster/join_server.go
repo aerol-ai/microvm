@@ -150,7 +150,7 @@ func (s *joinServer) handler() http.Handler {
 	mux.HandleFunc("POST "+JoinPreflightPath, s.limited(s.preflight))
 	mux.HandleFunc("POST "+JoinByCertPath, s.limited(s.joinByCert))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJoinJSON(w, http.StatusNotFound, joinErrorBody{Reason: "not_found", Error: "not found: the join port serves only " + JoinClusterInfoPath + ", " + JoinPath + " and " + JoinPreflightPath})
+		writeJoinJSON(w, http.StatusNotFound, joinErrorBody{Reason: "not_found", Error: "not found: the join port serves only " + JoinClusterInfoPath + ", " + JoinPath + ", " + JoinPreflightPath + " and " + JoinByCertPath})
 	})
 	return mux
 }

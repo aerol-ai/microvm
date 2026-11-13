@@ -7,7 +7,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -212,5 +214,150 @@ func TestInitExternalCARefusals(t *testing.T) {
 	mustWrite(t, r.paths.ClusterEnv, "SB_ENABLE_CLUSTER=true\nSB_NODE_ID=someone\n")
 	if _, err := r.run(t, InitOptions{ExternalCA: true, FilesOnly: true}); err == nil || !strings.Contains(err.Error(), "another cluster") {
 		t.Fatalf("over another cluster.env = %v", err)
+	}
+}
+
+// Every way a join by certificate stops before writing a file: the host,
+// the arguments, the server's refusal, and an answer an external-CA cluster
+// never gives.
+func TestJoinByCertificateStops(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  func(r *joinRig, o *JoinOptions)
+		want string
+	}{
+		"not root, not files-only": {func(r *joinRig, o *JoinOptions) { o.FilesOnly = false }, "as root"},
+		"not installed":            {func(r *joinRig, o *JoinOptions) { _ = os.Remove(r.paths.EnvFile) }, "is missing"},
+		"a URL that is not one":    {func(r *joinRig, o *JoinOptions) { o.URL = "https://" }, "is not a URL"},
+		"a bad --advertise":        {func(r *joinRig, o *JoinOptions) { o.Advertise = "not an address!" }, "not an IP address or a DNS name"},
+		"a role that is none":      {func(r *joinRig, o *JoinOptions) { o.Address.NodeRole = "boss" }, "boss"},
+		"a dial-back port held": {func(r *joinRig, o *JoinOptions) {
+			r.host.listenErr = errors.New("permission denied")
+		}, "for the dial-back"},
+		"the server refuses": {func(r *joinRig, o *JoinOptions) {
+			r.srv.refuse = map[string]joinRefuseSpec{cluster.JoinByCertPath: {http.StatusConflict, "node_id_in_use"}}
+		}, "node_id_in_use"},
+		"an answer for another node": {func(r *joinRig, o *JoinOptions) {
+			r.srv.certAnswer = func(a *cluster.JoinResponse) { a.NodeID = "someone-else" }
+		}, "the join answer is for someone-else"},
+		"an answer with a CA key": {func(r *joinRig, o *JoinOptions) {
+			r.srv.certAnswer = func(a *cluster.JoinResponse) { a.CAKey = "-----BEGIN PRIVATE KEY-----" }
+		}, "never sends"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newJoinRig(t)
+			r.host.notRoot = true
+			writeExternalCATLS(t, r, "pod-w1", cluster.JoinRoleWorker)
+			o := JoinOptions{ByCertificate: true, FilesOnly: true}
+			tc.set(r, &o)
+			if _, err := r.run(t, o); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if exists(r.paths.ClusterEnv) {
+				t.Fatal("a stopped join wrote cluster.env")
+			}
+		})
+	}
+	// A dial-back refusal says how to fix it.
+	r := newJoinRig(t)
+	r.host.notRoot = true
+	writeExternalCATLS(t, r, "pod-w1", cluster.JoinRoleWorker)
+	r.srv.refuse = map[string]joinRefuseSpec{cluster.JoinByCertPath: {http.StatusPreconditionFailed, "dial_back"}}
+	if _, err := r.run(t, JoinOptions{ByCertificate: true, FilesOnly: true}); err == nil || !strings.Contains(r.out.String(), "fix dial-back") {
+		t.Fatalf("dial-back = %v; output %s", err, r.out.String())
+	}
+}
+
+// The TLS dir is checked before anything is sent: a CA that is not one, a
+// missing pair, a certificate another CA signed, and one with no node ID.
+func TestExternalCAIdentity(t *testing.T) {
+	ca := testExternalCA(t)
+	for name, tc := range map[string]struct {
+		set  func(dir string)
+		want string
+	}{
+		"ca.crt holds no certificate": {func(dir string) { mustWrite(t, filepath.Join(dir, "ca.crt"), "junk") }, "holds no certificate"},
+		"no key":                      {func(dir string) { _ = os.Remove(filepath.Join(dir, "node.key")) }, "node.crt, node.key"},
+		"another CA": {func(dir string) {
+			mustWrite(t, filepath.Join(dir, "ca.crt"), string(testExternalCA(t).CertPEM()))
+		}, "does not chain"},
+		"no node id": {func(dir string) { writeExternalCATLSDir(t, dir, ca, "", cluster.JoinRoleWorker) }, "no valid node:<id>"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeExternalCATLSDir(t, dir, ca, "pod-w1", cluster.JoinRoleWorker)
+			tc.set(dir)
+			if _, _, _, _, err := externalCAIdentity(dir); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	if _, _, _, _, err := externalCAIdentity(filepath.Join(t.TempDir(), "none")); err == nil || !strings.Contains(err.Error(), "ca.crt") {
+		t.Fatalf("no TLS dir = %v", err)
+	}
+}
+
+func TestInitExternalCAStops(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  func(r *initRig, o *InitOptions)
+		want string
+	}{
+		"not installed":            {func(r *initRig, o *InitOptions) { _ = os.Remove(r.paths.EnvFile) }, "is missing"},
+		"a bad --advertise":        {func(r *initRig, o *InitOptions) { o.Advertise = "not an address!" }, "not an IP address or a DNS name"},
+		"no certificate":           {func(r *initRig, o *InitOptions) { _ = os.Remove(filepath.Join(r.paths.TLSDir, "node.crt")) }, "node.crt"},
+		"a bad custody":            {func(r *initRig, o *InitOptions) { o.KeyCustody = "vault" }, "--key-custody must be file or wrapped"},
+		"a bad gossip key":         {func(r *initRig, o *InitOptions) { o.GossipKey = "c2hvcnQ=" }, "--gossip-key must be base64"},
+		"ca.crt not a certificate": {func(r *initRig, o *InitOptions) { corruptCADER(t, r.paths.TLSDir) }, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newInitRig(t)
+			r.host.notRoot = true
+			writeExternalCATLSDir(t, r.paths.TLSDir, testExternalCA(t), "srv-seed", cluster.JoinRoleServer)
+			o := InitOptions{ExternalCA: true, FilesOnly: true}
+			tc.set(r, &o)
+			if _, err := r.run(t, o); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if exists(r.paths.ClusterEnv) {
+				t.Fatal("a stopped init wrote cluster.env")
+			}
+		})
+	}
+	// A given gossip key is used as it is.
+	r := newInitRig(t)
+	r.host.notRoot = true
+	writeExternalCATLSDir(t, r.paths.TLSDir, testExternalCA(t), "srv-seed", cluster.JoinRoleServer)
+	const key = "MDEyMzQ1Njc4OWFiY2RlZg==" // 16 bytes
+	if _, err := r.run(t, InitOptions{ExternalCA: true, FilesOnly: true, GossipKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	if env, _ := readEnvFile(r.paths.ClusterEnv); env["SB_GOSSIP_SECRET_KEY"] != key {
+		t.Fatalf("gossip key = %q", env["SB_GOSSIP_SECRET_KEY"])
+	}
+}
+
+// corruptCADER keeps ca.crt a PEM block whose bytes are not a certificate:
+// the identity check, which reads the pool, fails first.
+func corruptCADER(t *testing.T, dir string) {
+	t.Helper()
+	mustWrite(t, filepath.Join(dir, "ca.crt"), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")})))
+}
+
+func TestExternalClusterID(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := externalClusterID(dir); err == nil {
+		t.Fatal("no ca.crt")
+	}
+	mustWrite(t, filepath.Join(dir, "ca.crt"), "junk")
+	if _, err := externalClusterID(dir); err == nil || !strings.Contains(err.Error(), "no certificate") {
+		t.Fatalf("no PEM = %v", err)
+	}
+	corruptCADER(t, dir)
+	if _, err := externalClusterID(dir); err == nil {
+		t.Fatal("a PEM block that is not a certificate")
+	}
+	ca := testExternalCA(t)
+	mustWrite(t, filepath.Join(dir, "ca.crt"), string(ca.CertPEM()))
+	if id, err := externalClusterID(dir); err != nil || id != cluster.CACertHash(ca.Certificate()) {
+		t.Fatalf("id = %q %v", id, err)
 	}
 }
