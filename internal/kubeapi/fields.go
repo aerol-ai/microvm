@@ -252,7 +252,7 @@ func sandboxTags(sb *Sandbox) map[string]string {
 	if len(pod) == 0 {
 		return own
 	}
-	tags := make(map[string]string, len(pod)+len(own))
+	tags := make(map[string]string, len(pod))
 	for k, v := range pod {
 		tags[k] = v
 	}
