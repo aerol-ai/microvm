@@ -56,6 +56,7 @@ type fakeBackend struct {
 	keys     []string
 	deleted  []string
 	running  map[string]bool
+	tags     map[string]map[string]string
 	err      error
 	noFeed   bool
 	specless bool
@@ -70,6 +71,10 @@ func (b *fakeBackend) Create(_ context.Context, owner string, req models.CreateS
 	b.created, b.keys = append(b.created, req), append(b.keys, key)
 	b.next++
 	id := fmt.Sprintf("sb-new%d", b.next)
+	if b.tags == nil {
+		b.tags = map[string]map[string]string{}
+	}
+	b.tags[id] = req.Tags
 	if !b.noFeed {
 		p := cluster.Placement{SandboxID: id, Name: req.Name, OwnerRef: owner, OwnerNodeID: "w1", Version: 100 + b.next}
 		b.hub.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{{SandboxID: id, Index: p.Version, Placement: &p}}, Next: p.Version})
@@ -100,19 +105,23 @@ func (b *fakeBackend) SetRunning(_ context.Context, _ string, id string, running
 	return nil
 }
 
-func (b *fakeBackend) Specs(_ context.Context, ids []string) map[string]SpecSummary {
+func (b *fakeBackend) Specs(_ context.Context, refs []SpecRef) map[string]SpecSummary {
 	out := map[string]SpecSummary{}
 	if b.specless {
 		return out
 	}
-	for _, id := range ids {
-		out[id] = SpecSummary{Image: "img-" + id}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, r := range refs {
+		out[r.ID] = SpecSummary{Image: "img-" + r.ID, Tags: b.tags[r.ID]}
 	}
 	return out
 }
 
+// p is a placement as a cluster stores it: the name qualified with its
+// owner (cluster.QualifiedSandboxName).
 func p(id, name, owner string, version uint64, tags ...string) cluster.Placement {
-	return cluster.Placement{SandboxID: id, Name: name, OwnerRef: owner, OwnerNodeID: "w1", Version: version, CreatedUnix: 1700000000}
+	return cluster.Placement{SandboxID: id, Name: cluster.QualifiedSandboxName(owner, name), OwnerRef: owner, OwnerNodeID: "w1", Version: version, CreatedUnix: 1700000000}
 }
 
 type rig struct {
@@ -188,7 +197,7 @@ func TestServerHealthAndDiscovery(t *testing.T) {
 	if _, g := r.call(t, http.MethodGet, "/apis/agents.x-k8s.io", ""); g["name"] != Group {
 		t.Fatalf("group = %v", g)
 	}
-	if _, gl := r.call(t, http.MethodGet, "/apis", ""); len(gl["groups"].([]any)) != 1 {
+	if _, gl := r.call(t, http.MethodGet, "/apis", ""); len(gl["groups"].([]any)) != 2 {
 		t.Fatalf("group list = %v", gl)
 	}
 	for _, path := range []string{"/openapi/v2", "/openapi/v3"} {
@@ -569,6 +578,10 @@ func TestOwnerMap(t *testing.T) {
 	if _, ok := m.Owner("Bad_NS"); ok {
 		t.Fatal("an invalid namespace mapped")
 	}
+	// team:platform is ops's: the namespace platform must not reach it too.
+	if o, ok := m.Owner("platform"); ok {
+		t.Fatalf("Owner(platform) = %q, but team:platform is mapped to ops", o)
+	}
 	for owner, want := range map[string]string{"team:a": "a", "acct:k1": "acct", "team:platform": "ops"} {
 		if got, ok := m.Namespace(owner); !ok || got != want {
 			t.Errorf("Namespace(%q) = %q %v", owner, got, ok)
@@ -594,5 +607,92 @@ func TestWriteStatusFallsBackTo500(t *testing.T) {
 	body, _ := io.ReadAll(rr.Body)
 	if rr.Code != http.StatusInternalServerError || !strings.Contains(string(body), "InternalError") {
 		t.Fatalf("%d %s", rr.Code, body)
+	}
+}
+
+// A watch answers its headers at once, before any event: a quiet namespace
+// must not leave kubectl waiting for a response.
+func TestServerWatchSendsHeadersAtOnce(t *testing.T) {
+	r := newRig(t)
+	r.srv.Store = &memStore{}
+	ts := httptest.NewServer(r.srv)
+	defer ts.Close()
+	for _, path := range []string{base + "/namespaces/a/sandboxes?watch=true", ext + "/namespaces/a/sandboxclaims?watch=true", ext + "/namespaces/a/sandboxtemplates?watch=true"} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+path+"&timeoutSeconds=30", nil)
+		req.Header.Set("X-Test-User", "alice")
+		client := &http.Client{Timeout: 2 * time.Second}
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK || time.Since(start) > time.Second {
+			t.Fatalf("%s: headers after %s: %v", path, time.Since(start), err)
+		}
+		resp.Body.Close()
+	}
+}
+
+// noUserAuth is the kube-apiserver's own health check: a trusted
+// certificate, no user.
+type noUserAuth struct{}
+
+func (noUserAuth) Authenticate(*http.Request) (User, error) { return User{}, ErrNoUser }
+
+func TestDiscoveryWithoutAUser(t *testing.T) {
+	r := newRig(t)
+	r.srv.Auth = noUserAuth{}
+	for _, path := range []string{"/apis", "/apis/agents.x-k8s.io", base, ext, "/openapi/v2"} {
+		rr := httptest.NewRecorder()
+		r.srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Errorf("%s = %d", path, rr.Code)
+		}
+	}
+	rr := httptest.NewRecorder()
+	r.srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, base+"/namespaces/a/sandboxes", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("a resource without a user = %d", rr.Code)
+	}
+}
+
+// The end of the initial list comes where the hub's replay ends, even while
+// changes keep arriving: a quiet spell never has to happen first (the old
+// guess waited for 10 ms without an event, which a busy cluster may never
+// give).
+func TestServerWatchInitialEndUnderChurn(t *testing.T) {
+	r := newRig(t, p("sb-1", "web", "team:a", 3))
+	stopChurn := make(chan struct{})
+	churned := make(chan struct{})
+	go func() {
+		defer close(churned)
+		for v := uint64(100); ; v++ {
+			select {
+			case <-stopChurn:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			row := p("sb-1", "web", "team:a", v)
+			r.hub.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{{SandboxID: "sb-1", Index: v, Placement: &row}}, Next: v})
+		}
+	}()
+	defer func() { close(stopChurn); <-churned }()
+	time.Sleep(20 * time.Millisecond)
+	ch, stop := watchLines(t, r, "/sandboxes?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true")
+	defer stop()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok {
+				t.Fatal("the watch ended before the end of the initial list")
+			}
+			if ev["type"] != "BOOKMARK" {
+				continue
+			}
+			md := ev["object"].(map[string]any)["metadata"].(map[string]any)
+			if ann, _ := md["annotations"].(map[string]any); ann[initialEventsEnd] == "true" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("no end of the initial list while changes kept arriving")
+		}
 	}
 }

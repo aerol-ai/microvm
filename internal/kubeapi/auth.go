@@ -51,9 +51,28 @@ type Authorizer interface {
 	Authorize(ctx context.Context, u User, a Attributes) (allowed bool, reason string, err error)
 }
 
+type userKey struct{}
+
+// ContextWithUser carries the authenticated Kubernetes caller to the
+// Backend, which names it in the audit record of each write.
+func ContextWithUser(ctx context.Context, u User) context.Context {
+	return context.WithValue(ctx, userKey{}, u)
+}
+
+// UserFromContext is the caller ContextWithUser set.
+func UserFromContext(ctx context.Context) (User, bool) {
+	u, ok := ctx.Value(userKey{}).(User)
+	return u, ok
+}
+
 // ErrUnauthenticated is a request without a front-proxy certificate the
 // server trusts.
 var ErrUnauthenticated = errors.New("kubeapi: the request did not come through the Kubernetes API server")
+
+// ErrNoUser is a request with a front-proxy certificate the server trusts
+// but no caller: the kube-apiserver's own health check of the APIService.
+// It may read discovery, nothing else.
+var ErrNoUser = fmt.Errorf("%w: no user header", ErrUnauthenticated)
 
 // FrontProxy authenticates the kube-apiserver's forwarded requests
 // (requestheader authentication, the same contract metrics-server uses).
@@ -89,7 +108,7 @@ func (f *FrontProxy) Authenticate(r *http.Request) (User, error) {
 		}
 	}
 	if u.Name == "" {
-		return User{}, fmt.Errorf("%w: no user header", ErrUnauthenticated)
+		return User{}, ErrNoUser
 	}
 	for _, h := range orDefault(f.GroupHeaders, "X-Remote-Group") {
 		u.Groups = append(u.Groups, r.Header.Values(h)...)

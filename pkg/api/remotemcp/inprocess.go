@@ -45,13 +45,29 @@ type inProcessTransport struct {
 	// with none of the client's headers, so a PAT Caddy relayed from a
 	// public client would pass as the host (§5.11).
 	patOrigin string
+	// surface is the audit surface the inner calls are recorded with;
+	// "" is SurfaceMCP.
+	surface string
+}
+
+// NewInProcessTransport is the same hand-off for another in-process
+// surface: each request goes to handler as the given caller, recorded with
+// surface (the agent-sandbox API's writes, C17). There is still one API
+// path: the route's permission, tenant scoping, audit record, cluster
+// forwarding and idempotency all apply.
+func NewInProcessTransport(handler http.Handler, access controlplane.Access, surface string) http.RoundTripper {
+	return &inProcessTransport{handler: handler, remoteAddr: "127.0.0.1:0", access: access, hasAccess: true, surface: surface}
 }
 
 func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// The inner call is recorded as the tool call it is: one api record per
 	// tool call, attributed to the MCP caller, with surface "mcp" (§5.9).
 	// Only this transport sets the marker; nothing on the wire can.
-	ctx := auditlog.ContextWithSurface(req.Context(), auditlog.SurfaceMCP)
+	surface := t.surface
+	if surface == "" {
+		surface = auditlog.SurfaceMCP
+	}
+	ctx := auditlog.ContextWithSurface(req.Context(), surface)
 	ctx = contextWithHandoff(ctx, t.access, t.hasAccess)
 	if t.patOrigin != "" {
 		ctx = cluster.ContextWithPATOrigin(ctx, t.patOrigin)

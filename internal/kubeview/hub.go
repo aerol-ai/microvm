@@ -356,8 +356,10 @@ func (h *Hub) List(owner, after string, limit int) (items []Item, rv uint64, mor
 const AllOwners = ""
 
 // Watch streams owner's changes after resourceVersion from (AllOwners: every
-// owner's). From 0 starts with every current sandbox as Added. Cancel ctx to stop; the channel is
-// closed after the stream ends.
+// owner's). From 0 starts with every current sandbox as Added, then a
+// Bookmark at the position they were read at: the exact end of the initial
+// list, which a client asking for sendInitialEvents waits for. Cancel ctx to
+// stop; the channel is closed after the stream ends.
 func (h *Hub) Watch(ctx context.Context, owner string, from uint64) (<-chan Event, error) {
 	deadline := time.Now().Add(h.opts.TooNewWait)
 	h.mu.Lock()
@@ -388,6 +390,9 @@ func (h *Hub) Watch(ctx context.Context, owner string, from uint64) (<-chan Even
 		return nil, ErrExpired
 	}
 	backlog := h.backlogLocked(owner, from)
+	if from == 0 {
+		backlog = append(backlog, Event{Type: Bookmark, RV: h.position})
+	}
 	w := &watcher{owner: owner, ch: make(chan Event, h.opts.WatchBuffer+len(backlog)), done: make(chan struct{})}
 	for _, ev := range backlog {
 		w.ch <- ev

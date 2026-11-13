@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"net/http"
+
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // Peer calls by node cert alone (plans/kubectl-style-cluster-ops.md §8).
@@ -45,6 +47,15 @@ const (
 	// every X-Cluster-* header it is honoured only from a live mTLS peer.
 	HeaderCaller = "X-Cluster-Caller"
 	CallerNode   = "node"
+	// HeaderOnBehalfOf and HeaderOnBehalfOwner ride a forward the edge node
+	// speaks for on behalf of a caller it authenticated itself, with no
+	// AerolVM credential to pass on: the agent-sandbox API's Kubernetes user
+	// (C17), whom the edge checked through the Kubernetes API's RBAC. The
+	// peer grants such a call exactly that caller's access, one owner with
+	// the runner role, never the node's own fleet-wide access: a node that
+	// may already speak for itself gains nothing by naming someone narrower.
+	HeaderOnBehalfOf    = "X-Cluster-On-Behalf-Of"
+	HeaderOnBehalfOwner = "X-Cluster-On-Behalf-Owner"
 )
 
 type internalPeerCtxKey struct{}
@@ -81,7 +92,19 @@ func LocalCallerFromContext(ctx context.Context) bool {
 // accept, and says the edge node speaks for it. Any other forward keeps the
 // user's credential and never carries the marker, so an edge that dropped a
 // credential by mistake gets a 401 from the peer, not node powers.
-func stampCaller(out *http.Request) {
+func stampCaller(out *http.Request, access controlplane.Access) {
+	out.Header.Del(HeaderOnBehalfOf)
+	out.Header.Del(HeaderOnBehalfOwner)
+	if access.Principal.Kind == controlplane.PrincipalKubernetes {
+		// The caller has no credential a peer could check; the edge speaks
+		// for the call and names whom for (HeaderOnBehalfOf).
+		out.Header.Del("Authorization")
+		out.Header.Del("X-API-KEY")
+		out.Header.Set(HeaderCaller, CallerNode)
+		out.Header.Set(HeaderOnBehalfOf, access.Principal.ID)
+		out.Header.Set(HeaderOnBehalfOwner, access.Identity.OwnerRef)
+		return
+	}
 	if !LocalCallerFromContext(out.Context()) {
 		out.Header.Del(HeaderCaller)
 		return

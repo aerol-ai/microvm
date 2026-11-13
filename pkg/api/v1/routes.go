@@ -351,6 +351,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))
 	mux.Handle("POST "+cluster.PublicInternalRunStatesPath, internalOp(http.HandlerFunc(h.clusterInternalRunStates)))
+	mux.Handle("POST "+cluster.PublicInternalSpecSummariesPath, internalOp(http.HandlerFunc(h.clusterInternalSpecSummaries)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenChangesPath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenChanges)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenPagePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenPage)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
