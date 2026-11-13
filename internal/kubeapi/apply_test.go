@@ -89,3 +89,40 @@ func TestMergeSandboxPatchComparesValues(t *testing.T) {
 		t.Fatal("an unknown mode passed")
 	}
 }
+
+// The rest of what a patch can get wrong: another memory size, a label that
+// is not a string, and a claim's fields this server does not show.
+func TestMergePatchRefusalsAndWarnings(t *testing.T) {
+	spec := &SpecSummary{Image: "python:3.12", Runtime: "gvisor", CPU: 0.5, MemoryMB: 1024}
+	cur := SandboxFrom(kubeview.Item{Placement: p("sb-1", "web", "team:a", 3), RV: 3}, "a", spec)
+	created := time.Unix(1700000000, 0)
+	mem := map[string]any{"spec": map[string]any{"podTemplate": map[string]any{"spec": map[string]any{
+		"containers": []any{map[string]any{"name": "main", "image": "python:3.12",
+			"resources": map[string]any{"limits": map[string]any{"cpu": "500m", "memory": "2Gi"}}}},
+	}}}}
+	if _, err := mergeSandboxPatch(cur, spec, mem, created); err == nil || !strings.Contains(err.Error(), "memory") {
+		t.Fatalf("another memory size = %v", err)
+	}
+	notString := map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": 1}}}
+	if _, err := mergeSandboxPatch(cur, spec, notString, created); err == nil {
+		t.Fatal("a label that is a number passed")
+	}
+
+	claim := map[string]any{
+		"apiVersion": ExtensionsAPIVersion(), "kind": SandboxClaimKind,
+		"metadata": map[string]any{"name": "job", "namespace": "a", "uid": "u", "labels": map[string]any{"team": "ml"}},
+		"spec":     map[string]any{"warmPoolRef": map[string]any{"name": "pool"}},
+	}
+	tags := map[string]string{"team": "ml", TagWarmPool: "pool"}
+	warnings, err := mergeClaimPatch(claim, "pool", tags, map[string]any{"spec": map[string]any{
+		"lifecycle":             map[string]any{"shutdownPolicy": "Delete"},
+		"additionalPodMetadata": map[string]any{"labels": map[string]any{"x": "y"}},
+	}})
+	if err != nil || len(warnings) != 2 || !strings.Contains(strings.Join(warnings, " "), "spec.lifecycle") ||
+		!strings.Contains(strings.Join(warnings, " "), "spec.additionalPodMetadata") {
+		t.Fatalf("lifecycle and pod metadata = %v %v", warnings, err)
+	}
+	if _, err := mergeClaimPatch(claim, "pool", tags, notString); err == nil {
+		t.Fatal("a claim label that is a number passed")
+	}
+}
