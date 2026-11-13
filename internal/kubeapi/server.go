@@ -694,11 +694,12 @@ func (s *Server) delete(w http.ResponseWriter, ctx context.Context, ns, name str
 }
 
 // patch changes spec.operatingMode, the one field a sandbox can change in
-// place: Suspended stops it, Running starts it.
+// place: Suspended stops it, Running starts it. Any other field may be
+// sent as it already is, as a second `kubectl apply` does (apply.go).
 func (s *Server) patch(w http.ResponseWriter, r *http.Request, ns, name string) error {
 	ct := r.Header.Get("Content-Type")
 	if !strings.HasPrefix(ct, "application/merge-patch+json") && !strings.HasPrefix(ct, "application/strategic-merge-patch+json") {
-		return &StatusError{Code: http.StatusUnsupportedMediaType, Reason: "UnsupportedMediaType", Message: "only merge patches are supported, of spec.operatingMode"}
+		return &StatusError{Code: http.StatusUnsupportedMediaType, Reason: "UnsupportedMediaType", Message: "only merge patches are supported"}
 	}
 	owner, ok := s.Owners.Owner(ns)
 	if !ok {
@@ -708,29 +709,27 @@ func (s *Server) patch(w http.ResponseWriter, r *http.Request, ns, name string) 
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&raw); err != nil {
 		return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "the patch is not a JSON object"}
 	}
-	var refused []string
-	refusedFields(raw, map[string]any{"spec": map[string]any{"operatingMode": true}, "metadata": map[string]any{"name": true, "namespace": true}}, "", &refused)
-	if len(refused) > 0 {
-		return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid", Message: "only spec.operatingMode can change; not: " + strings.Join(refused, "; ")}
-	}
 	it, err := s.find(owner, name)
 	if err != nil {
 		return err
 	}
-	if spec, _ := raw["spec"].(map[string]any); spec != nil {
-		switch spec["operatingMode"] {
-		case nil:
-		case OperatingModeRunning:
-			err = s.Backend.SetRunning(r.Context(), owner, it.Placement.SandboxID, true)
-		case OperatingModeSuspended:
-			err = s.Backend.SetRunning(r.Context(), owner, it.Placement.SandboxID, false)
-		default:
-			return &StatusError{Code: http.StatusUnprocessableEntity, Reason: "Invalid", Message: "spec.operatingMode: must be Running or Suspended"}
-		}
-		if err != nil {
+	var spec *SpecSummary
+	if sm, ok := s.Backend.Specs(r.Context(), specRefs(it))[it.Placement.SandboxID]; ok {
+		spec = &sm
+	}
+	cur := SandboxFrom(it, ns, spec)
+	m, err := mergeSandboxPatch(cur, spec, raw, time.Unix(it.Placement.CreatedUnix, 0))
+	if err != nil {
+		return err
+	}
+	// The mode changes when the patch names it: a second apply of a file
+	// that says Running starts a suspended sandbox, as apply means.
+	if rawSpec, _ := raw["spec"].(map[string]any); rawSpec != nil && rawSpec["operatingMode"] != nil {
+		if err := s.Backend.SetRunning(r.Context(), owner, it.Placement.SandboxID, m.mode != OperatingModeSuspended); err != nil {
 			return err
 		}
 	}
+	warn(w, m.warnings)
 	writeJSON(w, http.StatusOK, s.render(r.Context(), []kubeview.Item{it}, func(string) string { return ns })[0])
 	return nil
 }

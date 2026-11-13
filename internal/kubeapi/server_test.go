@@ -395,7 +395,7 @@ func TestServerDeleteAndPatch(t *testing.T) {
 		code     int
 	}{
 		{`{"spec":{"operatingMode":"Paused"}}`, merge, 422},
-		{`{"spec":{"podTemplate":{}}}`, merge, 422},
+		{`{"spec":{"podTemplate":{"spec":{"containers":[{"name":"main","image":"other:1"}]}}}}`, merge, 422},
 		{`x`, merge, 400},
 		{`{}`, "application/json-patch+json", 415},
 		{`{}`, "application/apply-patch+yaml", 415},
