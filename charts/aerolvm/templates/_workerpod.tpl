@@ -13,6 +13,12 @@ and cluster mode's pod template, which the operator stamps per worker
 # No Kubernetes API rights (plan §8.7, wall 4).
 automountServiceAccountToken: false
 enableServiceLinks: false
+{{- if $root.Values.worker.wasm.enabled }}
+# WASM sandboxes are processes sandboxd starts: with one process namespace
+# for the pod they outlive an agent restart, and the next agent takes them
+# over (C14). sandboxd refuses to start them without it.
+shareProcessNamespace: true
+{{- end }}
 {{- if $root.Values.edge.enabled }}
 # The edge container is not root, and Kubernetes gives a non-root
 # container no ambient capabilities, so ports 80 and 443 are opened
@@ -175,7 +181,12 @@ containers:
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
-      - { name: SB_HOST_RUNTIMES, value: "docker,gvisor" }
+      - { name: SB_HOST_RUNTIMES, value: {{ ternary "docker,gvisor,wasm" "docker,gvisor" $root.Values.worker.wasm.enabled | quote }} }
+      {{- if $root.Values.worker.wasm.enabled }}
+      # WASM workers start under the runtime container's sandboxes group
+      # (SB_HOST_PROCESS_CGROUP_PARENT defaults to the containerd parent).
+      - { name: SB_ENABLE_WASM, value: "true" }
+      {{- end }}
       - { name: SB_CONTAINER_ENGINE, value: containerd }
       - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
       - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }

@@ -37,6 +37,11 @@ type Config struct {
 	// JailCgroupRoot is the parent cgroup (v2) under which each group gets
 	// its own cgroup with the group's caps.
 	JailCgroupRoot string
+	// HostsCgroupRoot is the directory the group hosts' own cgroup is made
+	// in, so they outlive sandboxd (pkg/hostproc); "" for the cgroup v2
+	// root. A worker pod sets it under the runtime container's sandboxes
+	// group (C14).
+	HostsCgroupRoot string
 	// JailPidsMax is pids.max for each group cgroup. Zero = unlimited.
 	JailPidsMax int
 	// SeccompMode is enforce | audit | off (pkg/isolate.Seccomp*).
@@ -64,6 +69,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		JailGID:          cfg.IsolateJailGID,
 		Jitless:          cfg.IsolateJitless,
 		JailCgroupRoot:   cfg.IsolateJailCgroupRoot,
+		HostsCgroupRoot:  cfg.HostProcessCgroupRoot(),
 		JailPidsMax:      cfg.IsolateJailPidsMax,
 		SeccompMode:      cfg.IsolateSeccompMode,
 		IdleTTL:          cfg.IsolateGroupIdleTTL,

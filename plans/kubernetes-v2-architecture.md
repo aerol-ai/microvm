@@ -691,8 +691,8 @@ they start in a cgroup outside `sandboxd`'s unit and the next `sandboxd` takes
 them over (`pkg/hostproc`; `internal/runtime/wasm/adopt.go`,
 `internal/runtime/isolate/adopt.go`). In the pod, the same code must target the
 `runtime` container's cgroup, and the pod must share one process namespace, or
-an `agent` restart kills them with the container (C14). They still come in
-Phase 5, after gVisor works.
+an `agent` restart kills them with the container (C14). They come in
+Phase 5, after gVisor works: WASM first ("Phase 5 results").
 
 ## 9. The control plane inside one cell
 
@@ -2129,6 +2129,39 @@ each server used about 6% of one core and 160 MB (E5 above).
   every goroutine's stack. Stand-ins share a machine's CPU, so per-create
   latency on a worker is not a real worker's; the bench measures the
   control plane.
+
+### Phase 5 results
+
+**C14 on kind** (2026-11-13, `scripts/k8s-dev.sh` single mode with
+`worker.wasm.enabled=true`; WASM first, as it needs nothing the images do
+not already carry):
+
+- WASM workers start in `aerolvm-wasm` under the runtime container's
+  sandboxes group (`SB_HOST_PROCESS_CGROUP_PARENT`, by default
+  `SB_CONTAINERD_CGROUP_PARENT`): inside the pod's box and under the
+  sandboxes' memory cap (F10). The V8 hosts and their jail's group cgroups,
+  and the Firecracker VMs' cgroup, follow the same parent.
+- With WASM on, the chart makes the worker pod share one process
+  namespace. sandboxd refuses to boot with WASM, V8 isolates or Firecracker
+  on in a pod whose agent container owns its process namespace (its PID 1
+  is in sandboxd's own cgroup): there each agent restart would kill every
+  one of them. Checked live: without the shared namespace the agent stops
+  at boot with that reason and restarts.
+- The kubelet's stop of the agent container (`crictl stop`, as for a crash
+  or an in-place image change) took 1 s; the agent came back; the same
+  worker process ran on, and the new `sandboxd` took the sandbox over
+  ("adopted 1, lost 0"). The sandbox stayed `started`.
+- F32. The first run's stop hung for over 2 minutes and the agent never
+  came back: the WASM resident host had inherited `sandboxd`'s stdout and
+  stderr, which in a container are its log pipes, and the container
+  runtime counts a container stopped only once every holder has closed
+  them. In a pod, a process started to outlive `sandboxd` now writes what
+  it would send there to a log file in its run directory (`workers.log`,
+  `hosts.log`; 0600, truncated by a start past 32 MiB). On a VM it keeps
+  the journal, as before.
+- Left in Phase 5: V8 isolates need `workerd` in the agent image;
+  Firecracker needs its binaries and kernel there and a machine with
+  `/dev/kvm` (the Firecracker pools item, nested virtualization from S6).
 
 ## 19. Tests, drills and benchmarks
 

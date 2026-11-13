@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,12 +32,24 @@ import (
 // ends every record.
 
 const (
-	// vmmCgroupName is the cgroup, under the cgroup v2 root, every VM
-	// runs in.
+	// vmmCgroupName is the cgroup, under the cgroup v2 root or the
+	// configured parent (Config.VMMCgroupParent), every VM runs in.
 	vmmCgroupName = "aerolvm-vmm"
 	// vmmRecordDirName holds one record per running VM, under the run dir.
 	vmmRecordDirName = "vmms"
 )
+
+// vmmCgroupParent is Config.VMMCgroupParent of the driver this process
+// runs. There is one driver per sandboxd, and the host seams below read it
+// without a driver at hand, so New sets it once.
+var vmmCgroupParent atomic.Pointer[string]
+
+func currentVMMCgroupParent() string {
+	if p := vmmCgroupParent.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 var (
 	// errProcessGone: the process exited, or its pid now names another.

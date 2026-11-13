@@ -59,8 +59,14 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// Workers run in their own cgroup, outside sandboxd's unit, so a
 	// restart or an upgrade does not stop them (pkg/hostproc); the next
 	// sandboxd takes them over below. Off by itself where cgroup v2 is not
-	// usable, and then workers die with sandboxd as before.
-	workerCgroup := hostproc.NewCgroup(logger, "", wasmWorkerCgroup, "WASM workers")
+	// usable, and then workers die with sandboxd as before. In a worker pod
+	// the cgroup is under the runtime container's sandboxes group (C14).
+	workerCgroup := hostproc.NewCgroup(logger, cfg.HostProcessCgroupRoot(), wasmWorkerCgroup, "WASM workers")
+	if cfg.HostProcessCgroupParent != "" {
+		// In the pod, not the agent container's log pipes: a worker
+		// holding them would hold the container's stop (C14).
+		workerCgroup.SetLogFile(filepath.Join(cfg.WasmRunDir, "workers.log"))
+	}
 	supervisor.SetCgroup(workerCgroup)
 	driver.SetWorkerCgroup(workerCgroup)
 	driver.SetModuleResolver(resolver)

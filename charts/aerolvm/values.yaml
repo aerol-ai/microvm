@@ -63,6 +63,17 @@ worker:
   # become label values; set false to keep them off /v1/metrics.
   usageMetrics:
     enabled: true
+  # WASM sandboxes on workers (plans/kubernetes-v2-architecture.md §8.9,
+  # C14). sandboxd runs each one as a process of its own, in a cgroup under
+  # the runtime container's sandboxes group, so it counts against the
+  # sandboxes' budget. Turning this on also makes the worker pod share one
+  # process namespace: without it, each restart or upgrade of the agent
+  # container would kill every WASM sandbox, and sandboxd refuses to start
+  # them. With it, the next agent takes the running ones over. Every
+  # container in the pod can then see the others' processes (not their
+  # environment or files).
+  wasm:
+    enabled: false
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
   # In cluster mode the operator adds the API server to the first and the
   # pod and Service ranges to the second, for every new worker; you add
