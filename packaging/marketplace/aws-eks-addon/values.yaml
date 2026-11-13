@@ -1,0 +1,12 @@
+# AerolVM as an Amazon EKS add-on: the defaults the listing ships with
+# (../README.md). check.sh renders the chart with these values.
+image:
+  # The listing's Marketplace ECR repositories; check.sh takes the real
+  # registry as its argument.
+  registry: REPLACE_WITH_MARKETPLACE_ECR_REGISTRY
+mode: single
+apiToken:
+  # Create this Secret (key SB_PAT_TOKEN) before the add-on. EKS renders an
+  # add-on without reading the cluster, so the chart cannot keep a token it
+  # made itself across upgrades: every update would make a new one.
+  existingSecret: aerolvm-api-token

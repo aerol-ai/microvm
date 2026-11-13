@@ -1,0 +1,13 @@
+# A cluster-mode configuration for the EKS add-on: three zones, one gVisor
+# worker pool. Cluster mode needs cert-manager in the cluster first (it
+# issues the cluster's internal certificates); see ../README.md.
+mode: cluster
+cluster:
+  zones: [us-east-1a, us-east-1b, us-east-1c]
+  workerPools:
+    - name: general
+      runtimes: [gvisor]
+      machine: { cpu: 16, memoryGiB: 64 }
+      minWorkers: 3
+      maxWorkers: 30
+      headroomPercent: 15
