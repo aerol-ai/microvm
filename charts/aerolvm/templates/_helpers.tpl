@@ -16,9 +16,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: worker
 {{- end -}}
 
+{{- /* An image by name. The Azure Marketplace package names each image
+under global.azure.images (packaging/marketplace/azure): registry, image and
+digest, which it rewrites to its own registry; without it, the chart's
+registry and tag. */ -}}
 {{- define "aerolvm.image" -}}
+{{- $az := dig "azure" "images" .name dict (.root.Values.global | default dict) -}}
+{{- if and $az.registry $az.image $az.digest -}}
+{{- printf "%s/%s@%s" $az.registry $az.image $az.digest -}}
+{{- else -}}
 {{- $tag := .root.Values.image.tag | default .root.Chart.AppVersion -}}
 {{- printf "%s/%s:%s" .root.Values.image.registry .name $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "aerolvm.edgeTLSSecret" -}}

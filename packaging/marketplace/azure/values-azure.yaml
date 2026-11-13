@@ -1,0 +1,24 @@
+# Merged into the packaged chart's values.yaml by build.sh: the Marketplace
+# wants every image named under global.azure.images, by digest, and copies
+# them to its own registry (charts/aerolvm/templates/_helpers.tpl,
+# aerolvm.image). build.sh fills each digest with the linux/amd64 image of
+# the release (the Marketplace takes amd64 only).
+global:
+  azure:
+    images:
+      aerolvm:
+        registry: ghcr.io/aerol-ai
+        image: aerolvm
+        digest: ""
+      aerolvm-runtime:
+        registry: ghcr.io/aerol-ai
+        image: aerolvm-runtime
+        digest: ""
+      aerolvm-edge:
+        registry: ghcr.io/aerol-ai
+        image: aerolvm-edge
+        digest: ""
+      aerolvm-operator:
+        registry: ghcr.io/aerol-ai
+        image: aerolvm-operator
+        digest: ""

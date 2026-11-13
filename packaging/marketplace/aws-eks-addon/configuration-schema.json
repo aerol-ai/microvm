@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AerolVM EKS add-on configuration",
+  "description": "The chart values a customer may set on the add-on (charts/aerolvm/values.yaml has the meaning of each).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["single", "cluster"],
+      "description": "single: one worker pod. cluster: servers, gateways and worker pools run by the operator; needs cert-manager."
+    },
+    "apiToken": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A Secret with the API token under the key SB_PAT_TOKEN. Required: the add-on cannot keep a token it makes itself."
+        }
+      },
+      "required": ["existingSecret"]
+    },
+    "worker": {
+      "type": "object",
+      "properties": {
+        "defaultRuntime": { "type": "string", "enum": ["", "docker", "gvisor"] },
+        "diskFloorRatio": { "type": "string", "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?)$" },
+        "blockPrivateByDefault": { "type": "boolean" },
+        "runtime": {
+          "type": "object",
+          "properties": { "resources": { "type": "object" } }
+        },
+        "firecracker": {
+          "type": "object",
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "gvisor": {
+          "type": "object",
+          "properties": { "checkpointMoves": { "type": "boolean" } }
+        },
+        "egressDenyFloor": { "type": "array", "items": { "type": "string" } },
+        "egressPrivateRanges": { "type": "array", "items": { "type": "string" } },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "extraEgressCIDRs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "monitoring": {
+      "type": "object",
+      "properties": { "enabled": { "type": "boolean" } }
+    },
+    "cluster": {
+      "type": "object",
+      "properties": {
+        "zones": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "workerNamespace": { "type": "string" },
+        "createWorkerNamespace": { "type": "boolean" },
+        "workerPools": { "type": "array", "items": { "type": "object" } }
+      }
+    }
+  },
+  "required": ["apiToken"]
+}
