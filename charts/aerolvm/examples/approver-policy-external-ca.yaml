@@ -1,0 +1,77 @@
+# External-CA mode (C23, plans/kubernetes-v2-architecture.md §15.2.1): let
+# the bank's issuer sign AerolVM node certificates only for Certificates in
+# AerolVM's two namespaces, where only the operator may make them. For
+# cert-manager's approver-policy.
+#
+# A Certificate's request is made by cert-manager itself, not by whoever
+# made the Certificate, so the policy is bound to cert-manager's controller
+# ServiceAccount and limits by namespace: a request for these names from
+# any other namespace matches no policy and is never signed. Keep it that
+# way:
+#   - give no one but the operator the right to create Certificates in
+#     aerolvm-system and aerolvm-workers (the chart grants only the
+#     operator);
+#   - turn cert-manager's own approval off (its Helm value
+#     disableAutoApproval: true, cert-manager 1.15 or later), or it approves
+#     every request before this policy is read;
+#   - let no other policy for this issuer allow node: or aerolvm-role: URIs.
+#
+# Tested on kind with cert-manager v1.21.3 and approver-policy v0.29.0
+# (integration-tests/k8s/fckind.sh, AEROL_FCKIND_PROOF=externalca): a
+# worker's and a server's renewal are approved; node names asked for from
+# another namespace wait unsigned; other names in AerolVM's namespace are
+# denied.
+#
+# Change bank-ca to your issuer (kind and name as in the chart's
+# cluster.externalCA.issuerRef), aerolvm-system and aerolvm-workers to your
+# namespaces, aerolvm-servers to <cluster.name>-servers, and the subject to
+# your cert-manager controller's ServiceAccount.
+apiVersion: policy.cert-manager.io/v1alpha1
+kind: CertificateRequestPolicy
+metadata:
+  name: aerolvm-nodes
+spec:
+  allowed:
+    # The node's ID; sandboxd reads only the SANs.
+    commonName:
+      value: "*"
+    # The name every node dials, and a server's own stable name.
+    dnsNames:
+      values: ["aerolvm-cluster-node", "*.aerolvm-servers.aerolvm-system.svc"]
+    uris:
+      values: ["node:*", "aerolvm-role:server", "aerolvm-role:ingress", "aerolvm-role:worker"]
+      required: true
+    usages: ["digital signature", "server auth", "client auth"]
+  constraints:
+    privateKey:
+      algorithm: ECDSA
+  selector:
+    issuerRef:
+      name: bank-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    namespace:
+      matchNames: [aerolvm-system, aerolvm-workers]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aerolvm-nodes-policy
+rules:
+  - apiGroups: [policy.cert-manager.io]
+    resources: [certificaterequestpolicies]
+    verbs: [use]
+    resourceNames: [aerolvm-nodes]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aerolvm-nodes-policy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aerolvm-nodes-policy
+subjects:
+  - kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager

@@ -349,7 +349,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	a.startOwnerWatcher()
 	a.startPlacementFeed()
 	a.startDenyMirror(denyMirrorInterval)
-	if clusterTLS != nil {
+	// In external-CA mode cert-manager renews the certificate (C23).
+	if clusterTLS != nil && !cfg.ClusterExternalCA {
 		a.certRenewStop = startCertRenewer(&certRenewer{tls: clusterTLS, nodeID: nodeID, logger: logger, renew: a.renewViaServers})
 	}
 	a.startUpgradeNode()

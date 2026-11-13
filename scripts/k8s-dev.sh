@@ -11,6 +11,10 @@
 #                                  # cluster mode (P2): the operator, three
 #                                  # servers, gateways and a worker pool on a
 #                                  # kind cluster of three nodes, one per zone
+#   AEROL_K8S_MODE=cluster AEROL_K8S_EXTERNAL_CA=1 make k8s-dev
+#                                  # the same in external-CA mode (C23): every
+#                                  # node's certificate from a cert-manager CA
+#                                  # issuer that stands in for a bank's
 #
 # Needs Docker, kind, kubectl and Helm 3.8 or later (HELM names another).
 # sandboxd links glibc, so it is compiled in a golang container; toolboxd, the
@@ -26,6 +30,7 @@ case "$mode" in
   *) echo "k8s-dev: AEROL_K8S_MODE is single or cluster, got $mode" >&2; exit 2 ;;
 esac
 edge="${AEROL_K8S_EDGE:-0}"
+external_ca="${AEROL_K8S_EXTERNAL_CA:-0}"
 # The images' tag, and in cluster mode the version sandboxd reports: an
 # AerolCluster's version is a release tag, and the operator upgrades any
 # node that reports another (AEROL_K8S_VERSION=v0.0.0-dev.2 builds a
@@ -128,6 +133,31 @@ if [[ "$edge" == 1 || "$mode" == cluster ]]; then
   fi
 fi
 
+ca_flags=()
+if [[ "$mode" == cluster && "$external_ca" == 1 ]]; then
+  # The bank's issuer, stood in for by a CA of its own: a root the
+  # self-signed issuer makes, and a CA ClusterIssuer that signs with it
+  # (it returns the root as ca.crt, as the operator needs).
+  kubectl --context "kind-$cluster" apply -f - >/dev/null <<'YAML'
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: aerolvm-dev-bank-ca, namespace: cert-manager }
+spec:
+  isCA: true
+  commonName: aerolvm-dev-bank-ca
+  secretName: aerolvm-dev-bank-ca
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev }
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: aerolvm-dev-bank-ca }
+spec: { ca: { secretName: aerolvm-dev-bank-ca } }
+YAML
+  kubectl --context "kind-$cluster" -n cert-manager wait --for=condition=Ready certificate/aerolvm-dev-bank-ca --timeout=2m >/dev/null
+  ca_flags=(--set cluster.externalCA.issuerRef.name=aerolvm-dev-bank-ca)
+fi
+
 if [[ "$mode" == cluster ]]; then
   # Small requests: kind's nodes all share this machine. Each node reports
   # the whole machine, so the pods fit on paper; little runs in them.
@@ -158,7 +188,8 @@ VALUES
   # Servers, gateways and the operator run under `restricted` (C5).
   kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null
   "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
-    -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"}
+    -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never \
+    ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"}
   # The operator replaces nothing a new image changes on its own: restart it
   # so a rebuilt operator runs.
   kubectl --context "kind-$cluster" -n "$namespace" rollout restart deployment/aerolvm-operator >/dev/null
