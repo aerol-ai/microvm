@@ -363,6 +363,11 @@ func JoinErrorStatus(err error) int {
 	case errors.Is(err, ErrNoCASigner), errors.Is(err, ErrNotLeader):
 		return http.StatusServiceUnavailable
 	}
+	// A worker or gateway relays join calls to a server: the server's own
+	// refusal keeps its status (an external-CA cluster's 412 on a token).
+	if s := ForwardedStatus(err); s != 0 {
+		return s
+	}
 	return http.StatusInternalServerError
 }
 

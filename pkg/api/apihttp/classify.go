@@ -391,6 +391,11 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrOwnershipFenced):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "this sandbox's node has lost contact with the cluster, so the sandbox is paused; retry shortly"}
 
+	// A server's refusal of a call this node forwarded, about the request
+	// itself: the caller gets the server's status, not a guess.
+	case cluster.ForwardedStatus(err) != 0:
+		return Classification{Status: cluster.ForwardedStatus(err), Message: truncate(err.Error())}
+
 	default:
 		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error()), Kind: ErrKindUnclassified, LogLevel: slog.LevelWarn, Log: true}
 	}

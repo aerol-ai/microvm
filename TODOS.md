@@ -739,27 +739,6 @@ the skip.
 
 ---
 
-## A forwarded control-plane 4xx reaches the API caller as 500 (API)
-
-- **What:** when a gateway or worker forwards a control-plane call to a
-  server and the server refuses it with a 4xx, the caller gets HTTP 500
-  with the server's status in the message: "cluster control-plane request
-  failed with status 412: …" (`internal/cluster/agent.go`, `statusError`;
-  the API's error writer does not know that type, so it answers 500).
-- **Why:** seen live in run `c23-extca-3` (2026-11-13): a join-token
-  request in external-CA mode is refused with 412 by the server, and the
-  caller saw 500. The message is right; only the status is wrong, so a
-  client cannot tell a refusal from a fault.
-- **Caveat:** not every forwarded 4xx is the caller's: a 403 "cluster peer
-  not in membership" is between nodes and must stay a 5xx (retryable) to
-  the caller. Pass through only refusals about the request itself (400,
-  404, 409, 412), and keep the rest as they are.
-- **Where to start:** `statusError` in `internal/cluster/agent.go`, and
-  `apihttp.WriteStoreAwareError`, which maps error types to statuses.
-- **Effort:** S. **Priority:** P3.
-
----
-
 ## Propose a controller-class field upstream in agent-sandbox (Kubernetes, P2)
 
 - **What:** open an issue/KEP in `kubernetes-sigs/agent-sandbox` for a
@@ -786,6 +765,30 @@ the skip.
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### A forwarded control-plane 4xx reaches the API caller as 500 (API) — FIXED
+
+- **What:** when a gateway or worker forwards a control-plane call to a
+  server and the server refuses it with a 4xx, the caller gets HTTP 500
+  with the server's status in the message: "cluster control-plane request
+  failed with status 412: …" (`internal/cluster/agent.go`, `statusError`;
+  the API's error writer does not know that type, so it answers 500).
+- **Why:** seen live in run `c23-extca-3` (2026-11-13): a join-token
+  request in external-CA mode is refused with 412 by the server, and the
+  caller saw 500. The message is right; only the status is wrong, so a
+  client cannot tell a refusal from a fault.
+- **Caveat:** not every forwarded 4xx is the caller's: a 403 "cluster peer
+  not in membership" is between nodes and must stay a 5xx (retryable) to
+  the caller. Pass through only refusals about the request itself (400,
+  404, 409, 412), and keep the rest as they are.
+- **Where to start:** `statusError` in `internal/cluster/agent.go`, and
+  `apihttp.WriteStoreAwareError`, which maps error types to statuses.
+- **Effort:** S. **Priority:** P3.
+- **Fixed** (2026-11-14): `cluster.ForwardedStatus` gives a forwarded
+  refusal about the request (400, 404, 409, 412, 422, 429) its own status,
+  in `cluster.JoinErrorStatus` and `apihttp.Classify`; a 401 or 403 between
+  nodes, "peer not in membership", and every 5xx keep their old answers.
+  Tests: `TestForwardedStatus`, `TestClassifyForwardedRefusal`.
 
 ### Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2) — DECIDED and BUILT
 
