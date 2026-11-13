@@ -153,11 +153,11 @@ func TestAgentFeedMergesRunStates(t *testing.T) {
 	a := &Agent{}
 	f := &agentPlacementFeed{rows: map[string]Placement{"sb-a": {SandboxID: "sb-a", Version: 5, RunState: RunStateRunning, RunStateIndex: 6}}}
 	stopped := Placement{SandboxID: "sb-a", Version: 5, RunState: RunStateSuspended, RunStateIndex: 8}
-	if !a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 8, Placement: &stopped}}, Next: 8}) {
+	if len(a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 8, Placement: &stopped}}, Next: 8})) == 0 {
 		t.Fatal("a stop at the same version was not merged")
 	}
 	stale := Placement{SandboxID: "sb-a", Version: 5, RunState: RunStateRunning, RunStateIndex: 6}
-	if a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 6, Placement: &stale}}, Next: 9}) {
+	if len(a.applyPlacementChanges(f, PlacementChangesResponse{Changes: []PlacementChange{{SandboxID: "sb-a", Index: 6, Placement: &stale}}, Next: 9})) > 0 {
 		t.Fatal("an older run state replaced a newer one")
 	}
 	if got := f.rows["sb-a"]; got.RunState != RunStateSuspended {
