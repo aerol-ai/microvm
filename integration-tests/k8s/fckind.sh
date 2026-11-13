@@ -3,7 +3,7 @@
 # architecture.md Phase 5, "Firecracker pools"), proven on kind on one EC2
 # machine with nested virtualization, the setting spike S6 tested.
 #
-#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move] fckind.sh <name>
+#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move|gmove] fckind.sh <name>
 #
 # pod (the default): one worker, a VM survives an agent restart. move:
 # cluster mode, every worker a Firecracker worker; a VM's worker is
