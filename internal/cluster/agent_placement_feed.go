@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // Agent half of the placement delta feed (plans/ingress-proxy-routing.md
@@ -70,6 +72,7 @@ type agentPlacementFeed struct {
 	subMu       sync.Mutex
 	subs        []chan struct{}
 	watchers    map[int]PlacementChangeHandler
+	events      map[int]PlacementFeedHandler
 	nextWatcher int
 
 	stop context.CancelFunc
@@ -87,10 +90,18 @@ var (
 	feedBackoffMax = 30 * time.Second
 )
 
+// placementFeedWanted: the feed runs for proxy routing (which needs Caddy
+// and a domain, IngressProxyRoutingApplies) and for the agent-sandbox API
+// on an ingress node (C17), whose hub needs it whether the node serves
+// sandbox links or not.
+func placementFeedWanted(cfg config.Config) bool {
+	return cfg.IngressProxyRouting || (cfg.AgentSandboxAPI && cfg.IsIngress())
+}
+
 // startPlacementFeed launches the feed when the node routes without
 // per-sandbox Caddy writes. It is idempotent.
 func (a *Agent) startPlacementFeed() {
-	if a == nil || !a.cfg.IngressProxyRouting || a.feed != nil {
+	if a == nil || !placementFeedWanted(a.cfg) || a.feed != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,17 +189,22 @@ func (a *Agent) runPlacementFeed(ctx context.Context, f *agentPlacementFeed) {
 			continue
 		}
 		f.transitionMu.Lock()
-		changed := a.applyPlacementChanges(f, resp)
+		before := f.position()
+		applied := a.applyPlacementChanges(f, resp)
+		next := f.position()
 		if full, wasInFlux := f.markAnswered(); wasInFlux {
 			// Watchers hold the all-in-flux view: the deltas alone would
 			// leave every untouched row in flux, so they get the whole real
 			// view (which already includes these changes).
-			f.notifyWatchers(full, nil)
+			f.notifyWatchers(PlacementFeedEvent{View: true, Full: full, Next: next}, nil)
 			f.signal()
 			a.logger.Info("cluster agent: placement feed answered again; routing by the real view")
-		} else if changed {
-			f.notifyWatchers(nil, resp.Changes)
+		} else if len(applied) > 0 {
+			f.notifyWatchers(PlacementFeedEvent{Changes: applied, Next: next}, resp.Changes)
 			f.signal()
+		} else if next > before {
+			// Nothing changed, but the view is now current up to next.
+			f.notifyWatchers(PlacementFeedEvent{Next: next}, nil)
 		}
 		f.transitionMu.Unlock()
 	}
@@ -212,7 +228,7 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	f.mu.Lock()
 	next := make(map[string]Placement, len(walked))
 	for _, p := range walked {
-		if cur, ok := next[p.SandboxID]; !ok || p.Version >= cur.Version {
+		if cur, ok := next[p.SandboxID]; !ok || placementAtLeast(p, cur) {
 			next[p.SandboxID] = p
 		}
 	}
@@ -231,7 +247,7 @@ func (a *Agent) resyncPlacementFeed(ctx context.Context, f *agentPlacementFeed) 
 	}
 	f.mu.Unlock()
 	a.observePlacementVersions(walked)
-	f.notifyWatchers(full, nil)
+	f.notifyWatchers(PlacementFeedEvent{View: true, Full: full, Next: v0}, nil)
 	f.signal()
 	return nil
 }
@@ -266,12 +282,14 @@ func (a *Agent) fetchPlacementChanges(ctx context.Context, since uint64, wait ti
 	return resp, nil
 }
 
-// applyPlacementChanges merges one delta and reports whether anything
-// changed. Merge rule: keep the higher Version. A delete removes the row
+// applyPlacementChanges merges one delta and returns the changes that moved
+// a row. For a delete, the returned change carries the row as it was, so a
+// consumer that indexes rows by their owner knows whose row went. Merge rule: keep the higher Version, and at the same Version the
+// later run state (placementAtLeast). A delete removes the row
 // only if the row is not newer than the delete (a delete older than a
 // re-create cannot remove it).
-func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChangesResponse) bool {
-	changed := false
+func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChangesResponse) []PlacementChange {
+	var applied []PlacementChange
 	var seen []Placement
 	f.mu.Lock()
 	for _, ch := range resp.Changes {
@@ -280,13 +298,15 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 		case ch.Deleted:
 			if ok && cur.Version <= ch.Index {
 				delete(f.rows, ch.SandboxID)
-				changed = true
+				gone := cur
+				applied = append(applied, PlacementChange{Index: ch.Index, SandboxID: ch.SandboxID, Deleted: true, Placement: &gone})
 			}
 		case ch.Placement != nil:
-			if !ok || ch.Placement.Version >= cur.Version {
-				f.rows[ch.SandboxID] = *ch.Placement
-				seen = append(seen, *ch.Placement)
-				changed = true
+			if !ok || placementAtLeast(*ch.Placement, cur) {
+				row := *ch.Placement
+				f.rows[ch.SandboxID] = row
+				seen = append(seen, row)
+				applied = append(applied, PlacementChange{Index: ch.Index, SandboxID: ch.SandboxID, Placement: &row})
 			}
 		}
 	}
@@ -295,7 +315,7 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 	}
 	f.mu.Unlock()
 	a.observePlacementVersions(seen)
-	return changed
+	return applied
 }
 
 // feedPlacements answers PlacementsForShards from the synced view: no
@@ -410,6 +430,7 @@ func (a *Agent) checkPlacementFeedAge(f *agentPlacementFeed) bool {
 		return false
 	}
 	f.inFluxSent = true
+	next := f.cursor
 	age := now.Sub(f.lastAnswered)
 	full := make([]Placement, 0, len(f.rows))
 	inFlux := 0
@@ -425,7 +446,7 @@ func (a *Agent) checkPlacementFeedAge(f *agentPlacementFeed) bool {
 		a.logger.Warn("cluster agent: placement feed has had no answer from the control plane past its age limit; failover.policy=recreate sandbox routes are in flux (503) until it answers",
 			"since_last_answer", age.Round(time.Millisecond), "age_limit", f.maxStale, "placements", len(full), "in_flux", inFlux)
 	}
-	f.notifyWatchers(clonePlacements(full), nil)
+	f.notifyWatchers(PlacementFeedEvent{View: true, Full: clonePlacements(full), Next: next, InFlux: true}, nil)
 	f.signal()
 	return true
 }
@@ -528,14 +549,107 @@ func (a *Agent) WatchPlacementChanges(ctx context.Context, fn PlacementChangeHan
 	return true
 }
 
-func (f *agentPlacementFeed) notifyWatchers(full []Placement, changes []PlacementChange) {
+func (f *agentPlacementFeed) notifyWatchers(ev PlacementFeedEvent, legacy []PlacementChange) {
 	f.subMu.Lock()
 	ws := make([]PlacementChangeHandler, 0, len(f.watchers))
 	for _, w := range f.watchers {
 		ws = append(ws, w)
 	}
-	f.subMu.Unlock()
-	for _, w := range ws {
-		w(full, changes)
+	es := make([]PlacementFeedHandler, 0, len(f.events))
+	for _, e := range f.events {
+		es = append(es, e)
 	}
+	f.subMu.Unlock()
+	if ev.View || len(legacy) > 0 {
+		for _, w := range ws {
+			w(ev.Full, legacy)
+		}
+	}
+	for _, e := range es {
+		e(ev)
+	}
+}
+
+// position is how far the rows are current: the feed cursor.
+func (f *agentPlacementFeed) position() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.cursor
+}
+
+// PlacementFeedEvent is one step of the placement feed as an Agent applied
+// it, for a consumer that keeps its own index and must know how far that
+// index is current (the agent-sandbox API's watch hub, C17).
+//
+//   - View: Full is the whole view (nil when there are no rows); replace
+//     everything. InFlux says it is the view past the age limit
+//     (staleViewPlacement), not the real one.
+//   - Otherwise Changes: only the rows that moved (merged by
+//     placementAtLeast); a delete carries the row as it was.
+//   - Next: every change at a Raft index <= Next is in the view. An event
+//     that is not a View and has no Changes only moves Next.
+type PlacementFeedEvent struct {
+	View    bool
+	Full    []Placement
+	Changes []PlacementChange
+	Next    uint64
+	InFlux  bool
+}
+
+// PlacementFeedHandler receives feed events in order, one at a time.
+type PlacementFeedHandler func(PlacementFeedEvent)
+
+// PlacementFeedWatcher is implemented by the Agent.
+type PlacementFeedWatcher interface {
+	WatchPlacementFeed(ctx context.Context, fn PlacementFeedHandler) bool
+}
+
+// WatchPlacementFeed registers fn with the delta feed and returns false when
+// the feed is off. fn first gets the current full view with its position,
+// if the feed has synced.
+func (a *Agent) WatchPlacementFeed(ctx context.Context, fn PlacementFeedHandler) bool {
+	if a == nil || a.feed == nil || fn == nil {
+		return false
+	}
+	f := a.feed
+	f.subMu.Lock()
+	id := f.nextWatcher
+	f.nextWatcher++
+	if f.events == nil {
+		f.events = map[int]PlacementFeedHandler{}
+	}
+	f.events[id] = fn
+	f.subMu.Unlock()
+	// Under transitionMu, as WatchPlacementChanges: no later event can
+	// reach fn before this initial view.
+	f.transitionMu.Lock()
+	if ev, ok := f.view(); ok {
+		fn(ev)
+	}
+	f.transitionMu.Unlock()
+	go func() {
+		<-ctx.Done()
+		f.subMu.Lock()
+		delete(f.events, id)
+		f.subMu.Unlock()
+	}()
+	return true
+}
+
+// view is the current full view and its position, read under one lock.
+func (f *agentPlacementFeed) view() (PlacementFeedEvent, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	stale := f.staleLocked(f.now())
+	if !f.synced && !stale {
+		return PlacementFeedEvent{}, false
+	}
+	full := make([]Placement, 0, len(f.rows))
+	for _, p := range f.rows {
+		if stale {
+			p = staleViewPlacement(p)
+		}
+		full = append(full, p)
+	}
+	return PlacementFeedEvent{View: true, Full: clonePlacements(full), Next: f.cursor, InFlux: stale}, true
 }

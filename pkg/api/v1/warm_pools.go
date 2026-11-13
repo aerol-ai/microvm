@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -106,4 +107,55 @@ func (h *handlers) clusterInternalWarmPoolRead(w http.ResponseWriter, r *http.Re
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// clusterInternalRunStates records an owner's run-state batch on this
+// server: the leader applies it, a follower forwards it one hop
+// (cluster.SetRunStates).
+func (h *handlers) clusterInternalRunStates(w http.ResponseWriter, r *http.Request) {
+	writer, ok := h.deps.Service.Cluster().(cluster.RunStatePublisher)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.RunStateWriteRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	applied, err := writer.SetRunStates(r.Context(), req.Reports)
+	if errors.Is(err, cluster.ErrBadRunStateBatch) {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: run states: "+err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.RunStateWriteResponse{Applied: applied})
+}
+
+// clusterInternalSpecSummaries answers a gateway's batch of spec summaries
+// from this server's FSM (cluster.SpecSummaries).
+func (h *handlers) clusterInternalSpecSummaries(w http.ResponseWriter, r *http.Request) {
+	reader, ok := h.deps.Service.Cluster().(cluster.SpecSummaryReader)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.SpecSummariesRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	out, err := reader.SpecSummaries(r.Context(), req.IDs)
+	if errors.Is(err, cluster.ErrBadSpecSummaryBatch) {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SpecSummariesResponse{Summaries: out})
 }

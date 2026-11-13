@@ -166,6 +166,11 @@ containers:
         {{- end }}
         exec sandboxd
     env:
+      {{- if and $cluster $root.Values.cluster.agentSandboxAPI.enabled }}
+      {{- /* Workers report their sandboxes' run state for the agent-sandbox
+      API (C17). */}}
+      {{- include "aerolvm.agentSandboxEnv" $root | nindent 6 }}
+      {{- end }}
       {{- /* In cluster mode a worker holds no admin token: its join gives
       it only the token's fingerprint, to check callers with. */}}
       {{- if not $cluster }}

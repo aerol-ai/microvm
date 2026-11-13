@@ -223,6 +223,8 @@ var routePermissions = map[string]string{
 	"POST /v1/cluster/internal/tokens/write":                  "cluster.internal",
 	"POST /v1/cluster/internal/warm-pools/read":               "cluster.internal",
 	"POST /v1/cluster/internal/warm-pools/write":              "cluster.internal",
+	"POST /v1/cluster/internal/run-states":                    "cluster.internal",
+	"POST /v1/cluster/internal/placements/spec-summaries":     "cluster.internal",
 	"POST /v1/cluster/internal/placements-by-ids":             "cluster.internal",
 	"POST /v1/cluster/internal/placements/owned-recovery":     "cluster.internal",
 	"POST /v1/cluster/internal/placements/page":               "cluster.internal",

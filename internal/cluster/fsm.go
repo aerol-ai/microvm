@@ -62,7 +62,8 @@ const (
 	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
 	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go); 43-47
 	// are the join ops (fsm_join.go); 48-50 are the active version and
-	// rollout ops (fsm_rollout.go). The next free code is 51.
+	// rollout ops (fsm_rollout.go); 51 is opSetRunStates (fsm_run_state.go).
+	// The next free code is 52.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -237,6 +238,8 @@ type command struct {
 	// WarmPool carries the entry for opPutWarmPool, and its image for
 	// opDeleteWarmPool (fsm_warm_pools.go).
 	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
+	// RunStates carries opSetRunStates' batch (fsm_run_state.go).
+	RunStates []RunStateReport `json:"run_states,omitempty"`
 	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
 	// opPutIdentityRole and names the tag opDeleteIdentityRole removes
 	// (fsm_identity.go).
@@ -2061,6 +2064,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return nil
+	case opSetRunStates:
+		result, err := f.applySetRunStatesLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
 	case opDenyNode:
 		result, err := f.applyDenyNodeLocked(cmd, log.Index)
 		if err != nil {

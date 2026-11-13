@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 17
+	fsmOpsVersion              = 18
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -77,7 +77,8 @@ const (
 // (peerCertAuthFSMOpsVersion in peer_cert_auth.go, no FSM op); 16 is the
 // rollout node's operator flag (rolloutOperatorFSMOpsVersion in
 // rollout_operator.go); 17 is opUpsertSpec's version check
-// (specVersionFenceFSMOpsVersion in spec_version_fence.go). Versions 6 to 8
+// (specVersionFenceFSMOpsVersion in spec_version_fence.go); 18 is
+// opSetRunStates (runStateFSMOpsVersion in fsm_run_state.go). Versions 6 to 8
 // are the gates in the block above.
 
 // FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
