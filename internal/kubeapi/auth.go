@@ -69,6 +69,11 @@ func UserFromContext(ctx context.Context) (User, bool) {
 // server trusts.
 var ErrUnauthenticated = errors.New("kubeapi: the request did not come through the Kubernetes API server")
 
+// ErrNoUser is a request with a front-proxy certificate the server trusts
+// but no caller: the kube-apiserver's own health check of the APIService.
+// It may read discovery, nothing else.
+var ErrNoUser = fmt.Errorf("%w: no user header", ErrUnauthenticated)
+
 // FrontProxy authenticates the kube-apiserver's forwarded requests
 // (requestheader authentication, the same contract metrics-server uses).
 type FrontProxy struct {
@@ -103,7 +108,7 @@ func (f *FrontProxy) Authenticate(r *http.Request) (User, error) {
 		}
 	}
 	if u.Name == "" {
-		return User{}, fmt.Errorf("%w: no user header", ErrUnauthenticated)
+		return User{}, ErrNoUser
 	}
 	for _, h := range orDefault(f.GroupHeaders, "X-Remote-Group") {
 		u.Groups = append(u.Groups, r.Header.Values(h)...)
