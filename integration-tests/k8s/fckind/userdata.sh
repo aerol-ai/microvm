@@ -219,12 +219,31 @@ YAML
   # Another team's namespace sees nothing of dev's.
   $kk create namespace other >/dev/null 2>&1
   say "other namespace: $($kk -n other get sandboxes 2>&1 | head -c 200)"
+  local uid1
+  uid1=$($kk -n dev get sandbox web -o jsonpath='{.metadata.uid}' 2>/dev/null)
   say "delete: $($kk -n dev delete sandbox web --timeout=120s 2>&1 | head -c 200)"
   for i in $(seq 1 24); do
     $kk -n dev get sandbox web >/dev/null 2>&1 || break
     sleep 5
   done
   say "after delete: $($kk -n dev get sandboxes 2>&1 | head -c 200)"
+  # The same name again with another image (kubectl delete, then create):
+  # the same sandbox ID, a new incarnation, shown with its own image.
+  say "re-create: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata: { name: web, namespace: dev }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - { name: main, image: "busybox:1.36", command: ["sleep", "infinity"] }
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandbox/web --timeout=180s 2>&1 | sed 's/^/FCK wait re-created: /'
+  say "re-created: uid $uid1 -> $($kk -n dev get sandbox web -o jsonpath='{.metadata.uid} {.spec.podTemplate.spec.containers[0].image}' 2>&1 | head -c 200)"
+  say "re-created delete: $($kk -n dev delete sandbox web --timeout=120s 2>&1 | head -c 200)"
   # The claim flow: a template, a warm pool, a claim that makes a sandbox.
   say "template and pool: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
 apiVersion: extensions.agents.x-k8s.io/v1beta1
@@ -256,6 +275,7 @@ YAML
 )"
   $kk -n dev wait --for=condition=Ready sandboxclaim/job --timeout=240s 2>&1 | sed 's/^/FCK wait claim: /'
   say "claims: $($kk -n dev get sandboxclaims 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  say "claims by name: $($kk -n dev get sandboxclaims --field-selector metadata.name=nope --no-headers 2>&1 | head -c 200)"
   say "its sandbox: $($kk -n dev get sandbox job -o jsonpath='{.metadata.labels}' 2>&1 | head -c 300)"
   say "templates and pools: $($kk -n dev get sandboxtemplates,sandboxwarmpools --no-headers 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
   say "claim delete: $($kk -n dev delete sandboxclaim job --timeout=120s 2>&1 | head -c 200)"
