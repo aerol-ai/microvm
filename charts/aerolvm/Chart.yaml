@@ -5,7 +5,7 @@ type: application
 # The chart's own version; appVersion is the AerolVM release whose images it
 # runs by default (image.tag overrides it).
 version: 0.1.0
-appVersion: "v0.7.1"
+appVersion: "v0.7.3"
 home: https://github.com/aerol-ai/microvm
 sources:
   - https://github.com/aerol-ai/microvm
