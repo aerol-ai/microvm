@@ -312,3 +312,50 @@ func TestClusterInternalRunStates(t *testing.T) {
 		t.Fatalf("stateless = %d", rr.Code)
 	}
 }
+
+type specSummaryStubCluster struct {
+	*cluster.Noop
+	err error
+}
+
+func (s *specSummaryStubCluster) SpecSummaries(_ context.Context, ids []string) (map[string]cluster.SpecSummary, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return map[string]cluster.SpecSummary{ids[0]: {Image: "python:3.12", Version: 4}}, nil
+}
+
+func TestClusterInternalSpecSummaries(t *testing.T) {
+	stub := &specSummaryStubCluster{Noop: cluster.NewNoop("srv", "http://srv", "")}
+	h := newOwnedRecoveryHandlers(t, stub)
+	call := func(h *handlers, body string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		h.clusterInternalSpecSummaries(rr, withPeer(httptest.NewRequest(http.MethodPost, cluster.PublicInternalSpecSummariesPath, strings.NewReader(body)), "gw-a"))
+		return rr
+	}
+	rr := call(h, `{"ids":["sb-a"]}`)
+	var out cluster.SpecSummariesResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &out)
+	if rr.Code != http.StatusOK || out.Summaries["sb-a"].Image != "python:3.12" {
+		t.Fatalf("summaries = %d %+v", rr.Code, out)
+	}
+	for _, tc := range []struct {
+		name string
+		err  error
+		body string
+		want int
+	}{
+		{"bad JSON", nil, "x", http.StatusBadRequest},
+		{"bad batch", cluster.ErrBadSpecSummaryBatch, `{"ids":[]}`, http.StatusBadRequest},
+		{"transient", errors.New("no fsm"), `{"ids":["sb-a"]}`, http.StatusServiceUnavailable},
+	} {
+		stub.err = tc.err
+		if rr := call(h, tc.body); rr.Code != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, rr.Code, tc.want)
+		}
+	}
+	stateless := newOwnedRecoveryHandlers(t, cluster.NewNoop("srv", "http://srv", ""))
+	if rr := call(stateless, `{"ids":["sb-a"]}`); rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stateless = %d", rr.Code)
+	}
+}

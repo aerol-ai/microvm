@@ -943,6 +943,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// cannot confirm it still owns them (ownership_lease.go). A no-op
 		// outside cluster mode.
 		svc.StartOwnershipLease(ctx)
+		// Run states for the agent-sandbox API (run_state_report.go). A
+		// no-op unless SB_AGENT_SANDBOX_API and cluster mode.
+		svc.StartRunStateReports(ctx)
 		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
@@ -1106,6 +1109,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// keeps working unchanged.
 	if cfg.EnableCluster {
 		svc.Cluster().AttachInternalHandler(server.Handler())
+	}
+	// The agent-sandbox API (C17): ingress nodes with SB_AGENT_SANDBOX_API
+	// serve it on their own TLS listener. It is opt-in and off the node's
+	// main job, so a failure to start is logged, not fatal; the APIService
+	// then shows it unavailable.
+	if _, err := startAgentSandboxAPI(ctx, cfg, svc.Cluster(), server.KubeBackend(), logger); err != nil {
+		logger.Error("agent-sandbox API not started", "error", err)
 	}
 	logPATBootSettings(logger, cfg)
 	// SB_PAT_SCOPE=host: Caddy's own listener, where every request is public
