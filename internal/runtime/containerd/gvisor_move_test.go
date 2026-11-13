@@ -79,7 +79,7 @@ func TestCheckpointMoveSourceToTarget(t *testing.T) {
 	if err := src.Stop(sbruntime.WithCheckpoint(ctx), "sb-g"); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	out := src.moveDir(moveOut, "sb-g")
+	out := mustMoveDir(t, src, moveOut, "sb-g")
 	want := []string{"--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + out, "sb-g"}
 	if len(*calls) != 1 || !slices.Equal((*calls)[0], want) {
 		t.Fatalf("runsc %q, want %q", *calls, want)
@@ -99,7 +99,7 @@ func TestCheckpointMoveSourceToTarget(t *testing.T) {
 	if !dst.staged("sb-g") {
 		t.Fatal("nothing staged")
 	}
-	got, _ := os.ReadFile(filepath.Join(dst.moveDir(moveIn, "sb-g"), "pages.img"))
+	got, _ := os.ReadFile(filepath.Join(mustMoveDir(t, dst, moveIn, "sb-g"), "pages.img"))
 	if string(got) != savedCheckpoint["pages.img"] {
 		t.Fatalf("pages: %d bytes", len(got))
 	}
@@ -151,7 +151,7 @@ func TestCheckpointRefusals(t *testing.T) {
 			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) {
 				t.Fatalf("stop = %v, want %v", err, tc.want)
 			}
-			if runscwrap.HasCheckpoint(d.moveDir(moveOut, tc.c.id)) {
+			if runscwrap.HasCheckpoint(mustMoveDir(t, d, moveOut, tc.c.id)) {
 				t.Fatal("a failed checkpoint left files")
 			}
 			if tc.c.task != nil && tc.c.task.deletes != 0 {
@@ -233,7 +233,7 @@ func TestCreateRestoresAStagedCheckpoint(t *testing.T) {
 	if _, err := d.Create(ctx, req, "sb-m", "tok", nil); err == nil {
 		t.Fatal("restored with nothing staged")
 	}
-	dir := d.moveDir(moveIn, "sb-m")
+	dir := mustMoveDir(t, d, moveIn, "sb-m")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -272,20 +272,51 @@ func TestCreateRestoresAStagedCheckpoint(t *testing.T) {
 	}
 	// The spec names the checkpoint for the wrapper.
 	var spec oci.Spec
-	if err := d.restoreSpecOpt("sb-m")(context.Background(), nil, nil, &spec); err != nil {
+	opt, err := d.restoreSpecOpt("sb-m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opt(context.Background(), nil, nil, &spec); err != nil {
 		t.Fatal(err)
 	}
 	if spec.Annotations[runscwrap.RestoreAnnotation] != dir {
 		t.Fatalf("annotations %v", spec.Annotations)
 	}
 	// Deleted, the sandbox takes its move files with it.
-	if err := os.MkdirAll(d.moveDir(moveOut, "sb-m"), 0o700); err != nil {
+	if err := os.MkdirAll(mustMoveDir(t, d, moveOut, "sb-m"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-m"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(d.moveDir(moveOut, "sb-m")); !os.IsNotExist(err) {
+	if _, err := os.Stat(mustMoveDir(t, d, moveOut, "sb-m")); !os.IsNotExist(err) {
 		t.Fatal("destroy kept the move files")
+	}
+}
+
+func mustMoveDir(t *testing.T, d *Driver, side, id string) string {
+	t.Helper()
+	dir, err := d.moveDir(side, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// An ID that is not a sandbox ID gets no move folder, and a restore spec
+// for it is refused.
+func TestMoveDirRefusesBadIDs(t *testing.T) {
+	d, _ := driverWith(t)
+	for _, id := range []string{"../x", "", "a/b"} {
+		if _, err := d.moveDir(moveIn, id); err == nil {
+			t.Errorf("moveDir(%q) gave a folder", id)
+		}
+		if _, err := d.restoreSpecOpt(id); err == nil {
+			t.Errorf("restoreSpecOpt(%q) gave an option", id)
+		}
+		if d.staged(id) {
+			t.Errorf("staged(%q)", id)
+		}
+		d.removeMoveFiles(id)
 	}
 }

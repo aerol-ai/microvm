@@ -66,12 +66,10 @@ var runscCommandFn = func(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "runsc", args...).CombinedOutput()
 }
 
-func (d *Driver) moveDir(side, sandboxID string) string {
-	return filepath.Join(d.runDir(), movesDirName, side, sandboxID)
-}
-
-// checkedMoveDir is moveDir for an ID that arrived from another worker.
-func (d *Driver) checkedMoveDir(side, sandboxID string) (string, error) {
+// moveDir is sandboxID's folder on one side of a move. The ID reaches here
+// from API calls and from other workers, so every caller gets the path
+// only through this check (code scanning, go/path-injection).
+func (d *Driver) moveDir(side, sandboxID string) (string, error) {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return "", err
 	}
@@ -108,7 +106,10 @@ func (d *Driver) checkpointForMove(ctx context.Context, client *Client, containe
 		}
 	}
 	id := container.ID()
-	dir := d.moveDir(moveOut, id)
+	dir, err := d.moveDir(moveOut, id)
+	if err != nil {
+		return err
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
@@ -130,7 +131,7 @@ func (d *Driver) checkpointForMove(ctx context.Context, client *Client, containe
 // ExportSandboxSnapshot writes the checkpoint a move's stop saved for
 // sandboxID to w, for ImportSandboxSnapshot on the target.
 func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w io.Writer) error {
-	dir, err := d.checkedMoveDir(moveOut, sandboxID)
+	dir, err := d.moveDir(moveOut, sandboxID)
 	if err != nil {
 		return fmt.Errorf("containerd runtime: export %s: %w", sandboxID, err)
 	}
@@ -147,7 +148,7 @@ func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w 
 // moves/in/<id>, where a create marked runtime.WithRestore finds it. A
 // failed import leaves nothing behind.
 func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r io.Reader) error {
-	final, err := d.checkedMoveDir(moveIn, sandboxID)
+	final, err := d.moveDir(moveIn, sandboxID)
 	if err != nil {
 		return fmt.Errorf("containerd runtime: import %s: %w", sandboxID, err)
 	}
@@ -174,7 +175,7 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 
 // DropImportedSnapshot removes what ImportSandboxSnapshot staged.
 func (d *Driver) DropImportedSnapshot(_ context.Context, sandboxID string) error {
-	dir, err := d.checkedMoveDir(moveIn, sandboxID)
+	dir, err := d.moveDir(moveIn, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -183,23 +184,28 @@ func (d *Driver) DropImportedSnapshot(_ context.Context, sandboxID string) error
 
 // restoreSpecOpt names the staged checkpoint on a restored sandbox's spec,
 // for aerolvm-runsc. runsc does not check this annotation on restore.
-func (d *Driver) restoreSpecOpt(sandboxID string) oci.SpecOpts {
-	return oci.WithAnnotations(map[string]string{runscwrap.RestoreAnnotation: d.moveDir(moveIn, sandboxID)})
+func (d *Driver) restoreSpecOpt(sandboxID string) (oci.SpecOpts, error) {
+	dir, err := d.moveDir(moveIn, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return oci.WithAnnotations(map[string]string{runscwrap.RestoreAnnotation: dir}), nil
 }
 
 // staged reports whether a checkpoint for sandboxID waits here.
 func (d *Driver) staged(sandboxID string) bool {
-	return runscwrap.HasCheckpoint(d.moveDir(moveIn, sandboxID))
+	dir, err := d.moveDir(moveIn, sandboxID)
+	return err == nil && runscwrap.HasCheckpoint(dir)
 }
 
 // removeMoveFiles drops both sides' checkpoints of sandboxID: a start here
 // makes a saved one stale, and a deleted sandbox has no use for them.
 func (d *Driver) removeMoveFiles(sandboxID string) {
-	if validateSandboxID(sandboxID) != nil {
-		return
+	for _, side := range []string{moveOut, moveIn} {
+		if dir, err := d.moveDir(side, sandboxID); err == nil {
+			_ = os.RemoveAll(dir)
+		}
 	}
-	_ = os.RemoveAll(d.moveDir(moveOut, sandboxID))
-	_ = os.RemoveAll(d.moveDir(moveIn, sandboxID))
 }
 
 // ensureRunscRestoreConfig writes the shim config of a restored sandbox.
