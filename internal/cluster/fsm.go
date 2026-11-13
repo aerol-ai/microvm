@@ -3251,6 +3251,21 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 	return clonePlacement(p), true
 }
 
+// getHot is get without the recovery payload (spec and secrets): the hot
+// row every replica holds in memory. A reader that needs only the owner, its
+// epoch, the incarnation or the state uses it, so it never reads the
+// recovery store from disk (F30: at 1,174 creates a second, owner lookups
+// that missed the cache spent 8% of the leader's CPU there).
+func (f *placementFSM) getHot(id string) (Placement, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.placements[id]
+	if !ok {
+		return Placement{}, false
+	}
+	return cloneHotPlacement(p), true
+}
+
 // placementsByIDs returns hot clones for the requested IDs. Missing IDs are
 // omitted. Holds the FSM read lock once for the whole batch.
 func (f *placementFSM) placementsByIDs(ids []string) map[string]Placement {

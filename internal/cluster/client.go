@@ -540,7 +540,8 @@ func (c *Cluster) currentRecreator() SandboxRecreator {
 // exists but has no active owner (auto-orphaned after the owning node died —
 // see voter_autojoin / dead-owner reconciler).
 func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
-	p, ok := c.fsm.get(sandboxID)
+	// The owner is on the hot row; the spec is not needed (F30).
+	p, ok := c.fsm.getHot(sandboxID)
 	if !ok {
 		return OwnerInfo{}, ErrUnknownSandbox
 	}
@@ -944,7 +945,7 @@ func (c *Cluster) currentPlacementIncarnation(sandboxID string) (string, bool, e
 	if c == nil || c.fsm == nil || sandboxID == "" {
 		return "", false, nil
 	}
-	placement, ok := c.fsm.get(sandboxID)
+	placement, ok := c.fsm.getHot(sandboxID)
 	if !ok {
 		return "", false, nil
 	}
