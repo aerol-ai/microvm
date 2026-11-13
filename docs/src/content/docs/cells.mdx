@@ -1,0 +1,182 @@
+---
+title: Many cells
+description: Run several AerolVM clusters side by side, and let the SDKs reach each sandbox at the cluster that holds it.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A **cell** is one AerolVM cluster, or one AerolVM server, with its own address. One cell can hold a lot of sandboxes. Very large setups, and setups in more than one region, run several cells side by side.
+
+With several cells, your app still talks to one address. When it asks for a sandbox that lives in another cell, the SDK finds that cell and sends the request there. You do not change your code.
+
+## Words to know
+
+| Word | What it means |
+|---|---|
+| **Cell** | One AerolVM cluster or server, with its own servers, workers and address. |
+| **Cell number** | A number from 1 to 255 that names a cell. Every cell in a group has a different one. |
+| **Federation** | A group of cells that work together. |
+| **ID key** | A secret that every cell in a federation shares. It hides the cell number inside each sandbox ID. |
+| **Cell address** | The web address of a cell's API, such as `https://cell2.example.com`. |
+
+## How it works
+
+1. Every new sandbox ID carries the number of the cell that made it. The ID key hides the number, so only the cells can read it. The ID looks like any other: `sb-` and 16 letters and digits.
+2. Your app sends a request to any cell.
+3. If the sandbox lives in another cell, the cell answers with status 421 and the right cell's address. The address comes in the `X-Aerolvm-Cell-Endpoint` header.
+4. The SDK sends the same request to that address, with the same token. It remembers the address, so later calls for that sandbox go straight there.
+
+Cells never pass requests to each other. Each cell trusts only its own nodes, so the SDK makes the second call itself.
+
+A new sandbox is made in the cell you send the create to.
+
+## Before you start
+
+- **Use the same sign-in in every cell.** The SDK sends your token to the other cell, so that cell must accept it. Give every cell the same admin token, or set up every cell with the same identity provider and roles. API tokens that one cell makes for you work only in that cell.
+- **Set it up before the first sandbox.** IDs made before the key was set do not say which cell they live in. Ask the cell that made them, by its own address.
+- **Never change the ID key.** A new key reads every old ID as a different cell.
+
+## Make the ID key
+
+Make the key once, then give the same key to every cell:
+
+```bash
+openssl rand -base64 32
+```
+
+Keep it as safe as a password. Anyone with the key can read which cell a sandbox ID belongs to.
+
+## Set up cells on servers
+
+Add three settings to `/etc/sandboxd/sandboxd.env` on every node of every cell, then restart `sandboxd`. This example is for cell 1, in a federation of three cells:
+
+```bash
+SB_CELL_ID=1
+SB_CELL_ID_KEY=<the key you made>
+SB_CELL_ENDPOINTS=2=https://cell2.example.com,3=https://cell3.example.com
+```
+
+| Setting | What it does |
+|---|---|
+| `SB_CELL_ID` | This cell's number, 1 to 255. The same on every node of the cell. |
+| `SB_CELL_ID_KEY` | The ID key. The same on every node of every cell. It must be at least 32 bytes. |
+| `SB_CELL_ENDPOINTS` | The other cells' addresses, as `number=address` pairs split by commas. Listing this cell's own number is fine; it is skipped. It needs `SB_CELL_ID_KEY`. |
+
+A wrong value stops `sandboxd` from starting, with a message that names the setting.
+
+## Set up cells on Kubernetes
+
+In each cell's cluster, before you install the chart:
+
+1. Make a Secret that holds the ID key, under the key `key`. Use the same key in every cell.
+2. Make the admin token Secret yourself, with the same token in every cell. The operator uses a Secret named `<cluster.name>-admin` (key `token`) when it finds one, and makes its own only when there is none.
+3. Set the cell's number and the federation in the chart's values:
+
+```yaml
+mode: cluster
+cluster:
+  name: aerolvm
+  cell: 1
+  federation:
+    idKeySecret: aerolvm-federation
+    cells:
+      "2": https://cell2.example.com
+      "3": https://cell3.example.com
+```
+
+The operator gives every server, gateway and worker the key and the addresses. It copies the key to the worker namespace for you. Pods wait until the key's Secret exists, so no node makes IDs without it. A bad cell number or address is refused on the `AerolCluster`, with the reason in its status.
+
+## Use it from the SDK
+
+There is nothing new to call. Point the client at any cell, and use sandboxes from every cell:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM({
+      apiUrl: "https://cell1.example.com",
+      patToken: "your-secret-pat",
+    });
+
+    // This sandbox lives in cell 2. The SDK finds it there.
+    const sandbox = await client.get("sb-1a2b3c4d5e6f7a8b");
+    console.log(sandbox.status);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url="https://cell1.example.com",
+        pat_token="your-secret-pat",
+    )
+
+    # This sandbox lives in cell 2. The SDK finds it there.
+    sandbox = client.get("sb-1a2b3c4d5e6f7a8b")
+    print(sandbox.status)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   "https://cell1.example.com",
+        PATToken: "your-secret-pat",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // This sandbox lives in cell 2. The SDK finds it there.
+    sandbox, err := client.Get(ctx, "sb-1a2b3c4d5e6f7a8b")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.Status)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(Some("https://cell1.example.com"), Some("your-secret-pat"))?;
+
+    // This sandbox lives in cell 2. The SDK finds it there.
+    let sandbox = client.get("sb-1a2b3c4d5e6f7a8b")?;
+    println!("{}", sandbox.data.status);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("https://cell1.example.com")
+            .setPatToken("your-secret-pat")
+    );
+
+    // This sandbox lives in cell 2. The SDK finds it there.
+    Sandbox sandbox = client.get("sb-1a2b3c4d5e6f7a8b");
+    System.out.println(sandbox.status);
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="note">
+This needs an SDK newer than 0.8.2. An older SDK gets the 421 answer as an error. Keep one client for your app's whole life: a new client has to learn each sandbox's cell again, which costs one extra call.
+</Aside>
+
+## Limits
+
+- **Lists and names are per cell.** `list` shows the sandboxes of the cell you ask. A sandbox name is unique only within its cell.
+- **Other SDKs do not follow the answer.** The Daytona, E2B and Runloop SDKs do not know the 421 answer. Point them at the cell that holds the sandbox.
+- **No switch from `https` to `http`.** A client that uses an `https` address never follows an `http` cell address, so your token is never sent in clear text. Give every cell an `https` address.
+- **One extra call the first time.** The first call for a sandbox in another cell takes two requests. Later calls take one.
+
+## Watch it
+
+Each cell counts the 421 answers it sends in the metric `aerolvm_cell_redirects_total`. A count that keeps growing means some apps call the wrong cell over and over. The usual causes are an SDK older than this feature, or an app that makes a new client for every call.

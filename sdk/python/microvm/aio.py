@@ -36,6 +36,7 @@ from .client import (
     SessionAttachHandle,
     Tokens,
     _call_deadline,
+    _cell_header,
     _deadline_error,
     _error_code,
     _error_from_answer,
@@ -788,9 +789,9 @@ class AsyncMicroVM(_MicroVMCore):
         reader: Any = None,
     ) -> Tuple[Any, Any]:
         """MicroVM._request_headers over httpx, with the same retry rules:
-        the same statuses per tier, done_code, Retry-After pacing, send_once
-        and deadline handling. tests/test_async.py runs one scenario table
-        against both clients to keep them equal."""
+        the same statuses per tier, done_code, Retry-After pacing, send_once,
+        the cell redirect and deadline handling. tests/test_async.py runs one
+        scenario table against both clients to keep them equal."""
         streamed = body is not None and not isinstance(body, (bytes, bytearray))
         max_retries = 0 if (send_once or streamed) else self._retry_config["maxRetries"]
         retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
@@ -799,8 +800,12 @@ class AsyncMicroVM(_MicroVMCore):
             headers[key] = value
         last_exc: Optional[BaseException] = None
         may_have_run = False  # done_code: see MicroVM._request
+        base, path, sandbox_id = self._cell_route(url)
+        url = base + path
+        followed = False
 
-        for attempt in range(max_retries + 1):
+        attempt = 0
+        while attempt <= max_retries:
             retry_after: Optional[str] = None
             left = _time_left()
             if left is not None and left <= 0:
@@ -834,8 +839,19 @@ class AsyncMicroVM(_MicroVMCore):
                         result = await asyncio.to_thread(reader, _SyncBody(loop, response), response.headers)
                         return result, response.headers
                     payload = await response.aread()
+                    cell = _cell_header(response.status_code, response.headers)
+                    if cell:
+                        # As MicroVM._request_headers: once to the cell named,
+                        # never a second hop, never a streamed body again.
+                        moved = None if followed else self._learn_cell(sandbox_id, cell)
+                        if moved is not None and path and not streamed:
+                            base, url, followed = moved, moved + path, True
+                            continue
+                        raise _error_from_answer(response.status_code, response.reason_phrase, response.headers.get("Retry-After"), payload)
                     if done_code is not None and may_have_run and _error_code(payload) == done_code:
                         return b"", {}
+                    if response.status_code == 404:
+                        self._cell_not_found(sandbox_id, base, payload)
                     if response.status_code in _REPLY_LOST_STATUSES:
                         may_have_run = True
                     if response.status_code in retry_statuses and attempt < max_retries:
@@ -868,6 +884,7 @@ class AsyncMicroVM(_MicroVMCore):
             if left is not None and delay >= left:
                 raise _deadline_error() from last_exc
             await asyncio.sleep(delay)
+            attempt += 1
 
         assert last_exc is not None
         if isinstance(last_exc, httpx.TimeoutException):

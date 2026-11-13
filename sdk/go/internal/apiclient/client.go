@@ -66,6 +66,12 @@ type Client struct {
 	// restart can bring a newer agent.
 	featuresMu      sync.Mutex
 	toolboxFeatures map[string]map[string]struct{}
+
+	// base is baseURL parsed, nil when it does not parse. Cell routing
+	// (cells.go) needs it to split a built URL back into base and path.
+	base *url.URL
+	// cells remembers the cell a 421 sent each sandbox to (cells.go).
+	cells cellRoutes
 }
 
 type ClientOptions struct {
@@ -83,7 +89,9 @@ type ClientOptions struct {
 	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
 	// re-sent only when the connection never opened or on 429/503, because a
 	// re-sent exec runs the command again. A 429 or 503 retry waits as long
-	// as the server's Retry-After asks, up to MaxRetryAfterMs.
+	// as the server's Retry-After asks, up to MaxRetryAfterMs. A 421 that
+	// names another cell (HeaderCellEndpoint) is not retried here: the
+	// request, exec included, goes once to that cell instead.
 	Retry *RetryConfig
 }
 
@@ -134,6 +142,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 		apiVersion:    version,
 		versionPrefix: prefix,
 	}
+	client.base, _ = url.Parse(client.baseURL)
 	if config.Retry != nil {
 		client.retryConfig = *config.Retry
 	}
@@ -1375,7 +1384,7 @@ func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCo
 			return nil, err // Can't even build the request, don't retry.
 		}
 
-		response, err := c.httpClient.Do(req)
+		response, err := c.send(req)
 		if err == nil && mayHaveRun && doneCode != "" && response.StatusCode >= 400 && replyHasCode(response, doneCode) {
 			response.Body.Close()
 			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
@@ -1389,7 +1398,7 @@ func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCo
 		var retryAfter string
 		if err == nil {
 			// A response: re-send only a transient status with budget left.
-			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries {
+			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries || namesCell(response) {
 				return response, nil
 			}
 			retryAfter = retryAfterHint(response)

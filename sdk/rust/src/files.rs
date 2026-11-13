@@ -19,7 +19,7 @@ use reqwest::Method;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{Authorize, Client, Error, RetryPolicy, Sandbox};
+use crate::{Client, Error, RetryPolicy, Sandbox};
 
 /// The toolboxd feature (on `/version`) behind the file verbs' options: list
 /// depth and cap, the move and copy overwrite guard, mkdir without parents
@@ -456,10 +456,17 @@ impl Client {
             .and_then(|name| name.to_str())
             .unwrap_or("file")
             .to_string();
-        let form = Form::new()
-            .text("path", target_path.to_string())
-            .part("file", Part::reader(reader).file_name(file_name));
-        let response = self.inner.post(self.full_url(&route)).authorize(self).multipart(form).send()?;
+        let mut form = Some(
+            Form::new()
+                .text("path", target_path.to_string())
+                .part("file", Part::reader(reader).file_name(file_name)),
+        );
+        // The reader is drained by the first send, so a 421 naming another
+        // cell is not followed; the cell is remembered for the caller's retry.
+        let (response, _) = self.send_routed(&Method::POST, &route, false, |builder| match form.take() {
+            Some(form) => builder.multipart(form),
+            None => builder,
+        })?;
         self.handle_response(response).map(|_| ())
     }
 
@@ -511,15 +518,18 @@ impl Client {
         self.require_toolbox_features(id, &[FEATURE_EXTRACT])?;
         let archive = tar_folder(local_dir).map_err(|err| Error::Client(format!("pack {}: {}", local_dir.display(), err)))?;
         let route = self.toolbox_path(id, "/files/upload", &[("extract", "true")]);
-        let form = Form::new()
-            .text("path", remote_dir.to_string())
-            .part("file", Part::bytes(archive).file_name("upload.tar"));
-        let response = self
-            .inner
-            .post(self.full_url(&route))
-            .authorize(self)
-            .multipart(form)
-            .send()?;
+        let mut form = Some(
+            Form::new()
+                .text("path", remote_dir.to_string())
+                .part("file", Part::bytes(archive).file_name("upload.tar")),
+        );
+        // Sent once, so the archive is never copied. The /version check
+        // above normally finds the sandbox's cell first; a 421 naming
+        // another one is remembered for the caller's retry.
+        let (response, _) = self.send_routed(&Method::POST, &route, false, |builder| match form.take() {
+            Some(form) => builder.multipart(form),
+            None => builder,
+        })?;
         self.handle_response(response).map(|_| ())
     }
 
