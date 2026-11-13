@@ -38,9 +38,27 @@ type Backend interface {
 	Delete(ctx context.Context, owner, sandboxID string) error
 	// SetRunning starts (true) or stops (false) a sandbox.
 	SetRunning(ctx context.Context, owner, sandboxID string, running bool) error
-	// Specs summarizes the given sandboxes' specs; missing ones render
-	// without a spec.
-	Specs(ctx context.Context, ids []string) map[string]SpecSummary
+	// Specs summarizes the given sandboxes' specs, by sandbox ID; missing
+	// ones render without a spec.
+	Specs(ctx context.Context, refs []SpecRef) map[string]SpecSummary
+}
+
+// SpecRef names one lifetime of a sandbox. An Idempotency-Key create after
+// a delete (kubectl delete, then create again) makes the same ID again, so
+// a spec cached by ID alone would show the deleted sandbox's image and
+// labels; the incarnation tells the two apart.
+type SpecRef struct {
+	ID          string
+	Incarnation string
+}
+
+// specRefs names the items' sandboxes.
+func specRefs(items ...kubeview.Item) []SpecRef {
+	refs := make([]SpecRef, len(items))
+	for i, it := range items {
+		refs[i] = SpecRef{ID: it.Placement.SandboxID, Incarnation: it.Placement.IncarnationID}
+	}
+	return refs
 }
 
 // StatusError is an error with the Kubernetes status to answer it with. A
@@ -436,13 +454,9 @@ func (s *Server) owned(ns string) (map[string]string, error) {
 // render turns hub items into objects, with spec summaries from the
 // backend.
 func (s *Server) render(ctx context.Context, items []kubeview.Item, nsOf func(owner string) string) []Sandbox {
-	ids := make([]string, len(items))
-	for i, it := range items {
-		ids[i] = it.Placement.SandboxID
-	}
 	specs := map[string]SpecSummary{}
-	if len(ids) > 0 {
-		specs = s.Backend.Specs(ctx, ids)
+	if len(items) > 0 {
+		specs = s.Backend.Specs(ctx, specRefs(items...))
 	}
 	out := make([]Sandbox, 0, len(items))
 	for _, it := range items {

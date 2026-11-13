@@ -105,15 +105,15 @@ func (b *fakeBackend) SetRunning(_ context.Context, _ string, id string, running
 	return nil
 }
 
-func (b *fakeBackend) Specs(_ context.Context, ids []string) map[string]SpecSummary {
+func (b *fakeBackend) Specs(_ context.Context, refs []SpecRef) map[string]SpecSummary {
 	out := map[string]SpecSummary{}
 	if b.specless {
 		return out
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, id := range ids {
-		out[id] = SpecSummary{Image: "img-" + id, Tags: b.tags[id]}
+	for _, r := range refs {
+		out[r.ID] = SpecSummary{Image: "img-" + r.ID, Tags: b.tags[r.ID]}
 	}
 	return out
 }

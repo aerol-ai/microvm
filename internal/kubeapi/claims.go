@@ -211,11 +211,7 @@ func (s *Server) claims(ctx context.Context, owner, ns string) ([]map[string]any
 	var out []map[string]any
 	for i := 0; i < len(items); i += maxPageLimit {
 		chunk := items[i:min(i+maxPageLimit, len(items))]
-		ids := make([]string, len(chunk))
-		for j, it := range chunk {
-			ids[j] = it.Placement.SandboxID
-		}
-		specs := s.Backend.Specs(ctx, ids)
+		specs := s.Backend.Specs(ctx, specRefs(chunk...))
 		for _, it := range chunk {
 			sp, ok := specs[it.Placement.SandboxID]
 			if isClaim(sp, ok) {
@@ -267,7 +263,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		if err != nil {
 			return err
 		}
-		sp, ok := s.Backend.Specs(ctx, []string{it.Placement.SandboxID})[it.Placement.SandboxID]
+		sp, ok := s.Backend.Specs(ctx, specRefs(it))[it.Placement.SandboxID]
 		if !isClaim(sp, ok) {
 			return &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
 		}
@@ -372,7 +368,7 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 		if n == "" {
 			continue
 		}
-		sp, ok := s.Backend.Specs(ctx, []string{ev.Item.Placement.SandboxID})[ev.Item.Placement.SandboxID]
+		sp, ok := s.Backend.Specs(ctx, specRefs(ev.Item))[ev.Item.Placement.SandboxID]
 		if !isClaim(sp, ok) {
 			continue
 		}

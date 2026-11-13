@@ -40,8 +40,9 @@ type KubeBackend struct {
 }
 
 type cachedSpec struct {
-	summary kubeapi.SpecSummary
-	at      time.Time
+	summary     kubeapi.SpecSummary
+	incarnation string
+	at          time.Time
 }
 
 const (
@@ -165,17 +166,20 @@ func (b *KubeBackend) SetRunning(ctx context.Context, owner, id string, running 
 }
 
 // Specs summarizes the sandboxes from the servers, in batches, cached for a
-// minute. A failed read leaves those sandboxes without a spec.
-func (b *KubeBackend) Specs(ctx context.Context, ids []string) map[string]kubeapi.SpecSummary {
-	out := make(map[string]kubeapi.SpecSummary, len(ids))
+// minute per lifetime (an ID made again is read again). A failed read
+// leaves those sandboxes without a spec.
+func (b *KubeBackend) Specs(ctx context.Context, refs []kubeapi.SpecRef) map[string]kubeapi.SpecSummary {
+	out := make(map[string]kubeapi.SpecSummary, len(refs))
 	now := b.now()
 	var missing []string
+	incarnation := make(map[string]string, len(refs))
 	b.mu.Lock()
-	for _, id := range ids {
-		if c, ok := b.cache[id]; ok && now.Sub(c.at) < kubeSpecTTL {
-			out[id] = c.summary
+	for _, r := range refs {
+		if c, ok := b.cache[r.ID]; ok && c.incarnation == r.Incarnation && now.Sub(c.at) < kubeSpecTTL {
+			out[r.ID] = c.summary
 		} else {
-			missing = append(missing, id)
+			missing = append(missing, r.ID)
+			incarnation[r.ID] = r.Incarnation
 		}
 	}
 	b.mu.Unlock()
@@ -195,7 +199,7 @@ func (b *KubeBackend) Specs(ctx context.Context, ids []string) map[string]kubeap
 		}
 		for id, s := range got {
 			sum := kubeapi.SpecSummary{Image: s.Image, Runtime: s.Runtime, CPU: s.CPU, MemoryMB: s.MemoryMB, Command: s.Command, Tags: s.Tags}
-			b.cache[id] = cachedSpec{summary: sum, at: now}
+			b.cache[id] = cachedSpec{summary: sum, incarnation: incarnation[id], at: now}
 			out[id] = sum
 		}
 		b.mu.Unlock()
