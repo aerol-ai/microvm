@@ -354,3 +354,37 @@ func TestClaimWatchInitialEvents(t *testing.T) {
 	}
 	t.Fatalf("no end of the initial list; saw %v", seen)
 }
+
+// A claim list reads the spec of a claim, and of a row an older build left
+// unmarked, never of a sandbox the hot row marks as no claim (C17).
+func TestClaimListSkipsRowsMarkedNoClaim(t *testing.T) {
+	mark := func(id, name string, m cluster.KubeClaimMark) cluster.Placement {
+		row := p(id, name, "team:a", 3)
+		row.KubeClaim = m
+		return row
+	}
+	r := newRig(t,
+		mark("sb-plain", "plain", cluster.KubeClaimNo),
+		mark("sb-claim", "claimed", cluster.KubeClaimYes),
+		mark("sb-old-claim", "old-claim", cluster.KubeClaimUnknown),
+		mark("sb-old-plain", "old-plain", cluster.KubeClaimUnknown),
+	)
+	claimTags := map[string]string{TagClaim: "true", TagWarmPool: "pool"}
+	r.be.tags = map[string]map[string]string{"sb-claim": claimTags, "sb-old-claim": claimTags, "sb-plain": claimTags}
+	_, out := r.call(t, http.MethodGet, ext+"/namespaces/a/sandboxclaims", "")
+	var got []string
+	for _, it := range out["items"].([]any) {
+		got = append(got, it.(map[string]any)["metadata"].(map[string]any)["name"].(string))
+	}
+	if strings.Join(got, ",") != "claimed,old-claim" {
+		t.Fatalf("claims = %v", got)
+	}
+	for _, id := range r.be.specIDs {
+		if id == "sb-plain" {
+			t.Fatal("read the spec of a row marked no claim")
+		}
+	}
+	if len(r.be.specIDs) != 3 {
+		t.Fatalf("spec reads = %v, want the claim and the two unmarked rows", r.be.specIDs)
+	}
+}

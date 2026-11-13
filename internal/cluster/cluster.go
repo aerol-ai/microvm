@@ -471,6 +471,12 @@ type Placement struct {
 	// sandbox without profiles.
 	EgressProfiles        []string `json:"egress_profiles,omitempty"`
 	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
+	// KubeClaim says whether the sandbox was made by an agent-sandbox
+	// claim (its spec's KubeClaimTag), so a claim list skips every other
+	// sandbox without reading its spec (C17). Derived from the spec on the
+	// hot row, as FailoverRecreate is. Zero is "not known": a row an older
+	// build wrote or rewrote, which a reader checks against the spec.
+	KubeClaim KubeClaimMark `json:"kube_claim,omitempty"`
 	// QuotaCPU / QuotaMemoryMB mirror the size a team's sandbox asked for
 	// (Spec.CPU / Spec.MemoryMB with server defaults) on the HOT row, so the
 	// FSM's team-usage index is rebuilt on Restore without hydrating specs

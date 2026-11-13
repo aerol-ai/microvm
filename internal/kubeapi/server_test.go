@@ -60,6 +60,8 @@ type fakeBackend struct {
 	err      error
 	noFeed   bool
 	specless bool
+	// specIDs are the sandboxes whose spec was asked for.
+	specIDs []string
 }
 
 func (b *fakeBackend) Create(_ context.Context, owner string, req models.CreateSandboxRequest, key string) (string, error) {
@@ -113,6 +115,7 @@ func (b *fakeBackend) Specs(_ context.Context, refs []SpecRef) map[string]SpecSu
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, r := range refs {
+		b.specIDs = append(b.specIDs, r.ID)
 		out[r.ID] = SpecSummary{Image: "img-" + r.ID, Tags: b.tags[r.ID]}
 	}
 	return out

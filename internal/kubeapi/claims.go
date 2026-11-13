@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/kubeview"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -29,7 +30,7 @@ const (
 	SandboxClaimsResource = "sandboxclaims"
 	SandboxClaimKind      = "SandboxClaim"
 	// TagClaim and TagWarmPool mark a sandbox made by a claim.
-	TagClaim    = "agents.x-k8s.io/claim"
+	TagClaim    = cluster.KubeClaimTag
 	TagWarmPool = "agents.x-k8s.io/warm-pool"
 )
 
@@ -247,9 +248,17 @@ func (s *Server) claims(ctx context.Context, owner, ns string, lq listQuery) ([]
 	if err != nil {
 		return nil, 0, hubError(err)
 	}
+	// Rows marked not a claim are skipped without a spec read; only
+	// claims, and rows an older build left unmarked, need one.
+	maybe := make([]kubeview.Item, 0, len(items))
+	for _, it := range items {
+		if it.Placement.KubeClaim != cluster.KubeClaimNo {
+			maybe = append(maybe, it)
+		}
+	}
 	var out []map[string]any
-	for i := 0; i < len(items); i += maxPageLimit {
-		chunk := items[i:min(i+maxPageLimit, len(items))]
+	for i := 0; i < len(maybe); i += maxPageLimit {
+		chunk := maybe[i:min(i+maxPageLimit, len(maybe))]
 		specs := s.Backend.Specs(ctx, specRefs(chunk...))
 		for _, it := range chunk {
 			sp, ok := specs[it.Placement.SandboxID]
@@ -388,6 +397,9 @@ func (s *Server) watchClaims(w http.ResponseWriter, r *http.Request, ns string, 
 			n, _ = s.Owners.Namespace(ev.Item.Placement.OwnerRef)
 		}
 		if n == "" {
+			return nil
+		}
+		if ev.Item.Placement.KubeClaim == cluster.KubeClaimNo {
 			return nil
 		}
 		sp, ok := s.Backend.Specs(ctx, specRefs(ev.Item))[ev.Item.Placement.SandboxID]

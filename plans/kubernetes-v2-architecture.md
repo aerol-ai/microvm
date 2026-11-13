@@ -1411,8 +1411,12 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   as written.
 - **Not built yet:** warm pools pre-starting sandboxes (a claim
   cold-starts; the plan is to sum `replicas` per image into the FSM's
-  warm-pool entries, next to the operator's own); and carrying the claim mark in the
-  placement row (a claim list reads every spec summary in the namespace).
+  warm-pool entries, next to the operator's own).
+- **The claim mark rides the placement row** (a follow-up):
+  `Placement.KubeClaim`, derived from the spec's claim tag wherever the hot
+  row is, so a claim list and watch read the spec of claims only, not of
+  every sandbox in the namespace. Zero means a row an older build wrote:
+  its spec is read, as before, so no version gate is needed.
 - **A second `kubectl apply`** (a follow-up): the patch is merged onto the
   shown object and checked as a create. A change to what is shown (image,
   command, runtime class, CPU, memory, labels; a claim's warm pool) is
