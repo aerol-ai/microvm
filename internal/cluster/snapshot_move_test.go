@@ -1,8 +1,11 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -212,5 +215,58 @@ func TestRunSnapshotMoveAction(t *testing.T) {
 	h.importErr = errors.New("no room")
 	if out, err := RunMoveAction(ctx, h, MoveAction{Action: "import", IDs: []string{"sb"}, Source: "a"}); err != nil || out.Error != "no room" {
 		t.Fatalf("a failed import = %+v %v", out, err)
+	}
+}
+
+// bundlePeer is a worker's view for FetchMoveBundle: the source is srv,
+// reached with client.
+type bundlePeer struct {
+	*Noop
+	srv    *httptest.Server
+	client *http.Client
+}
+
+func (b *bundlePeer) LookupMember(id string) (Member, bool) {
+	return Member{NodeID: id, Alive: true, InternalURL: b.srv.URL}, true
+}
+
+func (b *bundlePeer) PeerDialMember(Member) (*http.Client, string, error) {
+	return b.client, b.srv.URL, nil
+}
+
+func (b *bundlePeer) SelfNodeID() string { return "worker-b" }
+
+// A bundle streams for as long as the move allows, past the internal
+// client's per-call timeout (F35); the move's own deadline still ends it.
+func TestFetchMoveBundleOutlastsTheClientTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != MoveBundlePath("sb-1") || r.Header.Get(PeerNodeIDHeader) != "worker-b" {
+			http.Error(w, "wrong request", http.StatusBadRequest)
+			return
+		}
+		for i := 0; i < 4; i++ {
+			_, _ = w.Write(bytes.Repeat([]byte{byte('a' + i)}, 1024))
+			w.(http.Flusher).Flush()
+			time.Sleep(60 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	client := srv.Client()
+	client.Timeout = 100 * time.Millisecond
+	peer := &bundlePeer{Noop: NewNoop("worker-b", "", ""), srv: srv, client: client}
+	var got bytes.Buffer
+	if err := FetchMoveBundle(context.Background(), peer, "worker-a", "sb-1", &got); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if got.Len() != 4096 {
+		t.Fatalf("got %d bytes, want 4096", got.Len())
+	}
+	if client.Timeout != 100*time.Millisecond {
+		t.Fatal("the shared client was changed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Millisecond)
+	defer cancel()
+	if err := FetchMoveBundle(ctx, peer, "worker-a", "sb-1", &bytes.Buffer{}); err == nil {
+		t.Fatal("the move's deadline did not end the pull")
 	}
 }

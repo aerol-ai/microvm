@@ -228,7 +228,13 @@ func FetchMoveBundle(ctx context.Context, c Client, source, sandboxID string, w 
 	if pat := wasmMigratePAT(c); pat != "" {
 		req.Header.Set("Authorization", "Bearer "+pat)
 	}
-	resp, err := client.Do(req)
+	// A VM's memory and disks take as long as ctx allows (importMoveTimeout,
+	// or a gVisor move's budget), not the internal client's per-call limit,
+	// which is for control-plane calls: with it, every Firecracker move's
+	// pull was cut off mid-stream (F35, p5-move-5).
+	streaming := *client
+	streaming.Timeout = 0
+	resp, err := streaming.Do(req)
 	if err != nil {
 		return err
 	}

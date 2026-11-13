@@ -104,6 +104,8 @@ for m in d.get("members", d):
     sleep 5
   done
   say "move took $(( $(date +%s) - t0 ))s"
+  # What a move carries: each snapshot file's allocated and full size.
+  $kw exec "$owner" -c agent -- sh -c "ls -ls /var/lib/sandboxd/firecracker/templates/_sandboxes/$id/ 2>&1" 2>&1 | tail -6 | sed 's/^/FCK   source files: /'
   owner2=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
   say "owner after: $owner2"
   say "sandbox after: $(api http://127.0.0.1:$port/v1/sandboxes/$id | head -c 200)"
