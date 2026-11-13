@@ -2432,6 +2432,19 @@ not already carry):
   fifth (`p6-kubeapi-5`) passed every step: create, wait, stop and start
   under a watch, a viewer refused, another namespace empty, delete and
   create again (a new uid), and a template, a pool and a claim.
+- **C23's external-CA mode built** (#1252, merged with the stack #1253 to
+  #1258): the bank's issuer signs every node's certificate through
+  cert-manager, and the cluster holds no CA key (§15.2.1). Live on kind
+  (`AEROL_FCKIND_PROOF=externalca`, run `c23-extca-3`), every check passed.
+  Nine nodes joined by their certificates, with no join token and no CA
+  key. A create worked through a gateway. A renewal kept the key. The join
+  port answered a node's own certificate as a replay, and refused a second
+  key for it, a certificate with no role and one from another CA. The docs'
+  approver-policy example approved node renewals, left names asked for
+  from another namespace unsigned, and denied other names. Run 1 found a
+  shell bug in the proof, and run 2 a wrong runtime name in it. A live-only
+  RBAC gap (the operator's cached read of a Certificate needs list and
+  watch) was caught before the first run.
 - Next: the C17 follow-ups in §16.1's "not built yet".
 
 ## 19. Tests, drills and benchmarks
