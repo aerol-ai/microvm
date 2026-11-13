@@ -18,7 +18,9 @@ cd /root
 # decommissioned moves to another worker with its memory: the same guest
 # boot ID answers there.
 proof_move() {
-  local ns=aerolvm-system kc="kubectl --context kind-aerolvm-cluster -n aerolvm-system"
+  local kc="kubectl --context kind-aerolvm-cluster -n aerolvm-system"
+  # Worker pods run in their own namespace (k8s-dev's cluster values).
+  local kw="kubectl --context kind-aerolvm-cluster -n aerolvm-workers"
   local tok port=21298 pf=""
   tok="$($kc get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
   for _ in $(seq 1 30); do
@@ -31,20 +33,26 @@ proof_move() {
   members() { api http://127.0.0.1:$port/v1/cluster/members | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("members", d); print(" ".join(x["node_id"]+"/"+x.get("role","")+("/alive" if x.get("alive") else "") for x in m))'; }
   # The AerolCluster is Ready before every worker has joined gossip: a
   # move needs two.
-  local m="" n=0
-  for _ in $(seq 1 60); do
+  local m="" n=0 i
+  for i in $(seq 1 120); do
     m=$(members 2>/dev/null)
     n=$(tr ' ' '\n' <<<"$m" | grep -c '/worker/alive')
     [ "$n" -ge 2 ] && break
+    [ $((i % 12)) -eq 0 ] && say "waiting for workers ($((i * 5))s): $($kc get aerolnodes --no-headers 2>/dev/null | awk '$2 == "worker" {printf "%s/%s/%s ", $1, $4, $NF}')"
     sleep 5
   done
   say "members: $m"
   if [ "$n" -lt 2 ]; then
-    $kc get aerolnodes,pods -o wide 2>&1 | sed 's/^/FCK   /'
-    for w in $($kc get pods -o name | grep worker | head -2); do
-      $kc logs $w -c preflight 2>&1 | tail -5 | sed "s|^|FCK   ${w#pod/} preflight: |"
-      $kc logs $w -c agent 2>&1 | tail -10 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent: |"
+    $kc get aerolnodes -o wide 2>&1 | sed 's/^/FCK   /'
+    $kw get pods -o wide 2>&1 | sed 's/^/FCK   /'
+    $kw get events --sort-by=.lastTimestamp 2>&1 | tail -15 | cut -c1-250 | sed 's/^/FCK   event: /'
+    for w in $($kw get pods -o name | head -2); do
+      $kw describe $w 2>&1 | grep -A12 -E '^\s*(State|Last State):' | head -30 | sed "s|^|FCK   ${w#pod/} describe: |"
+      $kw logs $w -c preflight 2>&1 | tail -8 | sed "s|^|FCK   ${w#pod/} preflight: |"
+      $kw logs $w -c agent 2>&1 | tail -15 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent: |"
+      $kw logs $w -c agent --previous 2>&1 | tail -10 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent (previous): |"
     done
+    $kc logs deploy/aerolvm-operator 2>&1 | grep -iE 'worker|general|error|fail' | tail -15 | cut -c1-300 | sed 's/^/FCK   operator: /'
     return
   fi
   local out id owner owner2 i
@@ -73,8 +81,8 @@ proof_move() {
   say "owner after: $owner2"
   say "sandbox after: $(api http://127.0.0.1:$port/v1/sandboxes/$id | head -c 200)"
   say "after: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
-  for w in $($kc get pods -o name | grep worker); do
-    $kc logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
+  for w in $($kw get pods -o name); do
+    $kw logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
   done
 }
 
