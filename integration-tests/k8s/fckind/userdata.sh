@@ -14,11 +14,57 @@ finish() { say "DONE"; sync; sleep 180; poweroff; }
 export HOME=/root
 cd /root
 
+# The snapshot move (plan §10.5): a Firecracker VM on a worker that is
+# decommissioned moves to another worker with its memory: the same guest
+# boot ID answers there.
+proof_move() {
+  local ns=aerolvm-system kc="kubectl --context kind-aerolvm-cluster -n aerolvm-system"
+  local tok port=21298 pf=""
+  tok="$($kc get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+  for _ in $(seq 1 30); do
+    [ -n "$pf" ] && kill $pf 2>/dev/null
+    $kc port-forward svc/aerolvm-gateway $port:21212 >/dev/null 2>&1 & pf=$!
+    sleep 2
+    curl -fsS -m 3 -o /dev/null http://127.0.0.1:$port/health 2>/dev/null && break
+  done
+  api() { curl -sS -m 900 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
+  say "members: $(api http://127.0.0.1:$port/v1/cluster/members | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("members", d); print(" ".join(x["node_id"]+"/"+x.get("role","")+("/alive" if x.get("alive") else "") for x in m))')"
+  local out id owner owner2 i
+  out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
+  id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
+  say "create: $(head -c 240 <<<"$out")"
+  [ -n "$id" ] || return
+  ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute \
+    -d "$(python3 -c 'import json, sys; print(json.dumps({"command": sys.argv[1]}))' "$1")" | head -c 300; }
+  # A process that counts on, to show it kept running across the move.
+  ex 'nohup sh -c "i=0; while true; do i=\$((i+1)); echo \$i > /tmp/counter; sleep 1; done" >/dev/null 2>&1 &' >/dev/null
+  sleep 3
+  say "before: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
+  owner=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
+  say "owner before: $owner"
+  say "cordon: $(api -X POST http://127.0.0.1:$port/v1/cluster/nodes/$owner/cordon | head -c 200)"
+  local t0=$(date +%s)
+  for i in $(seq 1 20); do
+    out=$(api -X POST http://127.0.0.1:$port/v1/cluster/nodes/$owner/evacuate -d '{"max":8}')
+    say "evacuate pass $i: $(head -c 300 <<<"$out")"
+    grep -q '"moved":\["'"$id"'"\]\|"done":true' <<<"$out" && break
+    sleep 5
+  done
+  say "move took $(( $(date +%s) - t0 ))s"
+  owner2=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
+  say "owner after: $owner2"
+  say "sandbox after: $(api http://127.0.0.1:$port/v1/sandboxes/$id | head -c 200)"
+  say "after: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
+  for w in $($kc get pods -o name | grep worker); do
+    $kc logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
+  done
+}
+
 [ -e /dev/kvm ] || modprobe kvm_intel 2>/dev/null
 if [ -e /dev/kvm ]; then say "machine: /dev/kvm present, $(grep -c -w vmx /proc/cpuinfo) cpus with vmx, kernel $(uname -r)"; else say "machine: /dev/kvm ABSENT"; finish; fi
 
 say "installing docker and the tools"
-dnf -y -q install docker git tar gzip iptables >/dev/null 2>&1 || say "dnf install failed"
+dnf -y -q install docker git tar gzip iptables perl-Digest-SHA >/dev/null 2>&1 || say "dnf install failed"
 systemctl start docker || { say "docker did not start"; finish; }
 pinned() { # <file> <url> <sha256>
   curl -fsSL --retry 5 -o "$1" "$2" && echo "$3  $1" | sha256sum -c --quiet - || { say "download failed or checksum wrong: $2"; finish; }
@@ -37,11 +83,27 @@ export PATH=/usr/local/go/bin:/usr/local/bin:$PATH GOTOOLCHAIN=auto
 say "tools ready: $(go version | cut -d' ' -f3), helm $(helm version --short), kind $(kind version | cut -d' ' -f2), $(docker buildx version | cut -d' ' -f2)"
 mkdir -p src && curl -fsSL --retry 5 '@SRC_URL@' | tar -xz -C src || { say "source download failed"; finish; }
 cd src
+proof='@PROOF@'
+if [ "$proof" = move ]; then
+  # Cluster mode, every worker a Firecracker worker: this machine is one
+  # KVM pool. The chart's defaults change in this copy only.
+  python3 - <<'PY'
+import re
+p = "charts/aerolvm/values.yaml"
+s = open(p).read()
+s = s.replace("  firecracker:\n    enabled: false", "  firecracker:\n    enabled: true", 1)
+s = re.sub(r'(?m)^  diskFloorRatio: "[0-9.]+"', '  diskFloorRatio: "0"', s, count=1)
+open(p, "w").write(s)
+PY
+  grep -A1 '^  firecracker:' charts/aerolvm/values.yaml | sed 's/^/FCK chart: /'
+  export AEROL_K8S_MODE=cluster
+fi
 git init -q && git add -A >/dev/null 2>&1 && git -c user.email=fck@localhost -c user.name=fck commit -qm src >/dev/null 2>&1
-say "building the images and starting kind"
+say "building the images and starting kind ($proof)"
 t0=$(date +%s)
 if ! scripts/k8s-dev.sh > /root/k8s-dev.log 2>&1; then say "k8s-dev failed:"; tail -20 /root/k8s-dev.log | sed 's/^/FCK   /'; finish; fi
 say "built and installed in $(( $(date +%s) - t0 ))s"
+[ "$proof" = move ] && { proof_move; finish; }
 
 k() { kubectl --context kind-aerolvm -n aerolvm "$@"; }
 pod=aerolvm-0
