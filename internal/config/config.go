@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -1259,11 +1260,24 @@ type Config struct {
 	NodeRole string
 	NodeID   string
 	// CellID is the cell this node's sandboxes belong to, 1 to 255
-	// (SB_CELL_ID, default 1). New sandbox IDs carry it in their first two
-	// hex digits, so once there is more than one cell a gateway can route
-	// an ID without a lookup (plans/kubernetes-v2-architecture.md §12.3,
-	// C12). Every node of one cluster is one cell and must share it.
+	// (SB_CELL_ID, default 1). With CellIDKey set, new sandbox IDs carry it
+	// in their first byte, masked so that only the cells can read it, and a
+	// cell routes an ID without a lookup (plans/kubernetes-v2-architecture.md
+	// §12.3-12.4, C12, C16). Every node of one cluster is one cell and must
+	// share it.
 	CellID int
+	// CellIDKey masks the cell in new sandbox IDs (SB_CELL_ID_KEY, base64,
+	// at least 32 bytes). Every cell of one federation shares it, and it
+	// never rotates: an ID minted under one key is routed by it for life.
+	// Unset, a single cell mints IDs with a random first byte: a fixed
+	// first byte would itself show the cell scheme.
+	CellIDKey []byte
+	// CellEndpoints is every other cell's public API address, by cell
+	// number (SB_CELL_ENDPOINTS, "2=https://cell2.example.com,3=..."). A
+	// request for a sandbox of one of them is answered 421 with that
+	// address, which the SDKs retry at (C16): cells never forward to each
+	// other. Needs CellIDKey.
+	CellEndpoints map[int]string
 	// ReadyLeaderGrace is how long a cluster node may go without proof of a
 	// working control plane before /ready answers 503 (SB_READY_LEADER_GRACE,
 	// default 10 s: above a normal raft election, so one does not take a
@@ -3325,6 +3339,9 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadCellID(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadCellRouting(); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.loadReadyLeaderGrace(); err != nil {
 		return Config{}, err
 	}
@@ -3862,6 +3879,40 @@ func (c *Config) loadCellID() error {
 		return fmt.Errorf("SB_CELL_ID must be a cell number from 1 to 255, got %q", v)
 	}
 	c.CellID = n
+	return nil
+}
+
+// loadCellRouting reads SB_CELL_ID_KEY and SB_CELL_ENDPOINTS strictly: a
+// wrong key or address would route a federation's sandboxes to the wrong
+// cell, and an address without a key could not be routed to at all.
+func (c *Config) loadCellRouting() error {
+	if v := strings.TrimSpace(os.Getenv("SB_CELL_ID_KEY")); v != "" {
+		key, err := base64.StdEncoding.DecodeString(v)
+		if err != nil || len(key) < 32 {
+			return errors.New("SB_CELL_ID_KEY must be base64 of at least 32 bytes (openssl rand -base64 32)")
+		}
+		c.CellIDKey = key
+	}
+	v := strings.TrimSpace(os.Getenv("SB_CELL_ENDPOINTS"))
+	if v == "" {
+		return nil
+	}
+	if len(c.CellIDKey) == 0 {
+		return errors.New("SB_CELL_ENDPOINTS needs SB_CELL_ID_KEY: without it no ID says which cell it belongs to")
+	}
+	c.CellEndpoints = map[int]string{}
+	for _, part := range strings.Split(v, ",") {
+		k, addr, ok := strings.Cut(strings.TrimSpace(part), "=")
+		n, err := strconv.Atoi(strings.TrimSpace(k))
+		u, uerr := url.Parse(strings.TrimSpace(addr))
+		if !ok || err != nil || n < 1 || n > 255 || uerr != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("SB_CELL_ENDPOINTS: %q is not <cell 1-255>=<http(s) address>", part)
+		}
+		if n == c.CellID {
+			continue // this cell's own address is not a redirect
+		}
+		c.CellEndpoints[n] = strings.TrimRight(u.String(), "/")
+	}
 	return nil
 }
 

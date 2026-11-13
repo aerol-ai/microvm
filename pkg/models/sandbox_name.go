@@ -26,6 +26,12 @@ var generatedSandboxIDPattern = regexp.MustCompile(`^sb-[0-9a-f]{16}$`)
 // apihttp.WriteStoreAwareError.
 var ErrInvalidSandboxName = errors.New("invalid sandbox name")
 
+// CellEndpointHeader carries, on a 421 answer, the address of the cell a
+// sandbox lives in when a request reached another cell
+// (plans/kubernetes-v2-architecture.md §12.4, C16). The SDKs send the
+// request again to that address, with the same token.
+const CellEndpointHeader = "X-Aerolvm-Cell-Endpoint"
+
 // IsGeneratedSandboxID reports whether ref has the shape of a daemon-generated
 // sandbox ID. Agent clients use it to decide between an ID lookup and a name
 // lookup with one request.

@@ -51,6 +51,7 @@ const clusterPages = [
   ].map(([id, label]) => link(`/cluster/${id}`, label)),
   ...[
     ['/cluster-ingress', 'Ingress nodes'],
+    ['/cells', 'Many cells'],
     ['/cluster-secrets', 'Secrets providers'],
     ['/dashboard', 'Dashboard'],
     ['/operational-runbooks', 'Runbooks'],

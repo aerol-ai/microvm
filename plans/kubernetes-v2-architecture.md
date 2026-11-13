@@ -1093,6 +1093,16 @@ IDs made before that are found by asking each cell once and caching the
 answer. Facade IDs (`fc-`, `wasm-`, `iso-` and derived IDs) get the same
 rule or a small lookup; that detail is for engineering review.
 
+**Changed in Phase 6 (C16, the user's decision on 2026-11-13: "should
+obscure cell-id so not to reveal internal implementation").** The cell is
+no longer in plain hex. A federation shares one key (`SB_CELL_ID_KEY`); the
+first byte is the cell XOR one byte of HMAC-SHA256(key, a label and the
+other 7 bytes). Every cell reads it without a lookup; no one else can.
+Without a key the first byte is random. Still 56 random bits, still the
+same shape. IDs made before the key, and derived IDs, read as a random
+cell: the cell that holds one still serves it, and a wrong guess ends in
+another cell's 404, never a loop. No cell asks the others.
+
 ### 12.4 Many cells, one front door
 
 ```mermaid
@@ -1115,6 +1125,14 @@ flowchart TB
 
 - **Requests for an existing sandbox:** any gateway reads the cell number from
   the ID and forwards to that cell. No lookup.
+  **Changed in Phase 6 (C16, the user's decision on 2026-11-13: "SDKs go to
+  the right cell").** Gateways do not forward between cells, so no cell
+  trusts another's nodes. A gateway answers 421 with the right cell's
+  address (`X-Aerolvm-Cell-Endpoint`, from `SB_CELL_ENDPOINTS`) for a
+  sandbox its own cell does not know; the five SDKs resend the request
+  there with the same token and remember the address per sandbox. So every
+  cell must accept the same token: a shared admin token, or the same
+  identity provider and roles.
 - **New sandboxes:** the gateway places it in its own cell if there is room.
   If not, it picks the cell with the most room (two random cells, the freer
   one wins, as placement already does inside a cell).
@@ -2260,8 +2278,27 @@ not already carry):
   - The proof's counter must leave its exec's session (`setsid`): in
     gVisor a background loop left in it ended with the exec (`p5-gmove-3`
     moved and restored the sandbox, but its counter had stopped before).
-- Next: Phase 6 (C16 cells, C17 agent-sandbox API, the marketplace
-  listings), each with a design decision to make first.
+- **Phase 6 decisions** (the user, 2026-11-13): C16, the SDKs go to the
+  right cell and an ID does not show its cell; C17, templates and warm
+  pools as Kubernetes CRDs, and a namespace shows all of its owner's
+  sandboxes; marketplaces, prepare the files only.
+- **Marketplace packages** (#1228, with #1227's chart `appVersion` fix): the
+  EKS add-on and the Azure Kubernetes app, `packaging/marketplace/`.
+  `cpa verify` passed on the Azure package. Nothing is listed: the seller
+  accounts are the user's. AKS is untested (Phase 4 skipped).
+- **C16 built** (#1229 server, #1230 operator and chart, #1231 SDKs, and
+  the docs): the masked cell byte (§12.3), Idempotency-Key IDs masked the
+  same way (the SDKs send a key with every create), the 421 answer with the cell's
+  address (§12.4), `AerolCluster.spec.federation` and `cluster.federation`,
+  the five SDKs following the answer once and remembering it, and the
+  [Many cells](/cells/) docs page. Lists, names and quotas stay per cell
+  (§21). New sandboxes are made in the cell the create reaches; placing
+  them in another cell when one is full is not built. Proved on two
+  single-node cells in Docker with the Go SDK, no cloud cost: each cell's
+  client got and destroyed the other cell's sandbox, the second get went
+  straight to the right cell. Its first run found that keyed creates' IDs
+  had no cell (fixed in #1229).
+- Next: C17 (the agent-sandbox API).
 
 ## 19. Tests, drills and benchmarks
 

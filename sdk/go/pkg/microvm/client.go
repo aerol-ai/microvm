@@ -47,6 +47,12 @@ var (
 	ErrFileTooLarge = apiclient.ErrFileTooLarge
 )
 
+// HeaderCellEndpoint is the response header a 421 carries when a sandbox
+// lives in another cell of a federation: that cell's base URL. The client
+// sends the request there once, with the same token, and sends later calls
+// for that sandbox straight there.
+const HeaderCellEndpoint = apiclient.HeaderCellEndpoint
+
 const defaultAPIURL = "http://127.0.0.1:21212"
 const authRequiredErrorMessage = "PAT token is required. Set PATToken, SB_PAT_TOKEN or SB_API_TOKEN."
 

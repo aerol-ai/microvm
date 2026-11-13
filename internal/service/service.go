@@ -8546,36 +8546,17 @@ func generateToolboxToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// NewSandboxID mints a fresh sandbox ID in this node's cell: "sb-", two hex
-// digits of the cell number, then 14 random hex digits
-// (plans/kubernetes-v2-architecture.md §12.3, C12). The shape, "sb-" plus 16
-// lowercase hex, is unchanged: clients tell an ID from a name by it
-// (models.IsGeneratedSandboxID), and it is a valid container name. 56
-// random bits leave a clash at a million live sandboxes about 1 in 140,000,
-// and the create path refuses one anyway.
+// NewSandboxID mints a fresh sandbox ID in this node's cell
+// (sandbox_id_cell.go). The shape, "sb-" plus 16 lowercase hex, is
+// unchanged: clients tell an ID from a name by it
+// (models.IsGeneratedSandboxID), and it is a valid container name.
 //
 // The cluster handler's reservation-first create mints through this too, so
 // the router's ID and the local create's share one format. IDs derived from
-// a key (an idempotent create's, the facades') keep their hashed form for
-// now; like IDs made before cells, a router finds them by asking each cell.
+// a key (an idempotent create's, the facades') keep their hashed form; like
+// IDs made before cells, each is served where it lives.
 func (s *Service) NewSandboxID() (string, error) {
-	return newSandboxIDInCell(s.cfg.CellID)
-}
-
-// newSandboxIDInCell is NewSandboxID for a given cell. A zero cell (a
-// Config not built by config.Load, as in tests) is cell 1, the default.
-func newSandboxIDInCell(cell int) (string, error) {
-	if cell == 0 {
-		cell = 1
-	}
-	if cell < 1 || cell > 255 {
-		return "", fmt.Errorf("sandbox id: cell %d is outside 1 to 255", cell)
-	}
-	buf := make([]byte, 7)
-	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("sb-%02x%s", cell, hex.EncodeToString(buf)), nil
+	return newSandboxIDInCell(s.cfg.CellID, s.cfg.CellIDKey)
 }
 
 // imageStillReferenced reports whether any sandbox in the given slice still

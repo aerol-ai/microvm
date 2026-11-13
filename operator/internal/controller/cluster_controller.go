@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"fmt"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,6 +102,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.syncCreatePolicy(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.syncFederationKey(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
 	nodes, err := listNodes(ctx, r.Client, &c)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -165,6 +170,26 @@ func refuseSpec(c *v1.AerolCluster) string {
 		seen[p.Name] = true
 		if p.MaxWorkers > 0 && p.MinWorkers > p.MaxWorkers {
 			return "worker pool " + p.Name + ": minWorkers is above maxWorkers"
+		}
+	}
+	if f := c.Spec.Federation; f != nil {
+		// sandboxd refuses the same values at start; refusing them here
+		// says why on the AerolCluster instead of in crash-looping pods.
+		if f.IDKeySecret.Name == "" {
+			return "federation.idKeySecret.name is empty"
+		}
+		for k, addr := range f.Cells {
+			n, err := strconv.Atoi(k)
+			u, uerr := url.Parse(addr)
+			if err != nil || n < 1 || n > 255 {
+				return "federation.cells: " + k + " is not a cell number from 1 to 255"
+			}
+			if n == int(max(c.Spec.Cell, 1)) {
+				return "federation.cells: " + k + " is this cell"
+			}
+			if uerr != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+				return "federation.cells: " + k + " is not an http(s) address"
+			}
 		}
 	}
 	return ""
@@ -519,9 +544,6 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// syncEdgeSecret copies the sandbox-link certificate, its certificate and
-// key only, into the worker namespace (C25). A renewal reaches the copy on
-// the next pass; sandboxd reloads it from the file.
 // syncCreatePolicy keeps a copy of the create policy's ConfigMap in the
 // worker namespace, where worker pods mount it: a ConfigMap volume is
 // namespaced. Only the policy key is copied.
@@ -544,6 +566,9 @@ func (r *ClusterReconciler) syncCreatePolicy(ctx context.Context, c *v1.AerolClu
 	return err
 }
 
+// syncEdgeSecret copies the sandbox-link certificate, its certificate and
+// key only, into the worker namespace (C25). A renewal reaches the copy on
+// the next pass; sandboxd reloads it from the file.
 func (r *ClusterReconciler) syncEdgeSecret(ctx context.Context, c *v1.AerolCluster) error {
 	name := c.Spec.Edge.TLSSecret
 	if name == "" || r.WorkerNamespace == "" || r.WorkerNamespace == c.Namespace {
@@ -563,6 +588,28 @@ func (r *ClusterReconciler) syncEdgeSecret(ctx context.Context, c *v1.AerolClust
 			corev1.TLSCertKey:       src.Data[corev1.TLSCertKey],
 			corev1.TLSPrivateKeyKey: src.Data[corev1.TLSPrivateKeyKey],
 		}
+		return nil
+	})
+	return err
+}
+
+// syncFederationKey copies the federation's ID key, that key only, into the
+// worker namespace, where worker pods read it: a Secret reference is
+// namespaced. Until the Secret exists the pods that need it wait
+// (CreateContainerConfigError), so no node mints IDs without the key.
+func (r *ClusterReconciler) syncFederationKey(ctx context.Context, c *v1.AerolCluster) error {
+	f := c.Spec.Federation
+	if f == nil || f.IDKeySecret.Name == "" || r.WorkerNamespace == "" || r.WorkerNamespace == c.Namespace {
+		return nil
+	}
+	var src corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: f.IDKeySecret.Name}, &src); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	dst := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: f.IDKeySecret.Name, Namespace: r.WorkerNamespace}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Data = map[string][]byte{FederationKeyKey: src.Data[FederationKeyKey]}
 		return nil
 	})
 	return err

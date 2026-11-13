@@ -69,7 +69,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	// existing placement; on the single-node / local-image path it is the
 	// CreateOptions.SandboxID below, so CreateSandboxWithID replays the
 	// existing sandbox. Empty leaves both to mint a fresh id (the default).
-	preferredID := clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	preferredID := clustercreate.DeterministicSandboxID(h.deps.Service, service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
 	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: preferredID})
 	if !ok {
 		return

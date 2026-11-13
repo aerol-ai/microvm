@@ -120,7 +120,7 @@ func TestCreateSandbox_IdempotencyKeyLegacyRowReplays(t *testing.T) {
 		t.Fatalf("an unkeyed create stored digest %q", got)
 	}
 
-	id := clustercreate.DeterministicSandboxID("", "old-key")
+	id := clustercreate.DeterministicSandboxID(nil, "", "old-key")
 	if _, err := h.deps.Service.CreateSandboxWithID(t.Context(), models.CreateSandboxRequest{Image: "alpine:3.20"}, id); err != nil {
 		t.Fatalf("seed a row without a digest: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestClusterCreateWrap_ForwardedRetryWithAReusedKey(t *testing.T) {
 	rt := &apiRecordingRuntime{}
 	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
 	h, st := newClusterCreateHarness(t, rt, stub)
-	id := clustercreate.DeterministicSandboxID("", "job-77")
+	id := clustercreate.DeterministicSandboxID(nil, "", "job-77")
 	if _, err := h.deps.Service.CreateSandboxWithID(service.WithIdempotencyKey(t.Context(), "job-77"), models.CreateSandboxRequest{Image: "alpine:3.20", CreateRequestDigests: []string{"hmac:0:aaaa"}}, id); err != nil {
 		t.Fatalf("seed: %v", err)
 	}

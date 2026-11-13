@@ -130,6 +130,13 @@ type FetchLike = typeof fetch;
 export const TEAM_HEADER = "X-AerolVM-Team";
 
 /**
+ * The response header a 421 carries when the sandbox lives in another cell
+ * (a separate AerolVM install in the same federation): that cell's base URL.
+ * Keep in sync with models.CellEndpointHeader on the server.
+ */
+export const CELL_ENDPOINT_HEADER = "X-Aerolvm-Cell-Endpoint";
+
+/**
  * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
  * client speaks. The SDK and the server version independently — bumping the
  * SDK package does not move the wire version. Today only "v1" exists; future
@@ -674,6 +681,49 @@ const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 // 504 is a hop's, not the server's, so those use the normal backoff.
 const REFUSED_STATUS_CODES = new Set([429, 503]);
 
+// Bounds the sandbox-to-cell map, so a long-lived client that touches many
+// sandboxes in other cells cannot grow without end. A dropped entry costs
+// only one more 421 the next time.
+const MAX_REMEMBERED_CELLS = 10_000;
+
+/**
+ * A 421 that names a cell is the cell router's answer, which sending to the
+ * same place again cannot change. The retry loop hands it back at once and
+ * {@link APIClient.request} decides whether to follow it.
+ */
+function isCellAnswer(response: Response): boolean {
+  return response.status === 421 && (response.headers.get(CELL_ENDPOINT_HEADER) ?? "").trim() !== "";
+}
+
+// fetch reads a stream while it sends it, so only a body held whole in
+// memory can go out a second time.
+function isReplayableBody(body: BodyInit | null | undefined): boolean {
+  return (
+    body == null ||
+    typeof body === "string" ||
+    body instanceof ArrayBuffer ||
+    ArrayBuffer.isView(body) ||
+    body instanceof Blob ||
+    body instanceof FormData ||
+    body instanceof URLSearchParams
+  );
+}
+
+/** The sandbox ID a per-sandbox path names: the segment right after `prefix` (".../sandboxes/"). */
+function sandboxIDInPath(path: string, prefix: string): string | undefined {
+  if (!path.startsWith(prefix)) return undefined;
+  const rest = path.slice(prefix.length);
+  const end = rest.search(/[/?#]/);
+  const segment = end === -1 ? rest : rest.slice(0, end);
+  if (segment === "") return undefined;
+  // Some call sites escape the ID and some do not; decoding keys both alike.
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /**
  * The toolboxd feature (on /version) behind the file verbs' options: list
  * depth and cap, the move and copy overwrite guard, mkdir without parents and
@@ -944,6 +994,15 @@ export class APIClient {
    * Refreshed on a miss, because a restart can bring a newer agent.
    */
   private readonly toolboxFeatures = new Map<string, Set<string>>();
+  /**
+   * The base URL of the cell each sandbox in another cell lives in, learned
+   * from a 421 that named it, oldest first. Shared with {@link withSignal}
+   * views, so what one call learns routes the next. Entries are dropped only
+   * on a 404 from that cell (the sandbox may be gone) or past
+   * {@link MAX_REMEMBERED_CELLS}: the cell is minted into the ID, so it
+   * never changes.
+   */
+  private readonly sandboxCells = new Map<string, string>();
 
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
@@ -1346,7 +1405,7 @@ export class APIClient {
     // argv waits for the feature check: the start message goes out only once
     // the agent has listed exec.argv, so an older one never receives it.
     const ready = options.argv?.length ? this.requireToolboxFeatures(id, "exec.argv") : undefined;
-    return openExecStream(this.baseURL, this.versionPrefix, this.patToken, id, options, ready);
+    return openExecStream(this.baseURLFor(id), this.versionPrefix, this.patToken, id, options, ready);
   }
 
   /**
@@ -1358,7 +1417,7 @@ export class APIClient {
   async watchFiles(id: string, path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
     const query = `path=${encodeURIComponent(path)}${options.recursive ? "&recursive=true" : ""}`;
     const routePath = `${this.versioned(`/sandboxes/${encodeURIComponent(id)}/toolbox/files/watch`)}?${query}`;
-    return openFileWatch(this.baseURL, routePath, this.patToken, onEvent, (detail) => this.fileWatchRefusal(id, routePath, detail));
+    return openFileWatch(this.baseURLFor(id), routePath, this.patToken, onEvent, (detail) => this.fileWatchRefusal(id, routePath, detail));
   }
 
   /**
@@ -1374,7 +1433,7 @@ export class APIClient {
     let response: Response;
     let text: string;
     try {
-      response = await this.fetchFn(`${this.baseURL}${routePath}`, {
+      response = await this.fetchFn(`${this.baseURLFor(id)}${routePath}`, {
         method: "GET",
         headers: this.authHeaders(),
         ...(this.signal ? { signal: this.signal } : {}),
@@ -1437,7 +1496,7 @@ export class APIClient {
   }
 
   attachSession(id: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
-    return openSessionAttach(this.baseURL, this.versionPrefix, this.patToken, id, sessionID, options);
+    return openSessionAttach(this.baseURLFor(id), this.versionPrefix, this.patToken, id, sessionID, options);
   }
 
   /**
@@ -2218,6 +2277,17 @@ export class APIClient {
     return new Uint8Array(await response.arrayBuffer());
   }
 
+  private authHeaders(base?: HeadersInit): Headers {
+    const headers = new Headers(base);
+    if (this.patToken !== "") {
+      headers.set("Authorization", `Bearer ${this.patToken}`);
+    }
+    if (this.team !== "") {
+      headers.set(TEAM_HEADER, this.team);
+    }
+    return headers;
+  }
+
   /**
    * Low-level HTTP request with automatic retry for transient failures.
    *
@@ -2236,24 +2306,90 @@ export class APIClient {
    * A 429 or 503 waits as long as its `Retry-After` asks (see
    * {@link retryDelayMs}). The client's `signal` ends the request and any
    * wait.
+   *
+   * A 421 that names another cell ({@link CELL_ENDPOINT_HEADER}) is not
+   * retried in place: the same request goes once to that cell instead, and
+   * later requests for that sandbox go straight there.
    */
-  private authHeaders(base?: HeadersInit): Headers {
-    const headers = new Headers(base);
-    if (this.patToken !== "") {
-      headers.set("Authorization", `Bearer ${this.patToken}`);
-    }
-    if (this.team !== "") {
-      headers.set(TEAM_HEADER, this.team);
-    }
-    return headers;
-  }
-
   private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
     const headers = this.authHeaders(init.headers);
-
-    const url = `${this.baseURL}${path}`;
     const signal = init.signal ?? this.signal;
     const requestInit: RequestInit = { ...init, method, headers, ...(signal ? { signal } : {}) };
+    const sandboxID = sandboxIDInPath(path, this.versioned("/sandboxes/"));
+
+    let base = this.baseURLFor(sandboxID);
+    let response = await this.send(`${base}${path}`, requestInit, options);
+    const cell = this.cellEndpoint(response);
+    if (cell !== undefined) {
+      // Remembered even when the body cannot go again, so the caller's own
+      // retry goes to the right cell.
+      if (sandboxID !== undefined) this.rememberCell(sandboxID, cell);
+      // The cell router answers before any work is done, so even an exec or
+      // a folder upload may go again; only a body that fetch has already
+      // read cannot.
+      if (!isReplayableBody(init.body)) return response;
+      response.body?.cancel().catch(() => undefined);
+      base = cell;
+      // send hands back a second 421 naming a cell as it is, and nothing
+      // follows it: two cells that disagree cannot bounce a request between
+      // them.
+      response = await this.send(`${base}${path}`, requestInit, options);
+    }
+    // A 404 from the remembered cell may mean the sandbox was deleted, so the
+    // next call asks the configured server again. A missing file says nothing
+    // about the sandbox, and forgetting on it would add a 421 to every poll.
+    if (
+      response.status === 404 &&
+      sandboxID !== undefined &&
+      this.sandboxCells.get(sandboxID) === base &&
+      !isMissingFile(await decodeError(response.clone()))
+    ) {
+      this.sandboxCells.delete(sandboxID);
+    }
+    return response;
+  }
+
+  /** Where requests for sandbox `id` go: the cell it was found in, else the configured server. */
+  private baseURLFor(id: string | undefined): string {
+    return (id !== undefined && this.sandboxCells.get(id)) || this.baseURL;
+  }
+
+  private rememberCell(id: string, cell: string): void {
+    // Re-inserted so a re-learned entry counts as the newest.
+    this.sandboxCells.delete(id);
+    this.sandboxCells.set(id, cell);
+    if (this.sandboxCells.size > MAX_REMEMBERED_CELLS) {
+      const oldest = this.sandboxCells.keys().next().value;
+      if (oldest !== undefined) this.sandboxCells.delete(oldest);
+    }
+  }
+
+  /**
+   * The cell base URL a 421 names, or `undefined` when it names none this
+   * client may send its token to: not an absolute http(s) URL, or plain http
+   * while the client was configured for https, which would let one bad
+   * answer move the token to clear text.
+   */
+  private cellEndpoint(response: Response): string | undefined {
+    if (!isCellAnswer(response)) return undefined;
+    let url: URL;
+    try {
+      url = new URL((response.headers.get(CELL_ENDPOINT_HEADER) ?? "").trim());
+    } catch {
+      return undefined;
+    }
+    if (url.host === "" || (url.protocol !== "https:" && (url.protocol !== "http:" || /^https:/i.test(this.baseURL)))) {
+      return undefined;
+    }
+    // Built like the configured base URL: the cell's own path prefix stays,
+    // so /v1/... lands under it. A query, fragment or userinfo has no place
+    // in a base URL and is dropped.
+    return url.origin + stripTrailingSlashes(url.pathname);
+  }
+
+  /** One request to `url` with the retry loop described on {@link request}. */
+  private async send(url: string, requestInit: RequestInit, options: RequestOptions): Promise<Response> {
+    const signal = requestInit.signal ?? undefined;
     const maxRetries = options.sendOnce ? 0 : this.retryConfig.maxRetries;
     const idempotent = options.idempotent ?? true;
     const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
@@ -2271,7 +2407,7 @@ export class APIClient {
         if (response.status === 502 || response.status === 504) {
           mayHaveRun = true;
         }
-        if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries) {
+        if (!retryableStatusCodes.has(response.status) || attempt >= maxRetries || isCellAnswer(response)) {
           return response;
         }
         if (REFUSED_STATUS_CODES.has(response.status)) {
