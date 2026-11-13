@@ -212,7 +212,7 @@ These counters show what happens to sandboxes over time. Each one has a `key` la
 | Metric | `key` values | What it counts |
 |---|---|---|
 | `aerolvm_sandbox_stops_total` | `user_stop`, `idle`, `max_age`, `out_of_memory`, `disk_limit`, `crashed`, `program_exited`, `reconcile` | Sandboxes that stopped, by their [stop reason](/lifecycle/#why-a-sandbox-stopped). |
-| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover` | Sandboxes that started again. `requested` is a call, including a wake. `restarted` is `restartOnFailure`. `failover` is a sandbox rebuilt after its node failed. |
+| `aerolvm_sandbox_starts_total` | `requested`, `restarted`, `failover`, `moved` | Sandboxes that started again. `requested` is a call, including a wake. `restarted` is `restartOnFailure`. `failover` is a sandbox rebuilt after its node failed. `moved` is a gVisor sandbox a machine replacement moved, with its memory, to another node. |
 | `aerolvm_sandbox_expired_total` | `idle`, `max_age`, `program_exited` | Sandboxes a lifecycle timer deleted, by the timer. `destroyAt` counts as `max_age`. `destroyAfterExitFor` counts as `program_exited`. |
 | `aerolvm_sandbox_finished_total` | `success`, `failure` | Main programs that ended, by whether the exit code was `0`. A sandbox that goes down with another exit code counts as a `crashed` stop instead. So `failure` counts only programs watched for [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends). Those end while the sandbox keeps running. |
 | `aerolvm_create_latency_by_start_seconds_bucket` | `warm`, `cold` (`key2` is the bucket) | How long successful creates took. `warm` means a warm pool, a parked container or a running V8-isolate group served the create. |
