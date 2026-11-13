@@ -406,7 +406,7 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.federation` | This cell as one of several: `idKeySecret` (a Secret whose key `key` holds the shared ID key) and `cells` (the other cells' addresses by number). See [Many cells](/cells/). | none |
 | `cluster.zones` | The zones to spread over. | none (required) |
 | `cluster.servers.count` | 3 or 5. | `3` |
-| `cluster.servers.storage` | Each server's disk: `size` and `storageClassName`. | `20Gi` |
+| `cluster.servers.storage` | Each server's disk: `size` and `storageClassName`. For a busy cell (about 1,000 creates a second), use a fast class: on EKS, gp3 with 16,000 IOPS and 1,000 MB/s. On gp3's default 3,000 IOPS, the servers pause for 1 to 5 seconds every 2 minutes at that rate. | `20Gi` |
 | `cluster.gateways.minReplicas` | Gateways to keep, at least one per zone. | `3` |
 | `cluster.gateways.service` | The gateways' load balancer: `type` and `annotations`. | `LoadBalancer` |
 | `cluster.gateways.gatewayRef` | Sit behind your own Gateway API Gateway instead, as `name` and `namespace`. | none |
