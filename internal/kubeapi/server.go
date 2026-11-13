@@ -97,7 +97,10 @@ type Server struct {
 	Auth    Authenticator
 	Authz   Authorizer
 	Backend Backend
-	Owners  OwnerMap
+	// Store keeps templates and warm pools (objects.go); nil serves the
+	// extensions group as unavailable.
+	Store  ObjectStore
+	Owners OwnerMap
 	// Now and Random are the clock and the generateName suffix; tests set
 	// them.
 	Now    func() time.Time
@@ -150,10 +153,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiGroupList())
 		return
 	case "/apis/" + Group:
-		writeJSON(w, http.StatusOK, apiGroup())
+		writeJSON(w, http.StatusOK, apiGroup(Group))
 		return
 	case "/apis/" + Group + "/" + Version:
 		writeJSON(w, http.StatusOK, resourceList())
+		return
+	case "/apis/" + ExtensionsGroup:
+		writeJSON(w, http.StatusOK, apiGroup(ExtensionsGroup))
+		return
+	case "/apis/" + ExtensionsGroup + "/" + Version:
+		writeJSON(w, http.StatusOK, extensionsResourceList())
 		return
 	case "/openapi/v2":
 		writeJSON(w, http.StatusOK, map[string]any{"swagger": "2.0", "info": map[string]string{"title": "AerolVM agent-sandbox API", "version": UpstreamRelease}, "paths": map[string]any{}})
@@ -162,7 +171,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"paths": map[string]any{}})
 		return
 	}
-	ns, name, sub, ok := parseResourcePath(path)
+	group, resource, ns, name, sub, ok := parseResourcePath(path)
 	if !ok {
 		writeStatus(w, &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: "no such path: " + r.URL.Path})
 		return
@@ -172,22 +181,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	verb, err := verbOf(r.Method, name, q.Get("watch"))
+	verb, err := verbOf(r.Method, name, q.Get("watch"), group == ExtensionsGroup)
 	if err != nil {
 		writeStatus(w, err)
 		return
 	}
-	allowed, reason, err := s.Authz.Authorize(r.Context(), u, Attributes{Verb: verb, Group: Group, Resource: SandboxesResource, Namespace: ns, Name: name})
+	allowed, reason, err := s.Authz.Authorize(r.Context(), u, Attributes{Verb: verb, Group: group, Resource: resource, Namespace: ns, Name: name})
 	if err != nil {
 		writeStatus(w, &StatusError{Code: http.StatusInternalServerError, Reason: "InternalError", Message: "authorization check failed: " + err.Error()})
 		return
 	}
 	if !allowed {
-		msg := fmt.Sprintf("%s cannot %s sandboxes.%s in namespace %q", u.Name, verb, Group, ns)
+		msg := fmt.Sprintf("%s cannot %s %s.%s in namespace %q", u.Name, verb, resource, group, ns)
 		if reason != "" {
 			msg += ": " + reason
 		}
 		writeStatus(w, &StatusError{Code: http.StatusForbidden, Reason: "Forbidden", Message: msg})
+		return
+	}
+	if group == ExtensionsGroup {
+		if err := s.serveStored(w, r, verb, resource, ns, name); err != nil {
+			writeStatus(w, err)
+		}
 		return
 	}
 	switch verb {
@@ -209,36 +224,53 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parseResourcePath reads /apis/agents.x-k8s.io/v1beta1/[namespaces/{ns}/]sandboxes[/{name}[/{sub}]].
-func parseResourcePath(path string) (ns, name, sub string, ok bool) {
-	rest, found := strings.CutPrefix(path, "/apis/"+Group+"/"+Version+"/")
-	if !found {
-		return "", "", "", false
+// parseResourcePath reads
+// /apis/{group}/v1beta1/[namespaces/{ns}/]{resource}[/{name}[/{sub}]] for
+// the resources this server serves.
+func parseResourcePath(path string) (group, resource, ns, name, sub string, ok bool) {
+	for _, g := range []string{Group, ExtensionsGroup} {
+		if rest, found := strings.CutPrefix(path, "/apis/"+g+"/"+Version+"/"); found {
+			group, path = g, rest
+			break
+		}
 	}
-	parts := strings.Split(rest, "/")
+	if group == "" {
+		return "", "", "", "", "", false
+	}
+	parts := strings.Split(path, "/")
 	if len(parts) >= 3 && parts[0] == "namespaces" {
 		ns, parts = parts[1], parts[2:]
 		if ns == "" {
-			return "", "", "", false
+			return "", "", "", "", "", false
 		}
 	}
-	if len(parts) == 0 || parts[0] != SandboxesResource || len(parts) > 3 {
-		return "", "", "", false
+	if len(parts) == 0 || len(parts) > 3 {
+		return "", "", "", "", "", false
+	}
+	resource = parts[0]
+	served := resource == SandboxesResource
+	if group == ExtensionsGroup {
+		_, served = storedKinds[resource]
+	}
+	if !served {
+		return "", "", "", "", "", false
 	}
 	if len(parts) >= 2 {
 		name = parts[1]
 		if name == "" || ns == "" {
-			return "", "", "", false
+			return "", "", "", "", "", false
 		}
 	}
 	if len(parts) == 3 {
 		sub = parts[2]
 	}
-	return ns, name, sub, true
+	return group, resource, ns, name, sub, true
 }
 
-func verbOf(method, name, watch string) (string, error) {
+func verbOf(method, name, watch string, updatable bool) (string, error) {
 	switch {
+	case method == http.MethodPut && name != "" && updatable:
+		return "update", nil
 	case method == http.MethodGet && name == "" && (watch == "true" || watch == "1"):
 		return "watch", nil
 	case method == http.MethodGet && name == "":
@@ -834,15 +866,19 @@ type apiGroupDoc struct {
 	PreferredVersion groupVersion   `json:"preferredVersion"`
 }
 
-func apiGroup() apiGroupDoc {
-	gv := groupVersion{GroupVersion: GroupVersion(), Version: Version}
-	return apiGroupDoc{TypeMeta: TypeMeta{APIVersion: "v1", Kind: "APIGroup"}, Name: Group, Versions: []groupVersion{gv}, PreferredVersion: gv}
+func apiGroup(name string) apiGroupDoc {
+	gv := groupVersion{GroupVersion: name + "/" + Version, Version: Version}
+	return apiGroupDoc{TypeMeta: TypeMeta{APIVersion: "v1", Kind: "APIGroup"}, Name: name, Versions: []groupVersion{gv}, PreferredVersion: gv}
 }
 
 func apiGroupList() map[string]any {
-	g := apiGroup()
-	g.TypeMeta = TypeMeta{}
-	return map[string]any{"kind": "APIGroupList", "apiVersion": "v1", "groups": []apiGroupDoc{g}}
+	var groups []apiGroupDoc
+	for _, name := range []string{Group, ExtensionsGroup} {
+		g := apiGroup(name)
+		g.TypeMeta = TypeMeta{}
+		groups = append(groups, g)
+	}
+	return map[string]any{"kind": "APIGroupList", "apiVersion": "v1", "groups": groups}
 }
 
 const suffixAlphabet = "bcdfghjklmnpqrstvwxz2456789"

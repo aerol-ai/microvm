@@ -188,7 +188,7 @@ func TestServerHealthAndDiscovery(t *testing.T) {
 	if _, g := r.call(t, http.MethodGet, "/apis/agents.x-k8s.io", ""); g["name"] != Group {
 		t.Fatalf("group = %v", g)
 	}
-	if _, gl := r.call(t, http.MethodGet, "/apis", ""); len(gl["groups"].([]any)) != 1 {
+	if _, gl := r.call(t, http.MethodGet, "/apis", ""); len(gl["groups"].([]any)) != 2 {
 		t.Fatalf("group list = %v", gl)
 	}
 	for _, path := range []string{"/openapi/v2", "/openapi/v3"} {

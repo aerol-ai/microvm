@@ -82,8 +82,9 @@ func TestCertReloader(t *testing.T) {
 }
 
 type fakeKube struct {
-	fails int
-	calls int
+	kubeapi.ObjectStore // the store is not called here
+	fails               int
+	calls               int
 }
 
 func (k *fakeKube) FrontProxyConfig(context.Context) (*kubeapi.FrontProxy, error) {

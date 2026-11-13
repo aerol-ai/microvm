@@ -790,9 +790,23 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := docsOfKind(docs, "APIService")
-	if len(api) != 1 || dig(api[0], "spec", "group") != "agents.x-k8s.io" || dig(api[0], "spec", "service", "name") != "aerolvm-agent-sandbox-api" ||
-		dig(api[0], "metadata", "annotations", "cert-manager.io/inject-ca-from") != "aerolvm/aerolvm-agent-sandbox-api" {
-		t.Fatalf("APIService = %v", api)
+	groups := map[any]bool{}
+	for _, a := range api {
+		groups[dig(a, "spec", "group")] = true
+		if dig(a, "spec", "service", "name") != "aerolvm-agent-sandbox-api" ||
+			dig(a, "metadata", "annotations", "cert-manager.io/inject-ca-from") != "aerolvm/aerolvm-agent-sandbox-api" {
+			t.Fatalf("APIService = %v", a)
+		}
+	}
+	if len(api) != 2 || !groups["agents.x-k8s.io"] || !groups["extensions.agents.x-k8s.io"] {
+		t.Fatalf("APIServices = %v", groups)
+	}
+	crds := map[any]bool{}
+	for _, c := range docsOfKind(docs, "CustomResourceDefinition") {
+		crds[dig(c, "metadata", "name")] = true
+	}
+	if !crds["sandboxtemplates.k8s.aerolvm.io"] || !crds["sandboxwarmpools.k8s.aerolvm.io"] {
+		t.Fatalf("internal CRDs = %v", crds)
 	}
 	roles := map[string]bool{}
 	for _, b := range append(docsOfKind(docs, "ClusterRoleBinding"), docsOfKind(docs, "RoleBinding")...) {
@@ -800,7 +814,7 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 			roles[dig(b, "roleRef", "name").(string)] = true
 		}
 	}
-	if !roles["system:auth-delegator"] || !roles["extension-apiserver-authentication-reader"] || len(roles) != 2 {
+	if !roles["system:auth-delegator"] || !roles["extension-apiserver-authentication-reader"] || !roles["aerolvm-gateway-store"] || len(roles) != 3 {
 		t.Fatalf("the gateway's roles = %v", roles)
 	}
 	if n := len(docsOfKind(docs, "Certificate")); n < 1 {
