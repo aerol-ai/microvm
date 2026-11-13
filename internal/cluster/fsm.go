@@ -3229,6 +3229,7 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 		// hydrating the spec.
 		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
 		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
+		p.KubeClaim = kubeClaimMarkOf(p.Spec)
 		// A team's sandbox carries its size on the hot row, so the quota
 		// index is rebuilt on Restore without hydrating every spec. Other
 		// owners pay nothing for it.
