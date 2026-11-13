@@ -553,3 +553,72 @@ func TestWarmPoolOnImageChangeAndOutdated(t *testing.T) {
 		t.Fatalf("a record with no strategy reads as replace_now: %+v %v", got, err)
 	}
 }
+
+// The agent-sandbox API's depths (C17) reach only the pool of their
+// runtime, and add to an operator entry for the same image (both are per
+// worker).
+func TestConfiguredForAddsTheAgentSandboxDepths(t *testing.T) {
+	entries := []models.WarmPool{
+		{Image: "python:3.12", Depth: 2},
+		{Image: "node:22", Depth: 1, MinDepth: 1, MaxDepth: 4},
+	}
+	kube := []cluster.KubeWarmDepth{
+		{Image: "python:3.12", Runtime: "gvisor", Depth: 3},
+		{Image: "node:22", Runtime: "gvisor", Depth: 1},
+		{Image: "alpine:3.20", Runtime: "gvisor", Depth: 2},
+		{Image: "alpine:3.20", Runtime: "runc", Depth: 5},
+	}
+	byImage := func(c []dockerpool.Configured) map[string]dockerpool.Configured {
+		out := map[string]dockerpool.Configured{}
+		for _, x := range c {
+			out[x.Key.Image] = x
+		}
+		return out
+	}
+	g := byImage(configuredFor("gvisor", entries, kube))
+	if len(g) != 3 || g["python:3.12"].Depth != 5 || g["alpine:3.20"].Depth != 2 || g["alpine:3.20"].Key.Runtime != "gvisor" {
+		t.Fatalf("gvisor pool = %+v", g)
+	}
+	if n := g["node:22"]; n.Depth != 2 || n.MinDepth != 2 || n.MaxDepth != 5 {
+		t.Fatalf("a demand range moves with the added depth: %+v", n)
+	}
+	d := byImage(configuredFor("docker", entries, kube))
+	if len(d) != 2 || d["python:3.12"].Depth != 2 {
+		t.Fatalf("another runtime's pool takes none of them: %+v", d)
+	}
+}
+
+// The depths ride the read a worker already polls.
+func TestClusterWarmPoolSyncCarriesTheAgentSandboxDepths(t *testing.T) {
+	svc, c := newClusterWarmPoolService(t)
+	pool := newFakeWarmPool()
+	svc.RegisterWarmPool(pool, "gvisor")
+	c.answer = &cluster.WarmPoolReadResponse{Version: 4, Authoritative: true,
+		Kube: []cluster.KubeWarmDepth{{Image: "python:3.12", Runtime: "gvisor", Depth: 2}}}
+	svc.syncWarmPoolsLogged(context.Background())
+	if last := pool.last(); len(last) != 1 || last[0].Key.Image != "python:3.12" || last[0].Depth != 2 {
+		t.Fatalf("applied = %+v", last)
+	}
+}
+
+// A worker logs a warm-pool apply when what it applies changes, not on
+// every poll of a cluster that never had an entry (it answers in full).
+func TestWarmPoolApplyLogsOnlyAChange(t *testing.T) {
+	svc, c := newClusterWarmPoolService(t)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.RegisterWarmPool(newFakeWarmPool(), "gvisor")
+	empty := &cluster.WarmPoolReadResponse{Version: 0, Authoritative: true}
+	for range 3 {
+		c.answer = empty
+		svc.syncWarmPoolsLogged(context.Background())
+	}
+	if n := strings.Count(logs.String(), "warm pool entries applied"); n != 1 {
+		t.Fatalf("logged %d times for the same empty set", n)
+	}
+	c.answer = &cluster.WarmPoolReadResponse{Version: 5, Authoritative: true, Kube: []cluster.KubeWarmDepth{{Image: "a", Runtime: "gvisor", Depth: 1}}}
+	svc.syncWarmPoolsLogged(context.Background())
+	if n := strings.Count(logs.String(), "warm pool entries applied"); n != 2 {
+		t.Fatalf("a change was not logged (%d)", n)
+	}
+}

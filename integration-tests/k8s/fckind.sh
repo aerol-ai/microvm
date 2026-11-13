@@ -72,14 +72,22 @@ PY
 trap 'aws ec2 terminate-instances --instance-ids "$id" >/dev/null 2>&1 || true' EXIT
 say "instance $id"
 
-# Each FCK line as it comes (the console shows the last 64 KB), until DONE
-# or the instance is gone.
-start=$(date +%s) seen=0 done=""
+# Each FCK line as it comes, until DONE or the instance is gone. The console
+# keeps its last 64 KB, so once a long run rolls past its start, a line's
+# position moves: follow the last line printed, by its text.
+start=$(date +%s) last="" done=""
 while (( $(date +%s) - start < 6000 )); do
   out="$(aws ec2 get-console-output --instance-id "$id" --latest --query Output --output text 2>/dev/null || true)"
   mapfile -t lines < <(grep -E '^FCK ' <<<"$out" || true)
-  for (( i = seen; i < ${#lines[@]}; i++ )); do echo "${lines[$i]}" | tee -a "$report"; done
-  (( ${#lines[@]} > seen )) && seen=${#lines[@]}
+  # After the last line printed; all of them when it has rolled out too.
+  from=0
+  if [[ -n "$last" ]]; then
+    for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
+      [[ "${lines[$i]}" == "$last" ]] && { from=$((i + 1)); break; }
+    done
+  fi
+  for (( i = from; i < ${#lines[@]}; i++ )); do echo "${lines[$i]}" | tee -a "$report"; done
+  (( ${#lines[@]} > 0 )) && last="${lines[${#lines[@]} - 1]}"
   grep -q '^FCK DONE' <<<"$out" && { done=1; break; }
   state="$(aws ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)"
   [[ "$state" == shutting-down || "$state" == terminated ]] && { say "fckind: the instance is $state"; break; }

@@ -107,6 +107,7 @@ func (f *placementFSM) readWarmPools(req WarmPoolReadRequest) WarmPoolReadRespon
 		return out
 	}
 	out.Pools = f.warmPoolsSnapshotLocked()
+	out.Kube = f.kubeWarmSnapshotLocked()
 	return out
 }
 

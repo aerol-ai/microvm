@@ -170,6 +170,11 @@ containers:
       {{- /* Workers report their sandboxes' run state for the agent-sandbox
       API (C17). */}}
       {{- include "aerolvm.agentSandboxEnv" $root | nindent 6 }}
+      # The API's warm pools keep sandboxes ready in this pool (C17). Depth
+      # 0 parks only what is configured (those pools and /v1 warm pools),
+      # never every image a worker has seen.
+      - { name: SB_CONTAINERD_POOL_ENABLED, value: "true" }
+      - { name: SB_CONTAINERD_POOL_DEPTH, value: "0" }
       {{- end }}
       {{- /* In cluster mode a worker holds no admin token: its join gives
       it only the token's fingerprint, to check callers with. */}}

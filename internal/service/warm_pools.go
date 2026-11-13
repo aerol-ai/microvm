@@ -317,51 +317,89 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 	if len(pools) == 0 {
 		return nil
 	}
-	entries, ok, err := s.readWarmPoolsForSync(ctx)
+	entries, kube, ok, err := s.readWarmPoolsForSync(ctx)
 	if err != nil || !ok {
 		return err
 	}
 	for _, reg := range pools {
-		configured := make([]dockerpool.Configured, 0, len(entries))
-		for _, e := range entries {
-			configured = append(configured, dockerpool.Configured{
-				Key:   dockerpool.Key{Image: e.Image, Runtime: reg.runtime},
-				Depth: e.Depth, MinDepth: e.MinDepth, MaxDepth: e.MaxDepth,
-				ReplaceAsUsed: e.OnImageChange == models.WarmPoolReplaceAsUsed,
-			})
-		}
-		reg.pool.SetConfigured(configured)
+		reg.pool.SetConfigured(configuredFor(reg.runtime, entries, kube))
+	}
+	// Logged when what is applied changes: which pools park what is
+	// otherwise invisible on a worker. A cluster that never had an entry
+	// answers every poll in full (version 0), so the answer alone is no
+	// sign of a change.
+	applied := fmt.Sprint(entries, kube)
+	s.warmPoolMu.Lock()
+	changed := applied != s.warmPoolApplied
+	s.warmPoolApplied = applied
+	s.warmPoolMu.Unlock()
+	if changed && s.logger != nil {
+		s.logger.Info("warm pool entries applied", "entries", len(entries), "agent_sandbox_depths", len(kube), "pools", len(pools))
 	}
 	return nil
 }
 
-// readWarmPoolsForSync returns the entries to apply; ok is false when there
-// is nothing new (an "unchanged" answer, or an older one being held back).
-func (s *Service) readWarmPoolsForSync(ctx context.Context) ([]models.WarmPool, bool, error) {
+// configuredFor is what a pool of runtime parks: every operator entry, in
+// this runtime, plus the agent-sandbox API's depths for this runtime
+// (cluster.KubeWarmDepth, C17). Both are per worker, so where they name the
+// same image their depths add up.
+func configuredFor(runtime string, entries []models.WarmPool, kube []cluster.KubeWarmDepth) []dockerpool.Configured {
+	configured := make([]dockerpool.Configured, 0, len(entries)+len(kube))
+	at := make(map[string]int, len(entries))
+	for _, e := range entries {
+		at[e.Image] = len(configured)
+		configured = append(configured, dockerpool.Configured{
+			Key:   dockerpool.Key{Image: e.Image, Runtime: runtime},
+			Depth: e.Depth, MinDepth: e.MinDepth, MaxDepth: e.MaxDepth,
+			ReplaceAsUsed: e.OnImageChange == models.WarmPoolReplaceAsUsed,
+		})
+	}
+	for _, k := range kube {
+		if k.Runtime != runtime {
+			continue
+		}
+		if i, ok := at[k.Image]; ok {
+			c := &configured[i]
+			c.Depth += k.Depth
+			if c.MaxDepth > 0 {
+				c.MinDepth, c.MaxDepth = c.MinDepth+k.Depth, c.MaxDepth+k.Depth
+			}
+			continue
+		}
+		at[k.Image] = len(configured)
+		configured = append(configured, dockerpool.Configured{Key: dockerpool.Key{Image: k.Image, Runtime: runtime}, Depth: k.Depth})
+	}
+	return configured
+}
+
+// readWarmPoolsForSync returns the entries to apply, and the agent-sandbox
+// API's depths (a cluster's only); ok is false when there is nothing new
+// (an "unchanged" answer, or an older one being held back).
+func (s *Service) readWarmPoolsForSync(ctx context.Context) ([]models.WarmPool, []cluster.KubeWarmDepth, bool, error) {
 	if s.warmPoolStore != nil || !s.ClusterEnabled() {
 		entries, err := s.warmPoolBackend().ListWarmPools(ctx)
-		return entries, err == nil, err
+		return entries, nil, err == nil, err
 	}
 	c, ok := s.Cluster().(warmPoolCluster)
 	if !ok {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	s.warmPoolMu.Lock()
 	since := s.warmPoolSyncVersion
 	s.warmPoolMu.Unlock()
 	resp, err := c.ReadWarmPools(ctx, cluster.WarmPoolReadRequest{Since: since})
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	if resp.Unchanged {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	s.warmPoolMu.Lock()
 	defer s.warmPoolMu.Unlock()
 	if resp.Version < s.warmPoolSyncVersion {
 		s.warmPoolSyncBehind++
 		if s.warmPoolSyncBehind < warmPoolBehindPolls {
-			return nil, false, nil
+			return nil, nil, false, nil
 		}
 	}
 	s.warmPoolSyncBehind = 0
@@ -370,7 +408,7 @@ func (s *Service) readWarmPoolsForSync(ctx context.Context) ([]models.WarmPool, 
 	for _, rec := range resp.Pools {
 		entries = append(entries, warmPoolFromRecord(rec))
 	}
-	return entries, true, nil
+	return entries, resp.Kube, true, nil
 }
 
 // clusterWarmPools adapts the replicated store to warmPoolBackend.

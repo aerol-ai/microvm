@@ -152,6 +152,12 @@ func startAgentSandboxAPI(ctx context.Context, cfg config.Config, c cluster.Clie
 	}
 	fp := &frontProxyHolder{}
 	go fp.load(ctx, kc, logger)
+	// The warm pools' depths, summed into the cluster so workers pre-start
+	// their sandboxes (C17). Every gateway runs it; the write is a whole
+	// replace, so they agree.
+	if w, ok := c.(kubeapi.WarmDepthWriter); ok {
+		go kubeapi.RunWarmDepthSync(ctx, kc, w, logger)
+	}
 	srv := &http.Server{
 		Addr: cfg.AgentSandboxAPIAddr,
 		Handler: &kubeapi.Server{
