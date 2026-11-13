@@ -52,7 +52,10 @@ const (
 	CreatePolicyVolume = "create-policy"
 	// CreatePolicyKey is the ConfigMap key that holds the policy file.
 	CreatePolicyKey = "policy.yaml"
-	createPolicyDir = "/etc/aerolvm/create-policy"
+	// FederationKeyKey is the Secret key that holds the federation's ID
+	// key (spec.federation.idKeySecret).
+	FederationKeyKey = "key"
+	createPolicyDir  = "/etc/aerolvm/create-policy"
 )
 
 // Labels the operator puts on every pod and object it makes.
@@ -248,6 +251,7 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 
 	setEnv(&pod.Spec, AgentContainer, nodeEnv(in))
 	addCreatePolicy(&pod.Spec, in.Cluster)
+	addFederation(&pod.Spec, in.Cluster)
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
 		setPoolRuntimes(&pod.Spec, in.Pool.Runtimes)
 		setEgressRanges(&pod.Spec, in.Addresses)
@@ -398,7 +402,9 @@ func setupSecurity(agent *corev1.SecurityContext) *corev1.SecurityContext {
 func setupEnv(agent []corev1.EnvVar) []corev1.EnvVar {
 	env := []corev1.EnvVar{podIPEnv()}
 	for _, e := range agent {
-		if e.Name != "POD_IP" {
+		// Setup writes every SB_ setting to a file on the node's disk; the
+		// federation key stays in the agent's own environment instead.
+		if e.Name != "POD_IP" && e.Name != "SB_CELL_ID_KEY" {
 			env = append(env, e)
 		}
 	}
@@ -533,6 +539,28 @@ func addCreatePolicy(spec *corev1.PodSpec, c *v1.AerolCluster) {
 	spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts,
 		corev1.VolumeMount{Name: CreatePolicyVolume, MountPath: createPolicyDir, ReadOnly: true})
 	setEnv(spec, AgentContainer, []corev1.EnvVar{{Name: "SB_CREATE_POLICY_FILE", Value: createPolicyDir + "/" + CreatePolicyKey}})
+}
+
+// addFederation gives the agent the federation's ID key and the other
+// cells' addresses (C16). Every role gets them: any node may mint an ID,
+// and the node a request reaches answers for another cell's sandbox.
+func addFederation(spec *corev1.PodSpec, c *v1.AerolCluster) {
+	f := c.Spec.Federation
+	if f == nil || f.IDKeySecret.Name == "" {
+		return
+	}
+	env := []corev1.EnvVar{{Name: "SB_CELL_ID_KEY", ValueFrom: &corev1.EnvVarSource{
+		SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: f.IDKeySecret, Key: FederationKeyKey},
+	}}}
+	if len(f.Cells) > 0 {
+		cells := make([]string, 0, len(f.Cells))
+		for n, addr := range f.Cells {
+			cells = append(cells, n+"="+addr)
+		}
+		slices.Sort(cells) // a stable pod spec
+		env = append(env, corev1.EnvVar{Name: "SB_CELL_ENDPOINTS", Value: strings.Join(cells, ",")})
+	}
+	setEnv(spec, AgentContainer, env)
 }
 
 // setPoolRuntimes makes a worker run only its pool's runtimes. The worker

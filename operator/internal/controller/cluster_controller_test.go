@@ -138,12 +138,22 @@ func TestRefuseSpec(t *testing.T) {
 		{func(c *v1.AerolCluster) { c.Spec.Servers.Count = 4 }, "3 or 5"},
 		{func(c *v1.AerolCluster) { c.Spec.WorkerPools = append(c.Spec.WorkerPools, c.Spec.WorkerPools[0]) }, "twice"},
 		{func(c *v1.AerolCluster) { c.Spec.WorkerPools[0].MinWorkers = 20 }, "above maxWorkers"},
+		{func(c *v1.AerolCluster) { c.Spec.Federation = &v1.FederationSpec{} }, "idKeySecret.name is empty"},
+		{fed(map[string]string{"0": "https://a.example.com"}), "0 is not a cell number"},
+		{fed(map[string]string{"256": "https://a.example.com"}), "256 is not a cell number"},
+		{fed(map[string]string{"two": "https://a.example.com"}), "two is not a cell number"},
+		{fed(map[string]string{"3": "https://a.example.com"}), "3 is this cell"},
+		{fed(map[string]string{"2": "ftp://a.example.com"}), "2 is not an http(s) address"},
+		{fed(map[string]string{"2": "https://"}), "2 is not an http(s) address"},
 	} {
 		c := testCluster()
 		tc.edit(c)
 		if got := refuseSpec(c); !strings.Contains(got, tc.want) {
 			t.Fatalf("refuseSpec = %q, want %q", got, tc.want)
 		}
+	}
+	if got := refuseSpec(federated(testCluster())); got != "" {
+		t.Fatalf("a good federation is refused: %s", got)
 	}
 	c := testCluster()
 	c.Spec.Security.ExternalCA = &v1.ExternalCASpec{}
@@ -419,5 +429,43 @@ func TestClusterCopiesCreatePolicy(t *testing.T) {
 	reconcileCluster(t, r)
 	if err := cl.Get(ctx, types.NamespacedName{Namespace: testWorkerNS, Name: "prod-create-policy"}, &dst); err != nil || !strings.Contains(dst.Data[CreatePolicyKey], "allow_gpu") {
 		t.Fatalf("after a change: %v %v", dst.Data, err)
+	}
+}
+
+// federated makes testCluster (cell 3) one of three cells.
+func federated(c *v1.AerolCluster) *v1.AerolCluster {
+	c.Spec.Federation = &v1.FederationSpec{
+		IDKeySecret: corev1.LocalObjectReference{Name: "prod-federation"},
+		Cells:       map[string]string{"2": "https://cell2.example.com", "1": "http://10.0.0.1:8080"},
+	}
+	return c
+}
+
+func fed(cells map[string]string) func(c *v1.AerolCluster) {
+	return func(c *v1.AerolCluster) {
+		federated(c).Spec.Federation.Cells = cells
+	}
+}
+
+// Worker pods read the federation's key from a copy in their namespace.
+func TestClusterCopiesFederationKey(t *testing.T) {
+	c := federated(bootstrapped(testCluster()))
+	r, api, cl := clusterRig(t, c)
+	r.WorkerNamespace = testWorkerNS
+	api.membersErr = errors.New("down")
+	reconcileCluster(t, r) // not made yet: nothing to copy, no error
+	ctx := context.Background()
+	src := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "prod-federation", Namespace: testNS},
+		Data: map[string][]byte{FederationKeyKey: []byte("a-key"), "notes": []byte("not copied")}}
+	if err := cl.Create(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCluster(t, r)
+	var dst corev1.Secret
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: testWorkerNS, Name: "prod-federation"}, &dst); err != nil {
+		t.Fatal(err)
+	}
+	if len(dst.Data) != 1 || string(dst.Data[FederationKeyKey]) != "a-key" {
+		t.Fatalf("copy = %v", dst.Data)
 	}
 }

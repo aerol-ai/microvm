@@ -260,6 +260,17 @@ cluster:
   version: ""
   # This cluster's number, 1 to 255, in every new sandbox ID (C12).
   cell: 1
+  # This cell as one of several (C16; docs: Many cells). The SDKs reach a
+  # sandbox at the cell that holds it. idKeySecret names a Secret in this
+  # namespace whose key "key" is the federation's ID key: make it with
+  # openssl rand -base64 32, use the same one in every cell, and never
+  # change it. cells is every other cell's API address by number. Set both
+  # before the first sandbox. For example:
+  #   idKeySecret: aerolvm-federation
+  #   cells: { "2": "https://cell2.example.com" }
+  federation:
+    idKeySecret: ""
+    cells: {}
   # The zones to spread over, such as [eu-west-1a, eu-west-1b, eu-west-1c].
   # Servers go one per zone; gateways and workers spread across them.
   zones: []
