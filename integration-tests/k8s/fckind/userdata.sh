@@ -49,10 +49,19 @@ proof_move() {
     for w in $($kw get pods -o name | head -2); do
       $kw describe $w 2>&1 | grep -A12 -E '^\s*(State|Last State):' | head -30 | sed "s|^|FCK   ${w#pod/} describe: |"
       $kw logs $w -c preflight 2>&1 | tail -8 | sed "s|^|FCK   ${w#pod/} preflight: |"
+      { $kw logs $w -c setup 2>&1; $kw logs $w -c setup --previous 2>&1; } | tail -12 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} setup: |"
       $kw logs $w -c agent 2>&1 | tail -15 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent: |"
       $kw logs $w -c agent --previous 2>&1 | tail -10 | cut -c1-300 | sed "s|^|FCK   ${w#pod/} agent (previous): |"
     done
-    $kc logs deploy/aerolvm-operator 2>&1 | grep -iE 'worker|general|error|fail' | tail -15 | cut -c1-300 | sed 's/^/FCK   operator: /'
+    $kc logs deploy/aerolvm-operator 2>&1 | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("level") == "error":
+        print((d.get("AerolNode") or d.get("AerolCluster") or {}).get("name", "?"), d.get("error", "")[:240])' | sort | uniq -c | tail -8 | sed 's/^/FCK   operator error: /'
     return
   fi
   local out id owner owner2 i

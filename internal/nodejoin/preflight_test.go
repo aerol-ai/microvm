@@ -46,18 +46,23 @@ func TestCheckKVM(t *testing.T) {
 	dir := t.TempDir()
 	present := filepath.Join(dir, "kvm")
 	mustWrite(t, present, "")
+	none := filepath.Join(dir, "none")
 	cases := []struct {
-		name   string
-		device string
-		fc     bool
-		want   CheckStatus
+		name          string
+		device, sysfs string
+		fc            bool
+		want          CheckStatus
 	}{
-		{"Firecracker off", filepath.Join(dir, "none"), false, StatusOK},
-		{"Firecracker on, device there", present, true, StatusOK},
-		{"Firecracker on, no device", filepath.Join(dir, "none"), true, StatusFail},
+		{"Firecracker off", none, none, false, StatusOK},
+		{"Firecracker on, device there", present, none, true, StatusOK},
+		{"Firecracker on, no device", none, none, true, StatusFail},
+		{"Firecracker on, no device, no sysfs path", none, "", true, StatusFail},
+		// The worker pod's setup: unprivileged, so no /dev/kvm, on a
+		// machine that has it (F34).
+		{"Firecracker on, the machine's device in sysfs", none, present, true, StatusOK},
 	}
 	for _, tc := range cases {
-		c := checkKVM(Paths{KVMDevice: tc.device}, tc.fc)
+		c := checkKVM(Paths{KVMDevice: tc.device, KVMSysfs: tc.sysfs}, tc.fc)
 		if c.Status != tc.want || (tc.want == StatusFail && !strings.Contains(c.Fix, "metal")) {
 			t.Fatalf("%s: %+v", tc.name, c)
 		}

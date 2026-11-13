@@ -115,18 +115,28 @@ func checkCgroup(p Paths, firecracker bool) Check {
 	return c
 }
 
-// checkKVM fails only on a Firecracker node with no /dev/kvm.
+// checkKVM fails only on a Firecracker node whose machine has no kvm
+// device. A container that cannot open the device still sees the machine's
+// sysfs entry for it: the Kubernetes worker's setup, which runs this join
+// unprivileged with the agent's settings, Firecracker's included (F34;
+// the pod preflight before it reads sysfs the same way, checkKVMSysfs).
 func checkKVM(p Paths, firecracker bool) Check {
 	c := Check{Name: "kvm", Status: StatusOK, Detail: "Firecracker is off on this node"}
 	if !firecracker {
 		return c
 	}
-	if _, err := os.Stat(p.KVMDevice); err != nil {
-		c.Status, c.Detail = StatusFail, p.KVMDevice+" is missing and this node runs Firecracker"
-		c.Fix = "use a metal or nested-virt machine, or turn Firecracker off (SB_ENABLE_FIRECRACKER=false)"
+	if _, err := os.Stat(p.KVMDevice); err == nil {
+		c.Detail = p.KVMDevice + " is present"
 		return c
 	}
-	c.Detail = p.KVMDevice + " is present"
+	if p.KVMSysfs != "" {
+		if _, err := os.Stat(p.KVMSysfs); err == nil {
+			c.Detail = "this machine has " + p.KVMDevice + " (" + p.KVMSysfs + "); this container cannot open it"
+			return c
+		}
+	}
+	c.Status, c.Detail = StatusFail, p.KVMDevice+" is missing and this node runs Firecracker"
+	c.Fix = "use a metal or nested-virt machine, or turn Firecracker off (SB_ENABLE_FIRECRACKER=false)"
 	return c
 }
 
