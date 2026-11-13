@@ -46,6 +46,7 @@ func TestKubernetesImagePins(t *testing.T) {
 	sha512Hex := regexp.MustCompile(`^[0-9a-f]{128}$`)
 	for _, c := range []struct{ name, hash string }{
 		{"CONTAINERD", "SHA256"}, {"RUNC", "SHA256"}, {"CNI_PLUGINS", "SHA256"}, {"GVISOR", "SHA512"}, {"WORKERD", "SHA256"},
+		{"FIRECRACKER", "SHA256"}, {"FIRECRACKER_KERNEL", "SHA256"},
 	} {
 		version := pins[c.name+"_VERSION"] + pins[c.name+"_RELEASE"]
 		if version == "" {
@@ -141,6 +142,34 @@ func TestWorkerdPinMatchesInstallScript(t *testing.T) {
 		"WORKERD_VERSION":            pins["WORKERD_VERSION"],
 		"WORKERD_SHA256_LINUX_64":    pins["WORKERD_SHA256_AMD64"],
 		"WORKERD_SHA256_LINUX_ARM64": pins["WORKERD_SHA256_ARM64"],
+	} {
+		m := regexp.MustCompile(`(?m)^` + key + `="([^"]*)"`).FindStringSubmatch(script)
+		if m == nil || want == "" || m[1] != want {
+			t.Errorf("install.sh %s = %v, versions.env has %q", key, m, want)
+		}
+	}
+}
+
+// Firecracker pools run the Firecracker, jailer and guest kernel that
+// scripts/install.sh --with-firecracker installs on a VM.
+func TestFirecrackerPinsMatchInstallScript(t *testing.T) {
+	root := repoRoot(t)
+	pins := readVersionsEnv(t, root)
+	raw, err := os.ReadFile(filepath.Join(root, "scripts", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	for key, want := range map[string]string{
+		"FIRECRACKER_VERSION":                      pins["FIRECRACKER_VERSION"],
+		"FIRECRACKER_KERNEL_CI_VERSION":            pins["FIRECRACKER_KERNEL_CI_VERSION"],
+		"FIRECRACKER_KERNEL_VERSION":               pins["FIRECRACKER_KERNEL_VERSION"],
+		"FIRECRACKER_SHA256_X86_64":                pins["FIRECRACKER_SHA256_AMD64"],
+		"FIRECRACKER_SHA256_AARCH64":               pins["FIRECRACKER_SHA256_ARM64"],
+		"FIRECRACKER_KERNEL_SHA256_X86_64":         pins["FIRECRACKER_KERNEL_SHA256_AMD64"],
+		"FIRECRACKER_KERNEL_SHA256_AARCH64":        pins["FIRECRACKER_KERNEL_SHA256_ARM64"],
+		"FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64":  pins["FIRECRACKER_KERNEL_CONFIG_SHA256_AMD64"],
+		"FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64": pins["FIRECRACKER_KERNEL_CONFIG_SHA256_ARM64"],
 	} {
 		m := regexp.MustCompile(`(?m)^` + key + `="([^"]*)"`).FindStringSubmatch(script)
 		if m == nil || want == "" || m[1] != want {

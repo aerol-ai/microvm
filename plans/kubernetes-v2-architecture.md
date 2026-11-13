@@ -692,7 +692,7 @@ them over (`pkg/hostproc`; `internal/runtime/wasm/adopt.go`,
 `internal/runtime/isolate/adopt.go`). In the pod, the same code must target the
 `runtime` container's cgroup, and the pod must share one process namespace, or
 an `agent` restart kills them with the container (C14). They come in
-Phase 5, after gVisor works: WASM and V8 isolates first ("Phase 5 results").
+Phase 5, after gVisor works: WASM, V8 isolates and Firecracker ("Phase 5 results").
 
 ## 9. The control plane inside one cell
 
@@ -2173,9 +2173,24 @@ not already carry):
   Bidirectional like the network namespaces, and the runtime container's
   supervisor unmounts them when the pod ends; deleting the pod took 3 s
   and left no mount on the node.
-- Left in Phase 5: Firecracker needs its binaries and kernel in the agent
-  image and a machine with `/dev/kvm` (the Firecracker pools item, nested
-  virtualization from S6).
+- **Firecracker in the worker pod** (2026-11-13, `integration-tests/k8s/fckind.sh`:
+  kind on one EC2 m8i.2xlarge with nested virtualization, S6's setting; runs
+  `p5-fc-1` to `-4`, about $0.60). The agent image ships Firecracker v1.15.1,
+  its jailer, the guest kernel 5.10.245 and the tools that turn an image into
+  a VM's disk (the releases `install.sh` pins); `worker.firecracker.enabled`
+  turns it on. The worker preflight found `/dev/kvm` through the machine's
+  sysfs (its unprivileged container has no `/dev/kvm`, and the pod takes no
+  host folder). A cold create, image to disk, took 1.6 s; a command in the VM
+  answered; the agent container was stopped and came back, and the same VM
+  (in `sandboxes/aerolvm-vmm`) ran on, taken over by the next `sandboxd`, its
+  guest boot ID unchanged.
+- F33. The first create failed: "Open tap device failed ... Operation not
+  permitted". The jailed VM runs as the jailer's user, which on kernel 6.18
+  may attach only to a TAP it owns, and ours had no owner. With the jailer
+  on, each TAP is now made for the jailer's user and group, as Firecracker's
+  own setup does. VMs on plain machines take the same change.
+- Next in Phase 5: snapshot moves during decommission (Firecracker with its
+  memory), then C21.
 
 ## 19. Tests, drills and benchmarks
 

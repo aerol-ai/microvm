@@ -495,6 +495,7 @@ Set these with `--set` or a values file.
 | `worker.usageMetrics.enabled` | [Usage per team](#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |
 | `worker.wasm.enabled` | Run WASM sandboxes on workers. The worker pod then shares one process namespace, so WASM sandboxes keep running while the `agent` container restarts or is upgraded. Every container in the pod can then see the others' processes, not their files or settings. | `false` |
 | `worker.isolate.enabled` | Run [V8 isolate sandboxes](/isolate-sandbox/) on workers. The agent image includes workerd. As with WASM, the worker pod then shares one process namespace, so they keep running while the `agent` container restarts. | `false` |
+| `worker.firecracker.enabled` | Run Firecracker microVM sandboxes on workers. Only on machines with `/dev/kvm`: metal, or on EKS an m7i, c7i, r7i, m8i, c8i or r8i machine with nested virtualization on. A worker on a machine without it does not start, and its preflight says why. As with WASM, VMs keep running while the `agent` container restarts. | `false` |
 | `worker.egressDenyFloor` | [Addresses no sandbox can ever reach](#tell-aerolvm-your-clusters-addresses), such as the Kubernetes API server. | none |
 | `worker.egressPrivateRanges` | Your cluster's pod, Service and node ranges. Sandboxes cannot reach them unless an egress profile opens one. Needs `worker.blockPrivateByDefault`. | none |
 | `networkPolicy.enabled` | Give the worker pod an egress NetworkPolicy. | `true` |

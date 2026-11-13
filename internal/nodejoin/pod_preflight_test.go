@@ -39,7 +39,7 @@ func TestPodPreflight(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			p := Paths{CgroupRoot: dir, KVMDevice: filepath.Join(dir, "kvm"), OSRelease: filepath.Join(dir, "osrelease"),
+			p := Paths{CgroupRoot: dir, KVMSysfs: filepath.Join(dir, "kvm"), OSRelease: filepath.Join(dir, "osrelease"),
 				BridgeNF: filepath.Join(dir, "bridge-nf-call-iptables")}
 			write := func(path, body string) {
 				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -53,7 +53,7 @@ func TestPodPreflight(t *testing.T) {
 				write(p.BridgeNF, "1\n")
 			}
 			if tc.m.kvm {
-				write(p.KVMDevice, "")
+				write(p.KVMSysfs, "")
 			}
 			if tc.m.release != "" {
 				write(p.OSRelease, tc.m.release)
