@@ -143,7 +143,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.Auth.Authenticate(r)
-	if err != nil {
+	if err != nil && !(errors.Is(err, ErrNoUser) && discoveryPath(path)) {
 		writeStatus(w, &StatusError{Code: http.StatusUnauthorized, Reason: "Unauthorized", Message: err.Error()})
 		return
 	}
@@ -903,4 +903,17 @@ func randomSuffix() string {
 		b[i] = suffixAlphabet[int(b[i])%len(suffixAlphabet)]
 	}
 	return string(b)
+}
+
+// discoveryPath is a discovery or OpenAPI document: what the
+// kube-apiserver's health check of the APIService reads, sent with its
+// front-proxy certificate and no user.
+func discoveryPath(path string) bool {
+	switch path {
+	case "/apis", "/apis/" + Group, "/apis/" + Group + "/" + Version,
+		"/apis/" + ExtensionsGroup, "/apis/" + ExtensionsGroup + "/" + Version,
+		"/openapi/v2", "/openapi/v3":
+		return true
+	}
+	return false
 }

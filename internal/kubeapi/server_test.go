@@ -623,3 +623,26 @@ func TestServerWatchSendsHeadersAtOnce(t *testing.T) {
 		resp.Body.Close()
 	}
 }
+
+// noUserAuth is the kube-apiserver's own health check: a trusted
+// certificate, no user.
+type noUserAuth struct{}
+
+func (noUserAuth) Authenticate(*http.Request) (User, error) { return User{}, ErrNoUser }
+
+func TestDiscoveryWithoutAUser(t *testing.T) {
+	r := newRig(t)
+	r.srv.Auth = noUserAuth{}
+	for _, path := range []string{"/apis", "/apis/agents.x-k8s.io", base, ext, "/openapi/v2"} {
+		rr := httptest.NewRecorder()
+		r.srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Errorf("%s = %d", path, rr.Code)
+		}
+	}
+	rr := httptest.NewRecorder()
+	r.srv.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, base+"/namespaces/a/sandboxes", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("a resource without a user = %d", rr.Code)
+	}
+}

@@ -225,6 +225,40 @@ YAML
     sleep 5
   done
   say "after delete: $($kk -n dev get sandboxes 2>&1 | head -c 200)"
+  # The claim flow: a template, a warm pool, a claim that makes a sandbox.
+  say "template and pool: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata: { name: python, namespace: dev }
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      containers:
+        - name: main
+          image: python:3.12-alpine
+          command: ["sleep", "infinity"]
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata: { name: pool, namespace: dev }
+spec: { replicas: 1, sandboxTemplateRef: { name: python } }
+YAML
+)"
+  say "claim: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata: { name: job, namespace: dev }
+spec:
+  warmPoolRef: { name: pool }
+  env: [{ name: TASK, value: proof }]
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandboxclaim/job --timeout=240s 2>&1 | sed 's/^/FCK wait claim: /'
+  say "claims: $($kk -n dev get sandboxclaims 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  say "its sandbox: $($kk -n dev get sandbox job -o jsonpath='{.metadata.labels}' 2>&1 | head -c 300)"
+  say "templates and pools: $($kk -n dev get sandboxtemplates,sandboxwarmpools --no-headers 2>&1 | tr -s ' ' | tr '\n' ';' | head -c 300)"
+  say "claim delete: $($kk -n dev delete sandboxclaim job --timeout=120s 2>&1 | head -c 200)"
   [ "$ok" = 1 ] || return
   dumpapi
 }
