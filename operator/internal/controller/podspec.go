@@ -250,6 +250,9 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	}
 
 	setEnv(&pod.Spec, AgentContainer, nodeEnv(in))
+	if externalCA(c) {
+		useNodeCert(&pod.Spec, n.Name, in.Maintenance)
+	}
 	addCreatePolicy(&pod.Spec, in.Cluster)
 	addFederation(&pod.Spec, in.Cluster)
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
@@ -324,10 +327,18 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 	agent := spec.Containers[containerIndex(spec.Containers, AgentContainer)]
 	n := in.Node
 	role := sandboxdRole(n.Spec.Role)
+	ext := externalCA(in.Cluster)
 	var cmd string
-	if in.Bootstrap {
+	switch {
+	case in.Bootstrap && ext:
+		cmd = fmt.Sprintf(`exec sandboxd init --files-only --external-ca --role %s --node-id %s --advertise "%s"`, role, n.Name, advertise(in))
+	case in.Bootstrap:
 		cmd = fmt.Sprintf(`exec sandboxd init --files-only --role %s --node-id %s --advertise "%s"`, role, n.Name, advertise(in))
-	} else {
+	case ext:
+		// The certificate in the TLS dir is the credential: no token, no
+		// CA hash (the bank's CA beside it is the trust).
+		cmd = fmt.Sprintf(`exec sandboxd join %s --by-certificate --role %s --node-id %s --advertise "%s" --files-only`, joinServiceURL(in.Cluster), role, n.Name, advertise(in))
+	default:
 		cmd = fmt.Sprintf(`exec sandboxd join "$(cat /var/run/aerolvm-join/join_url)" --token "$(cat /var/run/aerolvm-join/token)" --ca-cert-hash "$(cat /var/run/aerolvm-join/ca_cert_hash)" --role %s --node-id %s --advertise "%s" --files-only`, role, n.Name, advertise(in))
 		// By key, so the pod gets exactly the three things a join needs,
 		// and aerolvm k8s verify can see that (it cannot read Secrets).
@@ -356,7 +367,7 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		VolumeMounts:    setupMounts(agent.VolumeMounts),
 		SecurityContext: setupSecurity(agent.SecurityContext),
 	}
-	if !in.Bootstrap {
+	if !in.Bootstrap && !ext {
 		setup.VolumeMounts = append(append([]corev1.VolumeMount{}, setup.VolumeMounts...),
 			corev1.VolumeMount{Name: JoinVolume, MountPath: "/var/run/aerolvm-join", ReadOnly: true})
 	}
@@ -367,14 +378,15 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 
 // setupMounts are the agent's folders setup writes: the node's settings and
 // cluster files (etc), its state (a server's Raft folder, which init checks)
-// and scratch space where the agent has its own. Never the sandbox
+// and scratch space where the agent has its own. In external-CA mode, also
+// the certificate setup joins with (read only). Never the sandbox
 // machinery a worker's agent mounts (containerd's folders, the two-way
 // netns mount, which only a privileged container may have).
 func setupMounts(agent []corev1.VolumeMount) []corev1.VolumeMount {
 	var out []corev1.VolumeMount
 	for _, m := range agent {
 		switch m.Name {
-		case EtcVolume, StateVolume, "tmp":
+		case EtcVolume, StateVolume, TLSVolume, "tmp":
 			out = append(out, m)
 		}
 	}

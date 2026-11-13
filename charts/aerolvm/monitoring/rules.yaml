@@ -287,16 +287,17 @@ groups:
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmjointokenerrors"
 
       # §19: external-CA certificates pending. In external-CA mode the
-      # bank's issuer signs node certificates through cert-manager.
+      # bank's issuer signs node certificates through cert-manager; a node
+      # gets no pod until its certificate is ready (C23).
       - alert: AerolVMNodeCertificateFailing
-        expr: sum by (namespace) (increase(aerolvm_operator_cert_renewal_failures_total[15m])) > 0
+        expr: max by (namespace) (aerolvm_operator_node_certificates_pending) > 0
         for: 10m
         labels:
           severity: warning
           component: identity
         annotations:
-          summary: "The AerolVM operator cannot get node certificates"
-          description: "Node certificate requests have failed for over 10 minutes. Running nodes keep working until their certificates expire; new nodes cannot join. The AerolNode condition CertificatePending says which request waits."
+          summary: "{{ $value }} AerolVM node(s) have waited over 10 minutes for their certificates"
+          description: "A node certificate has waited for the issuer for over 10 minutes. Running nodes keep working until their certificates expire; new nodes cannot join. The AerolNode condition CertificatePending says which request waits and why."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmnodecertificatefailing"
 
   # Upgrades (C13). The rollout gauges come from the Raft state, so every

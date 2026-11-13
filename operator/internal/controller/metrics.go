@@ -37,6 +37,10 @@ var (
 		Name: "aerolvm_operator_maintenance_servers",
 		Help: "Servers held in maintenance mode (C22).",
 	})
+	nodeCertsPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aerolvm_operator_node_certificates_pending",
+		Help: "AerolNodes whose certificate waits for the bank's issuer (external-CA mode, C23); they have no pod yet.",
+	})
 	certRenewalFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aerolvm_operator_cert_renewal_failures_total",
 		Help: "Times the edge certificate was seen not ready after it had been issued (C25).",
@@ -45,5 +49,5 @@ var (
 
 func init() {
 	metrics.Registry.MustRegister(reconcileErrors, nodeStates, workerPodsLost, decommissionSeconds,
-		upgradeStepFailures, joinTokenErrors, maintenanceServers, certRenewalFailures)
+		upgradeStepFailures, joinTokenErrors, maintenanceServers, nodeCertsPending, certRenewalFailures)
 }

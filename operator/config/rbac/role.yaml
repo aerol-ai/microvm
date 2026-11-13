@@ -58,6 +58,14 @@ rules:
   - patch
   - update
 - apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
   - karpenter.sh
   resources:
   - nodeclaims

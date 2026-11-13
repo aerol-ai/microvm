@@ -71,6 +71,7 @@ var operatorMetrics = []string{
 	"aerolvm_operator_upgrade_step_failures_total",
 	"aerolvm_operator_join_token_errors_total",
 	"aerolvm_operator_maintenance_servers",
+	"aerolvm_operator_node_certificates_pending",
 	"aerolvm_operator_cert_renewal_failures_total",
 }
 

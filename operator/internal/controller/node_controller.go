@@ -74,6 +74,7 @@ type NodeReconciler struct {
 // +kubebuilder:rbac:groups="",namespace=default,resources=services,resourceNames=kubernetes,verbs=get
 // +kubebuilder:rbac:groups=discovery.k8s.io,namespace=default,resources=endpointslices,resourceNames=kubernetes,verbs=get
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=servicecidrs,verbs=list
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;create;delete
 
 func (r *NodeReconciler) podNamespace(role string) string {
 	if role == v1.RoleWorker && r.WorkerNamespace != "" {
@@ -105,7 +106,14 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	}
 	if n.Status.State == v1.StateRemoved {
 		// Nothing left: the object goes too, which also tells the cluster
-		// controller the slot is free.
+		// controller the slot is free. Every way a node leaves comes
+		// here, so its certificate goes here too: the next node gets a
+		// new name and a new certificate.
+		if externalCA(&c) {
+			if err := r.removeNodeCert(ctx, r.podNamespace(n.Spec.Role), n.Name); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &n))
 	}
 	token, err := r.adminToken(ctx, &c)
@@ -211,8 +219,9 @@ func (r *NodeReconciler) setState(n *v1.AerolNode, state, reason string) {
 	n.Status.State, n.Status.Reason = state, reason
 }
 
-// createPod makes the node's pod: its join token first (C23), then the pod
-// from its role's template.
+// createPod makes the node's pod: its identity first (C23), a join token
+// or, in external-CA mode, its certificate; then the pod from its role's
+// template.
 func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, api AerolAPI) (ctrl.Result, error) {
 	bootstrap := n.Spec.Role == v1.RoleServer && n.Name == ServerName(c.Name, 0) &&
 		!meta.IsStatusConditionTrue(c.Status.Conditions, CondBootstrapped)
@@ -220,7 +229,23 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	maint := n.Spec.Role == v1.RoleServer && n.Annotations[v1.AnnotationMaintenance] == "true"
 	// A maintenance pod runs no setup, so it needs no token: it is how a
 	// cluster that lost quorum is repaired, when no token can be minted.
-	if !bootstrap && !maint {
+	switch {
+	case externalCA(c) && !maint:
+		// Every pod, server 0 too, starts with its certificate in place:
+		// init and join read it, and nothing else can make one.
+		why, err := r.ensureNodeCert(ctx, c, n, ns)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if why != "" {
+			r.certificatePending(n, why)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		meta.RemoveStatusCondition(&n.Status.Conditions, CondCertificatePending)
+	case externalCA(c):
+		// A maintenance pod runs no sandboxd: it mounts the certificate
+		// if it is there and never waits for the issuer.
+	case !bootstrap && !maint:
 		if err := r.ensureJoinSecret(ctx, c, n, ns, api); err != nil {
 			joinTokenErrors.Inc()
 			if n.Spec.Role != v1.RoleServer {
@@ -335,10 +360,12 @@ func (r *NodeReconciler) ensureJoinSecret(ctx context.Context, c *v1.AerolCluste
 // observe sets the node's state from its pod and from AerolVM.
 func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
 	n.Status.PodName, n.Status.NodeName = pod.Name, pod.Spec.NodeName
-	if n.Spec.Role == v1.RoleServer && setupHasFailed(pod) {
+	if n.Spec.Role == v1.RoleServer && setupHasFailed(pod) && !externalCA(c) {
 		// A server made without a token (createPod) whose disk held no
 		// identity: mint one now that a leader may be back. The kubelet
 		// puts it in the pod's optional volume before setup's next try.
+		// In external-CA mode its certificate is its identity, and setup
+		// retries the join with it by itself.
 		if err := r.ensureJoinSecret(ctx, c, n, pod.Namespace, api); err != nil {
 			joinTokenErrors.Inc()
 		}
@@ -636,8 +663,8 @@ func (r *NodeReconciler) endPod(ctx context.Context, n *v1.AerolNode, pod *corev
 }
 
 // cleanup deletes what lives outside the AerolNode's namespace: a worker's
-// pod and join token in the worker namespace, which no owner reference can
-// reach across namespaces.
+// pod, join token and certificate in the worker namespace, which no owner
+// reference can reach across namespaces.
 func (r *NodeReconciler) cleanup(ctx context.Context, n *v1.AerolNode) error {
 	if r.podNamespace(n.Spec.Role) == n.Namespace {
 		return nil
@@ -646,12 +673,27 @@ func (r *NodeReconciler) cleanup(ctx context.Context, n *v1.AerolNode) error {
 	if err := client.IgnoreNotFound(r.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: n.Name, Namespace: ns}})); err != nil {
 		return err
 	}
-	return client.IgnoreNotFound(r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: JoinSecret(n.Name), Namespace: ns}}))
+	if err := client.IgnoreNotFound(r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: JoinSecret(n.Name), Namespace: ns}})); err != nil {
+		return err
+	}
+	return r.sweepCert(ctx, ns, n.Name)
 }
 
-// sweepGone removes a deleted worker AerolNode's pod and join Secret. They
-// live in the worker namespace, where no owner reference reaches (an owner
-// must share its namespace), so the garbage collector never takes them.
+// sweepCert removes a worker's certificate from the worker namespace when
+// its Secret is there (read from the cache, so a token-mode cluster makes
+// no API call for it).
+func (r *NodeReconciler) sweepCert(ctx context.Context, ns, name string) error {
+	var s corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: NodeCert(name)}, &s); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return r.removeNodeCert(ctx, ns, name)
+}
+
+// sweepGone removes a deleted worker AerolNode's pod, join Secret and
+// certificate. They live in the worker namespace, where no owner reference
+// reaches (an owner must share its namespace), so the garbage collector
+// never takes them.
 // No finalizer: helm uninstall deletes the operator and the AerolCluster at
 // once, and a finalizer would then hold every AerolNode's deletion forever.
 // The pod watch maps each worker pod back here when the operator starts,
@@ -664,9 +706,11 @@ func (r *NodeReconciler) sweepGone(ctx context.Context, name string) error {
 	var pod corev1.Pod
 	podLeft := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &pod) == nil &&
 		pod.Labels[LabelNode] == name && pod.DeletionTimestamp == nil
-	var secret corev1.Secret
+	var secret, cert corev1.Secret
 	secretLeft := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: JoinSecret(name)}, &secret) == nil
-	if !podLeft && !secretLeft {
+	certLeft := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: NodeCert(name)}, &cert) == nil &&
+		cert.Labels[LabelNode] == name
+	if !podLeft && !secretLeft && !certLeft {
 		return nil // the usual case: costs no API call
 	}
 	// The cache can be behind: only the API server may say the node is gone.
@@ -681,7 +725,12 @@ func (r *NodeReconciler) sweepGone(ctx context.Context, name string) error {
 		log.FromContext(ctx).Info("removed the pod of a deleted AerolNode", "pod", ns+"/"+name)
 	}
 	if secretLeft {
-		return client.IgnoreNotFound(r.Delete(ctx, &secret))
+		if err := client.IgnoreNotFound(r.Delete(ctx, &secret)); err != nil {
+			return err
+		}
+	}
+	if certLeft {
+		return r.removeNodeCert(ctx, ns, name)
 	}
 	return nil
 }
