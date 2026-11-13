@@ -213,8 +213,11 @@ func TestClaimWatch(t *testing.T) {
 				}
 			}
 		}()
-		// A plain sandbox, then a claim: only the claim is an event.
+		// A plain sandbox, then a claim: only the claim is an event. The
+		// plain one is marked no claim on its row, so its spec is never
+		// read.
 		plain := p("sb-p"+path[:3], "plain2", "team:a", 60)
+		plain.KubeClaim = cluster.KubeClaimNo
 		r.hub.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{{SandboxID: plain.SandboxID, Index: 60, Placement: &plain}}, Next: 60})
 		name := "w" + string(rune('a'+len(r.be.created)))
 		if rr, _ := r.call(t, http.MethodPost, ext+"/namespaces/a/sandboxclaims", strings.Replace(claimBody, `"job"`, `"`+name+`"`, 1)); rr.Code != http.StatusCreated {
@@ -229,6 +232,13 @@ func TestClaimWatch(t *testing.T) {
 			t.Fatalf("%s: event = %v", path, ev)
 		}
 		resp.Body.Close()
+		r.be.mu.Lock()
+		for _, id := range r.be.specIDs {
+			if id == plain.SandboxID {
+				t.Errorf("%s: the watch read the spec of a row marked no claim", path)
+			}
+		}
+		r.be.mu.Unlock()
 	}
 	for q, code := range map[string]int{"?watch=true&resourceVersion=x": 400, "?watch=true&resourceVersion=1": 410} {
 		if rr, _ := r.call(t, http.MethodGet, ext+"/namespaces/a/sandboxclaims"+q, ""); rr.Code != code {
