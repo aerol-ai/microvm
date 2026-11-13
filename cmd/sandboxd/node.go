@@ -75,6 +75,10 @@ a join command and a login line. Run install.sh first. Safe to run again.
                               no systemd, no restart (a Kubernetes init
                               container); run init again once sandboxd is
                               up to admit this node and make join tokens
+  --external-ca               with --files-only: start an external-CA
+                              cluster; the TLS dir already holds the bank's
+                              CA and this node's cert-manager certificate
+                              (aerolvm-role:server), so no CA is made
 `
 
 const joinUsage = `usage: sudo sandboxd join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>]
@@ -98,6 +102,10 @@ answer.
   --ingress-advertise-host <h>
                               as cluster-join.sh's flags of the same names
   --wait-timeout <dur>        how long to wait to be a member (default 3m)
+  --by-certificate            external-CA mode: join with the certificate
+                              already in the TLS dir (ca.crt, node.crt and
+                              node.key, from cert-manager); no token. The
+                              node ID and role are the certificate's
   --files-only                write this node's files and stop: no root,
                               no systemd, no restart (a Kubernetes init
                               container); sandboxd joins as it starts
@@ -179,6 +187,8 @@ type nodeFlags struct {
 	reusable, json                    bool
 	filesOnly                         bool
 	pod, kvm                          bool
+	byCert                            bool
+	externalCA                        bool
 }
 
 func (f *nodeFlags) address() nodejoin.AddressOptions {
@@ -226,12 +236,14 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 	switch cmd {
 	case initSubcommand:
 		fs.Var(&f.tokens, "token", "")
+		fs.BoolVar(&f.externalCA, "external-ca", false, "")
 		fs.StringVar(&f.custody, "key-custody", "", "")
 		fs.StringVar(&f.gossipKey, "gossip-key", "", "")
 		fs.StringVar(&f.installer, "installer-url", "", "")
 	case joinSubcommand:
 		fs.StringVar(&f.token, "token", "", "")
 		fs.StringVar(&f.caHash, "ca-cert-hash", "", "")
+		fs.BoolVar(&f.byCert, "by-certificate", false, "")
 	}
 	var positional []string
 	rest := args
@@ -298,16 +310,19 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 		_, err = in.Run(ctx, nodejoin.InitOptions{
 			NodeID: f.nodeID, Advertise: f.advertise, Address: f.address(), Tokens: specs, KeyCustody: f.custody,
 			GossipKey: f.gossipKey, WaitTimeout: f.waitTimeout, InstallerURL: f.installer, FilesOnly: f.filesOnly,
+			ExternalCA: f.externalCA,
 		})
 	case joinSubcommand:
-		if strings.TrimSpace(f.token) == "" {
-			fmt.Fprintf(stderr, "sandboxd join: --token is required\n%s", usage)
+		// --by-certificate (external-CA mode) joins with the certificate in
+		// the TLS dir instead of a token.
+		if strings.TrimSpace(f.token) == "" && !f.byCert {
+			fmt.Fprintf(stderr, "sandboxd join: --token is required (or --by-certificate in external-CA mode)\n%s", usage)
 			return 2
 		}
 		j := &nodejoin.Joiner{Paths: paths, Host: host, Version: version.Version, Printer: printer, LocalAPI: nodeLocalAPI}
 		_, err = j.Run(ctx, nodejoin.JoinOptions{
 			URL: positional[0], Token: f.token, CACertHash: f.caHash, NodeID: f.nodeID, Advertise: f.advertise,
-			Address: f.address(), WaitTimeout: f.waitTimeout, FilesOnly: f.filesOnly,
+			Address: f.address(), WaitTimeout: f.waitTimeout, FilesOnly: f.filesOnly, ByCertificate: f.byCert,
 		})
 	case adoptSubcommand:
 		a := &nodejoin.Adopter{Paths: paths, Host: host, Printer: printer, LocalAPI: nodeLocalAPI}

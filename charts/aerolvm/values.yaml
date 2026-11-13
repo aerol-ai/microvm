@@ -338,6 +338,14 @@ cluster:
   #   runtimes: [gvisor]
   #   limits: { max_cpu: 4, max_memory_mb: 8192, max_disk_gb: 50 }
   createPolicy: {}
+  # External-CA mode (C23): every node's certificate comes from your issuer
+  # through cert-manager, and no CA key enters the cluster. The issuer must
+  # return its CA as ca.crt (a cert-manager CA, Vault or private-CA issuer
+  # does). Set it when you install: it cannot be turned on or off once the
+  # cluster has started. For example:
+  #   issuerRef: { kind: ClusterIssuer, name: bank-ca }
+  externalCA:
+    issuerRef: {}
   operator:
     replicas: 2
     resources:

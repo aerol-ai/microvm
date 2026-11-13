@@ -136,3 +136,66 @@ func (c *Cluster) refuseInExternalCAMode() error {
 	}
 	return nil
 }
+
+// adoptSelfByCert is Adopt in external-CA mode: there is no CA key to
+// fetch, and every other node joins by its own certificate, so the seed
+// admits itself the same way, by the certificate it serves. The operator
+// calls it once the seed leads; running it again changes nothing.
+func (c *Cluster) adoptSelfByCert(ctx context.Context) (AdoptResponse, error) {
+	out := AdoptResponse{ClusterID: c.externalCAClusterID(), CASource: "external", Admitted: []string{}, Already: []string{}, Skipped: map[string]string{}}
+	if c.tls == nil {
+		return out, ErrJoinCertRequired
+	}
+	pair, err := c.tls.certificateForHandshake()
+	if err != nil {
+		return out, err
+	}
+	leaf, err := leafCertificate(pair)
+	if err != nil {
+		return out, err
+	}
+	nodeID, role, err := certJoinIdentity(leaf)
+	if err != nil {
+		return out, err
+	}
+	keyHash, err := PublicKeyHash(leaf.PublicKey)
+	if err != nil {
+		return out, err
+	}
+	written, err := c.WriteJoin(ctx, JoinWriteRequest{Kind: joinWriteAdmitByCert, Admit: &JoinAdmitCommand{
+		NodeID: nodeID, Role: role, KeyHash: keyHash, NotAfterUnixNano: leaf.NotAfter.UnixNano(),
+	}})
+	if err != nil {
+		return out, err
+	}
+	if written.Admit != nil && written.Admit.Replay {
+		out.Already = append(out.Already, nodeID)
+	} else {
+		out.Admitted = append(out.Admitted, nodeID)
+	}
+	if c.logger != nil {
+		c.logger.Info("cluster: seed admitted by its certificate", "node_id", nodeID, "role", role, "already", len(out.Already) > 0)
+	}
+	return out, nil
+}
+
+// selfKeyHash is the key hash of the certificate this server serves with,
+// or "" when it has none.
+func (c *Cluster) selfKeyHash() string {
+	if c.tls == nil {
+		return ""
+	}
+	pair, err := c.tls.certificateForHandshake()
+	if err != nil {
+		return ""
+	}
+	leaf, err := leafCertificate(pair)
+	if err != nil {
+		return ""
+	}
+	h, err := PublicKeyHash(leaf.PublicKey)
+	if err != nil {
+		return ""
+	}
+	return h
+}
