@@ -271,7 +271,7 @@ func (h *Hub) recordLocked(e ringEntry) {
 // it is closed: dropping events would leave its cache wrong for good.
 func (h *Hub) sendLocked(owner string, ev Event) {
 	for w := range h.watchers {
-		if w.owner != owner {
+		if w.owner != AllOwners && w.owner != owner {
 			continue
 		}
 		select {
@@ -352,8 +352,11 @@ func (h *Hub) List(owner, after string, limit int) (items []Item, rv uint64, mor
 	return items, h.position, more, nil
 }
 
-// Watch streams owner's changes after resourceVersion from. From 0 starts
-// with every current sandbox as Added. Cancel ctx to stop; the channel is
+// AllOwners watches every owner's sandboxes (a watch across namespaces).
+const AllOwners = ""
+
+// Watch streams owner's changes after resourceVersion from (AllOwners: every
+// owner's). From 0 starts with every current sandbox as Added. Cancel ctx to stop; the channel is
 // closed after the stream ends.
 func (h *Hub) Watch(ctx context.Context, owner string, from uint64) (<-chan Event, error) {
 	deadline := time.Now().Add(h.opts.TooNewWait)
@@ -443,9 +446,17 @@ func (h *Hub) Watch(ctx context.Context, owner string, from uint64) (<-chan Even
 func (h *Hub) backlogLocked(owner string, from uint64) []Event {
 	var out []Event
 	if from == 0 {
-		for id := range h.byOwner[owner] {
-			p := h.rows[id]
+		add := func(p cluster.Placement) {
 			out = append(out, Event{Type: Added, Item: Item{Placement: p, RV: ItemRV(p)}})
+		}
+		if owner == AllOwners {
+			for _, p := range h.rows {
+				add(p)
+			}
+		} else {
+			for id := range h.byOwner[owner] {
+				add(h.rows[id])
+			}
 		}
 	} else {
 		type seen struct {
@@ -456,7 +467,7 @@ func (h *Hub) backlogLocked(owner string, from uint64) []Event {
 		changed := map[string]*seen{}
 		for i := 0; i < h.n; i++ {
 			e := h.ring[(h.start+i)%len(h.ring)]
-			if e.rv <= from || e.owner != owner {
+			if e.rv <= from || (owner != AllOwners && e.owner != owner) {
 				continue
 			}
 			s := changed[e.id]
@@ -473,7 +484,7 @@ func (h *Hub) backlogLocked(owner string, from uint64) []Event {
 			}
 		}
 		for id, s := range changed {
-			if p, ok := h.rows[id]; ok && p.OwnerRef == owner {
+			if p, ok := h.rows[id]; ok && (owner == AllOwners || p.OwnerRef == owner) {
 				typ := Modified
 				if s.created && s.gone == nil {
 					typ = Added

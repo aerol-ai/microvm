@@ -325,3 +325,32 @@ func TestHubReadyOnAnEmptyView(t *testing.T) {
 		t.Fatalf("Position = %d %v", rv, err)
 	}
 }
+
+// AllOwners watches every owner at once: the backlog and live events of
+// each.
+func TestHubWatchAllOwners(t *testing.T) {
+	h := readyHub(t, Options{}, row("sb1", "team:a", 3), row("sb2", "team:b", 4))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	all, err := h.Watch(ctx, AllOwners, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	got[next(t, all).Item.Placement.SandboxID] = true
+	got[next(t, all).Item.Placement.SandboxID] = true
+	if !got["sb1"] || !got["sb2"] {
+		t.Fatalf("backlog = %v", got)
+	}
+	h.Apply(cluster.PlacementFeedEvent{Changes: []cluster.PlacementChange{upsert(row("sb3", "team:c", 11), 11)}, Next: 11})
+	if ev := next(t, all); ev.Item.Placement.SandboxID != "sb3" {
+		t.Fatalf("live = %+v", ev)
+	}
+	resumed, err := h.Watch(ctx, AllOwners, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev := next(t, resumed); ev.Type != Added || ev.Item.Placement.SandboxID != "sb3" {
+		t.Fatalf("resumed = %+v", ev)
+	}
+}
