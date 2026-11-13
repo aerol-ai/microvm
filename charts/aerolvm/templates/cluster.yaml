@@ -135,6 +135,19 @@ spec:
     domain: {{ .Values.edge.domain | quote }}
     tlsSecret: {{ include "aerolvm.edgeTLSSecret" . }}
   {{- end }}
+  {{- with .Values.cluster.federation }}
+  {{- if .idKeySecret }}
+  federation:
+    idKeySecret:
+      name: {{ .idKeySecret | quote }}
+    {{- with .cells }}
+    cells:
+      {{- range $cell, $addr := . }}
+      {{ $cell | quote }}: {{ $addr | quote }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
   security:
     createPolicy:
       name: {{ .Values.cluster.name }}-create-policy

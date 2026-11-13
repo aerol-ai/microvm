@@ -100,6 +100,42 @@ spec:
                       is namespaced, and a second Certificate would be a second issuance.
                     type: string
                 type: object
+              federation:
+                description: |-
+                  Federation makes this cell one of several (C16): each new sandbox
+                  ID carries its cell, hidden by a key the cells share, and a request
+                  for another cell's sandbox is answered with that cell's address,
+                  which the SDKs follow. Set it before the first sandbox: IDs made
+                  without the key are served only by the cell that made them.
+                properties:
+                  cells:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Cells is every other cell's public API address by its number, such
+                      as {"2": "https://cell2.example.com"} (SB_CELL_ENDPOINTS).
+                    type: object
+                  idKeySecret:
+                    description: |-
+                      IDKeySecret names a Secret in this namespace whose key "key" holds
+                      the federation's ID key (SB_CELL_ID_KEY): base64 of at least 32
+                      random bytes (openssl rand -base64 32), the same in every cell, and
+                      never changed. The operator copies it to the worker namespace.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - idKeySecret
+                type: object
               gateways:
                 description: Gateways serve the API, sandbox links, SSH and TLS ports
                   (C11).

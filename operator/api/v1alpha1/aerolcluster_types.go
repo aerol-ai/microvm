@@ -50,6 +50,27 @@ type AerolClusterSpec struct {
 	// Security holds node identity and secret settings.
 	// +optional
 	Security SecuritySpec `json:"security,omitempty"`
+
+	// Federation makes this cell one of several (C16): each new sandbox
+	// ID carries its cell, hidden by a key the cells share, and a request
+	// for another cell's sandbox is answered with that cell's address,
+	// which the SDKs follow. Set it before the first sandbox: IDs made
+	// without the key are served only by the cell that made them.
+	// +optional
+	Federation *FederationSpec `json:"federation,omitempty"`
+}
+
+// FederationSpec is this cell's place among the others.
+type FederationSpec struct {
+	// IDKeySecret names a Secret in this namespace whose key "key" holds
+	// the federation's ID key (SB_CELL_ID_KEY): base64 of at least 32
+	// random bytes (openssl rand -base64 32), the same in every cell, and
+	// never changed. The operator copies it to the worker namespace.
+	IDKeySecret corev1.LocalObjectReference `json:"idKeySecret"`
+	// Cells is every other cell's public API address by its number, such
+	// as {"2": "https://cell2.example.com"} (SB_CELL_ENDPOINTS).
+	// +optional
+	Cells map[string]string `json:"cells,omitempty"`
 }
 
 // ImageSpec names the image registry.

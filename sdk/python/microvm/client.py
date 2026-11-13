@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import OrderedDict
 from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -269,6 +270,15 @@ TEAM_HEADER = "X-AerolVM-Team"
 # The header a sandbox create carries so the server can recognise a retry of
 # it. Keep in sync with clustercreate.HeaderIdempotencyKey on the server.
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+# The header naming, on a 421, the base URL of the federation cell a sandbox
+# lives in when the request reached another cell. Cells do not forward to
+# each other, so the client sends the request there itself. Keep in sync with
+# models.CellEndpointHeader on the server.
+CELL_ENDPOINT_HEADER = "X-Aerolvm-Cell-Endpoint"
+# How many sandbox -> cell routes one client remembers. Past it the oldest
+# go: a forgotten route costs one extra 421 round trip, never a wrong answer.
+_MAX_CELL_ROUTES = 10000
 
 
 def _new_idempotency_key() -> str:
@@ -1175,6 +1185,59 @@ class _MicroVMCore:
         self._toolbox_features: Dict[str, frozenset] = {}
         # The runtime a sandbox's /version named ("wasm"), for the error text.
         self._toolbox_runtimes: Dict[str, str] = {}
+        # Sandbox ID -> base URL of the cell another cell's 421 named for it,
+        # so later calls skip the wrong cell. Oldest first, for the bound;
+        # locked because one client may serve many threads.
+        self._cell_routes: "OrderedDict[str, str]" = OrderedDict()
+        self._cell_lock = threading.Lock()
+
+    def _cell_base(self, sandbox_id: str) -> str:
+        """The base URL calls for ``sandbox_id`` go to: the cell remembered
+        for it, else the configured one. Stream handshakes (exec_stream,
+        attach_session, watch_files) bypass the request transport, so they
+        ask here too; they do not follow a 421 themselves."""
+        with self._cell_lock:
+            return self._cell_routes.get(sandbox_id) or self.api_url
+
+    def _cell_route(self, url: str) -> Tuple[str, str, str]:
+        """Where a request for ``url`` (``api_url`` + a path) goes, as
+        ``(base, path, sandbox_id)`` with ``base + path`` the URL to send.
+        ``path`` and ``sandbox_id`` are "" when there is none."""
+        if not url.startswith(self.api_url + "/"):
+            return url, "", ""
+        path = url[len(self.api_url):]
+        sandbox_id = _path_sandbox_id(path, self._version_prefix)
+        return (self._cell_base(sandbox_id) if sandbox_id else self.api_url), path, sandbox_id
+
+    def _learn_cell(self, sandbox_id: str, header: str) -> Optional[str]:
+        """The base URL a 421's cell header names, remembered for
+        ``sandbox_id``. None when it is not one to follow: not an absolute
+        http(s) URL, or http for an https client (a bad answer must not
+        get the token sent in clear)."""
+        endpoint = _cell_endpoint(header)
+        if endpoint is None:
+            return None
+        if endpoint.startswith("http:") and self.api_url.lower().startswith("https:"):
+            return None
+        if sandbox_id:
+            with self._cell_lock:
+                self._cell_routes[sandbox_id] = endpoint
+                self._cell_routes.move_to_end(sandbox_id)
+                while len(self._cell_routes) > _MAX_CELL_ROUTES:
+                    self._cell_routes.popitem(last=False)
+        return endpoint
+
+    def _cell_not_found(self, sandbox_id: str, base: str, payload: Optional[bytes]) -> None:
+        """A 404 from the cell a sandbox was sent to: forget the route, as
+        the sandbox may be gone. Not for a toolbox's missing file, which the
+        sandbox itself answered, so a file_exists poll stays one hop."""
+        if not sandbox_id or base == self.api_url or _error_code(payload) == _CODE_FILE_NOT_FOUND:
+            return
+        with self._cell_lock:
+            # Only the route that answered: another thread may have learned
+            # a newer one meanwhile.
+            if self._cell_routes.get(sandbox_id) == base:
+                del self._cell_routes[sandbox_id]
 
     def _versioned(self, suffix: str) -> str:
         """Build a versioned API path. Pass the suffix beginning with "/" (e.g.
@@ -1797,7 +1860,7 @@ class _MicroVMCore:
             yield from self._op_require_toolbox_features(sandbox_id, "exec.argv")
 
         websocket_module = _load_websocket_module()
-        ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
+        ws_url = _to_websocket_url(self._cell_base(sandbox_id), f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
         ws = (yield _io("_blocking", _open_exec_stream,
             websocket_module, ws_url, self._websocket_headers(), self._ssl_context, json.dumps(_to_api_exec_stream_request(options))
         ))
@@ -1842,7 +1905,7 @@ class _MicroVMCore:
         attach_options: SessionAttachOptions = options or {}
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(
-            self.api_url,
+            self._cell_base(sandbox_id),
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
         cols = _first_of(attach_options, "cols")
@@ -1996,7 +2059,7 @@ class _MicroVMCore:
             query["recursive"] = "true"
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(
-            self.api_url,
+            self._cell_base(sandbox_id),
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/files/watch",
         ) + "?" + urllib.parse.urlencode(query)
         ws = (yield _io("_blocking", _open_file_watch, websocket_module, ws_url, self._websocket_headers(), sandbox_id, self._ssl_context))
@@ -2364,6 +2427,10 @@ class MicroVM(_MicroVMCore):
         :meth:`_retry_delay`). The wait is a plain ``time.sleep``, so a
         signal handler that raises (Ctrl-C, a ``signal.alarm`` timeout) ends
         it at once.
+
+        A 421 naming another cell (``X-Aerolvm-Cell-Endpoint``) is sent once
+        to that cell instead of retried here, and the cell is remembered for
+        the sandbox, so its later calls go there first.
         """
         # send_once: a body plan section 10 says is never re-sent (a folder
         # upload).
@@ -2372,8 +2439,12 @@ class MicroVM(_MicroVMCore):
 
         last_exc: Optional[Exception] = None
         may_have_run = False
+        base, path, sandbox_id = self._cell_route(url)
+        url = base + path
+        followed = False
 
-        for attempt in range(max_retries + 1):
+        attempt = 0
+        while attempt <= max_retries:
             retry_after: Optional[str] = None
             body_started = False
             # A per-call timeout bounds each attempt with what is left of it;
@@ -2398,6 +2469,22 @@ class MicroVM(_MicroVMCore):
             except urllib.error.HTTPError as exc:
                 last_exc = exc
                 payload: Optional[bytes] = None
+                cell = _cell_header(exc.code, exc.headers)
+                if cell:
+                    # Another cell answered before doing anything, so even an
+                    # exec goes once to the cell named. Never a second hop (no
+                    # loops), and never a one-shot body already consumed.
+                    moved = None if followed else self._learn_cell(sandbox_id, cell)
+                    if moved is not None and path and (body is None or isinstance(body, (bytes, bytearray))):
+                        exc.close()
+                        base, url, followed = moved, moved + path, True
+                        continue
+                    # Retrying here would get the same answer.
+                    try:
+                        payload = exc.read()
+                    finally:
+                        exc.close()
+                    raise _error_from_answer(exc.code, str(exc.reason), exc.headers.get("Retry-After"), payload) from exc
                 if done_code is not None and may_have_run:
                     try:
                         payload = exc.read()
@@ -2405,6 +2492,13 @@ class MicroVM(_MicroVMCore):
                         exc.close()
                     if _error_code(payload) == done_code:
                         return b"", {}
+                if exc.code == 404 and base != self.api_url:
+                    if payload is None:
+                        try:
+                            payload = exc.read()
+                        finally:
+                            exc.close()
+                    self._cell_not_found(sandbox_id, base, payload)
                 if exc.code in _REPLY_LOST_STATUSES:
                     may_have_run = True
                 if exc.code in retry_statuses and attempt < max_retries:
@@ -2449,6 +2543,7 @@ class MicroVM(_MicroVMCore):
                 # The retry could not start before the deadline.
                 raise _deadline_error() from last_exc
             time.sleep(delay)
+            attempt += 1
 
         assert last_exc is not None
         raise last_exc
@@ -3537,6 +3632,43 @@ def _to_websocket_url(base_url: str, path: str) -> str:
     if scheme is None:
         raise MicroVMError(f"unsupported API URL scheme: {parsed.scheme}")
     return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
+
+
+def _path_sandbox_id(path: str, version_prefix: str) -> str:
+    """The sandbox a per-sandbox path names (the segment after
+    ``/v1/sandboxes/``), or "" for any other path. Some calls quote the ID
+    and some do not, so it is unquoted to give one key either way."""
+    head = f"{version_prefix}/sandboxes/"
+    if not path.startswith(head):
+        return ""
+    segment = path[len(head):]
+    for sep in "/?#":
+        segment = segment.split(sep, 1)[0]
+    return urllib.parse.unquote(segment)
+
+
+def _cell_header(status: int, headers: Any) -> str:
+    """The cell a 421 names, or "" for any other answer."""
+    if status != 421 or headers is None:
+        return ""
+    return (headers.get(CELL_ENDPOINT_HEADER) or "").strip()
+
+
+def _cell_endpoint(value: str) -> Optional[str]:
+    """A cell header's base URL without a trailing slash, or None unless it
+    is an absolute http or https URL with a host. A query or fragment is
+    refused too: the request's path is appended after the base."""
+    if not value or any(ch.isspace() or ord(ch) < 0x20 for ch in value):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not host or parts.query or parts.fragment:
+        return None
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
 
 def _request_never_sent(exc: urllib.error.URLError) -> bool:

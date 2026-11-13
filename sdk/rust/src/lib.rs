@@ -1,3 +1,4 @@
+mod cells;
 mod files;
 mod fleet;
 mod image;
@@ -20,6 +21,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+
+use cells::{CellHint, CellRoutes};
 
 pub use files::{
     CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
@@ -71,6 +74,12 @@ pub const TEAM_HEADER: &str = "X-AerolVM-Team";
 /// of it. Keep in sync with `clustercreate.HeaderIdempotencyKey` on the
 /// server.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// The header a 421 names the cell that holds the sandbox in, when several
+/// AerolVM installs form a federation. The client re-sends the request
+/// there and remembers the cell for the sandbox. Keep in sync with
+/// `models.CellEndpointHeader` on the server.
+pub const CELL_ENDPOINT_HEADER: &str = "X-Aerolvm-Cell-Endpoint";
 
 /// A fresh create key: 128 random bits as 32 lowercase hex characters.
 fn new_idempotency_key() -> String {
@@ -500,6 +509,56 @@ fn websocket_request(
     Ok(request)
 }
 
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// What a WebSocket call takes from its [`Client`] to the thread that runs
+/// it, so the handshake is routed to the sandbox's cell like an HTTP call.
+struct WsDial {
+    api_url: String,
+    api_version: ApiVersion,
+    pat_token: String,
+    team: Option<String>,
+    cells: Arc<CellRoutes>,
+}
+
+impl WsDial {
+    /// Opens the WebSocket at `path`, following a 421 that names another
+    /// cell once as [`Client::send_routed`] does. The handshake carries no
+    /// body, so it can always be sent again. `refused` turns the server's
+    /// refusal into the call's error.
+    async fn connect(&self, path: &str, refused: impl FnOnce(WebSocketError) -> Error) -> Result<WsStream, Error> {
+        let sandbox = cells::sandbox_of(path, self.api_version.path_prefix());
+        let mut cell = sandbox.as_deref().and_then(|id| self.cells.get(id));
+        let mut followed = false;
+        loop {
+            let base = cell.as_deref().unwrap_or(&self.api_url);
+            let request = websocket_request(websocket_url(base, path)?, &self.pat_token, self.team.as_deref())?;
+            let err = match connect_async(request).await {
+                Ok((stream, _)) => return Ok(stream),
+                Err(err) => err,
+            };
+            if let (Some(id), WebSocketError::Http(response)) = (sandbox.as_deref(), &err) {
+                match cells::cell_hint(response.status(), response.headers(), &self.api_url) {
+                    // No chains: a second cell redirect is the caller's error.
+                    CellHint::Follow(next) if !followed => {
+                        self.cells.remember(id, &next);
+                        followed = true;
+                        cell = Some(next);
+                        continue;
+                    }
+                    CellHint::None if response.status() == http::StatusCode::NOT_FOUND => {
+                        if let Some(cell) = cell.as_deref() {
+                            self.cells.forget(id, cell);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Err(refused(err));
+        }
+    }
+}
+
 /// Scoped API tokens (`avm_…`) for services and CI, reached through
 /// [`Client::tokens`]. Creating and revoking needs an admin credential;
 /// listing needs an auditor or an admin.
@@ -711,6 +770,9 @@ pub struct Client {
     /// ([`Client::require_toolbox_features`]). A miss refreshes it, because
     /// a restart can bring a newer agent. Clones share it.
     toolbox_features: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// The cell each sandbox lives in, learned from 421 answers
+    /// ([`CELL_ENDPOINT_HEADER`]). Clones share it.
+    cells: Arc<CellRoutes>,
 }
 
 #[derive(Clone, Debug)]
@@ -1225,6 +1287,7 @@ impl Client {
             inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
             toolbox_features: Arc::default(),
+            cells: Arc::default(),
         })
     }
 
@@ -2221,17 +2284,13 @@ impl Client {
     }
 
     pub fn session_log(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
+        let path = format!(
             "{}/sandboxes/{}/sessions/{}/log",
             self.version_prefix(),
             id,
             session_id
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
+        );
+        let (response, _) = self.send_routed(&Method::GET, &path, true, |builder| builder)?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -2239,17 +2298,13 @@ impl Client {
     }
 
     pub fn session_recording(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
+        let path = format!(
             "{}/sandboxes/{}/sessions/{}/recording",
             self.version_prefix(),
             id,
             session_id
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
+        );
+        let (response, _) = self.send_routed(&Method::GET, &path, true, |builder| builder)?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -2264,10 +2319,7 @@ impl Client {
     ) -> Result<SessionAttachHandle, Error> {
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let api_url = self.api_url.clone();
-        let pat_token = self.pat_token.clone();
-        let team = self.team.clone();
-        let api_version = self.api_version;
+        let dial = self.ws_dial();
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
 
@@ -2275,10 +2327,7 @@ impl Client {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
                 Ok(runtime) => runtime.block_on(run_session_attach(
-                    api_url,
-                    api_version,
-                    pat_token,
-                    team,
+                    dial,
                     sandbox_id,
                     session_id,
                     options,
@@ -2316,20 +2365,14 @@ impl Client {
 
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let api_url = self.api_url.clone();
-        let pat_token = self.pat_token.clone();
-        let team = self.team.clone();
-        let api_version = self.api_version;
+        let dial = self.ws_dial();
         let sandbox_id = id.to_string();
 
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
                 Ok(runtime) => runtime.block_on(run_exec_stream(
-                    api_url,
-                    api_version,
-                    pat_token,
-                    team,
+                    dial,
                     sandbox_id,
                     options,
                     control_rx,
@@ -2364,10 +2407,7 @@ impl Client {
         let (stop_tx, stop_rx) = unbounded_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let api_url = self.api_url.clone();
-        let pat_token = self.pat_token.clone();
-        let team = self.team.clone();
-        let api_version = self.api_version;
+        let dial = self.ws_dial();
         let sandbox_id = id.to_string();
         let path = path.to_string();
 
@@ -2377,10 +2417,7 @@ impl Client {
             let mut ready = Some(ready_tx);
             let result = match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime.block_on(run_file_watch(
-                    api_url,
-                    api_version,
-                    pat_token,
-                    team,
+                    dial,
                     sandbox_id,
                     path,
                     options,
@@ -2626,6 +2663,16 @@ impl Client {
         format!("{}{}", self.api_url, path)
     }
 
+    fn ws_dial(&self) -> WsDial {
+        WsDial {
+            api_url: self.api_url.clone(),
+            api_version: self.api_version,
+            pat_token: self.pat_token.clone(),
+            team: self.team.clone(),
+            cells: Arc::clone(&self.cells),
+        }
+    }
+
     /// Fails closed unless the sandbox's agent lists every feature on
     /// `/version`. toolboxd ignores request options it does not know, so
     /// sending a newer option to an older agent would silently skip it.
@@ -2805,20 +2852,19 @@ impl Client {
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
-            let url = self.full_url(path);
-            let mut builder = body(
-                self.inner
-                    .request(method.clone(), &url)
-                    .authorize(self),
-            );
-            for (name, value) in headers {
-                builder = builder.header(*name, *value);
-            }
+            let sent = self.send_routed(&method, path, true, |builder| {
+                let mut builder = body(builder);
+                for (name, value) in headers {
+                    builder = builder.header(*name, *value);
+                }
+                builder
+            });
 
-            match builder.send() {
-                Ok(response) => {
+            match sent {
+                Ok((response, cell_answer)) => {
                     let earlier_may_have_run = may_have_run;
                     may_have_run |= matches!(response.status().as_u16(), 502 | 504);
+                    let retries = !cell_answer && policy.retries_status(response.status());
                     if let (Some(code), true) = (done_code, earlier_may_have_run && !response.status().is_success()) {
                         let status = response.status();
                         let hint = retry_after_hint(&response);
@@ -2832,11 +2878,11 @@ impl Client {
                         if err.code() == Some(code) {
                             return Ok(None);
                         }
-                        if attempt >= max_retries || !policy.retries_status(status) {
+                        if attempt >= max_retries || !retries {
                             return Err(Error::Api(err));
                         }
                         retry_after = hint;
-                    } else if attempt < max_retries && policy.retries_status(response.status()) {
+                    } else if attempt < max_retries && retries {
                         // Fall through to retry logic; dropping the response
                         // frees the connection before the wait.
                         retry_after = retry_after_hint(&response);
@@ -2866,6 +2912,58 @@ impl Client {
         }
     }
 
+    /// Sends one attempt to the cell that holds the path's sandbox: the one
+    /// this client learned for it, else the configured base URL.
+    ///
+    /// A cell answers 421 + [`CELL_ENDPOINT_HEADER`] before doing any work,
+    /// so the request goes to the named cell once, under any retry policy,
+    /// when `resend` says its body can be built again. The cell is
+    /// remembered either way, so a caller's own retry of a one-shot body
+    /// goes to the right place. The flag is true for a cell answer that must
+    /// reach the caller as it is (a second hop, a downgrade to http, a body
+    /// that cannot be re-sent): the retry loop would only repeat it.
+    fn send_routed(
+        &self,
+        method: &Method,
+        path: &str,
+        resend: bool,
+        mut build: impl FnMut(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::blocking::Response, bool), reqwest::Error> {
+        let sandbox = cells::sandbox_of(path, self.version_prefix());
+        let mut cell = sandbox.as_deref().and_then(|id| self.cells.get(id));
+        let mut send = |base: &str| {
+            build(self.inner.request(method.clone(), format!("{}{}", base, path)).authorize(self)).send()
+        };
+        let mut response = send(cell.as_deref().unwrap_or(&self.api_url))?;
+        let Some(id) = sandbox.as_deref() else {
+            return Ok((response, false));
+        };
+        let mut cell_answer = false;
+        match cells::cell_hint(response.status(), response.headers(), &self.api_url) {
+            CellHint::None => {}
+            CellHint::Downgrade => cell_answer = true,
+            CellHint::Follow(next) => {
+                self.cells.remember(id, &next);
+                if resend {
+                    response = send(&next)?;
+                    // No chains: a second cell redirect is the caller's error.
+                    cell_answer = cells::cell_hint(response.status(), response.headers(), &self.api_url) != CellHint::None;
+                    cell = Some(next);
+                } else {
+                    cell_answer = true;
+                }
+            }
+        }
+        // The sandbox may have been deleted; the configured base finds its
+        // cell again if not. Any 404 counts (a missing file too): telling
+        // them apart is not worth a wrong guess, and a wrong forget costs
+        // only one more 421 round trip.
+        if let (Some(cell), reqwest::StatusCode::NOT_FOUND) = (cell.as_deref(), response.status()) {
+            self.cells.forget(id, cell);
+        }
+        Ok((response, cell_answer))
+    }
+
     fn handle_response(
         &self,
         response: reqwest::blocking::Response,
@@ -2890,27 +2988,19 @@ impl Client {
 }
 
 async fn run_exec_stream(
-    api_url: String,
-    api_version: ApiVersion,
-    pat_token: String,
-    team: Option<String>,
+    dial: WsDial,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(
-        &api_url,
-        &format!(
-            "{}/sandboxes/{}/toolbox/process/exec/stream",
-            api_version.path_prefix(),
-            urlencoding::encode(&sandbox_id)
-        ),
-    )?;
-    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
-
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|err| decorate_ws_handshake("exec stream", err))?;
+    let route = format!(
+        "{}/sandboxes/{}/toolbox/process/exec/stream",
+        dial.api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id)
+    );
+    let stream = dial
+        .connect(&route, |err| decorate_ws_handshake("exec stream", err))
+        .await?;
     let (mut write, mut read) = stream.split();
 
     let start = ExecStreamStartRequest {
@@ -2982,29 +3072,21 @@ async fn run_exec_stream(
 }
 
 async fn run_session_attach(
-    api_url: String,
-    api_version: ApiVersion,
-    pat_token: String,
-    team: Option<String>,
+    dial: WsDial,
     sandbox_id: String,
     session_id: String,
     options: SessionAttachOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(
-        &api_url,
-        &format!(
-            "{}/sandboxes/{}/sessions/{}/attach",
-            api_version.path_prefix(),
-            urlencoding::encode(&sandbox_id),
-            urlencoding::encode(&session_id)
-        ),
-    )?;
-    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
-
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|err| decorate_ws_handshake("session attach", err))?;
+    let route = format!(
+        "{}/sandboxes/{}/sessions/{}/attach",
+        dial.api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id),
+        urlencoding::encode(&session_id)
+    );
+    let stream = dial
+        .connect(&route, |err| decorate_ws_handshake("session attach", err))
+        .await?;
     let (mut write, mut read) = stream.split();
 
     if let (Some(cols), Some(rows)) = (options.cols, options.rows) {
@@ -3092,12 +3174,8 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_file_watch(
-    api_url: String,
-    api_version: ApiVersion,
-    pat_token: String,
-    team: Option<String>,
+    dial: WsDial,
     sandbox_id: String,
     path: String,
     options: WatchOptions,
@@ -3107,17 +3185,16 @@ async fn run_file_watch(
 ) -> Result<(), Error> {
     let mut route = format!(
         "{}/sandboxes/{}/toolbox/files/watch?path={}",
-        api_version.path_prefix(),
+        dial.api_version.path_prefix(),
         urlencoding::encode(&sandbox_id),
         urlencoding::encode(&path)
     );
     if options.recursive {
         route.push_str("&recursive=true");
     }
-    let request = websocket_request(websocket_url(&api_url, &route)?, &pat_token, team.as_deref())?;
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|err| file_watch_handshake_error(&sandbox_id, err))?;
+    let stream = dial
+        .connect(&route, |err| file_watch_handshake_error(&sandbox_id, err))
+        .await?;
     let (mut write, mut read) = stream.split();
 
     // The watch is in place only once the start frame arrives; returning
@@ -3382,6 +3459,8 @@ mod tests {
             status: &'static str,
             retry_after: Option<String>,
         },
+        /// A 421 naming another cell in [`CELL_ENDPOINT_HEADER`].
+        Cell(String),
     }
 
     impl Reply {
@@ -3423,6 +3502,7 @@ mod tests {
                 server_requests.lock().expect("requests lock").push(request);
                 server_hits.fetch_add(1, Ordering::SeqCst);
                 let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
+                let cell_body = r#"{"error":"sandbox lives in another cell"}"#.to_string();
                 let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
                     Reply::Hangup => continue,
                     Reply::Json { status, body, delay } => (*status, body, *delay, String::new()),
@@ -3434,6 +3514,12 @@ mod tests {
                             .as_ref()
                             .map(|v| format!("Retry-After: {}\r\n", v))
                             .unwrap_or_default(),
+                    ),
+                    Reply::Cell(endpoint) => (
+                        "421 Misdirected Request",
+                        &cell_body,
+                        Duration::ZERO,
+                        format!("{}: {}\r\n", CELL_ENDPOINT_HEADER, endpoint),
                     ),
                 };
                 thread::sleep(delay);
@@ -3601,6 +3687,7 @@ mod tests {
         let mut buffer = Vec::new();
         let mut header_end = None;
         let mut content_length = 0usize;
+        let mut chunked = false;
 
         loop {
             let mut chunk = [0u8; 1024];
@@ -3620,13 +3707,23 @@ mod tests {
                             if value.0.eq_ignore_ascii_case("content-length") {
                                 content_length = value.1.trim().parse::<usize>().unwrap_or(0);
                             }
+                            // A streamed body (a reader upload) has no length.
+                            if value.0.eq_ignore_ascii_case("transfer-encoding")
+                                && value.1.trim().eq_ignore_ascii_case("chunked")
+                            {
+                                chunked = true;
+                            }
                         }
                     }
                 }
             }
 
             if let Some(end) = header_end {
-                if buffer.len() >= end + content_length {
+                if chunked {
+                    if buffer[end..].ends_with(b"0\r\n\r\n") {
+                        break;
+                    }
+                } else if buffer.len() >= end + content_length {
                     break;
                 }
             }
@@ -3927,6 +4024,175 @@ mod tests {
             .expect("get should retry to success");
         assert_eq!(sandbox.data.id, "sb-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    fn sandbox_body(id: &str) -> String {
+        named_sandbox_json(id, id).to_string()
+    }
+
+    fn api_status_of<T: fmt::Debug>(result: Result<T, Error>) -> u16 {
+        match result {
+            Err(Error::Api(api)) => api.status(),
+            other => panic!("want an API error, got {:?}", other),
+        }
+    }
+
+    // C16: a cell asked about a sandbox another cell holds answers 421 and
+    // names that cell. The same request goes there once, under the cell's
+    // own path prefix. Exec shows it holds under the retry tier that never
+    // re-sends a plain 421: the first cell did no work.
+    #[test]
+    fn cell_redirect_resends_the_request_to_the_named_cell() {
+        let (cell2, cell2_hits, cell2_requests) =
+            spawn_recording_scripted_server(vec![Reply::ok(exec_ok_json())]);
+        let (cell1, cell1_hits, cell1_requests) =
+            spawn_recording_scripted_server(vec![Reply::Cell(format!("{}/cell2/", cell2))]);
+        let mut client = fast_retry_client(&format!("{}/edge", cell1));
+        client.team = Some("payments".to_string());
+
+        let result = client
+            .exec("sb-x", ExecRequest::from("echo hi"))
+            .expect("exec should reach cell 2");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        let first = cell1_requests.lock().expect("requests lock")[0].clone();
+        let second = cell2_requests.lock().expect("requests lock")[0].clone();
+        assert!(
+            first.starts_with("POST /edge/v1/sandboxes/sb-x/toolbox/process/execute HTTP/1.1\r\n"),
+            "{}",
+            first
+        );
+        assert!(
+            second.starts_with("POST /cell2/v1/sandboxes/sb-x/toolbox/process/execute HTTP/1.1\r\n"),
+            "{}",
+            second
+        );
+        assert_eq!(header_value(&second, "Authorization"), Some("Bearer pat-token"));
+        assert_eq!(header_value(&second, TEAM_HEADER), Some("payments"));
+        assert_eq!(header_value(&second, "Content-Type"), header_value(&first, "Content-Type"));
+        assert_eq!(request_json_body(&second), request_json_body(&first));
+        assert_eq!(request_json_body(&second)["command"], "echo hi");
+    }
+
+    // The cell is remembered for that sandbox, by the client and every
+    // clone of it (a returned Sandbox); other sandboxes still start at the
+    // configured base.
+    #[test]
+    fn cell_redirect_is_remembered_for_that_sandbox_only() {
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell1, cell1_hits) =
+            spawn_scripted_server(vec![Reply::Cell(cell2.clone()), Reply::ok(sandbox_body("sb-y"))]);
+        let client = fast_retry_client(&cell1);
+
+        let sandbox = client.get("sb-x").expect("first get follows the redirect");
+        assert_eq!(sandbox.data.id, "sb-x");
+        client.get("sb-x").expect("second get");
+        sandbox.client.get("sb-x").expect("get through the sandbox's client");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1, "cell 1 asked again");
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 3);
+
+        assert_eq!(client.get("sb-y").expect("other sandbox").data.id, "sb-y");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 3);
+    }
+
+    // A 421 with no cell header (or one that is not an absolute URL) is the
+    // in-cluster kind: retried on the same endpoint as before, nothing
+    // remembered.
+    #[test]
+    fn misdirected_without_a_usable_cell_header_retries_the_same_endpoint() {
+        for first in [Reply::status("421 Misdirected Request"), Reply::Cell("cell2.example.com".to_string())] {
+            let (url, hits) = spawn_scripted_server(vec![first, Reply::ok(sandbox_body("sb-x"))]);
+            let client = fast_retry_client(&url);
+            assert_eq!(client.get("sb-x").expect("421 should be retried").data.id, "sb-x");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert_eq!(client.cells.len(), 0);
+        }
+    }
+
+    // No chains: the named cell answering with yet another cell is the
+    // caller's error. Each cell is asked once (the retry loop does not
+    // repeat a cell answer) and the third is never dialled.
+    #[test]
+    fn cell_redirect_is_followed_at_most_once() {
+        let (cell3, cell3_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::Cell(cell3)]);
+        let (cell1, cell1_hits) = spawn_scripted_server(vec![Reply::Cell(cell2.clone())]);
+        let client = fast_retry_client(&cell1);
+
+        assert_eq!(api_status_of(client.get("sb-x")), 421);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell3_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+    }
+
+    // An https client never follows a cell to http: that would send its
+    // token in clear text. The fake servers speak plain HTTP, so sandbox X
+    // is pinned to one of them directly; the https base is never dialled.
+    #[test]
+    fn cell_redirect_never_downgrades_an_https_client_to_http() {
+        let (cell3, cell3_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::Cell(cell3)]);
+        let client = fast_retry_client("https://cell1.invalid");
+        client.cells.remember("sb-x", &cell2);
+
+        assert_eq!(api_status_of(client.get("sb-x")), 421);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell3_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+    }
+
+    // A 404 from the remembered cell (the sandbox may be gone) forgets it,
+    // so the next call starts at the configured base again.
+    #[test]
+    fn not_found_from_the_remembered_cell_forgets_it() {
+        let (cell2, cell2_hits) =
+            spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x")), Reply::status("404 Not Found")]);
+        let (cell1, cell1_hits) =
+            spawn_scripted_server(vec![Reply::Cell(cell2.clone()), Reply::ok(sandbox_body("sb-x"))]);
+        let client = fast_retry_client(&cell1);
+
+        client.get("sb-x").expect("first get follows the redirect");
+        assert_eq!(api_status_of(client.get("sb-x")), 404);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(client.cells.get("sb-x"), None);
+
+        client.get("sb-x").expect("third get starts at the configured base");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 2);
+    }
+
+    // A streamed body cannot be sent twice: the 421 reaches the caller, but
+    // the cell is remembered, so the caller's own retry goes to it.
+    #[test]
+    fn streamed_upload_is_not_resent_but_its_cell_is_remembered() {
+        let (cell2, cell2_hits, cell2_requests) =
+            spawn_recording_scripted_server(vec![Reply::ok("{}".to_string())]);
+        let (cell1, cell1_hits) = spawn_scripted_server(vec![Reply::Cell(cell2.clone())]);
+        let client = fast_retry_client(&cell1);
+        let upload = || {
+            client.upload_file_from(
+                "sb-x",
+                "/w/a.txt",
+                std::io::Cursor::new(b"streamed-bytes".to_vec()),
+                UploadFileOptions::default(),
+            )
+        };
+
+        assert_eq!(api_status_of(upload()), 421);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+
+        upload().expect("the caller's retry reaches cell 2");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        let request = cell2_requests.lock().expect("requests lock")[0].clone();
+        assert!(request.starts_with("POST /v1/sandboxes/sb-x/toolbox/files/upload HTTP/1.1\r\n"), "{}", request);
+        assert!(request.contains("streamed-bytes"), "{}", request);
     }
 
     /// Formats `t` as an IMF-fixdate, the HTTP-date form servers send.
@@ -8180,6 +8446,32 @@ mod tests {
                 Ok(_) => panic!("want an error"),
             }
         }
+    }
+
+    // A WebSocket handshake carries no body, so a 421 naming another cell is
+    // followed like an HTTP call's, and the cell is remembered.
+    #[test]
+    fn watch_files_follows_a_cell_redirect() {
+        let (cell2, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let cell1 = spawn_handshake_refusal(
+            "421 Misdirected Request",
+            &format!("{}: {}\r\n", CELL_ENDPOINT_HEADER, cell2),
+            r#"{"error":"sandbox lives in another cell"}"#,
+        );
+        let client = Client::new(Some(&cell1), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-x", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start on cell 2");
+        assert_eq!(seen.recv().expect("uri"), "uri /v1/sandboxes/sb-x/toolbox/files/watch?path=%2Fwork");
+        assert_eq!(seen.recv().expect("auth"), "auth Bearer pat-token");
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+        handle.stop();
+        handle.wait().expect("wait after stop should be Ok");
     }
 
     #[test]

@@ -124,6 +124,14 @@ public class MicroVMClient {
      */
     public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
+    /**
+     * The header a 421 carries when the sandbox lives in another cell of a
+     * federation: that cell's base URL. The client sends the request there
+     * once and remembers the cell for later calls about that sandbox. Keep in
+     * sync with models.CellEndpointHeader on the server.
+     */
+    public static final String CELL_ENDPOINT_HEADER = "X-Aerolvm-Cell-Endpoint";
+
     private static final java.security.SecureRandom IDEMPOTENCY_KEY_RANDOM = new java.security.SecureRandom();
     // How long watchFiles waits for the server's start frame. toolboxd sends
     // it once every folder is watched; a recursive walk of a large tree can
@@ -148,6 +156,7 @@ public class MicroVMClient {
     // A miss refreshes it, because a restart can bring a newer agent.
     private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> toolboxFeatures =
         new java.util.concurrent.ConcurrentHashMap<>();
+    private final CellRoutes cellRoutes = new CellRoutes(CellRoutes.MAX_ENTRIES);
 
     /** One bounded fleet-list page plus the opaque token for the next page. */
     public static final class SandboxPage {
@@ -1308,7 +1317,9 @@ public class MicroVMClient {
      * Uploads from {@code data} a piece at a time, so a large file never sits
      * in memory. The options are {@link #uploadFile(String, String, byte[],
      * UploadFileOptions)}'s. The data is read as it is sent, so it is sent
-     * once and never retried.
+     * once and never retried, not even to the cell a 421 names (see
+     * {@link #CELL_ENDPOINT_HEADER}): that 421 is thrown, and a new call with
+     * fresh data goes straight to that cell.
      */
     public void uploadFileStream(String sandboxId, String targetPath, java.io.InputStream data, UploadFileOptions options) {
         String path = toolboxPath(sandboxId, "/files/upload", uploadQuery(sandboxId, options));
@@ -2207,25 +2218,49 @@ public class MicroVMClient {
         // work. A 421, 429 or 503 is answered before any work, so after one
         // a delete of a path that was never there still reports it.
         boolean mayHaveRun = false;
+        String sandbox = sandboxSegment(path);
+        String base = baseFor(sandbox);
+        // One cell hop per call: a second 421 naming a cell surfaces, so two
+        // cells that disagree cannot bounce the request between them.
+        boolean hopped = false;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             String retryAfter = null;
-            HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
-            if (contentType != null) {
-                builder.header("Content-Type", contentType);
-            }
-            if (extraHeaders != null) {
-                for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
-                    builder.header(entry.getKey(), entry.getValue());
-                }
-            }
-            builder.header("Authorization", authorizationHeaderValue());
-            if (team != null) {
-                builder.header(TEAM_HEADER, team);
-            }
-
             try {
-                HttpResponse<T> response = httpClient.send(builder.build(), handler);
+                HttpResponse<T> response = httpClient.send(newRequest(base + path, method, bodyPublisher, contentType, extraHeaders), handler);
+                String cell = cellEndpoint(response);
+                if (cell != null && !hopped) {
+                    // The wrong cell answers before any work and never
+                    // forwards (cells do not trust each other), so going to
+                    // the named cell is this request's first real send, in
+                    // every retry mode. It does not use up a retry.
+                    String target = sandbox == null ? null : cellBase(cell);
+                    if (target != null) {
+                        cellRoutes.put(sandbox, target);
+                        // A body of unknown length is a stream read as it is
+                        // sent, so a second send would carry what is left of
+                        // it. The 421 surfaces instead; the caller's own retry
+                        // goes to the remembered cell.
+                        if (bodyPublisher.contentLength() >= 0) {
+                            discard(response);
+                            base = target;
+                            hopped = true;
+                            response = httpClient.send(newRequest(base + path, method, bodyPublisher, contentType, extraHeaders), handler);
+                            cell = cellEndpoint(response);
+                        }
+                    }
+                }
+                if (cell != null) {
+                    // The sandbox is in another cell, so trying this one again
+                    // cannot help.
+                    return response;
+                }
+                if (response.statusCode() == 404 && sandbox != null && !isFileNotFound(response)) {
+                    // The sandbox may have been deleted; the next call asks
+                    // the configured cell again. A missing file inside it says
+                    // nothing about where the sandbox lives.
+                    cellRoutes.remove(sandbox, base);
+                }
                 if (doneCode != null && mayHaveRun && response.statusCode() >= 400
                     && response.body() instanceof byte[] && doneCode.equals(errorCode((byte[]) response.body()))) {
                     return null;
@@ -2234,10 +2269,8 @@ public class MicroVMClient {
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                     retryAfter = RetryAfter.hint(response);
-                    if (response.body() instanceof java.io.InputStream) {
-                        // Free the connection before the wait.
-                        ((java.io.InputStream) response.body()).close();
-                    }
+                    // Free the connection before the wait.
+                    discard(response);
                 } else {
                     return response;
                 }
@@ -2273,6 +2306,86 @@ public class MicroVMClient {
         throw new MicroVMException("request failed after " + maxRetries + " retries");
     }
 
+    private HttpRequest newRequest(String url, String method, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url)).method(method, bodyPublisher);
+        if (contentType != null) {
+            builder.header("Content-Type", contentType);
+        }
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                builder.header(entry.getKey(), entry.getValue());
+            }
+        }
+        builder.header("Authorization", authorizationHeaderValue());
+        if (team != null) {
+            builder.header(TEAM_HEADER, team);
+        }
+        return builder.build();
+    }
+
+    // Frees the connection of a response that is not handed back.
+    private static void discard(HttpResponse<?> response) throws IOException {
+        if (response.body() instanceof java.io.InputStream) {
+            ((java.io.InputStream) response.body()).close();
+        }
+    }
+
+    /** The cell a 421 names, or null when it is not a cell redirect. */
+    private static String cellEndpoint(HttpResponse<?> response) {
+        if (response.statusCode() != 421) {
+            return null;
+        }
+        return trimToNull(response.headers().firstValue(CELL_ENDPOINT_HEADER).orElse(null));
+    }
+
+    /**
+     * The base URL in a cell redirect, or null when this client must not send
+     * its token there: not an absolute http(s) URL with a host, or plain http
+     * when the client was set up with https, which would let one bad answer
+     * put the token on the wire in clear text.
+     */
+    private String cellBase(String endpoint) {
+        URI uri;
+        try {
+            uri = new URI(endpoint);
+        } catch (java.net.URISyntaxException ex) {
+            return null;
+        }
+        String scheme = uri.getScheme();
+        boolean https = "https".equalsIgnoreCase(scheme);
+        if (!https && !"http".equalsIgnoreCase(scheme) || uri.getHost() == null
+            || uri.getRawQuery() != null || uri.getRawFragment() != null) {
+            return null;
+        }
+        if (!https && apiUrl.regionMatches(true, 0, "https:", 0, 6)) {
+            return null;
+        }
+        return normalizeUrl(endpoint);
+    }
+
+    /** The sandbox a per-sandbox path ({@code /v1/sandboxes/{id}...}) is about, as sent; null for any other path. */
+    private String sandboxSegment(String path) {
+        String prefix = versioned("/sandboxes/");
+        if (!path.startsWith(prefix)) {
+            return null;
+        }
+        int end = prefix.length();
+        while (end < path.length() && path.charAt(end) != '/' && path.charAt(end) != '?') {
+            end++;
+        }
+        return end == prefix.length() ? null : path.substring(prefix.length(), end);
+    }
+
+    /** Where a call about {@code sandbox} goes: the cell a 421 named for it, else the configured URL. */
+    private String baseFor(String sandbox) {
+        String cell = sandbox == null ? null : cellRoutes.get(sandbox);
+        return cell != null ? cell : apiUrl;
+    }
+
+    private static boolean isFileNotFound(HttpResponse<?> response) {
+        return response.body() instanceof byte[] && "file_not_found".equals(errorCode((byte[]) response.body()));
+    }
+
     private static String errorCode(byte[] body) {
         ErrorResponse error = JsonSupport.tryRead(body, ErrorResponse.class);
         return error == null ? null : error.code;
@@ -2300,12 +2413,10 @@ public class MicroVMClient {
         return MicroVMApiException.forStatus(status, null, "request failed with status " + status, retryAfter);
     }
 
-    private URI resolve(String path) {
-        return URI.create(apiUrl + path);
-    }
-
     private URI webSocketUri(String path) {
-        URI uri = resolve(path);
+        // A stream to a sandbox goes to the cell an earlier call learned it
+        // is in. The handshake itself does not follow a 421.
+        URI uri = URI.create(baseFor(sandboxSegment(path)) + path);
         String scheme = uri.getScheme();
         String websocketScheme;
         if ("http".equalsIgnoreCase(scheme)) {
@@ -2485,6 +2596,47 @@ public class MicroVMClient {
         abstract boolean retriesStatus(int status);
 
         abstract boolean retriesTransportFailure(IOException error);
+    }
+
+    /**
+     * The cell each sandbox lives in, learned from 421 answers
+     * (plans/kubernetes-v2-architecture.md §12.4, C16), so later calls about
+     * it skip the wrong cell. A sandbox never changes cell (its ID names it),
+     * so nothing expires: an entry goes on a 404 from that cell, or oldest
+     * first past {@code max}, which bounds a long-lived client's memory.
+     */
+    static final class CellRoutes {
+        static final int MAX_ENTRIES = 10_000;
+
+        private final int max;
+        private final java.util.LinkedHashMap<String, String> routes = new java.util.LinkedHashMap<>();
+
+        CellRoutes(int max) {
+            this.max = max;
+        }
+
+        synchronized String get(String sandbox) {
+            return routes.get(sandbox);
+        }
+
+        synchronized void put(String sandbox, String base) {
+            routes.put(sandbox, base);
+            if (routes.size() > max) {
+                java.util.Iterator<String> oldest = routes.keySet().iterator();
+                oldest.next();
+                oldest.remove();
+            }
+        }
+
+        // Only if it still points at base: a 404 from the configured cell
+        // must not drop a route another thread just learned.
+        synchronized void remove(String sandbox, String base) {
+            routes.remove(sandbox, base);
+        }
+
+        synchronized int size() {
+            return routes.size();
+        }
     }
 
     private static final class ToolboxVersion {

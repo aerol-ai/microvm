@@ -60,13 +60,9 @@ func (c *Client) WatchFiles(ctx context.Context, id, path string, options WatchO
 	if options.Recursive {
 		query.Set("recursive", "true")
 	}
-	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/files/watch?"+query.Encode())
-	if err != nil {
-		return nil, err
-	}
 	header := http.Header{}
 	c.setAuthHeaders(header)
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, header)
+	conn, resp, wsURL, err := c.dialSandbox(ctx, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/files/watch?"+query.Encode(), header)
 	if err != nil {
 		return nil, watchHandshakeError(id, wsURL, resp, err)
 	}

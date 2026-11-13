@@ -353,3 +353,53 @@ func TestSetupMountsAndSecurity(t *testing.T) {
 		t.Fatalf("nil agent context: %+v", sc)
 	}
 }
+
+// Every role gets the federation's key, by reference, and the other cells'
+// addresses in a stable order; setup, which writes the node's settings to
+// its disk, does not get the key.
+func TestStampFederation(t *testing.T) {
+	c := federated(testCluster())
+	inputs := map[string]StampInput{
+		TemplateServer:  {Cluster: c, Node: node("prod-server-0", v1.RoleServer, "", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"},
+		TemplateGateway: {Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2"},
+		TemplateWorker:  {Cluster: c, Node: node("prod-general-x", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]},
+	}
+	for role, in := range inputs {
+		pod, err := Stamp(mustTemplate(t, role), in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := pod.Spec.Containers[containerIndex(pod.Spec.Containers, AgentContainer)]
+		if got := env(agent, "SB_CELL_ENDPOINTS"); got != "1=http://10.0.0.1:8080,2=https://cell2.example.com" {
+			t.Fatalf("%s: SB_CELL_ENDPOINTS = %q", role, got)
+		}
+		var key *corev1.EnvVar
+		for i := range agent.Env {
+			if agent.Env[i].Name == "SB_CELL_ID_KEY" {
+				key = &agent.Env[i]
+			}
+		}
+		if key == nil || key.Value != "" || key.ValueFrom == nil || key.ValueFrom.SecretKeyRef == nil ||
+			key.ValueFrom.SecretKeyRef.Name != "prod-federation" || key.ValueFrom.SecretKeyRef.Key != FederationKeyKey {
+			t.Fatalf("%s: SB_CELL_ID_KEY = %+v", role, key)
+		}
+		for _, ic := range pod.Spec.InitContainers {
+			if ic.Name == SetupContainer && env(ic, "SB_CELL_ENDPOINTS") == "<unset>" {
+				t.Fatalf("%s: setup lost the plain settings", role)
+			}
+			for _, e := range ic.Env {
+				if e.Name == "SB_CELL_ID_KEY" {
+					t.Fatalf("%s: %s gets the key", role, ic.Name)
+				}
+			}
+		}
+	}
+	c.Spec.Federation = nil
+	pod, err := Stamp(mustTemplate(t, TemplateGateway), inputs[TemplateGateway])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env(pod.Spec.Containers[0], "SB_CELL_ID_KEY") != "<unset>" || env(pod.Spec.Containers[0], "SB_CELL_ENDPOINTS") != "<unset>" {
+		t.Fatal("federation settings with no federation")
+	}
+}

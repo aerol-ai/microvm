@@ -140,7 +140,7 @@ func (c *Client) sendUploadStream(ctx context.Context, target, targetPath, fileN
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.send(request)
 	if err != nil {
 		return err
 	}
