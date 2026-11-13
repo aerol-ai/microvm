@@ -118,8 +118,10 @@ func (b *fakeBackend) Specs(_ context.Context, refs []SpecRef) map[string]SpecSu
 	return out
 }
 
+// p is a placement as a cluster stores it: the name qualified with its
+// owner (cluster.QualifiedSandboxName).
 func p(id, name, owner string, version uint64, tags ...string) cluster.Placement {
-	return cluster.Placement{SandboxID: id, Name: name, OwnerRef: owner, OwnerNodeID: "w1", Version: version, CreatedUnix: 1700000000}
+	return cluster.Placement{SandboxID: id, Name: cluster.QualifiedSandboxName(owner, name), OwnerRef: owner, OwnerNodeID: "w1", Version: version, CreatedUnix: 1700000000}
 }
 
 type rig struct {
@@ -575,6 +577,10 @@ func TestOwnerMap(t *testing.T) {
 	}
 	if _, ok := m.Owner("Bad_NS"); ok {
 		t.Fatal("an invalid namespace mapped")
+	}
+	// team:platform is ops's: the namespace platform must not reach it too.
+	if o, ok := m.Owner("platform"); ok {
+		t.Fatalf("Owner(platform) = %q, but team:platform is mapped to ops", o)
 	}
 	for owner, want := range map[string]string{"team:a": "a", "acct:k1": "acct", "team:platform": "ops"} {
 		if got, ok := m.Namespace(owner); !ok || got != want {

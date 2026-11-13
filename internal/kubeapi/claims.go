@@ -277,13 +277,17 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		return nil
 	case "get", "delete":
 		owner := firstKey(owners)
+		claimNotFound := &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
 		it, err := s.find(owner, name)
-		if err != nil {
+		var se *StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return claimNotFound
+		} else if err != nil {
 			return err
 		}
 		sp, ok := s.Backend.Specs(ctx, specRefs(it))[it.Placement.SandboxID]
 		if !isClaim(sp, ok) {
-			return &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
+			return claimNotFound
 		}
 		if verb == "delete" {
 			if err := s.Backend.Delete(ctx, owner, it.Placement.SandboxID); err != nil {

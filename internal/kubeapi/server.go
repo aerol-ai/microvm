@@ -83,15 +83,23 @@ type OwnerMap struct {
 
 var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
-// Owner is a namespace's owner.
+// Owner is a namespace's owner. An owner has one namespace: once the map
+// gives team:x another namespace, the namespace x no longer reaches it, so
+// RBAC on the mapped namespace is the only way to that team's sandboxes.
 func (m OwnerMap) Owner(ns string) (string, bool) {
 	if o, ok := m.Explicit[ns]; ok {
 		return o, true
 	}
-	if len(ns) <= 63 && dnsLabel.MatchString(ns) {
-		return "team:" + ns, true
+	if len(ns) > 63 || !dnsLabel.MatchString(ns) {
+		return "", false
 	}
-	return "", false
+	owner := "team:" + ns
+	for _, o := range m.Explicit {
+		if o == owner {
+			return "", false
+		}
+	}
+	return owner, true
 }
 
 // Namespace is an owner's namespace.

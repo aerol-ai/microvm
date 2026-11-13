@@ -35,10 +35,18 @@ func ValidName(s string) bool {
 // ObjectName is the name a sandbox has in Kubernetes: its AerolVM name when
 // that is a valid object name, else its ID (which always is).
 func ObjectName(p cluster.Placement) string {
-	if ValidName(p.Name) {
-		return p.Name
+	if name := userName(p); ValidName(name) {
+		return name
 	}
 	return p.SandboxID
+}
+
+// userName is the name the sandbox was given. A cluster keeps names unique
+// per owner by storing them qualified with it ("owner:<owner>/<name>",
+// cluster.QualifiedSandboxName), which is never a valid object name.
+func userName(p cluster.Placement) string {
+	_, name, _ := cluster.DecodeSandboxNameKey(p.Name)
+	return name
 }
 
 func rfc3339(unix int64) string {
@@ -64,8 +72,8 @@ func runtimeClass(runtime string) string {
 func SandboxFrom(item kubeview.Item, ns string, spec *SpecSummary) Sandbox {
 	p := item.Placement
 	annotations := map[string]string{AnnotationSandboxID: p.SandboxID}
-	if p.Name != "" && !ValidName(p.Name) {
-		annotations[AnnotationName] = p.Name
+	if name := userName(p); name != "" && !ValidName(name) {
+		annotations[AnnotationName] = name
 	}
 	container := Container{Name: "sandbox"}
 	var runtimeClassName string

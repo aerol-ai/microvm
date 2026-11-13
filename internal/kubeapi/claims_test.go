@@ -52,8 +52,8 @@ func TestClaimCreateGetListDelete(t *testing.T) {
 	if rr, _ := r.call(t, http.MethodGet, claims+"/plain", ""); rr.Code != http.StatusNotFound {
 		t.Fatalf("a plain sandbox as a claim = %d", rr.Code)
 	}
-	if rr, _ := r.call(t, http.MethodGet, claims+"/nope", ""); rr.Code != http.StatusNotFound {
-		t.Fatal("an unknown claim")
+	if rr, out := r.call(t, http.MethodGet, claims+"/nope", ""); rr.Code != http.StatusNotFound || !strings.Contains(out["message"].(string), "sandboxclaims") {
+		t.Fatalf("an unknown claim = %d %v", rr.Code, out["message"])
 	}
 	for _, path := range []string{claims, ext + "/sandboxclaims"} {
 		_, out := r.call(t, http.MethodGet, path, "")
