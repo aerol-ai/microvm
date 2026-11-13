@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // ErrorWriter renders one error in the calling facade's envelope.
@@ -71,6 +72,9 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		// A single node routes nothing: its lookups are the Noop's constant
 		// answers, so they are not counted as control-plane reads.
 		_, single := c.(*cluster.Noop)
+		if single && redirectToCell(svc, id, w, r, write) {
+			return
+		}
 		hop := cluster.RouteHopEdge
 		hint := ""
 		var forwardEpoch uint64
@@ -200,6 +204,12 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			// Not a cluster-known sandbox: let the local handler answer
 			// (it decides 404, or serves a local-only row).
 			cache.Forget(id)
+			// One minted in another cell is that cell's to answer. Only
+			// the edge says so, and only once its placement view has
+			// caught up: before that, "unknown" is a guess.
+			if hop == cluster.RouteHopEdge && cluster.CaughtUp(c) && redirectToCell(svc, id, w, r, write) {
+				return
+			}
 			serveLocal(localID)
 			return
 		case errors.Is(err, cluster.ErrOrphaned):
@@ -240,6 +250,21 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		r = r.WithContext(cluster.ContextWithOwnerEpoch(r.Context(), owner.Epoch))
 		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
+}
+
+// redirectToCell answers 421 with the address of the cell a sandbox id was
+// minted in, when that is another cell (C16, service.OtherCellEndpoint).
+// Cells do not forward to each other, since each trusts only its own nodes;
+// the SDKs send the request again to the address the header names.
+func redirectToCell(svc *service.Service, id string, w http.ResponseWriter, r *http.Request, write ErrorWriter) bool {
+	endpoint, ok := svc.OtherCellEndpoint(r.Context(), id)
+	if !ok {
+		return false
+	}
+	service.RecordCellRedirect()
+	w.Header().Set(models.CellEndpointHeader, endpoint)
+	write(w, http.StatusMisdirectedRequest, "this sandbox is in another cell: send the request to the address in "+models.CellEndpointHeader)
+	return true
 }
 
 // WriteOwnershipFenced answers a request for a sandbox this node has paused

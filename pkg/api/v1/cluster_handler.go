@@ -86,7 +86,7 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 // call (the pre-existing, non-idempotent default). The id is namespaced by the
 // create owner, so one tenant's key never resolves to another tenant's id.
 func (h *handlers) idempotentCreateID(r *http.Request) string {
-	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	return clustercreate.DeterministicSandboxID(h.deps.Service, service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
 }
 
 // withIdempotencyKey names the request's Idempotency-Key on its context, so a

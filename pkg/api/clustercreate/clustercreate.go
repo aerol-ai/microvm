@@ -45,14 +45,18 @@ const (
 // two tenants that happen to choose the same key never collide, and so a
 // derived id satisfies CreateSandboxWithID's owner check on replay. The shape
 // ("sb-" + 16 hex) matches Service.NewSandboxID, so the id is a valid
-// container name and is indistinguishable downstream from a random one.
-func DeterministicSandboxID(ownerRef, key string) string {
+// container name and is indistinguishable downstream from a random one. In a
+// federation of cells its first byte is this cell's, masked as a minted id's
+// (Service.IDInCell): the SDKs send a key with every create, so without it
+// most sandboxes could not be routed to their cell. A nil svc (tests) leaves
+// the digest as it is.
+func DeterministicSandboxID(svc *service.Service, ownerRef, key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerRef) + "\x00" + key))
-	return "sb-" + hex.EncodeToString(sum[:8])
+	return svc.IDInCell("sb-" + hex.EncodeToString(sum[:8]))
 }
 
 // ErrorWriter renders one error in the calling facade's envelope. code is

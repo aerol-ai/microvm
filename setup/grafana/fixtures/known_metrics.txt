@@ -180,3 +180,4 @@ aerolvm_upgrade_step_refused_total
 aerolvm_active_fsm_ops_version
 aerolvm_members_below_active_version
 aerolvm_obsolete_servers_removed_total
+aerolvm_cell_redirects_total
