@@ -1298,6 +1298,51 @@ example admission policy that refuses unsigned AerolVM images.
   Kubernetes service account.
   Clients reach sandbox ports through AerolVM's normal sandbox links (§7.1).
 
+### 16.1 How C17 is built (Phase 6)
+
+The user's decisions (2026-11-13): templates and warm pools are Kubernetes
+CRDs, and a namespace shows all of its owner's sandboxes.
+
+- **Two APIServices on the gateways**, `v1beta1.agents.x-k8s.io` and
+  `v1beta1.extensions.agents.x-k8s.io`, on port 9443, with a serving
+  certificate from cert-manager (`cluster.agentSandboxAPI.enabled`, off by
+  default). The kube-apiserver reaches the gateways through the front
+  proxy; the gateways trust only its client CA and ask
+  `SubjectAccessReview` (cached) whether the user may do the verb.
+- **Versions are Raft indexes.** A sandbox's `resourceVersion` is the
+  larger of its placement row's `Version` and `RunStateIndex`. Each gateway
+  keeps a ring of recent changes from the placement feed (`internal/kubeview`),
+  so a watch resumes on any gateway; a version older than the ring answers
+  `410 Gone`, and a feed resync closes every watch with that answer.
+- **Run state comes from the workers.** A worker reports a stopped or
+  failed sandbox in a batch (`opSetRunStates`, fsm version 18), which edits
+  the hot row without moving its `Version`, so an owner's other readers are
+  unaffected. This is how `Suspended` and `Ready` reach `kubectl`.
+- **Writes go through `/v1`.** A Kubernetes create, delete, stop or start is
+  a call to the gateway's own `/v1` handler, in process, as the Kubernetes
+  user (principal `kubernetes:<user>`, surface `kubernetes`), so it meets
+  the same create policy, quota, idempotency and audit as an SDK call. A
+  forward to a worker carries no credential: the edge names the caller in
+  `X-Cluster-On-Behalf-Of` and `-Owner`, and the worker grants exactly that
+  caller, one owner with the runner role.
+- **Namespaces are owners.** Namespace `N` is `team:N`; the
+  `namespaces` map names any other owner, and then `N` no longer reaches
+  `team:N`. Deleting a namespace deletes every sandbox of its owner.
+- **Templates and warm pools** are two internal CRDs
+  (`sandboxtemplates.k8s.aerolvm.io`, `sandboxwarmpools.k8s.aerolvm.io`,
+  kept by Helm when the API is turned off). The gateways write only these,
+  after checking each write against the same field table as a create.
+- **A claim is its sandbox**, tagged `agents.x-k8s.io/claim` and
+  `agents.x-k8s.io/warm-pool`; nothing per claim is stored.
+- **Not built yet:** warm pools pre-starting sandboxes (a claim
+  cold-starts; the plan is to sum `replicas` per image into the FSM's
+  warm-pool entries, next to the operator's own); the upstream release pin
+  with its e2e gate and golden examples; carrying the claim mark in the
+  placement row (a claim list reads every spec summary in the namespace);
+  and a second `kubectl apply` of a Sandbox or a claim (annotations are
+  not kept, so kubectl's own annotation makes the patch one that only
+  `operatingMode` may pass; claims have no patch at all).
+
 ---
 
 # Part 4: Building and proving it
@@ -2298,7 +2343,16 @@ not already carry):
   client got and destroyed the other cell's sandbox, the second get went
   straight to the right cell. Its first run found that keyed creates' IDs
   had no cell (fixed in #1229).
-- Next: C17 (the agent-sandbox API).
+- **C17 built** (the stack from #1233): the agent-sandbox API (§16.1).
+  Live on kind (`AEROL_FCKIND_PROOF=kubeapi`), four runs, each one step
+  further: no placement feed without Caddy, the gateways' NetworkPolicy
+  shut the kube-apiserver out of port 9443, and names stored qualified
+  with their owner showed every sandbox under its ID; a fourth found that
+  `kubectl wait` on a claim needs the bookmark ending the initial list. The
+  fifth (`p6-kubeapi-5`) passed every step: create, wait, stop and start
+  under a watch, a viewer refused, another namespace empty, delete and
+  create again (a new uid), and a template, a pool and a claim.
+- Next: the C17 follow-ups in §16.1's "not built yet".
 
 ## 19. Tests, drills and benchmarks
 
