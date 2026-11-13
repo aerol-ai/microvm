@@ -19,7 +19,14 @@ import (
 // and most of its garbage.
 
 // allocBytesPerRun is the heap allocated by one call of f, averaged over n.
+// TotalAlloc counts the whole process, so it runs on one P, as
+// testing.AllocsPerRun does: a goroutine an earlier test left running (in a
+// full run of this package, a capacity lease loop's ticker is still alive
+// here) must not allocate in parallel and be counted as f's cost. Next to
+// a goroutine allocating in a loop, an empty f measured above zero 5 times
+// in 50 without this, and never with it.
 func allocBytesPerRun(n int, f func()) uint64 {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 	f() // warm up: lazily built state is not the call's cost
 	var before, after runtime.MemStats
 	runtime.GC()

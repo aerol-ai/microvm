@@ -1110,6 +1110,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.EnableCluster {
 		svc.Cluster().AttachInternalHandler(server.Handler())
 	}
+	// The agent-sandbox API (C17): ingress nodes with SB_AGENT_SANDBOX_API
+	// serve it on their own TLS listener. It is opt-in and off the node's
+	// main job, so a failure to start is logged, not fatal; the APIService
+	// then shows it unavailable.
+	if _, err := startAgentSandboxAPI(ctx, cfg, svc.Cluster(), server.KubeBackend(), logger); err != nil {
+		logger.Error("agent-sandbox API not started", "error", err)
+	}
 	logPATBootSettings(logger, cfg)
 	// SB_PAT_SCOPE=host: Caddy's own listener, where every request is public
 	// (plans/identity-and-access.md §5.11). Opened before the API listener

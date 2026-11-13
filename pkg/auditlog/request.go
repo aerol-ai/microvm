@@ -50,6 +50,9 @@ const (
 	SurfaceMCP = "mcp"
 	// SurfaceSSH is an SSH session opened through the gateway.
 	SurfaceSSH = "ssh"
+	// SurfaceKubernetes is the agent-sandbox API's inner API call on behalf
+	// of a Kubernetes user (internal/kubeapi, C17).
+	SurfaceKubernetes = "kubernetes"
 )
 
 // RefSSH is the ref of an SSH session-open record.

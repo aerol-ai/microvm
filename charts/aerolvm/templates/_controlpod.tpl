@@ -12,7 +12,16 @@ cluster files (init or join --files-only, F14).
 {{- $role := .role -}}
 {{- $gateway := eq $role "gateway" -}}
 {{- $edge := and $gateway $root.Values.edge.enabled -}}
+{{- $kubeAPI := $root.Values.cluster.agentSandboxAPI.enabled -}}
+{{- if and $gateway $kubeAPI }}
+# The agent-sandbox API (C17) asks Kubernetes who may do what
+# (SubjectAccessReview) and reads the front-proxy CA: the one Kubernetes
+# right a gateway holds, through its own service account.
+serviceAccountName: {{ $root.Values.cluster.name }}-gateway
+automountServiceAccountToken: true
+{{- else }}
 automountServiceAccountToken: false
+{{- end }}
 enableServiceLinks: false
 securityContext:
   runAsNonRoot: true
@@ -101,6 +110,9 @@ containers:
       {{- else }}
       - { name: SB_ENABLE_CADDY, value: "false" }
       {{- end }}
+      {{- if $kubeAPI }}
+      {{- include "aerolvm.agentSandboxEnv" $root | nindent 6 }}
+      {{- end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
       {{- if or (hasPrefix "SB_CLUSTER_" $k) (eq $k "SB_DEAD_OWNER_GRACE") }}
       - { name: {{ $k }}, value: {{ $v | quote }} }
@@ -116,6 +128,9 @@ containers:
       {{- if $gateway }}
       - { name: ssh, containerPort: 2220 }
       {{- end }}
+      {{- if and $gateway $kubeAPI }}
+      - { name: agent-sandbox, containerPort: 9443 }
+      {{- end }}
     readinessProbe:
       httpGet: { path: /ready, port: api }
       periodSeconds: 5
@@ -130,6 +145,9 @@ containers:
       - { name: tmp, mountPath: /tmp }
       {{- if $edge }}
       - { name: edge-cert, mountPath: /etc/aerolvm/tls, readOnly: true }
+      {{- end }}
+      {{- if and $gateway $kubeAPI }}
+      - { name: agent-sandbox-tls, mountPath: /etc/aerolvm/agent-sandbox-api, readOnly: true }
       {{- end }}
   {{- if $edge }}
   - name: edge
@@ -156,6 +174,14 @@ volumes:
   - { name: state, emptyDir: {} }
   - { name: run, emptyDir: {} }
   - { name: tmp, emptyDir: {} }
+  {{- if and $gateway $kubeAPI }}
+  - name: agent-sandbox-tls
+    secret:
+      secretName: {{ $root.Values.cluster.name }}-agent-sandbox-api-tls
+      items:
+        - { key: tls.crt, path: tls.crt }
+        - { key: tls.key, path: tls.key }
+  {{- end }}
   {{- if $edge }}
   - name: edge-config
     configMap:

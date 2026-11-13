@@ -3,7 +3,7 @@
 # architecture.md Phase 5, "Firecracker pools"), proven on kind on one EC2
 # machine with nested virtualization, the setting spike S6 tested.
 #
-#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move|gmove] fckind.sh <name>
+#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move|gmove|kubeapi] fckind.sh <name>
 #
 # pod (the default): one worker, a VM survives an agent restart. move:
 # cluster mode, every worker a Firecracker worker; a VM's worker is
@@ -49,7 +49,7 @@ URL="$url" PROOF="${AEROL_FCKIND_PROOF:-pod}" python3 -c 'import os, sys; sys.st
 say "source ${ref:0:12} staged; launching $itype with nested virtualization"
 
 id="$(REGION="$region" ITYPE="$itype" NAME="$name" UD="$sd/userdata.sh" "$py" - <<'PY'
-import boto3, datetime, os
+import boto3, datetime, gzip, os
 region, itype, name = os.environ["REGION"], os.environ["ITYPE"], os.environ["NAME"]
 ec2 = boto3.client("ec2", region_name=region)
 ssm = boto3.client("ssm", region_name=region)
@@ -59,7 +59,8 @@ tags = [{"Key": "Name", "Value": "aerol-fckind-" + name}, {"Key": "aerol:owner",
         {"Key": "aerol:ttl", "Value": ttl}, {"Key": "aerol:run", "Value": name}]
 r = ec2.run_instances(ImageId=ami, InstanceType=itype, MinCount=1, MaxCount=1,
     CpuOptions={"NestedVirtualization": "enabled"}, InstanceInitiatedShutdownBehavior="terminate",
-    UserData=open(os.environ["UD"]).read(),
+    # Gzipped: EC2 takes 16 KB of user data, and cloud-init unpacks it.
+    UserData=gzip.compress(open(os.environ["UD"], "rb").read()),
     BlockDeviceMappings=[{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 60, "VolumeType": "gp3", "DeleteOnTermination": True}}],
     TagSpecifications=[{"ResourceType": "instance", "Tags": tags}, {"ResourceType": "volume", "Tags": tags}])
 print(r["Instances"][0]["InstanceId"])

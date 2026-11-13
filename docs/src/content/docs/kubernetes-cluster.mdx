@@ -30,7 +30,7 @@ There are four kinds of pod:
 - **Servers** keep the list of every sandbox and which worker runs it. There are three or five, one per zone, each with its own disk. They agree using Raft, so the cluster keeps working when one zone is down.
 - **Gateways** take every request: the API, sandbox links, SSH. They are stateless, so a load balancer can send a request to any of them. A gateway passes each request to the worker that runs the sandbox.
 - **Workers** run the sandboxes, one worker pod per machine. The pod asks for nearly the whole machine, so Kubernetes and your cost tools see the machine as full.
-- **The operator** builds and watches all of the above. It is the only AerolVM pod that talks to the Kubernetes API.
+- **The operator** builds and watches all of the above. It is the only AerolVM pod that talks to the Kubernetes API, unless you turn on the [Kubernetes API for sandboxes](/kubernetes-api/): then the gateways may also ask Kubernetes who may do what, and store templates and warm pools.
 
 Servers, gateways and the operator run under the `restricted` pod security level, as a normal user with no special rights. Worker pods are privileged, because they build sandboxes, so they run in a namespace of their own, the only one that allows it.
 
@@ -380,6 +380,7 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.gateways.gatewayRef` | Sit behind your own Gateway API Gateway instead, as `name` and `namespace`. | none |
 | `cluster.workerPools` | One entry per kind of worker machine: `machine` size, `minWorkers`, `maxWorkers`, `headroomPercent`, `zoneLossReservePercent`, `runtimes` (the only runtimes its workers run), `nodeSelector`, `tolerations`, `provisioner`, `decommission` (`drainWindow`, `deadline`) and `maxMachineAge`. | none (required) |
 | `cluster.createPolicy` | What any sandbox may be: images, runtimes, size, root, GPU. Every node checks it. Turning it on, changing it or turning it off reaches every running node within a minute. See [Limit what users can create](/enterprise/create-policy/). | none |
+| `cluster.agentSandboxAPI` | `enabled` serves `kubectl get sandboxes` and the agent-sandbox kinds from the gateways (needs cert-manager); `namespaces` maps a namespace to an owner other than the team of the same name. See [The Kubernetes API](/kubernetes-api/). | off |
 | `cluster.operator.replicas` | Operator pods; one leads at a time. | `2` |
 | `networkPolicy.extraIngressFrom` | Who else may reach a worker pod, as NetworkPolicy peers. | none |
 | `monitoring.prometheusNamespace` | The namespace Prometheus runs in; only it may read the workers' metrics. | `monitoring` |

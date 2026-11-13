@@ -76,6 +76,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/getting-started/single-node-setup', '- Single Node Cloud Setup'),
       link('/kubernetes', '- Kubernetes'),
       link('/kubernetes-cluster', '- Kubernetes Cluster Mode'),
+      link('/kubernetes-api', '- Kubernetes API (kubectl)'),
       { ...link('/cluster', '- Cluster Setup'), children: clusterPages },
     ],
   },
