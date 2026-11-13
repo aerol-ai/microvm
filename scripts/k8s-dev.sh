@@ -55,7 +55,9 @@ case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; *) arch=amd64 ;; esac
 dist="$root/dist/k8s-dev"
 mkdir -p "$dist"
 echo "k8s-dev: building linux/$arch binaries" >&2
-CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
+# toolboxd carries sandboxd's version, as a release builds it: a warm slot
+# is refused when the agent in it reports another (readysock_park.go).
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
 if [[ "$mode" == cluster ]]; then
   # The operator is its own Go module (operator/).
