@@ -143,7 +143,7 @@ func (s *Service) ExportMove(ctx context.Context, id, peer string, w io.Writer) 
 		return ErrMoveNotForThisNode
 	}
 	defer s.moveTargets.clear(id)
-	inc, err := s.ownedIncarnation(id)
+	inc, err := s.ownedIncarnation(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -180,13 +180,19 @@ func (s *Service) ExportMove(ctx context.Context, id, peer string, w io.Writer) 
 	return sw.Close()
 }
 
-// ownedIncarnation is id's placement incarnation while this node owns it.
-func (s *Service) ownedIncarnation(id string) (string, error) {
+// ownedIncarnation is id's placement incarnation while this node owns it,
+// read from the leader: a worker's own view lags a reassign, and the target
+// asks just after one (StartMoved; p5-move-7 refused its own sandbox).
+func (s *Service) ownedIncarnation(ctx context.Context, id string) (string, error) {
 	c := s.Cluster()
 	if c == nil {
 		return "", errors.New("snapshot moves need cluster mode")
 	}
-	p, ok := c.PlacementOf(id)
+	got, err := c.AuthoritativePlacementsByIDs(ctx, []string{id})
+	if err != nil {
+		return "", fmt.Errorf("%s: read its placement: %w", id, err)
+	}
+	p, ok := got[id]
 	if !ok || strings.TrimSpace(p.OwnerNodeID) != c.SelfNodeID() {
 		return "", fmt.Errorf("%s: this node does not own it", id)
 	}
@@ -331,7 +337,7 @@ func (s *Service) DropMove(ctx context.Context, id string) error {
 // StartMoved starts id, which moved here, from its memory.
 func (s *Service) StartMoved(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
-	if _, err := s.ownedIncarnation(id); err != nil {
+	if _, err := s.ownedIncarnation(ctx, id); err != nil {
 		return err
 	}
 	s.movesIn.clear(id)

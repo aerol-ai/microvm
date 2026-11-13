@@ -119,7 +119,20 @@ for m in d.get("members", d):
     # Moved but not started: a start restores it on the target.
     say "start on the target: $(api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/start | head -c 200)"
   fi
-  say "after: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
+  # A gateway's owner view and the resumed guest's network both settle
+  # within seconds of the swap.
+  local res
+  for i in $(seq 1 15); do
+    res=$(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')
+    grep -q '"exit_code":0' <<<"$res" && break
+    sleep 2
+  done
+  say "after (try $i): $res"
+  if ! grep -q '"exit_code":0' <<<"$res"; then
+    for w in $($kw get pods -o name); do
+      $kw logs $w -c agent 2>&1 | grep -iE 'restore|resume|toolbox|firecracker|snapshot|move' | grep -v 'request complete' | tail -6 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
+    done
+  fi
   for w in $($kw get pods -o name); do
     $kw logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"
   done

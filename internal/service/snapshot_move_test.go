@@ -61,6 +61,15 @@ func (c *moveStubCluster) PlacementOf(id string) (cluster.Placement, bool) {
 	return cluster.Placement{SandboxID: id, OwnerNodeID: c.owner, IncarnationID: "inc-1"}, true
 }
 
+// AuthoritativePlacementsByIDs is the leader's answer: the same placement.
+func (c *moveStubCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		out[id], _ = c.PlacementOf(id)
+	}
+	return out, nil
+}
+
 func (c *moveStubCluster) LookupMember(id string) (cluster.Member, bool) {
 	return cluster.Member{NodeID: id, Alive: true, InternalURL: c.srv.URL}, true
 }
