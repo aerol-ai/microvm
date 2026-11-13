@@ -44,6 +44,9 @@ const (
 	// importMoveTimeout bounds the target's pull of the bundle: a VM's
 	// memory and disks, gigabytes on the internal network.
 	importMoveTimeout = 15 * time.Minute
+	// moveStartTimeout bounds the target's start after the swap: a restore
+	// that copies the sandbox's disk into place first.
+	moveStartTimeout = 5 * time.Minute
 )
 
 // SnapshotMoveHandler is the worker's half of a snapshot move. It is
@@ -151,7 +154,7 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	}); err != nil {
 		return drop(err)
 	}
-	sctx, cancel := context.WithTimeout(ctx, moveStepTimeout)
+	sctx, cancel := context.WithTimeout(ctx, moveStartTimeout)
 	out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}})
 	cancel()
 	if err == nil && out.Error != "" {

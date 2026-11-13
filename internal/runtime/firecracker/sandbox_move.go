@@ -3,12 +3,14 @@ package firecracker
 import (
 	"archive/tar"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -69,6 +71,23 @@ func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w 
 	return tw.Close()
 }
 
+// A VM's disk is a 10 GiB image of mostly holes and its memory file is
+// mostly holes too (p5-move-6: 50 MiB and 73 MiB used). Sent whole, a move
+// carried 10.5 GiB of zeros and the target wrote every one, so its disk
+// was no longer sparse and the start's copy into the jailer took longer
+// than the move's start step. A file with holes therefore goes as its
+// data ranges only: sparseSizeKey (PAX) gives its full size, and the entry
+// is a table of ranges (sparseTable) followed by their bytes. The target
+// writes no zero block, so its copy stays sparse either way.
+
+const (
+	// sparseSizeKey marks a sparse entry and gives the file's full size.
+	sparseSizeKey = "AEROLVM.sparse.size"
+	// maxMoveFileSize and maxMoveRanges bound what an import accepts.
+	maxMoveFileSize = int64(1) << 40
+	maxMoveRanges   = 1 << 20
+)
+
 func tarFile(tw *tar.Writer, path, name string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -82,11 +101,75 @@ func tarFile(tw *tar.Writer, path, name string) error {
 	if !st.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", name)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: st.Size(), Typeflag: tar.TypeReg, ModTime: st.ModTime()}); err != nil {
+	size := st.Size()
+	ranges := dataRanges(f, size)
+	if size == 0 || (len(ranges) == 1 && ranges[0] == byteRange{0, size}) {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: size, Typeflag: tar.TypeReg, ModTime: st.ModTime()}); err != nil {
+			return err
+		}
+		_, err = io.Copy(tw, io.NewSectionReader(f, 0, size))
 		return err
 	}
-	_, err = io.Copy(tw, f)
-	return err
+	table := sparseTable(ranges)
+	entry := int64(len(table))
+	for _, r := range ranges {
+		entry += r.end - r.start
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: entry, Typeflag: tar.TypeReg, ModTime: st.ModTime(),
+		Format: tar.FormatPAX, PAXRecords: map[string]string{sparseSizeKey: strconv.FormatInt(size, 10)}}); err != nil {
+		return err
+	}
+	if _, err := tw.Write(table); err != nil {
+		return err
+	}
+	for _, r := range ranges {
+		if _, err := io.Copy(tw, io.NewSectionReader(f, r.start, r.end-r.start)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sparseTable is a sparse entry's head: the range count, then each range's
+// start and end, big-endian.
+func sparseTable(ranges []byteRange) []byte {
+	out := make([]byte, 4, 4+16*len(ranges))
+	binary.BigEndian.PutUint32(out, uint32(len(ranges)))
+	for _, r := range ranges {
+		out = binary.BigEndian.AppendUint64(out, uint64(r.start))
+		out = binary.BigEndian.AppendUint64(out, uint64(r.end))
+	}
+	return out
+}
+
+// readSparseTable reads and checks a sparse entry's table: ranges in
+// order, apart, inside size, and their bytes exactly the rest of the entry.
+func readSparseTable(r io.Reader, size, entry int64) ([]byteRange, error) {
+	var n [4]byte
+	if _, err := io.ReadFull(r, n[:]); err != nil {
+		return nil, fmt.Errorf("sparse table: %w", err)
+	}
+	count := int64(binary.BigEndian.Uint32(n[:]))
+	if count > maxMoveRanges || 4+16*count > entry {
+		return nil, fmt.Errorf("sparse table: %d ranges", count)
+	}
+	raw := make([]byte, 16*count)
+	if _, err := io.ReadFull(r, raw); err != nil {
+		return nil, fmt.Errorf("sparse table: %w", err)
+	}
+	ranges := make([]byteRange, count)
+	data, prev := int64(0), int64(0)
+	for i := range ranges {
+		start, end := int64(binary.BigEndian.Uint64(raw[16*i:])), int64(binary.BigEndian.Uint64(raw[16*i+8:]))
+		if start < prev || end <= start || end > size {
+			return nil, fmt.Errorf("sparse table: range %d is [%d, %d) in a %d-byte file", i, start, end, size)
+		}
+		ranges[i], prev, data = byteRange{start, end}, end, data+end-start
+	}
+	if 4+16*count+data != entry {
+		return nil, fmt.Errorf("sparse table: %d bytes of ranges in a %d-byte entry", data, entry)
+	}
+	return ranges, nil
 }
 
 // ImportSandboxSnapshot installs, under this worker's snapshot folder, a
@@ -141,7 +224,7 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 		if err := checkMoveEntry(h, manifest, got); err != nil {
 			return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 		}
-		if err := writeMoveEntry(filepath.Join(staging, h.Name), tr); err != nil {
+		if err := writeMoveEntry(filepath.Join(staging, h.Name), h, tr); err != nil {
 			return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 		}
 		got[h.Name] = true
@@ -205,12 +288,40 @@ func checkMoveEntry(h *tar.Header, manifest *sandboxSnapshotManifest, got map[st
 	return fmt.Errorf("%q is not part of a sandbox snapshot", h.Name)
 }
 
-func writeMoveEntry(path string, r io.Reader) error {
+// writeMoveEntry writes the entry h, read from r, to a new file at path,
+// leaving every zero block a hole.
+func writeMoveEntry(path string, h *tar.Header, r io.Reader) error {
+	size, ranges := h.Size, []byteRange{{0, h.Size}}
+	if v, ok := h.PAXRecords[sparseSizeKey]; ok {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 || n > maxMoveFileSize {
+			return fmt.Errorf("%s: sparse size %q", h.Name, v)
+		}
+		size = n
+		if ranges, err = readSparseTable(r, size, h.Size); err != nil {
+			return fmt.Errorf("%s: %w", h.Name, err)
+		}
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	buf := make([]byte, sparseBufSize)
+	for _, rg := range ranges {
+		for off := rg.start; off < rg.end; {
+			chunk := buf[:min(int64(len(buf)), rg.end-off)]
+			if _, err := io.ReadFull(r, chunk); err != nil {
+				_ = f.Close()
+				return err
+			}
+			if err := writeDataBlocks(f, chunk, off); err != nil {
+				_ = f.Close()
+				return err
+			}
+			off += int64(len(chunk))
+		}
+	}
+	if err := f.Truncate(size); err != nil {
 		_ = f.Close()
 		return err
 	}

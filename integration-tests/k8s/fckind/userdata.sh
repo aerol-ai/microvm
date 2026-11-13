@@ -108,7 +108,17 @@ for m in d.get("members", d):
   $kw exec "$owner" -c agent -- sh -c "ls -ls /var/lib/sandboxd/firecracker/templates/_sandboxes/$id/ 2>&1" 2>&1 | tail -6 | sed 's/^/FCK   source files: /'
   owner2=$(api http://127.0.0.1:$port/v1/cluster/placements/$id | python3 -c 'import json,sys; d=json.load(sys.stdin); o=d.get("owner"); print(o.get("node_id") if isinstance(o, dict) else (o or d.get("owner_node_id","")))')
   say "owner after: $owner2"
-  say "sandbox after: $(api http://127.0.0.1:$port/v1/sandboxes/$id | head -c 200)"
+  local after
+  after=$(api http://127.0.0.1:$port/v1/sandboxes/$id)
+  say "sandbox after: $(head -c 200 <<<"$after")"
+  # The leader logs the move's steps (it runs on a server).
+  for sv in aerolvm-server-0 aerolvm-server-1 aerolvm-server-2; do
+    $kc logs $sv 2>/dev/null | grep -E 'snapshot move|decommission pass' | tail -4 | cut -c1-400 | sed "s|^|FCK   $sv: |"
+  done
+  if grep -q '"status":"stopped"' <<<"$after"; then
+    # Moved but not started: a start restores it on the target.
+    say "start on the target: $(api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/start | head -c 200)"
+  fi
   say "after: $(ex 'echo boot-$(cut -c1-8 /proc/sys/kernel/random/boot_id) counter-$(cat /tmp/counter)')"
   for w in $($kw get pods -o name); do
     $kw logs $w -c agent 2>/dev/null | grep -E 'snapshot move|move (import|export)|moved' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${w#pod/}: |"

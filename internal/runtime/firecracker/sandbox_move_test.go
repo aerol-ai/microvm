@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -140,5 +143,129 @@ func TestDropImportedSnapshot(t *testing.T) {
 	}
 	if err := b.driver.DropImportedSnapshot(ctx, "bad id/"); err == nil {
 		t.Fatal("a bad id was accepted")
+	}
+}
+
+// writeHoley makes a size-byte file whose only data is at each offset.
+func writeHoley(t *testing.T, path string, size int64, data map[int64]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	for off, s := range data {
+		if _, err := f.WriteAt([]byte(s), off); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A file of holes moves as its data only and lands with its holes (F36:
+// a VM's 10 GiB disk went whole, and the target's copy was dense).
+func TestMoveEntryKeepsHoles(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "disk")
+	const size = 64 << 20
+	data := map[int64]string{0: "boot", 32 << 20: strings.Repeat("d", 10_000), size - 5: "tail!"}
+	writeHoley(t, src, size, data)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tarFile(tw, src, "disk"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() > 1<<20 {
+		t.Fatalf("a %d-byte file with %d data bytes sent %d bytes", size, 10_009, buf.Len())
+	}
+	tr := tar.NewReader(&buf)
+	h, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "copy")
+	if err := writeMoveEntry(dst, h, tr); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.ReadFile(src)
+	got, _ := os.ReadFile(dst)
+	if !bytes.Equal(got, want) {
+		t.Fatal("the copy's bytes differ")
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(dst, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Blocks*512 > 4<<20 {
+		t.Fatalf("the copy takes %d bytes on disk for %d bytes of data", st.Blocks*512, 10_009)
+	}
+
+	// A dense file moves whole, and its zero blocks become holes.
+	dense := filepath.Join(dir, "dense")
+	if err := os.WriteFile(dense, append(bytes.Repeat([]byte{0}, 1<<20), "end"...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	tw = tar.NewWriter(&buf)
+	if err := tarFile(tw, dense, "dense"); err != nil {
+		t.Fatal(err)
+	}
+	_ = tw.Close()
+	tr = tar.NewReader(&buf)
+	if h, err = tr.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeMoveEntry(filepath.Join(dir, "dense-copy"), h, tr); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(filepath.Join(dir, "dense-copy"))
+	if len(got) != 1<<20+3 || string(got[len(got)-3:]) != "end" {
+		t.Fatalf("dense copy: %d bytes", len(got))
+	}
+}
+
+func TestMoveEntryRefusesBadRanges(t *testing.T) {
+	entry := func(size string, table []byte, data int) (*tar.Header, io.Reader) {
+		body := append(append([]byte{}, table...), bytes.Repeat([]byte("x"), data)...)
+		return &tar.Header{Name: "disk", Size: int64(len(body)), PAXRecords: map[string]string{sparseSizeKey: size}}, bytes.NewReader(body)
+	}
+	two := func(a, b, c, d int64) []byte { return sparseTable([]byteRange{{a, b}, {c, d}}) }
+	for _, tc := range []struct {
+		name  string
+		size  string
+		table []byte
+		data  int
+	}{
+		{"a size that is not a number", "ten", sparseTable(nil), 0},
+		{"a negative size", "-1", sparseTable(nil), 0},
+		{"a size past the bound", "1099511627777", sparseTable(nil), 0},
+		{"ranges out of order", "100", two(50, 60, 10, 20), 20},
+		{"overlapping ranges", "100", two(10, 30, 20, 40), 40},
+		{"a range past the end", "100", sparseTable([]byteRange{{90, 110}}), 20},
+		{"an empty range", "100", sparseTable([]byteRange{{10, 10}}), 0},
+		{"fewer bytes than the ranges", "100", sparseTable([]byteRange{{0, 50}}), 10},
+		{"more bytes than the ranges", "100", sparseTable([]byteRange{{0, 5}}), 10},
+		{"a table cut short", "100", sparseTable([]byteRange{{0, 5}})[:10], 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, r := entry(tc.size, tc.table, tc.data)
+			if err := writeMoveEntry(filepath.Join(t.TempDir(), "disk"), h, r); err == nil {
+				t.Fatal("written")
+			}
+		})
+	}
+	// An all-hole file: no ranges, its full size.
+	h, r := entry("4096", sparseTable(nil), 0)
+	p := filepath.Join(t.TempDir(), "holes")
+	if err := writeMoveEntry(p, h, r); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(p); st.Size() != 4096 {
+		t.Fatalf("size %d", st.Size())
 	}
 }
