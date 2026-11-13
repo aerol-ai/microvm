@@ -52,6 +52,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
 			"SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER",
 			"SB_CLUSTER_RESERVE_APPLY_LIMIT",
+			"SB_CLUSTER_EXTERNAL_CA",
 			"SB_IMAGE_PULL_MAX_CONCURRENT",
 			"SB_IMAGE_PULL_FAILURE_BACKOFF",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
@@ -129,6 +130,9 @@ func TestLoadCases(t *testing.T) {
 				}
 				if cfg.ClusterMaxAutoVoters != 5 {
 					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
+				}
+				if cfg.ClusterExternalCA {
+					t.Fatal("expected the external-CA mode off by default")
 				}
 				if cfg.ClusterReserveApplyLimit != 256 {
 					t.Fatalf("expected default ClusterReserveApplyLimit=256, got %d", cfg.ClusterReserveApplyLimit)

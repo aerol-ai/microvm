@@ -234,6 +234,33 @@ func leafCertificate(cert *tls.Certificate) (*x509.Certificate, error) {
 	return x509.ParseCertificate(cert.Certificate[0])
 }
 
+// certRoleSANprefix is the URI SAN an external-CA certificate carries for
+// its node's role (aerolvm-role:<role>, plan §15.2.1). The operator asks
+// for it; the bank's issuer signs it.
+const certRoleSANprefix = "aerolvm-role:"
+
+// ExtractCertRoles returns every role a certificate's URI SANs name. A
+// join by certificate takes exactly one.
+func ExtractCertRoles(cert *x509.Certificate) []string {
+	if cert == nil {
+		return nil
+	}
+	var out []string
+	for _, uri := range cert.URIs {
+		if uri == nil {
+			continue
+		}
+		s := uri.String()
+		if uri.Opaque != "" {
+			s = uri.Scheme + ":" + uri.Opaque
+		}
+		if role, ok := strings.CutPrefix(strings.TrimSpace(s), certRoleSANprefix); ok && strings.TrimSpace(role) != "" {
+			out = append(out, strings.TrimSpace(role))
+		}
+	}
+	return out
+}
+
 // ExtractPeerNodeID returns the node-bound identity from a peer certificate.
 // Only DNS/URI SAN `node:<id>` is authoritative; common-name and shared-SAN
 // fallbacks are intentionally unsupported.

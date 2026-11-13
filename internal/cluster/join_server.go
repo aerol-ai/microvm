@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +36,7 @@ type joinService interface {
 	ClusterInfo(tokenID string) (ClusterInfo, error)
 	Join(ctx context.Context, req JoinRequest, source netip.Addr) (JoinResponse, error)
 	JoinPreflight(ctx context.Context, req PreflightRequest, source netip.Addr) (PreflightResponse, error)
+	JoinByCert(ctx context.Context, leaf *x509.Certificate, req JoinByCertRequest, source netip.Addr) (JoinResponse, error)
 }
 
 // Limits on the join listener.
@@ -87,24 +89,36 @@ type joinServer struct {
 	logger   *slog.Logger
 }
 
-// joinTLSConfig serves this node's cert and asks for no client cert.
-func joinTLSConfig(ct *ClusterTLS) *tls.Config {
-	return &tls.Config{
+// joinTLSConfig serves this node's cert and asks for no client cert. In
+// external-CA mode it verifies one when given, against the bank's CA: a
+// join by certificate is that certificate (JoinByCertPath), and a caller
+// with none still reaches the token paths, which refuse in that mode.
+func joinTLSConfig(ct *ClusterTLS, externalCA bool) *tls.Config {
+	cfg := &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return ct.certificateForHandshake()
 		},
 		ClientAuth: tls.NoClientCert,
 		MinVersion: tls.VersionTLS12,
 	}
+	if externalCA {
+		cfg.ClientAuth, cfg.ClientCAs = tls.VerifyClientCertIfGiven, ct.caPool
+	}
+	return cfg
 }
 
-// startJoinServer binds addr and serves the three join paths.
+// startJoinServer binds addr and serves the join paths.
 func startJoinServer(addr string, ct *ClusterTLS, svc joinService, audit func(JoinAuditEvent), logger *slog.Logger) (*joinServer, error) {
+	return startJoinServerMode(addr, ct, svc, audit, logger, false)
+}
+
+// startJoinServerMode is startJoinServer, in external-CA mode or not.
+func startJoinServerMode(addr string, ct *ClusterTLS, svc joinService, audit func(JoinAuditEvent), logger *slog.Logger, externalCA bool) (*joinServer, error) {
 	if ct == nil {
 		return nil, errors.New("cluster join server: TLS material required")
 	}
 	s := &joinServer{svc: svc, limiter: newJoinRateLimiter(), audit: audit, logger: logger}
-	ln, err := tls.Listen("tcp", addr, joinTLSConfig(ct))
+	ln, err := tls.Listen("tcp", addr, joinTLSConfig(ct, externalCA))
 	if err != nil {
 		return nil, fmt.Errorf("cluster join server: listen on %q: %w", addr, err)
 	}
@@ -134,6 +148,7 @@ func (s *joinServer) handler() http.Handler {
 	mux.HandleFunc("GET "+JoinClusterInfoPath, s.limited(s.clusterInfo))
 	mux.HandleFunc("POST "+JoinPath, s.limited(s.join))
 	mux.HandleFunc("POST "+JoinPreflightPath, s.limited(s.preflight))
+	mux.HandleFunc("POST "+JoinByCertPath, s.limited(s.joinByCert))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJoinJSON(w, http.StatusNotFound, joinErrorBody{Reason: "not_found", Error: "not found: the join port serves only " + JoinClusterInfoPath + ", " + JoinPath + " and " + JoinPreflightPath})
 	})
@@ -220,6 +235,40 @@ func (s *joinServer) join(w http.ResponseWriter, r *http.Request, src netip.Addr
 	s.succeed(w, ev, resp)
 }
 
+// joinByCert is a join by certificate: the client certificate, verified by
+// the handshake against the bank's CA, is the credential.
+func (s *joinServer) joinByCert(w http.ResponseWriter, r *http.Request, src netip.Addr) {
+	ev := JoinAuditEvent{Route: JoinByCertPath, Source: src.String()}
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
+		s.fail(w, ev, ErrJoinCertRequired, nil)
+		return
+	}
+	leaf := r.TLS.PeerCertificates[0]
+	ev.NodeID = ExtractPeerNodeID(leaf)
+	var req JoinByCertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.fail(w, ev, fmt.Errorf("%w: invalid JSON body", ErrJoinBadRequest), nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), joinRequestTimeout)
+	defer cancel()
+	resp, err := s.svc.JoinByCert(ctx, leaf, req, src)
+	if err != nil {
+		var dbe *JoinDialBackError
+		var results []DialBackResult
+		if errors.As(err, &dbe) {
+			results = dbe.Results
+		}
+		s.fail(w, ev, err, results)
+		return
+	}
+	ev.Role = resp.Role
+	if resp.Replay {
+		ev.Reason = "replay"
+	}
+	s.succeed(w, ev, resp)
+}
+
 func (s *joinServer) preflight(w http.ResponseWriter, r *http.Request, src netip.Addr) {
 	ev := JoinAuditEvent{Route: JoinPreflightPath, Source: src.String()}
 	var req PreflightRequest
@@ -281,7 +330,7 @@ func (s *joinServer) fail(w http.ResponseWriter, ev JoinAuditEvent, err error, r
 // record counts, logs and audits one call.
 func (s *joinServer) record(ev JoinAuditEvent, result string) {
 	ev.Result = result
-	if ev.Route == JoinPath {
+	if ev.Route == JoinPath || ev.Route == JoinByCertPath {
 		recordJoinAttempt(result, ev.Reason)
 	}
 	if s.logger != nil {
@@ -306,8 +355,11 @@ func JoinErrorStatus(err error) int {
 	case errors.Is(err, ErrNodeIDInUse), errors.Is(err, ErrJoinKeyInUse), errors.Is(err, ErrClusterVersion),
 		errors.Is(err, ErrRekeyConflict), errors.Is(err, ErrJoinTokenIDTaken):
 		return http.StatusConflict
-	case errors.Is(err, ErrJoinVersion), errors.Is(err, ErrJoinDialBack), errors.Is(err, ErrNotAdmitted):
+	case errors.Is(err, ErrJoinVersion), errors.Is(err, ErrJoinDialBack), errors.Is(err, ErrNotAdmitted),
+		errors.Is(err, ErrExternalCAMode), errors.Is(err, ErrJoinByCertOff):
 		return http.StatusPreconditionFailed
+	case errors.Is(err, ErrJoinCertRequired):
+		return http.StatusUnauthorized
 	case errors.Is(err, ErrNoCASigner), errors.Is(err, ErrNotLeader):
 		return http.StatusServiceUnavailable
 	}
