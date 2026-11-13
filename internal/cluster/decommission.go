@@ -114,11 +114,16 @@ var (
 
 // MoveAction is the body of the worker's internal move route.
 type MoveAction struct {
-	// Action is release, stop, notice or prepare.
+	// Action is release, stop, notice or prepare; for a snapshot move
+	// (snapshot_move.go) release-snapshot, import, drop or start-moved.
 	Action       string                       `json:"action"`
 	IDs          []string                     `json:"ids,omitempty"`
 	DeadlineUnix int64                        `json:"deadline_unix,omitempty"`
 	Spec         *models.CreateSandboxRequest `json:"spec,omitempty"`
+	// Target is release-snapshot's: the only node that may pull the bundle.
+	Target string `json:"target,omitempty"`
+	// Source is import's: the node to pull the bundle from.
+	Source string `json:"source,omitempty"`
 }
 
 // MoveActionResult answers a move action.
@@ -148,6 +153,8 @@ func RunMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (MoveAction
 			return MoveActionResult{Error: err.Error()}, nil
 		}
 		return MoveActionResult{}, nil
+	case "release-snapshot", "import", "drop", "start-moved":
+		return runSnapshotMoveAction(ctx, h, a)
 	default:
 		return MoveActionResult{}, errors.New("unknown move action " + a.Action)
 	}
@@ -159,6 +166,9 @@ type moveHandlerHolder struct {
 	h  MoveHandler
 	// noticed is the nodes this leader has already told owners about.
 	noticed map[string]bool
+	// peers stands in for other nodes' handlers in tests: a move action
+	// for one of them runs here instead of over the internal route.
+	peers map[string]MoveHandler
 }
 
 // AttachMoveHandler wires in the worker side (the service).
@@ -193,6 +203,12 @@ func (c *Cluster) noticeOnce(nodeID string) bool {
 func (c *Cluster) moveCall(ctx context.Context, m Member, a MoveAction) (MoveActionResult, error) {
 	if m.NodeID == c.nodeID {
 		return RunMoveAction(ctx, c.moveHandler(), a)
+	}
+	c.moves.mu.RLock()
+	peer := c.moves.peers[m.NodeID]
+	c.moves.mu.RUnlock()
+	if peer != nil {
+		return RunMoveAction(ctx, peer, a)
 	}
 	body, err := json.Marshal(a)
 	if err != nil {
@@ -237,7 +253,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID || p.IsDeleting() {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) {
+		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p) {
 			movable = append(movable, p)
 		} else {
 			others = append(others, id)
@@ -258,7 +274,11 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		wg.Add(1)
 		go func(p Placement) {
 			defer wg.Done()
-			results <- outcome{id: p.SandboxID, err: c.moveOne(ctx, p, source)}
+			move := c.moveOne
+			if placementWantsSnapshotMove(p) {
+				move = c.moveSnapshotOne
+			}
+			results <- outcome{id: p.SandboxID, err: move(ctx, p, source)}
 		}(p)
 	}
 	wg.Wait()
@@ -303,7 +323,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) {
+		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p) {
 			res.RemainingMovable++
 		} else {
 			res.Remaining++
