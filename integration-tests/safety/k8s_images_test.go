@@ -45,7 +45,7 @@ func TestKubernetesImagePins(t *testing.T) {
 	sha256Hex := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	sha512Hex := regexp.MustCompile(`^[0-9a-f]{128}$`)
 	for _, c := range []struct{ name, hash string }{
-		{"CONTAINERD", "SHA256"}, {"RUNC", "SHA256"}, {"CNI_PLUGINS", "SHA256"}, {"GVISOR", "SHA512"},
+		{"CONTAINERD", "SHA256"}, {"RUNC", "SHA256"}, {"CNI_PLUGINS", "SHA256"}, {"GVISOR", "SHA512"}, {"WORKERD", "SHA256"},
 	} {
 		version := pins[c.name+"_VERSION"] + pins[c.name+"_RELEASE"]
 		if version == "" {
@@ -123,6 +123,28 @@ func TestReleaseWorkflowShipsKubernetesImages(t *testing.T) {
 	} {
 		if !strings.Contains(wf, want) {
 			t.Errorf("release.yml lacks %q", want)
+		}
+	}
+}
+
+// The agent image and scripts/install.sh --with-isolate ship the same
+// workerd release: a VM and a pod running one AerolVM version run one V8.
+func TestWorkerdPinMatchesInstallScript(t *testing.T) {
+	root := repoRoot(t)
+	pins := readVersionsEnv(t, root)
+	raw, err := os.ReadFile(filepath.Join(root, "scripts", "install.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	for key, want := range map[string]string{
+		"WORKERD_VERSION":            pins["WORKERD_VERSION"],
+		"WORKERD_SHA256_LINUX_64":    pins["WORKERD_SHA256_AMD64"],
+		"WORKERD_SHA256_LINUX_ARM64": pins["WORKERD_SHA256_ARM64"],
+	} {
+		m := regexp.MustCompile(`(?m)^` + key + `="([^"]*)"`).FindStringSubmatch(script)
+		if m == nil || want == "" || m[1] != want {
+			t.Errorf("install.sh %s = %v, versions.env has %q", key, m, want)
 		}
 	}
 }

@@ -74,6 +74,13 @@ worker:
   # environment or files).
   wasm:
     enabled: false
+  # V8-isolate sandboxes on workers (Cloudflare's workerd, in the agent
+  # image). Each isolate group runs as a workerd process sandboxd starts,
+  # jailed in a chroot on the state volume, under the runtime container's
+  # sandboxes group; like WASM, turning this on makes the pod share one
+  # process namespace so they outlive an agent restart.
+  isolate:
+    enabled: false
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
   # In cluster mode the operator adds the API server to the first and the
   # pod and Service ranges to the second, for every new worker; you add

@@ -3,7 +3,8 @@
 # server and gateway pods all run it; SB_NODE_ROLE picks the role. It ships
 # toolboxd (bind-mounted into every sandbox) and the CNI plugins the agent
 # runs to build each sandbox's network, plus the tools those plugins and
-# sandboxd's firewall need.
+# sandboxd's firewall need, and workerd for V8-isolate sandboxes (Phase 5;
+# used only with SB_ENABLE_ISOLATE).
 #
 # Built by scripts/build-images.sh: the context holds <arch>/sandboxd and
 # <arch>/toolboxd from the release build, and versions.env's pins arrive as
@@ -17,6 +18,9 @@ ARG TARGETARCH
 ARG CNI_PLUGINS_VERSION
 ARG CNI_PLUGINS_SHA256_AMD64
 ARG CNI_PLUGINS_SHA256_ARM64
+ARG WORKERD_VERSION
+ARG WORKERD_SHA256_AMD64
+ARG WORKERD_SHA256_ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /fetch
@@ -31,6 +35,17 @@ RUN set -eu; \
     echo "$sum  cni.tgz" | sha256sum -c --quiet -; \
     mkdir -p /out/cni; \
     tar -xzf cni.tgz -C /out/cni
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) file=workerd-linux-64.gz; sum="$WORKERD_SHA256_AMD64" ;; \
+      arm64) file=workerd-linux-arm64.gz; sum="$WORKERD_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 -o workerd.gz \
+      "https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}/${file}"; \
+    echo "$sum  workerd.gz" | sha256sum -c --quiet -; \
+    gunzip -c workerd.gz > /out/workerd; \
+    chmod 0755 /out/workerd
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG TARGETARCH
@@ -48,6 +63,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates iproute2 iptables nftables procps \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fetch /out/cni /opt/aerolvm/cni
+COPY --from=fetch /out/workerd /usr/local/bin/workerd
 COPY ${TARGETARCH}/sandboxd ${TARGETARCH}/toolboxd /usr/local/bin/
 ENV SB_TOOLBOX_BINARY_PATH=/usr/local/bin/toolboxd \
     SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/aerolvm/cni

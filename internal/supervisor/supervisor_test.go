@@ -233,6 +233,13 @@ func TestSettingsFromEnv(t *testing.T) {
 	if s := SettingsFromEnv(); s.LeaseFile != "/run/aerolvm/ownership-lease" {
 		t.Fatalf("lease file %q", s.LeaseFile)
 	}
+	if s.IsolateJailDir != "" {
+		t.Fatalf("isolate jail dir %q without SB_ISOLATE_JAIL_DIR", s.IsolateJailDir)
+	}
+	t.Setenv("SB_ISOLATE_JAIL_DIR", "/var/lib/sandboxd/isolate-jail")
+	if s := SettingsFromEnv(); s.IsolateJailDir != "/var/lib/sandboxd/isolate-jail" {
+		t.Fatalf("isolate jail dir %q", s.IsolateJailDir)
+	}
 }
 
 // fakeClock fires each After at once and records the waits.
@@ -335,7 +342,7 @@ func TestRun(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(netns, n), nil, 0o644)
 	}
 	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns,
-		LeaseFile: filepath.Join(dir, "ownership-lease")}
+		LeaseFile: filepath.Join(dir, "ownership-lease"), IsolateJailDir: "/var/lib/sandboxd/isolate-jail"}
 	// A lease that already ran out, fencing one sandbox: the guard Run
 	// starts freezes it (T3).
 	if err := os.MkdirAll(filepath.Join(l.Root, "kubepods/pod1/ctr/sandboxes/sb-1"), 0o755); err != nil {
@@ -356,7 +363,8 @@ func TestRun(t *testing.T) {
 		ReadFile: func(p string) ([]byte, error) {
 			switch p {
 			case "/proc/self/mountinfo":
-				return []byte("30 25 0:26 / " + l.Root + " ro,nosuid - cgroup2 cgroup rw\n"), nil
+				return []byte("30 25 0:26 / " + l.Root + " ro,nosuid - cgroup2 cgroup rw\n" +
+					"31 25 0:40 / /var/lib/sandboxd/isolate-jail/g1/run rw,noexec shared:7 - tmpfs tmpfs rw\n"), nil
 			case "/proc/self/cgroup":
 				return []byte("0::/kubepods/pod1/ctr\n"), nil
 			}
@@ -417,8 +425,8 @@ func TestRun(t *testing.T) {
 	if !strings.Contains(logs.String(), "could not lower its own OOM score") {
 		t.Fatal("a failed OOM score change was not logged")
 	}
-	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1" {
-		t.Fatalf("unmounted %v, want both namespaces after containerd stopped (finding F8)", unmounted)
+	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1,run" {
+		t.Fatalf("unmounted %v, want both namespaces and the V8 jail's tmpfs after containerd stopped (finding F8)", unmounted)
 	}
 }
 
@@ -563,5 +571,49 @@ func TestWriteParentFileOverAFolder(t *testing.T) {
 	}
 	if err := WriteParentFile(f, "/p"); err == nil {
 		t.Fatal("renamed over a folder that holds files")
+	}
+}
+
+// At pod end every mount below the V8 jail's chroot base goes, deepest
+// first: the tmpfs on each group's run and tmp folders, found in the mount
+// table, not the base itself and not a sibling folder (C14).
+func TestUnmountUnder(t *testing.T) {
+	const base = "/var/lib/sandboxd/isolate-jail"
+	table := strings.Join([]string{
+		"36 35 98:0 / " + base + " rw,relatime shared:1 - ext4 /dev/root rw",
+		"37 36 0:51 / " + base + "/g1/run rw,nosuid,nodev,noexec shared:2 - tmpfs tmpfs rw",
+		"38 37 0:52 / " + base + "/g1/run/inner rw shared:3 - tmpfs tmpfs rw",
+		"39 36 0:53 / " + base + "/g1/tmp rw shared:4 - tmpfs tmpfs rw",
+		`40 36 0:54 / ` + base + `/g\0402/run rw shared:5 - tmpfs tmpfs rw`,
+		"41 1 0:55 / " + base + "x/other rw - tmpfs tmpfs rw",
+		"42 1 0:4 / /run/netns/sb-1 rw - nsfs nsfs rw",
+		"short line",
+	}, "\n")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	var got []string
+	UnmountUnder(base+"/", []byte(table), func(p string) error {
+		got = append(got, p)
+		if strings.HasSuffix(p, "/tmp") {
+			return errors.New("EBUSY")
+		}
+		return nil
+	}, log)
+	if len(got) != 4 || got[0] != base+"/g1/run/inner" {
+		t.Fatalf("unmounted %v; want the 4 mounts below the base, deepest first", got)
+	}
+	want := map[string]bool{base + "/g1/run/inner": true, base + "/g1/run": true, base + "/g1/tmp": true, base + "/g 2/run": true}
+	for _, p := range got {
+		if !want[p] {
+			t.Fatalf("unmounted %q, which is not below the jail base", p)
+		}
+	}
+	if !strings.Contains(logs.String(), "could not unmount a V8 jail mount") || !strings.Contains(logs.String(), "count=3") {
+		t.Fatalf("logs: %s", logs.String())
+	}
+	logs.Reset()
+	UnmountUnder(base, []byte("42 1 0:4 / /run/netns/sb-1 rw - nsfs nsfs rw\n"), func(string) error { t.Fatal("nothing to unmount"); return nil }, log)
+	if logs.Len() != 0 {
+		t.Fatalf("nothing to unmount was reported: %s", logs.String())
 	}
 }

@@ -118,10 +118,16 @@ func (c *Cgroup) SetLogFile(path string) {
 	c.mu.Unlock()
 }
 
-// redirectOwnOutput points cmd's stdout and stderr, where they are
+// RedirectOwnOutput points cmd's stdout and stderr, where they are
 // sandboxd's own, at the log file, or at /dev/null when the file cannot be
-// opened: never at the container's pipes.
-func (c *Cgroup) redirectOwnOutput(cmd *exec.Cmd) {
+// opened: never at the container's pipes. Start calls it for a process it
+// starts in the cgroup; a caller that starts a process meant to outlive
+// sandboxd some other way (the V8 jail, in a cgroup of its own) calls it
+// before the start. Without a log file set it changes nothing.
+func (c *Cgroup) RedirectOwnOutput(cmd *exec.Cmd) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.logPath == "" {
@@ -243,7 +249,7 @@ func (c *Cgroup) Start(newCmd func() (*exec.Cmd, error)) (*exec.Cmd, error) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	setCgroupFD(cmd.SysProcAttr, fd)
-	c.redirectOwnOutput(cmd)
+	c.RedirectOwnOutput(cmd)
 	cgErr := startCmd(cmd)
 	if cgErr == nil {
 		return cmd, nil

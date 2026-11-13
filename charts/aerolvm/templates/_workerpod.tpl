@@ -13,10 +13,10 @@ and cluster mode's pod template, which the operator stamps per worker
 # No Kubernetes API rights (plan §8.7, wall 4).
 automountServiceAccountToken: false
 enableServiceLinks: false
-{{- if $root.Values.worker.wasm.enabled }}
-# WASM sandboxes are processes sandboxd starts: with one process namespace
-# for the pod they outlive an agent restart, and the next agent takes them
-# over (C14). sandboxd refuses to start them without it.
+{{- if or $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled }}
+# WASM and V8-isolate sandboxes are processes sandboxd starts: with one
+# process namespace for the pod they outlive an agent restart, and the next
+# agent takes them over (C14). sandboxd refuses to start them without it.
 shareProcessNamespace: true
 {{- end }}
 {{- if $root.Values.edge.enabled }}
@@ -82,13 +82,19 @@ containers:
       privileged: true
     resources:
       {{- toYaml $root.Values.worker.runtime.resources | nindent 6 }}
-    {{- if $cluster }}
+    {{- if or $cluster $root.Values.worker.isolate.enabled }}
     env:
+      {{- if $cluster }}
       # sandboxd's ownership lease (C7). When it runs out the supervisor
       # freezes the sandboxes it fences, even with sandboxd down; that is
       # what lets a machine the operator says is gone fail over at its
       # lease limit instead of after the grace (C19).
       - { name: SB_OWNERSHIP_LEASE_FILE, value: /run/aerolvm/ownership-lease }
+      {{- end }}
+      {{- if $root.Values.worker.isolate.enabled }}
+      # The V8 jail's mounts, unmounted when the pod ends (as netns, F8).
+      - { name: SB_ISOLATE_JAIL_DIR, value: /var/lib/sandboxd/isolate-jail }
+      {{- end }}
     {{- end }}
     volumeMounts:
       - { name: containerd, mountPath: /var/lib/containerd }
@@ -102,6 +108,11 @@ containers:
       # when the pod ends reaches the machine; left mounted there, they
       # keep the pod in Terminating (finding F8).
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+      {{- if $root.Values.worker.isolate.enabled }}
+      # The V8 jail's chroots, here only to unmount their tmpfs mounts
+      # when the pod ends.
+      - { name: isolate-jail, mountPath: /var/lib/sandboxd/isolate-jail, mountPropagation: Bidirectional }
+      {{- end }}
   - name: agent
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -181,11 +192,22 @@ containers:
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
-      - { name: SB_HOST_RUNTIMES, value: {{ ternary "docker,gvisor,wasm" "docker,gvisor" $root.Values.worker.wasm.enabled | quote }} }
+      {{- $runtimes := list "docker" "gvisor" }}
+      {{- if $root.Values.worker.wasm.enabled }}{{ $runtimes = append $runtimes "wasm" }}{{ end }}
+      {{- if $root.Values.worker.isolate.enabled }}{{ $runtimes = append $runtimes "isolate" }}{{ end }}
+      - { name: SB_HOST_RUNTIMES, value: {{ join "," $runtimes | quote }} }
       {{- if $root.Values.worker.wasm.enabled }}
       # WASM workers start under the runtime container's sandboxes group
       # (SB_HOST_PROCESS_CGROUP_PARENT defaults to the containerd parent).
       - { name: SB_ENABLE_WASM, value: "true" }
+      {{- end }}
+      {{- if $root.Values.worker.isolate.enabled }}
+      # workerd ships in this image; its group hosts and their jail's
+      # cgroups go under the sandboxes group too. The jail's chroots are on
+      # their own volume (isolate-jail, below), which outlives an agent
+      # restart, so a host the next agent takes over still has its root.
+      - { name: SB_ENABLE_ISOLATE, value: "true" }
+      - { name: SB_ISOLATE_JAIL_CHROOT_BASE, value: /var/lib/sandboxd/isolate-jail }
       {{- end }}
       - { name: SB_CONTAINER_ENGINE, value: containerd }
       - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
@@ -253,6 +275,12 @@ containers:
       - { name: cni-state, mountPath: /var/lib/cni }
       # Kubernetes allows Bidirectional only in privileged containers.
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+      {{- if $root.Values.worker.isolate.enabled }}
+      # The V8 jail's chroots. Each group's run and tmp folders get a
+      # tmpfs; Bidirectional, so a restarted agent finds them and takes
+      # the group over (C14) as it would on a VM.
+      - { name: isolate-jail, mountPath: /var/lib/sandboxd/isolate-jail, mountPropagation: Bidirectional }
+      {{- end }}
       {{- if $root.Values.edge.enabled }}
       # The certificate alone, to see it change: sandboxd never
       # needs the key.
@@ -334,6 +362,9 @@ volumes:
   - { name: toolbox, emptyDir: {} }
   - { name: cni-state, emptyDir: {} }
   - { name: netns, emptyDir: {} }
+  {{- if $root.Values.worker.isolate.enabled }}
+  - { name: isolate-jail, emptyDir: {} }
+  {{- end }}
   - { name: egress-state, emptyDir: {} }
   {{- if $cluster }}
   # /etc/sandboxd: the node's settings and cluster files, written by the
