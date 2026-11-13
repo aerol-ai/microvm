@@ -262,3 +262,25 @@ func TestNodeCommandsFilesOnly(t *testing.T) {
 		t.Fatalf("join --files-only against nothing = %d %s", code, errOut)
 	}
 }
+
+// --by-certificate (external-CA mode) needs no --token: the join runs and,
+// on a machine with no certificate in its TLS dir, stops there.
+func TestNodeJoinByCertificateFlag(t *testing.T) {
+	withNodeSeams(t, true)
+	code, _, errOut := runNode("join", "https://10.0.0.5:7003", "--by-certificate", "--files-only")
+	if code == 2 || strings.Contains(errOut, "--token is required") {
+		t.Fatalf("--by-certificate still asked for a token: %d %q", code, errOut)
+	}
+	if code != 1 || !strings.Contains(errOut, "ca.crt") {
+		t.Fatalf("join --by-certificate with no certificate = %d %q", code, errOut)
+	}
+}
+
+// --external-ca reaches init, which wants --files-only with it.
+func TestNodeInitExternalCAFlag(t *testing.T) {
+	withNodeSeams(t, true)
+	code, _, errOut := runNode("init", "--external-ca")
+	if code != 1 || !strings.Contains(errOut, "needs --files-only") {
+		t.Fatalf("init --external-ca = %d %q", code, errOut)
+	}
+}

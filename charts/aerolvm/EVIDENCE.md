@@ -127,9 +127,18 @@ envelope.
   release namespace.
 - **Callers** use AerolVM's own API tokens, SSO and roles, as on any install.
 
-Not built yet, and refused if asked for: getting node certificates from your
-own CA through cert-manager (`security.externalCA`). An `AerolCluster` that
-sets it is refused with a reason.
+**Or, with your own CA** (`cluster.externalCA.issuerRef`, external-CA mode):
+
+- **No CA key is in the cluster.** Your issuer signs every node's
+  certificate through cert-manager. The operator asks for one certificate
+  per node and makes the node's pod only once it is ready.
+- **The certificate is the credential.** It names the node and its one role.
+  The node joins with it over mutual TLS: no join token is made. The cluster
+  keeps the node's key and refuses any other key for that node.
+- **cert-manager renews it,** with the same key, and the node reads the new
+  certificate on its next connection.
+- **The mode is set at install** and cannot be turned on or off after the
+  cluster starts.
 
 ## 4. Network walls
 

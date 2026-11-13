@@ -58,7 +58,14 @@ const (
 	opAdmitNode       opCode = 45 // one join: use the token, reserve the ID, admit the key
 	opAdoptNodes      opCode = 46 // admit the current members of a scripted cluster
 	opRekeyNode       opCode = 47 // move an admitted node to a new key (renewal)
+	// opAdmitNodeByCert admits a node whose certificate the bank's CA
+	// signed (external-CA mode, C23, plan §15.2.1): no token, the role from
+	// the certificate. Every rule of opAdmitNode but the token's holds.
+	opAdmitNodeByCert opCode = 52
 )
+
+// externalCAFSMOpsVersion: opAdmitNodeByCert.
+const externalCAFSMOpsVersion = 19
 
 // joinFSMOpsVersion: opPutJoinToken through opRekeyNode, and opDenyNode
 // tombstoning an admitted key.
@@ -430,29 +437,92 @@ func (f *placementFSM) applyAdmitNodeLocked(cmd command, index uint64) (any, err
 	case !tok.Reusable && len(tok.UsedBy) > 0:
 		return nil, ErrJoinTokenUsed
 	}
-	if _, revoked := f.revokedKeys[in.KeyHash]; revoked {
-		return nil, ErrJoinKeyRevoked
+	res, err := f.admitKeyLocked(nodeID, in, stamp, tok.ID)
+	if err != nil {
+		return nil, err
 	}
-	if holder, ok := f.admittedByKey[in.KeyHash]; ok && holder != nodeID {
-		return nil, fmt.Errorf("%w: %s", ErrJoinKeyInUse, holder)
-	}
-	if cur, ok := f.admitted[nodeID]; ok && cur.KeyHash != in.KeyHash {
-		// One admitted key per ID: the old one must be deleted first
-		// (`aerolvm delete node` tombstones it), so a stolen token can't
-		// take over a running node's identity.
-		return nil, fmt.Errorf("%w: %s is admitted with another key; delete the node first", ErrNodeIDInUse, nodeID)
-	}
-	rec := AdmittedNode{
-		NodeID: nodeID, Role: in.Role, KeyHash: in.KeyHash,
-		NotAfterUnixNano: in.NotAfterUnixNano, AdmittedUnixNano: stamp, TokenID: tok.ID,
-	}
-	f.admitted[nodeID] = rec
-	f.admittedByKey[in.KeyHash] = nodeID
 	tok.UsedBy = append(tok.UsedBy, JoinTokenUse{NodeID: nodeID, KeyHash: in.KeyHash, UnixNano: stamp})
 	if n := len(tok.UsedBy); n > maxJoinTokenUses {
 		tok.UsedBy = append([]JoinTokenUse(nil), tok.UsedBy[n-maxJoinTokenUses:]...)
 	}
 	f.pruneJoinTokensLocked(stamp)
+	trustChanged = trustChanged || res.ReplacedDeny
+	return res, nil
+}
+
+// applyAdmitNodeByCertLocked admits a node by its certificate (external-CA
+// mode): the leader checked the chain to the bank's CA and read the ID and
+// role from it before proposing. A retry is the same ID, key and role,
+// admitted by certificate, and gets the same answer.
+func (f *placementFSM) applyAdmitNodeByCertLocked(cmd command, index uint64) (any, error) {
+	in := cmd.JoinAdmit
+	if in == nil {
+		return nil, errors.New("placementFSM: opAdmitNodeByCert requires a join")
+	}
+	stamp, err := joinStamp(cmd)
+	if err != nil {
+		return nil, err
+	}
+	nodeID := strings.TrimSpace(in.NodeID)
+	switch {
+	case !ValidJoinNodeID(nodeID):
+		return nil, fmt.Errorf("%w: %q", ErrJoinNodeIDInvalid, in.NodeID)
+	case !validKeyHash(in.KeyHash):
+		return nil, errors.New("placementFSM: opAdmitNodeByCert requires a key hash")
+	case !ValidJoinRole(in.Role):
+		return nil, fmt.Errorf("%w: role %q", ErrJoinBadRequest, in.Role)
+	case strings.TrimSpace(in.TokenID) != "":
+		return nil, errors.New("placementFSM: opAdmitNodeByCert takes no token")
+	}
+	f.joinStateInitLocked()
+	trustChanged := f.pruneRevokedKeysLocked(stamp)
+	if f.pruneDeniedNodesLocked(stamp) {
+		trustChanged = true
+	}
+	defer func() {
+		if trustChanged {
+			f.deniedNodesVersion = index
+			f.publishDeniedLocked()
+			f.publishPeerTrustLocked()
+		}
+	}()
+	if cur, ok := f.admitted[nodeID]; ok && cur.KeyHash == in.KeyHash && cur.TokenID == "" {
+		if cur.Role != in.Role {
+			// The certificate's role is the node's only role.
+			return nil, fmt.Errorf("%w: %s is admitted as %s, not %s", ErrJoinRoleMismatch, nodeID, cur.Role, in.Role)
+		}
+		return JoinAdmitResult{Node: cur, Replay: true}, nil
+	}
+	res, err := f.admitKeyLocked(nodeID, in, stamp, "")
+	if err != nil {
+		return nil, err
+	}
+	trustChanged = trustChanged || res.ReplacedDeny
+	return res, nil
+}
+
+// admitKeyLocked is what both admits share once their own checks pass: the
+// key is neither revoked nor another node's, the ID holds no other key, and
+// a deny record for the ID gives way to the fresh admit (J7).
+func (f *placementFSM) admitKeyLocked(nodeID string, in *JoinAdmitCommand, stamp int64, tokenID string) (JoinAdmitResult, error) {
+	if _, revoked := f.revokedKeys[in.KeyHash]; revoked {
+		return JoinAdmitResult{}, ErrJoinKeyRevoked
+	}
+	if holder, ok := f.admittedByKey[in.KeyHash]; ok && holder != nodeID {
+		return JoinAdmitResult{}, fmt.Errorf("%w: %s", ErrJoinKeyInUse, holder)
+	}
+	if cur, ok := f.admitted[nodeID]; ok && cur.KeyHash != in.KeyHash {
+		// One admitted key per ID: the old one must be deleted first
+		// (`aerolvm delete node` tombstones it), so a stolen token or a
+		// second certificate can't take over a running node's identity.
+		return JoinAdmitResult{}, fmt.Errorf("%w: %s is admitted with another key; delete the node first", ErrNodeIDInUse, nodeID)
+	}
+	rec := AdmittedNode{
+		NodeID: nodeID, Role: in.Role, KeyHash: in.KeyHash,
+		NotAfterUnixNano: in.NotAfterUnixNano, AdmittedUnixNano: stamp, TokenID: tokenID,
+	}
+	f.admitted[nodeID] = rec
+	f.admittedByKey[in.KeyHash] = nodeID
 	res := JoinAdmitResult{Node: rec}
 	if deny, denied := f.deniedNodes[nodeID]; denied {
 		// A fresh join (new token, new key: the revoked check above refused
@@ -464,7 +534,6 @@ func (f *placementFSM) applyAdmitNodeLocked(cmd command, index uint64) (any, err
 		f.tombstoneNodeCertsLocked(nodeID, deny.DeniedUnixNano, deny.expiresAt())
 		res.ReplacedDeny = true
 	}
-	trustChanged = trustChanged || res.ReplacedDeny
 	f.publishPeerTrustLocked()
 	return res, nil
 }
@@ -784,7 +853,7 @@ var errJoinOpNotForwardable = errors.New("cluster: join state is written only th
 // isJoinOp reports whether op belongs to this file.
 func isJoinOp(op opCode) bool {
 	switch op {
-	case opPutJoinToken, opDeleteJoinToken, opAdmitNode, opAdoptNodes, opRekeyNode:
+	case opPutJoinToken, opDeleteJoinToken, opAdmitNode, opAdoptNodes, opRekeyNode, opAdmitNodeByCert:
 		return true
 	}
 	return false

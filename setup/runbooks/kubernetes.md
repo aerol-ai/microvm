@@ -498,17 +498,22 @@ Pending or Joining.
 
 *Cluster mode.*
 
-**What it means.** The operator's requests for node certificates have
-failed for over 10 minutes. In external-CA mode, the bank's issuer signs
-them through cert-manager. Running nodes keep working until their
+**What it means.** A node's certificate has waited for the issuer for
+over 10 minutes. In external-CA mode, the bank's issuer signs every node's
+certificate through cert-manager, and the operator makes a node's pod only
+once its certificate is ready. Running nodes keep working until their
 certificates expire. New nodes cannot join.
 
 **Check.**
 
 - `kubectl describe aerolnode <name>`: the condition `CertificatePending`
-  names the request.
+  says what the node waits for.
+- `kubectl describe certificate <name>-cert` in the node's namespace (the
+  worker namespace for a worker): what does cert-manager say?
 - `kubectl get certificaterequests -A`: is the request denied, or waiting?
 - Is the issuer healthy? `kubectl describe clusterissuer <name>`.
+- Does the issuer return its CA? The certificate's Secret needs `ca.crt`
+  beside `tls.crt` and `tls.key`.
 
 **Fix.**
 

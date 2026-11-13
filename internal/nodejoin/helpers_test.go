@@ -3,6 +3,7 @@ package nodejoin
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -171,6 +172,8 @@ type fakeJoinServer struct {
 	// patFree answers a worker or ingress join without the PAT, the way a
 	// server answers once every member takes cert-only calls.
 	patFree bool
+	// certAnswer changes a join by certificate's answer before it is sent.
+	certAnswer func(*cluster.JoinResponse)
 }
 
 type joinRefuseSpec struct {
@@ -209,8 +212,13 @@ func newFakeJoinServer(t *testing.T) *fakeJoinServer {
 	mux.HandleFunc("GET "+cluster.JoinClusterInfoPath, f.clusterInfo)
 	mux.HandleFunc("POST "+cluster.JoinPreflightPath, f.preflight)
 	mux.HandleFunc("POST "+cluster.JoinPath, f.join)
+	mux.HandleFunc("POST "+cluster.JoinByCertPath, f.joinByCert)
 	f.srv = httptest.NewUnstartedServer(mux)
-	f.srv.TLS = &tls.Config{Certificates: []tls.Certificate{pair}}
+	// As the join port in external-CA mode: a client certificate, when
+	// given, must chain to the CA (token clients send none).
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(ca.Certificate())
+	f.srv.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: clientCAs}
 	f.srv.StartTLS()
 	t.Cleanup(f.srv.Close)
 	f.url = f.srv.URL
@@ -449,3 +457,31 @@ func (l *fakeLocalAPI) setMembers(m ...localMember) {
 }
 
 func b64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
+
+// joinByCert answers a join by certificate the way the join port does in
+// external-CA mode: the verified client certificate names the node and its
+// role; the answer carries no certificate and no CA key.
+func (f *fakeJoinServer) joinByCert(w http.ResponseWriter, r *http.Request) {
+	if f.refused(w, cluster.JoinByCertPath) {
+		return
+	}
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no client certificate", "reason": "no_client_cert"})
+		return
+	}
+	leaf := r.TLS.PeerCertificates[0]
+	roles := cluster.ExtractCertRoles(leaf)
+	f.mu.Lock()
+	f.joins++
+	f.mu.Unlock()
+	resp := cluster.JoinResponse{
+		NodeID: cluster.ExtractPeerNodeID(leaf), Role: roles[0], ClusterID: cluster.CACertHash(f.ca.Certificate()),
+		GossipKey: "Z29zc2lwLWtleS0xNi1ieXRlcw==", BootstrapPeers: []string{"10.0.0.5:7001"}, JoinURLs: []string{f.url},
+		Credentials: f.custody, NotAfter: leaf.NotAfter, Version: f.version, PATToken: f.pat,
+	}
+	if f.certAnswer != nil {
+		f.certAnswer(&resp)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}

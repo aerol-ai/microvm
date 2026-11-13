@@ -1239,6 +1239,70 @@ Each row is a drill in section 19.
   AerolVM owner by namespace (D10). Normal SDK callers use AerolVM's own keys,
   SSO and roles, as today.
 
+#### 15.2.1 External-CA mode: the design (C23)
+
+The default mode is built (a join token per pod). This is how the
+external-CA mode is built on top of it, in the order of its PRs.
+
+```
+operator ─► Certificate per pod (bank's issuer, cert-manager) ─► Secret, mounted in that pod only
+pod start ─► sandboxd: TLS dir = that Secret (ca.crt, tls.crt, tls.key)
+          ─► POST join-by-certificate over mTLS (no token)
+server   ─► chain to the CA? node:<id> and role in the certificate? key not tombstoned?
+          ─► opAdmitNode (key pinned) ─► a server becomes a voter ─► the bundle, without a certificate or CA key
+cert-manager renews ─► sandboxd reloads it per handshake (internal/cluster/tls.go)
+```
+
+- **Trust.** `SB_CLUSTER_EXTERNAL_CA=true`. The cluster TLS directory is the
+  pod's cert-manager Secret: `ca.crt` is the bank's CA, `tls.crt` and
+  `tls.key` the pod's certificate. No server holds a CA key (D11), so every
+  path that signs a node certificate (join by token, the renewal in
+  `internal/cluster/cert_renew.go`, `aerolvm join-command`) is refused in
+  this mode with a reason; cert-manager renews instead.
+- **The certificate.** One cert-manager `Certificate` per pod, made by the
+  operator: the issuer from `spec.security.externalCA.issuerRef`, the URI
+  SANs `node:<id>` and `aerolvm-role:<role>`, the DNS names the cluster's
+  server name and the pod's own (lesson L7). It is mounted only into that
+  pod's `agent` container.
+- **Join by certificate.** A new mTLS-only join route. The caller's
+  certificate must chain to the CA and carry `node:<id>` and one role; that
+  role is the only one it can join as. The server admits its key
+  (`opAdmitNode`, pinned, so a second key for the ID is refused until the
+  node is deleted), adds a server as a voter, and answers the usual bundle
+  without a node certificate or a CA key. The first server initialises the
+  cluster with its certificate.
+- **Who may get a certificate.** Only the operator creates `Certificate`
+  objects (its RBAC). What the bank's issuer will sign is the bank's
+  policy. The docs show a cert-manager approver-policy that limits these
+  URI SANs to AerolVM's two namespaces
+  (`charts/aerolvm/examples/approver-policy-external-ca.yaml`). It cannot
+  name the operator's ServiceAccount: cert-manager itself makes the request
+  for a `Certificate`, so the policy is bound to cert-manager's controller
+  and selects by namespace.
+- **Failure.** Issuer slow or down: `AerolNode` condition
+  `CertificatePending`, an alert after 10 minutes; running nodes keep
+  working, since their certificates are still valid (§14).
+- **Tests.** Unit (SAN parsing; join-by-certificate refusals: another CA,
+  no role, a second role, a tombstoned key, a second key for the ID),
+  envtest (the operator makes, mounts and waits for the `Certificate`),
+  and live on kind with a cert-manager CA `Issuer` standing in for the
+  bank's issuer (`AEROL_FCKIND_PROOF=externalca`).
+- **Settled while building** (the C23 stack, #1252 onward):
+  - The bundle still carries the gossip key and the credential keys; the
+    PAT follows the default mode's rule.
+  - The `Certificate` keeps its key across renewals (`rotationPolicy:
+    Never`): the cluster pins the first key, and cert-manager's default
+    since v1.18 is a new key on every renewal.
+  - The pod's TLS dir is the Secret mounted at /var/run/aerolvm-tls
+    (`SB_CLUSTER_TLS_DIR`), not under /etc/sandboxd, which a server keeps
+    on its disk.
+  - Pods join through the servers' headless Service, so a server that is
+    down costs a refused dial, not the join.
+  - The mode is recorded on the `AerolCluster` (condition `ExternalCA`)
+    when server 0 starts it; turning it on or off later is refused.
+  - The chart grants the operator `Certificate` rights only in this mode.
+  - The alert reads `aerolvm_operator_node_certificates_pending`.
+
 ### 15.3 Network walls
 
 | From | To | Allowed |

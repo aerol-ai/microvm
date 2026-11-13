@@ -1858,6 +1858,13 @@ type Config struct {
 	// must not be distributed to joiners or retained in this daemon runtime
 	// directory in enterprise mode. SB_CLUSTER_TLS_DIR.
 	ClusterTLSDir string
+	// ClusterExternalCA is the external-CA mode (C23, plan §15.2.1): the
+	// TLS dir's ca.crt is the bank's CA and node.crt and node.key the
+	// pod's certificate from cert-manager. No server holds a CA key, so a
+	// token join, a new join token and a certificate renewal are refused; a
+	// node joins by its certificate and cert-manager renews it.
+	// SB_CLUSTER_EXTERNAL_CA.
+	ClusterExternalCA bool
 	// ClusterInternalListenAddr is the bind address for the mTLS internal
 	// listener. SB_CLUSTER_INTERNAL_LISTEN. Default 0.0.0.0:7002.
 	ClusterInternalListenAddr string
@@ -2581,6 +2588,7 @@ func load(keyTool bool) (Config, error) {
 		E2BClientID:                   strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID")),
 		RunloopBlueprintMapJSON:       strings.TrimSpace(os.Getenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON")),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterExternalCA:             getEnvBool("SB_CLUSTER_EXTERNAL_CA", false),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
 		ClusterJoinListenAddr:         strings.TrimSpace(os.Getenv("SB_CLUSTER_JOIN_LISTEN_ADDR")),

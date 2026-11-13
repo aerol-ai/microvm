@@ -85,7 +85,7 @@ The chart makes the worker namespace, `aerolvm-workers`, and labels it to allow 
 
 1. The first server starts the cluster.
 2. The other servers join it, one per zone.
-3. The gateways and the first workers join. Each new pod gets a one-time join token that only it can read, and the token is deleted once the pod joins.
+3. The gateways and the first workers join. Each new pod gets a one-time join token that only it can read, and the token is deleted once the pod joins. (With [your own certificate authority](#use-your-own-certificate-authority), each pod joins with its certificate instead.)
 
 Watch it:
 
@@ -348,6 +348,38 @@ kubectl -n aerolvm-system exec -it aerolvm-server-0 -- sandboxd backup --output 
 
 Remove the annotation to bring the server back. To recover from losing most servers, put **every** surviving server in maintenance mode first: `recover-quorum` refuses while the AerolVM server runs on any of them, and the operator replaces no lost server while one is in maintenance. See the [operational runbooks](/operational-runbooks/).
 
+## Use your own certificate authority
+
+By default, the servers hold the cluster's certificate authority (CA) key. Each new pod joins with a one-time token, and the servers sign its certificate.
+
+A bank may need the CA key to stay outside the cluster. **External-CA mode** does that. Your own issuer signs every node's certificate through cert-manager, and the cluster never holds a CA key.
+
+Set it in your values **before you install**:
+
+```yaml
+cluster:
+  externalCA:
+    issuerRef: { kind: ClusterIssuer, name: bank-ca }
+```
+
+Your issuer must put its CA certificate in the Secret it writes, as `ca.crt`. cert-manager's CA issuer and Vault issuer both do. Every node trusts that CA, and no other.
+
+What changes:
+
+- **One certificate per node.** The operator makes a cert-manager `Certificate` named `<node>-cert` in the node's namespace. It names the node (`node:<id>`) and its one role (`aerolvm-role:server`, `ingress` or `worker`).
+- **No pod until the certificate is ready.** Until then, the node's `AerolNode` is `Pending`, and its condition `CertificatePending` says what it waits for. If a certificate waits more than 10 minutes, the `AerolVMNodeCertificateFailing` alert fires. Nodes that already run keep working.
+- **No join tokens.** The pod joins with its certificate.
+- **One key per node, for life.** The cluster remembers the key each node joined with and refuses any other key for that node. So when cert-manager renews a certificate, it keeps the key (`rotationPolicy: Never`). Do not delete a node's certificate Secret: cert-manager would make a new key, and the cluster would refuse that node from then on.
+- **The mode is fixed.** The `AerolCluster` records the mode when its first server starts, and refuses to turn it on or off after that.
+- **A new issuer affects new nodes only.** If you change `issuerRef` later, it must sign with the same CA.
+
+### Limit who can get a node certificate
+
+With your CA as the trust, a certificate from your issuer that names a node and a role is a pass into the cluster. Limit who can get one in two places:
+
+1. **Kubernetes RBAC.** Only the operator may create `Certificate` objects in `aerolvm-system` and `aerolvm-workers`. The chart grants this right only to the operator, and only in external-CA mode. Give it to no one else.
+2. **Your issuer.** Sign these names only for those two namespaces. With cert-manager's [approver-policy](https://cert-manager.io/docs/policy/approval/approver-policy/), `charts/aerolvm/examples/approver-policy-external-ca.yaml` does this. Turn off cert-manager's own approval first (`disableAutoApproval: true` in cert-manager's Helm values), or it approves every request before the policy is read. A request from another namespace matches no policy, so it is never signed.
+
 ## Security and the bank evidence pack
 
 The chart ships a security evidence pack, `charts/aerolvm/EVIDENCE.md`, for a bank's security team. It lists each pod's exact rights and why, the network walls, the data flows, the threat model, how to check the image signatures, and the one exception to Pod Security: the worker pods' `runtime` and `agent` containers are privileged, in the worker namespace only.
@@ -380,6 +412,7 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.gateways.gatewayRef` | Sit behind your own Gateway API Gateway instead, as `name` and `namespace`. | none |
 | `cluster.workerPools` | One entry per kind of worker machine: `machine` size, `minWorkers`, `maxWorkers`, `headroomPercent`, `zoneLossReservePercent`, `runtimes` (the only runtimes its workers run), `nodeSelector`, `tolerations`, `provisioner`, `decommission` (`drainWindow`, `deadline`) and `maxMachineAge`. | none (required) |
 | `cluster.createPolicy` | What any sandbox may be: images, runtimes, size, root, GPU. Every node checks it. Turning it on, changing it or turning it off reaches every running node within a minute. See [Limit what users can create](/enterprise/create-policy/). | none |
+| `cluster.externalCA` | `issuerRef` (`kind`, `name`): every node's certificate comes from your issuer through cert-manager, with no CA key in the cluster and no join tokens. Set it before you install. See [Use your own certificate authority](#use-your-own-certificate-authority). | none: join tokens |
 | `cluster.agentSandboxAPI` | `enabled` serves `kubectl get sandboxes` and the agent-sandbox kinds from the gateways (needs cert-manager); `namespaces` maps a namespace to an owner other than the team of the same name. See [The Kubernetes API](/kubernetes-api/). | off |
 | `cluster.operator.replicas` | Operator pods; one leads at a time. | `2` |
 | `networkPolicy.extraIngressFrom` | Who else may reach a worker pod, as NetworkPolicy peers. | none |
@@ -389,4 +422,4 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 
 - **Each server's disk stays in its zone.** EBS and Azure disks cannot move between zones, so a server never moves zone either.
 - **Deleting the AerolCluster keeps the server disks.** Delete them yourself, with `kubectl delete pvc`, when you are sure.
-- **Node certificates come from join tokens.** Getting them from your own certificate authority through cert-manager is not built yet; an `AerolCluster` that asks for it is refused with a reason.
+- **Node certificates come from join tokens by default.** To keep the CA key out of the cluster, [use your own certificate authority](#use-your-own-certificate-authority).

@@ -617,6 +617,7 @@ func TestApplyEncodedRefusesJoinOps(t *testing.T) {
 		admitCmd(rec.ID, "evil", JoinRoleServer, testKey("evil"), 2),
 		{Op: opAdoptNodes, StampUnixNano: 1, JoinAdopt: &JoinAdoptCommand{}},
 		{Op: opRekeyNode, StampUnixNano: 1, JoinRekey: &JoinRekeyCommand{}},
+		certAdmitCmd("evil", JoinRoleServer, testKey("evil"), 2),
 	} {
 		payload, _ := encodeCommand(cmd)
 		if err := leader.ApplyEncoded(t.Context(), payload); !errors.Is(err, errJoinOpNotForwardable) {

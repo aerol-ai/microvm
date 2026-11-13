@@ -20,7 +20,8 @@ var clusterScoped = []string{"nodes", "nodeclaims", "servicecidrs"}
 // ClusterRole, the rest in both namespaces it works in, and the default
 // namespace's in a Role there. A right only the markers have fails live,
 // on a real cluster, and nowhere else. CI renders templates/operator.yaml
-// and points AEROLVM_CHART_OPERATOR at it; without it the test skips.
+// with every gated right on (external-CA mode's Certificates) and points
+// AEROLVM_CHART_OPERATOR at it; without it the test skips.
 func TestChartGrantsGeneratedRBAC(t *testing.T) {
 	path := os.Getenv("AEROLVM_CHART_OPERATOR")
 	if path == "" {

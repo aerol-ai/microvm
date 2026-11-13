@@ -47,6 +47,9 @@ const (
 	JoinClusterInfoPath = "/v1/join/cluster-info"
 	JoinPath            = "/v1/join"
 	JoinPreflightPath   = "/v1/join/preflight"
+	// JoinByCertPath is a join by certificate (external-CA mode, C23): the
+	// join port verifies the client certificate against the bank's CA.
+	JoinByCertPath = "/v1/join/by-certificate"
 	// Operator routes on the public API (fleet.admin).
 	PublicJoinTokensPath = "/v1/cluster/join-tokens"
 	PublicAdoptPath      = "/v1/cluster/adopt"
@@ -314,6 +317,9 @@ const (
 	joinWriteAdmit       = "admit"
 	joinWriteAdopt       = "adopt"
 	joinWriteRekey       = "rekey"
+	// joinWriteAdmitByCert admits a node by its certificate (external-CA
+	// mode, opAdmitNodeByCert): Admit without a token.
+	joinWriteAdmitByCert = "admit_by_cert"
 )
 
 // JoinWriteResponse is the outcome. Code carries a refusal's sentinel so it
@@ -392,6 +398,10 @@ func JoinReason(err error) string {
 		return "bad_request"
 	case errors.Is(err, ErrNotLeader):
 		return "not_leader"
+	case errors.Is(err, ErrExternalCAMode), errors.Is(err, ErrJoinByCertOff):
+		return "ca_mode"
+	case errors.Is(err, ErrJoinCertRequired):
+		return "no_client_cert"
 	}
 	return "error"
 }
@@ -428,6 +438,18 @@ func (c *Cluster) WriteJoin(ctx context.Context, req JoinWriteRequest) (JoinWrit
 			return JoinWriteResponse{}, err
 		}
 		cmd.Op, cmd.JoinAdmit = opAdmitNode, req.Admit
+	case joinWriteAdmitByCert:
+		if req.Admit == nil {
+			return JoinWriteResponse{}, fmt.Errorf("%w: admit without a node", ErrJoinBadRequest)
+		}
+		// A newer op than the join set: every server must apply it alike.
+		if err := c.raftServersSupport(externalCAFSMOpsVersion, "joins by certificate"); err != nil {
+			return JoinWriteResponse{}, err
+		}
+		if err := c.liveMemberHoldsID(req.Admit.NodeID, req.Admit.KeyHash); err != nil {
+			return JoinWriteResponse{}, err
+		}
+		cmd.Op, cmd.JoinAdmit = opAdmitNodeByCert, req.Admit
 	case joinWriteAdopt:
 		cmd.Op, cmd.JoinAdopt = opAdoptNodes, req.Adopt
 	case joinWriteRekey:
@@ -468,6 +490,11 @@ func (c *Cluster) liveMemberHoldsID(nodeID, keyHash string) error {
 		return nil
 	}
 	if rec, ok := c.fsm.admittedNode(nodeID); ok && rec.KeyHash == keyHash {
+		return nil
+	}
+	// The live member is this very server, admitting the key it serves
+	// with (external-CA mode: the seed admits itself by its certificate).
+	if nodeID == c.nodeID && keyHash != "" && keyHash == c.selfKeyHash() {
 		return nil
 	}
 	return fmt.Errorf("%w: %s is a live member", ErrNodeIDInUse, nodeID)
@@ -534,6 +561,9 @@ func (c *Cluster) validateJoinTokenTTL(role, raw string) (time.Duration, string,
 // CreateJoinToken mints a join token, stores its hash and discovery key in
 // Raft and returns the token once.
 func (c *Cluster) CreateJoinToken(ctx context.Context, req JoinTokenCreateRequest) (JoinTokenCreated, error) {
+	if err := c.refuseInExternalCAMode(); err != nil {
+		return JoinTokenCreated{}, err
+	}
 	role := strings.ToLower(strings.TrimSpace(req.Role))
 	if role == "" {
 		role = JoinRoleWorker
@@ -912,6 +942,9 @@ func (c *Cluster) nodeIDTaken(nodeID, keyHash string) bool {
 // Join admits one node: checks, dial-back, one Raft op, then the signature
 // (§4). A retry with the same key and node ID gets the same answer.
 func (c *Cluster) Join(ctx context.Context, req JoinRequest, source netip.Addr) (JoinResponse, error) {
+	if err := c.refuseInExternalCAMode(); err != nil {
+		return JoinResponse{}, err
+	}
 	tok, err := c.checkJoinToken(req.Token)
 	if err != nil {
 		return JoinResponse{}, err
@@ -1128,6 +1161,9 @@ type AdoptResponse struct {
 // node ID, current cert key and role as admitted, in one Raft op. Running
 // it again changes nothing.
 func (c *Cluster) Adopt(ctx context.Context, req AdoptRequest) (AdoptResponse, error) {
+	if c.cfg.ClusterExternalCA {
+		return c.adoptSelfByCert(ctx)
+	}
 	caCert, caPEM, err := c.clusterCACert()
 	if err != nil {
 		return AdoptResponse{}, err

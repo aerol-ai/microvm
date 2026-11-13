@@ -89,6 +89,8 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		c.Status.Phase = "Refused"
 		return ctrl.Result{}, r.Status().Update(ctx, &c)
 	}
+	// Fixed: the status update at the end of this pass clears it.
+	meta.RemoveStatusCondition(&c.Status.Conditions, CondRefused)
 	token, err := r.ensureAdminSecret(ctx, &c)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -122,6 +124,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 			r.setCondition(&c, CondBootstrapped, metav1.ConditionTrue, "FirstServerUp", ServerName(c.Name, 0)+" started the cluster")
+			r.recordMode(&c)
 			r.event(&c, corev1.EventTypeNormal, "Bootstrapped", ServerName(c.Name, 0)+" started the cluster")
 		}
 		r.updateStatus(ctx, &c, nodes)
@@ -153,8 +156,11 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // refuseSpec names what this build cannot do yet.
 func refuseSpec(c *v1.AerolCluster) string {
-	if c.Spec.Security.ExternalCA != nil {
-		return "security.externalCA is not built yet: remove it to use join tokens (plans/kubernetes-v2-architecture.md R2)"
+	if why := refuseModeChange(c); why != "" {
+		return why
+	}
+	if ca := c.Spec.Security.ExternalCA; ca != nil && ca.IssuerRef.Name == "" {
+		return "security.externalCA.issuerRef.name is empty"
 	}
 	if len(c.Spec.Zones) == 0 {
 		return "zones is empty"
@@ -523,9 +529,14 @@ func (r *ClusterReconciler) updateStatus(_ context.Context, c *v1.AerolCluster, 
 	r.setCondition(c, CondReady, ready, c.Status.Phase, fmt.Sprintf("servers %d/%d, gateways %d, workers %d/%d",
 		servers.Ready, servers.Desired, gateways.Ready, workers.Ready, workers.Desired))
 	nodeStates.Reset()
+	pending := 0
 	for _, n := range nodes {
 		nodeStates.WithLabelValues(n.Status.State, n.Spec.Role).Inc()
+		if meta.IsStatusConditionTrue(n.Status.Conditions, CondCertificatePending) {
+			pending++
+		}
 	}
+	nodeCertsPending.Set(float64(pending))
 }
 
 // SetupWithManager registers the controller.

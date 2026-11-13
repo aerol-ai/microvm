@@ -455,7 +455,7 @@ func (c *Cluster) startJoinService() {
 		return
 	}
 	if addr := c.cfg.ClusterJoinListenAddr; addr != "" {
-		js, err := startJoinServer(addr, c.tls, c, c.recordJoinAudit, c.logger)
+		js, err := startJoinServerMode(addr, c.tls, c, c.recordJoinAudit, c.logger, c.cfg.ClusterExternalCA)
 		if err != nil {
 			c.logger.Error("cluster: join listener did not start; one-line joins land on other servers only", "addr", addr, "err", err)
 		} else {
@@ -465,7 +465,11 @@ func (c *Cluster) startJoinService() {
 			}
 		}
 	}
-	c.certRenewStop = startCertRenewer(&certRenewer{tls: c.tls, nodeID: c.nodeID, logger: c.logger, renew: c.renewViaServers})
+	// In external-CA mode cert-manager renews the certificate and no server
+	// can sign one; tls.go reloads the renewed file per handshake.
+	if !c.cfg.ClusterExternalCA {
+		c.certRenewStop = startCertRenewer(&certRenewer{tls: c.tls, nodeID: c.nodeID, logger: c.logger, renew: c.renewViaServers})
+	}
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }

@@ -173,6 +173,12 @@ type InitOptions struct {
 	// loads cluster.env itself. Run init again without it once that
 	// sandboxd is up, to admit this node and register the join tokens.
 	FilesOnly bool
+	// ExternalCA starts the cluster in external-CA mode (C23): the TLS dir
+	// already holds the bank's CA and this node's certificate (from
+	// cert-manager), so no CA is made and no certificate signed. Pods only
+	// for now, so it needs FilesOnly; the operator admits the seed by its
+	// certificate once it leads (Adopt).
+	ExternalCA bool
 }
 
 // Initer starts a cluster on this machine.
@@ -203,6 +209,9 @@ type InitResult struct {
 // changes no file and no key: it checks sandboxd leads, registers the
 // tokens again (the cluster answers the stored rows) and prints the same.
 func (in *Initer) Run(ctx context.Context, o InitOptions) (InitResult, error) {
+	if o.ExternalCA {
+		return in.runExternalCA(ctx, o)
+	}
 	// Root writes a machine's system files. A files-only run writes to
 	// folders its user owns, and a re-run writes no cluster file, so
 	// neither needs it; a user who cannot read sandboxd.env stops below.

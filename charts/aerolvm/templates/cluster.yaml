@@ -151,6 +151,14 @@ spec:
   security:
     createPolicy:
       name: {{ .Values.cluster.name }}-create-policy
+    {{- with .Values.cluster.externalCA.issuerRef }}
+    {{- if .name }}
+    externalCA:
+      issuerRef:
+        kind: {{ .kind | default "ClusterIssuer" }}
+        name: {{ .name | quote }}
+    {{- end }}
+    {{- end }}
 ---
 # The create policy (docs: Limit what users can create), on every node:
 # the node a create reaches checks it, and the worker that runs it checks
