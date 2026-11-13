@@ -12,6 +12,8 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	raftwal "github.com/hashicorp/raft-wal"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // raftTransportTimeout bounds each raft RPC's write and read, on both the
@@ -21,7 +23,7 @@ const raftTransportTimeout = 10 * time.Second
 
 const (
 	raftLogBoltFilename = "raft-log.bolt"
-	raftLogWALDirname   = "raft-wal"
+	raftLogWALDirname   = raftlogdir.DefaultName
 	raftStableFilename  = "raft-stable.bolt"
 )
 
@@ -52,11 +54,15 @@ type raftNode struct {
 
 // raftSetupConfig captures the inputs setupRaft needs.
 type raftSetupConfig struct {
-	NodeID           string
-	BindAddr         string // listen address for raft TCP transport
-	AdvertiseAddr    string // address peers should reach us at
-	DataDir          string // directory for log/stable/snapshot stores
-	BootstrapCluster bool   // single-node bootstrap flag
+	NodeID        string
+	BindAddr      string // listen address for raft TCP transport
+	AdvertiseAddr string // address peers should reach us at
+	DataDir       string // directory for log/stable/snapshot stores
+	// WALDir is SB_RAFT_WAL_DIR: the raft-wal log on a disk of its own. ""
+	// keeps it in DataDir. internal/raftlogdir decides, and keeps it where
+	// the node first put it.
+	WALDir           string
+	BootstrapCluster bool // single-node bootstrap flag
 	// TLS, when non-nil, switches the transport from plaintext TCP to mTLS via
 	// a custom StreamLayer. Both peer connect AND peer accept require a cert
 	// chained to the cluster CA — the same property the cluster-internal HTTP
@@ -122,7 +128,7 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 	// (existing nodes); otherwise open raft-wal. Detection keys off the bolt
 	// file existing — a bolt file is never byte-empty — not a fuzzy
 	// "non-empty dir". Mixed-format clusters are safe (store is node-local).
-	logStore, err := openRaftLogStore(cfg.DataDir, logger)
+	logStore, err := openRaftLogStore(cfg.DataDir, cfg.WALDir, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -230,10 +236,12 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 }
 
 // openRaftLogStore picks Bolt or WAL by on-disk format. Existing
-// raft-log.bolt → Bolt (no conversion). Absent → WAL under raft-wal/.
+// raft-log.bolt → Bolt (no conversion). Absent → WAL, in the directory
+// raftlogdir.Resolve picks: raft-wal/ under dataDir, or walDir
+// (SB_RAFT_WAL_DIR) on a node that started with it.
 // Reverting a WAL node is NOT in-place: drain → rejoin with bolt build +
 // fresh DataDir (see setup/runbooks/lost-quorum-recovery.md).
-func openRaftLogStore(dataDir string, logger *slog.Logger) (closableLogStore, error) {
+func openRaftLogStore(dataDir, walDir string, logger *slog.Logger) (closableLogStore, error) {
 	boltPath := filepath.Join(dataDir, raftLogBoltFilename)
 	if st, err := os.Stat(boltPath); err == nil {
 		if st.IsDir() {
@@ -247,13 +255,19 @@ func openRaftLogStore(dataDir string, logger *slog.Logger) (closableLogStore, er
 		}
 		if logger != nil {
 			logger.Info("raft log store: boltdb (existing raft-log.bolt)")
+			if walDir != "" {
+				logger.Warn("SB_RAFT_WAL_DIR is ignored: this node keeps its Raft log in raft-log.bolt", "dir", walDir)
+			}
 		}
 		return store, nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("raft setup: stat log store: %w", err)
 	}
 
-	walDir := filepath.Join(dataDir, raftLogWALDirname)
+	walDir, err := raftlogdir.Resolve(dataDir, walDir)
+	if err != nil {
+		return nil, fmt.Errorf("raft setup: %w", err)
+	}
 	if err := os.MkdirAll(walDir, 0o700); err != nil {
 		return nil, fmt.Errorf("raft setup: mkdir wal dir: %w", err)
 	}

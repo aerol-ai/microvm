@@ -97,6 +97,16 @@ type ServerSpec struct {
 	// Storage is each server's disk. It cannot move between zones, so each
 	// server is pinned to its zone.
 	Storage StorageSpec `json:"storage"`
+	// LogStorage, when set, is a second disk for each server that holds
+	// only its Raft log (sandboxd's SB_RAFT_WAL_DIR). A commit waits for a
+	// log write on the leader and then on a follower, so the log's disk
+	// sets the commit time; on the cell bench, a log on a disk of its own
+	// brought Raft apply p99 under 25 ms at 1,354 creates a second
+	// (plans/kubernetes-v2-architecture.md §9.5). A server keeps the layout
+	// it was made with: setting or clearing this changes only servers made
+	// after it, because a new disk laid over a log would hide it.
+	// +optional
+	LogStorage *StorageSpec `json:"logStorage,omitempty"`
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +optional

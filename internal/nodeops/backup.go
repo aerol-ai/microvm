@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // The archive layout. The names are fixed whatever the source paths were,
@@ -92,6 +93,8 @@ type source struct {
 	// copy); the header still describes path.
 	content string
 	tree    bool
+	// skip is a file at the top of a tree the archive leaves out.
+	skip string
 }
 
 // Backup writes the node's database, Raft data, config directory and server
@@ -118,8 +121,16 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 	if err != nil {
 		return res, err
 	}
-	for _, dir := range []string{o.RaftDir, o.ConfigDir} {
-		if within(out, dir) {
+	// A log SB_RAFT_WAL_DIR put on a disk of its own goes into the archive
+	// where it is by default, raft/raft-wal, and the record naming that disk
+	// stays out: archive names are fixed (see archiveLib), so a restore lands
+	// the default layout.
+	walDir, err := raftlogdir.Recorded(o.RaftDir)
+	if err != nil {
+		return res, err
+	}
+	for _, dir := range []string{o.RaftDir, walDir, o.ConfigDir} {
+		if dir != "" && within(out, dir) {
 			return res, usageErr("--output %s is inside %s, which the backup copies", out, dir)
 		}
 	}
@@ -172,6 +183,13 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 		m.add("missing", o.StateDB)
 	}
 	srcs = m.tree(srcs, archiveRaft, o.RaftDir)
+	if walDir != "" {
+		if n := len(srcs); n > 0 && srcs[n-1].name == archiveRaft {
+			srcs[n-1].skip = raftlogdir.LocationFile
+		}
+		m.add("raft_wal_dir", walDir)
+		srcs = m.tree(srcs, archiveRaft+"/"+raftlogdir.DefaultName, walDir)
+	}
 	srcs = m.tree(srcs, archiveConfig, o.ConfigDir)
 	if exists(o.RaftDir) && !o.Stop && o.Host.UnitActive(ctx, sandboxdUnit) {
 		fmt.Fprintf(o.Out, "note: %s is copied while sandboxd runs; pass --stop for a copy at rest\n", o.RaftDir)
@@ -344,6 +362,9 @@ func (w *archiveWriter) entries(manifest []byte, srcs []source) error {
 			rel, err := filepath.Rel(s.path, path)
 			if err != nil {
 				return err
+			}
+			if s.skip != "" && rel == s.skip {
+				return nil
 			}
 			name := s.name
 			if rel != "." {
