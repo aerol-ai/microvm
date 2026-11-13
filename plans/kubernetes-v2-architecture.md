@@ -1411,11 +1411,14 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   as written.
 - **Not built yet:** warm pools pre-starting sandboxes (a claim
   cold-starts; the plan is to sum `replicas` per image into the FSM's
-  warm-pool entries, next to the operator's own); carrying the claim mark in the
-  placement row (a claim list reads every spec summary in the namespace);
-  and a second `kubectl apply` of a Sandbox or a claim (annotations are
-  not kept, so kubectl's own annotation makes the patch one that only
-  `operatingMode` may pass; claims have no patch at all).
+  warm-pool entries, next to the operator's own); and carrying the claim mark in the
+  placement row (a claim list reads every spec summary in the namespace).
+- **A second `kubectl apply`** (a follow-up): the patch is merged onto the
+  shown object and checked as a create. A change to what is shown (image,
+  command, runtime class, CPU, memory, labels; a claim's warm pool) is
+  refused; env, disk and shutdown time are not shown, so they are not
+  compared, and a `Warning` says so. Env is never hashed to compare it:
+  no server holds it in the clear.
 
 ---
 

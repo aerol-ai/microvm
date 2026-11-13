@@ -210,6 +210,27 @@ func claimFrom(it kubeview.Item, ns string, spec *SpecSummary) map[string]any {
 
 func isClaim(spec SpecSummary, ok bool) bool { return ok && spec.Tags[TagClaim] == "true" }
 
+// patchClaim answers a patch of a claim, which cannot change: a second
+// `kubectl apply` of it passes when what it shows is as it was (apply.go).
+func (s *Server) patchClaim(w http.ResponseWriter, r *http.Request, it kubeview.Item, ns string, sp SpecSummary) error {
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/merge-patch+json") && !strings.HasPrefix(ct, "application/strategic-merge-patch+json") {
+		return &StatusError{Code: http.StatusUnsupportedMediaType, Reason: "UnsupportedMediaType", Message: "only merge patches are supported"}
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&raw); err != nil {
+		return &StatusError{Code: http.StatusBadRequest, Reason: "BadRequest", Message: "the patch is not a JSON object"}
+	}
+	cur := claimFrom(it, ns, &sp)
+	warnings, err := mergeClaimPatch(cur, sp.Tags[TagWarmPool], sp.Tags, raw)
+	if err != nil {
+		return err
+	}
+	warn(w, warnings)
+	writeJSON(w, http.StatusOK, cur)
+	return nil
+}
+
 // keepClaim applies a list's or watch's selectors to a rendered claim, as
 // keep does to a sandbox: kubectl wait finds its one object by
 // fieldSelector metadata.name.
@@ -282,7 +303,7 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		writeJSON(w, http.StatusOK, map[string]any{"apiVersion": ExtensionsAPIVersion(), "kind": "SandboxClaimList",
 			"metadata": map[string]any{"resourceVersion": strconv.FormatUint(pos, 10)}, "items": items})
 		return nil
-	case "get", "delete":
+	case "get", "delete", "patch":
 		owner := firstKey(owners)
 		claimNotFound := &StatusError{Code: http.StatusNotFound, Reason: "NotFound", Message: fmt.Sprintf("sandboxclaims.%s %q not found", ExtensionsGroup, name)}
 		it, err := s.find(owner, name)
@@ -295,6 +316,9 @@ func (s *Server) serveClaims(w http.ResponseWriter, r *http.Request, verb, ns, n
 		sp, ok := s.Backend.Specs(ctx, specRefs(it))[it.Placement.SandboxID]
 		if !isClaim(sp, ok) {
 			return claimNotFound
+		}
+		if verb == "patch" {
+			return s.patchClaim(w, r, it, ns, sp)
 		}
 		if verb == "delete" {
 			if err := s.Backend.Delete(ctx, owner, it.Placement.SandboxID); err != nil {

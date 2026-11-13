@@ -69,8 +69,29 @@ func TestClaimCreateGetListDelete(t *testing.T) {
 	if rr, _ := r.call(t, http.MethodPost, claims, claimBody); rr.Code != http.StatusConflict {
 		t.Fatalf("a taken name = %d", rr.Code)
 	}
-	if rr, _ := r.call(t, http.MethodPatch, claims+"/job", `{}`, "Content-Type", "application/merge-patch+json"); rr.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("patch = %d", rr.Code)
+	// A claim cannot change; one sent as it is (a second kubectl apply)
+	// passes, and its env, which this server does not show, is not
+	// compared and is said so.
+	merge := "application/merge-patch+json"
+	if rr, _ := r.call(t, http.MethodPatch, claims+"/job", `{"metadata":{"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{}"}},"spec":{"warmPoolRef":{"name":"pool"},"env":[{"name":"TASK","value":"t1"}]}}`, "Content-Type", merge); rr.Code != http.StatusOK ||
+		!strings.Contains(rr.Header().Get("Warning"), "spec.env") {
+		t.Fatalf("a second apply = %d %q", rr.Code, rr.Header().Get("Warning"))
+	}
+	for body, want := range map[string]string{
+		`{"spec":{"warmPoolRef":{"name":"another"}}}`:  "spec.warmPoolRef",
+		`{"metadata":{"labels":{"team":"other"}}}`:     "metadata.labels",
+		`{"metadata":{"name":"renamed"}}`:              "cannot change",
+		`{"spec":{"sandboxTemplateRef":{"name":"t"}}}`: "not supported",
+	} {
+		if rr, out := r.call(t, http.MethodPatch, claims+"/job", body, "Content-Type", merge); rr.Code != http.StatusUnprocessableEntity || !strings.Contains(out["message"].(string), want) {
+			t.Fatalf("patch %s = %d %v", body, rr.Code, out["message"])
+		}
+	}
+	if rr, _ := r.call(t, http.MethodPatch, claims+"/job", `{}`, "Content-Type", "application/json-patch+json"); rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("a JSON patch = %d", rr.Code)
+	}
+	if rr, _ := r.call(t, http.MethodPatch, claims+"/job", `x`, "Content-Type", merge); rr.Code != http.StatusBadRequest {
+		t.Fatalf("not JSON = %d", rr.Code)
 	}
 	if rr, _ := r.call(t, http.MethodDelete, claims+"/plain", ""); rr.Code != http.StatusNotFound {
 		t.Fatal("deleting a plain sandbox as a claim")

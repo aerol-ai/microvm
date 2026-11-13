@@ -163,7 +163,9 @@ kubectl -n payments wait --for=condition=Ready sandbox/web
 `operatingMode` is the only field you can change after a create. To change anything else, delete the sandbox and create it again.
 
 <Aside>
-`kubectl apply` works for the first create only. A second `kubectl apply` of a Sandbox or a claim is refused, even if the file did not change. Use `kubectl patch` to stop and start, or delete and create again.
+You can run `kubectl apply` again on the same file. It passes when nothing that AerolVM shows has changed: the image, the command, the runtime class, CPU, memory and labels. A change to one of them is refused with the field's name; delete the sandbox and create it again instead. A changed `spec.operatingMode` stops or starts the sandbox.
+
+AerolVM does not show a sandbox's env, disk size or shutdown time, so a second apply does not compare or change them. kubectl prints a warning that says so. The same goes for a claim: its warm pool and labels are compared, and its env and lifecycle are not.
 </Aside>
 
 ## Shut down at a set time
