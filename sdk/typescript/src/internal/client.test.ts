@@ -3,7 +3,7 @@ import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { APIClient, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
+import { APIClient, CELL_ENDPOINT_HEADER, SandboxResource, newIdempotencyKey, parseRetryAfter, retryDelayMs } from "./client.js";
 import {
   MicroVMApiError,
   MicroVMAuthError,
@@ -1576,10 +1576,10 @@ test("sandbox resource customDomains.dns delegates to client", async () => {
   assert.equal(result.target.source, "hostname");
 });
 
-function jsonResponse(value: unknown, status = 200): Response {
+function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(value), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -1634,6 +1634,259 @@ test("internal client retries 421 Misdirected Request", async () => {
   const sandbox = await client.get("sb-421");
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
+});
+
+// C16: a sandbox in another cell of a federation is answered 421 with that
+// cell's base URL. The client sends the same request there once and sends the
+// sandbox's later requests straight there.
+
+function cellAnswer(endpoint: string): Response {
+  return jsonResponse({ error: "this sandbox is in another cell" }, 421, { [CELL_ENDPOINT_HEADER]: endpoint });
+}
+
+/** A fake fetch that records each URL and answers from `route`. */
+function cellFetch(route: (url: URL, init?: RequestInit) => Response): { urls: string[]; fetch: typeof fetch } {
+  const urls: string[] = [];
+  return {
+    urls,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      urls.push(`${init?.method ?? "GET"} ${url.href}`);
+      return route(url, init);
+    },
+  };
+}
+
+test("internal client follows a cell redirect once, with the same auth, headers and body", async () => {
+  type Seen = { cell: string; method: string; url: string; auth: string; team: string; body: string };
+  const seen: Seen[] = [];
+  const record = (cell: string, req: Parameters<RequestListener>[0], then: () => void) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => (body += chunk));
+    req.on("end", () => {
+      seen.push({
+        cell,
+        method: req.method ?? "",
+        url: req.url ?? "",
+        auth: req.headers.authorization ?? "",
+        team: String(req.headers["x-aerolvm-team"] ?? ""),
+        body,
+      });
+      then();
+    });
+  };
+  const send = (res: Parameters<RequestListener>[1], status: number, value: unknown, headers: Record<string, string> = {}) => {
+    res.writeHead(status, { "content-type": "application/json", ...headers });
+    res.end(JSON.stringify(value));
+  };
+
+  await withServer((req, res) => {
+    record("cell2", req, () => {
+      if (req.method === "POST") send(res, 200, { stdout: "from cell 2\n", stderr: "", exit_code: 0, duration_ms: 1 });
+      else send(res, 200, apiSandbox("sb-x"));
+    });
+  }, async (cell2) => {
+    await withServer((req, res) => {
+      record("cell1", req, () => {
+        // Each install has its own path prefix, and the header may carry a
+        // trailing slash.
+        if (req.url?.includes("/sb-x")) send(res, 421, { error: "another cell" }, { [CELL_ENDPOINT_HEADER]: `${cell2}/edge/` });
+        else send(res, 200, apiSandbox("sb-y"));
+      });
+    }, async (cell1) => {
+      // fetch itself sends a 421 once more on a new connection (the Fetch
+      // standard), so cell 1 sees the first request twice; what the client
+      // sends is counted here.
+      const sent: string[] = [];
+      const client = new APIClient({
+        baseURL: `${cell1}/api`,
+        patToken: "pat-token",
+        team: "acme",
+        retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+        fetch: (input, init) => {
+          sent.push(`${init?.method} ${String(input)}`);
+          return fetch(input, init);
+        },
+      });
+
+      // exec is not idempotent, but the cell router turns it away before
+      // any work, so it follows too.
+      const result = await client.exec("sb-x", { command: "echo hi" });
+      assert.equal(result.stdout, "from cell 2\n");
+      assert.deepEqual(sent, [
+        `POST ${cell1}/api/v1/sandboxes/sb-x/toolbox/process/execute`,
+        `POST ${cell2}/edge/v1/sandboxes/sb-x/toolbox/process/execute`,
+      ]);
+      assert.deepEqual(
+        seen.filter((s) => s.cell === "cell2").map((s) => `${s.method} ${s.url}`),
+        ["POST /edge/v1/sandboxes/sb-x/toolbox/process/execute"],
+      );
+      for (const s of seen) {
+        assert.equal(s.auth, "Bearer pat-token", s.cell);
+        assert.equal(s.team, "acme", s.cell);
+        assert.equal(s.body, seen[0].body, s.cell);
+      }
+      assert.equal((JSON.parse(seen[0].body) as { command: string }).command, "echo hi");
+
+      // Remembered: X goes straight to cell 2; Y still goes to cell 1.
+      seen.length = 0;
+      assert.equal((await client.get("sb-x")).id, "sb-x");
+      assert.equal((await client.get("sb-y")).id, "sb-y");
+      assert.deepEqual(
+        seen.map((s) => `${s.cell} ${s.method} ${s.url}`),
+        ["cell2 GET /edge/v1/sandboxes/sb-x", "cell1 GET /api/v1/sandboxes/sb-y"],
+      );
+    });
+  });
+});
+
+test("internal client retries a 421 without a cell header at the same address", async () => {
+  let misdirected = 1;
+  const { urls, fetch } = cellFetch(() => (misdirected-- > 0 ? jsonResponse({ error: "misdirected" }, 421) : jsonResponse(apiSandbox("sb-x"))));
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch,
+  });
+  await client.get("sb-x");
+  await client.get("sb-x");
+  assert.deepEqual(urls, Array(3).fill("GET https://api.example.com/v1/sandboxes/sb-x"));
+});
+
+test("internal client does not follow a second cell redirect", async () => {
+  const { urls, fetch } = cellFetch((url) =>
+    cellAnswer(url.host === "api.example.com" ? "https://cell2.example.com" : "https://api.example.com"),
+  );
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch,
+  });
+  await assert.rejects(client.get("sb-x"), (err: unknown) => err instanceof MicroVMApiError && err.status === 421);
+  assert.deepEqual(urls, ["GET https://api.example.com/v1/sandboxes/sb-x", "GET https://cell2.example.com/v1/sandboxes/sb-x"]);
+});
+
+test("internal client refuses a cell endpoint it may not send its token to", async () => {
+  const cases: Array<{ name: string; endpoint: string }> = [
+    { name: "https to http downgrade", endpoint: "http://cell2.example.com" },
+    { name: "no scheme", endpoint: "cell2.example.com" },
+    { name: "relative", endpoint: "/cell2" },
+    { name: "not http", endpoint: "ftp://cell2.example.com" },
+  ];
+  for (const tc of cases) {
+    const { urls, fetch } = cellFetch((url) => (url.host === "api.example.com" ? cellAnswer(tc.endpoint) : jsonResponse(apiSandbox("sb-x"))));
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch,
+    });
+    // Neither followed nor retried in place, and not remembered.
+    await assert.rejects(client.get("sb-x"), (err: unknown) => err instanceof MicroVMApiError && err.status === 421, tc.name);
+    await assert.rejects(client.get("sb-x"), (err: unknown) => err instanceof MicroVMApiError && err.status === 421, tc.name);
+    assert.deepEqual(urls, Array(2).fill("GET https://api.example.com/v1/sandboxes/sb-x"), tc.name);
+  }
+});
+
+test("internal client follows an http cell endpoint from an http client", async () => {
+  const { urls, fetch } = cellFetch((url) => (url.host === "api.example.com" ? cellAnswer("http://cell2.example.com") : jsonResponse(apiSandbox("sb-x"))));
+  const client = new APIClient({ baseURL: "http://api.example.com", patToken: "pat-token", fetch });
+  assert.equal((await client.get("sb-x")).id, "sb-x");
+  assert.deepEqual(urls, ["GET http://api.example.com/v1/sandboxes/sb-x", "GET http://cell2.example.com/v1/sandboxes/sb-x"]);
+});
+
+test("internal client forgets a sandbox's cell on a 404 from it, but not on a missing file", async () => {
+  let gone = false;
+  const { urls, fetch } = cellFetch((url) => {
+    if (url.host === "api.example.com") return cellAnswer("https://cell2.example.com");
+    if (url.pathname.endsWith("/toolbox/files/info")) {
+      return jsonResponse({ error: "stat /nope: no such file or directory", code: "file_not_found" }, 404);
+    }
+    return gone ? jsonResponse({ error: "sandbox not found" }, 404) : jsonResponse(apiSandbox("sb-x"));
+  });
+  const client = new APIClient({ baseURL: "https://api.example.com", patToken: "pat-token", fetch });
+  const api = "https://api.example.com/v1/sandboxes/sb-x";
+  const cell2 = "https://cell2.example.com/v1/sandboxes/sb-x";
+
+  await client.get("sb-x");
+  assert.equal(await client.fileExists("sb-x", "/nope"), false);
+  gone = true;
+  await assert.rejects(client.get("sb-x"), MicroVMNotFoundError);
+  // Forgotten: the next call asks the configured server again.
+  gone = false;
+  await client.get("sb-x");
+  assert.deepEqual(urls, [
+    `GET ${api}`,
+    `GET ${cell2}`,
+    `GET ${cell2}/toolbox/files/info?path=%2Fnope&extended=true`,
+    `GET ${cell2}`,
+    `GET ${api}`,
+    `GET ${cell2}`,
+  ]);
+});
+
+test("internal client remembers the cell but does not re-send a streamed body", async () => {
+  const { urls, fetch } = cellFetch((url) => (url.host === "api.example.com" ? cellAnswer("https://cell2.example.com") : new Response(null, { status: 204 })));
+  const client = new APIClient({ baseURL: "https://api.example.com", patToken: "pat-token", fetch });
+  async function* chunks() {
+    yield new TextEncoder().encode("data");
+  }
+  await assert.rejects(client.uploadFileStream("sb-x", "/w/f", chunks()), (err: unknown) => err instanceof MicroVMApiError && err.status === 421);
+  // The caller's own retry, here with a body in memory, goes to the right cell.
+  await client.uploadFile("sb-x", "/w/f", "data");
+  assert.deepEqual(urls, [
+    "POST https://api.example.com/v1/sandboxes/sb-x/toolbox/files/upload",
+    "POST https://cell2.example.com/v1/sandboxes/sb-x/toolbox/files/upload",
+  ]);
+});
+
+test("internal client opens a stream to a sandbox's remembered cell", async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const opened: string[] = [];
+  class FakeWebSocket {
+    binaryType = "blob";
+    constructor(url: string) {
+      opened.push(url);
+    }
+    addEventListener(): void {}
+    send(): void {}
+    close(): void {}
+  }
+  try {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    const { fetch } = cellFetch((url) => (url.host === "api.example.com" ? cellAnswer("https://cell2.example.com/edge") : jsonResponse(apiSandbox("sb-x"))));
+    const client = new APIClient({ baseURL: "https://api.example.com", patToken: "pat-token", fetch });
+    await client.get("sb-x");
+    client.execStream("sb-x", { command: "true" });
+    client.execStream("sb-y", { command: "true" });
+    assert.deepEqual(opened, [
+      "wss://cell2.example.com/edge/v1/sandboxes/sb-x/toolbox/process/exec/stream",
+      "wss://api.example.com/v1/sandboxes/sb-y/toolbox/process/exec/stream",
+    ]);
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("internal client keeps at most 10,000 remembered cells, dropping the oldest", async () => {
+  const { urls, fetch } = cellFetch((url) => (url.host === "api.example.com" ? cellAnswer("https://cell2.example.com") : new Response(null, { status: 204 })));
+  const client = new APIClient({ baseURL: "https://api.example.com", patToken: "pat-token", fetch });
+  for (let i = 0; i <= 10_000; i++) {
+    await client.destroy(`sb-${i}`);
+  }
+  urls.length = 0;
+  await client.destroy("sb-10000");
+  await client.destroy("sb-1");
+  await client.destroy("sb-0");
+  assert.deepEqual(urls, [
+    "DELETE https://cell2.example.com/v1/sandboxes/sb-10000",
+    "DELETE https://cell2.example.com/v1/sandboxes/sb-1",
+    "DELETE https://api.example.com/v1/sandboxes/sb-0",
+    "DELETE https://cell2.example.com/v1/sandboxes/sb-0",
+  ]);
 });
 
 // A re-sent exec runs the caller's command again (the Rust SDK once ran a 40 s

@@ -67,15 +67,10 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 		}
 	}
 
-	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/process/exec/stream")
-	if err != nil {
-		return nil, err
-	}
-
 	requestHeader := http.Header{}
 	c.setAuthHeaders(requestHeader)
 
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
+	conn, resp, wsURL, err := c.dialSandbox(ctx, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/process/exec/stream", requestHeader)
 	if err != nil {
 		return nil, decorateHandshakeError("exec stream", wsURL, resp, err)
 	}

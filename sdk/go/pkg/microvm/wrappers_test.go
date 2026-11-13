@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -307,10 +308,12 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 // fail the call, not run the command again, even with retries configured.
 func TestSandboxExecIsNotResent(t *testing.T) {
 	ctx := context.Background()
-	var execs int
+	// Atomic: a dropped connection gives the race detector no ordering
+	// between the handler's write and the read below.
+	var execs atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
-		execs++
+		execs.Add(1)
 		conn, _, err := w.(http.Hijacker).Hijack()
 		if err != nil {
 			t.Errorf("Hijack() error = %v", err)
@@ -337,8 +340,8 @@ func TestSandboxExecIsNotResent(t *testing.T) {
 	if _, err := sb.ExecCommand(ctx, "sleep 40"); err == nil {
 		t.Fatal("Sandbox.ExecCommand() succeeded on a dropped connection")
 	}
-	if execs != 2 {
-		t.Fatalf("server saw %d exec requests for 2 calls, want 2", execs)
+	if got := execs.Load(); got != 2 {
+		t.Fatalf("server saw %d exec requests for 2 calls, want 2", got)
 	}
 }
 
