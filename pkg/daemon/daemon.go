@@ -943,6 +943,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// cannot confirm it still owns them (ownership_lease.go). A no-op
 		// outside cluster mode.
 		svc.StartOwnershipLease(ctx)
+		// Run states for the agent-sandbox API (run_state_report.go). A
+		// no-op unless SB_AGENT_SANDBOX_API and cluster mode.
+		svc.StartRunStateReports(ctx)
 		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
