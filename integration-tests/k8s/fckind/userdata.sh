@@ -80,7 +80,11 @@ t0=$(date +%s%N)
 out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"firecracker","image":"alpine:3.20","cpu":1,"memory_mb":512}')
 id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
 say "create (cold, image to disk): $(( ($(date +%s%N) - t0) / 1000000 )) ms: $(head -c 300 <<<"$out")"
-if [ -z "$id" ]; then k logs $pod -c agent 2>&1 | grep -iE 'firecracker|vmm|tap|jailer|error' | grep -v 'request complete' | tail -20 | sed 's/^/FCK   agent: /'; finish; fi
+if [ -z "$id" ]; then
+  k logs $pod -c agent 2>&1 | grep -iE 'firecracker|vmm|tap|jailer|error' | grep -v 'request complete\|ssh handshake' | tail -8 | cut -c1-400 | sed 's/^/FCK   agent: /'
+  k exec $pod -c agent -- sh -c 'ip -d link show 2>&1 | grep -A2 fctap; echo "sandboxd netns $(readlink /proc/$(pgrep -x sandboxd | head -1)/ns/net), agent netns $(readlink /proc/self/ns/net)"; ls -ln /dev/net/tun' 2>&1 | sed 's/^/FCK   diag: /'
+  finish
+fi
 ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute -d "{\"command\":\"$1\"}" | head -c 300; }
 say "exec before: $(ex 'echo booted-$(cat /proc/sys/kernel/random/boot_id | cut -c1-8) && uname -r')"
 vmm() { k exec $pod -c agent -- sh -c 'for p in $(pgrep -x firecracker); do echo "$p=$(sed -n "s#^0::.*/sandboxes/##p" /proc/$p/cgroup)"; done' | tr '\n' ' '; }

@@ -493,7 +493,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
-		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
+		tapHost := tap.NewHost(cfg.FirecrackerIPBinary)
+		if cfg.UseJailer {
+			// The jailed VM runs as the jailer's user, which may attach
+			// only to a TAP it owns.
+			tapHost.Owner = &tap.Owner{UID: cfg.JailerUID, GID: cfg.JailerGID}
+		}
+		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tapHost})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
 		// Snapshots (CreateSnapshot) go into the node's container engine,
 		// and a cold boot pulls a snapshot another node pushed with the

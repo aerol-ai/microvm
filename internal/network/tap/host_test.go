@@ -517,3 +517,18 @@ func TestEnsureDefaultIPv6Off(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A TAP for a jailed Firecracker is made for the jailer's user and group:
+// without CAP_NET_ADMIN a process attaches only to a TAP it owns.
+func TestEnsure_OwnedByTheJailer(t *testing.T) {
+	r := &recordingRun{}
+	h := newHostWithRun(r)
+	h.Owner = &Owner{UID: 990, GID: 991}
+	slot := Slot{TapName: "fctap-1", CIDR: "172.16.0.0/30", HostIP: "172.16.0.1", GuestIP: "172.16.0.2", VsockCID: 3}
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if want := []string{"tuntap", "add", "fctap-1", "mode", "tap", "user", "990", "group", "991"}; len(r.calls) == 0 || !equalStrings(r.calls[0].args, want) {
+		t.Fatalf("tuntap add = %v, want %v", r.calls[0].args, want)
+	}
+}
