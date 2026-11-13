@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -198,7 +199,7 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return err
 	}
-	staging, err := os.MkdirTemp(base, "."+sandboxID+".import-")
+	staging, err := os.MkdirTemp(base, ".import-")
 	if err != nil {
 		return err
 	}
@@ -224,12 +225,16 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 		if err := checkMoveEntry(h, manifest, got); err != nil {
 			return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 		}
-		if err := writeMoveEntry(filepath.Join(staging, h.Name), h, tr); err != nil {
+		path, err := inside(staging, h.Name)
+		if err != nil {
+			return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
+		}
+		if err := writeMoveEntry(path, h, tr); err != nil {
 			return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 		}
 		got[h.Name] = true
 		if h.Name == sandboxSnapshotManifestName {
-			if manifest, err = readMoveManifest(filepath.Join(staging, h.Name), sandboxID); err != nil {
+			if manifest, err = readMoveManifest(path, sandboxID); err != nil {
 				return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 			}
 		}
@@ -250,7 +255,10 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 	}
 
 	// In place: what an earlier, unfinished import of this sandbox left goes.
-	final := d.sandboxSnapshotDir(sandboxID)
+	final, err := inside(base, sandboxID)
+	if err != nil {
+		return err
+	}
 	if err := os.RemoveAll(final); err != nil {
 		return err
 	}
@@ -265,6 +273,18 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 		return fmt.Errorf("firecracker runtime: import %s: tap allocate: %w", sandboxID, err)
 	}
 	return nil
+}
+
+// inside is dir's child name, refusing a name that would leave dir. The
+// sandbox ID and the entry names are checked already (validateSandboxID,
+// checkMoveEntry), but they arrive from another worker, and this is the
+// check code scanning recognizes (go/path-injection, go/zipslip).
+func inside(dir, name string) (string, error) {
+	p := filepath.Join(dir, name)
+	if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(dir)+string(filepath.Separator)) {
+		return "", fmt.Errorf("%q is not a name inside %s", name, dir)
+	}
+	return p, nil
 }
 
 // checkMoveEntry refuses an entry a move never sends: a name outside the
@@ -365,7 +385,15 @@ func (d *Driver) DropImportedSnapshot(ctx context.Context, sandboxID string) err
 	if running {
 		return fmt.Errorf("firecracker runtime: drop %s: %w", sandboxID, errSandboxRunning)
 	}
-	if err := os.RemoveAll(d.sandboxSnapshotDir(sandboxID)); err != nil {
+	base, err := d.sandboxSnapshotBase()
+	if err != nil {
+		return err
+	}
+	dir, err := inside(base, sandboxID)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
 		return err
 	}
 	if d.pool != nil {

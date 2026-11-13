@@ -111,6 +111,7 @@ var routePermissions = map[string]string{
 	"GET /v1/cluster/internal/audit-acl/{id}":                  "cluster.internal",
 	"GET /v1/cluster/internal/drain/{id}":                      "cluster.internal",
 	"GET /v1/cluster/internal/drained-nodes":                   "cluster.internal",
+	"GET /v1/cluster/internal/move/{id}/bundle":                "cluster.internal",
 	"GET /v1/cluster/internal/denied-nodes":                    "cluster.internal",
 	"GET /v1/cluster/nodes/{id}":                               "fleet.admin",
 	"DELETE /v1/cluster/nodes/{id}":                            "fleet.admin",
