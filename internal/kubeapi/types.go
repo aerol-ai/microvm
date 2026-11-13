@@ -133,10 +133,12 @@ const (
 // SandboxSpec is the upstream SandboxSpec: the blueprint and lifecycle
 // inlined, as upstream does.
 type SandboxSpec struct {
-	PodTemplate    PodTemplate `json:"podTemplate"`
-	ShutdownTime   string      `json:"shutdownTime,omitempty"`
-	ShutdownPolicy string      `json:"shutdownPolicy,omitempty"`
-	OperatingMode  string      `json:"operatingMode,omitempty"`
+	PodTemplate     PodTemplate `json:"podTemplate"`
+	ShutdownTime    string      `json:"shutdownTime,omitempty"`
+	ShutdownPolicy  string      `json:"shutdownPolicy,omitempty"`
+	OperatingMode   string      `json:"operatingMode,omitempty"`
+	Service         *bool       `json:"service,omitempty"`
+	FailedPodPolicy string      `json:"failedPodPolicy,omitempty"`
 }
 
 // SandboxStatus is the upstream SandboxStatus, without the Pod-only fields

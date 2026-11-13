@@ -226,12 +226,12 @@ kubectl -n payments wait --for=condition=Ready sandboxclaim/job-42
 The claim makes a sandbox with the claim's name, here `job-42`. Deleting the claim deletes its sandbox.
 
 - **A claim and its sandbox are the same thing.** AerolVM stores no separate claim object. It marks the sandbox with two labels, `agents.x-k8s.io/claim` and `agents.x-k8s.io/warm-pool`, and a claim list shows the sandboxes that carry them.
-- **Env from a claim** follows the template's `envVarsInjectionPolicy`: `Disallowed` refuses it, `Allowed` adds new names only, and `Overrides` may also replace the template's values.
+- **Env from a claim** follows the template's `envVarsInjectionPolicy`: `Disallowed` (the default, when the template does not say) refuses it, `Allowed` adds new names only, and `Overrides` may also replace the template's values.
 - **What is checked when.** Saving a template checks every field and value, so a field AerolVM cannot honor is refused then, not later. The image itself is not pulled until a claim uses it. A warm pool may name a template that does not exist yet; the claim is what fails, with an error that names the missing pool or template.
 
 ## What AerolVM supports
 
-A sandbox is not a pod. AerolVM refuses a field it cannot honor, and names the field in the error, instead of quietly ignoring it. Anything not listed here is refused.
+A sandbox is not a pod. AerolVM refuses a field it cannot honor, and names the field in the error, instead of quietly ignoring it. Anything not listed here is refused. The list follows agent-sandbox v1.0.11; a field's upstream default is always accepted when written out.
 
 | Kind | Field | Supported |
 |---|---|---|
@@ -241,10 +241,13 @@ A sandbox is not a pod. AerolVM refuses a field it cannot honor, and names the f
 | Sandbox, Template | `podTemplate.metadata` | `labels` become tags too; the sandbox's own labels win a clash. `annotations` are accepted and not kept. |
 | Sandbox | `spec.operatingMode` | `Running` or `Suspended`. A sandbox is created `Running`. |
 | Sandbox | `spec.shutdownTime`, `spec.shutdownPolicy` | Yes. |
-| Template | `envVarsInjectionPolicy` | `Allowed`, `Overrides` or `Disallowed`. |
-| Template | `networkPolicyManagement` | `Unmanaged` only. Use AerolVM's [network rules](/network-access/). |
+| Sandbox, Template | `service` | Unset or `false`. AerolVM makes no Kubernetes Service; use the sandbox's [links](/public-urls/). |
+| Sandbox, Template | `failedPodPolicy` | Unset or `Retain`. A failed sandbox stays failed until you delete it. |
+| Template | `envVarsInjectionPolicy` | `Disallowed` (the default), `Allowed` or `Overrides`. |
+| Template | `networkPolicyManagement` | `Managed` (the default) or `Unmanaged`. AerolVM's own walls already give the secure default: the public internet out, no private ranges, only AerolVM's gateways in. Custom `networkPolicy` rules are refused; use AerolVM's [network rules](/network-access/). |
+| Template | `volumeClaimTemplatesPolicy` | Unset or `Disallowed`. |
 | Warm pool | `replicas`, `sandboxTemplateRef.name`, `updateStrategy.type` | `replicas` from 0 to 128; `updateStrategy` `Recreate` or `OnReplenish`. |
-| Claim | `warmPoolRef.name`, `env`, `lifecycle.shutdownTime`, `lifecycle.shutdownPolicy`, `additionalPodMetadata` | Yes. `additionalPodMetadata.labels` become tags. |
+| Claim | `warmPoolRef.name`, `env`, `lifecycle.shutdownTime`, `lifecycle.shutdownPolicy`, `additionalPodMetadata` | Yes. `additionalPodMetadata.labels` become tags. `DeleteForeground` works as `Delete`. |
 | Claim | `volumeClaimTemplates`, `lifecycle.ttlSecondsAfterFinished` | No. |
 | Any | Service accounts, IRSA, volumes, GPUs, node placement, security contexts, init or sidecar containers | No. For cloud access, use AerolVM's own [cloud identity](/sandbox-cloud-identity/). |
 | — | The `sandbox-router` API | No. Reach sandbox ports through AerolVM's normal [links](/public-urls/). |

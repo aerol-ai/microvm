@@ -1336,8 +1336,9 @@ CRDs, and a namespace shows all of its owner's sandboxes.
   `agents.x-k8s.io/warm-pool`; nothing per claim is stored.
 - **Not built yet:** warm pools pre-starting sandboxes (a claim
   cold-starts; the plan is to sum `replicas` per image into the FSM's
-  warm-pool entries, next to the operator's own); the upstream release pin
-  with its e2e gate and golden examples; carrying the claim mark in the
+  warm-pool entries, next to the operator's own); the gate of golden
+  examples and e2e tests for the pinned release (v1.0.11, commit
+  `890de53a4dd18e35313173e6dc34d9559b1a9733`, in `internal/kubeapi`); carrying the claim mark in the
   placement row (a claim list reads every spec summary in the namespace);
   and a second `kubectl apply` of a Sandbox or a claim (annotations are
   not kept, so kubectl's own annotation makes the patch one that only

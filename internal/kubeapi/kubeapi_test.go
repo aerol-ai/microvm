@@ -117,6 +117,11 @@ func TestCreateFrom(t *testing.T) {
 	if strings.Join(req.ContainerCommand, " ") != "python -m http.server" || req.Env["MODE"] != "dev" || req.Tags["app"] != "agent" {
 		t.Fatalf("req = %+v", req)
 	}
+	// Upstream's defaults, spelled out, are accepted (v1.0.11).
+	defaults := strings.Replace(goodCreate, `"shutdownTime"`, `"service": false, "failedPodPolicy": "Retain", "shutdownTime"`, 1)
+	if _, _, err := CreateFrom([]byte(defaults), now, fixed); err != nil {
+		t.Fatalf("upstream's defaults = %v", err)
+	}
 	// The pod template's labels are tags too; the sandbox's own win.
 	if req.Tags["x"] != "y" || len(req.Tags) != 2 {
 		t.Fatalf("tags = %v, want the pod template's label x too", req.Tags)
@@ -160,6 +165,9 @@ func TestCreateFromRefuses(t *testing.T) {
 		{"bad memory", container(`,"resources":{"limits":{"memory":"-1Gi"}}`), "resources.limits.memory"},
 		{"other resource", container(`,"resources":{"limits":{"nvidia.com/gpu":"1"}}`), "resources.limits.nvidia.com/gpu"},
 		{"runtime", `{"metadata":{"name":"web"},"spec":{"podTemplate":{"spec":{"runtimeClassName":"kata","containers":[{"name":"a","image":"x"}]}}}}`, "runtimeClassName"},
+		{"a service", `{"metadata":{"name":"web"},"spec":{"service":true,"podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "spec.service"},
+		{"recreate on failure", `{"metadata":{"name":"web"},"spec":{"failedPodPolicy":"Recreate","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "only Retain"},
+		{"unknown failure policy", `{"metadata":{"name":"web"},"spec":{"failedPodPolicy":"Restart","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "must be Retain"},
 		{"created suspended", `{"metadata":{"name":"web"},"spec":{"operatingMode":"Suspended","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "created Running"},
 		{"unknown mode", `{"metadata":{"name":"web"},"spec":{"operatingMode":"Paused","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "Running or Suspended"},
 		{"past shutdown", `{"metadata":{"name":"web"},"spec":{"shutdownTime":"2026-11-13T11:00:00Z","podTemplate":{"spec":{"containers":[{"name":"a","image":"x"}]}}}}`, "in the future"},

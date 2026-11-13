@@ -45,9 +45,11 @@ var fieldTable = map[string]any{
 				"runtimeClassName": true,
 			},
 		},
-		"shutdownTime":   true,
-		"shutdownPolicy": true,
-		"operatingMode":  true,
+		"shutdownTime":    true,
+		"shutdownPolicy":  true,
+		"operatingMode":   true,
+		"service":         true,
+		"failedPodPolicy": true,
 	},
 	// Status is the server's; a client's copy is dropped, as Kubernetes
 	// drops it for a resource with a status subresource.
@@ -213,6 +215,18 @@ func createRequest(sb *Sandbox, now time.Time, random func() string) (models.Cre
 		bad("spec.podTemplate.spec.runtimeClassName: %v", err)
 	}
 	req.Runtime = runtime
+	// Upstream's defaults are accepted, so a manifest that spells them out
+	// works; what they would change is refused.
+	if sb.Spec.Service != nil && *sb.Spec.Service {
+		bad("spec.service: AerolVM makes no Kubernetes Service for a sandbox; reach it through its AerolVM links")
+	}
+	switch sb.Spec.FailedPodPolicy {
+	case "", "Retain":
+	case "Recreate":
+		bad("spec.failedPodPolicy: only Retain is supported; a failed sandbox stays failed until deleted")
+	default:
+		bad("spec.failedPodPolicy: must be Retain")
+	}
 	switch sb.Spec.OperatingMode {
 	case "", OperatingModeRunning:
 	case OperatingModeSuspended:
