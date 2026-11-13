@@ -342,7 +342,12 @@ while :; do
 done
 echo "BENCH members \$n of \$want after \$(( \$(date +%s) - t0 ))s"
 # Only what the bench reads: the console keeps its last 64 KB.
-metrics() { api \$S/v1/metrics | grep -E '^aerolvm_(raft_apply|raft_snapshot|cluster_placement|scheduler|capacity_lease|cluster_capacity|go_goroutines|cluster_reserve|create)' | grep -v '^#' | sed "s/^/BENCH metric \$1 /"; }
+# Empty buckets are left out. The steps of a commit come from the leader
+# (s1 starts the cluster) and, for a follower's own write, from s2.
+metrics() {
+  api \$S/v1/metrics | grep -E '^aerolvm_(raft_apply|raft_snapshot|raft_leader_store|raft_append_rpc|raft_commit|raft_fsm_enqueue|cluster_placement|scheduler|capacity_lease|cluster_capacity|go_goroutines|cluster_reserve|create)' | grep -v '^#' | grep -v ' 0\$' | sed "s/^/BENCH metric \$1 /"
+  api http://$s2:21212/v1/metrics | grep -E '^aerolvm_raft_(follower_store|apply_wait|apply_fsm)' | grep -v ' 0\$' | sed "s/^/BENCH metric \$1 s2:/"
+}
 # A member is not a placement target until a server has its capacity
 # (polled every few seconds): wait for one create to go through.
 probe() { api -X POST \$G1/v1/sandboxes -d '{"runtime":"wasm","module_ref":"bench","tags":{"bench":"probe"}}' 2>/dev/null | jq -r '.id // empty'; }

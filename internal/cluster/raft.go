@@ -193,6 +193,7 @@ func setupRaft(cfg raftSetupConfig, fsm *placementFSM, logger *slog.Logger) (*ra
 
 	pipelines := newPipelineGuardTransport(transport, raftPipelineStallFactor*raftTransportTimeout, logger)
 	heartbeats := newHeartbeatGateTransport(pipelines)
+	installRaftStepMetrics()
 	r, err := raft.NewRaft(rcfg, fsm, logStore, stableStore, snaps, heartbeats)
 	if err != nil {
 		_ = transport.Close()
