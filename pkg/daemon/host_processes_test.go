@@ -49,3 +49,15 @@ func TestCheckHostProcessesOutliveAgent(t *testing.T) {
 		})
 	}
 }
+
+// A jailed VM's TAP is made for the jailer's user and group (F33); without
+// the jailer it has no owner, as before.
+func TestFirecrackerTapHost(t *testing.T) {
+	h := firecrackerTapHost(config.Config{FirecrackerIPBinary: "/sbin/ip", UseJailer: true, JailerUID: 990, JailerGID: 991})
+	if h.IPCmd != "/sbin/ip" || h.Owner == nil || h.Owner.UID != 990 || h.Owner.GID != 991 {
+		t.Fatalf("jailed: %+v %+v", h, h.Owner)
+	}
+	if h := firecrackerTapHost(config.Config{}); h.Owner != nil {
+		t.Fatalf("no jailer: owner %+v", h.Owner)
+	}
+}

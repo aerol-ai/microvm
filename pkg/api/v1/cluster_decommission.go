@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
@@ -98,4 +99,44 @@ func (h *handlers) clusterNodeMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, out)
+}
+
+// clusterInternalMoveBundle is the source's half of a snapshot move: the
+// sandbox's row and snapshot, sealed for the asking peer, which must be
+// the target the leader's release named (internal/service/snapshot_move.go).
+// An error once the stream has begun ends the connection, and the target's
+// reader then finds no last chunk.
+func (h *handlers) clusterInternalMoveBundle(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Service == nil || h.deps.Service.Cluster() == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	w.Header().Set("Content-Type", cluster.MoveBundleMediaType)
+	out := &startedWriter{w: w}
+	err := h.deps.Service.ExportMove(r.Context(), r.PathValue("id"), peerID, out)
+	switch {
+	case err == nil:
+	case errors.Is(err, service.ErrMoveNotForThisNode) && !out.started:
+		apihttp.WriteError(w, http.StatusForbidden, err.Error())
+	case !out.started:
+		apihttp.WriteError(w, http.StatusConflict, err.Error())
+	default:
+		h.deps.Logger.Warn("cluster: snapshot move export failed mid-stream", "sandbox_id", r.PathValue("id"), "peer", peerID, "err", err)
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// startedWriter notes whether any byte went out, after which an error can
+// only end the connection.
+type startedWriter struct {
+	w       http.ResponseWriter
+	started bool
+}
+
+func (s *startedWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		s.started = true
+	}
+	return s.w.Write(p)
 }

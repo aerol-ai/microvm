@@ -94,3 +94,10 @@ func TestPodPreflight(t *testing.T) {
 		})
 	}
 }
+
+// The pod preflight reads the kvm device from the machine's sysfs.
+func TestDefaultPathsKVMSysfs(t *testing.T) {
+	if p := DefaultPaths(); p.KVMSysfs != "/sys/class/misc/kvm" || p.KVMDevice != "/dev/kvm" {
+		t.Fatalf("kvm paths = %q, %q", p.KVMSysfs, p.KVMDevice)
+	}
+}

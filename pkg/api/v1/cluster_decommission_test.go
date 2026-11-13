@@ -138,3 +138,38 @@ func TestClusterNodeMove(t *testing.T) {
 		t.Fatalf("no service: %d", rr.Code)
 	}
 }
+
+// The source's bundle route: only for a peer a snapshot move names, and a
+// refusal before any byte is a status, not a cut connection.
+func TestClusterInternalMoveBundle(t *testing.T) {
+	c := &evacStubCluster{staleReadStubCluster: &staleReadStubCluster{Noop: cluster.NewNoop("wkr", "", "")}, leader: "srv-leader"}
+	h := placementChangesHandlers(t, c)
+	call := func(peer string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, cluster.MoveBundlePath("sb-vm"), nil)
+		r.SetPathValue("id", "sb-vm")
+		if peer != "" {
+			r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peer))
+		}
+		rr := httptest.NewRecorder()
+		h.clusterInternalMoveBundle(rr, r)
+		return rr
+	}
+	if rr := call("wkr-2"); rr.Code != http.StatusForbidden || rr.Header().Get("Content-Type") == "" {
+		t.Fatalf("no move names this peer: %d", rr.Code)
+	}
+	if rr := call(""); rr.Code != http.StatusForbidden {
+		t.Fatalf("no peer identity: %d", rr.Code)
+	}
+	rr := httptest.NewRecorder()
+	(&handlers{}).clusterInternalMoveBundle(rr, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no service: %d", rr.Code)
+	}
+	sw := &startedWriter{w: httptest.NewRecorder()}
+	if _, _ = sw.Write(nil); sw.started {
+		t.Fatal("an empty write counted as started")
+	}
+	if _, _ = sw.Write([]byte("x")); !sw.started {
+		t.Fatal("a byte out did not count")
+	}
+}

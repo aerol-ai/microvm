@@ -316,6 +316,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.MoveSuffix, internalOp(http.HandlerFunc(h.clusterNodeMove)))
+	mux.Handle("GET "+cluster.PublicInternalMovePath+"{id}/bundle", internalOp(http.HandlerFunc(h.clusterInternalMoveBundle)))
 	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStatus)))
 	mux.Handle("GET "+cluster.PublicInternalUpgradeFencePath, internalOp(http.HandlerFunc(h.clusterInternalUpgradeFence)))
 	mux.Handle("GET "+cluster.PublicInternalUpgradeFilesPath+"{sha256}", internalOp(http.HandlerFunc(h.clusterInternalUpgradeFile)))

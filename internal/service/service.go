@@ -658,6 +658,11 @@ type Service struct {
 	// moves holds the sandboxes released for a decommission move (C9,
 	// decommission.go); OwnershipFenced folds them in.
 	moves moveFences
+	// moveTargets names, per sandbox released for a snapshot move, the
+	// node that may pull its bundle; movesIn holds sandboxes imported here
+	// by one until the placement names this node (snapshot_move.go).
+	moveTargets moveTargets
+	movesIn     moveFences
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
@@ -1554,6 +1559,11 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 			continue
 		}
 		placement, ok := placements[sb.ID]
+		// A sandbox imported here by a snapshot move still names its
+		// source until the leader's swap, moments later (snapshot_move.go).
+		if s.movesIn.held(sb.ID, time.Now()) {
+			continue
+		}
 		// No placement can be a fresh local create awaiting ownership replay;
 		// an orphan has no replacement owner yet. Neither is proof that this
 		// node's runtime is stale. A row with no placement is the ownership

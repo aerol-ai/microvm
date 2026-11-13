@@ -2189,8 +2189,35 @@ not already carry):
   may attach only to a TAP it owns, and ours had no owner. With the jailer
   on, each TAP is now made for the jailer's user and group, as Firecracker's
   own setup does. VMs on plain machines take the same change.
-- Next in Phase 5: snapshot moves during decommission (Firecracker with its
-  memory), then C21.
+- **Firecracker snapshot moves** (2026-11-13, `fckind.sh` with
+  `AEROL_FCKIND_PROOF=move`: kind in cluster mode, three Firecracker
+  workers, on one EC2 m8i.4xlarge; runs `p5-move-1` to `-8`, about $1.10).
+  A decommission moves a Firecracker sandbox without the recreate policy
+  with its memory: the source's stop writes the snapshot and fences it, the
+  target pulls the row and the snapshot over the internal mTLS link, sealed
+  for that target and incarnation (`pkg/secrets` streams), one placement
+  compare-and-swap moves it, and only then does the target restore it. Run
+  `p5-move-8`: moved in the first pass in 9 s, the owner changed, the guest
+  boot ID stayed (`e862c178`) and a counter in the guest went on (4, then
+  49). Four bugs the runs found, fixed:
+  - F34. In cluster mode every Firecracker worker failed its setup init
+    container: setup runs `sandboxd join --files-only` with the agent's
+    settings, whose local checks want `/dev/kvm`, which an unprivileged
+    container never has. The check now takes the machine's sysfs entry, as
+    the pod preflight does. Single mode has no join.
+  - F35. Every import was cut off mid-stream: the target pulled the bundle
+    with the internal client, whose timeout is for control-plane calls. The
+    pull now runs on the move's own deadline.
+  - F36. A VM's disk (10 GiB, 50 MiB used) and memory file (512 MiB, 73 MiB
+    used) went whole, 10.5 GiB of zeros (96 s), and the target wrote every
+    zero, so its start's copy into the jailer outran the start step. A file
+    with holes now goes as its data ranges and lands sparse: 6-9 s.
+  - The target checked its ownership with its own placement view, which on
+    a worker lags the swap it had just been told about; it now asks the
+    leader. Found next, not fixed: a sandbox fenced for a move answers with
+    the lost-contact message ("this sandbox's node has lost contact"),
+    which misleads during a planned move.
+- Next in Phase 5: C21, gVisor sandboxes moving with their memory.
 
 ## 19. Tests, drills and benchmarks
 

@@ -493,13 +493,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
-		tapHost := tap.NewHost(cfg.FirecrackerIPBinary)
-		if cfg.UseJailer {
-			// The jailed VM runs as the jailer's user, which may attach
-			// only to a TAP it owns.
-			tapHost.Owner = &tap.Owner{UID: cfg.JailerUID, GID: cfg.JailerGID}
-		}
-		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tapHost})
+		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: firecrackerTapHost(cfg)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
 		// Snapshots (CreateSnapshot) go into the node's container engine,
 		// and a cold boot pulls a snapshot another node pushed with the
@@ -2376,4 +2370,15 @@ func loopbackAPIBaseURL(listenAddr string) string {
 		port = listenAddr[i+1:]
 	}
 	return "http://127.0.0.1:" + port
+}
+
+// firecrackerTapHost makes the VMs' TAPs. With the jailer on, each is made
+// for the jailer's user and group: the jailed VM runs as that user, which
+// may attach only to a TAP it owns (F33).
+func firecrackerTapHost(cfg config.Config) *tap.Host {
+	h := tap.NewHost(cfg.FirecrackerIPBinary)
+	if cfg.UseJailer {
+		h.Owner = &tap.Owner{UID: cfg.JailerUID, GID: cfg.JailerGID}
+	}
+	return h
 }

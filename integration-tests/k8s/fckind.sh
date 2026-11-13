@@ -3,7 +3,13 @@
 # architecture.md Phase 5, "Firecracker pools"), proven on kind on one EC2
 # machine with nested virtualization, the setting spike S6 tested.
 #
-#   AEROL_BUILD_REF=<commit> fckind.sh <name>
+#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move] fckind.sh <name>
+#
+# pod (the default): one worker, a VM survives an agent restart. move:
+# cluster mode, every worker a Firecracker worker; a VM's worker is
+# cordoned and evacuated, and the VM must answer on another worker with the
+# same guest boot ID and a counter that kept counting (a snapshot move,
+# plan §10.5). Use an m8i.4xlarge for move (AEROL_FCKIND_TYPE).
 #
 # The commit's source goes to the artifact bucket (a presigned link; nothing
 # goes from this machine to the instance directly). The instance builds the
@@ -38,7 +44,7 @@ git -C "$root" archive --format=tar.gz -o "$sd/src.tgz" "$ref"
 aws s3 cp --only-show-errors "$sd/src.tgz" "s3://$bucket/$key"
 url="$(aws s3 presign "s3://$bucket/$key" --expires-in 7200)"
 # Not sed: a presigned link is full of "&", which sed reads as the match.
-URL="$url" python3 -c 'import os, sys; sys.stdout.write(open(sys.argv[1]).read().replace("@SRC_URL@", os.environ["URL"]))' \
+URL="$url" PROOF="${AEROL_FCKIND_PROOF:-pod}" python3 -c 'import os, sys; sys.stdout.write(open(sys.argv[1]).read().replace("@SRC_URL@", os.environ["URL"]).replace("@PROOF@", os.environ["PROOF"]))' \
   "$root/integration-tests/k8s/fckind/userdata.sh" > "$sd/userdata.sh"
 say "source ${ref:0:12} staged; launching $itype with nested virtualization"
 
