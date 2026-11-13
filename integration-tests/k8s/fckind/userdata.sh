@@ -261,6 +261,9 @@ apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata: { name: python, namespace: dev }
 spec:
+  # Claims may set env only when the template says so (upstream's default
+  # is Disallowed; p6-kubeapi-7 showed the refusal).
+  envVarsInjectionPolicy: Allowed
   podTemplate:
     spec:
       runtimeClassName: gvisor
