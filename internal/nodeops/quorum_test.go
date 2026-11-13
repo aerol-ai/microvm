@@ -330,6 +330,24 @@ func TestRecoverQuorumRejoinMovesALogOnItsOwnDisk(t *testing.T) {
 			t.Fatal("the log was left aside")
 		}
 	})
+	t.Run("a log that cannot move stops the rejoin", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root renames in a read-only directory")
+		}
+		n, own := setup(t)
+		disk := filepath.Dir(own)
+		if err := os.Chmod(disk, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(disk, 0o700) })
+		_, _, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true})
+		if err == nil || !strings.Contains(err.Error(), "not the disk's mount point") {
+			t.Fatalf("rejoin = %v; want the log's move refused", err)
+		}
+		if !exists(filepath.Join(n.lib, "raft")) || read(t, filepath.Join(own, "wal-meta.db")) != "meta" {
+			t.Fatal("something moved although the log could not")
+		}
+	})
 	t.Run("a log directory already gone", func(t *testing.T) {
 		n, own := setup(t)
 		if err := os.RemoveAll(own); err != nil {

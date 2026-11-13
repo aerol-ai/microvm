@@ -228,3 +228,44 @@ func TestRecordFailure(t *testing.T) {
 		t.Fatalf("Recorded = %q, %v; want none", rec, err)
 	}
 }
+
+// Failures to read the Raft directory refuse the start; they are never taken
+// for "no record", which would open the default log in place of the real one.
+func TestRecordedFailures(t *testing.T) {
+	root := t.TempDir()
+	notDir := filepath.Join(root, "file")
+	touch(t, notDir)
+	if _, err := Recorded(notDir); err == nil {
+		t.Fatal("a data dir that is a file was taken for no record")
+	}
+	if _, err := Resolve(notDir, filepath.Join(root, "disk")); err == nil {
+		t.Fatal("Resolve went on past a data dir it could not read")
+	}
+	data := filepath.Join(root, "raft")
+	touch(t, filepath.Join(data, LocationFile))
+	if err := os.WriteFile(filepath.Join(data, LocationFile), []byte("relative\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(data, ""); err == nil {
+		t.Fatal("Resolve took a relative record")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root reads an unreadable record and writes a read-only directory")
+	}
+	if err := os.Chmod(filepath.Join(data, LocationFile), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(data, LocationFile), 0o600) })
+	if _, err := Recorded(data); err == nil {
+		t.Fatal("an unreadable record was taken for none")
+	}
+	// A data dir that does not exist yet, under one that cannot be written.
+	ro := filepath.Join(root, "ro")
+	if err := os.Mkdir(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+	if _, err := Resolve(filepath.Join(ro, "raft"), filepath.Join(root, "disk")); err == nil || !strings.Contains(err.Error(), "record") {
+		t.Fatalf("Resolve with a data dir it cannot make = %v", err)
+	}
+}
