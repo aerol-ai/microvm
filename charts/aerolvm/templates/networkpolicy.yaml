@@ -151,7 +151,11 @@ spec:
 ---
 # The gateways take every client's request: anyone may reach their client
 # ports (the API, SSH, and HTTPS and HTTP with the edge). The cluster ports
-# (gossip, the internal mTLS port) are this install's pods' only.
+# (gossip, the internal mTLS port) are this install's pods' only. With the
+# agent-sandbox API on, its port is open too: the kube-apiserver calls it
+# and has no pod address to name (as with the operator's webhook), and
+# every request there must carry the kube-apiserver's front-proxy
+# certificate.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -171,6 +175,9 @@ spec:
         - { protocol: TCP, port: 2220 }
         - { protocol: TCP, port: 443 }
         - { protocol: TCP, port: 80 }
+        {{- if .Values.cluster.agentSandboxAPI.enabled }}
+        - { protocol: TCP, port: 9443 }
+        {{- end }}
     - from:
         {{- include "aerolvm.installPeers" . | nindent 8 }}
 ---
