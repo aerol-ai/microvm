@@ -314,6 +314,9 @@ const (
 	joinWriteAdmit       = "admit"
 	joinWriteAdopt       = "adopt"
 	joinWriteRekey       = "rekey"
+	// joinWriteAdmitByCert admits a node by its certificate (external-CA
+	// mode, opAdmitNodeByCert): Admit without a token.
+	joinWriteAdmitByCert = "admit_by_cert"
 )
 
 // JoinWriteResponse is the outcome. Code carries a refusal's sentinel so it
@@ -428,6 +431,18 @@ func (c *Cluster) WriteJoin(ctx context.Context, req JoinWriteRequest) (JoinWrit
 			return JoinWriteResponse{}, err
 		}
 		cmd.Op, cmd.JoinAdmit = opAdmitNode, req.Admit
+	case joinWriteAdmitByCert:
+		if req.Admit == nil {
+			return JoinWriteResponse{}, fmt.Errorf("%w: admit without a node", ErrJoinBadRequest)
+		}
+		// A newer op than the join set: every server must apply it alike.
+		if err := c.raftServersSupport(externalCAFSMOpsVersion, "joins by certificate"); err != nil {
+			return JoinWriteResponse{}, err
+		}
+		if err := c.liveMemberHoldsID(req.Admit.NodeID, req.Admit.KeyHash); err != nil {
+			return JoinWriteResponse{}, err
+		}
+		cmd.Op, cmd.JoinAdmit = opAdmitNodeByCert, req.Admit
 	case joinWriteAdopt:
 		cmd.Op, cmd.JoinAdopt = opAdoptNodes, req.Adopt
 	case joinWriteRekey:

@@ -2093,6 +2093,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return result
+	case opAdmitNodeByCert:
+		result, err := f.applyAdmitNodeByCertLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
 	case opAdoptNodes:
 		result, err := f.applyAdoptNodesLocked(cmd)
 		if err != nil {
