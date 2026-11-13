@@ -486,6 +486,94 @@ except Exception:
   [ "$pass" = 1 ] && say "RESULT PASS: external-CA mode" || say "RESULT FAIL: external-CA mode"
 }
 
+# The docs' approver-policy example (charts/aerolvm/examples), live: with
+# cert-manager's own approval off, it approves AerolVM's node certificates
+# in its two namespaces (a worker's and a server's renewal) and nothing
+# else: a request for those names from another namespace waits unsigned,
+# and one in AerolVM's namespace that names something else is denied.
+proof_externalca_policy() {
+  local kk="kubectl --context kind-aerolvm-cluster"
+  local kc="$kk -n aerolvm-system" kw="$kk -n aerolvm-workers"
+  local pass=1 i v out
+  ok() { say "OK $*"; }
+  bad() { say "BAD $*"; pass=0; }
+  # Installed first, so the cert-manager change below never leaves a
+  # request with no approver at all.
+  for v in v0.29.0 0.29.0; do
+    out=$(helm --kube-context kind-aerolvm-cluster upgrade --install cert-manager-approver-policy \
+      oci://quay.io/jetstack/charts/cert-manager-approver-policy --version $v -n cert-manager --wait --timeout 5m 2>&1) && break
+  done
+  say "approver-policy $v: $(tail -1 <<<"$out" | head -c 200)"
+  $kk -n cert-manager patch deployment cert-manager --type=json \
+    -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--controllers=*,-certificaterequests-approver"}]' >/dev/null
+  $kk -n cert-manager rollout status deployment cert-manager --timeout=3m 2>&1 | tail -1 | sed 's/^/FCK cert-manager: /'
+  sed 's/name: bank-ca$/name: aerolvm-dev-bank-ca/' charts/aerolvm/examples/approver-policy-external-ca.yaml | $kk apply -f - 2>&1 | tr '\n' ' ' | sed 's/^/FCK policy: /'; echo
+  sleep 5
+  crstate() { # <namespace> <certificate>: its newest request's verdict
+    $kk -n "$1" get certificaterequests -o json 2>/dev/null | python3 -c '
+import json, sys
+items = [i for i in json.load(sys.stdin)["items"]
+         if i["metadata"].get("annotations", {}).get("cert-manager.io/certificate-name") == sys.argv[1]]
+items.sort(key=lambda i: i["metadata"]["creationTimestamp"])
+if not items:
+    print("none"); sys.exit()
+c = {x["type"]: x for x in items[-1].get("status", {}).get("conditions", [])}
+for t in ("Denied", "Approved"):
+    if c.get(t, {}).get("status") == "True":
+        print(t + ": " + c[t].get("message", "")[:160]); sys.exit()
+print("pending")' "$2"
+  }
+  renew() { # <namespace> <certificate>
+    $kk -n "$1" patch certificate "$2" --subresource=status --type=json \
+      -p '[{"op":"add","path":"/status/conditions/-","value":{"type":"Issuing","status":"True","reason":"ManuallyTriggered","message":"policy proof","lastTransitionTime":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}}]' >/dev/null
+  }
+  serial() { $kk -n "$1" get secret "$2" -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -serial; }
+  local w s1 ns c before st
+  w=$($kw get pods -l app.kubernetes.io/component=worker -o jsonpath='{.items[0].metadata.name}')
+  for c in "aerolvm-workers $w-cert" "aerolvm-system aerolvm-server-1-cert"; do
+    ns=${c% *}; c=${c#* }
+    before=$(serial $ns $c)
+    renew $ns $c
+    for i in $(seq 1 30); do
+      st=$(crstate $ns $c); [[ "$st" == Approved* || "$st" == Denied* ]] && [ "$(serial $ns $c)" != "$before" ] && break
+      sleep 4
+    done
+    [[ "$st" == Approved* ]] && [ "$(serial $ns $c)" != "$before" ] && ok "$c renewed under the policy: $st" || bad "$c: $st, serial $before -> $(serial $ns $c)"
+  done
+  $kk create namespace outside >/dev/null 2>&1
+  $kk -n outside apply -f - >/dev/null <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: pretend-worker }
+spec:
+  secretName: pretend-worker
+  commonName: pretend-worker
+  uris: ["node:pretend-worker", "aerolvm-role:worker"]
+  usages: [digital signature, server auth, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+YAML
+  $kw apply -f - >/dev/null <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: stray }
+spec:
+  secretName: stray
+  commonName: stray
+  uris: ["spiffe://elsewhere/stray"]
+  usages: [digital signature, client auth]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { kind: ClusterIssuer, name: aerolvm-dev-bank-ca }
+YAML
+  sleep 45
+  st=$(crstate outside pretend-worker)
+  [ "$st" = pending ] && [ -z "$($kk -n outside get secret pretend-worker -o name 2>/dev/null)" ] && ok "node names from another namespace: unsigned ($st)" || bad "another namespace: $st"
+  st=$(crstate aerolvm-workers stray)
+  [[ "$st" == Denied* ]] && ok "other names in AerolVM's namespace: $st" || bad "stray in aerolvm-workers: $st"
+  $kw delete certificate stray >/dev/null 2>&1; $kw delete secret stray >/dev/null 2>&1
+  [ "$pass" = 1 ] && say "RESULT PASS: the approver-policy example" || say "RESULT FAIL: the approver-policy example"
+}
+
 # dump_externalca: why the AerolCluster did not get Ready.
 dump_externalca() {
   local kk="kubectl --context kind-aerolvm-cluster"
@@ -578,7 +666,7 @@ say "built and installed in $(( $(date +%s) - t0 ))s"
 [ "$proof" = move ] && { proof_move firecracker; finish; }
 [ "$proof" = gmove ] && { proof_move gvisor; finish; }
 [ "$proof" = kubeapi ] && { proof_kubeapi; finish; }
-[ "$proof" = externalca ] && { proof_externalca; finish; }
+[ "$proof" = externalca ] && { proof_externalca; proof_externalca_policy; finish; }
 # A proof that stops part way (bash drops the rest of a command on an
 # expansion error) must not run on into the pod proof below.
 [ "$proof" = pod ] || { say "the $proof proof stopped part way"; finish; }
