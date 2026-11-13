@@ -363,7 +363,7 @@ proof_externalca() {
   create() { # prints the new sandbox's ID, or nothing
     local out id
     for i in $(seq 1 18); do
-      out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"runc","image":"alpine:3.20","cpu":1,"memory_mb":256}')
+      out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d '{"runtime":"gvisor","image":"alpine:3.20","cpu":1,"memory_mb":256}')
       id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
       [ -n "$id" ] && break
       sleep 10
