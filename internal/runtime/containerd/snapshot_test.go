@@ -93,7 +93,7 @@ func TestEnsureRunscConfigWritesHostUDS(t *testing.T) {
 	if !strings.Contains(string(body), `host-uds = "open"`) {
 		t.Fatalf("config=%q", body)
 	}
-	opt, err := d.runscRuntimeOpts()
+	opt, err := d.runscRuntimeOpts(false)
 	if err != nil {
 		t.Fatal(err)
 	}

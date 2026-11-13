@@ -222,6 +222,8 @@ type fakeContainer struct {
 	// when set, is handed to that attach as containerd would.
 	attaches    int
 	attachFIFOs *cio.FIFOSet
+	// runtime is the container's shim, as containerd records it.
+	runtime containers.RuntimeInfo
 }
 
 func (c *fakeContainer) ID() string { return c.id }
@@ -254,6 +256,7 @@ func (c *fakeContainer) Info(context.Context, ...cntr.InfoOpts) (containers.Cont
 		Labels:      labels,
 		SnapshotKey: snapKey,
 		Snapshotter: snapper,
+		Runtime:     c.runtime,
 	}, nil
 }
 func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error {

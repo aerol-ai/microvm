@@ -31,8 +31,15 @@ func containerdRuntimeName(ociRuntime string) string {
 // r.Options against its own proto registry, so a custom-registered Go type
 // fails task create with "type with url ...: not found" — caught live by the
 // first cluster-3-mixed-gvisor bench run; client-side-only tests can't see it.
-func (d *Driver) runscRuntimeOpts() (interface{}, error) {
-	path, err := d.ensureRunscConfig()
+//
+// A sandbox restored from a move's checkpoint gets the restore config,
+// which runs aerolvm-runsc as its runsc (gvisor_move.go).
+func (d *Driver) runscRuntimeOpts(restore bool) (interface{}, error) {
+	ensure := d.ensureRunscConfig
+	if restore {
+		ensure = d.ensureRunscRestoreConfig
+	}
+	path, err := ensure()
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +74,12 @@ func runscSandboxAnnotationOpt() oci.SpecOpts {
 }
 
 func (d *Driver) runtimeContainerOpt(ociRuntime string) (cntr.NewContainerOpts, error) {
+	return d.runtimeContainerOptFor(ociRuntime, false)
+}
+
+// runtimeContainerOptFor is runtimeContainerOpt for a create that restores
+// a gVisor sandbox from a move's checkpoint when restore is set.
+func (d *Driver) runtimeContainerOptFor(ociRuntime string, restore bool) (cntr.NewContainerOpts, error) {
 	name := containerdRuntimeName(ociRuntime)
 	if ociRuntime != "runsc" {
 		if name == "" {
@@ -74,7 +87,7 @@ func (d *Driver) runtimeContainerOpt(ociRuntime string) (cntr.NewContainerOpts, 
 		}
 		return cntr.WithRuntime(name, nil), nil
 	}
-	opts, err := d.runscRuntimeOpts()
+	opts, err := d.runscRuntimeOpts(restore)
 	if err != nil {
 		return nil, err
 	}
