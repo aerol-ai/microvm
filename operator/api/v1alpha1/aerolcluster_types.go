@@ -125,9 +125,12 @@ type StorageSpec struct {
 
 // GatewaySpec is the stateless gateway tier.
 type GatewaySpec struct {
-	// MinReplicas is at least one per zone.
+	// MinReplicas is how many gateways the cluster keeps, at least one per
+	// zone. Lowering it retires the surplus.
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas int32 `json:"minReplicas"`
+	// MaxReplicas caps the gateways. The operator refuses a cap below
+	// minReplicas or below one per zone. Zero: no cap.
 	// +optional
 	MaxReplicas int32 `json:"maxReplicas,omitempty"`
 	// Service is the gateways' own load balancer. Ignored with GatewayRef.

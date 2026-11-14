@@ -153,10 +153,15 @@ spec:
                     - name
                     type: object
                   maxReplicas:
+                    description: |-
+                      MaxReplicas caps the gateways. The operator refuses a cap below
+                      minReplicas or below one per zone. Zero: no cap.
                     format: int32
                     type: integer
                   minReplicas:
-                    description: MinReplicas is at least one per zone.
+                    description: |-
+                      MinReplicas is how many gateways the cluster keeps, at least one per
+                      zone. Lowering it retires the surplus.
                     format: int32
                     minimum: 1
                     type: integer

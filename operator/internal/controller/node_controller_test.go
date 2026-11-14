@@ -1102,3 +1102,39 @@ func TestDecommissionWaitsItsTurn(t *testing.T) {
 		t.Fatalf("reason %q", got.Status.Reason)
 	}
 }
+
+// A gateway marked for retirement (a scale-down) loses its pod, waits for
+// gossip to see it gone, leaves the cluster and is removed (review R7).
+func TestRetireGateway(t *testing.T) {
+	n := node("prod-gateway-retire", v1.RoleGateway, "", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	g.reconcile(n.Name)
+	g.running(g.pod(testNS, n.Name), "m1", true)
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true}
+	g.reconcile(n.Name)
+	got := g.node(n.Name)
+	got.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	if g.pod(testNS, n.Name) != nil {
+		t.Fatal("a retired gateway kept its pod")
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateDecommissioning {
+		t.Fatalf("state %s", got.Status.State)
+	}
+	g.reconcile(n.Name) // gossip still sees it
+	if len(g.api.deleted) != 0 {
+		t.Fatal("a gateway gossip still sees left the cluster")
+	}
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: false}
+	g.reconcile(n.Name)
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved || len(g.api.deleted) != 1 {
+		t.Fatalf("state %s, deleted %v", got.Status.State, g.api.deleted)
+	}
+	g.reconcile(n.Name)
+	if g.node(n.Name) != nil {
+		t.Fatal("the retired gateway's AerolNode was kept")
+	}
+}

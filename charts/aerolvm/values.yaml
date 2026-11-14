@@ -315,7 +315,11 @@ cluster:
     nodeSelector: {}
     tolerations: []
   gateways:
+    # Gateways to keep, at least one per zone. Lowering it retires the
+    # extra ones.
     minReplicas: 3
+    # A cap: the operator refuses one below minReplicas or below one per
+    # zone, and adds no gateways past minReplicas by itself.
     maxReplicas: 30
     resources:
       requests: { cpu: 500m, memory: 512Mi }

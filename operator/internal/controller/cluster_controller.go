@@ -168,6 +168,9 @@ func refuseSpec(c *v1.AerolCluster) string {
 	if c.Spec.Servers.Count != 3 && c.Spec.Servers.Count != 5 {
 		return "servers.count must be 3 or 5"
 	}
+	if g := c.Spec.Gateways; g.MaxReplicas > 0 && int(g.MaxReplicas) < wantedGateways(c) {
+		return fmt.Sprintf("gateways.maxReplicas (%d) is below the %d gateways the cluster keeps: minReplicas, and at least one per zone", g.MaxReplicas, wantedGateways(c))
+	}
 	seen := map[string]bool{}
 	for _, p := range c.Spec.WorkerPools {
 		if seen[p.Name] {
@@ -487,20 +490,29 @@ func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, 
 	return nil
 }
 
-// ensureGateways keeps minReplicas gateways, spread across the zones. A
+// wantedGateways is how many gateways the cluster keeps: minReplicas, and
+// at least one per zone. maxReplicas caps it (refuseSpec refuses a cap
+// below it); nothing scales gateways past it.
+func wantedGateways(c *v1.AerolCluster) int {
+	return int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
+}
+
+// ensureGateways keeps wantedGateways gateways, spread across the zones. A
 // gateway that ended is replaced by a new one (a new node: gateways hold
-// no state).
+// no state). A surplus, left when minReplicas went down, is retired
+// (review R7): the node controller deletes each one's pod and takes it out
+// of the cluster (retireGateway).
 func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) error {
 	perZone := map[string]int{}
-	live := 0
+	var live []v1.AerolNode
 	for _, n := range nodes {
-		if n.Spec.Role == v1.RoleGateway && !ended(n) {
+		if n.Spec.Role == v1.RoleGateway && !ended(n) && n.Annotations[v1.AnnotationDecommission] != "true" {
 			perZone[n.Spec.Zone]++
-			live++
+			live = append(live, n)
 		}
 	}
-	want := int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
-	for live < want {
+	want := wantedGateways(c)
+	for have := len(live); have < want; have++ {
 		zone := leastZone(c.Spec.Zones, perZone)
 		suffix, err := randomToken(5)
 		if err != nil {
@@ -510,9 +522,52 @@ func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolClust
 			return err
 		}
 		perZone[zone]++
-		live++
+	}
+	why := fmt.Sprintf("scale-down: the cluster keeps %d gateways", want)
+	for len(live) > want {
+		i := surplusGateway(c.Spec.Zones, perZone, live)
+		if err := r.markDecommission(ctx, c, live[i].Name, why); err != nil {
+			return err
+		}
+		perZone[live[i].Spec.Zone]--
+		live = append(live[:i], live[i+1:]...)
 	}
 	return nil
+}
+
+// surplusGateway picks the gateway to retire first: one in a zone no
+// longer in the spec, then one not serving, then one from the zone with the
+// most gateways, so every zone keeps its own. Ties go to the last name.
+func surplusGateway(zones []string, perZone map[string]int, live []v1.AerolNode) int {
+	inSpec := map[string]bool{}
+	for _, z := range zones {
+		inSpec[z] = true
+	}
+	rank := func(n v1.AerolNode) (bool, bool, int) {
+		return !inSpec[n.Spec.Zone], n.Status.State != v1.StateServing, perZone[n.Spec.Zone]
+	}
+	best := 0
+	for i := 1; i < len(live); i++ {
+		ao, an, ac := rank(live[i])
+		bo, bn, bc := rank(live[best])
+		switch {
+		case ao != bo:
+			if ao {
+				best = i
+			}
+		case an != bn:
+			if an {
+				best = i
+			}
+		case ac != bc:
+			if ac > bc {
+				best = i
+			}
+		case live[i].Name > live[best].Name:
+			best = i
+		}
+	}
+	return best
 }
 
 // ended reports a node whose pod is gone for good: removed, dead, or a

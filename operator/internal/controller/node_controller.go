@@ -155,6 +155,9 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if n.Spec.Role == v1.RoleGateway && n.Annotations[v1.AnnotationDecommission] == "true" {
+		return r.retireGateway(ctx, &n, pod, api)
+	}
 	if pod != nil && podEnded(pod) {
 		return r.retireEndedPod(ctx, &n, pod)
 	}
@@ -734,6 +737,37 @@ func (r *NodeReconciler) retireEndedPod(ctx context.Context, n *v1.AerolNode, po
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// retireGateway removes a gateway the cluster no longer keeps (review R7).
+// A gateway holds no sandboxes, so nothing moves: its pod goes first, which
+// takes it out of the gateways' Service and gives its open connections the
+// pod's termination grace to finish; then, once gossip sees it gone, it
+// leaves the cluster and the AerolNode is removed.
+func (r *NodeReconciler) retireGateway(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
+	if pod != nil {
+		r.setState(n, v1.StateDecommissioning, "scale-down: its pod is going")
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	node, err := api.GetNode(ctx, n.Name)
+	switch {
+	case aerolapi.IsStatus(err, http.StatusNotFound):
+	case err != nil:
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	case node.Alive:
+		r.setState(n, v1.StateDecommissioning, "scale-down: waiting for the cluster to see it gone")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if err := api.DeleteNode(ctx, n.Name, false); err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	r.setState(n, v1.StateRemoved, "scale-down")
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // endPod deletes a pod the operator gave up on; the node is then lost.
