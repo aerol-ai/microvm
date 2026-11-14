@@ -119,7 +119,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := checkHostProcessesOutliveAgent(cfg); err != nil {
 		return err
 	}
-	warnMountHelpersEndWithAgent(cfg, logger)
+	mountsOff := mountsOffReason(cfg)
+	if mountsOff != "" {
+		logger.Info("external storage is refused on this node: a create with mounts answers 501 mounts_unavailable", "reason", mountsOff)
+	}
 
 	// Derive a cancellable child so a fatal failure in a background server
 	// goroutine (HTTP/ingress ListenAndServe) can trigger graceful shutdown by
@@ -249,13 +252,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Mount helpers start where the sandboxes sandboxd runs itself do (in a
 	// worker pod, the runtime container's group, so an agent restart leaves
 	// them serving); in a split pod each mount is checked visible to the
-	// runtime before a create answers (F13).
+	// runtime before a create answers, and a pod set up without external
+	// storage refuses it (F13).
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:        cfg.MountsRootPath,
 		CredDir:        cfg.MountsCredentialsRuntimeDir,
 		WaitTimeout:    cfg.MountWaitTimeout,
 		CgroupRoot:     cfg.HostProcessCgroupRoot(),
 		RuntimePIDFile: cfg.MountsRuntimePIDFile,
+		Unavailable:    mountsOff,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize mount manager: %w", err)

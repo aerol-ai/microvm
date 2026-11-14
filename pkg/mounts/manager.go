@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +43,12 @@ type Config struct {
 	// (checkVisible, F13). Empty on a VM, where sandboxd and the runtime
 	// share one mount namespace.
 	RuntimePIDFile string
+	// Unavailable, when set, says why this node cannot serve external
+	// storage (a Kubernetes worker pod with it off, see
+	// pkg/daemon.mountsOffReason). Every mount set is then refused with
+	// ErrMountsUnavailable before anything starts: served anyway, the
+	// sandbox would write to local disk instead of the store.
+	Unavailable string
 }
 
 // Manager owns mount processes for every active sandbox.
@@ -66,6 +73,8 @@ type Manager struct {
 
 	// runtimePIDFile is Config.RuntimePIDFile (visible.go).
 	runtimePIDFile string
+	// unavailable is Config.Unavailable (Available).
+	unavailable string
 }
 
 type mountState struct {
@@ -131,7 +140,22 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		cgroup:      newHelperCgroup(logger, cgroupRoot),
 
 		runtimePIDFile: cfg.RuntimePIDFile,
+		unavailable:    cfg.Unavailable,
 	}, nil
+}
+
+// ErrMountsUnavailable is a mount this node refuses to serve because its
+// setup could not keep the mount where the sandbox is built
+// (Config.Unavailable). The node's configuration, not the request.
+var ErrMountsUnavailable = errors.New("external storage is not available on this node")
+
+// Available reports whether this node serves external storage, and if not,
+// why. The service asks before a create does any work; mountSet asks again.
+func (m *Manager) Available() error {
+	if m.unavailable == "" {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrMountsUnavailable, m.unavailable)
 }
 
 // Close stops the supervisor. Existing mounts are left in place so an
@@ -165,6 +189,9 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []models.MountSpec, adopt bool) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
+	}
+	if err := m.Available(); err != nil {
+		return nil, err
 	}
 	// sandboxID is a path component for every host dir and bind below. Validate
 	// it here as well as at the create entry: the mount manager must be
@@ -246,7 +273,11 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		for _, s := range established {
 			_ = m.tearDownState(s)
 		}
-		_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
+		// The id was validated at entry; the prefix check keeps this
+		// RemoveAll inside rootDir on its own.
+		if dir := filepath.Clean(filepath.Join(m.rootDir, sandboxID)); strings.HasPrefix(dir, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
+			_ = os.RemoveAll(dir)
+		}
 		return nil, failed
 	}
 

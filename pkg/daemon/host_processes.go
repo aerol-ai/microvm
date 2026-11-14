@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"fmt"
-	"log/slog"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
@@ -40,18 +39,39 @@ func checkHostProcessesOutliveAgent(cfg config.Config) error {
 	return nil
 }
 
-// warnMountHelpersEndWithAgent says so when external-storage mount helpers
-// cannot outlive this container (F13). They start in the same group as the
-// sandboxes above, and die with an agent PID namespace the same way; then a
-// running sandbox's storage stops answering at the next agent restart. A
-// warning, not a refusal: the chart shares the pod's namespace, and a pod
-// that does not still mounts storage until the agent restarts.
-func warnMountHelpersEndWithAgent(cfg config.Config, logger *slog.Logger) {
+// mountsOffReason says why this node must refuse external storage, or ""
+// when it may serve it (F13). Only in a Kubernetes worker pod (a cgroup
+// parent set, as above): there sandboxd's mount helpers serve sandboxes the
+// runtime container builds, and a mount is safe to hand out only when
+//
+//   - the chart turned external storage on (worker.externalStorage.enabled),
+//     which gives the two containers a mounts folder with two-way
+//     propagation and gives sandboxd the runtime's pid to check each mount
+//     through (SB_MOUNTS_RUNTIME_PID_FILE); and
+//   - the pod shares one process namespace. Without it that pid names a
+//     process in sandboxd's own container, so the check sees only itself,
+//     and each helper ends with this container's namespace at the next
+//     agent restart.
+//
+// The chart keeps external storage off by default: sharing the namespace
+// lets every container in the pod, the internet-facing edge among them,
+// read the command line of every process in it. A refusal is the safe
+// answer: the sandbox would otherwise get the empty folder under its mount
+// and write to local disk instead of the store.
+func mountsOffReason(cfg config.Config) string {
 	if cfg.HostProcessCgroupParent == "" {
-		return
+		return ""
 	}
-	if owns, err := ownsPIDNamespace(); err == nil && owns {
-		logger.Warn("external-storage mounts stop when this container restarts: the worker pod does not share one process namespace " +
-			"(shareProcessNamespace: true), so their helpers end with it")
+	if cfg.MountsRuntimePIDFile == "" {
+		return "external storage is off on this Kubernetes worker (chart value worker.externalStorage.enabled)"
 	}
+	owns, err := ownsPIDNamespace()
+	if err != nil {
+		return fmt.Sprintf("cannot tell whether this Kubernetes worker pod shares one process namespace: %v", err)
+	}
+	if owns {
+		return "this Kubernetes worker pod does not share one process namespace (shareProcessNamespace: true), " +
+			"so a mount helper would end with the agent container and a mount could not be checked from the runtime container"
+	}
+	return ""
 }

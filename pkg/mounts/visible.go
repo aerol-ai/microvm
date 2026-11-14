@@ -57,5 +57,23 @@ func (m *Manager) checkVisible(hostPath string) error {
 		return fmt.Errorf("%w: the runtime (pid %d) sees the folder under %s, not the mount; "+
 			"the mounts folder needs two-way mount propagation in both containers", ErrMountNotVisible, pid, hostPath)
 	}
+	// The same file proves nothing when the pid is a process in this
+	// container's own mount namespace. That is what a pod without one
+	// shared process namespace gives: the runtime wrote its pid as its
+	// namespace numbers it (1), and pid 1 here is this container's own
+	// first process. The daemon refuses mounts in such a pod
+	// (mountsOffReason); this keeps the check honest on its own.
+	selfNS, err := os.Stat(filepath.Join(procRoot, "self", "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("%w: cannot read this container's mount namespace: %v", ErrMountNotVisible, err)
+	}
+	theirNS, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid), "ns", "mnt"))
+	if err != nil {
+		return fmt.Errorf("%w: cannot read the runtime's (pid %d) mount namespace: %v", ErrMountNotVisible, pid, err)
+	}
+	if os.SameFile(selfNS, theirNS) {
+		return fmt.Errorf("%w: pid %d from %s is in sandboxd's own mount namespace, so the check would see only itself; "+
+			"the worker pod must share one process namespace", ErrMountNotVisible, pid, m.runtimePIDFile)
+	}
 	return nil
 }

@@ -3,12 +3,15 @@
 # userdata.sh sources it for AEROL_FCKIND_PROOF=mount, after
 # scripts/k8s-dev.sh brought up single mode (one worker pod, aerolvm-0).
 #
-# proof_mount (finding F13, eng review OV-E2): a gVisor sandbox gets an
-# rclone mount of a folder in the agent container (rclone's local backend,
-# standing in for a remote store, as OV-E2 did). What it writes must reach
-# the store, keep reaching it across an agent restart (the helper runs in
-# the runtime container's group and the next agent adopts it), and the
-# pod's end must leave no mount on the machine.
+# proof_mount (finding F13, eng review OV-E2): external storage is off by
+# default, so a create with a mount is refused (501 mounts_unavailable) and
+# the pod keeps its process namespace unshared. Turned on
+# (worker.externalStorage.enabled), a gVisor sandbox gets an rclone mount
+# of a folder in the agent container (rclone's local backend, standing in
+# for a remote store, as OV-E2 did). What it writes must reach the store,
+# keep reaching it across an agent restart (the helper runs in the runtime
+# container's group and the next agent adopts it), and the pod's end must
+# leave no mount on the machine.
 proof_mount() {
   local k="kubectl --context kind-aerolvm -n aerolvm" pod=aerolvm-0 port=21294 pf="" tok id out body
   tok=$($k get secret -o json | python3 -c 'import json,sys,base64
@@ -26,6 +29,32 @@ for s in json.load(sys.stdin)["items"]:
   }
   fwdm || { say "RESULT FAIL: mount: the API never answered"; return; }
   api() { curl -sS -m 300 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
+  body=$(python3 -c 'import json; print(json.dumps({"runtime": "gvisor", "image": "alpine:3.20", "mounts": [{"type": "rclone", "source": "store:/var/lib/sandboxd/ext-store", "target": "/mnt/ext", "credentials": {"rclone_conf": "[store]\ntype = local\n"}}]}))')
+  # Off by default: the namespace stays unshared, so the edge container
+  # cannot read the pod's command lines, and a mount is refused rather
+  # than served from the worker's own disk.
+  local share0
+  share0=$($k get pod $pod -o jsonpath='{.spec.shareProcessNamespace}')
+  out=$(api -w '\nHTTP %{http_code}' -X POST http://127.0.0.1:$port/v1/sandboxes -d "$body")
+  say "external storage off (shareProcessNamespace=${share0:-unset}): mount create: $(tr '\n' ' ' <<<"$out" | head -c 400)"
+  if [ "$share0" != true ] && grep -q '"mounts_unavailable"' <<<"$out" && grep -q 'HTTP 501' <<<"$out"; then
+    say "RESULT PASS: mount: off by default, the pod's namespace is unshared and a create with a mount is refused (501 mounts_unavailable)"
+  else
+    say "RESULT FAIL: mount: off by default, shareProcessNamespace=${share0:-unset}, create answered: $(tr '\n' ' ' <<<"$out" | head -c 200)"
+  fi
+  helm --kube-context kind-aerolvm upgrade aerolvm charts/aerolvm -n aerolvm --reuse-values \
+    --set worker.externalStorage.enabled=true >/dev/null
+  $k delete pod $pod --wait=true --timeout=180s >/dev/null 2>&1
+  local share1="" ready1=""
+  for _ in $(seq 1 150); do
+    share1=$($k get pod $pod -o jsonpath='{.spec.shareProcessNamespace}' 2>/dev/null)
+    ready1=$($k get pod $pod -o jsonpath='{.status.containerStatuses[?(@.name=="agent")].ready}' 2>/dev/null)
+    [ "$share1" = true ] && [ "$ready1" = true ] && break
+    sleep 2
+  done
+  say "external storage on: shareProcessNamespace=${share1:-unset}, agent ready ${ready1:-?}"
+  pf=""
+  fwdm || { say "RESULT FAIL: mount: the API never answered with external storage on"; return; }
   ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute \
     -d "$(python3 -c 'import json, sys; print(json.dumps({"command": sys.argv[1]}))' "$1")" | head -c 400; }
   # The writer makes one file a second: rclone uploads a file 5 s after its
@@ -35,7 +64,6 @@ for s in json.load(sys.stdin)["items"]:
   helper() { $k exec $pod -c agent -- sh -c 'for p in $(pgrep -f "^rclone mount"); do echo "pid $p cgroup $(sed -n "s/^0:://p" /proc/$p/cgroup)"; done' 2>&1 | tr '\n' ' '; }
   say "mount tools in the agent image: $($k exec $pod -c agent -- sh -c 'for t in rclone sshfs mount-s3 fusermount3 mount.nfs; do command -v $t >/dev/null && printf "%s " $t || printf "MISSING-%s " $t; done' 2>&1)"
   $k exec $pod -c agent -- sh -c 'mkdir -p /var/lib/sandboxd/ext-store && echo seed-ok > /var/lib/sandboxd/ext-store/seed.txt'
-  body=$(python3 -c 'import json; print(json.dumps({"runtime": "gvisor", "image": "alpine:3.20", "mounts": [{"type": "rclone", "source": "store:/var/lib/sandboxd/ext-store", "target": "/mnt/ext", "credentials": {"rclone_conf": "[store]\ntype = local\n"}}]}))')
   out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d "$body")
   id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
   say "mount create: $(head -c 300 <<<"$out")"

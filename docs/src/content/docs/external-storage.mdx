@@ -178,7 +178,8 @@ stateDiagram-v2
 - **Credentials never enter the sandbox.** Only the server's mount program sees them, and they are stored encrypted (AES-256-GCM).
 - **Reading the mounts back shows no secrets.** `client.mounts(id)` (Go: `client.Mounts(ctx, id)`) returns `hasCredentials: true`, never the values. Rust calls the field `has_credentials`.
 - **`source` and `options` are not secret.** Reading the mounts back shows them. In a cluster they are copied as plain text to other servers, so another one can mount the storage if this one fails.
-- **So every secret belongs in `credentials`.** The server refuses a create that puts a secret-like name in `options` or `source`. Examples are an `extra_args` flag like `--s3-secret-access-key`, or an rclone source like `:s3,secret_access_key=...:bucket`. The error names the field to use instead.
+- **A mount program's arguments are not secret either.** Other programs on the server can read them while the mount runs.
+- **So every secret belongs in `credentials`.** The server refuses a create that puts a secret-like name in `options` or `source`. Examples are an `extra_args` flag like `--s3-secret-access-key` or `--key`, a word like `AWS_SECRET_ACCESS_KEY=...`, or an rclone source like `:s3,secret_access_key=...:bucket`. It also refuses an AWS access key id, and a link with a user name or password in it (`https://user:pass@host`). The error names the field to use instead, never the secret.
 
 <Aside type="caution" title="Anyone with an API token is trusted with the server">
 The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server itself, outside every sandbox, as the server's own user. They receive your `source` and `options` as given. The server refuses a `source` that a mount program could mistake for one of its own options. Still, give API tokens only to people you would trust to run the server.
@@ -193,8 +194,8 @@ The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server it
 - **Which sandboxes support mounts:** Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes refuse them.
 - **An SSH server's host key is trusted on first use.** The server accepts the storage server's key the first time it connects.
 - **The server needs the mount program installed.** The [server installer](/getting-started/installer-options/) adds them, and so does the [Kubernetes](/kubernetes/) worker image. A server without the program for a mount, such as a [local install](/getting-started/local-setup/), refuses the sandbox with `501` and the code `mount_tool_unavailable`. The error names the missing program. Retrying does not help: the operator installs the program, or you create the sandbox without the mount.
+- **On Kubernetes, the operator turns external storage on.** It is off by default: a create with a mount gets `501` and the code `mounts_unavailable`, and the sandbox is not made. The operator turns it on with the chart value [`worker.externalStorage.enabled`](/kubernetes/values/). Retrying does not help.
 - **On Kubernetes, the mount is checked before the sandbox starts.** A worker pod mounts the storage in one container and builds the sandbox in another, so before it answers, the worker checks the sandbox will really see the mount. If it would not, the create fails and the mount is removed: the sandbox never writes to its own disk while you think it writes to your storage. The mount programs keep running when the worker's agent restarts, so a running sandbox keeps its storage.
-
 ## Next steps
 
 - [Platform volumes](/platform-volumes/): named storage your operator sets up, so you pass only a name.

@@ -15,7 +15,8 @@
 # port refuses a second key, a certificate with no role and another CA.
 # review: the Kubernetes review fixes (R1-R17, S5) on cluster mode, one
 # check per fix with live behaviour (fckind/review.sh); m8i.4xlarge.
-# mount: single mode; an rclone mount reaches a gVisor sandbox, keeps
+# mount: single mode; with external storage off (the default) a mount is
+# refused, and turned on, an rclone mount reaches a gVisor sandbox, keeps
 # serving across an agent restart, and the pod's end leaves no mount
 # (finding F13, fckind/mount.sh).
 #
