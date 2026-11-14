@@ -341,8 +341,10 @@ func (s *Service) syncWarmPools(ctx context.Context) error {
 
 // configuredFor is what a pool of runtime parks: every operator entry, in
 // this runtime, plus the agent-sandbox API's depths for this runtime
-// (cluster.KubeWarmDepth, C17). Both are per worker, so where they name the
-// same image their depths add up.
+// (cluster.KubeWarmDepth, C17) and for templates that name no runtime
+// (cluster.KubeWarmDefaultRuntime: a pool is registered under the node's
+// default runtime, which is what such a create gets). All are per worker,
+// so where they name the same image their depths add up.
 func configuredFor(runtime string, entries []models.WarmPool, kube []cluster.KubeWarmDepth) []dockerpool.Configured {
 	configured := make([]dockerpool.Configured, 0, len(entries)+len(kube))
 	at := make(map[string]int, len(entries))
@@ -355,7 +357,7 @@ func configuredFor(runtime string, entries []models.WarmPool, kube []cluster.Kub
 		})
 	}
 	for _, k := range kube {
-		if k.Runtime != runtime {
+		if k.Runtime != runtime && k.Runtime != cluster.KubeWarmDefaultRuntime {
 			continue
 		}
 		if i, ok := at[k.Image]; ok {

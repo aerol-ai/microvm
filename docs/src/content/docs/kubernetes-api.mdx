@@ -185,7 +185,11 @@ A claim asks for a sandbox from a warm pool. The pool names a template, and the 
 <Aside>
 A warm pool keeps sandboxes started ahead of time, so a claim takes one that is ready instead of starting a new one. Two things differ from upstream agent-sandbox:
 
-- **`replicas` is per worker.** Each worker that runs the template's runtime keeps that many ready, as AerolVM's own [warm pools](/warm-pools/) do. Upstream counts the whole cluster. Start with `replicas: 1`.
+- **`replicas` is per worker, in each worker's default runtime.** Each worker keeps that many ready, as AerolVM's own [warm pools](/warm-pools/) do, in the runtime a sandbox gets when it names none: the chart's `worker.defaultRuntime`, which is runc unless you set it. Upstream counts the whole cluster. Start with `replicas: 1`.
+  - A template with no `runtimeClassName`, like agent-sandbox's own examples, is kept ready on every worker.
+  - A template that names the workers' default runtime is kept ready too.
+  - A template for another runtime still works, but each claim on it starts a new sandbox. For example, a gVisor template on workers whose default is runc. Set `worker.defaultRuntime: gvisor` to keep gVisor templates ready instead.
+  - Firecracker templates are never kept ready.
 - **Only templates that run the image's own entrypoint are kept ready.** A ready sandbox has already started its image, so it cannot run another command. A template that sets `command` or `args` still works, but each claim on it starts a new sandbox. A claim's `env` is fine: it is handed to the ready sandbox when the claim takes it.
 
 A new or changed pool takes effect within about half a minute.
@@ -259,7 +263,7 @@ Of the 133 objects in agent-sandbox v1.0.11's own examples, 52 work as written, 
 | Template | `envVarsInjectionPolicy` | `Disallowed` (the default), `Allowed` or `Overrides`. |
 | Template | `networkPolicyManagement` | `Managed` (the default) or `Unmanaged`. AerolVM's own walls already give the secure default: the public internet out, no private ranges, only AerolVM's gateways in. Custom `networkPolicy` rules are refused; use AerolVM's [network rules](/network-access/). |
 | Template | `volumeClaimTemplatesPolicy` | Unset or `Disallowed`. |
-| Warm pool | `replicas`, `sandboxTemplateRef.name`, `updateStrategy.type` | `replicas` from 0 to 128; `updateStrategy` `Recreate` or `OnReplenish`. |
+| Warm pool | `replicas`, `sandboxTemplateRef.name`, `updateStrategy.type` | `replicas` from 0 to 128. `updateStrategy` may be `Recreate` or `OnReplenish`, so a manifest that sets it is accepted, but AerolVM does not act on it. |
 | Claim | `warmPoolRef.name`, `env`, `lifecycle.shutdownTime`, `lifecycle.shutdownPolicy`, `additionalPodMetadata` | Yes. `additionalPodMetadata.labels` become tags. `DeleteForeground` works as `Delete`. |
 | Claim | `volumeClaimTemplates`, `lifecycle.ttlSecondsAfterFinished` | No. |
 | Any | Service accounts, IRSA, volumes, GPUs, node placement, security contexts, init or sidecar containers | No. For cloud access, use AerolVM's own [cloud identity](/sandbox-cloud-identity/). |
