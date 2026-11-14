@@ -1,0 +1,152 @@
+---
+title: Security
+description: What each AerolVM pod may do on Kubernetes, how pods join the cluster, how to keep the CA key outside it, and one command that checks a live install.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page is for the person who signs off the install. It sums up what each pod may do and why, and ends with one command that checks a live install against all of it.
+
+The full record is the chart's **evidence pack**, [`EVIDENCE.md`](https://github.com/aerol-ai/microvm/blob/main/charts/aerolvm/EVIDENCE.md): every pod's rights, the network walls, the data flows and the threat model. Hand it to your security team.
+
+## What each pod may do
+
+| Pod | Runs as | Rights | Kubernetes API |
+|---|---|---|---|
+| Server | uid 65532 | No capabilities, read-only root, `RuntimeDefault` seccomp | None |
+| Gateway | uid 65532 | Same as a server. The `edge` container (with HTTPS on) also has no capabilities. | None, unless the [kubectl API](/kubernetes/kubectl/) is on |
+| Operator | uid 65532 | Same as a server | Only what it needs ([below](#the-operators-rights)) |
+| Worker: `preflight`, `setup`, `edge` | uid 65532 (`setup` as root with every capability dropped) | None | None |
+| Worker: `egress` | Drops to uid 65532 | `NET_ADMIN` and `NET_BIND_SERVICE` | None |
+| Worker: **`runtime`, `agent`** | root | **privileged** | None |
+
+Servers, gateways and the operator run under the `restricted` Pod Security level. The worker pod's `runtime` and `agent` containers are the one exception.
+
+### Why the worker is privileged
+
+For every sandbox, the worker:
+
+- runs containerd and mounts the sandbox's filesystem (`CAP_SYS_ADMIN`);
+- makes a network namespace, its link and its firewall rules (`CAP_NET_ADMIN`);
+- writes the sandbox's CPU and memory limits into the pod's cgroup (a writable `/sys/fs/cgroup`);
+- shares network namespaces between `agent` and `runtime` (two-way mount propagation, which Kubernetes allows only in privileged containers).
+
+To contain it:
+
+- In cluster mode, workers run in their own namespace, the only one labelled `privileged`. The chart makes it. In single mode, give the pod a namespace of its own.
+- In cluster mode, worker machines run nothing else: the worker pool's taint keeps other pods off. In single mode, keep other workloads off its node if you can.
+- The worker pod mounts no folder from the node and does not share its network or PID namespace.
+- No worker container holds a Kubernetes API credential.
+- The node's cloud identity is out of reach: the IMDS hop limit is 1 ([below](#the-metadata-service)).
+
+If you run Kyverno or Gatekeeper pod-security policies, exempt the worker pods (labelled `app.kubernetes.io/name=aerolvm` and `app.kubernetes.io/component=worker`, in the worker namespace), and only these containers:
+
+| Container | Exempt from |
+|---|---|
+| `runtime`, `agent` | `privileged` |
+| `egress` | Running as root and the added capabilities `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`. It starts as root only to drop to uid 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`. |
+| `setup` (init, cluster mode) | Running as root. It has every capability dropped and a read-only root. |
+
+### The operator's rights
+
+The chart's `templates/operator.yaml` names every one:
+
+- **In its own namespace and the worker namespace:** pods, Secrets, Services, ConfigMaps, PVCs, Events, leases, and its own `AerolCluster` and `AerolNode` objects.
+- **Cluster-wide, read only:** Nodes, ServiceCIDRs, Karpenter NodeClaims (and delete one, to hand back a machine it emptied).
+- **Cluster-wide:** create TokenReviews, to check which pod is asking to join.
+- **In `default`:** read the `kubernetes` Service and its EndpointSlice, to keep sandboxes away from the API server.
+- **In external-CA mode only:** create and delete cert-manager `Certificate` objects in its two namespaces, one per node.
+- **Not:** `pods/exec`, any other namespace, or any RBAC object.
+
+During a cluster-mode `helm upgrade`, a short Job also runs with rights to get and update the two AerolVM CRDs, by name, and nothing else. Helm deletes it, with its role, when it succeeds. If it fails, its pod stays: delete it once fixed, or `aerolvm k8s verify` counts it as a pod holding an API credential.
+
+## How a pod joins the cluster
+
+A new server, gateway or worker needs a one-time join token. The operator hands one out only to a pod that proves who it is:
+
+1. The pod's `setup` container gets a projected ServiceAccount token with the operator as its audience, valid for 10 minutes. It names the pod and its node. The Kubernetes API refuses it, so it opens nothing there.
+2. The pod sends that token to the operator.
+3. The operator checks it with a TokenReview: the pod exists with that UID, belongs to an AerolVM node, runs on the node the token names, and has not joined yet.
+4. Only then does the operator ask the servers for a join token. It works once, lasts 10 minutes, and is never stored in a Secret.
+
+When the operator refuses a pod, its `AerolNode` gets the condition `IdentityDenied`, with the reason. This needs Kubernetes 1.30 or later, which puts the node's name in the token.
+
+Once joined, nodes talk to each other over mutual TLS, each with its own certificate. Workers never hold the admin token, only its fingerprint.
+
+## Keep the CA key outside the cluster
+
+By default, the servers hold the cluster's certificate authority key and sign each node's certificate. If the CA key must stay outside the cluster, turn on **external-CA mode**: your own issuer signs every node's certificate through cert-manager, and no join tokens are used.
+
+Set it **before you install**. The cluster records the mode when its first server starts, and refuses to turn it on or off later.
+
+```yaml title="aerolvm-cluster.yaml"
+cluster:
+  externalCA:
+    issuerRef: { kind: ClusterIssuer, name: bank-ca }
+```
+
+Your issuer must put its CA certificate in the Secret it writes, as `ca.crt`. cert-manager's CA issuer and Vault issuer both do. Every node trusts that CA and no other.
+
+What changes:
+
+- **One cert-manager `Certificate` per node**, named `<node>-cert`, in the node's namespace. It names the node (`node:<id>`) and its one role (`aerolvm-role:server`, `ingress` or `worker`). A gateway's role is `ingress`.
+- **No pod until its certificate is ready.** Until then, the `AerolNode` is `Pending` with the condition `CertificatePending`. After 10 minutes, the `AerolVMNodeCertificateFailing` alert fires.
+- **One key per node, for life.** The cluster refuses any other key for that node, so renewals keep the key (`rotationPolicy: Never`). **Do not delete a node's certificate Secret**: cert-manager would make a new key, and the cluster would refuse that node from then on.
+- **Changing `issuerRef` later** affects new nodes only, and the new issuer must sign with the same CA.
+
+### Limit who can get a node certificate
+
+A certificate from your issuer that names a node and a role is a pass into the cluster. Limit who can get one in two places:
+
+1. **RBAC.** Only the operator may create `Certificate` objects in `aerolvm-system` and `aerolvm-workers`. The chart grants it that right in external-CA mode only. Grant it to no one else.
+2. **Your issuer.** Sign these names only for those two namespaces. With cert-manager's [approver-policy](https://cert-manager.io/docs/policy/approval/approver-policy/), apply the chart's `examples/approver-policy-external-ca.yaml` ([unpack the chart](/kubernetes/#get-the-chart) to get it). Turn off cert-manager's own approval first (`disableAutoApproval: true` in its Helm values), or it approves every request before the policy is read.
+
+## Signed images
+
+All four images and the chart itself are signed keyless by AerolVM's release workflow, with build provenance; the images also carry an SBOM. [`RELEASE-VERIFICATION.md`](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) shows the `cosign verify` command and the identity to expect. In production, run images by digest.
+
+To make Kubernetes refuse any AerolVM pod whose image the release workflow did not sign, apply the chart's `examples/kyverno-signed-images.yaml` (Kyverno 1.15 or later). It also pins each image to the digest it checked.
+
+## The metadata service
+
+Each cloud machine has a metadata service that hands out the machine's own cloud credentials. No pod and no sandbox should reach it. AerolVM's firewall already blocks sandboxes from it. The machine's settings are the second wall:
+
+- **IMDSv2 only** (`HttpTokens: required`).
+- **A hop limit of 1** (`HttpPutResponseHopLimit: 1`). A pod's network is one hop from the machine, so the answer never reaches a pod or a sandbox.
+
+Karpenter sets both by default. EKS managed node groups with a custom launch template default to a hop limit of 2: set it to 1 there.
+
+## Check a live install
+
+`aerolvm k8s verify` checks a running install against the rules above. It needs:
+
+- the [`aerolvm` CLI](/cli/#install), v0.7.1 or later;
+- a kubectl context that can read pods, NetworkPolicies, namespaces and nodes;
+- `SB_API_URL` and `SB_PAT_TOKEN` pointing at the install. It makes two test sandboxes, and deletes them after.
+
+```bash title="Your machine, cluster mode"
+aerolvm k8s verify --namespace aerolvm-system --worker-namespace aerolvm-workers --release aerolvm --cluster aerolvm
+```
+
+```bash title="Your machine, single mode"
+aerolvm k8s verify --namespace aerolvm
+```
+
+It exits 1 if any rule fails:
+
+- every image is signed by the AerolVM release workflow (needs `cosign` v3+);
+- no pod mounts a folder from the node, holds a Kubernetes API credential (except the operator), or holds a DNS provider token;
+- only the worker pods' `runtime` and `agent` containers are privileged;
+- the worker namespace is labelled `privileged`, and the release namespace enforces `restricted` (cluster mode);
+- NetworkPolicies limit the workers' egress, and who reaches the workers and servers;
+- on AWS, worker machines allow IMDSv2 only, with a hop limit of 1;
+- with `gatewayRef`, your Gateway accepted every AerolVM route, and the sandbox-link listener passes TLS through;
+- a runc and a gVisor sandbox cannot reach the worker, another pod, or the Kubernetes API.
+
+The IMDS check reads the machines with your own `aws` CLI and credentials (`ec2:DescribeInstances`). Without them, or off AWS, it prints `SKIP` and the run can still pass.
+
+## Next steps
+
+- [HTTPS and networking](/kubernetes/networking/): the network walls around sandboxes.
+- [Limit what users can create](/enterprise/create-policy/): allow only gVisor, your own registry, and a maximum size.
+- [Sandbox cloud identity](/sandbox-cloud-identity/): cloud credentials for a sandbox, with no stored keys.

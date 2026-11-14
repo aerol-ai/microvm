@@ -1,0 +1,240 @@
+---
+title: HTTPS and networking
+description: Give the API and sandbox links your own domain with HTTPS, and keep sandboxes off your cluster's network. For both modes.
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This page covers traffic in both directions:
+
+- **In:** your apps and users reach the API and each sandbox's ports at your own domain, over HTTPS.
+- **Out:** sandboxes run code you may not trust, so they must not reach your cluster's pods, Services, nodes or cloud metadata.
+
+## HTTPS for the API and sandbox links
+
+Turn on the **edge** and AerolVM serves everything under one domain, such as `sandboxes.example.com`:
+
+| What | Address |
+|---|---|
+| The API | `https://sandboxes.example.com` |
+| Port 3000 of a sandbox | `https://<sandbox id>-3000.sandboxes.example.com`, once you [publish the port](/network-access/#who-can-reach-the-sandbox-from-outside) |
+
+The edge is AerolVM's build of Caddy, in a container named `edge`. Where it runs depends on the mode:
+
+| | Single mode | Cluster mode |
+|---|---|---|
+| The `edge` container runs in | The worker pod `aerolvm-0` | Every gateway pod |
+| Point DNS at the Service | `aerolvm-edge` | `aerolvm-gateway` |
+| Ports on that Service | 443 and 80 | 443, 80 and 2220 (SSH). Port 21212 closes. |
+
+### Step 1: Get a certificate
+
+The certificate covers the domain and its wildcard (`sandboxes.example.com` and `*.sandboxes.example.com`). It comes from [cert-manager](https://cert-manager.io), so install cert-manager first, with an issuer that can sign a wildcard:
+
+- **Your own certificate authority**, through cert-manager's CA or Vault issuer.
+- **Let's Encrypt with DNS-01.** HTTP-01 cannot issue a wildcard. The DNS provider's token stays in cert-manager's namespace; no AerolVM pod ever holds it.
+
+Or bring your own certificate: put it in a `kubernetes.io/tls` Secret and set `edge.existingTLSSecret` instead of an issuer.
+
+### Step 2: Turn on the edge
+
+```yaml title="values.yaml"
+edge:
+  enabled: true
+  domain: sandboxes.example.com
+  certManager:
+    issuerRef: { name: letsencrypt-dns, kind: ClusterIssuer }
+```
+
+```bash title="Your machine"
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+  --namespace <namespace> --reuse-values -f values.yaml
+```
+
+Pass the `--version` you already run. `--reuse-values` is safe only while the chart stays the same; when you move to a newer chart, pass your full values file instead.
+
+In cluster mode, also set the gateways' Service back to a load balancer, if you made it `ClusterIP` during the [production install](/kubernetes/production/#step-2-write-the-values-file). Add your cloud's annotations for an internal one:
+
+```yaml title="values.yaml (cluster mode, EKS with the AWS Load Balancer Controller)"
+cluster:
+  gateways:
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-type: external
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+```
+
+### Step 3: Point DNS at it
+
+Read the load balancer's address, then make two DNS records for it: the domain and its wildcard.
+
+```bash title="Your machine"
+kubectl -n aerolvm get svc aerolvm-edge                    # single mode
+kubectl -n aerolvm-system get svc aerolvm-gateway          # cluster mode
+```
+
+Then set `SB_API_URL=https://sandboxes.example.com` in your apps.
+
+cert-manager renews the certificate, and the edge serves the new one within about two minutes, with no restart. [Custom domains](/custom-domains/) work as on a server: their certificates are issued the first time they are needed, kept in the pod, and issued again after the pod is replaced.
+
+### Behind your own Gateway (cluster mode)
+
+If your cluster already has a [Gateway API](https://gateway-api.sigs.k8s.io/) Gateway in front of everything, put the AerolVM gateways behind it instead of a load balancer:
+
+```yaml title="values.yaml"
+edge:
+  enabled: true
+  domain: sandboxes.example.com
+  certManager:
+    issuerRef: { name: bank-ca, kind: ClusterIssuer }
+cluster:
+  gateways:
+    gatewayRef: { name: bank-gateway, namespace: gateways }
+```
+
+The `aerolvm-gateway` Service becomes ClusterIP, and the chart writes three routes to your Gateway:
+
+| Route | Name | For |
+|---|---|---|
+| HTTPRoute | `aerolvm-api` | The API, on the domain |
+| TLSRoute | `aerolvm-links` | Sandbox links, on `*.<domain>`. Passthrough: the traffic stays encrypted to the AerolVM gateway. |
+| TCPRoute | `aerolvm-ssh` | SSH, on your Gateway's listener named `ssh` |
+
+You need Gateway API **v1.6 or later**, the first release with `TCPRoute` in `v1`, and a Gateway implementation that supports TLS passthrough and TCP routes. [`aerolvm k8s verify`](/kubernetes/security/#check-a-live-install) checks that your Gateway accepted all three routes, and that the links listener passes traffic through.
+
+## Keep sandboxes off your network
+
+On Kubernetes, a sandbox's traffic leaves with the worker pod's IP. So your cluster's own NetworkPolicies cannot tell a sandbox from AerolVM. AerolVM puts two walls around sandboxes:
+
+1. **AerolVM's firewall, inside the worker pod.** A sandbox with no network policy of its own cannot reach `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` or `169.254.0.0/16`, plus the ranges you list [below](#tell-aerolvm-your-clusters-addresses). It cannot reach the worker pod's own ports or the cloud metadata service either. It can reach the internet and resolve names.
+2. **A NetworkPolicy on the worker pod.** The chart adds one (`networkPolicy.enabled`, on by default). The pod may reach the other AerolVM pods of the install, the cluster DNS, and the internet. It may not reach the ranges above, nor `100.64.0.0/10`.
+
+The first wall works on every cluster. The second needs a network plugin that enforces NetworkPolicy, such as Calico, Cilium, or the Amazon VPC CNI with network policy turned on. A plugin that does not enforce it ignores the policy.
+
+### Tell AerolVM your cluster's addresses
+
+AerolVM blocks two lists of addresses for sandboxes:
+
+| Value | What to put there | Can an egress profile open it? |
+|---|---|---|
+| `worker.egressDenyFloor` | The Kubernetes API server: its Service IP and the IPs behind it | No, never |
+| `worker.egressPrivateRanges` | Your pod, Service and node CIDRs | Yes, on purpose ([below](#open-one-internal-range-on-purpose)) |
+
+**In cluster mode**, the operator reads the API server's addresses and the pod and Service CIDRs from the Kubernetes API, and adds them for you. List only what the API cannot tell it, such as node CIDRs outside the private ranges. When the API server's addresses change (EKS replaces its control-plane machines), running workers get the new ones within a minute, with no restart.
+
+**In single mode**, list both yourself:
+
+```yaml title="values.yaml"
+worker:
+  egressDenyFloor:
+    - 10.96.0.1     # kubectl get svc kubernetes -n default
+    - 172.18.0.2    # kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes
+  egressPrivateRanges:
+    - 10.244.0.0/16 # pods
+    - 10.96.0.0/12  # Services
+    - 172.18.0.0/16 # nodes
+```
+
+Good to know:
+
+- **List every cluster CIDR outside the private ranges.** The firewall blocks only the private ranges by default. For example, EKS custom networking gives pods `100.64.0.0/10` addresses: list it, or sandboxes can reach those pods past the first wall.
+- **List your CIDRs even if they are inside the private ranges.** The NetworkPolicy then leaves them out by name too.
+- **Keep only the API server in `egressDenyFloor`.** Never put the cluster DNS IP there (often `10.96.0.10`), or sandboxes cannot resolve names. Inside a range in `egressPrivateRanges` it is fine: AerolVM keeps the DNS address open.
+- **A change reaches only new worker pods.** The lists are set when a worker pod is made. The chart never restarts a worker pod on its own, because that ends every sandbox. In single mode, run `helm upgrade`, then delete `aerolvm-0` when you are ready. In cluster mode, new workers get the change, and you can [replace the running ones](/kubernetes/operations/#replace-a-machine).
+
+### Open one internal range on purpose
+
+Say some sandboxes must reach an internal API at `10.50.0.0/16`. Open it in **both walls**. Open it in only one, and sandboxes still cannot reach it.
+
+**Wall 1: in AerolVM, with an egress profile.** A profile is a named allow list. Sandboxes that use it can reach the range; other sandboxes still cannot. See [Reusable allow lists](/advanced-network-rules/#reusable-allow-lists).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.putEgressProfile('bank-api', {
+      allowOut: ['10.50.0.0/16', 'pypi.org'],
+      description: 'the internal API, and pip',
+    })
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['bank-api'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.put_egress_profile('bank-api', {
+        'allowOut': ['10.50.0.0/16', 'pypi.org'],
+        'description': 'the internal API, and pip',
+    })
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['bank-api'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.PutEgressProfile(ctx, "bank-api", sdktypes.EgressProfileOptions{
+        AllowOut:    []string{"10.50.0.0/16", "pypi.org"},
+        Description: "the internal API, and pip",
+    })
+    if err != nil {
+        return err
+    }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"bank-api"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.put_egress_profile("bank-api", EgressProfileOptions {
+        allow_out: vec!["10.50.0.0/16".to_string(), "pypi.org".to_string()],
+        description: "the internal API, and pip".to_string(),
+    })?;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["bank-api".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.putEgressProfile("bank-api", new EgressProfileOptions()
+        .setAllowOut(List.of("10.50.0.0/16", "pypi.org"))
+        .setDescription("the internal API, and pip"));
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("bank-api"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+A sandbox that uses a profile can reach only what the profile allows. That is why `pypi.org` is in the list too: add every site the sandbox needs.
+
+**Wall 2: in the worker pod's NetworkPolicy.** Add the same range and run `helm upgrade`. This one needs no new pod: the network plugin applies it at once.
+
+```yaml title="values.yaml"
+networkPolicy:
+  extraEgressCIDRs:
+    - 10.50.0.0/16
+```
+
+Put private addresses the worker pod itself needs in the same list: a private registry for sandbox images, a VPC endpoint for object storage or KMS, or the NodeLocal DNSCache address (often `169.254.20.10`).
+
+## Next steps
+
+- [Security](/kubernetes/security/): every right each pod has, and `aerolvm k8s verify`.
+- [Network access](/network-access/): per-sandbox allow lists and published ports, from the SDK.
+- [Advanced network rules](/advanced-network-rules/): egress profiles and learn mode.

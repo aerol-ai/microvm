@@ -162,6 +162,13 @@ jobs:
               - '.github/workflows/release.yml'
               # caddy_version_test checks the plugin's Caddy pin.
               - 'caddymod/go.mod'
+              # chart_values_docs_test checks the Helm values page names
+              # every setting in the chart's values.yaml.
+              - 'charts/aerolvm/values.yaml'
+              - 'docs/src/content/docs/kubernetes/values.mdx'
+              # helm_chart_release_test checks the guide names the chart
+              # reference release.yml publishes.
+              - 'docs/src/content/docs/kubernetes/index.mdx'
             # The Helm chart, the images and the runtime supervisor: the
             # kubernetes job lints the chart and runs it on kind.
             kubernetes:

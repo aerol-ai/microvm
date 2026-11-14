@@ -4,7 +4,8 @@
 #
 #   kubectl create namespace aerolvm-system
 #   kubectl label namespace aerolvm-system pod-security.kubernetes.io/enforce=restricted
-#   helm install aerolvm charts/aerolvm -n aerolvm-system -f values-bank-eks.yaml
+#   helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+#     -n aerolvm-system -f values-bank-eks.yaml
 #
 # What this file sets:
 #   - cluster mode over three zones, with gVisor as the only runtime;
@@ -21,7 +22,7 @@
 #   - The worker NodePool (Karpenter): `expireAfter: Never`, no
 #     `terminationGracePeriod`, the label and taint below. The operator
 #     replaces machines by age instead (maxMachineAge), moving sandboxes
-#     first. Example: docs, Kubernetes cluster mode, "Karpenter".
+#     first. Example: docs, Kubernetes, "Production install", "Karpenter".
 #   - The EC2NodeClass: `metadataOptions.httpTokens: required` and
 #     `httpPutResponseHopLimit: 1` (Karpenter's defaults; keep them). A pod
 #     then cannot reach the machine's instance metadata, so no sandbox can
@@ -78,6 +79,10 @@ monitoring:
 
 cluster:
   name: aerolvm
+  # The release every server, gateway and worker runs. Keep it equal to
+  # image.tag above (the operator's image): each defaults to the chart's
+  # appVersion on its own, so pinning only one splits the versions.
+  version: "<version>"
   # This cell's number, 1 to 255; give each cell its own.
   cell: 1
   zones: ["<eu-west-1a>", "<eu-west-1b>", "<eu-west-1c>"]

@@ -1,33 +1,34 @@
 ---
 title: Choose a setup
-description: Decide where to run the AerolVM server. Use your own computer, one server, or a group of servers.
+description: Decide where to run the AerolVM server. Use your own computer, one server, a group of servers, or your Kubernetes cluster.
 ---
 
 import { CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-AerolVM is a server program that you run yourself. Your app talks to it through an SDK. You can run the server in three places, and your SDK code is the same in all of them. Only the server address and token change.
+AerolVM is a server program that you run yourself. Your app talks to it through an SDK. You can run the server in four places, and your SDK code is the same in all of them. Only the server address and token change.
 
-Most people start on their own computer. Move to a server when your sandboxes need web links that other people can open. Move to a cluster (a group of servers that work as one) when one server is not enough.
+Most people start on their own computer. Move to a server when your sandboxes need web links that other people can open. Move to a cluster (a group of servers that work as one) when one server is not enough. If your team already runs Kubernetes, install AerolVM there with Helm instead.
 
-## Compare the three setups
+## Compare the setups
 
-| | Your computer | One server | A cluster |
-|---|---|---|---|
-| **Best for** | Trying AerolVM and building your app | Real use, with public web links | Many sandboxes, and staying up when a server fails |
-| **Runs on** | macOS or Linux | One Ubuntu or Debian server | Three or more Linux machines, on any cloud |
-| **You need** | Docker. On a Mac, Docker Desktop or OrbStack. | A domain name managed by Cloudflare | A domain name managed by Cloudflare, and a private network between the machines |
-| **How you install** | One command | One command | One command on each machine. Or Terraform makes it on AWS. |
-| **Server address** | `http://localhost:21212` | `https://sandbox.example.com` (your domain) | `https://sandbox.example.com` (your domain) |
-| **Public web links for sandboxes** | No | Yes, under your domain | Yes, under your domain |
-| **HTTPS** | No | Yes, set up for you | Yes, set up for you |
-| **Kinds of sandbox** | Containers | Containers, plus gVisor, Firecracker, WebAssembly, V8 isolates and GPUs if you turn them on | Same as one server |
-| **If a server fails** | Not a concern | Nothing takes over | Sandboxes that ask for it are recreated on a healthy server |
+| | Your computer | One server | A cluster | Your Kubernetes |
+|---|---|---|---|---|
+| **Best for** | Trying AerolVM and building your app | Real use, with public web links | Many sandboxes, and staying up when a server fails | Teams that already run Kubernetes |
+| **Runs on** | macOS or Linux | One Ubuntu or Debian server | Three or more Linux machines, on any cloud | EKS, AKS, GKE, or kind on a laptop |
+| **You need** | Docker. On a Mac, Docker Desktop or OrbStack. | A domain name managed by Cloudflare | A domain name managed by Cloudflare, and a private network between the machines | Helm and cluster-admin. For production, cert-manager too. |
+| **How you install** | One command | One command | One command on each machine. Or Terraform makes it on AWS. | `helm install` |
+| **Server address** | `http://localhost:21212` | `https://sandbox.example.com` (your domain) | `https://sandbox.example.com` (your domain) | Your domain, or a port-forward |
+| **Public web links for sandboxes** | No | Yes, under your domain | Yes, under your domain | Yes, under your domain |
+| **HTTPS** | No | Yes, set up for you | Yes, set up for you | Yes, with cert-manager |
+| **Kinds of sandbox** | Containers | Containers, plus gVisor, Firecracker, WebAssembly, V8 isolates and GPUs if you turn them on | Same as one server | Containers and gVisor, plus Firecracker, WebAssembly and V8 isolates if you turn them on |
+| **If a server fails** | Not a concern | Nothing takes over | Sandboxes that ask for it are recreated on a healthy server | In cluster mode, as for a cluster |
 
 ## Which one should I pick?
 
 - **You want to try AerolVM or build your app.** Use [your computer](/getting-started/local-setup/). The [Quickstart](/quick-start/) does this in about five minutes.
 - **People on the internet need to open a sandbox's web page.** Use [one server](/getting-started/single-node-setup/). It gives each sandbox a link like `https://<sandbox-id>-3000.sandbox.example.com`.
 - **You run more sandboxes than one server can hold, or you cannot afford downtime.** Use a [cluster](/cluster/).
+- **Your team already runs Kubernetes.** Install with the [Helm chart](/kubernetes/). Single mode takes about five minutes on any cluster.
 
 ## Good to know
 
@@ -41,5 +42,6 @@ Most people start on their own computer. Move to a server when your sandboxes ne
   <LinkCard title="Install on your computer" description="Run the server on your Mac or Linux computer. No domain needed." href="/getting-started/local-setup/" />
   <LinkCard title="Install on a server" description="One Linux server with your own domain, HTTPS and public links." href="/getting-started/single-node-setup/" />
   <LinkCard title="Cluster setup" description="Spread sandboxes across three or more Linux machines, on any cloud." href="/cluster/" />
+  <LinkCard title="Kubernetes" description="Install in your own Kubernetes cluster with one Helm chart." href="/kubernetes/" />
   <LinkCard title="Quickstart" description="Install on your computer and run your first sandbox." href="/quick-start/" />
 </CardGrid>

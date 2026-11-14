@@ -1,9 +1,15 @@
 ---
-title: Coming from Kubernetes
-description: Kubernetes ideas and commands, next to their AerolVM match, and the few things that work differently.
+title: If you know kubeadm
+description: kubeadm and kubectl ideas and commands, next to their match in an AerolVM cluster, and the few things that work differently.
 ---
 
-If you have run a Kubernetes cluster with `kubeadm` and `kubectl`, most of an AerolVM cluster will feel familiar. This page maps what you know. If you have never used Kubernetes, you can skip it.
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside>
+This page is about AerolVM's own cluster on plain Linux machines. To run AerolVM **inside** your Kubernetes cluster with Helm, see [Kubernetes](/kubernetes/).
+</Aside>
+
+If you have built a Kubernetes cluster with `kubeadm` and `kubectl`, most of an AerolVM cluster will feel familiar. This page maps what you know. If you have never used Kubernetes, you can skip it.
 
 `sandboxd` is the AerolVM program on each node. `aerolvm` is the command-line tool on your computer.
 

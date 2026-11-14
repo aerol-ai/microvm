@@ -1,45 +1,50 @@
 ---
-title: The Kubernetes API (kubectl get sandboxes)
-description: Use kubectl and agent-sandbox clients with AerolVM. Sandbox, SandboxTemplate, SandboxWarmPool and SandboxClaim, served by AerolVM's gateways, with Kubernetes RBAC.
+title: kubectl and agent-sandbox
+description: Use kubectl get sandboxes, agent-sandbox clients and Kubernetes RBAC with AerolVM. Cluster mode only.
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-[agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is a Kubernetes project that defines four kinds of object for AI sandboxes: `Sandbox`, `SandboxTemplate`, `SandboxWarmPool` and `SandboxClaim`. Many agent frameworks make these objects to get a sandbox.
+This is an optional add-on for [cluster mode](/kubernetes/production/). Turn it on and AerolVM serves the [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) API itself:
 
-On a [Kubernetes cluster install](/kubernetes-cluster/), AerolVM can serve those four kinds itself. Then `kubectl get sandboxes` works, tools built for agent-sandbox work, and Kubernetes RBAC decides who may see and change which sandboxes. You do not install the agent-sandbox controller.
+- `kubectl get sandboxes` works, and so do tools built for agent-sandbox.
+- Kubernetes RBAC decides who may see and change which sandboxes.
+- You do not install the agent-sandbox controller.
 
-`kubectl` and the SDKs work side by side. A sandbox made with `kubectl` is an ordinary AerolVM sandbox, so the SDKs see it, and `kubectl` sees the sandboxes the SDKs make.
+`kubectl` and the SDKs see the same sandboxes. A sandbox made with `kubectl` is an ordinary AerolVM sandbox, and `kubectl` lists the ones the SDKs make.
 
 | Kind | apiVersion | What it is |
 |---|---|---|
 | `Sandbox` | `agents.x-k8s.io/v1beta1` | One sandbox. |
 | `SandboxTemplate` | `extensions.agents.x-k8s.io/v1beta1` | What a claim runs: image, size, runtime, env. |
-| `SandboxWarmPool` | `extensions.agents.x-k8s.io/v1beta1` | A named pool that points at a template. |
+| `SandboxWarmPool` | `extensions.agents.x-k8s.io/v1beta1` | Sandboxes started ahead of time from a template. |
 | `SandboxClaim` | `extensions.agents.x-k8s.io/v1beta1` | "Give me a sandbox from this pool." |
 
 ## How it works
 
+AerolVM's gateways run an **aggregated API server** for the two API groups above. Two `APIService` objects tell the kube-apiserver to send every call for those groups to the gateways, on port 9443.
+
 ```mermaid
 flowchart LR
     K["kubectl or an agent-sandbox client"] --> API["kube-apiserver"]
-    API -->|"checks RBAC, then passes the call on"| G["AerolVM gateways"]
+    API -->|"authenticates, then proxies"| G["AerolVM gateways"]
+    G -->|"SubjectAccessReview"| API
     G -->|"the same create as an SDK call"| C["AerolVM cluster"]
     G -->|"templates and warm pools only"| E[("etcd")]
 ```
 
-- **The gateways answer.** Gateways are the AerolVM pods that take every request. With this feature on, they also answer the two API groups above. An `APIService` object tells the kube-apiserver to pass every call for a group to them.
-- **Sandboxes and claims are not stored in etcd.** When you list them, the gateways read AerolVM's own records. So 100,000 sandboxes add nothing to etcd.
-- **Templates and warm pools are stored in etcd**, as two AerolVM CRDs (`sandboxtemplates.k8s.aerolvm.io` and `sandboxwarmpools.k8s.aerolvm.io`). They change rarely. You never edit these CRDs directly: you use the agent-sandbox kinds, and the gateways write the CRDs for you.
-- **A create from `kubectl` is checked like an SDK create**: [create policy](/enterprise/create-policy/), quotas, and the audit log. The audit record names the Kubernetes user.
+- **RBAC is checked twice.** The kube-apiserver authenticates the caller. The gateway then asks it, with a SubjectAccessReview, whether that user may do that verb on that resource in that namespace.
+- **Sandboxes and claims are not stored in etcd.** A list reads AerolVM's own records, so 100,000 sandboxes add nothing to etcd.
+- **Templates and warm pools are stored in etcd**, as two AerolVM CRDs: `sandboxtemplates.k8s.aerolvm.io` and `sandboxwarmpools.k8s.aerolvm.io`. They change rarely. You never edit these CRDs directly; you use the agent-sandbox kinds, and the gateways write the CRDs.
+- **A create from `kubectl` is checked like an SDK create**: [create policy](/enterprise/create-policy/), quotas and the audit log. The audit record names the Kubernetes user.
 
 <Aside type="caution">
-Do not install the agent-sandbox controller in the same cluster. AerolVM answers its kinds itself, and the two would fight over them.
+Do not install the agent-sandbox controller in the same cluster. AerolVM serves its kinds itself, and the two would fight over them.
 </Aside>
 
 ## Turn it on
 
-You need [cert-manager](https://cert-manager.io/) in the cluster. The chart uses it to make the certificate the kube-apiserver trusts.
+You need a cluster-mode install and [cert-manager](https://cert-manager.io/). The chart uses cert-manager to make the serving certificate the kube-apiserver trusts.
 
 Add this to your cluster values:
 
@@ -54,7 +59,8 @@ cluster:
 Then upgrade:
 
 ```bash
-helm upgrade aerolvm charts/aerolvm --namespace aerolvm-system -f aerolvm-cluster.yaml
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+  --namespace aerolvm-system -f aerolvm-cluster.yaml
 ```
 
 Check that Kubernetes can reach the gateways. Both lines should say `True`:
@@ -65,9 +71,11 @@ kubectl get apiservice v1beta1.agents.x-k8s.io v1beta1.extensions.agents.x-k8s.i
 
 Turning it on gives the gateways three Kubernetes rights they did not have:
 
-- Ask Kubernetes "may this user do this?" (`SubjectAccessReview`).
-- Read the certificate the kube-apiserver signs its calls with (the front-proxy CA).
+- `system:auth-delegator`: create TokenReviews and SubjectAccessReviews, to ask "may this user do this?".
+- `extension-apiserver-authentication-reader` in `kube-system`: read the front-proxy CA, to check that a call really comes from the kube-apiserver.
 - Read and write the two template and warm-pool CRDs, and nothing else.
+
+These are the standard rights of any aggregated API server.
 
 With the chart's network policy on, it also opens the gateways' port 9443, which the kube-apiserver calls.
 
@@ -183,7 +191,7 @@ spec:
 A claim asks for a sandbox from a warm pool. The pool names a template, and the template says what to run.
 
 <Aside>
-A warm pool keeps sandboxes started ahead of time, so a claim takes one that is ready instead of starting a new one. Two things differ from upstream agent-sandbox:
+A claim takes a ready sandbox from the pool instead of starting a new one. Two things differ from upstream agent-sandbox:
 
 - **`replicas` is per worker, in each worker's default runtime.** Each worker keeps that many ready, as AerolVM's own [warm pools](/warm-pools/) do, in the runtime a sandbox gets when it names none: the chart's `worker.defaultRuntime`, which is runc unless you set it. Upstream counts the whole cluster. Start with `replicas: 1`.
   - A template with no `runtimeClassName`, like agent-sandbox's own examples, is kept ready on every worker.
@@ -269,9 +277,21 @@ Of the 133 objects in agent-sandbox v1.0.11's own examples, 52 work as written, 
 | Any | Service accounts, IRSA, volumes, GPUs, node placement, security contexts, init or sidecar containers | No. For cloud access, use AerolVM's own [cloud identity](/sandbox-cloud-identity/). |
 | — | The `sandbox-router` API | No. Reach sandbox ports through AerolVM's normal [links](/public-urls/). |
 
-## Good to know
+## If something is wrong
 
-- **If the gateways cannot answer the Kubernetes API**, Kubernetes marks the `APIService` unavailable. `kubectl get sandboxes` fails, and deleting any namespace waits until the gateways answer again. Run at least three gateways across zones.
+| What you see | What to do |
+|---|---|
+| `kubectl get apiservice v1beta1.agents.x-k8s.io` says `False` | The kube-apiserver cannot reach the gateways on port 9443. The `MESSAGE` column says why. Check that the gateways are `Serving` (`kubectl -n aerolvm-system get aerolnodes`), that the serving certificate is ready (`kubectl -n aerolvm-system get certificate`), and that nothing else blocks port 9443 to the gateway pods. |
+| `error: the server doesn't have a resource type "sandboxes"` | The API is not turned on, or the `APIService` objects are missing. Check `cluster.agentSandboxAPI.enabled`. |
+| `Forbidden` | RBAC. `kubectl auth can-i list sandboxes.agents.x-k8s.io -n <namespace>` shows what the caller may do. |
+| A field is refused with its name | AerolVM cannot honor that field. See [What AerolVM supports](#what-aerolvm-supports). |
+
+<Aside type="caution">
+If the gateways cannot answer, Kubernetes marks the `APIService` unavailable. Then `kubectl get sandboxes` fails, **and deleting any namespace waits** until the gateways answer again. Run at least three gateways across zones.
+</Aside>
+
+## kubectl details
+
 - **Turning the API off** removes the two `APIService` objects and the gateways' rights. The template and warm-pool CRDs stay, so turning it on again finds them.
 - **Delete, then create again with the same name** gives a new sandbox with a new `uid`, as Kubernetes expects.
 - **`kubectl get` shows only `NAME` and `AGE`.** To see more, ask for the columns: `kubectl -n payments get sandboxes -o custom-columns=NAME:.metadata.name,MODE:.spec.operatingMode`.
@@ -364,7 +384,7 @@ kubectl -n payments get sandboxes -w -o custom-columns=NAME:.metadata.name,MODE:
 
 ## Next steps
 
-- [Kubernetes cluster mode](/kubernetes-cluster/): install the cluster this API runs on.
+- [Production install](/kubernetes/production/): install the cluster this API runs on.
 - [Move from agent-sandbox](/moving-from-agent-sandbox/): call AerolVM from code instead, call by call.
 - [Create and manage sandboxes](/sandboxes/): everything else a sandbox can do, from the SDK.
 - [SSO](/enterprise/sso/): the teams that namespaces map to.

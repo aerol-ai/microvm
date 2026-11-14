@@ -1,0 +1,132 @@
+---
+title: Helm values
+description: Every setting in the AerolVM Helm chart, grouped by what it controls, with its default.
+---
+
+Set these with `--set` or a values file (`-f values.yaml`). The chart's own [`values.yaml`](https://github.com/aerol-ai/microvm/blob/main/charts/aerolvm/values.yaml) has a comment on each one. A test keeps this page and that file in step.
+
+## Mode and images
+
+| Setting | What it does | Default |
+|---|---|---|
+| `mode` | `single` (one pod, no operator) or `cluster` (the operator, servers, gateways and worker pools). See [Pick a mode](/kubernetes/#pick-a-mode). | `single` |
+| `image.registry` | Where the [four images](/kubernetes/#images) come from. Point it at your mirror. | `ghcr.io/aerol-ai` |
+| `image.tag` | The image version. In cluster mode, the operator's image; set `cluster.version` to the same value. Use a digest-pinned tag in production. | The chart's `appVersion` |
+| `image.pullPolicy` | The pull policy for every AerolVM container. | `IfNotPresent` |
+| `apiToken.existingSecret` | Single mode: your own token Secret (key `SB_PAT_TOKEN`), instead of the one the chart makes. | none |
+
+## Worker pods
+
+These shape every worker pod: the single-mode pod, and every cluster-mode worker.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `worker.runtime.resources` | The sandboxes' budget. Every sandbox runs inside it, with a reserve kept for containerd. Keep requests equal to limits. In cluster mode, the operator sizes it to the machine instead. | 2 CPUs, 4 GiB |
+| `worker.agent.resources` | The AerolVM server container. | 0.5 CPU, 1 GiB |
+| `worker.egress.resources` | The hostname-filter container. | 0.1 CPU, 128 MiB |
+| `worker.defaultRuntime` | The isolation a create gets when it names none: `docker` (runc) or `gvisor`. It is also the runtime [kubectl warm pools](/kubernetes/kubectl/#templates-warm-pools-and-claims) keep sandboxes ready in. | runc |
+| `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. Keep it well above the share where the kubelet evicts pods (10% free on EKS) when the sandbox disk is the node's own disk. `"0"` turns it off. | `"0.20"` |
+| `worker.blockPrivateByDefault` | Sandboxes cannot reach private addresses unless a create allows them. | `true` |
+| `worker.usageMetrics.enabled` | [Usage per team](/kubernetes/operations/#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |
+| `worker.wasm.enabled` | Run [WASM sandboxes](/wasm-sandbox/) on workers. The pod then shares one process namespace, so WASM sandboxes survive an `agent` restart. | `false` |
+| `worker.isolate.enabled` | Run [V8 isolate sandboxes](/isolate-sandbox/) on workers. Shares the process namespace, as with WASM. | `false` |
+| `worker.firecracker` | `enabled`: run [Firecracker microVMs](/firecracker-sandbox/) on workers. Needs `/dev/kvm`: a metal instance, or on EKS an m7i, c7i, r7i, m8i, c8i or r8i instance with nested virtualization on. A worker on a machine without it fails its checks. `jailerUID`: the unused uid each VM runs as. | `false`, `990` |
+| `worker.gvisor.checkpointMoves` | When a machine is [replaced](/kubernetes/operations/#replace-a-machine), move running gVisor sandboxes with their memory. `false` rebuilds or stops them, as their failover policy says. | `true` |
+| `worker.egressDenyFloor` | [Addresses no sandbox can ever reach](/kubernetes/networking/#tell-aerolvm-your-clusters-addresses), such as the Kubernetes API server. | none |
+| `worker.egressPrivateRanges` | Your pod, Service and node CIDRs. Closed to sandboxes unless an egress profile opens one. Needs `worker.blockPrivateByDefault`. | none |
+| `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. | none |
+| `worker.containerdVolume` | A volume source for images and sandbox files. Use a [local disk](/kubernetes/single-node/#keep-data-across-restarts) for real work. | `emptyDir` |
+| `worker.stateVolume` | A volume source for the server's database. | `emptyDir` |
+| `worker.nodeSelector`, `worker.tolerations`, `worker.affinity` | Single mode: where the pod runs. In cluster mode, each worker pool's own `nodeSelector` and `tolerations` decide. | none |
+
+## API Service (single mode)
+
+| Setting | What it does | Default |
+|---|---|---|
+| `service.type` | The `aerolvm` Service's type. | `ClusterIP` |
+| `service.port` | The API port. | `21212` |
+
+## NetworkPolicy
+
+| Setting | What it does | Default |
+|---|---|---|
+| `networkPolicy.enabled` | Put NetworkPolicies around the worker pods (and, in cluster mode, every AerolVM pod). See [Keep sandboxes off your network](/kubernetes/networking/#keep-sandboxes-off-your-network). | `true` |
+| `networkPolicy.dns` | Where your cluster DNS runs: `namespace` and `podLabels`. | `kube-system`, `k8s-app: kube-dns` |
+| `networkPolicy.extraEgressCIDRs` | Private ranges the worker pod may reach: a range you [open on purpose](/kubernetes/networking/#open-one-internal-range-on-purpose), or a registry or VPC endpoint the pod needs. | none |
+| `networkPolicy.extraIngressFrom` | Cluster mode: who else may reach a worker pod, as NetworkPolicy peers. Gateways, servers, other workers and Prometheus are already allowed. | none |
+
+## HTTPS edge
+
+| Setting | What it does | Default |
+|---|---|---|
+| `edge.enabled` | [The API and sandbox links over HTTPS](/kubernetes/networking/#https-for-the-api-and-sandbox-links). Needs `edge.domain` and a certificate. | `false` |
+| `edge.domain` | The API's host name. Sandbox links are under it. | none |
+| `edge.certManager.issuerRef` | The cert-manager issuer, as `name` and `kind`. It must sign a wildcard. | none |
+| `edge.existingTLSSecret` | Your own `kubernetes.io/tls` Secret for the domain and its wildcard, instead of an issuer. | none |
+| `edge.resources` | The `edge` container. | 0.25 CPU, 256 MiB |
+| `edge.service.type` | Single mode: the `aerolvm-edge` Service's type. (Cluster mode uses `cluster.gateways.service`.) | `LoadBalancer` |
+
+## Monitoring
+
+| Setting | What it does | Default |
+|---|---|---|
+| `monitoring.enabled` | [ServiceMonitors, alerts and dashboards](/kubernetes/operations/#monitoring). Needs the Prometheus Operator. | `false` |
+| `monitoring.labels` | Labels your Prometheus selects, such as `release: kube-prometheus-stack`. | none |
+| `monitoring.interval` | How often Prometheus scrapes each pod. | `30s` |
+| `monitoring.scrapeTimeout` | The scrape timeout. | `10s` |
+| `monitoring.prometheusNamespace` | Cluster mode: the namespace Prometheus runs in. Only it may read the workers' metrics. | `monitoring` |
+| `monitoring.scrapeToken` | `existingSecret` and `key`: a Secret with a [read-only token](/kubernetes/operations/#use-a-read-only-scrape-token) for Prometheus. | The API token |
+| `monitoring.prometheusRule` | `enabled`: add the alerts. `disabledAlerts`: alerts to leave out, by name. | `true`, none |
+| `monitoring.grafanaDashboards` | Add the two Grafana dashboards as ConfigMaps. | `true` |
+| `monitoring.dashboardsNamespace` | Where the dashboard ConfigMaps go. Your Grafana sidecar must watch it. | The release namespace |
+
+## Cluster
+
+Everything under `cluster` applies when `mode: cluster`.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `cluster.name` | The `AerolCluster`'s name. Every node, Service and Secret is named after it. | `aerolvm` |
+| `cluster.workerNamespace` | Where worker pods run. Must not be the release namespace. | `aerolvm-workers` |
+| `cluster.createWorkerNamespace` | Make the worker namespace and label it `privileged`. Set `false` to make and label it yourself. | `true` |
+| `cluster.version` | The AerolVM release every node runs. Change it to [upgrade](/kubernetes/operations/#upgrade); set it back to roll back. Keep it equal to `image.tag` if you pin either. | The chart's `appVersion` |
+| `cluster.zones` | The zones to spread over. Servers go one per zone. | none (required) |
+| `cluster.servers.count` | 3 or 5. | `3` |
+| `cluster.servers.storage` | Each server's disk: `size` and `storageClassName` (`WaitForFirstConsumer`). For a busy cluster (about 1,000 creates a second), use a fast class: on EKS, gp3 with 16,000 IOPS and 1,000 MB/s. | `20Gi`, the default class |
+| `cluster.servers.logStorage` | A second disk per server for its Raft log only: `size` and `storageClassName`. A busy cluster needs it fast: on EKS, io2. Set it before the servers are made; each server keeps the layout it was made with. | off |
+| `cluster.servers.resources` | Each server pod. A cluster near 1,000 creates a second needs 4 CPUs. | 1 CPU, 2 GiB request |
+| `cluster.servers.nodeSelector`, `cluster.servers.tolerations` | Where servers run. | none |
+| `cluster.gateways.minReplicas` | Gateways to keep, at least one per zone. Lower it and the extra ones retire. | `3` |
+| `cluster.gateways.maxReplicas` | A cap. The operator refuses a value below `minReplicas` or below one per zone. | `30` |
+| `cluster.gateways.resources` | Each gateway pod. | 0.5 CPU, 512 MiB request |
+| `cluster.gateways.service` | The `aerolvm-gateway` Service: `type` and `annotations`. Without HTTPS, keep it `ClusterIP` or internal. | `LoadBalancer` |
+| `cluster.gateways.gatewayRef` | Sit [behind your own Gateway API Gateway](/kubernetes/networking/#behind-your-own-gateway-cluster-mode), as `name` and `namespace`. | none |
+| `cluster.gateways.nodeSelector`, `cluster.gateways.tolerations` | Where gateways run. | none |
+| `cluster.workerPools` | One entry per kind of worker machine. Fields [below](#worker-pools). | none (required) |
+| `cluster.createPolicy` | What any sandbox may be: images, registries, runtimes, size, root, GPU. Every node checks it, and changes reach running nodes within a minute. See [Limit what users can create](/enterprise/create-policy/). | allow all |
+| `cluster.externalCA.issuerRef` | [External-CA mode](/kubernetes/security/#keep-the-ca-key-outside-the-cluster): node certificates from your issuer, no CA key in the cluster. Set it before you install. | none |
+| `cluster.agentSandboxAPI` | `enabled`: serve [`kubectl get sandboxes`](/kubernetes/kubectl/) from the gateways. `namespaces`: map a namespace to an owner other than the team of the same name. | off |
+| `cluster.cell` | This cluster's number, 1 to 255, in every new sandbox ID. Give each cluster its own. | `1` |
+| `cluster.federation` | This cluster as one of [many cells](/cells/): `idKeySecret` and `cells`. Set both before the first sandbox. | none |
+| `cluster.operator.replicas` | Operator pods. One leads at a time. | `2` |
+| `cluster.operator.upgradeCRDs` | Update the two CRDs with a short Job on each `helm upgrade`. Set `false` if Argo CD or someone else manages CRDs. | `true` |
+| `cluster.operator.resources` | Each operator pod. | 0.1 CPU, 128 MiB request |
+| `cluster.operator.nodeSelector`, `cluster.operator.tolerations` | Where the operator runs. | none |
+
+### Worker pools
+
+Each entry in `cluster.workerPools`:
+
+| Field | What it does | Default |
+|---|---|---|
+| `name` | The pool's name, in its worker pods' names. Lowercase letters, digits and dashes. | required |
+| `machine` | One machine's size, `cpu` and `memoryGiB`. The worker pod asks for nearly all of it. | required |
+| `minWorkers`, `maxWorkers` | The floor and the cap, spread over the zones. | required |
+| `runtimes` | The only runtimes this pool's workers run, such as `[gvisor]`. | what `worker` allows |
+| `nodeSelector`, `tolerations` | Pick the pool's machines. | none |
+| `headroomPercent` | Free room kept in each zone. The operator adds a worker when a zone has less. At 0, it adds one only when a zone is full. Most pools want 10 to 20. | `0` |
+| `zoneLossReservePercent` | Extra room per zone, so a lost zone's sandboxes come back quickly. | `0` |
+| `images` | Images a new worker pulls before it takes sandboxes. | none |
+| `provisioner` | Who brings machines: `karpenter`, `nap`, `eks-managed`, `aks-pool` or `none`. `eks-managed` caps a decommission at 14 minutes. | `none` |
+| `decommission` | `drainWindow` (time for sandboxes to end by themselves) and `deadline` (when what could not move stops). | `15m`, `45m` |
+| `maxMachineAge` | Replace a worker whose machine is older, one per zone at a time. Set it on Karpenter pools, whose NodePool has `expireAfter: Never`. | never |

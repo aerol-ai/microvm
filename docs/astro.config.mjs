@@ -42,6 +42,9 @@ export default defineConfig({
     // the step-by-step build that cluster-setup.mdx held.
     '/getting-started/cluster-setup': '/cluster',
     '/cluster-setup': '/cluster/create',
+    // The three Kubernetes pages became the guide under /kubernetes/.
+    '/kubernetes-cluster': '/kubernetes/production',
+    '/kubernetes-api': '/kubernetes/kubectl',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

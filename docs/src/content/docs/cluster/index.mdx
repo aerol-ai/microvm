@@ -161,30 +161,11 @@ Want the ideas first? Read [How a cluster works](/cluster/how-it-works/).
 7. [Keep it safe](/cluster/security/): the secrets you hold, and what each one opens.
 8. [Fix problems](/cluster/troubleshooting/): what to run when something looks wrong.
 9. [Command cheat sheet](/cluster/cheat-sheet/): every cluster command on one page.
-10. [Coming from Kubernetes](/cluster/kubernetes/): Kubernetes words and commands, and their AerolVM match.
+10. [If you know kubeadm](/cluster/kubernetes/): kubeadm and kubectl commands, and their AerolVM match.
 
 ## If you know Kubernetes
 
-Most commands have a direct match:
-
-| In Kubernetes | In AerolVM |
-|---|---|
-| `kubeadm` on the nodes, `kubectl` on your computer | `sandboxd` (the AerolVM program on each node) on the nodes, `aerolvm` on your computer |
-| `kubeadm init` | The installer, with `init` |
-| `kubeadm token create --print-join-command` | `aerolvm join-command` |
-| `kubeadm join` with `--discovery-token-ca-cert-hash` | The join command, with `--ca-cert-hash` |
-| Copy `/etc/kubernetes/admin.conf` to `~/.kube/config` | Copy `/etc/sandboxd/admin-context.json`, then `aerolvm config import` |
-| `kubectl get nodes`, `cordon`, `uncordon`, `delete node` | The same words, after `aerolvm` |
-| `kubeadm upgrade plan` | `aerolvm upgrade plan` |
-| `kubeadm upgrade apply`, then `kubeadm upgrade node` on every node | One `aerolvm upgrade apply`, for every node |
-| `kubeadm reset` | `sudo sandboxd reset --yes` |
-
-Two things work differently:
-
-- **`aerolvm drain` does not move sandboxes.** It stops new sandboxes from starting on the node. Then it waits until the node runs none. Add `--delete-sandboxes` to delete them instead. To move sandboxes, turn on [failover](#your-code-does-not-change) when you create them. Then `aerolvm delete node` rebuilds them on other nodes.
-- **There is less to install.** You run the installer on each node. There is no YAML to write, no network plugin to add, and no separate database to run. You still [back up](/cluster/backup/) the cluster's records.
-
-See [Coming from Kubernetes](/cluster/kubernetes/) for the full list.
+An AerolVM cluster works much like a `kubeadm` cluster: `aerolvm get nodes`, `cordon`, `drain` and `upgrade plan` do what you expect. [If you know kubeadm](/cluster/kubernetes/) maps every command and the few differences. Already run Kubernetes? You can also install AerolVM [inside it, with Helm](/kubernetes/).
 
 ## Want help?
 
