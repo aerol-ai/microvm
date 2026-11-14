@@ -19,14 +19,18 @@ cp "$here/manifest.yaml" "$here/createUiDefinition.json" "$here/mainTemplate.jso
 
 # The amd64 image of each release image (the Marketplace takes amd64 only).
 # From the registry's API with an anonymous pull token: the images are
-# public, and no local docker login or buildx is needed.
+# public, and no local docker login or buildx is needed. Each answer is
+# read into a variable before python3 parses it: curl piped into python3
+# reads to Scorecard as a download run by an interpreter (Pinned-Dependencies,
+# "downloadThenRun"), though python3 only reads JSON here.
 amd64_digest() {
-  local tok
-  tok="$(curl -fsSL "https://ghcr.io/token?scope=repository:aerol-ai/$1:pull" |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')" || return 1
-  curl -fsSL -H "Authorization: Bearer $tok" \
+  local tok index
+  tok="$(curl -fsSL "https://ghcr.io/token?scope=repository:aerol-ai/$1:pull")" || return 1
+  tok="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])' <<<"$tok")" || return 1
+  index="$(curl -fsSL -H "Authorization: Bearer $tok" \
     -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-    "https://ghcr.io/v2/aerol-ai/$1/manifests/$tag" | python3 -c '
+    "https://ghcr.io/v2/aerol-ai/$1/manifests/$tag")" || return 1
+  python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 for m in d.get("manifests", []):
@@ -34,7 +38,7 @@ for m in d.get("manifests", []):
     if p.get("os") == "linux" and p.get("architecture") == "amd64":
         print(m["digest"]); break
 else:
-    sys.exit("no linux/amd64 image")'
+    sys.exit("no linux/amd64 image")' <<<"$index"
 }
 values="$(cat "$here/values-azure.yaml")"
 for img in aerolvm aerolvm-runtime aerolvm-edge aerolvm-operator; do
