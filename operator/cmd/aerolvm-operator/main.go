@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,6 +47,8 @@ type options struct {
 	certDir         string
 	leaderElect     bool
 	serviceAccount  string
+	joinURL         string
+	joinCAFile      string
 }
 
 func parse(args []string) (options, error) {
@@ -60,6 +63,8 @@ func parse(args []string) (options, error) {
 	fs.StringVar(&o.certDir, "webhook-cert-dir", "/etc/aerolvm-operator/webhook", "")
 	fs.BoolVar(&o.leaderElect, "leader-elect", true, "")
 	fs.StringVar(&o.serviceAccount, "service-account", os.Getenv("POD_SERVICE_ACCOUNT"), "the operator's own service account, which the delete guard always allows")
+	fs.StringVar(&o.joinURL, "join-url", "", "where a new pod asks the operator for its join token: https://<operator Service>.<namespace>.svc"+controller.JoinIssuePath)
+	fs.StringVar(&o.joinCAFile, "join-ca-file", "", "the CA a joining pod trusts the operator by (default: ca.crt in --webhook-cert-dir)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -68,6 +73,9 @@ func parse(args []string) (options, error) {
 	}
 	if o.workerNamespace == "" {
 		o.workerNamespace = o.namespace
+	}
+	if o.joinCAFile == "" {
+		o.joinCAFile = filepath.Join(o.certDir, "ca.crt")
 	}
 	return o, nil
 }
@@ -129,7 +137,8 @@ func wire(mgr ctrl.Manager, o options, scheme *runtime.Scheme) error {
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Recorder: rec,
 		Namespace: o.namespace, WorkerNamespace: o.workerNamespace, Templates: o.templates,
-		Reader: mgr.GetAPIReader(),
+		Reader:  mgr.GetAPIReader(),
+		JoinURL: o.joinURL, JoinCA: func() ([]byte, error) { return os.ReadFile(o.joinCAFile) },
 	}).SetupWithManager(mgr); err != nil {
 		return err
 	}
@@ -141,6 +150,11 @@ func wire(mgr ctrl.Manager, o options, scheme *runtime.Scheme) error {
 		Client: mgr.GetAPIReader(), OperatorUser: user, Namespace: o.namespace,
 	}})
 	var _ admission.Handler = (*guard.PodGuard)(nil)
+	// Node identity (§15.2): every replica answers a joining pod.
+	mgr.GetWebhookServer().Register(controller.JoinIssuePath, &controller.JoinIssuer{
+		Client: mgr.GetClient(), Reader: mgr.GetAPIReader(), Reviewer: controller.ClientTokenReviewer{Client: mgr.GetClient()},
+		API: controller.DefaultAPIFactory, Namespace: o.namespace, WorkerNamespace: o.workerNamespace,
+	})
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		return err
 	}

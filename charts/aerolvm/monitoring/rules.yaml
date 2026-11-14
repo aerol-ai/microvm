@@ -273,8 +273,9 @@ groups:
           description: "The servers refused {{ $value }} join(s) in the last 10 minutes with reason {{ $labels.key2 }}. A join token used twice, a node name in use or a revoked key can mean someone else holds a node's credentials. The audit log names the caller's address and token."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmcertsignerdenied"
 
-      # §19: identity denials. The operator could not hand a pod its join
-      # token: TokenReview said no, or the token could not be made.
+      # §19: identity denials. The operator would not hand a pod its join
+      # token (TokenReview said no, or the pod was not who or where it
+      # said), or the token could not be made.
       - alert: AerolVMJoinTokenErrors
         expr: sum by (namespace) (increase(aerolvm_operator_join_token_errors_total[10m])) > 0
         for: 10m
@@ -283,7 +284,7 @@ groups:
           component: identity
         annotations:
           summary: "The AerolVM operator keeps failing to give new nodes their join tokens"
-          description: "Join token errors for over 10 minutes. New nodes wait in Pending or Joining without a token. The AerolNode condition IdentityDenied says why."
+          description: "Join token refusals or errors for over 10 minutes. New nodes wait in Joining while their setup asks again. The AerolNode condition IdentityDenied says why a pod was refused."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmjointokenerrors"
 
       # §19: external-CA certificates pending. In external-CA mode the

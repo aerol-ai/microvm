@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -49,7 +50,8 @@ func newNodeRig(t *testing.T, c *v1.AerolCluster, objs ...client.Object) *nodeRi
 	api := newFakeAPI()
 	g := &nodeRig{t: t, api: api, cl: cl, now: time.Unix(2_000_000_000, 0)}
 	g.r = &NodeReconciler{Client: cl, Scheme: cl.Scheme(), Recorder: record.NewFakeRecorder(200), API: api.factory,
-		Namespace: testNS, WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: func() time.Time { return g.now }}
+		Namespace: testNS, WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: func() time.Time { return g.now },
+		JoinURL: testJoinURL, JoinCA: func() ([]byte, error) { return testJoinCA, nil }}
 	return g
 }
 
@@ -154,29 +156,45 @@ func TestNodeServerZeroBootstrapsThenServes(t *testing.T) {
 	}
 }
 
-func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
+// A worker's pod is made at once, with no token made for it: its setup asks
+// the operator once it runs on a machine (§15.2). A join Secret an older
+// operator made is deleted once the node serves.
+func TestNodeWorkerJoinsThroughTheOperator(t *testing.T) {
 	c := bootstrapped(testCluster())
 	g := newNodeRig(t, c, node("prod-general-aaaaa", v1.RoleWorker, "general", "z-a"), machine("m1"))
 	g.api.mintErr = errors.New("leader down")
+
+	// The operator started without its join URL: no pod that could not join.
+	g.r.JoinURL = ""
 	g.reconcile("prod-general-aaaaa")
-	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "join token") {
-		t.Fatalf("no token: %+v", n.Status)
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "--join-url") || g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
+		t.Fatalf("no join URL: %+v", n.Status)
 	}
-	if g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
-		t.Fatal("pod made without its token")
-	}
-	g.api.mintErr = nil
+	g.r.JoinURL = testJoinURL
+	g.r.JoinCA = func() ([]byte, error) { return []byte("not a certificate"), nil }
 	g.reconcile("prod-general-aaaaa")
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); err != nil {
-		t.Fatal(err)
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "operator's CA") || g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
+		t.Fatalf("no CA: %+v", n.Status)
 	}
-	if string(s.Data["token"]) != "tok-worker" || string(s.Data["join_url"]) != "https://s0:7003" || len(g.api.minted) != 1 {
-		t.Fatalf("join secret = %v minted %v", s.Data, g.api.minted)
-	}
+	g.r.JoinCA = func() ([]byte, error) { return testJoinCA, nil }
+
+	g.reconcile("prod-general-aaaaa")
 	p := g.pod(testWorkerNS, "prod-general-aaaaa")
 	if p == nil || len(p.OwnerReferences) != 0 {
 		t.Fatalf("worker pod = %+v (no owner reference across namespaces)", p)
+	}
+	checkJoinsFromOperator(t, p, "worker")
+	if len(g.api.minted) != 0 {
+		t.Fatalf("a token made before the pod asked: %v", g.api.minted)
+	}
+	var s corev1.Secret
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("a join Secret: %v", err)
+	}
+	// One an older operator made, before the upgrade.
+	s = corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}}
+	if err := g.cl.Create(context.Background(), &s); err != nil {
+		t.Fatal(err)
 	}
 	g.running(p, "m1", true)
 	g.api.nodes["prod-general-aaaaa"] = aerolapi.Node{Alive: true, SandboxesRunning: 4}
@@ -184,9 +202,8 @@ func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
 	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StateServing || n.Status.Sandboxes != 4 {
 		t.Fatalf("status = %+v", n.Status)
 	}
-	// The spent token is gone.
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); !apierrors.IsNotFound(err) {
-		t.Fatalf("join secret after serving: %v", err)
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("the old join secret after serving: %v", err)
 	}
 	// Spent once: later passes over a serving node send no delete at all
 	// (at 2,000 nodes that is a delete per node per pass).
@@ -464,8 +481,9 @@ func TestNodeSweepsAGoneWorker(t *testing.T) {
 	if g.pod(testWorkerNS, n.Name) == nil {
 		t.Fatal("no pod")
 	}
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}, &s); err != nil {
+	// A join Secret an operator before §15.2 made goes with the node too.
+	s := corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}}
+	if err := g.cl.Create(context.Background(), &s); err != nil {
 		t.Fatal(err)
 	}
 
@@ -631,56 +649,109 @@ func TestPreflightFailedReason(t *testing.T) {
 	}
 }
 
-// Without a leader no join token can be minted. A server pod made again
-// keeps its identity on its disk, so it is made without one (its token
-// volume optional); a worker waits for its token. The maintenance pod, how
-// a cluster that lost quorum is repaired, never needs one.
+// Without a leader no join token can be made, and none is needed to make a
+// pod: a server made again keeps its identity on its disk, and any pod
+// that needs a token asks the operator once it runs, until a leader is back.
+// The maintenance pod, how a cluster that lost quorum is repaired, never asks.
 func TestNodeServersComeBackWithoutQuorum(t *testing.T) {
 	c := bootstrapped(testCluster())
 	srv, wrk := node("prod-server-1", v1.RoleServer, "", "z-b"), node("prod-general-eeeee", v1.RoleWorker, "general", "z-a")
 	g := newNodeRig(t, c, srv, wrk, machine("m1"))
 	g.api.mintErr = errors.New("no leader")
-
 	g.reconcile(srv.Name)
-	p := g.pod(testNS, srv.Name)
-	if p == nil {
-		t.Fatal("a server pod was not made without a token")
-	}
-	var join *corev1.SecretVolumeSource
-	for _, v := range p.Spec.Volumes {
-		if v.Name == JoinVolume {
-			join = v.Secret
+	g.reconcile(wrk.Name)
+	for _, p := range []*corev1.Pod{g.pod(testNS, srv.Name), g.pod(testWorkerNS, wrk.Name)} {
+		if p == nil {
+			t.Fatal("a pod was not made without a leader")
 		}
 	}
-	if join == nil || join.Optional == nil || !*join.Optional {
-		t.Fatalf("server join volume = %+v, want optional", join)
+	checkJoinsFromOperator(t, g.pod(testNS, srv.Name), "server")
+	if len(g.api.minted) != 0 {
+		t.Fatalf("tokens made for pods that did not ask: %v", g.api.minted)
 	}
-	g.reconcile(wrk.Name)
-	if g.pod(testWorkerNS, wrk.Name) != nil || g.node(wrk.Name).Status.State != v1.StatePending {
-		t.Fatalf("a worker was made without a token: %+v", g.node(wrk.Name).Status)
-	}
+}
 
-	// Its setup failed (no identity on the disk): a token is minted once a
-	// leader is back, for the optional volume.
+// A server pod an older operator made without a token, whose disk held no
+// identity, waits for a join Secret no operator makes now. It is made
+// again, to ask the operator; a server pod whose setup works is left alone.
+func TestNodeRemakesAServerPodWaitingForAJoinSecret(t *testing.T) {
+	c := bootstrapped(testCluster())
+	srv := node("prod-server-1", v1.RoleServer, "", "z-b")
+	g := newNodeRig(t, c, srv, machine("m1"))
+	g.reconcile(srv.Name)
+	p := g.pod(testNS, srv.Name)
+	// As the older operator stamped it: an optional join Secret volume.
+	p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
+		Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(srv.Name), Optional: ptr(true)}}})
 	p.Spec.NodeName = "m1"
 	if err := g.cl.Update(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod whose setup did not fail was ended")
+	}
+	p = g.pod(testNS, srv.Name)
 	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
 		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 2}},
 		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}}}
 	if err := g.cl.Status().Update(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	g.reconcile(srv.Name) // still no leader: nothing to mint, no error
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); !apierrors.IsNotFound(err) {
-		t.Fatalf("a token without a leader: %v", err)
-	}
-	g.api.mintErr = nil
 	g.reconcile(srv.Name)
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); err != nil {
-		t.Fatalf("no token minted once a leader is back: %v", err)
+	if g.pod(testNS, srv.Name) != nil {
+		t.Fatal("the server pod waiting for a join Secret was not made again")
+	}
+	g.reconcile(srv.Name)
+	checkJoinsFromOperator(t, g.pod(testNS, srv.Name), "server")
+}
+
+// A server pod stamped with the operator's CA before it was renewed cannot
+// trust the operator's answer: once its setup fails it is made again with
+// the current CA. One stamped with the current CA is left to retry.
+func TestNodeRemakesAServerPodWithAnOldCA(t *testing.T) {
+	c := bootstrapped(testCluster())
+	srv := node("prod-server-2", v1.RoleServer, "", "z-c")
+	g := newNodeRig(t, c, srv, machine("m1"))
+	g.reconcile(srv.Name)
+	failSetup := func() {
+		t.Helper()
+		p := g.pod(testNS, srv.Name)
+		p.Spec.NodeName = "m1"
+		if err := g.cl.Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		p = g.pod(testNS, srv.Name)
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}}}
+		if err := g.cl.Status().Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failSetup()
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod with the current CA was made again")
+	}
+	// The CA is renewed (another certificate in ca.crt).
+	renewed := otherJoinCA(t)
+	g.r.JoinCA = func() ([]byte, error) { return renewed, nil }
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) != nil {
+		t.Fatal("a server pod that trusts the old CA was not made again")
+	}
+	g.reconcile(srv.Name)
+	p := g.pod(testNS, srv.Name)
+	setup := p.Spec.InitContainers[containerIndex(p.Spec.InitContainers, SetupContainer)]
+	if got, _ := base64.StdEncoding.DecodeString(envValue(setup.Env, JoinCAEnv)); string(got) != string(renewed) {
+		t.Fatal("the new pod does not trust the renewed CA")
+	}
+	// The CA cannot be read for a moment: nothing is made again for it.
+	failSetup()
+	g.r.JoinCA = func() ([]byte, error) { return nil, errors.New("gone") }
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod was made again on an unreadable CA")
 	}
 }
 

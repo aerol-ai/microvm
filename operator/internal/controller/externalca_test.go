@@ -292,7 +292,7 @@ func TestStampExternalCA(t *testing.T) {
 	c := bootstrapped(externalCACluster())
 	stamp := func(n *v1.AerolNode, ns string, boot, maint bool) *corev1.Pod {
 		t.Helper()
-		in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: "v0.7.2", Bootstrap: boot, Maintenance: maint}
+		in := StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: n, Namespace: ns, Version: "v0.7.2", Bootstrap: boot, Maintenance: maint}
 		switch n.Spec.Role {
 		case v1.RoleServer:
 			in.PVC = PVCName(n.Name)
@@ -320,7 +320,7 @@ func TestStampExternalCA(t *testing.T) {
 		{node("prod-server-1", v1.RoleServer, "", "z-b"), testNS, false,
 			"sandboxd join https://prod-servers.aerolvm-system.svc:7003 --by-certificate --role server --node-id prod-server-1", "--token"},
 		{node("prod-gw-aaaaa", v1.RoleGateway, "", "z-a"), testNS, false, "--by-certificate --role ingress", "--ca-cert-hash"},
-		{node("prod-general-aaaaa", v1.RoleWorker, "general", "z-a"), testWorkerNS, false, "--by-certificate --role worker", "aerolvm-join"},
+		{node("prod-general-aaaaa", v1.RoleWorker, "general", "z-a"), testWorkerNS, false, "--by-certificate --role worker", "--from-operator"},
 	} {
 		p := stamp(tc.n, tc.ns, tc.boot, false)
 		setup := p.Spec.InitContainers[len(p.Spec.InitContainers)-1]
@@ -338,8 +338,8 @@ func TestStampExternalCA(t *testing.T) {
 		if len(got) != 3 || got["tls.crt"] != "node.crt" || got["tls.key"] != "node.key" || got["ca.crt"] != "ca.crt" {
 			t.Errorf("%s: items %v", tc.n.Name, got)
 		}
-		if volumeNamed(p.Spec.Volumes, JoinVolume) != nil || mountNamed(setup.VolumeMounts, JoinVolume) != nil {
-			t.Errorf("%s: a join-token volume in external-CA mode", tc.n.Name)
+		if volumeNamed(p.Spec.Volumes, JoinIdentityVolume) != nil || mountNamed(setup.VolumeMounts, JoinIdentityVolume) != nil || envValue(setup.Env, JoinCAEnv) != "" {
+			t.Errorf("%s: a join-token identity in external-CA mode", tc.n.Name)
 		}
 		agent := p.Spec.Containers[containerIndex(p.Spec.Containers, AgentContainer)]
 		for _, ctr := range []corev1.Container{agent, setup} {
@@ -361,7 +361,7 @@ func TestStampExternalCA(t *testing.T) {
 	// Token mode is unchanged.
 	c = bootstrapped(testCluster())
 	p = stamp(node("prod-server-1", v1.RoleServer, "", "z-b"), testNS, false, false)
-	if volumeNamed(p.Spec.Volumes, TLSVolume) != nil || volumeNamed(p.Spec.Volumes, JoinVolume) == nil {
+	if volumeNamed(p.Spec.Volumes, TLSVolume) != nil || volumeNamed(p.Spec.Volumes, JoinIdentityVolume) == nil {
 		t.Fatal("token mode got the external-CA volume")
 	}
 }

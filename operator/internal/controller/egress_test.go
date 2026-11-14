@@ -77,7 +77,7 @@ func stampWithEnv(t *testing.T, addrs clusterAddresses, env ...corev1.EnvVar) *c
 	agent := &tpl.Spec.Containers[containerIndex(tpl.Spec.Containers, AgentContainer)]
 	agent.Env = append(agent.Env, env...)
 	tpl.Spec.Containers = append(tpl.Spec.Containers, corev1.Container{Name: "egress"})
-	pod, err := Stamp(tpl, StampInput{Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS,
+	pod, err := Stamp(tpl, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS,
 		Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0], Addresses: addrs})
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestStampWorkerEgressRanges(t *testing.T) {
 		})
 	}
 	c := testCluster()
-	gw, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{Cluster: c, Node: node("g", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2", Addresses: found})
+	gw, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("g", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2", Addresses: found})
 	if err != nil || env(gw.Spec.Containers[0], envDenyFloor) != "<unset>" {
 		t.Fatalf("gateway got the worker's lists: %v", err)
 	}

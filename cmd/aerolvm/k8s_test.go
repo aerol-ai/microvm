@@ -253,6 +253,14 @@ func TestK8sVerifyFailures(t *testing.T) {
 		{name: "a projected token", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"kube-api-access","projected":{"sources":[{"serviceAccountToken":{"path":"token"}}]}}`, 1)
 		})}, check: "no Kubernetes API credential in the pods", want: "fail: aerolvm-0: volume kube-api-access holds a service account token"},
+		// A joining pod's proof for the operator (§15.2) is for the
+		// operator's audience alone: the API server refuses it.
+		{name: "a join identity token", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"join-identity","projected":{"sources":[{"serviceAccountToken":{"audience":"aerolvm.io/join","expirationSeconds":600,"path":"token"}}]}}`, 1)
+		})}, check: "no Kubernetes API credential in the pods", want: "pass"},
+		{name: "a token for the API server's audience", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"join-identity","projected":{"sources":[{"serviceAccountToken":{"audience":"https://kubernetes.default.svc","path":"token"}}]}}`, 1)
+		})}, check: "no Kubernetes API credential in the pods", want: "fail: aerolvm-0: volume join-identity holds a service account token"},
 		{name: "a Secret volume with every key", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `,"items":[{"key":"tls.crt","path":"tls.crt"},{"key":"tls.key","path":"tls.key"}]`, ``, 1)
 		})}, check: "no DNS provider token in the pods", want: "fail: aerolvm-0: volume edge-tls mounts every key of Secret aerolvm-edge-tls"},
