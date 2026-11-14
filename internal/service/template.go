@@ -454,8 +454,11 @@ func (s *Service) setTemplateStatus(ctx context.Context, id string, status model
 	return nil
 }
 
+// deleteTemplateRow deletes a template's row and, with it, records the
+// obligation to retire the copy this node pushed to the registry (the
+// snapshot push reconciler removes it).
 func (s *Service) deleteTemplateRow(ctx context.Context, id string) error {
-	if err := s.store.DeleteTemplate(ctx, id); err != nil {
+	if err := s.store.DeleteTemplateRetiringRegistryCopy(ctx, id); err != nil {
 		return err
 	}
 	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
