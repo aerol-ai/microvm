@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -75,6 +77,76 @@ func TestCreateRefusesAnUnfencedRecreate(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "failover.policy=recreate is not available for runtime \"wasm\"") {
 		t.Fatalf("create = %v, want the recreate refusal", err)
+	}
+}
+
+// Recreate-policy sandboxes made before creates of them were refused (an
+// upgrade) keep running unfenced: when the lease starts, one warning names
+// how many, and up to five of them. Freezable ones, and ones with no
+// failover, are not counted; a node without the lease file, or with none
+// to name, says nothing.
+func TestOwnershipLeaseStartWarnsAboutUnfencedRecreate(t *testing.T) {
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	seed := func(id, rt string, recreate bool) {
+		t.Helper()
+		now := time.Now().UTC()
+		sb := &models.Sandbox{ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted, Runtime: rt,
+			AuditIncarnationID: "inc-" + id, CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root",
+			CreatedAt: now, UpdatedAt: now, LastActiveAt: now}
+		if recreate {
+			sb.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
+		}
+		if err := st.Create(context.Background(), sb); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 6 {
+		seed(fmt.Sprintf("sb-wasm-%d", i), models.RuntimeWasm, true)
+	}
+	seed("sb-iso", models.RuntimeIsolate, true)
+	seed("sb-gvisor", models.RuntimeGvisor, true)
+	seed("sb-wasm-plain", models.RuntimeWasm, false)
+	lc.up()
+
+	// No lease file: nothing to say.
+	svc.warnUnfencedRecreate(context.Background())
+	if logs.Len() != 0 {
+		t.Fatalf("warned with no lease file: %s", logs.String())
+	}
+
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "ownership-lease")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	svc.StartOwnershipLease(ctx)
+	out := logs.String()
+	if c := strings.Count(out, "cannot freeze alone"); c != 1 {
+		t.Fatalf("warned %d times, want once: %s", c, out)
+	}
+	if !strings.Contains(out, "count=7") {
+		t.Fatalf("want 7 counted (6 WASM, 1 isolate): %s", out)
+	}
+	for _, not := range []string{"sb-gvisor", "sb-wasm-plain"} {
+		if strings.Contains(out, not) {
+			t.Fatalf("%s named: %s", not, out)
+		}
+	}
+	line := out[strings.Index(out, "sandbox_ids="):]
+	if n := strings.Count(strings.SplitN(line, " ", 2)[0], "sb-"); n != unfencedListedIDs {
+		t.Fatalf("named %d sandboxes, want %d: %s", n, unfencedListedIDs, line)
+	}
+
+	// Only freezable ones left: nothing.
+	logs.Reset()
+	for _, id := range []string{"sb-wasm-0", "sb-wasm-1", "sb-wasm-2", "sb-wasm-3", "sb-wasm-4", "sb-wasm-5", "sb-iso"} {
+		if err := st.Delete(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc.warnUnfencedRecreate(context.Background())
+	if logs.Len() != 0 {
+		t.Fatalf("warned with every recreate sandbox freezable: %s", logs.String())
 	}
 }
 

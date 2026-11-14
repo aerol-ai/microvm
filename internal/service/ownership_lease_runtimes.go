@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -52,6 +54,41 @@ func (s *Service) leaseFreezable(chosenRuntime string) bool {
 		return s.cfg.HostProcessCgroupParent == "" || s.cfg.HostProcessCgroupParent == s.cfg.ContainerdCgroupParent
 	}
 	return true
+}
+
+// unfencedListedIDs is how many sandbox IDs warnUnfencedRecreate names.
+const unfencedListedIDs = 5
+
+// warnUnfencedRecreate logs, once when the ownership lease starts on a node
+// that writes the lease file, the local recreate-policy sandboxes on a
+// runtime the supervisor cannot freeze alone. refuseUnfencedRecreate
+// refuses new ones, but rows made before it (an upgrade) keep running here
+// unfenced: if this node loses its lease, they run on while the cluster
+// recreates them elsewhere. One listing, at start; nothing changes.
+func (s *Service) warnUnfencedRecreate(ctx context.Context) {
+	if !s.ownershipLeaseFileOn() || s.logger == nil {
+		return
+	}
+	rows, err := s.localRecreateSandboxes(ctx)
+	if err != nil {
+		return
+	}
+	var ids []string
+	n := 0
+	for _, sb := range rows {
+		if s.leaseFreezable(sb.Runtime) {
+			continue
+		}
+		n++
+		if len(ids) < unfencedListedIDs {
+			ids = append(ids, sb.ID)
+		}
+	}
+	if n == 0 {
+		return
+	}
+	s.logger.Warn("cluster: failover.policy=recreate sandboxes on a runtime the runtime supervisor cannot freeze alone (WASM, V8 isolates, or Firecracker outside the sandboxes' cgroup parent): they are not frozen if this node loses its ownership lease, and could run on while the cluster recreates them elsewhere; recreate them with failover.policy=none, or move them off this node",
+		"count", n, "sandbox_ids", strings.Join(ids, ","))
 }
 
 // refuseUnfencedRecreate refuses a failover.policy=recreate create, on a

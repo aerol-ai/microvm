@@ -208,6 +208,9 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.beginOwnershipLease(time.Now())
 	// The move fences a previous process left in the rows (R11).
 	s.rearmMoveFences(ctx)
+	// Recreate-policy sandboxes made before creates of them were refused
+	// here, on a runtime the supervisor cannot freeze alone.
+	s.warnUnfencedRecreate(ctx)
 
 	lease := cluster.OwnershipLease(s.cfg)
 	probe := max(lease/3, 10*time.Millisecond)
