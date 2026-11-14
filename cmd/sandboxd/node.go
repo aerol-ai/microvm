@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -83,6 +84,8 @@ a join command and a login line. Run install.sh first. Safe to run again.
 
 const joinUsage = `usage: sudo sandboxd join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>]
                           [--node-id <id>] [--advertise <ip>] [--role <role>]
+       sandboxd join --from-operator <url> --operator-ca <base64> --files-only
+                          [--identity-token <file>] [--node-id <id>] [--advertise <ip>] [--role <role>]
 
 Joins this machine to the cluster behind <url> (https://<server>:7003). The
 token decides the role. It checks the cluster (the CA hash, or the token's
@@ -109,6 +112,13 @@ answer.
   --files-only                write this node's files and stop: no root,
                               no systemd, no restart (a Kubernetes init
                               container); sandboxd joins as it starts
+  --from-operator <url>       a Kubernetes pod's setup, with --files-only and
+                              no <url> or --token: show the operator the
+                              pod's own ServiceAccount token and join with
+                              the single-use token it gives back
+  --operator-ca <base64>      the CA the operator's certificate chains to
+  --identity-token <file>     the pod's projected ServiceAccount token
+                              (default /var/run/aerolvm-identity/token)
 `
 
 const preflightUsage = `usage: sandboxd preflight [--join <url> --token <id.secret>] [--ca-cert-hash sha256:<hex>]
@@ -189,6 +199,8 @@ type nodeFlags struct {
 	pod, kvm                          bool
 	byCert                            bool
 	externalCA                        bool
+	fromOperator, operatorCA          string
+	identityToken                     string
 }
 
 func (f *nodeFlags) address() nodejoin.AddressOptions {
@@ -244,6 +256,9 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 		fs.StringVar(&f.token, "token", "", "")
 		fs.StringVar(&f.caHash, "ca-cert-hash", "", "")
 		fs.BoolVar(&f.byCert, "by-certificate", false, "")
+		fs.StringVar(&f.fromOperator, "from-operator", "", "")
+		fs.StringVar(&f.operatorCA, "operator-ca", "", "")
+		fs.StringVar(&f.identityToken, "identity-token", "/var/run/aerolvm-identity/token", "")
 	}
 	var positional []string
 	rest := args
@@ -276,7 +291,7 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	wantArgs := 0
-	if cmd == joinSubcommand {
+	if cmd == joinSubcommand && f.fromOperator == "" {
 		wantArgs = 1
 	}
 	if len(positional) != wantArgs {
@@ -315,15 +330,27 @@ func runNodeCLI(cmd string, args []string, stdout, stderr io.Writer) int {
 	case joinSubcommand:
 		// --by-certificate (external-CA mode) joins with the certificate in
 		// the TLS dir instead of a token.
-		if strings.TrimSpace(f.token) == "" && !f.byCert {
-			fmt.Fprintf(stderr, "sandboxd join: --token is required (or --by-certificate in external-CA mode)\n%s", usage)
+		if strings.TrimSpace(f.token) == "" && !f.byCert && f.fromOperator == "" {
+			fmt.Fprintf(stderr, "sandboxd join: --token is required (or --by-certificate in external-CA mode, or --from-operator in a Kubernetes pod)\n%s", usage)
 			return 2
 		}
-		j := &nodejoin.Joiner{Paths: paths, Host: host, Version: version.Version, Printer: printer, LocalAPI: nodeLocalAPI}
-		_, err = j.Run(ctx, nodejoin.JoinOptions{
-			URL: positional[0], Token: f.token, CACertHash: f.caHash, NodeID: f.nodeID, Advertise: f.advertise,
+		o := nodejoin.JoinOptions{
+			Token: f.token, CACertHash: f.caHash, NodeID: f.nodeID, Advertise: f.advertise,
 			Address: f.address(), WaitTimeout: f.waitTimeout, FilesOnly: f.filesOnly, ByCertificate: f.byCert,
-		})
+		}
+		if len(positional) == 1 {
+			o.URL = positional[0]
+		}
+		if f.fromOperator != "" {
+			ca, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(f.operatorCA))
+			if derr != nil || len(ca) == 0 {
+				fmt.Fprintf(stderr, "sandboxd join: --operator-ca wants the operator's CA certificate, base64\n%s", usage)
+				return 2
+			}
+			o.FromOperator = &nodejoin.OperatorJoin{URL: f.fromOperator, CA: ca, TokenFile: f.identityToken}
+		}
+		j := &nodejoin.Joiner{Paths: paths, Host: host, Version: version.Version, Printer: printer, LocalAPI: nodeLocalAPI}
+		_, err = j.Run(ctx, o)
 	case adoptSubcommand:
 		a := &nodejoin.Adopter{Paths: paths, Host: host, Printer: printer, LocalAPI: nodeLocalAPI}
 		_, err = a.Run(ctx, nodejoin.AdoptOptions{CAKeyFile: f.caKey})
