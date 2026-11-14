@@ -344,21 +344,38 @@ proof_review() {
     local Es others6
     $kc scale deploy/aerolvm-operator --replicas=0 >/dev/null
     $kc wait --for=delete pod -l app.kubernetes.io/component=operator --timeout=90s >/dev/null 2>&1
+    # It must be alive with its capacity reported, or nothing lands there.
+    for i in $(seq 1 36); do
+      members | jq -e --arg e "$E" '.[] | select(.node_id == $e and .alive and (.capacity_stale | not))' >/dev/null 2>&1 && break
+      sleep 5
+    done
     others6=$(alive_workers | grep -vx "$E")
     for w in $others6; do api -X POST "$U/v1/cluster/nodes/$w/cordon" >/dev/null; done
-    Es=$(mk '{"image":"alpine:3.20","cpu":1,"memory_mb":256}')
+    # A cordon reaches placement within seconds: a sandbox that still
+    # landed elsewhere is deleted and the create tried again.
+    for i in $(seq 1 8); do
+      sleep 5
+      Es=$(mk '{"image":"alpine:3.20","cpu":1,"memory_mb":256}')
+      [ "$(owner "$Es")" = "$E" ] && break
+      say "sandbox $Es landed on $(owner "$Es"), not $E; again"
+      api -X DELETE "$U/v1/sandboxes/$Es" >/dev/null 2>&1
+      Es=""
+    done
     for w in $others6; do api -X POST "$U/v1/cluster/nodes/$w/uncordon" >/dev/null; done
     $kc scale deploy/aerolvm-operator --replicas=1 >/dev/null
     $kc wait --for=condition=Available deploy/aerolvm-operator --timeout=180s >/dev/null 2>&1
-    say "sandbox $Es on $(owner "$Es")"
+    say "sandbox ${Es:-none} on $(owner "$Es"); kept settings before: $($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | head -c 300)"
     local idx dec="" st
     idx=$($kc get aerolcluster aerolvm -o json | jq '.spec.workerPools | map(.name) | index("eks")')
     $kc patch aerolcluster aerolvm --type=json -p "[{\"op\":\"test\",\"path\":\"/spec/workerPools/$idx/name\",\"value\":\"eks\"},{\"op\":\"remove\",\"path\":\"/spec/workerPools/$idx\"}]" >/dev/null
-    for i in $(seq 1 60); do
+    local kept=""
+    for i in $(seq 1 120); do
+      [ -z "$kept" ] && kept=$($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | grep -o '"name":"eks"[^}]*}*' | head -1)
       dec=$($kc get aerolnode "$E" -o json 2>/dev/null | jq -c '.status.decommission // empty' 2>/dev/null)
       [ -n "$dec" ] && break
-      sleep 2
+      sleep 1
     done
+    say "kept for the removed pool: ${kept:-nothing}"
     say "decommission of $E: ${dec:-none}, $(nstate "$E"); kept settings: $($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | head -c 300)"
     if [ -n "$dec" ]; then
       local cap
