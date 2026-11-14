@@ -187,6 +187,14 @@ func TestPersistSandboxCreateConfirmsFirst(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ownership-lease")
 	svc.cfg.OwnershipLeaseFile = path
 
+	// The write itself refuses a lease no read proved.
+	svc.ownershipFile.mu.Lock()
+	err := svc.writeOwnershipLeaseFileLocked(ctx)
+	svc.ownershipFile.mu.Unlock()
+	if !errors.Is(err, ErrOwnershipFenced) {
+		t.Fatalf("a write before any read: %v, want ErrOwnershipFenced", err)
+	}
+
 	lc.down()
 	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("a", true)); !errors.Is(err, ErrOwnershipFenced) {
 		t.Fatalf("create with no read and no leader: %v, want ErrOwnershipFenced", err)
