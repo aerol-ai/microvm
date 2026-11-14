@@ -206,6 +206,8 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.ownership.started = true
 	s.ownership.mu.Unlock()
 	s.beginOwnershipLease(time.Now())
+	// The move fences a previous process left in the rows (R11).
+	s.rearmMoveFences(ctx)
 
 	lease := cluster.OwnershipLease(s.cfg)
 	probe := max(lease/3, 10*time.Millisecond)
@@ -216,9 +218,6 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.startPeriodic(ctx, check, lease, func(c context.Context) {
 		s.enforceOwnershipLease(c, time.Now())
 	})
-	if s.ownershipLeaseFileOn() {
-		go s.runOwnershipLeaseFileWriter(ctx)
-	}
 }
 
 // beginOwnershipLease starts the lease clock at now: a node that has just

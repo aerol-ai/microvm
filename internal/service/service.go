@@ -3467,14 +3467,23 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if err := s.store.CreateWithSealedEnv(ctx, sandbox, sealed); err != nil {
 		return err
 	}
+	// A recreate-policy sandbox is in the lease file's fence before its
+	// create is answered (T3, R9): the answer lets the cluster recreate it
+	// elsewhere, so the runtime supervisor must already know to freeze it
+	// here if sandboxd dies. With SB_OWNERSHIP_LEASE_FILE only: one listing
+	// of this node's rows and one small file write, plus one ownership read
+	// on the first such create after a start. A fence that cannot be written
+	// fails the create, and its row goes with it.
+	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
+		if err := s.publishOwnershipFence(ctx); err != nil {
+			if rbErr := s.store.RollbackSandboxCreate(context.WithoutCancel(ctx), sandbox.ID, sandbox.AuditIncarnationID); rbErr != nil && s.logger != nil {
+				s.logger.Error("create: could not remove the row of a sandbox whose fence failed", "sandbox_id", sandbox.ID, "error", rbErr)
+			}
+			return err
+		}
+	}
 	if keepFirstCreated && s.usageEnabled() {
 		s.advanceUsageCursor(sandbox.ID, madeAt)
-	}
-	// A recreate-policy sandbox joins the lease file's fence now, not at the
-	// next read (T3). A channel send that never blocks; the file is written
-	// off this path.
-	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
-		s.kickOwnershipLeaseFile()
 	}
 	// The row is the authority from here on. Complete the lifecycle identity
 	// so audit stamps carry the tenant owner instead of the blank one the
@@ -3902,6 +3911,12 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 	}()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
+		return nil, err
+	}
+	// A row a move release fenced, which this process never saw (it
+	// restarted since): refused like any fenced sandbox until the fence in
+	// the row lapses (R11).
+	if err := s.refuseMovedRowStart(sandbox); err != nil {
 		return nil, err
 	}
 	// Sealed-env mode omits Env from store scans. Runtime paths (especially
