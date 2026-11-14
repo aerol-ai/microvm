@@ -280,7 +280,7 @@ These are environment settings on each server, not in the file:
 
 - **`SB_EGRESS_PRIVATE_DEFAULT_CIDRS`:** more ranges to treat like the private ones, such as a cluster's pod, Service and node ranges. A sandbox with no policy cannot reach them, and a policy or profile that allows one of them opens it on purpose. Needs `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true`. Empty by default.
 
-  The server refuses to start if either list has a bad entry. On a server with the website-name filter, put both lists in `/etc/sandboxd/egress-gateway.env` too, with the same values: the filter connects for sandboxes itself. The [Kubernetes chart](/kubernetes/#keep-sandboxes-off-your-network) sets them in both places for you.
+  The server refuses to start if either list has a bad entry. On a server with the website-name filter, put both lists in `/etc/sandboxd/egress-gateway.env` too, with the same values: the filter connects for sandboxes itself. The [Kubernetes chart](/kubernetes/networking/#keep-sandboxes-off-your-network) sets them in both places for you.
 
 - **`SB_SANDBOX_NODE_PORTS_ALLOW`:** extra ports of the server that every sandbox on it may reach, such as `8080,5353/udp`. Empty by default. It cannot open AerolVM's own ports or SSH, and it is refused in enterprise mode: run a service sandboxes need on another machine.
 

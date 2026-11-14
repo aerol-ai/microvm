@@ -242,9 +242,12 @@ narrow: only the worker pods' `runtime` and `agent` containers are privileged.
 container.
 
 If you also run your own pod-security policies (Kyverno, Gatekeeper), exempt
-exactly this: pods labelled `app.kubernetes.io/name=aerolvm`,
-`app.kubernetes.io/component=worker`, in the worker namespace, containers
-`runtime` and `agent`, for `privileged`.
+pods labelled `app.kubernetes.io/name=aerolvm`,
+`app.kubernetes.io/component=worker`, in the worker namespace, and only these
+containers: `runtime` and `agent` for `privileged`; `egress` for running as
+root and adding `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP` (it starts as
+root only to drop to user 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`); and
+the `setup` init container for running as root (all capabilities dropped).
 
 **Signed images.** `examples/kyverno-signed-images.yaml` in this chart is a
 Kyverno policy that refuses any pod in the two AerolVM namespaces whose image

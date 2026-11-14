@@ -47,7 +47,7 @@ const clusterPages = [
     ['security', 'Keep it safe'],
     ['troubleshooting', 'Fix problems'],
     ['cheat-sheet', 'Command cheat sheet'],
-    ['kubernetes', 'Coming from Kubernetes'],
+    ['kubernetes', 'If you know kubeadm'],
   ].map(([id, label]) => link(`/cluster/${id}`, label)),
   ...[
     ['/cluster-ingress', 'Ingress nodes'],
@@ -58,6 +58,21 @@ const clusterPages = [
     ['/reconcile', 'Reconcile'],
     ['/cluster-glossary', 'Glossary'],
   ].map(([href, label]) => ({ ...link(href, label), reference: true })),
+]
+
+// The Kubernetes guide works the same way: one entry, its pages in reading
+// order (single mode, then production, then what you do after), and the
+// values reference last, out of "Next".
+const kubernetesPages = [
+  ...[
+    ['single-node', 'Single mode (quick start)'],
+    ['production', 'Production install'],
+    ['networking', 'HTTPS and networking'],
+    ['security', 'Security'],
+    ['operations', 'Operate'],
+    ['kubectl', 'kubectl and agent-sandbox'],
+  ].map(([id, label]) => link(`/kubernetes/${id}`, label)),
+  { ...link('/kubernetes/values', 'Helm values'), reference: true },
 ]
 
 // Every docs page appears exactly once, in reading order: pagination walks
@@ -74,10 +89,8 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       // link('/quick-start', 'Quickstart'),
       link('/getting-started/local-setup', '- Local Setup'),
       link('/getting-started/single-node-setup', '- Single Node Cloud Setup'),
-      link('/kubernetes', '- Kubernetes'),
-      link('/kubernetes-cluster', '- Kubernetes Cluster Mode'),
-      link('/kubernetes-api', '- Kubernetes API (kubectl)'),
       { ...link('/cluster', '- Cluster Setup'), children: clusterPages },
+      { ...link('/kubernetes', '- Kubernetes'), children: kubernetesPages },
     ],
   },
   {
