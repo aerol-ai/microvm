@@ -87,29 +87,37 @@ func TestWireEgressFloorFile(t *testing.T) {
 
 	prev := egresspolicy.FileFloor()
 	t.Cleanup(func() { egresspolicy.SetFileFloor(prev) })
+	egresspolicy.SetFileFloor(nil)
 	prevPoll := floorFilePoll
 	floorFilePoll = 5 * time.Millisecond
 	t.Cleanup(func() { floorFilePoll = prevPoll })
 	path := filepath.Join(t.TempDir(), "deny-floor")
-	if err := os.WriteFile(path, []byte("172.18.0.2\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("203.0.113.2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	svc := service.New(config.Config{}, log, nil, nil, nil, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	wireEgressFloorFile(ctx, config.Config{EgressDenyFloorFile: path}, svc, log)
-	if err := os.WriteFile(path+".new", []byte("172.18.0.44\n"), 0o644); err != nil {
+	waitFloor := func(addr string) {
+		t.Helper()
+		target := egresspolicy.DialTarget{Addr: netip.MustParseAddrPort(addr)}
+		deadline := time.Now().Add(5 * time.Second)
+		for pkgisolate.EgressDialGuard().Check(nil, target) == nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("isolate still dials %s", addr)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitFloor("203.0.113.2:443")
+	if err := os.WriteFile(path+".new", []byte("203.0.113.44\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(path+".new", path); err != nil {
 		t.Fatal(err)
 	}
-	target := egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("172.18.0.44:443")}
-	deadline := time.Now().Add(5 * time.Second)
-	for pkgisolate.EgressDialGuard().Check(nil, target) == nil {
-		if time.Now().After(deadline) {
-			t.Fatal("isolate still dials the API server's new address")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	// The API server's new address (public test addresses: a strict
+	// isolate guard refuses every private one anyway).
+	waitFloor("203.0.113.44:443")
 }
