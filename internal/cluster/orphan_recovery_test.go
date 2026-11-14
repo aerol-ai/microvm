@@ -338,6 +338,109 @@ func TestOrphanRetryBoundsAWalkThatFindsNoRoom(t *testing.T) {
 	}
 }
 
+// Creates keep landing while a backlog drains: each pass gives the leader
+// back the rest of its tick, so a create waits at most about one pass's
+// budget behind recovery, not the whole drain.
+func TestOrphanRetryLeavesRoomForCreates(t *testing.T) {
+	c, cleanup := newTestClusterWithRole(t, "srv-recovery-creates", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	quietOrphanLoop(c)
+	const n = 300
+	for i := range n {
+		placeFailoverPlacement(t, c, fmt.Sprintf("sb-backlog-%03d", i), "lost-zone")
+	}
+	if err := c.applyCommand(context.Background(), command{Op: opOrphanOwner, NodeID: "lost-zone"}); err != nil {
+		t.Fatal(err)
+	}
+	var room []Member
+	for i := range 6 {
+		room = append(room, recreateCandidate(fmt.Sprintf("room-%d", i), config.NodeRoleWorker, 512))
+	}
+	seedGossipView(t, c, room)
+	c.cfg.ClusterOrphanRetryRate = 100
+
+	// Foreground creates, one after another, for as long as the drain runs.
+	stop := make(chan struct{})
+	type result struct {
+		n       int
+		slowest time.Duration
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var r result
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				done <- r
+				return
+			default:
+			}
+			started := time.Now()
+			err := c.applyCommand(context.Background(), command{Op: opPlace, SandboxID: fmt.Sprintf("sb-create-%04d", i),
+				OwnerNodeID: "room-0", IncarnationID: fmt.Sprintf("inc-create-%04d", i), Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+			if err != nil {
+				r.err = err
+				done <- r
+				return
+			}
+			r.n++
+			r.slowest = max(r.slowest, time.Since(started))
+		}
+	}()
+	passes := 0
+	for c.fsm.orphanedRecoveryLen() > 0 && passes < 30 {
+		c.retryOrphanedRecoveries(context.Background())
+		passes++
+	}
+	close(stop)
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("a create failed during the drain: %v", r.err)
+	}
+	if c.fsm.orphanedRecoveryLen() != 0 {
+		t.Fatalf("%d orphans left after %d passes", c.fsm.orphanedRecoveryLen(), passes)
+	}
+	if r.n == 0 || r.slowest > orphanRetryBudget+2*time.Second {
+		t.Fatalf("creates during the drain: %d, slowest %s", r.n, r.slowest)
+	}
+	t.Logf("%d orphans moved in %d passes alongside %d creates (slowest %s)", n, passes, r.n, r.slowest)
+}
+
+// The index keeps one entry per row: the same orphan time again changes
+// nothing, a new one re-keys it, and a machine without an index (a zero
+// value) answers empty. A row gone before its retry is skipped.
+func TestOrphanedRecoveryKeyUpdates(t *testing.T) {
+	var f placementFSM
+	f.dropOrphanedRecoveryLocked("sb")
+	if _, ok := f.orphanedRecoveryOldest(); ok {
+		t.Fatal("a zero-value machine has an oldest orphan")
+	}
+	orphan := func(unix int64) Placement {
+		return Placement{OwnerState: PlacementOwnerStateOrphaned, FailoverRecreate: true, OrphanedUnix: unix}
+	}
+	f.indexOrphanedRecoveryLocked("sb", orphan(5))
+	f.indexOrphanedRecoveryLocked("sb", orphan(5))
+	f.indexOrphanedRecoveryLocked("sb", orphan(9))
+	keys, _ := f.orphanedRecoveryPage(orphanKey{}, 10)
+	if len(keys) != 1 || keys[0] != (orphanKey{9, "sb"}) || f.orphanedRecoveryKeys["sb"] != 9 {
+		t.Fatalf("keys %v, map %v", keys, f.orphanedRecoveryKeys)
+	}
+	f.indexOrphanedRecoveryLocked("sb", Placement{OwnerNodeID: "back"})
+	if f.orphanedRecoveryLen() != 0 || len(f.orphanedRecoveryKeys) != 0 {
+		t.Fatalf("a row with an owner is still indexed: %d", f.orphanedRecoveryLen())
+	}
+
+	c, cleanup := newTestClusterWithRole(t, "srv-recovery-gone", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	quietOrphanLoop(c)
+	if moved, stop := c.retryOrphan(context.Background(), "sb-never-placed", time.Now()); moved || stop {
+		t.Fatalf("a missing row: moved %v stop %v", moved, stop)
+	}
+}
+
 // The loop's tick passes on the leader only; a server that is not the
 // leader forgets its place, so a new leader starts from the oldest. An
 // empty backlog still publishes its gauges.
