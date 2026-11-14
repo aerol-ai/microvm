@@ -54,3 +54,31 @@ gh attestation verify oci://ghcr.io/aerol-ai/aerolvm@sha256:<digest> \
 `gh` reads the image from ghcr.io with its own token, which needs the `read:packages` scope (`gh auth refresh -s read:packages`). Without it, check the image's manifest as a file instead: fetch it anonymously by its digest, check its SHA-256 equals the digest, and run `gh attestation verify <manifest file> --repo aerol-ai/microvm`.
 
 Repeat for `aerolvm-runtime`, `aerolvm-edge` and `aerolvm-operator`. To have Kubernetes refuse any AerolVM pod whose image fails this check, apply the example admission policy in `charts/aerolvm/examples/kyverno-signed-images.yaml`. The third-party programs in the images (containerd, runc, gVisor, the CNI plugins) are downloaded at build time and checked against hashes pinned in `packaging/images/versions.env`.
+
+## Helm chart
+
+From the first release after v0.7.3, each release also publishes the Helm chart as an OCI artifact, `ghcr.io/aerol-ai/charts/aerolvm`. Its version is the release number without the `v` (release `v1.2.3` is chart `1.2.3`), and it runs that release's images by default. It is published only after the images, with a keyless cosign signature and GitHub's build provenance, like the images.
+
+1. Download the chart. `helm pull` saves `aerolvm-1.2.3.tgz` and prints its digest:
+
+```bash
+helm pull oci://ghcr.io/aerol-ai/charts/aerolvm --version 1.2.3
+```
+
+2. Check the signature, with the same identity as the images:
+
+```bash
+cosign verify ghcr.io/aerol-ai/charts/aerolvm@sha256:<digest> \
+  --certificate-identity-regexp '^https://github.com/aerol-ai/microvm/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+3. Check the provenance:
+
+```bash
+gh attestation verify oci://ghcr.io/aerol-ai/charts/aerolvm@sha256:<digest> \
+  --repo aerol-ai/microvm \
+  --signer-workflow aerol-ai/microvm/.github/workflows/release.yml
+```
+
+Then install the file you checked, not the registry tag, so nothing can change in between: `helm install aerolvm ./aerolvm-1.2.3.tgz`.

@@ -43,6 +43,7 @@ gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>
 - **The workflow runs the tests, builds every binary and attaches the files.** Until it finishes, the release has no downloads and the previous release stays latest. If the workflow fails, the previous release stays latest until a rerun succeeds. If a test fails for a timing reason, rerun the failed jobs with `gh run rerun <run id> --failed`.
 - **Re-running the workflow for an older release does not make it latest.** Only the newest stable release becomes latest. A prerelease never does.
 - **The workflow also copies the files to the download mirror,** in its `mirror` job: see "The download mirror" below.
+- **The workflow publishes the Helm chart** to `oci://ghcr.io/aerol-ai/charts/aerolvm`, in its `chart` job, after the images. Its version is the tag without the `v`, and its `appVersion` is stamped from the tag. **Once, after the first release that publishes it,** make the package public: GitHub creates a new package private, and `helm install` then fails for everyone outside the org. In the org's Packages, open `charts/aerolvm`, then Package settings, then Change visibility to Public. Check it with `gh api /orgs/aerol-ai/packages/container/charts%2Faerolvm --jq .visibility`.
 
 ## 3. Check the download mirror
 

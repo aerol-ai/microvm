@@ -494,6 +494,64 @@ jobs:
           subject-digest: ${{ env.OPERATOR_DIGEST }}
           push-to-registry: true
 
+  # The Helm chart as an OCI artifact, ghcr.io/aerol-ai/charts/aerolvm, so
+  # an install is `helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm
+  # --version 1.2.3` with no clone. It waits for the images: a chart that
+  # names images not yet pushed would install pods stuck pulling. The chart's
+  # version is the release's number (v1.2.3 -> 1.2.3, SemVer), and its
+  # appVersion is set to the tag at packaging, so the published chart always
+  # runs its own release's images, even when Chart.yaml lags (v0.7.2 and
+  # v0.7.3 shipped Chart.yaml on v0.7.1). Signed and attested like the images.
+  chart:
+    name: Helm chart
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      CHART_REPO: ghcr.io/aerol-ai/charts
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The same pinned Helm the chart's CI checks use (test.yml).
+      - name: Install Helm
+        run: |
+          curl -fsSL -o helm.tgz https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          echo "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+
+      - name: Package and push
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chart_version="${VERSION#v}"
+          helm package charts/aerolvm --version "$chart_version" --app-version "$VERSION" --destination chart-dist
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GHCR_USER" --password-stdin
+          helm push "chart-dist/aerolvm-$chart_version.tgz" "oci://$CHART_REPO" 2>&1 | tee push.log
+          digest="$(sed -n 's/^Digest: *//p' push.log)"
+          [[ "$digest" == sha256:* ]] || { echo "::error::helm push printed no digest"; exit 1; }
+          echo "CHART_DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign
+        run: cosign sign --yes "$CHART_REPO/aerolvm@$CHART_DIGEST"
+
+      - name: Attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/charts/aerolvm
+          subject-digest: ${{ env.CHART_DIGEST }}
+          push-to-registry: true
+
   release:
     name: Publish release
     needs: [hold-latest, build, cli]

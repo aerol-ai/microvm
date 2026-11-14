@@ -166,6 +166,9 @@ jobs:
               # every setting in the chart's values.yaml.
               - 'charts/aerolvm/values.yaml'
               - 'docs/src/content/docs/kubernetes/values.mdx'
+              # helm_chart_release_test checks the guide names the chart
+              # reference release.yml publishes.
+              - 'docs/src/content/docs/kubernetes/index.mdx'
             # The Helm chart, the images and the runtime supervisor: the
             # kubernetes job lints the chart and runs it on kind.
             kubernetes:

@@ -7,7 +7,7 @@ import { Aside } from '@astrojs/starlight/components';
 
 This page is for the person who signs off the install. It sums up what each pod may do and why, and ends with one command that checks a live install against all of it.
 
-The full record is the chart's **evidence pack**, [`charts/aerolvm/EVIDENCE.md`](https://github.com/aerol-ai/microvm/blob/main/charts/aerolvm/EVIDENCE.md): every pod's rights, the network walls, the data flows and the threat model. Hand it to your security team.
+The full record is the chart's **evidence pack**, [`EVIDENCE.md`](https://github.com/aerol-ai/microvm/blob/main/charts/aerolvm/EVIDENCE.md): every pod's rights, the network walls, the data flows and the threat model. Hand it to your security team.
 
 ## What each pod may do
 
@@ -99,13 +99,13 @@ What changes:
 A certificate from your issuer that names a node and a role is a pass into the cluster. Limit who can get one in two places:
 
 1. **RBAC.** Only the operator may create `Certificate` objects in `aerolvm-system` and `aerolvm-workers`. The chart grants it that right in external-CA mode only. Grant it to no one else.
-2. **Your issuer.** Sign these names only for those two namespaces. With cert-manager's [approver-policy](https://cert-manager.io/docs/policy/approval/approver-policy/), apply `charts/aerolvm/examples/approver-policy-external-ca.yaml`. Turn off cert-manager's own approval first (`disableAutoApproval: true` in its Helm values), or it approves every request before the policy is read.
+2. **Your issuer.** Sign these names only for those two namespaces. With cert-manager's [approver-policy](https://cert-manager.io/docs/policy/approval/approver-policy/), apply the chart's `examples/approver-policy-external-ca.yaml` ([unpack the chart](/kubernetes/#get-the-chart) to get it). Turn off cert-manager's own approval first (`disableAutoApproval: true` in its Helm values), or it approves every request before the policy is read.
 
 ## Signed images
 
-All four images are signed keyless by AerolVM's release workflow, with an SBOM and build provenance. [`RELEASE-VERIFICATION.md`](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) shows the `cosign verify` command and the identity to expect. In production, run images by digest.
+All four images and the chart itself are signed keyless by AerolVM's release workflow, with build provenance; the images also carry an SBOM. [`RELEASE-VERIFICATION.md`](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) shows the `cosign verify` command and the identity to expect. In production, run images by digest.
 
-To make Kubernetes refuse any AerolVM pod whose image the release workflow did not sign, apply `charts/aerolvm/examples/kyverno-signed-images.yaml` (Kyverno 1.15 or later). It also pins each image to the digest it checked.
+To make Kubernetes refuse any AerolVM pod whose image the release workflow did not sign, apply the chart's `examples/kyverno-signed-images.yaml` (Kyverno 1.15 or later). It also pins each image to the digest it checked.
 
 ## The metadata service
 

@@ -47,10 +47,11 @@ edge:
 ```
 
 ```bash title="Your machine"
-helm upgrade aerolvm charts/aerolvm --namespace <namespace> --reuse-values -f values.yaml
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+  --namespace <namespace> --reuse-values -f values.yaml
 ```
 
-`--reuse-values` is safe here because the chart does not change. When you move to a newer chart, pass your full values file instead.
+Pass the `--version` you already run. `--reuse-values` is safe only while the chart stays the same; when you move to a newer chart, pass your full values file instead.
 
 In cluster mode, also set the gateways' Service back to a load balancer, if you made it `ClusterIP` during the [production install](/kubernetes/production/#step-2-write-the-values-file). Add your cloud's annotations for an internal one:
 
