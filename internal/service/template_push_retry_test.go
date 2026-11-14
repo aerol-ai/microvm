@@ -33,6 +33,7 @@ type fakeTemplatePushStore struct {
 	completeErr error
 	releaseErr  map[string]error
 	retirements []storepkg.SnapshotRegistryRetirement
+	retireErr   error
 }
 
 func newFakeTemplatePushStore() *fakeTemplatePushStore {
@@ -550,6 +551,9 @@ func TestTemplatePushFencedCompletionWritesNothing(t *testing.T) {
 func (f *fakeTemplatePushStore) ScheduleSnapshotRegistryRetirement(_ context.Context, r storepkg.SnapshotRegistryRetirement) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.retireErr != nil {
+		return f.retireErr
+	}
 	f.retirements = append(f.retirements, r)
 	return nil
 }

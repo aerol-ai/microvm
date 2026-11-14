@@ -82,6 +82,26 @@ func TestDeleteTemplateRetirementIsAtomicWithTheDelete(t *testing.T) {
 	}
 }
 
+// A row that cannot be read is neither deleted nor retired.
+func TestDeleteTemplateRetiringRegistryCopyUnreadableRow(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	seedPushedTemplate(t, st, "tpl-1", retireTemplateRef, retireOld, models.TemplatePushStateActive)
+	if _, err := st.db.Exec(`ALTER TABLE firecracker_templates DROP COLUMN push_digest`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteTemplateRetiringRegistryCopy(ctx, "tpl-1"); err == nil {
+		t.Fatal("delete succeeded without reading the row")
+	}
+	var n int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM firecracker_templates WHERE id = 'tpl-1'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("rows = %d, %v; want the row kept", n, err)
+	}
+	if due := dueRetirements(t, st); len(due) != 0 {
+		t.Fatalf("obligation without its delete: %+v", due)
+	}
+}
+
 // A template row that names a manifest makes its obligation void, and a
 // template with a push still to land makes an obligation under its id wait.
 func TestSnapshotRegistryCopyInUseSeesTemplates(t *testing.T) {

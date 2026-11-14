@@ -75,6 +75,39 @@ func TestCleanupOrphanWarmSlot(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "a slot that never had a run dir",
+			setup: func(t *testing.T, f *driverFixture) vmmpool.Slot {
+				f.pool.slots["vmms-a"] = &TapSlot{TapName: "fctap7"}
+				return vmmpool.Slot{ID: "vmms-a"}
+			},
+			wantTapRemove: 1,
+		},
+		{
+			name: "the run dir cannot be removed",
+			setup: func(t *testing.T, f *driverFixture) vmmpool.Slot {
+				slot := orphanSlot(t, f, "vmms-a", true)
+				// A read-only directory inside refuses its file's removal,
+				// as a root-owned jail tree does for sandboxd's user.
+				locked := filepath.Join(slot.RunDir, "jail")
+				if err := os.MkdirAll(locked, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(locked, "f"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(locked, 0o555); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+				if f, err := os.CreateTemp(locked, "probe"); err == nil {
+					_ = f.Close()
+					t.Skip("running as root: a read-only directory does not refuse changes")
+				}
+				return slot
+			},
+			wantErr: true,
+		},
+		{
 			name: "a run dir outside the root",
 			setup: func(t *testing.T, f *driverFixture) vmmpool.Slot {
 				slot := orphanSlot(t, f, "vmms-a", true)
@@ -103,6 +136,9 @@ func TestCleanupOrphanWarmSlot(t *testing.T) {
 			}
 			if f.tapHost.removeCalls != tc.wantTapRemove {
 				t.Fatalf("TAP removes = %d, want %d", f.tapHost.removeCalls, tc.wantTapRemove)
+			}
+			if slot.RunDir == "" {
+				return
 			}
 			_, statErr := os.Stat(slot.RunDir)
 			if gone := os.IsNotExist(statErr); gone != tc.wantDirGone {
@@ -151,10 +187,35 @@ func TestWarmSocketAnswers(t *testing.T) {
 	if answers, err := warmSocketAnswers(path); !answers || err != nil {
 		t.Fatalf("listening socket = %v, %v; want a VM", answers, err)
 	}
+	// A socket this user may not connect to is an unknown answer, not "no
+	// VM": the reaper must not remove a run dir it cannot see into.
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if answers, err := warmSocketAnswers(path); os.Getuid() != 0 && (answers || err == nil) {
+		t.Fatalf("socket with no access = %v, %v; want an unknown answer", answers, err)
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	// A socket file left behind with no listener refuses connections.
 	ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	_ = ln.Close()
 	if answers, err := warmSocketAnswers(path); answers || err != nil {
 		t.Fatalf("stale socket = %v, %v; want no VM", answers, err)
+	}
+
+	// A regular file where the socket should be is no VM.
+	plain := filepath.Join(dir, "plain")
+	if err := os.WriteFile(plain, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if answers, err := warmSocketAnswers(plain); answers || err != nil {
+		t.Fatalf("regular file = %v, %v; want no VM", answers, err)
+	}
+	// A path that cannot be looked at (a file in place of its directory)
+	// is an unknown answer.
+	if answers, err := warmSocketAnswers(filepath.Join(plain, "api.sock")); answers || err == nil {
+		t.Fatalf("unreadable path = %v, %v; want an unknown answer", answers, err)
 	}
 }
