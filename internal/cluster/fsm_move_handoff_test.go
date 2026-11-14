@@ -409,6 +409,56 @@ func TestAgentAbortMoveHandoff(t *testing.T) {
 	}
 }
 
+// The worker's gate and the leader's agree on every view: an old worker
+// beside new servers leaves handoffs on for both, an old server turns them
+// off for both. A worker that still required every live member (the bug
+// before) answers "off" beside an old worker while the leader answers
+// "on", and fails the first row.
+func TestMoveHandoffGateAgreesAcrossSides(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestClusterWithCfg(t, "ldr-handoff-agree", true, nil, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	self, _ := c.gossip.lookupMember(c.nodeID)
+	fv := moveHandoffFSMOpsVersion
+	server := func(id string, v int) Member {
+		return Member{NodeID: id, Alive: true, Role: config.NodeRoleServer, InternalURL: "http://" + id, FSMOpsVersion: v}
+	}
+	worker := func(id string, v int) Member {
+		return Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, InternalURL: "http://" + id, FSMOpsVersion: v}
+	}
+	for _, tc := range []struct {
+		name string
+		// others is the view beside this leader (for the leader) and
+		// beside it and this worker (for the worker).
+		others []Member
+		want   bool
+	}{
+		{"an old worker beside new servers", []Member{server("srv-2", fv), worker("wkr-old", fv-1)}, true},
+		{"an old server", []Member{server("srv-old", fv-1), worker("wkr-2", fv)}, false},
+		{"every node new", []Member{server("srv-2", fv), worker("wkr-2", fv)}, true},
+		{"an old server that is down", []Member{server("srv-2", fv), {NodeID: "srv-gone", Role: config.NodeRoleServer, InternalURL: "http://srv-gone", FSMOpsVersion: fv - 1}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seedGossipView(t, c, append([]Member{self}, tc.others...))
+			index := newGossipMemberIndex()
+			for _, m := range append([]Member{self, worker("wkr-self", fv)}, tc.others...) {
+				index.upsert(m)
+			}
+			agent := &Agent{nodeID: "wkr-self", gossip: &gossipNode{}}
+			agent.gossip.setMemberIndex(index)
+			if got := agent.moveHandoffReplicated(); got != tc.want {
+				t.Fatalf("worker gate = %v, want %v", got, tc.want)
+			}
+			if got := c.moveHandoffReplicated(); got != tc.want {
+				t.Fatalf("leader gate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // The leader's side of the same gate: an old worker does not stop it
 // opening handoffs (a source beside it still aborts, above), and an old
 // server does, even before Raft has it as a member (a source beside it
