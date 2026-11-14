@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // survivor is a server node with a Raft log, stopped.
@@ -278,4 +280,88 @@ func TestRecoverQuorumRejoin(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A log SB_RAFT_WAL_DIR put on a disk of its own goes aside with its Raft
+// directory, under the same name; if the directory cannot move, the log is
+// put back, so the node never keeps a Raft directory without its log.
+func TestRecoverQuorumRejoinMovesALogOnItsOwnDisk(t *testing.T) {
+	setup := func(t *testing.T) (node, string) {
+		own := filepath.Join(t.TempDir(), "disk", "raft-wal")
+		n := survivor(t, "SB_RAFT_WAL_DIR="+own+"\n")
+		write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), own+"\n")
+		write(t, filepath.Join(own, "wal-meta.db"), "meta")
+		return n, own
+	}
+	t.Run("moved aside together", func(t *testing.T) {
+		n, own := setup(t)
+		res, out, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true})
+		if err != nil {
+			t.Fatalf("rejoin: %v\n%s", err, out)
+		}
+		if res.MovedAsideLog != own+".pre-rejoin.1762500000" || res.MovedAside != filepath.Join(n.lib, "raft.pre-rejoin.1762500000") {
+			t.Fatalf("moved aside %+v\n%s", res, out)
+		}
+		if exists(own) || read(t, filepath.Join(res.MovedAsideLog, "wal-meta.db")) != "meta" || !strings.Contains(out, "its log") {
+			t.Fatalf("the log was not moved aside:\n%s", out)
+		}
+		// A second rejoin in the same second takes a name free for both.
+		write(t, filepath.Join(n.lib, "raft", "raft-stable.bolt"), "new")
+		write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), own+"\n")
+		write(t, filepath.Join(own, "wal-meta.db"), "meta2")
+		res, _, err = recoverQuorum(t, n, QuorumOptions{Rejoin: true})
+		if err != nil || res.MovedAsideLog != own+".pre-rejoin.1762500000.1" || res.MovedAside != filepath.Join(n.lib, "raft.pre-rejoin.1762500000.1") {
+			t.Fatalf("second rejoin %+v %v", res, err)
+		}
+	})
+	t.Run("put back when the directory cannot move", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root renames in a read-only directory")
+		}
+		n, own := setup(t)
+		if err := os.Chmod(n.lib, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(n.lib, 0o700) })
+		if _, out, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true}); err == nil {
+			t.Fatalf("rejoin moved a directory it could not:\n%s", out)
+		}
+		if read(t, filepath.Join(own, "wal-meta.db")) != "meta" {
+			t.Fatal("the log was left aside")
+		}
+	})
+	t.Run("a log that cannot move stops the rejoin", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root renames in a read-only directory")
+		}
+		n, own := setup(t)
+		disk := filepath.Dir(own)
+		if err := os.Chmod(disk, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(disk, 0o700) })
+		_, _, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true})
+		if err == nil || !strings.Contains(err.Error(), "not the disk's mount point") {
+			t.Fatalf("rejoin = %v; want the log's move refused", err)
+		}
+		if !exists(filepath.Join(n.lib, "raft")) || read(t, filepath.Join(own, "wal-meta.db")) != "meta" {
+			t.Fatal("something moved although the log could not")
+		}
+	})
+	t.Run("a log directory already gone", func(t *testing.T) {
+		n, own := setup(t)
+		if err := os.RemoveAll(own); err != nil {
+			t.Fatal(err)
+		}
+		if res, out, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true}); err != nil || res.MovedAsideLog != "" || res.MovedAside == "" {
+			t.Fatalf("rejoin %+v %v\n%s", res, err, out)
+		}
+	})
+	t.Run("a bad record", func(t *testing.T) {
+		n, _ := setup(t)
+		write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), "relative\n")
+		if _, _, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true}); err == nil || !exists(filepath.Join(n.lib, "raft")) {
+			t.Fatalf("rejoin with a bad record = %v; want refused, nothing moved", err)
+		}
+	})
 }

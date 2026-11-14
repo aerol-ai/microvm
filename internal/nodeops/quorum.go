@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // peersFile is the file sandboxd's Raft setup reads at boot for lost-quorum
@@ -67,6 +69,9 @@ type QuorumResult struct {
 	Applied string
 	// MovedAside is the stale Raft directory a rejoin kept.
 	MovedAside string
+	// MovedAsideLog is its log, kept beside its own directory when
+	// SB_RAFT_WAL_DIR put it on a disk of its own.
+	MovedAsideLog string
 }
 
 // peer is one server in peers.json, in the script's field order.
@@ -188,16 +193,42 @@ func rejoin(ctx context.Context, o QuorumOptions, node Node) (QuorumResult, erro
 		// moved away.
 		return res, fmt.Errorf("%s holds no Raft data; is this the right --raft-dir?", o.RaftDir)
 	}
+	// A log SB_RAFT_WAL_DIR put on a disk of its own goes aside with its
+	// directory, under the same name: left in place, it is a log the new
+	// Raft directory does not name, and sandboxd refuses to start on it.
+	walDir, err := raftlogdir.Recorded(o.RaftDir)
+	if err != nil {
+		return res, err
+	}
+	if walDir != "" && !exists(walDir) {
+		walDir = ""
+	}
 	if exists(o.RaftDir) {
-		aside := fmt.Sprintf("%s.pre-rejoin.%d", o.RaftDir, o.now().Unix())
-		for i := 1; exists(aside); i++ {
-			aside = fmt.Sprintf("%s.pre-rejoin.%d.%d", o.RaftDir, o.now().Unix(), i)
+		stamp := fmt.Sprintf(".pre-rejoin.%d", o.now().Unix())
+		suffix := stamp
+		for i := 1; exists(o.RaftDir+suffix) || (walDir != "" && exists(walDir+suffix)); i++ {
+			suffix = fmt.Sprintf("%s.%d", stamp, i)
 		}
+		if walDir != "" {
+			if err := os.Rename(walDir, walDir+suffix); err != nil {
+				return res, fmt.Errorf("move the Raft log aside: %w (SB_RAFT_WAL_DIR must be a directory on its disk, not the disk's mount point)", err)
+			}
+			res.MovedAsideLog = walDir + suffix
+		}
+		aside := o.RaftDir + suffix
 		if err := os.Rename(o.RaftDir, aside); err != nil {
+			if walDir != "" {
+				// Back as it was: a Raft directory without its log is worse
+				// than one not moved at all.
+				_ = os.Rename(walDir+suffix, walDir)
+			}
 			return res, err
 		}
 		res.MovedAside = aside
 		fmt.Fprintf(o.Out, "moved aside: %s -> %s (keep it until the cluster is healthy and backed up)\n", o.RaftDir, aside)
+		if walDir != "" {
+			fmt.Fprintf(o.Out, "moved aside: %s -> %s, its log\n", walDir, res.MovedAsideLog)
+		}
 	} else {
 		fmt.Fprintf(o.Out, "%s does not exist; nothing to move aside\n", o.RaftDir)
 	}
@@ -205,7 +236,7 @@ func rejoin(ctx context.Context, o QuorumOptions, node Node) (QuorumResult, erro
 		fmt.Fprintln(o.Out, "start sandboxd: it rejoins through gossip and the leader adds it as a voter")
 		return res, nil
 	}
-	_, err := startAndWait(ctx, o.Host, o.Out, node.HealthURL, o.Timeout, o.poll)
+	_, err = startAndWait(ctx, o.Host, o.Out, node.HealthURL, o.Timeout, o.poll)
 	return res, err
 }
 

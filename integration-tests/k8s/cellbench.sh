@@ -46,6 +46,18 @@ victim_sandboxes="${AEROL_BENCH_VICTIM_SANDBOXES:-1000}"
 steps="${AEROL_BENCH_STEPS:-32 128 512}"
 step_seconds="${AEROL_BENCH_STEP_SECONDS:-120}"
 profile_step="${AEROL_BENCH_PROFILE_STEP:-}"
+# AEROL_BENCH_SERVER_WAL_DISK: a second volume on each server holding only
+# the Raft log (SB_RAFT_WAL_DIR), to tell the log's own fsyncs from the
+# other writes on the root disk (snapshots, recovery blobs). "1" is gp3 like the root volume;
+# "gp3:<iops>" is gp3 with that many IOPS at its floor's 125 MB/s;
+# "io2:<iops>" is an io2 volume (EBS's low-latency type) of that many IOPS.
+wal_disk=""
+case "${AEROL_BENCH_SERVER_WAL_DISK:-}" in
+  "") ;;
+  gp3:*) wal_disk="VolumeType=gp3,Iops=${AEROL_BENCH_SERVER_WAL_DISK#gp3:},Throughput=125" ;;
+  io2:*) wal_disk="VolumeType=io2,Iops=${AEROL_BENCH_SERVER_WAL_DISK#io2:}" ;;
+  *) wal_disk="VolumeType=gp3,Iops=${AEROL_BENCH_SERVER_IOPS:-3000},Throughput=${AEROL_BENCH_SERVER_MBPS:-$([[ -n "${AEROL_BENCH_SERVER_IOPS:-}" ]] && echo 1000 || echo 125)}" ;;
+esac
 (( per <= 61 )) || { echo "cellbench: at most 61 stand-ins per machine (4 × /28, and machine 1 also holds the 3 gateways)" >&2; exit 2; }
 (( machines <= 15 )) || { echo "cellbench: at most 15 worker machines (their prefixes sit in one /20)" >&2; exit 2; }
 region=us-east-1
@@ -203,9 +215,30 @@ else
   until tok="\$(curl -fsS http://$s1:8080/token-$1)" && [ -n "\$tok" ]; do sleep 2; done
   until sandboxd join https://$s1:7003 --token "\$tok" --role server --node-id $1 --advertise $2 --files-only; do sleep 5; done
 fi
+# The Raft directory init or join chose (cluster.env), where raft-wal lives.
+raft_dir=\$(. /etc/sandboxd/sandboxd.env; [ -s /etc/sandboxd/cluster.env ] && . /etc/sandboxd/cluster.env; echo "\${SB_RAFT_DATA_DIR:-/var/lib/sandboxd/db/raft}")
+EOF
+  [[ -n "$wal_disk" ]] && cat <<EOF
+# The Raft log on its own volume (AEROL_BENCH_SERVER_WAL_DISK): the launch's
+# second disk, named by SB_RAFT_WAL_DIR before sandboxd first opens the log.
+root_disk=\$(lsblk -no PKNAME "\$(findmnt -no SOURCE /)")
+for try in \$(seq 1 60); do
+  dev=\$(lsblk -dpno NAME,TYPE | awk -v r="/dev/\$root_disk" '\$2 == "disk" && \$1 != r {print \$1; exit}')
+  [ -n "\$dev" ] && break; sleep 1
+done
+if [ -n "\$dev" ] && mkfs.ext4 -q "\$dev" && mkdir -p /mnt/wal && mount -o noatime "\$dev" /mnt/wal \\
+   && mkdir -p /mnt/wal/raft-wal && echo SB_RAFT_WAL_DIR=/mnt/wal/raft-wal >> /etc/sandboxd/cluster.env; then
+  echo "BENCHNODE $1 raft log on \$dev"
+else
+  echo "BENCHNODE $1 raft log disk FAILED (\${dev:-no second disk})"
+fi
+EOF
+  cat <<EOF
 (start_sandboxd) > /var/log/sandboxd.log 2>&1 &
 until curl -fsS -o /dev/null http://127.0.0.1:21212/health; do sleep 1; done
-echo "BENCHNODE $1 up \$(date -u +%T)"
+# With SB_RAFT_WAL_DIR, raft-wal is a file naming the log's directory.
+wal="\$raft_dir/raft-wal"; [ -f "\$wal" ] && wal=\$(cat "\$wal")
+echo "BENCHNODE $1 up \$(date -u +%T); raft-wal in \$wal on \$(df --output=source "\$wal/" | tail -1), \$(ls "\$wal/" | wc -l) files"
 if [ "$1" = s1 ]; then
   # A token only once one comes back: right after /health the node may not
   # lead yet (503), and an empty answer must never be published.
@@ -342,7 +375,18 @@ while :; do
 done
 echo "BENCH members \$n of \$want after \$(( \$(date +%s) - t0 ))s"
 # Only what the bench reads: the console keeps its last 64 KB.
-metrics() { api \$S/v1/metrics | grep -E '^aerolvm_(raft_apply|raft_snapshot|cluster_placement|scheduler|capacity_lease|cluster_capacity|go_goroutines|cluster_reserve|create)' | grep -v '^#' | sed "s/^/BENCH metric \$1 /"; }
+# One line per histogram, empty buckets left out: the console keeps 64 KB,
+# and a line per bucket pushed the first steps out of it (run bench-p99-2).
+# The steps of a commit come from the leader (s1 starts the cluster) and,
+# for a follower's own write, from s2.
+fold() { awk -v p="\$1" '{ n = index(\$1, "{key=\""); if (n == 0) { print p, \$1, \$2; next }
+  name = substr(\$1, 1, n - 1); b = substr(\$1, n + 6); sub(/"}\$/, "", b)
+  if (!(name in h)) h[name] = ""; if (\$2 != 0) h[name] = h[name] " " b "=" \$2 }
+  END { for (name in h) print p, name h[name] }'; }
+metrics() {
+  api \$S/v1/metrics | grep -E '^aerolvm_(raft_apply|raft_snapshot|raft_leader_store|raft_append_rpc|raft_commit|raft_fsm_enqueue|cluster_placement|scheduler|capacity_lease|cluster_capacity|go_goroutines|cluster_reserve|create)' | grep -v '^#' | fold "BENCH metric \$1"
+  api http://$s2:21212/v1/metrics | grep -E '^aerolvm_raft_(follower_store|apply_wait|apply_fsm)' | fold "BENCH metric \$1 s2"
+}
 # A member is not a placement target until a server has its capacity
 # (polled every few seconds): wait for one create to go through.
 probe() { api -X POST \$G1/v1/sandboxes -d '{"runtime":"wasm","module_ref":"bench","tags":{"bench":"probe"}}' 2>/dev/null | jq -r '.id // empty'; }
@@ -431,13 +475,15 @@ if [[ -n "$dry" ]]; then
 fi
 
 # --- launch ------------------------------------------------------------------
-run() { # <ud file> <type> <ip or ""> [prefixes] [disk]
+run() { # <ud file> <type> <ip or ""> [prefixes] [disk] [second disk]
   local ni="DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true"
   [[ -n "$3" ]] && ni+=",PrivateIpAddress=$3"
   [[ -n "${4:-}" ]] && ni+=",Ipv4Prefixes=[$(for p in $4; do printf '{Ipv4Prefix=%s},' "$p"; done | sed 's/,$//')]"
+  local bdm=("DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true${5:-}}")
+  [[ -n "${6:-}" ]] && bdm+=("DeviceName=/dev/xvdb,Ebs={VolumeSize=40,DeleteOnTermination=true,$6}")
   aws ec2 run-instances --image-id "$ami" --instance-type "$2" --network-interfaces "$ni" \
     --instance-initiated-shutdown-behavior terminate --user-data "file://$1" \
-    --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true${5:-}}" \
+    --block-device-mappings "${bdm[@]}" \
     --tag-specifications "$(printf "$tags" instance)" "$(printf "$tags" volume)" \
     --query 'Instances[0].InstanceId' --output text
 }
@@ -451,7 +497,7 @@ fi
 for s in s1 s2 s3; do
   ip="${!s}"
   server_ud "$s" "$ip" > "$sd/ud-$s.sh"
-  ids[$s]="$(run "$sd/ud-$s.sh" "$server_type" "$ip" "" "$server_disk")"; instances+=" ${ids[$s]}"
+  ids[$s]="$(run "$sd/ud-$s.sh" "$server_type" "$ip" "" "$server_disk" "$wal_disk")"; instances+=" ${ids[$s]}"
 done
 for m in $(seq 1 "$machines"); do
   worker_ud "$m" > "$sd/ud-m$m.sh"
@@ -459,7 +505,7 @@ for m in $(seq 1 "$machines"); do
 done
 driver_ud > "$sd/ud-driver.sh"
 ids[driver]="$(run "$sd/ud-driver.sh" "$driver_type" "$drv")"; instances+=" ${ids[driver]}"
-say "machines: 3 × $server_type${server_disk:+ (gp3$server_disk)}, $machines × $worker_type ($per stand-ins each), driver $driver_type; $(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].Name' --output text)"
+say "machines: 3 × $server_type${server_disk:+ (gp3$server_disk)}${wal_disk:+ + a Raft log disk ($wal_disk)}, $machines × $worker_type ($per stand-ins each), driver $driver_type; $(aws ec2 describe-images --image-ids "$ami" --query 'Images[0].Name' --output text)"
 
 # --- results -----------------------------------------------------------------
 console() { aws ec2 get-console-output --instance-id "$1" --latest --query Output --output text 2>/dev/null || true; }
@@ -472,7 +518,10 @@ done
 # Each line reaches the console twice (as written, and through cloud-init's
 # log with a prefix): keep the bare ones.
 grep -E '^BENCH ' <<<"$out" | tee -a "$report"
-for s in s1 s2 s3 m1; do console "${ids[$s]}" | grep -E '^(LOAD|KILLED|BENCHNODE|STANDIN)' | tail -14 | sed "s/^/$s: /" >> "$report"; done
+for s in s1 s2 s3 m1; do
+  out="$(console "${ids[$s]}")"
+  { grep -E '^BENCHNODE' <<<"$out" | tail -6; grep -E '^(LOAD|KILLED|STANDIN)' <<<"$out" | tail -14; } | sed "s/^/$s: /" >> "$report"
+done
 grep -q 'BENCH DONE' "$report" || say "cellbench: the driver did not finish within two hours"
 if [[ -n "$profile_step" ]]; then
   aws s3 cp --only-show-errors --recursive "s3://$bucket/$prof_prefix/" "$sd/prof/" && say "profiles in $sd/prof: $(ls "$sd/prof" 2>/dev/null | tr '\n' ' ')"

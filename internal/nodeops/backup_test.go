@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 // node is a fake node's tree: <dir>/etc holds the env files, <dir>/lib the
@@ -356,5 +358,67 @@ func TestHumanBytes(t *testing.T) {
 		if got := humanBytes(n); got != want {
 			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
 		}
+	}
+}
+
+// A log SB_RAFT_WAL_DIR put on a disk of its own is archived where it is by
+// default, raft/raft-wal, without the record naming that disk, so a restore
+// lands the default layout. A restore onto a node still configured for its
+// own log disk says sandboxd will refuse to start until that is removed.
+func TestBackupTakesALogOnItsOwnDisk(t *testing.T) {
+	own := filepath.Join(t.TempDir(), "disk", "raft-wal")
+	n := newNode(t, "SB_RAFT_WAL_DIR="+own+"\n")
+	write(t, filepath.Join(n.lib, "raft", "raft-stable.bolt"), "stable")
+	write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), own+"\n")
+	write(t, filepath.Join(own, "wal-meta.db"), "meta")
+	write(t, filepath.Join(own, "00000000000000000001-0000000000000000.wal"), "segment")
+
+	res := n.backup(t, BackupOptions{})
+	files, _ := readArchive(t, res.Output)
+	for name, want := range map[string]string{
+		archiveRaft + "/raft-stable.bolt":                                   "stable",
+		archiveRaft + "/raft-wal/wal-meta.db":                               "meta",
+		archiveRaft + "/raft-wal/00000000000000000001-0000000000000000.wal": "segment",
+	} {
+		if files[name] != want {
+			t.Errorf("%s = %q, want %q", name, files[name], want)
+		}
+	}
+	if _, ok := files[archiveRaft+"/"+raftlogdir.LocationFile]; ok {
+		t.Error("the record naming the log disk was archived")
+	}
+	if !strings.Contains(files[manifestName], "raft_wal_dir="+own+"\n") {
+		t.Errorf("manifest lacks the log directory:\n%s", files[manifestName])
+	}
+
+	// An archive inside the log directory would copy itself.
+	o := BackupOptions{ConfigDir: n.etc, Output: filepath.Join(own, "b.tgz"), Host: &fakeHost{}}
+	if _, err := Backup(context.Background(), o); !errors.Is(err, ErrUsage) {
+		t.Fatalf("backup into the log directory: %v", err)
+	}
+
+	dst := t.TempDir()
+	write(t, filepath.Join(dst, "etc", "sandboxd", "sandboxd.env"), "SB_RAFT_WAL_DIR="+own+"\n")
+	_, out, err := restore(t, RestoreOptions{Input: res.Output, TargetRoot: dst})
+	if err != nil {
+		t.Fatalf("restore: %v\n%s", err, out)
+	}
+	lib := filepath.Join(dst, "var", "lib", "sandboxd")
+	if read(t, filepath.Join(lib, "raft", "raft-wal", "wal-meta.db")) != "meta" {
+		t.Fatal("the log did not land in raft/raft-wal")
+	}
+	if !strings.Contains(out, "WARNING: the restored Raft log is in") || !strings.Contains(out, "SB_RAFT_WAL_DIR="+own) {
+		t.Fatalf("no warning about SB_RAFT_WAL_DIR:\n%s", out)
+	}
+}
+
+// A node whose Raft directory records an unreadable location is not backed
+// up with its log missing.
+func TestBackupRefusesABadLogRecord(t *testing.T) {
+	n := newNode(t, "")
+	write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), "relative/dir\n")
+	o := BackupOptions{ConfigDir: n.etc, Output: filepath.Join(n.dir, "out", "b.tgz"), Host: &fakeHost{}}
+	if _, err := Backup(context.Background(), o); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("backup = %v; want the record refused", err)
 	}
 }

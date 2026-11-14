@@ -998,7 +998,9 @@ func (f *placementFSM) pruneAuditACLLocked(cutoff int64) int {
 
 // Apply is invoked by raft for every committed log entry on every node.
 func (f *placementFSM) Apply(log *raft.Log) interface{} {
+	start := time.Now()
 	res := f.apply(log)
+	recordFSMApply(log.AppendedAt, start)
 	// Notify subscribers AFTER releasing the FSM lock so the ingress
 	// reconciler (or any other watcher) can immediately re-read placements
 	// without contending with the next Apply. Non-blocking by design — see

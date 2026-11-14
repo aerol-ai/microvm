@@ -10,11 +10,17 @@ import (
 )
 
 var (
-	raftApplyTotal        = expvar.NewInt("aerolvm_raft_apply_total")
-	raftApplyInflight     = expvar.NewInt("aerolvm_raft_apply_inflight")
-	raftApplyErrors       = expvar.NewMap("aerolvm_raft_apply_errors_total")
-	raftApplyLastNanos    = expvar.NewInt("aerolvm_raft_apply_last_nanos")
-	raftApplyLatency      = scaleobs.NewDurationBuckets("aerolvm_raft_apply_latency_seconds_bucket")
+	raftApplyTotal     = expvar.NewInt("aerolvm_raft_apply_total")
+	raftApplyInflight  = expvar.NewInt("aerolvm_raft_apply_inflight")
+	raftApplyErrors    = expvar.NewMap("aerolvm_raft_apply_errors_total")
+	raftApplyLastNanos = expvar.NewInt("aerolvm_raft_apply_last_nanos")
+	raftApplyLatency   = scaleobs.NewDurationBuckets("aerolvm_raft_apply_latency_seconds_bucket")
+	// raftApplyWaitLatency is an entry's wait from the leader appending it
+	// to this replica's FSM starting it: the commit, and any queue in front
+	// of the FSM. raftApplyFSMLatency is the FSM's own time on it. With
+	// raftApplyLatency they split a slow apply between the log and the FSM.
+	raftApplyWaitLatency  = scaleobs.NewDurationBuckets("aerolvm_raft_apply_wait_latency_seconds_bucket")
+	raftApplyFSMLatency   = scaleobs.NewDurationBuckets("aerolvm_raft_apply_fsm_latency_seconds_bucket")
 	raftLeaderForward     = expvar.NewInt("aerolvm_raft_leader_forward_total")
 	raftLeaderForwardErrs = expvar.NewMap("aerolvm_raft_leader_forward_errors_total")
 	raftLeaderForwardLast = expvar.NewInt("aerolvm_raft_leader_forward_last_nanos")
@@ -328,4 +334,18 @@ func classifyClusterMetricError(err error) string {
 	default:
 		return "error"
 	}
+}
+
+// maxApplyWait bounds what counts as an entry's wait: a replica replaying
+// its log at start applies entries appended long ago, which is no wait.
+const maxApplyWait = time.Minute
+
+// recordFSMApply records an entry's wait and the FSM's time on it.
+func recordFSMApply(appendedAt, start time.Time) {
+	if !appendedAt.IsZero() {
+		if wait := start.Sub(appendedAt); wait >= 0 && wait < maxApplyWait {
+			raftApplyWaitLatency.Observe(wait)
+		}
+	}
+	raftApplyFSMLatency.Observe(time.Since(start))
 }

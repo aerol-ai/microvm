@@ -1173,6 +1173,7 @@ file themselves can set them directly in `/etc/sandboxd/cluster.env`.
 | `SB_RAFT_BIND_ADDR` | yes | Raft listen. Default `0.0.0.0:7000`. |
 | `SB_RAFT_ADVERTISE_ADDR` | yes | Raft address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_RAFT_DATA_DIR` | yes | On-disk raft state. Default `/var/lib/sandboxd/raft`. |
+| `SB_RAFT_WAL_DIR` | no | Servers only: the Raft log on a disk of its own, as a directory on that disk (not its mount point). Every commit waits for a log write on the leader and then on a follower, so a busy cell's servers need it on a low-latency disk (io2, not gp3): see "A disk for the Raft log" below. Set it before the node's first start; the node records where its log is and refuses to start if the setting later points elsewhere. Default: `raft-wal` inside `SB_RAFT_DATA_DIR`. |
 | `SB_GOSSIP_BIND_ADDR` | yes | Gossip listen. Default `0.0.0.0:7001`. |
 | `SB_GOSSIP_ADVERTISE_ADDR` | yes | Gossip address peers connect to. Cannot be `0.0.0.0`. |
 | `SB_GOSSIP_SECRET_KEY` | yes | Base64 16/24/32-byte AES key. Same on every node. |
@@ -1218,8 +1219,49 @@ Same as a single-node install, plus:
 | `/etc/sandboxd/tls/node.crt` | This node's cert, signed by the cluster CA (`DNS:node:<id>`, `DNS:role:<role>`). Renewed by itself at 2/3 of its life. |
 | `/etc/sandboxd/tls/node.key` | This node's private key. Mode 0600. |
 | `/etc/sandboxd/admin-context.json` | The seed only: the admin login `sandboxd init` wrote for `aerolvm config import`. Mode 0600. Holds the PAT; delete it once you have copied it. |
-| `/var/lib/sandboxd/raft/` | Raft log + snapshots. |
+| `/var/lib/sandboxd/raft/` | Raft log + snapshots. With `SB_RAFT_WAL_DIR`, the log is on its own disk and a file named `raft-wal` here names it (see below). |
 | `/var/lib/sandboxd/credential_encryption.key` | Cluster-wide AES key (also exported into env). |
+
+### A disk for the Raft log
+
+Every change to the cluster waits for two writes to the Raft log, one after
+the other: the leader's, then a follower's. So on a busy cell the servers'
+commit time is their log disk's write time. A cell near 1,000 creates a
+second needs the log on a low-latency disk of its own.
+
+Measured on the cell bench (3 servers with 4 vCPUs, 500 stand-in workers;
+runs `bench-p99-1` to `-6`):
+
+| Where the log is | One log write under load | Raft apply within 25 ms, at the rate it reached |
+|---|---|---|
+| The server's gp3 root disk (16,000 IOPS) | 2 to 5 ms | 98.4% at 1,001 creates a second |
+| A gp3 disk of its own (3,000 IOPS) | 2 to 5 ms | 98.3% at 996 |
+| An io2 disk of its own (6,000 IOPS) | about 1 ms | **99.2% at 1,354** |
+
+The disk type is what counts: gp3 is as slow on a disk of its own. Keep the
+snapshots and the rest on the root disk, which needs its IOPS for snapshots
+(16,000 IOPS on gp3, see F29 in `plans/kubernetes-v2-architecture.md`).
+
+To set it up on a server, **before its first start**:
+
+1. Attach the disk, make a filesystem on it and mount it, say at
+   `/var/lib/aerolvm-raft-log` (add it to `/etc/fstab`).
+2. Make a folder on it: `mkdir /var/lib/aerolvm-raft-log/raft-wal`. Name
+   the folder, not the mount point, so `sandboxd recover-quorum --rejoin`
+   can move the log aside.
+3. Add `SB_RAFT_WAL_DIR=/var/lib/aerolvm-raft-log/raft-wal` to
+   `/etc/sandboxd/cluster.env`.
+
+On its first start the server puts a file named `raft-wal` in
+`SB_RAFT_DATA_DIR`, where the log's folder is by default, naming that
+folder. From then on it refuses to start if the setting points anywhere
+else, or if the folder holds no log (its disk is not mounted). An older
+sandboxd cannot make its log folder there and does not start, so rolling a
+server back never opens an empty log in place of the real one. A server's
+log never moves: to give a running server a log disk, replace it with a new
+server (`aerolvm delete node`, then join a fresh one). `sandboxd backup`,
+`restore`, `recover-quorum --rejoin` and `reset` follow the record; a backup
+holds the log at `raft/raft-wal`, as on a server without a log disk.
 
 Servers hold the CA key because they all sign joins (the same exposure as
 the credential key every node already holds). An external-CA mode, with the

@@ -95,6 +95,13 @@ spec:
       {{- with .Values.cluster.servers.storage.storageClassName }}
       storageClassName: {{ . }}
       {{- end }}
+    {{- with .Values.cluster.servers.logStorage }}
+    logStorage:
+      size: {{ .size | default "20Gi" }}
+      {{- with .storageClassName }}
+      storageClassName: {{ . }}
+      {{- end }}
+    {{- end }}
     resources:
       {{- toYaml .Values.cluster.servers.resources | nindent 6 }}
     {{- with .Values.cluster.servers.nodeSelector }}
