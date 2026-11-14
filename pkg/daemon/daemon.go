@@ -599,6 +599,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			fcDriver.SetWarmPool(vmmPool)
 			lister := &vmmTemplateListerAdapter{svc: svc}
 			spawner := fcruntime.NewPoolSpawner(fcDriver)
+			// The same adapter tears down a released slot the pool has no
+			// handle for (every slot a restart left behind), so the reap
+			// never deletes the last record of its run dir and TAP device.
+			vmmPool.SetOrphanCleaner(spawner)
 			refillCfg := vmmpool.RefillConfig{
 				RefillInterval: cfg.FirecrackerVMMPoolRefillInterval,
 				GCInterval:     cfg.FirecrackerVMMPoolGCInterval,
