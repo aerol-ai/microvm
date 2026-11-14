@@ -1935,9 +1935,15 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 }
 
 // waitForLeader blocks until raft reports a leader or the deadline passes.
+// A cancelled ctx wins over a leader that is already known: the caller has
+// given up, so it gets ctx.Err() and does not go on to apply. Checking the
+// leader first made the answer depend on whether an election had finished.
 func (c *Cluster) waitForLeader(ctx context.Context, max time.Duration) error {
 	deadline := time.Now().Add(max)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if leader, _ := c.raft.raft.LeaderWithID(); leader != "" {
 			return nil
 		}
