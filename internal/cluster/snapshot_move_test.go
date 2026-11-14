@@ -29,6 +29,8 @@ type fakeSnapshotMoves struct {
 	duringImport func()
 	// startErrs are the next starts' answers, in order.
 	startErrs []error
+	// duringStart runs inside each start.
+	duringStart func()
 	// importRecreate is the recreate inputs the last import carried.
 	importRecreate *MoveRecreate
 }
@@ -69,6 +71,9 @@ func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id string, rc *MoveRec
 		return nil
 	}
 	f.note("start " + id + " from " + rc.Spec.Image)
+	if f.duringStart != nil {
+		f.duringStart()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.startErrs) > 0 {
@@ -178,6 +183,47 @@ func TestSnapshotMoveRetriesTheStartOnTheTarget(t *testing.T) {
 	}
 	if owner, _ := c2.OwnerOf("sb-vm"); owner.NodeID != "wkr-b" {
 		t.Fatalf("owner = %s, want wkr-b", owner.NodeID)
+	}
+
+	// The pass ends while the leader waits to try again: no more tries,
+	// no wait for the rest of the delay (the target's own check starts it).
+	moveStartRetryDelay = time.Minute
+	c3, _, target3, cleanup3 := snapshotMovePair(t, "ldr-snap-retry3")
+	defer cleanup3()
+	ctx, cancelPass := context.WithCancel(context.Background())
+	defer cancelPass()
+	target3.startErrs = []error{errors.New("down")}
+	target3.duringStart = func() { time.AfterFunc(50*time.Millisecond, cancelPass) }
+	began := time.Now()
+	_, _ = c3.EvacuateNode(ctx, c3.nodeID, EvacuateRequest{})
+	if waited := time.Since(began); waited > 30*time.Second {
+		t.Fatalf("the leader waited %s after its pass ended", waited)
+	}
+	if got := strings.Count(strings.Join(target3.calls, "; "), "start sb-vm"); got != 1 {
+		t.Fatalf("starts after the pass ended = %d, want 1: %v", got, target3.calls)
+	}
+}
+
+// A handoff the FSM refuses (the leader's read of the sandbox is stale: it
+// has another lifetime now) stops the move before the release: nothing is
+// stopped on the source, nothing imported on the target.
+func TestSnapshotMoveStopsWhenTheHandoffIsRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, source, target, cleanup := snapshotMovePair(t, "ldr-snap-stale")
+	defer cleanup()
+	p, ok := c.fsm.get("sb-vm")
+	if !ok {
+		t.Fatal("no placement")
+	}
+	p.IncarnationID = "inc-stale"
+	self, _ := c.gossip.lookupMember(c.nodeID)
+	if err := c.moveSnapshotOne(context.Background(), p, self); !errors.Is(err, ErrIncarnationConflict) {
+		t.Fatalf("move on a stale read = %v, want ErrIncarnationConflict", err)
+	}
+	if len(source.calls)+len(target.calls) != 0 {
+		t.Fatalf("calls after a refused handoff: source %v, target %v", source.calls, target.calls)
 	}
 }
 

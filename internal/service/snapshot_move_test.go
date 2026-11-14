@@ -30,6 +30,7 @@ type fakeMoverRuntime struct {
 	snapshot []byte
 	imported []byte
 	dropped  int
+	dropErr  error
 }
 
 func (f *fakeMoverRuntime) ExportSandboxSnapshot(_ context.Context, _ string, w io.Writer) error {
@@ -48,6 +49,9 @@ func (f *fakeMoverRuntime) ImportSandboxSnapshot(_ context.Context, _ string, r 
 
 func (f *fakeMoverRuntime) DropImportedSnapshot(context.Context, string) error {
 	f.dropped++
+	if f.dropErr != nil {
+		return f.dropErr
+	}
 	f.imported = nil
 	return nil
 }

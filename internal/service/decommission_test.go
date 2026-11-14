@@ -244,10 +244,8 @@ func TestResumeLapsedMove(t *testing.T) {
 
 // End to end through the timer the release sets.
 func TestReleaseSchedulesTheResume(t *testing.T) {
-	old := moveFenceTTL
-	moveFenceTTL = 10 * time.Millisecond
-	t.Cleanup(func() { moveFenceTTL = old })
 	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.moveTimings.fenceTTL = 10 * time.Millisecond
 	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
 	putRunning(t, svc, "sb-timer")
 	if got := svc.ReleaseForMove(context.Background(), []string{"sb-timer"}, nil); got["sb-timer"] != MoveReleased {
@@ -302,10 +300,11 @@ func TestDelayedMoveMustNotStopReplacement(t *testing.T) {
 
 // restartedService is a new sandboxd process on the same store and runtime:
 // fresh process state, the same rows and tasks.
-func restartedService(svc *Service, c *ownerStubCluster) *Service {
+func restartedService(t *testing.T, svc *Service, c *ownerStubCluster) *Service {
 	r := &Service{cfg: svc.cfg, logger: svc.logger, store: svc.store, docker: svc.docker,
-		caddy: svc.caddy, mounts: svc.mounts, admitter: svc.admitter}
+		caddy: svc.caddy, mounts: svc.mounts, admitter: svc.admitter, moveTimings: svc.moveTimings}
 	r.AttachCluster(c)
+	t.Cleanup(r.moveTimers.stop)
 	return r
 }
 
@@ -315,11 +314,9 @@ func restartedService(svc *Service, c *ownerStubCluster) *Service {
 // stopped is started again (the leader says the move never happened); one
 // its user had stopped stays stopped.
 func TestMoveFenceSurvivesAgentRestart(t *testing.T) {
-	old := moveFenceTTL
-	moveFenceTTL = 400 * time.Millisecond
-	t.Cleanup(func() { moveFenceTTL = old })
 	ctx := context.Background()
 	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.moveTimings.fenceTTL = 400 * time.Millisecond
 	svc.cfg.EnableCluster = true
 	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
 	// The process that releases dies right after: its own resume check can
@@ -337,7 +334,7 @@ func TestMoveFenceSurvivesAgentRestart(t *testing.T) {
 	}
 	dead.readErr = errors.New("this process is gone")
 
-	restarted := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", readErr: errors.New("gone too")})
+	restarted := restartedService(t, svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", readErr: errors.New("gone too")})
 	restarted.beginOwnershipLease(time.Now())
 	for _, id := range []string{"sb-released", "sb-user"} {
 		if _, err := restarted.StartSandbox(ctx, id); !errors.Is(err, ErrOwnershipFenced) {
@@ -348,7 +345,7 @@ func TestMoveFenceSurvivesAgentRestart(t *testing.T) {
 		}
 	}
 
-	again := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
+	again := restartedService(t, svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
 	again.rearmMoveFences(ctx)
 	if !again.OwnershipFenced("sb-released") || !again.OwnershipFenced("sb-user") {
 		t.Fatal("a process starting up did not re-arm the fences in the rows")
@@ -372,11 +369,9 @@ func TestMoveFenceSurvivesAgentRestart(t *testing.T) {
 // read is checked again later, and a placement that now holds another
 // lifetime is left alone.
 func TestResumeLapsedMoveAsksTheLeader(t *testing.T) {
-	oldRetry := moveResumeRetry
-	moveResumeRetry = 50 * time.Millisecond
-	t.Cleanup(func() { moveResumeRetry = oldRetry })
 	ctx := context.Background()
 	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.moveTimings.resumeRetry = 50 * time.Millisecond
 	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
 	owner := &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", incarnation: "inc-now"}
 	svc.AttachCluster(owner)
@@ -423,7 +418,7 @@ func TestRearmMoveFencesWithoutTheRows(t *testing.T) {
 	if got := svc.ReleaseForMove(context.Background(), []string{"sb-x"}, nil); got["sb-x"] != MoveReleased {
 		t.Fatalf("release: %v", got)
 	}
-	fresh := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
+	fresh := restartedService(t, svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
 	_ = st.Close()
 	fresh.rearmMoveFences(context.Background())
 	if fresh.OwnershipFenced("sb-x") {

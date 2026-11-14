@@ -141,6 +141,9 @@ func newCapacityHarness(t *testing.T, managed, inspect map[string]*models.Sandbo
 		mounts:   mgr,
 		admitter: admitter,
 	}
+	// Registered last, so it runs first: no move check outlives the test
+	// or reads its closed store.
+	t.Cleanup(svc.moveTimers.stop)
 	return svc, admitter, st
 }
 

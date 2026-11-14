@@ -77,10 +77,7 @@ func (s *Store) ListMovedInRows(ctx context.Context) ([]MovedInRow, error) {
 		}
 		out = append(out, r)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list moved-in rows: %w", err)
-	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // DeleteMovedInRow removes id's moved-in row. Idempotent.

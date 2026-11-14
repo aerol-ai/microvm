@@ -668,6 +668,13 @@ type Service struct {
 	// here, so an agent restart before its start does not lose it.
 	moveTargets moveTargets
 	movesIn     moveFences
+	// moveInChecks is, per sandbox imported here, its live move-in check
+	// (checkMovedIn), which starts or drops the import when the leader
+	// does not. moveTimers holds every pending move check, and
+	// moveTimings the timings they read (decommission.go).
+	moveInChecks moveInChecks
+	moveTimers   moveTimers
+	moveTimings  moveTimings
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile

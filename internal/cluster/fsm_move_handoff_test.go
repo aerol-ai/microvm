@@ -270,6 +270,11 @@ func TestClusterMoveHandoffThroughRaft(t *testing.T) {
 			ExpectedOwnerNodeID: c.nodeID, ExpectedOwnerNodeIDSet: true, ExpectedMoveToken: token, ReassignCause: reassignCauseFailover})
 	}
 
+	stale := p
+	stale.IncarnationID = "inc-stale"
+	if got, err := c.beginMoveHandoff(ctx, stale, c.nodeID); got != "" || !errors.Is(err, ErrIncarnationConflict) {
+		t.Fatalf("begin on a stale read = %q, %v; want ErrIncarnationConflict", got, err)
+	}
 	token, err := c.beginMoveHandoff(ctx, p, c.nodeID)
 	if err != nil || token == "" {
 		t.Fatalf("begin = %q, %v", token, err)

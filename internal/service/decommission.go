@@ -1,6 +1,7 @@
 package service
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -33,14 +34,71 @@ import (
 // stopped at the deadline (StopForDecommission), then orphaned when the node
 // is deleted.
 
-// moveFenceTTL is how long a sandbox released for a move stays fenced. The
-// leader moves the placement right after the release; if it never does (it
-// lost leadership, the swap was refused, the decommission was called off),
-// the fence lapses and this node starts the sandbox again
-// (resumeLapsedMove): nothing else would, and a sandbox that asked to be
-// moved must not simply stay stopped. A later pass releases it once more.
-// A var for tests.
-var moveFenceTTL = 5 * time.Minute
+const (
+	// defaultMoveFenceTTL is how long a sandbox released for a move stays
+	// fenced. The leader moves the placement right after the release; if
+	// it never does (it lost leadership, the swap was refused, the
+	// decommission was called off), the fence lapses and this node starts
+	// the sandbox again (resumeLapsedMove): nothing else would, and a
+	// sandbox that asked to be moved must not simply stay stopped. A later
+	// pass releases it once more.
+	defaultMoveFenceTTL = 5 * time.Minute
+	// defaultMoveResumeRetry is how soon a lapsed move, or a move taken in
+	// (checkMovedIn), is checked again when it is not settled yet.
+	defaultMoveResumeRetry = time.Minute
+)
+
+// moveTimings are one Service's move timings; zero means the default. They
+// live on the Service, not in package vars, because the checks that read
+// them run on timers: a test sets its own Service's before it does any
+// work, and no timer of one test reads a value another test changes.
+type moveTimings struct {
+	fenceTTL    time.Duration // defaultMoveFenceTTL
+	resumeRetry time.Duration // defaultMoveResumeRetry
+	inFenceTTL  time.Duration // defaultMoveInFenceTTL
+}
+
+func (t moveTimings) fence() time.Duration   { return cmp.Or(t.fenceTTL, defaultMoveFenceTTL) }
+func (t moveTimings) retry() time.Duration   { return cmp.Or(t.resumeRetry, defaultMoveResumeRetry) }
+func (t moveTimings) inFence() time.Duration { return cmp.Or(t.inFenceTTL, defaultMoveInFenceTTL) }
+
+// moveTimers are a Service's pending move checks: a lapsed release's resume
+// and an import's move-in check. stop (a test's cleanup, before its store
+// closes) ends them and waits for any that is running, so none outlives
+// the Service's test.
+type moveTimers struct {
+	mu      sync.Mutex
+	stopped bool
+	pending map[*time.Timer]struct{}
+	running sync.WaitGroup
+}
+
+// after runs f after d on its own goroutine, unless stop comes first.
+func (m *moveTimers) after(d time.Duration, f func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return
+	}
+	if m.pending == nil {
+		m.pending = make(map[*time.Timer]struct{})
+	}
+	var t *time.Timer
+	// The callback takes mu first, so it reads t only once it is set.
+	t = time.AfterFunc(d, func() {
+		m.mu.Lock()
+		delete(m.pending, t)
+		if m.stopped {
+			m.mu.Unlock()
+			return
+		}
+		m.running.Add(1)
+		m.mu.Unlock()
+		defer m.running.Done()
+		f()
+	})
+	m.pending[t] = struct{}{}
+}
 
 // moveFences holds the sandboxes released for a move, by expiry. The row
 // carries the same fence (statusReasonMoveReleased and its updated_at), so a
@@ -128,14 +186,14 @@ const (
 
 // movedRowFence is when the move fence a row carries lapses, or zero when
 // the row carries none.
-func movedRowFence(sb *models.Sandbox) time.Time {
+func (s *Service) movedRowFence(sb *models.Sandbox) time.Time {
 	if sb == nil || sb.Status != models.SandboxStatusStopped {
 		return time.Time{}
 	}
 	if sb.StatusReason != statusReasonMoveReleased && sb.StatusReason != statusReasonMoveReleasedStopped {
 		return time.Time{}
 	}
-	return sb.UpdatedAt.Add(moveFenceTTL)
+	return sb.UpdatedAt.Add(s.moveTimings.fence())
 }
 
 // refuseMovedRowStart is the start gate's check of a row a release stopped
@@ -146,7 +204,7 @@ func movedRowFence(sb *models.Sandbox) time.Time {
 // needs proof first (proveMoveAborted). The caller holds id's lifecycle
 // lock, so no release comes in between the proof and the start.
 func (s *Service) refuseMovedRowStart(ctx context.Context, sb *models.Sandbox) error {
-	until := movedRowFence(sb)
+	until := s.movedRowFence(sb)
 	if until.IsZero() {
 		return nil
 	}
@@ -216,7 +274,7 @@ func (s *Service) rearmMoveFences(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, sb := range all {
-		until := movedRowFence(sb)
+		until := s.movedRowFence(sb)
 		if until.IsZero() || s.moves.known(sb.ID) {
 			continue
 		}
@@ -296,7 +354,7 @@ func (s *Service) stopOne(ctx context.Context, id, lifetime string, fence bool) 
 	// Fence before the stop, under the lifecycle lock: once the lock is
 	// released, nothing may start it here again.
 	if fence {
-		s.moves.set(id, time.Now().Add(moveFenceTTL))
+		s.moves.set(id, time.Now().Add(s.moveTimings.fence()))
 	}
 	s.cancelRestartTimer(id)
 	switch {
@@ -329,7 +387,7 @@ func (s *Service) stopOne(ctx context.Context, id, lifetime string, fence bool) 
 		}
 	}
 	if fence {
-		s.scheduleMoveResumeIn(id, moveFenceTTL+time.Second)
+		s.scheduleMoveResumeIn(id, s.moveTimings.fence()+time.Second)
 		return MoveReleased
 	}
 	return MoveStopped
@@ -339,16 +397,12 @@ func (s *Service) stopOne(ctx context.Context, id, lifetime string, fence bool) 
 // A renewed fence (a later release) makes this check a no-op; that release
 // schedules its own.
 func (s *Service) scheduleMoveResumeIn(id string, d time.Duration) {
-	time.AfterFunc(d, func() {
+	s.moveTimers.after(d, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		s.resumeLapsedMove(ctx, id)
 	})
 }
-
-// moveResumeRetry is how soon a lapsed move is checked again when the
-// leader could not say whether it happened. A var for tests.
-var moveResumeRetry = time.Minute
 
 // resumeLapsedMove starts id again when its move never happened: its fence
 // has lapsed and it is still stopped for the move. The start's gate proves
@@ -377,7 +431,7 @@ func (s *Service) resumeLapsedMove(ctx context.Context, id string) bool {
 	if _, err := s.startSandboxLocked(ctx, id, startForRestart); err != nil {
 		switch {
 		case errors.Is(err, errMoveUnproven):
-			s.scheduleMoveResumeIn(id, moveResumeRetry)
+			s.scheduleMoveResumeIn(id, s.moveTimings.retry())
 		case errors.Is(err, errMovedAway):
 			// Not this node's: nothing to start.
 		default:

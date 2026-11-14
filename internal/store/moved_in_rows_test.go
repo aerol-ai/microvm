@@ -61,6 +61,14 @@ func TestMovedInRows(t *testing.T) {
 	if _, err := st.GetMovedInRow(ctx, "sb-a"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("after the delete: %v, want ErrNotFound", err)
 	}
+	// A row that does not scan (written by something else): the list says
+	// so instead of skipping it.
+	if _, err := st.db.ExecContext(ctx, `INSERT INTO moved_in_rows (sandbox_id, sealed_blob, imported_at) VALUES ('sb-bad', x'00', 'not a time')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListMovedInRows(ctx); err == nil {
+		t.Fatal("listed a row that does not scan")
+	}
 	// Closed: every call reports it.
 	_ = st.Close()
 	if _, err := st.ListMovedInRows(ctx); err == nil {

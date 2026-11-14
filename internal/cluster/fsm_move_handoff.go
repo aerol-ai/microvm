@@ -180,37 +180,32 @@ func (c *Cluster) admitMoveHandoff(payload []byte, cmd command) ([]byte, command
 		if !c.moveHandoffReplicated() {
 			cmd.ExpectedMoveToken = ""
 			out, err := encodeCommand(cmd)
-			if err != nil {
-				return nil, cmd, fmt.Errorf("cluster: encode command: %w", err)
-			}
-			return out, cmd, nil
+			return out, cmd, err
 		}
 	}
 	return payload, cmd, nil
 }
 
 // beginMoveHandoff opens a handoff on p, owned by source, and returns its
-// token for the swap; "" (no error) when the cluster cannot record
-// handoffs yet, and the move goes on as before.
+// token for the swap. While any Raft server cannot record handoffs, the
+// leader refuses the op (admitMoveHandoff, ErrClusterVersion) before it
+// reaches Raft: then "" and no error, and the move goes on as before.
 func (c *Cluster) beginMoveHandoff(ctx context.Context, p Placement, source string) (string, error) {
-	if !c.moveHandoffReplicated() {
+	token, err := MintIncarnationID()
+	if err == nil {
+		err = c.applyCommand(ctx, command{
+			Op:                     opMoveHandoff,
+			SandboxID:              p.SandboxID,
+			ExpectedIncarnationID:  strings.TrimSpace(p.IncarnationID),
+			ExpectedOwnerNodeID:    source,
+			ExpectedOwnerNodeIDSet: true,
+			MoveToken:              token,
+		})
+	}
+	if errors.Is(err, ErrClusterVersion) {
 		return "", nil
 	}
-	token, err := MintIncarnationID()
 	if err != nil {
-		return "", err
-	}
-	if err := c.applyCommand(ctx, command{
-		Op:                     opMoveHandoff,
-		SandboxID:              p.SandboxID,
-		ExpectedIncarnationID:  strings.TrimSpace(p.IncarnationID),
-		ExpectedOwnerNodeID:    source,
-		ExpectedOwnerNodeIDSet: true,
-		MoveToken:              token,
-	}); err != nil {
-		if errors.Is(err, ErrClusterVersion) {
-			return "", nil
-		}
 		return "", err
 	}
 	return token, nil

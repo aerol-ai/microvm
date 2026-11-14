@@ -240,8 +240,9 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	// After the swap: not cut short by a gVisor move's budget. The target
 	// holds the sandbox durably from its import on (a stopped row, or a
 	// stored checkpoint row), so a start that fails, the target's agent
-	// restarting say, is tried again here, and the target starts it itself
-	// at its next start if every try fails (Service.resumeMovedIn).
+	// restarting say, is tried again here. If every try fails, or this
+	// leader dies first, the target starts it itself: its import armed a
+	// check that does once the placement names it (Service.checkMovedIn).
 	sctx, cancel := context.WithTimeout(ctx, moveStartTimeout)
 	defer cancel()
 	for attempt := 1; ; attempt++ {
@@ -252,16 +253,24 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		if err == nil {
 			return nil
 		}
-		if attempt == moveStartAttempts || sctx.Err() != nil {
+		if attempt == moveStartAttempts || !waitOrDone(sctx, time.Duration(attempt)*moveStartRetryDelay) {
 			break
 		}
-		select {
-		case <-sctx.Done():
-		case <-time.After(time.Duration(attempt) * moveStartRetryDelay):
-		}
 	}
-	c.logger.Warn("cluster: snapshot move: moved, but the start on the target failed; it starts the sandbox at its next start", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
+	c.logger.Warn("cluster: snapshot move: moved, but the start on the target failed; the target's own check starts it", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
 	return nil
+}
+
+// waitOrDone waits d, or until ctx ends: false when ctx ended first.
+func waitOrDone(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // moveStartAttempts and moveStartRetryDelay space the leader's tries of a
