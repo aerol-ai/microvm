@@ -3,10 +3,12 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -135,8 +137,34 @@ func TestNonLinuxStubsAndWarmDestroyHandle(t *testing.T) {
 		if spawned.shutdownCalls != 1 || spawned.lastGrace != 2*time.Second {
 			t.Fatalf("spawned shutdown calls = %d grace=%v", spawned.shutdownCalls, spawned.lastGrace)
 		}
+		// Kill sends the warm VM SIGKILL: through the seam, never to a
+		// real pid 42. A VM already gone (ESRCH) is not an error; any
+		// other refusal is.
+		orig := signalWarmVM
+		t.Cleanup(func() { signalWarmVM = orig })
+		var signalled []string
+		var signalErr error
+		signalWarmVM = func(pid int, sig syscall.Signal) error {
+			signalled = append(signalled, fmt.Sprintf("%d:%v", pid, sig))
+			return signalErr
+		}
 		if err := h.Kill(); err != nil {
 			t.Fatalf("Kill() error = %v", err)
+		}
+		if want := fmt.Sprintf("42:%v", syscall.SIGKILL); len(signalled) != 1 || signalled[0] != want {
+			t.Fatalf("Kill() signalled %v, want [%s]", signalled, want)
+		}
+		signalErr = syscall.ESRCH
+		if err := h.Kill(); err != nil {
+			t.Fatalf("Kill() of a VM already gone: %v", err)
+		}
+		signalErr = syscall.EPERM
+		if err := h.Kill(); !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("Kill() refused = %v, want EPERM", err)
+		}
+		spawned.pid = 0
+		if err := h.Kill(); err != nil || len(signalled) != 3 {
+			t.Fatalf("Kill() with no pid: err %v, signalled %d times, want 3", err, len(signalled))
 		}
 		if err := h.Cleanup(); err != nil {
 			t.Fatalf("Cleanup() error = %v", err)

@@ -249,6 +249,21 @@ type Freezer interface {
 	Thaw(ctx context.Context, containerRef string) error
 }
 
+// ErrCannotFreeze is a Freezer's answer for a sandbox it cannot freeze where
+// it runs (a Firecracker VM outside a group of its own, on a host without
+// cgroup v2). The ownership fence then refuses the sandbox but leaves it
+// running, as for a runtime with no Freezer, instead of retrying.
+var ErrCannotFreeze = errors.New("runtime: this sandbox cannot be frozen in place")
+
+// FenceGrouper is a runtime whose sandboxes are not containers: it names
+// the cgroup, under the sandboxes' cgroup parent, that the runtime
+// supervisor freezes for one sandbox when sandboxd's ownership lease runs
+// out with sandboxd down (internal/supervisor/lease.go). A container's
+// group is its container ref, so container runtimes need not implement it.
+type FenceGrouper interface {
+	FenceGroup(sandboxID string) string
+}
+
 // AsContainerRuntime returns the network-rule surface when rt implements it.
 // WASM and other host-mediated runtimes return false.
 func AsContainerRuntime(rt Runtime) (ContainerRuntime, bool) {

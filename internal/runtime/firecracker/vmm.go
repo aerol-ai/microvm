@@ -206,8 +206,9 @@ func (v *vmm) Start(ctx context.Context) error {
 		return fmt.Errorf("vmm: spawn %s: %w", v.cfg.FirecrackerBinary, err)
 	}
 	// Out of sandboxd's cgroup, so a sandboxd restart leaves the VM
-	// running (vmm_adopt.go).
-	if err := moveVMMToCgroup(cmd.Process.Pid); err != nil && !errors.Is(err, errVMMAdoptionUnsupported) {
+	// running (vmm_adopt.go), and into a group of its own, so the
+	// ownership lease can freeze this VM alone.
+	if err := moveVMMToCgroup(cmd.Process.Pid, v.sandboxID); err != nil && !errors.Is(err, errVMMAdoptionUnsupported) {
 		cgroupWarnOnce.Do(func() {
 			logger := v.logger
 			if logger == nil {

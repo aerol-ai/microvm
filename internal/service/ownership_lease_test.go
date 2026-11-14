@@ -318,7 +318,8 @@ func TestOwnershipLeaseWithoutRecreateSandboxesNeedsNoRead(t *testing.T) {
 	}
 }
 
-// A runtime that cannot freeze in place (Firecracker, WASM, isolate) still
+// A runtime that cannot freeze in place (WASM, isolate; here a stand-in
+// registered as Firecracker, a runtime with no Freezer) still
 // gets the fence (no start, no serve); its instance keeps running. A failed
 // freeze is retried on the next check.
 func TestOwnershipLeaseFreezeGapsAndRetries(t *testing.T) {

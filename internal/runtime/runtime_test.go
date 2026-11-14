@@ -61,16 +61,24 @@ func TestOnlyContainerdStartsWithIdentityEnv(t *testing.T) {
 }
 
 // The ownership fence freezes in place where the runtime can: the two
-// container engines. Firecracker, WASM and isolate cannot yet, and the fence
-// only refuses their sandboxes; this pins which is which.
+// container engines, and Firecracker, each VM in its own group, which it
+// also names for the runtime supervisor (FenceGrouper, review N2). WASM
+// and isolate cannot: the fence only refuses their sandboxes, and on a
+// Kubernetes worker a recreate-policy create of them is refused. This pins
+// which is which.
 func TestFreezerOptIn(t *testing.T) {
 	var _ runtime.Freezer = (*docker.Client)(nil)
 	var _ runtime.Freezer = (*containerdruntime.Driver)(nil)
+	var _ runtime.Freezer = (*firecracker.Driver)(nil)
+	var _ runtime.FenceGrouper = (*firecracker.Driver)(nil)
 	for name, rt := range map[string]runtime.Runtime{
-		"firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+		"wasm": (*wasmruntime.Driver)(nil),
 	} {
 		if _, ok := rt.(runtime.Freezer); ok {
 			t.Errorf("%s now implements Freezer: drop it from the fence's refuse-only list", name)
+		}
+		if _, ok := rt.(runtime.FenceGrouper); ok {
+			t.Errorf("%s now names a fence group: let refuseUnfencedRecreate accept it", name)
 		}
 	}
 }

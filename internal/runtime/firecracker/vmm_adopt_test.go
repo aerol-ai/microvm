@@ -77,12 +77,33 @@ type vmmHost struct {
 	killErr   map[int]error
 	killed    []int
 	cmdlines  map[int][]string
+	// placed is each VM's own group, by pid (moveVMMToCgroup).
+	placed map[int]string
+	// sweeps counts sweeps of emptied VM groups.
+	sweeps int
+}
+
+func (h *vmmHost) placedIn(pid int) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.placed[pid]
 }
 
 func stubVMMHost(t *testing.T) *vmmHost {
 	t.Helper()
-	h := &vmmHost{boot: "boot-1", procs: map[int]*fakeProcess{}, killErr: map[int]error{}, cmdlines: map[int][]string{}}
-	saved := []any{moveVMMToCgroup, listVMMCgroup, processStart, hostBootID, openProcess, killStrayVMM, processCmdline}
+	h := &vmmHost{boot: "boot-1", procs: map[int]*fakeProcess{}, killErr: map[int]error{}, cmdlines: map[int][]string{}, placed: map[int]string{}}
+	saved := []any{moveVMMToCgroup, listVMMCgroup, processStart, hostBootID, openProcess, killStrayVMM, processCmdline, sweepVMMGroups}
+	moveVMMToCgroup = func(pid int, group string) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.placed[pid] = group
+		return nil
+	}
+	sweepVMMGroups = func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.sweeps++
+	}
 	processCmdline = func(pid int) ([]string, error) {
 		if args, ok := h.cmdlines[pid]; ok {
 			return args, nil
@@ -113,19 +134,39 @@ func stubVMMHost(t *testing.T) *vmmHost {
 		return h.killErr[pid]
 	}
 	t.Cleanup(func() {
-		moveVMMToCgroup = saved[0].(func(int) error)
+		moveVMMToCgroup = saved[0].(func(int, string) error)
 		listVMMCgroup = saved[1].(func() ([]int, error))
 		processStart = saved[2].(func(int) (uint64, error))
 		hostBootID = saved[3].(func() (string, error))
 		openProcess = saved[4].(func(int, uint64) (liveProcess, error))
 		killStrayVMM = saved[5].(func(int) error)
 		processCmdline = saved[6].(func(int) ([]string, error))
+		sweepVMMGroups = saved[7].(func())
 	})
 	return h
 }
 
 // adoptDriver is a driver whose run dir is a temp dir and whose clients are
 // fakes, one per API socket, kept for inspection.
+// A VM that cannot get a group of its own is warned about (the ownership
+// lease cannot freeze it); a host without the feature, or no process yet,
+// says nothing.
+func TestPlaceVMMWarnsWhenTheVMHasNoGroup(t *testing.T) {
+	stubVMMHost(t)
+	d, _, logs := adoptDriver(t)
+	d.placeVMM("sb-x", 0)
+	moveVMMToCgroup = func(int, string) error { return errVMMAdoptionUnsupported }
+	d.placeVMM("sb-x", 5)
+	if logs.Len() != 0 {
+		t.Fatalf("warned without cause: %s", logs)
+	}
+	moveVMMToCgroup = func(int, string) error { return errors.New("read-only cgroupfs") }
+	d.placeVMM("sb-x", 5)
+	if !strings.Contains(logs.String(), "the ownership lease cannot freeze it") {
+		t.Fatalf("no warning: %s", logs)
+	}
+}
+
 func adoptDriver(t *testing.T) (*Driver, map[string]*fakeClient, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
@@ -351,6 +392,16 @@ func TestAdoptRunningVMs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(host.killed, []int{200, 201}) {
 		t.Fatalf("killed strays %v, want [200 201]", host.killed)
+	}
+	// Each adopted VM is in its own group, so the ownership lease can
+	// freeze it alone (review N2); the emptied groups are swept once.
+	for id, pid := range map[string]int{"sb-keep": 101, "sb-paused": 102, "sb-unknown": 106, "sb-warm": 107} {
+		if got := host.placedIn(pid); got != id {
+			t.Errorf("adopted VM %d is in group %q, want %q", pid, got, id)
+		}
+	}
+	if host.sweeps != 1 {
+		t.Fatalf("swept the VM groups %d times, want once", host.sweeps)
 	}
 	for _, want := range []string{"cannot tell whether a VM should run", "leftover VM not killed", "killed a VM no sandbox owns", "recorded VM is gone"} {
 		if !strings.Contains(logs.String(), want) {
@@ -584,8 +635,10 @@ func TestVMMStartMovesTheVMOutOfSandboxdsCgroup(t *testing.T) {
 	dir := t.TempDir()
 	bin := writeFakeFirecracker(t, dir, fakeOpts{})
 	var moved []int
-	moveVMMToCgroup = func(pid int) error {
+	var groups []string
+	moveVMMToCgroup = func(pid int, group string) error {
 		moved = append(moved, pid)
+		groups = append(groups, group)
 		return errors.New("read-only cgroupfs")
 	}
 	cgroupWarnOnce = sync.Once{}
@@ -599,8 +652,8 @@ func TestVMMStartMovesTheVMOutOfSandboxdsCgroup(t *testing.T) {
 		if err := v.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if moved[len(moved)-1] != v.Pid() {
-			t.Fatalf("moved pid %d, want %d", moved[len(moved)-1], v.Pid())
+		if moved[len(moved)-1] != v.Pid() || groups[len(groups)-1] != id {
+			t.Fatalf("moved pid %d into %q, want %d into its own group %q", moved[len(moved)-1], groups[len(groups)-1], v.Pid(), id)
 		}
 		_ = v.Kill()
 	}
@@ -621,7 +674,7 @@ func TestVMMStartMovesTheVMOutOfSandboxdsCgroup(t *testing.T) {
 	}
 	startAndKill("vm-c", nil)
 	// A host that cannot keep VMs past sandboxd at all says nothing.
-	moveVMMToCgroup = func(int) error { return errVMMAdoptionUnsupported }
+	moveVMMToCgroup = func(int, string) error { return errVMMAdoptionUnsupported }
 	cgroupWarnOnce = sync.Once{}
 	logs.Reset()
 	startAndKill("vm-d", logger)

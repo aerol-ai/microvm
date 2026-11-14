@@ -212,6 +212,9 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.resumeMovedIn(ctx)
 	// The move fences a previous process left in the rows (R11).
 	s.rearmMoveFences(ctx)
+	// Recreate-policy sandboxes made before creates of them were refused
+	// here, on a runtime the supervisor cannot freeze alone.
+	s.warnUnfencedRecreate(ctx)
 
 	lease := cluster.OwnershipLease(s.cfg)
 	probe := max(lease/3, 10*time.Millisecond)
@@ -500,6 +503,19 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 		return
 	}
 	if err := fr.Freeze(ctx, s.runtimeRef(sb)); err != nil {
+		if errors.Is(err, runtime.ErrCannotFreeze) {
+			// This one cannot be frozen where it runs (a Firecracker VM
+			// with no group of its own): refused, as for a runtime with no
+			// Freezer, not retried every check.
+			s.ownership.mu.Lock()
+			f.cannotFreeze = true
+			s.ownership.mu.Unlock()
+			if s.logger != nil {
+				s.logger.Warn("cluster: this sandbox cannot be paused in place; it is refused but keeps running until ownership is confirmed",
+					"sandbox_id", id, "runtime", sb.Runtime, "error", err)
+			}
+			return
+		}
 		if s.logger != nil {
 			s.logger.Warn("cluster: freeze of a fenced sandbox failed; will retry", "sandbox_id", id, "error", err)
 		}
