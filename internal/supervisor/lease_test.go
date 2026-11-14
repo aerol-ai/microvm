@@ -53,10 +53,13 @@ func newLeaseHarness(t *testing.T, refs ...string) *leaseHarness {
 
 // write writes a lease confirmed at confirmed (seconds) with remaining
 // seconds left.
-func (h *leaseHarness) write(t *testing.T, confirmed int64, remaining int64, fence, owned []string) {
+// write is sandboxd writing the file now, on the clock the guard shares,
+// with remaining seconds of the lease left: the read it carries was
+// confirmed 15 - remaining seconds ago.
+func (h *leaseHarness) write(t *testing.T, remaining int64, fence, owned []string) {
 	t.Helper()
-	l := ownerlease.Lease{ConfirmedUnixMs: confirmed * 1000, LeaseMs: 15_000, Fence: fence, Owned: owned}
-	l.WrittenUnixMs = l.ConfirmedUnixMs + l.LeaseMs - remaining*1000
+	l := ownerlease.Lease{WrittenUnixMs: h.now.UnixMilli(), LeaseMs: 15_000, Fence: fence, Owned: owned}
+	l.ConfirmedUnixMs = l.WrittenUnixMs - l.LeaseMs + remaining*1000
 	if err := ownerlease.Write(h.file, l); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +89,7 @@ func TestLeaseGuardFreezesAndThawsOnProof(t *testing.T) {
 		t.Fatalf("froze %v with no lease", h.frozen)
 	}
 
-	h.write(t, 100, 15, []string{"ctr-a", "ctr-b", "ctr-gone", "../supervisor"}, []string{"ctr-a", "ctr-b"})
+	h.write(t, 15, []string{"ctr-a", "ctr-b", "ctr-gone", "../supervisor"}, []string{"ctr-a", "ctr-b"})
 	h.step(0)
 	h.step(14 * time.Second)
 	if len(h.frozen) != 0 {
@@ -105,7 +108,7 @@ func TestLeaseGuardFreezesAndThawsOnProof(t *testing.T) {
 
 	// sandboxd comes back and its first read proves only ctr-a still here
 	// (ctr-b moved to another node): ctr-a thaws, ctr-b stays frozen.
-	h.write(t, 140, 15, []string{"ctr-a", "ctr-b"}, []string{"ctr-a"})
+	h.write(t, 15, []string{"ctr-a", "ctr-b"}, []string{"ctr-a"})
 	h.step(time.Second)
 	if h.isFrozen("ctr-a") || !h.isFrozen("ctr-b") {
 		t.Fatalf("after the read: %v, want ctr-a thawed and ctr-b frozen", h.frozen)
@@ -113,7 +116,7 @@ func TestLeaseGuardFreezesAndThawsOnProof(t *testing.T) {
 	// A rewrite after a create carries the same read and a longer fence:
 	// nothing more thaws or freezes, and ctr-b stays frozen until sandboxd
 	// removes it.
-	h.write(t, 140, 14, []string{"ctr-a", "ctr-b", "ctr-c"}, []string{"ctr-a"})
+	h.write(t, 14, []string{"ctr-a", "ctr-b", "ctr-c"}, []string{"ctr-a"})
 	h.step(time.Second)
 	if !h.isFrozen("ctr-b") || h.isFrozen("ctr-c") {
 		t.Fatalf("after a rewrite of the same read: %v", h.frozen)
@@ -127,11 +130,51 @@ func TestLeaseGuardFreezesAndThawsOnProof(t *testing.T) {
 	}
 }
 
+// A file read for the first time after it was written counts its age: the
+// guard starting long after sandboxd stopped, or a slow check, never gives
+// a lease fresh time. A write time ahead of the clock adds nothing.
+func TestLeaseGuardCountsALeaseFromItsWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		readAfter time.Duration // from the write to the first check
+		end       time.Duration // the freeze, from the write; 0: at the first check
+	}{
+		{"read on time", 0, 15 * time.Second},
+		// Before the fix it ran to 20 s: 15 s counted from the late read.
+		{"read 5 s late", 5 * time.Second, 15 * time.Second},
+		{"read after it ran out", time.Minute, 0},
+		// The clock reads 3 s before the write time: the guard grants what
+		// the file says was left, from its read, and nothing for the gap.
+		{"written 3 s in the future", -3 * time.Second, 12 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newLeaseHarness(t, "ctr-a")
+			h.write(t, 15, []string{"ctr-a"}, []string{"ctr-a"})
+			written := h.now
+			h.step(tc.readAfter)
+			if tc.end == 0 {
+				if !h.isFrozen("ctr-a") {
+					t.Fatal("a lease that ran out before its first read was not enforced")
+				}
+				return
+			}
+			h.step(written.Add(tc.end - time.Millisecond).Sub(h.now))
+			if h.isFrozen("ctr-a") {
+				t.Fatal("frozen before the lease's end")
+			}
+			h.step(time.Millisecond)
+			if !h.isFrozen("ctr-a") {
+				t.Fatal("not frozen at the lease's end")
+			}
+		})
+	}
+}
+
 // A file that disappears or cannot be read renews nothing: the last lease
 // read still runs out and freezes.
 func TestLeaseGuardKeepsEnforcingAnUnreadableLease(t *testing.T) {
 	h := newLeaseHarness(t, "ctr-a")
-	h.write(t, 100, 15, []string{"ctr-a"}, []string{"ctr-a"})
+	h.write(t, 15, []string{"ctr-a"}, []string{"ctr-a"})
 	h.step(0)
 	if err := os.WriteFile(h.file, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
@@ -162,7 +205,7 @@ func TestLeaseGuardKeepsEnforcingAnUnreadableLease(t *testing.T) {
 // A freeze or thaw that fails is tried again at the next check.
 func TestLeaseGuardRetries(t *testing.T) {
 	h := newLeaseHarness(t, "ctr-a")
-	h.write(t, 100, 0, []string{"ctr-a"}, []string{"ctr-a"})
+	h.write(t, 0, []string{"ctr-a"}, []string{"ctr-a"})
 	h.err = errors.New("EBUSY")
 	h.step(0)
 	if _, ok := h.g.frozen["ctr-a"]; ok {
@@ -173,7 +216,7 @@ func TestLeaseGuardRetries(t *testing.T) {
 	if !h.isFrozen("ctr-a") {
 		t.Fatal("the freeze was not retried")
 	}
-	h.write(t, 130, 15, []string{"ctr-a"}, []string{"ctr-a"})
+	h.write(t, 15, []string{"ctr-a"}, []string{"ctr-a"})
 	h.err = errors.New("EBUSY")
 	h.step(time.Second)
 	h.err = nil
@@ -191,7 +234,7 @@ func TestLeaseGuardRetries(t *testing.T) {
 
 func TestLeaseGuardRunAndCgroupFreeze(t *testing.T) {
 	h := newLeaseHarness(t, "ctr-a")
-	h.write(t, 100, 0, []string{"ctr-a"}, nil)
+	h.write(t, 0, []string{"ctr-a"}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { h.g.Run(ctx, time.Millisecond); close(done) }()

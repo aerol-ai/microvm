@@ -179,8 +179,9 @@ func (s *Service) snapshotMoverFor(sb *models.Sandbox) (snapshotMover, error) {
 }
 
 // ReleaseForSnapshotMove stops and fences id, as ReleaseForMove does, and
-// names target as the only node that may pull its bundle.
-func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target string) string {
+// names target as the only node that may pull its bundle. lifetime is the
+// incarnation the leader chose to move, as for ReleaseForMove (R10).
+func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target, lifetime string) string {
 	id, target = strings.TrimSpace(id), strings.TrimSpace(target)
 	sb, err := s.store.Get(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -209,7 +210,7 @@ func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target string)
 		ctx = runtime.WithCheckpoint(ctx)
 	}
 	s.moveTargets.set(id, target)
-	out := s.stopOne(ctx, id, true)
+	out := s.stopOne(ctx, id, lifetime, true)
 	if out != MoveReleased {
 		s.moveTargets.clear(id)
 	}

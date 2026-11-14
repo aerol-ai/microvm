@@ -108,6 +108,10 @@ func (s failingTemplateArtifactPushStore) ReleaseTemplatePush(context.Context, s
 	return false, s.err
 }
 
+func (s failingTemplateArtifactPushStore) ScheduleSnapshotRegistryRetirement(context.Context, store.SnapshotRegistryRetirement) error {
+	return s.err
+}
+
 func (s *serviceClusterStub) Leader() string { return s.leader }
 
 func (s *serviceClusterStub) Placements() []cluster.Placement {

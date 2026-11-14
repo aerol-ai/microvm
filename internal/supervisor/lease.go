@@ -22,10 +22,13 @@ import (
 //
 // The end is measured on this process's own monotonic clock: the file says
 // how much of the lease was left when it was written, and the guard counts
-// that down from when it first read it. It reads late by at most one check
-// interval, so the freeze lands at most lease + interval after the last
+// that down from when it first read it, less the file's age by the wall
+// clock sandboxd and this process share. So a file first read late (this
+// process starting long after sandboxd stopped, or a slow check) is never
+// given fresh time: the freeze lands at the lease's own end after the last
 // read sandboxd sent, against the leader's grace of twice the lease before
 // it may recreate the sandbox (the margin sandboxd's own fence relies on).
+// A write time ahead of the wall clock (a stepped clock) adds nothing.
 type LeaseGuard struct {
 	// File is SB_OWNERSHIP_LEASE_FILE, written by sandboxd.
 	File string
@@ -81,7 +84,7 @@ func (g *LeaseGuard) Check() {
 		g.readErr = ""
 		if !g.have || l.WrittenUnixMs != g.written {
 			g.lease, g.have, g.written = l, true, l.WrittenUnixMs
-			g.end = now.Add(l.Remaining())
+			g.end = now.Add(l.Remaining() - fileAge(now, l))
 		}
 	case errors.Is(err, os.ErrNotExist) && !g.have:
 		// No lease written yet: single mode, or no read has succeeded.
@@ -103,6 +106,18 @@ func (g *LeaseGuard) Check() {
 		return
 	}
 	g.freezeFenced(now)
+}
+
+// fileAge is how long before now, by the wall clock, l was written: never
+// less than zero, so a file that seems to come from the future renews
+// nothing. sandboxd writes the file on the same machine, so both read the
+// same wall clock; a clock stepped forward between the write and the read
+// only makes the freeze come sooner, the safe side.
+func fileAge(now time.Time, l ownerlease.Lease) time.Duration {
+	if age := time.Duration(now.UnixMilli()-l.WrittenUnixMs) * time.Millisecond; age > 0 {
+		return age
+	}
+	return 0
 }
 
 // thawOwned thaws each group this guard froze that a lease confirmed after
