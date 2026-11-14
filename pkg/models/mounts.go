@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -332,7 +333,12 @@ var mountCredentialNameMarkers = []string{
 // names a credential. Leading dashes are dropped, case is ignored, and '-'
 // and '_' are equivalent, so --s3-secret-access-key, secret_access_key and
 // SECRET-ACCESS-KEY are one name. A bare "pass" (rclone's sftp/ftp/webdav
-// parameter) and any name ending in _pass count too.
+// parameter) and any name ending in _pass count too, and so do a bare
+// "key" or a name ending in _key (rclone's azureblob and b2 keys, a --key
+// flag), an inline PEM (rclone's sftp key_pem) and a name ending in
+// _credentials (rclone's service_account_credentials, a whole JSON key). A
+// name for where a key lives (key_file, sse_kms_key_id,
+// shared_credentials_file) is not one.
 func isMountCredentialName(name string) bool {
 	name = strings.ToLower(strings.TrimLeft(strings.TrimSpace(name), "-"))
 	name = strings.ReplaceAll(name, "-", "_")
@@ -340,6 +346,10 @@ func isMountCredentialName(name string) bool {
 		return false
 	}
 	if name == "pass" || strings.HasSuffix(name, "_pass") {
+		return true
+	}
+	if name == "key" || strings.HasSuffix(name, "_key") || strings.Contains(name, "key_pem") ||
+		name == "credentials" || strings.HasSuffix(name, "_credentials") {
 		return true
 	}
 	for _, marker := range mountCredentialNameMarkers {
@@ -354,6 +364,36 @@ func mountCredentialInClearError(where, name string) error {
 	return fmt.Errorf("%s %q names a credential: put it in credentials, which is sealed; source and options are stored and replicated in the clear", where, name)
 }
 
+// awsAccessKeyID is an AWS access key id: AKIA for a long-term key, ASIA for
+// a temporary one. The id is not the secret, but a pasted command line that
+// carries one carries the secret beside it.
+var awsAccessKeyID = regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`)
+
+// mountCredentialValue says what credential a value looks like: an AWS
+// access key id, or a URL with a user part (https://user:pass@host). A test
+// on values cannot know every secret's shape, so names stay the main rule;
+// these are the two shapes a pasted command line brings. The caller's error
+// names the shape, never the value.
+func mountCredentialValue(v string) (string, bool) {
+	if awsAccessKeyID.MatchString(v) {
+		return "an AWS access key id", true
+	}
+	if _, rest, found := strings.Cut(v, "://"); found {
+		authority := rest
+		if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+			authority = rest[:end]
+		}
+		if strings.Contains(authority, "@") {
+			return "a URL with a user name or password in it", true
+		}
+	}
+	return "", false
+}
+
+func mountCredentialValueInClearError(where, what string) error {
+	return fmt.Errorf("%s holds %s: put it in credentials, which is sealed; source and options are stored and replicated in the clear, and a mount tool's arguments can be read by other processes", where, what)
+}
+
 // ValidateSecretsPlacement refuses credential-shaped names in the fields that
 // are stored and replicated unsealed. See mountCredentialNameMarkers.
 func (m *MountSpec) ValidateSecretsPlacement() error {
@@ -365,16 +405,35 @@ func (m *MountSpec) ValidateSecretsPlacement() error {
 			return mountCredentialInClearError("options key", k)
 		}
 	}
-	// options.extra_args is whitespace-split into argv by the S3 adapter;
-	// check every flag name, in both --flag=value and --flag value forms.
+	// options.extra_args is whitespace-split into the mount tool's argv by
+	// the S3 adapter, and a running program's argv can be read by every
+	// process that can list it (in a Kubernetes worker pod with external
+	// storage on, every container in the pod). Check every flag name, in
+	// both --flag=value and --flag value forms, and the name in a bare
+	// NAME=value word (AWS_SECRET_ACCESS_KEY=...).
 	for _, tok := range strings.Fields(m.Options["extra_args"]) {
-		if !strings.HasPrefix(tok, "-") {
+		name, _, hasValue := strings.Cut(tok, "=")
+		if !isMountCredentialName(name) {
 			continue
 		}
-		name, _, _ := strings.Cut(tok, "=")
-		if isMountCredentialName(name) {
+		if strings.HasPrefix(tok, "-") {
 			return mountCredentialInClearError("options.extra_args flag", name)
 		}
+		if hasValue {
+			return mountCredentialInClearError("options.extra_args entry", name)
+		}
+	}
+	// A credential's own shape, whatever name carries it, in every word of
+	// every option and in the source: these all reach a mount tool's argv.
+	for k, v := range m.Options {
+		for i, tok := range strings.Fields(v) {
+			if what, found := mountCredentialValue(tok); found {
+				return mountCredentialValueInClearError(fmt.Sprintf("options %q word %d", k, i+1), what)
+			}
+		}
+	}
+	if what, found := mountCredentialValue(m.Source); found {
+		return mountCredentialValueInClearError("source", what)
 	}
 	// options.opts is the NFS -o list: name or name=value, comma-separated.
 	if opts := strings.TrimSpace(m.Options["opts"]); opts != "" {

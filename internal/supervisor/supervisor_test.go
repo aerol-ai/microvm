@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -240,6 +241,18 @@ func TestSettingsFromEnv(t *testing.T) {
 	if s := SettingsFromEnv(); s.IsolateJailDir != "/var/lib/sandboxd/isolate-jail" {
 		t.Fatalf("isolate jail dir %q", s.IsolateJailDir)
 	}
+	// The external-storage folder and the pid file are off unless the pod
+	// names them.
+	t.Setenv("SB_MOUNTS_DIR", "")
+	t.Setenv("SB_RUNTIME_PID_FILE", "")
+	if s := SettingsFromEnv(); s.MountsDir != "" || s.PIDFile != "" {
+		t.Fatalf("mounts dir %q, pid file %q without their settings", s.MountsDir, s.PIDFile)
+	}
+	t.Setenv("SB_MOUNTS_DIR", "/var/lib/sandboxd/mounts")
+	t.Setenv("SB_RUNTIME_PID_FILE", "/run/aerolvm/runtime.pid")
+	if s := SettingsFromEnv(); s.MountsDir != "/var/lib/sandboxd/mounts" || s.PIDFile != "/run/aerolvm/runtime.pid" {
+		t.Fatalf("mounts dir %q, pid file %q", s.MountsDir, s.PIDFile)
+	}
 }
 
 // fakeClock fires each After at once and records the waits.
@@ -342,7 +355,8 @@ func TestRun(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(netns, n), nil, 0o644)
 	}
 	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns,
-		LeaseFile: filepath.Join(dir, "ownership-lease"), IsolateJailDir: "/var/lib/sandboxd/isolate-jail"}
+		LeaseFile: filepath.Join(dir, "ownership-lease"), IsolateJailDir: "/var/lib/sandboxd/isolate-jail",
+		MountsDir: "/var/lib/sandboxd/mounts", PIDFile: filepath.Join(dir, "run", "runtime.pid")}
 	// A lease that already ran out, fencing one sandbox: the guard Run
 	// starts freezes it (T3).
 	if err := os.MkdirAll(filepath.Join(l.Root, "kubepods/pod1/ctr/sandboxes/sb-1"), 0o755); err != nil {
@@ -364,7 +378,8 @@ func TestRun(t *testing.T) {
 			switch p {
 			case "/proc/self/mountinfo":
 				return []byte("30 25 0:26 / " + l.Root + " ro,nosuid - cgroup2 cgroup rw\n" +
-					"31 25 0:40 / /var/lib/sandboxd/isolate-jail/g1/run rw,noexec shared:7 - tmpfs tmpfs rw\n"), nil
+					"31 25 0:40 / /var/lib/sandboxd/isolate-jail/g1/run rw,noexec shared:7 - tmpfs tmpfs rw\n" +
+					"32 25 0:60 / /var/lib/sandboxd/mounts/sb-1/0 rw,nosuid shared:9 - fuse.rclone store: rw\n"), nil
 			case "/proc/self/cgroup":
 				return []byte("0::/kubepods/pod1/ctr\n"), nil
 			}
@@ -425,8 +440,55 @@ func TestRun(t *testing.T) {
 	if !strings.Contains(logs.String(), "could not lower its own OOM score") {
 		t.Fatal("a failed OOM score change was not logged")
 	}
-	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1,run" {
-		t.Fatalf("unmounted %v, want both namespaces and the V8 jail's tmpfs after containerd stopped (finding F8)", unmounted)
+	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1,run,0" {
+		t.Fatalf("unmounted %v, want both namespaces, the V8 jail's tmpfs and the sandbox's storage after containerd stopped (findings F8, F13)", unmounted)
+	}
+	// sandboxd checks an external mount through this pid's view (F13).
+	if read(t, s.PIDFile) != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("pid file = %q, want %d", read(t, s.PIDFile), os.Getpid())
+	}
+}
+
+// A pid file that cannot be written does not stop the runtime: restarting
+// it would end every sandbox, and sandboxd refuses external mounts without
+// the file. It is logged.
+func TestRunPIDFileNotWritable(t *testing.T) {
+	l := fakeCgroup(t, "/kubepods/pod1/ctr", "12884901888", "1")
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "file")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "config.toml"), ParentFile: filepath.Join(dir, "parent"),
+		NetnsDir: filepath.Join(dir, "netns"), PIDFile: filepath.Join(blocker, "runtime.pid")}
+	ctx, cancel := context.WithCancel(context.Background())
+	sys := OS{
+		CgroupRoot: l.Root,
+		ReadFile: func(p string) ([]byte, error) {
+			switch p {
+			case "/proc/self/mountinfo":
+				return nil, nil
+			case "/proc/self/cgroup":
+				return []byte("0::/kubepods/pod1/ctr\n"), nil
+			}
+			return os.ReadFile(p)
+		},
+		Remount:       func() error { return nil },
+		LowerOOM:      func() error { return nil },
+		BecomeReaper:  func() error { return nil },
+		DefaultConfig: func(string) ([]byte, error) { return []byte("version = 3"), nil },
+		StartInGroup:  func(string, []string) (int, error) { cancel(); return 4242, nil },
+		Terminate:     func(int) {},
+		Unmount:       func(string) error { return nil },
+		Reap:          func(*atomic.Int64, chan<- int, *slog.Logger) {},
+		SetFrozen:     func(string, bool) error { return nil },
+	}
+	var logs bytes.Buffer
+	if err := Run(ctx, s, sys, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+		t.Fatalf("Run stopped on a pid file it could not write: %v", err)
+	}
+	if !strings.Contains(logs.String(), "could not publish its pid") {
+		t.Fatalf("logs: %s", logs.String())
 	}
 }
 
@@ -592,7 +654,7 @@ func TestUnmountUnder(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&logs, nil))
 	var got []string
-	UnmountUnder(base+"/", []byte(table), func(p string) error {
+	UnmountUnder(base+"/", "V8 jail", []byte(table), func(p string) error {
 		got = append(got, p)
 		if strings.HasSuffix(p, "/tmp") {
 			return errors.New("EBUSY")
@@ -612,7 +674,7 @@ func TestUnmountUnder(t *testing.T) {
 		t.Fatalf("logs: %s", logs.String())
 	}
 	logs.Reset()
-	UnmountUnder(base, []byte("42 1 0:4 / /run/netns/sb-1 rw - nsfs nsfs rw\n"), func(string) error { t.Fatal("nothing to unmount"); return nil }, log)
+	UnmountUnder(base, "V8 jail", []byte("42 1 0:4 / /run/netns/sb-1 rw - nsfs nsfs rw\n"), func(string) error { t.Fatal("nothing to unmount"); return nil }, log)
 	if logs.Len() != 0 {
 		t.Fatalf("nothing to unmount was reported: %s", logs.String())
 	}

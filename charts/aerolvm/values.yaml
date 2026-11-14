@@ -92,6 +92,23 @@ worker:
   firecracker:
     enabled: false
     jailerUID: 990
+  # External storage in a create's mounts (S3, NFS, SSHFS, rclone; docs page
+  # "External storage"). sandboxd runs each mount's helper (mount-s3,
+  # rclone, sshfs) in the runtime container's group, below a mounts folder
+  # both containers share with two-way mount propagation, and answers a
+  # create only once the runtime container sees each mount. Turning this on
+  # also makes the worker pod share one process namespace, so a helper
+  # outlives an agent restart and that check means something. The cost:
+  # every container in the pod, the internet-facing edge (Caddy) among
+  # them, can then list the pod's processes and read their command lines,
+  # and with runc sandboxes the tenants' processes too; not their memory,
+  # environment or files. Mount credentials never go on a command line
+  # (sandboxd writes them to files and refuses them in options). Off, a
+  # create with mounts is refused (501 mounts_unavailable), never served
+  # from the worker's own disk. Platform volumes are mounts the same way,
+  # so they need it too.
+  externalStorage:
+    enabled: false
   # A decommission moves a running gVisor sandbox to another worker with its
   # memory: its programs keep running, its open connections drop (C21).
   # false is the kill switch: such a sandbox is then rebuilt or stopped as

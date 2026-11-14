@@ -35,6 +35,9 @@ ARG FIRECRACKER_KERNEL_CONFIG_SHA256_ARM64
 ARG GVISOR_RELEASE
 ARG GVISOR_SHA512_AMD64
 ARG GVISOR_SHA512_ARM64
+ARG MOUNTPOINT_S3_VERSION
+ARG MOUNTPOINT_S3_SHA256_AMD64
+ARG MOUNTPOINT_S3_SHA256_ARM64
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl bzip2 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /fetch
@@ -91,6 +94,17 @@ RUN set -eu; \
     mkdir -p gvisor; \
     tar -xjf gvisor.tar.bz2 -C gvisor; \
     install -m 0755 "$(find gvisor -type f -name runsc | head -1)" /out/runsc
+# mount-s3, the s3 mount type's helper (AWS ships it only as a package);
+# installed in the final stage, which has its dependencies' apt index.
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) m=x86_64; ms="$MOUNTPOINT_S3_SHA256_AMD64" ;; \
+      arm64) m=arm64; ms="$MOUNTPOINT_S3_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 -o /out/mount-s3.deb \
+      "https://s3.amazonaws.com/mountpoint-s3-release/${MOUNTPOINT_S3_VERSION}/${m}/mount-s3-${MOUNTPOINT_S3_VERSION}-${m}.deb"; \
+    echo "$ms  /out/mount-s3.deb" | sha256sum -c --quiet -
 
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ARG TARGETARCH
@@ -104,10 +118,16 @@ LABEL org.opencontainers.image.title="aerolvm" \
       org.opencontainers.image.revision="${REVISION}"
 # iproute2, iptables and nftables: the CNI bridge plugin's NAT and sandboxd's
 # per-sandbox rules (the Phase 0 agent installed the same, agent.sh).
+# fuse3, sshfs, rclone, nfs-common and mount-s3: the external-storage mount
+# helpers sandboxd runs, the same tools scripts/install.sh puts on a VM;
+# without them every mount type was refused in a worker pod (finding F13).
+# rpcbind (nfs-common's) is never started here: no init runs in the image.
+COPY --from=fetch /out/mount-s3.deb /tmp/mount-s3.deb
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates iproute2 iptables nftables procps \
       skopeo umoci e2fsprogs \
-    && rm -rf /var/lib/apt/lists/*
+      fuse3 sshfs rclone nfs-common /tmp/mount-s3.deb \
+    && rm -rf /var/lib/apt/lists/* /tmp/mount-s3.deb
 COPY --from=fetch /out/cni /opt/aerolvm/cni
 COPY --from=fetch /out/workerd /usr/local/bin/workerd
 COPY --from=fetch /out/fc/firecracker /out/fc/jailer /out/runsc /usr/local/bin/

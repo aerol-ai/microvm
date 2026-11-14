@@ -211,6 +211,17 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "SB_CLUSTER_RESERVE_APPLY_LIMIT must be >= 0",
 		},
 		{
+			name: "cluster orphan retry rate below one",
+			env: map[string]string{
+				"SB_ENABLE_CLUSTER":               "true",
+				"SB_CLUSTER_BOOTSTRAP":            "true",
+				"SB_CLUSTER_INSECURE_GOSSIP":      "true",
+				"SB_CLUSTER_INSECURE_CREDENTIALS": "true",
+				"SB_CLUSTER_ORPHAN_RETRY_RATE":    "0",
+			},
+			want: "SB_CLUSTER_ORPHAN_RETRY_RATE must be >= 1",
+		},
+		{
 			name: "auto import reconcile interval must be positive",
 			env: map[string]string{
 				"SB_AUTO_IMPORT_ENABLED":            "true",
