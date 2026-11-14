@@ -79,6 +79,10 @@ func replaceInFile(raw, pattern, newValue string) error {
 	if info.IsDir() {
 		return fmt.Errorf("%s is a folder", target)
 	}
+	// A named pipe would wait for a writer, a device may never end.
+	if !info.Mode().IsRegular() {
+		return &fileKindError{msg: target + " is not a file: only files are edited"}
+	}
 	content, err := os.ReadFile(target)
 	if err != nil {
 		return err
