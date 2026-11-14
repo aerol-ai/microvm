@@ -250,6 +250,15 @@ func runSnapshotMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (Mo
 		return MoveActionResult{}, errors.New(a.Action + " takes one sandbox")
 	}
 	id := strings.TrimSpace(a.IDs[0])
+	// The id becomes a host path on this worker (the runtime's state dir,
+	// sockets, logs, a WASM checkpoint). The leader sends only ids it
+	// placed, and each driver checks the id again before it builds a path,
+	// but code scanning cannot see those hand-written checks
+	// (go/path-injection): refuse a malformed id here, where it enters,
+	// before any handler sees it.
+	if err := models.ValidateSandboxID(id); err != nil {
+		return MoveActionResult{}, fmt.Errorf("%s: %w", a.Action, err)
+	}
 	var err error
 	switch a.Action {
 	case "release-snapshot":

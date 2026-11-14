@@ -313,6 +313,24 @@ func TestRunSnapshotMoveAction(t *testing.T) {
 	if _, err := RunMoveAction(ctx, &fakeMoves{}, MoveAction{Action: "import", IDs: []string{"sb"}, Source: "a"}); err == nil {
 		t.Fatal("a handler without the snapshot half took an import")
 	}
+	// An id that is not a sandbox id never reaches the handler: it would
+	// become a host path there.
+	before := len(h.calls)
+	for _, bad := range []string{"../sb", "sb/../../etc", "a/b", "sb.1", strings.Repeat("a", 129)} {
+		for _, a := range []MoveAction{
+			{Action: "release-snapshot", IDs: []string{bad}, Target: "b"},
+			{Action: "import", IDs: []string{bad}, Source: "a"},
+			{Action: "drop", IDs: []string{bad}},
+			{Action: "start-moved", IDs: []string{bad}, Recreate: &MoveRecreate{Spec: models.CreateSandboxRequest{Image: "alpine"}}},
+		} {
+			if _, err := RunMoveAction(ctx, h, a); err == nil || !strings.Contains(err.Error(), a.Action) {
+				t.Fatalf("%s of %q = %v, want an error naming the action", a.Action, bad, err)
+			}
+		}
+	}
+	if len(h.calls) != before {
+		t.Fatalf("a malformed id reached the handler: %v", h.calls[before:])
+	}
 	h.importErr = errors.New("no room")
 	if out, err := RunMoveAction(ctx, h, MoveAction{Action: "import", IDs: []string{"sb"}, Source: "a"}); err != nil || out.Error != "no room" {
 		t.Fatalf("a failed import = %+v %v", out, err)
