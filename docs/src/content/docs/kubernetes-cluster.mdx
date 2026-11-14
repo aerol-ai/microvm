@@ -36,7 +36,7 @@ Servers, gateways and the operator run under the `restricted` pod security level
 
 ## What you need
 
-- A Kubernetes cluster with Linux nodes (amd64 or arm64) that use cgroup v2 and kernel 5.10 or later, spread over two or more zones. Amazon Linux 2023, Bottlerocket, Azure Linux and Ubuntu 22.04 all qualify.
+- Kubernetes 1.30 or later, with Linux nodes (amd64 or arm64) that use cgroup v2 and kernel 5.10 or later, spread over two or more zones. Amazon Linux 2023, Bottlerocket, Azure Linux and Ubuntu 22.04 all qualify.
 - The `br_netfilter` kernel module loaded on the worker machines. Stock Amazon Linux 2023 does not load it: add `modprobe br_netfilter` to the node image or its user data, and list it in `/etc/modules-load.d`.
 - [cert-manager](https://cert-manager.io). The operator's webhook gets its certificate from it, and so do [sandbox links over HTTPS](/kubernetes/#sandbox-links-over-https).
 - A storage class that binds a disk when a pod first uses it (`volumeBindingMode: WaitForFirstConsumer`), so each server's disk lands in its own zone. EKS's `gp3` and AKS's `managed-csi` do.
@@ -85,7 +85,7 @@ The chart makes the worker namespace, `aerolvm-workers`, and labels it to allow 
 
 1. The first server starts the cluster.
 2. The other servers join it, one per zone.
-3. The gateways and the first workers join. Each new pod gets a one-time join token that only it can read, and the token is deleted once the pod joins. (With [your own certificate authority](#use-your-own-certificate-authority), each pod joins with its certificate instead.)
+3. The gateways and the first workers join. Each new pod proves to the operator which pod it is and which machine it runs on, and gets a one-time join token back (see [How a pod proves who it is](#how-a-pod-proves-who-it-is)). (With [your own certificate authority](#use-your-own-certificate-authority), each pod joins with its certificate instead.)
 
 Watch it:
 
@@ -348,9 +348,28 @@ kubectl -n aerolvm-system exec -it aerolvm-server-0 -- sandboxd backup --output 
 
 Remove the annotation to bring the server back. To recover from losing most servers, put **every** surviving server in maintenance mode first: `recover-quorum` refuses while the AerolVM server runs on any of them, and the operator replaces no lost server while one is in maintenance. See the [operational runbooks](/operational-runbooks/).
 
+## How a pod proves who it is
+
+A new server, gateway or worker pod needs a join token before it can join. The operator gives one only to a pod that proves who it is:
+
+1. Kubernetes gives the pod a short-lived token that names the pod and the machine it runs on. The token is made for the operator alone. The Kubernetes API refuses it, so it opens nothing there.
+2. When the pod starts, it shows that token to the operator.
+3. The operator asks Kubernetes about the token. It checks that the pod exists, is the pod the token names, belongs to an AerolVM node, runs on the machine the token names, and has not joined yet.
+4. Only then does the operator ask the servers for a join token. The token works once and lasts 10 minutes.
+
+No token is made before its pod runs on a machine, and none is stored in a Secret. A pod gets one token. If that token runs out before the pod joins, the pod may ask again.
+
+When the operator refuses a pod, the pod's AerolNode shows why in its `IdentityDenied` condition:
+
+```bash
+kubectl -n aerolvm-system describe aerolnode aerolvm-general-x7k2p
+```
+
+This needs Kubernetes 1.30 or later, which puts the machine's name in the pod's token.
+
 ## Use your own certificate authority
 
-By default, the servers hold the cluster's certificate authority (CA) key. Each new pod joins with a one-time token, and the servers sign its certificate.
+By default, the servers hold the cluster's certificate authority (CA) key. Each new pod joins with a one-time token (see [How a pod proves who it is](#how-a-pod-proves-who-it-is)), and the servers sign its certificate.
 
 A bank may need the CA key to stay outside the cluster. **External-CA mode** does that. Your own issuer signs every node's certificate through cert-manager, and the cluster never holds a CA key.
 

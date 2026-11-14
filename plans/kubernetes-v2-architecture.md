@@ -1226,9 +1226,20 @@ Each row is a drill in section 19.
   for a worker also checks that the pod really runs on the machine it names
   (D6). Only then does it issue the pod's identity (R2, CEO review RQ12):
   - **By default**, a single-use v0.7.0 join token for that pod
-    (`internal/nodejoin`), stored as a Secret mounted only into that pod and
-    deleted once the pod joins. The pod joins exactly as a VM does, its node
-    certificate renews itself, and the CA key lives on the servers.
+    (`internal/nodejoin`). The pod joins exactly as a VM does, its node
+    certificate renews itself, and the CA key lives on the servers. Built as
+    a pull (S5 fix): the pod's `setup` container has a projected token for
+    the audience `aerolvm.io/join` (10 minutes, setup only) and posts it to
+    the operator's `/v1/join-token` on the webhook server. The operator runs
+    TokenReview, then checks the live pod has the token's UID, is the
+    current pod of an AerolNode, runs on the machine the token names
+    (Kubernetes 1.30+ puts it there), and has not joined. It marks the pod
+    (`aerolvm.io/join-token-issued`, written with the pod's resource version,
+    so two replicas cannot both answer), then mints a 10-minute token. No
+    token is made before a scheduled pod asks, and none is stored in a
+    Secret (S-2). The pod trusts the operator by the CA in its spec (the
+    chart's own CA issuer, ten years). A refused pod's AerolNode shows
+    `IdentityDenied`.
   - **In external-CA mode** (`security.externalCA`), the operator instead
     requests the pod's certificate from the bank's issuer through cert-manager,
     and the CA key never enters the cluster (D11). This is also the
@@ -3437,7 +3448,7 @@ namespace). Its remedy enforces an approved behavior (C14: processes survive an
 | # | Threat | Likelihood | Impact | Mitigated by the plan? |
 |---|---|---|---|---|
 | S-1 | **CRITICAL GAP.** A sandbox reaches the bank's cluster network: other pods (VPC addresses on EKS), Services, the API server, and its own worker pod's ports. Sandbox traffic leaves with the worker pod's address (§8.4), so the bank's NetworkPolicy cannot tell it apart from AerolVM's own traffic. `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT` is off by default (`internal/config/config.go:2171`). The plan's "second, outer wall" (§8.4, §15.3) holds only for destinations the worker pod itself must never reach. | High (untrusted code, by design) | High (lateral movement inside a bank's cluster) | Yes, by C24 (RQ14) |
-| S-2 | A join token Secret is read before its pod uses it (someone with Secret read in the worker namespace, or an etcd backup) | Low | High (a rogue node joins) | Partly: single use, deleted after join (C23). Pending for eng review: a life of at most 10 minutes, bound to the pod's UID and machine, and RBAC so only the operator touches Secrets in the worker namespace. |
+| S-2 | A join token Secret is read before its pod uses it (someone with Secret read in the worker namespace, or an etcd backup) | Low | High (a rogue node joins) | Yes (S5 fix, §15.2): no join token is stored in a Secret. One is made only for a scheduled pod that proves itself with TokenReview, bound to its UID and machine, single use, 10 minutes. |
 | S-3 | A sandbox that escapes gVisor reads the pod's ServiceAccount token | Low | Medium (the worker SA has no API rights, K4) | Partly. Pending: mount the projected token only into the `agent` container, never `runtime`. |
 | S-4 | Every privileged worker holds a DNS API token so `edge` can get wildcard certificates (DNS-01), the same issue the cluster docs review found on VMs | Medium | Medium (DNS takeover of the zone) | No. Pending for eng review: cert-manager issues the wildcard into a Secret mounted only into `edge`, so workers hold no DNS token. |
 | S-5 | Escape from the privileged `runtime` container to the machine | Low (gVisor) | High | Yes, as far as it can be: §8.7 walls, gVisor default, S7 measures the smallest rights, P7 states it. |
