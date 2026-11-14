@@ -233,7 +233,7 @@ spec:
 ---
 # The worker-pod delete guard (C26, eng review D5). failurePolicy Ignore: an
 # operator outage never blocks a cluster repair; a worker pod lost without
-# a decommission raises an alert instead.
+# a decommission raises an alert instead. It also decides evictions, below.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
@@ -267,4 +267,57 @@ webhooks:
       matchLabels:
         app.kubernetes.io/name: aerolvm
         app.kubernetes.io/component: worker
+  # An eviction (kubectl drain, a node group update, Karpenter) is a CREATE
+  # on pods/eviction, which the delete rule above never sees: the API server
+  # deletes the evicted pod itself. Its object is an Eviction, without the
+  # pod's labels, so this rule has no objectSelector and the guard reads the
+  # pod. The PodDisruptionBudget below refuses these evictions first; this
+  # holds if someone removes it. A refusal is a 429, as the budget's is.
+  - name: worker-pod-eviction.aerolvm.io
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: {{ $op }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-worker-pod-delete
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods/eviction]
+        scope: Namespaced
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $workerNS }}
+---
+# Worker pods refuse every voluntary eviction (plans/kubernetes-v2-architecture.md
+# §10.6). kubectl drain, an EKS managed node group update, Karpenter and the
+# AKS upgrade wait here while the operator, seeing the cordon, moves the
+# worker's sandboxes off; it then deletes the pod itself, which a budget does
+# not block. A managed node group waits 15 minutes per machine, then stops
+# its update with PodEvictionFailure: drain a pool before its upgrade when
+# moving its sandboxes takes longer. The ASG's AZRebalance and scale-in
+# ignore budgets: suspend AZRebalance on worker node groups. A not-ready
+# worker is held too (the default
+# unhealthyPodEvictionPolicy): an agent restarting in place still runs its
+# sandboxes. One budget per pod: the eviction API refuses a pod that two
+# budgets select, so add no other budget over worker pods.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}-workers
+  namespace: {{ $workerNS }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/component: worker
+      aerolvm.io/cluster: {{ .Values.cluster.name }}
 {{- end }}

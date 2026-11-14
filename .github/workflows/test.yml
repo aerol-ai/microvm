@@ -914,13 +914,14 @@ jobs:
         run: |
           helm lint charts/aerolvm
           helm template t charts/aerolvm | grep -q 'kind: StatefulSet'
-          # Cluster mode (P2): the operator, its webhook, the AerolCluster
-          # and the pod templates; no single-mode StatefulSet. It refuses
-          # without zones and worker pools.
+          # Cluster mode (P2): the operator, its webhook, the worker
+          # PodDisruptionBudget, the AerolCluster and the pod templates; no
+          # single-mode StatefulSet. It refuses without zones and worker
+          # pools.
           cluster="--set mode=cluster --set cluster.zones={a,b,c} --set cluster.workerPools[0].name=general --set cluster.workerPools[0].machine.cpu=8 --set cluster.workerPools[0].machine.memoryGiB=32 --set cluster.workerPools[0].minWorkers=3 --set cluster.workerPools[0].maxWorkers=9"
           helm lint charts/aerolvm $cluster
           out="$(helm template t charts/aerolvm $cluster)"
-          for kind in AerolCluster ValidatingWebhookConfiguration PriorityClass Namespace; do
+          for kind in AerolCluster ValidatingWebhookConfiguration PodDisruptionBudget PriorityClass Namespace; do
             grep -q "kind: $kind" <<<"$out" || { echo "::error::cluster mode rendered no $kind"; exit 1; }
           done
           if grep -q 'kind: StatefulSet' <<<"$out"; then
