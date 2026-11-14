@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,6 +51,7 @@ type options struct {
 	joinURL         string
 	joinCAFile      string
 	nodeConcurrency int
+	applyCRDs       string
 }
 
 func parse(args []string) (options, error) {
@@ -67,11 +69,16 @@ func parse(args []string) (options, error) {
 	fs.StringVar(&o.joinURL, "join-url", "", "where a new pod asks the operator for its join token: https://<operator Service>.<namespace>.svc"+controller.JoinIssuePath)
 	fs.StringVar(&o.joinCAFile, "join-ca-file", "", "the CA a joining pod trusts the operator by (default: ca.crt in --webhook-cert-dir)")
 	fs.IntVar(&o.nodeConcurrency, "node-concurrency", controller.DefaultNodeConcurrency, "AerolNodes reconciled at once")
+	fs.StringVar(&o.applyCRDs, "apply-crds", "", "update AerolVM's CustomResourceDefinitions from the YAML files in this folder, then exit (the chart's pre-upgrade hook)")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
 	if o.nodeConcurrency < 1 {
 		return o, fmt.Errorf("--node-concurrency must be at least 1")
+	}
+	if o.applyCRDs != "" {
+		// A one-shot that runs no controllers: nothing else applies.
+		return o, nil
 	}
 	if o.namespace == "" {
 		return o, fmt.Errorf("--namespace (or POD_NAMESPACE) is required")
@@ -85,6 +92,15 @@ func parse(args []string) (options, error) {
 	return o, nil
 }
 
+// newCRDClient is --apply-crds' client; a test replaces it.
+var newCRDClient = func() (client.Client, error) {
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	return client.New(cfg, client.Options{Scheme: crdScheme()})
+}
+
 func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
@@ -96,6 +112,15 @@ func run(args []string) error {
 	o, err := parse(args)
 	if err != nil {
 		return err
+	}
+	if o.applyCRDs != "" {
+		c, err := newCRDClient()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		return applyCRDs(ctx, c, o.applyCRDs, os.Stdout)
 	}
 	ctrl.SetLogger(zap.New())
 	scheme := newScheme()

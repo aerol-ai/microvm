@@ -856,6 +856,12 @@ jobs:
             --set 'cluster.workerPools[0].minWorkers=3' --set 'cluster.workerPools[0].maxWorkers=9' \
             --set cluster.externalCA.issuerRef.name=bank-ca \
             --show-only templates/operator.yaml > "$RUNNER_TEMP/chart-operator.yaml"
+          helm template t charts/aerolvm --namespace aerolvm-system \
+            --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
+            --set 'cluster.workerPools[0].name=general' \
+            --set 'cluster.workerPools[0].machine.cpu=8' --set 'cluster.workerPools[0].machine.memoryGiB=32' \
+            --set 'cluster.workerPools[0].minWorkers=3' --set 'cluster.workerPools[0].maxWorkers=9' \
+            --show-only templates/crd-upgrade.yaml > "$RUNNER_TEMP/chart-crd-upgrade.yaml"
 
       # The CRDs, deep copies and RBAC are generated from the Go types and
       # markers; a stale copy fails here, not on a live cluster.
@@ -870,6 +876,7 @@ jobs:
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
+          AEROLVM_CHART_CRD_UPGRADE: ${{ runner.temp }}/chart-crd-upgrade.yaml
         run: |
           go vet ./...
           go test -race -count=1 -cover ./...
@@ -926,6 +933,13 @@ jobs:
           done
           if grep -q 'kind: StatefulSet' <<<"$out"; then
             echo "::error::cluster mode rendered the single-mode StatefulSet"
+            exit 1
+          fi
+          # Helm never updates crds/: a pre-upgrade Job does, unless asked
+          # not to.
+          grep -q -- '--apply-crds=/crds' <<<"$out" || { echo "::error::cluster mode rendered no CRD upgrade hook"; exit 1; }
+          if helm template t charts/aerolvm $cluster --set cluster.operator.upgradeCRDs=false | grep -q -- '--apply-crds'; then
+            echo "::error::cluster.operator.upgradeCRDs=false still rendered the CRD upgrade hook"
             exit 1
           fi
           if helm template t charts/aerolvm --set mode=cluster >/dev/null 2>&1; then
