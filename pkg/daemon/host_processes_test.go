@@ -53,6 +53,44 @@ func TestCheckHostProcessesOutliveAgent(t *testing.T) {
 	}
 }
 
+// External-storage mount helpers die with an agent that owns its PID
+// namespace too (F13): a worker pod that does not share one is warned, never
+// refused, and nothing is said on a VM or in a shared pod.
+// In a Kubernetes worker pod, external storage is served only when the
+// chart turned it on (the runtime pid file is set) and the pod shares one
+// process namespace; otherwise every mount is refused, never written to
+// local disk (F13). Off Kubernetes nothing changes. Fail closed: a pod
+// whose namespace cannot be read is refused too.
+func TestMountsOffReason(t *testing.T) {
+	const pod = "/kubepods.slice/pod1/sandboxes"
+	const pidFile = "/run/aerolvm/runtime.pid"
+	for _, tc := range []struct {
+		name    string
+		parent  string
+		pidFile string
+		owns    bool
+		err     error
+		want    string // "" = served
+	}{
+		{name: "VM", owns: true},
+		{name: "VM with a pid file", pidFile: pidFile, owns: true},
+		{name: "chart value off", parent: pod, want: "worker.externalStorage.enabled"},
+		{name: "on, namespace shared", parent: pod, pidFile: pidFile},
+		{name: "on, pod owns its namespace", parent: pod, pidFile: pidFile, owns: true, want: "does not share one process namespace"},
+		{name: "on, namespace unreadable", parent: pod, pidFile: pidFile, err: errors.New("no procfs"), want: "cannot tell"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := ownsPIDNamespace
+			ownsPIDNamespace = func() (bool, error) { return tc.owns, tc.err }
+			t.Cleanup(func() { ownsPIDNamespace = old })
+			got := mountsOffReason(config.Config{HostProcessCgroupParent: tc.parent, MountsRuntimePIDFile: tc.pidFile})
+			if (got == "") != (tc.want == "") || !strings.Contains(got, tc.want) {
+				t.Fatalf("mountsOffReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // A jailed VM's TAP is made for the jailer's user and group (F33); without
 // the jailer it has no owner, as before.
 func TestFirecrackerTapHost(t *testing.T) {

@@ -816,6 +816,7 @@ say "built and installed in $(( $(date +%s) - t0 ))s"
 [ "$proof" = gmove ] && { proof_move gvisor; finish; }
 [ "$proof" = kubeapi ] && { proof_kubeapi; finish; }
 [ "$proof" = externalca ] && { proof_externalca; proof_externalca_policy; finish; }
+[ "$proof" = mount ] && { . integration-tests/k8s/fckind/mount.sh; proof_mount; finish; }
 [ "$proof" = review ] && { . integration-tests/k8s/fckind/review.sh; proof_review; finish; }
 # A proof that stops part way (bash drops the rest of a command on an
 # expansion error) must not run on into the pod proof below.

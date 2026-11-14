@@ -593,15 +593,22 @@ type Config struct {
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
-	PlatformVolumes             PlatformVolumesConfig
-	LogLevel                    string
-	ShutdownTimeout             time.Duration
-	HTTPClientTimeout           time.Duration
-	DockerRuntimeWaitTimeout    time.Duration
-	ToolboxWaitTimeout          time.Duration
-	DockerReadySocketEnabled    bool
-	DockerReadinessPollInitial  time.Duration
-	DockerReadinessPollMax      time.Duration
+	// MountsRuntimePIDFile names a file holding the pid of a process in the
+	// mount namespace that builds sandboxes: in the Kubernetes worker pod,
+	// the runtime container's supervisor writes it. Set, an external mount
+	// is checked visible there before a create answers, and the create fails
+	// otherwise (pkg/mounts, finding F13). Empty on a VM, where sandboxd and
+	// the runtime share one mount namespace. SB_MOUNTS_RUNTIME_PID_FILE.
+	MountsRuntimePIDFile       string
+	PlatformVolumes            PlatformVolumesConfig
+	LogLevel                   string
+	ShutdownTimeout            time.Duration
+	HTTPClientTimeout          time.Duration
+	DockerRuntimeWaitTimeout   time.Duration
+	ToolboxWaitTimeout         time.Duration
+	DockerReadySocketEnabled   bool
+	DockerReadinessPollInitial time.Duration
+	DockerReadinessPollMax     time.Duration
 	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
 	// SB_DOCKER_POOL_ENABLED.
 	DockerPoolEnabled bool
@@ -1433,6 +1440,13 @@ type Config struct {
 	// Only reservations are bounded, never heartbeats, deletes or repairs.
 	// 0 disables the bound. SB_CLUSTER_RESERVE_APPLY_LIMIT.
 	ClusterReserveApplyLimit int
+	// ClusterOrphanRetryRate is how many orphaned recreate-policy sandboxes
+	// the leader may move to a node with room each second, once room is
+	// back after a loss (R14): each move is one Raft write, so the rate
+	// bounds what recovery takes from creates. At the default 200, the
+	// 33,000 sandboxes of a lost zone in a 100,000-sandbox cell wait under
+	// 3 minutes for a node. SB_CLUSTER_ORPHAN_RETRY_RATE.
+	ClusterOrphanRetryRate int
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
 	// raft configuration. Long enough to absorb transient gossip flap
@@ -2409,6 +2423,7 @@ func load(keyTool bool) (Config, error) {
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
+		MountsRuntimePIDFile:              strings.TrimSpace(os.Getenv("SB_MOUNTS_RUNTIME_PID_FILE")),
 		PlatformVolumes: PlatformVolumesConfig{
 			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
 			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
@@ -2510,6 +2525,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
 		ClusterReserveApplyLimit:         getEnvInt("SB_CLUSTER_RESERVE_APPLY_LIMIT", 256),
+		ClusterOrphanRetryRate:           getEnvInt("SB_CLUSTER_ORPHAN_RETRY_RATE", 200),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
 		ClusterRestartWindow:             getEnvDuration("SB_CLUSTER_RESTART_WINDOW", 120*time.Second),
 		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
@@ -2963,6 +2979,9 @@ func load(keyTool bool) (Config, error) {
 			cfg.IsolateJailCgroupRoot = filepath.Join(cgroupV2Mount, p, "aerolvm-isolate")
 		}
 	}
+	if p := cfg.MountsRuntimePIDFile; p != "" && !filepath.IsAbs(p) {
+		return Config{}, fmt.Errorf("SB_MOUNTS_RUNTIME_PID_FILE must be an absolute path, got %q", p)
+	}
 
 	// Firecracker host-side wiring is opt-in. The flag exists to gate the
 	// driver registration in cmd/sandboxd/main.go; when it's off the
@@ -3208,6 +3227,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ClusterCreateMaxPendingPerWorker < 0 {
 			return Config{}, errors.New("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0")
+		}
+		if cfg.ClusterOrphanRetryRate < 1 {
+			return Config{}, errors.New("SB_CLUSTER_ORPHAN_RETRY_RATE must be >= 1")
 		}
 		if cfg.ClusterReserveApplyLimit < 0 {
 			return Config{}, errors.New("SB_CLUSTER_RESERVE_APPLY_LIMIT must be >= 0")

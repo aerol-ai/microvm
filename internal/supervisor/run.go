@@ -34,6 +34,17 @@ type Settings struct {
 	// each group's chroot, Bidirectional like the network namespaces, and
 	// they are unmounted when the supervisor stops (UnmountUnder).
 	IsolateJailDir string
+	// MountsDir is where the agent mounts sandboxes' external storage
+	// (SB_MOUNTS_DIR, the agent's SB_MOUNTS_ROOT). Both containers mount it
+	// Bidirectional, so a mount the agent makes reaches containerd here
+	// (F13); that puts it in the machine's mount table too, so it is
+	// unmounted when the supervisor stops, as the jail's mounts are.
+	MountsDir string
+	// PIDFile is where the supervisor writes its pid (SB_RUNTIME_PID_FILE),
+	// on a folder both containers mount: sandboxd checks an external mount
+	// through /proc/<pid>/root, this container's view, before a create
+	// answers (SB_MOUNTS_RUNTIME_PID_FILE).
+	PIDFile string
 }
 
 // leaseCheckInterval paces the LeaseGuard: well under sandboxd's own
@@ -58,6 +69,8 @@ func SettingsFromEnv() Settings {
 		NetnsDir:         get("SB_NETNS_DIR", "/run/netns"),
 		LeaseFile:        get("SB_OWNERSHIP_LEASE_FILE", ""),
 		IsolateJailDir:   get("SB_ISOLATE_JAIL_DIR", ""),
+		MountsDir:        get("SB_MOUNTS_DIR", ""),
+		PIDFile:          get("SB_RUNTIME_PID_FILE", ""),
 	}
 }
 
@@ -130,6 +143,14 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	if err := WriteParentFile(s.ParentFile, shape.Parent); err != nil {
 		return fmt.Errorf("publish the cgroup parent: %w", err)
 	}
+	if s.PIDFile != "" {
+		// Not fatal: restarting this container ends every sandbox, and
+		// without the file sandboxd refuses external mounts, never
+		// serves one the sandbox cannot see.
+		if err := WriteParentFile(s.PIDFile, strconv.Itoa(os.Getpid())); err != nil {
+			log.Warn("supervisor: could not publish its pid; creates with external storage are refused until it can", "file", s.PIDFile, "error", err)
+		}
+	}
 	if err := sys.LowerOOM(); err != nil {
 		log.Warn("supervisor: could not lower its own OOM score", "error", err)
 	}
@@ -172,11 +193,16 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	k.Run(ctx)
 	<-guardDone
 	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
-	if s.IsolateJailDir != "" {
+	if s.IsolateJailDir != "" || s.MountsDir != "" {
 		if raw, err := sys.ReadFile("/proc/self/mountinfo"); err != nil {
-			log.Warn("supervisor: could not read the mount table to unmount the V8 jail's mounts", "error", err)
+			log.Warn("supervisor: could not read the mount table to unmount the pod's mounts", "error", err)
 		} else {
-			UnmountUnder(s.IsolateJailDir, raw, sys.Unmount, log)
+			if s.IsolateJailDir != "" {
+				UnmountUnder(s.IsolateJailDir, "V8 jail", raw, sys.Unmount, log)
+			}
+			if s.MountsDir != "" {
+				UnmountUnder(s.MountsDir, "sandbox storage", raw, sys.Unmount, log)
+			}
 		}
 	}
 	return nil
@@ -188,8 +214,9 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 // pod its chroot base is mounted Bidirectional, so a restarted agent finds
 // them and takes the group over (C14), which also puts them in the
 // machine's mount table: left there, the pod stays in Terminating, as the
-// network namespaces did (F8).
-func UnmountUnder(dir string, mountinfo []byte, unmount func(string) error, log *slog.Logger) {
+// network namespaces did (F8). Sandboxes' external storage is the same
+// (MountsDir). label names the mounts in the logs ("V8 jail").
+func UnmountUnder(dir, label string, mountinfo []byte, unmount func(string) error, log *slog.Logger) {
 	dir = filepath.Clean(dir)
 	var points []string
 	for _, line := range strings.Split(string(mountinfo), "\n") {
@@ -208,13 +235,13 @@ func UnmountUnder(dir string, mountinfo []byte, unmount func(string) error, log 
 	n := 0
 	for _, p := range points {
 		if err := unmount(p); err != nil {
-			log.Warn("supervisor: could not unmount a V8 jail mount", "path", p, "error", err)
+			log.Warn("supervisor: could not unmount a "+label+" mount", "path", p, "error", err)
 			continue
 		}
 		n++
 	}
 	if len(points) > 0 {
-		log.Info("supervisor: V8 jail mounts unmounted", "count", n)
+		log.Info("supervisor: "+label+" mounts unmounted", "count", n)
 	}
 }
 

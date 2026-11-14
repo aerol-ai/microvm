@@ -99,6 +99,8 @@ type Cluster struct {
 	// Close can stop its loop. See dead_owner.go for the reconciler logic.
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
+	// orphanRetryLoopStop ends startOrphanRetryLoop.
+	orphanRetryLoopStop context.CancelFunc
 	// orphanRetry is the leader's place in the orphaned-recovery backlog
 	// (orphan_recovery.go).
 	orphanRetry orphanRetryCursor
@@ -386,6 +388,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// removes them from the raft configuration. Followers maintain the
 	// in-memory tracker (cheap) but never act.
 	c.startDeadOwnerLoop()
+
+	// Orphaned recreate-policy sandboxes no node had room for: the leader
+	// moves them, oldest first, as room comes back (R14, orphan_recovery.go).
+	c.startOrphanRetryLoop()
 
 	// Reservation GC: leader-only sweep that cancels opReserve rows whose
 	// 120s TTL has elapsed (target node never promoted via opPlace, e.g.
@@ -1613,6 +1619,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
 			return err
 		}
+		if payload, cmd, err = c.admitMoveHandoff(payload, cmd); err != nil {
+			return err
+		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
@@ -1665,6 +1674,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		return nil
 	}
 	if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+		return err
+	}
+	if payload, cmd, err = c.admitMoveHandoff(payload, cmd); err != nil {
 		return err
 	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
@@ -2269,6 +2281,9 @@ func (c *Cluster) Close() error {
 	}
 	if c.deadOwnerLoopStop != nil {
 		c.deadOwnerLoopStop()
+	}
+	if c.orphanRetryLoopStop != nil {
+		c.orphanRetryLoopStop()
 	}
 	if c.obligationBatcherStop != nil {
 		c.obligationBatcherStop()
