@@ -13,13 +13,14 @@ and cluster mode's pod template, which the operator stamps per worker
 # No Kubernetes API rights (plan §8.7, wall 4).
 automountServiceAccountToken: false
 enableServiceLinks: false
-{{- if or $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled $root.Values.worker.firecracker.enabled }}
-# WASM, V8-isolate and Firecracker sandboxes are processes sandboxd starts:
-# with one process namespace for the pod they outlive an agent restart, and
-# the next agent takes them over (C14). sandboxd refuses to start them
-# without it.
+# One process namespace for the pod. External-storage mount helpers, and
+# WASM, V8-isolate and Firecracker sandboxes, are processes sandboxd starts
+# in the runtime container's group: with the namespace shared they outlive
+# an agent restart, and the next agent takes them over (C14, F13). With the
+# agent owning its own namespace, its end killed every one of them, and a
+# running sandbox's storage stopped answering. sandboxd refuses the WASM,
+# V8 and Firecracker runtimes without it.
 shareProcessNamespace: true
-{{- end }}
 {{- if $root.Values.edge.enabled }}
 # The edge container is not root, and Kubernetes gives a non-root
 # container no ambient capabilities, so ports 80 and 443 are opened

@@ -149,6 +149,11 @@ func TestRenderedExternalMountsPropagate(t *testing.T) {
 		t.Fatalf("the agent checks mounts through %q, the runtime writes its pid to %q",
 			envValue(pod.Spec.Containers[agent].Env, "SB_MOUNTS_RUNTIME_PID_FILE"), envValue(pod.Spec.Containers[runtime].Env, "SB_RUNTIME_PID_FILE"))
 	}
+	// The helpers outlive an agent restart only in one process namespace
+	// for the pod: an agent that owns its own takes them with it.
+	if pod.Spec.ShareProcessNamespace == nil || !*pod.Spec.ShareProcessNamespace {
+		t.Fatal("the worker pod does not share one process namespace: an agent restart would end every mount helper")
+	}
 	if envValue(pod.Spec.Containers[runtime].Env, "SB_MOUNTS_DIR") != root {
 		t.Fatalf("the runtime unmounts %q when the pod ends, the agent mounts below %q",
 			envValue(pod.Spec.Containers[runtime].Env, "SB_MOUNTS_DIR"), root)

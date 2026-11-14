@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"maps"
 	"strings"
 	"testing"
@@ -48,6 +50,36 @@ func TestCheckHostProcessesOutliveAgent(t *testing.T) {
 			}
 			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 				t.Fatalf("err = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// External-storage mount helpers die with an agent that owns its PID
+// namespace too (F13): a worker pod that does not share one is warned, never
+// refused, and nothing is said on a VM or in a shared pod.
+func TestWarnMountHelpersEndWithAgent(t *testing.T) {
+	const pod = "/kubepods.slice/pod1/sandboxes"
+	for _, tc := range []struct {
+		name   string
+		parent string
+		owns   bool
+		err    error
+		warns  bool
+	}{
+		{name: "pod that owns its namespace", parent: pod, owns: true, warns: true},
+		{name: "pod that shares one", parent: pod},
+		{name: "procfs unreadable: nothing to say", parent: pod, err: errors.New("no procfs")},
+		{name: "VM", owns: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := ownsPIDNamespace
+			ownsPIDNamespace = func() (bool, error) { return tc.owns, tc.err }
+			t.Cleanup(func() { ownsPIDNamespace = old })
+			var logs bytes.Buffer
+			warnMountHelpersEndWithAgent(config.Config{HostProcessCgroupParent: tc.parent}, slog.New(slog.NewTextHandler(&logs, nil)))
+			if got := strings.Contains(logs.String(), "external-storage mounts stop when this container restarts"); got != tc.warns {
+				t.Fatalf("warned %v, want %v: %s", got, tc.warns, logs.String())
 			}
 		})
 	}

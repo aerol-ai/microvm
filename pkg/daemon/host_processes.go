@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
@@ -37,4 +38,20 @@ func checkHostProcessesOutliveAgent(cfg config.Config) error {
 			"Turn those runtimes off (SB_ENABLE_WASM, SB_ENABLE_ISOLATE, SB_ENABLE_FIRECRACKER) or share the namespace")
 	}
 	return nil
+}
+
+// warnMountHelpersEndWithAgent says so when external-storage mount helpers
+// cannot outlive this container (F13). They start in the same group as the
+// sandboxes above, and die with an agent PID namespace the same way; then a
+// running sandbox's storage stops answering at the next agent restart. A
+// warning, not a refusal: the chart shares the pod's namespace, and a pod
+// that does not still mounts storage until the agent restarts.
+func warnMountHelpersEndWithAgent(cfg config.Config, logger *slog.Logger) {
+	if cfg.HostProcessCgroupParent == "" {
+		return
+	}
+	if owns, err := ownsPIDNamespace(); err == nil && owns {
+		logger.Warn("external-storage mounts stop when this container restarts: the worker pod does not share one process namespace " +
+			"(shareProcessNamespace: true), so their helpers end with it")
+	}
 }
