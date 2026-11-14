@@ -2,6 +2,8 @@ package config
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -86,5 +88,50 @@ func TestValidateEgressRangesBadSandboxRange(t *testing.T) {
 	cfg := Config{EnableNetworkRules: true, ContainerdBridgeSubnet: "nope", EgressDenyFloorCIDRs: []netip.Prefix{netip.MustParsePrefix("10.96.0.1/32")}}
 	if err := validateEgressRanges(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestEgressDenyFloorFile (review R4): the floor file is read at boot, a
+// file that cannot be read or holds a bad entry stops the node, and it
+// needs the host firewall like the other lists.
+func TestEgressDenyFloorFile(t *testing.T) {
+	t.Setenv("SB_ENABLE_CLUSTER", "false")
+	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_ENABLE_NETWORK_RULES", "true")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "deny-floor")
+	if err := os.WriteFile(path, []byte("172.18.0.44\nfd00:10:96::1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_EGRESS_DENY_FLOOR_FILE", path)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EgressDenyFloorFile != path || len(cfg.EgressDenyFloorFileCIDRs) != 2 || cfg.EgressDenyFloorFileCIDRs[0] != netip.MustParsePrefix("172.18.0.44/32") {
+		t.Fatalf("file %q %v", cfg.EgressDenyFloorFile, cfg.EgressDenyFloorFileCIDRs)
+	}
+	bad := filepath.Join(dir, "bad")
+	if err := os.WriteFile(bad, []byte("nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "a missing file", env: map[string]string{"SB_EGRESS_DENY_FLOOR_FILE": filepath.Join(dir, "missing")}, want: "SB_EGRESS_DENY_FLOOR_FILE"},
+		{name: "a bad entry", env: map[string]string{"SB_EGRESS_DENY_FLOOR_FILE": bad}, want: "invalid SB_EGRESS_DENY_FLOOR_FILE " + bad + " entry"},
+		{name: "the host firewall off", env: map[string]string{"SB_ENABLE_NETWORK_RULES": "false"}, want: "SB_EGRESS_DENY_FLOOR_FILE needs SB_ENABLE_NETWORK_RULES=true"},
+		{name: "an entry inside the sandbox range", env: map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "172.18.0.0/24"}, want: "SB_EGRESS_DENY_FLOOR_FILE entry 172.18.0.44/32 overlaps the sandbox range"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"expvar"
+	"fmt"
 	"sync"
 	"time"
 
@@ -30,22 +31,16 @@ import (
 var ownershipLeaseFileWriteErrors = expvar.NewInt("aerolvm_ownership_lease_file_write_errors_total")
 
 type ownershipLeaseFile struct {
-	// mu covers the fields and each write, so a write from the create
-	// path's kick can never put an older read back over a newer one.
+	// mu covers the fields and each write, with the listing of the rows the
+	// write fences: writes go out in the order they listed, so one that
+	// listed the sandboxes earlier can never put back a fence without a
+	// sandbox a later write added.
 	mu sync.Mutex
 	// confirmed is when this process's last successful read was sent;
 	// zero until one has.
 	confirmed time.Time
 	// owned names the instances that read proved still owned.
 	owned []string
-
-	kickOnce sync.Once
-	kick     chan struct{}
-}
-
-func (f *ownershipLeaseFile) kicks() chan struct{} {
-	f.kickOnce.Do(func() { f.kick = make(chan struct{}, 1) })
-	return f.kick
 }
 
 // ownershipLeaseFileOn reports whether this node writes the lease file.
@@ -54,8 +49,9 @@ func (s *Service) ownershipLeaseFileOn() bool {
 }
 
 // recordOwnershipRead takes the read sent at sent: rows are the local
-// recreate-policy sandboxes, placements what the leader answered for them.
-// It writes the file before confirmOwnership thaws anything.
+// recreate-policy sandboxes the read asked about, placements what the
+// leader answered for them. It writes the file before confirmOwnership
+// thaws anything.
 func (s *Service) recordOwnershipRead(ctx context.Context, sent time.Time, rows []*models.Sandbox, placements map[string]cluster.Placement, self string) {
 	if !s.ownershipLeaseFileOn() {
 		return
@@ -73,71 +69,73 @@ func (s *Service) recordOwnershipRead(ctx context.Context, sent time.Time, rows 
 		return
 	}
 	f.confirmed, f.owned = sent, owned
-	s.writeOwnershipLeaseFileLocked(rows)
+	// The fence comes from a fresh listing, not rows: rows were listed
+	// before the read went out, and a sandbox created since is already in
+	// the file (publishOwnershipFence).
+	_ = s.writeOwnershipLeaseFileLocked(ctx)
 }
 
-// kickOwnershipLeaseFile asks the writer to rewrite the file with the
-// current fence. It never blocks: a kick already waiting covers this one.
-func (s *Service) kickOwnershipLeaseFile() {
+// publishOwnershipFence writes the file with every local recreate-policy
+// sandbox in the fence, the one whose row was just written included, before
+// that create is answered (R9). The answer is what lets its placement be
+// placed, and so recreated elsewhere if this node dies: a fence that only
+// reached the file later could be lost with sandboxd, leaving a running task
+// the supervisor never freezes. A process that has not confirmed its lease
+// yet confirms it first (the first such create after a start only): it
+// writes nothing before a read succeeds, so a crash loop never extends the
+// lease the supervisor enforces.
+func (s *Service) publishOwnershipFence(ctx context.Context) error {
 	if !s.ownershipLeaseFileOn() {
-		return
+		return nil
 	}
-	select {
-	case s.ownershipFile.kicks() <- struct{}{}:
-	default:
+	f := &s.ownershipFile
+	f.mu.Lock()
+	confirmed := !f.confirmed.IsZero()
+	f.mu.Unlock()
+	if !confirmed {
+		if err := s.confirmOwnership(ctx, time.Now()); err != nil {
+			return fmt.Errorf("fence the new sandbox: this node's first ownership read failed (%v): %w", err, ErrOwnershipFenced)
+		}
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return s.writeOwnershipLeaseFileLocked(ctx)
 }
 
-// runOwnershipLeaseFileWriter rewrites the file for each kick until ctx
-// ends: the same read, a fence that includes the sandboxes created since.
-func (s *Service) runOwnershipLeaseFileWriter(ctx context.Context) {
-	kicks := s.ownershipFile.kicks()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-kicks:
-		}
-		rows, err := s.localRecreateSandboxes(ctx)
-		if err != nil {
-			if s.logger != nil {
-				s.logger.Warn("ownership lease file: cannot list the sandboxes to fence", "error", err)
-			}
-			continue
-		}
-		s.ownershipFile.mu.Lock()
-		s.writeOwnershipLeaseFileLocked(rows)
-		s.ownershipFile.mu.Unlock()
-	}
-}
-
-// writeOwnershipLeaseFileLocked writes the file with rows as the fence.
-// Nothing before this process's first successful read.
-func (s *Service) writeOwnershipLeaseFileLocked(rows []*models.Sandbox) {
+// writeOwnershipLeaseFileLocked writes the file under the last read, with
+// every local recreate-policy sandbox, listed now, as the fence. It refuses
+// before this process's first successful read: a lease no read proved must
+// never reach the supervisor (both callers have one by then).
+func (s *Service) writeOwnershipLeaseFileLocked(ctx context.Context) error {
 	f := &s.ownershipFile
 	if f.confirmed.IsZero() {
-		return
+		return fmt.Errorf("fence the new sandbox: no ownership read has succeeded: %w", ErrOwnershipFenced)
 	}
-	fence := make([]string, 0, len(rows))
-	for _, sb := range rows {
-		fence = append(fence, s.runtimeRef(sb))
+	rows, err := s.localRecreateSandboxes(ctx)
+	if err == nil {
+		fence := make([]string, 0, len(rows))
+		for _, sb := range rows {
+			fence = append(fence, s.runtimeRef(sb))
+		}
+		confirmed := f.confirmed.UnixMilli()
+		err = ownerlease.Write(s.cfg.OwnershipLeaseFile, ownerlease.Lease{
+			ConfirmedUnixMs: confirmed,
+			// On the read's own timeline through the monotonic clock, so a
+			// wall-clock step since the read cannot shorten or stretch what
+			// the supervisor counts down.
+			WrittenUnixMs: confirmed + time.Since(f.confirmed).Milliseconds(),
+			LeaseMs:       cluster.OwnershipLease(s.cfg).Milliseconds(),
+			Fence:         fence,
+			Owned:         f.owned,
+		})
 	}
-	confirmed := f.confirmed.UnixMilli()
-	l := ownerlease.Lease{
-		ConfirmedUnixMs: confirmed,
-		// On the read's own timeline through the monotonic clock, so a
-		// wall-clock step since the read cannot shorten or stretch what
-		// the supervisor counts down.
-		WrittenUnixMs: confirmed + time.Since(f.confirmed).Milliseconds(),
-		LeaseMs:       cluster.OwnershipLease(s.cfg).Milliseconds(),
-		Fence:         fence,
-		Owned:         f.owned,
-	}
-	if err := ownerlease.Write(s.cfg.OwnershipLeaseFile, l); err != nil {
+	if err != nil {
 		ownershipLeaseFileWriteErrors.Add(1)
 		if s.logger != nil {
 			s.logger.Error("ownership lease file: write failed; the runtime supervisor freezes failover.policy=recreate sandboxes when the last written lease runs out",
 				"file", s.cfg.OwnershipLeaseFile, "error", err)
 		}
+		return fmt.Errorf("ownership lease file %s: %w", s.cfg.OwnershipLeaseFile, err)
 	}
+	return nil
 }

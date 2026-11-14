@@ -96,3 +96,35 @@ func TestClusterNodeCertTTLBounds(t *testing.T) {
 		})
 	}
 }
+
+// SB_RAFT_WAL_DIR reaches the cluster as given, and a relative one is
+// refused: it would name a different directory from another working
+// directory, and the node keeps its log where it first put it.
+func TestRaftWALDir(t *testing.T) {
+	for _, tc := range []struct {
+		value, want string
+		wantErr     bool
+	}{
+		{value: "", want: ""},
+		{value: " /mnt/raft-log/raft-wal ", want: "/mnt/raft-log/raft-wal"},
+		{value: "raft-log", wantErr: true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			setJoinClusterEnv(t, NodeRoleServer)
+			t.Setenv("SB_RAFT_WAL_DIR", tc.value)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "SB_RAFT_WAL_DIR") {
+					t.Fatalf("Load = %v; want an SB_RAFT_WAL_DIR error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.RaftWALDir != tc.want {
+				t.Fatalf("RaftWALDir = %q, want %q", cfg.RaftWALDir, tc.want)
+			}
+		})
+	}
+}

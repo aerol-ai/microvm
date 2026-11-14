@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/raftlogdir"
 )
 
 func clusterNode(t *testing.T, p Paths, role string) {
@@ -240,5 +242,33 @@ func TestSystemHost(t *testing.T) {
 	}
 	if nearestExisting("/") != "/" {
 		t.Fatal("nearestExisting(/)")
+	}
+}
+
+// Reset takes a log SB_RAFT_WAL_DIR put on a disk of its own too: left
+// behind, the next start would find a log its Raft directory does not name.
+func TestResetRemovesALogOnItsOwnDisk(t *testing.T) {
+	ctx := context.Background()
+	p := testPaths(t)
+	api := newFakeLocalAPI(t)
+	var out bytes.Buffer
+	r := &Resetter{Paths: p, Host: newFakeHost(), Printer: Printer{Out: &out}, LocalAPI: api.srv.URL}
+	clusterNode(t, p, "server")
+	own := filepath.Join(t.TempDir(), "disk", "raft-wal")
+	mustWrite(t, filepath.Join(p.RaftDir, "raft-stable.bolt"), "x")
+	mustWrite(t, filepath.Join(p.RaftDir, raftlogdir.LocationFile), own+"\n")
+	mustWrite(t, filepath.Join(own, "wal-meta.db"), "x")
+	if err := r.Run(ctx, ResetOptions{Yes: true}); err != nil {
+		t.Fatal(err)
+	}
+	if exists(own) || exists(p.RaftDir) || !strings.Contains(out.String(), own) {
+		t.Fatalf("the log or its directory survived reset:\n%s", out.String())
+	}
+
+	// A record that names no absolute path stops reset before it deletes.
+	clusterNode(t, p, "server")
+	mustWrite(t, filepath.Join(p.RaftDir, raftlogdir.LocationFile), "relative\n")
+	if err := r.Run(ctx, ResetOptions{Yes: true}); err == nil || !exists(p.RaftDir) {
+		t.Fatalf("reset with a bad record = %v; want refused with the Raft directory kept", err)
 	}
 }

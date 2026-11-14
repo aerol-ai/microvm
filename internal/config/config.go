@@ -358,6 +358,14 @@ type Config struct {
 	// the API server's addresses go here (SB_EGRESS_DENY_FLOOR_CIDRS,
 	// plans/kubernetes-v2-architecture.md C24). Default empty.
 	EgressDenyFloorCIDRs []netip.Prefix
+	// EgressDenyFloorFile names a file of more deny-floor addresses that
+	// may change while sandboxd runs (SB_EGRESS_DENY_FLOOR_FILE, review R4).
+	// On Kubernetes the operator keeps the API server's current addresses
+	// there, so a worker made before they changed refuses the new ones too.
+	// Read at boot into EgressDenyFloorFileCIDRs, then watched. Default
+	// empty.
+	EgressDenyFloorFile      string
+	EgressDenyFloorFileCIDRs []netip.Prefix
 	// EgressPrivateDefaultCIDRs are ranges treated like RFC 1918: a sandbox
 	// with no egress policy cannot reach them, and a policy opens one only
 	// with an allow entry for it, so a bank can open one range on purpose.
@@ -1311,10 +1319,15 @@ type Config struct {
 	// label syntax, at most 16, 63 characters each) and reported on the
 	// capacity heartbeat for placement rules (plans/placement-rules.md).
 	// nil = no labels; such a node never satisfies a rule.
-	NodeLabels          map[string]string
-	RaftBindAddr        string
-	RaftAdvertiseAddr   string
-	RaftDataDir         string
+	NodeLabels        map[string]string
+	RaftBindAddr      string
+	RaftAdvertiseAddr string
+	RaftDataDir       string
+	// RaftWALDir (SB_RAFT_WAL_DIR) puts the Raft log on a disk of its own,
+	// away from the snapshots and recovery blobs in RaftDataDir: a commit
+	// waits for two log writes, the leader's then a follower's
+	// (internal/raftlogdir). "" keeps it in RaftDataDir/raft-wal.
+	RaftWALDir          string
 	GossipBindAddr      string
 	GossipAdvertiseAddr string
 	BootstrapPeers      []string
@@ -2477,6 +2490,7 @@ func load(keyTool bool) (Config, error) {
 		RaftBindAddr:                     getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
 		RaftAdvertiseAddr:                strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
 		RaftDataDir:                      strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		RaftWALDir:                       strings.TrimSpace(os.Getenv("SB_RAFT_WAL_DIR")),
 		GossipBindAddr:                   getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
 		GossipAdvertiseAddr:              strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
 		BootstrapPeers:                   splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
@@ -3166,6 +3180,9 @@ func load(keyTool bool) (Config, error) {
 	if cfg.EnableCluster {
 		if cfg.RaftDataDir == "" {
 			cfg.RaftDataDir = filepath.Join(filepath.Dir(cfg.DBPath), "raft")
+		}
+		if cfg.RaftWALDir != "" && !filepath.IsAbs(cfg.RaftWALDir) {
+			return Config{}, fmt.Errorf("SB_RAFT_WAL_DIR=%q must be an absolute path", cfg.RaftWALDir)
 		}
 		if cfg.RaftAdvertiseAddr == "" {
 			cfg.RaftAdvertiseAddr = cfg.RaftBindAddr

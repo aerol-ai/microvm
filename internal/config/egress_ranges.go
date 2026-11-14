@@ -26,6 +26,15 @@ func loadEgressRanges(cfg *Config) error {
 		return err
 	}
 	cfg.EgressDenyFloorCIDRs, cfg.EgressPrivateDefaultCIDRs = floor, private
+	// The floor file (review R4): read now, so a node whose file it cannot
+	// read does not start without the addresses in it.
+	if path := strings.TrimSpace(os.Getenv(egresspolicy.FloorFileEnv)); path != "" {
+		file, err := egresspolicy.ReadFloorFile(path)
+		if err != nil {
+			return err
+		}
+		cfg.EgressDenyFloorFile, cfg.EgressDenyFloorFileCIDRs = path, file
+	}
 	return validateEgressRanges(*cfg)
 }
 
@@ -35,6 +44,9 @@ func validateEgressRanges(cfg Config) error {
 	// isolate guards held both: a rule one runtime ignores.
 	if (len(cfg.EgressDenyFloorCIDRs) > 0 || len(cfg.EgressPrivateDefaultCIDRs) > 0) && !cfg.EnableNetworkRules {
 		return fmt.Errorf("%s and %s need SB_ENABLE_NETWORK_RULES=true: container and Firecracker sandboxes get them from the host firewall", egresspolicy.DenyFloorEnv, egresspolicy.PrivateRangesEnv)
+	}
+	if cfg.EgressDenyFloorFile != "" && !cfg.EnableNetworkRules {
+		return fmt.Errorf("%s needs SB_ENABLE_NETWORK_RULES=true: container and Firecracker sandboxes get the floor from the host firewall", egresspolicy.FloorFileEnv)
 	}
 	// The extra private ranges join the private-range default, which only
 	// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT turns on for container sandboxes.
@@ -60,11 +72,11 @@ func validateEgressRanges(cfg Config) error {
 		if err != nil {
 			continue // its own check reports it
 		}
-		for i, list := range [][]netip.Prefix{cfg.EgressDenyFloorCIDRs, cfg.EgressPrivateDefaultCIDRs} {
+		for i, list := range [][]netip.Prefix{cfg.EgressDenyFloorCIDRs, cfg.EgressPrivateDefaultCIDRs, cfg.EgressDenyFloorFileCIDRs} {
 			for _, p := range list {
 				if p.Overlaps(r) {
 					return fmt.Errorf("%s entry %s overlaps the sandbox range %s (%s): inside the pod those addresses are sandboxes, not the cluster; pick a sandbox range the cluster does not use",
-						[]string{egresspolicy.DenyFloorEnv, egresspolicy.PrivateRangesEnv}[i], p, r, sr.env)
+						[]string{egresspolicy.DenyFloorEnv, egresspolicy.PrivateRangesEnv, egresspolicy.FloorFileEnv}[i], p, r, sr.env)
 				}
 			}
 		}

@@ -293,6 +293,18 @@ cluster:
       # 2 minutes, and with 16,000 IOPS and 1,000 MB/s none did (F29). On
       # EKS, a gp3 StorageClass with parameters iops and throughput.
       storageClassName: ""
+    # A second disk for each server that holds only its Raft log. Every
+    # commit waits for a log write on the leader and then on a follower, so
+    # a busy cell's servers need it: on the cell bench, a log sharing the
+    # disk above wrote in 2 to 5 ms under load, and on a disk of its own in
+    # about 1 ms, which brought Raft apply p99 under 25 ms at 1,354 creates
+    # a second. Set it before the servers are made: a server keeps the
+    # layout it was made with, so setting or clearing this later changes
+    # only servers made after.
+    #   logStorage:
+    #     size: 20Gi
+    #     storageClassName: ""
+    logStorage: {}
     # Enough for a small cell. A cell near G3 (500 workers, 1,000 creates a
     # second) needs 4 CPUs on its servers: the Raft leader used 2 to 3 cores
     # at 900 to 1,200 creates a second (plans/kubernetes-v2-architecture.md,
@@ -303,7 +315,11 @@ cluster:
     nodeSelector: {}
     tolerations: []
   gateways:
+    # Gateways to keep, at least one per zone. Lowering it retires the
+    # extra ones.
     minReplicas: 3
+    # A cap: the operator refuses one below minReplicas or below one per
+    # zone, and adds no gateways past minReplicas by itself.
     maxReplicas: 30
     resources:
       requests: { cpu: 500m, memory: 512Mi }

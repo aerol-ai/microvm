@@ -34,7 +34,7 @@ func TestRenderedChartTemplates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", role, err)
 		}
-		in := StampInput{Cluster: c, Node: node("prod-"+role+"-0", role, "general", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"}
+		in := StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-"+role+"-0", role, "general", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"}
 		if role == TemplateWorker {
 			in.Pool = &c.Spec.WorkerPools[0]
 		}
@@ -73,21 +73,10 @@ func TestRenderedChartTemplates(t *testing.T) {
 				t.Fatalf("worker setup security = %+v", sc)
 			}
 			for _, m := range ic[1].VolumeMounts {
-				if m.Name != EtcVolume && m.Name != StateVolume && m.Name != JoinVolume {
+				if m.Name != EtcVolume && m.Name != StateVolume && m.Name != JoinIdentityVolume {
 					t.Fatalf("worker setup mounts %s (%s)", m.Name, m.MountPath)
 				}
 			}
 		}
 	}
-}
-
-// envValue is name's value in env (the last, as Kubernetes reads it).
-func envValue(env []corev1.EnvVar, name string) string {
-	v := ""
-	for _, e := range env {
-		if e.Name == name {
-			v = e.Value
-		}
-	}
-	return v
 }

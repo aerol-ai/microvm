@@ -14,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/ownerlease"
+	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -75,56 +76,15 @@ func TestOwnershipLeaseFile(t *testing.T) {
 	}
 }
 
-// A recreate-policy sandbox created between reads joins the fence at once,
-// under the same read: a sandboxd that dies before its next read still
-// leaves it for the supervisor to freeze. Nothing is written before this
-// process's first read.
-func TestOwnershipLeaseFileFollowsCreates(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	svc, st, lc := newLeaseService(t, newFreezeRuntime())
-	path := filepath.Join(t.TempDir(), "ownership-lease")
-	svc.cfg.OwnershipLeaseFile = path
-	go svc.runOwnershipLeaseFileWriter(ctx)
-
-	seedLeaseRow(t, st, "a", true, models.SandboxStatusStarted)
-	svc.kickOwnershipLeaseFile()
-	time.Sleep(50 * time.Millisecond)
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("written before any read: %v", err)
-	}
-
-	lc.up(selfPlacement("a"))
-	sent := time.Now()
-	if err := svc.confirmOwnership(ctx, sent); err != nil {
-		t.Fatal(err)
-	}
-	seedLeaseRow(t, st, "d", true, models.SandboxStatusStarted)
-	svc.kickOwnershipLeaseFile()
-	svc.kickOwnershipLeaseFile() // a second kick while one waits is dropped
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		l := readLeaseFile(t, path)
-		if slices.Contains(l.Fence, "ctr-d") {
-			if l.ConfirmedUnixMs != sent.UnixMilli() || !slices.Equal(l.Owned, []string{"ctr-a"}) {
-				t.Fatalf("the rewrite changed the read: %+v", l)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("ctr-d never joined the fence: %+v", l)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // Off in single-node mode and without the setting; a failed write is
 // counted and logged, and the next read writes again.
 func TestOwnershipLeaseFileOffAndFailures(t *testing.T) {
 	ctx := context.Background()
 	single, _, _ := newServiceRuntimeHarnessAtPath(t, filepath.Join(t.TempDir(), "state.db"), newFreezeRuntime())
 	single.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "ownership-lease")
-	single.kickOwnershipLeaseFile()
+	if err := single.publishOwnershipFence(ctx); err != nil {
+		t.Fatal(err)
+	}
 	single.recordOwnershipRead(ctx, time.Now(), nil, nil, "worker-a")
 	if _, err := os.Stat(single.cfg.OwnershipLeaseFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("single-node mode wrote the file: %v", err)
@@ -149,70 +109,138 @@ func TestOwnershipLeaseFileOffAndFailures(t *testing.T) {
 		t.Fatal("a failed write was not counted")
 	}
 
-	// The writer skips a kick it cannot list the sandboxes for.
+	// A write that cannot list the sandboxes leaves the file alone.
 	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "ownership-lease")
-	wctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { svc.runOwnershipLeaseFileWriter(wctx); close(done) }()
 	_ = st.Close()
-	svc.kickOwnershipLeaseFile()
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	<-done
+	if err := svc.publishOwnershipFence(ctx); err == nil {
+		t.Fatal("a fence written without the sandbox list")
+	}
 	if _, err := os.Stat(svc.cfg.OwnershipLeaseFile); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("written without the sandbox list: %v", err)
 	}
 }
 
-// StartOwnershipLease starts the writer with the setting on.
-func TestStartOwnershipLeaseStartsTheFileWriter(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// leaseCreateRow is a row for persistSandboxCreate.
+func leaseCreateRow(id string, recreate bool) *models.Sandbox {
+	now := time.Now().UTC()
+	sb := &models.Sandbox{ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted, Runtime: models.RuntimeDocker,
+		ContainerID: "ctr-" + id, AuditIncarnationID: "inc-" + id, CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root",
+		CreatedAt: now, UpdatedAt: now, LastActiveAt: now}
+	if recreate {
+		sb.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
+	}
+	return sb
+}
+
+// A recreate-policy sandbox is in the fence when its create returns (R9),
+// under the same read: a sandboxd that dies right after still leaves it for
+// the supervisor to freeze, and nothing waits on a writer that could be
+// lost with it. Any other sandbox changes nothing.
+func TestPersistSandboxCreatePublishesTheFence(t *testing.T) {
+	ctx := context.Background()
 	svc, st, lc := newLeaseService(t, newFreezeRuntime())
 	path := filepath.Join(t.TempDir(), "ownership-lease")
 	svc.cfg.OwnershipLeaseFile = path
-	svc.StartOwnershipLease(ctx)
-	if err := svc.confirmOwnership(ctx, time.Now()); err != nil {
+	seedLeaseRow(t, st, "a", true, models.SandboxStatusStarted)
+	lc.up(selfPlacement("a"))
+	sent := time.Now()
+	if err := svc.confirmOwnership(ctx, sent); err != nil {
 		t.Fatal(err)
 	}
-	seedLeaseRow(t, st, "e", true, models.SandboxStatusStarted)
-	lc.up(selfPlacement("e"))
-	svc.kickOwnershipLeaseFile()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if l, err := ownerlease.Read(path); err == nil && slices.Contains(l.Fence, "ctr-e") {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the writer StartOwnershipLease started never rewrote the file")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// Persisting a recreate-policy sandbox queues a rewrite; any other does not.
-func TestPersistSandboxCreateKicksTheLeaseFile(t *testing.T) {
-	ctx := context.Background()
-	svc, _, _ := newLeaseService(t, newFreezeRuntime())
-	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "ownership-lease")
-	now := time.Now().UTC()
 	for _, tc := range []struct {
 		id       string
 		recreate bool
-		kicks    int
-	}{{"plain", false, 0}, {"moves", true, 1}} {
-		sb := &models.Sandbox{ID: tc.id, Image: "alpine:3.20", Status: models.SandboxStatusStarted, Runtime: models.RuntimeDocker,
-			ContainerID: "ctr-" + tc.id, AuditIncarnationID: "inc-" + tc.id, CPU: 1, MemoryMB: 256, DiskGB: 1, OSUser: "root",
-			CreatedAt: now, UpdatedAt: now, LastActiveAt: now}
-		if tc.recreate {
-			sb.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
-		}
-		if err := svc.persistSandboxCreate(ctx, sb); err != nil {
+		fence    []string
+	}{
+		{"plain", false, []string{"ctr-a"}},
+		{"moves", true, []string{"ctr-a", "ctr-moves"}},
+	} {
+		if err := svc.persistSandboxCreate(ctx, leaseCreateRow(tc.id, tc.recreate)); err != nil {
 			t.Fatal(err)
 		}
-		if got := len(svc.ownershipFile.kicks()); got != tc.kicks {
-			t.Fatalf("%s: %d kicks queued, want %d", tc.id, got, tc.kicks)
+		l := readLeaseFile(t, path)
+		slices.Sort(l.Fence)
+		if !slices.Equal(l.Fence, tc.fence) {
+			t.Fatalf("%s: create returned with fence %v, want %v", tc.id, l.Fence, tc.fence)
 		}
+		if l.ConfirmedUnixMs != sent.UnixMilli() || !slices.Equal(l.Owned, []string{"ctr-a"}) {
+			t.Fatalf("%s: the create changed the read: %+v", tc.id, l)
+		}
+	}
+
+	// A fence that cannot be written fails the create and takes its row.
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "missing", "ownership-lease")
+	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("unfenced", true)); err == nil {
+		t.Fatal("a create whose fence was not written succeeded")
+	}
+	if _, err := st.Get(ctx, "unfenced"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("the row of a create whose fence failed is still there: %v", err)
+	}
+}
+
+// A process that has not confirmed its lease yet writes nothing on its own:
+// its first recreate-policy create runs the read first. With the leader
+// unreachable that create fails, nothing is written and its row is gone.
+func TestPersistSandboxCreateConfirmsFirst(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	path := filepath.Join(t.TempDir(), "ownership-lease")
+	svc.cfg.OwnershipLeaseFile = path
+
+	// The write itself refuses a lease no read proved.
+	svc.ownershipFile.mu.Lock()
+	err := svc.writeOwnershipLeaseFileLocked(ctx)
+	svc.ownershipFile.mu.Unlock()
+	if !errors.Is(err, ErrOwnershipFenced) {
+		t.Fatalf("a write before any read: %v, want ErrOwnershipFenced", err)
+	}
+
+	lc.down()
+	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("a", true)); !errors.Is(err, ErrOwnershipFenced) {
+		t.Fatalf("create with no read and no leader: %v, want ErrOwnershipFenced", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("written before any read: %v", err)
+	}
+	if _, err := st.Get(ctx, "a"); !errors.Is(err, storepkg.ErrNotFound) {
+		t.Fatalf("the refused create left its row: %v", err)
+	}
+
+	lc.up()
+	reads := lc.readCount()
+	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("a", true)); err != nil {
+		t.Fatal(err)
+	}
+	if l := readLeaseFile(t, path); !slices.Equal(l.Fence, []string{"ctr-a"}) || lc.readCount() != reads+1 {
+		t.Fatalf("fence %v after %d reads, want ctr-a after one more", l.Fence, lc.readCount()-reads)
+	}
+}
+
+// A read's rows were listed before it went out. A sandbox created while it
+// was out is already in the file, and the read's write keeps it: every
+// write lists the fence afresh.
+func TestOwnershipReadKeepsASandboxCreatedMeanwhile(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	path := filepath.Join(t.TempDir(), "ownership-lease")
+	svc.cfg.OwnershipLeaseFile = path
+	seedLeaseRow(t, st, "a", true, models.SandboxStatusStarted)
+	lc.up(selfPlacement("a"))
+	if err := svc.confirmOwnership(ctx, time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := svc.localRecreateSandboxes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("new", true)); err != nil {
+		t.Fatal(err)
+	}
+	svc.recordOwnershipRead(ctx, time.Now(), stale, map[string]cluster.Placement{"a": selfPlacement("a")}, "worker-a")
+	l := readLeaseFile(t, path)
+	slices.Sort(l.Fence)
+	if !slices.Equal(l.Fence, []string{"ctr-a", "ctr-new"}) {
+		t.Fatalf("a read listed before the create dropped it from the fence: %v", l.Fence)
 	}
 }
 

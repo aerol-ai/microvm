@@ -2,8 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,11 +36,34 @@ type nodeRig struct {
 func newNodeRig(t *testing.T, c *v1.AerolCluster, objs ...client.Object) *nodeRig {
 	t.Helper()
 	all := append([]client.Object{c, adminSecret(), templates(t)}, objs...)
+	// A server's data claim, as the cluster controller makes it before the
+	// server's AerolNode (ensurePVC), unless the test brings its own.
+	claims := map[string]bool{}
+	apiServer := false
+	for _, o := range objs {
+		if pvc, ok := o.(*corev1.PersistentVolumeClaim); ok {
+			claims[pvc.Name] = true
+		}
+		if svc, ok := o.(*corev1.Service); ok && svc.Namespace == "default" && svc.Name == "kubernetes" {
+			apiServer = true
+		}
+	}
+	// The API server's Service and addresses, which every cluster has: a
+	// worker is not made without them on its deny floor (review R4).
+	if !apiServer {
+		all = append(all, apiServerObjects()...)
+	}
+	for _, o := range objs {
+		if n, ok := o.(*v1.AerolNode); ok && n.Spec.Role == v1.RoleServer && !claims[PVCName(n.Name)] {
+			all = append(all, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Namespace: c.Namespace, Name: PVCName(n.Name)}})
+		}
+	}
 	cl := newFakeClient(t, all...)
 	api := newFakeAPI()
 	g := &nodeRig{t: t, api: api, cl: cl, now: time.Unix(2_000_000_000, 0)}
 	g.r = &NodeReconciler{Client: cl, Scheme: cl.Scheme(), Recorder: record.NewFakeRecorder(200), API: api.factory,
-		Namespace: testNS, WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: func() time.Time { return g.now }}
+		Namespace: testNS, WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: func() time.Time { return g.now },
+		JoinURL: testJoinURL, JoinCA: func() ([]byte, error) { return testJoinCA, nil }}
 	return g
 }
 
@@ -141,29 +168,45 @@ func TestNodeServerZeroBootstrapsThenServes(t *testing.T) {
 	}
 }
 
-func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
+// A worker's pod is made at once, with no token made for it: its setup asks
+// the operator once it runs on a machine (§15.2). A join Secret an older
+// operator made is deleted once the node serves.
+func TestNodeWorkerJoinsThroughTheOperator(t *testing.T) {
 	c := bootstrapped(testCluster())
 	g := newNodeRig(t, c, node("prod-general-aaaaa", v1.RoleWorker, "general", "z-a"), machine("m1"))
 	g.api.mintErr = errors.New("leader down")
+
+	// The operator started without its join URL: no pod that could not join.
+	g.r.JoinURL = ""
 	g.reconcile("prod-general-aaaaa")
-	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "join token") {
-		t.Fatalf("no token: %+v", n.Status)
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "--join-url") || g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
+		t.Fatalf("no join URL: %+v", n.Status)
 	}
-	if g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
-		t.Fatal("pod made without its token")
-	}
-	g.api.mintErr = nil
+	g.r.JoinURL = testJoinURL
+	g.r.JoinCA = func() ([]byte, error) { return []byte("not a certificate"), nil }
 	g.reconcile("prod-general-aaaaa")
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); err != nil {
-		t.Fatal(err)
+	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StatePending || !strings.Contains(n.Status.Reason, "operator's CA") || g.pod(testWorkerNS, "prod-general-aaaaa") != nil {
+		t.Fatalf("no CA: %+v", n.Status)
 	}
-	if string(s.Data["token"]) != "tok-worker" || string(s.Data["join_url"]) != "https://s0:7003" || len(g.api.minted) != 1 {
-		t.Fatalf("join secret = %v minted %v", s.Data, g.api.minted)
-	}
+	g.r.JoinCA = func() ([]byte, error) { return testJoinCA, nil }
+
+	g.reconcile("prod-general-aaaaa")
 	p := g.pod(testWorkerNS, "prod-general-aaaaa")
 	if p == nil || len(p.OwnerReferences) != 0 {
 		t.Fatalf("worker pod = %+v (no owner reference across namespaces)", p)
+	}
+	checkJoinsFromOperator(t, p, "worker")
+	if len(g.api.minted) != 0 {
+		t.Fatalf("a token made before the pod asked: %v", g.api.minted)
+	}
+	var s corev1.Secret
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("a join Secret: %v", err)
+	}
+	// One an older operator made, before the upgrade.
+	s = corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}}
+	if err := g.cl.Create(context.Background(), &s); err != nil {
+		t.Fatal(err)
 	}
 	g.running(p, "m1", true)
 	g.api.nodes["prod-general-aaaaa"] = aerolapi.Node{Alive: true, SandboxesRunning: 4}
@@ -171,9 +214,8 @@ func TestNodeWorkerJoinsWithItsOwnToken(t *testing.T) {
 	if n := g.node("prod-general-aaaaa"); n.Status.State != v1.StateServing || n.Status.Sandboxes != 4 {
 		t.Fatalf("status = %+v", n.Status)
 	}
-	// The spent token is gone.
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: "prod-general-aaaaa-join"}, &s); !apierrors.IsNotFound(err) {
-		t.Fatalf("join secret after serving: %v", err)
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(p.Name)}, &s); !apierrors.IsNotFound(err) {
+		t.Fatalf("the old join secret after serving: %v", err)
 	}
 	// Spent once: later passes over a serving node send no delete at all
 	// (at 2,000 nodes that is a delete per node per pass).
@@ -451,8 +493,9 @@ func TestNodeSweepsAGoneWorker(t *testing.T) {
 	if g.pod(testWorkerNS, n.Name) == nil {
 		t.Fatal("no pod")
 	}
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}, &s); err != nil {
+	// A join Secret an operator before §15.2 made goes with the node too.
+	s := corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testWorkerNS, Name: JoinSecret(n.Name)}}
+	if err := g.cl.Create(context.Background(), &s); err != nil {
 		t.Fatal(err)
 	}
 
@@ -618,56 +661,109 @@ func TestPreflightFailedReason(t *testing.T) {
 	}
 }
 
-// Without a leader no join token can be minted. A server pod made again
-// keeps its identity on its disk, so it is made without one (its token
-// volume optional); a worker waits for its token. The maintenance pod, how
-// a cluster that lost quorum is repaired, never needs one.
+// Without a leader no join token can be made, and none is needed to make a
+// pod: a server made again keeps its identity on its disk, and any pod
+// that needs a token asks the operator once it runs, until a leader is back.
+// The maintenance pod, how a cluster that lost quorum is repaired, never asks.
 func TestNodeServersComeBackWithoutQuorum(t *testing.T) {
 	c := bootstrapped(testCluster())
 	srv, wrk := node("prod-server-1", v1.RoleServer, "", "z-b"), node("prod-general-eeeee", v1.RoleWorker, "general", "z-a")
 	g := newNodeRig(t, c, srv, wrk, machine("m1"))
 	g.api.mintErr = errors.New("no leader")
-
 	g.reconcile(srv.Name)
-	p := g.pod(testNS, srv.Name)
-	if p == nil {
-		t.Fatal("a server pod was not made without a token")
-	}
-	var join *corev1.SecretVolumeSource
-	for _, v := range p.Spec.Volumes {
-		if v.Name == JoinVolume {
-			join = v.Secret
+	g.reconcile(wrk.Name)
+	for _, p := range []*corev1.Pod{g.pod(testNS, srv.Name), g.pod(testWorkerNS, wrk.Name)} {
+		if p == nil {
+			t.Fatal("a pod was not made without a leader")
 		}
 	}
-	if join == nil || join.Optional == nil || !*join.Optional {
-		t.Fatalf("server join volume = %+v, want optional", join)
+	checkJoinsFromOperator(t, g.pod(testNS, srv.Name), "server")
+	if len(g.api.minted) != 0 {
+		t.Fatalf("tokens made for pods that did not ask: %v", g.api.minted)
 	}
-	g.reconcile(wrk.Name)
-	if g.pod(testWorkerNS, wrk.Name) != nil || g.node(wrk.Name).Status.State != v1.StatePending {
-		t.Fatalf("a worker was made without a token: %+v", g.node(wrk.Name).Status)
-	}
+}
 
-	// Its setup failed (no identity on the disk): a token is minted once a
-	// leader is back, for the optional volume.
+// A server pod an older operator made without a token, whose disk held no
+// identity, waits for a join Secret no operator makes now. It is made
+// again, to ask the operator; a server pod whose setup works is left alone.
+func TestNodeRemakesAServerPodWaitingForAJoinSecret(t *testing.T) {
+	c := bootstrapped(testCluster())
+	srv := node("prod-server-1", v1.RoleServer, "", "z-b")
+	g := newNodeRig(t, c, srv, machine("m1"))
+	g.reconcile(srv.Name)
+	p := g.pod(testNS, srv.Name)
+	// As the older operator stamped it: an optional join Secret volume.
+	p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
+		Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(srv.Name), Optional: ptr(true)}}})
 	p.Spec.NodeName = "m1"
 	if err := g.cl.Update(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod whose setup did not fail was ended")
+	}
+	p = g.pod(testNS, srv.Name)
 	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
 		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 2}},
 		State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}}}
 	if err := g.cl.Status().Update(context.Background(), p); err != nil {
 		t.Fatal(err)
 	}
-	g.reconcile(srv.Name) // still no leader: nothing to mint, no error
-	var s corev1.Secret
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); !apierrors.IsNotFound(err) {
-		t.Fatalf("a token without a leader: %v", err)
-	}
-	g.api.mintErr = nil
 	g.reconcile(srv.Name)
-	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: JoinSecret(srv.Name)}, &s); err != nil {
-		t.Fatalf("no token minted once a leader is back: %v", err)
+	if g.pod(testNS, srv.Name) != nil {
+		t.Fatal("the server pod waiting for a join Secret was not made again")
+	}
+	g.reconcile(srv.Name)
+	checkJoinsFromOperator(t, g.pod(testNS, srv.Name), "server")
+}
+
+// A server pod stamped with the operator's CA before it was renewed cannot
+// trust the operator's answer: once its setup fails it is made again with
+// the current CA. One stamped with the current CA is left to retry.
+func TestNodeRemakesAServerPodWithAnOldCA(t *testing.T) {
+	c := bootstrapped(testCluster())
+	srv := node("prod-server-2", v1.RoleServer, "", "z-c")
+	g := newNodeRig(t, c, srv, machine("m1"))
+	g.reconcile(srv.Name)
+	failSetup := func() {
+		t.Helper()
+		p := g.pod(testNS, srv.Name)
+		p.Spec.NodeName = "m1"
+		if err := g.cl.Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+		p = g.pod(testNS, srv.Name)
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: SetupContainer,
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}}}
+		if err := g.cl.Status().Update(context.Background(), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failSetup()
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod with the current CA was made again")
+	}
+	// The CA is renewed (another certificate in ca.crt).
+	renewed := otherJoinCA(t)
+	g.r.JoinCA = func() ([]byte, error) { return renewed, nil }
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) != nil {
+		t.Fatal("a server pod that trusts the old CA was not made again")
+	}
+	g.reconcile(srv.Name)
+	p := g.pod(testNS, srv.Name)
+	setup := p.Spec.InitContainers[containerIndex(p.Spec.InitContainers, SetupContainer)]
+	if got, _ := base64.StdEncoding.DecodeString(envValue(setup.Env, JoinCAEnv)); string(got) != string(renewed) {
+		t.Fatal("the new pod does not trust the renewed CA")
+	}
+	// The CA cannot be read for a moment: nothing is made again for it.
+	failSetup()
+	g.r.JoinCA = func() ([]byte, error) { return nil, errors.New("gone") }
+	g.reconcile(srv.Name)
+	if g.pod(testNS, srv.Name) == nil {
+		t.Fatal("a server pod was made again on an unreadable CA")
 	}
 }
 
@@ -737,5 +833,499 @@ func TestNodePendingSaysWhy(t *testing.T) {
 		Reason: corev1.PodReasonUnschedulable, Message: strings.Repeat("x", 500)}}}}
 	if got := waitingForMachine(long); len(got) > 300 || !strings.HasSuffix(got, "...") {
 		t.Fatalf("a long message is not cut: %d chars", len(got))
+	}
+}
+
+// endPodPhase marks p ended (Failed or Succeeded) with reason, as the
+// kubelet leaves an evicted or shut-down pod.
+func (g *nodeRig) endPodPhase(p *corev1.Pod, phase corev1.PodPhase, reason string) {
+	g.t.Helper()
+	p.Status.Phase, p.Status.Reason = phase, reason
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: AgentContainer, Ready: false,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"}}}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		g.t.Fatal(err)
+	}
+}
+
+// A pod that ended for good (evicted, or stopped by a machine's shutdown)
+// is never ready again. It must not hold its node's slot as Joining
+// forever (review R2): a gateway or worker is lost and replaced, a server
+// gets a new pod with the same name and volume, and a decommission goes on
+// without it.
+func TestTerminalPodRetires(t *testing.T) {
+	for _, tc := range []struct {
+		name, node, role, pool string
+		phase                  corev1.PodPhase
+		reason                 string
+		decommission           bool
+	}{
+		{name: "evicted worker", node: "prod-general-term1", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Evicted"},
+		{name: "worker stopped by its machine's shutdown", node: "prod-general-term2", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Terminated"},
+		{name: "completed gateway", node: "prod-gateway-term3", role: v1.RoleGateway, phase: corev1.PodSucceeded},
+		{name: "evicted server", node: "prod-server-1", role: v1.RoleServer, phase: corev1.PodFailed, reason: "Evicted"},
+		{name: "evicted decommissioning worker", node: "prod-general-term4", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Evicted", decommission: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := node(tc.node, tc.role, tc.pool, "z-a")
+			g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+			ns := g.r.podNamespace(tc.role)
+			g.reconcile(tc.node)
+			p := g.pod(ns, tc.node)
+			if p == nil {
+				t.Fatal("no pod")
+			}
+			g.running(p, "m1", true)
+			g.api.nodes[tc.node] = aerolapi.Node{Alive: true}
+			g.reconcile(tc.node)
+			if tc.decommission {
+				// The leader refuses to evacuate a node gossip sees dead
+				// (ErrNodeNotAlive): only the dead-owner failover can.
+				g.api.evacuate = func(id string, _ aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+					if n, _ := g.api.GetNode(context.Background(), id); !n.Alive {
+						return aerolapi.EvacuateResult{}, &aerolapi.Error{Status: http.StatusConflict, Reason: "node is not alive"}
+					}
+					return aerolapi.EvacuateResult{RemainingMovable: 1}, nil
+				}
+				got := g.node(tc.node)
+				got.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+				if err := g.cl.Update(context.Background(), got); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lostBefore := testutilCounter(workerPodsLost)
+			g.endPodPhase(g.pod(ns, tc.node), tc.phase, tc.reason)
+			g.reconcile(tc.node)
+			if g.pod(ns, tc.node) != nil {
+				t.Fatal("an ended pod was kept")
+			}
+			// Its machine's gossip sees it gone.
+			g.api.nodes[tc.node] = aerolapi.Node{Alive: false}
+			got := g.node(tc.node)
+			switch {
+			case tc.role == v1.RoleServer:
+				if got.Status.State != v1.StateRestarting || !strings.Contains(got.Status.Reason, "pod ended: Failed (Evicted)") {
+					t.Fatalf("server state %s (%s)", got.Status.State, got.Status.Reason)
+				}
+				g.reconcile(tc.node)
+				again := g.pod(ns, tc.node)
+				if again == nil {
+					t.Fatal("the server got no new pod")
+				}
+				if !podMounts(again, PVCName(tc.node)) {
+					t.Fatal("the server's new pod lost its volume")
+				}
+				if len(g.api.deleted) != 0 || len(g.api.gone) != 0 {
+					t.Fatalf("a server with its disk left the cluster: deleted %v gone %v", g.api.deleted, g.api.gone)
+				}
+				return
+			case tc.decommission:
+				for range 3 {
+					g.reconcile(tc.node)
+				}
+				if got := g.node(tc.node); got != nil && got.Status.State != v1.StateRemoved {
+					t.Fatalf("the decommission stopped at %s (%s)", got.Status.State, got.Status.Reason)
+				}
+				return
+			}
+			if got.Status.State != v1.StateSuspect {
+				t.Fatalf("state %s (%s)", got.Status.State, got.Status.Reason)
+			}
+			for range 3 {
+				g.reconcile(tc.node)
+			}
+			if got := g.node(tc.node); got != nil {
+				t.Fatalf("the node was not removed for a replacement: %s (%s)", got.Status.State, got.Status.Reason)
+			}
+			if len(g.api.deleted) != 1 {
+				t.Fatalf("left the cluster %v times", g.api.deleted)
+			}
+			want := 0.0
+			if tc.role == v1.RoleWorker {
+				want = 1
+			}
+			if d := testutilCounter(workerPodsLost) - lostBefore; d != want {
+				t.Fatalf("lost workers counted %v times, want %v", d, want)
+			}
+		})
+	}
+}
+
+// An agent that is not ready in a running pod is a restart, not an end:
+// the pod stays.
+func TestUnreadyRunningPodIsNotRetired(t *testing.T) {
+	n := node("prod-general-unready", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	g.reconcile(n.Name)
+	g.running(g.pod(testWorkerNS, n.Name), "m1", false)
+	for range 3 {
+		g.reconcile(n.Name)
+	}
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("a running pod whose agent is not ready yet was deleted")
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateJoining {
+		t.Fatalf("state %s", got.Status.State)
+	}
+}
+
+func podMounts(p *corev1.Pod, claim string) bool {
+	for _, v := range p.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
+			return true
+		}
+	}
+	return false
+}
+
+// decommissioning returns a serving worker on m1 whose decommission is
+// past its drain window, so its next pass evacuates.
+func decommissioning(t *testing.T, g *nodeRig, name string) {
+	t.Helper()
+	g.reconcile(name)
+	g.running(g.pod(testWorkerNS, name), "m1", true)
+	g.api.mu.Lock()
+	g.api.nodes[name] = aerolapi.Node{Alive: true, SandboxesOwned: 4}
+	g.api.mu.Unlock()
+	n := g.node(name)
+	n.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(name) // the drain window starts
+	g.now = g.now.Add(defaultDrainWindow + time.Second)
+}
+
+// One slow evacuate pass must not hold the node controller (review R3): a
+// pass can take minutes, and a reconcile that waited for it held a worker
+// that long. Now the reconcile comes back for the answer, starts no second
+// pass and makes no second cordon meanwhile, and another node's reconcile
+// runs while the pass is still out.
+func TestSlowEvacuateDoesNotBlockAnotherNode(t *testing.T) {
+	c := bootstrapped(testCluster())
+	slow := node("prod-general-slow1", v1.RoleWorker, "general", "z-a")
+	other := node("prod-general-other", v1.RoleWorker, "general", "z-b")
+	g := newNodeRig(t, c, slow, other, machine("m1"))
+	g.r.EvacuateWait = 20 * time.Millisecond
+	decommissioning(t, g, slow.Name)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	passes := 0
+	g.api.evacuate = func(id string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		mu.Lock()
+		passes++
+		mu.Unlock()
+		<-release
+		return aerolapi.EvacuateResult{Moved: []string{"a", "b"}, RemainingMovable: 2}, nil
+	}
+	cordons := len(g.api.cordoned)
+	start := time.Now()
+	res := g.reconcile(slow.Name)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("the reconcile waited %s for a pass still running", d)
+	}
+	if res.RequeueAfter != evacuatePoll {
+		t.Fatalf("requeue %v, want %v", res.RequeueAfter, evacuatePoll)
+	}
+	if got := g.node(slow.Name); got.Status.State != v1.StateDecommissioning {
+		t.Fatalf("state %s", got.Status.State)
+	}
+	// Another node is reconciled meanwhile.
+	g.reconcile(other.Name)
+	if g.pod(testWorkerNS, other.Name) == nil {
+		t.Fatal("another node got no pod while a pass ran")
+	}
+	// Coming back while the pass runs: no second pass, no second cordon.
+	g.reconcile(slow.Name)
+	g.api.mu.Lock()
+	cordoned := len(g.api.cordoned)
+	g.api.mu.Unlock()
+	mu.Lock()
+	n := passes
+	mu.Unlock()
+	if n != 1 || cordoned != cordons+1 {
+		t.Fatalf("passes %d, cordons %d (want 1, %d)", n, cordoned, cordons+1)
+	}
+	close(release)
+	run := g.r.evacuations().get(evacKey(g.node(slow.Name)))
+	if run == nil || !run.wait(5*time.Second) {
+		t.Fatal("the pass never ended")
+	}
+	g.reconcile(slow.Name)
+	got := g.node(slow.Name)
+	if d := got.Status.Decommission; d == nil || d.Moved != 2 || d.Remaining != 2 {
+		t.Fatalf("the pass's answer was not taken: %+v", got.Status.Decommission)
+	}
+	if g.r.evacuations().get(evacKey(got)) != nil {
+		t.Fatal("a taken answer was kept")
+	}
+}
+
+// A pass that started before the deadline did not stop the rest, even when
+// its answer comes after the deadline: the node is not deleted on it, and
+// the next pass stops the rest.
+func TestEvacuateAnswerAfterTheDeadline(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-late1", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.r.EvacuateWait = 20 * time.Millisecond
+	decommissioning(t, g, n.Name)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var reqs []aerolapi.EvacuateRequest
+	g.api.evacuate = func(id string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		mu.Lock()
+		reqs = append(reqs, req)
+		mu.Unlock()
+		if !req.StopRemaining {
+			<-release
+			return aerolapi.EvacuateResult{Moved: []string{"a"}, Remaining: 2}, nil
+		}
+		return aerolapi.EvacuateResult{Stopped: 2, Done: true}, nil
+	}
+	g.reconcile(n.Name) // the pass starts, before the deadline
+	g.now = g.now.Add(defaultDecomDeadline)
+	close(release)
+	run := g.r.evacuations().get(evacKey(g.node(n.Name)))
+	if run == nil || !run.wait(5*time.Second) {
+		t.Fatal("the pass never ended")
+	}
+	g.reconcile(n.Name) // its answer, after the deadline
+	g.api.mu.Lock()
+	deleted := len(g.api.deleted)
+	g.api.mu.Unlock()
+	if deleted != 0 {
+		t.Fatal("the node was deleted on a pass that stopped nothing")
+	}
+	g.reconcile(n.Name) // the next pass stops the rest
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 2 || !reqs[1].StopRemaining {
+		t.Fatalf("passes %+v", reqs)
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved {
+		t.Fatalf("state %s (%s)", got.Status.State, got.Status.Reason)
+	}
+}
+
+// At most maxEvacuations passes run at once; a node over that waits its
+// turn, and an answer nobody came back for is dropped in time.
+func TestEvacuationsCap(t *testing.T) {
+	e := &evacuations{runs: map[string]*evacRun{}}
+	release := make(chan struct{})
+	block := func(context.Context) (aerolapi.EvacuateResult, error) {
+		<-release
+		return aerolapi.EvacuateResult{Done: true}, nil
+	}
+	for i := range maxEvacuations {
+		if e.start(fmt.Sprint("n", i), aerolapi.EvacuateRequest{}, block) == nil {
+			t.Fatalf("pass %d refused", i)
+		}
+	}
+	if e.start("over", aerolapi.EvacuateRequest{}, block) != nil {
+		t.Fatal("a pass past the cap started")
+	}
+	close(release)
+	for i := range maxEvacuations {
+		if !e.get(fmt.Sprint("n", i)).wait(5 * time.Second) {
+			t.Fatal("a pass never ended")
+		}
+	}
+	if e.start("over", aerolapi.EvacuateRequest{}, block) == nil {
+		t.Fatal("finished passes still count against the cap")
+	}
+	// An answer older than evacuateKeep goes on the next start.
+	e.mu.Lock()
+	e.runs["n0"].doneAt = time.Now().Add(-evacuateKeep - time.Minute)
+	e.mu.Unlock()
+	e.start("another", aerolapi.EvacuateRequest{}, block)
+	if e.get("n0") != nil {
+		t.Fatal("an old answer nobody came back for was kept")
+	}
+	if e.get("n1") == nil {
+		t.Fatal("a recent answer was dropped")
+	}
+}
+
+// The node controller runs DefaultNodeConcurrency reconciles at once
+// unless told otherwise; controller-runtime's own default is one.
+func TestNodeConcurrency(t *testing.T) {
+	if got := (&NodeReconciler{}).concurrency(); got != DefaultNodeConcurrency || got < 2 {
+		t.Fatalf("default %d", got)
+	}
+	if got := (&NodeReconciler{MaxConcurrentReconciles: 3}).concurrency(); got != 3 {
+		t.Fatalf("set %d", got)
+	}
+}
+
+// With maxEvacuations passes out, a node waits its turn and says so.
+func TestDecommissionWaitsItsTurn(t *testing.T) {
+	n := node("prod-general-turn1", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	decommissioning(t, g, n.Name)
+	release := make(chan struct{})
+	defer close(release)
+	for i := range maxEvacuations {
+		g.r.evacuations().start(fmt.Sprint("busy", i), aerolapi.EvacuateRequest{}, func(context.Context) (aerolapi.EvacuateResult, error) {
+			<-release
+			return aerolapi.EvacuateResult{}, nil
+		})
+	}
+	g.api.evacuate = func(string, aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		t.Error("a pass past the cap started")
+		return aerolapi.EvacuateResult{}, nil
+	}
+	if res := g.reconcile(n.Name); res.RequeueAfter != 10*time.Second {
+		t.Fatalf("requeue %v", res.RequeueAfter)
+	}
+	if got := g.node(n.Name); !strings.Contains(got.Status.Reason, "waiting its turn") {
+		t.Fatalf("reason %q", got.Status.Reason)
+	}
+}
+
+// A gateway marked for retirement (a scale-down) loses its pod, waits for
+// gossip to see it gone, leaves the cluster and is removed (review R7).
+func TestRetireGateway(t *testing.T) {
+	n := node("prod-gateway-retire", v1.RoleGateway, "", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	g.reconcile(n.Name)
+	g.running(g.pod(testNS, n.Name), "m1", true)
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true}
+	g.reconcile(n.Name)
+	got := g.node(n.Name)
+	got.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	if g.pod(testNS, n.Name) != nil {
+		t.Fatal("a retired gateway kept its pod")
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateDecommissioning {
+		t.Fatalf("state %s", got.Status.State)
+	}
+	g.reconcile(n.Name) // gossip still sees it
+	if len(g.api.deleted) != 0 {
+		t.Fatal("a gateway gossip still sees left the cluster")
+	}
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: false}
+	g.reconcile(n.Name)
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved || len(g.api.deleted) != 1 {
+		t.Fatalf("state %s, deleted %v", got.Status.State, g.api.deleted)
+	}
+	g.reconcile(n.Name)
+	if g.node(n.Name) != nil {
+		t.Fatal("the retired gateway's AerolNode was kept")
+	}
+}
+
+// An EKS managed node group evicts for 15 minutes, then gives up with
+// PodEvictionFailure (§10.6). With the worker PodDisruptionBudget (#1270)
+// holding the eviction, a decommission on such a pool must end first: its
+// deadline and drain window are at most 14 minutes, whatever is set; other
+// pools keep theirs.
+func TestEKSManagedDecommissionFitsTheEvictionWindow(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	pool := func(provisioner string, drain, deadline *metav1.Duration) *v1.WorkerPoolSpec {
+		return &v1.WorkerPoolSpec{Provisioner: provisioner, Decommission: v1.DecommissionSpec{DrainWindow: drain, Deadline: deadline}}
+	}
+	for _, tc := range []struct {
+		name            string
+		pool            *v1.WorkerPoolSpec
+		drain, deadline time.Duration
+	}{
+		{"eks-managed defaults", pool("eks-managed", nil, nil), 5 * time.Minute, 14 * time.Minute},
+		{"eks-managed, a longer deadline set", pool("eks-managed", nil, dur(30*time.Minute)), 5 * time.Minute, 14 * time.Minute},
+		{"eks-managed, a shorter deadline set", pool("eks-managed", nil, dur(10*time.Minute)), 5 * time.Minute, 10 * time.Minute},
+		{"eks-managed, a drain window past the cap", pool("eks-managed", dur(20*time.Minute), nil), 14 * time.Minute, 14 * time.Minute},
+		{"karpenter keeps its defaults", pool("karpenter", nil, nil), defaultDrainWindow, defaultDecomDeadline},
+		{"none keeps what is set", pool("none", dur(20*time.Minute), dur(time.Hour)), 20 * time.Minute, time.Hour},
+	} {
+		if d := drainWindow(tc.pool); d != tc.drain {
+			t.Errorf("%s: drain window %s, want %s", tc.name, d, tc.drain)
+		}
+		if d := decomDeadline(tc.pool); d != tc.deadline {
+			t.Errorf("%s: deadline %s, want %s", tc.name, d, tc.deadline)
+		}
+	}
+	// A decommission that starts on such a pool records the capped
+	// deadline.
+	c := bootstrapped(testCluster())
+	c.Spec.WorkerPools[0].Provisioner = "eks-managed"
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(time.Hour)
+	n := node("prod-general-eks01", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	decommissioning(t, g, n.Name)
+	d := g.node(n.Name).Status.Decommission
+	if d == nil || d.Deadline.Sub(d.StartedAt.Time) != 14*time.Minute || d.DrainUntil.Sub(d.StartedAt.Time) != 5*time.Minute {
+		t.Fatalf("decommission = %+v", d)
+	}
+}
+
+// A worker pool removed from the spec keeps its decommission settings
+// through the status (keepPoolDecommission). Found live: a removed
+// eks-managed pool's worker took the defaults, a 45-minute deadline, past
+// the node group's 15-minute eviction window.
+func TestRemovedEKSPoolKeepsItsCap(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := bootstrapped(testCluster())
+	eks := *c.Spec.WorkerPools[0].DeepCopy()
+	eks.Name, eks.Provisioner = "eks", "eks-managed"
+	eks.Decommission = v1.DecommissionSpec{DrainWindow: dur(20 * time.Minute), Deadline: dur(time.Hour)}
+	c.Spec.WorkerPools = append(c.Spec.WorkerPools, eks)
+	n := node("prod-eks-a1", v1.RoleWorker, "eks", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.reconcile(n.Name) // its pod, made while the pool is in the spec
+	g.running(g.pod(testWorkerNS, n.Name), "m1", true)
+
+	// A cluster pass with the pool, then the pool leaves the spec and the
+	// next pass keeps its settings: a worker of it is left.
+	var cur v1.AerolCluster
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: c.Namespace, Name: c.Name}, &cur); err != nil {
+		t.Fatal(err)
+	}
+	nodes := []v1.AerolNode{*g.node(n.Name)}
+	keepPoolDecommission(&cur, nodes)
+	cur.Spec.WorkerPools = cur.Spec.WorkerPools[:1]
+	keepPoolDecommission(&cur, nodes)
+	status := cur.Status
+	if err := g.cl.Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+	cur.Status = status
+	if err := g.cl.Status().Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+
+	g.api.mu.Lock()
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true, SandboxesOwned: 4}
+	g.api.mu.Unlock()
+	w := g.node(n.Name)
+	w.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	d := g.node(n.Name).Status.Decommission
+	if d == nil || d.Deadline.Sub(d.StartedAt.Time) != 14*time.Minute || d.DrainUntil.Sub(d.StartedAt.Time) != 14*time.Minute {
+		t.Fatalf("removed eks-managed pool: decommission = %+v, want a 14m deadline and drain window", d)
+	}
+}
+
+func TestDecommissionPool(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := testCluster()
+	c.Status.PoolDecommission = []v1.PoolDecommission{
+		{Name: "general", Provisioner: "eks-managed"},
+		{Name: "gone", Provisioner: "eks-managed", Decommission: v1.DecommissionSpec{Deadline: dur(time.Hour)}},
+	}
+	if p := decommissionPool(c, "general"); p != &c.Spec.WorkerPools[0] {
+		t.Errorf("a pool in the spec: %+v, want the spec's", p)
+	}
+	if p := decommissionPool(c, "gone"); p == nil || p.Name != "gone" || decomDeadline(p) != 14*time.Minute || drainWindow(p) != 5*time.Minute {
+		t.Errorf("a removed pool: %+v, want its kept settings with the eks-managed cap", p)
+	}
+	if p := decommissionPool(c, "never"); p != nil || decomDeadline(p) != defaultDecomDeadline || drainWindow(p) != defaultDrainWindow {
+		t.Errorf("a pool known nowhere: %+v, want the defaults", p)
 	}
 }

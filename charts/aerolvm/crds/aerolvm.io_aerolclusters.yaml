@@ -153,10 +153,15 @@ spec:
                     - name
                     type: object
                   maxReplicas:
+                    description: |-
+                      MaxReplicas caps the gateways. The operator refuses a cap below
+                      minReplicas or below one per zone. Zero: no cap.
                     format: int32
                     type: integer
                   minReplicas:
-                    description: MinReplicas is at least one per zone.
+                    description: |-
+                      MinReplicas is how many gateways the cluster keeps, at least one per
+                      zone. Lowering it retires the surplus.
                     format: int32
                     minimum: 1
                     type: integer
@@ -374,6 +379,29 @@ spec:
                     - 5
                     format: int32
                     type: integer
+                  logStorage:
+                    description: |-
+                      LogStorage, when set, is a second disk for each server that holds
+                      only its Raft log (sandboxd's SB_RAFT_WAL_DIR). A commit waits for a
+                      log write on the leader and then on a follower, so the log's disk
+                      sets the commit time; on the cell bench, a log on a disk of its own
+                      brought Raft apply p99 under 25 ms at 1,354 creates a second
+                      (plans/kubernetes-v2-architecture.md §9.5). A server keeps the layout
+                      it was made with: setting or clearing this changes only servers made
+                      after it, because a new disk laid over a log would hide it.
+                    properties:
+                      size:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 20Gi
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      storageClassName:
+                        type: string
+                    required:
+                    - size
+                    type: object
                   nodeSelector:
                     additionalProperties:
                       type: string
@@ -517,7 +545,9 @@ spec:
                         deadline:
                           description: |-
                             Deadline is when what could not move is stopped, counted from the
-                            start. Default 45m.
+                            start. Default 45m. On eks-managed pools the deadline and the drain
+                            window are at most 14m: a managed node group gives up evicting after
+                            15 minutes.
                           type: string
                         drainWindow:
                           description: |-
@@ -753,6 +783,42 @@ spec:
               phase:
                 description: Phase is Bootstrapping, Ready, Upgrading or Degraded.
                 type: string
+              poolDecommission:
+                description: |-
+                  PoolDecommission is each worker pool's decommission settings as the
+                  operator last saw them in the spec. A pool removed from the spec still
+                  has workers to decommission, and they keep its settings, the
+                  eks-managed cap included. A removed pool's entry goes once no worker
+                  of it is left.
+                items:
+                  description: PoolDecommission is one worker pool's decommission
+                    settings.
+                  properties:
+                    decommission:
+                      description: DecommissionSpec times a worker's decommission
+                        (§10.5).
+                      properties:
+                        deadline:
+                          description: |-
+                            Deadline is when what could not move is stopped, counted from the
+                            start. Default 45m. On eks-managed pools the deadline and the drain
+                            window are at most 14m: a managed node group gives up evicting after
+                            15 minutes.
+                          type: string
+                        drainWindow:
+                          description: |-
+                            DrainWindow is the time sandboxes get to end by themselves before
+                            the moves start. Default 15m (5m on eks-managed pools, §10.6).
+                          type: string
+                      type: object
+                    name:
+                      type: string
+                    provisioner:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               rollout:
                 description: Rollout is AerolVM's own upgrade record, when one exists.
                 properties:

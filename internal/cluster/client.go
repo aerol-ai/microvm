@@ -99,6 +99,12 @@ type Cluster struct {
 	// Close can stop its loop. See dead_owner.go for the reconciler logic.
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
+	// orphanRetry is the leader's place in the orphaned-recovery backlog
+	// (orphan_recovery.go).
+	orphanRetry orphanRetryCursor
+	// orphanRetryBeforeApply, when set (tests only), runs just before a
+	// retry's move is applied: the window another write can race it in.
+	orphanRetryBeforeApply func(sandboxID string)
 
 	// reservationGCStop cancels the leader-only sweep that cancels expired
 	// opReserve rows. Followers run no loop because every CancelReservation
@@ -251,6 +257,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		BindAddr:         cfg.RaftBindAddr,
 		AdvertiseAddr:    cfg.RaftAdvertiseAddr,
 		DataDir:          cfg.RaftDataDir,
+		WALDir:           cfg.RaftWALDir,
 		BootstrapCluster: cfg.ClusterBootstrap,
 		TLS:              clusterTLS,
 	}, fsm, logger)

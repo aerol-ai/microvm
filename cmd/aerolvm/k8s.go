@@ -509,7 +509,7 @@ func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
 				continue
 			}
 			for _, s := range v.Projected.Sources {
-				if s.ServiceAccountToken != nil {
+				if s.ServiceAccountToken != nil && !k8sJoinIdentityToken(*s.ServiceAccountToken) {
 					found = append(found, fmt.Sprintf("%s: volume %s holds a service account token", p.Metadata.Name, v.Name))
 				}
 			}
@@ -522,6 +522,20 @@ func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
 		return k8sCheck{Name: name, Result: k8sPass, Detail: fmt.Sprintf("the %d operator pod(s) hold one by design", operators)}
 	}
 	return k8sCheck{Name: name, Result: k8sPass}
+}
+
+// k8sJoinAudience is the audience of the token a joining pod shows the
+// operator (plans/kubernetes-v2-architecture.md §15.2).
+const k8sJoinAudience = "aerolvm.io/join"
+
+// k8sJoinIdentityToken says whether a projected token is a joining pod's
+// proof of who it is: made for the operator's audience alone, which the API
+// server refuses, so it opens nothing in the Kubernetes API.
+func k8sJoinIdentityToken(raw json.RawMessage) bool {
+	var sat struct {
+		Audience string `json:"audience"`
+	}
+	return json.Unmarshal(raw, &sat) == nil && sat.Audience == k8sJoinAudience
 }
 
 // k8sPrivileged checks privilege stays where §7 and §15.1 put it: in the

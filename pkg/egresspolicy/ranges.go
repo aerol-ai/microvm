@@ -100,9 +100,10 @@ func SetRanges(floor, private []netip.Prefix) {
 	extraPrivate.Store(&p)
 }
 
-// LoadRangesFromEnv reads both lists from the environment and installs
-// them. A process that cannot read a list it was given must not run: it
-// would guard sandboxes without a floor entry the operator asked for.
+// LoadRangesFromEnv reads both lists from the environment, and the floor
+// file when FloorFileEnv names one, and installs them. A process that
+// cannot read a list it was given must not run: it would guard sandboxes
+// without a floor entry the operator asked for.
 func LoadRangesFromEnv() error {
 	floor, err := ParseRanges(DenyFloorEnv, os.Getenv(DenyFloorEnv))
 	if err != nil {
@@ -112,12 +113,22 @@ func LoadRangesFromEnv() error {
 	if err != nil {
 		return err
 	}
+	var file []netip.Prefix
+	if path := os.Getenv(FloorFileEnv); path != "" {
+		if file, err = ReadFloorFile(path); err != nil {
+			return err
+		}
+	}
 	SetRanges(floor, private)
+	SetFileFloor(file)
 	return nil
 }
 
-// ExtraDenyFloor returns the deny floor SetRanges installed.
-func ExtraDenyFloor() []netip.Prefix { return loadPrefixes(&extraFloor) }
+// ExtraDenyFloor returns the deny floor SetRanges installed, with the
+// floor file's (SetFileFloor).
+func ExtraDenyFloor() []netip.Prefix {
+	return withEach(loadPrefixes(&extraFloor), loadPrefixes(&fileFloor))
+}
 
 // ExtraPrivateRanges returns the private ranges SetRanges installed.
 func ExtraPrivateRanges() []netip.Prefix { return loadPrefixes(&extraPrivate) }

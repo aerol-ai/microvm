@@ -65,6 +65,13 @@ type ClusterReconciler struct {
 	API      APIFactory
 	// WorkerNamespace holds the worker pods.
 	WorkerNamespace string
+	// Templates is the chart's pod-templates ConfigMap, in the cluster's
+	// namespace: the worker template says whether workers take the deny
+	// floor, and their sandbox range.
+	Templates string
+	// Reader reads past the manager's cache: the API server's Service and
+	// addresses live in default (syncEgressFloor). Nil uses the client.
+	Reader client.Reader
 	// Now is the clock; tests replace it.
 	Now func() time.Time
 }
@@ -105,6 +112,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if err := r.syncFederationKey(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.syncEgressFloor(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
 	nodes, err := listNodes(ctx, r.Client, &c)
@@ -167,6 +177,9 @@ func refuseSpec(c *v1.AerolCluster) string {
 	}
 	if c.Spec.Servers.Count != 3 && c.Spec.Servers.Count != 5 {
 		return "servers.count must be 3 or 5"
+	}
+	if g := c.Spec.Gateways; g.MaxReplicas > 0 && int(g.MaxReplicas) < wantedGateways(c) {
+		return fmt.Sprintf("gateways.maxReplicas (%d) is below the %d gateways the cluster keeps: minReplicas, and at least one per zone", g.MaxReplicas, wantedGateways(c))
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Spec.WorkerPools {
@@ -374,28 +387,98 @@ func anyMaintenance(nodes []v1.AerolNode) bool {
 // PVCName is server node's volume claim.
 func PVCName(node string) string { return "data-" + node }
 
-// ensurePVC makes server node's volume. It lands in the server's zone
-// because the server pod is pinned there and the storage class binds on
-// first use (WaitForFirstConsumer, which the chart's docs require).
+// LogPVCName is server node's Raft log claim (servers.logStorage).
+func LogPVCName(node string) string { return "raftlog-" + node }
+
+// AnnotationLogClaim, on a server's data claim, names its Raft log claim.
+// It is written once, with the data claim, and the server's pods mount what
+// it names from then on, whatever servers.logStorage says later: a log
+// claim laid over a log already on the data disk would hide it, and
+// dropping one would hide the log on it. sandboxd refuses either too
+// (internal/raftlogdir); this keeps a server from ever being asked to.
+const AnnotationLogClaim = "aerolvm.io/raft-log-claim"
+
+// ensurePVC makes server node's volume, and its Raft log volume when
+// servers.logStorage asks for one. They land in the server's zone because
+// the server pod is pinned there and the storage class binds on first use
+// (WaitForFirstConsumer, which the chart's docs require). A data claim that
+// exists already keeps the layout it was made with.
+//
+// The data claim is made first, naming its log claim, and the log claim
+// after: a log claim with no data claim can then only be a server's old
+// log, kept when a person deleted the data claim to start the server
+// afresh. A new server must not take it, and the operator never deletes a
+// disk, so that is refused. A data claim whose log claim was not made yet
+// (the operator stopped in between) gets it on the next pass.
 func (r *ClusterReconciler) ensurePVC(ctx context.Context, c *v1.AerolCluster, node string) error {
+	ls := c.Spec.Servers.LogStorage
 	var pvc corev1.PersistentVolumeClaim
 	err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: PVCName(node)}, &pvc)
+	switch {
+	case err == nil:
+		name := pvc.Annotations[AnnotationLogClaim]
+		if name == "" {
+			return nil
+		}
+		return r.ensureLogPVC(ctx, c, node, name)
+	case !apierrors.IsNotFound(err):
+		return err
+	}
+	pvc = serverClaim(c, PVCName(node), c.Spec.Servers.Storage)
+	if ls != nil {
+		var old corev1.PersistentVolumeClaim
+		err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: LogPVCName(node)}, &old)
+		if err == nil {
+			return fmt.Errorf("server %s: claim %s holds an old Raft log and %s is gone; delete %s too to make the server afresh", node, LogPVCName(node), PVCName(node), LogPVCName(node))
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		pvc.Annotations = map[string]string{AnnotationLogClaim: LogPVCName(node)}
+	}
+	if err := r.Create(ctx, &pvc); err != nil {
+		return err
+	}
+	if ls == nil {
+		return nil
+	}
+	return r.ensureLogPVC(ctx, c, node, LogPVCName(node))
+}
+
+// ensureLogPVC makes the log claim a server's data claim names, if it is
+// not there. Its size and class come from servers.logStorage; with that
+// cleared, a missing one cannot be made, and the server waits for it.
+func (r *ClusterReconciler) ensureLogPVC(ctx context.Context, c *v1.AerolCluster, node, name string) error {
+	var pvc corev1.PersistentVolumeClaim
+	err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: name}, &pvc)
 	if err == nil || !apierrors.IsNotFound(err) {
 		return err
 	}
-	pvc = corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: PVCName(node), Namespace: c.Namespace, Labels: clusterLabels(c)},
+	ls := c.Spec.Servers.LogStorage
+	if ls == nil {
+		return fmt.Errorf("server %s: its data claim names Raft log claim %s, which is gone, and servers.logStorage is not set to make it again", node, name)
+	}
+	pvc = serverClaim(c, name, *ls)
+	if err := r.Create(ctx, &pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
+
+// serverClaim is one of a server's claims. No owner reference: a server's
+// disk outlives everything but a person deleting it, deleting the
+// AerolCluster included.
+func serverClaim(c *v1.AerolCluster, name string, s v1.StorageSpec) corev1.PersistentVolumeClaim {
+	return corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace, Labels: clusterLabels(c)},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			StorageClassName: c.Spec.Servers.Storage.StorageClassName,
+			StorageClassName: s.StorageClassName,
 			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: c.Spec.Servers.Storage.Size},
+				Requests: corev1.ResourceList{corev1.ResourceStorage: s.Size},
 			},
 		},
 	}
-	// No owner reference: a server's disk outlives everything but a person
-	// deleting it, deleting the AerolCluster included.
-	return r.Create(ctx, &pvc)
 }
 
 func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, name, role, pool, zone string) error {
@@ -417,20 +500,59 @@ func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, 
 	return nil
 }
 
-// ensureGateways keeps minReplicas gateways, spread across the zones. A
-// gateway that ended is replaced by a new one (a new node: gateways hold
-// no state).
-func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) error {
-	perZone := map[string]int{}
-	live := 0
+// keepPoolDecommission records each worker pool's decommission settings in
+// the status. A pool removed from the spec still has workers to
+// decommission (retireRemovedPools), and the spec no longer says how: they
+// took the defaults, a 15-minute drain window and a 45-minute deadline,
+// even on an eks-managed pool, whose node group gives up evicting after 15
+// minutes. So a removed pool's settings stay here until no worker of it is
+// left. It rides the status write every pass makes already.
+func keepPoolDecommission(c *v1.AerolCluster, nodes []v1.AerolNode) {
+	left := map[string]bool{}
 	for _, n := range nodes {
-		if n.Spec.Role == v1.RoleGateway && !ended(n) {
-			perZone[n.Spec.Zone]++
-			live++
+		if n.Spec.Role == v1.RoleWorker {
+			left[n.Spec.Pool] = true
 		}
 	}
-	want := int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
-	for live < want {
+	out := make([]v1.PoolDecommission, 0, len(c.Spec.WorkerPools))
+	for _, p := range c.Spec.WorkerPools {
+		out = append(out, v1.PoolDecommission{Name: p.Name, Provisioner: p.Provisioner, Decommission: *p.Decommission.DeepCopy()})
+	}
+	for _, k := range c.Status.PoolDecommission {
+		if poolOf(c, k.Name) == nil && left[k.Name] {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) == 0 {
+		out = nil
+	}
+	c.Status.PoolDecommission = out
+}
+
+// wantedGateways is how many gateways the cluster keeps: minReplicas, and
+// at least one per zone. maxReplicas caps it (refuseSpec refuses a cap
+// below it); nothing scales gateways past it.
+func wantedGateways(c *v1.AerolCluster) int {
+	return int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
+}
+
+// ensureGateways keeps wantedGateways gateways, spread across the zones. A
+// gateway that ended is replaced by a new one (a new node: gateways hold
+// no state). A surplus, left when minReplicas went down, is retired
+// (review R7): the node controller deletes each one's pod and takes it out
+// of the cluster (retireGateway).
+func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) error {
+	perZone := map[string]int{}
+	var live []v1.AerolNode
+	for _, n := range nodes {
+		if n.Spec.Role == v1.RoleGateway && !ended(n) && n.Annotations[v1.AnnotationDecommission] != "true" {
+			perZone[n.Spec.Zone]++
+			live = append(live, n)
+		}
+	}
+	want := wantedGateways(c)
+	for have := len(live); have < want; have++ {
 		zone := leastZone(c.Spec.Zones, perZone)
 		suffix, err := randomToken(5)
 		if err != nil {
@@ -440,9 +562,52 @@ func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolClust
 			return err
 		}
 		perZone[zone]++
-		live++
+	}
+	why := fmt.Sprintf("scale-down: the cluster keeps %d gateways", want)
+	for len(live) > want {
+		i := surplusGateway(c.Spec.Zones, perZone, live)
+		if err := r.markDecommission(ctx, c, live[i].Name, why); err != nil {
+			return err
+		}
+		perZone[live[i].Spec.Zone]--
+		live = append(live[:i], live[i+1:]...)
 	}
 	return nil
+}
+
+// surplusGateway picks the gateway to retire first: one in a zone no
+// longer in the spec, then one not serving, then one from the zone with the
+// most gateways, so every zone keeps its own. Ties go to the last name.
+func surplusGateway(zones []string, perZone map[string]int, live []v1.AerolNode) int {
+	inSpec := map[string]bool{}
+	for _, z := range zones {
+		inSpec[z] = true
+	}
+	rank := func(n v1.AerolNode) (bool, bool, int) {
+		return !inSpec[n.Spec.Zone], n.Status.State != v1.StateServing, perZone[n.Spec.Zone]
+	}
+	best := 0
+	for i := 1; i < len(live); i++ {
+		ao, an, ac := rank(live[i])
+		bo, bn, bc := rank(live[best])
+		switch {
+		case ao != bo:
+			if ao {
+				best = i
+			}
+		case an != bn:
+			if an {
+				best = i
+			}
+		case ac != bc:
+			if ac > bc {
+				best = i
+			}
+		case live[i].Name > live[best].Name:
+			best = i
+		}
+	}
+	return best
 }
 
 // ended reports a node whose pod is gone for good: removed, dead, or a
@@ -481,6 +646,7 @@ func (r *ClusterReconciler) event(obj runtime.Object, typ, reason, msg string) {
 // updateStatus counts each tier and reports the version every node runs.
 func (r *ClusterReconciler) updateStatus(_ context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) {
 	c.Status.ObservedGeneration = c.Generation
+	keepPoolDecommission(c, nodes)
 	var servers, gateways, workers v1.TierStatus
 	versions := map[string]int{}
 	for _, n := range nodes {
@@ -621,6 +787,50 @@ func (r *ClusterReconciler) syncFederationKey(ctx context.Context, c *v1.AerolCl
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
 		dst.Labels = clusterLabels(c)
 		dst.Data = map[string][]byte{FederationKeyKey: src.Data[FederationKeyKey]}
+		return nil
+	})
+	return err
+}
+
+// syncEgressFloor keeps the API server's current addresses in the worker
+// namespace's deny-floor ConfigMap, which every worker pod mounts and
+// sandboxd watches (review R4; egress.go). One read past the cache per pass,
+// and a write only when the addresses changed. A read that fails changes
+// nothing: the last good addresses stay on every worker's floor, and while
+// there are none yet, new worker pods wait for the ConfigMap.
+func (r *ClusterReconciler) syncEgressFloor(ctx context.Context, c *v1.AerolCluster) error {
+	ns := r.WorkerNamespace
+	if ns == "" {
+		ns = c.Namespace
+	}
+	if r.Templates == "" {
+		return nil
+	}
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: r.Templates}, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	tpl, err := ParsePodTemplate(cm.Data[TemplateWorker])
+	if err != nil || !usesEgressRanges(&tpl.Spec) {
+		// No worker template to read, or workers without the host
+		// firewall: no worker mounts the file (useEgressFloorFile).
+		return nil
+	}
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
+	found, err := readDenyFloor(ctx, reader)
+	if err != nil {
+		egressFloorReadErrors.Inc()
+		log.FromContext(ctx).Info("cannot read the API server's addresses; the workers keep the last ones", "error", err.Error())
+		return nil
+	}
+	body := strings.Join(floorFor(&tpl.Spec, found), "\n") + "\n"
+	dst := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: EgressFloorConfigMap(c.Name), Namespace: ns}}
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Data = map[string]string{EgressFloorKey: body}
 		return nil
 	})
 	return err

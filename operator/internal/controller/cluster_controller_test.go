@@ -138,6 +138,8 @@ func TestRefuseSpec(t *testing.T) {
 		{func(c *v1.AerolCluster) { c.Spec.Servers.Count = 4 }, "3 or 5"},
 		{func(c *v1.AerolCluster) { c.Spec.WorkerPools = append(c.Spec.WorkerPools, c.Spec.WorkerPools[0]) }, "twice"},
 		{func(c *v1.AerolCluster) { c.Spec.WorkerPools[0].MinWorkers = 20 }, "above maxWorkers"},
+		{func(c *v1.AerolCluster) { c.Spec.Gateways.MinReplicas, c.Spec.Gateways.MaxReplicas = 6, 4 }, "maxReplicas (4) is below the 6 gateways"},
+		{func(c *v1.AerolCluster) { c.Spec.Gateways.MinReplicas, c.Spec.Gateways.MaxReplicas = 1, 2 }, "maxReplicas (2) is below the 3 gateways"},
 		{func(c *v1.AerolCluster) { c.Spec.Federation = &v1.FederationSpec{} }, "idKeySecret.name is empty"},
 		{fed(map[string]string{"0": "https://a.example.com"}), "0 is not a cell number"},
 		{fed(map[string]string{"256": "https://a.example.com"}), "256 is not a cell number"},
@@ -154,6 +156,11 @@ func TestRefuseSpec(t *testing.T) {
 	}
 	if got := refuseSpec(federated(testCluster())); got != "" {
 		t.Fatalf("a good federation is refused: %s", got)
+	}
+	capped := testCluster()
+	capped.Spec.Gateways.MaxReplicas = 3
+	if got := refuseSpec(capped); got != "" {
+		t.Fatalf("maxReplicas equal to the gateways kept is refused: %s", got)
 	}
 	c := testCluster()
 	c.Spec.Security.ExternalCA = &v1.ExternalCASpec{}
@@ -467,5 +474,132 @@ func TestClusterCopiesFederationKey(t *testing.T) {
 	}
 	if len(dst.Data) != 1 || string(dst.Data[FederationKeyKey]) != "a-key" {
 		t.Fatalf("copy = %v", dst.Data)
+	}
+}
+
+// Lowering minReplicas retires the surplus gateways (review R7), keeping
+// one in every zone and taking the ones not serving first; a retired
+// gateway is not counted, so it is not replaced.
+func TestGatewayScaleDown(t *testing.T) {
+	c := bootstrapped(testCluster())
+	c.Spec.Gateways.MinReplicas, c.Spec.Gateways.MaxReplicas = 3, 3
+	var objs []client.Object
+	var nodes []v1.AerolNode
+	states := []string{v1.StateServing, v1.StateServing, v1.StateServing, v1.StateServing, v1.StateJoining, v1.StateServing}
+	for i := 0; i < 6; i++ {
+		// z-a holds three, z-b two, z-c one.
+		zone := []string{"z-a", "z-a", "z-a", "z-b", "z-b", "z-c"}[i]
+		n := node(fmt.Sprintf("prod-gateway-%d", i), v1.RoleGateway, "", zone)
+		n.Labels = map[string]string{LabelCluster: "prod"}
+		n.Status.State = states[i]
+		nodes = append(nodes, *n)
+		objs = append(objs, n)
+	}
+	r, _, cl := clusterRig(t, c, objs...)
+	for range 2 {
+		if err := r.ensureGateways(context.Background(), c, nodes); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		if nodes, err = listNodes(context.Background(), cl, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kept := map[string]int{}
+	var retired []string
+	for _, n := range nodesByRole(t, cl)[v1.RoleGateway] {
+		if n.Annotations[v1.AnnotationDecommission] == "true" {
+			retired = append(retired, n.Name)
+			continue
+		}
+		kept[n.Spec.Zone]++
+	}
+	sort.Strings(retired)
+	// The joining one in z-b, then two of z-a's three.
+	if strings.Join(retired, ",") != "prod-gateway-1,prod-gateway-2,prod-gateway-4" {
+		t.Fatalf("retired %v", retired)
+	}
+	if kept["z-a"] != 1 || kept["z-b"] != 1 || kept["z-c"] != 1 {
+		t.Fatalf("kept per zone %v", kept)
+	}
+}
+
+// surplusGateway's order: out of the spec's zones, then not serving, then
+// the fullest zone, then the last name.
+func TestSurplusGateway(t *testing.T) {
+	gw := func(name, zone, state string) v1.AerolNode {
+		n := node(name, v1.RoleGateway, "", zone)
+		n.Status.State = state
+		return *n
+	}
+	zones := []string{"z-a", "z-b"}
+	for _, tc := range []struct {
+		live []v1.AerolNode
+		want string
+	}{
+		{[]v1.AerolNode{gw("g1", "z-a", v1.StateServing), gw("g2", "z-old", v1.StateServing), gw("g3", "z-a", v1.StateJoining)}, "g2"},
+		{[]v1.AerolNode{gw("g1", "z-a", v1.StateServing), gw("g3", "z-b", v1.StateJoining), gw("g2", "z-a", v1.StateServing)}, "g3"},
+		{[]v1.AerolNode{gw("g1", "z-b", v1.StateServing), gw("g2", "z-a", v1.StateServing), gw("g3", "z-a", v1.StateServing)}, "g3"},
+		{[]v1.AerolNode{gw("g9", "z-a", v1.StateServing), gw("g2", "z-b", v1.StateServing)}, "g9"},
+	} {
+		per := map[string]int{}
+		for _, n := range tc.live {
+			per[n.Spec.Zone]++
+		}
+		if got := tc.live[surplusGateway(zones, per, tc.live)].Name; got != tc.want {
+			t.Errorf("picked %s, want %s", got, tc.want)
+		}
+	}
+}
+
+// keepPoolDecommission keeps a pool's settings from the spec, keeps a
+// removed pool's while a worker of it is left, and drops it after.
+func TestKeepPoolDecommission(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := testCluster()
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(20 * time.Minute)
+	eks := *c.Spec.WorkerPools[0].DeepCopy()
+	eks.Name, eks.Provisioner = "eks", "eks-managed"
+	c.Spec.WorkerPools = append(c.Spec.WorkerPools, eks)
+	w := func(name, pool string) v1.AerolNode { return *node(name, v1.RoleWorker, pool, "z-a") }
+	nodes := []v1.AerolNode{w("prod-general-a1", "general"), w("prod-eks-a1", "eks"), *node("prod-gateway-a1", v1.RoleGateway, "", "z-a")}
+
+	keepPoolDecommission(c, nodes)
+	names := func() string {
+		var out []string
+		for _, k := range c.Status.PoolDecommission {
+			out = append(out, k.Name+"/"+k.Provisioner)
+		}
+		return strings.Join(out, " ")
+	}
+	if got := names(); got != "eks/eks-managed general/" {
+		t.Fatalf("with both pools in the spec: %q", got)
+	}
+	if d := c.Status.PoolDecommission[1].Decommission.Deadline; d == nil || d.Duration != 20*time.Minute {
+		t.Fatalf("general's deadline = %v, want 20m", d)
+	}
+
+	// Removed from the spec, a worker of it left: kept. The spec's own
+	// pool follows an edit.
+	c.Spec.WorkerPools = c.Spec.WorkerPools[:1]
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(30 * time.Minute)
+	keepPoolDecommission(c, nodes)
+	if got := names(); got != "eks/eks-managed general/" {
+		t.Fatalf("after removing eks: %q", got)
+	}
+	if d := c.Status.PoolDecommission[1].Decommission.Deadline; d == nil || d.Duration != 30*time.Minute {
+		t.Fatalf("general's deadline after an edit = %v, want 30m", d)
+	}
+
+	// Its last worker gone: dropped.
+	keepPoolDecommission(c, nodes[:1])
+	if got := names(); got != "general/" {
+		t.Fatalf("after the last eks worker left: %q", got)
+	}
+	// No pools at all: nothing kept.
+	c.Spec.WorkerPools = nil
+	keepPoolDecommission(c, nil)
+	if c.Status.PoolDecommission != nil {
+		t.Fatalf("no pools: %+v", c.Status.PoolDecommission)
 	}
 }

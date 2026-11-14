@@ -5,11 +5,11 @@
 # The operator (plans/kubernetes-v2-architecture.md §7.4): the only AerolVM
 # part that writes to the Kubernetes API while the cluster runs. Two
 # replicas, one leader. Its rights (§15.1): its own namespace and the worker
-# namespace (pods, the join-token Secrets, Services, volume claims), Nodes
-# and Karpenter NodeClaims (read; a NodeClaim deleted to return an emptied
-# machine), the API server's Service and EndpointSlice in default and the
-# ServiceCIDRs (read, C24), and its own objects. No other pod of AerolVM
-# has any.
+# namespace (pods, Services, volume claims), Nodes and Karpenter NodeClaims
+# (read; a NodeClaim deleted to return an emptied machine), the API
+# server's Service and EndpointSlice in default and the ServiceCIDRs (read,
+# C24), TokenReview (a joining pod's identity, §15.2), and its own objects.
+# No other pod of AerolVM has any.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -35,6 +35,10 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [servicecidrs]
     verbs: [list]
+  # Which pod, on which machine, asks for a join token (§15.2, R2, D6).
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -165,6 +169,8 @@ spec:
             - --worker-namespace={{ $workerNS }}
             - --pod-templates={{ $name }}-pod-templates
             - --service-account={{ $op }}
+            # Where a new pod's setup asks for its join token (§15.2).
+            - --join-url=https://{{ $op }}.{{ .Release.Namespace }}.svc/v1/join-token
           ports:
             - { name: webhook, containerPort: 9443 }
             - { name: metrics, containerPort: 8080 }
@@ -182,14 +188,16 @@ spec:
           volumeMounts:
             - { name: webhook-cert, mountPath: /etc/aerolvm-operator/webhook, readOnly: true }
       volumes:
-        # By key: the webhook needs its certificate and key, never the CA's
-        # copy or anything else a Secret might gain.
+        # By key: the webhook needs its certificate and key, and the CA's
+        # certificate (public) that joining pods trust it by; never
+        # anything else a Secret might gain.
         - name: webhook-cert
           secret:
             secretName: {{ $op }}-webhook
             items:
               - { key: tls.crt, path: tls.crt }
               - { key: tls.key, path: tls.key }
+              - { key: ca.crt, path: ca.crt }
 ---
 apiVersion: v1
 kind: Service
@@ -207,8 +215,11 @@ spec:
     - { name: webhook, port: 443, targetPort: webhook }
     - { name: metrics, port: 8080, targetPort: metrics }
 ---
-# The webhook's own certificate, from a self-signed issuer: only the API
-# server calls it, and cert-manager hands the API server the CA.
+# The webhook's own certificate. Two callers trust it: the API server (the
+# delete guard; cert-manager hands it the CA) and a joining pod's setup
+# (§15.2; the operator puts the CA in the pod spec). So it comes from a CA
+# of the operator's own that lives ten years, not a self-signed certificate
+# a renewal would replace under a pod made just before.
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -221,6 +232,29 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
+  name: {{ $op }}-ca
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ $op }}-ca
+  secretName: {{ $op }}-ca
+  duration: 87600h
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { name: {{ $op }}-selfsigned, kind: Issuer }
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $op }}-ca
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  ca: { secretName: {{ $op }}-ca }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
   name: {{ $op }}-webhook
   labels:
     {{- include "aerolvm.labels" . | nindent 4 }}
@@ -229,11 +263,11 @@ spec:
   dnsNames:
     - {{ $op }}.{{ .Release.Namespace }}.svc
     - {{ $op }}.{{ .Release.Namespace }}.svc.cluster.local
-  issuerRef: { name: {{ $op }}-selfsigned, kind: Issuer }
+  issuerRef: { name: {{ $op }}-ca, kind: Issuer }
 ---
 # The worker-pod delete guard (C26, eng review D5). failurePolicy Ignore: an
 # operator outage never blocks a cluster repair; a worker pod lost without
-# a decommission raises an alert instead.
+# a decommission raises an alert instead. It also decides evictions, below.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
@@ -267,4 +301,57 @@ webhooks:
       matchLabels:
         app.kubernetes.io/name: aerolvm
         app.kubernetes.io/component: worker
+  # An eviction (kubectl drain, a node group update, Karpenter) is a CREATE
+  # on pods/eviction, which the delete rule above never sees: the API server
+  # deletes the evicted pod itself. Its object is an Eviction, without the
+  # pod's labels, so this rule has no objectSelector and the guard reads the
+  # pod. The PodDisruptionBudget below refuses these evictions first; this
+  # holds if someone removes it. A refusal is a 429, as the budget's is.
+  - name: worker-pod-eviction.aerolvm.io
+    admissionReviewVersions: [v1]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      service:
+        name: {{ $op }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate-worker-pod-delete
+        port: 443
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods/eviction]
+        scope: Namespaced
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $workerNS }}
+---
+# Worker pods refuse every voluntary eviction (plans/kubernetes-v2-architecture.md
+# §10.6). kubectl drain, an EKS managed node group update, Karpenter and the
+# AKS upgrade wait here while the operator, seeing the cordon, moves the
+# worker's sandboxes off; it then deletes the pod itself, which a budget does
+# not block. A managed node group waits 15 minutes per machine, then stops
+# its update with PodEvictionFailure: drain a pool before its upgrade when
+# moving its sandboxes takes longer. The ASG's AZRebalance and scale-in
+# ignore budgets: suspend AZRebalance on worker node groups. A not-ready
+# worker is held too (the default
+# unhealthyPodEvictionPolicy): an agent restarting in place still runs its
+# sandboxes. One budget per pod: the eviction API refuses a pod that two
+# budgets select, so add no other budget over worker pods.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}-workers
+  namespace: {{ $workerNS }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aerolvm
+      app.kubernetes.io/component: worker
+      aerolvm.io/cluster: {{ .Values.cluster.name }}
 {{- end }}

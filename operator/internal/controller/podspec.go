@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/base64"
 	"fmt"
 	"math"
 	"slices"
@@ -45,8 +46,29 @@ const (
 	EtcVolume = "etc"
 	// StateVolume holds /var/lib/sandboxd.
 	StateVolume = "state"
-	// JoinVolume holds the pod's join token Secret.
+	// RaftLogVolume holds a server's Raft log when servers.logStorage gave
+	// it a disk of its own.
+	RaftLogVolume = "raft-log"
+	// raftLogMount is where that disk is, outside /var/lib/sandboxd: a
+	// mount inside the state volume would need its parent made by the
+	// container runtime, as root, where sandboxd's user writes.
+	raftLogMount = "/var/lib/aerolvm-raft-log"
+	// raftLogDir is SB_RAFT_WAL_DIR: a folder on the disk, not its mount
+	// point, so recover-quorum --rejoin can move the log aside.
+	raftLogDir = raftLogMount + "/raft-wal"
+	// JoinVolume held the pod's join token Secret, before §15.2's join:
+	// a pod made by an older operator still has it.
 	JoinVolume = "join"
+	// JoinIdentityVolume holds the pod's own ServiceAccount token for
+	// JoinAudience, which its setup shows the operator for a join token.
+	JoinIdentityVolume = "join-identity"
+	joinIdentityMount  = "/var/run/aerolvm-identity"
+	// joinIdentityLife is the shortest life Kubernetes allows a projected
+	// token; the kubelet renews it long before.
+	joinIdentityLife = 600
+	// JoinCAEnv carries the operator's CA, base64, to setup alone: setup
+	// keeps SB_JOIN_ settings out of sandboxd.env.
+	JoinCAEnv = "SB_JOIN_OPERATOR_CA"
 	// CreatePolicyVolume holds the operator's create policy, when the
 	// AerolCluster names one.
 	CreatePolicyVolume = "create-policy"
@@ -167,9 +189,16 @@ type StampInput struct {
 	Pool *v1.WorkerPoolSpec
 	// PVC is a server's volume claim.
 	PVC string
+	// LogPVC is a server's Raft log claim, as its data claim names it
+	// (AnnotationLogClaim); "" for none.
+	LogPVC string
 	// Addresses are the cluster's own, kept from sandboxes (C24): a
 	// worker's only.
 	Addresses clusterAddresses
+	// JoinURL is where setup asks the operator for its join token, and
+	// JoinCA (PEM) the CA it trusts the answer by: a joining pod's only.
+	JoinURL string
+	JoinCA  []byte
 }
 
 // Stamp makes node's pod from its role's template.
@@ -229,6 +258,9 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 			return nil, fmt.Errorf("server %s has no volume claim", n.Name)
 		}
 		usePVC(&pod.Spec, in.PVC)
+		if in.LogPVC != "" {
+			useLogPVC(&pod.Spec, in.LogPVC)
+		}
 	case v1.RoleGateway:
 		mergeSelector(&pod.Spec, c.Spec.Gateways.NodeSelector)
 		pod.Spec.Tolerations = append(pod.Spec.Tolerations, c.Spec.Gateways.Tolerations...)
@@ -258,13 +290,16 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
 		setPoolRuntimes(&pod.Spec, in.Pool.Runtimes)
 		setEgressRanges(&pod.Spec, in.Addresses)
+		useEgressFloorFile(&pod.Spec, c.Name)
 	}
 	if in.Maintenance {
 		holdServer(&pod.Spec)
 		pod.Labels[v1.AnnotationMaintenance] = "true"
 		return pod, nil
 	}
-	addSetup(&pod.Spec, in)
+	if err := addSetup(&pod.Spec, in); err != nil {
+		return nil, err
+	}
 	return pod, nil
 }
 
@@ -323,7 +358,7 @@ if [ -s /etc/sandboxd/cluster.env ]; then
 fi
 `
 
-func addSetup(spec *corev1.PodSpec, in StampInput) {
+func addSetup(spec *corev1.PodSpec, in StampInput) error {
 	agent := spec.Containers[containerIndex(spec.Containers, AgentContainer)]
 	n := in.Node
 	role := sandboxdRole(n.Spec.Role)
@@ -339,22 +374,18 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 		// CA hash (the bank's CA beside it is the trust).
 		cmd = fmt.Sprintf(`exec sandboxd join %s --by-certificate --role %s --node-id %s --advertise "%s" --files-only`, joinServiceURL(in.Cluster), role, n.Name, advertise(in))
 	default:
-		cmd = fmt.Sprintf(`exec sandboxd join "$(cat /var/run/aerolvm-join/join_url)" --token "$(cat /var/run/aerolvm-join/token)" --ca-cert-hash "$(cat /var/run/aerolvm-join/ca_cert_hash)" --role %s --node-id %s --advertise "%s" --files-only`, role, n.Name, advertise(in))
-		// By key, so the pod gets exactly the three things a join needs,
-		// and aerolvm k8s verify can see that (it cannot read Secrets).
-		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinVolume, VolumeSource: corev1.VolumeSource{
-			// Optional for every role. The Secret is deleted once the node
-			// serves (its token is single-use), and a pod that has joined
-			// never reads it again: setup stops at "cluster files already
-			// here". Required, kubelet failed to mount it every minute or
-			// so for the pod's whole life (FailedMount), and a pod it sets
-			// up again, after a machine restart, would wait for it forever.
-			// A server made again keeps its identity on its disk (createPod
-			// makes it without a token); any other pod is made only once
-			// its token's Secret exists.
-			Secret: &corev1.SecretVolumeSource{SecretName: JoinSecret(n.Name), DefaultMode: ptr[int32](0o400),
-				Optional: ptr(true),
-				Items:    []corev1.KeyToPath{{Key: "join_url", Path: "join_url"}, {Key: "token", Path: "token"}, {Key: "ca_cert_hash", Path: "ca_cert_hash"}}},
+		if in.JoinURL == "" || len(in.JoinCA) == 0 {
+			return fmt.Errorf("pod %s joins, but the operator has no join URL and CA to give it", n.Name)
+		}
+		// Setup shows the operator its own token, which Kubernetes made for
+		// this pod on this machine, and gets a single-use join token back
+		// (§15.2). The token's audience is the operator's alone.
+		cmd = fmt.Sprintf(`exec sandboxd join --from-operator %s --operator-ca "$%s" --identity-token %s/token --role %s --node-id %s --advertise "%s" --files-only`,
+			in.JoinURL, JoinCAEnv, joinIdentityMount, role, n.Name, advertise(in))
+		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinIdentityVolume, VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{DefaultMode: ptr[int32](0o440), Sources: []corev1.VolumeProjection{{
+				ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: JoinAudience, ExpirationSeconds: ptr[int64](joinIdentityLife), Path: "token"},
+			}}},
 		}})
 	}
 	setup := corev1.Container{
@@ -369,11 +400,33 @@ func addSetup(spec *corev1.PodSpec, in StampInput) {
 	}
 	if !in.Bootstrap && !ext {
 		setup.VolumeMounts = append(append([]corev1.VolumeMount{}, setup.VolumeMounts...),
-			corev1.VolumeMount{Name: JoinVolume, MountPath: "/var/run/aerolvm-join", ReadOnly: true})
+			corev1.VolumeMount{Name: JoinIdentityVolume, MountPath: joinIdentityMount, ReadOnly: true})
+		setup.Env = append(setup.Env, corev1.EnvVar{Name: JoinCAEnv, Value: base64.StdEncoding.EncodeToString(in.JoinCA)})
 	}
 	// After the template's own: a worker's preflight checks its machine
 	// before setup spends the single-use join token on it.
 	spec.InitContainers = append(spec.InitContainers, setup)
+	return nil
+}
+
+// envValue is name's value in env (the last, as Kubernetes reads it).
+func envValue(env []corev1.EnvVar, name string) string {
+	v := ""
+	for _, e := range env {
+		if e.Name == name {
+			v = e.Value
+		}
+	}
+	return v
+}
+
+func hasVolume(vs []corev1.Volume, name string) bool {
+	for _, v := range vs {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // setupMounts are the agent's folders setup writes: the node's settings and
@@ -625,6 +678,59 @@ func setEnv(spec *corev1.PodSpec, name string, env []corev1.EnvVar) {
 			c.Env = append(c.Env, e)
 		}
 	}
+}
+
+// The deny-floor file (review R4; egress.go): the API server's current
+// addresses, which the cluster controller keeps in a ConfigMap in the worker
+// namespace.
+const (
+	EgressFloorVolume = "egress-floor"
+	egressFloorMount  = "/etc/aerolvm-egress-floor"
+	// EgressFloorKey is the ConfigMap's key: one address per line.
+	EgressFloorKey = "deny-floor"
+	// envFloorFile is egresspolicy.FloorFileEnv.
+	envFloorFile = "SB_EGRESS_DENY_FLOOR_FILE"
+)
+
+// EgressFloorConfigMap is cluster's deny-floor ConfigMap.
+func EgressFloorConfigMap(cluster string) string { return cluster + "-egress-floor" }
+
+// useEgressFloorFile mounts the deny-floor ConfigMap into the containers
+// that guard sandbox traffic (sandboxd and the egress gateway) and points
+// them at the file. The whole volume, never a subPath: the kubelet updates
+// only a volume mounted whole. Not optional: a worker pod waits for the
+// ConfigMap rather than start without the floor.
+func useEgressFloorFile(spec *corev1.PodSpec, cluster string) {
+	if !usesEgressRanges(spec) {
+		return
+	}
+	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: EgressFloorVolume, VolumeSource: corev1.VolumeSource{
+		ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: EgressFloorConfigMap(cluster)}},
+	}})
+	for i := range spec.Containers {
+		c := &spec.Containers[i]
+		if c.Name != AgentContainer && c.Name != "egress" {
+			continue
+		}
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: EgressFloorVolume, MountPath: egressFloorMount, ReadOnly: true})
+		setEnv(spec, c.Name, []corev1.EnvVar{{Name: envFloorFile, Value: egressFloorMount + "/" + EgressFloorKey}})
+	}
+}
+
+// useLogPVC mounts the server's Raft log claim into sandboxd's container,
+// where maintenance runs its tools too (holdServer), and points sandboxd at
+// it. The setup container does not need it: init and join write no log.
+func useLogPVC(spec *corev1.PodSpec, claim string) {
+	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: RaftLogVolume, VolumeSource: corev1.VolumeSource{
+		PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+	}})
+	i := containerIndex(spec.Containers, AgentContainer)
+	if i < 0 {
+		return
+	}
+	c := &spec.Containers[i]
+	c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: RaftLogVolume, MountPath: raftLogMount})
+	setEnv(spec, AgentContainer, []corev1.EnvVar{{Name: "SB_RAFT_WAL_DIR", Value: raftLogDir}})
 }
 
 // usePVC puts the server's claim behind its etc and state volumes, so its

@@ -40,7 +40,7 @@ nothing else.
 
 | Pod | Runs as | Rights | Kubernetes API |
 |---|---|---|---|
-| Server | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | None: no service account token is mounted |
+| Server | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | None: no service account token for the API is mounted. Its `setup` container alone gets a 10-minute token for the operator's audience, which the API refuses (section 3) |
 | Gateway | user 65532, not root | Same as a server. With the edge on, its Caddy container is also user 65532 with no capabilities; ports 80 and 443 open through the namespaced `ip_unprivileged_port_start` sysctl, which `restricted` allows | None |
 | Operator | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | See below |
 
@@ -49,14 +49,15 @@ The operator's Kubernetes rights, all named in the chart's
 
 - **In its own namespace and the worker namespace only:** pods, Secrets,
   Services, ConfigMaps and volume claims (to make and replace AerolVM's pods,
-  hand each pod its join token, and keep each server's disk); Events; leader
-  election leases; its own `AerolCluster` and `AerolNode` objects.
+  mark which pod got a join token, and keep each server's disk); Events;
+  leader election leases; its own `AerolCluster` and `AerolNode` objects.
 - **Across the cluster:** read Nodes; list ServiceCIDRs; read Karpenter
-  NodeClaims, and delete one to give back a machine it has emptied.
+  NodeClaims, and delete one to give back a machine it has emptied; create
+  TokenReviews, to check which pod, on which machine, asks for a join token.
 - **In `default`:** read the `kubernetes` Service and its EndpointSlice, by
   name, to keep sandboxes away from the API server.
-- **Not:** `pods/exec`, any other namespace, cluster roles, TokenReview, or
-  anything in cert-manager.
+- **Not:** `pods/exec`, any other namespace, cluster roles, or anything in
+  cert-manager.
 
 The operator can make pods in the worker namespace, where privileged pods are
 allowed. That is its job, and it is why its rights stop at those two
@@ -67,7 +68,7 @@ namespaces.
 | Container | Runs as | Rights | Why |
 |---|---|---|---|
 | `preflight` (runs first) | user 65532 | None; read-only root disk | Checks the machine: cgroup v2, kernel 5.10 or later, `br_netfilter` |
-| `setup` (runs second) | root | None: not privileged, all capabilities dropped, read-only root disk; mounts only the node's settings and state folders | Writes the node's cluster files with its one-time join token |
+| `setup` (runs second) | root | None: not privileged, all capabilities dropped, read-only root disk; mounts only the node's settings and state folders, and its token for the operator | Gets the node's one-time join token from the operator and writes the node's cluster files with it |
 | `runtime` | root | **privileged** | Runs AerolVM's own containerd and gVisor, which build sandboxes |
 | `agent` | root | **privileged** | Runs `sandboxd`, which makes each sandbox's network and cgroup |
 | `egress` | starts as root, drops to user 65532 | `NET_ADMIN` and `NET_BIND_SERVICE` only (it gets `SETUID`, `SETGID` and `SETPCAP` just to hand itself over); read-only root disk | The hostname-filtering egress gateway for sandboxes |
@@ -75,7 +76,8 @@ namespaces.
 
 What the worker pod does **not** have: host network, host PID, host IPC, any
 folder from the machine (`hostPath`), the machine's containerd socket, a
-service account token, or any Kubernetes API right. It copies nothing onto
+service account token the Kubernetes API accepts, or any Kubernetes API
+right. It copies nothing onto
 the machine. A bad firewall rule breaks that worker's sandboxes, not the
 machine's networking.
 
@@ -114,10 +116,17 @@ envelope.
 
 ## 3. Identity
 
-- **A new pod proves who it is with a one-time join token.** The operator asks
-  the servers for a token for that one pod, stores it in a Secret that only
-  that pod mounts (read-only, mode 0400), and deletes the Secret once the pod
-  has joined. The token is spent on first use.
+- **A new pod proves who it is before it gets a join token.** Kubernetes
+  gives the pod's `setup` container a token that names the pod and its
+  machine, for the operator's audience alone (the Kubernetes API refuses
+  it), good for 10 minutes. The pod shows it to the operator, which checks
+  it with TokenReview: the pod exists with that UID, belongs to an AerolVM
+  node, runs on the machine the token names, and has not joined. Only then
+  does the operator ask the servers for a join token for it. That token
+  works once, lasts 10 minutes, and is never stored in a Secret. The
+  operator marks the pod, so it gets one token, or a fresh one only after
+  the first ran out unused. A refused pod's AerolNode says why
+  (`IdentityDenied`).
 - **Nodes talk to each other with mutual TLS.** Each node has its own
   certificate, signed by the cluster's certificate authority, which renews
   itself. The CA key lives on the servers.
@@ -206,9 +215,9 @@ with network policy turned on, or Calico or Cilium).
 | Something escapes to the privileged worker container | Worker machines run nothing else (taint); no host folders, network or PID; no Kubernetes API right; the machine's cloud identity is unreachable (IMDS hop limit 1) |
 | A sandbox reaches your network or the cluster | AerolVM's firewall refuses private ranges, the cluster's ranges, the API server and the worker's own ports; the egress NetworkPolicy refuses the same around the whole pod; `aerolvm k8s verify` probes it from a real sandbox |
 | Another pod in the cluster reaches a worker | The worker ingress NetworkPolicy; mTLS on every node port |
-| A rogue pod joins the cluster | One-time join tokens, mounted only into the pod they are for and deleted after use; mTLS certificates per node |
+| A rogue pod joins the cluster | A join token only for a pod that TokenReview proves is that AerolVM node, on its machine; single use, 10 minutes, never stored in a Secret; mTLS certificates per node |
 | A tampered or unsigned image | Signed images with SBOMs and provenance; the example admission policy refuses any AerolVM pod whose image the release workflow did not sign |
-| Someone deletes a worker pod by mistake | The operator's delete guard refuses it unless the pod is marked `aerolvm.io/force-delete=true`; the guard fails open, so a down operator never blocks repairs |
+| Someone deletes or drains a worker pod by mistake | The operator's delete guard refuses it, also mid-move, unless every sandbox has moved or the pod is marked `aerolvm.io/force-delete=true`; the guard fails open, so a down operator never blocks repairs. A PodDisruptionBudget holds drains and node group updates until the operator has moved the sandboxes |
 | The Kubernetes API is down | Sandboxes keep running and the API keeps answering: AerolVM's control plane is its own. Only changes to the layout wait |
 | Too many sandboxes for a machine | Every sandbox is capped inside the worker pod's own CPU and memory limit; one out-of-memory event ends one sandbox, never the worker |
 

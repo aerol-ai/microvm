@@ -5,10 +5,12 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
@@ -183,4 +185,43 @@ func firstLocalIPv4() (netip.Addr, bool) {
 		}
 	}
 	return netip.Addr{}, false
+}
+
+// TestWorkerFloorFile (review R4): a worker gets the deny-floor file's
+// path, refuses what it holds, and follows a change while it runs.
+func TestWorkerFloorFile(t *testing.T) {
+	prevFloor, prevPrivate, prevFile := egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges(), egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetRanges(prevFloor, prevPrivate); egresspolicy.SetFileFloor(prevFile) })
+	prevPoll := operatorPoll
+	operatorPoll = 5 * time.Millisecond
+	t.Cleanup(func() { operatorPoll = prevPoll })
+	path := filepath.Join(t.TempDir(), "deny-floor")
+	if err := os.WriteFile(path, []byte("172.18.0.2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(egresspolicy.DenyFloorEnv, "")
+	t.Setenv(egresspolicy.PrivateRangesEnv, "")
+	t.Setenv(egresspolicy.FloorFileEnv, path)
+	if !slices.Contains(workerEnvironment(), egresspolicy.FloorFileEnv+"="+path) {
+		t.Fatal("the worker environment must carry the floor file")
+	}
+	if err := loadWorkerGuards(); err != nil {
+		t.Fatal(err)
+	}
+	if err := openCheck(egresspolicy.DialGuard{}, "", netip.MustParseAddrPort("172.18.0.2:443")); err == nil {
+		t.Fatal("an address in the floor file was dialed")
+	}
+	if err := os.WriteFile(path+".new", []byte("172.18.0.44\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for openCheck(egresspolicy.DialGuard{}, "", netip.MustParseAddrPort("172.18.0.44:443")) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the worker still dials the API server's new address")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

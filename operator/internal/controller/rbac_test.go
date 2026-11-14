@@ -13,7 +13,7 @@ import (
 // clusterScoped are the resources the operator reads that live outside any
 // namespace: the chart must grant them in its ClusterRole. A new one in a
 // +kubebuilder:rbac marker goes here too.
-var clusterScoped = []string{"nodes", "nodeclaims", "servicecidrs"}
+var clusterScoped = []string{"nodes", "nodeclaims", "servicecidrs", "tokenreviews"}
 
 // The chart grants the operator every right its +kubebuilder:rbac markers
 // ask for (config/rbac/role.yaml, generated): cluster-scoped ones in its

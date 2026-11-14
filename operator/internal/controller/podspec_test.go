@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -49,7 +51,7 @@ func TestParsePodTemplate(t *testing.T) {
 func TestStampServer(t *testing.T) {
 	c := testCluster()
 	n := node("prod-server-0", v1.RoleServer, "", "z-a")
-	pod, err := Stamp(mustTemplate(t, TemplateServer), StampInput{Cluster: c, Node: n, Namespace: testNS, Version: "v0.7.2", Bootstrap: true, PVC: "data-prod-server-0"})
+	pod, err := Stamp(mustTemplate(t, TemplateServer), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: n, Namespace: testNS, Version: "v0.7.2", Bootstrap: true, PVC: "data-prod-server-0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,27 +101,26 @@ func TestStampServer(t *testing.T) {
 		t.Fatalf("zone pin = %+v", terms)
 	}
 
-	// A server that joins: the token's Secret, read-only.
-	joiner, err := Stamp(mustTemplate(t, TemplateServer), StampInput{Cluster: c, Node: node("prod-server-1", v1.RoleServer, "", "z-b"), Namespace: testNS, Version: "v0.7.2", PVC: "data-prod-server-1"})
+	// A server that joins: it asks the operator for its token (§15.2), with
+	// its own ServiceAccount token for the operator's audience; no Secret.
+	joiner, err := Stamp(mustTemplate(t, TemplateServer), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-server-1", v1.RoleServer, "", "z-b"), Namespace: testNS, Version: "v0.7.2", PVC: "data-prod-server-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(joiner.Spec.InitContainers[0].Command[2], "sandboxd join") || joiner.Spec.Volumes[len(joiner.Spec.Volumes)-1].Secret.SecretName != "prod-server-1-join" {
-		t.Fatalf("joiner setup = %v", joiner.Spec.InitContainers[0].Command)
-	}
-	// By key, the three a join needs (aerolvm k8s verify checks Secret
-	// volumes name their keys).
-	if items := joiner.Spec.Volumes[len(joiner.Spec.Volumes)-1].Secret.Items; len(items) != 3 || items[0].Key != "join_url" || items[1].Key != "token" || items[2].Key != "ca_cert_hash" {
-		t.Fatalf("join volume items = %+v", items)
+	checkJoinsFromOperator(t, joiner, "server")
+
+	// No URL or CA from the operator: no pod that could never join.
+	if _, err := Stamp(mustTemplate(t, TemplateServer), StampInput{Cluster: c, Node: node("prod-server-1", v1.RoleServer, "", "z-b"), Namespace: testNS, Version: "v0.7.2", PVC: "data-prod-server-1"}); err == nil {
+		t.Fatal("a joining server stamped without the operator's join URL and CA")
 	}
 
 	// Maintenance: the volume, a holding process, no setup (C22).
-	held, err := Stamp(mustTemplate(t, TemplateServer), StampInput{Cluster: c, Node: n, Namespace: testNS, Version: "v0.7.2", Maintenance: true, PVC: "data-prod-server-0"})
+	held, err := Stamp(mustTemplate(t, TemplateServer), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: n, Namespace: testNS, Version: "v0.7.2", Maintenance: true, PVC: "data-prod-server-0"})
 	if err != nil || len(held.Spec.InitContainers) != 0 || !strings.Contains(strings.Join(held.Spec.Containers[0].Command, " "), "sleep") || held.Labels[v1.AnnotationMaintenance] != "true" {
 		t.Fatalf("maintenance pod = %+v %v", held.Spec, err)
 	}
 
-	if _, err := Stamp(mustTemplate(t, TemplateServer), StampInput{Cluster: c, Node: n, Namespace: testNS}); err == nil {
+	if _, err := Stamp(mustTemplate(t, TemplateServer), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: n, Namespace: testNS}); err == nil {
 		t.Fatal("server without a claim accepted")
 	}
 }
@@ -127,7 +128,7 @@ func TestStampServer(t *testing.T) {
 func TestStampWorkerAndGateway(t *testing.T) {
 	c := testCluster()
 	pool := &c.Spec.WorkerPools[0]
-	pod, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{Cluster: c, Node: node("prod-general-abcde", v1.RoleWorker, "general", "z-c"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: pool})
+	pod, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-general-abcde", v1.RoleWorker, "general", "z-c"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: pool})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,34 +162,22 @@ func TestStampWorkerAndGateway(t *testing.T) {
 	if !strings.Contains(pod.Spec.InitContainers[0].Command[2], `--advertise "$(POD_IP)"`) {
 		t.Fatalf("worker advertise: %v", pod.Spec.InitContainers[0].Command)
 	}
-	if _, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS}); err == nil {
+	if _, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS}); err == nil {
 		t.Fatal("worker without a pool accepted")
 	}
 	tiny := *pool
 	tiny.Machine = v1.MachineSpec{CPU: 2, MemoryGiB: 2}
-	if _, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Pool: &tiny}); err == nil {
+	if _, err := Stamp(mustTemplate(t, TemplateWorker), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Pool: &tiny}); err == nil {
 		t.Fatal("a machine too small for the pod accepted")
 	}
 
-	gw, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-b"), Namespace: testNS, Version: "v0.7.2"})
+	gw, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-b"), Namespace: testNS, Version: "v0.7.2"})
 	if err != nil || env(gw.Spec.Containers[0], "SB_NODE_ROLE") != "ingress" {
 		t.Fatalf("gateway = %v %v", gw, err)
 	}
-	// The join Secret is deleted once the node serves: a required volume
-	// made kubelet report FailedMount for the pod's life, and a pod set up
-	// again (a machine restart) could not start. Every role's is optional.
-	for _, p := range []*corev1.Pod{pod, gw} {
-		var join *corev1.SecretVolumeSource
-		for _, v := range p.Spec.Volumes {
-			if v.Name == JoinVolume {
-				join = v.Secret
-			}
-		}
-		if join == nil || join.Optional == nil || !*join.Optional {
-			t.Fatalf("%s join volume = %+v, want optional", p.Name, join)
-		}
-	}
-	if _, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{Cluster: c, Node: node("x", "nope", "", "z-a"), Namespace: testNS}); err == nil {
+	checkJoinsFromOperator(t, pod, "worker")
+	checkJoinsFromOperator(t, gw, "ingress")
+	if _, err := Stamp(mustTemplate(t, TemplateGateway), StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("x", "nope", "", "z-a"), Namespace: testNS}); err == nil {
 		t.Fatal("unknown role accepted")
 	}
 }
@@ -265,7 +254,7 @@ func TestStampWorkerPoolRuntimes(t *testing.T) {
 			}
 			pool := c.Spec.WorkerPools[0]
 			pool.Runtimes = tc.runtimes
-			pod, err := Stamp(tpl, StampInput{Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &pool})
+			pod, err := Stamp(tpl, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &pool})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -296,9 +285,9 @@ func TestStampCreatePolicy(t *testing.T) {
 	c := testCluster()
 	c.Spec.Security.CreatePolicy = &corev1.LocalObjectReference{Name: "prod-create-policy"}
 	inputs := map[string]StampInput{
-		TemplateServer:  {Cluster: c, Node: node("prod-server-0", v1.RoleServer, "", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"},
-		TemplateGateway: {Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2"},
-		TemplateWorker:  {Cluster: c, Node: node("prod-general-x", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]},
+		TemplateServer:  {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-server-0", v1.RoleServer, "", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"},
+		TemplateGateway: {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2"},
+		TemplateWorker:  {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-general-x", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]},
 	}
 	for role, in := range inputs {
 		pod, err := Stamp(mustTemplate(t, role), in)
@@ -360,9 +349,9 @@ func TestSetupMountsAndSecurity(t *testing.T) {
 func TestStampFederation(t *testing.T) {
 	c := federated(testCluster())
 	inputs := map[string]StampInput{
-		TemplateServer:  {Cluster: c, Node: node("prod-server-0", v1.RoleServer, "", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"},
-		TemplateGateway: {Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2"},
-		TemplateWorker:  {Cluster: c, Node: node("prod-general-x", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]},
+		TemplateServer:  {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-server-0", v1.RoleServer, "", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"},
+		TemplateGateway: {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-gateway-x", v1.RoleGateway, "", "z-a"), Namespace: testNS, Version: "v0.7.2"},
+		TemplateWorker:  {JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-general-x", v1.RoleWorker, "general", "z-a"), Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]},
 	}
 	for role, in := range inputs {
 		pod, err := Stamp(mustTemplate(t, role), in)
@@ -401,5 +390,42 @@ func TestStampFederation(t *testing.T) {
 	}
 	if env(pod.Spec.Containers[0], "SB_CELL_ID_KEY") != "<unset>" || env(pod.Spec.Containers[0], "SB_CELL_ENDPOINTS") != "<unset>" {
 		t.Fatal("federation settings with no federation")
+	}
+}
+
+// checkJoinsFromOperator checks a joining pod's setup asks the operator for
+// its token (§15.2): its own ServiceAccount token for the operator's
+// audience, short-lived and mounted in setup alone; the operator's CA in
+// setup's environment alone; no join Secret.
+func checkJoinsFromOperator(t *testing.T, p *corev1.Pod, role string) {
+	t.Helper()
+	setup := p.Spec.InitContainers[len(p.Spec.InitContainers)-1]
+	cmd := setup.Command[2]
+	want := fmt.Sprintf(`exec sandboxd join --from-operator %s --operator-ca "$%s" --identity-token /var/run/aerolvm-identity/token --role %s --node-id %s`, testJoinURL, JoinCAEnv, role, p.Name)
+	if !strings.Contains(cmd, want) || !strings.Contains(cmd, "--files-only") || strings.Contains(cmd, "--token ") {
+		t.Fatalf("%s setup = %s", p.Name, cmd)
+	}
+	if volumeNamed(p.Spec.Volumes, JoinVolume) != nil {
+		t.Fatalf("%s: a join Secret volume", p.Name)
+	}
+	v := volumeNamed(p.Spec.Volumes, JoinIdentityVolume)
+	if v == nil || v.Projected == nil || len(v.Projected.Sources) != 1 || v.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("%s identity volume = %+v", p.Name, v)
+	}
+	sat := v.Projected.Sources[0].ServiceAccountToken
+	if sat.Audience != JoinAudience || sat.ExpirationSeconds == nil || *sat.ExpirationSeconds != 600 || sat.Path != "token" {
+		t.Fatalf("%s token projection = %+v", p.Name, sat)
+	}
+	if m := mountNamed(setup.VolumeMounts, JoinIdentityVolume); m == nil || m.MountPath != "/var/run/aerolvm-identity" || !m.ReadOnly {
+		t.Fatalf("%s identity mount = %+v", p.Name, m)
+	}
+	ca, err := base64.StdEncoding.DecodeString(envValue(setup.Env, JoinCAEnv))
+	if err != nil || string(ca) != string(testJoinCA) {
+		t.Fatalf("%s operator CA in setup = %q (%v)", p.Name, envValue(setup.Env, JoinCAEnv), err)
+	}
+	for _, c := range p.Spec.Containers {
+		if mountNamed(c.VolumeMounts, JoinIdentityVolume) != nil || envValue(c.Env, JoinCAEnv) != "" {
+			t.Fatalf("%s/%s holds the join identity; only setup may", p.Name, c.Name)
+		}
 	}
 }

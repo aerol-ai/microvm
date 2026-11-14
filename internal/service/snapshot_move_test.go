@@ -133,7 +133,7 @@ func TestSnapshotMoveBetweenTwoWorkers(t *testing.T) {
 	dst, dstRT, dstC := moveWorker(t, "worker-b", cipher)
 	dstC.srv = srv
 
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b"); got != MoveReleased {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
 	if err := dst.ImportMove(ctx, "sb-vm", "worker-a"); err != nil {
@@ -183,7 +183,7 @@ func TestSnapshotMoveRefusals(t *testing.T) {
 	if err := src.ExportMove(ctx, "sb-vm", "worker-b", &out); !errors.Is(err, ErrMoveNotForThisNode) {
 		t.Fatalf("export of an unreleased sandbox = %v", err)
 	}
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b"); got != MoveReleased {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
 	if err := src.ExportMove(ctx, "sb-vm", "worker-c", &out); !errors.Is(err, ErrMoveNotForThisNode) {
@@ -204,10 +204,10 @@ func TestSnapshotMoveRefusals(t *testing.T) {
 	}
 	// A sandbox that is not Firecracker is not moved by snapshot.
 	_ = src.store.Create(ctx, &models.Sandbox{ID: "sb-ctr", Name: "sb-ctr", Image: "alpine", Runtime: models.RuntimeGvisor, Status: models.SandboxStatusStarted})
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-ctr", "worker-b"); !strings.HasPrefix(got, "error:") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-ctr", "worker-b", ""); !strings.HasPrefix(got, "error:") {
 		t.Fatalf("release of a gVisor sandbox = %q", got)
 	}
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-none", "worker-b"); got != MoveGone {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-none", "worker-b", ""); got != MoveGone {
 		t.Fatalf("release of no sandbox = %q", got)
 	}
 }
@@ -291,7 +291,7 @@ func TestCheckpointMoveBetweenTwoWorkers(t *testing.T) {
 	ctx := context.Background()
 	src, dst, srcRT, dstRT, dstC := gvisorMovePair(t)
 
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b"); got != MoveReleased {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
 	if !srcRT.stopCheckpointed {
@@ -343,7 +343,7 @@ func TestCheckpointMoveFallsBackToItsImage(t *testing.T) {
 	ctx := context.Background()
 	src, dst, _, dstRT, dstC := gvisorMovePair(t)
 	dstRT.restoreErr = errors.New("runsc restore: incompatible CPU features")
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b"); got != MoveReleased {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
 	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
@@ -379,13 +379,13 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 
 	// The kill switch: off, a gVisor sandbox does not move with its memory.
 	src.cfg.GvisorCheckpointMoves = false
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b"); !strings.HasPrefix(got, "error:") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); !strings.HasPrefix(got, "error:") {
 		t.Fatalf("release with the switch off = %q", got)
 	}
 	src.cfg.GvisorCheckpointMoves = true
 	// A stopped one has no memory to save.
 	_ = src.store.Create(ctx, &models.Sandbox{ID: "sb-off", Name: "sb-off", Image: "alpine:3.20", Runtime: models.RuntimeGvisor, Status: models.SandboxStatusStopped})
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-off", "worker-b"); !strings.Contains(got, "no memory") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-off", "worker-b", ""); !strings.Contains(got, "no memory") {
 		t.Fatalf("release of a stopped sandbox = %q", got)
 	}
 	if srcRT.stopCheckpointed {
@@ -393,7 +393,7 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	}
 
 	// A move that does not happen leaves nothing on the target.
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b"); got != MoveReleased {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
 	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {

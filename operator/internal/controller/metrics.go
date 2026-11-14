@@ -31,8 +31,12 @@ var (
 	})
 	joinTokenErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aerolvm_operator_join_token_errors_total",
-		Help: "Join tokens the operator could not mint for a new pod.",
+		Help: "Join token requests refused because Kubernetes did not vouch for the pod or the pod was not who or where it said, and tokens the servers could not make.",
 	})
+	joinRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aerolvm_operator_join_requests_total",
+		Help: "Join token requests from pods, by result: issued, refused (do not ask again) or retry.",
+	}, []string{"result"})
 	maintenanceServers = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "aerolvm_operator_maintenance_servers",
 		Help: "Servers held in maintenance mode (C22).",
@@ -45,9 +49,13 @@ var (
 		Name: "aerolvm_operator_cert_renewal_failures_total",
 		Help: "Times the edge certificate was seen not ready after it had been issued (C25).",
 	})
+	egressFloorReadErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aerolvm_operator_egress_floor_read_errors_total",
+		Help: "Passes that could not read the Kubernetes API server's addresses for the workers' deny floor; the workers keep the last ones (C24).",
+	})
 )
 
 func init() {
 	metrics.Registry.MustRegister(reconcileErrors, nodeStates, workerPodsLost, decommissionSeconds,
-		upgradeStepFailures, joinTokenErrors, maintenanceServers, nodeCertsPending, certRenewalFailures)
+		upgradeStepFailures, joinTokenErrors, joinRequests, maintenanceServers, nodeCertsPending, certRenewalFailures, egressFloorReadErrors)
 }

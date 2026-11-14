@@ -101,6 +101,15 @@ func (s *Service) ApplyEgressFloor(ctx context.Context) {
 	s.applyEgressFloor(ctx, nil)
 }
 
+// RefreshEgressFloor installs the host-firewall deny floor again, with the
+// operator file in force, after the node's extra floor changed: the
+// deny-floor file (SB_EGRESS_DENY_FLOOR_FILE) holds the Kubernetes API
+// server's current addresses, which can change while the node runs (review
+// R4).
+func (s *Service) RefreshEgressFloor(ctx context.Context) {
+	s.applyEgressFloor(ctx, s.egressOperator())
+}
+
 // applyEgressFloor makes op's deny floor (the operator's deny_cidrs and the
 // cloud metadata endpoints; op may be nil) the one this node must have, and
 // installs it now as a node-wide DROP on each container engine's bridge and

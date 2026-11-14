@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
@@ -273,6 +274,28 @@ func TestNodeJoinByCertificateFlag(t *testing.T) {
 	}
 	if code != 1 || !strings.Contains(errOut, "ca.crt") {
 		t.Fatalf("join --by-certificate with no certificate = %d %q", code, errOut)
+	}
+}
+
+// --from-operator (a Kubernetes pod's setup) needs no join URL or --token,
+// and wants the operator's CA, base64. It reaches the join, which asks the
+// operator with the pod's token and, with nobody there, gives up.
+func TestNodeJoinFromOperatorFlags(t *testing.T) {
+	withNodeSeams(t, false)
+	ca := base64.StdEncoding.EncodeToString([]byte("-----BEGIN CERTIFICATE-----\n"))
+	if code, _, errOut := runNode("join", "--from-operator", "https://op/v1/join-token", "--files-only"); code != 2 || !strings.Contains(errOut, "--operator-ca wants") {
+		t.Fatalf("no CA = %d %q", code, errOut)
+	}
+	if code, _, errOut := runNode("join", "--from-operator", "https://op/v1/join-token", "--operator-ca", "!!", "--files-only"); code != 2 || !strings.Contains(errOut, "--operator-ca wants") {
+		t.Fatalf("bad CA = %d %q", code, errOut)
+	}
+	if code, _, errOut := runNode("join", "https://s0:7003", "--from-operator", "https://op/v1/join-token", "--operator-ca", ca); code != 2 || !strings.Contains(errOut, "unexpected argument") {
+		t.Fatalf("a join URL too = %d %q", code, errOut)
+	}
+	code, _, errOut := runNode("join", "--from-operator", "https://op/v1/join-token", "--operator-ca", ca, "--files-only",
+		"--identity-token", filepath.Join(t.TempDir(), "none"))
+	if code != 1 || !strings.Contains(errOut, "ServiceAccount token") && !strings.Contains(errOut, "PEM") {
+		t.Fatalf("join --from-operator with no pod token = %d %q", code, errOut)
 	}
 }
 

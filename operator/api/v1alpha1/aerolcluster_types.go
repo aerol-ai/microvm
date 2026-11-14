@@ -97,6 +97,16 @@ type ServerSpec struct {
 	// Storage is each server's disk. It cannot move between zones, so each
 	// server is pinned to its zone.
 	Storage StorageSpec `json:"storage"`
+	// LogStorage, when set, is a second disk for each server that holds
+	// only its Raft log (sandboxd's SB_RAFT_WAL_DIR). A commit waits for a
+	// log write on the leader and then on a follower, so the log's disk
+	// sets the commit time; on the cell bench, a log on a disk of its own
+	// brought Raft apply p99 under 25 ms at 1,354 creates a second
+	// (plans/kubernetes-v2-architecture.md §9.5). A server keeps the layout
+	// it was made with: setting or clearing this changes only servers made
+	// after it, because a new disk laid over a log would hide it.
+	// +optional
+	LogStorage *StorageSpec `json:"logStorage,omitempty"`
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +optional
@@ -115,9 +125,12 @@ type StorageSpec struct {
 
 // GatewaySpec is the stateless gateway tier.
 type GatewaySpec struct {
-	// MinReplicas is at least one per zone.
+	// MinReplicas is how many gateways the cluster keeps, at least one per
+	// zone. Lowering it retires the surplus.
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas int32 `json:"minReplicas"`
+	// MaxReplicas caps the gateways. The operator refuses a cap below
+	// minReplicas or below one per zone. Zero: no cap.
 	// +optional
 	MaxReplicas int32 `json:"maxReplicas,omitempty"`
 	// Service is the gateways' own load balancer. Ignored with GatewayRef.
@@ -222,7 +235,9 @@ type DecommissionSpec struct {
 	// +optional
 	DrainWindow *metav1.Duration `json:"drainWindow,omitempty"`
 	// Deadline is when what could not move is stopped, counted from the
-	// start. Default 45m.
+	// start. Default 45m. On eks-managed pools the deadline and the drain
+	// window are at most 14m: a managed node group gives up evicting after
+	// 15 minutes.
 	// +optional
 	Deadline *metav1.Duration `json:"deadline,omitempty"`
 }
@@ -292,8 +307,24 @@ type AerolClusterStatus struct {
 	// Rollout is AerolVM's own upgrade record, when one exists.
 	// +optional
 	Rollout *RolloutStatus `json:"rollout,omitempty"`
+	// PoolDecommission is each worker pool's decommission settings as the
+	// operator last saw them in the spec. A pool removed from the spec still
+	// has workers to decommission, and they keep its settings, the
+	// eks-managed cap included. A removed pool's entry goes once no worker
+	// of it is left.
+	// +optional
+	PoolDecommission []PoolDecommission `json:"poolDecommission,omitempty"`
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// PoolDecommission is one worker pool's decommission settings.
+type PoolDecommission struct {
+	Name string `json:"name"`
+	// +optional
+	Provisioner string `json:"provisioner,omitempty"`
+	// +optional
+	Decommission DecommissionSpec `json:"decommission,omitempty"`
 }
 
 // TierStatus counts one tier's nodes.

@@ -786,7 +786,7 @@ move the table to disk with incremental snapshots.
 | Creates per second, sustained | ≥ 1,000 | 1,174 at 64 creates at once (p50 46 ms), 1,202 at 128 (p50 85 ms) |
 | Live sandboxes | ≥ 100,000 (about 72 MB of table per server) | not measured live: the bench deletes as it goes |
 | Workers | ≥ 500 | 500, joined in 20 to 40 s |
-| Raft commit p99 under that load | ≤ 25 ms | **just missed**: 25 to 50 ms at 996 creates/s (98.8% ≤ 25 ms); the 1 s pauses were the servers' disks, and with 16,000 IOPS there are none (F29) |
+| Raft commit p99 under that load | ≤ 25 ms | **met with the Raft log on its own io2 disk**: 99.8% to 99.9% of commits within 25 ms at 1,304 to 1,354 creates/s; whole applies (queue, commit and FSM) 98.9% to 99.2% (F37, `servers.logStorage`). On gp3, shared or not, applies 98.3% at about 1,000 |
 | Owner lookups that reach a server | 0 on a cache hit | not measured: each sandbox is deleted before the cache has it |
 | Failover of 1,000 sandboxes from one dead worker | ≤ 60 s | all within 50 s |
 | Server restart to caught up, at 100,000 sandboxes | ≤ 30 s | not measured |
@@ -1226,9 +1226,20 @@ Each row is a drill in section 19.
   for a worker also checks that the pod really runs on the machine it names
   (D6). Only then does it issue the pod's identity (R2, CEO review RQ12):
   - **By default**, a single-use v0.7.0 join token for that pod
-    (`internal/nodejoin`), stored as a Secret mounted only into that pod and
-    deleted once the pod joins. The pod joins exactly as a VM does, its node
-    certificate renews itself, and the CA key lives on the servers.
+    (`internal/nodejoin`). The pod joins exactly as a VM does, its node
+    certificate renews itself, and the CA key lives on the servers. Built as
+    a pull (S5 fix): the pod's `setup` container has a projected token for
+    the audience `aerolvm.io/join` (10 minutes, setup only) and posts it to
+    the operator's `/v1/join-token` on the webhook server. The operator runs
+    TokenReview, then checks the live pod has the token's UID, is the
+    current pod of an AerolNode, runs on the machine the token names
+    (Kubernetes 1.30+ puts it there), and has not joined. It marks the pod
+    (`aerolvm.io/join-token-issued`, written with the pod's resource version,
+    so two replicas cannot both answer), then mints a 10-minute token. No
+    token is made before a scheduled pod asks, and none is stored in a
+    Secret (S-2). The pod trusts the operator by the CA in its spec (the
+    chart's own CA issuer, ten years). A refused pod's AerolNode shows
+    `IdentityDenied`.
   - **In external-CA mode** (`security.externalCA`), the operator instead
     requests the pod's certificate from the bank's issuer through cert-manager,
     and the CA key never enters the cluster (D11). This is also the
@@ -2278,7 +2289,7 @@ each server used about 6% of one core and 160 MB (E5 above).
     cell did 1,283 creates a second at 64 at once (p99 188 ms) and 1,317 at
     128. The chart's values and docs now say so.
   Raft apply p99 at about 1,000 creates a second is still just over the
-  target: 98.8% of applies took 25 ms or less at 32 at once.
+  target: 98.8% of applies took 25 ms or less at 32 at once. Met in F37.
 - F30 (fixed). An owner lookup the cache misses read the sandbox's
   recovery file from disk (`fullPlacementLocked`, then
   `resolveRecoveryRef`): 8% of the leader's CPU at 1,174 creates a
@@ -2288,6 +2299,34 @@ each server used about 6% of one core and 160 MB (E5 above).
 - F31. The chart's server pods are limited to 2 CPUs, and the leader used
   2 to 3 cores at 900 to 1,200 creates a second. The default suits a small
   cell; `values.yaml` now says to give servers 4 CPUs for a cell at G3.
+- F37 (fixed: the Raft log on its own io2 disk). Raft apply p99 stayed just
+  over 25 ms at about 1,000 creates a second. New timings split an apply
+  into its steps (`aerolvm_raft_apply_wait_latency`, `_fsm_latency`, and
+  hashicorp/raft's own: `aerolvm_raft_leader_store_latency`,
+  `_append_rpc_latency`, `_follower_store_latency`, `_commit_latency`):
+  - The FSM is never the tail: p99 under 5 ms at every step.
+  - A commit is two log writes in a row, because hashicorp/raft writes the
+    leader's log before it sends the entries on: the leader's, then a
+    follower's. On gp3 each took 2 to 5 ms under load, and the commit
+    median was 10 ms.
+  - The disk type sets it, not sharing the disk. Runs `bench-p99-1` to
+    `-6`, 3 servers with 16,000 IOPS root disks, at 32 creates at once:
+
+    | The Raft log on | A leader log write under load | Applies within 25 ms |
+    |---|---|---|
+    | the gp3 root disk | 2 to 5 ms (18% within 2 ms) | 98.4% at 1,001 creates/s |
+    | a gp3 disk of its own (3,000 IOPS) | 2 to 5 ms (9% within 2 ms) | 98.3% at 996 |
+    | an io2 disk of its own (6,000 IOPS) | about 1 ms (97% within 2 ms) | **99.2% at 1,354** |
+    | the same, through `SB_RAFT_WAL_DIR` (`bench-p99-7`) | 95% within 2 ms | 98.9% at 1,304; commits 99.8% |
+
+  The fix keeps the bulk on gp3 and puts only the log on io2: sandboxd's
+  `SB_RAFT_WAL_DIR` (internal/raftlogdir) and the chart's
+  `cluster.servers.logStorage`. A node records where its log is and
+  refuses to start on any other place, so a log is never left behind or
+  hidden; the operator fixes a server's layout when it makes its claims.
+  Runs 3 and 4 measured nothing: the bench linked the log under the
+  directory `SB_DB_PATH` implies, but `init` and `join` write
+  `SB_RAFT_DATA_DIR=/var/lib/sandboxd/raft`.
 - Harness: in one pilot (`bench-pilot-6`) a throughput step hung for two
   hours with the cluster idle, and it did not happen again in five runs.
   Each `aerolvm-bench` now runs under a time limit that makes it print
@@ -3409,7 +3448,7 @@ namespace). Its remedy enforces an approved behavior (C14: processes survive an
 | # | Threat | Likelihood | Impact | Mitigated by the plan? |
 |---|---|---|---|---|
 | S-1 | **CRITICAL GAP.** A sandbox reaches the bank's cluster network: other pods (VPC addresses on EKS), Services, the API server, and its own worker pod's ports. Sandbox traffic leaves with the worker pod's address (§8.4), so the bank's NetworkPolicy cannot tell it apart from AerolVM's own traffic. `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT` is off by default (`internal/config/config.go:2171`). The plan's "second, outer wall" (§8.4, §15.3) holds only for destinations the worker pod itself must never reach. | High (untrusted code, by design) | High (lateral movement inside a bank's cluster) | Yes, by C24 (RQ14) |
-| S-2 | A join token Secret is read before its pod uses it (someone with Secret read in the worker namespace, or an etcd backup) | Low | High (a rogue node joins) | Partly: single use, deleted after join (C23). Pending for eng review: a life of at most 10 minutes, bound to the pod's UID and machine, and RBAC so only the operator touches Secrets in the worker namespace. |
+| S-2 | A join token Secret is read before its pod uses it (someone with Secret read in the worker namespace, or an etcd backup) | Low | High (a rogue node joins) | Yes (S5 fix, §15.2): no join token is stored in a Secret. One is made only for a scheduled pod that proves itself with TokenReview, bound to its UID and machine, single use, 10 minutes. |
 | S-3 | A sandbox that escapes gVisor reads the pod's ServiceAccount token | Low | Medium (the worker SA has no API rights, K4) | Partly. Pending: mount the projected token only into the `agent` container, never `runtime`. |
 | S-4 | Every privileged worker holds a DNS API token so `edge` can get wildcard certificates (DNS-01), the same issue the cluster docs review found on VMs | Medium | Medium (DNS takeover of the zone) | No. Pending for eng review: cert-manager issues the wildcard into a Secret mounted only into `edge`, so workers hold no DNS token. |
 | S-5 | Escape from the privileged `runtime` container to the machine | Low (gVisor) | High | Yes, as far as it can be: §8.7 walls, gVisor default, S7 measures the smallest rights, P7 states it. |

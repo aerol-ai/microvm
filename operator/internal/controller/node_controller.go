@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +19,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -34,9 +38,6 @@ import (
 
 // Timing.
 const (
-	// joinTokenTTL bounds a minted token; the pod uses it within seconds
-	// of its machine starting, and Karpenter can take two minutes.
-	joinTokenTTL = "30m"
 	// statusEvery spaces the counters' writes (G4: a few writes per
 	// machine per minute at most).
 	statusEvery = time.Minute
@@ -66,7 +67,31 @@ type NodeReconciler struct {
 	// namespaces: the API server's Service and addresses in default, and
 	// the ServiceCIDRs (C24). Nil uses the client.
 	Reader client.Reader
+	// JoinURL is the operator's JoinIssuePath, where a new pod's setup
+	// asks for its join token (§15.2), and JoinCA the CA it trusts that
+	// answer by: read at each pod made, so a renewed CA reaches new pods.
+	JoinURL string
+	JoinCA  func() ([]byte, error)
+	// MaxConcurrentReconciles is how many AerolNodes are reconciled at once
+	// (DefaultNodeConcurrency when zero). controller-runtime's default is
+	// one: a cell's 2,000 nodes behind one worker, where one server that
+	// stopped answering held them all (review R3). One node is never
+	// reconciled twice at once.
+	MaxConcurrentReconciles int
+	// EvacuateWait is how long a reconcile waits for a decommission pass it
+	// started before it comes back for the result (defaultEvacuateWait
+	// when zero).
+	EvacuateWait time.Duration
+
+	evacOnce sync.Once
+	evacs    *evacuations
 }
+
+// DefaultNodeConcurrency is the node controller's workers. Each pass makes
+// a few quick admin API calls (each bounded by aerolapi.DefaultCallTimeout)
+// and evacuate passes run in the background, so 16 keep a 2,000-node cell's
+// 30-second passes going with servers slow to answer.
+const DefaultNodeConcurrency = 16
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
@@ -118,7 +143,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &n))
 	}
-	token, err := r.adminToken(ctx, &c)
+	token, err := adminToken(ctx, r.Client, &c)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -133,6 +158,12 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	pod, err := r.pod(ctx, &n)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if n.Spec.Role == v1.RoleGateway && n.Annotations[v1.AnnotationDecommission] == "true" {
+		return r.retireGateway(ctx, &n, pod, api)
+	}
+	if pod != nil && podEnded(pod) {
+		return r.retireEndedPod(ctx, &n, pod)
 	}
 
 	if n.Spec.Role == v1.RoleServer {
@@ -172,7 +203,21 @@ func statusEqual(a, b *v1.AerolNodeStatus) bool {
 	return a.State == b.State && a.Reason == b.Reason && a.PodName == b.PodName && a.NodeName == b.NodeName &&
 		a.Version == b.Version && a.Sandboxes == b.Sandboxes && a.FreeCPU == b.FreeCPU && a.FreeMemory == b.FreeMemory &&
 		a.AgentImage == b.AgentImage && a.AgentImageID == b.AgentImageID && a.LastUpdated.Equal(&b.LastUpdated) &&
-		decomEqual(a.Decommission, b.Decommission) && len(a.Conditions) == len(b.Conditions)
+		decomEqual(a.Decommission, b.Decommission) && conditionsEqual(a.Conditions, b.Conditions)
+}
+
+// conditionsEqual compares what a person reads in a condition: a changed
+// reason or message is written, a refreshed time alone is not.
+func conditionsEqual(a, b []metav1.Condition) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Type != b[i].Type || a[i].Status != b[i].Status || a[i].Reason != b[i].Reason || a[i].Message != b[i].Message {
+			return false
+		}
+	}
+	return true
 }
 
 func decomEqual(a, b *v1.DecommissionStatus) bool {
@@ -180,14 +225,6 @@ func decomEqual(a, b *v1.DecommissionStatus) bool {
 		return a == b
 	}
 	return *a == *b
-}
-
-func (r *NodeReconciler) adminToken(ctx context.Context, c *v1.AerolCluster) (string, error) {
-	var s corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: AdminSecret(c.Name)}, &s); err != nil {
-		return "", err
-	}
-	return string(s.Data["token"]), nil
 }
 
 func (r *NodeReconciler) pod(ctx context.Context, n *v1.AerolNode) (*corev1.Pod, error) {
@@ -221,16 +258,18 @@ func (r *NodeReconciler) setState(n *v1.AerolNode, state, reason string) {
 	n.Status.State, n.Status.Reason = state, reason
 }
 
-// createPod makes the node's pod: its identity first (C23), a join token
-// or, in external-CA mode, its certificate; then the pod from its role's
-// template.
+// createPod makes the node's pod from its role's template. In external-CA
+// mode its certificate comes first (C23). Otherwise its setup asks the
+// operator for a join token once it runs (§15.2): no token is made before
+// the pod is on a machine and proves who it is.
 func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, api AerolAPI) (ctrl.Result, error) {
 	bootstrap := n.Spec.Role == v1.RoleServer && n.Name == ServerName(c.Name, 0) &&
 		!meta.IsStatusConditionTrue(c.Status.Conditions, CondBootstrapped)
 	ns := r.podNamespace(n.Spec.Role)
 	maint := n.Spec.Role == v1.RoleServer && n.Annotations[v1.AnnotationMaintenance] == "true"
+	var joinCA []byte
 	// A maintenance pod runs no setup, so it needs no token: it is how a
-	// cluster that lost quorum is repaired, when no token can be minted.
+	// cluster that lost quorum is repaired, when no token can be made.
 	switch {
 	case externalCA(c) && !maint:
 		// Every pod, server 0 too, starts with its certificate in place:
@@ -248,20 +287,12 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 		// A maintenance pod runs no sandboxd: it mounts the certificate
 		// if it is there and never waits for the issuer.
 	case !bootstrap && !maint:
-		if err := r.ensureJoinSecret(ctx, c, n, ns, api); err != nil {
-			joinTokenErrors.Inc()
-			if n.Spec.Role != v1.RoleServer {
-				r.setState(n, v1.StatePending, "waiting for a join token: "+err.Error())
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-			// Minting needs a leader. A server pod made again (moved, or
-			// its pod lost) keeps its identity on its disk, and its setup
-			// then needs no token: waiting here would keep a cluster that
-			// lost two of three servers from ever getting them back. The
-			// token volume is optional for servers; one that has no
-			// identity waits in setup until observe can mint it a token.
-			log.FromContext(ctx).Info("no join token for a server; making its pod without one", "node", n.Name, "error", err.Error())
+		ca, err := r.joinCA()
+		if err != nil {
+			r.setState(n, v1.StatePending, "waiting for the operator's CA, which a joining pod trusts it by: "+err.Error())
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
+		joinCA = ca
 	}
 	t, err := r.template(ctx, n.Spec.Role)
 	if err != nil {
@@ -276,9 +307,23 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	if v := n.Annotations[AnnotationAgentVersion]; v != "" {
 		version = v
 	}
-	in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: version, Bootstrap: bootstrap, Maintenance: maint}
+	in := StampInput{Cluster: c, Node: n, Namespace: ns, Version: version, Bootstrap: bootstrap, Maintenance: maint,
+		JoinURL: r.JoinURL, JoinCA: joinCA}
 	if n.Spec.Role == v1.RoleServer {
 		in.PVC = PVCName(n.Name)
+		// The data claim says whether this server has a log claim
+		// (AnnotationLogClaim). Read past the cache: a server pod made
+		// before its claim showed would put the log on the data disk, and
+		// every pod after would lay the log claim over it.
+		var data corev1.PersistentVolumeClaim
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: in.PVC}, &data); err != nil {
+			if apierrors.IsNotFound(err) {
+				r.setState(n, v1.StatePending, "waiting for volume claim "+in.PVC)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		in.LogPVC = data.Annotations[AnnotationLogClaim]
 	}
 	if n.Spec.Role == v1.RoleWorker {
 		in.Pool = poolOf(c, n.Spec.Pool)
@@ -292,6 +337,12 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	if err != nil {
 		r.setState(n, v1.StateFailed, err.Error())
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+	if n.Spec.Role == v1.RoleWorker && usesEgressRanges(&pod.Spec) && in.Addresses.FloorErr != nil {
+		// Fail closed (review R4): a worker made now would start without
+		// the API server on its deny floor.
+		r.setState(n, v1.StatePending, "waiting to read the API server's addresses for the deny floor: "+in.Addresses.FloorErr.Error())
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	if ns == n.Namespace {
 		if err := controllerutil.SetControllerReference(n, pod, r.Scheme); err != nil {
@@ -323,55 +374,52 @@ func (r *NodeReconciler) template(ctx context.Context, role string) (corev1.PodT
 	return ParsePodTemplate(cm.Data[role])
 }
 
-// ensureJoinSecret mints the pod's single-use join token and stores it in
-// a Secret only that pod mounts; it is deleted once the node serves. The
-// operator made the pod itself, after the scheduler bound nothing yet, so
-// no other pod can claim the token: the Secret's name is the pod's.
-func (r *NodeReconciler) ensureJoinSecret(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, ns string, api AerolAPI) error {
-	var s corev1.Secret
-	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: JoinSecret(n.Name)}, &s)
-	if err == nil || !apierrors.IsNotFound(err) {
-		return err
+// cannotAskForToken says why a pod's setup can never get its join token,
+// or "": a pod an operator before §15.2 made waits for a join Secret no
+// operator makes now, and a pod stamped with a CA the operator no longer
+// serves under cannot trust its answer.
+func (r *NodeReconciler) cannotAskForToken(pod *corev1.Pod) string {
+	if hasVolume(pod.Spec.Volumes, JoinVolume) {
+		return "its setup waits for a join Secret; made again to ask the operator for its token"
 	}
-	tok, err := api.MintJoinToken(ctx, sandboxdRole(n.Spec.Role), joinTokenTTL, "aerolvm-operator:"+n.Name)
+	i := containerIndex(pod.Spec.InitContainers, SetupContainer)
+	if i < 0 {
+		return ""
+	}
+	stamped := envValue(pod.Spec.InitContainers[i].Env, JoinCAEnv)
+	if stamped == "" {
+		return ""
+	}
+	ca, err := r.joinCA()
+	if err != nil || base64.StdEncoding.EncodeToString(ca) == stamped {
+		return ""
+	}
+	return "its setup trusts a CA the operator no longer serves under; made again with the current one"
+}
+
+func (r *NodeReconciler) joinCA() ([]byte, error) {
+	if r.JoinURL == "" || r.JoinCA == nil {
+		return nil, errors.New("the operator was started without --join-url")
+	}
+	raw, err := r.JoinCA()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// The answering server's join listener; servers advertise their stable
-	// DNS names (C4), so it outlives any pod IP.
-	joinURL := fmt.Sprintf("https://%s:%d", ServerDNS(ServerName(c.Name, 0), c.Name, c.Namespace), JoinPort)
-	if len(tok.JoinURLs) > 0 {
-		joinURL = tok.JoinURLs[0]
-	}
-	s = corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: JoinSecret(n.Name), Namespace: ns, Labels: map[string]string{
-			LabelName: "aerolvm", LabelCluster: c.Name, LabelNode: n.Name, LabelManagedBy: "aerolvm-operator",
-		}},
-		Data: map[string][]byte{
-			"token": []byte(tok.Token), "ca_cert_hash": []byte(tok.CACertHash), "join_url": []byte(joinURL),
-		},
-	}
-	if ns == n.Namespace {
-		if err := controllerutil.SetControllerReference(n, &s, r.Scheme); err != nil {
-			return err
-		}
-	}
-	return r.Create(ctx, &s)
+	return ReadJoinCA(raw)
 }
 
 // observe sets the node's state from its pod and from AerolVM.
 func (r *NodeReconciler) observe(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
 	n.Status.PodName, n.Status.NodeName = pod.Name, pod.Spec.NodeName
-	if n.Spec.Role == v1.RoleServer && setupHasFailed(pod) && !externalCA(c) {
-		// A server made without a token (createPod) whose disk held no
-		// identity: mint one now that a leader may be back. The kubelet
-		// puts it in the pod's optional volume before setup's next try.
-		// In external-CA mode its certificate is its identity, and setup
-		// retries the join with it by itself.
-		if err := r.ensureJoinSecret(ctx, c, n, pod.Namespace, api); err != nil {
-			joinTokenErrors.Inc()
+	if n.Spec.Role == v1.RoleServer && setupHasFailed(pod) {
+		// A server pod is never replaced for a failing setup (it keeps its
+		// disk and its name), so one that cannot ask the operator for its
+		// token is made again here. A gateway or worker is replaced anyway.
+		if why := r.cannotAskForToken(pod); why != "" {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, r.endPod(ctx, n, pod, why)
 		}
 	}
+	identityDenied(n, pod)
 	if why := preflightFailed(pod); why != "" {
 		// The machine is wrong, not the pod: a new pod would only land on
 		// a machine like it. This one stays, holding its machine out of
@@ -656,6 +704,80 @@ func (r *NodeReconciler) lost(ctx context.Context, n *v1.AerolNode, api AerolAPI
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// podEnded reports a pod that will never run again: Failed or Succeeded.
+// A pod the kubelet evicted (disk or memory pressure), or stopped in a
+// machine's graceful shutdown, stays in the API this way until the pod
+// garbage collector reaches it, which by default keeps 12,500 of them.
+// Its agent is never ready again, so observe alone would call it Joining
+// forever while it held its slot.
+func podEnded(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// retireEndedPod deletes a pod that ended for good, so the node goes on as
+// if its pod were gone:
+//
+//   - a server keeps its name and its disk, so its next pod (createPod, on
+//     the next pass) is the same Raft member with the same log, as after a
+//     lost pod or a maintenance swap: membership does not change;
+//   - a decommissioning worker's decommission goes on without a pod;
+//   - any other gateway or worker is lost: the dead-owner failover takes
+//     its sandboxes, it leaves the cluster, and the cluster controller makes
+//     a replacement with a new identity (lost).
+func (r *NodeReconciler) retireEndedPod(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod) (ctrl.Result, error) {
+	why := "its pod ended: " + string(pod.Status.Phase)
+	if pod.Status.Reason != "" {
+		why += " (" + pod.Status.Reason + ")"
+	}
+	switch {
+	case n.Spec.Role == v1.RoleServer:
+		r.setState(n, v1.StateRestarting, why+"; making it again with its volume")
+	case n.Annotations[v1.AnnotationDecommission] == "true":
+	case n.Status.State != v1.StateDead && n.Status.State != v1.StateSuspect:
+		// Counted here, not in lost: Suspect keeps lost from counting it
+		// again.
+		if n.Spec.Role == v1.RoleWorker {
+			workerPodsLost.Inc()
+		}
+		r.setState(n, v1.StateSuspect, why)
+	}
+	if err := r.endPod(ctx, n, pod, why); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// retireGateway removes a gateway the cluster no longer keeps (review R7).
+// A gateway holds no sandboxes, so nothing moves: its pod goes first, which
+// takes it out of the gateways' Service and gives its open connections the
+// pod's termination grace to finish; then, once gossip sees it gone, it
+// leaves the cluster and the AerolNode is removed.
+func (r *NodeReconciler) retireGateway(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
+	if pod != nil {
+		r.setState(n, v1.StateDecommissioning, "scale-down: its pod is going")
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	node, err := api.GetNode(ctx, n.Name)
+	switch {
+	case aerolapi.IsStatus(err, http.StatusNotFound):
+	case err != nil:
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	case node.Alive:
+		r.setState(n, v1.StateDecommissioning, "scale-down: waiting for the cluster to see it gone")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if err := api.DeleteNode(ctx, n.Name, false); err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	r.setState(n, v1.StateRemoved, "scale-down")
+	return ctrl.Result{Requeue: true}, nil
+}
+
 // endPod deletes a pod the operator gave up on; the node is then lost.
 func (r *NodeReconciler) endPod(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod, why string) error {
 	if r.Recorder != nil {
@@ -762,8 +884,16 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1.AerolNode{}).
 		Watches(&corev1.Pod{}, toNode).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.nodeToAerolNodes)).
+		WithOptions(crcontroller.Options{MaxConcurrentReconciles: r.concurrency()}).
 		Named("aerolnode").
 		Complete(r)
+}
+
+func (r *NodeReconciler) concurrency() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return DefaultNodeConcurrency
 }
 
 // nodeToAerolNodes wakes the AerolNodes whose pods run on a Kubernetes Node
