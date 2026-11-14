@@ -187,3 +187,65 @@ func TestOrphanRetryWalksTheBacklogAcrossPasses(t *testing.T) {
 		t.Fatalf("backlog left: %d", c.fsm.orphanedRecoveryLen())
 	}
 }
+
+// A write that lands between the retry's read and its move wins: the fenced
+// move fails and the retry leaves the row to whoever moved it. A move that
+// fails for any other reason ends the pass, and the row stays orphaned for
+// the next one.
+func TestOrphanRetryLosesRacesAndStopsOnErrors(t *testing.T) {
+	c, cleanup := newTestClusterWithRole(t, "srv-recovery-race", config.NodeRoleServer, true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedGossipView(t, c, []Member{recreateCandidate("room", config.NodeRoleWorker, 128)})
+	p := placeFailoverPlacement(t, c, "sb-race", "gone")
+	if err := c.applyCommand(context.Background(), command{Op: opOrphanOwner, NodeID: "gone"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another path gives it an owner first.
+	c.orphanRetryBeforeApply = func(id string) {
+		if err := c.applyCommand(context.Background(), command{Op: opReassign, SandboxID: id, OwnerNodeID: "elsewhere",
+			ExpectedIncarnationID: p.IncarnationID, ExpectedOwnerNodeIDSet: true}); err != nil {
+			t.Errorf("racing move: %v", err)
+		}
+	}
+	if moved := c.retryOrphanedRecoveries(context.Background()); moved != 0 {
+		t.Fatalf("counted %d moves of a row another path moved", moved)
+	}
+	if after, _ := c.fsm.get(p.SandboxID); after.OwnerNodeID != "elsewhere" {
+		t.Fatalf("owner %q, want the racing move's", after.OwnerNodeID)
+	}
+
+	// A move that fails outright (here: its context is gone) ends the pass.
+	q := placeFailoverPlacement(t, c, "sb-fail", "gone-too")
+	if err := c.applyCommand(context.Background(), command{Op: opOrphanOwner, NodeID: "gone-too"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.orphanRetryBeforeApply = func(string) { cancel() }
+	if moved := c.retryOrphanedRecoveries(ctx); moved != 0 {
+		t.Fatalf("moved %d with the context gone", moved)
+	}
+	if after, _ := c.fsm.get(q.SandboxID); !after.IsOrphaned() {
+		t.Fatalf("a failed move changed the row: owner %q", after.OwnerNodeID)
+	}
+}
+
+// A placement state machine built without its indexes (a zero value)
+// reads as an empty backlog.
+func TestOrphanedRecoveryIndexZeroValue(t *testing.T) {
+	var f placementFSM
+	if f.orphanedRecoveryLen() != 0 {
+		t.Fatal("zero-value backlog not empty")
+	}
+	if ids, end := f.orphanedRecoveryPage("", 10); len(ids) != 0 || !end {
+		t.Fatalf("zero-value page %v end %v", ids, end)
+	}
+	f.indexOrphanedRecoveryLocked("sb", Placement{OwnerState: PlacementOwnerStateOrphaned, FailoverRecreate: true})
+	if ids, _ := f.orphanedRecoveryPage("", 0); ids != nil {
+		t.Fatalf("a zero limit returned %v", ids)
+	}
+	if f.orphanedRecoveryLen() != 1 {
+		t.Fatal("an orphan written into a zero-value machine is not indexed")
+	}
+}

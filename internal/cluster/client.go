@@ -102,6 +102,9 @@ type Cluster struct {
 	// orphanRetry is the leader's place in the orphaned-recovery backlog
 	// (orphan_recovery.go).
 	orphanRetry orphanRetryCursor
+	// orphanRetryBeforeApply, when set (tests only), runs just before a
+	// retry's move is applied: the window another write can race it in.
+	orphanRetryBeforeApply func(sandboxID string)
 
 	// reservationGCStop cancels the leader-only sweep that cancels expired
 	// opReserve rows. Followers run no loop because every CancelReservation

@@ -90,6 +90,9 @@ func (c *Cluster) retryOrphanedRecoveries(ctx context.Context) int {
 			// the next pass looks again.
 			continue
 		}
+		if c.orphanRetryBeforeApply != nil {
+			c.orphanRetryBeforeApply(id)
+		}
 		err = c.applyCommand(ctx, command{
 			Op:                     opReassign,
 			SandboxID:              id,
