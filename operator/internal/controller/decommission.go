@@ -111,23 +111,42 @@ func (r *NodeReconciler) nodeClaim(ctx context.Context, node string) *unstructur
 	return nil
 }
 
+// eksManagedDecomCap bounds a whole decommission, drain window and moves
+// together, on an EKS managed node group pool (§10.6). A managed node
+// group update evicts a cordoned machine's pods for 15 minutes, then stops
+// with PodEvictionFailure unless someone forces it. The worker's
+// PodDisruptionBudget (#1270) holds the eviction until the decommission
+// deletes the pod, so the decommission must end inside those 15 minutes,
+// with a minute to spare.
+const eksManagedDecomCap = 14 * time.Minute
+
+func eksManaged(p *v1.WorkerPoolSpec) bool { return p != nil && p.Provisioner == "eks-managed" }
+
 func drainWindow(p *v1.WorkerPoolSpec) time.Duration {
-	if p != nil && p.Decommission.DrainWindow != nil {
-		return p.Decommission.DrainWindow.Duration
-	}
-	if p != nil && p.Provisioner == "eks-managed" {
+	d := defaultDrainWindow
+	switch {
+	case p != nil && p.Decommission.DrainWindow != nil:
+		d = p.Decommission.DrainWindow.Duration
+	case eksManaged(p):
 		// A managed node group evicts after 15 minutes whatever happens;
 		// the moves need the rest (§10.6).
-		return eksManagedDrain
+		d = eksManagedDrain
 	}
-	return defaultDrainWindow
+	if eksManaged(p) {
+		d = min(d, eksManagedDecomCap)
+	}
+	return d
 }
 
 func decomDeadline(p *v1.WorkerPoolSpec) time.Duration {
+	d := defaultDecomDeadline
 	if p != nil && p.Decommission.Deadline != nil {
-		return p.Decommission.Deadline.Duration
+		d = p.Decommission.Deadline.Duration
 	}
-	return defaultDecomDeadline
+	if eksManaged(p) {
+		d = min(d, eksManagedDecomCap)
+	}
+	return d
 }
 
 // decommission carries one worker's decommission one step further.

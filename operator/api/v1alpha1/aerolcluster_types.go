@@ -235,7 +235,9 @@ type DecommissionSpec struct {
 	// +optional
 	DrainWindow *metav1.Duration `json:"drainWindow,omitempty"`
 	// Deadline is when what could not move is stopped, counted from the
-	// start. Default 45m.
+	// start. Default 45m. On eks-managed pools the deadline and the drain
+	// window are at most 14m: a managed node group gives up evicting after
+	// 15 minutes.
 	// +optional
 	Deadline *metav1.Duration `json:"deadline,omitempty"`
 }

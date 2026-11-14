@@ -1147,3 +1147,46 @@ func TestRetireGateway(t *testing.T) {
 		t.Fatal("the retired gateway's AerolNode was kept")
 	}
 }
+
+// An EKS managed node group evicts for 15 minutes, then gives up with
+// PodEvictionFailure (§10.6). With the worker PodDisruptionBudget (#1270)
+// holding the eviction, a decommission on such a pool must end first: its
+// deadline and drain window are at most 14 minutes, whatever is set; other
+// pools keep theirs.
+func TestEKSManagedDecommissionFitsTheEvictionWindow(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	pool := func(provisioner string, drain, deadline *metav1.Duration) *v1.WorkerPoolSpec {
+		return &v1.WorkerPoolSpec{Provisioner: provisioner, Decommission: v1.DecommissionSpec{DrainWindow: drain, Deadline: deadline}}
+	}
+	for _, tc := range []struct {
+		name            string
+		pool            *v1.WorkerPoolSpec
+		drain, deadline time.Duration
+	}{
+		{"eks-managed defaults", pool("eks-managed", nil, nil), 5 * time.Minute, 14 * time.Minute},
+		{"eks-managed, a longer deadline set", pool("eks-managed", nil, dur(30*time.Minute)), 5 * time.Minute, 14 * time.Minute},
+		{"eks-managed, a shorter deadline set", pool("eks-managed", nil, dur(10*time.Minute)), 5 * time.Minute, 10 * time.Minute},
+		{"eks-managed, a drain window past the cap", pool("eks-managed", dur(20*time.Minute), nil), 14 * time.Minute, 14 * time.Minute},
+		{"karpenter keeps its defaults", pool("karpenter", nil, nil), defaultDrainWindow, defaultDecomDeadline},
+		{"none keeps what is set", pool("none", dur(20*time.Minute), dur(time.Hour)), 20 * time.Minute, time.Hour},
+	} {
+		if d := drainWindow(tc.pool); d != tc.drain {
+			t.Errorf("%s: drain window %s, want %s", tc.name, d, tc.drain)
+		}
+		if d := decomDeadline(tc.pool); d != tc.deadline {
+			t.Errorf("%s: deadline %s, want %s", tc.name, d, tc.deadline)
+		}
+	}
+	// A decommission that starts on such a pool records the capped
+	// deadline.
+	c := bootstrapped(testCluster())
+	c.Spec.WorkerPools[0].Provisioner = "eks-managed"
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(time.Hour)
+	n := node("prod-general-eks01", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	decommissioning(t, g, n.Name)
+	d := g.node(n.Name).Status.Decommission
+	if d == nil || d.Deadline.Sub(d.StartedAt.Time) != 14*time.Minute || d.DrainUntil.Sub(d.StartedAt.Time) != 5*time.Minute {
+		t.Fatalf("decommission = %+v", d)
+	}
+}
