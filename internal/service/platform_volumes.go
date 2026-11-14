@@ -47,6 +47,14 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 	if chosenRuntime == models.RuntimeFirecracker || chosenRuntime == models.RuntimeWasm || chosenRuntime == models.RuntimeIsolate {
 		return nil, fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
 	}
+	// A volume is a mount: a node that cannot serve mounts (a Kubernetes
+	// worker pod with external storage off, F13) refuses it here too,
+	// before any storage work, not only at the mount validation after it.
+	if s.mounts != nil {
+		if err := s.mounts.Available(); err != nil {
+			return nil, err
+		}
+	}
 
 	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken, s.cfg.OperatorVolumeScope))
 	if err != nil {

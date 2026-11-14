@@ -1749,6 +1749,14 @@ const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
 // creates the sandbox without the mount.
 const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
 
+// ErrorCodeMountsUnavailable is returned (501) for a create whose mounts this
+// node refuses to serve because its setup could not keep a mount where the
+// sandbox is built: a Kubernetes worker pod with external storage off (the
+// chart's default). Served anyway, the sandbox would write to local disk.
+// Retrying won't help; the operator turns external storage on, or the
+// caller creates the sandbox without the mount.
+const ErrorCodeMountsUnavailable = "mounts_unavailable"
+
 // ErrorCodeOverloaded is returned (503, with Retry-After) when the node shed
 // the request: it already runs as many requests of that kind (cluster-wide
 // sandbox lists) as it is configured to. Retrying after Retry-After is the

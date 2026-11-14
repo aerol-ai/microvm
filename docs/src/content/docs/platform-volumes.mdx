@@ -211,6 +211,8 @@ This depends on the store your operator picked. Ask them which one it is.
 
 On an S3 store, the server mounts the bucket with `mount-s3`, which only adds new files by default. To change a file, write a new file with a new name. A server without `mount-s3` installed, such as a [local install](/getting-started/local-setup/), refuses the volume with `501` and the code `mount_tool_unavailable`.
 
+On [Kubernetes](/kubernetes/), workers mount nothing until the operator sets the chart value [`worker.externalStorage.enabled`](/kubernetes/values/). Until then, a sandbox with a platform volume, on either store, is refused with `501` and the code `mounts_unavailable`.
+
 ## Platform volume or your own storage?
 
 | | [Attach cloud storage](/external-storage/) | Platform volume |

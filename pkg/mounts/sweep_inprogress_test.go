@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -223,20 +224,41 @@ func TestSweepKillsOrphanMountTool(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	exited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(exited)
-	}()
+	exit := watchExit(cmd)
 	t.Cleanup(func() { _ = killMount(cmd) })
+	waitForArgv(t, cmd.Process.Pid, hostPath, exit.done)
 
 	m.Sweep(map[string]struct{}{})
-	select {
-	case <-exited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("orphan mount tool still running after the sweep")
+	// No clock: the sweep's SIGKILL ends the tool at once, and if it never
+	// came, the tool's own sleep ends it in 30 s; how it ended tells which.
+	<-exit.done
+	if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("orphan mount tool was not killed by the sweep: %v", cmd.ProcessState)
 	}
 	if _, err := os.Stat(filepath.Dir(hostPath)); !os.IsNotExist(err) {
 		t.Fatalf("orphan dir not removed: %v", err)
+	}
+}
+
+// waitForArgv waits until a process just started shows needle in its
+// arguments. cmd.Start returns once the exec is under way, before the
+// kernel has set the new program's arguments, so /proc/<pid>/cmdline can
+// still read empty: in a root Linux container about one sweep in a few
+// hundred found no tool to kill and the test timed out. Code that finds
+// helpers by their arguments, as the sweep and adoption do, rightly misses
+// such a process; a real orphan, or a helper a previous sandboxd left, has
+// long been running. done ends the wait if the process exits first.
+func waitForArgv(t *testing.T, pid int, needle string, done <-chan struct{}) {
+	t.Helper()
+	cmdline := filepath.Join("/proc", strconv.Itoa(pid), "cmdline")
+	for {
+		if raw, err := os.ReadFile(cmdline); err == nil && bytes.Contains(raw, []byte(needle)) {
+			return
+		}
+		select {
+		case <-done:
+			t.Fatalf("pid %d exited before its arguments showed %q", pid, needle)
+		case <-time.After(time.Millisecond):
+		}
 	}
 }

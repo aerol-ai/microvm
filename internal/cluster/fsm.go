@@ -554,8 +554,11 @@ type placementFSM struct {
 	// retryOrphanedRecoveries pages it, so its work follows that backlog,
 	// not the fleet. Derived from the rows, never persisted: every write
 	// (storePlacementLocked) and delete keeps it, and Restore rebuilds it,
-	// so every replica holds the same set and no FSM format changes.
-	orphanedRecoveryIndex *btree.BTreeG[string]
+	// so every replica holds the same set and no FSM format changes. It is
+	// ordered oldest orphan first (orphanKey), the order G1 promises;
+	// orphanedRecoveryKeys finds a row's key by its ID.
+	orphanedRecoveryIndex *btree.BTreeG[orphanKey]
+	orphanedRecoveryKeys  map[string]int64
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -774,7 +777,8 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
-		orphanedRecoveryIndex:        newPlacementIDIndex(),
+		orphanedRecoveryIndex:        newOrphanKeyIndex(),
+		orphanedRecoveryKeys:         make(map[string]int64),
 		drainedNodes:                 make(map[string]bool),
 		storageRetirements:           make(map[string]NodeStorageRetirement),
 		storageObligations:           make(map[string]StorageObligation),
@@ -818,6 +822,23 @@ func volumeAttachmentKey(tenant, volumeID, sandboxID, target string) string {
 
 func newPlacementIDIndex() *btree.BTreeG[string] {
 	return btree.NewG[string](32, func(a, b string) bool { return a < b })
+}
+
+// orphanKey orders the orphaned-recovery backlog: by when the row was
+// orphaned (Placement.OrphanedUnix, the log's time, the same on every
+// replica), then by sandbox ID.
+type orphanKey struct {
+	unix int64
+	id   string
+}
+
+func newOrphanKeyIndex() *btree.BTreeG[orphanKey] {
+	return btree.NewG[orphanKey](32, func(a, b orphanKey) bool {
+		if a.unix != b.unix {
+			return a.unix < b.unix
+		}
+		return a.id < b.id
+	})
 }
 
 // maxRetainedAuditACLs is the post-delete audit index cap applied when a
@@ -3252,16 +3273,35 @@ func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
 }
 
 // indexOrphanedRecoveryLocked keeps id in orphanedRecoveryIndex exactly
-// while its hot row p is orphaned and still wants a failover recreate.
+// while its hot row p is orphaned and still wants a failover recreate,
+// under the time it was orphaned.
 func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
 	if f.orphanedRecoveryIndex == nil {
-		f.orphanedRecoveryIndex = newPlacementIDIndex()
+		f.orphanedRecoveryIndex, f.orphanedRecoveryKeys = newOrphanKeyIndex(), make(map[string]int64)
 	}
+	old, had := f.orphanedRecoveryKeys[id]
 	if p.IsOrphaned() && placementMovableOnFailover(p) {
-		f.orphanedRecoveryIndex.ReplaceOrInsert(id)
+		if had && old == p.OrphanedUnix {
+			return
+		}
+		if had {
+			f.orphanedRecoveryIndex.Delete(orphanKey{old, id})
+		}
+		f.orphanedRecoveryIndex.ReplaceOrInsert(orphanKey{p.OrphanedUnix, id})
+		f.orphanedRecoveryKeys[id] = p.OrphanedUnix
 		return
 	}
-	f.orphanedRecoveryIndex.Delete(id)
+	f.dropOrphanedRecoveryLocked(id)
+}
+
+func (f *placementFSM) dropOrphanedRecoveryLocked(id string) {
+	if f.orphanedRecoveryIndex == nil {
+		return
+	}
+	if old, had := f.orphanedRecoveryKeys[id]; had {
+		f.orphanedRecoveryIndex.Delete(orphanKey{old, id})
+		delete(f.orphanedRecoveryKeys, id)
+	}
 }
 
 // unindexDeletedPlacementLocked drops a deleted row from the indexes kept
@@ -3269,9 +3309,7 @@ func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
 func (f *placementFSM) unindexDeletedPlacementLocked(id string) {
 	delete(f.moveHandoffs, id)
 	delete(f.deletingIndex, id)
-	if f.orphanedRecoveryIndex != nil {
-		f.orphanedRecoveryIndex.Delete(id)
-	}
+	f.dropOrphanedRecoveryLocked(id)
 }
 
 // orphanedRecoveryLen is the size of orphanedRecoveryIndex.
@@ -3284,28 +3322,41 @@ func (f *placementFSM) orphanedRecoveryLen() int {
 	return f.orphanedRecoveryIndex.Len()
 }
 
-// orphanedRecoveryPage returns up to limit ids from orphanedRecoveryIndex
-// after the cursor, in order, and whether the walk reached the end.
-func (f *placementFSM) orphanedRecoveryPage(after string, limit int) ([]string, bool) {
+// orphanedRecoveryPage returns up to limit keys from orphanedRecoveryIndex
+// after the cursor (the zero key: from the oldest), oldest first, and
+// whether the walk reached the end.
+func (f *placementFSM) orphanedRecoveryPage(after orphanKey, limit int) ([]orphanKey, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.orphanedRecoveryIndex == nil || limit <= 0 {
 		return nil, true
 	}
-	ids := make([]string, 0, limit)
+	keys := make([]orphanKey, 0, limit)
 	end := true
-	f.orphanedRecoveryIndex.AscendGreaterOrEqual(after, func(id string) bool {
-		if after != "" && id <= after {
+	f.orphanedRecoveryIndex.AscendGreaterOrEqual(after, func(k orphanKey) bool {
+		if after.id != "" && k == after {
 			return true
 		}
-		if len(ids) == limit {
+		if len(keys) == limit {
 			end = false
 			return false
 		}
-		ids = append(ids, id)
+		keys = append(keys, k)
 		return true
 	})
-	return ids, end
+	return keys, end
+}
+
+// orphanedRecoveryOldest is when the oldest row of the backlog was
+// orphaned; ok is false for an empty backlog.
+func (f *placementFSM) orphanedRecoveryOldest() (unix int64, ok bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.orphanedRecoveryIndex == nil {
+		return 0, false
+	}
+	k, ok := f.orphanedRecoveryIndex.Min()
+	return k.unix, ok
 }
 
 func (f *placementFSM) deletePlacementRecoveryLocked(id string) {
@@ -4403,7 +4454,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
-	f.orphanedRecoveryIndex = newPlacementIDIndex()
+	f.orphanedRecoveryIndex, f.orphanedRecoveryKeys = newOrphanKeyIndex(), make(map[string]int64)
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)

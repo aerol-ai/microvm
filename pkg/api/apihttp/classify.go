@@ -185,6 +185,10 @@ func Classify(err error) Classification {
 	// Logged, so the node's journal names the missing tool.
 	case errors.Is(err, mounts.ErrMountToolUnavailable):
 		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeMountToolUnavailable, Message: err.Error(), Log: true, LogLevel: slog.LevelWarn}
+	// External storage off on this node (a Kubernetes worker pod set up
+	// without it, F13): the node's configuration again, logged once at boot.
+	case errors.Is(err, mounts.ErrMountsUnavailable):
+		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeMountsUnavailable, Message: err.Error()}
 
 	// The node cannot keep IPv6 off its sandbox networks right now. The
 	// cause (a netlink error) is for the node's log, not the caller.
