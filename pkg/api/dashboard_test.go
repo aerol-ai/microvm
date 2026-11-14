@@ -382,7 +382,10 @@ func TestDashboardPageLogic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("node --test testdata/dashboard_test.mjs: %v\n%s", err, out)
 	}
-	if !regexp.MustCompile(`(?m)^# fail 0$`).Match(out) || !regexp.MustCompile(`(?m)^# pass [1-9]`).Match(out) {
+	// The summary is TAP ("# pass 43") from node 22 when its output is not
+	// a terminal, and the spec reporter's ("ℹ pass 43") from node 23 on,
+	// which CI runners now have: accept either.
+	if !regexp.MustCompile(`(?m)^[#ℹ] fail 0$`).Match(out) || !regexp.MustCompile(`(?m)^[#ℹ] pass [1-9]`).Match(out) {
 		t.Fatalf("node reported no passing run:\n%s", out)
 	}
 }

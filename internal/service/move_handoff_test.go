@@ -548,7 +548,7 @@ func importedFirecracker(t *testing.T, tm moveTimings) (*Service, *fakeMoverRunt
 	dst.moveTimings = tm
 	srcRT.snapshot = bytes.Repeat([]byte("vm memory "), 10_000)
 	if err := src.store.Create(ctx, &models.Sandbox{ID: "sb-vm", Name: "sb-vm", Image: "alpine", Runtime: models.RuntimeFirecracker,
-		Status: models.SandboxStatusStarted, ContainerID: "vm"}); err != nil {
+		Status: models.SandboxStatusStarted, ContainerID: "vm", AuditIncarnationID: "inc-1"}); err != nil {
 		t.Fatal(err)
 	}
 	srv := serveBundles(src, "worker-b")
@@ -660,11 +660,24 @@ func TestCheckMovedInOnceUnfinished(t *testing.T) {
 		return svc.checkMovedInOnce(ctx, moveInCheck{id: id})
 	}
 
-	t.Run("a start that fails", func(t *testing.T) {
-		dst, _, dstC := importedGvisor(t, false, moveTimings{}) // no recreate inputs: nothing to rebuild from
+	t.Run("a start that fails within the move's time", func(t *testing.T) {
+		dst, dstRT, dstC := importedFirecracker(t, moveTimings{})
+		dstRT.startErr = errors.New("runtime busy")
 		movedOwner(dst, dstC, "worker-b")
-		if err := step(dst, "sb-g"); err == nil {
+		if err := step(dst, "sb-vm"); err == nil {
 			t.Fatal("a start that failed ended the check")
+		}
+		if sb, _ := dst.store.Get(ctx, "sb-vm"); sb.StatusReason != statusReasonMovedIn {
+			t.Fatalf("gave up within the move's time: reason %q", sb.StatusReason)
+		}
+		// The failed start left the row in error; it still awaits its
+		// start, so the next step starts it.
+		dstRT.startErr = nil
+		if err := step(dst, "sb-vm"); err != nil {
+			t.Fatalf("the next step: %v", err)
+		}
+		if sb, _ := dst.store.Get(ctx, "sb-vm"); sb.Status != models.SandboxStatusStarted {
+			t.Fatalf("not started on the next step: %s", sb.Status)
 		}
 	})
 	t.Run("a leader that cannot answer", func(t *testing.T) {
@@ -675,15 +688,20 @@ func TestCheckMovedInOnceUnfinished(t *testing.T) {
 			t.Fatalf("an unanswered read: err %v, reads %d", err, flaky.reads())
 		}
 	})
-	t.Run("a drop that fails", func(t *testing.T) {
-		dst, _, dstC := importedGvisor(t, true, moveTimings{inFenceTTL: time.Nanosecond}) // the move's time is up
+	t.Run("a drop that fails: tried again, then given up", func(t *testing.T) {
+		dst, _, dstC := importedGvisor(t, true, moveTimings{inFenceTTL: time.Minute})
 		// This node's own view already names it; the leader's does not.
 		dst.AttachCluster(&splitViewCluster{moveStubCluster: dstC, leaderOwner: "worker-a"})
+		importedAgo(t, dst, "sb-g", 90*time.Second) // the move's time is up
 		if err := step(dst, "sb-g"); err == nil {
 			t.Fatal("a drop that failed ended the check")
 		}
 		if _, err := dst.store.GetMovedInRow(ctx, "sb-g"); err != nil {
 			t.Fatalf("a failed drop removed the row: %v", err)
+		}
+		importedAgo(t, dst, "sb-g", 3*time.Minute) // and passed again
+		if err := step(dst, "sb-g"); err != nil {
+			t.Fatalf("a drop that kept failing did not end the check: %v", err)
 		}
 	})
 	t.Run("a store that cannot be read", func(t *testing.T) {
@@ -789,6 +807,203 @@ func TestResumeLapsedMoveRuntimeFailure(t *testing.T) {
 	svc.moves.set("sb-rt", time.Now().Add(-time.Second))
 	if svc.resumeLapsedMove(ctx, "sb-rt") {
 		t.Fatal("reported a start the runtime refused")
+	}
+}
+
+// importedAgo moves id's stored import back by ago, as if it came then.
+func importedAgo(t *testing.T, svc *Service, id string, ago time.Duration) {
+	t.Helper()
+	row, err := svc.store.GetMovedInRow(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.store.PutMovedInRow(context.Background(), id, row.Sealed, time.Now().Add(-ago)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The move-in check gives up instead of trying forever, with one log line
+// and a status: a gVisor import with no recreate inputs (a target newer
+// than its leader) at once, a Firecracker start that keeps failing once
+// the move's time is up, and a stored row that does not open at once. The
+// sandbox is left stopped with reason move_start_failed; a Firecracker one
+// keeps its staged memory, so a user's start tries again.
+func TestMoveInCheckGivesUp(t *testing.T) {
+	ctx := context.Background()
+	step := func(svc *Service, id string) error {
+		return svc.checkMovedInOnce(ctx, moveInCheck{id: id})
+	}
+
+	t.Run("gVisor with no recreate inputs", func(t *testing.T) {
+		dst, dstRT, dstC := importedGvisor(t, false, moveTimings{})
+		movedOwner(dst, dstC, "worker-b")
+		if err := step(dst, "sb-g"); err != nil {
+			t.Fatalf("a start that can never work was not given up: %v", err)
+		}
+		sb, err := dst.store.Get(ctx, "sb-g")
+		if err != nil || sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonMoveStartFailed || sb.ToolboxToken != "guest-token" {
+			t.Fatalf("the row left behind: %+v %v", sb, err)
+		}
+		if _, err := dst.store.GetMovedInRow(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("the stored row stayed: %v", err)
+		}
+		if dstRT.imported != nil || len(dstRT.createRestored) != 0 {
+			t.Fatalf("staged %d bytes, %d creates", len(dstRT.imported), len(dstRT.createRestored))
+		}
+		if err := step(dst, "sb-g"); err != nil {
+			t.Fatalf("a check after giving up: %v", err)
+		}
+	})
+	t.Run("a Firecracker start that keeps failing", func(t *testing.T) {
+		dst, dstRT, dstC := importedFirecracker(t, moveTimings{inFenceTTL: time.Nanosecond}) // the move's time is up
+		dstRT.startErr = errors.New("runtime busy")
+		movedOwner(dst, dstC, "worker-b")
+		if err := step(dst, "sb-vm"); err != nil {
+			t.Fatalf("a start that kept failing was not given up: %v", err)
+		}
+		sb, err := dst.store.Get(ctx, "sb-vm")
+		if err != nil || sb.Status != models.SandboxStatusError || sb.LastError == "" || sb.StatusReason != statusReasonMoveStartFailed || dstRT.imported == nil {
+			t.Fatalf("the row left behind: %+v %v, %d bytes staged", sb, err, len(dstRT.imported))
+		}
+		dstRT.startErr = nil
+		if _, err := dst.StartSandbox(ctx, "sb-vm"); err != nil {
+			t.Fatalf("a user's start after the check gave up: %v", err)
+		}
+	})
+	t.Run("a stored row that does not open", func(t *testing.T) {
+		dst, dstRT, dstC := importedGvisor(t, true, moveTimings{})
+		if err := dst.store.PutMovedInRow(ctx, "sb-g", []byte("not sealed"), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		movedOwner(dst, dstC, "worker-b")
+		dropped := dstRT.dropped
+		if err := step(dst, "sb-g"); err != nil {
+			t.Fatalf("an unreadable row was not given up: %v", err)
+		}
+		if _, err := dst.store.GetMovedInRow(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) || dstRT.dropped == dropped {
+			t.Fatalf("the unreadable row: %v, drops %d", err, dstRT.dropped-dropped)
+		}
+		if _, err := dst.store.Get(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("a row was made from nothing: %v", err)
+		}
+	})
+}
+
+// Giving up reports what it could not do, and changes nothing then: a
+// lifecycle lock it cannot take before its caller leaves, and a store it
+// cannot read.
+func TestGiveUpMovedInFailures(t *testing.T) {
+	ctx := context.Background()
+	dst, _, _ := importedFirecracker(t, moveTimings{})
+	unlock := dst.lifecycleLocks.lock("sb-vm")
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := dst.giveUpMovedIn(gone, "sb-vm", errors.New("x")); err == nil {
+		t.Fatal("gave up without the sandbox's lock")
+	}
+	unlock()
+	if sb, _ := dst.store.Get(ctx, "sb-vm"); sb.StatusReason != statusReasonMovedIn {
+		t.Fatalf("changed the row without the lock: %q", sb.StatusReason)
+	}
+	_ = dst.store.Close()
+	if err := dst.giveUpMovedIn(ctx, "sb-vm", errors.New("x")); err == nil {
+		t.Fatal("gave up on a store it could not read")
+	}
+}
+
+// A Firecracker import whose row cannot be stored (its name is taken here)
+// is refused, and leaves no staged memory behind.
+func TestFirecrackerImportRowNotStored(t *testing.T) {
+	ctx := context.Background()
+	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, srcRT, _ := moveWorker(t, "worker-a", cipher)
+	dst, dstRT, dstC := moveWorker(t, "worker-b", cipher)
+	srcRT.snapshot = []byte("vm memory")
+	if err := src.store.Create(ctx, &models.Sandbox{ID: "sb-vm", Name: "sb-vm", Image: "alpine", Runtime: models.RuntimeFirecracker,
+		Status: models.SandboxStatusStarted, ContainerID: "vm"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.store.Create(ctx, &models.Sandbox{ID: "sb-other", Name: "sb-vm", Image: "alpine", Status: models.SandboxStatusStarted}); err != nil {
+		t.Fatal(err)
+	}
+	srv := serveBundles(src, "worker-b")
+	t.Cleanup(srv.Close)
+	dstC.srv = srv
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
+		t.Fatal(got)
+	}
+	if err := dst.ImportMove(ctx, "sb-vm", "worker-a", nil); err == nil {
+		t.Fatal("acknowledged an import whose row was not stored")
+	}
+	if _, err := dst.store.Get(ctx, "sb-vm"); !errors.Is(err, store.ErrNotFound) || dstRT.imported != nil {
+		t.Fatalf("left behind: row %v, %d bytes staged", err, len(dstRT.imported))
+	}
+}
+
+// lifetimeCluster is a placement of another lifetime with the same id,
+// owned by this node.
+type lifetimeCluster struct {
+	*moveStubCluster
+	incarnation string
+}
+
+func (c *lifetimeCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		out[id] = cluster.Placement{SandboxID: id, OwnerNodeID: c.self, IncarnationID: c.incarnation}
+	}
+	return out, nil
+}
+
+// A placement here of another lifetime with the same id (a keyed create
+// after a delete) never starts an import of the old one: the check drops
+// the import, and a row of the current lifetime is never touched.
+func TestMoveInCheckDropsAnotherLifetime(t *testing.T) {
+	ctx := context.Background()
+	step := func(svc *Service, id string) error {
+		return svc.checkMovedInOnce(ctx, moveInCheck{id: id})
+	}
+	t.Run("gVisor", func(t *testing.T) {
+		dst, dstRT, dstC := importedGvisor(t, true, moveTimings{})
+		rec, _, _, err := dst.loadMovedIn(ctx, "sb-g")
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.Row.AuditIncarnationID = "inc-old"
+		if err := dst.putMovedIn(ctx, "sb-g", rec); err != nil {
+			t.Fatal(err)
+		}
+		dst.AttachCluster(&lifetimeCluster{moveStubCluster: dstC, incarnation: "inc-new"})
+		if err := step(dst, "sb-g"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dst.store.GetMovedInRow(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) || dstRT.imported != nil || len(dstRT.createRestored) != 0 {
+			t.Fatalf("the old lifetime's import: row %v, %d bytes staged, %d creates", err, len(dstRT.imported), len(dstRT.createRestored))
+		}
+	})
+	t.Run("Firecracker", func(t *testing.T) {
+		dst, dstRT, dstC := importedFirecracker(t, moveTimings{})
+		dst.AttachCluster(&lifetimeCluster{moveStubCluster: dstC, incarnation: "inc-new"})
+		// The import's own lifetime is not the one dropImport is asked
+		// for: the row stays.
+		if err := dst.dropImport(ctx, "sb-vm", "inc-other"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dst.store.Get(ctx, "sb-vm"); err != nil {
+			t.Fatalf("a row of another lifetime went: %v", err)
+		}
+		if err := step(dst, "sb-vm"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dst.store.Get(ctx, "sb-vm"); !errors.Is(err, store.ErrNotFound) || dstRT.imported != nil || dstRT.startCount != 0 {
+			t.Fatalf("the old lifetime's import: row %v, %d bytes staged, %d starts", err, len(dstRT.imported), dstRT.startCount)
+		}
+	})
+	if !sameIncarnation("", "inc") || !sameIncarnation("inc", " inc ") || sameIncarnation("a", "b") {
+		t.Fatal("sameIncarnation")
 	}
 }
 
