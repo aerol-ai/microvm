@@ -138,19 +138,69 @@ func movedRowFence(sb *models.Sandbox) time.Time {
 	return sb.UpdatedAt.Add(moveFenceTTL)
 }
 
-// refuseMovedRowStart is the start gate's check of the row (R11): a row a
-// release fenced, in a process that never saw that fence, is fenced again
-// here until it lapses, and refused. The caller holds id's lifecycle lock.
-func (s *Service) refuseMovedRowStart(sb *models.Sandbox) error {
+// refuseMovedRowStart is the start gate's check of a row a release stopped
+// for a move. While its fence holds, in a process that never saw that fence
+// (it restarted since, R11), it is fenced again here and refused. Once the
+// fence lapsed, this process's or the row's, the move may still be on its
+// way: a snapshot move's import can outlast the fence (N3). So a start
+// needs proof first (proveMoveAborted). The caller holds id's lifecycle
+// lock, so no release comes in between the proof and the start.
+func (s *Service) refuseMovedRowStart(ctx context.Context, sb *models.Sandbox) error {
 	until := movedRowFence(sb)
-	if until.IsZero() || s.moves.known(sb.ID) || !time.Now().Before(until) {
+	if until.IsZero() {
 		return nil
 	}
-	s.moves.set(sb.ID, until)
-	if sb.StatusReason == statusReasonMoveReleased {
-		s.scheduleMoveResumeIn(sb.ID, time.Until(until)+time.Second)
+	if !s.moves.known(sb.ID) && time.Now().Before(until) {
+		s.moves.set(sb.ID, until)
+		if sb.StatusReason == statusReasonMoveReleased {
+			s.scheduleMoveResumeIn(sb.ID, time.Until(until)+time.Second)
+		}
+		return ErrOwnershipFenced
 	}
-	return ErrOwnershipFenced
+	return s.proveMoveAborted(ctx, sb)
+}
+
+// errMoveUnproven is a start of a released row the leader could not rule
+// on: it may have moved. Another try later can succeed.
+var errMoveUnproven = errors.New("released for a move, and the leader could not say whether it moved")
+
+// errMovedAway is a start of a released row whose move happened: it is not
+// this node's to start; the stale-ownership sweep removes it.
+var errMovedAway = errors.New("released for a move, and it moved to another node")
+
+// proveMoveAborted is the proof a start of a released row needs once its
+// fence lapsed (N3): the leader says this node still owns this lifetime,
+// and then, where the cluster records move handoffs, this node aborts the
+// handoff, which a snapshot move's late swap would otherwise still win
+// (cluster/fsm_move_handoff.go). Both answers come from the leader: this
+// node's own placement view can lag the swap. A cluster that predates
+// handoffs gets the ownership read alone, as before. Every refusal wraps
+// ErrOwnershipFenced, the start's usual answer for a held sandbox.
+func (s *Service) proveMoveAborted(ctx context.Context, sb *models.Sandbox) error {
+	c := s.Cluster()
+	if c == nil {
+		return nil
+	}
+	got, err := c.AuthoritativePlacementsByIDs(ctx, []string{sb.ID})
+	if err != nil {
+		return fmt.Errorf("%w: %w: %v", ErrOwnershipFenced, errMoveUnproven, err)
+	}
+	p, ok := got[sb.ID]
+	if !ok || strings.TrimSpace(p.OwnerNodeID) != c.SelfNodeID() || !sameLifetime(sb, p.IncarnationID) {
+		return fmt.Errorf("%w: %w", ErrOwnershipFenced, errMovedAway)
+	}
+	h, ok := c.(cluster.MoveHandoffClient)
+	if !ok {
+		return nil
+	}
+	switch err := h.AbortMoveHandoff(ctx, sb.ID, p.IncarnationID); {
+	case err == nil, errors.Is(err, cluster.ErrMoveHandoffUnsupported):
+		return nil
+	case errors.Is(err, cluster.ErrMoveHandoffMoved):
+		return fmt.Errorf("%w: %w", ErrOwnershipFenced, errMovedAway)
+	default:
+		return fmt.Errorf("%w: %w: %v", ErrOwnershipFenced, errMoveUnproven, err)
+	}
 }
 
 // rearmMoveFences restores, at start, the fences of rows a release left
@@ -301,27 +351,15 @@ func (s *Service) scheduleMoveResumeIn(id string, d time.Duration) {
 var moveResumeRetry = time.Minute
 
 // resumeLapsedMove starts id again when its move never happened: its fence
-// has lapsed, it is still stopped for the move, and the leader itself says
-// this node still owns this lifetime of it (a worker's own placement view
-// may lag the swap). A placement that did move is left for the
+// has lapsed and it is still stopped for the move. The start's gate proves
+// it first (refuseMovedRowStart): the leader says this node still owns this
+// lifetime of it, and the move's handoff is aborted, so a swap still on its
+// way can no longer land (N3). A placement that did move is left for the
 // stale-ownership sweep. A leader that cannot answer means another check
 // later. Reports whether it started the sandbox.
 func (s *Service) resumeLapsedMove(ctx context.Context, id string) bool {
 	if s == nil || s.moves.held(id, time.Now()) {
 		return false
-	}
-	var placed cluster.Placement
-	if c := s.Cluster(); c != nil {
-		got, err := c.AuthoritativePlacementsByIDs(ctx, []string{id})
-		if err != nil {
-			s.scheduleMoveResumeIn(id, moveResumeRetry)
-			return false
-		}
-		p, ok := got[id]
-		if !ok || strings.TrimSpace(p.OwnerNodeID) != c.SelfNodeID() {
-			return false
-		}
-		placed = p
 	}
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
@@ -333,11 +371,18 @@ func (s *Service) resumeLapsedMove(ctx context.Context, id string) bool {
 		return false
 	}
 	sb, err := s.store.Get(ctx, id)
-	if err != nil || sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonMoveReleased || !sameLifetime(sb, placed.IncarnationID) {
+	if err != nil || sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonMoveReleased {
 		return false
 	}
 	if _, err := s.startSandboxLocked(ctx, id, startForRestart); err != nil {
-		s.logger.Warn("decommission: a sandbox whose move never happened could not be started again", "sandbox_id", id, "err", err)
+		switch {
+		case errors.Is(err, errMoveUnproven):
+			s.scheduleMoveResumeIn(id, moveResumeRetry)
+		case errors.Is(err, errMovedAway):
+			// Not this node's: nothing to start.
+		default:
+			s.logger.Warn("decommission: a sandbox whose move never happened could not be started again", "sandbox_id", id, "err", err)
+		}
 		return false
 	}
 	s.logger.Info("decommission: started a sandbox again; its move never happened", "sandbox_id", id)

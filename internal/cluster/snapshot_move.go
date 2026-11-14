@@ -69,8 +69,10 @@ type SnapshotMoveHandler interface {
 	// ReleaseForSnapshotMove is ReleaseForMove for one sandbox, naming the
 	// only node that may pull its bundle.
 	ReleaseForSnapshotMove(ctx context.Context, id, target, lifetime string) string
-	// ImportMove pulls id's bundle from source and puts it in place.
-	ImportMove(ctx context.Context, id, source string) error
+	// ImportMove pulls id's bundle from source and puts it in place,
+	// durably before it answers (a stopped row, or a stored row with rc for
+	// a runtime that rebuilds), so a restart before the start loses nothing.
+	ImportMove(ctx context.Context, id, source string, rc *MoveRecreate) error
 	// DropMove undoes ImportMove when the move does not happen.
 	DropMove(ctx context.Context, id string) error
 	// StartMoved starts id once the placement names this node. rc is what
@@ -183,6 +185,13 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	if why := snapshotTargetFits(p, source, tm); why != "" {
 		return errors.New("snapshot move: " + why)
 	}
+	// Opened before the release: from here on, a source that takes the
+	// sandbox back (its fence lapsed during a slow import) makes the swap
+	// below fail, instead of both copies running (N3).
+	token, err := c.beginMoveHandoff(pre, p, source.NodeID)
+	if err != nil {
+		return fmt.Errorf("snapshot move: open the handoff: %w", err)
+	}
 	rctx, cancel := context.WithTimeout(pre, moveStepTimeout)
 	release := releaseAction("release-snapshot", p)
 	release.Target = target.NodeID
@@ -203,7 +212,10 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		return why
 	}
 	ictx, cancel := context.WithTimeout(pre, importTimeout)
-	out, err = c.moveCall(ictx, tm, MoveAction{Action: "import", IDs: []string{p.SandboxID}, Source: source.NodeID})
+	// The recreate inputs go with the import too: a gVisor target stores
+	// them with the row, and rebuilds from them itself if its agent
+	// restarts before the start (N4). A worker from before ignores them.
+	out, err = c.moveCall(ictx, tm, MoveAction{Action: "import", IDs: []string{p.SandboxID}, Source: source.NodeID, Recreate: moveRecreateFor(p)})
 	cancel()
 	if err == nil && out.Error != "" {
 		err = errors.New(out.Error)
@@ -220,24 +232,45 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		ExpectedIncarnationID:  strings.TrimSpace(p.IncarnationID),
 		ExpectedOwnerNodeID:    source.NodeID,
 		ExpectedOwnerNodeIDSet: true,
+		ExpectedMoveToken:      token,
 		ReassignCause:          reassignCauseFailover,
 	}); err != nil {
 		return drop(err)
 	}
-	// After the swap: not cut short by a gVisor move's budget.
+	// After the swap: not cut short by a gVisor move's budget. The target
+	// holds the sandbox durably from its import on (a stopped row, or a
+	// stored checkpoint row), so a start that fails, the target's agent
+	// restarting say, is tried again here, and the target starts it itself
+	// at its next start if every try fails (Service.resumeMovedIn).
 	sctx, cancel := context.WithTimeout(ctx, moveStartTimeout)
-	out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}, Recreate: moveRecreateFor(p)})
-	cancel()
-	if err == nil && out.Error != "" {
-		err = errors.New(out.Error)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}, Recreate: moveRecreateFor(p)})
+		if err == nil && out.Error != "" {
+			err = errors.New(out.Error)
+		}
+		if err == nil {
+			return nil
+		}
+		if attempt == moveStartAttempts || sctx.Err() != nil {
+			break
+		}
+		select {
+		case <-sctx.Done():
+		case <-time.After(time.Duration(attempt) * moveStartRetryDelay):
+		}
 	}
-	if err != nil {
-		// Moved, not started: the target holds it stopped, and a start
-		// restores it.
-		c.logger.Warn("cluster: snapshot move: moved, but the start on the target failed", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
-	}
+	c.logger.Warn("cluster: snapshot move: moved, but the start on the target failed; it starts the sandbox at its next start", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
 	return nil
 }
+
+// moveStartAttempts and moveStartRetryDelay space the leader's tries of a
+// moved sandbox's start on its target (the delay grows by itself each
+// try). A var for tests.
+var (
+	moveStartAttempts   = 3
+	moveStartRetryDelay = 5 * time.Second
+)
 
 // runSnapshotMoveAction runs a snapshot move's actions on a worker whose
 // MoveHandler has the snapshot half.
@@ -270,7 +303,7 @@ func runSnapshotMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (Mo
 		if strings.TrimSpace(a.Source) == "" {
 			return MoveActionResult{}, errors.New("import needs the source")
 		}
-		err = sh.ImportMove(ctx, id, strings.TrimSpace(a.Source))
+		err = sh.ImportMove(ctx, id, strings.TrimSpace(a.Source), a.Recreate)
 	case "drop":
 		err = sh.DropMove(ctx, id)
 	case "start-moved":

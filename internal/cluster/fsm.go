@@ -62,8 +62,10 @@ const (
 	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
 	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go); 43-47
 	// are the join ops (fsm_join.go); 48-50 are the active version and
-	// rollout ops (fsm_rollout.go); 51 is opSetRunStates (fsm_run_state.go).
-	// The next free code is 52.
+	// rollout ops (fsm_rollout.go); 51 is opSetRunStates (fsm_run_state.go);
+	// 52 is opAdmitNodeByCert (fsm_join.go); 53 is opSetKubeWarmDepths
+	// (fsm_kube_warm.go); 54 is opMoveHandoff (fsm_move_handoff.go).
+	// The next free code is 55.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -118,6 +120,13 @@ type command struct {
 	// before the fence and every one a proposer writes while an older server
 	// is still in the cluster (spec_version_fence.go).
 	ExpectedPlacementVersion uint64 `json:"expected_placement_version,omitempty"`
+	// MoveToken is opMoveHandoff's token: set, the leader opens a snapshot
+	// move's handoff; empty, the owner aborts it (fsm_move_handoff.go).
+	// ExpectedMoveToken is opReassign's check of that handoff: the swap
+	// lands only while the placement still holds it. Both are omitted when
+	// empty, so commands from before them replay byte for byte.
+	MoveToken         string `json:"move_token,omitempty"`
+	ExpectedMoveToken string `json:"expected_move_token,omitempty"`
 	// OwnerRef is the control-plane tenant account.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
@@ -653,6 +662,10 @@ type placementFSM struct {
 	// runtime (fsm_kube_warm.go, snapshotted). A change to it moves
 	// warmPoolsVersion too: workers read both in one poll.
 	kubeWarm []KubeWarmDepth
+	// moveHandoffs are the snapshot moves in flight, by sandbox: the token
+	// their swap must carry (fsm_move_handoff.go, snapshotted). One entry
+	// per move, cleared by its swap, an abort, an orphaning or a delete.
+	moveHandoffs map[string]string
 	// identity is the cloud-identity signing keys and role allow lists
 	// (fsm_identity.go, snapshotted). nil until the first write.
 	identity *identityState
@@ -1473,6 +1486,14 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		if existing.IsDeleting() {
 			return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 		}
+		// A snapshot move's swap: refused once its source took the
+		// sandbox back (N3, fsm_move_handoff.go).
+		if err := f.moveHandoffRefusesReassign(cmd); err != nil {
+			return err
+		}
+		// Any reassign ends a handoff: the move it guarded either is this
+		// swap or can no longer be.
+		delete(f.moveHandoffs, cmd.SandboxID)
 		wasReserved := existing.IsReserved()
 		if wasReserved {
 			f.releasePendingReservationLocked(cmd.SandboxID)
@@ -1537,6 +1558,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseOwnerLocked(id, existing)
 			recordPlacementAuditNode(&existing, cmd.NodeID)
 			setPlacementOwner(&existing, "", "", "", log)
+			delete(f.moveHandoffs, id)
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			existing.OrphanedOwnerNodeID = cmd.NodeID
 			existing.OrphanedUnix = now
@@ -2081,6 +2103,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		return nil
+	case opMoveHandoff:
+		return f.applyMoveHandoffLocked(cmd)
 	case opSetKubeWarmDepths:
 		result, err := f.applySetKubeWarmDepthsLocked(cmd)
 		if err != nil {
@@ -3244,6 +3268,7 @@ func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
 // by state.
 func (f *placementFSM) unindexDeletedPlacementLocked(id string) {
 	delete(f.deletingIndex, id)
+	delete(f.moveHandoffs, id)
 	if f.orphanedRecoveryIndex != nil {
 		f.orphanedRecoveryIndex.Delete(id)
 	}
@@ -4154,6 +4179,11 @@ type fsmSnapshotPayload struct {
 	// WarmPools; nothing is written until every server applies
 	// opSetKubeWarmDepths (kubeWarmFSMOpsVersion).
 	KubeWarm []KubeWarmDepth
+	// MoveHandoffs are the snapshot moves in flight (fsm_move_handoff.go).
+	// Optional; an older snapshot decodes it as nil, "none in flight", and
+	// an older build ignores it, which is safe because none is written
+	// until every server applies opMoveHandoff (moveHandoffFSMOpsVersion).
+	MoveHandoffs map[string]string
 	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
 	// (sealed) and role allow lists. Optional; an older snapshot decodes
 	// them as nil, which reads as "no keys, no roles".
@@ -4273,6 +4303,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		apiTokens:          f.apiTokens().snapshot(),
 		warmPools:          f.warmPoolsSnapshotLocked(),
 		kubeWarm:           f.kubeWarmSnapshotLocked(),
+		moveHandoffs:       f.moveHandoffsSnapshotLocked(),
 		identityKeys:       identityKeys,
 		identityRoles:      identityRoles,
 		deniedNodes:        f.deniedNodesSnapshotLocked(),
@@ -4472,6 +4503,8 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 			f.claimOwnerLocked(id, indexed)
 		}
 	}
+	// After the rows: a handoff of a placement the snapshot lacks is dropped.
+	f.restoreMoveHandoffsLocked(payload.MoveHandoffs)
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the
 	// add path can write without a nil-map panic. Active drains carried in
 	// the envelope are copied across verbatim; raft will apply any
@@ -4543,6 +4576,7 @@ type fsmSnapshot struct {
 	apiTokens          []identity.TokenRecord
 	warmPools          []WarmPoolRecord
 	kubeWarm           []KubeWarmDepth
+	moveHandoffs       map[string]string
 	identityKeys       *cloudidentity.KeySet
 	identityRoles      []IdentityRoleRecord
 	teamQuotas         []TeamQuotaRecord
@@ -4593,6 +4627,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		APITokens:          s.apiTokens,
 		WarmPools:          s.warmPools,
 		KubeWarm:           s.kubeWarm,
+		MoveHandoffs:       s.moveHandoffs,
 		IdentityKeys:       s.identityKeys,
 		IdentityRoles:      s.identityRoles,
 		TeamQuotas:         s.teamQuotas,

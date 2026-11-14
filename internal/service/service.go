@@ -663,10 +663,11 @@ type Service struct {
 	moves moveFences
 	// moveTargets names, per sandbox released for a snapshot move, the
 	// node that may pull its bundle; movesIn holds sandboxes imported here
-	// by one until the placement names this node (snapshot_move.go).
+	// by one until the placement names this node (snapshot_move.go). A
+	// gVisor sandbox's imported row is stored (moved_in_rows), not held
+	// here, so an agent restart before its start does not lose it.
 	moveTargets moveTargets
 	movesIn     moveFences
-	movedRows   checkpointRows
 	// ownershipFile writes that lease for the runtime supervisor
 	// (ownership_lease_file.go).
 	ownershipFile ownershipLeaseFile
@@ -1592,7 +1593,8 @@ func (s *Service) reconcileStaleOwnership(ctx context.Context) {
 		placement, ok := placements[sb.ID]
 		// A sandbox imported here by a snapshot move still names its
 		// source until the leader's swap, moments later (snapshot_move.go).
-		if s.movesIn.held(sb.ID, time.Now()) {
+		// The row says so too, for a process that restarted since (N4).
+		if s.movedInHeld(sb, time.Now()) {
 			continue
 		}
 		// No placement can be a fresh local create awaiting ownership replay;
@@ -3915,8 +3917,9 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 	}
 	// A row a move release fenced, which this process never saw (it
 	// restarted since): refused like any fenced sandbox until the fence in
-	// the row lapses (R11).
-	if err := s.refuseMovedRowStart(sandbox); err != nil {
+	// the row lapses (R11), and after that started only once the leader
+	// proves its move did not happen (N3).
+	if err := s.refuseMovedRowStart(ctx, sandbox); err != nil {
 		return nil, err
 	}
 	// Sealed-env mode omits Env from store scans. Runtime paths (especially

@@ -24,6 +24,13 @@ type fakeSnapshotMoves struct {
 	calls     []string
 	importErr error
 	lifetime  string // the incarnation the last release named
+	// duringImport runs inside the import: what happens while a slow one
+	// is still going.
+	duringImport func()
+	// startErrs are the next starts' answers, in order.
+	startErrs []error
+	// importRecreate is the recreate inputs the last import carried.
+	importRecreate *MoveRecreate
 }
 
 func (f *fakeSnapshotMoves) note(s string) {
@@ -40,8 +47,14 @@ func (f *fakeSnapshotMoves) ReleaseForSnapshotMove(_ context.Context, id, target
 	return "released"
 }
 
-func (f *fakeSnapshotMoves) ImportMove(_ context.Context, id, source string) error {
+func (f *fakeSnapshotMoves) ImportMove(_ context.Context, id, source string, rc *MoveRecreate) error {
 	f.note("import " + id + " from " + source)
+	f.mu.Lock()
+	f.importRecreate = rc
+	f.mu.Unlock()
+	if f.duringImport != nil {
+		f.duringImport()
+	}
 	return f.importErr
 }
 
@@ -56,7 +69,116 @@ func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id string, rc *MoveRec
 		return nil
 	}
 	f.note("start " + id + " from " + rc.Spec.Image)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.startErrs) > 0 {
+		err := f.startErrs[0]
+		f.startErrs = f.startErrs[1:]
+		return err
+	}
 	return nil
+}
+
+// snapshotMovePair is the leader (also the source, a mixed node) with
+// sb-vm, a Firecracker sandbox, and wkr-b, a worker with room for it.
+func snapshotMovePair(t *testing.T, name string) (*Cluster, *fakeSnapshotMoves, *fakeSnapshotMoves, func()) {
+	t.Helper()
+	c, cleanup := newTestClusterWithCfg(t, name, true, nil, func(cfg *config.Config) { cfg.NodeRole = config.NodeRoleMixed })
+	waitForLeader(t, c, 10*time.Second)
+	source, target := &fakeSnapshotMoves{}, &fakeSnapshotMoves{}
+	c.AttachMoveHandler(source)
+	c.moves.mu.Lock()
+	c.moves.peers = map[string]MoveHandler{"wkr-b": target}
+	c.moves.mu.Unlock()
+	room := capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384, CPUBudget: 8, MemoryBudgetMB: 16384, CanAdmit: true,
+		SupportedRuntimes: []string{models.RuntimeFirecracker}}
+	self, _ := c.gossip.lookupMember(c.nodeID)
+	self.Role = config.NodeRoleMixed
+	seedGossipView(t, c, []Member{self, {NodeID: "wkr-b", Alive: true, Role: config.NodeRoleWorker, APIURL: "http://wkr-b", Capacity: room, Arch: self.Arch, Version: self.Version}})
+	placeFirecracker(t, c, "sb-vm", c.nodeID, models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 128})
+	applyDrain(t, c, c.nodeID)
+	return c, source, target, cleanup
+}
+
+// The review's N3, end to end on the leader: the source takes the sandbox
+// back while the target is still importing (its fence lapsed during a slow
+// import). The swap is then refused, the target's copy is dropped, and the
+// placement stays on the source: one executor.
+func TestSnapshotMoveSourceTakesItBackDuringTheImport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, _, target, cleanup := snapshotMovePair(t, "ldr-snap-abort")
+	defer cleanup()
+	var abortErr error
+	target.duringImport = func() {
+		if c.fsm.moveHandoffToken("sb-vm") == "" {
+			abortErr = errors.New("no handoff open during the import")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		abortErr = c.AbortMoveHandoff(ctx, "sb-vm", "inc-sb-vm")
+	}
+	res, err := c.EvacuateNode(context.Background(), c.nodeID, EvacuateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if abortErr != nil {
+		t.Fatalf("the source's abort: %v", abortErr)
+	}
+	if len(res.Moved) != 0 {
+		t.Fatalf("pass = %+v: nothing may move once the source took it back", res)
+	}
+	if owner, err := c.OwnerOf("sb-vm"); err != nil || owner.NodeID != c.nodeID {
+		t.Fatalf("sb-vm owner = %+v %v, want the source", owner, err)
+	}
+	if got := strings.Join(target.calls, "; "); got != "import sb-vm from "+c.nodeID+"; drop sb-vm" {
+		t.Fatalf("target calls: %s", got)
+	}
+}
+
+// A moved sandbox's start that fails on the target, its agent restarting
+// say, is tried again; the move counts as done.
+func TestSnapshotMoveRetriesTheStartOnTheTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	old := moveStartRetryDelay
+	moveStartRetryDelay = 10 * time.Millisecond
+	t.Cleanup(func() { moveStartRetryDelay = old })
+	c, _, target, cleanup := snapshotMovePair(t, "ldr-snap-retry")
+	defer cleanup()
+	target.startErrs = []error{errors.New("agent restarting"), errors.New("agent restarting")}
+	res, err := c.EvacuateNode(context.Background(), c.nodeID, EvacuateRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.Moved, ",") != "sb-vm" {
+		t.Fatalf("pass = %+v", res)
+	}
+	if got := strings.Count(strings.Join(target.calls, "; "), "start sb-vm"); got != 3 {
+		t.Fatalf("starts on the target = %d, want 3: %v", got, target.calls)
+	}
+	// The import carried the recreate inputs a target stores (N4).
+	if rc := target.importRecreate; rc == nil || rc.Spec.Image != "alpine" {
+		t.Fatalf("the import's recreate inputs = %+v", rc)
+	}
+	if c.fsm.moveHandoffToken("sb-vm") != "" {
+		t.Fatal("the swap left its handoff open")
+	}
+
+	// Every try fails: still moved (the target starts it itself later).
+	c2, _, target2, cleanup2 := snapshotMovePair(t, "ldr-snap-retry2")
+	defer cleanup2()
+	target2.startErrs = []error{errors.New("down"), errors.New("down"), errors.New("down")}
+	res, err = c2.EvacuateNode(context.Background(), c2.nodeID, EvacuateRequest{})
+	if err != nil || strings.Join(res.Moved, ",") != "sb-vm" {
+		t.Fatalf("pass with every start failing = %+v %v", res, err)
+	}
+	if owner, _ := c2.OwnerOf("sb-vm"); owner.NodeID != "wkr-b" {
+		t.Fatalf("owner = %s, want wkr-b", owner.NodeID)
+	}
 }
 
 func placeFirecracker(t *testing.T, c *Cluster, id, owner string, spec models.CreateSandboxRequest) {
