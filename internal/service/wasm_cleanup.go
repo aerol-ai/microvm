@@ -78,15 +78,44 @@ func (s *Service) cleanupWasmSandboxArtifacts(ctx context.Context, sandbox *mode
 		return nil
 	}
 
-	// No pusher (durable AOCR push disabled — the common single-node / local
-	// case): there is no registry to leak into, so the tracking rows carry no
-	// recoverable obligation. Bulk-delete them as before.
+	// No pusher (durable AOCR push off). A node that never pushed has no push
+	// rows, so nothing is kept there. A node that pushed before its pusher was
+	// turned off still has those manifests in the registry, and these rows
+	// are the only record of them: deleting them here leaked the manifests
+	// for good. So a row that names a ref stays, under the same no-vacuum rule
+	// as above, and the orphan-ref sweep deletes the manifest and then the
+	// row once a pusher is configured again. The rolling :latest tags need no
+	// row: a delete removes a manifest by digest, with every tag on it.
 	if s.store != nil {
 		if err := s.store.DeleteAllWasmStateKV(ctx, sandbox.ID); err != nil {
 			return err
 		}
-		if err := s.store.DeleteAllWasmCheckpointPushes(ctx, sandbox.ID); err != nil {
+		pushes, err := s.store.ListWasmCheckpointPushes(ctx, sandbox.ID)
+		if err != nil {
 			return err
+		}
+		kept := 0
+		tracked := false
+		for _, p := range pushes {
+			ref := strings.TrimSpace(p.RegistryRef)
+			if ref == "" {
+				if err := s.store.DeleteWasmCheckpointPush(ctx, p.ID); err != nil {
+					return err
+				}
+				continue
+			}
+			kept++
+			tracked = tracked || ref == strings.TrimSpace(sandbox.WasmRegistryRef)
+		}
+		if ref := strings.TrimSpace(sandbox.WasmRegistryRef); ref != "" && !tracked {
+			if _, err := s.store.EnsureWasmCheckpointCleanupRef(ctx, sandbox.ID, ref); err != nil {
+				return err
+			}
+			kept++
+		}
+		if kept > 0 {
+			s.logger.Warn("wasm checkpoint manifests kept in the registry: no checkpoint pusher is configured to delete them; their rows stay until one is",
+				"sandbox_id", sandbox.ID, "refs", kept)
 		}
 	}
 	return nil

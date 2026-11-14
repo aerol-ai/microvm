@@ -208,7 +208,7 @@ with network policy turned on, or Calico or Cilium).
 | Another pod in the cluster reaches a worker | The worker ingress NetworkPolicy; mTLS on every node port |
 | A rogue pod joins the cluster | One-time join tokens, mounted only into the pod they are for and deleted after use; mTLS certificates per node |
 | A tampered or unsigned image | Signed images with SBOMs and provenance; the example admission policy refuses any AerolVM pod whose image the release workflow did not sign |
-| Someone deletes a worker pod by mistake | The operator's delete guard refuses it unless the pod is marked `aerolvm.io/force-delete=true`; the guard fails open, so a down operator never blocks repairs |
+| Someone deletes or drains a worker pod by mistake | The operator's delete guard refuses it, also mid-move, unless every sandbox has moved or the pod is marked `aerolvm.io/force-delete=true`; the guard fails open, so a down operator never blocks repairs. A PodDisruptionBudget holds drains and node group updates until the operator has moved the sandboxes |
 | The Kubernetes API is down | Sandboxes keep running and the API keeps answering: AerolVM's control plane is its own. Only changes to the layout wait |
 | Too many sandboxes for a machine | Every sandbox is capped inside the worker pod's own CPU and memory limit; one out-of-memory event ends one sandbox, never the worker |
 

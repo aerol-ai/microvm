@@ -1256,6 +1256,33 @@ func (s *Service) containerRuntimeForSandbox(sandbox *models.Sandbox) (runtime.C
 	return cr, nil
 }
 
+// runtimeListings holds one reconcile pass's listing from each runtime
+// driver on this node.
+type runtimeListings struct {
+	docker, containerd, firecracker, wasm, isolate map[string]*models.SandboxRuntimeState
+}
+
+// forSandbox is the listing a row is checked against: the one from the
+// driver that runs its runtime. Every non-OCI runtime is named here. One that
+// was not used to fall through to Docker's listing: an isolate row was
+// skipped whenever Docker was off or could not be listed, so a gone isolate
+// kept its row, its capacity and its routes for good. inDocker reports a
+// Docker-engine row, the only listing a pass can fail to read.
+func (l runtimeListings) forSandbox(sandbox *models.Sandbox) (listing map[string]*models.SandboxRuntimeState, inDocker bool) {
+	switch sandbox.Runtime {
+	case models.RuntimeFirecracker:
+		return l.firecracker, false
+	case models.RuntimeWasm:
+		return l.wasm, false
+	case models.RuntimeIsolate:
+		return l.isolate, false
+	}
+	if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd {
+		return l.containerd, false
+	}
+	return l.docker, true
+}
+
 func mergeManagedRuntimes(maps ...map[string]*models.SandboxRuntimeState) map[string]*models.SandboxRuntimeState {
 	total := 0
 	for _, m := range maps {
@@ -6819,46 +6846,48 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	// and no warning to give: Docker-owned rows (there should be none) are
 	// left alone, and the mount sweep still runs, since no Docker sandbox
 	// can hold a mount here.
-	dockerManaged := map[string]*models.SandboxRuntimeState{}
+	listings := runtimeListings{
+		docker:      map[string]*models.SandboxRuntimeState{},
+		containerd:  map[string]*models.SandboxRuntimeState{},
+		firecracker: map[string]*models.SandboxRuntimeState{},
+		wasm:        map[string]*models.SandboxRuntimeState{},
+		isolate:     map[string]*models.SandboxRuntimeState{},
+	}
 	dockerListed := false
 	if !s.cfg.DockerDisabled {
 		m, dockerErr := s.docker.ListManaged(ctx)
 		dockerListed = dockerErr == nil
 		if dockerListed {
-			dockerManaged = m
+			listings.docker = m
 		} else {
 			s.logger.Warn("reconcile: docker listing failed; leaving docker-owned sandboxes and mounts for the next pass", "error", dockerErr)
 		}
 	}
-	containerdManaged := map[string]*models.SandboxRuntimeState{}
 	if s.containerd != nil {
-		containerdManaged, err = s.containerd.ListManaged(ctx)
+		listings.containerd, err = s.containerd.ListManaged(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	firecrackerManaged := map[string]*models.SandboxRuntimeState{}
 	if s.firecracker != nil {
-		firecrackerManaged, err = s.firecracker.ListManaged(ctx)
+		listings.firecracker, err = s.firecracker.ListManaged(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	wasmManaged := map[string]*models.SandboxRuntimeState{}
 	if s.wasm != nil {
-		wasmManaged, err = s.wasm.ListManaged(ctx)
+		listings.wasm, err = s.wasm.ListManaged(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	isolateManaged := map[string]*models.SandboxRuntimeState{}
 	if s.isolate != nil {
-		isolateManaged, err = s.isolate.ListManaged(ctx)
+		listings.isolate, err = s.isolate.ListManaged(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	managed := mergeManagedRuntimes(dockerManaged, containerdManaged, firecrackerManaged, wasmManaged, isolateManaged)
+	managed := mergeManagedRuntimes(listings.docker, listings.containerd, listings.firecracker, listings.wasm, listings.isolate)
 
 	s.reconcileLocalClusterOwnership(ctx, known, managed)
 
@@ -6870,16 +6899,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
-		runtimeManaged, inDocker := dockerManaged, true
-		if models.SandboxEngine(sandbox) == models.ContainerEngineContainerd {
-			runtimeManaged, inDocker = containerdManaged, false
-		}
-		if s.isFirecrackerSandbox(sandbox) {
-			runtimeManaged, inDocker = firecrackerManaged, false
-		}
-		if s.isWasmSandbox(sandbox) {
-			runtimeManaged, inDocker = wasmManaged, false
-		}
+		runtimeManaged, inDocker := listings.forSandbox(sandbox)
 		if inDocker && !dockerListed {
 			continue
 		}
@@ -6975,7 +6995,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
 			}
-			if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) {
+			if s.isFirecrackerSandbox(sandbox) || s.isWasmSandbox(sandbox) || s.isIsolateSandbox(sandbox) {
 				rt, err := s.runtimeForSandbox(sandbox)
 				if err != nil {
 					return err
@@ -7319,20 +7339,20 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		}
 	}
 	if dockerListed {
-		removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, dockerManaged)
+		removeOrphans(s.docker, models.RuntimeDocker, models.ContainerEngineDocker, listings.docker)
 	}
 	if s.containerd != nil {
 		// containerd is the default engine on clusters. finalizeStaleLocalSandbox
 		// deletes the row before runtime Destroy and names this sweep as the
 		// retry anchor for a failed Destroy, so an engine missing here leaks
 		// its instance forever after one transient failure.
-		removeOrphans(s.containerd, models.RuntimeDocker, models.ContainerEngineContainerd, containerdManaged)
+		removeOrphans(s.containerd, models.RuntimeDocker, models.ContainerEngineContainerd, listings.containerd)
 	}
 	if s.firecracker != nil {
-		removeOrphans(s.firecracker, models.RuntimeFirecracker, "", firecrackerManaged)
+		removeOrphans(s.firecracker, models.RuntimeFirecracker, "", listings.firecracker)
 	}
 	if s.wasm != nil {
-		removeOrphans(s.wasm, models.RuntimeWasm, "", wasmManaged)
+		removeOrphans(s.wasm, models.RuntimeWasm, "", listings.wasm)
 	}
 	if s.isolate != nil {
 		// Isolate leaks more than a process: a jailed group owns a cgroup and a
@@ -7345,7 +7365,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		// finalizeStaleLocalSandbox case that names this sweep as its retry
 		// anchor. Leaks across a restart are swept once at boot, before any
 		// spawn (pkg/isolate.SweepLeftovers, after AdoptHosts).
-		removeOrphans(s.isolate, models.RuntimeIsolate, "", isolateManaged)
+		removeOrphans(s.isolate, models.RuntimeIsolate, "", listings.isolate)
 	}
 
 	// Zombie caddy entry sweep. The destroyed-sandbox loop above already
