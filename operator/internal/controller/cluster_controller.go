@@ -65,6 +65,13 @@ type ClusterReconciler struct {
 	API      APIFactory
 	// WorkerNamespace holds the worker pods.
 	WorkerNamespace string
+	// Templates is the chart's pod-templates ConfigMap, in the cluster's
+	// namespace: the worker template says whether workers take the deny
+	// floor, and their sandbox range.
+	Templates string
+	// Reader reads past the manager's cache: the API server's Service and
+	// addresses live in default (syncEgressFloor). Nil uses the client.
+	Reader client.Reader
 	// Now is the clock; tests replace it.
 	Now func() time.Time
 }
@@ -105,6 +112,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if err := r.syncFederationKey(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.syncEgressFloor(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
 	nodes, err := listNodes(ctx, r.Client, &c)
@@ -746,6 +756,50 @@ func (r *ClusterReconciler) syncFederationKey(ctx context.Context, c *v1.AerolCl
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
 		dst.Labels = clusterLabels(c)
 		dst.Data = map[string][]byte{FederationKeyKey: src.Data[FederationKeyKey]}
+		return nil
+	})
+	return err
+}
+
+// syncEgressFloor keeps the API server's current addresses in the worker
+// namespace's deny-floor ConfigMap, which every worker pod mounts and
+// sandboxd watches (review R4; egress.go). One read past the cache per pass,
+// and a write only when the addresses changed. A read that fails changes
+// nothing: the last good addresses stay on every worker's floor, and while
+// there are none yet, new worker pods wait for the ConfigMap.
+func (r *ClusterReconciler) syncEgressFloor(ctx context.Context, c *v1.AerolCluster) error {
+	ns := r.WorkerNamespace
+	if ns == "" {
+		ns = c.Namespace
+	}
+	if r.Templates == "" {
+		return nil
+	}
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: r.Templates}, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	tpl, err := ParsePodTemplate(cm.Data[TemplateWorker])
+	if err != nil || !usesEgressRanges(&tpl.Spec) {
+		// No worker template to read, or workers without the host
+		// firewall: no worker mounts the file (useEgressFloorFile).
+		return nil
+	}
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
+	found, err := readDenyFloor(ctx, reader)
+	if err != nil {
+		egressFloorReadErrors.Inc()
+		log.FromContext(ctx).Info("cannot read the API server's addresses; the workers keep the last ones", "error", err.Error())
+		return nil
+	}
+	body := strings.Join(floorFor(&tpl.Spec, found), "\n") + "\n"
+	dst := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: EgressFloorConfigMap(c.Name), Namespace: ns}}
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Data = map[string]string{EgressFloorKey: body}
 		return nil
 	})
 	return err

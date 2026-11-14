@@ -333,6 +333,12 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 		r.setState(n, v1.StateFailed, err.Error())
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
+	if n.Spec.Role == v1.RoleWorker && usesEgressRanges(&pod.Spec) && in.Addresses.FloorErr != nil {
+		// Fail closed (review R4): a worker made now would start without
+		// the API server on its deny floor.
+		r.setState(n, v1.StatePending, "waiting to read the API server's addresses for the deny floor: "+in.Addresses.FloorErr.Error())
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
 	if ns == n.Namespace {
 		if err := controllerutil.SetControllerReference(n, pod, r.Scheme); err != nil {
 			return ctrl.Result{}, err

@@ -228,6 +228,11 @@ var blockPrivateNoPolicy atomic.Bool
 // entry sandboxd enforces for every other runtime would open it for WASM
 // alone. sandboxd checked the same value at boot and wrote it back in a
 // form that parses, so this does not happen in practice.
+//
+// The deny-floor file (review R4) can change while the worker runs, so the
+// worker watches it, on the operator file's clock, for its whole life. Its
+// dial checks read the extra floor at each dial, so a new address is
+// refused from the next one on.
 func loadWorkerGuards() error {
 	loadNodeAllowedPorts()
 	on, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(egresspolicy.BlockPrivateEnv)))
@@ -235,8 +240,18 @@ func loadWorkerGuards() error {
 	if err := egresspolicy.LoadRangesFromEnv(); err != nil {
 		return fmt.Errorf("wasm worker: %w", err)
 	}
+	if path := strings.TrimSpace(os.Getenv(egresspolicy.FloorFileEnv)); path != "" {
+		floorWatchOnce.Do(func() {
+			// No logger, as for the operator file: sandboxd watches the
+			// same file and logs a bad one once per node.
+			go egresspolicy.WatchFloorFile(context.Background(), path, operatorPoll, nil, nil)
+		})
+	}
 	return nil
 }
+
+// floorWatchOnce starts one floor-file watch per worker process.
+var floorWatchOnce sync.Once
 
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
 	m.mu.RLock()

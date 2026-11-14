@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -74,5 +75,41 @@ func TestWireEgressOperatorIsolateGuard(t *testing.T) {
 	g := pkgisolate.EgressDialGuard()
 	if err := g.Check(nil, egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("203.0.113.9:443")}); err == nil || !g.Strict {
 		t.Fatalf("isolate must refuse the operator floor and stay strict: %v", err)
+	}
+}
+
+// TestWireEgressFloorFile (review R4): unset is a no-op; set, a change to
+// the file reaches isolate's dial guard and the host firewall while
+// sandboxd runs.
+func TestWireEgressFloorFile(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	wireEgressFloorFile(context.Background(), config.Config{}, nil, log)
+
+	prev := egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetFileFloor(prev) })
+	prevPoll := floorFilePoll
+	floorFilePoll = 5 * time.Millisecond
+	t.Cleanup(func() { floorFilePoll = prevPoll })
+	path := filepath.Join(t.TempDir(), "deny-floor")
+	if err := os.WriteFile(path, []byte("172.18.0.2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	svc := service.New(config.Config{}, log, nil, nil, nil, nil, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wireEgressFloorFile(ctx, config.Config{EgressDenyFloorFile: path}, svc, log)
+	if err := os.WriteFile(path+".new", []byte("172.18.0.44\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	target := egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("172.18.0.44:443")}
+	deadline := time.Now().Add(5 * time.Second)
+	for pkgisolate.EgressDialGuard().Check(nil, target) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("isolate still dials the API server's new address")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

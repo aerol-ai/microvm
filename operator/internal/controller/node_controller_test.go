@@ -38,10 +38,19 @@ func newNodeRig(t *testing.T, c *v1.AerolCluster, objs ...client.Object) *nodeRi
 	// A server's data claim, as the cluster controller makes it before the
 	// server's AerolNode (ensurePVC), unless the test brings its own.
 	claims := map[string]bool{}
+	apiServer := false
 	for _, o := range objs {
 		if pvc, ok := o.(*corev1.PersistentVolumeClaim); ok {
 			claims[pvc.Name] = true
 		}
+		if svc, ok := o.(*corev1.Service); ok && svc.Namespace == "default" && svc.Name == "kubernetes" {
+			apiServer = true
+		}
+	}
+	// The API server's Service and addresses, which every cluster has: a
+	// worker is not made without them on its deny floor (review R4).
+	if !apiServer {
+		all = append(all, apiServerObjects()...)
 	}
 	for _, o := range objs {
 		if n, ok := o.(*v1.AerolNode); ok && n.Spec.Role == v1.RoleServer && !claims[PVCName(n.Name)] {

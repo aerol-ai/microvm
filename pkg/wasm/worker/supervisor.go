@@ -77,6 +77,8 @@ func workerEnvironment() []string {
 		// sandbox reach what the host firewall keeps every container
 		// sandbox from.
 		egresspolicy.BlockPrivateEnv: {}, egresspolicy.DenyFloorEnv: {}, egresspolicy.PrivateRangesEnv: {},
+		// The deny-floor file, which the worker watches (review R4).
+		egresspolicy.FloorFileEnv: {},
 	}
 	out := make([]string, 0, len(allowed))
 	for _, entry := range os.Environ() {
