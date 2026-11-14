@@ -247,7 +247,10 @@ proof_review() {
   else bad "R12: deleting $Wd while it is $s: $(head -c 240 <<<"$out")"; fi
   wait "$dpid"
   local evicts dexit
-  evicts=$(grep -c "disruption budget\|Too Many Requests" /root/drain.log)
+  # A refusal comes from the eviction guard (it runs first, as a validating
+  # webhook on pods/eviction) or, without it, from the budget.
+  evicts=$(grep -c "will retry after" /root/drain.log)
+  say "worker budget: $($kw get pdb -o jsonpath='{range .items[*]}{.metadata.name} maxUnavailable={.spec.maxUnavailable} allowed={.status.disruptionsAllowed}{"\n"}{end}' | tr '\n' ' ')"
   dexit=$(sed -n 's/^exit=//p' /root/drain.log)
   grep -E 'evict|drain|error|exit=' /root/drain.log | sort | uniq -c | sort -rn | head -6 | cut -c1-240 | sed 's/^/FCK   drain: /'
   local Dto
@@ -264,9 +267,13 @@ proof_review() {
   # ---- R2: an ended pod is replaced ----
   say "== R2: a Failed worker pod"
   local W2 uid2 r2=""
-  # One with no sandboxes; the drain's replacement joins meanwhile.
+  # One that owns none of this run's sandboxes, asked of the cluster: the
+  # AerolNode's count is written at most once a minute. The drain's
+  # replacement joins meanwhile.
+  local busy
+  busy="$(owner "$F") $(owner "$D")"
   for i in $(seq 1 36); do
-    W2=$($kc get aerolnodes -o json | jq -r '[.items[] | select(.spec.role == "worker" and .status.state == "Serving" and ((.status.sandboxes // 0) == 0))][0].metadata.name // empty')
+    W2=$($kc get aerolnodes -o json | jq -r --arg busy " $busy " '[.items[] | select(.spec.role == "worker" and .status.state == "Serving" and ($busy | contains(" " + .metadata.name + " ") | not))][0].metadata.name // empty')
     [ -n "$W2" ] && break
     sleep 5
   done
@@ -412,6 +419,8 @@ print(int((p("deadline") - p("startedAt")).total_seconds()), int((p("drainUntil"
   local tw
   tw=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   docker unpause "$No" >/dev/null && say "unpaused machine $No after $(( $(date +%s) - t0 ))s"
+  local twoke
+  twoke=$(date +%s)
   sleep 60
   say "supervisor on $Wo: $($kw logs "$Wo" -c runtime --since-time="$tw" 2>/dev/null | grep -E 'lease ran out|thawed|could not freeze' | cut -c1-260 | tr '\n' ' ')"
   say "agent on $Wo: $($kw logs "$Wo" -c agent --since-time="$tw" 2>/dev/null | grep -F "$O" | grep -v 'request complete' | tail -4 | cut -c1-260 | tr '\n' ' ')"
@@ -429,6 +438,17 @@ print(int((p("deadline") - p("startedAt")).total_seconds()), int((p("drainUntil"
     esac
   else
     say "INFO R1: no fence entry was found for $O, so its group cannot be named"
+  fi
+  # Then sandboxd removes the copy, whose placement is elsewhere, on its
+  # next stale-ownership pass (SB_RECONCILE_INTERVAL, 5 minutes).
+  if [ -n "$oref" ]; then
+    for i in $(seq 1 45); do
+      grp=$(grpstate "$Wo" "$oref")
+      [ "$grp" = gone ] && break
+      sleep 10
+    done
+    [ "$grp" = gone ] && ok "R14: sandboxd on $Wo removed the old copy $(( $(date +%s) - twoke ))s after its machine woke" ||
+      bad "R14: the old copy on $Wo is still there $(( $(date +%s) - twoke ))s after its machine woke: $grp"
   fi
 
   # Put things back.
