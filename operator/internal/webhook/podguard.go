@@ -22,10 +22,15 @@ import (
 // So the guard refuses it, unless:
 //
 //   - the operator itself asks (its decommission and its cleanup);
-//   - the pod's AerolNode is decommissioning, removed or gone;
+//   - the pod's AerolNode is removed, dead, failed or gone, or its
+//     decommission finished moving its sandboxes;
 //   - the pod is not running (never started, or already failed);
 //   - a person set aerolvm.io/force-delete=true on the pod. That delete is
 //     logged here, with who asked, and the API server's audit log has it too.
+//
+// A node that is draining or decommissioning is not enough: its sandboxes
+// are still moving, and the operator deletes the pod itself once they have
+// moved or stopped.
 //
 // The webhook is registered with failurePolicy: Ignore, so an operator
 // outage never blocks a cluster repair; the "worker pod lost without a
@@ -91,16 +96,26 @@ func (g *PodGuard) decide(ctx context.Context, pod *corev1.Pod, user string) (bo
 		return true, "its AerolNode is being deleted"
 	}
 	switch n.Status.State {
-	case v1.StateDecommissioning, v1.StateRemoved, v1.StateDead, v1.StateFailed:
+	case v1.StateRemoved, v1.StateDead, v1.StateFailed:
 		return true, "its node is " + n.Status.State
 	}
-	if n.Annotations[v1.AnnotationDecommission] == "true" && n.Status.Decommission != nil && n.Status.Decommission.Remaining == 0 && n.Status.Decommission.Moved > 0 {
+	d := n.Status.Decommission
+	if n.Annotations[v1.AnnotationDecommission] == "true" && d != nil && d.Remaining == 0 && d.Moved > 0 {
 		return true, "decommissioned"
 	}
+	force := fmt.Sprintf("kubectl annotate pod %s %s=true -n %s", pod.Name, v1.AnnotationForceDelete, pod.Namespace)
+	if n.Status.State == v1.StateDraining || n.Status.State == v1.StateDecommissioning {
+		left := fmt.Sprintf("%d sandboxes on it", n.Status.Sandboxes)
+		if d != nil && (d.Moved > 0 || d.Remaining > 0) {
+			left = fmt.Sprintf("%d moved, %d left", d.Moved, d.Remaining)
+		}
+		return false, fmt.Sprintf("worker pod %s is still being decommissioned (%s: %s); the operator deletes it once the rest "+
+			"have moved or stopped. To delete it now anyway, ending what is left: %s",
+			pod.Name, n.Status.State, left, force)
+	}
 	return false, fmt.Sprintf("worker pod %s runs sandboxes (%d) and is not decommissioned; deleting it ends them all. "+
-		"Decommission it (kubectl annotate aerolnode %s %s=true -n %s) or, to delete it anyway, "+
-		"kubectl annotate pod %s %s=true -n %s",
-		pod.Name, n.Status.Sandboxes, name, v1.AnnotationDecommission, g.Namespace, pod.Name, v1.AnnotationForceDelete, pod.Namespace)
+		"Decommission it (kubectl annotate aerolnode %s %s=true -n %s) or, to delete it anyway, %s",
+		pod.Name, n.Status.Sandboxes, name, v1.AnnotationDecommission, g.Namespace, force)
 }
 
 var _ admission.Handler = (*PodGuard)(nil)

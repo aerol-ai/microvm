@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -55,13 +56,19 @@ func TestPodGuard(t *testing.T) {
 	utilruntime.Must(v1.AddToScheme(s))
 	objs := []client.Object{
 		aerolNode("w-live", v1.StateServing, false),
-		aerolNode("w-decom", v1.StateDecommissioning, false),
+		aerolNode("w-draining", v1.StateDraining, false),
 		aerolNode("w-gc", v1.StateServing, true),
+		aerolNode("w-removed", v1.StateRemoved, false),
+		aerolNode("w-dead", v1.StateDead, false),
+		aerolNode("w-failed", v1.StateFailed, false),
 	}
-	done := aerolNode("w-done", v1.StateServing, false)
+	moving := aerolNode("w-moving", v1.StateDecommissioning, false)
+	moving.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	moving.Status.Decommission = &v1.DecommissionStatus{Moved: 8, Remaining: 100}
+	done := aerolNode("w-done", v1.StateDecommissioning, false)
 	done.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
 	done.Status.Decommission = &v1.DecommissionStatus{Moved: 3}
-	objs = append(objs, done)
+	objs = append(objs, moving, done)
 	g := &PodGuard{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build(),
 		OperatorUser: "system:serviceaccount:aerolvm-system:aerolvm-operator", Namespace: ns}
 	cases := []struct {
@@ -75,8 +82,16 @@ func TestPodGuard(t *testing.T) {
 		{"the operator", admissionv1.Delete, workerPod("w-live", corev1.PodRunning, nil), "system:serviceaccount:aerolvm-system:aerolvm-operator", true},
 		{"forced, and recorded", admissionv1.Delete, workerPod("w-live", corev1.PodRunning, map[string]string{v1.AnnotationForceDelete: "true"}), "alice", true},
 		{"not running", admissionv1.Delete, workerPod("w-live", corev1.PodPending, nil), "alice", true},
-		{"its node is decommissioning", admissionv1.Delete, workerPod("w-decom", corev1.PodRunning, nil), "alice", true},
-		{"decommissioned", admissionv1.Delete, workerPod("w-done", corev1.PodRunning, nil), "alice", true},
+		// Decommissioning means the sandboxes are still moving: a plain
+		// delete would end the ones left (R12).
+		{"its node is decommissioning, sandboxes left: refused", admissionv1.Delete, workerPod("w-moving", corev1.PodRunning, nil), "alice", false},
+		{"its node is draining: refused", admissionv1.Delete, workerPod("w-draining", corev1.PodRunning, nil), "alice", false},
+		{"decommissioning, by the operator", admissionv1.Delete, workerPod("w-moving", corev1.PodRunning, nil), "system:serviceaccount:aerolvm-system:aerolvm-operator", true},
+		{"decommissioning, forced", admissionv1.Delete, workerPod("w-moving", corev1.PodRunning, map[string]string{v1.AnnotationForceDelete: "true"}), "alice", true},
+		{"decommissioned: every sandbox moved", admissionv1.Delete, workerPod("w-done", corev1.PodRunning, nil), "alice", true},
+		{"its node is removed", admissionv1.Delete, workerPod("w-removed", corev1.PodRunning, nil), "alice", true},
+		{"its node is dead", admissionv1.Delete, workerPod("w-dead", corev1.PodRunning, nil), "alice", true},
+		{"its node failed", admissionv1.Delete, workerPod("w-failed", corev1.PodRunning, nil), "alice", true},
 		{"the garbage collector, its AerolNode going", admissionv1.Delete, workerPod("w-gc", corev1.PodRunning, nil), gcUser, true},
 		{"no AerolNode", admissionv1.Delete, workerPod("w-none", corev1.PodRunning, nil), "alice", true},
 		{"not a worker pod", admissionv1.Delete, func() *corev1.Pod {
@@ -100,5 +115,27 @@ func TestPodGuard(t *testing.T) {
 	bad := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Operation: admissionv1.Delete, OldObject: runtime.RawExtension{Raw: []byte("{")}}}
 	if !g.Handle(context.Background(), bad).Allowed {
 		t.Fatal("an unreadable pod must fail open")
+	}
+}
+
+// A plain delete while a decommission is still moving sandboxes is refused,
+// and the refusal says how far the move got and how to force it (R12).
+func TestPodGuardRefusesDeleteDuringEvacuation(t *testing.T) {
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(v1.AddToScheme(s))
+	n := aerolNode("worker-mid-move", v1.StateDecommissioning, false)
+	n.Status.Sandboxes = 100
+	n.Status.Decommission = &v1.DecommissionStatus{Moved: 8, Remaining: 100}
+	g := &PodGuard{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(n).Build(), Namespace: ns,
+		OperatorUser: "system:serviceaccount:aerolvm-system:aerolvm-operator"}
+	resp := g.Handle(context.Background(), request(t, admissionv1.Delete, workerPod(n.Name, corev1.PodRunning, nil), "alice"))
+	if resp.Allowed {
+		t.Fatalf("plain delete accepted with 100 sandboxes still on a decommissioning worker: %s", resp.Result.Message)
+	}
+	for _, want := range []string{"8 moved, 100 left", v1.AnnotationForceDelete} {
+		if !strings.Contains(resp.Result.Message, want) {
+			t.Errorf("refusal %q does not say %q", resp.Result.Message, want)
+		}
 	}
 }
