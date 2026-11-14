@@ -334,6 +334,20 @@ apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
 metadata: { name: quick-pool, namespace: dev }
 spec: { replicas: 1, sandboxTemplateRef: { name: quick } }
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata: { name: plain, namespace: dev }
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - { name: main, image: "alpine:3.19" }
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata: { name: plain-pool, namespace: dev }
+spec: { replicas: 1, sandboxTemplateRef: { name: plain } }
 YAML
 )"
   # What a worker is running with, and what it reports.
@@ -345,13 +359,20 @@ YAML
   say "warm worker metrics: HTTP $(curl -s -m 5 -o /root/wm.txt -w '%{http_code}' -H "Authorization: Bearer $tok" http://127.0.0.1:$port/v1/metrics); $(grep -E '^aerolvm_containerd_pool_(parked|hits_total|misses_total|spawn_fails_total)' /root/wm.txt | tr '\n' ' ')"
   kill $pf 2>/dev/null; wait $pf 2>/dev/null
   $kw logs "$w0" -c agent 2>&1 | grep -iE 'warm|park|pool' | tail -6 | cut -c1-260 | sed "s|^|FCK   warm log: |"
-  local parked=0
+  # Two pools, one of them a template with no runtimeClassName: before,
+  # that one made the gateway's set invalid, and neither pool parked
+  # anything. Now every worker parks one slot of each.
+  local parked=0 nw
+  nw=$($kw get pods -l app.kubernetes.io/component=worker -o name | wc -l)
   for i in $(seq 1 24); do
     parked=$(pool_metric aerolvm_containerd_pool_parked)
-    [ "$parked" -ge 1 ] && break
+    [ "$parked" -ge $((2 * nw)) ] && break
     sleep 10
   done
-  say "warm: $parked slots parked on the workers after $((i * 10))s"
+  say "warm: $parked slots parked on the $nw workers after $((i * 10))s (want $((2 * nw)): two pools, one slot each per worker)"
+  for g in $($kc get pods -l app.kubernetes.io/component=gateway -o name | head -1); do
+    $kc logs $g -c agent 2>&1 | grep -iE 'agent-sandbox warm pools' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${g#pod/}: |"
+  done
   local before after t0
   before=$(pool_metric aerolvm_containerd_pool_hits_total)
   t0=$(date +%s%N)
@@ -368,6 +389,43 @@ YAML
   say "warm claim ready in $(( ($(date +%s%N) - t0) / 1000000 )) ms (with kubectl's own round trips)"
   after=$(pool_metric aerolvm_containerd_pool_hits_total)
   $kw logs "$w0" -c agent 2>&1 | grep -iE 'warm|park|pool' | tail -6 | cut -c1-260 | sed "s|^|FCK   warm log after: |"
+  # A claim on the template with no runtimeClassName takes a parked slot
+  # too.
+  local before2 after2
+  before2=$after
+  say "warm claim, no runtimeClassName: $($kk apply -f - 2>&1 <<'YAML' | tr '\n' ' '
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata: { name: plain-claim, namespace: dev }
+spec:
+  warmPoolRef: { name: plain-pool }
+YAML
+)"
+  $kk -n dev wait --for=condition=Ready sandboxclaim/plain-claim --timeout=120s 2>&1 | sed 's/^/FCK wait plain claim: /'
+  after2=$(pool_metric aerolvm_containerd_pool_hits_total)
+  if [ "$parked" -ge $((2 * nw)) ] && [ "$after2" -gt "$before2" ]; then
+    say "RESULT PASS: warm pool, no runtimeClassName: both pools parked ($parked slots) and its claim took one (hits $before2 -> $after2)"
+  else
+    say "RESULT FAIL: warm pool, no runtimeClassName: parked $parked of $((2 * nw)), pool hits $before2 -> $after2"
+  fi
+  $kk -n dev delete sandboxclaim plain-claim --timeout=120s >/dev/null 2>&1
+  # A named pipe in a sandbox: download and upload are refused at once
+  # (409), never waited on (toolboxd's openFile).
+  local gp=21295 gpf sid fo
+  $kc port-forward svc/aerolvm-gateway $gp:21212 >/dev/null 2>&1 & gpf=$!
+  sleep 3
+  gapi() { curl -sS -m 30 -H "Authorization: Bearer $tok" "$@"; }
+  sid=$(gapi -X POST -H 'Content-Type: application/json' http://127.0.0.1:$gp/v1/sandboxes -d '{"image":"alpine:3.20"}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+  fo=$(gapi -X POST -H 'Content-Type: application/json' http://127.0.0.1:$gp/v1/sandboxes/$sid/toolbox/process/execute -d '{"command":"mkfifo /tmp/pipe && ls -l /tmp/pipe"}' | head -c 200)
+  local dl ul t1
+  t1=$(date +%s)
+  dl=$(gapi -o /root/fifo-dl.txt -w '%{http_code}' "http://127.0.0.1:$gp/v1/sandboxes/$sid/toolbox/files/download?path=/tmp/pipe")
+  ul=$(gapi -o /root/fifo-ul.txt -w '%{http_code}' -F path=/tmp/pipe -F file=@/etc/hostname "http://127.0.0.1:$gp/v1/sandboxes/$sid/toolbox/files/upload")
+  say "named pipe in sandbox $sid ($fo): download HTTP $dl $(head -c 160 /root/fifo-dl.txt), upload HTTP $ul $(head -c 160 /root/fifo-ul.txt), in $(( $(date +%s) - t1 ))s"
+  if [ "$dl" = 409 ] && [ "$ul" = 409 ]; then say "RESULT PASS: named pipe: download and upload refused with 409, not waited on"
+  else say "RESULT FAIL: named pipe: download $dl, upload $ul"; fi
+  gapi -X DELETE http://127.0.0.1:$gp/v1/sandboxes/$sid >/dev/null 2>&1
+  kill $gpf 2>/dev/null
   if [ "$parked" -ge 1 ] && [ "$after" -gt "$before" ]; then
     say "RESULT PASS: warm pool: the claim took a parked slot (pool hits $before -> $after)"
   else
