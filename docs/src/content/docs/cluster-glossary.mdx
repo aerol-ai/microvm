@@ -1,35 +1,48 @@
 ---
 title: Glossary
-description: Plain meanings of cluster words, plus the main settings on each node and what they do.
+description: Plain meanings of cluster words, and the settings on each node with their defaults.
 ---
 
-This page explains the words you see in cluster logs and docs. It also lists the settings on each node. Use it to read logs, fix problems, or change settings that Terraform sets for you.
+This page explains the words you see in cluster logs and docs. It also lists the settings on each node, with their defaults. Use it to read logs, fix problems, or change a setting that Terraform set for you.
+
+`sandboxd` is the AerolVM program on each node.
 
 ## Words you will see
 
+Words in code font, such as `raft`, come straight from logs and setting names.
+
 | Word | What it means |
 |---|---|
-| Cluster | A group of AerolVM servers that work together as one system. |
-| Node | One server in the cluster. |
-| Seed | The first node. It starts the cluster, and every other node joins it. |
+| Cluster | A group of machines that work together like one AerolVM server. |
+| Node | One machine in the cluster. A machine becomes a node when it joins. |
+| Seed | The first node: the one where you ran `init`. It starts the cluster. The guides call it node 1. |
 | Role | The jobs a node does: `server`, `worker`, `ingress`, or all three (`mixed`). |
-| Placement map | The shared record of which sandbox lives on which node. |
-| Owner | The node a sandbox runs on. Requests for that sandbox are forwarded to it. |
-| Raft | The method server nodes use to agree on every change to the placement map. |
-| Voter | A server node that votes on changes in Raft. |
-| Leader | The one voter that makes changes at a time. If it fails, the voters pick a new one. |
-| Quorum | A majority of voters. Changes go through only while a quorum is online. |
-| Gossip | A light protocol (it uses one called SWIM) that every node uses to find the others and share its free space. |
-| Ingress | Traffic coming in from the internet, and the nodes that receive it. |
-| Drain | Mark a node so it gets no new sandboxes. Sandboxes already on it keep running. |
-| Orphaned | A sandbox whose owner died. Normal sandboxes then return `410 Gone`. |
-| PAT token | The shared access token (`SB_PAT_TOKEN`) that operators, SDKs and nodes use. |
+| Placement map | The shared record of which sandbox runs on which node. |
+| Owner | The node a sandbox runs on. Requests for that sandbox are passed to it. |
+| Cluster change | A change every node must agree on, such as adding a node, or choosing the node for a sandbox. |
+| Voter | A server or mixed node that votes on cluster changes. |
+| Non-voter | A server or mixed node past the voter cap. It gets every change, but it does not vote. |
+| Majority | More than half of the voters. A change goes through only while a majority is up. |
+| Leader | The one voter that writes down each change. If it fails, the voters pick a new one. |
+| `raft` | The method server nodes use to agree on each change to the placement map. Each change needs a majority. Settings named `SB_RAFT_*` belong to it. |
+| `quorum` | The word logs and `sandboxd recover-quorum` use for a majority of the voters. |
+| `gossip` | How every node finds the other nodes. Each node also tells the others its free CPU, memory and GPUs. Settings named `SB_GOSSIP_*` belong to it. The method's name is `SWIM`. |
+| `mTLS` | Both nodes show their node certificate before they talk. Logs use this word for traffic between nodes. |
+| Node certificate | A node's signed ID card. Nodes show it to each other before they talk. |
+| Join token | A short secret that lets one machine join the cluster. |
+| Join command | The command that uses a join token. `aerolvm join-command` prints it. |
+| Ingress | Traffic coming in from the internet, and the nodes that take it. |
+| Cordon | Mark a node so no new sandboxes start on it. Sandboxes already on it keep running. |
+| Drain | Cordon a node, then wait until it runs no sandboxes. |
+| Failover | An option on a sandbox, `failover.policy="recreate"`. If its node dies, the sandbox is rebuilt on a healthy node. |
+| Orphaned | A sandbox whose node died, without failover. It returns `410 Gone`. |
+| Admin token | The cluster's password for apps and admins. `--pat-token` and `SB_PAT_TOKEN` hold it. Worker and ingress nodes that joined with a join command keep only its hash (`SB_PAT_TOKEN_SHA256`). A **hash** is a fingerprint that checks the token but cannot rebuild it. |
 
 ## Node roles
 
 Each node's role decides what it does.
 
-| Role | Votes in Raft | Runs sandboxes | Takes public traffic |
+| Role | Votes | Runs sandboxes | Takes public traffic |
 |---|---|---|---|
 | `mixed` | Yes | Yes | Yes |
 | `server` | Yes | No | No |
@@ -39,151 +52,163 @@ Each node's role decides what it does.
 | `server,ingress` | Yes | No | Yes |
 | `worker,ingress` | No | Yes | Yes |
 
-**Raft** keeps every server node in agreement on which sandbox lives where. Nodes with `server` in their role (or `mixed`) vote. A majority of voters must be online to make changes. Worker and ingress nodes do not join Raft at all. They can run sandboxes and forward traffic without changing that majority.
+Nodes with `server` in their role, or `mixed`, keep the cluster's records. They vote on each change. A majority of the voters must be up to make changes. Worker and ingress nodes do not vote, and do not keep the cluster's records. They ask the server nodes for what they need. So you can add them without changing the majority.
 
-**Gossip** is how every node, whatever its role, finds the others. Nodes also use it to share changes when a node joins or leaves.
+Every node finds the others the same way, whatever its role. Nodes also tell each other when a node joins or leaves.
 
 For when to use each role, see [Ingress nodes](/cluster-ingress/).
 
 ## How many voting nodes you need
 
-| Voting nodes | Can lose | Notes |
+| Voters | How many can die | Notes |
 |---|---|---|
 | 1 | 0 | Testing only. |
-| 2 | 0 | Avoid. It has the same safety as 1 voter, but both must agree. |
-| 3 | 1 | The minimum for production. |
+| 2 | 0 | Avoid. It is no safer than 1 voter, and both must agree. |
+| 3 | 1 | The smallest number for production. |
 | 5 | 2 | Good when nodes are spread across availability zones (separate data centers). |
-| 7 | 3 | Little extra gain, and each change takes more work to copy. |
+| 7 | 3 | Little extra gain. Each change takes more work to copy. Needs `SB_CLUSTER_MAX_AUTO_VOTERS` set to `7` or `0`. |
 
-Always use an **odd number** of voting nodes. An even number raises the majority you need without letting you lose more nodes.
+Use an **odd number** of voters. An even number raises the majority you need. It does not let you lose more nodes.
 
-`SB_CLUSTER_MAX_AUTO_VOTERS` caps how many server nodes become voters on their own. The default cap is `5`. Server nodes past the cap join as **non-voters**: they still get every change, but they do not count toward the majority.
+`SB_CLUSTER_MAX_AUTO_VOTERS` caps how many server nodes vote. The default cap is `5`. Server nodes past the cap join as **non-voters**. They get every change, but their votes do not count toward the majority.
 
 ## Cluster settings
 
-Terraform writes these settings to `/etc/sandboxd/cluster.env` on each node when you run `scripts/terraform.sh apply`. You do not need to set them yourself. They help when you read logs or fix problems.
+`sandboxd init` and `sandboxd join` write the cluster's core settings to `/etc/sandboxd/cluster.env` on each node. This happens whether you run them or Terraform does. Other settings go in `/etc/sandboxd/sandboxd.env`. When both files set the same setting, `cluster.env` wins.
+
+You do not need to set these yourself. They help when you read logs or fix problems.
 
 ### Node identity
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_ENABLE_CLUSTER` | Set to `true` to turn on cluster mode. | `false` |
-| `SB_NODE_ID` | A fixed name for this node, such as `node1`. Never change it after the node joins. A new ID leaves a "ghost" entry for the old one in the cluster's records. | Required |
-| `SB_NODE_ROLE` | This node's role. See [Node roles](#node-roles). | `mixed` |
-| `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on all other nodes. Only a role with `server` (or `mixed`) may be the seed. | `false` |
-| `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that become voters on their own. Extra server nodes join as non-voters. `0` means no cap. | `5` |
+| `SB_ENABLE_CLUSTER` | `true` turns on cluster mode. | `false` |
+| `SB_NODE_ID` | This node's fixed name, such as `node1`. It must match the name in this node's node certificate. Never change it after the node joins. A new name leaves a "ghost" entry for the old one in the cluster's records. | Required |
+| `SB_NODE_ROLE` | This node's jobs. See [Node roles](#node-roles). Any value but `mixed` needs `SB_ENABLE_CLUSTER=true`. | `mixed` |
+| `SB_NODE_ZONE` | This node's zone, such as `eu-west-1a`. A create can ask for a zone. See [Choose where a sandbox runs](/engineering-placement-failover/#choose-where-a-sandbox-runs). | Empty (no zone) |
+| `SB_NODE_LABELS` | This node's labels, as `key=value` pairs split by commas, such as `tier=pci,gpu=a10`. A create can ask for labels. At most 16 labels. A bad label stops the node from starting. | Empty (no labels) |
+| `SB_CELL_ID` | The cell this cluster belongs to, a number from 1 to 255. With `SB_CELL_ID_KEY` set, new sandbox IDs carry it, hidden. Set the same number on every node of a cluster. Leave it at 1 unless you run more than one cell. A value outside 1 to 255 stops the node from starting. See [Many cells](/cells/). | `1` |
+| `SB_CELL_ID_KEY` | The ID key every cell of a federation shares: base64 of at least 32 bytes (`openssl rand -base64 32`). It hides the cell number in new sandbox IDs. Never change it. Unset, an ID's first byte is random. | Empty |
+| `SB_CELL_ENDPOINTS` | The other cells' API addresses, as `number=address` pairs split by commas, such as `2=https://cell2.example.com`. A request for a sandbox of one of them is answered 421 with its address, which the SDKs follow. Needs `SB_CELL_ID_KEY`. | Empty |
+| `SB_CLUSTER_BOOTSTRAP` | `true` only on the seed, `false` on every other node. Only a node whose role has `server`, or is `mixed`, can be the seed. | `false` |
+| `SB_CLUSTER_MAX_AUTO_VOTERS` | The most server nodes that vote. Extra server nodes join as non-voters. `0` means no cap. | `5` |
+| `SB_READY_LEADER_GRACE` | How long a node may go without hearing from a working control plane before `GET /ready` answers 503, such as `10s`. Keep it above a normal leader election (a second or two) so one election does not take every node out of rotation. | `10s` |
 
-### Networking
+### Addresses
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_API_ADVERTISE_URL` | The address other nodes use to forward API requests to this node, for example `http://10.0.0.5:21212`. | `http://<hostname>:21212` |
-| `SB_DATA_PLANE_ADVERTISE_HOST` | The host other nodes use to send sandbox traffic here. Set it when that differs from the API address. | The host in `SB_API_ADVERTISE_URL` |
-| `SB_BOOTSTRAP_PEERS` | Gossip addresses to contact when joining, separated by commas. Required on every node except the seed. | Empty |
-| `SB_INGRESS_ADVERTISE_HOST` | The public host name used in sandbox URLs. See [Ingress nodes](/cluster-ingress/). | Empty |
-| `SB_L4_PUBLIC_HOST` | The host name in raw TCP port addresses (`tcp://<host>:<port>`). Set it when your domain points at a load balancer that cannot carry the TCP port pool. Terraform sets it to `tcp.<domain>` when the [load balancer](/cluster-setup/#put-a-load-balancer-in-front) is on. | Empty: the domain |
+| `SB_API_ADVERTISE_URL` | The address other nodes use to pass API requests to this node, such as `http://10.0.0.5:21212`. | `http://<hostname>:21212` (the port is `SB_API_PORT`) |
+| `SB_DATA_PLANE_ADVERTISE_HOST` | The host other nodes use to send sandbox traffic to this node. Set it when that differs from the API address. | The host in `SB_API_ADVERTISE_URL` |
+| `SB_BOOTSTRAP_PEERS` | Other nodes to contact at start, as `host:7001` addresses split by commas. Required on every node except the seed. | Empty |
+| `SB_INGRESS_ADVERTISE_HOST` | The public host name in sandbox URLs. `sandboxd init` and `join` set it to your domain, unless you pass another or `sandboxd.env` sets it. See [Ingress nodes](/cluster-ingress/). | Empty |
+| `SB_L4_PUBLIC_HOST` | The host name in raw TCP port addresses (`tcp://<host>:<port>`). Set it when your domain leads to a load balancer that cannot carry the TCP ports. Terraform sets it to `tcp.<domain>` when its [load balancer](/cluster/aws/#step-6-add-a-load-balancer-for-production) is on. | Empty: the domain, or `SB_PUBLIC_HOST` without one |
 
-### Raft settings
+### Voting settings (`SB_RAFT_*`)
 
-Raft keeps its records on disk, so they survive restarts.
+The server nodes keep their records on disk, so the records survive restarts.
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_RAFT_BIND_ADDR` | The address Raft listens on. | `0.0.0.0:7000` |
-| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach Raft here. It must be a real address they can reach, not `0.0.0.0`. | Required (Terraform and the setup scripts set it) |
-| `SB_RAFT_DATA_DIR` | Where Raft stores its log and snapshots (saved copies of its state). | `/var/lib/sandboxd/raft` |
+| `SB_RAFT_BIND_ADDR` | The address this node listens on for voting traffic. | `0.0.0.0:7000` |
+| `SB_RAFT_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7000`. A DNS name with a port (`server-0.aerolvm.svc:7000`) is kept as a name, so a server that moves to a new IP stays reachable: other nodes look the name up each time they connect. | The same as `SB_RAFT_BIND_ADDR` |
+| `SB_RAFT_DATA_DIR` | Where the node keeps its log of changes, and its snapshots (saved copies of the records). | `/var/lib/sandboxd/raft` (a `raft` folder next to `SB_DB_PATH`) |
+| `SB_RAFT_WAL_DIR` | Puts the log of changes on a disk of its own. Every change waits for two writes to that log, one on the leader and one on another server, so a busy cluster's servers commit faster when that disk is quick to write (on AWS, io2: gp3 is too slow for this, even on its own). Name a folder on that disk, not the disk's mount point, and set it before the server's first start: the server remembers where its log is and will not start if the setting later points somewhere else. | A `raft-wal` folder inside `SB_RAFT_DATA_DIR` |
 
-### Gossip settings
+### Node-finding settings (`SB_GOSSIP_*`)
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_GOSSIP_BIND_ADDR` | The address gossip listens on. | `0.0.0.0:7001` |
-| `SB_GOSSIP_ADVERTISE_ADDR` | The address other nodes use to reach gossip here. It must be a real address they can reach, not `0.0.0.0`. | Required (Terraform and the setup scripts set it) |
-| `SB_GOSSIP_SECRET_KEY` | A shared key, base64-encoded, of 16, 24 or 32 bytes. Every node must have the same one. It signs gossip messages so strange machines cannot join. Required. | Empty |
-| `SB_CLUSTER_INSECURE_GOSSIP` | Skip the gossip key. Only safe on a fully closed network that untrusted machines cannot reach. Not allowed in enterprise mode. | `false` |
+| `SB_GOSSIP_BIND_ADDR` | The address this node listens on to find other nodes. | `0.0.0.0:7001` |
+| `SB_GOSSIP_ADVERTISE_ADDR` | The address other nodes use to reach that listener. It must be a real address they can reach, not `0.0.0.0`. `sandboxd init` and `join` set it to `<node IP>:7001`. | The same as `SB_GOSSIP_BIND_ADDR` |
+| `SB_GOSSIP_SECRET_KEY` | A shared key of 16, 24 or 32 bytes, written in base64. Every node must have the same one. It signs the messages nodes use to find each other, so unknown machines cannot join. Required in cluster mode. | Empty |
+| `SB_CLUSTER_INSECURE_GOSSIP` | Skip that key. Only for a fully closed network that untrusted machines cannot reach. Not allowed in enterprise mode. | `false` |
 
 ### Security settings
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_CLUSTER_TLS_DIR` | The folder with the cluster's certificate authority and this node's certificate and key (`ca.crt`, `node.crt`, `node.key`). Traffic between nodes then uses mutual TLS (both sides show a certificate). A PAT token alone cannot fake requests between nodes. Required in cluster mode. | Empty |
-| `SB_CLUSTER_INTERNAL_LISTEN` | Where the private node-to-node HTTPS listener binds. | `0.0.0.0:7002` |
-| `SB_CLUSTER_INTERNAL_ADVERTISE` | The HTTPS address other nodes use for that listener, for example `https://10.0.0.5:7002`. | Worked out from the node's main IP |
+| `SB_CLUSTER_TLS_DIR` | The folder with the cluster's signing certificate (`ca.crt`), this node's node certificate (`node.crt`) and its key (`node.key`). Nodes show their node certificates to each other before they talk. So the admin token alone cannot fake a request between nodes. Required in cluster mode. | Empty |
+| `SB_CLUSTER_INTERNAL_LISTEN` | Where the private HTTPS listener for traffic between nodes listens. | `0.0.0.0:7002` |
+| `SB_CLUSTER_INTERNAL_ADVERTISE` | The HTTPS address other nodes use for that listener, such as `https://10.0.0.5:7002`. `sandboxd init` and `join` set it to `https://<node IP>:7002`. | `https://` and the host in `SB_CLUSTER_INTERNAL_LISTEN`. When that host is `0.0.0.0`: `https://127.0.0.1:7002`. |
+| `SB_PAT_TOKEN_SHA256` | The SHA-256 hash of the admin token, in hex. A worker or ingress node that joined without the admin token holds this instead. The node checks the admin token against this hash. It calls other nodes with its node certificate alone. Its own `SB_PAT_TOKEN` then works only for tools on that machine. During a token change, list two hashes split by a comma, the new one first. `sandboxd join` writes it in `cluster.env`. | Empty (the node holds the admin token) |
 | `SB_CREDENTIAL_ENCRYPTION_KEY` | The shared key for the local secrets provider. Required in cluster mode, unless the key file exists. It is not enough for failover on its own. See [Secrets providers](/cluster-secrets/). | Empty |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | A file to read that key from. | `/var/lib/sandboxd/credential_encryption.key` |
-| `SB_CREDENTIAL_KEY_CUSTODY` | `file` keeps the server key in a file or `SB_CREDENTIAL_ENCRYPTION_KEY`. `wrapped` keeps only a copy wrapped by your key store, so no plain key sits on disk. See [Use your own key store](/enterprise/key-custody/). | `file` |
-| `SB_CLUSTER_INSECURE_CREDENTIALS` | Skip the key requirement. Only for short-lived tests that use no sealed passwords. Not allowed in enterprise mode. | `false` |
-| `SB_SECRET_PROVIDER` | `local`, `awskms`, `vault` or `pkcs11`. See [Secrets providers](/cluster-secrets/). | `local` |
-| `SB_SECRET_AWS_KMS_KEY_ID` | The AWS KMS key used to wrap each secret's key. Required with `awskms`. | Empty |
-| `SB_SECRET_RECIPIENT_BACKUP_COUNT` | How many nodes besides the owner can open each sealed secret for `failover.policy=recreate`. At least 1 in a cluster, at least 2 in enterprise mode. | `2` |
-| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | How long a create waits for the first backup to confirm its copy. Must be above zero in a cluster. | `2s` |
+| `SB_CREDENTIAL_KEY_CUSTODY` | `file` keeps the server key in a file or in `SB_CREDENTIAL_ENCRYPTION_KEY`. `wrapped` keeps only a copy locked by your key store, so no plain key sits on disk. `wrapped` needs `SB_SECRET_PROVIDER` set to `awskms`, `vault` or `pkcs11`. See [Use your own key store](/enterprise/key-custody/). | `file` |
+| `SB_CLUSTER_INSECURE_CREDENTIALS` | Skip the key rule. Only for short tests that use no sealed passwords. Not allowed in enterprise mode. | `false` |
+| `SB_SECRET_PROVIDER` | Where secrets are locked: `local`, `awskms`, `vault` or `pkcs11`. See [Secrets providers](/cluster-secrets/). | `local` |
+| `SB_SECRET_AWS_KMS_KEY_ID` | The AWS KMS key that locks each secret's key. Required with `awskms`. | Empty |
+| `SB_SECRET_RECIPIENT_BACKUP_COUNT` | How many nodes, besides the owner, can open each sealed secret for `failover.policy="recreate"`. At least 1 in a cluster. At least 2 in enterprise mode. | `2` |
+| `SB_SECRET_FANOUT_MIN_ACK_WAIT` | How long a create waits for the first backup node to confirm its copy. Must be above zero in a cluster. | `2s` |
 
 ## GPU support
 
-GPU passthrough lets a sandbox use a physical NVIDIA or AMD GPU on its worker. The cluster sends GPU sandboxes only to nodes with a matching GPU.
+GPU passthrough lets a sandbox use a real NVIDIA or AMD GPU on its worker. The cluster sends GPU sandboxes only to nodes with a matching GPU.
 
-To add GPU support, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on a worker in `terraform.tfvars`. Terraform then passes `--with-nvidia-gpu` or `--with-amd-gpu` to the node's install script. The script installs the GPU tools and sets up Docker to use them.
+To add GPU support, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on a worker in Terraform's `nodes`. Terraform then passes `--with-nvidia-gpu` or `--with-amd-gpu` to the node's install script. The script installs the GPU tools, and sets up Docker to use them.
 
-There is no extra setting to add. Each node shares its GPUs over gossip, next to its CPU and memory.
+There is no extra setting to add. Each node reports its GPUs to the other nodes, with its CPU and memory.
 
-- **NVIDIA:** installs the NVIDIA Container Toolkit. Needs an EC2 instance with a real NVIDIA GPU (`g4dn`, `g5`, `p3` and so on). The NVIDIA driver must already be installed.
-- **AMD:** installs ROCm, AMD's GPU software. Works on `x86_64` instances only (`g4ad` and so on).
+- **NVIDIA:** installs the NVIDIA Container Toolkit. Needs an EC2 instance with a real NVIDIA GPU, such as `g4dn`, `g5` or `p3`. The NVIDIA driver must already be installed.
+- **AMD:** installs ROCm, AMD's GPU software. Works on `x86_64` instances only, such as `g4ad`.
 
 A sandbox can use a GPU or gVisor, but not both.
 
 ## gVisor
 
-gVisor puts a small kernel of its own between each container and the server. That is a stronger wall than a plain container, and it needs no bare-metal hardware. It works on any EC2 instance type.
+gVisor puts a small kernel of its own between each container and the machine. That is a stronger wall than a plain container. It needs no bare-metal hardware. It works on any EC2 instance type.
 
-To add it, set `with_gvisor = true` on a worker in `terraform.tfvars`. Terraform passes `--with-gvisor` to the node's install script. The script installs gVisor's `runsc` runtime (the program that runs gVisor containers) and sets up Docker to offer it.
+To add it, set `with_gvisor = true` on a worker in Terraform's `nodes`. Terraform passes `--with-gvisor` to the node's install script. The script installs gVisor's `runsc` runtime, the program that runs gVisor containers. It sets up Docker and containerd to offer it.
 
-The node then tells the cluster it supports `gvisor`. The cluster sends `runtime: "gvisor"` sandboxes only to such nodes. There is no extra setting to add.
+The script also writes `SB_HOST_RUNTIMES=docker,gvisor`. So the node tells the cluster it supports `gvisor`. The cluster sends `runtime: "gvisor"` sandboxes only to such nodes. There is no extra setting to add.
 
 ## Firecracker settings
 
-Terraform writes these when a node has `with_firecracker = true` in `terraform.tfvars`. Firecracker runs each sandbox in a microVM (a small, fast virtual machine).
+Firecracker runs each sandbox in a **microVM**: a small, fast virtual machine. Terraform writes these settings when a node has `with_firecracker = true` in Terraform's `nodes`. Terraform allows it only on nodes whose role has `worker` in it, or is `mixed`.
 
 ### Core settings
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_ENABLE_FIRECRACKER` | Set to `true` to turn on Firecracker on this node. | `false` |
+| `SB_ENABLE_FIRECRACKER` | `true` turns on Firecracker on this node. | `false` |
 | `SB_FIRECRACKER_BINARY` | Where the `firecracker` program is. | `/usr/local/bin/firecracker` |
-| `SB_JAILER_BINARY` | Where the `jailer` program is. The jailer locks each microVM in for extra safety. | `/usr/local/bin/jailer` |
+| `SB_JAILER_BINARY` | Where the `jailer` program is. The jailer locks each microVM in, for extra safety. | `/usr/local/bin/jailer` |
 | `SB_FIRECRACKER_KERNEL` | Where the Linux kernel file (`vmlinux`) for microVMs is. Firecracker cannot start without it. | `/var/lib/sandboxd/firecracker/vmlinux` |
 | `SB_FIRECRACKER_USE_JAILER` | `true` runs each microVM inside the jailer. | `true` |
 | `SB_FIRECRACKER_RUN_DIR` | Where Firecracker keeps each microVM's socket files and state. | `/run/sandboxd/firecracker` |
-| `SB_FIRECRACKER_TEMPLATES_DIR` | Where Firecracker templates are stored on disk. | `/var/lib/sandboxd/firecracker/templates` |
-| `SB_FIRECRACKER_TAP_BASE_CIDR` | The IP address range for the virtual network cards that link microVMs to the server. | `172.16.0.0/20` |
-| `SB_FIRECRACKER_TAP_POOL_SIZE` | How many of those virtual network cards to set aside. | `256` |
+| `SB_FIRECRACKER_TEMPLATES_DIR` | Where Firecracker keeps templates on disk. | `/var/lib/sandboxd/firecracker/templates` |
+| `SB_FIRECRACKER_TAP_BASE_CIDR` | The IP address range for the virtual network cards that link microVMs to the machine. | `172.16.0.0/20` |
+| `SB_FIRECRACKER_TAP_POOL_SIZE` | How many of those virtual network cards to set aside. This is the most Firecracker sandboxes the node runs at once. | `256` |
 
 ### Warm microVM pool
 
 The pool keeps spare microVMs ready ahead of time. It refills itself in the background. It is off by default.
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Turn on the pool. | `false` |
-| `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT` | How many spare microVMs to keep for each template. Raise it for bursty work. | `0` |
+| `SB_FIRECRACKER_VMM_POOL_ENABLED` | Turns on the pool. | `false` |
+| `SB_FIRECRACKER_VMM_POOL_DEPTH_DEFAULT` | How many spare microVMs to keep for each template. Raise it for bursts of creates. | `0` |
 | `SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL` | How often the pool checks itself and starts replacements. | `5s` |
-| `SB_FIRECRACKER_VMM_POOL_GC_INTERVAL` | How often old spare microVMs are cleaned up. | `5m` |
-| `SB_FIRECRACKER_VMM_POOL_GC_TTL` | How old a spare microVM can get before it is replaced. | `1h` |
+| `SB_FIRECRACKER_VMM_POOL_GC_INTERVAL` | How often the cleanup runs. It stops leftover microVMs from used pool slots, and deletes their records. | `5m` |
+| `SB_FIRECRACKER_VMM_POOL_GC_TTL` | How long a used pool slot waits before the cleanup deletes its record. | `1h` |
 
 ### Template and snapshot settings
 
-| Variable | What it does | Default |
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_FIRECRACKER_SNAPSHOT_ENABLED` | Start microVMs from a snapshot. A snapshot saves a booted microVM's memory, so later starts skip the boot. | `true` |
+| `SB_FIRECRACKER_SNAPSHOT_ENABLED` | Start microVMs from a snapshot. A snapshot saves a booted microVM's memory, so later starts skip the boot. `false` makes every create boot from scratch. | `true` |
 | `SB_FIRECRACKER_TEMPLATE_MEMORY_MB` | Memory, in MB, for the microVM that builds a template. | `512` |
 | `SB_FIRECRACKER_TEMPLATE_VCPU` | Virtual CPUs for the microVM that builds a template. | `1` |
-| `SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT` | The longest a template build may take. | `45m` |
+| `SB_FIRECRACKER_TEMPLATE_BUILD_TIMEOUT` | The longest a template build can take. | `45m` |
 | `SB_FIRECRACKER_TEMPLATE_GC_ENABLED` | Delete unused templates from disk on a schedule. | `true` |
-| `SB_FIRECRACKER_TEMPLATE_GC_TTL` | How long a template can sit unused before it may be deleted. | `168h` (7 days) |
-| `SB_FIRECRACKER_RSS_WATERMARK_RATIO` | The share of server memory to keep free. A new Firecracker sandbox is refused if it would push free memory below this. `0` turns the check off. A typical value is `0.10` (keep 10% free). | `0` |
+| `SB_FIRECRACKER_TEMPLATE_GC_TTL` | How long a template with no sandboxes is kept after its last update. Then the cleanup deletes it. | `168h` (7 days) |
+| `SB_FIRECRACKER_RSS_WATERMARK_RATIO` | The share of the machine's memory to keep free. A new Firecracker sandbox is refused if it would push free memory below this. `0` turns the check off. A typical value is `0.10`: keep 10% free. | `0` |
 
 ## Next steps
 
-- [Cluster setup](/cluster-setup/): create a cluster with Terraform.
+- [How a cluster works](/cluster/how-it-works/): the jobs, the voters, and what happens when a machine dies.
+- [Build it on AWS](/cluster/aws/): make a cluster with Terraform.
 - [Ingress nodes](/cluster-ingress/): choose roles for a large cluster.
+- [Keep it safe](/cluster/security/): which secret opens what.
 - [Secrets providers](/cluster-secrets/): the full story on sealed passwords.
 - [Firecracker](/firecracker-sandbox/): run sandboxes in microVMs.

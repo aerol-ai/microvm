@@ -15,7 +15,7 @@ Untrusted code that can reach your private network can attack it. This post expl
 
 | Runtime | Outbound, with no policy | Inbound |
 |---|---|---|
-| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses. Never the cloud metadata service, another sandbox on the same server, or the server itself. | Nothing, until you share a port |
+| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses. Never the cloud metadata service, another sandbox on the same server, or the server itself. With [private networks blocked by default](#block-private-networks-by-default), the internet only. | Nothing, until you share a port |
 | WebAssembly | No filter until you set a policy. Never the cloud metadata service or the server itself. | Nothing, until you share a port |
 | V8 isolate | The internet over HTTPS only. Private, loopback, link-local and metadata addresses are always blocked, and so is the server itself. | Nothing, until you share a port |
 
@@ -35,13 +35,27 @@ flowchart TB
     Q -- "yes" --> Own["Use the sandbox's own policy"]
     Q -- "no" --> Op{"Did the operator set a default<br/>of block everything or an allow list?"}
     Op -- "yes" --> Def["Use the operator's default"]
-    Op -- "no" --> Open["No filter"]
+    Op -- "no" --> Flag{"Is SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT on?"}
+    Flag -- "yes" --> Priv["Block private ranges,<br/>keep DNS and the internet"]
+    Flag -- "no" --> Open["No filter"]
     Own --> Floor["The operator's always-blocked<br/>ranges, if set, still apply"]
     Def --> Floor
+    Priv --> Floor
     Open --> Floor
 ```
 
 - The default is saved with the sandbox when it is created, so reading the sandbox shows the policy it got.
+
+### Block private networks by default
+
+Set `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true` on a server, and a container, gVisor or Firecracker sandbox created with no network policy can no longer reach private addresses. It still reaches the internet. The setting is off by default.
+
+- **What is blocked:** the private ranges `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`, and the link-local range `169.254.0.0/16`. Sandboxes have no IPv6 at all, so the private IPv6 ranges (`fc00::/7`, `fe80::/10`) are already out of reach. The metadata addresses stay blocked, as always.
+- **DNS keeps working.** If the server's DNS resolver is a private address, such as an AWS VPC resolver at `172.31.0.2`, that one address stays open. The server reads its resolvers when it starts, so restart it after you change them.
+- **It is a default, not a rule.** It applies only when a create sets no network policy, and the operator file sets no `block_all` or `allowlist` default (that default wins). A sandbox that sets its own policy keeps exactly that policy, even one that opens a private address. To block a range for every sandbox, whatever it asks for, use `deny_cidrs` in the operator file instead.
+- **It is saved with the sandbox.** Reading the sandbox shows the deny list, and the resolver in its allow list. Turning the setting off later does not open sandboxes that already run, and a sandbox that moves to another server keeps it.
+- **It needs the host firewall.** The server refuses to start with this setting on and `SB_ENABLE_NETWORK_RULES=false`.
+- **WebAssembly and V8 isolate sandboxes are covered by their own filters.** A WebAssembly sandbox with no policy is kept off the same private ranges. A V8 isolate already blocks private addresses.
 
 ## Turn on a policy
 
@@ -213,7 +227,7 @@ A server runs more than AerolVM: an EDR agent, a log shipper, a metrics exporter
 |---|---|
 | The egress gateway's DNS (53054) and proxy (15080) ports | The gateway runs on the server, and only for sandboxes with a name allow list, which are sent there. The gateway drops them for every other sandbox. |
 | DNS (53) on one server address | The resolver handed to sandboxes is that address. By default sandboxes get the server's upstream resolvers, which are not on the server. |
-| Web ports 80 and 443 | The server serves public URLs. They answer the internet anyway, so a sandbox can open its own public URL. |
+| Web ports 80 and 443 | The server serves public URLs. They answer the internet anyway, so a sandbox can open its own public URL. `SB_SANDBOX_NODE_INGRESS=false` keeps them closed, as the Kubernetes chart does: there the public URLs are reached through a Service, which a sandbox still reaches like any internet client. |
 | Ports the operator lists in `SB_SANDBOX_NODE_PORTS_ALLOW` | Only outside enterprise mode. |
 
 - **Replies still flow.** When the server opens a connection into a sandbox (AerolVM's agent, health checks), the sandbox's replies get through.
@@ -257,6 +271,16 @@ Set these in the private-network policy file (`SB_EGRESS_OPERATOR_FILE`). They a
 - **`node_control_port_guard`:** on by default, file or no file. Sandboxes cannot reach AerolVM's own ports on the other servers of a cluster, or their SSH and rpcbind. Set `false` only if a sandbox must reach them. It never opens the sandbox's own server: see [The server itself](#the-server-itself).
 
 These are environment settings on each server, not in the file:
+
+- **`SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT`:** `true` blocks private and link-local addresses for every container, gVisor or Firecracker sandbox created with no network policy. Off by default. See [Block private networks by default](#block-private-networks-by-default).
+
+- **`SB_EGRESS_DENY_FLOOR_CIDRS`:** addresses no sandbox can ever reach, such as a Kubernetes API server, as a comma list of addresses and ranges. They join the cloud metadata addresses: no policy or profile opens them. Empty by default.
+
+- **`SB_EGRESS_DENY_FLOOR_FILE`:** a file of more such addresses, one per line, that may change while the server runs. The server reads it every 10 seconds and adds what it holds to the floor, without a restart. If the file cannot be read, the addresses in force stay. On Kubernetes the operator keeps the API server's current addresses in this file. Empty by default.
+
+- **`SB_EGRESS_PRIVATE_DEFAULT_CIDRS`:** more ranges to treat like the private ones, such as a cluster's pod, Service and node ranges. A sandbox with no policy cannot reach them, and a policy or profile that allows one of them opens it on purpose. Needs `SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true`. Empty by default.
+
+  The server refuses to start if either list has a bad entry. On a server with the website-name filter, put both lists in `/etc/sandboxd/egress-gateway.env` too, with the same values: the filter connects for sandboxes itself. The [Kubernetes chart](/kubernetes/#keep-sandboxes-off-your-network) sets them in both places for you.
 
 - **`SB_SANDBOX_NODE_PORTS_ALLOW`:** extra ports of the server that every sandbox on it may reach, such as `8080,5353/udp`. Empty by default. It cannot open AerolVM's own ports or SSH, and it is refused in enterprise mode: run a service sandboxes need on another machine.
 

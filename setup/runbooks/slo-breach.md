@@ -47,6 +47,7 @@ image-pull storm if the signals point there.
 | `SandboxdRaftApplyStuck` | Stop new deploys; inspect leader CPU/disk/network. | in-flight apply remains > 5 minutes. |
 | `SandboxdWorkerLeaseStale` | Check worker health and mTLS/gossip connectivity. | stale age keeps rising or all workers stale. |
 | `SandboxdNoAdmitWorkers` | Check capacity, disk, and drains. | all creates fail or no workers can uncordon. |
+| `SandboxdSandboxDiskHigh` | Find what fills the node's sandbox volume ([Sandbox disk](#sandbox-disk)). | free space nears `SB_DISK_FLOOR_RATIO`, or several nodes fire at once. |
 | `SandboxdCreateQueueBacklog` | Determine if backlog is image, capacity, or Raft bound. | queue grows for > 10 minutes. |
 | `SandboxdIngressRouteLag` | Check Caddy admin errors and ingress CPU. | route lag increases while creates continue. |
 | `SandboxdCaddyAdminErrors` | Check Caddy service and admin endpoint. | public URLs fail or route lag grows. |
@@ -62,7 +63,7 @@ curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
   http://127.0.0.1:21212/v1/cluster/leader | jq .
 curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
   http://127.0.0.1:21212/v1/metrics \
-  | grep -E 'aerolvm_raft_apply|aerolvm_raft_snapshot|aerolvm_gossip'
+  | grep -E 'aerolvm_raft_apply|aerolvm_raft_snapshot|aerolvm_raft_pipeline|aerolvm_gossip'
 sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager \
   | grep -iE 'raft|leader|apply|snapshot|election|error'
 ```
@@ -74,6 +75,23 @@ Mitigation:
 - If no leader exists, move to lost-quorum recovery.
 - If snapshot errors correlate with disk full, free disk or move the node out
   of service.
+- `SandboxdRaftPipelineStall` (`aerolvm_raft_pipeline_stalls_total` for one
+  follower, its `key` label, rose by 2 or more in 30 minutes): the leader's
+  fast send path to that follower keeps getting stuck. sandboxd resets it
+  each time, and the follower catches up the normal way, but a follower that
+  keeps rejecting appends needs a look. A single reset after a follower
+  restart or a leader change is expected, and single resets on different
+  followers (a rolling upgrade) do not fire the alert. The alert names the
+  follower; check that node's health, disk and Raft log errors, and the
+  leader's journal (`raft replication pipeline send stalled`, `peer=`).
+- `SandboxdOwnershipLeaseFileWriteFailing` (Kubernetes worker pods): the
+  agent container cannot write `SB_OWNERSHIP_LEASE_FILE`, so the runtime
+  container's supervisor freezes the pod's recreate-policy sandboxes when the
+  last lease written runs out, even though sandboxd still reaches the leader.
+  The agent log says why (`ownership lease file: write failed`). Check that
+  the shared folder (`/run/aerolvm`) is mounted in both containers and not
+  full. The supervisor thaws each sandbox at the first write that follows a
+  successful leader read and proves it still owned.
 
 ## Scheduler and Capacity Checks
 
@@ -92,6 +110,22 @@ Mitigation:
 - Drain workers with stale leases only if they are flapping and causing
   placement retries.
 - Do not manually create sandboxes on server/ingress-only nodes.
+
+### Sandbox disk
+
+The node's sandbox volume holds image layers and every sandbox's own files.
+`aerolvm_host_pressure_sandbox_disk_free_mb` and `_total_mb` show it; the
+`sandbox volume` line in the boot log names its path. When free space drops
+below `SB_DISK_FLOOR_RATIO` of the volume, the node refuses new creates with
+`503` and `disk floor breached` in the reason, and placement sends creates to
+other nodes. Running sandboxes keep running and can still be resized; a
+stopped sandbox cannot start on that node until space is freed.
+
+- Find the largest sandboxes on the node and ask their owners to clean up,
+  or delete abandoned ones.
+- Remove images no sandbox uses (image GC, or the engine's prune).
+- Drain the node if one sandbox keeps writing; its files go with it.
+- Add disk or nodes if the fill is steady growth, not one runaway sandbox.
 
 ## Create Path Checks
 

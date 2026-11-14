@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm list: unexpected argument "extra"
+run `aerolvm list --help` for usage

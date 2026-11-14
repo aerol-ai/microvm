@@ -228,9 +228,14 @@ func TestCoverage97MCPStdinAndFlagEcho(t *testing.T) {
 	}
 }
 
+// The API is port 1, not a closed fake. Closing the fake frees its port,
+// and list retries a refused connection for about 1.4s. On a busy runner a
+// new listener took the freed port inside that window (another test
+// binary's fake answers list with the same token) and list succeeded.
+// bind(":0") never hands out port 1, so nothing in a test run listens there.
 func TestCoverage97ListAgainstClosedAPI(t *testing.T) {
 	h := newHarness(t)
-	h.fake.Close()
+	h.env["SB_API_URL"] = "http://127.0.0.1:1"
 	if code := h.run("list"); code == 0 {
 		t.Fatal("list succeeded against a closed API")
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -86,6 +87,32 @@ func (c *trackedChild) wait() error {
 // such process" (UC-335 on cluster-bank-flagship).
 func reapedElsewhere(err error) bool {
 	return errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.ESRCH)
+}
+
+// isExitStatus reports whether a wait error only carries the command's own
+// exit status: Go's ExitError, the status the reaper collected when it won
+// the race (reapedExit, from settle), or a status already reaped elsewhere.
+// That is the command's result, not a failure, so callers must not append
+// its text to the command's stderr. Missing reapedExit here made a plain
+// "exit 3" show up as "exit status 3" at the end of stderr whenever the
+// reaper won (UC-458 on cluster-3-mixed-docker, 2026-11-07).
+func isExitStatus(err error) bool {
+	var exitErr *exec.ExitError
+	var reaped *reapedExit
+	return errors.As(err, &exitErr) || errors.As(err, &reaped) || reapedElsewhere(err)
+}
+
+// withWaitError returns stderr with waitErr added at the end when waitErr is
+// a real failure, so the caller sees why the run broke (with these pipes, in
+// practice the exec's deadline landing just as the command exited 0). A wait
+// error that is the command's own exit status (isExitStatus) is the result,
+// not a failure, and leaves stderr as it was. handleExec and
+// handleDaytonaCodeRun share it so the two cannot drift apart again.
+func withWaitError(stderr string, waitErr error) string {
+	if waitErr == nil || isExitStatus(waitErr) {
+		return stderr
+	}
+	return strings.TrimSpace(stderr + "\n" + waitErr.Error())
 }
 
 // settle is wait after cmd.Wait returned err.

@@ -1,0 +1,366 @@
+---
+title: File watching
+description: Get told when files in a sandbox change, instead of checking again and again. Works on gVisor and Firecracker sandboxes.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A file watch tells your app when files in a sandbox folder change: a file is made, written, renamed, has its permissions changed, or is deleted. Use it to react to what a build or an agent writes, without asking for the folder over and over.
+
+<Aside type="caution" title="gVisor and Firecracker only">
+File watching works on [gVisor](/gvisor-sandbox/) and [Firecracker](/firecracker-sandbox/) sandboxes. Docker and containerd sandboxes, WebAssembly sandboxes and V8 isolates answer with an error (HTTP 501). See [Which sandboxes can watch](#which-sandboxes-can-watch) for why.
+</Aside>
+
+## Watch a folder
+
+Pass a folder and a function. The function is called once for every change, in order. The call returns once the watch is in place, so a change you make right after it is always seen. If the sandbox does not confirm the watch within 60 seconds, the call fails with an error.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const watch = await sandbox.watchFiles("/workspace", (event) => {
+      console.log(event.type, event.path);
+    });
+
+    await sandbox.exec("echo hi > /workspace/notes.txt");
+    // prints: create /workspace/notes.txt
+    //         write /workspace/notes.txt
+
+    // Later, when you are done:
+    watch.stop();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    def on_event(event):
+        print(event.type, event.path)
+
+    watch = sandbox.watch_files("/workspace", on_event)
+
+    sandbox.exec("echo hi > /workspace/notes.txt")
+    # prints: create /workspace/notes.txt
+    #         write /workspace/notes.txt
+
+    # Later, when you are done:
+    watch.stop()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    watch, err := sandbox.WatchFiles(ctx, "/workspace", sdktypes.WatchOptions{
+        OnEvent: func(event sdktypes.FileEvent) {
+            fmt.Println(event.Type, event.Path)
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    if _, err := sandbox.ExecCommand(ctx, "echo hi > /workspace/notes.txt"); err != nil {
+        log.Fatal(err)
+    }
+    // prints: create /workspace/notes.txt
+    //         write /workspace/notes.txt
+
+    // Later, when you are done:
+    watch.Stop()
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::WatchOptions;
+
+    let watch = sandbox.watch_files("/workspace", WatchOptions::default(), |event| {
+        println!("{} {}", event.kind, event.path);
+    })?;
+
+    sandbox.exec("echo hi > /workspace/notes.txt")?;
+    // prints: create /workspace/notes.txt
+    //         write /workspace/notes.txt
+
+    // Later, when you are done:
+    watch.stop();
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    FileWatchHandle watch = sandbox.watchFiles("/workspace", new WatchOptions(),
+        event -> System.out.println(event.type + " " + event.path));
+
+    sandbox.exec("echo hi > /workspace/notes.txt");
+    // prints: create /workspace/notes.txt
+    //         write /workspace/notes.txt
+
+    // Later, when you are done:
+    watch.stop();
+    ```
+  </TabItem>
+</Tabs>
+
+- Changes are sent in small batches, at most every quarter of a second. Your function runs a moment after the change, on a background thread.
+- Keep your function quick. Events wait while it runs.
+- The folder must exist. A path that is a file, not a folder, is refused (HTTP 409).
+- In Rust, dropping the handle also stops the watch, so keep it for as long as you want events.
+
+## What an event tells you
+
+| Field | What it holds |
+|---|---|
+| type (`kind` in Rust) | What happened: `create`, `write`, `remove`, `rename`, `chmod` or `overflow`. |
+| path | The full path that changed. |
+| is dir (`isDir` in TypeScript and Java, `is_dir` in Python and Rust, `IsDir` in Go) | True when the path is a folder. |
+| reason | Set only on `overflow`: why events were lost. |
+
+| Type | When you get it |
+|---|---|
+| `create` | A file or folder was made, or moved into the watched folder. |
+| `write` | A file's contents changed. Many writes in a row show as one `write`. |
+| `remove` | A file or folder was deleted. |
+| `rename` | A file or folder was renamed or moved away. This event has the **old** path. The new path comes as a `create`. |
+| `chmod` | Permissions or other details of a file changed. |
+| `overflow` | Some events were lost. See [When events are lost](#when-events-are-lost). |
+
+A newer sandbox agent may add more types. Treat a type you do not know like `overflow`: list the folder again.
+
+## Watch subfolders too
+
+By default only the folder itself is watched, not the folders inside it. Turn on `recursive` to watch every folder below it as well, including folders made after the watch starts.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const watch = await sandbox.watchFiles("/workspace", (event) => {
+      console.log(event.type, event.path, event.isDir ? "(folder)" : "");
+    }, { recursive: true });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    def on_event(event):
+        print(event.type, event.path, "(folder)" if event.is_dir else "")
+
+    watch = sandbox.watch_files("/workspace", on_event, recursive=True)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    watch, err := sandbox.WatchFiles(ctx, "/workspace", sdktypes.WatchOptions{
+        Recursive: true,
+        OnEvent: func(event sdktypes.FileEvent) {
+            fmt.Println(event.Type, event.Path, event.IsDir)
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::WatchOptions;
+
+    let watch = sandbox.watch_files("/workspace", WatchOptions { recursive: true }, |event| {
+        println!("{} {} {}", event.kind, event.path, event.is_dir);
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    FileWatchHandle watch = sandbox.watchFiles("/workspace", new WatchOptions().setRecursive(true),
+        event -> System.out.println(event.type + " " + event.path + " " + event.isDir));
+    ```
+  </TabItem>
+</Tabs>
+
+When a new folder appears, you also get a `create` for each file already in it. So `mkdir -p a/b && touch a/b/f` reports `a`, `a/b` and `a/b/f`, even though the file was made before the watch could reach the new folder. Now and then this means you see the same `create` twice.
+
+Links to other folders are not followed, so a link that points back up the tree cannot make a watch go around in circles.
+
+## Stop a watch, or learn why it ended
+
+Call stop when you are done. To block until the watch ends, call wait. After stop, wait returns with no error. If the sandbox ends the watch itself, wait fails with the reason. That happens when the watched folder is deleted or moved, or when the connection drops.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    try {
+      await watch.wait();
+      console.log("stopped");
+    } catch (err) {
+      console.log("watch ended:", (err as Error).message);
+      // watch ended: the watched folder was removed
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMError
+
+    try:
+        watch.wait()
+        print("stopped")
+    except MicroVMError as err:
+        print("watch ended:", err)
+        # watch ended: the watched folder was removed
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := watch.Wait(); err != nil {
+        fmt.Println("watch ended:", err)
+        // watch ended: the watched folder was removed
+    } else {
+        fmt.Println("stopped")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    match watch.wait() {
+        Ok(()) => println!("stopped"),
+        Err(err) => println!("watch ended: {err}"),
+    }
+    // watch ended: API error: the watched folder was removed
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try {
+        watch.waitForEnd();
+        System.out.println("stopped");
+    } catch (MicroVMException err) {
+        System.out.println("watch ended: " + err.getMessage());
+        // watch ended: the watched folder was removed
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+In Rust, `wait` takes the handle. To end a watch yourself, call `stop` first, then `wait`.
+
+## When events are lost
+
+Sometimes a watch cannot report everything. It then sends an `overflow` event, and its reason says why:
+
+| Reason | What happened |
+|---|---|
+| `kernel_queue` | So many changes came at once that the sandbox's kernel dropped some. |
+| `event_buffer` | More than about 4,000 changes came in one quarter of a second. |
+| `watch_limit` | A folder could not be watched, because the watch limit was reached. The event's path names that folder. |
+
+The watch keeps running after an overflow. But you may have missed changes, so list the folder again to catch up.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const watch = await sandbox.watchFiles("/workspace", (event) => {
+      if (event.type === "overflow") {
+        console.log("missed some changes:", event.reason);
+        // list /workspace again here
+        return;
+      }
+      console.log(event.type, event.path);
+    }, { recursive: true });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    def on_event(event):
+        if event.type == "overflow":
+            print("missed some changes:", event.reason)
+            # list /workspace again here
+            return
+        print(event.type, event.path)
+
+    watch = sandbox.watch_files("/workspace", on_event, recursive=True)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    watch, err := sandbox.WatchFiles(ctx, "/workspace", sdktypes.WatchOptions{
+        Recursive: true,
+        OnEvent: func(event sdktypes.FileEvent) {
+            if event.Type == sdktypes.FileEventOverflow {
+                fmt.Println("missed some changes:", event.Reason)
+                // list /workspace again here
+                return
+            }
+            fmt.Println(event.Type, event.Path)
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::WatchOptions;
+
+    let watch = sandbox.watch_files("/workspace", WatchOptions { recursive: true }, |event| {
+        if event.kind == "overflow" {
+            println!("missed some changes: {:?}", event.reason);
+            // list /workspace again here
+            return;
+        }
+        println!("{} {}", event.kind, event.path);
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    FileWatchHandle watch = sandbox.watchFiles("/workspace", new WatchOptions().setRecursive(true), event -> {
+        if (FileEvent.OVERFLOW.equals(event.type)) {
+            System.out.println("missed some changes: " + event.reason);
+            // list /workspace again here
+            return;
+        }
+        System.out.println(event.type + " " + event.path);
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+## Which sandboxes can watch
+
+| Sandbox | File watching |
+|---|---|
+| gVisor | Works. |
+| Firecracker | Works. |
+| Docker and containerd | Refused (HTTP 501). |
+| WebAssembly | Refused (HTTP 501). |
+| V8 isolate | Refused (HTTP 501). |
+
+Why not Docker and containerd? Watching uses the Linux kernel's inotify feature, and the kernel gives each user a small, fixed number of watchers. In Docker and containerd sandboxes, the root user in every sandbox is the root user of the machine that runs them. So all the sandboxes on one machine share that one small budget, and one busy sandbox could use it up for everyone else. A gVisor or Firecracker sandbox has a kernel of its own, with a budget of its own, so its watches cannot affect other sandboxes.
+
+WebAssembly sandboxes and V8 isolates have no Linux kernel to watch.
+
+The refusal says: "file watching needs a gVisor or Firecracker sandbox". To watch files, [create the sandbox](/sandboxes/) with the `gvisor` or `firecracker` runtime.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Watches open at once in one sandbox | 16. One more is refused (HTTP 429) until you stop one. |
+| Folders in one recursive watch | 8,192. Past this you get an `overflow` with reason `watch_limit`. |
+| Folders watched in one sandbox, all watches together | 16,384. |
+| Changes held between two batches | About 4,000. Past this you get an `overflow` with reason `event_buffer`. |
+
+The sandbox's own kernel can have lower limits than these, for example a small Firecracker sandbox. Hitting its limit looks the same: a 429 when you start a watch, or an `overflow` with reason `watch_limit`.
+
+## Errors
+
+| What you see | Why |
+|---|---|
+| HTTP 501, "file watching needs a gVisor or Firecracker sandbox" | The sandbox's runtime cannot watch. See [Which sandboxes can watch](#which-sandboxes-can-watch). |
+| HTTP 404, "path not found" | The folder does not exist. |
+| HTTP 409, "not a folder" | The path is a file. Watch the folder that holds it. |
+| HTTP 403, "permission denied" | The sandbox's agent cannot read the folder. |
+| HTTP 429 | Too many watches are open. Stop one first. |
+| An "unsupported feature" error naming `files.watch` | The sandbox runs an agent from before file watching existed. Restart the sandbox to get the current agent. A Firecracker sandbox made from a [template](/images-and-snapshots/) keeps the agent its template was built with, so re-create the template. |
+
+The SDKs open a watch once and do not retry it, because a watch is a live stream. If starting a watch fails, you can call it again.
+
+## From the E2B SDK
+
+E2B's `files.watchDir` works too, on gVisor and Firecracker sandboxes. See [Using the E2B SDK](/using-e2b-sdk/).

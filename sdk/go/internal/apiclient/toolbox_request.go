@@ -48,7 +48,7 @@ func (c *Client) ToolboxRequest(ctx context.Context, sandboxID, method, path str
 		if err != nil {
 			return nil, err
 		}
-		response, err = c.httpClient.Do(request)
+		response, err = c.send(request)
 	}
 	if err != nil {
 		return nil, err

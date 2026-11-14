@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -53,6 +54,9 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 		// not leak through this tenant-visible endpoint either.
 		snapshot.LocalWasmModuleInventoryKnown = false
 		snapshot.LocalWasmModuleIDs = nil
+		// Warm-pool entries name the images an operator runs; like the
+		// warm-pool API itself they are for fleet admins only.
+		snapshot.WarmPools = nil
 	}
 	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }
@@ -78,11 +82,7 @@ func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docke
 		// plans/firecracker-create-latency.md). Absent stages are simply
 		// not rendered — a docker create carries no fc_* entries.
 		for _, st := range timing.Stages() {
-			entry := st.Name + ";dur=" + strconv.FormatFloat(st.DurMS, 'f', 1, 64)
-			if st.Desc != "" {
-				entry += ";desc=" + st.Desc
-			}
-			parts = append(parts, entry)
+			parts = append(parts, createtiming.FormatStage(st))
 		}
 	}
 	w.Header().Set("Server-Timing", strings.Join(parts, ", "))
@@ -326,7 +326,7 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("id")
-	resp, err := h.deps.Service.ExposePort(r.Context(), id, port, req.Protocol)
+	resp, err := h.deps.Service.ExposePortWithVisibility(r.Context(), id, port, req.Protocol, req.Visibility)
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -335,9 +335,10 @@ func (h *handlers) exposePort(w http.ResponseWriter, r *http.Request) {
 	// request value) so a future failover-recreate uses the same protocol the
 	// user is seeing.
 	h.replicateAddExposedPort(r.Context(), id, port, cluster.ExposedPortRoute{
-		Protocol:  resp.Protocol,
-		HostPort:  resp.HostPort,
-		PublicURL: resp.PublicURL,
+		Protocol:   resp.Protocol,
+		HostPort:   resp.HostPort,
+		PublicURL:  resp.PublicURL,
+		Visibility: resp.Visibility,
 	})
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }

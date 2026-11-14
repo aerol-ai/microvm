@@ -1,17 +1,17 @@
+mod cells;
+mod files;
+mod fleet;
 mod image;
 mod types;
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use reqwest::blocking::{
-    multipart::{Form, Part},
-    Client as HttpClient,
-};
+use reqwest::blocking::Client as HttpClient;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -22,13 +22,28 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
+use cells::{CellHint, CellRoutes};
+
+pub use files::{
+    CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
+    DownloadFileOptions, MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
+};
+pub use fleet::SandboxGuard;
 pub use image::Image;
 pub use types::CreateSandboxResponse;
-use types::{CustomDomainListWire, ExposePortResponseWire};
+pub use types::{
+    STATUS_REASON_CRASHED, STATUS_REASON_DISK_LIMIT, STATUS_REASON_FAILOVER, STATUS_REASON_IDLE,
+    STATUS_REASON_MAX_AGE, STATUS_REASON_OUT_OF_MEMORY, STATUS_REASON_PROGRAM_EXITED,
+    STATUS_REASON_RECONCILE, STATUS_REASON_RESTARTED, STATUS_REASON_USER_STOP,
+};
+use types::{CustomDomainListWire, ExposePortResponseWire, WarmPoolListWire};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
+pub use types::{CreateSandboxTokenOptions, ExposeVisibility, RevokeSandboxTokensResult, SandboxToken};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    IdentityOptions, IdentityRole, IdentityRoleList, IdentityRoleOptions, ListIdentityRolesOptions,
+    SandboxIdentity,
     ListEgressProfilesOptions, ListSnapshotsOptions, SnapshotList, NetworkLearned, NetworkLearnedEntry,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
@@ -36,16 +51,18 @@ pub use types::{
     CreateSnapshotOptions, CreateWasmModuleOptions,
     CustomDomain,
     CustomDomainDnsRecords,
-    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
+    CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions, FileEvent,
+    ExposePortInfo, ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
     IngressTarget, Lifecycle,
-    MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
+    MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlacementRule, PlatformVolumeMount,
+    TeamQuota, TeamQuotaOptions, TeamQuotaUsage,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
     SessionStatus, SetNetworkLimitsOptions, Template, TemplatePushState, TemplateStatus,
     UpdateLifecycleOptions, WasmModule, WasmModuleStatus, PushWasmModuleOptions,
-    PushWasmModuleResponse,
+    PushWasmModuleResponse, WatchOptions,
 };
+pub use types::{WarmPool, WarmPoolOptions, WarmPoolServerStatus, WarmPoolStatus};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
 
@@ -57,6 +74,12 @@ pub const TEAM_HEADER: &str = "X-AerolVM-Team";
 /// of it. Keep in sync with `clustercreate.HeaderIdempotencyKey` on the
 /// server.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+
+/// The header a 421 names the cell that holds the sandbox in, when several
+/// AerolVM installs form a federation. The client re-sends the request
+/// there and remembers the cell for the sandbox. Keep in sync with
+/// `models.CellEndpointHeader` on the server.
+pub const CELL_ENDPOINT_HEADER: &str = "X-Aerolvm-Cell-Endpoint";
 
 /// A fresh create key: 128 random bits as 32 lowercase hex characters.
 fn new_idempotency_key() -> String {
@@ -73,6 +96,11 @@ pub type ExitCallback = Arc<dyn Fn(ExecExitInfo) + Send + Sync + 'static>;
 #[derive(Default)]
 pub struct ExecStreamOptions {
     pub command: String,
+    /// Run a program with these arguments instead of `command`, with no
+    /// shell parsing. Set `command` or `argv`, not both. A sandbox whose
+    /// agent predates argv returns `Error::UnsupportedFeature` before the
+    /// stream opens.
+    pub argv: Option<Vec<String>>,
     pub workdir: Option<String>,
     pub env: Option<std::collections::HashMap<String, String>>,
     pub tty: bool,
@@ -112,6 +140,10 @@ pub enum Error {
     /// WebSocket handshake or stream failure. Before 0.8.0 these were
     /// `Error::Api(String)`.
     Client(String),
+    /// The sandbox's agent (toolboxd) is older than an option the call
+    /// needs. An older agent would silently ignore the option (an overwrite
+    /// guard, an output cap), so the SDK refuses instead of sending it.
+    UnsupportedFeature(UnsupportedFeatureError),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -130,6 +162,7 @@ impl fmt::Display for Error {
             Error::Api(err) => write!(f, "API error: {}", err),
             // The text these errors had as Error::Api(String) before 0.8.0.
             Error::Client(message) => write!(f, "API error: {}", message),
+            Error::UnsupportedFeature(err) => write!(f, "{}", err),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -140,6 +173,115 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// The [`ApiError`] behind this error when the server answered with an
+    /// HTTP error status, or `None` for any other failure.
+    pub fn api_error(&self) -> Option<&ApiError> {
+        match self {
+            Error::Api(err) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// The server answered 404. See [`ApiError::is_not_found`].
+    pub fn is_not_found(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_not_found)
+    }
+
+    /// The server answered 409. See [`ApiError::is_conflict`].
+    pub fn is_conflict(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_conflict)
+    }
+
+    /// The server answered 503. See [`ApiError::is_capacity`].
+    pub fn is_capacity(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_capacity)
+    }
+
+    /// The call timed out: the server answered 408 or 504
+    /// ([`ApiError::is_timeout`]), or the HTTP client itself gave up
+    /// waiting (a connect or request timeout).
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Error::Api(err) => err.is_timeout(),
+            Error::Reqwest(err) => err.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// The server answered 401 or 403. See [`ApiError::is_auth`].
+    pub fn is_auth(&self) -> bool {
+        self.api_error().is_some_and(ApiError::is_auth)
+    }
+}
+
+/// The sandbox and the features its agent did not list on `/version`,
+/// returned as [`Error::UnsupportedFeature`]. Restart the sandbox, or
+/// re-create its Firecracker template, to get the current agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedFeatureError {
+    sandbox_id: String,
+    features: Vec<String>,
+    agent_version: String,
+    runtime: String,
+}
+
+impl UnsupportedFeatureError {
+    /// The sandbox whose agent is too old.
+    pub fn sandbox_id(&self) -> &str {
+        &self.sandbox_id
+    }
+
+    /// The features the agent did not list.
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    /// The agent's version, empty when it did not say.
+    pub fn agent_version(&self) -> &str {
+        &self.agent_version
+    }
+
+    /// Set (for example `"wasm"`) when the sandbox's runtime cannot offer
+    /// the features at all; a restart does not help there.
+    pub fn runtime(&self) -> &str {
+        &self.runtime
+    }
+}
+
+impl fmt::Display for UnsupportedFeatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.runtime.is_empty() {
+            let runtime = match self.runtime.as_str() {
+                "wasm" => "WebAssembly",
+                "isolate" => "V8 isolate",
+                other => other,
+            };
+            return write!(
+                f,
+                "sandbox {} is a {} sandbox, which does not support {}",
+                self.sandbox_id,
+                runtime,
+                self.features.join(", ")
+            );
+        }
+        let agent = if self.agent_version.is_empty() {
+            "an older toolboxd".to_string()
+        } else {
+            format!("toolboxd {}", self.agent_version)
+        };
+        write!(
+            f,
+            "sandbox {} runs {}, which does not support {}; restart the sandbox, or re-create its Firecracker template, to get the current agent",
+            self.sandbox_id,
+            agent,
+            self.features.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedFeatureError {}
 
 /// An HTTP error response from the AerolVM server, returned as
 /// [`Error::Api`].
@@ -204,6 +346,41 @@ impl ApiError {
     /// wait, or `None` without a usable header.
     pub fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    // The predicates below name the common statuses, so a caller can branch
+    // on the case it handles instead of comparing numbers. They are methods,
+    // not new `Error` variants, so existing `Error::Api(_)` arms keep
+    // matching every HTTP error.
+
+    /// HTTP 404: the sandbox, file, snapshot or other thing the call named
+    /// does not exist (or is not yours).
+    pub fn is_not_found(&self) -> bool {
+        self.status() == 404
+    }
+
+    /// HTTP 409: the call clashes with what is there now, such as a sandbox
+    /// name you already use.
+    pub fn is_conflict(&self) -> bool {
+        self.status() == 409
+    }
+
+    /// HTTP 503: the server has no room for the call right now or is
+    /// shedding load. The client has already retried it.
+    pub fn is_capacity(&self) -> bool {
+        self.status() == 503
+    }
+
+    /// HTTP 408 or 504: the server, or a proxy in front of it, gave up
+    /// waiting.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self.status(), 408 | 504)
+    }
+
+    /// HTTP 401 (the token is missing, wrong or expired) or 403 (the token
+    /// may not do this).
+    pub fn is_auth(&self) -> bool {
+        matches!(self.status(), 401 | 403)
     }
 }
 
@@ -330,6 +507,56 @@ fn websocket_request(
         );
     }
     Ok(request)
+}
+
+type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// What a WebSocket call takes from its [`Client`] to the thread that runs
+/// it, so the handshake is routed to the sandbox's cell like an HTTP call.
+struct WsDial {
+    api_url: String,
+    api_version: ApiVersion,
+    pat_token: String,
+    team: Option<String>,
+    cells: Arc<CellRoutes>,
+}
+
+impl WsDial {
+    /// Opens the WebSocket at `path`, following a 421 that names another
+    /// cell once as [`Client::send_routed`] does. The handshake carries no
+    /// body, so it can always be sent again. `refused` turns the server's
+    /// refusal into the call's error.
+    async fn connect(&self, path: &str, refused: impl FnOnce(WebSocketError) -> Error) -> Result<WsStream, Error> {
+        let sandbox = cells::sandbox_of(path, self.api_version.path_prefix());
+        let mut cell = sandbox.as_deref().and_then(|id| self.cells.get(id));
+        let mut followed = false;
+        loop {
+            let base = cell.as_deref().unwrap_or(&self.api_url);
+            let request = websocket_request(websocket_url(base, path)?, &self.pat_token, self.team.as_deref())?;
+            let err = match connect_async(request).await {
+                Ok((stream, _)) => return Ok(stream),
+                Err(err) => err,
+            };
+            if let (Some(id), WebSocketError::Http(response)) = (sandbox.as_deref(), &err) {
+                match cells::cell_hint(response.status(), response.headers(), &self.api_url) {
+                    // No chains: a second cell redirect is the caller's error.
+                    CellHint::Follow(next) if !followed => {
+                        self.cells.remember(id, &next);
+                        followed = true;
+                        cell = Some(next);
+                        continue;
+                    }
+                    CellHint::None if response.status() == http::StatusCode::NOT_FOUND => {
+                        if let Some(cell) = cell.as_deref() {
+                            self.cells.forget(id, cell);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Err(refused(err));
+        }
+    }
 }
 
 /// Scoped API tokens (`avm_…`) for services and CI, reached through
@@ -539,6 +766,13 @@ pub struct Client {
     api_version: ApiVersion,
     inner: HttpClient,
     retry_config: RetryConfig,
+    /// Each sandbox's agent feature list from `/version`
+    /// ([`Client::require_toolbox_features`]). A miss refreshes it, because
+    /// a restart can bring a newer agent. Clones share it.
+    toolbox_features: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// The cell each sandbox lives in, learned from 421 answers
+    /// ([`CELL_ENDPOINT_HEADER`]). Clones share it.
+    cells: Arc<CellRoutes>,
 }
 
 #[derive(Clone, Debug)]
@@ -565,6 +799,26 @@ pub struct SessionAttachHandle {
     done_rx: mpsc::Receiver<Result<ExecExitInfo, Error>>,
 }
 
+/// A running file watch, from [`Client::watch_files`]. Dropping it stops
+/// the watch, so keep it for as long as you want events.
+pub struct FileWatchHandle {
+    stop_tx: UnboundedSender<()>,
+    done_rx: mpsc::Receiver<Result<(), Error>>,
+}
+
+/// The feature name an agent too old to watch files is reported with.
+const FILE_WATCH_FEATURE: &str = "files.watch";
+
+#[derive(serde::Deserialize)]
+struct FileWatchServerFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    events: Vec<FileEvent>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 enum ControlMessage {
     Binary(Vec<u8>),
     Text(String),
@@ -573,6 +827,8 @@ enum ControlMessage {
 #[derive(Serialize)]
 struct ExecStreamStartRequest {
     command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argv: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workdir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -677,6 +933,28 @@ impl SessionAttachHandle {
     }
 }
 
+impl FileWatchHandle {
+    /// Stops the watch. Calling it again, or after the watch ended, does
+    /// nothing.
+    pub fn stop(&self) {
+        // The stream task is gone once the watch ended; nothing to stop.
+        let _ = self.stop_tx.send(());
+    }
+
+    /// Blocks until the watch ends. It returns `Ok(())` after [`stop`], and
+    /// an [`Error::Client`] carrying the reason when the sandbox ended the
+    /// watch (the folder was removed or moved) or the connection dropped.
+    ///
+    /// [`stop`]: FileWatchHandle::stop
+    pub fn wait(self) -> Result<(), Error> {
+        // Held until the end: dropping the sender stops the watch.
+        let FileWatchHandle { stop_tx, done_rx } = self;
+        let result = done_rx.recv().map_err(|_| Error::ChannelClosed)?;
+        drop(stop_tx);
+        result
+    }
+}
+
 impl Sandbox {
     fn new(client: Client, data: SandboxData) -> Self {
         Sandbox {
@@ -718,6 +996,16 @@ impl Sandbox {
 
     pub fn exec_stream(&self, options: ExecStreamOptions) -> Result<ExecStreamHandle, Error> {
         self.client.exec_stream(&self.data.id, options)
+    }
+
+    /// Watches a folder in this sandbox. See [`Client::watch_files`].
+    pub fn watch_files(
+        &self,
+        path: &str,
+        options: WatchOptions,
+        on_event: impl FnMut(FileEvent) + Send + 'static,
+    ) -> Result<FileWatchHandle, Error> {
+        self.client.watch_files(&self.data.id, path, options, on_event)
     }
 
     pub fn create_session(&self, options: CreateSessionOptions) -> Result<Session, Error> {
@@ -767,8 +1055,34 @@ impl Sandbox {
         self.client.upload_file(&self.data.id, target_path, data)
     }
 
+    /// Upload with write options: append, create-only, atomic replace and a
+    /// file mode. See [`UploadFileOptions`].
+    pub fn upload_file_with_options(&self, target_path: &str, data: Vec<u8>, options: UploadFileOptions) -> Result<(), Error> {
+        self.client.upload_file_with_options(&self.data.id, target_path, data, options)
+    }
+
     pub fn download_file(&self, target_path: &str) -> Result<Vec<u8>, Error> {
         self.client.download_file(&self.data.id, target_path)
+    }
+
+    /// Read a file with a size limit. See [`DownloadFileOptions`].
+    pub fn download_file_with_options(&self, target_path: &str, options: DownloadFileOptions) -> Result<Vec<u8>, Error> {
+        self.client.download_file_with_options(&self.data.id, target_path, options)
+    }
+
+    /// Stream a file into `dest`. See [`Client::download_file_to`].
+    pub fn download_file_to(&self, target_path: &str, dest: &mut impl std::io::Write, options: DownloadFileOptions) -> Result<u64, Error> {
+        self.client.download_file_to(&self.data.id, target_path, dest, options)
+    }
+
+    /// Upload from a reader, sent once. See [`Client::upload_file_from`].
+    pub fn upload_file_from(
+        &self,
+        target_path: &str,
+        reader: impl std::io::Read + Send + 'static,
+        options: UploadFileOptions,
+    ) -> Result<(), Error> {
+        self.client.upload_file_from(&self.data.id, target_path, reader, options)
     }
 
     /// Publish a sandbox container port. Pass [`ExposeOptions::default()`] (or
@@ -780,8 +1094,31 @@ impl Sandbox {
         self.client.expose_port(&self.data.id, port, options)
     }
 
+    /// Like [`Sandbox::expose_port`], but returns every field the server
+    /// reports, including the port's visibility. See [`ExposePortInfo`].
+    pub fn expose_port_info(
+        &self,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortInfo, Error> {
+        self.client.expose_port_info(&self.data.id, port, options)
+    }
+
     pub fn unexpose_port(&self, port: u16) -> Result<(), Error> {
         self.client.unexpose_port(&self.data.id, port)
+    }
+
+    /// Issue a signed token for this sandbox only, to hand to a browser or
+    /// an end user. Each call makes a new token; the server keeps no copy.
+    pub fn create_token(&self, options: CreateSandboxTokenOptions) -> Result<SandboxToken, Error> {
+        self.client.create_sandbox_token(&self.data.id, options)
+    }
+
+    /// Make every token issued for this sandbox so far stop working,
+    /// toolbox and port tokens alike. A token made after the call works.
+    /// Safe to call again.
+    pub fn revoke_tokens(&self) -> Result<RevokeSandboxTokensResult, Error> {
+        self.client.revoke_sandbox_tokens(&self.data.id)
     }
 
     /// Attach a custom hostname to this sandbox. Returns the post-add list
@@ -949,6 +1286,8 @@ impl Client {
             api_version,
             inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
+            toolbox_features: Arc::default(),
+            cells: Arc::default(),
         })
     }
 
@@ -1676,6 +2015,104 @@ impl Client {
         self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
     }
 
+    // An image is the rest of the warm-pool path: each segment is escaped and
+    // the slashes kept, so no proxy has an encoded slash to rewrite. Every
+    // warm-pool call is a PUT, GET or DELETE of one entry, safe to retry.
+    fn warm_pool_path(&self, image: &str) -> String {
+        let segments: Vec<String> = image.split('/').map(|s| urlencoding::encode(s).into_owned()).collect();
+        format!("{}/warm-pools/{}", self.version_prefix(), segments.join("/"))
+    }
+
+    /// Sets how many ready sandboxes every server with a warm pool keeps for
+    /// an image (a full replace: the same call twice is a no-op). A create
+    /// that names the image then starts from a warm sandbox. Admin only.
+    pub fn put_warm_pool(&self, image: &str, opts: WarmPoolOptions) -> Result<WarmPool, Error> {
+        self.do_json::<WarmPoolOptions, WarmPool>(Method::PUT, &self.warm_pool_path(image), Some(&opts))
+    }
+
+    /// Reads an image's warm-pool entry with its status (ready and target,
+    /// in total and per server).
+    pub fn get_warm_pool(&self, image: &str) -> Result<WarmPool, Error> {
+        self.do_json::<(), WarmPool>(Method::GET, &self.warm_pool_path(image), None)
+    }
+
+    /// Reads every warm-pool entry, by image, with its status.
+    pub fn list_warm_pools(&self) -> Result<Vec<WarmPool>, Error> {
+        let wire = self.do_json::<(), WarmPoolListWire>(Method::GET, &format!("{}/warm-pools", self.version_prefix()), None)?;
+        Ok(wire.pools)
+    }
+
+    /// Deletes an image's warm-pool entry; its warm sandboxes are removed.
+    /// Deleting a missing entry succeeds.
+    pub fn delete_warm_pool(&self, image: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.warm_pool_path(image), None)
+    }
+
+    fn identity_role_path(&self, tag: &str, team: Option<&str>) -> String {
+        let path = format!("{}/identity/roles/{}", self.version_prefix(), urlencoding::encode(tag));
+        match team {
+            Some(team) if !team.is_empty() => append_query_param(&path, "team", team),
+            _ => path,
+        }
+    }
+
+    /// Puts a role tag on a team's cloud identity allow list, or changes its
+    /// minimum caller role (`"runner"` or `"admin"`). Admin only. The same
+    /// call twice changes nothing, so it is safe to retry.
+    pub fn put_identity_role(&self, tag: &str, opts: IdentityRoleOptions) -> Result<IdentityRole, Error> {
+        let body = serde_json::json!({ "min_role": opts.min_role });
+        self.do_json::<serde_json::Value, IdentityRole>(
+            Method::PUT,
+            &self.identity_role_path(tag, opts.team.as_deref()),
+            Some(&body),
+        )
+    }
+
+    /// Lists a team's cloud identity allow list, one page at a time. Admin only.
+    pub fn list_identity_roles(&self, opts: ListIdentityRolesOptions) -> Result<IdentityRoleList, Error> {
+        let mut path = format!("{}/identity/roles", self.version_prefix());
+        if let Some(team) = &opts.team {
+            path = append_query_param(&path, "team", team);
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), IdentityRoleList>(Method::GET, &path, None)
+    }
+
+    /// Takes a role tag off a team's allow list (`None` is the operator
+    /// namespace). Admin only. Sandboxes that use it keep their current
+    /// token (at most one hour) and get no new one. Deleting a tag that is
+    /// already gone succeeds.
+    pub fn delete_identity_role(&self, tag: &str, team: Option<&str>) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.identity_role_path(tag, team), None)
+    }
+
+    fn team_quota_path(&self, team: &str) -> String {
+        format!("{}/teams/{}/quota", self.version_prefix(), urlencoding::encode(team))
+    }
+
+    /// Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+    /// may hold. Admin only. The same limits twice change nothing. A create,
+    /// resize or start past the quota fails with a 429 whose code is
+    /// `team_quota_exceeded`.
+    pub fn put_team_quota(&self, team: &str, opts: TeamQuotaOptions) -> Result<TeamQuota, Error> {
+        self.do_json::<TeamQuotaOptions, TeamQuota>(Method::PUT, &self.team_quota_path(team), Some(&opts))
+    }
+
+    /// Reads a team's quota and what the team holds now (404 if none).
+    pub fn get_team_quota(&self, team: &str) -> Result<TeamQuota, Error> {
+        self.do_json::<(), TeamQuota>(Method::GET, &self.team_quota_path(team), None)
+    }
+
+    /// Removes a team's quota. Removing one that is already gone succeeds.
+    pub fn delete_team_quota(&self, team: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.team_quota_path(team), None)
+    }
+
     /// Who the server says the caller is: principal, role, team and when
     /// the credential expires. Every valid credential may ask.
     pub fn whoami(&self) -> Result<WhoAmI, Error> {
@@ -1704,6 +2141,9 @@ impl Client {
         }
         if let Some(inc) = &opts.incarnation_id {
             path = append_query_param(&path, "incarnation_id", inc);
+        }
+        if let Some(caller) = &opts.caller {
+            path = append_query_param(&path, "caller", caller);
         }
         self.do_json::<(), AuditPage>(Method::GET, &path, None)
     }
@@ -1739,7 +2179,20 @@ impl Client {
     /// after the request may have reached the sandbox (timeout, reset, 502,
     /// 504) is returned rather than retried, because a re-send would run the
     /// command a second time; the command may or may not have run.
+    ///
+    /// Output caps and argv are checked against the sandbox's agent first: an
+    /// agent older than them would ignore the caps and return all output, or
+    /// refuse argv with a confusing "command is required", so the call fails
+    /// with `Error::UnsupportedFeature` instead.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
+        let mut features = Vec::new();
+        if request.max_stdout_bytes.unwrap_or(0) > 0 || request.max_stderr_bytes.unwrap_or(0) > 0 {
+            features.push("exec.max_output_bytes");
+        }
+        if request.argv.as_ref().is_some_and(|argv| !argv.is_empty()) {
+            features.push("exec.argv");
+        }
+        self.require_toolbox_features(id, &features)?;
         let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
@@ -1831,17 +2284,13 @@ impl Client {
     }
 
     pub fn session_log(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
+        let path = format!(
             "{}/sandboxes/{}/sessions/{}/log",
             self.version_prefix(),
             id,
             session_id
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
+        );
+        let (response, _) = self.send_routed(&Method::GET, &path, true, |builder| builder)?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -1849,17 +2298,13 @@ impl Client {
     }
 
     pub fn session_recording(&self, id: &str, session_id: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
+        let path = format!(
             "{}/sandboxes/{}/sessions/{}/recording",
             self.version_prefix(),
             id,
             session_id
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
+        );
+        let (response, _) = self.send_routed(&Method::GET, &path, true, |builder| builder)?;
         self.handle_response(response)?
             .bytes()
             .map_err(Error::Reqwest)
@@ -1874,10 +2319,7 @@ impl Client {
     ) -> Result<SessionAttachHandle, Error> {
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let api_url = self.api_url.clone();
-        let pat_token = self.pat_token.clone();
-        let team = self.team.clone();
-        let api_version = self.api_version;
+        let dial = self.ws_dial();
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
 
@@ -1885,10 +2327,7 @@ impl Client {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
                 Ok(runtime) => runtime.block_on(run_session_attach(
-                    api_url,
-                    api_version,
-                    pat_token,
-                    team,
+                    dial,
                     sandbox_id,
                     session_id,
                     options,
@@ -1910,26 +2349,30 @@ impl Client {
         id: &str,
         options: ExecStreamOptions,
     ) -> Result<ExecStreamHandle, Error> {
-        if options.command.trim().is_empty() {
+        let has_command = !options.command.trim().is_empty();
+        let has_argv = options.argv.as_ref().is_some_and(|argv| !argv.is_empty());
+        if has_command && has_argv {
+            return Err(Error::Client("set command or argv, not both".to_string()));
+        }
+        if !has_command && !has_argv {
             return Err(Error::Client("command is required".to_string()));
+        }
+        if has_argv {
+            // Before the stream opens, so an older agent never gets a start
+            // message it cannot run.
+            self.require_toolbox_features(id, &["exec.argv"])?;
         }
 
         let (control_tx, control_rx) = unbounded_channel();
         let (done_tx, done_rx) = mpsc::channel();
-        let api_url = self.api_url.clone();
-        let pat_token = self.pat_token.clone();
-        let team = self.team.clone();
-        let api_version = self.api_version;
+        let dial = self.ws_dial();
         let sandbox_id = id.to_string();
 
         thread::spawn(move || {
             let runtime = Builder::new_current_thread().enable_all().build();
             let result = match runtime {
                 Ok(runtime) => runtime.block_on(run_exec_stream(
-                    api_url,
-                    api_version,
-                    pat_token,
-                    team,
+                    dial,
                     sandbox_id,
                     options,
                     control_rx,
@@ -1945,42 +2388,69 @@ impl Client {
         })
     }
 
-    pub fn upload_file(&self, id: &str, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
-        let file_name = Path::new(target_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file");
+    /// Watches a folder in a sandbox and calls `on_event` once per change,
+    /// in order, on a background thread. Events arrive in batches at most
+    /// every 250 ms. It returns once the watch is in place, so a change made
+    /// after it returns is reported.
+    ///
+    /// File watching needs a gVisor or Firecracker sandbox; any other
+    /// runtime answers [`Error::Api`] with status 501. A sandbox whose agent
+    /// predates file watching gives [`Error::UnsupportedFeature`] naming
+    /// `files.watch`. The request is sent once and never retried.
+    pub fn watch_files(
+        &self,
+        id: &str,
+        path: &str,
+        options: WatchOptions,
+        on_event: impl FnMut(FileEvent) + Send + 'static,
+    ) -> Result<FileWatchHandle, Error> {
+        let (stop_tx, stop_rx) = unbounded_channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let dial = self.ws_dial();
+        let sandbox_id = id.to_string();
+        let path = path.to_string();
 
-        let form = Form::new()
-            .text("path", target_path.to_string())
-            .part("file", Part::bytes(data).file_name(file_name.to_string()));
+        thread::spawn(move || {
+            // ready_tx answers watch_files: an error before the start frame,
+            // or Ok once the watch is in place. Later results go to wait().
+            let mut ready = Some(ready_tx);
+            let result = match Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime.block_on(run_file_watch(
+                    dial,
+                    sandbox_id,
+                    path,
+                    options,
+                    on_event,
+                    &mut ready,
+                    stop_rx,
+                )),
+                Err(err) => Err(Error::Runtime(err)),
+            };
+            match ready {
+                Some(ready_tx) => {
+                    let _ = ready_tx.send(result);
+                }
+                None => {
+                    let _ = done_tx.send(result);
+                }
+            }
+        });
 
-        self.do_multipart(
-            &format!(
-                "{}/sandboxes/{}/toolbox/files/upload",
-                self.version_prefix(),
-                id
-            ),
-            form,
-        )
+        ready_rx.recv().map_err(|_| Error::ChannelClosed)??;
+        Ok(FileWatchHandle { stop_tx, done_rx })
     }
 
+    /// Uploads `data` to `target_path` with no write options; see
+    /// [`Client::upload_file_with_options`].
+    pub fn upload_file(&self, id: &str, target_path: &str, data: Vec<u8>) -> Result<(), Error> {
+        self.upload_file_with_options(id, target_path, data, UploadFileOptions::default())
+    }
+
+    /// Reads a whole file. It retries like any safe call; see
+    /// [`Client::download_file_with_options`] for a size limit.
     pub fn download_file(&self, id: &str, target_path: &str) -> Result<Vec<u8>, Error> {
-        let url = self.full_url(&format!(
-            "{}/sandboxes/{}/toolbox/files/download?path={}",
-            self.version_prefix(),
-            id,
-            urlencoding::encode(target_path)
-        ));
-        let response = self
-            .inner
-            .request(Method::GET, &url)
-            .authorize(self)
-            .send()?;
-        self.handle_response(response)?
-            .bytes()
-            .map_err(Error::Reqwest)
-            .map(|bytes| bytes.to_vec())
+        self.download_file_with_options(id, target_path, DownloadFileOptions::default())
     }
 
     pub fn expose_port(
@@ -1989,21 +2459,7 @@ impl Client {
         port: u16,
         options: ExposeOptions,
     ) -> Result<ExposeResult, Error> {
-        let protocol_str = match options.protocol {
-            ExposeProtocol::Http => "http",
-            ExposeProtocol::Tcp => "tcp",
-            ExposeProtocol::Tls => "tls",
-        };
-        let body = if matches!(options.protocol, ExposeProtocol::Http) {
-            None
-        } else {
-            Some(serde_json::json!({"protocol": protocol_str}))
-        };
-        let wire = self.do_json::<Value, ExposePortResponseWire>(
-            Method::POST,
-            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
-            body.as_ref(),
-        )?;
+        let wire = self.expose_port_wire(id, port, options)?;
         match wire.protocol.as_str() {
             "tcp" => Ok(ExposeResult::Tcp {
                 url: wire.public_url,
@@ -2020,10 +2476,104 @@ impl Client {
         }
     }
 
+    /// Like [`Client::expose_port`], but returns every field the server
+    /// reports, including the port's visibility, in one struct.
+    pub fn expose_port_info(
+        &self,
+        id: &str,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortInfo, Error> {
+        let wire = self.expose_port_wire(id, port, options)?;
+        let protocol = match wire.protocol.as_str() {
+            "tcp" => ExposeProtocol::Tcp,
+            "tls" => ExposeProtocol::Tls,
+            "http" | "" => ExposeProtocol::Http,
+            other => return Err(Error::Client(format!("unknown expose protocol: {}", other))),
+        };
+        // An unknown value is an error, not Public: reporting a gated port
+        // as open to everyone would be the wrong way to be lenient.
+        let visibility = match wire.visibility.as_deref() {
+            None | Some("") | Some("public") => ExposeVisibility::Public,
+            Some("token") => ExposeVisibility::Token,
+            Some(other) => {
+                return Err(Error::Client(format!("unknown port visibility: {}", other)))
+            }
+        };
+        Ok(ExposePortInfo {
+            protocol,
+            url: wire.public_url,
+            host: wire.host.filter(|h| !h.is_empty()),
+            host_port: wire.host_port.filter(|p| *p != 0),
+            visibility,
+        })
+    }
+
+    fn expose_port_wire(
+        &self,
+        id: &str,
+        port: u16,
+        options: ExposeOptions,
+    ) -> Result<ExposePortResponseWire, Error> {
+        let protocol_str = match options.protocol {
+            ExposeProtocol::Http => "http",
+            ExposeProtocol::Tcp => "tcp",
+            ExposeProtocol::Tls => "tls",
+        };
+        // Only what the caller set: an omitted visibility keeps an exposed
+        // port's gate, so a plain retry never opens a token port.
+        let mut fields = serde_json::Map::new();
+        if !matches!(options.protocol, ExposeProtocol::Http) {
+            fields.insert("protocol".into(), Value::from(protocol_str));
+        }
+        if let Some(visibility) = options.visibility {
+            fields.insert("visibility".into(), Value::from(visibility.as_str()));
+        }
+        let body = if fields.is_empty() {
+            None
+        } else {
+            Some(Value::Object(fields))
+        };
+        self.do_json::<Value, ExposePortResponseWire>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
+            body.as_ref(),
+        )
+    }
+
     pub fn unexpose_port(&self, id: &str, port: u16) -> Result<(), Error> {
         self.do_json::<(), ()>(
             Method::DELETE,
             &format!("{}/sandboxes/{}/ports/{}", self.version_prefix(), id, port),
+            None,
+        )
+    }
+
+    /// Issue a signed token scoped to one sandbox (`POST
+    /// /v1/sandboxes/{id}/tokens`). Not idempotent by nature: every call
+    /// makes a new token and the server stores none. It uses the normal
+    /// retry tier: a retry after a lost answer makes a second token nobody
+    /// holds, which simply expires.
+    pub fn create_sandbox_token(
+        &self,
+        id: &str,
+        options: CreateSandboxTokenOptions,
+    ) -> Result<SandboxToken, Error> {
+        self.do_json::<CreateSandboxTokenOptions, SandboxToken>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/tokens", self.version_prefix(), id),
+            Some(&options),
+        )
+    }
+
+    /// Make every token issued for one sandbox so far stop working (`POST
+    /// /v1/sandboxes/{id}/tokens/revoke`). A token issued after it works.
+    /// Safe to retry: a repeated call refuses the same tokens again (plus
+    /// any issued in between), so it uses the normal retry tier.
+    pub fn revoke_sandbox_tokens(&self, id: &str) -> Result<RevokeSandboxTokensResult, Error> {
+        self.do_json::<(), RevokeSandboxTokensResult>(
+            Method::POST,
+            &format!("{}/sandboxes/{}/tokens/revoke", self.version_prefix(), id),
             None,
         )
     }
@@ -2113,6 +2663,61 @@ impl Client {
         format!("{}{}", self.api_url, path)
     }
 
+    fn ws_dial(&self) -> WsDial {
+        WsDial {
+            api_url: self.api_url.clone(),
+            api_version: self.api_version,
+            pat_token: self.pat_token.clone(),
+            team: self.team.clone(),
+            cells: Arc::clone(&self.cells),
+        }
+    }
+
+    /// Fails closed unless the sandbox's agent lists every feature on
+    /// `/version`. toolboxd ignores request options it does not know, so
+    /// sending a newer option to an older agent would silently skip it.
+    pub(crate) fn require_toolbox_features(&self, sandbox_id: &str, features: &[&str]) -> Result<(), Error> {
+        if features.is_empty() {
+            return Ok(());
+        }
+        {
+            let cache = self.toolbox_features.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(have) = cache.get(sandbox_id) {
+                if features.iter().all(|feature| have.contains(*feature)) {
+                    return Ok(());
+                }
+            }
+        }
+        let info: Value = self.do_json::<Value, Value>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/toolbox/version", self.version_prefix(), sandbox_id),
+            None,
+        )?;
+        let have: HashSet<String> = info
+            .get("features")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let missing: Vec<String> = features
+            .iter()
+            .filter(|feature| !have.contains(**feature))
+            .map(|feature| feature.to_string())
+            .collect();
+        self.toolbox_features
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(sandbox_id.to_string(), have);
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::UnsupportedFeature(UnsupportedFeatureError {
+            sandbox_id: sandbox_id.to_string(),
+            features: missing,
+            agent_version: info.get("version").and_then(Value::as_str).unwrap_or_default().to_string(),
+            runtime: info.get("runtime").and_then(Value::as_str).unwrap_or_default().to_string(),
+        }))
+    }
+
     fn do_json<T: Serialize, U: DeserializeOwned>(
         &self,
         method: Method,
@@ -2173,44 +2778,124 @@ impl Client {
         policy: RetryPolicy,
         headers: &[(&str, &str)],
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json_done(method, path, payload, policy, headers, None)
+    }
+
+    /// [`Client::send_json_with_headers`] for a call whose retry can find
+    /// its own work done: a delete finds the path gone, a mkdir its folder.
+    /// When a re-sent attempt (never the first) gets an error carrying the
+    /// toolbox error code `done_code`, the first attempt's reply was lost
+    /// and the call succeeds as an empty reply.
+    fn send_json_done<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_with_retry(method, path, policy, headers, done_code, |builder| match payload {
+            Some(body) => builder.json(body),
+            None => builder,
+        })
+    }
+
+    /// The retry loop behind every request with a body that can be sent
+    /// again: `body` adds the body to each attempt's request, so a body that
+    /// is consumed when sent (a multipart form) is built afresh each time.
+    fn send_with_retry<U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+        body: impl Fn(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        let Some(response) = self.send_raw_with_retry(method, path, policy, headers, done_code, body)? else {
+            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+            return Ok((body, reqwest::header::HeaderMap::new()));
+        };
+        let headers = response.headers().clone();
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
+            return Ok((body, headers));
+        }
+        // A success may come with no body at all (the toolbox's mkdir
+        // answers a bare 201): read it as null.
+        let text = response.text().map_err(Error::Reqwest)?;
+        let text = if text.trim().is_empty() { "null" } else { text.as_str() };
+        Ok((serde_json::from_str(text).map_err(Error::SerdeJson)?, headers))
+    }
+
+    /// The retry loop itself. It returns the first successful response with
+    /// its body unread (a download streams it), or `None` when a retry found
+    /// its work done (`done_code`). Nothing is retried once a response is
+    /// returned.
+    fn send_raw_with_retry(
+        &self,
+        method: Method,
+        path: &str,
+        policy: RetryPolicy,
+        headers: &[(&str, &str)],
+        done_code: Option<&str>,
+        body: impl Fn(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<Option<reqwest::blocking::Response>, Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
 
+        // done_code counts only after an attempt whose reply was lost (a
+        // dropped connection, 502 or 504): that attempt may have done the
+        // work. A 421, 429 or 503 is answered before any work, so after one
+        // a delete of a path that was never there still reports it.
+        let mut may_have_run = false;
         let mut attempt = 0;
         loop {
             let mut retry_after = None;
-            let url = self.full_url(path);
-            let mut builder = self
-                .inner
-                .request(method.clone(), &url)
-                .authorize(self);
-            if let Some(body) = payload {
-                builder = builder.json(body);
-            }
-            for (name, value) in headers {
-                builder = builder.header(*name, *value);
-            }
+            let sent = self.send_routed(&method, path, true, |builder| {
+                let mut builder = body(builder);
+                for (name, value) in headers {
+                    builder = builder.header(*name, *value);
+                }
+                builder
+            });
 
-            match builder.send() {
-                Ok(response) => {
-                    if attempt < max_retries && policy.retries_status(response.status()) {
+            match sent {
+                Ok((response, cell_answer)) => {
+                    let earlier_may_have_run = may_have_run;
+                    may_have_run |= matches!(response.status().as_u16(), 502 | 504);
+                    let retries = !cell_answer && policy.retries_status(response.status());
+                    if let (Some(code), true) = (done_code, earlier_may_have_run && !response.status().is_success()) {
+                        let status = response.status();
+                        let hint = retry_after_hint(&response);
+                        let header_retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(String::from);
+                        let body = response.text().unwrap_or_default();
+                        let err = ApiError::from_response(status, header_retry_after.as_deref(), &body);
+                        if err.code() == Some(code) {
+                            return Ok(None);
+                        }
+                        if attempt >= max_retries || !retries {
+                            return Err(Error::Api(err));
+                        }
+                        retry_after = hint;
+                    } else if attempt < max_retries && retries {
                         // Fall through to retry logic; dropping the response
                         // frees the connection before the wait.
                         retry_after = retry_after_hint(&response);
                     } else {
-                        let response = self.handle_response(response)?;
-                        let headers = response.headers().clone();
-                        if response.status() == reqwest::StatusCode::NO_CONTENT {
-                            let body = serde_json::from_str("null").map_err(Error::SerdeJson)?;
-                            return Ok((body, headers));
-                        }
-                        let body = response.json().map_err(Error::Reqwest)?;
-                        return Ok((body, headers));
+                        return self.handle_response(response).map(Some);
                     }
                 }
                 Err(err) => {
                     if attempt >= max_retries || !policy.retries_error(&err) {
                         return Err(Error::Reqwest(err));
                     }
+                    // is_connect fails before a byte of the request is written.
+                    may_have_run |= !err.is_connect();
                 }
             }
 
@@ -2227,15 +2912,56 @@ impl Client {
         }
     }
 
-    fn do_multipart(&self, path: &str, form: Form) -> Result<(), Error> {
-        let url = self.full_url(path);
-        let response = self
-            .inner
-            .post(&url)
-            .authorize(self)
-            .multipart(form)
-            .send()?;
-        self.handle_response(response).map(|_| ())
+    /// Sends one attempt to the cell that holds the path's sandbox: the one
+    /// this client learned for it, else the configured base URL.
+    ///
+    /// A cell answers 421 + [`CELL_ENDPOINT_HEADER`] before doing any work,
+    /// so the request goes to the named cell once, under any retry policy,
+    /// when `resend` says its body can be built again. The cell is
+    /// remembered either way, so a caller's own retry of a one-shot body
+    /// goes to the right place. The flag is true for a cell answer that must
+    /// reach the caller as it is (a second hop, a downgrade to http, a body
+    /// that cannot be re-sent): the retry loop would only repeat it.
+    fn send_routed(
+        &self,
+        method: &Method,
+        path: &str,
+        resend: bool,
+        mut build: impl FnMut(reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::blocking::Response, bool), reqwest::Error> {
+        let sandbox = cells::sandbox_of(path, self.version_prefix());
+        let mut cell = sandbox.as_deref().and_then(|id| self.cells.get(id));
+        let mut send = |base: &str| {
+            build(self.inner.request(method.clone(), format!("{}{}", base, path)).authorize(self)).send()
+        };
+        let mut response = send(cell.as_deref().unwrap_or(&self.api_url))?;
+        let Some(id) = sandbox.as_deref() else {
+            return Ok((response, false));
+        };
+        let mut cell_answer = false;
+        match cells::cell_hint(response.status(), response.headers(), &self.api_url) {
+            CellHint::None => {}
+            CellHint::Downgrade => cell_answer = true,
+            CellHint::Follow(next) => {
+                self.cells.remember(id, &next);
+                if resend {
+                    response = send(&next)?;
+                    // No chains: a second cell redirect is the caller's error.
+                    cell_answer = cells::cell_hint(response.status(), response.headers(), &self.api_url) != CellHint::None;
+                    cell = Some(next);
+                } else {
+                    cell_answer = true;
+                }
+            }
+        }
+        // The sandbox may have been deleted; the configured base finds its
+        // cell again if not. Any 404 counts (a missing file too): telling
+        // them apart is not worth a wrong guess, and a wrong forget costs
+        // only one more 421 round trip.
+        if let (Some(cell), reqwest::StatusCode::NOT_FOUND) = (cell.as_deref(), response.status()) {
+            self.cells.forget(id, cell);
+        }
+        Ok((response, cell_answer))
     }
 
     fn handle_response(
@@ -2262,31 +2988,24 @@ impl Client {
 }
 
 async fn run_exec_stream(
-    api_url: String,
-    api_version: ApiVersion,
-    pat_token: String,
-    team: Option<String>,
+    dial: WsDial,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(
-        &api_url,
-        &format!(
-            "{}/sandboxes/{}/toolbox/process/exec/stream",
-            api_version.path_prefix(),
-            urlencoding::encode(&sandbox_id)
-        ),
-    )?;
-    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
-
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|err| decorate_ws_handshake("exec stream", err))?;
+    let route = format!(
+        "{}/sandboxes/{}/toolbox/process/exec/stream",
+        dial.api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id)
+    );
+    let stream = dial
+        .connect(&route, |err| decorate_ws_handshake("exec stream", err))
+        .await?;
     let (mut write, mut read) = stream.split();
 
     let start = ExecStreamStartRequest {
         command: options.command.clone(),
+        argv: options.argv.clone(),
         workdir: options.workdir.clone(),
         env: options.env.clone(),
         tty: options.tty,
@@ -2353,29 +3072,21 @@ async fn run_exec_stream(
 }
 
 async fn run_session_attach(
-    api_url: String,
-    api_version: ApiVersion,
-    pat_token: String,
-    team: Option<String>,
+    dial: WsDial,
     sandbox_id: String,
     session_id: String,
     options: SessionAttachOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
 ) -> Result<ExecExitInfo, Error> {
-    let ws_url = websocket_url(
-        &api_url,
-        &format!(
-            "{}/sandboxes/{}/sessions/{}/attach",
-            api_version.path_prefix(),
-            urlencoding::encode(&sandbox_id),
-            urlencoding::encode(&session_id)
-        ),
-    )?;
-    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
-
-    let (stream, _) = connect_async(request)
-        .await
-        .map_err(|err| decorate_ws_handshake("session attach", err))?;
+    let route = format!(
+        "{}/sandboxes/{}/sessions/{}/attach",
+        dial.api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id),
+        urlencoding::encode(&session_id)
+    );
+    let stream = dial
+        .connect(&route, |err| decorate_ws_handshake("session attach", err))
+        .await?;
     let (mut write, mut read) = stream.split();
 
     if let (Some(cols), Some(rows)) = (options.cols, options.rows) {
@@ -2447,6 +3158,143 @@ async fn run_session_attach(
             }
         }
     }
+}
+
+/// How long a file watch waits for the agent to say the watch is armed.
+const FILE_WATCH_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs the wait for the start frame, giving up after `limit`.
+async fn within_file_watch_start<F>(limit: Duration, wait_for_start: F) -> Result<(), Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    match tokio::time::timeout(limit, wait_for_start).await {
+        Ok(started) => started,
+        Err(_) => Err(Error::Client(format!("file watch did not start within {:?}", limit))),
+    }
+}
+
+async fn run_file_watch(
+    dial: WsDial,
+    sandbox_id: String,
+    path: String,
+    options: WatchOptions,
+    mut on_event: impl FnMut(FileEvent),
+    ready: &mut Option<mpsc::Sender<Result<(), Error>>>,
+    mut stop_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> Result<(), Error> {
+    let mut route = format!(
+        "{}/sandboxes/{}/toolbox/files/watch?path={}",
+        dial.api_version.path_prefix(),
+        urlencoding::encode(&sandbox_id),
+        urlencoding::encode(&path)
+    );
+    if options.recursive {
+        route.push_str("&recursive=true");
+    }
+    let stream = dial
+        .connect(&route, |err| file_watch_handshake_error(&sandbox_id, err))
+        .await?;
+    let (mut write, mut read) = stream.split();
+
+    // The watch is in place only once the start frame arrives; returning
+    // before it would lose a change the caller makes right away. The wait is
+    // bounded: a proxy that accepts the upgrade and then goes quiet would
+    // otherwise block the caller forever. Later reads are not bounded, since
+    // a quiet folder sends nothing for as long as it stays quiet.
+    let wait_for_start = async {
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
+                    match frame.kind.as_str() {
+                        "start" => return Ok::<(), Error>(()),
+                        "end" => return Err(file_watch_ended(frame.reason)),
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err(Error::Client("file watch closed before it started".to_string()))
+                }
+                Some(Ok(_)) => {}
+                Some(Err(err)) => return Err(Error::WebSocket(err)),
+            }
+        }
+    };
+    within_file_watch_start(FILE_WATCH_START_TIMEOUT, wait_for_start).await?;
+    if let Some(ready_tx) = ready.take() {
+        let _ = ready_tx.send(Ok(()));
+    }
+
+    loop {
+        tokio::select! {
+            // stop(), or the handle dropped (recv gives None).
+            _ = stop_rx.recv() => {
+                let _ = write.send(Message::Close(None)).await;
+                return Ok(());
+            }
+            message = read.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: FileWatchServerFrame = serde_json::from_str(text.as_ref())?;
+                        match frame.kind.as_str() {
+                            "events" => frame.events.into_iter().for_each(&mut on_event),
+                            "end" => return Err(file_watch_ended(frame.reason)),
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err(Error::Client("file watch stream closed before the watch ended".to_string()))
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => return Err(Error::WebSocket(err)),
+                }
+            }
+        }
+    }
+}
+
+/// The sandbox ended the watch on its own: the folder was removed or moved.
+fn file_watch_ended(reason: Option<String>) -> Error {
+    Error::Client(
+        reason
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "file watch ended".to_string()),
+    )
+}
+
+/// Maps a refused watch handshake to an error. A 404 that toolboxd marks
+/// as "no such route" (the `X-Toolbox-Route: none` header, or the bare
+/// `not found` an agent sends from before the header existed) means the
+/// agent predates file watching. sandboxd's own 404 says "sandbox not
+/// found" and a missing path "path not found: ...", so neither is taken for
+/// it. Every other refusal is the server's [`ApiError`].
+fn file_watch_handshake_error(sandbox_id: &str, err: WebSocketError) -> Error {
+    let response = match err {
+        WebSocketError::Http(response) => response,
+        other => return Error::WebSocket(other),
+    };
+    let status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+    };
+    let route_missing = header("X-Toolbox-Route").is_some_and(|value| value.trim() == "none");
+    let retry_after = header("Retry-After");
+    let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default()).to_string();
+    let api = ApiError::from_response(status, retry_after.as_deref(), &body);
+    if status == reqwest::StatusCode::NOT_FOUND && (route_missing || api.message() == "not found") {
+        return Error::UnsupportedFeature(UnsupportedFeatureError {
+            sandbox_id: sandbox_id.to_string(),
+            features: vec![FILE_WATCH_FEATURE.to_string()],
+            agent_version: String::new(),
+            runtime: String::new(),
+        });
+    }
+    Error::Api(api)
 }
 
 // decorate_ws_handshake unwraps tungstenite's Http error variant so the
@@ -2611,6 +3459,8 @@ mod tests {
             status: &'static str,
             retry_after: Option<String>,
         },
+        /// A 421 naming another cell in [`CELL_ENDPOINT_HEADER`].
+        Cell(String),
     }
 
     impl Reply {
@@ -2652,6 +3502,7 @@ mod tests {
                 server_requests.lock().expect("requests lock").push(request);
                 server_hits.fetch_add(1, Ordering::SeqCst);
                 let paced_body = r#"{"error":"busy","code":"overloaded"}"#.to_string();
+                let cell_body = r#"{"error":"sandbox lives in another cell"}"#.to_string();
                 let (status, body, delay, extra) = match &script[i.min(script.len() - 1)] {
                     Reply::Hangup => continue,
                     Reply::Json { status, body, delay } => (*status, body, *delay, String::new()),
@@ -2663,6 +3514,12 @@ mod tests {
                             .as_ref()
                             .map(|v| format!("Retry-After: {}\r\n", v))
                             .unwrap_or_default(),
+                    ),
+                    Reply::Cell(endpoint) => (
+                        "421 Misdirected Request",
+                        &cell_body,
+                        Duration::ZERO,
+                        format!("{}: {}\r\n", CELL_ENDPOINT_HEADER, endpoint),
                     ),
                 };
                 thread::sleep(delay);
@@ -2830,6 +3687,7 @@ mod tests {
         let mut buffer = Vec::new();
         let mut header_end = None;
         let mut content_length = 0usize;
+        let mut chunked = false;
 
         loop {
             let mut chunk = [0u8; 1024];
@@ -2849,13 +3707,23 @@ mod tests {
                             if value.0.eq_ignore_ascii_case("content-length") {
                                 content_length = value.1.trim().parse::<usize>().unwrap_or(0);
                             }
+                            // A streamed body (a reader upload) has no length.
+                            if value.0.eq_ignore_ascii_case("transfer-encoding")
+                                && value.1.trim().eq_ignore_ascii_case("chunked")
+                            {
+                                chunked = true;
+                            }
                         }
                     }
                 }
             }
 
             if let Some(end) = header_end {
-                if buffer.len() >= end + content_length {
+                if chunked {
+                    if buffer[end..].ends_with(b"0\r\n\r\n") {
+                        break;
+                    }
+                } else if buffer.len() >= end + content_length {
                     break;
                 }
             }
@@ -2888,6 +3756,7 @@ mod tests {
             platform_volumes: None,
             lifecycle: None,
             failover: None,
+            placement: None,
             runtime: None,
             template_id: None,
             gpus: None,
@@ -2898,6 +3767,7 @@ mod tests {
             name: None,
             tags: None,
             idempotency_key: None,
+            identity: None,
         }
     }
 
@@ -2936,11 +3806,19 @@ mod tests {
                 name: "data".to_string(),
                 path: "/workspace".to_string(),
                 read_only: None,
+                delete_with_sandbox: None,
             },
             PlatformVolumeMount {
                 name: "cache".to_string(),
                 path: "/cache".to_string(),
                 read_only: Some(true),
+                delete_with_sandbox: None,
+            },
+            PlatformVolumeMount {
+                name: "scratch".to_string(),
+                path: "/scratch".to_string(),
+                delete_with_sandbox: Some(true),
+                ..Default::default()
             },
         ]);
         let value = serde_json::to_value(&opts).expect("serialize create options");
@@ -2953,6 +3831,14 @@ mod tests {
         assert!(value["platform_volumes"][0].get("read_only").is_none());
         assert_eq!(
             value["platform_volumes"][1]["read_only"],
+            serde_json::json!(true)
+        );
+        // delete_with_sandbox follows the same rule.
+        assert!(value["platform_volumes"][0]
+            .get("delete_with_sandbox")
+            .is_none());
+        assert_eq!(
+            value["platform_volumes"][2]["delete_with_sandbox"],
             serde_json::json!(true)
         );
         // Unset by default => skip_serializing_if omits the field.
@@ -3138,6 +4024,175 @@ mod tests {
             .expect("get should retry to success");
         assert_eq!(sandbox.data.id, "sb-1");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    fn sandbox_body(id: &str) -> String {
+        named_sandbox_json(id, id).to_string()
+    }
+
+    fn api_status_of<T: fmt::Debug>(result: Result<T, Error>) -> u16 {
+        match result {
+            Err(Error::Api(api)) => api.status(),
+            other => panic!("want an API error, got {:?}", other),
+        }
+    }
+
+    // C16: a cell asked about a sandbox another cell holds answers 421 and
+    // names that cell. The same request goes there once, under the cell's
+    // own path prefix. Exec shows it holds under the retry tier that never
+    // re-sends a plain 421: the first cell did no work.
+    #[test]
+    fn cell_redirect_resends_the_request_to_the_named_cell() {
+        let (cell2, cell2_hits, cell2_requests) =
+            spawn_recording_scripted_server(vec![Reply::ok(exec_ok_json())]);
+        let (cell1, cell1_hits, cell1_requests) =
+            spawn_recording_scripted_server(vec![Reply::Cell(format!("{}/cell2/", cell2))]);
+        let mut client = fast_retry_client(&format!("{}/edge", cell1));
+        client.team = Some("payments".to_string());
+
+        let result = client
+            .exec("sb-x", ExecRequest::from("echo hi"))
+            .expect("exec should reach cell 2");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        let first = cell1_requests.lock().expect("requests lock")[0].clone();
+        let second = cell2_requests.lock().expect("requests lock")[0].clone();
+        assert!(
+            first.starts_with("POST /edge/v1/sandboxes/sb-x/toolbox/process/execute HTTP/1.1\r\n"),
+            "{}",
+            first
+        );
+        assert!(
+            second.starts_with("POST /cell2/v1/sandboxes/sb-x/toolbox/process/execute HTTP/1.1\r\n"),
+            "{}",
+            second
+        );
+        assert_eq!(header_value(&second, "Authorization"), Some("Bearer pat-token"));
+        assert_eq!(header_value(&second, TEAM_HEADER), Some("payments"));
+        assert_eq!(header_value(&second, "Content-Type"), header_value(&first, "Content-Type"));
+        assert_eq!(request_json_body(&second), request_json_body(&first));
+        assert_eq!(request_json_body(&second)["command"], "echo hi");
+    }
+
+    // The cell is remembered for that sandbox, by the client and every
+    // clone of it (a returned Sandbox); other sandboxes still start at the
+    // configured base.
+    #[test]
+    fn cell_redirect_is_remembered_for_that_sandbox_only() {
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell1, cell1_hits) =
+            spawn_scripted_server(vec![Reply::Cell(cell2.clone()), Reply::ok(sandbox_body("sb-y"))]);
+        let client = fast_retry_client(&cell1);
+
+        let sandbox = client.get("sb-x").expect("first get follows the redirect");
+        assert_eq!(sandbox.data.id, "sb-x");
+        client.get("sb-x").expect("second get");
+        sandbox.client.get("sb-x").expect("get through the sandbox's client");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1, "cell 1 asked again");
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 3);
+
+        assert_eq!(client.get("sb-y").expect("other sandbox").data.id, "sb-y");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 3);
+    }
+
+    // A 421 with no cell header (or one that is not an absolute URL) is the
+    // in-cluster kind: retried on the same endpoint as before, nothing
+    // remembered.
+    #[test]
+    fn misdirected_without_a_usable_cell_header_retries_the_same_endpoint() {
+        for first in [Reply::status("421 Misdirected Request"), Reply::Cell("cell2.example.com".to_string())] {
+            let (url, hits) = spawn_scripted_server(vec![first, Reply::ok(sandbox_body("sb-x"))]);
+            let client = fast_retry_client(&url);
+            assert_eq!(client.get("sb-x").expect("421 should be retried").data.id, "sb-x");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert_eq!(client.cells.len(), 0);
+        }
+    }
+
+    // No chains: the named cell answering with yet another cell is the
+    // caller's error. Each cell is asked once (the retry loop does not
+    // repeat a cell answer) and the third is never dialled.
+    #[test]
+    fn cell_redirect_is_followed_at_most_once() {
+        let (cell3, cell3_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::Cell(cell3)]);
+        let (cell1, cell1_hits) = spawn_scripted_server(vec![Reply::Cell(cell2.clone())]);
+        let client = fast_retry_client(&cell1);
+
+        assert_eq!(api_status_of(client.get("sb-x")), 421);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell3_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+    }
+
+    // An https client never follows a cell to http: that would send its
+    // token in clear text. The fake servers speak plain HTTP, so sandbox X
+    // is pinned to one of them directly; the https base is never dialled.
+    #[test]
+    fn cell_redirect_never_downgrades_an_https_client_to_http() {
+        let (cell3, cell3_hits) = spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x"))]);
+        let (cell2, cell2_hits) = spawn_scripted_server(vec![Reply::Cell(cell3)]);
+        let client = fast_retry_client("https://cell1.invalid");
+        client.cells.remember("sb-x", &cell2);
+
+        assert_eq!(api_status_of(client.get("sb-x")), 421);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell3_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+    }
+
+    // A 404 from the remembered cell (the sandbox may be gone) forgets it,
+    // so the next call starts at the configured base again.
+    #[test]
+    fn not_found_from_the_remembered_cell_forgets_it() {
+        let (cell2, cell2_hits) =
+            spawn_scripted_server(vec![Reply::ok(sandbox_body("sb-x")), Reply::status("404 Not Found")]);
+        let (cell1, cell1_hits) =
+            spawn_scripted_server(vec![Reply::Cell(cell2.clone()), Reply::ok(sandbox_body("sb-x"))]);
+        let client = fast_retry_client(&cell1);
+
+        client.get("sb-x").expect("first get follows the redirect");
+        assert_eq!(api_status_of(client.get("sb-x")), 404);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(client.cells.get("sb-x"), None);
+
+        client.get("sb-x").expect("third get starts at the configured base");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 2);
+    }
+
+    // A streamed body cannot be sent twice: the 421 reaches the caller, but
+    // the cell is remembered, so the caller's own retry goes to it.
+    #[test]
+    fn streamed_upload_is_not_resent_but_its_cell_is_remembered() {
+        let (cell2, cell2_hits, cell2_requests) =
+            spawn_recording_scripted_server(vec![Reply::ok("{}".to_string())]);
+        let (cell1, cell1_hits) = spawn_scripted_server(vec![Reply::Cell(cell2.clone())]);
+        let client = fast_retry_client(&cell1);
+        let upload = || {
+            client.upload_file_from(
+                "sb-x",
+                "/w/a.txt",
+                std::io::Cursor::new(b"streamed-bytes".to_vec()),
+                UploadFileOptions::default(),
+            )
+        };
+
+        assert_eq!(api_status_of(upload()), 421);
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+
+        upload().expect("the caller's retry reaches cell 2");
+        assert_eq!(cell1_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(cell2_hits.load(Ordering::SeqCst), 1);
+        let request = cell2_requests.lock().expect("requests lock")[0].clone();
+        assert!(request.starts_with("POST /v1/sandboxes/sb-x/toolbox/files/upload HTTP/1.1\r\n"), "{}", request);
+        assert!(request.contains("streamed-bytes"), "{}", request);
     }
 
     /// Formats `t` as an IMF-fixdate, the HTTP-date form servers send.
@@ -3695,12 +4750,57 @@ mod tests {
                 stop_at_age: 0,
                 destroy_at_age: 86400000000000,
                 serverless: false,
+                restart_on_failure: false,
+                destroy_after_exit_for: 0,
+                destroy_at: None,
             }
         );
         assert_eq!(
             sandbox.data.failover,
             Some(Failover {
                 policy: "recreate".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn create_sends_placement_rule() {
+        let body = serde_json::json!({
+            "id": "sb-placed",
+            "image": "ubuntu:22.04",
+            "status": "running",
+            "public_url": "",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2026-05-07T10:00:00Z",
+            "updated_at": "2026-05-07T10:00:00Z",
+            "last_active_at": "2026-05-07T10:00:00Z"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("tier".to_string(), "pci".to_string());
+        client
+            .create(CreateOptions {
+                placement: Some(PlacementRule {
+                    zone: Some("eu-west-1a".to_string()),
+                    labels: Some(labels),
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let body = request_json_body(&request);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "placement": { "zone": "eu-west-1a", "labels": { "tier": "pci" } }
             })
         );
     }
@@ -3764,6 +4864,9 @@ mod tests {
                 stop_at_age: 0,
                 destroy_at_age: 172800000000000,
                 serverless: false,
+                restart_on_failure: false,
+                destroy_after_exit_for: 0,
+                destroy_at: None,
             }
         );
     }
@@ -3818,6 +4921,75 @@ mod tests {
             })
         );
         assert!(sandbox.data.lifecycle.serverless);
+    }
+
+    #[test]
+    fn create_round_trips_restart_on_failure() {
+        let body = serde_json::json!({
+            "id": "sb-restart",
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "",
+            "cpu": 1,
+            "memory_mb": 1024,
+            "disk_gb": 10,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2026-11-06T10:00:00Z",
+            "updated_at": "2026-11-06T10:00:00Z",
+            "last_active_at": "2026-11-06T10:00:00Z",
+            "lifecycle": { "restart_on_failure": true }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                lifecycle: Some(Lifecycle {
+                    restart_on_failure: true,
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        let wire = request_json_body(&request);
+
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "image": "ubuntu:22.04",
+                "lifecycle": { "restart_on_failure": true }
+            })
+        );
+        assert!(sandbox.data.lifecycle.restart_on_failure);
+    }
+
+    #[test]
+    fn lifecycle_destroy_after_exit_for_round_trips() {
+        let lc = Lifecycle {
+            destroy_after_exit_for: 60_000_000_000,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&lc).unwrap();
+        assert_eq!(wire, serde_json::json!({ "destroy_after_exit_for": 60_000_000_000u64 }));
+        let back: Lifecycle = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, lc);
+        assert_eq!(serde_json::to_value(Lifecycle::default()).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn lifecycle_destroy_at_goes_out_as_a_string() {
+        let lc = Lifecycle {
+            destroy_at: Some("2026-11-06T18:00:00Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&lc).unwrap(),
+            serde_json::json!({ "destroy_at": "2026-11-06T18:00:00Z" })
+        );
     }
 
     #[test]
@@ -4259,13 +5431,14 @@ mod tests {
                     limit: Some(50),
                     cursor: Some("c1".to_string()),
                     incarnation_id: Some("inc-1".to_string()),
+                    caller: Some("system:*".to_string()),
                 },
             )
             .expect("get_audit should succeed");
         let request = request_rx.recv().expect("request should be captured");
         assert!(
             request.starts_with(
-                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A%2A HTTP/1.1\r\n"
             ),
             "unexpected request: {}",
             request
@@ -4623,6 +5796,203 @@ mod tests {
         assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
         assert!(page.profiles.is_empty());
         assert_eq!(page.next_cursor.as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn warm_pool_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "image": "ghcr.io/acme/agent:1", "depth": 2, "generation": 1, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client
+            .put_warm_pool("ghcr.io/acme/agent:1", WarmPoolOptions { depth: 2, ..Default::default() })
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/warm-pools/ghcr.io/acme/agent%3A1 HTTP/1.1\r\n"),
+            "an image keeps its slashes and each segment is escaped: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 2}));
+        assert_eq!(pool.depth, 2);
+        assert!(pool.status.is_none());
+
+        let got = serde_json::json!({
+            "image": "python:3.12", "depth": 2, "generation": 3,
+            "status": {"ready": 3, "target": 4, "servers": [
+                {"node_id": "n1", "ready": 2, "target": 2},
+                {"node_id": "n2", "ready": 1, "target": 2, "stale": true}
+            ]}
+        });
+        let (url, request_rx) = spawn_json_server(got.to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client.get_warm_pool("python:3.12").expect("get should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/warm-pools/python%3A3.12 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        let status = pool.status.expect("a GET carries status");
+        assert_eq!((status.ready, status.target, status.servers.len()), (3, 4, 2));
+        assert!(status.servers[1].stale && !status.servers[0].stale);
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"pools": [got]}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pools = client.list_warm_pools().expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/warm-pools HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(pools.len(), 1);
+
+        let (url, _rx) = spawn_json_server(serde_json::json!({"pools": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        assert!(client.list_warm_pools().expect("list should succeed").is_empty());
+
+        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.delete_warm_pool("python:3.12").expect("delete should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("DELETE /v1/warm-pools/python%3A3.12 HTTP/1.1\r\n"), "unexpected request: {}", request);
+
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({"image": "python:3.12", "depth": 0, "min_depth": 1, "max_depth": 4, "generation": 1}).to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client
+            .put_warm_pool("python:3.12", WarmPoolOptions { min_depth: 1, max_depth: 4, ..Default::default() })
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 0, "min_depth": 1, "max_depth": 4}));
+        assert_eq!((pool.min_depth, pool.max_depth), (1, 4));
+
+        let (url, request_rx) = spawn_json_server(
+            serde_json::json!({
+                "image": "python:3.12", "depth": 2, "on_image_change": "replace_as_used",
+                "status": {"ready": 2, "target": 2, "outdated": 1, "servers": [{"node_id": "n1", "ready": 2, "target": 2, "outdated": 1}]}
+            })
+            .to_string(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let pool = client
+            .put_warm_pool(
+                "python:3.12",
+                WarmPoolOptions { depth: 2, on_image_change: "replace_as_used".to_string(), ..Default::default() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"depth": 2, "on_image_change": "replace_as_used"}));
+        assert_eq!(pool.on_image_change, "replace_as_used");
+        let status = pool.status.expect("status");
+        assert_eq!((status.outdated, status.servers[0].outdated), (1, 1));
+    }
+
+    #[test]
+    fn identity_role_calls_map_wire_shape() {
+        let role = serde_json::json!({
+            "tag": "deploy", "min_role": "runner", "team": "payments", "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(role);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let got = client
+            .put_identity_role(
+                "deploy",
+                IdentityRoleOptions { min_role: "runner".to_string(), team: Some("payments".to_string()) },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/identity/roles/deploy?team=payments HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"min_role": "runner"}));
+        assert_eq!(got.min_role, "runner");
+        assert_eq!(got.team.as_deref(), Some("payments"));
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"roles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_identity_roles(ListIdentityRolesOptions {
+                team: Some("payments".to_string()),
+                cursor: Some("a".to_string()),
+                limit: Some(5),
+            })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("GET /v1/identity/roles?team=payments&cursor=a&limit=5 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(page.roles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
+
+        let (url, request_rx) = spawn_response_server("204 No Content", "application/json", Vec::new());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client.delete_identity_role("ops", None).expect("delete should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("DELETE /v1/identity/roles/ops HTTP/1.1\r\n"), "unexpected request: {}", request);
+    }
+
+    #[test]
+    fn create_sends_identity_and_reads_it_back() {
+        let body = serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1, "memory_mb": 256,
+            "disk_gb": 5, "os_user": "root", "network_block_all": false, "toolbox_enabled": true,
+            "created_at": "c", "updated_at": "u", "last_active_at": "l",
+            "identity": {
+                "role_tag": "deploy", "audience": "sts.amazonaws.com", "subject": "team:payments:role:deploy",
+                "aws_role_arn": "arn:aws:iam::123456789012:role/deploy", "token_file": "/run/aerolvm/identity/token"
+            }
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let sandbox = client
+            .create(CreateOptions {
+                identity: Some(IdentityOptions {
+                    role_tag: "deploy".to_string(),
+                    aws_role_arn: "arn:aws:iam::123456789012:role/deploy".to_string(),
+                    ..Default::default()
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let sent = request_json_body(&request_rx.recv().expect("request should be captured"));
+        assert_eq!(
+            sent["identity"],
+            serde_json::json!({"role_tag": "deploy", "aws_role_arn": "arn:aws:iam::123456789012:role/deploy"})
+        );
+        let identity = sandbox.data.identity.clone().expect("identity should be read back");
+        assert_eq!(identity.subject, "team:payments:role:deploy");
+        assert_eq!(identity.token_file, "/run/aerolvm/identity/token");
+        assert!(identity.token_expires_at.is_none());
+    }
+
+    #[test]
+    fn team_quota_calls_map_wire_shape() {
+        let body = serde_json::json!({
+            "team": "risk", "max_sandboxes": 3, "max_cpu": 4.0, "generation": 1,
+            "created_at": "c", "updated_at": "u",
+            "usage": {"sandboxes": 2, "cpu": 1.5, "memory_mb": 1024}
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body.clone());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let quota = client
+            .put_team_quota("risk", TeamQuotaOptions { max_sandboxes: Some(3), max_cpu: Some(4.0), max_memory_mb: None })
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/teams/risk/quota HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"max_sandboxes": 3, "max_cpu": 4.0}));
+        assert_eq!(quota.max_sandboxes, Some(3));
+        assert_eq!(quota.usage.as_ref().map(|u| u.sandboxes), Some(2));
+
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let quota = client.get_team_quota("risk").expect("get should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/teams/risk/quota HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(quota.usage.map(|u| u.memory_mb), Some(1024));
     }
 
     #[test]
@@ -5195,6 +6565,267 @@ mod tests {
             Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // A2: expose_port sends visibility only when it is set.
+    #[test]
+    fn expose_port_sends_visibility_only_when_set() {
+        for (options, want) in [
+            (ExposeOptions::token(), Some(serde_json::json!({"visibility": "token"}))),
+            (
+                ExposeOptions::http().with_visibility(ExposeVisibility::Public),
+                Some(serde_json::json!({"visibility": "public"})),
+            ),
+            (ExposeOptions::default(), None),
+        ] {
+            let (url, request_rx) = spawn_response_server(
+                "200 OK",
+                "application/json",
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"token"}"#.to_vec(),
+            );
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let result = client.expose_port("sb-1", 3000, options).expect("expose_port should succeed");
+            assert!(matches!(result, ExposeResult::Http { .. }));
+            let request = request_rx.recv().expect("request should be captured");
+            match want {
+                Some(body) => assert_eq!(request_json_body(&request), body),
+                None => assert!(request.ends_with("\r\n\r\n"), "unexpected body: {}", request),
+            }
+        }
+    }
+
+    // expose_port_info reports what the server sent, visibility included,
+    // which ExposeResult has no field for.
+    #[test]
+    fn expose_port_info_reports_every_field() {
+        let cases: Vec<(&[u8], ExposePortInfo)> = vec![
+            (
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"token"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Http,
+                    url: "https://sb-1-3000.example.com".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Token,
+                },
+            ),
+            (
+                // A public port: the server leaves visibility out.
+                br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Http,
+                    url: "https://sb-1-3000.example.com".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+            (
+                br#"{"protocol":"tcp","public_url":"tcp://example.com:40001","host":"example.com","host_port":40001}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Tcp,
+                    url: "tcp://example.com:40001".into(),
+                    host: Some("example.com".into()),
+                    host_port: Some(40001),
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+            (
+                br#"{"protocol":"tls","public_url":"tls://sb-1-5432.example.com:443"}"#,
+                ExposePortInfo {
+                    protocol: ExposeProtocol::Tls,
+                    url: "tls://sb-1-5432.example.com:443".into(),
+                    host: None,
+                    host_port: None,
+                    visibility: ExposeVisibility::Public,
+                },
+            ),
+        ];
+        for (body, want) in cases {
+            let (url, request_rx) =
+                spawn_response_server("200 OK", "application/json", body.to_vec());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let got = client
+                .expose_port_info("sb-1", 3000, ExposeOptions::default())
+                .expect("expose_port_info should succeed");
+            assert_eq!(got, want);
+            let request = request_rx.recv().expect("request should be captured");
+            assert!(
+                request.starts_with("POST /v1/sandboxes/sb-1/ports/3000 "),
+                "request: {}",
+                request
+            );
+        }
+    }
+
+    // A value this SDK does not know is an error, never Public: reading a
+    // gated port as open to everyone is the unsafe mistake.
+    #[test]
+    fn expose_port_info_refuses_unknown_values() {
+        for (body, want) in [
+            (
+                br#"{"protocol":"http","public_url":"https://x","visibility":"team"}"#.as_slice(),
+                "unknown port visibility: team",
+            ),
+            (
+                br#"{"protocol":"udp","public_url":"udp://x"}"#.as_slice(),
+                "unknown expose protocol: udp",
+            ),
+        ] {
+            let (url, _request_rx) =
+                spawn_response_server("200 OK", "application/json", body.to_vec());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            match client.expose_port_info("sb-1", 3000, ExposeOptions::token()) {
+                Err(Error::Client(msg)) => assert_eq!(msg, want),
+                other => panic!("want Error::Client({want}), got {other:?}"),
+            }
+        }
+    }
+
+    // expose_port is unchanged: same variants, and a visibility it cannot
+    // carry is ignored, so existing callers see no difference.
+    #[test]
+    fn expose_port_keeps_its_shape() {
+        let (url, _request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"protocol":"http","public_url":"https://sb-1-3000.example.com","visibility":"team"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        match client.expose_port("sb-1", 3000, ExposeOptions::default()) {
+            Ok(ExposeResult::Http { url }) => assert_eq!(url, "https://sb-1-3000.example.com"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // Sandbox tokens: the body carries only the fields that were set, and
+    // the 201 maps onto SandboxToken. Mirrors the other SDKs' tests.
+    #[test]
+    fn create_sandbox_token_posts_scope_and_maps_answer() {
+        let body = serde_json::json!({
+            "token": "avmst_0.p.s",
+            "token_id": "stk_abc",
+            "sandbox_id": "sb-1",
+            "path_prefix": "/files",
+            "methods": ["GET"],
+            "expires_at": "2026-11-06T10:15:00Z"
+        })
+        .to_string();
+        let (url, request_rx) =
+            spawn_response_server("201 Created", "application/json", body.into_bytes());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let token = client
+            .create_sandbox_token(
+                "sb-1",
+                CreateSandboxTokenOptions {
+                    expires_in: "15m".into(),
+                    path_prefix: Some("/files".into()),
+                    methods: vec!["GET".into()],
+                    ..Default::default()
+                },
+            )
+            .expect("create_sandbox_token should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/tokens HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"expires_in": "15m", "path_prefix": "/files", "methods": ["GET"]})
+        );
+        assert_eq!(token.token, "avmst_0.p.s");
+        assert_eq!(token.token_id, "stk_abc");
+        assert_eq!(token.sandbox_id, "sb-1");
+        assert_eq!(token.port, None);
+        assert_eq!(token.methods, vec!["GET".to_string()]);
+    }
+
+    #[test]
+    fn create_sandbox_token_sends_only_the_port() {
+        let (url, request_rx) = spawn_response_server(
+            "201 Created",
+            "application/json",
+            br#"{"token":"avmst_0.p.s","token_id":"stk_x","sandbox_id":"sb-1","port":3000,"expires_at":"t"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let token = client
+            .create_sandbox_token(
+                "sb-1",
+                CreateSandboxTokenOptions { expires_in: "1h".into(), port: Some(3000), ..Default::default() },
+            )
+            .expect("create_sandbox_token should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(request_json_body(&request), serde_json::json!({"expires_in": "1h", "port": 3000}));
+        assert_eq!(token.port, Some(3000));
+    }
+
+    #[test]
+    fn create_sandbox_token_surfaces_400() {
+        let (url, _rx) = spawn_response_server(
+            "400 Bad Request",
+            "application/json",
+            br#"{"error":"invalid sandbox token request: expires_in is required"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client
+            .create_sandbox_token("sb-1", CreateSandboxTokenOptions::default())
+            .expect_err("a 400 must be an error");
+        assert!(format!("{}", err).contains("expires_in"), "error: {}", err);
+    }
+
+    #[test]
+    fn revoke_sandbox_tokens_posts_no_body_and_maps_answer() {
+        let (url, request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"sandbox_id":"sb-1","tokens_not_before":"2026-11-07T10:00:01Z"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let result = client.revoke_sandbox_tokens("sb-1").expect("revoke_sandbox_tokens should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/tokens/revoke HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(request.ends_with("\r\n\r\n"), "unexpected body: {}", request);
+        assert_eq!(result.sandbox_id, "sb-1");
+        assert_eq!(result.tokens_not_before, "2026-11-07T10:00:01Z");
+    }
+
+    #[test]
+    fn sandbox_revoke_tokens_uses_its_own_id() {
+        let (url, request_rx) = spawn_response_server(
+            "200 OK",
+            "application/json",
+            br#"{"sandbox_id":"sb-1","tokens_not_before":"2026-11-07T10:00:01Z"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let result = Sandbox::new(client, data).revoke_tokens().expect("revoke_tokens should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/sandboxes/sb-1/tokens/revoke HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(result.tokens_not_before, "2026-11-07T10:00:01Z");
+    }
+
+    #[test]
+    fn revoke_sandbox_tokens_surfaces_404() {
+        let (url, _rx) = spawn_response_server(
+            "404 Not Found",
+            "application/json",
+            br#"{"error":"sandbox not found"}"#.to_vec(),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let err = client.revoke_sandbox_tokens("sb-none").expect_err("a 404 must be an error");
+        assert!(format!("{}", err).contains("not found"), "error: {}", err);
     }
 
     // Custom-domains: POST returns 201 with the post-add list envelope, body
@@ -5969,6 +7600,223 @@ mod tests {
         assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
     }
 
+    // ER4: a call that sends a newer option first checks the agent lists it
+    // and fails closed against an older toolboxd. The list is cached per
+    // sandbox and refetched on a miss.
+    #[test]
+    fn require_toolbox_features_fails_closed_on_an_older_agent() {
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["files.create_only"]}"#.to_string()),
+            Reply::ok(r#"{"version":"0.6.12","features":["files.create_only"]}"#.to_string()),
+            Reply::ok(r#"{"version":"0.6.0"}"#.to_string()),
+            Reply::status("404 Not Found"),
+        ]);
+        let client = no_retry_client(&url);
+
+        client.require_toolbox_features("sb-1", &[]).expect("no features needs no call");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        client
+            .require_toolbox_features("sb-1", &["files.create_only"])
+            .expect("listed feature is allowed");
+        client
+            .require_toolbox_features("sb-1", &["files.create_only"])
+            .expect("cached feature is allowed");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(requests.lock().unwrap()[0].starts_with("GET /v1/sandboxes/sb-1/toolbox/version "));
+
+        match client.require_toolbox_features("sb-1", &["files.create_only", "exec.max_output_bytes"]) {
+            Err(Error::UnsupportedFeature(err)) => {
+                assert_eq!(err.sandbox_id(), "sb-1");
+                assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                assert_eq!(err.agent_version(), "0.6.12");
+                assert!(err.to_string().contains("toolboxd 0.6.12"));
+            }
+            other => panic!("want UnsupportedFeature, got {:?}", other),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // An agent older than the features list sends none.
+        match client.require_toolbox_features("sb-1", &["exec.max_output_bytes"]) {
+            Err(Error::UnsupportedFeature(err)) => {
+                assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                assert!(err.to_string().contains("toolboxd 0.6.0"));
+            }
+            other => panic!("want UnsupportedFeature, got {:?}", other),
+        }
+        let unnamed = UnsupportedFeatureError {
+            sandbox_id: "sb-1".to_string(),
+            features: vec!["a".to_string(), "b".to_string()],
+            agent_version: String::new(),
+            runtime: String::new(),
+        };
+        let wasm = UnsupportedFeatureError {
+            sandbox_id: "sb-w".to_string(),
+            features: vec!["files.verbs".to_string()],
+            agent_version: "v9".to_string(),
+            runtime: "wasm".to_string(),
+        };
+        assert_eq!(wasm.runtime(), "wasm");
+        assert_eq!(wasm.to_string(), "sandbox sb-w is a WebAssembly sandbox, which does not support files.verbs");
+        assert!(unnamed.to_string().contains("runs an older toolboxd, which does not support a, b;"));
+
+        // A failed /version call is returned as is.
+        match client.require_toolbox_features("sb-missing", &["files.create_only"]) {
+            Err(Error::Api(err)) => assert_eq!(err.status(), 404),
+            other => panic!("want Api 404, got {:?}", other),
+        }
+    }
+
+    // E1 + ER4 mixed-version: an exec with an output cap against an agent
+    // that does not list the caps reads /version and stops there; the
+    // command is never sent.
+    #[test]
+    fn exec_output_caps_fail_closed_on_an_older_agent() {
+        for version in [r#"{"version":"0.6.11","features":[]}"#, r#"{"version":"0.6.0"}"#] {
+            let (url, hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(version.to_string())]);
+            let client = no_retry_client(&url);
+            let err = client
+                .exec(
+                    "sb-1",
+                    ExecRequest { command: "yes".into(), max_stderr_bytes: Some(1024), ..Default::default() },
+                )
+                .expect_err("an older agent must refuse the cap");
+            match err {
+                Error::UnsupportedFeature(err) => {
+                    assert_eq!(err.features(), &["exec.max_output_bytes".to_string()]);
+                    assert!(err.to_string().contains("restart the sandbox"));
+                }
+                other => panic!("want UnsupportedFeature, got {:?}", other),
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "only /version may be called");
+            assert!(requests.lock().unwrap()[0].starts_with("GET /v1/sandboxes/sb-1/toolbox/version "));
+        }
+    }
+
+    #[test]
+    fn exec_sends_output_caps_when_the_agent_lists_them() {
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["exec.max_output_bytes"]}"#.to_string()),
+            Reply::ok(r#"{"stdout":"aaaa","stderr":"","exit_code":0,"duration_ms":1,"stdout_truncated":true}"#.to_string()),
+        ]);
+        let client = no_retry_client(&url);
+        let result = client
+            .exec(
+                "sb-1",
+                ExecRequest { command: "yes a".into(), max_stdout_bytes: Some(4), ..Default::default() },
+            )
+            .expect("capped exec");
+        assert!(result.stdout_truncated && !result.stderr_truncated);
+        assert_eq!(result.stdout, "aaaa");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let exec = requests.lock().unwrap()[1].clone();
+        assert!(exec.starts_with("POST /v1/sandboxes/sb-1/toolbox/process/execute "), "{}", exec);
+        assert!(exec.contains(r#""max_stdout_bytes":4"#) && !exec.contains("max_stderr_bytes"), "{}", exec);
+
+        // No cap, no /version call; an older agent's reply reads untruncated.
+        let (url, hits, _) = spawn_recording_scripted_server(vec![Reply::ok(
+            r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#.to_string(),
+        )]);
+        let result = no_retry_client(&url).exec("sb-1", "ls".into()).expect("plain exec");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!result.stdout_truncated && !result.stderr_truncated);
+    }
+
+    /// Serves one HTTP `/version` answer, then accepts one exec-stream
+    /// WebSocket, reports its start message and answers exit 0.
+    fn spawn_version_then_stream_server(version: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("version request");
+            let request = read_http_request(&mut first);
+            assert!(request.starts_with("GET /v1/sandboxes/sb-1/toolbox/version "), "{}", request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                version.len()
+            );
+            first.write_all(head.as_bytes()).expect("version head");
+            first.write_all(version.as_bytes()).expect("version body");
+            drop(first);
+            listener.set_nonblocking(true).expect("non-blocking");
+            let runtime = Builder::new_current_thread().enable_all().build().expect("runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+                let (stream, _) = listener.accept().await.expect("stream accept");
+                let ws = accept_async(stream).await.expect("websocket accept");
+                let (mut write, mut read) = ws.split();
+                if let Some(Ok(Message::Text(text))) = read.next().await {
+                    start_tx.send(text.to_string()).expect("start message");
+                }
+                write
+                    .send(Message::Text(serde_json::json!({ "type": "exit", "code": 0 }).to_string().into()))
+                    .await
+                    .expect("exit frame");
+            });
+        });
+        (format!("http://{}", addr), start_rx)
+    }
+
+    // E2 + ER4: argv on exec and the exec stream goes out only after the
+    // agent listed exec.argv; an older agent gets the /version read only.
+    #[test]
+    fn exec_argv_is_checked_against_the_agent() {
+        let argv: Vec<String> = ["printf", "%s|", "a b", "$HOME", "; echo pwned"].iter().map(|s| s.to_string()).collect();
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![
+            Reply::ok(r#"{"version":"0.6.12","features":["exec.argv"]}"#.to_string()),
+            Reply::ok(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#.to_string()),
+        ]);
+        no_retry_client(&url)
+            .exec("sb-1", ExecRequest { argv: Some(argv.clone()), ..Default::default() })
+            .expect("argv exec");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let exec = requests.lock().unwrap()[1].clone();
+        assert!(exec.contains(&serde_json::to_string(&argv).unwrap()), "{}", exec);
+
+        let (url, hits, requests) = spawn_recording_scripted_server(vec![Reply::ok(
+            r#"{"version":"0.6.11","features":["exec.max_output_bytes"]}"#.to_string(),
+        )]);
+        let client = no_retry_client(&url);
+        match client.exec("sb-1", ExecRequest { argv: Some(argv.clone()), ..Default::default() }) {
+            Err(Error::UnsupportedFeature(err)) => assert_eq!(err.features(), &["exec.argv".to_string()]),
+            other => panic!("want UnsupportedFeature, got {:?}", other.map(|r| r.exit_code)),
+        }
+        match client.exec_stream("sb-1", ExecStreamOptions { argv: Some(argv.clone()), ..Default::default() }) {
+            Err(Error::UnsupportedFeature(err)) => assert_eq!(err.features(), &["exec.argv".to_string()]),
+            Err(other) => panic!("want UnsupportedFeature, got {:?}", other),
+            Ok(_) => panic!("an older agent got an argv stream"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "only /version may be called");
+        assert!(requests.lock().unwrap().iter().all(|r| r.starts_with("GET /v1/sandboxes/sb-1/toolbox/version ")));
+
+        let (url, start_rx) = spawn_version_then_stream_server(r#"{"version":"0.6.12","features":["exec.argv"]}"#);
+        let handle = no_retry_client(&url)
+            .exec_stream("sb-1", ExecStreamOptions { argv: Some(argv.clone()), ..Default::default() })
+            .expect("argv stream");
+        assert_eq!(handle.wait().expect("exit").code, 0);
+        let start: Value = serde_json::from_str(&start_rx.recv_timeout(Duration::from_secs(5)).expect("start")).unwrap();
+        assert_eq!(start["argv"], serde_json::json!(argv));
+    }
+
+    #[test]
+    fn exec_stream_needs_command_or_argv() {
+        let client = no_retry_client("http://127.0.0.1:9");
+        for (options, want) in [
+            (
+                ExecStreamOptions { command: "ls".into(), argv: Some(vec!["ls".into()]), ..Default::default() },
+                "set command or argv, not both",
+            ),
+            (ExecStreamOptions { command: " ".into(), ..Default::default() }, "command is required"),
+            (ExecStreamOptions { argv: Some(vec![]), ..Default::default() }, "command is required"),
+        ] {
+            match client.exec_stream("sb-1", options) {
+                Err(Error::Client(msg)) => assert_eq!(msg, want),
+                Err(other) => panic!("want Client error {:?}, got {:?}", want, other),
+                Ok(_) => panic!("want Client error {:?}", want),
+            }
+        }
+    }
+
     fn no_retry_client(url: &str) -> Client {
         Client::with_config(
             ClientConfig {
@@ -6064,6 +7912,52 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn status_predicates_name_the_common_statuses() {
+        // (status line, not_found, conflict, capacity, timeout, auth)
+        let cases = [
+            ("401 Unauthorized", false, false, false, false, true),
+            ("403 Forbidden", false, false, false, false, true),
+            ("404 Not Found", true, false, false, false, false),
+            ("408 Request Timeout", false, false, false, true, false),
+            ("409 Conflict", false, true, false, false, false),
+            ("503 Service Unavailable", false, false, true, false, false),
+            ("504 Gateway Timeout", false, false, false, true, false),
+            ("400 Bad Request", false, false, false, false, false),
+            ("412 Precondition Failed", false, false, false, false, false),
+            ("500 Internal Server Error", false, false, false, false, false),
+            ("502 Bad Gateway", false, false, false, false, false),
+        ];
+        for (line, not_found, conflict, capacity, timeout, auth) in cases {
+            let (url, _rx) = spawn_response_server_with_headers(
+                line,
+                "application/json",
+                "",
+                br#"{"error":"no"}"#.to_vec(),
+            );
+            let err = no_retry_client(&url).get("sb-1").expect_err(line);
+            let got = (
+                err.is_not_found(),
+                err.is_conflict(),
+                err.is_capacity(),
+                err.is_timeout(),
+                err.is_auth(),
+            );
+            assert_eq!(got, (not_found, conflict, capacity, timeout, auth), "{line}");
+            let api = err.api_error().expect(line);
+            assert_eq!(
+                (api.is_not_found(), api.is_conflict(), api.is_capacity(), api.is_timeout(), api.is_auth()),
+                got,
+                "{line}"
+            );
+            // The existing Error::Api arm still matches every HTTP error.
+            assert!(matches!(err, Error::Api(_)), "{line}");
+        }
+        let client_err = Error::Client("bad argument".to_string());
+        assert!(client_err.api_error().is_none());
+        assert!(!client_err.is_not_found() && !client_err.is_timeout() && !client_err.is_auth());
     }
 
     #[test]
@@ -6235,5 +8129,361 @@ mod tests {
         let keys: std::collections::HashSet<String> = (0..1000).map(|_| new_idempotency_key()).collect();
         assert_eq!(keys.len(), 1000);
         assert!(keys.iter().all(|k| is_generated_key(k)));
+    }
+
+    /// How the fake file-watch server ends its side.
+    enum WatchServerEnd {
+        /// Send `{"type":"end","reason":...}` and close normally.
+        EndFrame(&'static str),
+        /// Wait for the client to close, then report "client closed".
+        AwaitClientClose,
+        /// Drop the connection without a close frame.
+        Drop,
+    }
+
+    // tungstenite fixes the handshake callback's error type (a whole HTTP
+    // response), which clippy calls large.
+    #[allow(clippy::result_large_err)]
+    /// A toolboxd-like file-watch WebSocket. It reports the handshake's URI
+    /// and Authorization header, waits `delay`, sends `frames` in order, then
+    /// ends as `end` says.
+    fn spawn_watch_server(
+        delay: Duration,
+        frames: Vec<serde_json::Value>,
+        end: WatchServerEnd,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        listener.set_nonblocking(true).expect("listener should be non-blocking");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("tokio listener should build");
+                let (stream, _) = listener.accept().await.expect("server should accept");
+                let handshake_tx = seen_tx.clone();
+                let ws_stream = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                          response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        let auth = request
+                            .headers()
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let _ = handshake_tx.send(format!("uri {}", request.uri()));
+                        let _ = handshake_tx.send(format!("auth {}", auth));
+                        Ok(response)
+                    },
+                )
+                .await
+                .expect("websocket should accept");
+                let (mut write, mut read) = ws_stream.split();
+                tokio::time::sleep(delay).await;
+                for frame in frames {
+                    write
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .expect("frame should send");
+                }
+                match end {
+                    WatchServerEnd::EndFrame(reason) => {
+                        write
+                            .send(Message::Text(
+                                serde_json::json!({ "type": "end", "reason": reason }).to_string().into(),
+                            ))
+                            .await
+                            .expect("end frame should send");
+                        let _ = write.send(Message::Close(None)).await;
+                    }
+                    WatchServerEnd::AwaitClientClose => loop {
+                        match read.next().await {
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                let _ = seen_tx.send("client closed".to_string());
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                        }
+                    },
+                    WatchServerEnd::Drop => {}
+                }
+            });
+        });
+
+        (format!("http://{}", addr), seen_rx)
+    }
+
+    /// A server that refuses the WebSocket handshake with one write, so the
+    /// client reads the head and the body together.
+    fn spawn_handshake_refusal(status_line: &str, extra_headers: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let response = format!(
+            "HTTP/1.1 {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_line,
+            extra_headers,
+            body.len(),
+            body
+        );
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should accept");
+            let _ = read_http_request(&mut stream);
+            stream.write_all(response.as_bytes()).expect("response should write");
+        });
+        format!("http://{}", addr)
+    }
+
+    fn watch_start(path: &str, recursive: bool) -> serde_json::Value {
+        serde_json::json!({ "type": "start", "path": path, "recursive": recursive })
+    }
+
+    fn recorded_events() -> (Arc<Mutex<Vec<FileEvent>>>, impl FnMut(FileEvent) + Send + 'static) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&events);
+        (events, move |event| capture.lock().expect("events lock").push(event))
+    }
+
+    #[test]
+    fn watch_files_returns_after_start_and_delivers_events_in_order() {
+        let (url, seen) = spawn_watch_server(
+            Duration::from_millis(150),
+            vec![
+                watch_start("/work dir", true),
+                serde_json::json!({ "type": "events", "events": [
+                    { "type": "create", "path": "/work dir/a.txt" },
+                    { "type": "write", "path": "/work dir/a.txt" },
+                    { "type": "create", "path": "/work dir/sub", "is_dir": true },
+                    { "type": "overflow", "reason": "kernel_queue" },
+                ]}),
+                serde_json::json!({ "type": "something_new" }),
+                serde_json::json!({ "type": "events", "events": [
+                    { "type": "future_kind", "path": "/work dir/b" },
+                ]}),
+            ],
+            WatchServerEnd::EndFrame("the watched folder was removed"),
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (events, on_event) = recorded_events();
+        let started = std::time::Instant::now();
+        let handle = client
+            .watch_files("sb-1", "/work dir", WatchOptions { recursive: true }, on_event)
+            .expect("watch should start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "watch_files returned before the start frame"
+        );
+        assert_eq!(
+            seen.recv().expect("uri"),
+            "uri /v1/sandboxes/sb-1/toolbox/files/watch?path=%2Fwork%20dir&recursive=true"
+        );
+        assert_eq!(seen.recv().expect("auth"), "auth Bearer pat-token");
+
+        match handle.wait() {
+            Err(Error::Client(reason)) => assert_eq!(reason, "the watched folder was removed"),
+            other => panic!("want the end reason, got {:?}", other),
+        }
+        let event = |kind: &str, path: &str, is_dir: bool, reason: Option<&str>| FileEvent {
+            kind: kind.to_string(),
+            path: path.to_string(),
+            is_dir,
+            reason: reason.map(String::from),
+        };
+        assert_eq!(
+            events.lock().expect("events lock").clone(),
+            vec![
+                event("create", "/work dir/a.txt", false, None),
+                event("write", "/work dir/a.txt", false, None),
+                event("create", "/work dir/sub", true, None),
+                event("overflow", "", false, Some("kernel_queue")),
+                event("future_kind", "/work dir/b", false, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn watch_files_stop_closes_the_socket_and_wait_returns_ok() {
+        let (url, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let sandbox_handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        // Not recursive: the query has no recursive parameter at all.
+        assert_eq!(seen.recv().expect("uri"), "uri /v1/sandboxes/sb-1/toolbox/files/watch?path=%2Fwork");
+        sandbox_handle.stop();
+        sandbox_handle.stop();
+        sandbox_handle.wait().expect("wait after stop should be Ok");
+        let _ = seen.recv().expect("auth");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).expect("server should see the close"),
+            "client closed"
+        );
+    }
+
+    #[test]
+    fn dropping_the_watch_handle_stops_the_watch() {
+        let (url, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        drop(handle);
+        let _ = seen.recv().expect("uri");
+        let _ = seen.recv().expect("auth");
+        assert_eq!(
+            seen.recv_timeout(Duration::from_secs(5)).expect("server should see the close"),
+            "client closed"
+        );
+    }
+
+    #[test]
+    fn watch_files_reports_a_dropped_connection() {
+        let (url, _seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::Drop,
+        );
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-1", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start");
+        assert!(handle.wait().is_err(), "a dropped connection must not look like a clean stop");
+    }
+
+    #[test]
+    fn watch_files_fails_when_the_watch_ends_before_it_starts() {
+        let (url, _seen) = spawn_watch_server(Duration::ZERO, vec![], WatchServerEnd::EndFrame("gone"));
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        match client.watch_files("sb-1", "/work", WatchOptions::default(), on_event) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "gone"),
+            Err(other) => panic!("want the end reason, got {:?}", other),
+            Ok(_) => panic!("want an error"),
+        }
+    }
+
+    // The wait for the start frame is bounded; a result inside the limit
+    // passes through unchanged.
+    #[test]
+    fn file_watch_start_wait_is_bounded() {
+        let runtime = Builder::new_current_thread().enable_all().build().expect("runtime should build");
+        match runtime.block_on(within_file_watch_start(Duration::from_millis(20), std::future::pending())) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "file watch did not start within 20ms"),
+            other => panic!("want the timeout, got {:?}", other),
+        }
+        assert!(runtime
+            .block_on(within_file_watch_start(Duration::from_millis(20), async { Ok(()) }))
+            .is_ok());
+        match runtime.block_on(within_file_watch_start(Duration::from_millis(20), async {
+            Err(Error::Client("gone".to_string()))
+        })) {
+            Err(Error::Client(reason)) => assert_eq!(reason, "gone"),
+            other => panic!("want the inner error, got {:?}", other),
+        }
+        assert_eq!(format!("{:?}", FILE_WATCH_START_TIMEOUT), "60s");
+    }
+
+    #[test]
+    fn watch_files_on_an_agent_without_the_route_is_unsupported() {
+        for (headers, body) in [
+            ("X-Toolbox-Route: none\r\n", r#"{"error":"not found"}"#),
+            ("X-Toolbox-Route: none\r\n", ""),
+            ("", r#"{"error":"not found"}"#),
+        ] {
+            let url = spawn_handshake_refusal("404 Not Found", headers, body);
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let (_, on_event) = recorded_events();
+            match client.watch_files("sb-1", "/work", WatchOptions::default(), on_event) {
+                Err(Error::UnsupportedFeature(err)) => {
+                    assert_eq!(err.sandbox_id(), "sb-1");
+                    assert_eq!(err.features(), ["files.watch".to_string()]);
+                    assert!(err.to_string().contains("restart the sandbox"), "{}", err);
+                }
+                Err(other) => panic!("headers {:?} body {:?}: want UnsupportedFeature, got {:?}", headers, body, other),
+                Ok(_) => panic!("want an error"),
+            }
+        }
+    }
+
+    #[test]
+    fn watch_files_refusals_are_api_errors() {
+        for (status_line, body, status, message) in [
+            (
+                "501 Not Implemented",
+                r#"{"error":"file watching needs a gVisor or Firecracker sandbox"}"#,
+                501,
+                "file watching needs a gVisor or Firecracker sandbox",
+            ),
+            ("404 Not Found", r#"{"error":"path not found: /x"}"#, 404, "path not found: /x"),
+            ("404 Not Found", r#"{"error":"sandbox not found"}"#, 404, "sandbox not found"),
+            ("409 Conflict", r#"{"error":"not a folder: /x"}"#, 409, "not a folder: /x"),
+        ] {
+            let url = spawn_handshake_refusal(status_line, "", body);
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            let (_, on_event) = recorded_events();
+            match client.watch_files("sb-1", "/x", WatchOptions::default(), on_event) {
+                Err(Error::Api(err)) => {
+                    assert_eq!(err.status(), status);
+                    assert_eq!(err.message(), message);
+                }
+                Err(other) => panic!("{}: want Error::Api, got {:?}", status_line, other),
+                Ok(_) => panic!("want an error"),
+            }
+        }
+    }
+
+    // A WebSocket handshake carries no body, so a 421 naming another cell is
+    // followed like an HTTP call's, and the cell is remembered.
+    #[test]
+    fn watch_files_follows_a_cell_redirect() {
+        let (cell2, seen) = spawn_watch_server(
+            Duration::ZERO,
+            vec![watch_start("/work", false)],
+            WatchServerEnd::AwaitClientClose,
+        );
+        let cell1 = spawn_handshake_refusal(
+            "421 Misdirected Request",
+            &format!("{}: {}\r\n", CELL_ENDPOINT_HEADER, cell2),
+            r#"{"error":"sandbox lives in another cell"}"#,
+        );
+        let client = Client::new(Some(&cell1), Some("pat-token")).expect("client should build");
+        let (_, on_event) = recorded_events();
+        let handle = client
+            .watch_files("sb-x", "/work", WatchOptions::default(), on_event)
+            .expect("watch should start on cell 2");
+        assert_eq!(seen.recv().expect("uri"), "uri /v1/sandboxes/sb-x/toolbox/files/watch?path=%2Fwork");
+        assert_eq!(seen.recv().expect("auth"), "auth Bearer pat-token");
+        assert_eq!(client.cells.get("sb-x").as_deref(), Some(cell2.as_str()));
+        handle.stop();
+        handle.wait().expect("wait after stop should be Ok");
+    }
+
+    #[test]
+    fn file_event_reads_the_wire_shape() {
+        let event: FileEvent =
+            serde_json::from_str(r#"{"type":"overflow","reason":"watch_limit","path":"/w/deep"}"#)
+                .expect("event should parse");
+        assert_eq!(event.kind, "overflow");
+        assert_eq!(event.reason.as_deref(), Some("watch_limit"));
+        assert!(!event.is_dir);
+        let bare: FileEvent = serde_json::from_str(r#"{"type":"chmod"}"#).expect("event should parse");
+        assert_eq!(bare.path, "");
+        assert_eq!(bare.reason, None);
     }
 }

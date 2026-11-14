@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/network/hostnet"
@@ -83,6 +84,18 @@ type Host struct {
 	// ipv6Off turns IPv6 off on a TAP; nil is hostnet.DisableIPv6OnLink.
 	// Seam for tests.
 	ipv6Off func(tap string) error
+	// Owner, when set, owns each TAP it makes: the user and group the
+	// jailed Firecracker runs as. A process without CAP_NET_ADMIN may
+	// attach to a TAP only if it owns it; a TAP with no owner turned the
+	// jailed VM away ("Open tap device failed ... Operation not
+	// permitted", Phase 5 on kernel 6.18). Firecracker's own setup makes
+	// its TAPs the same way.
+	Owner *Owner
+}
+
+// Owner is the user and group a TAP is made for.
+type Owner struct {
+	UID, GID int
 }
 
 // runFn is the type the test seam injects. Mirrors exec.CommandContext's
@@ -153,13 +166,17 @@ func (h *Host) Ensure(ctx context.Context, slot Slot) error {
 		return errors.New("tap host: slot has empty HostIP or CIDR")
 	}
 
-	// Step 1: create the tap. `ip tuntap add ... mode tap` is the only
-	// shape that works without root-bound CAP_NET_ADMIN expansion; we
-	// pass `user root` so the firecracker process (running as the jailer
-	// UID later) can open /dev/net/tun against it. Keep the form stable
-	// — every operator in the bring-up channel knows `ip tuntap add NAME
-	// mode tap user X` and will misread alternative forms as a typo.
-	if out, err := h.exec(ctx, "tuntap", "add", slot.TapName, "mode", "tap"); err != nil {
+	// Step 1: create the tap: `ip tuntap add NAME mode tap`, with
+	// `user UID group GID` when the jailed Firecracker runs as someone
+	// else (Owner), so that process can attach to it. Keep the form
+	// stable: every operator in the bring-up channel knows `ip tuntap
+	// add NAME mode tap user X` and will misread alternative forms as a
+	// typo.
+	add := []string{"tuntap", "add", slot.TapName, "mode", "tap"}
+	if h.Owner != nil {
+		add = append(add, "user", strconv.Itoa(h.Owner.UID), "group", strconv.Itoa(h.Owner.GID))
+	}
+	if out, err := h.exec(ctx, add...); err != nil {
 		// "File exists" / "Device or resource busy" mean the device is
 		// already present from a previous Create; that's the idempotent
 		// case. Anything else surfaces as an error with the `ip` output

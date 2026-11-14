@@ -1,0 +1,13 @@
+exit 0
+--- stdout
+Name:            snap-c
+Source sandbox:  -
+Created:         -
+Image:           snapshots/snap-c
+Image ID:        -
+Distribution:    -
+Digest:          -
+Registry ref:    -
+Verified:        -
+Entrypoint:      -
+--- stderr

@@ -174,13 +174,17 @@ obs1      (NOT a sandboxd node)  m6i.large                    # Prometheus(+long
 - **EBS tuning — pin gp3 with bumped IOPS on the write-hot nodes.** Durable writes on
   the create path are `fsync`-bound, not CPU-bound, so the instance family (t3 vs m6i)
   does *not* govern them — the **EBS volume does**. Two write paths matter: the SQLite
-  sandbox-row INSERT (`internal/store/store.go` — WAL, `MaxOpenConns=1` single-writer,
-  `synchronous` left at the default so each commit fsyncs) on the **owner worker**, and
-  the Raft log append (`raft-boltdb/v2` + `raft-wal`, `internal/cluster/raft.go`) on the
-  **leader server**. For a normal create both are trivial and `svc_persist` /
-  `cluster_promote` are low-single-digit ms — but the **UC-95 density burst** fires
-  hundreds of creates rapidly, serializing many small fsyncs through the single SQLite
-  writer + the Raft log. gp3's baseline **3000 IOPS / 125 MiB/s** covers ordinary runs;
+  sandbox-row INSERT (`internal/store/store.go` — WAL, `MaxOpenConns=1` single writer)
+  on the **owner worker**, and the Raft log append (`raft-boltdb/v2` + `raft-wal`,
+  `internal/cluster/raft.go`) on the **leader server**. *Correction (2026-11-07):* the
+  SQLite path does **not** fsync per commit. go-sqlite3 defaults to
+  `synchronous = NORMAL` (now pinned in `sqliteDSN`), so in WAL mode a commit syncs
+  only at checkpoints; `BenchmarkStoreCreate` is unchanged with 1 ms added to every
+  fsync. Only the Raft log pays a sync per write, so the IOPS bump below matters for
+  the **3 Raft servers**, not for `worker-c`. For a normal create both are trivial and
+  `svc_persist` / `cluster_promote` are low-single-digit ms — but the **UC-95 density
+  burst** fires hundreds of creates rapidly, serializing many small fsyncs through the
+  Raft log. gp3's baseline **3000 IOPS / 125 MiB/s** covers ordinary runs;
   to guarantee the density burst never hits an fsync ceiling (which would read as a fake
   latency tail), bump the volume on the write-hot nodes via the per-node knobs the TF
   module already exposes (`volume_iops` / `volume_throughput`, `Terraform/locals.tf:66-68`,

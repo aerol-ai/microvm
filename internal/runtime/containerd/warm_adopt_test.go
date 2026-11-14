@@ -6,8 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -17,9 +21,10 @@ func TestPoolEligible(t *testing.T) {
 	if !poolEligible(req, nil) {
 		t.Fatal("default create should be eligible")
 	}
+	// Env rides the adopt frame on this engine (plans/cluster-phase-2.md §2).
 	req.Env = map[string]string{"X": "1"}
-	if poolEligible(req, nil) {
-		t.Fatal("env should disqualify")
+	if !poolEligible(req, nil) {
+		t.Fatal("plain env should not disqualify")
 	}
 }
 
@@ -94,6 +99,14 @@ func (f *fakeHandle) Close() error                                        { retu
 func TestIsParkedLabels(t *testing.T) {
 	if !IsParkedContainerLabels(map[string]string{poolParkLabelKey: poolParkLabelValue}) {
 		t.Fatal("expected parked")
+	}
+	// An older build's adopt left the park label next to the sandbox id;
+	// that container is a sandbox, not park inventory.
+	if IsParkedContainerLabels(map[string]string{poolParkLabelKey: poolParkLabelValue, sandboxIDLabelKey: "sb-1"}) {
+		t.Fatal("a container with a sandbox id is not parked")
+	}
+	if IsParkedContainerLabels(nil) || IsParkedContainerLabels(map[string]string{sandboxIDLabelKey: "sb-1"}) {
+		t.Fatal("no park label means not parked")
 	}
 	if IsParkedSandboxID("park-deadbeef") != true {
 		t.Fatal("expected park id")
@@ -273,5 +286,98 @@ func TestAdoptParkedIncompleteSlot(t *testing.T) {
 	}
 	if _, err := d.adoptParked(context.Background(), models.CreateSandboxRequest{}, "sb", "tok", &containerdpool.ParkedSlot{ID: "x"}); err == nil {
 		t.Fatal("want incomplete error")
+	}
+}
+
+// deleteErrContainer is a parked container whose Delete fails with err.
+type deleteErrContainer struct {
+	*fakeContainer
+	err error
+}
+
+func (c deleteErrContainer) Delete(context.Context, ...cntr.DeleteOpts) error { return c.err }
+
+// The warm pool retries a failed park teardown until destroyParked returns
+// nil (dockerpool pending_destroy.go), so a container that is already gone
+// must read as torn down, at load or at delete. Any other error still fails,
+// so the pool keeps the slot and its reservation.
+func TestDestroyParkedTreatsMissingContainerAsGone(t *testing.T) {
+	cases := []struct {
+		name    string
+		load    func(context.Context, string) (cntr.Container, error)
+		wantErr bool
+	}{
+		{"never loaded", nil, false},
+		{"gone before delete", func(context.Context, string) (cntr.Container, error) {
+			return deleteErrContainer{&fakeContainer{id: "park-x"}, errdefs.ErrNotFound}, nil
+		}, false},
+		{"delete refused", func(context.Context, string) (cntr.Container, error) {
+			return deleteErrContainer{&fakeContainer{id: "park-x"}, errors.New("busy")}, nil
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTransport()
+			tr.loadContainerFn = tc.load
+			d := newTestDriver(t)
+			d.SetClient(NewTestClient("aerolvm", tr))
+			err := d.destroyParked(context.Background(), &containerdpool.ParkedSlot{ID: "park-x", ContainerID: "park-x"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("destroyParked err = %v, want error %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A parked container whose delete fails keeps its netns slot and its park
+// block: freeing the slot while the container still runs in it would let
+// the pool hand the slot to another sandbox, two sandboxes on one network.
+// Once the container is confirmed gone (here on the pool's retry), the
+// rules are cleared while the slot still holds the address, and the slot is
+// released, once.
+func TestDestroyParkedHoldsNetnsSlotUntilContainerGone(t *testing.T) {
+	be := &netrulesMemBackend{}
+	d := New(Config{}, netrules.NewWithBackend(be), nil)
+	ns := &fakeNetnsHandoff{}
+	d.SetNetnsHandoff(ns)
+	const ip = "10.88.0.9"
+	if err := d.ApplyNetworkBlockAll(ip); err != nil {
+		t.Fatal(err)
+	}
+	blocked := func() bool {
+		for _, r := range be.rules {
+			if strings.Contains(r, ip) {
+				return true
+			}
+		}
+		return false
+	}
+	if !blocked() {
+		t.Fatal("setup: the park block is not in place")
+	}
+	slot := &containerdpool.ParkedSlot{ID: "park-n", ContainerID: "park-n", ContainerIP: ip}
+
+	stuck := newFakeTransport()
+	stuck.loadContainerFn = func(context.Context, string) (cntr.Container, error) { return nil, errors.New("engine busy") }
+	d.SetClient(NewTestClient("aerolvm", stuck))
+	if err := d.destroyParked(context.Background(), slot); err == nil {
+		t.Fatal("a failed delete must be reported so the pool retries it")
+	}
+	if ns.relCalls != 0 {
+		t.Fatalf("netns slot released %d times while the container may still run in it", ns.relCalls)
+	}
+	if !blocked() {
+		t.Fatal("the park block was cleared while the container may still run")
+	}
+
+	d.SetClient(NewTestClient("aerolvm", newFakeTransport())) // the retry finds it gone
+	if err := d.destroyParked(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if ns.relCalls != 1 {
+		t.Fatalf("netns slot released %d times on confirmed absence, want once", ns.relCalls)
+	}
+	if blocked() {
+		t.Fatal("the address's rules must be cleared once the container is gone")
 	}
 }

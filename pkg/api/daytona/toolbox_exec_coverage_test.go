@@ -2,6 +2,7 @@ package daytona
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,6 +166,13 @@ func TestToolboxBulkDownload_RequestError(t *testing.T) {
 
 func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (facadeURL, sandboxID string) {
 	t.Helper()
+	return newToolboxExecEnvWithConfig(t, executeFn, nil)
+}
+
+// newToolboxExecEnvWithConfig is newToolboxExecEnvWithHandler with the
+// service config adjusted.
+func newToolboxExecEnvWithConfig(t *testing.T, executeFn http.HandlerFunc, mutate func(*config.Config)) (facadeURL, sandboxID string) {
+	t.Helper()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/process/execute", executeFn)
@@ -214,6 +222,9 @@ func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (fac
 		Runtime:           models.RuntimeDocker,
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 
@@ -325,22 +336,45 @@ func TestToolboxBulkDownload(t *testing.T) {
 		t.Fatalf("Content-Type = %q (%v)", resp.Header.Get("Content-Type"), err)
 	}
 	mr := multipart.NewReader(resp.Body, params["boundary"])
-	var fileParts, errorParts int
+	var fileParts, errorParts []string
 	for {
 		part, err := mr.NextPart()
 		if err != nil {
 			break
 		}
+		// Every part, error parts too, carries the full requested path as
+		// its filename: the Daytona Python SDK keys its results on it and
+		// fails the whole download on a part without one.
+		// part.FileName() would strip the folders, so read the raw header.
+		_, cd, _ := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
 		if part.FormName() == "error" {
-			errorParts++
+			errorParts = append(errorParts, cd["filename"])
+			// Daytona's error shape: the SDKs show message and read
+			// statusCode.
+			var body downloadErrorBody
+			if err := json.NewDecoder(part).Decode(&body); err != nil || body.Message == "" || body.StatusCode != http.StatusNotFound {
+				t.Fatalf("error part body = %+v (%v), want a message and statusCode 404", body, err)
+			}
 		} else {
-			fileParts++
+			fileParts = append(fileParts, cd["filename"])
 		}
 		_, _ = io.Copy(io.Discard, part)
 	}
 	// One good file + one error part (the missing path).
-	if fileParts != 1 || errorParts != 1 {
-		t.Fatalf("parts: file=%d error=%d, want 1/1", fileParts, errorParts)
+	if strings.Join(fileParts, ",") != "/a.txt" || strings.Join(errorParts, ",") != "/missing.txt" {
+		t.Fatalf("parts: file=%q error=%q, want [/a.txt] / [/missing.txt]", fileParts, errorParts)
+	}
+}
+
+func TestDownloadPartDispositionQuotesThePath(t *testing.T) {
+	for _, path := range []string{"/workspace/a.txt", `/tmp/say "hi".txt`, `/tmp/back\slash`, "/tmp/naïve.txt"} {
+		_, params, err := mime.ParseMediaType(downloadPartDisposition("file", path))
+		if err != nil {
+			t.Fatalf("%q: ParseMediaType error = %v", path, err)
+		}
+		if params["name"] != "file" || params["filename"] != path {
+			t.Fatalf("%q: parsed %v, want name=file filename=%q", path, params, path)
+		}
 	}
 }
 
@@ -854,9 +888,9 @@ func TestToolboxDirectCoverage(t *testing.T) {
 	t.Run("writeMultipartErrorPart_empty_body", func(t *testing.T) {
 		var buf strings.Builder
 		mw := multipart.NewWriter(&buf)
-		h.writeMultipartErrorPart(mw, nil)
+		h.writeMultipartErrorPart(mw, "/x.txt", nil)
 		_ = mw.Close()
-		if !strings.Contains(buf.String(), "Bad Gateway") {
+		if !strings.Contains(buf.String(), "Bad Gateway") || !strings.Contains(buf.String(), `filename="/x.txt"`) {
 			t.Fatalf("expected Bad Gateway, got %s", buf.String())
 		}
 	})

@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/hostport"
 	"github.com/aerol-ai/microvm/internal/routedns"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -31,12 +32,19 @@ type wholeCaddy struct {
 	emu    http.RoundTripper
 	loads  int
 	writes int
+	plugin bool // built with AerolVM's aerolvm_route plugin (caddymod/)
 }
 
 func (f *wholeCaddy) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if r.URL.Path == "/aerolvm/route-upstream" {
+			if !f.plugin {
+				http.NotFound(w, r)
+			}
+			return
+		}
 		if r.URL.Path == "/load" {
 			var root any
 			if err := json.NewDecoder(r.Body).Decode(&root); err != nil {
@@ -94,22 +102,11 @@ func (f *recordingHostPorts) Reconcile(desired map[int]hostport.Target) error {
 	return nil
 }
 
+// freeLoopbackPort is an address free for TCP and UDP that the test binds
+// later. testport keeps it from another socket in between.
 func freeLoopbackPort(t *testing.T) string {
 	t.Helper()
-	for i := 0; i < 20; i++ {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
-		if pc, err := net.ListenPacket("udp", addr); err == nil {
-			_ = pc.Close()
-			return addr
-		}
-	}
-	t.Fatal("no free loopback port for tcp+udp")
-	return ""
+	return testport.UDPAddr(t)
 }
 
 const baseCaddyConfig = `{"apps":{"http":{"servers":{"srv0":{"routes":[
@@ -157,7 +154,12 @@ func TestIngressProxyRoutingOwnerCycle(t *testing.T) {
 	defer cancel()
 
 	allow := true
-	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allow})
+	// A fixed ID, not a random one. About 1 random ID in 1,850 is all
+	// decimal digits (CI drew sb-5530321697392958). Its root host then
+	// fits the static map's {id}-{port} rule, so the responder answers
+	// NXDOMAIN and Caddy takes the router (TestDerivedPort): the direct
+	// answer checked below never comes.
+	resp, err := svc.CreateSandboxWithID(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", AllowPublicTraffic: &allow}, "sb-0123456789abcdef")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,6 +258,51 @@ func TestCommitIngressProxyRoutingSkipsPruneAfterIncompleteReassert(t *testing.T
 	}
 	if err := svc.CommitIngressProxyRouting(ctx, nil, true); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The owner route looks up with the plugin when this Caddy has it, and with
+// Caddy's stock source (IPv4 only) when it does not. Asking costs a read,
+// never a write: commit stays one load either way.
+func TestCommitIngressProxyRoutingPicksTheLookup(t *testing.T) {
+	cases := []struct {
+		name   string
+		plugin bool
+		want   []string
+		absent string
+	}{
+		{"release Caddy with the plugin", true, []string{`"source":"aerolvm_route"`, `"fallback":"127.0.0.1:21213"`}, `"source":"a"`},
+		{"Caddy without the plugin", false, []string{`"source":"a"`, `"versions":{"ipv4":true}`}, `aerolvm_route`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, fc, _, opts := newRoutingHarness(t)
+			fc.plugin = tc.plugin
+			ctx := context.Background()
+			r, err := svc.StartIngressProxyRouting(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Stop()
+			if err := svc.CommitIngressProxyRouting(ctx, r, true); err != nil {
+				t.Fatal(err)
+			}
+			if loads, writes := fc.counts(); loads != 1 || writes != 0 {
+				t.Fatalf("loads=%d writes=%d, want one load and no other write", loads, writes)
+			}
+			cfg := fc.config(t)
+			for _, want := range tc.want {
+				if !strings.Contains(cfg, want) {
+					t.Errorf("static route missing %s", want)
+				}
+			}
+			if strings.Contains(cfg, tc.absent) {
+				t.Errorf("static route has %s", tc.absent)
+			}
+			if t.Failed() {
+				t.Logf("config:\n%s", cfg)
+			}
+		})
 	}
 }
 

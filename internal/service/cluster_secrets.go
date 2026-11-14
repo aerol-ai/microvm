@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,33 +19,121 @@ import (
 )
 
 // replicateSpecPatch keeps the FSM-replicated spec in sync after a local
-// mutation (resize, lifecycle update). It is a best-effort write-through that
+// mutation (resize, public traffic). It is a best-effort write-through that
 // mirrors the v1 wrapper of the same name: on failure it warns and returns
 // without surfacing the error to the caller, because the local sandbox is
 // already authoritative and the next mutation will refresh the FSM.
 //
 // No-op when the cluster doesn't carry a spec for this sandbox yet
-// (pre-cluster sandbox; Noop client in single-node mode also returns nil).
-// Same-sandbox concurrent mutations can clobber each other in the FSM, but
-// the worst case is a stale spec on a node that hasn't died — the next
-// mutating call fixes it. Single-sandbox mutations serialize at the docker
-// layer anyway.
+// (pre-cluster sandbox; Noop client in single-node mode also returns nil),
+// and when the patch changes nothing the Raft command would carry: the same
+// tags or facade state saved again would still be a log entry every server
+// syncs. The read, patch and write run under the sandbox's spec lock, so two
+// patches of the same sandbox on this node (a lifecycle update and a
+// resize, say) cannot each read the old spec and put back the field the
+// other changed. Before the lock a lifecycle write could put back a
+// sandbox's old size after a resize had recorded the new one, and its
+// team's quota then counted the old size.
+//
+// Fields that only a failover recreate reads back go through
+// replicateRecoverySpecPatch instead.
 func (s *Service) replicateSpecPatch(ctx context.Context, id string, patch func(*models.CreateSandboxRequest)) {
+	s.replicateSpecPatchUnless(ctx, id, patch, nil)
+}
+
+// replicateSpecPatchUnless is replicateSpecPatch that also skips the write
+// when current, given the replicated spec before the patch, reports it close
+// enough to what the patch would write. It runs under the spec lock.
+func (s *Service) replicateSpecPatchUnless(ctx context.Context, id string, patch func(*models.CreateSandboxRequest), current func(*models.CreateSandboxRequest) bool) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	spec := c.SpecOf(id)
-	if spec == nil {
+	unlock, err := s.lockSpec(ctx, id)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: spec write-through skipped; FSM spec stale until next mutation",
+				"sandbox_id", id, "err", err)
+		}
 		return
 	}
-	patch(spec)
+	defer unlock()
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil && s.logger != nil {
+	err = s.writeReplicatedSpec(commitCtx, c, id, func(spec *models.CreateSandboxRequest) (bool, error) {
+		if spec == nil || (current != nil && current(spec)) {
+			return false, nil
+		}
+		// Compare what the command would carry: opUpsertSpec encodes the
+		// spec as JSON, so a field kept off the wire (json:"-") never
+		// reaches Raft and does not count. An encode error just means
+		// "write, as before".
+		before, beforeErr := json.Marshal(spec)
+		patch(spec)
+		if beforeErr == nil {
+			if after, err := json.Marshal(spec); err == nil && bytes.Equal(before, after) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil && s.logger != nil {
 		s.logger.Warn("cluster: spec write-through failed; FSM spec stale until next mutation",
 			"sandbox_id", id, "err", err)
 	}
+}
+
+// replicateRecoverySpecPatch is replicateSpecPatch for the fields that only a
+// failover recreate reads back from the replicated spec: lifecycle, tags and
+// facade state (lifecycle through replicateRecoveryLifecycle, which also lets
+// the copy lag a keep-alive). The owner watcher recreates a placement only when its spec
+// asks for failover=recreate (recreateOwnedPlacement), and nothing else in
+// the cluster reads these fields, so for any other sandbox the write buys
+// nothing. Deciding before SpecOf also skips the round trips a worker makes
+// to the servers to read and write the spec: an E2B setTimeout on a default
+// sandbox costs no Raft entry and no control-plane call.
+//
+// sb is the caller's local row when it has one; nil reads it. The row and the
+// replicated spec take their failover policy from the same create request,
+// and an ownership replay rebuilds the spec from the row
+// (specFromSandbox). If the row cannot be read, the write goes ahead as it
+// did before.
+func (s *Service) replicateRecoverySpecPatch(ctx context.Context, id string, sb *models.Sandbox, patch func(*models.CreateSandboxRequest)) {
+	if _, ok := s.recoverySpecWanted(ctx, id, sb); ok {
+		s.replicateSpecPatch(ctx, id, patch)
+	}
+}
+
+// recoverySpecWanted is replicateRecoverySpecPatch's guard: false when no
+// failover recreate will read the field back. It returns the local row it
+// decided on (sb, or the one it read; nil if unreadable).
+func (s *Service) recoverySpecWanted(ctx context.Context, id string, sb *models.Sandbox) (*models.Sandbox, bool) {
+	if _, standalone := s.Cluster().(*cluster.Noop); standalone {
+		return sb, false
+	}
+	if sb == nil && s.store != nil {
+		if row, err := s.store.Get(ctx, id); err == nil {
+			sb = row
+		}
+	}
+	if sb != nil && (sb.Failover == nil || !sb.Failover.ShouldRecreate()) {
+		return sb, false
+	}
+	return sb, true
+}
+
+// lockSpec takes id's spec lock (specLocks) in a cluster. A single node has
+// no replicated spec to protect, so it takes nothing and its paths (a facade
+// create's state write-through among them) are unchanged.
+func (s *Service) lockSpec(ctx context.Context, id string) (func(), error) {
+	if !s.ClusterEnabled() {
+		return func() {}, nil
+	}
+	// A caller that already left starts nothing, even on a free lock.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.specLocks.lockCtx(ctx, id)
 }
 
 // provider returns the provider installed by New or ConfigureSecretProvider.

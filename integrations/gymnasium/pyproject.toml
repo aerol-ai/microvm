@@ -1,0 +1,33 @@
+[project]
+name = "aerolvm-gymnasium"
+version = "0.1.0"
+description = "A Gymnasium environment where every episode is a fresh AerolVM sandbox."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Aerol AI" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  # The release line the tests (reset/step signatures, check_env) run
+  # against. Widen it only after the tests pass on the next one.
+  "gymnasium>=1.4,<1.5",
+  # Uses upload_dir and the exec output caps, added after aerolvm-sdk
+  # 0.8.1. Raise this floor to the first release that has them before
+  # publishing this package.
+  "aerolvm-sdk>=0.8.1",
+]
+
+[project.urls]
+Documentation = "https://microvm.aerol.ai/integrations/gymnasium/"
+
+# Only the package goes in the wheel; tests stay out so they never shadow a
+# user's own "tests" package.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"

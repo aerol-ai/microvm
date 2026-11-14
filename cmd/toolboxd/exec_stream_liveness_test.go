@@ -104,7 +104,14 @@ func TestExecStreamDropKillsProcessGroup(t *testing.T) {
 	for _, tty := range []bool{false, true} {
 		t.Run(map[bool]string{false: "pipes", true: "pty"}[tty], func(t *testing.T) {
 			conn := dialExecStream(t, newExecStreamTestServer(t))
-			if err := conn.WriteJSON(map[string]any{"command": "echo $$; sleep 300 & sleep 300", "tty": tty}); err != nil {
+			// The background child is forked before the PID line and the
+			// last command is exec'd, so no fork is in flight when the test
+			// drops the stream right after that line. macOS's killpg can
+			// miss a child forked during the kill (117 of 300 runs in a
+			// standalone repro left the background sleep alive); Linux
+			// restarts a fork that a group signal interrupts, so toolboxd in
+			// a sandbox does not have this gap.
+			if err := conn.WriteJSON(map[string]any{"command": "sleep 300 & echo $$; exec sleep 300", "tty": tty}); err != nil {
 				t.Fatalf("start: %v", err)
 			}
 			pgid := readShellPID(t, conn)

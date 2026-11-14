@@ -56,6 +56,27 @@ func installShFunctions(t *testing.T, src string, names ...string) string {
 	return out.String()
 }
 
+// installShPins returns install.sh's download pins block (download_pins and
+// the NAME="value" lines it reads) with each assignment turned into a
+// default, NAME="${NAME-value}", so a value the test already set (a fixture's
+// hash) wins over the real pin.
+func installShPins(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, "\n# --- BEGIN DOWNLOAD PINS")
+	end := strings.Index(src, "\n# --- END DOWNLOAD PINS")
+	if start < 0 || end < start {
+		t.Fatal("install.sh has no DOWNLOAD PINS block")
+	}
+	return regexp.MustCompile(`(?m)^([A-Z0-9_]+)="([^"]*)"$`).
+		ReplaceAllString(src[start:end+1], `$1="$${$1-$2}"`)
+}
+
+// installShFetchFunctions are the download helpers the pinned downloads go
+// through: fetch_pinned looks a file up in download_pins and hands it to
+// fetch_with_fallback, which calls curl_download (stubbed) once per source.
+var installShFetchFunctions = []string{"fetch_pinned", "fetch_with_fallback", "fetch_source",
+	"download_mirror_on", "mirror_url_for", "sha256_of"}
+
 // installShVar returns the value of install.sh's top-level NAME="value".
 func installShVar(t *testing.T, src, name string) string {
 	t.Helper()
@@ -135,13 +156,15 @@ func checkCallsInOrder(t *testing.T, calls, want, never []string) {
 
 // fcStubs replaces the programs that would change the host or reach the
 // network. curl_download serves a fixture named like the URL's last path
-// element; FAKE_DOWNLOAD_OK=0 fails every download. getent reports the jailer
-// user present when FAKE_JAILER_USER=1.
+// element; FAKE_DOWNLOAD_OK=0 fails every download, and FAKE_GITHUB_DOWN=1
+// fails every github.com one. getent reports the jailer user present when
+// FAKE_JAILER_USER=1.
 const fcStubs = `
 uname() { case "$1" in -s) echo "$FAKE_OS" ;; -m) echo "$FAKE_ARCH" ;; esac; }
 apt-get() { echo "apt-get $*" >>"$LOG"; }
 curl_download() {
 	echo "curl_download $1" >>"$LOG"
+	[[ "${FAKE_GITHUB_DOWN:-0}" == 1 && "$1" == https://github.com/* ]] && return 22
 	[[ "$FAKE_DOWNLOAD_OK" == 1 && -f "$FIXTURES/${1##*/}" ]] || return 1
 	cat "$FIXTURES/${1##*/}" >"$3"
 }
@@ -276,8 +299,8 @@ func writeHostFile(t *testing.T, path string, body []byte, mode os.FileMode) {
 
 func TestInstallShInstallsFirecracker(t *testing.T) {
 	src := installShSource(t)
-	funcs := installShFunctions(t, src, "firecracker_binary_version", "firecracker_verify",
-		"install_firecracker_release", "install_firecracker_kernel", "install_firecracker")
+	funcs := installShPins(t, src) + installShFunctions(t, src, append([]string{"firecracker_binary_version", "firecracker_verify",
+		"install_firecracker_release", "install_firecracker_kernel", "install_firecracker"}, installShFetchFunctions...)...)
 	version := installShVar(t, src, "FIRECRACKER_VERSION")
 	kciVersion := installShVar(t, src, "FIRECRACKER_KERNEL_CI_VERSION")
 	kVersion := installShVar(t, src, "FIRECRACKER_KERNEL_VERSION")
@@ -286,6 +309,9 @@ func TestInstallShInstallsFirecracker(t *testing.T) {
 	}
 	kernelURL := func(arch string) string {
 		return "curl_download https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/" + kciVersion + "/" + arch + "/vmlinux-" + kVersion
+	}
+	mirrorURL := func(arch string) string {
+		return "curl_download https://mirror.test/deps/firecracker/" + version + "/firecracker-" + version + "-" + arch + ".tgz"
 	}
 	const (
 		apt     = "apt-get install -y skopeo umoci e2fsprogs iproute2"
@@ -383,6 +409,21 @@ func TestInstallShInstallsFirecracker(t *testing.T) {
 			env:     map[string]string{"FAKE_DOWNLOAD_OK": "0"},
 			want:    []string{releaseURL("x86_64")},
 			never:   []string{kernelURL("x86_64"), "useradd"},
+			wantErr: "failed to download"},
+		{name: "GitHub down: the release comes from the mirror, checked against the same pin", arch: "x86_64",
+			env:         map[string]string{"FAKE_GITHUB_DOWN": "1", "DOWNLOAD_MIRROR": "https://mirror.test"},
+			want:        []string{releaseURL("x86_64"), mirrorURL("x86_64"), kernelURL("x86_64"), useradd},
+			wantRelease: true, wantKernel: true},
+		{name: "the mirror's copy must match the pin too", arch: "aarch64",
+			env: map[string]string{"FAKE_GITHUB_DOWN": "1", "DOWNLOAD_MIRROR": "https://mirror.test",
+				"FIRECRACKER_SHA256_AARCH64": strings.Repeat("0", 64)},
+			want:    []string{releaseURL("aarch64"), mirrorURL("aarch64")},
+			never:   []string{kernelURL("aarch64"), "useradd"},
+			wantErr: "checksum verification failed for firecracker-" + version + "-aarch64.tgz"},
+		{name: "GitHub down and the mirror off: the install stops", arch: "x86_64",
+			env:     map[string]string{"FAKE_GITHUB_DOWN": "1", "DOWNLOAD_MIRROR": "off"},
+			want:    []string{releaseURL("x86_64")},
+			never:   []string{"mirror.test", kernelURL("x86_64"), "useradd"},
 			wantErr: "failed to download"},
 		{name: "an unsupported architecture is refused before anything is installed", arch: "x86_64",
 			env:     map[string]string{"FAKE_ARCH": "riscv64"},

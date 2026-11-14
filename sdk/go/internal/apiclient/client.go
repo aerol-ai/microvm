@@ -8,13 +8,12 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -61,6 +60,18 @@ type Client struct {
 	apiVersion    APIVersion
 	versionPrefix string
 	retryConfig   RetryConfig
+
+	// toolboxFeatures caches each sandbox's agent feature list from
+	// /version (RequireToolboxFeatures). A miss refreshes it, because a
+	// restart can bring a newer agent.
+	featuresMu      sync.Mutex
+	toolboxFeatures map[string]map[string]struct{}
+
+	// base is baseURL parsed, nil when it does not parse. Cell routing
+	// (cells.go) needs it to split a built URL back into base and path.
+	base *url.URL
+	// cells remembers the cell a 421 sent each sandbox to (cells.go).
+	cells cellRoutes
 }
 
 type ClientOptions struct {
@@ -78,7 +89,9 @@ type ClientOptions struct {
 	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
 	// re-sent only when the connection never opened or on 429/503, because a
 	// re-sent exec runs the command again. A 429 or 503 retry waits as long
-	// as the server's Retry-After asks, up to MaxRetryAfterMs.
+	// as the server's Retry-After asks, up to MaxRetryAfterMs. A 421 that
+	// names another cell (HeaderCellEndpoint) is not retried here: the
+	// request, exec included, goes once to that cell instead.
 	Retry *RetryConfig
 }
 
@@ -129,6 +142,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 		apiVersion:    version,
 		versionPrefix: prefix,
 	}
+	client.base, _ = url.Parse(client.baseURL)
 	if config.Retry != nil {
 		client.retryConfig = *config.Retry
 	}
@@ -752,6 +766,30 @@ func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
 }
 
+func (c *Client) teamQuotaPath(team string) string {
+	return c.versionPrefix + "/teams/" + url.PathEscape(team) + "/quota"
+}
+
+// PutTeamQuota sets a team's quota (admin only). Idempotent: the same
+// limits twice change nothing, so it retries like a read.
+func (c *Client) PutTeamQuota(ctx context.Context, team string, request models.TeamQuotaRequest) (models.TeamQuota, error) {
+	var response models.TeamQuota
+	err := c.doJSON(ctx, http.MethodPut, c.teamQuotaPath(team), request, &response)
+	return response, err
+}
+
+// GetTeamQuota reads a team's quota and what the team holds now.
+func (c *Client) GetTeamQuota(ctx context.Context, team string) (models.TeamQuota, error) {
+	var response models.TeamQuota
+	err := c.doJSON(ctx, http.MethodGet, c.teamQuotaPath(team), nil, &response)
+	return response, err
+}
+
+// DeleteTeamQuota removes a team's quota; one already gone is a success.
+func (c *Client) DeleteTeamQuota(ctx context.Context, team string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.teamQuotaPath(team), nil, nil)
+}
+
 func (c *Client) snapshotPath(name string) string {
 	return c.versionPrefix + "/snapshots/" + url.PathEscape(name)
 }
@@ -808,6 +846,9 @@ func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOpt
 	if opts.IncarnationID != "" {
 		values.Set("incarnation_id", opts.IncarnationID)
 	}
+	if opts.Caller != "" {
+		values.Set("caller", opts.Caller)
+	}
 	path := c.versionPrefix + "/sandboxes/" + id + "/audit"
 	if len(values) > 0 {
 		path += "?" + values.Encode()
@@ -836,88 +877,36 @@ func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models
 // request was written cannot tell whether it already ran. So it is retried
 // only when the connection never opened or the server refused it with 429 or
 // 503; any other failure is returned to the caller.
+//
+// MaxStdoutBytes, MaxStderrBytes and Argv are checked against the sandbox's
+// agent first: an agent older than them would ignore the caps and return all
+// output, or refuse argv with a confusing "command is required", so the call
+// fails with *UnsupportedFeatureError instead.
 func (c *Client) Exec(ctx context.Context, id string, request ExecRequest) (ExecResult, error) {
 	var response ExecResult
+	var features []string
+	if request.MaxStdoutBytes != 0 || request.MaxStderrBytes != 0 {
+		features = append(features, "exec.max_output_bytes")
+	}
+	if len(request.Argv) > 0 {
+		features = append(features, "exec.argv")
+	}
+	if err := c.RequireToolboxFeatures(ctx, id, features...); err != nil {
+		return response, err
+	}
 	_, err := c.doJSONHeaders(ctx, http.MethodPost, c.versionPrefix+"/sandboxes/"+id+"/toolbox/process/execute", request, &response, retryUnsentOnly)
 	return response, err
 }
 
+// UploadFile uploads data to targetPath with no write options.
 func (c *Client) UploadFile(ctx context.Context, id, targetPath string, data []byte) error {
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	_ = writer.WriteField("path", targetPath)
-	part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
-	if err != nil {
-		return err
-	}
-	if _, err := part.Write(data); err != nil {
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", &body)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return decodeError(response)
-	}
-	return nil
+	return c.UploadFileWithOptions(ctx, id, targetPath, data, sdktypes.UploadFileOptions{})
 }
 
-// UploadFileStream uploads r to targetPath without holding the file in
-// memory: the multipart body is produced through an io.Pipe while the request
-// is sent, so memory stays at the copy buffer no matter the file size. Unlike
-// a []byte upload it can't be retried by the client (the reader is consumed),
-// which matches UploadFile, whose request is not retried either.
+// UploadFileStream uploads r to targetPath with no write options; see
+// UploadFileStreamWithOptions.
 func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r io.Reader) error {
-	pr, pw := io.Pipe()
-	// Closing the read side unblocks the writer goroutine if the request
-	// fails before the body is fully read.
-	defer pr.Close()
-	writer := multipart.NewWriter(pw)
-	go func() {
-		pw.CloseWithError(func() error {
-			if err := writer.WriteField("path", targetPath); err != nil {
-				return err
-			}
-			part, err := writer.CreateFormFile("file", filepath.Base(targetPath))
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(part, r); err != nil {
-				return err
-			}
-			return writer.Close()
-		}())
-	}()
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/upload", pr)
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return decodeError(response)
-	}
-	return nil
+	return c.UploadFileStreamWithOptions(ctx, id, targetPath, r, sdktypes.UploadFileOptions{})
 }
 
 // DownloadFileStream opens targetPath for reading without buffering it. The
@@ -925,42 +914,12 @@ func (c *Client) UploadFileStream(ctx context.Context, id, targetPath string, r 
 // first window of a large file, say) ends the transfer. The request retries
 // like any other GET until the response headers arrive.
 func (c *Client) DownloadFileStream(ctx context.Context, id, targetPath string) (io.ReadCloser, error) {
-	path := c.versionPrefix + "/sandboxes/" + id + "/toolbox/files/download?path=" + url.QueryEscape(targetPath)
-	response, err := c.doWithRetry(ctx, retryIdempotent, func() (*http.Request, error) {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-		if err != nil {
-			return nil, err
-		}
-		c.addAuth(request)
-		return request, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode >= 400 {
-		defer response.Body.Close()
-		return nil, decodeError(response)
-	}
-	return response.Body, nil
+	return c.DownloadFileStreamWithOptions(ctx, id, targetPath, sdktypes.DownloadFileOptions{})
 }
 
+// DownloadFile reads the whole of targetPath. It retries like any safe call.
 func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byte, error) {
-	encodedPath := url.QueryEscape(targetPath)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+c.versionPrefix+"/sandboxes/"+id+"/toolbox/files/download?path="+encodedPath, nil)
-	if err != nil {
-		return nil, err
-	}
-	c.addAuth(request)
-
-	response, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 400 {
-		return nil, decodeError(response)
-	}
-	return io.ReadAll(response.Body)
+	return c.DownloadFileWithOptions(ctx, id, targetPath, sdktypes.DownloadFileOptions{})
 }
 
 // ExposePort publishes a sandbox container port. Pass an empty protocol to
@@ -969,9 +928,24 @@ func (c *Client) DownloadFile(ctx context.Context, id, targetPath string) ([]byt
 // populated only on the "tcp" path. The first exposure makes a private
 // sandbox public (AllowPublicTraffic omitted or false at create alike).
 func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol string) (ExposeResult, error) {
+	return c.ExposePortWithVisibility(ctx, id, port, protocol, "")
+}
+
+// ExposePortWithVisibility is ExposePort with a visibility: "token" makes the
+// URL need a sandbox token for this port, "public" opens it. Empty sends
+// none, so a new port is public and an exposed port keeps its gate (a plain
+// retry never opens a token port).
+func (c *Client) ExposePortWithVisibility(ctx context.Context, id string, port int, protocol, visibility string) (ExposeResult, error) {
 	var body any
+	fields := map[string]string{}
 	if protocol != "" && protocol != "http" {
-		body = map[string]string{"protocol": protocol}
+		fields["protocol"] = protocol
+	}
+	if visibility != "" {
+		fields["visibility"] = visibility
+	}
+	if len(fields) > 0 {
+		body = fields
 	}
 	var response ExposeResult
 	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), body, &response)
@@ -980,6 +954,27 @@ func (c *Client) ExposePort(ctx context.Context, id string, port int, protocol s
 
 func (c *Client) UnexposePort(ctx context.Context, id string, port int) error {
 	return c.doJSON(ctx, http.MethodDelete, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/ports/%d", id, port), nil, nil)
+}
+
+// CreateSandboxToken issues a signed token scoped to one sandbox (POST
+// /v1/sandboxes/{id}/tokens). Not idempotent by nature: every call makes a
+// new token and the server stores none. It uses the normal retry tier: a
+// retry after a lost answer makes a second token nobody holds, which simply
+// expires.
+func (c *Client) CreateSandboxToken(ctx context.Context, id string, req models.CreateSandboxTokenRequest) (models.SandboxToken, error) {
+	var out models.SandboxToken
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/tokens", id), req, &out)
+	return out, err
+}
+
+// RevokeSandboxTokens makes every token issued for one sandbox so far stop
+// working (POST /v1/sandboxes/{id}/tokens/revoke). A token issued after it
+// works. Safe to retry: a repeated call refuses the same tokens again (plus
+// any issued in between), so it uses the normal retry tier.
+func (c *Client) RevokeSandboxTokens(ctx context.Context, id string) (models.RevokeSandboxTokensResponse, error) {
+	var out models.RevokeSandboxTokensResponse
+	err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf(c.versionPrefix+"/sandboxes/%s/tokens/revoke", id), nil, &out)
+	return out, err
 }
 
 // customDomainsEnvelope mirrors the {"custom_domains":[...]} shape used by
@@ -1083,6 +1078,14 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, protocol string) (Ex
 	return s.client.ExposePort(ctx, s.ID, port, protocol)
 }
 
+func (s *Sandbox) CreateToken(ctx context.Context, req models.CreateSandboxTokenRequest) (models.SandboxToken, error) {
+	return s.client.CreateSandboxToken(ctx, s.ID, req)
+}
+
+func (s *Sandbox) RevokeTokens(ctx context.Context) (models.RevokeSandboxTokensResponse, error) {
+	return s.client.RevokeSandboxTokens(ctx, s.ID)
+}
+
 func (s *Sandbox) AddCustomDomain(ctx context.Context, hostname string, targetPort int) ([]models.CustomDomain, error) {
 	return s.client.AddCustomDomain(ctx, s.ID, hostname, targetPort)
 }
@@ -1133,6 +1136,62 @@ func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle models.Lifecycl
 	}
 	s.Sandbox = updated.Sandbox
 	return nil
+}
+
+// RequireToolboxFeatures fails closed unless the sandbox's agent lists every
+// feature on /version. toolboxd ignores request options it does not know, so
+// sending a newer option to an older agent would silently skip it (an
+// overwrite guard, an output cap). The error is an *UnsupportedFeatureError.
+func (c *Client) RequireToolboxFeatures(ctx context.Context, id string, features ...string) error {
+	if len(features) == 0 {
+		return nil
+	}
+	if c.hasToolboxFeatures(id, features) {
+		return nil
+	}
+	var info struct {
+		Version  string   `json:"version"`
+		Features []string `json:"features"`
+		Runtime  string   `json:"runtime"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/version", nil, &info); err != nil {
+		return err
+	}
+	have := make(map[string]struct{}, len(info.Features))
+	for _, f := range info.Features {
+		have[f] = struct{}{}
+	}
+	c.featuresMu.Lock()
+	if c.toolboxFeatures == nil {
+		c.toolboxFeatures = map[string]map[string]struct{}{}
+	}
+	c.toolboxFeatures[id] = have
+	c.featuresMu.Unlock()
+	var missing []string
+	for _, f := range features {
+		if _, ok := have[f]; !ok {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		return &UnsupportedFeatureError{SandboxID: id, Features: missing, AgentVersion: info.Version, Runtime: info.Runtime}
+	}
+	return nil
+}
+
+func (c *Client) hasToolboxFeatures(id string, features []string) bool {
+	c.featuresMu.Lock()
+	defer c.featuresMu.Unlock()
+	have, ok := c.toolboxFeatures[id]
+	if !ok {
+		return false
+	}
+	for _, f := range features {
+		if _, ok := have[f]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, requestBody any, responseBody any) error {
@@ -1300,24 +1359,46 @@ func isRetryableStatusCode(code int) bool {
 // exponential backoff when policy allows the failure. A 429 or 503 waits as
 // long as its Retry-After asks instead (see retryWait), and ctx ends any wait.
 func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq func() (*http.Request, error)) (*http.Response, error) {
+	return c.doWithRetryDone(ctx, policy, "", makeReq)
+}
+
+// doWithRetryDone is doWithRetry for a call whose retry can find its own
+// work already done: a delete whose reply was lost finds the path gone, a
+// mkdir finds its folder made. When a re-sent attempt gets an error reply
+// carrying the toolbox error code doneCode, the call succeeds with an empty
+// 204 (plan section 10, "Retries"), but only if an earlier attempt may have
+// done the work: its reply was lost (a dropped connection, 502 or 504). A
+// 421, 429 or 503 says the server did nothing, so a delete of a path that
+// was never there still reports it after one, as the first attempt does.
+func (c *Client) doWithRetryDone(ctx context.Context, policy retryPolicy, doneCode string, makeReq func() (*http.Request, error)) (*http.Response, error) {
 	maxRetries := *c.retryConfig.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
 
 	var lastErr error
+	mayHaveRun := false
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := makeReq()
 		if err != nil {
 			return nil, err // Can't even build the request, don't retry.
 		}
 
-		response, err := c.httpClient.Do(req)
+		response, err := c.send(req)
+		if err == nil && mayHaveRun && doneCode != "" && response.StatusCode >= 400 && replyHasCode(response, doneCode) {
+			response.Body.Close()
+			return &http.Response{StatusCode: http.StatusNoContent, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+		}
+		// A connect-phase failure sent nothing (isUnsentTransportError), so,
+		// as in the other SDKs, it says nothing about the work.
+		if (err != nil && !isUnsentTransportError(err)) || (err == nil && replyMayBeLost(response.StatusCode)) {
+			mayHaveRun = true
+		}
 
 		var retryAfter string
 		if err == nil {
 			// A response: re-send only a transient status with budget left.
-			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries {
+			if !policy.retriesStatus(response.StatusCode) || attempt >= maxRetries || namesCell(response) {
 				return response, nil
 			}
 			retryAfter = retryAfterHint(response)
@@ -1335,6 +1416,23 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 		}
 	}
 	return nil, lastErr
+}
+
+// replyMayBeLost reports a status after which the server may still have
+// done the work: a gateway gave up waiting for it (502, 504). 421, 429 and
+// 503 are answered before any work.
+func replyMayBeLost(code int) bool {
+	return code == http.StatusBadGateway || code == http.StatusGatewayTimeout
+}
+
+// replyHasCode reports whether an error reply's JSON carries code. The body
+// stays readable for decodeError.
+func replyHasCode(response *http.Response, code string) bool {
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	var reply models.ErrorResponse
+	return json.Unmarshal(body, &reply) == nil && reply.Code == code
 }
 
 func (c *Client) addAuth(request *http.Request) {

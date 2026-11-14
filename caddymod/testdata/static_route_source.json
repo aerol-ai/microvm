@@ -1,0 +1,8 @@
+{
+  "source": "aerolvm_route",
+  "name": "{http.request.host}.",
+  "port": "{sbport}",
+  "refresh": "1s",
+  "resolver": "127.0.0.1:53053",
+  "fallback": "127.0.0.1:21213"
+}

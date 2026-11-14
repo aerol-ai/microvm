@@ -21,6 +21,7 @@ import (
 //	map {http.request.host} → {sbport}   (SandboxPortHostRegexp; default = toolbox port)
 //	reverse_proxy dynamic A name={http.request.host}. port={sbport} resolver=route responder
 //	              static upstream = sandboxd router  (used when the responder says NXDOMAIN)
+//	              lookup = AerolVM's Caddy plugin when Caddy has it (staticRouteSource)
 //
 // Ingress tls-mux: three routes ahead of the fallback.
 //
@@ -58,7 +59,21 @@ type StaticRouteSpec struct {
 	RouterAddr   string // sandboxd router (loopback), e.g. 127.0.0.1:21213
 	ToolboxPort  int
 	LocalIP      string // ingress self-dial marker, e.g. 127.0.0.1
+	// RouteUpstream: this Caddy has AerolVM's upstream plugin
+	// (HasRouteUpstream). The owner route then looks up with it, not with
+	// Caddy's stock "a" source.
+	RouteUpstream bool
 }
+
+// AerolVM's Caddy plugin (caddymod/, built into every release Caddy).
+// TestRouteUpstreamMatchesThePlugin checks these against the plugin's
+// source, and TestStaticSandboxRouteUsesThePlugin checks the route against
+// the config the plugin's own tests load
+// (caddymod/testdata/static_route_source.json).
+const (
+	routeUpstreamSource     = "aerolvm_route"
+	routeUpstreamStatusPath = "/aerolvm/route-upstream"
+)
 
 // StaticSandboxRoute is the owner http route (see the file comment).
 func (c *Client) StaticSandboxRoute(spec StaticRouteSpec) map[string]any {
@@ -74,23 +89,71 @@ func (c *Client) StaticSandboxRoute(spec StaticRouteSpec) map[string]any {
 				"defaults":     []string{strconv.Itoa(spec.ToolboxPort)},
 			},
 			{
-				"handler": "reverse_proxy",
-				// Fully qualified (trailing dot): no search-domain expansion.
-				"dynamic_upstreams": map[string]any{
-					"source":   "a",
-					"name":     "{http.request.host}.",
-					"port":     "{sbport}",
-					"refresh":  "1s",
-					"resolver": map[string]any{"addresses": []string{spec.RouteDNSAddr}},
-				},
-				// Taken whenever the responder answers NXDOMAIN: wake, 503,
-				// WASM/isolate mediators, masked hosts, unknown hosts.
+				"handler":           "reverse_proxy",
+				"dynamic_upstreams": staticRouteSource(spec),
+				// The router, for every host the responder answers NXDOMAIN:
+				// wake, 503, WASM/isolate mediators, masked hosts, unknown
+				// hosts. The stock source fails over to it; the plugin returns
+				// the router itself, so Caddy takes this only when the
+				// plugin's lookup fails.
 				"upstreams":          []map[string]any{{"dial": spec.RouterAddr}},
 				"flush_interval":     -1,
 				"stream_close_delay": streamCloseDelay,
 			},
 		},
 	}
+}
+
+// staticRouteSource is the owner route's lookup: the Host, fully qualified
+// (trailing dot: no search-domain expansion), as an A record from the route
+// responder, re-asked every second, on the map's {sbport}.
+//
+// Every sandbox request goes through it. Caddy's stock "a" source caches 100
+// hosts for the whole process and looks up under one lock, so past 100
+// hosts every request is a lookup and they all queue (2.4M lookups/s at 100
+// hosts, 4.9k at 1,000). It caches no NXDOMAIN, the responder's answer for
+// every host the router serves (WASM/isolate, masked, waking, in flux), and
+// logs each one at ERROR. The plugin caches per host with no shared lock,
+// caches "not found" too and sends it to the router itself.
+//
+// The stock source stays for a Caddy without the plugin: install.sh falls
+// back to Caddy's build service when the release Caddy cannot be fetched,
+// and that service cannot add a private plugin. IPv4 only there: the
+// responder answers only A, so the AAAA query doubled the lookups for
+// nothing.
+func staticRouteSource(spec StaticRouteSpec) map[string]any {
+	if spec.RouteUpstream {
+		return map[string]any{
+			"source":   routeUpstreamSource,
+			"name":     "{http.request.host}.",
+			"port":     "{sbport}",
+			"refresh":  "1s",
+			"resolver": spec.RouteDNSAddr,
+			"fallback": spec.RouterAddr,
+		}
+	}
+	return map[string]any{
+		"source":   "a",
+		"name":     "{http.request.host}.",
+		"port":     "{sbport}",
+		"refresh":  "1s",
+		"resolver": map[string]any{"addresses": []string{spec.RouteDNSAddr}},
+		"versions": map[string]any{"ipv4": true},
+	}
+}
+
+// HasRouteUpstream reports whether this Caddy has AerolVM's upstream plugin.
+// The plugin's admin module answers routeUpstreamStatusPath and a stock
+// Caddy answers 404. It asks with a read, not by trying the route: the route
+// goes in with one batched /load, which an unknown module fails whole. The
+// read goes straight to Caddy, so it works inside a Batch too. Any failure
+// reads as "no": the stock source is slower, never wrong.
+func (c *Client) HasRouteUpstream(ctx context.Context) bool {
+	if !c.enabled {
+		return false
+	}
+	status, _, err := c.sendDirect(ctx, http.MethodGet, c.baseURL+routeUpstreamStatusPath, nil)
+	return err == nil && status == http.StatusOK
 }
 
 // StaticIngressRoutes are the tls-mux routes, in order (see the file comment).

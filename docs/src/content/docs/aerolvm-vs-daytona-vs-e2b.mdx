@@ -153,7 +153,7 @@ If you want a hosted service with virtual machine, GPU and macOS sandboxes and n
 
 ## Growing past one server
 
-E2B, Daytona and AerolVM are all built for heavy sandbox traffic. The difference is who runs the servers. With AerolVM you run a [cluster](/cluster-setup/) on your own servers, instead of paying a vendor for every sandbox you run.
+E2B, Daytona and AerolVM are all built for heavy sandbox traffic. The difference is who runs the servers. With AerolVM you run a [cluster](/cluster/) on your own servers, instead of paying a vendor for every sandbox you run.
 
 - **Shared placement records.** Raft keeps a copy of where each sandbox lives on every `server` node. Any `server` node can answer "where is sandbox X?" without asking the leader.
 - **Separate roles.** Each server takes one or more roles: `server` (keeps the Raft records and votes), `worker` (runs sandboxes) or `ingress` (holds the public route table). You keep 3 or 5 `server` nodes however many workers you add. Kubernetes splits control-plane nodes from worker nodes the same way. See [Ingress nodes](/cluster-ingress/).

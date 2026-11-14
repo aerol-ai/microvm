@@ -295,10 +295,11 @@ func TestFileAndGitErrorMappers(t *testing.T) {
 		t.Fatalf("writeFilesystemError(permission) = %d, want 403", rec.Code)
 	}
 
+	// B1: a taken path is the caller's conflict, not a server fault.
 	rec = httptest.NewRecorder()
 	writeFilesystemError(rec, os.ErrExist)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("writeFilesystemError(exist) = %d, want 500", rec.Code)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("writeFilesystemError(exist) = %d, want 409", rec.Code)
 	}
 
 	rec = httptest.NewRecorder()

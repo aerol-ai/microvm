@@ -1,0 +1,5 @@
+exit 0
+--- stdout
+NAME   ID                    STATUS    RUNTIME   AGE
+db     sb-0000000000000002   started   docker    5h
+--- stderr

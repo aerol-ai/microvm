@@ -35,6 +35,7 @@ import (
 	"time"
 
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -321,6 +322,8 @@ func (d *Driver) tryAcquireWarm(
 	d.register(sandboxID, client, wrapped, slot.VsockCID, false)
 
 	committed = true
+	// A create served by a paused VMM from the pool is warm (O1).
+	scaleobs.MarkWarmStart(ctx)
 	return &models.SandboxRuntimeState{
 		SandboxID:   sandboxID,
 		ContainerID: slot.APISocket,

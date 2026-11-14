@@ -170,3 +170,40 @@ func TestCollectExpvarSamplesNestedMap(t *testing.T) {
 		t.Fatalf("nested labels = %+v", samples[0].Labels)
 	}
 }
+
+// The goroutine gauge is an expvar.Func, which reaches the collector through
+// its String() form, and must read the live count, not a value frozen at
+// registration.
+//
+// The count is process-wide, and goroutines that earlier tests left behind
+// end on their own schedule (TestCoverage96ErrorBranches arms 30ms context
+// timers and stops waiting on its calls after 40ms). Checking "rose by the
+// 50 we parked" broke when one of them ended between the two reads:
+// 4 -> 53. So the test parks enough goroutines to hold the whole bound
+// itself: the first read plus 50. A live gauge must read at least that,
+// whatever else ends; a value frozen at registration or at the first read
+// cannot.
+func TestGoGoroutinesGaugeIsLive(t *testing.T) {
+	read := func() int64 {
+		for _, s := range CollectAerolVMExpvars() {
+			if s.Name == "aerolvm_go_goroutines" && s.Int64 != nil {
+				return *s.Int64
+			}
+		}
+		t.Fatal("aerolvm_go_goroutines is not collected")
+		return 0
+	}
+	before := read()
+	if before <= 0 {
+		t.Fatalf("aerolvm_go_goroutines = %d, want the live count", before)
+	}
+	parked := before + 50
+	stop := make(chan struct{})
+	for i := int64(0); i < parked; i++ {
+		go func() { <-stop }()
+	}
+	defer close(stop)
+	if after := read(); after < parked {
+		t.Fatalf("aerolvm_go_goroutines went %d -> %d with %d goroutines parked", before, after, parked)
+	}
+}

@@ -333,3 +333,103 @@ func seedNetstatsSandbox(t *testing.T, st *storepkg.Store, sandbox *models.Sandb
 		t.Fatalf("seed sandbox: %v", err)
 	}
 }
+
+// TestNetstatsBatchReReadsOnlyQuotaRows pins the batched sink: a sandbox under
+// its caps is counted and billed from the counter UPDATE alone, while one
+// still flagged over quota takes the re-read path and has the flag lifted
+// once a raised cap puts it back under.
+func TestNetstatsBatchReReadsOnlyQuotaRows(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	reporter := &captureReporter{}
+	svc.usageReporter = reporter
+	for _, id := range []string{"sb-under", "sb-lifted"} {
+		seedNetstatsSandbox(t, st, &models.Sandbox{
+			ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+			ContainerID: "ctr-" + id, ContainerIP: "10.0.0.30", Runtime: models.RuntimeDocker,
+			CPU: 1, MemoryMB: 256, DiskGB: 5, OSUser: "root", OwnerRef: "acme",
+		})
+	}
+	if err := st.SetNetworkLimits(ctx, "sb-under", 1000, 1000); err != nil {
+		t.Fatalf("SetNetworkLimits(under): %v", err)
+	}
+	if err := st.MarkNetworkQuotaExceeded(ctx, "sb-lifted", time.Now().UTC()); err != nil {
+		t.Fatalf("MarkNetworkQuotaExceeded: %v", err)
+	}
+
+	sampledAt := time.Now().UTC()
+	netstatsServiceSink{svc: svc}.handleNetworkSamples(ctx, []netstats.Sample{
+		{SandboxID: "sb-under", BytesIn: 10, BytesOut: 20, SampledAt: sampledAt},
+		{SandboxID: "sb-lifted", BytesIn: 5, BytesOut: 5, SampledAt: sampledAt},
+	})
+
+	under, err := st.Get(ctx, "sb-under")
+	if err != nil {
+		t.Fatalf("Get(under): %v", err)
+	}
+	if under.NetworkBytesIn != 10 || under.NetworkBytesOut != 20 || under.NetworkQuotaExceeded {
+		t.Fatalf("under = in:%d out:%d flagged:%v, want 10/20 unflagged", under.NetworkBytesIn, under.NetworkBytesOut, under.NetworkQuotaExceeded)
+	}
+	lifted, err := st.Get(ctx, "sb-lifted")
+	if err != nil {
+		t.Fatalf("Get(lifted): %v", err)
+	}
+	if lifted.NetworkQuotaExceeded {
+		t.Fatal("flag should be lifted: no cap is set, so the sandbox is under quota")
+	}
+	if len(rt.applyNetworkBlockAllCalls) != 0 {
+		t.Fatalf("no sandbox is over a cap, yet block calls = %v", rt.applyNetworkBlockAllCalls)
+	}
+
+	var ingress int
+	for _, sample := range reporter.all() {
+		if sample.Kind != usageKindIngress {
+			continue
+		}
+		ingress++
+		if sample.OwnerRef != "acme" {
+			t.Fatalf("usage owner = %q, want the owner_ref read back by the UPDATE", sample.OwnerRef)
+		}
+	}
+	if ingress != 2 {
+		t.Fatalf("ingress usage samples = %d, want one per applied sandbox", ingress)
+	}
+}
+
+// TestNetstatsBatchBillsEachSampleOnce covers one sandbox appearing twice in a
+// call: both deltas are stored, and usage is billed per sample, not twice
+// for the last one.
+func TestNetstatsBatchBillsEachSampleOnce(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	reporter := &captureReporter{}
+	svc.usageReporter = reporter
+	seedNetstatsSandbox(t, st, &models.Sandbox{
+		ID: "sb-twice", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-twice", ContainerIP: "10.0.0.31", Runtime: models.RuntimeDocker,
+		CPU: 1, MemoryMB: 256, DiskGB: 5, OSUser: "root",
+	})
+	first := time.Now().UTC()
+	netstatsServiceSink{svc: svc}.handleNetworkSamples(ctx, []netstats.Sample{
+		{SandboxID: "sb-twice", BytesIn: 100, SampledAt: first},
+		{SandboxID: "sb-twice", BytesIn: 7, SampledAt: first.Add(time.Second)},
+	})
+
+	got, err := st.Get(ctx, "sb-twice")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.NetworkBytesIn != 107 {
+		t.Fatalf("stored bytes in = %d, want 107", got.NetworkBytesIn)
+	}
+	var billed float64
+	for _, sample := range reporter.all() {
+		if sample.Kind == usageKindIngress {
+			billed += sample.Value
+		}
+	}
+	if billed != 107 {
+		t.Fatalf("billed ingress = %v, want 107 (each sample once)", billed)
+	}
+}

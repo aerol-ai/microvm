@@ -32,6 +32,34 @@ export enum NavigationCategory {
 
 const link = (href: string, label: string) => ({ type: 'link' as const, href, label })
 
+// The cluster guide sits under one Cluster Setup entry, closed until its +
+// opens it, the way SSO's providers do. Its pages come in reading order, so
+// "Next" walks the guide. The reference pages follow under a "Reference"
+// heading and stay out of "Next".
+const clusterPages = [
+  ...[
+    ['how-it-works', 'How a cluster works'],
+    ['create', 'Build a cluster'],
+    ['aws', 'Build it on AWS'],
+    ['nodes', 'Add and remove nodes'],
+    ['upgrade', 'Upgrade'],
+    ['backup', 'Back up and recover'],
+    ['security', 'Keep it safe'],
+    ['troubleshooting', 'Fix problems'],
+    ['cheat-sheet', 'Command cheat sheet'],
+    ['kubernetes', 'Coming from Kubernetes'],
+  ].map(([id, label]) => link(`/cluster/${id}`, label)),
+  ...[
+    ['/cluster-ingress', 'Ingress nodes'],
+    ['/cells', 'Many cells'],
+    ['/cluster-secrets', 'Secrets providers'],
+    ['/dashboard', 'Dashboard'],
+    ['/operational-runbooks', 'Runbooks'],
+    ['/reconcile', 'Reconcile'],
+    ['/cluster-glossary', 'Glossary'],
+  ].map(([href, label]) => ({ ...link(href, label), reference: true })),
+]
+
 // Every docs page appears exactly once, in reading order: pagination walks
 // this list, so "Next" on one page is the next thing a newcomer should read.
 // Keep it two levels deep (group -> page); deeper nesting is what made the old
@@ -46,7 +74,10 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       // link('/quick-start', 'Quickstart'),
       link('/getting-started/local-setup', '- Local Setup'),
       link('/getting-started/single-node-setup', '- Single Node Cloud Setup'),
-      link('/getting-started/cluster-setup', '- Cluster Setup'),
+      link('/kubernetes', '- Kubernetes'),
+      link('/kubernetes-cluster', '- Kubernetes Cluster Mode'),
+      link('/kubernetes-api', '- Kubernetes API (kubectl)'),
+      { ...link('/cluster', '- Cluster Setup'), children: clusterPages },
     ],
   },
   {
@@ -60,6 +91,18 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/using-daytona-sdk', '- Use the Daytona SDK'),
       link('/using-e2b-sdk', '- Use the E2B SDK'),
       link('/using-runloop-sdk', '- Use the Runloop SDK'),
+      link('/moving-from-agent-sandbox', '- Move from agent-sandbox'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Agent Framework Integrations',
+    category: NavigationCategory.SDKS,
+    entries: [
+      link('/integrations/openai-agents', '- OpenAI Agents SDK'),
+      link('/integrations/deepagents', '- LangChain DeepAgents'),
+      link('/integrations/gymnasium', '- Gymnasium'),
+      link('/integrations/nemo-gym', '- NVIDIA NeMo Gym'),
     ],
   },
   {
@@ -84,15 +127,29 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/sandboxes', '- Create and Manage'),
       link('/ghost-sandboxes', '- Ghost(Vercel) Mode'),
       link('/images-and-snapshots', '- Images and Snapshots'),
+      link('/warm-pools', '- Warm pools'),
+      link('/performance-benchmark', '- Create throughput'),
       link('/lifecycle', '- Lifecycle'),
       link('/sandbox-env', '- Secured Env variables'),
+      link('/sandbox-cloud-identity', '- Cloud identity (AWS, GCP, Azure)'),
       link('/durability', '- Durability and failover'),
       link('/exec-streaming', '- Run commands'),
       link('/file-system', '- Handle Files'),
+      link('/file-watching', '- Watch files'),
       link('/sessions', '- Terminal sessions'),
       link('/sandbox-tags', '- Tags'),
       link('/ssh-access', '- SSH access'),
+      link('/sandbox-tokens', '- Sandbox tokens'),
       
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Ready-made Images',
+    category: NavigationCategory.SANDBOXES,
+    entries: [
+      link('/computer-use', '- Computer use and browser'),
+      link('/vscode-in-browser', '- VS Code in the browser'),
     ],
   },
   
@@ -118,20 +175,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/platform-volumes', '- Platform volumes'),
     ],
   },
-  // {
-  //   type: 'group',
-  //   label: 'Run a Cluster',
-  //   category: NavigationCategory.OPERATIONS,
-  //   entries: [
-  //     link('/cluster-setup', 'Cluster setup'),
-  //     link('/cluster-ingress', 'Ingress nodes'),
-  //     link('/cluster-secrets', 'Secrets providers'),
-  //     link('/cluster-glossary', 'Glossary'),
-  //     link('/dashboard', 'Dashboard'),
-  //     link('/reconcile', 'Reconcile'),
-  //     link('/operational-runbooks', 'Runbooks'),
-  //   ],
-  // },
 ]
 
 // Blog posts keep the URLs they had as docs pages, because the docs link to
@@ -174,6 +217,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
       link('/engineering-sparse-disks', '- Stop and start, disk stays small'),
+      link('/engineering-route-lookup', '- Requests waited past 100 names'),
     ],
   },
   {
@@ -238,6 +282,11 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
       link(`${uca}/pull-request-review-auto-fix-agent`, '- Review a pull request'),
       link(`${uca}/test-writing-failure-reproduction-agent`, '- Write 500 tests'),
       link(`${uca}/claude-code-security-vulnerability-remediation-agent`, '- Find and fix security problems'),
+      link(`${uca}/opencode-agent`, '- Run OpenCode'),
+      link(`${uca}/aider-agent`, '- Run Aider'),
+      link(`${uca}/gemini-cli-agent`, '- Run Gemini CLI'),
+      link(`${uca}/codex-cli-agent`, '- Run Codex CLI'),
+      link(`${uca}/host-mcp-server`, '- Host an MCP server'),
     ],
   },
   {
@@ -293,6 +342,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
+      link(`${ent}/create-policy`, '- Limit what users create'),
       { ...link(`${ent}/sso`, '- SSO'), children: ssoProviders },
       link(`${ent}/key-custody`, '- Use your own key store'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),

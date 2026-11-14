@@ -335,6 +335,10 @@ func TestReconcileBackfillsMissingPlacementForManagedLocalSandbox(t *testing.T) 
 		},
 	}, nil)
 	svc.cfg.EnableCluster = true
+	// A fresh row with no placement is placed only when the post-delete
+	// grace proves it was never deleted (settleUnplacedRow); 1h is the
+	// SB_AUDIT_DELETED_GRACE default.
+	svc.cfg.AuditDeletedGrace = time.Hour
 	recorder := &recordingOwnershipCluster{
 		Noop:       cluster.NewNoop("self", "http://self", ""),
 		placements: map[string]cluster.Placement{},

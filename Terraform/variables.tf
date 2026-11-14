@@ -285,13 +285,16 @@ variable "nodes" {
       with_firecracker (bool,    default var.default_with_firecracker)
       with_gvisor      (bool,    default var.default_with_gvisor)
       with_isolate     (bool,    default var.default_with_isolate)
-      ingress_proxy_routing (bool, default var.default_ingress_proxy_routing)
+      ingress_proxy_routing (bool or null, default var.default_ingress_proxy_routing; null = install.sh's default)
       with_nvidia_gpu  (bool,    default var.default_with_nvidia_gpu)
       with_amd_gpu     (bool,    default var.default_with_amd_gpu)
       idle_timeout_min (number,  default var.default_idle_timeout_min; 0 disables)
       extra_user_data  (string,  default ""; appended to bootstrap.sh)
       sandboxd_env     (map(string), default {}; merged over var.extra_sandboxd_env)
       tags             (map(string), default {})
+      blank            (bool,    default false; plain Ubuntu, nothing installed,
+                        for a test to join by hand. Not a member, so it
+                        gets no DNS record and is not counted.)
   EOT
   type = map(object({
     role                  = optional(string, "mixed")
@@ -316,6 +319,7 @@ variable "nodes" {
     # SB_* profiles (audit rate limits, jail settings) from one node map.
     sandboxd_env = optional(map(string), {})
     tags         = optional(map(string), {})
+    blank        = optional(bool, false)
     # spot requests this node as an EC2 spot instance (one-time, terminate on
     # reclaim). Default false → on-demand, identical to prior behaviour. Only
     # the integration test harness sets this true; prod node maps omit it.
@@ -430,10 +434,16 @@ variable "default_with_isolate" {
   default     = false
 }
 
+# Three values on purpose. null (the default) passes no routing flag, so the
+# node gets install.sh's own default: on for a domain install. It renders
+# exactly what the old default false rendered, so a cluster that never set
+# this keeps byte-identical user_data and no node is replaced
+# (user_data_replace_on_change). true and false pass an explicit flag.
 variable "default_ingress_proxy_routing" {
-  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md): install.sh --ingress-proxy-routing writes SB_INGRESS_PROXY_ROUTING=true and routes *.rt.internal to the sandboxd route responder. Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. Default off (setup/config-defaults.md)."
+  description = "Route sandboxes without per-sandbox Caddy writes (plans/ingress-proxy-routing.md). null (default): no installer flag, so install.sh's default applies, which is on for a domain install. true: install.sh --ingress-proxy-routing. false: install.sh --no-ingress-proxy-routing (per-sandbox Caddy routes). Per-node, no flag-day; per-node override via nodes[*].ingress_proxy_routing. See Terraform/README.md, \"Ingress proxy routing\"."
   type        = bool
-  default     = false
+  default     = null
+  nullable    = true
 }
 
 variable "default_with_nvidia_gpu" {
@@ -619,6 +629,22 @@ variable "install_script_url" {
   description = "URL of the single-node install.sh."
   type        = string
   default     = "https://aerolvm.aerol.ai"
+}
+
+# null (the default) renders the bootstrap exactly as before, so a cluster that
+# never set this keeps byte-identical user_data and no node is replaced
+# (user_data_replace_on_change). Setting it changes user_data once: the next
+# apply replaces each node.
+variable "download_mirror" {
+  description = "Download mirror the node bootstrap falls back to when a file's own source fails: AerolVM release files (install.sh, cluster-init.sh, cluster-join.sh, cluster-sign-node.sh) and the CNI plugins, BuildKit and Firecracker it downloads, with the CNI plugins and BuildKit checked against install.sh's pinned SHA-256. The public mirror is https://aerolvm-downloads.s3.us-east-1.amazonaws.com (scripts/mirror-sync.sh fills it). null (default): no fallback, GitHub only, as before. Setting it replaces each node once. See Terraform/README.md, \"Download mirror\"."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.download_mirror == null || can(regex("^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$", var.download_mirror))
+    error_message = "download_mirror must be an https:// URL with no query, quotes or spaces (it is written into the bootstrap script), or null."
+  }
 }
 
 variable "caddy_binary_url" {
@@ -816,6 +842,18 @@ variable "audit_receiver_url" {
 # name, a webhook URL) stay as dedicated template vars; this map is for the
 # static per-scenario profile.
 #
+# identity_issuer_enabled makes every node an OIDC issuer for sandbox cloud
+# identities (plans/sandbox-cloud-identity.md): SB_IDENTITY_ISSUER_URL is the
+# deployment's public API URL, https://<domain>, which a static
+# extra_sandboxd_env entry cannot name because the domain is leased at apply
+# time. Off by default and rendered only when on (and the deployment has a
+# domain), so a production render is byte-identical to before.
+variable "identity_issuer_enabled" {
+  description = "Set SB_IDENTITY_ISSUER_URL=https://<domain> on every node so sandboxes can get cloud identity tokens. Needs a domain."
+  type        = bool
+  default     = false
+}
+
 # Empty by default, so a production render is byte-identical to before.
 variable "extra_sandboxd_env" {
   description = "Extra SB_* env vars written to /etc/sandboxd/cluster.env before the final sandboxd restart. Merged under each node's own sandboxd_env."
@@ -914,6 +952,22 @@ variable "bundle_bucket_force_destroy" {
   description = "Whether `terraform destroy` may delete the bundle S3 bucket even if it still has objects."
   type        = bool
   default     = true
+}
+
+# kubeadm's way to add a node after its join token expired: make a fresh
+# token on the cluster and give it to the new machine. This is how that
+# fresh token reaches one new node's user data (Terraform/join.tf).
+variable "node_join_tokens" {
+  description = "A join token for one node, by its name in nodes, used instead of the module's token for its role. For a node added after that token stopped working: the module's server token lasts 24h (worker and ingress tokens never expire), so a server added later needs a fresh one. Make it on a server with `sudo sandboxd join-command --role server --ttl 2h --json` (a server token can only be made through a server) and use its \"token\". Only that node's user data changes, so no other node is replaced. Leave the entry in after the node has joined: removing it changes that node's user data, which replaces it."
+  type        = map(string)
+  default     = {}
+  nullable    = false
+  sensitive   = true
+
+  validation {
+    condition     = alltrue([for t in values(var.node_join_tokens) : can(regex("^[a-z0-9]{6}\\.[a-z0-9]{32}$", t))])
+    error_message = "Each node_join_tokens value must be a join token: 6 then 32 characters of a-z and 0-9, joined by a dot, as `aerolvm join-command --json` prints in \"token\"."
+  }
 }
 
 variable "caddy_certs_bucket_force_destroy" {

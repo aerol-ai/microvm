@@ -3,6 +3,8 @@ import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
   APITokenList,
+  CallOptions,
+  DestroyAllOptions,
   BuildImageOptions,
   BuildImageResult,
   CloneGeneration,
@@ -16,11 +18,21 @@ import type {
   PushWasmModuleResult,
   ExecStreamHandle,
   ExecStreamOptions,
+  FileEvent,
+  FileWatchHandle,
   HealthStatus,
   EgressProfile,
   EgressProfileList,
   EgressProfileOptions,
+  IdentityRole,
+  IdentityRoleList,
+  IdentityRoleOptions,
   ListEgressProfilesOptions,
+  TeamQuota,
+  TeamQuotaOptions,
+  WarmPool,
+  WarmPoolOptions,
+  ListIdentityRolesOptions,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
   IngressTarget,
@@ -28,6 +40,7 @@ import type {
   GetOptions,
   ListOptions,
   MountSpecRedacted,
+  RevokeSandboxTokensResult,
   CreateSnapshotOptions,
   RegisterSnapshotOptions,
   ListSnapshotsOptions,
@@ -40,6 +53,7 @@ import type {
   SessionAttachOptions,
   Template,
   WasmModule,
+  WatchFilesOptions,
   WhoAmI,
 } from "./types.js";
 
@@ -56,11 +70,18 @@ export interface Tokens {
    * earlier attempt whose reply was lost; that secret cannot be recovered,
    * so revoke the token and create it again.
    */
-  create(options: CreateAPITokenOptions): Promise<CreatedAPIToken>;
+  create(options: CreateAPITokenOptions, call?: CallOptions): Promise<CreatedAPIToken>;
   /** List every token (auditor or admin); expired ones stay listed for 30 days. */
-  list(): Promise<APITokenList>;
+  list(call?: CallOptions): Promise<APITokenList>;
   /** Revoke a token by id (admin only). Revoking one already gone succeeds. */
-  revoke(id: string): Promise<void>;
+  revoke(id: string, call?: CallOptions): Promise<void>;
+}
+
+/** What {@link MicroVM.getOrCreate} found or made. */
+export interface GetOrCreateResult {
+  sandbox: Sandbox;
+  /** True only when this call created the sandbox. */
+  created: boolean;
 }
 
 export interface MicroVMConfig {
@@ -104,18 +125,23 @@ export interface MicroVMConfig {
    * Cancels the client's HTTP requests: aborting it ends the request in
    * flight and any retry wait, so a call never sits out a long
    * `Retry-After` once aborted. Pass `AbortSignal.timeout(ms)` to bound
-   * how long the client may run. WebSocket streams are not affected.
+   * how long the client may run. WebSocket streams are not affected. To
+   * cancel or time-limit one call, pass `{ signal }` as that call's last
+   * argument ({@link CallOptions}).
    */
   signal?: AbortSignal;
 }
 
 export class MicroVM {
   readonly apiUrl: string;
-  readonly patToken: string;
+  // patToken and client are set in the constructor as non-enumerable
+  // properties: still readable by name, but JSON.stringify, object spread
+  // and Object.keys of a MicroVM never carry the token.
+  declare readonly patToken: string;
   /** The team sent as `X-AerolVM-Team`, or `""` when none is. */
   readonly team: string;
 
-  private readonly client: APIClient;
+  declare private readonly client: APIClient;
 
   constructor(config: MicroVMConfig = {}) {
     const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? readEnv("SB_API_TOKEN") ?? "";
@@ -127,9 +153,9 @@ export class MicroVM {
     }
 
     this.apiUrl = apiUrl;
-    this.patToken = patToken;
+    Object.defineProperty(this, "patToken", { value: patToken, enumerable: false });
     this.team = team;
-    this.client = new APIClient({
+    const client = new APIClient({
       baseURL: apiUrl,
       patToken,
       team,
@@ -138,15 +164,18 @@ export class MicroVM {
       retry: config.retry,
       signal: config.signal,
     });
+    Object.defineProperty(this, "client", { value: client, enumerable: false });
   }
 
-  async create(options: CreateOptions): Promise<Sandbox> {
-    const sandbox = await this.client.create(options);
-    return this.wrap(sandbox.toJSON());
+  async create(options: CreateOptions, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).create(options);
+    const wrapped = this.wrap(sandbox.toJSON());
+    wrapped.destroyOnExit = options.destroyOnExit ?? false;
+    return wrapped;
   }
 
-  async list(options?: ListOptions): Promise<Sandbox[]> {
-    const sandboxes = await this.client.list(options);
+  async list(options?: ListOptions, call?: CallOptions): Promise<Sandbox[]> {
+    const sandboxes = await this.clientFor(call).list(options);
     return sandboxes.map((sandbox) => this.wrap(sandbox.toJSON()));
   }
 
@@ -154,14 +183,14 @@ export class MicroVM {
    * Iterates one server page at a time. Use this for large fleet inventories so
    * the SDK does not retain every sandbox in memory.
    */
-  async *listPages(options?: ListOptions): AsyncGenerator<Sandbox[]> {
-    for await (const page of this.client.listPages(options)) {
+  async *listPages(options?: ListOptions, call?: CallOptions): AsyncGenerator<Sandbox[]> {
+    for await (const page of this.clientFor(call).listPages(options)) {
       yield page.map((sandbox) => this.wrap(sandbox.toJSON()));
     }
   }
 
-  async get(id: string, options?: GetOptions): Promise<Sandbox> {
-    const sandbox = await this.client.get(id, options);
+  async get(id: string, options?: GetOptions, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).get(id, options);
     return this.wrap(sandbox.toJSON());
   }
 
@@ -170,68 +199,100 @@ export class MicroVM {
    * Names are unique per owner. Throws when the server predates name lookup
    * (it ignores `?name=`), rather than guessing from an unfiltered list.
    */
-  async getByName(name: string, options?: GetOptions): Promise<Sandbox | null> {
-    const sandbox = await this.client.getByName(name, options);
+  async getByName(name: string, options?: GetOptions, call?: CallOptions): Promise<Sandbox | null> {
+    const sandbox = await this.clientFor(call).getByName(name, options);
     return sandbox === null ? null : this.wrap(sandbox.toJSON());
   }
 
-  async start(id: string): Promise<Sandbox> {
-    const sandbox = await this.client.start(id);
+  /**
+   * Returns the caller's sandbox called `name`, creating it from `options`
+   * when there is none. `created` is true only when this call made the
+   * sandbox. Safe to retry and to run at the same time from many processes:
+   * names are unique per owner, so when two callers race to create the same
+   * name, one gets a 409 and reads the winner's sandbox instead. An existing
+   * sandbox is returned as it is; its image and settings are not compared
+   * with `options`.
+   */
+  async getOrCreate(name: string, options: CreateOptions, call?: CallOptions): Promise<GetOrCreateResult> {
+    const result = await this.clientFor(call).getOrCreate(name, options);
+    const sandbox = this.wrap(result.sandbox.toJSON());
+    // destroyOnExit applies only to a sandbox this call created. One it found
+    // may be in use by another program that shares the name.
+    sandbox.destroyOnExit = result.created ? (options.destroyOnExit ?? false) : false;
+    return { sandbox, created: result.created };
+  }
+
+  async start(id: string, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).start(id);
     return this.wrap(sandbox.toJSON());
   }
 
-  async stop(id: string): Promise<Sandbox> {
-    const sandbox = await this.client.stop(id);
+  async stop(id: string, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).stop(id);
     return this.wrap(sandbox.toJSON());
   }
 
-	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}): Promise<SandboxSnapshot> {
-		return this.client.createSnapshot(id, name, options);
+	async createSnapshot(id: string, name: string, options: CreateSnapshotOptions = {}, call?: CallOptions): Promise<SandboxSnapshot> {
+		return this.clientFor(call).createSnapshot(id, name, options);
 	}
 
-  async registerSnapshot(options: RegisterSnapshotOptions): Promise<SandboxSnapshot> {
-    return this.client.registerSnapshot(options);
+  async registerSnapshot(options: RegisterSnapshotOptions, call?: CallOptions): Promise<SandboxSnapshot> {
+    return this.clientFor(call).registerSnapshot(options);
   }
 
   async registerSnapshotFromImage(
     name: string,
     image: Image,
     options: Omit<RegisterSnapshotOptions, "name" | "image" | "dockerfileContent"> = {},
+    call?: CallOptions,
   ): Promise<SandboxSnapshot> {
-    return this.client.registerSnapshotFromImage(name, image, options);
+    return this.clientFor(call).registerSnapshotFromImage(name, image, options);
   }
 
   /** Look a snapshot up by name. In a cluster the request is routed to the node holding the image. */
-  async getSnapshot(name: string): Promise<SandboxSnapshot> {
-    return this.client.getSnapshot(name);
+  async getSnapshot(name: string, call?: CallOptions): Promise<SandboxSnapshot> {
+    return this.clientFor(call).getSnapshot(name);
   }
 
   /** List the caller's snapshots, one name-ordered page at a time. */
-  async listSnapshots(options: ListSnapshotsOptions = {}): Promise<SnapshotList> {
-    return this.client.listSnapshots(options);
+  async listSnapshots(options: ListSnapshotsOptions = {}, call?: CallOptions): Promise<SnapshotList> {
+    return this.clientFor(call).listSnapshots(options);
   }
 
   /** Delete a snapshot by name (idempotent 404 if it does not exist). */
-  async deleteSnapshot(name: string): Promise<void> {
-    return this.client.deleteSnapshot(name);
+  async deleteSnapshot(name: string, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteSnapshot(name);
   }
 
-  async destroy(id: string): Promise<void> {
-    await this.client.destroy(id);
+  async destroy(id: string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).destroy(id);
   }
 
-  async resize(id: string, options: ResizeOptions): Promise<Sandbox> {
-    const sandbox = await this.client.resize(id, options);
+  /**
+   * Deletes every sandbox of yours that carries all of `options.tags` and
+   * returns the IDs of the ones now gone. It lists every page first, then
+   * deletes them one at a time. A sandbox that is already gone (404) counts
+   * as deleted, so a second call, or two calls at once, is safe. Any other
+   * failed delete stops the call and is thrown; the sandboxes already
+   * deleted stay deleted, and calling it again finishes the job. `tags`
+   * must not be empty.
+   */
+  async destroyAll(options: DestroyAllOptions, call?: CallOptions): Promise<string[]> {
+    return this.clientFor(call).destroyAll(options.tags);
+  }
+
+  async resize(id: string, options: ResizeOptions, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).resize(id, options);
     return this.wrap(sandbox.toJSON());
   }
 
-  async updateLifecycle(id: string, lifecycle: Lifecycle): Promise<Sandbox> {
-    const sandbox = await this.client.updateLifecycle(id, lifecycle);
+  async updateLifecycle(id: string, lifecycle: Lifecycle, call?: CallOptions): Promise<Sandbox> {
+    const sandbox = await this.clientFor(call).updateLifecycle(id, lifecycle);
     return this.wrap(sandbox.toJSON());
   }
 
-  async reconcile(): Promise<void> {
-    await this.client.reconcile();
+  async reconcile(call?: CallOptions): Promise<void> {
+    await this.clientFor(call).reconcile();
   }
 
   /**
@@ -240,12 +301,12 @@ export class MicroVM {
    * persisted by the daemon. Returns the local content-addressed tag and,
    * when push was requested, the pushed reference.
    */
-  async buildImage(image: Image, options?: BuildImageOptions): Promise<BuildImageResult> {
-    return this.client.buildImage(image, options);
+  async buildImage(image: Image, options?: BuildImageOptions, call?: CallOptions): Promise<BuildImageResult> {
+    return this.clientFor(call).buildImage(image, options);
   }
 
-  async health(): Promise<HealthStatus> {
-    return this.client.health();
+  async health(call?: CallOptions): Promise<HealthStatus> {
+    return this.clientFor(call).health();
   }
 
   /**
@@ -253,8 +314,8 @@ export class MicroVM {
    * destination, using the same matcher the filter enforces. No sandbox is
    * needed.
    */
-  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
-    return this.client.checkNetworkPolicy(options);
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions, call?: CallOptions): Promise<NetworkPolicyCheckResult> {
+    return this.clientFor(call).checkNetworkPolicy(options);
   }
 
   /**
@@ -262,25 +323,99 @@ export class MicroVM {
    * twice is a no-op). Sandboxes reference it through `egressProfiles`, and a
    * change reaches every one of them.
    */
-  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
-    return this.client.putEgressProfile(name, options);
+  async putEgressProfile(name: string, options: EgressProfileOptions, call?: CallOptions): Promise<EgressProfile> {
+    return this.clientFor(call).putEgressProfile(name, options);
   }
 
-  async getEgressProfile(name: string): Promise<EgressProfile> {
-    return this.client.getEgressProfile(name);
+  async getEgressProfile(name: string, call?: CallOptions): Promise<EgressProfile> {
+    return this.clientFor(call).getEgressProfile(name);
   }
 
-  async listEgressProfiles(options?: ListEgressProfilesOptions): Promise<EgressProfileList> {
-    return this.client.listEgressProfiles(options);
+  async listEgressProfiles(options?: ListEgressProfilesOptions, call?: CallOptions): Promise<EgressProfileList> {
+    return this.clientFor(call).listEgressProfiles(options);
   }
 
   /** Deletes a profile; one that sandboxes still reference is refused (409). */
-  async deleteEgressProfile(name: string): Promise<void> {
-    return this.client.deleteEgressProfile(name);
+  async deleteEgressProfile(name: string, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteEgressProfile(name);
   }
 
-  async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {
-    return this.client.mounts(sandboxID);
+  /**
+   * Sets how many ready sandboxes every server with a warm pool keeps for an
+   * image (a full replace: the same call twice is a no-op). A create that names
+   * the image then starts from a warm sandbox. Admin only.
+   */
+  async putWarmPool(image: string, options: WarmPoolOptions, call?: CallOptions): Promise<WarmPool> {
+    return this.clientFor(call).putWarmPool(image, options);
+  }
+
+  /** Returns an image's warm-pool entry with its status (ready and target, per server). */
+  async getWarmPool(image: string, call?: CallOptions): Promise<WarmPool> {
+    return this.clientFor(call).getWarmPool(image);
+  }
+
+  /** Returns every warm-pool entry, by image, with its status. */
+  async listWarmPools(call?: CallOptions): Promise<WarmPool[]> {
+    return this.clientFor(call).listWarmPools();
+  }
+
+  /** Deletes an image's warm-pool entry; its warm sandboxes are removed. Deleting a missing entry succeeds. */
+  async deleteWarmPool(image: string, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteWarmPool(image);
+  }
+
+  /**
+   * Puts a role tag on a team's cloud identity allow list, or changes its
+   * minimum caller role (`"runner"` or `"admin"`). Admin only. The same call
+   * twice changes nothing, so it is safe to retry.
+   */
+  async putIdentityRole(tag: string, options: IdentityRoleOptions, call?: CallOptions): Promise<IdentityRole> {
+    return this.clientFor(call).putIdentityRole(tag, options);
+  }
+
+  /** Lists a team's cloud identity allow list, one page at a time. Admin only. */
+  async listIdentityRoles(options?: ListIdentityRolesOptions, call?: CallOptions): Promise<IdentityRoleList> {
+    return this.clientFor(call).listIdentityRoles(options);
+  }
+
+  /**
+   * Takes a role tag off a team's allow list. Admin only. Sandboxes that use
+   * it keep their current token (at most one hour) and get no new one.
+   * Deleting a tag that is already gone succeeds.
+   */
+  async deleteIdentityRole(tag: string, options?: { team?: string }, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteIdentityRole(tag, options);
+  }
+
+  /**
+   * Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+   * may hold. Admin only. The same limits twice change nothing. A create,
+   * resize or start past the quota fails with 429 `team_quota_exceeded`.
+   */
+  async putTeamQuota(team: string, options: TeamQuotaOptions, call?: CallOptions): Promise<TeamQuota> {
+    return this.clientFor(call).putTeamQuota(team, options);
+  }
+
+  /** Reads a team's quota and what the team holds now. 404 if it has none. */
+  async getTeamQuota(team: string, call?: CallOptions): Promise<TeamQuota> {
+    return this.clientFor(call).getTeamQuota(team);
+  }
+
+  /** Removes a team's quota. Removing one that is already gone succeeds. */
+  async deleteTeamQuota(team: string, call?: CallOptions): Promise<void> {
+    return this.clientFor(call).deleteTeamQuota(team);
+  }
+
+  async mounts(sandboxID: string, call?: CallOptions): Promise<MountSpecRedacted[]> {
+    return this.clientFor(call).mounts(sandboxID);
+  }
+
+  /**
+   * Make every token issued for a sandbox so far stop working (see
+   * `sandbox.revokeTokens()`). A token made after the call works.
+   */
+  async revokeSandboxTokens(sandboxID: string, call?: CallOptions): Promise<RevokeSandboxTokensResult> {
+    return this.clientFor(call).revokeSandboxTokens(sandboxID);
   }
 
   /**
@@ -289,44 +424,56 @@ export class MicroVM {
    * Read-only — the SDK cannot reseed a process inside the guest; see the
    * "Randomness in cloned sandboxes" docs page for the in-guest reseed pattern.
    */
-  async cloneGeneration(sandboxID: string): Promise<CloneGeneration> {
-    return this.client.cloneGeneration(sandboxID);
+  async cloneGeneration(sandboxID: string, call?: CallOptions): Promise<CloneGeneration> {
+    return this.clientFor(call).cloneGeneration(sandboxID);
   }
 
   execStream(sandboxID: string, options: ExecStreamOptions): ExecStreamHandle {
     return this.client.execStream(sandboxID, options);
   }
 
-  async createSession(sandboxID: string, options: CreateSessionOptions): Promise<Session> {
-    return this.client.createSession(sandboxID, options);
+  /**
+   * Watch a folder in a sandbox for changes: `onEvent` gets each create,
+   * write, remove, rename and chmod, in batches every 250 ms. Resolves once
+   * the watch is in place. gVisor and Firecracker sandboxes only; Docker,
+   * containerd, WASM and isolate sandboxes reject with a 501
+   * `MicroVMApiError`. A sandbox whose agent predates file watching rejects
+   * with `MicroVMUnsupportedFeatureError`.
+   */
+  async watchFiles(sandboxID: string, path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
+    return this.client.watchFiles(sandboxID, path, onEvent, options);
   }
 
-  async listSessions(sandboxID: string): Promise<Session[]> {
-    return this.client.listSessions(sandboxID);
+  async createSession(sandboxID: string, options: CreateSessionOptions, call?: CallOptions): Promise<Session> {
+    return this.clientFor(call).createSession(sandboxID, options);
   }
 
-  async getSession(sandboxID: string, sessionID: string): Promise<Session> {
-    return this.client.getSession(sandboxID, sessionID);
+  async listSessions(sandboxID: string, call?: CallOptions): Promise<Session[]> {
+    return this.clientFor(call).listSessions(sandboxID);
   }
 
-  async deleteSession(sandboxID: string, sessionID: string): Promise<void> {
-    await this.client.deleteSession(sandboxID, sessionID);
+  async getSession(sandboxID: string, sessionID: string, call?: CallOptions): Promise<Session> {
+    return this.clientFor(call).getSession(sandboxID, sessionID);
   }
 
-  async signalSession(sandboxID: string, sessionID: string, signal: string): Promise<void> {
-    await this.client.signalSession(sandboxID, sessionID, signal);
+  async deleteSession(sandboxID: string, sessionID: string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).deleteSession(sandboxID, sessionID);
   }
 
-  async resizeSession(sandboxID: string, sessionID: string, cols: number, rows: number): Promise<void> {
-    await this.client.resizeSession(sandboxID, sessionID, cols, rows);
+  async signalSession(sandboxID: string, sessionID: string, signal: string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).signalSession(sandboxID, sessionID, signal);
   }
 
-  async sessionLog(sandboxID: string, sessionID: string): Promise<Uint8Array> {
-    return this.client.sessionLog(sandboxID, sessionID);
+  async resizeSession(sandboxID: string, sessionID: string, cols: number, rows: number, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).resizeSession(sandboxID, sessionID, cols, rows);
   }
 
-  async sessionRecording(sandboxID: string, sessionID: string): Promise<Uint8Array> {
-    return this.client.sessionRecording(sandboxID, sessionID);
+  async sessionLog(sandboxID: string, sessionID: string, call?: CallOptions): Promise<Uint8Array> {
+    return this.clientFor(call).sessionLog(sandboxID, sessionID);
+  }
+
+  async sessionRecording(sandboxID: string, sessionID: string, call?: CallOptions): Promise<Uint8Array> {
+    return this.clientFor(call).sessionRecording(sandboxID, sessionID);
   }
 
   attachSession(sandboxID: string, sessionID: string, options: SessionAttachOptions = {}): SessionAttachHandle {
@@ -343,20 +490,20 @@ export class MicroVM {
    * duplicate ID returns 409 so a retried CI step does not create two
    * rows for the same logical template.
    */
-  async createTemplate(options: CreateTemplateOptions): Promise<Template> {
-    return this.client.createTemplate(options);
+  async createTemplate(options: CreateTemplateOptions, call?: CallOptions): Promise<Template> {
+    return this.clientFor(call).createTemplate(options);
   }
 
-  async listTemplates(): Promise<Template[]> {
-    return this.client.listTemplates();
+  async listTemplates(call?: CallOptions): Promise<Template[]> {
+    return this.clientFor(call).listTemplates();
   }
 
-  async getTemplate(id: string): Promise<Template> {
-    return this.client.getTemplate(id);
+  async getTemplate(id: string, call?: CallOptions): Promise<Template> {
+    return this.clientFor(call).getTemplate(id);
   }
 
-  async deleteTemplate(id: string): Promise<void> {
-    await this.client.deleteTemplate(id);
+  async deleteTemplate(id: string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).deleteTemplate(id);
   }
 
   /**
@@ -364,20 +511,20 @@ export class MicroVM {
    * the returned row is typically already `ready`. Use the row's `id` or
    * `moduleRef` on subsequent `create` calls with `runtime: "wasm"`.
    */
-  async createWasmModule(options: CreateWasmModuleOptions): Promise<WasmModule> {
-    return this.client.createWasmModule(options);
+  async createWasmModule(options: CreateWasmModuleOptions, call?: CallOptions): Promise<WasmModule> {
+    return this.clientFor(call).createWasmModule(options);
   }
 
-  async listWasmModules(): Promise<WasmModule[]> {
-    return this.client.listWasmModules();
+  async listWasmModules(call?: CallOptions): Promise<WasmModule[]> {
+    return this.clientFor(call).listWasmModules();
   }
 
-  async getWasmModule(id: string): Promise<WasmModule> {
-    return this.client.getWasmModule(id);
+  async getWasmModule(id: string, call?: CallOptions): Promise<WasmModule> {
+    return this.clientFor(call).getWasmModule(id);
   }
 
-  async deleteWasmModule(id: string): Promise<void> {
-    await this.client.deleteWasmModule(id);
+  async deleteWasmModule(id: string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).deleteWasmModule(id);
   }
 
   /**
@@ -385,8 +532,8 @@ export class MicroVM {
    * credentials and get back the `oci://` ref to use as `moduleRef` on create.
    * The daemon validates and forwards the bytes; it never stores them.
    */
-  async pushWasmModule(options: PushWasmModuleOptions): Promise<PushWasmModuleResult> {
-    return this.client.pushWasmModule(options);
+  async pushWasmModule(options: PushWasmModuleOptions, call?: CallOptions): Promise<PushWasmModuleResult> {
+    return this.clientFor(call).pushWasmModule(options);
   }
 
   /**
@@ -400,8 +547,8 @@ export class MicroVM {
    * where rebuild is not safe (build in flight) or not supported
    * (`ready_no_snapshot` / `failed` — those need delete+recreate today).
    */
-  async rebuildTemplate(id: string): Promise<Template> {
-    return this.client.rebuildTemplate(id);
+  async rebuildTemplate(id: string, call?: CallOptions): Promise<Template> {
+    return this.clientFor(call).rebuildTemplate(id);
   }
 
   /**
@@ -411,10 +558,10 @@ export class MicroVM {
    * pattern. A fresh object is returned per access so the closures always
    * see the current client even if MicroVM is later extended.
    */
-  get dns(): { target(): Promise<IngressTarget> } {
+  get dns(): { target(call?: CallOptions): Promise<IngressTarget> } {
     const client = this.client;
     return {
-      target: () => client.ingressDNS(),
+      target: (call?: CallOptions) => client.withSignal(call?.signal).ingressDNS(),
     };
   }
 
@@ -422,8 +569,8 @@ export class MicroVM {
    * Who the server says the caller is: principal, role, team and when the
    * credential expires. Every valid credential may ask.
    */
-  async whoami(): Promise<WhoAmI> {
-    return this.client.whoami();
+  async whoami(call?: CallOptions): Promise<WhoAmI> {
+    return this.clientFor(call).whoami();
   }
 
   /**
@@ -434,10 +581,15 @@ export class MicroVM {
   get tokens(): Tokens {
     const client = this.client;
     return {
-      create: (options) => client.createAPIToken(options),
-      list: () => client.listAPITokens(),
-      revoke: (id) => client.revokeAPIToken(id),
+      create: (options, call) => client.withSignal(call?.signal).createAPIToken(options),
+      list: (call) => client.withSignal(call?.signal).listAPITokens(),
+      revoke: (id, call) => client.withSignal(call?.signal).revokeAPIToken(id),
     };
+  }
+
+  /** The client for one call: the real one, or a view carrying the call's signal. */
+  private clientFor(call?: CallOptions): APIClient {
+    return this.client.withSignal(call?.signal);
   }
 
   private wrap(sandbox: SandboxData): Sandbox {

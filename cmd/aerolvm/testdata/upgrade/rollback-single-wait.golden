@@ -1,0 +1,10 @@
+exit 0
+--- stdout
+node now runs v0.6.12 (upgrade op-2)
+--- stderr
+aerolvm: rollback op-2 started: v0.6.13 -> v0.6.12
+aerolvm: op-2: staging
+aerolvm: op-2: swapping
+aerolvm: sandboxd is restarting; waiting for it
+aerolvm: op-2: starting
+aerolvm: op-2: done

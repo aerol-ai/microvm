@@ -1,0 +1,9 @@
+exit 0
+--- stdout
+{
+  "alive": true,
+  "api_url": "https://old-1:21212",
+  "capacity": {},
+  "node_id": "old-1"
+}
+--- stderr

@@ -1,0 +1,33 @@
+[project]
+name = "aerolvm-deepagents"
+version = "0.1.0"
+description = "Run LangChain DeepAgents tools in AerolVM sandboxes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Aerol AI" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  # The range the tests run against. BaseSandbox's protocol still moves
+  # between minor releases, so widen it only after the tests pass.
+  "deepagents>=0.7.34,<0.8",
+  # Uses list_files and delete_file and the exec output caps, added after
+  # aerolvm-sdk 0.8.1. Raise this floor to the first release that has them
+  # before publishing this package.
+  "aerolvm-sdk>=0.8.1",
+]
+
+[project.urls]
+Documentation = "https://microvm.aerol.ai/integrations/deepagents/"
+
+# Only the package goes in the wheel; tests stay out so they never shadow a
+# user's own "tests" package.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"

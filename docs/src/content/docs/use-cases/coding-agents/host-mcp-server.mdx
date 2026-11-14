@@ -1,0 +1,401 @@
+---
+title: Host an MCP server
+description: Run an MCP server inside a sandbox and let AI agents reach it over HTTPS, behind a key or a sandbox token.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+MCP, the [Model Context Protocol](https://modelcontextprotocol.io), is how AI agents find and call tools. An MCP server is a small program that offers those tools: read files, query a database, search the web.
+
+Many MCP servers are written to run on your own computer. In this recipe you run one inside a sandbox instead. The server's work stays in the sandbox, away from your machine, and any agent can reach it over HTTPS.
+
+## How it works
+
+| Part | What it does |
+|---|---|
+| An MCP server | Offers the tools. This recipe uses the official filesystem server, which reads and writes files in `/workspace`. |
+| supergateway | Most MCP servers talk over their standard input and output. supergateway turns that into MCP over HTTP on port 8000, at `/mcp`. It also checks a key on every request. |
+| A session | Keeps the server running after your code moves on. See [Terminal sessions](/sessions/). |
+| `exposePort` | Gives port 8000 an HTTPS address agents can reach. See [Public URLs](/public-urls/). |
+
+## What you need
+
+- **An AerolVM server with a domain**, so the port gets an HTTPS address. See [Single node setup](/getting-started/single-node-setup/).
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, and an SDK for your language. See [SDK setup](/sdk-setup/).
+- **A key for the MCP server**, in `MCP_API_KEY`. Pick a long random string. Agents send it with every request.
+
+## Step 1: Create the sandbox
+
+The sandbox starts from a Node.js image, because supergateway and the filesystem server are Node.js programs. The key goes in as an environment variable, so it never appears in a command. The lifecycle rule deletes the sandbox after one idle hour, in case you forget it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    const sandbox = await client.create({
+      image: "node:22-bookworm",
+      env: { MCP_API_KEY: process.env.MCP_API_KEY! },
+      lifecycle: { destroyIfIdleFor: HOUR },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
+
+    sandbox = client.create(
+        image="node:22-bookworm",
+        env={"MCP_API_KEY": os.environ["MCP_API_KEY"]},
+        lifecycle={"destroyIfIdleFor": HOUR},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "node:22-bookworm",
+        Env:       map[string]string{"MCP_API_KEY": os.Getenv("MCP_API_KEY")},
+        Lifecycle: &sdktypes.Lifecycle{DestroyIfIdleFor: time.Hour},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+    use std::collections::HashMap;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "node:22-bookworm".into(),
+        env: Some(HashMap::from([(
+            "MCP_API_KEY".to_string(),
+            std::env::var("MCP_API_KEY").unwrap(),
+        )])),
+        lifecycle: Some(Lifecycle {
+            destroy_if_idle_for: hour,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = Duration.ofHours(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("node:22-bookworm")
+        .setEnv(Map.of("MCP_API_KEY", System.getenv("MCP_API_KEY")))
+        .setLifecycle(new Lifecycle().setDestroyIfIdleFor(hour)));
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 2: Install the server
+
+This installs supergateway and the filesystem server, at fixed versions, and makes the folder the server shares. It downloads from npm, so it can take a minute.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const install = await sandbox.exec({
+      command:
+        "npm install -g supergateway@4.2.1 @modelcontextprotocol/server-filesystem@2.2.0" +
+        " && mkdir -p /workspace",
+      timeoutSeconds: 300,
+    });
+    console.log(install.exitCode);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    install = sandbox.exec({
+        "command": (
+            "npm install -g supergateway@4.2.1 @modelcontextprotocol/server-filesystem@2.2.0"
+            " && mkdir -p /workspace"
+        ),
+        "timeoutSeconds": 300,
+    })
+    print(install["exitCode"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    install, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command: "npm install -g supergateway@4.2.1 @modelcontextprotocol/server-filesystem@2.2.0" +
+            " && mkdir -p /workspace",
+        TimeoutSeconds: 300,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(install.ExitCode)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let install = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "npm install -g supergateway@4.2.1 @modelcontextprotocol/server-filesystem@2.2.0 \
+                  && mkdir -p /workspace"
+            .to_string(),
+        timeout_seconds: Some(300),
+        ..Default::default()
+    })?;
+    println!("{}", install.exit_code);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult install = sandbox.exec(new ExecRequest()
+        .setCommand("npm install -g supergateway@4.2.1 @modelcontextprotocol/server-filesystem@2.2.0"
+            + " && mkdir -p /workspace")
+        .setTimeoutSeconds(300));
+    System.out.println(install.exitCode);
+    ```
+  </TabItem>
+</Tabs>
+
+An exit code of `0` means both programs are installed.
+
+## Step 3: Start the server in a session
+
+A session keeps the server running after your code moves on or your connection drops. supergateway starts the filesystem server, listens on port 8000, and refuses any request without the key.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const session = await sandbox.createSession({
+      name: "mcp",
+      command:
+        'supergateway --stdio "mcp-server-filesystem /workspace"' +
+        ' --outputTransport streamableHttp --port 8000 --apiKey "$MCP_API_KEY"',
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    session = sandbox.create_session({
+        "name": "mcp",
+        "command": (
+            'supergateway --stdio "mcp-server-filesystem /workspace"'
+            ' --outputTransport streamableHttp --port 8000 --apiKey "$MCP_API_KEY"'
+        ),
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
+        Name: "mcp",
+        Command: `supergateway --stdio "mcp-server-filesystem /workspace"` +
+            ` --outputTransport streamableHttp --port 8000 --apiKey "$MCP_API_KEY"`,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::CreateSessionOptions;
+
+    let session = sandbox.create_session(CreateSessionOptions {
+        name: Some("mcp".into()),
+        command: Some(
+            r#"supergateway --stdio "mcp-server-filesystem /workspace" --outputTransport streamableHttp --port 8000 --apiKey "$MCP_API_KEY""#
+                .into(),
+        ),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session session = sandbox.createSession(new CreateSessionOptions()
+        .setName("mcp")
+        .setCommand("supergateway --stdio \"mcp-server-filesystem /workspace\""
+            + " --outputTransport streamableHttp --port 8000 --apiKey \"$MCP_API_KEY\""));
+    ```
+  </TabItem>
+</Tabs>
+
+To check that it started, read the session's output. After a few seconds it shows `Listening on port 8000`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const log = await sandbox.sessionLog(session.id);
+    console.log(new TextDecoder().decode(log));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    print(sandbox.session_log(session["id"]).decode())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    out, err := sandbox.SessionLog(ctx, session.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(string(out))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let log = sandbox.session_log(&session.id)?;
+    println!("{}", String::from_utf8_lossy(&log));
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    byte[] log = sandbox.sessionLog(session.id);
+    System.out.println(new String(log, StandardCharsets.UTF_8));
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 4: Share port 8000
+
+Give the port an address. The MCP address is that address with `/mcp` on the end.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(8000);
+    console.log(`${exposure.url}/mcp`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(8000)
+    print(f"{exposure.url}/mcp")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 8000)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(exposure.PublicURL + "/mcp")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{ExposeOptions, ExposeResult};
+
+    if let ExposeResult::Http { url } = sandbox.expose_port(8000, ExposeOptions::default())? {
+        println!("{}/mcp", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(8000);
+    System.out.println(exposure.url + "/mcp");
+    ```
+  </TabItem>
+</Tabs>
+
+The address looks like `https://<sandbox-id>-8000.<your-domain>/mcp`.
+
+## Step 5: Connect your agent
+
+Give your agent the MCP address and the key. The key goes in an `Authorization` header as `Bearer <key>`. For example, with Claude Code:
+
+```bash
+claude mcp add --transport http sandbox-files \
+  "https://<sandbox-id>-8000.<your-domain>/mcp" \
+  --header "Authorization: Bearer $MCP_API_KEY"
+```
+
+Other MCP tools take the same two things, the address and the header, in their settings file. A request without the key gets `401`.
+
+## Keep it to one person (optional)
+
+The key is shared by everyone who has it. For a second lock that is tied to this one sandbox and port, and that runs out on its own, expose the port with `visibility: "token"` and make a [sandbox token](/sandbox-tokens/) for it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.exposePort(8000, { visibility: "token" });
+    const tok = await sandbox.createToken({ port: 8000, expiresIn: "8h" });
+    console.log(`Cookie: __Host-aerolvm-token=${tok.token}`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.expose_port(8000, visibility="token")
+    tok = sandbox.create_token(port=8000, expires_in="8h")
+    print(f"Cookie: __Host-aerolvm-token={tok['token']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := sandbox.ExposePort(ctx, 8000, microvm.WithVisibility(sdktypes.ExposeVisibilityToken)); err != nil {
+        log.Fatal(err)
+    }
+    tok, err := sandbox.CreateToken(ctx, sdktypes.CreateSandboxTokenOptions{Port: 8000, ExpiresIn: "8h"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("Cookie: __Host-aerolvm-token=" + tok.Token)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateSandboxTokenOptions, ExposeOptions};
+
+    sandbox.expose_port(8000, ExposeOptions::token())?;
+    let tok = sandbox.create_token(CreateSandboxTokenOptions {
+        port: Some(8000),
+        expires_in: "8h".into(),
+        ..Default::default()
+    })?;
+    println!("Cookie: __Host-aerolvm-token={}", tok.token);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.exposePort(8000, ExposeOptions.token());
+    SandboxToken tok = sandbox.createToken(
+        new CreateSandboxTokenOptions().setPort(8000).setExpiresIn("8h"));
+    System.out.println("Cookie: __Host-aerolvm-token=" + tok.token);
+    ```
+  </TabItem>
+</Tabs>
+
+Add the printed line to your agent's settings as a second header, next to `Authorization`. Now a request needs both: the AerolVM server checks the token before the request reaches the sandbox, and supergateway checks the key. Without the token the answer is `401` and the request never reaches your server.
+
+The token stops working when it expires, so keep it short. To stop it sooner, [revoke the sandbox's tokens](/sandbox-tokens/#revoke-tokens). To open the port to everyone with the key again, expose it with `visibility: "public"`. See [Share a port behind a token](/public-urls/#share-a-port-behind-a-token) for the rules.
+
+## Clean up
+
+Delete the sandbox with `sandbox.destroy()` when you are done. The lifecycle rule from step 1 deletes it after an idle hour anyway.
+
+## From the E2B SDK
+
+The E2B SDK has its own `mcp` option, which starts E2B's MCP gateway program. AerolVM accepts the option, but does not ship that program. [Use the E2B SDK](/using-e2b-sdk/#mcp-servers) says what works. Running your own server as on this page works with any MCP server.
+
+## Good to know
+
+- **Use another server.** Change the `--stdio` command in step 3 to any MCP server that talks over standard input and output, and install it in step 2. A Python server needs an image with Python, such as `python:3.12`, plus Node.js for supergateway.
+- **The server can do whatever its tools allow.** The filesystem server can read and change everything in `/workspace`, and nothing outside it. Anyone with the key can use its tools, so treat the key like a password.
+- **Every request starts the server afresh.** supergateway runs in stateless mode here, which suits most tools. For a server that must remember things between calls, add `--stateful`.
+- **The sandbox can reach the internet.** To limit what the server can reach, see [Allow only some websites](/network-access/#allow-only-some-websites).
+
+## Next steps
+
+- [Terminal sessions](/sessions/): read the server's output, or stop and restart it.
+- [Public URLs](/public-urls/): how port addresses work.
+- [Sandbox tokens](/sandbox-tokens/): what a token can and cannot open.
+- [MCP server](/mcp/): give an AI tool its own sandboxes through AerolVM's own MCP server.

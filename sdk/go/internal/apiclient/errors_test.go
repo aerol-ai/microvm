@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -62,6 +63,45 @@ func TestDecodeErrorReturnsAPIError(t *testing.T) {
 			}
 			if errors.Is(err, ErrNameLookupUnsupported) {
 				t.Fatal("an HTTP error must not match ErrNameLookupUnsupported")
+			}
+		})
+	}
+}
+
+// TestAPIErrorMatchesStatusSentinels: each common status matches exactly one
+// sentinel with errors.Is; other statuses match none, and errors.As still
+// reads the *APIError behind any of them.
+func TestAPIErrorMatchesStatusSentinels(t *testing.T) {
+	sentinels := []error{ErrNotFound, ErrConflict, ErrCapacity, ErrTimeout, ErrAuth}
+	tests := []struct {
+		status int
+		want   error
+	}{
+		{http.StatusUnauthorized, ErrAuth},
+		{http.StatusForbidden, ErrAuth},
+		{http.StatusNotFound, ErrNotFound},
+		{http.StatusRequestTimeout, ErrTimeout},
+		{http.StatusConflict, ErrConflict},
+		{http.StatusServiceUnavailable, ErrCapacity},
+		{http.StatusGatewayTimeout, ErrTimeout},
+		{http.StatusBadRequest, nil},
+		{http.StatusPreconditionFailed, nil},
+		{http.StatusUnprocessableEntity, nil},
+		{http.StatusTooManyRequests, nil},
+		{http.StatusInternalServerError, nil},
+		{http.StatusBadGateway, nil},
+	}
+	for _, tt := range tests {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			err := fmt.Errorf("call: %w", &APIError{StatusCode: tt.status, Message: "m"})
+			for _, sentinel := range sentinels {
+				if got := errors.Is(err, sentinel); got != (sentinel == tt.want) {
+					t.Fatalf("errors.Is(%d, %v) = %v", tt.status, sentinel, got)
+				}
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.StatusCode != tt.status {
+				t.Fatalf("errors.As lost the *APIError: %v", err)
 			}
 		})
 	}

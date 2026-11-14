@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,13 @@ func TestAgentDelegatesVolumeReadWriteToServerControlPlane(t *testing.T) {
 	count, err := agent.VolumeAttachmentCount(ctx, "t-a", "vol-agent")
 	if err != nil || count != 1 {
 		t.Fatalf("agent VolumeAttachmentCount = %d, %v", count, err)
+	}
+	held, err := agent.VolumeAttachmentsForSandbox(ctx, "sb-1")
+	if err != nil || len(held) != 1 || held[0].VolumeID != "vol-agent" {
+		t.Fatalf("agent VolumeAttachmentsForSandbox = %+v, %v", held, err)
+	}
+	if none, err := agent.VolumeAttachmentsForSandbox(ctx, "sb-none"); err != nil || none == nil || len(none) != 0 {
+		t.Fatalf("agent VolumeAttachmentsForSandbox unknown = %#v, %v", none, err)
 	}
 	if err := agent.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("agent DeleteVolumeAttachmentsForSandbox: %v", err)
@@ -157,6 +165,17 @@ func startAgentControlPlaneServerWithVolumes(t *testing.T, c *Cluster, ln net.Li
 				return
 			}
 			_ = json.NewEncoder(w).Encode(VolumeQueryResponse{Count: count})
+		case "sandbox":
+			attachments, err := c.VolumeAttachmentsForSandbox(r.Context(), q.Get("sandbox_id"))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(VolumeQueryResponse{Attachments: attachments})
+		case "reclaims":
+			limit, _ := strconv.Atoi(q.Get("limit"))
+			reclaims, _ := c.VolumeReclaimsFor(r.Context(), q.Get("node_id"), limit)
+			_ = json.NewEncoder(w).Encode(VolumeQueryResponse{Reclaims: reclaims})
 		default:
 			http.Error(w, "unknown volume query kind", http.StatusBadRequest)
 		}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 // PathPrefix is the URL prefix Caddy rewrites wake-aware HTTP port
@@ -40,10 +41,20 @@ const PathPrefix = "/__ingress/http"
 // at MaxBufferBytes and add avoidable memory pressure under load.
 // Returns store.ErrNotFound when no sandbox row matches id so the handler
 // can surface 404 without a second store hit.
+//
+// PortAccess is that preflight plus the port's token gate (A2), answered
+// from the same warm-cache entry or row read, so the gate costs no extra
+// query.
 type PortResolver interface {
 	WakeAwarePortTarget(ctx context.Context, id string, port int) (service.PortEndpoint, error)
 	TouchSandbox(ctx context.Context, id string) error
-	IsSandboxStarted(ctx context.Context, id string) (bool, error)
+	PortAccess(ctx context.Context, id string, port int) (service.PortAccess, error)
+}
+
+// TokenVerifier checks a sandbox token with no store read (A1). The
+// service is one; nil refuses every token, so a gated port stays shut.
+type TokenVerifier interface {
+	VerifySandboxToken(raw string) (sandboxtoken.Claims, error)
 }
 
 // activityTickInterval is how often a long-lived in-flight request
@@ -89,6 +100,8 @@ type Deps struct {
 	// Hosts mounts the host router at "/" when set
 	// (SB_INGRESS_PROXY_ROUTING); nil keeps only the wake path route.
 	Hosts *HostRoutes
+	// Tokens checks the sandbox tokens of token-gated ports (A2).
+	Tokens TokenVerifier
 }
 
 // RegisterRoutes mounts the ingress proxy routes onto mux. The mux is

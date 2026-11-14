@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // The pause-netns pool pre-pays dockerd's per-container network setup
@@ -68,6 +70,10 @@ type NetnsPool struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
+	// idle wakes the refill when the node's last running create ends, so
+	// the pool fills in the gaps between creates (refill) rather than at
+	// the next tick.
+	idle chan struct{}
 }
 
 func newNetnsPool(logger *slog.Logger, client *Client, depth int, pauseImage string, interval time.Duration) *NetnsPool {
@@ -85,6 +91,16 @@ func newNetnsPool(logger *slog.Logger, client *Client, depth int, pauseImage str
 		interval:   interval,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
+		idle:       make(chan struct{}, 1),
+	}
+}
+
+// wakeIdle tells the refill loop the node has no create running. It never
+// blocks: one pending wake is enough.
+func (p *NetnsPool) wakeIdle() {
+	select {
+	case p.idle <- struct{}{}:
+	default:
 	}
 }
 
@@ -128,6 +144,7 @@ func (p *NetnsPool) run(ctx context.Context) {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
+		case <-p.idle:
 		}
 	}
 }
@@ -188,6 +205,14 @@ func (p *NetnsPool) refill(ctx context.Context) {
 		case <-p.stopCh:
 			return
 		default:
+		}
+		// A pause's start competes with the creates for dockerd and the
+		// disk, the cost netnsPoolBusy keeps off busy creates, so the pool
+		// refills between creates: the last create to end wakes it
+		// (endColdCreate). A node that stays busy runs Docker's own path
+		// until it is idle again.
+		if p.client.coldCreates.Load() > 0 {
+			return
 		}
 		slot, err := p.spawnPause(ctx)
 		if err != nil {
@@ -286,6 +311,34 @@ func (c *Client) bootNetnsPause(ctx context.Context, id string) (netnsSlot, erro
 		return netnsSlot{}, err
 	}
 	return netnsSlot{containerID: id, ip: ip}, nil
+}
+
+// netnsPoolBusy reports whether a create leaves the pool's slots alone and
+// takes Docker's own path: another create is running on this node, and this
+// one has no network rules (a restricted create needs a pause either way,
+// and a slot is the cheaper one).
+//
+// A slot spares a lone create Docker's network setup (~20 ms on an idle
+// node), but it is a second container per sandbox: created and started by
+// the refill, renamed by the create, removed by the destroy. Each of those
+// costs dockerd fsyncs of the container's config, containerd metadata
+// commits and an overlay unmount, all on the root disk, and that disk is
+// what saturates when creates overlap. Live on Docker 29 and gp3 (3000
+// IOPS), 8 concurrent creates over two nodes ran at 6.6 creates/s with the
+// pool and 9.9 without it (p50 598 vs 423 ms), while one create at a time
+// was 22 ms faster with it. Skipping the pool only when creates overlap
+// keeps that win without the loss, and since the refill replaces only what
+// creates take, a busy node also stops starting pause containers.
+func (c *Client) netnsPoolBusy(req models.CreateSandboxRequest, effectiveRuntime string) bool {
+	return c.coldCreates.Load() > 1 && !c.needsOwnPause(req, effectiveRuntime)
+}
+
+// endColdCreate gives back a create's count and, when it was the node's
+// last running create, wakes the netns pool's refill.
+func (c *Client) endColdCreate() {
+	if c.coldCreates.Add(-1) == 0 && c.netnsPool != nil {
+		c.netnsPool.wakeIdle()
+	}
 }
 
 // Adopt pops a warm slot and renames it to the sandbox's adopted name.

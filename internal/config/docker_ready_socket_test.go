@@ -2,6 +2,8 @@ package config
 
 import (
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func TestDockerReadySocketEffectiveGating(t *testing.T) {
@@ -66,6 +68,25 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 		}
 	})
 
+	// Plan PR #1000 item L2: the containerd pool alone must turn on the
+	// containerd driver's ready socket, and must not change the docker gate.
+	t.Run("containerd_pool_single_node_turns_on_containerd_ready_socket", func(t *testing.T) {
+		t.Setenv("SB_ENABLE_CLUSTER", "false")
+		t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+		t.Setenv("SB_CONTAINERD_POOL_ENABLED", "true")
+		t.Setenv("SB_DOCKER_POOL_ENABLED", "false")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.ContainerdReadySocketEffective() {
+			t.Fatal("containerd pool on, but the containerd ready socket is off")
+		}
+		if cfg.DockerReadySocketEffective() {
+			t.Fatal("docker ready-socket gate must not change for the containerd pool")
+		}
+	})
+
 	t.Run("containerd_pool_requires_engine", func(t *testing.T) {
 		t.Setenv("SB_ENABLE_CLUSTER", "false")
 		t.Setenv("SB_CONTAINER_ENGINE", "docker")
@@ -111,6 +132,34 @@ func TestDockerReadySocketEffectiveGating(t *testing.T) {
 			t.Fatal("expected kill switch to disable push")
 		}
 	})
+}
+
+func TestContainerdReadySocketEffective(t *testing.T) {
+	ctd := models.ContainerEngineContainerd
+	cases := []struct {
+		name       string
+		cfg        Config
+		wantCtd    bool
+		wantDocker bool
+	}{
+		{"all off", Config{ContainerEngine: ctd}, false, false},
+		{"knob only, single node", Config{ContainerEngine: ctd, DockerReadySocketEnabled: true}, false, false},
+		{"containerd pool, single node", Config{ContainerEngine: ctd, DockerReadySocketEnabled: true, ContainerdPoolEnabled: true}, true, false},
+		{"containerd pool, kill switch", Config{ContainerEngine: ctd, ContainerdPoolEnabled: true}, false, false},
+		{"containerd pool knob on docker engine", Config{ContainerEngine: models.ContainerEngineDocker, DockerReadySocketEnabled: true, ContainerdPoolEnabled: true}, false, false},
+		{"cluster", Config{ContainerEngine: ctd, DockerReadySocketEnabled: true, EnableCluster: true}, true, true},
+		{"docker pool", Config{ContainerEngine: ctd, DockerReadySocketEnabled: true, DockerPoolEnabled: true}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.ContainerdReadySocketEffective(); got != tc.wantCtd {
+				t.Fatalf("ContainerdReadySocketEffective = %v, want %v", got, tc.wantCtd)
+			}
+			if got := tc.cfg.DockerReadySocketEffective(); got != tc.wantDocker {
+				t.Fatalf("DockerReadySocketEffective = %v, want %v", got, tc.wantDocker)
+			}
+		})
+	}
 }
 
 func TestDockerReadySocketDirDerived(t *testing.T) {

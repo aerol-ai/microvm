@@ -191,6 +191,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
+	d.recordInstance(inst)
 
 	return d.runtimeState(inst), nil
 }

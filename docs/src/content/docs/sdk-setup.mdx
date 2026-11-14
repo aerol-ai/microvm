@@ -19,6 +19,12 @@ An SDK is a library that lets your code talk to the AerolVM server. There is one
     ```bash
     pip install aerolvm-sdk
     ```
+
+    For the asyncio client, `AsyncMicroVM`, add the `async` extra. It also installs `httpx`:
+
+    ```bash
+    pip install "aerolvm-sdk[async]"
+    ```
   </TabItem>
   <TabItem label="Go">
     ```bash
@@ -45,7 +51,7 @@ An SDK is a library that lets your code talk to the AerolVM server. There is one
       <dependency>
         <groupId>ai.aerol</groupId>
         <artifactId>aerolvm-sdk</artifactId>
-        <version>0.8.1</version>
+        <version>0.8.2</version>
       </dependency>
     </dependencies>
     ```
@@ -177,6 +183,168 @@ This lists your sandboxes. If the address or token is wrong, it fails with a cle
 | `unauthorized` | The token does not match the one the server was installed with. |
 | `Connection refused` | The server is not running, or `SB_API_URL` points to the wrong address. |
 
+## Connect through a company network
+
+Some company networks put a proxy between your code and the server. The proxy may check TLS with its own certificate authority (CA), ask for a client certificate, or need an extra header. Each SDK can handle this:
+
+| SDK | Trust another CA | Send a client certificate | Add headers |
+|---|---|---|---|
+| TypeScript | Start Node with `NODE_EXTRA_CA_CERTS` | Pass a `fetch` that uses an undici `Agent` with `connect: { cert, key }` | Pass a `fetch` that adds them |
+| Python | `ca_file=` | `client_cert=` | `headers=` |
+| Go | `HTTPClient` with `tls.Config.RootCAs` | `HTTPClient` with `tls.Config.Certificates` | `HTTPClient` with a `RoundTripper` that adds them |
+| Rust | Add the CA to the system's list | Not yet | Not yet |
+| Java | `setHttpClient` with an `SSLContext` | `setHttpClient` with an `SSLContext` | Not yet |
+
+In Python, `ca_file` replaces the system's CA list for this client, like `verify=` does in the `requests` library. `client_cert` takes one PEM file that holds the certificate and its key, or a pair of files `(cert_file, key_file)`. `headers` go on every request and on every live stream. They cannot replace the headers the SDK or HTTP sets itself: `Authorization`, the team header, `Content-Type`, `Idempotency-Key`, `Host`, `Content-Length` and `Transfer-Encoding`. A file that cannot be read fails when you make the client, not on the first call.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Run with: NODE_EXTRA_CA_CERTS=/etc/ssl/company-ca.pem node app.js
+    const client = new MicroVM({
+      fetch: (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("X-Proxy-Auth", process.env.PROXY_TOKEN ?? "");
+        return fetch(input, { ...init, headers });
+      },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+
+    from microvm import MicroVM
+
+    client = MicroVM(
+        ca_file="/etc/ssl/company-ca.pem",
+        client_cert=("/etc/ssl/me.pem", "/etc/ssl/me.key"),
+        headers={"X-Proxy-Auth": os.environ["PROXY_TOKEN"]},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    caPEM, err := os.ReadFile("/etc/ssl/company-ca.pem")
+    if err != nil {
+        log.Fatal(err)
+    }
+    roots := x509.NewCertPool()
+    roots.AppendCertsFromPEM(caPEM)
+    cert, err := tls.LoadX509KeyPair("/etc/ssl/me.pem", "/etc/ssl/me.key")
+    if err != nil {
+        log.Fatal(err)
+    }
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        HTTPClient: &http.Client{Transport: &http.Transport{
+            TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{cert}},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // The Rust client trusts the system's CA list. Add your company CA to
+    // it (on Linux, for example, with update-ca-certificates).
+    // Client certificates and extra headers are not supported yet.
+    let client = Client::new(None, None)?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    // sslContext trusts your company CA and holds your client key,
+    // for example loaded from a KeyStore with TrustManagerFactory
+    // and KeyManagerFactory.
+    HttpClient http = HttpClient.newBuilder().sslContext(sslContext).build();
+    MicroVMClient client = new MicroVMClient(new MicroVMConfig().setHttpClient(http));
+    ```
+  </TabItem>
+</Tabs>
+
+## Run many calls at the same time
+
+An agent often runs many sandboxes at once. Each SDK lets you send calls side by side, in the way that is normal for its language:
+
+- **TypeScript:** every call returns a promise. Use `Promise.all`.
+- **Python:** use `AsyncMicroVM` with `asyncio`. It has every call `MicroVM` has, as coroutines, and runs the same request code, so the two always act the same. Close it with `async with`. Callbacks from live streams run on the event loop. The plain `MicroVM` also works from threads.
+- **Go:** the client is safe to share between goroutines.
+- **Rust:** the client blocks, so run calls on threads. Clone the client for each thread.
+- **Java:** the client is safe to share between threads. Run calls on an `ExecutorService`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await Promise.all(
+      ["a", "b", "c"].map((name) => client.getOrCreate(name, { image: "python:3.12" })),
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import asyncio
+
+    from microvm import AsyncMicroVM
+
+
+    async def main():
+        async with AsyncMicroVM() as client:
+            results = await asyncio.gather(
+                *(client.get_or_create(name, image="python:3.12") for name in ["a", "b", "c"])
+            )
+            for sandbox, created in results:
+                print(sandbox.id, created)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    var wg sync.WaitGroup
+    for _, name := range []string{"a", "b", "c"} {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            if _, _, err := client.GetOrCreate(ctx, name, sdktypes.CreateSandboxOptions{Image: "python:3.12"}); err != nil {
+                log.Print(err)
+            }
+        }()
+    }
+    wg.Wait()
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    std::thread::scope(|scope| {
+        for name in ["a", "b", "c"] {
+            let client = client.clone();
+            scope.spawn(move || {
+                client.get_or_create(
+                    name,
+                    CreateOptions {
+                        image: "python:3.12".to_string(),
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+    });
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecutorService pool = Executors.newFixedThreadPool(3);
+    List<Future<GetOrCreateResult>> calls = new ArrayList<>();
+    for (String name : List.of("a", "b", "c")) {
+        calls.add(pool.submit(() -> client.getOrCreate(name, new CreateOptions().setImage("python:3.12"))));
+    }
+    for (Future<GetOrCreateResult> call : calls) {
+        System.out.println(call.get().getSandbox().id);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
 ## When the server is busy
 
 A busy server can turn a request away and say when to try again. It answers `503` when it is overloaded, and `429` when your code sends more than its fair share. Both answers can carry a `Retry-After` header: the number of seconds to wait, or a date and time.
@@ -258,11 +426,83 @@ Each SDK stops a wait early in its own way:
 
 | SDK | How to stop waiting |
 |---|---|
-| TypeScript | Pass `signal` to `MicroVM`. Aborting it ends the request and any wait. |
-| Python | A signal handler that raises, such as Ctrl-C, ends the wait. |
+| TypeScript | Pass `signal` to `MicroVM`, or to one call (see below). Aborting it ends the request and any wait. |
+| Python | Pass `timeout=` to one call (see below). A signal handler that raises, such as Ctrl-C, also ends the wait. |
 | Go | Cancel the `ctx` you pass, or give it a deadline. |
 | Rust | The client blocks, so a wait cannot be stopped. Lower `max_retry_after_ms` to keep waits short. |
 | Java | Interrupt the thread, for example with `Future.cancel(true)`. |
+
+### Give one call a time limit
+
+Sometimes one call must not take long, while others may. Each SDK lets you limit a single call:
+
+- **TypeScript:** every call takes an optional last argument, `{ signal }`. Use `AbortSignal.timeout(ms)` for a time limit. The call fails with the signal's reason, a `TimeoutError`.
+- **Python:** every call takes `timeout=`, in seconds. The call fails with `MicroVMTimeoutError`. Its `status_code` is `0`, which tells it apart from a `504` sent by the server.
+- **Go:** give the call a `ctx` with a deadline.
+- **Java:** run the call on another thread and stop waiting with `Future.get(timeout)`.
+- **Rust:** there is no time limit for one call yet.
+
+The limit covers the whole call: every automatic retry and every wait between retries. A call that does more than one request, such as `getOrCreate`, gets one limit for all of them. For a call that opens a stream, such as running a command with live output or watching files, the limit covers opening the stream, not how long it runs.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get("sb-1234", undefined, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    const result = await sandbox.exec("make test", { signal: AbortSignal.timeout(60_000) });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMTimeoutError
+
+    try:
+        sandbox = client.get("sb-1234", timeout=5)
+        result = sandbox.exec("make test", timeout=60)
+    except MicroVMTimeoutError:
+        print("too slow; try again later")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+    sandbox, err := client.Get(callCtx, "sb-1234")
+    if errors.Is(err, context.DeadlineExceeded) {
+        log.Print("too slow; try again later")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // The Rust client blocks and has no time limit for one call yet.
+    // Keep retry waits short instead:
+    let client = Client::with_config(
+        ClientConfig {
+            retry: Some(RetryConfig {
+                max_retry_after_ms: Some(5_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ApiVersion::V1,
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecutorService pool = Executors.newCachedThreadPool();
+    Future<Sandbox> call = pool.submit(() -> client.get("sb-1234"));
+    try {
+        Sandbox sandbox = call.get(5, TimeUnit.SECONDS);
+    } catch (TimeoutException e) {
+        call.cancel(true); // stops the request and any retry wait
+        System.out.println("too slow; try again later");
+    }
+    ```
+  </TabItem>
+</Tabs>
 
 ## When a request fails
 
@@ -378,6 +618,96 @@ Not every error has a code. Many errors are only meant for a person to read. An 
     ```
   </TabItem>
 </Tabs>
+
+### Catch one kind of error
+
+Some statuses come up often, so each SDK gives them their own error type. You can catch just the case you care about, such as "this sandbox does not exist", without checking numbers. Each one is a kind of the error above, so code that catches the general error still catches all of them.
+
+| Status | What it means | TypeScript | Python | Go (`errors.Is`) | Rust | Java |
+|---|---|---|---|---|---|---|
+| `404` | The thing you named does not exist, or is not yours. | `MicroVMNotFoundError` | `MicroVMNotFoundError` | `microvm.ErrNotFound` | `is_not_found()` | `MicroVMNotFoundException` |
+| `409` | It clashes with what is there now, such as a name you already use. | `MicroVMConflictError` | `MicroVMConflictError` | `microvm.ErrConflict` | `is_conflict()` | `MicroVMConflictException` |
+| `503` | The server is full or busy. The SDK already tried again. | `MicroVMCapacityError` | `MicroVMCapacityError` | `microvm.ErrCapacity` | `is_capacity()` | `MicroVMCapacityException` |
+| `408`, `504` | The server, or a proxy in front of it, stopped waiting. | `MicroVMTimeoutError` | `MicroVMTimeoutError` | `microvm.ErrTimeout` | `is_timeout()` | `MicroVMTimeoutException` |
+| `401`, `403` | The token is missing, wrong or expired (`401`), or it may not do this (`403`). | `MicroVMAuthError` | `MicroVMAuthError` | `microvm.ErrAuth` | `is_auth()` | `MicroVMAuthException` |
+
+Other statuses, such as `422` or `500`, use the general error type.
+
+A few details:
+
+- **Python:** `MicroVMTimeoutError` is also a built-in `TimeoutError`, so `except TimeoutError` catches it. A `TimeoutError` is an `OSError`, so code that catches `OSError` around a call now also catches a `408` or `504` answer.
+- **Rust:** the checks are methods on both `ApiError` and `Error`. `Error::is_timeout()` is also true when the HTTP client itself stopped waiting. `Error::Api(_)` still matches every HTTP error.
+- **TypeScript:** the error's `name` stays `"MicroVMApiError"`, so code that checks the name still works. Use `instanceof` to tell the types apart.
+- **Go:** a `ctx` that runs out of time gives `context.DeadlineExceeded`, not `ErrTimeout`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM, MicroVMNotFoundError } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM();
+
+    try {
+      await client.destroy("sb-1234");
+    } catch (err) {
+      if (!(err instanceof MicroVMNotFoundError)) throw err;
+      console.log("Already gone.");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM, MicroVMNotFoundError
+
+    client = MicroVM()
+
+    try:
+        client.destroy("sb-1234")
+    except MicroVMNotFoundError:
+        print("Already gone.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := client.Destroy(ctx, "sb-1234")
+    switch {
+    case errors.Is(err, microvm.ErrNotFound):
+        fmt.Println("Already gone.")
+    case err != nil:
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(None, None)?;
+
+    match client.destroy("sb-1234") {
+        Ok(()) => {}
+        Err(err) if err.is_not_found() => println!("Already gone."),
+        Err(err) => return Err(err.into()),
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMNotFoundException;
+
+    MicroVMClient client = new MicroVMClient();
+
+    try {
+        client.destroy("sb-1234");
+    } catch (MicroVMNotFoundException e) {
+        System.out.println("Already gone.");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Error codes
 
 Some codes you may see:
 

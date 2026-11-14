@@ -44,6 +44,10 @@ type restartRig struct {
 	adopted []readyproto.AdoptFrame
 	// silent guests never say hello (a toolbox that cannot boot).
 	silent bool
+	// ackDigest is the env digest guests ack an adopt with; nil plays the
+	// current toolboxd (readyproto.EnvDigest over the frame's env). A test
+	// plays one built before adopt frames carried env by returning "".
+	ackDigest func(readyproto.AdoptFrame) string
 }
 
 func newRestartRig(t *testing.T) *restartRig {
@@ -185,8 +189,14 @@ func (r *restartRig) guest(spec *specs.Spec) {
 	}
 	r.mu.Lock()
 	r.adopted = append(r.adopted, frame)
+	ackDigest := r.ackDigest
 	r.mu.Unlock()
-	_ = readyproto.Encode(conn, readyproto.ReadySignal{Event: readyproto.EventReady, SandboxID: frame.SandboxID, Token: frame.Token, Nonce: frame.Nonce})
+	ack := readyproto.ReadySignal{Event: readyproto.EventReady, SandboxID: frame.SandboxID, Token: frame.Token, Nonce: frame.Nonce,
+		EnvDigest: readyproto.EnvDigest(frame.Nonce, frame.Env)}
+	if ackDigest != nil {
+		ack.EnvDigest = ackDigest(frame)
+	}
+	_ = readyproto.Encode(conn, ack)
 }
 
 func (r *restartRig) lastAdopt() readyproto.AdoptFrame {
@@ -371,7 +381,9 @@ func TestStartWithIdentityFailsClosedWhenTheToolboxIsNotAdopted(t *testing.T) {
 
 	// The same start with a stubbed handshake error takes the same branch.
 	orig := readoptParkedFn
-	readoptParkedFn = func(context.Context, *dockerpkg.ParkedListener, string, string) error { return errors.New("boom") }
+	readoptParkedFn = func(context.Context, *dockerpkg.ParkedListener, string, string, map[string]string) error {
+		return errors.New("boom")
+	}
 	t.Cleanup(func() { readoptParkedFn = orig })
 	if _, err := r.d.StartWithIdentity(ctx, "park-r4", "sb-r4", "tok"); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("err = %v", err)

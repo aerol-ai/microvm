@@ -80,6 +80,12 @@ func IsLeaderUnavailable(err error) bool {
 // systemd's restart limit made it final.
 var ErrMembershipPending = errors.New("cluster: peer membership not yet recognised by the control plane")
 
+// PeerNotInMembershipMessage is the 403 body every peer check (the internal
+// listener, the v1 apply route, the peer middleware) answers a node it does
+// not see alive in gossip. The callers match it to restore
+// ErrMembershipPending, so it is one constant, never retyped.
+const PeerNotInMembershipMessage = "cluster peer not in membership"
+
 // IsControlPlaneUnavailable reports whether err means only that the control
 // plane could not serve this node at this instant — no leader seated, or the
 // server not yet seeing this node in gossip. Neither says anything about the
@@ -153,6 +159,12 @@ var ErrInvalidSecretHandle = errors.New("cluster: invalid secret handle")
 // a different lifetime of the same sandbox ID.
 var ErrIncarnationConflict = errors.New("cluster: sandbox incarnation conflict")
 
+// ErrPlacementDeleted refuses an opPlace that would write back the placement
+// of a lifetime (sandbox ID + incarnation) the cluster already deleted. It is
+// what a node that was cut off gets when its ownership replay tries to place
+// a sandbox someone deleted meanwhile; that node must destroy its copy.
+var ErrPlacementDeleted = errors.New("cluster: sandbox lifecycle was deleted")
+
 // ErrNoPlacementTarget is returned when no alive worker-capable node can
 // accept a new sandbox. This is distinct from "self wins": a pure server or
 // ingress node must not silently fall back to local Docker ownership.
@@ -178,6 +190,20 @@ var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gatewa
 // its message says "capacity", so a client reading it can tell a full fleet
 // from a fleet that cannot run the request at all.
 var ErrClusterAtCapacity = fmt.Errorf("%w: every worker that can run this sandbox is at capacity (cpu, memory, disk or network slots)", ErrNoPlacementTarget)
+
+// ErrPlacementUnsatisfiable is a create whose placement rule (zone and node
+// labels, plans/placement-rules.md) no live worker's heartbeat satisfies. It
+// is deliberately NOT an ErrNoPlacementTarget: that is a retryable 503, and
+// waiting does not make a node grow a label. The API answers 409
+// placement_unsatisfiable naming the rule.
+var ErrPlacementUnsatisfiable = models.ErrPlacementUnsatisfiable
+
+// ErrPlacementRulesUnsupported is a create with a placement rule that reached
+// a control plane too old to filter on labels (it answered without saying it
+// checked them). The agent fails closed rather than trust a target picked
+// without the rule; it stays an ErrNoPlacementTarget, so the create is a
+// retryable 503 that succeeds once the server tier is upgraded.
+var ErrPlacementRulesUnsupported = fmt.Errorf("%w: the control plane runs a build that cannot apply placement rules yet", ErrNoPlacementTarget)
 
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
@@ -366,6 +392,10 @@ type ExposedPortRoute struct {
 	Protocol  string `json:"protocol"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is "token" for a port whose public URL needs a sandbox
+	// token (A2), so a failover recreate gates it again; omitted for a
+	// public port, so every placement written before it decodes the same.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // ExposedPorts is the legacy replicated set of port→protocol intents. Newer
@@ -380,9 +410,31 @@ type Placement struct {
 	OwnerState          PlacementOwnerState `json:"owner_state,omitempty"`
 	OrphanedOwnerNodeID string              `json:"orphaned_owner_node_id,omitempty"`
 	OrphanedUnix        int64               `json:"orphaned_unix,omitempty"`
-	Version             uint64              `json:"version"`
-	CreatedUnix         int64               `json:"created_unix"`
-	UpdatedUnix         int64               `json:"updated_unix"`
+	// OwnerSinceUnixNano is when OwnerNodeID took the placement over from
+	// another node: the leader's append time (raft.Log.AppendedAt) of the
+	// entry that moved it, never a clock read in apply, so every replica and
+	// every replay computes the same value. 0 means no takeover is known: the
+	// placement still has the owner it was created (reserved or placed)
+	// with, the entry carried no append time, or an older build applied it.
+	// Orphaning, and a claim back by the node it was orphaned from, keep the
+	// value, as no other node owned the sandbox in between. The owner reads
+	// it when it reuses a local row from an earlier ownership, to refuse the
+	// sandbox tokens issued before the takeover (another node may have
+	// revoked them): Service.RecreateSandboxReport.
+	OwnerSinceUnixNano int64 `json:"owner_since_unix_nano,omitempty"`
+	// OwnerEpoch is the Raft log index of the entry that last changed
+	// OwnerNodeID: the entry that wrote the row, and every reassign, orphaning
+	// and claim since (invariant I2, plan C4 part 4). Unlike
+	// OwnerSinceUnixNano it is a log index, not a leader's clock, so a later
+	// owner change always has a larger epoch, even across leader changes. A
+	// forward carries the epoch the edge saw (HeaderOwnerEpoch), and the owner
+	// compares it with its own reading. 0 means unknown (a row written by an
+	// older build, or restored from its snapshot): readers then fall back to
+	// looking the owner up.
+	OwnerEpoch  uint64 `json:"owner_epoch,omitempty"`
+	Version     uint64 `json:"version"`
+	CreatedUnix int64  `json:"created_unix"`
+	UpdatedUnix int64  `json:"updated_unix"`
 	// Name is the small, hot copy of Spec.Name used to rebuild the cluster-wide
 	// uniqueness index without loading the larger recovery spec payload.
 	Name string `json:"name,omitempty"`
@@ -405,14 +457,34 @@ type Placement struct {
 	// field"; placementAllowsPublicTraffic still consults Spec when present,
 	// so a legacy row behaves exactly as before until its next write.
 	PublicTraffic bool `json:"public_traffic,omitempty"`
+	// FailoverRecreate mirrors Spec.Failover.ShouldRecreate() on the HOT row,
+	// for the same reason as PublicTraffic: an ingress reads only redacted
+	// pages and feed rows. When it loses the servers past the ownership
+	// lease it puts only these sandboxes in flux, since only they can be
+	// handed to another worker behind its back (placementMovableOnFailover).
+	// false means "no recreate policy, or recorded by a build that predates
+	// this field"; a row read with its Spec still consults the Spec.
+	FailoverRecreate bool `json:"failover_recreate,omitempty"`
 	// EgressProfiles / EgressInlineHostnames mirror Spec.EgressProfiles and
 	// the hostname count of Spec.NetworkAllowOut on the HOT row, for the
 	// FSM's profile reference index and union-cap check (D21). Empty for a
 	// sandbox without profiles.
 	EgressProfiles        []string `json:"egress_profiles,omitempty"`
 	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
-	SecretRef             string   `json:"secret_ref,omitempty"`
-	SecretVersion         int      `json:"secret_version,omitempty"`
+	// KubeClaim says whether the sandbox was made by an agent-sandbox
+	// claim (its spec's KubeClaimTag), so a claim list skips every other
+	// sandbox without reading its spec (C17). Derived from the spec on the
+	// hot row, as FailoverRecreate is. Zero is "not known": a row an older
+	// build wrote or rewrote, which a reader checks against the spec.
+	KubeClaim KubeClaimMark `json:"kube_claim,omitempty"`
+	// QuotaCPU / QuotaMemoryMB mirror the size a team's sandbox asked for
+	// (Spec.CPU / Spec.MemoryMB with server defaults) on the HOT row, so the
+	// FSM's team-usage index is rebuilt on Restore without hydrating specs
+	// (fsm_team_quotas.go). Zero for a sandbox no team owns.
+	QuotaCPU      float64 `json:"quota_cpu,omitempty"`
+	QuotaMemoryMB int     `json:"quota_memory_mb,omitempty"`
+	SecretRef     string  `json:"secret_ref,omitempty"`
+	SecretVersion int     `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated
@@ -457,6 +529,13 @@ type Placement struct {
 	// cancels expired reservations and completes abandoned exact-lifecycle
 	// deletes after their finalization lease expires.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// RunState is the run state the owner last reported (opSetRunStates,
+	// fsm_run_state.go); empty until it reports one. RunStateIndex is the
+	// Raft index of that report. Neither moves Version: merge two copies of
+	// a row with placementAtLeast.
+	RunState       RunState `json:"run_state,omitempty"`
+	RunStateReason string   `json:"run_state_reason,omitempty"`
+	RunStateIndex  uint64   `json:"run_state_index,omitempty"`
 }
 
 // AuditACL is the minimal post-delete existence/authorization and evidence-node
@@ -513,6 +592,22 @@ type Member struct {
 	// the default "any" (and for older builds). It feeds the
 	// aerolvm_pat_scope_drift gauge and grants nothing.
 	PATScope string `json:"pat_scope,omitempty"`
+	// Version is the peer's gossiped sandboxd build ("bv"). Empty for a peer
+	// on a build that predates the field.
+	Version string `json:"version,omitempty"`
+	// Arch is the peer's gossiped CPU type ("ar"). Empty for a peer on a
+	// build that predates the field.
+	Arch string `json:"arch,omitempty"`
+	// Restarting says the node announced a restart on SIGTERM ("rs", C8):
+	// placement sends it nothing new, and the leader waits the restart
+	// window, not only the grace, before moving its sandboxes.
+	Restarting bool `json:"restarting,omitempty"`
+	// Voter and Leader come from the Raft configuration and leadership, not
+	// gossip, so only a Raft server can fill them in (AnnotateRaftRoles).
+	// Both stay false for workers, ingress nodes and any member listed
+	// without a Raft view; an agent's Members() carries a server's answer.
+	Voter  bool `json:"voter,omitempty"`
+	Leader bool `json:"leader,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.
@@ -571,6 +666,8 @@ type OwnerInfo struct {
 	// InternalURL is the owner's required cluster-internal mTLS URL.
 	InternalURL string
 	IsSelf      bool
+	// Epoch is the placement's OwnerEpoch when it was read (0: unknown).
+	Epoch uint64
 }
 
 // Endpoint binds a peer identity to its cluster-internal mTLS URL. APIURL is
@@ -611,8 +708,14 @@ type SandboxRecreator interface {
 // no-op where the sandbox and its replicated routes were already present.
 // Failures always report attempted=true so retry/error metrics retain the
 // signal that drives stuck-placement reassignment.
+//
+// ownerSinceUnixNano is the placement's OwnerSinceUnixNano, handed over from
+// the row the watcher already read: an owner that finds a local row from an
+// earlier ownership refuses the sandbox tokens issued before it took the
+// placement back. Reading the placement again in the service instead would
+// cost a worker one control-plane round trip per owned sandbox per tick.
 type SandboxRecreateReporter interface {
-	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute) (attempted bool, err error)
+	RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, exposedPorts map[int]ExposedPortRoute, ownerSinceUnixNano int64) (attempted bool, err error)
 }
 
 // Client is the surface the rest of the daemon (Service, API handlers)
@@ -823,6 +926,10 @@ type Client interface {
 	// volume. Put/Delete keep this index in the same raft log as volume metadata
 	// so Daytona delete cannot miss a sandbox that lives on another worker.
 	VolumeAttachmentCount(ctx context.Context, tenant, id string) (int, error)
+	// VolumeAttachmentsForSandbox lists the attachments one sandbox holds
+	// (a destroy finds its delete_with_sandbox volumes with it). Read-only;
+	// an agent asks a server, which answers from its replicated FSM.
+	VolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) ([]models.VolumeAttachment, error)
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 

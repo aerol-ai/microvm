@@ -406,19 +406,7 @@ func (s *Service) addLocalIngressExpectedRoutes(expectedHTTP, expectedTCPServers
 		if sb == nil || sb.Status == models.SandboxStatusDestroyed {
 			continue
 		}
-		expectedHTTP["sandbox-"+sb.ID] = struct{}{}
-		for _, p := range sb.ExposedPorts {
-			switch p.Protocol {
-			case "", models.ExposedPortProtocolHTTP:
-				expectedHTTP[fmt.Sprintf("sandbox-%s-port-%d", sb.ID, p.Port)] = struct{}{}
-			case models.ExposedPortProtocolTCP:
-				if p.HostPort > 0 {
-					expectedTCPServers[fmt.Sprintf("tcp-port-%d", p.HostPort)] = struct{}{}
-				}
-			case models.ExposedPortProtocolTLS:
-				expectedTLSRoutes[fmt.Sprintf("sandbox-%s-port-%d-tls", sb.ID, p.Port)] = struct{}{}
-			}
-		}
+		s.expectLocalSandboxRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes, sb)
 	}
 }
 

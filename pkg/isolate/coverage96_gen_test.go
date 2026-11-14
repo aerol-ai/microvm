@@ -5,7 +5,6 @@ import (
 	"context"
 	"net/http"
 	"os"
-	"os/exec"
 	"reflect"
 	"testing"
 	"time"
@@ -84,14 +83,14 @@ func cover96Ctx() context.Context {
 }
 
 func cover96_ptr_Host(recv *Host) {
-	cover96Call(func() { recv.SetEgressObserver(zero96[EgressObserver]()) })                          // host.go:93
-	cover96Call(func() { recv.SetEgressPolicy(zero96[string](), zero96[EgressPolicy]()) })            // egress.go:34
-	cover96Call(func() { recv.Start(cover96Ctx()) })                                                  // host.go:208
-	cover96Call(func() { recv.Stop() })                                                               // host.go:422
-	cover96Call(func() { recv.grantJailAccess() })                                                    // host.go:473
-	cover96Call(func() { recv.observeEgress(zero96[string](), zero96[string](), zero96[string]()) })  // host.go:102
-	cover96Call(func() { recv.startSlotServerLocked(zero96[int]()) })                                 // egress.go:83
-	cover96Call(func() { recv.waitReady(cover96Ctx(), zero96[*exec.Cmd](), zero96[*http.Client]()) }) // host.go:351
+	cover96Call(func() { recv.SetEgressObserver(zero96[EgressObserver]()) })                              // host.go:93
+	cover96Call(func() { recv.SetEgressPolicy(zero96[string](), zero96[EgressPolicy]()) })                // egress.go:34
+	cover96Call(func() { recv.Start(cover96Ctx()) })                                                      // host.go:208
+	cover96Call(func() { recv.Stop() })                                                                   // host.go:422
+	cover96Call(func() { recv.grantJailAccess() })                                                        // host.go:473
+	cover96Call(func() { recv.observeEgress(zero96[string](), zero96[string](), zero96[string]()) })      // host.go:102
+	cover96Call(func() { recv.startSlotServerLocked(zero96[int]()) })                                     // egress.go:83
+	cover96Call(func() { recv.waitReady(cover96Ctx(), zero96[chan struct{}](), zero96[*http.Client]()) }) // host.go:351
 }
 
 func cover96_ptr_jailRealized(recv *jailRealized) {

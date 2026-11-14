@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm get: -l is for kinds: aerolvm get sandboxes -l app=web
+run `aerolvm get --help` for usage

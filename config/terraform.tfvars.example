@@ -3,10 +3,18 @@
 #   scripts/terraform.sh init
 #   scripts/terraform.sh apply
 #
-# scripts/terraform.sh runs `terraform -chdir=Terraform` and auto-loads this
-# file via -var-file=../config/terraform.tfvars. Don't run `terraform` directly
-# from Terraform/ — this file is no longer on Terraform's auto-load path.
+# scripts/terraform.sh runs `terraform -chdir=Terraform/root` and loads this
+# file with -var-file. Don't run `terraform` directly: this file is not on
+# Terraform's auto-load path. (Without a checkout, use the module by URL
+# instead: Terraform/examples/from-url.)
 ###############################################################################
+
+# --- Joining ------------------------------------------------------------------
+#
+# A NEW cluster: join every node with one line and a token per role.
+# A cluster built from this checkout before: leave this out (false). Your
+# nodes were built with the old join, and changing it replaces every node.
+# one_line_join = true
 
 # --- Required ---------------------------------------------------------------
 #
@@ -59,6 +67,13 @@ default_volume_type       = "gp3"
 # default_with_nvidia_gpu  = false   # adds --with-nvidia-gpu (driver must be loaded)
 # default_with_amd_gpu     = false   # adds --with-amd-gpu (x86_64 only)
 # default_idle_timeout_min = 0       # sandbox auto-stop minutes; 0 disables
+#
+# Ingress proxy routing: an expose or destroy writes nothing to Caddy, so it
+# never reloads Caddy and drops new connections. Unset (null) passes no flag
+# and install.sh turns it on for a domain install; true passes
+# --ingress-proxy-routing; false passes --no-ingress-proxy-routing (off).
+# Terraform/README.md, "Ingress proxy routing", has the details.
+# default_ingress_proxy_routing = true
 
 # Firecracker host onboarding. URLs are optional: set them to let Terraform
 # bootstrap download the firecracker/jailer/kernel artifacts, or leave them
@@ -114,7 +129,7 @@ default_volume_type       = "gp3"
 # Roles: "server" | "worker" | "ingress" | "worker,ingress" |
 #        "server,worker" | "server,ingress" | "mixed"
 #
-# Validation (enforced at plan-time, mirrors cluster-init.sh / cluster-join.sh):
+# Validation (enforced at plan-time, mirrors sandboxd init / sandboxd join):
 #   - exactly one node has seed = true
 #   - the seed's role contains "server" or equals "mixed"
 #   - "mixed" cannot be combined with other tokens

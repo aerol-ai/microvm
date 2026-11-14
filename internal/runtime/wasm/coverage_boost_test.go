@@ -1081,24 +1081,6 @@ func TestCheckpointFailureWithEmptyWorkerKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// sessions.go — creation path
-// ---------------------------------------------------------------------------
-
-func TestSessionsForCreatesManager(t *testing.T) {
-	dir := t.TempDir()
-	workDir := filepath.Join(dir, "sb-sess-new")
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	d := New(Config{ModulesDir: dir}, nil)
-	inst := &sandboxInstance{sandboxID: "sb-sess-new", workDir: workDir}
-	mgr, err := d.sessionsFor(inst)
-	if err != nil || mgr == nil {
-		t.Fatalf("sessionsFor: mgr=%v err=%v", mgr, err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // exec.go — wasmExecArgs direct fields return
 // ---------------------------------------------------------------------------
 

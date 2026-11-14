@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -17,10 +18,63 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrConflict matches a 409, e.g. a create whose name the caller holds.
 	ErrConflict = errors.New("conflict")
+	// ErrCapacity matches a 503: the server has no room for the call right
+	// now or is shedding load. The client has already retried it.
+	ErrCapacity = errors.New("server is out of capacity")
+	// ErrTimeout matches a 408 or 504: the server, or a proxy in front of
+	// it, gave up waiting. A ctx deadline is context.DeadlineExceeded, not
+	// this.
+	ErrTimeout = errors.New("server timed out")
+	// ErrAuth matches a 401 (the token is missing, wrong or expired) and a
+	// 403 (the token may not do this).
+	ErrAuth = errors.New("not authorized")
 	// ErrNameLookupUnsupported means the server ignored ?name= (it predates
 	// name lookup), so its reply can't identify a sandbox.
 	ErrNameLookupUnsupported = errors.New("sandbox name lookup not supported by this server")
+	// ErrUnsupportedFeature means the sandbox's agent (toolboxd) is older
+	// than an option the call needs. An older agent would silently ignore
+	// the option, so the SDK refuses instead of sending it. Match the
+	// details with errors.As on *UnsupportedFeatureError.
+	ErrUnsupportedFeature = errors.New("sandbox agent does not support this feature")
+	// ErrFileTooLarge means a download was larger than its MaxBytes.
+	ErrFileTooLarge = errors.New("file is larger than the download limit")
 )
+
+// UnsupportedFeatureError names the sandbox and the features its agent did
+// not list on /version. errors.Is(err, ErrUnsupportedFeature) matches it.
+type UnsupportedFeatureError struct {
+	SandboxID    string
+	Features     []string
+	AgentVersion string
+	// Runtime is set (for example "wasm") when the sandbox's runtime cannot
+	// offer the features at all; a restart does not help there.
+	Runtime string
+}
+
+func (e *UnsupportedFeatureError) Error() string {
+	if e.Runtime != "" {
+		return fmt.Sprintf("sandbox %s is a %s sandbox, which does not support %s",
+			e.SandboxID, runtimeDisplayName(e.Runtime), strings.Join(e.Features, ", "))
+	}
+	agent := "an older toolboxd"
+	if e.AgentVersion != "" {
+		agent = "toolboxd " + e.AgentVersion
+	}
+	return fmt.Sprintf("sandbox %s runs %s, which does not support %s; restart the sandbox, or re-create its Firecracker template, to get the current agent",
+		e.SandboxID, agent, strings.Join(e.Features, ", "))
+}
+
+func (e *UnsupportedFeatureError) Unwrap() error { return ErrUnsupportedFeature }
+
+func runtimeDisplayName(runtime string) string {
+	switch runtime {
+	case "wasm":
+		return "WebAssembly"
+	case "isolate":
+		return "V8 isolate"
+	}
+	return runtime
+}
 
 // StreamError is a failure the toolbox reported on an exec or session
 // stream (an "error" frame: the command could not start, say), as opposed
@@ -76,6 +130,12 @@ func (e *APIError) Is(target error) bool {
 		return e.StatusCode == http.StatusNotFound
 	case ErrConflict:
 		return e.StatusCode == http.StatusConflict
+	case ErrCapacity:
+		return e.StatusCode == http.StatusServiceUnavailable
+	case ErrTimeout:
+		return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusGatewayTimeout
+	case ErrAuth:
+		return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 	}
 	return false
 }

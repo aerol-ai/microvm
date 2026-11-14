@@ -21,13 +21,6 @@ ACME_CA=""
 ACME_CA_ROOT=""
 TLS_ISSUER="acme"
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
-# The stock Caddy package, which provides the caddy user, caddy.service and
-# /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
-# from Caddy's GitHub release, not the Cloudsmith apt repository: that
-# answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
-# out (2023, 2024, and from 2026-10-09), and then every install failed.
-CADDY_PACKAGE_VERSION="2.11.7"
-CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
 CADDY_BINARY_URL=""
 CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
@@ -35,8 +28,14 @@ RUNSC_PATH=""
 WITH_ISOLATE="false"
 # Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
 # Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
-# route responder via systemd-resolved.
-INGRESS_PROXY_ROUTING="false"
+# route responder via systemd-resolved. Empty until the flags are parsed:
+# --ingress-proxy-routing / --no-ingress-proxy-routing decide, and without
+# either resolve_ingress_proxy_routing turns it on for a --domain install.
+INGRESS_PROXY_ROUTING=""
+# true once resolve_ingress_proxy_routing chose the value itself, so node.json
+# keeps "auto" rather than freezing what this run derived: a node that gets a
+# --domain later would otherwise keep routing off.
+INGRESS_PROXY_ROUTING_AUTO="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
 # The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
 # here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
@@ -44,31 +43,7 @@ ROUTE_DNS_ADDR="127.0.0.1:53053"
 ROUTE_DNS_LINK_IP="169.254.53.53"
 ROUTE_DNS_LINK_ADDR="${ROUTE_DNS_LINK_IP}:53053"
 WORKERD_PATH=""
-# Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
-# Phase 1). Upstream ships gzipped standalone binaries with no checksum
-# sidecar, so the per-arch SHA-256 is pinned here and MUST be bumped together
-# with the version — see setup/runbooks for the upgrade recipe.
-WORKERD_VERSION="v1.20260717.1"
-WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
-WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
 WITH_FIRECRACKER="false"
-# Version-pinned Firecracker for --with-firecracker: the release and guest
-# kernel Terraform (Terraform/variables.tf) and Ansible
-# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
-# hand boots what the cluster tooling is tested on. The kernel bucket
-# publishes no checksums, and the release's .sha256.txt comes from the same
-# place as the tarball, so it cannot catch a replaced release. Every file is
-# checked against a SHA-256 pinned here instead, as for workerd. Bump the
-# versions and all six hashes together.
-FIRECRACKER_VERSION="v1.15.1"
-FIRECRACKER_KERNEL_CI_VERSION="v1.15"
-FIRECRACKER_KERNEL_VERSION="5.10.245"
-FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
-FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
-FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
-FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
-FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
-FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
 # The daemon's own defaults (SB_FIRECRACKER_BINARY, SB_JAILER_BINARY,
 # SB_FIRECRACKER_KERNEL, SB_FIRECRACKER_TEMPLATES_DIR, SB_JAILER_CHROOT_BASE),
 # so sandboxd.env carries no path settings for them.
@@ -97,8 +72,11 @@ PAT_TOKEN_EXPLICIT="false"
 # Linux VM (OrbStack / Docker Desktop) shares with containers, so the Linux
 # toolboxd bind-mounts into sandboxes from here (a /usr/local/bin path would
 # arrive as an empty directory). sandboxd runs as a LaunchAgent.
-DARWIN_HOME="$HOME/.aerolvm"
-DARWIN_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.aerol.sandboxd.plist"
+# ${HOME:-}: these run before any OS check, and under `set -u` an unset HOME
+# (EC2 user data, which cloud-init runs without one) would stop a Linux
+# install here. Only the macOS path reads them, and macOS always sets HOME.
+DARWIN_HOME="${HOME:-}/.aerolvm"
+DARWIN_LAUNCH_AGENT="${HOME:-}/Library/LaunchAgents/com.aerol.sandboxd.plist"
 
 # Bound every bootstrap download. Without low-speed and total timeouts, a dead
 # CDN/GitHub connection can sit at 0 bytes forever and leave cloud-init running
@@ -110,6 +88,22 @@ DOWNLOAD_LOW_SPEED_TIME="${AEROL_DOWNLOAD_LOW_SPEED_TIME:-30}"
 DOWNLOAD_RETRY="${AEROL_DOWNLOAD_RETRY:-60}"
 DOWNLOAD_RETRY_DELAY="${AEROL_DOWNLOAD_RETRY_DELAY:-5}"
 DOWNLOAD_RETRY_MAX_TIME="${AEROL_DOWNLOAD_RETRY_MAX_TIME:-900}"
+
+# The download mirror fetch_with_fallback tries when a file's own source
+# fails. On 2026-11-08 GitHub's release downloads answered 504 for hours
+# while its status page stayed green, and every install, Terraform node and
+# integration run failed, because GitHub was the only source. The public
+# bucket holds each AerolVM release at aerolvm/<tag>/<file> and each pinned
+# third-party file at deps/<project>/<version>/<file>; scripts/mirror-sync.sh
+# fills it. It is checked like GitHub is: release files against the
+# release's checksums.txt, third-party files against the SHA-256 pins below.
+# AEROL_DOWNLOAD_MIRROR or --download-mirror replace it; "" or "off" turns it
+# off. ${VAR-default}, not :-, so an empty AEROL_DOWNLOAD_MIRROR turns it off.
+DOWNLOAD_MIRROR_DEFAULT="https://aerolvm-downloads.s3.us-east-1.amazonaws.com"
+DOWNLOAD_MIRROR="${AEROL_DOWNLOAD_MIRROR-$DOWNLOAD_MIRROR_DEFAULT}"
+# The latest release on the mirror, read once from aerolvm/latest.txt when a
+# "latest" download first needs it ("none" once that read failed).
+MIRROR_LATEST_TAG=""
 
 # Shared Caddy cert storage (S3). All default empty / off; the feature is
 # off unless --caddy-storage-s3 is passed. When enabled, every node points
@@ -140,6 +134,12 @@ PAT_SCOPE="any"
 KEY_CUSTODY="file"
 SECRET_PROVIDER_ENV=""
 NO_START="false"
+# `init` or `join` as a word on the command line (plans/kubectl-style-
+# cluster-ops.md §3.1, §7): install this host, then hand the rest of the
+# arguments to `sandboxd init` / `sandboxd join`.
+NODE_COMMAND=""
+NODE_COMMAND_ARGS=()
+PRINT_JOIN_VERSION="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 # --lb-health-port: a plain-HTTP /health listener for a load balancer's
@@ -147,11 +147,30 @@ L4_PROXY_PROTOCOL="false"
 # a default install opens no new port.
 LB_HEALTH_PORT=""
 
-# A re-run restarts a running sandboxd when it changed the daemon's settings
-# file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
-# fills the two state variables before anything is written.
+# A re-run restarts a running sandboxd when it changed the daemon's binary,
+# settings file or unit (see restart_sandboxd_if_reconfigured).
+# record_sandboxd_state fills the two state variables before anything is
+# written.
 SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
 SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+# Saved answers (plans/kubectl-style-cluster-ops.md D7). node.json holds
+# every non-secret setting a run used, so a re-run with no flags rebuilds
+# the same node; flags given on a re-run win over it. Secrets stay only in
+# the env files they are written to and are read back from there. On a node
+# installed before node.json existed, the first re-run reads its settings
+# back from the files below once (see migrate_node_settings).
+NODE_SETTINGS_FILE="/etc/sandboxd/node.json"
+CADDY_ENV_FILE="/etc/default/caddy"
+CADDYFILE_PATH="/etc/caddy/Caddyfile"
+# The flags this run was given, each followed by a space (flag_given).
+GIVEN_FLAGS=" "
+# true when PUBLIC_HOST came from this machine's address, not from
+# --public-host or node.json: node.json then keeps it empty, so a machine
+# whose address changed gets its new one on the next run.
+PUBLIC_HOST_DETECTED="false"
+# The key-store lines read back from sandboxd.env when a wrapped-custody
+# node is re-run without --secret-provider-env (secret_provider_lines).
+SAVED_SECRET_PROVIDER_LINES=""
 # The cgroup v2 and proc mounts keep_firecracker_vms_running reads (tests
 # point them at fixtures).
 CGROUP_ROOT="/sys/fs/cgroup"
@@ -160,6 +179,188 @@ SANDBOXD_HEALTH_URL="http://127.0.0.1:21212/health"
 SANDBOXD_READY_TRIES=60
 SANDBOXD_WAS_ACTIVE="false"
 SANDBOXD_CONFIG_BEFORE=""
+# Where install_buildkit puts buildkitd, buildctl and their unit: the paths
+# the Terraform bootstrap uses (tests point them elsewhere).
+BUILDKIT_BIN_DIR="/usr/local/bin"
+BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
+# Where upgrade_containerd_engine_tools reads the node's engine settings.
+SANDBOXD_ENV_DIR="/etc/sandboxd"
+
+# --- BEGIN DOWNLOAD PINS ------------------------------------------------------
+# Every pinned third-party download, with its SHA-256. A file is installed
+# only if it has the pinned hash, whichever source served it, so neither
+# GitHub nor the mirror has to be trusted with these files.
+# scripts/mirror-sync.sh --deps runs this block (and nothing else from this
+# file) to copy each file listed by download_pins to the mirror, so the
+# installer and the mirror cannot disagree about a version or a hash. Keep it
+# to NAME="value" lines and download_pins. Bump a version and its hashes
+# together, and run mirror-sync.sh --deps before the release that ships them.
+
+# Two Caddy pins. CADDY_VERSION is a Caddy release: the stock package below
+# and the build-service fallback in install_custom_caddy, which can only
+# build releases. CADDY_BUILD_VERSION is the Caddy core (a Go module
+# version) of every custom build this project makes: the build each release
+# attaches (.github/workflows/release.yml), the integration harness
+# (integration-tests/lib/build.sh), the e2e tests (Makefile,
+# internal/service/testfixtures/caddyfx). Before these pins, the release
+# build named no version and shipped whatever Caddy was newest on release
+# day, untested. integration-tests/safety/caddy_version_test.go fails if any
+# of those places names another version or plugin. To move Caddy: change the
+# pins and the package hashes here, then the places that test lists, then
+# run mirror-sync.sh --deps.
+CADDY_VERSION="2.11.9"
+# v2.11.9 still requires github.com/go-jose/go-jose/v3 v3.0.5
+# (GHSA-mgcc-cww5-fp2q, high, denial of service while parsing an RSA
+# JWK). v3 has no patched release; the fix is only in v4. Caddy master
+# 31f9f0cb99491fdd1a27f82793b78d216c5b2a76 (caddyserver/caddy#8368,
+# 2026-11-06) moves github.com/smallstep/certificates to
+# v0.30.3-0.20261105213751-6d5a251fbe01, which drops v3 and leaves
+# go-jose/v4 v4.1.9. No release tag contains that commit yet. An
+# allow-list would leave v3 in the binary a bank scanner reads, so the
+# custom build tracks this commit until a Caddy release includes it,
+# then this pin goes back to that tag.
+CADDY_BUILD_VERSION="v2.11.8-0.20261106223313-31f9f0cb9949"
+# The plugins in the custom build, at fixed versions. The release build also
+# carries AerolVM's own plugin from the same commit (caddymod/: the sandbox
+# route's upstream lookup). The build service in install_custom_caddy cannot
+# add it, so a Caddy from there routes with Caddy's stock lookup: it works,
+# and sandboxd logs a warning (pkg/caddy HasRouteUpstream).
+CADDY_L4_MODULE="github.com/mholt/caddy-l4@v0.1.2"
+CADDY_DNS_CLOUDFLARE_MODULE="github.com/caddy-dns/cloudflare@v0.2.4"
+CADDY_STORAGE_S3_MODULE="github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39"
+# The stock Caddy package, which provides the caddy user, caddy.service and
+# /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
+# from Caddy's GitHub release, not the Cloudsmith apt repository: that
+# answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
+# out (2023, 2024, and from 2026-10-09), and then every install failed. The
+# hashes are the release's .deb files (their SHA-512 matches
+# caddy_2.11.9_checksums.txt).
+CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
+CADDY_PACKAGE_SHA256_AMD64="bbea4aeaadc86b233c168cc33bad9daa1cbce756dc08949b783b45398f8e65cb"
+CADDY_PACKAGE_SHA256_ARM64="a226cafaddf2db7f392d232cecccc8b3bfaf8b2919f65d80e5e6aed15a97fe66"
+CADDY_PACKAGE_SHA256_ARMV7="e77fa0132065af043c8d7e42ee8aba27d35f3d9aae850d8f13d0fa0b250e5873"
+CADDY_PACKAGE_SHA256_ARMV6="cba34c8025ee631a538b78652186511e5aafa0d7cf166846c881e1f5a357684f"
+
+# Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
+# Phase 1). Upstream ships gzipped standalone binaries with no checksum
+# sidecar, so the per-arch SHA-256 is pinned here and MUST be bumped together
+# with the version — see setup/runbooks for the upgrade recipe.
+WORKERD_VERSION="v1.20260717.1"
+WORKERD_SHA256_LINUX_64="7ff61e052347ab3122c43b1e2419ccd68bd91e3c766f9770320591798e0e89a0"
+WORKERD_SHA256_LINUX_ARM64="3ef71b4a692d2705fa4db0636724409be833402f1c9b99094294a5901989680d"
+
+# Version-pinned Firecracker for --with-firecracker: the release and guest
+# kernel Terraform (Terraform/variables.tf) and Ansible
+# (Ansible/inventory/group_vars/all/defaults.yml) pin, so a node set up by
+# hand boots what the cluster tooling is tested on. The kernel bucket
+# publishes no checksums, and the release's .sha256.txt comes from the same
+# place as the tarball, so it cannot catch a replaced release. Every file is
+# checked against a SHA-256 pinned here instead, as for workerd. Bump the
+# versions and all six hashes together. The BIN hashes are the firecracker
+# and jailer binaries inside each tarball (its own SHA256SUMS lists the
+# same): install.sh never downloads them alone, but the mirror holds them so
+# a Terraform operator can point firecracker_binary_url and
+# firecracker_jailer_url at it.
+FIRECRACKER_VERSION="v1.15.1"
+FIRECRACKER_KERNEL_CI_VERSION="v1.15"
+FIRECRACKER_KERNEL_VERSION="5.10.245"
+FIRECRACKER_SHA256_X86_64="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+FIRECRACKER_SHA256_AARCH64="00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5"
+FIRECRACKER_KERNEL_SHA256_X86_64="c453f36520d2f2792ab8e4532a814e4a647a4a41a4c94d4e9083a502800159b1"
+FIRECRACKER_KERNEL_SHA256_AARCH64="f88e4f934b8d9c3f3a58a4df24c3cef4e6d94976d34a9360525c008e7e5df0a7"
+FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64="bccb4a2403d902e1e184e6281270b2b755c6ad6eff1a830c5b8bc788c7b205f8"
+FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64="ecd245d7a011920456813472f5182db730884a3088dbe79aad4c1e7e23401656"
+FIRECRACKER_BIN_SHA256_X86_64="7e8b57e88c459396d4680d83dcdd8c7f72305447cb55b11f4ac98ad70a3f7825"
+FIRECRACKER_BIN_SHA256_AARCH64="e9ce7466c3b0d879d7a9158f4bf710dd5e131bbc5e580e5269fec66d5b5a0f0a"
+JAILER_BIN_SHA256_X86_64="4830a9b1fc6cece036d8992ff12f1fe9c5247aacad77f42c7aba683c7a08622e"
+JAILER_BIN_SHA256_AARCH64="7faa581395fd1994ee005efc0a9c8826b4a9f0616dd942c2486adb8a8eac13f0"
+
+# CNI plugins and BuildKit for --with-containerd-engine: the versions the
+# Terraform bootstrap installs (Terraform/templates/bootstrap.sh.tftpl), so a
+# node where install.sh put them first, and the bootstrap skips its own
+# install, ends up the same. Hashes: the CNI release's .sha256 files, and
+# the subject digests in BuildKit's provenance attestations.
+#
+# BuildKit v0.17.2 and CNI v1.5.1 (before v0.7.0) were built with Go 1.22:
+# govulncheck counts 92 known vulnerabilities in that buildkitd. The
+# bootstrap installs these versions on the one-line join path only; its old
+# path keeps the old ones, because any byte it changes there replaces every
+# node of a running cluster, and this installer upgrades them in place
+# (upgrade_containerd_engine_tools).
+CNI_PLUGINS_VERSION="v1.9.1"
+CNI_PLUGINS_SHA256_AMD64="b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303"
+CNI_PLUGINS_SHA256_ARM64="56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbecb1375ee7ec"
+BUILDKIT_VERSION="v0.34.2"
+BUILDKIT_SHA256_AMD64="b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13"
+BUILDKIT_SHA256_ARM64="a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3"
+
+# download_pins prints one line per file the mirror holds:
+#   <project> <version> <file> <sha256> <origin>
+# The mirror keeps it at deps/<project>/<version>/<file>. <origin> is the
+# file's own URL, or tar:<file>:<member> for a file mirror-sync.sh takes out
+# of another file already listed (and checked) for the same project and
+# version. fetch_pinned looks downloads up here.
+download_pins() {
+	local caddy="${CADDY_PACKAGE_URL_BASE}/v${CADDY_VERSION}"
+	local workerd="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}"
+	local fc="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}"
+	local cni="https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}"
+	local buildkit="https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}"
+	local v="$CADDY_VERSION"
+	echo "caddy v${v} caddy_${v}_linux_amd64.deb ${CADDY_PACKAGE_SHA256_AMD64} ${caddy}/caddy_${v}_linux_amd64.deb"
+	echo "caddy v${v} caddy_${v}_linux_arm64.deb ${CADDY_PACKAGE_SHA256_ARM64} ${caddy}/caddy_${v}_linux_arm64.deb"
+	echo "caddy v${v} caddy_${v}_linux_armv7.deb ${CADDY_PACKAGE_SHA256_ARMV7} ${caddy}/caddy_${v}_linux_armv7.deb"
+	echo "caddy v${v} caddy_${v}_linux_armv6.deb ${CADDY_PACKAGE_SHA256_ARMV6} ${caddy}/caddy_${v}_linux_armv6.deb"
+	echo "workerd ${WORKERD_VERSION} workerd-linux-64.gz ${WORKERD_SHA256_LINUX_64} ${workerd}/workerd-linux-64.gz"
+	echo "workerd ${WORKERD_VERSION} workerd-linux-arm64.gz ${WORKERD_SHA256_LINUX_ARM64} ${workerd}/workerd-linux-arm64.gz"
+	v="$FIRECRACKER_VERSION"
+	echo "firecracker ${v} firecracker-${v}-x86_64.tgz ${FIRECRACKER_SHA256_X86_64} ${fc}/firecracker-${v}-x86_64.tgz"
+	echo "firecracker ${v} firecracker-${v}-aarch64.tgz ${FIRECRACKER_SHA256_AARCH64} ${fc}/firecracker-${v}-aarch64.tgz"
+	echo "firecracker ${v} firecracker-${v}-x86_64 ${FIRECRACKER_BIN_SHA256_X86_64} tar:firecracker-${v}-x86_64.tgz:release-${v}-x86_64/firecracker-${v}-x86_64"
+	echo "firecracker ${v} jailer-${v}-x86_64 ${JAILER_BIN_SHA256_X86_64} tar:firecracker-${v}-x86_64.tgz:release-${v}-x86_64/jailer-${v}-x86_64"
+	echo "firecracker ${v} firecracker-${v}-aarch64 ${FIRECRACKER_BIN_SHA256_AARCH64} tar:firecracker-${v}-aarch64.tgz:release-${v}-aarch64/firecracker-${v}-aarch64"
+	echo "firecracker ${v} jailer-${v}-aarch64 ${JAILER_BIN_SHA256_AARCH64} tar:firecracker-${v}-aarch64.tgz:release-${v}-aarch64/jailer-${v}-aarch64"
+	v="$CNI_PLUGINS_VERSION"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz ${CNI_PLUGINS_SHA256_AMD64} ${cni}/cni-plugins-linux-amd64-${v}.tgz"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz ${CNI_PLUGINS_SHA256_ARM64} ${cni}/cni-plugins-linux-arm64-${v}.tgz"
+	v="$BUILDKIT_VERSION"
+	echo "buildkit ${v} buildkit-${v}.linux-amd64.tar.gz ${BUILDKIT_SHA256_AMD64} ${buildkit}/buildkit-${v}.linux-amd64.tar.gz"
+	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
+	# Upstream's own checksum files, kept beside the files on the mirror for
+	# anyone checking by hand. install.sh does not read them, so their
+	# hashes need bumping only when CADDY_VERSION,
+	# CNI_PLUGINS_VERSION or FIRECRACKER_VERSION changes (and then these lines
+	# must change anyway). The Terraform bootstrap does read the Firecracker
+	# ones: with download_mirror set it fetches the tarball and its
+	# .sha256.txt from the mirror when GitHub fails, and checks one against
+	# the other.
+	v="$FIRECRACKER_VERSION"
+	echo "firecracker ${v} firecracker-${v}-x86_64.tgz.sha256.txt 3405b4dffd6afdbd99824de84c1eabbcc71030a3166ce1f3255b08cf61e874cc ${fc}/firecracker-${v}-x86_64.tgz.sha256.txt"
+	echo "firecracker ${v} firecracker-${v}-aarch64.tgz.sha256.txt 6215cbde7ae9981d20fafec8d3939c0b8da8d7c9055d48bd963d03199fcd7279 ${fc}/firecracker-${v}-aarch64.tgz.sha256.txt"
+	v="$CADDY_VERSION"
+	echo "caddy v${v} caddy_${v}_checksums.txt e4e1e43b78299733b19b8aeab8abebcf57aef4f5dae617be125016f9e4e0299f ${caddy}/caddy_${v}_checksums.txt"
+	v="$CNI_PLUGINS_VERSION"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha256 059bc7641eb3e6b5b5086d675e3a1db25a003262c6b9ee0587affcee6abf1320 ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-amd64-${v}.tgz.sha512 b059f6ab13e3109356492cd07c43734f96c331e0508c108ae1bf946ffe7f5ecc ${cni}/cni-plugins-linux-amd64-${v}.tgz.sha512"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha256 641b0eb7769e98671922f91868892f4a63abe03782c6a872a420efb4b6054377 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha256"
+	echo "cni-plugins ${v} cni-plugins-linux-arm64-${v}.tgz.sha512 16750ad60f2136ad2f097035e5f32f75e1f3f1b5ef4c73dd233e12b6937d04c6 ${cni}/cni-plugins-linux-arm64-${v}.tgz.sha512"
+}
+# --- END DOWNLOAD PINS --------------------------------------------------------
+# --config-only re-renders an installed node's configuration and touches
+# nothing else (apply_config_only); `sandboxd host apply` runs it.
+CONFIG_ONLY="false"
+# The upgrader hand-off (plans/kubectl-style-cluster-ops.md eng D7). When the
+# installed sandboxd has `sandboxd upgrade node`, a re-run downloads and
+# checks the files as before, puts them in HANDOFF_DIR instead of over the
+# installed ones, and hands them to the upgrader, so every binary swap keeps
+# the *.prev copies, the database backup and running VMs, and is put back if
+# the new set does not come up. A first install, and a node whose sandboxd
+# predates the command, install the files directly as before.
+RELEASE_JSON_URL=""
+UPGRADER_HANDOFF="false"
+HANDOFF_DIR=""
+HANDOFF_VERSION=""
+HANDOFF_UPGRADED="false"
 
 usage() {
 	cat <<'EOF'
@@ -179,6 +380,16 @@ Options:
                                certmagic-s3. Defaults to the matching GitHub
                                release asset when available, then falls back to
                                Caddy's build service.
+  --download-mirror <url|off>  Where a download goes next when its own source
+                               (GitHub, for most files) fails: release files
+                               from <url>/aerolvm/<tag>/, pinned third-party
+                               files from <url>/deps/. Every file is still
+                               checked: release files against the release's
+                               checksums.txt, third-party files against the
+                               SHA-256 pinned in this script. Must be https.
+                               "off" or "" turns the mirror off. Default:
+                               https://aerolvm-downloads.s3.us-east-1.amazonaws.com
+                               or $AEROL_DOWNLOAD_MIRROR when that is set.
   --install-prefix <dir>       Binary install directory (default: /usr/local/bin)
   --idle-timeout-min <minutes> Idle auto-stop timeout in minutes
   --build-from-source          Build binaries from the current checkout
@@ -224,9 +435,13 @@ Options:
   --with-containerd-engine     Opt into SB_CONTAINER_ENGINE=containerd
                                (dark default remains docker). Installs CNI
                                bridge + host-local plugins under /opt/cni/bin
-                               and writes SB_CONTAINER_ENGINE=containerd into
+                               and BuildKit (buildkitd, buildctl and
+                               buildkit.service) for image builds, and writes
+                               SB_CONTAINER_ENGINE=containerd into
                                sandboxd.env. Requires a system containerd
                                socket (usually /run/containerd/containerd.sock).
+                               Server install only: refused with --local and
+                               --cli-only.
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
                                Skips the download step and registers this
                                binary instead. Only consulted with
@@ -234,7 +449,11 @@ Options:
   --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
                                writes (static routes + sandboxd route
                                responder; configures systemd-resolved for
-                               *.rt.internal). Off by default.
+                               *.rt.internal). On by default with --domain;
+                               it does not apply without one.
+  --no-ingress-proxy-routing   Keep a --domain install on per-sandbox Caddy
+                               routes (every expose and destroy reloads
+                               Caddy). Writes SB_INGRESS_PROXY_ROUTING=false.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -324,6 +543,13 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --config-only                Re-render this node's configuration (env files,
+                               Caddyfile, systemd units) from node.json and the
+                               secrets saved in the env files. Downloads
+                               nothing, replaces no binary, installs no package
+                               and starts or restarts no service; it only runs
+                               systemctl daemon-reload. Restart sandboxd to use
+                               the new settings. `sandboxd host apply` runs it.
   --no-start                   Install and enable everything but leave sandboxd
                                stopped, for a node cluster-join.sh will start
                                once it has the cluster's config and server key.
@@ -372,7 +598,33 @@ Options:
                                every server option.
   --cli-url <url>              Download URL for the aerolvm binary
                                (--cli-only).
+  --print-join-version         With join: print the version the cluster asks
+                               new nodes to install, and stop.
   --help                       Show this help
+
+Starting or joining a cluster (one line per machine):
+  install.sh [options] init [sandboxd init options]
+  install.sh [options] join <url> --token <id.secret> [--ca-cert-hash sha256:<hex>] [--node-id <id>]
+  Installs this host (sandboxd is left for the command to start), then runs
+  `sandboxd init` or `sandboxd join` with everything after the word. For
+  join, the installer first asks the cluster which version to install
+  (checked with the token), unless --version or --sandboxd-url says. Get a
+  join line from `aerolvm join-command`; install options go before the word.
+
+Re-running (Linux):
+  Each run saves every option except secrets and download choices to
+  /etc/sandboxd/node.json (root only). Secrets stay in the env files, and
+  a re-run reads them back, so it keeps the PAT. A re-run with no options
+  installs the latest release onto the same settings and restarts sandboxd
+  when its binary or settings changed. Options you pass win over saved
+  ones. To turn a saved switch such as --with-gvisor off, set it to false
+  in node.json.
+
+  When the installed sandboxd has `sandboxd upgrade node`, a re-run hands
+  the downloaded and checked binaries to it instead of copying them over
+  the installed ones: the swap keeps the old files as *.prev and a backup
+  of the database, keeps Firecracker VMs running, and puts the old files
+  back if the new sandboxd does not come up.
 
 Examples:
 	curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
@@ -446,13 +698,17 @@ resolve_release_urls() {
 		CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
 		CADDY_BINARY_URL="${CADDY_BINARY_URL:-${release_base}/download/${VERSION}/caddy_${platform}}"
 	fi
+	# release.json sits beside the binaries in every release since it was
+	# added; for an explicit --sandboxd-url it is looked for in the same
+	# place. Only the upgrader hand-off reads it.
+	RELEASE_JSON_URL="${RELEASE_JSON_URL:-${SANDBOXD_URL%/*}/release.json}"
 }
 
 download_asset() {
 	local url="$1"
 	local output="$2"
 
-	curl_download "$url" -o "$output"
+	fetch_with_fallback "$output" "$(release_mirror_path "$url")" "$url"
 }
 
 curl_download() {
@@ -472,6 +728,166 @@ curl_download() {
 		"$url" "$@"
 }
 
+# fetch_with_fallback [--sha256 <hex>] <dest> <mirror-path> <primary-url> [vendor-url...]
+#
+# Downloads one file to <dest>, trying its sources in order: <primary-url>
+# (the file's origin, usually GitHub), then the download mirror at
+# $DOWNLOAD_MIRROR/<mirror-path>, then each vendor URL. An empty mirror path,
+# or the mirror turned off, skips the mirror.
+#
+# Every source but the last gets two quick retries, so a 504 moves on to the
+# next source in seconds, not after curl_download's 15 minutes. The last
+# source keeps curl_download's patient retries: there is nothing left to
+# move on to, so waiting out a blip costs nothing.
+#
+# With --sha256 the file must have that SHA-256, whichever source served it.
+# A mismatch fails at once, without trying the next source: either the pin
+# is wrong or a source serves a different file, and a person must look.
+fetch_with_fallback() {
+	local want=""
+	if [[ "${1:-}" == "--sha256" ]]; then
+		want="$2"
+		shift 2
+	fi
+	local dest="$1" mirror_path="$2"
+	shift 2
+	local sources=("$1")
+	shift
+	if [[ -n "$mirror_path" ]] && download_mirror_on; then
+		sources+=("mirror:${mirror_path}")
+	fi
+	sources+=("$@")
+
+	local i url got mode last=$((${#sources[@]} - 1)) tried=()
+	for i in "${!sources[@]}"; do
+		url="${sources[$i]}"
+		if [[ "$url" == mirror:* ]]; then
+			if ! mirror_url_for "${url#mirror:}"; then
+				tried+=("the mirror (${DOWNLOAD_MIRROR}): no latest release named there")
+				continue
+			fi
+			url="$MIRROR_URL"
+		fi
+		mode="quick"
+		((i < last)) || mode="patient"
+		rm -f "$dest"
+		if ! fetch_source "$url" "$dest" "$mode"; then
+			tried+=("$url")
+			if ((i < last)); then
+				echo "Download failed: ${url}; trying the next source" >&2
+			fi
+			continue
+		fi
+		if [[ -n "$want" ]]; then
+			got="$(sha256_of "$dest")"
+			if [[ "$got" != "$want" ]]; then
+				rm -f "$dest"
+				echo "checksum verification failed for ${dest##*/}: got ${got}, pinned ${want} (served by ${url}); refusing it" >&2
+				return 1
+			fi
+		fi
+		if ((i > 0)); then
+			echo "Downloaded ${dest##*/} from ${url}"
+		fi
+		return 0
+	done
+	echo "Failed to download ${dest##*/} from every source:" >&2
+	local t
+	for t in "${tried[@]}"; do
+		echo "  ${t}" >&2
+	done
+	return 1
+}
+
+# fetch_source downloads one URL to dest ("-" for stdout). "quick" overrides
+# curl_download's retry settings for this one call (bash locals are visible
+# to the functions they call); "patient" keeps them.
+fetch_source() {
+	local url="$1" dest="$2" mode="$3"
+	if [[ "$mode" == "quick" ]]; then
+		local DOWNLOAD_RETRY=2 DOWNLOAD_RETRY_DELAY=2 DOWNLOAD_RETRY_MAX_TIME=30
+	fi
+	curl_download "$url" -o "$dest"
+}
+
+download_mirror_on() {
+	[[ -n "${DOWNLOAD_MIRROR:-}" && "${DOWNLOAD_MIRROR:-}" != "off" ]]
+}
+
+# mirror_url_for sets MIRROR_URL to the mirror's URL for a mirror path. A path
+# under aerolvm/latest/ names a file of the latest release, which the mirror
+# records in aerolvm/latest.txt; that is read once, and fails when the
+# mirror has none. A global rather than printed output, so that one read
+# serves every later file instead of being lost in a $(...) subshell.
+mirror_url_for() {
+	local path="$1" base="${DOWNLOAD_MIRROR%/}"
+	MIRROR_URL=""
+	download_mirror_on || return 1
+	if [[ "$path" == aerolvm/latest/* ]]; then
+		if [[ -z "${MIRROR_LATEST_TAG:-}" ]]; then
+			local tag
+			tag="$(fetch_source "${base}/aerolvm/latest.txt" - quick 2>/dev/null)" || tag=""
+			tag="${tag//[[:space:]]/}"
+			if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+				MIRROR_LATEST_TAG="$tag"
+			else
+				MIRROR_LATEST_TAG="none"
+			fi
+		fi
+		[[ "$MIRROR_LATEST_TAG" != "none" ]] || return 1
+		path="aerolvm/${MIRROR_LATEST_TAG}/${path#aerolvm/latest/}"
+	fi
+	MIRROR_URL="${base}/${path}"
+}
+
+# release_mirror_path prints where the mirror keeps a file of an AerolVM
+# GitHub release URL: aerolvm/<tag>/<file>, or aerolvm/latest/<file> for a
+# releases/latest URL. For any other URL (a fork's release, a presigned
+# bucket URL, an operator's own server) it prints nothing, and that download
+# has no mirror. The mirror holds aerol-ai/microvm's releases only.
+release_mirror_path() {
+	local re='^https://github\.com/aerol-ai/microvm/releases/(download/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)|latest/download)/([A-Za-z0-9._-]+)$'
+	[[ "$1" =~ $re ]] || return 0
+	if [[ -n "${BASH_REMATCH[2]}" ]]; then
+		echo "aerolvm/${BASH_REMATCH[2]}/${BASH_REMATCH[4]}"
+	else
+		echo "aerolvm/latest/${BASH_REMATCH[4]}"
+	fi
+}
+
+# fetch_pinned <dest> <project> <file> [vendor-url...] downloads a file
+# listed in download_pins: from its origin, then the mirror's copy at
+# deps/<project>/<version>/<file>, then the vendor URLs, and refuses it
+# unless it has the pinned SHA-256.
+fetch_pinned() {
+	local dest="$1" project="$2" file="$3"
+	shift 3
+	local p v f sha origin row=""
+	while read -r p v f sha origin; do
+		if [[ "$p" == "$project" && "$f" == "$file" ]]; then
+			row="${v} ${sha} ${origin}"
+			break
+		fi
+	done < <(download_pins)
+	if [[ -z "$row" ]]; then
+		echo "install.sh: no pinned download for ${project} ${file}" >&2
+		return 1
+	fi
+	read -r v sha origin <<<"$row"
+	fetch_with_fallback --sha256 "$sha" "$dest" "deps/${project}/${v}/${file}" "$origin" "$@"
+}
+
+# sha256_of prints a file's SHA-256. macOS before 14 has no sha256sum.
+sha256_of() {
+	local out
+	if command -v sha256sum >/dev/null 2>&1; then
+		out="$(sha256sum "$1")"
+	else
+		out="$(shasum -a 256 "$1")"
+	fi
+	echo "${out%% *}"
+}
+
 verify_downloads() {
 	local tmp_dir="$1"
 	shift
@@ -486,7 +902,7 @@ verify_downloads() {
 		return 1
 	fi
 
-	(
+	if ! (
 		cd "$tmp_dir"
 		: > selected-checksums.txt
 		local asset
@@ -499,7 +915,14 @@ verify_downloads() {
 			cat "checksum-${asset}.txt" >> selected-checksums.txt
 		done
 		sha256_check selected-checksums.txt
-	)
+	); then
+		# With --version latest, a GitHub that fails part way through can
+		# leave some files from GitHub's latest release and some from the
+		# mirror's, which may be one release behind.
+		echo "Release files do not match checksums.txt; refusing to install them." >&2
+		echo "If some downloads fell back to the mirror, run the installer again, or pin one release with --version <tag>." >&2
+		return 1
+	fi
 }
 
 # sha256_check verifies a checksum file. macOS before 14 has no sha256sum,
@@ -510,6 +933,336 @@ sha256_check() {
 	else
 		shasum -a 256 -c "$1"
 	fi
+}
+
+# resolve_ingress_proxy_routing settles the routing flag once the flags are
+# parsed. An explicit --ingress-proxy-routing or --no-ingress-proxy-routing
+# wins. Otherwise it is on for a --domain install, the only kind it applies
+# to: sandboxd routes names under the domain with static Caddy routes and
+# its own responder, so an expose or destroy no longer reloads Caddy and
+# drops new connections (plans/ingress-proxy-routing.md §1). Without a domain, or
+# with --local (no Caddy), it is off: sandboxd would skip it anyway, and the
+# resolver link would be set up for nothing.
+resolve_ingress_proxy_routing() {
+	if [[ -n "$INGRESS_PROXY_ROUTING" ]]; then
+		return
+	fi
+	INGRESS_PROXY_ROUTING_AUTO="true"
+	if [[ -n "$DOMAIN" && "$LOCAL_MODE" != "true" ]]; then
+		INGRESS_PROXY_ROUTING="true"
+	else
+		INGRESS_PROXY_ROUTING="false"
+	fi
+}
+
+# NODE_SETTINGS lists every setting node.json keeps, as VARIABLE:--flag:type.
+# A setting's key in node.json is its flag without the dashes, with "_" for
+# "-", so a saved file maps back to flags one to one. Left out on purpose:
+#   - secrets (--pat-token, --dns-api-token, the --caddy-storage-s3-*-key
+#     flags, --secret-provider-env): node.json is not where secrets live;
+#     load_saved_node_settings reads them back from the env files;
+#   - what one run fetches or does (--version, the --*-url flags,
+#     --build-from-source, --no-start, --cli-only, --config-only): a re-run
+#     with no flags installs the latest release, which is how a node is
+#     upgraded, and --no-start is only for a joiner's first install.
+# Types: string; bool, a switch saved as true or false; auto, a switch whose
+# default depends on other settings, saved as true or false only when a flag
+# gave it and as "auto" otherwise, so a re-run derives it again. A --no-<flag>
+# given now wins over a saved bool or auto setting, like <flag> itself.
+NODE_SETTINGS=(
+	DOMAIN:--domain:string
+	PUBLIC_HOST:--public-host:string
+	NODE_NAME:--node-name:string
+	GITHUB_REPO:--github-repo:string
+	INSTALL_PREFIX:--install-prefix:string
+	IDLE_TIMEOUT_MIN:--idle-timeout-min:string
+	DNS_PROVIDER:--dns-provider:string
+	ACME_EMAIL:--acme-email:string
+	ACME_CA:--acme-ca:string
+	ACME_CA_ROOT:--acme-ca-root:string
+	TLS_ISSUER:--tls-issuer:string
+	LOCAL_MODE:--local:bool
+	INGRESS_PROXY_ROUTING:--ingress-proxy-routing:auto
+	WITH_GVISOR:--with-gvisor:bool
+	RUNSC_PATH:--runsc-path:string
+	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
+	WITH_ISOLATE:--with-isolate:bool
+	WORKERD_PATH:--workerd-path:string
+	WITH_FIRECRACKER:--with-firecracker:bool
+	WITH_NVIDIA_GPU:--with-nvidia-gpu:bool
+	WITH_AMD_GPU:--with-amd-gpu:bool
+	CADDY_STORAGE_S3:--caddy-storage-s3:bool
+	CADDY_STORAGE_S3_BUCKET:--caddy-storage-s3-bucket:string
+	CADDY_STORAGE_S3_REGION:--caddy-storage-s3-region:string
+	CADDY_STORAGE_S3_ENDPOINT:--caddy-storage-s3-endpoint:string
+	CADDY_STORAGE_S3_PREFIX:--caddy-storage-s3-prefix:string
+	PAT_SCOPE:--pat-scope:string
+	L4_PROXY_PROTOCOL:--l4-proxy-protocol:bool
+	LB_HEALTH_PORT:--lb-health-port:string
+	KEY_CUSTODY:--key-custody:string
+)
+
+# flag_given reports whether this run was given flag $1 on its command line.
+flag_given() {
+	[[ "$GIVEN_FLAGS" == *" $1 "* ]]
+}
+
+# env_file_value prints KEY's value from an env file install.sh wrote
+# (KEY=value lines; the value may hold "="), or nothing.
+env_file_value() {
+	[[ -r "$1" ]] || return 0
+	awk -F= -v key="$2" '$1 == key { value = substr($0, length($1) + 2); found = 1 } END { if (found) print value }' "$1"
+}
+
+# detect_public_host prints this machine's first address, the default
+# public host. macOS hostname has no -I; under pipefail the failed pipeline
+# would exit the script silently, so it falls through to 127.0.0.1.
+detect_public_host() {
+	local host
+	host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+	echo "${host:-127.0.0.1}"
+}
+
+# json_string prints $1 as a JSON string. sed, not ${v//...}: how bash
+# treats a backslash in a replacement changed in 5.2. A control character
+# would need an escape the reader does not take, and it would break the env
+# files anyway, so it fails the run.
+json_string() {
+	if [[ "$1" == *[[:cntrl:]]* ]]; then
+		echo "Cannot save $2: its value holds a control character" >&2
+		exit 1
+	fi
+	printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+# json_unescape undoes json_string, one character at a time so an escaped
+# backslash is never read as the start of the next escape.
+json_unescape() {
+	local in="$1" out="" c i
+	for ((i = 0; i < ${#in}; i++)); do
+		c="${in:i:1}"
+		if [[ "$c" == '\' ]]; then
+			i=$((i + 1))
+			c="${in:i:1}"
+			case "$c" in
+			'"' | '\' | '/') ;;
+			*)
+				echo "$NODE_SETTINGS_FILE: unsupported escape \\$c; keep values free of control characters" >&2
+				return 1
+				;;
+			esac
+		fi
+		out+="$c"
+	done
+	printf '%s' "$out"
+}
+
+# saved_setting stores one saved value as NODE_JSON_<key>.
+saved_setting() {
+	printf -v "NODE_JSON_$1" '%s' "$2"
+}
+
+# read_node_settings loads node.json into NODE_JSON_<key>. It takes the
+# shape write_node_settings writes (and jq prints): one "key": value per
+# line. Anything else fails the run, so a broken hand edit never silently
+# drops a setting.
+read_node_settings() {
+	local line n=0 value
+	local brace='^[[:space:]]*[{}]?[[:space:]]*$'
+	local re='^[[:space:]]*"([a-z0-9_]+)"[[:space:]]*:[[:space:]]*("(([^"\\]|\\.)*)"|true|false|[0-9]+)[[:space:]]*,?[[:space:]]*$'
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		n=$((n + 1))
+		[[ "$line" =~ $brace ]] && continue
+		if [[ ! "$line" =~ $re ]]; then
+			echo "$NODE_SETTINGS_FILE line $n is not one \"key\": value setting. Fix it, or delete the file to read the settings back from $SANDBOXD_ENV_FILE." >&2
+			exit 1
+		fi
+		value="${BASH_REMATCH[2]}"
+		if [[ "$value" == \"* ]]; then
+			value="$(json_unescape "${BASH_REMATCH[3]}")" || exit 1
+		fi
+		saved_setting "${BASH_REMATCH[1]}" "$value"
+	done <"$NODE_SETTINGS_FILE"
+	if [[ "${NODE_JSON_format:-}" != "1" ]]; then
+		echo "$NODE_SETTINGS_FILE has format '${NODE_JSON_format:-}'; this install.sh reads format 1. Use the install.sh of the release that wrote it." >&2
+		exit 1
+	fi
+}
+
+# migrate_node_settings recovers the non-secret settings of a node installed
+# before node.json existed, from the files those installs wrote: sandboxd.env
+# and, in domain mode, /etc/default/caddy and the Caddyfile. A setting none
+# of them records (--runsc-path, the GPU flags) stays at its default; those
+# only install extra software, which a re-run leaves in place.
+migrate_node_settings() {
+	local env="$SANDBOXD_ENV_FILE" v
+	echo "No $NODE_SETTINGS_FILE yet: reading this node's settings back from $env"
+	saved_setting format 1
+	saved_setting node_name "$(env_file_value "$env" SB_NODE_NAME)"
+	saved_setting idle_timeout_min "$(env_file_value "$env" SB_IDLE_TIMEOUT_MIN)"
+	v="$(env_file_value "$env" SB_TOOLBOX_BINARY_PATH)"
+	[[ -n "$v" ]] && saved_setting install_prefix "$(dirname "$v")"
+	# Only a --local install binds the API to loopback, and it writes none
+	# of the settings below.
+	if [[ "$(env_file_value "$env" SB_API_HOST)" == "127.0.0.1" ]]; then
+		saved_setting local true
+		return 0
+	fi
+	saved_setting domain "$(env_file_value "$env" SB_DOMAIN)"
+	v="$(env_file_value "$env" SB_PUBLIC_HOST)"
+	[[ "$v" == "$(detect_public_host)" ]] || saved_setting public_host "$v"
+	saved_setting acme_ca "$(env_file_value "$env" SB_TLS_ACME_CA)"
+	saved_setting acme_ca_root "$(env_file_value "$env" SB_TLS_ACME_CA_ROOT)"
+	saved_setting tls_issuer "$(env_file_value "$env" SB_TLS_ISSUER)"
+	saved_setting pat_scope "$(env_file_value "$env" SB_PAT_SCOPE)"
+	[[ "$(env_file_value "$env" SB_INGRESS_PROXY_ROUTING)" == "true" ]] && saved_setting ingress_proxy_routing true
+	[[ "$(env_file_value "$env" SB_L4_FALLBACK_PROXY_PROTOCOL)" == "true" ]] && saved_setting l4_proxy_protocol true
+	[[ ",$(env_file_value "$env" SB_HOST_RUNTIMES)," == *,gvisor,* ]] && saved_setting with_gvisor true
+	[[ "$(env_file_value "$env" SB_ENABLE_FIRECRACKER)" == "true" ]] && saved_setting with_firecracker true
+	[[ "$(env_file_value "$env" SB_ENABLE_ISOLATE)" == "true" ]] && saved_setting with_isolate true
+	saved_setting workerd_path "$(env_file_value "$env" SB_ISOLATE_WORKERD_PATH)"
+	[[ "$(env_file_value "$env" SB_CONTAINER_ENGINE)" == "containerd" ]] && saved_setting with_containerd_engine true
+	[[ "$(env_file_value "$env" SB_CREDENTIAL_KEY_CUSTODY)" == "wrapped" ]] && saved_setting key_custody wrapped
+	# Cloudflare is the only DNS provider install.sh supports, and it writes
+	# the provider's token to /etc/default/caddy only when one is set.
+	[[ -n "$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)" ]] && saved_setting dns_provider cloudflare
+	v="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_BUCKET)"
+	if [[ -n "$v" ]]; then
+		saved_setting caddy_storage_s3 true
+		saved_setting caddy_storage_s3_bucket "$v"
+		saved_setting caddy_storage_s3_region "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_REGION)"
+		saved_setting caddy_storage_s3_endpoint "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENDPOINT)"
+		saved_setting caddy_storage_s3_prefix "$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_PREFIX)"
+	fi
+	if [[ -r "$CADDYFILE_PATH" ]]; then
+		saved_setting acme_email "$(awk '/^\temail / { sub(/^\temail /, ""); print; exit }' "$CADDYFILE_PATH")"
+		# Dropping this listener would take the node out of its load
+		# balancer, so it is recovered too.
+		saved_setting lb_health_port "$(sed -n 's/^http:\/\/:\([0-9][0-9]*\) {$/\1/p' "$CADDYFILE_PATH" | head -n1)"
+	fi
+	return 0
+}
+
+# load_saved_node_settings applies the saved settings this run was not
+# given a flag for, then reads back the secrets it was not given. macOS
+# --local keeps its token in the LaunchAgent (reuse_darwin_pat_token) and has
+# no /etc/sandboxd, so this is Linux only.
+load_saved_node_settings() {
+	[[ "$(uname -s)" == "Darwin" ]] && return 0
+	if [[ -f "$NODE_SETTINGS_FILE" ]]; then
+		if [[ ! -r "$NODE_SETTINGS_FILE" ]]; then
+			echo "Cannot read $NODE_SETTINGS_FILE: run install.sh as root" >&2
+			exit 1
+		fi
+		echo "Using the settings saved in $NODE_SETTINGS_FILE; flags given now win over them"
+		read_node_settings
+	elif [[ -f "$SANDBOXD_ENV_FILE" ]]; then
+		migrate_node_settings
+	fi
+	local entry var flag kind key name value
+	for entry in "${NODE_SETTINGS[@]}"; do
+		IFS=: read -r var flag kind <<<"$entry"
+		key="${flag#--}"
+		key="${key//-/_}"
+		name="NODE_JSON_$key"
+		value="${!name-}"
+		# Empty means "the default": every setting with a non-empty default
+		# is always saved with its value.
+		[[ -n "$value" ]] || continue
+		flag_given "$flag" && continue
+		[[ "$kind" != string ]] && flag_given "--no-${flag#--}" && continue
+		[[ "$kind" == auto && "$value" == auto ]] && continue
+		if [[ "$kind" != string && "$value" != true && "$value" != false ]]; then
+			if [[ "$kind" == auto ]]; then
+				echo "$NODE_SETTINGS_FILE: $key must be true, false or auto, got '$value'" >&2
+			else
+				echo "$NODE_SETTINGS_FILE: $key must be true or false, got '$value'" >&2
+			fi
+			exit 1
+		fi
+		printf -v "$var" '%s' "$value"
+	done
+
+	# Secrets. A re-run must never make a new PAT while one exists: every
+	# client, and every peer in a cluster, holds the old one.
+	if ! flag_given --pat-token; then
+		value="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PAT_TOKEN)"
+		[[ -n "$value" ]] && PAT_TOKEN="$value"
+	fi
+	if [[ -n "$DNS_PROVIDER" ]] && ! flag_given --dns-api-token; then
+		DNS_API_TOKEN="$(env_file_value "$CADDY_ENV_FILE" SB_DNS_API_TOKEN)"
+	fi
+	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
+		flag_given --caddy-storage-s3-access-key || CADDY_STORAGE_S3_ACCESS_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ACCESS_KEY)"
+		flag_given --caddy-storage-s3-secret-key || CADDY_STORAGE_S3_SECRET_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_SECRET_KEY)"
+		flag_given --caddy-storage-s3-encryption-key || CADDY_STORAGE_S3_ENCRYPTION_KEY="$(env_file_value "$CADDY_ENV_FILE" SB_CADDY_S3_ENCRYPTION_KEY)"
+	fi
+	if [[ "$KEY_CUSTODY" == "wrapped" ]] && ! flag_given --secret-provider-env && [[ -r "$SANDBOXD_ENV_FILE" ]]; then
+		SAVED_SECRET_PROVIDER_LINES="$(grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SANDBOXD_ENV_FILE" || true)"
+	fi
+	return 0
+}
+
+# secret_provider_lines prints the key-store settings write_environment
+# appends for --key-custody wrapped: from --secret-provider-env when given,
+# else the lines read back from the existing sandboxd.env.
+secret_provider_lines() {
+	if [[ -n "$SECRET_PROVIDER_ENV" ]]; then
+		grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV" || true
+	elif [[ -n "$SAVED_SECRET_PROVIDER_LINES" ]]; then
+		printf '%s\n' "$SAVED_SECRET_PROVIDER_LINES"
+	fi
+}
+
+# node_setting_answer prints what node.json keeps for a setting: the answer,
+# not what install.sh derived from it. A detected address or the default S3
+# endpoint is left empty, so the next run derives it afresh.
+node_setting_answer() {
+	case "$1" in
+	PUBLIC_HOST)
+		[[ "$PUBLIC_HOST_DETECTED" == "true" ]] && return 0
+		;;
+	CADDY_STORAGE_S3_ENDPOINT)
+		[[ "$CADDY_STORAGE_S3_ENDPOINT" == "s3.${CADDY_STORAGE_S3_REGION}.amazonaws.com" ]] && return 0
+		;;
+	INGRESS_PROXY_ROUTING)
+		[[ "$INGRESS_PROXY_ROUTING_AUTO" == "true" ]] && return 0
+		;;
+	esac
+	printf '%s' "${!1}"
+}
+
+# write_node_settings saves this run's settings to node.json, mode 0600 (it
+# names the key store and buckets the node uses). It is replaced in one
+# rename, so a run that dies mid-write leaves the old file.
+write_node_settings() {
+	local dir entry var flag kind key value tmp
+	dir="$(dirname "$NODE_SETTINGS_FILE")"
+	mkdir -p "$dir"
+	tmp="$(mktemp "$dir/.node.json.XXXXXX")"
+	{
+		printf '{\n  "format": 1'
+		for entry in "${NODE_SETTINGS[@]}"; do
+			IFS=: read -r var flag kind <<<"$entry"
+			key="${flag#--}"
+			key="${key//-/_}"
+			value="$(node_setting_answer "$var")"
+			if [[ "$kind" == bool ]]; then
+				[[ "$value" == "true" ]] || value="false"
+			elif [[ "$kind" == auto ]]; then
+				[[ "$value" == "true" || "$value" == "false" ]] || value='"auto"'
+			else
+				value="$(json_string "$value" "$flag")" || {
+					rm -f "$tmp"
+					exit 1
+				}
+			fi
+			printf ',\n  "%s": %s' "$key" "$value"
+		done
+		printf '\n}\n'
+	} >"$tmp"
+	chmod 0600 "$tmp"
+	mv -f "$tmp" "$NODE_SETTINGS_FILE"
 }
 
 # install_cli installs the aerolvm agent CLI alone
@@ -577,7 +1330,137 @@ install_cli() {
 	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 
+# join_cluster_version asks the join server which build a new node installs
+# (plans/kubectl-style-cluster-ops.md §6.5): GET /v1/join/cluster-info.
+# TLS is not checked yet; the answer is, with a key only the token derives
+# (HKDF, then HMAC over the CA and over the version and join URLs), so a man
+# in the middle can't pick the build. Prints the version; fails with a
+# message on any refusal. Without python3 it prints nothing and warns.
+join_cluster_version() {
+	if ! command -v python3 >/dev/null 2>&1; then
+		echo "python3 not found: installing $VERSION without asking the cluster which version it runs" >&2
+		return 0
+	fi
+	python3 - "$1" "$2" <<'PY'
+import base64, hashlib, hmac, json, re, ssl, sys, urllib.error, urllib.parse, urllib.request
+url, token = sys.argv[1].strip(), sys.argv[2].strip()
+m = re.fullmatch(r"([a-z0-9]{6})\.([a-z0-9]{32})", token)
+if not m:
+    sys.exit("the join token must look like <6 chars>.<32 chars>, lowercase letters and digits")
+tid, secret = m.group(1), m.group(2)
+if "://" not in url:
+    url = "https://" + url
+u = urllib.parse.urlsplit(url)
+if u.scheme != "https" or not u.hostname:
+    sys.exit("the join URL %s must be https://<server>:7003" % url)
+host = u.netloc if u.port else u.netloc + ":7003"
+ctx = ssl._create_unverified_context()  # trust comes from the MACs below
+try:
+    with urllib.request.urlopen("https://%s/v1/join/cluster-info?token_id=%s" % (host, tid), context=ctx, timeout=20) as r:
+        info = json.load(r)
+except urllib.error.HTTPError as e:
+    sys.exit("the join server refused the token (%d): %s; make a new one with: aerolvm join-command" % (e.code, e.read().decode(errors="replace").strip()))
+except Exception as e:
+    sys.exit("can't reach the join server %s: %s; open TCP 7003 to the servers" % (host, e))
+def mac(key, msg):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+key = mac(mac(("aerolvm-join:" + tid).encode(), secret.encode()), b"aerolvm join discovery v1\x01")
+ca = info.get("ca_cert") or ""
+signed = "\n".join(["aerolvm-cluster-info-v1", ca, info.get("cluster_id") or "", info.get("version") or "", ",".join(info.get("join_urls") or [])])
+try:
+    ok = hmac.compare_digest(mac(key, ca.encode()), base64.b64decode(info.get("mac") or "")) and \
+        hmac.compare_digest(mac(key, signed.encode()), base64.b64decode(info.get("info_mac") or ""))
+except Exception:
+    ok = False
+if not ok:
+    sys.exit("the join server could not prove it knows the token: a wrong token, or not this cluster")
+print(info.get("version") or "")
+PY
+}
+
+# resolve_join_version sets VERSION to the cluster's build for `join`,
+# unless the operator chose one (--version or --sandboxd-url).
+resolve_join_version() {
+	local url="" token="" arg prev=""
+	for arg in ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}; do
+		case "$arg" in
+			--token=*) token="${arg#--token=}"; prev=""; continue ;;
+			-*) ;;
+			*)
+				if [[ "$prev" == "--token" ]]; then
+					token="$arg"
+				elif [[ -z "$url" && "$prev" != -* ]]; then
+					url="$arg"
+				fi
+				;;
+		esac
+		prev="$arg"
+	done
+	if [[ -z "$url" || -z "$token" ]]; then
+		echo "join needs the join URL and a token: install.sh join https://<server>:7003 --token <id.secret> (aerolvm join-command prints the whole line)" >&2
+		exit 1
+	fi
+	if [[ "$PRINT_JOIN_VERSION" != "true" ]] && { [[ -n "$SANDBOXD_URL" ]] || flag_given --version; }; then
+		return 0
+	fi
+	local want
+	want="$(join_cluster_version "$url" "$token")" || exit 1
+	if [[ "$PRINT_JOIN_VERSION" == "true" ]]; then
+		echo "$want"
+		exit 0
+	fi
+	[[ -n "$want" ]] || return 0
+	if [[ ! "$want" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.-]+)?$ ]]; then
+		echo "the cluster runs $want, which is not a release this installer can download; pass --sandboxd-url, --toolboxd-url and --checksums-url for that build (before the word join)" >&2
+		exit 1
+	fi
+	VERSION="$want"
+	echo "The cluster runs $want; installing that version."
+}
+
+# check_node_command refuses init and join where they can't work, before
+# anything on the machine changes.
+check_node_command() {
+	if [[ "$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true" || "$CONFIG_ONLY" == "true" ]]; then
+		echo "$NODE_COMMAND sets up a cluster node; it does not work with --cli-only, --local or --config-only" >&2
+		exit 1
+	fi
+	if [[ "$NODE_COMMAND" == "join" ]]; then
+		resolve_join_version
+	fi
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "$NODE_COMMAND sets up a Linux cluster node; this is $(uname -s)" >&2
+		exit 1
+	fi
+	# sandboxd init and join start sandboxd once the cluster's config and
+	# keys are in place. Booted before that, as a lone node, it would make
+	# a server key of its own.
+	NO_START="true"
+}
+
+# run_node_command hands over to sandboxd init or join with the arguments
+# after the word. A release older than the command can't run it.
+run_node_command() {
+	local bin="$INSTALL_PREFIX/sandboxd"
+	if ! "$bin" version -o json 2>/dev/null | grep -q "\"$NODE_COMMAND\""; then
+		echo "the sandboxd installed here ($("$bin" version 2>/dev/null | head -n1)) has no 'sandboxd $NODE_COMMAND'; install a newer release" >&2
+		exit 1
+	fi
+	echo "Running sandboxd $NODE_COMMAND"
+	exec "$bin" "$NODE_COMMAND" ${NODE_COMMAND_ARGS[@]+"${NODE_COMMAND_ARGS[@]}"}
+}
+
 while [[ $# -gt 0 ]]; do
+	# init and join end the installer's options: everything after the word
+	# belongs to sandboxd, so it is never parsed here.
+	if [[ "$1" == "init" || "$1" == "join" ]]; then
+		NODE_COMMAND="$1"
+		shift
+		NODE_COMMAND_ARGS=("$@")
+		break
+	fi
+	# Every arm shifts its value away, so $1 here is always a flag.
+	GIVEN_FLAGS+="$1 "
 	case "$1" in
 		--domain)
 			DOMAIN="$2"
@@ -633,6 +1516,10 @@ while [[ $# -gt 0 ]]; do
 			BUILD_FROM_SOURCE="true"
 			shift
 			;;
+		--download-mirror)
+			DOWNLOAD_MIRROR="$2"
+			shift 2
+			;;
 		--dns-provider)
 			DNS_PROVIDER="$2"
 			shift 2
@@ -679,6 +1566,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--ingress-proxy-routing)
 			INGRESS_PROXY_ROUTING="true"
+			shift
+			;;
+		--no-ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="false"
 			shift
 			;;
 		--workerd-path)
@@ -761,9 +1652,17 @@ while [[ $# -gt 0 ]]; do
 			NO_START="true"
 			shift
 			;;
+		--config-only)
+			CONFIG_ONLY="true"
+			shift
+			;;
 		--secret-provider-env)
 			SECRET_PROVIDER_ENV="$2"
 			shift 2
+			;;
+		--print-join-version)
+			PRINT_JOIN_VERSION="true"
+			shift
 			;;
 		--help)
 			usage
@@ -777,6 +1676,37 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
+# Before any check, so saved settings are checked exactly like flags. A
+# --cli-only run installs no node and must not pick up a node's settings.
+if [[ "$CLI_ONLY" != "true" ]]; then
+	load_saved_node_settings
+fi
+
+if [[ "$PRINT_JOIN_VERSION" == "true" && "$NODE_COMMAND" != "join" ]]; then
+	echo "--print-join-version goes with join: install.sh --print-join-version join <url> --token <id.secret>" >&2
+	exit 1
+fi
+if [[ -n "$NODE_COMMAND" ]]; then
+	check_node_command
+fi
+
+# --config-only re-renders a node that exists: it never makes a PAT, and with
+# nothing saved there is nothing to re-render.
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ "$CLI_ONLY" == "true" || "$(uname -s)" != "Linux" ]]; then
+		echo "--config-only re-renders a Linux node's configuration; it does not work with --cli-only or on $(uname -s)" >&2
+		exit 1
+	fi
+	if [[ ! -f "$NODE_SETTINGS_FILE" && ! -f "$SANDBOXD_ENV_FILE" ]]; then
+		echo "--config-only re-renders an installed node, and this one has neither $NODE_SETTINGS_FILE nor $SANDBOXD_ENV_FILE. Run install.sh without it first." >&2
+		exit 1
+	fi
+	if [[ -z "$PAT_TOKEN" ]]; then
+		echo "--config-only found no SB_PAT_TOKEN in $SANDBOXD_ENV_FILE and never makes a new one: every client holds the old one. Pass --pat-token." >&2
+		exit 1
+	fi
+fi
+
 # Firecracker is a runtime for a server node: --cli-only installs no daemon,
 # and --local is the Docker-only developer install (macOS has no KVM at all).
 # Refused before either branch runs, so neither half-installs it.
@@ -784,11 +1714,30 @@ if [[ "$WITH_FIRECRACKER" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" =
 	echo "--with-firecracker sets up a server node; it does not work with --cli-only or --local" >&2
 	exit 1
 fi
+# The containerd engine is a server-node setting too: only the server path
+# writes SB_CONTAINER_ENGINE=containerd and installs the CNI plugins, so with
+# --local the flag used to be ignored and the node silently ran Docker.
+if [[ "$WITH_CONTAINERD_ENGINE" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
+	echo "--with-containerd-engine sets up a server node; it does not work with --cli-only or --local" >&2
+	exit 1
+fi
+# Release files from the mirror are checked against a checksums.txt from the
+# same mirror, so only TLS keeps a network attacker from swapping both.
+case "$DOWNLOAD_MIRROR" in
+	"" | off) ;;
+	https://*) DOWNLOAD_MIRROR="${DOWNLOAD_MIRROR%/}" ;;
+	*)
+		echo "--download-mirror (or AEROL_DOWNLOAD_MIRROR) must be an https:// URL, \"off\" or empty (got ${DOWNLOAD_MIRROR})" >&2
+		exit 1
+		;;
+esac
 
 if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+resolve_ingress_proxy_routing
 
 if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
 	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
@@ -802,12 +1751,15 @@ case "$KEY_CUSTODY" in
 			echo "--key-custody wrapped is not supported with --local" >&2
 			exit 1
 		fi
-		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+		# A re-run may leave --secret-provider-env out: the settings are then
+		# the ones the last run wrote to sandboxd.env.
+		if [[ -n "$SECRET_PROVIDER_ENV" && ! -f "$SECRET_PROVIDER_ENV" ]] ||
+			[[ -z "$SECRET_PROVIDER_ENV" && -z "$SAVED_SECRET_PROVIDER_LINES" ]]; then
 			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
 			exit 1
 		fi
-		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
-			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' <<<"$(secret_provider_lines)"; then
+			echo "${SECRET_PROVIDER_ENV:-$SANDBOXD_ENV_FILE} must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
 			exit 1
 		fi
 		;;
@@ -827,10 +1779,8 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	# macOS hostname has no -I; under pipefail the failed pipeline would
-	# exit the script silently, so fall through to the default instead.
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
+	PUBLIC_HOST="$(detect_public_host)"
+	PUBLIC_HOST_DETECTED="true"
 fi
 
 # Host path of the toolboxd binary bind-mounted into every sandbox.
@@ -1029,10 +1979,10 @@ drop_caddy_apt_source() {
 }
 
 # install_caddy_package installs the stock Caddy .deb from Caddy's GitHub
-# release, checked against the release's SHA-512 list. It is the same
-# package Cloudsmith served: its postinst creates the caddy user, and it
-# ships caddy.service and /etc/caddy, which the rest of this installer
-# builds on.
+# release (or the mirror's copy), checked against the SHA-256 pinned in the
+# download pins. It is the same package Cloudsmith served: its postinst
+# creates the caddy user, and it ships caddy.service and /etc/caddy, which
+# the rest of this installer builds on.
 install_caddy_package() {
 	local arch
 	case "$(uname -m)" in
@@ -1045,25 +1995,12 @@ install_caddy_package() {
 			exit 1
 			;;
 	esac
-	local base="${CADDY_PACKAGE_URL_BASE}/v${CADDY_PACKAGE_VERSION}"
-	local asset="caddy_${CADDY_PACKAGE_VERSION}_linux_${arch}.deb"
-	local sums="caddy_${CADDY_PACKAGE_VERSION}_checksums.txt"
+	local asset="caddy_${CADDY_VERSION}_linux_${arch}.deb"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
-	if ! curl_download "${base}/${asset}" -o "${tmp_dir}/${asset}" \
-		|| ! curl_download "${base}/${sums}" -o "${tmp_dir}/${sums}"; then
+	if ! fetch_pinned "${tmp_dir}/${asset}" caddy "$asset"; then
 		rm -rf "$tmp_dir"
-		echo "Failed to download the Caddy ${CADDY_PACKAGE_VERSION} package" >&2
-		exit 1
-	fi
-	if ! (
-		cd "$tmp_dir" \
-			&& awk -v name="$asset" '$2 == name { print }' "$sums" > selected-checksum.txt \
-			&& [[ "$(wc -l < selected-checksum.txt)" -eq 1 ]] \
-			&& sha512sum -c selected-checksum.txt
-	); then
-		rm -rf "$tmp_dir"
-		echo "Caddy package checksum verification failed; refusing to install it" >&2
+		echo "Failed to download the Caddy ${CADDY_VERSION} package, or it failed its checksum; refusing to install it" >&2
 		exit 1
 	fi
 	apt-get install -y "${tmp_dir}/${asset}"
@@ -1173,6 +2110,24 @@ install_packages() {
 	fi
 }
 
+# check_caddy_core_version refuses a Caddy whose core is not CADDY_VERSION.
+# Only the build-service fallback needs it: a release's own Caddy is checked
+# against that release's checksums.txt, and an older release may pin an older
+# Caddy. The build service builds the newest Caddy whatever it is asked for,
+# so after a Caddy release it serves a version no AerolVM release was tested
+# with; refusing it is better than running it unseen.
+check_caddy_core_version() {
+	local binary="$1"
+	local source_label="$2"
+	local got
+	got="$("$binary" version 2>/dev/null | awk '{print $1; exit}')"
+	if [[ "$got" != "v${CADDY_VERSION}" ]]; then
+		echo "${source_label} built Caddy ${got:-of an unknown version}, but this installer pins v${CADDY_VERSION}; refusing it." >&2
+		echo "Retry when GitHub or the download mirror answers, or pass --caddy-binary-url with a v${CADDY_VERSION} build." >&2
+		return 1
+	fi
+}
+
 verify_custom_caddy_binary() {
 	local tmp_binary="$1"
 	local source_label="$2"
@@ -1258,7 +2213,9 @@ install_custom_caddy() {
 		prebuilt_asset="$(basename "${CADDY_BINARY_URL%%\?*}")"
 		tmp_binary="$prebuilt_dir/$prebuilt_asset"
 		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
-		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary"; then
+		# An AerolVM release URL, explicit or not, falls back to the
+		# mirror's copy of the same release file before the build service.
+		if fetch_with_fallback "$tmp_binary" "$(release_mirror_path "$CADDY_BINARY_URL")" "$CADDY_BINARY_URL"; then
 			if [[ "$CADDY_BINARY_URL_EXPLICIT" != "true" ]] \
 				&& ! verify_downloads "$prebuilt_dir" "$prebuilt_asset"; then
 				rm -rf "$prebuilt_dir"
@@ -1268,6 +2225,14 @@ install_custom_caddy() {
 			if ! verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
 				rm -rf "$prebuilt_dir"
 				exit 1
+			fi
+			# Checked against the release's checksums.txt, so the upgrader
+			# can be given its hash: it swaps Caddy, and restarts it, only
+			# when the file changed.
+			if [[ "$UPGRADER_HANDOFF" == "true" && "$CADDY_BINARY_URL_EXPLICIT" != "true" ]]; then
+				handoff_add "$tmp_binary" "$prebuilt_asset" "$prebuilt_dir/checksums.txt" caddy
+				rm -rf "$prebuilt_dir"
+				return
 			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
@@ -1282,9 +2247,16 @@ install_custom_caddy() {
 		echo "Prebuilt custom Caddy release asset unavailable; falling back to Caddy build service" >&2
 	fi
 
-	# Caddy build server accepts repeated &p= for additional modules.
-	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=github.com/mholt/caddy-l4"
-	if [[ -n "$provider" ]]; then
+	# Caddy build server accepts repeated &p= for additional modules, each
+	# at the version after its @. It always builds the newest Caddy core: it
+	# ignores a requested version (checked 2026-11-10), so the core is
+	# checked after the download instead (check_caddy_core_version).
+	local download_url="${CADDY_BUILD_URL_BASE}?os=linux&arch=${arch_tag}${arch_extra}&p=${CADDY_L4_MODULE}"
+	if [[ "$provider" == "cloudflare" ]]; then
+		download_url="${download_url}&p=${CADDY_DNS_CLOUDFLARE_MODULE}"
+	elif [[ -n "$provider" ]]; then
+		# Only Cloudflare is pinned: it is the only DNS plugin the release
+		# build carries.
 		download_url="${download_url}&p=github.com/caddy-dns/${provider}"
 	fi
 	# Shared cert storage adds the certmagic-s3 plugin so multiple ingress
@@ -1292,7 +2264,7 @@ install_custom_caddy() {
 	# handles distributed locking via S3 conditional writes — no
 	# orchestration code lives in install.sh.
 	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
-		download_url="${download_url}&p=github.com/ss098/certmagic-s3"
+		download_url="${download_url}&p=${CADDY_STORAGE_S3_MODULE}"
 	fi
 
 	tmp_binary="$(mktemp)"
@@ -1303,7 +2275,8 @@ install_custom_caddy() {
 		exit 1
 	fi
 
-	if ! verify_custom_caddy_binary "$tmp_binary" "Caddy build server" "${required_modules[@]}"; then
+	if ! verify_custom_caddy_binary "$tmp_binary" "Caddy build server" "${required_modules[@]}" \
+		|| ! check_caddy_core_version "$tmp_binary" "Caddy build server"; then
 		rm -f "$tmp_binary"
 		exit 1
 	fi
@@ -1341,6 +2314,13 @@ install_binaries() {
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
 		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
 
+		if [[ "$UPGRADER_HANDOFF" == "true" ]]; then
+			# hand_off_to_upgrader installs them.
+			handoff_add "$tmp_dir/$sandboxd_asset" "$sandboxd_asset" "$tmp_dir/checksums.txt" sandboxd
+			handoff_add "$tmp_dir/$toolboxd_asset" "$toolboxd_asset" "$tmp_dir/checksums.txt" toolboxd
+			rm -rf "$tmp_dir"
+			return 0
+		fi
 		install -m 0755 "$tmp_dir/$sandboxd_asset" "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 "$tmp_dir/$toolboxd_asset" "$TOOLBOX_BINARY_PATH"
 		rm -rf "$tmp_dir"
@@ -1496,7 +2476,7 @@ EOF
 			echo "# only wrapped by the key store below; see sandboxd key status."
 			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
 			# IMDS fallback turns a missing region into an opaque timeout.
-			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			secret_provider_lines
 			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
 		} >> /etc/sandboxd/sandboxd.env
 	fi
@@ -1638,7 +2618,7 @@ EOF
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
 ${tls_block}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource*
+	@api path /health /ready /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource* /.well-known/openid-configuration /.well-known/jwks.json
 	handle @api {
 		# stream_close_delay: every admin-API change reloads Caddy, and a
 		# reload closes each WebSocket this proxy carries (exec streams,
@@ -1800,17 +2780,28 @@ write_route_dns_resolver() {
 		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
 	fi
 	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
-		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
-		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		# Routing is on by default with --domain, so say how to turn it off.
+		echo "WARNING: ingress proxy routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. On a cluster ingress node sandboxd will refuse the flag at boot and keep" >&2
+		echo "         per-sandbox Caddy routes. Re-run with --no-ingress-proxy-routing to turn it off." >&2
 		return
 	fi
 	mkdir -p /etc/systemd/network
+	local units_before
+	units_before="$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)"
 	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
 [NetDev]
 Name=aerolvm-rt
 Kind=dummy
 EOF
 	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
+	# --config-only restarts nothing; it says when a restart is owed.
+	if [[ "$CONFIG_ONLY" == "true" ]]; then
+		if [[ "$({ cat /etc/systemd/network/10-aerolvm-rt.netdev /etc/systemd/network/10-aerolvm-rt.network 2>/dev/null || true; } | cksum)" != "$units_before" ]]; then
+			echo "Note: the aerolvm-rt network units changed; apply them with: systemctl restart systemd-networkd systemd-resolved"
+		fi
+		return
+	fi
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
@@ -1820,7 +2811,7 @@ EOF
 		fi
 		sleep 1
 	done
-	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
+	echo "WARNING: aerolvm-rt never got a DNS scope; on a cluster ingress node sandboxd will refuse ingress proxy routing at boot." >&2
 }
 
 write_caddy_systemd_dropin() {
@@ -1869,17 +2860,19 @@ WantedBy=multi-user.target
 EOF
 }
 
-# sandboxd_config_fingerprint identifies the two files a running sandboxd
-# read when it started and install.sh rewrites: its settings file and its
-# unit. cksum, not sha256sum, because it is POSIX; it only has to notice a
-# change. On a fresh install neither file exists yet, and under pipefail a
-# failing cat would abort the install, hence the `|| true`.
+# sandboxd_config_fingerprint identifies the three files a running sandboxd
+# was started from and install.sh rewrites: its binary, its settings file
+# and its unit. The binary is in it because re-running the installer is how
+# a node is upgraded: without it, a run that only installed a new release
+# left the old one running. cksum, not sha256sum, because it is POSIX; it
+# only has to notice a change. On a fresh install no file exists yet, and
+# under pipefail a failing cat would abort the install, hence the `|| true`.
 sandboxd_config_fingerprint() {
-	{ cat "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+	{ cat "$INSTALL_PREFIX/sandboxd" "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
 }
 
 # record_sandboxd_state notes, before any file is written, whether sandboxd
-# is running and what its settings were.
+# is running and what it was started from.
 record_sandboxd_state() {
 	SANDBOXD_WAS_ACTIVE="false"
 	if systemctl is-active --quiet sandboxd 2>/dev/null; then
@@ -1934,7 +2927,7 @@ keep_firecracker_vms_running() {
 }
 
 # restart_sandboxd_if_reconfigured restarts sandboxd when it was running
-# before this run and the run changed its settings file or unit.
+# before this run and the run changed its binary, settings file or unit.
 # `systemctl enable --now` only starts a stopped unit, so before this a
 # re-run left the old process on its old settings. Under --pat-scope host
 # that was an outage: Caddy, restarted onto the public socket, proxied to a
@@ -1946,15 +2939,135 @@ restart_sandboxd_if_reconfigured() {
 	if [[ "$SANDBOXD_WAS_ACTIVE" != "true" ]]; then
 		return 0
 	fi
+	# The upgrader restarted it onto the new binary, after this run wrote
+	# the settings and the unit.
+	if [[ "${HANDOFF_UPGRADED:-}" == "true" ]]; then
+		return 0
+	fi
 	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
 		return 0
 	fi
-	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	echo "sandboxd binary or settings changed; restarting sandboxd before Caddy"
 	keep_firecracker_vms_running
 	systemctl restart sandboxd
 	if ! wait_for_sandboxd_ready; then
 		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2
 	fi
+}
+
+# prepare_upgrader_handoff decides whether this run hands the binaries to
+# `sandboxd upgrade node` (eng D7): only when the installed sandboxd has the
+# command and the release ships a release.json its checksums.txt vouches
+# for, which names the version to pass. Anything else keeps the direct
+# install, so first installs and older nodes work as before.
+prepare_upgrader_handoff() {
+	UPGRADER_HANDOFF="false"
+	[[ "$BUILD_FROM_SOURCE" != "true" && "$(uname -s)" == "Linux" ]] || return 0
+	local bin="$INSTALL_PREFIX/sandboxd"
+	[[ -x "$bin" ]] || return 0
+	# A sandboxd from before the command takes "upgrade" as no argument at
+	# all and boots a second daemon on the live state directory, so it is
+	# only run when it carries the command's usage text.
+	grep -aqF 'usage: sandboxd upgrade node' "$bin" || return 0
+	"$bin" upgrade node --help >/dev/null 2>&1 || return 0
+	HANDOFF_DIR="$(mktemp -d)"
+	# Few retries: an older release has no release.json, and the direct
+	# install is a fine answer to that.
+	if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time 120 \
+		"$RELEASE_JSON_URL" -o "$HANDOFF_DIR/release.json" 2>/dev/null ||
+		! verify_downloads "$HANDOFF_DIR" release.json >/dev/null 2>&1; then
+		echo "The release has no release.json that checksums.txt vouches for; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	HANDOFF_VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)",* *$/\1/p' "$HANDOFF_DIR/release.json" | head -n1)"
+	if [[ -z "$HANDOFF_VERSION" ]]; then
+		echo "release.json names no version; installing the binaries directly"
+		rm -rf "$HANDOFF_DIR"
+		HANDOFF_DIR=""
+		return 0
+	fi
+	handoff_add "$HANDOFF_DIR/release.json" release.json "$HANDOFF_DIR/checksums.txt" release.json
+	UPGRADER_HANDOFF="true"
+	echo "The installed sandboxd has 'sandboxd upgrade node'; it will install $HANDOFF_VERSION"
+}
+
+# handoff_add puts a downloaded, checked file into HANDOFF_DIR under the name
+# the upgrader takes ($4), and notes its hash from the checksums file it was
+# checked against.
+handoff_add() {
+	local file="$1" asset="$2" sums="$3" name="$4" hash
+	hash="$(awk -v name="$asset" '$2 == name { print $1 }' "$sums" | head -n1)"
+	if [[ -z "$hash" ]]; then
+		echo "No checksum for $asset in $sums" >&2
+		exit 1
+	fi
+	if [[ "$file" != "$HANDOFF_DIR/$name" ]]; then
+		mv -f "$file" "$HANDOFF_DIR/$name"
+	fi
+	echo "$hash $name" >>"$HANDOFF_DIR/handoff.sha256"
+}
+
+# hand_off_to_upgrader runs `sandboxd upgrade node` on the files this run
+# staged. It runs after the settings and units are written and loaded, so
+# the restart it does starts the new binary on them, and it tells the
+# upgrader the host setup is applied: this run just did that. A failure is
+# put back by the upgrader and ends the run.
+hand_off_to_upgrader() {
+	[[ "$UPGRADER_HANDOFF" == "true" ]] || return 0
+	local args=() hash name out
+	while read -r hash name; do
+		[[ -n "$name" ]] && args+=(--sha256 "$name=$hash")
+	done <"$HANDOFF_DIR/handoff.sha256"
+	echo "Handing the new binaries to sandboxd upgrade node $HANDOFF_VERSION"
+	if ! out="$("$INSTALL_PREFIX/sandboxd" upgrade node "$HANDOFF_VERSION" --from "$HANDOFF_DIR" "${args[@]}" --skip-host-apply -o json)"; then
+		printf '%s\n' "$out"
+		rm -rf "$HANDOFF_DIR"
+		echo "sandboxd upgrade node failed and kept (or put back) the previous binaries; see its output above" >&2
+		exit 1
+	fi
+	printf '%s\n' "$out"
+	if grep -q '"result": "upgraded"' <<<"$out"; then
+		HANDOFF_UPGRADED="true"
+	fi
+	rm -rf "$HANDOFF_DIR"
+}
+
+# apply_config_only is --config-only: every file a full run writes from the
+# settings, and nothing else (plans/kubectl-style-cluster-ops.md §6.3 step 7).
+# It never downloads or replaces a binary, never installs a package, and
+# never starts or restarts a service; `sandboxd upgrade node`, which runs it
+# through `sandboxd host apply`, owns the binaries and every restart. So a
+# host change must keep working with the previous binary too.
+apply_config_only() {
+	# What register_isolate_runtime resolves, without its download.
+	if [[ -n "$WORKERD_PATH" ]]; then
+		WORKERD_BIN_RESOLVED="$WORKERD_PATH"
+	elif command -v workerd >/dev/null 2>&1; then
+		WORKERD_BIN_RESOLVED="$(command -v workerd)"
+	else
+		WORKERD_BIN_RESOLVED="/usr/local/bin/workerd"
+	fi
+	if [[ "$LOCAL_MODE" == "true" ]]; then
+		write_local_environment
+		write_node_settings
+		write_local_systemd_unit
+	else
+		write_environment
+		write_node_settings
+		prepare_key_custody
+		write_caddy_env
+		write_caddy_systemd_dropin
+		write_route_dns_resolver
+		write_caddyfile
+		write_systemd_unit
+	fi
+	write_egress_gateway_units
+	write_healthcheck_script
+	write_healthcheck_units
+	systemctl daemon-reload
+	echo "Configuration re-rendered from $NODE_SETTINGS_FILE; no binary or service was touched. Restart sandboxd to use it."
 }
 
 write_healthcheck_script() {
@@ -2354,30 +3467,25 @@ install_workerd_binary() {
 	# runsc shim). Assets are gzipped standalone binaries
 	# (workerd-linux-{64,arm64}.gz); upstream publishes no checksum sidecar,
 	# so verification runs against the SHA-256 pinned next to WORKERD_VERSION
-	# at the top of this script. Bump version + hashes together.
-	local arch sha
+	# in the download pins. Bump version + hashes together.
+	local arch
 	case "$(uname -m)" in
-		x86_64|amd64)   arch="linux-64";    sha="$WORKERD_SHA256_LINUX_64" ;;
-		aarch64|arm64)  arch="linux-arm64"; sha="$WORKERD_SHA256_LINUX_ARM64" ;;
+		x86_64|amd64)   arch="linux-64" ;;
+		aarch64|arm64)  arch="linux-arm64" ;;
 		*)
 			echo "--with-isolate: unsupported architecture $(uname -m) for workerd" >&2
 			exit 1
 			;;
 	esac
 
-	local url="https://github.com/cloudflare/workerd/releases/download/${WORKERD_VERSION}/workerd-${arch}.gz"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	echo "Downloading workerd ${WORKERD_VERSION} for ${arch} from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/workerd.gz"; then
-		echo "--with-isolate: failed to download workerd from ${url}" >&2
-		exit 1
-	fi
-	if ! echo "${sha}  ${tmp_dir}/workerd.gz" | sha256sum -c -; then
-		echo "--with-isolate: workerd checksum verification failed (pinned ${sha} for ${WORKERD_VERSION}/${arch})" >&2
+	echo "Downloading workerd ${WORKERD_VERSION} for ${arch}"
+	if ! fetch_pinned "${tmp_dir}/workerd.gz" workerd "workerd-${arch}.gz"; then
+		echo "--with-isolate: failed to download workerd ${WORKERD_VERSION}/${arch}, or it failed its checksum" >&2
 		exit 1
 	fi
 	gunzip -f "${tmp_dir}/workerd.gz"
@@ -2453,23 +3561,21 @@ firecracker_verify() {
 }
 
 # install_firecracker_release installs firecracker and jailer from the pinned
-# release, unless both already report the pinned version. A different version
-# is replaced, as the Ansible install does.
+# release (GitHub, then the mirror), unless both already report the pinned
+# version. A different version is replaced, as the Ansible install does.
 install_firecracker_release() {
-	local arch="$1" sha="$2" tmp_dir="$3"
+	local arch="$1" tmp_dir="$2"
 	if [[ "$(firecracker_binary_version "$FIRECRACKER_BIN")" == "Firecracker $FIRECRACKER_VERSION" &&
 		"$(firecracker_binary_version "$JAILER_BIN")" == "Jailer $FIRECRACKER_VERSION" ]]; then
 		echo "firecracker and jailer $FIRECRACKER_VERSION already installed"
 		return 0
 	fi
 	local tarball="firecracker-${FIRECRACKER_VERSION}-${arch}.tgz"
-	local url="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${tarball}"
-	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch} from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/${tarball}"; then
-		echo "--with-firecracker: failed to download ${url}" >&2
+	echo "Downloading Firecracker ${FIRECRACKER_VERSION} for ${arch}"
+	if ! fetch_pinned "${tmp_dir}/${tarball}" firecracker "$tarball"; then
+		echo "--with-firecracker: failed to download ${tarball}, or it failed its checksum" >&2
 		exit 1
 	fi
-	firecracker_verify "${tmp_dir}/${tarball}" "$sha"
 	tar -xzf "${tmp_dir}/${tarball}" -C "$tmp_dir"
 	local release="${tmp_dir}/release-${FIRECRACKER_VERSION}-${arch}"
 	install -m 0755 "${release}/firecracker-${FIRECRACKER_VERSION}-${arch}" "$FIRECRACKER_BIN"
@@ -2527,17 +3633,15 @@ install_firecracker_kernel() {
 # jailer's user. Every download is checked before anything is installed from
 # it. Same artifacts as the Terraform bootstrap and Ansible configure-ops.yml.
 install_firecracker() {
-	local arch release_sha kernel_sha config_sha
+	local arch kernel_sha config_sha
 	case "$(uname -m)" in
 		x86_64 | amd64)
 			arch="x86_64"
-			release_sha="$FIRECRACKER_SHA256_X86_64"
 			kernel_sha="$FIRECRACKER_KERNEL_SHA256_X86_64"
 			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_X86_64"
 			;;
 		aarch64 | arm64)
 			arch="aarch64"
-			release_sha="$FIRECRACKER_SHA256_AARCH64"
 			kernel_sha="$FIRECRACKER_KERNEL_SHA256_AARCH64"
 			config_sha="$FIRECRACKER_KERNEL_CONFIG_SHA256_AARCH64"
 			;;
@@ -2556,7 +3660,7 @@ install_firecracker() {
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	install_firecracker_release "$arch" "$release_sha" "$tmp_dir"
+	install_firecracker_release "$arch" "$tmp_dir"
 	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
 	install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR" "$JAILER_CHROOT_BASE"
 	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
@@ -2591,16 +3695,15 @@ install_cni_plugins() {
 			;;
 	esac
 
-	local ver="v1.5.1"
-	local url="https://github.com/containernetworking/plugins/releases/download/${ver}/cni-plugins-linux-${arch}-${ver}.tgz"
+	local file="cni-plugins-linux-${arch}-${CNI_PLUGINS_VERSION}.tgz"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064
 	trap "rm -rf '$tmp_dir'" RETURN
 
-	echo "Downloading CNI plugins ${ver} (${arch}) from ${url}"
-	if ! curl_download "$url" -o "${tmp_dir}/cni.tgz"; then
-		echo "--with-containerd-engine: failed to download CNI plugins from ${url}" >&2
+	echo "Downloading CNI plugins ${CNI_PLUGINS_VERSION} (${arch})"
+	if ! fetch_pinned "${tmp_dir}/cni.tgz" cni-plugins "$file"; then
+		echo "--with-containerd-engine: failed to download ${file}, or it failed its checksum" >&2
 		exit 1
 	fi
 	mkdir -p /opt/cni/bin
@@ -2612,6 +3715,139 @@ install_cni_plugins() {
 		fi
 	done
 	echo "Installed CNI plugins to /opt/cni/bin (bridge, host-local, loopback)"
+}
+
+# buildkit_version_at prints the release a buildkitd binary reports
+# ("buildkitd github.com/moby/buildkit v0.34.2 <commit>"), or nothing.
+buildkit_version_at() {
+	"$1" --version 2>/dev/null | awk 'NR == 1 { print $3 }' || true
+}
+
+# cni_version_at prints the release of the CNI plugins in a directory, from
+# its bridge plugin ("CNI bridge plugin v1.9.1"), or nothing. The plugins
+# print --version to stderr, not stdout.
+cni_version_at() {
+	"$1/bridge" --version 2>&1 | awk 'NR == 1 && $1 == "CNI" { print $4 }' || true
+}
+
+# node_env_value prints KEY's value from the node's sandboxd.env or
+# cluster.env (the Terraform bootstrap writes the engine to cluster.env),
+# or nothing.
+node_env_value() {
+	local key="$1" f
+	for f in "${SANDBOXD_ENV_DIR}/sandboxd.env" "${SANDBOXD_ENV_DIR}/cluster.env"; do
+		[[ -r "$f" ]] || continue
+		awk -F= -v k="$key" '$1 == k { v = substr($0, length(k) + 2) } END { if (v != "") print v }' "$f"
+	done | tail -n 1
+}
+
+# upgrade_containerd_engine_tools moves a containerd-engine node that was not
+# installed with --with-containerd-engine (the Terraform bootstrap installs
+# CNI and BuildKit itself) to the pinned CNI plugins and BuildKit. It only
+# replaces what is already there: a node without them is left for the
+# bootstrap, which installs them after this script runs.
+upgrade_containerd_engine_tools() {
+	[[ "$(node_env_value SB_CONTAINER_ENGINE)" == "containerd" ]] || return 0
+	local cni_dir have
+	cni_dir="$(node_env_value SB_CONTAINERD_CNI_PLUGIN_DIR)"
+	cni_dir="${cni_dir:-/opt/cni/bin}"
+	if [[ -x "${cni_dir}/bridge" ]]; then
+		have="$(cni_version_at "$cni_dir")"
+		if [[ "$have" != "$CNI_PLUGINS_VERSION" ]]; then
+			if [[ "$cni_dir" == "/opt/cni/bin" ]]; then
+				echo "Upgrading CNI plugins ${have:-(unknown version)} to ${CNI_PLUGINS_VERSION}"
+				install_cni_plugins
+			else
+				echo "warning: CNI plugins in ${cni_dir} are ${have:-of an unknown version}; this installer updates /opt/cni/bin only. Install ${CNI_PLUGINS_VERSION} there by hand." >&2
+			fi
+		fi
+	fi
+	if [[ -x "${BUILDKIT_BIN_DIR}/buildkitd" ]]; then
+		install_buildkit
+	fi
+}
+
+# install_buildkit sets up BuildKit for image builds on the containerd engine
+# (POST /v1/images/build, snapshot from a Dockerfile) exactly as the
+# Terraform bootstrap does: the same release, the same two binaries and the
+# same unit, each skipped when already there. The bootstrap runs install.sh
+# before its own BuildKit step, which it skips when buildkitd and the unit
+# exist, so a node where this ran first must end up the same. The bootstrap
+# downloads from GitHub only; this goes through the mirror. (Today's
+# bootstrap does not pass --with-containerd-engine, so on a Terraform node
+# its own step still does the install.)
+install_buildkit() {
+	# Three cases. No buildkitd at all: install it. Ours (BUILDKIT_BIN_DIR,
+	# the path this installer and the Terraform bootstrap use) at another
+	# version: replace it, so a re-run moves an older node to the pinned
+	# release. A buildkitd somewhere else on PATH is the operator's own: leave
+	# it alone, as before.
+	local ours="${BUILDKIT_BIN_DIR}/buildkitd" have="" upgrade="false" fresh="false"
+	if [[ -x "$ours" ]]; then
+		have="$(buildkit_version_at "$ours")"
+		[[ "$have" == "$BUILDKIT_VERSION" ]] || upgrade="true"
+	elif ! command -v buildkitd >/dev/null 2>&1; then
+		fresh="true"
+	fi
+	if [[ "$fresh" == "true" || "$upgrade" == "true" ]]; then
+		local arch
+		case "$(uname -m)" in
+			x86_64|amd64)   arch="amd64" ;;
+			aarch64|arm64)  arch="arm64" ;;
+			*)
+				echo "--with-containerd-engine: unsupported architecture $(uname -m) for BuildKit" >&2
+				exit 1
+				;;
+		esac
+		local file="buildkit-${BUILDKIT_VERSION}.linux-${arch}.tar.gz"
+		local tmp_dir
+		tmp_dir="$(mktemp -d)"
+		# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+		trap "rm -rf '$tmp_dir'" RETURN
+		echo "Downloading BuildKit ${BUILDKIT_VERSION} (${arch})"
+		if ! fetch_pinned "${tmp_dir}/${file}" buildkit "$file"; then
+			echo "--with-containerd-engine: failed to download ${file}, or it failed its checksum" >&2
+			exit 1
+		fi
+		tar -xzf "${tmp_dir}/${file}" -C "$tmp_dir"
+		if [[ "$upgrade" == "true" ]]; then
+			# Stopped first: a build in progress fails either way when the
+			# daemon restarts, and nothing then runs the old binary while
+			# it is replaced. enable --now below starts the new one.
+			echo "Upgrading BuildKit ${have:-(unknown version)} to ${BUILDKIT_VERSION}"
+			systemctl stop buildkit.service || true
+		fi
+		install -m 0755 "${tmp_dir}/bin/buildkitd" "${BUILDKIT_BIN_DIR}/buildkitd"
+		install -m 0755 "${tmp_dir}/bin/buildctl" "${BUILDKIT_BIN_DIR}/buildctl"
+		echo "Installed buildkitd and buildctl ${BUILDKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
+	fi
+	if [[ ! -f "$BUILDKIT_UNIT_FILE" ]]; then
+		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		systemctl daemon-reload
+	fi
+	systemctl enable --now buildkit.service || echo "warning: buildkit.service failed to start" >&2
+}
+
+# buildkit_unit prints the bootstrap's buildkit.service, rendered with the
+# socket and namespace this installer writes into sandboxd.env (and
+# Terraform's defaults): the containerd worker only, in the aerolvm namespace,
+# so builds land in the image store the driver runs from. Host networking
+# for RUN steps avoids a separate BuildKit CNI config.
+buildkit_unit() {
+	cat <<'UNIT'
+[Unit]
+Description=BuildKit (aerolvm containerd worker)
+Requires=containerd.service
+After=containerd.service
+
+[Service]
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=/run/containerd/containerd.sock --containerd-worker-namespace=aerolvm --containerd-worker-net=host
+Restart=on-failure
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 }
 
 register_gvisor_runtime() {
@@ -2994,6 +4230,15 @@ install_darwin_local() {
 	echo "Stop: launchctl bootout $domain/com.aerol.sandboxd"
 }
 
+if [[ "$CONFIG_ONLY" == "true" ]]; then
+	if [[ $EUID -ne 0 ]]; then
+		echo "install.sh --config-only must run as root" >&2
+		exit 1
+	fi
+	apply_config_only
+	exit 0
+fi
+
 if [[ "$LOCAL_MODE" == "true" ]]; then
 	if [[ -n "$DOMAIN" || -n "$DNS_PROVIDER" ]]; then
 		echo "--local is incompatible with --domain and --dns-provider" >&2
@@ -3007,9 +4252,12 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
-	install_binaries
+	prepare_upgrader_handoff
+	# Before install_binaries, so the restart check sees a new binary too.
 	record_sandboxd_state
+	install_binaries
 	write_local_environment
+	write_node_settings
 	# This branch skips install_packages, so it installs the two parts of it
 	# a local server still needs, in the same order: the mount tools (platform
 	# volumes and external storage are mounted on the host), then Docker.
@@ -3023,6 +4271,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	write_healthcheck_units
 	systemctl daemon-reload
 	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+	hand_off_to_upgrader
 	restart_sandboxd_if_reconfigured
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
@@ -3057,6 +4306,9 @@ if [[ "$WITH_FIRECRACKER" == "true" ]]; then
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
+	install_buildkit
+else
+	upgrade_containerd_engine_tools
 fi
 if [[ "$WITH_NVIDIA_GPU" == "true" ]]; then
 	install_nvidia_gpu
@@ -3068,10 +4320,13 @@ fi
 # caddy-l4 (TCP routing for sandbox-exposed ports). DNS plugin gets folded
 # into the same build when --dns-provider is set so we make exactly one
 # trip to the Caddy build server.
+prepare_upgrader_handoff
 install_custom_caddy "$DNS_PROVIDER"
-install_binaries
+# Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
+install_binaries
 write_environment
+write_node_settings
 prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
@@ -3084,6 +4339,7 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+hand_off_to_upgrader
 if [[ "$NO_START" == "true" ]]; then
 	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
 	# cluster's server key are in place (see --no-start).
@@ -3098,11 +4354,17 @@ else
 fi
 
 echo "AerolVM installed"
-if [[ "$NO_START" == "true" ]]; then
+if [[ -n "$NODE_COMMAND" ]]; then
+	echo "sandboxd: enabled, not started; sandboxd $NODE_COMMAND starts it"
+elif [[ "$NO_START" == "true" ]]; then
 	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
 fi
-echo "PAT token: $PAT_TOKEN"
-echo "Use header: Authorization: Bearer <PAT token>"
+# A joining node takes the cluster's PAT from its join answer, so this
+# machine's own one is never the one to use.
+if [[ "$NODE_COMMAND" != "join" ]]; then
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+fi
 if [[ -n "$DOMAIN" ]]; then
 	echo "API URL: https://$DOMAIN"
 	echo "Health URL: https://$DOMAIN/health"
@@ -3125,3 +4387,8 @@ echo "  kernel never hands these out as outbound source ports — eliminates ran
 echo "  failures on ExposeTCPPort. 1000 slots = max concurrent TCP exposures per host."
 echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
 echo "Health watchdog: sandboxd-healthcheck.timer probes the liveness socket every 30 seconds and restarts sandboxd only after 3 failed probes in a row over 90 seconds"
+
+# init or join: the host is set up; sandboxd does the rest.
+if [[ -n "$NODE_COMMAND" ]]; then
+	run_node_command
+fi

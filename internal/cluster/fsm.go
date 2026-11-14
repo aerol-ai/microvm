@@ -11,8 +11,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -55,7 +57,13 @@ const (
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
 	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
-	// ops (fsm_tokens.go). The next free code is 33.
+	// ops (fsm_tokens.go); 33/34 are the warm-pool ops (fsm_warm_pools.go);
+	// 35-37 are the identity ops (fsm_identity.go); 38/39 are the team-quota
+	// ops (fsm_team_quotas.go); 40/41 are the volume-reclaim ops
+	// (fsm_volume_reclaims.go); 42 is opDenyNode (fsm_node_deny.go); 43-47
+	// are the join ops (fsm_join.go); 48-50 are the active version and
+	// rollout ops (fsm_rollout.go); 51 is opSetRunStates (fsm_run_state.go).
+	// The next free code is 52.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -103,12 +111,23 @@ type command struct {
 	ExpectedOwnerNodeID    string `json:"expected_owner_node_id,omitempty"`
 	ExpectedOwnerNodeIDSet bool   `json:"expected_owner_node_id_set,omitempty"`
 	ExpectedSealGeneration int64  `json:"expected_seal_generation,omitempty"`
+	// ExpectedPlacementVersion is opUpsertSpec's compare-and-set: the
+	// Placement.Version of the spec the writer read and patched. Apply
+	// refuses the write (ErrSpecVersionConflict) when the placement has
+	// moved since. Zero asks for no check, which is every entry written
+	// before the fence and every one a proposer writes while an older server
+	// is still in the cluster (spec_version_fence.go).
+	ExpectedPlacementVersion uint64 `json:"expected_placement_version,omitempty"`
 	// OwnerRef is the control-plane tenant account.
 	OwnerRef  string `json:"owner_ref,omitempty"`
 	Port      int    `json:"port,omitempty"`
 	Protocol  string `json:"protocol,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
 	PublicURL string `json:"public_url,omitempty"`
+	// Visibility is opAddExposedPort's port visibility ("token" for a
+	// sandbox-token-gated port, A2). Omitted for public, so commands from
+	// before it replay byte for byte.
+	Visibility string `json:"visibility,omitempty"`
 	// ExpiresUnix is set on opReserve to bound how long a reservation holds
 	// capacity before the leader GC sweep cancels it. Ignored by every other
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
@@ -190,6 +209,17 @@ type command struct {
 	MaxPerTenant      int                       `json:"max_per_tenant,omitempty"`
 	VolumeAttachments []models.VolumeAttachment `json:"volume_attachments,omitempty"`
 	VolumeSandboxID   string                    `json:"volume_sandbox_id,omitempty"`
+	// VolumeReclaimNodeID asks the FSM to record a VolumeReclaim (stamped
+	// StampUnixNano, drained by this node; fsm_volume_reclaims.go): on
+	// opDelete for every delete_with_sandbox volume the deleted sandbox was
+	// the last holder of, on opDeleteVolume for the deleted volume.
+	// VolumeReclaimSource is opDeleteVolume's source for a row stored without
+	// one. Empty: no record, the older behaviour.
+	VolumeReclaimNodeID string `json:"volume_reclaim_node_id,omitempty"`
+	VolumeReclaimSource string `json:"volume_reclaim_source,omitempty"`
+	// VolumeReclaim names the entry opAckVolumeReclaim drops or
+	// opClaimVolumeReclaim moves to NodeID.
+	VolumeReclaim *VolumeReclaim `json:"volume_reclaim,omitempty"`
 	// EgressProfile carries the profile for opPutEgressProfile, and its owner
 	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
 	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
@@ -205,6 +235,57 @@ type command struct {
 	// (fsm_tokens.go).
 	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
 	APITokenID string                `json:"api_token_id,omitempty"`
+	// WarmPool carries the entry for opPutWarmPool, and its image for
+	// opDeleteWarmPool (fsm_warm_pools.go).
+	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
+	// KubeWarm carries opSetKubeWarmDepths' whole set (fsm_kube_warm.go).
+	KubeWarm []KubeWarmDepth `json:"kube_warm,omitempty"`
+	// RunStates carries opSetRunStates' batch (fsm_run_state.go).
+	RunStates []RunStateReport `json:"run_states,omitempty"`
+	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
+	// opPutIdentityRole and names the tag opDeleteIdentityRole removes
+	// (fsm_identity.go).
+	IdentityKeys *IdentityKeysWrite  `json:"identity_keys,omitempty"`
+	IdentityRole *IdentityRoleRecord `json:"identity_role,omitempty"`
+	// TeamQuota carries the quota for opPutTeamQuota, and its team for
+	// opDeleteTeamQuota (fsm_team_quotas.go).
+	TeamQuota *TeamQuotaRecord `json:"team_quota,omitempty"`
+	// QuotaAdmit marks an opPlace that can grow a team's usage (a create
+	// that skipped the reservation), so the leader admits it against the
+	// team's quota like a reservation. A spec write needs no mark: the leader
+	// checks every one that grows a team's sandbox (teamQuotaAsks), because a
+	// worker on an older build never sets it. Apply ignores it: an older
+	// replica reads the same state from the entry.
+	QuotaAdmit bool `json:"quota_admit,omitempty"`
+	// QuotaReplay marks an opUpsertSpec that records what a sandbox already
+	// is (the boot backfill of a spec the row never had), so the leader does
+	// not refuse it. It can only loosen the check for builds that know quotas;
+	// an older build never sets it, so its spec writes are always checked.
+	// Apply ignores it.
+	QuotaReplay bool `json:"quota_replay,omitempty"`
+	// RefuseDeletedLifecycle asks opPlace to refuse a missing row whose
+	// (SandboxID, IncarnationID) has a post-delete record
+	// (deletedLifecycleRetainedLocked). Entries written before the fence carry
+	// false and apply exactly as they did, so a log replay reaches the same
+	// state. A proposer sets it only once every server applies it
+	// (deletedLifecycleFenceFSMOpsVersion), so a mixed-version server tier
+	// never splits on one entry.
+	RefuseDeletedLifecycle bool `json:"refuse_deleted_lifecycle,omitempty"`
+	// NodeDeny carries the deleted node for opDenyNode (fsm_node_deny.go).
+	NodeDeny *NodeDenyRecord `json:"node_deny,omitempty"`
+	// JoinToken carries opPutJoinToken, JoinTokenID opDeleteJoinToken,
+	// JoinAdmit opAdmitNode, JoinAdopt opAdoptNodes and JoinRekey
+	// opRekeyNode (fsm_join.go).
+	JoinToken   *JoinTokenRecord  `json:"join_token,omitempty"`
+	JoinTokenID string            `json:"join_token_id,omitempty"`
+	JoinAdmit   *JoinAdmitCommand `json:"join_admit,omitempty"`
+	JoinAdopt   *JoinAdoptCommand `json:"join_adopt,omitempty"`
+	JoinRekey   *JoinRekeyCommand `json:"join_rekey,omitempty"`
+	// ActiveVersion carries opSetActiveVersion, RolloutCmd opRolloutCommand
+	// and RolloutNode opRolloutNode (fsm_rollout.go).
+	ActiveVersion *ActiveVersionCommand `json:"active_version,omitempty"`
+	RolloutCmd    *RolloutCommand       `json:"rollout_cmd,omitempty"`
+	RolloutNode   *RolloutNodeUpdate    `json:"rollout_node,omitempty"`
 }
 
 type reservationCommand struct {
@@ -458,6 +539,14 @@ type placementFSM struct {
 	// deletingIndex bounds leader cleanup of abandoned delete fences to the
 	// number of in-flight deletions rather than the full placement fleet.
 	deletingIndex map[string]struct{}
+	// orphanedRecoveryIndex holds the orphaned placements whose sandbox
+	// wants a failover recreate: those no node had room for when their
+	// owner died, or that a target refused for capacity (R14). The leader's
+	// retryOrphanedRecoveries pages it, so its work follows that backlog,
+	// not the fleet. Derived from the rows, never persisted: every write
+	// (storePlacementLocked) and delete keeps it, and Restore rebuilds it,
+	// so every replica holds the same set and no FSM format changes.
+	orphanedRecoveryIndex *btree.BTreeG[string]
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -531,23 +620,82 @@ type placementFSM struct {
 	volumeAttachments          map[string]models.VolumeAttachment
 	volumeAttachmentsByVolume  map[string]map[string]struct{}
 	volumeAttachmentsBySandbox map[string]map[string]struct{}
+	// volumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete, by volumeKey (fsm_volume_reclaims.go, snapshotted).
+	// volumeReclaimsByNode indexes them by the node that drains them
+	// (derived, rebuilt on Restore).
+	volumeReclaims       map[string]VolumeReclaim
+	volumeReclaimsByNode map[string]map[string]struct{}
 	// egressProfiles are the replicated named egress profiles (snapshotted).
 	// egressProfileRefs is derived: which placements reference each profile,
 	// kept in step with f.placements by reindexEgressProfilesLocked and
 	// rebuilt on Restore from the rows.
 	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
 	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// teamQuotas are the replicated team quotas (snapshotted). teamUsage and
+	// teamUsageEntries are derived: each team's usage and each sandbox's
+	// share of it, kept in step with f.placements by
+	// reindexTeamUsageLocked and rebuilt on Restore (fsm_team_quotas.go).
+	teamQuotas       map[string]*TeamQuotaRecord
+	teamUsage        map[string]*models.TeamQuotaUsage
+	teamUsageEntries map[string]teamUsageEntry
 	// tokens is the replicated API-token table and its change ring
 	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
 	// lock: token reads on the request path never take mu.
 	tokens       *apiTokenState
 	apiTokenInit sync.Once
+	// warmPools are the replicated warm-pool entries by image
+	// (fsm_warm_pools.go, snapshotted). warmPoolsVersion is the Raft index
+	// of the last change to them, the cursor workers poll with.
+	warmPools        map[string]*WarmPoolRecord
+	warmPoolsVersion uint64
+	// kubeWarm is the agent-sandbox API's warm-pool depths, by image and
+	// runtime (fsm_kube_warm.go, snapshotted). A change to it moves
+	// warmPoolsVersion too: workers read both in one poll.
+	kubeWarm []KubeWarmDepth
+	// identity is the cloud-identity signing keys and role allow lists
+	// (fsm_identity.go, snapshotted). nil until the first write.
+	identity *identityState
+	// deniedNodes are the deleted node IDs (fsm_node_deny.go, snapshotted).
+	// deniedNodesVersion is the Raft index of the last change to them, the
+	// cursor workers poll with.
+	deniedNodes        map[string]NodeDenyRecord
+	deniedNodesVersion uint64
+	// deniedSet is deniedNodes' keys, published copy-on-write on every
+	// change so the hot readers (gossip, the peer authorizer) never take mu.
+	deniedSet atomic.Pointer[map[string]bool]
+	// Join state (fsm_join.go, snapshotted): join tokens by id, the one
+	// admitted key per node ID (and its reverse index) and the revoked-key
+	// tombstones. A change to the tombstones moves deniedNodesVersion too,
+	// because workers mirror them with the deny set. peerTrust is the
+	// published copy the per-request peer check reads without mu.
+	joinTokens    map[string]*JoinTokenRecord
+	admitted      map[string]AdmittedNode
+	admittedByKey map[string]string
+	revokedKeys   map[string]RevokedKey
+	peerTrust     atomic.Pointer[peerTrustView]
+	// The active cluster version and the one rollout (fsm_rollout.go,
+	// snapshotted). activeFV is the active version's FV, published for the
+	// lock-free readers (write gates, voter auto-join); rolloutVersion
+	// counts changes to the rollout.
+	activeVersion  *ActiveVersion
+	activeFV       atomic.Int64
+	rollout        *RolloutRecord
+	rolloutVersion uint64
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
 	// then takes subMu to fan out.
 	subMu       sync.Mutex
 	subscribers []chan<- struct{}
+
+	// unreported receives load an apply stops counting as pending before
+	// the owner's capacity heartbeat can show it (capacity_unreported.go).
+	// It is this server's, written by apply and never read by it, and not
+	// in snapshots, so replicated state stays a function of the log alone.
+	// Atomic so a test can install one beside a running raft; nil records
+	// nothing.
+	unreported atomic.Pointer[unreportedLoad]
 }
 
 type placementRecovery struct {
@@ -613,6 +761,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
+		orphanedRecoveryIndex:        newPlacementIDIndex(),
 		drainedNodes:                 make(map[string]bool),
 		storageRetirements:           make(map[string]NodeStorageRetirement),
 		storageObligations:           make(map[string]StorageObligation),
@@ -628,9 +777,20 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
+		volumeReclaims:               make(map[string]VolumeReclaim),
+		volumeReclaimsByNode:         make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		teamQuotas:                   make(map[string]*TeamQuotaRecord),
+		teamUsage:                    make(map[string]*models.TeamQuotaUsage),
+		teamUsageEntries:             make(map[string]teamUsageEntry),
 		tokens:                       newAPITokenState(),
+		warmPools:                    make(map[string]*WarmPoolRecord),
+		deniedNodes:                  make(map[string]NodeDenyRecord),
+		joinTokens:                   make(map[string]*JoinTokenRecord),
+		admitted:                     make(map[string]AdmittedNode),
+		admittedByKey:                make(map[string]string),
+		revokedKeys:                  make(map[string]RevokedKey),
 	}
 }
 
@@ -768,6 +928,21 @@ func (f *placementFSM) retainAuditACLLocked(acl AuditACL, cap int64) {
 	}
 }
 
+// deletedLifecycleRetainedLocked reports whether opDelete left a post-delete
+// record for this exact lifetime. It checks presence, not ExpiresUnix, so it
+// needs no clock: the record leaves the map only through opPruneAuditACL or
+// cap eviction, both log entries, so every replica gives the same answer at
+// the same index. A record past its expiry but not pruned yet still proves
+// the delete.
+func (f *placementFSM) deletedLifecycleRetainedLocked(sandboxID, incarnationID string) bool {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return false
+	}
+	_, ok := f.auditACLs[auditACLKey(sandboxID, incarnationID)]
+	return ok
+}
+
 func (f *placementFSM) removeAuditACLLocked(key string) {
 	acl, ok := f.auditACLs[key]
 	if !ok {
@@ -832,13 +1007,91 @@ func (f *placementFSM) pruneAuditACLLocked(cutoff int64) int {
 
 // Apply is invoked by raft for every committed log entry on every node.
 func (f *placementFSM) Apply(log *raft.Log) interface{} {
+	start := time.Now()
 	res := f.apply(log)
+	recordFSMApply(log.AppendedAt, start)
 	// Notify subscribers AFTER releasing the FSM lock so the ingress
 	// reconciler (or any other watcher) can immediately re-read placements
 	// without contending with the next Apply. Non-blocking by design — see
 	// notifySubscribers.
 	f.notifySubscribers()
 	return res
+}
+
+// applyNow is the time an entry is applied "at": the leader's timestamp from
+// when it first appended the entry. Every decision apply makes from time
+// (whether a reservation or a delete fence has expired) must come out the
+// same on every server and on every replay, and the applying server's own
+// clock does not: a lagging follower, or a server replaying its log after a
+// restart, read a later time than the leader and could overwrite a
+// reservation the leader had refused, leaving servers that disagree on a
+// sandbox's owner and incarnation. raft sets AppendedAt once on the leader,
+// the transport sends it with the entry, and both log stores (raft-boltdb
+// and raft-wal) persist it. An entry without one (built by hand in tests)
+// falls back to the local clock.
+func applyNow(log *raft.Log) int64 {
+	if log != nil && !log.AppendedAt.IsZero() {
+		return log.AppendedAt.Unix()
+	}
+	return time.Now().Unix()
+}
+
+// ownerSinceAfter is the OwnerSinceUnixNano a placement carries once the
+// entry log makes newOwner its owner; prev is the row before the entry and
+// existed is false for a new row. A new row has had no other owner, so it
+// starts at 0 even though it has an owner: a create that runs locally first
+// writes its sandbox row before the opPlace that records the owner, and
+// stamping that first owner would refuse the tokens the create's caller
+// issues straight after it. The time is the leader's append time from the
+// entry itself, so replicas and replays agree; an entry without one (an old
+// log, a test) records 0, which reads as "no takeover known".
+func ownerSinceAfter(prev Placement, existed bool, newOwner string, log *raft.Log) int64 {
+	if !existed {
+		return 0
+	}
+	newOwner = strings.TrimSpace(newOwner)
+	previous := strings.TrimSpace(prev.OwnerNodeID)
+	if prev.IsOrphaned() {
+		previous = strings.TrimSpace(prev.OrphanedOwnerNodeID)
+	}
+	// Orphaning hands the sandbox to nobody, and a claim back by the node it
+	// was orphaned from is the same owner returning: neither is a takeover.
+	if newOwner == "" || newOwner == previous {
+		return prev.OwnerSinceUnixNano
+	}
+	if log == nil || log.AppendedAt.IsZero() {
+		return 0
+	}
+	return log.AppendedAt.UnixNano()
+}
+
+// ownerEpochAfter is the OwnerEpoch a placement carries once the entry at
+// index makes newOwner its owner; prev is the row before the entry and existed
+// is false for a new row. A new row, and any change of OwnerNodeID (an
+// orphaning to "" and a claim back included), take the entry's index; any
+// other write keeps the epoch. index 0 (no log entry, in tests) records 0,
+// which readers treat as unknown.
+func ownerEpochAfter(prev Placement, existed bool, newOwner string, index uint64) uint64 {
+	if existed && strings.TrimSpace(newOwner) == strings.TrimSpace(prev.OwnerNodeID) {
+		return prev.OwnerEpoch
+	}
+	return index
+}
+
+// setPlacementOwner moves an existing placement to owner ("" orphans it; the
+// caller keeps the orphan bookkeeping) and keeps OwnerSinceUnixNano in step.
+// Every apply that changes the owner of an existing row goes through it, so
+// the takeover time cannot drift from the owner it describes.
+func setPlacementOwner(p *Placement, owner, apiURL, dataPlaneHost string, log *raft.Log) {
+	p.OwnerSinceUnixNano = ownerSinceAfter(*p, true, owner, log)
+	var index uint64
+	if log != nil {
+		index = log.Index
+	}
+	p.OwnerEpoch = ownerEpochAfter(*p, true, owner, index)
+	p.OwnerNodeID = owner
+	p.OwnerAPIURL = apiURL
+	p.OwnerDataPlaneHost = dataPlaneHost
 }
 
 func (f *placementFSM) apply(log *raft.Log) interface{} {
@@ -857,7 +1110,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 	// and reset to 0 on every cold restart, which broke watchers that
 	// expected a monotonic revision across restores (B9).
 	f.version = log.Index
-	now := time.Now().Unix()
+	now := applyNow(log)
+	// The pending-load index is replicated state, so only apply prunes it,
+	// and by the entry's time: every server then drops the same claims at the
+	// same log position. Reads used to prune with the reading server's clock,
+	// which made servers disagree once apply stopped reading the clock (C1).
+	f.pruneExpiredPendingReservationsLocked(now)
 
 	switch cmd.Op {
 	case opPlace:
@@ -882,6 +1140,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			if existing.IsDeleting() {
 				return fmt.Errorf("%w: %s is being deleted", ErrReservationConflict, cmd.SandboxID)
 			}
+		}
+		// A missing row is not proof the lifetime is new: a node that was cut
+		// off while the cluster deleted its sandbox replays the old
+		// incarnation here. Without this the placement came back (C2).
+		if !exists && cmd.RefuseDeletedLifecycle && f.deletedLifecycleRetainedLocked(cmd.SandboxID, cmd.IncarnationID) {
+			return fmt.Errorf("%w: %s incarnation %q", ErrPlacementDeleted, cmd.SandboxID, strings.TrimSpace(cmd.IncarnationID))
 		}
 		if exists && existing.OwnerNodeID == cmd.OwnerNodeID && cmd.Spec == nil && !cmd.hasSecretUpdate() && !existing.IsReserved() {
 			return nil
@@ -983,6 +1247,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			OwnerNodeID:          cmd.OwnerNodeID,
 			OwnerAPIURL:          cmd.OwnerAPIURL,
 			OwnerDataPlaneHost:   dataPlaneHost,
+			OwnerSinceUnixNano:   ownerSinceAfter(existing, exists, cmd.OwnerNodeID, log),
+			OwnerEpoch:           ownerEpochAfter(existing, exists, cmd.OwnerNodeID, f.version),
 			Version:              f.version,
 			CreatedUnix:          created,
 			UpdatedUnix:          now,
@@ -1004,6 +1270,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// to recompute it from and must not silently make the sandbox
 			// private. A present spec still overrides it.
 			PublicTraffic: exists && existing.PublicTraffic,
+			// Same rule for the failover policy mirror.
+			FailoverRecreate: exists && existing.FailoverRecreate,
 			// opPlace is the promotion path for reservations: writing the
 			// empty State here transitions a Reserved row back to Placed.
 			// ExpiresUnix is cleared by the zero-value as well so the GC
@@ -1018,6 +1286,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.claimShardLocked(cmd.SandboxID)
 		f.claimOwnerRefLocked(cmd.SandboxID, ownerRef)
 		f.claimOwnerLocked(cmd.SandboxID, p)
+		if exists && existing.IsReserved() {
+			// The reservation's pending load was released above, and the
+			// owner's next heartbeat has not been taken yet.
+			f.recordUnreportedLocked(cmd.OwnerNodeID, spec)
+		}
 		return nil
 	case opReserve:
 		// Reservations are the first-half of the two-step create: the router
@@ -1073,8 +1346,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, expectedIncarnationID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.deletingIndex, cmd.SandboxID)
+		f.unindexDeletedPlacementLocked(cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opBeginDelete:
@@ -1152,11 +1426,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
 			}
 		}
+		// The attachments below are the last link from a sandbox to a
+		// delete_with_sandbox volume: record what they leave owed first.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordVolumeReclaimsLocked(cmd.SandboxID, cmd.VolumeReclaimNodeID, cmd.StampUnixNano)
+		}
 		f.releaseVolumeAttachmentsForSandboxLocked(cmd.SandboxID)
 		f.deletePlacementRecoveryLocked(cmd.SandboxID)
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
+		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.deletingIndex, cmd.SandboxID)
+		f.unindexDeletedPlacementLocked(cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opPruneAuditACL:
@@ -1202,9 +1482,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		previousOwner := existing.OwnerNodeID
 		ownerChanged := previousOwner != cmd.OwnerNodeID
 		recordPlacementAuditNode(&existing, previousOwner)
-		existing.OwnerNodeID = cmd.OwnerNodeID
-		existing.OwnerAPIURL = cmd.OwnerAPIURL
-		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		setPlacementOwner(&existing, cmd.OwnerNodeID, cmd.OwnerAPIURL, cmd.OwnerDataPlaneHost, log)
 		if cmd.OwnerNodeID == "" {
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			if existing.OrphanedOwnerNodeID == "" {
@@ -1229,6 +1507,21 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.claimOwnerLocked(cmd.SandboxID, existing)
 		}
 		if cmd.ReassignCause == reassignCauseFailover {
+			// A reserved row keeps its load pending under the new owner
+			// (claimed just above). A placed one was never pending, so
+			// without this the new owner looked as empty as its last
+			// heartbeat to every reassign after this one in the same
+			// eviction. It counts until the new owner's next heartbeat; one
+			// taken before the owner watcher there recreates the sandbox
+			// still misses it (live run UC-478: a heartbeat half way through
+			// an eviction over-assigned both survivors). The worker's
+			// admitter then refuses the overflow and the owner watcher
+			// hands it back (handBackRefusedPlacement). Only failover moves
+			// count: a WASM migrate reassigns to the node that already
+			// holds the sandbox.
+			if !wasReserved && ownerChanged {
+				f.recordUnreportedLocked(cmd.OwnerNodeID, existing.Spec)
+			}
 			return reassignApplyResult{Changed: ownerChanged}
 		}
 		return nil
@@ -1243,9 +1536,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 			f.releaseOwnerLocked(id, existing)
 			recordPlacementAuditNode(&existing, cmd.NodeID)
-			existing.OwnerNodeID = ""
-			existing.OwnerAPIURL = ""
-			existing.OwnerDataPlaneHost = ""
+			setPlacementOwner(&existing, "", "", "", log)
 			existing.OwnerState = PlacementOwnerStateOrphaned
 			existing.OrphanedOwnerNodeID = cmd.NodeID
 			existing.OrphanedUnix = now
@@ -1269,8 +1560,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseVolumeAttachmentsForIncarnationLocked(id, existing.IncarnationID)
 			f.deletePlacementRecoveryLocked(id)
 			f.releaseEgressProfilesLocked(id)
+			f.reindexTeamUsageLocked(id, nil)
 			delete(f.placements, id)
-			delete(f.deletingIndex, id)
+			f.unindexDeletedPlacementLocked(id)
 			f.recordPlacementChangeLocked(id, true)
 		}
 		// Drop the dead node's snapshot-home entries: its local SQLite catalogue
@@ -1341,9 +1633,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			}
 		}
 		recordPlacementAuditNode(&existing, existing.OrphanedOwnerNodeID)
-		existing.OwnerNodeID = cmd.OwnerNodeID
-		existing.OwnerAPIURL = cmd.OwnerAPIURL
-		existing.OwnerDataPlaneHost = cmd.OwnerDataPlaneHost
+		setPlacementOwner(&existing, cmd.OwnerNodeID, cmd.OwnerAPIURL, cmd.OwnerDataPlaneHost, log)
 		existing.OwnerState = PlacementOwnerStateActive
 		existing.OrphanedOwnerNodeID = ""
 		existing.OrphanedUnix = 0
@@ -1371,6 +1661,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		expectedIncarnationID := strings.TrimSpace(cmd.ExpectedIncarnationID)
 		if expectedIncarnationID == "" || strings.TrimSpace(existing.IncarnationID) != expectedIncarnationID {
 			return fmt.Errorf("%w: spec update want %q have %q", ErrIncarnationConflict, expectedIncarnationID, existing.IncarnationID)
+		}
+		if err := specVersionFence(cmd, existing.Version); err != nil {
+			return err
 		}
 		if cmd.hasSecretUpdate() {
 			if err := validatePlacementSecretHandle(cmd.SandboxID, cmd.placementSecrets()); err != nil {
@@ -1475,9 +1768,10 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		route := ExposedPortRoute{
-			Protocol:  cmd.Protocol,
-			HostPort:  cmd.HostPort,
-			PublicURL: cmd.PublicURL,
+			Protocol:   cmd.Protocol,
+			HostPort:   cmd.HostPort,
+			PublicURL:  cmd.PublicURL,
+			Visibility: cmd.Visibility,
 		}
 		if route.Protocol == "" {
 			route.Protocol = existing.ExposedPorts[cmd.Port]
@@ -1743,6 +2037,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		state.Committed[nodeID] = pending
 		delete(state.Pending, nodeID)
 		return nil
+	case opPutTeamQuota:
+		result, err := f.applyPutTeamQuotaLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteTeamQuota:
+		if err := f.applyDeleteTeamQuotaLocked(cmd); err != nil {
+			return err
+		}
+		return nil
 	case opPutEgressProfile:
 		result, err := f.applyPutEgressProfileLocked(cmd)
 		if err != nil {
@@ -1762,6 +2067,115 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteAPIToken:
 		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutWarmPool:
+		result, err := f.applyPutWarmPoolLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteWarmPool:
+		if err := f.applyDeleteWarmPoolLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opSetKubeWarmDepths:
+		result, err := f.applySetKubeWarmDepthsLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opSetRunStates:
+		result, err := f.applySetRunStatesLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDenyNode:
+		result, err := f.applyDenyNodeLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
+	case opPutJoinToken:
+		result, err := f.applyPutJoinTokenLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteJoinToken:
+		if err := f.applyDeleteJoinTokenLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opAdmitNode:
+		result, err := f.applyAdmitNodeLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
+	case opAdmitNodeByCert:
+		result, err := f.applyAdmitNodeByCertLocked(cmd, log.Index)
+		if err != nil {
+			return err
+		}
+		return result
+	case opAdoptNodes:
+		result, err := f.applyAdoptNodesLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRekeyNode:
+		result, err := f.applyRekeyNodeLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opSetActiveVersion:
+		result, err := f.applySetActiveVersionLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRolloutCommand:
+		result, err := f.applyRolloutCommandLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opRolloutNode:
+		result, err := f.applyRolloutNodeLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opAckVolumeReclaim:
+		if err := f.applyAckVolumeReclaimLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opClaimVolumeReclaim:
+		if err := f.applyClaimVolumeReclaimLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutIdentityKeys:
+		result, err := f.applyPutIdentityKeysLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opPutIdentityRole:
+		result, err := f.applyPutIdentityRoleLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteIdentityRole:
+		if err := f.applyDeleteIdentityRoleLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -1897,6 +2311,11 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		// The row was the last record of where the bytes are: record what
+		// they are owed in the same apply.
+		if cmd.VolumeReclaimNodeID != "" {
+			f.recordDeletedVolumeReclaimLocked(row, cmd)
+		}
 		return nil
 	case opRegisterSnapshotNode:
 		// Idempotent get-or-set-or-move: a re-register with the same name
@@ -2001,6 +2420,14 @@ func placementName(p Placement) string {
 	return specName(p.Spec)
 }
 
+// validateReservationBatchLocked refuses an opReserveBatch before any item is
+// written, so a batch is all-or-nothing. Each item must pass
+// checkReservationLocked, the same check a single opReserve makes, against
+// the state before the batch; a hand-copied subset here once let a later
+// item fail after earlier items were stored. On top of that no two items may
+// share a sandbox id or a name. Items cannot unblock each other: with ids
+// unique, an earlier write touches only its own row plus the name index,
+// which the name check below already covers.
 func (f *placementFSM) validateReservationBatchLocked(reservations []reservationCommand, now int64) error {
 	seenIDs := make(map[string]struct{}, len(reservations))
 	seenNames := make(map[string]string, len(reservations))
@@ -2013,13 +2440,9 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 		}
 		seenIDs[r.SandboxID] = struct{}{}
 
-		if existing, exists := f.fullPlacementLocked(r.SandboxID); exists {
-			if !existing.IsReserved() {
-				return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
-			if existing.OwnerNodeID != r.OwnerNodeID && now <= existing.ExpiresUnix {
-				return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, r.SandboxID, existing.OwnerNodeID)
-			}
+		existing, exists := f.fullPlacementLocked(r.SandboxID)
+		if err := f.checkReservationLocked(commandFromReservation(r), existing, exists, now); err != nil {
+			return err
 		}
 
 		name := specName(r.Spec)
@@ -2030,14 +2453,25 @@ func (f *placementFSM) validateReservationBatchLocked(reservations []reservation
 			return fmt.Errorf("%w: %q appears more than once in reservation batch", ErrNameConflict, name)
 		}
 		seenNames[name] = r.SandboxID
-		if err := f.validateNameUniqueLocked(r.SandboxID, name); err != nil {
-			return err
-		}
 	}
 	return nil
 }
 
-func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+// isReservationRetry reports whether cmd re-reserves a live reservation from
+// the same owner. The check and the write share it so they cannot disagree
+// about which branch a command takes.
+func isReservationRetry(existing Placement, cmd command, now int64) bool {
+	return existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix
+}
+
+// checkReservationLocked returns the error reservePlacementLocked would
+// return for cmd, without writing anything. It is the single list of
+// opReserve rejections: validateReservationBatchLocked runs it for every
+// batch item before the first write, so a rule added here is enforced
+// atomically for batches too. existing/exists are the caller's
+// fullPlacementLocked lookup, passed in so the hot opReserve path hydrates
+// the recovery payload once.
+func (f *placementFSM) checkReservationLocked(cmd command, existing Placement, exists bool, now int64) error {
 	if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
 		return fmt.Errorf("placementFSM: opReserve requires sandbox_id and owner_node_id")
 	}
@@ -2046,17 +2480,17 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			return err
 		}
 	}
-	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
 	if exists {
 		// Reject when the slot is already materialized — a router racing a
 		// completed sandbox should back off and let the caller see 409.
 		if !existing.IsReserved() {
 			return fmt.Errorf("%w: %s already placed by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
 		}
-		// Re-reserve from the same owner before expiry is an idempotent retry —
-		// refresh the TTL (and recipient set when supplied) and treat it as a
-		// no-op otherwise.
-		if existing.OwnerNodeID == cmd.OwnerNodeID && now <= existing.ExpiresUnix {
+		if isReservationRetry(existing, cmd, now) {
+			// A retry refreshes the TTL only, so it must be the same create:
+			// same incarnation and, when it carries one, the same secret
+			// handle. The name is not re-checked because a retry keeps the
+			// row's spec.
 			if strings.TrimSpace(existing.IncarnationID) != strings.TrimSpace(cmd.IncarnationID) {
 				return fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict)
 			}
@@ -2064,6 +2498,28 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 				existing.SecretSealGeneration != cmd.SecretSealGeneration) {
 				return fmt.Errorf("%w: reservation retry changed its secret handle", ErrInvalidSecretHandle)
 			}
+			return nil
+		}
+		if now <= existing.ExpiresUnix {
+			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
+		}
+		// Expired: the write path releases the old row's indexes and
+		// overwrites it. The old row's own name maps to this same sandbox
+		// id, so it never blocks the check below.
+	}
+	return f.validateNameUniqueLocked(cmd.SandboxID, specName(cmd.Spec))
+}
+
+func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
+	existing, exists := f.fullPlacementLocked(cmd.SandboxID)
+	if err := f.checkReservationLocked(cmd, existing, exists, now); err != nil {
+		return err
+	}
+	if exists {
+		// Re-reserve from the same owner before expiry is an idempotent retry —
+		// refresh the TTL (and recipient set when supplied) and treat it as a
+		// no-op otherwise.
+		if isReservationRetry(existing, cmd, now) {
 			existing.ExpiresUnix = cmd.ExpiresUnix
 			existing.Version = f.version
 			existing.UpdatedUnix = now
@@ -2084,28 +2540,23 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 			f.refreshPendingReservationExpiryLocked(cmd.SandboxID, cmd.ExpiresUnix)
 			return nil
 		}
-		// Expired reservations are eligible for overwrite by a fresh reservation.
-		if now > existing.ExpiresUnix {
-			f.releasePendingReservationLocked(cmd.SandboxID)
-			f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
-			f.releaseNameLocked(cmd.SandboxID, placementName(existing))
-			f.releaseShardLocked(cmd.SandboxID)
-			f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
-			f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
-		} else {
-			return fmt.Errorf("%w: %s reserved by %s", ErrReservationConflict, cmd.SandboxID, existing.OwnerNodeID)
-		}
+		// checkReservationLocked refused a live reservation held by another
+		// owner, so this row has expired and a fresh reservation overwrites it.
+		f.releasePendingReservationLocked(cmd.SandboxID)
+		f.releasePendingReservationOwnerLocked(cmd.SandboxID, existing.OwnerNodeID)
+		f.releaseNameLocked(cmd.SandboxID, placementName(existing))
+		f.releaseShardLocked(cmd.SandboxID)
+		f.releaseOwnerRefLocked(cmd.SandboxID, existing.OwnerRef)
+		f.releaseVolumeAttachmentsForIncarnationLocked(cmd.SandboxID, existing.IncarnationID)
 	}
 	name := specName(cmd.Spec)
-	if err := f.validateNameUniqueLocked(cmd.SandboxID, name); err != nil {
-		return err
-	}
 	secrets := applyCommandSecretUpdate(Placement{}, false, cmd)
 	p := Placement{
 		SandboxID:            cmd.SandboxID,
 		OwnerNodeID:          cmd.OwnerNodeID,
 		OwnerAPIURL:          cmd.OwnerAPIURL,
 		OwnerDataPlaneHost:   cmd.OwnerDataPlaneHost,
+		OwnerEpoch:           f.version,
 		Version:              f.version,
 		CreatedUnix:          now,
 		UpdatedUnix:          now,
@@ -2421,6 +2872,18 @@ func (f *placementFSM) validateHostPortAvailableLocked(sandboxID string, port in
 	return nil
 }
 
+// recordUnreportedLocked hands owner's new load to this server's unreported
+// ledger. It runs on every server and on log replay; a replayed entry is
+// counted until the owner's next heartbeat, which is over-counting, the safe
+// direction.
+func (f *placementFSM) recordUnreportedLocked(owner string, spec *models.CreateSandboxRequest) {
+	u := f.unreported.Load()
+	if u == nil || owner == "" {
+		return
+	}
+	u.record(owner, capacityRequestFromSpec(spec))
+}
+
 func (f *placementFSM) claimPendingReservationLocked(sandboxID string, p Placement) {
 	if sandboxID == "" || !p.IsReserved() {
 		return
@@ -2524,12 +2987,19 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 	if owner == "" {
 		return 0
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.pendingReservationIDsByOwner == nil {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.livePendingReservationCountLocked(owner, now)
+}
+
+// livePendingReservationCountLocked is livePendingReservationCount for a
+// caller that holds f.mu.
+func (f *placementFSM) livePendingReservationCountLocked(owner string, now int64) int {
+	if owner == "" || f.pendingReservationIDsByOwner == nil {
 		return 0
 	}
-	f.pruneExpiredPendingReservationsLocked(now)
+	// No prune here: see pendingReservationLoadByNode. Expired claims are
+	// skipped below instead.
 	ids := f.pendingReservationIDsByOwner[owner]
 	if len(ids) == 0 {
 		return 0
@@ -2548,11 +3018,16 @@ func (f *placementFSM) livePendingReservationCount(owner string, now int64) int 
 }
 
 func (f *placementFSM) refreshPendingReservationExpiryLocked(sandboxID string, expiresUnix int64) {
-	if f.pendingReservationClaims == nil {
-		return
-	}
 	claim, ok := f.pendingReservationClaims[sandboxID]
 	if !ok {
+		// Apply prunes claims by entry time. Entry times normally rise, but a
+		// new leader's clock can run behind the old one's, so a retry stamped
+		// before the old expiry can follow an entry that already pruned this
+		// claim. The caller has just stored the row, still reserved, with its
+		// new expiry: count its load again rather than lose it (I4).
+		if p, exists := f.fullPlacementLocked(sandboxID); exists && p.IsReserved() {
+			f.claimPendingReservationLocked(sandboxID, p)
+		}
 		return
 	}
 	claim.ExpiresUnix = expiresUnix
@@ -2695,6 +3170,11 @@ func (f *placementFSM) storeRecoveryBlob(blob RecoveryBlob) error {
 	if ref != blob.Ref {
 		return fmt.Errorf("placement recovery blob ref mismatch: got %s want %s", ref, blob.Ref)
 	}
+	// A fetched blob belongs to a snapshot row: no log entry here would
+	// write it again after a crash, so it is made durable now.
+	if syncer, ok := f.recoveryStore.(recoveryStoreSyncer); ok {
+		return syncer.SyncRef(ref)
+	}
 	return nil
 }
 
@@ -2708,6 +3188,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 	} else {
 		f.reindexEgressProfilesLocked(id, nil, &hot)
 	}
+	f.reindexTeamUsageLocked(id, &hot)
 	if rec.empty() {
 		if hot.RecoveryRef == "" {
 			delete(f.recovery, id)
@@ -2735,6 +3216,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 }
 
 func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
+	f.indexOrphanedRecoveryLocked(id, p)
 	if f.deletingIndex == nil {
 		f.deletingIndex = make(map[string]struct{})
 	}
@@ -2743,6 +3225,62 @@ func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
 		return
 	}
 	delete(f.deletingIndex, id)
+}
+
+// indexOrphanedRecoveryLocked keeps id in orphanedRecoveryIndex exactly
+// while its hot row p is orphaned and still wants a failover recreate.
+func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
+	if f.orphanedRecoveryIndex == nil {
+		f.orphanedRecoveryIndex = newPlacementIDIndex()
+	}
+	if p.IsOrphaned() && placementMovableOnFailover(p) {
+		f.orphanedRecoveryIndex.ReplaceOrInsert(id)
+		return
+	}
+	f.orphanedRecoveryIndex.Delete(id)
+}
+
+// unindexDeletedPlacementLocked drops a deleted row from the indexes kept
+// by state.
+func (f *placementFSM) unindexDeletedPlacementLocked(id string) {
+	delete(f.deletingIndex, id)
+	if f.orphanedRecoveryIndex != nil {
+		f.orphanedRecoveryIndex.Delete(id)
+	}
+}
+
+// orphanedRecoveryLen is the size of orphanedRecoveryIndex.
+func (f *placementFSM) orphanedRecoveryLen() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.orphanedRecoveryIndex == nil {
+		return 0
+	}
+	return f.orphanedRecoveryIndex.Len()
+}
+
+// orphanedRecoveryPage returns up to limit ids from orphanedRecoveryIndex
+// after the cursor, in order, and whether the walk reached the end.
+func (f *placementFSM) orphanedRecoveryPage(after string, limit int) ([]string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.orphanedRecoveryIndex == nil || limit <= 0 {
+		return nil, true
+	}
+	ids := make([]string, 0, limit)
+	end := true
+	f.orphanedRecoveryIndex.AscendGreaterOrEqual(after, func(id string) bool {
+		if after != "" && id <= after {
+			return true
+		}
+		if len(ids) == limit {
+			end = false
+			return false
+		}
+		ids = append(ids, id)
+		return true
+	})
+	return ids, end
 }
 
 func (f *placementFSM) deletePlacementRecoveryLocked(id string) {
@@ -2763,11 +3301,21 @@ func splitPlacement(p Placement) (Placement, placementRecovery) {
 	// the hot row already carries rather than clearing it.
 	if p.Spec != nil {
 		p.PublicTraffic = p.Spec.AllowPublicTraffic != nil && *p.Spec.AllowPublicTraffic
+		// The failover policy rides the hot row for the same readers: an
+		// ingress's age limit reads it to put only movable sandboxes in flux.
+		p.FailoverRecreate = specWantsFailoverRecreate(p.Spec)
 		// Egress profile references ride the hot row too: the FSM's
 		// reference index and apply-time cap check read them without
 		// hydrating the spec.
 		p.EgressProfiles = append([]string(nil), p.Spec.EgressProfiles...)
 		p.EgressInlineHostnames = egressInlineHostnames(p.Spec)
+		p.KubeClaim = kubeClaimMarkOf(p.Spec)
+		// A team's sandbox carries its size on the hot row, so the quota
+		// index is rebuilt on Restore without hydrating every spec. Other
+		// owners pay nothing for it.
+		if models.TeamOfOwnerRef(p.OwnerRef) != "" {
+			p.QuotaCPU, p.QuotaMemoryMB = models.QuotaSize(p.Spec.CPU, p.Spec.MemoryMB)
+		}
 	}
 	p.Spec = nil
 	p.SecretRef = ""
@@ -2788,6 +3336,21 @@ func (f *placementFSM) get(id string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return clonePlacement(p), true
+}
+
+// getHot is get without the recovery payload (spec and secrets): the hot
+// row every replica holds in memory. A reader that needs only the owner, its
+// epoch, the incarnation or the state uses it, so it never reads the
+// recovery store from disk (F30: at 1,174 creates a second, owner lookups
+// that missed the cache spent 8% of the leader's CPU there).
+func (f *placementFSM) getHot(id string) (Placement, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.placements[id]
+	if !ok {
+		return Placement{}, false
+	}
+	return cloneHotPlacement(p), true
 }
 
 // placementsByIDs returns hot clones for the requested IDs. Missing IDs are
@@ -2927,10 +3490,19 @@ func (f *placementFSM) pendingReservationsByNode(now int64) map[string]capacity.
 // reservations counted by owner and runtime, read under one lock so the two
 // agree. Placement needs both: the aggregate for CPU, memory and disk, the
 // counts for network slots (a pool serves some runtimes, not others).
+//
+// It never prunes: the index is replicated state that only apply may change
+// (see apply). Claims that expired after the last applied entry are left out
+// of the answer instead, so a read at a later time still sees the right load.
 func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capacity.Request, map[string]map[string]int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pruneExpiredPendingReservationsLocked(now)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pendingReservationLoadByNodeLocked(now)
+}
+
+// pendingReservationLoadByNodeLocked is pendingReservationLoadByNode for a
+// caller that holds f.mu. The maps it returns are copies.
+func (f *placementFSM) pendingReservationLoadByNodeLocked(now int64) (map[string]capacity.Request, map[string]map[string]int) {
 	out := make(map[string]capacity.Request, len(f.pendingReservationCapacity))
 	for owner, req := range f.pendingReservationCapacity {
 		out[owner] = req
@@ -2943,7 +3515,165 @@ func (f *placementFSM) pendingReservationLoadByNode(now int64) (map[string]capac
 		}
 		runtimes[owner] = cp
 	}
+	f.forEachExpiredClaimLocked(now, func(claim pendingReservationClaim) {
+		subtractPendingLoad(out, runtimes, claim.OwnerNodeID, claim.Request)
+	})
 	return out, runtimes
+}
+
+// heldReservation is a reservation the leader has admitted and proposed but
+// has not yet seen applied: one item of an admission hold
+// (admission_ledger.go).
+type heldReservation struct {
+	SandboxID     string
+	OwnerNodeID   string
+	IncarnationID string
+	Request       capacity.Request
+}
+
+// admissionPendingLoad is the pending load the leader admits a reservation
+// against: live claims in the index (pendingReservationLoadByNode), the live
+// pending count of each of owners (livePendingReservationCount), and every
+// held reservation the index does not count yet.
+//
+// All of it is read under one lock. A hold is released only after apply has
+// added its claim to the index, and the caller holds the admission lock, so
+// no hold leaves while this runs; the claims may still change. Deciding "is
+// this hold in the index already?" from the same read as the index totals is
+// what counts every reservation exactly once: as a claim or as a hold. From
+// two reads, an apply in between could hide one from both (I4), or show it
+// in both and refuse a create that fits.
+//
+// A hold counts unless the index has a live claim for the same sandbox on
+// the same owner with the same load: that claim is the hold's own entry,
+// already applied, or the reservation it retries. Anything else (no claim,
+// an expired one, another owner or size) is counted again, which can only
+// over-count. Holds for the same sandbox, owner and incarnation are one
+// create sent twice and count once.
+func (f *placementFSM) admissionPendingLoad(now int64, owners []string, held []heldReservation) (map[string]capacity.Request, map[string]map[string]int, map[string]int) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	load, runtimes := f.pendingReservationLoadByNodeLocked(now)
+	counts := make(map[string]int, len(owners))
+	for _, owner := range owners {
+		if _, ok := counts[owner]; !ok {
+			counts[owner] = f.livePendingReservationCountLocked(owner, now)
+		}
+	}
+	type heldKey struct{ sandbox, owner, incarnation string }
+	seen := make(map[heldKey]struct{}, len(held))
+	for _, h := range held {
+		if h.SandboxID == "" || h.OwnerNodeID == "" {
+			continue
+		}
+		key := heldKey{h.SandboxID, h.OwnerNodeID, h.IncarnationID}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if claim, ok := f.pendingReservationClaims[h.SandboxID]; ok && claim.OwnerNodeID == h.OwnerNodeID &&
+			(claim.ExpiresUnix <= 0 || now <= claim.ExpiresUnix) && samePendingLoad(claim.Request, h.Request) {
+			continue
+		}
+		addPendingLoad(load, runtimes, h.OwnerNodeID, h.Request)
+		if _, ok := counts[h.OwnerNodeID]; ok {
+			counts[h.OwnerNodeID]++
+		}
+	}
+	return load, runtimes, counts
+}
+
+// samePendingLoad compares the fields the pending index sums.
+func samePendingLoad(a, b capacity.Request) bool {
+	return a.CPU == b.CPU && a.MemoryMB == b.MemoryMB && a.DiskGB == b.DiskGB && a.GPUs == b.GPUs && a.Runtime == b.Runtime
+}
+
+// addPendingLoad adds one reservation to a copy of the pending aggregates,
+// the same way addPendingCapacityLocked does on the index.
+func addPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	cur := load[owner]
+	cur.CPU += req.CPU
+	cur.MemoryMB += req.MemoryMB
+	cur.DiskGB += req.DiskGB
+	cur.GPUs += req.GPUs
+	load[owner] = cur
+	byRuntime := runtimes[owner]
+	if byRuntime == nil {
+		byRuntime = make(map[string]int)
+		runtimes[owner] = byRuntime
+	}
+	byRuntime[req.Runtime]++
+}
+
+// forEachExpiredClaimLocked calls fn once for every claim that has expired
+// by now but is still in the index (apply has not yet reached an entry past
+// its expiry). It walks only the expired part of the expiry min-heap: a node
+// that has not expired has no expired descendants, so the cost is the number
+// of expired entries, not the number of reservations. Heap entries left by a
+// refresh (an older expiry for the same claim) are skipped. Caller holds f.mu
+// for reading.
+func (f *placementFSM) forEachExpiredClaimLocked(now int64, fn func(pendingReservationClaim)) {
+	h := f.pendingReservationExpiries
+	if now <= 0 || len(h) == 0 {
+		return
+	}
+	var seen map[string]struct{}
+	stack := []int{0}
+	for len(stack) > 0 {
+		i := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if i >= len(h) {
+			continue
+		}
+		e := h[i]
+		if e.ExpiresUnix <= 0 || now <= e.ExpiresUnix {
+			continue
+		}
+		stack = append(stack, 2*i+1, 2*i+2)
+		claim, ok := f.pendingReservationClaims[e.SandboxID]
+		if !ok || claim.ExpiresUnix != e.ExpiresUnix {
+			continue
+		}
+		if _, dup := seen[e.SandboxID]; dup {
+			continue
+		}
+		if seen == nil {
+			seen = make(map[string]struct{})
+		}
+		seen[e.SandboxID] = struct{}{}
+		fn(claim)
+	}
+}
+
+// subtractPendingLoad removes one claim from a copy of the pending
+// aggregates, the same way subtractPendingCapacityLocked does on the index.
+func subtractPendingLoad(load map[string]capacity.Request, runtimes map[string]map[string]int, owner string, req capacity.Request) {
+	if owner == "" {
+		return
+	}
+	if byRuntime := runtimes[owner]; byRuntime != nil {
+		if byRuntime[req.Runtime] <= 1 {
+			delete(byRuntime, req.Runtime)
+		} else {
+			byRuntime[req.Runtime]--
+		}
+		if len(byRuntime) == 0 {
+			delete(runtimes, owner)
+		}
+	}
+	cur, ok := load[owner]
+	if !ok {
+		return
+	}
+	cur.CPU -= req.CPU
+	cur.MemoryMB -= req.MemoryMB
+	cur.DiskGB -= req.DiskGB
+	cur.GPUs -= req.GPUs
+	if cur.CPU == 0 && cur.MemoryMB == 0 && cur.DiskGB == 0 && cur.GPUs == 0 {
+		delete(load, owner)
+		return
+	}
+	load[owner] = cur
 }
 
 func (f *placementFSM) expiredReservationIDs(now int64) []string {
@@ -3414,6 +4144,50 @@ type fsmSnapshotPayload struct {
 	// Optional; an older snapshot decodes it as nil, which reads as "no
 	// tokens". An older build decoding a newer snapshot ignores the field.
 	APITokens []identity.TokenRecord
+	// WarmPools is the replicated warm-pool entry set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no entries". An older
+	// build decoding a newer snapshot ignores the field, which is safe
+	// because no entry can be written until every server runs a build with
+	// it (warmPoolFSMOpsVersion).
+	WarmPools []WarmPoolRecord
+	// KubeWarm is the agent-sandbox API's warm-pool depths. Optional, as
+	// WarmPools; nothing is written until every server applies
+	// opSetKubeWarmDepths (kubeWarmFSMOpsVersion).
+	KubeWarm []KubeWarmDepth
+	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
+	// (sealed) and role allow lists. Optional; an older snapshot decodes
+	// them as nil, which reads as "no keys, no roles".
+	IdentityKeys  *cloudidentity.KeySet
+	IdentityRoles []IdentityRoleRecord
+	// TeamQuotas is the replicated team-quota set. Optional; an older
+	// snapshot decodes it as nil, which reads as "no quotas".
+	TeamQuotas []TeamQuotaRecord
+	// VolumeReclaims are the delete_with_sandbox volumes still owed a
+	// backend delete. Optional; an older snapshot decodes it as nil, which
+	// reads as "none owed". An older build ignores the field, which is safe
+	// because no entry is written until every server runs a build with it
+	// (volumeReclaimFSMOpsVersion).
+	VolumeReclaims []VolumeReclaim
+	// DeniedNodes are the deleted node IDs. Optional; an older snapshot
+	// decodes it as nil, which reads as "none denied". An older build ignores
+	// the field, which is safe because no record is written until every
+	// server runs a build with it (nodeDenyFSMOpsVersion).
+	DeniedNodes []NodeDenyRecord
+	// JoinTokens, AdmittedNodes and RevokedKeys are the join state
+	// (fsm_join.go). Optional; an older snapshot decodes them as nil, which
+	// reads as nothing issued, admitted or revoked. An older build ignores
+	// them, which is safe because nothing is written until every server runs
+	// a build with them (joinFSMOpsVersion).
+	JoinTokens    []JoinTokenRecord
+	AdmittedNodes []AdmittedNode
+	RevokedKeys   []RevokedKey
+	// ActiveVersion and Rollout are the active cluster version and the
+	// rollout (fsm_rollout.go). Optional; an older snapshot decodes them as
+	// nil, which reads as "never written, no rollout". An older build
+	// ignores them, which is safe because nothing is written until every
+	// server runs a build with them (rolloutFSMOpsVersion).
+	ActiveVersion *ActiveVersion
+	Rollout       *RolloutRecord
 }
 
 type placementSnapshotRow struct {
@@ -3479,6 +4253,8 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 			Issued:    cloneArtifactCatalogIssued(state.Issued),
 		}
 	}
+	identityKeys, identityRoles := f.identitySnapshotLocked()
+	activeVersion, rollout := f.rolloutSnapshotLocked()
 	return &fsmSnapshot{
 		version:            version,
 		rows:               rows,
@@ -3490,12 +4266,37 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		auditACLs:          auditACLs,
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
+		volumeReclaims:     f.volumeReclaimsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
+		teamQuotas:         f.teamQuotasSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
 		apiTokens:          f.apiTokens().snapshot(),
+		warmPools:          f.warmPoolsSnapshotLocked(),
+		kubeWarm:           f.kubeWarmSnapshotLocked(),
+		identityKeys:       identityKeys,
+		identityRoles:      identityRoles,
+		deniedNodes:        f.deniedNodesSnapshotLocked(),
+		joinTokens:         f.joinTokensSnapshotLocked(),
+		admittedNodes:      f.admittedSnapshotLocked(),
+		revokedKeys:        f.revokedSnapshotLocked(),
+		activeVersion:      activeVersion,
+		rollout:            rollout,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
+		guard:              beginRecoverySnapshot(f.recoveryStore),
 	}, nil
+}
+
+// beginRecoverySnapshot starts the store's tracking of Puts for a snapshot
+// (recoveryStoreSnapshotGuard). The caller holds the FSM lock, so no Put
+// can fall between the rows the snapshot read and this call.
+func beginRecoverySnapshot(store placementRecoveryStore) recoveryStoreSnapshotGuard {
+	guard, ok := store.(recoveryStoreSnapshotGuard)
+	if !ok {
+		return nil
+	}
+	guard.BeginSnapshot()
+	return guard
 }
 
 // Restore loads state from a previously written snapshot. Replaces in-memory
@@ -3571,10 +4372,21 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
+	f.orphanedRecoveryIndex = newPlacementIDIndex()
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	// Usage is derived from the rows re-stored below; the quotas are state.
+	f.teamUsage = make(map[string]*models.TeamQuotaUsage)
+	f.teamUsageEntries = make(map[string]teamUsageEntry)
+	f.restoreTeamQuotasLocked(payload.TeamQuotas)
 	f.apiTokens().restore(payload.APITokens, payload.Version)
+	f.restoreWarmPoolsLocked(payload.WarmPools, payload.Version)
+	f.restoreKubeWarmLocked(payload.KubeWarm)
+	f.restoreIdentityLocked(payload.IdentityKeys, payload.IdentityRoles)
+	f.restoreJoinStateLocked(payload.JoinTokens, payload.AdmittedNodes, payload.RevokedKeys)
+	f.restoreDeniedNodesLocked(payload.DeniedNodes, payload.Version, len(payload.RevokedKeys) > 0)
+	f.restoreRolloutLocked(payload.ActiveVersion, payload.Rollout)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3621,6 +4433,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 		}
 		f.putVolumeAttachmentLocked(a)
 	}
+	f.restoreVolumeReclaimsLocked(payload.VolumeReclaims)
 	for id, p := range payload.Placements {
 		full := p
 		if full.SandboxID == "" {
@@ -3724,11 +4537,27 @@ type fsmSnapshot struct {
 	auditACLs          map[string]AuditACL
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
+	volumeReclaims     []VolumeReclaim
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
 	apiTokens          []identity.TokenRecord
+	warmPools          []WarmPoolRecord
+	kubeWarm           []KubeWarmDepth
+	identityKeys       *cloudidentity.KeySet
+	identityRoles      []IdentityRoleRecord
+	teamQuotas         []TeamQuotaRecord
+	deniedNodes        []NodeDenyRecord
+	joinTokens         []JoinTokenRecord
+	admittedNodes      []AdmittedNode
+	revokedKeys        []RevokedKey
+	activeVersion      *ActiveVersion
+	rollout            *RolloutRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
+	// guard is the store's Put tracking this snapshot began; Release ends
+	// it, once.
+	guard       recoveryStoreSnapshotGuard
+	releaseOnce sync.Once
 }
 
 func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
@@ -3737,6 +4566,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	defer func() {
 		recordSnapshotPersist(time.Since(start), counting.bytes, len(s.rows), err)
 	}()
+	// The snapshot stands in for the log entries that wrote its rows'
+	// recovery blobs once it is closed, and raft may then compact them
+	// away, so the blobs go to disk first (recoveryStoreSyncer).
+	if syncer, ok := s.recoveryStore.(recoveryStoreSyncer); ok {
+		if err := syncer.Sync(); err != nil {
+			_ = sink.Cancel()
+			return fmt.Errorf("fsmSnapshot: %w", err)
+		}
+	}
 	enc := gob.NewEncoder(counting)
 	if err := enc.Encode(fsmSnapshotPayload{
 		Version:            s.version,
@@ -3749,9 +4587,21 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		AuditACLs:          s.auditACLs,
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
+		VolumeReclaims:     s.volumeReclaims,
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
 		APITokens:          s.apiTokens,
+		WarmPools:          s.warmPools,
+		KubeWarm:           s.kubeWarm,
+		IdentityKeys:       s.identityKeys,
+		IdentityRoles:      s.identityRoles,
+		TeamQuotas:         s.teamQuotas,
+		DeniedNodes:        s.deniedNodes,
+		JoinTokens:         s.joinTokens,
+		AdmittedNodes:      s.admittedNodes,
+		RevokedKeys:        s.revokedKeys,
+		ActiveVersion:      s.activeVersion,
+		Rollout:            s.rollout,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
@@ -3765,7 +4615,15 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 	return nil
 }
 
-func (s *fsmSnapshot) Release() {}
+// Release ends the store's Put tracking (recoveryStoreSnapshotGuard). Raft
+// calls it after Persist, whether Persist worked or not.
+func (s *fsmSnapshot) Release() {
+	s.releaseOnce.Do(func() {
+		if s.guard != nil {
+			s.guard.EndSnapshot()
+		}
+	})
+}
 
 type countingSnapshotSink struct {
 	raft.SnapshotSink

@@ -66,7 +66,7 @@ func (c *Client) SessionLog(ctx context.Context, sandboxID, sessionID string) ([
 	}
 	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.send(request)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +86,7 @@ func (c *Client) SessionRecording(ctx context.Context, sandboxID, sessionID stri
 	}
 	c.addAuth(request)
 
-	response, err := c.httpClient.Do(request)
+	response, err := c.send(request)
 	if err != nil {
 		return nil, err
 	}
@@ -146,13 +146,9 @@ func (c *Client) AttachSession(ctx context.Context, sandboxID, sessionID string,
 	if sandboxID == "" || sessionID == "" {
 		return nil, errors.New("sandbox id and session id are required")
 	}
-	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(sandboxID)+"/sessions/"+url.PathEscape(sessionID)+"/attach")
-	if err != nil {
-		return nil, err
-	}
 	requestHeader := http.Header{}
 	c.setAuthHeaders(requestHeader)
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
+	conn, resp, wsURL, err := c.dialSandbox(ctx, c.versionPrefix+"/sandboxes/"+url.PathEscape(sandboxID)+"/sessions/"+url.PathEscape(sessionID)+"/attach", requestHeader)
 	if err != nil {
 		return nil, decorateHandshakeError("session attach", wsURL, resp, err)
 	}

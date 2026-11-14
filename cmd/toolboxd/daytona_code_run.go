@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -141,15 +140,9 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	// The SDK exposes only `result` (stdout) and `exitCode`. Merge stderr in
 	// when stdout is empty so users on a non-zero exit aren't staring at a
 	// blank string; otherwise mirror handleExec and discard it. This also
-	// preserves the spawn-failure message we appended below.
+	// keeps a wait failure that withWaitError adds to stderr.
 	stdoutStr := string(stdoutBytes)
-	stderrStr := string(stderrBytes)
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
-			stderrStr = strings.TrimSpace(stderrStr + "\n" + waitErr.Error())
-		}
-	}
+	stderrStr := withWaitError(string(stderrBytes), waitErr)
 	result := stdoutStr
 	if result == "" {
 		result = stderrStr

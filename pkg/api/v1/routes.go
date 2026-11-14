@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // Deps holds the shared dependencies a version package needs from the
@@ -124,9 +125,19 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, wrap(http.HandlerFunc(h.clusterDestroyWrap))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Route(permWrite, wrap(http.HandlerFunc(h.resizeSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Route(permWrite, wrap(http.HandlerFunc(h.createSnapshot))))
-	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, wrap(http.HandlerFunc(h.updateLifecycle))))
+	// destroy_at is checked against the cluster's builds before the forward
+	// (an older owner would drop it and clear every timer).
+	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/lifecycle", d.Route(permWrite, h.destroyAtUpgradeGate(wrap(http.HandlerFunc(h.updateLifecycle)))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.exposePort))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/ports/{port}", d.Route(permWrite, wrap(http.HandlerFunc(h.unexposePort))))
+	// Signed per-sandbox tokens (A1, pkg/sandboxtoken): sandbox.exec, the
+	// most a token can grant. Forwarded to the owner, which reads the row;
+	// not idempotent by nature (each call mints a new token).
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens", d.Route(permExec, wrap(http.HandlerFunc(h.createSandboxToken))))
+	// Revoking every token issued so far: the same permission and the same
+	// owner forward (the owner's row holds the not-before every check
+	// reads). Idempotent in effect.
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/tokens/revoke", d.Route(permExec, wrap(http.HandlerFunc(h.revokeSandboxTokens))))
 	// Custom domains (plans/custom-domains.md). Gated server-side by
 	// SB_ENABLE_CUSTOM_DOMAINS — routes are always mounted (so a request
 	// hits a 412 rather than a 404 when the cluster has the feature off)
@@ -155,8 +166,30 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
 	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.deleteEgressProfile)))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
+	// Team quotas (plan item P2): an admin caps what a team may hold. Not
+	// sandbox-scoped; in a cluster the service writes them through Raft.
+	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.putTeamQuota)))
+	mux.Handle("GET "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.getTeamQuota)))
+	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.deleteTeamQuota)))
+	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
+	// role-tag allow list is admin only (D1.5), key rotation is the
+	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
+	// the service writes them through Raft. No route returns a token.
+	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.putIdentityRole)))
+	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.deleteIdentityRole)))
+	mux.Handle("GET "+PathPrefix+"/identity/roles", d.Route(permFleet, http.HandlerFunc(h.listIdentityRoles)))
+	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, http.HandlerFunc(h.rotateIdentityKey)))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
+	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
+	// operator config, so fleet.admin even to read (an entry names the
+	// images an operator runs). Not sandbox-scoped, so no owner forwarding;
+	// in a cluster the service writes them through Raft. {image...} takes
+	// the rest of the path, so an image's slashes need no escaping.
+	mux.Handle("GET "+PathPrefix+"/warm-pools", d.Route(permFleet, http.HandlerFunc(h.listWarmPools)))
+	mux.Handle("GET "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.getWarmPool)))
+	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.putWarmPool)))
+	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.deleteWarmPool)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Route(controlplane.PermAuditRead, withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -237,10 +270,59 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	// cordon is drain's clear name (`aerolvm cordon`): the same admission-
+	// only mark. /drain stays for older clients and the lifecycle script.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/cordon", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterGetNode)))
+	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
+	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	// The operator's "this node's machine is gone" (C19): the leader may
+	// fail it over at its ownership lease limit instead of after the grace.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/gone", op(http.HandlerFunc(h.clusterNodeGone)))
+	// One decommission pass over a cordoned node (C9): moves its
+	// recreate-policy sandboxes, tells the owners of the rest, and at the
+	// deadline stops them. The operator calls it until done.
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/evacuate", op(http.HandlerFunc(h.clusterEvacuateNode)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
 	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
+	// Single-node upgrade (plans/kubectl-style-cluster-ops.md §6.1): upload
+	// release files, start `sandboxd upgrade node`, read its progress. 409
+	// cluster_mode on a cluster; the rollout routes own upgrades there.
+	mux.Handle("POST "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStart)))
+	mux.Handle("GET "+upgradewire.NodeUpgradePath, op(http.HandlerFunc(h.nodeUpgradeStatus)))
+	mux.Handle("PUT "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradePutFile)))
+	mux.Handle("HEAD "+upgradewire.NodeUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.nodeUpgradeHeadFile)))
+	// Join service (plans/kubectl-style-cluster-ops.md §4): tokens and
+	// adopt for operators; renewal, the CA key and join writes for peers.
+	// The new machine's own calls never reach this mux: they go to the join
+	// listener (:7003) on servers.
+	mux.Handle("POST "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterCreateJoinToken)))
+	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterListJoinTokens)))
+	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(http.HandlerFunc(h.clusterRevokeJoinToken)))
+	mux.Handle("POST "+cluster.PublicAdoptPath, op(http.HandlerFunc(h.clusterAdopt)))
+	// Cluster upgrades (plans/kubectl-style-cluster-ops.md §6,
+	// cluster_upgrade.go): the rollout for operators; the node step, the
+	// fence and release-file copies for peers.
+	mux.Handle("GET "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterGetUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradePath, op(http.HandlerFunc(h.clusterApplyUpgrade)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeStopPath, op(h.clusterUpgradeCommand(cluster.RolloutStop)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeResumePath, op(h.clusterUpgradeCommand(cluster.RolloutResume)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeFinalizePath, op(h.clusterUpgradeCommand(cluster.RolloutFinalize)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeRollbackPath, op(h.clusterUpgradeCommand(cluster.RolloutRollback)))
+	mux.Handle("PUT "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("HEAD "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
+	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.MoveSuffix, internalOp(http.HandlerFunc(h.clusterNodeMove)))
+	mux.Handle("GET "+cluster.PublicInternalMovePath+"{id}/bundle", internalOp(http.HandlerFunc(h.clusterInternalMoveBundle)))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStatus)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFencePath, internalOp(http.HandlerFunc(h.clusterInternalUpgradeFence)))
+	mux.Handle("GET "+cluster.PublicInternalUpgradeFilesPath+"{sha256}", internalOp(http.HandlerFunc(h.clusterInternalUpgradeFile)))
+	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
+	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
+	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
 	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
 	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
 	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
@@ -261,7 +343,15 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaWritePath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaWrite)))
+	mux.Handle("POST "+cluster.PublicInternalTeamQuotaReadPath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaRead)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityWritePath, internalOp(http.HandlerFunc(h.clusterInternalIdentityWrite)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityReadPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityRead)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
+	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))
+	mux.Handle("POST "+cluster.PublicInternalRunStatesPath, internalOp(http.HandlerFunc(h.clusterInternalRunStates)))
+	mux.Handle("POST "+cluster.PublicInternalSpecSummariesPath, internalOp(http.HandlerFunc(h.clusterInternalSpecSummaries)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenChangesPath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenChanges)))
 	mux.Handle("GET "+cluster.PublicInternalAPITokenPagePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenPage)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
@@ -271,6 +361,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalSnapshotNodePath, internalOp(http.HandlerFunc(h.clusterInternalSnapshotNode)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
 	mux.Handle("GET "+cluster.PublicInternalDrainedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDrainedNodes)))
+	mux.Handle("GET "+cluster.PublicInternalDeniedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDeniedNodes)))
 	mux.Handle("GET "+cluster.PublicInternalStorageObligationsPath, internalOp(http.HandlerFunc(h.clusterInternalStorageObligations)))
 	mux.Handle("POST "+cluster.PublicInternalSecretPath, internalOp(http.HandlerFunc(h.clusterInternalSecretPut)))
 	mux.Handle("HEAD "+cluster.PublicInternalSecretPath+"/{sandboxID}", internalOp(http.HandlerFunc(h.clusterInternalSecretHead)))
@@ -287,9 +378,17 @@ func withInternalMTLS(d Deps, next http.Handler) http.Handler {
 			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
+		if peerDenied(d, peerID) {
+			http.Error(w, cluster.ErrPeerDeleted.Error(), http.StatusForbidden)
+			return
+		}
+		if err := peerKeyRefused(d, r, peerID); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
 		if !peerMemberAlive(d, peerID) {
 			cluster.RecordMTLSUnknownPeer()
-			http.Error(w, "cluster peer not in membership", http.StatusForbidden)
+			http.Error(w, cluster.PeerNotInMembershipMessage, http.StatusForbidden)
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), clusterPeerNodeIDContextKey{}, peerID))

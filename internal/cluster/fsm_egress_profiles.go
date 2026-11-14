@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 5
+	fsmOpsVersion              = 20
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -50,7 +50,45 @@ const (
 	// key-ring build, and a build with fv 4 and without this would drop the
 	// record the gateway handed it.
 	sshSessionOwnerRecordFSMOpsVersion = 5
+	// tokenPortFSMOpsVersion: the cluster's port record carries a port's
+	// visibility, so a failover recreate gates a token port again
+	// (TokenPortsAllowed). No FSM op: an older build decodes the record and
+	// drops the field, which would recreate the port as public.
+	tokenPortFSMOpsVersion = 6
+	// warmPoolFSMOpsVersion: opPutWarmPool, opDeleteWarmPool
+	// (fsm_warm_pools.go).
+	warmPoolFSMOpsVersion = 7
+	// identityFSMOpsVersion: opPutIdentityKeys, opPutIdentityRole,
+	// opDeleteIdentityRole (fsm_identity.go) and the identity create option
+	// a worker must understand; the token_issued audit record needs no gate
+	// (IdentityAllowed).
+	identityFSMOpsVersion = 8
 )
+
+// fsmOpsVersion 9 is P2's team quotas (teamQuotaFSMOpsVersion in
+// fsm_team_quotas.go); 10 is the delete_with_sandbox volume reclaim ledger
+// (volumeReclaimFSMOpsVersion in fsm_volume_reclaims.go); 11 is the
+// deleted-lifecycle fence on opPlace (deletedLifecycleFenceFSMOpsVersion in
+// deleted_lifecycle.go); 12 is the node deny records (nodeDenyFSMOpsVersion
+// in fsm_node_deny.go); 13 is the join tokens, admitted keys and tombstones
+// (joinFSMOpsVersion in fsm_join.go); 14 is the active cluster version and
+// the rollout record (rolloutFSMOpsVersion in fsm_rollout.go); 15 is peer
+// calls by node cert alone, which lets a join leave the PAT out
+// (peerCertAuthFSMOpsVersion in peer_cert_auth.go, no FSM op); 16 is the
+// rollout node's operator flag (rolloutOperatorFSMOpsVersion in
+// rollout_operator.go); 17 is opUpsertSpec's version check
+// (specVersionFenceFSMOpsVersion in spec_version_fence.go); 18 is
+// opSetRunStates (runStateFSMOpsVersion in fsm_run_state.go); 19 is
+// opAdmitNodeByCert (externalCAFSMOpsVersion in fsm_join.go); 20 is
+// opSetKubeWarmDepths (kubeWarmFSMOpsVersion in fsm_kube_warm.go). Versions
+// 6 to 8 are the gates in the block above.
+
+// FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it
+// without a cluster: an operator compares it across nodes before and during
+// a rolling upgrade, when gossip may not be up yet. A function, not an
+// exported constant, so code outside this package cannot gate on it at
+// compile time and skip the per-member checks.
+func FSMOpsVersion() int { return fsmOpsVersion }
 
 var (
 	// ErrEgressProfileInUse is a delete of a profile placements reference.

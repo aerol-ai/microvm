@@ -5,12 +5,15 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -49,7 +52,7 @@ func TestMultiEventsSourceForwardsPastBufferWithoutDeadlock(t *testing.T) {
 	// blocked once the buffer filled. Concurrent drain must forward all.
 	a := &fakeEventsSource{prefix: "a", n: 50}
 	b := &fakeEventsSource{prefix: "b", n: 50}
-	mux := newMultiEventsSource(a, b)
+	mux := newMultiEventsSource(testLogger(), a, b)
 
 	out := make(chan docker.DockerEvent, 8)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -84,7 +87,7 @@ func TestMultiEventsSourceContainerPIDFallsThrough(t *testing.T) {
 	// First source doesn't own the ref (0, nil); second answers.
 	a := &fakeEventsSource{pid: 0}
 	b := &fakeEventsSource{pid: 4242}
-	mux := newMultiEventsSource(a, b)
+	mux := newMultiEventsSource(testLogger(), a, b)
 	pid, err := mux.ContainerPID(context.Background(), "ref")
 	if err != nil || pid != 4242 {
 		t.Fatalf("ContainerPID = (%d, %v), want (4242, nil)", pid, err)
@@ -93,7 +96,7 @@ func TestMultiEventsSourceContainerPIDFallsThrough(t *testing.T) {
 	// All sources error → surface the first error, do not double-invoke.
 	boom := errors.New("boom")
 	c := &fakeEventsSource{pidErr: boom}
-	muxErr := newMultiEventsSource(c)
+	muxErr := newMultiEventsSource(testLogger(), c)
 	if _, err := muxErr.ContainerPID(context.Background(), "ref"); err != nil {
 		// single-source path delegates directly; either the error or nil is
 		// acceptable, but it must not panic or hang.
@@ -192,5 +195,76 @@ func TestWireContainerEngineConfiguresContainerdAOCRPullAuth(t *testing.T) {
 				t.Fatalf("containerd aocr pull auth configured = %v, want %v; logs:\n%s", got, tc.want, logs)
 			}
 		})
+	}
+}
+
+// A configured cgroup parent that cannot hold sandboxes with their limits
+// stops the daemon at boot (plan C7), before any firewall or driver work.
+func TestWireContainerEngineChecksCgroupParent(t *testing.T) {
+	root := t.TempDir()
+	orig := cntr.CgroupRoot
+	cntr.CgroupRoot = root
+	t.Cleanup(func() { cntr.CgroupRoot = orig })
+	if err := os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(root, "pod", "sandboxes")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := config.Config{
+		ContainerEngine:        models.ContainerEngineContainerd,
+		EnableNetworkRules:     false,
+		NetrulesBackend:        "exec",
+		ContainerdCgroupParent: "/pod/sandboxes",
+	}
+
+	// No cgroup.subtree_control: controllers are not handed down.
+	if _, err := wireContainerEngine(context.Background(), cfg, testLogger(), &service.Service{}, st, nil, nil, nil); err == nil ||
+		!strings.Contains(err.Error(), "containerd cgroup parent") {
+		t.Fatalf("err = %v, want a cgroup parent refusal", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(parent, "cgroup.subtree_control"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := wireContainerEngine(context.Background(), cfg, testLogger(), &service.Service{}, st, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("wireContainerEngine with a ready parent: %v", err)
+	}
+	w.Stop()
+}
+
+// C2: without Docker, containerd is the only event source and nothing asks
+// Docker for its bridge.
+func TestDockerOffWiring(t *testing.T) {
+	driver := &fakeEventsSource{prefix: "ctd"}
+	dc := &docker.Client{}
+	on := config.Config{ContainerEngine: models.ContainerEngineContainerd}
+	off := config.Config{ContainerEngine: models.ContainerEngineContainerd, DockerDisabled: true}
+
+	if _, ok := containerdEventsSource(on, testLogger(), dc, driver).(*multiEventsSource); !ok {
+		t.Fatal("Docker on: want Docker and containerd fanned in")
+	}
+	if got := containerdEventsSource(off, testLogger(), dc, driver); got != docker.EventsSource(driver) {
+		t.Fatalf("Docker off: event source %T, want containerd's alone", got)
+	}
+	if got := containerdEventsSource(on, testLogger(), nil, driver); got != docker.EventsSource(driver) {
+		t.Fatalf("no Docker client: event source %T, want containerd's alone", got)
+	}
+
+	if dockerBridgeSource(on, dc) == nil {
+		t.Fatal("Docker on: want the Docker client as the bridge source")
+	}
+	if src := dockerBridgeSource(off, dc); src != nil {
+		t.Fatalf("Docker off: bridge source %v, want a nil interface", src)
+	}
+	if src := dockerBridgeSource(on, nil); src != nil {
+		t.Fatalf("no Docker client: bridge source %v, want a nil interface", src)
 	}
 }

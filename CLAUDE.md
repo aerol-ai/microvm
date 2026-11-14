@@ -131,7 +131,8 @@ internal/
                  secrets, image distribution. Daytona/E2B helpers live here
                  as named files (daytona.go, e2b.go), NOT version-aware
                  branching.
-  store/         SQLite store. Single-writer (MaxOpenConns=1, WAL).
+  store/         SQLite store. One writer (MaxOpenConns=1) + a read-only
+                 pool for plain reads, WAL, synchronous=NORMAL.
                  store.go has all schema + CRUD; store_test.go is the
                  regression-test target for host-port pool changes.
   version/       Build version string.
@@ -178,6 +179,12 @@ pkg/
                  validates the artifact.
   isolate/       workerd engine host (pkg/isolate) — group supervisor, jail
                  spec, per-slot egress pool. Driven by internal/runtime/isolate.
+caddymod/        AerolVM's Caddy plugins. Its own Go module (so Caddy's build
+                 takes only Caddy's deps), built into every release Caddy by
+                 xcaddy (release.yml). aerolvm_route is the owner static
+                 route's upstream lookup; sandboxd asks Caddy for it
+                 (pkg/caddy HasRouteUpstream) and falls back to Caddy's stock
+                 "a" source without it. Not covered by `make test`.
 sdk/
   typescript/    @aerol-ai/aerolvm-sdk. src/MicroVM.ts + Sandbox.ts; transport
                  in src/internal/api/v1/.
@@ -249,6 +256,7 @@ Per-SDK tests:
 (cd sdk/go && go test ./...)
 (cd sdk/java && mvn -B -ntp test)
 (cd sdk/rust && cargo test)
+(cd caddymod && go test -race ./...)   # the Caddy plugin (own Go module)
 ```
 
 CI is path-filtered (`.github/workflows/test.yml`): touching `docs/**`
@@ -259,6 +267,11 @@ Live integration runs (`make integration-single`, `integration-cluster-*`,
 `integration-all`) provision **real AWS** via the prod Terraform module and
 cost money — they are operator-run, not part of `make test`. `make
 integration-reap` terminates leaked instances. See `integration-tests/README.md`.
+To put a file on a test node (a hot-patched `sandboxd`, a test binary), use
+`integration-tests/scripts/stage-to-node.sh` or `stage_to_node` from
+`integration-tests/lib/stage.sh`: it goes through S3. Never `scp` a build from
+this machine to a node; one scp stream over a laptop uplink takes 20+ minutes
+per node, and `safety/stage_test.go` fails on it.
 
 ## Project skills
 
@@ -293,7 +306,7 @@ For changes that don't match a skill, the file-level "where to look" map is:
 | Live AWS integration scenarios | `integration-tests/suite/` + `harness/`; run via `make integration-*` |
 | Cluster placement / Raft FSM / gossip / failover | `internal/cluster/` — see `cluster.go` for the package overview, `fsm.go` + `placement.go` for owner assignment, `recovery_*.go` for failover replicas |
 | OTEL traces / expvar metrics exporter | `internal/observability/` |
-| Caddy route / TLS / L4 wiring | `pkg/caddy/client.go` |
+| Caddy route / TLS / L4 wiring | `pkg/caddy/client.go`; owner route lookup plugin `caddymod/` |
 | Capacity / admission rules | `pkg/capacity/` |
 | Docker events / image GC | `pkg/docker/events.go`, `pkg/docker/image_gc_test.go` |
 | SSH gateway behavior | `pkg/sshgateway/gateway.go` |
@@ -313,26 +326,34 @@ For changes that don't match a skill, the file-level "where to look" map is:
   `internal/`.
 - **Errors that the API surfaces use `apihttp.WriteStoreAwareError`** so
   `models.ErrNotFound`, capacity errors, etc. get the right HTTP status.
-- **SQLite is single-writer in this process** (`MaxOpenConns=1`). Don't add a
-  second `*sql.DB` — queue through the existing one.
+- **SQLite has one writer in this process** (`Store.db`, `MaxOpenConns=1`).
+  Every write and every transaction goes through it; don't open another
+  writable `*sql.DB`. Plain reads outside a transaction use the read-only
+  pool (`Store.rdb`, `query_only`), so they never wait behind a write. A
+  statement that writes — including `UPDATE … RETURNING` through
+  `QueryRowContext` — must use `s.db`; the pool rejects it. Claim paths
+  also stay on `s.db`: a claim is one `UPDATE` that picks its own target
+  (see `claimContainerNetnsSlot`), never a read followed by a claim
+  (see the `Store` comment and `TestClaimPathsReadOnWriter`).
 - **`pkg/models` is shared between server, facades, and SDK-internal Go
   transport.** Adding a field there ripples; keep DTOs lean and stable.
 
 ## Skill routing
 
-When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+When the user's request matches an available skill, invoke it via the Skill tool. Route only to skills in the session's available-skills list; answer directly for quick questions or small scoped edits.
 
 Key routing rules:
 - Product ideas/brainstorming → invoke /office-hours
 - Strategy/scope → invoke /plan-ceo-review
-- Architecture → invoke /plan-eng-review
+- Architecture → invoke /autoplan
 - Design system/plan review → invoke /design-consultation or /plan-design-review
 - Full review pipeline → invoke /autoplan
-- Bugs/errors → invoke /investigate
+- Bugs/errors → fix them directly: one read-only check of the cause, or a focused failing test first when the cause is unclear; then fix it and run that test
 - QA/testing site behavior → invoke /qa or /qa-only
 - Code review/diff check → invoke /review
 - Visual polish → invoke /design-review
-- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Building UI → once it renders, invoke /design-review --build <preview url> (opt-in)
+- Ship/deploy/PR → invoke /ship (merge + deploy: the user types /land-and-deploy)
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 - Author a backlog-ready spec/issue → invoke /spec

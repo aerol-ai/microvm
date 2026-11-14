@@ -30,6 +30,10 @@ func ApplyErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrCreateBackpressure):
 		return http.StatusTooManyRequests
+	case errors.Is(err, ErrTeamQuotaExceeded):
+		// A team at its quota. 429 like the API answer; the message names
+		// the sentinel so forwardApplyStatus restores it, not backpressure.
+		return http.StatusTooManyRequests
 	case errors.Is(err, ErrCapacityExceeded), errors.Is(err, ErrNoPlacementTarget):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrArtifactCatalogSuperseded):
@@ -48,6 +52,11 @@ func ApplyErrorStatus(err error) int {
 		// a retry of an Idempotency-Key create on a multi-node cluster 503s
 		// instead of replaying the existing sandbox.
 		return http.StatusConflict
+	case errors.Is(err, ErrPlacementUnsatisfiable):
+		// The leader refused a reservation onto a node the sandbox's
+		// placement rule excludes. A verdict, not a fault: as a 500 the
+		// router would answer a retryable 503 for a rule no retry satisfies.
+		return http.StatusConflict
 	case errors.Is(err, ErrIncarnationConflict):
 		// An incarnation fence is a verdict too: the placement moved to
 		// another incarnation, and re-sending the same write cannot succeed.
@@ -55,6 +64,17 @@ func ApplyErrorStatus(err error) int {
 		// hit it to the reservation's owner (clustercreate.Prepare), which
 		// only works if the sentinel survives the hop; as a 500 the retry
 		// answered 503 (seen live on cluster-hetero-lite, UC-367).
+		return http.StatusConflict
+	case errors.Is(err, ErrSpecVersionConflict):
+		// A verdict: the spec moved on since the writer read it. The
+		// writer reads it again (spec_version_fence.go), which it can only
+		// do if the sentinel survives the hop; as a 500 the change was
+		// dropped with a warning.
+		return http.StatusConflict
+	case errors.Is(err, ErrPlacementDeleted):
+		// A verdict: the lifetime is deleted for good. As a 500 a returning
+		// node's ownership replay could not tell it from a transient fault
+		// and would keep its copy of a deleted sandbox.
 		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
@@ -81,6 +101,9 @@ func forwardApplyStatus(status int, message string) error {
 	case http.StatusOK, http.StatusNoContent:
 		return nil
 	case http.StatusTooManyRequests:
+		if strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
+			return fmt.Errorf("%w: %s", ErrTeamQuotaExceeded, message)
+		}
 		return fmt.Errorf("%w: %s", ErrCreateBackpressure, message)
 	case http.StatusConflict:
 		// Restore whichever conflict sentinel the leader answered 409 with.
@@ -95,6 +118,23 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrNameConflict, message)
 		case strings.Contains(message, ErrIncarnationConflict.Error()):
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		case strings.Contains(message, ErrPlacementUnsatisfiable.Error()):
+			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
+		case strings.Contains(message, ErrPlacementDeleted.Error()):
+			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
+		case strings.Contains(message, ErrSpecVersionConflict.Error()):
+			return fmt.Errorf("%w: %s", ErrSpecVersionConflict, message)
+		}
+	case http.StatusForbidden:
+		// The leader's peer check does not see this node alive in gossip
+		// yet. During a leader change the new leader's view can lag the
+		// forwarder's for a moment; as an unclassified error the create
+		// answered 400 and an SDK gave up on a write a retry seconds later
+		// commits (the reserve never reached the FSM). The agent's
+		// control-plane calls already treat the same 403 this way. Every
+		// other 403 stays final.
+		if strings.Contains(message, PeerNotInMembershipMessage) {
+			return fmt.Errorf("%w: leader-forward apply: %s", ErrMembershipPending, message)
 		}
 	case http.StatusServiceUnavailable:
 		switch {

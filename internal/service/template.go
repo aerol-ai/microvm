@@ -454,8 +454,11 @@ func (s *Service) setTemplateStatus(ctx context.Context, id string, status model
 	return nil
 }
 
+// deleteTemplateRow deletes a template's row and, with it, records the
+// obligation to retire the copy this node pushed to the registry (the
+// snapshot push reconciler removes it).
 func (s *Service) deleteTemplateRow(ctx context.Context, id string) error {
-	if err := s.store.DeleteTemplate(ctx, id); err != nil {
+	if err := s.store.DeleteTemplateRetiringRegistryCopy(ctx, id); err != nil {
 		return err
 	}
 	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
@@ -466,10 +469,11 @@ func (s *Service) deleteTemplateRow(ctx context.Context, id string) error {
 // template — yanking the rootfs out from under a running Firecracker
 // guest would surface as a delayed I/O error inside the guest, hours
 // after the operator's action. The 409 forces the operator to destroy
-// the sandbox first. Best-effort artifact cleanup runs before the row
-// delete: a half-cleaned dir on disk is fine (GC catches it), a missing
-// row with an orphan dir is the painful case (no one will ever clean
-// it). Pending rows are also rejected — a delete that races the build
+// the sandbox first. The files go before the row, and a failure to
+// remove them fails the delete with the row kept: a row with no files
+// can be deleted again, while files with no row are never cleaned up,
+// because nothing sweeps the templates directory by path. Pending rows
+// are also rejected — a delete that races the build
 // goroutine would leave the goroutine writing to a directory the
 // operator believed was gone.
 func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
@@ -500,22 +504,29 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string) error {
 	if vmmReferenced {
 		return store.ErrTemplateInUse
 	}
-	// Release the per-template CID reservation before dropping the row.
-	// The allocator is keyed on the template id, so a delete-then-recreate
-	// cycle gets a fresh slot (idempotent re-reservation against a stale
-	// row would otherwise fail).
+	if err := removeTemplateFiles(template); err != nil {
+		return fmt.Errorf("template %q: remove its files: %w", id, err)
+	}
+	// Release the per-template CID reservation before dropping the row,
+	// and only once the files are gone: a kept row still boots clones of
+	// its snapshot, which need that CID. The allocator is keyed on the
+	// template id, so a delete-then-recreate cycle gets a fresh slot
+	// (idempotent re-reservation against a stale row would otherwise fail).
 	if template.HasSnapshot && s.templateCIDAllocator != nil {
 		if relErr := s.templateCIDAllocator.ReleaseForTemplate(ctx, id); relErr != nil {
 			s.logger.Warn("template delete: cid release failed", "template_id", id, "error", relErr)
 		}
 	}
-	if template.RootfsPath != "" {
-		dir := filepath.Dir(template.RootfsPath)
-		if rmErr := os.RemoveAll(dir); rmErr != nil {
-			s.logger.Warn("template delete: rootfs cleanup failed", "template_id", id, "error", rmErr)
-		}
-	}
 	return s.deleteTemplateRow(ctx, id)
+}
+
+// removeTemplateFiles removes a template's directory: its rootfs and
+// snapshot files. A missing directory is already removed.
+func removeTemplateFiles(t *models.Template) error {
+	if t.RootfsPath == "" {
+		return nil
+	}
+	return os.RemoveAll(filepath.Dir(t.RootfsPath))
 }
 
 // StartTemplateGC launches the periodic janitor that drops unreferenced
@@ -584,21 +595,18 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 		if s.testAfterTemplateGCVMMRefCheck != nil {
 			s.testAfterTemplateGCVMMRefCheck()
 		}
-		// Release the per-template CID before the row goes. Same shape as
-		// DeleteTemplate — the GC sweeper's responsibilities are a strict
-		// superset of the API-driven delete.
+		// Files, then the CID, then the row: the same order as
+		// DeleteTemplate, whose responsibilities this sweep's are a strict
+		// superset of. A failed remove keeps the row (and its CID) for the
+		// next pass. The row is the only record of the directory; dropping
+		// it after a failed remove left files nothing would ever reclaim.
+		if rmErr := removeTemplateFiles(t); rmErr != nil {
+			s.logger.Warn("template gc: files not removed; row kept for the next pass", "template_id", t.ID, "error", rmErr)
+			continue
+		}
 		if t.HasSnapshot && s.templateCIDAllocator != nil {
 			if relErr := s.templateCIDAllocator.ReleaseForTemplate(ctx, t.ID); relErr != nil {
 				s.logger.Warn("template gc cid release failed", "template_id", t.ID, "error", relErr)
-			}
-		}
-		if t.RootfsPath != "" {
-			dir := filepath.Dir(t.RootfsPath)
-			if rmErr := os.RemoveAll(dir); rmErr != nil {
-				s.logger.Warn("template gc rootfs cleanup failed", "template_id", t.ID, "error", rmErr)
-				// Continue to delete the row anyway — a stale dir is
-				// recoverable (operator can rm -rf), a stale row pointing
-				// at a missing file is much worse.
 			}
 		}
 		if err := s.deleteTemplateRow(ctx, t.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -610,7 +618,7 @@ func (s *Service) runTemplateGC(ctx context.Context, now time.Time) {
 }
 
 // generateTemplateID returns "tpl-<16 hex chars>". Same shape as
-// generateSandboxID — different prefix so a glance at the ID
+// NewSandboxID — different prefix so a glance at the ID
 // immediately distinguishes a template from a sandbox.
 func generateTemplateID() (string, error) {
 	buf := make([]byte, 8)

@@ -29,6 +29,10 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path is required")
 		return
 	}
+	if option := unsupportedUploadOption(r); option != "" {
+		writeError(w, http.StatusNotImplemented, "upload option "+option+" is not supported on WASM sandboxes")
+		return
+	}
 
 	root, rel, _, err := openInWorkDir(h.workDir, targetPath)
 	if err != nil {
@@ -60,6 +64,11 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Range") != "" {
+		// Plan F4: a clear 501 rather than the whole file for a range.
+		writeError(w, http.StatusNotImplemented, "range requests are not supported on WASM sandboxes")
+		return
+	}
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
 	if targetPath == "" {
 		writeError(w, http.StatusBadRequest, "path is required")
@@ -106,6 +115,12 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	// toolboxd's listing options (plan F1). Ignoring them would hand back a
+	// one-level list of bare names as if a depth or cap had been applied.
+	if q := r.URL.Query(); q.Has("depth") || q.Has("limit") || q.Has("extended") {
+		writeError(w, http.StatusNotImplemented, "listing with depth, limit or extended is not supported on WASM sandboxes")
+		return
+	}
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
 	root, rel, _, err := openInWorkDir(h.workDir, targetPath)
 	if err != nil {
@@ -129,6 +144,27 @@ func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
 		names = append(names, e.Name())
 	}
 	writeJSON(w, http.StatusOK, names)
+}
+
+// unsupportedUploadOption names the first toolboxd upload option (plan F2's
+// append, create_only, mode and atomic; F3's extract) the request sets. This
+// host would otherwise ignore it and answer 201: create_only would replace a
+// file, extract would store the archive itself. A false value asks for
+// nothing, so it passes.
+func unsupportedUploadOption(r *http.Request) string {
+	for _, name := range []string{"append", "create_only", "atomic", "extract", "mode"} {
+		value := strings.TrimSpace(r.FormValue(name))
+		if value == "" {
+			continue
+		}
+		if name != "mode" {
+			if off, err := strconv.ParseBool(value); err == nil && !off {
+				continue
+			}
+		}
+		return name
+	}
+	return ""
 }
 
 // writeOpenError answers a failed openInWorkDir: a path the caller cannot

@@ -1,0 +1,13 @@
+# Terraform used by URL, the Phase 5 gate: the module fetched by git URL
+# from a root with no checkout behind it, one-line joins by default. The
+# gate cases are UC-683..687; run them with
+# AEROL_TEST_RUN='TestModuleURL' to skip the rest of the catalogue. spare-1
+# is a blank machine and not a member until UC-687 joins it.
+name: cluster-module-url
+capabilities:
+  - docker
+  - domain
+  - cluster
+  - module-url
+
+expected_members: 4

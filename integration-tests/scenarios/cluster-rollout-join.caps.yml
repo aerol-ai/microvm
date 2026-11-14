@@ -1,0 +1,21 @@
+# cluster-rollout with one-line joins (plans/kubectl-style-cluster-ops.md
+# §8): worker and ingress nodes hold no operator PAT. Run
+# AEROL_TEST_RUN='TestPATFree|TestNodeVerbs|TestNodeDeleteWorkerAndItCannotRejoin|TestRolloutLive|TestUpgradeCLICluster'
+# with AEROL_ALLOW_DISRUPTIVE=1: the later cases delete a worker and
+# restart every node.
+name: cluster-rollout-join
+capabilities:
+  - docker
+  - platform-volumes
+  - gvisor
+  - wasm
+  - domain
+  - cluster
+  - remote-mcp
+  - egress-fqdn
+  - one-line-join
+
+expected_members: 8
+
+# A rollout restarts every node; role separation keeps the API up.
+disruptive: true

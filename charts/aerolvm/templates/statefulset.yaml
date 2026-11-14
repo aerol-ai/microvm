@@ -1,0 +1,35 @@
+{{- if not (has .Values.mode (list "single" "cluster")) }}
+{{- fail "mode is single (one pod, no operator) or cluster (the operator, servers, gateways and worker pools)" }}
+{{- end }}
+{{- if eq .Values.mode "single" }}
+{{- $name := include "aerolvm.name" . }}
+# The worker pod (plans/kubernetes-v2-architecture.md §8.2): runtime holds
+# containerd and every sandbox and changes only with containerd or gVisor;
+# agent is sandboxd; egress is the hostname-filtering gateway (C6). The
+# containers hand each other folders at the same path.
+#
+# updateStrategy OnDelete: a chart upgrade never deletes the pod, which would
+# end every sandbox. Upgrade sandboxd by changing the agent container's image
+# in place (NOTES.txt); only that container restarts.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      {{- include "aerolvm.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "aerolvm.selector" . | nindent 8 }}
+    spec:
+      {{- include "aerolvm.workerPodSpec" (dict "root" . "cluster" false) | nindent 6 }}
+{{- end }}

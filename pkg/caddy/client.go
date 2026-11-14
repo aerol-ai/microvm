@@ -455,6 +455,61 @@ func (c *Client) UpsertPortRouteWithRetry(ctx context.Context, id, containerIP s
 	return c.upsertRoute(ctx, routeID, route)
 }
 
+// UpsertFencedPortRoute turns a local sandbox's per-port HTTP route into a
+// 503 + Retry-After answer while the worker's ownership lease holds the
+// sandbox paused (internal/service/ownership_lease.go). A paused process
+// keeps its listening socket, so the proxy route would take each connection
+// and never answer it. The 503 is written under the port route's own @id and
+// matcher, so each swap is one PATCH in place: there is never a moment with
+// no route, and never a second route that could end up behind the proxy one.
+// The proxy route comes back through UpsertPortRoute*. Domain mode only, like
+// UpsertPortRoute.
+func (c *Client) UpsertFencedPortRoute(ctx context.Context, id string, port int) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	routeID := portRouteID(id, port)
+	match := []map[string]any{{"host": []string{fmt.Sprintf("%s-%d.%s", id, port, c.domain)}}}
+	return c.upsertRoute(ctx, routeID, inFluxRoute(routeID, match))
+}
+
+// UpsertFencedSandboxRoute is UpsertFencedPortRoute for a sandbox's root
+// (toolbox) route and each of its custom hostnames: each URL answers 503 +
+// Retry-After under the live route's own @id and matcher, so the swap there
+// and back is one write in place and route order never changes. It mirrors
+// UpsertSandboxRoute's modes: the root route is swapped in IP (path) mode
+// too, custom hostnames exist only in domain mode.
+func (c *Client) UpsertFencedSandboxRoute(ctx context.Context, id string, customHostnames []string) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := sandboxRouteID(id)
+	if err := c.upsertRoute(ctx, routeID, inFluxRoute(routeID, c.inFluxMatchSandbox(id))); err != nil {
+		return err
+	}
+	for _, h := range customHostnames {
+		if err := c.UpsertFencedCustomDomainRoute(ctx, id, h); err != nil {
+			return fmt.Errorf("fence custom-domain route %q: %w", h, err)
+		}
+	}
+	return nil
+}
+
+// UpsertFencedCustomDomainRoute writes the 503 for one custom hostname under
+// that hostname's route id (IngressCustomDomainHTTPRouteID), the id
+// UpsertCustomDomainHTTPRouteWithDial writes the live route under.
+func (c *Client) UpsertFencedCustomDomainRoute(ctx context.Context, sandboxID, hostname string) error {
+	if !c.enabled || c.domain == "" {
+		return nil
+	}
+	host := strings.TrimSpace(strings.ToLower(hostname))
+	if host == "" {
+		return nil
+	}
+	routeID := IngressCustomDomainHTTPRouteID(sandboxID, host)
+	return c.upsertRoute(ctx, routeID, inFluxRoute(routeID, []map[string]any{{"host": []string{host}}}))
+}
+
 // UpsertPortRouteToPeer installs the IP/path-mode per-port route for a
 // sandbox owned by another node. In domain mode this is handled by SNI
 // pass-through routes in the layer4 mux.
@@ -914,14 +969,17 @@ func IngressCustomDomainHTTPRouteID(sandboxID, hostname string) string {
 // at those paths only, leaving any pre-existing wildcard policy and other
 // automation knobs untouched.
 //
-//   - PUT /config/apps/tls/automation/on_demand → ask URL. Replacing the leaf on
-//     every boot makes handler URL changes take effect without a manual Caddy
-//     reload. The daemon-side ACME budget performs issuance throttling; the
-//     deployed Caddy schema rejects the older `rate_limit` field here.
-//   - POST /config/apps/tls/automation/policies (with a catch-all policy
-//     {on_demand: true, issuers: [acme]}) only when no on-demand policy is
-//     present yet. Discovered by checking pathExists on automation/policies
-//     and re-walking the list; we never insert a duplicate.
+//   - POST /config/apps/tls/automation/on_demand → the ask URL, as the http
+//     permission module (PUT when the parent keys do not exist yet). Replacing
+//     the leaf on every boot makes handler URL changes take effect without a
+//     manual Caddy reload. The daemon-side ACME budget performs issuance
+//     throttling; the deployed Caddy schema rejects the older `rate_limit`
+//     field here.
+//   - POST /config/apps/tls/automation/policies/... (a one-element list with
+//     the catch-all policy {on_demand: true, issuers: [acme]}) only when no
+//     on-demand policy is present yet. onDemandPolicy GETs
+//     automation/policies and walks the list first, so a second boot never
+//     inserts a duplicate.
 //
 // askURL must be reachable from Caddy — typically
 // http://127.0.0.1:<api-port>/internal/tls-ask (the InternalIngressAddr
@@ -950,19 +1008,38 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 }
 
 func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) error {
-	onDemand := map[string]any{"ask": askURL}
+	// The ask URL goes in as the http permission module, not the deprecated
+	// "ask" field. Since Caddy 2.10, the TLS app provisions automation
+	// policies before it turns "ask" into a permission, so an on-demand
+	// policy behind "ask" alone fails: "on-demand TLS cannot be enabled
+	// without a permission module". Caddy 2.9 converted first, which is why
+	// this worked when it was written; releases built the newest Caddy until
+	// the pin (2.11.x since v0.6.11), so the policy never installed and no
+	// custom domain got a certificate. The http module (Caddy 2.8+) calls the
+	// endpoint with ?domain= exactly as "ask" did.
+	onDemand := map[string]any{"permission": map[string]any{"module": "http", "endpoint": askURL}}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
 		return fmt.Errorf("marshal on-demand block: %w", err)
 	}
-	// PUT replaces (or creates) the leaf. Caddy auto-creates intermediate
-	// paths if apps/tls or apps/tls/automation didn't exist.
-	status, err := c.sendJSON(ctx, http.MethodPut, c.baseURL+"/config/apps/tls/automation/on_demand", onDemandBody)
+	// POST sets or replaces the leaf. PUT alone was wrong: it only creates,
+	// and answers 409 "key already exists" once on_demand is set, so every
+	// sandboxd start while Caddy kept running (the usual restart) failed here,
+	// logged and never retried, and a changed ask URL never landed. But only
+	// PUT creates missing parent keys; POST into a Caddy with no
+	// apps.tls.automation yet fails ("invalid traversal path"). So a refused
+	// POST is retried as PUT, which cannot conflict there: no parent, no key.
+	// If the PUT fails too, the POST's reason is the one to report.
+	onDemandURL := c.baseURL + "/config/apps/tls/automation/on_demand"
+	status, detail, err := c.sendJSONDetail(ctx, http.MethodPost, onDemandURL, onDemandBody)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("install on-demand settings failed: %d", status)
+		putStatus, _, putErr := c.sendJSONDetail(ctx, http.MethodPut, onDemandURL, onDemandBody)
+		if putErr != nil || putStatus >= 400 {
+			return caddyErr("install on-demand settings", status, detail)
+		}
 	}
 
 	idx, stored, found, err := c.onDemandPolicy(ctx)
@@ -976,18 +1053,20 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 		"on_demand": true,
 		"issuers":   []map[string]any{c.onDemandIssuer.config()},
 	}
-	policyBody, err := json.Marshal(policy)
+	// A one-element list POSTed to policies/... appends to the list, or
+	// creates it when there is none, so the on-demand policy ends up last.
+	// A plain POST of the object to policies only appends: with no list yet
+	// Caddy sets policies to the object itself and refuses the config.
+	policyBody, err := json.Marshal([]any{policy})
 	if err != nil {
 		return fmt.Errorf("marshal on-demand policy: %w", err)
 	}
-	// POST appends to the array if it exists, or creates a one-element
-	// array if it doesn't. Either way the on-demand policy ends up last.
-	status, err = c.sendJSON(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies", policyBody)
+	status, detail, err = c.sendJSONDetail(ctx, http.MethodPost, c.baseURL+"/config/apps/tls/automation/policies/...", policyBody)
 	if err != nil {
 		return err
 	}
 	if status >= 400 {
-		return fmt.Errorf("install on-demand policy failed: %d", status)
+		return caddyErr("install on-demand policy", status, detail)
 	}
 	return nil
 }
@@ -1323,6 +1402,43 @@ func (c *Client) UpsertWakeTCPRoute(ctx context.Context, id string, port, hostPo
 	return nil
 }
 
+// UpsertFencedTCPRoute is UpsertTCPRoute for a sandbox whose node cannot
+// confirm it still owns it (paused): the host port keeps its listener, but
+// its one route closes each new connection at once. layer4.handlers.close
+// ships in caddy-l4, which the custom Caddy build includes whole. Raw TCP has
+// no way to say "retry later", but a closed connection is an answer a client
+// acts on, where a proxy to the frozen process would hang it.
+func (c *Client) UpsertFencedTCPRoute(ctx context.Context, id string, port, hostPort int) error {
+	if !c.enabled {
+		return nil
+	}
+	if hostPort <= 0 {
+		return errors.New("host port must be positive")
+	}
+	server := map[string]any{
+		"listen": []string{fmt.Sprintf(":%d", hostPort)},
+		"routes": []any{
+			map[string]any{
+				"@id":    tcpRouteID(id, port),
+				"handle": []map[string]any{{"handler": "close"}},
+			},
+		},
+	}
+	body, err := json.Marshal(server)
+	if err != nil {
+		return fmt.Errorf("marshal fenced tcp server: %w", err)
+	}
+	target := fmt.Sprintf("%s/config/apps/layer4/servers/%s", c.baseURL, tcpServerID(hostPort))
+	status, err := c.sendJSON(ctx, http.MethodPost, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("upsert fenced tcp server failed: %d", status)
+	}
+	return nil
+}
+
 // UpsertTCPProxyRoute creates a raw-TCP ingress server bound to hostPort that
 // forwards to another node's hostPort. This is the non-owner half of stable
 // cluster TCP exposure: every node can accept tcp://cluster-host:hostPort, but
@@ -1430,6 +1546,29 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 		return fmt.Errorf("marshal tls sni route: %w", err)
 	}
 	return c.upsertTLSMuxRoute(ctx, "tls sni route", routeID, body)
+}
+
+// UpsertFencedTLSSNIRoute is UpsertTLSSNIRoute for a paused sandbox: the same
+// @id and SNI matcher (read from the ClientHello, no handshake), with a
+// handler that closes the connection. It is terminal, so the mux's fallback
+// route never sees the connection.
+func (c *Client) UpsertFencedTLSSNIRoute(ctx context.Context, id, sniHost string, port int) error {
+	if !c.enabled {
+		return nil
+	}
+	routeID := tlsRouteID(id, port)
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{{
+			"tls": map[string]any{"sni": []string{sniHost}},
+		}},
+		"handle": []map[string]any{{"handler": "close"}},
+	}
+	body, err := json.Marshal(route)
+	if err != nil {
+		return fmt.Errorf("marshal fenced tls sni route: %w", err)
+	}
+	return c.upsertTLSMuxRoute(ctx, "fenced tls sni route", routeID, body)
 }
 
 // upsertTLSMuxRoute is upsertRoute for the tls-mux layer4 server: PATCH

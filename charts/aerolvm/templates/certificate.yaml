@@ -1,0 +1,22 @@
+{{- if and .Values.edge.enabled .Values.edge.certManager.issuerRef.name (not .Values.edge.existingTLSSecret) }}
+# The sandbox-link certificate (C25): one certificate for the API host and
+# every sandbox link under it, issued and renewed by cert-manager with the
+# bank's issuer (or ACME DNS-01 with the DNS token held only in
+# cert-manager's namespace). The edge and agent containers mount the Secret
+# read-only; sandboxd makes Caddy reload it when it changes.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "aerolvm.name" . }}-edge
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "aerolvm.name" . }}-edge-tls
+  dnsNames:
+    - {{ .Values.edge.domain | quote }}
+    - {{ printf "*.%s" .Values.edge.domain | quote }}
+  issuerRef:
+    name: {{ .Values.edge.certManager.issuerRef.name }}
+    kind: {{ .Values.edge.certManager.issuerRef.kind | default "ClusterIssuer" }}
+    group: cert-manager.io
+{{- end }}

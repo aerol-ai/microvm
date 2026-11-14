@@ -3,12 +3,14 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress/operator"
@@ -215,6 +217,42 @@ func loadNodeAllowedPorts() {
 	egresspolicy.SetNodeAllowedPorts(egresspolicy.ParseNodePorts(os.Getenv(egresspolicy.NodePortsEnv)))
 }
 
+// blockPrivateNoPolicy is SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT as sandboxd
+// read it: no-policy sandboxes are kept off private ranges (openCheck).
+var blockPrivateNoPolicy atomic.Bool
+
+// loadWorkerGuards takes everything the dial guard needs from the
+// environment sandboxd starts the worker with: the node ports, the
+// private-range default, and the node's extra deny floor and private ranges
+// (C24). A list it cannot read stops the worker: serving without a floor
+// entry sandboxd enforces for every other runtime would open it for WASM
+// alone. sandboxd checked the same value at boot and wrote it back in a
+// form that parses, so this does not happen in practice.
+//
+// The deny-floor file (review R4) can change while the worker runs, so the
+// worker watches it, on the operator file's clock, for its whole life. Its
+// dial checks read the extra floor at each dial, so a new address is
+// refused from the next one on.
+func loadWorkerGuards() error {
+	loadNodeAllowedPorts()
+	on, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(egresspolicy.BlockPrivateEnv)))
+	blockPrivateNoPolicy.Store(err == nil && on)
+	if err := egresspolicy.LoadRangesFromEnv(); err != nil {
+		return fmt.Errorf("wasm worker: %w", err)
+	}
+	if path := strings.TrimSpace(os.Getenv(egresspolicy.FloorFileEnv)); path != "" {
+		floorWatchOnce.Do(func() {
+			// No logger, as for the operator file: sandboxd watches the
+			// same file and logs a bad one once per node.
+			go egresspolicy.WatchFloorFile(context.Background(), path, operatorPoll, nil, nil)
+		})
+	}
+	return nil
+}
+
+// floorWatchOnce starts one floor-file watch per worker process.
+var floorWatchOnce sync.Once
+
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -274,16 +312,19 @@ func policyMatch(p *egresspolicy.Policy, d connDest) (allowed bool, rule string)
 // what the operator imposes on every sandbox applies: the deny floor, as the
 // container runtimes get it from their node-wide rules. The private-range
 // rule and the internal zone only narrow what a policy's allow rules open,
-// so they stay policy-mode rules. A strict guard is this worker's "operator
-// file unreadable" posture: the floor is unknown, so the whole strict guard
-// applies (fail closed, as for policy dials).
+// so they stay policy-mode rules, unless the node blocks private ranges by
+// default (blockPrivateNoPolicy): then a no-policy WASM sandbox is kept off
+// them like a no-policy container sandbox, extra private ranges included
+// (C24). A strict guard is this worker's "operator file unreadable"
+// posture: the floor is unknown, so the whole strict guard applies (fail
+// closed, as for policy dials).
 func openCheck(g egresspolicy.DialGuard, name string, addr netip.AddrPort) error {
 	// The node itself first: no policy, no operator file and no guard
 	// posture makes the node a destination (egresspolicy.CheckNode).
 	if err := nodeCheck(addr); err != nil {
 		return err
 	}
-	if g.Strict {
+	if g.Strict || blockPrivateNoPolicy.Load() {
 		return g.Check(nil, egresspolicy.DialTarget{Name: name, Addr: addr})
 	}
 	return g.CheckFloor(addr)

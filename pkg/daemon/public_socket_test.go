@@ -257,7 +257,7 @@ func TestRunPublicSocketFailureStopsBoot(t *testing.T) {
 	t.Cleanup(func() { publicAPISocketGroup = old })
 	t.Setenv("SB_PAT_SCOPE", "host")
 	t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "api.sock"))
-	err := runWithAutoCancel(t, 2*time.Second, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "public API socket") {
 		t.Fatalf("Run err = %v, want the public socket refusal", err)
 	}
@@ -290,5 +290,10 @@ func TestLogPATBootSettings(t *testing.T) {
 	cfg.OperatorVolumeScope, cfg.PATToken = "", ""
 	if got := logs(cfg); !strings.Contains(got, "operator volume scope unresolved") {
 		t.Errorf("an unresolvable scope warns:\n%s", got)
+	}
+	// A node joined without the PAT says so, once.
+	patFree := config.Config{PATToken: "own-token", PATTokenSHA256: []string{config.PATSHA256("pat")}}
+	if got := logs(patFree); strings.Count(got, "SB_PAT_TOKEN_SHA256") != 1 || !strings.Contains(got, "hashes=1") {
+		t.Errorf("a node without the PAT logs:\n%s", got)
 	}
 }

@@ -195,6 +195,7 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 			{"list", "kind=list&tenant=t-a", http.StatusOK},
 			{"source", "kind=source&source=bucket/t-a/data", http.StatusOK},
 			{"attachment_count", "kind=attachment_count&tenant=t-a&id=vol-1", http.StatusOK},
+			{"sandbox", "kind=sandbox&sandbox_id=sb-1", http.StatusOK},
 			{"missing id", "kind=id&tenant=t-a&id=missing", http.StatusNotFound},
 			{"bad kind", "kind=unknown", http.StatusBadRequest},
 		}
@@ -204,6 +205,12 @@ func TestClusterInternalHandlers_BasicCoverage(t *testing.T) {
 			h.clusterInternalVolume(rr, req)
 			if rr.Code != tc.status {
 				t.Fatalf("%s: status = %d, want %d; body=%s", tc.kind, rr.Code, tc.status, rr.Body.String())
+			}
+			if tc.kind == "sandbox" {
+				var resp cluster.VolumeQueryResponse
+				if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil || len(resp.Attachments) != 1 || resp.Attachments[0].VolumeID != "vol-1" {
+					t.Fatalf("sandbox attachments = %+v, %v", resp, err)
+				}
 			}
 		}
 	})

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -17,6 +18,22 @@ import (
 // `dig <sandbox-url>` could discover.
 func (s *Service) IngressDNSTarget() models.IngressTarget {
 	return s.cluster.IngressTargets()
+}
+
+// JoinPublicSetup is this node's public setup, as a printed join command
+// repeats it for a new machine: the domain; the ingress host only when it is
+// not the domain (sandboxd init and join default it to the domain); and the
+// TLS issuer only when it is Caddy's own ("internal"), which needs no DNS
+// provider. None of them is a secret.
+func (s *Service) JoinPublicSetup() (domain, ingressHost, tlsIssuer string) {
+	domain = strings.TrimSpace(s.cfg.Domain)
+	if h := strings.TrimSpace(s.cfg.IngressAdvertiseHost); !strings.EqualFold(h, domain) {
+		ingressHost = h
+	}
+	if strings.EqualFold(strings.TrimSpace(s.cfg.TLSIssuer), "internal") {
+		tlsIssuer = "internal"
+	}
+	return domain, ingressHost, tlsIssuer
 }
 
 // CustomDomainDNS expands a sandbox's attached custom domains into the

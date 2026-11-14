@@ -39,6 +39,66 @@ const (
 	SandboxStatusPassivateFailed SandboxStatus = "passivate_failed"
 )
 
+// Status reasons say why a sandbox is in its current status
+// (Sandbox.StatusReason). The set is small and fixed on purpose: SDKs switch
+// on it and the lifecycle metrics use it as a label, so a new value is an API
+// change, not a log detail. last_error keeps the free-form detail.
+//
+// Reasons a sandbox is stopped:
+const (
+	// StatusReasonUserStop: a stop call (API, SDK, CLI, a facade, or the
+	// operator's fleet suspend).
+	StatusReasonUserStop = "user_stop"
+	// StatusReasonIdle: stopIfIdleFor, or the server's SB_IDLE_TIMEOUT_MIN.
+	StatusReasonIdle = "idle"
+	// StatusReasonMaxAge: stopAtAge.
+	StatusReasonMaxAge = "max_age"
+	// StatusReasonOutOfMemory: the sandbox's init was killed for using too
+	// much memory. ExitCode is set.
+	StatusReasonOutOfMemory = "out_of_memory"
+	// StatusReasonDiskLimit: the disk watchdog stopped it for writing more
+	// than its disk size.
+	StatusReasonDiskLimit = "disk_limit"
+	// StatusReasonCrashed: the sandbox went down on its own with a non-zero
+	// exit code that nobody asked for. ExitCode is set.
+	StatusReasonCrashed = "crashed"
+	// StatusReasonReconcile: sandboxd found the sandbox stopped when it
+	// checked, without having seen it stop (it was down, or missed the
+	// event), so it cannot say more.
+	StatusReasonReconcile = "reconcile"
+)
+
+// Reasons that also describe a started sandbox:
+const (
+	// StatusReasonProgramExited: the sandbox's main program ended. On a
+	// stopped sandbox, its init exited with code 0 on its own; on a started
+	// one, the program run under toolboxd ended and the sandbox is still up
+	// (lifecycle.destroyAfterExitFor). ExitCode is set.
+	StatusReasonProgramExited = "program_exited"
+	// StatusReasonFailover: the sandbox was recreated on another node after
+	// its owner node failed; its in-memory state did not survive.
+	StatusReasonFailover = "failover"
+	// StatusReasonRestarted: lifecycle.restartOnFailure started the sandbox
+	// again after a crash or an out-of-memory kill. ExitCode is the exit
+	// code of that crash.
+	StatusReasonRestarted = "restarted"
+)
+
+// StatusReasons lists every status reason, in documentation order. Tests and
+// the metrics use it so a reason cannot be added in one place only.
+var StatusReasons = []string{
+	StatusReasonUserStop,
+	StatusReasonIdle,
+	StatusReasonMaxAge,
+	StatusReasonOutOfMemory,
+	StatusReasonDiskLimit,
+	StatusReasonCrashed,
+	StatusReasonProgramExited,
+	StatusReasonReconcile,
+	StatusReasonFailover,
+	StatusReasonRestarted,
+}
+
 type RegistryAuth struct {
 	Server   string `json:"server"`
 	Username string `json:"username"`
@@ -66,6 +126,14 @@ type SandboxRuntimeState struct {
 	// AdoptedParkID is non-empty when Create adopted a warm-pool slot; the
 	// service uses it to release the park capacity reservation (§4).
 	AdoptedParkID string
+	// StartedAt is when the run a start began, on the clock the engine's
+	// exit events are stamped with: Docker's State.StartedAt, or the
+	// containerd driver's host clock just before it makes the new task. The
+	// service tells an exit event of an earlier run by it (run_starts.go),
+	// so it must be no later than anything the new run can report, and no
+	// earlier than the exit of the run before. Zero when the runtime does
+	// not say (Firecracker, WASM and isolate send no exit events).
+	StartedAt time.Time
 }
 
 // User-facing runtime identifiers. These are the values the API, SDK, and
@@ -371,6 +439,26 @@ type Lifecycle struct {
 	// Requires StopIfIdleFor to be set explicitly; there is no implicit
 	// default — see Validate.
 	Serverless bool `json:"serverless,omitempty"`
+	// RestartOnFailure starts the sandbox again after it crashes or its init
+	// is OOM-killed, with a backoff from 5 s to 5 min that resets after 10
+	// minutes of running fine (plans/agent-sandbox-feature-parity.md L1).
+	// Off by default. Docker and containerd (gVisor included) only: their
+	// die events are the failure signal; the service refuses it for other
+	// runtimes. Not a timer, so it does not count for IsZero: a sandbox
+	// with only this flag still gets the server's default timers.
+	RestartOnFailure bool `json:"restart_on_failure,omitempty"`
+	// DestroyAfterExitFor destroys the sandbox this long after its main
+	// program (the container command toolboxd runs) ends (L5, owner row
+	// P2). The lifecycle sweep reads the program's state from toolboxd's
+	// /health and stores the exit, so a daemon restart keeps the timer.
+	// Zero is off. WASM and isolate sandboxes have no main program and
+	// refuse it.
+	DestroyAfterExitFor time.Duration `json:"destroy_after_exit_for,omitempty"`
+	// DestroyAt is an input-only clock time (RFC 3339) to destroy the
+	// sandbox at (L6). ResolveDestroyAt turns it into DestroyAtAge measured
+	// from the sandbox's creation, so only the age is stored, replicated and
+	// returned; Validate refuses one left unconverted.
+	DestroyAt *time.Time `json:"destroy_at,omitempty"`
 }
 
 // MaxLifecycleDuration caps each Lifecycle field. 30 days is generous for
@@ -385,7 +473,12 @@ const MaxLifecycleDuration = 30 * 24 * time.Hour
 //     not fire before stop. Without this we could surprise a user who set
 //     "stop at 2h, destroy at 1h" by skipping the stop entirely.
 func (l Lifecycle) Validate() error {
-	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 {
+	if l.DestroyAt != nil {
+		// A path that forgot ResolveDestroyAt would otherwise store the
+		// lifecycle without the time the caller asked for.
+		return errors.New("destroy_at must be converted to destroy_at_age before validation")
+	}
+	if l.StopIfIdleFor < 0 || l.DestroyIfIdleFor < 0 || l.StopAtAge < 0 || l.DestroyAtAge < 0 || l.DestroyAfterExitFor < 0 {
 		return errors.New("lifecycle durations must be non-negative")
 	}
 	checks := []struct {
@@ -396,6 +489,7 @@ func (l Lifecycle) Validate() error {
 		{"destroy_if_idle_for", l.DestroyIfIdleFor},
 		{"stop_at_age", l.StopAtAge},
 		{"destroy_at_age", l.DestroyAtAge},
+		{"destroy_after_exit_for", l.DestroyAfterExitFor},
 	}
 	for _, c := range checks {
 		if c.v > MaxLifecycleDuration {
@@ -417,6 +511,31 @@ func (l Lifecycle) Validate() error {
 	if l.Serverless && l.StopIfIdleFor == 0 {
 		return errors.New("serverless requires stop_if_idle_for to be set explicitly")
 	}
+	return nil
+}
+
+// ResolveDestroyAt turns DestroyAt into DestroyAtAge, the age the sandbox
+// created at createdAt has at that time, and clears DestroyAt. now is the
+// current time: a DestroyAt that is not after it is refused, as is one set
+// together with DestroyAtAge (which would win is unclear) and one more than
+// MaxLifecycleDuration after createdAt. A nil DestroyAt is a no-op.
+func (l *Lifecycle) ResolveDestroyAt(createdAt, now time.Time) error {
+	if l == nil || l.DestroyAt == nil {
+		return nil
+	}
+	at := l.DestroyAt.UTC()
+	if l.DestroyAtAge != 0 {
+		return errors.New("set destroy_at or destroy_at_age, not both")
+	}
+	if !at.After(now) {
+		return fmt.Errorf("destroy_at %s is not in the future", at.Format(time.RFC3339))
+	}
+	age := at.Sub(createdAt)
+	if age > MaxLifecycleDuration {
+		return fmt.Errorf("destroy_at %s is more than %s after the sandbox was created", at.Format(time.RFC3339), MaxLifecycleDuration)
+	}
+	l.DestroyAtAge = age
+	l.DestroyAt = nil
 	return nil
 }
 
@@ -451,11 +570,12 @@ func (l Lifecycle) ValidateWithBypassFloor(pollInterval, reconcileInterval time.
 	return nil
 }
 
-// IsZero reports whether all four timers are disabled. Useful for skipping
-// Lifecycle inspection in the sweep when there's nothing to evaluate.
+// IsZero reports whether every timer is disabled and the sandbox is not
+// serverless: a sandbox with no lifecycle of its own, which the server-wide
+// defaults apply to. RestartOnFailure is not a timer and does not count.
 func (l Lifecycle) IsZero() bool {
 	return l.StopIfIdleFor == 0 && l.DestroyIfIdleFor == 0 &&
-		l.StopAtAge == 0 && l.DestroyAtAge == 0 && !l.Serverless
+		l.StopAtAge == 0 && l.DestroyAtAge == 0 && l.DestroyAfterExitFor == 0 && !l.Serverless
 }
 
 // UpdateLifecycleRequest is the body for PUT /v1/sandboxes/{id}/lifecycle.
@@ -606,8 +726,14 @@ type CreateSandboxRequest struct {
 	// image just because it is already in the shared local cache. Internal-only
 	// (json:"-"): never on the wire, re-derived on the owner node after a
 	// cluster forward from the re-authenticated caller.
-	VerifyRegistryAccess bool        `json:"-"`
-	Mounts               []MountSpec `json:"mounts,omitempty"`
+	VerifyRegistryAccess bool `json:"-"`
+	// RequireNonRootUser tells a container runtime to refuse an image whose
+	// configured user is root, after it has the image config and before the
+	// container exists (the operator create policy's require_non_root rule,
+	// CheckImageUserNonRoot). Internal-only (json:"-"): the node that runs the
+	// sandbox sets it from its own policy file.
+	RequireNonRootUser bool        `json:"-"`
+	Mounts             []MountSpec `json:"mounts,omitempty"`
 	// PlatformVolumes references named, operator-backed persistent volumes by
 	// name only — the user never supplies storage coordinates or credentials.
 	// The service translates each entry into a synthesized, tenant-scoped
@@ -654,6 +780,11 @@ type CreateSandboxRequest struct {
 	// is not supported with the gVisor runtime — the API returns an error if
 	// both GPUs and runtime="gvisor" are set.
 	GPUs *GPURequest `json:"gpus,omitempty"`
+	// Placement limits which nodes may run the sandbox: a zone and/or exact
+	// node labels (plans/placement-rules.md). It rides the replicated spec,
+	// so failover and recreate keep it. No node matching gives 409
+	// placement_unsatisfiable, never a quiet fallback.
+	Placement *PlacementRule `json:"placement,omitempty"`
 	// NetworkBytesInLimit caps lifetime ingress bytes for the sandbox. Zero
 	// means unlimited. When the cumulative counter crosses the limit, the
 	// reconcile loop installs an ingress DROP rule. The "we already paid for
@@ -773,6 +904,10 @@ type CreateSandboxRequest struct {
 	// identity is not authorized to use; when empty, the group key falls back
 	// to the authenticated API identity. Ignored by other runtimes today.
 	TenantID string `json:"tenant_id,omitempty"`
+	// Identity gives the sandbox a short-lived cloud identity token
+	// (plans/sandbox-cloud-identity.md). It rides the replicated spec, so a
+	// failover recreate keeps it; it holds no secret.
+	Identity *IdentityRequest `json:"identity,omitempty"`
 }
 
 func (r CreateSandboxRequest) ImageDistribution() ImageDistributionMetadata {
@@ -836,9 +971,43 @@ type Sandbox struct {
 	UpdatedAt          time.Time     `json:"updated_at"`
 	LastActiveAt       time.Time     `json:"last_active_at"`
 	LastError          string        `json:"last_error,omitempty"`
-	ContainerCommand   []string      `json:"container_command,omitempty"`
-	Lifecycle          Lifecycle     `json:"lifecycle"`
-	Failover           *Failover     `json:"failover,omitempty"`
+	// StatusReason says why the sandbox is in its current status, one of the
+	// StatusReason* values. Empty when a call simply created or started it.
+	// The store writes it only with a status change (or through a targeted
+	// update), so a whole-row write from an older read cannot undo it.
+	StatusReason string `json:"status_reason,omitempty"`
+	// ExitCode is the exit code behind out_of_memory, crashed,
+	// program_exited and restarted; nil for every other reason.
+	ExitCode *int `json:"exit_code,omitempty"`
+	// RestartFailures, RestartAt and LastRestartedAt are the restart-on-
+	// failure backoff state (L1): consecutive failures, when the pending
+	// restart is due (nil when none is pending), and when the last restart
+	// ran. Stored so a daemon restart keeps the backoff; never on the wire.
+	RestartFailures int        `json:"-"`
+	RestartAt       *time.Time `json:"-"`
+	LastRestartedAt *time.Time `json:"-"`
+	// ProgramExitedAt is when the main program ended, as the lifecycle
+	// sweep recorded it from toolboxd (L5); nil while it runs, and cleared
+	// when the sandbox starts again. destroy_after_exit_for counts from it.
+	ProgramExitedAt *time.Time `json:"-"`
+	// TokensNotBefore is the unix second before which a sandbox token for
+	// this sandbox is refused (pkg/sandboxtoken): set by a revoke and when
+	// a row is created, 0 when neither ever happened. It lives only in the
+	// owner node's row, never on the wire or in Raft.
+	TokensNotBefore int64 `json:"-"`
+	// RunGeneration says which run of the sandbox this row was read in: the
+	// store adds one each time the sandbox starts. A main-program exit is
+	// stored only for the run it was read from. Never on the wire.
+	RunGeneration int64 `json:"-"`
+	// RollbackPending marks a sandbox whose create the client was told
+	// failed but whose rollback could not finish (a cluster create whose
+	// rollback destroy needed a Raft leader that was not there). The
+	// ownership replay never publishes such a row and reconcile keeps
+	// destroying it. Set once, by the rollback; never on the wire or in Raft.
+	RollbackPending  bool      `json:"-"`
+	ContainerCommand []string  `json:"container_command,omitempty"`
+	Lifecycle        Lifecycle `json:"lifecycle"`
+	Failover         *Failover `json:"failover,omitempty"`
 	// FailoverReady is set on Get/List when failover.policy=recreate: true iff
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
@@ -1000,6 +1169,9 @@ type Sandbox struct {
 	// process the security posture is stated in terms of
 	// (plans/isolate-runtime.md §2.1).
 	TenantID string `json:"tenant_id,omitempty"`
+	// Identity is the sandbox's cloud identity, when it was created with
+	// one (plans/sandbox-cloud-identity.md). It never carries the token.
+	Identity *SandboxIdentity `json:"identity,omitempty"`
 }
 
 // ModuleRefForCreate returns the WASM module reference from a create request.
@@ -1324,6 +1496,11 @@ func (s *SandboxSnapshot) ApplyImageDistribution(meta ImageDistributionMetadata)
 // so old SDK callers keep working unchanged.
 type ExposePortRequest struct {
 	Protocol string `json:"protocol,omitempty"`
+	// Visibility is "public" (anyone with the URL) or "token" (the URL needs
+	// a sandbox token for this port, A2). Omitted, a new exposure is public
+	// and a re-expose keeps the visibility it has: only an explicit value
+	// changes it, so an older client's retry can never open a gated port.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 // ExposePortResponse is the JSON body returned by POST /v1/sandboxes/{id}/ports/{port}.
@@ -1336,6 +1513,9 @@ type ExposePortResponse struct {
 	PublicURL string `json:"public_url"`
 	Host      string `json:"host,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
+	// Visibility is set only for a token-gated port ("token"); a public
+	// port leaves it out, so the body is what it was before A2.
+	Visibility string `json:"visibility,omitempty"`
 }
 
 type ExposedPort struct {
@@ -1352,7 +1532,32 @@ type ExposedPort struct {
 	HostPort  int       `json:"host_port,omitempty"`
 	PublicURL string    `json:"public_url"`
 	CreatedAt time.Time `json:"created_at"`
+	// Visibility is "token" for a port whose public URL needs a sandbox
+	// token; empty (public) otherwise. Stored as "public" for every row
+	// written before A2 (the column default).
+	Visibility string `json:"visibility,omitempty"`
 }
+
+// Exposed port visibilities (A2). Public is the default and the meaning of
+// every row from before visibility existed.
+const (
+	ExposedPortVisibilityPublic = "public"
+	ExposedPortVisibilityToken  = "token"
+)
+
+// ValidExposedPortVisibility checks a requested visibility. "" stays "" (the
+// caller asked for no change); anything else must be public or token.
+func ValidExposedPortVisibility(value string) (string, error) {
+	switch value {
+	case "", ExposedPortVisibilityPublic, ExposedPortVisibilityToken:
+		return value, nil
+	default:
+		return "", fmt.Errorf("invalid port visibility %q (allowed: %s, %s)", value, ExposedPortVisibilityPublic, ExposedPortVisibilityToken)
+	}
+}
+
+// TokenGated reports whether the exposure's public URL needs a sandbox token.
+func (p ExposedPort) TokenGated() bool { return p.Visibility == ExposedPortVisibilityToken }
 
 // Exposed port protocols. http is the original behavior (Caddy HTTP reverse
 // proxy); tcp and tls are the caddy-l4 paths added with the L4 work.
@@ -1397,10 +1602,26 @@ type HealthStatus struct {
 }
 
 type ExecRequest struct {
-	Command        string            `json:"command"`
+	Command string `json:"command"`
+	// Argv runs a program with these arguments instead of Command, with no
+	// shell parsing in between: spaces, quotes, $ and ; reach the program
+	// as written. It finds programs the same way Command does, including
+	// what the login profile adds to PATH. Set Command or Argv, not both.
+	// An agent older than Argv answers "command is required"; the SDKs
+	// check /version (exec.argv) first.
+	Argv           []string          `json:"argv,omitempty"`
 	WorkDir        string            `json:"workdir,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	// MaxStdoutBytes and MaxStderrBytes keep only the first N bytes of each
+	// stream; toolboxd reads and drops the rest, so the command never blocks
+	// on a full pipe. 0 means the caller sets no cap: sandboxd may fill in
+	// the operator's default (SB_EXEC_OUTPUT_DEFAULT_BYTES), and toolboxd
+	// still applies its own hard ceiling. An agent older than these fields
+	// ignores them, so the SDKs check /version (exec.max_output_bytes) and
+	// refuse rather than send them to it.
+	MaxStdoutBytes int64 `json:"max_stdout_bytes,omitempty"`
+	MaxStderrBytes int64 `json:"max_stderr_bytes,omitempty"`
 }
 
 type ExecResult struct {
@@ -1408,6 +1629,27 @@ type ExecResult struct {
 	Stderr     string `json:"stderr"`
 	ExitCode   int    `json:"exit_code"`
 	DurationMS int64  `json:"duration_ms"`
+	// TimedOut is true when the command ran past its timeout and toolboxd
+	// killed its whole process group. A sandbox agent older than this field
+	// never sets it.
+	TimedOut bool `json:"timed_out,omitempty"`
+	// StdoutTruncated and StderrTruncated report that the stream printed more
+	// than its cap and only the first bytes are in Stdout or Stderr. One flag
+	// per stream, because the caps are set per stream: a caller whose stdout
+	// is complete can trust it even when noisy stderr was cut, and a single
+	// flag would make it compare lengths, which fails when the output is
+	// exactly the cap. Output a background job prints after the reply is
+	// dropped (B2) and never sets them.
+	StdoutTruncated bool `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool `json:"stderr_truncated,omitempty"`
+	// Signal names the signal that ended the process toolboxd started, such
+	// as "SIGKILL" (a timeout) or "SIGSEGV"; empty when it exited on its
+	// own. ExitCode stays -1 then, as before this field; the shell
+	// convention for the same end is 128 + the signal's number (137 for
+	// SIGKILL). A command run by a shell that outlives it reports the
+	// shell's 128+n exit code and no signal. Response-only: an older agent
+	// leaves it out.
+	Signal string `json:"signal,omitempty"`
 }
 
 type ErrorResponse struct {
@@ -1830,7 +2072,7 @@ func ValidTemplateID(templateID string) bool {
 }
 
 // sandboxIDPattern is the delimiter-safe grammar for a sandbox ID. It matches
-// what generateSandboxID produces ("sb-" + hex) and the warm-slot / facade IDs
+// what Service.NewSandboxID produces ("sb-" + hex) and the warm-slot / facade IDs
 // (fc-*, wasm-*, iso-*), and it is the grammar the firecracker and containerd
 // drivers already enforce. Disallowing '.', '/', and every other separator is
 // what makes an ID safe to use as a filesystem path component, a URL segment,

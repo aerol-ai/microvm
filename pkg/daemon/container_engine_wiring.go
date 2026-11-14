@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
-	"github.com/aerol-ai/microvm/internal/network/cni"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -34,6 +34,13 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 		svc.SetEventsSource(dockerClient)
 		return nil, nil
 	}
+	// A configured cgroup parent must be able to hold sandboxes with their
+	// limits before any is created; refuse to start otherwise (plan C7).
+	if cfg.ContainerdCgroupParent != "" {
+		if err := cntr.CheckCgroupParent(cntr.CgroupRoot, cfg.ContainerdCgroupParent); err != nil {
+			return nil, fmt.Errorf("containerd cgroup parent: %w", err)
+		}
+	}
 	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
 	// never collide with the docker driver's DOCKER-USER rules on a
 	// mixed-engine (migrating) host. EnsureChain bootstraps the chain and
@@ -45,7 +52,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	// dockerd sets FORWARD policy to DROP and only ACCEPTs docker0; our aerolvm0
 	// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
 	// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
-	ctdRules.SetBridgeSubnet(cni.DefaultBridgeSubnet)
+	ctdRules.SetBridgeSubnet(containerdBridgeSubnet(cfg))
 	if err := ctdRules.EnsureChain(); err != nil {
 		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
 	}
@@ -62,11 +69,7 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	warmPool := wireContainerdWarmPool(ctx, cfg, logger, driver, admitter)
 	svc.SetContainerdRuntime(driver)
-	if dockerClient != nil {
-		svc.SetEventsSource(newMultiEventsSource(dockerClient, driver))
-	} else {
-		svc.SetEventsSource(driver)
-	}
+	svc.SetEventsSource(containerdEventsSource(cfg, logger, dockerClient, driver))
 	logger.Info("containerd engine enabled",
 		"socket", cfg.ContainerdSocket,
 		"namespace", cfg.ContainerdNamespace,
@@ -111,20 +114,42 @@ func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *sl
 
 // multiEventsSource fans in dockerd and containerd event streams during
 // migration when both engines may own live sandboxes on one host.
+//
+// Each source streams on its own: one that ends is retried on its own
+// backoff, and the others keep flowing. It used to be all or nothing (one
+// source's error tore the rest down), and on a containerd-engine host where
+// dockerd is stopped, or was never installed (the Kubernetes worker pod), the
+// Docker subscribe fails at once on every try, so containerd's task-exit and
+// OOM events never reached the service: a sandbox the kernel killed stayed
+// "started" (Kubernetes Phase 0, finding F12). Events a source misses while
+// it is down are reconcile's to find, as after any stream gap.
 type multiEventsSource struct {
 	sources []docker.EventsSource
+	logger  *slog.Logger
 }
 
-func newMultiEventsSource(sources ...docker.EventsSource) docker.EventsSource {
+// eventSourceRetryInitial and eventSourceRetryMax bound how often a failing
+// source is subscribed again. Variables so tests can shorten them.
+var (
+	eventSourceRetryInitial = time.Second
+	eventSourceRetryMax     = 30 * time.Second
+)
+
+func newMultiEventsSource(logger *slog.Logger, sources ...docker.EventsSource) docker.EventsSource {
 	out := make([]docker.EventsSource, 0, len(sources))
 	for _, s := range sources {
 		if s != nil {
 			out = append(out, s)
 		}
 	}
-	return &multiEventsSource{sources: out}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &multiEventsSource{sources: out, logger: logger}
 }
 
+// StreamEvents returns only when ctx ends (with one source, it is that
+// source's own stream, retried by the service's event monitor).
 func (m *multiEventsSource) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent) error {
 	if len(m.sources) == 0 {
 		<-ctx.Done()
@@ -133,42 +158,64 @@ func (m *multiEventsSource) StreamEvents(ctx context.Context, out chan<- docker.
 	if len(m.sources) == 1 {
 		return m.sources[0].StreamEvents(ctx, out)
 	}
-	childCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	done := make(chan error, len(m.sources))
+	var wg sync.WaitGroup
 	for _, src := range m.sources {
-		src := src
+		wg.Add(1)
 		go func() {
-			buf := make(chan docker.DockerEvent, 32)
-			// Drain buf -> out in a SEPARATE goroutine that runs concurrently
-			// with the stream. StreamEvents blocks for the source's lifetime,
-			// so draining only after it returns (the original bug) forwarded
-			// nothing and deadlocked once the 32-slot buffer filled.
-			drained := make(chan struct{})
-			go func() {
-				defer close(drained)
-				for ev := range buf {
-					select {
-					case out <- ev:
-					case <-childCtx.Done():
-						return
-					}
-				}
-			}()
-			err := src.StreamEvents(childCtx, buf)
-			close(buf) // StreamEvents is the only writer; safe once it returns
-			<-drained
-			done <- err
+			defer wg.Done()
+			m.keepStreaming(ctx, src, out)
 		}()
 	}
-	var firstErr error
-	for range m.sources {
-		if err := <-done; err != nil && firstErr == nil {
-			firstErr = err
-			cancel() // one source failing tears the rest down
+	wg.Wait()
+	return ctx.Err()
+}
+
+// keepStreaming runs one source until ctx ends, subscribing again after
+// each end with a doubling wait, reset once a stream has stayed up longer
+// than the longest wait.
+func (m *multiEventsSource) keepStreaming(ctx context.Context, src docker.EventsSource, out chan<- docker.DockerEvent) {
+	wait := eventSourceRetryInitial
+	for {
+		started := time.Now()
+		err := forwardEvents(ctx, src, out)
+		if ctx.Err() != nil {
+			return
 		}
+		if time.Since(started) > eventSourceRetryMax {
+			wait = eventSourceRetryInitial
+		}
+		m.logger.Warn("event source ended; retrying it alone while the others keep streaming",
+			"source", fmt.Sprintf("%T", src), "error", err, "retry_in", wait)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, eventSourceRetryMax)
 	}
-	return firstErr
+}
+
+// forwardEvents runs one subscription of src, copying its events to out.
+// The copy runs beside the stream, not after it: StreamEvents blocks for the
+// stream's lifetime, so copying only after it returned forwarded nothing and
+// deadlocked once the buffer filled.
+func forwardEvents(ctx context.Context, src docker.EventsSource, out chan<- docker.DockerEvent) error {
+	buf := make(chan docker.DockerEvent, 32)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for ev := range buf {
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	err := src.StreamEvents(ctx, buf)
+	close(buf) // StreamEvents is the only writer; safe once it returns
+	<-drained
+	return err
 }
 
 func (m *multiEventsSource) ContainerPID(ctx context.Context, containerRef string) (int, error) {
@@ -187,4 +234,16 @@ func (m *multiEventsSource) ContainerPID(ctx context.Context, containerRef strin
 	// running here" — never re-invoke a source (the old code double-called
 	// sources[0], doubling a failed RPC).
 	return 0, firstErr
+}
+
+// containerdEventsSource is the containerd engine's event source: Docker's
+// and containerd's streams together while both engines may own sandboxes on
+// the host, or containerd's alone when there is no Docker client or Docker
+// is off (SB_DOCKER_ENABLED=false, C2), where a Docker stream would only
+// fail and be retried forever.
+func containerdEventsSource(cfg config.Config, logger *slog.Logger, dockerClient *docker.Client, driver docker.EventsSource) docker.EventsSource {
+	if dockerClient != nil && !cfg.DockerDisabled {
+		return newMultiEventsSource(logger, dockerClient, driver)
+	}
+	return driver
 }

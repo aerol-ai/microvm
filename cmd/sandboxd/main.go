@@ -38,6 +38,49 @@ func run(ctx context.Context, logger *slog.Logger) error {
 // entire boot sequence lives in pkg/daemon.Run, which a managed build reuses by
 // supplying a real provider factory.
 func main() {
+	// Checked first, and never falls through to run(): a version query on a
+	// live node must not boot a second daemon on its state directory.
+	if len(os.Args) >= 2 && isVersionArg(os.Args[1]) {
+		if err := runVersionCLI(os.Args[2:], os.Stdout); err != nil {
+			os.Stderr.WriteString("sandboxd version: " + err.Error() + "\n" + versionUsage)
+			osExit(2)
+		}
+		return
+	}
+
+	// Node upgrader and host setup (plans/kubectl-style-cluster-ops.md
+	// §6.3, §7). Like version, they never fall through to run(): each
+	// stops, swaps or reconfigures the daemon from outside it.
+	if len(os.Args) >= 2 && os.Args[1] == upgradeSubcommand {
+		if code := runUpgradeCLI(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == hostSubcommand {
+		if code := runHostCLI(os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+	// Backup, restore and lost-quorum recovery (§3.1, Phase 5): the
+	// node's day-2 tools. They read and write the state directory from
+	// outside the daemon, so they never boot one.
+	if len(os.Args) >= 2 && opsCommands[os.Args[1]] != nil {
+		if code := opsCommands[os.Args[1]](os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+	// One-line joins (§3.1, §4): init, join, preflight, adopt, reset and
+	// join-command act on this node from outside the daemon, like upgrade.
+	if len(os.Args) >= 2 && isNodeCommand(os.Args[1]) {
+		if code := runNodeCLI(os.Args[1], os.Args[2:], os.Stdout, os.Stderr); code != 0 {
+			osExit(code)
+		}
+		return
+	}
+
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
@@ -112,4 +155,25 @@ func main() {
 		logger.Error("sandboxd exited with error", "error", err)
 		osExit(1)
 	}
+}
+
+// isDaemonArgv reports whether a sandboxd command line runs the daemon:
+// main falls through to run() for any first argument none of its branches
+// takes. nodeops.PodHost uses it to find a live daemon in a server pod
+// (C22), so a daemon started with a flag still counts. A subcommand added
+// to main but not here reads as the daemon, and the day-2 tools then refuse
+// rather than race it; TestIsDaemonArgv lists every branch.
+func isDaemonArgv(argv []string) bool {
+	if len(argv) < 2 {
+		return true
+	}
+	switch a := argv[1]; {
+	case isVersionArg(a), isNodeCommand(a),
+		a == upgradeSubcommand, a == hostSubcommand, a == keySubcommand,
+		a == backupSubcommand, a == restoreSubcommand, a == recoverQuorumSubcommand,
+		a == "--wasm-worker", a == "--wasm-resident-host", a == pkcs11.HelperFlag,
+		a == isolate.JailShimFlag, a == gatewayd.Subcommand:
+		return false
+	}
+	return true
 }

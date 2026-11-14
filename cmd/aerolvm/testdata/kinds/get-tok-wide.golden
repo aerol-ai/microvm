@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+ID                NAME    ROLE    TEAM  EXPIRES               CREATED BY  CREATED
+tok_aaaaaaaaaaaa  ci      runner  ml    2027-01-15            operator    2026-10-17
+tok_bbbbbbbbbbbb  ci      viewer  web   2026-10-27 (expired)  -           2026-10-17
+tok_cccccccccccc  deploy  admin   *     2026-11-07            alice       2026-10-17
+--- stderr

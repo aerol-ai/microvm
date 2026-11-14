@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -117,12 +118,24 @@ type SelectPlacementResponse struct {
 	// build matches — it keeps answering a 503 during a rolling upgrade —
 	// while a current agent restores ErrClusterAtCapacity from this flag.
 	AtCapacity bool `json:"at_capacity,omitempty"`
+	// PlacementUnsatisfiable marks a refusal because no worker carries the
+	// request's labels (ErrPlacementUnsatisfiable); Error names the rule.
+	PlacementUnsatisfiable bool `json:"placement_unsatisfiable,omitempty"`
+	// LabelsChecked says this control plane filtered on Request.Labels. A
+	// server on an older build drops the field it cannot read and places as
+	// if there were no rule; an agent that sent labels and does not get this
+	// back fails closed (ErrPlacementRulesUnsupported) instead of creating
+	// the sandbox wherever that server chose.
+	LabelsChecked bool `json:"labels_checked,omitempty"`
 }
 
 // SelectPlacementErrorResponse renders a placement failure for an agent.
 func SelectPlacementErrorResponse(err error) SelectPlacementResponse {
 	if errors.Is(err, ErrClusterAtCapacity) {
 		return SelectPlacementResponse{Error: ErrNoPlacementTarget.Error(), AtCapacity: true}
+	}
+	if errors.Is(err, ErrPlacementUnsatisfiable) {
+		return SelectPlacementResponse{Error: err.Error(), PlacementUnsatisfiable: true, LabelsChecked: true}
 	}
 	return SelectPlacementResponse{Error: err.Error()}
 }
@@ -142,10 +155,29 @@ type Agent struct {
 	// profiles caches the egress profiles this worker's sandboxes use
 	// (egress_profiles.go): a worker holds no FSM.
 	profiles egressProfileCache
+	// teamQuotas caches team-quota reads for the start check (team_quotas.go).
+	teamQuotas teamQuotaCache
+	// identityRoles caches the role tags this worker's creates and token
+	// refreshes ask about (identity.go).
+	identityRoles identityRoleCache
+	// deny is this node's copy of the deleted-node set
+	// (agent_deny_mirror.go); denyMirrorStop ends its poll.
+	deny           agentDenyMirror
+	denyMirrorStop context.CancelFunc
+	// certRenewStop ends the node cert renewal loop (cert_renew.go).
+	certRenewStop context.CancelFunc
+	denyHits      *denyHitRecorder
+	// upgrade is the node side of a rollout step (upgrade_node.go);
+	// upgradePruneStop ends its file-store prune.
+	upgrade          *upgradeNode
+	upgradePruneStop context.CancelFunc
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
 	feed *agentPlacementFeed
+	// ownerCache remembers which node owns a sandbox so routing skips the
+	// control-plane lookup (owner_cache.go). nil unless SB_CLUSTER_OWNER_CACHE.
+	ownerCache *OwnerCache
 
 	cfg           config.Config
 	logger        *slog.Logger
@@ -155,6 +187,8 @@ type Agent struct {
 
 	gossip *gossipNode
 
+	// patToken is cfg.ClusterPeerPAT(): empty on a node joined without the
+	// operator PAT, which then calls peers with its cert alone.
 	patToken string
 
 	internalURL    string
@@ -166,7 +200,11 @@ type Agent struct {
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement
-	shardCache     map[string][]Placement
+	// placementWalkAnswered is when the last page walk that the control
+	// plane answered began. Past OwnershipLease the cached rows are handed
+	// out in flux (PlacementsForShards).
+	placementWalkAnswered time.Time
+	shardCache            map[string][]Placement
 	// shardCacheOrder is the insertion order of shardCache keys, oldest first,
 	// so superseded ring generations can be evicted.
 	shardCacheOrder []string
@@ -175,6 +213,12 @@ type Agent struct {
 	// endpoint on worker/ingress-only agents.
 	placementVersion          atomic.Uint64
 	lastNoControlPlaneLogUnix atomic.Int64
+	// contact is the last successful control-plane exchange, for /ready
+	// (readiness.go).
+	contact agentContact
+	// leaderProbeHook stands in for Leader in readiness tests. Always nil
+	// in production.
+	leaderProbeHook func() string
 
 	// recreator is the service-layer hook the worker owner watcher calls to
 	// materialize placements the FSM assigned to this node. Attached after
@@ -228,8 +272,9 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		nodeID:        nodeID,
 		apiURL:        cfg.SelfAPIAdvertiseURL,
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 
 	if clusterTLS != nil {
@@ -245,6 +290,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		if err != nil {
 			return nil, fmt.Errorf("cluster.NewAgent: internal server: %w", err)
 		}
+		is.SetPeerDenyCheck(a.refuseDeniedPeer)
+		is.SetPeerKeyCheck(a.CheckPeerKey)
 		a.internalServer = is
 		a.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -278,6 +325,8 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		OnLeave:        a.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         a.deny.has,
+		DenyHits:       a.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {
@@ -286,6 +335,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		return nil, fmt.Errorf("cluster.NewAgent: gossip: %w", err)
 	}
 	a.gossip = gn
+	a.ownerCache = newAgentOwnerCache(a)
 	if a.internalServer != nil {
 		a.internalServer.SetPeerAuthorizer(func(nodeID string) bool {
 			m, ok := gn.lookupMember(nodeID)
@@ -298,7 +348,37 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 	// AttachRecreator probe silently skipped an Agent.
 	a.startOwnerWatcher()
 	a.startPlacementFeed()
+	a.startDenyMirror(denyMirrorInterval)
+	// In external-CA mode cert-manager renews the certificate (C23).
+	if clusterTLS != nil && !cfg.ClusterExternalCA {
+		a.certRenewStop = startCertRenewer(&certRenewer{tls: clusterTLS, nodeID: nodeID, logger: logger, renew: a.renewViaServers})
+	}
+	a.startUpgradeNode()
 	return a, nil
+}
+
+// startUpgradeNode wires this worker's or ingress node's half of a
+// rollout step and the prune of its upgrade file store.
+func (a *Agent) startUpgradeNode() {
+	a.upgrade = newUpgradeNode(a.cfg, a.nodeID, false, a.logger)
+	a.upgrade.fence = a.agentFence
+	a.upgrade.servers = func() []Member { return serversForCopy(a.controlPlaneMembers(), a.nodeID, "") }
+	a.upgrade.clientFor = a.ClientForPeer
+	a.upgrade.audit = a.recordUpgradeAudit
+	ctx, cancel := context.WithCancel(context.Background())
+	a.upgradePruneStop = cancel
+	go func() {
+		t := time.NewTicker(upgradePruneEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-t.C:
+				a.upgrade.pruneKeepingRollout(ctx, now)
+			}
+		}
+	}()
 }
 
 func (a *Agent) SelfNodeID() string { return a.nodeID }
@@ -351,6 +431,8 @@ func (a *Agent) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}
 	owner := lookup.Owner
 	owner.IsSelf = owner.NodeID == a.nodeID
+	// The epoch rides the placement, which every server version returns.
+	owner.Epoch = lookup.Placement.OwnerEpoch
 	return owner, nil
 }
 
@@ -413,6 +495,7 @@ func (a *Agent) ownerFromNameLookup(lookup PlacementLookupResponse) (string, Own
 	}
 	owner := lookup.Owner
 	owner.IsSelf = owner.NodeID == a.nodeID
+	owner.Epoch = lookup.Placement.OwnerEpoch
 	return lookup.SandboxID, owner, nil
 }
 
@@ -448,6 +531,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 		if resp.AtCapacity {
 			return PlacementTarget{}, nil, nil, ErrClusterAtCapacity
 		}
+		if resp.PlacementUnsatisfiable {
+			return PlacementTarget{}, nil, nil, fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, strings.TrimPrefix(resp.Error, ErrPlacementUnsatisfiable.Error()+": "))
+		}
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}
@@ -458,6 +544,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 			return PlacementTarget{}, nil, nil, err
 		}
 		return PlacementTarget{}, nil, nil, errors.New(resp.Error)
+	}
+	if len(body.Request.Labels) > 0 && !resp.LabelsChecked {
+		return PlacementTarget{}, nil, nil, ErrPlacementRulesUnsupported
 	}
 	if resp.Target.NodeID == a.nodeID {
 		resp.Target.APIURL = a.apiURL
@@ -505,19 +594,20 @@ func (a *Agent) RecordPlacement(ctx context.Context, sandboxID string, spec *mod
 		}
 	}
 	cmd := command{
-		Op:                    opPlace,
-		SandboxID:             sandboxID,
-		OwnerNodeID:           a.nodeID,
-		OwnerAPIURL:           a.apiURL,
-		OwnerDataPlaneHost:    a.dataPlaneHost,
-		Spec:                  QualifySpecName(spec, nameOwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         incarnationID,
-		ExpectedIncarnationID: expectedIncarnationID,
-		OwnerRef:              secrets.OwnerRef,
+		Op:                     opPlace,
+		SandboxID:              sandboxID,
+		OwnerNodeID:            a.nodeID,
+		OwnerAPIURL:            a.apiURL,
+		OwnerDataPlaneHost:     a.dataPlaneHost,
+		Spec:                   QualifySpecName(spec, nameOwnerRef),
+		SecretRef:              secrets.Ref,
+		SecretVersion:          secrets.Version,
+		SecretRecipients:       normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:   secrets.SealGeneration,
+		IncarnationID:          incarnationID,
+		ExpectedIncarnationID:  expectedIncarnationID,
+		OwnerRef:               secrets.OwnerRef,
+		RefuseDeletedLifecycle: a.deletedLifecycleFenceReplicated(),
 	}
 	return a.applyCommand(ctx, cmd)
 }
@@ -563,6 +653,12 @@ func (a *Agent) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.
 }
 
 func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return a.upsertSpec(ctx, sandboxID, spec, secrets, 0)
+}
+
+// upsertSpec is UpsertSpec with opUpsertSpec's version check
+// (spec_version_fence.go); expectedVersion 0 asks for none.
+func (a *Agent) upsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets, expectedVersion uint64) error {
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
@@ -589,15 +685,16 @@ func (a *Agent) UpsertSpec(ctx context.Context, sandboxID string, spec *models.C
 		}
 	}
 	return a.applyCommand(ctx, command{
-		Op:                    opUpsertSpec,
-		SandboxID:             sandboxID,
-		Spec:                  QualifySpecName(spec, nameOwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
-		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
+		Op:                       opUpsertSpec,
+		SandboxID:                sandboxID,
+		Spec:                     QualifySpecName(spec, nameOwnerRef),
+		SecretRef:                secrets.Ref,
+		SecretVersion:            secrets.Version,
+		SecretRecipients:         normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:     secrets.SealGeneration,
+		IncarnationID:            strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:    strings.TrimSpace(secrets.IncarnationID),
+		ExpectedPlacementVersion: expectedVersion,
 	})
 }
 
@@ -657,7 +754,7 @@ func (a *Agent) AddExposedPort(ctx context.Context, sandboxID string, port int, 
 }
 
 func (a *Agent) addExposedPortForIncarnation(ctx context.Context, sandboxID, incarnationID string, port int, route ExposedPortRoute) error {
-	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL}
+	cmd := command{Op: opAddExposedPort, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Port: port, Protocol: route.Protocol, HostPort: route.HostPort, PublicURL: route.PublicURL, Visibility: route.Visibility}
 	return a.applyCommand(ctx, cmd)
 }
 
@@ -777,11 +874,13 @@ func (a *Agent) DeletePlacementExact(ctx context.Context, sandboxID, expectedOwn
 	if expectedIncarnationID == "" {
 		return fmt.Errorf("%w: exact placement delete requires current incarnation", ErrIncarnationConflict)
 	}
-	return a.applyCommand(ctx, command{
+	cmd := command{
 		Op: opDelete, SandboxID: sandboxID,
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
 		ExpiresUnix: auditACLExpiryUnix(a.cfg.AuditDeletedGrace), AuditIndexMax: int64(a.cfg.AuditDeletedIndexMax),
-	})
+	}
+	stampVolumeReclaims(&cmd, a.VolumeReclaimsReplicated(), a.nodeID)
+	return a.applyCommand(ctx, cmd)
 }
 
 func (a *Agent) BeginDeletePlacementExact(ctx context.Context, sandboxID, expectedOwnerNodeID, expectedIncarnationID string) error {
@@ -976,8 +1075,9 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 		}
 		switch {
 		case !ok:
-			if err := a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
-				firstErr = err
+			record := func() error { return a.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
+			if !placeUnplacedRow(a.logger, a.nodeID, st, record, &firstErr) {
+				continue
 			}
 			for port, route := range st.ExposedPorts {
 				if err := a.addExposedPortForIncarnation(ctx, st.ID, incarnationID, port, route); err != nil && firstErr == nil {
@@ -1014,7 +1114,9 @@ func (a *Agent) AssertOwnership(ctx context.Context, local []LocalSandboxState) 
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
-				if err := a.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+				// A backfill records what the sandbox already is, so a
+				// team over a lowered quota does not refuse it.
+				if err := a.UpsertSpec(withTeamQuotaReplay(ctx), st.ID, spec, replaySecrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1160,13 +1262,35 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	}
 	out, err := a.fetchPlacementPages(filter)
 	if err != nil {
-		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
-			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards())
+		// Age limit (plan C4 part 3, invariant I7), as the feed has. Without
+		// SB_INGRESS_PROXY_ROUTING this walk is the ingress's only view, and
+		// a cut-off ingress kept routing by its last rows for the whole cut:
+		// to an owner the leader may have replaced, or one that has paused
+		// the sandbox (C4 part 1), whose paused process takes the connection
+		// and never answers. Past the lease the recreate-policy rows go out
+		// in flux, which the ingress answers with 503 + Retry-After; the rest
+		// keep routing (staleViewPlacement).
 		cached := a.cachedPlacementsForShards(filter)
+		a.cacheMu.RLock()
+		answered := a.placementWalkAnswered
+		a.cacheMu.RUnlock()
+		age := time.Since(answered)
+		inFlux := !answered.IsZero() && age > OwnershipLease(a.cfg)
+		if inFlux {
+			for i := range cached {
+				cached[i] = staleViewPlacement(cached[i])
+			}
+		}
+		a.logger.Warn("cluster agent: paged placement lookup failed; using cached placement view",
+			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards(),
+			"since_last_answer", age.Round(time.Millisecond), "in_flux", inFlux)
 		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
 		return cached
 	}
 	a.cacheMu.Lock()
+	if start.After(a.placementWalkAnswered) {
+		a.placementWalkAnswered = start
+	}
 	if filter.allShards() {
 		a.placementCache = clonePlacements(out)
 	}
@@ -1407,6 +1531,15 @@ func (a *Agent) Leader() string {
 
 func (a *Agent) Close() error {
 	var firstErr error
+	if a.certRenewStop != nil {
+		a.certRenewStop()
+	}
+	if a.denyMirrorStop != nil {
+		a.denyMirrorStop()
+	}
+	if a.upgradePruneStop != nil {
+		a.upgradePruneStop()
+	}
 	a.stopOwnerWatcher()
 	a.stopPlacementFeed()
 	if a.gossip != nil {
@@ -1469,6 +1602,7 @@ func (a *Agent) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	cmd = markQuotaAdmit(ctx, cmd)
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1502,12 +1636,13 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 	for _, m := range members {
 		err := a.tryControlPlaneMember(ctx, m, method, publicPath, internalPath, body, out)
 		if err == nil {
+			a.contact.record(time.Now())
 			return nil
 		}
 		if firstErr == nil {
 			firstErr = err
 		}
-		if isStatus(err, http.StatusServiceUnavailable) || errors.Is(err, ErrNotLeader) {
+		if isStatus(err, http.StatusServiceUnavailable) || errors.Is(err, ErrNotLeader) || neverReachedPeer(err) {
 			continue
 		}
 		return err
@@ -1516,6 +1651,17 @@ func (a *Agent) doControlPlaneBytes(ctx context.Context, method, publicPath, int
 		return firstErr
 	}
 	return ErrNotLeader
+}
+
+// neverReachedPeer reports an error from opening the connection: the call
+// never left this node, so the next server can take it whatever it does,
+// writes included. Gossip takes seconds to see a server in a lost zone go;
+// until then it stays in the list, and before this one such server failed
+// every call that tried it first (Phase 3 zone-loss drill). An error after
+// the request went out stays final: the server may have applied it.
+func neverReachedPeer(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
 }
 
 func (a *Agent) tryControlPlaneMember(ctx context.Context, m Member, method, publicPath, internalPath string, body []byte, out any) error {
@@ -1673,6 +1819,27 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// the reservation's owner, which keys off errors.Is.
 			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
 		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrSpecVersionConflict.Error()) {
+			// The spec version check across the same hop: the writer keys
+			// off errors.Is to read the spec again and redo its change.
+			return fmt.Errorf("%w: %s", ErrSpecVersionConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementDeleted.Error()) {
+			// The deleted-lifecycle fence across the same hop: a worker's
+			// ownership replay keys off errors.Is to stop replaying the row.
+			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && strings.Contains(message, ErrTeamQuotaExceeded.Error()) {
+			// A team at its quota is a verdict, not backpressure: the create
+			// path answers it as team_quota_exceeded.
+			return fmt.Errorf("%w: %s", ErrTeamQuotaExceeded, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrPlacementUnsatisfiable.Error()) {
+			// The leader refused a reservation outside the sandbox's
+			// placement rule (admitReservationCommands): a 409 the create
+			// path answers as placement_unsatisfiable, not a reserve failure.
+			return fmt.Errorf("%w: %s", ErrPlacementUnsatisfiable, message)
+		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive
 		}
@@ -1793,11 +1960,39 @@ func (e statusError) Is(target error) bool {
 	}
 	switch e.status {
 	case http.StatusForbidden:
-		return strings.Contains(e.message, "cluster peer not in membership")
+		return strings.Contains(e.message, PeerNotInMembershipMessage)
 	case http.StatusServiceUnavailable:
 		return strings.Contains(e.message, "peer membership not yet available")
 	}
 	return false
+}
+
+// ForwardedStatus returns the 4xx a server answered a forwarded call with
+// when that refusal is about the request itself, so the caller gets the
+// server's status and not a 500; 0 otherwise. Any error in err's chain
+// with a ForwardedStatus method answers it (statusError does).
+func ForwardedStatus(err error) int {
+	var f interface{ ForwardedStatus() int }
+	if errors.As(err, &f) {
+		return f.ForwardedStatus()
+	}
+	return 0
+}
+
+// ForwardedStatus is e's status when it refuses the request itself (400,
+// 404, 409, 412, 422, 429). A refusal between nodes is left out: a 401 or
+// 403 on the peer's own credentials, or "peer not in membership"
+// (ErrMembershipPending), is not the caller's to fix.
+func (e statusError) ForwardedStatus() int {
+	if e.Is(ErrMembershipPending) {
+		return 0
+	}
+	switch e.status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusPreconditionFailed,
+		http.StatusUnprocessableEntity, http.StatusTooManyRequests:
+		return e.status
+	}
+	return 0
 }
 
 func isStatus(err error, status int) bool {

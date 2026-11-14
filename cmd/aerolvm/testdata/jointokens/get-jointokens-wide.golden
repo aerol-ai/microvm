@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+ID       ROLE      STATUS    EXPIRES                REUSABLE   USES   CREATED                CREATED-BY   USED-BY
+old001   ingress   Expired   2026-11-01T12:00:00Z   false      0      2026-11-01T10:00:00Z   -            -
+srv001   server    Used      2026-11-08T10:00:00Z   false      1      2026-11-07T10:00:00Z   node:srv-a   srv-b
+wrk001   worker    Valid     never                  true       2      2026-11-07T10:00:00Z   operator     wkr-1,wkr-2
+--- stderr

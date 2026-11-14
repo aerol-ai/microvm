@@ -10,6 +10,11 @@ type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
 type Lifecycle = models.Lifecycle
 type Failover = models.Failover
+
+// PlacementRule limits which cluster nodes may run a sandbox, by zone and
+// node labels (CreateSandboxOptions.Placement). No matching node makes the
+// create fail with 409 placement_unsatisfiable.
+type PlacementRule = models.PlacementRule
 type UpdateLifecycleOptions = models.UpdateLifecycleRequest
 type ExecRequest = models.ExecRequest
 type ExecResult = models.ExecResult
@@ -84,6 +89,19 @@ const (
 // ExposeProtocol selects the wire surface an exposure publishes through.
 type ExposeProtocol string
 
+// ExposeVisibility says who can open a port's URL (Sandbox.ExposePort's
+// WithVisibility). Token-gated URLs need a server with a domain and work
+// for HTTP ports only.
+type ExposeVisibility string
+
+const (
+	// ExposeVisibilityPublic: anyone with the URL.
+	ExposeVisibilityPublic ExposeVisibility = "public"
+	// ExposeVisibilityToken: only a visitor with a sandbox token for this
+	// port (Sandbox.CreateToken with Port set).
+	ExposeVisibilityToken ExposeVisibility = "token"
+)
+
 const (
 	FailoverPolicyNone     = models.FailoverPolicyNone
 	FailoverPolicyRecreate = models.FailoverPolicyRecreate
@@ -113,6 +131,22 @@ type MountType = models.MountType
 type CreateSessionOptions = models.CreateSessionRequest
 type Session = models.Session
 type SessionStatus = models.SessionStatus
+
+// Status reasons say why a sandbox is in its current status
+// (Sandbox.StatusReason). ExitCode is set for out_of_memory, crashed,
+// program_exited and restarted.
+const (
+	StatusReasonUserStop      = models.StatusReasonUserStop
+	StatusReasonIdle          = models.StatusReasonIdle
+	StatusReasonMaxAge        = models.StatusReasonMaxAge
+	StatusReasonOutOfMemory   = models.StatusReasonOutOfMemory
+	StatusReasonDiskLimit     = models.StatusReasonDiskLimit
+	StatusReasonCrashed       = models.StatusReasonCrashed
+	StatusReasonReconcile     = models.StatusReasonReconcile
+	StatusReasonProgramExited = models.StatusReasonProgramExited
+	StatusReasonFailover      = models.StatusReasonFailover
+	StatusReasonRestarted     = models.StatusReasonRestarted
+)
 
 const (
 	SessionStatusRunning = models.SessionStatusRunning
@@ -206,6 +240,18 @@ type EgressProfile = models.EgressProfile
 // EgressProfileOptions is the body of PutEgressProfile: a full replace.
 type EgressProfileOptions = models.EgressProfileRequest
 
+// TeamQuotaOptions is the body of PutTeamQuota: MaxSandboxes, MaxCPU and
+// MaxMemoryMB. A zero limit is no limit; at least one must be set.
+type TeamQuotaOptions = models.TeamQuotaRequest
+
+// TeamQuota is a team's quota, with Usage (what the team holds now) when
+// read back.
+type TeamQuota = models.TeamQuota
+
+// TeamQuotaUsage is what a team holds: every sandbox not deleted, at the
+// size it asked for.
+type TeamQuotaUsage = models.TeamQuotaUsage
+
 // EgressProfileList is one page of ListEgressProfiles.
 type EgressProfileList = models.EgressProfileList
 
@@ -213,8 +259,58 @@ type EgressProfileList = models.EgressProfileList
 // a sandbox (Sandbox.EgressProfilesApplied).
 type EgressProfileRef = models.EgressProfileRef
 
+// WarmPool is a warm-pool entry: how many ready sandboxes every server with a
+// warm pool keeps for one image. Status is set by GetWarmPool and
+// ListWarmPools.
+type WarmPool = models.WarmPool
+
+// WarmPoolOptions is the body of PutWarmPool: a full replace.
+type WarmPoolOptions = models.WarmPoolRequest
+
+// WarmPoolStatus is ready and target slots in total and per server.
+type WarmPoolStatus = models.WarmPoolStatus
+
+// WarmPoolServerStatus is one server's pool for an image.
+type WarmPoolServerStatus = models.WarmPoolServerStatus
+
+// What a warm pool does when its image changes (WarmPoolOptions.OnImageChange).
+const (
+	WarmPoolReplaceNow    = models.WarmPoolReplaceNow
+	WarmPoolReplaceAsUsed = models.WarmPoolReplaceAsUsed
+)
+
 // ListEgressProfilesOptions pages ListEgressProfiles.
 type ListEgressProfilesOptions struct {
+	Cursor string
+	Limit  int
+}
+
+// IdentityOptions is CreateSandboxOptions.Identity: a short-lived cloud
+// identity token for the sandbox. RoleTag must be on the team's allow list
+// (PutIdentityRole); Audience defaults to "sts.amazonaws.com".
+type IdentityOptions = models.IdentityRequest
+
+// SandboxIdentity is Sandbox.Identity: what the sandbox's tokens say and
+// where the token is. It never carries the token.
+type SandboxIdentity = models.SandboxIdentity
+
+// IdentityRole is one role tag on a team's identity allow list.
+type IdentityRole = models.IdentityRole
+
+// IdentityRoleList is one page of ListIdentityRoles.
+type IdentityRoleList = models.IdentityRoleList
+
+// IdentityRoleOptions is PutIdentityRole's body and the team it changes.
+// MinRole is "runner" or "admin"; an empty Team is the operator namespace
+// (sandboxes the operator token creates).
+type IdentityRoleOptions struct {
+	MinRole string
+	Team    string
+}
+
+// ListIdentityRolesOptions pages ListIdentityRoles.
+type ListIdentityRolesOptions struct {
+	Team   string
 	Cursor string
 	Limit  int
 }
@@ -243,6 +339,21 @@ type CreateAPITokenOptions = models.CreateAPITokenRequest
 
 // APITokenList is Tokens().List's result.
 type APITokenList = models.APITokenList
+
+// CreateSandboxTokenOptions is the body of Sandbox.CreateToken: a signed
+// token for one sandbox that can be handed to a browser or an end user.
+// ExpiresIn is required ("15m", "2h", "1d") and capped by the server (24h
+// by default). Port makes a public-port token; without it the token is for
+// the sandbox's toolbox. PathPrefix and Methods narrow it further.
+type CreateSandboxTokenOptions = models.CreateSandboxTokenRequest
+
+// SandboxToken is Sandbox.CreateToken's result. Token (avmst_…) is shown
+// only here: the server keeps no copy. TokenID (stk_…) is safe to log.
+type SandboxToken = models.SandboxToken
+
+// RevokeSandboxTokensResult is Sandbox.RevokeTokens' result: every token
+// issued for the sandbox before TokensNotBefore no longer works.
+type RevokeSandboxTokensResult = models.RevokeSandboxTokensResponse
 
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
@@ -283,6 +394,10 @@ type AuditOptions struct {
 	Limit         int
 	Cursor        string
 	IncarnationID string
+	// Caller keeps only records by this caller: an id such as
+	// "system:lifecycle", or "system:*" for everything the server did on
+	// its own (automatic stops, deletes, restarts and recreates).
+	Caller string
 }
 
 // CustomDomain is the per-hostname row attached to a sandbox. Status moves

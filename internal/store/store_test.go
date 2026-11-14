@@ -2,12 +2,17 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -115,6 +120,35 @@ func TestStoreCases(t *testing.T) {
 				}
 				if foreignKeys != 1 {
 					t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+				}
+
+				// NORMAL is pinned in the DSN, not left to the driver.
+				var synchronous int
+				if err := st.db.QueryRowContext(ctx, `PRAGMA synchronous;`).Scan(&synchronous); err != nil {
+					t.Fatalf("read synchronous pragma: %v", err)
+				}
+				if synchronous != 1 {
+					t.Fatalf("synchronous = %d, want 1 (NORMAL)", synchronous)
+				}
+
+				if st.rdb == st.db {
+					t.Fatal("a file database must get its own read pool")
+				}
+				if got := st.rdb.Stats().MaxOpenConnections; got != sqliteReadConns {
+					t.Fatalf("read pool MaxOpenConnections = %d, want %d", got, sqliteReadConns)
+				}
+				var queryOnly int
+				if err := st.rdb.QueryRowContext(ctx, `PRAGMA query_only;`).Scan(&queryOnly); err != nil {
+					t.Fatalf("read query_only pragma: %v", err)
+				}
+				if queryOnly != 1 {
+					t.Fatalf("read pool query_only = %d, want 1", queryOnly)
+				}
+				if err := st.rdb.QueryRowContext(ctx, `PRAGMA busy_timeout;`).Scan(&busyTimeout); err != nil {
+					t.Fatalf("read pool busy_timeout pragma: %v", err)
+				}
+				if busyTimeout != sqliteBusyTimeoutMS {
+					t.Fatalf("read pool busy_timeout = %d, want %d", busyTimeout, sqliteBusyTimeoutMS)
 				}
 			},
 		},
@@ -2698,5 +2732,410 @@ func TestListCompatStateByOwner(t *testing.T) {
 	st.Close()
 	if _, err := st.ListCompatStateByOwner(ctx, models.FacadeE2B, "acme"); err == nil {
 		t.Fatal("ListCompatStateByOwner on a closed store returned no error")
+	}
+}
+
+// TestReadPool covers the read-only pool beside the single writer: reads do
+// not wait for an open write transaction, see only committed data, see a
+// write as soon as it has returned, and cannot write.
+func TestReadPool(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reads do not wait for an open write transaction", func(t *testing.T) {
+		st := newTestStore(t)
+		if err := st.Create(ctx, sampleSandbox("sb-before")); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("BeginTx: %v", err)
+		}
+		defer tx.Rollback()
+		if err := insertSandboxForTest(ctx, st, tx, sampleSandbox("sb-pending")); err != nil {
+			t.Fatalf("insert in open tx: %v", err)
+		}
+
+		// With one connection for everything this Get would block until the
+		// transaction ended; the deadline proves it does not.
+		readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if _, err := st.Get(readCtx, "sb-before"); err != nil {
+			t.Fatalf("Get during open write tx: %v", err)
+		}
+		if _, err := st.Get(readCtx, "sb-pending"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get(uncommitted) = %v, want ErrNotFound", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if _, err := st.Get(ctx, "sb-pending"); err != nil {
+			t.Fatalf("Get after commit: %v", err)
+		}
+	})
+
+	t.Run("a returned write is visible to the next read", func(t *testing.T) {
+		st := newTestStore(t)
+		if err := st.Create(ctx, sampleSandbox("sb-rw")); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		for i, status := range []models.SandboxStatus{models.SandboxStatusStopped, models.SandboxStatusStarted, models.SandboxStatusError} {
+			if err := st.UpdateStatus(ctx, "sb-rw", status, fmt.Sprintf("step %d", i)); err != nil {
+				t.Fatalf("UpdateStatus: %v", err)
+			}
+			got, err := st.Get(ctx, "sb-rw")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got.Status != status {
+				t.Fatalf("step %d: status = %s, want %s", i, got.Status, status)
+			}
+		}
+	})
+
+	t.Run("the pool refuses writes", func(t *testing.T) {
+		st := newTestStore(t)
+		if _, err := st.rdb.ExecContext(ctx, `DELETE FROM sandboxes`); err == nil {
+			t.Fatal("a write through the read pool must fail")
+		}
+	})
+
+	t.Run("close waits for a read that is still running", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.db")
+		st, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if err := st.Create(ctx, sampleSandbox("sb-held")); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		rows, err := st.rdb.QueryContext(ctx, `SELECT id FROM sandboxes`)
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- st.Close() }()
+		select {
+		case err := <-done:
+			t.Fatalf("Close returned (%v) while a read still held a connection", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		_ = rows.Close()
+		if err := <-done; err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if n := st.rdb.Stats().OpenConnections; n != 0 {
+			t.Fatalf("read pool open connections after Close = %d, want 0", n)
+		}
+		if _, err := os.Stat(path + "-wal"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("WAL file after Close: %v, want it removed by the last close", err)
+		}
+	})
+
+	t.Run("close gives up on a read that never ends", func(t *testing.T) {
+		st := newTestStore(t)
+		rows, err := st.rdb.QueryContext(ctx, `SELECT 1`)
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		defer rows.Close()
+		_ = st.rdb.Close()
+		if waitConnsClosed(20*time.Millisecond, st.rdb) {
+			t.Fatal("waitConnsClosed reported success while a connection was held")
+		}
+	})
+
+	t.Run("close releases both pools", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.db")
+		st, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := st.rdb.PingContext(ctx); err == nil {
+			t.Fatal("read pool still open after Close")
+		}
+	})
+}
+
+// insertSandboxForTest inserts through an open transaction, the way Create
+// does, so a test can hold the writer mid-transaction.
+func insertSandboxForTest(ctx context.Context, st *Store, tx *sql.Tx, sb *models.Sandbox) error {
+	return st.insertSandbox(ctx, tx, sb)
+}
+
+func TestSQLiteDSNs(t *testing.T) {
+	tests := []struct {
+		name   string
+		dsn    string
+		want   []string
+		absent []string
+	}{
+		{
+			name: "writer pins WAL and NORMAL",
+			dsn:  sqliteDSN("/var/lib/sandboxd/state.db"),
+			want: []string{"_journal_mode=WAL", "_synchronous=NORMAL", "_foreign_keys=on", "_busy_timeout=5000"},
+		},
+		{
+			name:   "reader is query-only and leaves the journal alone",
+			dsn:    sqliteReadDSN("/var/lib/sandboxd/state.db"),
+			want:   []string{"_query_only=true", "_busy_timeout=5000"},
+			absent: []string{"_journal_mode", "_foreign_keys"},
+		},
+		{
+			name: "existing query string is extended, not replaced",
+			dsn:  sqliteReadDSN("file:/x/state.db?cache=private"),
+			want: []string{"file:/x/state.db?cache=private&", "_query_only=true"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, w := range tc.want {
+				if !strings.Contains(tc.dsn, w) {
+					t.Fatalf("dsn %q lacks %q", tc.dsn, w)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(tc.dsn, a) {
+					t.Fatalf("dsn %q must not contain %q", tc.dsn, a)
+				}
+			}
+		})
+	}
+}
+
+func TestIsMemorySQLitePath(t *testing.T) {
+	for path, want := range map[string]bool{
+		":memory:":                        true,
+		"file::memory:?cache=shared":      true,
+		"file:state.db?mode=memory":       true,
+		"/var/lib/sandboxd/state.db":      false,
+		"file:/var/lib/sandboxd/state.db": false,
+	} {
+		if got := isMemorySQLitePath(path); got != want {
+			t.Errorf("isMemorySQLitePath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestApplyNetCounterDeltas(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("totals, skips and rejects", func(t *testing.T) {
+		st := newTestStore(t)
+		sb := sampleSandbox("sb-net")
+		sb.OwnerRef = "acme"
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := st.SetNetworkLimits(ctx, "sb-net", 150, 0); err != nil {
+			t.Fatalf("SetNetworkLimits: %v", err)
+		}
+		if err := st.MarkNetworkQuotaExceeded(ctx, "sb-net", time.Now().UTC()); err != nil {
+			t.Fatalf("MarkNetworkQuotaExceeded: %v", err)
+		}
+
+		// One negative delta rejects the whole call before any write.
+		if _, err := st.ApplyNetCounterDeltas(ctx, []NetCounterDelta{
+			{SandboxID: "sb-net", BytesIn: 100},
+			{SandboxID: "sb-net", BytesIn: -1},
+		}); err == nil {
+			t.Fatal("expected an error for a negative delta")
+		}
+		if got, _ := st.Get(ctx, "sb-net"); got.NetworkBytesIn != 0 {
+			t.Fatalf("rejected call wrote %d bytes", got.NetworkBytesIn)
+		}
+
+		totals, err := st.ApplyNetCounterDeltas(ctx, []NetCounterDelta{
+			{SandboxID: "sb-net", BytesIn: 100, BytesOut: 7},
+			{SandboxID: "sb-net"},                           // zero delta: skipped
+			{SandboxID: "missing", BytesIn: 1},              // deleted since the poll: skipped
+			{SandboxID: "sb-net", BytesIn: 60, BytesOut: 0}, // applies on top
+		})
+		if err != nil {
+			t.Fatalf("ApplyNetCounterDeltas: %v", err)
+		}
+		want := []NetCounterTotals{
+			{Index: 0, SandboxID: "sb-net", OwnerRef: "acme", BytesIn: 100, BytesOut: 7, BytesInLimit: 150, QuotaExceeded: true},
+			{Index: 3, SandboxID: "sb-net", OwnerRef: "acme", BytesIn: 160, BytesOut: 7, BytesInLimit: 150, QuotaExceeded: true},
+		}
+		if !reflect.DeepEqual(totals, want) {
+			t.Fatalf("totals = %+v, want %+v", totals, want)
+		}
+		if got, _ := st.ApplyNetCounterDeltas(ctx, nil); len(got) != 0 {
+			t.Fatalf("empty call returned %+v", got)
+		}
+	})
+
+	t.Run("a failed batch reports only the batches that committed", func(t *testing.T) {
+		st := newTestStore(t)
+		n := 2*netCounterBatchRows + 3
+		deltas := make([]NetCounterDelta, 0, n)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("sb-%04d", i)
+			if err := st.Create(ctx, sampleSandbox(id)); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			deltas = append(deltas, NetCounterDelta{SandboxID: id, BytesIn: 1, BytesOut: 1})
+		}
+		// Every sandbox applies when nothing fails, across all three batches.
+		totals, err := st.ApplyNetCounterDeltas(ctx, deltas)
+		if err != nil || len(totals) != n {
+			t.Fatalf("ApplyNetCounterDeltas = %d totals, %v; want %d, nil", len(totals), err, n)
+		}
+
+		// Poison one row in the second batch.
+		poison := deltas[netCounterBatchRows+5].SandboxID
+		if _, err := st.db.ExecContext(ctx, `
+			CREATE TRIGGER poison_net BEFORE UPDATE OF net_bytes_in ON sandboxes
+			WHEN NEW.id = '`+poison+`' BEGIN SELECT RAISE(ABORT, 'poisoned'); END`); err != nil {
+			t.Fatalf("create trigger: %v", err)
+		}
+		totals, err = st.ApplyNetCounterDeltas(ctx, deltas)
+		if err == nil {
+			t.Fatal("expected the poisoned batch to fail")
+		}
+		if len(totals) != netCounterBatchRows {
+			t.Fatalf("totals = %d, want the %d rows of the first batch", len(totals), netCounterBatchRows)
+		}
+		if last := totals[len(totals)-1]; last.Index != netCounterBatchRows-1 || last.SandboxID != deltas[netCounterBatchRows-1].SandboxID {
+			t.Fatalf("last committed total = %+v, want index %d", last, netCounterBatchRows-1)
+		}
+		for i, wantIn := range map[int]int64{0: 2, netCounterBatchRows: 1, n - 1: 1} {
+			got, err := st.Get(ctx, deltas[i].SandboxID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got.NetworkBytesIn != wantIn {
+				t.Fatalf("%s bytes in = %d, want %d", deltas[i].SandboxID, got.NetworkBytesIn, wantIn)
+			}
+		}
+	})
+
+	t.Run("a canceled context writes nothing", func(t *testing.T) {
+		st := newTestStore(t)
+		if err := st.Create(ctx, sampleSandbox("sb-cancel")); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		totals, err := st.ApplyNetCounterDeltas(canceled, []NetCounterDelta{{SandboxID: "sb-cancel", BytesIn: 1}})
+		if err == nil || len(totals) != 0 {
+			t.Fatalf("canceled call = %+v, %v; want no totals and an error", totals, err)
+		}
+	})
+}
+
+// TestClaimPathsReadOnWriter keeps every claim path off the read pool (see
+// the Store doc comment). A claim decided by a read on the pool races other
+// claimers: before claims became one statement, a read-then-claim loop on
+// the pool failed 19% of 32 concurrent netns reservations.
+func TestClaimPathsReadOnWriter(t *testing.T) {
+	claimLoops := map[string][]string{
+		"netns_slots.go": {"ReserveContainerNetnsSlot", "BeginPrewarmContainerNetnsSlot", "ClaimPooledContainerNetnsSlot", "claimContainerNetnsSlotForSandbox", "claimContainerNetnsSlot"},
+		"store.go":       {"AddCustomDomain", "AllocateFirecrackerTapSlot", "AllocateFirecrackerVMMSlot", "EnsureWasmCheckpointCleanupRef", "getPort"},
+	}
+	fset := token.NewFileSet()
+	for file, names := range claimLoops {
+		parsed, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		bodies := map[string]*ast.FuncDecl{}
+		for _, decl := range parsed.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil {
+				bodies[fn.Name.Name] = fn
+			}
+		}
+		for _, name := range names {
+			fn, ok := bodies[name]
+			if !ok {
+				t.Fatalf("%s: method %s not found; update this list", file, name)
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "rdb" {
+					return true
+				}
+				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "s" {
+					t.Errorf("%s reads through s.rdb at %s; claim paths must read on s.db", name, fset.Position(sel.Pos()))
+				}
+				return true
+			})
+		}
+	}
+}
+
+// The create-time check that a new id is not another sandbox's name must seek
+// an index, not scan every sandbox: the scan made each create cost about
+// 0.1 ms more per 1,000 rows on the node.
+func TestSandboxIDAsNameCheckSeeksAnIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	for i := 0; i < 50; i++ {
+		sb := sampleSandbox(fmt.Sprintf("sb-plan-%02d", i))
+		sb.Name = fmt.Sprintf("name-%02d", i)
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	plan := queryPlan(t, st, sandboxIDTakenAsNameSQL, []any{"sb-new", "sb-new"})
+	if !strings.Contains(plan, "idx_sandboxes_name_lookup") || strings.Contains(plan, "SCAN sandboxes") {
+		t.Fatalf("plan = %q, want a search on idx_sandboxes_name_lookup", plan)
+	}
+
+	// The answers are unchanged: an id that is another sandbox's name is
+	// refused, and a fresh id is not.
+	if err := st.Create(ctx, sampleSandbox("name-07")); !errors.Is(err, ErrSandboxNameConflict) {
+		t.Fatalf("Create(id = existing name) = %v, want ErrSandboxNameConflict", err)
+	}
+	if err := st.Create(ctx, sampleSandbox("sb-plan-fresh")); err != nil {
+		t.Fatalf("Create(fresh id) = %v", err)
+	}
+}
+
+// CountLive is /health's sandbox count: every row but the destroyed ones,
+// the number Health used to get by listing every sandbox.
+func TestCountLive(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if n, err := st.CountLive(ctx); err != nil || n != 0 {
+		t.Fatalf("empty store: CountLive = %d, %v", n, err)
+	}
+	statuses := map[string]models.SandboxStatus{
+		"sb-started":   models.SandboxStatusStarted,
+		"sb-stopped":   models.SandboxStatusStopped,
+		"sb-destroyed": models.SandboxStatusDestroyed,
+		"sb-error":     models.SandboxStatusError,
+	}
+	for id, status := range statuses {
+		if err := st.Create(ctx, sampleSandbox(id)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpdateStatus(ctx, id, status, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := st.CountLive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := st.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, sb := range all {
+		if sb.Status != models.SandboxStatusDestroyed {
+			listed++
+		}
+	}
+	if n != 3 || n != listed {
+		t.Fatalf("CountLive = %d, List counts %d live, want 3", n, listed)
+	}
+	_ = st.Close()
+	if _, err := st.CountLive(ctx); err == nil {
+		t.Fatal("CountLive on a closed store: want an error")
 	}
 }

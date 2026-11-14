@@ -12,7 +12,7 @@ func TestCoverage95LiftExternalWitnessRequired(t *testing.T) {
 	// fail closed before the daemon claims tamper-evidence.
 	_ = setBaseRunEnv(t)
 	t.Setenv("SB_SECRET_AUDIT_EXTERNAL_WITNESS", "true")
-	if err := runWithAutoCancel(t, 800*time.Millisecond, nil); err == nil {
+	if err := runUntilBootFails(t, nil); err == nil {
 		t.Fatal("expected external-witness boot failure under Noop control plane")
 	}
 }
@@ -40,7 +40,7 @@ func TestCoverage95LiftAuditSinkDirBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
-	if err := runWithAutoCancel(t, 500*time.Millisecond, nil); err == nil {
+	if err := runUntilBootFails(t, nil); err == nil {
 		t.Fatal("expected secret audit sink boot failure")
 	}
 }

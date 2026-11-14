@@ -102,7 +102,7 @@ func TestRecreateSandboxReplaysPortsForExistingSandbox(t *testing.T) {
 
 	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		3000: {Protocol: models.ExposedPortProtocolHTTP},
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("RecreateSandbox existing replay: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestRecreateSandboxExistingReplayFailureCountsAttempt(t *testing.T) {
 
 	attempted, err := svc.RecreateSandboxReport(ctx, sandboxID, models.CreateSandboxRequest{}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 30505},
-	})
+	}, 0)
 	if !attempted {
 		t.Fatal("failed existing route replay reported attempted=false")
 	}
@@ -198,6 +198,14 @@ func TestRecreateSandboxFailsWhenClusterSecretRefMissing(t *testing.T) {
 	}
 }
 
+// ownedHostPortReserveCluster is a hostPortReserveCluster that owns every
+// placement it is asked about (selfOwnedPlacementsFor).
+type ownedHostPortReserveCluster struct{ *hostPortReserveCluster }
+
+func (c ownedHostPortReserveCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	return selfOwnedPlacementsFor(c.SelfNodeID(), ids), nil
+}
+
 func TestRecreateSandboxKeepsCreatedSandboxWhenReplayFails(t *testing.T) {
 	ctx := context.Background()
 	rt := &recordingRuntime{}
@@ -210,7 +218,9 @@ func TestRecreateSandboxKeepsCreatedSandboxWhenReplayFails(t *testing.T) {
 		Noop:     cluster.NewNoop("self", "http://self", ""),
 		reserved: map[int]bool{30505: true},
 	}
-	svc.AttachCluster(reserver)
+	// The watcher recreates only a placement this node owns, and the
+	// recreate confirms that before it creates.
+	svc.AttachCluster(ownedHostPortReserveCluster{reserver})
 
 	err := svc.RecreateSandbox(ctx, "sb-recreate-replay-failure", models.CreateSandboxRequest{Image: "alpine:3.20"}, cluster.PlacementSecrets{}, map[int]cluster.ExposedPortRoute{
 		5432: {Protocol: models.ExposedPortProtocolTCP, HostPort: 30505},

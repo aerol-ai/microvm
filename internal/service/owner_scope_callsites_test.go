@@ -62,6 +62,7 @@ var reviewedOwnerScopeUses = map[string]scopeUse{
 	"Service.ListSnapshotPage":                 {1, whyVisibility},
 	"Service.CountSnapshots":                   {1, whyVisibility},
 	"wasmModuleVisible":                        {1, whyVisibility},
+	"identityRoleOwner":                        {1, whyNamespace + ": the team whose identity allow list a roles call reads or writes"},
 }
 
 // reviewedHostCapableUses lists every function that asks hostCapable: the

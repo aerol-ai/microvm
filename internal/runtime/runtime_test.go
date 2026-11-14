@@ -42,6 +42,39 @@ func TestContainerAndFirecrackerDriversStartWithIdentity(t *testing.T) {
 	}
 }
 
+// Only containerd's warm pool hands a create's env to the toolbox in the
+// adopt frame rather than the container spec, so only its start re-sends
+// the env on a re-adopt. Docker keeps env off its pool, and a Firecracker
+// guest restored from its snapshot still holds its env in memory.
+func TestOnlyContainerdStartsWithIdentityEnv(t *testing.T) {
+	var _ runtime.EnvIdentityStarter = (*containerdruntime.Driver)(nil)
+	if _, ok := runtime.AsEnvIdentityStarter((*containerdruntime.Driver)(nil)); !ok {
+		t.Fatal("containerd must re-send the env on a re-adopt")
+	}
+	for name, rt := range map[string]runtime.Runtime{
+		"docker": (*docker.Client)(nil), "firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+	} {
+		if _, ok := runtime.AsEnvIdentityStarter(rt); ok {
+			t.Errorf("%s now re-sends env on start: check its pool's env eligibility", name)
+		}
+	}
+}
+
+// The ownership fence freezes in place where the runtime can: the two
+// container engines. Firecracker, WASM and isolate cannot yet, and the fence
+// only refuses their sandboxes; this pins which is which.
+func TestFreezerOptIn(t *testing.T) {
+	var _ runtime.Freezer = (*docker.Client)(nil)
+	var _ runtime.Freezer = (*containerdruntime.Driver)(nil)
+	for name, rt := range map[string]runtime.Runtime{
+		"firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+	} {
+		if _, ok := rt.(runtime.Freezer); ok {
+			t.Errorf("%s now implements Freezer: drop it from the fence's refuse-only list", name)
+		}
+	}
+}
+
 func TestContainerdDriverSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*containerdruntime.Driver)(nil)
 	var _ runtime.ContainerRuntime = (*containerdruntime.Driver)(nil)

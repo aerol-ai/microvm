@@ -145,3 +145,33 @@ func TestWarmImageIDCacheOnceErrorAndStalePaths(t *testing.T) {
 		t.Fatal("stale warm Put must be dropped when Flush races inspect")
 	}
 }
+
+// TestPoolImageID (W3): the pool's image-change check reads the cached ID
+// when there is one and inspects otherwise, and a missing image is an
+// error, never an empty ID the pool would act on.
+func TestPoolImageID(t *testing.T) {
+	var inspects atomic.Int32
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	d := &poolFakeDaemon{t: t, imageInspect: func() *http.Response {
+		inspects.Add(1)
+		if status.Load() != http.StatusOK {
+			return jsonResponse(int(status.Load()), map[string]any{"message": "missing"})
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"Id": "sha256:v2"})
+	}}
+	c := newPoolClient(t, d, func(c *Client) {
+		c.imageIDs = newImageIDCache(time.Minute)
+	})
+	ctx := context.Background()
+	if id, err := c.PoolImageID(ctx, "python:3.12"); err != nil || id != "sha256:v2" || inspects.Load() != 1 {
+		t.Fatalf("cold lookup = %q %v (inspects %d)", id, err, inspects.Load())
+	}
+	if id, err := c.PoolImageID(ctx, "python:3.12"); err != nil || id != "sha256:v2" || inspects.Load() != 1 {
+		t.Fatalf("a cached lookup must not inspect: %q %v (inspects %d)", id, err, inspects.Load())
+	}
+	status.Store(http.StatusNotFound)
+	if id, err := c.PoolImageID(ctx, "gone:1"); err == nil || id != "" {
+		t.Fatalf("missing image = %q %v, want an error", id, err)
+	}
+}

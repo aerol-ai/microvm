@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,11 @@ var (
 	procRoot      = "/proc"
 )
 
+// vmmCgroupDir is the VMs' cgroup directory: <mount>/<parent>/aerolvm-vmm.
+func vmmCgroupDir() string {
+	return filepath.Join(vmmCgroupRoot, currentVMMCgroupParent(), vmmCgroupName)
+}
+
 // moveToVMMCgroup moves a VMM out of sandboxd's cgroup into one of its own.
 // systemd stops a unit by killing every process in the unit's cgroup
 // (KillMode=control-group); a VM left there dies with every sandboxd restart
@@ -35,7 +41,7 @@ func moveToVMMCgroup(pid int) error {
 	if _, err := os.Stat(filepath.Join(vmmCgroupRoot, "cgroup.controllers")); err != nil {
 		return fmt.Errorf("no cgroup v2 hierarchy at %s: %w", vmmCgroupRoot, err)
 	}
-	dir := filepath.Join(vmmCgroupRoot, vmmCgroupName)
+	dir := vmmCgroupDir()
 	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
 	}
@@ -54,7 +60,7 @@ func moveToVMMCgroup(pid int) error {
 
 // vmmCgroupPIDs lists the processes in the VMs' cgroup.
 func vmmCgroupPIDs() ([]int, error) {
-	raw, err := os.ReadFile(filepath.Join(vmmCgroupRoot, vmmCgroupName, "cgroup.procs"))
+	raw, err := os.ReadFile(filepath.Join(vmmCgroupDir(), "cgroup.procs"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -209,10 +215,11 @@ func killCgroupStray(pid int) error {
 }
 
 // inVMMCgroup reports whether a /proc/<pid>/cgroup file puts the process in
-// the VMs' cgroup (the v2 line, "0::/aerolvm-vmm").
+// the VMs' cgroup (the v2 line, "0::/aerolvm-vmm", or under its parent).
 func inVMMCgroup(procCgroup []byte) bool {
+	want := path.Join("/", currentVMMCgroupParent(), vmmCgroupName)
 	for _, line := range strings.Split(string(procCgroup), "\n") {
-		if path, ok := strings.CutPrefix(line, "0::"); ok && path == "/"+vmmCgroupName {
+		if p, ok := strings.CutPrefix(line, "0::"); ok && p == want {
 			return true
 		}
 	}

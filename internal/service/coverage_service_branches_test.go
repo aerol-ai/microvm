@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -104,6 +106,10 @@ func (s failingTemplateArtifactPushStore) CompleteTemplatePush(context.Context, 
 
 func (s failingTemplateArtifactPushStore) ReleaseTemplatePush(context.Context, string, time.Time, string, string) (bool, error) {
 	return false, s.err
+}
+
+func (s failingTemplateArtifactPushStore) ScheduleSnapshotRegistryRetirement(context.Context, store.SnapshotRegistryRetirement) error {
+	return s.err
 }
 
 func (s *serviceClusterStub) Leader() string { return s.leader }
@@ -310,10 +316,11 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 					},
 				},
 				{
-					SandboxID:       "sb-peer",
-					OwnerNodeID:     "peer",
-					Spec:            &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
-					CustomHostnames: []string{"api.external.test", "www.external.test"},
+					SandboxID:          "sb-peer",
+					OwnerNodeID:        "peer",
+					OwnerDataPlaneHost: "10.0.0.2",
+					Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
+					CustomHostnames:    []string{"api.external.test", "www.external.test"},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},
@@ -357,9 +364,10 @@ func TestAddClusterIngressExpectedRoutesBranches(t *testing.T) {
 			Noop: cluster.NewNoop("self", "http://self", ""),
 			placements: []cluster.Placement{
 				{
-					SandboxID:   "sb-direct",
-					OwnerNodeID: "peer",
-					Spec:        &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
+					SandboxID:          "sb-direct",
+					OwnerNodeID:        "peer",
+					OwnerDataPlaneHost: "10.0.0.2",
+					Spec:               &models.CreateSandboxRequest{AllowPublicTraffic: privateFlag(true)},
 					ExposedPortRoutes: map[int]cluster.ExposedPortRoute{
 						8080: {Protocol: models.ExposedPortProtocolHTTP},
 						8443: {Protocol: models.ExposedPortProtocolTLS},
@@ -483,7 +491,7 @@ func TestStartBuiltImageGCAndLifecycleSweepEnabledPaths(t *testing.T) {
 }
 
 func TestServicePureHelperBranches(t *testing.T) {
-	if got := capacityRequestFromSandbox(nil); got != (capacity.Request{}) {
+	if got := capacityRequestFromSandbox(nil); !reflect.DeepEqual(got, capacity.Request{}) {
 		t.Fatalf("capacityRequestFromSandbox(nil) = %+v, want zero value", got)
 	}
 
@@ -598,14 +606,8 @@ func TestServiceOwnershipAndHealthBranches(t *testing.T) {
 	}
 
 	// Health should surface degraded probes, including the SSH gateway.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
 	svc.cfg.EnableSSHGateway = true
-	svc.cfg.SSHListenAddr = addr
+	svc.cfg.SSHListenAddr = testport.Addr(t) // nothing listens here
 	svc.cfg.EnableFirecracker = true
 	svc.cfg.EnableWasm = true
 	svc.docker = &recordingRuntime{pingErr: errors.New("docker down")}
@@ -815,6 +817,7 @@ func TestServiceHelperBranchCoverageRoundTwo(t *testing.T) {
 		svc.ReplayReservations(ctx)
 		svc.refreshPendingImageGCOnUse(ctx, "alpine:latest")
 		svc.schedulePendingImageGC(ctx, "", "alpine:latest")
+		withGCCaddyFake(t, svc)
 		if err := svc.gcClusterIngressRoutes(ctx); err == nil {
 			t.Fatal("closed store should fail gcClusterIngressRoutes")
 		}

@@ -6,6 +6,11 @@
 #   build.sh publish [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh urls    [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh artifacts-init
+#   build.sh variant <suffix> [--arch ...]
+#
+# AEROL_GO_TAGS (e.g. itest_failpoints) compiles sandboxd with test-only Go
+# build tags and becomes part of the build id; unset, the build is the
+# release build. run.sh sets it from a scenario's caps go_tags.
 #
 # WHY this exists: every scenario until now provisioned from
 # `releases/latest`, so a branch under test could only be exercised after it
@@ -164,13 +169,44 @@ tree_delta() {
   done < <(git -C "$REPO_ROOT" ls-files --others --exclude-standard)
 }
 
+# go_tags echoes AEROL_GO_TAGS (comma- or space-separated) as one sorted,
+# de-duplicated, comma-separated list, or nothing when it is unset. Sorted so
+# "a,b" and "b a" name the same build. Only sandboxd is built with them, and
+# only run.sh's local itest build sets them (a scenario's caps go_tags): a
+# release build never goes through this script.
+go_tags() {
+  local raw="${AEROL_GO_TAGS:-}" t
+  local -a parts=() tags=()
+  IFS=$', \t' read -r -a parts <<<"$raw"
+  for t in ${parts[@]+"${parts[@]}"}; do
+    [[ -n "$t" ]] || continue
+    # The tags land in the build id, so in a directory name, an S3 key and
+    # the version string; Go itself allows nothing else in a tag.
+    [[ "$t" =~ ^[A-Za-z0-9_.]+$ ]] \
+      || die "AEROL_GO_TAGS: '${t}' is not a Go build tag (letters, digits, '_' and '.')"
+    tags+=("$t")
+  done
+  (( ${#tags[@]} > 0 )) || return 0
+  printf '%s\n' "${tags[@]}" | LC_ALL=C sort -u | paste -sd, -
+}
+
 # resolve_build_id echoes AEROL_BUILD_ID for the current invocation.
 #   --ref <commit>  ->  <short-sha>            (a commit is immutable; never dirty)
 #   default (HEAD)  ->  <short-sha>[-dirty-<tree-hash>]
+# either way followed by -tags-<tag>[-<tag>…] when AEROL_GO_TAGS is set: the
+# id is the cache key and the S3 prefix, so a tagged binary must never be
+# served for an untagged request, or the reverse. '-' cannot occur in a tag,
+# so the suffix reads back unambiguously.
 resolve_build_id() {
+  local tags suffix=""
+  # $(…) clears errexit here too, so a refused tag must fail this by hand.
+  tags=$(go_tags) || exit 1
+  [[ -n "$tags" ]] && suffix="-tags-${tags//,/-}"
   if [[ -n "$REF" ]]; then
-    git -C "$REPO_ROOT" rev-parse --short=12 "${REF}^{commit}" 2>/dev/null \
+    local id
+    id=$(git -C "$REPO_ROOT" rev-parse --short=12 "${REF}^{commit}" 2>/dev/null) \
       || die "--ref '${REF}' is not a commit in this repository"
+    printf '%s%s\n' "$id" "$suffix"
     return
   fi
   local sha delta
@@ -182,9 +218,9 @@ resolve_build_id() {
     || die "cannot resolve HEAD in ${REPO_ROOT}; refusing to build under an empty id"
   delta=$(tree_delta)
   if [[ -n "$delta" ]]; then
-    printf '%s-dirty-%s\n' "$sha" "$(printf '%s' "$delta" | sha256_stdin | cut -c1-12)"
+    printf '%s-dirty-%s%s\n' "$sha" "$(printf '%s' "$delta" | sha256_stdin | cut -c1-12)" "$suffix"
   else
-    printf '%s\n' "$sha"
+    printf '%s%s\n' "$sha" "$suffix"
   fi
 }
 
@@ -242,12 +278,21 @@ build_one_arch() {
   # exact tree that produced the numbers.
   ldflags="-X ${VERSION_PKG}.Version=itest-${build_id}"
 
+  # Test-only build tags (AEROL_GO_TAGS, e.g. itest_failpoints) go on sandboxd
+  # alone: it is the only binary with a failpoint, and toolboxd runs inside
+  # every sandbox, where a test hook has no business. No tags, no -tags flag:
+  # the default build is the release build.
+  local tags
+  tags=$(go_tags) || exit 1
+  local -a tagflag=()
+  [[ -n "$tags" ]] && tagflag=(-tags "$tags")
+
   # sandboxd needs CGO: mattn/go-sqlite3 is a C library, and the store is not
   # optional. zig cc supplies the cross-linking C toolchain Apple's clang can't.
-  log "build: sandboxd_linux_${arch} (CGO=1, zig cc -target ${zig_target})"
+  log "build: sandboxd_linux_${arch} (CGO=1, zig cc -target ${zig_target}${tags:+, -tags ${tags}})"
   ( cd "$src" && CGO_ENABLED=1 GOOS=linux GOARCH="$goarch" \
       CC="zig cc -target ${zig_target}" CXX="zig c++ -target ${zig_target}" \
-      go build -trimpath -ldflags "$ldflags" \
+      go build -trimpath ${tagflag[@]+"${tagflag[@]}"} -ldflags "$ldflags" \
       -o "${out}/sandboxd_linux_${arch}" ./cmd/sandboxd )
   assert_linux_elf "${out}/sandboxd_linux_${arch}" "$arch"
 
@@ -284,10 +329,11 @@ build_one_arch() {
     # not touch pkg/caddy. Building it is opt-in for the case where it does.
     log "build: caddy_linux_${arch} (xcaddy)"
     ( cd "$src" && GOOS=linux GOARCH="$goarch" CGO_ENABLED=0 \
-        xcaddy build \
-          --with github.com/mholt/caddy-l4 \
-          --with github.com/caddy-dns/cloudflare \
-          --with github.com/ss098/certmagic-s3 \
+        xcaddy build v2.11.8-0.20261106223313-31f9f0cb9949 \
+          --with github.com/aerol-ai/microvm/caddymod=./caddymod \
+          --with github.com/mholt/caddy-l4@v0.1.2 \
+          --with github.com/caddy-dns/cloudflare@v0.2.4 \
+          --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39 \
           --output "${out}/caddy_linux_${arch}" )
     assert_linux_elf "${out}/caddy_linux_${arch}" "$arch"
   fi
@@ -340,6 +386,46 @@ cmd_build() {
 
   log "build: done — ${out}"
   printf '%s\n' "$build_id"
+}
+
+# cmd_variant builds this tree again under another version stamp,
+# itest-<build id>-<suffix>, into <build dir>/variant-<suffix>/ with its own
+# checksums.txt, and prints that directory. The upgrade gates
+# (plans/kubectl-style-cluster-ops.md §9 Phase 3b: "two local builds of this
+# stack with different versions") install the normal build, then upgrade to
+# this one: the same code, so the only change an upgrade makes is the
+# version. Cached like build: a second call with the same tree is free.
+cmd_variant() {
+  local suffix="${1:-}"
+  [[ "$suffix" =~ ^[a-z0-9]{1,8}$ ]] || die "variant needs a suffix of 1-8 lower-case letters or digits, e.g. 'variant b'"
+  shift
+  parse_common_flags "$@"
+  preflight
+
+  local build_id out src arch
+  build_id=$(resolve_build_id)
+  out="${BUILD_ROOT}/${build_id}/variant-${suffix}"
+  # checksums.txt is written last, so its presence marks a whole build.
+  if [[ -f "${out}/checksums.txt" ]]; then
+    local complete=1
+    for arch in "${ARCHES[@]}"; do
+      [[ -f "${out}/sandboxd_linux_${arch}" && -f "${out}/toolboxd_linux_${arch}" ]] || complete=0
+    done
+    if (( complete )); then
+      log "build: variant ${suffix} of ${build_id} already built (cache hit) — ${out}"
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+  src=$(source_tree_for "$build_id")
+  rm -rf "$out"
+  mkdir -p "$out"
+  log "build: variant ${suffix} of ${build_id} (version itest-${build_id}-${suffix})"
+  for arch in "${ARCHES[@]}"; do
+    build_one_arch "$src" "$out" "$arch" "${build_id}-${suffix}"
+  done
+  write_checksums "$out"
+  printf '%s\n' "$out"
 }
 
 # prune_build_cache caps local disk.
@@ -466,6 +552,7 @@ write_buildinfo() {
   "arches": [$(printf '"%s",' "${ARCHES[@]}" | sed 's/,$//')],
   "with_caddy": $( ((WITH_CADDY)) && echo true || echo false ),
   "with_receiver": $( ((WITH_RECEIVER)) && echo true || echo false ),
+  "go_tags": "$(go_tags)",
   "receiver_built": $( compgen -G "${out}/audit-receiver_linux_*" >/dev/null && echo true || echo false ),
   "zig_version": "$(zig version)",
   "zig_target_amd64": "${ZIG_TARGET_amd64}",
@@ -648,6 +735,47 @@ presign() {
     --expires-in "$TTL_SECONDS"
 }
 
+# publish_mirror_install_script passes AEROL_DOWNLOAD_MIRROR to the nodes,
+# and prints the key of the install.sh they should download.
+#
+# The bootstrap runs `sudo /tmp/install.sh`, so no variable from here reaches
+# it, and changing Terraform/templates/bootstrap.sh.tftpl would replace every
+# node of a running production cluster (user_data_replace_on_change). The one
+# thing the harness already controls is which install.sh the nodes fetch, so
+# this uploads a copy of the build's install.sh whose default mirror is the
+# operator's value, beside the original. Its key carries the copy's hash, so
+# re-presigning the same build and value reuses it. Called only when
+# AEROL_DOWNLOAD_MIRROR is set; otherwise nodes get the build's install.sh
+# unchanged.
+publish_mirror_install_script() {
+  local bucket="$1" region="$2" prefix="$3"
+  local value="$AEROL_DOWNLOAD_MIRROR"
+  # The value lands inside a double-quoted bash string on the node, and in
+  # a sed replacement here: no quotes, $, backslash, & or |.
+  # (No empty alternative in the pattern: macOS's regex library rejects it.)
+  if [[ -n "$value" && "$value" != "off" && ! "$value" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    die "AEROL_DOWNLOAD_MIRROR must be an https:// URL, \"off\" or empty (got ${value})"
+  fi
+  local tmp
+  tmp=$(mktemp -d)
+  "${AWSCLI[@]}" --region "$region" s3 cp "s3://${bucket}/${prefix}/install.sh" "${tmp}/install.sh" --only-show-errors >&2 ||
+    { rm -rf "$tmp"; die "cannot read s3://${bucket}/${prefix}/install.sh"; }
+  if [[ "$(grep -c '^DOWNLOAD_MIRROR_DEFAULT="[^"]*"$' "${tmp}/install.sh")" != 1 ]]; then
+    rm -rf "$tmp"
+    log "urls: this build's install.sh predates the download mirror; AEROL_DOWNLOAD_MIRROR does not reach the nodes"
+    printf '%s' "${prefix}/install.sh"
+    return
+  fi
+  sed "s|^DOWNLOAD_MIRROR_DEFAULT=\"[^\"]*\"\$|DOWNLOAD_MIRROR_DEFAULT=\"${value}\"|" "${tmp}/install.sh" >"${tmp}/mirror.sh"
+  local key
+  key="${prefix}/install.mirror-$(sha256_stdin <"${tmp}/mirror.sh" | cut -c1-12).sh"
+  "${AWSCLI[@]}" --region "$region" s3 cp "${tmp}/mirror.sh" "s3://${bucket}/${key}" --only-show-errors >&2 ||
+    { rm -rf "$tmp"; die "cannot upload s3://${bucket}/${key}"; }
+  rm -rf "$tmp"
+  log "urls: nodes get install.sh with AEROL_DOWNLOAD_MIRROR=${value:-<off>} (${key})"
+  printf '%s' "$key"
+}
+
 # emit_urls writes ready-to-chain tfvars to STDOUT (status goes to stderr), so
 # `build.sh urls > artifacts.tfvars` composes directly into run.sh's
 # -var-file chain.
@@ -691,7 +819,11 @@ emit_urls() {
   printf 'sandboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/sandboxd_linux_${arch}")"
   printf 'toolboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/toolboxd_linux_${arch}")"
   printf 'checksums_url           = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/checksums.txt")"
-  printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/install.sh")"
+  local install_key="${prefix}/install.sh"
+  if [[ -n "${AEROL_DOWNLOAD_MIRROR+set}" ]]; then
+    install_key=$(publish_mirror_install_script "$bucket" "$region" "$prefix")
+  fi
+  printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "$install_key")"
   printf 'cluster_init_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-init.sh")"
   printf 'cluster_join_script_url = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/cluster-join.sh")"
   if (( have_sign_node )); then
@@ -721,15 +853,46 @@ emit_urls() {
 # installs sandboxd. The custom Caddy doesn't track sandboxd's version, so an
 # older release's binary is the right one. Falls back to releases/latest
 # when GitHub can't be asked.
+#
+# GitHub's release downloads can fail while its API answers (504s for hours
+# on 2026-11-08), so the chosen file is probed, and the download mirror's
+# copy (aerolvm/<tag>/caddy_linux_<arch>, filled by scripts/mirror-sync.sh)
+# is named instead when GitHub's does not answer. When the API itself is
+# down, the mirror's aerolvm/latest.txt names the release: mirror-sync.sh
+# only syncs a release whose files all checked out, so it carries Caddy.
+# AEROL_RELEASE_BASE replaces the GitHub releases URL; AEROL_DOWNLOAD_MIRROR
+# the mirror ("" or "off" turns it off).
 release_caddy_url() {
   local arch=$1 tag=""
-  tag=$(curl -fsSL "https://api.github.com/repos/aerol-ai/microvm/releases?per_page=30" 2>/dev/null |
-    jq -r --arg a "caddy_linux_${arch}" 'first(.[] | select((.draft | not) and (.prerelease | not) and any(.assets[]; .name == $a)) | .tag_name) // empty' 2>/dev/null) || tag=""
+  local base="${AEROL_RELEASE_BASE:-https://github.com/aerol-ai/microvm/releases}"
+  local mirror="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+  local api="${AEROL_RELEASE_API:-https://api.github.com/repos/aerol-ai/microvm/releases?per_page=30}"
+  local file="caddy_linux_${arch}"
+  [[ "$mirror" == "off" ]] && mirror=""
+  mirror="${mirror%/}"
+  tag=$(curl -fsSL "$api" 2>/dev/null |
+    jq -r --arg a "$file" 'first(.[] | select((.draft | not) and (.prerelease | not) and any(.assets[]; .name == $a)) | .tag_name) // empty' 2>/dev/null) || tag=""
   if [[ -z "$tag" ]]; then
-    printf 'https://github.com/aerol-ai/microvm/releases/latest/download/caddy_linux_%s' "$arch"
+    if [[ -n "$mirror" ]]; then
+      tag=$(curl -fsS --max-time 20 "${mirror}/aerolvm/latest.txt" 2>/dev/null | tr -d '[:space:]') || tag=""
+      if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] &&
+        curl -fsIL -o /dev/null --max-time 20 "${mirror}/aerolvm/${tag}/${file}"; then
+        log "release_caddy_url: GitHub's API did not answer; using the mirror's ${tag}"
+        printf '%s/aerolvm/%s/%s' "$mirror" "$tag" "$file"
+        return
+      fi
+    fi
+    printf '%s/latest/download/%s' "$base" "$file"
     return
   fi
-  printf 'https://github.com/aerol-ai/microvm/releases/download/%s/caddy_linux_%s' "$tag" "$arch"
+  local primary="${base}/download/${tag}/${file}"
+  if [[ -n "$mirror" ]] && ! curl -fsIL -o /dev/null --max-time 20 "$primary" &&
+    curl -fsIL -o /dev/null --max-time 20 "${mirror}/aerolvm/${tag}/${file}"; then
+    log "release_caddy_url: ${primary} did not answer; using the mirror's copy"
+    printf '%s/aerolvm/%s/%s' "$mirror" "$tag" "$file"
+    return
+  fi
+  printf '%s' "$primary"
 }
 
 cmd_urls() {
@@ -748,6 +911,90 @@ cmd_build_id() {
 }
 
 ###############################################################################
+# stage: files for a test node, through S3 (never scp from this machine)
+###############################################################################
+
+# A test node gets a file from this machine through S3, not over scp. One scp
+# is one TCP stream over this laptop's uplink: 10-170 KB/s to us-east-1, so
+# the adopt gate's 129 MB build took 20+ minutes per node, every node, and
+# slowed every other session's uploads meanwhile. An S3 upload runs many
+# connections at once (~1.4 MB/s from the same laptop) and happens once, and
+# a published build is already there, so it often costs nothing; each node
+# then downloads inside AWS in seconds. lib/stage.sh's stage_to_node is the
+# caller; scripts/stage-to-node.sh is the same thing for a person or agent.
+
+STAGE_TTL_SECONDS=3600 # a staged file is fetched within minutes
+
+# stage_build_key echoes builds/<id>/<name> when file sits directly in a
+# build folder (integration-tests/.build/<id>/), where publish puts the same
+# bytes, and nothing otherwise.
+stage_build_key() {
+  local f="$1" dir root
+  dir="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || return 0
+  root="$(cd "$BUILD_ROOT" 2>/dev/null && pwd -P)" || return 0
+  [[ "$(dirname "$dir")" == "$root" ]] || return 0
+  printf 'builds/%s/%s' "$(basename "$dir")" "$(basename "$f")"
+}
+
+# stage_content_key is where a file that is not in a published build goes:
+# keyed by its SHA-256, so the same bytes are uploaded once however many
+# nodes or runs ask for them. Under builds/, so the 7-day expiry covers it.
+stage_content_key() {
+  printf 'builds/stage/%s/%s' "$1" "$(basename "$2")"
+}
+
+# stage_file_mode keeps the one permission bit scp used to carry over.
+stage_file_mode() {
+  if [[ -x "$1" ]]; then echo 0755; else echo 0644; fi
+}
+
+# cmd_stage puts each file where a node can fetch it and prints one line per
+# file on stdout: "<sha256> <mode> <name> <presigned GET url>". It uploads
+# only what the bucket lacks. The node checks the SHA-256 of what it fetched
+# against this machine's copy (stage_remote_script), so reusing a published
+# object can never hand a node other bytes than the ones named here.
+cmd_stage() {
+  local files=() ttl
+  TTL_SECONDS="$STAGE_TTL_SECONDS"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="$(parse_ttl "${2:?--ttl needs a duration}")" || exit 1; TTL_SECONDS="$ttl"; shift 2 ;;
+      --)    shift; files+=("$@"); break ;;
+      -*)    die "stage: unknown flag: $1" ;;
+      *)     files+=("$1"); shift ;;
+    esac
+  done
+  [[ ${#files[@]} -gt 0 ]] || die "stage: no files given"
+  local f
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || die "stage: ${f} is not a file"
+  done
+
+  resolve_aws
+  local region="$AWS_REGION_RESOLVED" bucket="$ARTIFACT_BUCKET"
+  local sha size key remote_size
+  for f in "${files[@]}"; do
+    sha="$(sha256_stdin <"$f")"
+    size="$(wc -c <"$f" | tr -d '[:space:]')"
+    key="$(stage_build_key "$f")"
+    if [[ -n "$key" ]]; then
+      remote_size="$("${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" \
+        --query ContentLength --output text 2>/dev/null || true)"
+      [[ "$remote_size" == "$size" ]] || key=""
+    fi
+    if [[ -z "$key" ]]; then
+      key="$(stage_content_key "$sha" "$f")"
+      if ! "${AWSCLI[@]}" --region "$region" s3api head-object --bucket "$bucket" --key "$key" >/dev/null 2>&1; then
+        log "stage: uploading $(basename "$f") ($((size / 1048576)) MB) to s3://${bucket}/${key}"
+        "${AWSCLI[@]}" --region "$region" s3 cp --only-show-errors "$f" "s3://${bucket}/${key}" >&2 \
+          || die "stage: upload of ${f} failed"
+      fi
+    fi
+    printf '%s %s %s %s\n' "$sha" "$(stage_file_mode "$f")" "$(basename "$f")" "$(presign "$bucket" "$region" "$key")"
+  done
+}
+
+###############################################################################
 
 main() {
   local cmd="${1:-}"
@@ -757,6 +1004,8 @@ main() {
     publish)        cmd_publish "$@" ;;
     urls)           cmd_urls "$@" ;;
     build-id)       cmd_build_id "$@" ;;
+    stage)          cmd_stage "$@" ;;
+    variant)        cmd_variant "$@" ;;
     artifacts-init) cmd_artifacts_init ;;
     *)
       cat >&2 <<'USAGE'
@@ -770,6 +1019,13 @@ usage: build.sh <command> [flags]
           Re-presign an already-published build (stdout = tfvars).
   build-id [--ref <commit>]
           Print AEROL_BUILD_ID only.
+  stage   [--ttl 1h] <file>...
+          Put local files in S3 for a test node (reusing a published build's
+          copy) and print "<sha256> <mode> <name> <url>" per file. Use
+          lib/stage.sh's stage_to_node, not this, to move files to a node.
+  variant <suffix> [--arch ...]
+          Build this tree again as version itest-<id>-<suffix> into
+          .build/<id>/variant-<suffix>/ and print that directory.
   artifacts-init
           One-time per-account artifacts bucket bootstrap.
 USAGE

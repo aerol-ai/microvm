@@ -288,7 +288,7 @@ func TestFailoverRestoresTheCurrentLifetimeNotALateOldPush(t *testing.T) {
 	survivor, survivorStore, rt := newCheckpointService(t, reg)
 	if _, err := survivor.recreateWasmDurableSandbox(ctx, "sb-fo", "inc-new", models.CreateSandboxRequest{
 		Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm",
-	}, nil); err != nil {
+	}, nil, 0); err != nil {
 		t.Fatalf("failover recreate: %v", err)
 	}
 	restored, err := survivorStore.Get(ctx, "sb-fo")
@@ -309,7 +309,7 @@ func TestFailoverRestoresTheCurrentLifetimeNotALateOldPush(t *testing.T) {
 	// With no lifetime to bind to there is nothing safe to restore.
 	if _, err := survivor.recreateWasmDurableSandbox(ctx, "sb-unbound", "", models.CreateSandboxRequest{
 		Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm",
-	}, nil); err == nil {
+	}, nil, 0); err == nil {
 		t.Fatal("a recreate with no lifetime restored a checkpoint anyway")
 	}
 }

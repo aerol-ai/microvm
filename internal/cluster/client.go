@@ -6,17 +6,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
@@ -35,18 +39,35 @@ type Cluster struct {
 	raft   *raftNode
 	gossip *gossipNode
 
+	// reserveSlots bounds the reservations this leader applies at once
+	// (cfg.ClusterReserveApplyLimit, F28); made on first use.
+	reserveSlotsOnce sync.Once
+	reserveSlots     chan struct{}
+
+	// gone is the leader's "machine is gone" state (C19, node_gone.go).
+	gone goneTracker
+	// moves is the decommission's worker-side hook and notice memory (C9,
+	// decommission.go).
+	moves moveHandlerHolder
+
 	// authoritativePlacementsHook stands in for AuthoritativePlacementsByIDs
 	// in tests that need a lagging local replica next to a live leader.
 	// Always nil in production.
 	authoritativePlacementsHook func(context.Context, []string) (map[string]Placement, error)
+	// leaderContactHook stands in for raft's state and last-leader-contact
+	// time in tests (stale_read.go). Always nil in production.
+	leaderContactHook func() (raft.RaftState, time.Time)
+	// raftMemberHook stands in for the raft configuration lookup in
+	// readiness tests (readiness.go). Always nil in production.
+	raftMemberHook func() bool
 
-	// patToken authenticates leader-forwarded raft applies. Sourced from
-	// cfg.PATToken at construction; same value every node already shares for
-	// regular API auth, so no new secret-distribution surface. With mTLS
-	// enabled the PAT is belt-and-braces — the TLS handshake already proved
-	// cluster membership — but we keep sending it so the receiving handler can
-	// stay symmetric with the public endpoint. A selected mTLS request never
-	// downgrades to the public endpoint after a TLS error.
+	// patToken is the bearer this node's own peer calls carry:
+	// cfg.ClusterPeerPAT(), the operator PAT when the node holds it. A node
+	// joined without it sends none and peers know it by its cert alone
+	// (peer_cert_auth.go). The TLS handshake proves membership either way;
+	// a node with the PAT keeps sending it so older peers still accept it.
+	// A selected mTLS request never downgrades to the public endpoint after
+	// a TLS error. The join service also hands it to the servers it joins.
 	patToken string
 	// internalURL is this node's cluster-internal mTLS advertise URL.
 	internalURL string
@@ -78,6 +99,12 @@ type Cluster struct {
 	// Close can stop its loop. See dead_owner.go for the reconciler logic.
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
+	// orphanRetry is the leader's place in the orphaned-recovery backlog
+	// (orphan_recovery.go).
+	orphanRetry orphanRetryCursor
+	// orphanRetryBeforeApply, when set (tests only), runs just before a
+	// retry's move is applied: the window another write can race it in.
+	orphanRetryBeforeApply func(sandboxID string)
 
 	// reservationGCStop cancels the leader-only sweep that cancels expired
 	// opReserve rows. Followers run no loop because every CancelReservation
@@ -99,12 +126,29 @@ type Cluster struct {
 	// be admitted. Nothing repairs that afterwards: an already-configured
 	// server skips the admission check on every later reconcile.
 	raftMembershipMu sync.Mutex
-	// reservationAdmissionMu serializes leader-side reservation admission.
-	// Capacity leases are outside the Raft FSM, so the leader must check
-	// target capacity + per-worker pending caps under one queue before
-	// appending opReserve/opReserveBatch. Otherwise two routers can both
-	// validate against the same pending snapshot and overfill a worker.
+	// reservationAdmissionMu serializes leader-side admission checks (the
+	// capacity and pending-create cap of opReserve/opReserveBatch, and team
+	// quotas) and guards the admission ledger. Capacity leases are outside
+	// the Raft FSM, so two routers checking the same pending snapshot at once
+	// could both fill a worker's last slot. It is held for the check only,
+	// never across the Raft commit: what is admitted but not yet applied is
+	// counted from the ledger instead (admission_ledger.go).
 	reservationAdmissionMu sync.Mutex
+	// admission is the leader's ledger of in-flight admissions for its
+	// current term, guarded by reservationAdmissionMu.
+	admission admissionLedger
+	// admissionEnqueue is held for reading from a passed admission check
+	// until raft has taken the entry, and for writing by a term change before
+	// its barrier, so every entry admitted in an earlier term is in the log
+	// ahead of that barrier (admission_ledger.go).
+	admissionEnqueue sync.RWMutex
+	// leaderTermHook and admissionBarrierHook stand in for raft's state, term
+	// and barrier in admission tests. Always nil in production.
+	leaderTermHook       func() (bool, uint64)
+	admissionBarrierHook func() error
+	// applyWaitBoundsHook shortens awaitApply's leader-loss grace and poll
+	// interval in tests. Always nil in production.
+	applyWaitBoundsHook func() (grace, interval time.Duration)
 	// authoritativeBarrierOnce/authoritativeBarrier admit ONE fsm barrier at
 	// a time. A raft barrier cannot be cancelled, so the goroutine waiting on
 	// one outlives an abandoned read; holding the slot until raft returns is
@@ -139,6 +183,29 @@ type Cluster struct {
 	readIndexHook func(context.Context) (uint64, error)
 	// catchUpLogEvery overrides catchUpStillWaitingLogEvery in tests.
 	catchUpLogEvery time.Duration
+	// evictDeadOwnerStepHook runs just before each write evictDeadOwner
+	// makes, so tests can move a placement or revive the node between the
+	// read and the write. Always nil in production.
+	evictDeadOwnerStepHook func(step evictDeadOwnerStep, sandboxID string)
+	// denyHits counts and logs refusals of deleted nodes (gossip_deny.go).
+	denyHits *denyHitRecorder
+
+	// Join service (join.go): the CA signer from the CA store, the join
+	// listener and the port it advertises, the dial-back dialer (tests swap
+	// it; nil is net.Dialer) and the cert renewal loop.
+	ca                caSigner
+	joinServer        *joinServer
+	joinAdvertisePort int
+	joinDial          dialFunc
+	certRenewStop     context.CancelFunc
+
+	// Rollouts (rollout*.go, upgrade_*.go): the node side of an upgrade
+	// step, the release-file server, the leader's driver and its loop.
+	upgrade     *upgradeNode
+	files       *upgradeFileServer
+	driver      *rolloutDriver
+	rolloutStop context.CancelFunc
+	rolloutWake chan struct{}
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -169,6 +236,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	if err != nil {
 		return nil, fmt.Errorf("cluster.New: recovery store: %w", err)
 	}
+	// Installed before raft starts so every entry this server applies is
+	// recorded. The capacity lease cache built below shares it and clears
+	// what each heartbeat covers (capacity_unreported.go).
+	unreported := newUnreportedLoad()
+	fsm.unreported.Store(unreported)
 
 	// Load cluster TLS material first — both raft transport and the internal
 	// HTTPS listener need it. Cluster configuration rejects an empty TLS dir.
@@ -185,6 +257,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		BindAddr:         cfg.RaftBindAddr,
 		AdvertiseAddr:    cfg.RaftAdvertiseAddr,
 		DataDir:          cfg.RaftDataDir,
+		WALDir:           cfg.RaftWALDir,
 		BootstrapCluster: cfg.ClusterBootstrap,
 		TLS:              clusterTLS,
 	}, fsm, logger)
@@ -205,10 +278,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		dataPlaneHost: cfg.DataPlaneAdvertiseHost,
 		fsm:           fsm,
 		raft:          rn,
-		patToken:      cfg.PATToken,
+		patToken:      cfg.ClusterPeerPAT(),
 		commitTimeout: commitTimeout,
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
+		denyHits:      &denyHitRecorder{logger: logger},
 	}
 	// Not caught up from the first instant anything can read the FSM; the
 	// loop that clears it starts at the end of New (startCatchUpWatch).
@@ -231,6 +305,10 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
 		}
 		is.SetReadIndexHandler(c.LeaderReadIndex)
+		// The FSM exists before the listener, so a deleted node is refused
+		// from the first request, boot window included.
+		is.SetPeerDenyCheck(c.refuseDeniedPeer)
+		is.SetPeerKeyCheck(c.CheckPeerKey)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -276,6 +354,8 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		OnLeave:        c.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
 		PATScope:       cfg.PATScope,
+		Denied:         fsm.isNodeDenied,
+		DenyHits:       c.denyHits,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {
@@ -291,7 +371,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			return ok && m.Alive
 		})
 	}
-	c.capacityLeases = newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases := newCapacityLeaseCache(c.nodeID, admitter, cfg.ClusterCapacityGossipInterval, logger)
+	leases.unreported = unreported
+	c.capacityLeases = leases
 	c.startCapacityLeaseLoop(cfg.ClusterCapacityGossipInterval)
 
 	// Slow reconcile loop: catches the "joined too fast" race where the
@@ -326,7 +408,75 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// so the loop's first read index finds gossip and the internal client.
 	c.startCatchUpWatch()
 
+	c.startJoinService()
+	c.startRollouts()
+
 	return c, nil
+}
+
+// startRollouts wires the upgrade node, the release-file server and the
+// rollout driver, and starts their loop. Nothing here is on the sandbox
+// boot path: the loop's first tick is rolloutTickEvery after start.
+func (c *Cluster) startRollouts() {
+	c.upgrade = newUpgradeNode(c.cfg, c.nodeID, true, c.logger)
+	c.upgrade.fence = func(ctx context.Context, rolloutID string) (UpgradeFence, error) {
+		return c.serverFence(ctx, rolloutID, c.nodeID)
+	}
+	c.upgrade.servers = func() []Member { return serversForCopy(c.LocalMembers(), c.nodeID, c.Leader()) }
+	c.upgrade.clientFor = c.ClientForPeer
+	c.upgrade.appliedIndex = c.fsm.currentVersion
+	c.upgrade.audit = c.recordUpgradeAudit
+	c.files = newUpgradeFileServer(c.cfg.UpgradeServeMBPS, func() (nodeupgrade.Paths, error) { return c.upgrade.paths() }, c.leaderRefusesCopy)
+	c.driver = newRolloutDriver(clusterRolloutHost{c: c}, clusterNodeClient{c: c}, c.logger)
+	c.rolloutWake = make(chan struct{}, 1)
+	rolloutMetricsSource.Store(c.fsm)
+	activeVersionSource.Store(c)
+	c.startRolloutLoop()
+}
+
+// recordUpgradeAudit hands an upgrade record to the service's audit
+// writer, when one is attached (AttachRecreator).
+func (c *Cluster) recordUpgradeAudit(ev UpgradeAuditEvent) {
+	if rec, ok := c.currentRecreator().(UpgradeAuditRecorder); ok {
+		rec.RecordClusterUpgrade(ev)
+	}
+}
+
+// startJoinService loads the CA store, opens the join listener (servers
+// only, when SB_CLUSTER_JOIN_LISTEN_ADDR resolved to an address) and starts
+// cert renewal. None of it is on the sandbox boot path, and none of it can
+// fail the daemon's start: a cluster that can't join new nodes still serves
+// the ones it has, so problems are logged loudly instead.
+func (c *Cluster) startJoinService() {
+	joinTokenSource.Store(c.fsm)
+	if ca, err := LoadClusterCA(c.cfg.ClusterCADir); err != nil {
+		c.logger.Error("cluster: CA store unreadable; joins and renewals signed here are off until it is fixed", "dir", c.cfg.ClusterCADir, "err", err)
+	} else if ca != nil {
+		if id := c.clusterID(); id != "" && CACertHash(ca.Certificate()) != id {
+			c.logger.Error("cluster: the CA store holds another cluster's CA; not signing with it", "dir", c.cfg.ClusterCADir)
+		} else {
+			c.ca.set(ca)
+		}
+	}
+	if c.tls == nil {
+		return
+	}
+	if addr := c.cfg.ClusterJoinListenAddr; addr != "" {
+		js, err := startJoinServerMode(addr, c.tls, c, c.recordJoinAudit, c.logger, c.cfg.ClusterExternalCA)
+		if err != nil {
+			c.logger.Error("cluster: join listener did not start; one-line joins land on other servers only", "addr", addr, "err", err)
+		} else {
+			c.joinServer = js
+			if tcp, ok := js.listener.Addr().(*net.TCPAddr); ok {
+				c.joinAdvertisePort = tcp.Port
+			}
+		}
+	}
+	// In external-CA mode cert-manager renews the certificate and no server
+	// can sign one; tls.go reloads the renewed file per handshake.
+	if !c.cfg.ClusterExternalCA {
+		c.certRenewStop = startCertRenewer(&certRenewer{tls: c.tls, nodeID: c.nodeID, logger: c.logger, renew: c.renewViaServers})
+	}
 }
 
 func (c *Cluster) SelfNodeID() string { return c.nodeID }
@@ -407,7 +557,8 @@ func (c *Cluster) currentRecreator() SandboxRecreator {
 // exists but has no active owner (auto-orphaned after the owning node died —
 // see voter_autojoin / dead-owner reconciler).
 func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
-	p, ok := c.fsm.get(sandboxID)
+	// The owner is on the hot row; the spec is not needed (F30).
+	p, ok := c.fsm.getHot(sandboxID)
 	if !ok {
 		return OwnerInfo{}, ErrUnknownSandbox
 	}
@@ -428,6 +579,7 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 		APIURL:      apiURL,
 		InternalURL: internalURL,
 		IsSelf:      p.OwnerNodeID == c.nodeID,
+		Epoch:       p.OwnerEpoch,
 	}, nil
 }
 
@@ -521,6 +673,9 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		IncarnationID:         incarnationID,
 		ExpectedIncarnationID: expectedIncarnationID,
 		OwnerRef:              secrets.OwnerRef,
+		// No caller may place a lifetime the cluster deleted; see
+		// deleted_lifecycle.go for why this is gated on server versions.
+		RefuseDeletedLifecycle: c.deletedLifecycleFenceReplicated(),
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -587,6 +742,12 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 // spec MUST be redacted; empty secrets preserves the previously replicated
 // handle (resize/lifecycle never change credentials).
 func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return c.upsertSpec(ctx, sandboxID, spec, secrets, 0)
+}
+
+// upsertSpec is UpsertSpec with opUpsertSpec's version check
+// (spec_version_fence.go); expectedVersion 0 asks for none.
+func (c *Cluster) upsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets, expectedVersion uint64) error {
 	if spec == nil && !secrets.hasUpdate() {
 		return nil
 	}
@@ -606,15 +767,16 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 		}
 	}
 	cmd := command{
-		Op:                    opUpsertSpec,
-		SandboxID:             sandboxID,
-		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
-		SecretRef:             secrets.Ref,
-		SecretVersion:         secrets.Version,
-		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
-		SecretSealGeneration:  secrets.SealGeneration,
-		IncarnationID:         strings.TrimSpace(secrets.IncarnationID),
-		ExpectedIncarnationID: strings.TrimSpace(secrets.IncarnationID),
+		Op:                       opUpsertSpec,
+		SandboxID:                sandboxID,
+		Spec:                     c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
+		SecretRef:                secrets.Ref,
+		SecretVersion:            secrets.Version,
+		SecretRecipients:         normalizeSecretRecipientIDs(secrets.Recipients),
+		SecretSealGeneration:     secrets.SealGeneration,
+		IncarnationID:            strings.TrimSpace(secrets.IncarnationID),
+		ExpectedIncarnationID:    strings.TrimSpace(secrets.IncarnationID),
+		ExpectedPlacementVersion: expectedVersion,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -728,6 +890,7 @@ func (c *Cluster) addExposedPortForIncarnation(ctx context.Context, sandboxID, i
 		Protocol:              route.Protocol,
 		HostPort:              route.HostPort,
 		PublicURL:             route.PublicURL,
+		Visibility:            route.Visibility,
 	}
 	return c.applyCommand(ctx, cmd)
 }
@@ -799,7 +962,7 @@ func (c *Cluster) currentPlacementIncarnation(sandboxID string) (string, bool, e
 	if c == nil || c.fsm == nil || sandboxID == "" {
 		return "", false, nil
 	}
-	placement, ok := c.fsm.get(sandboxID)
+	placement, ok := c.fsm.getHot(sandboxID)
 	if !ok {
 		return "", false, nil
 	}
@@ -860,6 +1023,10 @@ func (c *Cluster) DeletePlacementExact(ctx context.Context, sandboxID, expectedO
 		ExpectedOwnerNodeID: expectedOwnerNodeID, ExpectedOwnerNodeIDSet: true, ExpectedIncarnationID: expectedIncarnationID,
 		ExpiresUnix: auditACLExpiryUnix(c.cfg.AuditDeletedGrace), AuditIndexMax: int64(c.cfg.AuditDeletedIndexMax),
 	}
+	// Every path that deletes a placement (a destroy, the leader expiring an
+	// abandoned delete, an operator's orphan delete) goes through here, so
+	// the volumes it leaves owed are recorded on all of them.
+	stampVolumeReclaims(&cmd, c.VolumeReclaimsReplicated(), c.nodeID)
 	return c.applyCommand(ctx, cmd)
 }
 
@@ -1161,15 +1328,8 @@ func (c *Cluster) removeMemberLocal(ctx context.Context, nodeID string, force bo
 }
 
 func (c *Cluster) memberAlive(nodeID string) bool {
-	if c.gossip == nil {
-		return false
-	}
-	for _, m := range c.gossip.members() {
-		if m.NodeID == nodeID {
-			return m.Alive
-		}
-	}
-	return false
+	m, ok := c.gossip.memberByID(nodeID)
+	return ok && m.Alive
 }
 
 func (c *Cluster) forwardRemoveMemberToLeader(ctx context.Context, nodeID string, force bool) error {
@@ -1250,8 +1410,12 @@ func (c *Cluster) IsNodeDrained(nodeID string) bool {
 // ownership (never overwrite an existing non-self owner):
 //
 //   - **No FSM placement.** Write opPlace claiming self as owner, with spec +
-//     secret ref so the new placement is born recoverable. This is the
-//     normal case for sandboxes created before AssertOwnership last ran.
+//     secret ref so the new placement is born recoverable. The service only
+//     hands over such a row when it is provably not a deleted sandbox
+//     (service.settleUnplacedRow destroys the others), and the FSM refuses
+//     one whose lifecycle has a post-delete record (ErrPlacementDeleted).
+//     This is the case for sandboxes created before AssertOwnership last
+//     ran, e.g. on a single node turned into a cluster.
 //
 //   - **FSM owner == self.** No ownership change. Backfill missing Spec /
 //     secret ref via opUpsertSpec (closes the pre-spec-replication gap)
@@ -1302,10 +1466,11 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 
 		switch {
 		case !ok:
-			// No placement exists — claim ownership. Pass spec + secret handle
-			// so the placement is born recoverable.
-			if err := c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets); err != nil && firstErr == nil {
-				firstErr = err
+			// No placement exists — claim ownership. Pass spec + secret
+			// handle so the placement is born recoverable.
+			record := func() error { return c.RecordPlacement(ctx, st.ID, st.Spec, st.Secrets) }
+			if !placeUnplacedRow(c.logger, c.nodeID, st, record, &firstErr) {
+				continue
 			}
 			// Replay port intents so the FSM matches local truth.
 			for port, route := range st.ExposedPorts {
@@ -1350,7 +1515,9 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}
-				if err := c.UpsertSpec(ctx, st.ID, spec, replaySecrets); err != nil && firstErr == nil {
+				// A backfill records what the sandbox already is, so a
+				// team over a lowered quota does not refuse it.
+				if err := c.UpsertSpec(withTeamQuotaReplay(ctx), st.ID, spec, replaySecrets); err != nil && firstErr == nil {
 					firstErr = err
 				}
 			}
@@ -1431,6 +1598,7 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	cmd = markQuotaAdmit(ctx, cmd)
 	payload, err := encodeCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("cluster: encode command: %w", err)
@@ -1442,8 +1610,14 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 			c.obligations.add(cmd.ObligationReports)
 			return nil
 		}
+		if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+			return err
+		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
+		}
+		if c.takesTeamQuotaAdmission(cmd) {
+			return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
 		}
 		return c.applyEncodedLocal(ctx, payload)
 	}
@@ -1468,26 +1642,88 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if err := validateCommandLifecycle(cmd); err != nil {
 		return err
 	}
+	if cmd.Op == opDenyNode {
+		// Only this leader's node-delete path writes a deny record, after
+		// its upgrade gate (writeNodeDeny). A peer's raw forward could carry
+		// the op past that gate, or deny another node outright.
+		return errDenyNodeNotForwardable
+	}
+	if isJoinOp(cmd.Op) {
+		// Join state is proposed only by a server's join path (join.go),
+		// after its token, role and upgrade checks; a raw forward from any
+		// peer could admit a key as a server, or skip the gate.
+		return errJoinOpNotForwardable
+	}
+	if isRolloutOp(cmd.Op) {
+		// The active version and the rollout are proposed only by this
+		// leader's rollout code, after its upgrade gate and the transition
+		// tables; a raw forward could move a rollout past both.
+		return errRolloutOpNotForwardable
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil
 	}
+	if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+		return err
+	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 		return c.applyReservationEncodedLocal(ctx, payload, cmd)
+	}
+	if c.takesTeamQuotaAdmission(cmd) {
+		return c.applyQuotaAdmittedEncodedLocal(ctx, payload, cmd)
 	}
 	return c.applyEncodedLocal(ctx, payload)
 }
 
+// applyReservationEncodedLocal admits a reservation (capacity, pending cap,
+// team quota) against committed state plus the leader's in-flight holds, then
+// proposes it without holding the admission lock across the commit
+// (admission_ledger.go).
 func (c *Cluster) applyReservationEncodedLocal(ctx context.Context, payload []byte, cmd command) error {
-	c.reservationAdmissionMu.Lock()
-	defer c.reservationAdmissionMu.Unlock()
-	if c.raft.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-	if err := c.admitReservationCommand(cmd); err != nil {
+	release, err := c.acquireReserveSlot()
+	if err != nil {
 		return err
 	}
-	return c.applyEncodedLocal(ctx, payload)
+	defer release()
+	// Outside the admission lock: a lease this leader lacks is fetched from
+	// the owner first (capacity_lease_ondemand.go).
+	c.ensureOwnerLeases(ctx, cmd)
+	return c.applyAdmittedEncodedLocal(ctx, payload, cmd, func() error {
+		if err := c.admitReservationCommand(cmd); err != nil {
+			return err
+		}
+		return c.admitTeamQuotaCommand(cmd)
+	})
+}
+
+// reserveAppliesRefused counts creates the leader turned away because it was
+// applying its limit of reservations already (F28).
+var reserveAppliesRefused = expvar.NewInt("aerolvm_cluster_reserve_applies_refused_total")
+
+// acquireReserveSlot takes one of the leader's reservation slots, or answers
+// at once with create backpressure when they are all in use. Before, a
+// create past the cell's ceiling queued behind Raft until its caller's
+// deadline ran out (F28: at 512 at once, 122 failed after waiting); a quick
+// 429 with Retry-After sends it to another try instead. The bound is on the
+// leader, where every reservation is applied, and only on reservations:
+// heartbeats, deletes and repairs are never turned away.
+func (c *Cluster) acquireReserveSlot() (func(), error) {
+	c.reserveSlotsOnce.Do(func() {
+		if n := c.cfg.ClusterReserveApplyLimit; n > 0 {
+			c.reserveSlots = make(chan struct{}, n)
+		}
+	})
+	if c.reserveSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.reserveSlots <- struct{}{}:
+		return func() { <-c.reserveSlots }, nil
+	default:
+		reserveAppliesRefused.Add(1)
+		return nil, fmt.Errorf("%w: the leader is applying %d reservations already", ErrCreateBackpressure, cap(c.reserveSlots))
+	}
 }
 
 // applyEncodedLocal submits an already-encoded command to the local raft.
@@ -1501,7 +1737,18 @@ func (c *Cluster) applyEncodedLocal(ctx context.Context, payload []byte) error {
 
 // applyEncodedLocalResult is applyEncodedLocal for the ops whose FSM answer
 // the caller needs (an allocated token, say). Everything else discards it.
-func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (result any, err error) {
+func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (any, error) {
+	result, _, err := c.applyEncodedLocalOutcome(ctx, payload, nil, nil)
+	return result, err
+}
+
+// applyEncodedLocalOutcome is applyEncodedLocalResult plus whether the entry
+// can still commit after an error (raftApplyOutcome), which the admission
+// ledger needs to know when to let go of a hold. enqueued, when not nil, is
+// called as soon as raft has taken the entry (or refused to), before the
+// wait for its commit. settle, when not nil, gets the outcome once raft
+// answers, even if the wait gave up first (awaitApply).
+func (c *Cluster) applyEncodedLocalOutcome(ctx context.Context, payload []byte, enqueued func(), settle func(admissionOutcome)) (result any, outcome admissionOutcome, err error) {
 	done := beginRaftApply()
 	defer func() { done(err) }()
 	timeout := c.commitTimeout
@@ -1510,26 +1757,113 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 			timeout = remaining
 		}
 	}
+	_, term := c.leaderTerm()
 	f := c.raft.raft.Apply(payload, timeout)
-	if applyErr := f.Error(); applyErr != nil {
-		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
-			return nil, ErrNotLeader
+	if enqueued != nil {
+		enqueued()
+	}
+	return c.awaitApply(ctx, f, term, settle)
+}
+
+const (
+	// applyLeaderLossGrace is how long a write still waits for raft's own
+	// answer after this server stopped leading the term it was proposed in.
+	// raft answers in-flight entries as it steps down, and the FSM keeps
+	// applying the ones it already committed, so a real answer comes within
+	// milliseconds; the grace only covers a slow FSM batch.
+	applyLeaderLossGrace = 2 * time.Second
+	// applyLeaderPollInterval is how often a waiting write checks that this
+	// server still leads. A healthy commit answers well before the first check.
+	applyLeaderPollInterval = 100 * time.Millisecond
+)
+
+// applyAnswer is raft's answer to one proposed entry.
+type applyAnswer struct {
+	result  any
+	outcome admissionOutcome
+	err     error
+}
+
+// awaitApply waits for raft's answer to f, proposed while this server led
+// term. raft does not always answer: when it shuts down, a batch the leader
+// has committed and queued for the FSM (raft's fsmMutateCh is buffered) is
+// dropped if runFSM picks shutdownCh first, and the batch's futures have
+// already left the leader's in-flight list, which is the only one the
+// step-down answers. A bare f.Error() then blocks forever (the hang that
+// TestClusterFaultLeaderChangeDuringConcurrentReserves/kill hit about 1 run
+// in 12).
+//
+// So the caller is let go when its ctx ends, or when this server has stopped
+// leading term and raft has still not answered after applyLeaderLossGrace.
+// Both give outcomeUnknown, the same as raft's own ErrLeadershipLost: the
+// entry may still commit, and every caller already treats ErrNotLeader as
+// "retry the idempotent command". settle still gets the real outcome if raft
+// answers later, so an admission hold whose caller went away is released by
+// the commit, not kept for the rest of the term.
+func (c *Cluster) awaitApply(ctx context.Context, f raft.ApplyFuture, term uint64, settle func(admissionOutcome)) (any, admissionOutcome, error) {
+	answered := make(chan applyAnswer, 1)
+	go func() {
+		a := applyAnswerOf(f)
+		if settle != nil {
+			settle(a.outcome)
 		}
-		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
-		return nil, err
+		answered <- a
+	}()
+	grace, interval := c.applyWaitBounds()
+	poll := time.NewTicker(interval)
+	defer poll.Stop()
+	var giveUp <-chan time.Time
+	for {
+		select {
+		case a := <-answered:
+			return a.result, a.outcome, a.err
+		case <-ctx.Done():
+			return nil, outcomeUnknown, fmt.Errorf("cluster: raft apply: %w", ctx.Err())
+		case <-giveUp:
+			return nil, outcomeUnknown, ErrNotLeader
+		case <-poll.C:
+			if giveUp != nil {
+				continue
+			}
+			if leading, now := c.leaderTerm(); !leading || now != term {
+				giveUp = time.After(grace)
+			}
+		}
+	}
+}
+
+// applyWaitBounds returns awaitApply's grace and poll interval; tests shorten
+// them.
+func (c *Cluster) applyWaitBounds() (grace, interval time.Duration) {
+	grace, interval = applyLeaderLossGrace, applyLeaderPollInterval
+	if c.applyWaitBoundsHook != nil {
+		grace, interval = c.applyWaitBoundsHook()
+	}
+	return grace, interval
+}
+
+// applyAnswerOf blocks until raft answers f and maps the answer to the
+// cluster's errors.
+func applyAnswerOf(f raft.ApplyFuture) applyAnswer {
+	if applyErr := f.Error(); applyErr != nil {
+		outcome := raftApplyOutcome(applyErr)
+		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
+			return applyAnswer{outcome: outcome, err: ErrNotLeader}
+		}
+		return applyAnswer{outcome: outcome, err: fmt.Errorf("cluster: raft apply: %w", applyErr)}
 	}
 	response := f.Response()
 	if appErr, ok := response.(error); ok && appErr != nil {
-		err = fmt.Errorf("cluster: fsm apply: %w", appErr)
-		return nil, err
+		return applyAnswer{outcome: outcomeSettled, err: fmt.Errorf("cluster: fsm apply: %w", appErr)}
 	}
 	if reassigned, ok := response.(reassignApplyResult); ok && reassigned.Changed {
 		// This runs once on the leader after its FSM confirms the ownership
 		// transition. Followers apply the same log entry but never execute this
-		// wrapper, and a lost HTTP acknowledgement cannot erase the count.
+		// wrapper, and a lost HTTP acknowledgement cannot erase the count. It
+		// runs even when the caller stopped waiting: the transition happened.
 		recordFailoverReassign()
 	}
-	return response, nil
+	return applyAnswer{result: response, outcome: outcomeSettled}
 }
 
 // forwardApplyToLeader posts an encoded raft command to the current leader's
@@ -1701,6 +2035,49 @@ func (c *Cluster) membersWithCapacity() []Member {
 		return members
 	}
 	return c.capacityLeases.apply(members, time.Now())
+}
+
+// membersWithCapacityFor is membersWithCapacity for the named members only.
+// The leader's reservation check needs each reservation's owner, not the
+// fleet: the full copy and its lease overlay were a tenth of the leader's
+// CPU at 500 workers (C18, bench-full-4). A name the index does not hold is
+// left out, as the full list leaves out a member gossip no longer has.
+func (c *Cluster) membersWithCapacityFor(nodeIDs []string) []Member {
+	out := make([]Member, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		if slices.ContainsFunc(out, func(m Member) bool { return m.NodeID == id }) {
+			continue
+		}
+		if m, ok := c.gossip.memberByID(id); ok {
+			out = append(out, m)
+		}
+	}
+	if c.capacityLeases != nil {
+		c.capacityLeases.applyInPlace(out, time.Now())
+	}
+	return out
+}
+
+// pendingLoadByNode is the load placement adds to each node's last capacity
+// heartbeat: reservations still in flight (the FSM) plus load the FSM stopped
+// counting at a promote or failover reassign that the heartbeat does not show
+// yet (capacity_unreported.go). Without the second part a promoted sandbox
+// counted nowhere until the next heartbeat (plan item C7).
+//
+// Look nodes up with of only AFTER reading the members the load is added to.
+// That read re-reads this server's own admitter, which clears the entries the
+// admitter now shows; looked up first, this server's last promote would count
+// twice on the next create here. The cost of this order is a peer heartbeat
+// stored between the two reads: its entries are gone while the copied member
+// still has the older snapshot, so that one decision misses them, as every
+// decision did before this change.
+func (c *Cluster) pendingLoadByNode(now int64) pendingLoad {
+	reserved, runtimes := c.fsm.pendingReservationLoadByNode(now)
+	load := pendingLoad{reserved: reserved, runtimes: runtimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
+	return load
 }
 
 func (c *Cluster) Placements() []Placement {
@@ -1876,6 +2253,17 @@ func (c *Cluster) LeaderAPIURL() string {
 // Close shuts down gossip + raft. Idempotent.
 func (c *Cluster) Close() error {
 	var firstErr error
+	if c.certRenewStop != nil {
+		c.certRenewStop()
+	}
+	if c.rolloutStop != nil {
+		c.rolloutStop()
+	}
+	if c.joinServer != nil {
+		if err := c.joinServer.Close(); err != nil {
+			firstErr = fmt.Errorf("cluster: join server close: %w", err)
+		}
+	}
 	if c.voterReconcileStop != nil {
 		c.voterReconcileStop()
 	}
@@ -1898,7 +2286,7 @@ func (c *Cluster) Close() error {
 		c.catchUpStop()
 	}
 	if c.gossip != nil {
-		if err := c.gossip.Close(); err != nil {
+		if err := c.gossip.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
 		}
 	}

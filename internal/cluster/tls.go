@@ -102,7 +102,10 @@ const nodeIDSANprefix = "node:"
 // boot from the on-disk files and shared by the raft StreamLayer and the
 // internal HTTPS listener / client.
 type ClusterTLS struct {
-	caPool   *x509.CertPool
+	caPool *x509.CertPool
+	// caPEM is ca.crt as read at boot: the join service hands it out and
+	// MACs it (join.go).
+	caPEM    []byte
 	nodeCert tls.Certificate
 	certPath string
 	keyPath  string
@@ -153,7 +156,7 @@ func loadClusterTLS(dir string) (*ClusterTLS, error) {
 	}
 	recordClusterTLSExpiry(leafExpiry, caExpiry)
 	loaded := &ClusterTLS{
-		caPool: pool, nodeCert: cert, nodeID: nodeID,
+		caPool: pool, caPEM: caBytes, nodeCert: cert, nodeID: nodeID,
 		certPath: certPath, keyPath: keyPath,
 	}
 	loaded.current.Store(&loaded.nodeCert)
@@ -229,6 +232,33 @@ func leafCertificate(cert *tls.Certificate) (*x509.Certificate, error) {
 		return cert.Leaf, nil
 	}
 	return x509.ParseCertificate(cert.Certificate[0])
+}
+
+// certRoleSANprefix is the URI SAN an external-CA certificate carries for
+// its node's role (aerolvm-role:<role>, plan §15.2.1). The operator asks
+// for it; the bank's issuer signs it.
+const certRoleSANprefix = "aerolvm-role:"
+
+// ExtractCertRoles returns every role a certificate's URI SANs name. A
+// join by certificate takes exactly one.
+func ExtractCertRoles(cert *x509.Certificate) []string {
+	if cert == nil {
+		return nil
+	}
+	var out []string
+	for _, uri := range cert.URIs {
+		if uri == nil {
+			continue
+		}
+		s := uri.String()
+		if uri.Opaque != "" {
+			s = uri.Scheme + ":" + uri.Opaque
+		}
+		if role, ok := strings.CutPrefix(strings.TrimSpace(s), certRoleSANprefix); ok && strings.TrimSpace(role) != "" {
+			out = append(out, strings.TrimSpace(role))
+		}
+	}
+	return out
 }
 
 // ExtractPeerNodeID returns the node-bound identity from a peer certificate.

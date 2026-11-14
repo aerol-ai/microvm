@@ -12,43 +12,142 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A partitioned node keeps serving: /health ignores cluster membership (readiness gap)
+## An orphaned recreate-policy sandbox answers 410 while it waits for room (API, cluster)
 
-- **What:** a node with no Raft leader, or that is not a Raft member, still
-  answers `/health` with 200, so the ingress keeps routing traffic to it and
-  every request that lands there fails.
-- **Status (2026-10-06):** still open. `handleHealth`
-  (`pkg/api/server.go:146`) answers 200 unless `Service.Health` errors.
-  `Service.Health` (`internal/service/service.go:4434`) only marks the body
-  `"degraded"` for runtime, Caddy, SSH or topology faults
-  (`clusterTopologyErrorFor`, `:4543-4555`), never for "no raft leader" or
-  "not a raft member". No `/ready` route exists anywhere in `pkg/`,
-  `internal/` or `cmd/`.
-- **Measured** (S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). node1 was
-  `active`, `NRestarts=0`, and `/health` = 200, while the cluster's member
-  list held only node2 and node3, node1's own list held only node1, and node1
-  was stuck `entering candidate state`. About one request in three failed
-  across the run (4 of 5 calls to S4's `/v1/audit/verify` returned 502),
-  mostly `cluster: reserve placement failed: cluster: not raft leader`.
-  That partition's cause was the restarted-seed bug, now fixed (see Done).
-  This gap is what turned it into user-visible errors, and it will do the
-  same for any other way a node falls out of the cluster.
-- **Why it matters most:** every one of those reds looks like a bug in
-  whatever test happened to run. A cluster that is degraded but advertising
-  itself as healthy costs the most debugging time per incident.
-- **The fix needs design, not a one-liner.** Failing `/health` when there is
-  no leader would take the whole cluster out of rotation during any routine
-  election. It needs readiness distinct from liveness, a grace period so
-  elections do not flap it, and a decision about whether a partitioned node
-  should still serve reads.
-- **Design exists, unmerged:** PR #522 (branch
-  `origin/plans/kubernetes-ceo-review`) designs `/ready` (decision D8, §5.4:
-  503 when not a Raft member, with an election grace window). The plan on
-  `main` (`plans/kubernetes-deployment.md:146-148`) still says `/health`
-  backs the readiness probe.
-- **Start:** `pkg/api/server.go` health handler, `cfg.EnableCluster` gating,
-  the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
-  PR #522 design.
+- **What:** a `failover.policy=recreate` sandbox orphaned because no node had
+  room when its owner died is now retried until a node has room (R14,
+  `internal/cluster/orphan_recovery.go`, `retryOrphanedRecoveries`). While it
+  waits, `OwnerOf` still returns `ErrOrphaned`, which the API answers as
+  410 Gone (`internal/cluster/client.go`, `OwnerOf`; `internal/cluster/agent.go`,
+  `OwnerOf`). A client reading 410 as "gone for good" may delete it or make
+  a new one.
+- **Why:** R14 made the wait temporary; the answer still says permanent.
+- **Fix sketch:** for an orphan whose hot row has `FailoverRecreate`, answer
+  503 with Retry-After ("waiting for a node with room") instead of 410, in
+  both lookups and in the error classifier. Keep 410 for every other orphan.
+- **Effort:** human S / CC S. **Priority:** P2.
+
+---
+
+## A reused sandbox ID drops the old lifetime's WASM push rows (cleanup obligations)
+
+- **What:** `finalizeStaleLocalSandbox` (`internal/service/service.go`)
+  bulk-deletes the WASM checkpoint push rows of an old lifetime when the ID
+  is reused. Those rows are the only record of manifests in the registry,
+  the same obligation R8 kept when no pusher is configured.
+- **Why:** seen while fixing R8 (#1273); left alone because the path is
+  cluster-sensitive.
+- **Fix sketch:** keep the rows that name a ref until the orphan-ref sweep
+  deletes their manifests, as `wasm_cleanup.go` now does without a pusher.
+- **Effort:** human S / CC S. **Priority:** P2.
+
+---
+
+## The chart does not set shard-aware ingress for more than 10 gateways (ingress)
+
+- **What:** with `SB_CLUSTER_SHARD_AWARE_INGRESS=false` a daemon refuses or
+  degrades above `MaxReplicatedIngressRouteNodes` (10) ingress nodes. The
+  chart sets ingress proxy routing but not shard-aware ingress, and a plain
+  load balancer in front of more than 10 gateways sends most connections to
+  a gateway without the route (`plans/data-plane-load-balancer.md`).
+- **Why:** from the 2026-11-13 review's scale table (100 ingress). The
+  operator now honours `maxReplicas` (#1272), but nothing renders the
+  shard-aware path.
+- **Fix sketch:** a chart value that turns on shard-aware ingress together
+  with a documented shard-aware load balancer contract, refused when
+  gateways exceed 10 without it.
+- **Effort:** human M / CC S. **Priority:** P2.
+
+---
+
+## Advisory cleanups from the 2026-11-13 Kubernetes review (maintainability)
+
+- **What:** six refactors the review marked advisory. None changes behaviour:
+  1. one artefact GC helper (list, reference check, delete) for templates,
+     WASM modules, built and pending images and isolate bundles
+     (`template.go`, `wasm_module_health.go`, `service.go`,
+     `isolate_bundle_gc.go`);
+  2. isolate bundle GC through `startPeriodic` (cancel race, per-tick
+     timeout) instead of its own ticker;
+  3. one artefact-GC settings profile, with overrides only where a TTL must
+     differ, instead of a set of `SB_*_GC_{ENABLED,INTERVAL,TTL}` per runtime;
+  4. the operator's decommission states as a thin driver of the cluster's
+     cordon and evacuate answers (`operator/internal/controller/decommission.go`);
+  5. one `EvacuateRequest`/`EvacuateResult` wire type shared by
+     `operator/internal/aerolapi` and `internal/cluster/decommission.go`;
+  6. drop the one-method `NodeEvacuator` interface if only `*Cluster`
+     implements it.
+- **Why:** the review asks for shared machinery, not merged tables: the
+  separate tables (`firecracker_tap_pool`, `firecracker_vmm_pool`,
+  `container_netns_slots`, `firecracker_templates`, `wasm_modules`,
+  `wasm_state_kv`, `wasm_checkpoint_pushes`) are justified and stay.
+- **Effort:** human M / CC M. **Priority:** P3.
+
+---
+
+## Security addenda from the 2026-11-13 Kubernetes review (Kubernetes, security)
+
+- **What:**
+  - the chart lets `containerdVolume` be a hostPath (`charts/aerolvm/values.yaml`),
+    against the plan's "no hostPath";
+  - signed-image enforcement is an example Kyverno policy, not a chart
+    default;
+  - the pod and Service ranges go to workers as a private default that an
+    egress profile may open (`operator/internal/controller/egress.go`,
+    `setEgressRanges`). The API server's own addresses are in the deny floor,
+    which nothing opens, and since R4 (#1272) a failed discovery no longer
+    leaves that floor empty; what is left is to check that the API server
+    answers on no address found only in the private default;
+  - the worker-pod guard allows a delete when it cannot read the pod's
+    AerolNode (`operator/internal/webhook/podguard.go`). This is intended with
+    `failurePolicy: Ignore`, but it widens what a guard outage allows.
+- **Why:** listed by the review as gaps against plan promises, not new P0s.
+- **Fix sketch:** refuse a hostPath `containerdVolume` unless a bank preset
+  opts out; ship the image policy as an opt-in chart value; a test that every
+  API server address the operator finds lands in the deny floor; record each fail-open in the
+  "lost without decommission" alert's labels.
+- **Effort:** human M / CC S. **Priority:** P2.
+
+---
+
+## A worker's lease renewed without a read covers a sandbox started later (cluster)
+
+- **What:** a worker with no running `failover.policy=recreate` sandbox keeps
+  its ownership lease without asking the leader
+  (`internal/service/ownership_lease.go`, `confirmOwnership`: "nothing to
+  confirm"). If it is cut off from the servers and one of its recreate
+  sandboxes then starts there (a stopped one started again, or a create whose
+  image pull finishes), that sandbox runs on a lease the leader never saw, past
+  the grace, while the leader recreates it elsewhere: two copies.
+- **Why:** found while proving C19 live on kind (2026-11-12). C19's early
+  failover now refuses a node that was not reading until the leader last
+  heard from it, which closes it there except for a node whose recreate
+  sandboxes all stopped within one read interval (about 6 s) of being cut
+  off. The dead-owner grace path reaches it with no such limit, as on main
+  before Phase 2.
+- **Fix sketch:** a renewal without a read must not extend the lease; a
+  recreate sandbox that starts on a node whose lease is older than the lease
+  needs one authoritative read first (one leader round trip, only the first
+  start after the node was idle). That touches the boot path: use
+  `/touch-create-sandbox`.
+- **Effort:** human M / CC S. **Priority:** P1.
+
+---
+
+## The snapshot list is node-local on a cluster (API)
+
+`GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
+answering server's own store; unlike `GET`/`DELETE /v1/snapshots/{id}` it has no
+`snapshotForwardWrap` and no owner fan-out. On a cluster the API usually lands
+on a server or the ingress, which holds no sandboxes, so `aerolvm get snapshots`
+(and the older `aerolvm snapshot` list) shows nothing for snapshots made on
+workers, while get, describe and delete by name work.
+
+Found 2026-11-09 by an unfiltered live run of the kubectl cases (UC-674) on
+cluster-join-token and cluster-rollout-join. UC-674 now skips its list checks on
+a cluster. Fix: page the list across owners the way the sandbox list does
+(`internal/clusterlist`), or list from the Raft artifact catalogue, then drop
+the skip.
 
 ## Destroy events WARN about an already-deleted placement (cluster)
 
@@ -153,7 +252,7 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   `secret_audit_index.go`. An E2b witness sink may double as the central
   store.
 
-## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default flip pending
+## Ingress route changes reset in-flight TLS connections on :443 — IMPLEMENTED behind `SB_INGRESS_PROXY_ROUTING`; default on (Go, install.sh, Terraform null)
 
 - **Shipped 2026-09-28 (#503–#512, released in v0.6.0; design in
   `plans/ingress-proxy-routing.md`):** a static Caddy config, with sandboxd
@@ -171,17 +270,28 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   - UC-172: established sessions survive sandboxd restarts on the ingress
     and the owner.
   - UC-173: no per-sandbox Caddy routes on any node.
-- **Still off by default everywhere (2026-10-06):**
-  `internal/config/config.go:1781`, `setup/config-defaults.md:177`,
-  `Terraform/variables.tf:379-383`, `scripts/install.sh:29`. Only the two
-  t3.medium `-routing` scenarios turn it on. The 2026-10-04 cluster-hetero
-  run behind #595 ran with it off.
-- **Remaining before the default flips on:** a green run of
-  `cluster-bank-flagship` (the metal flagship), which now runs with the flag
-  on and carries the routing gate plus UC-357, and a latency/throughput A/B
-  against the flag-off flagship runs (`plans/ingress-proxy-routing.md:300-301`,
-  `:494-496`). Then the flip is `default_ingress_proxy_routing = true` in
-  `Terraform/variables.tf` plus the `setup/config-defaults.md` row.
+- **The gate moved (`plans/cluster-phase-2.md` §4.2):** from the metal
+  flagship to `cluster-hetero-lite-routing` (8 × t3.medium), with the test
+  binary on one of its server nodes rather than a laptop, so neither the
+  laptop's network nor its SSH and DNS blips are in the numbers
+  (`integration-tests/scripts/run-on-node.sh`). Churn: UC-171 and UC-357
+  with 0 failed connections. A/B: UC-171 records expose-to-first-200 and
+  p50/p99 of fresh-connection requests; run it flag on, flip every node off
+  (`integration-tests/scripts/routing-ab.sh <scenario> off`), run again, flip
+  back, and repeat the pair once (t3 CPU credits add noise). Pass: flag-on
+  p50/p99 no worse than flag-off beyond that noise. The commands are in
+  `integration-tests/README.md`, "Routing gate from inside the VPC".
+- **Default on where it applies:** `internal/config/config.go` defaults the
+  flag on and clears it on a node without a Caddy domain (no ERROR, no
+  probe). `scripts/install.sh` turns it on for a `--domain` install
+  (`--no-ingress-proxy-routing` for off). Terraform's
+  `default_ingress_proxy_routing` is nullable (the owner's answer to
+  `plans/cluster-phase-2.md` §8, question 1): null, the default, passes no
+  flag and renders the same user data as the old default false, so no
+  running node is replaced and new nodes come up on; `true` or `false`
+  passes an explicit flag. `cluster-chaos` pins false (its cases were proven
+  against the page walk); the three routing scenarios set true; every other
+  domain scenario now runs with routing on.
 - **Why it matters (cluster-bank-flagship, 2026-11-01, flag off):** UC-230
   and UC-266 exec-stream dials failed with `unexpected EOF`, 1 run in 20.
   Every create or destroy anywhere in the cluster made both dedicated
@@ -234,6 +344,16 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   until Caddy reloaded with S3 storage at 06:33:35. At the same boundary
   sandboxd got a 500 installing the on-demand TLS policy ("on-demand TLS
   cannot be enabled without a permission module").
+- **Update (2026-11-10):** the 500 was not storage timing. Since Caddy
+  2.10, the TLS app checks automation policies before it turns the
+  deprecated `ask` into a permission, so an on-demand policy behind `ask`
+  alone always failed, and no custom domain got a certificate. Fixed:
+  `EnsureOnDemandTLS` sends the `http` permission module (Caddy 2.8+), POSTs
+  `on_demand` (PUT answered 409 whenever sandboxd restarted under a running
+  Caddy) with a PUT fallback when its parent keys are missing, and appends
+  the policy as a list to `policies/...` so it also works with no list yet.
+  The boot log no longer promises a retry. Proven by `make test-acme-e2e`
+  on Caddy 2.11.9.
 - **Correction (2026-10-06):** that policy is **not** retried on reconcile,
   despite the log line. `pkg/daemon/daemon.go:1006-1007` logs "will retry on
   next reconcile", but `EnsureOnDemandTLS` has only that one boot-time call.
@@ -302,8 +422,9 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   **Cons:** it removes the rollback lever, so do it only after a soak at
   default-on.
 - **Context:** `plans/ingress-proxy-routing.md` §3.6.
-- **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true (still
-  false, see above), plus a soak of about one release cycle.
+- **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true (on in Go
+  and install.sh, still off in Terraform, see above), plus a soak of about
+  one release cycle.
 
 ## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
 
@@ -329,9 +450,18 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 - **Start:** `internal/runtime/containerd/events.go`, then `Reconcile`'s
   missing-runtime branch.
 
-## Isolate orphan sweep survives a daemon restart (runtime) — part 2
+## Isolate orphan sweep survives a daemon restart (runtime) — part 2 — DONE 2026-11-08
 
-- **What:** give `internal/runtime/isolate` a host-backed enumeration so
+- **Done by the WASM/isolate restart work (`fix/kops-wasm-isolate-restart`):**
+  a group host now outlives sandboxd and keeps a record on tmpfs
+  (`pkg/isolate/adopt.go`). At boot `workerdSupervisor.AdoptGroups` takes
+  over the hosts whose workerd still runs and then
+  `pkg/isolate.SweepLeftovers` kills every group-host process (the
+  `aerolvm-isolate-hosts` cgroup, and each `aerolvm-isolate-<key>` jail
+  cgroup) and removes every chroot no adopted host owns. It runs once, at
+  boot, before any spawn, so there is no enumerate-while-spawning race.
+  `Driver.ListManaged` stays the in-memory map: after boot it is complete.
+- **Was:** give `internal/runtime/isolate` a host-backed enumeration so
   `Reconcile`'s orphan sweep can find workerd groups leaked across a
   restart. `Driver.ListManaged` (`internal/runtime/isolate/driver.go:205-213`)
   returns the driver's in-memory `byID` map, and `HostSupervisor`
@@ -639,22 +769,120 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## A cancelled warm-pool park can leave its slot's container (containerd)
+
+- **What:** the containerd warm pool's park path
+  (`internal/runtime/containerd/warm_park.go`) undoes a failed park on the
+  request context, the pattern "fix(containerd): undo a failed create even
+  when its client hung up" removed from `Driver.Create`. A park cancelled
+  mid-way can leave its slot's container until the orphan sweep.
+- **Why it is only a TODO:** slot IDs are fresh (`park-*`), so no create or
+  retry ever collides with one; it costs a container until the sweep, not a
+  failed call.
+- **Status (2026-11-06):** the create-side leftovers this came from are
+  fixed in the parity stack: the undo runs on `undoContext`, and a keyed
+  create that still meets a leftover (a hang-up inside Docker's
+  `/containers/create` or containerd's `NewContainer`) removes it under the
+  create lease and creates again (`internal/service/create_leftover.go`).
+- **Fix:** run the park undo on a context like `undoContext`.
+- **Effort / priority:** S, P3.
+
+---
+
+
+## Enforce the ownership lease when sandboxd is down on a VM (cluster correctness, P1)
+
+- **What:** a small host-side lease watchdog (its own systemd unit, outside
+  `sandboxd`'s cgroup) that stops this node's sandboxes when the ownership lease
+  expires without renewal, plus a regression test that keeps `sandboxd` down past
+  the lease and checks no sandbox runs twice.
+- **Why:** the ownership lease (invariant I1, one executor) is enforced only
+  inside `sandboxd` (`internal/service/ownership_lease.go:193-197`). containerd
+  sandboxes are not in `sandboxd`'s unit cgroup, so they outlive it. After 10
+  crashes in 5 minutes systemd stops restarting `sandboxd`
+  (`scripts/install.sh:2826-2827`), and failover then recreates its `recreate`
+  sandboxes elsewhere while the originals keep running. Found by the outside
+  voice in the 2026-11-10 CEO review of `plans/kubernetes-v2-architecture.md`,
+  whose C7 fixes the same hole for pods.
+- **Pros:** closes a real break of a shipped correctness rule; shares its design
+  with the plan's C7 (the `runtime` supervisor's lease check).
+- **Cons:** one more unit on every node; touches the fragile cluster path.
+- **Effort:** human M / CC S. **Priority:** P1.
+- **Depends on:** nothing. Can share code with C7 when the Kubernetes work starts.
+- **Start:** `internal/service/ownership_lease.go` (`StartOwnershipLease`) and
+  the systemd unit in `scripts/install.sh` (around line 2809). C7's T3 built
+  the pod version to reuse: sandboxd writes `SB_OWNERSHIP_LEASE_FILE`
+  (`internal/ownerlease`), and `internal/supervisor/lease.go` (`LeaseGuard`)
+  freezes `<cgroup parent>/<ref>` when it runs out and thaws only on proof.
+
+---
+
+## Design a pod mode for banks that refuse privileged pods (Kubernetes, P2)
+
+- **What:** a worker mode where each sandbox is its own Kubernetes pod, made
+  through the Kubernetes API or through agent-sandbox underneath, with
+  AerolVM's API, SDKs, sessions and audit on top.
+- **Why:** `plans/kubernetes-v2-architecture.md` §20 says a bank that refuses
+  privileged pods gets "No worker at all". Spike S9 (§8.7, the worker pod in a
+  Kubernetes user namespace) may remove the privileged pod. If it fails, pod
+  mode is the only way such a bank can run AerolVM.
+- **Pros:** no privileged pod; every Kubernetes tool sees each sandbox.
+- **Cons:** loses the speed and density the plan exists for (option A in §5:
+  seconds to start cold, etcd writes per sandbox, 110 pods per machine); rule
+  K5 does not hold in that mode; egress control needs a new home, because
+  there is no worker firewall.
+- **Effort:** design first, human M / CC S. **Priority:** P2.
+- **Depends on:** spike S9's result. Trigger: a bank refuses privileged pods
+  and S9 fails on its machine image.
+
+---
+
+## Propose a controller-class field upstream in agent-sandbox (Kubernetes, P2)
+
+- **What:** open an issue/KEP in `kubernetes-sigs/agent-sandbox` for a
+  `spec.controllerName` class field (precedent: IngressClass, GatewayClass) so
+  several backends can serve `agents.x-k8s.io` objects in one cluster.
+- **Why:** D5 (`plans/kubernetes-deployment.md`, kept by
+  `plans/kubernetes-v2-architecture.md` §16) makes AerolVM serve the
+  agents.x-k8s.io API in place of the upstream controller, and the chart refuses
+  to install next to it.
+  A customer therefore cannot run upstream gVisor sandboxes and AerolVM
+  sandboxes side by side. A class field removes that for every backend (Mitos
+  included) and puts AerolVM in the upstream conversation.
+- **Pros:** removes the main adoption caveat of the facade; SIG Apps visibility.
+- **Cons:** the upstream timeline is out of our control; design discussion, not code.
+- **Effort:** human S / CC S. **Priority:** P2.
+- **Depends on:** the agent-sandbox API (`plans/kubernetes-v2-architecture.md`,
+  C17, Phase 6, CEO review RQ10) existing, so the proposal can cite a real
+  second backend.
+- **Start:** the agent-sandbox issue tracker; cite GatewayClass
+  `controllerName` semantics.
+
+---
+
 ## `aerolvm apply -f` and a manifest shared with the Kubernetes operator (CLI)
 
 - **What:** `aerolvm apply -f sandbox.yaml`, and an `-o yaml` object shape
   (`apiVersion`, `kind`, `metadata`, `spec`, `status`) that is the same as the
-  Kubernetes operator's CRDs, so one YAML file works with `aerolvm apply` and
+  `Sandbox` object AerolVM serves to `kubectl` (`agents.x-k8s.io/v1beta1`,
+  `internal/kubeapi`), so one YAML file works with `aerolvm apply` and
   `kubectl apply`.
 - **Why deferred:** CEO review of `plans/kubectl-style-cluster-ops.md`
-  (D3, 2026-11-07). The format must match the CRD shape the Kubernetes v2
-  plan picks (its Q1: implement `kubernetes-sigs/agent-sandbox` or own CRDs),
-  and that is still open on PR #522. Picking a format first risks a rename
-  that breaks saved files.
-- **Start when:** the Kubernetes v2 plan answers its Q1.
+  (D3, 2026-11-07). The format had to match the CRD shape the Kubernetes v2
+  plan would pick (its Q1: implement `kubernetes-sigs/agent-sandbox` or own
+  CRDs), which was still open on PR #522. Picking a format first risked a
+  rename that breaks saved files.
+- **Status (2026-11-14):** ready to start. The Kubernetes v2 plan picked the
+  agent-sandbox API, and AerolVM serves it (C17 in
+  `plans/kubernetes-v2-architecture.md`, built 2026-11-13). `aerolvm apply`
+  does not exist yet.
 - **Where to start:** `plans/kubectl-style-cluster-ops.md` D12 and §3.3;
-  `cmd/aerolvm/verbs.go` (today's `get` and `create`).
+  `cmd/aerolvm/verbs.go` (today's `get` and `create`); `internal/kubeapi`
+  (the `Sandbox` object's shape).
 
-## External-CA mode for cluster joins (security, cluster PKI)
+---
+
+## External-CA mode for cluster joins on VMs (security, cluster PKI)
 
 - **What:** `sandboxd init --external-ca` keeps the cluster CA key out of
   the cluster. A join then waits as a pending CSR until
@@ -665,14 +893,97 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   already makes joining one line, and this mode can be added later without
   changing it. It would add a pending-CSR record in Raft and a second
   signing path to the riskiest phase.
-- **Start when:** a customer needs the CA key outside the cluster (the
-  Kubernetes v2 plan's D11 asks the same for Kubernetes installs).
+- **Status (2026-11-14):** built for Kubernetes installs only, as C23
+  (`plans/kubernetes-v2-architecture.md` §15.2.1, #1252 to #1258): the
+  bank's issuer signs each pod's certificate through cert-manager, the pod
+  joins with that certificate (`JoinByCert` in
+  `internal/cluster/join_cert.go`), and the CA key never enters the
+  cluster. On VMs it is not built: `sandboxd init --external-ca` works only
+  with `--files-only`, and there is no pending-CSR flow (`aerolvm
+  certificate approve`, `aerolvm get csr`). A VM version can reuse C23's
+  join by certificate instead of a pending CSR in Raft.
+- **Start when:** a customer running on VMs needs the CA key outside the
+  cluster.
 - **Where to start:** `plans/kubectl-style-cluster-ops.md` D5, §4 and §8;
+  `plans/kubernetes-v2-architecture.md` §15.2.1; `cmd/sandboxd/node.go`
+  (`--external-ca`); `internal/cluster/join_cert.go`;
   `internal/cluster/tls.go` (cert checks and reload).
+
+---
 
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### A forwarded control-plane 4xx reaches the API caller as 500 (API) — FIXED
+
+- **What:** when a gateway or worker forwards a control-plane call to a
+  server and the server refuses it with a 4xx, the caller gets HTTP 500
+  with the server's status in the message: "cluster control-plane request
+  failed with status 412: …" (`internal/cluster/agent.go`, `statusError`;
+  the API's error writer does not know that type, so it answers 500).
+- **Why:** seen live in run `c23-extca-3` (2026-11-13): a join-token
+  request in external-CA mode is refused with 412 by the server, and the
+  caller saw 500. The message is right; only the status is wrong, so a
+  client cannot tell a refusal from a fault.
+- **Caveat:** not every forwarded 4xx is the caller's: a 403 "cluster peer
+  not in membership" is between nodes and must stay a 5xx (retryable) to
+  the caller. Pass through only refusals about the request itself (400,
+  404, 409, 412), and keep the rest as they are.
+- **Where to start:** `statusError` in `internal/cluster/agent.go`, and
+  `apihttp.WriteStoreAwareError`, which maps error types to statuses.
+- **Effort:** S. **Priority:** P3.
+- **Fixed** (2026-11-14): `cluster.ForwardedStatus` gives a forwarded
+  refusal about the request (400, 404, 409, 412, 422, 429) its own status,
+  in `cluster.JoinErrorStatus` and `apihttp.Classify`; a 401 or 403 between
+  nodes, "peer not in membership", and every 5xx keep their old answers.
+  Tests: `TestForwardedStatus`, `TestClassifyForwardedRefusal`.
+
+### Decide the agent-sandbox facade's storage and namespace rules (Kubernetes, P2) — DECIDED and BUILT
+
+- **What:** before C17 (`plans/kubernetes-v2-architecture.md` §16, Phase 6) is
+  built, decide (1) where upstream `SandboxTemplate` and `SandboxWarmPool`
+  records live, and (2) which sandboxes `kubectl get sandboxes -n X` shows and
+  what deleting namespace X deletes.
+- **Why:** the 2026-11-10 CEO review (RQ10) moved the facade out of the
+  current phases and added no storage for those records, in Kubernetes or in
+  AerolVM. The founder rule "no facade-specific tables" rules out a
+  Kubernetes-only store inside AerolVM. Upstream puts `SandboxClaim` (one per
+  sandbox) in the same group-version as templates and pools, so the whole
+  group must be served by the aggregated API.
+- **Options seen so far:** internal CRDs in etcd written by the gateways; a new
+  AerolVM FSM kind (breaks the rule); serve only `Sandbox`. On namespaces:
+  show and delete only what was created through the Kubernetes API, or
+  everything the mapped owner has.
+- **Effort:** design only, human S / CC S. **Priority:** P2.
+- **Depends on:** Phase 3 of the Kubernetes plan being done.
+- **Decided** (the user, 2026-11-13): templates and warm pools are
+  Kubernetes CRDs; a namespace shows, and deleting it deletes, all of its
+  owner's sandboxes. Built as C17 (#1233 to #1246); see the plan's §16.1.
+
+### A partitioned node keeps serving: /health ignores cluster membership (readiness gap) — FIXED
+
+- **Was:** a node with no raft leader, or not a raft member, still
+  answered `/health` with 200, so the ingress kept routing traffic to it
+  and every request that landed there failed (about one request in three
+  in S3 `cluster-3-mixed-secrets-kms`, 2026-09-27). Failing `/health`
+  instead would have taken the whole cluster out of rotation during any
+  election.
+- **Fix:** a separate `GET /ready` (Kubernetes v2 plan C1, the first
+  plan's decision D8): `Service.Ready` (`internal/service/ready.go`) is
+  `Health` on a single node; in cluster mode it is 503 when this server is
+  not in the raft configuration or the node has had no proof of a working
+  control plane for longer than `SB_READY_LEADER_GRACE` (10 s, above an
+  election). The proof is `cluster.ControlPlaneContact`
+  (`internal/cluster/readiness.go`): the leader, a follower's last leader
+  contact, or an agent's last successful control-plane call (one shared
+  `Leader` probe when that is older than 6 s). `/health` is unchanged.
+- **Tests:** `TestClusterControlPlaneContact`,
+  `TestAgentControlPlaneContact`, `TestReadinessAgainstRealRaft` in
+  `internal/cluster/readiness_test.go`; `TestServiceReady`;
+  `TestReadyRoute`.
+- **Residual:** nothing probes `/ready` yet: the Kubernetes chart (P3) and
+  the VM installer's `--lb-health-port`, which still serves `/health`.
 
 ### L4 splice drops the response after a client half-close — FIXED (egress P1-0)
 

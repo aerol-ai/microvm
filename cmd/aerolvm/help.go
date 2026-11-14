@@ -21,6 +21,7 @@ Environment (these override "aerolvm login"):
   SB_PAT_TOKEN     API token (required unless you ran "aerolvm login")
   SB_API_TOKEN     the same as SB_PAT_TOKEN; SB_PAT_TOKEN wins if both are set
   SB_TEAM          the team to act for, when your sign-in has several
+  AEROLVM_CONTEXT  the saved context to use (see "aerolvm config")
   AEROLVM_OUTPUT   set to "json" to make --json the default
 
 Output: stdout is data, stderr is everything else. With --json, errors are
@@ -86,6 +87,9 @@ Flags:
                        or comma list): a host, *.domain, host:port or CIDR
   --json               print the sandbox as JSON, plus "created": true|false
 
+A name that is also a kind (nodes, sb, ...) works, with a warning: "aerolvm
+get <name>" lists that kind, so reach the sandbox with "aerolvm get sb <name>".
+
 Examples:
   aerolvm create --name build-box --image python:3.12 --destroy-if-idle 2h
   id=$(aerolvm create --image node:22 --json | jq -r .id)
@@ -107,14 +111,35 @@ Examples:
   aerolvm list --limit 20 --json
 `
 
-const getHelp = `Show one sandbox.
+const getHelp = `List or show sandboxes, snapshots, tokens, join tokens or nodes, like kubectl get.
 
 Usage: aerolvm get <sandbox>
+       aerolvm get <kind> [<name>...] [-o wide|json|yaml|name] [-l SELECTOR]
 
-  --json   print the sandbox object
+Kinds and their short names: sandboxes (sb), snapshots (snap), tokens
+(tok), nodes (no), jointokens (jt). "aerolvm api-resources" lists them. After get, a kind
+lists that kind; any other word is a sandbox, as always, so
+"aerolvm get build-box" prints what it always did. A sandbox named like a
+kind is reached with "aerolvm get sb <name>".
 
-Example:
+Nodes show STATUS like kubectl: Ready or NotReady, plus SchedulingDisabled
+when cordoned and Leader for the Raft leader. Listing nodes needs an admin.
+
+  --json        print JSON: for "get <sandbox>" the sandbox object, as
+                always; for a kind the same as -o json
+  -o FORMAT     kinds only. wide adds columns; json and yaml print the
+                server's objects (one named object bare, else
+                {"<kind>":[...]}); name prints <kind>/<name>
+  -l SELECTOR   sandboxes only: select by tag. k=v and k==v are filtered
+                by sandboxd; k!=v, k (has the tag) and !k (lacks it) here.
+                Comma-separate terms; every one must hold.
+
+Examples:
   aerolvm get build-box --json
+  aerolvm get sb -l app=web,env!=prod -o wide
+  aerolvm get sb build-box -o yaml
+  aerolvm get snapshots
+  aerolvm get nodes -o wide
 `
 
 const execHelp = `Run a command in a sandbox and stream its output.
@@ -125,7 +150,8 @@ One argument after -- runs as a shell command line ("make test | tail");
 several are quoted and joined. Exit code: the command's own, 128+n if a
 signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
 
-For an interactive shell, use "aerolvm shell" instead.
+For an interactive shell, use "aerolvm shell" instead. "exec -it <sandbox>"
+with no command does the same, as kubectl exec -it does.
 
 Stdin is forwarded when it is not a terminal (echo x | aerolvm exec sb -- cat).
 Some agent harnesses leave stdin open forever; pass --no-stdin there or a
@@ -163,18 +189,25 @@ Example:
   aerolvm logs build-box ses-1 --follow
 `
 
-const cpHelp = `Copy a file between this machine and a sandbox.
+const cpHelp = `Copy a file or a folder between this machine and a sandbox.
 
-Usage: aerolvm cp <src> <dst>
+Usage: aerolvm cp [-r] <src> <dst>
+
+  -r, --recursive   copy a folder (as a tar; the sandbox needs tar to copy
+                    one out, and WASM and V8 isolate sandboxes cannot)
 
 A sandbox path is <sandbox>:<path>. "-" is stdin (as src) or stdout (as dst).
-Files stream; size doesn't matter. Directories are not supported yet (use
-tar through exec).
+Files stream; size doesn't matter. With -r, a destination that is an
+existing folder (or, in the sandbox, ends with "/") gets the folder inside
+it; any other destination becomes the copy. A folder copied out is checked
+entry by entry: nothing can be written outside the destination.
 
 Examples:
   aerolvm cp ./data.csv build-box:/work/data.csv
   aerolvm cp build-box:/work/report.html ./report.html
   aerolvm cp build-box:/var/log/app.log - | tail
+  aerolvm cp -r ./src build-box:/work/
+  aerolvm cp -r build-box:/work/out ./results
 `
 
 const lsHelp = `List a directory in a sandbox.
@@ -422,6 +455,166 @@ Usage: aerolvm logout [--json]
 const versionHelp = `Print the aerolvm version.
 
 Usage: aerolvm version [--json]
+       aerolvm version --server
+       aerolvm version -o json
+
+Plain "aerolvm version" (and "aerolvm --version") prints the client's
+version and nothing else, without calling sandboxd.
+
+  --json      {"version":"<client>"}
+  --server    also ask sandboxd (the login or SB_API_URL, like any command)
+              and print "Client Version: ..." and "Server Version: ..."
+  -o json     {"client":"...","server":"..."}
+
+With --server or -o json, a sandboxd that can't be reached still prints the
+client's half, then the error, and exits 1.
+`
+
+const describeHelp = `Show one sandbox, snapshot, token or node in detail, like kubectl describe.
+
+Usage: aerolvm describe <kind> <name> [-o json|yaml]
+       aerolvm describe <sandbox>
+
+Kinds: sandboxes (sb), snapshots (snap), tokens (tok), nodes (no). A word
+that is not a kind is a sandbox.
+
+A node shows role, status, version, Raft voter and leader, addresses,
+labels, and how many sandboxes it owns and runs. "Sandboxes running" comes
+from the node's last capacity heartbeat; with none fresh it says unknown
+and gives the owned count as the most there could be. Nodes need an admin.
+
+A token is named by its ID (tok_...) or its name; a name used in several
+teams describes each.
+
+Examples:
+  aerolvm describe sb build-box
+  aerolvm describe node wrk-1
+`
+
+const cordonHelp = `Stop new sandboxes landing on nodes. Sandboxes already there keep running.
+
+Usage: aerolvm cordon <name>...
+
+Prints node/<name> cordoned. Safe to repeat. Needs an admin.
+`
+
+const uncordonHelp = `Let new sandboxes land on nodes again.
+
+Usage: aerolvm uncordon <name>...
+
+Prints node/<name> uncordoned. Safe to repeat. Needs an admin.
+`
+
+const drainHelp = `Cordon a node, then wait until it runs no sandboxes.
+
+Usage: aerolvm drain <name> [--timeout 10m] [--delete-sandboxes] [--migrate] [--evacuate]
+
+Without flags, drain waits for the node's own users to stop or destroy
+their sandboxes. It reads the node's counts each poll (GET
+/v1/cluster/nodes/{id}), so it never pages the fleet's sandbox list.
+
+Flags:
+  --timeout D          give up after D (default 10m; 0 waits forever).
+                       The node stays cordoned either way. Exit 1 on timeout.
+  --delete-sandboxes   destroy every sandbox the node owns, running or
+                       stopped, and wait until it owns none
+  --migrate            first move the node's WASM sandboxes to another ready
+                       worker with live migration
+  --evacuate           move the node's failover.policy=recreate sandboxes to
+                       other workers (stop here, start there, same ID and
+                       link); the owners of the rest are told it is going
+  --json               print {"node_id","cordoned","drained","migrated","evacuated","deleted"}
+
+Examples:
+  aerolvm drain wrk-2 --timeout 30m
+  aerolvm drain wrk-2 --migrate --delete-sandboxes
+  aerolvm drain wrk-2 --evacuate --timeout 30m
+`
+
+const deleteHelp = `Delete sandboxes, snapshots, tokens, join tokens or nodes, like kubectl delete.
+
+Usage: aerolvm delete <kind> <name>... [--force]
+
+Kinds: sandboxes (sb), snapshots (snap), tokens (tok), nodes (no),
+jointokens (jt; delete revokes them). Unlike
+get, delete always needs the kind, so a typo never deletes a sandbox. Each
+prints <kind> "<name>" deleted. One that is already gone counts as deleted
+(exit 0), so a retry never fails.
+
+  sandbox    the same as aerolvm destroy, with the same --json results
+  snapshot   deletes the snapshot image
+  token      revokes the token; name it by ID (tok_...), never by name
+  node       works for every role. A Raft server leaves the Raft
+             configuration. A worker or ingress node is cordoned, its
+             sandboxes are handed to other workers when they asked for
+             failover, or else marked lost, and its ID is denied: other
+             nodes refuse its calls and its gossip until it joins again as
+             a new node. Drain it first; deleting a live node that still
+             owns sandboxes needs --force. Needs an admin.
+
+Examples:
+  aerolvm delete sb build-box
+  aerolvm drain wrk-2 --delete-sandboxes && aerolvm delete node wrk-2
+`
+
+const apiResourcesHelp = `List the kinds get, describe and delete take, with their short names.
+
+Usage: aerolvm api-resources [-o wide|json|yaml|name]
+
+  -o wide   add the verbs each kind takes
+  -o name   print only the kind names
+
+It asks no server: the kinds are this aerolvm's.
+`
+
+const topHelp = `Show the CPU and memory each node has reserved for sandboxes, like kubectl top.
+
+Usage: aerolvm top nodes [<name>...] [-o json|yaml]
+
+CPU% and MEMORY% are of the node's budget: what sandboxd may hand out
+after overcommit. Placement decides on these reservations, so they say
+whether the next sandbox fits. The numbers come from each node's last
+capacity heartbeat; a node with none fresh shows -. On a single node (no
+cluster), the one row is named after the API host. Needs an admin in a
+cluster.
+
+Example:
+  aerolvm top nodes
+`
+
+const clusterInfoHelp = `Show where sandboxd runs, its version, the Raft leader, the members by role,
+and the cluster version (the lowest FSM ops version a live member runs).
+
+Usage: aerolvm cluster-info [--json]
+
+Needs an admin.
+`
+
+const configHelp = `List and switch saved contexts: one login per cluster.
+
+Usage: aerolvm config get-contexts
+       aerolvm config current-context
+       aerolvm config use-context <name>
+       aerolvm config rename-context <old> <new>
+       aerolvm config delete-context <name>
+       aerolvm config view
+       aerolvm config import <file> [--name N] [--use]
+
+"aerolvm login <url> [--name N]" saves a context, named after the host
+unless --name says otherwise, and makes it current. Contexts live in
+contexts.json beside config.json; config.json always holds the current one,
+so older aerolvm versions keep working. view never prints a token. import
+reads a login file (api_url, token, optional name and team) or another
+contexts.json; it becomes current when there is none, or with --use.
+
+Every command takes --context <name>. Which login a command uses, first
+match wins: --context, then SB_PAT_TOKEN / SB_API_URL, then AEROLVM_CONTEXT,
+then the current context.
+
+Examples:
+  aerolvm login https://api.staging.example.com --name staging
+  aerolvm config use-context prod
+  aerolvm get nodes --context staging
 `
 
 const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked, or

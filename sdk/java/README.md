@@ -110,6 +110,23 @@ ExecExitInfo exit = handle.waitForExit();
 System.out.println(exit.code);
 ```
 
+## Watching Files
+
+Works on gVisor and Firecracker sandboxes; others answer 501.
+
+```java
+import ai.aerol.microvm.FileWatchHandle;
+import ai.aerol.microvm.model.WatchOptions;
+
+FileWatchHandle watch = sandbox.watchFiles(
+    "/workspace",
+    new WatchOptions().setRecursive(true),
+    event -> System.out.println(event.type + " " + event.path)
+);
+// ... later
+watch.stop();
+```
+
 ## Sessions
 
 ```java

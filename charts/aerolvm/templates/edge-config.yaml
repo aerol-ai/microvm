@@ -1,0 +1,65 @@
+{{- if .Values.edge.enabled }}
+{{- if not .Values.edge.domain }}
+{{- fail "edge.enabled needs edge.domain: sandbox links are https://<id>-<port>.<domain>" }}
+{{- end }}
+{{- if not (or .Values.edge.certManager.issuerRef.name .Values.edge.existingTLSSecret) }}
+{{- fail "edge.enabled needs a certificate: set edge.certManager.issuerRef.name (cert-manager issues it) or edge.existingTLSSecret" }}
+{{- end }}
+# The edge container's Caddyfile (C25): the same sites install.sh writes for
+# a domain install (scripts/install.sh write_caddyfile), with the wildcard
+# certificate loaded from the Secret cert-manager keeps renewed instead of
+# issued over DNS, so no pod holds a DNS provider token. caddy-l4 owns :443
+# (sandboxd configures it); these sites take its SNI fallback on
+# 127.0.0.1:8443. The @api matcher stays in step with sandboxd's public
+# routes (pkg/api TestCaddyForwardsEveryPublicRoute reads this file).
+# Custom domains keep Caddy's on-demand TLS: sandboxd installs that policy
+# over the admin API, as on a VM. Their certificates live in /data, an
+# emptyDir, so they are issued again after the pod is replaced.
+{{- $namespaces := list .Release.Namespace }}
+{{- if and (eq .Values.mode "cluster") (ne .Values.cluster.workerNamespace .Release.Namespace) }}
+{{- /* Worker pods mount it too, and a ConfigMap volume is namespaced. */}}
+{{- $namespaces = append $namespaces .Values.cluster.workerNamespace }}
+{{- end }}
+{{- range $i, $ns := $namespaces }}
+{{- with $ }}
+{{- if $i }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aerolvm.name" . }}-edge
+  namespace: {{ $ns }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+data:
+  Caddyfile: |
+    {
+    	admin localhost:2019
+    	auto_https disable_redirects
+    }
+
+    https://{{ .Values.edge.domain }}:8443 {
+    	bind 127.0.0.1
+    	tls /etc/aerolvm/tls/tls.crt /etc/aerolvm/tls/tls.key
+    	@api path /health /ready /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /ui /ui/* /.well-known/aerolvm-auth /.well-known/oauth-protected-resource* /.well-known/openid-configuration /.well-known/jwks.json
+    	handle @api {
+    		reverse_proxy 127.0.0.1:21212 {
+    			stream_close_delay 10m
+    		}
+    	}
+    	handle {
+    		respond "Sandbox API not found" 404
+    	}
+    }
+
+    https://*.{{ .Values.edge.domain }}:8443 {
+    	bind 127.0.0.1
+    	tls /etc/aerolvm/tls/tls.crt /etc/aerolvm/tls/tls.key
+    	respond "Sandbox not found" 404 {
+    		close
+    	}
+    }
+{{- end }}
+{{- end }}
+{{- end }}

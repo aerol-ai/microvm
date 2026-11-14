@@ -41,6 +41,13 @@ func runExec(ctx context.Context, a *app, args []string) int {
 	}
 	words := append(pos[1:], rest...)
 	if len(words) == 0 {
+		// kubectl's `exec -it <pod>` habit with nothing to run: the
+		// sandbox's own shell, the one `aerolvm shell` opens (plan §3.3).
+		// Any flag that only means something for a command keeps the old
+		// usage error, so nothing typed is silently dropped.
+		if interactive && tty && cwd == "" && len(env) == 0 && timeout == 0 && !background && !noStdin {
+			return a.openShell(ctx, c, pos[0], "", false)
+		}
 		a.usageError(c, "exec", "no command given after --")
 		return execFailure
 	}

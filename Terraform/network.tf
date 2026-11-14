@@ -165,6 +165,28 @@ resource "aws_security_group_rule" "cluster_internal_tcp" {
   description       = "Cluster-internal TCP ${each.key} (raft / gossip / mTLS)"
 }
 
+# The join port (plans/kubectl-style-cluster-ops.md eng D3): TCP 7003 on
+# server nodes only, from inside the VPC. A machine that is joining has no
+# cert yet, so the port takes calls without one; only servers open it, and
+# this SG is attached only to them (nodes.tf).
+resource "aws_security_group" "join" {
+  name        = "${var.cluster_name}-join"
+  description = "AerolVM join port 7003 (server nodes only)"
+  vpc_id      = aws_vpc.this.id
+
+  tags = { Name = "${var.cluster_name}-join" }
+}
+
+resource "aws_security_group_rule" "join_port" {
+  type              = "ingress"
+  security_group_id = aws_security_group.join.id
+  protocol          = "tcp"
+  from_port         = 7003
+  to_port           = 7003
+  cidr_blocks       = [var.vpc_cidr]
+  description       = "Join port 7003 (servers only; no client cert)"
+}
+
 resource "aws_security_group_rule" "cluster_internal_udp" {
   for_each          = toset([for p in var.cluster_internal_udp_ports : tostring(p)])
   type              = "ingress"

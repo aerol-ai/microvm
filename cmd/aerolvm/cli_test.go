@@ -549,7 +549,9 @@ func TestCpAndLs(t *testing.T) {
 			t.Fatalf("%v = %d, want usage", args, code)
 		}
 	}
-	if code := h.run("cp", dir, "box:/x"); code != exitError || !strings.Contains(h.stderr.String(), "tar") {
+	// A folder without -r points at cp -r, which replaced the tar hint
+	// (plan F3, X4).
+	if code := h.run("cp", dir, "box:/x"); code != exitError || !strings.Contains(h.stderr.String(), "cp -r") {
 		t.Fatalf("directory upload = %d %q", code, h.stderr.String())
 	}
 	if code := h.run("cp", "box:/missing", out); code != exitError {

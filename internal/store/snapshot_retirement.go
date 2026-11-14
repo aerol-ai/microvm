@@ -10,10 +10,10 @@ import (
 )
 
 // SnapshotRegistryRetirement is the obligation to remove one registry copy
-// of a snapshot that no longer exists on this node: the manifest at
-// RegistryRef@Digest. OwnerRef and Name are the snapshot it was pushed for,
-// so the worker can tell when a re-created snapshot of the same name still
-// has a push to land.
+// of a snapshot or template that no longer exists on this node: the
+// manifest at RegistryRef@Digest. OwnerRef and Name are the snapshot it was
+// pushed for (for a template: no owner, and its id), so the worker can tell
+// when a row of that name still has a push to land.
 type SnapshotRegistryRetirement struct {
 	RegistryRef string
 	Digest      string
@@ -74,6 +74,45 @@ func (s *Store) DeleteSnapshotRetiringRegistryCopy(ctx context.Context, ownerRef
 	return nil
 }
 
+// DeleteTemplateRetiringRegistryCopy deletes a template row and, in the same
+// transaction, records the obligation to retire its registry copy (the
+// manifest at registry_ref@push_digest), as DeleteSnapshotRetiringRegistryCopy
+// does for a snapshot. Without it a deleted template's pushed image stayed
+// in the registry for good. A row never pushed, or pushed without a digest,
+// records nothing: such a copy can only be addressed by tag. A push that
+// completes after the delete finds the row gone and records its own
+// obligation (ScheduleSnapshotRegistryRetirement).
+func (s *Store) DeleteTemplateRetiringRegistryCopy(ctx context.Context, id string) (retErr error) {
+	id = strings.TrimSpace(id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("delete template: begin: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	var ref, digest string
+	err = tx.QueryRowContext(ctx, `SELECT registry_ref, push_digest FROM firecracker_templates WHERE id = ?`, id).Scan(&ref, &digest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("delete template: read row: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM firecracker_templates WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete template: %w", err)
+	}
+	if err := scheduleRetirement(ctx, tx, SnapshotRegistryRetirement{RegistryRef: ref, Digest: digest, Name: id}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete template: commit: %w", err)
+	}
+	return nil
+}
+
 // ScheduleSnapshotRegistryRetirement records a retirement obligation. An
 // obligation already recorded for the same manifest is left as it is.
 func (s *Store) ScheduleSnapshotRegistryRetirement(ctx context.Context, r SnapshotRegistryRetirement) error {
@@ -105,7 +144,7 @@ func (s *Store) ListDueSnapshotRegistryRetirements(ctx context.Context, now time
 	if limit <= 0 {
 		return nil, errors.New("list snapshot registry retirements: limit must be positive")
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT registry_ref, digest, owner_ref, name, scheduled_at, attempts, last_error
 		FROM snapshot_registry_retirements
 		WHERE scheduled_at <= ?
@@ -131,17 +170,24 @@ func (s *Store) ListDueSnapshotRegistryRetirements(ctx context.Context, now time
 }
 
 // SnapshotRegistryCopyInUse answers the two questions asked before a copy
-// is retired. inUse: a snapshot row on this node still names this exact
-// manifest (ref and digest) — the obligation is void. pushPending: a row of
-// the same owner and name has a push still to land (pending, pushing or
-// error), which can put this very digest back under the tag — wait for it.
+// is retired. inUse: a snapshot or template row on this node still names
+// this exact manifest (ref and digest) — the obligation is void.
+// pushPending: a row of the same owner and name (for a template: no owner,
+// and its id) has a push still to land (pending, pushing or error), which
+// can put this very digest back under the tag — wait for it. A snapshot
+// and a template that share a name only make an obligation wait.
 func (s *Store) SnapshotRegistryCopyInUse(ctx context.Context, registryRef, digest, ownerRef, name string) (inUse, pushPending bool, err error) {
-	err = s.db.QueryRowContext(ctx, `
+	registryRef, digest = strings.TrimSpace(registryRef), strings.TrimSpace(digest)
+	ownerRef, name = strings.TrimSpace(ownerRef), strings.TrimSpace(name)
+	err = s.rdb.QueryRowContext(ctx, `
 		SELECT
-			EXISTS (SELECT 1 FROM sandbox_snapshots WHERE image_registry_ref = ? AND image_digest = ?),
+			EXISTS (SELECT 1 FROM sandbox_snapshots WHERE image_registry_ref = ? AND image_digest = ?)
+				OR EXISTS (SELECT 1 FROM firecracker_templates WHERE registry_ref = ? AND push_digest = ?),
 			EXISTS (SELECT 1 FROM sandbox_snapshots WHERE owner_ref = ? AND name = ?
 				AND push_state IN ('pending', 'pushing', 'error'))
-	`, strings.TrimSpace(registryRef), strings.TrimSpace(digest), strings.TrimSpace(ownerRef), strings.TrimSpace(name)).Scan(&inUse, &pushPending)
+				OR (? = '' AND EXISTS (SELECT 1 FROM firecracker_templates WHERE id = ?
+					AND push_state IN ('pending', 'pushing', 'error')))
+	`, registryRef, digest, registryRef, digest, ownerRef, name, ownerRef, name).Scan(&inUse, &pushPending)
 	if err != nil {
 		return false, false, fmt.Errorf("check snapshot registry copy: %w", err)
 	}

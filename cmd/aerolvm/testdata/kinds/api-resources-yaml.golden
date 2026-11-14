@@ -1,0 +1,50 @@
+exit 0
+--- stdout
+resources:
+    - kind: JoinToken
+      name: jointokens
+      short_names:
+        - jt
+        - join-token
+        - join-tokens
+      singular_name: jointoken
+      verbs:
+        - get
+        - delete
+    - kind: Node
+      name: nodes
+      short_names:
+        - "no"
+      singular_name: node
+      verbs:
+        - get
+        - describe
+        - delete
+    - kind: Sandbox
+      name: sandboxes
+      short_names:
+        - sb
+      singular_name: sandbox
+      verbs:
+        - get
+        - describe
+        - delete
+    - kind: Snapshot
+      name: snapshots
+      short_names:
+        - snap
+      singular_name: snapshot
+      verbs:
+        - get
+        - describe
+        - delete
+    - kind: Token
+      name: tokens
+      short_names:
+        - tok
+      singular_name: token
+      verbs:
+        - get
+        - describe
+        - delete
+--- stderr

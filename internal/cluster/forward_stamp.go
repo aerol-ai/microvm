@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -49,7 +51,73 @@ const (
 	// it only with the operator token, on the sandbox's sessions routes,
 	// for the sandbox the path names.
 	HeaderSSHGateway = "X-Cluster-Ssh-Gateway"
+	// HeaderRouteHint marks a forward whose target came from the edge's
+	// owner cache (owner_cache.go), not from a lookup the edge just made. Its
+	// value is a random token the edge made for this one request. The
+	// receiver serves the request only when its own lookup says it owns the
+	// sandbox; otherwise it answers 421 with HeaderNotOwner set to the same
+	// token. Like every X-Cluster-* header it is honoured only from a live
+	// mTLS peer, and StampForward sets it only from the request context
+	// (ContextWithRouteHint), never from a header that came in.
+	HeaderRouteHint = "X-Cluster-Route-Hint"
+	// HeaderNotOwner is the response header of that 421 ("not here"). It
+	// echoes the request's HeaderRouteHint token. The edge routes the call
+	// again only on a 421 carrying its own token, so a 421 from anything
+	// else (the sandbox's own server behind a toolbox route, a node on an
+	// older build) reaches the caller as it is and never causes a second
+	// send. The receiver drops the hint header before any handler runs, so
+	// nothing behind it can learn the token.
+	HeaderNotOwner = "X-Cluster-Not-Owner"
+	// HeaderOwnerEpoch carries the placement's OwnerEpoch the edge read when
+	// it chose the target (invariant I2, plan C4 part 4): from a lookup it
+	// just made, or from its owner-cache entry. The owner compares it with
+	// its own reading and turns down a cache-routed forward that is older
+	// (HeaderNotOwner). Like every X-Cluster-* header it is honoured only
+	// from a live mTLS peer, and StampForward sets it only from the request
+	// context (ContextWithOwnerEpoch).
+	HeaderOwnerEpoch = "X-Cluster-Owner-Epoch"
 )
+
+type ownerEpochCtxKey struct{}
+
+// ContextWithOwnerEpoch records the owner epoch the edge read for the
+// forwards made under ctx. 0 records nothing.
+func ContextWithOwnerEpoch(ctx context.Context, epoch uint64) context.Context {
+	if epoch == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ownerEpochCtxKey{}, epoch)
+}
+
+// OwnerEpochFromContext is the epoch ContextWithOwnerEpoch recorded, or 0.
+func OwnerEpochFromContext(ctx context.Context) uint64 {
+	epoch, _ := ctx.Value(ownerEpochCtxKey{}).(uint64)
+	return epoch
+}
+
+// ForwardedOwnerEpoch reads HeaderOwnerEpoch from a forward. 0: absent or
+// malformed (an edge on an older build), which the owner treats as unknown.
+func ForwardedOwnerEpoch(h http.Header) uint64 {
+	epoch, err := strconv.ParseUint(strings.TrimSpace(h.Get(HeaderOwnerEpoch)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return epoch
+}
+
+type routeHintCtxKey struct{}
+
+// ContextWithRouteHint marks the forwards made under ctx as routed from the
+// owner cache, with token as the request's HeaderRouteHint.
+func ContextWithRouteHint(ctx context.Context, token string) context.Context {
+	return context.WithValue(ctx, routeHintCtxKey{}, token)
+}
+
+// RouteHintFromContext is the token ContextWithRouteHint recorded, or "".
+func RouteHintFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(routeHintCtxKey{}).(string)
+	return token
+}
 
 // PAT origins carried in HeaderPATOrigin.
 const (
@@ -109,6 +177,16 @@ func PATOriginFromContext(ctx context.Context) string {
 //     the SSH gateway bridged for a sandbox key holder (the context carries
 //     auditlog.SSHGatewayCall). Removed from every other request, the same
 //     way as HeaderSurface.
+//   - HeaderRouteHint, when the edge routed the request from its owner
+//     cache (ContextWithRouteHint). Removed from every other request, the
+//     same way as HeaderSurface.
+//   - HeaderOwnerEpoch, the owner epoch the edge read for its target
+//     (ContextWithOwnerEpoch). Removed from every other request.
+//   - HeaderCaller, for a request a local tool made with this node's own
+//     token (ContextWithLocalCaller): the credential, which no peer would
+//     accept, is dropped, and the edge node speaks for the call
+//     (stampCaller, peer_cert_auth.go). Removed from every other request.
+//     Call it after the credential is set on a fresh request.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
@@ -151,6 +229,17 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	} else {
 		out.Header.Del(HeaderSSHGateway)
 	}
+	if token := RouteHintFromContext(out.Context()); token != "" {
+		out.Header.Set(HeaderRouteHint, token)
+	} else {
+		out.Header.Del(HeaderRouteHint)
+	}
+	if epoch := OwnerEpochFromContext(out.Context()); epoch != 0 {
+		out.Header.Set(HeaderOwnerEpoch, strconv.FormatUint(epoch, 10))
+	} else {
+		out.Header.Del(HeaderOwnerEpoch)
+	}
+	stampCaller(out, access)
 	auditlog.MarkForwarded(out.Context())
 }
 

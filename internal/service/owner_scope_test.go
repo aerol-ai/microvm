@@ -8,6 +8,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 func userCtx(owner string) context.Context {
@@ -56,6 +57,36 @@ func TestEnforceOwner(t *testing.T) {
 	// A user token never matches an owner-less (operator-created) sandbox.
 	if err := enforceOwner(userCtx("acme"), &models.Sandbox{ID: "sb2", OwnerRef: ""}); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("owner-less sandbox vs user: got %v, want ErrNotFound", err)
+	}
+	// A sandbox token for an operator-made sandbox has an empty owner, like
+	// every other operator-made sandbox: it still reaches only its own.
+	tokenCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Principal:    controlplane.Principal{Kind: controlplane.PrincipalSandboxToken, ID: "stk_1"},
+		SandboxToken: &sandboxtoken.Claims{SandboxID: "sb2"},
+	})
+	if err := enforceOwner(tokenCtx, &models.Sandbox{ID: "sb2", OwnerRef: ""}); err != nil {
+		t.Fatalf("a sandbox token on its own sandbox: %v", err)
+	}
+	if err := enforceOwner(tokenCtx, &models.Sandbox{ID: "sb3", OwnerRef: ""}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a sandbox token on another owner-less sandbox: got %v, want ErrNotFound", err)
+	}
+	// A revoke refuses a token issued before the row's not-before, and only
+	// a sandbox token: other callers never carry an issue time.
+	issuedAt := func(iat int64) context.Context {
+		return controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+			Principal:    controlplane.Principal{Kind: controlplane.PrincipalSandboxToken, ID: "stk_1"},
+			SandboxToken: &sandboxtoken.Claims{SandboxID: "sb2", IssuedAt: iat},
+		})
+	}
+	revoked := &models.Sandbox{ID: "sb2", OwnerRef: "", TokensNotBefore: 100}
+	if err := enforceOwner(issuedAt(99), revoked); !errors.Is(err, ErrSandboxTokenRevoked) {
+		t.Fatalf("a token from before the revoke: got %v, want ErrSandboxTokenRevoked", err)
+	}
+	if err := enforceOwner(issuedAt(100), revoked); err != nil {
+		t.Fatalf("a token from the not-before second: %v", err)
+	}
+	if err := enforceOwner(operatorCtx(), revoked); err != nil {
+		t.Fatalf("the operator on a revoked sandbox: %v", err)
 	}
 }
 

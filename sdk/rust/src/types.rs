@@ -134,6 +134,16 @@ pub struct PlatformVolumeMount {
     pub path: String,
     #[serde(rename = "read_only", skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// `Some(true)` deletes the volume (its files and its record) once the
+    /// last sandbox using it is deleted. It is set when the volume is first
+    /// made; a later sandbox naming the same volume must pass the same value,
+    /// or the create fails with HTTP 409. `None` is `false`: the volume
+    /// outlives its sandboxes.
+    #[serde(
+        rename = "delete_with_sandbox",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delete_with_sandbox: Option<bool>,
 }
 
 /// GPU hardware vendor for sandbox GPU allocation.
@@ -275,6 +285,11 @@ pub struct CreateOptions {
     /// cluster recreation from the replicated create spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<Failover>,
+    /// Limit which nodes may run the sandbox, by zone and node labels. Kept
+    /// on failover. No matching node fails the create with 409
+    /// `placement_unsatisfiable`; it never falls back to another node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementRule>,
     /// Container runtime for this sandbox. Omit to inherit the host default
     /// (SB_CONTAINER_RUNTIME). Use `"gvisor"` for runsc-backed isolation when
     /// running untrusted workloads. `"kata"` is reserved and rejected by the
@@ -309,6 +324,100 @@ pub struct CreateOptions {
     /// Ignored by other runtimes.
     #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// A short-lived cloud identity token for the sandbox (AWS, GCP,
+    /// Azure). The role tag must be on your team's allow list
+    /// ([`Client::put_identity_role`](crate::Client::put_identity_role)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityOptions>,
+}
+
+/// A cloud identity for a sandbox. The server signs a one-hour token whose
+/// subject is your team and `role_tag`, writes it to
+/// `/run/aerolvm/identity/token` inside the sandbox and refreshes it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityOptions {
+    pub role_tag: String,
+    /// The token's `aud`; empty means `"sts.amazonaws.com"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub audience: String,
+    /// Also sets `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` for the AWS SDKs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub aws_role_arn: String,
+    /// Set both to give the Azure SDKs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
+    /// and `AZURE_FEDERATED_TOKEN_FILE`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub azure_client_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub azure_tenant_id: String,
+}
+
+/// A sandbox's cloud identity as `get` shows it. Never the token.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxIdentity {
+    pub role_tag: String,
+    pub audience: String,
+    /// The token's `sub`: what your cloud's trust policy matches.
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_role_arn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_tenant_id: Option<String>,
+    pub token_file: String,
+    /// When the token now in the sandbox expires; `None` until the first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// One role tag on a team's identity allow list.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRole {
+    pub tag: String,
+    /// The least caller role that may create a sandbox with this tag:
+    /// `"runner"` or `"admin"`.
+    pub min_role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// The body of `put_identity_role`, and the team it changes (`None` is the
+/// operator namespace: sandboxes the operator token creates).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRoleOptions {
+    pub min_role: String,
+    pub team: Option<String>,
+}
+
+/// Paging for `list_identity_roles`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListIdentityRolesOptions {
+    pub team: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One page of a team's identity allow list.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityRoleList {
+    #[serde(default, deserialize_with = "null_as_empty_roles")]
+    pub roles: Vec<IdentityRole>,
+    /// Pass back as `cursor` for the next page; absent on the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn null_as_empty_roles<'de, D>(d: D) -> Result<Vec<IdentityRole>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<IdentityRole>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -339,6 +448,26 @@ pub struct Lifecycle {
     /// window.
     #[serde(default, skip_serializing_if = "is_false")]
     pub serverless: bool,
+    /// Starts the sandbox again when it crashes or runs out of memory,
+    /// waiting 5 s, then 10 s, 20 s and so on up to 5 minutes; the wait goes
+    /// back to 5 s after 10 minutes of running. Docker, gVisor and
+    /// containerd sandboxes only (others answer 400).
+    #[serde(rename = "restart_on_failure", default, skip_serializing_if = "is_false")]
+    pub restart_on_failure: bool,
+    /// Deletes the sandbox this long (nanoseconds) after its main program
+    /// ends; checked about once a minute. Not for WebAssembly or V8-isolate
+    /// sandboxes (400).
+    #[serde(
+        rename = "destroy_after_exit_for",
+        default,
+        skip_serializing_if = "is_zero_u64"
+    )]
+    pub destroy_after_exit_for: u64,
+    /// Deletes the sandbox at this clock time, an RFC 3339 string such as
+    /// `"2026-11-06T18:00:00Z"`. The server turns it into `destroy_at_age`,
+    /// which is what the sandbox shows; a past time is refused with a 400.
+    #[serde(rename = "destroy_at", default, skip_serializing_if = "Option::is_none")]
+    pub destroy_at: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -351,6 +480,18 @@ pub type UpdateLifecycleOptions = Lifecycle;
 pub struct Failover {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy: String,
+}
+
+/// Where a sandbox may run in a cluster. Every field you set must match the
+/// node's labels exactly.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlacementRule {
+    /// Run only on nodes in this zone (the node's `SB_NODE_ZONE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// Run only on nodes that have all of these labels (`SB_NODE_LABELS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -510,23 +651,59 @@ impl Default for ExposeProtocol {
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ExposeOptions {
     pub protocol: ExposeProtocol,
+    /// Who can open the URL. `None` sends nothing: a new port is public and
+    /// an exposed port keeps what it has. Pass a value to change it.
+    pub visibility: Option<ExposeVisibility>,
+}
+
+/// Who can open a port's URL. `Token` makes it need a sandbox token for
+/// that port (`sandbox.create_token` with `port`); HTTP ports on a server
+/// with a domain only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeVisibility {
+    Public,
+    Token,
+}
+
+impl ExposeVisibility {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExposeVisibility::Public => "public",
+            ExposeVisibility::Token => "token",
+        }
+    }
 }
 
 impl ExposeOptions {
     pub fn http() -> Self {
         Self {
             protocol: ExposeProtocol::Http,
+            visibility: None,
         }
     }
     pub fn tcp() -> Self {
         Self {
             protocol: ExposeProtocol::Tcp,
+            visibility: None,
         }
     }
     pub fn tls() -> Self {
         Self {
             protocol: ExposeProtocol::Tls,
+            visibility: None,
         }
+    }
+    /// An HTTP port whose URL needs a sandbox token.
+    pub fn token() -> Self {
+        Self {
+            protocol: ExposeProtocol::Http,
+            visibility: Some(ExposeVisibility::Token),
+        }
+    }
+    /// Sets who can open the URL.
+    pub fn with_visibility(mut self, visibility: ExposeVisibility) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 }
 
@@ -548,8 +725,27 @@ pub enum ExposeResult {
     },
 }
 
+/// Everything an expose call reports, including who can open the URL.
+/// [`Client::expose_port_info`](crate::Client::expose_port_info) returns it.
+/// It exists beside [`ExposeResult`] because that enum's variants have no
+/// room for the visibility: adding a field to them would break every match
+/// on `ExposeResult::Http { url }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExposePortInfo {
+    pub protocol: ExposeProtocol,
+    pub url: String,
+    /// Set for TCP exposures: native clients (psql, redis-cli) dial it.
+    pub host: Option<String>,
+    /// Set for TCP exposures, with `host`.
+    pub host_port: Option<u16>,
+    /// `Token` when the URL needs a sandbox token, `Public` otherwise. The
+    /// server leaves the field out for a public port, and servers from
+    /// before token-only ports never send it; both read as `Public`.
+    pub visibility: ExposeVisibility,
+}
+
 /// Wire shape for the expose response — kept private; callers consume the
-/// public [`ExposeResult`] enum instead.
+/// public [`ExposeResult`] enum or [`ExposePortInfo`] instead.
 #[derive(Deserialize)]
 pub(crate) struct ExposePortResponseWire {
     pub protocol: String,
@@ -559,6 +755,8 @@ pub(crate) struct ExposePortResponseWire {
     pub host: Option<String>,
     #[serde(rename = "host_port", default)]
     pub host_port: Option<u16>,
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -619,6 +817,14 @@ pub struct Sandbox {
     pub last_active_at: String,
     #[serde(rename = "last_error", skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Why the sandbox is in its status (see the `STATUS_REASON_*`
+    /// constants). `None` when a call simply created or started it.
+    #[serde(default, rename = "status_reason", skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// Exit code behind `out_of_memory`, `crashed`, `program_exited` and
+    /// `restarted`. `Some(0)` is a real exit code.
+    #[serde(default, rename = "exit_code", skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     #[serde(rename = "container_command", skip_serializing_if = "Option::is_none")]
     pub container_command: Option<Vec<String>>,
     #[serde(default)]
@@ -645,7 +851,25 @@ pub struct Sandbox {
     /// Isolate-group key this sandbox was created under (`runtime = "isolate"` only).
     #[serde(rename = "tenant_id", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// The sandbox's cloud identity, when it was created with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SandboxIdentity>,
 }
+
+/// Status reasons: why a sandbox is in its current status
+/// (`Sandbox::status_reason`). The first seven are reasons a sandbox is
+/// stopped; `program_exited`, `failover` and `restarted` can also describe a
+/// started one.
+pub const STATUS_REASON_USER_STOP: &str = "user_stop";
+pub const STATUS_REASON_IDLE: &str = "idle";
+pub const STATUS_REASON_MAX_AGE: &str = "max_age";
+pub const STATUS_REASON_OUT_OF_MEMORY: &str = "out_of_memory";
+pub const STATUS_REASON_DISK_LIMIT: &str = "disk_limit";
+pub const STATUS_REASON_CRASHED: &str = "crashed";
+pub const STATUS_REASON_RECONCILE: &str = "reconcile";
+pub const STATUS_REASON_PROGRAM_EXITED: &str = "program_exited";
+pub const STATUS_REASON_FAILOVER: &str = "failover";
+pub const STATUS_REASON_RESTARTED: &str = "restarted";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CreateSandboxResponse {
@@ -719,13 +943,28 @@ pub struct HealthStatus {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ExecRequest {
+    /// A shell command. Leave it empty when you set `argv`.
     pub command: String,
+    /// Run a program with these arguments instead of `command`: spaces,
+    /// quotes, `$` and `;` reach it as written. Set `command` or `argv`, not
+    /// both. A sandbox whose agent predates argv returns
+    /// `Error::UnsupportedFeature` before anything runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
     #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
     pub work_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "timeout_seconds", skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    /// Keep only the first N bytes of stdout; the rest is dropped and the
+    /// command is not slowed down. A sandbox whose agent predates the caps
+    /// returns `Error::UnsupportedFeature` instead of all output.
+    #[serde(rename = "max_stdout_bytes", skip_serializing_if = "Option::is_none")]
+    pub max_stdout_bytes: Option<u64>,
+    /// Keep only the first N bytes of stderr. Same rules as `max_stdout_bytes`.
+    #[serde(rename = "max_stderr_bytes", skip_serializing_if = "Option::is_none")]
+    pub max_stderr_bytes: Option<u64>,
 }
 
 // A plain string is a shell command with default options, so
@@ -750,6 +989,22 @@ pub struct ExecResult {
     pub exit_code: i32,
     #[serde(rename = "duration_ms")]
     pub duration_ms: i64,
+    /// True when the command ran past its timeout and the sandbox killed its
+    /// whole process group. Older sandbox agents never set it.
+    #[serde(rename = "timed_out", default)]
+    pub timed_out: bool,
+    /// True when stdout was longer than its cap (`max_stdout_bytes`, or the
+    /// server's own limit) and was cut.
+    #[serde(rename = "stdout_truncated", default)]
+    pub stdout_truncated: bool,
+    /// True when stderr was longer than its cap and was cut.
+    #[serde(rename = "stderr_truncated", default)]
+    pub stderr_truncated: bool,
+    /// The signal that ended the command, such as `"SIGKILL"`; `None` when
+    /// it exited on its own. `exit_code` is -1 then; a shell would say 128 +
+    /// the signal's number (137 for SIGKILL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -757,6 +1012,35 @@ pub struct ExecExitInfo {
     pub code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
+}
+
+/// Options for [`crate::Client::watch_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// Also watch every folder below the path, including folders made
+    /// after the watch starts.
+    pub recursive: bool,
+}
+
+/// One change a file watch reports.
+///
+/// `kind` is `create`, `write`, `remove`, `rename` or `chmod`, or
+/// `overflow` when events were lost (list the folder again to catch up). A
+/// rename shows as `rename` for the old name and `create` for the new one.
+/// A newer agent may send other kinds; they are passed through unchanged.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The absolute path that changed. Empty for most overflow events.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// Why events were lost, on an overflow only: `kernel_queue`,
+    /// `event_buffer` or `watch_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -969,6 +1253,52 @@ pub struct EgressInject {
     pub secret_ref: String,
 }
 
+/// A team quota's limits, the body of `put_team_quota`. `None` (or 0) is no
+/// limit on that axis; at least one must be set.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuotaOptions {
+    /// Most sandboxes the team may hold, running or stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sandboxes: Option<u32>,
+    /// Most CPU the team's sandboxes may ask for in total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cpu: Option<f64>,
+    /// Most memory, in MB, the team's sandboxes may ask for in total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+}
+
+/// What a team holds now: every sandbox not deleted, at the size it asked for.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuotaUsage {
+    #[serde(default)]
+    pub sandboxes: u32,
+    #[serde(default)]
+    pub cpu: f64,
+    #[serde(default)]
+    pub memory_mb: u32,
+}
+
+/// A team's quota, and its usage when read back.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TeamQuota {
+    pub team: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sandboxes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mb: Option<u32>,
+    #[serde(default)]
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TeamQuotaUsage>,
+}
+
 /// A named allowlist sandboxes reference through `egress_profiles`.
 /// Profiles belong to your account; `generation` goes up on every change.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -1016,6 +1346,113 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Vec<EgressProfile>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A warm-pool entry: how many ready sandboxes every server with a warm pool
+/// keeps for one image. The server's `SB_DOCKER_POOL_*` /
+/// `SB_CONTAINERD_POOL_*` settings stay the default for every other image.
+/// Admin only.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPool {
+    /// The image, exactly as creates name it (`python:3.12`, `ghcr.io/acme/agent:1`).
+    pub image: String,
+    /// Warm slots each server keeps for this image; 0 turns warming off for it.
+    #[serde(default)]
+    pub depth: u32,
+    /// With `max_depth`, each server sets its own target from recent
+    /// demand, never below `min_depth` and never above `max_depth`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_depth: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_depth: u32,
+    /// What happens to warm sandboxes when the image changes:
+    /// `"replace_now"` or `"replace_as_used"`.
+    #[serde(default)]
+    pub on_image_change: String,
+    /// Goes up by one on every change; the same put twice leaves it alone.
+    #[serde(default)]
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    /// How full the pools are. Set by `get_warm_pool` and `list_warm_pools`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WarmPoolStatus>,
+}
+
+/// The body of `put_warm_pool`: a full replace. Set `depth` for a fixed
+/// size, or `min_depth` and `max_depth` to follow demand, not both.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolOptions {
+    /// Warm slots each server keeps for this image (0 to 128).
+    pub depth: u32,
+    /// The fewest warm slots a server keeps when demand is low (0 lets it reach zero).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub min_depth: u32,
+    /// The most warm slots a server keeps when demand is high (1 to 128).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_depth: u32,
+    /// When the image changes: `"replace_now"` (the default, when empty)
+    /// swaps every waiting sandbox at once; `"replace_as_used"` hands the
+    /// old ones out first and replaces each as it is used.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub on_image_change: String,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// Ready and target slots in total, and on each server that runs a warm pool.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolStatus {
+    #[serde(default)]
+    pub ready: u32,
+    #[serde(default)]
+    pub target: u32,
+    /// Ready sandboxes still on an older image.
+    #[serde(default)]
+    pub outdated: u32,
+    #[serde(default, deserialize_with = "null_as_empty_servers")]
+    pub servers: Vec<WarmPoolServerStatus>,
+}
+
+/// One server's pool for an image.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WarmPoolServerStatus {
+    pub node_id: String,
+    #[serde(default)]
+    pub ready: u32,
+    #[serde(default)]
+    pub target: u32,
+    #[serde(default)]
+    pub outdated: u32,
+    /// The server's last report is too old to trust; the numbers are its last ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
+}
+
+fn null_as_empty_servers<'de, D>(d: D) -> Result<Vec<WarmPoolServerStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<WarmPoolServerStatus>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// The wire shape of `GET /v1/warm-pools`; `list_warm_pools` returns the
+/// entries themselves.
+#[derive(Deserialize, Debug, Default)]
+pub(crate) struct WarmPoolListWire {
+    #[serde(default, deserialize_with = "null_as_empty_pools")]
+    pub pools: Vec<WarmPool>,
+}
+
+fn null_as_empty_pools<'de, D>(d: D) -> Result<Vec<WarmPool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<WarmPool>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// One destination a learn-mode sandbox reached.
@@ -1115,6 +1552,9 @@ pub struct AuditOptions {
     pub limit: Option<u32>,
     pub cursor: Option<String>,
     pub incarnation_id: Option<String>,
+    /// Only records by this caller: an id such as `"system:lifecycle"`, or
+    /// `"system:*"` for everything the server did on its own.
+    pub caller: Option<String>,
 }
 
 fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
@@ -1440,6 +1880,54 @@ pub struct CreatedApiToken {
     pub token: String,
 }
 
+/// The body of `sandbox.create_token()`: a signed token for one sandbox
+/// that you can hand to a browser or an end user. Only `expires_in` is
+/// required ("15m", "2h", "1d"; the server caps it, 24 hours by default).
+/// `port` makes a public-port token; without it the token is for the
+/// sandbox's toolbox (commands, files, sessions). `path_prefix` and
+/// `methods` narrow it further.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateSandboxTokenOptions {
+    pub expires_in: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+}
+
+/// `sandbox.create_token()`'s result. `token` (`avmst_…`) is shown only
+/// here: the server keeps no copy. `token_id` (`stk_…`) is safe to log.
+/// A token stops working when it expires, when its sandbox is deleted, or
+/// when `sandbox.revoke_tokens()` is called.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxToken {
+    pub token: String,
+    pub token_id: String,
+    pub sandbox_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// RFC 3339 time the token stops working.
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+/// `sandbox.revoke_tokens()`'s result: every token issued for the sandbox
+/// before `tokens_not_before` no longer works. A token made after the call
+/// works.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokeSandboxTokensResult {
+    pub sandbox_id: String,
+    /// RFC 3339 time. Tokens issued before it are refused.
+    #[serde(default)]
+    pub tokens_not_before: String,
+}
+
 /// The body of `client.tokens().create()`. All four fields are required.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateApiTokenOptions {
@@ -1466,4 +1954,56 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Vec<ApiToken>>::deserialize(d)?.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod exec_result_tests {
+    use super::ExecResult;
+
+    #[test]
+    fn signal_reads_and_defaults_to_none() {
+        let killed: ExecResult = serde_json::from_str(
+            r#"{"stdout":"","stderr":"","exit_code":-1,"duration_ms":1000,"timed_out":true,"signal":"SIGKILL"}"#,
+        )
+        .unwrap();
+        assert_eq!(killed.signal.as_deref(), Some("SIGKILL"));
+        assert_eq!(killed.exit_code, -1);
+        let old: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#).unwrap();
+        assert!(old.signal.is_none());
+    }
+
+    #[test]
+    fn timed_out_defaults_to_false_and_reads_true() {
+        let old: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":0,"duration_ms":1}"#).unwrap();
+        assert!(!old.timed_out);
+        let new: ExecResult = serde_json::from_str(r#"{"stdout":"","stderr":"","exit_code":-1,"duration_ms":1000,"timed_out":true}"#).unwrap();
+        assert!(new.timed_out);
+    }
+}
+
+#[cfg(test)]
+mod status_reason_tests {
+    use super::{Sandbox, STATUS_REASON_CRASHED, STATUS_REASON_PROGRAM_EXITED};
+
+    fn sandbox(extra: &str) -> Sandbox {
+        let body = format!(
+            r#"{{"id":"sb","image":"i","status":"stopped","public_url":"","container_id":null,"container_ip":null,"cpu":1,"memory_mb":1,"disk_gb":1,"os_user":"root","network_block_all":false,"toolbox_enabled":true,"created_at":"","updated_at":"","last_active_at":""{}}}"#,
+            extra
+        );
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn reads_status_reason_and_exit_code() {
+        let crashed = sandbox(r#","status_reason":"crashed","exit_code":3"#);
+        assert_eq!(crashed.status_reason.as_deref(), Some(STATUS_REASON_CRASHED));
+        assert_eq!(crashed.exit_code, Some(3));
+        // Exit code 0 is a real exit, not "no exit".
+        let exited = sandbox(r#","status_reason":"program_exited","exit_code":0"#);
+        assert_eq!(exited.status_reason.as_deref(), Some(STATUS_REASON_PROGRAM_EXITED));
+        assert_eq!(exited.exit_code, Some(0));
+        let plain = sandbox("");
+        assert_eq!(plain.status_reason, None);
+        assert_eq!(plain.exit_code, None);
+    }
 }

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -115,9 +116,13 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 			recreator: r,
 			failures:  c.recreateFailures,
 			logger:    c.logger,
-			escalate: func(ctx context.Context, id string, p Placement) {
+			escalate: func(ctx context.Context, id string, p Placement, cause error) {
 				// The local watcher keeps retrying on failure; the log in
 				// tryReassignStuckPlacement already carries the reason.
+				if refusedForCapacity(cause) {
+					_ = c.handBackRefusedPlacement(ctx, id, p)
+					return
+				}
 				_ = c.tryReassignStuckPlacement(ctx, id, p)
 			},
 		}, id, p)
@@ -133,9 +138,30 @@ type ownerRecreateDeps struct {
 	recreator SandboxRecreator
 	failures  *recreateFailureTracker
 	logger    *slog.Logger
-	// escalate hands a repeatedly failing placement to whoever can move it.
-	// The server does it through its own FSM; a worker asks the leader.
-	escalate func(context.Context, string, Placement)
+	// escalate hands a repeatedly failing placement to whoever can move it,
+	// with the last recreate error. The server does it through its own FSM; a
+	// worker asks the leader.
+	escalate func(context.Context, string, Placement, error)
+}
+
+// refusedForCapacity reports whether a recreate failed because this node's
+// admitter (or a full network-slot pool) had no room for it. Retrying here
+// cannot help until something on the node goes away; only another node, or
+// handing the sandbox back, ends it.
+func refusedForCapacity(err error) bool {
+	return errors.Is(err, capacity.ErrCapacityExceeded)
+}
+
+// RecreateInputs is what rebuilding p's sandbox on its owner takes: its
+// spec, its secret provider handle, passed through unchanged (only the
+// service resolves and merges credentials), and its exposed ports. ok is
+// false for a placement without a spec. The owner watcher's failover
+// recreate and a gVisor move's target (C21) both rebuild from it.
+func RecreateInputs(p Placement) (spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute, ok bool) {
+	if p.Spec == nil {
+		return models.CreateSandboxRequest{}, PlacementSecrets{}, nil, false
+	}
+	return *p.Spec, secretsFromPlacement(p), exposedPortRoutesForPlacement(p), true
 }
 
 func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id string, p Placement) {
@@ -148,23 +174,20 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 	if deps.failures != nil && deps.failures.isPermanent(id) {
 		return
 	}
-	if p.Spec == nil {
+	spec, sealed, ports, ok := RecreateInputs(p)
+	if !ok {
 		// Pre-cluster sandbox or never-replicated spec. Without a spec we
 		// can't reconstruct the container; leave it unhandled. The
 		// dead-owner reconciler still won't reassign such placements
 		// because there's no way to recover them.
 		return
 	}
-	spec := *p.Spec
-	ports := exposedPortRoutesForPlacement(p)
-	// Pass the secret provider handle through unchanged — only the service
-	// is allowed to resolve and merge credentials.
 	attempted := true
 	var err error
 	if reporter, ok := deps.recreator.(SandboxRecreateReporter); ok {
-		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, secretsFromPlacement(p), ports)
+		attempted, err = reporter.RecreateSandboxReport(ctx, id, spec, sealed, ports, p.OwnerSinceUnixNano)
 	} else {
-		err = deps.recreator.RecreateSandbox(ctx, id, spec, secretsFromPlacement(p), ports)
+		err = deps.recreator.RecreateSandbox(ctx, id, spec, sealed, ports)
 	}
 	if attempted || err != nil {
 		recordFailoverRecreate(err)
@@ -196,7 +219,7 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 			"sandbox_id", id, "consecutive_failures", fails, "err", err)
 	}
 	if fails >= maxRecreateFailuresBeforeReassign && deps.escalate != nil {
-		deps.escalate(ctx, id, p)
+		deps.escalate(ctx, id, p, err)
 	}
 }
 
@@ -227,10 +250,13 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 		// self-exclusion so a server that just failed it isn't re-elected.
 		stuckOwner = c.nodeID
 	}
-	target, ok := c.selectRecreationTarget(p, stuckOwner)
-	if !ok {
+	target, err := c.selectRecreationTargetFor(p, stuckOwner)
+	if err != nil {
+		if errors.Is(err, ErrPlacementUnsatisfiable) {
+			c.reportFailoverRefused(p, stuckOwner, err)
+		}
 		c.logger.Warn("cluster: no alternate node available for stuck placement; will keep retrying locally",
-			"sandbox_id", id, "stuck_owner", stuckOwner)
+			"sandbox_id", id, "stuck_owner", stuckOwner, "reason", err)
 		return ErrNoReassignTarget
 	}
 	cmd := command{
@@ -263,18 +289,85 @@ func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Pl
 	return nil
 }
 
+// handBackRefusedPlacement escalates a recreate the owner's own admitter
+// refused for capacity. It moves the sandbox to a node with room when there is
+// one, like any stuck placement. When there is none it orphans the placement
+// instead of leaving it where it is.
+//
+// Left in place, such a sandbox is placed on a node that can never run it,
+// for good (I6): the eviction scores every reassign of a dead node against
+// heartbeats that do not yet show the reassigns before it, so a mass failover
+// can hand a survivor more than it has room for, and nothing else ever moves
+// the overflow. Orphaning is what the eviction itself does with a sandbox it
+// finds no room for, so the outcome no longer depends on that timing. The
+// fence is the owner that refused: a placement that moved meanwhile is left
+// alone. The orphan records that owner as its previous one, which never ran
+// it, so the dead node it came from cannot reclaim it on return.
+func (c *Cluster) handBackRefusedPlacement(ctx context.Context, id string, p Placement) error {
+	err := c.tryReassignStuckPlacement(ctx, id, p)
+	stuckOwner := strings.TrimSpace(p.OwnerNodeID)
+	if !errors.Is(err, ErrNoReassignTarget) || stuckOwner == "" {
+		return err
+	}
+	cmd := command{
+		Op:                     opReassign,
+		SandboxID:              id,
+		ExpectedIncarnationID:  strings.TrimSpace(p.IncarnationID),
+		ExpectedOwnerNodeID:    stuckOwner,
+		ExpectedOwnerNodeIDSet: true,
+	}
+	if err := c.applyCommand(ctx, cmd); err != nil {
+		c.logger.Warn("cluster: hand back of a placement refused for capacity failed; will retry on next tick",
+			"sandbox_id", id, "owner", stuckOwner, "err", err)
+		return err
+	}
+	c.recreateFailures.clear(id)
+	c.logger.Warn("cluster: no node has room for a failover recreate its owner refused for capacity; placement orphaned",
+		"sandbox_id", id, "refused_by", stuckOwner)
+	return nil
+}
+
 // selectRecreationTarget picks a placement target for a failover recreate,
 // skipping any node ID listed in exclude. A placement with sealed secrets is
 // restricted to its replicated recipient set: those are the only nodes that
 // can both hold and decrypt the local-provider row. Placements without a
 // secret handle retain ordinary fleet-wide placement behavior.
 func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (PlacementTarget, bool) {
+	target, err := c.selectRecreationTargetFor(p, exclude...)
+	return target, err == nil
+}
+
+// selectRecreationTargetFor is selectRecreationTarget with the reason it
+// found none. ErrPlacementUnsatisfiable means the sandbox's placement rule
+// excludes every candidate: the failover must not move it (P1.5), and the
+// caller says so in a counter and an audit record rather than a bare log.
+func (c *Cluster) selectRecreationTargetFor(p Placement, exclude ...string) (PlacementTarget, error) {
+	return c.selectRecreationTargetAvoiding(p, "", exclude...)
+}
+
+// selectFailoverTarget is selectRecreationTargetFor for a dead owner's
+// sandbox: it keeps the sandbox out of the dead node's zone unless no other
+// zone has room for it (C10). A zone loss takes its nodes one by one, so a
+// sandbox moved to a neighbour in the same zone would likely move again.
+func (c *Cluster) selectFailoverTarget(p Placement, deadNodeID string) (PlacementTarget, error) {
+	return c.selectRecreationTargetAvoiding(p, c.lastKnownZone(deadNodeID))
+}
+
+// lastKnownZone is the zone nodeID last reported to this server (C10).
+func (c *Cluster) lastKnownZone(nodeID string) string {
+	if c == nil {
+		return ""
+	}
+	return c.capacityLeases.lastKnownZone(nodeID)
+}
+
+func (c *Cluster) selectRecreationTargetAvoiding(p Placement, avoidZone string, exclude ...string) (PlacementTarget, error) {
 	spec := p.Spec
 	if spec == nil {
-		return PlacementTarget{}, false
+		return PlacementTarget{}, ErrNoReassignTarget
 	}
 	if spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
-		return PlacementTarget{}, false
+		return PlacementTarget{}, ErrNoReassignTarget
 	}
 	excluded := make(map[string]struct{}, len(exclude))
 	for _, id := range exclude {
@@ -286,59 +379,89 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 	// is needed only when exclusions apply or a small recipient set constrains
 	// the candidates.
 	if !placementHasSecretHandle(p) && len(exclude) == 0 {
-		target, err := c.SelectPlacement(req)
-		return target, err == nil
+		target, _, err := c.selectPlacement(req, placementOpts{avoidZone: avoidZone})
+		return target, err
 	}
 	drained := c.fsm.drainedNodesSnapshot()
+	denied := c.fsm.deniedNodeSet()
 	// Score every eligible candidate that isn't excluded and pick the one with
 	// the highest headroom. Secret-bearing placements normally have only the
 	// owner plus two backups, so the recipient lookup remains O(recipients)
 	// rather than scanning a 2,000-node fleet for every failed sandbox.
 	all := c.withCatalogueTemplateHolders(c.recreationCandidates(p), req.TemplateID)
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
+	pending := c.pendingLoadByNode(time.Now().Unix())
 	var best Member
 	bestScore := -1.0
 	found := false
+	// The best outside avoidZone, which wins over best when there is one
+	// (C10: never back into the zone that just failed if another has room).
+	var bestAway Member
+	bestAwayScore := -1.0
+	foundAway := false
+	labelMatched := false
 	for _, m := range all {
-		if !m.Alive {
-			continue
-		}
-		if _, skip := excluded[m.NodeID]; skip {
+		// A node going down to restart (C8) is no failover target: the
+		// sandbox would move again when it leaves.
+		if !m.Alive || m.Restarting {
 			continue
 		}
 		if !CanOwnSandboxRole(m.Role) {
 			continue
 		}
+		// Labels are checked before the exclusion: a stuck owner that is the
+		// only node in the rule makes the rule satisfiable, so having no
+		// alternative is "stay put and retry", not a refused failover.
+		if len(req.Labels) > 0 {
+			if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+				continue
+			}
+			labelMatched = true
+		}
+		if _, skip := excluded[m.NodeID]; skip {
+			continue
+		}
 		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
 			continue
 		}
-		if drained[m.NodeID] {
+		if drained[m.NodeID] || denied[m.NodeID] {
 			continue
 		}
 		if m.APIURL == "" && m.NodeID != c.nodeID {
 			continue
 		}
-		if !nodeFits(m, req, pending[m.NodeID]) {
+		extra, extraByRuntime := pending.of(m.NodeID)
+		if !nodeFits(m, req, extra) {
 			continue
 		}
 		// A recreate needs a network slot as much as a first create did.
-		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
+		if !slotsFit(m, req, extraByRuntime) {
 			continue
 		}
-		s := placementScore(m, req, pending[m.NodeID], pendingRuntimes[m.NodeID])
+		s := placementScore(m, req, extra, extraByRuntime)
 		if !found || s > bestScore {
 			best = m
 			bestScore = s
 			found = true
 		}
+		if avoidZone != "" && memberZone(m) != avoidZone && (!foundAway || s > bestAwayScore) {
+			bestAway = m
+			bestAwayScore = s
+			foundAway = true
+		}
 	}
 	if !found {
-		return PlacementTarget{}, false
+		if len(req.Labels) > 0 && !labelMatched {
+			return PlacementTarget{}, models.PlacementUnsatisfiableError(req.Labels)
+		}
+		return PlacementTarget{}, ErrNoReassignTarget
+	}
+	if foundAway {
+		best = bestAway
 	}
 	if best.NodeID == c.nodeID {
-		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, true
+		return PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, IsSelf: true}, nil
 	}
-	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, true
+	return PlacementTarget{NodeID: best.NodeID, APIURL: best.APIURL, DataPlaneHost: best.DataPlaneHost, IsSelf: false}, nil
 }
 
 // recreationCandidates returns the existing fleet gossip view for a stuck
@@ -348,9 +471,11 @@ func (c *Cluster) selectRecreationTarget(p Placement, exclude ...string) (Placem
 func (c *Cluster) recreationCandidates(p Placement) []Member {
 	if !placementHasSecretHandle(p) {
 		// This path is used only for stuck-owner reassignment (initial
-		// secretless failover returned through SelectPlacement above). Preserve
-		// its existing gossip-view behavior.
-		return c.gossip.members()
+		// secretless failover returned through SelectPlacement above). With
+		// the capacity heartbeats overlaid: a gossip member carries no
+		// capacity, so on the bare view no peer ever fit and a stuck sandbox
+		// could not move even to an empty node.
+		return c.membersWithCapacity()
 	}
 	if c == nil || c.gossip == nil {
 		return nil

@@ -32,6 +32,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
 | [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |
 | [Stop and start without filling the disk](/engineering-sparse-disks/) | Why copying a VM disk the plain way turns a few hundred MiB into 10 GiB, and how AerolVM's copy keeps the holes. Measured on bare metal. |
+| [Why sandbox requests waited past 100 names](/engineering-route-lookup/) | Why every sandbox request waited in one line once a server had more than 100 busy hosts, how we found it in Caddy's code, and the small Caddy plugin that handles about 7.6 times more requests at 1,000 hosts. Measured. |
 
 ## Architecture
 

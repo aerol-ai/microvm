@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -286,5 +288,62 @@ func TestSessionProcessKeepsExitStatusWhenReaperWinsTheRace(t *testing.T) {
 	}
 	if _, err := startSessionProcess(exec.Command("sh"), func() error { return errors.New("boom") }); err == nil {
 		t.Fatal("a failed start returned no error")
+	}
+}
+
+// TestIsExitStatus: a wait error that only carries the command's exit status
+// is its result, not a failure to append to stderr. The reaper's status
+// (reapedExit) is one of those: missing it made a plain "exit 3" end stderr
+// with "exit status 3" whenever the reaper won the race (UC-458 on
+// cluster-3-mixed-docker, 2026-11-07).
+func TestIsExitStatus(t *testing.T) {
+	ranExit3 := exec.Command("sh", "-c", "exit 3").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(ranExit3, &exitErr) {
+		t.Fatalf("sh -c 'exit 3' gave %T %v, want an *exec.ExitError", ranExit3, ranExit3)
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"Go's exit error", ranExit3, true},
+		{"the reaper's exit status", &reapedExit{status: syscall.WaitStatus(3 << 8)}, true},
+		{"the reaper's kill", &reapedExit{status: syscall.WaitStatus(syscall.SIGKILL)}, true},
+		{"a wrapped reaper status", fmt.Errorf("wait: %w", &reapedExit{status: syscall.WaitStatus(1 << 8)}), true},
+		{"reaped elsewhere", syscall.ECHILD, true},
+		{"a spawn failure", errors.New("exec: \"nope\": executable file not found in $PATH"), false},
+		{"a pipe error", fmt.Errorf("read |0: %w", os.ErrClosed), false},
+	}
+	for _, tc := range cases {
+		if got := isExitStatus(tc.err); got != tc.want {
+			t.Errorf("%s: isExitStatus(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
+
+// withWaitError is the one rule handleExec and handleDaytonaCodeRun use to
+// put a wait error into stderr. The failure branch cannot be reached through
+// a real exec on demand (it needs the deadline to land just as the command
+// exits 0), so it is pinned here with made-up errors.
+func TestWithWaitError(t *testing.T) {
+	ranExit3 := exec.Command("sh", "-c", "exit 3").Run()
+	cases := []struct {
+		name   string
+		stderr string
+		err    error
+		want   string
+	}{
+		{"no error", "warn\n", nil, "warn\n"},
+		{"Go's exit error", "bad\n", ranExit3, "bad\n"},
+		{"the reaper's exit status (UC-458)", "bad\n", &reapedExit{status: syscall.WaitStatus(3 << 8)}, "bad\n"},
+		{"reaped elsewhere", "bad\n", syscall.ECHILD, "bad\n"},
+		{"a deadline that won over a clean exit", "partial\n", context.DeadlineExceeded, "partial\n\ncontext deadline exceeded"},
+		{"a pipe error, empty stderr", "", fmt.Errorf("read |0: %w", os.ErrClosed), "read |0: file already closed"},
+	}
+	for _, tc := range cases {
+		if got := withWaitError(tc.stderr, tc.err); got != tc.want {
+			t.Errorf("%s: withWaitError(%q, %v) = %q, want %q", tc.name, tc.stderr, tc.err, got, tc.want)
+		}
 	}
 }

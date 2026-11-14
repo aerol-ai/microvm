@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +78,50 @@ func SecretHolders(t *testing.T, c *Client, sandboxID string) []string {
 		t.Fatalf("read secret holders for %s: %v", sandboxID, err)
 	}
 	return v.Holders
+}
+
+// NodeRole is one cluster member's id and role, as /v1/cluster/members
+// reports them.
+type NodeRole struct {
+	NodeID string
+	Role   string
+}
+
+// ResealDrainPlan picks the two nodes a concurrent-drain case drains, and
+// the nodes that could take a sealed copy in their place.
+//
+// Victims are never the owner (draining it moves the sandbox, a different
+// experiment) and are current holders first. A node that holds no copy owes
+// no reseal when it drains, so draining only such nodes proves nothing and
+// waits for a reseal that is never due. Picking by member order did exactly
+// that in one live run: it drained ingress-1 and server-1 of an 8-node
+// cluster whose copies sat on three workers.
+//
+// canHold is every member that shares a role with a current holder. An
+// ingress, or a server in a cluster that runs sandboxes on workers, never
+// holds a copy, so it does not count as a replacement.
+func ResealDrainPlan(holders []string, members []NodeRole, owner string) (victims, canHold []string) {
+	roles := make(map[string]bool)
+	for _, m := range members {
+		if slices.Contains(holders, m.NodeID) {
+			roles[m.Role] = true
+		}
+	}
+	var others []string
+	for _, m := range members {
+		if roles[m.Role] {
+			canHold = append(canHold, m.NodeID)
+		}
+		if m.NodeID != owner && !slices.Contains(holders, m.NodeID) {
+			others = append(others, m.NodeID)
+		}
+	}
+	for _, id := range append(slices.Clone(holders), others...) {
+		if id != owner && len(victims) < 2 {
+			victims = append(victims, id)
+		}
+	}
+	return victims, canHold
 }
 
 // WaitSecretHolders polls until pred is satisfied by a CONVERGED holder view.
@@ -496,7 +541,11 @@ const (
 // on-demand, which is why the design never hit it.
 //
 // Stopping the daemon is also the fault these cases actually model: SWIM
-// marks the owner dead and placement reassigns. The box keeps answering
+// marks the owner dead and placement reassigns. Since C8 a stop announces a
+// restart, so the leader waits SB_CLUSTER_RESTART_WINDOW (120 s) instead of
+// the 30 s grace before it reassigns; the failover deadlines here are
+// minutes. A case that times the failover against the grace crashes the
+// daemon instead (CrashStopSandboxdScript, as chaosHardKill does). The box keeps answering
 // SSH, which is what makes the restore reliable — and a restore that works
 // is worth more here than fidelity to a power cut, because a node this
 // suite cannot bring back poisons every case after it.

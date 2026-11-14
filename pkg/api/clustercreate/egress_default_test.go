@@ -65,3 +65,23 @@ func TestCreateOnSelectedNodeStoresOperatorDefault(t *testing.T) {
 		t.Fatalf("explicit policy rewritten: %+v", spec)
 	}
 }
+
+// TestCreateOnSelectedNodeStoresPrivateDefault (T4): the promoted spec
+// carries SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT's deny list, so a failover
+// recreate, which never re-applies a default, comes back with it.
+func TestCreateOnSelectedNodeStoresPrivateDefault(t *testing.T) {
+	stub := &clusterStub{
+		Noop: cluster.NewNoop("node-a", "http://node-a", ""),
+		placements: map[string]cluster.Placement{
+			"sb-priv": {SandboxID: "sb-priv", OwnerNodeID: "node-a", IncarnationID: "inc-sb-priv", State: cluster.PlacementStateReserved},
+		},
+	}
+	svc, _ := newCreateService(t, stub, true)
+	svc.EnableBlockPrivateByDefault()
+	if _, err := CreateOnSelectedNode(context.Background(), svc, nil, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-priv", CreateOptions{PromoteWithSpec: true}); err != nil {
+		t.Fatalf("CreateOnSelectedNode: %v", err)
+	}
+	if len(stub.recordCalls) != 1 || stub.recordCalls[0].spec == nil || !slices.Contains(stub.recordCalls[0].spec.NetworkDenyOut, "10.0.0.0/8") {
+		t.Fatalf("promoted spec = %+v", stub.recordCalls)
+	}
+}

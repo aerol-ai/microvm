@@ -49,6 +49,8 @@ import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.EgressInject;
 import ai.aerol.microvm.model.EgressRule;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.WarmPool;
+import ai.aerol.microvm.model.WarmPoolOptions;
 import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
@@ -58,7 +60,12 @@ import ai.aerol.microvm.model.NetworkPolicyCheckResult;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.CustomDomain;
+import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.CustomDomainDnsRecords;
 import ai.aerol.microvm.model.CustomDomainStatus;
 import ai.aerol.microvm.model.DnsRecord;
@@ -68,6 +75,9 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.Failover;
+import ai.aerol.microvm.model.PlacementRule;
+import ai.aerol.microvm.model.TeamQuota;
+import ai.aerol.microvm.model.TeamQuotaOptions;
 import ai.aerol.microvm.model.GpuOptions;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.MountSpec;
@@ -77,6 +87,7 @@ import ai.aerol.microvm.model.NetworkUsage;
 import ai.aerol.microvm.model.RegisterSnapshotOptions;
 import ai.aerol.microvm.model.RetryConfig;
 import ai.aerol.microvm.model.SandboxData;
+import ai.aerol.microvm.model.StatusReason;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
 import ai.aerol.microvm.model.SnapshotList;
@@ -118,6 +129,63 @@ class MicroVMClientTest {
             Sandbox sandbox = client.get("sb-421");
             assertEquals("sb-421", sandbox.id);
             assertEquals(2, hits.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // ER4: a call that sends a newer option first checks the agent lists it
+    // and fails closed against an older toolboxd. The list is cached per
+    // sandbox and refetched on a miss.
+    @Test
+    void requireToolboxFeaturesFailsClosedOnAnOlderAgent() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+        AtomicReference<String> path = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            path.set(exchange.getRequestURI().getPath());
+            if (!exchange.getRequestURI().getPath().equals("/v1/sandboxes/sb-1/toolbox/version")) {
+                writeJson(exchange, 404, mapOf("error", "sandbox not found"));
+                return;
+            }
+            if (hits.incrementAndGet() <= 2) {
+                writeJson(exchange, 200, mapOf("version", "0.6.12", "features", List.of("files.create_only")));
+            } else {
+                writeJson(exchange, 200, mapOf("version", "0.6.0"));
+            }
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            client.requireToolboxFeatures("sb-1");
+            assertEquals(0, hits.get());
+            client.requireToolboxFeatures("sb-1", "files.create_only");
+            client.requireToolboxFeatures("sb-1", "files.create_only");
+            assertEquals(1, hits.get());
+            assertEquals("/v1/sandboxes/sb-1/toolbox/version", path.get());
+
+            MicroVMUnsupportedFeatureException missing = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMUnsupportedFeatureException.class,
+                () -> client.requireToolboxFeatures("sb-1", "files.create_only", "exec.max_output_bytes"));
+            assertEquals(2, hits.get());
+            assertEquals("sb-1", missing.getSandboxId());
+            assertEquals(List.of("exec.max_output_bytes"), missing.getFeatures());
+            assertEquals("0.6.12", missing.getAgentVersion());
+            assertTrue(missing.getMessage().contains("toolboxd 0.6.12"));
+
+            MicroVMUnsupportedFeatureException old = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMUnsupportedFeatureException.class,
+                () -> client.requireToolboxFeatures("sb-1", "exec.max_output_bytes"));
+            assertEquals("0.6.0", old.getAgentVersion());
+            assertTrue(new MicroVMUnsupportedFeatureException("sb-1", List.of("a", "b"), "")
+                .getMessage().contains("runs an older toolboxd, which does not support a, b;"));
+            MicroVMUnsupportedFeatureException wasm = new MicroVMUnsupportedFeatureException("sb-w", List.of("files.verbs"), "v9", "wasm");
+            assertEquals("wasm", wasm.getRuntime());
+            assertEquals("sandbox sb-w is a WebAssembly sandbox, which does not support files.verbs", wasm.getMessage());
+
+            // A failed /version call is thrown as is, not as unsupported.
+            MicroVMApiException notFound = org.junit.jupiter.api.Assertions.assertThrows(
+                MicroVMApiException.class,
+                () -> client.requireToolboxFeatures("sb-missing", "files.create_only"));
+            assertEquals(404, notFound.getStatusCode());
         } finally {
             server.stop(0);
         }
@@ -416,7 +484,8 @@ class MicroVMClientTest {
                     ))
                     .setPlatformVolumes(List.of(
                         new PlatformVolumeMount().setName("data").setPath("/workspace"),
-                        new PlatformVolumeMount().setName("cache").setPath("/cache").setReadOnly(true)
+                        new PlatformVolumeMount().setName("cache").setPath("/cache").setReadOnly(true),
+                        new PlatformVolumeMount().setName("scratch").setPath("/scratch").setDeleteWithSandbox(true)
                     ))
                     .setLifecycle(new Lifecycle()
                         .setStopIfIdleFor(3_600_000_000_000L)
@@ -446,13 +515,16 @@ class MicroVMClientTest {
             Map<String, Object> failover = castMap(payload.get("failover"));
             assertEquals("recreate", failover.get("policy"));
             List<?> platformVolumes = (List<?>) payload.get("platform_volumes");
-            assertEquals(2, platformVolumes.size());
+            assertEquals(3, platformVolumes.size());
             Map<String, Object> firstVolume = castMap(platformVolumes.get(0));
             assertEquals("data", firstVolume.get("name"));
             assertEquals("/workspace", firstVolume.get("path"));
             assertNull(firstVolume.get("read_only"));
+            assertFalse(firstVolume.containsKey("delete_with_sandbox"));
             Map<String, Object> secondVolume = castMap(platformVolumes.get(1));
             assertEquals(Boolean.TRUE, secondVolume.get("read_only"));
+            Map<String, Object> thirdVolume = castMap(platformVolumes.get(2));
+            assertEquals(Boolean.TRUE, thirdVolume.get("delete_with_sandbox"));
         } finally {
             server.stop(0);
         }
@@ -485,6 +557,48 @@ class MicroVMClientTest {
             MicroVMClient client = clientFor(server);
             client.create(new CreateOptions().setImage("ubuntu:22.04"));
             assertNull(requestBody.get().get("allow_public_traffic"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createSendsPlacementRule() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-placed",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "public_url", "",
+                "cpu", 1,
+                "memory_mb", 1024,
+                "disk_gb", 10,
+                "os_user", "root",
+                "network_block_all", false,
+                "toolbox_enabled", true,
+                "exposed_ports", List.of(),
+                "created_at", "2026-11-06T10:00:00Z",
+                "updated_at", "2026-11-06T10:00:00Z",
+                "last_active_at", "2026-11-06T10:00:00Z"
+            ));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            client.create(new CreateOptions()
+                .setImage("ubuntu:22.04")
+                .setPlacement(new PlacementRule().setZone("eu-west-1a").setLabels(Map.of("tier", "pci"))));
+            Map<String, Object> placement = castMap(requestBody.get().get("placement"));
+            assertEquals("eu-west-1a", placement.get("zone"));
+            assertEquals(Map.of("tier", "pci"), placement.get("labels"));
+
+            // A zone alone sends no labels key, and no rule sends no placement.
+            client.create(new CreateOptions().setImage("ubuntu:22.04").setPlacement(new PlacementRule().setZone("eu-west-1a")));
+            assertEquals(Map.of("zone", "eu-west-1a"), requestBody.get().get("placement"));
+            client.create(new CreateOptions().setImage("ubuntu:22.04"));
+            assertNull(requestBody.get().get("placement"));
         } finally {
             server.stop(0);
         }
@@ -532,6 +646,44 @@ class MicroVMClientTest {
             assertEquals(Boolean.TRUE, lifecycle.get("serverless"));
             assertEquals(300_000_000_000L, ((Number) lifecycle.get("stop_if_idle_for")).longValue());
             assertEquals(Boolean.TRUE, sandbox.lifecycle.serverless);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createRoundTripsRestartOnFailure() throws Exception {
+        AtomicReference<Map<String, Object>> requestBody = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            requestBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-restart",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "lifecycle", mapOf("restart_on_failure", true)
+            ));
+        });
+
+        try {
+            Sandbox sandbox = clientFor(server).create(
+                new CreateOptions()
+                    .setImage("ubuntu:22.04")
+                    .setLifecycle(new Lifecycle().setRestartOnFailure(Boolean.TRUE))
+            );
+            Map<String, Object> lifecycle = castMap(requestBody.get().get("lifecycle"));
+            assertEquals(Map.of("restart_on_failure", Boolean.TRUE), lifecycle);
+            assertEquals(Boolean.TRUE, sandbox.lifecycle.restartOnFailure);
+            assertEquals(Boolean.TRUE, sandbox.lifecycle.copy().restartOnFailure, "copy keeps the flag");
+
+            Lifecycle exit = new Lifecycle().setDestroyAfterExitFor(60_000_000_000L);
+            Map<String, Object> wire = castMap(JsonSupport.read(JsonSupport.writeBytes(exit), Map.class));
+            assertEquals(60_000_000_000L, ((Number) wire.get("destroy_after_exit_for")).longValue());
+            assertEquals(Long.valueOf(60_000_000_000L), exit.copy().destroyAfterExitFor);
+
+            Lifecycle at = new Lifecycle().setDestroyAt(java.time.Instant.parse("2026-11-06T18:00:00Z"));
+            Map<String, Object> atWire = castMap(JsonSupport.read(JsonSupport.writeBytes(at), Map.class));
+            assertEquals("2026-11-06T18:00:00Z", atWire.get("destroy_at"));
+            assertEquals(at.destroyAt, at.copy().destroyAt);
         } finally {
             server.stop(0);
         }
@@ -1027,6 +1179,38 @@ class MicroVMClientTest {
     }
 
     @Test
+    void getReadsStatusReasonAndExitCode() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("/v1/sandboxes/sb-crash".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-crash", "image", "alpine", "status", "stopped",
+                    "status_reason", "crashed", "exit_code", 3));
+                return;
+            }
+            if ("/v1/sandboxes/sb-done".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-done", "image", "alpine", "status", "started",
+                    "status_reason", "program_exited", "exit_code", 0));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("id", "sb-plain", "image", "alpine", "status", "started"));
+        });
+        try {
+            Sandbox crashed = clientFor(server).get("sb-crash");
+            assertEquals(StatusReason.CRASHED, crashed.statusReason);
+            assertEquals(Integer.valueOf(3), crashed.exitCode);
+            Sandbox done = clientFor(server).get("sb-done");
+            assertEquals(StatusReason.PROGRAM_EXITED, done.statusReason);
+            assertEquals(Integer.valueOf(0), done.exitCode, "exit code 0 is a real exit");
+            Sandbox plain = clientFor(server).get("sb-plain");
+            assertNull(plain.statusReason);
+            assertNull(plain.exitCode);
+            assertEquals(Integer.valueOf(3), crashed.toData().exitCode, "copy keeps the exit code");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void setNetworkPolicyPutsWholePolicyAndUpdatesSandbox() throws Exception {
         AtomicReference<Map<String, Object>> body = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {
@@ -1292,6 +1476,112 @@ class MicroVMClientTest {
     }
 
     @Test
+    void warmPoolCrudKeepsImageSlashesAndMapsStatus() throws Exception {
+        List<String> seen = new java.util.ArrayList<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        Map<String, Object> status = mapOf("ready", 3, "target", 4, "outdated", 1, "servers", List.of(
+            mapOf("node_id", "n1", "ready", 2, "target", 2, "outdated", 1),
+            mapOf("node_id", "n2", "ready", 1, "target", 2, "stale", true)));
+        HttpServer server = startServer(exchange -> {
+            String rawPath = exchange.getRequestURI().getRawPath();
+            String method = exchange.getRequestMethod();
+            seen.add(method + " " + rawPath);
+            if ("DELETE".equals(method)) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("GET".equals(method) && "/v1/warm-pools".equals(rawPath)) {
+                writeJson(exchange, 200, mapOf("pools", seen.size() < 4 ? List.of(mapOf("image", "python:3.12", "depth", 2, "status", status)) : null));
+                return;
+            }
+            if ("PUT".equals(method) && rawPath.endsWith("/demand%3A1")) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "demand:1", "depth", 0, "min_depth", 1, "max_depth", 4, "generation", 1));
+                return;
+            }
+            if ("PUT".equals(method)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("image", "ghcr.io/acme/agent:1", "depth", 2, "generation", 1, "created_at", "c", "updated_at", "u"));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("image", "ghcr.io/acme/agent:1", "depth", 2, "generation", 1, "status", status));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            WarmPool put = client.putWarmPool("ghcr.io/acme/agent:1", new WarmPoolOptions().setDepth(2));
+            assertEquals(2, put.depth);
+            assertEquals(1, put.generation);
+            assertEquals("c", put.createdAt);
+            assertEquals(null, put.status);
+            assertEquals(2, ((Number) body.get().get("depth")).intValue());
+            WarmPool got = client.getWarmPool("ghcr.io/acme/agent:1");
+            assertEquals(3, got.status.ready);
+            assertEquals(4, got.status.target);
+            assertEquals("n2", got.status.servers.get(1).nodeId);
+            assertEquals(1, got.status.outdated);
+            assertEquals(1, got.status.servers.get(0).outdated);
+            assertTrue(got.status.servers.get(1).stale);
+            assertEquals(1, client.listWarmPools().size());
+            assertTrue(client.listWarmPools().isEmpty());
+            client.deleteWarmPool("odd name/img:1");
+            assertEquals(List.of(
+                "PUT /v1/warm-pools/ghcr.io/acme/agent%3A1",
+                "GET /v1/warm-pools/ghcr.io/acme/agent%3A1",
+                "GET /v1/warm-pools",
+                "GET /v1/warm-pools",
+                "DELETE /v1/warm-pools/odd%20name/img%3A1"), seen);
+            WarmPool demand = client.putWarmPool("demand:1", new WarmPoolOptions().setMinDepth(1).setMaxDepth(4));
+            assertEquals(1, ((Number) body.get().get("min_depth")).intValue());
+            assertEquals(4, ((Number) body.get().get("max_depth")).intValue());
+            assertEquals(1, demand.minDepth);
+            assertEquals(4, demand.maxDepth);
+            assertEquals(WarmPoolOptions.REPLACE_NOW, demand.onImageChange);
+            assertTrue(!body.get().containsKey("on_image_change"));
+            client.putWarmPool("demand:1", new WarmPoolOptions().setDepth(1).setOnImageChange(WarmPoolOptions.REPLACE_AS_USED));
+            assertEquals("replace_as_used", body.get().get("on_image_change"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void teamQuotaCallsMapWireShape() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        AtomicReference<String> deleted = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if (!"/v1/teams/risk/quota".equals(path)) {
+                throw new AssertionError("unexpected request: " + method + " " + path);
+            }
+            if ("DELETE".equals(method)) {
+                deleted.set(path);
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("PUT".equals(method)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            }
+            writeJson(exchange, 200, mapOf("team", "risk", "max_sandboxes", 3, "max_cpu", 4.0, "generation", 1,
+                "usage", mapOf("sandboxes", 2, "cpu", 1.5, "memory_mb", 1024)));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            TeamQuota quota = client.putTeamQuota("risk", new TeamQuotaOptions().setMaxSandboxes(3).setMaxCpu(4.0));
+            assertEquals(Map.of("max_sandboxes", 3, "max_cpu", 4.0), body.get());
+            assertEquals(3, quota.maxSandboxes);
+            assertEquals(2, quota.usage.sandboxes);
+            assertEquals(1024, client.getTeamQuota("risk").usage.memoryMb);
+            client.deleteTeamQuota("risk");
+            assertEquals("/v1/teams/risk/quota", deleted.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void auditSendsFiltersAndMapsPage() throws Exception {
         AtomicReference<String> query = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {
@@ -1320,8 +1610,8 @@ class MicroVMClientTest {
         });
         try {
             MicroVMClient client = clientFor(server);
-            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1"));
-            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", query.get());
+            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1").setCaller("system:*"));
+            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1&caller=system%3A*", query.get());
             assertEquals("host_not_allowed", page.events.get(0).reason);
             assertEquals("ae-1", page.events.get(0).eventId);
             assertEquals(List.of("n1"), page.coverage.answered);
@@ -2160,6 +2450,118 @@ class MicroVMClientTest {
     }
 
     @Test
+    void exposePortSendsVisibilityOnlyWhenSet() throws Exception {
+        List<String> bodies = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            String body = new String(exchange.getRequestBody().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            bodies.add(body);
+            writeJson(exchange, 200, body.contains("token")
+                ? mapOf("protocol", "http", "public_url", "https://sb-1-3000.example.com", "visibility", "token")
+                : mapOf("protocol", "http", "public_url", "https://sb-1-3000.example.com"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            ExposeResult gated = client.exposePort("sb-1", 3000, ExposeOptions.token());
+            assertEquals("token", gated.visibility);
+            ExposeResult plain = client.exposePort("sb-1", 3000);
+            assertNull(plain.visibility);
+            client.exposePort("sb-1", 5432, ExposeOptions.tcp());
+            assertEquals(3, bodies.size());
+            assertEquals(mapOf("visibility", "token"), castMap(JsonSupport.read(bodies.get(0).getBytes(), Map.class)));
+            assertEquals("", bodies.get(1));
+            assertEquals(mapOf("protocol", "tcp"), castMap(JsonSupport.read(bodies.get(2).getBytes(), Map.class)));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTokenPostsScopeAndMapsAnswer() throws Exception {
+        AtomicReference<String> path = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            path.set(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath());
+            body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+            writeJson(exchange, 201, mapOf(
+                "token", "avmst_0.p.s",
+                "token_id", "stk_abc",
+                "sandbox_id", "sb-1",
+                "path_prefix", "/files",
+                "methods", List.of("GET"),
+                "expires_at", "2026-11-06T10:15:00Z"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            SandboxToken token = sandbox.createToken(new CreateSandboxTokenOptions()
+                .setExpiresIn("15m").setPathPrefix("/files").setMethods(List.of("GET")));
+            assertEquals("POST /v1/sandboxes/sb-1/tokens", path.get());
+            assertEquals(mapOf("expires_in", "15m", "path_prefix", "/files", "methods", List.of("GET")), body.get());
+            assertEquals("avmst_0.p.s", token.token);
+            assertEquals("stk_abc", token.tokenId);
+            assertEquals("sb-1", token.sandboxId);
+            assertEquals("/files", token.pathPrefix);
+            assertEquals(List.of("GET"), token.methods);
+            assertNull(token.port);
+
+            // A port token sends only the port; an empty method list is left out.
+            client.createSandboxToken("sb-1", new CreateSandboxTokenOptions().setExpiresIn("1h").setPort(3000).setMethods(List.of()));
+            assertEquals(mapOf("expires_in", "1h", "port", 3000), body.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createTokenSurfacesBadRequest() throws Exception {
+        HttpServer server = startServer(exchange ->
+            writeJson(exchange, 400, mapOf("error", "invalid sandbox token request: expires_in is required")));
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.createSandboxToken("sb-1", null));
+            assertTrue(error.getMessage().contains("expires_in"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void revokeTokensPostsNoBodyAndMapsAnswer() throws Exception {
+        List<String> seen = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            byte[] body = exchange.getRequestBody().readAllBytes();
+            seen.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath() + " " + body.length);
+            writeJson(exchange, 200, mapOf("sandbox_id", "sb-1", "tokens_not_before", "2026-11-07T10:00:01Z"));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox sandbox = new Sandbox(client, new SandboxData());
+            sandbox.id = "sb-1";
+            RevokeSandboxTokensResult result = sandbox.revokeTokens();
+            assertEquals("sb-1", result.sandboxId);
+            assertEquals("2026-11-07T10:00:01Z", result.tokensNotBefore);
+            assertEquals("2026-11-07T10:00:01Z", client.revokeSandboxTokens("sb-1").tokensNotBefore);
+            assertEquals(List.of("POST /v1/sandboxes/sb-1/tokens/revoke 0", "POST /v1/sandboxes/sb-1/tokens/revoke 0"), seen);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void revokeTokensSurfacesNotFound() throws Exception {
+        HttpServer server = startServer(exchange -> writeJson(exchange, 404, mapOf("error", "sandbox not found")));
+        try {
+            MicroVMClient client = clientFor(server);
+            MicroVMException error = assertThrows(MicroVMException.class, () -> client.revokeSandboxTokens("sb-none"));
+            assertTrue(error.getMessage().contains("not found"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void customDomainsAddListAndRemoveMapApiShapes() throws Exception {
         AtomicReference<Map<String, Object>> addBody = new AtomicReference<>();
         AtomicReference<String> deletePath = new AtomicReference<>();
@@ -2833,6 +3235,49 @@ class MicroVMClientTest {
                 assertEquals(c[7], err.getRetryAfter(), name);
             } finally {
                 server.stop(0);
+            }
+        }
+    }
+
+    // Each common status throws its own MicroVMApiException subclass, so a
+    // caller can catch the case it handles; MicroVMApiException still
+    // catches them all.
+    @Test
+    void eachCommonStatusThrowsItsOwnException() throws Exception {
+        Object[][] cases = {
+            {401, MicroVMAuthException.class},
+            {403, MicroVMAuthException.class},
+            {404, MicroVMNotFoundException.class},
+            {408, MicroVMTimeoutException.class},
+            {409, MicroVMConflictException.class},
+            {503, MicroVMCapacityException.class},
+            {504, MicroVMTimeoutException.class},
+            {400, MicroVMApiException.class},
+            {412, MicroVMApiException.class},
+            {422, MicroVMApiException.class},
+            {500, MicroVMApiException.class},
+            {502, MicroVMApiException.class},
+        };
+        String[][] bodies = {
+            // {content type, body, code, message (null: status message)}
+            {"application/json", "{\"error\":\"nope\",\"code\":\"some_code\"}", "some_code", "nope"},
+            {"text/html", "<html>error</html>", null, null},
+        };
+        for (Object[] c : cases) {
+            int status = (Integer) c[0];
+            for (String[] b : bodies) {
+                String name = status + " " + b[0];
+                HttpServer server = startServer(exchange -> writeResponse(exchange, status, b[0], b[1].getBytes(StandardCharsets.UTF_8)));
+                try {
+                    MicroVMClient client = clientFor(serverUrl(server), new RetryConfig().setMaxRetries(0), HttpClient.newHttpClient());
+                    MicroVMApiException err = assertThrows(MicroVMApiException.class, () -> client.get("sb-1"), name);
+                    assertEquals(c[1], err.getClass(), name);
+                    assertEquals(status, err.getStatusCode(), name);
+                    assertEquals(b[2], err.getCode(), name);
+                    assertEquals(b[3] == null ? "request failed with status " + status : b[3], err.getMessage(), name);
+                } finally {
+                    server.stop(0);
+                }
             }
         }
     }

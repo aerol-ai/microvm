@@ -310,6 +310,9 @@ func (s *Service) resealPass(ctx context.Context, count func(from uint32, moved 
 	if err := s.resealEgressCA(count, unopenable); err != nil {
 		return err
 	}
+	if err := s.resealIdentityKeys(ctx, count, unopenable); err != nil {
+		return err
+	}
 	if s.store != nil {
 		return s.resealLocalClusterSecrets(ctx, count)
 	}

@@ -1,0 +1,13 @@
+exit 0
+--- stdout
+{
+  "created_at": "2026-10-17T00:00:00Z",
+  "created_by": "alice",
+  "expired": false,
+  "expires_at": "2026-11-07T11:00:00Z",
+  "id": "tok_cccccccccccc",
+  "name": "deploy",
+  "role": "admin",
+  "team": "*"
+}
+--- stderr

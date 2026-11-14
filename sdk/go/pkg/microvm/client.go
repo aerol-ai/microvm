@@ -3,10 +3,12 @@ package microvm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	apiclient "github.com/aerol-ai/microvm/sdk/go/internal/apiclient"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
@@ -22,14 +24,34 @@ type APIError = apiclient.APIError
 // dropping. Use errors.As to tell the two apart.
 type StreamError = apiclient.StreamError
 
+// UnsupportedFeatureError is returned when the sandbox's agent (toolboxd) is
+// older than an option the call needs; the SDK refuses rather than send an
+// option the agent would silently ignore. Restart the sandbox, or re-create
+// its Firecracker template, to get the current agent.
+type UnsupportedFeatureError = apiclient.UnsupportedFeatureError
+
 // Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
-// ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
-// `?name=`.
+// ErrConflict a 409, ErrCapacity a 503, ErrTimeout a 408 or 504, ErrAuth a
+// 401 or 403, ErrNameLookupUnsupported a server that ignored `?name=`, and
+// ErrUnsupportedFeature an *UnsupportedFeatureError. The status sentinels
+// match an *APIError, which errors.As still reads for the details.
 var (
 	ErrNotFound              = apiclient.ErrNotFound
 	ErrConflict              = apiclient.ErrConflict
+	ErrCapacity              = apiclient.ErrCapacity
+	ErrTimeout               = apiclient.ErrTimeout
+	ErrAuth                  = apiclient.ErrAuth
 	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
+	ErrUnsupportedFeature    = apiclient.ErrUnsupportedFeature
+	// ErrFileTooLarge means a download was larger than its MaxBytes.
+	ErrFileTooLarge = apiclient.ErrFileTooLarge
 )
+
+// HeaderCellEndpoint is the response header a 421 carries when a sandbox
+// lives in another cell of a federation: that cell's base URL. The client
+// sends the request there once, with the same token, and sends later calls
+// for that sandbox straight there.
+const HeaderCellEndpoint = apiclient.HeaderCellEndpoint
 
 const defaultAPIURL = "http://127.0.0.1:21212"
 const authRequiredErrorMessage = "PAT token is required. Set PATToken, SB_PAT_TOKEN or SB_API_TOKEN."
@@ -58,7 +80,12 @@ type Sandbox struct {
 	// it locally before discarding the create response, the server cannot
 	// regenerate it.
 	SSHPrivateKey string
-	client        *Client
+	// DestroyOnClose makes Close delete the sandbox. It is off by default,
+	// so `defer sb.Close(ctx)` alone leaves the sandbox running; set it to
+	// opt in to delete-on-exit (plan S2).
+	DestroyOnClose bool
+	client         *Client
+	closed         bool
 }
 
 type ExecStreamHandle struct {
@@ -337,6 +364,57 @@ func (c *Client) GetByName(ctx context.Context, name string, opts ...GetOption) 
 	return wrapSandbox(c, item), nil
 }
 
+// GetOrCreate returns the caller's sandbox called name, creating it from opts
+// when there is none; created is true only when this call made it. It is
+// safe to retry and to run concurrently:
+//
+//	GET ?name=name ── hit ──► (existing, false)
+//	      │ miss
+//	POST {opts, name}
+//	      ├─ 201 ──────────────► (new, true)
+//	      ├─ 409 ─► GET ?name= ─► (the winner, false)
+//	      └─ lost reply ─► the client retries the same POST (same
+//	         Idempotency-Key) ─► 201, or 409 as above
+//
+// Names are unique per owner, so of two callers racing to create a name one
+// gets a 409 and reads the other's sandbox. A 409 whose name still cannot be
+// found is a conflict on something else and is returned as is. An existing
+// sandbox is returned unchanged: its image and settings are not compared with
+// opts. opts.Name may be empty or repeat name.
+func (c *Client) GetOrCreate(ctx context.Context, name string, opts sdktypes.CreateSandboxOptions) (*Sandbox, bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false, errors.New("sandbox name is required")
+	}
+	if given := strings.TrimSpace(opts.Name); given != "" && given != name {
+		return nil, false, fmt.Errorf("options name %q differs from %q", given, name)
+	}
+	if existing, err := c.GetByName(ctx, name); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+	opts.Name = name
+	created, err := c.Create(ctx, opts)
+	if err == nil {
+		return created, true, nil
+	}
+	if !errors.Is(err, ErrConflict) {
+		return nil, false, err
+	}
+	winner, lookupErr := c.GetByName(ctx, name)
+	if lookupErr != nil {
+		return nil, false, err
+	}
+	return winner, false, nil
+}
+
+// RevokeSandboxTokens makes every token issued for the sandbox id so far
+// stop working (see Sandbox.RevokeTokens).
+func (c *Client) RevokeSandboxTokens(ctx context.Context, id string) (sdktypes.RevokeSandboxTokensResult, error) {
+	return c.inner.RevokeSandboxTokens(ctx, id)
+}
+
 // Mounts returns the redacted mount config for a sandbox. Credentials are
 // never included; this endpoint is for showing the user what their sandbox
 // has configured, not for retrieving secrets.
@@ -418,6 +496,50 @@ func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgres
 // is refused (409).
 func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
 	return c.inner.DeleteEgressProfile(ctx, name)
+}
+
+// PutWarmPool sets how many ready sandboxes every server with a warm pool
+// keeps for an image (a full replace: the same call twice is a no-op). A
+// create that names the image then starts from a warm sandbox. Admin only.
+func (c *Client) PutWarmPool(ctx context.Context, image string, opts sdktypes.WarmPoolOptions) (sdktypes.WarmPool, error) {
+	return c.inner.PutWarmPool(ctx, image, opts)
+}
+
+// GetWarmPool reads an image's warm-pool entry with its status (ready and
+// target, in total and per server).
+func (c *Client) GetWarmPool(ctx context.Context, image string) (sdktypes.WarmPool, error) {
+	return c.inner.GetWarmPool(ctx, image)
+}
+
+// ListWarmPools reads every warm-pool entry, by image, with its status.
+func (c *Client) ListWarmPools(ctx context.Context) ([]sdktypes.WarmPool, error) {
+	return c.inner.ListWarmPools(ctx)
+}
+
+// DeleteWarmPool deletes an image's warm-pool entry; its warm sandboxes are
+// removed. Deleting a missing entry succeeds.
+func (c *Client) DeleteWarmPool(ctx context.Context, image string) error {
+	return c.inner.DeleteWarmPool(ctx, image)
+}
+
+// PutTeamQuota sets a team's quota: the most sandboxes, CPU and memory its
+// sandboxes may hold. Admin only. The same limits twice change nothing. A
+// create, resize or start past the quota fails with an *APIError whose
+// StatusCode is 429 and Code is "team_quota_exceeded".
+func (c *Client) PutTeamQuota(ctx context.Context, team string, opts sdktypes.TeamQuotaOptions) (sdktypes.TeamQuota, error) {
+	return c.inner.PutTeamQuota(ctx, team, opts)
+}
+
+// GetTeamQuota reads a team's quota and what the team holds now (Usage). A
+// team with no quota is a 404 *APIError.
+func (c *Client) GetTeamQuota(ctx context.Context, team string) (sdktypes.TeamQuota, error) {
+	return c.inner.GetTeamQuota(ctx, team)
+}
+
+// DeleteTeamQuota removes a team's quota. Removing one that is already gone
+// succeeds.
+func (c *Client) DeleteTeamQuota(ctx context.Context, team string) error {
+	return c.inner.DeleteTeamQuota(ctx, team)
 }
 
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
@@ -525,6 +647,31 @@ func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
 
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
+}
+
+// DestroyAll deletes every sandbox of the caller's that carries all of tags
+// and returns the IDs of the ones now gone. It lists every page first, then
+// deletes them one at a time. A sandbox that is already gone (404) counts as
+// deleted, so a second call, or two calls at once, is safe. Any other failed
+// delete stops it: the error is returned with the IDs deleted so far, and
+// calling it again finishes the job. tags must not be empty, since with no
+// filter it would delete every sandbox the caller owns.
+func (c *Client) DestroyAll(ctx context.Context, tags map[string]string) ([]string, error) {
+	if len(tags) == 0 {
+		return nil, errors.New("DestroyAll needs at least one tag; with none it would delete every sandbox you own")
+	}
+	matches, err := c.List(ctx, WithTags(tags))
+	if err != nil {
+		return nil, err
+	}
+	gone := make([]string, 0, len(matches))
+	for _, sb := range matches {
+		if err := c.Destroy(ctx, sb.ID); err != nil && !errors.Is(err, ErrNotFound) {
+			return gone, fmt.Errorf("destroy %s: %w", sb.ID, err)
+		}
+		gone = append(gone, sb.ID)
+	}
+	return gone, nil
 }
 
 // CreateTemplate registers a Firecracker rootfs template. Returns immediately
@@ -674,6 +821,21 @@ func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.
 	return s.client.inner.UploadFileStream(ctx, s.ID, targetPath, r)
 }
 
+// UploadFileWithOptions is UploadFile with write options: append,
+// create-only, atomic replace and a file mode (see UploadFileOptions). A
+// sandbox whose agent predates them fails with ErrUnsupportedFeature rather
+// than ignoring them. Plain and atomic uploads retry like UploadFile; append
+// and create-only retry only on 429 and 503.
+func (s *Sandbox) UploadFileWithOptions(ctx context.Context, targetPath string, data []byte, opts sdktypes.UploadFileOptions) error {
+	return s.client.inner.UploadFileWithOptions(ctx, s.ID, targetPath, data, opts)
+}
+
+// UploadFileStreamWithOptions is UploadFileStream with write options. It is
+// sent once and never retried.
+func (s *Sandbox) UploadFileStreamWithOptions(ctx context.Context, targetPath string, r io.Reader, opts sdktypes.UploadFileOptions) error {
+	return s.client.inner.UploadFileStreamWithOptions(ctx, s.ID, targetPath, r, opts)
+}
+
 // DownloadFileStream opens targetPath for reading without buffering it. The
 // caller must Close the returned body; closing early ends the transfer, so
 // reading only the head of a large file costs only the head.
@@ -697,7 +859,16 @@ func (s *Sandbox) ToolboxRequest(ctx context.Context, method, path string, query
 type ExposeOption func(*exposeOptions)
 
 type exposeOptions struct {
-	protocol sdktypes.ExposeProtocol
+	protocol   sdktypes.ExposeProtocol
+	visibility sdktypes.ExposeVisibility
+}
+
+// WithVisibility sets who can open the port's URL. ExposeVisibilityToken
+// makes it need a sandbox token for this port (Sandbox.CreateToken with
+// Port). Without it a new port is public and an exposed port keeps what it
+// has; pass it to change it.
+func WithVisibility(v sdktypes.ExposeVisibility) ExposeOption {
+	return func(o *exposeOptions) { o.visibility = v }
 }
 
 // WithProtocol selects the wire surface the exposure publishes through.
@@ -726,11 +897,29 @@ func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return s.client.inner.ExposePort(ctx, s.ID, port, string(cfg.protocol))
+	return s.client.inner.ExposePortWithVisibility(ctx, s.ID, port, string(cfg.protocol), string(cfg.visibility))
 }
 
 func (s *Sandbox) UnexposePort(ctx context.Context, port int) error {
 	return s.client.inner.UnexposePort(ctx, s.ID, port)
+}
+
+// CreateToken issues a signed token for this sandbox only, to hand to a
+// browser or an end user. With opts.Port the token opens that port's public
+// URL (a port exposed with token visibility); without it the token is for
+// the toolbox: commands, files and sessions. Each call makes a new token,
+// and the server keeps no copy, so Token is shown only in the result. A
+// token stops working when it expires, when the sandbox is deleted, or when
+// RevokeTokens is called.
+func (s *Sandbox) CreateToken(ctx context.Context, opts sdktypes.CreateSandboxTokenOptions) (sdktypes.SandboxToken, error) {
+	return s.client.inner.CreateSandboxToken(ctx, s.ID, opts)
+}
+
+// RevokeTokens makes every token issued for this sandbox so far stop
+// working, toolbox and port tokens alike. A token made after the call
+// works. Safe to call again.
+func (s *Sandbox) RevokeTokens(ctx context.Context) (sdktypes.RevokeSandboxTokensResult, error) {
+	return s.client.RevokeSandboxTokens(ctx, s.ID)
 }
 
 // CustomDomainOption customizes an AddCustomDomain call. Build values with
@@ -817,6 +1006,29 @@ func (s *Sandbox) Stop(ctx context.Context) error {
 
 func (s *Sandbox) Destroy(ctx context.Context) error {
 	return s.client.Destroy(ctx, s.ID)
+}
+
+// closeTimeout bounds the delete Close sends. It is not tied to the caller's
+// ctx: a deferred Close often runs after that ctx was cancelled or timed out,
+// which is exactly when the cleanup still has to happen.
+const closeTimeout = 2 * time.Minute
+
+// Close deletes the sandbox when DestroyOnClose is true and does nothing
+// otherwise, so `defer sb.Close(ctx)` is the Go form of a block that cleans
+// up after itself. The delete ignores ctx's cancellation and deadline (it
+// keeps ctx's values) and has its own two-minute bound. A sandbox that is
+// already gone counts as deleted, and a second Close does nothing.
+func (s *Sandbox) Close(ctx context.Context) error {
+	if !s.DestroyOnClose || s.closed {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+	defer cancel()
+	if err := s.Destroy(ctx); err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	s.closed = true
+	return nil
 }
 
 func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions) error {

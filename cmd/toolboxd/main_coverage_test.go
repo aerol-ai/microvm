@@ -110,7 +110,10 @@ func TestHandleExecNonExitWaitMerge(t *testing.T) {
 		t.Fatalf("interpretWaitResult = (%d,%q)", code, sig)
 	}
 	srv := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	body := `{"command":"sh","argv":["-c","kill -9 $$"]}`
+	// Before argv existed this body also carried "argv", which toolboxd
+	// ignored; command and argv together are now refused (E2), so the
+	// command kills its own shell instead.
+	body := `{"command":"kill -9 $$"}`
 	rec := httptest.NewRecorder()
 	srv.handleExec(rec, httptest.NewRequest(http.MethodPost, "/process/execute", strings.NewReader(body)))
 	if rec.Code != http.StatusOK {
@@ -296,7 +299,9 @@ func TestHandleUploadMissingFileAndMkdirFail(t *testing.T) {
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	rec = httptest.NewRecorder()
 	srv.handleUpload(rec, req)
-	if rec.Code != http.StatusInternalServerError {
+	// A file where a parent folder should be: the wrong kind of path, a 409
+	// since plan F1/F2 mapped filesystem errors (it was a bare 500).
+	if rec.Code != http.StatusConflict {
 		t.Fatalf("mkdir fail status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }

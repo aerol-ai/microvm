@@ -88,7 +88,7 @@ flowchart TB
 | ID | Control | On by default | Owner | How to configure |
 |---|---|---|---|---|
 | WI‑1 | Runtime isolation | Containers | You | Choose `runtime: "gvisor"` or `"firecracker"` for code you do not trust. See [Sandboxes](/sandboxes/). |
-| WI‑2 | CPU, memory and disk limits | 1 CPU, 1 GB of memory, 10 GB of disk | Shared | `cpu`, `memoryMB` and `diskGB`. Disk is not limited on containerd and gVisor. |
+| WI‑2 | CPU, memory and disk limits | 1 CPU, 1 GB of memory, 10 GB of disk | Shared | `cpu`, `memoryMB` and `diskGB`. On containerd and gVisor, disk is limited only with `SB_CONTAINERD_DISK_QUOTA=true` (XFS with project quotas). |
 | WI‑3 | Process-count limit | Partial. Not in containers | Shared | Use Firecracker for hostile code |
 | WI‑4 | Lifetime timers | No | You | `stopIfIdleFor` and `destroyAtAge`, up to 30 days. See [Lifecycle](/lifecycle/). |
 | WI‑5 | Non-root code | Partial. Code runs as the image's default user. | You | Build images with a non-root `USER` |

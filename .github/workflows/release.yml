@@ -173,26 +173,28 @@ jobs:
             apt_pkgs: ""
             goarm: ""
 
-          # macOS — sandboxd (native CGO, for install.sh --local) + toolboxd.
-          # The in-sandbox agent install.sh mounts on macOS is the Linux
-          # toolboxd (containers run in Docker's Linux VM); toolboxd_darwin_*
-          # is still published for direct use.
+          # macOS — sandboxd (CGO, for install.sh --local) + toolboxd.
+          # The org has no macOS runners, so sandboxd cross-compiles on Linux
+          # with zig as the C toolchain (.github/darwin-cross/setup.sh). The
+          # in-sandbox agent install.sh mounts on macOS is the Linux toolboxd
+          # (containers run in Docker's Linux VM); toolboxd_darwin_* is still
+          # published for direct use.
           # - name: MacOS x86_64
-          #   runner: macos-13
+          #   runner: ubuntu-latest
           #   goos: darwin
           #   goarch: amd64
           #   suffix: darwin_amd64
-          #   cc: ""
-          #   apt_pkgs: ""
+          #   cc: "zig cc -target x86_64-macos.14.0"
+          #   apt_pkgs: llvm
           #   goarm: ""
 
           - name: MacOS aarch64
-            runner: macos-14
+            runner: ubuntu-latest
             goos: darwin
             goarch: arm64
             suffix: darwin_arm64
-            cc: ""
-            apt_pkgs: ""
+            cc: "zig cc -target aarch64-macos.14.0"
+            apt_pkgs: llvm
             goarm: ""
 
     steps:
@@ -222,6 +224,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
+      - name: Set up darwin cross toolchain
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: bash .github/darwin-cross/setup.sh
+
       - name: Build sandboxd (Linux + macOS, CGO enabled)
         if: matrix.goos == 'linux' || matrix.goos == 'darwin'
         shell: bash
@@ -236,6 +243,32 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
           chmod 0755 dist/sandboxd_${{ matrix.suffix }}
 
+      # Upgrade checks (`sandboxd upgrade node`, the docs' "Upgrading"
+      # steps, integration-tests/upgrade-gate.sh) read the version from the
+      # binary (`sandboxd version`, `sandboxd --version`), so a release whose
+      # binary misreports it would pass them all while running the wrong
+      # build.
+      - name: Check the linux_amd64 sandboxd reports the release version
+        if: matrix.suffix == 'linux_amd64'
+        shell: bash
+        run: |
+          # The whole output first, then its first line: `| head -n1` under
+          # pipefail can fail on SIGPIPE when head exits before the rest.
+          out="$(dist/sandboxd_linux_amd64 --version)"
+          got="${out%%$'\n'*}"
+          if [[ "$got" != "sandboxd $VERSION" ]]; then
+            echo "::error::sandboxd --version printed '$got', want 'sandboxd $VERSION'"
+            exit 1
+          fi
+
+      # Same check as test.yml: macOS kills an unsigned arm64 binary at launch.
+      - name: Check the darwin binary is signed
+        if: matrix.suffix == 'darwin_arm64'
+        shell: bash
+        run: |
+          llvm-objdump --macho --private-headers dist/sandboxd_${{ matrix.suffix }} | grep LC_CODE_SIGNATURE >/dev/null ||
+            { echo "::error::sandboxd_${{ matrix.suffix }} has no code signature; macOS will not run it"; exit 1; }
+
       - name: Build toolboxd
         shell: bash
         env:
@@ -248,15 +281,50 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/toolboxd_${{ matrix.suffix }} ./cmd/toolboxd
           chmod 0755 dist/toolboxd_${{ matrix.suffix }}
 
+      # The Kubernetes runtime container's first process (cmd/aerolvm-supervisor);
+      # the images job packs it into aerolvm-runtime. Static, like toolboxd.
+      - name: Build aerolvm-supervisor (Linux amd64 and arm64)
+        if: matrix.goos == 'linux' && (matrix.goarch == 'amd64' || matrix.goarch == 'arm64')
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/aerolvm-supervisor_${{ matrix.suffix }} ./cmd/aerolvm-supervisor
+          chmod 0755 dist/aerolvm-supervisor_${{ matrix.suffix }}
+
+      # The Kubernetes operator (operator/, its own Go module, P2); the
+      # images job packs it into aerolvm-operator. Static.
+      - name: Build aerolvm-operator (Linux amd64 and arm64)
+        if: matrix.goos == 'linux' && (matrix.goarch == 'amd64' || matrix.goarch == 'arm64')
+        shell: bash
+        working-directory: operator
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p ../dist
+          go build -trimpath -ldflags "$LDFLAGS" -o ../dist/aerolvm-operator_${{ matrix.suffix }} ./cmd/aerolvm-operator
+          chmod 0755 ../dist/aerolvm-operator_${{ matrix.suffix }}
+
       - name: Build custom Caddy (Linux only)
         if: matrix.goos == 'linux'
         shell: bash
         run: |
           mkdir -p dist
+          # The Caddy core and plugins are pinned in scripts/install.sh
+          # (CADDY_BUILD_VERSION and the CADDY_*_MODULE lines);
+          # integration-tests/safety/caddy_version_test.go keeps this in step.
+          # caddymod is AerolVM's own plugin, from this checkout: the owner
+          # route's upstream lookup (pkg/caddy staticRouteSource).
           go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            "$(go env GOPATH)/bin/xcaddy" build \
+            "$(go env GOPATH)/bin/xcaddy" build v2.11.8-0.20261106223313-31f9f0cb9949 \
             --output dist/caddy_${{ matrix.suffix }} \
+            --with github.com/aerol-ai/microvm/caddymod=./caddymod \
             --with github.com/mholt/caddy-l4@v0.1.2 \
             --with github.com/caddy-dns/cloudflare@v0.2.4 \
             --with github.com/ss098/certmagic-s3@v0.0.0-20250922022452-8af482af5f39
@@ -266,6 +334,9 @@ jobs:
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'layer4.handlers.proxy'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'dns.providers.cloudflare'
             dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'caddy.storage.s3'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'http.reverse_proxy.upstreams.aerolvm_route'
+            dist/caddy_${{ matrix.suffix }} list-modules | grep -qx 'admin.api.aerolvm_route'
+            dist/caddy_${{ matrix.suffix }} version | grep -q '^v2\.11\.8-0\.20261106223313-31f9f0cb9949 '
           fi
 
       - name: Upload build artifacts
@@ -336,6 +407,93 @@ jobs:
           name: dist-aerolvm
           path: dist/
 
+  # The Kubernetes images (plans/kubernetes-v2-architecture.md P1): aerolvm,
+  # aerolvm-runtime, aerolvm-edge and aerolvm-operator, built from this release's own Linux
+  # binaries (scripts/build-images.sh; nothing is compiled in the image) for
+  # amd64 and arm64, pushed to ghcr.io/aerol-ai with an SBOM and SLSA
+  # provenance attached by buildx, signed keyless with cosign, and attested
+  # with GitHub's provenance as the release files are. RELEASE-VERIFICATION.md
+  # says how to check them.
+  images:
+    name: Images
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      REGISTRY: ghcr.io/aerol-ai
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download the Linux binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-linux_{amd64,arm64}
+          merge-multiple: true
+          path: dist
+
+      - name: Set up QEMU (arm64 package installs)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: scripts/build-images.sh --dist dist --version "$VERSION" --registry "$REGISTRY" --push --metadata-dir image-meta
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign
+        run: |
+          for pair in aerolvm:AEROLVM_DIGEST aerolvm-runtime:RUNTIME_DIGEST aerolvm-edge:EDGE_DIGEST aerolvm-operator:OPERATOR_DIGEST; do
+            image="${pair%%:*}" var="${pair#*:}"
+            digest="$(jq -r '."containerimage.digest"' "image-meta/$image.json")"
+            [[ "$digest" == sha256:* ]] || { echo "::error::no digest for $image"; exit 1; }
+            cosign sign --yes "$REGISTRY/$image@$digest"
+            echo "$var=$digest" >> "$GITHUB_ENV"
+          done
+
+      - name: Attest aerolvm
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm
+          subject-digest: ${{ env.AEROLVM_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-runtime
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-runtime
+          subject-digest: ${{ env.RUNTIME_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-edge
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-edge
+          subject-digest: ${{ env.EDGE_DIGEST }}
+          push-to-registry: true
+
+      - name: Attest aerolvm-operator
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/aerol-ai/aerolvm-operator
+          subject-digest: ${{ env.OPERATOR_DIGEST }}
+          push-to-registry: true
+
   release:
     name: Publish release
     needs: [hold-latest, build, cli]
@@ -374,16 +532,48 @@ jobs:
           merge-multiple: true
 
       # Terraform's seed bootstrap downloads cluster-sign-node.sh from
-      # /releases/latest/download/ (Terraform/variables.tf), so every script a
-      # Terraform default names must ship here; integration-tests/safety
-      # TestTerraformReleaseURLsNameShippedAssets keeps the two in step.
+      # /releases/latest/download/ (Terraform/variables.tf), and the operator
+      # docs download uninstall.sh from there, so every script a Terraform
+      # default or a doc names must ship here; integration-tests/safety
+      # TestTerraformReleaseURLsNameShippedAssets and
+      # TestDocsReleaseURLsNameShippedAssets keep them in step.
       - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
+          cp scripts/uninstall.sh dist/uninstall.sh
           cp scripts/cluster-init.sh dist/cluster-init.sh
           cp scripts/cluster-join.sh dist/cluster-join.sh
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
-          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
+          chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
+
+      # release.json says which versions may upgrade straight to this one and
+      # what the upgrade changes (plans/kubectl-style-cluster-ops.md §6.5). It
+      # is generated from the tagged tree through the pkg/release type, never
+      # written by hand, and hashes the install.sh shipped above. It runs
+      # before the tagged copies and checksums.txt so both cover it.
+      # integration-tests/safety TestReleaseWorkflowGeneratesReleaseJSON keeps
+      # it in that place.
+      - name: Generate release.json
+        run: go run ./cmd/releasemeta -version "$VERSION" -install-script dist/install.sh -o dist/release.json
+
+      # The operator files from setup/ (alert rules, Alertmanager config,
+      # Grafana dashboards, runbooks), so nobody needs a checkout for them
+      # (plans/kubectl-style-cluster-ops.md §7). The file list is the tree
+      # itself; cmd/opsbundle's tests check the bundle holds what setup/
+      # has. Before checksums.txt, so it covers the bundle;
+      # integration-tests/safety TestReleaseWorkflowShipsTheOpsBundle keeps
+      # it there.
+      - name: Bundle the ops files
+        run: go run ./cmd/opsbundle -version "$VERSION" -setup setup -mtime "$(git log -1 --format=%ct)" -o "dist/aerolvm-ops-${VERSION}.tar.gz"
+
+      # Krew installs only from archives, so aerolvm ships as
+      # aerolvm_<os>_<arch>.tar.gz too, with a Krew manifest and a Homebrew
+      # formula built from those archives' names and hashes
+      # (plans/kubectl-style-cluster-ops.md §7, D13). Like release.json it is
+      # generated, never hand-synced, and runs before the tagged copies and
+      # checksums.txt so both cover it; cmd/aerolvmdist's tests keep it here.
+      - name: Package aerolvm for Krew and Homebrew
+        run: go run ./cmd/aerolvmdist -version "$VERSION" -dist dist -repo "$GITHUB_REPOSITORY"
 
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
@@ -396,7 +586,8 @@ jobs:
           cd dist
           for asset in *; do
             case "$asset" in
-              checksums.txt|sbom.cdx.json|*.intoto.jsonl) continue ;;
+              # The ops bundle's name already carries the tag.
+              checksums.txt|sbom.cdx.json|*.intoto.jsonl|aerolvm-ops-*) continue ;;
             esac
             cp "$asset" "${VERSION}_${asset}"
           done
@@ -422,7 +613,7 @@ jobs:
         run: cp "$BUNDLE_PATH" "dist/${VERSION}.intoto.jsonl"
 
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true
@@ -445,6 +636,135 @@ jobs:
             exit 0
           fi
           gh release edit "$VERSION" --latest
+
+  # A second home for the release files, for when github.com release
+  # downloads fail (they returned 504 for hours on 2026-11-08, from a laptop
+  # and from AWS alike, so new nodes could not install Caddy). The same files
+  # go to s3://aerolvm-downloads/aerolvm/<tag>/, which anyone can read; the
+  # download side that falls back to it lives in install.sh and the harness.
+  # A job of its own, after the GitHub release: a mirror failure never holds
+  # back the binaries, and "Re-run failed jobs" retries just this. It reads
+  # the published release, checks every file against its checksums.txt, then
+  # syncs, so the mirror holds exactly what GitHub serves; a release that
+  # became GitHub's latest also becomes the mirror's (latest.txt). Off until the
+  # one-time setup is done (RELEASING.md, "The download mirror"): set the
+  # repository variable AEROLVM_MIRROR_ROLE_ARN to the role it assumes.
+  mirror:
+    name: Copy the release files to the download mirror
+    needs: release
+    if: vars.AEROLVM_MIRROR_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      MIRROR_BUCKET: aerolvm-downloads
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag becomes part of the S3 key.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Download the published release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$VERSION" --dir dist
+
+      - name: Check every file against checksums.txt
+        run: |
+          cd dist
+          sha256sum --check --strict checksums.txt
+          # checksums.txt does not list itself or the provenance bundle;
+          # anything else unlisted would be an extra, unchecked file.
+          unlisted=$(comm -23 <(ls | sort) <(awk '{print $2}' checksums.txt | sort) \
+            | grep -vxF -e checksums.txt -e "${VERSION}.intoto.jsonl" || true)
+          if [[ -n "$unlisted" ]]; then
+            echo "::error::release files not in checksums.txt: $unlisted"
+            exit 1
+          fi
+
+      - name: Get AWS credentials for the mirror (GitHub OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AEROLVM_MIRROR_ROLE_ARN }}
+          role-session-name: release-mirror-${{ github.run_id }}
+          role-duration-seconds: 3600
+          aws-region: us-east-1
+
+      - name: Copy the files to the mirror
+        run: aws s3 sync dist/ "s3://${MIRROR_BUCKET}/aerolvm/${VERSION}/" --only-show-errors --no-progress
+
+      - name: Check the mirror serves the same checksums.txt
+        run: |
+          url="https://${MIRROR_BUCKET}.s3.us-east-1.amazonaws.com/aerolvm/${VERSION}/checksums.txt"
+          if ! curl -fsSL --retry 3 "$url" | cmp -s - dist/checksums.txt; then
+            echo "::error::$url does not match the release's checksums.txt"
+            exit 1
+          fi
+          echo "Mirrored $(ls dist | wc -l) files to $url"
+
+      # install.sh finds "latest" on the mirror by reading aerolvm/latest.txt
+      # (#1051, the download side). It names this tag only when the release
+      # job made it GitHub's latest, and moves only after every file is up and
+      # checked above, so an install that reads it never finds a release half
+      # uploaded. Same format as scripts/mirror-sync.sh writes.
+      - name: Point the mirror's latest.txt at this release, if it is GitHub's latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "GitHub's latest release is $latest, so aerolvm/latest.txt stays as it is."
+            exit 0
+          fi
+          printf '%s\n' "$VERSION" > latest.txt
+          aws s3 cp latest.txt "s3://${MIRROR_BUCKET}/aerolvm/latest.txt" \
+            --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
+          echo "aerolvm/latest.txt now names $VERSION"
+
+      # The third-party files this release's install.sh pins (CNI plugins,
+      # BuildKit, Firecracker, Caddy, workerd) are its fallback too. A pin
+      # bump used to need a hand-run `mirror-sync.sh --deps`, and a forgotten
+      # one left the new version without a mirror copy. This runs it on every
+      # release: it first asks the public mirror, and when every pinned file
+      # is there (the usual case) it downloads and uploads nothing. Otherwise
+      # it checks every file against its pin before uploading any. Last in the
+      # job, so the release files and latest.txt above never wait on it.
+      - name: Check out this release's install.sh (its download pins)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+          path: src
+          persist-credentials: false
+
+      - name: Copy any pinned third-party file the mirror lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: src/scripts/mirror-sync.sh --deps --bucket "$MIRROR_BUCKET"
+
+      # Terraform's providers for this release's Terraform/, as a network
+      # mirror under tf-providers/: the harness's tf_init_failover falls back
+      # to it when the registries fail on a machine whose plugin cache lacks
+      # a provider (cloudflare's GitHub-hosted packages answered 504 for
+      # hours on 2026-11-09). Terraform checks each package's signature as
+      # it downloads it; a version already on the mirror is not sent again.
+      # Then the check installs every provider from the mirror alone.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_wrapper: false
+
+      - name: Copy Terraform's providers to the mirror
+        run: src/scripts/mirror-sync.sh --tf-providers --bucket "$MIRROR_BUCKET"
+
+      - name: Check Terraform installs every provider from the mirror alone
+        run: src/scripts/mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"
 
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
@@ -514,6 +834,76 @@ jobs:
             fi
             (cd "npm-dist/$dir" && "$npm_bin" publish --access public --tag "$tag")
           done < npm-dist/order.txt
+
+  # The Homebrew tap is opt-in like npm, until its one-time setup is done:
+  # the repository variable AEROLVM_HOMEBREW_TAP names the tap (owner/repo,
+  # for example aerol-ai/homebrew-tap, so `brew install aerol-ai/tap/aerolvm`
+  # works) and the secret HOMEBREW_TAP_TOKEN may push to it. It runs after the
+  # GitHub release, for stable releases only, and copies the aerolvm.rb that
+  # release published, so the tap always names that release's own archives
+  # and hashes. Safe to re-run: an unchanged formula makes no commit.
+  homebrew:
+    name: Publish the Homebrew formula
+    needs: release
+    if: vars.AEROLVM_HOMEBREW_TAP != '' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      TAP: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+    steps:
+      - name: Reject a release tag or tap that is not well formed
+        run: |
+          # Same check as the test job, stable versions only. The tag and the
+          # tap reach gh and git below.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+          if [[ ! "$TAP" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::AEROLVM_HOMEBREW_TAP must look like owner/homebrew-tap"
+            exit 1
+          fi
+
+      - name: Download the formula this release published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$VERSION" --pattern aerolvm.rb --dir formula
+
+      - name: Check out the tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ vars.AEROLVM_HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # Re-running this workflow for an older tag must not move the tap back,
+      # the same rule as "Mark the release as latest".
+      - name: Commit the formula if this is the newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          if [[ "$newest" != "$VERSION" ]]; then
+            echo "$newest is newer than $VERSION, so the tap stays on $newest."
+            exit 0
+          fi
+          mkdir -p tap/Formula
+          cp formula/aerolvm.rb tap/Formula/aerolvm.rb
+          cd tap
+          git add Formula/aerolvm.rb
+          if git diff --cached --quiet; then
+            echo "The tap already has the $VERSION formula."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "aerolvm ${VERSION}"
+          git push
 
   mcp-registry:
     name: Publish to the MCP Registry

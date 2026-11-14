@@ -113,6 +113,26 @@ behavior, single-node no-op, and leader-change replay safety.
   `cluster_handler_test.go`, `build_test.go`, `template_test.go`).
 - **Single-node / cluster-off.** All wrappers must no-op when `EnableCluster` is
   false or `cluster.Client` is nil (`cluster.NewNoop`).
+- **Raft writes outside create and delete.** Every Raft entry is synced by every
+  server and shares one leader's commit pipeline with all creates. A PR that
+  adds a Raft write (or a spec write-through) to any other call must say in its
+  description how many entries one call makes and how often clients call it (a
+  keep-alive can be called every few seconds per sandbox). Skip the write when
+  nothing changed, or when nothing will read the field back: lifecycle, tags and
+  facade state go through `replicateRecoverySpecPatch`, which writes only for
+  failover=recreate sandboxes. A keep-alive that only moves an age timer later
+  may lag up to a minute (`replicateRecoveryLifecycle`). Count the writes in a
+  test, per facade route (`TestSpecWriteThroughRaftWrites`,
+  `TestLifecycleKeepAliveRaftWrites`, `TestE2BTimeoutRoutesRaftWrites`,
+  `TestDaytonaRoutesRaftWrites`, `TestRunloopRoutesRaftWrites`).
+- **Replicated spec writes read, change and write through
+  `writeReplicatedSpec`.** A spec write replaces the whole spec, and a worker
+  reads it from a random server, which can be a follower behind this node's
+  last write. A new `SpecOf` + `UpsertSpec` pair outside that helper can put
+  back a field another write just changed (a resize lost to a lifecycle
+  change, UC-706). Its edit function must be safe to run again on a fresh
+  copy; the helper re-reads after `cluster.ErrSpecVersionConflict`
+  (`TestWriteReplicatedSpecReadsPastStaleCopies`).
 
 ### 7.1 Reference implementation — B7 local-only built images & per-host routing
 

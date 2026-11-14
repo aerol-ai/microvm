@@ -76,7 +76,7 @@ This attaches the volume `data` at `/workspace`.
         platform_volumes: Some(vec![PlatformVolumeMount {
             name: "data".into(),
             path: "/workspace".into(),
-            read_only: None,
+            ..Default::default()
         }]),
         ..Default::default()
     })?;
@@ -97,8 +97,9 @@ This attaches the volume `data` at `/workspace`.
 | `name` | The volume's name. | Required |
 | `path` | The folder inside the sandbox, as a full path. | Required |
 | `readOnly` | Let the sandbox read the files but not change them. | `false` |
+| `deleteWithSandbox` | Delete the volume when the last sandbox that uses it is deleted. See [Delete a volume with its sandbox](#delete-a-volume-with-its-sandbox). | `false` |
 
-Go spells these `Name`, `Path` and `ReadOnly`. Rust uses `read_only`. Python also accepts `platform_volumes` and `read_only`.
+Go spells these `Name`, `Path`, `ReadOnly` and `DeleteWithSandbox`. Rust uses `read_only` and `delete_with_sandbox`. Python also accepts `platform_volumes`, `read_only` and `delete_with_sandbox`.
 
 <Aside>
 Platform volumes only work when your operator has turned them on. If they are off, every request that uses a volume fails with HTTP 412 (Precondition Failed). Ask your server operator to turn them on.
@@ -130,6 +131,73 @@ stateDiagram-v2
 - **A volume in use cannot be deleted.** A stopped sandbox still counts. Delete every sandbox that uses the volume first, or the delete fails with HTTP 409 (Conflict).
 - **Deleting a volume deletes its files.** The server removes them in the background, a few minutes later. If you reuse the name before that, the old files are still there.
 - **There is no AerolVM SDK call to list or delete volumes yet.** The [Daytona SDK](/using-daytona-sdk/) can create, list, get and delete them through AerolVM.
+
+## Delete a volume with its sandbox
+
+Some volumes are only scratch space for one job. Set `deleteWithSandbox: true`, and the volume goes away when the last sandbox that uses it is deleted. You do not have to clean it up yourself.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      platformVolumes: [{ name: "job-42", path: "/work", deleteWithSandbox: true }],
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        platformVolumes=[{"name": "job-42", "path": "/work", "deleteWithSandbox": True}],
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        PlatformVolumes: []sdktypes.PlatformVolumeMount{
+            {Name: "job-42", Path: "/work", DeleteWithSandbox: true},
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::PlatformVolumeMount;
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        platform_volumes: Some(vec![PlatformVolumeMount {
+            name: "job-42".into(),
+            path: "/work".into(),
+            delete_with_sandbox: Some(true),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setPlatformVolumes(List.of(
+            new PlatformVolumeMount().setName("job-42").setPath("/work").setDeleteWithSandbox(true))));
+    ```
+  </TabItem>
+</Tabs>
+
+- **It is a setting of the volume, not of one sandbox.** It is fixed when the volume is first made. A later sandbox that names the same volume must pass the same value, or its create fails with HTTP 409 (Conflict). This way nobody deletes a volume they did not mean to, and nobody keeps one they meant to delete.
+- **"The last sandbox" counts every sandbox that uses the volume,** stopped ones too. While any of them is left, the volume stays. A sandbox that moves to another server after a failure still counts.
+- **The volume's record goes with the sandbox,** or at the latest on the next cleanup pass a few minutes later (for example in a cluster, when another server has not yet caught up). Its files are removed in the background, like any deleted volume. If a new sandbox uses the same name before then, it sees the old files. For a clean start each time, give each job its own name.
+- **If the delete fails, it is not lost.** The server writes the volume down to be deleted before it tries. If the store is unreachable, the next cleanup pass tries again.
+- **A create that races the delete may fail.** If one sandbox starts with the volume just as the last other one is deleted, the start can fail. Try it again: it then gets a new, empty volume.
+- The Daytona and E2B SDKs have no such setting. Volumes they make are always kept, and attaching a volume made with `deleteWithSandbox: true` from them fails with HTTP 409.
 
 ## What you can do with the files
 
@@ -180,6 +248,7 @@ How it is laid out and kept safe:
 - **A volume's folder is fixed when the volume is made.** If you later change the bucket, prefix or export, existing volumes keep mounting from their old folder, with the current keys.
 - **The store's keys stay on the server.** They are saved encrypted in the server's database with each mount. No read API returns them, and they never enter a sandbox, because the mount runs on the server.
 - **You own and pay for the store.** Set any lifecycle or retention rules on it yourself.
+- **Size limits are set on the store, not in AerolVM.** A sandbox writes to its volume directly, so AerolVM cannot stop a write that goes over a limit. Cap the size where the data lives. On NFS, use your file server's quotas on the export, or on each account's folder under it. On S3, there is no size limit per prefix: watch usage with S3 Storage Lens or a CloudWatch alarm on the bucket's size, and use a lifecycle rule to expire old objects. Use a separate bucket when one group of users needs its own limit.
 
 When a volume is deleted, a background job removes its files. On S3 it runs `aws s3 rm --recursive`, so the AWS CLI must be installed on each server. The one-line installer does not install it, but the cluster Terraform setup does. On NFS it mounts the export and removes the volume's folder. A failed cleanup is tried again on the next pass.
 

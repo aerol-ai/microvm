@@ -105,7 +105,7 @@ sandboxd_node_id: ""
 
 # CNI plugins for SB_CONTAINER_ENGINE=containerd (plans/containerd-engine.md
 # Phase 5). Mirrors scripts/install.sh install_cni_plugins version pin.
-sandboxd_cni_plugins_version: "v1.5.1"
+sandboxd_cni_plugins_version: "v1.9.1"
 
 # Optional Vault/SOPS workflow: deliver the secret from a file on the control
 # node instead of inlining it in config/secrets.yml. If a *_src path is set

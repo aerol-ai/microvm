@@ -90,3 +90,18 @@ type SpawnedHandle interface {
 type Spawner interface {
 	Spawn(ctx context.Context, slotID string, inputs SnapshotInputs) (SpawnedHandle, error)
 }
+
+// OrphanCleaner tears down what a released slot's row points to when the
+// pool holds no handle for it. That is every claimed slot (its sandbox's
+// destroy already stopped the VM) and every slot a daemon restart left
+// behind: handles do not survive a restart, and the row then is the only
+// record of the slot's run dir and TAP device. The runtime adapter
+// implements it, as it does Spawner.
+//
+// CleanupOrphanSlot must be idempotent: a slot whose VM, TAP device and
+// run dir are already gone is torn down. It returns an error, and the pool
+// keeps the row for the next pass, when it cannot tear something down,
+// including a VM that still answers on the slot's API socket.
+type OrphanCleaner interface {
+	CleanupOrphanSlot(ctx context.Context, slot Slot) error
+}

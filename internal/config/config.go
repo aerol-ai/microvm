@@ -1,11 +1,14 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -14,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
@@ -129,20 +133,44 @@ type Config struct {
 	// EnterpriseMode enables a fail-fast production profile. It validates that
 	// secret sealing, audit durability, resource isolation, and cluster mTLS
 	// cannot be accidentally disabled. SB_ENTERPRISE_MODE.
-	EnterpriseMode              bool
-	PATToken                    string
-	APIHost                     string
-	APIPort                     int
-	Domain                      string
-	PublicHost                  string
-	CaddyAdminURL               string
-	CaddyServerID               string
-	DBPath                      string
-	DockerNetwork               string
-	ToolboxBinaryPath           string
-	ToolboxMountPath            string
-	ToolboxPort                 int
-	IdleTimeoutMinutes          int
+	EnterpriseMode bool
+	// RemoteUpgrade is SB_REMOTE_UPGRADE: whether this node accepts upgrade
+	// commands over the API. Default true, false in enterprise mode unless
+	// set (remote_upgrade.go).
+	RemoteUpgrade bool
+	// UpgradeDriver is SB_UPGRADE_DRIVER: empty, or "operator" when the
+	// Kubernetes operator upgrades this node (remote_upgrade.go).
+	UpgradeDriver string
+	// UpgradeServeMBPS is SB_UPGRADE_SERVE_MBPS: the cap, in MB/s, on the
+	// release-file copies one server serves to other nodes during a
+	// rollout (CEO D15). Default DefaultUpgradeServeMBPS.
+	UpgradeServeMBPS   int
+	PATToken           string
+	APIHost            string
+	APIPort            int
+	Domain             string
+	PublicHost         string
+	CaddyAdminURL      string
+	CaddyServerID      string
+	DBPath             string
+	DockerNetwork      string
+	ToolboxBinaryPath  string
+	ToolboxMountPath   string
+	ToolboxPort        int
+	IdleTimeoutMinutes int
+	// DefaultDestroyIfIdleFor and MaxAge are server-wide default destroy
+	// timers (SB_DEFAULT_DESTROY_IF_IDLE_FOR, SB_MAX_AGE; 0 = off, at most
+	// 30 days), so a client that crashes before cleaning up cannot leak
+	// sandboxes forever (plans/agent-sandbox-feature-parity.md L4). Like
+	// SB_IDLE_TIMEOUT_MIN they apply only to a sandbox created with no
+	// lifecycle timers of its own, and never touch one that has its own.
+	DefaultDestroyIfIdleFor time.Duration
+	MaxAge                  time.Duration
+	// EnablePprof serves Go's profiler (net/http/pprof) at /debug/pprof/
+	// to fleet.admin callers (SB_ENABLE_PPROF, default false; plans/agent-
+	// sandbox-feature-parity.md O2). Off by default: a profile shows the
+	// daemon's goroutines, heap and command line, and taking one costs CPU.
+	EnablePprof                 bool
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
@@ -162,6 +190,14 @@ type Config struct {
 	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
 	// mode). Sandboxes are default-denied from the node they run on.
 	SandboxNodePortsAllow []SandboxNodePort
+	// SandboxNodeIngressClosed keeps 80 and 443 closed to sandboxes on an
+	// ingress node (SB_SANDBOX_NODE_INGRESS=false; default open). On a
+	// server the internet reaches those ports on its own address anyway, so
+	// a sandbox may too. In a Kubernetes pod the internet reaches them
+	// through a Service, and a sandbox's own traffic to the public name
+	// leaves the pod; a direct path would skip the private-range block when
+	// that Service is internal (C24).
+	SandboxNodeIngressClosed bool
 	// DiskLimitCheckInterval is how often the disk watchdog checks each
 	// container sandbox's writable layer against its DiskGB
 	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
@@ -184,12 +220,46 @@ type Config struct {
 	// ContainerdRunDir is the host workdir for per-sandbox host files
 	// (resolv.conf, hosts, task logs). SB_CONTAINERD_RUN_DIR.
 	ContainerdRunDir string
+	// ContainerdCgroupParent, when set, is the cgroup (a path under the
+	// cgroup v2 root, e.g. a Kubernetes worker pod's own group) that every
+	// containerd-engine sandbox's cgroup is made under, as <parent>/<id>.
+	// Unset keeps containerd's default, /<namespace>/<id> at the root of the
+	// machine's tree. Inside a Kubernetes pod that default puts sandboxes
+	// outside the pod's CPU and memory box (plans/kubernetes-v2-architecture.md
+	// §8.3, C7; seen live in Phase 0 spike S1). SB_CONTAINERD_CGROUP_PARENT.
+	ContainerdCgroupParent string
+	// HostProcessCgroupParent is the cgroup (a path under the cgroup v2
+	// root) that the sandboxes sandboxd starts itself are made under: WASM
+	// workers, V8-isolate group hosts and their jail, Firecracker VMs. They
+	// go there to outlive sandboxd, and the next one takes them over. Unset,
+	// they go at the root of the machine's tree, as on a VM. It defaults to
+	// SB_CONTAINERD_CGROUP_PARENT: in a Kubernetes worker pod that is the
+	// runtime container's sandboxes group, inside the pod's box and its
+	// sandbox memory cap (F10), and outside the agent container, whose
+	// restart would otherwise kill them (C14). With it set, a worker that
+	// runs these sandboxes needs a process namespace its own container does
+	// not own (CheckHostProcessesOutliveAgent). SB_HOST_PROCESS_CGROUP_PARENT.
+	HostProcessCgroupParent string
 	// ContainerdLogDir overrides per-task log file placement; defaults to
 	// ${ContainerdRunDir}/logs. SB_CONTAINERD_LOG_DIR.
 	ContainerdLogDir string
 	// ContainerdNativeNetnsPoolEnabled gates the CNI-backed native netns pool
 	// for containerd creates (Phase 2). Default off — dockerd path unchanged.
 	ContainerdNativeNetnsPoolEnabled bool
+	// ContainerdDiskQuota enforces each sandbox's DiskGB as an XFS project
+	// quota on its writable layer (C27 in plans/kubernetes-v2-architecture.md,
+	// proven by spike S8). containerd's snapshots must sit on XFS mounted with
+	// prjquota, on a volume nothing else uses project IDs on: a sandbox's
+	// project ID is its overlay snapshot's number. SB_CONTAINERD_DISK_QUOTA.
+	ContainerdDiskQuota bool
+	// GvisorCheckpointMoves lets a decommission move a running gVisor
+	// sandbox to another worker with its memory (C21 in
+	// plans/kubernetes-v2-architecture.md): the source saves it with runsc
+	// checkpoint, the target restores it through aerolvm-runsc, which only
+	// the Kubernetes worker's runtime image installs. Off here; the chart
+	// turns it on for workers, and off again is the kill switch (D-1): the
+	// sandbox then takes the next §10.5 row. SB_GVISOR_CHECKPOINT_MOVES.
+	GvisorCheckpointMoves bool
 	// ContainerdNetnsPoolDepth is the number of slots the refiller keeps
 	// pre-realized (CNI ADD done) for a fast warm-hit create. It is the WARM
 	// target, NOT the total capacity — see ContainerdNetnsPoolSize.
@@ -208,12 +278,21 @@ type Config struct {
 	ContainerdCNIPluginDir string
 	// ContainerdCNIConfPath is the bridge conflist used for ADD/DEL.
 	ContainerdCNIConfPath string
+	// ContainerdBridgeSubnet is the IPv4 range containerd sandboxes get
+	// their addresses from (C3: a bank network may already use 10.88.0.0/16).
+	// SB_CONTAINERD_BRIDGE_SUBNET. Empty here means "not set"; the daemon
+	// resolves it at boot against the conflist (resolveContainerdBridgeSubnet)
+	// and every user reads the resolved value.
+	ContainerdBridgeSubnet string
 	// ContainerdBuildKitAddr is the buildkitd control socket used for image
 	// builds on the containerd engine (buildctl --addr). The bootstrap installs
 	// buildkitd at the default socket with a containerd worker on the aerolvm
 	// namespace. SB_CONTAINERD_BUILDKIT_ADDR.
 	ContainerdBuildKitAddr string
-	// ContainerdNetnsPoolRefillInterval drives native netns pool refill.
+	// ContainerdNetnsPoolRefillInterval is the native netns pool's refill
+	// backstop tick. A claim from the warm queue wakes the refiller at
+	// once; the tick covers freed slots, failed refills and the retry of
+	// slots parked as releasing.
 	ContainerdNetnsPoolRefillInterval time.Duration
 	// ContainerdPoolEnabled gates the warm containerd task pool (Phase 3).
 	// SB_CONTAINERD_POOL_ENABLED.
@@ -259,11 +338,47 @@ type Config struct {
 	// them off (the rules' flows are then refused).
 	EgressProcidSocket string
 	// EgressGatewayUser is the gateway's system user, the only peer the
-	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER): a name, or "uid" or
+	// "uid:gid" where the gateway runs in a container of its own (C6).
 	EgressGatewayUser string
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
+	// EgressBlockPrivateByDefault gives a container, gVisor or Firecracker
+	// create that sets no egress policy a deny list of the private and
+	// link-local ranges (RFC 1918, 169.254/16), with the sandbox's own DNS
+	// resolvers left open, instead of no filter at all
+	// (SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT, plans/agent-sandbox-feature-parity.md
+	// T4). A create that sets any policy keeps its own. Off by default.
+	EgressBlockPrivateByDefault bool
+	// EgressDenyFloorCIDRs are addresses no sandbox may reach, whatever its
+	// policy or egress profile allows: they join the cloud metadata
+	// endpoints on the deny floor of every runtime (the host firewall, the
+	// egress gateway, and the WASM and isolate dial guards). On Kubernetes
+	// the API server's addresses go here (SB_EGRESS_DENY_FLOOR_CIDRS,
+	// plans/kubernetes-v2-architecture.md C24). Default empty.
+	EgressDenyFloorCIDRs []netip.Prefix
+	// EgressDenyFloorFile names a file of more deny-floor addresses that
+	// may change while sandboxd runs (SB_EGRESS_DENY_FLOOR_FILE, review R4).
+	// On Kubernetes the operator keeps the API server's current addresses
+	// there, so a worker made before they changed refuses the new ones too.
+	// Read at boot into EgressDenyFloorFileCIDRs, then watched. Default
+	// empty.
+	EgressDenyFloorFile      string
+	EgressDenyFloorFileCIDRs []netip.Prefix
+	// EgressPrivateDefaultCIDRs are ranges treated like RFC 1918: a sandbox
+	// with no egress policy cannot reach them, and a policy opens one only
+	// with an allow entry for it, so a bank can open one range on purpose.
+	// On Kubernetes the cluster's pod, Service and node ranges go here; a
+	// cluster may use ranges outside RFC 1918
+	// (SB_EGRESS_PRIVATE_DEFAULT_CIDRS, C24). Needs
+	// SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT. Default empty.
+	EgressPrivateDefaultCIDRs []netip.Prefix
+	// CreatePolicyFile is the operator's create policy
+	// (SB_CREATE_POLICY_FILE, internal/createpolicy): allowed images,
+	// registries and runtimes, size limits, non-root and GPU rules, checked
+	// at create and resize. Empty keeps today's behavior.
+	CreatePolicyFile string
 	// EgressProfileApplyQPS bounds how many sandboxes per second this node
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
@@ -323,6 +438,11 @@ type Config struct {
 	// TLSIssuer selects the on-demand policy's issuer (SB_TLS_ISSUER):
 	// "acme" (default) or "internal", Caddy's own CA, for labs.
 	TLSIssuer string
+	// TLSCertWatchFile is a certificate Caddy loads from a file, watched for
+	// changes so Caddy reloads it (SB_TLS_CERT_WATCH_FILE). On Kubernetes,
+	// cert-manager renews the sandbox-link wildcard into a mounted Secret
+	// and Caddy does not watch files (C25). Empty: no watch.
+	TLSCertWatchFile string
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's
 	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
@@ -485,6 +605,16 @@ type Config struct {
 	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
 	// SB_DOCKER_POOL_ENABLED.
 	DockerPoolEnabled bool
+	// DockerDisabled is true on a containerd-engine host with no Docker at
+	// all, such as a Kubernetes worker pod (SB_DOCKER_ENABLED=false; the
+	// default is enabled; Kubernetes v2 plan C2). Then sandboxd never
+	// pings, lists, watches or firewalls Docker: /health reports it
+	// "disabled" instead of degraded, reconcile and the egress floor leave
+	// it out, and the event stream is containerd's alone. Only valid with
+	// the containerd engine, and not with the Docker warm or
+	// network-namespace pools. Named for the off state so a Config built in
+	// code (tests) keeps Docker on.
+	DockerDisabled bool
 	// DockerPoolDepth is warm slots per image key. SB_DOCKER_POOL_DEPTH.
 	DockerPoolDepth int
 	// DockerPoolImages is a comma-separated list of pinned warm targets.
@@ -534,6 +664,18 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ExecOutputDefaultBytes is the per-stream output cap sandboxd writes
+	// into a buffered exec (toolbox /process/execute) that sets none, and
+	// ExecOutputMaxBytes the largest cap a caller may ask for; a larger or
+	// missing one is lowered to it. sandboxd applies them on every path that
+	// reaches the sandbox's exec (v1, Daytona, Runloop), so they hold on every
+	// runtime and on agents already running (plan E1, ER5). An agent older
+	// than the caps ignores them, as it ignores the caller's own. 0 = off:
+	// no default cap and no maximum, only the agent's 64 MiB ceiling.
+	// SB_EXEC_OUTPUT_DEFAULT_BYTES, SB_EXEC_OUTPUT_MAX_BYTES; the default
+	// may not exceed the maximum.
+	ExecOutputDefaultBytes int64
+	ExecOutputMaxBytes     int64
 	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
 	// a file transfer, a session) lives on once its sandbox stops answering
 	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
@@ -547,6 +689,33 @@ type Config struct {
 	OTELMetricsEnabled  bool
 	OTELMetricsEndpoint string
 	OTELMetricsInterval time.Duration
+	// AgentSandboxAPI turns on the Kubernetes agent-sandbox API (C17,
+	// SB_AGENT_SANDBOX_API): gateways serve it, and every node that runs
+	// sandboxes reports their run state through Raft so the API can show
+	// it. Off by default: off, a cluster writes no run-state entries.
+	AgentSandboxAPI bool
+	// AgentSandboxAPIAddr is where a gateway serves it, over TLS
+	// (SB_AGENT_SANDBOX_API_ADDR, default :9443); the Kubernetes
+	// APIService points here.
+	AgentSandboxAPIAddr string
+	// AgentSandboxAPICertFile and AgentSandboxAPIKeyFile are its serving
+	// pair (SB_AGENT_SANDBOX_API_TLS_CERT, SB_AGENT_SANDBOX_API_TLS_KEY),
+	// reloaded when they change on disk (cert-manager renews them).
+	AgentSandboxAPICertFile string
+	AgentSandboxAPIKeyFile  string
+	// AgentSandboxAPINamespaces maps namespaces to owners that are not
+	// team:<namespace> (SB_AGENT_SANDBOX_API_NAMESPACES, "ns=owner,...").
+	AgentSandboxAPINamespaces map[string]string
+	// UsageMetricsEnabled adds per-owner usage counters to /v1/metrics
+	// (plans/kubernetes-v2-architecture.md, C20): each running sandbox's CPU
+	// and memory limit times the time it ran (the charge), and the CPU and
+	// memory measured from its cgroup (shown, never billed). A bank's cost
+	// tool sees one machine-sized worker pod; these counters let it split
+	// that pod's cost by team. Off by default, because owner names become
+	// label values, which an operator should choose to publish; the
+	// Kubernetes chart turns it on. The counters stay on this node and are
+	// sent nowhere. SB_USAGE_METRICS_ENABLED.
+	UsageMetricsEnabled bool
 	// OTELTracesEnabled starts a native OTLP/HTTP trace exporter for API
 	// request spans. It is also enabled automatically when
 	// SB_OTEL_TRACES_ENDPOINT is set.
@@ -580,6 +749,14 @@ type Config struct {
 	// budget when the host filesystem is larger than the sandbox pool.
 	DiskReservationRatio float64
 	HostDiskGB           int
+	// DiskFloorRatio refuses new creates (503 + Retry-After) while the
+	// sandbox volume has less than this share of its space free, so one
+	// sandbox filling the disk cannot take the images, the database and
+	// every other sandbox down with it (C27 in
+	// plans/kubernetes-v2-architecture.md). 0 turns it off. DiskFloorPath
+	// names the volume; empty means the container engine's data folder.
+	DiskFloorRatio float64
+	DiskFloorPath  string
 	// HostGPUCount and HostGPUVendor describe the GPU inventory wired into
 	// Docker via nvidia-container-runtime / amdgpu / etc. Used by placement
 	// scheduling so a GPU sandbox is never forwarded to a GPU-less peer.
@@ -1107,14 +1284,50 @@ type Config struct {
 	// EnableCluster=false — single-node mode is implicitly "mixed".
 	NodeRole string
 	NodeID   string
+	// CellID is the cell this node's sandboxes belong to, 1 to 255
+	// (SB_CELL_ID, default 1). With CellIDKey set, new sandbox IDs carry it
+	// in their first byte, masked so that only the cells can read it, and a
+	// cell routes an ID without a lookup (plans/kubernetes-v2-architecture.md
+	// §12.3-12.4, C12, C16). Every node of one cluster is one cell and must
+	// share it.
+	CellID int
+	// CellIDKey masks the cell in new sandbox IDs (SB_CELL_ID_KEY, base64,
+	// at least 32 bytes). Every cell of one federation shares it, and it
+	// never rotates: an ID minted under one key is routed by it for life.
+	// Unset, a single cell mints IDs with a random first byte: a fixed
+	// first byte would itself show the cell scheme.
+	CellIDKey []byte
+	// CellEndpoints is every other cell's public API address, by cell
+	// number (SB_CELL_ENDPOINTS, "2=https://cell2.example.com,3=..."). A
+	// request for a sandbox of one of them is answered 421 with that
+	// address, which the SDKs retry at (C16): cells never forward to each
+	// other. Needs CellIDKey.
+	CellEndpoints map[int]string
+	// ReadyLeaderGrace is how long a cluster node may go without proof of a
+	// working control plane before /ready answers 503 (SB_READY_LEADER_GRACE,
+	// default 10 s: above a normal raft election, so one does not take a
+	// node out of rotation). Kubernetes probes /ready to stop sending a
+	// cut-off node traffic (Kubernetes v2 plan C1).
+	ReadyLeaderGrace time.Duration
 	// NodeName is the operator-friendly label gossiped to peers and shown on
 	// the dashboard (e.g. "node1", "wrk2"). Display-only; raft/gossip identity
 	// stays on NodeID. SB_NODE_NAME; empty falls back to NodeID at display
 	// time so single-node and pre-existing deployments need no config change.
-	NodeName            string
-	RaftBindAddr        string
-	RaftAdvertiseAddr   string
-	RaftDataDir         string
+	NodeName string
+	// NodeLabels are this node's placement labels: SB_NODE_LABELS ("k=v,k=v")
+	// with SB_NODE_ZONE folded in under "zone". Validated at boot (Kubernetes
+	// label syntax, at most 16, 63 characters each) and reported on the
+	// capacity heartbeat for placement rules (plans/placement-rules.md).
+	// nil = no labels; such a node never satisfies a rule.
+	NodeLabels        map[string]string
+	RaftBindAddr      string
+	RaftAdvertiseAddr string
+	RaftDataDir       string
+	// RaftWALDir (SB_RAFT_WAL_DIR) puts the Raft log on a disk of its own,
+	// away from the snapshots and recovery blobs in RaftDataDir: a commit
+	// waits for two log writes, the leader's then a follower's
+	// (internal/raftlogdir). "" keeps it in RaftDataDir/raft-wal.
+	RaftWALDir          string
 	GossipBindAddr      string
 	GossipAdvertiseAddr string
 	BootstrapPeers      []string
@@ -1160,9 +1373,23 @@ type Config struct {
 	// IngressProxyRouting enables routing without per-sandbox Caddy writes
 	// (plans/ingress-proxy-routing.md): static Caddy routes, a sandboxd route
 	// responder, and on ingress Agents a versioned placement delta feed
-	// instead of the 5s full page-walk. Default off; per-node; rationale in
+	// instead of the 5s full page-walk. Default on; per-node; rationale in
 	// setup/config-defaults.md. SB_INGRESS_PROXY_ROUTING.
+	//
+	// Load clears it on a node it cannot apply to (no Caddy domain, see
+	// IngressProxyRoutingApplies), so every reader sees it off there.
 	IngressProxyRouting bool
+	// ClusterOwnerCache turns on the owner cache on worker and ingress nodes
+	// (internal/cluster/owner_cache.go, plan PR #1000 item E3a). Such a node
+	// remembers which node owns a sandbox and forwards there without asking
+	// the server tier first. The owner still checks every request and
+	// answers 421 "not here" to a stale entry, so the cache changes where a
+	// request goes, never the answer. Default on: every supported build
+	// (v0.6.12 and later) answers "not here". It was off while an older
+	// owner, which would serve or 404 a stale forward, could still be in a
+	// cluster. Ignored on server-role nodes, which read their own placement
+	// copy. Rationale in setup/config-defaults.md. SB_CLUSTER_OWNER_CACHE.
+	ClusterOwnerCache bool
 	// RouteDNSAddr is the loopback address of the sandboxd route responder
 	// that the static Caddy routes query (plans/ingress-proxy-routing.md
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
@@ -1197,12 +1424,35 @@ type Config struct {
 	// unbounded image-pull/docker-create storm. 0 disables the cap.
 	// SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER.
 	ClusterCreateMaxPendingPerWorker int
+	// ClusterReserveApplyLimit bounds the create reservations the leader
+	// applies at once (F28). Past it a create is turned away at once with
+	// create backpressure (429, Retry-After) instead of queueing behind Raft
+	// until its caller's deadline: at 512 creates at once, 122 timed out
+	// that way. About 50 are in flight at 985 creates a second and over 100
+	// at a cell's ceiling (G3), so the default 256 leaves room for both.
+	// Only reservations are bounded, never heartbeats, deletes or repairs.
+	// 0 disables the bound. SB_CLUSTER_RESERVE_APPLY_LIMIT.
+	ClusterReserveApplyLimit int
 	// ClusterDeadOwnerGrace is how long the leader waits after memberlist marks
 	// a node dead before orphaning its placements and removing it from the
 	// raft configuration. Long enough to absorb transient gossip flap
 	// (network blips, GC pauses) but short enough that operators don't have
 	// to wait minutes to recover.
 	ClusterDeadOwnerGrace time.Duration
+	// ClusterRestartWindow is how long the leader waits for a node that
+	// announced a restart on SIGTERM before it moves that node's sandboxes
+	// (SB_CLUSTER_RESTART_WINDOW, default 120s). A planned restart is not a
+	// death: without the notice a clean stop starts the dead-owner grace,
+	// and an agent upgrade that takes longer than it moves every sandbox.
+	// A crash sends no notice and still gets only the grace. 0 turns the
+	// wait off; a window no longer than the grace changes nothing.
+	ClusterRestartWindow time.Duration
+	// OwnershipLeaseFile is where a cluster worker writes its ownership lease
+	// for the runtime supervisor to enforce with sandboxd down
+	// (SB_OWNERSHIP_LEASE_FILE, internal/ownerlease; default empty: not
+	// written). The Kubernetes worker pod sets it on a folder both the
+	// agent and the runtime container mount.
+	OwnershipLeaseFile string
 	// ClusterGossipSecretKey, when non-empty, enables AES gossip encryption +
 	// authentication. Accepts a base64-encoded 16/24/32-byte key (AES-128/192/256).
 	// Required in cluster mode (Load() refuses to start otherwise). The escape
@@ -1502,6 +1752,14 @@ type Config struct {
 	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
 	// enterprise mode, which refuses anything longer.
 	TokenMaxTTL time.Duration
+	// SandboxTokenMaxTTL caps a sandbox token's lifetime (pkg/sandboxtoken,
+	// POST /v1/sandboxes/{id}/tokens). There is no per-token revocation
+	// list, only a per-sandbox revoke, so this cap is how long a leaked
+	// token works if nobody revokes its sandbox's tokens, and how long a
+	// rotation must wait between promoting a server key and retiring the
+	// old one.
+	// SB_SANDBOX_TOKEN_MAX_TTL. Default 24h; at most 720h (30 days).
+	SandboxTokenMaxTTL time.Duration
 	// IdentityFile is the identity file (plans/identity-and-access.md
 	// §5.5): the OIDC issuers this node trusts and the group-to-role
 	// bindings. Empty with IdentityEnabled is tokens-only mode (avm_ tokens,
@@ -1509,12 +1767,27 @@ type Config struct {
 	// operator never believes SSO and the deny list are on when they are
 	// not. SB_IDENTITY_FILE.
 	IdentityFile string
+	// IdentityIssuerURL makes this deployment an OIDC issuer for sandbox
+	// cloud identities (plans/sandbox-cloud-identity.md D1.1): the HTTPS
+	// public URL of the API, with no path, that customers' clouds fetch
+	// /.well-known/openid-configuration and the JWKS from. Empty turns the
+	// feature off: create refuses `identity` and the documents 404. Every
+	// node of a cluster must carry the same value. SB_IDENTITY_ISSUER_URL.
+	IdentityIssuerURL string
 
 	// PATTokenPrevious is also accepted as the PAT during a rotation, in
 	// constant time; nodes always send PATToken. Set it on every node with
 	// the new token as SB_PAT_TOKEN, restart in turn, then remove it.
 	// SB_PAT_TOKEN_PREVIOUS (plans/identity-and-access.md §5.11).
 	PATTokenPrevious string
+	// PATTokenSHA256 holds the lowercase hex SHA-256 of the operator PAT,
+	// and during a rotation of the previous one too. A worker or ingress
+	// node that joined without the PAT holds these instead of it
+	// (pat_verifier.go): it accepts a bearer whose hash is listed as the
+	// PAT, and its own SB_PAT_TOKEN, which then does not match, works
+	// only for local tools on this node. SB_PAT_TOKEN_SHA256, comma
+	// separated.
+	PATTokenSHA256 []string
 	// PATScope is where the PAT is accepted: PATScopeAny (default, as
 	// before) or PATScopeHost (a loopback TCP peer on the API listener and
 	// mTLS cluster peers only). SB_PAT_SCOPE.
@@ -1598,6 +1871,13 @@ type Config struct {
 	// must not be distributed to joiners or retained in this daemon runtime
 	// directory in enterprise mode. SB_CLUSTER_TLS_DIR.
 	ClusterTLSDir string
+	// ClusterExternalCA is the external-CA mode (C23, plan §15.2.1): the
+	// TLS dir's ca.crt is the bank's CA and node.crt and node.key the
+	// pod's certificate from cert-manager. No server holds a CA key, so a
+	// token join, a new join token and a certificate renewal are refused; a
+	// node joins by its certificate and cert-manager renews it.
+	// SB_CLUSTER_EXTERNAL_CA.
+	ClusterExternalCA bool
 	// ClusterInternalListenAddr is the bind address for the mTLS internal
 	// listener. SB_CLUSTER_INTERNAL_LISTEN. Default 0.0.0.0:7002.
 	ClusterInternalListenAddr string
@@ -1605,6 +1885,25 @@ type Config struct {
 	// RPCs. Falls back to https://<derived-host>:<internal-port> when empty.
 	// Must be HTTPS — plaintext defeats the purpose. SB_CLUSTER_INTERNAL_ADVERTISE.
 	ClusterInternalAdvertiseURL string
+	// ClusterJoinListenAddr is the join listener (plans/kubectl-style-
+	// cluster-ops.md eng D3): TLS with this server's node cert, no client
+	// cert, and only the three join paths. Server roles in cluster mode
+	// default to 0.0.0.0:7003; workers and ingress nodes never open it, and
+	// "off" turns it off on a server. 7002 keeps requiring a client cert.
+	// SB_CLUSTER_JOIN_LISTEN_ADDR.
+	ClusterJoinListenAddr string
+	// ClusterCADir is the CA store on server nodes: ca.crt and ca.key, the
+	// signer for joins and cert renewal (D5). Never SB_CLUSTER_TLS_DIR,
+	// which enterprise mode keeps free of ca.key. A server without ca.key
+	// here serves cluster-info but refuses to sign until `sandboxd adopt`
+	// puts one there. SB_CLUSTER_CA_DIR, default /etc/sandboxd/cluster-ca
+	// (where cluster-init.sh keeps it).
+	ClusterCADir string
+	// ClusterNodeCertTTL is how long a node cert signed by a join or a
+	// renewal lasts. 90 days by default; shorter values (at least 5
+	// minutes) exist to exercise renewal. Never longer than 90 days: the
+	// deny tombstones assume no cert outlives that. SB_CLUSTER_NODE_CERT_TTL.
+	ClusterNodeCertTTL time.Duration
 	// ImageBuildContextEnabled is the operator opt-in for the contextHashes
 	// upload path — image builds whose context includes caller-supplied
 	// local files (COPY/ADD). Off by default because the resolution path
@@ -1917,6 +2216,26 @@ const (
 	enterpriseTokenMaxTTL = 90 * 24 * time.Hour
 )
 
+// Sandbox token lifetime caps (plans/agent-sandbox-feature-parity.md A1).
+// The ceiling keeps a key rotation's promote-to-retire wait bounded: a
+// retire must wait out the longest token the old key may have signed.
+const (
+	defaultSandboxTokenMaxTTL = 24 * time.Hour
+	ceilingSandboxTokenMaxTTL = 30 * 24 * time.Hour
+)
+
+// validateSandboxTokens applies the sandbox token lifetime default and
+// refuses a cap above the ceiling.
+func validateSandboxTokens(cfg *Config) error {
+	if cfg.SandboxTokenMaxTTL == 0 {
+		cfg.SandboxTokenMaxTTL = defaultSandboxTokenMaxTTL
+	}
+	if cfg.SandboxTokenMaxTTL < 0 || cfg.SandboxTokenMaxTTL > ceilingSandboxTokenMaxTTL {
+		return fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL must be between 1s and %s", ceilingSandboxTokenMaxTTL)
+	}
+	return nil
+}
+
 // validateIdentity checks the identity settings. Enterprise mode lowers the
 // token lifetime default to 90 days and refuses a longer cap.
 func validateIdentity(cfg *Config) error {
@@ -1951,6 +2270,22 @@ func validateIdentityFile(cfg Config) error {
 	return nil
 }
 
+// validateIdentityIssuer canonicalises SB_IDENTITY_ISSUER_URL, refusing one
+// the clouds could not use (not HTTPS, or with a path): a typo would
+// otherwise surface only as an AssumeRoleWithWebIdentity failure in a
+// customer's account.
+func validateIdentityIssuer(cfg *Config) error {
+	if cfg.IdentityIssuerURL == "" {
+		return nil
+	}
+	issuer, err := cloudidentity.ValidateIssuerURL(cfg.IdentityIssuerURL)
+	if err != nil {
+		return err
+	}
+	cfg.IdentityIssuerURL = issuer
+	return nil
+}
+
 func Load() (Config, error) {
 	return load(false)
 }
@@ -1982,23 +2317,31 @@ func load(keyTool bool) (Config, error) {
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
 		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
+		DefaultDestroyIfIdleFor:           getEnvDuration("SB_DEFAULT_DESTROY_IF_IDLE_FOR", 0),
+		MaxAge:                            getEnvDuration("SB_MAX_AGE", 0),
+		EnablePprof:                       getEnvBool("SB_ENABLE_PPROF", false),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
 		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
 		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		SandboxNodeIngressClosed:          !getEnvBool("SB_SANDBOX_NODE_INGRESS", true),
 		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
+		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
+		GvisorCheckpointMoves:             getEnvBool("SB_GVISOR_CHECKPOINT_MOVES", false),
+		HostProcessCgroupParent:           strings.TrimSpace(os.Getenv("SB_HOST_PROCESS_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
 		ContainerdNativeNetnsPoolEnabled:  getEnvBool("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", false),
 		ContainerdNetnsPoolDepth:          getEnvInt("SB_CONTAINERD_NETNS_POOL_DEPTH", 4),
 		ContainerdNetnsPoolSize:           getEnvInt("SB_CONTAINERD_NETNS_POOL_SIZE", 256),
 		ContainerdCNIPluginDir:            getEnv("SB_CONTAINERD_CNI_PLUGIN_DIR", "/opt/cni/bin"),
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
+		ContainerdBridgeSubnet:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
 		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
 		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
@@ -2017,6 +2360,8 @@ func load(keyTool bool) (Config, error) {
 		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		CreatePolicyFile:                  strings.TrimSpace(getEnv("SB_CREATE_POLICY_FILE", "")),
+		EgressBlockPrivateByDefault:       getEnvBool("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT", false),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
 		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
@@ -2032,6 +2377,7 @@ func load(keyTool bool) (Config, error) {
 		TLSACMECA:                         strings.TrimSpace(getEnv("SB_TLS_ACME_CA", "")),
 		TLSACMECARoot:                     strings.TrimSpace(getEnv("SB_TLS_ACME_CA_ROOT", "")),
 		TLSIssuer:                         strings.ToLower(strings.TrimSpace(getEnv("SB_TLS_ISSUER", TLSIssuerACME))),
+		TLSCertWatchFile:                  strings.TrimSpace(os.Getenv("SB_TLS_CERT_WATCH_FILE")),
 		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
 		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
 		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
@@ -2103,9 +2449,16 @@ func load(keyTool bool) (Config, error) {
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:                int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
+		ExecOutputDefaultBytes:        getEnvInt64("SB_EXEC_OUTPUT_DEFAULT_BYTES", 0),
+		ExecOutputMaxBytes:            getEnvInt64("SB_EXEC_OUTPUT_MAX_BYTES", 0),
 		OTELMetricsEnabled:            getEnvBool("SB_OTEL_METRICS_ENABLED", false),
 		OTELMetricsEndpoint:           firstNonEmpty(os.Getenv("SB_OTEL_METRICS_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")),
 		OTELMetricsInterval:           getEnvDuration("SB_OTEL_METRICS_INTERVAL", 30*time.Second),
+		UsageMetricsEnabled:           getEnvBool("SB_USAGE_METRICS_ENABLED", false),
+		AgentSandboxAPI:               getEnvBool("SB_AGENT_SANDBOX_API", false),
+		AgentSandboxAPIAddr:           getEnv("SB_AGENT_SANDBOX_API_ADDR", ":9443"),
+		AgentSandboxAPICertFile:       getEnv("SB_AGENT_SANDBOX_API_TLS_CERT", "/etc/aerolvm/agent-sandbox-api/tls.crt"),
+		AgentSandboxAPIKeyFile:        getEnv("SB_AGENT_SANDBOX_API_TLS_KEY", "/etc/aerolvm/agent-sandbox-api/tls.key"),
 		OTELTracesEnabled:             getEnvBool("SB_OTEL_TRACES_ENABLED", false),
 		OTELTracesEndpoint:            firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
 		OTELTracesSampleRatio:         getEnvFloat("SB_OTEL_TRACES_SAMPLE_RATIO", 0.05),
@@ -2120,6 +2473,7 @@ func load(keyTool bool) (Config, error) {
 		HostMemoryMBOverride:      getEnvInt("SB_HOST_MEMORY_MB", 0),
 		DiskReservationRatio:      getEnvFloat("SB_DISK_RESERVATION_RATIO", 0),
 		HostDiskGB:                getEnvInt("SB_HOST_DISK_GB", 0),
+		DiskFloorPath:             strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_PATH")),
 		HostGPUCount:              getEnvInt("SB_HOST_GPU_COUNT", 0),
 		HostGPUVendor:             strings.ToLower(strings.TrimSpace(os.Getenv("SB_HOST_GPU_VENDOR"))),
 		HostSupportedRuntimes:     splitAndTrim(os.Getenv("SB_HOST_RUNTIMES"), ","),
@@ -2136,6 +2490,7 @@ func load(keyTool bool) (Config, error) {
 		RaftBindAddr:                     getEnv("SB_RAFT_BIND_ADDR", "0.0.0.0:7000"),
 		RaftAdvertiseAddr:                strings.TrimSpace(os.Getenv("SB_RAFT_ADVERTISE_ADDR")),
 		RaftDataDir:                      strings.TrimSpace(os.Getenv("SB_RAFT_DATA_DIR")),
+		RaftWALDir:                       strings.TrimSpace(os.Getenv("SB_RAFT_WAL_DIR")),
 		GossipBindAddr:                   getEnv("SB_GOSSIP_BIND_ADDR", "0.0.0.0:7001"),
 		GossipAdvertiseAddr:              strings.TrimSpace(os.Getenv("SB_GOSSIP_ADVERTISE_ADDR")),
 		BootstrapPeers:                   splitAndTrim(os.Getenv("SB_BOOTSTRAP_PEERS"), ","),
@@ -2145,7 +2500,8 @@ func load(keyTool bool) (Config, error) {
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
 		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
-		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
+		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", true),
+		ClusterOwnerCache:                getEnvBool("SB_CLUSTER_OWNER_CACHE", true),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
 		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
@@ -2153,7 +2509,10 @@ func load(keyTool bool) (Config, error) {
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
 		ClusterMaxAutoVoters:             getEnvInt("SB_CLUSTER_MAX_AUTO_VOTERS", 5),
 		ClusterCreateMaxPendingPerWorker: getEnvInt("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER", 32),
+		ClusterReserveApplyLimit:         getEnvInt("SB_CLUSTER_RESERVE_APPLY_LIMIT", 256),
 		ClusterDeadOwnerGrace:            getEnvDuration("SB_DEAD_OWNER_GRACE", 30*time.Second),
+		ClusterRestartWindow:             getEnvDuration("SB_CLUSTER_RESTART_WINDOW", 120*time.Second),
+		OwnershipLeaseFile:               strings.TrimSpace(os.Getenv("SB_OWNERSHIP_LEASE_FILE")),
 		ClusterGossipSecretKey:           strings.TrimSpace(os.Getenv("SB_GOSSIP_SECRET_KEY")),
 		ClusterInsecureGossip:            getEnvBool("SB_CLUSTER_INSECURE_GOSSIP", false),
 		ClusterInsecureCredentials:       getEnvBool("SB_CLUSTER_INSECURE_CREDENTIALS", false),
@@ -2233,6 +2592,7 @@ func load(keyTool bool) (Config, error) {
 		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
 		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
 		IdentityFile:                  strings.TrimSpace(os.Getenv("SB_IDENTITY_FILE")),
+		IdentityIssuerURL:             strings.TrimSpace(os.Getenv("SB_IDENTITY_ISSUER_URL")),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -2242,8 +2602,12 @@ func load(keyTool bool) (Config, error) {
 		E2BClientID:                   strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID")),
 		RunloopBlueprintMapJSON:       strings.TrimSpace(os.Getenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON")),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
+		ClusterExternalCA:             getEnvBool("SB_CLUSTER_EXTERNAL_CA", false),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
+		ClusterJoinListenAddr:         strings.TrimSpace(os.Getenv("SB_CLUSTER_JOIN_LISTEN_ADDR")),
+		ClusterCADir:                  getEnv("SB_CLUSTER_CA_DIR", "/etc/sandboxd/cluster-ca"),
+		ClusterNodeCertTTL:            getEnvDuration("SB_CLUSTER_NODE_CERT_TTL", maxClusterNodeCertTTL),
 		ImageBuildContextEnabled:      getEnvBool("SB_IMAGE_BUILD_CONTEXT_ENABLED", false),
 		ImageBuildTimeout:             getEnvDuration("SB_IMAGE_BUILD_TIMEOUT", 10*time.Minute),
 		ImageBuildGCEnabled:           getEnvBool("SB_IMAGE_BUILD_GC_ENABLED", true),
@@ -2408,8 +2772,32 @@ func load(keyTool bool) (Config, error) {
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
 	}
+	// Unlike most numeric settings, a value that does not parse refuses the
+	// boot instead of keeping the default: the default is "off", so a typo
+	// such as "10MB" would silently remove the limit the operator meant.
+	for _, name := range []string{"SB_EXEC_OUTPUT_DEFAULT_BYTES", "SB_EXEC_OUTPUT_MAX_BYTES"} {
+		if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+			if _, err := strconv.ParseInt(raw, 10, 64); err != nil {
+				return Config{}, fmt.Errorf("%s must be a whole number of bytes, got %q", name, raw)
+			}
+		}
+	}
+	if cfg.ExecOutputDefaultBytes < 0 || cfg.ExecOutputMaxBytes < 0 {
+		return Config{}, errors.New("SB_EXEC_OUTPUT_DEFAULT_BYTES and SB_EXEC_OUTPUT_MAX_BYTES must be 0 (off) or more")
+	}
+	if cfg.ExecOutputMaxBytes > 0 && cfg.ExecOutputDefaultBytes > cfg.ExecOutputMaxBytes {
+		return Config{}, fmt.Errorf("SB_EXEC_OUTPUT_DEFAULT_BYTES (%d) must not exceed SB_EXEC_OUTPUT_MAX_BYTES (%d)", cfg.ExecOutputDefaultBytes, cfg.ExecOutputMaxBytes)
+	}
+	diskFloorRatio, err := loadDiskFloorRatio()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DiskFloorRatio = diskFloorRatio
 	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
 		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
+	}
+	if err := validateDefaultLifecycle(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
@@ -2500,6 +2888,13 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, errors.New("SB_PUBLIC_HOST is required when SB_DOMAIN is empty")
 	}
 
+	// The private-range default is host firewall rules: on a node with the
+	// firewall off every default create would get a policy nothing enforces
+	// (refused with 501, or accepted unenforced), so refuse the pair at boot.
+	if cfg.EgressBlockPrivateByDefault && !cfg.EnableNetworkRules {
+		return Config{}, errors.New("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT=true needs SB_ENABLE_NETWORK_RULES=true: the private-range default is enforced by the host firewall")
+	}
+
 	// SB_CONTAINER_RUNTIME must be one of the runtimes we know how to drive.
 	// We reject "" here too: the caller substitutes the host default when a
 	// per-sandbox value is empty, but the host default itself must always be
@@ -2531,12 +2926,41 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)
 	}
 	cfg.ContainerEngine = resolvedEngine
+	if cfg.ContainerdDiskQuota, err = loadContainerdDiskQuota(cfg.ContainerEngine); err != nil {
+		return Config{}, err
+	}
+	if err := validateBridgeSubnet(cfg.ContainerdBridgeSubnet); err != nil {
+		return Config{}, err
+	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
 		if strings.TrimSpace(cfg.ContainerdSocket) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_SOCKET is required when SB_CONTAINER_ENGINE=containerd")
 		}
 		if strings.TrimSpace(cfg.ContainerdNamespace) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_NAMESPACE is required when SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if p := cfg.ContainerdCgroupParent; p != "" {
+		// A relative or unclean path would be joined onto whatever the
+		// runtime treats as its base; refuse it rather than guess.
+		if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" {
+			return Config{}, fmt.Errorf("SB_CONTAINERD_CGROUP_PARENT must be a clean absolute cgroup path below the root, got %q", p)
+		}
+		if cfg.ContainerEngine != models.ContainerEngineContainerd {
+			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT needs SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if cfg.HostProcessCgroupParent == "" {
+		cfg.HostProcessCgroupParent = cfg.ContainerdCgroupParent
+	}
+	if p := cfg.HostProcessCgroupParent; p != "" {
+		if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" {
+			return Config{}, fmt.Errorf("SB_HOST_PROCESS_CGROUP_PARENT must be a clean absolute cgroup path below the root, got %q", p)
+		}
+		// The V8 jail's group cgroups follow the hosts into the parent,
+		// unless the operator named their own place.
+		if strings.TrimSpace(os.Getenv("SB_ISOLATE_JAIL_CGROUP_ROOT")) == "" {
+			cfg.IsolateJailCgroupRoot = filepath.Join(cgroupV2Mount, p, "aerolvm-isolate")
 		}
 	}
 
@@ -2671,6 +3095,20 @@ func load(keyTool bool) (Config, error) {
 		}
 	}
 
+	// SB_INGRESS_PROXY_ROUTING is on by default, but it routes names under a
+	// Caddy domain and nothing else. On a node without one (local mode, IP
+	// mode, Caddy off) it is not applicable, so it is cleared here instead of
+	// refused at boot: refusing logged an ERROR, and on a cluster ingress ran
+	// 60 s of resolver probes, on every such node for a mode it can never
+	// use. Clearing it in one place keeps every reader consistent: the
+	// ingress placement feed, the node control-port guard, the redirect-port
+	// check below. A node whose previous boot engaged still rolls back,
+	// because the daemon keys that off its marker file, not this flag. Before
+	// the redirect-port check, so an IP-mode node with a custom L4 range does
+	// not start failing boot over a listener it will never open.
+	if cfg.IngressProxyRouting && !cfg.IngressProxyRoutingApplies() {
+		cfg.IngressProxyRouting = false
+	}
 	// L4 port pool sanity. Out-of-range or inverted bounds would silently
 	// brick raw-TCP exposure later; surface it at boot instead.
 	if cfg.IngressProxyRouting && (cfg.HostPortRedirectPort <= 0 || cfg.HostPortRedirectPort > 65535 ||
@@ -2698,6 +3136,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := loadEgressRanges(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
@@ -2732,12 +3173,16 @@ func load(keyTool bool) (Config, error) {
 	if cfg.NodeRole != NodeRoleMixed && !cfg.EnableCluster {
 		return Config{}, fmt.Errorf("SB_NODE_ROLE=%q requires SB_ENABLE_CLUSTER=true (single-node mode is implicitly %q)", cfg.NodeRole, NodeRoleMixed)
 	}
+	cfg.ClusterJoinListenAddr = resolveJoinListenAddr(cfg.ClusterJoinListenAddr, cfg.EnableCluster && cfg.IsServer())
 
 	// Cluster-mode invariants. Single-node mode (EnableCluster=false) skips
 	// all of this — defaults are non-load-bearing in that case.
 	if cfg.EnableCluster {
 		if cfg.RaftDataDir == "" {
 			cfg.RaftDataDir = filepath.Join(filepath.Dir(cfg.DBPath), "raft")
+		}
+		if cfg.RaftWALDir != "" && !filepath.IsAbs(cfg.RaftWALDir) {
+			return Config{}, fmt.Errorf("SB_RAFT_WAL_DIR=%q must be an absolute path", cfg.RaftWALDir)
 		}
 		if cfg.RaftAdvertiseAddr == "" {
 			cfg.RaftAdvertiseAddr = cfg.RaftBindAddr
@@ -2763,6 +3208,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ClusterCreateMaxPendingPerWorker < 0 {
 			return Config{}, errors.New("SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER must be >= 0")
+		}
+		if cfg.ClusterReserveApplyLimit < 0 {
+			return Config{}, errors.New("SB_CLUSTER_RESERVE_APPLY_LIMIT must be >= 0")
 		}
 		if !cfg.ClusterBootstrap && len(cfg.BootstrapPeers) == 0 {
 			return Config{}, errors.New("SB_BOOTSTRAP_PEERS is required when SB_ENABLE_CLUSTER=true and SB_CLUSTER_BOOTSTRAP=false")
@@ -2796,6 +3244,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ClusterTLSDir == "" {
 			return Config{}, errors.New("SB_CLUSTER_TLS_DIR is required when SB_ENABLE_CLUSTER=true")
+		}
+		if cfg.ClusterNodeCertTTL < minClusterNodeCertTTL || cfg.ClusterNodeCertTTL > maxClusterNodeCertTTL {
+			return Config{}, fmt.Errorf("SB_CLUSTER_NODE_CERT_TTL must be between %s and %s (got %s)", minClusterNodeCertTTL, maxClusterNodeCertTTL, cfg.ClusterNodeCertTTL)
 		}
 		if cfg.SecretRecipientBackupCount < 1 {
 			return Config{}, errors.New("SB_SECRET_RECIPIENT_BACKUP_COUNT must be >= 1 when SB_ENABLE_CLUSTER=true")
@@ -2919,10 +3370,23 @@ func load(keyTool bool) (Config, error) {
 		}
 		cfg.TokenMaxTTL = ttl
 	}
+	if raw := strings.TrimSpace(os.Getenv("SB_SANDBOX_TOKEN_MAX_TTL")); raw != "" {
+		ttl, err := identitywire.ParseTokenTTL(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("SB_SANDBOX_TOKEN_MAX_TTL: %w", err)
+		}
+		cfg.SandboxTokenMaxTTL = ttl
+	}
 	if err := cfg.loadAuditAPIConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadRemoteUpgradeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadNodeLabelsConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.loadLivenessConfig(); err != nil {
@@ -2931,10 +3395,31 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadCellID(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadCellRouting(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAgentSandboxAPINamespaces(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadReadyLeaderGrace(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadDockerEnabled(); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxTokens(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentityFile(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentityIssuer(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.EnterpriseMode {
@@ -3138,6 +3623,34 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// Bounds on SB_CLUSTER_NODE_CERT_TTL. The upper bound is the 90 days
+// cluster-sign-node.sh always used.
+const (
+	minClusterNodeCertTTL = 5 * time.Minute
+	maxClusterNodeCertTTL = 90 * 24 * time.Hour
+)
+
+// defaultClusterJoinListenAddr is the join port on server nodes (eng D3).
+const defaultClusterJoinListenAddr = "0.0.0.0:7003"
+
+// resolveJoinListenAddr applies SB_CLUSTER_JOIN_LISTEN_ADDR: unset means
+// the default on a cluster server and off elsewhere; "off" (or false,
+// disabled, none) means off. Only server roles ever listen: joins are
+// signed by a CA key that workers never hold, so a worker never sees join
+// traffic and there is no relay.
+func resolveJoinListenAddr(raw string, clusterServer bool) string {
+	if !clusterServer {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return defaultClusterJoinListenAddr
+	case "off", "false", "disabled", "none", strings.ToLower(envClearSentinel):
+		return ""
+	}
+	return strings.TrimSpace(raw)
+}
+
 // KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
 // else the key file's path plus ".ring".
 func (c Config) KeyRingPath() string {
@@ -3198,10 +3711,37 @@ func (c Config) IsServer() bool { return c.hasRole(NodeRoleServer) }
 // return false; mixed and any hybrid that includes "worker" return true.
 func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 
+// cgroupV2Mount is where cgroup v2 is mounted.
+const cgroupV2Mount = "/sys/fs/cgroup"
+
+// HostProcessCgroupRoot is the directory the cgroups of the sandboxes
+// sandboxd starts itself are made in: the HostProcessCgroupParent group,
+// or "" for the root of the cgroup v2 mount.
+func (c Config) HostProcessCgroupRoot() string {
+	if c.HostProcessCgroupParent == "" {
+		return ""
+	}
+	return filepath.Join(cgroupV2Mount, c.HostProcessCgroupParent)
+}
+
+// RunsHostProcessSandboxes reports whether this node starts sandboxes as
+// processes of its own (WASM, V8 isolates, Firecracker), which must outlive
+// sandboxd.
+func (c Config) RunsHostProcessSandboxes() bool {
+	return c.IsWorker() && (c.EnableWasm || c.EnableIsolate || c.EnableFirecracker)
+}
+
 // IsIngress reports whether this daemon installs owner-aware Caddy routes for
 // remote sandboxes. Pure server/worker nodes return false; mixed and any
 // hybrid that includes "ingress" return true.
 func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
+
+// IngressProxyRoutingApplies reports whether this node has what
+// SB_INGRESS_PROXY_ROUTING routes: Caddy fronting sandboxes under a domain.
+// The static routes match "*.<domain>" names and the responder answers
+// under that domain; IP-mode path routes are still per-sandbox (TODOS.md,
+// "IP mode on the ingress router").
+func (c Config) IngressProxyRoutingApplies() bool { return c.EnableCaddy && c.Domain != "" }
 
 // RunsSSHGateway reports whether this node binds the per-sandbox SSH gateway:
 // SB_ENABLE_SSH_GATEWAY on a node whose role needs one. Workers run it
@@ -3239,6 +3779,25 @@ func (c Config) EffectivePublicHost() string {
 		return c.IngressAdvertiseHost
 	}
 	return c.PublicHost
+}
+
+// validateDefaultLifecycle holds the default destroy timers to the same
+// bounds a sandbox's own lifecycle has (models.MaxLifecycleDuration), so a
+// typo cannot stamp an out-of-range timer onto every new sandbox: the
+// create would then fail its own lifecycle check.
+func validateDefaultLifecycle(cfg Config) error {
+	for _, d := range []struct {
+		name string
+		v    time.Duration
+	}{
+		{"SB_DEFAULT_DESTROY_IF_IDLE_FOR", cfg.DefaultDestroyIfIdleFor},
+		{"SB_MAX_AGE", cfg.MaxAge},
+	} {
+		if d.v < 0 || d.v > models.MaxLifecycleDuration {
+			return fmt.Errorf("%s must be between 0 (off) and %s, got %s", d.name, models.MaxLifecycleDuration, d.v)
+		}
+	}
+	return nil
 }
 
 func (c Config) IdleTimeout() time.Duration {
@@ -3301,6 +3860,16 @@ func (c Config) ContainerdPoolEffective() bool {
 		c.ContainerdPoolEnabled && c.DockerReadySocketEnabled
 }
 
+// ContainerdReadySocketEffective is the containerd driver's ready-socket gate:
+// the docker gate, widened by the containerd warm pool. Park and adopt both
+// run over the held socket, so without the widening a single-node host that
+// turns on only SB_CONTAINERD_POOL_ENABLED wires the pool but never parks a
+// slot. It is a separate gate, not a change to DockerReadySocketEffective,
+// so the docker client and its boot-time ready-dir sweep stay as they were.
+func (c Config) ContainerdReadySocketEffective() bool {
+	return c.DockerReadySocketEffective() || c.ContainerdPoolEffective()
+}
+
 // DockerReadySocketDir is the host directory for per-create readiness sockets.
 func (c Config) DockerReadySocketDir() string {
 	base := strings.TrimSpace(c.MountsCredentialsRuntimeDir)
@@ -3358,6 +3927,91 @@ func checkClusterCredentialKey(cfg Config) error {
 	return nil
 }
 
+// loadCellID reads SB_CELL_ID strictly: a value that is not a number from
+// 1 to 255 stops the boot. getEnvInt's quiet fall back to the default
+// would put a node with a typo in cell 1, and its IDs in the wrong cell.
+func (c *Config) loadCellID() error {
+	c.CellID = 1
+	v := strings.TrimSpace(os.Getenv("SB_CELL_ID"))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 255 {
+		return fmt.Errorf("SB_CELL_ID must be a cell number from 1 to 255, got %q", v)
+	}
+	c.CellID = n
+	return nil
+}
+
+// loadCellRouting reads SB_CELL_ID_KEY and SB_CELL_ENDPOINTS strictly: a
+// wrong key or address would route a federation's sandboxes to the wrong
+// cell, and an address without a key could not be routed to at all.
+func (c *Config) loadCellRouting() error {
+	if v := strings.TrimSpace(os.Getenv("SB_CELL_ID_KEY")); v != "" {
+		key, err := base64.StdEncoding.DecodeString(v)
+		if err != nil || len(key) < 32 {
+			return errors.New("SB_CELL_ID_KEY must be base64 of at least 32 bytes (openssl rand -base64 32)")
+		}
+		c.CellIDKey = key
+	}
+	v := strings.TrimSpace(os.Getenv("SB_CELL_ENDPOINTS"))
+	if v == "" {
+		return nil
+	}
+	if len(c.CellIDKey) == 0 {
+		return errors.New("SB_CELL_ENDPOINTS needs SB_CELL_ID_KEY: without it no ID says which cell it belongs to")
+	}
+	c.CellEndpoints = map[int]string{}
+	for _, part := range strings.Split(v, ",") {
+		k, addr, ok := strings.Cut(strings.TrimSpace(part), "=")
+		n, err := strconv.Atoi(strings.TrimSpace(k))
+		u, uerr := url.Parse(strings.TrimSpace(addr))
+		if !ok || err != nil || n < 1 || n > 255 || uerr != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("SB_CELL_ENDPOINTS: %q is not <cell 1-255>=<http(s) address>", part)
+		}
+		if n == c.CellID {
+			continue // this cell's own address is not a redirect
+		}
+		c.CellEndpoints[n] = strings.TrimRight(u.String(), "/")
+	}
+	return nil
+}
+
+// loadDockerEnabled reads SB_DOCKER_ENABLED strictly and refuses the
+// settings that need Docker when it is off: the Docker engine itself, and
+// the Docker warm and network-namespace pools.
+func (c *Config) loadDockerEnabled() error {
+	c.DockerDisabled = false
+	v := strings.TrimSpace(os.Getenv("SB_DOCKER_ENABLED"))
+	if v == "" {
+		return nil
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("SB_DOCKER_ENABLED must be true or false, got %q", v)
+	}
+	c.DockerDisabled = !on
+	if on {
+		return nil
+	}
+	if models.ResolveContainerEngineOrDocker(c.ContainerEngine) != models.ContainerEngineContainerd {
+		return errors.New("SB_DOCKER_ENABLED=false needs SB_CONTAINER_ENGINE=containerd: the docker engine runs sandboxes in Docker")
+	}
+	for _, f := range []struct {
+		on   bool
+		name string
+	}{
+		{c.DockerPoolEnabled, "SB_DOCKER_POOL_ENABLED"},
+		{c.DockerNetnsPoolEnabled, "SB_DOCKER_NETNS_POOL_ENABLED"},
+	} {
+		if f.on {
+			return fmt.Errorf("%s=true needs Docker, and SB_DOCKER_ENABLED=false", f.name)
+		}
+	}
+	return nil
+}
+
 func getEnvInt(key string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -3394,6 +4048,43 @@ func getEnvBool(key string, fallback bool) bool {
 	return parsed
 }
 
+// loadDiskFloorRatio reads SB_DISK_FLOOR_RATIO. Like the exec output limits,
+// a value that does not parse refuses the boot instead of falling back to
+// the default: the default is off, so a typo such as "10%" would silently
+// drop the floor the operator asked for.
+func loadDiskFloorRatio() (float64, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_DISK_FLOOR_RATIO"))
+	if raw == "" {
+		return 0, nil
+	}
+	ratio, err := strconv.ParseFloat(raw, 64)
+	if err != nil || ratio < 0 || ratio >= 1 {
+		return 0, fmt.Errorf("SB_DISK_FLOOR_RATIO must be 0 (off) or a fraction below 1 such as 0.10, got %q", raw)
+	}
+	return ratio, nil
+}
+
+// validateBridgeSubnet checks SB_CONTAINERD_BRIDGE_SUBNET when set: an IPv4
+// network address (10.200.0.0/16, not 10.200.3.4/16, so the operator and
+// the firewall mean the same range) between /8 and /24. A /24 still holds
+// 253 sandboxes; anything smaller is a typo more often than a plan.
+func validateBridgeSubnet(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	p, err := netip.ParsePrefix(raw)
+	if err != nil || !p.Addr().Is4() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET must be an IPv4 range such as 10.200.0.0/16, got %q", raw)
+	}
+	if p != p.Masked() {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q is not a network address; did you mean %s?", raw, p.Masked())
+	}
+	if p.Bits() < 8 || p.Bits() > 24 {
+		return fmt.Errorf("SB_CONTAINERD_BRIDGE_SUBNET %q must be between /8 and /24", raw)
+	}
+	return nil
+}
+
 func getEnvFloat(key string, fallback float64) float64 {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -3404,6 +4095,43 @@ func getEnvFloat(key string, fallback float64) float64 {
 		return fallback
 	}
 	return parsed
+}
+
+// DefaultReadyLeaderGrace is ReadyLeaderGrace's default.
+const DefaultReadyLeaderGrace = 10 * time.Second
+
+// loadReadyLeaderGrace reads SB_READY_LEADER_GRACE strictly: a typo stops
+// the boot, rather than quietly fall back to the default.
+func (c *Config) loadReadyLeaderGrace() error {
+	c.ReadyLeaderGrace = DefaultReadyLeaderGrace
+	v := strings.TrimSpace(os.Getenv("SB_READY_LEADER_GRACE"))
+	if v == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("SB_READY_LEADER_GRACE must be a positive duration such as 10s, got %q", v)
+	}
+	c.ReadyLeaderGrace = d
+	return nil
+}
+
+// loadContainerdDiskQuota reads SB_CONTAINERD_DISK_QUOTA strictly: the
+// default is off, so a typo must not silently leave every sandbox's disk
+// unlimited, and only the containerd engine can enforce it.
+func loadContainerdDiskQuota(engine string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv("SB_CONTAINERD_DISK_QUOTA"))
+	if raw == "" {
+		return false, nil
+	}
+	on, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("SB_CONTAINERD_DISK_QUOTA must be true or false, got %q", raw)
+	}
+	if on && engine != models.ContainerEngineContainerd {
+		return false, errors.New("SB_CONTAINERD_DISK_QUOTA=true needs SB_CONTAINER_ENGINE=containerd")
+	}
+	return on, nil
 }
 
 func getEnvDuration(key string, fallback time.Duration) time.Duration {
@@ -3726,3 +4454,29 @@ func validateTLSIssuer(cfg Config) error {
 	}
 	return nil
 }
+
+// loadAgentSandboxAPINamespaces reads SB_AGENT_SANDBOX_API_NAMESPACES
+// strictly: a wrong pair would show one owner's sandboxes in another's
+// namespace.
+func (c *Config) loadAgentSandboxAPINamespaces() error {
+	v := strings.TrimSpace(os.Getenv("SB_AGENT_SANDBOX_API_NAMESPACES"))
+	if v == "" {
+		return nil
+	}
+	c.AgentSandboxAPINamespaces = map[string]string{}
+	owners := map[string]bool{}
+	for _, part := range strings.Split(v, ",") {
+		ns, owner, ok := strings.Cut(strings.TrimSpace(part), "=")
+		ns, owner = strings.TrimSpace(ns), strings.TrimSpace(owner)
+		if !ok || ns == "" || owner == "" || len(ns) > 63 || !agentSandboxNamespace.MatchString(ns) {
+			return fmt.Errorf("SB_AGENT_SANDBOX_API_NAMESPACES: %q is not <namespace>=<owner>", part)
+		}
+		if _, dup := c.AgentSandboxAPINamespaces[ns]; dup || owners[owner] {
+			return fmt.Errorf("SB_AGENT_SANDBOX_API_NAMESPACES: %q maps a namespace or an owner twice", part)
+		}
+		c.AgentSandboxAPINamespaces[ns], owners[owner] = owner, true
+	}
+	return nil
+}
+
+var agentSandboxNamespace = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)

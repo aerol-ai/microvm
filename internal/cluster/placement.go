@@ -82,6 +82,9 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 		out.GPUs = want
 		out.GPUVendor = string(spec.GPUs.Vendor)
 	}
+	// The placement rule rides the replicated spec, so a failover recreate
+	// filters on the same labels the first create did (P1.5).
+	out.Labels = spec.Placement.RequiredLabels()
 	return out
 }
 
@@ -112,115 +115,89 @@ func (c *Cluster) SelectPlacement(req capacity.Request) (PlacementTarget, error)
 // slice the router uses to record the secret recipient set at reserve time
 // (plans/secrets-hardening §3d-1). The target is always one of candidates.
 func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
-	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
-	rejects := make(map[string]int64)
-	if err := LargeClusterTopologyError(all); err != nil {
-		rejects["topology"] = 1
-		recordSchedulerDecision("invalid_topology", 0, rejects)
-		return PlacementTarget{}, nil, err
-	}
+	return c.selectPlacement(req, placementOpts{})
+}
+
+// placementOpts are placement inputs that are not part of the request.
+type placementOpts struct {
+	// avoidZone is the zone of the node a failover moves the sandbox off
+	// (C10). Candidates there are used only when no other zone has room.
+	avoidZone string
+}
+
+func (c *Cluster) selectPlacement(req capacity.Request, opts placementOpts) (PlacementTarget, []Member, error) {
 	// Subtract still-in-flight reservations (router wrote opReserve but the
 	// target hasn't yet promoted via opPlace, so the gossip ledger doesn't
 	// reflect them) from each peer's headroom. Without this, two creates that
 	// arrive between gossip ticks both pick the same "best" node and double-
 	// book it. The FSM serializes opReserve through raft, so the second
 	// SelectPlacement on the same leader sees the first reservation here.
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
+	// Promoted and failed-over sandboxes the heartbeat does not show yet are
+	// counted too: that window is the same double-booking one step later.
+	//
 	// Drained nodes are excluded from the candidate set entirely. Cheaper and
 	// clearer than threading the flag through nodeFits — drain is a hard
 	// admission rule (operator says "don't put more work here"), not a
 	// soft-scoring penalty. Self can be drained too; that's the intended way
 	// to roll a node out of rotation without restarting it.
-	drained := c.fsm.drainedNodesSnapshot()
-	candidates := make([]Member, 0, len(all))
-	// requiredReachable records whether the artifact-bound node, if any, was
-	// seen as a live capacity-reporting member. If it was and still produced
-	// no candidate, the failure is ordinary (capacity, drain); if it was not,
-	// the artifact itself is out of reach and the client must re-create it.
-	requiredReachable := false
-	// full records that a live, eligible worker able to run the request was
-	// turned away only for room (CPU, memory, disk, live memory, or a full
-	// network-slot pool). An empty candidate set with one is a cluster at
-	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
-	full := false
-	for _, m := range all {
-		if !m.Alive {
-			rejects["dead"]++
-			continue
-		}
-		if !CanOwnSandboxRole(m.Role) {
-			rejects["role"]++
-			continue
-		}
-		if req.RequiredNodeID != "" && m.NodeID != req.RequiredNodeID {
-			rejects["artifact_affinity"]++
-			continue
-		}
-		// Only consider members that have advertised an APIURL — others may
-		// be partially-joined and forwarding to them would 502.
-		if m.APIURL == "" && m.NodeID != c.nodeID {
-			rejects["missing_api_url"]++
-			continue
-		}
-		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
-			rejects["capacity_heartbeat"]++
-			continue
-		}
-		if req.RequiredNodeID != "" && m.NodeID == req.RequiredNodeID {
-			requiredReachable = true
-		}
-		if drained[m.NodeID] {
-			rejects["drained"]++
-			continue
-		}
-		// A hard capability rule like drain, kept out of nodeFits so the
-		// empty-set error can name it: "no gateway" is not "cluster full".
-		if req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
-			rejects["egress_gateway"]++
-			continue
-		}
-		if req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
-			rejects["mediated_egress"]++
-			continue
-		}
-		switch nodeFitVerdict(m, req, pending[m.NodeID]) {
-		case fitIncompatible:
-			rejects["capacity"]++
-			continue
-		case fitNoRoom:
-			rejects["capacity"]++
-			full = true
-			continue
-		}
-		// A node with CPU and memory to spare is still full for this
-		// runtime when its network-slot pool is: the create would fail
-		// there with "no free slot" (bank density run, 2026-11-01).
-		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
-			rejects["network_slots"]++
-			full = true
-			continue
-		}
-		candidates = append(candidates, m)
+	//
+	// A deleted node is out of the gossip view within one refresh; until
+	// then the deny record keeps it out of the candidates.
+	//
+	// A member below the active cluster version missed a finalize while it
+	// was down: it stays out of placement until it is upgraded (§6.5).
+	// Zero (never written) excludes nobody.
+	f := placementFilter{
+		c: c, req: req,
+		drained:  c.fsm.drainedNodesSnapshot(),
+		denied:   c.fsm.deniedNodeSet(),
+		activeFV: c.fsm.activeFVValue(),
 	}
+	if target, candidates, ok := c.selectPlacementSampled(f, opts); ok {
+		return target, candidates, nil
+	}
+	placementFullScans.Add(1)
+	all := c.withCatalogueTemplateHolders(c.membersWithCapacity(), req.TemplateID)
+	if err := LargeClusterTopologyError(all); err != nil {
+		recordSchedulerDecision("invalid_topology", 0, map[string]int64{"topology": 1})
+		return PlacementTarget{}, nil, err
+	}
+	f.pending = c.pendingLoadByNode(time.Now().Unix())
+	r := f.scan(all)
+	if len(r.candidates) == 0 {
+		recordSchedulerDecision("no_target", 0, r.rejects)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, r.requiredReachable, r.labelMatched, r.rejects["egress_gateway"] > 0, r.full)
+	}
+	return c.choosePlacement(f, opts, r)
+}
 
+// choosePlacement is the decision once the candidates are known: zone rules,
+// then the power of two choices. Shared by the full scan and the sampled
+// path (placement_sampled.go).
+func (c *Cluster) choosePlacement(f placementFilter, opts placementOpts, r candidateScan) (PlacementTarget, []Member, error) {
+	candidates := r.candidates
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
-	if len(candidates) == 0 {
-		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0, full)
+	score := func(m Member) float64 {
+		extra, byRuntime := f.pending.of(m.NodeID)
+		return placementScore(m, f.req, extra, byRuntime)
 	}
+	// Zone rules (C10), on a pool so the full candidate set still goes back
+	// for the secret recipients: off the failed zone when another has
+	// room, then one zone chosen by free room.
+	pool := spreadByZone(withoutZone(candidates, opts.avoidZone), score)
 
 	// Power-of-two-choices.
-	a, b := pickTwo(candidates)
+	a, b := pickTwo(pool)
 	winner := a
-	if !sameNode(a, b) && placementScore(b, req, pending[b.NodeID], pendingRuntimes[b.NodeID]) > placementScore(a, req, pending[a.NodeID], pendingRuntimes[a.NodeID]) {
+	if !sameNode(a, b) && score(b) > score(a) {
 		winner = b
 	}
 
 	if winner.NodeID == c.nodeID {
-		recordSchedulerDecision("self", len(candidates), rejects)
+		recordSchedulerDecision("self", len(candidates), r.rejects)
 		return self, candidates, nil
 	}
-	recordSchedulerDecision("remote", len(candidates), rejects)
+	recordSchedulerDecision("remote", len(candidates), r.rejects)
 	return PlacementTarget{
 		NodeID:        winner.NodeID,
 		APIURL:        winner.APIURL,
@@ -228,6 +205,136 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		InternalURL:   winner.InternalURL,
 		IsSelf:        false,
 	}, candidates, nil
+}
+
+// placementFilter is what one placement decision reads once and judges
+// every member against.
+type placementFilter struct {
+	c        *Cluster
+	req      capacity.Request
+	pending  pendingLoad
+	drained  map[string]bool
+	denied   map[string]bool
+	activeFV int
+}
+
+// candidateScan is what scan found: the members that can take the request,
+// why the others could not, and what an empty result means.
+type candidateScan struct {
+	candidates []Member
+	rejects    map[string]int64
+	// requiredReachable records whether the artifact-bound node, if any, was
+	// seen as a live capacity-reporting member. If it was and still produced
+	// no candidate, the failure is ordinary (capacity, drain); if it was not,
+	// the artifact itself is out of reach and the client must re-create it.
+	requiredReachable bool
+	// full records that a live, eligible worker able to run the request was
+	// turned away only for room (CPU, memory, disk, live memory, or a full
+	// network-slot pool). An empty candidate set with one is a cluster at
+	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
+	full bool
+	// labelMatched records that some live, role-eligible worker's last-known
+	// heartbeat carries every label the rule asks for. Without one the rule
+	// is unsatisfiable (409), not a capacity wait (503): no amount of waiting
+	// gives a node a label its operator did not set.
+	labelMatched bool
+}
+
+// scan judges members against the request: every hard rule, then room.
+func (f placementFilter) scan(members []Member) candidateScan {
+	r := candidateScan{candidates: make([]Member, 0, len(members)), rejects: make(map[string]int64)}
+	for _, m := range members {
+		if !m.Alive {
+			r.rejects["dead"]++
+			continue
+		}
+		// It announced a restart on SIGTERM (C8) and is about to leave: a
+		// create forwarded there now would fail or be lost in the restart.
+		if m.Restarting {
+			r.rejects["restarting"]++
+			continue
+		}
+		if !CanOwnSandboxRole(m.Role) {
+			r.rejects["role"]++
+			continue
+		}
+		if f.req.RequiredNodeID != "" && m.NodeID != f.req.RequiredNodeID {
+			r.rejects["artifact_affinity"]++
+			continue
+		}
+		// Only consider members that have advertised an APIURL — others may
+		// be partially-joined and forwarding to them would 502.
+		if m.APIURL == "" && m.NodeID != f.c.nodeID {
+			r.rejects["missing_api_url"]++
+			continue
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			// A stale lease still says what the node is: if its labels
+			// match, the rule is satisfiable and this is a heartbeat wait.
+			if len(f.req.Labels) > 0 && hasCapacitySnapshot(m.Capacity) && models.LabelsSatisfy(m.Capacity.Labels, f.req.Labels) {
+				r.labelMatched = true
+			}
+			r.rejects["capacity_heartbeat"]++
+			continue
+		}
+		if f.req.RequiredNodeID != "" && m.NodeID == f.req.RequiredNodeID {
+			r.requiredReachable = true
+		}
+		// Placement rules filter BEFORE power-of-two-choices (P1.4), and
+		// before drain and capacity so an empty set can tell "no node has
+		// these labels" from "the nodes that have them are busy".
+		if len(f.req.Labels) > 0 {
+			if !models.LabelsSatisfy(m.Capacity.Labels, f.req.Labels) {
+				r.rejects["placement_rule"]++
+				continue
+			}
+			r.labelMatched = true
+		}
+		if f.denied[m.NodeID] {
+			r.rejects["denied"]++
+			f.c.denyHits.hit(denyHitPlacement, m.NodeID)
+			continue
+		}
+		if f.drained[m.NodeID] {
+			r.rejects["drained"]++
+			continue
+		}
+		if f.activeFV > 0 && m.FSMOpsVersion > 0 && m.FSMOpsVersion < f.activeFV {
+			r.rejects["below_active_version"]++
+			continue
+		}
+		// A hard capability rule like drain, kept out of nodeFits so the
+		// empty-set error can name it: "no gateway" is not "cluster full".
+		if f.req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
+			r.rejects["egress_gateway"]++
+			continue
+		}
+		if f.req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
+			r.rejects["mediated_egress"]++
+			continue
+		}
+		extra, extraByRuntime := f.pending.of(m.NodeID)
+		switch nodeFitVerdict(m, f.req, extra) {
+		case fitIncompatible:
+			r.rejects["capacity"]++
+			continue
+		case fitNoRoom:
+			r.rejects["capacity"]++
+			r.full = true
+			continue
+		}
+		// A node with CPU and memory to spare is still full for this
+		// runtime when its network-slot pool is: the create would fail
+		// there with "no free slot" (bank density run, 2026-11-01).
+		if !slotsFit(m, f.req, extraByRuntime) {
+			r.rejects["network_slots"]++
+			r.full = true
+			continue
+		}
+		r.candidates = append(r.candidates, m)
+	}
+
+	return r
 }
 
 func normalizeSecretRecipientIDs(ids []string) []string {
@@ -275,6 +382,16 @@ func sameSecretRecipientSet(a, b []string) bool {
 // remaining stable for a given sandbox.
 // When the cluster is smaller than owner+maxBackups, every eligible candidate
 // is included. Empty ownerID or candidates yields nil.
+//
+// Zones (C10): backups go to zones other than the owner's first, one per
+// zone before a second in any, then to nodes whose zone is unknown, and to
+// the owner's own zone last. A zone loss then cannot take the owner and
+// every backup together. HRW order holds inside each step, so the set stays
+// stable for a sandbox, and a cluster without zones gets exactly the set it
+// got before. A build without this rule picks a different set for a zoned
+// cluster, so during a rolling upgrade old and new nodes disagree; that is
+// safe only because the set is chosen once, when the create is reserved,
+// and recorded with the placement, never chosen again by another node.
 func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID string, maxBackups int) []string {
 	ownerID = strings.TrimSpace(ownerID)
 	if ownerID == "" || len(candidates) == 0 {
@@ -283,10 +400,18 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 	if maxBackups < 0 {
 		maxBackups = 0
 	}
+	ownerZone := ""
+	for _, m := range candidates {
+		if strings.TrimSpace(m.NodeID) == ownerID {
+			ownerZone = memberZone(m)
+			break
+		}
+	}
 	seen := map[string]struct{}{ownerID: {}}
 	out := []string{ownerID}
 	type scored struct {
 		id    string
+		zone  string
 		score uint64
 	}
 	rest := make([]scored, 0, len(candidates))
@@ -299,7 +424,7 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 			continue
 		}
 		seen[id] = struct{}{}
-		rest = append(rest, scored{id: id, score: secretRecipientScore(sandboxID, id)})
+		rest = append(rest, scored{id: id, zone: memberZone(m), score: secretRecipientScore(sandboxID, id)})
 	}
 	sort.SliceStable(rest, func(i, j int) bool {
 		if rest[i].score != rest[j].score {
@@ -310,8 +435,46 @@ func SelectSecretRecipients(sandboxID string, candidates []Member, ownerID strin
 	if maxBackups > len(rest) {
 		maxBackups = len(rest)
 	}
-	for i := 0; i < maxBackups; i++ {
-		out = append(out, rest[i].id)
+	// rank: 0 another known zone, 1 unknown zone, 2 the owner's zone. With
+	// no zones anywhere every node ranks the same and HRW order stands.
+	rank := func(z string) int {
+		switch {
+		case z == ownerZone:
+			return 2
+		case z == "":
+			return 1
+		default:
+			return 0
+		}
+	}
+	// No size hint: maxBackups comes from the request, and the map only
+	// ever holds the few backups picked.
+	picked := make(map[string]bool)
+	take := func(c scored) {
+		out = append(out, c.id)
+		picked[c.id] = true
+	}
+	// First, the best node of each other zone, so two backups land in two
+	// zones when there are two to use.
+	usedZone := map[string]bool{}
+	for _, c := range rest {
+		if len(out)-1 == maxBackups {
+			break
+		}
+		if rank(c.zone) == 0 && !usedZone[c.zone] {
+			usedZone[c.zone] = true
+			take(c)
+		}
+	}
+	for r := 0; r <= 2 && len(out)-1 < maxBackups; r++ {
+		for _, c := range rest {
+			if len(out)-1 == maxBackups {
+				break
+			}
+			if !picked[c.id] && rank(c.zone) == r {
+				take(c)
+			}
+		}
 	}
 	return out
 }
@@ -385,6 +548,12 @@ func nodeFitVerdict(m Member, req capacity.Request, extraReserved capacity.Reque
 		if req.GPUVendor != "" && cap.GPUVendor != "" && req.GPUVendor != cap.GPUVendor {
 			return fitIncompatible
 		}
+	}
+	// A node without the rule's labels can never run the request. Callers
+	// that need to name the rule check it first; this keeps every other
+	// caller (failover scoring, reservation re-admission) from forgetting.
+	if !models.LabelsSatisfy(cap.Labels, req.Labels) {
+		return fitIncompatible
 	}
 	if req.Runtime != "" && len(cap.SupportedRuntimes) > 0 {
 		supported := false
@@ -475,10 +644,11 @@ func freeSlotsAfterPending(m Member, req capacity.Request, pendingByRuntime map[
 // empty SupportedRuntimes), so a rolling upgrade places exactly as before.
 //
 // The heartbeat can lag a create that has already been promoted (the pending
-// claim is gone, the next pull has not run): within one capacity interval a
-// node can still be picked for its last slots. The worker then refuses with
-// its pool's capacity error (503 + Retry-After) and the retry is placed again;
-// that is the same window CPU and memory accounting have.
+// claim is gone, the next pull has not run). pendingByRuntime carries those
+// creates too until a heartbeat requested after the promote is stored
+// (capacity_unreported.go), so the window that remains is a failover recreate
+// the new owner has not started yet. There the worker refuses with its pool's
+// capacity error (503 + Retry-After), the same as for CPU and memory.
 func slotsFit(m Member, req capacity.Request, pendingByRuntime map[string]int) bool {
 	free, _, ok := freeSlotsAfterPending(m, req, pendingByRuntime)
 	return !ok || free >= 1
@@ -557,17 +727,75 @@ func pickTwo(c []Member) (Member, Member) {
 
 func sameNode(a, b Member) bool { return a.NodeID == b.NodeID }
 
+// reservationRetryAdmitMargin is how long a reservation must still have to
+// live for admission to treat a resend of it as a refresh. Admission reads
+// the leader's clock; the FSM decides by the time the same leader stamps on
+// the entry a moment later. Inside this margin the FSM may find the row
+// expired and reserve afresh, which needs a normal admission.
+const reservationRetryAdmitMargin = 5 // seconds
+
+// withoutLiveReservationRetries drops the reservations the FSM will apply as
+// a TTL refresh of a live reservation: same sandbox, same owner, same
+// incarnation (reservePlacementLocked's retry branch). Their load is already
+// in the pending index, so admitting them again counted one sandbox twice: a
+// create whose first answer was lost in a leader change, resent to the next
+// server, was refused on a full worker while its reservation kept the slot
+// until the TTL sweep. Found by the offline fault harness (PR #1017, Bug A).
+// A resend that changed its incarnation is admitted as usual; the FSM
+// refuses it anyway.
+func withoutLiveReservationRetries(fsm *placementFSM, reservations []reservationCommand, now int64) []reservationCommand {
+	var kept []reservationCommand
+	for i, r := range reservations {
+		if !isLiveReservationRetry(fsm, r, now) {
+			if kept != nil {
+				kept = append(kept, r)
+			}
+			continue
+		}
+		if kept == nil {
+			kept = append(make([]reservationCommand, 0, len(reservations)), reservations[:i]...)
+		}
+	}
+	if kept == nil {
+		return reservations
+	}
+	return kept
+}
+
+func isLiveReservationRetry(fsm *placementFSM, r reservationCommand, now int64) bool {
+	incarnation := strings.TrimSpace(r.IncarnationID)
+	if fsm == nil || r.SandboxID == "" || incarnation == "" {
+		return false
+	}
+	p, ok := fsm.get(r.SandboxID)
+	return ok && p.IsReserved() &&
+		strings.TrimSpace(p.OwnerNodeID) == strings.TrimSpace(r.OwnerNodeID) &&
+		strings.TrimSpace(p.IncarnationID) == incarnation &&
+		now+reservationRetryAdmitMargin <= p.ExpiresUnix
+}
+
+// admitReservationCommand is the leader's capacity answer for a reservation
+// command. It runs under reservationAdmissionMu and counts, besides the
+// owner's heartbeat, the committed pending load plus every reservation the
+// leader has admitted but not yet seen applied (admission_ledger.go). A
+// resend of a create still in flight is not counted again.
 func (c *Cluster) admitReservationCommand(cmd command) error {
-	reservations := reservationCommands(cmd)
+	// Two kinds of resend add no load: one of a reservation the FSM already
+	// holds live (Bug A, PR #1021), and one of a create still in flight on
+	// this leader (the ledger, PR #1024).
+	reservations := withoutLiveReservationRetries(c.fsm, reservationCommands(cmd), time.Now().Unix())
+	reservations = c.admission.withoutHeldResends(reservations)
 	if len(reservations) == 0 {
 		return nil
 	}
-	now := time.Now().Unix()
-	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(now)
-	pendingCounts := make(map[string]int, len(reservations))
-	for _, r := range reservations {
-		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
-			pendingCounts[r.OwnerNodeID] = c.fsm.livePendingReservationCount(r.OwnerNodeID, now)
+	// A router with a stale view may still pick a node deleted since; the
+	// leader refuses it here, so the create retries elsewhere.
+	if denied := c.fsm.deniedNodeSet(); len(denied) > 0 {
+		for _, r := range reservations {
+			if denied[r.OwnerNodeID] {
+				c.denyHits.hit(denyHitPlacement, r.OwnerNodeID)
+				return fmt.Errorf("%w: worker %s was deleted from the cluster", ErrNoPlacementTarget, r.OwnerNodeID)
+			}
 		}
 	}
 	templateIDs := make([]string, 0, len(reservations))
@@ -576,7 +804,28 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 			templateIDs = append(templateIDs, r.Spec.TemplateID)
 		}
 	}
-	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
+	owners := make([]string, 0, len(reservations))
+	for _, r := range reservations {
+		owners = append(owners, r.OwnerNodeID)
+	}
+	// Heartbeats before pending lookups, as pendingLoadByNode requires (C7).
+	// Only the owners': the check reads no other member.
+	members := c.withCatalogueTemplateHolders(c.membersWithCapacityFor(owners), templateIDs...)
+	now := time.Now().Unix()
+	// Committed pending load plus the ledger's in-flight holds (E2), then the
+	// load promoted or failed over since the owner's last heartbeat (C7).
+	reserved, reservedRuntimes, pendingCounts := c.fsm.admissionPendingLoad(now, owners, c.admission.heldReservations())
+	load := pendingLoad{reserved: reserved, runtimes: reservedRuntimes}
+	if c.capacityLeases != nil {
+		load.unreported = c.capacityLeases.unreported
+	}
+	pending := make(map[string]capacity.Request, len(reservations))
+	pendingRuntimes := make(map[string]map[string]int, len(reservations))
+	for _, r := range reservations {
+		if _, ok := pending[r.OwnerNodeID]; !ok {
+			pending[r.OwnerNodeID], pendingRuntimes[r.OwnerNodeID] = load.of(r.OwnerNodeID)
+		}
+	}
 	return admitReservationCommands(members, pending, pendingRuntimes, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
 }
 
@@ -669,6 +918,12 @@ func admitReservationCommands(members []Member, pending map[string]capacity.Requ
 				ErrCreateBackpressure, r.OwnerNodeID, pendingCounts[r.OwnerNodeID]+batchCounts[r.OwnerNodeID], maxPendingPerWorker)
 		}
 		req := capacityRequestFromSpec(r.Spec)
+		// The router filtered on labels, but a router on an older build did
+		// not: the leader refuses a reservation onto a node the rule
+		// excludes, so a mixed-version cluster fails closed.
+		if !models.LabelsSatisfy(m.Capacity.Labels, req.Labels) {
+			return fmt.Errorf("worker %s: %w", r.OwnerNodeID, models.PlacementUnsatisfiableError(req.Labels))
+		}
 		extra := pending[r.OwnerNodeID]
 		batchExtra := batchPending[r.OwnerNodeID]
 		extra.CPU += batchExtra.CPU
@@ -772,12 +1027,19 @@ var _ = func() error {
 // fails as ErrNoEgressGatewayTarget so the client is told why: some node may
 // have had room, none could filter hostnames.
 //
+// A request with a placement rule that no live worker's labels satisfy fails
+// as ErrPlacementUnsatisfiable naming the rule: a 409, because waiting does
+// not change a node's labels, and never a fallback to an unlabelled node.
+//
 // Otherwise, when a worker that could run the request was turned away only
 // for room (full), the cluster is at capacity: ErrClusterAtCapacity says so,
 // and stays an ErrNoPlacementTarget for every existing 503 mapping.
-func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected, full bool) error {
+func noPlacementTargetError(req capacity.Request, requiredReachable, labelMatched, gatewayRejected, full bool) error {
 	if req.RequiredNodeID != "" && !requiredReachable {
 		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	if len(req.Labels) > 0 && !labelMatched {
+		return models.PlacementUnsatisfiableError(req.Labels)
 	}
 	if req.NeedsEgressGateway && gatewayRejected {
 		return ErrNoEgressGatewayTarget

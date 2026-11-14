@@ -164,22 +164,26 @@ func TestMountWaitError(t *testing.T) {
 		return e
 	}
 	running := &procExit{done: make(chan struct{})}
-	withOutput := &capturedOutput{}
-	_, _ = withOutput.Write([]byte("mount-s3 INFO starting\n"))
+	logDir := t.TempDir()
+	withOutput := &helperOutput{path: filepath.Join(logDir, "with.log")}
+	silent := &helperOutput{path: filepath.Join(logDir, "silent.log")}
+	if err := os.WriteFile(withOutput.path, []byte("mount-s3 INFO starting\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	timeout := errors.New("timed out waiting for mount at /m/sb/0")
 
 	cases := []struct {
 		name    string
 		waitErr error
 		exit    *procExit
-		out     *capturedOutput
+		out     *helperOutput
 		want    string
 	}{
 		{"live tool, timeout, output", timeout, running, withOutput,
 			"timed out waiting for mount at /m/sb/0 (mount tool output: mount-s3 INFO starting)"},
-		{"live tool, timeout, silent", timeout, running, &capturedOutput{},
+		{"live tool, timeout, silent", timeout, running, silent,
 			"timed out waiting for mount at /m/sb/0 (mount tool produced no output)"},
-		{"tool exited cleanly", errMountToolExited, exitedWith(nil), &capturedOutput{},
+		{"tool exited cleanly", errMountToolExited, exitedWith(nil), silent,
 			"mount tool exited before the mount was ready: exit status 0 (mount tool produced no output)"},
 		{"path removed, tool exited too", errMountPathRemoved, exitedWith(errors.New("signal: killed")), withOutput,
 			"mount path was removed while waiting for the mount (mount tool exited: signal: killed) (mount tool output: mount-s3 INFO starting)"},

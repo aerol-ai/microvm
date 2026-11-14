@@ -121,6 +121,7 @@ func TestSandboxNodeAllowlist(t *testing.T) {
 		{name: "privileged node: no gateway, no ports", gateway: true, cfg: func(c *config.Config) { c.ContainerPrivileged = true }, want: nil},
 		{name: "ingress node serves 80 and 443", cfg: func(c *config.Config) { c.NodeRole = config.NodeRoleMixed }, want: []string{"tcp/443", "tcp/80"}},
 		{name: "ingress without caddy", cfg: func(c *config.Config) { c.NodeRole, c.EnableCaddy = config.NodeRoleMixed, false }, want: nil},
+		{name: "ingress kept closed to sandboxes", cfg: func(c *config.Config) { c.NodeRole, c.SandboxNodeIngressClosed = config.NodeRoleMixed, true }, want: nil},
 		{name: "escape hatch", cfg: func(c *config.Config) {
 			c.SandboxNodePortsAllow = []config.SandboxNodePort{{Proto: "tcp", Port: 8443}, {Proto: "udp", Port: 5353}}
 		}, want: []string{"tcp/8443", "udp/5353"}},
@@ -196,6 +197,15 @@ func TestHostMediatedNodePorts(t *testing.T) {
 	cfg.SandboxNodePortsAllow = []config.SandboxNodePort{{Proto: "udp", Port: 443}, {Proto: "tcp", Port: 8443}}
 	if got := HostMediatedNodePorts(cfg); !slices.Equal(got, []uint16{80, 443, 8443}) {
 		t.Fatalf("ingress + hatch: %v", got)
+	}
+	// Closed, ingress adds nothing; the hatch's own 443 (udp) stays.
+	cfg.SandboxNodeIngressClosed = true
+	if got := HostMediatedNodePorts(cfg); !slices.Equal(got, []uint16{443, 8443}) {
+		t.Fatalf("ingress kept closed + hatch: %v", got)
+	}
+	cfg.SandboxNodePortsAllow = nil
+	if got := HostMediatedNodePorts(cfg); len(got) != 0 {
+		t.Fatalf("ingress kept closed: %v", got)
 	}
 }
 
@@ -382,6 +392,19 @@ func TestNodeControlAndNodeGuardAgree(t *testing.T) {
 			if p.Port == port && p.Proto == "tcp" {
 				t.Errorf("node_control drops the TAP pool's port %d, which the node guard opens (%s)", port, p)
 			}
+		}
+	}
+}
+
+// A configured port out of range is no port at all, not a wrapped one:
+// uint16(70000) would be 4464.
+func TestPortOf(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want uint16
+	}{{53054, 53054}, {1, 1}, {65535, 65535}, {0, 0}, {-1, 0}, {65536, 0}, {70000, 0}} {
+		if got := portOf(tc.in); got != tc.want {
+			t.Errorf("portOf(%d) = %d, want %d", tc.in, got, tc.want)
 		}
 	}
 }

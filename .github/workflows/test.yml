@@ -4,16 +4,16 @@ on:
   push:
     branches:
       - main
-  # Only pull requests into main. A plain pull request into a feature
-  # branch runs nothing. A GitHub native stacked pull request still runs:
-  # GitHub builds its merge ref against main and merges the whole stack
-  # under main's ruleset, so every layer must post the required `changes`
-  # check. On those layers `paths` turns every suite off, and only the
-  # gate jobs run. `edited` is listed so a pull request retargeted to main
-  # gets its checks without a new push; a title or body edit also fires it.
+  # Every pull request, whatever its base. On a layer of a stack (base is
+  # another branch) `paths` turns every suite off, so only DCO,
+  # baseline-tests and the gate run. Before, a pull request into a feature
+  # branch ran nothing, and OpenSSF Scorecard's CI-Tests check counted it
+  # as merged untested (#626, merged into its parent's branch). `edited` is
+  # listed so a pull request retargeted to main gets its checks without a
+  # new push. A title or body edit also fires it; that run tests nothing
+  # new, so `paths` turns every suite off and only DCO, baseline-tests and
+  # the gate run (they stay real, so an edit cannot turn a red gate green).
   pull_request:
-    branches:
-      - main
     types: [opened, synchronize, reopened, edited]
   # The merge queue re-runs the required `changes` check on a temporary
   # merge commit. That event is merge_group, not pull_request, so without
@@ -22,9 +22,11 @@ on:
 
 # A new push to a pull request cancels that pull request's older run, so
 # a rebased stack doesn't queue a stale run per layer ahead of the current
-# one. Pushes to main and merge-queue runs are never cancelled.
+# one. Pushes to main and merge-queue runs are never cancelled. A title or
+# body edit gets its own group: in the shared one it cancelled the suites
+# running for the same commit, and its own run starts none of them.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'edited' && !github.event.changes.base && '-edit' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -36,15 +38,22 @@ jobs:
     # A stacked layer (base is another branch) reports every suite as
     # unselected, so it runs only DCO, baseline-tests and the gate. The
     # suites are advisory, and they run on the stack's root pull request
-    # and on the push to main once the stack lands.
+    # and on the push to main once the stack lands. A title or body edit
+    # skips the filter step, and every output below falls back to 'false'.
     outputs:
       docs: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.docs || 'false' }}
       go_main: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_main || 'false' }}
       go_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_sdk || 'false' }}
+      caddy_plugin: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.caddy_plugin || 'false' }}
       java_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.java_sdk || 'false' }}
       python_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_sdk || 'false' }}
+      python_integrations: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_integrations || 'false' }}
       typescript_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.typescript_sdk || 'false' }}
       rust_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.rust_sdk || 'false' }}
+      installer: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer || 'false' }}
+      installer_harness: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.installer_harness || 'false' }}
+      kubernetes: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.kubernetes || 'false' }}
+      operator: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.operator || 'false' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -75,8 +84,12 @@ jobs:
           done < <(git rev-list --no-merges "${BASE_SHA}..HEAD")
           exit "$missing"
 
+      # An edit that keeps the base re-tests a commit that already ran its
+      # suites: about 1 in 5 pull request runs (2026-11-09 to 11-12). A
+      # changed base still runs them, since the merge result is new.
       - name: Detect changed paths
         id: filter
+        if: github.event.action != 'edited' || github.event.changes.base
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         with:
           filters: |
@@ -86,11 +99,13 @@ jobs:
               - 'cmd/**'
               - 'internal/**'
               - 'pkg/**'
+              - 'images/**'
               - 'go.mod'
               - 'go.sum'
               - 'integration-tests/suite/harness/**'
               - '.github/workflows/test.yml'
               - 'scripts/scale-gates.sh'
+              - 'scripts/go-test-split.sh'
               # cmd/aerolvm and the MCP packages build on the Go SDK, and
               # cmd/aerolvm/distribution_test.go checks what ships around
               # the aerolvm binary.
@@ -100,6 +115,13 @@ jobs:
               - 'npm/**'
               - 'server.json'
               - '.github/workflows/release.yml'
+              - '.github/darwin-cross/**'
+              # pkg/caddy's tests check the static route against the plugin's
+              # constants and test config.
+              - 'caddymod/**'
+              # cmd/aerolvm's tests check the evidence pack lists exactly the
+              # rules `aerolvm k8s verify` checks (P7).
+              - 'charts/aerolvm/EVIDENCE.md'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
@@ -108,15 +130,99 @@ jobs:
               - 'sdk/java/**'
             python_sdk:
               - 'sdk/python/**'
+            # The integration packages run on the Python SDK, so an SDK
+            # change re-runs their tests too.
+            python_integrations:
+              - 'integrations/**'
+              - 'sdk/python/**'
             typescript_sdk:
               - 'sdk/typescript/**'
             rust_sdk:
               - 'sdk/rust/**'
+            # AerolVM's Caddy plugin: its own Go module, so go-tests (./...
+            # from the root) never reaches it.
+            caddy_plugin:
+              - 'caddymod/**'
+              - '.github/workflows/test.yml'
+            # The download pins in install.sh, and the script that copies
+            # them to the mirror.
+            installer:
+              - 'scripts/install.sh'
+              - 'scripts/mirror-sync.sh'
+            # What integration-tests/safety and Terraform/validate test:
+            # the installer and operator scripts, the harness, Terraform.
+            installer_harness:
+              - 'scripts/**'
+              - 'integration-tests/**'
+              - 'Terraform/**'
+              - '.github/workflows/test.yml'
+              # k8s_images_test.go checks the Kubernetes image pins and the
+              # release job that builds them.
+              - 'packaging/images/**'
+              - '.github/workflows/release.yml'
+              # caddy_version_test checks the plugin's Caddy pin.
+              - 'caddymod/go.mod'
+            # The Helm chart, the images and the runtime supervisor: the
+            # kubernetes job lints the chart and runs it on kind.
+            kubernetes:
+              - 'charts/**'
+              - 'packaging/images/**'
+              - 'scripts/build-images.sh'
+              - 'scripts/k8s-dev.sh'
+              - 'scripts/k8s-smoke.sh'
+              - 'cmd/aerolvm/k8s*.go'
+              - 'cmd/aerolvm-supervisor/**'
+              - 'internal/supervisor/**'
+              - 'pkg/caddy/cert_reload*.go'
+              - 'pkg/daemon/tls_cert_watch*.go'
+              # The chart's monitoring checks (P6, P9).
+              - 'setup/prometheus/k8s_chart_test.go'
+              - 'setup/prometheus/testdata/k8s-chart-rules.test.yaml'
+              - 'setup/runbooks/kubernetes.md'
+              - 'operator/**'
+              - '.github/workflows/test.yml'
+            # The operator: its own Go module (go-tests from the root never
+            # reaches it), and the chart's pod templates it stamps.
+            operator:
+              - 'operator/**'
+              - 'charts/**'
+              - 'pkg/upgradewire/**'
+              - '.github/workflows/test.yml'
 
+  # go-tests and go-race each run as two jobs. "cluster-service" runs
+  # internal/cluster and internal/service, each split by test name into parts
+  # that run side by side (scripts/go-test-split.sh); they ran their tests one
+  # at a time and took most of each job. "rest" runs every other package. The
+  # two need separate runners: next to the CPU-heavy packages, the cluster
+  # package's Raft tests (250 ms election timers) lost their leader mid-test.
+  # Each cluster-service part also gets its own network namespace
+  # (GO_TEST_NETNS), so one part's Raft and gossip nodes never reach another's.
+  #
+  # Each job keeps its own Go build cache. setup-go's cache uses one key for
+  # every Go job, and the first job to finish saves it: baseline-tests, with
+  # only the Go SDK build (28 MB). go-tests and go-race then restored that,
+  # rebuilt every package (2-4 min) and could not save their own. These
+  # caches are saved only from pushes to main; pull requests restore main's
+  # newest one.
   go-tests:
     needs: paths
     if: needs.paths.outputs.go_main == 'true'
+    name: go-tests (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: cluster-service
+            packages: ./internal/cluster ./internal/service
+            split: ./internal/cluster=3 ./internal/service=2
+            skip: ""
+            netns: "1"
+          - group: rest
+            packages: ./cmd/... ./internal/... ./pkg/... ./images/...
+            split: ""
+            skip: ./internal/cluster ./internal/service
+            netns: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -125,7 +231,18 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install build dependencies
         # softhsm2 lets pkg/secrets/pkcs11 test its real PKCS#11 adapter
@@ -136,18 +253,29 @@ jobs:
           sudo apt-get install -y build-essential softhsm2
 
       - name: Run unit tests with coverage
+        env:
+          AEROLVM_SCALE_GATES: "1"
+          GO_TEST_SPLIT: ${{ matrix.split }}
+          GO_TEST_SKIP: ${{ matrix.skip }}
+          GO_TEST_NETNS: ${{ matrix.netns }}
+          GO_TEST_COVERPROFILE: coverage.out
+          PACKAGES: ${{ matrix.packages }}
         run: |
-          AEROLVM_SCALE_GATES=1 go test -count=1 -timeout 20m -coverprofile=coverage.out ./cmd/... ./internal/... ./pkg/...
+          # PACKAGES is a space-separated list of patterns: split it.
+          # shellcheck disable=SC2086
+          scripts/go-test-split.sh -count=1 -timeout 20m -- $PACKAGES
           go tool cover -func=coverage.out | tail -n 1
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: go-coverage
+          name: go-coverage-${{ matrix.group }}
           path: coverage.out
 
+      # The two jobs cover different packages; Codecov merges their uploads
+      # for the commit.
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: aerol-ai/microvm
@@ -155,11 +283,43 @@ jobs:
           flags: go-main
           fail_ci_if_error: false
 
+      # A failed test run still leaves a good build cache.
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+
+  # Pushes to main only. It is advisory and took 17% of the repo's runner
+  # time (2026-11-09 to 11-12), mostly on pull requests. The org's plan
+  # runs 20 jobs at once, so it made the required checks wait for a runner.
+  # A race now shows on the push run; on a pull request it never blocked
+  # the merge anyway.
   go-race:
     needs: paths
-    if: needs.paths.outputs.go_main == 'true'
+    if: github.event_name == 'push' && needs.paths.outputs.go_main == 'true'
+    name: go-race (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: cluster-service
+            packages: ./internal/cluster ./internal/service
+            split: ./internal/cluster=3 ./internal/service=2
+            skip: ""
+            netns: "1"
+          # Under -race, internal/runtime/wasm is the slowest of the rest
+          # (~300 s): a handful of tests compile wasm guests, CPU-bound.
+          - group: rest
+            packages: ./cmd/... ./internal/... ./pkg/...
+            split: ./internal/runtime/wasm=2
+            skip: ./internal/cluster ./internal/service
+            netns: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -168,7 +328,18 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      - name: Restore Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-
+            ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install build dependencies
         run: |
@@ -176,15 +347,37 @@ jobs:
           sudo apt-get install -y build-essential softhsm2
 
       - name: Race test all daemon packages
-        run: go test -race -count=1 -timeout 25m ./cmd/... ./internal/... ./pkg/...
+        env:
+          GO_TEST_SPLIT: ${{ matrix.split }}
+          GO_TEST_SKIP: ${{ matrix.skip }}
+          GO_TEST_NETNS: ${{ matrix.netns }}
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          # PACKAGES is a space-separated list of patterns: split it.
+          # shellcheck disable=SC2086
+          scripts/go-test-split.sh -race -count=1 -timeout 25m -- $PACKAGES
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ github.job }}-${{ matrix.group }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum') }}-${{ github.sha }}
 
   # Every sandboxd release target builds with cgo (go-sqlite3, and the
   # PKCS#11 helper's miekg/pkcs11 since plans/customer-key-custody.md Phase
   # 3). Same toolchains as release.yml's build matrix, so a cgo dependency
   # that breaks a cross-compile fails here instead of at release time.
+  # darwin also cross-compiles on Linux, with zig as the C toolchain
+  # (.github/darwin-cross/setup.sh), because the org has no macOS runners.
+  # Pushes to main only: six runners per pull request were a quarter of the
+  # repo's runner time (2026-11-09 to 11-12), and a broken target still
+  # shows here before a release builds it.
   sandboxd-cgo-matrix:
     needs: paths
-    if: needs.paths.outputs.go_main == 'true'
+    if: github.event_name == 'push' && needs.paths.outputs.go_main == 'true'
     name: sandboxd cgo build - ${{ matrix.suffix }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -196,7 +389,7 @@ jobs:
           - { runner: ubuntu-latest, goos: linux, goarch: arm64, goarm: "", suffix: linux_arm64, cc: aarch64-linux-gnu-gcc, apt_pkgs: "build-essential gcc-aarch64-linux-gnu" }
           - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "7", suffix: linux_armv7, cc: arm-linux-gnueabihf-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabihf" }
           - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "6", suffix: linux_armv6, cc: arm-linux-gnueabi-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabi" }
-          - { runner: macos-14, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "", apt_pkgs: "" }
+          - { runner: ubuntu-latest, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "zig cc -target aarch64-macos.14.0", apt_pkgs: llvm }
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -213,6 +406,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
+      - name: Set up darwin cross toolchain
+        if: matrix.goos == 'darwin'
+        run: bash .github/darwin-cross/setup.sh
+
       - name: Build sandboxd
         env:
           CGO_ENABLED: "1"
@@ -221,6 +418,14 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           CC: ${{ matrix.cc }}
         run: go build -trimpath -o /tmp/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
+
+      # macOS kills an arm64 binary that has no code signature at launch. The
+      # zig link adds an ad-hoc one; a toolchain bump must not lose it.
+      - name: Check the darwin binary is signed
+        if: matrix.suffix == 'darwin_arm64'
+        run: |
+          llvm-objdump --macho --private-headers /tmp/sandboxd_${{ matrix.suffix }} | grep LC_CODE_SIGNATURE >/dev/null ||
+            { echo "::error::sandboxd_${{ matrix.suffix }} has no code signature; macOS will not run it"; exit 1; }
 
   go-security:
     needs: paths
@@ -237,7 +442,7 @@ jobs:
           cache: true
 
       - name: Vet production packages
-        run: go vet ./cmd/... ./internal/... ./pkg/...
+        run: go vet ./cmd/... ./internal/... ./pkg/... ./images/...
 
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
@@ -361,6 +566,31 @@ jobs:
       - name: Run Go SDK tests
         run: go test -count=1 ./sdk/go/...
 
+  # The Caddy plugin in every release Caddy (the sandbox route's upstream
+  # lookup). One of its tests runs a whole Caddy in process.
+  caddy-plugin-tests:
+    needs: paths
+    if: needs.paths.outputs.caddy_plugin == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: caddymod
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: caddymod/go.sum
+
+      - name: Vet and test the Caddy plugin
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
   java-sdk-tests:
     needs: paths
     if: needs.paths.outputs.java_sdk == 'true'
@@ -373,7 +603,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Java
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: '17'
@@ -411,6 +641,56 @@ jobs:
           python -m pip install --no-deps --no-build-isolation -e .
 
       - name: Run Python SDK tests
+        run: python -m unittest discover -s tests -v
+
+  # One leg per agent-framework package in integrations/. Each pins its
+  # framework in its own hash-locked requirements-ci.txt, so the legs never
+  # share a dependency set.
+  python-integrations-tests:
+    needs: paths
+    if: needs.paths.outputs.python_integrations == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: openai-agents
+            python: '3.12'
+          - package: deepagents
+            python: '3.12'
+          - package: gymnasium
+            python: '3.12'
+          # NeMo Gym asks for Python >=3.13.14, which only 3.14 meets.
+          - package: nemo-gym
+            python: '3.14'
+    defaults:
+      run:
+        working-directory: integrations/${{ matrix.package }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: integrations/${{ matrix.package }}/requirements-ci*.txt
+
+      - name: Install the package and its pinned dependencies
+        run: |
+          # Hash-pin third-party packages, then install the SDK and the
+          # package from this checkout with --no-deps, as the SDK job does.
+          python -m pip install --require-hashes -r requirements-ci.txt
+          # A framework installed without its own dependencies (NeMo Gym's
+          # are a training stack its provider API never imports), still by
+          # hash.
+          if [ -f requirements-ci-nodeps.txt ]; then
+            python -m pip install --no-deps --no-build-isolation --require-hashes -r requirements-ci-nodeps.txt
+          fi
+          python -m pip install --no-deps --no-build-isolation -e ../../sdk/python -e .
+
+      - name: Run the package's tests
         run: python -m unittest discover -s tests -v
 
   typescript-sdk-tests:
@@ -481,10 +761,273 @@ jobs:
       - name: Run the Go SDK test suite
         run: go test -count=1 ./sdk/go/...
 
+  # The installer, the integration harness and Terraform. go-tests runs none
+  # of this: its filter (go_main) is the daemon's code, so a pull request that
+  # changed only install.sh, the harness or Terraform ran none of their
+  # offline tests in CI (#1093 merged that way, tested only on laptops).
+  # The mirror step fails when install.sh pins a third-party file the
+  # download mirror does not serve yet, so a forgotten copy shows here and
+  # not after a release; the release workflow's mirror job fills it.
+  # Advisory, like the other suites.
+  installer-and-harness:
+    needs: paths
+    if: needs.paths.outputs.installer_harness == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Every file install.sh pins is on the download mirror
+        if: needs.paths.outputs.installer == 'true'
+        run: scripts/mirror-sync.sh --deps --check
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The bootstrap render tests run terraform; without it they skip.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
+        with:
+          terraform_wrapper: false
+
+      - name: Install yq
+        run: |
+          go install github.com/mikefarah/yq/v4@v4.53.3
+          sudo install -m 0755 "$(go env GOPATH)/bin/yq" /usr/local/bin/yq
+
+      - name: Run the harness safety tests and Terraform's validate tests
+        run: go test -count=1 ./integration-tests/safety/ ./Terraform/validate/
+
+      # The live suite (build tag integration) only runs against a real
+      # cluster, so a test there that reads source instead of a cluster used
+      # to run only during a live run: two such guards failed on main for
+      # weeks (chaosStopVoters). TestMain needs a scenario, but these tests
+      # never call it, so placeholder values do. go vet compiles the whole
+      # suite, which no other job does.
+      - name: Compile the live suite and run its offline guards
+        env:
+          AEROL_CAPS: ${{ github.workspace }}/integration-tests/scenarios/single-node.caps.yml
+          AEROL_BASE_URL: http://127.0.0.1:1
+          AEROL_PAT: offline
+          AEROL_SCENARIO: single-node
+        run: |
+          go vet -tags integration ./integration-tests/...
+          go test -tags integration -count=1 \
+            -run '^(TestEveryCaseThatStopsSandboxdWaitsForTheRejoin|TestTheRejoinWaitIsWiredEndToEnd|TestDisruptiveCasesChooseANonSeedVictim|TestParseMachineConfigRealScenarios)$' \
+            ./integration-tests/suite/
+
+  # The operator (plans/kubernetes-v2-architecture.md P2): generated files
+  # up to date, vet and race tests (the chart's RBAC grants what the
+  # markers ask), then the chart's cluster-mode pod templates, rendered by Helm,
+  # parsed strictly and stamped for every role, so the chart and the
+  # operator agree on container and volume names.
+  operator-tests:
+    needs: paths
+    if: needs.paths.outputs.operator == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: operator/go.sum
+
+      - name: Install Helm
+        run: |
+          curl -fsSL -o helm.tgz https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          echo "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+
+      - name: Render the chart's pod templates and operator RBAC
+        run: |
+          scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
+          helm template t charts/aerolvm --namespace aerolvm-system \
+            --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
+            --set 'cluster.workerPools[0].name=general' \
+            --set 'cluster.workerPools[0].machine.cpu=8' --set 'cluster.workerPools[0].machine.memoryGiB=32' \
+            --set 'cluster.workerPools[0].minWorkers=3' --set 'cluster.workerPools[0].maxWorkers=9' \
+            --set cluster.externalCA.issuerRef.name=bank-ca \
+            --show-only templates/operator.yaml > "$RUNNER_TEMP/chart-operator.yaml"
+          helm template t charts/aerolvm --namespace aerolvm-system \
+            --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
+            --set 'cluster.workerPools[0].name=general' \
+            --set 'cluster.workerPools[0].machine.cpu=8' --set 'cluster.workerPools[0].machine.memoryGiB=32' \
+            --set 'cluster.workerPools[0].minWorkers=3' --set 'cluster.workerPools[0].maxWorkers=9' \
+            --show-only templates/crd-upgrade.yaml > "$RUNNER_TEMP/chart-crd-upgrade.yaml"
+
+      # The CRDs, deep copies and RBAC are generated from the Go types and
+      # markers; a stale copy fails here, not on a live cluster.
+      - name: Generated files are up to date
+        working-directory: operator
+        run: |
+          go generate ./api/...
+          git diff --exit-code -- . ../charts/aerolvm/crds
+
+      - name: Vet and test the operator
+        working-directory: operator
+        env:
+          AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
+          AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
+          AEROLVM_CHART_CRD_UPGRADE: ${{ runner.temp }}/chart-crd-upgrade.yaml
+        run: |
+          go vet ./...
+          go test -race -count=1 -cover ./...
+
+  # The Helm chart in single mode on kind (plans/kubernetes-v2-architecture.md,
+  # Phase 1 exit): lint and render it, build the images from this checkout,
+  # install it, use a runc and a gVisor sandbox through the API, and delete
+  # the worker pod with them running (finding F8). Advisory, like the other
+  # heavy suites; it runs only when the chart, the images or the supervisor
+  # change.
+  kubernetes:
+    needs: paths
+    if: needs.paths.outputs.kubernetes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Helm and kind
+        run: |
+          curl -fsSL -o helm.tgz https://get.helm.sh/helm-v3.22.1-linux-amd64.tar.gz
+          echo "896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          curl -fsSL -o kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
+          sudo install -m 0755 kind /usr/local/bin/kind
+          # promtool, for the chart's alert rules (P6, P9).
+          curl -fsSL -o prometheus.tgz https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz
+          echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  prometheus.tgz" | sha256sum -c -
+          tar -xzf prometheus.tgz prometheus-3.5.0.linux-amd64/promtool
+          sudo install -m 0755 prometheus-3.5.0.linux-amd64/promtool /usr/local/bin/promtool
+
+      - name: Lint and render the chart
+        run: |
+          helm lint charts/aerolvm
+          helm template t charts/aerolvm | grep -q 'kind: StatefulSet'
+          # Cluster mode (P2): the operator, its webhook, the worker
+          # PodDisruptionBudget, the AerolCluster and the pod templates; no
+          # single-mode StatefulSet. It refuses without zones and worker
+          # pools.
+          cluster="--set mode=cluster --set cluster.zones={a,b,c} --set cluster.workerPools[0].name=general --set cluster.workerPools[0].machine.cpu=8 --set cluster.workerPools[0].machine.memoryGiB=32 --set cluster.workerPools[0].minWorkers=3 --set cluster.workerPools[0].maxWorkers=9"
+          helm lint charts/aerolvm $cluster
+          out="$(helm template t charts/aerolvm $cluster)"
+          for kind in AerolCluster ValidatingWebhookConfiguration PodDisruptionBudget PriorityClass Namespace; do
+            grep -q "kind: $kind" <<<"$out" || { echo "::error::cluster mode rendered no $kind"; exit 1; }
+          done
+          if grep -q 'kind: StatefulSet' <<<"$out"; then
+            echo "::error::cluster mode rendered the single-mode StatefulSet"
+            exit 1
+          fi
+          # Helm never updates crds/: a pre-upgrade Job does, unless asked
+          # not to.
+          grep -q -- '--apply-crds=/crds' <<<"$out" || { echo "::error::cluster mode rendered no CRD upgrade hook"; exit 1; }
+          if helm template t charts/aerolvm $cluster --set cluster.operator.upgradeCRDs=false | grep -q -- '--apply-crds'; then
+            echo "::error::cluster.operator.upgradeCRDs=false still rendered the CRD upgrade hook"
+            exit 1
+          fi
+          if helm template t charts/aerolvm --set mode=cluster >/dev/null 2>&1; then
+            echo "::error::cluster mode rendered with no zones or worker pools"
+            exit 1
+          fi
+          edge="--set edge.enabled=true --set edge.domain=aerolvm.test --set edge.certManager.issuerRef.name=ci"
+          helm lint charts/aerolvm $edge
+          helm template t charts/aerolvm $edge | grep -q 'kind: Certificate'
+          if helm template t charts/aerolvm --set edge.enabled=true --set edge.domain=aerolvm.test >/dev/null 2>&1; then
+            echo "::error::the edge rendered with no certificate source"
+            exit 1
+          fi
+          # C24: the egress NetworkPolicy is on by default and off when
+          # asked; the cluster's addresses reach sandboxd and the gateway,
+          # and stay out of the policy's internet rule.
+          helm template t charts/aerolvm | grep -q 'kind: NetworkPolicy'
+          if helm template t charts/aerolvm --set networkPolicy.enabled=false | grep -q 'kind: NetworkPolicy'; then
+            echo "::error::networkPolicy.enabled=false still rendered a NetworkPolicy"
+            exit 1
+          fi
+          ranges="--set worker.egressDenyFloor={10.96.0.1} --set worker.egressPrivateRanges={10.244.0.0/16} --set networkPolicy.extraEgressCIDRs={10.50.0.0/16}"
+          out="$(helm template t charts/aerolvm $ranges)"
+          [ "$(grep -c 'SB_EGRESS_DENY_FLOOR_CIDRS, value: "10.96.0.1"' <<<"$out")" = 2 ]
+          [ "$(grep -c 'SB_EGRESS_PRIVATE_DEFAULT_CIDRS, value: "10.244.0.0/16"' <<<"$out")" = 2 ]
+          grep -q -- '- 10.96.0.1/32' <<<"$out"
+          grep -q -- '- 10.244.0.0/16' <<<"$out"
+          grep -q 'cidr: 10.50.0.0/16' <<<"$out"
+          # P9: monitoring is off by default (its kinds need the Prometheus
+          # Operator's CRDs) and renders a ServiceMonitor, the rules and
+          # the dashboards when on.
+          if helm template t charts/aerolvm | grep -qE 'kind: (ServiceMonitor|PrometheusRule)'; then
+            echo "::error::monitoring rendered while monitoring.enabled is false"
+            exit 1
+          fi
+          helm lint charts/aerolvm --set monitoring.enabled=true
+          out="$(helm template t charts/aerolvm --set monitoring.enabled=true)"
+          grep -q 'kind: ServiceMonitor' <<<"$out"
+          grep -q 'kind: PrometheusRule' <<<"$out"
+          grep -q 'grafana_dashboard: "1"' <<<"$out"
+          # P10: the bank preset renders everything the evidence pack
+          # names, with gVisor as the only runtime.
+          helm lint charts/aerolvm -f charts/aerolvm/values-bank-eks.yaml
+          out="$(helm template t charts/aerolvm -f charts/aerolvm/values-bank-eks.yaml)"
+          for kind in AerolCluster NetworkPolicy ServiceMonitor PrometheusRule Certificate; do
+            grep -q "kind: $kind" <<<"$out" || { echo "::error::the bank preset rendered no $kind"; exit 1; }
+          done
+          grep -q 'SB_CONTAINER_RUNTIME, value: "gvisor"' <<<"$out"
+
+      # The chart's alerts, recording rules and dashboards (P6, P9): every
+      # metric they read is registered in the Go code (or is the
+      # operator's or kube-state-metrics'), every alert has its runbook
+      # entry, promtool checks and unit-tests the rules, and the rendered
+      # PrometheusRule holds exactly the rule file.
+      - name: Check the chart's monitoring
+        env:
+          AEROLVM_CHART_TOOLS: require
+        run: go test -count=1 -run '^TestKubernetesChart' -v ./setup/prometheus/
+
+      # kind's nodes share this runner's kernel, which has no br_netfilter
+      # loaded; sandboxd refuses to start without it, since sandbox
+      # isolation on the bridge would fail open (Kubernetes v2 finding F2).
+      - name: Load br_netfilter
+        run: sudo modprobe br_netfilter
+
+      - name: Install single mode on kind
+        run: make k8s-dev
+
+      - name: Smoke test
+        run: scripts/k8s-smoke.sh
+
+      # The same install with the edge (C25): Caddy, cert-manager, HTTPS
+      # sandbox links and a certificate renewal.
+      - name: Install with the edge on kind
+        run: AEROL_K8S_EDGE=1 make k8s-dev
+
+      - name: Smoke test with the edge
+        run: scripts/k8s-smoke.sh
+
+      - name: Worker logs
+        if: failure()
+        run: kubectl -n aerolvm logs aerolvm-0 --all-containers --tail=200 || true
+
   # Job id stays `changes` because ruleset 16186085 requires that check.
   # It gates the merge on the DCO sign-off (checked in `paths`) and the
-  # baseline suite only. The suites above still run on every pull request
-  # and report their own result, but they don't block the merge: waiting
+  # baseline suite only. The suites above (except go-race and the cgo
+  # matrix, which run only on the push to main) run on pull requests and report
+  # their own result, but they don't block the merge: waiting
   # ~25 min for go-tests and go-race, then again whenever main moved, made
   # every merge slow. A break they would have caught shows up on the
   # push-to-main run instead. It runs even when a dependency fails

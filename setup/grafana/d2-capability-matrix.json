@@ -214,6 +214,45 @@
       ],
       "title": "Create Activity by Node",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Toolbox calls through every API (key: v1, daytona, e2b, runloop) by feature (key2: files, watch, exec, exec_stream, sessions, pty, lsp, other) and result (key3: 2xx, 4xx, 501, 5xx). A new 4xx or 5xx after a release means a feature broke; 501s show which unsupported features callers try.",
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 25 },
+      "id": 6,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "expr": "sum by (key, key2, key3) (rate(aerolvm_toolbox_calls_total[5m]))",
+          "legendFormat": "{{key}} {{key2}} {{key3}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Toolbox Calls by API, Feature and Result",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Sandbox lifecycle events per second (plans/agent-sandbox-feature-parity.md O1): stops by status reason (user_stop, idle, max_age, out_of_memory, disk_limit, crashed, program_exited, reconcile), starts by kind (requested, restarted, failover, moved), deletes by the timer that fired (idle, max_age, program_exited) and main programs that ended (success, failure). A rise in crashed or out_of_memory stops with restarted starts is a crash loop.",
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
+      "id": 7,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "sum by (key) (rate(aerolvm_sandbox_stops_total[5m]))", "legendFormat": "stop {{key}}", "refId": "A" },
+        { "expr": "sum by (key) (rate(aerolvm_sandbox_starts_total[5m]))", "legendFormat": "start {{key}}", "refId": "B" },
+        { "expr": "sum by (key) (rate(aerolvm_sandbox_expired_total[5m]))", "legendFormat": "expired {{key}}", "refId": "C" },
+        { "expr": "sum by (key) (rate(aerolvm_sandbox_finished_total[5m]))", "legendFormat": "finished {{key}}", "refId": "D" }
+      ],
+      "title": "Sandbox Lifecycle: Stops, Starts, Expiries and Finished Programs",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -224,5 +263,5 @@
   "timezone": "browser",
   "title": "D2 Capability Matrix",
   "uid": "aerolvm-d2-capability",
-  "version": 3
+  "version": 5
 }

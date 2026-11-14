@@ -52,20 +52,34 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		effectiveRuntime = d.cfg.DefaultRuntime
 	}
 	logf := func(msg string, args ...any) { d.logger.Warn(msg, args...) }
-	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, d.cfg.Privileged, logf); err != nil {
+	// ValidateRuntimeRequest logs only its "gVisor ignores DiskGB" warning,
+	// which is not true here with the disk limit on: the gVisor file store
+	// sits in the limited writable layer (spike S8).
+	validateLogf := logf
+	if d.cfg.DiskQuota {
+		validateLogf = nil
+	}
+	if err := models.ValidateRuntimeRequest(req, effectiveRuntime, d.cfg.Privileged, validateLogf); err != nil {
 		return nil, err
 	}
-	// DiskGB: dockerd may enforce via StorageOpt; containerd overlayfs does not
-	// (plans/containerd-engine-phase0-decisions.md DiskGB row). Soft-ignore.
-	if req.DiskGB > 0 && !models.DiskGBEnforced(models.ContainerEngineContainerd, effectiveRuntime) {
+	// DiskGB: enforced only with SB_CONTAINERD_DISK_QUOTA (limitWritableLayer,
+	// below); otherwise soft-ignored, as overlayfs alone has no limit
+	// (plans/containerd-engine-phase0-decisions.md DiskGB row).
+	if req.DiskGB > 0 && !d.cfg.DiskQuota && !models.DiskGBEnforced(models.ContainerEngineContainerd, effectiveRuntime) {
 		logf("ignoring disk quota: containerd overlayfs DiskGB not enforced yet", "disk_gb", req.DiskGB)
 	}
 	ociRuntime, err := models.ResolveOCIRuntime(effectiveRuntime)
 	if err != nil {
 		return nil, err
 	}
+	// A move's recreate resumes a gVisor sandbox from the checkpoint staged
+	// here (gvisor_move.go), never from the warm pool.
+	restore := sbruntime.RestoreRequested(ctx)
+	if restore && (ociRuntime != "runsc" || !d.staged(sandboxID)) {
+		return nil, fmt.Errorf("containerd runtime: no gVisor checkpoint is staged for %s", sandboxID)
+	}
 
-	if d.warmPool != nil {
+	if d.warmPool != nil && !restore {
 		if warm, warmErr := d.tryWarmAdopt(ctx, req, sandboxID, toolboxToken, hostMounts, effectiveRuntime); warmErr == nil {
 			return warm, nil
 		} else if errors.Is(warmErr, dockerpkg.ErrSandboxContainerExists) {
@@ -92,7 +106,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("provision netns: %w", err)
 		}
 		netnsProvisioned = true
-		createtiming.From(ctx).RecordStageDesc("containerd_netns", 0, "provisioned")
+		// The containerd_netns stage is the handoff's to record: only it
+		// knows a warm claim (hit) from an inline build (miss), and it times
+		// both (netns.RuntimeHandoff.Provision). This used to record a fixed
+		// 0 here, which the docs then published as "Network setup 0 ms".
 	}
 
 	committed := false
@@ -106,6 +123,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// createdContainer, which wrongly leaked host files / ready socket / netns
 	// slot / lease on any failure BEFORE NewContainer.)
 	lostRace := false
+	// snapshotLeft is set when NewContainer failed for any reason but
+	// AlreadyExists: it may have prepared the sandbox's snapshot and not
+	// written the container (see removeOrphanSnapshot).
+	snapshotLeft := false
 	var (
 		container cntr.Container
 		task      cntr.Task
@@ -121,6 +142,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || lostRace {
 			return
 		}
+		ctx, cancel := undoContext(ctx)
+		defer cancel()
 		// Undo in the order that keeps the sandbox shut and its address
 		// clean: the workload dies first; then whatever the create keyed by
 		// the address (the egress gateway attach) is told and lets go; then
@@ -128,6 +151,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// rule cleared after the slot is free could be the next owner's);
 		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
+		if snapshotLeft {
+			if err := d.removeOrphanSnapshot(ctx, client, sandboxID); err != nil {
+				d.logger.Warn("containerd: failed create's snapshot not removed; the next create of the id removes it as a leftover",
+					"sandbox_id", sandboxID, "error", err)
+			}
+		}
 		if !netnsProvisioned || d.netns == nil {
 			return
 		}
@@ -148,6 +177,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || leaseID == "" {
 			return
 		}
+		ctx, cancel := undoContext(ctx)
+		defer cancel()
 		d.releaseImageLease(ctx, client, map[string]string{imageLeaseLabelKey: leaseID})
 	}()
 
@@ -157,6 +188,22 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordStageDesc("containerd_image", time.Since(imageStart), "resolved")
+	// containerd_spec: everything between the image and the image lease
+	// (the image's user and command, the host files, the env, the OCI spec
+	// options and the ready socket). Boot-path (pr-review §2): this and the
+	// stages below add timer reads and RecordStage calls only.
+	specStart := time.Now()
+	// The operator create policy's require_non_root rule: the image config is
+	// the first place the user is known, before any host file or container.
+	if req.RequireNonRootUser {
+		user, err := imageUser(ctx, client, image)
+		if err != nil {
+			return nil, fmt.Errorf("read image user: %w", err)
+		}
+		if err := models.CheckImageUserNonRoot(req.Image, user); err != nil {
+			return nil, err
+		}
+	}
 
 	hostFiles, err = prepareSandboxHostFiles(d.cfg.RunDir, sandboxID)
 	if err != nil {
@@ -211,10 +258,18 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
 	specOpts = append(specOpts, withSandboxIPv6Off())
+	specOpts = append(specOpts, d.cgroupSpecOpts(sandboxID)...)
 	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
+		if restore {
+			opt, err := d.restoreSpecOpt(sandboxID)
+			if err != nil {
+				return nil, err
+			}
+			specOpts = append(specOpts, opt)
+		}
 	}
 
 	if d.cfg.ReadyEnabled {
@@ -236,10 +291,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if ip := strings.TrimSpace(prepaidIP); ip != "" {
 		containerLabels[containerIPLabelKey] = ip
 	}
+	createtiming.From(ctx).RecordStage("containerd_spec", time.Since(specStart))
+	leaseStart := time.Now()
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_lease", time.Since(leaseStart))
 	if leaseID != "" {
 		containerLabels[imageLeaseLabelKey] = leaseID
 	}
@@ -251,7 +309,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		cntr.WithContainerLabels(containerLabels),
 	}
 	if ociRuntime != "" {
-		opt, err := d.runtimeContainerOpt(ociRuntime)
+		opt, err := d.runtimeContainerOptFor(ociRuntime, restore)
 		if err != nil {
 			return nil, err
 		}
@@ -267,7 +325,22 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			lostRace = true
 			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
 		}
+		snapshotLeft = true
 		return nil, fmt.Errorf("create container: %w", err)
+	}
+	// containerd_create keeps its old span (NewContainer through NewTask), so
+	// it compares with every report before it; containerd_container and
+	// containerd_task are its two parts.
+	createtiming.From(ctx).RecordStage("containerd_container", time.Since(createStart))
+	// The disk limit goes on the empty writable layer before anything runs
+	// in it. A failure is the create's: the container (and with it the
+	// snapshot) goes in the rollback above.
+	if d.cfg.DiskQuota && req.DiskGB > 0 {
+		quotaStart := time.Now()
+		if err := d.limitWritableLayer(ctx, client, sandboxID, req.DiskGB); err != nil {
+			return nil, err
+		}
+		createtiming.From(ctx).RecordStage("containerd_disk_quota", time.Since(quotaStart))
 	}
 	// The prepaid address is this sandbox's from here (a duplicate create
 	// stopped at NewContainer above), and the workload hasn't started: put
@@ -289,6 +362,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		sbruntime.NotifyAddressKnown(ctx, ip)
 	}
 
+	taskStart := time.Now()
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
 		return nil, err
@@ -303,18 +377,28 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
 	}
+	createtiming.From(ctx).RecordStage("containerd_task", time.Since(taskStart))
 	createtiming.From(ctx).RecordStage("containerd_create", time.Since(createStart))
 
 	startStart := time.Now()
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+			return nil, err
+		}
+	}
 	createtiming.From(ctx).RecordStage("containerd_start", time.Since(startStart))
 
+	// containerd_address: reading the started task's IPv4 back (the netns
+	// probe; for gVisor, the fallback to the prepaid address or label).
+	addressStart := time.Now()
 	state, err := d.runtimeStateAfterStart(ctx, container, task, sandboxID, prepaidIP)
 	if err != nil {
 		return nil, err
 	}
+	createtiming.From(ctx).RecordStage("containerd_address", time.Since(addressStart))
 
 	// Attribute the readiness wait for Server-Timing (parity with the docker
 	// driver): the ready socket is the fast path ("socket"); the HTTP health
@@ -322,7 +406,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// header carries no readiness source on containerd hosts (UC-11).
 	readyStart := time.Now()
 	readinessSource := "health"
-	if d.cfg.ReadyEnabled && readyListener != nil {
+	if restore {
+		// The restored toolbox said its hello at its first boot; it
+		// answers health, at the address it has here.
+		if err := d.waitToolboxHTTP(ctx, state.ContainerIP, toolboxToken); err != nil {
+			return nil, err
+		}
+		keepReadySocket = readySocketCreated
+	} else if d.cfg.ReadyEnabled && readyListener != nil {
 		readinessSource = "socket"
 		if err := createReadyWaitFn(ctx, readyListener); err != nil {
 			return nil, fmt.Errorf("ready socket: %w", err)
@@ -332,6 +423,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
+	// Again, now that the sandbox answers: gVisor starts some of its
+	// processes after task.Start returns, and the pass above can miss them
+	// (4 of 7,021 gvisor_sentry processes in a 1,000-sandbox run).
+	if d.cfg.CgroupParent != "" {
+		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+			return nil, err
+		}
+	}
 
 	switch {
 	case earlyRules && state.ContainerIP != strings.TrimSpace(prepaidIP):
@@ -356,6 +455,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
+	if restore {
+		// Used: a later start of this container boots it, and the wrapper
+		// then passes the start through.
+		if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
+			_ = os.RemoveAll(dir)
+		}
+	}
 	committed = true
 	return state, nil
 }
@@ -365,7 +471,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 // pool's env, so its toolboxd would boot parked and serve nothing; the
 // service starts every containerd sandbox through StartWithIdentity.
 func (d *Driver) Start(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
-	return d.startTask(ctx, containerRef, "", "")
+	return d.startTask(ctx, containerRef, "", "", nil)
 }
 
 // StartWithIdentity implements runtime.IdentityStarter. A container adopted
@@ -377,13 +483,27 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 // adopted again. This listens on the slot's socket before the task starts,
 // takes the parked hello and adopts it with the sandbox's own ID and token,
 // exactly as the create did. Any other container starts as Start does.
+// A container adopted with env can't be started this way: it needs
+// StartWithIdentityEnv, which re-sends the env.
 func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
-	return d.startTask(ctx, containerRef, sandboxID, toolboxToken)
+	return d.startTask(ctx, containerRef, sandboxID, toolboxToken, nil)
+}
+
+// StartWithIdentityEnv implements runtime.EnvIdentityStarter: StartWithIdentity
+// for a pool container whose create carried env. That env reached the
+// toolbox in the adopt frame and is in no spec, so the re-adopt must carry
+// it again, as a cold container's start re-reads its env from its spec.
+// loadEnv is called only for a container adopted with env (adoptEnvLabelKey),
+// and before the task is created, so a start that cannot have the env
+// starts nothing.
+func (d *Driver) StartWithIdentityEnv(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
+	return d.startTask(ctx, containerRef, sandboxID, toolboxToken, loadEnv)
 }
 
 // readoptParkedFn waits for a restarted pool container's parked hello and
-// adopts it. Tests stub it to drive the handshake without a guest toolbox.
-var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sandboxID, toolboxToken string) error {
+// adopts it with env. Tests stub it to drive the handshake without a guest
+// toolbox.
+var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sandboxID, toolboxToken string, env map[string]string) error {
 	if err := pl.WaitParked(ctx); err != nil {
 		return err
 	}
@@ -391,10 +511,36 @@ var readoptParkedFn = func(ctx context.Context, pl *dockerpkg.ParkedListener, sa
 	if err != nil {
 		return err
 	}
-	return pl.Adopt(ctx, sandboxID, toolboxToken, nonce)
+	return pl.AdoptWithEnv(ctx, sandboxID, toolboxToken, nonce, env)
 }
 
-func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+// readoptEnv is the env a start re-adopts a pool container with: none for
+// one adopted without env, else loadEnv's answer from the sealed row. A
+// container adopted with env whose start has no loader, or whose env loads
+// empty, is refused: starting it would serve the sandbox without its env.
+// No error here quotes the env.
+func readoptEnv(ctx context.Context, container cntr.Container, loadEnv sbruntime.AdoptEnvLoader) (map[string]string, error) {
+	labels, err := container.Labels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load container labels: %w", err)
+	}
+	if labels[adoptEnvLabelKey] != adoptEnvLabelValue {
+		return nil, nil
+	}
+	if loadEnv == nil {
+		return nil, errors.New("warm-pool container was adopted with env: a start needs the sandbox's env to adopt it again")
+	}
+	env, err := loadEnv(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load the sandbox env to adopt it again: %w", err)
+	}
+	if len(env) == 0 {
+		return nil, errors.New("warm-pool container was adopted with env, but the sandbox's env loaded empty")
+	}
+	return env, nil
+}
+
+func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
@@ -406,6 +552,10 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	container, err := client.LoadContainer(ctx, containerRef)
 	if err != nil {
 		return nil, fmt.Errorf("load container: %w", err)
+	}
+	// A move's checkpoint of this sandbox is stale once it runs here again.
+	if dir, err := d.moveDir(moveOut, containerRef); err == nil {
+		_ = os.RemoveAll(dir)
 	}
 	task, err := container.Task(ctx, nil)
 	if err == nil {
@@ -428,8 +578,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	if err != nil {
 		return nil, err
 	}
+	var adoptEnv map[string]string
 	if parked != nil {
 		defer func() { _ = parked.Close() }()
+		if adoptEnv, err = readoptEnv(ctx, container, loadEnv); err != nil {
+			return nil, err
+		}
 	}
 	logPath, err := d.taskLogPath(containerRef)
 	if err != nil {
@@ -451,11 +605,21 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	// the exact socket (nonce from the spec mount path, token from the spec env)
 	// so the mount succeeds and the restarted toolbox can re-signal readiness.
 	// A pool container's park socket is the parked listener above.
-	if d.cfg.ReadyEnabled && parked == nil {
+	// The stored spec decides, not today's ReadyEnabled: a sandbox created
+	// while the socket was on still bind-mounts it after an operator turns
+	// the socket (or the warm pool that widens it) off, and without the file
+	// runc refuses the task. recreateResumeReadySocket is a no-op for a spec
+	// with no ready mount.
+	if parked == nil {
 		if rl := d.recreateResumeReadySocket(spec); rl != nil {
 			defer func() { _ = rl.Close() }()
 		}
 	}
+	// The new run's start time (SandboxRuntimeState.StartedAt): taken after
+	// the old task was deleted, so after its exit, and before the new task
+	// exists, so before anything it can report. The shims stamp exits on
+	// this same host clock.
+	startedAt := time.Now().UTC()
 	task, err = container.NewTask(ctx, logIO)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -463,9 +627,17 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	if err := task.Start(ctx); err != nil {
 		return nil, fmt.Errorf("start task: %w", err)
 	}
+	// A restart makes the task's cgroup anew; mark it again (F10).
+	if spec != nil && spec.Linux != nil {
+		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, err
+		}
+	}
 	if parked != nil {
 		waitCtx, cancel := context.WithTimeout(ctx, d.cfg.ToolboxWaitTimeout)
-		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken)
+		err := readoptParkedFn(waitCtx, parked, sandboxID, toolboxToken, adoptEnv)
 		cancel()
 		if err != nil {
 			// A container that was not adopted serves nothing: don't leave it
@@ -475,7 +647,20 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
 		}
 	}
-	return d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	state, err := d.runtimeStateAfterStart(ctx, container, task, containerRef, "")
+	if err != nil {
+		return nil, err
+	}
+	// Again, for processes gVisor started after task.Start returned.
+	if spec != nil && spec.Linux != nil {
+		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+			_ = task.Kill(ctx, syscall.SIGKILL)
+			_, _ = task.Delete(ctx, cntr.WithProcessKill)
+			return nil, err
+		}
+	}
+	state.StartedAt = startedAt
+	return state, nil
 }
 
 // parkedRestartListener returns the listener a start of a warm-pool
@@ -512,9 +697,11 @@ func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken
 }
 
 // stopGraceTimeout and stopPollInterval are test seams for Stop's SIGTERM→SIGKILL path.
+// stopDeleteTimeout bounds deleteExitedTask's retries.
 var (
-	stopGraceTimeout = 10 * time.Second
-	stopPollInterval = 100 * time.Millisecond
+	stopGraceTimeout  = 10 * time.Second
+	stopPollInterval  = 100 * time.Millisecond
+	stopDeleteTimeout = 5 * time.Second
 )
 
 func (d *Driver) Stop(ctx context.Context, containerRef string) error {
@@ -527,16 +714,27 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 		return fmt.Errorf("load container: %w", err)
 	}
 	task, err := container.Task(ctx, nil)
+	checkpoint := sbruntime.CheckpointRequested(ctx)
 	if err != nil {
+		if checkpoint {
+			return errNotCheckpointable
+		}
 		return nil
+	}
+	if checkpoint {
+		if err := d.checkpointForMove(ctx, client, container, task); err != nil {
+			return err
+		}
+		// runsc ended the sandbox once it was saved: reap the task as a
+		// stop does.
+		return deleteExitedTask(ctx, task)
 	}
 	_ = task.Kill(ctx, syscall.SIGTERM)
 	deadline := time.Now().Add(stopGraceTimeout)
 	for time.Now().Before(deadline) {
 		status, statusErr := task.Status(ctx)
 		if statusErr == nil && status.Status != cntr.Running {
-			_, err = task.Delete(ctx)
-			return err
+			return deleteExitedTask(ctx, task)
 		}
 		select {
 		case <-ctx.Done():
@@ -546,6 +744,38 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	}
 	_ = task.Kill(ctx, syscall.SIGKILL)
 	_, err = task.Delete(ctx, cntr.WithProcessKill)
+	return err
+}
+
+// deleteExitedTask deletes a task whose status already left Running. Under
+// gVisor that status can come before runsc has torn the sandbox down, and a
+// delete in between fails with "cannot delete a running container" (Phase 3
+// disk-full drill on EKS: a gVisor sandbox that had just written 3.6 GB). A
+// stop that answers that error fails although its SIGTERM worked: the
+// service then dropped the stop's reason, and the exit that followed was
+// recorded as the sandbox's own (program_exited instead of disk_limit). So
+// the delete is tried again until stopDeleteTimeout, a task already gone
+// counts as deleted, and the last try kills what is left.
+func deleteExitedTask(ctx context.Context, task cntr.Task) error {
+	deadline := time.Now().Add(stopDeleteTimeout)
+	for {
+		_, err := task.Delete(ctx)
+		if err == nil || errdefs.IsNotFound(err) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(stopPollInterval):
+		}
+	}
+	_, err := task.Delete(ctx, cntr.WithProcessKill)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
 	return err
 }
 
@@ -582,8 +812,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return destroyErr
 }
 
-// destroyContainer kills the sandbox's task and deletes its container; a
-// container containerd doesn't have is already gone.
+// destroyContainer kills the sandbox's task and deletes its container with
+// its snapshot. A container containerd doesn't have is gone, but the snapshot
+// named after it can still be there (removeOrphanSnapshot), so that goes too.
 func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) error {
 	client, err := d.ensureClient()
 	if err != nil {
@@ -596,7 +827,7 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 	container, err := client.LoadContainer(ctx, ref)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return nil
+			return removeSnapshot(ctx, client, ref)
 		}
 		return err
 	}
@@ -608,6 +839,64 @@ func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) 
 		_, _ = task.Delete(ctx, cntr.WithProcessKill)
 	}
 	return container.Delete(ctx, cntr.WithSnapshotCleanup)
+}
+
+// removeOrphanSnapshot removes the snapshot named id when containerd says no
+// container holds id.
+//
+// NewContainer prepares a container's snapshot (cntr.WithNewSnapshot, keyed by
+// the container's own id, here the sandbox ID) before it writes the
+// container. A NewContainer that fails in between leaves the snapshot with no
+// container, most often a create whose client hung up (an SDK timeout): its
+// context is cancelled, the container write fails, and so does the delete of
+// NewContainer's own lease, which keeps the snapshot pinned for a day. The
+// next create of the ID, an Idempotency-Key retry, fails its prepare with
+// AlreadyExists, and the service answered 409 "sandbox already exists"
+// (UC-450 live, 2026-11-08).
+//
+// A snapshot whose container exists is that container's rootfs, and
+// containerd's Remove does not check for one, so the container is looked up
+// first and a lookup that fails leaves the snapshot. Nothing else can hold a
+// snapshot under a sandbox ID with no container: the service runs one create
+// of an ID at a time (its create lease), and every other snapshot this driver
+// makes is named after a warm-pool slot.
+func (d *Driver) removeOrphanSnapshot(ctx context.Context, client *Client, id string) error {
+	if _, err := client.LoadContainer(ctx, id); !errdefs.IsNotFound(err) {
+		return err
+	}
+	return removeSnapshot(ctx, client, id)
+}
+
+// removeSnapshot removes the snapshot named key from the default snapshotter;
+// one that is not there is already gone.
+func removeSnapshot(ctx context.Context, client *Client, key string) error {
+	s := snapshotsFn(client)
+	if s == nil {
+		return nil
+	}
+	if err := s.Remove(client.withNS(ctx), key); err != nil && !errdefs.IsNotFound(err) {
+		return fmt.Errorf("remove snapshot %q: %w", key, err)
+	}
+	return nil
+}
+
+// snapshotRemover is the containerd snapshotter surface the orphan-snapshot
+// cleanup needs. Tests inject a fake so the path is covered offline.
+type snapshotRemover interface {
+	Remove(ctx context.Context, key string) error
+}
+
+// snapshotsFn resolves the default snapshotter, the one cntr.WithNewSnapshot
+// prepares every sandbox's snapshot on (Create names none). Production uses
+// client.Raw(); tests override.
+var snapshotsFn = func(client *Client) snapshotRemover {
+	if client == nil || client.Raw() == nil {
+		return nil
+	}
+	if s := client.Raw().SnapshotService(""); s != nil {
+		return s
+	}
+	return nil
 }
 
 // Inspect reports what containerd knows about one container. An error
@@ -777,6 +1066,17 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 	if err != nil {
 		return fmt.Errorf("load container: %w", err)
 	}
+	// The disk limit is on the snapshot, not the task, so it changes
+	// whether the sandbox runs or not.
+	if d.cfg.DiskQuota && req.DiskGB > 0 {
+		info, err := container.Info(client.withNS(ctx))
+		if err != nil {
+			return fmt.Errorf("resize disk: %w", err)
+		}
+		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
+			return err
+		}
+	}
 	task, err := container.Task(ctx, nil)
 	if err != nil {
 		// Stopped sandbox: the store holds the new size and it takes effect via
@@ -805,8 +1105,7 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 	if res.Memory == nil && res.CPU == nil {
 		return nil
 	}
-	// DiskGB is soft-ignored (containerd overlayfs has no live quota; same as
-	// create — plans/containerd-engine-phase0-decisions.md DiskGB row).
+	// DiskGB was handled above, on the snapshot.
 	return task.Update(ctx, cntr.WithResources(res))
 }
 
@@ -1108,6 +1407,26 @@ func (d *Driver) recreateResumeReadySocket(spec *specs.Spec) *dockerpkg.ReadyLis
 	return rl
 }
 
+// createUndoTimeout bounds the undo of a failed create, as the service bounds
+// its own create rollback, so a containerd that stops answering cannot hold
+// the create, and the service's create lease of the ID around it, forever.
+const createUndoTimeout = 30 * time.Second
+
+// undoContext is the context a failed create undoes itself on: ctx's values
+// (the address observer the egress attach listens on) without its
+// cancellation. The request that failed is often the reason it failed: a
+// client that hangs up mid-create (an SDK timeout, a closed proxy connection)
+// cancels ctx, and the create stops at its next containerd call. An undo on
+// that same ctx failed every call at once and left the container, its
+// snapshot, its task, the netns slot and the image lease under the sandbox
+// ID, so the client's retry of its Idempotency-Key, which derives the same
+// ID, met the container as AlreadyExists and was answered 409 "sandbox
+// already exists" (UC-450). The docker driver removes a failed create's
+// workload the same way (removeWorkload).
+func undoContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), createUndoTimeout)
+}
+
 func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cntr.Container, task cntr.Task, logPath string, hostFiles *sandboxHostFiles) {
 	if task != nil {
 		_ = task.Kill(ctx, syscall.SIGKILL)
@@ -1224,6 +1543,7 @@ func (d *Driver) removeContainerFiles(key string) {
 	}
 	_ = d.removeHostFiles(key)
 	_ = d.removeTaskLog(key)
+	d.removeMoveFiles(key)
 	if IsParkedSandboxID(key) && strings.TrimSpace(d.cfg.ReadyDir) != "" {
 		dockerpkg.RemoveParkSocket(filepath.Join(d.cfg.ReadyDir, key+".sock"))
 	}

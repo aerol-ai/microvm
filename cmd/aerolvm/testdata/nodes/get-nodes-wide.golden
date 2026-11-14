@@ -1,0 +1,8 @@
+exit 0
+--- stdout
+NAME    ROLE     STATUS                     VERSION   SANDBOXES   CPU   MEMORY   ZONE   API-URL
+old-1   mixed    Ready                      -         -           -     -        -      https://old-1:21212
+srv-a   server   Ready,Leader               v0.6.12   -           -     -        -      https://srv-a:21212
+wkr-1   worker   Ready,SchedulingDisabled   v0.6.12   2           25%   25%      az-1   https://wkr-1:21212
+wkr-2   worker   NotReady                   v0.6.11   -           -     -        -      https://wkr-2:21212
+--- stderr

@@ -1,0 +1,7 @@
+exit 0
+--- stdout
+NAME     SOURCE                AGE
+snap-a   sb-0000000000000001   3d
+snap-b   sb-0000000000000002   400d
+snap-c   -                     -
+--- stderr

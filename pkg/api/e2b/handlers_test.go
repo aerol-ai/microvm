@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -427,6 +428,7 @@ func TestRuntimeProxyRewritesToEnvdToolboxSurface(t *testing.T) {
 		t.Fatalf("decode create response error = %v", err)
 	}
 
+	countedBefore := e2bToolboxCallCount("other", "2xx")
 	runtimeReq := httptest.NewRequest(http.MethodGet, "/e2b/runtime/health", nil)
 	runtimeReq.Header.Set("E2b-Sandbox-Id", created.SandboxID)
 	runtimeReq.Header.Set("X-Access-Token", created.EnvdAccessToken)
@@ -435,6 +437,10 @@ func TestRuntimeProxyRewritesToEnvdToolboxSurface(t *testing.T) {
 	handler.ServeHTTP(runtimeResp, runtimeReq)
 	if runtimeResp.Code != http.StatusOK {
 		t.Fatalf("runtime status = %d, want %d; body=%s", runtimeResp.Code, http.StatusOK, runtimeResp.Body.String())
+	}
+	// E2B's own proxy counts its calls under the e2b surface (plan O4).
+	if got := e2bToolboxCallCount("other", "2xx"); got != countedBefore+1 {
+		t.Fatalf("e2b toolbox call count = %d, want %d", got, countedBefore+1)
 	}
 
 	select {
@@ -786,4 +792,25 @@ func TestE2BServerlessMetadataAcceptsTruthyVariants(t *testing.T) {
 			t.Errorf("serverlessFromMetadata(%q) = %v, want %v", tc.value, got, tc.want)
 		}
 	}
+}
+
+// e2bToolboxCallCount reads aerolvm_toolbox_calls_total{e2b, route, class}.
+func e2bToolboxCallCount(route, class string) int64 {
+	total, ok := expvar.Get("aerolvm_toolbox_calls_total").(*expvar.Map)
+	if !ok {
+		return 0
+	}
+	routes, ok := total.Get("e2b").(*expvar.Map)
+	if !ok {
+		return 0
+	}
+	classes, ok := routes.Get(route).(*expvar.Map)
+	if !ok {
+		return 0
+	}
+	n, ok := classes.Get(class).(*expvar.Int)
+	if !ok {
+		return 0
+	}
+	return n.Value()
 }

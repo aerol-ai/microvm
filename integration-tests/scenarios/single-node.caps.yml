@@ -17,6 +17,9 @@ capabilities:
   # SB_IDENTITY_FILE at the path the suite installs the test issuer to.
   - identity
   - identity-oidc
+  # identity_issuer_enabled=true: the node is an OIDC issuer for sandbox
+  # cloud identities (UC-431..437).
+  - cloud-identity
   # SB_MCP_ENABLED=true, for UC-286's OAuth connector flow.
   - remote-mcp
   # NOTE: UC-35/36 additionally require external-dns-zone, which this scenario

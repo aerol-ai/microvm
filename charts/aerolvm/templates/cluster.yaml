@@ -1,0 +1,242 @@
+{{- if eq .Values.mode "cluster" }}
+{{- if not .Values.cluster.zones }}
+{{- fail "mode: cluster needs cluster.zones, such as [eu-west-1a, eu-west-1b, eu-west-1c]" }}
+{{- end }}
+{{- if not .Values.cluster.workerPools }}
+{{- fail "mode: cluster needs at least one entry in cluster.workerPools" }}
+{{- end }}
+{{- $name := include "aerolvm.name" . }}
+{{- $workerNS := .Values.cluster.workerNamespace }}
+{{- if .Values.cluster.createWorkerNamespace }}
+{{- if eq $workerNS .Release.Namespace }}
+{{- fail "cluster.workerNamespace must not be the release namespace: worker pods are privileged and only their own namespace allows that (§8.7)" }}
+{{- end }}
+# Worker pods are privileged (§8.7, the one named exception in the bank
+# evidence pack, P7), so they get a namespace of their own, the only one
+# where Pod Security allows that. Kept on uninstall: deleting it would end
+# every sandbox.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $workerNS }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+  annotations:
+    helm.sh/resource-policy: keep
+---
+{{- end }}
+# A worker pod is the last pod the kubelet removes under pressure (§8.1),
+# and never preempts another: its pool's machines are its own.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $name }}-worker
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+value: 1000000000
+preemptionPolicy: Never
+globalDefault: false
+description: AerolVM worker pods, which hold running sandboxes.
+---
+# The pod templates the operator stamps per node (P2): one source for each
+# role's containers, volumes and security settings, the same Helm partials
+# single mode uses.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-pod-templates
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+data:
+  server: |
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- include "aerolvm.controlPodSpec" (dict "root" . "role" "server") | nindent 6 }}
+  gateway: |
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- include "aerolvm.controlPodSpec" (dict "root" . "role" "gateway") | nindent 6 }}
+  worker: |
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- include "aerolvm.workerPodSpec" (dict "root" . "cluster" true) | nindent 6 }}
+---
+# The cell (plans/kubernetes-v2-architecture.md §10.1). The operator owns
+# everything it describes; change it here, or edit the object itself, and
+# the operator follows. spec.version is the one place that sets the
+# version (eng review D6).
+apiVersion: aerolvm.io/v1alpha1
+kind: AerolCluster
+metadata:
+  name: {{ .Values.cluster.name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+spec:
+  version: {{ .Values.cluster.version | default .Chart.AppVersion | quote }}
+  cell: {{ .Values.cluster.cell }}
+  zones:
+    {{- toYaml .Values.cluster.zones | nindent 4 }}
+  images:
+    registry: {{ .Values.image.registry | quote }}
+    pullPolicy: {{ .Values.image.pullPolicy }}
+  servers:
+    count: {{ .Values.cluster.servers.count }}
+    storage:
+      size: {{ .Values.cluster.servers.storage.size }}
+      {{- with .Values.cluster.servers.storage.storageClassName }}
+      storageClassName: {{ . }}
+      {{- end }}
+    {{- with .Values.cluster.servers.logStorage }}
+    logStorage:
+      size: {{ .size | default "20Gi" }}
+      {{- with .storageClassName }}
+      storageClassName: {{ . }}
+      {{- end }}
+    {{- end }}
+    resources:
+      {{- toYaml .Values.cluster.servers.resources | nindent 6 }}
+    {{- with .Values.cluster.servers.nodeSelector }}
+    nodeSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.cluster.servers.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  gateways:
+    minReplicas: {{ .Values.cluster.gateways.minReplicas }}
+    maxReplicas: {{ .Values.cluster.gateways.maxReplicas }}
+    resources:
+      {{- toYaml .Values.cluster.gateways.resources | nindent 6 }}
+    service:
+      type: {{ .Values.cluster.gateways.service.type }}
+      {{- with .Values.cluster.gateways.service.annotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- with .Values.cluster.gateways.gatewayRef }}
+    gatewayRef:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.cluster.gateways.nodeSelector }}
+    nodeSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.cluster.gateways.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  workerPools:
+    {{- toYaml .Values.cluster.workerPools | nindent 4 }}
+  {{- if .Values.edge.enabled }}
+  edge:
+    domain: {{ .Values.edge.domain | quote }}
+    tlsSecret: {{ include "aerolvm.edgeTLSSecret" . }}
+  {{- end }}
+  {{- with .Values.cluster.federation }}
+  {{- if .idKeySecret }}
+  federation:
+    idKeySecret:
+      name: {{ .idKeySecret | quote }}
+    {{- with .cells }}
+    cells:
+      {{- range $cell, $addr := . }}
+      {{ $cell | quote }}: {{ $addr | quote }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- end }}
+  security:
+    createPolicy:
+      name: {{ .Values.cluster.name }}-create-policy
+    {{- with .Values.cluster.externalCA.issuerRef }}
+    {{- if .name }}
+    externalCA:
+      issuerRef:
+        kind: {{ .kind | default "ClusterIssuer" }}
+        name: {{ .name | quote }}
+    {{- end }}
+    {{- end }}
+---
+# The create policy (docs: Limit what users can create), on every node:
+# the node a create reaches checks it, and the worker that runs it checks
+# again. The operator copies it to the worker namespace. Always made, and
+# every pod always mounts it, so turning a policy on, changing it or
+# turning it off is a change to this ConfigMap that reaches every running
+# pod within a minute. With none set it is `version: 1`, which allows
+# everything.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.cluster.name }}-create-policy
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+    {{- toYaml (.Values.cluster.createPolicy | default (dict "version" 1)) | nindent 4 }}
+{{- with .Values.cluster.gateways.gatewayRef }}
+---
+# Behind the bank's own Gateway (§7.1): fixed routes, written once, none
+# per sandbox (K5). The sandbox links stay encrypted to the worker:
+# passthrough only. aerolvm k8s verify checks each route was accepted.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $.Values.cluster.name }}-api
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .name }}
+      {{- with .namespace }}
+      namespace: {{ . }}
+      {{- end }}
+  hostnames: [{{ $.Values.edge.domain | quote }}]
+  rules:
+    - backendRefs:
+        - { name: {{ $.Values.cluster.name }}-gateway, port: 443 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ $.Values.cluster.name }}-links
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .name }}
+      {{- with .namespace }}
+      namespace: {{ . }}
+      {{- end }}
+  hostnames: [{{ printf "*.%s" $.Values.edge.domain | quote }}]
+  rules:
+    - backendRefs:
+        - { name: {{ $.Values.cluster.name }}-gateway, port: 443 }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: {{ $.Values.cluster.name }}-ssh
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .name }}
+      {{- with .namespace }}
+      namespace: {{ . }}
+      {{- end }}
+      sectionName: ssh
+  rules:
+    - backendRefs:
+        - { name: {{ $.Values.cluster.name }}-gateway, port: 2220 }
+{{- end }}
+{{- end }}

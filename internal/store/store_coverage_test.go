@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,48 +15,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	sqlite3 "github.com/mattn/go-sqlite3"
 )
-
-func TestAllocateFirecrackerTapSlotContested(t *testing.T) {
-	ctx := context.Background()
-	path := t.TempDir() + "/tap-c.db"
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	db2, err := sql.Open("sqlite3", sqliteDSN(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db2.Close() })
-
-	now := time.Now().UTC()
-	if err := st.SeedFirecrackerTapSlot(ctx, FirecrackerTapSlot{
-		TapName: "tap0", CIDR: "10.0.0.0/30", HostIP: "10.0.0.1", GuestIP: "10.0.0.2", VsockCID: 3,
-	}, now); err != nil {
-		t.Fatal(err)
-	}
-
-	afterTapAllocateSelect = func(tapName string) {
-		_, _ = db2.ExecContext(ctx, `
-			UPDATE firecracker_tap_pool SET sandbox_id = 'thief', allocated_at = ?
-			WHERE tap_name = ? AND sandbox_id IS NULL`, now, tapName)
-	}
-	afterTapAllocateMiss = func() {
-		_, _ = db2.ExecContext(ctx, `
-			UPDATE firecracker_tap_pool SET sandbox_id = NULL, allocated_at = NULL
-			WHERE sandbox_id = 'thief'`)
-	}
-	t.Cleanup(func() {
-		afterTapAllocateSelect = nil
-		afterTapAllocateMiss = nil
-	})
-
-	_, err = st.AllocateFirecrackerTapSlot(ctx, "sb-victim", now)
-	if err == nil || !strings.Contains(err.Error(), "pool contested") {
-		t.Fatalf("want contested error, got %v", err)
-	}
-}
 
 func TestTransferTapUpdateAbortAndGetPortError(t *testing.T) {
 	st := newTestStore(t)
@@ -1876,7 +1833,7 @@ func TestStoreLastNineLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.AllocateFirecrackerVMMSlot(ctx, "tpl-race", "sb-race", now); err == nil {
-		t.Fatal("contested allocate")
+		t.Fatal("an allocate whose UPDATE is ignored must report an error")
 	}
 
 	scan := newTestStore(t)
@@ -1945,8 +1902,6 @@ func TestStoreLastNineLines(t *testing.T) {
 	if err := st.SeedContainerNetnsSlot(ctx, "ns-1", now); err != nil {
 		t.Fatal(err)
 	}
-	afterNetnsFreeSelect = func(string) {}
-	t.Cleanup(func() { afterNetnsFreeSelect = nil })
 	if _, err := st.ReserveContainerNetnsSlot(ctx, "sb-ns", now); err != nil {
 		t.Fatalf("reserve netns: %v", err)
 	}
@@ -3224,7 +3179,7 @@ func TestUpdateTagsLifecycleQueryErrors(t *testing.T) {
 	_ = st.UpdateLifecycle(ctx, "sb", models.Lifecycle{StopIfIdleFor: time.Second})
 	_ = st.MarkNetworkQuotaExceeded(ctx, "sb", time.Now())
 	_ = st.SetAllowPublicTraffic(ctx, "sb", true, "https://x")
-	_ = st.UpdateSandboxNetCounters(ctx, "sb", 1, 2)
+	_, _ = st.ApplyNetCounterDeltas(ctx, []NetCounterDelta{{SandboxID: "sb", BytesIn: 1, BytesOut: 2}})
 	_, _ = st.ListAutoImportPendingIDs(ctx)
 }
 

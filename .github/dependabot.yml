@@ -15,6 +15,23 @@ updates:
     schedule:
       interval: "weekly"
 
+  # The ready-made images pin their base image by digest. A digest never
+  # moves, so without this entry they would miss the base image's security
+  # rebuilds. Dependabot moves the tag and the digest together.
+  - package-ecosystem: "docker"
+    directories:
+      - "/images/*"
+      # The Kubernetes images' bases (aerolvm, -runtime, -edge): each FROM
+      # is a tag pinned by digest, and Dependabot moves the digest.
+      - "/packaging/images"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # images/computer-use installs cp312 wheels pinned by hash. A new
+      # Python minor needs new wheels, so it is a hand change, not a bump.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+
   - package-ecosystem: "npm"
     directory: "/docs"
     schedule:

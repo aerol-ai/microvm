@@ -17,6 +17,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/observability"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 func TestSocketListenerFailures(t *testing.T) {
@@ -98,6 +99,15 @@ func TestRunUnprivilegedPaths(t *testing.T) {
 	if err := os.WriteFile(op, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The deny-floor file is watched while the gateway serves (review R4).
+	prevFloor := egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetFileFloor(prevFloor) })
+	egresspolicy.SetFileFloor(nil)
+	floorFile := filepath.Join(dir, "deny-floor")
+	if err := os.WriteFile(floorFile, []byte("203.0.113.45\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(egresspolicy.FloorFileEnv, floorFile)
 	sock := filepath.Join(dir, "gw.sock")
 	serveCtx, serveCancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
@@ -125,6 +135,10 @@ func TestRunUnprivilegedPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(80 * time.Millisecond)
+	if got := egresspolicy.FormatRanges(egresspolicy.FileFloor()); got != "203.0.113.45/32" {
+		serveCancel()
+		t.Fatalf("the serving gateway did not take the floor file: %q", got)
+	}
 	serveCancel()
 	select {
 	case err := <-errc:

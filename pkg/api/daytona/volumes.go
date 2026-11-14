@@ -51,7 +51,8 @@ func (h *handlers) createVolume(w http.ResponseWriter, r *http.Request) {
 		writeVolumeError(w, err)
 		return
 	}
-	apihttp.WriteJSON(w, http.StatusCreated, toVolumeResponse(vol))
+	// 200, as Daytona answers (createVolume "200"); see the sandbox create.
+	apihttp.WriteJSON(w, http.StatusOK, toVolumeResponse(vol))
 }
 
 // listVolumes handles GET /volumes.

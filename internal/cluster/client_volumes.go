@@ -100,6 +100,10 @@ func (c *Cluster) VolumeAttachmentCount(_ context.Context, tenant, id string) (i
 	return c.fsm.VolumeAttachmentCount(tenant, id), nil
 }
 
+func (c *Cluster) VolumeAttachmentsForSandbox(_ context.Context, sandboxID string) ([]models.VolumeAttachment, error) {
+	return c.fsm.VolumeAttachmentsForSandbox(sandboxID), nil
+}
+
 func (c *Cluster) PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error {
 	if len(attachments) == 0 {
 		return nil

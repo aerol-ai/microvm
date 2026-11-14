@@ -1,0 +1,14 @@
+exit 0
+--- stdout
+[
+  {
+    "already_gone": true,
+    "deleted": true,
+    "name": "snap-c"
+  },
+  {
+    "deleted": true,
+    "name": "snap-b"
+  }
+]
+--- stderr

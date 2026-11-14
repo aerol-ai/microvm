@@ -1,0 +1,12 @@
+exit 0
+--- stdout
+[
+  {
+    "revoked": "tok_bbbbbbbbbbbb"
+  },
+  {
+    "already_gone": true,
+    "revoked": "tok_cccccccccccc"
+  }
+]
+--- stderr

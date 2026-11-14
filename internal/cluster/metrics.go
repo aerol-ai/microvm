@@ -10,11 +10,17 @@ import (
 )
 
 var (
-	raftApplyTotal        = expvar.NewInt("aerolvm_raft_apply_total")
-	raftApplyInflight     = expvar.NewInt("aerolvm_raft_apply_inflight")
-	raftApplyErrors       = expvar.NewMap("aerolvm_raft_apply_errors_total")
-	raftApplyLastNanos    = expvar.NewInt("aerolvm_raft_apply_last_nanos")
-	raftApplyLatency      = scaleobs.NewDurationBuckets("aerolvm_raft_apply_latency_seconds_bucket")
+	raftApplyTotal     = expvar.NewInt("aerolvm_raft_apply_total")
+	raftApplyInflight  = expvar.NewInt("aerolvm_raft_apply_inflight")
+	raftApplyErrors    = expvar.NewMap("aerolvm_raft_apply_errors_total")
+	raftApplyLastNanos = expvar.NewInt("aerolvm_raft_apply_last_nanos")
+	raftApplyLatency   = scaleobs.NewDurationBuckets("aerolvm_raft_apply_latency_seconds_bucket")
+	// raftApplyWaitLatency is an entry's wait from the leader appending it
+	// to this replica's FSM starting it: the commit, and any queue in front
+	// of the FSM. raftApplyFSMLatency is the FSM's own time on it. With
+	// raftApplyLatency they split a slow apply between the log and the FSM.
+	raftApplyWaitLatency  = scaleobs.NewDurationBuckets("aerolvm_raft_apply_wait_latency_seconds_bucket")
+	raftApplyFSMLatency   = scaleobs.NewDurationBuckets("aerolvm_raft_apply_fsm_latency_seconds_bucket")
 	raftLeaderForward     = expvar.NewInt("aerolvm_raft_leader_forward_total")
 	raftLeaderForwardErrs = expvar.NewMap("aerolvm_raft_leader_forward_errors_total")
 	raftLeaderForwardLast = expvar.NewInt("aerolvm_raft_leader_forward_last_nanos")
@@ -43,6 +49,22 @@ var (
 	workerLeaseLostTotal    = expvar.NewInt("aerolvm_worker_lease_lost_total")
 	workerLeaseMaxAgeNanos  = expvar.NewInt("aerolvm_worker_lease_max_age_nanos")
 	workerLeaseRefreshNanos = expvar.NewInt("aerolvm_worker_lease_refresh_unix_nanos")
+	// capacityLeaseOnDemandFetches counts leases the leader fetched at
+	// admission because its sweep had no fresh one for the owner
+	// (capacity_lease_ondemand.go). It moves after a leader change onto a
+	// server that just started; steady growth means the sweep is not keeping
+	// leases alive.
+	capacityLeaseOnDemandFetches = expvar.NewInt("aerolvm_capacity_lease_on_demand_fetches_total")
+	// raftPipelineStalls counts raft replication pipelines the stall guard
+	// closed because one send was blocked past any healthy wait
+	// (raft_pipeline_guard.go), per follower: exported as
+	// aerolvm_raft_pipeline_stalls_total{key=<follower server id>}. Each one
+	// is a follower that would otherwise have stopped receiving the log until
+	// the next leader change. Per follower, so the alert can tell one
+	// follower stalling again from two followers each stalling once (two
+	// restarts in a rolling upgrade). Followers are raft servers only, at
+	// most MaxServerTierNodes, so the label set stays small.
+	raftPipelineStalls = expvar.NewMap("aerolvm_raft_pipeline_stalls_total")
 
 	ownerForwardTotal        = expvar.NewInt("aerolvm_owner_forward_total")
 	ownerForwardErrors       = expvar.NewMap("aerolvm_owner_forward_errors_total")
@@ -52,6 +74,33 @@ var (
 	ownerForwardTargetMisses = expvar.NewMap("aerolvm_owner_forward_target_misses_total")
 
 	clusterReservationsExpired = expvar.NewInt("aerolvm_cluster_reservations_expired_total")
+
+	// Ownership replays of a local row that opPlace refused because the
+	// cluster deleted that lifecycle (deleted_lifecycle.go). The service
+	// checks first, so this moves only on a race with a delete.
+	clusterOwnershipReplayRefused = expvar.NewInt("aerolvm_cluster_ownership_replay_refused_total")
+
+	// Request routing (pkg/api/clusterroute.Wrap, plan PR #1000 item E3a).
+	// route_requests counts per-sandbox calls a client sent to this node;
+	// route_lookups counts the control-plane reads the router made, by hop
+	// ("edge" = the node the client called, "owner" = the node a forward
+	// reached). Summed over the fleet, lookups / requests is the number of
+	// control-plane reads one routed call costs. On a worker or ingress node
+	// each read is a round trip to the server tier.
+	clusterRouteRequests = expvar.NewInt("aerolvm_cluster_route_requests_total")
+	clusterRouteLookups  = expvar.NewMap("aerolvm_cluster_route_lookups_total")
+	// Owner cache (owner_cache.go). hits: forwards routed from an entry;
+	// misses: routed calls that found no usable entry; retries: hits the
+	// target turned down ("not here") that the edge routed again; not_owner:
+	// cache-routed forwards this node turned down; entries: entries held.
+	ownerCacheHits     = expvar.NewInt("aerolvm_cluster_owner_cache_hits_total")
+	ownerCacheMisses   = expvar.NewInt("aerolvm_cluster_owner_cache_misses_total")
+	ownerCacheRetries  = expvar.NewInt("aerolvm_cluster_owner_cache_retries_total")
+	ownerCacheNotOwner = expvar.NewInt("aerolvm_cluster_owner_cache_not_owner_total")
+	ownerCacheEntries  = expvar.NewInt("aerolvm_cluster_owner_cache_entries")
+	// ownerLeaseServes counts forwards the owner served from its ownership
+	// lease reading without looking the sandbox up (E3b).
+	ownerLeaseServes = expvar.NewInt("aerolvm_cluster_owner_lease_serves_total")
 
 	// Restart catch-up (catch_up.go). catching_up is 1 from New until the
 	// FSM applies the leader's read index; a node stuck at 1 cannot reach a
@@ -178,8 +227,42 @@ func recordOwnerForwardTargetMiss(reason string) {
 	scaleobs.Add(ownerForwardTargetMisses, reason, 1)
 }
 
+// Route hops for RecordRouteLookup.
+const (
+	RouteHopEdge  = "edge"
+	RouteHopOwner = "owner"
+)
+
+// RecordRouteRequest counts one per-sandbox call a client sent to this node.
+func RecordRouteRequest() { clusterRouteRequests.Add(1) }
+
+// RecordRouteLookup counts one control-plane read the router made on hop.
+func RecordRouteLookup(hop string) { scaleobs.Add(clusterRouteLookups, hop, 1) }
+
+// RecordOwnerCacheHit counts one forward routed from an owner-cache entry.
+func RecordOwnerCacheHit() { ownerCacheHits.Add(1) }
+
+// RecordOwnerLeaseServe counts one forward the owner served from its lease
+// reading, with no lookup (E3b).
+func RecordOwnerLeaseServe() { ownerLeaseServes.Add(1) }
+
+// RecordOwnerCacheMiss counts one routed call that found no usable entry.
+func RecordOwnerCacheMiss() { ownerCacheMisses.Add(1) }
+
+// RecordOwnerCacheRetry counts one cache-routed call the target turned down
+// and the edge routed again from a fresh lookup.
+func RecordOwnerCacheRetry() { ownerCacheRetries.Add(1) }
+
+// RecordOwnerCacheNotOwner counts one cache-routed forward this node turned
+// down because its own lookup does not say it owns the sandbox.
+func RecordOwnerCacheNotOwner() { ownerCacheNotOwner.Add(1) }
+
 func recordExpiredReservation() {
 	clusterReservationsExpired.Add(1)
+}
+
+func recordOwnershipReplayRefused() {
+	clusterOwnershipReplayRefused.Add(1)
 }
 
 // recordFailoverRecreate counts one attempt to re-materialize an opted-in
@@ -251,4 +334,18 @@ func classifyClusterMetricError(err error) string {
 	default:
 		return "error"
 	}
+}
+
+// maxApplyWait bounds what counts as an entry's wait: a replica replaying
+// its log at start applies entries appended long ago, which is no wait.
+const maxApplyWait = time.Minute
+
+// recordFSMApply records an entry's wait and the FSM's time on it.
+func recordFSMApply(appendedAt, start time.Time) {
+	if !appendedAt.IsZero() {
+		if wait := start.Sub(appendedAt); wait >= 0 && wait < maxApplyWait {
+			raftApplyWaitLatency.Observe(wait)
+		}
+	}
+	raftApplyFSMLatency.Observe(time.Since(start))
 }

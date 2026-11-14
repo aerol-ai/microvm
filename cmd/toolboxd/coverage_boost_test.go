@@ -496,7 +496,10 @@ func TestEnvdFilesystemStat_InvalidJSON(t *testing.T) {
 	}
 }
 
+// The watcher calls answer 501 on a shared-kernel runtime (Docker and
+// containerd, plan F5 R8); StreamInput is not built at all.
 func TestEnvdRouteWatcherNotImplemented(t *testing.T) {
+	newWatchHarness(t, watchRuntimeShared)
 	srv := newEnvdTestServer(t)
 	h := authedRoutes(srv)
 

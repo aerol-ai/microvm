@@ -222,6 +222,8 @@ type fakeContainer struct {
 	// when set, is handed to that attach as containerd would.
 	attaches    int
 	attachFIFOs *cio.FIFOSet
+	// runtime is the container's shim, as containerd records it.
+	runtime containers.RuntimeInfo
 }
 
 func (c *fakeContainer) ID() string { return c.id }
@@ -254,6 +256,7 @@ func (c *fakeContainer) Info(context.Context, ...cntr.InfoOpts) (containers.Cont
 		Labels:      labels,
 		SnapshotKey: snapKey,
 		Snapshotter: snapper,
+		Runtime:     c.runtime,
 	}, nil
 }
 func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error {
@@ -329,8 +332,17 @@ func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (
 	if c.setLabelsErr != nil {
 		return nil, c.setLabelsErr
 	}
-	c.labels = make(map[string]string, len(labels))
+	// Like containerd: only the given keys change, the rest stay, and an
+	// empty value deletes its label (client container.SetLabels and
+	// metadata boltutil.writeMap).
+	if c.labels == nil {
+		c.labels = make(map[string]string, len(labels))
+	}
 	for k, v := range labels {
+		if v == "" {
+			delete(c.labels, k)
+			continue
+		}
 		c.labels[k] = v
 	}
 	return c.labels, nil
@@ -354,6 +366,14 @@ type fakeTask struct {
 	startErr  error
 	onStart   func()
 	killed    int
+	// pauses / resumes count Pause and Resume calls (freeze_test.go).
+	pauses    int
+	resumes   int
+	resumeErr error
+	// deleteFn, when set, answers each Delete (given its option count);
+	// deletes counts the calls (stop_delete_test.go).
+	deleteFn func(opts int) error
+	deletes  int
 }
 
 func (t *fakeTask) Pid() uint32 { return 0 }
@@ -368,7 +388,13 @@ func (t *fakeTask) Start(context.Context) error {
 	}
 	return nil
 }
-func (t *fakeTask) Delete(context.Context, ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
+func (t *fakeTask) Delete(_ context.Context, opts ...cntr.ProcessDeleteOpts) (*cntr.ExitStatus, error) {
+	t.deletes++
+	if t.deleteFn != nil {
+		if err := t.deleteFn(len(opts)); err != nil {
+			return nil, err
+		}
+	}
 	t.status = cntr.Stopped
 	return &cntr.ExitStatus{}, nil
 }
@@ -377,12 +403,16 @@ func (t *fakeTask) Kill(context.Context, syscall.Signal, ...cntr.KillOpts) error
 	return nil
 }
 func (t *fakeTask) Pause(context.Context) error {
+	t.pauses++
 	if t.pauseErr != nil {
 		return t.pauseErr
 	}
 	return nil
 }
-func (t *fakeTask) Resume(context.Context) error { return nil }
+func (t *fakeTask) Resume(context.Context) error {
+	t.resumes++
+	return t.resumeErr
+}
 func (t *fakeTask) Status(context.Context) (cntr.Status, error) {
 	if t.statusErr != nil {
 		return cntr.Status{}, t.statusErr

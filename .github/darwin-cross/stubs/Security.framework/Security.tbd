@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+install-name:    '/System/Library/Frameworks/Security.framework/Versions/A/Security'
+current-version: 61123.121.1
+compatibility-version: 1
+exports:
+  - targets:         [ x86_64-macos, arm64-macos, arm64e-macos ]
+    symbols:         [ _SecCertificateCopyData, _SecCertificateCreateWithData,
+                       _SecPolicyCreateSSL, _SecTrustCopyCertificateChain,
+                       _SecTrustCreateWithCertificates, _SecTrustEvaluate,
+                       _SecTrustEvaluateWithError, _SecTrustSetVerifyDate ]
+...

@@ -3,6 +3,7 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
@@ -60,6 +61,9 @@ type keyRing struct {
 	// the raw key need not be: a ring change derives one for a new key and
 	// carries the rest over, and a revoke drops them with the AEADs.
 	digestKeys map[uint32][]byte
+	// tokenKeys are each key's derived sandbox-token signing key
+	// (token_keys.go), held and dropped exactly like digestKeys.
+	tokenKeys map[uint32]ed25519.PrivateKey
 }
 
 // keyIDMarker starts a sealed blob that names its key:
@@ -114,7 +118,7 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 }
 
 func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32][]byte, error) {
-	ring := &keyRing{keys: map[uint32]cipher.AEAD{}, digestKeys: map[uint32][]byte{}}
+	ring := &keyRing{keys: map[uint32]cipher.AEAD{}, digestKeys: map[uint32][]byte{}, tokenKeys: map[uint32]ed25519.PrivateKey{}}
 	checks := map[uint32][]byte{}
 	currents := 0
 	for _, k := range keys {
@@ -127,6 +131,7 @@ func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32]
 			}
 			ring.keys[k.ID] = prev.keys[k.ID]
 			ring.digestKeys[k.ID] = prev.digestKeys[k.ID]
+			ring.tokenKeys[k.ID] = prev.tokenKeys[k.ID]
 			checks[k.ID] = c.checks[k.ID]
 			if k.Current {
 				ring.current = k.ID
@@ -146,8 +151,13 @@ func (c *Cipher) buildRing(keys []RingKey, prev *keyRing) (*keyRing, map[uint32]
 		if err != nil {
 			return nil, nil, err
 		}
+		tokenKey, err := deriveSandboxTokenKey(k.Key)
+		if err != nil {
+			return nil, nil, err
+		}
 		ring.keys[k.ID] = gcm
 		ring.digestKeys[k.ID] = digestKey
+		ring.tokenKeys[k.ID] = tokenKey
 		checks[k.ID] = check
 		if k.Current {
 			ring.current = k.ID

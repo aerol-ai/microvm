@@ -467,7 +467,7 @@ func (s *server) handleDaytonaProcessRoute(w http.ResponseWriter, r *http.Reques
 	case strings.HasPrefix(action, "command/"):
 		s.handleDaytonaSessionCommandRoute(w, r, sessionID, strings.TrimPrefix(action, "command/"))
 	default:
-		writeError(w, http.StatusNotFound, "not found")
+		writeRouteNotFound(w)
 	}
 	return true
 }
@@ -498,7 +498,7 @@ func (s *server) handleDaytonaSessionCommandRoute(w http.ResponseWriter, r *http
 		}
 		s.handleDaytonaSessionCommandInput(w, r, sessionID, commandID)
 	default:
-		writeError(w, http.StatusNotFound, "not found")
+		writeRouteNotFound(w)
 	}
 }
 

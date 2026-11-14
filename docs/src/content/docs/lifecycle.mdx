@@ -17,6 +17,8 @@ Every timer is optional, and a timer you leave out is off.
 | `destroyIfIdleFor` | Delete the sandbox after it has had no activity for this long. |
 | `stopAtAge` | Stop the sandbox this long after it was created. |
 | `destroyAtAge` | Delete the sandbox this long after it was created. |
+| `destroyAfterExitFor` | Delete the sandbox this long after its main program ends. See [below](#delete-when-the-program-ends). |
+| `destroyAt` | Delete the sandbox at a set clock time. See [below](#delete-at-a-set-time). |
 | `serverless` | Start the sandbox again by itself when a request reaches it. Needs `stopIfIdleFor`. See [Ghost sandboxes](/ghost-sandboxes/). |
 
 Activity means anything that reaches the sandbox: a command, a file read or write, a terminal or SSH session, or traffic to its public URL.
@@ -139,6 +141,349 @@ The SDKs take each time in nanoseconds (billionths of a second). One hour is `60
   </TabItem>
 </Tabs>
 
+## Delete at a set time
+
+`destroyAt` deletes the sandbox at a clock time instead of after a length of time. Pass a time in RFC 3339 format, such as `2026-11-06T18:00:00Z`. You can set it when you create a sandbox or with `updateLifecycle`.
+
+The server turns the time into `destroyAtAge`: how old the sandbox will be at that time. So when you read the sandbox back, you see `destroyAtAge`, not `destroyAt`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: { destroyAt: new Date("2026-11-06T18:00:00Z") },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from datetime import datetime, timezone
+
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"destroyAt": datetime(2026, 11, 6, 18, 0, tzinfo=timezone.utc)},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    at := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{DestroyAt: &at},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            destroy_at: Some("2026-11-06T18:00:00Z".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle()
+            .setDestroyAt(Instant.parse("2026-11-06T18:00:00Z")))); // java.time.Instant
+    ```
+  </TabItem>
+</Tabs>
+
+The server rejects these with a `400` error:
+
+- **A time that is not in the future.**
+- **Both `destroyAt` and `destroyAtAge`.** Pick one.
+- **A time more than 30 days after the sandbox was created**, the same limit as every other timer.
+
+As with every timer, the delete can come up to a minute late.
+
+In a cluster that is part way through an upgrade, a server on this release refuses `updateLifecycle` with `destroyAt` with a `400` until every server runs this release. A server on an older release does not know `destroyAt`, so it would take the update as one with no timers and clear them all. It does not refuse the call either, so send these updates to an upgraded server, or wait until the upgrade is done. A create is safe when the server you call runs this release: it turns the time into `destroyAtAge` before it passes the create on, and every release reads that. A server on an older release that you call directly drops `destroyAt`, so the sandbox gets no delete time.
+
+## Delete when the program ends
+
+A sandbox's main program is the command it starts with: the image's own start command, or the `containerCommand` you pass. When that program ends, the sandbox keeps running, so you can still read its files. Set `destroyAfterExitFor` to delete the sandbox a while after the program ends.
+
+This example runs a job and deletes the sandbox 10 minutes after the job ends. In the meantime you can download its results.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const MINUTE = 60 * 1_000_000_000; // one minute in nanoseconds
+
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      containerCommand: ["python3", "/work/job.py"],
+      lifecycle: { destroyAfterExitFor: 10 * MINUTE },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    MINUTE = 60 * 1_000_000_000  # one minute in nanoseconds
+
+    sandbox = client.create(
+        image="python:3.12-slim",
+        container_command=["python3", "/work/job.py"],
+        lifecycle={"destroyAfterExitFor": 10 * MINUTE},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:            "python:3.12-slim",
+        ContainerCommand: []string{"python3", "/work/job.py"},
+        Lifecycle:        &sdktypes.Lifecycle{DestroyAfterExitFor: 10 * time.Minute},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let minute: u64 = 60 * 1_000_000_000; // one minute in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        container_command: Some(vec!["python3".into(), "/work/job.py".into()]),
+        lifecycle: Some(Lifecycle {
+            destroy_after_exit_for: 10 * minute,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long minute = Duration.ofMinutes(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setContainerCommand(List.of("python3", "/work/job.py"))
+        .setLifecycle(new Lifecycle().setDestroyAfterExitFor(10 * minute)));
+    ```
+  </TabItem>
+</Tabs>
+
+Once the program has ended, `statusReason` is `program_exited` and `exitCode` is its exit code, while the sandbox is still running. A program killed by a signal gets `128` plus the signal number, the way a shell reports it. A start command that could not start at all counts as ended with `127`.
+
+- **The server checks about once a minute**, so the delete can come up to a minute late.
+- **Stopping the sandbox does not cancel the timer.** The program has already ended. Starting the sandbox again runs the program again, which cancels it.
+- **The timer survives a server restart.** The server saves the time the program ended.
+- **It works on Docker, gVisor, containerd and Firecracker sandboxes.** WebAssembly and V8-isolate sandboxes have no main program and reject it with a `400` error.
+- **A sandbox needs an agent from this release or later.** A Firecracker template keeps the agent it was built with, so rebuild older templates. Without a new agent the option does nothing.
+
+## Why a sandbox stopped
+
+Every sandbox has a `statusReason`. It tells you why the sandbox is in its current state. When the reason comes from a program that ended, `exitCode` holds that program's exit code.
+
+| `statusReason` | Status | What happened |
+|---|---|---|
+| `user_stop` | stopped | Someone called `stop`: your code, the CLI, another SDK, or the server's operator. |
+| `idle` | stopped | `stopIfIdleFor` ran out, or the server's default idle stop did. |
+| `max_age` | stopped | `stopAtAge` ran out. |
+| `out_of_memory` | stopped | The sandbox used more memory than it has, and the system killed it. `exitCode` is set. |
+| `disk_limit` | stopped | The sandbox wrote more than its disk size. |
+| `crashed` | stopped | The sandbox went down on its own with a non-zero exit code. `exitCode` is set. |
+| `reconcile` | stopped | The server found the sandbox stopped but did not see it stop, so it cannot say why. This can happen after the server itself restarts. |
+| `program_exited` | stopped or started | The sandbox's main program ended. `exitCode` says how. |
+| `failover` | started | The server the sandbox ran on failed, so the sandbox was created again on another server. Running programs and files outside a volume were lost. |
+| `restarted` | started | The sandbox crashed and was started again for you. `exitCode` is the exit code of the crash. |
+
+A sandbox that you created or started yourself has no reason. Starting a sandbox clears the reason. `lastError` still holds the full message, such as `container exited with code 3`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const info = await client.get(sandbox.id);
+    if (info.status === "stopped") {
+      console.log("stopped because:", info.statusReason, "exit code:", info.exitCode);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    info = client.get(sandbox.id).to_dict()
+    if info["status"] == "stopped":
+        print("stopped because:", info.get("statusReason"), "exit code:", info.get("exitCode"))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    info, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if info.Status == "stopped" {
+        fmt.Println("stopped because:", info.StatusReason)
+        if info.ExitCode != nil {
+            fmt.Println("exit code:", *info.ExitCode)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let info = client.get(&sandbox.data.id)?;
+    if info.data.status == "stopped" {
+        println!("stopped because: {:?}, exit code: {:?}", info.data.status_reason, info.data.exit_code);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox info = client.get(sandbox.id);
+    if ("stopped".equals(info.status)) {
+        System.out.println("stopped because: " + info.statusReason + ", exit code: " + info.exitCode);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Restart after a crash
+
+Set `restartOnFailure` and the server starts the sandbox again when it crashes or runs out of memory. It is off by default.
+
+The server waits before each restart, so a sandbox that keeps crashing does not use up the server. The first wait is 5 seconds. Each crash after that doubles the wait: 10 seconds, 20 seconds, and so on, up to 5 minutes. Once the sandbox has run for 10 minutes without a crash, the wait goes back to 5 seconds.
+
+After a restart, `statusReason` is `restarted` and `exitCode` is the exit code of the crash. `lastError` keeps the crash message.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: { restartOnFailure: true },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"restartOnFailure": True},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{RestartOnFailure: true},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            restart_on_failure: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle().setRestartOnFailure(true)));
+    ```
+  </TabItem>
+</Tabs>
+
+A restart never fights you or your timers:
+
+- **A stop you ask for is never undone.** If you stop a sandbox, it stays stopped. Stopping a sandbox that is waiting for a restart cancels the restart.
+- **Timers still win.** A sandbox whose idle or age timer has run out is not restarted. A restart does not count as activity, so a sandbox that keeps crashing still stops when it has been idle long enough.
+- **Deleting a sandbox cancels its restart.**
+- **Only real crashes count.** A stop by a timer, by the disk limit, or by you is not a crash. Neither is a program that ends with exit code `0`.
+
+`restartOnFailure` works on Docker, gVisor and containerd sandboxes. Firecracker, WebAssembly and V8-isolate sandboxes reject it with a `400` error.
+
+If the server itself restarts while a sandbox waits, the wait is kept. The restart happens within about a minute of the server coming back, or later if the wait is longer.
+
+## See what happened to a sandbox
+
+The sandbox's audit log records everything the server does to a sandbox on its own: each automatic stop, delete, restart and re-create. Ask for the records whose caller is `system:*` to get just those, newest last.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await sandbox.audit({ caller: "system:*" });
+    for (const event of page.events) {
+      console.log(event.time, event.ref, event.reason);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = sandbox.audit({"caller": "system:*"})
+    for event in page["events"]:
+        print(event.get("time"), event.get("ref"), event.get("reason"))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := sandbox.Audit(ctx, sdktypes.AuditOptions{Caller: "system:*"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, event := range page.Events {
+        fmt.Println(event.Time, event.Ref, event.Reason)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = sandbox.audit(AuditOptions {
+        caller: Some("system:*".into()),
+        ..Default::default()
+    })?;
+    for event in &page.events {
+        println!("{} {:?} {:?}", event.time, event.r#ref, event.reason);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    AuditPage page = sandbox.audit(new AuditOptions().setCaller("system:*"));
+    for (AuditEvent event : page.events) {
+        System.out.println(event.time + " " + event.ref + " " + event.reason);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Each record's `ref` says what happened, and `reason` says why, using the same words as `statusReason`. For one source only, ask for its caller by name, such as `system:lifecycle`.
+
+| `ref` | Caller | What happened |
+|---|---|---|
+| `SYSTEM lifecycle.auto_stop` | `system:lifecycle` | A stop timer ran out. `reason` is `idle` or `max_age`. |
+| `SYSTEM lifecycle.auto_delete` | `system:lifecycle` | A delete timer ran out. `reason` is `idle`, `max_age` (this includes `destroyAt`) or `program_exited`. |
+| `SYSTEM lifecycle.disk_limit_stop` | `system:lifecycle` | The sandbox wrote more than its disk size. |
+| `SYSTEM lifecycle.restart_on_failure` | `system:lifecycle` | `restartOnFailure` started it again. `reason` is the crash: `crashed` or `out_of_memory`. |
+| `SYSTEM runtime.exited` | `system:runtime` | The sandbox went down without anyone asking. `reason` is `crashed`, `out_of_memory` or `program_exited`. |
+| `SYSTEM runtime.removed` | `system:runtime` | The sandbox's container was removed outside the server. |
+| `SYSTEM reconcile.found_stopped` | `system:reconcile` | The server found the sandbox stopped without seeing it stop. |
+| `SYSTEM reconcile.reap` | `system:reconcile` | The sandbox's container was gone, so the server deleted the sandbox. |
+| `SYSTEM cluster.deleted_while_away` | `system:boot-restore` or `system:reconcile` | The sandbox was deleted while its server was cut off from the cluster. When the server came back, it deleted its leftover copy. |
+| `SYSTEM cluster.unproven_while_away` | `system:boot-restore` or `system:reconcile` | The server came back after being cut off for longer than the cluster keeps its delete records (`SB_AUDIT_DELETED_GRACE`, 1 hour by default). The cluster had no record of this sandbox, so nothing showed it was still meant to exist, and the server deleted its copy. |
+| `SYSTEM failover.recreated` | `system:failover` | The sandbox was created again on another server after its server failed. |
+| `SYSTEM move.restored` | `system:move` | A machine replacement moved the running gVisor sandbox to another server with its memory: its programs kept running. `reason` is `moved`. |
+
+A stop or delete that you ask for is in the same log, under your own caller. Reading the audit log needs the `audit.read` permission.
+
 ## Good to know
 
 - **The longest timer is 30 days.** A longer value is rejected.
@@ -149,6 +494,23 @@ The SDKs take each time in nanoseconds (billionths of a second). One hour is `60
 ## For server operators
 
 `SB_IDLE_TIMEOUT_MIN` sets a default idle stop for the whole server. It stops any running sandbox that has been idle for that many minutes. It only applies to sandboxes with no lifecycle timers of their own. The default is `0` (off).
+
+Two more settings give every new sandbox a default delete timer. Use them so a client that crashes before it cleans up cannot leave sandboxes running forever.
+
+| Setting | What it does |
+|---|---|
+| `SB_DEFAULT_DESTROY_IF_IDLE_FOR` | Gives a new sandbox `destroyIfIdleFor` of this length. |
+| `SB_MAX_AGE` | Gives a new sandbox `destroyAtAge` of this length. |
+
+Both take a length such as `30m`, `2h` or `168h` (there is no `d` for days). Both are off by default (`0`). The most you can set is `720h` (30 days). The server refuses to start with a value outside that range.
+
+They follow the same rule as `SB_IDLE_TIMEOUT_MIN`: they only apply to a sandbox created with no lifecycle timers of its own. A sandbox that sets any timer keeps exactly its own timers.
+
+Unlike `SB_IDLE_TIMEOUT_MIN`, the defaults are written into the new sandbox's lifecycle when it is created:
+
+- **You can see them.** `get` shows them in the sandbox's lifecycle, and `updateLifecycle` can change them.
+- **They never reach older sandboxes.** Turning them on does not delete sandboxes that were created before.
+- **They keep the idle stop.** If `SB_IDLE_TIMEOUT_MIN` is also set and comes before the delete, it is written in as `stopIfIdleFor`, so the sandbox still stops first.
 
 ## Next steps
 

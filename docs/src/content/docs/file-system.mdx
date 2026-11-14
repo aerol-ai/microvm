@@ -7,6 +7,8 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 A sandbox has its own disk, separate from the machine your app runs on. To give it input, you upload a file to a path inside the sandbox. To get results, you download a file from a path. Both calls use the same token as the rest of the SDK.
 
+To be told when files change instead of checking for them, see [File watching](/file-watching/).
+
 ## Copy a file into a sandbox
 
 <Tabs syncKey="lang">
@@ -41,8 +43,77 @@ A sandbox has its own disk, separate from the machine your app runs on. To give 
 </Tabs>
 
 - Missing folders in the path are created for you. Here, `/workspace` does not need to exist yet.
-- If a file is already at that path, it is replaced.
+- If a file is already at that path, it is replaced, and it keeps its permissions.
 - In TypeScript you can pass a string, a `Uint8Array`, an `ArrayBuffer` or a `Blob`. The other SDKs take bytes.
+
+## Choose how the file is written
+
+Four options change how an upload writes its file:
+
+- **append** adds to the end of the file instead of replacing it. A missing file is created.
+- **create only** writes only if no file is there yet. Otherwise the call fails with HTTP 412 and the file is left alone. If two uploads race for the same new path, exactly one wins.
+- **atomic** writes to a temporary file first and then swaps it into place. Anyone reading the file sees the old version or the new one, never half of each.
+- **mode** sets the file's permissions, such as `0o600` for a private file.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadFile("/workspace/log.txt", "one more line\n", { append: true });
+    await sandbox.uploadFile("/workspace/job.lock", "taken", { createOnly: true });
+    await sandbox.uploadFile("/workspace/config.json", JSON.stringify({ debug: true }), { atomic: true, mode: 0o600 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_file("/workspace/log.txt", b"one more line\n", append=True)
+    sandbox.upload_file("/workspace/job.lock", b"taken", create_only=True)
+    sandbox.upload_file("/workspace/config.json", b'{"debug": true}', atomic=True, mode=0o600)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UploadFileWithOptions(ctx, "/workspace/job.lock", []byte("taken"),
+        sdktypes.UploadFileOptions{CreateOnly: true})
+    var apiErr *microvm.APIError
+    if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusPreconditionFailed {
+        log.Fatal("another worker holds the lock")
+    }
+    err = sandbox.UploadFileWithOptions(ctx, "/workspace/config.json", []byte(`{"debug": true}`),
+        sdktypes.UploadFileOptions{Atomic: true, Mode: 0o600})
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::UploadFileOptions;
+
+    sandbox.upload_file_with_options(
+        "/workspace/log.txt",
+        b"one more line\n".to_vec(),
+        UploadFileOptions { append: true, ..Default::default() },
+    )?;
+    sandbox.upload_file_with_options(
+        "/workspace/config.json",
+        br#"{"debug": true}"#.to_vec(),
+        UploadFileOptions { atomic: true, mode: Some(0o600), ..Default::default() },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile("/workspace/log.txt", "one more line\n".getBytes(StandardCharsets.UTF_8),
+        new UploadFileOptions().setAppend(true));
+    sandbox.uploadFile("/workspace/config.json", "{\"debug\": true}".getBytes(StandardCharsets.UTF_8),
+        new UploadFileOptions().setAtomic(true).setMode(0600));
+    ```
+  </TabItem>
+</Tabs>
+
+- `append` cannot be combined with `create only` or `atomic`. Asking for both is refused (HTTP 400) with a message that names both.
+- Without `mode`, a new file gets `rw-r--r--` and an existing file keeps its permissions. An atomic replace also keeps the old file's owner.
+- An atomic write never changes the old file's contents in place. If another path is a hard link to the old file, that path keeps the old contents.
 
 ## Read a file from a sandbox
 
@@ -186,31 +257,548 @@ Run a command that writes a file, then download it. Here Python in the sandbox w
   </TabItem>
 </Tabs>
 
+## List a folder
+
+`listFiles` returns what is in a folder. Each entry has its name, full path, size in bytes, whether it is a folder, its permissions, owner and change time. A symlink is listed as a symlink, with where it points.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const listing = await sandbox.listFiles("/workspace", { depth: 2 });
+    for (const entry of listing.entries) {
+      console.log(entry.isDir ? `${entry.path}/` : `${entry.path} (${entry.size} bytes)`);
+    }
+    if (listing.truncated) {
+      console.log("there is more; raise the limit or list a smaller folder");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    listing = sandbox.list_files("/workspace", depth=2)
+    for entry in listing["entries"]:
+        print(entry["path"] + "/" if entry["isDir"] else f'{entry["path"]} ({entry["size"]} bytes)')
+    if listing["truncated"]:
+        print("there is more; raise the limit or list a smaller folder")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    listing, err := sandbox.ListFiles(ctx, "/workspace", sdktypes.ListFilesOptions{Depth: 2})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, entry := range listing.Entries {
+        fmt.Println(entry.Path, entry.IsDir, entry.Size)
+    }
+    if listing.Truncated {
+        fmt.Println("there is more; raise the limit or list a smaller folder")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ListFilesOptions;
+
+    let listing = sandbox.list_files("/workspace", ListFilesOptions { depth: Some(2), limit: None })?;
+    for entry in &listing.entries {
+        println!("{} {} {}", entry.path, entry.is_dir, entry.size);
+    }
+    if listing.truncated {
+        println!("there is more; raise the limit or list a smaller folder");
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    FileList listing = sandbox.listFiles("/workspace", new ListFilesOptions().setDepth(2));
+    for (FileInfo entry : listing.entries) {
+        System.out.println(entry.path + " " + entry.isDir + " " + entry.size);
+    }
+    if (listing.truncated) {
+        System.out.println("there is more; raise the limit or list a smaller folder");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- **Depth** is how many levels to go down. `1` (the default) is the folder's own entries; `2` adds what is inside its subfolders, and so on.
+- **Limit** caps the number of entries. It is 10,000 unless you set it. When a folder has more, you get the first entries and `truncated` is true.
+- A symlink to a folder is listed but never followed, so a link to `/` cannot turn a listing into a walk of the whole disk.
+- A subfolder the agent cannot read is still listed; only its contents are left out.
+
+## Check a path
+
+`getFileInfo` returns the details of one file or folder. It follows a symlink and describes what the link points to. `fileExists` just says yes or no.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    if (await sandbox.fileExists("/workspace/data.csv")) {
+      const info = await sandbox.getFileInfo("/workspace/data.csv");
+      console.log(info.size, info.permissions, info.modTime);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    if sandbox.file_exists("/workspace/data.csv"):
+        info = sandbox.get_file_info("/workspace/data.csv")
+        print(info["size"], info["permissions"], info["modTime"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exists, err := sandbox.FileExists(ctx, "/workspace/data.csv")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if exists {
+        info, err := sandbox.GetFileInfo(ctx, "/workspace/data.csv")
+        if err != nil {
+            log.Fatal(err)
+        }
+        fmt.Println(info.Size, info.Permissions, info.ModTime)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    if sandbox.file_exists("/workspace/data.csv")? {
+        let info = sandbox.get_file_info("/workspace/data.csv")?;
+        println!("{} {} {}", info.size, info.permissions, info.mod_time);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    if (sandbox.fileExists("/workspace/data.csv")) {
+        FileInfo info = sandbox.getFileInfo("/workspace/data.csv");
+        System.out.println(info.size + " " + info.permissions + " " + info.modTime);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The size is a 64-bit number, so files over 2 GB report their real size. If the sandbox itself does not exist, `fileExists` raises an error instead of saying no.
+
+## Make a folder
+
+`makeDir` makes one folder. Turn on `parents` to also make the folders above it and to accept a folder that is already there, like `mkdir -p`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.makeDir("/workspace/out/logs", { parents: true });
+    await sandbox.makeDir("/workspace/private", { mode: 0o700 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.make_dir("/workspace/out/logs", parents=True)
+    sandbox.make_dir("/workspace/private", mode=0o700)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.MakeDir(ctx, "/workspace/out/logs", sdktypes.MakeDirOptions{Parents: true})
+    if err != nil {
+        log.Fatal(err)
+    }
+    err = sandbox.MakeDir(ctx, "/workspace/private", sdktypes.MakeDirOptions{Mode: 0o700})
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::MakeDirOptions;
+
+    sandbox.make_dir("/workspace/out/logs", MakeDirOptions { parents: true, mode: None })?;
+    sandbox.make_dir("/workspace/private", MakeDirOptions { parents: false, mode: Some(0o700) })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.makeDir("/workspace/out/logs", new MakeDirOptions().setParents(true));
+    sandbox.makeDir("/workspace/private", new MakeDirOptions().setMode(0700));
+    ```
+  </TabItem>
+</Tabs>
+
+- Without `parents`, the folder above must exist (else "not found", HTTP 404), and a folder already at the path is a conflict (HTTP 409).
+- A new folder gets mode `0755` unless you pass `mode`. With `parents`, a folder that was already there keeps its mode unless you pass one.
+
+## Move, rename and copy
+
+`moveFile` moves or renames a file or folder. `copyFile` copies one; a folder needs `recursive`. Both keep what is at the destination unless you turn on `overwrite`: an existing destination is a conflict (HTTP 409).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.moveFile("/workspace/draft.md", "/workspace/final.md");
+    await sandbox.copyFile("/workspace/src", "/workspace/src-backup", { recursive: true });
+    await sandbox.copyFile("/workspace/new.cfg", "/etc/app.cfg", { overwrite: true });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.move_file("/workspace/draft.md", "/workspace/final.md")
+    sandbox.copy_file("/workspace/src", "/workspace/src-backup", recursive=True)
+    sandbox.copy_file("/workspace/new.cfg", "/etc/app.cfg", overwrite=True)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.MoveFile(ctx, "/workspace/draft.md", "/workspace/final.md", sdktypes.MoveFileOptions{})
+    if errors.Is(err, microvm.ErrConflict) {
+        log.Fatal("final.md is already there")
+    }
+    err = sandbox.CopyFile(ctx, "/workspace/src", "/workspace/src-backup", sdktypes.CopyFileOptions{Recursive: true})
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CopyFileOptions, MoveFileOptions};
+
+    sandbox.move_file("/workspace/draft.md", "/workspace/final.md", MoveFileOptions::default())?;
+    sandbox.copy_file(
+        "/workspace/src",
+        "/workspace/src-backup",
+        CopyFileOptions { recursive: true, overwrite: false },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.moveFile("/workspace/draft.md", "/workspace/final.md");
+    sandbox.copyFile("/workspace/src", "/workspace/src-backup", new CopyFileOptions().setRecursive(true));
+    sandbox.copyFile("/workspace/new.cfg", "/etc/app.cfg", new CopyFileOptions().setOverwrite(true));
+    ```
+  </TabItem>
+</Tabs>
+
+- The overwrite check is exact: if two calls move different files to the same new name at the same time, one wins and the other gets the conflict.
+- A move across disks (for example from `/tmp` to `/workspace` when `/tmp` is its own disk) still works: the sandbox copies the files, then removes the originals. If that fails part way, the originals stay and nothing is left at the destination.
+- A copied folder keeps its file modes and its symlinks (as links, not the files they point to).
+- You cannot move or copy a folder into itself (HTTP 400).
+
+## Delete a file or folder
+
+`deleteFile` deletes a file. A folder needs `recursive`, so passing a folder by mistake deletes nothing (HTTP 409).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.deleteFile("/workspace/old.log");
+    await sandbox.deleteFile("/workspace/build", { recursive: true });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.delete_file("/workspace/old.log")
+    sandbox.delete_file("/workspace/build", recursive=True)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.DeleteFile(ctx, "/workspace/build", sdktypes.DeleteFileOptions{Recursive: true})
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::DeleteFileOptions;
+
+    sandbox.delete_file("/workspace/build", DeleteFileOptions { recursive: true })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.deleteFile("/workspace/old.log");
+    sandbox.deleteFile("/workspace/build", new DeleteFileOptions().setRecursive(true));
+    ```
+  </TabItem>
+</Tabs>
+
+Deleting a symlink deletes the link, never what it points to. Deleting `/` is refused.
+
+## Find files and text
+
+`searchFiles` finds files whose name matches a pattern such as `*.py`. `findInFiles` finds every line that contains some text (plain text, not a regular expression).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const tests = await sandbox.searchFiles("/workspace", "test_*.py");
+    const todos = await sandbox.findInFiles("/workspace", "TODO");
+    for (const match of todos) {
+      console.log(`${match.file}:${match.line}: ${match.content}`);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    tests = sandbox.search_files("/workspace", "test_*.py")
+    for match in sandbox.find_in_files("/workspace", "TODO"):
+        print(f'{match["file"]}:{match["line"]}: {match["content"]}')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    tests, err := sandbox.SearchFiles(ctx, "/workspace", "test_*.py")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(tests)
+    todos, err := sandbox.FindInFiles(ctx, "/workspace", "TODO")
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, m := range todos {
+        fmt.Printf("%s:%d: %s\n", m.File, m.Line, m.Content)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let tests = sandbox.search_files("/workspace", "test_*.py")?;
+    println!("{:?}", tests);
+    for m in sandbox.find_in_files("/workspace", "TODO")? {
+        println!("{}:{}: {}", m.file, m.line, m.content);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<String> tests = sandbox.searchFiles("/workspace", "test_*.py");
+    for (FileMatch match : sandbox.findInFiles("/workspace", "TODO")) {
+        System.out.println(match.file + ":" + match.line + ": " + match.content);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## When a file call fails
+
+| What happened | HTTP status |
+|---|---|
+| The path does not exist | 404 |
+| The sandbox user may not read or change it | 403 |
+| The path is the wrong kind (a folder where a file was expected, or the reverse), a folder without `recursive`, or the destination already exists | 409 |
+| A request that cannot work, such as deleting `/`, copying a folder into itself, upload options that clash, or an unsafe entry in a folder archive | 400 |
+| An upload with `create only` found a file already there | 412 |
+| A folder archive has too many entries or too many bytes | 413 |
+| A download range starts past the end of the file | 416 |
+| The sandbox disk is full ("sandbox disk is full") | 507 |
+| The sandbox is a WASM or V8 isolate sandbox, which has no such call | 501 |
+
+## Retries
+
+The SDKs retry a call that failed on the way. Calls that are safe to send twice retry more often than calls that are not.
+
+| Call | Retried on |
+|---|---|
+| `listFiles`, `getFileInfo`, `fileExists`, `searchFiles`, `findInFiles`, `downloadFile` | 421, 429, 502, 503, 504 and dropped connections |
+| Streamed downloads (`downloadFileStream`, `download_file_to`) | The same, until the file starts to arrive; never after. |
+| `uploadFile`, plain or atomic | 421, 429, 502, 503, 504 and dropped connections: sending the same bytes again leaves the same file |
+| `deleteFile`, `makeDir` | The same. If an earlier try's answer was lost (the connection dropped, or a `502` or `504`) and the retry finds the work done (the file is gone, the folder is there), the call succeeds. After a `421`, `429` or `503` the server did nothing, so a missing file is still an error. |
+| `moveFile`, `copyFile`, `uploadFile` with append or create only | Only 429 and 503, when the server did nothing. After any other failure the work may have happened (a second append would add the data twice), so the SDK reports the error instead of guessing. |
+| `uploadDir` and the streamed uploads (`uploadFileStream`, `upload_file_from`, Go `UploadFileStream`) | Never: the data is built or read as it is sent, so the SDK sends it once. |
+
 ## Copy a whole folder
 
-Upload and download work on one file at a time. To move a folder, pack it into one file with `tar` inside the sandbox, then download that file:
+`uploadDir` copies a folder from your machine into the sandbox. The SDK packs it as a `tar` archive, and the sandbox unpacks it into the folder you name, making it if needed.
 
-```bash
-tar czf /tmp/results.tar.gz -C /workspace results
-```
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.uploadDir("./my-project", "/workspace/my-project");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.upload_dir("./my-project", "/workspace/my-project")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UploadDir(ctx, "./my-project", "/workspace/my-project")
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.upload_dir("./my-project", "/workspace/my-project")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadDir(Path.of("./my-project"), "/workspace/my-project");
+    ```
+  </TabItem>
+</Tabs>
 
-Run that line with `exec`, then download `/tmp/results.tar.gz`. To send a folder in, do the reverse: upload a `.tar.gz` file, then unpack it with `tar xzf`.
+- Files already in the destination with the same name are replaced; other files stay.
+- Symlinks are copied as links. A file with several hard links is copied as separate files. Devices, pipes and sockets are skipped.
+- The sandbox checks every entry: an absolute path, a `..`, a link that leads outside the folder, a hard link, or a device file is refused (HTTP 400), and nothing is written outside the folder. If the archive fails part way, the files before the bad entry stay, and the error names the entry and how many were written.
+- An archive can hold up to 200,000 entries and 4 GB of file content once unpacked (HTTP 413 past that). The upload itself is capped at 256 MB, like any upload.
+- In TypeScript this needs Node.js. The TypeScript, Python, Rust and Java SDKs build the archive in memory; the Go SDK builds it while it sends.
+
+To copy a folder out of a sandbox, use the [CLI](/cli/#copy-a-folder): `aerolvm cp -r my-box:/workspace/out ./out`. It checks every entry the same way before it writes to your disk.
 
 ## Move big files without filling memory
 
-Most SDK calls hold the whole file in memory while they copy it. The Go SDK also has streaming versions that copy a file piece by piece:
+`uploadFile` and `downloadFile` hold the whole file in memory. For big files, use the streaming calls: they copy the file a piece at a time, so memory stays small however big the file is.
 
-- `UploadFileStream(ctx, path, reader)` reads from any `io.Reader`, such as an open file.
-- `DownloadFileStream(ctx, path)` returns an `io.ReadCloser`. You must close it. Closing it early stops the download, so reading only the start of a big file is cheap.
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { createReadStream, createWriteStream } from "node:fs";
+    import { Readable, Writable } from "node:stream";
+
+    await sandbox.uploadFileStream("/workspace/data.bin", Readable.toWeb(createReadStream("./data.bin")) as ReadableStream<Uint8Array>);
+    const stream = await sandbox.downloadFileStream("/workspace/result.bin");
+    await stream.pipeTo(Writable.toWeb(createWriteStream("./result.bin")));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with open("data.bin", "rb") as src:
+        sandbox.upload_file_from("/workspace/data.bin", src)
+    with open("result.bin", "wb") as dest:
+        sandbox.download_file_to("/workspace/result.bin", dest)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    src, err := os.Open("data.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer src.Close()
+    if err := sandbox.UploadFileStream(ctx, "/workspace/data.bin", src); err != nil {
+        log.Fatal(err)
+    }
+    body, err := sandbox.DownloadFileStream(ctx, "/workspace/result.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer body.Close()
+    dest, err := os.Create("result.bin")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer dest.Close()
+    if _, err := io.Copy(dest, body); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{DownloadFileOptions, UploadFileOptions};
+
+    let src = std::fs::File::open("data.bin")?;
+    sandbox.upload_file_from("/workspace/data.bin", src, UploadFileOptions::default())?;
+    let mut dest = std::fs::File::create("result.bin")?;
+    sandbox.download_file_to("/workspace/result.bin", &mut dest, DownloadFileOptions::default())?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try (InputStream src = Files.newInputStream(Path.of("data.bin"))) {
+        sandbox.uploadFileStream("/workspace/data.bin", src, null);
+    }
+    try (InputStream body = sandbox.downloadFileStream("/workspace/result.bin", null)) {
+        Files.copy(body, Path.of("result.bin"), StandardCopyOption.REPLACE_EXISTING);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+- A streamed upload takes the same options as `uploadFile` (append, create only, atomic, mode).
+- A streamed upload is sent once and never retried: the data is read as it goes. A streamed download is retried until the file starts to arrive, never after.
+- Closing a download stream early stops the transfer, so reading only the start of a big file is cheap.
+- In TypeScript, streaming needs Node.js 18 or later.
+
+## Limit how much you download
+
+Pass a byte limit to refuse a file bigger than you expect, so a huge log or a runaway output file cannot fill your app's memory. When the sandbox reports the file's size, the call fails before reading any of it. Otherwise it fails as soon as more than the limit arrives.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    try {
+      const bytes = await sandbox.downloadFile("/workspace/out.log", { maxBytes: 10_000_000 });
+    } catch (err) {
+      if (err instanceof MicroVMFileTooLargeError) {
+        console.log("the log is over 10 MB");
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMFileTooLargeError
+
+    try:
+        data = sandbox.download_file("/workspace/out.log", max_bytes=10_000_000)
+    except MicroVMFileTooLargeError:
+        print("the log is over 10 MB")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    data, err := sandbox.DownloadFileWithOptions(ctx, "/workspace/out.log",
+        sdktypes.DownloadFileOptions{MaxBytes: 10_000_000})
+    if errors.Is(err, microvm.ErrFileTooLarge) {
+        log.Fatal("the log is over 10 MB")
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::DownloadFileOptions;
+
+    let data = sandbox.download_file_with_options(
+        "/workspace/out.log",
+        DownloadFileOptions { max_bytes: Some(10_000_000) },
+    )?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try {
+        byte[] data = sandbox.downloadFile("/workspace/out.log", new DownloadFileOptions().setMaxBytes(10_000_000L));
+    } catch (MicroVMFileTooLargeException err) {
+        System.out.println("the log is over 10 MB");
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The streaming downloads take the same limit (`downloadFileStream`, `download_file_to`, `DownloadFileStreamWithOptions`, `download_file_to`, `downloadFileStream`).
+
+The sandbox also answers ranged and `HEAD` requests on downloads, so any HTTP client can resume a large download or check a file's size and change time without reading it. A range past the end of the file is HTTP 416.
 
 ## Good to know
 
 - **Use full paths** that start with `/`.
 - **One upload can be up to 256 MB.** For bigger data, [attach cloud storage](/external-storage/) or a [platform volume](/platform-volumes/) instead.
 - **The sandbox must be running.** Start a stopped sandbox before you copy files.
-- **Uploaded files belong to `root`** and everyone can read them (`rw-r--r--`). If a program running as another user must change a file, fix its owner with `chown` through `exec`.
-- **There is no SDK call to list a folder.** Run `ls` with `exec`, or use `aerolvm ls` from the [CLI](/cli/).
-- **V8 isolate sandboxes have no files.** See [V8 isolate](/isolate-sandbox/).
+- **A new uploaded file belongs to `root`** and everyone can read it (`rw-r--r--`), unless you pass a `mode`. If a program running as another user must change a file, fix its owner with `chown` through `exec`.
+- **The file calls above need a current sandbox agent.** A sandbox created before this release, or a Firecracker template built before it, runs an older agent. The SDK refuses the calls that need a newer one with an "unsupported feature" error that says to restart the sandbox or re-create the template. It never sends an option the older agent would ignore.
+- **WASM sandboxes** support only upload, download and a plain folder list. The other file calls answer HTTP 501.
+- **V8 isolate sandboxes have no files.** Every file call answers HTTP 501. See [V8 isolate](/isolate-sandbox/).
 
 <Aside type="tip">
 From a terminal, `aerolvm cp ./data.csv my-box:/work/data.csv` copies a file in, and `aerolvm cp my-box:/work/report.html .` copies one out. See the [aerolvm CLI](/cli/).

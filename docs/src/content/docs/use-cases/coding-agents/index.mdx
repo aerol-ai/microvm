@@ -17,6 +17,23 @@ Each project below runs Claude Code, Anthropic's coding agent, on a real GitHub 
 | [Find and fix security problems](/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent/) | Scans for known security problems, fixes what it can and opens a pull request. |
 | [Make a code change and open a pull request](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | Takes a change request in plain words, makes the change, tests it and opens a pull request. |
 
+## Other coding agents
+
+The same pattern works with any agent that runs from the command line. Each recipe below installs one at a fixed version, starts it in a session on a cloned repository, and downloads its change as a patch.
+
+| Recipe | Agent | API key |
+|---|---|---|
+| [Run OpenCode](/use-cases/coding-agents/opencode-agent/) | OpenCode, an open-source agent that works with many model providers | Anthropic (or another provider) |
+| [Run Aider](/use-cases/coding-agents/aider-agent/) | Aider, an open-source agent that edits a Git repository | Anthropic (or another provider) |
+| [Run Gemini CLI](/use-cases/coding-agents/gemini-cli-agent/) | Google's Gemini CLI | Gemini |
+| [Run Codex CLI](/use-cases/coding-agents/codex-cli-agent/) | OpenAI's Codex CLI | OpenAI |
+
+## Tools for agents
+
+| Recipe | What it does |
+|---|---|
+| [Host an MCP server](/use-cases/coding-agents/host-mcp-server/) | Runs an MCP server in a sandbox, so agents can call its tools over HTTPS, behind a key and an optional sandbox token. |
+
 ## What every project needs
 
 - **An AerolVM server and the TypeScript SDK.** See [Quickstart](/quick-start/) and [SDK setup](/sdk-setup/).

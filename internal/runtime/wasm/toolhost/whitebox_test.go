@@ -22,10 +22,9 @@ func TestStrconvQuote(t *testing.T) {
 	}
 }
 
-// ─── host.go New with sessions ────────────────────────────────────────────────
+// ─── host.go New ──────────────────────────────────────────────────────────────
 
-func TestNewHostWithSessions(t *testing.T) {
-	// When sessions is nil, daytona should also be nil
+func TestNewHostHandler(t *testing.T) {
 	h := New(Config{
 		SandboxID: "sb",
 		WorkDir:   t.TempDir(),

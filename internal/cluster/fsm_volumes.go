@@ -104,6 +104,34 @@ func (f *placementFSM) volumeAttachmentCountLocked(tenant, volumeID string) int 
 	return len(f.volumeAttachmentsByVolume[volumeKey(tenant, volumeID)])
 }
 
+// VolumeAttachmentsForSandbox returns the replicated attachments sandboxID
+// holds, every incarnation's, sorted by volume and target. A destroy reads
+// them before its placement delete releases them, to find the
+// delete_with_sandbox volumes it may be the last user of. Never nil.
+func (f *placementFSM) VolumeAttachmentsForSandbox(sandboxID string) []models.VolumeAttachment {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := []models.VolumeAttachment{}
+	for key := range f.volumeAttachmentsBySandbox[strings.TrimSpace(sandboxID)] {
+		if a, ok := f.volumeAttachments[key]; ok {
+			out = append(out, a)
+		}
+	}
+	sortVolumeAttachments(out)
+	return out
+}
+
+// sortVolumeAttachments orders attachments by volume, then target, so map
+// iteration never reaches a caller.
+func sortVolumeAttachments(out []models.VolumeAttachment) {
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].VolumeID != out[j].VolumeID {
+			return out[i].VolumeID < out[j].VolumeID
+		}
+		return out[i].Target < out[j].Target
+	})
+}
+
 // LiveVolumeExistsForSource reports whether any replicated row resolves to
 // source. The reclaim worker uses it cluster-wide instead of a single node's
 // SQLite so it never deletes bytes a recreated volume still owns.

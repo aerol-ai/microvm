@@ -329,9 +329,16 @@ func TestBankEgressFloorFailsClosedAndHeals(t *testing.T) {
 		t.Cleanup(func() {
 			if !healed {
 				// Never leave a node without its floor for the cases after
-				// this one: a restart installs it at boot.
-				t.Logf("floor %s on %s was not put back; restarting sandboxd there: %s", floor.Name, node.Name,
+				// this one: a restart installs it at boot. The node is
+				// wherever the sandbox landed, the seed included: a restart
+				// (not a stop) brings the daemon straight back and the other
+				// members keep a quorum, so it is safe on the seed too, as
+				// long as the next case waits for the node to rejoin.
+				t.Logf("floor %s on %s (seed: %v) was not put back; restarting sandboxd there: %s", floor.Name, node.Name, node.Seed,
 					nodeSSH(t, node, "sudo systemctl restart sandboxd && echo restarted"))
+				if err := waitNodeRejoined(t, node); err != nil {
+					t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+				}
 			}
 		})
 		t.Logf("removed %s (the %s floor for %s, first in %s) on %s: %s", floor.Name, key, floor.Src, parent, node.Name, strings.TrimSpace(out))
@@ -1794,28 +1801,14 @@ func bankStillAnswers(t *testing.T, sb *microvm.Sandbox, wait time.Duration) {
 	}
 }
 
-// bankAddressRules is the node's host firewall lines that name ip (iptables,
-// legacy iptables and nftables, whichever the node uses), normalized so two
-// snapshots compare: nft counters are dropped, and a set's element list is
-// reduced to "holds ip".
+// bankAddressRules is what the node's host firewall (iptables, legacy
+// iptables and nftables, whichever the node uses) holds for ip, normalized so
+// two snapshots compare (harness.AddressRuleLines: counters dropped, nft sets
+// read element by element, so a set re-wrapped by another address is no
+// change).
 func bankAddressRules(t *testing.T, node harness.IntegrationNode, ip string) []string {
 	t.Helper()
-	out := bankRuleDump(t, node)
-	re := ipOnLine(ip)
-	counters := regexp.MustCompile(`counter packets \d+ bytes \d+ ?`)
-	var rules []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if !re.MatchString(line) {
-			continue
-		}
-		if strings.Contains(line, "elements = {") {
-			line = "a set holds " + ip
-		}
-		rules = append(rules, counters.ReplaceAllString(line, ""))
-	}
-	sort.Strings(rules)
-	return rules
+	return harness.AddressRuleLines(bankRuleDump(t, node), ip)
 }
 
 // UC-345 — a process OOM-killed inside a sandbox neither stops the sandbox
@@ -1892,9 +1885,11 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 
 	for _, surface := range []struct {
 		name, path, imageField string
+		created                int
 	}{
-		{name: "v1", path: "/v1/sandboxes", imageField: "image"},
-		{name: "daytona", path: "/daytona/sandbox", imageField: "snapshot"},
+		{name: "v1", path: "/v1/sandboxes", imageField: "image", created: http.StatusCreated},
+		// Daytona's create answers 200, as Daytona's own API does.
+		{name: "daytona", path: "/daytona/sandbox", imageField: "snapshot", created: http.StatusOK},
 	} {
 		t.Run(surface.name, func(t *testing.T) {
 			key := "uc365-" + surface.name + "-" + harness.UniqueName(sc, t)
@@ -1905,8 +1900,8 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 			}
 
 			st, b := fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
-			if st != http.StatusCreated {
-				t.Fatalf("first create = %d; body=%s", st, b)
+			if st != surface.created {
+				t.Fatalf("first create = %d, want %d; body=%s", st, surface.created, b)
 			}
 			var first idResponse
 			fcDecode(t, b, &first)
@@ -1914,11 +1909,11 @@ func TestBankIdempotencyKeyReuseRefused(t *testing.T) {
 
 			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(oldSecret), hdr)
 			var replay idResponse
-			if st == http.StatusCreated {
+			if st == surface.created {
 				fcDecode(t, b, &replay)
 			}
-			if st != http.StatusCreated || replay.ID != first.ID {
-				t.Fatalf("retry with the same request = %d %s; want 201 and %s", st, b, first.ID)
+			if st != surface.created || replay.ID != first.ID {
+				t.Fatalf("retry with the same request = %d %s; want %d and %s", st, b, surface.created, first.ID)
 			}
 
 			st, b = fcDo(t, ctx, http.MethodPost, "", surface.path, body(newSecret), hdr)

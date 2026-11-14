@@ -75,7 +75,7 @@ func (h *handlers) toolboxCall(ctx context.Context, devboxID, method, path strin
 		reader = bytes.NewReader(payload)
 		headers.Set("Content-Type", "application/json")
 	}
-	resp, err := h.deps.Service.RoundTripToolbox(ctx, devboxID, method, path, query, reader, headers)
+	resp, err := h.deps.Service.RoundTripToolbox(service.WithToolboxSurface(ctx, service.ToolboxSurfaceRunloop), devboxID, method, path, query, reader, headers)
 	if err != nil {
 		return 0, err
 	}

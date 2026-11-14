@@ -69,7 +69,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	// existing placement; on the single-node / local-image path it is the
 	// CreateOptions.SandboxID below, so CreateSandboxWithID replays the
 	// existing sandbox. Empty leaves both to mint a fresh id (the default).
-	preferredID := clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	preferredID := clustercreate.DeterministicSandboxID(h.deps.Service, service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
 	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: preferredID})
 	if !ok {
 		return
@@ -144,7 +144,10 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	apihttp.WriteJSON(w, http.StatusCreated, h.toSandboxResponse(r, &response.Sandbox, meta))
+	// 200, as Daytona answers (its OpenAPI spec: createSandbox "200"). The
+	// Daytona Python SDK reads a body only from the status its spec names,
+	// so a 201 left every Python create with no sandbox.
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, &response.Sandbox, meta))
 }
 
 func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandboxRequest) (models.CreateSandboxRequest, error) {
@@ -330,7 +333,8 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	apihttp.WriteJSON(w, http.StatusCreated, h.toSnapshotResponse(r, registered))
+	// 200, as Daytona answers (createSnapshot "200"); see the sandbox create.
+	apihttp.WriteJSON(w, http.StatusOK, h.toSnapshotResponse(r, registered))
 }
 
 // listFacadeClusterItems merges local facade list items with peer facade lists

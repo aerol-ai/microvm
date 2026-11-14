@@ -18,23 +18,44 @@ func imageDefaultCommand(ctx context.Context, client *Client, image cntr.Image) 
 }
 
 func imageConfigCommand(ctx context.Context, provider content.Provider, image cntr.Image) ([]string, error) {
+	cfg, err := readImageConfig(ctx, provider, image)
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]string{}, cfg.Config.Entrypoint...), cfg.Config.Cmd...), nil
+}
+
+// imageUser is the image's USER, the user oci.WithImageConfig runs the
+// container as: the create policy's require_non_root rule reads it.
+func imageUser(ctx context.Context, client *Client, image cntr.Image) (string, error) {
+	if client == nil || client.contentProvider() == nil {
+		return "", fmt.Errorf("content store unavailable")
+	}
+	cfg, err := readImageConfig(ctx, client.contentProvider(), image)
+	if err != nil {
+		return "", err
+	}
+	return cfg.Config.User, nil
+}
+
+func readImageConfig(ctx context.Context, provider content.Provider, image cntr.Image) (ocispec.Image, error) {
 	// Image.Config returns the config descriptor directly — containerd already
 	// resolves index→manifest→config for the client platform. Read it straight
 	// from the content store. Do NOT feed it back through images.Config, which
 	// expects a manifest/index and fails with "unexpected media type
 	// application/vnd.oci.image.config.v1+json" on the config descriptor.
+	var cfg ocispec.Image
 	cfgDesc, err := image.Config(ctx)
 	if err != nil {
-		return nil, err
+		return cfg, err
 	}
 	ra, err := provider.ReaderAt(ctx, cfgDesc)
 	if err != nil {
-		return nil, err
+		return cfg, err
 	}
 	defer ra.Close()
-	var cfg ocispec.Image
 	if err := json.NewDecoder(content.NewReader(ra)).Decode(&cfg); err != nil {
-		return nil, err
+		return cfg, err
 	}
-	return append(append([]string{}, cfg.Config.Entrypoint...), cfg.Config.Cmd...), nil
+	return cfg, nil
 }

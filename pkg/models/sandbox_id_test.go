@@ -4,7 +4,7 @@ import "testing"
 
 func TestValidateSandboxID(t *testing.T) {
 	good := []string{
-		"sb-0123456789abcdef", // generateSandboxID output
+		"sb-0123456789abcdef", // Service.NewSandboxID output
 		"fc-jailer",
 		"wasm-abc_DEF-123",
 		"a",

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -136,20 +137,22 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 	if err != nil {
 		return 0, nil, nil, err
 	}
+	client = peerBuildClient(client, h.deps.Service.ImageBuildTimeout())
 	req, err := http.NewRequestWithContext(parent.Context(), http.MethodPost,
 		base+PathPrefix+"/images/build", bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	req.Header.Set(clusterImageBuildRoutedHeader, "1")
-	// The caller's own credential follows; StampForward adds the
-	// forwarded marker, the selected team and the correlation id.
-	access, _ := controlplane.AccessFromContext(parent.Context())
-	cluster.StampForward(req, access)
+	// The caller's own credential follows; StampForward then adds the
+	// forwarded marker, the selected team and the correlation id, and
+	// drops a credential only this node accepts (a local tool's token).
 	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
+	access, _ := controlplane.AccessFromContext(parent.Context())
+	cluster.StampForward(req, access)
 	if ct := parent.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}
@@ -163,6 +166,23 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 		return 0, nil, nil, err
 	}
 	return resp.StatusCode, resp.Header.Clone(), body, nil
+}
+
+// peerBuildClient is the peer client with a limit that fits a build. The
+// shared peer client's limit (a Raft commit plus 2 s, about 30 s) suits a
+// forwarded API call, but the target answers a build only when the build,
+// and a push if one was asked for, are done, each bounded there by
+// SB_IMAGE_BUILD_TIMEOUT. With the shared limit, every build that took
+// longer than 30 s on another node failed with "Client.Timeout exceeded
+// while awaiting headers" (UC-464/465 live, 2026-11-06). The copy shares
+// the transport; the call still ends when the caller goes away.
+func peerBuildClient(c *http.Client, buildTimeout time.Duration) *http.Client {
+	cc := *c
+	cc.Timeout = 0
+	if buildTimeout > 0 {
+		cc.Timeout = 2*buildTimeout + time.Minute
+	}
+	return &cc
 }
 
 // buildImage builds through the service (Service.BuildImage), the one build

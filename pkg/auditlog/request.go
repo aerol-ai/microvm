@@ -50,6 +50,9 @@ const (
 	SurfaceMCP = "mcp"
 	// SurfaceSSH is an SSH session opened through the gateway.
 	SurfaceSSH = "ssh"
+	// SurfaceKubernetes is the agent-sandbox API's inner API call on behalf
+	// of a Kubernetes user (internal/kubeapi, C17).
+	SurfaceKubernetes = "kubernetes"
 )
 
 // RefSSH is the ref of an SSH session-open record.
@@ -162,6 +165,17 @@ func CallStateFromContext(ctx context.Context) *CallState {
 func MarkForwarded(ctx context.Context) {
 	if st := CallStateFromContext(ctx); st != nil {
 		st.forwarded.Store(true)
+	}
+}
+
+// ClearForwarded undoes MarkForwarded for a forward the peer turned down
+// without running it: a forward routed from the owner cache that the target
+// answered "not here" (cluster.HeaderNotOwner). The edge routes the call
+// again, and whichever node answers it then writes the record, the edge
+// included.
+func ClearForwarded(ctx context.Context) {
+	if st := CallStateFromContext(ctx); st != nil {
+		st.forwarded.Store(false)
 	}
 }
 

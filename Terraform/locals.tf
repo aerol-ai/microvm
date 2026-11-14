@@ -93,6 +93,9 @@ locals {
       )
       # bool defaults need explicit null handling — coalesce treats `false` as
       # a real value, but optional() without a default returns null.
+      # ingress_proxy_routing may stay null on purpose (its default is null):
+      # null renders no routing flag, so the node follows install.sh's own
+      # default (templates/bootstrap.sh.tftpl). coalesce would error there.
       with_firecracker      = n.with_firecracker == null ? var.default_with_firecracker : n.with_firecracker
       with_gvisor           = n.with_gvisor == null ? var.default_with_gvisor : n.with_gvisor
       with_isolate          = n.with_isolate == null ? var.default_with_isolate : n.with_isolate
@@ -104,6 +107,7 @@ locals {
       sandboxd_env          = n.sandboxd_env
       tags                  = n.tags
       spot                  = n.spot
+      blank                 = n.blank
     }
   }
 
@@ -303,12 +307,32 @@ locals {
   # docker in cluster.yml to keep a legacy dockerd host). Ansible
   # configure-ops.yml installs CNI plugins for containerd; Terraform only writes
   # the env (bootstrap assumes CNI already on the AMI / day-2 Ansible).
+  # The bootstrap template renders its mirror fallback only for a non-empty
+  # value, so null renders exactly what it did before (variables.tf).
+  download_mirror = var.download_mirror == null ? "" : trimsuffix(var.download_mirror, "/")
+
   container_engine = try(local.cluster_ops.container_engine, "containerd")
   containerd_cfg = {
     socket                    = try(local.cluster_ops.containerd.socket, "/run/containerd/containerd.sock")
     namespace                 = try(local.cluster_ops.containerd.namespace, "aerolvm")
     cni_plugin_dir            = try(local.cluster_ops.containerd.cni_plugin_dir, "/opt/cni/bin")
     native_netns_pool_enabled = try(local.cluster_ops.containerd.native_netns_pool_enabled, true) ? "true" : "false"
+  }
+
+  # containerd warm container pool (park + adopt), from cluster.yml's
+  # containerd.pool block. Mirrors docker_pool_cfg, including the try()
+  # fallbacks equal to config.go's defaults, so an older cluster.yml with no
+  # containerd.pool block renders the pool off rather than failing the plan.
+  # bootstrap.sh.tftpl writes these lines only when enabled is "true": off
+  # must leave the rendered user_data unchanged, or the next apply replaces
+  # every node (user_data_replace_on_change). Ansible applies the same rule.
+  containerd_pool_cfg = {
+    enabled         = try(local.cluster_ops.containerd.pool.enabled, false) ? "true" : "false"
+    depth           = tostring(try(local.cluster_ops.containerd.pool.depth, 2))
+    images          = join(",", try(local.cluster_ops.containerd.pool.images, []))
+    max_images      = tostring(try(local.cluster_ops.containerd.pool.max_images, 8))
+    idle_ttl        = try(local.cluster_ops.containerd.pool.idle_ttl, "15m")
+    refill_interval = try(local.cluster_ops.containerd.pool.refill_interval, "5s")
   }
 
   # Homogeneous per-arch clusters (D5): one GOARCH for snapshot tagging and

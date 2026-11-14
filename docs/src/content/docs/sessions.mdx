@@ -316,7 +316,7 @@ Recordings are stored inside the sandbox. They are deleted with the sandbox, and
 - **Replayed output arrives through `onStdout`,** even the parts that were error output.
 - **A slow reader can miss live output.** The session does not wait for attached clients. The session log still holds the most recent 1 MB.
 - **The `default` session is shared.** [`aerolvm shell`](/cli/) and an [SSH login](/ssh-access/) both open the session named `default`, or start it if it is not running.
-- **Sessions are for container and virtual machine sandboxes:** Docker, gVisor and Firecracker. V8 isolate sandboxes have no shell, so they have no sessions.
+- **Sessions are for container and virtual machine sandboxes:** Docker, gVisor and Firecracker. WebAssembly and V8 isolate sandboxes have no shell, so they have no sessions. On a WebAssembly sandbox, every session call fails with HTTP 501.
 
 ## Next steps
 

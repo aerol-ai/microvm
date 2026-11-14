@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 if TYPE_CHECKING:
     from .image import Image
@@ -80,6 +81,11 @@ class PlatformVolumeMount(TypedDict, total=False):
     name: str
     path: str
     readOnly: bool
+    # Delete the volume (its files and its record) once the last sandbox
+    # using it is deleted. Set when the volume is first made; a later
+    # sandbox naming the same volume must pass the same value, or the create
+    # fails with 409. Also accepted as delete_with_sandbox.
+    deleteWithSandbox: bool
 
 
 class MountSpecRedacted(TypedDict, total=False):
@@ -102,6 +108,20 @@ class Lifecycle(TypedDict, total=False):
     # stopIfIdleFor must also be set explicitly — the server rejects
     # serverless=True without an idle window.
     serverless: bool
+    # restartOnFailure=True starts the sandbox again when it crashes or runs
+    # out of memory, waiting 5 s, then 10 s, 20 s and so on up to 5 minutes;
+    # the wait goes back to 5 s after 10 minutes of running. Docker, gVisor
+    # and containerd sandboxes only (others answer 400).
+    restartOnFailure: bool
+    # Delete the sandbox this long (integer nanoseconds) after its main
+    # program ends; checked about once a minute. Not for WebAssembly or
+    # V8-isolate sandboxes (400).
+    destroyAfterExitFor: int
+    # Delete the sandbox at this clock time: a timezone-aware datetime, or an
+    # RFC 3339 string such as "2026-11-06T18:00:00Z" (a naive datetime is
+    # taken as UTC). The server turns it into destroyAtAge, which is what
+    # the sandbox shows; a past time is refused with a 400.
+    destroyAt: Union[str, datetime.datetime]
 
 
 UpdateLifecycleOptions = Lifecycle
@@ -114,6 +134,19 @@ class Failover(TypedDict, total=False):
     # "none" (default) returns 410 Gone after owner-node death. "recreate"
     # opts into best-effort cluster recreation from the replicated create spec.
     policy: FailoverPolicy
+
+
+class PlacementRule(TypedDict, total=False):
+    """Where a sandbox may run in a cluster.
+
+    Every field you set must match the node's labels exactly. If no node
+    matches, create fails with 409 ``placement_unsatisfiable``; it never
+    falls back to another node.
+    """
+    # Run only on nodes in this zone (the node's SB_NODE_ZONE).
+    zone: str
+    # Run only on nodes that have all of these labels (SB_NODE_LABELS).
+    labels: Dict[str, str]
 
 
 GPUVendor = Literal["nvidia", "amd", "apple"]
@@ -211,6 +244,9 @@ class CreateOptions(TypedDict, total=False):
     platformVolumes: List[PlatformVolumeMount]
     lifecycle: Lifecycle
     failover: Failover
+    # Limit which nodes may run the sandbox, by zone and node labels. Kept on
+    # failover. No matching node gives a 409 placement_unsatisfiable error.
+    placement: PlacementRule
     # Container runtime to use for this sandbox. Omit to inherit the host
     # default (SB_CONTAINER_RUNTIME). Use "gvisor" for runsc-backed isolation
     # when running untrusted workloads. "kata" is reserved and rejected by the
@@ -237,6 +273,78 @@ class CreateOptions(TypedDict, total=False):
     # Requires runtime="firecracker" and image; the template must be ready.
     # template_id is accepted too.
     templateId: str
+    # A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+    # The role tag must be on your team's allow list (put_identity_role).
+    identity: "IdentityOptions"
+    # Client-side only, never sent: the returned Sandbox deletes itself when
+    # a with block around it ends (Sandbox.close). Off by default, so leaving
+    # a block keeps the sandbox. destroyOnExit is accepted too.
+    destroy_on_exit: bool
+
+
+class IdentityOptions(TypedDict, total=False):
+    """A cloud identity for a sandbox. The server signs a one-hour token whose
+    subject is your team and ``roleTag``, writes it to
+    ``/run/aerolvm/identity/token`` inside the sandbox and refreshes it."""
+
+    roleTag: str
+    # The token's ``aud``; default "sts.amazonaws.com".
+    audience: str
+    # Also set AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE for the AWS SDKs.
+    awsRoleArn: str
+    # Set both to give the Azure SDKs AZURE_CLIENT_ID, AZURE_TENANT_ID and
+    # AZURE_FEDERATED_TOKEN_FILE.
+    azureClientId: str
+    azureTenantId: str
+
+
+class SandboxIdentity(TypedDict, total=False):
+    """A sandbox's cloud identity as ``get`` shows it. Never the token."""
+
+    roleTag: str
+    audience: str
+    # The token's ``sub``: what your cloud's trust policy matches.
+    subject: str
+    awsRoleArn: str
+    azureClientId: str
+    azureTenantId: str
+    tokenFile: str
+    # When the token now in the sandbox expires; absent until the first one.
+    tokenExpiresAt: str
+    lastError: str
+
+
+class IdentityRole(TypedDict, total=False):
+    """One role tag on a team's identity allow list."""
+
+    tag: str
+    # The least caller role that may create a sandbox with this tag:
+    # "runner" or "admin".
+    minRole: str
+    team: str
+    createdAt: str
+    updatedAt: str
+
+
+class IdentityRoleOptions(TypedDict, total=False):
+    """The body of ``put_identity_role``."""
+
+    minRole: str
+    # The team whose list to change; omit for sandboxes the operator token
+    # creates.
+    team: str
+
+
+class ListIdentityRolesOptions(TypedDict, total=False):
+    team: str
+    cursor: str
+    limit: int
+
+
+class IdentityRoleList(TypedDict, total=False):
+    roles: List[IdentityRole]
+    # Pass back as ``cursor`` for the next page; absent on the last one.
+    nextCursor: str
 
 
 class ResizeOptions(TypedDict, total=False):
@@ -258,9 +366,17 @@ class CreateSessionOptions(TypedDict, total=False):
 
 class ExecRequest(TypedDict, total=False):
     command: str
+    # Run a program with these arguments instead of a shell command: spaces,
+    # quotes, $ and ; reach it as written. Set command or argv, not both.
+    argv: List[str]
     workDir: str
     env: Dict[str, str]
     timeoutSeconds: int
+    # Keep only the first N bytes of stdout / stderr; the rest is dropped and
+    # the command is not slowed down. Sandboxes whose agent predates the caps
+    # raise MicroVMUnsupportedFeatureError instead of returning everything.
+    maxStdoutBytes: int
+    maxStderrBytes: int
 
 
 class ExecResult(TypedDict):
@@ -268,6 +384,51 @@ class ExecResult(TypedDict):
     stderr: str
     exitCode: int
     durationMS: int
+    # True when the command ran past its timeout and the sandbox killed its
+    # whole process group. Older sandbox agents never set it.
+    timedOut: bool
+    # True when the stream printed more than its cap (maxStdoutBytes /
+    # maxStderrBytes, or the server's own limit) and was cut.
+    stdoutTruncated: bool
+    stderrTruncated: bool
+    # The signal that ended the command, such as "SIGKILL"; "" when it
+    # exited on its own. exitCode is -1 then; a shell would say 128 + the
+    # signal's number (137 for SIGKILL).
+    signal: str
+
+
+class FileInfo(TypedDict, total=False):
+    """One file, folder or symlink in a sandbox."""
+
+    name: str
+    # The full path in the sandbox.
+    path: str
+    isDir: bool
+    # Bytes, 64-bit (no 2 GiB limit).
+    size: int
+    # Type and permission string, such as "-rw-r--r--".
+    mode: str
+    # Octal permission bits, such as "0644".
+    permissions: str
+    owner: str
+    group: str
+    # Last change time, RFC 3339 in UTC.
+    modTime: str
+    # Where a symlink points. Only on list_files entries: get_file_info
+    # follows a symlink and describes what it names.
+    symlinkTarget: str
+
+
+class FileList(TypedDict):
+    entries: List[FileInfo]
+    # True when the listing reached its limit and stopped; more exist.
+    truncated: bool
+
+
+class FileMatch(TypedDict):
+    file: str
+    line: int
+    content: str
 
 
 ChunkCallback = Callable[[bytes], None]
@@ -276,6 +437,8 @@ ErrorCallback = Callable[[str], None]
 
 class ExecStreamOptions(TypedDict, total=False):
     command: str
+    # Same as ExecRequest.argv. Set command or argv, not both.
+    argv: List[str]
     workdir: str
     env: Dict[str, str]
     tty: bool
@@ -289,6 +452,28 @@ class ExecStreamOptions(TypedDict, total=False):
 class ExecExitInfo(TypedDict, total=False):
     code: int
     signal: str
+
+
+@dataclass(frozen=True)
+class FileEvent:
+    """One change a file watch reports (:meth:`MicroVM.watch_files`).
+
+    ``type`` is ``create``, ``write``, ``remove``, ``rename`` or ``chmod``, or
+    ``overflow`` when events were lost: the kernel's queue filled up
+    (``reason`` ``kernel_queue``), too many changes came at once
+    (``event_buffer``), or a folder could not be watched (``watch_limit``,
+    ``path`` names it). After an overflow, list the folder again to catch up.
+    A rename shows as ``rename`` for the old name and ``create`` for the new
+    one. ``path`` is absolute inside the sandbox.
+    """
+
+    type: str
+    path: str = ""
+    is_dir: bool = False
+    reason: Optional[str] = None
+
+
+FileEventCallback = Callable[[FileEvent], None]
 
 
 SessionStatus = Literal["running", "exited", "killed", "failed"]
@@ -435,6 +620,9 @@ class SnapshotList(TypedDict, total=False):
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]
+# Who can open a port's URL: "public" (anyone) or "token" (only a visitor
+# with a sandbox token for that port; HTTP ports on a server with a domain).
+ExposeVisibility = Literal["public", "token"]
 
 
 @dataclass(frozen=True)
@@ -451,6 +639,26 @@ class ExposeResult:
     url: str
     host: Optional[str] = None
     host_port: Optional[int] = None
+    # "token" when the URL needs a sandbox token; None for a public port.
+    visibility: Optional[str] = None
+
+
+# Why a sandbox is in its current status. A stopped sandbox has one of the
+# first seven (plus "program_exited" when its init ended with code 0); a
+# started one may have "program_exited" (its main program ended and
+# lifecycle.destroyAfterExitFor is counting), "failover" or "restarted".
+StatusReason = Literal[
+    "user_stop",
+    "idle",
+    "max_age",
+    "out_of_memory",
+    "disk_limit",
+    "crashed",
+    "reconcile",
+    "program_exited",
+    "failover",
+    "restarted",
+]
 
 
 class SandboxData(TypedDict, total=False):
@@ -490,6 +698,11 @@ class SandboxData(TypedDict, total=False):
     updatedAt: str
     lastActiveAt: str
     lastError: str
+    # Why the sandbox is in its status; absent when a call simply created or
+    # started it. exitCode is set for out_of_memory, crashed, program_exited
+    # and restarted.
+    statusReason: StatusReason
+    exitCode: int
     containerCommand: List[str]
     lifecycle: Lifecycle
     failover: Failover
@@ -503,6 +716,8 @@ class SandboxData(TypedDict, total=False):
     tenant_id: str
     # GPU configuration this sandbox was created with. Absent means no GPU.
     gpus: GPUOptions
+    # The sandbox's cloud identity, when it was created with one.
+    identity: SandboxIdentity
 
 
 class NetworkUsage(TypedDict, total=False):
@@ -556,6 +771,9 @@ class AuditOptions(TypedDict, total=False):
     limit: int
     cursor: str
     incarnationID: str
+    # Only records by this caller: an id such as "system:lifecycle", or
+    # "system:*" for everything the server did on its own.
+    caller: str
 
 
 class NetworkPolicyCheckOptions(TypedDict, total=False):
@@ -584,6 +802,36 @@ class NetworkPolicyCheckResult(TypedDict, total=False):
 class EgressProfileRef(TypedDict):
     name: str
     generation: int
+
+
+class TeamQuotaOptions(TypedDict, total=False):
+    """A team quota's limits, the body of ``put_team_quota``. Leave a limit
+    out (or 0) for no limit on it. At least one must be set."""
+
+    # Most sandboxes the team may hold, running or stopped.
+    maxSandboxes: int
+    # Most CPU the team's sandboxes may ask for in total.
+    maxCPU: float
+    # Most memory, in MB, the team's sandboxes may ask for in total.
+    maxMemoryMB: int
+
+
+class TeamQuotaUsage(TypedDict):
+    """What a team holds now: every sandbox not deleted, at its asked size."""
+
+    sandboxes: int
+    cpu: float
+    memoryMB: int
+
+
+class TeamQuota(TeamQuotaOptions, total=False):
+    """A team's quota, and its usage when read back."""
+
+    team: str
+    generation: int
+    createdAt: str
+    updatedAt: str
+    usage: TeamQuotaUsage
 
 
 class EgressProfile(TypedDict, total=False):
@@ -615,6 +863,66 @@ class EgressProfileList(TypedDict, total=False):
     profiles: List[EgressProfile]
     # Pass back as ``cursor`` for the next page; absent on the last one.
     nextCursor: str
+
+
+class WarmPoolServerStatus(TypedDict, total=False):
+    nodeId: str
+    ready: int
+    target: int
+    # Ready sandboxes still on an older image.
+    outdated: int
+    # The server's last report is too old to trust; the numbers are its last ones.
+    stale: bool
+
+
+class WarmPoolStatus(TypedDict):
+    """Ready and target slots in total, and on each server that runs a warm pool."""
+
+    ready: int
+    target: int
+    # Ready sandboxes still on an older image (a replace_as_used change in progress).
+    outdated: int
+    servers: List[WarmPoolServerStatus]
+
+
+class WarmPool(TypedDict, total=False):
+    """A warm-pool entry: how many ready sandboxes every server with a warm
+    pool keeps for one image. The server's SB_DOCKER_POOL_* /
+    SB_CONTAINERD_POOL_* settings stay the default for every other image.
+    Admin only."""
+
+    # The image, exactly as creates name it (python:3.12, ghcr.io/acme/agent:1).
+    image: str
+    # Warm slots each server keeps for this image; 0 turns warming off for it.
+    depth: int
+    # With maxDepth, each server sets its own target from recent demand,
+    # never below minDepth and never above maxDepth.
+    minDepth: int
+    maxDepth: int
+    # What happens to warm sandboxes when the image changes:
+    # "replace_now" or "replace_as_used".
+    onImageChange: str
+    # Goes up by one on every change; the same put twice leaves it alone.
+    generation: int
+    createdAt: str
+    updatedAt: str
+    # How full the pools are. Set by get_warm_pool and list_warm_pools.
+    status: WarmPoolStatus
+
+
+class WarmPoolOptions(TypedDict, total=False):
+    """The body of ``put_warm_pool``: a full replace. Set ``depth`` for a
+    fixed size, or ``minDepth`` and ``maxDepth`` to follow demand, not both."""
+
+    # Warm slots each server keeps for this image (0 to 128).
+    depth: int
+    # The fewest warm slots a server keeps when demand is low (0 lets it reach zero).
+    minDepth: int
+    # The most warm slots a server keeps when demand is high (1 to 128).
+    maxDepth: int
+    # When the image changes: "replace_now" (the default) swaps every waiting
+    # sandbox at once; "replace_as_used" hands the old ones out first.
+    onImageChange: str
 
 
 class NetworkPolicyOptions(TypedDict, total=False):
@@ -761,6 +1069,15 @@ class MicroVMConfig(TypedDict, total=False):
     # request. Defaults to SB_TEAM; with neither, no header is sent.
     team: str
     retry: RetryConfig
+    # A PEM file of the certificate authorities to trust for https, used
+    # instead of the system's list (a company proxy that inspects TLS).
+    caFile: str
+    # A client certificate: one PEM file with the certificate and key, or a
+    # (cert_file, key_file) pair.
+    clientCert: Union[str, Tuple[str, str]]
+    # Extra headers for every request and WebSocket handshake. They cannot
+    # replace Authorization, X-AerolVM-Team, Content-Type or Idempotency-Key.
+    headers: Dict[str, str]
 
 
 class WhoAmIPrincipal(TypedDict, total=False):
@@ -823,6 +1140,35 @@ class CreateAPITokenOptions(TypedDict, total=False):
 
 class APITokenList(TypedDict):
     tokens: List[APIToken]
+
+
+class SandboxToken(TypedDict, total=False):
+    """The result of ``sandbox.create_token()``: a signed token for one
+    sandbox, to hand to a browser or an end user. The server keeps no copy,
+    so ``token`` is shown only here. It stops working when it expires, when
+    its sandbox is deleted, or when ``sandbox.revoke_tokens()`` is called."""
+
+    # The token (avmst_…). Send it as the bearer credential.
+    token: str
+    # Public id (stk_…): what audit records name. Safe to log.
+    tokenID: str
+    sandboxID: str
+    # Set for a public-port token; absent for a toolbox token.
+    port: int
+    pathPrefix: str
+    methods: List[str]
+    # RFC 3339 time the token stops working.
+    expiresAt: str
+
+
+class RevokeSandboxTokensResult(TypedDict):
+    """The result of ``sandbox.revoke_tokens()``: every token issued for the
+    sandbox before ``tokensNotBefore`` no longer works. A token made after
+    the call works."""
+
+    sandboxID: str
+    # RFC 3339 time. Tokens issued before it are refused.
+    tokensNotBefore: str
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's

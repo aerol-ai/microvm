@@ -1,0 +1,6 @@
+exit 0
+--- stdout
+token/tok_aaaaaaaaaaaa
+token/tok_bbbbbbbbbbbb
+token/tok_cccccccccccc
+--- stderr

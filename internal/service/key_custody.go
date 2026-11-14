@@ -127,7 +127,9 @@ func CustodyReport(cfg config.Config, facts CustodyFacts) []CustodyRow {
 		{Class: "egress-inspection CA key", Custody: server, InScope: true},
 		{Class: "node TLS key", Custody: plainOrNone(cfg.ClusterTLSDir != "", CustodyPlaintextFile)},
 		{Class: "gossip key", Custody: plainOrNone(cfg.ClusterGossipSecretKey != "", CustodyEnvVar)},
-		{Class: "PAT", Custody: plainOrNone(cfg.PATToken != "", CustodyEnvVar)},
+		// A node joined without the operator PAT holds only its hash, and
+		// its own SB_PAT_TOKEN is no PAT (config/pat_verifier.go).
+		{Class: "PAT", Custody: plainOrNone(cfg.PATToken != "" && !cfg.PATIsNodeLocal(), CustodyEnvVar)},
 		{Class: "audit-ingest token", Custody: plainOrNone(cfg.AuditIngestToken != "", CustodyEnvVar)},
 		{Class: "upstream wrap key", Custody: plainOrNone(cfg.UpstreamWrapKeyPath != "", CustodyPlaintextFile)},
 	}

@@ -113,3 +113,31 @@ func TestIndexRouteWriterTCPNoForwarder(t *testing.T) {
 		}
 	}
 }
+
+// Under proxy routing a fenced raw-TCP port has no kernel forward, so a new
+// connection is refused at once; the next UpsertTCPRoute puts the DNAT back.
+func TestIndexRouteWriterFencedTCPRoute(t *testing.T) {
+	fwd := &recordingTCPForwarder{}
+	w := newIndexRouteWriter(routedns.NewOwnerTable(), "d.test")
+	w.tcp = fwd
+	ctx := context.Background()
+	if err := w.UpsertTCPRoute(ctx, "sb", "10.0.0.9", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.UpsertFencedTCPRoute(ctx, "sb", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fwd.rules[40001]; ok {
+		t.Fatalf("fenced host port still forwarded: %+v", fwd.rules)
+	}
+	if err := w.UpsertTCPRoute(ctx, "sb", "10.0.0.9", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+	if tg, ok := fwd.rules[40001]; !ok || tg.Kind != hostport.DNAT {
+		t.Fatalf("after the swap back host port 40001 = %+v, want the DNAT", tg)
+	}
+	// No forwarder wired: a no-op, like the other TCP writes.
+	if err := newIndexRouteWriter(routedns.NewOwnerTable(), "d.test").UpsertFencedTCPRoute(ctx, "sb", 5432, 40001); err != nil {
+		t.Fatal(err)
+	}
+}

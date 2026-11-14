@@ -3,10 +3,21 @@ package isolate
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
+
+// hostRecordDirName holds the group hosts' records under the run dir. The
+// leading dot keeps it out of the group-key space: a key starts with a
+// letter or digit (SanitizeGroupKey), so no group's run dir is ever it.
+const hostRecordDirName = ".hosts"
+
+// hostsCgroupName is the cgroup, under the cgroup v2 root, an unjailed
+// workerd runs in. A jailed one has its group's cgroup under JailCgroupRoot.
+const hostsCgroupName = "aerolvm-isolate-hosts"
 
 // workerdSupervisor is the production HostSupervisor: it realizes a group's
 // JailSpec by starting a pkg/isolate.Host (the workerd process + controller +
@@ -17,6 +28,12 @@ type workerdSupervisor struct {
 	runDir         string
 	useJail        bool
 	egressPoolSize int
+	jailCgroupRoot string
+	jailChrootBase string
+	logger         *slog.Logger
+	// hostsCgroup is where an unjailed workerd starts, outside sandboxd's
+	// unit, so a restart does not stop it (pkg/hostproc).
+	hostsCgroup    *hostproc.Cgroup
 	egressObserver pkgisolate.EgressObserver
 	denialObserver pkgisolate.EgressDenialObserver
 	learnObserver  pkgisolate.LearnObserver
@@ -32,12 +49,44 @@ func (s *workerdSupervisor) SetLearnObserver(obs pkgisolate.LearnObserver) {
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
 func NewHostSupervisor(cfg Config) HostSupervisor {
+	return newWorkerdSupervisor(cfg, nil)
+}
+
+// NewHostSupervisorWithLogger is NewHostSupervisor with the daemon's logger,
+// which the hosts and the boot adoption log through.
+func NewHostSupervisorWithLogger(cfg Config, logger *slog.Logger) HostSupervisor {
+	return newWorkerdSupervisor(cfg, logger)
+}
+
+func newWorkerdSupervisor(cfg Config, logger *slog.Logger) *workerdSupervisor {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	hostsCgroup := hostproc.NewCgroup(logger, cfg.HostsCgroupRoot, hostsCgroupName, "V8-isolate group hosts")
+	if cfg.HostsCgroupRoot != "" && cfg.RunDir != "" {
+		// In a worker pod, not the agent container's log pipes: a host
+		// holding them would hold the container's stop (C14).
+		hostsCgroup.SetLogFile(filepath.Join(cfg.RunDir, "hosts.log"))
+	}
 	return &workerdSupervisor{
 		workerdPath:    cfg.WorkerdPath,
 		runDir:         cfg.RunDir,
 		useJail:        cfg.UseJail,
 		egressPoolSize: cfg.EgressPoolSize,
+		jailCgroupRoot: cfg.JailCgroupRoot,
+		jailChrootBase: cfg.JailChrootBase,
+		logger:         logger,
+		hostsCgroup:    hostsCgroup,
 	}
+}
+
+// recordDir is where running hosts keep their records ("" without a run
+// dir: no records, no adoption).
+func (s *workerdSupervisor) recordDir() string {
+	if s.runDir == "" {
+		return ""
+	}
+	return filepath.Join(s.runDir, hostRecordDirName)
 }
 
 // SetEgressObserver installs host-mediated egress attribution on every group
@@ -74,6 +123,9 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 		GroupKey:       spec.GroupKey,
 		RunDir:         runDir,
 		EgressPoolSize: s.egressPoolSize,
+		Logger:         s.logger,
+		RecordDir:      s.recordDir(),
+		Cgroup:         s.hostsCgroup,
 		// When UseJail is set, the host MUST realize this spec or fail closed.
 		Jail: pkgisolate.JailConfig{
 			Require:         s.useJail,
@@ -94,6 +146,15 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	if err != nil {
 		return nil, err
 	}
+	s.observe(host)
+	if err := host.Start(ctx); err != nil {
+		return nil, err
+	}
+	return &hostAdapter{Host: host}, nil
+}
+
+// observe installs the supervisor's observers on a host.
+func (s *workerdSupervisor) observe(host *pkgisolate.Host) {
 	if s.egressObserver != nil {
 		host.SetEgressObserver(s.egressObserver)
 	}
@@ -103,10 +164,43 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	if s.learnObserver != nil {
 		host.SetLearnObserver(s.learnObserver)
 	}
-	if err := host.Start(ctx); err != nil {
-		return nil, err
+}
+
+// Seams for the boot pass, replaced in tests.
+var (
+	adoptHosts     = pkgisolate.AdoptHosts
+	sweepLeftovers = pkgisolate.SweepLeftovers
+)
+
+// AdoptGroups takes over the group hosts a previous sandboxd left running
+// (their records), then removes every workerd and jail no record kept. Call
+// it once at boot, before any group is spawned.
+func (s *workerdSupervisor) AdoptGroups(ctx context.Context) []AdoptedGroup {
+	adopted := adoptHosts(ctx, pkgisolate.HostConfig{
+		WorkerdPath: s.workerdPath,
+		Logger:      s.logger,
+		RecordDir:   s.recordDir(),
+		Cgroup:      s.hostsCgroup,
+	})
+	out := make([]AdoptedGroup, 0, len(adopted))
+	keep := make(map[string]bool, len(adopted))
+	keepPIDs := make(map[int]bool, len(adopted))
+	for _, a := range adopted {
+		s.observe(a.Host)
+		keep[a.Host.GroupKey()] = true
+		if pid := a.Host.PID(); pid > 0 {
+			keepPIDs[pid] = true
+		}
+		out = append(out, AdoptedGroup{Key: a.Host.GroupKey(), Host: &hostAdapter{Host: a.Host}, Loaded: a.Loaded})
 	}
-	return &hostAdapter{Host: host}, nil
+	leftovers := pkgisolate.Leftovers{HostsCgroup: s.hostsCgroup, Keep: keep, KeepPIDs: keepPIDs}
+	if s.useJail {
+		leftovers.JailCgroupRoot, leftovers.JailChrootBase = s.jailCgroupRoot, s.jailChrootBase
+	}
+	if killed := sweepLeftovers(leftovers); killed > 0 {
+		s.logger.Info("isolate adopt: stopped group hosts no record kept", "processes", killed)
+	}
+	return out
 }
 
 // hostAdapter bridges pkg/isolate.Host onto the driver's GroupHost +

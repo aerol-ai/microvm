@@ -11,4 +11,6 @@ public class ExposedPort {
     @JsonProperty("public_url")
     public String publicUrl;
     public Instant createdAt;
+    /** {@code "token"} when the URL needs a sandbox token; {@code null} for a public port. */
+    public String visibility;
 }

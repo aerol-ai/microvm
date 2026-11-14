@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -48,7 +48,7 @@ func (s *Server) clusterControlHeaderGuard(next http.Handler) http.Handler {
 		}
 		if s.service == nil || !cluster.IsLivePeer(s.service.Cluster(), peerID) {
 			cluster.RecordMTLSUnknownPeer()
-			apihttp.WriteError(w, http.StatusForbidden, "cluster peer not in membership")
+			apihttp.WriteError(w, http.StatusForbidden, cluster.PeerNotInMembershipMessage)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -67,7 +67,9 @@ func hasClusterControlHeader(header http.Header) bool {
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		// The caller's W3C trace context is taken even with tracing off, so
+		// the toolbox calls this request makes carry it into toolboxd (A3).
+		ctx := observability.ExtractTraceContext(r.Context(), r.Header)
 		ctx, span := otel.Tracer("github.com/aerol-ai/microvm/pkg/api").Start(ctx, r.Method+" "+r.URL.Path,
 			oteltrace.WithSpanKind(oteltrace.SpanKindServer),
 			oteltrace.WithAttributes(

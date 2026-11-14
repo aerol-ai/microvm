@@ -21,6 +21,10 @@ const (
 	PrincipalToken PrincipalKind = "token"
 	// PrincipalOIDC is an identity provider's signed token (task T6).
 	PrincipalOIDC PrincipalKind = "oidc"
+	// PrincipalKubernetes is a Kubernetes user the agent-sandbox API
+	// authenticated (front-proxy certificate) and Kubernetes RBAC allowed
+	// (C17); its id is "kubernetes:<user>".
+	PrincipalKubernetes PrincipalKind = "kubernetes"
 	// PrincipalControlPlane is a caller the managed provider's Validator
 	// resolved.
 	PrincipalControlPlane PrincipalKind = "controlplane"
@@ -33,6 +37,10 @@ const (
 	// PrincipalSandboxKey is an SSH session authenticated by a sandbox's
 	// Ed25519 key (task T5).
 	PrincipalSandboxKey PrincipalKind = "sandbox_key"
+	// PrincipalSandboxToken is a signed per-sandbox token (pkg/sandboxtoken,
+	// A1): its id is the token's public id (stk_…), never the token. It
+	// holds sandbox.exec on one sandbox's toolbox and nothing else.
+	PrincipalSandboxToken PrincipalKind = "sandbox_token"
 )
 
 // Principal is who made the request. ID is stable and safe for audit records

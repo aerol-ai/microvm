@@ -1,0 +1,23 @@
+# The CNAB package manifest for the Azure Marketplace Kubernetes app offer
+# (Microsoft Learn: "Prepare Azure container technical assets for a
+# Kubernetes app"). build.sh copies the chart beside it and runs
+# `cpa verify`; the REPLACE_ values are the seller's (../README.md).
+applicationName: aerolvm
+publisher: REPLACE_WITH_PARTNER_CENTER_PUBLISHER_NAME
+description: Run code you do not trust in isolated sandboxes (gVisor) on your own AKS cluster.
+version: 0.7.3
+helmChart: ./aerolvm
+clusterArmTemplate: ./mainTemplate.json
+uiDefinition: ./createUiDefinition.json
+registryServer: REPLACE_WITH_YOUR_ACR.azurecr.io
+extensionRegistrationParameters:
+  # One AerolVM per cluster, in its own namespace.
+  defaultScope: cluster
+  namespace: aerolvm
+  # AKS only (an Arc-connected cluster would be a separate offer), every
+  # AKS distribution from 1.31.
+  supportedClusterTypes:
+    managedClusters:
+      - distribution: ["All"]
+        distributionSupported: true
+        unsupportedVersions: ["<1.31.0"]

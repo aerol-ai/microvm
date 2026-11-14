@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
@@ -28,6 +29,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/sandboxtoken"
 )
 
 // Authenticator recognises one credential kind. matched=false means "not
@@ -93,7 +95,7 @@ func WithCredentialAuthenticator(kind controlplane.PrincipalKind, a Authenticato
 // buildAuthChain orders the authenticators: pat, the named credentials, then
 // the managed provider, which is last because it claims every non-empty
 // bearer nothing before it recognised.
-func buildAuthChain(pat patAuthenticator, validator controlplane.Validator, credentials []authLink) []authLink {
+func buildAuthChain(pat patAuthenticator, sandboxTokens Authenticator, validator controlplane.Validator, credentials []authLink) []authLink {
 	providerKind := string(controlplane.PrincipalControlPlane)
 	if controlplane.IsNoopValidator(validator) {
 		// The open-source build has no provider: a refusal there means
@@ -103,8 +105,14 @@ func buildAuthChain(pat patAuthenticator, validator controlplane.Validator, cred
 	if validator == nil {
 		validator = controlplane.Noop().Validator
 	}
-	links := make([]authLink, 0, len(credentials)+2)
+	links := make([]authLink, 0, len(credentials)+3)
 	links = append(links, authLink{kind: string(controlplane.PrincipalOperator), auth: pat})
+	if sandboxTokens != nil {
+		// Identity on or off: a sandbox token is not a person's credential,
+		// and its avmst_ prefix is its own, so it changes nothing for any
+		// bearer that was accepted or refused before (L8).
+		links = append(links, authLink{kind: string(controlplane.PrincipalSandboxToken), auth: sandboxTokens})
+	}
 	links = append(links, credentials...)
 	return append(links, authLink{kind: providerKind, auth: providerAuthenticator{validator: validator}})
 }
@@ -115,12 +123,20 @@ func (s *Server) authLinks() []authLink {
 	if s.authChain != nil {
 		return s.authChain
 	}
-	return buildAuthChain(s.patAuth(), s.validator, nil)
+	return buildAuthChain(s.patAuth(), s.sandboxTokenAuth(), s.validator, nil)
+}
+
+// sandboxTokenAuth is the server's sandbox token authenticator: it checks a
+// token with the service's server key (no store read). A server with no
+// service still claims avmst_ bearers and refuses them.
+func (s *Server) sandboxTokenAuth() sandboxTokenAuthenticator {
+	return sandboxTokenAuthenticator{verify: s.service.VerifySandboxToken}
 }
 
 // patAuth is the server's PAT authenticator.
 func (s *Server) patAuth() patAuthenticator {
-	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
+	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, sha256: s.patSHA256, local: s.localToken,
+		hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
 }
 
 // patAuthenticator recognises the operator token (PAT).
@@ -129,6 +145,15 @@ type patAuthenticator struct {
 	// previous is SB_PAT_TOKEN_PREVIOUS: during a rolling rotation the old
 	// token keeps working on every node until it is removed (§5.11, H2).
 	previous string
+	// sha256 is SB_PAT_TOKEN_SHA256: the PAT's hashes on a node that was
+	// joined without it (config/pat_verifier.go). A bearer whose hash is
+	// listed is the PAT, with every rule below.
+	sha256 []string
+	// local is this node's own SB_PAT_TOKEN on such a node: not the PAT,
+	// and accepted only from a local tool (localCaller), never from a peer
+	// or through Caddy. It lets the node's own tools and its SSH gateway
+	// act as the operator on this node and nowhere else.
+	local string
 	// hostOnly is SB_PAT_SCOPE=host: the PAT is accepted only from a
 	// loopback TCP peer and from mTLS cluster peers (CEO review D4).
 	hostOnly bool
@@ -147,7 +172,38 @@ func (p patAuthenticator) matches(candidate string) bool {
 	}
 	current := p.token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.token)) == 1
 	previous := p.previous != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.previous)) == 1
-	return current || previous
+	hashed := len(p.sha256) > 0 && config.PATMatchesSHA256(candidate, p.sha256)
+	return current || previous || hashed
+}
+
+// matchesLocal reports whether candidate is this node's local token, in
+// constant time.
+func (p patAuthenticator) matchesLocal(candidate string) bool {
+	return candidate != "" && p.local != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.local)) == 1
+}
+
+// errLocalToken refuses this node's local token from anywhere but a local
+// tool. The 401 keeps the surface's own text: the caller learns nothing.
+var errLocalToken = errors.New("node-local token refused: not a local caller")
+
+// localCaller reports whether r comes from a tool on this host talking to
+// sandboxd directly: a loopback TCP peer, not the public socket, not a
+// cluster peer, not a forward, and without the headers Caddy adds to every
+// request it proxies (X-Forwarded-For and X-Forwarded-Host, and
+// X-AerolVM-Client-IP with the PROXY protocol). Under the default PAT scope
+// Caddy reaches sandboxd over loopback too, so loopback alone would let a
+// public request through; the token is the secret, this only keeps it on
+// the host.
+func localCaller(r *http.Request) bool {
+	if requestOrigin(r, false) != originHost || isForwarded(r) {
+		return false
+	}
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", headerClientIPKey} {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Authenticate splits the PAT into its two principals (§5.1). A cluster peer
@@ -164,6 +220,12 @@ func (p patAuthenticator) matches(candidate string) bool {
 // runs this release (the runbook's order). Under the default scope "any"
 // nothing here changes (L8).
 func (p patAuthenticator) Authenticate(r *http.Request, bearer string) (controlplane.Access, bool, error) {
+	if p.matchesLocal(bearer) {
+		if !localCaller(r) {
+			return controlplane.Access{}, true, errLocalToken
+		}
+		return controlplane.OperatorAccess(), true, nil
+	}
 	if !p.matches(bearer) {
 		return controlplane.Access{}, false, nil
 	}
@@ -209,7 +271,7 @@ func (p providerAuthenticator) Authenticate(r *http.Request, bearer string) (con
 // order. Each may refine the Access or refuse the request.
 type postMatchStep func(r *http.Request, a controlplane.Access) (controlplane.Access, error)
 
-var postMatchSteps = []postMatchStep{attributeForward, enforceSurface, selectTeam}
+var postMatchSteps = []postMatchStep{enforceSandboxTokenScope, attributeForward, enforceSurface, selectTeam}
 
 // authenticate decides who the request is from. It never reads an identity
 // header: the credential, the verified mTLS peer and the request path are the
@@ -231,6 +293,13 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 		return access, nil
 	}
 	if bearer == "" {
+		if access, ok := nodeCertAccess(r); ok {
+			access, err := runPostMatchSteps(r, access)
+			if err != nil {
+				return controlplane.Access{}, mapAuthFailure(string(controlplane.PrincipalNode), err)
+			}
+			return access, nil
+		}
 		return controlplane.Access{}, &authFailure{status: http.StatusUnauthorized, kind: authKindNone, reason: "missing"}
 	}
 	for _, link := range s.authLinks() {
@@ -272,6 +341,50 @@ func runPostMatchSteps(r *http.Request, access controlplane.Access) (controlplan
 		}
 	}
 	return access, nil
+}
+
+// nodeCertAccess is a cluster peer calling with its node cert and no bearer
+// (internal/cluster/peer_cert_auth.go): a node joined without the operator
+// PAT calls its peers this way. It is node:<peer>, the same principal a peer
+// sending the PAT over mTLS gets. The internal listener's mark says the
+// peer passed the live-member, deny and admitted-key checks; the verified
+// cert must name the same node. A forward counts only when the edge said it
+// speaks for the call itself (a local tool's request, cluster.HeaderCaller):
+// a forward that merely lost the user's credential stays a 401.
+func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
+	peer, ok := cluster.InternalPeerFromContext(r.Context())
+	if !ok {
+		return controlplane.Access{}, false
+	}
+	if cert, ok := mtlsPeer(r); !ok || cert != peer {
+		return controlplane.Access{}, false
+	}
+	if isForwarded(r) && r.Header.Get(cluster.HeaderCaller) != cluster.CallerNode {
+		return controlplane.Access{}, false
+	}
+	if onBehalf := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOf)); onBehalf != "" {
+		return onBehalfAccess(r, peer, onBehalf)
+	}
+	return controlplane.NodeAccess(peer), true
+}
+
+// onBehalfAccess is a forward the edge spoke for on behalf of a caller it
+// authenticated itself (cluster.HeaderOnBehalfOf: the agent-sandbox API's
+// Kubernetes user, C17). The call gets that caller's access, one owner with
+// the runner role, never the node's own: the stamp can only narrow what the
+// edge, a node, could already do. Anything malformed is a 401.
+func onBehalfAccess(r *http.Request, peer, onBehalf string) (controlplane.Access, bool) {
+	owner := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOwner))
+	name, isKube := strings.CutPrefix(onBehalf, "kubernetes:")
+	if !isForwarded(r) || owner == "" || !isKube || strings.TrimSpace(name) == "" {
+		return controlplane.Access{}, false
+	}
+	return controlplane.Access{
+		Identity:  controlplane.Identity{OwnerRef: owner, Role: controlplane.RoleRunner, Name: name},
+		Role:      controlplane.RoleRunner,
+		Principal: controlplane.Principal{Kind: controlplane.PrincipalKubernetes, ID: onBehalf, Name: name},
+		Via:       peer,
+	}, true
 }
 
 // isForwarded reports whether a peer reverse-proxied this request on a
@@ -496,7 +609,7 @@ const identityUnavailableRetryAfter = 30
 func mapAuthFailure(linkKind string, err error) *authFailure {
 	if ce, ok := controlplane.AsCredentialError(err); ok {
 		switch ce.Kind {
-		case controlplane.PrincipalToken, controlplane.PrincipalOIDC:
+		case controlplane.PrincipalToken, controlplane.PrincipalOIDC, controlplane.PrincipalSandboxToken:
 			if ce.Reason.Valid() {
 				return &authFailure{status: http.StatusUnauthorized, kind: string(ce.Kind), reason: string(ce.Reason), invalidToken: ce.Reason, hint: ce.Hint}
 			}
@@ -508,6 +621,12 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 	}
 	var notBound *teamNotBoundError
 	switch {
+	case errors.Is(err, sandboxtoken.ErrOutOfScope):
+		// A good token used for a request it does not cover. The text
+		// names the part (sandbox, port, path or method), never a value.
+		return &authFailure{status: http.StatusForbidden, kind: linkKind, reason: "out_of_scope", message: "this sandbox token does not cover this request: " + scopePart(err)}
+	case errors.Is(err, errSandboxTokenRoute):
+		return &authFailure{status: http.StatusForbidden, kind: linkKind, reason: "wrong_route", message: errSandboxTokenRoute.Error()}
 	case errors.Is(err, controlplane.ErrIdentityStale):
 		// The token mirror on this node cannot vouch for any token right
 		// now (§5.4): the credential may be fine, so 503, not 401.
@@ -523,6 +642,8 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_scope", message: patScopeMessage}
 	case errors.Is(err, errPATOrigin):
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_origin", message: patScopeMessage}
+	case errors.Is(err, errLocalToken):
+		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "local_only"}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
@@ -619,7 +740,8 @@ func (s *Server) isPATToken(candidate string) bool {
 // plus three error writers (H5).
 func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		access, failure := s.authenticate(r, surface.credential(s, r))
+		credential := surface.credential(s, r)
+		access, failure := s.authenticate(r, credential)
 		s.observeAuth(r, access, failure)
 		if failure != nil {
 			challenge := ""
@@ -644,6 +766,12 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 			// the client's headers) a public PAT would pass as the host.
 			if _, inner, _ := remotemcp.Handoff(r.Context()); !inner {
 				ctx = cluster.ContextWithPATOrigin(ctx, patOrigin(r, s.l4ProxyProtocol))
+				if s.patAuth().matchesLocal(credential) {
+					// No peer knows this node's local token: a forward of
+					// this request goes as this node instead
+					// (cluster.StampForward).
+					ctx = cluster.ContextWithLocalCaller(ctx)
+				}
 			}
 		}
 		next.ServeHTTP(w, r.WithContext(withCorrelationID(ctx, r)))

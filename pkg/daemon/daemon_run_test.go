@@ -132,6 +132,12 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	t.Setenv("SB_ENABLE_NETWORK_RULES", "false")
 	t.Setenv("SB_AUTO_RECONCILE", "false")
 	t.Setenv("SB_ENABLE_CADDY", "false")
+	// Pinned off. It defaults on in domain mode, and the cases that turn
+	// Caddy and a domain on for other reasons would then engage it: bind
+	// the route responder (127.0.0.1:53053) and the :21215 redirect
+	// listener on the test host, and on a host with iptables try to write
+	// rules. Cases about routing set it themselves.
+	t.Setenv("SB_INGRESS_PROXY_ROUTING", "false")
 	t.Setenv("SB_ENABLE_EVENT_MONITOR", "false")
 	t.Setenv("SB_ENABLE_SERVERLESS", "false")
 	t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "false")
@@ -163,6 +169,29 @@ func runWithAutoCancel(t *testing.T, delay time.Duration, makeProvider ProviderF
 	t.Cleanup(func() { stop.Stop() })
 
 	return Run(ctx, testLogger(), makeProvider)
+}
+
+// bootFailureSafetyNet stops a runUntilBootFails Run that booted when it
+// should have failed. Nothing waits for it on the normal path: a failing
+// boot step returns at once.
+const bootFailureSafetyNet = 30 * time.Second
+
+// runUntilBootFails runs Run for a test that expects a boot step to fail, and
+// returns that error. It does not stop Run on a short timer the way
+// runWithAutoCancel does. A stop that lands mid-boot turns the failing step's
+// error into a clean exit (bootStopped, by design), so on a loaded CI runner
+// whose boot was slower than the timer the expected error came back as nil.
+func runUntilBootFails(t *testing.T, makeProvider ProviderFactory) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	safety := time.AfterFunc(bootFailureSafetyNet, cancel)
+	defer safety.Stop()
+	err := Run(ctx, testLogger(), makeProvider)
+	if ctx.Err() != nil {
+		t.Fatalf("Run still running after %s: no boot step failed (Run = %v)", bootFailureSafetyNet, err)
+	}
+	return err
 }
 
 func TestRun_GracefulShutdownWithProviderAndSSH(t *testing.T) {

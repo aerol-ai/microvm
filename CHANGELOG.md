@@ -2,7 +2,7 @@
 
 Every AerolVM release, newest first: its highlights, and anything to check before you upgrade. The full notes, the merged pull requests and the downloads are on [GitHub Releases](https://github.com/aerol-ai/microvm/releases).
 
-Security fixes land on the newest release line only, which is **0.6** today. See [SUPPORT.md](SUPPORT.md). This project follows [Semantic Versioning](https://semver.org).
+Security fixes land on the newest release line only, which is **0.7** today. See [SUPPORT.md](SUPPORT.md). This project follows [Semantic Versioning](https://semver.org).
 
 <!-- Generated from the GitHub release notes by `npm run releases:sync` in docs/. Edit the release notes on GitHub, then run it again. The docs Changelog page is built from the same notes. -->
 
@@ -14,19 +14,157 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 3 releases : v0.6.9 to v0.6.11
+    November 2026 : 9 releases : v0.6.9 to v0.7.3
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 12 | Sep 28, 2026 to Nov 4, 2026 | [v0.6.11](#v0611-firecracker-from-installsh-snapshots-and-vms-that-survive-a-restart) |
+| [0.7](#07-release-line) | 4 | Nov 10, 2026 to Nov 12, 2026 | [v0.7.3](#v073-kubernetes-upgrades-work-and-every-worker-takes-gvisor-sandboxes) |
+| [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
 | [0.2](#02-release-line) | 4 | May 19, 2026 to May 24, 2026 | [v0.2.4](#v024-serverless-wake-on-http-and-snapshot-push) |
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
+## 0.7 release line
+
+### v0.7.3: Kubernetes upgrades work, and every worker takes gVisor sandboxes
+
+*November 12, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.3)
+
+This release fixes upgrades on Kubernetes, and a bug that could make one worker refuse every gVisor sandbox. In v0.7.2, the operator could not start any upgrade: changing the version did nothing but log a refusal. Now it upgrades the cluster node by node, as v0.7.2 promised.
+
+- **Kubernetes upgrades work.** Change `cluster.version` (or `spec.version` on the `AerolCluster`) and the operator upgrades the servers one at a time, then the gateways, then the workers in batches, swapping each node's AerolVM server in place. Sandboxes keep running. In v0.7.2 the leader refused every such upgrade with "files has no sandboxd for linux/<arch>", because it asked for release files that an image upgrade does not use.
+- **A refused upgrade says so.** When an upgrade cannot start, the `AerolCluster` gets a Warning event, `UpgradeNotStarted`, with the reason. Before, `kubectl describe` showed only "upgrading" while nothing moved.
+- **No more workers that refuse every gVisor sandbox.** Depending on timing when a worker started, every gVisor create on it could fail with "sandbox came up at <address>, not at its prepaid address", until the worker restarted. This hit Kubernetes worker pods. The cause was a thread of the AerolVM server left inside one sandbox's network; it now always goes back, and the address check no longer trusts the wrong source.
+- **No FailedMount warnings on gateway and worker pods.** Their join token volume is optional now, as a server's already was. A pod that has joined never needs the token again, and one that kubelet sets up again, for example after a machine restart, no longer needs the deleted token to start.
+- **A failover keeps the sandbox's create time.** A sandbox recreated on a new node after its node died keeps its first `created_at`.
+- **Keep-alives cost the cluster far less.** E2B clients that extend a failover sandbox's timeout every few seconds used to cost one cluster write per call. Now it is about one per minute per sandbox. After a failover, the sandbox stops at most a minute before the time the last keep-alive asked for, never later.
+- **A Pending node says why.** An `AerolNode` that waits for a machine shows the Kubernetes scheduler's reason, such as "Insufficient cpu".
+
+**Before you upgrade:**
+
+- **From v0.7.2 on Kubernetes in cluster mode,** the v0.7.2 servers still refuse the operator's upgrade, so move the three servers first:
+  1. `helm upgrade` to the v0.7.3 chart as usual. The `AerolCluster` then shows the `UpgradeNotStarted` warning.
+  2. Find the Raft leader with `aerolvm cluster-info`.
+  3. Move each server's `AerolNode` (`<cluster>-server-0`, `-1` and `-2`), the leader last, and wait until each one shows v0.7.3 in `kubectl get aerolnodes` before the next. For a cluster named `aerolvm` in `aerolvm-system`: `kubectl -n aerolvm-system annotate aerolnode aerolvm-server-1 aerolvm.io/agent-version=v0.7.3`.
+  4. Once the leader runs v0.7.3, the operator upgrades the gateways and workers by itself.
+
+  Tested on kind from the published v0.7.2: every node reached the new version and every running sandbox kept its session.
+- **System machines need 4 CPUs.** On Kubernetes, give each zone a machine with 4 or more CPUs for a server, a gateway and an operator replica. With 2 CPUs a server can stay Pending.
+- **Plain VM clusters and single nodes:** nothing to do.
+
+### v0.7.2: AerolVM clusters on Kubernetes
+
+*November 12, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.2)
+
+AerolVM can now run as a full cluster on Kubernetes: three servers across three zones, gateways, and worker pools that grow and shrink, all managed by the new AerolVM operator. This release also makes failover smarter on every cluster.
+
+- **Cluster mode on Kubernetes.** `helm install` with `mode: cluster` starts the AerolVM operator. It makes the servers, gateways and workers from an `AerolCluster`, replaces a worker whose machine is gone, and upgrades the cluster node by node when you change `spec.version`, with pause and rollback. See "Kubernetes cluster mode" in the docs.
+- **A planned restart is not a death.** A node that stops cleanly (a service restart, an upgrade, a pod restart) tells the cluster first. The cluster waits up to two minutes for it before moving its sandboxes, and a leading server hands the lead over before it stops. A crash still gets the usual 30 seconds.
+- **Zones.** New sandboxes spread across zones by free room, failover avoids the zone that just failed, and secret backups go to other zones than the owner's.
+- **Faster failover for a machine that is gone.** When the operator sees a worker's machine leave, the leader can start that worker's failover at its ownership lease limit (about 16 seconds) instead of after the grace, when it can prove the worker's sandboxes are frozen by then.
+- **Decommission a worker safely.** `aerolvm drain --evacuate` moves recreate-policy sandboxes off a worker before it goes, and tells the owners of the others.
+- **Per-team usage.** Each worker exports CPU and memory counters per owner (used and reserved) on `/v1/metrics`, with a dashboard for splitting the cost.
+- **Sandboxes stay off the cluster network.** On Kubernetes the operator keeps sandboxes away from the API server and the cluster's pod and Service ranges, and NetworkPolicies wall in the workers, servers, gateways and operator.
+- **Proof for audits.** `aerolvm k8s verify` checks every promise of a running install (privilege, Pod Security, network walls, the IMDS hop limit, egress, signatures), and the chart ships an evidence pack, alerts, runbooks and dashboards.
+- **Day-2 tools in a pod.** `sandboxd backup`, `restore` and `recover-quorum` work in a Kubernetes server pod held in maintenance mode.
+
+**Before you upgrade:**
+
+- **Plain VM clusters:** a planned stop of a node now waits up to two minutes (`SB_CLUSTER_RESTART_WINDOW`) before its sandboxes fail over. A crash is unchanged.
+- **Zone rules are on by default.** A cluster whose nodes have no zone, or all the same one, places sandboxes as before.
+- **Upgrade servers first.** Operator-driven upgrade steps and the new rollout record need every Raft server on this version; until then an operator-driven node is upgraded by hand, as before.
+- **Not built yet:** node certificates from your own CA through cert-manager (`security.externalCA` is refused with a reason).
+
+### v0.7.1: AerolVM on Kubernetes
+
+*November 11, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.1)
+
+Run AerolVM on Kubernetes. A Helm chart installs one worker pod that holds the server and every sandbox, with signed images, HTTPS sandbox links through cert-manager, and a command that checks the install against its security rules.
+
+> **New sandbox IDs carry a cell number.** IDs made by v0.7.1 start with the node's cell (`SB_CELL_ID`, default 1). Old IDs keep working. Read "Upgrade notes" at the end.
+
+- **A Helm chart for Kubernetes.** `charts/aerolvm` installs AerolVM in `single` mode: one worker pod with a `runtime` container (containerd and every sandbox), an `agent` container (the server) and an `egress` container (the hostname filter). A chart upgrade never restarts the pod, and changing the agent's image restarts only the agent: sandboxes keep running. `make k8s-dev` runs it on kind from a checkout. (#1157)
+- **Signed images.** The release now publishes `aerolvm`, `aerolvm-runtime` and `aerolvm-edge` to ghcr.io for amd64 and arm64, signed with cosign by the release workflow, with an SBOM and build provenance. `RELEASE-VERIFICATION.md` shows how to check them. (#1156)
+- **`aerolvm k8s verify` checks an install.** It checks that the images are signed, that no pod mounts a folder from the node or holds a Kubernetes API credential or a DNS provider token, and that a runc and a gVisor sandbox cannot reach the worker pod's ports or the Kubernetes API. It exits 1 if any check fails. (#1158, #1161)
+- **HTTPS sandbox links on Kubernetes.** With `edge.enabled`, an edge container serves the API and every sandbox port over HTTPS, with a certificate from cert-manager. A renewed certificate is used without a restart. (#1159, #1161)
+- **Sandboxes stay inside the pod's limits.** The runtime container caps the sandboxes' memory below the pod's limit, keeps a reserve for the server, and makes each sandbox the kernel's whole choice when memory runs out: one sandbox stops, the server and other sandboxes keep running. Tested with 1,000 gVisor sandboxes on one machine. (#1146, #1154)
+- **`GET /ready`.** It answers 503 while a cluster node is cut off from the control plane, so a load balancer or Kubernetes stops sending it traffic. `/health` is unchanged. (#1148)
+- **Disk limits on the containerd engine.** New sandboxes are refused when the sandbox disk is nearly full (`SB_DISK_FLOOR_RATIO`), and `diskGB` can be enforced as an XFS project quota per sandbox (`SB_CONTAINERD_DISK_QUOTA`). (#1150, #1151)
+
+**Before you upgrade:**
+
+- **Sandbox IDs.** New IDs start with the cell number in their first two hex digits (`SB_CELL_ID`, 1 to 255, default 1). Code that parses IDs only as opaque strings is unaffected. Every node of one cluster must use the same cell.
+- **Nothing changes until you turn it on.** Every new setting above is off by default except `/ready`, which is a new route.
+
+### v0.7.0: Run clusters like Kubernetes: one-line joins, kubectl-style commands and rolling upgrades
+
+*November 10, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.0)
+
+Run an AerolVM cluster the way you run Kubernetes. Start it with one command. Add each machine with one pasted line. Manage and upgrade it from your computer with `aerolvm`.
+
+> **Upgrading a cluster from v0.6.x?** The first upgrade into v0.7.0 uses the installer, one node at a time. Read "Upgrade notes" at the end first.
+
+- **Start a cluster with one command, and add a machine with one line.** `sandboxd init` on the first machine starts the cluster. `aerolvm join-command` prints one line. Paste it on a new machine, and it joins as a worker, server, ingress or mixed node. Each line holds a join token that works for one machine and lasts 2 hours by default. Your Cloudflare token is never in the line. (#1059, #1064, #1100, #1104)
+- **Manage the cluster with kubectl-style commands.** `aerolvm get nodes`, `describe node`, `top nodes`, `cordon`, `uncordon`, `drain` and `delete node`. `get` and `describe` work for sandboxes, snapshots and tokens too, with `-o json` or `-o yaml`, and `-l` filters by label. Saved contexts let one `aerolvm` talk to several clusters. (#1056, #1065)
+- **Upgrade the whole cluster with `aerolvm upgrade`.** `plan` shows what will happen. `apply` upgrades one node at a time: server nodes first, then ingress nodes, then workers. If a node's new version does not come up healthy, the node goes back to its old version by itself. The upgrade then stops. You can pause, stop and roll back. `--hold` keeps the choice to roll back until you run `finalize`. `aerolvm release pull` makes one file for sites with no internet. (#1058, #1062, #1063)
+- **WebAssembly and V8 isolate sandboxes now survive a `sandboxd` restart and an upgrade.** Containers and Firecracker VMs already did. (#1071)
+- **Custom domains get HTTPS certificates again.** On Caddy 2.10 and later, a custom domain got no certificate. Caddy refused the setting with "on-demand TLS cannot be enabled without a permission module". Fixed. (#1107, #1109)
+- **Fewer known vulnerabilities in what runs on your nodes.** On containerd-engine nodes, BuildKit moves from v0.17.2 to v0.34.2 and the CNI plugins from v1.5.1 to v1.9.1. govulncheck counted 92 known vulnerabilities in the old buildkitd and finds 6 in the new one, which no BuildKit release fixes yet. Re-running the installer upgrades nodes that already have them. `sandboxd`, `toolboxd`, `aerolvm` and the release Caddy now scan clean: golang.org/x/crypto moves to the first commit without the unsafe `openpgp` package (GO-2026-5932). (#632, #1125)
+- **A cluster guide anyone can follow.** The docs have eleven short pages under "Cluster". They cover how a cluster works, building one (also on AWS), adding and removing nodes, upgrades, backups, security and fixing problems. A cheat sheet lists every command. (#1105)
+
+**Before you upgrade:**
+
+- **The first upgrade into v0.7.0 uses the installer.** Releases before v0.7.0 do not have `aerolvm upgrade`. On each node, one at a time, run `curl -fsSL https://aerolvm.aerol.ai | sudo bash`: server nodes first, then ingress nodes, then workers. Wait until `aerolvm get nodes` shows the node `Ready` before you go to the next one. The installer keeps the node's settings and admin token. After that, use `aerolvm upgrade`.
+- **Old and new server nodes can run side by side.** Upgrades, join tokens and node delete turn on only when every server node runs v0.7.0. Until then, those commands answer with an error that says so.
+- **WebAssembly and isolate sandboxes restart once** during this first upgrade. A WebAssembly sandbox keeps its files. An isolate starts fresh on its next request. To avoid that, drain the node first.
+- **Clusters built with `cluster-init.sh`:** to use join commands, run `sudo sandboxd adopt` once on the first server node. Then run it on every other server node. Worker and ingress nodes need nothing.
+- **Terraform clusters built from a checkout:** run `scripts/terraform.sh init` once (the folder moved to `Terraform/root`), then `scripts/terraform.sh plan`. The plan moves resources and replaces no node: on the old join path, every node's user data is exactly what v0.6.13 made. `root/` keeps `one_line_join = false`, because changing it replaces every node. If you move to the module by URL, set `one_line_join = false` there too. (#1125)
+- **BuildKit and the CNI plugins are upgraded when you re-run the installer** on a containerd-engine node. The installer restarts `buildkit.service`, so an image build running at that moment fails and must be started again. A `buildkitd` you installed somewhere else yourself is left alone. On the old Terraform join path, a node added after this release still starts with BuildKit v0.17.2 until the installer runs on it.
+- **The Ansible update playbooks are gone** (`update-sandboxd.yml`, `update-toolboxd.yml`). Use `aerolvm upgrade`.
+- **The owner cache is now on.** To turn it off, set `SB_CLUSTER_OWNER_CACHE=false`.
+- **Add the new alert** `SandboxdRaftPipelineStall` from `setup/prometheus/sandboxd-alerts.yml` to your Prometheus.
+
 ## 0.6 release line
+
+### v0.6.13: Cluster writes that never hang, creates right after a leader change, and a mirror fallback for Terraform nodes
+
+*November 9, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.13)
+
+- **Cluster API calls no longer hang when a server stops in the middle of a write.** When a leader's sandboxd stopped, restarted or was upgraded while writes were in flight, a write it had already committed could wait for an answer forever. Now it answers "not the leader, retry" within about 2 seconds, and SDKs retry it on the new leader. (#1091)
+- **Creates keep working right after a leader change.** A newly elected leader used to refuse creates with a retryable 503 ("worker has no fresh capacity heartbeat") for up to about 20 seconds, while its own view of the workers filled. Now it asks the worker for its capacity directly and decides. (#1092)
+- **Terraform-built nodes can fall back to the download mirror.** Set the new Terraform variable `download_mirror` and every file the node setup downloads (the install and cluster scripts, the CNI plugins, BuildKit and Firecracker) falls back to the public mirror when GitHub fails. The CNI plugins and BuildKit are checked against pinned SHA-256 values. Off by default. (#1093)
+
+**Before you upgrade:**
+
+- **No Raft state machine change.** Servers can be upgraded one at a time, and old and new servers can run side by side.
+- **`download_mirror` is off by default,** and leaving it unset changes nothing for an existing cluster: its node setup scripts render exactly as before. Setting it changes every node's `user_data`, so the next `terraform apply` replaces each node once. Plan it like any node replacement.
+- **Contributors with a test stack kept up with `--keep`:** the harness now turns `download_mirror` on, so that stack's nodes are replaced once on its next `run.sh` apply. Set `AEROL_DOWNLOAD_MIRROR=off` to avoid it.
+
+### v0.6.12: Safer cluster failover, sandbox lifecycle controls, and a download mirror
+
+*November 8, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.12)
+
+> **Upgrade every server in one window.** Some cluster fixes change how servers apply the Raft log. An old and a new server can disagree on rare edge cases while both run. See "Upgrade notes".
+
+- **Cluster mode is safer when nodes fail or get cut off.** A worker that loses touch with the servers pauses its sandboxes before the leader moves them, so a sandbox never runs twice. A sandbox deleted while its node was away does not come back. Every public address of a paused sandbox answers at once instead of hanging. (#1032, #1050)
+- **Sandboxes manage their own lifetime.** A sandbox can restart after a crash, delete itself when its program ends or at a set time, and says why it stopped. (#924)
+- **More Daytona and E2B SDK calls work.** Daytona terminals, folder watching on gVisor and Firecracker, file copy as tar, ranged downloads, and commands given as a list. (#924)
+- **New access controls.** Signed per-sandbox tokens you can hand to a browser, ports shared behind a token, a cloud identity for each sandbox, per-team quotas, and placement rules by zone and node label. (#924)
+- **Sandbox routing without per-sandbox Caddy writes is on by default** on nodes with Caddy and a domain (`SB_INGRESS_PROXY_ROUTING`). Public sandboxes and exposed ports no longer need a Caddy route each, so they no longer wait on a Caddy reload, and a reload no longer drops the first request. (#1046)
+- **Installs keep working when GitHub downloads fail.** `install.sh` tries GitHub, then a public mirror on S3, then the vendor's own site. (#1051, #1052)
+
+**Before you upgrade:**
+
+- **Upgrade every server in one window.** The new FSM rule for deleted sandboxes waits until every server runs it. Three other changes do not wait, so mixed servers can disagree on rare edge cases.
+- **`destroy_at` in a lifecycle update** is refused until every node runs this release.
+- **Routing default.** `SB_INGRESS_PROXY_ROUTING` is on by default where it applies. It is on for new installs with a domain. It is also on for nodes upgraded without re-running `install.sh` whose env file has no routing line (installs older than v0.6.0). Installs from v0.6.0 on keep the value their env file names. To stay on per-sandbox Caddy routes, set `SB_INGRESS_PROXY_ROUTING=false` or pass `install.sh --no-ingress-proxy-routing`.
+- **Terraform:** `default_ingress_proxy_routing` now defaults to `null`, which follows the installer (on for a domain install). `null` leaves user data unchanged, so no node is replaced. Setting it to `true` or `false` changes user data once, which replaces each node once. `false` passes `--no-ingress-proxy-routing`, which `install.sh` first knows in v0.6.12; an older `install.sh` stops on it ("Unknown argument"). So with `false`, use an install script from v0.6.12 or later (the default `install_script_url` follows the latest release).
+- **Downgrade:** going back to an older release restarts a sandbox that took a warm-pool container with env without its env.
+- **Containerd warm pool:** still off by default. Its settings are now in every cluster deploy file, off.
+- **SDK features** need SDK 0.8.2 or later.
 
 ### v0.6.11: Firecracker from install.sh, snapshots, and VMs that survive a restart
 

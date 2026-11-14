@@ -53,6 +53,9 @@ func TestClusterVolumeClientRoundTrip(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("VolumeAttachmentCount = %d, %v", count, err)
 	}
+	if held, err := c.VolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil || len(held) != 1 || held[0].VolumeID != "vol-1" {
+		t.Fatalf("VolumeAttachmentsForSandbox = %+v, %v", held, err)
+	}
 	if err := c.VolumeDelete(ctx, "t-a", "vol-1"); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("VolumeDelete attached = %v, want ErrVolumeInUse", err)
 	}

@@ -41,6 +41,7 @@ func TestLoadCases(t *testing.T) {
 			"SB_OTEL_METRICS_ENABLED",
 			"SB_OTEL_METRICS_ENDPOINT",
 			"SB_OTEL_METRICS_INTERVAL",
+			"SB_USAGE_METRICS_ENABLED",
 			"SB_OTEL_TRACES_ENABLED",
 			"SB_OTEL_TRACES_ENDPOINT",
 			"SB_OTEL_TRACES_SAMPLE_RATIO",
@@ -50,6 +51,8 @@ func TestLoadCases(t *testing.T) {
 			"OTEL_SERVICE_NAME",
 			"SB_CLUSTER_MAX_AUTO_VOTERS",
 			"SB_CLUSTER_CREATE_MAX_PENDING_PER_WORKER",
+			"SB_CLUSTER_RESERVE_APPLY_LIMIT",
+			"SB_CLUSTER_EXTERNAL_CA",
 			"SB_IMAGE_PULL_MAX_CONCURRENT",
 			"SB_IMAGE_PULL_FAILURE_BACKOFF",
 			"SB_DATA_PLANE_ADVERTISE_HOST",
@@ -128,11 +131,22 @@ func TestLoadCases(t *testing.T) {
 				if cfg.ClusterMaxAutoVoters != 5 {
 					t.Fatalf("expected default ClusterMaxAutoVoters=5, got %d", cfg.ClusterMaxAutoVoters)
 				}
+				if cfg.ClusterExternalCA {
+					t.Fatal("expected the external-CA mode off by default")
+				}
+				if cfg.ClusterReserveApplyLimit != 256 {
+					t.Fatalf("expected default ClusterReserveApplyLimit=256, got %d", cfg.ClusterReserveApplyLimit)
+				}
 				if cfg.ClusterCreateMaxPendingPerWorker != 32 {
 					t.Fatalf("expected default ClusterCreateMaxPendingPerWorker=32, got %d", cfg.ClusterCreateMaxPendingPerWorker)
 				}
 				if cfg.OTELMetricsEnabled || cfg.OTELMetricsEndpoint != "" || cfg.OTELMetricsInterval != 30*time.Second || cfg.OTELTracesEnabled || cfg.OTELTracesEndpoint != "" || cfg.OTELTracesSampleRatio != 0.05 || cfg.OTELServiceName != "sandboxd" {
 					t.Fatalf("unexpected otel defaults: %+v", cfg)
+				}
+				// The usage exporter is off unless an operator (or the
+				// Kubernetes chart) turns it on: owner names become labels.
+				if cfg.UsageMetricsEnabled {
+					t.Fatalf("expected UsageMetricsEnabled off by default, got %+v", cfg)
 				}
 				if cfg.ImagePullMaxConcurrent != 4 || cfg.ImagePullFailureBackoff != 30*time.Second {
 					t.Fatalf("unexpected image pull defaults: %+v", cfg)
@@ -598,9 +612,13 @@ func TestLoadCases(t *testing.T) {
 				t.Setenv("SB_IMAGE_PULL_MAX_CONCURRENT", "8")
 				t.Setenv("SB_IMAGE_PULL_FAILURE_BACKOFF", "2m")
 				t.Setenv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "ALWAYS")
+				t.Setenv("SB_USAGE_METRICS_ENABLED", "true")
 				cfg, err := Load()
 				if err != nil {
 					t.Fatalf("Load() error = %v", err)
+				}
+				if !cfg.UsageMetricsEnabled {
+					t.Fatalf("expected SB_USAGE_METRICS_ENABLED=true to turn the usage exporter on: %+v", cfg)
 				}
 				if cfg.APIHost != "127.0.0.1" || cfg.APIPort != 9001 || cfg.DBPath != "/tmp/test.db" {
 					t.Fatalf("unexpected override values: %+v", cfg)
@@ -1331,6 +1349,23 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 		if !cfg.ClusterShardAwareIngress {
 			t.Fatal("ClusterShardAwareIngress = false, want true")
+		}
+	})
+
+	// SB_CLUSTER_OWNER_CACHE is on unless turned off: every supported owner
+	// answers a stale cache-routed forward with 421 "not here".
+	t.Run("cluster_owner_cache_defaults_on_and_opts_out", func(t *testing.T) {
+		setClusterDefaults(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if !cfg.ClusterOwnerCache {
+			t.Fatal("ClusterOwnerCache = false by default")
+		}
+		t.Setenv("SB_CLUSTER_OWNER_CACHE", "false")
+		if cfg, err = Load(); err != nil || cfg.ClusterOwnerCache {
+			t.Fatalf("SB_CLUSTER_OWNER_CACHE=false: ClusterOwnerCache=%v err=%v", cfg.ClusterOwnerCache, err)
 		}
 	})
 

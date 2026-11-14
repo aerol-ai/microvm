@@ -104,6 +104,10 @@ func wireContainerdWarmPool(ctx context.Context, cfg config.Config, logger *slog
 
 	spawner := &cntr.PoolSpawner{Driver: driver}
 	pool.SetSpawner(spawner)
+	// Warm-pool entries replace slots whose image changed (W3). This is
+	// also what keeps an entry's old slots from being handed out: the
+	// containerd create path passes no image of its own to Acquire.
+	pool.SetImageResolver(containerdPoolImageResolver(driver))
 	refillCfg := dockerpool.RefillConfig{
 		RefillInterval: cfg.ContainerdPoolRefillInterval,
 		SpawnTimeout:   cfg.DockerRuntimeWaitTimeout,
@@ -117,6 +121,14 @@ func wireContainerdWarmPool(ctx context.Context, cfg config.Config, logger *slog
 		"max_images", cfg.ContainerdPoolMaxImages,
 		"refill_interval", cfg.ContainerdPoolRefillInterval)
 	return pool
+}
+
+// containerdPoolImageResolver answers the pool's image-change check from
+// containerd's image store (never a pull), in the form park records.
+func containerdPoolImageResolver(d *cntr.Driver) dockerpool.ImageResolver {
+	return func(ctx context.Context, key dockerpool.Key) (string, error) {
+		return d.PoolImageID(ctx, key.Image)
+	}
 }
 
 func drainContainerdWarmPool(pool *containerdpool.Pool, logger *slog.Logger) {

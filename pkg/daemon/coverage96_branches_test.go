@@ -88,7 +88,7 @@ func TestCov96RunAuditExportBackendOpenFails(t *testing.T) {
 	t.Setenv("SB_AUDIT_EXPORT_BACKEND", "file")
 	t.Setenv("SB_AUDIT_EXPORT_FILE_PATH", filepath.Join(blocker, "audit.ndjson"))
 
-	err := runWithAutoCancel(t, 500*time.Millisecond, nil)
+	err := runUntilBootFails(t, nil)
 	if err == nil || !strings.Contains(err.Error(), "configure audit export connector") {
 		t.Fatalf("Run = %v, want audit export connector failure", err)
 	}
@@ -106,7 +106,9 @@ func TestCov96RunDockerUnreachableIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	for _, want := range []string{"ready socket sweep failed", "initial reconcile failed"} {
+	// Reconcile itself no longer fails without Docker; it says it left the
+	// Docker-owned sandboxes for the next pass.
+	for _, want := range []string{"ready socket sweep failed", "docker listing failed"} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("log lacks %q", want)
 		}
@@ -140,7 +142,7 @@ func TestCov96RunCustomDomainsInstallsOnDemandTLS(t *testing.T) {
 		onDemand bool
 	)
 	caddyAdmin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && r.URL.Path == "/config/apps/tls/automation/on_demand" {
+		if r.Method == http.MethodPost && r.URL.Path == "/config/apps/tls/automation/on_demand" {
 			mu.Lock()
 			onDemand = true
 			mu.Unlock()
@@ -161,7 +163,7 @@ func TestCov96RunCustomDomainsInstallsOnDemandTLS(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !onDemand || !strings.Contains(logs, "caddy on-demand TLS policy installed") {
-		t.Fatalf("on-demand PUT seen=%v; log lacks install line", onDemand)
+		t.Fatalf("on-demand write seen=%v; log lacks install line", onDemand)
 	}
 }
 

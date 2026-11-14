@@ -38,12 +38,58 @@ func (s *Service) sandboxPublicURL(id string, allowPublicTraffic *bool) string {
 	return s.caddy.SandboxPublicURL(id)
 }
 
+// syncSandboxPublicRoute writes the sandbox's root route and its custom-domain
+// routes, or deletes them for a private sandbox. A custom domain that dials an
+// app port is a way into that port around its token gate, so when sandbox has
+// one, the domains written are the ones stored now, read under
+// customDomainRouteLocks (route_gate.go): reconcile or a start may hold a
+// copy with a domain that was removed before the port became gated. Domains
+// that all dial the toolbox (every create-time domain) skip the read and the
+// lock.
 func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || sandbox.ID == "" || s == nil || s.caddy == nil {
 		return nil
 	}
 	if !sandboxAllowsPublicTraffic(sandbox) {
 		return s.deleteSandboxPublicRoutes(ctx, sandbox)
+	}
+	if !hasPortCustomDomain(sandbox) {
+		return s.writeSandboxPublicRoute(ctx, sandbox)
+	}
+	unlock := s.customDomainRouteLocks.lock(sandbox.ID)
+	defer unlock()
+	return s.syncSandboxPublicRouteHeld(ctx, sandbox)
+}
+
+// syncSandboxPublicRouteHeld is syncSandboxPublicRoute for a caller that
+// holds customDomainRouteLocks for the sandbox (AddCustomDomain,
+// RemoveCustomDomain). It always writes the stored domains.
+func (s *Service) syncSandboxPublicRouteHeld(ctx context.Context, sandbox *models.Sandbox) error {
+	if sandbox == nil || sandbox.ID == "" || s == nil || s.caddy == nil {
+		return nil
+	}
+	if !sandboxAllowsPublicTraffic(sandbox) {
+		return s.deleteSandboxPublicRoutes(ctx, sandbox)
+	}
+	current, err := s.withCurrentCustomDomains(ctx, sandbox)
+	if err != nil {
+		return err
+	}
+	return s.writeSandboxPublicRoute(ctx, current)
+}
+
+// writeSandboxPublicRoute writes the root route and the custom-domain routes
+// in the shape the ownership fence asks for: while this node cannot confirm
+// it still owns the sandbox (it is paused), every one of those URLs answers
+// 503 instead of proxying to a process that will not answer. The fence is
+// read under rootRouteLocks, which the fence's own swap also takes (via
+// syncSandboxPublicRoute), so a reconcile or start that read the fence just
+// before it went up cannot land its live route after the 503.
+func (s *Service) writeSandboxPublicRoute(ctx context.Context, sandbox *models.Sandbox) error {
+	unlock := s.rootRouteLocks.lock(sandbox.ID)
+	defer unlock()
+	if s.OwnershipFenced(sandbox.ID) {
+		return s.publicRoutes().UpsertFencedSandboxRoute(ctx, sandbox.ID, sandboxCustomHostnamesList(sandbox))
 	}
 	return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
 }

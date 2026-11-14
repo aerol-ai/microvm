@@ -1,7 +1,13 @@
 # Install, grow and upgrade AerolVM like Kubernetes
 
-**Status:** PROPOSED (2026-11-07). CEO-reviewed 2026-11-07 in SELECTIVE
-EXPANSION mode (Part 5). Eng review pending. Nothing below is built.
+**Status:** BUILT. Phases 0 to 5 shipped in v0.7.0 as the kops 1 to 20
+stack (#1055 to #1071, #1100, #1104, #1105), merged to `main` in #1110 on
+2026-11-10. The two items the CEO review deferred are in `TODOS.md`:
+`aerolvm apply -f` (this plan's D12, CEO review D3) and external-CA mode
+on VMs (CEO review D4). Proposed and
+CEO-reviewed 2026-11-07 in SELECTIVE EXPANSION mode (Part 5); eng-reviewed
+2026-11-07. The rest of this file is the plan as reviewed, kept as the
+record.
 **Branch:** `plans/kubectl-style-ops`, cut from `main` at `e33b6e16`.
 **Related:**
 - `plans/kubernetes-v2-architecture.md` (PR #522). That plan runs AerolVM

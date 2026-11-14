@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm top: -o must be json or yaml, got "wide"
+run `aerolvm top --help` for usage

@@ -263,6 +263,8 @@ func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples [
 	if len(samples) == 0 {
 		return
 	}
+	deltas := make([]store.NetCounterDelta, 0, len(samples))
+	applied := make([]netstats.Sample, 0, len(samples)) // applied[i] produced deltas[i]
 	for _, sample := range samples {
 		// Activity floor for the idle sweep under bypass-on: record the
 		// SampledAt of any network activity before the zero-byte skip. Warm
@@ -274,45 +276,57 @@ func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples [
 		if sample.BytesIn == 0 && sample.BytesOut == 0 {
 			continue
 		}
-		if err := k.svc.store.UpdateSandboxNetCounters(ctx, sample.SandboxID, sample.BytesIn, sample.BytesOut); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
-			k.svc.logger.Warn("netstats: update counters failed",
-				"sandbox_id", sample.SandboxID, "error", err)
-			continue
-		}
+		deltas = append(deltas, store.NetCounterDelta{
+			SandboxID: sample.SandboxID, BytesIn: sample.BytesIn, BytesOut: sample.BytesOut,
+		})
+		applied = append(applied, sample)
+	}
+
+	// One write transaction per batch of sandboxes, and the post-update
+	// totals come back from the UPDATE. A poll used to cost one commit and a
+	// full four-query re-read per sandbox, all on the single writer, so a
+	// poll over a dense node held up creates for a quarter of a second.
+	// Totals cover only the batches that committed, so usage below is never
+	// reported for bytes that were not stored.
+	totals, err := k.svc.store.ApplyNetCounterDeltas(ctx, deltas)
+	if err != nil {
+		k.svc.logger.Warn("netstats: update counters failed",
+			"samples", len(deltas), "applied", len(totals), "error", err)
+	}
+	for _, t := range totals {
 		if k.svc.testAfterNetstatsUpdate != nil {
 			k.svc.testAfterNetstatsUpdate()
 		}
+		sample := applied[t.Index]
+		// Mirror the per-tick byte deltas as egress/ingress usage samples.
+		// No-op without a reporter; the poller goroutine is already off the
+		// request path.
+		k.svc.emitNetworkUsage(ctx, t.SandboxID, t.OwnerRef, sample.BytesIn, sample.BytesOut, sample.SampledAt)
 
-		// After persisting deltas, re-read the row so the quota check works
-		// against the post-update cumulative — including any concurrent
-		// SetNetworkLimits change to the caps. Cheap: SQLite, single row,
-		// already in cache.
-		sandbox, err := k.svc.store.Get(ctx, sample.SandboxID)
+		overIn := t.BytesInLimit > 0 && t.BytesIn >= t.BytesInLimit
+		overOut := t.BytesOutLimit > 0 && t.BytesOut >= t.BytesOutLimit
+		if !overIn && !overOut && !t.QuotaExceeded {
+			continue
+		}
+		// Enforcing or lifting a quota needs the whole row (IP, runtime,
+		// egress mode). Only sandboxes at or over a cap, or still flagged,
+		// get here, so the re-read is the rare path. Recompute from the
+		// re-read so a SetNetworkLimits change since the UPDATE is honoured.
+		sandbox, err := k.svc.store.Get(ctx, t.SandboxID)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				continue
 			}
 			k.svc.logger.Warn("netstats: re-fetch sandbox failed",
-				"sandbox_id", sample.SandboxID, "error", err)
+				"sandbox_id", t.SandboxID, "error", err)
 			continue
 		}
-
-		// Mirror the per-tick byte deltas as egress/ingress usage samples
-		// (owner_ref comes off the row we just re-read). No-op without a
-		// reporter; the poller goroutine is already off the request path.
-		k.svc.emitNetworkUsage(ctx, sandbox, sample.BytesIn, sample.BytesOut, sample.SampledAt)
-
-		overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
-		overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
+		overIn = sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
+		overOut = sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
 		if overIn || overOut || sandbox.NetworkQuotaExceeded {
 			k.svc.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
 		}
 	}
 
-	if len(samples) > 0 {
-		k.svc.netstatsLastTick.Store(samples[len(samples)-1].SampledAt.UnixNano())
-	}
+	k.svc.netstatsLastTick.Store(samples[len(samples)-1].SampledAt.UnixNano())
 }

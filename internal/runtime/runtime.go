@@ -175,6 +175,15 @@ type WritableLayerSizer interface {
 	WritableLayerBytes(ctx context.Context, containerRef string) (int64, error)
 }
 
+// CgroupLocator is a runtime that gives each sandbox its own cgroup v2
+// group and can name it without asking anyone: SandboxCgroup returns the
+// group's path below the cgroup mount, such as "/aerolvm/<id>". The usage
+// exporter reads CPU and memory there (C20). One reader then covers runc
+// and gVisor alike, since gVisor puts its sandbox kernel in that group.
+type CgroupLocator interface {
+	SandboxCgroup(containerRef string) string
+}
+
 type ContainerRuntime interface {
 	Runtime
 
@@ -224,6 +233,20 @@ type ContainerRuntime interface {
 	// same (containerIP, allowCIDRs, denyCIDRs). Callers pass the policy from
 	// the sandbox row so cleanup is exact and the blanket DROP is untouched.
 	ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error
+}
+
+// Freezer is implemented by runtimes that can stop every process of a sandbox
+// where it stands and let it continue later with its memory intact (the
+// cgroup freezer behind docker pause and containerd task.Pause). The cluster
+// ownership fence uses it: a worker that cannot confirm it still owns a
+// failover.policy=recreate sandbox freezes it, so it neither runs nor serves
+// while another node may be starting a replacement, and thaws it when
+// ownership is confirmed. Both calls are idempotent: freezing a frozen or
+// stopped instance, or thawing one that is not frozen, is a no-op. Neither
+// changes the sandbox's recorded status.
+type Freezer interface {
+	Freeze(ctx context.Context, containerRef string) error
+	Thaw(ctx context.Context, containerRef string) error
 }
 
 // AsContainerRuntime returns the network-rule surface when rt implements it.
@@ -286,5 +309,31 @@ type IdentityStarter interface {
 // Callers fall back to Start when this returns false.
 func AsIdentityStarter(rt Runtime) (IdentityStarter, bool) {
 	s, ok := rt.(IdentityStarter)
+	return s, ok
+}
+
+// AdoptEnvLoader returns the env a start must hand a warm-pool container
+// again, exactly as the create handed it: the sandbox's env from its sealed
+// row, with the withheld-key placeholders in place of the values the egress
+// gateway injects. It holds plaintext secrets, so it is called only when
+// the start really re-adopts a container that was adopted with env, and
+// what it returns is never logged.
+type AdoptEnvLoader func(ctx context.Context) (map[string]string, error)
+
+// EnvIdentityStarter is an IdentityStarter whose re-adopt also carries the
+// sandbox's env. A containerd warm-pool create hands the env to the toolbox
+// in the adopt frame instead of the container spec (plans/cluster-phase-2.md
+// §2), so the spec a start re-creates the task from has none: each start
+// must send it again, as a cold container's start re-reads it from its
+// spec. loadEnv is lazy so a start that needs no env (a cold container, a
+// pool container adopted without env) reads and decrypts nothing more.
+type EnvIdentityStarter interface {
+	StartWithIdentityEnv(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv AdoptEnvLoader) (*models.SandboxRuntimeState, error)
+}
+
+// AsEnvIdentityStarter returns the env-carrying start when rt implements it.
+// Callers fall back to AsIdentityStarter when this returns false.
+func AsEnvIdentityStarter(rt Runtime) (EnvIdentityStarter, bool) {
+	s, ok := rt.(EnvIdentityStarter)
 	return s, ok
 }

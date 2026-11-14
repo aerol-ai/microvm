@@ -30,3 +30,27 @@ The provenance certificate names the builder. Expect all of the following:
 - Source ref equal to the release tag, for example `refs/tags/v0.6.3`
 
 A bundle that names a different repository, a different workflow, or a branch ref instead of the tag is not an official release. The person or process that published it is the GitHub Actions workflow above, running with this repository's OIDC token. There is no separate maintainer signing key.
+
+## Kubernetes images
+
+From the release that ships them, each release also publishes these images to `ghcr.io/aerol-ai`, for amd64 and arm64: `aerolvm` (`sandboxd`), `aerolvm-runtime` (the runtime supervisor, containerd, runc and gVisor), `aerolvm-edge` (Caddy) and, from the release that adds cluster mode, `aerolvm-operator` (the Kubernetes operator). They are built from that release's own binaries. Each carries an SBOM and SLSA provenance from the build, a keyless cosign signature and GitHub's build provenance. Use the image's digest, not the tag: a digest cannot be moved.
+
+1. Check the signature with cosign v3 or later. The release signs with cosign v3, in its newer bundle format; cosign v2 reports "no signatures found" for a signed image. The certificate must name this repository's release workflow at the release tag:
+
+```bash
+cosign verify ghcr.io/aerol-ai/aerolvm@sha256:<digest> \
+  --certificate-identity-regexp '^https://github.com/aerol-ai/microvm/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+2. Check the provenance:
+
+```bash
+gh attestation verify oci://ghcr.io/aerol-ai/aerolvm@sha256:<digest> \
+  --repo aerol-ai/microvm \
+  --signer-workflow aerol-ai/microvm/.github/workflows/release.yml
+```
+
+`gh` reads the image from ghcr.io with its own token, which needs the `read:packages` scope (`gh auth refresh -s read:packages`). Without it, check the image's manifest as a file instead: fetch it anonymously by its digest, check its SHA-256 equals the digest, and run `gh attestation verify <manifest file> --repo aerol-ai/microvm`.
+
+Repeat for `aerolvm-runtime`, `aerolvm-edge` and `aerolvm-operator`. To have Kubernetes refuse any AerolVM pod whose image fails this check, apply the example admission policy in `charts/aerolvm/examples/kyverno-signed-images.yaml`. The third-party programs in the images (containerd, runc, gVisor, the CNI plugins) are downloaded at build time and checked against hashes pinned in `packaging/images/versions.env`.

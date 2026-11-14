@@ -1,0 +1,74 @@
+{{- if eq .Values.mode "cluster" -}}
+AerolVM is starting in {{ .Release.Namespace }} (cluster mode). The operator builds
+the cluster: the first server, the other servers, then gateways and workers.
+
+1. Watch it until the AerolCluster says Ready:
+
+   kubectl -n {{ .Release.Namespace }} get aerolcluster,aerolnodes
+
+{{ if .Values.edge.enabled -}}
+2. Point {{ .Values.edge.domain }} and *.{{ .Values.edge.domain }} at the gateways' Service:
+
+   kubectl -n {{ .Release.Namespace }} get svc {{ .Values.cluster.name }}-gateway
+
+   The API is then https://{{ .Values.edge.domain }}.
+
+3. Read the admin token, then point an SDK at https://{{ .Values.edge.domain }} with it:
+{{- else -}}
+2. Reach the API from this machine:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Values.cluster.name }}-gateway 21212:21212
+
+3. Read the admin token, then point an SDK at http://127.0.0.1:21212 with it:
+{{- end }}
+
+   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.cluster.name }}-admin -o jsonpath='{.data.token}' | base64 -d
+
+Health: every AerolNode says Serving; a worker that says Failed names the
+machine check it failed. Check the install against the security evidence pack
+(EVIDENCE.md in this chart):
+
+   aerolvm k8s verify --namespace {{ .Release.Namespace }} --worker-namespace {{ .Values.cluster.workerNamespace }} --release {{ .Release.Name }} --cluster {{ .Values.cluster.name }}
+
+This namespace must enforce restricted Pod Security
+(pod-security.kubernetes.io/enforce=restricted). Worker pods run privileged in
+{{ .Values.cluster.workerNamespace }}, the one namespace labelled for it.
+{{- else -}}
+AerolVM is starting in {{ .Release.Namespace }} ({{ .Values.mode }} mode).
+
+1. Wait until it is ready (the first start pulls images):
+
+   kubectl -n {{ .Release.Namespace }} wait --for=condition=Ready pod/{{ include "aerolvm.name" . }}-0 --timeout=5m
+
+{{ if .Values.edge.enabled -}}
+2. Point {{ .Values.edge.domain }} and *.{{ .Values.edge.domain }} at the edge Service's address:
+
+   kubectl -n {{ .Release.Namespace }} get svc {{ include "aerolvm.name" . }}-edge
+
+   The API is then https://{{ .Values.edge.domain }}, and a sandbox's port 3000 is
+   https://<sandbox id>-3000.{{ .Values.edge.domain }}. The certificate is in Secret
+   {{ include "aerolvm.edgeTLSSecret" . }}{{ if not .Values.edge.existingTLSSecret }}, kept renewed by cert-manager{{ end }}.
+
+3. Read the API token, then point an SDK at https://{{ .Values.edge.domain }} with it:
+{{- else -}}
+2. Reach the API from this machine:
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "aerolvm.name" . }} 21212:{{ .Values.service.port }}
+
+3. Read the API token, then point an SDK at http://127.0.0.1:21212 with it:
+{{- end }}
+
+   kubectl -n {{ .Release.Namespace }} get secret {{ include "aerolvm.tokenSecret" . }} -o jsonpath='{.data.SB_PAT_TOKEN}' | base64 -d
+
+Health: `kubectl -n {{ .Release.Namespace }} get pod {{ include "aerolvm.name" . }}-0` shows {{ if .Values.edge.enabled }}4/4{{ else }}3/3{{ end }} READY
+when sandboxd serves; `aerolvm health` (the CLI) reports the same through the API.
+
+The worker pod runs privileged: label the namespace for it
+(pod-security.kubernetes.io/enforce=privileged); `aerolvm k8s verify` checks the label.
+
+Upgrading: a chart upgrade never restarts the worker pod, which would end every
+sandbox. To move sandboxd to a new image, change the agent container in place;
+only it restarts, and the sandboxes keep running:
+
+   kubectl -n {{ .Release.Namespace }} set image pod/{{ include "aerolvm.name" . }}-0 agent=<image>
+{{- end }}

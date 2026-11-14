@@ -26,6 +26,14 @@ public class CreateOptions {
     @JsonIgnore
     public String idempotencyKey;
     /**
+     * Client-side only, never sent: when true, the returned sandbox deletes
+     * itself when a try-with-resources block around it ends
+     * ({@code Sandbox.close()}). False by default, so the block keeps the
+     * sandbox.
+     */
+    @JsonIgnore
+    public boolean destroyOnClose;
+    /**
      * Optional name, unique among the caller's sandboxes (another account may
      * use the same name); a repeat create with a held name returns HTTP 409.
      * Names starting with {@code owner:} or shaped like a sandbox ID
@@ -88,6 +96,11 @@ public class CreateOptions {
     public List<PlatformVolumeMount> platformVolumes;
     public Lifecycle lifecycle;
     public Failover failover;
+    /**
+     * Limit which nodes may run the sandbox, by zone and node labels. Kept on
+     * failover. No matching node gives a 409 {@code placement_unsatisfiable}.
+     */
+    public PlacementRule placement;
     public String runtime;
     /** Survival class across daemon restarts. Null uses the runtime default. */
     public String durability;
@@ -120,9 +133,20 @@ public class CreateOptions {
      */
     @JsonProperty("template_id")
     public String templateId;
+    /**
+     * A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+     * The role tag must be on your team's allow list.
+     */
+    public IdentityOptions identity;
 
     public CreateOptions setImage(String image) {
         this.image = image;
+        return this;
+    }
+
+    /** See {@link #destroyOnClose}. */
+    public CreateOptions setDestroyOnClose(boolean destroyOnClose) {
+        this.destroyOnClose = destroyOnClose;
         return this;
     }
 
@@ -236,6 +260,11 @@ public class CreateOptions {
         return this;
     }
 
+    public CreateOptions setPlacement(PlacementRule placement) {
+        this.placement = placement;
+        return this;
+    }
+
     public CreateOptions setRuntime(String runtime) {
         this.runtime = runtime;
         return this;
@@ -268,6 +297,11 @@ public class CreateOptions {
 
     public CreateOptions setTemplateId(String templateId) {
         this.templateId = templateId;
+        return this;
+    }
+
+    public CreateOptions setIdentity(IdentityOptions identity) {
+        this.identity = identity;
         return this;
     }
 }

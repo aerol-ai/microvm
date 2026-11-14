@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/routedns"
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 type fakeWatcherCluster struct {
@@ -115,9 +116,7 @@ func TestCheckRouteResolver(t *testing.T) {
 	}
 
 	// Nothing answers at all.
-	dead, _ := net.ListenPacket("udp", "127.0.0.1:0")
-	deadAddr := dead.LocalAddr().String()
-	_ = dead.Close()
+	deadAddr := testport.UDPAddr(t)
 	short, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel2()
 	if err := checkRouteResolver(short, resolverFor(deadAddr)); err == nil {

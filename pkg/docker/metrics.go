@@ -28,6 +28,9 @@ var (
 	netnsPoolRefillErrors  = expvar.NewInt("aerolvm_docker_netns_pool_refill_errors_total")
 	netnsPoolOrphansReaped = expvar.NewInt("aerolvm_docker_netns_pool_orphans_reaped_total")
 	netnsPoolSize          = expvar.NewInt("aerolvm_docker_netns_pool_size")
+	// Creates that left the pool alone because another create was running
+	// (netnsPoolBusy): not misses, the pool had a slot to give.
+	netnsPoolBusySkips = expvar.NewInt("aerolvm_docker_netns_pool_busy_skips_total")
 
 	// Warm-adopt image-ID cache (see image_cache.go). The hit ratio tells
 	// operators how often warm creates skip the per-create image inspect;

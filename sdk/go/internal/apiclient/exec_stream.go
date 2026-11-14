@@ -53,19 +53,24 @@ type execStreamServerMessage struct {
 }
 
 func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOptions) (*ExecStreamHandle, error) {
-	if strings.TrimSpace(options.Command) == "" {
+	hasCommand := strings.TrimSpace(options.Command) != ""
+	switch {
+	case hasCommand && len(options.Argv) > 0:
+		return nil, errors.New("set command or argv, not both")
+	case !hasCommand && len(options.Argv) == 0:
 		return nil, errors.New("command is required")
-	}
-
-	wsURL, err := websocketURL(c.baseURL, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/process/exec/stream")
-	if err != nil {
-		return nil, err
+	case len(options.Argv) > 0:
+		// Checked before the socket opens, so an older agent never
+		// receives a start message it cannot run.
+		if err := c.RequireToolboxFeatures(ctx, id, "exec.argv"); err != nil {
+			return nil, err
+		}
 	}
 
 	requestHeader := http.Header{}
 	c.setAuthHeaders(requestHeader)
 
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
+	conn, resp, wsURL, err := c.dialSandbox(ctx, c.versionPrefix+"/sandboxes/"+url.PathEscape(id)+"/toolbox/process/exec/stream", requestHeader)
 	if err != nil {
 		return nil, decorateHandshakeError("exec stream", wsURL, resp, err)
 	}
@@ -77,6 +82,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 
 	start := struct {
 		Command string            `json:"command"`
+		Argv    []string          `json:"argv,omitempty"`
 		Workdir string            `json:"workdir,omitempty"`
 		Env     map[string]string `json:"env,omitempty"`
 		TTY     bool              `json:"tty,omitempty"`
@@ -84,6 +90,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 		Rows    int               `json:"rows,omitempty"`
 	}{
 		Command: options.Command,
+		Argv:    options.Argv,
 		Workdir: options.Workdir,
 		Env:     options.Env,
 		TTY:     options.TTY,

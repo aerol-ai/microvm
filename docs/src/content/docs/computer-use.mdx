@@ -1,0 +1,341 @@
+---
+title: Computer use and browser automation
+description: Build a ready-made desktop image with Chromium, watch the screen in a web page, and drive the browser with Playwright.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Some agents need a whole computer, not just a shell. They open a browser, look at the screen and click. Other programs drive a browser through its DevTools port, the way Playwright and Puppeteer do.
+
+AerolVM has a ready-made image for both. It holds a small Linux desktop with Chromium. A script inside the sandbox drives the browser with Playwright, and a person can watch the screen live from a web page.
+
+## What is in the image
+
+| Part | What it does |
+|---|---|
+| Xvfb | A screen in memory, since a sandbox has no monitor. |
+| Openbox | A small window manager that draws the browser window. |
+| Chromium | The browser. Its DevTools port, 9222, is open inside the sandbox. |
+| Playwright for Python | Drives the browser over that port (CDP, the Chrome DevTools Protocol). |
+| x11vnc and noVNC | Show the screen as a web page on port 6080. |
+
+The image runs everything as a normal user, `desktop`, not as root. It starts the desktop by itself when the sandbox starts.
+
+## What you need
+
+- **An AerolVM server.** To watch the screen from another computer, it needs a domain. See [Single node setup](/getting-started/single-node-setup/).
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, and an SDK for your language. See [SDK setup](/sdk-setup/).
+- **The image's Dockerfile.** Save [`images/computer-use/Dockerfile`](https://github.com/aerol-ai/microvm/blob/main/images/computer-use/Dockerfile) from the AerolVM repository on your computer. The image is not in a registry: your server builds it from this one file.
+
+## Step 1: Build the image
+
+`buildImage` sends the Dockerfile to your server, which builds it and returns the image's name. The first build downloads about 1.3 GB and can take a few minutes. After that, the same Dockerfile reuses the finished image at once.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Image } from "@aerol-ai/aerolvm-sdk";
+    import { readFile } from "node:fs/promises";
+
+    const dockerfile = await readFile("Dockerfile", "utf8");
+    const { image } = await client.buildImage(Image.fromDockerfile(dockerfile));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import Image
+
+    with open("Dockerfile", encoding="utf-8") as f:
+        image = client.build_image(Image.from_dockerfile(f.read()))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    dockerfile, err := os.ReadFile("Dockerfile")
+    if err != nil {
+        log.Fatal(err)
+    }
+    image, err := client.BuildImage(ctx, microvm.FromDockerfile(string(dockerfile)))
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Image;
+
+    let dockerfile = std::fs::read_to_string("Dockerfile").expect("read Dockerfile");
+    let image = client.build_image(&Image::from_dockerfile(&dockerfile))?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String dockerfile = Files.readString(Path.of("Dockerfile"));
+    String image = client.buildImage(Image.fromDockerfile(dockerfile));
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 2: Create a sandbox from it
+
+A browser needs room, so give the sandbox 2 CPU cores and 2 GB of memory. The lifecycle rule deletes it after an idle hour.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    const sandbox = await client.create({
+      image,
+      cpu: 2,
+      memoryMB: 2048,
+      lifecycle: { destroyIfIdleFor: HOUR },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
+
+    sandbox = client.create(
+        image=image,
+        cpu=2,
+        memoryMB=2048,
+        lifecycle={"destroyIfIdleFor": HOUR},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:     image,
+        CPU:       2,
+        MemoryMB:  2048,
+        Lifecycle: &sdktypes.Lifecycle{DestroyIfIdleFor: time.Hour},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: image.clone(),
+        cpu: Some(2),
+        memory_mb: Some(2048),
+        lifecycle: Some(Lifecycle {
+            destroy_if_idle_for: hour,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = Duration.ofHours(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage(image)
+        .setCpu(2.0)
+        .setMemoryMb(2048)
+        .setLifecycle(new Lifecycle().setDestroyIfIdleFor(hour)));
+    ```
+  </TabItem>
+</Tabs>
+
+The desktop and the browser take a few seconds to start.
+
+## Step 3: Drive the browser with Playwright
+
+Playwright runs inside the sandbox and connects to Chromium's DevTools port. Save this script as `shot.py` on your computer. It opens a page, reads its heading and saves a screenshot.
+
+```python
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+    page = browser.contexts[0].new_page()
+    page.goto("https://example.com")
+    print(page.inner_text("h1"))
+    page.screenshot(path="/tmp/shot.png")
+    page.close()
+```
+
+Then upload it, run it, and download the screenshot:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { writeFile } from "node:fs/promises";
+
+    await sandbox.uploadFile("/tmp/shot.py", await readFile("shot.py"));
+    const run = await sandbox.exec({ command: "python3 /tmp/shot.py", timeoutSeconds: 120 });
+    console.log(run.stdout); // Example Domain
+
+    await writeFile("shot.png", await sandbox.downloadFile("/tmp/shot.png"));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    with open("shot.py", "rb") as f:
+        sandbox.upload_file("/tmp/shot.py", f.read())
+    run = sandbox.exec({"command": "python3 /tmp/shot.py", "timeoutSeconds": 120})
+    print(run["stdout"])  # Example Domain
+
+    with open("shot.png", "wb") as f:
+        f.write(sandbox.download_file("/tmp/shot.png"))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    script, err := os.ReadFile("shot.py")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := sandbox.UploadFile(ctx, "/tmp/shot.py", script); err != nil {
+        log.Fatal(err)
+    }
+    run, err := sandbox.Exec(ctx, sdktypes.ExecRequest{Command: "python3 /tmp/shot.py", TimeoutSeconds: 120})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(run.Stdout) // Example Domain
+
+    png, err := sandbox.DownloadFile(ctx, "/tmp/shot.png")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if err := os.WriteFile("shot.png", png, 0o644); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let script = std::fs::read("shot.py").expect("read shot.py");
+    sandbox.upload_file("/tmp/shot.py", script)?;
+    let run = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "python3 /tmp/shot.py".to_string(),
+        timeout_seconds: Some(120),
+        ..Default::default()
+    })?;
+    println!("{}", run.stdout); // Example Domain
+
+    let png = sandbox.download_file("/tmp/shot.png")?;
+    std::fs::write("shot.png", png).expect("write shot.png");
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.uploadFile("/tmp/shot.py", Files.readAllBytes(Path.of("shot.py")));
+    ExecResult run = sandbox.exec(new ExecRequest()
+        .setCommand("python3 /tmp/shot.py")
+        .setTimeoutSeconds(120));
+    System.out.println(run.stdout); // Example Domain
+
+    Files.write(Path.of("shot.png"), sandbox.downloadFile("/tmp/shot.png"));
+    ```
+  </TabItem>
+</Tabs>
+
+Each run of the script is one step. An AI agent can work in a loop the same way: look at the screenshot, decide what to do, and run the next script, such as one that calls `page.click` or `page.fill`.
+
+## Step 4: Watch the screen
+
+noVNC shows the desktop on port 6080. The screen has no password of its own, so share the port with `visibility: "token"`: only someone with a [sandbox token](/sandbox-tokens/) for this port can open it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const exposure = await sandbox.exposePort(6080, { visibility: "token" });
+    const tok = await sandbox.createToken({ port: 6080, expiresIn: "1h" });
+
+    console.log(`${exposure.url}/vnc.html?autoconnect=1&resize=remote&token=${tok.token}`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(6080, visibility="token")
+    tok = sandbox.create_token(port=6080, expires_in="1h")
+
+    print(f"{exposure.url}/vnc.html?autoconnect=1&resize=remote&token={tok['token']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 6080, microvm.WithVisibility(sdktypes.ExposeVisibilityToken))
+    if err != nil {
+        log.Fatal(err)
+    }
+    tok, err := sandbox.CreateToken(ctx, sdktypes.CreateSandboxTokenOptions{Port: 6080, ExpiresIn: "1h"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(exposure.PublicURL + "/vnc.html?autoconnect=1&resize=remote&token=" + tok.Token)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateSandboxTokenOptions, ExposeOptions, ExposeResult};
+
+    let exposure = sandbox.expose_port(6080, ExposeOptions::token())?;
+    let tok = sandbox.create_token(CreateSandboxTokenOptions {
+        port: Some(6080),
+        expires_in: "1h".into(),
+        ..Default::default()
+    })?;
+
+    if let ExposeResult::Http { url } = exposure {
+        println!("{}/vnc.html?autoconnect=1&resize=remote&token={}", url, tok.token);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult exposure = sandbox.exposePort(6080, ExposeOptions.token());
+    SandboxToken tok = sandbox.createToken(
+        new CreateSandboxTokenOptions().setPort(6080).setExpiresIn("1h"));
+
+    System.out.println(exposure.url + "/vnc.html?autoconnect=1&resize=remote&token=" + tok.token);
+    ```
+  </TabItem>
+</Tabs>
+
+Open the printed link in a browser. The server swaps the token for a cookie and takes it out of the address, then you see the desktop with Chromium on it. Run the script from step 3 again and watch the page open. You can also click and type in the browser yourself.
+
+## Change the screen
+
+The start script reads these environment variables. Pass them in `env` when you create the sandbox.
+
+| Variable | What it sets | Default |
+|---|---|---|
+| `SCREEN_GEOMETRY` | The screen size and color depth. | `1280x800x24` |
+| `WINDOW_SIZE` | The browser window size. | `1280,800` |
+| `START_URL` | The first page the browser shows. | `about:blank` |
+
+## Good to know
+
+<Aside type="caution">
+Do not share port 9222. DevTools has no password: whoever reaches it controls the browser, with every login and cookie in it. Chromium also refuses DevTools requests that come through a web address, so the port is meant for programs inside the sandbox, like the Playwright script above.
+</Aside>
+
+- **Closing the browser is fine.** If Chromium is closed or crashes, the start script opens it again within a second, so the DevTools port comes back.
+- **Logs** for each part are in `/home/desktop/.desktop/logs` inside the sandbox.
+- **The sandbox is the wall around the browser.** Chromium starts with `--no-sandbox`, which turns off its own sandbox, because it runs inside an AerolVM sandbox already. Treat what the browser visits as untrusted.
+- **We tested it on container sandboxes.** Try your workload on [gVisor](/gvisor-sandbox/) before you depend on it there.
+- **It needs the internet** to load web pages. To limit where the browser can go, see [Allow only some websites](/network-access/#allow-only-some-websites).
+
+## Next steps
+
+- [Images and snapshots](/images-and-snapshots/): save a set-up sandbox, so later ones start ready.
+- [Public URLs](/public-urls/): how port addresses and token-only ports work.
+- [Burner browser](/use-cases/customer-facing-product-experiences/secure-burner-browser/): give users a throwaway browser in their own tab.
+- [VS Code in the browser](/vscode-in-browser/): the other ready-made image.

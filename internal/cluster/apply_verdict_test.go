@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,6 +45,20 @@ func TestApplyVerdictCarriesReservationAndNameConflicts(t *testing.T) {
 			sentinel: ErrIncarnationConflict,
 		},
 		{
+			// C2: a returning node's replay of a deleted lifecycle.
+			name:     "deleted lifecycle",
+			err:      fmt.Errorf("cluster: fsm apply: %w: sb-x incarnation %q", ErrPlacementDeleted, "inc-x"),
+			wantCode: http.StatusConflict,
+			sentinel: ErrPlacementDeleted,
+		},
+		{
+			// A spec write based on an old copy (spec_version_fence.go).
+			name:     "spec version conflict",
+			err:      fmt.Errorf("cluster: fsm apply: %w: sb-x is at version 12, the write was based on 9", ErrSpecVersionConflict),
+			wantCode: http.StatusConflict,
+			sentinel: ErrSpecVersionConflict,
+		},
+		{
 			name:     "superseded still carried",
 			err:      fmt.Errorf("%w: template/worker-a", ErrArtifactCatalogSuperseded),
 			wantCode: http.StatusConflict,
@@ -67,7 +83,7 @@ func TestApplyVerdictCarriesReservationAndNameConflicts(t *testing.T) {
 			if tc.sentinel == nil {
 				// A generic failure must NOT be mistaken for any conflict
 				// sentinel — the caller retries it unchanged.
-				if errors.Is(round, ErrReservationConflict) || errors.Is(round, ErrNameConflict) || errors.Is(round, ErrArtifactCatalogSuperseded) || errors.Is(round, ErrIncarnationConflict) {
+				if errors.Is(round, ErrReservationConflict) || errors.Is(round, ErrNameConflict) || errors.Is(round, ErrArtifactCatalogSuperseded) || errors.Is(round, ErrIncarnationConflict) || errors.Is(round, ErrSpecVersionConflict) {
 					t.Fatalf("generic failure round-tripped into a conflict sentinel: %v", round)
 				}
 				return
@@ -97,6 +113,13 @@ func TestAgentControlPlaneCarriesReservationAndNameConflicts(t *testing.T) {
 		// UC-367 on cluster-hetero-lite: concurrent same-key creates through
 		// two ingresses re-reserved one id, and the fence came back as a 500.
 		{"incarnation", "cluster: fsm apply: " + ErrIncarnationConflict.Error() + ": reservation retry changed its incarnation", ErrIncarnationConflict},
+		// Placement rules: the leader refused a reservation outside the
+		// rule; an agent-routed create must still answer 409, not 503.
+		{"placement rule", "worker w1: " + ErrPlacementUnsatisfiable.Error() + ": no node has the labels zone=z", ErrPlacementUnsatisfiable},
+		// C2: a worker's ownership replay of a deleted lifecycle.
+		{"deleted lifecycle", "cluster: fsm apply: " + ErrPlacementDeleted.Error() + ": sb-x incarnation \"inc\"", ErrPlacementDeleted},
+		// A worker's spec write based on a copy a follower served late.
+		{"spec version", "cluster: fsm apply: " + ErrSpecVersionConflict.Error() + ": sb-x is at version 12, the write was based on 9", ErrSpecVersionConflict},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,5 +157,59 @@ func TestApplyVerdictDoesNotCrossConflictSentinels(t *testing.T) {
 		fmt.Errorf("%w: reservation retry changed its incarnation", ErrIncarnationConflict).Error())
 	if !errors.Is(inc, ErrIncarnationConflict) || errors.Is(inc, ErrReservationConflict) || errors.Is(inc, ErrNameConflict) {
 		t.Fatalf("incarnation-conflict message resolved to the wrong sentinel: %v", inc)
+	}
+}
+
+// A leader whose gossip view does not list the forwarder yet answers 403
+// PeerNotInMembershipMessage. During a leader change that is a moment's lag
+// (TestClusterFaultLeaderChangeDuringConcurrentReserves/kill hit it under
+// -race on main), so the forward must come back as ErrMembershipPending,
+// which callers retry like an election; it used to be unclassified, and the
+// public API answered 400. Every other 403 stays final.
+func TestLeaderForwardMembershipRefusalIsRetryable(t *testing.T) {
+	cases := []struct {
+		name      string
+		write     func(w http.ResponseWriter)
+		retryable bool
+	}{
+		{
+			name:      "internal listener (plain text)",
+			write:     func(w http.ResponseWriter) { http.Error(w, PeerNotInMembershipMessage, http.StatusForbidden) },
+			retryable: true,
+		},
+		{
+			name: "v1 apply route (JSON error body)",
+			write: func(w http.ResponseWriter) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"` + PeerNotInMembershipMessage + `"}`))
+			},
+			retryable: true,
+		},
+		{
+			name:      "unauthenticated peer stays final",
+			write:     func(w http.ResponseWriter) { http.Error(w, "cluster peer identity required", http.StatusForbidden) },
+			retryable: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { tc.write(w) }))
+			defer srv.Close()
+			c := &Cluster{nodeID: "forwarder-1"}
+			err := c.doLeaderApply(context.Background(), srv.Client(), srv.URL+"/internal/apply", []byte("cmd"))
+			if err == nil {
+				t.Fatal("a 403 from the leader returned no error")
+			}
+			if got := errors.Is(err, ErrMembershipPending); got != tc.retryable {
+				t.Fatalf("errors.Is(%v, ErrMembershipPending) = %v, want %v", err, got, tc.retryable)
+			}
+			if got := IsControlPlaneUnavailable(err); got != tc.retryable {
+				t.Fatalf("IsControlPlaneUnavailable(%v) = %v, want %v", err, got, tc.retryable)
+			}
+			if !strings.Contains(err.Error(), "leader-forward apply") {
+				t.Fatalf("error %q does not say it came from the leader forward", err)
+			}
+		})
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+
+	"github.com/aerol-ai/microvm/internal/service"
 )
 
 func (h *handlers) toolboxProxy(w http.ResponseWriter, r *http.Request) {
@@ -29,7 +31,8 @@ func (h *handlers) sessionsProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) proxyToToolbox(w http.ResponseWriter, r *http.Request, path string) {
-	if err := h.deps.Service.ServeToolboxReverseProxy(r.Context(), r.PathValue("id"), w, r, path); err != nil {
+	ctx := service.WithToolboxSurface(r.Context(), service.ToolboxSurfaceV1)
+	if err := h.deps.Service.ServeToolboxReverseProxy(ctx, r.PathValue("id"), w, r, path); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 	}
 }

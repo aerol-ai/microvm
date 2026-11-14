@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "type": "string", "defaultValue": "[resourceGroup().location]" },
+    "clusterResourceName": { "type": "string", "metadata": { "description": "The AKS cluster to install AerolVM on." } },
+    "extensionResourceName": { "type": "string", "defaultValue": "aerolvm" },
+    "apiTokenSecret": { "type": "string", "defaultValue": "aerolvm-api-token" },
+    "defaultRuntime": { "type": "string", "defaultValue": "gvisor", "allowedValues": ["gvisor", "docker"] }
+  },
+  "variables": {
+    "plan-name": "DONOTMODIFY",
+    "plan-publisher": "DONOTMODIFY",
+    "plan-offerID": "DONOTMODIFY",
+    "releaseTrain": "DONOTMODIFY",
+    "clusterExtensionTypeName": "DONOTMODIFY"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.KubernetesConfiguration/extensions",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('extensionResourceName')]",
+      "scope": "[concat('Microsoft.ContainerService/managedClusters/', parameters('clusterResourceName'))]",
+      "plan": {
+        "name": "[variables('plan-name')]",
+        "publisher": "[variables('plan-publisher')]",
+        "product": "[variables('plan-offerID')]"
+      },
+      "properties": {
+        "extensionType": "[variables('clusterExtensionTypeName')]",
+        "releaseTrain": "[variables('releaseTrain')]",
+        "autoUpgradeMinorVersion": false,
+        "scope": { "cluster": { "releaseNamespace": "aerolvm" } },
+        "configurationSettings": {
+          "apiToken.existingSecret": "[parameters('apiTokenSecret')]",
+          "worker.defaultRuntime": "[parameters('defaultRuntime')]"
+        }
+      }
+    }
+  ]
+}

@@ -25,13 +25,22 @@ const (
 	auditSubsystemReconcile   = "reconcile"
 	auditSubsystemLifecycle   = "lifecycle"
 	auditSubsystemFailover    = "failover"
-	auditSubsystemImageGC     = "image-gc"
+	// auditSubsystemMove: a decommission moved the sandbox here with its
+	// memory (C21).
+	auditSubsystemMove    = "move"
+	auditSubsystemImageGC = "image-gc"
 	// auditSubsystemWake is a sandbox started by traffic to one of its
 	// routes (HTTP or L4 wake), not by an API call.
 	auditSubsystemWake = "wake"
 	// auditSubsystemEgress is the egress gateway reading a sandbox's
 	// environment to inject a credential into its outbound traffic.
 	auditSubsystemEgress = "egress"
+	// auditSubsystemRuntime is the runtime event monitor: a sandbox that
+	// exited, or was removed, without sandboxd asking.
+	auditSubsystemRuntime = "runtime"
+	// auditSubsystemFleet is the managed control plane's standing
+	// directives (suspend, delete) acting on an owner's sandboxes.
+	auditSubsystemFleet = "fleet"
 )
 
 // withAuditSubsystem tags ctx as background work by subsystem. A request's

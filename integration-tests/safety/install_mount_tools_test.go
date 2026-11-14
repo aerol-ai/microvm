@@ -391,8 +391,9 @@ func TestLocalInstallRunsMountToolsOnLinuxOnly(t *testing.T) {
 	}
 	branch = strings.ReplaceAll(branch, "$EUID", "$FAKE_EUID")
 	steps := []string{"install_darwin_local", "install_binaries", "record_sandboxd_state", "write_local_environment",
-		"ensure_docker", "write_local_systemd_unit", "write_egress_gateway_units",
-		"write_healthcheck_script", "write_healthcheck_units", "restart_sandboxd_if_reconfigured"}
+		"write_node_settings", "ensure_docker", "write_local_systemd_unit", "write_egress_gateway_units",
+		"write_healthcheck_script", "write_healthcheck_units", "restart_sandboxd_if_reconfigured",
+		"prepare_upgrader_handoff", "hand_off_to_upgrader"}
 	stubs := mountToolStubs + fakeAptGet + fakeRPCSystemctl + mountToolFuncs(t, src)
 	for _, s := range steps {
 		stubs += s + "() { echo \"" + s + " $*\" >>\"$LOG\"; }\n"

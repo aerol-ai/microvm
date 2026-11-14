@@ -30,11 +30,34 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 	_ = token
 	path := r.URL.Path
 	switch {
+	case path == "/files/watch" || strings.HasSuffix(path, "/files/watch"):
+		// Same answer toolboxd gives on a shared kernel: watching is offered
+		// on gVisor and Firecracker only (plans/agent-sandbox-feature-parity.md
+		// F5, Q8).
+		http.Error(w, "file watching needs a gVisor or Firecracker sandbox", http.StatusNotImplemented)
+	case strings.Contains(path, "/process/pty") || strings.Contains(path, "/process/session") || strings.Contains(path, "/sessions"):
+		// Terminals and shell sessions need a shell. Without this case the
+		// "/process" match below would run them as a fetch-handler invoke and
+		// answer 200 with the handler's output, which a Daytona terminal
+		// client cannot tell from a working terminal.
+		http.Error(w, "isolate runtime has no shell: terminals and sessions are not supported", http.StatusNotImplemented)
 	case strings.Contains(path, "/exec") || strings.Contains(path, "/process"):
 		d.serveExec(ctx, sandboxID, w, r)
+	case path == "/files" || strings.HasPrefix(path, "/files/"):
+		// The file API (upload, download, list and the verbs the SDKs added
+		// in plan F1): an isolate has no filesystem. JSON like every other
+		// toolbox error, so the SDKs show this message, not just "501".
+		writeToolboxError(w, http.StatusNotImplemented, "file operations are not supported on V8 isolate sandboxes: an isolate has no filesystem")
 	default:
-		http.Error(w, "isolate runtime does not support this toolbox endpoint (no shell/filesystem; use exec as invoke-handler)", http.StatusNotImplemented)
+		writeToolboxError(w, http.StatusNotImplemented, "isolate runtime does not support this toolbox endpoint (no shell/filesystem; use exec as invoke-handler)")
 	}
+}
+
+// writeToolboxError answers in toolboxd's error shape ({"error": ...}).
+func writeToolboxError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(models.ErrorResponse{Error: message})
 }
 
 // serveExec treats exec as "invoke the sandbox's fetch handler". The command

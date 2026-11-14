@@ -251,3 +251,32 @@ func TestZombieRouteSweepKeepsNewRoutes(t *testing.T) {
 		t.Fatalf("tls routes after gc = %v", got)
 	}
 }
+
+// TestZombieRouteSweepReadsRowsOnceAfterItsSnapshot: the sweep explains
+// routes only by the rows it reads after its Caddy snapshot. A row the
+// caller read earlier but that is gone now (the sandbox was deleted in
+// between) no longer keeps its route for another pass, and a live row's
+// routes stay.
+func TestZombieRouteSweepReadsRowsOnceAfterItsSnapshot(t *testing.T) {
+	fake := newGCCaddyFake()
+	fake.httpRouteIDs["sandbox-live"] = struct{}{}
+	fake.httpRouteIDs["sandbox-gone"] = struct{}{}
+	server := httptest.NewServer(fake.handler(t))
+	t.Cleanup(server.Close)
+
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc.caddy = caddy.New(config.Config{CaddyAdminURL: server.URL, CaddyServerID: "srv0", EnableCaddy: true, HTTPClientTimeout: 5 * time.Second})
+	now := time.Now().UTC()
+	public := true
+	live := &models.Sandbox{ID: "live", Image: "alpine", Status: models.SandboxStatusStarted, AllowPublicTraffic: &public, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}
+	if err := st.Create(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	// The caller's rows still list "gone", which the store no longer has.
+	stale := []*models.Sandbox{live, {ID: "gone", Image: "alpine", Status: models.SandboxStatusStarted, AllowPublicTraffic: &public}}
+	svc.gcZombieCaddyEntries(context.Background(), stale)
+	if got := fake.keys(fake.httpRouteIDs); !equalSorted(got, []string{"sandbox-live"}) {
+		t.Fatalf("http routes after gc = %v, want only the live sandbox's", got)
+	}
+}

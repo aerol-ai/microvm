@@ -16,7 +16,7 @@ func TestBeginSandboxCreateMetricTracksSuccessAndTimeouts(t *testing.T) {
 	timeoutErrorsBefore := expvarMapValue(createErrors, "timeout")
 	timeoutsBefore := expvarMapValue(createTimeouts, "timeout")
 
-	success := beginSandboxCreateMetric()
+	success := beginSandboxCreateMetric(nil)
 	if got := createQueueDepth.Value(); got < 1 {
 		t.Fatalf("queue depth during in-flight create = %d, want >= 1", got)
 	}
@@ -28,7 +28,7 @@ func TestBeginSandboxCreateMetricTracksSuccessAndTimeouts(t *testing.T) {
 		t.Fatalf("queue depth after successful create = %d, want 0", got)
 	}
 
-	failure := beginSandboxCreateMetric()
+	failure := beginSandboxCreateMetric(nil)
 	failure(context.DeadlineExceeded)
 	if got := createRequestsTotal.Value() - totalBefore; got != 2 {
 		t.Fatalf("total create request delta = %d, want 2", got)

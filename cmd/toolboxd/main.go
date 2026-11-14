@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -35,10 +34,12 @@ import (
 var userCommandPID atomic.Int64
 
 // sandboxEnv is the sandbox env a Firecracker host pushes over vsock
-// (set_env). Empty on a container runtime, whose sandbox env is already in
-// os.Environ(). Every child toolboxd starts for the user takes its
-// environment from childEnviron, so the pushed env reaches exec, sessions,
-// terminals, SSH, envd and Daytona processes alike.
+// (set_env), or a containerd host sends in a warm-pool adopt frame
+// (applyAdoptFrame). Empty on a container created cold, whose sandbox env is
+// already in os.Environ(). Every child toolboxd starts for the user takes
+// its environment from childEnviron, so the pushed env reaches the held-back
+// image command, exec, sessions, terminals, SSH, envd and Daytona processes
+// alike.
 var sandboxEnv = &sandboxenv.Store{}
 
 // childEnviron is the environment a user-facing child starts from: toolboxd's
@@ -88,6 +89,11 @@ type server struct {
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+
+	// ptys is the Daytona SDK's terminals (plan E8), made on first use by
+	// daytonaPTYs().
+	ptyOnce sync.Once
+	ptys    *daytonaPTYs
 
 	// execLiveness overrides the exec-stream keepalive timings; the zero value
 	// means defaultExecStreamLiveness. Only tests set it.
@@ -184,7 +190,7 @@ func (s *server) portAllowed(port int) bool {
 
 func main() {
 	// --version / -v must be handled before any server setup so deploy
-	// tooling (Ansible's update-toolboxd.yml) can probe an installed binary
+	// tooling (or an operator) can probe an installed binary
 	// without accidentally launching it as a daemon. Note: when toolboxd
 	// runs inside a sandbox container, os.Args[1:] is the user's entry-point
 	// command — there's no ambiguity here because a user command starting
@@ -238,7 +244,7 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", srv.port)
 	httpServer := &http.Server{
-		Handler:           srv.routes(),
+		Handler:           withTraceLog(logger, srv.routes()),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -352,16 +358,36 @@ func (a *sessionFlusherAdapter) FlushRecording(id string) error {
 }
 
 func startUserCommand(logger *slog.Logger, args []string) {
+	env := childEnviron()
 	cmd := exec.Command(args[0], args[1:]...)
+	if sandboxEnv.Len() > 0 && !strings.Contains(args[0], "/") {
+		// exec.Command looked a bare name up on toolboxd's own PATH. On a
+		// container created cold that is the sandbox env's PATH, which is
+		// where the engine resolves an entrypoint too. A warm-pool
+		// container got its env in the adopt frame, after toolboxd
+		// started, so look the name up on the PATH the child gets, or a
+		// create that sets PATH could run another binary (or none) warm
+		// than it runs cold.
+		if path, code, _ := resolveArgvProgram(args[0], argvSearchPath(env, nil), ""); code == 0 {
+			cmd.Path, cmd.Err = path, nil
+		} else {
+			cmd.Err = &exec.Error{Name: args[0], Err: exec.ErrNotFound}
+		}
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = childEnviron()
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Held from fork until the pid is recorded: the reaper waits on it, so a
+	// command that exits at once is still known as the main program.
+	mainProgram.lockForStart()
 	if err := cmd.Start(); err != nil {
+		mainProgram.failedToStart()
 		logger.Error("failed to start user command", "args", args, "error", err)
 		return
 	}
 	userCommandPID.Store(int64(cmd.Process.Pid))
+	mainProgram.started(cmd.Process.Pid)
 	if err := cmd.Process.Release(); err != nil {
 		logger.Warn("failed to release user command handle", "error", err)
 	}
@@ -405,16 +431,18 @@ func startReaper(logger *slog.Logger) {
 				if !ok {
 					break
 				}
-				commandPID := int(userCommandPID.Load())
 				switch {
 				case tracked:
 					logger.Debug("reaped exec child", "pid", pid)
-				case pid == commandPID && status.Exited():
-					userCommandPID.CompareAndSwap(int64(commandPID), 0)
-					logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
-				case pid == commandPID && status.Signaled():
-					userCommandPID.CompareAndSwap(int64(commandPID), 0)
-					logger.Info("user command killed", "pid", pid, "signal", status.Signal())
+				case mainProgram.noteExit(pid, status):
+					// The main program's end is on /health from here on
+					// (main_program.go).
+					userCommandPID.CompareAndSwap(int64(pid), 0)
+					if status.Signaled() {
+						logger.Info("user command killed", "pid", pid, "signal", status.Signal())
+					} else {
+						logger.Info("user command exited", "pid", pid, "code", status.ExitStatus())
+					}
 				default:
 					logger.Debug("reaped orphan", "pid", pid)
 				}
@@ -444,9 +472,19 @@ func (s *server) routes() http.Handler {
 				"version":    version.Version,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/health":
-			writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"status":  "ok",
+				"version": version.Version,
+				// Readers still soaking up background jobs' exec output,
+				// and whether new jobs lose their output (B2, ER3).
+				"exec_drainers":        execDrainers.Load(),
+				"exec_drainers_at_cap": execDrainersAtCap(),
+				// The main program's state, exit code or signal and times
+				// (L5): sandboxd reads it for destroyAfterExitFor.
+				"main_program": mainProgram.snapshot(),
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/version":
-			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version})
+			writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": featureList()})
 		case r.Method == http.MethodGet && r.URL.Path == "/clone-generation":
 			// Unauthenticated like /health: the token is a non-sensitive
 			// change-detector for snapshot clones, and external access is
@@ -461,6 +499,7 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleEnvdRoute(w, r) {
+				markRouteMissing(w)
 				writeEnvdError(w, http.StatusNotFound, "not found")
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
@@ -488,14 +527,14 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleDaytonaProcessRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 			if !s.requireAuth(w, r) {
 				return
 			}
 			s.handleUpload(w, r)
-		case r.Method == http.MethodGet && r.URL.Path == "/files/download":
+		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/files/download":
 			if !s.requireAuth(w, r) {
 				return
 			}
@@ -515,6 +554,41 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDaytonaMoveFile(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/copy":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleCopyFile(w, r)
+		case r.Method == http.MethodDelete && r.URL.Path == "/files":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaDeleteFile(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/folder":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaCreateFolder(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/replace":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaReplaceInFiles(w, r)
+		case r.Method == http.MethodPost && r.URL.Path == "/files/permissions":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaSetPermissions(w, r)
+		case isDaytonaLSPPath(r.URL.Path):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			writeError(w, http.StatusNotImplemented, errDaytonaLSPUnsupported)
+		case isDaytonaPTYPath(r.URL.Path):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleDaytonaPTYRoute(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/files/search":
 			if !s.requireAuth(w, r) {
 				return
@@ -525,18 +599,28 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			s.handleDaytonaFindInFiles(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/files/watch":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleFileWatch(w, r)
 		case strings.HasPrefix(r.URL.Path, "/git/"):
 			if !s.requireAuth(w, r) {
 				return
 			}
 			if !s.handleDaytonaGitRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		case r.Method == http.MethodPost && r.URL.Path == "/admin/allowed-ports":
 			if !s.requireAuth(w, r) {
 				return
 			}
 			s.handleSetAllowedPorts(w, r)
+		case r.Method == http.MethodPut && r.URL.Path == "/admin/identity/token":
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.handleIdentityToken(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/process/exec/stream":
 			if !s.requireAuth(w, r) {
 				return
@@ -547,12 +631,27 @@ func (s *server) routes() http.Handler {
 				return
 			}
 			if !s.handleSessionsRoute(w, r) {
-				writeError(w, http.StatusNotFound, "not found")
+				writeRouteNotFound(w)
 			}
 		default:
-			writeError(w, http.StatusNotFound, "not found")
+			writeRouteNotFound(w)
 		}
 	})
+}
+
+// routeMissingHeader marks a 404 that means "toolboxd has no such route", as
+// opposed to a route that answered 404 for a missing file or session. The
+// facade route inventory test (plan X2) uses it to prove every path a facade
+// forwards really exists here.
+const routeMissingHeader = "X-Toolbox-Route"
+
+func markRouteMissing(w http.ResponseWriter) {
+	w.Header().Set(routeMissingHeader, "none")
+}
+
+func writeRouteNotFound(w http.ResponseWriter) {
+	markRouteMissing(w)
+	writeError(w, http.StatusNotFound, "not found")
 }
 
 func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
@@ -674,8 +773,12 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if strings.TrimSpace(req.Command) == "" {
-		writeError(w, http.StatusBadRequest, "command is required")
+	if msg := validateArgvRequest(strings.TrimSpace(req.Command) != "", req.Argv); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	if req.MaxStdoutBytes < 0 || req.MaxStderrBytes < 0 {
+		writeError(w, http.StatusBadRequest, "max_stdout_bytes and max_stderr_bytes must be 0 (no cap) or more")
 		return
 	}
 
@@ -687,108 +790,73 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	shell, err := detectShell()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	start := time.Now()
-	// A login shell, so profile setup applies; the image's PATH, which
-	// /etc/profile resets, goes back in front before the command runs.
-	cmd := exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
-	cmd.Env = append(append(childEnviron(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
+	env := append(append(childEnviron(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
+	shell, shellErr := detectShell()
+	var cmd *exec.Cmd
+	direct := false
+	switch {
+	case len(req.Argv) == 0:
+		if shellErr != nil {
+			writeError(w, http.StatusInternalServerError, shellErr.Error())
+			return
+		}
+		// A login shell, so profile setup applies; the image's PATH, which
+		// /etc/profile resets, goes back in front before the command runs.
+		cmd = exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
+	case shellErr == nil:
+		// The same login shell and PATH, with the arguments passed through
+		// "$@" unparsed (E2).
+		args := shellArgv(shell, true, req.Argv)
+		cmd = exec.CommandContext(ctx, args[0], args[1:]...)
+	default:
+		path, code, stderr := resolveArgvProgram(req.Argv[0], argvSearchPath(env, req.Env), req.WorkDir)
+		if code != 0 {
+			writeJSON(w, http.StatusOK, models.ExecResult{Stderr: stderr, ExitCode: code, DurationMS: time.Since(start).Milliseconds()})
+			return
+		}
+		cmd = exec.CommandContext(ctx, path, req.Argv[1:]...)
+		cmd.Args[0] = req.Argv[0]
+		direct = true
+	}
+	cmd.Env = env
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	// Own process group, so a timeout kills the background jobs the command
+	// started, not just the shell (B2).
+	prepareProcessGroup(cmd)
 
-	child, err := startTracked(cmd)
+	out, err := runBufferedExecLimited(s.logger, cmd, execOutputLimits{stdout: req.MaxStdoutBytes, stderr: req.MaxStderrBytes})
 	if err != nil {
+		if direct {
+			if code, stderr, ok := argvStartFailure(req.Argv[0], req.WorkDir, err); ok {
+				writeJSON(w, http.StatusOK, models.ExecResult{Stderr: stderr, ExitCode: code, DurationMS: time.Since(start).Milliseconds()})
+				return
+			}
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	var stdoutBytes []byte
-	var stderrBytes []byte
-	var readWG sync.WaitGroup
-	readWG.Add(2)
-	go func() {
-		defer readWG.Done()
-		stdoutBytes, _ = io.ReadAll(stdout)
-	}()
-	go func() {
-		defer readWG.Done()
-		stderrBytes, _ = io.ReadAll(stderr)
-	}()
-	readWG.Wait()
-	waitErr := child.wait()
+	waitErr := out.waitErr
 
 	result := models.ExecResult{
-		Stdout:     string(stdoutBytes),
-		Stderr:     string(stderrBytes),
+		Stdout:     out.stdout,
+		Stderr:     out.stderr,
 		DurationMS: time.Since(start).Milliseconds(),
+		// Only the exec's own deadline counts; a caller that hung up is
+		// not a timeout.
+		TimedOut:        errors.Is(ctx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil,
+		StdoutTruncated: out.stdoutTruncated,
+		StderrTruncated: out.stderrTruncated,
 	}
 
 	result.ExitCode, _ = interpretWaitResult(waitErr)
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
-			result.Stderr = strings.TrimSpace(result.Stderr + "\n" + waitErr.Error())
-		}
-	}
+	result.Signal = waitSignal(waitErr)
+	result.Stderr = withWaitError(result.Stderr, waitErr)
 
 	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	maxBytes := envInt64("SB_UPLOAD_MAX_BYTES", 256*1024*1024)
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
-		return
-	}
-
-	targetPath := strings.TrimSpace(r.FormValue("path"))
-	if targetPath == "" {
-		targetPath = strings.TrimSpace(r.URL.Query().Get("path"))
-	}
-	if targetPath == "" {
-		writeError(w, http.StatusBadRequest, "path is required")
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "file is required")
-		return
-	}
-	defer file.Close()
-
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	if err := writeMultipartFile(targetPath, file); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"path": targetPath,
-		"name": header.Filename,
-	})
 }
 
 func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -824,11 +892,20 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(targetPath)))
-	if info.Mode().IsRegular() {
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	if info.Mode().IsRegular() && info.Size() > 0 {
+		// Range (206, 416 for a range past the end), HEAD, Last-Modified
+		// and If-Modified-Since, from the standard library (plan F4).
+		// ServeContent keeps the Content-Type set above.
+		http.ServeContent(w, r, filepath.Base(targetPath), info.ModTime(), f)
+		return
 	}
+	// A device, a pipe, or a file whose size the kernel reports as 0 while
+	// it has content (/proc): its length is unknown, so it streams to the
+	// end with no Content-Length and no Range.
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, f)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, f)
+	}
 }
 
 func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {
@@ -921,7 +998,9 @@ func envMapToSlice(values map[string]string) []string {
 	return result
 }
 
-func writeMultipartFile(path string, file multipart.File) error {
+// writeMultipartFile is the plain upload: create or truncate path and copy
+// file into it.
+func writeMultipartFile(path string, file io.Reader) error {
 	tmp, err := os.Create(path)
 	if err != nil {
 		return err

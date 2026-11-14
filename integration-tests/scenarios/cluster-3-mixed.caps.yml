@@ -17,6 +17,9 @@ capabilities:
   # Identity and access (T12): avm_ tokens and the test issuer on every node.
   - identity
   - identity-oidc
+  # identity_issuer_enabled=true: every node is an OIDC issuer for sandbox
+  # cloud identities (UC-431..437, UC-436 needs the three nodes).
+  - cloud-identity
   # Every node exports audit records to the scenario's S3 bucket (UC-279).
   - audit-export-s3
   # UC-281's mixed-version gate runs here when the fleet is provisioned from

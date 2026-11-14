@@ -94,6 +94,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// here on instead of "connection refused" (liveness.go).
 	live := startLiveness(cfg.LivenessSocket, logger)
 	defer live.stop()
+	// Before anything reads a binary or the database: a node never boots
+	// on a half-swapped set of binaries (upgrade_recovery.go).
+	if err := recoverInterruptedUpgrade(ctx, cfg, logger); err != nil {
+		return err
+	}
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -111,6 +116,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := identityBootGuard(cfg, cp); err != nil {
 		return err
 	}
+	if err := checkHostProcessesOutliveAgent(cfg); err != nil {
+		return err
+	}
 
 	// Derive a cancellable child so a fatal failure in a background server
 	// goroutine (HTTP/ingress ListenAndServe) can trigger graceful shutdown by
@@ -120,6 +128,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
 	configureHostMediatedNodeGuard(cfg, logger)
+	configureEgressRanges(cfg, logger)
 	// Before anything dials a toolbox: every toolbox connection is
 	// dialed with this bound.
 	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)
@@ -185,6 +194,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer db.Close()
+	if err := runStandaloneOneWayMigrations(ctx, cfg, db); err != nil {
+		return err
+	}
+	// Open and migrate are done, and nothing past them (reconcile, the
+	// secret outbox, any loop) has run: the upgrader restores its database
+	// backup only when a new binary never got here.
+	markStoreOpened(cfg, logger)
 
 	// The dockerd driver ALWAYS drives DOCKER-USER, independent of the host
 	// engine choice. On a node flipped to containerd, pre-flip engine=docker
@@ -213,14 +229,21 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err := docker.EnsureReadyDir(readyDir); err != nil {
 			return fmt.Errorf("ready socket dir: %w", err)
 		}
-		if err := dockerClient.SweepOrphanReadySockets(ctx); err != nil {
-			logger.Warn("ready socket sweep failed", "error", err)
+		// The sweep asks Docker which sockets its containers still use;
+		// without Docker (C2) there is nothing to ask.
+		if !cfg.DockerDisabled {
+			if err := dockerClient.SweepOrphanReadySockets(ctx); err != nil {
+				logger.Warn("ready socket sweep failed", "error", err)
+			}
 		}
 	}
 	configureMirror(logger, cfg, dockerClient)
 	configureAOCRPullAuth(logger, cfg, models.ContainerEngineDocker, dockerClient)
 
 	caddyClient := caddy.New(cfg)
+	if cfg.EnableCaddy && cfg.TLSCertWatchFile != "" {
+		go watchTLSCertificate(ctx, cfg.TLSCertWatchFile, caddyClient.ReloadCertificates, logger)
+	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:     cfg.MountsRootPath,
@@ -245,6 +268,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// deployments that never configured SB_HOST_DISK_GB. Disk admission stays
 	// opt-in: DiskTotalGB only carries the operator's declared budget.
 	detectedDiskTotalGB := host.DiskTotalGB
+	host, memProbe, err := capacityFromCgroupParent(cfg, logger, host, capacity.NewProcMeminfoProbe())
+	if err != nil {
+		return err
+	}
 	if cfg.HostCPUCoresOverride > 0 {
 		host.CPUCores = cfg.HostCPUCoresOverride
 	}
@@ -255,6 +282,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
 	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
+	host.Labels = hostLabels(cfg)
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
 	// the start (capacity holds the RSSSource by reference, not value).
@@ -283,11 +311,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		CPUReservationRatio:       cfg.CPUReservationRatio,
 		MemoryReservationRatio:    cfg.MemoryReservationRatio,
 		DiskReservationRatio:      cfg.DiskReservationRatio,
+		DiskFloorRatio:            cfg.DiskFloorRatio,
 		MemoryFloorRatio:          cfg.MemoryFloorRatio,
 		CPUOverProvisionFactor:    cfg.CPUOverProvisionFactor,
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
 		RSSWatermarkRatio:         cfg.FirecrackerRSSWatermarkRatio,
-	}, capacity.NewProcMeminfoProbe(), rssSource)
+	}, memProbe, rssSource)
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,
@@ -297,6 +326,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"host_gpu_count", host.GPUCount,
 		"host_gpu_vendor", host.GPUVendor,
 		"host_supported_runtimes", host.SupportedRuntimes,
+		"node_labels", host.Labels,
 		"cpu_reservation_ratio", cfg.CPUReservationRatio,
 		"memory_reservation_ratio", cfg.MemoryReservationRatio,
 		"disk_reservation_ratio", cfg.DiskReservationRatio,
@@ -305,6 +335,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
+	if err := wireDiskFloor(logger, cfg, admitter, capacity.NewStatfsDiskProbe); err != nil {
+		return err
+	}
 	// The docker engine's sandbox bridge holds 1,023 ports; count them as a
 	// slot pool before any create or reservation replay can fill it.
 	wireDockerBridgeSlots(ctx, cfg, logger, dockerClient, admitter)
@@ -348,12 +381,24 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc.RecordKeyCustody()
 	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
+	if cfg.ContainerEngine == models.ContainerEngineContainerd {
+		subnet, err := resolveContainerdBridgeSubnet(cfg, logger)
+		if err != nil {
+			return err
+		}
+		cfg.ContainerdBridgeSubnet = subnet
+	}
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
 	} else if ctd != nil {
 		ctdWiring = ctd
 		defer ctd.Stop()
+		if ctd.warm != nil {
+			// API warm-pool entries (W1) configure this pool per image;
+			// StartWarmPoolSync below applies them.
+			svc.RegisterWarmPool(ctd.warm, cfg.Runtime)
+		}
 	}
 	// Wire the control-plane usage reporter into the service's background loops
 	// (reconcile / event monitor / netstats / live sampler). Under
@@ -387,6 +432,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	dockerWarmPool := wireDockerWarmPool(ctx, cfg, logger, dockerClient, admitter)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
+		// Keys carry cfg.Runtime, as the SB_DOCKER_POOL_IMAGES pins do, so
+		// an entry's slots match a create that names only the image.
+		svc.RegisterWarmPool(dockerWarmPool, cfg.Runtime)
 	}
 	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
 	if netnsPool != nil {
@@ -445,7 +493,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
-		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
+		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: firecrackerTapHost(cfg)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
 		// Snapshots (CreateSnapshot) go into the node's container engine,
 		// and a cold boot pulls a snapshot another node pushed with the
@@ -551,6 +599,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			fcDriver.SetWarmPool(vmmPool)
 			lister := &vmmTemplateListerAdapter{svc: svc}
 			spawner := fcruntime.NewPoolSpawner(fcDriver)
+			// The same adapter tears down a released slot the pool has no
+			// handle for (every slot a restart left behind), so the reap
+			// never deletes the last record of its run dir and TAP device.
+			vmmPool.SetOrphanCleaner(spawner)
 			refillCfg := vmmpool.RefillConfig{
 				RefillInterval: cfg.FirecrackerVMMPoolRefillInterval,
 				GCInterval:     cfg.FirecrackerVMMPoolGCInterval,
@@ -601,6 +653,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Cluster startup. Server-role nodes host Raft/FSM. Worker/ingress-only
 	// nodes start a lightweight agent: gossip + owner-forward receiver +
 	// control-plane RPC, but no Raft transport and no placement FSM copy.
+	var clusterShutdown cluster.ShutdownPreparer
 	if cfg.EnableCluster {
 		var (
 			clusterClient cluster.Client
@@ -619,6 +672,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				logger.Warn("cluster shutdown returned error", "error", err)
 			}
 		}()
+		clusterShutdown, _ = clusterClient.(cluster.ShutdownPreparer)
 		svc.AttachCluster(clusterClient)
 		// Fail closed on oversized ingress tiers without an explicit
 		// shard-aware router opt-in. Enterprise boots refuse to start;
@@ -642,6 +696,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// sandboxes too, and when only *Cluster did, this probe silently
 		// skipped every worker-role node and its reassigned placements were
 		// never materialized. A miss is now loud rather than invisible.
+		attachOneWayMigrator(ctx, clusterClient, db)
 		if withRecreator, ok := clusterClient.(interface {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {
@@ -649,6 +704,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		} else {
 			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
 				"node_role", cfg.NodeRole)
+		}
+		// A server that also runs sandboxes (mixed role) is its own
+		// decommission source or target (C9); a worker agent serves the
+		// leader's move route straight from the service.
+		if withMoves, ok := clusterClient.(interface{ AttachMoveHandler(cluster.MoveHandler) }); ok {
+			withMoves.AttachMoveHandler(svc)
 		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
@@ -710,7 +771,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
 	// the API serves, so no container or Firecracker sandbox is created
 	// without it; while it is not installed those creates are refused.
-	wireIPv6Fence(ctx, cfg, svc, dockerClient, logger)
+	wireIPv6Fence(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
 
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
@@ -732,16 +793,19 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// roll back) BEFORE the boot reconciles below, so they fill the
 	// in-memory route tables instead of writing Caddy. The Caddy side (one
 	// load) is committed once the router is serving.
-	var hostPortForwarder service.HostPortForwarder
-	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
-		hostPortForwarder = newHostPortForwarder(logger)
-	}
+	hostPortForwarder := hostPortForwarderFor(cfg, logger)
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
-	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	wireEgressFloorFile(ctx, cfg, svc, logger)
+	wireCreatePolicy(ctx, cfg, svc, logger)
+	if cfg.EgressBlockPrivateByDefault {
+		svc.EnableBlockPrivateByDefault()
+	}
+	wireEgressGateway(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
 	// After the gateway is wired: whether its ports are open depends on it.
 	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
+	wireCloudIdentity(ctx, cfg, svc, logger)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
@@ -880,6 +944,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartReconcileLoop(ctx)
 		}
 		svc.StartLifecycleSweep(ctx)
+		// Pauses this worker's failover.policy=recreate sandboxes when it
+		// cannot confirm it still owns them (ownership_lease.go). A no-op
+		// outside cluster mode.
+		svc.StartOwnershipLease(ctx)
+		// Run states for the agent-sandbox API (run_state_report.go). A
+		// no-op unless SB_AGENT_SANDBOX_API and cluster mode.
+		svc.StartRunStateReports(ctx)
 		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
@@ -887,6 +958,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// (managed build) and SB_FLEET_LIVE_SAMPLE_INTERVAL > 0; the reserved
 		// axes are emitted from the reconcile/event/netstats loops regardless.
 		svc.StartLiveUsageSampler(ctx)
+		// Per-owner usage counters on /v1/metrics (C20). No-op unless
+		// SB_USAGE_METRICS_ENABLED; sends nothing anywhere either way.
+		svc.StartUsageMetrics(ctx)
 		// Firecracker template janitor (plans/snapshot-clone-fast-boot.md
 		// Phase 2). No-op when SB_ENABLE_FIRECRACKER=false or the GC
 		// enable knob is off; per-tick cancellation is wired off ctx like
@@ -1020,6 +1094,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := svc.StartAPITokens(ctx); err != nil {
 		return err
 	}
+	// API warm-pool entries (plans/agent-sandbox-feature-parity.md W1).
+	// After AttachCluster, so a cluster node reads the replicated entries
+	// rather than its own store. A node with no warm pool starts nothing.
+	svc.StartWarmPoolSync(ctx)
 	// The chain runs the avm_ token authenticator before the OIDC verifier
 	// (§5.2). The verifier and the sign-in discovery issuers are wired only
 	// when an identity file is configured (SB_IDENTITY_FILE).
@@ -1036,6 +1114,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// keeps working unchanged.
 	if cfg.EnableCluster {
 		svc.Cluster().AttachInternalHandler(server.Handler())
+	}
+	// The agent-sandbox API (C17): ingress nodes with SB_AGENT_SANDBOX_API
+	// serve it on their own TLS listener. It is opt-in and off the node's
+	// main job, so a failure to start is logged, not fatal; the APIService
+	// then shows it unavailable.
+	if _, err := startAgentSandboxAPI(ctx, cfg, svc.Cluster(), server.KubeBackend(), logger); err != nil {
+		logger.Error("agent-sandbox API not started", "error", err)
 	}
 	logPATBootSettings(logger, cfg)
 	// SB_PAT_SCOPE=host: Caddy's own listener, where every request is public
@@ -1107,6 +1192,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				// The static routes' fallback (NXDOMAIN): wake, 503, 421,
 				// mediators. nil unless ingress proxy routing is engaged.
 				Hosts: routingBoot.hostRoutes(),
+				// Token-gated ports (A2): checked with the server key, no
+				// store read.
+				Tokens: svc,
 			})
 		}
 		// Caddy on-demand TLS ask callback (plans/custom-domains.md).
@@ -1152,7 +1240,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if !onDemandTLSOnThisNode(cfg) {
 				logger.Info("caddy on-demand TLS policy skipped: ingress-only node under SB_INGRESS_PROXY_ROUTING (owners terminate custom domains)")
 			} else if err := caddyClient.EnsureOnDemandTLS(ctx, askURL, cfg.TLSOnDemandBurst, cfg.TLSOnDemandInterval); err != nil {
-				logger.Warn("failed to install caddy on-demand TLS policy; will retry on next reconcile",
+				// Nothing retries it: this boot call is the only one. Say so,
+				// so an operator knows custom domains get no certificates
+				// until the cause is fixed and sandboxd restarts.
+				logger.Warn("failed to install caddy on-demand TLS policy; custom domains get no new certificates until sandboxd restarts",
 					"error", err, "ask_url", askURL)
 			} else {
 				logger.Info("caddy on-demand TLS policy installed", "ask_url", askURL)
@@ -1197,6 +1288,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	<-ctx.Done()
 	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
+	// First, while the listeners still serve: hand off Raft leadership and
+	// announce the restart (C8), so placement stops choosing this node
+	// during the drain below and the leader waits the restart window.
+	prepareClusterShutdown(clusterShutdown)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer shutdownCancel()
@@ -2290,4 +2385,31 @@ func loopbackAPIBaseURL(listenAddr string) string {
 		port = listenAddr[i+1:]
 	}
 	return "http://127.0.0.1:" + port
+}
+
+// firecrackerTapHost makes the VMs' TAPs. With the jailer on, each is made
+// for the jailer's user and group: the jailed VM runs as that user, which
+// may attach only to a TAP it owns (F33).
+func firecrackerTapHost(cfg config.Config) *tap.Host {
+	h := tap.NewHost(cfg.FirecrackerIPBinary)
+	if cfg.UseJailer {
+		h.Owner = &tap.Owner{UID: cfg.JailerUID, GID: cfg.JailerGID}
+	}
+	return h
+}
+
+// hostLabels are the labels this node's capacity reports: its placement
+// labels, and on a worker that moves gVisor sandboxes with their memory
+// (C21), the label the decommission leader looks for on both ends of such
+// a move.
+func hostLabels(cfg config.Config) map[string]string {
+	if !cfg.GvisorCheckpointMoves || cfg.ContainerEngine != models.ContainerEngineContainerd {
+		return cfg.NodeLabels
+	}
+	out := make(map[string]string, len(cfg.NodeLabels)+1)
+	for k, v := range cfg.NodeLabels {
+		out[k] = v
+	}
+	out[cluster.CheckpointMovesLabel] = "true"
+	return out
 }

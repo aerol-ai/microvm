@@ -6,6 +6,11 @@ dist-test/
 *.db-shm
 *.db-wal
 Terraform/.terraform.lock.hcl
+Terraform/root/.terraform.lock.hcl
+Terraform/examples/*/.terraform.lock.hcl
+# The from-url example's secrets; the committed sibling is
+# config/secrets.example.yml next to it.
+Terraform/examples/*/config/secrets.yml
 *.log
 # Shared cluster secrets (read by both Terraform and Ansible). The committed
 # sibling is config/secrets.example.yml.
@@ -22,6 +27,11 @@ config/terraform.tfvars
 sdk/python/__pycache__/
 sdk/python/.venv/
 sdk/python/venv/
+# Virtualenvs and build/coverage output of the Python integration packages
+# (integrations/*).
+.venv/
+*.egg-info/
+.coverage
 *.pyc
 *.pyo
 *.pyd
@@ -111,3 +121,7 @@ integration-tests/fixtures/wasm/*.wasm
 
 # Local build/debug binary; never commit
 /report
+
+# Phase 0 EKS spike runs: per-run Terraform state, kubeconfig and inputs.
+integration-tests/k8s/.state/
+integration-tests/k8s/terraform/.terraform.lock.hcl

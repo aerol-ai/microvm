@@ -79,6 +79,8 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 	// pool need it to destroy containers, and RunRefill's own SetSpawner
 	// happens on the goroutine's schedule, not ours.
 	pool.SetSpawner(spawner)
+	// Warm-pool entries replace slots whose image changed (W3).
+	pool.SetImageResolver(dockerPoolImageResolver(dockerClient))
 	refillCfg := dockerpool.RefillConfig{
 		RefillInterval: cfg.DockerPoolRefillInterval,
 		SpawnTimeout:   cfg.DockerRuntimeWaitTimeout,
@@ -97,6 +99,14 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 		"max_images", cfg.DockerPoolMaxImages,
 		"refill_interval", cfg.DockerPoolRefillInterval)
 	return pool
+}
+
+// dockerPoolImageResolver answers the pool's image-change check from the
+// engine's local image IDs (never a pull), in the form park records.
+func dockerPoolImageResolver(c *docker.Client) dockerpool.ImageResolver {
+	return func(ctx context.Context, key dockerpool.Key) (string, error) {
+		return c.PoolImageID(ctx, key.Image)
+	}
 }
 
 func drainDockerWarmPool(pool *dockerpool.Pool, logger *slog.Logger) {

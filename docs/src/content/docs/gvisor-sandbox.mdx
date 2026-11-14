@@ -207,7 +207,7 @@ Stop, start, resize and delete work the same as on a normal sandbox. See [Create
 
 - **No GPU.** A sandbox can use gVisor or a GPU, not both. Asking for both fails.
 - **No privileged containers.** gVisor refuses containers that ask for full access to the server.
-- **Disk limits are not enforced.** gVisor ignores `diskGB`, so disk use is limited only by the server.
+- **Disk limits need a server setting.** gVisor ignores `diskGB` itself. On the containerd engine, a server with `SB_CONTAINERD_DISK_QUOTA=true` holds each sandbox to its `diskGB`; without it, disk use is limited only by the server.
 - **Some programs may not run.** gVisor implements most, but not all, of the Linux kernel's features. If a program fails only under gVisor, try it in a normal sandbox.
 
 ## For server operators
@@ -221,7 +221,7 @@ Add `--with-gvisor` to the install command (see [Install on a server](/getting-s
 
 Use `--runsc-path /path/to/runsc` with `--with-gvisor` to register a `runsc` you installed yourself.
 
-On a cluster, set `with_gvisor = true` on each worker in `terraform.tfvars` (see [Cluster setup](/cluster-setup/)). Workers without it keep running normal containers only.
+On a cluster, set `with_gvisor = true` on each worker in Terraform's `nodes` (see [Cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional)). Workers without it keep running normal containers only.
 
 If a create fails with `runtime "gvisor" not supported on this host`, the server does not list gVisor in `SB_HOST_RUNTIMES`. Add it there and restart the server.
 

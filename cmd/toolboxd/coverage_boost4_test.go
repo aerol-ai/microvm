@@ -204,22 +204,50 @@ func TestHelperProcessStartReaper(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
+	// As startUserCommand does: the main program's pid is recorded under
+	// its lock, which is what the reaper matches on (main_program.go).
+	mainProgram.lockForStart()
 	if err := cmdExit.Start(); err != nil {
 		os.Exit(2)
 	}
 	userCommandPID.Store(int64(cmdExit.Process.Pid))
+	mainProgram.started(cmdExit.Process.Pid)
 	_, _ = stdin.Write([]byte("\n"))
 	_ = stdin.Close()
 	waitPIDCleared()
+	if snap := mainProgram.snapshot(); snap["state"] != mainProgramExited || snap["exit_code"] != 0 {
+		os.Exit(4)
+	}
 
 	// User command killed by a signal.
 	cmdKill := exec.Command("/bin/sh", "-c", "sleep 30")
+	mainProgram.lockForStart()
 	if err := cmdKill.Start(); err != nil {
 		os.Exit(2)
 	}
 	userCommandPID.Store(int64(cmdKill.Process.Pid))
+	mainProgram.started(cmdKill.Process.Pid)
 	_ = syscall.Kill(cmdKill.Process.Pid, syscall.SIGKILL)
 	waitPIDCleared()
+	if snap := mainProgram.snapshot(); snap["state"] != mainProgramKilled || snap["exit_code"] != 137 || snap["signal"] != "SIGKILL" {
+		os.Exit(5)
+	}
+
+	// A main program that exits before its pid is recorded: the reaper
+	// reaps it while startUserCommand still holds the lock, waits, and
+	// then knows it as the main program, not an orphan.
+	mainProgram.lockForStart()
+	fast := exec.Command("/bin/sh", "-c", "exit 7")
+	if err := fast.Start(); err != nil {
+		os.Exit(2)
+	}
+	time.Sleep(100 * time.Millisecond)
+	userCommandPID.Store(int64(fast.Process.Pid))
+	mainProgram.started(fast.Process.Pid)
+	waitPIDCleared()
+	if snap := mainProgram.snapshot(); snap["state"] != mainProgramExited || snap["exit_code"] != 7 {
+		os.Exit(6)
+	}
 
 	// Untracked orphan.
 	cmd2 := exec.Command("/bin/sh", "-c", "exit 0")

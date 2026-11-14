@@ -31,7 +31,7 @@ func TestDetectRaftLogStoreFormat(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir2, raftLogBoltFilename), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openRaftLogStore(dir2, slog.Default()); err == nil {
+	if _, err := openRaftLogStore(dir2, "", slog.Default()); err == nil {
 		t.Fatal("expected error when raft-log.bolt is a directory")
 	}
 }
@@ -39,7 +39,7 @@ func TestDetectRaftLogStoreFormat(t *testing.T) {
 func TestOpenRaftLogStoreWAL(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.Default()
-	store, err := openRaftLogStore(dir, logger)
+	store, err := openRaftLogStore(dir, "", logger)
 	if err != nil {
 		t.Fatalf("open wal: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestOpenRaftLogStoreBoltWhenPresent(t *testing.T) {
 	}
 	_ = seed.Close()
 
-	reopened, err := openRaftLogStore(dir, logger)
+	reopened, err := openRaftLogStore(dir, "", logger)
 	if err != nil {
 		t.Fatalf("reopen bolt: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestMixedFormatRecoveryUsesMatchingStore(t *testing.T) {
 	}
 	_ = seed.Close()
 
-	store, err := openRaftLogStore(dir, logger)
+	store, err := openRaftLogStore(dir, "", logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestOpenRaftLogStoreErrorPaths(t *testing.T) {
 	if err := os.WriteFile(boltPath, []byte("not-a-bolt-db"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openRaftLogStore(dir, logger); err == nil {
+	if _, err := openRaftLogStore(dir, "", logger); err == nil {
 		t.Fatal("want bolt open error on corrupt file")
 	}
 
@@ -160,13 +160,13 @@ func TestOpenRaftLogStoreErrorPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir2, 0o700) })
-	if _, err := openRaftLogStore(dir2, logger); err == nil {
+	if _, err := openRaftLogStore(dir2, "", logger); err == nil {
 		t.Fatal("want mkdir wal dir error on read-only dataDir")
 	}
 
 	// nil logger still opens WAL.
 	dir3 := t.TempDir()
-	store, err := openRaftLogStore(dir3, nil)
+	store, err := openRaftLogStore(dir3, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,5 +178,66 @@ func TestRaftNodeCloseNilFields(t *testing.T) {
 	rn := &raftNode{}
 	if err := rn.Close(); err != nil {
 		t.Fatalf("Close empty = %v", err)
+	}
+}
+
+// SB_RAFT_WAL_DIR puts the log where it names, and the node keeps it there:
+// a restart with the setting gone follows the record, and one naming another
+// directory is refused rather than opening an empty log.
+func TestOpenRaftLogStoreOwnDir(t *testing.T) {
+	dir, own := t.TempDir(), filepath.Join(t.TempDir(), "raft-wal")
+	logger := slog.Default()
+	store, err := openRaftLogStore(dir, own, logger)
+	if err != nil {
+		t.Fatalf("open with SB_RAFT_WAL_DIR: %v", err)
+	}
+	if err := store.StoreLogs([]*raft.Log{{Index: 1, Term: 1, Type: raft.LogCommand, Data: []byte("a")}}); err != nil {
+		t.Fatalf("StoreLogs: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The data dir holds the record where the log's directory would be, so
+	// an older sandboxd cannot open an empty log there.
+	if st, err := os.Lstat(filepath.Join(dir, raftLogWALDirname)); err != nil || !st.Mode().IsRegular() {
+		t.Fatalf("no record in place of the log directory: %v %v", st, err)
+	}
+	// The node has run: Raft's stable store sits beside the record.
+	if err := os.WriteFile(filepath.Join(dir, raftStableFilename), []byte{0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, configured := range []string{own, ""} {
+		reopened, err := openRaftLogStore(dir, configured, logger)
+		if err != nil {
+			t.Fatalf("reopen with SB_RAFT_WAL_DIR=%q: %v", configured, err)
+		}
+		var got raft.Log
+		if err := reopened.GetLog(1, &got); err != nil || string(got.Data) != "a" {
+			t.Fatalf("reopen with SB_RAFT_WAL_DIR=%q lost the entry: %v %q", configured, err, got.Data)
+		}
+		_ = reopened.Close()
+	}
+	if _, err := openRaftLogStore(dir, filepath.Join(t.TempDir(), "elsewhere"), logger); err == nil {
+		t.Fatal("a moved SB_RAFT_WAL_DIR opened a new log")
+	}
+}
+
+// A bolt node keeps its log in raft-log.bolt whatever SB_RAFT_WAL_DIR says.
+func TestOpenRaftLogStoreBoltIgnoresWALDir(t *testing.T) {
+	dir := t.TempDir()
+	seed, err := openBoltLogStoreForTest(filepath.Join(dir, raftLogBoltFilename))
+	if err != nil {
+		t.Fatalf("seed bolt: %v", err)
+	}
+	_ = seed.Close()
+	own := filepath.Join(t.TempDir(), "raft-wal")
+	store, err := openRaftLogStore(dir, own, slog.Default())
+	if err != nil {
+		t.Fatalf("open bolt with SB_RAFT_WAL_DIR: %v", err)
+	}
+	_ = store.Close()
+	if _, err := os.Stat(own); !os.IsNotExist(err) {
+		t.Fatalf("SB_RAFT_WAL_DIR was used on a bolt node: %v", err)
 	}
 }

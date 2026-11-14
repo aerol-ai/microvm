@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // On 2026-10-16 a live run of single-node-secrets-enterprise, started from a
@@ -56,14 +57,7 @@ func runBashScript(t *testing.T, script, root string, env []string) (string, str
 // have stopped on its own and this test would prove nothing.
 func TestLeaseDomainForScenarioNeverHandsOutAnEmptyDomain(t *testing.T) {
 	requireYQ(t)
-	src, err := os.ReadFile(runScript(t))
-	if err != nil {
-		t.Fatalf("read run.sh: %v", err)
-	}
-	var fns strings.Builder
-	for _, name := range []string{"domains_in_use", "lease_domain", "scenario_overlay_domain", "lease_domain_for_scenario"} {
-		fns.WriteString(extractShellFunc(t, string(src), name))
-	}
+	fns := leaseFuncs(t)
 
 	str := func(s string) *string { return &s }
 	cases := []struct {
@@ -121,7 +115,7 @@ DOMAINS_FILE="${HERE}/scenarios/domains.yml"
 KEEP=` + keep + `
 # No Terraform state: the --keep fallback must never reach a real backend.
 terraform_state_domain() { return 1; }
-` + fns.String() + `
+` + fns + `
 rc=0
 leased=$(lease_domain_for_scenario s) || rc=$?
 printf '%s' "$leased"
@@ -159,6 +153,216 @@ exit "$rc"
 				t.Errorf("pin holds %q (err %v); want the leased %q", pinBytes, pinErr, got)
 			}
 		})
+	}
+}
+
+// leaseFuncs lifts the lease functions, and every helper they call, out of
+// run.sh.
+func leaseFuncs(t *testing.T) string {
+	t.Helper()
+	src, err := os.ReadFile(runScript(t))
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	var fns strings.Builder
+	for _, name := range []string{
+		"worktree_roots", "domain_pins", "domains_in_use",
+		"lease_lock_path", "lease_lock_acquire", "lease_lock_release",
+		"lease_domain", "scenario_overlay_domain", "lease_domain_for_scenario",
+	} {
+		fns.WriteString(extractShellFunc(t, string(src), name))
+	}
+	return fns.String()
+}
+
+// leaseScript leases a domain for scenario from the tree at $1, as run_one
+// does (inside $(…), KEEP=0), and prints it.
+func leaseScript(fns, scenario string) string {
+	return `set -euo pipefail
+REPO_ROOT="$1"
+HERE="${REPO_ROOT}/integration-tests"
+DOMAINS_FILE="${HERE}/scenarios/domains.yml"
+KEEP=0
+terraform_state_domain() { return 1; }
+` + fns + `
+rc=0
+leased=$(lease_domain_for_scenario ` + scenario + `) || rc=$?
+printf '%s' "$leased"
+exit "$rc"
+`
+}
+
+// gitEnv keeps the operator's git config (signing, hooks) out of the
+// throwaway repos.
+func gitEnv() []string {
+	return append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+}
+
+// twoWorktrees makes a throwaway clone at a with a second worktree at b, both
+// holding the two-domain pool, the way parallel lanes and agent sessions each
+// run from their own worktree of one clone.
+func twoWorktrees(t *testing.T) (a, b string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	a, b = filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	mustMkdir(t, a)
+	for _, args := range [][]string{
+		{"-C", a, "init", "-q"},
+		{"-C", a, "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", a, "worktree", "add", "-q", b},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Env = gitEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	for _, root := range []string{a, b} {
+		mustMkdir(t, filepath.Join(root, "integration-tests", "scenarios"))
+		mustWrite(t, filepath.Join(root, "integration-tests", "scenarios", "domains.yml"), leasePool)
+	}
+	return a, b
+}
+
+func pinDomain(t *testing.T, root, scenario, domain string) {
+	t.Helper()
+	dir := filepath.Join(root, "integration-tests", ".tf", scenario)
+	mustMkdir(t, dir)
+	mustWrite(t, filepath.Join(dir, ".leased-domain"), domain+"\n")
+}
+
+// On 2026-11-07 a run in one worktree leased sandbox.aerol.live while another
+// session's worktree was live on it: the lease read only its own tree's pins.
+// Two stacks then sat behind one name, its A records round-robined between
+// two ingresses, and the suite saw "sandbox not found" and invalid_signature.
+func TestLeaseDomainSkipsPinsHeldInOtherWorktrees(t *testing.T) {
+	requireYQ(t)
+	a, b := twoWorktrees(t)
+	fns := leaseFuncs(t)
+	// b is live on one.itest under the SAME scenario name: a different pin
+	// path, so a different holder.
+	pinDomain(t, b, "s", "one.itest.example.com")
+	// A lock left by a run killed mid-lease must not block the next one.
+	lock := filepath.Join(a, ".git", "aerol-itest-domain-lease.lock")
+	mustMkdir(t, lock)
+	old := time.Now().Add(-2 * time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// The random start lands on the held domain half the time, so eight
+	// tries miss the old bug 1 time in 256.
+	for i := range 8 {
+		stdout, _, code := runBashScript(t, leaseScript(fns, "s"), a, gitEnv())
+		if code != 0 || strings.TrimSpace(stdout) != "two.itest.example.com" {
+			t.Fatalf("try %d: leased %q (exit %d); one.itest is held by worktree b", i, stdout, code)
+		}
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("the lease lock is still there after the leases finished (stat err %v)", err)
+	}
+
+	// With two.itest held in a's own tree too, the pool is exhausted, and the
+	// refusal names b's pin so the operator knows which worktree to tear down.
+	pinDomain(t, a, "other", "two.itest.example.com")
+	stdout, stderr, code := runBashScript(t, leaseScript(fns, "s"), a, gitEnv())
+	if code == 0 || stdout != "" {
+		t.Fatalf("leased %q (exit %d) with every domain held", stdout, code)
+	}
+	if !strings.Contains(stderr, "domain pool exhausted") ||
+		!strings.Contains(stderr, filepath.Join("b", "integration-tests", ".tf", "s", ".leased-domain")) {
+		t.Errorf("the refusal does not name worktree b's pin:\n%s", stderr)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("a refused lease left the lock behind (stat err %v)", err)
+	}
+}
+
+// A lease that finds the lock held by a live run waits for it instead of
+// reading the pins mid-lease, and goes on once the lock is freed.
+func TestLeaseWaitsForAHeldLock(t *testing.T) {
+	requireYQ(t)
+	a, b := twoWorktrees(t)
+	fns := leaseFuncs(t)
+	lock := filepath.Join(a, ".git", "aerol-itest-domain-lease.lock")
+	mustMkdir(t, lock) // fresh: another run is mid-lease
+	cmd := exec.Command("bash", "-c", leaseScript(fns, "s"), "bash", b)
+	cmd.Env = gitEnv()
+	var out strings.Builder
+	cmd.Stdout = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		t.Fatalf("the lease finished (%v, %q) while another run held the lock", err, out.String())
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := os.Remove(lock); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil || !slices.Contains(leasePoolDomains, strings.TrimSpace(out.String())) {
+			t.Fatalf("after the lock was freed: %v, leased %q", err, out.String())
+		}
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the lease did not go on after the lock was freed")
+	}
+}
+
+// Two runs started at the same moment from two worktrees, with a two-domain
+// pool, must each get a domain and never the same one. Without the lease lock
+// both read "nothing held" before either wrote its pin, so they matched half
+// the time.
+func TestConcurrentLeasesFromTwoWorktreesNeverShareADomain(t *testing.T) {
+	requireYQ(t)
+	a, b := twoWorktrees(t)
+	fns := leaseFuncs(t)
+	for round := range 10 {
+		for _, root := range []string{a, b} {
+			if err := os.RemoveAll(filepath.Join(root, "integration-tests", ".tf")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		type run struct {
+			cmd *exec.Cmd
+			out strings.Builder
+		}
+		runs := []*run{{}, {}}
+		for i, root := range []string{a, b} {
+			r := runs[i]
+			r.cmd = exec.Command("bash", "-c", leaseScript(fns, "s"), "bash", root)
+			r.cmd.Env = gitEnv()
+			r.cmd.Stdout = &r.out
+			var stderr strings.Builder
+			r.cmd.Stderr = &stderr
+			if err := r.cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i, r := range runs {
+			if err := r.cmd.Wait(); err != nil {
+				t.Fatalf("round %d: lease %d failed: %v", round, i, err)
+			}
+		}
+		got := []string{strings.TrimSpace(runs[0].out.String()), strings.TrimSpace(runs[1].out.String())}
+		if got[0] == got[1] {
+			t.Fatalf("round %d: both worktrees leased %q", round, got[0])
+		}
+		for _, d := range got {
+			if !slices.Contains(leasePoolDomains, d) {
+				t.Fatalf("round %d: leased %q, not a pool domain", round, d)
+			}
+		}
 	}
 }
 
@@ -214,6 +418,8 @@ func TestRunRefusesADomainScenarioWithNoDomainPool(t *testing.T) {
 			toolLog := filepath.Join(root, "tool-calls")
 			mustWrite(t, filepath.Join(it, "run.sh"), string(runSh))
 			mustWrite(t, filepath.Join(it, "lib", "common.sh"), string(common))
+			// common.sh sources stage.sh beside it.
+			mustWrite(t, filepath.Join(it, "lib", "stage.sh"), string(stageLib(t)))
 			mustWrite(t, filepath.Join(it, "lib", "provision.sh"),
 				"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >>\""+gateLog+"\"\nexit 97\n")
 			for _, tool := range []string{"terraform", "aws", "curl", "ssh"} {

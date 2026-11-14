@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -78,9 +79,12 @@ type Server struct {
 	// nil with no limit.
 	listGate       *apihttp.Gate
 	clusterEnabled bool
-	mux            *http.ServeMux
-	root           http.Handler
-	mcp            *remotemcp.Handler
+	// pprofEnabled mounts /debug/pprof/ for fleet.admin (SB_ENABLE_PPROF,
+	// pprof.go).
+	pprofEnabled bool
+	mux          *http.ServeMux
+	root         http.Handler
+	mcp          *remotemcp.Handler
 
 	// authChain is the ordered authenticator list authenticate() tries
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
@@ -94,6 +98,11 @@ type Server struct {
 	patTokenPrevious string
 	patScopeHost     bool
 	l4ProxyProtocol  bool
+	// patSHA256 and localToken are set on a node joined without the
+	// operator PAT (config/pat_verifier.go): the PAT's hashes, and this
+	// node's own token, which works only for local tools.
+	patSHA256  []string
+	localToken string
 
 	// Sign-in discovery (discovery.go): whether identity is on, the
 	// issuers to publish, and SB_DOMAIN for ui_url.
@@ -178,6 +187,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		mcpResource:     options.mcpResource,
 		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
+		pprofEnabled:    cfg.EnablePprof,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
 			OperatorRate: cfg.AuditRateLimitOperator,
@@ -195,9 +205,15 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	listGateLimitMetric.Set(int64(s.listGate.Limit()))
 	listGatePerTenantMetric.Set(int64(s.listGate.PerFlowLimit()))
 	s.patTokenPrevious = cfg.PATTokenPrevious
+	s.patSHA256 = cfg.PATTokenSHA256
+	if len(s.patSHA256) > 0 && !config.PATMatchesSHA256(patToken, s.patSHA256) {
+		// SB_PAT_TOKEN is not the operator PAT here: it is this node's own
+		// token, and the hashes stand for the PAT.
+		s.patToken, s.localToken = "", patToken
+	}
 	s.patScopeHost = cfg.PATScopeHostOnly()
 	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
-	s.authChain = buildAuthChain(s.patAuth(), validator, options.credentials)
+	s.authChain = buildAuthChain(s.patAuth(), s.sandboxTokenAuth(), validator, options.credentials)
 	if service != nil && service.APIRecordsConfigured() {
 		// Before registerRoutes: every surface captures the hook when it
 		// mounts its routes.
@@ -235,10 +251,22 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// balancers) which should keep working across API version rollouts.
 	// Public by design.
 	mux.Handle("GET /health", http.HandlerFunc(s.handleHealth))
+	// /ready is for readiness probes (Kubernetes, load balancers): 503 while
+	// this node should not get traffic, such as when it is cut off from the
+	// cluster's control plane. Public for the same reason as /health; the
+	// body says only ready or not, and why.
+	mux.Handle("GET /ready", http.HandlerFunc(s.handleReady))
 
 	// Sign-in discovery (§5.6): public by design, since a person reads it
 	// before holding any credential. It lists no issuer with identity off.
 	mux.Handle("GET "+identitywire.AuthDiscoveryPath, http.HandlerFunc(s.handleAuthDiscovery))
+
+	// Sandbox cloud identity (plans/sandbox-cloud-identity.md D1.1): the
+	// OIDC discovery document and the JWKS are public by design, because
+	// customers' clouds fetch them anonymously. They carry public keys
+	// only, and 404 when this deployment is not an issuer.
+	mux.Handle("GET "+cloudidentity.DiscoveryPath, http.HandlerFunc(s.handleIdentityDiscovery))
+	mux.Handle("GET "+cloudidentity.JWKSPath, http.HandlerFunc(s.handleIdentityJWKS))
 
 	// Each registered version owns its own URL prefix and is responsible for
 	// every route under it. Authentication is shared across versions via
@@ -307,12 +335,21 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// happens in the page), the metrics endpoints are permission-gated. See
 	// pkg/api/dashboard.go.
 	s.registerDashboard(mux)
+	s.registerPprof(mux)
 }
 
 // route is Route for the routes pkg/api mounts itself (/mcp and the
 // dashboard's metrics): v1 authentication and the v1 403 body.
 func (s *Server) route(perm controlplane.Permission, next http.Handler) http.Handler {
 	return apihttp.Router{Authenticate: s.requireAuth, Audit: s.audit}.Route(perm, next)
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.Ready(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "reason": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -180,7 +180,7 @@ SB_SECRET_PROVIDER_STRICT_BOOT=true
 Pointing AerolVM at a key store protects the failover copies. To keep the **server key** in your key store too, wrap it.
 
 - **A new server:** `install.sh --key-custody wrapped --secret-provider-env /path/to/key-store.env`. The first start makes a key and writes only the wrapped copy.
-- **A new cluster:** `cluster-init.sh --key-custody wrapped` on the first server. It puts only the wrapped key in the bundle other servers join with.
+- **A new cluster:** `sandboxd init --key-custody wrapped` on the first server (with the installer: `... init --role server --key-custody wrapped`). Joining nodes get only the wrapped key, and open it through their own access to your key store. Wrapped custody is also what lets you make never-expiring join tokens (`aerolvm join-command --ttl 0`) in enterprise mode: a leaked token then hands out no plain key.
 - **An existing server or cluster:**
   1. On one server: `sandboxd key wrap`. It writes `credential_encryption.key.wrapped` and reads it back through your key store.
   2. Copy that file to every server. It is safe to copy: it is encrypted.
@@ -257,7 +257,7 @@ A **deleted** key makes everything sealed with it unreadable for good. That is h
 A new server key makes old copies of the server key useless for anything in the current database. It works with wrapped custody and with a plain key file.
 
 1. `sandboxd key rotate --stage` on one server. Copy the file it names to every server. Wait until `aerolvm_server_key_ring{key="1",key2="decrypt"}` shows on every server.
-2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server. A value of -1 means no pass under the new key has finished yet, so keep waiting.
+2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server. A value of -1 means no pass under the new key has finished yet, so keep waiting. Also wait at least `SB_SANDBOX_TOKEN_MAX_TTL` (24 hours by default) after the promote: [sandbox tokens](/sandbox-tokens/) signed with the old key keep working until it is retired, and stop working at once when it is.
 3. `sandboxd key rotate --retire 0`, and copy the file again.
 
 Every server must run a release that supports rotation before step 1; `--stage` checks this and refuses otherwise. Each server records `key_rotation_staged`, `key_rotation_promoted` and `key_rotation_retired` in its audit log. After step 2 a server cannot go back to an older release.

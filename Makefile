@@ -1,7 +1,7 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
+.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd images k8s-dev k8s-dev-down docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
@@ -24,7 +24,8 @@ BIN_DIR ?= bin
 	integration-key-custody-vault integration-key-custody-pkcs11 integration-key-custody-kms \
 	integration-key-custody-kms-switch integration-key-custody-single \
 	integration-routing integration-routing-hetero-lite \
-	integration-bench-cluster integration-identity-gate integration-identity-only
+	integration-bench-cluster integration-identity-gate integration-identity-only \
+	integration-cluster-chaos
 
 fmt:
 	$(GO) fmt ./...
@@ -49,8 +50,10 @@ test-acme-e2e:
 # Needs a Caddy with caddy-l4: AEROL_E2E_CADDY_BIN, or this builds the
 # release combination (.github/workflows/release.yml) with xcaddy. Linux
 # only (the test is build-tagged linux): on macOS run it in a Linux container.
-CADDY_E2E_VERSION ?= v2.11.7
-CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e
+# The version and caddy-l4 match scripts/install.sh's pins (caddy_version_test).
+# The version is in the binary's name, so a bump never reuses an old build.
+CADDY_E2E_VERSION ?= v2.11.8-0.20261106223313-31f9f0cb9949
+CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e-$(CADDY_E2E_VERSION)
 test-ingress-reload-e2e:
 	@if [ -z "$$AEROL_E2E_CADDY_BIN" ] && [ ! -x "$(CADDY_E2E_BIN)" ]; then \
 		mkdir -p $(BIN_DIR) && CGO_ENABLED=0 $(GO) run github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6 build $(CADDY_E2E_VERSION) \
@@ -72,6 +75,24 @@ build-sandboxd:
 build-toolboxd:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 $(GO) build -ldflags "-s -w -X github.com/aerol-ai/microvm/internal/version.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o $(BIN_DIR)/toolboxd ./cmd/toolboxd
+
+# The Kubernetes images (aerolvm, aerolvm-runtime, aerolvm-edge) from Linux
+# binaries already in $(IMAGES_DIST), named as the release names them
+# (sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>,
+# caddy_linux_<arch>). Loads this machine's platform into the local Docker;
+# the release builds both CPU types and pushes (scripts/build-images.sh).
+IMAGES_DIST ?= dist
+IMAGES_VERSION ?= dev
+images:
+	scripts/build-images.sh --dist $(IMAGES_DIST) --version $(IMAGES_VERSION)
+
+# AerolVM in single mode on a local kind cluster, from this checkout
+# (scripts/k8s-dev.sh): build the images, start kind, install the chart.
+k8s-dev:
+	scripts/k8s-dev.sh
+
+k8s-dev-down:
+	scripts/k8s-dev.sh down
 
 docs-install:
 	cd docs && npm install
@@ -406,6 +427,22 @@ integration-cluster-hetero:
 # runtime but Firecracker, ~8 x t3.medium on-demand.
 integration-cluster-hetero-lite:
 	integration-tests/run.sh cluster-hetero-lite $(RUN_FLAGS)
+
+# Cluster correctness under faults (UC-470..UC-479,
+# plans/cluster-correctness-and-create-latency.md §3.2): partitions, packet
+# loss, owner and runtime kills, Raft leader kills; plus the release-gate
+# tools (UC-480..UC-482: a failpoint crash, control-plane recovery time, a
+# 15-minute soak; sandboxd is built with -tags itest_failpoints here only).
+# 3 server / 3 worker / 1 ingress, 7 x t3.medium on-demand (~$0.29/h; a run
+# is ~2-2.5 h, ~$0.60-0.80).
+# A FOCUSED scenario: only the chaos cases run (the focus block in
+# scenarios/cluster-chaos.caps.yml) and the report marks every other use case
+# skip. Several cases fail on main until the plan's C2-C7 fixes land; each
+# test's doc comment names the fix it guards. Re-run one case on a kept stack:
+#   make integration-cluster-chaos keep
+#   AEROL_TEST_RUN='^TestClusterChaosOldCopyDiesAfterReturn$$' make integration-cluster-chaos keep no-build
+integration-cluster-chaos:
+	integration-tests/run.sh cluster-chaos $(RUN_FLAGS)
 
 # Same as integration-cluster-hetero but skips node-kill / failover fault injection.
 integration-cluster-hetero-safe:

@@ -18,6 +18,10 @@ import (
 	"os"
 )
 
+// main never reads os.Args[0]. Installed as kubectl-aerolvm (Krew, or a copy
+// on PATH), `kubectl aerolvm get nodes` runs this binary under that name with
+// the same arguments, and it must behave exactly as aerolvm
+// (plans/kubectl-style-cluster-ops.md D13; TestKubectlPluginName).
 func main() {
 	os.Exit(newApp().run(context.Background(), os.Args[1:]))
 }

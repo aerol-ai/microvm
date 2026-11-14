@@ -71,8 +71,16 @@ var (
 	}
 )
 
-// isPrivate covers RFC 1918, ULA and RFC 6598.
-func isPrivate(ip netip.Addr) bool { return ip.IsPrivate() || sharedAddress.Contains(ip) }
+// isPrivate covers RFC 1918, ULA and RFC 6598, and the node's extra private
+// ranges (PrivateRangesEnv: a cluster's own ranges, which need not be in
+// RFC 1918). All of them are refused unless a policy CIDR opens them.
+func isPrivate(ip netip.Addr) bool {
+	if ip.IsPrivate() || sharedAddress.Contains(ip) {
+		return true
+	}
+	_, ok := inExtra(&extraPrivate, ip)
+	return ok
+}
 
 // DialTarget is one connection attempt as the guard sees it.
 type DialTarget struct {
@@ -158,14 +166,25 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	return nil
 }
 
-// CheckFloor applies only the deny floor: the cloud metadata endpoints, then
-// the operator's deny_cidrs. The floor is the one guard
+// CheckFloor applies only the deny floor: the cloud metadata endpoints, the
+// node's extra floor (DenyFloorEnv: the Kubernetes API server), then the
+// operator's deny_cidrs. The floor is the one guard
 // rule that binds a sandbox with no policy of its own (§5.10 PC-2: it drops
 // matching traffic from every sandbox in every mode); the private-range rule
 // and the internal zone only narrow what a policy's allow rules open.
+//
+// The extra floor is read here, not only from g.DenyFloor, for the same
+// reason the metadata endpoints are: a guard built without the operator
+// file (isolate's and the WASM worker's default) must still hold it.
 func (g DialGuard) CheckFloor(addr netip.AddrPort) error {
 	ip := addr.Addr().Unmap()
 	if pfx, ok := firstContaining(MetadataPrefixes, ip); ok {
+		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
+	}
+	if pfx, ok := inExtra(&extraFloor, ip); ok {
+		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
+	}
+	if pfx, ok := inExtra(&fileFloor, ip); ok {
 		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
 	}
 	if pfx, ok := firstContaining(g.DenyFloor, ip); ok {

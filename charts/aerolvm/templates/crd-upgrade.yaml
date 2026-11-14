@@ -1,0 +1,125 @@
+{{- if and (eq .Values.mode "cluster") .Values.cluster.operator.upgradeCRDs }}
+{{- /*
+Helm installs crds/ on the first install and never updates them, so a
+`helm upgrade` left a cluster on its first CRDs and the API server dropped
+every field added since. This pre-upgrade Job brings AerolVM's two CRDs up to
+this chart's (aerolvm-operator --apply-crds). Its role may only get and update
+those two, by name, and every object here is deleted once the Job succeeds.
+A rollback runs no pre-upgrade hook: the newer CRDs stay, and their fields are
+additive. Off (cluster.operator.upgradeCRDs: false) when someone else manages
+CRDs; then apply charts/aerolvm/crds/ before each upgrade.
+*/}}
+{{- $name := printf "%s-crd-upgrade" (include "aerolvm.name" .) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crd-upgrade
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-{{ .Release.Namespace }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crd-upgrade
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    resourceNames: [aerolclusters.aerolvm.io, aerolnodes.aerolvm.io]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-{{ .Release.Namespace }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crd-upgrade
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ $name }}-{{ .Release.Namespace }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ $name }}, namespace: {{ .Release.Namespace }} }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crd-upgrade
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+data:
+  {{- (.Files.Glob "crds/*.yaml").AsConfig | nindent 2 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "aerolvm.labels" . | nindent 4 }}
+    app.kubernetes.io/component: crd-upgrade
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aerolvm
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: crd-upgrade
+    spec:
+      serviceAccountName: {{ $name }}
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      {{- with .Values.cluster.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cluster.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: crd-upgrade
+          image: {{ include "aerolvm.image" (dict "root" . "name" "aerolvm-operator") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [--apply-crds=/crds]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+          volumeMounts:
+            - { name: crds, mountPath: /crds, readOnly: true }
+      volumes:
+        - name: crds
+          configMap:
+            name: {{ $name }}
+{{- end }}

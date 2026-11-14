@@ -38,8 +38,16 @@ extra_sandboxd_env = {
 audit_export_enabled = true
 audit_export_backend = "s3"
 
+# Each node declares its own zone and a label naming it, so the placement
+# rule cases (UC-438..440) can tell the nodes apart. A create without a rule
+# places exactly as before.
 nodes = {
-  node1 = { role = "mixed", seed = true, spot = true }
-  node2 = { role = "mixed", spot = true }
-  node3 = { role = "mixed", spot = true }
+  node1 = { role = "mixed", seed = true, spot = true, sandboxd_env = { SB_NODE_ZONE = "itest-zone-a", SB_NODE_LABELS = "itest-node=node1" } }
+  node2 = { role = "mixed", spot = true, sandboxd_env = { SB_NODE_ZONE = "itest-zone-b", SB_NODE_LABELS = "itest-node=node2" } }
+  node3 = { role = "mixed", spot = true, sandboxd_env = { SB_NODE_ZONE = "itest-zone-c", SB_NODE_LABELS = "itest-node=node3" } }
 }
+
+# Sandbox cloud identity (plans/sandbox-cloud-identity.md, UC-431..437):
+# every node is an OIDC issuer at https://<domain> (capability
+# cloud-identity).
+identity_issuer_enabled = true

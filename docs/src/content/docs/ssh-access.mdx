@@ -123,6 +123,7 @@ These shells are [terminal sessions](/sessions/), so you can also read and manag
 ## Good to know
 
 - **The sandbox must be running.** A stopped sandbox refuses the login.
+- **The sandbox needs a shell.** WebAssembly and V8 isolate sandboxes have none, so a login to one fails.
 - **Each sandbox accepts only its own key.** There is no shared login for all sandboxes on a server.
 - **No file copy or port forwarding over SSH.** `sftp` and the default `scp` do not work, and neither does `ssh -L`. Copy files with the [Files](/file-system/) calls or `aerolvm cp`, and share ports with [Public URLs](/public-urls/).
 
@@ -145,4 +146,4 @@ When a login reaches a server that does not run the sandbox, that server checks 
 - [Terminal sessions](/sessions/): manage the same shells from code.
 - [aerolvm CLI](/cli/): open a shell without handling keys.
 - [Files](/file-system/): copy files in and out.
-- [Cluster setup](/cluster-setup/): run AerolVM on several servers.
+- [Cluster setup](/cluster/): run AerolVM on several servers.

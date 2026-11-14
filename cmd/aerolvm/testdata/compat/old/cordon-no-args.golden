@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm cordon: name at least one node
+run `aerolvm cordon --help` for usage

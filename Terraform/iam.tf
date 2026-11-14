@@ -1,8 +1,10 @@
 ###############################################################################
 # Bootstrap artifact bucket.
 #
-# The seed node uploads two objects: gossip-key.txt + aerolvm-tls-bundle.tar.gz.
+# With one_line_join = false (the old join) the seed uploads three objects:
+# gossip-key.txt, aerolvm-tls-bundle.tar.gz and aerolvm-cred-bundle.tar.gz.
 # Every joiner polls until they appear, downloads them, runs cluster-join.sh.
+# One-line joins hand nothing to joiners through this bucket.
 # Bucket is private, SSE-encrypted, and (by default) force_destroy on tear-down.
 ###############################################################################
 

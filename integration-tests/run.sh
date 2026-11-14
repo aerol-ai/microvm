@@ -33,6 +33,7 @@
 #            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
 # Ingress load balancer (UC-356): cluster-3-mixed-lb
+# Cluster correctness faults + release-gate tools (UC-470..482, focused): cluster-chaos
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -85,6 +86,8 @@ BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
 UPGRADE_FROM=""
+UPGRADE_NODE=0
+ADOPT_FROM=""
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -138,20 +141,46 @@ while [[ $# -gt 0 ]]; do
       UPGRADE_FROM="$1"
       ;;
     --upgrade-from=*) UPGRADE_FROM="${arg#--upgrade-from=}" ;;
+    # With --upgrade-from: upgrade through `sandboxd upgrade node` instead of
+    # the install.sh re-run (upgrade-gate.sh --upgrade-node).
+    --upgrade-node) UPGRADE_NODE=1 ;;
+    # The adopt half of the one-line join gate (plans/kubectl-style-cluster-
+    # ops.md §4.4): provision on an OLD tag with the old scripts, move every
+    # node to the local build, `sandboxd adopt`, then join a blank node with
+    # one line. Delegates to adopt-gate.sh, like --upgrade-from.
+    --adopt-from)
+      shift
+      [[ $# -gt 0 ]] || { echo "--adopt-from needs a release tag (e.g. --adopt-from v0.6.11)" >&2; exit 2; }
+      ADOPT_FROM="$1"
+      ;;
+    --adopt-from=*) ADOPT_FROM="${arg#--adopt-from=}" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag>] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag> [--upgrade-node]] [--adopt-from <tag>] [--no-build]" >&2; exit 2; }
+if [[ "$UPGRADE_NODE" == 1 && -z "${UPGRADE_FROM:-}" ]]; then
+  echo "--upgrade-node is a way to run the --upgrade-from gate; give --upgrade-from <tag> too" >&2
+  exit 2
+fi
+GATE_ARGS=()
+[[ "$UPGRADE_NODE" == 1 ]] && GATE_ARGS+=(--upgrade-node)
 # --upgrade-from hands off to the warm-upgrade gate before any normal
 # provisioning. It runs its own old-tag provision and teardown, so returning
 # here afterwards would double-provision; exec replaces this process.
 if [[ -n "${UPGRADE_FROM:-}" ]]; then
   if [[ "$KEEP" == 1 ]]; then
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
   else
-    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM"
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+  fi
+fi
+if [[ -n "${ADOPT_FROM:-}" ]]; then
+  if [[ "$KEEP" == 1 ]]; then
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM" --keep
+  else
+    exec "${HERE}/adopt-gate.sh" "$SCENARIO" --from "$ADOPT_FROM"
   fi
 fi
 # A pinned tag and "reuse the last local build" describe different artifact
@@ -182,6 +211,77 @@ CONFIG_CLUSTER="${REPO_ROOT}/config/cluster.yml"
 # var-file (chained second) overrides only topology/identity/tags/cert-storage.
 # Terraform applies multiple -var-file in order, last value wins per variable.
 PROD_TFVARS="${REPO_ROOT}/config/terraform.tfvars"
+
+# uses_module_url: the scenario provisions through the module fetched by URL
+# (its caps list module-url), not through Terraform/root.
+uses_module_url() {
+  local caps="${HERE}/scenarios/${1}.caps.yml"
+  [[ -f "$caps" ]] && [[ "$(yq -r '.capabilities | contains(["module-url"])' "$caps")" == "true" ]]
+}
+
+# tf_root echoes the root module directory Terraform runs in for a scenario.
+# Terraform/ is a module, used by URL (plans/kubectl-style-cluster-ops.md
+# §7). Terraform/root is the root a checkout runs: it calls the module by
+# path and passes every variable through, so every scenario renders the same
+# user data it did when Terraform/ was the root. A module-url scenario runs
+# a root of its own, made by prepare_module_root.
+tf_root() {
+  if uses_module_url "$1"; then
+    printf '%s\n' "${HERE}/.tf/${1}/root"
+  else
+    printf '%s\n' "${REPO_ROOT}/Terraform/root"
+  fi
+}
+
+# prepare_module_root makes a module-url scenario's root: a folder of .tf
+# files only, whose module block fetches Terraform/ by git URL, the way an
+# operator with no checkout uses it. Nothing in it points back into the
+# repo: config_dir is passed as an absolute path, and the module brings its
+# own templates. It is Terraform/root's files without the moved blocks (a
+# new root has no old state to move) and with one_line_join left to the
+# module's default.
+#
+# The URL is AEROL_TF_MODULE_SOURCE when set (for example
+# git::https://github.com/aerol-ai/microvm//Terraform?ref=v0.6.13 once a
+# release has it). Otherwise it is a bare clone of this checkout's current
+# branch at its COMMITTED head, so commit Terraform/ changes before a run.
+prepare_module_root() {
+  local scenario="$1"
+  local sdir="${HERE}/.tf/${scenario}"
+  local root="${sdir}/root"
+  local src="${AEROL_TF_MODULE_SOURCE:-}"
+  if [[ -z "$src" ]]; then
+    local bare="${sdir}/module.git" ref
+    ref="$(git -C "$REPO_ROOT" symbolic-ref --short -q HEAD || true)"
+    [[ -n "$ref" ]] || ref="itest-${scenario}"
+    rm -rf "$bare"
+    mkdir -p "$sdir"
+    git init -q --bare "$bare"
+    git -C "$REPO_ROOT" push -q --force "$bare" "HEAD:refs/heads/${ref}"
+    src="git::file://${bare}//Terraform?ref=${ref}"
+  fi
+  # A stale download of the module would hide a new commit under the same ref.
+  rm -rf "$root" "${sdir}/modules"
+  mkdir -p "$root"
+  local f
+  for f in backend.tf providers.tf versions.tf variables.tf outputs.tf; do
+    cp "${REPO_ROOT}/Terraform/root/${f}" "${root}/${f}"
+  done
+  awk -v src="$src" '$0 == "  source = \"../\"" { print "  source = \"" src "\""; next } { print }' \
+    "${REPO_ROOT}/Terraform/root/main.tf" > "${root}/main.tf"
+  if ! grep -qF "source = \"${src}\"" "${root}/main.tf"; then
+    echo "module-url: could not set the module source in ${root}/main.tf" >&2
+    return 1
+  fi
+  cat > "${root}/join.tf" <<'EOF'
+# null leaves one_line_join to the module's default: one-line joins.
+variable "one_line_join" {
+  type    = bool
+  default = null
+}
+EOF
+  echo "module-url: ${scenario} runs the module from ${src}"
+}
 
 # tf_varfile_args echoes the ordered -var-file flags shared by apply + destroy.
 # When run_one has emitted a persistent-cert-store override for this scenario
@@ -375,7 +475,7 @@ EOF
 witness_bucket_of() {
   local scenario="$1" bucket
   bucket=$(TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="${REPO_ROOT}/Terraform" output -raw audit_witness_bucket 2>/dev/null) || bucket=""
+    terraform -chdir="$(tf_root "$scenario")" output -raw audit_witness_bucket 2>/dev/null) || bucket=""
   # A bucket name or nothing: a terraform warning must never reach the aws
   # CLI as a bucket to empty.
   if [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
@@ -414,6 +514,22 @@ EOF
   return 1
 }
 
+# tf_init_for_teardown points the scenario's data dir at its root and state
+# before a teardown reads outputs or destroys. A --destroy-only run may find
+# the data dir set up for another root: a stack kept from before
+# Terraform/root, or a module-url root that is gone. Init is idempotent, and
+# Terraform/root's moved blocks carry an old stack's state into the module
+# before the destroy plans.
+tf_init_for_teardown() {
+  local scenario="$1"
+  if uses_module_url "$scenario" && [[ ! -f "$(tf_root "$scenario")/main.tf" ]]; then
+    prepare_module_root "$scenario" || return 1
+  fi
+  TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
+    terraform -chdir="$(tf_root "$scenario")" init -reconfigure -input=false \
+    -backend-config="key=integration/${scenario}/terraform.tfstate" >/dev/null
+}
+
 # destroy_scenario runs terraform destroy with the exact variable set the
 # scenario applied with.
 destroy_scenario() {
@@ -426,8 +542,9 @@ destroy_scenario() {
   fi
   # shellcheck disable=SC2046
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
+    terraform -chdir="$(tf_root "$scenario")" destroy -auto-approve -input=false \
     $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
+    $(download_mirror_tfvar_args) \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
     -var="force_on_demand=$(on_demand_tfvar)" \
     -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")" \
@@ -455,6 +572,8 @@ teardown() {
   # instances and their role grants are gone and nothing can write to it.
   # A failed first emptying is not retried: it already said why.
   local witness emptied=0 destroyed=0
+  tf_init_for_teardown "$scenario" ||
+    echo "teardown: terraform init for ${scenario} failed; the destroy below may fail too" >&2
   witness=$(witness_bucket_of "$scenario")
   if [[ -n "$witness" ]] && empty_witness_bucket "$scenario" "$witness"; then
     emptied=1
@@ -469,17 +588,11 @@ teardown() {
   fi
   if [[ "$destroyed" == "1" ]]; then
     rm -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/.leased-domain"
+    release_scenario_claim "$scenario"
   else
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
   fi
 }
-
-if [[ "$DESTROY_ONLY" == "1" ]]; then
-  # Fast path: teardown() returns early when KEEP=1; force a real destroy here.
-  KEEP=0
-  teardown "$SCENARIO"
-  exit 0
-fi
 
 # lease_domain picks a RANDOM test domain from the pool for fresh runs, never
 # repeating the previous fresh pick. Reusing one name re-requests the same cert
@@ -493,15 +606,161 @@ fi
 # as long as that scenario's .tf dir does. $1 is this scenario's own pin
 # path, which is excluded so a kept scenario can re-lease what it already
 # holds.
+#
+# Pins are read from EVERY worktree of this clone, not just REPO_ROOT's.
+# Parallel lanes and agent sessions each run from their own worktree, and
+# each keeps its pins under its own .tf, so a lease that read only its own
+# tree handed out a domain another worktree was live on (2026-11-07: two
+# stacks behind one name, its A records round-robined between two ingresses,
+# and the suite saw "sandbox not found" and 401 invalid_signature). A worktree
+# whose run.sh predates this still reads only its own pins.
 domains_in_use() {
-  local own="${1:-}" f
-  for f in "${REPO_ROOT}"/integration-tests/.tf/*/.leased-domain; do
-    [[ -f "$f" ]] || continue
-    [[ -n "$own" && "$f" == "$own" ]] && continue
-    tr -d '[:space:]' < "$f"
-    echo
-  done
+  local own="${1:-}"
+  domain_pins "$own" | cut -d' ' -f1
 }
+
+# domain_pins prints "<domain> <pin path>" for every pin held in any worktree
+# of this clone, except $1 (this scenario's own pin).
+domain_pins() {
+  local own="${1:-}" root f
+  while IFS= read -r root; do
+    for f in "$root"/integration-tests/.tf/*/.leased-domain; do
+      [[ -f "$f" ]] || continue
+      [[ -n "$own" && "$f" == "$own" ]] && continue
+      printf '%s %s\n' "$(tr -d '[:space:]' < "$f")" "$f"
+    done
+  done < <(worktree_roots)
+}
+
+# worktree_roots prints REPO_ROOT first (so its pins keep the exact paths the
+# own-pin check compares against), then every other existing worktree of this
+# clone, once each. Outside a git checkout (a test tree) it is REPO_ROOT alone.
+worktree_roots() {
+  local self wt
+  printf '%s\n' "$REPO_ROOT"
+  self=$(cd "$REPO_ROOT" && pwd -P)
+  { git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null || true; } | sed -n 's/^worktree //p' |
+    while IFS= read -r wt; do
+      [[ -d "$wt" ]] || continue
+      [[ "$(cd "$wt" && pwd -P)" == "$self" ]] && continue
+      printf '%s\n' "$wt"
+    done
+}
+
+# The lease lock spans "read every pin" to "write ours", so two runs started
+# in the same second cannot both pick the one free domain. It is a directory
+# (mkdir is atomic everywhere; macOS has no flock) in the clone's shared git
+# dir, which every worktree sees. A lease holds it for well under a second, so
+# one older than a minute was left by a run killed mid-lease and is cleared.
+# find's -mmin rounding differs (BSD rounds up, GNU truncates), so "older than
+# a minute" can mean up to two; the wait runs for three, so a lock a killed run
+# left behind delays the next run but never fails it.
+lease_lock_path() {
+  local gitdir
+  gitdir=$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null) || gitdir=""
+  if [[ -z "$gitdir" ]]; then
+    echo "${REPO_ROOT}/integration-tests/.tf/.domain-lease.lock"
+    return
+  fi
+  [[ "$gitdir" == /* ]] || gitdir="${REPO_ROOT}/${gitdir}"
+  echo "${gitdir}/aerol-itest-domain-lease.lock"
+}
+
+lease_lock_acquire() {
+  local lock tries=0
+  lock=$(lease_lock_path)
+  mkdir -p "$(dirname "$lock")"
+  until mkdir "$lock" 2>/dev/null; do
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
+    tries=$((tries + 1))
+    if [[ "$tries" -gt 1800 ]]; then
+      echo "domain lease: ${lock} is still held after 3 minutes; remove it by hand if no run is leasing" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  LEASE_LOCK="$lock"
+}
+
+lease_lock_release() {
+  if [[ -n "${LEASE_LOCK:-}" ]]; then
+    rmdir "$LEASE_LOCK" 2>/dev/null || true
+  fi
+  LEASE_LOCK=""
+}
+
+# One worktree at a time may work on a scenario name. Every worktree of the
+# clone uses the same Terraform state key for a scenario
+# (integration/<scenario>/terraform.tfstate) and the same cluster name, so a
+# second worktree that ran, kept or destroyed the scenario would apply over,
+# or destroy, the first one's live stack. A run claims the name in
+# .tf/<scenario>/.state-claim before anything is applied, and teardown drops
+# the claim with the pin once the destroy succeeds; a kept stack keeps both.
+# A domain pin in another worktree counts as a claim too, so a stack started
+# by a run.sh from before claims existed still blocks.
+
+# scenario_holders prints the claim and pin files other worktrees hold for $1.
+scenario_holders() {
+  local scenario="$1" root f first=1
+  while IFS= read -r root; do
+    if [[ "$first" == "1" ]]; then
+      first=0 # REPO_ROOT itself: our own claim never blocks us
+      continue
+    fi
+    for f in "${root}/integration-tests/.tf/${scenario}/.state-claim" \
+      "${root}/integration-tests/.tf/${scenario}/.leased-domain"; do
+      if [[ -f "$f" ]]; then
+        printf '%s\n' "$f"
+      fi
+    done
+  done < <(worktree_roots)
+}
+
+# refuse_if_scenario_held returns 1, saying why, when another worktree holds $1.
+refuse_if_scenario_held() {
+  local scenario="$1" holders
+  holders=$(scenario_holders "$scenario")
+  [[ -z "$holders" ]] && return 0
+  echo "scenario ${scenario}: another worktree holds it, so this run will not touch integration/${scenario}/terraform.tfstate:" >&2
+  sed 's/^/  /' <<<"$holders" >&2
+  echo "  Every worktree shares that state, so running, keeping or destroying ${scenario} here would act on that stack." >&2
+  echo "  Run it from that worktree or wait for it to finish. If its stack is already gone, run" >&2
+  echo "  'integration-tests/run.sh ${scenario} --destroy-only' in that worktree, or delete the file." >&2
+  return 1
+}
+
+# claim_scenario checks and writes the claim under the lease lock, so two
+# worktrees that start the same scenario together cannot both get it.
+claim_scenario() {
+  local scenario="$1"
+  local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
+  lease_lock_acquire || return 1
+  if ! refuse_if_scenario_held "$scenario"; then
+    lease_lock_release
+    return 1
+  fi
+  mkdir -p "$sdir"
+  printf 'worktree=%s\nstate_key=integration/%s/terraform.tfstate\nsince=%s\n' \
+    "$REPO_ROOT" "$scenario" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${sdir}/.state-claim"
+  lease_lock_release
+}
+
+release_scenario_claim() {
+  rm -f "${REPO_ROOT}/integration-tests/.tf/${1}/.state-claim"
+}
+
+if [[ "$DESTROY_ONLY" == "1" ]]; then
+  # Another worktree's live stack sits behind the same state key; destroying
+  # from here would destroy it.
+  refuse_if_scenario_held "$SCENARIO" || exit 1
+  # Fast path: teardown() returns early when KEEP=1; force a real destroy here.
+  KEEP=0
+  teardown "$SCENARIO"
+  exit 0
+fi
 
 lease_domain() {
   local own_pin="${1:-}"
@@ -542,8 +801,9 @@ lease_domain() {
   # Fail loudly. Silently double-booking is how a live run gets its DNS
   # taken out from under it.
   echo "domain pool exhausted: all ${n} domains in ${DOMAINS_FILE} are held by another scenario" >&2
-  echo "held: $(tr '\n' ' ' <<<"$in_use")" >&2
-  echo "tear a scenario down (run.sh --destroy-only <scenario>) or add a domain to the pool" >&2
+  echo "held (domain, pin; pins in other worktrees count too):" >&2
+  domain_pins "$own_pin" | sed 's/^/  /' >&2
+  echo "tear a scenario down (run.sh --destroy-only <scenario>, from the worktree that holds it) or add a domain to the pool" >&2
   return 1
 }
 
@@ -551,7 +811,7 @@ terraform_state_domain() {
   local scenario="$1" sdir domain
   sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   [[ -d "$sdir" ]] || return 1
-  domain=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+  domain=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
     output -json integration_targets 2>/dev/null | jq -r '.domain // empty' 2>/dev/null) || return 1
   [[ -n "$domain" && "$domain" != "null" ]] || return 1
   echo "$domain"
@@ -608,13 +868,16 @@ lease_domain_for_scenario() {
   # an EMPTY pin, echoed nothing and returned 0, and a domain scenario went on
   # toward Terraform with no test domain (2026-10-16). A blank pool entry is no
   # lease either, so the pin is written only once there is a name to put in it.
-  domain=$(lease_domain "$pin") || return 1
+  lease_lock_acquire || return 1
+  domain=$(lease_domain "$pin") || { lease_lock_release; return 1; }
   if [[ -z "$domain" || "$domain" == "null" ]]; then
+    lease_lock_release
     echo "scenario ${scenario}: ${DOMAINS_FILE} handed out a blank entry; refusing to lease it" >&2
     return 1
   fi
   mkdir -p "$sdir"
   printf '%s\n' "$domain" > "$pin"
+  lease_lock_release
   echo "$domain"
 }
 
@@ -646,6 +909,22 @@ allow_disruptive_for() {
     return
   fi
   echo "0"
+}
+
+# go_tags_for echoes the test-only Go build tags a scenario's local build
+# compiles sandboxd with: the caps file's `go_tags`, from the caps file and
+# not the scenario name for the reason allow_disruptive_for gives. An
+# operator's AEROL_GO_TAGS wins, so one case can be tried on another fleet.
+# Empty for every scenario that declares none, which is the release build.
+go_tags_for() {
+  local caps_file="$1"
+  if [[ -n "${AEROL_GO_TAGS:-}" ]]; then
+    echo "$AEROL_GO_TAGS"
+    return
+  fi
+  if [[ -f "$caps_file" ]]; then
+    yq -r '.go_tags // ""' "$caps_file"
+  fi
 }
 
 is_stale_wasm_snapshot_ref() {
@@ -850,7 +1129,38 @@ BUILD_SH="${HERE}/lib/build.sh"
 
 # RELEASE_BASE mirrors install.sh's own release URL construction, so a
 # --version pin resolves to exactly the assets install.sh would have picked.
-RELEASE_BASE="https://github.com/aerol-ai/microvm/releases"
+# AEROL_RELEASE_BASE replaces it (a fork, or a file:// tree in tests).
+RELEASE_BASE="${AEROL_RELEASE_BASE:-https://github.com/aerol-ai/microvm/releases}"
+# The download mirror install.sh falls back to (scripts/mirror-sync.sh fills
+# it), holding each release at aerolvm/<tag>/<file>. When GitHub's release
+# downloads fail (504s for hours on 2026-11-08) a --version pin takes its
+# files from here instead. "" or "off" turns it off.
+DOWNLOAD_MIRROR="${AEROL_DOWNLOAD_MIRROR-https://aerolvm-downloads.s3.us-east-1.amazonaws.com}"
+
+# release_download_base prints the base URL a pinned release's files come
+# from: RELEASE_BASE/download/<tag> when it answers, else the mirror's
+# aerolvm/<tag> when that does. checksums.txt is the probe, as every release
+# has one. When neither answers it prints the GitHub base anyway, so the run
+# fails on the same URL it always did and the message names it.
+release_download_base() {
+  local tag="$1"
+  local primary="${RELEASE_BASE}/download/${tag}"
+  if curl -fsIL -o /dev/null --max-time 20 "${primary}/checksums.txt"; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+  local mirror="${DOWNLOAD_MIRROR:-}"
+  if [[ -n "$mirror" && "$mirror" != "off" ]]; then
+    mirror="${mirror%/}/aerolvm/${tag}"
+    if curl -fsIL -o /dev/null --max-time 20 "${mirror}/checksums.txt"; then
+      echo "run.sh: ${primary} did not answer; taking ${tag} from the mirror ${mirror}" >&2
+      printf '%s\n' "$mirror"
+      return 0
+    fi
+  fi
+  echo "run.sh: neither ${primary} nor the mirror has ${tag}'s checksums.txt" >&2
+  printf '%s\n' "$primary"
+}
 
 # prepare_artifacts decides what binaries this scenario installs and writes the
 # answer to <sdir>/artifacts.tfvars, which tf_varfile_args chains last.
@@ -871,7 +1181,10 @@ prepare_artifacts() {
   # Every scenario, enterprise ones included, provisions sandboxd built the way
   # a release builds it, with no build tags. Enterprise gets its witness from
   # SB_AUDIT_WITNESS_BACKEND=s3 and the scenario's Object Lock bucket
-  # (audit_witness_enabled), not from a test-only build.
+  # (audit_witness_enabled), not from a test-only build. The one exception is
+  # a caps file's go_tags (cluster-chaos: itest_failpoints, for UC-480), and
+  # only on the local build below: --released and --version install release
+  # binaries, which never carry a tag, and a case that needs one skips there.
 
   case "$BUILD_MODE" in
     released)
@@ -887,7 +1200,8 @@ prepare_artifacts() {
       # install.sh: the pin then shows up in the var-file, the plan, and the
       # report, instead of being invisible inside the node's bootstrap.
       echo "=== artifacts: pinned release ${PIN_VERSION} ==="
-      local base="${RELEASE_BASE}/download/${PIN_VERSION}"
+      local base
+      base="$(release_download_base "$PIN_VERSION")"
       cat >"$out" <<EOF
 # generated by run.sh --version ${PIN_VERSION}
 sandboxd_url            = "${base}/sandboxd_linux_amd64"
@@ -909,6 +1223,13 @@ EOF
         printf 'cluster_sign_node_script_url = "%s"\n' "${base}/cluster-sign-node.sh" >>"$out"
       else
         need_local+=(cluster_sign_node_script_url)
+      fi
+      # The release's own Caddy. Without it an older install.sh downloads
+      # releases/latest/caddy_linux_amd64 and checks it against this
+      # release's checksums.txt, which fails as soon as a newer release ships
+      # (the adopt gate's v0.6.11 base, the day v0.6.12 came out).
+      if curl -fsIL -o /dev/null --max-time 20 "${base}/caddy_linux_amd64"; then
+        printf 'caddy_binary_url = "%s"\n' "${base}/caddy_linux_amd64" >>"$out"
       fi
       if grep -Eq '^[[:space:]]*audit_receiver_enabled[[:space:]]*=[[:space:]]*true' "${HERE}/scenarios/${scenario}.tfvars"; then
         need_local+=(audit_receiver_url)
@@ -934,10 +1255,27 @@ EOF
       ;;
   esac
 
-  # Default: local build.
+  # Default: local build. AEROL_GO_TAGS is passed per call, never exported:
+  # `run.sh all` runs scenarios one after another in this shell, and a tag
+  # exported for cluster-chaos would build every later scenario's sandboxd
+  # with a failpoint in it.
+  local go_tags
+  go_tags=$(go_tags_for "${HERE}/scenarios/${scenario}.caps.yml")
+  if [[ -n "$go_tags" ]]; then
+    echo "=== artifacts: sandboxd built with -tags ${go_tags} (test-only; the build id says so) ==="
+  fi
+  # AEROL_WITH_CADDY=1: the nodes get a Caddy built from this tree
+  # (build.sh --with-caddy: install.sh's CADDY_BUILD_VERSION plus every
+  # plugin, caddymod/ included) instead of the latest release's Caddy. For a
+  # change to the Caddy build or caddymod/.
+  local caddy_flag=()
+  if [[ "${AEROL_WITH_CADDY:-}" == "1" ]]; then
+    caddy_flag=(--with-caddy)
+    echo "=== artifacts: Caddy built from this tree (AEROL_WITH_CADDY=1) ==="
+  fi
   local build_id
   if [[ "$NO_BUILD" == "1" ]]; then
-    build_id=$("$BUILD_SH" build-id)
+    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build-id)
     echo "=== artifacts: reusing published build ${build_id} (--no-build) ==="
     # Fall back to building rather than aborting when the build is not
     # published.
@@ -956,10 +1294,10 @@ EOF
     # stderr is NOT suppressed: if the failure is something other than a
     # missing build (bad credentials, an unreachable bucket) that message is
     # the only clue, and the fallback build would fail for the same reason.
-    if ! "$BUILD_SH" urls --with-receiver >"$out"; then
+    if ! AEROL_GO_TAGS="$go_tags" "$BUILD_SH" urls --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"; then
       echo "=== --no-build: ${build_id} is not published; building and publishing it now ===" >&2
-      build_id=$("$BUILD_SH" build --with-receiver)
-      "$BUILD_SH" publish --with-receiver >"$out"
+      build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"})
+      AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"
     fi
   else
     echo "=== artifacts: building locally ==="
@@ -967,8 +1305,8 @@ EOF
     # the alternative is a scenario that enables the receiver discovering at
     # apply time that this build did not produce one. Skipped automatically on
     # refs that predate it.
-    build_id=$("$BUILD_SH" build --with-receiver)
-    "$BUILD_SH" publish --with-receiver >"$out"
+    build_id=$(AEROL_GO_TAGS="$go_tags" "$BUILD_SH" build --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"})
+    AEROL_GO_TAGS="$go_tags" "$BUILD_SH" publish --with-receiver ${caddy_flag[@]+"${caddy_flag[@]}"} >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"
@@ -1027,7 +1365,7 @@ wait_for_bootstrap_assets() {
   local tfvars_file="$1"
   local artifacts_file="${2:-}"
   local timeout="${AEROL_BOOTSTRAP_ASSET_WAIT_TIMEOUT:-900}"
-  local default_base="https://github.com/aerol-ai/microvm/releases/latest/download"
+  local default_base="${RELEASE_BASE}/latest/download"
 
   # Local-build mode: the assets are objects WE just uploaded, so there is
   # nothing to wait for — a release-publishing race cannot exist. Polling
@@ -1090,6 +1428,17 @@ run_one() {
     return 2
   fi
 
+  # Claim the scenario name before the domain lease, so a refused run leaves
+  # no pin behind. A claim this run made is dropped again if it exits before
+  # the teardown trap below takes over: nothing has been applied yet. A claim
+  # that was already here belongs to a kept stack and stays.
+  local had_claim=0
+  [[ -f "${sdir}/.state-claim" ]] && had_claim=1
+  claim_scenario "$scenario" || return 1
+  if [[ "$had_claim" == "0" ]]; then
+    trap "release_scenario_claim '${scenario}'" EXIT INT TERM
+  fi
+
   mkdir -p "$overlay"
 
   local prod_domain leased cluster_name state_key
@@ -1099,7 +1448,7 @@ run_one() {
 
   # Capability checks read the structured list (not a substring grep, which
   # would false-match the word "domain" in a caps-file comment).
-  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_docker_engine
+  local caps_domain caps_wasm caps_cluster caps_platform_volumes caps_docker_pool caps_docker_netns_pool caps_docker_engine caps_containerd_pool
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file")
   caps_wasm=$(yq -r '.capabilities | contains(["wasm"])' "$caps_file")
   caps_cluster=$(yq -r '.capabilities | contains(["cluster"])' "$caps_file")
@@ -1107,6 +1456,7 @@ run_one() {
   caps_docker_pool=$(yq -r '.capabilities | contains(["docker-pool"])' "$caps_file")
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
+  caps_containerd_pool=$(yq -r '.capabilities | contains(["containerd-pool"])' "$caps_file")
   caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
   # Identity and access (plans/identity-and-access.md T12). pat-scope-host:
   # the nodes run SB_PAT_SCOPE=host, so the PAT works only from a loopback
@@ -1205,6 +1555,14 @@ run_one() {
   # scenarios. Depth override mirrors the other pools.
   local docker_netns_pool_depth
   docker_netns_pool_depth="${AEROL_DOCKER_NETNS_POOL_DEPTH:-4}"
+  # containerd warm pool follows its own containerd-pool capability, for the
+  # same reason as docker-pool: each waiting container holds a default-shaped
+  # capacity reservation and a netns slot, which moves the UC-95 density
+  # ceiling, so a scenario opts in on purpose. It is written false otherwise so
+  # a pool an operator turned on in config/cluster.yml never leaks into a run.
+  # It only acts on the containerd engine; a docker-engine scenario ignores it.
+  local containerd_pool_depth
+  containerd_pool_depth="${AEROL_CONTAINERD_POOL_DEPTH:-2}"
   # Container engine policy: containerd is the DEFAULT engine for every
   # deployment mode. Only a scenario advertising the `docker-engine` capability
   # opts back out to dockerd — the local dev install (local-mode) and the docker
@@ -1233,6 +1591,8 @@ run_one() {
       | .docker.pool.depth = '"$docker_pool_depth"'
       | .docker.netns_pool.enabled = '"$caps_docker_netns_pool"'
       | .docker.netns_pool.depth = '"$docker_netns_pool_depth"'
+      | .containerd.pool.enabled = '"$caps_containerd_pool"'
+      | .containerd.pool.depth = '"$containerd_pool_depth"'
       | .container_engine = "'"$container_engine"'"
       | .platform_volumes.enabled = '"$caps_platform_volumes"'
       | .platform_volumes.backend = "s3"
@@ -1285,14 +1645,19 @@ run_one() {
   fi
   ln -sf "${REPO_ROOT}/config/secrets.yml" "${overlay}/secrets.yml"
 
+  if uses_module_url "$scenario"; then
+    prepare_module_root "$scenario"
+  fi
+
   trap "teardown '${scenario}'" EXIT INT TERM
 
   echo "=== provisioning ${scenario} (domain=${leased:-none}) ==="
-  TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" init -reconfigure -input=false \
+  TF_DATA_DIR="$sdir" tf_init_failover -chdir="$(tf_root "$scenario")" init -reconfigure -input=false \
     -backend-config="key=${state_key}"
   # shellcheck disable=SC2046
-  TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" apply -auto-approve -input=false \
+  TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" apply -auto-approve -input=false \
     $(tf_varfile_args "$scenario") \
+    $(download_mirror_tfvar_args) \
     -var="config_dir=${overlay}" \
     -var="force_on_demand=$(on_demand_tfvar)" \
     -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")" \
@@ -1300,7 +1665,7 @@ run_one() {
 
   # Discover endpoint.
   local targets base_url pat grafana_url pushgateway_url
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets)
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets)
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // ""')
   pushgateway_url=$(echo "$targets" | jq -r '.pushgateway_url // ""')
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
@@ -1516,9 +1881,24 @@ run_one() {
   # EMPTY array is an unbound-variable error — so the common case (no filter)
   # would abort the run.
   local -a runflag=()
+  # A FOCUSED scenario (a `focus:` block in its caps file, e.g. cluster-chaos)
+  # runs only the tests that claim its focus capability's use cases, on
+  # purpose and every time. Unlike AEROL_TEST_RUN that run IS the scenario's
+  # canonical report, so it keeps the scenario's name; gen is told the focus
+  # capability and marks every other use case "skip (not in this focused
+  # scenario)" instead of "missing". An operator's AEROL_TEST_RUN still wins
+  # and still reports as -partial.
+  local focus_run focus_cap
+  focus_run=$(yq -r '.focus.run // ""' "$caps_file")
+  focus_cap=$(yq -r '.focus.capability // ""' "$caps_file")
+  local -a focusflag=()
   if [[ -n "${AEROL_TEST_RUN:-}" ]]; then
     runflag=(-run "${AEROL_TEST_RUN}")
     echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
+  elif [[ -n "$focus_run" && -n "$focus_cap" ]]; then
+    runflag=(-run "${focus_run}")
+    focusflag=(-focus-cap "${focus_cap}")
+    echo "focused scenario: -run ${focus_run} (only ${focus_cap} use cases run here; the rest report as skip)" >&2
   fi
 
   # The S3 Object Lock audit witness, when the scenario has one (empty values
@@ -1528,7 +1908,7 @@ run_one() {
   # rewrite.
   local witness_bucket witness_prefix witness_region
   witness_bucket=$(witness_bucket_of "$scenario")
-  witness_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+  witness_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
     output -raw audit_witness_prefix 2>/dev/null) || witness_prefix=""
   witness_region=$(tfvar_from_files aws_region "$PROD_TFVARS" "$tfvars_file" "${sdir}/override.tfvars")
   # The suite's own AWS calls (those witness reads and plants, and the EC2
@@ -1555,9 +1935,9 @@ run_one() {
   # the scenario exports to S3.
   local audit_export_bucket="" audit_export_prefix=""
   if [[ "$caps_audit_export_s3" == "true" ]]; then
-    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
       output -raw audit_export_bucket 2>/dev/null) || audit_export_bucket=""
-    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" \
       output -raw audit_export_prefix 2>/dev/null) || audit_export_prefix=""
   fi
 
@@ -1655,7 +2035,7 @@ run_one() {
     echo "partial run: reporting as ${report_scenario} so ${scenario}'s full report is preserved" >&2
   fi
   AEROL_SCENARIO="$scenario" go run "${HERE}/report" -scenario "$report_scenario" \
-    -json "$json_out" -out "${HERE}/reports"
+    -json "$json_out" -out "${HERE}/reports" ${focusflag[@]+"${focusflag[@]}"}
   if [[ "${AEROL_BENCH:-}" == "1" && -n "$bench_out" ]]; then
     publish_bench_artifacts "$bench_out"
   fi
@@ -1744,7 +2124,7 @@ collect_logs_only() {
     exit 2
   fi
   local targets pat caps_domain
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
   caps_domain=$(yq -r '.capabilities | contains(["domain"])' "$caps_file" 2>/dev/null || echo true)
@@ -1811,7 +2191,7 @@ bench_cluster_ready() {
   local sdir="${REPO_ROOT}/integration-tests/.tf/${scenario}"
   [[ -d "$sdir" ]] || return 1
   local targets pat base_url
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || return 1
   base_url=$(echo "$targets" | jq -r '.base_url // empty')
   [[ -n "$base_url" ]] || return 1
@@ -1836,7 +2216,7 @@ run_bench_only() {
   fi
 
   local targets pat base_url leased
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets from ${sdir} — is the cluster still up?" >&2; exit 2; }
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
   base_url=$(echo "$targets" | jq -r '.base_url // empty')
@@ -1881,7 +2261,7 @@ run_obs_snapshot_only() {
     exit 2
   fi
   local targets grafana_url obs_ip pw
-  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -json integration_targets 2>/dev/null) \
+  targets=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -json integration_targets 2>/dev/null) \
     || { echo "could not read integration_targets" >&2; exit 2; }
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // empty')
   obs_ip=$(echo "$targets" | jq -r '.obs_public_ip // empty')
@@ -1889,7 +2269,7 @@ run_obs_snapshot_only() {
     echo "obs not deployed for ${scenario} (grafana_url/obs_public_ip empty)" >&2
     exit 2
   fi
-  pw=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" output -raw grafana_admin_password 2>/dev/null || true)
+  pw=$(TF_DATA_DIR="$sdir" terraform -chdir="$(tf_root "$scenario")" output -raw grafana_admin_password 2>/dev/null || true)
   local out_dir="${HERE}/reports/obs"
   mkdir -p "$out_dir"
   local uids=(
@@ -1921,6 +2301,12 @@ run_obs_snapshot_only() {
       http://127.0.0.1:3000/api/snapshots" > "${out_dir}/d1-snapshot.json" 2>/dev/null || true
   echo "obs snapshots in ${out_dir}" >&2
 }
+
+# These modes read or load the stack behind the shared state key, which may be
+# another worktree's.
+if [[ "$COLLECT_LOGS_ONLY" == "1" || "$OBS_SNAPSHOT_ONLY" == "1" || "$BENCH_ONLY" == "1" ]]; then
+  refuse_if_scenario_held "$SCENARIO" || exit 1
+fi
 
 if [[ "$COLLECT_LOGS_ONLY" == "1" ]]; then
   collect_logs_only "$SCENARIO"

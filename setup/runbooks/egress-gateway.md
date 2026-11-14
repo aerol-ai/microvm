@@ -460,6 +460,27 @@ or Host, so the address only has to bring the connection to the redirect.
   settings; WASM workers pick them up as they restart; isolate follows the
   sandboxd reload.
 
+## Without systemd
+
+In a container (a Kubernetes pod) there is no systemd to create the control
+socket, the state folder or the gateway's user. Run `sandboxd egress-gateway`
+as its own process, in the same network namespace as the sandboxes' bridge:
+
+- Give it `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE` and a non-root user.
+- Put `SB_EGRESS_GATEWAY_SOCKET` (`/run/aerolvm/egress-gateway.sock`) and
+  `SB_EGRESS_PROCID_SOCKET` on a folder both it and sandboxd mount, and no
+  sandbox does. With no socket handed to it, the gateway creates its own,
+  mode 0600.
+- Point `SB_EGRESS_STATE_DIR` at a folder it can write.
+- Set `SB_EGRESS_PEER_CGROUP=none` for the gateway: sandboxd runs in another
+  container, so there is no `sandboxd.service` cgroup to check and its
+  process cannot be read. The gateway still accepts only root peers.
+- Set `SB_EGRESS_GATEWAY_USER` for sandboxd to the gateway's numbers,
+  `uid` or `uid:gid`, since sandboxd's `/etc/passwd` does not name that user.
+
+Check it the same way: `aerolvm_egress_gateway_up` is 1, and sandboxd logs
+`egress gateway ready`.
+
 ## Tracing and logs
 
 With `SB_OTEL_TRACES_ENABLED` (or an OTLP traces endpoint) set in the

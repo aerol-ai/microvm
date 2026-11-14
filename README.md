@@ -58,7 +58,7 @@ AerolVM gives you everything you need to build sandbox-backed products and agent
 
 | Sandboxes | Execution | Networking & Ports | Storage & Secrets | Platform & Cluster |
 | :--- | :--- | :--- | :--- | :--- |
-| [Lifecycle (create / start / stop / destroy)](https://microvm.aerol.ai/sandboxes) | [Streaming exec & PTY](https://microvm.aerol.ai/exec-streaming) | [HTTP public URLs](https://microvm.aerol.ai/public-urls) | [External storage (S3, NFS, SSHFS, rclone)](https://microvm.aerol.ai/external-storage) | [Raft-coordinated cluster](https://microvm.aerol.ai/getting-started/cluster-setup) |
+| [Lifecycle (create / start / stop / destroy)](https://microvm.aerol.ai/sandboxes) | [Streaming exec & PTY](https://microvm.aerol.ai/exec-streaming) | [HTTP public URLs](https://microvm.aerol.ai/public-urls) | [External storage (S3, NFS, SSHFS, rclone)](https://microvm.aerol.ai/external-storage) | [Raft-coordinated cluster](https://microvm.aerol.ai/cluster) |
 | [Environment & resource limits](https://microvm.aerol.ai/sandbox-env) | [Persistent PTY sessions w/ replay](https://microvm.aerol.ai/sessions) | [TCP port exposure](https://microvm.aerol.ai/tcp-ports) | [Encrypted sandbox secrets](https://microvm.aerol.ai/sandbox-env) | [HA failover & durability](https://microvm.aerol.ai/durability) |
 | [Images & snapshots](https://microvm.aerol.ai/images-and-snapshots) | [SSH access per sandbox](https://microvm.aerol.ai/ssh-access) | [TLS + SNI port routing](https://microvm.aerol.ai/tcp-vs-tls-ports) | [Custom domains](https://microvm.aerol.ai/custom-domains) | [Cluster ingress](https://microvm.aerol.ai/cluster-ingress) |
 | [Five runtimes (containerd / gVisor / Firecracker / WASM / Isolate)](https://microvm.aerol.ai/sandboxes) | [File system operations](https://microvm.aerol.ai/file-system) | [Per-sandbox egress control](https://microvm.aerol.ai/network-access) | [Sandbox tags & tenant scoping](https://microvm.aerol.ai/sandbox-tags) | [Reconciler & self-healing](https://microvm.aerol.ai/reconcile) |
@@ -109,7 +109,7 @@ Every node finds the others with SWIM gossip, protected by a shared key. Every c
 - **Audit.** Every node writes a record each time a secret is opened, an API call changes something, or a call is refused. Each record names the caller. Each record also holds a fingerprint (hash) of the one before it, so an edited or deleted record breaks the chain. Nodes ship the records to your S3 bucket or a webhook. The audit witness keeps each node's newest fingerprint in an S3 bucket with Object Lock, where no node can change it. So if someone with root on a node rewrites its log, `aerolvm audit verify` catches it. See [Audit and compliance](https://microvm.aerol.ai/enterprise/audit-evidence).
 - **Failover.** If a worker dies, the server nodes give its failover sandboxes to healthy workers. Each one is rebuilt with the same ID, ports, and public link. Its sealed secrets were copied to at least one backup node when it was created, so they still open on the new worker. See [Durability](https://microvm.aerol.ai/durability).
 
-You do not need a cluster to start. One server runs all three jobs on one machine. A **mixed cluster** of 2 to 10 alike servers gives you more room and survives a dead server. Move to a hetero cluster past 10 nodes, or when you want bare metal and GPU machines. Your code is the same in every layout. See [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) and [Reference architectures](https://microvm.aerol.ai/enterprise/deployment).
+You do not need a cluster to start. One server runs all three jobs on one machine. A **mixed cluster** of 2 to 10 alike servers gives you more room and survives a dead server. Move to a hetero cluster past 10 nodes, or when you want bare metal and GPU machines. Your code is the same in every layout. See [Clusters](https://microvm.aerol.ai/cluster) and [Reference architectures](https://microvm.aerol.ai/enterprise/deployment).
 
 Inside each node, `sandboxd` uses three parts:
 
@@ -317,7 +317,7 @@ Pick where you want to run it. The SDK code is the same in all three.
 | :--- | :--- | :--- |
 | Your computer | macOS or Linux with Docker | [Install on your computer](https://microvm.aerol.ai/getting-started/local-setup) |
 | One server on any cloud, or your own | One Ubuntu or Debian server and a domain on Cloudflare | [Install on a server](https://microvm.aerol.ai/getting-started/single-node-setup) |
-| A cluster | Several Linux servers. The step-by-step guide uses AWS with Terraform. | [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) |
+| A cluster | Three or more Linux machines, on any cloud. One command on each machine, or Terraform on AWS. | [Clusters](https://microvm.aerol.ai/cluster) |
 
 The installer gets HTTPS certificates through Cloudflare DNS, which is the only DNS provider it supports today. All installer flags are in [Installer options](https://microvm.aerol.ai/getting-started/installer-options).
 
@@ -340,7 +340,7 @@ The installer gets HTTPS certificates through Cloudflare DNS, which is the only 
 | [Sandboxes](https://microvm.aerol.ai/sandboxes) | Lifecycle states, runtimes, resource limits, and configuration. |
 | [Sessions](https://microvm.aerol.ai/sessions) | Persistent PTY sessions that survive reconnects with output replay. |
 | [Snapshots](https://microvm.aerol.ai/images-and-snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
-| [Clusters](https://microvm.aerol.ai/getting-started/cluster-setup) | Mixed and hetero clusters with Raft placement and SWIM gossip. |
+| [Clusters](https://microvm.aerol.ai/cluster) | Mixed and hetero clusters with Raft placement and SWIM gossip. |
 | [Reference architectures](https://microvm.aerol.ai/enterprise/deployment) | Single server, mixed cluster, and hetero cluster, with diagrams. |
 | [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
 | [Security assessment](SECURITY-ASSESSMENT.md) | The most likely and most severe problems for a released node, and where the 0.6.3 review left each one. |

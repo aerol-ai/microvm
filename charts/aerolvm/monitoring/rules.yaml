@@ -1,0 +1,429 @@
+# AerolVM on Kubernetes: alerts and recording rules
+# (plans/kubernetes-v2-architecture.md P6 and P9, the alert list in §19).
+#
+# Plain Prometheus rule groups, not a template: templates/monitoring-
+# prometheusrule.yaml wraps them in a PrometheusRule and drops the alerts
+# named in monitoring.prometheusRule.disabledAlerts. Being plain, promtool
+# checks this file as it is, and setup/prometheus/k8s_chart_test.go checks
+# every metric below against the names the Go code registers.
+#
+# Labels the chart's ServiceMonitors add to every AerolVM series:
+#   aerolvm_component  server, gateway, worker or operator (the pod's
+#                      app.kubernetes.io/component)
+#   aerolvm_cluster    the pod's aerolvm.io/cluster, or the Helm release in
+#                      single mode
+#   aerolvm_zone       the pod's topology.kubernetes.io/zone, when it has one
+#   namespace, pod     from the Prometheus Operator
+# sandboxd's own labels are key, key2 (expvar maps) and owner, incarnation
+# (usage counters). Each alert's runbook is the heading of the same name in
+# setup/runbooks/kubernetes.md.
+groups:
+  # Pods. Three of these read pod status from kube-state-metrics, joined to
+  # AerolVM's own scrape targets so they only see AerolVM pods.
+  - name: aerolvm.kubernetes.pods
+    rules:
+      # Prometheus cannot read a pod's metrics: sandboxd is down, or the
+      # scrape token is refused. Every other alert for that pod goes quiet
+      # with it, so this one says so.
+      - alert: AerolVMMetricsDown
+        expr: up{aerolvm_component!=""} == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: kubernetes
+        annotations:
+          summary: "Prometheus cannot read the metrics of {{ $labels.namespace }}/{{ $labels.pod }}"
+          description: "The {{ $labels.aerolvm_component }} pod {{ $labels.pod }} has not answered a metrics scrape for 10 minutes. Its process is down, or it refuses the scrape token. Its other alerts cannot fire until this is fixed."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmmetricsdown"
+
+      # §19: worker pod not ready. A not-ready worker is cut off from the
+      # cluster (C1): its sandboxes cannot be reached through it. Servers
+      # and gateways too: the alert says which.
+      - alert: AerolVMPodNotReady
+        expr: |
+          (max by (namespace, pod) (kube_pod_status_ready{condition="true"}) == 0)
+          * on (namespace, pod) group_left (aerolvm_cluster, aerolvm_component)
+          group by (namespace, pod, aerolvm_cluster, aerolvm_component) (up{aerolvm_component=~"worker|server|gateway"})
+        for: 10m
+        labels:
+          severity: critical
+          component: kubernetes
+        annotations:
+          summary: "AerolVM {{ $labels.aerolvm_component }} pod {{ $labels.namespace }}/{{ $labels.pod }} is not ready"
+          description: "The pod has not been ready for 10 minutes. A worker that is not ready takes no new sandboxes, and its sandboxes may be cut off. Its AerolNode and its agent container's log say why."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmpodnotready"
+
+      # §19: any runtime container restart. It holds containerd and every
+      # sandbox, so a restart ends them all. It has no liveness probe; it
+      # should never restart.
+      - alert: AerolVMRuntimeContainerRestarted
+        expr: |
+          (increase(kube_pod_container_status_restarts_total{container="runtime"}[15m]) > 0)
+          * on (namespace, pod) group_left (aerolvm_cluster)
+          group by (namespace, pod, aerolvm_cluster) (up{aerolvm_component="worker"})
+        for: 1m
+        labels:
+          severity: critical
+          component: kubernetes
+        annotations:
+          summary: "The runtime container of worker {{ $labels.namespace }}/{{ $labels.pod }} restarted"
+          description: "The runtime container holds every sandbox on that worker, so the restart ended them all. It should never happen. Find the cause before it repeats on other workers."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmruntimecontainerrestarted"
+
+      # §19 (CEO review A2): an AerolVM pod that cannot pull one of its own
+      # images. A new worker waits here before it can serve.
+      - alert: AerolVMPodImagePullStuck
+        expr: |
+          (max by (namespace, pod, container) (kube_pod_container_status_waiting_reason{reason=~"ErrImagePull|ImagePullBackOff"}) > 0)
+          * on (namespace, pod) group_left (aerolvm_cluster, aerolvm_component)
+          group by (namespace, pod, aerolvm_cluster, aerolvm_component) (up{aerolvm_component!=""})
+        for: 10m
+        labels:
+          severity: warning
+          component: kubernetes
+        annotations:
+          summary: "AerolVM pod {{ $labels.namespace }}/{{ $labels.pod }} cannot pull the image of its {{ $labels.container }} container"
+          description: "The container has waited on an image pull for 10 minutes. The registry or mirror is down, the image tag is wrong, or the pull secret is missing."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmpodimagepullstuck"
+
+  # What the operator sees (cluster mode). Node states are AerolNode states
+  # (plan §10.2). These series come from the operator's own pod.
+  - name: aerolvm.kubernetes.operator
+    rules:
+      # C26: a worker pod went away without a decommission (forced, or
+      # while the delete webhook was down). Its sandboxes went with it.
+      - alert: AerolVMWorkerPodLost
+        expr: sum by (namespace) (increase(aerolvm_operator_worker_pods_lost_total[15m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: operator
+        annotations:
+          summary: "A worker pod was deleted without a decommission"
+          description: "{{ $value }} worker pod(s) went away in the last 15 minutes without being decommissioned first. Their sandboxes ended; failover rebuilds only the ones with failover.policy=recreate. The audit log names who forced the delete."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmworkerpodlost"
+
+      # §19: decommission stuck past its deadline. A node has been
+      # decommissioning for the whole last hour and none finished in it:
+      # past the default deadline (drain window plus move budget, at most
+      # an hour). The operator exports a count per state, not per node, so
+      # a pool rotated one machine after another does not fire this.
+      - alert: AerolVMDecommissionStuck
+        expr: |
+          sum by (namespace) (min_over_time(aerolvm_operator_nodes{state="Decommissioning"}[1h])) > 0
+          unless on (namespace)
+          sum by (namespace) (increase(aerolvm_operator_decommission_seconds_count[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "A worker decommission is past its deadline"
+          description: "At least {{ $value }} AerolNode(s) have been Decommissioning for over an hour and no decommission finished in that hour. The machine cannot be returned until it ends, and a cloud upgrade may stop waiting and take it anyway."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmdecommissionstuck"
+
+      # §19: the cloud cannot supply machines. A new node's pod fits on no
+      # machine, so it stays Pending.
+      - alert: AerolVMNodePending
+        expr: sum by (namespace, role) (aerolvm_operator_nodes{state="Pending"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "{{ $value }} new AerolVM {{ $labels.role }} node(s) have no machine"
+          description: "The operator made the pod 15 minutes ago and no machine took it. Karpenter, NAP or the node group cannot start a machine of that type: no capacity, a quota, or a bad node pool. Headroom covers the gap until it runs out."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmnodepending"
+
+      # §19 (CEO review A2): a node joins slowly. Joining covers the
+      # certificate, gossip and the pool's images; image pulls are the
+      # usual slow step.
+      - alert: AerolVMNodeJoinSlow
+        expr: sum by (namespace, role) (aerolvm_operator_nodes{state="Joining"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "{{ $value }} AerolVM {{ $labels.role }} node(s) have been joining for over 10 minutes"
+          description: "A node is Joining until it has its certificate, has joined gossip, has pulled its pool's images and is ready. The AerolNode's condition says which step it waits on, usually an image pull."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmnodejoinslow"
+
+      # §14: a machine or pod gone quiet. Failover starts after the grace
+      # period; a person acts only if it repeats or if servers are lost.
+      - alert: AerolVMNodeLost
+        expr: sum by (namespace, role, state) (aerolvm_operator_nodes{state=~"Suspect|Dead"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "{{ $value }} AerolVM {{ $labels.role }} node(s) are {{ $labels.state }}"
+          description: "Gossip lost these nodes. For a worker, failover rebuilds its failover.policy=recreate sandboxes elsewhere after the grace period; its other sandboxes are lost. For servers, Raft needs a majority to place new sandboxes."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmnodelost"
+
+      - alert: AerolVMOperatorReconcileErrors
+        expr: sum by (namespace, controller) (rate(aerolvm_operator_reconcile_errors_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "The AerolVM operator's {{ $labels.controller }} controller keeps failing"
+          description: "The controller has returned errors for 15 minutes. It retries with backoff, so nothing it manages (scaling, upgrades, decommission) moves forward until the cause is fixed."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmoperatorreconcileerrors"
+
+      # C22: a server left in maintenance mode. While any server is in
+      # maintenance, the operator replaces no lost server.
+      - alert: AerolVMServerMaintenanceTooLong
+        expr: max by (namespace) (aerolvm_operator_maintenance_servers) > 0
+        for: 1h
+        labels:
+          severity: warning
+          component: operator
+        annotations:
+          summary: "{{ $value }} AerolVM server(s) have been in maintenance mode for over an hour"
+          description: "A server with the aerolvm.io/maintenance annotation runs no sandboxd, and the operator replaces no lost server until every maintenance annotation is gone."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmservermaintenancetoolong"
+
+  # Room for new sandboxes, on the workers' own numbers.
+  - name: aerolvm.kubernetes.capacity
+    rules:
+      # §19: headroom below target in a zone. 15% is AerolCluster's default
+      # headroomPercent; a pool with another target needs its own copy of
+      # this alert. Without a zone label it is the whole install's room.
+      - alert: AerolVMHeadroomLow
+        expr: |
+          (
+            1 - sum by (aerolvm_cluster, aerolvm_zone) (aerolvm_host_pressure_reserved_cpu_millicores{aerolvm_component="worker"})
+              / sum by (aerolvm_cluster, aerolvm_zone) (aerolvm_host_pressure_cpu_budget_millicores{aerolvm_component="worker"} > 0)
+          ) < 0.15
+          or
+          (
+            1 - sum by (aerolvm_cluster, aerolvm_zone) (aerolvm_host_pressure_reserved_memory_mb{aerolvm_component="worker"})
+              / sum by (aerolvm_cluster, aerolvm_zone) (aerolvm_host_pressure_memory_budget_mb{aerolvm_component="worker"} > 0)
+          ) < 0.15
+        for: 10m
+        labels:
+          severity: warning
+          component: capacity
+        annotations:
+          summary: "AerolVM headroom is low in zone '{{ $labels.aerolvm_zone }}' of {{ $labels.aerolvm_cluster }}"
+          description: "Only {{ $value | humanizePercentage }} of the workers' CPU or memory there is free, below the 15% target, for 10 minutes. New workers are not arriving fast enough. Creates get 503 'no room' when it runs out."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmheadroomlow"
+
+      # §14: the room ran out. Creates are refused with 503 and Retry-After.
+      - alert: AerolVMCreatesRefusedNoRoom
+        expr: sum by (aerolvm_cluster) (rate(aerolvm_create_admission_rejects_total{key=~"capacity|no_placement_target"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+          component: capacity
+        annotations:
+          summary: "AerolVM {{ $labels.aerolvm_cluster }} refuses new sandboxes: no room"
+          description: "Creates have been refused for lack of room for 10 minutes ({{ $value | humanize }} per second). Clients get 503 with Retry-After."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmcreatesrefusednoroom"
+
+      # C27: a worker's sandbox volume is filling. At worker.diskFloorRatio
+      # free (20% by default) it refuses new creates; this fires well before.
+      - alert: AerolVMWorkerDiskHigh
+        expr: |
+          (1 - aerolvm_host_pressure_sandbox_disk_free_mb{aerolvm_component="worker"} / aerolvm_host_pressure_sandbox_disk_total_mb{aerolvm_component="worker"}) > 0.7
+          and aerolvm_host_pressure_sandbox_disk_total_mb{aerolvm_component="worker"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: capacity
+        annotations:
+          summary: "Worker {{ $labels.namespace }}/{{ $labels.pod }} has used over 70% of its sandbox disk"
+          description: "The disk that holds images and sandboxes is {{ $value | humanizePercentage }} full. Below worker.diskFloorRatio free, the worker refuses new sandboxes with 503."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmworkerdiskhigh"
+
+  # Moving sandboxes off a worker (C9) and failover.
+  - name: aerolvm.kubernetes.decommission
+    rules:
+      # A failed move is tried again on the next pass, so one is no alarm;
+      # failures in every 15 minutes for 15 minutes are.
+      - alert: AerolVMDecommissionMovesFailing
+        expr: sum by (aerolvm_cluster) (increase(aerolvm_cluster_decommission_moves_total{key="failed"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: decommission
+        annotations:
+          summary: "Sandbox moves keep failing during a decommission in {{ $labels.aerolvm_cluster }}"
+          description: "Moves of failover.policy=recreate sandboxes off a decommissioning worker have failed again and again for 15 minutes. If they still fail at the deadline, those sandboxes are stopped instead of moved."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmdecommissionmovesfailing"
+
+  # Node identity (C23, R2).
+  - name: aerolvm.kubernetes.identity
+    rules:
+      # §19: cert signer denial, possible impersonation. These refusals
+      # mean a join used a token or a node name that was already used, a
+      # revoked key, or the wrong role: someone else may have read the
+      # token first.
+      - alert: AerolVMCertSignerDenied
+        expr: sum by (aerolvm_cluster, key2) (increase(aerolvm_join_attempts_total{key="failure", key2=~"token_used|node_id_in_use|key_in_use|key_revoked|role_mismatch"}[10m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "AerolVM refused a node certificate: {{ $labels.key2 }} (possible impersonation)"
+          description: "The servers refused {{ $value }} join(s) in the last 10 minutes with reason {{ $labels.key2 }}. A join token used twice, a node name in use or a revoked key can mean someone else holds a node's credentials. The audit log names the caller's address and token."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmcertsignerdenied"
+
+      # §19: identity denials. The operator would not hand a pod its join
+      # token (TokenReview said no, or the pod was not who or where it
+      # said), or the token could not be made.
+      - alert: AerolVMJoinTokenErrors
+        expr: sum by (namespace) (increase(aerolvm_operator_join_token_errors_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "The AerolVM operator keeps failing to give new nodes their join tokens"
+          description: "Join token refusals or errors for over 10 minutes. New nodes wait in Joining while their setup asks again. The AerolNode condition IdentityDenied says why a pod was refused."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmjointokenerrors"
+
+      # §19: external-CA certificates pending. In external-CA mode the
+      # bank's issuer signs node certificates through cert-manager; a node
+      # gets no pod until its certificate is ready (C23).
+      - alert: AerolVMNodeCertificateFailing
+        expr: max by (namespace) (aerolvm_operator_node_certificates_pending) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "{{ $value }} AerolVM node(s) have waited over 10 minutes for their certificates"
+          description: "A node certificate has waited for the issuer for over 10 minutes. Running nodes keep working until their certificates expire; new nodes cannot join. The AerolNode condition CertificatePending says which request waits and why."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmnodecertificatefailing"
+
+  # Upgrades (C13). The rollout gauges come from the Raft state, so every
+  # server reports the same values; max() keeps one.
+  - name: aerolvm.kubernetes.upgrades
+    rules:
+      - alert: AerolVMRolloutFailed
+        expr: max by (aerolvm_cluster) (aerolvm_rollout_state{key="failed"}) == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: upgrade
+        annotations:
+          summary: "The AerolVM upgrade of {{ $labels.aerolvm_cluster }} failed"
+          description: "The rollout stopped at its first failed node and starts no other. That node runs its old version again. `aerolvm upgrade status` names the node and the error."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmrolloutfailed"
+
+      # §19: a rollout step stuck past its deadline. On Kubernetes the
+      # operator changes each agent's image; a step that never finishes
+      # holds the rollout in one state.
+      - alert: AerolVMRolloutStuck
+        expr: |
+          max by (aerolvm_cluster) (aerolvm_rollout_state{key=~"staging|running|paused|stopped|finalizing|rolling-back"}) == 1
+          and on (aerolvm_cluster)
+          (time() - max by (aerolvm_cluster) (aerolvm_rollout_state_since_unix)) > 3600
+        for: 5m
+        labels:
+          severity: warning
+          component: upgrade
+        annotations:
+          summary: "The AerolVM upgrade of {{ $labels.aerolvm_cluster }} has not moved for over an hour"
+          description: "The rollout has stayed in one state for an hour. A node's step did not finish, or a pause was never resumed. `aerolvm upgrade status` shows which node it waits for."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmrolloutstuck"
+
+      - alert: AerolVMUpgradeStepFailing
+        expr: sum by (namespace) (increase(aerolvm_operator_upgrade_step_failures_total[30m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: upgrade
+        annotations:
+          summary: "The AerolVM operator failed an upgrade step"
+          description: "{{ $value }} upgrade step(s) failed in the last 30 minutes, usually because the new agent image could not be pulled or did not become ready in time. The operator put the old image back and the rollout stopped."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmupgradestepfailing"
+
+      # §19: finalization pending for over a day. Either the rollout is done
+      # and held (--hold) without a finalize, or a node that missed its
+      # turn has waited a day; finalize waits for it.
+      - alert: AerolVMFinalizePending
+        expr: |
+          (
+            max by (aerolvm_cluster) (aerolvm_rollout_state{key="done"}) == 1
+            and on (aerolvm_cluster)
+            (time() - max by (aerolvm_cluster) (aerolvm_rollout_state_since_unix)) > 86400
+          )
+          or
+          (
+            max by (aerolvm_cluster) (aerolvm_rollout_waiting_node_since_unix) > 0
+            and on (aerolvm_cluster)
+            (time() - max by (aerolvm_cluster) (aerolvm_rollout_waiting_node_since_unix)) > 86400
+          )
+        for: 10m
+        labels:
+          severity: warning
+          component: upgrade
+        annotations:
+          summary: "The AerolVM upgrade of {{ $labels.aerolvm_cluster }} has waited over a day to be finalized"
+          description: "New features of the new version stay off, and rollback stays possible, until the upgrade is finalized. Finalize it, or upgrade or delete the node it waits for."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmfinalizepending"
+
+  # Per-team usage (C20).
+  - name: aerolvm.kubernetes.usage
+    rules:
+      # §19: the usage exporter stale for over 10 minutes. The cost split
+      # misses that worker's share while it lasts.
+      - alert: AerolVMUsageExporterStale
+        expr: time() - max by (aerolvm_cluster, namespace, pod) (aerolvm_usage_last_sample_timestamp_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+          component: usage
+        annotations:
+          summary: "Worker {{ $labels.namespace }}/{{ $labels.pod }} stopped counting usage per team"
+          description: "Its usage counters have not moved for {{ $value | humanizeDuration }}. The per-team charge misses this worker until they move again. The agent's log says why each sample was skipped."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmusageexporterstale"
+
+  # Sandbox traffic to the cluster's own addresses (C24).
+  - name: aerolvm.kubernetes.egress
+    rules:
+      # §19: sandbox egress drops to cluster ranges above normal, by range
+      # kind (deny_floor: the API server and the other floor addresses;
+      # private: private and cluster ranges). Above normal is three times
+      # the last day's rate, and at least 20 in 15 minutes; with no day of
+      # history yet, the baseline is zero.
+      - alert: AerolVMSandboxEgressToClusterRanges
+        expr: |
+          sum by (aerolvm_cluster, key) (rate(aerolvm_egress_denied_total{key=~"deny_floor|private"}[15m]))
+          > 3 * (
+            sum by (aerolvm_cluster, key) (rate(aerolvm_egress_denied_total{key=~"deny_floor|private"}[1d] offset 15m))
+            or
+            0 * sum by (aerolvm_cluster, key) (rate(aerolvm_egress_denied_total{key=~"deny_floor|private"}[15m]))
+          )
+          and
+          sum by (aerolvm_cluster, key) (increase(aerolvm_egress_denied_total{key=~"deny_floor|private"}[15m])) > 20
+        for: 5m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "Sandboxes in {{ $labels.aerolvm_cluster }} try to reach {{ $labels.key }} addresses more than usual"
+          description: "Sandbox connections to {{ $labels.key }} addresses were refused at more than three times the usual rate. Each was blocked. A sandbox scanning the cluster's network looks like this, so find which sandboxes they were."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmsandboxegresstoclusterranges"
+
+  # Per-team usage sums (C20), as in the "Usage per team" docs. Each adds
+  # one counter across every worker and every incarnation, so a worker
+  # restart, a worker that leaves or a leader change loses or
+  # double-counts nothing. A rate of seconds per second is a count of CPUs
+  # (or MiB) held.
+  - name: aerolvm.kubernetes.usage-sums
+    rules:
+      - record: owner:aerolvm_usage_reserved_cpu_seconds:rate5m
+        expr: sum by (aerolvm_cluster, owner) (rate(aerolvm_usage_reserved_cpu_seconds_total[5m]))
+      - record: owner:aerolvm_usage_reserved_memory_mib_seconds:rate5m
+        expr: sum by (aerolvm_cluster, owner) (rate(aerolvm_usage_reserved_memory_mib_seconds_total[5m]))
+      - record: owner:aerolvm_usage_consumed_cpu_seconds:rate5m
+        expr: sum by (aerolvm_cluster, owner) (rate(aerolvm_usage_consumed_cpu_seconds_total[5m]))
+      - record: owner:aerolvm_usage_consumed_memory_mib_seconds:rate5m
+        expr: sum by (aerolvm_cluster, owner) (rate(aerolvm_usage_consumed_memory_mib_seconds_total[5m]))

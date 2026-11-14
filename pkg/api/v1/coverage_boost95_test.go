@@ -53,6 +53,9 @@ func (c *volumeErrCluster) VolumeExistsForSource(context.Context, string) (bool,
 func (c *volumeErrCluster) VolumeAttachmentCount(context.Context, string, string) (int, error) {
 	return 0, c.attachErr
 }
+func (c *volumeErrCluster) VolumeAttachmentsForSandbox(context.Context, string) ([]models.VolumeAttachment, error) {
+	return nil, c.attachErr
+}
 
 func TestHandlersReconcileSuccessPath(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -180,6 +183,7 @@ func TestClusterInternalVolumeErrorBranches(t *testing.T) {
 		{"kind=list&tenant=t", http.StatusInternalServerError},
 		{"kind=source&source=s3://x", http.StatusInternalServerError},
 		{"kind=attachment_count&tenant=t&id=vol-1", http.StatusInternalServerError},
+		{"kind=sandbox&sandbox_id=sb-1", http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
 		rr := httptest.NewRecorder()

@@ -15,96 +15,57 @@ This guide is the routine "I pushed new toolboxd code, now what" runbook.
 
 ## The rule
 
-**Ansible is the sole writer of `/usr/local/bin/toolboxd`. Terraform never
-touches it.** Use `Ansible/playbooks/update-toolboxd.yml` - the playbook
-already handles atomic file swap, per-host serialization, and version
-reporting.
+**`toolboxd` ships with `sandboxd`, and they upgrade together.** Every
+release carries `sandboxd`, `toolboxd` and `caddy` for each CPU type, and
+`aerolvm upgrade apply` replaces all three on every node in one step. There
+is no separate toolboxd rollout. The old Ansible playbook
+(`update-toolboxd.yml`) is gone, and Terraform never touches the binary.
 
-There are exactly two valid sources for the new binary:
+On each node the upgrader (`sandboxd upgrade node`) checks every file
+against its SHA-256 before anything changes, keeps the old files as
+`*.prev`, and swaps `toolboxd` first, then `caddy`, then `sandboxd`. Each
+swap is a rename, so a sandbox starting mid-upgrade sees either the old or
+the new file, never a half-written one.
 
-1. A locally built `bin/toolboxd` (the common case during development).
-2. A GitHub release asset attached by `.github/workflows/release.yml` when
-   a tag is published (the common case after a release is cut).
+Don't `scp` a binary onto a node by hand.
 
-Don't `scp` a binary onto a node by hand. The playbook's atomic `mv`
-guarantees a sandbox starting mid-rollout sees either the old or the new
-inode, never a half-written file.
-
-## Path A - push a locally built binary (most common while developing)
-
-Use this whenever you've merged or cherry-picked changes that aren't in a
-released artifact yet.
+## Path A - a release
 
 ```bash
-# 1. Pull the latest code and cross-compile for Linux nodes.
-cd <repo-root>
-git pull origin main
-GOOS=linux GOARCH=amd64 make build-toolboxd
-# → produces bin/toolboxd
-
-# 2. Roll it out across the fleet (run from Ansible/).
-cd Ansible
-ansible-playbook -i inventory/aws_ec2.yml playbooks/update-toolboxd.yml \
-  -e toolboxd_local_binary=../bin/toolboxd
+aerolvm upgrade plan v0.7.0
+aerolvm upgrade apply v0.7.0 --wait
 ```
 
-The path is resolved relative to the `Ansible/` directory, so `../bin/toolboxd`
-works regardless of where ansible-playbook switches cwd to internally.
+`plan` changes nothing. It shows each node's version, the order the nodes
+go in, and what restarts. `apply` hands the rollout to the cluster's
+leader: servers one at a time (the leader last), then ingress nodes, then
+workers in batches. Each node is checked healthy before the next one
+starts. See [`../runbooks/cluster-upgrades.md`](../runbooks/cluster-upgrades.md)
+for `status`, `stop`, `resume`, `rollback` and what to do when a node fails.
 
-For ARM64 nodes (e.g. Graviton), build with `GOARCH=arm64` and roll out the
-same way.
+## Path B - a build of your own (development)
 
-## Path B - fetch a GitHub release asset
+Build the Linux files into one folder with a `checksums.txt` that lists
+them (the integration harness's `make itest-build` makes exactly that
+folder, under `integration-tests/.build/<id>/`):
 
-Only valid if you've tagged a release and `release.yml` has finished
-building. Release assets follow `toolboxd_<goos>_<goarch>` - matching the
-sandboxd asset naming convention.
+```
+dist/
+  checksums.txt
+  sandboxd_linux_amd64
+  toolboxd_linux_amd64
+```
+
+Then push it to every node:
 
 ```bash
-cd Ansible
-ansible-playbook -i inventory/aws_ec2.yml playbooks/update-toolboxd.yml \
-  -e toolboxd_remote_url=https://github.com/aerol-ai/microvm/releases/latest/download/toolboxd_linux_amd64
+aerolvm upgrade apply <version-the-build-reports> --from ./dist --allow-unversioned --wait
 ```
 
-To pin to a specific version instead of `latest`:
-
-```bash
--e toolboxd_remote_url=https://github.com/aerol-ai/microvm/releases/download/v0.2.2/toolboxd_linux_amd64
-```
-
-## Test on one node before the full rollout
-
-The playbook uses `serial: 1` and `any_errors_fatal: true`, so a failure on
-node 1 stops the rollout before it touches the rest of the cluster. Even so,
-prefer to verify the binary on a single host first:
-
-```bash
-ansible-playbook -i inventory/aws_ec2.yml playbooks/update-toolboxd.yml \
-  -e toolboxd_local_binary=../bin/toolboxd \
-  --limit aerolvm-srv1
-```
-
-Then create a fresh sandbox against that host and exercise the changed code
-path. Once it works, drop `--limit` and run the full sweep.
-
-## What the playbook actually does
-
-Per node, in order:
-
-1. Validates exactly one of `toolboxd_local_binary` or `toolboxd_remote_url`
-   was passed.
-2. Stages the new binary at `/tmp/toolboxd.new` (upload or `get_url`),
-   mode `0755`, root-owned.
-3. Atomically `mv -f /tmp/toolboxd.new /usr/local/bin/toolboxd`. `mv`
-   within a filesystem is a directory-entry swap - sandboxes that already
-   bind-mounted the old inode keep it; new sandboxes see the new file.
-4. Runs `timeout 5s /usr/local/bin/toolboxd --version` and prints the
-   reported version. The `timeout` wrapper is intentional: toolboxd builds
-   older than the `--version` flag (added 2026-05-23) interpret any argv as
-   a user entrypoint and block on `ListenAndServe`. The timeout bounds that
-   worst case.
-5. Prints a reminder that **existing sandboxes still run the old in-RAM
-   binary**.
+`--from` uploads the files to the cluster, which hands them to the nodes;
+the nodes need no internet access. `--allow-unversioned` lets a build whose
+version is not a release tag through. To try it on one canary worker
+first, add `--pause-after 1`; `aerolvm upgrade resume` goes on.
 
 ## Existing sandboxes do not pick up the change
 
@@ -133,21 +94,13 @@ running the old inode.
 
 ## Verifying the rollout
 
-After the playbook reports success, the recommended sanity check is:
+1. `aerolvm upgrade status` shows every node `done`, and
+   `aerolvm get nodes` shows the new version on every node.
+2. On a node, `timeout 5s /usr/local/bin/toolboxd --version` prints the new
+   version.
+3. Create a new sandbox and exercise the changed endpoint.
 
-1. Confirm the host file is the expected version on a sample of nodes:
-
-   ```bash
-   ansible all -i inventory/aws_ec2.yml -a \
-     'timeout 5s /usr/local/bin/toolboxd --version'
-   ```
-
-2. Create a new sandbox and exercise the changed endpoint (e.g. for the
-   2026-05-23 interactive-input fix, run a session command that uses
-   `read`, send input via `sendSessionCommandInput`, and verify the
-   response is no longer `501 interactive command input is not implemented`).
-
-If both checks pass, the rollout is complete. Existing long-lived sandboxes
+If all three pass, the rollout is complete. Existing long-lived sandboxes
 that need the fix will pick it up on their next recreate cycle.
 
 ## When to use Terraform instead

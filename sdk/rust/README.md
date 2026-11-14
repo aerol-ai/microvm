@@ -104,6 +104,24 @@ let result = handle.wait()?;
 println!("{:?}", result);
 ```
 
+## Watching files
+
+File watching works on gVisor and Firecracker sandboxes; other runtimes answer
+a 501. `watch_files` returns once the watch is in place, and calls the closure
+once per change, on a background thread. Dropping the handle stops the watch.
+
+```rust
+let handle = sandbox.watch_files(
+	"/workspace",
+	aerolvm_sdk::WatchOptions { recursive: true },
+	|event| println!("{} {}", event.kind, event.path),
+)?;
+
+// ... later
+handle.stop();
+handle.wait()?;
+```
+
 ## Sessions
 
 ```rust

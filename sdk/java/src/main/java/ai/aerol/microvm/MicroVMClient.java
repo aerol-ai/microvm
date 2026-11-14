@@ -3,7 +3,6 @@ package ai.aerol.microvm;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -17,6 +16,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import ai.aerol.microvm.internal.Environment;
@@ -26,16 +26,29 @@ import ai.aerol.microvm.internal.StreamControlMessage;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.internal.WebSocketHandshakeFailure;
 import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.ApiTokenList;
 import ai.aerol.microvm.model.CreateApiTokenOptions;
 import ai.aerol.microvm.model.CreatedApiToken;
+import ai.aerol.microvm.model.CreateSandboxTokenOptions;
+import ai.aerol.microvm.model.RevokeSandboxTokensResult;
+import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.IdentityRole;
+import ai.aerol.microvm.model.IdentityRoleList;
+import ai.aerol.microvm.model.IdentityRoleOptions;
+import ai.aerol.microvm.model.ListIdentityRolesOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.TeamQuota;
+import ai.aerol.microvm.model.TeamQuotaOptions;
+import ai.aerol.microvm.model.WarmPool;
+import ai.aerol.microvm.model.WarmPoolList;
+import ai.aerol.microvm.model.WarmPoolOptions;
 import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkLearnedEntry;
@@ -66,6 +79,17 @@ import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
 import ai.aerol.microvm.model.ExposeProtocol;
 import ai.aerol.microvm.model.ExposeResult;
+import ai.aerol.microvm.model.FileEvent;
+import ai.aerol.microvm.model.CopyFileOptions;
+import ai.aerol.microvm.model.DeleteFileOptions;
+import ai.aerol.microvm.model.FileInfo;
+import ai.aerol.microvm.model.FileList;
+import ai.aerol.microvm.model.FileMatch;
+import ai.aerol.microvm.model.ListFilesOptions;
+import ai.aerol.microvm.model.MakeDirOptions;
+import ai.aerol.microvm.model.MoveFileOptions;
+import ai.aerol.microvm.model.UploadFileOptions;
+import ai.aerol.microvm.model.DownloadFileOptions;
 import ai.aerol.microvm.model.HealthStatus;
 import ai.aerol.microvm.model.IngressTarget;
 import ai.aerol.microvm.model.Lifecycle;
@@ -81,6 +105,7 @@ import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.Template;
 import ai.aerol.microvm.model.WasmModule;
+import ai.aerol.microvm.model.WatchOptions;
 
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
@@ -99,7 +124,19 @@ public class MicroVMClient {
      */
     public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
+    /**
+     * The header a 421 carries when the sandbox lives in another cell of a
+     * federation: that cell's base URL. The client sends the request there
+     * once and remembers the cell for later calls about that sandbox. Keep in
+     * sync with models.CellEndpointHeader on the server.
+     */
+    public static final String CELL_ENDPOINT_HEADER = "X-Aerolvm-Cell-Endpoint";
+
     private static final java.security.SecureRandom IDEMPOTENCY_KEY_RANDOM = new java.security.SecureRandom();
+    // How long watchFiles waits for the server's start frame. toolboxd sends
+    // it once every folder is watched; a recursive walk of a large tree can
+    // take seconds.
+    private static final java.time.Duration WATCH_START_TIMEOUT = java.time.Duration.ofSeconds(60);
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
 
@@ -115,6 +152,11 @@ public class MicroVMClient {
     private final HttpClient httpClient;
     private final WebSocketConnector webSocketConnector;
     private final ai.aerol.microvm.model.RetryConfig retryConfig;
+    // Each sandbox's agent feature list from /version (requireToolboxFeatures).
+    // A miss refreshes it, because a restart can bring a newer agent.
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.Set<String>> toolboxFeatures =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final CellRoutes cellRoutes = new CellRoutes(CellRoutes.MAX_ENTRIES);
 
     /** One bounded fleet-list page plus the opaque token for the next page. */
     public static final class SandboxPage {
@@ -270,8 +312,9 @@ public class MicroVMClient {
         if (key == null) {
             key = newIdempotencyKey();
         }
-        return wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class, RetryMode.IDEMPOTENT,
+        Sandbox sandbox = wrap(doJson("POST", versioned("/sandboxes"), options, SandboxData.class, RetryMode.IDEMPOTENT,
             Map.of(IDEMPOTENCY_KEY_HEADER, key)));
+        return sandbox.setDestroyOnClose(options != null && options.destroyOnClose);
     }
 
     /** A fresh create key: 128 random bits as 32 lowercase hex characters. */
@@ -485,6 +528,49 @@ public class MicroVMClient {
         return java.util.Optional.of(wrap(response[0]));
     }
 
+    /**
+     * Returns the caller's sandbox called {@code name}, creating it from
+     * {@code options} when there is none. {@link GetOrCreateResult#isCreated()}
+     * is true only when this call made the sandbox.
+     *
+     * <p>Safe to retry and to run at the same time from many processes. Names
+     * are unique per owner, so when two callers race to create the same name,
+     * one gets a 409 and reads the winner's sandbox instead; a 409 whose name
+     * still cannot be found is a conflict on something else and is thrown as
+     * is. An existing sandbox is returned as it is: its image and settings
+     * are not compared with {@code options}. {@code options.name} may be null
+     * or repeat {@code name}; {@code options} is not changed.
+     */
+    public GetOrCreateResult getOrCreate(String name, CreateOptions options) {
+        String wanted = name == null ? "" : name.trim();
+        if (wanted.isEmpty()) {
+            throw new IllegalArgumentException("sandbox name is required");
+        }
+        String given = options == null || options.name == null ? "" : options.name.trim();
+        if (!given.isEmpty() && !given.equals(wanted)) {
+            throw new IllegalArgumentException("options name \"" + given + "\" differs from \"" + wanted + "\"");
+        }
+        // destroyOnClose applies only to a sandbox this call creates (create()
+        // sets it). One it finds may be in use by another program that shares
+        // the name, so it is never deleted on close.
+        java.util.Optional<Sandbox> existing = getByName(wanted);
+        if (existing.isPresent()) {
+            return new GetOrCreateResult(existing.get().setDestroyOnClose(false), false);
+        }
+        CreateOptions named = copyCreateOptions(options);
+        named.name = wanted;
+        try {
+            return new GetOrCreateResult(create(named), true);
+        } catch (MicroVMConflictException e) {
+            // Another caller created the name after the lookup.
+            java.util.Optional<Sandbox> winner = getByName(wanted);
+            if (winner.isEmpty()) {
+                throw e;
+            }
+            return new GetOrCreateResult(winner.get().setDestroyOnClose(false), false);
+        }
+    }
+
     public Sandbox get(String sandboxId) {
         return get(sandboxId, false);
     }
@@ -590,6 +676,37 @@ public class MicroVMClient {
 
     private String snapshotPath(String name) {
         return versioned("/snapshots/" + encodePathSegment(name));
+    }
+
+    /**
+     * Deletes every sandbox of yours that carries all of {@code tags} and
+     * returns the IDs of the ones now gone. It lists every page first, then
+     * deletes them one at a time. A sandbox that is already gone (404) counts
+     * as deleted, so a second call, or two calls at once, is safe. Any other
+     * failed delete stops the call and is thrown; the sandboxes already
+     * deleted stay deleted, and calling it again finishes the job.
+     *
+     * @throws IllegalArgumentException when {@code tags} is null or empty:
+     *     with no filter it would delete every sandbox you own
+     */
+    public List<String> destroyAll(java.util.Map<String, String> tags) {
+        if (tags == null || tags.isEmpty()) {
+            throw new IllegalArgumentException("destroyAll needs at least one tag; with none it would delete every sandbox you own");
+        }
+        List<String> ids = new ArrayList<>();
+        for (Sandbox sandbox : list(tags)) {
+            ids.add(sandbox.id);
+        }
+        List<String> gone = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            try {
+                destroy(id);
+            } catch (MicroVMNotFoundException e) {
+                // Already gone: someone else deleted it, which is the goal.
+            }
+            gone.add(id);
+        }
+        return gone;
     }
 
     public void destroy(String sandboxId) {
@@ -743,6 +860,7 @@ public class MicroVMClient {
             appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
             appendQuery(query, "cursor", options.getCursor());
             appendQuery(query, "incarnation_id", options.getIncarnationId());
+            appendQuery(query, "caller", options.getCaller());
         }
         AuditPage page = doJson("GET", sandboxPath(sandboxId) + "/audit" + query, null, AuditPage.class);
         if (page == null) {
@@ -821,8 +939,85 @@ public class MicroVMClient {
         doNoContent("DELETE", egressProfilePath(name), null);
     }
 
+    /**
+     * Sets a team's quota: the most sandboxes, CPU and memory its sandboxes
+     * may hold. Admin only. The same limits twice change nothing. A create,
+     * resize or start past the quota fails with a 429 whose code is
+     * {@code team_quota_exceeded}.
+     */
+    public TeamQuota putTeamQuota(String team, TeamQuotaOptions options) {
+        TeamQuotaOptions body = options == null ? new TeamQuotaOptions() : options;
+        return doJson("PUT", teamQuotaPath(team), body, TeamQuota.class);
+    }
+
+    /** Reads a team's quota and what the team holds now (404 if none). */
+    public TeamQuota getTeamQuota(String team) {
+        return doJson("GET", teamQuotaPath(team), null, TeamQuota.class);
+    }
+
+    /** Removes a team's quota. Removing one that is already gone succeeds. */
+    public void deleteTeamQuota(String team) {
+        doNoContent("DELETE", teamQuotaPath(team), null);
+    }
+
+    private String teamQuotaPath(String team) {
+        return versioned("/teams/" + URLEncoder.encode(team, StandardCharsets.UTF_8) + "/quota");
+    }
+
     private String egressProfilePath(String name) {
         return versioned("/egress-profiles/" + URLEncoder.encode(name, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Puts a role tag on a team's cloud identity allow list, or changes its
+     * minimum caller role ({@code "runner"} or {@code "admin"}). Admin only.
+     * The same call twice changes nothing, so it is safe to retry.
+     */
+    public IdentityRole putIdentityRole(String tag, IdentityRoleOptions options) {
+        IdentityRoleOptions body = options == null ? new IdentityRoleOptions() : options;
+        return doJson("PUT", identityRolePath(tag, body.getTeam()), body, IdentityRole.class);
+    }
+
+    /** Lists a team's cloud identity allow list, one page at a time. Admin only. */
+    public IdentityRoleList listIdentityRoles(ListIdentityRolesOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "team", options.getTeam());
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+        }
+        IdentityRoleList page = doJson("GET", versioned("/identity/roles") + query, null, IdentityRoleList.class);
+        if (page == null) {
+            page = new IdentityRoleList();
+        }
+        if (page.roles == null) {
+            page.roles = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public IdentityRoleList listIdentityRoles() {
+        return listIdentityRoles(null);
+    }
+
+    /**
+     * Takes a role tag off a team's allow list (a null team is the operator
+     * namespace). Admin only. Sandboxes that use it keep their current token
+     * (at most one hour) and get no new one. Deleting a tag that is already
+     * gone succeeds.
+     */
+    public void deleteIdentityRole(String tag, String team) {
+        doNoContent("DELETE", identityRolePath(tag, team), null);
+    }
+
+    public void deleteIdentityRole(String tag) {
+        deleteIdentityRole(tag, null);
+    }
+
+    private String identityRolePath(String tag, String team) {
+        StringBuilder query = new StringBuilder();
+        appendQuery(query, "team", team);
+        return versioned("/identity/roles/" + URLEncoder.encode(tag, StandardCharsets.UTF_8)) + query;
     }
 
     private static EgressProfile withProfileDefaults(EgressProfile profile) {
@@ -830,6 +1025,66 @@ public class MicroVMClient {
             profile.allowOut = new ArrayList<>();
         }
         return profile;
+    }
+
+    // Warm pools are PUT/GET/DELETE of one entry: every call is safe to
+    // retry, so they keep the default (idempotent) retry tier.
+
+    /**
+     * Sets how many ready sandboxes every server with a warm pool keeps for an
+     * image (a full replace: the same call twice is a no-op). A create that
+     * names the image then starts from a warm sandbox. Admin only.
+     */
+    public WarmPool putWarmPool(String image, WarmPoolOptions options) {
+        WarmPoolOptions body = options == null ? new WarmPoolOptions() : options;
+        return withWarmPoolDefaults(doJson("PUT", warmPoolPath(image), body, WarmPool.class));
+    }
+
+    /** Reads an image's warm-pool entry with its status (ready and target, in total and per server). */
+    public WarmPool getWarmPool(String image) {
+        return withWarmPoolDefaults(doJson("GET", warmPoolPath(image), null, WarmPool.class));
+    }
+
+    /** Reads every warm-pool entry, by image, with its status. */
+    public List<WarmPool> listWarmPools() {
+        WarmPoolList list = doJson("GET", versioned("/warm-pools"), null, WarmPoolList.class);
+        List<WarmPool> out = new ArrayList<>();
+        if (list != null && list.pools != null) {
+            for (WarmPool pool : list.pools) {
+                out.add(withWarmPoolDefaults(pool));
+            }
+        }
+        return out;
+    }
+
+    /** Deletes an image's warm-pool entry; its warm sandboxes are removed. Deleting a missing entry succeeds. */
+    public void deleteWarmPool(String image) {
+        doNoContent("DELETE", warmPoolPath(image), null);
+    }
+
+    // An image is the rest of the path: each segment is escaped and the
+    // slashes kept, so no proxy has an encoded slash to rewrite. URLEncoder is
+    // a form encoder, so its '+' for a space becomes %20 for a path.
+    private String warmPoolPath(String image) {
+        String[] segments = (image == null ? "" : image).split("/", -1);
+        StringBuilder path = new StringBuilder("/warm-pools/");
+        for (int i = 0; i < segments.length; i++) {
+            if (i > 0) {
+                path.append('/');
+            }
+            path.append(URLEncoder.encode(segments[i], StandardCharsets.UTF_8).replace("+", "%20"));
+        }
+        return versioned(path.toString());
+    }
+
+    private static WarmPool withWarmPoolDefaults(WarmPool pool) {
+        if (pool != null && pool.status != null && pool.status.servers == null) {
+            pool.status.servers = new ArrayList<>();
+        }
+        if (pool != null && (pool.onImageChange == null || pool.onImageChange.isEmpty())) {
+            pool.onImageChange = WarmPoolOptions.REPLACE_NOW;
+        }
+        return pool;
     }
 
     public AuditPage getAudit(String sandboxId) {
@@ -876,30 +1131,437 @@ public class MicroVMClient {
      * caller, who knows whether the command is safe to repeat.
      */
     public ExecResult exec(String sandboxId, ExecRequest request) {
+        // An older agent ignores the caps and returns all output, and refuses
+        // argv with a confusing "command is required"; check first.
+        List<String> features = new ArrayList<>();
+        if (request != null && (isSet(request.maxStdoutBytes) || isSet(request.maxStderrBytes))) {
+            features.add("exec.max_output_bytes");
+        }
+        if (request != null && request.argv != null && !request.argv.isEmpty()) {
+            features.add("exec.argv");
+        }
+        requireToolboxFeatures(sandboxId, features.toArray(new String[0]));
         return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class, RetryMode.UNSENT_ONLY);
     }
 
+    /** A cap of 0 or null means none, as on the wire. */
+    private static boolean isSet(Long cap) {
+        return cap != null && cap != 0;
+    }
+
     public void uploadFile(String sandboxId, String targetPath, byte[] data) {
+        uploadFile(sandboxId, targetPath, data, null);
+    }
+
+    /**
+     * Uploads {@code data} with write options: append, create-only, atomic
+     * replace and a file mode. A sandbox whose agent predates them fails with
+     * {@link MicroVMUnsupportedFeatureException} instead of ignoring them.
+     * Plain and atomic uploads retry on 421/429/502/503/504; append and
+     * create-only only on 429/503, because a second send would append twice
+     * or find the first one's file.
+     */
+    public void uploadFile(String sandboxId, String targetPath, byte[] data, UploadFileOptions options) {
+        UploadFileOptions opts = options == null ? new UploadFileOptions() : options;
+        Map<String, String> query = uploadQuery(sandboxId, opts);
         String boundary = "----microvm-" + UUID.randomUUID();
         byte[] body = buildMultipartBody(boundary, targetPath, data);
         HttpResponse<byte[]> response = sendRequest(
             "POST",
-            sandboxPath(sandboxId) + "/toolbox/files/upload",
+            toolboxPath(sandboxId, "/files/upload", query),
             HttpRequest.BodyPublishers.ofByteArray(body),
-            "multipart/form-data; boundary=" + boundary
+            "multipart/form-data; boundary=" + boundary,
+            null,
+            opts.append || opts.createOnly ? RetryMode.UNSENT_ONLY : RetryMode.IDEMPOTENT
         );
         ensureSuccess(response);
     }
 
+    /** The upload's write options as query, after the /version check they need. */
+    private Map<String, String> uploadQuery(String sandboxId, UploadFileOptions options) {
+        UploadFileOptions opts = options == null ? new UploadFileOptions() : options;
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        if (opts.append) {
+            query.put("append", "true");
+        }
+        if (opts.createOnly) {
+            query.put("create_only", "true");
+        }
+        if (opts.atomic) {
+            query.put("atomic", "true");
+        }
+        if (opts.mode != null) {
+            query.put("mode", Integer.toOctalString(opts.mode));
+        }
+        if (!query.isEmpty()) {
+            // An older agent ignores these; create_only would replace a file.
+            requireToolboxFeatures(sandboxId, FEATURE_WRITE_OPTIONS);
+        }
+        return query;
+    }
+
     public byte[] downloadFile(String sandboxId, String targetPath) {
-        HttpResponse<byte[]> response = sendRequest(
+        return downloadFile(sandboxId, targetPath, null);
+    }
+
+    /** Reads a whole file, refusing one larger than {@code options.maxBytes}. Retries like any safe call. */
+    public byte[] downloadFile(String sandboxId, String targetPath, DownloadFileOptions options) {
+        try (java.io.InputStream in = downloadFileStream(sandboxId, targetPath, options)) {
+            return in.readAllBytes();
+        } catch (MicroVMException ex) {
+            throw ex;
+        } catch (IOException ex) {
+            if (ex.getCause() instanceof MicroVMFileTooLargeException) {
+                throw (MicroVMFileTooLargeException) ex.getCause();
+            }
+            throw new MicroVMException("read " + targetPath + ": " + ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * Opens a file for reading a piece at a time, so a large file never sits
+     * in memory; close the stream when done. With {@code maxBytes}, a larger
+     * file is refused before reading when the server states the size, and
+     * otherwise the read that passes the limit throws an IOException whose
+     * cause is a {@link MicroVMFileTooLargeException}. The request retries
+     * until the file starts to arrive (plans/agent-sandbox-feature-parity.md,
+     * F4).
+     */
+    public java.io.InputStream downloadFileStream(String sandboxId, String targetPath, DownloadFileOptions options) {
+        HttpResponse<java.io.InputStream> response = send(
             "GET",
-            sandboxPath(sandboxId) + "/toolbox/files/download?path=" + encodeQueryValue(targetPath),
+            toolboxPath(sandboxId, "/files/download", Map.of("path", targetPath)),
             HttpRequest.BodyPublishers.noBody(),
-            null
+            null,
+            null,
+            RetryMode.IDEMPOTENT,
+            null,
+            HttpResponse.BodyHandlers.ofInputStream()
+        );
+        java.io.InputStream body = response.body();
+        if (response.statusCode() >= 400) {
+            byte[] error;
+            try (java.io.InputStream in = body) {
+                error = in.readAllBytes();
+            } catch (IOException ex) {
+                error = new byte[0];
+            }
+            throwApiError(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null), error);
+        }
+        Long max = options == null ? null : options.maxBytes;
+        if (max == null) {
+            return body;
+        }
+        long length = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+        if (length > max) {
+            try {
+                body.close();
+            } catch (IOException ignored) {
+                // The refusal is the error that matters.
+            }
+            throw new MicroVMFileTooLargeException(targetPath, max);
+        }
+        return new CappedInputStream(body, targetPath, max);
+    }
+
+    /** Fails the read that would pass the limit, instead of quietly cutting the file short. */
+    private static final class CappedInputStream extends java.io.FilterInputStream {
+        private final String path;
+        private final long max;
+        private long left;
+        private boolean over;
+
+        CappedInputStream(java.io.InputStream in, String path, long max) {
+            super(in);
+            this.path = path;
+            this.max = max;
+            this.left = max;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int n = read(one, 0, 1);
+            return n < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            if (over) {
+                throw new IOException(new MicroVMFileTooLargeException(path, max));
+            }
+            if (len == 0) {
+                return 0;
+            }
+            // Read one byte past the limit to tell "exactly the limit" from "more".
+            int n = super.read(b, off, (int) Math.min(len, left + 1));
+            if (n > left) {
+                // Past the limit: hand over the bytes under it first, as the
+                // other SDKs do, and fail the next read.
+                int under = (int) left;
+                left = 0;
+                over = true;
+                if (under == 0) {
+                    throw new IOException(new MicroVMFileTooLargeException(path, max));
+                }
+                return under;
+            }
+            if (n > 0) {
+                left -= n;
+            }
+            return n;
+        }
+    }
+
+    /**
+     * Uploads from {@code data} a piece at a time, so a large file never sits
+     * in memory. The options are {@link #uploadFile(String, String, byte[],
+     * UploadFileOptions)}'s. The data is read as it is sent, so it is sent
+     * once and never retried, not even to the cell a 421 names (see
+     * {@link #CELL_ENDPOINT_HEADER}): that 421 is thrown, and a new call with
+     * fresh data goes straight to that cell.
+     */
+    public void uploadFileStream(String sandboxId, String targetPath, java.io.InputStream data, UploadFileOptions options) {
+        String path = toolboxPath(sandboxId, "/files/upload", uploadQuery(sandboxId, options));
+        String boundary = "----microvm-" + UUID.randomUUID();
+        byte[] head = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n" + targetPath + "\r\n"
+            + "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + baseName(targetPath) + "\"\r\n"
+            + "Content-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+        byte[] tail = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
+        HttpRequest.BodyPublisher body = HttpRequest.BodyPublishers.ofInputStream(() -> new java.io.SequenceInputStream(
+            java.util.Collections.enumeration(List.of(new java.io.ByteArrayInputStream(head), data, new java.io.ByteArrayInputStream(tail)))));
+        ensureSuccess(sendRequest("POST", path, body, "multipart/form-data; boundary=" + boundary, null, RetryMode.NEVER));
+    }
+
+    // File verbs beyond upload and download (plans/agent-sandbox-feature-
+    // parity.md, F1), through the sandbox's toolbox. A sandbox whose agent
+    // predates them fails closed with MicroVMUnsupportedFeatureException
+    // instead of ignoring a safety option; WASM and V8 isolate sandboxes
+    // answer HTTP 501.
+    //
+    // Retries: listFiles, getFileInfo, fileExists, searchFiles, findInFiles,
+    // deleteFile and makeDir are safe to re-send and retry on 421, 429, 502,
+    // 503 and 504 (a retried delete or mkdir whose work is already done counts
+    // as success). moveFile and copyFile retry only on 429 and 503, because a
+    // lost reply may hide a move that happened.
+
+    /**
+     * The toolboxd feature (on /version) behind the file verbs' options: list
+     * depth and cap, the move and copy overwrite guard, mkdir without parents
+     * and the copy route. An older agent ignores those options
+     * (overwrite=false would overwrite), so the calls that send them check
+     * first.
+     */
+    static final String FEATURE_FILE_VERBS = "files.verbs";
+
+    /** The toolboxd feature behind upload's write options. */
+    static final String FEATURE_WRITE_OPTIONS = "files.write_options";
+
+    /** The toolboxd feature behind upload's extract=true ({@link #uploadDir}). */
+    static final String FEATURE_EXTRACT = "files.extract";
+
+    /**
+     * Copies the local folder {@code localDir} into {@code remoteDir} in the
+     * sandbox (made if missing). The folder is packed as a gzipped tar and the
+     * sandbox unpacks it safely: no entry can land outside {@code remoteDir}.
+     * Symlinks are sent as links, hard-linked files as separate files;
+     * devices, pipes and sockets are skipped. The archive is built in memory
+     * and sent once, never retried.
+     */
+    public void uploadDir(String sandboxId, java.nio.file.Path localDir, String remoteDir) {
+        if (!java.nio.file.Files.isDirectory(localDir)) {
+            throw new MicroVMException(localDir + " is not a folder");
+        }
+        // An older agent ignores extract and stores the archive as a file.
+        requireToolboxFeatures(sandboxId, FEATURE_EXTRACT);
+        byte[] archive;
+        try {
+            archive = ai.aerol.microvm.internal.TarWriter.gzippedFolder(localDir);
+        } catch (IOException ex) {
+            throw new MicroVMException("pack " + localDir + ": " + ex.getMessage(), ex);
+        }
+        String boundary = "----microvm-" + UUID.randomUUID();
+        byte[] body = buildMultipartBody(boundary, remoteDir, archive);
+        HttpResponse<byte[]> response = sendRequest(
+            "POST",
+            toolboxPath(sandboxId, "/files/upload", Map.of("extract", "true")),
+            HttpRequest.BodyPublishers.ofByteArray(body),
+            "multipart/form-data; boundary=" + boundary,
+            null,
+            RetryMode.NEVER
         );
         ensureSuccess(response);
-        return response.body();
+    }
+
+    private String toolboxPath(String sandboxId, String route, Map<String, String> query) {
+        StringBuilder path = new StringBuilder(sandboxPath(sandboxId)).append("/toolbox").append(route);
+        char sep = '?';
+        for (Map.Entry<String, String> entry : query.entrySet()) {
+            path.append(sep).append(encodeQueryValue(entry.getKey())).append('=').append(encodeQueryValue(entry.getValue()));
+            sep = '&';
+        }
+        return path.toString();
+    }
+
+    /** Lists a folder. The listing's {@code truncated} says more entries exist. */
+    public FileList listFiles(String sandboxId, String path, ListFilesOptions options) {
+        ListFilesOptions opts = options == null ? new ListFilesOptions() : options;
+        if (opts.depth < 1 || opts.limit < 1) {
+            throw new MicroVMException("depth and limit must be at least 1");
+        }
+        requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("depth", Integer.toString(opts.depth));
+        query.put("limit", Integer.toString(opts.limit));
+        query.put("extended", "true");
+        HttpResponse<byte[]> response = sendRequest("GET", toolboxPath(sandboxId, "/files", query), HttpRequest.BodyPublishers.noBody(), null);
+        ensureSuccess(response);
+        FileInfoWire[] items = response.body().length == 0 ? null : JsonSupport.read(response.body(), FileInfoWire[].class);
+        FileList list = new FileList();
+        String base = path.replaceAll("/+$", "");
+        if (items != null) {
+            for (FileInfoWire item : items) {
+                list.entries.add(item.toFileInfo(base + "/" + (item.name == null ? "" : item.name)));
+            }
+        }
+        list.truncated = "true".equals(response.headers().firstValue("X-Toolbox-Truncated").orElse(null));
+        return list;
+    }
+
+    public FileList listFiles(String sandboxId, String path) {
+        return listFiles(sandboxId, path, null);
+    }
+
+    /** Describes one path. A symlink is followed. */
+    public FileInfo getFileInfo(String sandboxId, String path) {
+        // extended=true only adds fields; an older agent that ignores it
+        // answers fields this still reads, so no /version check.
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("extended", "true");
+        FileInfoWire wire = doJson("GET", toolboxPath(sandboxId, "/files/info", query), null, FileInfoWire.class);
+        return (wire == null ? new FileInfoWire() : wire).toFileInfo(path);
+    }
+
+    /** Whether a path exists. A missing sandbox throws; it is not {@code false}. */
+    public boolean fileExists(String sandboxId, String path) {
+        try {
+            getFileInfo(sandboxId, path);
+            return true;
+        } catch (MicroVMApiException err) {
+            if (isMissingFile(err)) {
+                return false;
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * A missing file, not a missing sandbox (also a 404). Current agents say
+     * file_not_found; older ones send no code, but their message is the OS
+     * error, which ends "no such file or directory".
+     */
+    private static boolean isMissingFile(MicroVMApiException err) {
+        if (err.getStatusCode() != 404) {
+            return false;
+        }
+        return "file_not_found".equals(err.getCode())
+            || (err.getCode() == null && err.getMessage() != null && err.getMessage().endsWith("no such file or directory"));
+    }
+
+    /** Deletes a file, or a folder and its contents with {@code recursive}. */
+    public void deleteFile(String sandboxId, String path, DeleteFileOptions options) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        if (options != null && options.recursive) {
+            query.put("recursive", "true");
+        }
+        fileCall("DELETE", toolboxPath(sandboxId, "/files", query), RetryMode.IDEMPOTENT, "file_not_found");
+    }
+
+    public void deleteFile(String sandboxId, String path) {
+        deleteFile(sandboxId, path, null);
+    }
+
+    /** Makes a folder; with {@code parents}, like {@code mkdir -p}. */
+    public void makeDir(String sandboxId, String path, MakeDirOptions options) {
+        MakeDirOptions opts = options == null ? new MakeDirOptions() : options;
+        if (!opts.parents) {
+            // An older agent ignores parents=false and makes them anyway.
+            requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        }
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("parents", Boolean.toString(opts.parents));
+        if (opts.mode != null) {
+            query.put("mode", Integer.toOctalString(opts.mode));
+        }
+        fileCall("POST", toolboxPath(sandboxId, "/files/folder", query), RetryMode.IDEMPOTENT, "folder_exists");
+    }
+
+    public void makeDir(String sandboxId, String path) {
+        makeDir(sandboxId, path, null);
+    }
+
+    /** Moves or renames a file or folder. Without {@code overwrite}, an existing destination is refused (HTTP 409). */
+    public void moveFile(String sandboxId, String source, String destination, MoveFileOptions options) {
+        boolean overwrite = options != null && options.overwrite;
+        if (!overwrite) {
+            // An older agent ignores overwrite=false and replaces the file.
+            requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        }
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("source", source);
+        query.put("destination", destination);
+        query.put("overwrite", Boolean.toString(overwrite));
+        fileCall("POST", toolboxPath(sandboxId, "/files/move", query), RetryMode.UNSENT_ONLY, null);
+    }
+
+    public void moveFile(String sandboxId, String source, String destination) {
+        moveFile(sandboxId, source, destination, null);
+    }
+
+    /** Copies a file, or a folder with {@code recursive} (keeping modes and symlinks). */
+    public void copyFile(String sandboxId, String source, String destination, CopyFileOptions options) {
+        CopyFileOptions opts = options == null ? new CopyFileOptions() : options;
+        requireToolboxFeatures(sandboxId, FEATURE_FILE_VERBS);
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("source", source);
+        query.put("destination", destination);
+        query.put("overwrite", Boolean.toString(opts.overwrite));
+        query.put("recursive", Boolean.toString(opts.recursive));
+        fileCall("POST", toolboxPath(sandboxId, "/files/copy", query), RetryMode.UNSENT_ONLY, null);
+    }
+
+    public void copyFile(String sandboxId, String source, String destination) {
+        copyFile(sandboxId, source, destination, null);
+    }
+
+    /** Paths under {@code path} whose name matches a glob such as {@code *.java}. */
+    public List<String> searchFiles(String sandboxId, String path, String pattern) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("pattern", pattern);
+        SearchFilesResponse found = doJson("GET", toolboxPath(sandboxId, "/files/search", query), null, SearchFilesResponse.class);
+        return found == null || found.files == null ? new ArrayList<>() : found.files;
+    }
+
+    /** Each line under {@code path} that contains {@code text} (plain text). */
+    public List<FileMatch> findInFiles(String sandboxId, String path, String text) {
+        Map<String, String> query = new java.util.LinkedHashMap<>();
+        query.put("path", path);
+        query.put("pattern", text);
+        FileMatch[] matches = doJson("GET", toolboxPath(sandboxId, "/files/find", query), null, FileMatch[].class);
+        return matches == null ? new ArrayList<>() : new ArrayList<>(java.util.Arrays.asList(matches));
+    }
+
+    /** A body-less file call whose success reply is discarded. */
+    private void fileCall(String method, String path, RetryMode retryMode, String doneCode) {
+        HttpResponse<byte[]> response = sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, null, retryMode, doneCode);
+        if (response != null) {
+            ensureSuccess(response);
+        }
     }
 
     /**
@@ -912,7 +1574,12 @@ public class MicroVMClient {
      */
     public ExposeResult exposePort(String sandboxId, int port, ExposeOptions options) {
         ExposeProtocol protocol = (options != null && options.protocol != null) ? options.protocol : ExposeProtocol.HTTP;
-        Object body = protocol == ExposeProtocol.HTTP ? null : new ExposePortRequest(protocol.getWireValue());
+        String visibility = options != null && options.visibility != null && !options.visibility.isEmpty() ? options.visibility : null;
+        // Only what the caller set: an omitted visibility keeps an exposed
+        // port's gate, so a plain retry never opens a token port.
+        Object body = protocol == ExposeProtocol.HTTP && visibility == null
+            ? null
+            : new ExposePortRequest(protocol == ExposeProtocol.HTTP ? null : protocol.getWireValue(), visibility);
         ExposeResult response = doJson("POST", sandboxPath(sandboxId) + "/ports/" + port, body, ExposeResult.class);
         if (response == null) {
             ExposeResult empty = new ExposeResult();
@@ -932,6 +1599,29 @@ public class MicroVMClient {
 
     public void unexposePort(String sandboxId, int port) {
         doNoContent("DELETE", sandboxPath(sandboxId) + "/ports/" + port, null);
+    }
+
+    /**
+     * Issue a signed token scoped to one sandbox ({@code POST
+     * /v1/sandboxes/{id}/tokens}), to hand to a browser or an end user. Not
+     * idempotent by nature: every call makes a new token and the server
+     * stores none. It uses the normal retry tier: a retry after a lost
+     * answer makes a second token nobody holds, which simply expires.
+     */
+    public SandboxToken createSandboxToken(String sandboxId, CreateSandboxTokenOptions options) {
+        CreateSandboxTokenOptions body = options == null ? new CreateSandboxTokenOptions() : options;
+        return doJson("POST", sandboxPath(sandboxId) + "/tokens", body, SandboxToken.class);
+    }
+
+    /**
+     * Make every token issued for one sandbox so far stop working ({@code
+     * POST /v1/sandboxes/{id}/tokens/revoke}), toolbox and port tokens
+     * alike. A token issued after it works. Safe to retry: a repeated call
+     * refuses the same tokens again (plus any issued in between), so it uses
+     * the normal retry tier.
+     */
+    public RevokeSandboxTokensResult revokeSandboxTokens(String sandboxId) {
+        return doJson("POST", sandboxPath(sandboxId) + "/tokens/revoke", null, RevokeSandboxTokensResult.class);
     }
 
     /**
@@ -1037,11 +1727,14 @@ public class MicroVMClient {
         public List<CustomDomain> customDomains;
     }
 
+    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
     static class ExposePortRequest {
         public final String protocol;
+        public final String visibility;
 
-        ExposePortRequest(String protocol) {
+        ExposePortRequest(String protocol, String visibility) {
             this.protocol = protocol;
+            this.visibility = visibility;
         }
     }
 
@@ -1098,8 +1791,18 @@ public class MicroVMClient {
 
     public ExecStreamHandle execStream(String sandboxId, ExecStreamOptions options) {
         ExecStreamOptions effective = options == null ? new ExecStreamOptions() : options;
-        if (trimToNull(effective.command) == null) {
+        boolean hasCommand = trimToNull(effective.command) != null;
+        boolean hasArgv = effective.argv != null && !effective.argv.isEmpty();
+        if (hasCommand && hasArgv) {
+            throw new MicroVMException("set command or argv, not both");
+        }
+        if (!hasCommand && !hasArgv) {
             throw new MicroVMException("command is required");
+        }
+        if (hasArgv) {
+            // Before the socket opens, so an older agent never gets a start
+            // message it cannot run.
+            requireToolboxFeatures(sandboxId, "exec.argv");
         }
 
         CompletableFuture<ExecExitInfo> completion = new CompletableFuture<>();
@@ -1158,6 +1861,64 @@ public class MicroVMClient {
         socketRef.set(socket);
         socket.sendText(JsonSupport.write(effective));
         return new ExecStreamHandle(socket, completion);
+    }
+
+    /**
+     * Watches a folder in the sandbox for changes and calls {@code onEvent}
+     * for each one, in order, on the socket's reader thread. Returns once the
+     * watch is in place, so a file changed after this returns is seen.
+     *
+     * <p>Watching works on gVisor and Firecracker sandboxes only; others
+     * answer 501 ({@link MicroVMApiException}). A sandbox whose agent predates
+     * file watching throws {@link MicroVMUnsupportedFeatureException}. The
+     * handshake is a stream, so it is sent once and never retried.
+     */
+    public FileWatchHandle watchFiles(String sandboxId, String path, WatchOptions options, Consumer<FileEvent> onEvent) {
+        if (trimToNull(sandboxId) == null) {
+            throw new MicroVMException("sandbox id is required");
+        }
+        if (trimToNull(path) == null) {
+            throw new MicroVMException("path is required");
+        }
+        if (onEvent == null) {
+            throw new MicroVMException("onEvent is required");
+        }
+        String query = "?path=" + encodeQueryValue(path);
+        if (options != null && options.recursive) {
+            query += "&recursive=true";
+        }
+        FileWatchHandle handle = new FileWatchHandle(onEvent);
+        StreamingWebSocket socket;
+        try {
+            socket = webSocketConnector.connect(
+                webSocketUri(sandboxPath(sandboxId) + "/toolbox/files/watch" + query),
+                webSocketHeaders(),
+                handle.listener()
+            );
+        } catch (WebSocketHandshakeFailure failure) {
+            throw watchHandshakeError(sandboxId, failure);
+        }
+        handle.attach(socket);
+        handle.awaitStart(WATCH_START_TIMEOUT);
+        return handle;
+    }
+
+    /**
+     * A 404 that says the route itself is missing (toolboxd marks it with
+     * {@code X-Toolbox-Route: none}; one built before that mark says just
+     * "not found") means the agent predates file watching. sandboxd's own 404
+     * says "sandbox not found", and a missing folder "path not found: ...",
+     * so neither is mistaken for it.
+     */
+    private RuntimeException watchHandshakeError(String sandboxId, WebSocketHandshakeFailure failure) {
+        int status = failure.getStatusCode();
+        byte[] body = failure.getBody().getBytes(StandardCharsets.UTF_8);
+        ErrorResponse error = JsonSupport.tryRead(body, ErrorResponse.class);
+        String route = failure.header("X-Toolbox-Route");
+        if (status == 404 && (route != null && "none".equals(route.trim()) || error != null && "not found".equals(error.error))) {
+            return new MicroVMUnsupportedFeatureException(sandboxId, List.of("files.watch"), "");
+        }
+        return apiException(status, failure.header("Retry-After"), body);
     }
 
     public Session createSession(String sandboxId, CreateSessionOptions options) {
@@ -1317,6 +2078,7 @@ public class MicroVMClient {
         copy.platformVolumes = source.platformVolumes;
         copy.lifecycle = source.lifecycle;
         copy.failover = source.failover;
+        copy.placement = source.placement;
         copy.runtime = source.runtime;
         copy.durability = source.durability;
         copy.moduleRef = source.moduleRef;
@@ -1325,6 +2087,7 @@ public class MicroVMClient {
         copy.customDomains = source.customDomains;
         copy.templateId = source.templateId;
         copy.idempotencyKey = source.idempotencyKey;
+        copy.destroyOnClose = source.destroyOnClose;
         return copy;
     }
 
@@ -1344,6 +2107,36 @@ public class MicroVMClient {
         copy.memoryMb = source.memoryMb;
         copy.diskGb = source.diskGb;
         return copy;
+    }
+
+    /**
+     * Fails closed unless the sandbox's agent lists every feature on
+     * /version. toolboxd ignores request options it does not know, so sending
+     * a newer option to an older agent would silently skip it.
+     */
+    void requireToolboxFeatures(String sandboxId, String... features) {
+        if (features.length == 0) {
+            return;
+        }
+        java.util.Set<String> have = toolboxFeatures.get(sandboxId);
+        String agentVersion = "";
+        String runtime = "";
+        if (have == null || !have.containsAll(java.util.Arrays.asList(features))) {
+            ToolboxVersion info = doJson("GET", sandboxPath(sandboxId) + "/toolbox/version", null, ToolboxVersion.class);
+            have = info == null || info.features == null ? java.util.Set.of() : java.util.Set.copyOf(info.features);
+            toolboxFeatures.put(sandboxId, have);
+            agentVersion = info == null || info.version == null ? "" : info.version;
+            runtime = info == null || info.runtime == null ? "" : info.runtime;
+        }
+        List<String> missing = new ArrayList<>();
+        for (String feature : features) {
+            if (!have.contains(feature)) {
+                missing.add(feature);
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new MicroVMUnsupportedFeatureException(sandboxId, missing, agentVersion, runtime);
+        }
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {
@@ -1394,34 +2187,90 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode) {
+        return sendRequest(method, path, bodyPublisher, contentType, extraHeaders, retryMode, null);
+    }
+
+    /**
+     * {@code doneCode} is for a call whose retry can find its own work done
+     * (a delete finds the path gone, a mkdir its folder): when a re-sent
+     * attempt, never the first, gets an error carrying that toolbox error
+     * code, the first attempt's reply was lost and this returns {@code null}
+     * for success. Without a {@code doneCode} it never returns {@code null}.
+     */
+    private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode, String doneCode) {
+        return send(method, path, bodyPublisher, contentType, extraHeaders, retryMode, doneCode, HttpResponse.BodyHandlers.ofByteArray());
+    }
+
+    /**
+     * The retry loop itself, for any body handler: a download streams its
+     * body ({@code ofInputStream}) and is retried only until the response
+     * arrives. {@code doneCode} needs a byte[] body.
+     */
+    private <T> HttpResponse<T> send(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode, String doneCode, HttpResponse.BodyHandler<T> handler) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
         int maxRetryAfter = retryConfig.maxRetryAfterMs != null ? retryConfig.maxRetryAfterMs : RetryAfter.DEFAULT_MAX_RETRY_AFTER_MS;
 
         Exception lastException = null;
+        // doneCode counts only after an attempt whose reply was lost (a
+        // dropped connection, 502 or 504): that attempt may have done the
+        // work. A 421, 429 or 503 is answered before any work, so after one
+        // a delete of a path that was never there still reports it.
+        boolean mayHaveRun = false;
+        String sandbox = sandboxSegment(path);
+        String base = baseFor(sandbox);
+        // One cell hop per call: a second 421 naming a cell surfaces, so two
+        // cells that disagree cannot bounce the request between them.
+        boolean hopped = false;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
             String retryAfter = null;
-            HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
-            if (contentType != null) {
-                builder.header("Content-Type", contentType);
-            }
-            if (extraHeaders != null) {
-                for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
-                    builder.header(entry.getKey(), entry.getValue());
-                }
-            }
-            builder.header("Authorization", authorizationHeaderValue());
-            if (team != null) {
-                builder.header(TEAM_HEADER, team);
-            }
-
             try {
-                HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                HttpResponse<T> response = httpClient.send(newRequest(base + path, method, bodyPublisher, contentType, extraHeaders), handler);
+                String cell = cellEndpoint(response);
+                if (cell != null && !hopped) {
+                    // The wrong cell answers before any work and never
+                    // forwards (cells do not trust each other), so going to
+                    // the named cell is this request's first real send, in
+                    // every retry mode. It does not use up a retry.
+                    String target = sandbox == null ? null : cellBase(cell);
+                    if (target != null) {
+                        cellRoutes.put(sandbox, target);
+                        // A body of unknown length is a stream read as it is
+                        // sent, so a second send would carry what is left of
+                        // it. The 421 surfaces instead; the caller's own retry
+                        // goes to the remembered cell.
+                        if (bodyPublisher.contentLength() >= 0) {
+                            discard(response);
+                            base = target;
+                            hopped = true;
+                            response = httpClient.send(newRequest(base + path, method, bodyPublisher, contentType, extraHeaders), handler);
+                            cell = cellEndpoint(response);
+                        }
+                    }
+                }
+                if (cell != null) {
+                    // The sandbox is in another cell, so trying this one again
+                    // cannot help.
+                    return response;
+                }
+                if (response.statusCode() == 404 && sandbox != null && !isFileNotFound(response)) {
+                    // The sandbox may have been deleted; the next call asks
+                    // the configured cell again. A missing file inside it says
+                    // nothing about where the sandbox lives.
+                    cellRoutes.remove(sandbox, base);
+                }
+                if (doneCode != null && mayHaveRun && response.statusCode() >= 400
+                    && response.body() instanceof byte[] && doneCode.equals(errorCode((byte[]) response.body()))) {
+                    return null;
+                }
+                mayHaveRun |= response.statusCode() == 502 || response.statusCode() == 504;
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                     retryAfter = RetryAfter.hint(response);
+                    // Free the connection before the wait.
+                    discard(response);
                 } else {
                     return response;
                 }
@@ -1436,6 +2285,7 @@ public class MicroVMClient {
                 if (attempt >= maxRetries) {
                     break;
                 }
+                mayHaveRun |= !RetryMode.UNSENT_ONLY.retriesTransportFailure(ex);
             }
 
             // A 429 or 503 waits as long as its Retry-After asks, within
@@ -1456,26 +2306,117 @@ public class MicroVMClient {
         throw new MicroVMException("request failed after " + maxRetries + " retries");
     }
 
-    private void ensureSuccess(HttpResponse<byte[]> response) {
-        if (response.statusCode() >= 400) {
-            int status = response.statusCode();
-            java.time.Duration retryAfter = RetryAfter.parse(
-                response.headers().firstValue("Retry-After").orElse(null), java.time.Instant.now());
-            ErrorResponse error = JsonSupport.tryRead(response.body(), ErrorResponse.class);
-            if (error != null && error.error != null && !error.error.isEmpty()) {
-                String code = error.code == null || error.code.isEmpty() ? null : error.code;
-                throw new MicroVMApiException(status, code, error.error, retryAfter);
+    private HttpRequest newRequest(String url, String method, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url)).method(method, bodyPublisher);
+        if (contentType != null) {
+            builder.header("Content-Type", contentType);
+        }
+        if (extraHeaders != null) {
+            for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
+                builder.header(entry.getKey(), entry.getValue());
             }
-            throw new MicroVMApiException(status, null, "request failed with status " + status, retryAfter);
+        }
+        builder.header("Authorization", authorizationHeaderValue());
+        if (team != null) {
+            builder.header(TEAM_HEADER, team);
+        }
+        return builder.build();
+    }
+
+    // Frees the connection of a response that is not handed back.
+    private static void discard(HttpResponse<?> response) throws IOException {
+        if (response.body() instanceof java.io.InputStream) {
+            ((java.io.InputStream) response.body()).close();
         }
     }
 
-    private URI resolve(String path) {
-        return URI.create(apiUrl + path);
+    /** The cell a 421 names, or null when it is not a cell redirect. */
+    private static String cellEndpoint(HttpResponse<?> response) {
+        if (response.statusCode() != 421) {
+            return null;
+        }
+        return trimToNull(response.headers().firstValue(CELL_ENDPOINT_HEADER).orElse(null));
+    }
+
+    /**
+     * The base URL in a cell redirect, or null when this client must not send
+     * its token there: not an absolute http(s) URL with a host, or plain http
+     * when the client was set up with https, which would let one bad answer
+     * put the token on the wire in clear text.
+     */
+    private String cellBase(String endpoint) {
+        URI uri;
+        try {
+            uri = new URI(endpoint);
+        } catch (java.net.URISyntaxException ex) {
+            return null;
+        }
+        String scheme = uri.getScheme();
+        boolean https = "https".equalsIgnoreCase(scheme);
+        if (!https && !"http".equalsIgnoreCase(scheme) || uri.getHost() == null
+            || uri.getRawQuery() != null || uri.getRawFragment() != null) {
+            return null;
+        }
+        if (!https && apiUrl.regionMatches(true, 0, "https:", 0, 6)) {
+            return null;
+        }
+        return normalizeUrl(endpoint);
+    }
+
+    /** The sandbox a per-sandbox path ({@code /v1/sandboxes/{id}...}) is about, as sent; null for any other path. */
+    private String sandboxSegment(String path) {
+        String prefix = versioned("/sandboxes/");
+        if (!path.startsWith(prefix)) {
+            return null;
+        }
+        int end = prefix.length();
+        while (end < path.length() && path.charAt(end) != '/' && path.charAt(end) != '?') {
+            end++;
+        }
+        return end == prefix.length() ? null : path.substring(prefix.length(), end);
+    }
+
+    /** Where a call about {@code sandbox} goes: the cell a 421 named for it, else the configured URL. */
+    private String baseFor(String sandbox) {
+        String cell = sandbox == null ? null : cellRoutes.get(sandbox);
+        return cell != null ? cell : apiUrl;
+    }
+
+    private static boolean isFileNotFound(HttpResponse<?> response) {
+        return response.body() instanceof byte[] && "file_not_found".equals(errorCode((byte[]) response.body()));
+    }
+
+    private static String errorCode(byte[] body) {
+        ErrorResponse error = JsonSupport.tryRead(body, ErrorResponse.class);
+        return error == null ? null : error.code;
+    }
+
+    private void ensureSuccess(HttpResponse<byte[]> response) {
+        if (response.statusCode() >= 400) {
+            throw apiException(response.statusCode(), response.headers().firstValue("Retry-After").orElse(null), response.body());
+        }
+    }
+
+    // Throws the API error for a failed response; the streaming download
+    // paths call it where a value-returning helper would not read well.
+    private static void throwApiError(int status, String retryAfterHeader, byte[] body) {
+        throw apiException(status, retryAfterHeader, body);
+    }
+
+    private static MicroVMApiException apiException(int status, String retryAfterHeader, byte[] body) {
+        java.time.Duration retryAfter = RetryAfter.parse(retryAfterHeader, java.time.Instant.now());
+        ErrorResponse error = body == null ? null : JsonSupport.tryRead(body, ErrorResponse.class);
+        if (error != null && error.error != null && !error.error.isEmpty()) {
+            String code = error.code == null || error.code.isEmpty() ? null : error.code;
+            return MicroVMApiException.forStatus(status, code, error.error, retryAfter);
+        }
+        return MicroVMApiException.forStatus(status, null, "request failed with status " + status, retryAfter);
     }
 
     private URI webSocketUri(String path) {
-        URI uri = resolve(path);
+        // A stream to a sandbox goes to the cell an earlier call learned it
+        // is in. The handshake itself does not follow a 421.
+        URI uri = URI.create(baseFor(sandboxSegment(path)) + path);
         String scheme = uri.getScheme();
         String websocketScheme;
         if ("http".equalsIgnoreCase(scheme)) {
@@ -1488,11 +2429,10 @@ public class MicroVMClient {
             throw new MicroVMException("unsupported base URL scheme \"" + scheme + "\"");
         }
 
-        try {
-            return new URI(websocketScheme, uri.getUserInfo(), uri.getHost(), uri.getPort(), uri.getPath(), uri.getQuery(), uri.getFragment());
-        } catch (URISyntaxException ex) {
-            throw new MicroVMException("invalid websocket URL", ex);
-        }
+        // Swap the scheme on the raw text: rebuilding from the decoded parts
+        // would turn an escaped '&' or '=' in a query value (a watched path)
+        // into a real separator.
+        return URI.create(websocketScheme + uri.toString().substring(scheme.length()));
     }
 
     private String authorizationHeaderValue() {
@@ -1617,6 +2557,21 @@ public class MicroVMClient {
          * not start either, so they surface. Of transport failures, only
          * connect-phase ones are retried.
          */
+        /**
+         * For a body plan section 10 says is sent once and never re-sent (a
+         * folder upload): no status and no transport failure is retried.
+         */
+        NEVER {
+            @Override
+            boolean retriesStatus(int status) {
+                return false;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                return false;
+            }
+        },
         UNSENT_ONLY {
             @Override
             boolean retriesStatus(int status) {
@@ -1641,6 +2596,93 @@ public class MicroVMClient {
         abstract boolean retriesStatus(int status);
 
         abstract boolean retriesTransportFailure(IOException error);
+    }
+
+    /**
+     * The cell each sandbox lives in, learned from 421 answers
+     * (plans/kubernetes-v2-architecture.md §12.4, C16), so later calls about
+     * it skip the wrong cell. A sandbox never changes cell (its ID names it),
+     * so nothing expires: an entry goes on a 404 from that cell, or oldest
+     * first past {@code max}, which bounds a long-lived client's memory.
+     */
+    static final class CellRoutes {
+        static final int MAX_ENTRIES = 10_000;
+
+        private final int max;
+        private final java.util.LinkedHashMap<String, String> routes = new java.util.LinkedHashMap<>();
+
+        CellRoutes(int max) {
+            this.max = max;
+        }
+
+        synchronized String get(String sandbox) {
+            return routes.get(sandbox);
+        }
+
+        synchronized void put(String sandbox, String base) {
+            routes.put(sandbox, base);
+            if (routes.size() > max) {
+                java.util.Iterator<String> oldest = routes.keySet().iterator();
+                oldest.next();
+                oldest.remove();
+            }
+        }
+
+        // Only if it still points at base: a 404 from the configured cell
+        // must not drop a route another thread just learned.
+        synchronized void remove(String sandbox, String base) {
+            routes.remove(sandbox, base);
+        }
+
+        synchronized int size() {
+            return routes.size();
+        }
+    }
+
+    private static final class ToolboxVersion {
+        public String version;
+        public List<String> features;
+        public String runtime;
+    }
+
+    /**
+     * toolboxd's file info with extended=true. An older agent ignores
+     * extended and sends only Daytona's fields (a 32-bit size, no path), so
+     * each extended field falls back.
+     */
+    private static final class FileInfoWire {
+        public String name;
+        @com.fasterxml.jackson.annotation.JsonProperty("isDir")
+        public boolean isDir;
+        public long size;
+        public Long sizeBytes;
+        public String path;
+        public String mode;
+        public String permissions;
+        public String owner;
+        public String group;
+        @com.fasterxml.jackson.annotation.JsonProperty("modTime")
+        public String modTime;
+        public String symlinkTarget;
+
+        FileInfo toFileInfo(String fallbackPath) {
+            FileInfo info = new FileInfo();
+            info.name = name == null ? "" : name;
+            info.path = path == null || path.isEmpty() ? fallbackPath : path;
+            info.isDir = isDir;
+            info.size = sizeBytes != null ? sizeBytes : size;
+            info.mode = mode == null ? "" : mode;
+            info.permissions = permissions == null ? "" : permissions;
+            info.owner = owner == null ? "" : owner;
+            info.group = group == null ? "" : group;
+            info.modTime = modTime == null ? "" : modTime;
+            info.symlinkTarget = symlinkTarget;
+            return info;
+        }
+    }
+
+    private static final class SearchFilesResponse {
+        public List<String> files;
     }
 
     private static final class MountListResponse {

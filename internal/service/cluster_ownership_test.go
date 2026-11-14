@@ -22,6 +22,13 @@ type fakeOwnershipCluster struct {
 	assertErr  error
 }
 
+// clusterOwnershipNeedsReplay is placementNeedsReplay over c's placement view,
+// the way assertClusterOwnership calls it.
+func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandbox) bool {
+	p, ok := c.PlacementOf(sb.ID)
+	return placementNeedsReplay(c.SelfNodeID(), p, ok, sb)
+}
+
 func (c *fakeOwnershipCluster) PlacementOf(sandboxID string) (cluster.Placement, bool) {
 	p, ok := c.placements[sandboxID]
 	return p, ok
@@ -244,7 +251,10 @@ func TestLocalSandboxStateForClusterKeepsHAFanoutOnOwnershipReplay(t *testing.T)
 }
 
 func TestAssertClusterOwnershipSkipsUnsafeRowWithoutStarvingSafeRows(t *testing.T) {
-	svc := &Service{cfg: config.Config{EnableCluster: true}}
+	// A fresh row with no placement is placed only when the post-delete
+	// grace proves it was never deleted (settleUnplacedRow); 1h is the
+	// SB_AUDIT_DELETED_GRACE default.
+	svc := &Service{cfg: config.Config{EnableCluster: true, AuditDeletedGrace: time.Hour}}
 	c := &fakeOwnershipCluster{
 		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),
 		placements: map[string]cluster.Placement{},
@@ -256,12 +266,14 @@ func TestAssertClusterOwnershipSkipsUnsafeRowWithoutStarvingSafeRows(t *testing.
 		Status:             models.SandboxStatusStarted,
 		Env:                map[string]string{"TOKEN": "must-not-enter-raft"},
 		AuditIncarnationID: "inc-unsafe",
+		CreatedAt:          time.Now().UTC(),
 	}
 	safe := &models.Sandbox{
 		ID:                 "sb-safe",
 		Image:              "alpine:3.20",
 		Status:             models.SandboxStatusStarted,
 		AuditIncarnationID: "inc-safe",
+		CreatedAt:          time.Now().UTC(),
 	}
 	count, err := svc.assertClusterOwnership(context.Background(), []*models.Sandbox{unsafe, safe}, nil)
 	if err == nil {
@@ -276,6 +288,10 @@ func TestClusterOwnershipReplayAndReconcileErrors(t *testing.T) {
 	ctx := context.Background()
 	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableCluster = true
+	// A fresh row with no placement is placed only when the post-delete
+	// grace proves it was never deleted (settleUnplacedRow); 1h is the
+	// SB_AUDIT_DELETED_GRACE default.
+	svc.cfg.AuditDeletedGrace = time.Hour
 	svc.cipher = newTestCipher(t)
 
 	now := time.Now().UTC()
@@ -353,6 +369,10 @@ func TestClusterOwnershipAssertBranches(t *testing.T) {
 	ctx := context.Background()
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cfg.EnableCluster = true
+	// A fresh row with no placement is placed only when the post-delete
+	// grace proves it was never deleted (settleUnplacedRow); 1h is the
+	// SB_AUDIT_DELETED_GRACE default.
+	svc.cfg.AuditDeletedGrace = time.Hour
 
 	rec := &fakeOwnershipCluster{
 		Noop:       cluster.NewNoop("self", "http://self", "self.example.com"),

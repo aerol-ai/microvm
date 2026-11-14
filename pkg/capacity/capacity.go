@@ -45,6 +45,13 @@ type Limits struct {
 	// because Docker's --storage-opt size is GB-granular and operators
 	// reason about disk in GB. 0 = unlimited.
 	DiskReservationRatio float64
+	// DiskFloorRatio refuses new sandboxes while the sandbox volume (the
+	// admitter's DiskProbe) has less than this share of its space free
+	// (e.g. 0.10 = refuse under 10% free). Unlike the reservation budget it
+	// reads the disk itself, because one sandbox can write far past its
+	// DiskGB where the runtime does not enforce it. 0 = no floor; without
+	// a DiskProbe there is nothing to read and the floor is off too.
+	DiskFloorRatio float64
 	// MemoryFloorRatio is the minimum live MemAvailable the host must retain
 	// after admitting the request, expressed as a fraction of total host
 	// memory (e.g. 0.05 = keep at least 5% of RAM free). Expressing this as a
@@ -109,6 +116,12 @@ type Request struct {
 	// NeedsMediatedEgress marks a WASM or isolate create that sets an egress
 	// field. Placement sends it only to peers advertising MediatedEgress.
 	NeedsMediatedEgress bool
+	// Labels are the node labels the request requires, zone included under
+	// "zone" (plans/placement-rules.md). Placement keeps only peers whose
+	// heartbeat Labels carry every one with the same value. nil = no rule.
+	// It crosses the agent's select-placement RPC as part of this struct, so
+	// it keeps a JSON name a control plane can read.
+	Labels map[string]string `json:"Labels,omitempty"`
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -157,6 +170,12 @@ type Snapshot struct {
 	// MemoryFloorMB is the absolute floor derived from MemoryFloorRatio and
 	// host memory, exposed for operators reading /capacity.
 	MemoryFloorMB int `json:"memory_floor_mb"`
+	// DiskFloorRatio and the sandbox volume's live size and free space, read
+	// through the DiskProbe. Omitted on a host without one, so a peer reads
+	// "unknown", never "empty disk".
+	DiskFloorRatio     float64 `json:"disk_floor_ratio,omitempty"`
+	SandboxDiskTotalMB int     `json:"sandbox_disk_total_mb,omitempty"`
+	SandboxDiskFreeMB  int     `json:"sandbox_disk_free_mb,omitempty"`
 	// Phase 5 effective-memory axis. ActualRSSMB is the live aggregate
 	// from the per-VMM sampler; EffectiveMemoryFreeMB is the headroom
 	// admission actually decides against (HostMem - ActualRSSMB);
@@ -191,6 +210,13 @@ type Snapshot struct {
 	// creates, because landing one there means a 501 or a 503 instead of a
 	// filtered sandbox (plans/egress-domain-filtering.md CEO D20).
 	EgressGatewayReady bool `json:"egress_gateway_ready,omitempty"`
+	// OwnershipLeaseFile is true when this node writes its ownership lease
+	// for the runtime supervisor (SB_OWNERSHIP_LEASE_FILE), so its
+	// recreate-policy sandboxes freeze at the lease limit even with
+	// sandboxd down. Only such a node may be failed over early on the
+	// operator's "machine is gone" (C19); an older build omits it and
+	// waits the full grace.
+	OwnershipLeaseFile bool `json:"ownership_lease_file,omitempty"`
 	// MediatedEgress is true on builds whose WASM and isolate mediators
 	// enforce egress policies (block-all, lists, profiles, learn mode). An
 	// older build stored a WASM create's lists and ignored them, so, as for
@@ -240,6 +266,31 @@ type Snapshot struct {
 	LocalWasmModuleInventoryKnown bool `json:"local_wasm_module_inventory_known,omitempty"`
 	// LocalWasmModuleIDs lists module_ref values cached on this host.
 	LocalWasmModuleIDs []string `json:"local_wasm_module_ids,omitempty"`
+	// WarmPools is this host's warm-pool status for each API warm-pool
+	// entry (plans/agent-sandbox-feature-parity.md W1). It rides the
+	// capacity heartbeat so any server can answer GET /v1/warm-pools per
+	// server without a fan-out. Only entries are listed, never miss-driven
+	// targets, and models.MaxWarmPools bounds them, so it stays small.
+	// Omitted by a host with no warm pool and by a peer that predates it.
+	WarmPools []WarmPoolStatus `json:"warm_pools,omitempty"`
+	// Labels are this node's operator-declared labels (SB_NODE_LABELS, plus
+	// SB_NODE_ZONE under "zone"). They ride this authenticated heartbeat, not
+	// gossip meta: memberlist meta is capped at 512 bytes and overflowing it
+	// once stripped Raft addresses (plans/placement-rules.md P1.2). A peer
+	// that predates the field reports none, so it never satisfies a placement
+	// rule: a rule fails closed rather than landing on an unlabelled node.
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// WarmPoolStatus is one warm-pool entry's state on one host: slots parked
+// and ready for a create, and how many the host is aiming for.
+type WarmPoolStatus struct {
+	Image  string `json:"image"`
+	Ready  int    `json:"ready"`
+	Target int    `json:"target"`
+	// Outdated counts ready slots holding an older image than the tag
+	// names now (W3); omitted when none.
+	Outdated int `json:"outdated,omitempty"`
 }
 
 // MemProbe reports live free memory in MB. The default implementation reads
@@ -285,6 +336,9 @@ type HostInfo struct {
 	// Empty defaults to []{"docker"} at Admitter construction so a node
 	// that doesn't set the field still admits the common case.
 	SupportedRuntimes []string
+	// Labels are the node's placement labels (SB_NODE_LABELS + SB_NODE_ZONE),
+	// validated at boot. Static like GPUCount: the admitter only reports them.
+	Labels map[string]string
 }
 
 // Admitter is the thread-safe admission controller. Construct with New and
@@ -294,6 +348,10 @@ type Admitter struct {
 	limits Limits
 	probe  MemProbe
 	rss    RSSSource // Phase 5; nil disables the RSS-watermark axis
+
+	// disk reads the sandbox volume for DiskFloorRatio and the snapshot;
+	// nil until SetDiskProbe. Guarded by mu.
+	disk DiskProbe
 
 	mu           sync.Mutex
 	reservations map[string]Request
@@ -447,6 +505,20 @@ func NewWithRSSSource(host HostInfo, limits Limits, probe MemProbe, rss RSSSourc
 		rss:          rss,
 		reservations: make(map[string]Request),
 	}
+}
+
+// cloneLabels gives each snapshot its own map: snapshots cross goroutines and
+// are stored in the lease cache, and a shared map would let a reader's
+// mutation reach the admitter.
+func cloneLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		out[k] = v
+	}
+	return out
 }
 
 // DetectHost returns CPU core count from runtime and memory total from
@@ -645,6 +717,15 @@ func (a *Admitter) admitOnce(sandboxID string, req Request, onlyNew bool) (int, 
 			))
 		}
 	}
+	// Only a new reservation (a create, a warm slot, a stopped sandbox
+	// starting) meets the disk floor. Re-admitting an ID that holds one is a
+	// resize or an idempotent retry of a sandbox already on the disk;
+	// refusing it would not stop one byte being written.
+	if !exists {
+		if reason := a.diskFloorReason(a.disk); reason != "" {
+			reasons = append(reasons, reason)
+		}
+	}
 
 	// Phase 5: effective-memory watermark. Gated on a non-nil sampler
 	// AND Ready() — a cold-start sampler returns 0, which under a
@@ -756,6 +837,7 @@ func (a *Admitter) Snapshot() Snapshot {
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
 	parkedCPU, parkedMem, parkedDisk, parkedSlots := a.parkedCPU, a.parkedMemMB, a.parkedDiskGB, a.parkedSlots
+	disk := a.disk
 	a.mu.Unlock()
 
 	free := 0
@@ -765,7 +847,15 @@ func (a *Admitter) Snapshot() Snapshot {
 		}
 	}
 	diskFree := a.host.DiskFreeGB
-	if _, v, err := detectDiskGB(defaultDiskPath()); err == nil {
+	var sandboxDiskTotalMB, sandboxDiskFreeMB int
+	if disk != nil {
+		// The probe names the sandbox volume, which is what HostDiskFreeGB
+		// means; one read serves both.
+		if total, avail, err := disk.DiskUsage(); err == nil {
+			sandboxDiskTotalMB, sandboxDiskFreeMB = bytesToMB(total), bytesToMB(avail)
+			diskFree = bytesToGB(avail)
+		}
+	} else if _, v, err := detectDiskGB(defaultDiskPath()); err == nil {
 		diskFree = v
 	}
 
@@ -809,12 +899,15 @@ func (a *Admitter) Snapshot() Snapshot {
 		CPUOverProvisionFactor:    a.cpuOverProvisionFactor(),
 		MemoryOverProvisionFactor: a.memOverProvisionFactor(),
 		MemoryFloorMB:             a.memoryFloorMB(),
+		SandboxDiskTotalMB:        sandboxDiskTotalMB,
+		SandboxDiskFreeMB:         sandboxDiskFreeMB,
 		CPUBudget:                 a.cpuBudget(),
 		MemoryBudgetMB:            a.memBudgetMB(),
 		DiskBudgetGB:              a.diskBudgetGB(),
 		GPUCount:                  a.host.GPUCount,
 		GPUVendor:                 a.host.GPUVendor,
 		SupportedRuntimes:         a.host.SupportedRuntimes,
+		Labels:                    cloneLabels(a.host.Labels),
 		ActualRSSMB:               actualRSS,
 		EffectiveMemoryFreeMB:     effectiveFree,
 		RSSWatermarkMB:            a.rssWatermarkMB(),
@@ -825,6 +918,10 @@ func (a *Admitter) Snapshot() Snapshot {
 	// report CanAdmit=true even when the host is full. Parked slots do not
 	// count: Admit reclaims them for a real sandbox, so a host full of warm
 	// slots is still accepting, and placement must not skip it on this flag.
+	if disk != nil {
+		// Without a probe the floor is off whatever the ratio says.
+		snap.DiskFloorRatio = a.limits.DiskFloorRatio
+	}
 	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1}, true)
 	recordHostPressure(snap)
 	return snap
@@ -847,6 +944,7 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
 	slotLimit, slotHeld := a.slotLimit, a.slotUsed
+	disk := a.disk
 	if excludeParked {
 		totalCPU -= a.parkedCPU
 		totalMem -= a.parkedMemMB
@@ -894,6 +992,9 @@ func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 		if free, err := a.probe.FreeMB(); err == nil && free-req.MemoryMB < floor {
 			reasons = append(reasons, fmt.Sprintf("live memory floor breached (%d MB free, %d MB floor)", free, floor))
 		}
+	}
+	if reason := a.diskFloorReason(disk); reason != "" {
+		reasons = append(reasons, reason)
 	}
 	if watermark := a.rssWatermarkMB(); watermark > 0 && a.rss != nil && a.rss.Ready() {
 		effective := a.host.MemoryTotalMB - a.rss.TotalRSSMB()

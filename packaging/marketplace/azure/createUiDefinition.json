@@ -1,0 +1,80 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "isWizard": false,
+      "basics": {
+        "location": { "visible": "[basics('createNewCluster')]" },
+        "resourceGroup": { "allowExisting": true }
+      }
+    },
+    "basics": [
+      {
+        "name": "createNewCluster",
+        "type": "Microsoft.Common.OptionsGroup",
+        "label": "Create a new AKS cluster",
+        "defaultValue": "No",
+        "toolTip": "Install AerolVM on a cluster you have; a new cluster is not offered.",
+        "constraints": { "allowedValues": [ { "label": "No", "value": false } ], "required": true },
+        "visible": false
+      },
+      {
+        "name": "clusterLookupControl",
+        "type": "Microsoft.Solutions.ArmApiControl",
+        "request": {
+          "method": "GET",
+          "path": "[concat(subscription().id, '/resourcegroups/', resourceGroup().name, '/providers/Microsoft.ContainerService/managedClusters?api-version=2023-05-01')]"
+        }
+      },
+      {
+        "name": "clusterResourceName",
+        "type": "Microsoft.Common.DropDown",
+        "label": "AKS cluster",
+        "toolTip": "The cluster to install AerolVM on. Its worker machines need cgroup v2 and the br_netfilter module.",
+        "constraints": {
+          "allowedValues": "[map(basics('clusterLookupControl').value, (item) => parse(concat('{\"label\":\"', item.name, '\",\"value\":\"', item.name, '\"}')))]",
+          "required": true
+        }
+      }
+    ],
+    "steps": [
+      {
+        "name": "extensionDetails",
+        "label": "AerolVM",
+        "elements": [
+          {
+            "name": "extensionResourceName",
+            "type": "Microsoft.Common.TextBox",
+            "defaultValue": "aerolvm",
+            "label": "Extension name",
+            "constraints": { "required": true, "regex": "^[a-z0-9-]{1,30}$", "validationMessage": "Lowercase letters, digits and dashes, up to 30." }
+          },
+          {
+            "name": "apiTokenSecret",
+            "type": "Microsoft.Common.TextBox",
+            "defaultValue": "aerolvm-api-token",
+            "label": "API token Secret",
+            "toolTip": "A Secret in the aerolvm namespace with the API token under the key SB_PAT_TOKEN. Create it before installing.",
+            "constraints": { "required": true, "regex": "^[a-z0-9-.]{1,253}$", "validationMessage": "A Kubernetes Secret name." }
+          },
+          {
+            "name": "defaultRuntime",
+            "type": "Microsoft.Common.DropDown",
+            "label": "Default isolation",
+            "defaultValue": "gVisor",
+            "constraints": { "allowedValues": [ { "label": "gVisor", "value": "gvisor" }, { "label": "runc", "value": "docker" } ], "required": true }
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "location": "[location()]",
+      "clusterResourceName": "[basics('clusterResourceName')]",
+      "extensionResourceName": "[steps('extensionDetails').extensionResourceName]",
+      "apiTokenSecret": "[steps('extensionDetails').apiTokenSecret]",
+      "defaultRuntime": "[steps('extensionDetails').defaultRuntime]"
+    }
+  }
+}

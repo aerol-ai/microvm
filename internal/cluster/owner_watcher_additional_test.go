@@ -28,12 +28,12 @@ type failingRecreator struct {
 }
 
 func (r *failingRecreator) RecreateSandbox(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) error {
-	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports)
+	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports, 0)
 	return errors.New("simulated failure")
 }
 
-func (r *failingRecreator) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute) (bool, error) {
-	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports)
+func (r *failingRecreator) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets PlacementSecrets, ports map[int]ExposedPortRoute, ownerSince int64) (bool, error) {
+	_, _ = r.recordingRecreator.RecreateSandboxReport(ctx, id, spec, secrets, ports, ownerSince)
 	return true, errors.New("simulated failure")
 }
 
@@ -52,6 +52,7 @@ func TestOwnerWatcherRecreateFailureAndReassign(t *testing.T) {
 		recreateCandidate("alt-worker", "worker", 100),
 	})
 	c.gossip.memberIndex.replace(index.snapshot())
+	seedCapacityHeartbeats(c, index.snapshot())
 
 	rec := &failingRecreator{recordingRecreator: newRecordingRecreator()}
 	c.AttachRecreator(rec)

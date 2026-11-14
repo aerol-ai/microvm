@@ -169,7 +169,7 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 
 	sandboxID := idOverride
 	if sandboxID == "" {
-		sandboxID, err = generateSandboxID()
+		sandboxID, err = s.NewSandboxID()
 		if err != nil {
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}

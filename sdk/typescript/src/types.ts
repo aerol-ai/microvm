@@ -7,6 +7,24 @@ export type SandboxStatus =
   | "passivated"
   | "awaiting_runtime";
 
+/**
+ * Why a sandbox is in its current status. A stopped sandbox says what
+ * stopped it; a started one may say `"program_exited"` (its main program
+ * ended and `lifecycle.destroyAfterExitFor` is counting), `"failover"`
+ * (recreated on another node) or `"restarted"` (by `restartOnFailure`).
+ */
+export type StatusReason =
+  | "user_stop"
+  | "idle"
+  | "max_age"
+  | "out_of_memory"
+  | "disk_limit"
+  | "crashed"
+  | "reconcile"
+  | "program_exited"
+  | "failover"
+  | "restarted";
+
 export type Durability = "ephemeral" | "passivatable" | "durable";
 
 export interface RegistryAuth {
@@ -106,6 +124,13 @@ export interface PlatformVolumeMount {
   path: string;
   /** Mount read-only. Defaults to read-write. */
   readOnly?: boolean;
+  /**
+   * Delete the volume, its files and its record, once the last sandbox using
+   * it is deleted. Set when the volume is first made; a later sandbox that
+   * names the same volume must pass the same value, or the create fails with
+   * 409. Defaults to false: the volume outlives its sandboxes.
+   */
+  deleteWithSandbox?: boolean;
 }
 
 export interface Lifecycle {
@@ -124,6 +149,27 @@ export interface Lifecycle {
    * without an idle window. TCP and TLS exposures stay always-on.
    */
   serverless?: boolean;
+  /**
+   * Start the sandbox again when it crashes or runs out of memory, waiting
+   * 5 s, then 10 s, 20 s and so on up to 5 minutes between tries. The wait
+   * goes back to 5 s once it has run for 10 minutes. Off by default.
+   * Docker, gVisor and containerd sandboxes only: Firecracker, WebAssembly
+   * and V8-isolate sandboxes refuse it with a 400.
+   */
+  restartOnFailure?: boolean;
+  /**
+   * Delete the sandbox this long (integer nanoseconds) after its main
+   * program ends. The server checks about once a minute. Not for
+   * WebAssembly or V8-isolate sandboxes, which have no main program (400).
+   */
+  destroyAfterExitFor?: number;
+  /**
+   * Delete the sandbox at this clock time: a `Date`, or an RFC 3339 string
+   * such as `"2026-11-06T18:00:00Z"`. The server turns it into
+   * `destroyAtAge`, so the sandbox you get back shows `destroyAtAge`, not
+   * this. A time in the past is refused with a 400, as is setting both.
+   */
+  destroyAt?: Date | string;
 }
 
 export type UpdateLifecycleOptions = Lifecycle;
@@ -136,6 +182,18 @@ export interface Failover {
    * opts into best-effort cluster recreation from the replicated create spec.
    */
   policy: FailoverPolicy;
+}
+
+/**
+ * Where a sandbox may run in a cluster. Every field you set must match the
+ * node's labels exactly. If no node matches, create fails with 409
+ * `placement_unsatisfiable`; it never falls back to another node.
+ */
+export interface PlacementRule {
+  /** Run only on nodes in this zone (the node's `SB_NODE_ZONE`). */
+  zone?: string;
+  /** Run only on nodes that have all of these labels (`SB_NODE_LABELS`). */
+  labels?: Record<string, string>;
 }
 
 export type GPUVendor = "nvidia" | "amd" | "apple";
@@ -184,6 +242,12 @@ export interface CreateOptions {
    * the whole call safe too, such as after your process restarts.
    */
   idempotencyKey?: string;
+  /**
+   * Client-side only, never sent. When true, the returned sandbox deletes
+   * itself when an `await using` block around it ends. Off by default, so
+   * leaving the block keeps the sandbox.
+   */
+  destroyOnExit?: boolean;
   /**
    * Optional name, unique among the caller's sandboxes (another account may
    * use the same name). A repeat create with a name the caller already holds
@@ -282,6 +346,11 @@ export interface CreateOptions {
   lifecycle?: Lifecycle;
   failover?: Failover;
   /**
+   * Limit which nodes may run the sandbox, by zone and node labels. Kept on
+   * failover. No matching node gives a 409 `placement_unsatisfiable` error.
+   */
+  placement?: PlacementRule;
+  /**
    * Container runtime to use for this sandbox. Omit to inherit the host
    * default (`SB_CONTAINER_RUNTIME`). Use `"gvisor"` for runsc-backed
    * isolation when running untrusted workloads — note that gVisor rejects
@@ -326,6 +395,71 @@ export interface CreateOptions {
    * rootfs instead of building one from `image` on every create.
    */
   templateId?: string;
+  /**
+   * A short-lived cloud identity token for the sandbox (AWS, GCP, Azure).
+   * The role tag must be on your team's allow list (`putIdentityRole`).
+   */
+  identity?: IdentityOptions;
+}
+
+/**
+ * A cloud identity for a sandbox. The server signs a one-hour token whose
+ * subject is your team and `roleTag`, writes it to
+ * `/run/aerolvm/identity/token` inside the sandbox and refreshes it.
+ */
+export interface IdentityOptions {
+  roleTag: string;
+  /** The token's `aud`; default `"sts.amazonaws.com"`. */
+  audience?: string;
+  /** Also sets `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` for the AWS SDKs. */
+  awsRoleArn?: string;
+  /** Set both to give the Azure SDKs `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_FEDERATED_TOKEN_FILE`. */
+  azureClientId?: string;
+  azureTenantId?: string;
+}
+
+/** A sandbox's cloud identity as `get` shows it. Never the token. */
+export interface SandboxIdentity {
+  roleTag: string;
+  audience: string;
+  /** The token's `sub`: what your cloud's trust policy matches. */
+  subject: string;
+  awsRoleArn?: string;
+  azureClientId?: string;
+  azureTenantId?: string;
+  tokenFile: string;
+  /** When the token now in the sandbox expires; absent until the first one. */
+  tokenExpiresAt?: string;
+  lastError?: string;
+}
+
+/** One role tag on a team's identity allow list. */
+export interface IdentityRole {
+  tag: string;
+  /** The least caller role that may create a sandbox with this tag: `"runner"` or `"admin"`. */
+  minRole: string;
+  team?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The body of `putIdentityRole`. */
+export interface IdentityRoleOptions {
+  minRole: "runner" | "admin";
+  /** The team whose list to change; omit for sandboxes the operator token creates. */
+  team?: string;
+}
+
+export interface ListIdentityRolesOptions {
+  team?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface IdentityRoleList {
+  roles: IdentityRole[];
+  /** Pass back as `cursor` for the next page; absent on the last one. */
+  nextCursor?: string;
 }
 
 export interface ResizeOptions {
@@ -333,6 +467,32 @@ export interface ResizeOptions {
   cpu?: number;
   memoryMB?: number;
   diskGB?: number;
+}
+
+/**
+ * The last, optional argument of every `MicroVM` and `Sandbox` call that
+ * talks to the server.
+ */
+export interface CallOptions {
+  /**
+   * Cancels this call: aborting it ends the request in flight and any retry
+   * wait, and the call rejects with the signal's reason. Pass
+   * `AbortSignal.timeout(ms)` to give one call a time limit. It works with
+   * the client-wide `signal`; either one aborting ends the call. Calls that
+   * open a stream (`execStream`, `attachSession`, `watchFiles`) take no
+   * `CallOptions`, as the client-wide signal does not cover streams either.
+   */
+  signal?: AbortSignal;
+}
+
+/** Options for {@link MicroVM.destroyAll}. */
+export interface DestroyAllOptions {
+  /**
+   * Delete only sandboxes whose `tags` hold every key/value pair given here.
+   * Required and must not be empty: with no filter the call would delete
+   * every sandbox you own.
+   */
+  tags: Record<string, string>;
 }
 
 export interface ListOptions {
@@ -400,6 +560,8 @@ export interface ExposedPort {
   port: number;
   publicURL: string;
   createdAt: string;
+  /** `"token"` when the URL needs a sandbox token; absent for a public port. */
+  visibility?: ExposeVisibility;
 }
 
 /**
@@ -502,9 +664,23 @@ export interface CustomDomainDNSRecords {
  */
 export type ExposeProtocol = "http" | "tcp" | "tls";
 
+/**
+ * Who can open a port's URL:
+ *   - "public": anyone with the URL.
+ *   - "token":  only a visitor with a sandbox token for this port (see
+ *               `sandbox.createToken({ port })`). HTTP ports on a server
+ *               with a domain only.
+ */
+export type ExposeVisibility = "public" | "token";
+
 export interface ExposePortOptions {
   /** Defaults to "http" when omitted. */
   protocol?: ExposeProtocol;
+  /**
+   * Left out, a new port is public and an exposed port keeps what it has.
+   * Pass it to change it.
+   */
+  visibility?: ExposeVisibility;
 }
 
 export interface SandboxSnapshot {
@@ -537,13 +713,62 @@ export interface SnapshotList {
 }
 
 /**
+ * Options for `sandbox.createToken`: a signed token for this one sandbox that
+ * you can hand to a browser or an end user. Every field but `expiresIn`
+ * narrows it; leave one out and that part is not limited.
+ */
+export interface CreateSandboxTokenOptions {
+  /** Required lifetime: `"15m"`, `"2h"` or `"1d"`. The server caps it (24 hours by default). */
+  expiresIn: string;
+  /**
+   * A port token opens that port's public URL (a port exposed with
+   * `visibility: "token"`). Without a port the token is for the sandbox's
+   * toolbox: commands, files and terminal sessions.
+   */
+  port?: number;
+  /** Only paths under this one, for example `"/files"` (toolbox) or `"/app"` (public URL). */
+  pathPrefix?: string;
+  /** Only these HTTP methods, for example `["GET"]`. */
+  methods?: string[];
+}
+
+/**
+ * A sandbox token from `sandbox.createToken`. The server keeps no copy, so
+ * `token` is shown only here. Every call makes a new token. It stops working
+ * when it expires, when its sandbox is deleted, or when
+ * `sandbox.revokeTokens()` is called.
+ */
+export interface SandboxToken {
+  /** The token (`avmst_…`). Send it as the bearer credential. */
+  token: string;
+  /** Public id (`stk_…`): what audit records name. Safe to log. */
+  tokenID: string;
+  sandboxID: string;
+  port?: number;
+  pathPrefix?: string;
+  methods?: string[];
+  /** RFC 3339 time the token stops working. */
+  expiresAt: string;
+}
+
+/**
+ * The result of `sandbox.revokeTokens()`. Every token issued for the sandbox
+ * before `tokensNotBefore` no longer works; a token made after the call works.
+ */
+export interface RevokeSandboxTokensResult {
+  sandboxID: string;
+  /** RFC 3339 time. Tokens issued before it are refused. */
+  tokensNotBefore: string;
+}
+
+/**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP
  * variant carries `host` and `hostPort`, which are what native protocol
  * clients (psql, redis-cli, mysql, mongosh, …) need to dial.
  */
 export type ExposeResult =
-  | { protocol: "http"; url: string }
+  | { protocol: "http"; url: string; visibility?: "token" }
   | { protocol: "tcp"; url: string; host: string; hostPort: number }
   | { protocol: "tls"; url: string };
 
@@ -590,6 +815,10 @@ export interface Sandbox {
   updatedAt: string;
   lastActiveAt: string;
   lastError?: string;
+  /** Why the sandbox is in its status; absent when a call simply created or started it. */
+  statusReason?: StatusReason;
+  /** Exit code behind `out_of_memory`, `crashed`, `program_exited` and `restarted`. */
+  exitCode?: number;
   containerCommand?: string[];
   lifecycle: Lifecycle;
   failover?: Failover;
@@ -608,6 +837,8 @@ export interface Sandbox {
   tenantId?: string;
   /** GPU configuration this sandbox was created with. Absent means no GPU. */
   gpus?: GPUOptions;
+  /** The sandbox's cloud identity, when it was created with one. */
+  identity?: SandboxIdentity;
 }
 
 /**
@@ -663,6 +894,12 @@ export interface AuditOptions {
   limit?: number;
   cursor?: string;
   incarnationID?: string;
+  /**
+   * Only records by this caller: an id such as `"system:lifecycle"`, or
+   * `"system:*"` for everything the server did on its own (automatic
+   * stops, deletes, restarts and recreates).
+   */
+  caller?: string;
 }
 
 /**
@@ -804,6 +1041,35 @@ export interface EgressProfile {
   updatedAt: string;
 }
 
+/**
+ * A team quota's limits, the body of `putTeamQuota`. Omit a limit (or set
+ * 0) for no limit on it. At least one must be set.
+ */
+export interface TeamQuotaOptions {
+  /** Most sandboxes the team may hold, running or stopped. */
+  maxSandboxes?: number;
+  /** Most CPU the team's sandboxes may ask for in total. */
+  maxCPU?: number;
+  /** Most memory, in MB, the team's sandboxes may ask for in total. */
+  maxMemoryMB?: number;
+}
+
+/** What a team holds now: every sandbox not deleted, at the size it asked for. */
+export interface TeamQuotaUsage {
+  sandboxes: number;
+  cpu: number;
+  memoryMB: number;
+}
+
+/** A team's quota, and its usage when read back. */
+export interface TeamQuota extends TeamQuotaOptions {
+  team: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+  usage?: TeamQuotaUsage;
+}
+
 /** The body of `putEgressProfile`: a full replace. */
 export interface EgressProfileOptions {
   allowOut: string[];
@@ -819,6 +1085,71 @@ export interface EgressProfileList {
   profiles: EgressProfile[];
   /** Pass back as `cursor` for the next page; absent on the last one. */
   nextCursor?: string;
+}
+
+/**
+ * A warm-pool entry: how many ready sandboxes every server with a warm pool
+ * keeps for one image. The server's `SB_DOCKER_POOL_*` / `SB_CONTAINERD_POOL_*`
+ * settings stay the default for every other image. Admin only.
+ */
+export interface WarmPool {
+  /** The image, exactly as creates name it (`python:3.12`, `ghcr.io/acme/agent:1`). */
+  image: string;
+  /** Warm slots each server keeps for this image. 0 turns warming off for it. */
+  depth: number;
+  /** With `maxDepth`, each server sets its own target from recent demand, never below this. */
+  minDepth?: number;
+  /** Set to follow demand: each server's target moves with its recent creates, up to this. */
+  maxDepth?: number;
+  /** What happens to warm sandboxes when the image changes. */
+  onImageChange: WarmPoolOnImageChange;
+  /** Goes up by one on every change; the same `putWarmPool` twice leaves it alone. */
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+  /** How full the pools are. Set by `getWarmPool` and `listWarmPools`. */
+  status?: WarmPoolStatus;
+}
+
+/**
+ * The body of `putWarmPool`: a full replace. Set `depth` for a fixed size, or
+ * `minDepth` and `maxDepth` to follow demand, not both.
+ */
+export interface WarmPoolOptions {
+  /** Warm slots each server keeps for this image (0 to 128). */
+  depth?: number;
+  /** The fewest warm slots a server keeps when demand is low (0 lets it reach zero). */
+  minDepth?: number;
+  /** The most warm slots a server keeps when demand is high (1 to 128). */
+  maxDepth?: number;
+  /** What happens to warm sandboxes when the image changes. Default `"replace_now"`. */
+  onImageChange?: WarmPoolOnImageChange;
+}
+
+/**
+ * What a warm pool does when the image its name points to changes on a
+ * server. `"replace_now"` swaps every waiting sandbox for one on the new
+ * image at once; `"replace_as_used"` keeps handing out the old ones and
+ * replaces each as it is used.
+ */
+export type WarmPoolOnImageChange = "replace_now" | "replace_as_used";
+
+/** Ready and target slots in total, and on each server that runs a warm pool. */
+export interface WarmPoolStatus {
+  ready: number;
+  target: number;
+  /** Ready sandboxes still on an older image (a `"replace_as_used"` change in progress). */
+  outdated: number;
+  servers: WarmPoolServerStatus[];
+}
+
+export interface WarmPoolServerStatus {
+  nodeId: string;
+  ready: number;
+  target: number;
+  outdated: number;
+  /** The server's last report is too old to trust; the numbers are its last ones. */
+  stale?: boolean;
 }
 
 /** Who the caller is, as `microvm.whoami()` reports it. */
@@ -918,10 +1249,25 @@ export interface SetNetworkLimitsOptions {
 }
 
 export interface ExecRequest {
-  command: string;
+  /** A shell command. Set `command` or `argv`, not both. */
+  command?: string;
+  /**
+   * Run a program with these arguments instead of a shell command: spaces,
+   * quotes, `$` and `;` reach it as written. A sandbox whose agent predates
+   * argv throws MicroVMUnsupportedFeatureError before anything runs.
+   */
+  argv?: string[];
   workDir?: string;
   env?: Record<string, string>;
   timeoutSeconds?: number;
+  /**
+   * Keep only the first N bytes of stdout. The rest is dropped and the command
+   * is not slowed down. A sandbox whose agent predates the caps throws
+   * MicroVMUnsupportedFeatureError instead of returning everything.
+   */
+  maxStdoutBytes?: number;
+  /** Keep only the first N bytes of stderr. Same rules as maxStdoutBytes. */
+  maxStderrBytes?: number;
 }
 
 export interface ExecResult {
@@ -929,10 +1275,116 @@ export interface ExecResult {
   stderr: string;
   exitCode: number;
   durationMS: number;
+  /** True when the command ran past its timeout and the sandbox killed its whole process group. Older sandbox agents never set it. */
+  timedOut: boolean;
+  /** True when stdout was longer than its cap (maxStdoutBytes, or the server's own limit) and was cut. */
+  stdoutTruncated: boolean;
+  /** True when stderr was longer than its cap and was cut. */
+  stderrTruncated: boolean;
+  /**
+   * The signal that ended the command, such as "SIGKILL"; undefined when it
+   * exited on its own. exitCode is -1 then; a shell would say 128 + the
+   * signal's number (137 for SIGKILL).
+   */
+  signal?: string;
+}
+
+/**
+ * How an upload writes its file. With none set, missing folders are made and
+ * an existing file is replaced in place.
+ */
+export interface UploadFileOptions {
+  /** Add to the end of the file instead of replacing it. */
+  append?: boolean;
+  /** Write only if the file does not exist yet (HTTP 412 otherwise). Of two uploads racing for one new path, exactly one wins. */
+  createOnly?: boolean;
+  /** Write a temp file and rename it into place, so a reader never sees half a file. Cannot be combined with `append`. */
+  atomic?: boolean;
+  /** Permissions such as `0o600`. Without it a new file is 0644 and an existing one keeps its own. */
+  mode?: number;
+}
+
+export interface DownloadFileOptions {
+  /**
+   * Refuse a file larger than this many bytes with `MicroVMFileTooLargeError`:
+   * before reading when the server states the size, otherwise as soon as more
+   * arrives. A guard against a file larger than expected filling memory.
+   */
+  maxBytes?: number;
+}
+
+/** One file, folder or symlink in a sandbox. */
+export interface FileInfo {
+  name: string;
+  /** The full path in the sandbox. */
+  path: string;
+  isDir: boolean;
+  /** Bytes. */
+  size: number;
+  /** Type and permission string, such as `-rw-r--r--`. */
+  mode: string;
+  /** Octal permission bits, such as `0644`. */
+  permissions: string;
+  owner: string;
+  group: string;
+  /** Last change time, RFC 3339 in UTC. */
+  modTime: string;
+  /**
+   * Where a symlink points. Only on `listFiles` entries: `getFileInfo`
+   * follows a symlink and describes what it names.
+   */
+  symlinkTarget?: string;
+}
+
+/** The result of `listFiles`. `truncated` means the listing reached its limit and more entries exist. */
+export interface FileList {
+  entries: FileInfo[];
+  truncated: boolean;
+}
+
+export interface ListFilesOptions {
+  /** Levels to go down; 1 (the default) is the folder's own entries. Symlinked folders are listed but never entered. */
+  depth?: number;
+  /** The most entries to return. Defaults to 10,000. */
+  limit?: number;
+}
+
+export interface DeleteFileOptions {
+  /** Delete a folder and everything in it. Without it a folder is refused (HTTP 409). */
+  recursive?: boolean;
+}
+
+export interface MakeDirOptions {
+  /** Also make missing parent folders, and accept an existing folder (`mkdir -p`). */
+  parents?: boolean;
+  /** Permissions such as `0o750`. Defaults to 0755. */
+  mode?: number;
+}
+
+export interface MoveFileOptions {
+  /** Replace an existing destination. Without it an existing destination is refused (HTTP 409). */
+  overwrite?: boolean;
+}
+
+export interface CopyFileOptions {
+  /** Replace an existing destination. Without it an existing destination is refused (HTTP 409). */
+  overwrite?: boolean;
+  /** Copy a folder and everything in it, keeping modes and symlinks. Without it a folder is refused (HTTP 409). */
+  recursive?: boolean;
+}
+
+/** One line `findInFiles` found. */
+export interface FileMatch {
+  file: string;
+  line: number;
+  content: string;
 }
 
 export interface ExecStreamOptions {
-  command: string;
+  /** A shell command. Set `command` or `argv`, not both. */
+  command?: string;
+  /** Same as ExecRequest.argv. */
+  argv?: string[];
   workdir?: string;
   env?: Record<string, string>;
   tty?: boolean;
@@ -981,6 +1433,45 @@ export interface SessionAttachHandle {
   close(): void;
   /** Resolves when the session exits, or rejects if the attach stream drops first. */
   done: Promise<ExecExitInfo>;
+}
+
+/**
+ * The kinds of change a file watch reports. `overflow` means some events were
+ * lost (the kernel's queue filled, too many changes in one batch, or a folder
+ * could not be watched): list the folder again to catch up. A rename is
+ * reported as `rename` for the old name and `create` for the new one.
+ */
+export type FileEventType = "create" | "write" | "remove" | "rename" | "chmod" | "overflow";
+
+/** One change reported by {@link FileWatchHandle}'s watch. */
+export interface FileEvent {
+  /**
+   * One of {@link FileEventType}. A newer sandbox agent may add kinds; they
+   * are passed through as they come rather than dropped.
+   */
+  type: FileEventType | (string & {});
+  /** The entry's absolute path in the sandbox. Empty on most overflow events. */
+  path: string;
+  /** True when the entry is a folder. */
+  isDir: boolean;
+  /** Overflow events only: `kernel_queue`, `event_buffer` or `watch_limit`. */
+  reason?: string;
+}
+
+export interface WatchFilesOptions {
+  /** Also watch every subfolder, including ones made after the watch starts. */
+  recursive?: boolean;
+}
+
+export interface FileWatchHandle {
+  /** Stop watching. Safe to call more than once; `wait()` then resolves. */
+  stop(): void;
+  /**
+   * Resolves after `stop()`. Rejects when the sandbox ends the watch (the
+   * watched folder was removed or moved; the error message says which), when
+   * the connection drops, or with the error `onEvent` threw.
+   */
+  wait(): Promise<void>;
 }
 
 export interface HealthStatus {

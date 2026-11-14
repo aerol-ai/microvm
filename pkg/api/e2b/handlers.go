@@ -152,6 +152,14 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// A replay (Replayed) answers with the sandbox an earlier create of the
 	// id made; a failure below must not roll that sandbox back.
+	if err := h.exposeMCPGateway(r.Context(), response.ID, meta); err != nil {
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
+		cleanupReservation()
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
 		if !response.Replayed {
 			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
@@ -425,12 +433,12 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// The timeout lives only on the native lifecycle the patch just wrote; the
+	// E2B compat blob never stores it (compatBlob). So nothing is saved here:
+	// re-saving the blob wrote the same bytes and, since facade state rides
+	// the replicated spec (B11), cost a Raft write per reconnect.
 	if changed {
 		meta.TimeoutSeconds = req.Timeout
-		if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
 	}
 
 	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
@@ -480,14 +488,14 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 	// Reset the timeout timers, reading the current Lifecycle under the sandbox
 	// lock so a concurrent idle-timer change can't be clobbered (D7). OnTimeout
 	// is fixed at create, so reading meta outside the lock is safe.
+	//
+	// The native lifecycle is the only copy of the timeout: the E2B compat blob
+	// does not store it, and reads derive it from the lifecycle. Do not save
+	// the blob here; it would write the same bytes and, because facade state
+	// rides the replicated spec (B11), cost a second Raft write per call.
 	if _, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
 		return lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout), true, nil
 	}); err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	meta.TimeoutSeconds = req.Timeout
-	if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -715,8 +723,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if templateID == "" {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, badRequest("templateID is required")
 	}
-	if req.MCP != nil {
-		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("MCP template startup is not implemented yet")
+	wantsMCP, err := parseMCPOption(req.MCP)
+	if err != nil {
+		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 	// Translate E2B volumeMounts → the neutral platform-volume references the
 	// service resolves against the operator's shared backend. The facade only
@@ -818,6 +827,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		if len(platformVolumes) > 0 {
 			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("volume mounts are not supported for wasm sandboxes")
 		}
+		if wantsMCP {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented(mcpWasmUnsupported)
+		}
 		wasmReq.Env = envVars
 		wasmReq.NetworkBlockAll = networkBlockAll
 		wasmReq.AllowPublicTraffic = allowPublicTraffic
@@ -842,6 +854,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 
 	resolvedImage, templateAlias, err := h.resolveTemplate(ctx, templateID)
 	if err != nil {
+		if wantsMCP {
+			err = mcpTemplateError(templateID, err)
+		}
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	}
 
@@ -874,6 +889,7 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		AllowPublicTraffic:  allowPublicTraffic,
 		MaskRequestHost:     maskRequestHost,
 		VolumeMounts:        volumeMountPayloads,
+		MCP:                 wantsMCP,
 	}
 	return serviceReq, meta, nil
 }

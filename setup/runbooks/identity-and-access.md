@@ -187,12 +187,19 @@ and accept both during the rollout.
    `SB_OPERATOR_VOLUME_SCOPE=<that value>` on every node and restart in
    turn. sandboxd refuses to boot with `SB_PAT_TOKEN_PREVIOUS` set and the
    scope unpinned while platform volumes are on, and prints the value to pin.
-1. On every node set `SB_PAT_TOKEN=<new>` and `SB_PAT_TOKEN_PREVIOUS=<old>`,
-   then restart one node at a time. Old and new both work everywhere.
+1. On every node that holds the PAT (every server, and any node with no
+   `SB_PAT_TOKEN_SHA256` in `/etc/sandboxd/cluster.env`) set
+   `SB_PAT_TOKEN=<new>` and `SB_PAT_TOKEN_PREVIOUS=<old>`. On a worker or
+   ingress node joined without the PAT (it has `SB_PAT_TOKEN_SHA256`), leave
+   `SB_PAT_TOKEN` alone, it is the node's own token, and set
+   `SB_PAT_TOKEN_SHA256=<sha256 of new>,<sha256 of old>` instead
+   (`printf %s "$NEW" | sha256sum`). Restart one node at a time. Old and new
+   both work everywhere.
 2. Move every client (scripts, `config/secrets.yml` `cluster.pat_token`,
    CI secrets) to the new PAT.
-3. Remove `SB_PAT_TOKEN_PREVIOUS` from every node and restart in turn. The old
-   PAT stops working.
+3. Remove `SB_PAT_TOKEN_PREVIOUS`, and the old hash from
+   `SB_PAT_TOKEN_SHA256`, on every node and restart in turn. The old PAT stops
+   working.
 
 ## RotateScrapeToken
 
@@ -297,23 +304,26 @@ installed. On Linux a re-run does three things that are easy to miss:
 
 - **It rewrites `/etc/sandboxd/sandboxd.env` from scratch** (`write_environment`
   starts with `cat >`). Nothing from the old file is kept: the new file holds
-  only the defaults and what this run's flags produce. Every setting you
+  only the defaults and what this run's settings produce. Every setting you
   added by hand is gone, including `SB_IDENTITY_ENABLED`, `SB_IDENTITY_FILE`,
   `SB_ENTERPRISE_MODE`, `SB_NODE_ID`, the audit export and witness settings,
   `SB_OPERATOR_VOLUME_SCOPE` and `SB_PAT_TOKEN_PREVIOUS`. With
   `SB_ENTERPRISE_MODE` gone the node boots outside enterprise mode; with
   `SB_IDENTITY_ENABLED` gone it refuses every API token and SSO sign-in.
-- **Without `--pat-token` it makes a new random PAT** (`openssl rand -hex 24`),
-  and every client and peer still holding the old one is refused.
-- **It restarts a running sandboxd when it changed the settings file or
-  the unit** (`restart_sandboxd_if_reconfigured`), so the restart happens
-  during the run, with whatever the new file holds. It runs before Caddy
-  starts, and waits until sandboxd answers `/health` and, under
+- **It keeps the options it was given before, and the PAT.** Each run saves
+  every non-secret option to `/etc/sandboxd/node.json` and reads the PAT and
+  other secrets back from the env files it wrote, so a re-run needs only the
+  flags that change something. A node installed before `node.json` existed
+  has its options read back from `sandboxd.env` and Caddy's files on that
+  first re-run. Releases before this one made a new random PAT when
+  `--pat-token` was left out; on those, pass it.
+- **It restarts a running sandboxd when it changed the binary, the settings
+  file or the unit** (`restart_sandboxd_if_reconfigured`), so the restart
+  happens during the run, with whatever the new file holds. It runs before
+  Caddy starts, and waits until sandboxd answers `/health` and, under
   `--pat-scope host`, has made `/run/sandboxd-public/api.sock`, so Caddy
-  never proxies to a socket that is not there. A run that changes neither
-  file leaves sandboxd running, even when it installed a new binary; restart
-  it yourself after such an upgrade. A fresh install, or a stopped unit, is
-  started as before.
+  never proxies to a socket that is not there. A fresh install, or a stopped
+  unit, is started as before.
 
 So, on each node:
 
@@ -330,11 +340,10 @@ So, on each node:
    ```
 
    A key in `local.env` wins over the same key in `sandboxd.env`.
-2. Re-run install.sh with every flag the node was installed with, the
-   current PAT (`--pat-token "$(sudo grep '^SB_PAT_TOKEN=' /root/sandboxd.env.before | cut -d= -f2-)"`),
-   and the new flag (`--pat-scope host`, `--l4-proxy-protocol`, …). It
-   restarts sandboxd if the settings changed and prints
-   `sandboxd settings changed; restarting sandboxd before Caddy`.
+2. Re-run install.sh with the new flag (`--pat-scope host`,
+   `--l4-proxy-protocol`, …); the saved options and the PAT are kept. It
+   restarts sandboxd if the binary or settings changed and prints
+   `sandboxd binary or settings changed; restarting sandboxd before Caddy`.
 3. Check `journalctl -u sandboxd` for a clean boot (enterprise mode names
    any rule that is missing). A warning that sandboxd is not answering
    means the restart did not come up within 60 s; the journal says why.

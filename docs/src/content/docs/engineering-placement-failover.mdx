@@ -3,7 +3,7 @@ title: Placement and failover
 description: How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 AerolVM is one program. It runs as the standalone daemon and as a cluster node: the same `sandboxd`, with different config. (A daemon is a program that runs in the background on a server.) There is no separate scheduler process and no etcd.
 
@@ -35,6 +35,21 @@ Three things in `internal/cluster/` are worth understanding before you read the 
 
 `Noop` (`internal/cluster/noop.go`) is used when `cfg.EnableCluster=false`, so the `cluster.Client` interface still works in single-node mode. Function and type names on this page are real, so you can search the code for them.
 
+## The rules the cluster keeps
+
+These are the rules every change to `internal/cluster/` is checked against. The fault tests (offline in `internal/cluster`, live in the `cluster-chaos` scenario) try to break them.
+
+| # | Rule | How it holds today |
+|---|---|---|
+| I1 | **One executor.** A node runs or serves sandbox X only while it may own X. | A worker that cannot reach the leader for half of `SB_DEAD_OWNER_GRACE` pauses its recreate-policy sandboxes before any move can start. Other sandboxes are never moved (they are orphaned), so their node stays their only executor. |
+| I2 | **Ownership epoch.** Every owner change raises a number, and anything carrying an older number is refused. | Every owner change records the Raft log index of that change as the placement's owner epoch, and every forward carries the epoch the edge read. An owner whose own reading is newer turns a cache-routed forward down, and the edge routes it again from a fresh lookup. A forward from a fresh lookup is still checked against the owner's own lookup. |
+| I3 | **No resurrection.** Once a sandbox's lifetime is deleted, it never runs or answers again. | The cluster keeps a delete record. A server that comes back deletes its leftover copy, and Raft refuses to place it. A delete that lands during a failover rebuild still finishes. |
+| I4 | **Capacity.** A worker never runs more than its budget, and the leader never under-counts a worker's load. | Each worker checks its own budget before it starts anything. The leader counts moved and promoted sandboxes until the worker's next capacity report shows them. |
+| I5 | **Same result on every server.** Applying a log entry depends only on the state and the entry. | Apply takes its time from the log entry, never from the server's clock. |
+| I6 | **Convergence.** After failures stop, every sandbox ends up with exactly one copy, on its owner. | Yes, within the reconcile interval (5 minutes by default). |
+| I7 | **Routing safety.** Only the current owner serves X; any other node answers 421 or 503. | Every request checks the owner. A server cut off from the leader refuses placement reads, a cut-off ingress treats recreate-policy routes as moving (503), and a paused sandbox answers 503. |
+| I8 | **A failed create leaves nothing.** A create reported as failed leaves no sandbox and no placement. | A create whose cleanup could not finish is marked, never published, and reconcile keeps deleting it. |
+
 ## Why not a single central scheduler
 
 AerolVM spreads placement decisions across nodes instead of running one central scheduler. Two assumptions about the workload drive that choice:
@@ -48,7 +63,7 @@ Power-of-two-choices on per-node capacity reaches roughly balanced at a fixed co
 
 **Where it sits on CAP.** The CAP theorem says that when a network splits, a distributed system must choose between consistency and availability. The placement FSM is CP: it chooses consistency. Placement writes (`opReserve`, `opPlace`, `opReassign` and the custom-domain commands) need a Raft leader, the one server that writes new log entries.
 
-During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
+During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. A write that was already waiting on a server when it stopped leading gets that answer within about 2 seconds, even if Raft itself never replies (it can drop the reply when it shuts down). The caller then retries on the new leader (`awaitApply` in `client.go`). Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
 
 ## Topology
 
@@ -87,6 +102,8 @@ Gossip (`hashicorp/memberlist`) carries only identity and role. Its payload must
 
 Instead, `capacityLeaseCache` fetches `capacity.Snapshot`, a point-in-time report of free resources, from each worker-capable peer. It uses an authenticated `/v1/capacity` GET request on the gossip interval. That interval is 5 seconds by default, and a report expires after 3 intervals or 15 seconds, whichever is longer (see `capacity_lease.go`).
 
+The leader checks every create against its own report for the chosen worker. A server that has just started may not have one yet, and if it becomes leader then, it used to refuse those creates with 503 for about 20 seconds. Now the leader asks the worker for a report first, then decides. One request is shared by all the creates waiting on that worker, and it is not repeated within a second of a failed one (`capacity_lease_ondemand.go`).
+
 Worker and Agent nodes do not join Raft. They call any server-role member over RPC, and writes get forwarded to the leader.
 
 ## The placement FSM
@@ -114,7 +131,7 @@ Later commands (15 and up) cover platform volumes, audit cleanup, secret recipie
 
 Because every change is one Raft log entry, placement state ends up the same on every replica (copy of the FSM). On apply, `f.version = log.Index` makes the Raft log index the FSM version. That version survives Raft snapshots (compact saved copies of the state) and matches between leader and followers with no extra bookkeeping. An earlier in-process counter reset to zero on every cold restart and broke watchers; tying the version to `log.Index` fixed that.
 
-One caveat: apply also sets `now := time.Now().Unix()`. So timestamps such as `UpdatedUnix` and `OrphanedUnix` come from each server's own clock, and differ between leader and followers by milliseconds. Placement correctness does not need those fields to match byte for byte. It needs the keys and ownership fields to match, and they do.
+Apply never reads the server's own clock. It takes "now" from the time the leader stamped on the log entry (`raft.Log.AppendedAt`, read by `applyNow` in `fsm.go`). So timestamps such as `UpdatedUnix` and `OrphanedUnix`, and every time check apply makes (a reservation that has run out, a delete record past its keep time), come out the same on every server and on every replay of the log. Only an entry written before Raft stamped that time falls back to the local clock.
 
 Reads come from the local FSM copy. The leader is only on the write path.
 
@@ -198,6 +215,7 @@ The score is `(budget − reserved − pending − request) / budget`, averaged 
 - Its GPU or runtime (container, gVisor, Firecracker and so on) does not match the request.
 - It lacks the requested template. Older peers that do not report templates are let through (the "unknown-allow" rule).
 - Its network-slot pool for the runtime has no free slot after its pending reservations are counted (see [Network slots](#network-slots)).
+- It lacks a label the create's placement rule asks for (see [Choose where a sandbox runs](#choose-where-a-sandbox-runs)).
 
 **The first pick wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
 
@@ -209,9 +227,11 @@ This is the whole choice, from the full member list down to one winner:
 flowchart TB
     ALL["Every node this server knows about"] --> F1["Drop nodes that are dead, drained,<br/>cannot own sandboxes or have no API address"]
     F1 --> F2["Drop nodes whose capacity report is stale"]
-    F2 --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
+    F2 --> FL["Drop nodes without every label<br/>the placement rule asks for"]
+    FL --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
     F3 --> F4["Drop nodes whose network-slot pool<br/>for the runtime is full"]
     F4 --> ANY{"Any nodes left?"}
+    ANY -- "no, and no node has the labels" --> RULE["Answer 409 placement_unsatisfiable<br/>naming the rule"]
     ANY -- "no" --> NONE["Answer 503 + Retry-After<br/>'at capacity' when a node that could<br/>run it was only full"]
     ANY -- "yes" --> PICK["Pick two of them at random"]
     PICK --> CMP{"Does the second pick have<br/>strictly more headroom?"}
@@ -231,6 +251,191 @@ Draining is a hard admission rule, not a scoring penalty. (Draining a node tells
 > soft-scoring penalty.
 
 > **Invariant.** A placement decision uses the freshest information the deciding node has. That is the capacity report, minus in-flight reservations, minus drain marks. The leader sees reservations at once; other replicas see them once their FSM apply catches up. Nodes with stale capacity drop out of the candidate set until their next successful report.
+
+## Choose where a sandbox runs
+
+Sometimes a sandbox must run on certain servers. A bank may need regulated work to stay on approved hosts. You may want to spread work across zones (separate parts of a data center), or send a job to a node with a certain GPU. A **placement rule** does this.
+
+It works in two parts:
+
+1. **The operator labels each node.** A label is a `key=value` pair, such as `tier=pci`. A zone is a label with the key `zone`.
+2. **The create asks for labels.** The sandbox runs only on a node that has every label it asks for, with the same value.
+
+### Label the nodes
+
+Set these on each node, next to its other settings. A node reads them when it starts.
+
+| Setting | What it does | Example |
+|---|---|---|
+| `SB_NODE_ZONE` | The node's zone. It becomes the label `zone`. | `eu-west-1a` |
+| `SB_NODE_LABELS` | Other labels, as `key=value` pairs split by commas. | `tier=pci,gpu=a10` |
+
+The rules for labels:
+
+- Keys and values follow the Kubernetes label rules. They use letters, digits, `-`, `_` and `.`, and start and end with a letter or digit. A key may have a prefix, like `example.com/tier`.
+- A node can have at most 16 labels, the zone included. Each key and each value is at most 63 characters.
+- A mistake stops the node from starting. A typo, a key set twice with two values, or a zone set two different ways all fail the boot. That is on purpose. A node that quietly dropped a bad label would never match the rules written for it.
+
+The cluster members list (`GET /v1/cluster/members`) shows each node's `zone` and `labels`, so you can see what a rule can target.
+
+### What zones do on their own
+
+Once nodes have zones, the cluster uses them even when a create asks for nothing:
+
+- **New sandboxes spread across zones by free room.** The leader picks two zones at random and takes the one with more free room on average. Then it picks a node in that zone as usual. So each zone keeps about the same headroom, and a zone loss leaves the others able to take its sandboxes.
+- **Failover never goes back into the zone that just lost a node,** unless no other zone has room. A zone outage takes its nodes one by one, so a sandbox moved to a neighbor in the same zone would likely move again.
+- **Sealed-secret backups go to other zones.** A `failover.policy="recreate"` sandbox keeps backup copies of its sealed secrets on other nodes. Those copies go to zones other than the owner's first, one per zone. So one zone loss cannot take the owner and every copy together.
+
+A cluster with no zones, or with every node in one zone, places exactly as before. On Kubernetes the operator sets `SB_NODE_ZONE` from the machine's `topology.kubernetes.io/zone` label.
+
+### Ask for a node in the create
+
+Add `placement` to the create. Set `zone`, `labels`, or both:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+
+    const client = new MicroVM({
+      apiUrl: process.env.SB_API_URL,
+      patToken: process.env.SB_PAT_TOKEN,
+    })
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      placement: { zone: 'eu-west-1a', labels: { tier: 'pci' } },
+    })
+
+    console.log(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url=os.environ['SB_API_URL'],
+        pat_token=os.environ['SB_PAT_TOKEN'],
+    )
+
+    # Run only on a node in zone eu-west-1a that has the label tier=pci.
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'placement': {'zone': 'eu-west-1a', 'labels': {'tier': 'pci'}},
+    })
+
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    import (
+        "context"
+        "fmt"
+        "log"
+        "os"
+
+        microvm  "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   os.Getenv("SB_API_URL"),
+        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Placement: &sdktypes.PlacementRule{
+            Zone:   "eu-west-1a",
+            Labels: map[string]string{"tier": "pci"},
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Println(sandbox.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+    use aerolvm_sdk::{Client, CreateOptions, PlacementRule};
+
+    let client = Client::new(
+        std::env::var("SB_API_URL").ok().as_deref(),
+        std::env::var("SB_PAT_TOKEN").ok().as_deref(),
+    )?;
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        placement: Some(PlacementRule {
+            zone: Some("eu-west-1a".to_string()),
+            labels: Some(HashMap::from([("tier".to_string(), "pci".to_string())])),
+        }),
+        ..Default::default()
+    })?;
+
+    println!("{}", sandbox.data.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.Map;
+
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.PlacementRule;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl(System.getenv("SB_API_URL"))
+            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+    );
+
+    // Run only on a node in zone eu-west-1a that has the label tier=pci.
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setPlacement(new PlacementRule()
+                .setZone("eu-west-1a")
+                .setLabels(Map.of("tier", "pci")))
+    );
+
+    System.out.println(sandbox.id);
+    ```
+  </TabItem>
+</Tabs>
+
+### What happens
+
+- **Every label must match.** The node must have each key you ask for, with exactly that value. A node may have more labels than you ask for. There is no "one of" or "not" in this version.
+- **No match is a refusal, never a fallback.** If no live node has the labels, the create fails with `409` and the code `placement_unsatisfiable`. The message names the rule. Retrying does not help, because waiting does not give a node a label.
+- **A busy match is a normal wait.** If a node has the labels but is full, drained, or its capacity report is late, you get the usual `503` with `Retry-After`. The SDKs retry it.
+- **One server works the same way.** On a single server, a rule that the server's own labels do not match gets the same `409`.
+- **The rule survives failover.** The rule is saved with the sandbox, so a [recreate after a node dies](/durability/) only picks a node that matches. If no live node matches, the sandbox is not moved. It is orphaned, like any sandbox with nowhere to go, and its old node takes it back if it returns. The counter `aerolvm_cluster_failover_refused_total{reason="placement_unsatisfiable"}` goes up, and the audit log gets a `failover_refused` record that names the sandbox, the node it could not leave, and the rule.
+
+How it works inside:
+
+- Labels travel in each node's capacity report (`labels` on `/v1/capacity`), not in gossip. Gossip data per node is capped at 512 bytes, and going over it once broke Raft joins. Placement already needs a fresh capacity report from each node, so the labels are always there when placement runs.
+- The label filter runs before the two random picks, so the picks only ever see nodes that match.
+- The leader checks the rule again when it records the reservation, and the chosen node checks its own labels before it creates anything. A router on an older release, which does not know about rules, cannot slip a sandbox onto the wrong node.
+- A node on an older release sends no labels, so it never matches a rule. During an upgrade a create with a rule fails closed instead of landing on an unlabelled node. A create without a rule places as before.
+
+<Aside type="caution">
+A server older than the release with placement rules ignores the `placement` field and places the sandbox anywhere. Upgrade every server before you depend on rules.
+</Aside>
 
 ## Network slots
 
@@ -293,6 +498,8 @@ A placed sandbox stays on its owner node, and every other node forwards requests
 
 **Loop detection.** A stale placement view could bounce a request between two nodes that each think the other owns sandbox X. `forward.go` sets `X-Cluster-Forwarded: 1` on the way out. A node that receives a request with that header, and is about to forward it again, returns 421 Misdirected Request instead. The caller then retries against fresh placement.
 
+**A server cut off from the leader stops answering placement questions.** Worker and ingress nodes keep no placement state; they ask a server-role node. A follower's copy only moves when the leader sends it changes, so a follower on the wrong side of a network split would keep naming an owner the leader may already have replaced. Once a follower has heard nothing from the leader for twice the Raft heartbeat timeout (2 seconds by default), it answers those questions with 503, and the asking node tries the next server. The leader always answers. `stale_read.go` holds the rule.
+
 Every node runs the same check on a request for a sandbox, whether the request came from a caller or from another node:
 
 ```mermaid
@@ -309,6 +516,21 @@ flowchart TB
 
 - A request is forwarded at most once. A second hop would mean two nodes disagree about the owner, so the request stops with 421.
 - Finding the owner is only a read. No Raft write happens on this path.
+
+**Owner cache (on by default).** A worker or ingress node holds no placement table, so each "who owns X?" is a call to the server tier, and the owner makes the same call again. With the owner cache (`SB_CLUSTER_OWNER_CACHE`, default `true`), a worker or ingress node remembers the owner its last lookup found and forwards straight there. The cache only picks where a request goes, never the answer:
+
+- The owner still looks itself up on every request. If the answer is not "this node", it does not serve, 404 or 410. It answers `421` with a private header that repeats a one-time token the edge sent, so nothing else can fake that answer.
+- The edge then drops the entry and routes the request once more from a fresh lookup, as it would with the cache off. That second try never uses the cache, so the edge sends a request at most twice.
+- An entry lasts 30 seconds. The cache holds at most 16,384 sandboxes, about 4 MiB. A node that gossip reports dead gets no cached traffic.
+- Turn it on only after every node runs a build that has it: an owner on an older build would serve or 404 a stale forward.
+
+**The owner skips its own lookup when it can prove ownership.** Every forward carries the placement's owner epoch: the Raft log index of the entry that last changed the owner. With the owner cache on, each worker's ownership lease reads all of its sandboxes from the leader every 5 seconds and keeps their epochs. A forward whose epoch matches that reading is served with no lookup, because two authoritative readings agree:
+
+- A forward from a fresh edge lookup may use a reading as old as the lease (15 seconds by default).
+- A forward from the edge's cache needs a reading under 2 seconds old. That is the same staleness the owner's own lookup could get from a follower before it refuses.
+- A reading that holds a newer epoch turns a cached forward down. A missing epoch, a fenced sandbox or an older reading falls back to the lookup.
+
+With both halves on, a routed call in steady state asks the server tier nothing.
 
 **The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
@@ -349,7 +571,12 @@ flowchart TB
 ```
 
 - The rebuild is safe to repeat. A sandbox that already runs here is left as it is.
-- If no other node can take it, the sandbox stays here and the watcher keeps trying.
+- For that move, the leader picks the new node from the nodes' capacity reports, so it only picks a node that has room.
+- If this node failed because it has no room (its own admission check said no), and no other node has room either, the leader orphans the sandbox (410 Gone) instead of leaving it on a node that cannot run it. For any other failure, if no other node can take it, the sandbox stays here and the watcher keeps trying.
+
+**The old owner pauses its copy first.** "Dead" only means the leader cannot hear the node. A node cut off by a network split may still be running its sandboxes. So every worker keeps a lease on what it owns: each time the leader answers one of its placement reads (every 5 seconds by default), the lease is renewed. If half of `ClusterDeadOwnerGrace` (15 seconds by default) passes with no answer, the worker pauses each of its recreate-policy sandboxes in place (docker and containerd freeze them with the cgroup freezer) and refuses to start or serve them. A paused process would take a connection and never answer, so none of its public addresses reaches it: API calls for it, its HTTP port URLs, its toolbox URL and its custom domains get 503 with `Retry-After`, and its raw TCP and TLS ports close each new connection at once (those protocols have no way to say "retry"). Connections that were already open when it paused wait until it resumes. That happens well before the leader may hand them to another node. When the leader answers again, a sandbox whose placement still names this node resumes where it stopped; one that moved stays paused until the stale-ownership check removes it. Firecracker, WASM and isolate sandboxes cannot be paused in place yet: they are refused, but keep running. `ownership_lease.go` in `internal/service` holds the rule.
+
+**The pause holds with the server process down.** A worker could only pause its sandboxes while its own `sandboxd` ran. In a Kubernetes worker pod the sandboxes live in another container, so a `sandboxd` that crashed or could not restart left them running while the leader handed them to another node. Now `sandboxd` also writes its lease to a file both containers share (`SB_OWNERSHIP_LEASE_FILE`) after each answer from the leader. The runtime container's supervisor reads it twice a second. When the lease in it runs out, the supervisor pauses the same sandboxes with the cgroup freezer. It resumes one only after a later answer proves the sandbox still belongs to this node. A restarted `sandboxd` writes nothing until the leader answers it, so a crash loop never extends the lease. `internal/ownerlease` holds the file, and `internal/supervisor/lease.go` the pause.
 
 Orphaned sandboxes have two ways out:
 
@@ -387,6 +614,7 @@ stateDiagram-v2
     Reserved --> [*] : create failed, timer ran out or owner died
     Placed --> Placed : owner died, recreate policy moves it with opReassign
     Placed --> Orphaned : owner died, no recreate policy
+    Placed --> Orphaned : recreate refused for room, no node has room
     Orphaned --> Placed : original owner returns, opClaimOrphan
     Orphaned --> [*] : operator deletes it
     Placed --> [*] : sandbox deleted
@@ -394,6 +622,22 @@ stateDiagram-v2
 
 - A reservation never turns into an orphan. When its owner dies, `opOrphanOwner` releases it in the same command.
 - Every change in the picture is written through Raft, so every server ends up with the same state.
+
+### What to watch
+
+Each server offers these counters at `GET /v1/metrics` (see [Dashboard](/dashboard/)):
+
+| Metric | What it tells you |
+|---|---|
+| `aerolvm_cluster_ownership_fenced_sandboxes` | Sandboxes this worker has paused because its lease ran out. Above 0 means the node cannot reach the leader, and those sandboxes answer 503 until it can. |
+| `aerolvm_ownership_lease_file_write_errors_total` | Lease-file writes that failed (`SB_OWNERSHIP_LEASE_FILE`). Above 0 means the runtime supervisor may pause this worker's recreate-policy sandboxes while `sandboxd` still reaches the leader. |
+| `aerolvm_cluster_stale_placement_read_rejects_total` | Placement questions a server refused because it lost touch with the leader. A count that keeps rising on one server means that server is cut off. |
+| `aerolvm_cluster_placement_feed_in_flux` | 1 while an ingress node treats every recreate-policy route as moving, because no server has answered its placement feed in time. |
+| `aerolvm_cluster_ownership_replay_unplaced_total` | Local copies with no placement that a returning server handled, by `outcome`: `destroyed_deleted` (deleted while it was away), `destroyed_unproven` (away longer than delete records are kept), `kept_grace_off` (`SB_AUDIT_DELETED_GRACE=0`, so there are no records to check) or `kept_no_incarnation`. Kept rows are logged. |
+| `aerolvm_cluster_ownership_replay_refused_total` | Times Raft refused to place a returning server's copy of a deleted sandbox. The server checks first, so this moves only when a delete races the return. |
+| `aerolvm_cluster_route_requests_total`, `aerolvm_cluster_route_lookups_total` | Calls for one sandbox that clients sent to this node, and the owner lookups the router made for them, by `hop` (`edge` is the node the client called, `owner` the node a forward reached). Summed over all nodes, lookups divided by requests is what one call costs the server tier. |
+| `aerolvm_cluster_owner_lease_serves_total` | Forwards this node served from its ownership lease reading, with no lookup. |
+| `aerolvm_cluster_owner_cache_hits_total`, `_misses_total`, `_retries_total`, `_not_owner_total`, `_entries` | The owner cache, when it is on: calls routed from an entry, calls with no usable entry, cached forwards the owner turned down that were routed again, cached forwards this node turned down, and entries held. |
 
 ## Keeping secrets out of the Raft log
 
@@ -455,10 +699,12 @@ These are the current limits of cluster mode. This page would be dishonest if it
 - **Capacity is pulled, not streamed.** A network blip between fetches does not lose membership, but it can mark capacity stale. A report expires after 3 intervals or 15 seconds, whichever is longer (the default interval is 5 seconds). A host that recovers quickly may take a tick or two to rejoin the placement set.
 - **Reservations expire on a timer.** A router that crashes between `opReserve` and starting the sandbox leaves a stray reservation. The cleanup loop runs every 5 seconds and the reservation TTL is 120 seconds. So at worst, the chosen owner's headroom looks too low for about 125 seconds.
 - **The dead-owner grace period is 30 seconds.** `ClusterDeadOwnerGrace` defaults to 30 seconds, and you can change it with `SB_DEAD_OWNER_GRACE`. Recreate-policy failover does not start until the dead-owner tracker has seen the node dead for that long without a break.
+- **A machine the operator says is gone can fail over sooner.** On Kubernetes the AerolVM operator calls `POST /v1/cluster/nodes/{id}/gone` when a machine leaves. The leader then may start that node's failover at its ownership lease limit, `lease + lease/15` after the last ownership read it answered for the node (16 seconds by default), instead of after the grace. Never sooner: a deleted machine object does not prove the machine stopped, and the lease is what stops the old copy. Only a node whose runtime freezes its sandboxes with sandboxd down (`SB_OWNERSHIP_LEASE_FILE`, the Kubernetes worker pod) gets this, and only while it renews its lease by reads: a worker asks the leader every 5 seconds while a recreate-policy sandbox runs on it, and renews on its own while none does, which the leader cannot see. Any other node, such as a plain VM or an idle worker, waits the grace. A node gossip sees again is not gone.
+- **A node that announced a restart gets the restart window instead.** On SIGTERM, sandboxd sets `rs` in its gossip metadata before it leaves (`gossipNode.announceRestart`). Every server records the deadline from its own leave callback, and the dead-owner loop skips the node until `SB_CLUSTER_RESTART_WINDOW` (120 seconds by default) has passed. Placement and the failover scan skip a node with `rs` set. A deleted node never waits. A leading server first hands Raft leadership to another voter (`Cluster.PrepareShutdown`), so the cluster does not wait out an election.
 - **`failover.policy = "recreate"` is best effort.** The new owner rebuilds from the spec. Anything kept only in the container's writable layer is gone; see [Durability and failover](/durability/) for the full table.
 - **Raft needs a majority.** Two server-role nodes cannot survive losing one; three can, so run an odd number of server-role nodes. Above 10 live nodes, `LargeClusterTopologyError` (in `topology.go`) also requires dedicated server, worker and ingress roles, and it caps the server tier at 7 nodes.
 
-None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster-setup/) covers how to run one.
+None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster/) covers how to run one.
 
 ## What this buys you
 
@@ -606,7 +852,7 @@ The same create call works on one node, on three nodes, and in the middle of a f
 ## Next steps
 
 - [Durability and failover](/durability/): what survives a host loss, and what `failover.policy = "recreate"` keeps.
-- [Cluster setup](/cluster-setup/): how to deploy a cluster, and the quorum rules.
+- [Cluster setup](/cluster/): how to deploy a cluster, and the quorum rules.
 - [Safe retries (idempotency)](/engineering-idempotency/): the single-node rules (name uniqueness, partial unique indexes) that the FSM mirrors across the cluster.
 - [Secrets providers](/cluster-secrets/): how sealed secrets are copied to the nodes that may need them.
 - [Staying up under overload](/overload-protection-architecture/): how a node protects itself when too many cluster-wide lists read the placement table at once.

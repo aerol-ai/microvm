@@ -118,6 +118,11 @@ type sandboxResponse struct {
 	UpdatedAt           *string           `json:"updatedAt,omitempty"`
 	LastActivityAt      *string           `json:"lastActivityAt,omitempty"`
 	ToolboxProxyURL     string            `json:"toolboxProxyUrl"`
+	// Kvm says whether the sandbox can use /dev/kvm. Always false here (no
+	// AerolVM sandbox exposes KVM to its code), and always present: newer
+	// Daytona SDKs (0.230) require the field and reject a sandbox without
+	// it, while older ones keep unknown fields, so sending it suits both.
+	Kvm bool `json:"kvm"`
 }
 
 type paginatedSandboxesResponse struct {

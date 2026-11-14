@@ -19,7 +19,6 @@ import (
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/creack/pty"
 )
 
 // writeLoginRestore writes the PATH restore as the first line of a
@@ -46,8 +45,10 @@ type Config struct {
 	// PID 1 and reaps orphans with wait4(-1), which can take a session's own
 	// exit status before cmd.Wait does; it passes its child table here so
 	// the status reaches the session instead of reading as exit 0. Nil means
-	// start, then cmd.Wait: right for a host that reaps nothing (the WASM
-	// tool host).
+	// start, then cmd.Wait: right for a parent that reaps nothing. The
+	// Manager starts real processes wherever it runs, so it belongs inside a
+	// sandbox (toolboxd), never in sandboxd: the WASM tool host stopped using
+	// it for that reason (internal/runtime/wasm/toolhost/sessions.go).
 	StartProcess func(cmd *exec.Cmd, start func() error) (wait func() (code int, signal string), err error)
 	// BaseEnv returns the environment a session starts from, before the
 	// request's own env is laid on top. Nil means os.Environ(). toolboxd
@@ -296,7 +297,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		var ptmx *os.File
 		wait, err := m.startProcess(cmd, func() error {
 			var err error
-			ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+			ptmx, err = StartPTY(cmd, uint16(s.cols), uint16(s.rows))
 			return err
 		})
 		if err != nil {
@@ -306,6 +307,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		}
 		s.ptmx = ptmx
 		s.wait = wait
+		s.ttyPath = ptsPath(ptmx)
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(1)
 		go s.runPump(ptmx, StreamStdout)

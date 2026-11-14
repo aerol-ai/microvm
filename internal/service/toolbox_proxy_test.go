@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -31,6 +31,7 @@ type captureToolboxHost struct {
 	rawQuery string
 	auth     string
 	testHdr  string
+	subproto string
 }
 
 func (c *captureToolboxHost) ServeToolbox(ctx context.Context, sandboxID string, token string, w http.ResponseWriter, r *http.Request) {
@@ -38,6 +39,7 @@ func (c *captureToolboxHost) ServeToolbox(ctx context.Context, sandboxID string,
 	c.rawQuery = r.URL.RawQuery
 	c.auth = r.Header.Get("Authorization")
 	c.testHdr = r.Header.Get("X-Test")
+	c.subproto = strings.Join(r.Header.Values("Sec-WebSocket-Protocol"), ",")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -325,15 +327,7 @@ func TestToolboxProxyErrorBranchesMore(t *testing.T) {
 		t.Fatal("RoundTripToolbox should fail for missing sandbox")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
-		t.Fatalf("listener close: %v", err)
-	}
-	svc.cfg.ToolboxPort = port
+	svc.cfg.ToolboxPort = testport.Reserve(t, false) // nothing listens here
 	if err := svc.ServeToolboxReverseProxy(ctx, "sb-net-error", rec, req, "/foo"); err != nil {
 		t.Fatalf("ServeToolboxReverseProxy proxy error path: %v", err)
 	}
@@ -480,5 +474,55 @@ func TestToolboxTargetRejectsStoppedSandbox(t *testing.T) {
 	}
 	if ep.URL == "" || ep.Token != "tok" {
 		t.Fatalf("running endpoint = %+v", ep)
+	}
+}
+
+// An in-process toolbox host (WASM, isolate) checks the sandbox's toolbox
+// token on every route, so the /v1 pass-through must hand it that token,
+// never the caller's credential, as the container path does. Before, the
+// caller's PAT went through and every authenticated WASM toolbox call
+// answered 401 (live, single-node-wasm, 2026-11-06).
+func TestServeToolboxReverseProxy_InProcessHostGetsToolboxToken(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		runtime string
+		wire    func(*Service, *captureToolboxHost)
+	}{
+		{"wasm", models.RuntimeWasm, func(s *Service, h *captureToolboxHost) { s.cfg.EnableWasm = true; s.SetWasmRuntime(h) }},
+		{"isolate", models.RuntimeIsolate, func(s *Service, h *captureToolboxHost) { s.cfg.EnableIsolate = true; s.SetIsolateRuntime(h) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+			host := &captureToolboxHost{}
+			tc.wire(svc, host)
+			now := time.Now().UTC()
+			if err := st.Create(ctx, &models.Sandbox{
+				ID: "sb-host-auth", Runtime: tc.runtime, Status: models.SandboxStatusStarted,
+				ToolboxToken: "sandbox-token", CreatedAt: now, UpdatedAt: now,
+			}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/v1/sandboxes/sb-host-auth/toolbox/files/info?path=/x", nil)
+			req.Header.Set("Authorization", "Bearer caller-pat")
+			req.Header.Set("X-Test", "kept")
+			req.Header.Set("Sec-WebSocket-Protocol", bearerSubprotocol+", caller-pat")
+			rec := httptest.NewRecorder()
+			if err := svc.ServeToolboxReverseProxy(ctx, "sb-host-auth", rec, req, "/files/info"); err != nil {
+				t.Fatalf("ServeToolboxReverseProxy: %v", err)
+			}
+			if host.auth != "Bearer sandbox-token" {
+				t.Fatalf("host saw Authorization %q, want the sandbox's toolbox token", host.auth)
+			}
+			if strings.Contains(host.subproto, "caller-pat") || !strings.Contains(host.subproto, bearerSubprotocol) {
+				t.Fatalf("host saw Sec-WebSocket-Protocol %q, want the marker without the caller's token", host.subproto)
+			}
+			if host.path != "/files/info" || host.rawQuery != "path=/x" || host.testHdr != "kept" {
+				t.Fatalf("host saw path %q query %q X-Test %q", host.path, host.rawQuery, host.testHdr)
+			}
+			if req.Header.Get("Authorization") != "Bearer caller-pat" {
+				t.Fatal("the caller's own request must not be changed")
+			}
+		})
 	}
 }

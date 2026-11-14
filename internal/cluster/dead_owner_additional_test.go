@@ -13,19 +13,19 @@ func TestHandleMemberLeave(t *testing.T) {
 		deadOwners: newDeadOwnerTracker(),
 	}
 	// empty node id
-	c.handleMemberLeave("")
+	c.handleMemberLeave("", false)
 	if len(c.deadOwners.snapshot()) != 0 {
 		t.Errorf("expected no mark")
 	}
 
 	// self node id
-	c.handleMemberLeave("self")
+	c.handleMemberLeave("self", false)
 	if len(c.deadOwners.snapshot()) != 0 {
 		t.Errorf("expected no mark")
 	}
 
 	// valid node id
-	c.handleMemberLeave("peer")
+	c.handleMemberLeave("peer", false)
 	if _, ok := c.deadOwners.snapshot()["peer"]; !ok {
 		t.Errorf("expected peer to be marked")
 	}

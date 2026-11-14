@@ -1,0 +1,12 @@
+apiVersion: v2
+name: aerolvm
+description: AerolVM sandboxes on Kubernetes. Single mode runs one worker pod with no operator, for kind and laptops.
+type: application
+# The chart's own version; appVersion is the AerolVM release whose images it
+# runs by default (image.tag overrides it).
+version: 0.1.0
+appVersion: "v0.7.3"
+home: https://github.com/aerol-ai/microvm
+sources:
+  - https://github.com/aerol-ai/microvm
+keywords: [sandbox, gvisor, containerd, ai-agents]

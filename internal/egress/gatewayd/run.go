@@ -15,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/internal/observability"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // Subcommand is how sandboxd is invoked to run the gateway.
@@ -69,6 +70,11 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	go w.Run(ctx, operatorPoll)
 	go reloadOnHUP(ctx, w)
+	// The deny-floor file (review R4), which RunCLI read at start: its
+	// addresses can change while the gateway runs.
+	if path := os.Getenv(egresspolicy.FloorFileEnv); path != "" {
+		go egresspolicy.WatchFloorFile(ctx, path, operatorPoll, log, func() { d.RefreshFloor(w.Current()) })
+	}
 	ln, err := socketListener(cfg.SocketPath)
 	if err != nil {
 		return err
@@ -117,6 +123,15 @@ func RunCLI(ctx context.Context, log *slog.Logger) error {
 	cfg, err := FromEnv()
 	if err != nil {
 		return err
+	}
+	// sandboxd's extra deny floor and private ranges (C24), from this
+	// process's own environment: the gateway dials for container sandboxes
+	// from the pod or host itself, past the host firewall's copy, so it
+	// must refuse them too. Before the guard is built from the operator
+	// file, whose floor carries them. A list it cannot read stops the
+	// gateway rather than run it without a floor entry.
+	if err := egresspolicy.LoadRangesFromEnv(); err != nil {
+		return fmt.Errorf("egress gateway: %w", err)
 	}
 	return Run(ctx, cfg, log)
 }

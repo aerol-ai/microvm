@@ -692,7 +692,7 @@ A container sandbox runs its image's own start command when it starts: the `ENTR
   </TabItem>
 </Tabs>
 
-You do not need a start command. You can run everything later with [Run commands](/exec-streaming/). The sandbox stays up even if the start command exits.
+You do not need a start command. You can run everything later with [Run commands](/exec-streaming/). The sandbox stays up even if the start command exits. To delete it some time after the command ends, set [`destroyAfterExitFor`](/lifecycle/#delete-when-the-program-ends).
 
 The server tracks a push state for each snapshot (`push_state` in the API, `PushState` in the Go SDK):
 
