@@ -79,6 +79,17 @@ type Pool struct {
 	// daemon restart, so reloading the map from disk is meaningless).
 	handlesMu sync.Mutex
 	handles   map[string]SpawnedHandle
+
+	// orphans tears down a released slot the pool holds no handle for
+	// (SetOrphanCleaner). Set once at boot, before Run.
+	orphans OrphanCleaner
+}
+
+// SetOrphanCleaner wires the teardown ReapReleased uses for a released
+// slot with no handle in this process. main.go passes the same runtime
+// adapter it passes to Run as the Spawner. Call it before Run.
+func (p *Pool) SetOrphanCleaner(c OrphanCleaner) {
+	p.orphans = c
 }
 
 // Slot is the policy-level view of one warm-VMM pool entry. Mirrors
@@ -457,6 +468,13 @@ func (p *Pool) ListNonReleased(ctx context.Context, templateID string) ([]Slot, 
 // partial cleanup that released the row before the process stopped).
 // Shutdown must succeed before delete so the row remains the durable
 // breadcrumb for a retry if teardown fails.
+//
+// A row with no handle goes through the OrphanCleaner first, under the
+// same rule. After a daemon restart no handle survives, and the reap
+// used to skip straight to the row delete: the slot's run dir and TAP
+// device were then left with no record that would ever lead back to them.
+// Without a cleaner (a pool no runtime is wired to) the row is all there
+// is, and it goes as before.
 func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) {
 	released, err := p.st.ListReleasedFirecrackerVMMSlots(ctx, cutoff)
 	if err != nil {
@@ -469,6 +487,12 @@ func (p *Pool) ReapReleased(ctx context.Context, cutoff time.Time) (int, error) 
 				p.logger.Warn("vmm pool reap: shutdown failed",
 					"slot_id", sl.ID, "error", sErr)
 				p.registerHandle(sl.ID, h)
+				continue
+			}
+		} else if p.orphans != nil {
+			if cErr := p.orphans.CleanupOrphanSlot(ctx, *slotFromStore(&sl)); cErr != nil {
+				p.logger.Warn("vmm pool reap: teardown of a slot with no handle failed; row kept for the next pass",
+					"slot_id", sl.ID, "run_dir", sl.RunDir, "error", cErr)
 				continue
 			}
 		}

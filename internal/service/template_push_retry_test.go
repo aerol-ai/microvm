@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -31,6 +32,8 @@ type fakeTemplatePushStore struct {
 	claimErr    error
 	completeErr error
 	releaseErr  map[string]error
+	retirements []storepkg.SnapshotRegistryRetirement
+	retireErr   error
 }
 
 func newFakeTemplatePushStore() *fakeTemplatePushStore {
@@ -543,4 +546,14 @@ func TestTemplatePushFencedCompletionWritesNothing(t *testing.T) {
 	if row := inner.get("tpl-fenced"); row.RegistryRef != "" || row.PushState != models.TemplatePushStatePushing {
 		t.Fatalf("a fenced push wrote the row: %+v", row)
 	}
+}
+
+func (f *fakeTemplatePushStore) ScheduleSnapshotRegistryRetirement(_ context.Context, r storepkg.SnapshotRegistryRetirement) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.retireErr != nil {
+		return f.retireErr
+	}
+	f.retirements = append(f.retirements, r)
+	return nil
 }

@@ -70,7 +70,8 @@ func repoOf(ref string) string {
 
 // The copy is deleted by digest — the tag may already hold a newer snapshot
 // of the same name — with the credentials it was pushed with, and only
-// inside this cluster's snapshot namespace on the configured host.
+// inside this cluster's snapshot and template namespaces on the configured
+// host.
 func TestRetireManifest(t *testing.T) {
 	del := &fakeManifestDeleter{}
 	p := retirePusher(t, &fakeSnapshotPushDocker{}, del)
@@ -85,11 +86,19 @@ func TestRetireManifest(t *testing.T) {
 	if cfg := del.cfgs[0]; cfg.Host != "aocr.test" || cfg.ClusterID != "cluster-1" || cfg.PATPath != p.cfg.PATPath {
 		t.Fatalf("delete cfg = %+v, want the pusher's own", cfg)
 	}
+	// A deleted template's copy is retired the same way (templateAOCRRef).
+	tplRef := templateAOCRRef("aocr.test", "cluster-1", "tpl-gone")
+	if err := p.RetireManifest(context.Background(), tplRef, retireDigestOld); err != nil {
+		t.Fatalf("RetireManifest(template copy): %v", err)
+	}
+	if got := del.refs(); len(got) != 2 || got[1] != repoOf(tplRef)+"@"+retireDigestOld {
+		t.Fatalf("deleted %v, want %s pinned by digest", got, repoOf(tplRef))
+	}
 
 	refused := []struct{ name, ref, digest string }{
 		{"another host", strings.Replace(ref, "aocr.test", "evil.test", 1), retireDigestOld},
 		{"another cluster", strings.Replace(ref, "cluster-1", "cluster-2", 1), retireDigestOld},
-		{"not a snapshot path", "aocr.test/cluster/cluster-1/templates/app:latest", retireDigestOld},
+		{"not a snapshot or template path", "aocr.test/cluster/cluster-1/other/app:latest", retireDigestOld},
 		{"the import namespace", "aocr.test/cluster/cluster-1/_imported/python:3.12", retireDigestOld},
 		{"unparsable ref", "Not A Ref", retireDigestOld},
 		{"not a digest", ref, "latest"},

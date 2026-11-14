@@ -221,11 +221,11 @@ func (p *SnapshotPusher) DestRefFor(ownerRef, snapshotName string) string {
 }
 
 // errRegistryCopyNotOurs marks a retirement this pusher must not perform:
-// the ref is not a snapshot copy under this cluster's namespace on the
-// configured registry host, or the digest is not a digest. Retrying cannot
+// the ref is not a snapshot or template copy under this cluster's
+// namespace on the configured registry host, or the digest is not a digest. Retrying cannot
 // change that, and the cluster credential must never be presented to a
 // host it was not configured for.
-var errRegistryCopyNotOurs = errors.New("not a snapshot registry copy this node pushes")
+var errRegistryCopyNotOurs = errors.New("not a registry copy this node pushes")
 
 // RetireManifest removes one registry copy of a deleted snapshot: the
 // manifest registryRef@digest, deleted BY DIGEST and never by tag. The tag
@@ -253,16 +253,19 @@ func (p *SnapshotPusher) RetireManifest(ctx context.Context, registryRef, dgst s
 }
 
 // pinnedRegistryCopy returns registryRef's repository pinned to dgst, or
-// errRegistryCopyNotOurs for anything outside this pusher's own snapshot
-// namespace (`<host>/cluster/<id>/snapshots/...`).
+// errRegistryCopyNotOurs for anything outside the namespaces this node's
+// reconcilers push to: snapshots (`<host>/cluster/<id>/snapshots/...`) and
+// templates (`<host>/cluster/<id>/templates/...`, templateAOCRRef).
 func (p *SnapshotPusher) pinnedRegistryCopy(registryRef, dgst string) (string, error) {
 	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(registryRef))
 	if err != nil {
 		return "", fmt.Errorf("%w: %q: %v", errRegistryCopyNotOurs, registryRef, err)
 	}
 	host := strings.TrimRight(strings.TrimSpace(p.cfg.Host), "/")
-	prefix := "cluster/" + strings.TrimSpace(p.cfg.ClusterID) + "/snapshots/"
-	if reference.Domain(named) != host || !strings.HasPrefix(reference.Path(named), prefix) {
+	cluster := "cluster/" + strings.TrimSpace(p.cfg.ClusterID) + "/"
+	path := reference.Path(named)
+	ours := strings.HasPrefix(path, cluster+"snapshots/") || strings.HasPrefix(path, cluster+"templates/")
+	if reference.Domain(named) != host || !ours {
 		return "", fmt.Errorf("%w: %q", errRegistryCopyNotOurs, registryRef)
 	}
 	parsed, err := digest.Parse(strings.TrimSpace(dgst))
