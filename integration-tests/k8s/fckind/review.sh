@@ -273,7 +273,7 @@ proof_review() {
   local busy
   busy="$(owner "$F") $(owner "$D")"
   for i in $(seq 1 36); do
-    W2=$($kc get aerolnodes -o json | jq -r --arg busy " $busy " '[.items[] | select(.spec.role == "worker" and .status.state == "Serving" and ($busy | contains(" " + .metadata.name + " ") | not))][0].metadata.name // empty')
+    W2=$($kc get aerolnodes -o json | jq -r --arg busy " $busy " '[.items[] | .metadata.name as $n | select(.spec.role == "worker" and .status.state == "Serving" and (($busy | contains(" " + $n + " ")) | not))][0].metadata.name // empty')
     [ -n "$W2" ] && break
     sleep 5
   done
@@ -338,29 +338,49 @@ proof_review() {
   if [ -z "$E" ]; then
     bad "R6: the eks pool's worker never served"
   else
+    # A sandbox on it, so its decommission waits in a drain window long
+    # enough to read: the other workers cordoned for the create, the
+    # operator stopped meanwhile so it does not answer the cordons.
+    local Es others6
+    $kc scale deploy/aerolvm-operator --replicas=0 >/dev/null
+    $kc wait --for=delete pod -l app.kubernetes.io/component=operator --timeout=90s >/dev/null 2>&1
+    others6=$(alive_workers | grep -vx "$E")
+    for w in $others6; do api -X POST "$U/v1/cluster/nodes/$w/cordon" >/dev/null; done
+    Es=$(mk '{"image":"alpine:3.20","cpu":1,"memory_mb":256}')
+    for w in $others6; do api -X POST "$U/v1/cluster/nodes/$w/uncordon" >/dev/null; done
+    $kc scale deploy/aerolvm-operator --replicas=1 >/dev/null
+    $kc wait --for=condition=Available deploy/aerolvm-operator --timeout=180s >/dev/null 2>&1
+    say "sandbox $Es on $(owner "$Es")"
     local idx dec="" st
     idx=$($kc get aerolcluster aerolvm -o json | jq '.spec.workerPools | map(.name) | index("eks")')
     $kc patch aerolcluster aerolvm --type=json -p "[{\"op\":\"test\",\"path\":\"/spec/workerPools/$idx/name\",\"value\":\"eks\"},{\"op\":\"remove\",\"path\":\"/spec/workerPools/$idx\"}]" >/dev/null
-    for i in $(seq 1 120); do
-      st=$($kc get aerolnode "$E" -o json 2>/dev/null)
-      [ -n "$(jq -r '.status.decommission.deadline // empty' <<<"$st" 2>/dev/null)" ] && dec=$(jq -c '.status.decommission' <<<"$st")
-      if [ -z "$st" ]; then s=gone; else s=$(jq -r '.status.state // "-"' <<<"$st"); fi
-      { [ "$s" = gone ] || [ "$s" = Removed ]; } && ! $kw get pod "$E" >/dev/null 2>&1 && break
+    for i in $(seq 1 60); do
+      dec=$($kc get aerolnode "$E" -o json 2>/dev/null | jq -c '.status.decommission // empty' 2>/dev/null)
+      [ -n "$dec" ] && break
       sleep 2
     done
-    say "after $((i * 2))s: $E is $s; decommission $dec; pod $($kw get pod "$E" --no-headers 2>&1 | head -c 100)"
-    if { [ "$s" = gone ] || [ "$s" = Removed ]; } && ! $kw get pod "$E" >/dev/null 2>&1; then ok "R6: the removed pool's worker $E was decommissioned and its pod removed in $((i * 2))s"
-    else bad "R6: the removed pool's worker $E is $s"; fi
+    say "decommission of $E: ${dec:-none}, $(nstate "$E"); kept settings: $($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | head -c 300)"
     if [ -n "$dec" ]; then
       local cap
       cap=$(python3 -c 'import json, sys, datetime as d
 s = json.loads(sys.argv[1]); p = lambda k: d.datetime.fromisoformat(s[k].replace("Z", "+00:00"))
 print(int((p("deadline") - p("startedAt")).total_seconds()), int((p("drainUntil") - p("startedAt")).total_seconds()))' "$dec")
-      [ "${cap%% *}" -le 840 ] && [ "${cap#* }" -le 840 ] && ok "EKS cap: deadline ${cap%% *}s and drain window ${cap#* }s after the start, though the pool asked 45m and 20m" ||
-        bad "EKS cap: deadline ${cap%% *}s, drain window ${cap#* }s after the start"
+      [ "${cap%% *}" -le 840 ] && [ "${cap#* }" -le 840 ] && ok "EKS cap: a removed eks-managed pool's worker got a deadline ${cap%% *}s and a drain window ${cap#* }s after the start, though the pool asked 45m and 20m" ||
+        bad "EKS cap: a removed eks-managed pool's worker got a deadline ${cap%% *}s and a drain window ${cap#* }s after the start"
     else
-      say "INFO EKS cap: the decommission ended before its status could be read"
+      bad "EKS cap: no decommission started on $E"
     fi
+    # The sandbox gone, the drain window has nothing to wait for.
+    say "delete $Es: $(api -X DELETE -w 'http=%{http_code}' "$U/v1/sandboxes/$Es" | tail -c 60)"
+    for i in $(seq 1 120); do
+      st=$($kc get aerolnode "$E" -o json 2>/dev/null)
+      if [ -z "$st" ]; then s=gone; else s=$(jq -r '.status.state // "-"' <<<"$st"); fi
+      { [ "$s" = gone ] || [ "$s" = Removed ]; } && ! $kw get pod "$E" >/dev/null 2>&1 && break
+      sleep 2
+    done
+    if { [ "$s" = gone ] || [ "$s" = Removed ]; } && ! $kw get pod "$E" >/dev/null 2>&1; then ok "R6: the removed pool's worker $E was decommissioned and its pod removed, $((i * 2))s after its sandbox went"
+    else bad "R6: the removed pool's worker $E is $s"; fi
+    say "kept settings after: $($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | head -c 300)"
   fi
   ensure
 
