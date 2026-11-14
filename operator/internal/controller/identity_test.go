@@ -331,19 +331,78 @@ func TestJoinIssuerIssuesOneTokenPerPod(t *testing.T) {
 	}
 }
 
-// Two requests for one pod at once, answered by two replicas: the pod's
-// mark is written with its resource version, so only one gets a token.
-func TestJoinIssuerOneWinnerOfARace(t *testing.T) {
-	p := joiningPod("prod-general-aaaaa", testWorkerNS, "m1")
-	g := newIssuerRig(t, bootstrapped(testCluster()), p, node(p.Name, v1.RoleWorker, "general", "z-a"))
-	g.rev.tokens["t"] = podToken(p, "m1")
-	g.h.Client = interceptor.NewClient(g.cl, interceptor.Funcs{
-		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(), errors.New("the object has been modified"))
-		},
-	})
-	if code, out := g.ask("t", ""); code != http.StatusConflict || !strings.Contains(out["error"].(string), "answered first") || len(g.api.minted) != 0 {
-		t.Fatalf("the race's loser: %d %v minted %v", code, out, g.api.minted)
+// The pod's mark is written with its resource version. A pod that only
+// changed (the kubelet writes its status while it starts) is read again
+// and marked; a mark another replica wrote in between wins, and this
+// request gets no token; a pod that never stops changing is told to ask
+// again.
+func TestJoinIssuerMarkRaces(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// onPatch runs before each patch; it may change the pod as another
+		// writer would, and say to fail this patch with a conflict.
+		onPatch func(g *issuerRig, p *corev1.Pod, try int) bool
+		code    int
+		want    string
+		minted  int
+		tries   int
+	}{
+		{"the kubelet wrote the pod's status in between", func(g *issuerRig, p *corev1.Pod, try int) bool {
+			if try == 1 {
+				fresh := g.pod(p.Namespace, p.Name)
+				fresh.Status.Phase = corev1.PodPending
+				if err := g.cl.Status().Update(context.Background(), fresh); err != nil {
+					g.t.Fatal(err)
+				}
+			}
+			return false
+		}, http.StatusOK, "", 1, 2},
+		{"another replica marked it first", func(g *issuerRig, p *corev1.Pod, try int) bool {
+			if try == 1 {
+				fresh := g.pod(p.Namespace, p.Name)
+				fresh.Annotations = map[string]string{AnnotationJoinIssued: g.now.UTC().Format(time.RFC3339)}
+				if err := g.cl.Update(context.Background(), fresh); err != nil {
+					g.t.Fatal(err)
+				}
+			}
+			return false
+		}, http.StatusConflict, "got its join token", 0, 1},
+		{"it never stops changing", func(*issuerRig, *corev1.Pod, int) bool { return true },
+			http.StatusServiceUnavailable, "kept changing", 0, markTries},
+		{"replaced by a new pod of the same name", func(g *issuerRig, p *corev1.Pod, try int) bool {
+			fresh := g.pod(p.Namespace, p.Name)
+			if err := g.cl.Delete(context.Background(), fresh); err != nil {
+				g.t.Fatal(err)
+			}
+			again := joiningPod(p.Name, p.Namespace, "m1")
+			again.UID = "uid-the-next-pod"
+			if err := g.cl.Create(context.Background(), again); err != nil {
+				g.t.Fatal(err)
+			}
+			return true
+		}, http.StatusForbidden, "was replaced", 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := joiningPod("prod-general-aaaaa", testWorkerNS, "m1")
+			g := newIssuerRig(t, bootstrapped(testCluster()), p, node(p.Name, v1.RoleWorker, "general", "z-a"))
+			g.rev.tokens["t"] = podToken(p, "m1")
+			tries := 0
+			g.h.Client = interceptor.NewClient(g.cl, interceptor.Funcs{
+				Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if _, ok := obj.(*corev1.Pod); ok && obj.GetAnnotations()[AnnotationJoinIssued] != "" {
+						tries++
+						if tc.onPatch(g, p, tries) {
+							return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(), errors.New("the object has been modified"))
+						}
+					}
+					return c.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			code, out := g.ask("t", "")
+			if code != tc.code || (tc.want != "" && !strings.Contains(out["error"].(string), tc.want)) || len(g.api.minted) != tc.minted || tries != tc.tries {
+				t.Fatalf("got %d %v minted %v after %d marks", code, out, g.api.minted, tries)
+			}
+		})
 	}
 }
 

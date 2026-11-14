@@ -83,6 +83,9 @@ const (
 	// podAskEvery spaces one pod's requests, a client stuck in a loop
 	// included.
 	podAskEvery = 2 * time.Second
+	// markTries bounds the writes of a pod's issued mark that its other
+	// changes can overtake.
+	markTries = 5
 )
 
 // TokenReviewer asks Kubernetes who a token belongs to.
@@ -328,25 +331,43 @@ func (h *JoinIssuer) issue(ctx context.Context, req *http.Request) (JoinGrant, *
 	case joined(&n, pod.Name):
 		return JoinGrant{}, &pod, deny(http.StatusConflict, "node %s already joined with this pod", nodeName)
 	}
-	if at := pod.Annotations[AnnotationJoinIssued]; at != "" {
-		if t, err := time.Parse(time.RFC3339, at); err == nil && now.Before(t.Add(joinTokenLife)) {
-			return JoinGrant{}, &pod, deny(http.StatusConflict, "pod %s got its join token at %s; it is good until %s", podName, at, t.Add(joinTokenLife).Format(time.RFC3339))
-		}
-	}
-
 	// Mark the pod first, with its resource version: of two requests for
-	// one pod (two replicas, or a retry), only one write lands.
-	marked := pod.DeepCopy()
-	if marked.Annotations == nil {
-		marked.Annotations = map[string]string{}
-	}
-	marked.Annotations[AnnotationJoinIssued] = now.UTC().Format(time.RFC3339)
-	delete(marked.Annotations, AnnotationJoinRefused)
-	if err := h.Client.Patch(ctx, marked, client.MergeFromWithOptions(&pod, client.MergeFromWithOptimisticLock{})); err != nil {
-		if apierrors.IsConflict(err) {
-			return JoinGrant{}, &pod, deny(http.StatusConflict, "another join request for pod %s was answered first", podName)
+	// one pod (two replicas, or a retry), only one write lands. A starting
+	// pod changes often (the kubelet writes its status), so a conflict
+	// reads the pod again: a mark another request wrote in between wins,
+	// anything else is tried again.
+	var marked *corev1.Pod
+	for try := 1; ; try++ {
+		if at := pod.Annotations[AnnotationJoinIssued]; at != "" {
+			if t, err := time.Parse(time.RFC3339, at); err == nil && now.Before(t.Add(joinTokenLife)) {
+				return JoinGrant{}, &pod, deny(http.StatusConflict, "pod %s got its join token at %s; it is good until %s", podName, at, t.Add(joinTokenLife).Format(time.RFC3339))
+			}
 		}
-		return JoinGrant{}, &pod, retry("marking pod %s: %v", podName, err)
+		m := pod.DeepCopy()
+		if m.Annotations == nil {
+			m.Annotations = map[string]string{}
+		}
+		m.Annotations[AnnotationJoinIssued] = now.UTC().Format(time.RFC3339)
+		delete(m.Annotations, AnnotationJoinRefused)
+		err := h.Client.Patch(ctx, m, client.MergeFromWithOptions(&pod, client.MergeFromWithOptimisticLock{}))
+		if err == nil {
+			marked = m
+			break
+		}
+		if !apierrors.IsConflict(err) {
+			return JoinGrant{}, &pod, retry("marking pod %s: %v", podName, err)
+		}
+		if try == markTries {
+			return JoinGrant{}, &pod, retry("pod %s kept changing while it was marked; ask again", podName)
+		}
+		var fresh corev1.Pod
+		if err := h.Reader.Get(ctx, types.NamespacedName{Namespace: ns, Name: podName}, &fresh); err != nil {
+			return JoinGrant{}, &pod, retry("reading pod %s again: %v", podName, err)
+		}
+		if fresh.UID != pod.UID {
+			return JoinGrant{}, &pod, deny(http.StatusForbidden, "the token is another pod's: pod %s/%s was replaced", ns, podName)
+		}
+		pod = fresh
 	}
 	admin, err := adminToken(ctx, h.Client, &c)
 	if err != nil {
