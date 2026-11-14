@@ -112,6 +112,9 @@ func TestWatchFloorFile(t *testing.T) {
 	waitFor("the new address was never refused", func() bool {
 		return (DialGuard{}).CheckFloor(ap("172.18.0.44:443")) != nil
 	})
+	// WatchFloorFile installs the floor, then calls onChange: wait for the
+	// call too, or the count can be read in between.
+	waitFor("onChange never ran", func() bool { return changes.Load() >= 1 })
 	if changes.Load() != 1 {
 		t.Fatalf("onChange ran %d times", changes.Load())
 	}
