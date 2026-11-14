@@ -856,6 +856,7 @@ jobs:
       - name: Render the chart's pod templates and operator RBAC
         run: |
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
+          scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
           helm template t charts/aerolvm --namespace aerolvm-system \
             --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
             --set 'cluster.workerPools[0].name=general' \
@@ -882,6 +883,7 @@ jobs:
         working-directory: operator
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
+          AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
           AEROLVM_CHART_CRD_UPGRADE: ${{ runner.temp }}/chart-crd-upgrade.yaml
         run: |

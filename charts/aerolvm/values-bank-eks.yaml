@@ -51,6 +51,12 @@ worker:
   # Each team's reserved and used CPU and memory, for the cost split.
   usageMetrics:
     enabled: true
+  # No external-storage mounts in sandboxes: they need the worker pod to
+  # share one process namespace, which would let the internet-facing edge
+  # container read every process's command line. A create with mounts or
+  # platform volumes is refused (501 mounts_unavailable).
+  externalStorage:
+    enabled: false
 
 networkPolicy:
   enabled: true

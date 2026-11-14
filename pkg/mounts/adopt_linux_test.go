@@ -168,6 +168,8 @@ func TestReestablishReplacesAHelperRunningOtherArguments(t *testing.T) {
 	}
 	strayExit := watchExit(stray)
 	t.Cleanup(func() { _ = killMount(stray) })
+	// Adoption finds helpers by their arguments, as the sweep does.
+	waitForArgv(t, stray.Process.Pid, hostPath, strayExit.done)
 	if err := os.MkdirAll(hostPath, 0o700); err != nil {
 		t.Fatal(err)
 	}

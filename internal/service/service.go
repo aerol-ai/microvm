@@ -2086,7 +2086,17 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 			}
 		}
 	}
-	return validateUniqueMountTargets(mounts)
+	if err := validateUniqueMountTargets(mounts); err != nil {
+		return err
+	}
+	// A node that cannot keep a mount where the sandbox is built (a
+	// Kubernetes worker pod with external storage off, F13) refuses here,
+	// before any work. The request itself was valid, so this is the node's
+	// 501, after the caller's 4xx checks above.
+	if len(mounts) > 0 && s.mounts != nil {
+		return s.mounts.Available()
+	}
+	return nil
 }
 
 func validateUniqueMountTargets(mounts []models.MountSpec) error {

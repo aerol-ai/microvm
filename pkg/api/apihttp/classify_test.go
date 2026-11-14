@@ -70,6 +70,7 @@ func TestClassify(t *testing.T) {
 		// The service's refusal matches both sentinels; it keeps its code.
 		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
 		{"mount tool unavailable", missingMountS3, http.StatusNotImplemented, 0, models.ErrorCodeMountToolUnavailable, ErrKindOther},
+		{"external storage off on this node", fmt.Errorf("%w: external storage is off on this Kubernetes worker", mounts.ErrMountsUnavailable), http.StatusNotImplemented, 0, models.ErrorCodeMountsUnavailable, ErrKindOther},
 		// A mount tool that ran and failed (bad bucket, bad credentials) is
 		// the caller's to fix: it stays the 400.
 		{"mount tool failed", errors.New("mount 0 (s3): mount tool exited before the mount was ready: exit status 2 (mount tool output: bucket does not exist)"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
