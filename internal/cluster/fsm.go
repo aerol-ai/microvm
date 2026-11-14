@@ -3267,8 +3267,8 @@ func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
 // unindexDeletedPlacementLocked drops a deleted row from the indexes kept
 // by state.
 func (f *placementFSM) unindexDeletedPlacementLocked(id string) {
-	delete(f.deletingIndex, id)
 	delete(f.moveHandoffs, id)
+	delete(f.deletingIndex, id)
 	if f.orphanedRecoveryIndex != nil {
 		f.orphanedRecoveryIndex.Delete(id)
 	}

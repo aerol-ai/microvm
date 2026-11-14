@@ -399,7 +399,10 @@ func TestResumeLapsedMoveAsksTheLeader(t *testing.T) {
 	if svc.resumeLapsedMove(ctx, "sb-wait") {
 		t.Fatal("started without the leader's answer")
 	}
-	owner.readErr = nil
+	// The leader answers again. A fresh stub, not a write to owner: the
+	// retry already scheduled reads the stub from its own goroutine, and
+	// AttachCluster's lock is what orders the two.
+	svc.AttachCluster(&ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", incarnation: "inc-now"})
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if sb, _ := st.Get(ctx, "sb-wait"); sb.Status == models.SandboxStatusStarted {
