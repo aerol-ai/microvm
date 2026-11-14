@@ -479,23 +479,35 @@ why.
 
 *Cluster mode.*
 
-**What it means.** For over 10 minutes, the operator could not give new
-nodes their join tokens. Kubernetes' TokenReview refused the pod's service
-account token, or the operator could not make a token. New nodes wait in
-Pending or Joining.
+**What it means.** For over 10 minutes, the operator kept refusing new pods
+their join tokens, or could not make them. A new pod shows the operator a
+token Kubernetes made for it; the operator checks it with TokenReview, then
+checks the pod is the AerolVM node it says and runs on the machine the token
+names. A pod that fails a check gets no token. A token the servers could not
+make (no Raft leader) counts too. New nodes wait in Joining, their `setup`
+container failing.
 
 **Check.**
 
 - `kubectl describe aerolnode <name>`: the condition `IdentityDenied` says
-  why.
-- The operator's log.
+  why the operator refused that node's pod.
+- The operator's log: each refusal, with the caller and the reason. A
+  refusal with no pod named means a token Kubernetes did not vouch for:
+  something other than an AerolVM pod is asking.
+- `aerolvm_operator_join_requests_total` by `result`: `issued`, `refused`
+  or `retry`.
 
 **Fix.**
 
-- TokenReview refused the pod: check that the pod runs with the service
-  account the operator expects, on the machine it says it runs on.
-- The operator cannot reach the servers to make a token: check the network
-  and the operator's admin credential.
+- "the token names no machine": the cluster runs Kubernetes older than 1.30.
+  Upgrade it.
+- "wrong machine" or "another pod's": a pod is showing a token that is not
+  its own. Treat it as a security event: find the pod by the caller address
+  in the operator's log.
+- "the servers made no join token": the servers have no leader. See
+  [lost-quorum-recovery.md](lost-quorum-recovery.md).
+- The pod cannot reach the operator: its `setup` log says "the operator did
+  not answer". Check the operator pods and the NetworkPolicies on port 9443.
 
 ## AerolVMNodeCertificateFailing
 

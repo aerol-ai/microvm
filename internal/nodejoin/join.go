@@ -37,6 +37,9 @@ type JoinOptions struct {
 	// (external-CA mode, C23): no token, no CA hash, no key or CSR made
 	// here. The node ID and role are the certificate's.
 	ByCertificate bool
+	// FromOperator gets the URL, token and CA hash from the Kubernetes
+	// operator, for this pod (§15.2), then joins with them. FilesOnly.
+	FromOperator *OperatorJoin
 }
 
 // Joiner runs a join on this machine.
@@ -72,6 +75,9 @@ type JoinResult struct {
 // success keeps the node key, so the join server answers it as a replay
 // and the files come out the same.
 func (j *Joiner) Run(ctx context.Context, o JoinOptions) (JoinResult, error) {
+	if o.FromOperator != nil {
+		return j.runFromOperator(ctx, o)
+	}
 	if o.ByCertificate {
 		return j.runByCert(ctx, o)
 	}

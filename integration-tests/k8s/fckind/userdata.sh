@@ -408,7 +408,7 @@ proof_externalca() {
   say "nodes that waited for their certificate (events): $waited"
   local joins tokvols
   joins=$($kk get secrets -A --no-headers 2>/dev/null | awk '$2 ~ /-join$/' | wc -l)
-  tokvols=$({ $kc get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; $kw get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; } 2>/dev/null | grep -cx join)
+  tokvols=$({ $kc get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; $kw get pods -o jsonpath='{range .items[*]}{range .spec.volumes[*]}{.name}{"\n"}{end}{end}'; } 2>/dev/null | grep -cxE 'join|join-identity')
   [ "$joins" -eq 0 ] && [ "$tokvols" -eq 0 ] && ok "no join token: no -join Secret, no pod with a join volume" || bad "join tokens: $joins Secrets, $tokvols pod volumes"
   local s0=aerolvm-server-0
   say "server 0 TLS dir: $($kc exec $s0 -c agent -- ls /var/run/aerolvm-tls 2>&1 | tr '\n' ' ')"

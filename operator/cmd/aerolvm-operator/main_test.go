@@ -37,6 +37,14 @@ func TestParse(t *testing.T) {
 	if _, err := parse([]string{"--nope"}); err == nil {
 		t.Fatal("unknown flag accepted")
 	}
+	// A joining pod's CA is the webhook certificate's, unless named.
+	o, err = parse([]string{"--namespace", "a", "--webhook-cert-dir", "/certs", "--join-url", "https://op.a.svc/v1/join-token"})
+	if err != nil || o.joinCAFile != "/certs/ca.crt" || o.joinURL != "https://op.a.svc/v1/join-token" {
+		t.Fatalf("join flags = %+v %v", o, err)
+	}
+	if o, _ = parse([]string{"--namespace", "a", "--join-ca-file", "/x/ca.pem"}); o.joinCAFile != "/x/ca.pem" {
+		t.Fatalf("join-ca-file = %q", o.joinCAFile)
+	}
 	if s := newScheme(); !s.IsGroupRegistered("aerolvm.io") {
 		t.Fatal("scheme lacks the aerolvm.io group")
 	}
