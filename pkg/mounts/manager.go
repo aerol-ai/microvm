@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +29,26 @@ type Config struct {
 	RootDir     string        // /var/lib/sandboxd/mounts
 	CredDir     string        // /run/sandboxd
 	WaitTimeout time.Duration // how long to wait for a mount to become ready
+	// CgroupRoot is the cgroup directory the helpers' own cgroup
+	// (helperCgroupName) is made in. Empty: the cgroup v2 root, as on a VM.
+	// In a Kubernetes worker pod it is the runtime container's sandboxes
+	// group (SB_HOST_PROCESS_CGROUP_PARENT): inside the pod's box, and
+	// outside the agent container, whose restart would otherwise end every
+	// helper. At the cgroup v2 root a privileged pod's helpers ran at the
+	// machine's root, outside the pod and past its end (eng review OV-E2).
+	CgroupRoot string
+	// RuntimePIDFile names a file holding the pid of a process in the mount
+	// namespace that builds sandboxes: the worker pod's runtime container.
+	// With it set, MountAll answers only once every mount is visible there
+	// (checkVisible, F13). Empty on a VM, where sandboxd and the runtime
+	// share one mount namespace.
+	RuntimePIDFile string
+	// Unavailable, when set, says why this node cannot serve external
+	// storage (a Kubernetes worker pod with it off, see
+	// pkg/daemon.mountsOffReason). Every mount set is then refused with
+	// ErrMountsUnavailable before anything starts: served anyway, the
+	// sandbox would write to local disk instead of the store.
+	Unavailable string
 }
 
 // Manager owns mount processes for every active sandbox.
@@ -49,6 +70,11 @@ type Manager struct {
 
 	// cgroup is where helpers start so they outlive sandboxd (cgroup.go).
 	cgroup *helperCgroup
+
+	// runtimePIDFile is Config.RuntimePIDFile (visible.go).
+	runtimePIDFile string
+	// unavailable is Config.Unavailable (Available).
+	unavailable string
 }
 
 type mountState struct {
@@ -84,6 +110,13 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	if !filepath.IsAbs(cfg.CredDir) {
 		return nil, fmt.Errorf("credentials dir must be absolute: %q", cfg.CredDir)
 	}
+	if cfg.RuntimePIDFile != "" && !filepath.IsAbs(cfg.RuntimePIDFile) {
+		return nil, fmt.Errorf("runtime pid file must be absolute: %q", cfg.RuntimePIDFile)
+	}
+	cgroupRoot := helperCgroupRoot
+	if cfg.CgroupRoot != "" {
+		cgroupRoot = cfg.CgroupRoot
+	}
 	if cfg.WaitTimeout <= 0 {
 		cfg.WaitTimeout = 30 * time.Second
 	}
@@ -104,8 +137,25 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		mounting:    make(map[string]int),
 		sweeping:    make(map[string]chan struct{}),
 		closeCh:     make(chan struct{}),
-		cgroup:      newHelperCgroup(logger, helperCgroupRoot),
+		cgroup:      newHelperCgroup(logger, cgroupRoot),
+
+		runtimePIDFile: cfg.RuntimePIDFile,
+		unavailable:    cfg.Unavailable,
 	}, nil
+}
+
+// ErrMountsUnavailable is a mount this node refuses to serve because its
+// setup could not keep the mount where the sandbox is built
+// (Config.Unavailable). The node's configuration, not the request.
+var ErrMountsUnavailable = errors.New("external storage is not available on this node")
+
+// Available reports whether this node serves external storage, and if not,
+// why. The service asks before a create does any work; mountSet asks again.
+func (m *Manager) Available() error {
+	if m.unavailable == "" {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrMountsUnavailable, m.unavailable)
 }
 
 // Close stops the supervisor. Existing mounts are left in place so an
@@ -139,6 +189,9 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []models.MountSpec, adopt bool) ([]ContainerBind, error) {
 	if len(mounts) == 0 {
 		return nil, nil
+	}
+	if err := m.Available(); err != nil {
+		return nil, err
 	}
 	// sandboxID is a path component for every host dir and bind below. Validate
 	// it here as well as at the create entry: the mount manager must be
@@ -181,6 +234,7 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		helpers = m.listHelperProcesses()
 	}
 
+	var failed error
 	for i, spec := range mounts {
 		var (
 			state *mountState
@@ -197,15 +251,34 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 			state, bind, err = m.mountOne(ctx, sandboxID, i, spec)
 		}
 		if err != nil {
-			// Roll back everything we just established for this sandbox.
-			for _, s := range established {
-				_ = m.tearDownState(s)
-			}
-			_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
-			return nil, fmt.Errorf("mount %d (%s): %w", i, spec.Type, err)
+			failed = fmt.Errorf("mount %d (%s): %w", i, spec.Type, err)
+			break
 		}
 		established = append(established, state)
 		binds = append(binds, bind)
+	}
+	// Every mount must be where the sandbox is built, or the sandbox gets
+	// the empty folder under it (F13). Checked once all are up, adopted
+	// ones too, and the whole set rolled back like any other failure.
+	for i := 0; failed == nil && i < len(binds); i++ {
+		if binds[i].Tmpfs || binds[i].HostPath == "" {
+			continue
+		}
+		if err := m.checkVisible(binds[i].HostPath); err != nil {
+			failed = fmt.Errorf("mount %d (%s): %w", i, mounts[i].Type, err)
+		}
+	}
+	if failed != nil {
+		// Roll back everything we just established for this sandbox.
+		for _, s := range established {
+			_ = m.tearDownState(s)
+		}
+		// The id was validated at entry; the prefix check keeps this
+		// RemoveAll inside rootDir on its own.
+		if dir := filepath.Clean(filepath.Join(m.rootDir, sandboxID)); strings.HasPrefix(dir, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
+			_ = os.RemoveAll(dir)
+		}
+		return nil, failed
 	}
 
 	m.mu.Lock()

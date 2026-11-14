@@ -46,7 +46,7 @@ func TestKubernetesImagePins(t *testing.T) {
 	sha512Hex := regexp.MustCompile(`^[0-9a-f]{128}$`)
 	for _, c := range []struct{ name, hash string }{
 		{"CONTAINERD", "SHA256"}, {"RUNC", "SHA256"}, {"CNI_PLUGINS", "SHA256"}, {"GVISOR", "SHA512"}, {"WORKERD", "SHA256"},
-		{"FIRECRACKER", "SHA256"}, {"FIRECRACKER_KERNEL", "SHA256"},
+		{"FIRECRACKER", "SHA256"}, {"FIRECRACKER_KERNEL", "SHA256"}, {"MOUNTPOINT_S3", "SHA256"},
 	} {
 		version := pins[c.name+"_VERSION"] + pins[c.name+"_RELEASE"]
 		if version == "" {

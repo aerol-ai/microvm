@@ -167,6 +167,18 @@ func TestMountSpecValidateRefusesCredentialsOutsideCredentials(t *testing.T) {
 		{"rclone remote override token", MountSpec{Type: MountTypeRclone, Source: "drive,token=abc:path", Target: "/d"}, "rclone source parameter"},
 		{"rclone remote override pass", MountSpec{Type: MountTypeRclone, Source: "sftp,pass=x:path", Target: "/d"}, "rclone source parameter"},
 		{"rclone key_file_pass", MountSpec{Type: MountTypeRclone, Source: "sftp,key_file_pass=x:path", Target: "/d"}, "rclone source parameter"},
+		// The mount tool's argv is readable by other processes (in a
+		// Kubernetes worker pod with external storage on, every container
+		// in the pod), so extra_args carries no credential in any form.
+		{"s3 extra_args bare key flag", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--key s3cr3tVALUE"}}, `options.extra_args flag "--key"`},
+		{"s3 extra_args env-style secret", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--allow-delete AWS_SECRET_ACCESS_KEY=s3cr3tVALUE"}}, `options.extra_args entry "AWS_SECRET_ACCESS_KEY"`},
+		{"s3 extra_args access key id value", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--allow-delete --profile AKIAIOSFODNN7EXAMPLE"}}, `options "extra_args" word 3 holds an AWS access key id`},
+		{"s3 extra_args url with password", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--endpoint-url=https://me:s3cr3tVALUE@s3.example/x"}}, `options "extra_args" word 1 holds a URL with a user name or password`},
+		{"s3 endpoint with password", MountSpec{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"endpoint": "https://me:s3cr3tVALUE@s3.example"}}, `options "endpoint" word 1 holds a URL`},
+		{"rclone azureblob key", MountSpec{Type: MountTypeRclone, Source: ":azureblob,account=a,key=s3cr3tVALUE:container", Target: "/d"}, `rclone source parameter "key"`},
+		{"rclone sftp key_pem", MountSpec{Type: MountTypeRclone, Source: "sftp,key_pem=s3cr3tVALUE:path", Target: "/d"}, `rclone source parameter "key_pem"`},
+		{"rclone service account json", MountSpec{Type: MountTypeRclone, Source: ":drive,service_account_credentials=s3cr3tVALUE:path", Target: "/d"}, "rclone source parameter"},
+		{"rclone http url with password", MountSpec{Type: MountTypeRclone, Source: "web,url=https\\://me:s3cr3tVALUE@files.example:path", Target: "/d"}, "source holds a URL"},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,6 +192,13 @@ func TestMountSpecValidateRefusesCredentialsOutsideCredentials(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "put it in credentials") {
 				t.Fatalf("error %q must name %s and point at credentials", err, tc.want)
 			}
+			// The refusal is logged and returned: it names where the
+			// credential is, never the credential.
+			for _, secret := range []string{"s3cr3tVALUE", "AKIAIOSFODNN7EXAMPLE"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error %q echoes the credential", err)
+				}
+			}
 		})
 	}
 	if err := (*MountSpec)(nil).ValidateSecretsPlacement(); err == nil {
@@ -192,6 +211,10 @@ func TestMountSpecValidateRefusesCredentialsOutsideCredentials(t *testing.T) {
 		{Type: MountTypeRclone, Source: ":s3,provider=AWS,env_auth=true:bucket", Target: "/d"},
 		{Type: MountTypeRclone, Source: "myremote:bucket", Target: "/d", Options: map[string]string{"vfs_cache_mode": "full"}},
 		{Type: MountTypeS3, Source: "bucket", Target: "/d", Credentials: map[string]string{"access_key_id": "A", "secret_access_key": "B", "session_token": "C"}},
+		// A word that only names a credential, as a flag's value, is not one;
+		// nor is a URL without a user part, or a key's location.
+		{Type: MountTypeS3, Source: "bucket", Target: "/d", Options: map[string]string{"extra_args": "--profile token --endpoint-url https://s3.example/a@b --cache /var/cache"}},
+		{Type: MountTypeRclone, Source: "sftp,key_file=/etc/k,user=me:path", Target: "/d"},
 	}
 	for _, m := range accepted {
 		if err := m.Validate(toolbox); err != nil {
@@ -206,6 +229,8 @@ func TestMountSpecValidateRefusesCredentialsOutsideCredentials(t *testing.T) {
 		"client_secret": true, "sas_url": true, "private-key": true, "api_key": true, "customer-key": true,
 		"sec": false, "region": false, "extra_args": false, "opts": false, "vfs_cache_mode": false, "sse-kms-key-id": false,
 		"expected-bucket-owner": false, "passthrough": false, "bypass": false, "": false, "--": false,
+		"key": true, "--key": true, "account_key": true, "KEY_PEM": true, "service_account_credentials": true, "credentials": true,
+		"key_file": false, "shared_credentials_file": false, "monkey": false, "keyring": false,
 	}
 	for name, want := range names {
 		if got := isMountCredentialName(name); got != want {

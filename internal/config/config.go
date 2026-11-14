@@ -593,15 +593,22 @@ type Config struct {
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
-	PlatformVolumes             PlatformVolumesConfig
-	LogLevel                    string
-	ShutdownTimeout             time.Duration
-	HTTPClientTimeout           time.Duration
-	DockerRuntimeWaitTimeout    time.Duration
-	ToolboxWaitTimeout          time.Duration
-	DockerReadySocketEnabled    bool
-	DockerReadinessPollInitial  time.Duration
-	DockerReadinessPollMax      time.Duration
+	// MountsRuntimePIDFile names a file holding the pid of a process in the
+	// mount namespace that builds sandboxes: in the Kubernetes worker pod,
+	// the runtime container's supervisor writes it. Set, an external mount
+	// is checked visible there before a create answers, and the create fails
+	// otherwise (pkg/mounts, finding F13). Empty on a VM, where sandboxd and
+	// the runtime share one mount namespace. SB_MOUNTS_RUNTIME_PID_FILE.
+	MountsRuntimePIDFile       string
+	PlatformVolumes            PlatformVolumesConfig
+	LogLevel                   string
+	ShutdownTimeout            time.Duration
+	HTTPClientTimeout          time.Duration
+	DockerRuntimeWaitTimeout   time.Duration
+	ToolboxWaitTimeout         time.Duration
+	DockerReadySocketEnabled   bool
+	DockerReadinessPollInitial time.Duration
+	DockerReadinessPollMax     time.Duration
 	// DockerPoolEnabled gates the warm Docker container pool (default off in v1).
 	// SB_DOCKER_POOL_ENABLED.
 	DockerPoolEnabled bool
@@ -2416,6 +2423,7 @@ func load(keyTool bool) (Config, error) {
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
+		MountsRuntimePIDFile:              strings.TrimSpace(os.Getenv("SB_MOUNTS_RUNTIME_PID_FILE")),
 		PlatformVolumes: PlatformVolumesConfig{
 			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
 			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
@@ -2970,6 +2978,9 @@ func load(keyTool bool) (Config, error) {
 		if strings.TrimSpace(os.Getenv("SB_ISOLATE_JAIL_CGROUP_ROOT")) == "" {
 			cfg.IsolateJailCgroupRoot = filepath.Join(cgroupV2Mount, p, "aerolvm-isolate")
 		}
+	}
+	if p := cfg.MountsRuntimePIDFile; p != "" && !filepath.IsAbs(p) {
+		return Config{}, fmt.Errorf("SB_MOUNTS_RUNTIME_PID_FILE must be an absolute path, got %q", p)
 	}
 
 	// Firecracker host-side wiring is opt-in. The flag exists to gate the
