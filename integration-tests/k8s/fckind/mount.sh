@@ -28,7 +28,10 @@ for s in json.load(sys.stdin)["items"]:
   api() { curl -sS -m 300 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
   ex() { api -X POST http://127.0.0.1:$port/v1/sandboxes/$id/toolbox/process/execute \
     -d "$(python3 -c 'import json, sys; print(json.dumps({"command": sys.argv[1]}))' "$1")" | head -c 400; }
-  storelines() { $k exec $pod -c agent -- sh -c 'wc -l < /var/lib/sandboxd/ext-store/log.txt 2>/dev/null || echo 0' 2>/dev/null | tr -d ' \r'; }
+  # The writer makes one file a second: rclone uploads a file 5 s after its
+  # last use, so a file appended to every second never reached the store
+  # while it was written (the first run's 0 lines).
+  storelines() { $k exec $pod -c agent -- sh -c 'ls /var/lib/sandboxd/ext-store 2>/dev/null | grep -c "^log-"' 2>/dev/null | tr -d ' \r'; }
   helper() { $k exec $pod -c agent -- sh -c 'for p in $(pgrep -f "^rclone mount"); do echo "pid $p cgroup $(sed -n "s/^0:://p" /proc/$p/cgroup)"; done' 2>&1 | tr '\n' ' '; }
   say "mount tools in the agent image: $($k exec $pod -c agent -- sh -c 'for t in rclone sshfs mount-s3 fusermount3 mount.nfs; do command -v $t >/dev/null && printf "%s " $t || printf "MISSING-%s " $t; done' 2>&1)"
   $k exec $pod -c agent -- sh -c 'mkdir -p /var/lib/sandboxd/ext-store && echo seed-ok > /var/lib/sandboxd/ext-store/seed.txt'
@@ -43,8 +46,8 @@ for s in json.load(sys.stdin)["items"]:
   fi
   local seed1 s1 s2 s3 seed2 h1 h2
   seed1=$(ex 'cat /mnt/ext/seed.txt')
-  ex 'setsid nohup sh -c "i=0; while true; do i=\$((i+1)); echo \$i >> /mnt/ext/log.txt; sleep 1; done" </dev/null >/dev/null 2>&1 &' >/dev/null
-  sleep 15
+  ex 'setsid nohup sh -c "i=0; while true; do i=\$((i+1)); echo \$i > /mnt/ext/log-\$i; sleep 1; done" </dev/null >/dev/null 2>&1 &' >/dev/null
+  sleep 20
   s1=$(storelines)
   h1=$(helper)
   say "before the agent restart: the sandbox reads the store's seed: $seed1; the store has $s1 lines from it; helper: $h1"
