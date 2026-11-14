@@ -1,11 +1,13 @@
 package kubeapi
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/url"
+	"slices"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -46,7 +48,11 @@ type WarmDepthWriter interface {
 
 // WarmDepths is the set the stored warm pools ask for. A pool whose
 // template is missing or would not create, or runs its own command (a
-// parked slot runs the image's), parks nothing.
+// parked slot runs the image's), parks nothing. A template with no
+// runtimeClassName is parked in each worker's default runtime
+// (cluster.KubeWarmDefaultRuntime). The set is always one the cluster
+// accepts: before, such a template gave an entry with no runtime, the
+// cluster refused the whole set, and no pool got a ready sandbox.
 func WarmDepths(ctx context.Context, store WarmDepthStore, now time.Time) ([]cluster.KubeWarmDepth, error) {
 	pools, err := listItems(ctx, store, SandboxWarmPoolsResource)
 	if err != nil {
@@ -81,12 +87,24 @@ func WarmDepths(ctx context.Context, store WarmDepthStore, now time.Time) ([]clu
 		if err != nil || len(req.ContainerCommand) > 0 {
 			continue
 		}
-		key := [2]string{req.Image, req.Runtime}
+		runtime := req.Runtime
+		if runtime == "" {
+			runtime = cluster.KubeWarmDefaultRuntime
+		}
+		key := [2]string{req.Image, runtime}
 		sums[key] = min(sums[key]+int(replicas), models.MaxWarmPoolDepth)
 	}
 	out := make([]cluster.KubeWarmDepth, 0, len(sums))
 	for k, d := range sums {
 		out = append(out, cluster.KubeWarmDepth{Image: k[0], Runtime: k[1], Depth: d})
+	}
+	// More image and runtime pairs than the cluster keeps: the first in
+	// the set's order are kept, rather than none at all.
+	if len(out) > cluster.MaxKubeWarmDepths {
+		slices.SortFunc(out, func(a, b cluster.KubeWarmDepth) int {
+			return cmp.Or(cmp.Compare(a.Image, b.Image), cmp.Compare(a.Runtime, b.Runtime))
+		})
+		out = out[:cluster.MaxKubeWarmDepths]
 	}
 	return cluster.NormalizeKubeWarmDepths(out)
 }
