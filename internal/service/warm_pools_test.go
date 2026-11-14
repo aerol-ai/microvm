@@ -557,6 +557,35 @@ func TestWarmPoolOnImageChangeAndOutdated(t *testing.T) {
 // The agent-sandbox API's depths (C17) reach only the pool of their
 // runtime, and add to an operator entry for the same image (both are per
 // worker).
+// A template with no runtimeClassName is parked by every worker in its own
+// default runtime: whichever runtime a pool is registered under, it takes
+// the default entry, adding to an entry of the same image.
+func TestConfiguredForParksTheDefaultRuntimeEntry(t *testing.T) {
+	kube := []cluster.KubeWarmDepth{
+		{Image: "busybox:1.36", Runtime: cluster.KubeWarmDefaultRuntime, Depth: 1},
+		{Image: "python:3.12", Runtime: cluster.KubeWarmDefaultRuntime, Depth: 2},
+		{Image: "python:3.12", Runtime: "gvisor", Depth: 3},
+	}
+	for _, runtime := range []string{"gvisor", "docker"} {
+		got := map[string]dockerpool.Configured{}
+		for _, c := range configuredFor(runtime, nil, kube) {
+			got[c.Key.Image] = c
+		}
+		want := map[string]int{"busybox:1.36": 1, "python:3.12": 2}
+		if runtime == "gvisor" {
+			want["python:3.12"] = 5
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: %+v, want depths %v", runtime, got, want)
+		}
+		for img, d := range want {
+			if got[img].Depth != d || got[img].Key.Runtime != runtime {
+				t.Errorf("%s: %s = %+v, want depth %d in %s", runtime, img, got[img], d, runtime)
+			}
+		}
+	}
+}
+
 func TestConfiguredForAddsTheAgentSandboxDepths(t *testing.T) {
 	entries := []models.WarmPool{
 		{Image: "python:3.12", Depth: 2},

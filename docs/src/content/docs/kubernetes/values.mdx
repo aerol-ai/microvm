@@ -24,7 +24,7 @@ These shape every worker pod: the single-mode pod, and every cluster-mode worker
 | `worker.runtime.resources` | The sandboxes' budget. Every sandbox runs inside it, with a reserve kept for containerd. Keep requests equal to limits. In cluster mode, the operator sizes it to the machine instead. | 2 CPUs, 4 GiB |
 | `worker.agent.resources` | The AerolVM server container. | 0.5 CPU, 1 GiB |
 | `worker.egress.resources` | The hostname-filter container. | 0.1 CPU, 128 MiB |
-| `worker.defaultRuntime` | The isolation a create gets when it names none: `docker` (runc) or `gvisor`. | runc |
+| `worker.defaultRuntime` | The isolation a create gets when it names none: `docker` (runc) or `gvisor`. It is also the runtime [kubectl warm pools](/kubernetes/kubectl/#templates-warm-pools-and-claims) keep sandboxes ready in. | runc |
 | `worker.diskFloorRatio` | New sandboxes are turned away while less than this share of the sandbox disk is free. Keep it well above the share where the kubelet evicts pods (10% free on EKS) when the sandbox disk is the node's own disk. `"0"` turns it off. | `"0.20"` |
 | `worker.blockPrivateByDefault` | Sandboxes cannot reach private addresses unless a create allows them. | `true` |
 | `worker.usageMetrics.enabled` | [Usage per team](/kubernetes/operations/#usage-per-team) on `/v1/metrics`. Owner names become label values. | `true` |

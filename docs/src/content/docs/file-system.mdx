@@ -155,7 +155,7 @@ You get the file's raw bytes. Turn them into text when the file is text.
   </TabItem>
 </Tabs>
 
-If the file does not exist, the call fails with a "not found" error (HTTP 404). Asking for a folder instead of a file also fails.
+If the file does not exist, the call fails with a "not found" error (HTTP 404). Asking for a folder instead of a file also fails. So does a named pipe (a FIFO) or a socket, for reading or writing (HTTP 409): such a path would wait for another program, so it is refused at once.
 
 ## Upload a script and run it
 

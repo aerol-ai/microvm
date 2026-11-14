@@ -869,21 +869,21 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Stream from the file rather than reading it whole: a client that only
 	// wants the head of a multi-GB file (the agent read_file tool reads one
 	// window) must not make toolboxd allocate the entire file in the guest.
-	f, err := os.Open(targetPath)
+	// openFile: a named pipe is refused, never waited on.
+	f, info, err := openFile(targetPath, os.O_RDONLY, 0)
 	if err != nil {
+		var kindErr *fileKindError
 		status := http.StatusInternalServerError
-		if errors.Is(err, os.ErrNotExist) {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
 			status = http.StatusNotFound
+		case errors.As(err, &kindErr):
+			status = http.StatusConflict
 		}
 		writeError(w, status, err.Error())
 		return
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	if info.IsDir() {
 		// Same status and text os.ReadFile produced for a directory.
 		writeError(w, http.StatusInternalServerError, "read "+targetPath+": is a directory")
@@ -899,9 +899,9 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.ServeContent(w, r, filepath.Base(targetPath), info.ModTime(), f)
 		return
 	}
-	// A device, a pipe, or a file whose size the kernel reports as 0 while
-	// it has content (/proc): its length is unknown, so it streams to the
-	// end with no Content-Length and no Range.
+	// A device, or a file whose size the kernel reports as 0 while it has
+	// content (/proc): its length is unknown, so it streams to the end with
+	// no Content-Length and no Range.
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = io.Copy(w, f)
@@ -1001,7 +1001,7 @@ func envMapToSlice(values map[string]string) []string {
 // writeMultipartFile is the plain upload: create or truncate path and copy
 // file into it.
 func writeMultipartFile(path string, file io.Reader) error {
-	tmp, err := os.Create(path)
+	tmp, _, err := openFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
 		return err
 	}

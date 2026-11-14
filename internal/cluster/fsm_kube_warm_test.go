@@ -51,7 +51,7 @@ func TestFSMKubeWarmDepthsReplaceTheSet(t *testing.T) {
 }
 
 func TestFSMKubeWarmDepthsRefusals(t *testing.T) {
-	tooMany := make([]KubeWarmDepth, maxKubeWarmDepths+1)
+	tooMany := make([]KubeWarmDepth, MaxKubeWarmDepths+1)
 	for i := range tooMany {
 		tooMany[i] = KubeWarmDepth{Image: "img-" + strconv.Itoa(i), Runtime: "gvisor", Depth: 1}
 	}

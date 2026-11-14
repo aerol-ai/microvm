@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -85,6 +86,54 @@ func TestWarmDepths(t *testing.T) {
 }
 
 // fakeDepthWriter is the cluster's set, read and replaced.
+// A template with no runtimeClassName, as agent-sandbox's own hello-world
+// has, is parked in each worker's default runtime. Before, its entry had
+// no runtime, the whole set was refused, and the other pools got nothing
+// either.
+func TestWarmDepthsTemplateWithNoRuntimeClass(t *testing.T) {
+	store := &allNamespaces{items: map[string][]any{
+		SandboxTemplatesResource: {
+			warmTemplate("a", "py", "python:3.12", "gvisor"),
+			warmTemplate("a", "hello", "busybox:1.36", ""),
+		},
+		SandboxWarmPoolsResource: {
+			warmPool("a", "good", "py", 2),
+			warmPool("a", "hello", "hello", 1),
+		},
+	}}
+	got, err := WarmDepths(context.Background(), store, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []cluster.KubeWarmDepth{
+		{Image: "busybox:1.36", Runtime: cluster.KubeWarmDefaultRuntime, Depth: 1},
+		{Image: "python:3.12", Runtime: "gvisor", Depth: 2},
+	}
+	if !equalDepths(got, want) {
+		t.Fatalf("depths = %+v, want %+v", got, want)
+	}
+	w := &fakeDepthWriter{}
+	if wrote, err := SyncWarmDepths(context.Background(), store, w, time.Now()); err != nil || !wrote || !equalDepths(w.held, want) {
+		t.Fatalf("sync: wrote %v, held %+v, err %v", wrote, w.held, err)
+	}
+}
+
+// More image and runtime pairs than the cluster keeps: the first ones are
+// kept, not none.
+func TestWarmDepthsKeepsTheFirstPairsPastTheCap(t *testing.T) {
+	var templates, pools []any
+	for i := range cluster.MaxKubeWarmDepths + 10 {
+		name := fmt.Sprintf("t%03d", i)
+		templates = append(templates, warmTemplate("a", name, "img-"+name+":1", "gvisor"))
+		pools = append(pools, warmPool("a", name, name, 1))
+	}
+	store := &allNamespaces{items: map[string][]any{SandboxTemplatesResource: templates, SandboxWarmPoolsResource: pools}}
+	got, err := WarmDepths(context.Background(), store, time.Now())
+	if err != nil || len(got) != cluster.MaxKubeWarmDepths || got[0].Image != "img-t000:1" || got[len(got)-1].Image != "img-t255:1" {
+		t.Fatalf("got %d entries (first %+v), err %v", len(got), got[:min(1, len(got))], err)
+	}
+}
+
 type fakeDepthWriter struct {
 	mu       sync.Mutex
 	held     []cluster.KubeWarmDepth
