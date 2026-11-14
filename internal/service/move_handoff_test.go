@@ -318,9 +318,91 @@ func TestResumeMovedInAtAgentStart(t *testing.T) {
 			t.Fatal("the import of a move that never happened was not dropped")
 		}
 	})
+	t.Run("a Firecracker row moved here: started", func(t *testing.T) {
+		cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		src, srcRT, _ := moveWorker(t, "worker-a", cipher)
+		dst, dstRT, dstC := moveWorker(t, "worker-b", cipher)
+		srcRT.snapshot = []byte("memory")
+		if err := src.store.Create(ctx, &models.Sandbox{ID: "sb-vm", Name: "sb-vm", Image: "alpine", Runtime: models.RuntimeFirecracker,
+			Status: models.SandboxStatusStarted, ContainerID: "vm"}); err != nil {
+			t.Fatal(err)
+		}
+		srv := serveBundles(src, "worker-b")
+		defer srv.Close()
+		dstC.srv = srv
+		if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
+			t.Fatal(got)
+		}
+		if err := dst.ImportMove(ctx, "sb-vm", "worker-a", nil); err != nil {
+			t.Fatal(err)
+		}
+		dstC.owner = "worker-b"
+		fresh := freshAgent(dst, dstC)
+		fresh.resumeMovedIn(ctx)
+		if !waitFor(5*time.Second, func() bool {
+			sb, err := fresh.store.Get(ctx, "sb-vm")
+			return err == nil && sb.Status == models.SandboxStatusStarted
+		}) || dstRT.startCount == 0 {
+			t.Fatal("the imported Firecracker row did not start")
+		}
+	})
+	t.Run("an unanswered read: checked again", func(t *testing.T) {
+		oldRetry := moveResumeRetry
+		moveResumeRetry = 20 * time.Millisecond
+		t.Cleanup(func() { moveResumeRetry = oldRetry })
+		src, dst, _, _, dstC := gvisorMovePair(t)
+		if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
+			t.Fatal(got)
+		}
+		if err := dst.ImportMove(ctx, "sb-g", "worker-a", gvisorRecreate(dstC)); err != nil {
+			t.Fatal(err)
+		}
+		dstC.owner = "worker-b"
+		flaky := &flakyReadCluster{moveStubCluster: dstC, failures: 2}
+		fresh := freshAgent(dst, dstC)
+		fresh.AttachCluster(flaky)
+		fresh.resumeMovedIn(ctx)
+		if !waitFor(5*time.Second, func() bool {
+			sb, err := fresh.store.Get(ctx, "sb-g")
+			return err == nil && sb.Status == models.SandboxStatusStarted
+		}) {
+			t.Fatal("the move was not finished after the leader came back")
+		}
+		if flaky.reads() < 3 {
+			t.Fatalf("reads = %d, want the failed ones tried again", flaky.reads())
+		}
+	})
 	t.Run("no cluster: nothing", func(t *testing.T) {
 		(&Service{}).resumeMovedIn(ctx)
 	})
+}
+
+// flakyReadCluster fails its first failures authoritative reads.
+type flakyReadCluster struct {
+	*moveStubCluster
+	mu       sync.Mutex
+	failures int
+	n        int
+}
+
+func (c *flakyReadCluster) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]cluster.Placement, error) {
+	c.mu.Lock()
+	c.n++
+	fail := c.n <= c.failures
+	c.mu.Unlock()
+	if fail {
+		return nil, errors.New("leader unreachable")
+	}
+	return c.moveStubCluster.AuthoritativePlacementsByIDs(ctx, ids)
+}
+
+func (c *flakyReadCluster) reads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
 }
 
 // A Firecracker row a move imported is held from the stale-ownership sweep

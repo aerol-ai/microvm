@@ -304,6 +304,10 @@ func TestClusterMoveHandoffThroughRaft(t *testing.T) {
 	if err := c.ApplyEncoded(ctx, forwarded); !errors.Is(err, ErrClusterVersion) {
 		t.Fatalf("forwarded abort during the upgrade = %v, want ErrClusterVersion", err)
 	}
+	// The leader's own proposal is refused the same way.
+	if err := c.applyCommand(ctx, abortMoveHandoffCommand(id, "inc-h", c.nodeID)); !errors.Is(err, ErrClusterVersion) {
+		t.Fatalf("the leader's own abort during the upgrade = %v, want ErrClusterVersion", err)
+	}
 	// A reassign that still carries a token lands without the check.
 	if err := swap("tok-stale"); err != nil {
 		t.Fatalf("swap during the upgrade = %v, want applied without the check", err)
