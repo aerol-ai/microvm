@@ -558,15 +558,40 @@ func TestWaitForLeaderAndHealthyForReads(t *testing.T) {
 	c, cleanup := newTestCluster(t, "wait-leader-node", true, nil)
 	defer cleanup()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := c.waitForLeader(ctx, time.Second); !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitForLeader(cancelled) = %v", err)
-	}
-
 	waitForLeader(t, c, 10*time.Second)
 	if !c.HealthyForReads() {
 		t.Fatal("HealthyForReads should be true once leader is elected")
+	}
+	if err := c.waitForLeader(context.Background(), time.Second); err != nil {
+		t.Fatalf("waitForLeader with a leader = %v", err)
+	}
+
+	// The leader is known and the caller has cancelled: the caller's
+	// cancellation wins. This test used to cancel before the election and
+	// fail whenever the one-node cluster had already elected itself.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.waitForLeader(ctx, time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForLeader(cancelled, leader known) = %v, want context.Canceled", err)
+	}
+}
+
+// A node that is not bootstrapped and has no peers never sees a leader:
+// waitForLeader gives up at its deadline, or as soon as its caller does.
+func TestWaitForLeaderWithoutALeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	c, cleanup := newTestCluster(t, "wait-leader-alone", false, nil)
+	defer cleanup()
+
+	if err := c.waitForLeader(context.Background(), 150*time.Millisecond); !errors.Is(err, ErrNoLeader) {
+		t.Fatalf("waitForLeader(no leader) = %v, want ErrNoLeader", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := c.waitForLeader(ctx, 10*time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForLeader(caller gives up) = %v, want context.DeadlineExceeded", err)
 	}
 }
 
