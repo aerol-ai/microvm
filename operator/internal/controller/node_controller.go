@@ -134,6 +134,9 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if pod != nil && podEnded(pod) {
+		return r.retireEndedPod(ctx, &n, pod)
+	}
 
 	if n.Spec.Role == v1.RoleServer {
 		if res, done, err := r.maintenance(ctx, &c, &n, pod); done || err != nil {
@@ -667,6 +670,49 @@ func (r *NodeReconciler) lost(ctx context.Context, n *v1.AerolNode, api AerolAPI
 	_ = client.IgnoreNotFound(r.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: JoinSecret(n.Name), Namespace: r.podNamespace(n.Spec.Role)}}))
 	r.setState(n, v1.StateRemoved, "its pod ended; replaced")
 	return ctrl.Result{Requeue: true}, nil
+}
+
+// podEnded reports a pod that will never run again: Failed or Succeeded.
+// A pod the kubelet evicted (disk or memory pressure), or stopped in a
+// machine's graceful shutdown, stays in the API this way until the pod
+// garbage collector reaches it, which by default keeps 12,500 of them.
+// Its agent is never ready again, so observe alone would call it Joining
+// forever while it held its slot.
+func podEnded(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// retireEndedPod deletes a pod that ended for good, so the node goes on as
+// if its pod were gone:
+//
+//   - a server keeps its name and its disk, so its next pod (createPod, on
+//     the next pass) is the same Raft member with the same log, as after a
+//     lost pod or a maintenance swap: membership does not change;
+//   - a decommissioning worker's decommission goes on without a pod;
+//   - any other gateway or worker is lost: the dead-owner failover takes
+//     its sandboxes, it leaves the cluster, and the cluster controller makes
+//     a replacement with a new identity (lost).
+func (r *NodeReconciler) retireEndedPod(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod) (ctrl.Result, error) {
+	why := "its pod ended: " + string(pod.Status.Phase)
+	if pod.Status.Reason != "" {
+		why += " (" + pod.Status.Reason + ")"
+	}
+	switch {
+	case n.Spec.Role == v1.RoleServer:
+		r.setState(n, v1.StateRestarting, why+"; making it again with its volume")
+	case n.Annotations[v1.AnnotationDecommission] == "true":
+	case n.Status.State != v1.StateDead && n.Status.State != v1.StateSuspect:
+		// Counted here, not in lost: Suspect keeps lost from counting it
+		// again.
+		if n.Spec.Role == v1.RoleWorker {
+			workerPodsLost.Inc()
+		}
+		r.setState(n, v1.StateSuspect, why)
+	}
+	if err := r.endPod(ctx, n, pod, why); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 // endPod deletes a pod the operator gave up on; the node is then lost.

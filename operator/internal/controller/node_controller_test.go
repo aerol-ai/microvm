@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -751,4 +752,146 @@ func TestNodePendingSaysWhy(t *testing.T) {
 	if got := waitingForMachine(long); len(got) > 300 || !strings.HasSuffix(got, "...") {
 		t.Fatalf("a long message is not cut: %d chars", len(got))
 	}
+}
+
+// endPodPhase marks p ended (Failed or Succeeded) with reason, as the
+// kubelet leaves an evicted or shut-down pod.
+func (g *nodeRig) endPodPhase(p *corev1.Pod, phase corev1.PodPhase, reason string) {
+	g.t.Helper()
+	p.Status.Phase, p.Status.Reason = phase, reason
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: AgentContainer, Ready: false,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "Error"}}}}
+	if err := g.cl.Status().Update(context.Background(), p); err != nil {
+		g.t.Fatal(err)
+	}
+}
+
+// A pod that ended for good (evicted, or stopped by a machine's shutdown)
+// is never ready again. It must not hold its node's slot as Joining
+// forever (review R2): a gateway or worker is lost and replaced, a server
+// gets a new pod with the same name and volume, and a decommission goes on
+// without it.
+func TestTerminalPodRetires(t *testing.T) {
+	for _, tc := range []struct {
+		name, node, role, pool string
+		phase                  corev1.PodPhase
+		reason                 string
+		decommission           bool
+	}{
+		{name: "evicted worker", node: "prod-general-term1", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Evicted"},
+		{name: "worker stopped by its machine's shutdown", node: "prod-general-term2", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Terminated"},
+		{name: "completed gateway", node: "prod-gateway-term3", role: v1.RoleGateway, phase: corev1.PodSucceeded},
+		{name: "evicted server", node: "prod-server-1", role: v1.RoleServer, phase: corev1.PodFailed, reason: "Evicted"},
+		{name: "evicted decommissioning worker", node: "prod-general-term4", role: v1.RoleWorker, pool: "general", phase: corev1.PodFailed, reason: "Evicted", decommission: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := node(tc.node, tc.role, tc.pool, "z-a")
+			g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+			ns := g.r.podNamespace(tc.role)
+			g.reconcile(tc.node)
+			p := g.pod(ns, tc.node)
+			if p == nil {
+				t.Fatal("no pod")
+			}
+			g.running(p, "m1", true)
+			g.api.nodes[tc.node] = aerolapi.Node{Alive: true}
+			g.reconcile(tc.node)
+			if tc.decommission {
+				// The leader refuses to evacuate a node gossip sees dead
+				// (ErrNodeNotAlive): only the dead-owner failover can.
+				g.api.evacuate = func(id string, _ aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+					if n, _ := g.api.GetNode(context.Background(), id); !n.Alive {
+						return aerolapi.EvacuateResult{}, &aerolapi.Error{Status: http.StatusConflict, Reason: "node is not alive"}
+					}
+					return aerolapi.EvacuateResult{RemainingMovable: 1}, nil
+				}
+				got := g.node(tc.node)
+				got.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+				if err := g.cl.Update(context.Background(), got); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lostBefore := testutilCounter(workerPodsLost)
+			g.endPodPhase(g.pod(ns, tc.node), tc.phase, tc.reason)
+			g.reconcile(tc.node)
+			if g.pod(ns, tc.node) != nil {
+				t.Fatal("an ended pod was kept")
+			}
+			// Its machine's gossip sees it gone.
+			g.api.nodes[tc.node] = aerolapi.Node{Alive: false}
+			got := g.node(tc.node)
+			switch {
+			case tc.role == v1.RoleServer:
+				if got.Status.State != v1.StateRestarting || !strings.Contains(got.Status.Reason, "pod ended: Failed (Evicted)") {
+					t.Fatalf("server state %s (%s)", got.Status.State, got.Status.Reason)
+				}
+				g.reconcile(tc.node)
+				again := g.pod(ns, tc.node)
+				if again == nil {
+					t.Fatal("the server got no new pod")
+				}
+				if !podMounts(again, PVCName(tc.node)) {
+					t.Fatal("the server's new pod lost its volume")
+				}
+				if len(g.api.deleted) != 0 || len(g.api.gone) != 0 {
+					t.Fatalf("a server with its disk left the cluster: deleted %v gone %v", g.api.deleted, g.api.gone)
+				}
+				return
+			case tc.decommission:
+				for range 3 {
+					g.reconcile(tc.node)
+				}
+				if got := g.node(tc.node); got != nil && got.Status.State != v1.StateRemoved {
+					t.Fatalf("the decommission stopped at %s (%s)", got.Status.State, got.Status.Reason)
+				}
+				return
+			}
+			if got.Status.State != v1.StateSuspect {
+				t.Fatalf("state %s (%s)", got.Status.State, got.Status.Reason)
+			}
+			for range 3 {
+				g.reconcile(tc.node)
+			}
+			if got := g.node(tc.node); got != nil {
+				t.Fatalf("the node was not removed for a replacement: %s (%s)", got.Status.State, got.Status.Reason)
+			}
+			if len(g.api.deleted) != 1 {
+				t.Fatalf("left the cluster %v times", g.api.deleted)
+			}
+			want := 0.0
+			if tc.role == v1.RoleWorker {
+				want = 1
+			}
+			if d := testutilCounter(workerPodsLost) - lostBefore; d != want {
+				t.Fatalf("lost workers counted %v times, want %v", d, want)
+			}
+		})
+	}
+}
+
+// An agent that is not ready in a running pod is a restart, not an end:
+// the pod stays.
+func TestUnreadyRunningPodIsNotRetired(t *testing.T) {
+	n := node("prod-general-unready", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	g.reconcile(n.Name)
+	g.running(g.pod(testWorkerNS, n.Name), "m1", false)
+	for range 3 {
+		g.reconcile(n.Name)
+	}
+	if g.pod(testWorkerNS, n.Name) == nil {
+		t.Fatal("a running pod whose agent is not ready yet was deleted")
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateJoining {
+		t.Fatalf("state %s", got.Status.State)
+	}
+}
+
+func podMounts(p *corev1.Pod, claim string) bool {
+	for _, v := range p.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
+			return true
+		}
+	}
+	return false
 }
