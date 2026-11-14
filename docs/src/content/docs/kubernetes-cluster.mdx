@@ -295,6 +295,16 @@ A machine that dies without warning is different: no move is possible. Sandboxes
 
 Change `cluster.version` and run `helm upgrade` (or edit the `AerolCluster` object, for example from Argo CD). The operator upgrades the cluster in AerolVM's own order: servers one at a time with the leader last, then gateways, then workers in batches. On each worker it swaps the AerolVM server in place; **sandboxes keep running**.
 
+`helm upgrade` also updates AerolVM's two CRDs (`AerolCluster` and `AerolNode`). Helm itself installs a chart's CRDs only once, on the first install, so the chart runs a short Job first that updates them. That Job may update those two CRDs and nothing else, and it is removed when it is done. A `helm rollback` keeps the newer CRDs: their new fields do no harm to an older operator.
+
+If someone else manages your CRDs, set `cluster.operator.upgradeCRDs: false` and apply the chart's CRDs yourself before each upgrade:
+
+```bash
+helm show crds charts/aerolvm | kubectl apply --server-side -f -
+```
+
+Argo CD applies the chart's CRDs on every sync by itself.
+
 Watch it with `aerolvm upgrade status`, or `kubectl get aerolcluster`. To roll back, set the version back. `aerolvm upgrade apply` and `aerolvm upgrade rollback` refuse here, so the version has one owner; `status`, `stop`, `resume` and `finalize` work as usual.
 
 ### Argo CD
@@ -438,6 +448,7 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.externalCA` | `issuerRef` (`kind`, `name`): every node's certificate comes from your issuer through cert-manager, with no CA key in the cluster and no join tokens. Set it before you install. See [Use your own certificate authority](#use-your-own-certificate-authority). | none: join tokens |
 | `cluster.agentSandboxAPI` | `enabled` serves `kubectl get sandboxes` and the agent-sandbox kinds from the gateways (needs cert-manager); `namespaces` maps a namespace to an owner other than the team of the same name. See [The Kubernetes API](/kubernetes-api/). | off |
 | `cluster.operator.replicas` | Operator pods; one leads at a time. | `2` |
+| `cluster.operator.upgradeCRDs` | Update AerolVM's two CRDs before each `helm upgrade`, with a short Job. Turn it off if someone else manages CRDs. | `true` |
 | `networkPolicy.extraIngressFrom` | Who else may reach a worker pod, as NetworkPolicy peers. | none |
 | `monitoring.prometheusNamespace` | The namespace Prometheus runs in; only it may read the workers' metrics. | `monitoring` |
 

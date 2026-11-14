@@ -21,6 +21,8 @@
 #   R7   lowering the gateway count retires the extra gateway
 #   R6   a removed worker pool is decommissioned, an EKS-managed one within
 #        14 minutes
+#   CRDs helm upgrade brings an older AerolCluster CRD up to the chart's
+#        (the chart's pre-upgrade Job), and the Job removes itself
 #   R14  an orphaned recreate-policy sandbox recovers once a worker has
 #        room; the machine that lost it does not run its copy on when it
 #        wakes (its lease ran out while it was away, R1)
@@ -399,6 +401,33 @@ print(int((p("deadline") - p("startedAt")).total_seconds()), int((p("drainUntil"
     else bad "R6: the removed pool's worker $E is $s"; fi
     say "kept settings after: $($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' | head -c 300)"
   fi
+  ensure
+
+  # ---- CRDs: helm upgrade updates them ----
+  # Helm installs crds/ once; the chart's pre-upgrade Job keeps them up to
+  # date. Take a field out of the AerolCluster CRD, as an older chart left
+  # it, then upgrade with the same values.
+  say "== CRDs: helm upgrade"
+  local crd=aerolclusters.aerolvm.io fld='/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/poolDecommission'
+  hasfld() { $kk get crd "$crd" -o json | jq -e '.spec.versions[0].schema.openAPIV3Schema.properties.status.properties.poolDecommission' >/dev/null 2>&1 && echo yes || echo no; }
+  $kk patch crd "$crd" --type=json -p "[{\"op\":\"remove\",\"path\":\"$fld\"}]" >/dev/null
+  local before after left
+  before=$(hasfld)
+  out=$(helm --kube-context kind-aerolvm-cluster upgrade aerolvm charts/aerolvm -n aerolvm-system --reuse-values --timeout 5m 2>&1 | tail -2 | tr '\n' ' ')
+  after=$(hasfld)
+  left=$($kk get clusterrole,clusterrolebinding -o name 2>/dev/null | grep -c crd-upgrade; $kc get job,configmap,serviceaccount -o name 2>/dev/null | grep -c crd-upgrade)
+  say "helm upgrade: $(head -c 200 <<<"$out"); field before $before, after $after; hook objects left: $(tr '\n' ' ' <<<"$left")"
+  if [ "$before" = no ] && [ "$after" = yes ] && [ "$(tr -d '\n ' <<<"$left")" = 00 ]; then
+    ok "CRDs: helm upgrade restored the AerolCluster CRD's status.poolDecommission, and its hook removed itself"
+  else
+    bad "CRDs: field before $before, after $after, hook objects left $(tr '\n' ' ' <<<"$left")"
+  fi
+  for i in $(seq 1 24); do
+    [ -n "$($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' 2>/dev/null)" ] && break
+    sleep 5
+  done
+  out=$($kc get aerolcluster aerolvm -o jsonpath='{.status.poolDecommission}' 2>/dev/null)
+  [ -n "$out" ] && ok "CRDs: the operator writes the kept pool settings again ($(head -c 120 <<<"$out"))" || bad "CRDs: no pool settings in the status after the upgrade"
   ensure
 
   # ---- R14: an orphan recovers when there is room; R1 on the old machine ----
