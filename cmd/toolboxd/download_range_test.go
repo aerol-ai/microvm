@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"syscall"
+	"strings"
 	"testing"
 	"time"
 )
@@ -86,25 +86,18 @@ func TestDownloadRangeAndHead(t *testing.T) {
 	}
 }
 
-// A file whose length is unknown (a pipe here; a /proc file, whose size
-// reads as 0, alike) streams to the end with no Content-Length.
+// A file whose length is unknown (a /proc file, whose size reads as 0)
+// streams to the end with no Content-Length. A named pipe is refused, not
+// streamed: its open waited for a writer (TestFileRoutesRefuseNamedPipes).
 func TestDownloadUnknownLengthStreams(t *testing.T) {
-	fifo := filepath.Join(t.TempDir(), "pipe")
-	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
-		t.Skip("mkfifo:", err)
+	const proc = "/proc/self/status"
+	if info, err := os.Stat(proc); err != nil || info.Size() != 0 {
+		t.Skip("no /proc file whose size reads as 0 here")
 	}
-	go func() {
-		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
-		if err != nil {
-			return
-		}
-		_, _ = w.Write([]byte("streamed"))
-		_ = w.Close()
-	}()
 	rr := httptest.NewRecorder()
-	authedRoutes(newDaytonaTestServer(t)).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/files/download?path="+url.QueryEscape(fifo), nil))
-	if rr.Code != http.StatusOK || rr.Body.String() != "streamed" || rr.Header().Get("Content-Length") != "" {
-		t.Fatalf("pipe download = %d %q %v", rr.Code, rr.Body.String(), rr.Header())
+	authedRoutes(newDaytonaTestServer(t)).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/files/download?path="+url.QueryEscape(proc), nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "Name:") || rr.Header().Get("Content-Length") != "" {
+		t.Fatalf("/proc download = %d %q %v", rr.Code, rr.Body.String(), rr.Header())
 	}
 	empty := filepath.Join(t.TempDir(), "empty")
 	_ = os.WriteFile(empty, nil, 0o644)

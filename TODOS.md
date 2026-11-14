@@ -860,6 +860,57 @@ the skip.
 
 ---
 
+## `aerolvm apply -f` and a manifest shared with the Kubernetes operator (CLI)
+
+- **What:** `aerolvm apply -f sandbox.yaml`, and an `-o yaml` object shape
+  (`apiVersion`, `kind`, `metadata`, `spec`, `status`) that is the same as the
+  `Sandbox` object AerolVM serves to `kubectl` (`agents.x-k8s.io/v1beta1`,
+  `internal/kubeapi`), so one YAML file works with `aerolvm apply` and
+  `kubectl apply`.
+- **Why deferred:** CEO review of `plans/kubectl-style-cluster-ops.md`
+  (D3, 2026-11-07). The format had to match the CRD shape the Kubernetes v2
+  plan would pick (its Q1: implement `kubernetes-sigs/agent-sandbox` or own
+  CRDs), which was still open on PR #522. Picking a format first risked a
+  rename that breaks saved files.
+- **Status (2026-11-14):** ready to start. The Kubernetes v2 plan picked the
+  agent-sandbox API, and AerolVM serves it (C17 in
+  `plans/kubernetes-v2-architecture.md`, built 2026-11-13). `aerolvm apply`
+  does not exist yet.
+- **Where to start:** `plans/kubectl-style-cluster-ops.md` D12 and §3.3;
+  `cmd/aerolvm/verbs.go` (today's `get` and `create`); `internal/kubeapi`
+  (the `Sandbox` object's shape).
+
+---
+
+## External-CA mode for cluster joins on VMs (security, cluster PKI)
+
+- **What:** `sandboxd init --external-ca` keeps the cluster CA key out of
+  the cluster. A join then waits as a pending CSR until
+  `aerolvm certificate approve <id>` or an outside signer signs it.
+  `aerolvm get csr` lists pending CSRs.
+- **Why deferred:** CEO review of `plans/kubectl-style-cluster-ops.md`
+  (D4, 2026-11-07). The default path (CA key on server nodes, like kubeadm)
+  already makes joining one line, and this mode can be added later without
+  changing it. It would add a pending-CSR record in Raft and a second
+  signing path to the riskiest phase.
+- **Status (2026-11-14):** built for Kubernetes installs only, as C23
+  (`plans/kubernetes-v2-architecture.md` §15.2.1, #1252 to #1258): the
+  bank's issuer signs each pod's certificate through cert-manager, the pod
+  joins with that certificate (`JoinByCert` in
+  `internal/cluster/join_cert.go`), and the CA key never enters the
+  cluster. On VMs it is not built: `sandboxd init --external-ca` works only
+  with `--files-only`, and there is no pending-CSR flow (`aerolvm
+  certificate approve`, `aerolvm get csr`). A VM version can reuse C23's
+  join by certificate instead of a pending CSR in Raft.
+- **Start when:** a customer running on VMs needs the CA key outside the
+  cluster.
+- **Where to start:** `plans/kubectl-style-cluster-ops.md` D5, §4 and §8;
+  `plans/kubernetes-v2-architecture.md` §15.2.1; `cmd/sandboxd/node.go`
+  (`--external-ca`); `internal/cluster/join_cert.go`;
+  `internal/cluster/tls.go` (cert checks and reload).
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
