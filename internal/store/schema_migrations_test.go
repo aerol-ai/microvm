@@ -56,6 +56,19 @@ func legacyFlags() map[int]bool {
 	return flags
 }
 
+// openFlags is what Open records with the production list: every legacy
+// step, and each newer migration that runs at open (n1Safe; a one-way one
+// waits for RunOneWayMigrations).
+func openFlags() map[int]bool {
+	flags := legacyFlags()
+	for _, m := range newerSchemaMigrations {
+		if m.n1Safe {
+			flags[m.number] = true
+		}
+	}
+	return flags
+}
+
 // countingMigration returns a newer migration that creates table and counts
 // how often it ran.
 func countingMigration(number int, n1Safe bool, table string, runs *int) schemaMigration {
@@ -150,7 +163,7 @@ func TestSchemaMigrationsFreshDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	if got, want := appliedOf(t, st.db), legacyFlags(); !maps.Equal(got, want) {
+	if got, want := appliedOf(t, st.db), openFlags(); !maps.Equal(got, want) {
 		t.Fatalf("applied = %v, want %v", got, want)
 	}
 	pending, err := st.PendingOneWayMigrations(context.Background())
@@ -211,7 +224,7 @@ func TestSchemaMigrationsRecordHistoryOnUpgrade(t *testing.T) {
 				t.Fatalf("Open: %v", err)
 			}
 			t.Cleanup(func() { _ = st.Close() })
-			if got, want := appliedOf(t, st.db), legacyFlags(); !maps.Equal(got, want) {
+			if got, want := appliedOf(t, st.db), openFlags(); !maps.Equal(got, want) {
 				t.Fatalf("applied = %v, want %v", got, want)
 			}
 			if tt.check != nil {

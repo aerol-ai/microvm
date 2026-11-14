@@ -30,6 +30,7 @@ type fakeMoverRuntime struct {
 	snapshot []byte
 	imported []byte
 	dropped  int
+	dropErr  error
 }
 
 func (f *fakeMoverRuntime) ExportSandboxSnapshot(_ context.Context, _ string, w io.Writer) error {
@@ -48,6 +49,9 @@ func (f *fakeMoverRuntime) ImportSandboxSnapshot(_ context.Context, _ string, r 
 
 func (f *fakeMoverRuntime) DropImportedSnapshot(context.Context, string) error {
 	f.dropped++
+	if f.dropErr != nil {
+		return f.dropErr
+	}
 	f.imported = nil
 	return nil
 }
@@ -136,7 +140,7 @@ func TestSnapshotMoveBetweenTwoWorkers(t *testing.T) {
 	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
-	if err := dst.ImportMove(ctx, "sb-vm", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-vm", "worker-a", nil); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 	if !bytes.Equal(dstRT.imported, srcRT.snapshot) {
@@ -196,7 +200,7 @@ func TestSnapshotMoveRefusals(t *testing.T) {
 	other, _ := secrets.NewCipher("", filepath.Join(t.TempDir(), "other.key"))
 	dst, dstRT, dstC := moveWorker(t, "worker-b", other)
 	dstC.srv = srv
-	if err := dst.ImportMove(ctx, "sb-vm", "worker-a"); err == nil {
+	if err := dst.ImportMove(ctx, "sb-vm", "worker-a", nil); err == nil {
 		t.Fatal("a bundle sealed with another key was imported")
 	}
 	if _, err := dst.store.Get(ctx, "sb-vm"); err == nil || dst.movesIn.held("sb-vm", time.Now()) || dstRT.dropped == 0 {
@@ -297,7 +301,7 @@ func TestCheckpointMoveBetweenTwoWorkers(t *testing.T) {
 	if !srcRT.stopCheckpointed {
 		t.Fatal("the source's stop did not save the sandbox")
 	}
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatalf("import: %v", err)
 	}
 	if !bytes.Equal(dstRT.imported, srcRT.snapshot) {
@@ -311,11 +315,11 @@ func TestCheckpointMoveBetweenTwoWorkers(t *testing.T) {
 	}
 	// A bundle goes out once: a second pull is refused until a release
 	// names the target again.
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err == nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err == nil {
 		t.Fatal("a second pull of a bundle the source already gave out")
 	}
 	src.moveTargets.set("sb-g", "worker-b")
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatalf("import again: %v", err)
 	}
 	dstC.owner = "worker-b"
@@ -346,7 +350,7 @@ func TestCheckpointMoveFallsBackToItsImage(t *testing.T) {
 	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatal(err)
 	}
 	dstC.owner = "worker-b"
@@ -396,7 +400,7 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {
 		t.Fatalf("release = %q", got)
 	}
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := dst.DropMove(ctx, "sb-g"); err != nil || dstRT.dropped == 0 || dstRT.imported != nil {
@@ -408,7 +412,7 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	// No spec from the leader to rebuild from: the start fails and drops
 	// the checkpoint.
 	src.moveTargets.set("sb-g", "worker-b")
-	if err := dst.ImportMove(ctx, "sb-g", "worker-a"); err != nil {
+	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatal(err)
 	}
 	dstC.owner = "worker-b"

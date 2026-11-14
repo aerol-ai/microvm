@@ -29,10 +29,22 @@ import (
 //
 // A gVisor sandbox moves the same way (C21) where SB_GVISOR_CHECKPOINT_MOVES
 // is on: the source's stop saves it with runsc checkpoint first, and the
-// target, which has no container to start, keeps the bundle's row in memory
-// until the swap and then rebuilds the sandbox as a failover recreate does,
-// from the placement, with the row's identity and the runtime restoring the
-// checkpoint instead of booting (startCheckpointMoved).
+// target, which has no container to start, stores the bundle's row (sealed,
+// in moved_in_rows) until the swap and then rebuilds the sandbox as a
+// failover recreate does, from the placement, with the row's identity and
+// the runtime restoring the checkpoint instead of booting
+// (startCheckpointMoved).
+//
+// What the target took in is durable from the moment it acknowledges the
+// import (review N4): a Firecracker sandbox's stopped row, or a gVisor
+// sandbox's stored row with the leader's recreate inputs. The import also
+// arms a move-in check on this agent (checkMovedIn), and an agent restart
+// arms it again at boot (resumeMovedIn): it starts the sandbox once the
+// placement names this node, or drops the import once the move's time is
+// up, so a leader that dies after the swap, or whose drop fails, leaves
+// nothing stopped or staged for good. Before, the gVisor row lived only in
+// memory, and a restart between the import and the start lost the sandbox
+// while the leader still counted it as moved.
 
 // snapshotMover is a runtime that can carry a stopped sandbox's memory to
 // another worker: the Firecracker driver, and the containerd driver for
@@ -47,12 +59,15 @@ const (
 	moveBundleVersion = 1
 	// statusReasonMovedIn is an imported row's reason until its start.
 	statusReasonMovedIn = "moved"
-	// moveInFenceTTL holds an imported row from the stale-ownership sweep:
-	// the placement names the source until the swap, moments later.
-	moveInFenceTTL = 30 * time.Minute
 	// maxMoveRow bounds the row at the head of a bundle.
 	maxMoveRow = 1 << 20
 )
+
+// defaultMoveInFenceTTL holds an imported row from the stale-ownership
+// sweep: the placement names the source until the swap, moments later.
+// Past it, the move-in check (checkMovedIn) drops an import whose move
+// never happened. A Service's own is moveTimings.inFence.
+const defaultMoveInFenceTTL = 30 * time.Minute
 
 var (
 	// ErrMoveNotForThisNode: a bundle asked for by a node the move does not
@@ -115,30 +130,67 @@ func (m *moveTargets) take(id, peer string) bool {
 	return true
 }
 
-// checkpointRows holds, per gVisor sandbox imported here, the row its
-// bundle carried, until its start after the swap or a drop. It is not
-// stored: until the swap this node does not own the sandbox, and a restart
-// in between ends the move (the leader then sees the start fail).
-type checkpointRows struct {
-	mu   sync.Mutex
-	rows map[string]moveRow
+// movedInRecord is what a gVisor checkpoint move's target stores from its
+// import until the start after the swap: the row the bundle carried and the
+// leader's recreate inputs (nil from a leader from before them), so a
+// restarted agent can rebuild the sandbox itself (resumeMovedIn).
+type movedInRecord struct {
+	Row      moveRow               `json:"row"`
+	Recreate *cluster.MoveRecreate `json:"recreate,omitempty"`
 }
 
-func (c *checkpointRows) put(id string, row moveRow) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.rows == nil {
-		c.rows = make(map[string]moveRow)
+// movedInAAD binds a stored record to its sandbox.
+func movedInAAD(id string) []byte { return []byte("aerolvm-moved-in-v1|" + id) }
+
+// putMovedIn stores id's record, sealed: the row holds the toolbox token.
+func (s *Service) putMovedIn(ctx context.Context, id string, rec movedInRecord) error {
+	if s.cipher == nil {
+		return errors.New("no cluster key to seal the moved row with")
 	}
-	c.rows[id] = row
+	raw, err := json.Marshal(rec)
+	var sealed []byte
+	if err == nil {
+		sealed, err = s.cipher.EncryptWithAAD(raw, movedInAAD(id))
+	}
+	if err == nil {
+		err = s.store.PutMovedInRow(ctx, id, sealed, time.Now())
+	}
+	return err
 }
 
-func (c *checkpointRows) take(id string) (moveRow, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	row, ok := c.rows[id]
-	delete(c.rows, id)
-	return row, ok
+// loadMovedIn is id's stored record. ok is false when there is none; a
+// record that does not open is an error.
+func (s *Service) loadMovedIn(ctx context.Context, id string) (rec movedInRecord, importedAt time.Time, ok bool, err error) {
+	stored, err := s.store.GetMovedInRow(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return movedInRecord{}, time.Time{}, false, nil
+	}
+	if err != nil {
+		return movedInRecord{}, time.Time{}, false, err
+	}
+	if s.cipher == nil {
+		return movedInRecord{}, stored.ImportedAt, true, errors.New("no cluster key to open the moved row with")
+	}
+	raw, err := s.cipher.DecryptWithAAD(stored.Sealed, movedInAAD(id))
+	if err == nil {
+		err = json.Unmarshal(raw, &rec)
+	}
+	if err != nil {
+		return movedInRecord{}, stored.ImportedAt, true, fmt.Errorf("moved row of %s: %w", id, err)
+	}
+	return rec, stored.ImportedAt, true, nil
+}
+
+// movedInHeld reports whether sb, a row a snapshot move imported here, is
+// held from the stale-ownership sweep: the placement names its source until
+// the swap. This process's hold, or for a process that restarted since,
+// the row's own (stopped, moved in, within the move's time).
+func (s *Service) movedInHeld(sb *models.Sandbox, now time.Time) bool {
+	if s.movesIn.held(sb.ID, now) {
+		return true
+	}
+	return sb.Status == models.SandboxStatusStopped && sb.StatusReason == statusReasonMovedIn &&
+		now.Before(sb.UpdatedAt.Add(s.moveTimings.inFence()))
 }
 
 // dropImportEverywhere drops id's import from every runtime that takes
@@ -321,8 +373,10 @@ func readMoveRow(r io.Reader) (moveRow, error) {
 
 // ImportMove pulls id's bundle from source and puts the sandbox in place
 // here, stopped, held from the stale-ownership sweep until the placement
-// names this node. Nothing stays behind when it fails.
-func (s *Service) ImportMove(ctx context.Context, id, source string) (err error) {
+// names this node, durably before it answers: a gVisor sandbox's row is
+// stored with rc, the leader's recreate inputs (N4). Nothing stays behind
+// when it fails.
+func (s *Service) ImportMove(ctx context.Context, id, source string, rc *cluster.MoveRecreate) (err error) {
 	id, source = strings.TrimSpace(id), strings.TrimSpace(source)
 	c := s.Cluster()
 	if c == nil {
@@ -332,8 +386,8 @@ func (s *Service) ImportMove(ctx context.Context, id, source string) (err error)
 	if !ok || strings.TrimSpace(p.OwnerNodeID) != source {
 		return fmt.Errorf("import %s: the placement does not name %s", id, source)
 	}
-	if _, gerr := s.store.Get(ctx, id); gerr == nil {
-		if !s.movesIn.held(id, time.Now()) {
+	if sb, gerr := s.store.Get(ctx, id); gerr == nil {
+		if !s.movedInHeld(sb, time.Now()) {
 			return fmt.Errorf("import %s: this node already has it", id)
 		}
 		// What an earlier import left: start again.
@@ -341,22 +395,33 @@ func (s *Service) ImportMove(ctx context.Context, id, source string) (err error)
 			return derr
 		}
 	}
-	s.movesIn.set(id, time.Now().Add(moveInFenceTTL))
+	if _, gerr := s.store.GetMovedInRow(ctx, id); gerr == nil {
+		// An earlier import of this move, never started: start again.
+		if derr := s.DropMove(ctx, id); derr != nil {
+			return derr
+		}
+	}
+	s.movesIn.set(id, time.Now().Add(s.moveTimings.inFence()))
 	placed := false
 	var mover snapshotMover
 	defer func() {
-		if err != nil {
-			if placed {
-				_ = s.store.Delete(context.Background(), id)
-			}
-			if mover != nil {
-				_ = mover.DropImportedSnapshot(context.Background(), id)
-			} else {
-				// Failed before the row named its runtime.
-				s.dropImportEverywhere(id)
-			}
-			s.movesIn.clear(id)
+		if err == nil {
+			// The leader's start, or its drop, may never come: it can die
+			// after the swap, and its drop is best effort. This agent then
+			// finishes the move itself, without waiting for a restart.
+			s.armMovedInCheck(ctx, id, s.moveTimings.retry())
+			return
 		}
+		if placed {
+			_ = s.store.Delete(context.Background(), id)
+		}
+		if mover != nil {
+			_ = mover.DropImportedSnapshot(context.Background(), id)
+		} else {
+			// Failed before the row named its runtime.
+			s.dropImportEverywhere(id)
+		}
+		s.movesIn.clear(id)
 	}()
 
 	pr, pw := io.Pipe()
@@ -384,8 +449,13 @@ func (s *Service) ImportMove(ctx context.Context, id, source string) (err error)
 		return fmt.Errorf("import %s: %w", id, err)
 	}
 	if s.isCheckpointMovable(&row.Sandbox) {
-		// Rebuilt after the swap (startCheckpointMoved): no row until then.
-		s.movedRows.put(id, row)
+		// Rebuilt after the swap (startCheckpointMoved): no sandbox row
+		// until then, so its bundle's row is stored before this answers.
+		// The leader swaps on that answer; a restart after it finds the row
+		// and finishes the move (resumeMovedIn).
+		if err := s.putMovedIn(ctx, id, movedInRecord{Row: row, Recreate: rc}); err != nil {
+			return fmt.Errorf("import %s: keep its row: %w", id, err)
+		}
 		s.prefetchMovedImage(mover, id, row.Sandbox.Image)
 		return nil
 	}
@@ -421,12 +491,22 @@ func (s *Service) DropMove(ctx context.Context, id string) error {
 	}
 	defer unlock()
 	s.movesIn.clear(id)
-	if row, ok := s.movedRows.take(id); ok {
-		mover, err := s.snapshotMoverFor(&row.Sandbox)
+	rec, _, stored, err := s.loadMovedIn(ctx, id)
+	if stored {
+		// The staged checkpoint goes first: a record left behind by a drop
+		// that failed is dropped again next time.
 		if err != nil {
-			return err
+			// A record that does not open names no runtime.
+			s.dropImportEverywhere(id)
+		} else if mover, merr := s.snapshotMoverFor(&rec.Row.Sandbox); merr != nil {
+			return merr
+		} else if derr := mover.DropImportedSnapshot(ctx, id); derr != nil {
+			return derr
 		}
-		return mover.DropImportedSnapshot(ctx, id)
+		return s.store.DeleteMovedInRow(ctx, id)
+	}
+	if err != nil {
+		return err
 	}
 	sb, err := s.store.Get(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -446,15 +526,32 @@ func (s *Service) DropMove(ctx context.Context, id string) error {
 	return mover.DropImportedSnapshot(ctx, id)
 }
 
-// StartMoved starts id, which moved here, from its memory.
+// StartMoved starts id, which moved here, from its memory. rc is the
+// leader's recreate inputs for a gVisor rebuild; nil uses the ones stored
+// at the import. Retryable: a gVisor sandbox's stored row goes only once it
+// started, and a Firecracker sandbox's row stays stopped here on a failure.
 func (s *Service) StartMoved(ctx context.Context, id string, rc *cluster.MoveRecreate) error {
 	id = strings.TrimSpace(id)
 	if _, err := s.ownedIncarnation(ctx, id); err != nil {
 		return err
 	}
 	s.movesIn.clear(id)
-	if row, ok := s.movedRows.take(id); ok {
-		return s.startCheckpointMoved(ctx, id, row, rc)
+	rec, _, stored, err := s.loadMovedIn(ctx, id)
+	if err != nil {
+		return err
+	}
+	if stored {
+		if rc == nil {
+			rc = rec.Recreate
+		}
+		if err := s.startCheckpointMoved(ctx, id, rec.Row, rc); err != nil {
+			return err
+		}
+		// A row left behind is harmless: a later start (the move-in
+		// check's, or the next agent start's) finds the sandbox already
+		// here, and removes it then.
+		_ = s.store.DeleteMovedInRow(ctx, id)
+		return nil
 	}
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
@@ -464,6 +561,181 @@ func (s *Service) StartMoved(ctx context.Context, id string, rc *cluster.MoveRec
 	_, err = s.startSandboxLocked(ctx, id, startForRestart)
 	return err
 }
+
+// resumeMovedIn finishes, at an agent's start, the moves it took in before
+// a restart (N4): each stored gVisor row and each Firecracker row still
+// stopped as moved in gets its move-in check again (checkMovedIn), and is
+// held from the stale-ownership sweep until the move's time is up.
+func (s *Service) resumeMovedIn(ctx context.Context) {
+	if s.Cluster() == nil {
+		return
+	}
+	pending := map[string]time.Time{}
+	stored, err := s.store.ListMovedInRows(ctx)
+	if err != nil && s.logger != nil {
+		s.logger.Warn("cluster: cannot list the moves taken in before this start", "error", err)
+	}
+	for _, r := range stored {
+		pending[r.SandboxID] = r.ImportedAt
+	}
+	if rows, err := s.store.List(ctx); err == nil {
+		for _, sb := range rows {
+			if sb.Status == models.SandboxStatusStopped && sb.StatusReason == statusReasonMovedIn {
+				pending[sb.ID] = sb.UpdatedAt
+			}
+		}
+	}
+	now := time.Now()
+	for id, at := range pending {
+		if until := at.Add(s.moveTimings.inFence()); now.Before(until) {
+			s.movesIn.set(id, until)
+		}
+		s.armMovedInCheck(ctx, id, 0)
+	}
+}
+
+// moveInChecks is, per sandbox imported here, the generation of its live
+// move-in check. Arming one retires the one before, so a sandbox has at
+// most one, and a re-import never loses its check.
+type moveInChecks struct {
+	mu   sync.Mutex
+	gen  map[string]uint64
+	next uint64
+}
+
+func (m *moveInChecks) arm(id string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen == nil {
+		m.gen = make(map[string]uint64)
+	}
+	m.next++
+	m.gen[id] = m.next
+	return m.next
+}
+
+// live reports whether g is still id's check.
+func (m *moveInChecks) live(id string, g uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gen[id] == g
+}
+
+// done retires id's check g, unless a later one replaced it.
+func (m *moveInChecks) done(id string, g uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gen[id] == g {
+		delete(m.gen, id)
+	}
+}
+
+// moveInCheck is one sandbox's move-in check: the sandbox, and the
+// generation it was armed as.
+type moveInCheck struct {
+	id  string
+	gen uint64
+}
+
+// armMovedInCheck runs id's move-in check after d, in place of any before.
+func (s *Service) armMovedInCheck(ctx context.Context, id string, d time.Duration) {
+	s.scheduleMovedInCheck(context.WithoutCancel(ctx), moveInCheck{id: id, gen: s.moveInChecks.arm(id)}, d)
+}
+
+func (s *Service) scheduleMovedInCheck(ctx context.Context, ck moveInCheck, d time.Duration) {
+	s.moveTimers.after(d, func() { s.checkMovedIn(ctx, ck) })
+}
+
+// movedInPending reports whether id is an import here that has not started,
+// and when its move's time is up: a stored gVisor row, or a Firecracker row
+// still stopped as moved in. Read from the store at every check, so a
+// check sees a re-import, and a start or a drop by anyone.
+func (s *Service) movedInPending(ctx context.Context, id string) (time.Time, bool, error) {
+	ttl := s.moveTimings.inFence()
+	stored, err := s.store.GetMovedInRow(ctx, id)
+	if err == nil {
+		return stored.ImportedAt.Add(ttl), true, nil
+	}
+	var sb *models.Sandbox
+	if errors.Is(err, store.ErrNotFound) {
+		sb, err = s.store.Get(ctx, id)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return sb.UpdatedAt.Add(ttl), sb.Status == models.SandboxStatusStopped && sb.StatusReason == statusReasonMovedIn, nil
+}
+
+// checkMovedIn is one step of a move-in check (N4). The import arms it on
+// a live agent, and resumeMovedIn after a restart: the leader may die after
+// the swap and before its start, and a new leader does not start a sandbox
+// whose placement already names this node; its drop of a move that did not
+// happen is best effort. Once the placement names this node, the check
+// starts the sandbox (StartMoved is idempotent, so racing the leader's own
+// start is safe). Past the move's time, with the placement elsewhere, it
+// drops the import. Otherwise, or on any error, it looks again a retry
+// later. It ends once the import is no longer pending, or a later check
+// replaced it.
+func (s *Service) checkMovedIn(ctx context.Context, ck moveInCheck) {
+	if !s.moveInChecks.live(ck.id, ck.gen) {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, moveInCheckTimeout)
+	defer cancel()
+	if err := s.checkMovedInOnce(rctx, ck); err != nil {
+		if s.logger != nil && !errors.Is(err, errMoveInWaiting) {
+			s.logger.Warn("cluster: a move taken in here is not finished; checking again", "sandbox_id", ck.id, "err", err)
+		}
+		s.scheduleMovedInCheck(ctx, ck, s.moveTimings.retry())
+		return
+	}
+	s.moveInChecks.done(ck.id, ck.gen)
+}
+
+// errMoveInWaiting: the placement still names the source, within the
+// move's time.
+var errMoveInWaiting = errors.New("the placement still names the move's source")
+
+// checkMovedInOnce is checkMovedIn's step: nil once the import is started,
+// dropped, or no longer pending.
+func (s *Service) checkMovedInOnce(ctx context.Context, ck moveInCheck) error {
+	id := ck.id
+	until, pending, err := s.movedInPending(ctx, id)
+	c := s.Cluster()
+	if err != nil || !pending || c == nil {
+		return err
+	}
+	got, err := c.AuthoritativePlacementsByIDs(ctx, []string{id})
+	if err != nil {
+		return fmt.Errorf("read its placement: %w", err)
+	}
+	if p, ok := got[id]; ok && strings.TrimSpace(p.OwnerNodeID) == c.SelfNodeID() {
+		if err := s.StartMoved(ctx, id, nil); err != nil {
+			return fmt.Errorf("start: %w", err)
+		}
+		if s.logger != nil {
+			s.logger.Info("cluster: started a sandbox moved here; the leader's start did not come", "sandbox_id", id)
+		}
+		return nil
+	}
+	if time.Now().Before(until) {
+		return errMoveInWaiting
+	}
+	// The move never happened: its time is up and the placement still
+	// names another node. The source starts its own copy (its fence lapsed
+	// long ago); this one goes.
+	if err := s.DropMove(ctx, id); err != nil {
+		return fmt.Errorf("drop: %w", err)
+	}
+	return nil
+}
+
+// moveInCheckTimeout bounds one checkMovedIn step: a read and a start that
+// may rebuild the sandbox from its checkpoint.
+const moveInCheckTimeout = 5 * time.Minute
 
 // movedIdentityKey carries a moved gVisor sandbox's source row into its
 // recreate here.

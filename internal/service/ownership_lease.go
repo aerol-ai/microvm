@@ -206,6 +206,10 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.ownership.started = true
 	s.ownership.mu.Unlock()
 	s.beginOwnershipLease(time.Now())
+	// The moves a previous process took in but never started (N4).
+	// Independent of the fences below: it holds and starts the target's
+	// rows (movesIn), the fences hold the source's (moves).
+	s.resumeMovedIn(ctx)
 	// The move fences a previous process left in the rows (R11).
 	s.rearmMoveFences(ctx)
 

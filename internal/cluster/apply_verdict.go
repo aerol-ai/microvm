@@ -76,6 +76,11 @@ func ApplyErrorStatus(err error) int {
 		// node's ownership replay could not tell it from a transient fault
 		// and would keep its copy of a deleted sandbox.
 		return http.StatusConflict
+	case errors.Is(err, ErrMoveHandoffMoved), errors.Is(err, ErrMoveHandoffAborted):
+		// Verdicts of a move handoff (fsm_move_handoff.go): the sandbox
+		// moved, or its source took it back. A source must tell "moved"
+		// from a fault, or it would retry a start that is not its own.
+		return http.StatusConflict
 	default:
 		return http.StatusInternalServerError
 	}
@@ -124,6 +129,10 @@ func forwardApplyStatus(status int, message string) error {
 			return fmt.Errorf("%w: %s", ErrPlacementDeleted, message)
 		case strings.Contains(message, ErrSpecVersionConflict.Error()):
 			return fmt.Errorf("%w: %s", ErrSpecVersionConflict, message)
+		case strings.Contains(message, ErrMoveHandoffMoved.Error()):
+			return fmt.Errorf("%w: %s", ErrMoveHandoffMoved, message)
+		case strings.Contains(message, ErrMoveHandoffAborted.Error()):
+			return fmt.Errorf("%w: %s", ErrMoveHandoffAborted, message)
 		}
 	case http.StatusForbidden:
 		// The leader's peer check does not see this node alive in gossip

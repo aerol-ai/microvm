@@ -70,8 +70,15 @@ type schemaMigration struct {
 }
 
 // newerSchemaMigrations lists the migrations added after schema versioning,
-// numbered from legacyMigrationBaseline+1. Empty today.
-var newerSchemaMigrations = []schemaMigration{}
+// numbered from legacyMigrationBaseline+1.
+var newerSchemaMigrations = []schemaMigration{
+	// 13: moved_in_rows (moved_in_rows.go). A new table the previous release
+	// never reads: safe at open.
+	{number: 13, name: "moved_in_rows", n1Safe: true, applyTx: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, createMovedInRowsTable)
+		return err
+	}},
+}
 
 // ErrSchemaFromNewerRelease is Open's error for a database on which a newer
 // sandboxd applied a one-way migration this build does not know.

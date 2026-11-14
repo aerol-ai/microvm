@@ -1619,6 +1619,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
 			return err
 		}
+		if payload, cmd, err = c.admitMoveHandoff(payload, cmd); err != nil {
+			return err
+		}
 		if cmd.Op == opReserve || cmd.Op == opReserveBatch {
 			return c.applyReservationEncodedLocal(ctx, payload, cmd)
 		}
@@ -1671,6 +1674,9 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		return nil
 	}
 	if payload, cmd, err = c.admitSpecVersion(payload, cmd); err != nil {
+		return err
+	}
+	if payload, cmd, err = c.admitMoveHandoff(payload, cmd); err != nil {
 		return err
 	}
 	if cmd.Op == opReserve || cmd.Op == opReserveBatch {
