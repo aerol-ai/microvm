@@ -551,3 +551,55 @@ func TestSurplusGateway(t *testing.T) {
 		}
 	}
 }
+
+// keepPoolDecommission keeps a pool's settings from the spec, keeps a
+// removed pool's while a worker of it is left, and drops it after.
+func TestKeepPoolDecommission(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := testCluster()
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(20 * time.Minute)
+	eks := *c.Spec.WorkerPools[0].DeepCopy()
+	eks.Name, eks.Provisioner = "eks", "eks-managed"
+	c.Spec.WorkerPools = append(c.Spec.WorkerPools, eks)
+	w := func(name, pool string) v1.AerolNode { return *node(name, v1.RoleWorker, pool, "z-a") }
+	nodes := []v1.AerolNode{w("prod-general-a1", "general"), w("prod-eks-a1", "eks"), *node("prod-gateway-a1", v1.RoleGateway, "", "z-a")}
+
+	keepPoolDecommission(c, nodes)
+	names := func() string {
+		var out []string
+		for _, k := range c.Status.PoolDecommission {
+			out = append(out, k.Name+"/"+k.Provisioner)
+		}
+		return strings.Join(out, " ")
+	}
+	if got := names(); got != "eks/eks-managed general/" {
+		t.Fatalf("with both pools in the spec: %q", got)
+	}
+	if d := c.Status.PoolDecommission[1].Decommission.Deadline; d == nil || d.Duration != 20*time.Minute {
+		t.Fatalf("general's deadline = %v, want 20m", d)
+	}
+
+	// Removed from the spec, a worker of it left: kept. The spec's own
+	// pool follows an edit.
+	c.Spec.WorkerPools = c.Spec.WorkerPools[:1]
+	c.Spec.WorkerPools[0].Decommission.Deadline = dur(30 * time.Minute)
+	keepPoolDecommission(c, nodes)
+	if got := names(); got != "eks/eks-managed general/" {
+		t.Fatalf("after removing eks: %q", got)
+	}
+	if d := c.Status.PoolDecommission[1].Decommission.Deadline; d == nil || d.Duration != 30*time.Minute {
+		t.Fatalf("general's deadline after an edit = %v, want 30m", d)
+	}
+
+	// Its last worker gone: dropped.
+	keepPoolDecommission(c, nodes[:1])
+	if got := names(); got != "general/" {
+		t.Fatalf("after the last eks worker left: %q", got)
+	}
+	// No pools at all: nothing kept.
+	c.Spec.WorkerPools = nil
+	keepPoolDecommission(c, nil)
+	if c.Status.PoolDecommission != nil {
+		t.Fatalf("no pools: %+v", c.Status.PoolDecommission)
+	}
+}
