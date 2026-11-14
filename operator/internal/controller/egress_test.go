@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 
 	v1 "github.com/aerol-ai/microvm/operator/api/v1alpha1"
 )
@@ -53,8 +56,13 @@ func TestReadClusterAddresses(t *testing.T) {
 			return errors.New("forbidden")
 		},
 	})
-	if got := readClusterAddresses(context.Background(), denied, denied); len(got.DenyFloor)+len(got.Private) != 0 {
+	if got := readClusterAddresses(context.Background(), denied, denied); len(got.DenyFloor)+len(got.Private) != 0 || got.FloorErr == nil {
 		t.Fatalf("unreadable cluster: %+v", got)
+	}
+	// Half a floor is no floor: the Service without its addresses.
+	half := newFakeClient(t, apiServerObjects()[0])
+	if floor, err := readDenyFloor(context.Background(), half); err == nil || floor != nil || !strings.Contains(err.Error(), "the API server's addresses") {
+		t.Fatalf("half a floor = %v, %v", floor, err)
 	}
 }
 
@@ -175,5 +183,167 @@ func TestNodeWorkerPodGetsClusterAddresses(t *testing.T) {
 	// sandboxd's default, so it stays.
 	if env(a, envDenyFloor) != "10.96.0.1/32,172.18.0.2/31,fd00:10:96::1/128" || env(a, envPrivate) != "100.96.0.0/23,fd00:10:244:1::/64" {
 		t.Fatalf("worker env: floor %q private %q", env(a, envDenyFloor), env(a, envPrivate))
+	}
+}
+
+// A worker whose agent has the host firewall on mounts the deny-floor
+// ConfigMap whole into sandboxd and the egress gateway and points both at
+// the file (review R4); one with it off takes neither.
+func TestUseEgressFloorFile(t *testing.T) {
+	p := stampWithEnv(t, clusterAddresses{DenyFloor: []string{"10.96.0.1/32"}})
+	if !podHasConfigMap(p, EgressFloorConfigMap("prod")) {
+		t.Fatal("no deny-floor volume")
+	}
+	for _, name := range []string{AgentContainer, "egress"} {
+		c := p.Spec.Containers[containerIndex(p.Spec.Containers, name)]
+		if env(c, envFloorFile) != "/etc/aerolvm-egress-floor/deny-floor" {
+			t.Fatalf("%s: %s = %q", name, envFloorFile, env(c, envFloorFile))
+		}
+		mounted := false
+		for _, m := range c.VolumeMounts {
+			if m.Name == EgressFloorVolume {
+				mounted = m.ReadOnly && m.SubPath == "" && m.MountPath == "/etc/aerolvm-egress-floor"
+			}
+		}
+		if !mounted {
+			t.Fatalf("%s: the floor volume is not mounted whole and read-only: %+v", name, c.VolumeMounts)
+		}
+	}
+	off := stampWithEnv(t, clusterAddresses{DenyFloor: []string{"10.96.0.1/32"}}, corev1.EnvVar{Name: "SB_ENABLE_NETWORK_RULES", Value: "false"})
+	if podHasConfigMap(off, EgressFloorConfigMap("prod")) || env(off.Spec.Containers[containerIndex(off.Spec.Containers, AgentContainer)], envFloorFile) != "<unset>" {
+		t.Fatal("a worker without the host firewall took the floor file")
+	}
+}
+
+func podHasConfigMap(p *corev1.Pod, name string) bool {
+	for _, v := range p.Spec.Volumes {
+		if v.ConfigMap != nil && v.ConfigMap.Name == name && v.ConfigMap.Optional == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// floorConfigMap reads the deny-floor ConfigMap's body, "" when it is not
+// there.
+func floorConfigMap(t *testing.T, cl client.Client) string {
+	t.Helper()
+	var cm corev1.ConfigMap
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: testWorkerNS, Name: EgressFloorConfigMap("prod")}, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	return cm.Data[EgressFloorKey]
+}
+
+// The API server moves to a new address: the deny-floor ConfigMap, which
+// a worker made before the move mounts, gets it on the next cluster pass
+// (review R4). sandboxd and the egress gateway then add it to their floor
+// as the kubelet updates the file (pkg/egresspolicy WatchFloorFile).
+func TestAPIEndpointRotationReachesExistingWorker(t *testing.T) {
+	const name = "prod-general-endpoint"
+	g := newNodeRig(t, bootstrapped(testCluster()), node(name, v1.RoleWorker, "general", "z-a"), machine("m1"))
+	g.reconcile(name)
+	p := g.pod(testWorkerNS, name)
+	if p == nil || !podHasConfigMap(p, EgressFloorConfigMap("prod")) {
+		t.Fatal("the worker does not mount the deny-floor ConfigMap")
+	}
+	r := &ClusterReconciler{Client: g.cl, Scheme: g.cl.Scheme(), WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: time.Now}
+	c := testCluster()
+	if err := r.syncEgressFloor(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	if got := floorConfigMap(t, g.cl); got != "10.96.0.1/32\n172.18.0.2/31\nfd00:10:96::1/128\n" {
+		t.Fatalf("floor = %q", got)
+	}
+	var ep discoveryv1.EndpointSlice
+	if err := g.cl.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "kubernetes"}, &ep); err != nil {
+		t.Fatal(err)
+	}
+	ep.Endpoints = []discoveryv1.Endpoint{{Addresses: []string{"172.18.0.44"}}}
+	if err := g.cl.Update(context.Background(), &ep); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncEgressFloor(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	if got := floorConfigMap(t, g.cl); !strings.Contains(got, "172.18.0.44/32") {
+		t.Fatalf("the existing worker's floor file lacks the API server's new address: %q", got)
+	}
+	if again := g.pod(testWorkerNS, name); again == nil || again.UID != p.UID {
+		t.Fatal("the worker was replaced; its running pod must follow the file")
+	}
+}
+
+// Fail closed (review R4): with the API server's addresses unreadable, no
+// floor ConfigMap is made (new worker pods wait for it), one that exists
+// keeps the last good addresses, and no worker pod is made.
+func TestEgressFloorFailsClosed(t *testing.T) {
+	denyDefault := interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if key.Namespace == "default" {
+			return errors.New("forbidden")
+		}
+		return c.Get(ctx, key, obj, opts...)
+	}}
+	cl := newFakeClient(t, testCluster(), templates(t))
+	denied := interceptor.NewClient(cl.(client.WithWatch), denyDefault)
+	r := &ClusterReconciler{Client: cl, Scheme: cl.Scheme(), WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Reader: denied, Now: time.Now}
+	before := testutilCounter(egressFloorReadErrors)
+	if err := r.syncEgressFloor(context.Background(), testCluster()); err != nil {
+		t.Fatal(err)
+	}
+	if floorConfigMap(t, cl) != "" || testutilCounter(egressFloorReadErrors) != before+1 {
+		t.Fatal("a floor ConfigMap was made without the API server's addresses")
+	}
+	// A good read, then a failed one: the last good addresses stay.
+	for _, o := range apiServerObjects()[:2] {
+		if err := cl.Create(context.Background(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.Reader = cl
+	if err := r.syncEgressFloor(context.Background(), testCluster()); err != nil {
+		t.Fatal(err)
+	}
+	good := floorConfigMap(t, cl)
+	r.Reader = denied
+	if err := r.syncEgressFloor(context.Background(), testCluster()); err != nil {
+		t.Fatal(err)
+	}
+	if got := floorConfigMap(t, cl); got != good || !strings.Contains(got, "172.18.0.2/31") {
+		t.Fatalf("a failed read changed the floor: %q, was %q", got, good)
+	}
+
+	const name = "prod-general-nofloor"
+	g := newNodeRig(t, bootstrapped(testCluster()), node(name, v1.RoleWorker, "general", "z-a"))
+	g.r.Reader = interceptor.NewClient(g.cl.(client.WithWatch), denyDefault)
+	g.reconcile(name)
+	if g.pod(testWorkerNS, name) != nil {
+		t.Fatal("a worker pod was made without the API server on its deny floor")
+	}
+	if got := g.node(name); got.Status.State != v1.StatePending || !strings.Contains(got.Status.Reason, "API server's addresses") {
+		t.Fatalf("state %s (%s)", got.Status.State, got.Status.Reason)
+	}
+	// Workers without the host firewall need no floor: nothing is written.
+	off := templates(t)
+	tpl, err := ParsePodTemplate(off.Data[TemplateWorker])
+	if err != nil {
+		t.Fatal(err)
+	}
+	setEnv(&tpl.Spec, AgentContainer, []corev1.EnvVar{envOn("SB_ENABLE_NETWORK_RULES", "false")})
+	raw, err := yaml.Marshal(tpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off.Data[TemplateWorker] = string(raw)
+	cl2 := newFakeClient(t, testCluster(), off)
+	r2 := &ClusterReconciler{Client: cl2, Scheme: cl2.Scheme(), WorkerNamespace: testWorkerNS, Templates: "aerolvm-pod-templates", Now: time.Now}
+	if err := r2.syncEgressFloor(context.Background(), testCluster()); err != nil {
+		t.Fatal(err)
+	}
+	if floorConfigMap(t, cl2) != "" {
+		t.Fatal("a floor ConfigMap for workers without the host firewall")
 	}
 }

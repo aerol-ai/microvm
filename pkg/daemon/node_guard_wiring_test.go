@@ -52,6 +52,9 @@ func TestConfigureEgressRanges(t *testing.T) {
 	t.Setenv(egresspolicy.DenyFloorEnv, "")
 	t.Setenv(egresspolicy.PrivateRangesEnv, "")
 	t.Setenv(egresspolicy.BlockPrivateEnv, "")
+	t.Setenv(egresspolicy.FloorFileEnv, "")
+	prevFile := egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetFileFloor(prevFile) })
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	floor := []netip.Prefix{netip.MustParsePrefix("10.96.0.1/32")}
@@ -70,6 +73,17 @@ func TestConfigureEgressRanges(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "deny_floor=10.96.0.1/32") {
 		t.Fatalf("the lists must be logged: %s", logs.String())
+	}
+	// The floor file: its addresses join the floor here, and a worker gets
+	// its path to watch.
+	moved := netip.MustParsePrefix("172.18.0.44/32")
+	configureEgressRanges(config.Config{EgressDenyFloorCIDRs: floor, EgressDenyFloorFile: "/etc/aerolvm-egress-floor/deny-floor",
+		EgressDenyFloorFileCIDRs: []netip.Prefix{moved}}, logger)
+	if !slices.Contains(egresspolicy.ExtraDenyFloor(), moved) || os.Getenv(egresspolicy.FloorFileEnv) != "/etc/aerolvm-egress-floor/deny-floor" {
+		t.Fatalf("floor file: %v %q", egresspolicy.ExtraDenyFloor(), os.Getenv(egresspolicy.FloorFileEnv))
+	}
+	if !strings.Contains(logs.String(), "deny-floor file") {
+		t.Fatalf("the floor file must be logged: %s", logs.String())
 	}
 	logs.Reset()
 	configureEgressRanges(config.Config{}, logger)

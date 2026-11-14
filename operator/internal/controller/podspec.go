@@ -290,6 +290,7 @@ func Stamp(t corev1.PodTemplateSpec, in StampInput) (*corev1.Pod, error) {
 	if n.Spec.Role == v1.RoleWorker && in.Pool != nil {
 		setPoolRuntimes(&pod.Spec, in.Pool.Runtimes)
 		setEgressRanges(&pod.Spec, in.Addresses)
+		useEgressFloorFile(&pod.Spec, c.Name)
 	}
 	if in.Maintenance {
 		holdServer(&pod.Spec)
@@ -676,6 +677,43 @@ func setEnv(spec *corev1.PodSpec, name string, env []corev1.EnvVar) {
 		if !replaced {
 			c.Env = append(c.Env, e)
 		}
+	}
+}
+
+// The deny-floor file (review R4; egress.go): the API server's current
+// addresses, which the cluster controller keeps in a ConfigMap in the worker
+// namespace.
+const (
+	EgressFloorVolume = "egress-floor"
+	egressFloorMount  = "/etc/aerolvm-egress-floor"
+	// EgressFloorKey is the ConfigMap's key: one address per line.
+	EgressFloorKey = "deny-floor"
+	// envFloorFile is egresspolicy.FloorFileEnv.
+	envFloorFile = "SB_EGRESS_DENY_FLOOR_FILE"
+)
+
+// EgressFloorConfigMap is cluster's deny-floor ConfigMap.
+func EgressFloorConfigMap(cluster string) string { return cluster + "-egress-floor" }
+
+// useEgressFloorFile mounts the deny-floor ConfigMap into the containers
+// that guard sandbox traffic (sandboxd and the egress gateway) and points
+// them at the file. The whole volume, never a subPath: the kubelet updates
+// only a volume mounted whole. Not optional: a worker pod waits for the
+// ConfigMap rather than start without the floor.
+func useEgressFloorFile(spec *corev1.PodSpec, cluster string) {
+	if !usesEgressRanges(spec) {
+		return
+	}
+	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: EgressFloorVolume, VolumeSource: corev1.VolumeSource{
+		ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: EgressFloorConfigMap(cluster)}},
+	}})
+	for i := range spec.Containers {
+		c := &spec.Containers[i]
+		if c.Name != AgentContainer && c.Name != "egress" {
+			continue
+		}
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: EgressFloorVolume, MountPath: egressFloorMount, ReadOnly: true})
+		setEnv(spec, c.Name, []corev1.EnvVar{{Name: envFloorFile, Value: egressFloorMount + "/" + EgressFloorKey}})
 	}
 }
 

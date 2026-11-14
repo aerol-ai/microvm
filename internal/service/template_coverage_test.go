@@ -583,8 +583,9 @@ func TestRunTemplateGCRemoveAllAndCIDReleaseWave3(t *testing.T) {
 	if _, err := st.GetTemplate(ctx, tplCID.ID); err == nil {
 		t.Fatal("CID-error template row should still be deleted")
 	}
-	if _, err := st.GetTemplate(ctx, tplRM.ID); err == nil {
-		t.Fatal("RemoveAll-error template row should still be deleted")
+	// A failed file remove keeps the row for the next pass (review R16).
+	if _, err := st.GetTemplate(ctx, tplRM.ID); err != nil {
+		t.Fatalf("RemoveAll-error template row = %v, want it kept for the next pass", err)
 	}
 }
 

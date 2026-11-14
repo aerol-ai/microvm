@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -110,23 +111,42 @@ func (r *NodeReconciler) nodeClaim(ctx context.Context, node string) *unstructur
 	return nil
 }
 
+// eksManagedDecomCap bounds a whole decommission, drain window and moves
+// together, on an EKS managed node group pool (§10.6). A managed node
+// group update evicts a cordoned machine's pods for 15 minutes, then stops
+// with PodEvictionFailure unless someone forces it. The worker's
+// PodDisruptionBudget (#1270) holds the eviction until the decommission
+// deletes the pod, so the decommission must end inside those 15 minutes,
+// with a minute to spare.
+const eksManagedDecomCap = 14 * time.Minute
+
+func eksManaged(p *v1.WorkerPoolSpec) bool { return p != nil && p.Provisioner == "eks-managed" }
+
 func drainWindow(p *v1.WorkerPoolSpec) time.Duration {
-	if p != nil && p.Decommission.DrainWindow != nil {
-		return p.Decommission.DrainWindow.Duration
-	}
-	if p != nil && p.Provisioner == "eks-managed" {
+	d := defaultDrainWindow
+	switch {
+	case p != nil && p.Decommission.DrainWindow != nil:
+		d = p.Decommission.DrainWindow.Duration
+	case eksManaged(p):
 		// A managed node group evicts after 15 minutes whatever happens;
 		// the moves need the rest (§10.6).
-		return eksManagedDrain
+		d = eksManagedDrain
 	}
-	return defaultDrainWindow
+	if eksManaged(p) {
+		d = min(d, eksManagedDecomCap)
+	}
+	return d
 }
 
 func decomDeadline(p *v1.WorkerPoolSpec) time.Duration {
+	d := defaultDecomDeadline
 	if p != nil && p.Decommission.Deadline != nil {
-		return p.Decommission.Deadline.Duration
+		d = p.Decommission.Deadline.Duration
 	}
-	return defaultDecomDeadline
+	if eksManaged(p) {
+		d = min(d, eksManagedDecomCap)
+	}
+	return d
 }
 
 // decommission carries one worker's decommission one step further.
@@ -147,12 +167,15 @@ func (r *NodeReconciler) decommission(ctx context.Context, c *v1.AerolCluster, n
 		r.setState(n, v1.StateRemoved, "decommissioned before it started")
 		return ctrl.Result{Requeue: true}, nil
 	}
-	if !d.NodeDeleted {
+	// A pass started earlier is still running or has an answer: the
+	// cordon and the drain window are behind it.
+	run := r.evacuations().get(evacKey(n))
+	if !d.NodeDeleted && run == nil {
 		if err := api.Cordon(ctx, n.Name); err != nil && !aerolapi.IsStatus(err, http.StatusNotFound) {
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
-	if now.Before(d.DrainUntil.Time) && !d.NodeDeleted {
+	if run == nil && now.Before(d.DrainUntil.Time) && !d.NodeDeleted {
 		if node, err := api.GetNode(ctx, n.Name); (err == nil && node.SandboxesOwned == 0) || aerolapi.IsStatus(err, http.StatusNotFound) {
 			// Nothing to wait for: it owns nothing, or it never joined
 			// (a worker whose pod never got a machine) and so owns
@@ -165,10 +188,22 @@ func (r *NodeReconciler) decommission(ctx context.Context, c *v1.AerolCluster, n
 	}
 	if !d.NodeDeleted {
 		r.setState(n, v1.StateDecommissioning, "")
+		if run == nil {
+			req := aerolapi.EvacuateRequest{DeadlineUnix: d.Deadline.Unix(), StopRemaining: !now.Before(d.Deadline.Time)}
+			name := n.Name
+			if run = r.evacuations().start(evacKey(n), req, func(ctx context.Context) (aerolapi.EvacuateResult, error) {
+				return api.Evacuate(ctx, name, req)
+			}); run == nil {
+				r.setState(n, v1.StateDecommissioning, fmt.Sprintf("waiting its turn: %d evacuate passes run already", maxEvacuations))
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+		}
+		if !run.wait(r.evacuateWait()) {
+			return ctrl.Result{RequeueAfter: evacuatePoll}, nil
+		}
+		r.evacuations().forget(evacKey(n))
 		before := d.Moved
-		res, err := api.Evacuate(ctx, n.Name, aerolapi.EvacuateRequest{
-			DeadlineUnix: d.Deadline.Unix(), StopRemaining: !now.Before(d.Deadline.Time),
-		})
+		res, err := run.res, run.err
 		switch {
 		case aerolapi.IsStatus(err, http.StatusConflict) && pod == nil:
 			// Not alive and no pod: the dead-owner failover has it.
@@ -182,7 +217,9 @@ func (r *NodeReconciler) decommission(ctx context.Context, c *v1.AerolCluster, n
 		d.Remaining = int32(res.RemainingMovable + res.Remaining)
 		r.progressEvent(n, before, d)
 		movedAll := res.RemainingMovable == 0
-		if !res.Done && !(movedAll && !now.Before(d.Deadline.Time)) {
+		// The pass's own request says whether it stopped the rest: the
+		// deadline may have passed while it ran.
+		if !res.Done && !(movedAll && run.req.StopRemaining) {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		// Done, or the deadline passed with every movable sandbox moved
@@ -226,5 +263,119 @@ func (r *NodeReconciler) progressEvent(n *v1.AerolNode, before int32, d *v1.Deco
 func (r *NodeReconciler) retireMachine(ctx context.Context, node string) {
 	if nc := r.nodeClaim(ctx, node); nc != nil {
 		_ = client.IgnoreNotFound(r.Delete(ctx, nc))
+	}
+}
+
+// Decommission passes run in the background (review R3). One pass moves up
+// to 8 sandboxes, each waiting for its target to pull the image (up to
+// 90 s), so a pass can take minutes. A reconcile that waited for it held
+// one of the node controller's workers that long, and with the default of
+// one worker, every node in the cell. A reconcile now starts the pass,
+// waits EvacuateWait for it (most passes answer in well under that), and
+// otherwise comes back for the answer every evacuatePoll. The answer is
+// handled exactly as before; the AerolNode still records every step.
+const (
+	defaultEvacuateWait = 2 * time.Second
+	evacuatePoll        = 5 * time.Second
+	// maxEvacuations bounds the passes running at once, operator-wide: with
+	// many machines cordoned at once (a node group upgrade), each pass's
+	// moves still land on the one leader.
+	maxEvacuations = 16
+	// evacuateRunTimeout bounds a pass's goroutine past its HTTP call's own
+	// bound (aerolapi.EvacuateTimeout).
+	evacuateRunTimeout = aerolapi.EvacuateTimeout + time.Minute
+	// evacuateKeep is how long an answer nobody came back for is kept: its
+	// AerolNode went away mid-pass.
+	evacuateKeep = 30 * time.Minute
+)
+
+// evacuations holds the passes in flight and the answers not yet taken.
+type evacuations struct {
+	mu   sync.Mutex
+	runs map[string]*evacRun
+}
+
+// evacRun is one pass. res and err are set before done is closed.
+type evacRun struct {
+	req    aerolapi.EvacuateRequest
+	done   chan struct{}
+	res    aerolapi.EvacuateResult
+	err    error
+	doneAt time.Time
+}
+
+// evacKey names a node's pass by its object, not only its name: a worker
+// name is random, but a node made again under the same name must not take
+// an old answer.
+func evacKey(n *v1.AerolNode) string { return n.Name + "/" + string(n.UID) }
+
+func (r *NodeReconciler) evacuations() *evacuations {
+	r.evacOnce.Do(func() { r.evacs = &evacuations{runs: map[string]*evacRun{}} })
+	return r.evacs
+}
+
+func (r *NodeReconciler) evacuateWait() time.Duration {
+	if r.EvacuateWait > 0 {
+		return r.EvacuateWait
+	}
+	return defaultEvacuateWait
+}
+
+// get is key's pass, running or answered; nil when there is none.
+func (e *evacuations) get(key string) *evacRun {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.runs[key]
+}
+
+// start runs pass for key in the background; nil when maxEvacuations
+// passes run already.
+func (e *evacuations) start(key string, req aerolapi.EvacuateRequest, pass func(context.Context) (aerolapi.EvacuateResult, error)) *evacRun {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	running := 0
+	for k, run := range e.runs {
+		select {
+		case <-run.done:
+			if time.Since(run.doneAt) > evacuateKeep {
+				delete(e.runs, k)
+			}
+		default:
+			running++
+		}
+	}
+	if running >= maxEvacuations {
+		return nil
+	}
+	run := &evacRun{req: req, done: make(chan struct{})}
+	e.runs[key] = run
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), evacuateRunTimeout)
+		defer cancel()
+		res, err := pass(ctx)
+		e.mu.Lock()
+		run.res, run.err, run.doneAt = res, err, time.Now()
+		e.mu.Unlock()
+		close(run.done)
+	}()
+	return run
+}
+
+// forget drops key's answer once it is taken.
+func (e *evacuations) forget(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.runs, key)
+}
+
+// wait reports whether the pass answered within d.
+func (run *evacRun) wait(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-run.done:
+		return true
+	case <-t.C:
+		return false
 	}
 }

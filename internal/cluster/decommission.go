@@ -47,8 +47,11 @@ import (
 // its internal route and on itself directly. *service.Service implements
 // it; AttachMoveHandler wires it in.
 type MoveHandler interface {
-	ReleaseForMove(ctx context.Context, ids []string) map[string]string
-	StopForDecommission(ctx context.Context, ids []string) map[string]string
+	// ReleaseForMove and StopForDecommission take, per id, the incarnation
+	// the leader read (MoveAction.Incarnations): a row of another lifetime
+	// is not the sandbox the leader means.
+	ReleaseForMove(ctx context.Context, ids []string, lifetimes map[string]string) map[string]string
+	StopForDecommission(ctx context.Context, ids []string, lifetimes map[string]string) map[string]string
 	PrepareMove(ctx context.Context, spec models.CreateSandboxRequest) error
 	NoticeDecommission(ctx context.Context, ids []string, deadline time.Time) int
 }
@@ -116,8 +119,14 @@ var (
 type MoveAction struct {
 	// Action is release, stop, notice or prepare; for a snapshot move
 	// (snapshot_move.go) release-snapshot, import, drop or start-moved.
-	Action       string                       `json:"action"`
-	IDs          []string                     `json:"ids,omitempty"`
+	Action string   `json:"action"`
+	IDs    []string `json:"ids,omitempty"`
+	// Incarnations names, per id, the lifetime the leader read when it
+	// chose the action (R10). The worker checks it under the sandbox's
+	// lifecycle lock before it stops anything: an id that is a new lifetime
+	// by then is not the sandbox meant. The swap that follows checks it
+	// too, but cannot undo a stop. A worker from before R10 ignores it.
+	Incarnations map[string]string            `json:"incarnations,omitempty"`
 	DeadlineUnix int64                        `json:"deadline_unix,omitempty"`
 	Spec         *models.CreateSandboxRequest `json:"spec,omitempty"`
 	// Target is release-snapshot's: the only node that may pull the bundle.
@@ -144,9 +153,9 @@ func RunMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (MoveAction
 	}
 	switch a.Action {
 	case "release":
-		return MoveActionResult{Results: h.ReleaseForMove(ctx, a.IDs)}, nil
+		return MoveActionResult{Results: h.ReleaseForMove(ctx, a.IDs, a.Incarnations)}, nil
 	case "stop":
-		return MoveActionResult{Results: h.StopForDecommission(ctx, a.IDs)}, nil
+		return MoveActionResult{Results: h.StopForDecommission(ctx, a.IDs, a.Incarnations)}, nil
 	case "notice":
 		return MoveActionResult{Count: h.NoticeDecommission(ctx, a.IDs, time.Unix(a.DeadlineUnix, 0))}, nil
 	case "prepare":
@@ -255,6 +264,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 
 	var movable []Placement
 	var others []string
+	othersLifetimes := make(map[string]string)
 	for _, id := range c.fsm.idsOwnedBy(nodeID) {
 		p, ok := c.fsm.get(id)
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID || p.IsDeleting() {
@@ -264,6 +274,9 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 			movable = append(movable, p)
 		} else {
 			others = append(others, id)
+			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
+				othersLifetimes[id] = inc
+			}
 		}
 	}
 	sort.Slice(movable, func(i, j int) bool { return movable[i].SandboxID < movable[j].SandboxID })
@@ -314,7 +327,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		res.Noticed = out.Count
 	}
 	if req.StopRemaining && len(others) > 0 {
-		out, err := c.moveCall(ctx, source, MoveAction{Action: "stop", IDs: others})
+		out, err := c.moveCall(ctx, source, MoveAction{Action: "stop", IDs: others, Incarnations: othersLifetimes})
 		if err != nil {
 			return res, err
 		}
@@ -342,6 +355,16 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 	return res, nil
 }
 
+// releaseAction is the action that stops p on its source, naming the
+// lifetime this leader read (R10).
+func releaseAction(action string, p Placement) MoveAction {
+	a := MoveAction{Action: action, IDs: []string{p.SandboxID}}
+	if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
+		a.Incarnations = map[string]string{p.SandboxID: inc}
+	}
+	return a
+}
+
 // moveOne moves p off source, prepare before break. The order is what keeps
 // one executor: the source's copy is stopped and fenced before the
 // placement names the target, and the swap is fenced on source as owner and
@@ -367,7 +390,7 @@ func (c *Cluster) moveOne(ctx context.Context, p Placement, source Member) error
 		}
 	}
 	rctx, cancel := context.WithTimeout(ctx, moveStepTimeout)
-	out, err := c.moveCall(rctx, source, MoveAction{Action: "release", IDs: []string{p.SandboxID}})
+	out, err := c.moveCall(rctx, source, releaseAction("release", p))
 	cancel()
 	if err != nil {
 		return err

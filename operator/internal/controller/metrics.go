@@ -49,9 +49,13 @@ var (
 		Name: "aerolvm_operator_cert_renewal_failures_total",
 		Help: "Times the edge certificate was seen not ready after it had been issued (C25).",
 	})
+	egressFloorReadErrors = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aerolvm_operator_egress_floor_read_errors_total",
+		Help: "Passes that could not read the Kubernetes API server's addresses for the workers' deny floor; the workers keep the last ones (C24).",
+	})
 )
 
 func init() {
 	metrics.Registry.MustRegister(reconcileErrors, nodeStates, workerPodsLost, decommissionSeconds,
-		upgradeStepFailures, joinTokenErrors, joinRequests, maintenanceServers, nodeCertsPending, certRenewalFailures)
+		upgradeStepFailures, joinTokenErrors, joinRequests, maintenanceServers, nodeCertsPending, certRenewalFailures, egressFloorReadErrors)
 }

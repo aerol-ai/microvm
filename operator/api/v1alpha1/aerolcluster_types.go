@@ -125,9 +125,12 @@ type StorageSpec struct {
 
 // GatewaySpec is the stateless gateway tier.
 type GatewaySpec struct {
-	// MinReplicas is at least one per zone.
+	// MinReplicas is how many gateways the cluster keeps, at least one per
+	// zone. Lowering it retires the surplus.
 	// +kubebuilder:validation:Minimum=1
 	MinReplicas int32 `json:"minReplicas"`
+	// MaxReplicas caps the gateways. The operator refuses a cap below
+	// minReplicas or below one per zone. Zero: no cap.
 	// +optional
 	MaxReplicas int32 `json:"maxReplicas,omitempty"`
 	// Service is the gateways' own load balancer. Ignored with GatewayRef.
@@ -232,7 +235,9 @@ type DecommissionSpec struct {
 	// +optional
 	DrainWindow *metav1.Duration `json:"drainWindow,omitempty"`
 	// Deadline is when what could not move is stopped, counted from the
-	// start. Default 45m.
+	// start. Default 45m. On eks-managed pools the deadline and the drain
+	// window are at most 14m: a managed node group gives up evicting after
+	// 15 minutes.
 	// +optional
 	Deadline *metav1.Duration `json:"deadline,omitempty"`
 }

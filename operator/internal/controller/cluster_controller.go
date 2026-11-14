@@ -65,6 +65,13 @@ type ClusterReconciler struct {
 	API      APIFactory
 	// WorkerNamespace holds the worker pods.
 	WorkerNamespace string
+	// Templates is the chart's pod-templates ConfigMap, in the cluster's
+	// namespace: the worker template says whether workers take the deny
+	// floor, and their sandbox range.
+	Templates string
+	// Reader reads past the manager's cache: the API server's Service and
+	// addresses live in default (syncEgressFloor). Nil uses the client.
+	Reader client.Reader
 	// Now is the clock; tests replace it.
 	Now func() time.Time
 }
@@ -105,6 +112,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if err := r.syncFederationKey(ctx, &c); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.syncEgressFloor(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
 	nodes, err := listNodes(ctx, r.Client, &c)
@@ -167,6 +177,9 @@ func refuseSpec(c *v1.AerolCluster) string {
 	}
 	if c.Spec.Servers.Count != 3 && c.Spec.Servers.Count != 5 {
 		return "servers.count must be 3 or 5"
+	}
+	if g := c.Spec.Gateways; g.MaxReplicas > 0 && int(g.MaxReplicas) < wantedGateways(c) {
+		return fmt.Sprintf("gateways.maxReplicas (%d) is below the %d gateways the cluster keeps: minReplicas, and at least one per zone", g.MaxReplicas, wantedGateways(c))
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Spec.WorkerPools {
@@ -487,20 +500,29 @@ func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, 
 	return nil
 }
 
-// ensureGateways keeps minReplicas gateways, spread across the zones. A
+// wantedGateways is how many gateways the cluster keeps: minReplicas, and
+// at least one per zone. maxReplicas caps it (refuseSpec refuses a cap
+// below it); nothing scales gateways past it.
+func wantedGateways(c *v1.AerolCluster) int {
+	return int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
+}
+
+// ensureGateways keeps wantedGateways gateways, spread across the zones. A
 // gateway that ended is replaced by a new one (a new node: gateways hold
-// no state).
+// no state). A surplus, left when minReplicas went down, is retired
+// (review R7): the node controller deletes each one's pod and takes it out
+// of the cluster (retireGateway).
 func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) error {
 	perZone := map[string]int{}
-	live := 0
+	var live []v1.AerolNode
 	for _, n := range nodes {
-		if n.Spec.Role == v1.RoleGateway && !ended(n) {
+		if n.Spec.Role == v1.RoleGateway && !ended(n) && n.Annotations[v1.AnnotationDecommission] != "true" {
 			perZone[n.Spec.Zone]++
-			live++
+			live = append(live, n)
 		}
 	}
-	want := int(max(c.Spec.Gateways.MinReplicas, int32(len(c.Spec.Zones))))
-	for live < want {
+	want := wantedGateways(c)
+	for have := len(live); have < want; have++ {
 		zone := leastZone(c.Spec.Zones, perZone)
 		suffix, err := randomToken(5)
 		if err != nil {
@@ -510,9 +532,52 @@ func (r *ClusterReconciler) ensureGateways(ctx context.Context, c *v1.AerolClust
 			return err
 		}
 		perZone[zone]++
-		live++
+	}
+	why := fmt.Sprintf("scale-down: the cluster keeps %d gateways", want)
+	for len(live) > want {
+		i := surplusGateway(c.Spec.Zones, perZone, live)
+		if err := r.markDecommission(ctx, c, live[i].Name, why); err != nil {
+			return err
+		}
+		perZone[live[i].Spec.Zone]--
+		live = append(live[:i], live[i+1:]...)
 	}
 	return nil
+}
+
+// surplusGateway picks the gateway to retire first: one in a zone no
+// longer in the spec, then one not serving, then one from the zone with the
+// most gateways, so every zone keeps its own. Ties go to the last name.
+func surplusGateway(zones []string, perZone map[string]int, live []v1.AerolNode) int {
+	inSpec := map[string]bool{}
+	for _, z := range zones {
+		inSpec[z] = true
+	}
+	rank := func(n v1.AerolNode) (bool, bool, int) {
+		return !inSpec[n.Spec.Zone], n.Status.State != v1.StateServing, perZone[n.Spec.Zone]
+	}
+	best := 0
+	for i := 1; i < len(live); i++ {
+		ao, an, ac := rank(live[i])
+		bo, bn, bc := rank(live[best])
+		switch {
+		case ao != bo:
+			if ao {
+				best = i
+			}
+		case an != bn:
+			if an {
+				best = i
+			}
+		case ac != bc:
+			if ac > bc {
+				best = i
+			}
+		case live[i].Name > live[best].Name:
+			best = i
+		}
+	}
+	return best
 }
 
 // ended reports a node whose pod is gone for good: removed, dead, or a
@@ -691,6 +756,50 @@ func (r *ClusterReconciler) syncFederationKey(ctx context.Context, c *v1.AerolCl
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
 		dst.Labels = clusterLabels(c)
 		dst.Data = map[string][]byte{FederationKeyKey: src.Data[FederationKeyKey]}
+		return nil
+	})
+	return err
+}
+
+// syncEgressFloor keeps the API server's current addresses in the worker
+// namespace's deny-floor ConfigMap, which every worker pod mounts and
+// sandboxd watches (review R4; egress.go). One read past the cache per pass,
+// and a write only when the addresses changed. A read that fails changes
+// nothing: the last good addresses stay on every worker's floor, and while
+// there are none yet, new worker pods wait for the ConfigMap.
+func (r *ClusterReconciler) syncEgressFloor(ctx context.Context, c *v1.AerolCluster) error {
+	ns := r.WorkerNamespace
+	if ns == "" {
+		ns = c.Namespace
+	}
+	if r.Templates == "" {
+		return nil
+	}
+	var cm corev1.ConfigMap
+	if err := r.Get(ctx, types.NamespacedName{Namespace: c.Namespace, Name: r.Templates}, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	tpl, err := ParsePodTemplate(cm.Data[TemplateWorker])
+	if err != nil || !usesEgressRanges(&tpl.Spec) {
+		// No worker template to read, or workers without the host
+		// firewall: no worker mounts the file (useEgressFloorFile).
+		return nil
+	}
+	reader := r.Reader
+	if reader == nil {
+		reader = r.Client
+	}
+	found, err := readDenyFloor(ctx, reader)
+	if err != nil {
+		egressFloorReadErrors.Inc()
+		log.FromContext(ctx).Info("cannot read the API server's addresses; the workers keep the last ones", "error", err.Error())
+		return nil
+	}
+	body := strings.Join(floorFor(&tpl.Spec, found), "\n") + "\n"
+	dst := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: EgressFloorConfigMap(c.Name), Namespace: ns}}
+	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, dst, func() error {
+		dst.Labels = clusterLabels(c)
+		dst.Data = map[string]string{EgressFloorKey: body}
 		return nil
 	})
 	return err

@@ -274,17 +274,39 @@ func (d *Daemon) SetOperator(op *operator.Operator) {
 	}
 	d.floor, d.upstream, d.opHash = guard.DenyFloor, up, op.Hash()
 	d.opMu.Unlock()
+	closed := d.applyGuard(guard, up)
+	d.log.Info("egress operator file applied", "hash", op.Hash(), "connections_closed", closed)
+}
+
+// RefreshFloor applies the node's extra deny floor again after the
+// deny-floor file changed (SB_EGRESS_DENY_FLOOR_FILE, review R4): on
+// Kubernetes it holds the API server's current addresses. op is the
+// operator file in force, nil without one. The dial guards already read
+// the extra floor at each dial; this rewrites the node-wide set and closes
+// proxied connections into an address now on the floor.
+func (d *Daemon) RefreshFloor(op *operator.Operator) {
+	guard := op.Guard()
+	d.opMu.Lock()
+	d.floor = guard.DenyFloor
+	up := d.upstream
+	d.opMu.Unlock()
+	closed := d.applyGuard(guard, up)
+	d.log.Info("egress deny floor applied", "connections_closed", closed)
+}
+
+// applyGuard gives the DNS filter and the proxy guard and up, rewrites the
+// node-wide deny floor and closes the proxied connections guard refuses.
+func (d *Daemon) applyGuard(guard egresspolicy.DialGuard, up *egresspolicy.Upstream) int {
 	d.dns.SetOperator(guard, up)
 	d.px.SetOperator(guard, up)
 	nw := d.gw.NodeWideState()
 	nw.Floor = guard.DenyFloor
 	if err := d.gw.SetNodeWide(nw); err != nil {
-		d.log.Error("egress operator file: deny floor not rewritten", "error", err)
+		d.log.Error("egress deny floor not rewritten", "error", err)
 	}
-	closed := d.gw.RevalidateConns(func(pol *egresspolicy.Policy, host string, dst netip.AddrPort) bool {
+	return d.gw.RevalidateConns(func(pol *egresspolicy.Policy, host string, dst netip.AddrPort) bool {
 		return dst.IsValid() && guard.Check(pol, egresspolicy.DialTarget{Name: host, NameAllowed: true, Addr: dst}) != nil
 	})
-	d.log.Info("egress operator file applied", "hash", op.Hash(), "connections_closed", closed)
 }
 
 // OperatorHash is the operator file in force ("" without one).

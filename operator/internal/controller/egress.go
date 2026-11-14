@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"slices"
 	"strings"
@@ -29,15 +30,28 @@ import (
 //
 // What the API does not say (node ranges; pod ranges under a CNI that takes
 // addresses from the VPC, which the private ranges already cover) stays in
-// the chart's worker.egressPrivateRanges. A worker gets the lists when it
-// is made: the API server's Service address never changes, and a worker
-// made later gets any new endpoint address.
+// the chart's worker.egressPrivateRanges.
+//
+// A worker gets both lists in its environment when it is made, which a
+// running pod cannot change. The API server's addresses do change (EKS
+// replaces its control-plane machines, and with them the endpoint
+// addresses), so the deny floor also goes in a file the worker reads and
+// watches (review R4): the cluster controller keeps the current addresses
+// in a ConfigMap in the worker namespace (syncEgressFloor), every worker
+// pod mounts it (useEgressFloorFile), the kubelet updates the file in
+// place, and sandboxd, its WASM workers and the egress gateway each add
+// what it holds to their deny floor within seconds
+// (SB_EGRESS_DENY_FLOOR_FILE). Both fail closed: a worker pod is not made
+// while the API server's addresses cannot be read, its volume makes it
+// wait until the ConfigMap exists, and a read that fails later leaves the
+// last good addresses in place.
 
 // clusterAddresses is what the operator found; empty lists when it could
-// read nothing.
+// read nothing. FloorErr says the deny floor is incomplete.
 type clusterAddresses struct {
 	DenyFloor []string
 	Private   []string
+	FloorErr  error
 }
 
 const (
@@ -54,23 +68,9 @@ const (
 func readClusterAddresses(ctx context.Context, reader, nodes client.Reader) clusterAddresses {
 	var out clusterAddresses
 	logger := log.FromContext(ctx)
-	var svc corev1.Service
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &svc); err == nil {
-		for _, ip := range append([]string{svc.Spec.ClusterIP}, svc.Spec.ClusterIPs...) {
-			out.DenyFloor = appendAddr(out.DenyFloor, ip)
-		}
-	} else {
-		logger.Info("cannot read the API server's Service; sandboxes still cannot reach private ranges", "error", err.Error())
-	}
-	var slice discoveryv1.EndpointSlice
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &slice); err == nil {
-		for _, ep := range slice.Endpoints {
-			for _, a := range ep.Addresses {
-				out.DenyFloor = appendAddr(out.DenyFloor, a)
-			}
-		}
-	} else {
-		logger.Info("cannot read the API server's addresses; sandboxes still cannot reach private ranges", "error", err.Error())
+	out.DenyFloor, out.FloorErr = readDenyFloor(ctx, reader)
+	if out.FloorErr != nil {
+		logger.Info("cannot read the API server's addresses", "error", out.FloorErr.Error())
 	}
 	var nodeList corev1.NodeList
 	if err := nodes.List(ctx, &nodeList); err != nil {
@@ -95,6 +95,29 @@ func readClusterAddresses(ctx context.Context, reader, nodes client.Reader) clus
 		}
 	}
 	return out
+}
+
+// readDenyFloor reads the API server's addresses: its Service's and the
+// ones behind it. Both reads must succeed; half a floor is an error.
+func readDenyFloor(ctx context.Context, reader client.Reader) ([]string, error) {
+	var floor []string
+	var svc corev1.Service
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &svc); err != nil {
+		return nil, fmt.Errorf("the API server's Service: %w", err)
+	}
+	for _, ip := range append([]string{svc.Spec.ClusterIP}, svc.Spec.ClusterIPs...) {
+		floor = appendAddr(floor, ip)
+	}
+	var slice discoveryv1.EndpointSlice
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &slice); err != nil {
+		return nil, fmt.Errorf("the API server's addresses: %w", err)
+	}
+	for _, ep := range slice.Endpoints {
+		for _, a := range ep.Addresses {
+			floor = appendAddr(floor, a)
+		}
+	}
+	return floor, nil
 }
 
 // appendAddr adds an address or CIDR once, in CIDR form, skipping what does
@@ -152,28 +175,12 @@ const defaultSandboxSubnet = "10.88.0.0/16"
 //   - a range that overlaps the sandboxes' own subnet is left out: inside
 //     the pod those addresses are sandboxes.
 func setEgressRanges(spec *corev1.PodSpec, a clusterAddresses) {
-	i := containerIndex(spec.Containers, AgentContainer)
-	if i < 0 {
+	if !usesEgressRanges(spec) {
 		return
 	}
-	// The last value wins, as Kubernetes resolves a repeated name.
-	agentEnv := func(name string) string {
-		v := ""
-		for _, e := range spec.Containers[i].Env {
-			if e.Name == name {
-				v = e.Value
-			}
-		}
-		return v
-	}
-	if agentEnv("SB_ENABLE_NETWORK_RULES") != "true" {
-		return
-	}
-	subnet, err := netip.ParsePrefix(cmpOr(agentEnv("SB_CONTAINERD_BRIDGE_SUBNET"), defaultSandboxSubnet))
-	if err != nil {
-		subnet = netip.MustParsePrefix(defaultSandboxSubnet)
-	}
-	floor := aggregate(keep(a.DenyFloor, func(p netip.Prefix) bool { return !p.Overlaps(subnet) }))
+	agentEnv := func(name string) string { return agentEnvValue(spec, name) }
+	subnet := sandboxSubnet(spec)
+	floor := floorFor(spec, a.DenyFloor)
 	var private []string
 	if agentEnv("SB_EGRESS_BLOCK_PRIVATE_BY_DEFAULT") == "true" {
 		private = aggregate(keep(a.Private, func(p netip.Prefix) bool {
@@ -215,6 +222,45 @@ func setEgressRanges(spec *corev1.PodSpec, a clusterAddresses) {
 			}
 		}
 	}
+}
+
+// agentEnvValue is the agent container's value for name; the last one
+// wins, as Kubernetes resolves a repeated name.
+func agentEnvValue(spec *corev1.PodSpec, name string) string {
+	i := containerIndex(spec.Containers, AgentContainer)
+	if i < 0 {
+		return ""
+	}
+	v := ""
+	for _, e := range spec.Containers[i].Env {
+		if e.Name == name {
+			v = e.Value
+		}
+	}
+	return v
+}
+
+// usesEgressRanges says whether a worker pod takes the found lists: its
+// agent has the host firewall on, which sandboxd requires for either.
+func usesEgressRanges(spec *corev1.PodSpec) bool {
+	return agentEnvValue(spec, "SB_ENABLE_NETWORK_RULES") == "true"
+}
+
+// sandboxSubnet is the pod's sandbox range: inside the pod those addresses
+// are sandboxes, so no found range may overlap it.
+func sandboxSubnet(spec *corev1.PodSpec) netip.Prefix {
+	subnet, err := netip.ParsePrefix(cmpOr(agentEnvValue(spec, "SB_CONTAINERD_BRIDGE_SUBNET"), defaultSandboxSubnet))
+	if err != nil {
+		return netip.MustParsePrefix(defaultSandboxSubnet)
+	}
+	return subnet
+}
+
+// floorFor is the deny floor a worker made from spec gets: the found
+// addresses outside its sandbox range, merged.
+func floorFor(spec *corev1.PodSpec, found []string) []string {
+	subnet := sandboxSubnet(spec)
+	return aggregate(keep(found, func(p netip.Prefix) bool { return !p.Overlaps(subnet) }))
 }
 
 func cmpOr(a, b string) string {

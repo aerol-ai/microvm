@@ -49,6 +49,7 @@ type options struct {
 	serviceAccount  string
 	joinURL         string
 	joinCAFile      string
+	nodeConcurrency int
 }
 
 func parse(args []string) (options, error) {
@@ -65,8 +66,12 @@ func parse(args []string) (options, error) {
 	fs.StringVar(&o.serviceAccount, "service-account", os.Getenv("POD_SERVICE_ACCOUNT"), "the operator's own service account, which the delete guard always allows")
 	fs.StringVar(&o.joinURL, "join-url", "", "where a new pod asks the operator for its join token: https://<operator Service>.<namespace>.svc"+controller.JoinIssuePath)
 	fs.StringVar(&o.joinCAFile, "join-ca-file", "", "the CA a joining pod trusts the operator by (default: ca.crt in --webhook-cert-dir)")
+	fs.IntVar(&o.nodeConcurrency, "node-concurrency", controller.DefaultNodeConcurrency, "AerolNodes reconciled at once")
 	if err := fs.Parse(args); err != nil {
 		return o, err
+	}
+	if o.nodeConcurrency < 1 {
+		return o, fmt.Errorf("--node-concurrency must be at least 1")
 	}
 	if o.namespace == "" {
 		return o, fmt.Errorf("--namespace (or POD_NAMESPACE) is required")
@@ -131,13 +136,14 @@ func wire(mgr ctrl.Manager, o options, scheme *runtime.Scheme) error {
 		return err
 	}
 	rec := mgr.GetEventRecorderFor("aerolvm-operator")
-	if err := (&controller.ClusterReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: rec, WorkerNamespace: o.workerNamespace}).SetupWithManager(mgr); err != nil {
+	if err := (&controller.ClusterReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: rec, WorkerNamespace: o.workerNamespace,
+		Templates: o.templates, Reader: mgr.GetAPIReader()}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(), Scheme: scheme, Recorder: rec,
 		Namespace: o.namespace, WorkerNamespace: o.workerNamespace, Templates: o.templates,
-		Reader:  mgr.GetAPIReader(),
+		Reader: mgr.GetAPIReader(), MaxConcurrentReconciles: o.nodeConcurrency,
 		JoinURL: o.joinURL, JoinCA: func() ([]byte, error) { return os.ReadFile(o.joinCAFile) },
 	}).SetupWithManager(mgr); err != nil {
 		return err

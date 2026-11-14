@@ -359,3 +359,79 @@ func TestClusterRotationKeepsEveryZoneServed(t *testing.T) {
 		}
 	}
 }
+
+// The workers of a pool removed from the spec leave through decommission
+// (review R6): one that never served at once, the others one per zone at
+// a time. The pools still in the spec are left alone.
+func TestRemovedWorkerPoolDecommissions(t *testing.T) {
+	c := bootstrapped(testCluster())
+	mk := func(name, pool, zone, state string) *v1.AerolNode {
+		n := node(name, v1.RoleWorker, pool, zone)
+		n.Labels = map[string]string{LabelCluster: "prod"}
+		n.Status.State = state
+		return n
+	}
+	objs := []client.Object{
+		mk("prod-oldpool-a1", "oldpool", "z-a", v1.StateServing),
+		mk("prod-oldpool-a2", "oldpool", "z-a", v1.StateServing),
+		mk("prod-oldpool-b1", "oldpool", "z-b", v1.StateRestarting),
+		mk("prod-oldpool-c1", "oldpool", "z-c", v1.StatePending),
+		mk("prod-oldpool-c2", "oldpool", "z-c", v1.StateFailed),
+		mk("prod-oldpool-c3", "oldpool", "z-c", v1.StateDead),
+		mk("prod-oldpool-c4", "oldpool", "z-c", v1.StateSuspect),
+		mk("prod-general-a1", "general", "z-a", v1.StateServing),
+	}
+	r, _, cl := clusterRig(t, c, objs...)
+	decommissioned := func() map[string]bool {
+		var list v1.AerolNodeList
+		if err := cl.List(context.Background(), &list); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, n := range list.Items {
+			if n.Annotations[v1.AnnotationDecommission] == "true" {
+				out[n.Name] = true
+			}
+		}
+		return out
+	}
+	pass := func() {
+		t.Helper()
+		nodes, err := listNodes(context.Background(), cl, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.ensureWorkers(context.Background(), c, nodes, nil, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pass()
+	got := decommissioned()
+	for _, want := range []string{"prod-oldpool-a1", "prod-oldpool-b1", "prod-oldpool-c1", "prod-oldpool-c2"} {
+		if !got[want] {
+			t.Errorf("%s was not decommissioned", want)
+		}
+	}
+	for _, kept := range []string{"prod-oldpool-a2", "prod-oldpool-c3", "prod-oldpool-c4", "prod-general-a1"} {
+		if got[kept] {
+			t.Errorf("%s was decommissioned", kept)
+		}
+	}
+	// Its zone's first one still leaving: the second waits.
+	pass()
+	if decommissioned()["prod-oldpool-a2"] {
+		t.Fatal("two serving workers of a removed pool left one zone at once")
+	}
+	// The first one gone: the second goes.
+	var gone v1.AerolNode
+	if err := cl.Get(context.Background(), client.ObjectKey{Namespace: testNS, Name: "prod-oldpool-a1"}, &gone); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Delete(context.Background(), &gone); err != nil {
+		t.Fatal(err)
+	}
+	pass()
+	if !decommissioned()["prod-oldpool-a2"] {
+		t.Fatal("the zone's next worker of a removed pool never went")
+	}
+}

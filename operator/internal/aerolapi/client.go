@@ -28,11 +28,26 @@ type Client struct {
 	// Token is the cluster's admin token (SB_PAT_TOKEN).
 	Token string
 	HTTP  *http.Client
+	// CallTimeout bounds every call but an evacuate pass (zero: only the
+	// HTTP client's own bound).
+	CallTimeout time.Duration
 }
 
-// New returns a Client with a bounded HTTP client.
+const (
+	// DefaultCallTimeout bounds the quick calls, which answer in
+	// milliseconds. A server that stopped answering then holds a reconcile
+	// 30 seconds, not the minutes an evacuate pass may take (review R3).
+	DefaultCallTimeout = 30 * time.Second
+	// EvacuateTimeout bounds one decommission pass: up to 8 moves at once,
+	// each waiting for its target's image pull (up to 90 s) and its
+	// source's release. It is the HTTP client's own bound.
+	EvacuateTimeout = 6 * time.Minute
+)
+
+// New returns a Client whose every call is bounded.
 func New(baseURL, token string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{Timeout: 6 * time.Minute}}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token,
+		HTTP: &http.Client{Timeout: EvacuateTimeout}, CallTimeout: DefaultCallTimeout}
 }
 
 // Error is a refused call: the status and the server's error text.
@@ -61,7 +76,18 @@ func IsCode(err error, code string) bool {
 	return errors.As(err, &e) && e.Code == code
 }
 
+// do makes a quick call, bounded by CallTimeout.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	if c.CallTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.CallTimeout)
+		defer cancel()
+	}
+	return c.call(ctx, method, path, body, out)
+}
+
+// call makes a call bounded only by ctx and the HTTP client.
+func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -226,7 +252,9 @@ type EvacuateResult struct {
 // Evacuate runs one decommission pass over a cordoned node (C9).
 func (c *Client) Evacuate(ctx context.Context, id string, req EvacuateRequest) (EvacuateResult, error) {
 	var out EvacuateResult
-	err := c.do(ctx, http.MethodPost, "/v1/cluster/nodes/"+url.PathEscape(id)+"/evacuate", req, &out)
+	// Not do: a pass may take minutes (EvacuateTimeout). The node
+	// controller runs it in the background, so no reconcile waits on it.
+	err := c.call(ctx, http.MethodPost, "/v1/cluster/nodes/"+url.PathEscape(id)+"/evacuate", req, &out)
 	return out, err
 }
 

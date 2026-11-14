@@ -22,11 +22,22 @@ type fakeMoves struct {
 	prepared  []string
 	releaseTo string // answer for every release ("released" by default)
 	deadline  time.Time
+	lifetimes map[string]string // the incarnation each release or stop named
 }
 
-func (f *fakeMoves) ReleaseForMove(_ context.Context, ids []string) map[string]string {
+func (f *fakeMoves) noteLifetimes(lifetimes map[string]string) {
+	if f.lifetimes == nil {
+		f.lifetimes = map[string]string{}
+	}
+	for id, inc := range lifetimes {
+		f.lifetimes[id] = inc
+	}
+}
+
+func (f *fakeMoves) ReleaseForMove(_ context.Context, ids []string, lifetimes map[string]string) map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.noteLifetimes(lifetimes)
 	out := map[string]string{}
 	for _, id := range ids {
 		f.released = append(f.released, id)
@@ -38,9 +49,10 @@ func (f *fakeMoves) ReleaseForMove(_ context.Context, ids []string) map[string]s
 	return out
 }
 
-func (f *fakeMoves) StopForDecommission(_ context.Context, ids []string) map[string]string {
+func (f *fakeMoves) StopForDecommission(_ context.Context, ids []string, lifetimes map[string]string) map[string]string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.noteLifetimes(lifetimes)
 	out := map[string]string{}
 	for _, id := range ids {
 		f.stopped = append(f.stopped, id)
@@ -144,6 +156,11 @@ func TestEvacuateNodeMovesNoticesAndStops(t *testing.T) {
 	}
 	if strings.Join(moves.stopped, ",") != "sb-stay" {
 		t.Fatalf("stopped %v", moves.stopped)
+	}
+	// Each stop named the lifetime the leader read (R10), so a worker can
+	// refuse one that is no longer there.
+	if moves.lifetimes["sb-move"] != moved.IncarnationID || moves.lifetimes["sb-stay"] != "inc-stay" {
+		t.Fatalf("lifetimes sent %v, want sb-move=%s sb-stay=inc-stay", moves.lifetimes, moved.IncarnationID)
 	}
 
 	// A node gossip does not see alive is the dead-owner failover's.

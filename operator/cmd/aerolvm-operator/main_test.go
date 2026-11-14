@@ -12,6 +12,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"github.com/aerol-ai/microvm/operator/internal/controller"
 )
 
 func TestParse(t *testing.T) {
@@ -22,9 +24,15 @@ func TestParse(t *testing.T) {
 	if err != nil || o.workerNamespace != "aerolvm-system" || o.templates != "aerolvm-pod-templates" || !o.leaderElect {
 		t.Fatalf("defaults = %+v %v", o, err)
 	}
-	o, err = parse([]string{"--namespace", "a", "--worker-namespace", "b", "--leader-elect=false"})
-	if err != nil || o.workerNamespace != "b" || o.leaderElect {
+	if o.nodeConcurrency != controller.DefaultNodeConcurrency {
+		t.Fatalf("node concurrency %d", o.nodeConcurrency)
+	}
+	o, err = parse([]string{"--namespace", "a", "--worker-namespace", "b", "--leader-elect=false", "--node-concurrency", "4"})
+	if err != nil || o.workerNamespace != "b" || o.leaderElect || o.nodeConcurrency != 4 {
 		t.Fatalf("flags = %+v %v", o, err)
+	}
+	if _, err := parse([]string{"--namespace", "a", "--node-concurrency", "0"}); err == nil {
+		t.Fatal("no node workers accepted")
 	}
 	if _, err := parse([]string{"--nope"}); err == nil {
 		t.Fatal("unknown flag accepted")

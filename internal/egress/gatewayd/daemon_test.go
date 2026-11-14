@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -623,4 +624,38 @@ func syncToken(t *testing.T, c *egress.Client) egress.SyncToken {
 		t.Fatal(err)
 	}
 	return tok
+}
+
+// TestRefreshFloorReachesTheGateway (review R4): when the deny-floor file
+// changes, the gateway's node-wide set gets the new address, a proxied
+// stream into it closes, and the operator file in force (here none) keeps
+// its say.
+func TestRefreshFloorReachesTheGateway(t *testing.T) {
+	prev := egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetFileFloor(prev) })
+	be := egress.NewMemBackend()
+	r := startDaemon(t, t.TempDir(), be)
+	ctx := context.Background()
+	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo, Subnet: netip.MustParsePrefix("127.0.0.0/8")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.Attach(ctx, egress.Spec{ID: "sb", IP: lo, AllowOut: []string{"api.example"}}); err != nil {
+		t.Fatal(err)
+	}
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	tc := r.d.Gateway().Track("sb", "api.example", 443, c1)
+	tc.AddDst(netip.MustParseAddrPort("203.0.113.44:443"))
+	floorBefore := be.Len(egress.SetDenyFloor)
+	egresspolicy.SetFileFloor([]netip.Prefix{netip.MustParsePrefix("203.0.113.44/32")})
+	r.d.RefreshFloor(nil)
+	if be.Len(egress.SetDenyFloor) <= floorBefore {
+		t.Fatal("the node-wide deny floor must get the new address")
+	}
+	if !slices.Contains(r.d.denyFloor(), netip.MustParsePrefix("203.0.113.44/32")) {
+		t.Fatalf("floor = %v", r.d.denyFloor())
+	}
+	if _, err := c2.Write([]byte("x")); err == nil {
+		t.Fatal("a stream into the new floor address must close")
+	}
 }
