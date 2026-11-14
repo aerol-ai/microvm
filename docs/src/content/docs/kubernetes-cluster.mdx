@@ -273,7 +273,7 @@ In the `EC2NodeClass`, keep Karpenter's instance metadata defaults, `httpTokens:
 
 ## A machine goes away
 
-Machines go away on purpose all the time: a new machine image, a Kubernetes upgrade, a smaller pool. The rule is: **the operator moves sandboxes off a machine before the machine goes.** It starts when the machine is cordoned, when Karpenter marks it drifted, when the pool shrinks, when the machine is older than `maxMachineAge`, or when its pool is removed from `cluster.workerPools`. A removed pool's workers leave one per zone at a time, so their sandboxes move to the pools that remain.
+Machines go away on purpose all the time: a new machine image, a Kubernetes upgrade, a smaller pool. The rule is: **the operator moves sandboxes off a machine before the machine goes.** It starts when the machine is cordoned, when Karpenter marks it drifted, when the pool shrinks, when the machine is older than `maxMachineAge`, or when its pool is removed from `cluster.workerPools`. A removed pool's workers leave one per zone at a time, so their sandboxes move to the pools that remain. They keep the removed pool's decommission settings, so a removed `eks-managed` pool still finishes within 14 minutes.
 
 1. **Drain.** The worker takes no new sandboxes. For `drainWindow` (15 minutes by default), sandboxes may finish by themselves.
 2. **Move.** Each sandbox created with `failover.policy: recreate` moves to a worker in another zone: the new worker pulls the image first, then the old copy stops and the new one starts with the same ID and the same link. Your sandbox is down for a stop and a start, a few seconds.

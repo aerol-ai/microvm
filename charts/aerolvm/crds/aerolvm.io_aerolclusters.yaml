@@ -783,6 +783,42 @@ spec:
               phase:
                 description: Phase is Bootstrapping, Ready, Upgrading or Degraded.
                 type: string
+              poolDecommission:
+                description: |-
+                  PoolDecommission is each worker pool's decommission settings as the
+                  operator last saw them in the spec. A pool removed from the spec still
+                  has workers to decommission, and they keep its settings, the
+                  eks-managed cap included. A removed pool's entry goes once no worker
+                  of it is left.
+                items:
+                  description: PoolDecommission is one worker pool's decommission
+                    settings.
+                  properties:
+                    decommission:
+                      description: DecommissionSpec times a worker's decommission
+                        (§10.5).
+                      properties:
+                        deadline:
+                          description: |-
+                            Deadline is when what could not move is stopped, counted from the
+                            start. Default 45m. On eks-managed pools the deadline and the drain
+                            window are at most 14m: a managed node group gives up evicting after
+                            15 minutes.
+                          type: string
+                        drainWindow:
+                          description: |-
+                            DrainWindow is the time sandboxes get to end by themselves before
+                            the moves start. Default 15m (5m on eks-managed pools, §10.6).
+                          type: string
+                      type: object
+                    name:
+                      type: string
+                    provisioner:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               rollout:
                 description: Rollout is AerolVM's own upgrade record, when one exists.
                 properties:

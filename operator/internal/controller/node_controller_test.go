@@ -1261,3 +1261,71 @@ func TestEKSManagedDecommissionFitsTheEvictionWindow(t *testing.T) {
 		t.Fatalf("decommission = %+v", d)
 	}
 }
+
+// A worker pool removed from the spec keeps its decommission settings
+// through the status (keepPoolDecommission). Found live: a removed
+// eks-managed pool's worker took the defaults, a 45-minute deadline, past
+// the node group's 15-minute eviction window.
+func TestRemovedEKSPoolKeepsItsCap(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := bootstrapped(testCluster())
+	eks := *c.Spec.WorkerPools[0].DeepCopy()
+	eks.Name, eks.Provisioner = "eks", "eks-managed"
+	eks.Decommission = v1.DecommissionSpec{DrainWindow: dur(20 * time.Minute), Deadline: dur(time.Hour)}
+	c.Spec.WorkerPools = append(c.Spec.WorkerPools, eks)
+	n := node("prod-eks-a1", v1.RoleWorker, "eks", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.reconcile(n.Name) // its pod, made while the pool is in the spec
+	g.running(g.pod(testWorkerNS, n.Name), "m1", true)
+
+	// A cluster pass with the pool, then the pool leaves the spec and the
+	// next pass keeps its settings: a worker of it is left.
+	var cur v1.AerolCluster
+	if err := g.cl.Get(context.Background(), types.NamespacedName{Namespace: c.Namespace, Name: c.Name}, &cur); err != nil {
+		t.Fatal(err)
+	}
+	nodes := []v1.AerolNode{*g.node(n.Name)}
+	keepPoolDecommission(&cur, nodes)
+	cur.Spec.WorkerPools = cur.Spec.WorkerPools[:1]
+	keepPoolDecommission(&cur, nodes)
+	status := cur.Status
+	if err := g.cl.Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+	cur.Status = status
+	if err := g.cl.Status().Update(context.Background(), &cur); err != nil {
+		t.Fatal(err)
+	}
+
+	g.api.mu.Lock()
+	g.api.nodes[n.Name] = aerolapi.Node{Alive: true, SandboxesOwned: 4}
+	g.api.mu.Unlock()
+	w := g.node(n.Name)
+	w.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), w); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(n.Name)
+	d := g.node(n.Name).Status.Decommission
+	if d == nil || d.Deadline.Sub(d.StartedAt.Time) != 14*time.Minute || d.DrainUntil.Sub(d.StartedAt.Time) != 14*time.Minute {
+		t.Fatalf("removed eks-managed pool: decommission = %+v, want a 14m deadline and drain window", d)
+	}
+}
+
+func TestDecommissionPool(t *testing.T) {
+	dur := func(d time.Duration) *metav1.Duration { return &metav1.Duration{Duration: d} }
+	c := testCluster()
+	c.Status.PoolDecommission = []v1.PoolDecommission{
+		{Name: "general", Provisioner: "eks-managed"},
+		{Name: "gone", Provisioner: "eks-managed", Decommission: v1.DecommissionSpec{Deadline: dur(time.Hour)}},
+	}
+	if p := decommissionPool(c, "general"); p != &c.Spec.WorkerPools[0] {
+		t.Errorf("a pool in the spec: %+v, want the spec's", p)
+	}
+	if p := decommissionPool(c, "gone"); p == nil || p.Name != "gone" || decomDeadline(p) != 14*time.Minute || drainWindow(p) != 5*time.Minute {
+		t.Errorf("a removed pool: %+v, want its kept settings with the eks-managed cap", p)
+	}
+	if p := decommissionPool(c, "never"); p != nil || decomDeadline(p) != defaultDecomDeadline || drainWindow(p) != defaultDrainWindow {
+		t.Errorf("a pool known nowhere: %+v, want the defaults", p)
+	}
+}
