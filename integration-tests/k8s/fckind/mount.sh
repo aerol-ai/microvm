@@ -86,5 +86,32 @@ for s in json.load(sys.stdin)["items"]:
   say "pod deleted in $(( $(date +%s) - t0 ))s; FUSE mounts of it left on the machine: ${left:-?}"
   if [ "${left:-1}" = 0 ] && [ $(( $(date +%s) - t0 )) -lt 180 ]; then say "RESULT PASS: mount: the pod's end left no mount on the machine"
   else say "RESULT FAIL: mount: pod end left ${left:-?} FUSE mounts"; fi
+
+  # Without propagation on the runtime side (what main rendered), the
+  # create is refused instead of handing the sandbox the empty folder.
+  local where
+  where=$($k get statefulset aerolvm -o json | python3 -c 'import json,sys
+cs=json.load(sys.stdin)["spec"]["template"]["spec"]["containers"]
+ci=[i for i,x in enumerate(cs) if x["name"]=="runtime"][0]
+mi=[i for i,m in enumerate(cs[ci]["volumeMounts"]) if m["name"]=="mounts"][0]
+print("/spec/template/spec/containers/%d/volumeMounts/%d/mountPropagation" % (ci, mi))')
+  $k patch statefulset aerolvm --type=json -p "[{\"op\":\"remove\",\"path\":\"$where\"}]" >/dev/null 2>&1 ||
+    say "could not patch the runtime container's mounts propagation ($where)"
+  $k delete pod $pod --wait=true --timeout=180s >/dev/null 2>&1
+  for _ in $(seq 1 60); do
+    $k get pod $pod >/dev/null 2>&1 && break
+    sleep 2
+  done
+  $k wait --for=condition=Ready pod/$pod --timeout=300s >/dev/null 2>&1
+  say "runtime mounts propagation now: $($k get pod $pod -o jsonpath='{.spec.containers[?(@.name=="runtime")].volumeMounts[?(@.name=="mounts")].mountPropagation}')"
+  pf=""
+  fwdm
+  out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d "$body")
+  say "create without propagation: $(head -c 400 <<<"$out")"
+  if grep -q 'not visible to the container runtime' <<<"$out"; then
+    say "RESULT PASS: mount: without propagation the create is refused, not served the empty folder"
+  else
+    say "RESULT FAIL: mount: without propagation the create answered: $(head -c 200 <<<"$out")"
+  fi
   kill $pf 2>/dev/null
 }
