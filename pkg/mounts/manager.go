@@ -207,6 +207,7 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		helpers = m.listHelperProcesses()
 	}
 
+	var failed error
 	for i, spec := range mounts {
 		var (
 			state *mountState
@@ -223,12 +224,8 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 			state, bind, err = m.mountOne(ctx, sandboxID, i, spec)
 		}
 		if err != nil {
-			// Roll back everything we just established for this sandbox.
-			for _, s := range established {
-				_ = m.tearDownState(s)
-			}
-			_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
-			return nil, fmt.Errorf("mount %d (%s): %w", i, spec.Type, err)
+			failed = fmt.Errorf("mount %d (%s): %w", i, spec.Type, err)
+			break
 		}
 		established = append(established, state)
 		binds = append(binds, bind)
@@ -236,17 +233,21 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 	// Every mount must be where the sandbox is built, or the sandbox gets
 	// the empty folder under it (F13). Checked once all are up, adopted
 	// ones too, and the whole set rolled back like any other failure.
-	for i, bind := range binds {
-		if bind.Tmpfs || bind.HostPath == "" {
+	for i := 0; failed == nil && i < len(binds); i++ {
+		if binds[i].Tmpfs || binds[i].HostPath == "" {
 			continue
 		}
-		if err := m.checkVisible(bind.HostPath); err != nil {
-			for _, s := range established {
-				_ = m.tearDownState(s)
-			}
-			_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
-			return nil, fmt.Errorf("mount %d (%s): %w", i, mounts[i].Type, err)
+		if err := m.checkVisible(binds[i].HostPath); err != nil {
+			failed = fmt.Errorf("mount %d (%s): %w", i, mounts[i].Type, err)
 		}
+	}
+	if failed != nil {
+		// Roll back everything we just established for this sandbox.
+		for _, s := range established {
+			_ = m.tearDownState(s)
+		}
+		_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
+		return nil, failed
 	}
 
 	m.mu.Lock()

@@ -95,6 +95,12 @@ func TestCheckVisible(t *testing.T) {
 	if err := m.checkVisible(filepath.Join(m.rootDir, "missing")); !errors.Is(err, ErrMountNotVisible) {
 		t.Fatalf("a mount point that is gone: %v", err)
 	}
+	// Nothing outside the mounts folder is looked at, however it is spelled.
+	for _, p := range []string{t.TempDir(), m.rootDir, filepath.Join(m.rootDir, "sb-visible", "..", "..", "etc")} {
+		if err := m.checkVisible(p); !errors.Is(err, ErrMountNotVisible) || !strings.Contains(err.Error(), "not below the mounts folder") {
+			t.Errorf("%s: %v, want it refused as outside the mounts folder", p, err)
+		}
+	}
 }
 
 // A mount the runtime cannot see fails the whole set: every mount made is

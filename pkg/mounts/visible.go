@@ -39,11 +39,17 @@ func (m *Manager) checkVisible(hostPath string) error {
 	if err != nil || pid <= 0 {
 		return fmt.Errorf("%w: %s holds no pid: %q", ErrMountNotVisible, m.runtimePIDFile, strings.TrimSpace(string(raw)))
 	}
-	mine, err := os.Stat(hostPath)
+	// Only a path below the mounts root is ever looked at, here or through
+	// the runtime's root: a mount point is always one.
+	clean := filepath.Clean(hostPath)
+	if !strings.HasPrefix(clean, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
+		return fmt.Errorf("%w: %s is not below the mounts folder %s", ErrMountNotVisible, hostPath, m.rootDir)
+	}
+	mine, err := os.Stat(clean)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrMountNotVisible, err)
 	}
-	theirs, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid), "root", hostPath))
+	theirs, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid), "root", clean))
 	if err != nil {
 		return fmt.Errorf("%w: %s as the runtime (pid %d) sees it: %v", ErrMountNotVisible, hostPath, pid, err)
 	}
