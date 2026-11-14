@@ -539,6 +539,14 @@ type placementFSM struct {
 	// deletingIndex bounds leader cleanup of abandoned delete fences to the
 	// number of in-flight deletions rather than the full placement fleet.
 	deletingIndex map[string]struct{}
+	// orphanedRecoveryIndex holds the orphaned placements whose sandbox
+	// wants a failover recreate: those no node had room for when their
+	// owner died, or that a target refused for capacity (R14). The leader's
+	// retryOrphanedRecoveries pages it, so its work follows that backlog,
+	// not the fleet. Derived from the rows, never persisted: every write
+	// (storePlacementLocked) and delete keeps it, and Restore rebuilds it,
+	// so every replica holds the same set and no FSM format changes.
+	orphanedRecoveryIndex *btree.BTreeG[string]
 	// drainedNodes holds the set of nodeIDs an operator has marked as
 	// "exclude from SelectPlacement candidate set". Stored in the FSM (not in
 	// gossip) so the state survives the drained node going away — operators
@@ -753,6 +761,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		pendingReservationRuntimes:   make(map[string]map[string]int),
 		reservedIndex:                make(map[string]struct{}),
 		deletingIndex:                make(map[string]struct{}),
+		orphanedRecoveryIndex:        newPlacementIDIndex(),
 		drainedNodes:                 make(map[string]bool),
 		storageRetirements:           make(map[string]NodeStorageRetirement),
 		storageObligations:           make(map[string]StorageObligation),
@@ -1339,7 +1348,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.deletingIndex, cmd.SandboxID)
+		f.unindexDeletedPlacementLocked(cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opBeginDelete:
@@ -1427,7 +1436,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		f.releaseEgressProfilesLocked(cmd.SandboxID)
 		f.reindexTeamUsageLocked(cmd.SandboxID, nil)
 		delete(f.placements, cmd.SandboxID)
-		delete(f.deletingIndex, cmd.SandboxID)
+		f.unindexDeletedPlacementLocked(cmd.SandboxID)
 		f.recordPlacementChangeLocked(cmd.SandboxID, true)
 		return nil
 	case opPruneAuditACL:
@@ -1553,7 +1562,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			f.releaseEgressProfilesLocked(id)
 			f.reindexTeamUsageLocked(id, nil)
 			delete(f.placements, id)
-			delete(f.deletingIndex, id)
+			f.unindexDeletedPlacementLocked(id)
 			f.recordPlacementChangeLocked(id, true)
 		}
 		// Drop the dead node's snapshot-home entries: its local SQLite catalogue
@@ -3207,6 +3216,7 @@ func (f *placementFSM) storePlacementLocked(id string, p Placement) error {
 }
 
 func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
+	f.indexOrphanedRecoveryLocked(id, p)
 	if f.deletingIndex == nil {
 		f.deletingIndex = make(map[string]struct{})
 	}
@@ -3215,6 +3225,62 @@ func (f *placementFSM) indexDeletingStateLocked(id string, p Placement) {
 		return
 	}
 	delete(f.deletingIndex, id)
+}
+
+// indexOrphanedRecoveryLocked keeps id in orphanedRecoveryIndex exactly
+// while its hot row p is orphaned and still wants a failover recreate.
+func (f *placementFSM) indexOrphanedRecoveryLocked(id string, p Placement) {
+	if f.orphanedRecoveryIndex == nil {
+		f.orphanedRecoveryIndex = newPlacementIDIndex()
+	}
+	if p.IsOrphaned() && placementMovableOnFailover(p) {
+		f.orphanedRecoveryIndex.ReplaceOrInsert(id)
+		return
+	}
+	f.orphanedRecoveryIndex.Delete(id)
+}
+
+// unindexDeletedPlacementLocked drops a deleted row from the indexes kept
+// by state.
+func (f *placementFSM) unindexDeletedPlacementLocked(id string) {
+	delete(f.deletingIndex, id)
+	if f.orphanedRecoveryIndex != nil {
+		f.orphanedRecoveryIndex.Delete(id)
+	}
+}
+
+// orphanedRecoveryLen is the size of orphanedRecoveryIndex.
+func (f *placementFSM) orphanedRecoveryLen() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.orphanedRecoveryIndex == nil {
+		return 0
+	}
+	return f.orphanedRecoveryIndex.Len()
+}
+
+// orphanedRecoveryPage returns up to limit ids from orphanedRecoveryIndex
+// after the cursor, in order, and whether the walk reached the end.
+func (f *placementFSM) orphanedRecoveryPage(after string, limit int) ([]string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.orphanedRecoveryIndex == nil || limit <= 0 {
+		return nil, true
+	}
+	ids := make([]string, 0, limit)
+	end := true
+	f.orphanedRecoveryIndex.AscendGreaterOrEqual(after, func(id string) bool {
+		if after != "" && id <= after {
+			return true
+		}
+		if len(ids) == limit {
+			end = false
+			return false
+		}
+		ids = append(ids, id)
+		return true
+	})
+	return ids, end
 }
 
 func (f *placementFSM) deletePlacementRecoveryLocked(id string) {
@@ -4306,6 +4372,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.pendingReservationExpiries = nil
 	f.reservedIndex = make(map[string]struct{})
 	f.deletingIndex = make(map[string]struct{})
+	f.orphanedRecoveryIndex = newPlacementIDIndex()
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)

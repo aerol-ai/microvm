@@ -99,6 +99,9 @@ type Cluster struct {
 	// Close can stop its loop. See dead_owner.go for the reconciler logic.
 	deadOwners        *deadOwnerTracker
 	deadOwnerLoopStop context.CancelFunc
+	// orphanRetry is the leader's place in the orphaned-recovery backlog
+	// (orphan_recovery.go).
+	orphanRetry orphanRetryCursor
 
 	// reservationGCStop cancels the leader-only sweep that cancels expired
 	// opReserve rows. Followers run no loop because every CancelReservation
