@@ -216,9 +216,6 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.startPeriodic(ctx, check, lease, func(c context.Context) {
 		s.enforceOwnershipLease(c, time.Now())
 	})
-	if s.ownershipLeaseFileOn() {
-		go s.runOwnershipLeaseFileWriter(ctx)
-	}
 }
 
 // beginOwnershipLease starts the lease clock at now: a node that has just
