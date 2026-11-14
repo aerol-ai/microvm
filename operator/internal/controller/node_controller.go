@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -66,7 +68,26 @@ type NodeReconciler struct {
 	// namespaces: the API server's Service and addresses in default, and
 	// the ServiceCIDRs (C24). Nil uses the client.
 	Reader client.Reader
+	// MaxConcurrentReconciles is how many AerolNodes are reconciled at once
+	// (DefaultNodeConcurrency when zero). controller-runtime's default is
+	// one: a cell's 2,000 nodes behind one worker, where one server that
+	// stopped answering held them all (review R3). One node is never
+	// reconciled twice at once.
+	MaxConcurrentReconciles int
+	// EvacuateWait is how long a reconcile waits for a decommission pass it
+	// started before it comes back for the result (defaultEvacuateWait
+	// when zero).
+	EvacuateWait time.Duration
+
+	evacOnce sync.Once
+	evacs    *evacuations
 }
+
+// DefaultNodeConcurrency is the node controller's workers. Each pass makes
+// a few quick admin API calls (each bounded by aerolapi.DefaultCallTimeout)
+// and evacuate passes run in the background, so 16 keep a 2,000-node cell's
+// 30-second passes going with servers slow to answer.
+const DefaultNodeConcurrency = 16
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
@@ -821,8 +842,16 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1.AerolNode{}).
 		Watches(&corev1.Pod{}, toNode).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.nodeToAerolNodes)).
+		WithOptions(crcontroller.Options{MaxConcurrentReconciles: r.concurrency()}).
 		Named("aerolnode").
 		Complete(r)
+}
+
+func (r *NodeReconciler) concurrency() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return DefaultNodeConcurrency
 }
 
 // nodeToAerolNodes wakes the AerolNodes whose pods run on a Kubernetes Node

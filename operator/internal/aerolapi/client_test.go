@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
@@ -134,5 +135,47 @@ func TestClient(t *testing.T) {
 	}
 	if (&Client{BaseURL: "http://127.0.0.1:1"}).Ready(ctx) {
 		t.Fatal("nothing listens there")
+	}
+}
+
+// A server that stops answering holds a quick call CallTimeout, not the
+// HTTP client's minutes; an evacuate pass, which may take minutes, is
+// bound only by the HTTP client (review R3).
+func TestCallTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/cluster/nodes/w1/evacuate" {
+			time.Sleep(150 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"done":true}`))
+			return
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); srv.Close() })
+	c := New(srv.URL, "tok")
+	if c.CallTimeout != DefaultCallTimeout || c.HTTP.Timeout != EvacuateTimeout {
+		t.Fatalf("defaults: call %s, http %s", c.CallTimeout, c.HTTP.Timeout)
+	}
+	c.CallTimeout = 50 * time.Millisecond
+	start := time.Now()
+	if _, err := c.GetNode(context.Background(), "w1"); err == nil {
+		t.Fatal("a call to a server that never answers returned no error")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the call waited %s", d)
+	}
+	res, err := c.Evacuate(context.Background(), "w1", EvacuateRequest{})
+	if err != nil || !res.Done {
+		t.Fatalf("an evacuate pass longer than CallTimeout: %+v %v", res, err)
+	}
+	// A zero CallTimeout (a hand-made Client) leaves the call to ctx.
+	c.CallTimeout = 0
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if c.Ready(ctx) {
+		t.Fatal("ready from a server that never answers")
 	}
 }

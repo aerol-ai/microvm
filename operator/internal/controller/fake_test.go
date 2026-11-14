@@ -79,6 +79,8 @@ func (f *fakeAPI) GetNode(_ context.Context, id string) (aerolapi.Node, error) {
 }
 func (f *fakeAPI) Members(context.Context) ([]aerolapi.Node, error) { return f.members, f.membersErr }
 func (f *fakeAPI) Cordon(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.cordoned = append(f.cordoned, id)
 	return nil
 }
@@ -90,10 +92,14 @@ func (f *fakeAPI) Evacuate(_ context.Context, id string, req aerolapi.EvacuateRe
 	return f.evacuate(id, req)
 }
 func (f *fakeAPI) Gone(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.gone = append(f.gone, id)
 	return nil
 }
 func (f *fakeAPI) DeleteNode(_ context.Context, id string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, id)
 	return f.deleteErr
 }

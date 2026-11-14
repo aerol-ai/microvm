@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -894,4 +896,209 @@ func podMounts(p *corev1.Pod, claim string) bool {
 		}
 	}
 	return false
+}
+
+// decommissioning returns a serving worker on m1 whose decommission is
+// past its drain window, so its next pass evacuates.
+func decommissioning(t *testing.T, g *nodeRig, name string) {
+	t.Helper()
+	g.reconcile(name)
+	g.running(g.pod(testWorkerNS, name), "m1", true)
+	g.api.mu.Lock()
+	g.api.nodes[name] = aerolapi.Node{Alive: true, SandboxesOwned: 4}
+	g.api.mu.Unlock()
+	n := g.node(name)
+	n.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	if err := g.cl.Update(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	g.reconcile(name) // the drain window starts
+	g.now = g.now.Add(defaultDrainWindow + time.Second)
+}
+
+// One slow evacuate pass must not hold the node controller (review R3): a
+// pass can take minutes, and a reconcile that waited for it held a worker
+// that long. Now the reconcile comes back for the answer, starts no second
+// pass and makes no second cordon meanwhile, and another node's reconcile
+// runs while the pass is still out.
+func TestSlowEvacuateDoesNotBlockAnotherNode(t *testing.T) {
+	c := bootstrapped(testCluster())
+	slow := node("prod-general-slow1", v1.RoleWorker, "general", "z-a")
+	other := node("prod-general-other", v1.RoleWorker, "general", "z-b")
+	g := newNodeRig(t, c, slow, other, machine("m1"))
+	g.r.EvacuateWait = 20 * time.Millisecond
+	decommissioning(t, g, slow.Name)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	passes := 0
+	g.api.evacuate = func(id string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		mu.Lock()
+		passes++
+		mu.Unlock()
+		<-release
+		return aerolapi.EvacuateResult{Moved: []string{"a", "b"}, RemainingMovable: 2}, nil
+	}
+	cordons := len(g.api.cordoned)
+	start := time.Now()
+	res := g.reconcile(slow.Name)
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("the reconcile waited %s for a pass still running", d)
+	}
+	if res.RequeueAfter != evacuatePoll {
+		t.Fatalf("requeue %v, want %v", res.RequeueAfter, evacuatePoll)
+	}
+	if got := g.node(slow.Name); got.Status.State != v1.StateDecommissioning {
+		t.Fatalf("state %s", got.Status.State)
+	}
+	// Another node is reconciled meanwhile.
+	g.reconcile(other.Name)
+	if g.pod(testWorkerNS, other.Name) == nil {
+		t.Fatal("another node got no pod while a pass ran")
+	}
+	// Coming back while the pass runs: no second pass, no second cordon.
+	g.reconcile(slow.Name)
+	g.api.mu.Lock()
+	cordoned := len(g.api.cordoned)
+	g.api.mu.Unlock()
+	mu.Lock()
+	n := passes
+	mu.Unlock()
+	if n != 1 || cordoned != cordons+1 {
+		t.Fatalf("passes %d, cordons %d (want 1, %d)", n, cordoned, cordons+1)
+	}
+	close(release)
+	run := g.r.evacuations().get(evacKey(g.node(slow.Name)))
+	if run == nil || !run.wait(5*time.Second) {
+		t.Fatal("the pass never ended")
+	}
+	g.reconcile(slow.Name)
+	got := g.node(slow.Name)
+	if d := got.Status.Decommission; d == nil || d.Moved != 2 || d.Remaining != 2 {
+		t.Fatalf("the pass's answer was not taken: %+v", got.Status.Decommission)
+	}
+	if g.r.evacuations().get(evacKey(got)) != nil {
+		t.Fatal("a taken answer was kept")
+	}
+}
+
+// A pass that started before the deadline did not stop the rest, even when
+// its answer comes after the deadline: the node is not deleted on it, and
+// the next pass stops the rest.
+func TestEvacuateAnswerAfterTheDeadline(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-late1", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	g.r.EvacuateWait = 20 * time.Millisecond
+	decommissioning(t, g, n.Name)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var reqs []aerolapi.EvacuateRequest
+	g.api.evacuate = func(id string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		mu.Lock()
+		reqs = append(reqs, req)
+		mu.Unlock()
+		if !req.StopRemaining {
+			<-release
+			return aerolapi.EvacuateResult{Moved: []string{"a"}, Remaining: 2}, nil
+		}
+		return aerolapi.EvacuateResult{Stopped: 2, Done: true}, nil
+	}
+	g.reconcile(n.Name) // the pass starts, before the deadline
+	g.now = g.now.Add(defaultDecomDeadline)
+	close(release)
+	run := g.r.evacuations().get(evacKey(g.node(n.Name)))
+	if run == nil || !run.wait(5*time.Second) {
+		t.Fatal("the pass never ended")
+	}
+	g.reconcile(n.Name) // its answer, after the deadline
+	g.api.mu.Lock()
+	deleted := len(g.api.deleted)
+	g.api.mu.Unlock()
+	if deleted != 0 {
+		t.Fatal("the node was deleted on a pass that stopped nothing")
+	}
+	g.reconcile(n.Name) // the next pass stops the rest
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 2 || !reqs[1].StopRemaining {
+		t.Fatalf("passes %+v", reqs)
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved {
+		t.Fatalf("state %s (%s)", got.Status.State, got.Status.Reason)
+	}
+}
+
+// At most maxEvacuations passes run at once; a node over that waits its
+// turn, and an answer nobody came back for is dropped in time.
+func TestEvacuationsCap(t *testing.T) {
+	e := &evacuations{runs: map[string]*evacRun{}}
+	release := make(chan struct{})
+	block := func(context.Context) (aerolapi.EvacuateResult, error) {
+		<-release
+		return aerolapi.EvacuateResult{Done: true}, nil
+	}
+	for i := range maxEvacuations {
+		if e.start(fmt.Sprint("n", i), aerolapi.EvacuateRequest{}, block) == nil {
+			t.Fatalf("pass %d refused", i)
+		}
+	}
+	if e.start("over", aerolapi.EvacuateRequest{}, block) != nil {
+		t.Fatal("a pass past the cap started")
+	}
+	close(release)
+	for i := range maxEvacuations {
+		if !e.get(fmt.Sprint("n", i)).wait(5 * time.Second) {
+			t.Fatal("a pass never ended")
+		}
+	}
+	if e.start("over", aerolapi.EvacuateRequest{}, block) == nil {
+		t.Fatal("finished passes still count against the cap")
+	}
+	// An answer older than evacuateKeep goes on the next start.
+	e.mu.Lock()
+	e.runs["n0"].doneAt = time.Now().Add(-evacuateKeep - time.Minute)
+	e.mu.Unlock()
+	e.start("another", aerolapi.EvacuateRequest{}, block)
+	if e.get("n0") != nil {
+		t.Fatal("an old answer nobody came back for was kept")
+	}
+	if e.get("n1") == nil {
+		t.Fatal("a recent answer was dropped")
+	}
+}
+
+// The node controller runs DefaultNodeConcurrency reconciles at once
+// unless told otherwise; controller-runtime's own default is one.
+func TestNodeConcurrency(t *testing.T) {
+	if got := (&NodeReconciler{}).concurrency(); got != DefaultNodeConcurrency || got < 2 {
+		t.Fatalf("default %d", got)
+	}
+	if got := (&NodeReconciler{MaxConcurrentReconciles: 3}).concurrency(); got != 3 {
+		t.Fatalf("set %d", got)
+	}
+}
+
+// With maxEvacuations passes out, a node waits its turn and says so.
+func TestDecommissionWaitsItsTurn(t *testing.T) {
+	n := node("prod-general-turn1", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, bootstrapped(testCluster()), n, machine("m1"))
+	decommissioning(t, g, n.Name)
+	release := make(chan struct{})
+	defer close(release)
+	for i := range maxEvacuations {
+		g.r.evacuations().start(fmt.Sprint("busy", i), aerolapi.EvacuateRequest{}, func(context.Context) (aerolapi.EvacuateResult, error) {
+			<-release
+			return aerolapi.EvacuateResult{}, nil
+		})
+	}
+	g.api.evacuate = func(string, aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		t.Error("a pass past the cap started")
+		return aerolapi.EvacuateResult{}, nil
+	}
+	if res := g.reconcile(n.Name); res.RequeueAfter != 10*time.Second {
+		t.Fatalf("requeue %v", res.RequeueAfter)
+	}
+	if got := g.node(n.Name); !strings.Contains(got.Status.Reason, "waiting its turn") {
+		t.Fatalf("reason %q", got.Status.Reason)
+	}
 }
