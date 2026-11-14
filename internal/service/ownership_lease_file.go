@@ -99,19 +99,17 @@ func (s *Service) publishOwnershipFence(ctx context.Context) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.confirmed.IsZero() {
-		return fmt.Errorf("fence the new sandbox: no ownership read has succeeded: %w", ErrOwnershipFenced)
-	}
 	return s.writeOwnershipLeaseFileLocked(ctx)
 }
 
 // writeOwnershipLeaseFileLocked writes the file under the last read, with
-// every local recreate-policy sandbox, listed now, as the fence. Nothing
-// before this process's first successful read.
+// every local recreate-policy sandbox, listed now, as the fence. It refuses
+// before this process's first successful read: a lease no read proved must
+// never reach the supervisor (both callers have one by then).
 func (s *Service) writeOwnershipLeaseFileLocked(ctx context.Context) error {
 	f := &s.ownershipFile
 	if f.confirmed.IsZero() {
-		return nil
+		return fmt.Errorf("fence the new sandbox: no ownership read has succeeded: %w", ErrOwnershipFenced)
 	}
 	rows, err := s.localRecreateSandboxes(ctx)
 	if err == nil {

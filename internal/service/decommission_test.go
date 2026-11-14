@@ -411,3 +411,19 @@ func TestResumeLapsedMoveAsksTheLeader(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// A process that cannot list its rows at start re-arms nothing, and says
+// so; the start gate still reads each row it is asked to start.
+func TestRearmMoveFencesWithoutTheRows(t *testing.T) {
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	putRunning(t, svc, "sb-x")
+	if got := svc.ReleaseForMove(context.Background(), []string{"sb-x"}, nil); got["sb-x"] != MoveReleased {
+		t.Fatalf("release: %v", got)
+	}
+	fresh := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
+	_ = st.Close()
+	fresh.rearmMoveFences(context.Background())
+	if fresh.OwnershipFenced("sb-x") {
+		t.Fatal("re-armed a fence without reading the rows")
+	}
+}
