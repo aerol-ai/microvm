@@ -3,12 +3,14 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -137,5 +139,105 @@ func TestPodGuardRefusesDeleteDuringEvacuation(t *testing.T) {
 		if !strings.Contains(resp.Result.Message, want) {
 			t.Errorf("refusal %q does not say %q", resp.Result.Message, want)
 		}
+	}
+}
+
+// evictionRequest is what the API server sends for an eviction: a CREATE on
+// pods/eviction carrying an Eviction, never the pod itself.
+func evictionRequest(t *testing.T, namespace, name, user string, named bool) admission.Request {
+	t.Helper()
+	raw, err := json.Marshal(&policyv1.Eviction{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+		Operation: admissionv1.Create, SubResource: "eviction",
+		Kind:     metav1.GroupVersionKind{Group: "policy", Version: "v1", Kind: "Eviction"},
+		Resource: metav1.GroupVersionResource{Version: "v1", Resource: "pods"},
+		Object:   runtime.RawExtension{Raw: raw}, UserInfo: authv1.UserInfo{Username: user}}}
+	if named {
+		req.Name, req.Namespace = name, namespace
+	}
+	return req
+}
+
+// An eviction (kubectl drain, a node group update, Karpenter) never reaches
+// a DELETE rule, and the API server deletes the pod itself once no
+// PodDisruptionBudget holds it. So evictions get the delete rules, and a
+// refusal is a 429, the answer a PodDisruptionBudget gives, which drain and
+// node group updates wait on and retry (R13).
+func TestPodGuardEviction(t *testing.T) {
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(v1.AddToScheme(s))
+	moving := aerolNode("w-moving", v1.StateDecommissioning, false)
+	moving.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	moving.Status.Decommission = &v1.DecommissionStatus{Moved: 8, Remaining: 100}
+	done := aerolNode("w-done", v1.StateDecommissioning, false)
+	done.Annotations = map[string]string{v1.AnnotationDecommission: "true"}
+	done.Status.Decommission = &v1.DecommissionStatus{Moved: 3}
+	server := workerPod("s-0", corev1.PodRunning, nil)
+	server.Labels["app.kubernetes.io/component"] = "server"
+	objs := []client.Object{
+		aerolNode("w-live", v1.StateServing, false), moving, done,
+		aerolNode("w-removed", v1.StateRemoved, false),
+		workerPod("w-live", corev1.PodRunning, nil),
+		workerPod("w-moving", corev1.PodRunning, nil),
+		workerPod("w-done", corev1.PodRunning, nil),
+		workerPod("w-removed", corev1.PodRunning, nil),
+		workerPod("w-new", corev1.PodPending, nil),
+		server,
+	}
+	forced := workerPod("w-forced", corev1.PodRunning, map[string]string{v1.AnnotationForceDelete: "true"})
+	objs = append(objs, aerolNode("w-forced", v1.StateServing, false), forced)
+	g := &PodGuard{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build(),
+		OperatorUser: "system:serviceaccount:aerolvm-system:aerolvm-operator", Namespace: ns}
+	const workers = "aerolvm-workers"
+	cases := []struct {
+		name, pod, user string
+		named, allow    bool
+	}{
+		{"a live worker, kubectl drain: refused", "w-live", "alice", true, false},
+		{"a managed node group update: refused", "w-live", "eks:node-manager", true, false},
+		{"its sandboxes still moving: refused", "w-moving", "system:serviceaccount:karpenter:karpenter", true, false},
+		{"the pod named only in the Eviction: refused", "w-live", "alice", false, false},
+		{"every sandbox moved", "w-done", "alice", true, true},
+		{"its node is removed", "w-removed", "alice", true, true},
+		{"forced", "w-forced", "alice", true, true},
+		{"not running yet", "w-new", "alice", true, true},
+		{"not a worker pod", "s-0", "alice", true, true},
+		{"no such pod", "w-gone", "alice", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := g.Handle(context.Background(), evictionRequest(t, workers, tc.pod, tc.user, tc.named))
+			if resp.Allowed != tc.allow {
+				t.Fatalf("allowed = %v (%s), want %v", resp.Allowed, resp.Result.Message, tc.allow)
+			}
+			if tc.allow {
+				return
+			}
+			if resp.Result.Code != http.StatusTooManyRequests || resp.Result.Reason != metav1.StatusReasonTooManyRequests {
+				t.Fatalf("refusal is %d %s, want 429 TooManyRequests so evictions retry", resp.Result.Code, resp.Result.Reason)
+			}
+			if !strings.Contains(resp.Result.Message, v1.AnnotationForceDelete) {
+				t.Fatalf("a refusal must say what to do instead: %q", resp.Result.Message)
+			}
+		})
+	}
+	// A delete refusal stays a 403: only evictions are retried.
+	if resp := g.Handle(context.Background(), request(t, admissionv1.Delete, workerPod("w-live", corev1.PodRunning, nil), "alice")); resp.Result.Code != http.StatusForbidden {
+		t.Fatalf("a refused delete answered %d, want 403", resp.Result.Code)
+	}
+	// Creating a pod, or any other subresource, is not guarded.
+	other := evictionRequest(t, workers, "w-live", "alice", true)
+	other.SubResource = "binding"
+	if !g.Handle(context.Background(), other).Allowed {
+		t.Fatal("a CREATE that is not an eviction must pass")
+	}
+	bad := evictionRequest(t, workers, "w-live", "alice", false)
+	bad.Object.Raw = []byte("{")
+	if !g.Handle(context.Background(), bad).Allowed {
+		t.Fatal("an unreadable eviction must fail open")
 	}
 }

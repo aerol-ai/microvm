@@ -6,10 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -32,6 +35,11 @@ import (
 // are still moving, and the operator deletes the pod itself once they have
 // moved or stopped.
 //
+// An eviction (kubectl drain, a node group update, Karpenter) ends the pod
+// the same way, so the same rules decide it. The chart's worker
+// PodDisruptionBudget refuses evictions first; this check holds if that
+// budget is removed.
+//
 // The webhook is registered with failurePolicy: Ignore, so an operator
 // outage never blocks a cluster repair; the "worker pod lost without a
 // decommission" alert (aerolvm_operator_worker_pods_lost_total) still fires.
@@ -49,25 +57,77 @@ type PodGuard struct {
 // gcUser is the garbage collector, which deletes what an owner left.
 const gcUser = "system:serviceaccount:kube-system:generic-garbage-collector"
 
-// Handle decides one pod delete.
+// Handle decides one pod delete or eviction.
 func (g *PodGuard) Handle(ctx context.Context, req admission.Request) admission.Response {
-	if req.Operation != admissionv1.Delete {
+	var pod *corev1.Pod
+	evict := false
+	switch {
+	case req.Operation == admissionv1.Delete:
+		pod = &corev1.Pod{}
+		if err := json.Unmarshal(req.OldObject.Raw, pod); err != nil {
+			// Unreadable: let it through, as an outage would.
+			return admission.Allowed("unreadable pod; not guarded")
+		}
+	case req.Operation == admissionv1.Create && req.SubResource == "eviction":
+		evict = true
+		var why string
+		if pod, why = g.evictedPod(ctx, req); pod == nil {
+			return admission.Allowed(why)
+		}
+	default:
 		return admission.Allowed("")
 	}
-	var pod corev1.Pod
-	if err := json.Unmarshal(req.OldObject.Raw, &pod); err != nil {
-		// Unreadable: let it through, as an outage would.
-		return admission.Allowed("unreadable pod; not guarded")
-	}
-	allowed, why := g.decide(ctx, &pod, req.UserInfo.Username)
+	allowed, why := g.decide(ctx, pod, req.UserInfo.Username)
 	if !allowed {
+		if evict {
+			return refuseEviction(why)
+		}
 		return admission.Denied(why)
 	}
 	if strings.HasPrefix(why, "forced") {
-		log.FromContext(ctx).Info("worker pod deleted with force-delete", "pod", pod.Namespace+"/"+pod.Name, "user", req.UserInfo.Username)
+		verb := "deleted"
+		if evict {
+			verb = "evicted"
+		}
+		log.FromContext(ctx).Info("worker pod "+verb+" with force-delete", "pod", pod.Namespace+"/"+pod.Name, "user", req.UserInfo.Username)
 		return admission.Allowed(why).WithWarnings("deleting worker pod " + pod.Name + " ends every sandbox on it; recorded")
 	}
 	return admission.Allowed(why)
+}
+
+// evictedPod reads the pod an eviction names. The request carries an
+// Eviction, not the pod, and an Eviction has none of the pod's labels, so
+// the webhook rule for it cannot select worker pods by label either.
+func (g *PodGuard) evictedPod(ctx context.Context, req admission.Request) (*corev1.Pod, string) {
+	key := client.ObjectKey{Namespace: req.Namespace, Name: req.Name}
+	if key.Name == "" {
+		var e policyv1.Eviction
+		if err := json.Unmarshal(req.Object.Raw, &e); err != nil || e.Name == "" {
+			return nil, "unreadable eviction; not guarded"
+		}
+		key.Name = e.Name
+		if key.Namespace == "" {
+			key.Namespace = e.Namespace
+		}
+	}
+	var pod corev1.Pod
+	if err := g.Client.Get(ctx, key, &pod); err != nil {
+		// No such pod (the eviction fails by itself), or cannot tell:
+		// fail open, as the webhook's failure policy does.
+		return nil, "could not read the pod"
+	}
+	return &pod, ""
+}
+
+// refuseEviction refuses the way a PodDisruptionBudget does, with 429 Too
+// Many Requests. kubectl drain, a managed node group update and Karpenter
+// then wait and retry while the operator moves the worker's sandboxes; a
+// 403 would make kubectl drain give up at once.
+func refuseEviction(why string) admission.Response {
+	resp := admission.Denied(why)
+	resp.Result.Code = http.StatusTooManyRequests
+	resp.Result.Reason = metav1.StatusReasonTooManyRequests
+	return resp
 }
 
 func (g *PodGuard) decide(ctx context.Context, pod *corev1.Pod, user string) (bool, string) {
@@ -120,5 +180,6 @@ func (g *PodGuard) decide(ctx context.Context, pod *corev1.Pod, user string) (bo
 
 var _ admission.Handler = (*PodGuard)(nil)
 
-// Path is where the chart's ValidatingWebhookConfiguration points.
+// Path is where the chart's ValidatingWebhookConfiguration points, for
+// both deletes and evictions.
 const Path = "/validate-worker-pod-delete"

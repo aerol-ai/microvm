@@ -59,7 +59,7 @@ single mode), `aerolvm_component` is the kind of pod, and `namespace` and
 | A worker machine | Marks the node Suspect, then Dead. Starts a new worker if headroom needs one. | Gossip notices. After the grace period, failover rebuilds the sandboxes with `failover.policy=recreate` on other workers. That machine's other sandboxes are lost. | Nothing, unless many machines go. | [AerolVMNodeLost](#aerolvmnodelost), [AerolVMHeadroomLow](#aerolvmheadroomlow) |
 | A whole zone | Starts workers in the other zones, up to the headroom target. | Gateways and servers in the other zones carry on. Failover rebuilds in the other zones. | Watch headroom. | [AerolVMNodeLost](#aerolvmnodelost), [AerolVMHeadroomLow](#aerolvmheadroomlow) |
 | The Kubernetes API or etcd | Waits. It can scale, upgrade or hand out certificates only when the API is back. | Nothing changes for sandboxes. Creates through the SDKs, exec and links keep working. | Fix the Kubernetes API. AerolVM needs nothing. | [AerolVMOperatorReconcileErrors](#aerolvmoperatorreconcileerrors) |
-| A person deletes a worker pod | Its webhook refuses the delete, unless the pod was decommissioned or has `aerolvm.io/force-delete=true`. | If the delete goes through, every sandbox on that pod ends. | Decommission a worker instead of deleting it. | [AerolVMWorkerPodLost](#aerolvmworkerpodlost) |
+| A person deletes or drains a worker pod | Its webhook refuses the delete, also while the pod's sandboxes are still moving, unless every sandbox has moved or the pod has `aerolvm.io/force-delete=true`. The worker PodDisruptionBudget holds evictions (`kubectl drain`, node group updates, Karpenter) until the operator deletes the pod itself. | If the delete goes through, every sandbox on that pod ends. | Decommission a worker instead of deleting it. | [AerolVMWorkerPodLost](#aerolvmworkerpodlost) |
 | The bank's certificate issuer (external-CA mode only) | Retries. | Running nodes keep their certificates and keep working. New machines wait to join. | Fix the issuer. | [AerolVMNodeCertificateFailing](#aerolvmnodecertificatefailing) |
 | The cloud has no machines of that type | Keeps the new pods Pending and waits. | Headroom covers new sandboxes for a while. Then creates get "no room" (503 with Retry-After). | Pick another machine type, or raise the cloud quota. | [AerolVMNodePending](#aerolvmnodepending), [AerolVMHeadroomLow](#aerolvmheadroomlow), [AerolVMCreatesRefusedNoRoom](#aerolvmcreatesrefusednoroom) |
 | Object storage | Nothing. | Snapshots and audit export wait and retry. | Fix the storage or its permissions. | Not in the chart yet: see `SandboxdAuditExportLagging` in `setup/prometheus/sandboxd-alerts.yml`. |
@@ -207,6 +207,9 @@ only the ones with `failover.policy=recreate`.
   time shows which pod went.
 - Was the operator's webhook running? A webhook that is down lets deletes
   through, so it never blocks repairs.
+- Is the worker PodDisruptionBudget (`<release>-workers` in the worker
+  namespace) still there? Without it, a drain or a node group update can
+  evict a worker while the webhook is down.
 
 **Fix.**
 

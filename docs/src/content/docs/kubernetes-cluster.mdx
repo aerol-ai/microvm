@@ -283,7 +283,9 @@ Machines go away on purpose all the time: a new machine image, a Kubernetes upgr
 
 Each step is saved on the worker's `AerolNode`, so an operator restart picks up where it stopped. `kubectl describe aerolnode <name>` shows the progress as events.
 
-A worker pod cannot be deleted by mistake: the operator refuses `kubectl delete pod` on a live worker. To delete one anyway, set `aerolvm.io/force-delete=true` on the pod first; the delete is logged.
+A worker pod cannot be removed by mistake. The operator refuses `kubectl delete pod` on a live worker, also while its sandboxes are still moving. `kubectl drain`, a node group update and Karpenter cannot evict it either: the chart gives worker pods a PodDisruptionBudget that allows no eviction, so they wait while the operator moves the sandboxes, and the operator then deletes the pod itself. To delete one anyway, set `aerolvm.io/force-delete=true` on the pod first; the delete is logged.
+
+On an EKS managed node group, an update waits 15 minutes for each machine and then stops. If moving a worker's sandboxes takes longer, drain the pool before the update. The Auto Scaling group's AZRebalance and scale-in do not wait for the budget, so suspend AZRebalance on worker node groups.
 
 <Aside>
 A machine that dies without warning is different: no move is possible. Sandboxes with `failover.policy: recreate` start again on another worker in another zone, after about 30 seconds, or 16 seconds once the operator sees the machine is gone. Other sandboxes on it are lost.
