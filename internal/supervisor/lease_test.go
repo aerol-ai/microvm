@@ -33,7 +33,7 @@ func newLeaseHarness(t *testing.T, refs ...string) *leaseHarness {
 	h := &leaseHarness{now: time.Unix(1_000, 0), file: filepath.Join(t.TempDir(), "ownership-lease"), dir: t.TempDir(),
 		frozen: map[string]bool{}, logs: &bytes.Buffer{}}
 	for _, ref := range refs {
-		if err := os.Mkdir(filepath.Join(h.dir, ref), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(h.dir, ref), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -45,7 +45,13 @@ func newLeaseHarness(t *testing.T, refs ...string) *leaseHarness {
 			if h.err != nil {
 				return h.err
 			}
-			h.frozen[filepath.Base(dir)] = frozen
+			// By the group's path under the sandboxes' parent: a VM's is
+			// aerolvm-vmm/<sandbox>.
+			rel, err := filepath.Rel(h.dir, dir)
+			if err != nil {
+				return err
+			}
+			h.frozen[rel] = frozen
 			return nil
 		}}
 	return h
@@ -257,5 +263,69 @@ func TestLeaseGuardRunAndCgroupFreeze(t *testing.T) {
 		if want := map[bool]string{true: "1", false: "0"}[frozen]; string(got) != want {
 			t.Fatalf("cgroup.freeze = %q, want %q", got, want)
 		}
+	}
+}
+
+// Two fence publications can share a millisecond (one per recreate-policy
+// create). The second one's fence is enforced: before, the guard took new
+// contents only when the write time changed, so a sandbox whose create was
+// acknowledged ran on past the lease (review N1). Re-reading the same
+// lease never renews its deadline.
+func TestLeaseGuardTakesASecondPublicationInTheSameMillisecond(t *testing.T) {
+	h := newLeaseHarness(t, "ctr-old", "ctr-new")
+	h.write(t, 15, []string{"ctr-old"}, []string{"ctr-old"})
+	h.step(0)
+	h.write(t, 15, []string{"ctr-old", "ctr-new"}, []string{"ctr-old"})
+	h.step(0)
+	// Read again and again within the lease: still the first deadline.
+	for range 10 {
+		h.step(time.Second)
+	}
+	if h.isFrozen("ctr-old") || h.isFrozen("ctr-new") {
+		t.Fatalf("frozen = %v within the lease", h.frozen)
+	}
+	h.step(6 * time.Second)
+	if !h.isFrozen("ctr-old") || !h.isFrozen("ctr-new") {
+		t.Fatalf("frozen = %v, want both sandboxes of the second publication", h.frozen)
+	}
+}
+
+// A Firecracker VM runs in its own group under the VMs' group
+// (aerolvm-vmm/<sandbox>), and the file names that group. The guard freezes
+// it, and never the VMs' group itself or another VM's: before, the file
+// named the sandbox ID, the guard looked for <parent>/<sandbox-id>, found
+// nothing, and the VM ran on past the lease (review N2).
+func TestLeaseGuardFreezesAFirecrackerVMsOwnGroup(t *testing.T) {
+	h := newLeaseHarness(t, "aerolvm-vmm/sb-vm", "aerolvm-vmm/sb-other")
+	h.write(t, 15, []string{"aerolvm-vmm/sb-vm"}, []string{"aerolvm-vmm/sb-vm"})
+	h.step(0)
+	h.step(16 * time.Second)
+	if !h.isFrozen("aerolvm-vmm/sb-vm") {
+		t.Fatalf("frozen = %v, want the VM's own group", h.frozen)
+	}
+	if h.isFrozen("aerolvm-vmm") || h.isFrozen("aerolvm-vmm/sb-other") {
+		t.Fatalf("frozen = %v: the VMs' group or another VM was frozen", h.frozen)
+	}
+	// A later read that proves ownership thaws it.
+	h.write(t, 15, []string{"aerolvm-vmm/sb-vm"}, []string{"aerolvm-vmm/sb-vm"})
+	h.step(0)
+	if h.isFrozen("aerolvm-vmm/sb-vm") {
+		t.Fatal("a proven VM stayed frozen")
+	}
+	// A ref outside the host groups is never followed.
+	h2 := newLeaseHarness(t, "aerolvm-wasm/sb-w")
+	h2.write(t, 15, []string{"aerolvm-wasm/sb-w"}, nil)
+	h2.step(0)
+	h2.step(16 * time.Second)
+	if len(h2.frozen) != 0 {
+		t.Fatalf("froze %v from a ref outside the host groups", h2.frozen)
+	}
+	// The VMs' group itself is never followed: it holds every VM.
+	h3 := newLeaseHarness(t, "aerolvm-vmm")
+	h3.write(t, 15, []string{"aerolvm-vmm"}, nil)
+	h3.step(0)
+	h3.step(16 * time.Second)
+	if len(h3.frozen) != 0 {
+		t.Fatalf("froze %v from the VMs' group itself", h3.frozen)
 	}
 }

@@ -85,6 +85,10 @@ func TestValidRef(t *testing.T) {
 	for ref, want := range map[string]bool{
 		"sb-a36d11bff9ff6787": true, "ctr-a": true,
 		"": false, ".": false, "..": false, "../supervisor": false, "a/b": false, "a\x00b": false,
+		// A Firecracker VM's own group, and nothing deeper or beside it,
+		// nor the VMs' group itself, which would freeze every VM.
+		"aerolvm-vmm/sb-a36d11bff9ff6787": true, "aerolvm-vmm": false,
+		"aerolvm-vmm/": false, "aerolvm-vmm/..": false, "aerolvm-vmm/a/b": false, "aerolvm-wasm/sb-a": false,
 	} {
 		if got := ValidRef(ref); got != want {
 			t.Errorf("ValidRef(%q) = %v, want %v", ref, got, want)

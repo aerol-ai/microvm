@@ -336,6 +336,8 @@ This sandbox uses gVisor and asks to start again on another machine if its machi
 
 [Durability and failover](/durability/) explains what a sandbox keeps when it starts again elsewhere.
 
+On Kubernetes, `failover.policy: recreate` works for container sandboxes (runc and gVisor) and Firecracker VMs. If a worker loses touch with the cluster, its runtime container freezes those sandboxes once their lease runs out, so the old copy never runs beside the new one. WASM and V8-isolate sandboxes share their host process with other sandboxes, so one cannot be frozen alone; a create that asks for `recreate` on them is refused with a 400.
+
 ## Step 7: Check the install
 
 `aerolvm k8s verify` checks the live install against the chart's security rules and exits 1 on any miss:

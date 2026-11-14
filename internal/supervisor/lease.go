@@ -41,10 +41,9 @@ type LeaseGuard struct {
 	Now func() time.Time
 	Log *slog.Logger
 
-	written int64     // WrittenUnixMs of the lease last read
-	end     time.Time // when that lease runs out, on Now's clock
-	lease   ownerlease.Lease
-	have    bool
+	end   time.Time // when the lease last read runs out, on Now's clock
+	lease ownerlease.Lease
+	have  bool
 	// frozen is every ref this guard froze, with the ConfirmedUnixMs of the
 	// lease that ran out: a lease confirmed later may thaw it.
 	frozen   map[string]int64
@@ -82,9 +81,15 @@ func (g *LeaseGuard) Check() {
 	switch {
 	case err == nil:
 		g.readErr = ""
-		if !g.have || l.WrittenUnixMs != g.written {
-			g.lease, g.have, g.written = l, true, l.WrittenUnixMs
+		if !g.have || !sameLease(l, g.lease) {
+			g.lease, g.have = l, true
 			g.end = now.Add(l.Remaining() - fileAge(now, l))
+		} else {
+			// The same lease written again: sandboxd publishes the fence
+			// on every recreate-policy create, and two writes can share a
+			// millisecond. The lists are taken (an acknowledged create
+			// must be fenced); the deadline is not renewed.
+			g.lease.Fence, g.lease.Owned = l.Fence, l.Owned
 		}
 	case errors.Is(err, os.ErrNotExist) && !g.have:
 		// No lease written yet: single mode, or no read has succeeded.
@@ -106,6 +111,14 @@ func (g *LeaseGuard) Check() {
 		return
 	}
 	g.freezeFenced(now)
+}
+
+// sameLease reports whether a and b are one lease: the same read, written
+// at the same time. Comparing only the write time missed a second write in
+// the same millisecond, with a new sandbox in its fence: that sandbox ran
+// on past the lease (review N1).
+func sameLease(a, b ownerlease.Lease) bool {
+	return a.WrittenUnixMs == b.WrittenUnixMs && a.ConfirmedUnixMs == b.ConfirmedUnixMs && a.LeaseMs == b.LeaseMs
 }
 
 // fileAge is how long before now, by the wall clock, l was written: never
