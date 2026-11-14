@@ -126,6 +126,57 @@ func (r *ClusterReconciler) ensureWorkers(ctx context.Context, c *v1.AerolCluste
 			}
 		}
 	}
+	return r.retireRemovedPools(ctx, c, nodes)
+}
+
+// whyPoolRemoved is the decommission reason of a worker whose pool left
+// the spec.
+const whyPoolRemoved = "its worker pool is no longer in the AerolCluster"
+
+// retireRemovedPools decommissions the workers of pools no longer in the
+// spec (review R6). The loop above walks the spec's pools only, so nothing
+// else ever looks at them: they would keep their machines, identities and
+// sandboxes forever. They leave through the usual decommission, which
+// moves what it can to the pools that remain:
+//
+//   - a worker that never served (no pod placed, still joining, or held
+//     by a failed preflight) has nothing to move and goes at once;
+//   - the others go one per zone at a time, as old machines do, so the
+//     moves land on pools with room and are not all at once.
+func (r *ClusterReconciler) retireRemovedPools(ctx context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) error {
+	leaving := map[string]bool{}
+	var rest []v1.AerolNode
+	for _, n := range nodes {
+		if n.Spec.Role != v1.RoleWorker || poolOf(c, n.Spec.Pool) != nil || n.DeletionTimestamp != nil {
+			continue
+		}
+		switch n.Status.State {
+		case v1.StateRemoved, v1.StateDead, v1.StateSuspect:
+			// On their way out already (lost), or back to serving first.
+			continue
+		}
+		if n.Annotations[v1.AnnotationDecommission] == "true" {
+			leaving[n.Spec.Zone] = true
+			continue
+		}
+		switch n.Status.State {
+		case "", v1.StatePending, v1.StateJoining, v1.StateFailed:
+			if err := r.markDecommission(ctx, c, n.Name, whyPoolRemoved); err != nil {
+				return err
+			}
+		default:
+			rest = append(rest, n)
+		}
+	}
+	for _, n := range rest {
+		if leaving[n.Spec.Zone] {
+			continue
+		}
+		if err := r.markDecommission(ctx, c, n.Name, whyPoolRemoved); err != nil {
+			return err
+		}
+		leaving[n.Spec.Zone] = true
+	}
 	return nil
 }
 
