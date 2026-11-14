@@ -23,6 +23,7 @@ type TemplateArtifactPushStore interface {
 	ClaimTemplatePush(ctx context.Context, id string) (*models.Template, time.Time, bool, error)
 	CompleteTemplatePush(ctx context.Context, id string, claimedAt time.Time, registryRef, digest string) (bool, error)
 	ReleaseTemplatePush(ctx context.Context, id string, claimedAt time.Time, state, errMsg string) (bool, error)
+	ScheduleSnapshotRegistryRetirement(ctx context.Context, r store.SnapshotRegistryRetirement) error
 }
 
 // TemplatePushStore wraps the raw store the push reconciler writes through so
@@ -65,6 +66,10 @@ func (t *templatePushStoreSeam) CompleteTemplatePush(ctx context.Context, id str
 		t.svc.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
 	}
 	return applied, err
+}
+
+func (t *templatePushStoreSeam) ScheduleSnapshotRegistryRetirement(ctx context.Context, r store.SnapshotRegistryRetirement) error {
+	return t.inner.ScheduleSnapshotRegistryRetirement(ctx, r)
 }
 
 func (t *templatePushStoreSeam) ReleaseTemplatePush(ctx context.Context, id string, claimedAt time.Time, state, errMsg string) (bool, error) {
@@ -292,8 +297,19 @@ func (r *TemplateArtifactPushReconciler) pushOne(ctx context.Context, listed *mo
 		return templatePushFailed
 	}
 	if !applied {
-		r.logger.Warn("template push: finished after losing its claim; the row's current owner decides",
-			"template", id, "registry_ref", result.RegistryRef)
+		// A newer claim owns the row, or the row was deleted while this
+		// push ran, and then nothing will ever name the copy just pushed.
+		// Either way it is recorded for retirement, as for snapshots: the
+		// worker drops the obligation if a row names this manifest, and
+		// waits while this template still has a push to land.
+		if err := r.store.ScheduleSnapshotRegistryRetirement(ctx, store.SnapshotRegistryRetirement{
+			RegistryRef: result.RegistryRef, Digest: result.Digest, Name: id,
+		}); err != nil {
+			r.logger.Warn("template push: record retirement of an unclaimed push failed",
+				"template", id, "registry_ref", result.RegistryRef, "error", err)
+		}
+		r.logger.Warn("template push: finished after losing its claim; its copy is scheduled for retirement",
+			"template", id, "registry_ref", result.RegistryRef, "digest", result.Digest)
 		return templatePushSkipped
 	}
 	r.logger.Info("template push: succeeded", "template", id, "registry_ref", result.RegistryRef)

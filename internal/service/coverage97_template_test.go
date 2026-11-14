@@ -37,9 +37,18 @@ func TestCoverage97TemplateCleanupFailures(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	svc.templateCIDAllocator = &fakeCIDAllocator{releaseErr: errors.New("cid busy")}
-	if err := svc.DeleteTemplate(ctx, "tpl-clean"); err != nil {
-		t.Fatalf("DeleteTemplate = %v", err)
+	cids := &fakeCIDAllocator{releaseErr: errors.New("cid busy")}
+	svc.templateCIDAllocator = cids
+	// Files that cannot be removed fail the delete and keep the row and
+	// its CID: the row is the only record of them (review R16).
+	if err := svc.DeleteTemplate(ctx, "tpl-clean"); err == nil {
+		t.Fatal("DeleteTemplate of a template whose files cannot be removed succeeded")
+	}
+	if _, err := st.GetTemplate(ctx, "tpl-clean"); err != nil {
+		t.Fatalf("row after a failed file remove = %v, want it kept", err)
+	}
+	if len(cids.releaseIDs) != 0 {
+		t.Fatalf("CID released for a kept row: %v", cids.releaseIDs)
 	}
 	if err := writeTemplateManifest(t.TempDir(), templateManifest{SourceImage: "img"}); err == nil {
 		t.Fatal("manifest write onto a directory succeeded")

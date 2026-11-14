@@ -68,7 +68,7 @@ const (
 type SnapshotMoveHandler interface {
 	// ReleaseForSnapshotMove is ReleaseForMove for one sandbox, naming the
 	// only node that may pull its bundle.
-	ReleaseForSnapshotMove(ctx context.Context, id, target string) string
+	ReleaseForSnapshotMove(ctx context.Context, id, target, lifetime string) string
 	// ImportMove pulls id's bundle from source and puts it in place.
 	ImportMove(ctx context.Context, id, source string) error
 	// DropMove undoes ImportMove when the move does not happen.
@@ -184,7 +184,9 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		return errors.New("snapshot move: " + why)
 	}
 	rctx, cancel := context.WithTimeout(pre, moveStepTimeout)
-	out, err := c.moveCall(rctx, source, MoveAction{Action: "release-snapshot", IDs: []string{p.SandboxID}, Target: target.NodeID})
+	release := releaseAction("release-snapshot", p)
+	release.Target = target.NodeID
+	out, err := c.moveCall(rctx, source, release)
 	cancel()
 	if err != nil {
 		return err
@@ -254,7 +256,7 @@ func runSnapshotMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (Mo
 		if strings.TrimSpace(a.Target) == "" {
 			return MoveActionResult{}, errors.New("release-snapshot needs the target")
 		}
-		return MoveActionResult{Results: map[string]string{id: sh.ReleaseForSnapshotMove(ctx, id, strings.TrimSpace(a.Target))}}, nil
+		return MoveActionResult{Results: map[string]string{id: sh.ReleaseForSnapshotMove(ctx, id, strings.TrimSpace(a.Target), a.Incarnations[id])}}, nil
 	case "import":
 		if strings.TrimSpace(a.Source) == "" {
 			return MoveActionResult{}, errors.New("import needs the source")

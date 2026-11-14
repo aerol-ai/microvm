@@ -452,11 +452,11 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 		}
 	})
 
-	t.Run("remove image error does not strand row", func(t *testing.T) {
-		// A failed best-effort artifact delete must NOT strand the catalogue row:
-		// the row is the source of placement inventory, so leaving it behind on a
-		// transient remove error accumulates vacuum (codex P1). GC ignores the
-		// error and still deletes the row; cache GC reclaims the bytes later.
+	t.Run("remove image error keeps the row for the next pass", func(t *testing.T) {
+		// A failed artifact delete keeps the catalogue row, as the API delete
+		// does: the row is the only record of the bytes, so dropping it here
+		// left them with nothing to reclaim them (review R15). The next pass
+		// tries again (TestWasmModuleGCKeepsRowUntilBytesAreGone).
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "state.db")
 		st, err := store.Open(dbPath)
@@ -488,8 +488,8 @@ func TestWasmModuleGCEdgeBranches(t *testing.T) {
 			wasm:   wasmModuleGCRuntime{removeErr: errors.New("remove failed")},
 		}
 		svc.runWasmModuleGC(ctx, time.Now())
-		if _, err := st.GetWasmModule(ctx, "", "mod-rm"); err == nil {
-			t.Fatal("row should be deleted despite remove failure")
+		if _, err := st.GetWasmModule(ctx, "", "mod-rm"); err != nil {
+			t.Fatalf("row after a failed remove = %v, want it kept", err)
 		}
 	})
 
@@ -760,4 +760,103 @@ func TestRunWasmModuleGCAdditionalBranches(t *testing.T) {
 			t.Fatal("out-of-tree module row should be deleted")
 		}
 	})
+}
+
+// failingRemoveRuntime is a WASM runtime whose RemoveImage fails while
+// removeErr is set.
+type failingRemoveRuntime struct {
+	recordingRuntime
+	removeErr error
+	tries     int
+}
+
+func (r *failingRemoveRuntime) RemoveImage(ctx context.Context, ref string) error {
+	r.tries++
+	if r.removeErr != nil {
+		return r.removeErr
+	}
+	return r.recordingRuntime.RemoveImage(ctx, ref)
+}
+
+// GC drops a catalogue row only once its bytes are gone, as the API delete
+// does. It used to drop the row after a failed remove, and the row is the
+// only record of a path-only module's file, so the file was never reclaimed.
+func TestWasmModuleGCKeepsRowUntilBytesAreGone(t *testing.T) {
+	cases := []struct {
+		name string
+		// setup stores the module and makes its first remove fail. It
+		// returns a func that lets the remove work again, and one that
+		// reports whether GC tried to remove the bytes.
+		setup func(t *testing.T, svc *Service, st *store.Store) (heal func(), tried func() bool)
+	}{
+		{
+			name: "digest remove fails",
+			setup: func(t *testing.T, svc *Service, st *store.Store) (func(), func() bool) {
+				rt := &failingRemoveRuntime{removeErr: errors.New("module busy")}
+				svc.SetWasmRuntime(rt)
+				upsertOldWasmModule(t, st, store.WasmModuleRecord{ID: "mod-gc", ModuleRef: "oci://h/r:t", Digest: "d1", Status: "ready"})
+				return func() { rt.removeErr = nil }, func() bool { return rt.tries > 0 }
+			},
+		},
+		{
+			name: "path remove fails",
+			setup: func(t *testing.T, svc *Service, st *store.Store) (func(), func() bool) {
+				dir := filepath.Join(svc.cfg.WasmModulesDir, "locked")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "m.wasm")
+				if err := os.WriteFile(path, []byte("wasm"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// A read-only directory refuses the file's removal.
+				if err := os.Chmod(dir, 0o500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+				if f, err := os.CreateTemp(dir, "probe"); err == nil {
+					_ = f.Close()
+					t.Skip("running as root: a read-only directory does not refuse removal")
+				}
+				upsertOldWasmModule(t, st, store.WasmModuleRecord{ID: "mod-gc", ModuleRef: "file://" + path, ModulePath: path, Status: "ready"})
+				return func() { _ = os.Chmod(dir, 0o755) }, func() bool {
+					_, err := os.Stat(path)
+					return err == nil // still there: the remove was refused
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+			svc.cfg.WasmModuleGCTTL = time.Hour
+			svc.cfg.WasmModulesDir = t.TempDir()
+			heal, tried := tc.setup(t, svc, st)
+			// The row's age is set by the store, so the passes run as if two
+			// TTLs had gone by.
+			later := time.Now().UTC().Add(2 * svc.cfg.WasmModuleGCTTL)
+
+			svc.runWasmModuleGC(ctx, later)
+			if !tried() {
+				t.Fatal("GC did not try to remove the module's bytes")
+			}
+			if _, err := st.GetWasmModule(ctx, "", "mod-gc"); err != nil {
+				t.Fatalf("row after a failed remove = %v, want it kept for the next pass", err)
+			}
+
+			heal()
+			svc.runWasmModuleGC(ctx, later)
+			if _, err := st.GetWasmModule(ctx, "", "mod-gc"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("row after a remove that worked = %v, want it gone", err)
+			}
+		})
+	}
+}
+
+func upsertOldWasmModule(t *testing.T, st *store.Store, rec store.WasmModuleRecord) {
+	t.Helper()
+	if err := st.UpsertWasmModule(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
 }

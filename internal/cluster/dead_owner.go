@@ -264,6 +264,9 @@ func (c *Cluster) reconcileDeadOwners(ctx context.Context) {
 		}
 		c.evictDeadOwner(ctx, nodeID)
 	}
+	// The recreate-policy sandboxes no node had room for, this pass or an
+	// earlier one, try again now that capacity may have come back (R14).
+	c.retryOrphanedRecoveries(ctx)
 }
 
 // evictDeadOwner handles every placement owned by nodeID (evictOwnerPlacements)
@@ -304,7 +307,9 @@ var errOwnerRejoined = errors.New("cluster: owner rejoined during eviction")
 // that opted into failover.policy=recreate are reassigned to a live peer
 // scored against their replicated spec; the owner watcher on that peer
 // re-materializes the container. All remaining placements are orphaned
-// (OwnerNodeID="") so the API surfaces ErrOrphaned (410 Gone). The dead-owner
+// (OwnerNodeID="") so the API surfaces ErrOrphaned (410 Gone). A
+// recreate-policy placement orphaned only for want of room is retried on
+// every later pass (retryOrphanedRecoveries, R14). The dead-owner
 // loop and an operator's node delete (node_lifecycle.go) share it. A failure
 // is logged and returned after the steps that succeeded; every step is
 // idempotent, so the caller's retry finishes the job.
