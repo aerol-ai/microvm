@@ -63,7 +63,8 @@ func ValidRef(ref string) bool {
 	if nested {
 		return HostGroups[group] && validElem(child)
 	}
-	return validElem(ref)
+	// A host group itself holds every VM: naming it would freeze them all.
+	return validElem(ref) && !HostGroups[ref]
 }
 
 // HostGroups are the groups, directly under the sandboxes' cgroup parent,

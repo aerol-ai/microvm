@@ -150,9 +150,14 @@ func (d *Driver) Freeze(_ context.Context, sandboxID string) error {
 	return setVMMGroupFrozen(sandboxID, true)
 }
 
-// Thaw lets a frozen VM run on.
+// Thaw lets a frozen VM run on, and finishes its adoption if it was
+// adopted frozen.
 func (d *Driver) Thaw(_ context.Context, sandboxID string) error {
-	return setVMMGroupFrozen(sandboxID, false)
+	if err := setVMMGroupFrozen(sandboxID, false); err != nil {
+		return err
+	}
+	d.finishFrozenAdoption(sandboxID)
+	return nil
 }
 
 // FenceGroup is the group the runtime supervisor freezes for a sandbox's
@@ -176,6 +181,7 @@ func (d *Driver) unregister(sandboxID string) (VMMHandle, bool) {
 	delete(d.clients, sandboxID)
 	delete(d.vmms, sandboxID)
 	delete(d.guestCID, sandboxID)
+	delete(d.frozenAdopted, sandboxID)
 	d.mu.Unlock()
 	d.rssUnregister(sandboxID)
 	d.removeVMMRecord(sandboxID)
@@ -376,25 +382,74 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 		go boundVMMOutput(filepath.Join(rec.RunDir, vmmOutputName), proc.Done())
 	}
 	client := d.newClient(rec.APISocket)
-	d.resumeIfPaused(ctx, rec.SandboxID, client)
+	// A VM the ownership lease froze (the agent was down past its lease)
+	// cannot answer its API: asking it would cost each one the full
+	// timeout, one after another, before sandboxd serves. Its adoption
+	// finishes once it is thawed (finishFrozenAdoption); it stays frozen,
+	// and so fenced, until this node proves it still owns it.
+	frozen := vmmGroupFrozen(rec.SandboxID)
+	if !frozen {
+		d.resumeIfPaused(ctx, rec.SandboxID, client)
+	}
 	d.mu.Lock()
 	d.clients[rec.SandboxID] = client
 	d.vmms[rec.SandboxID] = handle
 	d.guestCID[rec.SandboxID] = rec.VsockCID
+	if frozen {
+		d.frozenAdopted[rec.SandboxID] = frozenAdoption{client: client, runDir: rec.RunDir, cid: rec.VsockCID}
+	}
 	d.mu.Unlock()
 	d.rssRegister(rec.SandboxID, rec.PID)
 	// A release before this one started every VM in the VMs' shared
 	// cgroup: a group of its own lets the ownership lease freeze it alone.
 	d.placeVMM(rec.SandboxID, rec.PID)
-	// The sandboxd that died may have frozen the guest's disk (a snapshot's
-	// copy, or a Stop it never finished), and no one else will ever thaw
-	// it. Not waited for: an unresponsive guest must not hold up the boot,
-	// and its own timer thaws it in the end.
-	if d.vsockDial != nil {
-		go d.thawGuest(rec.SandboxID, filepath.Join(rec.RunDir, hostVsockUDSName), rec.VsockCID)
+	if !frozen {
+		d.thawGuestDisk(rec.SandboxID, rec.RunDir, rec.VsockCID)
 	}
-	d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID)
+	d.logger.Info("firecracker adopt: running VM taken over", "sandbox_id", rec.SandboxID, "pid", rec.PID, "frozen", frozen)
 	return true
+}
+
+// thawGuestDisk thaws a guest's disk the sandboxd that died may have left
+// frozen (a snapshot's copy, or a Stop it never finished): no one else
+// ever would. Not waited for: an unresponsive guest must not hold up the
+// boot, and its own timer thaws it in the end.
+func (d *Driver) thawGuestDisk(sandboxID, runDir string, cid uint32) {
+	if d.vsockDial != nil {
+		go d.thawGuest(sandboxID, filepath.Join(runDir, hostVsockUDSName), cid)
+	}
+}
+
+// frozenAdoption is what a VM adopted while frozen still needs once it
+// can answer.
+type frozenAdoption struct {
+	client VMMClient
+	runDir string
+	cid    uint32
+}
+
+// finishFrozenAdoption finishes the adoption of a VM adopted while frozen,
+// once its group is thawed: by this driver's Thaw (the ownership lease
+// confirmed this node still owns it), or by the runtime supervisor, which
+// a listing notices. In the background: the VM answers now, but a resume
+// may still take seconds. A VM never adopted frozen, or finished already,
+// is left alone.
+func (d *Driver) finishFrozenAdoption(sandboxID string) {
+	if vmmGroupFrozen(sandboxID) {
+		return
+	}
+	d.mu.Lock()
+	a, ok := d.frozenAdopted[sandboxID]
+	delete(d.frozenAdopted, sandboxID)
+	d.mu.Unlock()
+	if !ok {
+		return
+	}
+	go func() {
+		d.resumeIfPaused(context.Background(), sandboxID, a.client)
+		d.thawGuestDisk(sandboxID, a.runDir, a.cid)
+		d.logger.Info("firecracker adopt: a VM adopted frozen is thawed and taken over", "sandbox_id", sandboxID)
+	}()
 }
 
 // discoverVM builds the record a VM with none would have had, from its

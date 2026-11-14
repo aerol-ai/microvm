@@ -363,6 +363,10 @@ type fakeClient struct {
 	actions  []string
 	vmStates []string
 	instance *firecracker.InstanceInfo
+	// frozen makes InstanceInfo block until its context ends, as a frozen
+	// VMM's API does; infoCalls counts the calls.
+	frozen    bool
+	infoCalls int
 
 	snapshotCreate   *firecracker.SnapshotCreate
 	snapshotLoad     *firecracker.SnapshotLoad
@@ -463,7 +467,17 @@ func (c *fakeClient) PatchVM(_ context.Context, vm firecracker.VM) error {
 	return c.patchVMErr
 }
 
-func (c *fakeClient) InstanceInfo(_ context.Context) (*firecracker.InstanceInfo, error) {
+func (c *fakeClient) InstanceInfo(ctx context.Context) (*firecracker.InstanceInfo, error) {
+	c.mu.Lock()
+	c.infoCalls++
+	frozen := c.frozen
+	c.mu.Unlock()
+	if frozen {
+		// A frozen VMM's API thread never answers: the caller waits out
+		// its own deadline.
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.instance, nil

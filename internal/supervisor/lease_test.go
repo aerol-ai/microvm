@@ -320,4 +320,12 @@ func TestLeaseGuardFreezesAFirecrackerVMsOwnGroup(t *testing.T) {
 	if len(h2.frozen) != 0 {
 		t.Fatalf("froze %v from a ref outside the host groups", h2.frozen)
 	}
+	// The VMs' group itself is never followed: it holds every VM.
+	h3 := newLeaseHarness(t, "aerolvm-vmm")
+	h3.write(t, 15, []string{"aerolvm-vmm"}, nil)
+	h3.step(0)
+	h3.step(16 * time.Second)
+	if len(h3.frozen) != 0 {
+		t.Fatalf("froze %v from the VMs' group itself", h3.frozen)
+	}
 }

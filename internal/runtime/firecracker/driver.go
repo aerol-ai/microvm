@@ -155,7 +155,12 @@ type Driver struct {
 	clients  map[string]VMMClient // sandbox-id -> API client
 	vmms     map[string]VMMHandle // sandbox-id -> VMM handle (for Destroy)
 	guestCID map[string]uint32    // sandbox-id -> CID baked into the running guest
-	healthMu sync.Mutex
+	// frozenAdopted is every VM adopted while the ownership lease had it
+	// frozen: its adoption steps that need the VM to answer (resuming a
+	// paused VM, thawing the guest's disk) run once it is thawed
+	// (finishFrozenAdoption).
+	frozenAdopted map[string]frozenAdoption
+	healthMu      sync.Mutex
 	// runtimeHealth caches the vmgenid-capability probe result. The Firecracker
 	// binary path and kernel artifact are static for a daemon lifetime, so
 	// recomputing on every /health call just burns a subprocess and disk reads
@@ -322,6 +327,8 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		clients:  make(map[string]VMMClient),
 		vmms:     make(map[string]VMMHandle),
 		guestCID: make(map[string]uint32),
+
+		frozenAdopted: make(map[string]frozenAdoption),
 	}
 	// Default spawn function wires the real vmm. Tests overwrite via
 	// SetSpawner. The captured logger is used inside newVMM, so the
@@ -1525,16 +1532,18 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if hasHandle {
 		// A VM the ownership lease froze is a copy another node may be
 		// running now (the stale copy a failover leaves): killed where it
-		// stands, never thawed to shut down, and a frozen VMM would not
-		// answer the shutdown request anyway. SIGKILL ends a frozen task.
+		// stands, never thawed to shut down (SIGKILL ends a frozen task).
+		// Shutdown still runs after: for a VM this sandboxd started it
+		// finds the process gone; for a warm pool's VM it is what frees
+		// the slot's TAP, slot and run dir.
 		if vmmGroupFrozen(sandboxID) {
 			if err := handle.Kill(); err != nil {
 				d.logger.Warn("firecracker destroy: kill of a frozen VM failed",
 					"sandbox_id", sandboxID, "error", err)
 				rememberErr(err)
-				vmDown = false
 			}
-		} else if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
+		}
+		if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
 			d.logger.Warn("firecracker destroy: shutdown failed",
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
@@ -1638,6 +1647,13 @@ func (d *Driver) Inspect(ctx context.Context, sandboxID string) (*models.Sandbox
 	if !ok {
 		return nil, nil
 	}
+	// A VM the ownership lease froze cannot answer (the call would wait
+	// out the client's 30 s): it is alive, and the fence, not reconcile,
+	// decides what becomes of it.
+	if vmmGroupFrozen(sandboxID) {
+		return &models.SandboxRuntimeState{SandboxID: sandboxID, Status: models.SandboxStatusStarted}, nil
+	}
+	d.finishFrozenAdoption(sandboxID)
 	info, err := client.InstanceInfo(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: inspect %s: %w", sandboxID, err)
@@ -1668,6 +1684,14 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 
 	out := make(map[string]*models.SandboxRuntimeState, len(ids))
 	for i, id := range ids {
+		// A VM the ownership lease froze is alive and cannot answer: not
+		// asked, or reconcile at boot (and every pass of a partition)
+		// pays the timeout for each one in turn.
+		if vmmGroupFrozen(id) {
+			out[id] = &models.SandboxRuntimeState{SandboxID: id, Status: models.SandboxStatusStarted}
+			continue
+		}
+		d.finishFrozenAdoption(id)
 		// A VMM that does not answer costs listManagedInspectTimeout, not
 		// the client's 30 s: reconcile at boot walks every VM in turn.
 		ictx, cancel := context.WithTimeout(ctx, listManagedInspectTimeout)

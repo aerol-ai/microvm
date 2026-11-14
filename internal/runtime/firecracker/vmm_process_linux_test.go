@@ -5,17 +5,21 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/ownerlease"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -151,8 +155,10 @@ func TestDestroyKillsAFrozenVM(t *testing.T) {
 	if err := f.driver.Destroy(context.Background(), &models.Sandbox{ID: "sb-frozen"}); err != nil {
 		t.Fatal(err)
 	}
-	if !f.vmm.killed || f.vmm.graceful {
-		t.Fatalf("frozen VM: killed %v, shut down gracefully %v; want a kill only", f.vmm.killed, f.vmm.graceful)
+	// Killed first; the Shutdown after finds it gone (for a warm pool's VM
+	// it is what frees the slot: TestDestroyCleansUpAFrozenWarmVM).
+	if !f.vmm.killed || !f.vmm.graceful {
+		t.Fatalf("frozen VM: killed %v, shutdown called %v; want both", f.vmm.killed, f.vmm.graceful)
 	}
 
 	thawed := filepath.Join(root, vmmCgroupName, "sb-running")
@@ -171,6 +177,184 @@ func TestDestroyKillsAFrozenVM(t *testing.T) {
 	}
 	if _, err := os.Stat(thawed); !os.IsNotExist(err) {
 		t.Fatalf("the destroyed VM's empty group stayed: %v", err)
+	}
+}
+
+// warmSpawned is a warm pool's VM for Destroy: a real process, and a
+// Shutdown that counts (the pool's, which frees the slot).
+type warmSpawned struct {
+	pid       int
+	mu        sync.Mutex
+	shutdowns int
+}
+
+func (w *warmSpawned) APISocket() string { return "" }
+func (w *warmSpawned) RunDir() string    { return "" }
+func (w *warmSpawned) Pid() int          { return w.pid }
+func (w *warmSpawned) Shutdown(context.Context, time.Duration) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.shutdowns++
+	return nil
+}
+
+// A frozen VM a create took from the warm pool is killed (SIGKILL ends a
+// frozen task) and then shut down through the pool, which frees its TAP,
+// slot and run dir. Before, its handle's Kill did nothing and Shutdown was
+// skipped: the frozen process kept the guest's memory and its TAP busy.
+func TestDestroyCleansUpAFrozenWarmVM(t *testing.T) {
+	root := withCgroupRoot(t, true)
+	group := filepath.Join(root, vmmCgroupName, "sb-warm")
+	if err := os.MkdirAll(group, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(group, "cgroup.freeze"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proc := exec.Command("sleep", "60")
+	if err := proc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- proc.Wait() }()
+	t.Cleanup(func() { _ = proc.Process.Kill() })
+	spawned := &warmSpawned{pid: proc.Process.Pid}
+	d := New(Config{}, nil)
+	d.register("sb-warm", newFakeClient(), &warmDestroyHandle{spawned: spawned}, 9, false)
+
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-warm"}); err != nil {
+		t.Fatal(err)
+	}
+	if spawned.shutdowns != 1 {
+		t.Fatalf("pool Shutdown called %d times, want once", spawned.shutdowns)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the warm VM's process exited on its own, not killed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the frozen warm VM's process is still running")
+	}
+	// A handle whose process is gone: nothing to kill.
+	if err := (&warmDestroyHandle{spawned: &warmSpawned{}}).Kill(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Frozen VMs do not stall sandboxd's boot. The runtime supervisor froze
+// them while the agent was down past its lease; a frozen VMM cannot answer
+// its API, so adoption, the first reconcile's listing and Inspect each paid
+// the full timeout per VM, one after another, before sandboxd served (about
+// 13 minutes for 20 VMs). Now none of them asks a frozen VM anything, and a
+// VM adopted frozen finishes its adoption once thawed: by Thaw, or by the
+// supervisor, which the next listing notices.
+func TestFrozenVMsDoNotStallBoot(t *testing.T) {
+	root := withCgroupRoot(t, true)
+	host := stubVMMHost(t)
+	d, clients, _ := adoptDriver(t)
+	const n = 20
+	ids := make([]string, n)
+	for i := range n {
+		id := fmt.Sprintf("sb-%02d", i)
+		ids[i] = id
+		pid := 300 + i
+		host.procs[pid] = newFakeProcess(syscall.SIGKILL)
+		writeRecord(t, d, vmmRecord{SandboxID: id, PID: pid, StartTicks: uint64(pid) * 10, BootID: "boot-1",
+			APISocket: "/sock/" + id, RunDir: filepath.Join(d.cfg.RunDir, id), VsockCID: uint32(pid)})
+		group := filepath.Join(root, vmmCgroupName, id)
+		if err := os.MkdirAll(group, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for f, v := range map[string]string{"cgroup.freeze": "1", "cgroup.procs": ""} {
+			if err := os.WriteFile(filepath.Join(group, f), []byte(v), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	d.SetClientFactory(func(socket string) VMMClient {
+		c := newFakeClient()
+		c.frozen = true
+		c.instance = &firecracker.InstanceInfo{State: "Paused"}
+		clients[socket] = c
+		return c
+	})
+	keep := func(context.Context, string) (bool, error) { return true, nil }
+
+	start := time.Now()
+	if got := d.AdoptRunningVMs(context.Background(), keep); got != n {
+		t.Fatalf("adopted %d, want %d", got, n)
+	}
+	states, err := d.ListManaged(context.Background())
+	if err != nil || len(states) != n {
+		t.Fatalf("listed %d, %v", len(states), err)
+	}
+	for _, id := range ids {
+		st, err := d.Inspect(context.Background(), id)
+		if err != nil || st.Status != models.SandboxStatusStarted || states[id].Status != models.SandboxStatusStarted {
+			t.Fatalf("%s: inspect %+v %v, listed %+v", id, st, err, states[id])
+		}
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("adopt, list and inspect of %d frozen VMs took %v", n, took)
+	}
+	for socket, c := range clients {
+		if c.infoCalls != 0 {
+			t.Fatalf("%s: a frozen VM was asked its state %d times", socket, c.infoCalls)
+		}
+	}
+
+	// Thawed by this node (the lease confirmed it owns sb-00): its
+	// adoption finishes, the paused VM is resumed.
+	thaw := func(id string) *fakeClient {
+		c := clients["/sock/"+id]
+		c.mu.Lock()
+		c.frozen = false
+		c.mu.Unlock()
+		return c
+	}
+	c0 := thaw("sb-00")
+	if err := d.Thaw(context.Background(), "sb-00"); err != nil {
+		t.Fatal(err)
+	}
+	// Thawed by the supervisor (sb-01): the next listing notices.
+	c1 := thaw("sb-01")
+	if err := os.WriteFile(filepath.Join(root, vmmCgroupName, "sb-01", "cgroup.freeze"), []byte("0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ListManaged(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	resumed := func(c *fakeClient) bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return slices.Contains(c.vmStates, firecracker.VMStateResumed)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for (!resumed(c0) || !resumed(c1)) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !resumed(c0) || !resumed(c1) {
+		t.Fatalf("a thawed VM's adoption did not finish: resumed sb-00 %v, sb-01 %v", resumed(c0), resumed(c1))
+	}
+	d.mu.Lock()
+	_, pending0 := d.frozenAdopted["sb-00"]
+	_, pending1 := d.frozenAdopted["sb-01"]
+	_, pending2 := d.frozenAdopted["sb-02"]
+	d.mu.Unlock()
+	if pending0 || pending1 || !pending2 {
+		t.Fatalf("pending adoptions: sb-00 %v, sb-01 %v, sb-02 %v; want only the still frozen one", pending0, pending1, pending2)
+	}
+	// A frozen VM destroyed (not this node's after all) leaves nothing
+	// pending.
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-02"}); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	_, pending2 = d.frozenAdopted["sb-02"]
+	d.mu.Unlock()
+	if pending2 {
+		t.Fatal("a destroyed VM is still pending adoption")
 	}
 }
 
