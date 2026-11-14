@@ -60,12 +60,13 @@ func TestMoveFences(t *testing.T) {
 func TestReleaseForMoveStopsAndFences(t *testing.T) {
 	svc, _, st := newCapacityHarness(t, nil, nil)
 	putRunning(t, svc, "sb-move")
-	got := svc.ReleaseForMove(context.Background(), []string{"sb-move", "sb-none", " "})
+	got := svc.ReleaseForMove(context.Background(), []string{"sb-move", "sb-none", " "}, nil)
 	if got["sb-move"] != MoveReleased || got["sb-none"] != MoveGone || len(got) != 2 {
 		t.Fatalf("release = %v", got)
 	}
+	// The row's reason is the fence a restarted sandboxd reads (R11).
 	sb, _ := st.Get(context.Background(), "sb-move")
-	if sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonDecommission {
+	if sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonMoveReleased {
 		t.Fatalf("after release: %s (%s)", sb.Status, sb.StatusReason)
 	}
 	if !svc.OwnershipFenced("sb-move") {
@@ -74,9 +75,13 @@ func TestReleaseForMoveStopsAndFences(t *testing.T) {
 	if _, err := svc.StartSandbox(context.Background(), "sb-move"); !errors.Is(err, ErrOwnershipFenced) {
 		t.Fatalf("start of a released sandbox = %v, want ErrOwnershipFenced", err)
 	}
-	// Again: already stopped, released again (the fence is renewed).
-	if got := svc.ReleaseForMove(context.Background(), []string{"sb-move"}); got["sb-move"] != MoveReleased {
+	// Again: already stopped, released again (the fence is renewed). It
+	// still says the release stopped it, so a lapsed move starts it again.
+	if got := svc.ReleaseForMove(context.Background(), []string{"sb-move"}, nil); got["sb-move"] != MoveReleased {
 		t.Fatalf("second release = %v", got)
+	}
+	if sb, _ := st.Get(context.Background(), "sb-move"); sb.StatusReason != statusReasonMoveReleased {
+		t.Fatalf("after the second release: %s", sb.StatusReason)
 	}
 }
 
@@ -85,7 +90,7 @@ func TestReleaseForMoveStopsAndFences(t *testing.T) {
 func TestStopForDecommission(t *testing.T) {
 	svc, _, st := newCapacityHarness(t, nil, nil)
 	putRunning(t, svc, "sb-stay")
-	if got := svc.StopForDecommission(context.Background(), []string{"sb-stay"}); got["sb-stay"] != MoveStopped {
+	if got := svc.StopForDecommission(context.Background(), []string{"sb-stay"}, nil); got["sb-stay"] != MoveStopped {
 		t.Fatalf("stop = %v", got)
 	}
 	if sb, _ := st.Get(context.Background(), "sb-stay"); sb.Status != models.SandboxStatusStopped {
@@ -101,7 +106,7 @@ func TestReleaseForMoveRefusesAForeignPlacement(t *testing.T) {
 	svc, _, _ := newCapacityHarness(t, nil, nil)
 	putRunning(t, svc, "sb-x")
 	svc.AttachCluster(&ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "other"})
-	got := svc.ReleaseForMove(context.Background(), []string{"sb-x"})
+	got := svc.ReleaseForMove(context.Background(), []string{"sb-x"}, nil)
 	if !strings.HasPrefix(got["sb-x"], "error:") || svc.OwnershipFenced("sb-x") {
 		t.Fatalf("release of a foreign placement = %v, fenced %v", got, svc.OwnershipFenced("sb-x"))
 	}
@@ -149,11 +154,26 @@ func TestNoticeDecommission(t *testing.T) {
 // ownerStubCluster places every sandbox on owner.
 type ownerStubCluster struct {
 	*cluster.Noop
-	owner string
+	owner       string
+	incarnation string // the placement's lifetime; empty matches any row
+	readErr     error
 }
 
 func (c *ownerStubCluster) PlacementOf(id string) (cluster.Placement, bool) {
-	return cluster.Placement{SandboxID: id, OwnerNodeID: c.owner, IncarnationID: "i"}, true
+	return cluster.Placement{SandboxID: id, OwnerNodeID: c.owner, IncarnationID: c.incarnation}, true
+}
+
+// AuthoritativePlacementsByIDs is the leader's answer: the same placement,
+// or readErr.
+func (c *ownerStubCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
+	if c.readErr != nil {
+		return nil, c.readErr
+	}
+	out := make(map[string]cluster.Placement, len(ids))
+	for _, id := range ids {
+		out[id], _ = c.PlacementOf(id)
+	}
+	return out, nil
 }
 
 // The service is the worker side the leader calls.
@@ -177,7 +197,7 @@ func TestResumeLapsedMove(t *testing.T) {
 		putRunning(t, svc, id)
 	}
 	release := func(id string) {
-		if got := svc.ReleaseForMove(ctx, []string{id}); got[id] != MoveReleased {
+		if got := svc.ReleaseForMove(ctx, []string{id}, nil); got[id] != MoveReleased {
 			t.Fatalf("release %s = %v", id, got)
 		}
 	}
@@ -230,7 +250,7 @@ func TestReleaseSchedulesTheResume(t *testing.T) {
 	svc, _, st := newCapacityHarness(t, nil, nil)
 	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
 	putRunning(t, svc, "sb-timer")
-	if got := svc.ReleaseForMove(context.Background(), []string{"sb-timer"}); got["sb-timer"] != MoveReleased {
+	if got := svc.ReleaseForMove(context.Background(), []string{"sb-timer"}, nil); got["sb-timer"] != MoveReleased {
 		t.Fatalf("release = %v", got)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -241,4 +261,153 @@ func TestReleaseSchedulesTheResume(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("the lapsed move was never resumed")
+}
+
+// A move request is built from a placement read up to minutes before it
+// arrives (the target's pre-pull comes first). If the id has become a new
+// lifetime of the sandbox by then, the request is not about it: neither a
+// release nor a deadline stop touches it (R10). The same request for the
+// lifetime that is here goes through.
+func TestDelayedMoveMustNotStopReplacement(t *testing.T) {
+	ctx := context.Background()
+	for _, action := range []string{"release", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			svc, _, st := newCapacityHarness(t, nil, nil)
+			svc.AttachCluster(&ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
+			const id = "sb-reused"
+			// The leader built the action for the old lifetime, which was
+			// deleted; the id came back as a new one.
+			delayed := cluster.MoveAction{Action: action, IDs: []string{id}, Incarnations: map[string]string{id: "old-incarnation"}}
+			if err := st.Create(ctx, &models.Sandbox{ID: id, Image: "alpine", ContainerID: "new-task", Status: models.SandboxStatusStarted, AuditIncarnationID: "new-incarnation"}); err != nil {
+				t.Fatal(err)
+			}
+			out, err := cluster.RunMoveAction(ctx, svc, delayed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != models.SandboxStatusStarted || out.Results[id] != MoveGone || svc.OwnershipFenced(id) {
+				t.Fatalf("a %s for the old lifetime touched the new one: status=%s results=%v fenced=%v", action, got.Status, out.Results, svc.OwnershipFenced(id))
+			}
+			current := cluster.MoveAction{Action: action, IDs: []string{id}, Incarnations: map[string]string{id: "new-incarnation"}}
+			if out, _ := cluster.RunMoveAction(ctx, svc, current); out.Results[id] != MoveReleased && out.Results[id] != MoveStopped {
+				t.Fatalf("a %s for the current lifetime: %v", action, out.Results)
+			}
+		})
+	}
+}
+
+// restartedService is a new sandboxd process on the same store and runtime:
+// fresh process state, the same rows and tasks.
+func restartedService(svc *Service, c *ownerStubCluster) *Service {
+	r := &Service{cfg: svc.cfg, logger: svc.logger, store: svc.store, docker: svc.docker,
+		caddy: svc.caddy, mounts: svc.mounts, admitter: svc.admitter}
+	r.AttachCluster(c)
+	return r
+}
+
+// A release's fence survives a restart of sandboxd (R11). The row records
+// it, so a fresh process refuses every start until it lapses, and re-arms it
+// at start without waiting for one. Once it lapses, the sandbox the release
+// stopped is started again (the leader says the move never happened); one
+// its user had stopped stays stopped.
+func TestMoveFenceSurvivesAgentRestart(t *testing.T) {
+	old := moveFenceTTL
+	moveFenceTTL = 400 * time.Millisecond
+	t.Cleanup(func() { moveFenceTTL = old })
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.cfg.EnableCluster = true
+	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
+	// The process that releases dies right after: its own resume check can
+	// never reach the leader.
+	dead := &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"}
+	svc.AttachCluster(dead)
+	putRunning(t, svc, "sb-released")
+	putRunning(t, svc, "sb-user")
+	if _, err := svc.StopSandbox(ctx, "sb-user"); err != nil {
+		t.Fatal(err)
+	}
+	got := svc.ReleaseForMove(ctx, []string{"sb-released", "sb-user"}, nil)
+	if got["sb-released"] != MoveReleased || got["sb-user"] != MoveReleased {
+		t.Fatalf("release: %v", got)
+	}
+	dead.readErr = errors.New("this process is gone")
+
+	restarted := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", readErr: errors.New("gone too")})
+	restarted.beginOwnershipLease(time.Now())
+	for _, id := range []string{"sb-released", "sb-user"} {
+		if _, err := restarted.StartSandbox(ctx, id); !errors.Is(err, ErrOwnershipFenced) {
+			t.Fatalf("restarted process started released %s: %v", id, err)
+		}
+		if !restarted.OwnershipFenced(id) {
+			t.Fatalf("the refused start did not fence %s for its routes", id)
+		}
+	}
+
+	again := restartedService(svc, &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self"})
+	again.rearmMoveFences(ctx)
+	if !again.OwnershipFenced("sb-released") || !again.OwnershipFenced("sb-user") {
+		t.Fatal("a process starting up did not re-arm the fences in the rows")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sb, _ := st.Get(ctx, "sb-released"); sb.Status == models.SandboxStatusStarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the restarted process never started a sandbox whose move never happened")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if sb, _ := st.Get(ctx, "sb-user"); sb.Status != models.SandboxStatusStopped || sb.StatusReason != statusReasonMoveReleasedStopped {
+		t.Fatalf("the sandbox its user stopped: status %s reason %s", sb.Status, sb.StatusReason)
+	}
+}
+
+// A lapsed move is started again only on the leader's word: an unanswered
+// read is checked again later, and a placement that now holds another
+// lifetime is left alone.
+func TestResumeLapsedMoveAsksTheLeader(t *testing.T) {
+	oldRetry := moveResumeRetry
+	moveResumeRetry = 50 * time.Millisecond
+	t.Cleanup(func() { moveResumeRetry = oldRetry })
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	svc.docker.(*fakeCapacityRuntime).startResult = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted, ContainerID: "c"}
+	owner := &ownerStubCluster{Noop: cluster.NewNoop("self", "", ""), owner: "self", incarnation: "inc-now"}
+	svc.AttachCluster(owner)
+	for _, id := range []string{"sb-wait", "sb-old"} {
+		if err := st.Create(ctx, &models.Sandbox{ID: id, Name: id, Image: "alpine", Status: models.SandboxStatusStarted, ContainerID: "c-" + id, AuditIncarnationID: "inc-now"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := svc.ReleaseForMove(ctx, []string{id}, map[string]string{id: "inc-now"}); got[id] != MoveReleased {
+			t.Fatalf("release %s: %v", id, got)
+		}
+		svc.moves.set(id, time.Now().Add(-time.Second))
+	}
+
+	owner.incarnation = "inc-next" // the swap happened: a new lifetime
+	if svc.resumeLapsedMove(ctx, "sb-old") {
+		t.Fatal("started a sandbox whose placement holds another lifetime")
+	}
+	owner.incarnation = "inc-now"
+	owner.readErr = errors.New("no leader")
+	if svc.resumeLapsedMove(ctx, "sb-wait") {
+		t.Fatal("started without the leader's answer")
+	}
+	owner.readErr = nil
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if sb, _ := st.Get(ctx, "sb-wait"); sb.Status == models.SandboxStatusStarted {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the check after an unanswered read never came")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

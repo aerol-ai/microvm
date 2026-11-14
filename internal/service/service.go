@@ -3886,6 +3886,12 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 	if err != nil {
 		return nil, err
 	}
+	// A row a move release fenced, which this process never saw (it
+	// restarted since): refused like any fenced sandbox until the fence in
+	// the row lapses (R11).
+	if err := s.refuseMovedRowStart(sandbox); err != nil {
+		return nil, err
+	}
 	// Sealed-env mode omits Env from store scans. Runtime paths (especially
 	// WASM reconstruct / passivate rehydrate) need the materialised map —
 	// public Get/List redaction must not starve internal start.

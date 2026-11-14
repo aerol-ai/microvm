@@ -23,6 +23,7 @@ type fakeSnapshotMoves struct {
 	mu        sync.Mutex
 	calls     []string
 	importErr error
+	lifetime  string // the incarnation the last release named
 }
 
 func (f *fakeSnapshotMoves) note(s string) {
@@ -31,8 +32,11 @@ func (f *fakeSnapshotMoves) note(s string) {
 	f.calls = append(f.calls, s)
 }
 
-func (f *fakeSnapshotMoves) ReleaseForSnapshotMove(_ context.Context, id, target string) string {
+func (f *fakeSnapshotMoves) ReleaseForSnapshotMove(_ context.Context, id, target, lifetime string) string {
 	f.note("release " + id + " for " + target)
+	f.mu.Lock()
+	f.lifetime = lifetime
+	f.mu.Unlock()
 	return "released"
 }
 
@@ -105,6 +109,9 @@ func TestEvacuateNodeMovesAFirecrackerSandboxBySnapshot(t *testing.T) {
 	}
 	if got := strings.Join(source.calls, "; "); got != "release sb-vm for wkr-b" {
 		t.Fatalf("source calls: %s", got)
+	}
+	if source.lifetime != "inc-sb-vm" {
+		t.Fatalf("the release named lifetime %q, want inc-sb-vm (R10)", source.lifetime)
 	}
 	if got := strings.Join(target.calls, "; "); got != "import sb-vm from "+c.nodeID+"; start sb-vm from alpine" {
 		t.Fatalf("target calls: %s", got)
