@@ -192,7 +192,8 @@ The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server it
 - **Outbound network rules do not cover mounts.** [Network access](/network-access/) controls traffic from inside the sandbox. The mount runs on the server, so it can still reach the storage.
 - **Which sandboxes support mounts:** Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes refuse them.
 - **An SSH server's host key is trusted on first use.** The server accepts the storage server's key the first time it connects.
-- **The server needs the mount program installed.** The [server installer](/getting-started/installer-options/) adds them. A server without the program for a mount, such as a [local install](/getting-started/local-setup/), refuses the sandbox with `501` and the code `mount_tool_unavailable`. The error names the missing program. Retrying does not help: the operator installs the program, or you create the sandbox without the mount.
+- **The server needs the mount program installed.** The [server installer](/getting-started/installer-options/) adds them, and so does the [Kubernetes](/kubernetes/) worker image. A server without the program for a mount, such as a [local install](/getting-started/local-setup/), refuses the sandbox with `501` and the code `mount_tool_unavailable`. The error names the missing program. Retrying does not help: the operator installs the program, or you create the sandbox without the mount.
+- **On Kubernetes, the mount is checked before the sandbox starts.** A worker pod mounts the storage in one container and builds the sandbox in another, so before it answers, the worker checks the sandbox will really see the mount. If it would not, the create fails and the mount is removed: the sandbox never writes to its own disk while you think it writes to your storage. The mount programs keep running when the worker's agent restarts, so a running sandbox keeps its storage.
 
 ## Next steps
 

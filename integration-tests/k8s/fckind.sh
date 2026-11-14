@@ -3,7 +3,7 @@
 # architecture.md Phase 5, "Firecracker pools"), proven on kind on one EC2
 # machine with nested virtualization, the setting spike S6 tested.
 #
-#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move|gmove|kubeapi|externalca|review] fckind.sh <name>
+#   AEROL_BUILD_REF=<commit> [AEROL_FCKIND_PROOF=pod|move|gmove|kubeapi|externalca|review|mount] fckind.sh <name>
 #
 # pod (the default): one worker, a VM survives an agent restart. move:
 # cluster mode, every worker a Firecracker worker; a VM's worker is
@@ -15,6 +15,9 @@
 # port refuses a second key, a certificate with no role and another CA.
 # review: the Kubernetes review fixes (R1-R17, S5) on cluster mode, one
 # check per fix with live behaviour (fckind/review.sh); m8i.4xlarge.
+# mount: single mode; an rclone mount reaches a gVisor sandbox, keeps
+# serving across an agent restart, and the pod's end leaves no mount
+# (finding F13, fckind/mount.sh).
 #
 # The commit's source goes to the artifact bucket (a presigned link; nothing
 # goes from this machine to the instance directly). The instance builds the

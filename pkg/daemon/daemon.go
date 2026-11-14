@@ -245,10 +245,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		go watchTLSCertificate(ctx, cfg.TLSCertWatchFile, caddyClient.ReloadCertificates, logger)
 	}
 
+	// Mount helpers start where the sandboxes sandboxd runs itself do (in a
+	// worker pod, the runtime container's group, so an agent restart leaves
+	// them serving); in a split pod each mount is checked visible to the
+	// runtime before a create answers (F13).
 	mountManager, err := mounts.New(logger, mounts.Config{
-		RootDir:     cfg.MountsRootPath,
-		CredDir:     cfg.MountsCredentialsRuntimeDir,
-		WaitTimeout: cfg.MountWaitTimeout,
+		RootDir:        cfg.MountsRootPath,
+		CredDir:        cfg.MountsCredentialsRuntimeDir,
+		WaitTimeout:    cfg.MountWaitTimeout,
+		CgroupRoot:     cfg.HostProcessCgroupRoot(),
+		RuntimePIDFile: cfg.MountsRuntimePIDFile,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize mount manager: %w", err)

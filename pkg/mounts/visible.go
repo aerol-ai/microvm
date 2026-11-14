@@ -1,0 +1,55 @@
+package mounts
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+// Visibility (finding F13). In the Kubernetes worker pod, sandboxd (the
+// agent container) runs the mount helpers, while containerd and runsc (the
+// runtime container) build the sandbox. Each container has its own mount
+// namespace, and a mount made in the agent reaches the runtime only through
+// a volume both mount with two-way (Bidirectional) propagation. Without
+// that, the runtime bound the empty folder under the mount: the create
+// succeeded, and the sandbox wrote to local disk instead of the external
+// store. So with a runtime pid file set, MountAll answers only once each
+// mount is the same file in the runtime's mount namespace, seen through
+// /proc/<pid>/root, as it is here.
+
+// ErrMountNotVisible is a mount the container runtime cannot see.
+var ErrMountNotVisible = errors.New("the mount is not visible to the container runtime")
+
+// checkVisible reports whether hostPath, as the runtime's mount namespace
+// sees it, is the mount sandboxd sees: the same device and inode. A mount
+// that did not propagate shows the folder under it, another device. With
+// no runtime pid file, there is nothing to check (one mount namespace).
+func (m *Manager) checkVisible(hostPath string) error {
+	if m.runtimePIDFile == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(m.runtimePIDFile)
+	if err != nil {
+		return fmt.Errorf("%w: cannot read the runtime's pid: %v", ErrMountNotVisible, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("%w: %s holds no pid: %q", ErrMountNotVisible, m.runtimePIDFile, strings.TrimSpace(string(raw)))
+	}
+	mine, err := os.Stat(hostPath)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrMountNotVisible, err)
+	}
+	theirs, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid), "root", hostPath))
+	if err != nil {
+		return fmt.Errorf("%w: %s as the runtime (pid %d) sees it: %v", ErrMountNotVisible, hostPath, pid, err)
+	}
+	if !os.SameFile(mine, theirs) {
+		return fmt.Errorf("%w: the runtime (pid %d) sees the folder under %s, not the mount; "+
+			"the mounts folder needs two-way mount propagation in both containers", ErrMountNotVisible, pid, hostPath)
+	}
+	return nil
+}

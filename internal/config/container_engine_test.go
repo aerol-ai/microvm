@@ -138,6 +138,32 @@ func TestLoadHostProcessCgroupParent(t *testing.T) {
 	}
 }
 
+// SB_MOUNTS_RUNTIME_PID_FILE turns on the check that an external mount is
+// visible to the worker pod's runtime container (F13): unset on a VM, an
+// absolute path in the pod, a relative one refused.
+func TestLoadMountsRuntimePIDFile(t *testing.T) {
+	for _, tc := range []struct{ name, value, want, wantErr string }{
+		{name: "VM: unset"},
+		{name: "pod", value: " /run/aerolvm/runtime.pid ", want: "/run/aerolvm/runtime.pid"},
+		{name: "relative refused", value: "run/aerolvm/runtime.pid", wantErr: "SB_MOUNTS_RUNTIME_PID_FILE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SB_PAT_TOKEN", "operator-pat")
+			t.Setenv("SB_MOUNTS_RUNTIME_PID_FILE", tc.value)
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to mention %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || cfg.MountsRuntimePIDFile != tc.want {
+				t.Fatalf("MountsRuntimePIDFile = %q (%v), want %q", cfg.MountsRuntimePIDFile, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunsHostProcessSandboxes(t *testing.T) {
 	for _, tc := range []struct {
 		name string

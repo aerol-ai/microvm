@@ -28,6 +28,20 @@ type Config struct {
 	RootDir     string        // /var/lib/sandboxd/mounts
 	CredDir     string        // /run/sandboxd
 	WaitTimeout time.Duration // how long to wait for a mount to become ready
+	// CgroupRoot is the cgroup directory the helpers' own cgroup
+	// (helperCgroupName) is made in. Empty: the cgroup v2 root, as on a VM.
+	// In a Kubernetes worker pod it is the runtime container's sandboxes
+	// group (SB_HOST_PROCESS_CGROUP_PARENT): inside the pod's box, and
+	// outside the agent container, whose restart would otherwise end every
+	// helper. At the cgroup v2 root a privileged pod's helpers ran at the
+	// machine's root, outside the pod and past its end (eng review OV-E2).
+	CgroupRoot string
+	// RuntimePIDFile names a file holding the pid of a process in the mount
+	// namespace that builds sandboxes: the worker pod's runtime container.
+	// With it set, MountAll answers only once every mount is visible there
+	// (checkVisible, F13). Empty on a VM, where sandboxd and the runtime
+	// share one mount namespace.
+	RuntimePIDFile string
 }
 
 // Manager owns mount processes for every active sandbox.
@@ -49,6 +63,9 @@ type Manager struct {
 
 	// cgroup is where helpers start so they outlive sandboxd (cgroup.go).
 	cgroup *helperCgroup
+
+	// runtimePIDFile is Config.RuntimePIDFile (visible.go).
+	runtimePIDFile string
 }
 
 type mountState struct {
@@ -84,6 +101,13 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	if !filepath.IsAbs(cfg.CredDir) {
 		return nil, fmt.Errorf("credentials dir must be absolute: %q", cfg.CredDir)
 	}
+	if cfg.RuntimePIDFile != "" && !filepath.IsAbs(cfg.RuntimePIDFile) {
+		return nil, fmt.Errorf("runtime pid file must be absolute: %q", cfg.RuntimePIDFile)
+	}
+	cgroupRoot := helperCgroupRoot
+	if cfg.CgroupRoot != "" {
+		cgroupRoot = cfg.CgroupRoot
+	}
 	if cfg.WaitTimeout <= 0 {
 		cfg.WaitTimeout = 30 * time.Second
 	}
@@ -104,7 +128,9 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		mounting:    make(map[string]int),
 		sweeping:    make(map[string]chan struct{}),
 		closeCh:     make(chan struct{}),
-		cgroup:      newHelperCgroup(logger, helperCgroupRoot),
+		cgroup:      newHelperCgroup(logger, cgroupRoot),
+
+		runtimePIDFile: cfg.RuntimePIDFile,
 	}, nil
 }
 
@@ -206,6 +232,21 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		}
 		established = append(established, state)
 		binds = append(binds, bind)
+	}
+	// Every mount must be where the sandbox is built, or the sandbox gets
+	// the empty folder under it (F13). Checked once all are up, adopted
+	// ones too, and the whole set rolled back like any other failure.
+	for i, bind := range binds {
+		if bind.Tmpfs || bind.HostPath == "" {
+			continue
+		}
+		if err := m.checkVisible(bind.HostPath); err != nil {
+			for _, s := range established {
+				_ = m.tearDownState(s)
+			}
+			_ = os.RemoveAll(filepath.Join(m.rootDir, sandboxID))
+			return nil, fmt.Errorf("mount %d (%s): %w", i, mounts[i].Type, err)
+		}
 	}
 
 	m.mu.Lock()

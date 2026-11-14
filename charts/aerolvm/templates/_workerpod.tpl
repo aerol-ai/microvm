@@ -83,8 +83,12 @@ containers:
       privileged: true
     resources:
       {{- toYaml $root.Values.worker.runtime.resources | nindent 6 }}
-    {{- if or $cluster $root.Values.worker.isolate.enabled }}
     env:
+      # Sandboxes' external storage, unmounted when the pod ends (as netns,
+      # F8), and the pid sandboxd checks a mount through: a mount is only
+      # served once it shows here, where the sandbox is built (F13).
+      - { name: SB_MOUNTS_DIR, value: /var/lib/sandboxd/mounts }
+      - { name: SB_RUNTIME_PID_FILE, value: /run/aerolvm/runtime.pid }
       {{- if $cluster }}
       # sandboxd's ownership lease (C7). When it runs out the supervisor
       # freezes the sandboxes it fences, even with sandboxd down; that is
@@ -96,7 +100,6 @@ containers:
       # The V8 jail's mounts, unmounted when the pod ends (as netns, F8).
       - { name: SB_ISOLATE_JAIL_DIR, value: /var/lib/sandboxd/isolate-jail }
       {{- end }}
-    {{- end }}
     volumeMounts:
       - { name: containerd, mountPath: /var/lib/containerd }
       - { name: state, mountPath: /var/lib/sandboxd }
@@ -114,6 +117,12 @@ containers:
       # when the pod ends.
       - { name: isolate-jail, mountPath: /var/lib/sandboxd/isolate-jail, mountPropagation: Bidirectional }
       {{- end }}
+      # Sandboxes' external storage (FUSE and NFS): the agent's mount
+      # helpers mount below it, and runsc binds it into the sandbox. A
+      # mount reaches this container only through two-way propagation on
+      # both sides; without it the sandbox got the empty folder underneath
+      # and wrote to local disk (finding F13).
+      - { name: mounts, mountPath: /var/lib/sandboxd/mounts, mountPropagation: Bidirectional }
   - name: agent
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -203,6 +212,15 @@ containers:
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
+      # The runtime container's pid: a create answers only once each
+      # external mount shows there, where runsc builds the sandbox (F13).
+      # Mount helpers run under the runtime container's group (the
+      # containerd parent), so an agent restart leaves them serving.
+      - { name: SB_MOUNTS_RUNTIME_PID_FILE, value: /run/aerolvm/runtime.pid }
+      # rclone's write cache on the pod's state volume, not this
+      # container's own disk, which the kubelet deletes after a restart
+      # while the helper still writes there.
+      - { name: RCLONE_CACHE_DIR, value: /var/lib/sandboxd/rclone-cache }
       {{- $runtimes := list "docker" "gvisor" }}
       {{- if $root.Values.worker.wasm.enabled }}{{ $runtimes = append $runtimes "wasm" }}{{ end }}
       {{- if $root.Values.worker.isolate.enabled }}{{ $runtimes = append $runtimes "isolate" }}{{ end }}
@@ -305,6 +323,11 @@ containers:
       # the group over (C14) as it would on a VM.
       - { name: isolate-jail, mountPath: /var/lib/sandboxd/isolate-jail, mountPropagation: Bidirectional }
       {{- end }}
+      # Sandboxes' external storage: the mount helpers mount below it.
+      # Bidirectional, so each mount reaches the runtime container, where
+      # runsc binds it into the sandbox (finding F13), and a restarted
+      # agent still sees the mounts its helpers keep serving.
+      - { name: mounts, mountPath: /var/lib/sandboxd/mounts, mountPropagation: Bidirectional }
       {{- if $root.Values.edge.enabled }}
       # The certificate alone, to see it change: sandboxd never
       # needs the key.
@@ -386,6 +409,7 @@ volumes:
   - { name: toolbox, emptyDir: {} }
   - { name: cni-state, emptyDir: {} }
   - { name: netns, emptyDir: {} }
+  - { name: mounts, emptyDir: {} }
   {{- if $root.Values.worker.isolate.enabled }}
   - { name: isolate-jail, emptyDir: {} }
   {{- end }}

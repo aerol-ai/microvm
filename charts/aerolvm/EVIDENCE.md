@@ -96,7 +96,7 @@ that a sandbox starts in milliseconds without a Kubernetes API call:
 | A network namespace per sandbox, its link, firewall rules and address translation | `CAP_NET_ADMIN` |
 | Each sandbox's CPU and memory box inside the pod's cgroup | A writable `/sys/fs/cgroup` (normal pods get it read-only) |
 | Network namespaces shared between `agent` and `runtime` | Two-way mount propagation, which Kubernetes allows only in privileged containers |
-| External storage through FUSE | `/dev/fuse` and `CAP_SYS_ADMIN` |
+| External storage through FUSE | `/dev/fuse` and `CAP_SYS_ADMIN`, and two-way mount propagation of the pod's own `mounts` folder (an `emptyDir`), so a mount the `agent` makes reaches the `runtime` that builds the sandbox. The helpers run in the pod's cgroup, and every mount is removed when the pod ends |
 
 We measured the alternatives on Amazon Linux 2023 and Bottlerocket:
 

@@ -1,0 +1,151 @@
+package mounts
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts/adapters"
+)
+
+// runtimeView stands in procfs for the runtime container: proc/<pid>/root
+// points at "/" (the runtime sees what sandboxd sees, as with two-way
+// propagation) or at another tree (it sees the folder under the mount).
+type runtimeView struct {
+	t       *testing.T
+	proc    string
+	pidFile string
+}
+
+func newRuntimeView(t *testing.T, m *Manager) *runtimeView {
+	t.Helper()
+	old := procRoot
+	v := &runtimeView{t: t, proc: t.TempDir(), pidFile: filepath.Join(t.TempDir(), "runtime.pid")}
+	procRoot = v.proc
+	t.Cleanup(func() { procRoot = old })
+	m.runtimePIDFile = v.pidFile
+	return v
+}
+
+// sees points the runtime's root at root.
+func (v *runtimeView) sees(root string) {
+	v.t.Helper()
+	dir := filepath.Join(v.proc, "4242")
+	_ = os.RemoveAll(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		v.t.Fatal(err)
+	}
+	if err := os.Symlink(root, filepath.Join(dir, "root")); err != nil {
+		v.t.Fatal(err)
+	}
+	if err := os.WriteFile(v.pidFile, []byte("4242\n"), 0o644); err != nil {
+		v.t.Fatal(err)
+	}
+}
+
+// elsewhere is a tree where every path under the mounts root is a folder of
+// its own: what a runtime sees without propagation.
+func (v *runtimeView) elsewhere(m *Manager, paths ...string) string {
+	v.t.Helper()
+	other := v.t.TempDir()
+	for _, p := range paths {
+		if err := os.MkdirAll(filepath.Join(other, p), 0o755); err != nil {
+			v.t.Fatal(err)
+		}
+	}
+	return other
+}
+
+func TestCheckVisible(t *testing.T) {
+	m := newTestManager(t, nil)
+	host := filepath.Join(m.rootDir, "sb-visible", "0")
+	if err := os.MkdirAll(host, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.checkVisible(host); err != nil {
+		t.Fatalf("no runtime pid file (a VM) checks nothing: %v", err)
+	}
+	v := newRuntimeView(t, m)
+	for _, tc := range []struct {
+		name  string
+		setup func()
+		want  string
+	}{
+		{"no pid file yet", func() {}, "cannot read the runtime's pid"},
+		{"not a pid", func() { _ = os.WriteFile(v.pidFile, []byte("runtime"), 0o644) }, "holds no pid"},
+		{"no such process", func() { _ = os.WriteFile(v.pidFile, []byte("4242"), 0o644) }, "as the runtime (pid 4242) sees it"},
+		{"the folder under the mount", func() { v.sees(v.elsewhere(m, host)) }, "sees the folder under"},
+	} {
+		tc.setup()
+		err := m.checkVisible(host)
+		if !errors.Is(err, ErrMountNotVisible) || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want ErrMountNotVisible with %q", tc.name, err, tc.want)
+		}
+	}
+	v.sees("/")
+	if err := m.checkVisible(host); err != nil {
+		t.Fatalf("the runtime sees the same mount: %v", err)
+	}
+	if err := m.checkVisible(filepath.Join(m.rootDir, "missing")); !errors.Is(err, ErrMountNotVisible) {
+		t.Fatalf("a mount point that is gone: %v", err)
+	}
+}
+
+// A mount the runtime cannot see fails the whole set: every mount made is
+// torn down and the sandbox's folder removed, so a retry can mount again.
+// Before, the create went on and the sandbox wrote to local disk.
+func TestMountAllFailsWhenTheRuntimeCannotSeeAMount(t *testing.T) {
+	m := newTestManager(t, map[models.MountType]adapters.Adapter{models.MountTypeNFS: fakeAdapter{}})
+	v := newRuntimeView(t, m)
+	specs := []models.MountSpec{
+		{Type: models.MountTypeNFS, Source: "a:/x", Target: "/mnt/a"},
+		{Type: models.MountTypeNFS, Source: "b:/y", Target: "/mnt/b"},
+	}
+	v.sees(v.elsewhere(m, m.hostPath("sb-f13", 0), m.hostPath("sb-f13", 1)))
+	_, err := m.MountAll(context.Background(), "sb-f13", specs)
+	if !errors.Is(err, ErrMountNotVisible) || !strings.Contains(err.Error(), "mount 0 (nfs)") {
+		t.Fatalf("MountAll = %v, want mount 0 refused as not visible", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(m.rootDir, "sb-f13")); !os.IsNotExist(statErr) {
+		t.Fatalf("the sandbox's mount folder was left behind: %v", statErr)
+	}
+	if binds := m.HostBindsFor("sb-f13"); len(binds) != 0 {
+		t.Fatalf("binds kept for a refused set: %+v", binds)
+	}
+	// With the mounts visible, the same sandbox mounts.
+	v.sees("/")
+	binds, err := m.MountAll(context.Background(), "sb-f13", specs)
+	if err != nil || len(binds) != 2 {
+		t.Fatalf("MountAll once visible = %v, %+v", err, binds)
+	}
+}
+
+func TestNewRuntimePIDFileAndCgroupRoot(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := New(logger, Config{RootDir: t.TempDir(), CredDir: t.TempDir(), RuntimePIDFile: "run/aerolvm/runtime.pid"}); err == nil {
+		t.Fatal("a relative runtime pid file was accepted")
+	}
+	root := filepath.Join(t.TempDir(), "kubepods", "pod", "sandboxes")
+	m, err := New(logger, Config{RootDir: t.TempDir(), CredDir: t.TempDir(), RuntimePIDFile: "/run/aerolvm/runtime.pid", CgroupRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if m.cgroup.root != root || m.runtimePIDFile != "/run/aerolvm/runtime.pid" {
+		t.Fatalf("cgroup root %q, pid file %q", m.cgroup.root, m.runtimePIDFile)
+	}
+	d, err := New(logger, Config{RootDir: t.TempDir(), CredDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if d.cgroup.root != helperCgroupRoot {
+		t.Fatalf("default cgroup root %q, want %q", d.cgroup.root, helperCgroupRoot)
+	}
+}
