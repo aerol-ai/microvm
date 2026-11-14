@@ -358,6 +358,10 @@ func (h *warmDestroyHandle) Shutdown(ctx context.Context, grace time.Duration) e
 	return h.spawned.Shutdown(ctx, grace)
 }
 
+// signalWarmVM is syscall.Kill. A test swaps it, so a fake handle's pid
+// is never signalled on the machine running the tests.
+var signalWarmVM = syscall.Kill
+
 // Kill ends the warm VM's process at once. Destroy calls it for a VM the
 // ownership lease froze, then Shutdown, which frees the pool's slot; a
 // no-op here left the frozen process holding guest memory, and its TAP
@@ -367,7 +371,7 @@ func (h *warmDestroyHandle) Kill() error {
 	if pid <= 0 {
 		return nil
 	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := signalWarmVM(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("warm vmm kill %d: %w", pid, err)
 	}
 	return nil
