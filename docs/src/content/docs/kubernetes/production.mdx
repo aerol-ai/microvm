@@ -37,7 +37,7 @@ The [overview](/kubernetes/#cluster-mode) lists every object, name and namespace
 - **A StorageClass with `volumeBindingMode: WaitForFirstConsumer`**, so each server's disk is made in that server's zone. AKS's `managed-csi` works as it is. A stock EKS cluster has only `gp2`: add the [`gp3` class below](#a-gp3-storageclass-on-eks).
 - **Room for AerolVM's own pods**: in each zone, one server and one gateway. By default they request 1.5 CPU and 2.5 GiB together, plus 0.1 CPU per operator replica. Use machines with 4 or more CPUs. On a 2-CPU machine such as `m7i.large`, a server may not fit next to the cluster's own pods and stays Pending.
 - **Worker machines**: a Karpenter NodePool, an AKS node pool with Node Auto Provisioning, or a fixed node group. They need `br_netfilter` loaded ([step 1](#step-1-prepare-the-worker-machines)).
-- **Helm 3.8+, kubectl**, and [the chart](/kubernetes/#get-the-chart) cloned.
+- **Helm 3.8+ and kubectl**, and the release to install ([Get the chart](/kubernetes/#get-the-chart)).
 - **The [`aerolvm` CLI](/cli/#install)**, v0.7.1 or later, to check the install at the end.
 
 ### A gp3 StorageClass on EKS
@@ -188,7 +188,7 @@ What each part does:
 Every field is on [Helm values](/kubernetes/values/#cluster).
 
 <Aside>
-For a regulated setup, start from `charts/aerolvm/values-bank-eks.yaml` instead. It turns on gVisor only, NetworkPolicies, HTTPS, monitoring, a create policy and machine replacement, and lists what you must set outside the chart.
+For a regulated setup, start from the chart's `values-bank-eks.yaml` instead ([unpack the chart](/kubernetes/#get-the-chart) to get it). It turns on gVisor only, NetworkPolicies, HTTPS, monitoring, a create policy and machine replacement, and lists what you must set outside the chart.
 </Aside>
 
 ## Step 3: Install
@@ -198,7 +198,8 @@ The release namespace must enforce `restricted`. The chart makes the worker name
 ```bash title="Your machine"
 kubectl create namespace aerolvm-system
 kubectl label namespace aerolvm-system pod-security.kubernetes.io/enforce=restricted
-helm install aerolvm charts/aerolvm --namespace aerolvm-system -f aerolvm-cluster.yaml
+helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+  --namespace aerolvm-system -f aerolvm-cluster.yaml
 ```
 
 ## Step 4: Watch it build

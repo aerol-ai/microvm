@@ -59,7 +59,8 @@ cluster:
 Then upgrade:
 
 ```bash
-helm upgrade aerolvm charts/aerolvm --namespace aerolvm-system -f aerolvm-cluster.yaml
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+  --namespace aerolvm-system -f aerolvm-cluster.yaml
 ```
 
 Check that Kubernetes can reach the gateways. Both lines should say `True`:

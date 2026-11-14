@@ -4,7 +4,8 @@
 #
 #   kubectl create namespace aerolvm-system
 #   kubectl label namespace aerolvm-system pod-security.kubernetes.io/enforce=restricted
-#   helm install aerolvm charts/aerolvm -n aerolvm-system -f values-bank-eks.yaml
+#   helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> \
+#     -n aerolvm-system -f values-bank-eks.yaml
 #
 # What this file sets:
 #   - cluster mode over three zones, with gVisor as the only runtime;

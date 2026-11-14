@@ -122,14 +122,23 @@ Cluster mode needs more. The [production install](/kubernetes/production/#before
 
 ## Get the chart
 
-The chart lives in the AerolVM repository. Clone the newest release from the [releases page](https://github.com/aerol-ai/microvm/releases). This guide needs a release newer than v0.7.3: older charts lack settings it uses.
+Each release publishes the chart to GitHub's container registry, signed like the images. Releases after v0.7.3 publish it. There is nothing to clone or add: Helm reads it straight from the registry.
 
-```bash title="Your machine"
-git clone --depth 1 --branch <version> https://github.com/aerol-ai/microvm.git
-cd microvm
+```text title="The chart"
+oci://ghcr.io/aerol-ai/charts/aerolvm
 ```
 
-Every command in this guide runs from that folder. The chart is `charts/aerolvm`. It runs the images of its own release (its `appVersion`) unless you set `image.tag`.
+Every `helm` command in this guide passes `--version <version>`. Use the release number **without the `v`**: release `v1.2.3` is `--version 1.2.3`. The [releases page](https://github.com/aerol-ai/microvm/releases) lists them. Always pass it: without `--version`, Helm takes the newest chart, which can be an upgrade you did not plan.
+
+The chart runs the images of its own release unless you set `image.tag`. Image tags keep the `v`: `ghcr.io/aerol-ai/aerolvm:v1.2.3`.
+
+To read the chart's files, such as its `values.yaml`, the bank preset `values-bank-eks.yaml`, the example policies in `examples/` or the evidence pack `EVIDENCE.md`, unpack it into a folder named `aerolvm`:
+
+```bash title="Your machine"
+helm pull oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> --untar
+```
+
+To check the chart's signature before you install it, see [`RELEASE-VERIFICATION.md`](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md#helm-chart).
 
 ## Start here
 

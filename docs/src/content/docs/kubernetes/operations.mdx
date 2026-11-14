@@ -56,10 +56,11 @@ Servers never move zone: EBS and Azure disks cannot cross zones, so each server 
 
 ## Upgrade
 
-In cluster mode, one `helm upgrade` moves the whole cluster. Clone the [new release](/kubernetes/#get-the-chart), then:
+In cluster mode, one `helm upgrade` moves the whole cluster. Pass the new release's number, say `1.2.4`:
 
 ```bash title="Your machine"
-helm upgrade aerolvm charts/aerolvm --namespace aerolvm-system -f aerolvm-cluster.yaml
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version 1.2.4 \
+  --namespace aerolvm-system -f aerolvm-cluster.yaml
 ```
 
 Two values decide the version, and both default to the chart's `appVersion`:
@@ -77,14 +78,14 @@ What happens:
 
 Watch it: `kubectl -n aerolvm-system get aerolcluster` shows `VERSION` (wanted) and `RUNNING`. `aerolvm upgrade status` shows each node.
 
-**To roll back**, set `cluster.version` back and run `helm upgrade` again. A `helm rollback` works too, and keeps the newer CRDs: their new fields do no harm to an older operator.
+**To roll back**, run `helm upgrade` again with the old `--version`, or set `cluster.version` back. A `helm rollback` works too, and keeps the newer CRDs: their new fields do no harm to an older operator.
 
 The operator owns the version here, so `aerolvm upgrade apply` and `aerolvm upgrade rollback` refuse. `status`, `stop`, `resume` and `finalize` work as usual.
 
 **If someone else manages your CRDs**, set `cluster.operator.upgradeCRDs: false`, and apply them yourself before each upgrade:
 
 ```bash title="Your machine"
-helm show crds charts/aerolvm | kubectl apply --server-side --force-conflicts -f -
+helm show crds oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> | kubectl apply --server-side --force-conflicts -f -
 ```
 
 ## Back up and restore the servers
@@ -151,7 +152,7 @@ A worker that is draining or decommissioning shows Progressing: it is leaving on
 The chart can set up Prometheus and Grafana for you, in both modes. It needs the Prometheus Operator, which [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack) installs. It is off by default, because without the Prometheus Operator's CRDs the install would fail.
 
 ```bash title="Your machine"
-helm upgrade aerolvm charts/aerolvm --namespace <namespace> --reuse-values \
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> --namespace <namespace> --reuse-values \
   --set monitoring.enabled=true \
   --set monitoring.labels.release=kube-prometheus-stack
 ```
