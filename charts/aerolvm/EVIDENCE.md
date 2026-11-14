@@ -19,7 +19,7 @@ differ.
 
 | Namespace | Pod Security level | Pods |
 |---|---|---|
-| Your release namespace (for example `aerolvm-system`) | `restricted`, which you set | The operator (2), servers (3 or 5, one per zone), gateways (at least one per zone) |
+| Your release namespace (for example `aerolvm-system`) | `restricted`, which you set | The operator (2), servers (3 or 5, one per zone), gateways (at least one per zone); during a `helm upgrade` only, one CRD upgrade Job |
 | The worker namespace (`aerolvm-workers`, made by the chart) | `privileged`, set by the chart | One worker pod per worker machine |
 
 - **Servers** keep the list of sandboxes and where each runs. They agree using
@@ -27,8 +27,11 @@ differ.
 - **Gateways** take every request (the API, sandbox links, SSH) and pass it to
   the worker that runs the sandbox.
 - **Workers** run the sandboxes. One worker pod fills one machine.
-- **The operator** makes and watches all of the above. It is the only part
-  with rights on the Kubernetes API.
+- **The operator** makes and watches all of the above. It is the only
+  long-running part with rights on the Kubernetes API.
+- **The CRD upgrade Job** runs before each `helm upgrade` and updates
+  AerolVM's two CRDs, which Helm installs only once. It is removed when it
+  is done.
 
 Worker machines should be a node pool of their own, with a taint that only
 worker pods tolerate. Then the privileged pods run on machines that run
@@ -43,6 +46,7 @@ nothing else.
 | Server | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | None: no service account token for the API is mounted. Its `setup` container alone gets a 10-minute token for the operator's audience, which the API refuses (section 3) |
 | Gateway | user 65532, not root | Same as a server. With the edge on, its Caddy container is also user 65532 with no capabilities; ports 80 and 443 open through the namespaced `ip_unprivileged_port_start` sysctl, which `restricted` allows | None |
 | Operator | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | See below |
+| CRD upgrade Job (during a `helm upgrade` only) | user 65532, not root | Same as the operator | Get and update two CustomResourceDefinitions, by name: `aerolclusters.aerolvm.io` and `aerolnodes.aerolvm.io`. Nothing else, and it cannot create one. Its ClusterRole, binding and service account are Helm hooks, deleted when it succeeds (`templates/crd-upgrade.yaml`). Off with `cluster.operator.upgradeCRDs: false` |
 
 The operator's Kubernetes rights, all named in the chart's
 `templates/operator.yaml`:

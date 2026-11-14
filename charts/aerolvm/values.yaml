@@ -368,6 +368,12 @@ cluster:
     issuerRef: {}
   operator:
     replicas: 2
+    # Helm installs the CRDs on the first install only. On: a short Job
+    # before each `helm upgrade` updates AerolVM's two CRDs to this chart's
+    # (its role may update only those two). Off when someone else manages
+    # CRDs (Argo CD applies crds/ itself); then apply charts/aerolvm/crds/
+    # before each upgrade.
+    upgradeCRDs: true
     resources:
       requests: { cpu: 100m, memory: 128Mi }
       limits: { cpu: 500m, memory: 512Mi }
