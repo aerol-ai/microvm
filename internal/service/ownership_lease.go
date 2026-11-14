@@ -496,6 +496,19 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 		return
 	}
 	if err := fr.Freeze(ctx, s.runtimeRef(sb)); err != nil {
+		if errors.Is(err, runtime.ErrCannotFreeze) {
+			// This one cannot be frozen where it runs (a Firecracker VM
+			// with no group of its own): refused, as for a runtime with no
+			// Freezer, not retried every check.
+			s.ownership.mu.Lock()
+			f.cannotFreeze = true
+			s.ownership.mu.Unlock()
+			if s.logger != nil {
+				s.logger.Warn("cluster: this sandbox cannot be paused in place; it is refused but keeps running until ownership is confirmed",
+					"sandbox_id", id, "runtime", sb.Runtime, "error", err)
+			}
+			return
+		}
 		if s.logger != nil {
 			s.logger.Warn("cluster: freeze of a fenced sandbox failed; will retry", "sandbox_id", id, "error", err)
 		}

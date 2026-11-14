@@ -2378,6 +2378,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.requireEgressFloor(chosenRuntime); err != nil {
 		return nil, err
 	}
+	// Fail closed: on a node whose runtime supervisor enforces the
+	// ownership lease, a recreate-policy sandbox must run where that
+	// supervisor can freeze it alone (ownership_lease_runtimes.go). A
+	// field check.
+	if err := s.refuseUnfencedRecreate(req.Failover, chosenRuntime); err != nil {
+		return nil, err
+	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
 		return nil, unsupportedBinaries(chosenRuntime)
 	}

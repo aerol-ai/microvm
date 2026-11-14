@@ -324,6 +324,9 @@ type fakeVMM struct {
 	started  bool
 	waited   bool
 	shutdown bool
+	// graceful is a Shutdown; killed a Kill (both set shutdown).
+	graceful bool
+	killed   bool
 	cleaned  bool
 	stderrTl string
 }
@@ -338,10 +341,10 @@ func (v *fakeVMM) WaitSocket(_ context.Context, _ time.Duration) error {
 	return v.waitErr
 }
 func (v *fakeVMM) Shutdown(_ context.Context, _ time.Duration) error {
-	v.shutdown = true
+	v.shutdown, v.graceful = true, true
 	return v.shutdownErr
 }
-func (v *fakeVMM) Kill() error { v.shutdown = true; return nil }
+func (v *fakeVMM) Kill() error { v.shutdown, v.killed = true, true; return nil }
 func (v *fakeVMM) Cleanup() error {
 	v.cleaned = true
 	return v.cleanupErr

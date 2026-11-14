@@ -54,10 +54,25 @@ func (l Lease) Remaining() time.Duration {
 }
 
 // ValidRef reports whether ref can name a sandbox's group under the
-// sandboxes' cgroup parent: one path element, so a file that names
-// "../supervisor" can never make the reader freeze anything else.
+// sandboxes' cgroup parent: one path element (a container's group), or one
+// element under a host-process runtime's group (a Firecracker VM's,
+// "aerolvm-vmm/<sandbox>"), so a file that names "../supervisor" can never
+// make the reader freeze anything else.
 func ValidRef(ref string) bool {
-	return ref != "" && ref != "." && ref != ".." && !strings.ContainsAny(ref, "/\x00")
+	group, child, nested := strings.Cut(ref, "/")
+	if nested {
+		return HostGroups[group] && validElem(child)
+	}
+	return validElem(ref)
+}
+
+// HostGroups are the groups, directly under the sandboxes' cgroup parent,
+// a host-process runtime keeps each sandbox's own group in. Firecracker
+// starts each VM in aerolvm-vmm/<sandbox> (internal/runtime/firecracker).
+var HostGroups = map[string]bool{"aerolvm-vmm": true}
+
+func validElem(e string) bool {
+	return e != "" && e != "." && e != ".." && !strings.ContainsAny(e, "/\x00")
 }
 
 // Write replaces the file at path with l in one rename, so a reader sees

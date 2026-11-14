@@ -59,7 +59,7 @@ func (s *Service) recordOwnershipRead(ctx context.Context, sent time.Time, rows 
 	owned := make([]string, 0, len(rows))
 	for _, sb := range rows {
 		if p, ok := placements[sb.ID]; ownershipProven(p, ok, self, sb) {
-			owned = append(owned, s.runtimeRef(sb))
+			owned = append(owned, s.fenceRef(sb))
 		}
 	}
 	f := &s.ownershipFile
@@ -115,7 +115,9 @@ func (s *Service) writeOwnershipLeaseFileLocked(ctx context.Context) error {
 	if err == nil {
 		fence := make([]string, 0, len(rows))
 		for _, sb := range rows {
-			fence = append(fence, s.runtimeRef(sb))
+			// The group the supervisor freezes: a container's, or a
+			// Firecracker VM's own (ownership_lease_runtimes.go).
+			fence = append(fence, s.fenceRef(sb))
 		}
 		confirmed := f.confirmed.UnixMilli()
 		err = ownerlease.Write(s.cfg.OwnershipLeaseFile, ownerlease.Lease{

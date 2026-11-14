@@ -1523,12 +1523,26 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 
 	vmDown := true
 	if hasHandle {
-		if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
+		// A VM the ownership lease froze is a copy another node may be
+		// running now (the stale copy a failover leaves): killed where it
+		// stands, never thawed to shut down, and a frozen VMM would not
+		// answer the shutdown request anyway. SIGKILL ends a frozen task.
+		if vmmGroupFrozen(sandboxID) {
+			if err := handle.Kill(); err != nil {
+				d.logger.Warn("firecracker destroy: kill of a frozen VM failed",
+					"sandbox_id", sandboxID, "error", err)
+				rememberErr(err)
+				vmDown = false
+			}
+		} else if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
 			d.logger.Warn("firecracker destroy: shutdown failed",
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
 			vmDown = false
 		}
+	}
+	if vmDown {
+		removeVMMGroup(sandboxID)
 	}
 
 	// Look up the slot AFTER shutdown so the host-side TAP is removed
