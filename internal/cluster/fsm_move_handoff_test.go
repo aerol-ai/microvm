@@ -385,12 +385,60 @@ func TestAgentAbortMoveHandoff(t *testing.T) {
 		t.Fatalf("abort the leader cannot record = %v, want ErrMoveHandoffUnsupported", err)
 	}
 
-	var upgradingSent []command
-	upgrading := newAgent(t, &upgradingSent, http.StatusNoContent, "", fv-1)
-	if err := upgrading.AbortMoveHandoff(ctx, "sb-a", "inc-a"); !errors.Is(err, ErrMoveHandoffUnsupported) || len(upgradingSent) != 0 {
-		t.Fatalf("abort during the upgrade = %v, sent %d", err, len(upgradingSent))
+	// An old worker elsewhere does not matter: only servers apply or
+	// forward the op, and the leader opens handoffs on the servers alone.
+	var oldWorkerSent []command
+	oldWorker := newAgent(t, &oldWorkerSent, http.StatusNoContent, "", fv-1)
+	if err := oldWorker.AbortMoveHandoff(ctx, "sb-a", "inc-a"); err != nil || len(oldWorkerSent) != 1 {
+		t.Fatalf("abort beside an old worker = %v, sent %d; want it sent", err, len(oldWorkerSent))
+	}
+	// An old server does: it could not apply the op, so nothing is sent.
+	var oldServerSent []command
+	oldServer := newAgent(t, &oldServerSent, http.StatusNoContent, "", fv)
+	server, _ := oldServer.gossip.lookupMember("server-1")
+	server.FSMOpsVersion = fv - 1
+	oldServer.gossip.memberIndex.upsert(server)
+	if err := oldServer.AbortMoveHandoff(ctx, "sb-a", "inc-a"); !errors.Is(err, ErrMoveHandoffUnsupported) || len(oldServerSent) != 0 {
+		t.Fatalf("abort beside an old server = %v, sent %d", err, len(oldServerSent))
 	}
 	if (*Agent)(nil).moveHandoffReplicated() {
 		t.Fatal("a nil agent cannot enable handoffs")
+	}
+	if (&gossipNode{}).controlPlaneAtLeast(fv) {
+		t.Fatal("no server known must keep handoffs off")
+	}
+}
+
+// The leader's side of the same gate: an old worker does not stop it
+// opening handoffs (a source beside it still aborts, above), and an old
+// server does, even before Raft has it as a member (a source beside it
+// would not send its abort).
+func TestClusterMoveHandoffGateMatchesTheSources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestClusterWithCfg(t, "ldr-handoff-gate", true, nil, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	const id = "sb-gate"
+	if err := c.RecordPlacement(ctx, id, &models.CreateSandboxRequest{Image: "alpine"}, PlacementSecrets{IncarnationID: "inc-gate"}); err != nil {
+		t.Fatalf("place: %v", err)
+	}
+	p, _ := c.fsm.get(id)
+	self, _ := c.gossip.lookupMember(c.nodeID)
+	fv := moveHandoffFSMOpsVersion
+
+	seedGossipView(t, c, []Member{self, {NodeID: "wkr-old", Alive: true, Role: config.NodeRoleWorker, InternalURL: "http://wkr-old", FSMOpsVersion: fv - 1}})
+	if token, err := c.beginMoveHandoff(ctx, p, c.nodeID); err != nil || token == "" {
+		t.Fatalf("begin beside an old worker = %q, %v; want a handoff", token, err)
+	}
+	seedGossipView(t, c, []Member{self, {NodeID: "srv-old", Alive: true, Role: config.NodeRoleServer, InternalURL: "http://srv-old", FSMOpsVersion: fv - 1}})
+	if token, err := c.beginMoveHandoff(ctx, p, c.nodeID); err != nil || token != "" {
+		t.Fatalf("begin beside an old server = %q, %v; want none, no error", token, err)
+	}
+	if err := c.AbortMoveHandoff(ctx, id, "inc-gate"); !errors.Is(err, ErrMoveHandoffUnsupported) {
+		t.Fatalf("the leader's own abort beside an old server = %v", err)
 	}
 }

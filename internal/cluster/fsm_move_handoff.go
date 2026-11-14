@@ -153,18 +153,43 @@ func (f *placementFSM) restoreMoveHandoffsLocked(in map[string]string) {
 	}
 }
 
+// moveHandoffReplicated is the one gate for both sides of a handoff: the
+// leader opens one (and admits a swap's token or an abort) only while it
+// holds, and a source sends its abort only while it holds. Its server half
+// is the part a source can see: every live control-plane member runs the
+// handoff version, so the server a worker's abort reaches, and the leader
+// it forwards to, record it (controlPlaneAtLeast). The leader adds what
+// only it can read, every Raft server or the active cluster version
+// (raftServersSupport), and decides each abort with that. Workers do not
+// count: they neither apply nor forward the op. Before, a source required
+// every live member, workers included, while the leader required the
+// servers alone, so one old or stale worker made every source skip its
+// abort while the leader kept opening handoffs: the N3 race again.
 func (c *Cluster) moveHandoffReplicated() bool {
 	if c == nil || c.raft == nil || c.raft.raft == nil {
 		return false
 	}
-	return c.raftServersSupport(moveHandoffFSMOpsVersion, "move handoffs") == nil
+	return c.gossip.controlPlaneAtLeast(moveHandoffFSMOpsVersion) &&
+		c.raftServersSupport(moveHandoffFSMOpsVersion, "move handoffs") == nil
 }
 
 func (a *Agent) moveHandoffReplicated() bool {
 	if a == nil {
 		return false
 	}
-	return a.gossip.liveMembersAtLeast(moveHandoffFSMOpsVersion)
+	return a.gossip.controlPlaneAtLeast(moveHandoffFSMOpsVersion)
+}
+
+// controlPlaneAtLeast reports whether every live control-plane member
+// advertises fv >= v; false while it knows of none.
+func (g *gossipNode) controlPlaneAtLeast(v int) bool {
+	servers := g.currentMemberIndex().controlPlaneSnapshot()
+	for _, m := range servers {
+		if m.FSMOpsVersion < v {
+			return false
+		}
+	}
+	return len(servers) > 0
 }
 
 // admitMoveHandoff is the leader's step for the handoff's two writes, from
