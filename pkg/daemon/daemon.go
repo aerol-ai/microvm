@@ -796,6 +796,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	hostPortForwarder := hostPortForwarderFor(cfg, logger)
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
+	wireEgressFloorFile(ctx, cfg, svc, logger)
 	wireCreatePolicy(ctx, cfg, svc, logger)
 	if cfg.EgressBlockPrivateByDefault {
 		svc.EnableBlockPrivateByDefault()

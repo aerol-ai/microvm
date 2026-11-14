@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -66,7 +68,26 @@ type NodeReconciler struct {
 	// namespaces: the API server's Service and addresses in default, and
 	// the ServiceCIDRs (C24). Nil uses the client.
 	Reader client.Reader
+	// MaxConcurrentReconciles is how many AerolNodes are reconciled at once
+	// (DefaultNodeConcurrency when zero). controller-runtime's default is
+	// one: a cell's 2,000 nodes behind one worker, where one server that
+	// stopped answering held them all (review R3). One node is never
+	// reconciled twice at once.
+	MaxConcurrentReconciles int
+	// EvacuateWait is how long a reconcile waits for a decommission pass it
+	// started before it comes back for the result (defaultEvacuateWait
+	// when zero).
+	EvacuateWait time.Duration
+
+	evacOnce sync.Once
+	evacs    *evacuations
 }
+
+// DefaultNodeConcurrency is the node controller's workers. Each pass makes
+// a few quick admin API calls (each bounded by aerolapi.DefaultCallTimeout)
+// and evacuate passes run in the background, so 16 keep a 2,000-node cell's
+// 30-second passes going with servers slow to answer.
+const DefaultNodeConcurrency = 16
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
@@ -133,6 +154,12 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 	pod, err := r.pod(ctx, &n)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if n.Spec.Role == v1.RoleGateway && n.Annotations[v1.AnnotationDecommission] == "true" {
+		return r.retireGateway(ctx, &n, pod, api)
+	}
+	if pod != nil && podEnded(pod) {
+		return r.retireEndedPod(ctx, &n, pod)
 	}
 
 	if n.Spec.Role == v1.RoleServer {
@@ -305,6 +332,12 @@ func (r *NodeReconciler) createPod(ctx context.Context, c *v1.AerolCluster, n *v
 	if err != nil {
 		r.setState(n, v1.StateFailed, err.Error())
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+	if n.Spec.Role == v1.RoleWorker && usesEgressRanges(&pod.Spec) && in.Addresses.FloorErr != nil {
+		// Fail closed (review R4): a worker made now would start without
+		// the API server on its deny floor.
+		r.setState(n, v1.StatePending, "waiting to read the API server's addresses for the deny floor: "+in.Addresses.FloorErr.Error())
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 	if ns == n.Namespace {
 		if err := controllerutil.SetControllerReference(n, pod, r.Scheme); err != nil {
@@ -669,6 +702,80 @@ func (r *NodeReconciler) lost(ctx context.Context, n *v1.AerolNode, api AerolAPI
 	return ctrl.Result{Requeue: true}, nil
 }
 
+// podEnded reports a pod that will never run again: Failed or Succeeded.
+// A pod the kubelet evicted (disk or memory pressure), or stopped in a
+// machine's graceful shutdown, stays in the API this way until the pod
+// garbage collector reaches it, which by default keeps 12,500 of them.
+// Its agent is never ready again, so observe alone would call it Joining
+// forever while it held its slot.
+func podEnded(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+}
+
+// retireEndedPod deletes a pod that ended for good, so the node goes on as
+// if its pod were gone:
+//
+//   - a server keeps its name and its disk, so its next pod (createPod, on
+//     the next pass) is the same Raft member with the same log, as after a
+//     lost pod or a maintenance swap: membership does not change;
+//   - a decommissioning worker's decommission goes on without a pod;
+//   - any other gateway or worker is lost: the dead-owner failover takes
+//     its sandboxes, it leaves the cluster, and the cluster controller makes
+//     a replacement with a new identity (lost).
+func (r *NodeReconciler) retireEndedPod(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod) (ctrl.Result, error) {
+	why := "its pod ended: " + string(pod.Status.Phase)
+	if pod.Status.Reason != "" {
+		why += " (" + pod.Status.Reason + ")"
+	}
+	switch {
+	case n.Spec.Role == v1.RoleServer:
+		r.setState(n, v1.StateRestarting, why+"; making it again with its volume")
+	case n.Annotations[v1.AnnotationDecommission] == "true":
+	case n.Status.State != v1.StateDead && n.Status.State != v1.StateSuspect:
+		// Counted here, not in lost: Suspect keeps lost from counting it
+		// again.
+		if n.Spec.Role == v1.RoleWorker {
+			workerPodsLost.Inc()
+		}
+		r.setState(n, v1.StateSuspect, why)
+	}
+	if err := r.endPod(ctx, n, pod, why); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// retireGateway removes a gateway the cluster no longer keeps (review R7).
+// A gateway holds no sandboxes, so nothing moves: its pod goes first, which
+// takes it out of the gateways' Service and gives its open connections the
+// pod's termination grace to finish; then, once gossip sees it gone, it
+// leaves the cluster and the AerolNode is removed.
+func (r *NodeReconciler) retireGateway(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
+	if pod != nil {
+		r.setState(n, v1.StateDecommissioning, "scale-down: its pod is going")
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	node, err := api.GetNode(ctx, n.Name)
+	switch {
+	case aerolapi.IsStatus(err, http.StatusNotFound):
+	case err != nil:
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	case node.Alive:
+		r.setState(n, v1.StateDecommissioning, "scale-down: waiting for the cluster to see it gone")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if err := api.DeleteNode(ctx, n.Name, false); err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	r.setState(n, v1.StateRemoved, "scale-down")
+	return ctrl.Result{Requeue: true}, nil
+}
+
 // endPod deletes a pod the operator gave up on; the node is then lost.
 func (r *NodeReconciler) endPod(ctx context.Context, n *v1.AerolNode, pod *corev1.Pod, why string) error {
 	if r.Recorder != nil {
@@ -775,8 +882,16 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&v1.AerolNode{}).
 		Watches(&corev1.Pod{}, toNode).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(r.nodeToAerolNodes)).
+		WithOptions(crcontroller.Options{MaxConcurrentReconciles: r.concurrency()}).
 		Named("aerolnode").
 		Complete(r)
+}
+
+func (r *NodeReconciler) concurrency() int {
+	if r.MaxConcurrentReconciles > 0 {
+		return r.MaxConcurrentReconciles
+	}
+	return DefaultNodeConcurrency
 }
 
 // nodeToAerolNodes wakes the AerolNodes whose pods run on a Kubernetes Node

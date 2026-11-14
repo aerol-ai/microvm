@@ -358,6 +358,14 @@ type Config struct {
 	// the API server's addresses go here (SB_EGRESS_DENY_FLOOR_CIDRS,
 	// plans/kubernetes-v2-architecture.md C24). Default empty.
 	EgressDenyFloorCIDRs []netip.Prefix
+	// EgressDenyFloorFile names a file of more deny-floor addresses that
+	// may change while sandboxd runs (SB_EGRESS_DENY_FLOOR_FILE, review R4).
+	// On Kubernetes the operator keeps the API server's current addresses
+	// there, so a worker made before they changed refuses the new ones too.
+	// Read at boot into EgressDenyFloorFileCIDRs, then watched. Default
+	// empty.
+	EgressDenyFloorFile      string
+	EgressDenyFloorFileCIDRs []netip.Prefix
 	// EgressPrivateDefaultCIDRs are ranges treated like RFC 1918: a sandbox
 	// with no egress policy cannot reach them, and a policy opens one only
 	// with an allow entry for it, so a bank can open one range on purpose.

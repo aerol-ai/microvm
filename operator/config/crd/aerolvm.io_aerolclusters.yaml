@@ -153,10 +153,15 @@ spec:
                     - name
                     type: object
                   maxReplicas:
+                    description: |-
+                      MaxReplicas caps the gateways. The operator refuses a cap below
+                      minReplicas or below one per zone. Zero: no cap.
                     format: int32
                     type: integer
                   minReplicas:
-                    description: MinReplicas is at least one per zone.
+                    description: |-
+                      MinReplicas is how many gateways the cluster keeps, at least one per
+                      zone. Lowering it retires the surplus.
                     format: int32
                     minimum: 1
                     type: integer
@@ -540,7 +545,9 @@ spec:
                         deadline:
                           description: |-
                             Deadline is when what could not move is stopped, counted from the
-                            start. Default 45m.
+                            start. Default 45m. On eks-managed pools the deadline and the drain
+                            window are at most 14m: a managed node group gives up evicting after
+                            15 minutes.
                           type: string
                         drainWindow:
                           description: |-

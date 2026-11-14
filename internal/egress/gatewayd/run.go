@@ -70,6 +70,11 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	go w.Run(ctx, operatorPoll)
 	go reloadOnHUP(ctx, w)
+	// The deny-floor file (review R4), which RunCLI read at start: its
+	// addresses can change while the gateway runs.
+	if path := os.Getenv(egresspolicy.FloorFileEnv); path != "" {
+		go egresspolicy.WatchFloorFile(ctx, path, operatorPoll, log, func() { d.RefreshFloor(w.Current()) })
+	}
 	ln, err := socketListener(cfg.SocketPath)
 	if err != nil {
 		return err

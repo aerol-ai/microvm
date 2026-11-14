@@ -349,3 +349,23 @@ func TestPrefixesKey(t *testing.T) {
 		t.Fatalf("%q vs %q", prefixesKey(a), prefixesKey(b))
 	}
 }
+
+// TestRefreshEgressFloor (review R4): when the deny-floor file's addresses
+// change, the host firewall gets them, with the operator file's floor in
+// force kept.
+func TestRefreshEgressFloor(t *testing.T) {
+	prev := egresspolicy.FileFloor()
+	t.Cleanup(func() { egresspolicy.SetFileFloor(prev) })
+	ctx := context.Background()
+	svc, dockerRT, _, _, _ := newFloorService()
+	op := operatorWatcher(t, "version: 1\ndeny_cidrs: [10.20.0.0/16]\n")
+	svc.SetEgressOperator(op)
+	svc.OnEgressOperatorChange(op.Current())
+	moved := netip.MustParsePrefix("172.18.0.44/32")
+	egresspolicy.SetFileFloor([]netip.Prefix{moved})
+	svc.RefreshEgressFloor(ctx)
+	last := dockerRT.floor[len(dockerRT.floor)-1]
+	if !slices.Contains(last, moved) || !slices.Contains(last, netip.MustParsePrefix("10.20.0.0/16")) {
+		t.Fatalf("the host floor after a file change = %v", last)
+	}
+}

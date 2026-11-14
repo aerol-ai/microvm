@@ -41,10 +41,16 @@ func configureHostMediatedNodeGuard(cfg config.Config, logger *slog.Logger) {
 // Like the node ports, it runs before any runtime is wired: a worker's
 // environment is fixed when it spawns. The egress gateway is its own
 // process and reads the same settings from its own environment.
+//
+// The floor file (SB_EGRESS_DENY_FLOOR_FILE) is the exception: its
+// addresses can change while the node runs, so every process watches the
+// file itself (wireEgressFloorFile here); a worker gets its path.
 func configureEgressRanges(cfg config.Config, logger *slog.Logger) {
 	egresspolicy.SetRanges(cfg.EgressDenyFloorCIDRs, cfg.EgressPrivateDefaultCIDRs)
+	egresspolicy.SetFileFloor(cfg.EgressDenyFloorFileCIDRs)
 	for env, val := range map[string]string{
 		egresspolicy.DenyFloorEnv:     egresspolicy.FormatRanges(cfg.EgressDenyFloorCIDRs),
+		egresspolicy.FloorFileEnv:     cfg.EgressDenyFloorFile,
 		egresspolicy.PrivateRangesEnv: egresspolicy.FormatRanges(cfg.EgressPrivateDefaultCIDRs),
 		// As read: a value config took as false ("yes") must not turn
 		// into anything else in a worker.
@@ -53,6 +59,10 @@ func configureEgressRanges(cfg config.Config, logger *slog.Logger) {
 		if err := os.Setenv(env, val); err != nil {
 			logger.Error("egress: WASM workers may not get this setting", "setting", env, "error", err)
 		}
+	}
+	if cfg.EgressDenyFloorFile != "" {
+		logger.Info("egress: sandboxes cannot reach the addresses in the deny-floor file, which is watched for changes",
+			"path", cfg.EgressDenyFloorFile, "deny_floor", egresspolicy.FormatRanges(cfg.EgressDenyFloorFileCIDRs))
 	}
 	if len(cfg.EgressDenyFloorCIDRs) > 0 || len(cfg.EgressPrivateDefaultCIDRs) > 0 {
 		logger.Info("egress: sandboxes cannot reach the extra deny floor, and reach the extra private ranges only through a policy that opens one",

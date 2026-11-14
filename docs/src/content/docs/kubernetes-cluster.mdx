@@ -273,13 +273,13 @@ In the `EC2NodeClass`, keep Karpenter's instance metadata defaults, `httpTokens:
 
 ## A machine goes away
 
-Machines go away on purpose all the time: a new machine image, a Kubernetes upgrade, a smaller pool. The rule is: **the operator moves sandboxes off a machine before the machine goes.** It starts when the machine is cordoned, when Karpenter marks it drifted, when the pool shrinks, or when the machine is older than `maxMachineAge`.
+Machines go away on purpose all the time: a new machine image, a Kubernetes upgrade, a smaller pool. The rule is: **the operator moves sandboxes off a machine before the machine goes.** It starts when the machine is cordoned, when Karpenter marks it drifted, when the pool shrinks, when the machine is older than `maxMachineAge`, or when its pool is removed from `cluster.workerPools`. A removed pool's workers leave one per zone at a time, so their sandboxes move to the pools that remain.
 
 1. **Drain.** The worker takes no new sandboxes. For `drainWindow` (15 minutes by default), sandboxes may finish by themselves.
 2. **Move.** Each sandbox created with `failover.policy: recreate` moves to a worker in another zone: the new worker pulls the image first, then the old copy stops and the new one starts with the same ID and the same link. Your sandbox is down for a stop and a start, a few seconds.
    A Firecracker or gVisor sandbox without that policy moves **with its memory**: it is saved, copied to another worker over the cluster's own encrypted link, and started there from where it was. Its programs keep running and its files stay; open network connections drop. It keeps its ID, its link, its SSH key and its tokens, and takes the new worker's address. A gVisor move gets 60 seconds before the switch, and `worker.gvisor.checkpointMoves: false` turns gVisor moves off. If a move fails, the sandbox starts again where it was (a Firecracker one from the same saved state, a gVisor one from its image), and the next pass tries again. A sandbox with external storage mounted does not move this way.
 3. **Tell.** Every other sandbox's owner finds a notice in the sandbox's audit log, with the time it stops.
-4. **Finish.** At the deadline (45 minutes by default), what could not move stops. The worker leaves the cluster, its pod goes, and the machine goes back.
+4. **Finish.** At the deadline (45 minutes by default), what could not move stops. The worker leaves the cluster, its pod goes, and the machine goes back. On an EKS managed node group (`provisioner: eks-managed`) the whole decommission takes at most 14 minutes, drain window included: the node group gives up after 15.
 
 Each step is saved on the worker's `AerolNode`, so an operator restart picks up where it stopped. `kubectl describe aerolnode <name>` shows the progress as events.
 
@@ -410,7 +410,8 @@ The `cluster` block of the chart's values, with the `worker` block's container s
 | `cluster.servers.count` | 3 or 5. | `3` |
 | `cluster.servers.storage` | Each server's disk: `size` and `storageClassName`. For a busy cell (about 1,000 creates a second), use a fast class: on EKS, gp3 with 16,000 IOPS and 1,000 MB/s. On gp3's default 3,000 IOPS, the servers pause for 1 to 5 seconds every 2 minutes at that rate. | `20Gi` |
 | `cluster.servers.logStorage` | A second disk for each server that holds only its Raft log: `size` and `storageClassName`. Every change waits for a log write on the leader and then on a follower, so a busy cell needs this disk quick to write. On EKS, use io2 (a class with `type: io2` and `iopsPerGB`): with the log on io2 at 6,000 IOPS, a cell committed 99.2% of changes within 25 ms at 1,354 creates a second. gp3 is too slow for this, even on a disk of its own (98.3% at 996). Set it before the servers are made: each server keeps the layout it was made with. | off |
-| `cluster.gateways.minReplicas` | Gateways to keep, at least one per zone. | `3` |
+| `cluster.gateways.minReplicas` | Gateways to keep, at least one per zone. Lower it and the operator retires the extra gateways: each one's pod stops, then it leaves the cluster. | `3` |
+| `cluster.gateways.maxReplicas` | The most gateways there may be. The operator refuses a value below `minReplicas` or below one per zone. It does not add gateways past `minReplicas` by itself. | `30` |
 | `cluster.gateways.service` | The gateways' load balancer: `type` and `annotations`. | `LoadBalancer` |
 | `cluster.gateways.gatewayRef` | Sit behind your own Gateway API Gateway instead, as `name` and `namespace`. | none |
 | `cluster.workerPools` | One entry per kind of worker machine: `machine` size, `minWorkers`, `maxWorkers`, `headroomPercent`, `zoneLossReservePercent`, `runtimes` (the only runtimes its workers run), `nodeSelector`, `tolerations`, `provisioner`, `decommission` (`drainWindow`, `deadline`) and `maxMachineAge`. | none (required) |
