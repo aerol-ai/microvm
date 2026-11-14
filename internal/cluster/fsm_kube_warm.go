@@ -28,9 +28,17 @@ const opSetKubeWarmDepths opCode = 53
 // kubeWarmFSMOpsVersion is the build that applies opSetKubeWarmDepths.
 const kubeWarmFSMOpsVersion = 20
 
-// maxKubeWarmDepths bounds the set: one entry per image and runtime the
+// MaxKubeWarmDepths bounds the set: one entry per image and runtime the
 // cluster's warm pools use.
-const maxKubeWarmDepths = 256
+const MaxKubeWarmDepths = 256
+
+// KubeWarmDefaultRuntime is the runtime of an entry for templates that name
+// none (no runtimeClassName, as agent-sandbox's own examples have). A
+// create that names no runtime gets the worker's default one, so every
+// worker parks such an entry in its default runtime. It is not a runtime
+// name, and the FSM needs no change for it: an entry needs only a
+// non-empty runtime. A worker from before it parks nothing for it.
+const KubeWarmDefaultRuntime = "default"
 
 // ErrKubeWarmDepths is a set the FSM refuses: an entry with no image or
 // runtime, a depth out of range, a duplicate, or too many.
@@ -47,8 +55,8 @@ type KubeWarmDepth struct {
 // NormalizeKubeWarmDepths checks a set and puts it in its one order (image,
 // then runtime), so equal sets compare equal.
 func NormalizeKubeWarmDepths(in []KubeWarmDepth) ([]KubeWarmDepth, error) {
-	if len(in) > maxKubeWarmDepths {
-		return nil, fmt.Errorf("%w: %d entries, at most %d", ErrKubeWarmDepths, len(in), maxKubeWarmDepths)
+	if len(in) > MaxKubeWarmDepths {
+		return nil, fmt.Errorf("%w: %d entries, at most %d", ErrKubeWarmDepths, len(in), MaxKubeWarmDepths)
 	}
 	out := make([]KubeWarmDepth, 0, len(in))
 	seen := make(map[[2]string]bool, len(in))

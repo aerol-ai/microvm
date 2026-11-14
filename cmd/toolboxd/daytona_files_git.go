@@ -159,11 +159,20 @@ func (s *server) handleDaytonaFindInFiles(w http.ResponseWriter, r *http.Request
 		if entry.IsDir() {
 			return nil
 		}
-		file, err := os.Open(path)
+		// Only files are searched: a named pipe would wait for a writer and
+		// a device (/dev/tty, /dev/zero) may never end.
+		file, info, err := openFile(path, os.O_RDONLY, 0)
+		var kindErr *fileKindError
+		if errors.As(err, &kindErr) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		defer file.Close()
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 
 		scanner := bufio.NewScanner(file)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)

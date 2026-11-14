@@ -159,7 +159,7 @@ func writeUpload(target string, src io.Reader, opts uploadOptions) error {
 	if opts.modeSet {
 		perm = 0o600
 	}
-	out, err := os.OpenFile(target, flags, perm)
+	out, _, err := openFile(target, flags, perm)
 	if err != nil {
 		return err
 	}
