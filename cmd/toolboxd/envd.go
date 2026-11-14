@@ -469,7 +469,13 @@ func (s *server) handleEnvdFileRead(w http.ResponseWriter, r *http.Request) {
 		writeEnvdError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	data, err := os.ReadFile(targetPath)
+	f, _, err := openFile(targetPath, os.O_RDONLY, 0)
+	if err != nil {
+		writeEnvdFilesystemError(w, err)
+		return
+	}
+	data, err := io.ReadAll(f)
+	_ = f.Close()
 	if err != nil {
 		writeEnvdFilesystemError(w, err)
 		return
@@ -507,7 +513,7 @@ func (s *server) handleEnvdOctetStreamWrite(w http.ResponseWriter, r *http.Reque
 		writeEnvdFilesystemError(w, err)
 		return
 	}
-	file, err := os.Create(targetPath)
+	file, _, err := openFile(targetPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
 		writeEnvdFilesystemError(w, err)
 		return
@@ -554,7 +560,7 @@ func (s *server) handleEnvdMultipartWrite(w http.ResponseWriter, r *http.Request
 			writeEnvdFilesystemError(w, err)
 			return
 		}
-		output, err := os.Create(resolvedPath)
+		output, _, err := openFile(resolvedPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 		if err != nil {
 			file.Close()
 			writeEnvdFilesystemError(w, err)
