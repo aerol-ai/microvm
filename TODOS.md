@@ -12,6 +12,104 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## An orphaned recreate-policy sandbox answers 410 while it waits for room (API, cluster)
+
+- **What:** a `failover.policy=recreate` sandbox orphaned because no node had
+  room when its owner died is now retried until a node has room (R14,
+  `internal/cluster/orphan_recovery.go`, `retryOrphanedRecoveries`). While it
+  waits, `OwnerOf` still returns `ErrOrphaned`, which the API answers as
+  410 Gone (`internal/cluster/client.go`, `OwnerOf`; `internal/cluster/agent.go`,
+  `OwnerOf`). A client reading 410 as "gone for good" may delete it or make
+  a new one.
+- **Why:** R14 made the wait temporary; the answer still says permanent.
+- **Fix sketch:** for an orphan whose hot row has `FailoverRecreate`, answer
+  503 with Retry-After ("waiting for a node with room") instead of 410, in
+  both lookups and in the error classifier. Keep 410 for every other orphan.
+- **Effort:** human S / CC S. **Priority:** P2.
+
+---
+
+## A reused sandbox ID drops the old lifetime's WASM push rows (cleanup obligations)
+
+- **What:** `finalizeStaleLocalSandbox` (`internal/service/service.go`)
+  bulk-deletes the WASM checkpoint push rows of an old lifetime when the ID
+  is reused. Those rows are the only record of manifests in the registry,
+  the same obligation R8 kept when no pusher is configured.
+- **Why:** seen while fixing R8 (#1273); left alone because the path is
+  cluster-sensitive.
+- **Fix sketch:** keep the rows that name a ref until the orphan-ref sweep
+  deletes their manifests, as `wasm_cleanup.go` now does without a pusher.
+- **Effort:** human S / CC S. **Priority:** P2.
+
+---
+
+## The chart does not set shard-aware ingress for more than 10 gateways (ingress)
+
+- **What:** with `SB_CLUSTER_SHARD_AWARE_INGRESS=false` a daemon refuses or
+  degrades above `MaxReplicatedIngressRouteNodes` (10) ingress nodes. The
+  chart sets ingress proxy routing but not shard-aware ingress, and a plain
+  load balancer in front of more than 10 gateways sends most connections to
+  a gateway without the route (`plans/data-plane-load-balancer.md`).
+- **Why:** from the 2026-11-13 review's scale table (100 ingress). The
+  operator now honours `maxReplicas` (#1272), but nothing renders the
+  shard-aware path.
+- **Fix sketch:** a chart value that turns on shard-aware ingress together
+  with a documented shard-aware load balancer contract, refused when
+  gateways exceed 10 without it.
+- **Effort:** human M / CC S. **Priority:** P2.
+
+---
+
+## Advisory cleanups from the 2026-11-13 Kubernetes review (maintainability)
+
+- **What:** six refactors the review marked advisory. None changes behaviour:
+  1. one artefact GC helper (list, reference check, delete) for templates,
+     WASM modules, built and pending images and isolate bundles
+     (`template.go`, `wasm_module_health.go`, `service.go`,
+     `isolate_bundle_gc.go`);
+  2. isolate bundle GC through `startPeriodic` (cancel race, per-tick
+     timeout) instead of its own ticker;
+  3. one artefact-GC settings profile, with overrides only where a TTL must
+     differ, instead of a set of `SB_*_GC_{ENABLED,INTERVAL,TTL}` per runtime;
+  4. the operator's decommission states as a thin driver of the cluster's
+     cordon and evacuate answers (`operator/internal/controller/decommission.go`);
+  5. one `EvacuateRequest`/`EvacuateResult` wire type shared by
+     `operator/internal/aerolapi` and `internal/cluster/decommission.go`;
+  6. drop the one-method `NodeEvacuator` interface if only `*Cluster`
+     implements it.
+- **Why:** the review asks for shared machinery, not merged tables: the
+  separate tables (`firecracker_tap_pool`, `firecracker_vmm_pool`,
+  `container_netns_slots`, `firecracker_templates`, `wasm_modules`,
+  `wasm_state_kv`, `wasm_checkpoint_pushes`) are justified and stay.
+- **Effort:** human M / CC M. **Priority:** P3.
+
+---
+
+## Security addenda from the 2026-11-13 Kubernetes review (Kubernetes, security)
+
+- **What:**
+  - the chart lets `containerdVolume` be a hostPath (`charts/aerolvm/values.yaml`),
+    against the plan's "no hostPath";
+  - signed-image enforcement is an example Kyverno policy, not a chart
+    default;
+  - the pod and Service ranges go to workers as a private default that an
+    egress profile may open (`operator/internal/controller/egress.go`,
+    `setEgressRanges`). The API server's own addresses are in the deny floor,
+    which nothing opens, and since R4 (#1272) a failed discovery no longer
+    leaves that floor empty; what is left is to check that the API server
+    answers on no address found only in the private default;
+  - the worker-pod guard allows a delete when it cannot read the pod's
+    AerolNode (`operator/internal/webhook/podguard.go`). This is intended with
+    `failurePolicy: Ignore`, but it widens what a guard outage allows.
+- **Why:** listed by the review as gaps against plan promises, not new P0s.
+- **Fix sketch:** refuse a hostPath `containerdVolume` unless a bank preset
+  opts out; ship the image policy as an opt-in chart value; a test that every
+  API server address the operator finds lands in the deny floor; record each fail-open in the
+  "lost without decommission" alert's labels.
+- **Effort:** human M / CC S. **Priority:** P2.
+
+---
+
 ## A worker's lease renewed without a read covers a sandbox started later (cluster)
 
 - **What:** a worker with no running `failover.policy=recreate` sandbox keeps
