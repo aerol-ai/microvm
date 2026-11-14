@@ -307,8 +307,24 @@ type AerolClusterStatus struct {
 	// Rollout is AerolVM's own upgrade record, when one exists.
 	// +optional
 	Rollout *RolloutStatus `json:"rollout,omitempty"`
+	// PoolDecommission is each worker pool's decommission settings as the
+	// operator last saw them in the spec. A pool removed from the spec still
+	// has workers to decommission, and they keep its settings, the
+	// eks-managed cap included. A removed pool's entry goes once no worker
+	// of it is left.
+	// +optional
+	PoolDecommission []PoolDecommission `json:"poolDecommission,omitempty"`
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// PoolDecommission is one worker pool's decommission settings.
+type PoolDecommission struct {
+	Name string `json:"name"`
+	// +optional
+	Provisioner string `json:"provisioner,omitempty"`
+	// +optional
+	Decommission DecommissionSpec `json:"decommission,omitempty"`
 }
 
 // TierStatus counts one tier's nodes.

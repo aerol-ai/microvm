@@ -500,6 +500,36 @@ func (r *ClusterReconciler) createNode(ctx context.Context, c *v1.AerolCluster, 
 	return nil
 }
 
+// keepPoolDecommission records each worker pool's decommission settings in
+// the status. A pool removed from the spec still has workers to
+// decommission (retireRemovedPools), and the spec no longer says how: they
+// took the defaults, a 15-minute drain window and a 45-minute deadline,
+// even on an eks-managed pool, whose node group gives up evicting after 15
+// minutes. So a removed pool's settings stay here until no worker of it is
+// left. It rides the status write every pass makes already.
+func keepPoolDecommission(c *v1.AerolCluster, nodes []v1.AerolNode) {
+	left := map[string]bool{}
+	for _, n := range nodes {
+		if n.Spec.Role == v1.RoleWorker {
+			left[n.Spec.Pool] = true
+		}
+	}
+	out := make([]v1.PoolDecommission, 0, len(c.Spec.WorkerPools))
+	for _, p := range c.Spec.WorkerPools {
+		out = append(out, v1.PoolDecommission{Name: p.Name, Provisioner: p.Provisioner, Decommission: *p.Decommission.DeepCopy()})
+	}
+	for _, k := range c.Status.PoolDecommission {
+		if poolOf(c, k.Name) == nil && left[k.Name] {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if len(out) == 0 {
+		out = nil
+	}
+	c.Status.PoolDecommission = out
+}
+
 // wantedGateways is how many gateways the cluster keeps: minReplicas, and
 // at least one per zone. maxReplicas caps it (refuseSpec refuses a cap
 // below it); nothing scales gateways past it.
@@ -616,6 +646,7 @@ func (r *ClusterReconciler) event(obj runtime.Object, typ, reason, msg string) {
 // updateStatus counts each tier and reports the version every node runs.
 func (r *ClusterReconciler) updateStatus(_ context.Context, c *v1.AerolCluster, nodes []v1.AerolNode) {
 	c.Status.ObservedGeneration = c.Generation
+	keepPoolDecommission(c, nodes)
 	var servers, gateways, workers v1.TierStatus
 	versions := map[string]int{}
 	for _, n := range nodes {

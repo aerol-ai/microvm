@@ -122,6 +122,21 @@ const eksManagedDecomCap = 14 * time.Minute
 
 func eksManaged(p *v1.WorkerPoolSpec) bool { return p != nil && p.Provisioner == "eks-managed" }
 
+// decommissionPool is the pool whose settings time a worker's decommission:
+// the spec's, or, for a pool the spec no longer has, the settings the
+// status kept for it (keepPoolDecommission). Nil: neither, so the defaults.
+func decommissionPool(c *v1.AerolCluster, name string) *v1.WorkerPoolSpec {
+	if p := poolOf(c, name); p != nil {
+		return p
+	}
+	for _, k := range c.Status.PoolDecommission {
+		if k.Name == name {
+			return &v1.WorkerPoolSpec{Name: k.Name, Provisioner: k.Provisioner, Decommission: k.Decommission}
+		}
+	}
+	return nil
+}
+
 func drainWindow(p *v1.WorkerPoolSpec) time.Duration {
 	d := defaultDrainWindow
 	switch {
@@ -152,7 +167,7 @@ func decomDeadline(p *v1.WorkerPoolSpec) time.Duration {
 // decommission carries one worker's decommission one step further.
 func (r *NodeReconciler) decommission(ctx context.Context, c *v1.AerolCluster, n *v1.AerolNode, pod *corev1.Pod, api AerolAPI) (ctrl.Result, error) {
 	now := r.now()
-	pool := poolOf(c, n.Spec.Pool)
+	pool := decommissionPool(c, n.Spec.Pool)
 	d := n.Status.Decommission
 	if d == nil {
 		d = &v1.DecommissionStatus{
