@@ -2,6 +2,39 @@
 
 **Status:** Decisions closed 2026-11-05 (section 11) · **Date:** 2026-11-05 · **Branch:** `plans/agent-sandbox-feature-parity` (from `main` at `e33b6e16`)
 
+> **Status, 2026-11-14** (checked against agent-sandbox v1.0.11 and its
+> `main` at `454d3353`, and AerolVM `main`; every row by reading the code):
+>
+> - Of the 78 features this plan compares, 51 are on `main`, 5 in part and
+>   22 missing. All 52 decided "build" are on `main`; trace context (A3) is
+>   in part. All 9 a bank needs are on `main`.
+> - Section 6 is out of date: the Kubernetes effort shipped a Helm chart, an
+>   operator and an agent-sandbox API (`docs/src/content/docs/kubernetes/`).
+>   Of the 16 items there, 9 are on `main` or have an equivalent, 4 are in
+>   part (RuntimeClass picks gvisor, firecracker or docker only; claims and
+>   conditions but no Kubernetes Events; snapshots keep memory on
+>   Firecracker only; one API version, no conversion) and 3 are missing
+>   (any pod setting, refused on purpose; Kueue and API Priority and
+>   Fairness; KEDA or HPA scaling of warm pools).
+> - T1 and T2 (templates and their env and volume rules) exist on the
+>   Kubernetes API, not in `/v1` or the SDKs. W4 (env without a cold start)
+>   holds on containerd only. L8 (a stop that keeps memory) holds on
+>   Firecracker, and on gVisor only when a sandbox moves. Kata (R1) is also
+>   refused on Kubernetes.
+> - Section 7: in-sandbox auth now works through agent-sandbox's router
+>   (#2164). The token swap is at `toolbox_proxy.go:115-131`. L4's
+>   server-wide default timer is off by default.
+> - Section 8: snapshots are not on V8 isolates; the chart ships 105 alerts
+>   and 14 dashboards (not 72 and 12); containerd is an engine, not a
+>   runtime.
+> - agent-sandbox was ahead in one place: it refuses named pipes in file
+>   transfers (#2222). Fixed on our side in #1281.
+> - The features this plan calls "main-only" are all released now (v1.0.10).
+> - Section 5.11 (G9): the folders are `opencode-sandbox` and
+>   `aider-sandbox`. Appendix B: #1889 is closed. Section 12: the
+>   comparison page `aerolvm-vs-daytona-vs-e2b.mdx` has no agent-sandbox
+>   column yet.
+
 **In one line:** build the useful features of
 [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
 that do not need Kubernetes, fix three bugs we found on our side while
