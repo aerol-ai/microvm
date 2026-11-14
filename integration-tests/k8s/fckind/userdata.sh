@@ -371,7 +371,7 @@ YAML
   done
   say "warm: $parked slots parked on the $nw workers after $((i * 10))s (want $((2 * nw)): two pools, one slot each per worker)"
   for g in $($kc get pods -l app.kubernetes.io/component=gateway -o name | head -1); do
-    $kc logs $g -c agent 2>&1 | grep -iE 'agent-sandbox warm pools' | tail -3 | cut -c1-300 | sed "s|^|FCK   ${g#pod/}: |"
+    $kc logs $g -c agent 2>&1 | grep -iE 'agent-sandbox warm pools' | tail -3 | cut -c1-300 | sed "s|^|FCK   warm sync on ${g#pod/}: |"
   done
   local before after t0
   before=$(pool_metric aerolvm_containerd_pool_hits_total)
