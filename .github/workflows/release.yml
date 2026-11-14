@@ -539,6 +539,17 @@ jobs:
           [[ "$digest" == sha256:* ]] || { echo "::error::helm push printed no digest"; exit 1; }
           echo "CHART_DIGEST=$digest" >> "$GITHUB_ENV"
 
+      # helm registry login above writes Helm's own credentials file, which
+      # cosign and the attest step's registry push never read: they read
+      # Docker's. v0.7.4's chart was pushed but its signature upload failed
+      # with "UNAUTHORIZED: unauthenticated". The images job logs in this way.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 

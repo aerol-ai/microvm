@@ -46,11 +46,25 @@ func TestReleaseWorkflowPublishesHelmChart(t *testing.T) {
 
 	var runs strings.Builder
 	attested := false
-	for _, s := range job.Steps {
+	// cosign and the attest step push to ghcr.io with Docker's credentials,
+	// never Helm's: v0.7.4's chart job logged in only with helm registry
+	// login, so its signature upload was refused. A Docker login to ghcr.io
+	// must come before the first step that signs or attests.
+	dockerLogin, firstSigner := -1, -1
+	for i, s := range job.Steps {
 		runs.WriteString(s.Run + "\n")
 		if strings.HasPrefix(s.Uses, "actions/attest-build-provenance@") && s.With["subject-name"] == "ghcr.io/aerol-ai/charts/aerolvm" {
 			attested = true
 		}
+		if strings.HasPrefix(s.Uses, "docker/login-action@") && s.With["registry"] == "ghcr.io" && dockerLogin < 0 {
+			dockerLogin = i
+		}
+		if (strings.Contains(s.Run, "cosign sign") || strings.HasPrefix(s.Uses, "actions/attest-build-provenance@")) && firstSigner < 0 {
+			firstSigner = i
+		}
+	}
+	if dockerLogin < 0 || (firstSigner >= 0 && dockerLogin > firstSigner) {
+		t.Error("the chart job must log in to ghcr.io with docker/login-action before it signs or attests: cosign does not read helm registry login's credentials")
 	}
 	for _, want := range []string{
 		`helm package charts/aerolvm --version "$chart_version" --app-version "$VERSION"`,
