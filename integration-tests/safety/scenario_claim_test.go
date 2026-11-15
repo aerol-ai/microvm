@@ -23,7 +23,7 @@ func claimFuncs(t *testing.T) string {
 	}
 	var fns strings.Builder
 	for _, name := range []string{
-		"worktree_roots", "lease_lock_path", "lease_lock_acquire", "lease_lock_release",
+		"in_git_checkout", "worktree_roots", "lease_lock_path", "lease_lock_stale", "lease_lock_acquire", "lease_lock_release",
 		"scenario_holders", "refuse_if_scenario_held", "claim_scenario", "release_scenario_claim",
 	} {
 		fns.WriteString(extractShellFunc(t, string(src), name))

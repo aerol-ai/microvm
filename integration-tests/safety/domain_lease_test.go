@@ -166,8 +166,8 @@ func leaseFuncs(t *testing.T) string {
 	}
 	var fns strings.Builder
 	for _, name := range []string{
-		"worktree_roots", "domain_pins", "domains_in_use",
-		"lease_lock_path", "lease_lock_acquire", "lease_lock_release",
+		"in_git_checkout", "worktree_roots", "domain_pins", "domains_in_use",
+		"lease_lock_path", "lease_lock_stale", "lease_lock_acquire", "lease_lock_release",
 		"lease_domain", "scenario_overlay_domain", "lease_domain_for_scenario",
 	} {
 		fns.WriteString(extractShellFunc(t, string(src), name))
