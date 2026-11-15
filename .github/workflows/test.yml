@@ -480,6 +480,44 @@ jobs:
           AEROL_WASM_IT_TOKEN: ${{ secrets.AEROL_WASM_IT_TOKEN }}
         run: go test -count=1 -tags integration -run TestIntegrationModulePushPullRoundTrip ./pkg/wasmmod/...
 
+  wasmtime-engine:
+    # The optional wasmtime WASM engine (-tags wasmtime). No other job builds
+    # the tag, so it broke without anyone seeing: Go 1.26 refuses to link
+    # upstream wasmtime-go's libraries, which carry LLVM bitcode (#1307).
+    # AerolVM now uses github.com/aerol-ai/wasmtime-go, the same release with
+    # the bitcode stripped. This builds sandboxd with the tag and runs the
+    # packages that test the real engine, on both Linux architectures the
+    # libraries ship for. Advisory, like the other suites.
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
+    name: wasmtime-engine (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build sandboxd with the wasmtime engine
+        env:
+          CGO_ENABLED: "1"
+        run: go build -tags wasmtime -o /tmp/sandboxd ./cmd/sandboxd
+
+      - name: Test the wasmtime engine
+        env:
+          CGO_ENABLED: "1"
+        run: go test -count=1 -tags wasmtime ./pkg/wasm/ ./pkg/wasm/worker/
+
   key-custody-integration:
     # Real key stores for customer key custody (plans/customer-key-custody.md
     # Phase 6): the provider contract and the live Vault checks (canary, AAD,
