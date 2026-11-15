@@ -4,10 +4,10 @@ package suite
 
 // Live checks for streamed commands, code-run, sessions, the code
 // interpreter and several exposed ports on WASM sandboxes
-// (plans/code-interpreter.md section 5). UC-724 and UC-725 cover what this
-// stack ships first (W1..W3, #535). UC-726..728 cover W4..W6, which land
-// later in the stack: against a deployment without them they fail, and the
-// failure names the missing step rather than leaving a bare 501.
+// (plans/code-interpreter.md section 5): UC-724 and UC-725 cover W1..W3
+// (#535), UC-726..728 cover W4..W6 (#178, #177). Against a server without a
+// step they fail, and the failure names the missing step rather than leaving
+// a bare 501.
 
 import (
 	"bytes"
@@ -208,9 +208,11 @@ func TestWasmInterpDaytonaCodeRun(t *testing.T) {
 	}
 }
 
-// laterStepHint names the plan step a WASM failure is waiting for.
-func laterStepHint(step string) string {
-	return "this lands later in the stack (" + step + ", plans/code-interpreter.md section 5); a deployment without it answers 501 or an unsupported feature"
+// missingStepHint names the plan step a server must have for a WASM case:
+// against an older server these cases fail with 501 or an unsupported
+// feature, and the hint says which step it lacks.
+func missingStepHint(step string) string {
+	return "the server needs " + step + " (plans/code-interpreter.md section 5); a server without it answers 501 or an unsupported feature"
 }
 
 // UC-726 — Daytona sessions on WASM (W4).
@@ -219,7 +221,7 @@ func TestWasmInterpDaytonaSessions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	dsb := daytonaWasmSandbox(t, ctx)
-	hint := laterStepHint("W4, Daytona sessions on WASM, #178")
+	hint := missingStepHint("W4, Daytona sessions on WASM, #178")
 
 	const session = "uc726"
 	if err := dsb.Process.CreateSession(ctx, session); err != nil {
@@ -285,7 +287,7 @@ func TestWasmInterpRunCode(t *testing.T) {
 	sb := wasmPythonSandbox(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	hint := laterStepHint("W5, the code interpreter on WASM")
+	hint := missingStepHint("W5, the code interpreter on WASM")
 
 	run := func(code string, opts sdktypes.RunCodeOptions) *sdktypes.Execution {
 		t.Helper()
@@ -455,6 +457,6 @@ func TestWasmInterpTwoPorts(t *testing.T) {
 	}
 	if bodies[8080] != "port=8080" || bodies[9090] != "port=9090" {
 		t.Fatalf("bodies %v, want port=8080 and port=9090 from one guest\n%s", bodies,
-			laterStepHint("W6, several exposed ports on one WASM guest, #177; a guest that answers port=unknown ran on an engine without AEROL_WASM_LISTEN_FDS"))
+			missingStepHint("W6, several exposed ports on one WASM guest, #177; a guest that answers port=unknown ran on an engine without AEROL_WASM_LISTEN_FDS"))
 	}
 }
