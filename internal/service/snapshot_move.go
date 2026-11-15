@@ -399,13 +399,13 @@ func (s *Service) ImportMove(ctx context.Context, id, source string, rc *cluster
 			return fmt.Errorf("import %s: this node already has it", id)
 		}
 		// What an earlier import left: start again.
-		if derr := s.DropMove(ctx, id); derr != nil {
+		if derr := s.DropMove(ctx, id, ""); derr != nil {
 			return derr
 		}
 	}
 	if _, gerr := s.store.GetMovedInRow(ctx, id); gerr == nil {
 		// An earlier import of this move, never started: start again.
-		if derr := s.DropMove(ctx, id); derr != nil {
+		if derr := s.DropMove(ctx, id, ""); derr != nil {
 			return derr
 		}
 	}
@@ -491,33 +491,93 @@ func stoppedMovedRow(row moveRow, reason string) models.Sandbox {
 	return sb
 }
 
-// DropMove undoes ImportMove: the move did not happen. A sandbox the
-// placement already names this node's is kept.
-func (s *Service) DropMove(ctx context.Context, id string) error {
+// DropMove undoes ImportMove: the move did not happen. lifetime is the
+// incarnation the leader moved (MoveAction.Incarnations), "" from a leader
+// from before it or from this node's own move-in check of an older import.
+//
+// A drop can arrive late: the leader's best-effort drop after a swap it
+// thought failed, or after this id was deleted and placed here again (a
+// keyed create gets its id back). So it never trusts the cached placement
+// (V2): under the lifecycle lock it reads the leader's placement, and
+//   - refuses while that placement names this node with the import's
+//     lifetime: the swap happened, and the import is the sandbox now;
+//   - otherwise drops only an import still waiting for its start (a stored
+//     gVisor row, or a Firecracker row stopped as moved in) of the named
+//     lifetime. A started row, or one of another lifetime, is never touched.
+func (s *Service) DropMove(ctx context.Context, id, lifetime string) error {
 	id = strings.TrimSpace(id)
-	if c := s.Cluster(); c != nil {
-		if p, ok := c.PlacementOf(id); ok && strings.TrimSpace(p.OwnerNodeID) == c.SelfNodeID() {
-			return fmt.Errorf("drop %s: it moved here", id)
-		}
+	c := s.Cluster()
+	if c == nil {
+		return errors.New("snapshot moves need cluster mode")
 	}
-	return s.dropImport(ctx, id, "")
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	local, here, err := s.localMoveLifetime(ctx, id)
+	if err != nil || !here {
+		return err
+	}
+	got, err := c.AuthoritativePlacementsByIDs(ctx, []string{id})
+	if err != nil {
+		return fmt.Errorf("drop %s: read its placement: %w", id, err)
+	}
+	if p, ok := got[id]; ok && !p.IsDeleting() && strings.TrimSpace(p.OwnerNodeID) == c.SelfNodeID() && sameIncarnation(local, p.IncarnationID) {
+		return fmt.Errorf("drop %s: it moved here", id)
+	}
+	if lifetime = strings.TrimSpace(lifetime); lifetime != "" && !sameIncarnation(lifetime, local) {
+		// The import that drop names is not here any more.
+		return nil
+	}
+	return s.dropImportLocked(ctx, id, local)
 }
 
-// dropImport drops id's import. With lifetime set, it is an import of that
-// lifetime beside a placement of another (checkMovedInOnce): a Firecracker
-// row goes only while it is still that import, stopped as moved in, so a
-// row of the current lifetime is never touched.
+// localMoveLifetime is the lifetime of what this node holds for id: its
+// stored gVisor import, else its sandbox row (any status). here is false
+// when it holds neither. A stored row that does not open has no known
+// lifetime ("").
+func (s *Service) localMoveLifetime(ctx context.Context, id string) (lifetime string, here bool, err error) {
+	rec, _, stored, err := s.loadMovedIn(ctx, id)
+	if stored {
+		return rec.Row.AuditIncarnationID, true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	sb, err := s.store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return sb.AuditIncarnationID, true, nil
+}
+
+// dropImport drops id's import of lifetime under id's lifecycle lock
+// (dropImportLocked).
 func (s *Service) dropImport(ctx context.Context, id, lifetime string) error {
 	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	return s.dropImportLocked(ctx, id, lifetime)
+}
+
+// dropImportLocked drops id's import; the caller holds id's lifecycle
+// lock. A Firecracker row goes only while it is still an import waiting
+// for its start (stopped, or in error, as moved in) and, with lifetime
+// set, of that lifetime: a started row or one of another lifetime is never
+// touched. The runtime's copy goes first in both cases, and the record
+// that keeps the import pending (the stored row, or the sandbox row) only
+// once that worked, so a drop that failed stays pending and its move-in
+// check drops it again (V5).
+func (s *Service) dropImportLocked(ctx context.Context, id, lifetime string) error {
 	s.movesIn.clear(id)
 	rec, _, stored, err := s.loadMovedIn(ctx, id)
 	if stored {
-		// The staged checkpoint goes first: a record left behind by a drop
-		// that failed is dropped again next time.
 		if err != nil {
 			// A record that does not open names no runtime.
 			s.dropImportEverywhere(id)
@@ -539,28 +599,48 @@ func (s *Service) dropImport(ctx context.Context, id, lifetime string) error {
 	if err != nil {
 		return err
 	}
-	if lifetime != "" && (sb.AuditIncarnationID != lifetime || !awaitingMovedStart(sb)) {
+	if !awaitingMovedStart(sb) || (lifetime != "" && sb.AuditIncarnationID != lifetime) {
 		return nil
 	}
 	mover, err := s.snapshotMoverFor(sb)
 	if err != nil {
 		return err
 	}
+	if err := mover.DropImportedSnapshot(ctx, id); err != nil {
+		return err
+	}
 	if err := s.store.Delete(ctx, id); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
-	return mover.DropImportedSnapshot(ctx, id)
+	return nil
 }
 
-// StartMoved starts id, which moved here, from its memory. rc is the
-// leader's recreate inputs for a gVisor rebuild; nil uses the ones stored
-// at the import. Retryable: a gVisor sandbox's stored row goes only once it
-// started, and a Firecracker sandbox's row stays stopped here on a failure.
-func (s *Service) StartMoved(ctx context.Context, id string, rc *cluster.MoveRecreate) error {
+// StartMoved starts id, which moved here, from its memory. lifetime is the
+// incarnation the leader moved (MoveAction.Incarnations), or the import's
+// own for this node's move-in check; "" from a leader from before it. rc
+// is the leader's recreate inputs for a gVisor rebuild; nil uses the ones
+// stored at the import. Retryable: a gVisor sandbox's stored row goes only
+// once it started, and a Firecracker sandbox's row stays stopped here on a
+// failure.
+//
+// A start can arrive late, from an old move, after the id was deleted and
+// placed here again for a new lifetime (V1). So under the lifecycle lock it
+// checks the import against the leader's placement (movedStartAllowed):
+// the import's lifetime must be the placement's, and the one the leader
+// named. A leader that names none is checked the same way, minus that last
+// comparison: the leader's current placement is the authority either way.
+func (s *Service) StartMoved(ctx context.Context, id, lifetime string, rc *cluster.MoveRecreate) error {
 	id = strings.TrimSpace(id)
-	if _, err := s.ownedIncarnation(ctx, id); err != nil {
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	if err != nil {
 		return err
 	}
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 	s.movesIn.clear(id)
 	rec, _, stored, err := s.loadMovedIn(ctx, id)
 	if err != nil {
@@ -570,6 +650,18 @@ func (s *Service) StartMoved(ctx context.Context, id string, rc *cluster.MoveRec
 		if rc == nil {
 			rc = rec.Recreate
 		}
+		local := rec.Row.AuditIncarnationID
+		if rc != nil && !sameIncarnation(local, rc.Secrets.IncarnationID) {
+			return fmt.Errorf("start %s: %w: the import is %s, the recreate inputs %s", id, errMoveOtherLifetime, local, rc.Secrets.IncarnationID)
+		}
+		if err := s.movedStartAllowed(ctx, id, lifetime, local); err != nil {
+			return err
+		}
+		// The rebuild takes the create lease and its own lifecycle locks,
+		// and checks the placement again under that lease, against rc's
+		// lifetime, which is the import's (above).
+		locked = false
+		unlock()
 		if err := s.startCheckpointMoved(ctx, id, rec.Row, rc); err != nil {
 			return err
 		}
@@ -579,13 +671,47 @@ func (s *Service) StartMoved(ctx context.Context, id string, rc *cluster.MoveRec
 		_ = s.store.DeleteMovedInRow(ctx, id)
 		return nil
 	}
-	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	sb, err := s.store.Get(ctx, id)
 	if err != nil {
+		return fmt.Errorf("start %s: %w", id, err)
+	}
+	if err := s.movedStartAllowed(ctx, id, lifetime, sb.AuditIncarnationID); err != nil {
 		return err
 	}
-	defer unlock()
 	_, err = s.startSandboxLocked(ctx, id, startForRestart)
 	return err
+}
+
+// errMoveOtherLifetime: a moved sandbox's start names, or finds, another
+// lifetime than the import here.
+var errMoveOtherLifetime = errors.New("another lifetime of this sandbox")
+
+// movedStartAllowed reports why id's import, of local lifetime, must not
+// start now, or nil: this node must own id's placement in the leader's
+// view, not reserved or being deleted, with the import's lifetime, and the
+// lifetime the leader named, if it named one. The caller holds id's
+// lifecycle lock.
+func (s *Service) movedStartAllowed(ctx context.Context, id, expected, local string) error {
+	c := s.Cluster()
+	if c == nil {
+		return errors.New("snapshot moves need cluster mode")
+	}
+	got, err := c.AuthoritativePlacementsByIDs(ctx, []string{id})
+	if err != nil {
+		return fmt.Errorf("%s: read its placement: %w", id, err)
+	}
+	p, ok := got[id]
+	switch {
+	case !ok || strings.TrimSpace(p.OwnerNodeID) != c.SelfNodeID():
+		return fmt.Errorf("%s: this node does not own it", id)
+	case p.IsDeleting() || p.IsReserved():
+		return fmt.Errorf("%s: its placement is %s", id, p.State)
+	case !sameIncarnation(local, p.IncarnationID):
+		return fmt.Errorf("start %s: %w: the import is %s, the placement %s", id, errMoveOtherLifetime, local, p.IncarnationID)
+	case strings.TrimSpace(expected) != "" && (!sameIncarnation(expected, local) || !sameIncarnation(expected, p.IncarnationID)):
+		return fmt.Errorf("start %s: %w: the leader moved %s, the import is %s", id, errMoveOtherLifetime, expected, local)
+	}
+	return nil
 }
 
 // resumeMovedIn finishes, at an agent's start, the moves it took in before
@@ -778,7 +904,7 @@ func (s *Service) checkMovedInOnce(ctx context.Context, ck moveInCheck) error {
 		// Another lifetime with this id: never start this import as it.
 		err = s.dropImport(ctx, id, st.lifetime)
 	case ok && strings.TrimSpace(p.OwnerNodeID) == c.SelfNodeID():
-		if err := s.StartMoved(ctx, id, nil); err != nil {
+		if err := s.StartMoved(ctx, id, st.lifetime, nil); err != nil {
 			if errors.Is(err, errMoveNoSpec) || !time.Now().Before(st.until) {
 				return s.giveUpMovedIn(ctx, id, err)
 			}
@@ -794,7 +920,7 @@ func (s *Service) checkMovedInOnce(ctx context.Context, ck moveInCheck) error {
 		// The move never happened: its time is up and the placement still
 		// names another node. The source starts its own copy (its fence
 		// lapsed long ago); this one goes.
-		err = s.DropMove(ctx, id)
+		err = s.DropMove(ctx, id, st.lifetime)
 	}
 	if err != nil && time.Now().After(st.until.Add(s.moveTimings.inFence())) {
 		if s.logger != nil {
