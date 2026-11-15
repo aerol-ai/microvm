@@ -6,11 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // V3 (review 2026-11-15): an idle worker has no IDs to read, but that must
@@ -97,9 +100,10 @@ func TestIdleConfirmDoesNotRenewTheLease(t *testing.T) {
 // The create's read (requireFreshOwnership). A node with a recent read pays
 // a clock read. A node with no recent read (idle, failing reads, or not one
 // read since it started) reads first, with the new sandbox in the read:
-// with the leader up the create goes on and its lease is fresh, so the next
-// check does not fence it; with the leader down it is refused before its row
-// is written. A sandbox without the recreate policy never reads.
+// with the leader up, and its reservation naming this node, the create goes
+// on and its lease is fresh, so the next check does not fence it; with the
+// leader down it is refused before its row is written. A sandbox without the
+// recreate policy never reads.
 func TestRecreateCreateReadsAfterAnIdleSpell(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -135,7 +139,7 @@ func TestRecreateCreateReadsAfterAnIdleSpell(t *testing.T) {
 			if tc.down {
 				lc.down()
 			} else {
-				lc.up()
+				lc.up(reservedFor("new", "worker-a", "inc-new"))
 			}
 			reads, sizes := lc.readCount(), len(lc.batchSizes)
 			err := svc.persistSandboxCreate(ctx, leaseCreateRow("new", tc.recreate))
@@ -170,10 +174,131 @@ func TestRequireFreshOwnershipSingleNode(t *testing.T) {
 	svc, _, lc := newLeaseService(t, newFreezeRuntime())
 	svc.cfg.EnableCluster = false
 	lc.down()
-	if err := svc.requireFreshOwnership(context.Background(), "sb"); err != nil {
+	if err := svc.requireFreshOwnership(context.Background(), "sb", ""); err != nil {
 		t.Fatalf("single node: %v", err)
 	}
 	if lc.readCount() != 0 {
 		t.Fatalf("single node sent %d reads", lc.readCount())
+	}
+}
+
+// reservedFor is a new create's placement: reserved for owner, lifetime inc.
+func reservedFor(id, owner, inc string) cluster.Placement {
+	return cluster.Placement{SandboxID: id, OwnerNodeID: owner, OwnerAPIURL: "http://" + owner, IncarnationID: inc, State: cluster.PlacementStateReserved}
+}
+
+// The read must give the sandbox to this node, not only be answered (b3's
+// follow-up to V3). An idle node is cut off, the leader hands the sandbox to
+// another node, the node comes back: its read succeeds, but the answer names
+// worker-b, so the create is refused before its row is written. Before this
+// check that create was accepted, and not fenced either. A placement being
+// deleted, orphaned, missing, or of another lifetime refuses too; a
+// reservation or a placement for this node, of this lifetime (or with no
+// lifetime on either side), lets it go on.
+func TestRecreateCreateNeedsTheLeaderToNameThisNode(t *testing.T) {
+	placed := func(id, owner, inc string) cluster.Placement {
+		p := reservedFor(id, owner, inc)
+		p.State = cluster.PlacementStatePlaced
+		return p
+	}
+	deleting := reservedFor("delayed", "worker-a", "inc-delayed")
+	deleting.State = cluster.PlacementStateDeleting
+	orphaned := placed("delayed", "", "inc-delayed")
+	for _, tc := range []struct {
+		name      string
+		placement *cluster.Placement
+		ok        bool
+	}{
+		{name: "given to another node", placement: ptr(placed("delayed", "worker-b", "inc-delayed"))},
+		{name: "reserved for another node", placement: ptr(reservedFor("delayed", "worker-b", "inc-delayed"))},
+		{name: "being deleted", placement: &deleting},
+		{name: "orphaned", placement: &orphaned},
+		{name: "no placement", placement: nil},
+		{name: "another lifetime", placement: ptr(placed("delayed", "worker-a", "inc-other"))},
+		{name: "reserved for this node", placement: ptr(reservedFor("delayed", "worker-a", "inc-delayed")), ok: true},
+		{name: "placed on this node", placement: ptr(placed("delayed", "worker-a", "inc-delayed")), ok: true},
+		{name: "no lifetime on the placement", placement: ptr(placed("delayed", "worker-a", "")), ok: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc, st, lc := newLeaseService(t, newFreezeRuntime())
+			svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+			svc.beginOwnershipLease(time.Now().Add(-time.Minute))
+			if tc.placement != nil {
+				lc.up(*tc.placement)
+			} else {
+				lc.up()
+			}
+			err := svc.persistSandboxCreate(ctx, leaseCreateRow("delayed", true))
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("create = %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrOwnershipFenced) {
+				t.Fatalf("create = %v, want ErrOwnershipFenced; fenced=%v", err, svc.OwnershipFenced("delayed"))
+			}
+			if _, err := st.Get(ctx, "delayed"); !errors.Is(err, storepkg.ErrNotFound) {
+				t.Fatalf("the refused create left its row: %v", err)
+			}
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// createCountingRuntime counts instance creates, to show a refused create
+// never started one.
+type createCountingRuntime struct {
+	*freezeRuntime
+	creates atomic.Int32
+}
+
+func (r *createCountingRuntime) Create(ctx context.Context, req models.CreateSandboxRequest, id, token string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+	r.creates.Add(1)
+	return &models.SandboxRuntimeState{ContainerID: "ctr-" + id, ContainerIP: "10.0.0.2", Status: models.SandboxStatusStarted}, nil
+}
+
+// The check runs before the create starts anything (review: "before allowing
+// a recreate executor to start"), not only before its row is written: a
+// refused create never reached the runtime, so no executor ran even
+// briefly, and it reserved no capacity to give back. With the leader's
+// placement naming this node the create does reach the runtime.
+func TestRecreateCreateChecksOwnershipBeforeItStarts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		down      bool
+		owner     string
+		wantStart bool
+	}{
+		{name: "leader down", down: true},
+		{name: "given to another node", owner: "worker-b"},
+		{name: "reserved for this node", owner: "worker-a", wantStart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &createCountingRuntime{freezeRuntime: newFreezeRuntime()}
+			svc, _, lc := newLeaseService(t, rt)
+			svc.beginOwnershipLease(time.Now().Add(-time.Minute))
+			if tc.down {
+				lc.down()
+			} else {
+				lc.up(reservedFor("sb-prestart", tc.owner, ""))
+			}
+			_, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+				Image:    "alpine:3.20",
+				Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+			}, "sb-prestart")
+			started := rt.creates.Load() > 0
+			if started != tc.wantStart {
+				t.Fatalf("runtime creates = %d (err %v), want started %v", rt.creates.Load(), err, tc.wantStart)
+			}
+			if !tc.wantStart && !errors.Is(err, ErrOwnershipFenced) {
+				t.Fatalf("create = %v, want ErrOwnershipFenced", err)
+			}
+			if !tc.wantStart && svc.admitter != nil && svc.admitter.Snapshot().ReservedCPU != 0 {
+				t.Fatal("a refused create left capacity reserved")
+			}
+		})
 	}
 }

@@ -298,8 +298,15 @@ func (s *Service) unfenceLocked(id string) {
 
 // confirmOwnership is one authoritative read, sent at sent. On success the
 // lease runs from sent, and every fenced sandbox whose placement proves this
-// node still owns it is thawed. extra names sandboxes with no row yet that
-// the read must cover too (requireFreshOwnership).
+// node still owns it is thawed.
+func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
+	_, err := s.readOwnership(ctx, sent)
+	return err
+}
+
+// readOwnership is confirmOwnership that also returns what the leader
+// answered. extra names sandboxes with no row yet that the read must cover
+// too (requireFreshOwnership), so their placements are in the answer.
 //
 // A node with no recreate-policy sandbox has nothing to read, so it sends
 // no read, and then nothing is proven: the lease is not renewed and the
@@ -308,15 +315,15 @@ func (s *Service) unfenceLocked(id string) {
 // leader never saw, while the leader recreated the sandbox elsewhere. Such
 // a node's lease runs out, which fences nothing until it has a
 // recreate-policy sandbox, and that sandbox's create reads first.
-func (s *Service) confirmOwnership(ctx context.Context, sent time.Time, extra ...string) error {
+func (s *Service) readOwnership(ctx context.Context, sent time.Time, extra ...string) (map[string]cluster.Placement, error) {
 	if !s.ownershipLeaseApplies() {
-		return nil
+		return nil, nil
 	}
 	s.ownership.actionMu.Lock()
 	defer s.ownership.actionMu.Unlock()
 	live, err := s.localLiveSandboxes(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rows := recreateSandboxes(live)
 	// The lease itself needs only the recreate-policy sandboxes: no other
@@ -342,7 +349,7 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time, extra ..
 			if s.logger != nil {
 				s.logger.Debug("cluster: ownership lease read failed", "sandboxes", len(ids), "error", err)
 			}
-			return err
+			return nil, err
 		}
 	}
 
@@ -419,22 +426,29 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time, extra ..
 		}
 	}
 	s.restoreFencedRoutes(ctx)
-	return nil
+	return placements, nil
 }
 
-// requireFreshOwnership is what a new failover.policy=recreate sandbox needs
-// before its create is answered, on the create, recreate and moved-in paths
-// alike (persistSandboxCreate): an authoritative read sent within the last
-// two thirds of a lease. A node that runs recreate-policy sandboxes reads
-// every lease/3, so it has one and this costs a clock read. A node that had
-// none (its confirms send no read), or whose reads fail, or that has not
-// read since it started, reads now, with id in the read, before the row is
-// written. If that read fails the create fails: a create that waited out an
-// image pull on a node cut off from the servers must not start on a lease
-// the leader never saw (V3). Two thirds, not the whole lease: the next
-// regular read (every lease/3) then lands before the lease runs out, so a
-// new sandbox is never frozen just because its node had been idle.
-func (s *Service) requireFreshOwnership(ctx context.Context, id string) error {
+// requireFreshOwnership is what a new failover.policy=recreate sandbox needs,
+// on the create, recreate and moved-in paths alike: an authoritative read
+// sent within the last two thirds of a lease. It runs twice: before the
+// create starts anything (requireOwnershipToStart) and again before its row
+// is written (persistSandboxCreate), for a create whose image pull outlasted
+// the first read.
+//
+// A node that runs recreate-policy sandboxes reads every lease/3, so it has
+// a fresh read and this costs a clock read. A node that had none (its
+// confirms send no read), or whose reads fail, or that has not read since it
+// started, reads now with id in the read, and the answer must still give id
+// to this node: a placement that exists, is not orphaned or being deleted,
+// names this node, and is incarnation's lifetime when both carry one (a
+// reservation counts: a new create's placement is one). Otherwise the create
+// fails. A node cut off from the servers while a create waited must not
+// start it on a lease the leader never saw, nor after the leader gave the
+// sandbox to another node meanwhile (V3). Two thirds, not the whole lease:
+// the next regular read (every lease/3) then lands before the lease runs
+// out, so a new sandbox is never frozen just because its node was idle.
+func (s *Service) requireFreshOwnership(ctx context.Context, id, incarnation string) error {
 	if !s.ownershipLeaseApplies() {
 		return nil
 	}
@@ -445,10 +459,39 @@ func (s *Service) requireFreshOwnership(ctx context.Context, id string) error {
 	if !read.IsZero() && time.Since(read) <= lease-lease/3 {
 		return nil
 	}
-	if err := s.confirmOwnership(ctx, time.Now(), id); err != nil {
+	placements, err := s.readOwnership(ctx, time.Now(), id)
+	if err != nil {
 		return fmt.Errorf("start a failover.policy=recreate sandbox: this node has no recent ownership read and a new one failed (%v): %w", err, ErrOwnershipFenced)
 	}
+	p, ok := placements[id]
+	self := strings.TrimSpace(s.Cluster().SelfNodeID())
+	if !placementGivesStart(p, ok, self, incarnation) {
+		return fmt.Errorf("start a failover.policy=recreate sandbox: the leader does not give %s to this node (owner %q, state %q): %w",
+			id, strings.TrimSpace(p.OwnerNodeID), p.State, ErrOwnershipFenced)
+	}
 	return nil
+}
+
+// placementGivesStart reports whether the leader's placement p lets this node
+// start sandbox p.SandboxID now: like ownershipProven, but a reservation
+// counts, since a new create's placement is one until the create answers.
+func placementGivesStart(p cluster.Placement, ok bool, self, incarnation string) bool {
+	if !ok || p.IsOrphaned() || p.IsDeleting() || strings.TrimSpace(p.OwnerNodeID) != self {
+		return false
+	}
+	local, placed := strings.TrimSpace(incarnation), strings.TrimSpace(p.IncarnationID)
+	return local == "" || placed == "" || local == placed
+}
+
+// requireOwnershipToStart is requireFreshOwnership for a create that is
+// about to reserve capacity and start its instance: called just before
+// admitCreate on every create path, so a refusal has nothing to roll back
+// and no executor ever ran. Only failover.policy=recreate creates.
+func (s *Service) requireOwnershipToStart(ctx context.Context, id, incarnation string, failover *models.Failover) error {
+	if failover == nil || !failover.ShouldRecreate() {
+		return nil
+	}
+	return s.requireFreshOwnership(ctx, id, incarnation)
 }
 
 // ownershipProven reports whether a placement proves this node still owns the

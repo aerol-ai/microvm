@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func (s *Service) isIsolateSandbox(sandbox *models.Sandbox) bool {
@@ -173,6 +174,11 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		if err != nil {
 			return nil, fmt.Errorf("generate sandbox id: %w", err)
 		}
+	}
+
+	// As on the docker path: no start before a recent ownership read (V3).
+	if err := s.requireOwnershipToStart(ctx, sandboxID, secrets.IncarnationIDFromContext(ctx), req.Failover); err != nil {
+		return nil, err
 	}
 
 	// Admission. Isolates share a workerd process per group, so the base
