@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/gorilla/websocket"
 )
 
@@ -59,7 +60,7 @@ func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
 		t.Fatalf("exec status = %d body=%s", execRec.Code, execRec.Body.String())
 	}
 
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
 		t.Fatalf("decode exec response: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
 	if getRec.Code != http.StatusOK {
 		t.Fatalf("get status = %d", getRec.Code)
 	}
-	var sessionResp daytonaSessionResponse
+	var sessionResp toolboxwire.SessionResponse
 	if err := json.Unmarshal(getRec.Body.Bytes(), &sessionResp); err != nil {
 		t.Fatalf("decode session response: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {
 	if logsRec.Code != http.StatusOK {
 		t.Fatalf("logs status = %d", logsRec.Code)
 	}
-	var logsResp daytonaSessionLogsResponse
+	var logsResp toolboxwire.SessionLogsResponse
 	if err := json.Unmarshal(logsRec.Body.Bytes(), &logsResp); err != nil {
 		t.Fatalf("decode logs response: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestHandleDaytonaSessionCommandInputDeliversStdin(t *testing.T) {
 	if execRec.Code != http.StatusOK {
 		t.Fatalf("async exec status = %d body=%s", execRec.Code, execRec.Body.String())
 	}
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
 		t.Fatalf("decode exec response: %v", err)
 	}
@@ -192,7 +193,7 @@ func TestHandleDaytonaSessionCommandInputAutoTerminates(t *testing.T) {
 	if !srv.handleDaytonaProcessRoute(execRec, execReq) {
 		t.Fatal("expected exec route to be handled")
 	}
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
 		t.Fatalf("decode exec response: %v", err)
 	}
@@ -241,7 +242,7 @@ func TestHandleDaytonaSessionCommandInputRejectsInactive(t *testing.T) {
 	if execRec.Code != http.StatusOK {
 		t.Fatalf("sync exec status = %d", execRec.Code)
 	}
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
 		t.Fatalf("decode exec response: %v", err)
 	}
@@ -279,7 +280,7 @@ func TestHandleDaytonaSessionListAndCommandGet(t *testing.T) {
 	if execRec.Code != http.StatusOK {
 		t.Fatalf("exec status = %d body=%s", execRec.Code, execRec.Body.String())
 	}
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil {
 		t.Fatalf("decode exec response: %v", err)
 	}
@@ -292,7 +293,7 @@ func TestHandleDaytonaSessionListAndCommandGet(t *testing.T) {
 	if listRec.Code != http.StatusOK {
 		t.Fatalf("list status = %d body=%s", listRec.Code, listRec.Body.String())
 	}
-	var listed []daytonaSessionResponse
+	var listed []toolboxwire.SessionResponse
 	if err := json.Unmarshal(listRec.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode list response: %v", err)
 	}
@@ -460,7 +461,7 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput(t *testing.T) {
 		t.Fatalf("exec: %v", err)
 	}
 	defer execResp.Body.Close()
-	var execPayload daytonaSessionExecuteResponse
+	var execPayload toolboxwire.SessionExecuteResponse
 	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
 		t.Fatalf("decode exec: %v", err)
 	}
@@ -482,14 +483,14 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsShortOutput(t *testing.T) {
 			break
 		}
 		collected = append(collected, payload...)
-		demuxed := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
-		demuxed = bytes.ReplaceAll(demuxed, daytonaStderrPrefix, nil)
+		demuxed := bytes.ReplaceAll(collected, toolboxwire.LogStdoutMarker, nil)
+		demuxed = bytes.ReplaceAll(demuxed, toolboxwire.LogStderrMarker, nil)
 		if bytes.Contains(demuxed, []byte("Enter your name:")) {
 			return
 		}
 	}
-	demuxed := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
-	demuxed = bytes.ReplaceAll(demuxed, daytonaStderrPrefix, nil)
+	demuxed := bytes.ReplaceAll(collected, toolboxwire.LogStdoutMarker, nil)
+	demuxed = bytes.ReplaceAll(demuxed, toolboxwire.LogStderrMarker, nil)
 	t.Fatalf("never saw the prompt on the WS within %s; got %q", daytonaAsyncTestTimeout, demuxed)
 }
 
@@ -533,7 +534,7 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket(t *testing.T) {
 	if execResp.StatusCode != http.StatusOK {
 		t.Fatalf("exec status = %d", execResp.StatusCode)
 	}
-	var execPayload daytonaSessionExecuteResponse
+	var execPayload toolboxwire.SessionExecuteResponse
 	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
 		t.Fatalf("decode exec: %v", err)
 	}
@@ -569,14 +570,14 @@ func TestHandleDaytonaSessionCommandLogsFollowStreamsWebSocket(t *testing.T) {
 
 	// Every byte we received should be inside a stdout-prefixed region —
 	// the SDK's stdDemuxStream slices on these markers to assign streams.
-	if !bytes.HasPrefix(collected, daytonaStdoutPrefix) {
+	if !bytes.HasPrefix(collected, toolboxwire.LogStdoutMarker) {
 		t.Fatalf("first bytes = % x, want stdout marker prefix", collected[:min(len(collected), 6)])
 	}
 	// Strip the marker(s) and compare payload bytes. There may be a
 	// single replay frame or multiple live frames concatenated; either
 	// way the marker bytes themselves are not part of the user payload.
-	payload := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
-	payload = bytes.ReplaceAll(payload, daytonaStderrPrefix, nil)
+	payload := bytes.ReplaceAll(collected, toolboxwire.LogStdoutMarker, nil)
+	payload = bytes.ReplaceAll(payload, toolboxwire.LogStderrMarker, nil)
 	if !bytes.Contains(payload, []byte("first")) || !bytes.Contains(payload, []byte("second")) {
 		t.Fatalf("payload after demux = %q, want both 'first' and 'second'", payload)
 	}
@@ -611,7 +612,7 @@ func TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand(t *testing.
 		t.Fatalf("exec: %v", err)
 	}
 	defer execResp.Body.Close()
-	var execPayload daytonaSessionExecuteResponse
+	var execPayload toolboxwire.SessionExecuteResponse
 	if err := json.NewDecoder(execResp.Body).Decode(&execPayload); err != nil {
 		t.Fatalf("decode exec: %v", err)
 	}
@@ -633,8 +634,8 @@ func TestHandleDaytonaSessionCommandLogsFollowReplaysFinishedCommand(t *testing.
 		}
 		collected = append(collected, payload...)
 	}
-	payload := bytes.ReplaceAll(collected, daytonaStdoutPrefix, nil)
-	payload = bytes.ReplaceAll(payload, daytonaStderrPrefix, nil)
+	payload := bytes.ReplaceAll(collected, toolboxwire.LogStdoutMarker, nil)
+	payload = bytes.ReplaceAll(payload, toolboxwire.LogStderrMarker, nil)
 	if !bytes.Contains(payload, []byte("replay-payload")) {
 		t.Fatalf("replay payload = %q, want to contain 'replay-payload'", payload)
 	}
@@ -662,7 +663,7 @@ func TestDaytonaCommandStreamHelpers(t *testing.T) {
 	stream.broadcast(sessions.StreamStderr, []byte("err"))
 
 	initial, ch, finished = stream.subscribe()
-	if finished || len(initial) == 0 || !bytes.Contains(initial, daytonaStdoutPrefix) || !bytes.Contains(initial, daytonaStderrPrefix) {
+	if finished || len(initial) == 0 || !bytes.Contains(initial, toolboxwire.LogStdoutMarker) || !bytes.Contains(initial, toolboxwire.LogStderrMarker) {
 		t.Fatalf("subscribe replay unexpected: initial=%q finished=%v", initial, finished)
 	}
 
@@ -812,14 +813,14 @@ func TestDaytonaProcessRouteAndLookupErrorBranches(t *testing.T) {
 }
 
 // logsAt reads a session command's logs with the given query.
-func logsAt(t *testing.T, srv *server, session, cmdID, query string) (int, daytonaSessionLogsResponse) {
+func logsAt(t *testing.T, srv *server, session, cmdID, query string) (int, toolboxwire.SessionLogsResponse) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/process/session/"+session+"/command/"+cmdID+"/logs"+query, nil)
 	rec := httptest.NewRecorder()
 	if !srv.handleDaytonaProcessRoute(rec, req) {
 		t.Fatal("expected logs route to be handled")
 	}
-	var resp daytonaSessionLogsResponse
+	var resp toolboxwire.SessionLogsResponse
 	if rec.Code == http.StatusOK {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode logs: %v", err)
@@ -839,14 +840,14 @@ func TestDaytonaSessionCommandLogsWhileRunning(t *testing.T) {
 	execRec := httptest.NewRecorder()
 	srv.handleDaytonaProcessRoute(execRec, httptest.NewRequest(http.MethodPost, "/process/session/live/exec",
 		bytes.NewBufferString(`{"command":"printf 'ready\\n'; printf 'warn' >&2; read go; printf 'done'","runAsync":true}`)))
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil || execResp.CmdID == "" {
 		t.Fatalf("exec = %s, %v", execRec.Body.String(), err)
 	}
 	cmd := execResp.CmdID
 
 	deadline := time.Now().Add(daytonaAsyncTestTimeout)
-	var live daytonaSessionLogsResponse
+	var live toolboxwire.SessionLogsResponse
 	for {
 		_, live = logsAt(t, srv, "live", cmd, "")
 		if live.Stdout == "ready\n" && live.Stderr == "warn" {
@@ -878,44 +879,5 @@ func TestDaytonaSessionCommandLogsWhileRunning(t *testing.T) {
 	_, final := logsAt(t, srv, "live", cmd, "?stdoutOffset=6")
 	if final.Stdout != "done" || final.StdoutEnd != 10 || final.StdoutLength != 10 || final.Stderr != "warn" {
 		t.Fatalf("final logs from offset = %+v", final)
-	}
-}
-
-// A log window never ends inside a UTF-8 character, so its text decodes
-// whole and the reader's next window starts on a character. Bytes that are
-// not valid UTF-8 become '?', one for one, so the text is as long as the
-// bytes it stands for and end agrees with it.
-func TestCutLogWindowKeepsCharactersWhole(t *testing.T) {
-	const smile = "\U0001F642" // four bytes
-	tests := []struct {
-		name        string
-		text        string
-		from, limit int64
-		final       bool
-		want        string
-		wantEnd     int64
-	}{
-		{name: "limit inside a character stops before it", text: "ab" + smile + "c", limit: 3, final: true, want: "ab", wantEnd: 2},
-		{name: "the next window starts on it", text: "ab" + smile + "c", from: 2, limit: 5, final: true, want: smile + "c", wantEnd: 7},
-		{name: "a limit shorter than a character still moves", text: "ab" + smile, from: 2, limit: 3, final: true, want: "???", wantEnd: 5},
-		{name: "running: a character still being written waits", text: "ok" + smile[:2], want: "ok", wantEnd: 2},
-		{name: "running: nothing whole yet", text: smile[:1], want: "", wantEnd: 0},
-		{name: "finished: a cut-off character is all there is", text: "ok" + smile[:2], final: true, want: "ok??", wantEnd: 4},
-		{name: "invalid bytes are whole, one '?' each", text: "a\xffb\x80", want: "a?b?", wantEnd: 4},
-		{name: "a real replacement character is kept", text: "\uFFFD", want: "\uFFFD", wantEnd: 3},
-		{name: "a character ending at the limit", text: "ab" + smile, limit: 6, final: true, want: "ab" + smile, wantEnd: 6},
-		{name: "past the end", text: "abc", from: 9, want: "", wantEnd: 3},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			for _, got := range []logWindow{
-				cutLogWindow(tt.text, tt.from, tt.limit, tt.final),
-				cutLogWindow([]byte(tt.text), tt.from, tt.limit, tt.final),
-			} {
-				if got.text != tt.want || got.end != tt.wantEnd || got.length != int64(len(tt.text)) {
-					t.Fatalf("cutLogWindow = %q end %d length %d; want %q end %d", got.text, got.end, got.length, tt.want, tt.wantEnd)
-				}
-			}
-		})
 	}
 }

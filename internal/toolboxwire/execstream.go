@@ -1,11 +1,12 @@
-// Package toolboxwire holds the wire format of the toolbox exec stream
-// (GET /process/exec/stream), shared by toolboxd (cmd/toolboxd), which runs
-// inside container and VM sandboxes, and the WASM toolhost
+// Package toolboxwire holds the wire formats of the toolbox exec stream
+// (GET /process/exec/stream) and of the Daytona-compatible process sessions
+// (/process/session, session.go), shared by toolboxd (cmd/toolboxd), which
+// runs inside container and VM sandboxes, and the WASM toolhost
 // (internal/runtime/wasm/toolhost), which runs in sandboxd. Clients see one
 // protocol whichever runtime a sandbox uses; keeping its types in one place
 // is what keeps the two servers from drifting apart.
 //
-// The protocol: the client offers the sandbox.bearer subprotocol, which the
+// The exec stream: the client offers the sandbox.bearer subprotocol, which the
 // server echoes. Its first text frame, within StartTimeout, is an
 // ExecStreamStart. The server then sends binary frames whose first byte is
 // FramePrefixStdout or FramePrefixStderr, and ends with a JSON

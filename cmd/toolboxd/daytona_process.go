@@ -12,27 +12,17 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/gorilla/websocket"
 )
 
-// Daytona SDK ≥0.175 streams session command logs over WebSocket on
-// /process/session/{sid}/command/{cid}/logs?follow=true. Frames are binary;
-// the client (stdDemuxStream in @daytona/sdk's utils/Stream.js) demultiplexes
-// stdout and stderr by these three-byte markers preceding each chunk.
-var (
-	daytonaStdoutPrefix = []byte{0x01, 0x01, 0x01}
-	daytonaStderrPrefix = []byte{0x02, 0x02, 0x02}
-)
+// The wire shapes (bodies, log windows, follow framing) live in
+// internal/toolboxwire, shared with the WASM toolhost, which serves the same
+// routes from runs inside the wasm engine.
 
-var daytonaLogsUpgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	ReadBufferSize:  64 * 1024,
-	WriteBufferSize: 64 * 1024,
-}
+var daytonaLogsUpgrader = toolboxwire.NewLogsUpgrader()
 
 type daytonaCompat struct {
 	mu       sync.Mutex
@@ -86,13 +76,7 @@ func (c *daytonaCommandStream) broadcast(stream sessions.Stream, chunk []byte) {
 	if c == nil || len(chunk) == 0 {
 		return
 	}
-	prefix := daytonaStdoutPrefix
-	if stream == sessions.StreamStderr {
-		prefix = daytonaStderrPrefix
-	}
-	frame := make([]byte, 0, len(prefix)+len(chunk))
-	frame = append(frame, prefix...)
-	frame = append(frame, chunk...)
+	frame := toolboxwire.FrameLog(stream == sessions.StreamStderr, chunk)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -134,85 +118,18 @@ func (c *daytonaCommandStream) finish() {
 	}
 }
 
-// logWindow is one stream's bytes from an offset: text, then end, the offset
-// just past them, and length, the stream's full length so far, all counted
-// in the stream's own bytes. text is valid UTF-8 of the same length as the
-// bytes it stands for (see sameLengthUTF8), so a reader's offsets agree
-// whether it counts end or the text it has been sent.
-type logWindow struct {
-	text        string
-	end, length int64
-}
-
 // window returns each stream's bytes from its offset — at most limit bytes
 // of each, 0 meaning no limit — read in one critical section so the two
 // agree. Only the window is copied, so a poller reading a long-running
 // command's new output pays for the new bytes, not for everything the
 // command has written.
-func (c *daytonaCommandStream) window(stdoutFrom, stderrFrom, limit int64) (stdout, stderr logWindow) {
+func (c *daytonaCommandStream) window(q toolboxwire.LogQuery) (stdout, stderr toolboxwire.LogWindow) {
 	if c == nil {
-		return logWindow{}, logWindow{}
+		return toolboxwire.LogWindow{}, toolboxwire.LogWindow{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return cutLogWindow(c.stdout, stdoutFrom, limit, false), cutLogWindow(c.stderr, stderrFrom, limit, false)
-}
-
-// cutLogWindow is text[from:], cut to limit bytes when limit is positive,
-// and never ending partway through a UTF-8 character: a character the cut
-// would split is left for the next window, so each one decodes whole.
-// final says text will not grow; without it a character still being written
-// at the end of text is held back too. A cut that would leave nothing (a
-// limit shorter than one character) keeps the bytes, so a reader always
-// moves forward.
-func cutLogWindow[T ~string | ~[]byte](text T, from, limit int64, final bool) logWindow {
-	from = min(from, int64(len(text)))
-	window := text[from:]
-	cut := limit > 0 && int64(len(window)) > limit
-	if cut {
-		window = window[:limit]
-	}
-	if cut || !final {
-		if whole := wholeRunesLen(window); whole > 0 || !cut {
-			window = window[:whole]
-		}
-	}
-	return logWindow{text: sameLengthUTF8(string(window)), end: from + int64(len(window)), length: int64(len(text))}
-}
-
-// sameLengthUTF8 replaces each byte of text that is not part of a valid
-// UTF-8 character with '?'. The text goes out as a JSON string, and JSON
-// would replace each such byte with a three-byte character instead, so a
-// reader counting the text it received would drift past the stream's real
-// length and resume at the wrong place.
-func sameLengthUTF8(text string) string {
-	if utf8.ValidString(text) {
-		return text
-	}
-	out := []byte(text)
-	for i := 0; i < len(out); {
-		r, size := utf8.DecodeRune(out[i:])
-		if r == utf8.RuneError && size == 1 {
-			out[i] = '?'
-		}
-		i += size
-	}
-	return string(out)
-}
-
-// wholeRunesLen is the length of text without a final UTF-8 character that
-// is missing its last bytes. Invalid bytes count as whole: no later byte
-// can complete them.
-func wholeRunesLen[T ~string | ~[]byte](text T) int {
-	for i := len(text) - 1; i >= 0 && i > len(text)-utf8.UTFMax; i-- {
-		if utf8.RuneStart(text[i]) {
-			if utf8.FullRune([]byte(text[i:])) {
-				return len(text)
-			}
-			return i
-		}
-	}
-	return len(text)
+	return toolboxwire.CutLogWindow(c.stdout, q.StdoutOffset, q.Limit, false), toolboxwire.CutLogWindow(c.stderr, q.StderrOffset, q.Limit, false)
 }
 
 // subscribe registers a new live subscriber. Returns the framed replay of
@@ -229,14 +146,7 @@ func (c *daytonaCommandStream) subscribe() (initial []byte, ch <-chan []byte, fi
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.stdout) > 0 {
-		initial = append(initial, daytonaStdoutPrefix...)
-		initial = append(initial, c.stdout...)
-	}
-	if len(c.stderr) > 0 {
-		initial = append(initial, daytonaStderrPrefix...)
-		initial = append(initial, c.stderr...)
-	}
+	initial = toolboxwire.LogReplay(c.stdout, c.stderr)
 	select {
 	case <-c.finished:
 		closed := make(chan []byte)
@@ -247,56 +157,6 @@ func (c *daytonaCommandStream) subscribe() (initial []byte, ch <-chan []byte, fi
 	sub := make(chan []byte, 256)
 	c.subs = append(c.subs, sub)
 	return initial, sub, false
-}
-
-type daytonaCreateSessionRequest struct {
-	SessionID string `json:"sessionId"`
-}
-
-type daytonaSessionResponse struct {
-	Commands  []daytonaCommandResponse `json:"commands"`
-	SessionID string                   `json:"sessionId"`
-}
-
-type daytonaCommandResponse struct {
-	Command  string `json:"command"`
-	ExitCode *int32 `json:"exitCode,omitempty"`
-	ID       string `json:"id"`
-}
-
-type daytonaSessionExecuteRequest struct {
-	Async             *bool  `json:"async,omitempty"`
-	Command           string `json:"command"`
-	RunAsync          *bool  `json:"runAsync,omitempty"`
-	SuppressInputEcho *bool  `json:"suppressInputEcho,omitempty"`
-}
-
-type daytonaSessionExecuteResponse struct {
-	CmdID    string  `json:"cmdId"`
-	ExitCode *int32  `json:"exitCode,omitempty"`
-	Output   *string `json:"output,omitempty"`
-	Stderr   *string `json:"stderr,omitempty"`
-	Stdout   *string `json:"stdout,omitempty"`
-}
-
-type daytonaSessionLogsResponse struct {
-	Output string `json:"output"`
-	Stderr string `json:"stderr"`
-	Stdout string `json:"stdout"`
-	// StdoutLength / StderrLength are each stream's full length so far, so a
-	// caller that read from an offset knows how much is left. Their presence
-	// also tells a caller this toolbox serves a running command's output and
-	// honours the offset parameters.
-	StdoutLength int64 `json:"stdoutLength"`
-	StderrLength int64 `json:"stderrLength"`
-	// StdoutEnd / StderrEnd are the offsets just past the returned text, in
-	// the stream's bytes: where the caller's next read starts.
-	StdoutEnd int64 `json:"stdoutEnd"`
-	StderrEnd int64 `json:"stderrEnd"`
-}
-
-type daytonaSessionInputRequest struct {
-	Data string `json:"data"`
 }
 
 func newDaytonaCompat() *daytonaCompat {
@@ -509,14 +369,9 @@ func (s *server) handleDaytonaSessionCommandRoute(w http.ResponseWriter, r *http
 // running command picks up the input directly — no shared-buffer races with
 // the wrapper's end marker.
 //
-// We append a trailing newline if the payload doesn't already end in one
-// (\n or \r). Daytona's own SDK helper `sendSessionCommandInput(sid, cid,
-// 'Alice')` ships line-oriented examples that omit the terminator, and
-// bash's `read` builtin blocks forever without it, so verbatim forwarding
-// silently hangs interactive commands. Auto-terminating preserves the
-// obvious semantics ("send a line of input"), matches what the Daytona
-// platform appears to do, and still lets explicit-newline callers send
-// multi-line input by including their own \n bytes.
+// A trailing newline is added when the payload has none
+// (toolboxwire.SessionInputRequest.Line): bash's `read` builtin blocks
+// forever without it.
 func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http.Request, sessionID, commandID string) {
 	sess, state, ok := s.lookupDaytonaSession(sessionID)
 	if !ok {
@@ -531,16 +386,12 @@ func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http
 		writeError(w, http.StatusConflict, "command is not currently accepting input")
 		return
 	}
-	var req daytonaSessionInputRequest
+	var req toolboxwire.SessionInputRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	data := req.Data
-	if !strings.HasSuffix(data, "\n") && !strings.HasSuffix(data, "\r") {
-		data += "\n"
-	}
-	if _, err := sess.Write([]byte(data)); err != nil {
+	if _, err := sess.Write([]byte(req.Line())); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -548,7 +399,7 @@ func (s *server) handleDaytonaSessionCommandInput(w http.ResponseWriter, r *http
 }
 
 func (s *server) handleDaytonaSessionCreate(w http.ResponseWriter, r *http.Request) {
-	var req daytonaCreateSessionRequest
+	var req toolboxwire.CreateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
@@ -572,7 +423,7 @@ func (s *server) handleDaytonaSessionCreate(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *server) handleDaytonaSessionList(w http.ResponseWriter, r *http.Request) {
-	items := make([]daytonaSessionResponse, 0)
+	items := make([]toolboxwire.SessionResponse, 0)
 	for _, sessionID := range s.daytona.listSessionIDs() {
 		sess, state, ok := s.lookupDaytonaSession(sessionID)
 		if !ok {
@@ -616,7 +467,7 @@ func (s *server) handleDaytonaSessionExec(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	var req daytonaSessionExecuteRequest
+	var req toolboxwire.SessionExecuteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
@@ -639,10 +490,9 @@ func (s *server) handleDaytonaSessionExec(w http.ResponseWriter, r *http.Request
 		stream:    newDaytonaCommandStream(),
 	}
 	state.addCommand(command)
-	async := (req.RunAsync != nil && *req.RunAsync) || (req.Async != nil && *req.Async)
-	if async {
+	if req.RunsAsync() {
 		go s.runDaytonaSessionCommand(sess, state, command)
-		writeJSON(w, http.StatusOK, daytonaSessionExecuteResponse{CmdID: commandID})
+		writeJSON(w, http.StatusOK, toolboxwire.SessionExecuteResponse{CmdID: commandID})
 		return
 	}
 	response, err := s.runDaytonaSessionCommand(sess, state, command)
@@ -664,7 +514,7 @@ func (s *server) handleDaytonaSessionCommandGet(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusNotFound, "command not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, daytonaCommandResponse{Command: command.command, ExitCode: cloneInt32Ptr(command.exitCode), ID: command.id})
+	writeJSON(w, http.StatusOK, toolboxwire.CommandResponse{Command: command.command, ExitCode: cloneInt32Ptr(command.exitCode), ID: command.id})
 }
 
 func (s *server) handleDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.Request, sessionID, commandID string) {
@@ -687,34 +537,21 @@ func (s *server) handleDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusNotFound, "command not found")
 		return
 	}
-	var bounds [3]int64 // stdoutOffset, stderrOffset, limit
-	for i, name := range []string{"stdoutOffset", "stderrOffset", "limit"} {
-		raw := strings.TrimSpace(r.URL.Query().Get(name))
-		if raw == "" {
-			continue
-		}
-		n, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, name+" must be a non-negative integer")
-			return
-		}
-		bounds[i] = n
+	q, err := toolboxwire.ParseLogQuery(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	var stdout, stderr logWindow
+	var stdout, stderr toolboxwire.LogWindow
 	if command.exitCode == nil {
 		// Still running: the final text is set only when the command ends,
 		// so answer with what it has written so far — what a follower
 		// would have been sent.
-		stdout, stderr = command.stream.window(bounds[0], bounds[1], bounds[2])
+		stdout, stderr = command.stream.window(q)
 	} else {
-		stdout, stderr = cutLogWindow(command.stdout, bounds[0], bounds[2], true), cutLogWindow(command.stderr, bounds[1], bounds[2], true)
+		stdout, stderr = toolboxwire.CutLogWindow(command.stdout, q.StdoutOffset, q.Limit, true), toolboxwire.CutLogWindow(command.stderr, q.StderrOffset, q.Limit, true)
 	}
-	resp := daytonaSessionLogsResponse{
-		Stdout: stdout.text, StdoutEnd: stdout.end, StdoutLength: stdout.length,
-		Stderr: stderr.text, StderrEnd: stderr.end, StderrLength: stderr.length,
-		Output: stdout.text + stderr.text,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, toolboxwire.NewSessionLogsResponse(stdout, stderr))
 }
 
 // streamDaytonaSessionCommandLogs upgrades the request to a WebSocket and
@@ -734,38 +571,7 @@ func (s *server) streamDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.
 	defer conn.Close()
 
 	initial, ch, _ := cmd.stream.subscribe()
-	if len(initial) > 0 {
-		if err := conn.WriteMessage(websocket.BinaryMessage, initial); err != nil {
-			return
-		}
-	}
-
-	// Detect client disconnects so we don't block forever waiting on a
-	// command that may run indefinitely. Reads here drain any frames the
-	// client sends (none, per protocol) but unblock when the peer closes.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		select {
-		case frame, ok := <-ch:
-			if !ok {
-				return
-			}
-			if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-				return
-			}
-		case <-done:
-			return
-		}
-	}
+	toolboxwire.FollowLogs(conn, initial, ch)
 }
 
 func (s *server) lookupDaytonaSession(sessionID string) (*sessions.Session, *daytonaSessionState, bool) {
@@ -784,16 +590,16 @@ func (s *server) lookupDaytonaSession(sessionID string) (*sessions.Session, *day
 	return sess, state, true
 }
 
-func buildDaytonaSessionResponse(sessionID string, state *daytonaSessionState) daytonaSessionResponse {
+func buildDaytonaSessionResponse(sessionID string, state *daytonaSessionState) toolboxwire.SessionResponse {
 	commands := state.commandsSnapshot()
-	response := make([]daytonaCommandResponse, 0, len(commands))
+	response := make([]toolboxwire.CommandResponse, 0, len(commands))
 	for _, command := range commands {
-		response = append(response, daytonaCommandResponse{Command: command.command, ExitCode: cloneInt32Ptr(command.exitCode), ID: command.id})
+		response = append(response, toolboxwire.CommandResponse{Command: command.command, ExitCode: cloneInt32Ptr(command.exitCode), ID: command.id})
 	}
-	return daytonaSessionResponse{Commands: response, SessionID: sessionID}
+	return toolboxwire.SessionResponse{Commands: response, SessionID: sessionID}
 }
 
-func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytonaSessionState, command *daytonaCommandState) (*daytonaSessionExecuteResponse, error) {
+func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytonaSessionState, command *daytonaCommandState) (*toolboxwire.SessionExecuteResponse, error) {
 	state.execMu.Lock()
 	defer state.execMu.Unlock()
 	// finishStream always fires once the runner exits so any live
@@ -860,17 +666,10 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	var pendingStdout string
 	var pendingExit int32
 	havePending := false
-	complete := func(stdoutText string, exitCode int32) (*daytonaSessionExecuteResponse, error) {
+	complete := func(stdoutText string, exitCode int32) (*toolboxwire.SessionExecuteResponse, error) {
 		stderrText := stderr.String()
 		state.finishCommand(command.id, stdoutText, stderrText, exitCode)
-		output := stdoutText + stderrText
-		return &daytonaSessionExecuteResponse{
-			CmdID:    command.id,
-			ExitCode: int32Ptr(exitCode),
-			Output:   stringOrNil(output),
-			Stderr:   stringOrNil(stderrText),
-			Stdout:   stringOrNil(stdoutText),
-		}, nil
+		return toolboxwire.NewSessionExecuteResponse(command.id, exitCode, stdoutText, stderrText), nil
 	}
 	for frame := range frames {
 		chunk := string(frame.Data)
@@ -984,14 +783,7 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	}
 	flushStderr()
 	state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
-	output := stdoutText + stderrText
-	return &daytonaSessionExecuteResponse{
-		CmdID:    command.id,
-		ExitCode: int32Ptr(int32(exitCode)),
-		Output:   stringOrNil(output),
-		Stderr:   stringOrNil(stderrText),
-		Stdout:   stringOrNil(stdoutText),
-	}, nil
+	return toolboxwire.NewSessionExecuteResponse(command.id, int32(exitCode), stdoutText, stderrText), nil
 }
 
 // absorbDaytonaErrSentinel appends chunk and reports whether sentinel is
@@ -1049,13 +841,5 @@ func cloneInt32Ptr(value *int32) *int32 {
 		return nil
 	}
 	v := *value
-	return &v
-}
-
-func stringOrNil(value string) *string {
-	if value == "" {
-		return nil
-	}
-	v := value
 	return &v
 }

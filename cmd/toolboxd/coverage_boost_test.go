@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/gorilla/websocket"
 )
 
@@ -737,7 +738,7 @@ func TestHandleDaytonaSessionCommandRoute_MethodErrors(t *testing.T) {
 	srv.handleDaytonaProcessRoute(execRec,
 		httptest.NewRequest(http.MethodPost, "/process/session/cmd-route-test/exec",
 			strings.NewReader(`{"command":"printf cmdtest"}`)))
-	var execResp daytonaSessionExecuteResponse
+	var execResp toolboxwire.SessionExecuteResponse
 	_ = json.Unmarshal(execRec.Body.Bytes(), &execResp)
 
 	cmdBase := "/process/session/cmd-route-test/command/" + execResp.CmdID
@@ -1471,15 +1472,5 @@ func TestInt32PtrAndCloneInt32Ptr(t *testing.T) {
 	}
 	if got := cloneInt32Ptr(nil); got != nil {
 		t.Fatalf("cloneInt32Ptr(nil) = %v, want nil", got)
-	}
-}
-
-func TestStringOrNil(t *testing.T) {
-	if got := stringOrNil(""); got != nil {
-		t.Fatalf("stringOrNil(\"\") = %v, want nil", got)
-	}
-	got := stringOrNil("value")
-	if got == nil || *got != "value" {
-		t.Fatalf("stringOrNil(value) = %v, want &value", got)
 	}
 }
