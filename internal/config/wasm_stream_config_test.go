@@ -3,6 +3,7 @@ package config
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestWasmCodeRunModules(t *testing.T) {
@@ -57,15 +58,23 @@ func TestLoadWasmStreamSettings(t *testing.T) {
 	if cfg.WasmMaxStreamsPerSandbox != 8 {
 		t.Fatalf("default stream cap = %d, want 8", cfg.WasmMaxStreamsPerSandbox)
 	}
+	if cfg.WasmInterpMaxContexts != 4 || cfg.WasmInterpIdleTTL != 15*time.Minute {
+		t.Fatalf("interpreter defaults = %d contexts, idle %s", cfg.WasmInterpMaxContexts, cfg.WasmInterpIdleTTL)
+	}
 	if cfg.WasmCodeRunModules["py"] != "python" || cfg.WasmCodeRunModules["ruby"] != "" {
 		t.Fatalf("derived code-run modules = %#v", cfg.WasmCodeRunModules)
 	}
 
 	t.Setenv("SB_WASM_MAX_STREAMS_PER_SANDBOX", "3")
 	t.Setenv("SB_WASM_CODERUN_MODULES", "ruby=ruby")
+	t.Setenv("SB_WASM_INTERP_MAX_CONTEXTS", "2")
+	t.Setenv("SB_WASM_INTERP_IDLE_TTL", "90s")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.WasmInterpMaxContexts != 2 || cfg.WasmInterpIdleTTL != 90*time.Second {
+		t.Fatalf("interpreter settings = %d contexts, idle %s", cfg.WasmInterpMaxContexts, cfg.WasmInterpIdleTTL)
 	}
 	if cfg.WasmMaxStreamsPerSandbox != 3 || !reflect.DeepEqual(cfg.WasmCodeRunModules, map[string]string{"ruby": "ruby"}) {
 		t.Fatalf("cap %d modules %#v", cfg.WasmMaxStreamsPerSandbox, cfg.WasmCodeRunModules)

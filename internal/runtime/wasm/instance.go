@@ -68,6 +68,10 @@ type sandboxInstance struct {
 	// sessions are its Daytona-style process sessions (sessions.go), made
 	// on first use under Driver.mu and ended with the streams.
 	sessions *sessionSet
+
+	// interp is the sandbox's code interpreter (interpreter_state.go),
+	// made on first use under Driver.mu and closed with the streams.
+	interp *interpState
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

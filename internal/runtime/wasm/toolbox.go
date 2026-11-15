@@ -37,6 +37,8 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		Exec:      sandboxExecutor{driver: d, id: sandboxID},
 		Procs:     sandboxProcesses{driver: d, id: sandboxID},
 		Sessions:  sandboxSessions{driver: d, id: sandboxID},
+		// The code interpreter's python.wasm instances are runs too.
+		Interpreters: sandboxInterpreters{driver: d, id: sandboxID},
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV

@@ -160,6 +160,9 @@ func (d *Driver) killStreams(inst *sandboxInstance) {
 	if inst == nil {
 		return
 	}
+	// Interpreter contexts first: their Managers would otherwise start a
+	// new interpreter for a run whose old one was just killed.
+	d.closeInterpreters(inst)
 	d.mu.Lock()
 	set := inst.streams
 	sessions := inst.sessions

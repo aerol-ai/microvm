@@ -49,4 +49,7 @@
 //   - "stdio" (WASM, which has no child processes and no extra
 //     descriptors): requests on stdin, events on stdout, and the driver
 //     wraps the user's output into OUT and ERR frames itself. No markers.
+//     WASI has no working directory to inherit, so the launcher passes the
+//     context's cwd in AEROL_INTERP_CWD and the driver enters it before
+//     READY (FATAL when it cannot).
 package codeinterp

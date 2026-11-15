@@ -2,8 +2,10 @@ package codeinterp
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -134,5 +136,37 @@ func TestMissingInterpreterError(t *testing.T) {
 	}
 	if (Outcome{Status: "interrupted"}).Interrupted() != true {
 		t.Fatal("Interrupted")
+	}
+}
+
+func TestEventFromFrame(t *testing.T) {
+	cases := []struct {
+		kind, payload string
+		want          Event
+		ok            bool
+	}{
+		{kind: "COUNT", payload: "7", want: Event{Kind: EventCount, Count: 7}, ok: true},
+		{kind: "COUNT", payload: "x"},
+		{kind: "OUT", payload: "hi\n", want: Event{Kind: EventStdout, Text: "hi\n"}, ok: true},
+		{kind: "ERR", payload: "oops", want: Event{Kind: EventStderr, Text: "oops"}, ok: true},
+		{kind: "RESULT", payload: `{"data":{"text/plain":"5","application/json":{"n":12345678901234567890}},"main":true}`,
+			want: Event{Kind: EventResult, Main: true, Bundle: map[string]any{
+				"text/plain": "5", "application/json": map[string]any{"n": json.Number("12345678901234567890")},
+			}}, ok: true},
+		{kind: "RESULT", payload: `{"data":{}}`},
+		{kind: "RESULT", payload: `not json`},
+		{kind: "TEXT", payload: "'a'", want: Event{Kind: EventResult, Main: true, Bundle: map[string]any{"text/plain": "'a'"}}, ok: true},
+		{kind: "ERROR", payload: "NameError\x1fname 'x' is not defined\x1fTraceback", want: Event{Kind: EventError,
+			ErrName: "NameError", ErrValue: "name 'x' is not defined", ErrTraceback: "Traceback"}, ok: true},
+		{kind: "READY", payload: "1"},
+		{kind: "DONE", payload: "ok"},
+		{kind: "SYNC", payload: "3"},
+		{kind: "FUTURE", payload: "x"},
+	}
+	for _, tc := range cases {
+		got, ok := EventFromFrame(tc.kind, []byte(tc.payload))
+		if ok != tc.ok || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s %q = %+v %v, want %+v %v", tc.kind, tc.payload, got, ok, tc.want, tc.ok)
+		}
 	}
 }

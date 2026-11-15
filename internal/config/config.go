@@ -841,6 +841,17 @@ type Config struct {
 	WasmMaxSessionsPerSandbox int
 	WasmSessionCommandsKept   int
 	WasmSessionLogBudget      int64
+	// WasmInterpMaxContexts caps code interpreter contexts per WASM sandbox,
+	// the Daytona and E2B protocols together (plans/code-interpreter.md
+	// D11). Each running context is a python.wasm instance in the sandbox's
+	// worker and holds one of its streaming runs. Default 4.
+	// SB_WASM_INTERP_MAX_CONTEXTS.
+	WasmInterpMaxContexts int
+	// WasmInterpIdleTTL stops a context's interpreter after this long with
+	// no run, freeing its memory and its run slot; the context stays and
+	// its next run starts an empty interpreter. Default 15m.
+	// SB_WASM_INTERP_IDLE_TTL.
+	WasmInterpIdleTTL time.Duration
 	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
 	// the create request carries no per-tenant credentials. SB_WASM_REGISTRY_USERNAME.
 	WasmRegistryUsername string
@@ -2701,6 +2712,8 @@ func load(keyTool bool) (Config, error) {
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),
 		WasmSessionCommandsKept:   getEnvInt("SB_WASM_SESSION_COMMANDS_KEPT", 64),
 		WasmSessionLogBudget:      getEnvInt64("SB_WASM_SESSION_LOG_BUDGET_BYTES", 16<<20),
+		WasmInterpMaxContexts:     getEnvInt("SB_WASM_INTERP_MAX_CONTEXTS", 4),
+		WasmInterpIdleTTL:         getEnvDuration("SB_WASM_INTERP_IDLE_TTL", 15*time.Minute),
 		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
 		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
 		WasmRegistryPushHost:      getEnv("SB_WASM_REGISTRY_PUSH_HOST", ""),

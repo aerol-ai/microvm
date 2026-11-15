@@ -2,7 +2,6 @@ package proc
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -443,33 +442,10 @@ func (x *execution) handle(fr frame) (codeinterp.Outcome, bool) {
 		return codeinterp.Outcome{Status: string(fr.payload)}, true
 	}
 	defer x.release(x.k.synced)
-	switch fr.kind {
-	case "COUNT":
-		if n, err := strconv.Atoi(string(fr.payload)); err == nil {
-			x.sink(codeinterp.Event{Kind: codeinterp.EventCount, Count: n})
-		}
-	case "OUT":
-		x.sink(codeinterp.Event{Kind: codeinterp.EventStdout, Text: string(fr.payload)})
-	case "ERR":
-		x.sink(codeinterp.Event{Kind: codeinterp.EventStderr, Text: string(fr.payload)})
-	case "RESULT":
-		var r struct {
-			Data map[string]any `json:"data"`
-			Main bool           `json:"main"`
-		}
-		dec := json.NewDecoder(bytes.NewReader(fr.payload))
-		// Numbers in application/json and table data keep their digits.
-		dec.UseNumber()
-		if err := dec.Decode(&r); err == nil && len(r.Data) > 0 {
-			x.sink(codeinterp.Event{Kind: codeinterp.EventResult, Bundle: r.Data, Main: r.Main})
-		}
-	case "TEXT":
-		x.sink(codeinterp.Event{Kind: codeinterp.EventResult, Main: true, Bundle: map[string]any{"text/plain": string(fr.payload)}})
-	case "ERROR":
-		name, value, tb := codeinterp.ParseErrorPayload(fr.payload)
-		x.sink(codeinterp.Event{Kind: codeinterp.EventError, ErrName: name, ErrValue: value, ErrTraceback: tb})
-	}
 	// READY, FATAL and kinds a newer driver may add mean nothing mid-run.
+	if ev, ok := codeinterp.EventFromFrame(fr.kind, fr.payload); ok {
+		x.sink(ev)
+	}
 	return codeinterp.Outcome{}, false
 }
 

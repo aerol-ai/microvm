@@ -42,6 +42,12 @@ type Config struct {
 	MaxSessionsPerSandbox int
 	SessionCommandsKept   int
 	SessionLogBudget      int64
+	// InterpMaxContexts caps code interpreter contexts per sandbox; 0 means
+	// defaultInterpMaxContexts. SB_WASM_INTERP_MAX_CONTEXTS.
+	InterpMaxContexts int
+	// InterpIdleTTL stops an idle context's interpreter; 0 means
+	// defaultInterpIdleTTL. SB_WASM_INTERP_IDLE_TTL.
+	InterpIdleTTL time.Duration
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -61,5 +67,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		MaxSessionsPerSandbox:    cfg.WasmMaxSessionsPerSandbox,
 		SessionCommandsKept:      cfg.WasmSessionCommandsKept,
 		SessionLogBudget:         cfg.WasmSessionLogBudget,
+		InterpMaxContexts:        cfg.WasmInterpMaxContexts,
+		InterpIdleTTL:            cfg.WasmInterpIdleTTL,
 	}
 }
