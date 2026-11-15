@@ -109,6 +109,11 @@ type RunPolicy struct {
 	// client went away). Without it the run continues and the adapter drops
 	// its output (Daytona).
 	InterruptOnCancel bool
+	// Interrupt, when it fires, interrupts this run only. An adapter that
+	// lets its client interrupt passes it instead of calling
+	// Manager.Interrupt, which would hit whatever run the context has at
+	// that moment (another client's, if this one is still queued or done).
+	Interrupt <-chan struct{}
 }
 
 // RunResult is how a run ended.
@@ -225,6 +230,11 @@ func (e *unsupportedError) Unwrap() error { return ErrUnsupportedLanguage }
 func (m *Manager) newEntry(id, lang, cwd string, isDefault bool) (*entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.newEntryLocked(id, lang, cwd, isDefault)
+}
+
+// newEntryLocked is newEntry with m.mu held.
+func (m *Manager) newEntryLocked(id, lang, cwd string, isDefault bool) (*entry, error) {
 	if m.closed {
 		return nil, ErrClosed
 	}
@@ -302,16 +312,19 @@ func (m *Manager) Default(language string) (ContextInfo, error) {
 	if id == "" {
 		id = m.opts.newID()
 	}
+	// The re-check and the insert share one critical section: two first
+	// callers that both passed the check above must not both register,
+	// or Daytona's fixed "default" id would be overwritten (leaking its
+	// slot and kernel) and E2B would get two python defaults.
 	m.mu.Lock()
-	// Another caller may have registered it while the lock was released.
 	if existing, ok := m.defaults[lang]; ok {
 		e := m.contexts[existing]
 		m.mu.Unlock()
 		m.opts.Limit.release()
 		return e.snapshot(), nil
 	}
+	e, err := m.newEntryLocked(id, lang, m.opts.DefaultCwd, true)
 	m.mu.Unlock()
-	e, err := m.newEntry(id, lang, m.opts.DefaultCwd, true)
 	if err != nil {
 		m.opts.Limit.release()
 		return ContextInfo{}, err
@@ -465,6 +478,9 @@ func (m *Manager) Interrupt(id string) error {
 // Run executes req in the context and streams events to sink. It waits in
 // the context's queue first; ctx cancelled while waiting abandons the run.
 func (m *Manager) Run(ctx context.Context, id string, req Request, sink Sink, p RunPolicy) (RunResult, error) {
+	if err := ValidateEnv(req.Env); err != nil {
+		return RunResult{}, err
+	}
 	e, err := m.lookup(id)
 	if err != nil {
 		return RunResult{}, err
@@ -481,14 +497,19 @@ func (m *Manager) Run(ctx context.Context, id string, req Request, sink Sink, p 
 		return RunResult{}, ctx.Err()
 	}
 	defer func() { <-e.slot }()
+	// A client that left while its run waited in line (E2B interrupts on
+	// cancel) gets no run: starting it now would leave nobody to interrupt
+	// it, and E2B has no server timeout.
+	if p.InterruptOnCancel && ctx.Err() != nil {
+		return RunResult{}, ctx.Err()
+	}
 
+	// kernelFor marks the context running under the same lock that hands
+	// out the kernel, so the idle reaper never closes it in between.
 	k, gen, err := m.kernelFor(ctx, e)
 	if err != nil {
 		return RunResult{}, err
 	}
-	e.mu.Lock()
-	e.running = true
-	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
 		e.running = false
@@ -517,6 +538,7 @@ func (m *Manager) Run(ctx context.Context, id string, req Request, sink Sink, p 
 		graceFor = DefaultGrace
 	}
 	cancelled := ctx.Done()
+	interrupt := p.Interrupt
 	var res RunResult
 	for {
 		select {
@@ -541,6 +563,9 @@ func (m *Manager) Run(ctx context.Context, id string, req Request, sink Sink, p 
 			if p.InterruptOnCancel {
 				_ = k.Interrupt()
 			}
+		case <-interrupt:
+			interrupt = nil
+			_ = k.Interrupt()
 		}
 	}
 }
@@ -561,11 +586,12 @@ func (m *Manager) kernelFor(ctx context.Context, e *entry) (Kernel, uint64, erro
 			e.kernel = nil
 		default:
 			k, gen := e.kernel, e.gen
+			e.running = true
 			e.mu.Unlock()
 			return k, gen, nil
 		}
 	}
-	lang, cwd, gen := e.info.Language, e.info.Cwd, e.gen
+	lang, cwd := e.info.Language, e.info.Cwd
 	e.mu.Unlock()
 
 	k, err := m.opts.Launcher.Launch(ctx, Spec{Language: lang, Cwd: cwd})
@@ -575,20 +601,20 @@ func (m *Manager) kernelFor(ctx context.Context, e *entry) (Kernel, uint64, erro
 		e.failed = true
 		return nil, 0, err
 	}
-	if e.deleted || e.gen != gen {
+	if e.deleted {
 		_ = k.Close()
-		if e.deleted {
-			return nil, 0, ErrNotFound
-		}
-		// Restarted while launching: use the restart's kernel if it has one.
-		if e.kernel != nil {
-			return e.kernel, e.gen, nil
-		}
-		e.kernel = k
+		return nil, 0, ErrNotFound
+	}
+	if e.kernel != nil {
+		// A Restart installed its kernel while this one was launching (it
+		// bumped gen before launching, so gen alone cannot tell): keep the
+		// installed one, or Restart's would leak past Close.
+		_ = k.Close()
 	} else {
 		e.kernel = k
 	}
 	e.failed = false
+	e.running = true
 	return e.kernel, e.gen, nil
 }
 

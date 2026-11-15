@@ -630,3 +630,212 @@ func TestRandomIDShape(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// gatedLauncher blocks each Launch until its gate opens, so a test can
+// order two launches.
+type gatedLauncher struct {
+	mu      sync.Mutex
+	pending []chan struct{}
+	started []*fakeKernel
+}
+
+func (l *gatedLauncher) Launch(ctx context.Context, spec Spec) (Kernel, error) {
+	gate := make(chan struct{})
+	l.mu.Lock()
+	l.pending = append(l.pending, gate)
+	l.mu.Unlock()
+	<-gate
+	k := newFakeKernel(spec)
+	l.mu.Lock()
+	l.started = append(l.started, k)
+	l.mu.Unlock()
+	return k, nil
+}
+
+func (l *gatedLauncher) open(i int) {
+	l.mu.Lock()
+	g := l.pending[i]
+	l.mu.Unlock()
+	close(g)
+}
+
+func (l *gatedLauncher) waiting() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.pending)
+}
+
+// A Restart that installs its kernel while a run is launching one: the run
+// must use Restart's and close its own, or Restart's leaks past Close.
+func TestRestartRacingRunLaunchKeepsOneKernel(t *testing.T) {
+	l := &gatedLauncher{}
+	m := NewManager(Options{Launcher: l, newID: func() string { return "c" }})
+	t.Cleanup(m.Close)
+	go func() { _, _ = m.Create(context.Background(), "python", "") }()
+	waitFor(t, func() bool { return l.waiting() == 1 })
+	l.open(0)
+	waitFor(t, func() bool { _, err := m.Get("c"); return err == nil })
+
+	restarted := make(chan error, 1)
+	go func() { _, err := m.Restart(context.Background(), "c"); restarted <- err }()
+	waitFor(t, func() bool { return l.waiting() == 2 })
+	ran := make(chan error, 1)
+	go func() {
+		_, err := m.Run(context.Background(), "c", Request{Code: "x"}, func(Event) {}, RunPolicy{})
+		ran <- err
+	}()
+	waitFor(t, func() bool { return l.waiting() == 3 })
+	l.open(1) // Restart's kernel lands first.
+	if err := <-restarted; err != nil {
+		t.Fatal(err)
+	}
+	l.open(2) // then the run's.
+	if err := <-ran; err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	restartK, runK := l.started[1], l.started[2]
+	l.mu.Unlock()
+	select {
+	case <-runK.Done():
+	default:
+		t.Fatal("the run's extra kernel was not closed")
+	}
+	if restartK.runCount() != 1 {
+		t.Fatal("the run must use the kernel Restart installed")
+	}
+	m.Close()
+	select {
+	case <-restartK.Done():
+	default:
+		t.Fatal("Restart's kernel leaked past Close")
+	}
+}
+
+func TestDefaultConcurrentFirstCallsRegisterOnce(t *testing.T) {
+	for _, fixed := range []bool{true, false} {
+		lim := NewLimit(8)
+		var n atomic.Int32
+		opts := Options{Launcher: &fakeLauncher{}, Limit: lim, newID: func() string { return fmt.Sprintf("id-%d", n.Add(1)) }}
+		if fixed {
+			opts.DefaultID = func(string) string { return "default" }
+		}
+		m := NewManager(opts)
+		var wg sync.WaitGroup
+		ids := make(chan string, 64)
+		for i := 0; i < 64; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				info, err := m.Default("python")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				ids <- info.ID
+			}()
+		}
+		wg.Wait()
+		close(ids)
+		first := ""
+		for id := range ids {
+			if first == "" {
+				first = id
+			} else if id != first {
+				t.Fatalf("fixed=%v: two defaults %q and %q", fixed, first, id)
+			}
+		}
+		lim.mu.Lock()
+		used := lim.used
+		lim.mu.Unlock()
+		if used != 1 {
+			t.Fatalf("fixed=%v: limit slots used = %d, want 1", fixed, used)
+		}
+		m.Close()
+	}
+}
+
+func TestKernelForMarksRunning(t *testing.T) {
+	m := newTestManager(t, &fakeLauncher{}, func(o *Options) { o.IdleTTL = time.Hour })
+	info, _ := m.Create(context.Background(), "python", "")
+	e, _ := m.lookup(info.ID)
+	if _, _, err := m.kernelFor(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	running := e.running
+	e.lastUsed = time.Unix(0, 0)
+	e.mu.Unlock()
+	if !running {
+		t.Fatal("kernelFor must mark the context running before the reaper can see it idle")
+	}
+	m.reapOnce()
+	if got, _ := m.Get(info.ID); !got.Active {
+		t.Fatal("the reaper closed a kernel handed to a run")
+	}
+}
+
+func TestQueuedRunOfGoneClientDoesNotStart(t *testing.T) {
+	l := &fakeLauncher{}
+	m := newTestManager(t, l, nil)
+	info, _ := m.Create(context.Background(), "python", "")
+	first := make(chan struct{})
+	go func() {
+		_, _ = m.Run(context.Background(), info.ID, Request{Code: "sleep"}, func(Event) {}, RunPolicy{})
+		close(first)
+	}()
+	waitFor(t, func() bool { return l.launched[0].runCount() == 1 })
+	ctx, cancel := context.WithCancel(context.Background())
+	second := make(chan error, 1)
+	go func() {
+		_, err := m.Run(ctx, info.ID, Request{Code: "x"}, func(Event) {}, RunPolicy{InterruptOnCancel: true})
+		second <- err
+	}()
+	waitFor(t, func() bool {
+		e, _ := m.lookup(info.ID)
+		return e.waiting.Load() == 1
+	})
+	cancel()
+	if err := <-second; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued run of a gone client = %v, want context.Canceled", err)
+	}
+	_ = l.launched[0].Interrupt()
+	<-first
+	if got := l.launched[0].runCount(); got != 1 {
+		t.Fatalf("runs executed = %d, want 1", got)
+	}
+}
+
+func TestRunPolicyInterruptHitsOnlyItsRun(t *testing.T) {
+	l := &fakeLauncher{}
+	m := newTestManager(t, l, nil)
+	info, _ := m.Create(context.Background(), "python", "")
+	stop := make(chan struct{})
+	done := make(chan RunResult, 1)
+	go func() {
+		res, _ := m.Run(context.Background(), info.ID, Request{Code: "sleep"}, func(Event) {}, RunPolicy{Interrupt: stop})
+		done <- res
+	}()
+	waitFor(t, func() bool { return l.launched[0].runCount() == 1 })
+	close(stop)
+	if res := <-done; res.Status != "interrupted" {
+		t.Fatalf("res = %+v", res)
+	}
+	// A closed channel of a finished run does nothing to the next run.
+	res, err := m.Run(context.Background(), info.ID, Request{Code: "x"}, func(Event) {}, RunPolicy{})
+	if err != nil || res.Status != "ok" {
+		t.Fatalf("next run = %+v %v", res, err)
+	}
+}
+
+func TestRunRejectsInvalidEnv(t *testing.T) {
+	l := &fakeLauncher{}
+	m := newTestManager(t, l, nil)
+	info, _ := m.Create(context.Background(), "python", "")
+	if _, err := m.Run(context.Background(), info.ID, Request{Code: "x", Env: map[string]string{"A=B": "c"}}, func(Event) {}, RunPolicy{}); !errors.Is(err, ErrInvalidEnv) {
+		t.Fatalf("err = %v", err)
+	}
+	if l.launched[0].runCount() != 0 {
+		t.Fatal("a run with invalid env reached the kernel")
+	}
+}

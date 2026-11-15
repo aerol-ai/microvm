@@ -46,14 +46,20 @@ func NewFrameReader(r io.Reader) *FrameReader {
 // Read returns the next frame. io.EOF means the driver closed the stream
 // between frames; io.ErrUnexpectedEOF means it died in the middle of one.
 func (f *FrameReader) Read() (string, []byte, error) {
-	header, err := f.r.ReadString('\n')
+	// ReadSlice, not ReadString: a header is a few dozen bytes, and user code
+	// can write to the event stream, so a line without a newline must not
+	// grow the host's memory until it runs out.
+	line, err := f.r.ReadSlice('\n')
 	if err != nil {
-		if err == io.EOF && header != "" {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", nil, fmt.Errorf("%w: header longer than %d bytes", ErrBadFrame, len(line))
+		}
+		if err == io.EOF && len(line) > 0 {
 			return "", nil, io.ErrUnexpectedEOF
 		}
 		return "", nil, err
 	}
-	header = strings.TrimSuffix(header, "\n")
+	header := strings.TrimSuffix(string(line), "\n")
 	kind, size, ok := strings.Cut(header, " ")
 	if !ok || kind == "" || len(kind) > maxKindLen || strings.ToUpper(kind) != kind {
 		return "", nil, fmt.Errorf("%w: header %q", ErrBadFrame, truncate(header, 64))

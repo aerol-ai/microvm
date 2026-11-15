@@ -55,6 +55,7 @@ func TestFrameReaderRejects(t *testing.T) {
 		{"too large", "OUT 999999999999\n", ErrBadFrame},
 		{"cut header", "OUT 3", io.ErrUnexpectedEOF},
 		{"cut payload", "OUT 3\nab", io.ErrUnexpectedEOF},
+		{"endless header", strings.Repeat("A", 200<<10), ErrBadFrame},
 		{"no payload", "OUT 3\n", io.ErrUnexpectedEOF},
 	}
 	for _, tc := range cases {
