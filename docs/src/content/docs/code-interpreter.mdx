@@ -1,0 +1,634 @@
+---
+title: Code interpreter
+description: Run Python, JavaScript and other code in a sandbox that remembers its variables between runs, and get charts and tables back as results.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A code interpreter keeps a Python (or JavaScript, TypeScript, Bash, R or Java) process open inside your sandbox. You send it code as many times as you like. It remembers your variables, imports and open files between runs, like a notebook. It streams output while the code runs, and it returns charts and tables as rich results.
+
+That is the difference from [running a command](/exec-streaming/). Each `exec` starts a new program, so nothing carries over:
+
+```text
+run 1: x = 5      run 2: print(x)
+exec               -> a new Python each time -> "name 'x' is not defined"
+code interpreter   -> the same Python stays open -> 5
+```
+
+This is what AI agents use to analyze data step by step: load a file once, then ask questions about it in later runs.
+
+<Aside title="What you need">
+SDK 0.8.4 or newer, and a sandbox whose image has the language's interpreter (`python3` for Python, `node` for JavaScript, and so on). See [Languages](#languages) and [Which sandboxes can run it](#which-sandboxes-can-run-it).
+</Aside>
+
+## Run code
+
+`runCode` sends code to the sandbox and waits until it finishes. Without a context, the code runs in the sandbox's default Python context, so a second run sees what the first one made.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.runCode("x = 5");
+    const execution = await sandbox.runCode("print(x)");
+    console.log(execution.logs.stdout); // [ '5\n' ]
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.run_code("x = 5")
+    execution = sandbox.run_code("print(x)")
+    print(execution.logs.stdout)  # ['5\n']
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := sandbox.RunCode(ctx, "x = 5", sdktypes.RunCodeOptions{}); err != nil {
+        log.Fatal(err)
+    }
+    execution, err := sandbox.RunCode(ctx, "print(x)", sdktypes.RunCodeOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(execution.Logs.Stdout) // [5\n]
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::RunCodeOptions;
+
+    sandbox.run_code("x = 5", RunCodeOptions::default())?;
+    let execution = sandbox.run_code("print(x)", RunCodeOptions::default())?;
+    println!("{:?}", execution.logs.stdout); // ["5\n"]
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.runCode("x = 5");
+    Execution execution = sandbox.runCode("print(x)");
+    System.out.println(execution.logs.stdout); // [5\n]
+    ```
+  </TabItem>
+</Tabs>
+
+When the last line of your code is a value, like `x * 2`, that value comes back as the run's main result. Its text is in `execution.text`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const execution = await sandbox.runCode("x * 2");
+    console.log(execution.text); // 10
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    execution = sandbox.run_code("x * 2")
+    print(execution.text)  # 10
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    execution, err := sandbox.RunCode(ctx, "x * 2", sdktypes.RunCodeOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(execution.Text()) // 10
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let execution = sandbox.run_code("x * 2", RunCodeOptions::default())?;
+    println!("{:?}", execution.text()); // Some("10")
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Execution execution = sandbox.runCode("x * 2");
+    System.out.println(execution.getText()); // 10
+    ```
+  </TabItem>
+</Tabs>
+
+## What you get back
+
+A run returns an execution with these parts:
+
+| Field | What it holds |
+|---|---|
+| `logs.stdout`, `logs.stderr` | Everything the code printed, in the pieces it arrived in. Output from programs the code starts (like `os.system("ls")`) is included. |
+| `results` | Rich results: the value of the last line, plus any charts or tables the code showed. See [Charts and tables](#charts-and-tables). |
+| `text` | The main result's text, if there is a main result. |
+| `error` | The exception your code raised, with its `name`, `value` (the message) and `traceback`. Empty when the code worked. |
+| `executionCount` | The run's number in this context: 1 for the first run, 2 for the next, and so on. |
+| `interrupted` | True when an [interrupt](#stop-code-that-runs-too-long) stopped the code. |
+
+Python and Rust spell the names in snake case (`execution_count`), Go starts them with a capital letter (`ExecutionCount`), and the text is a method in Go, Rust and Java (`Text()`, `text()`, `getText()`).
+
+An exception in your code is not an SDK error. The call still returns, and the exception is in `error`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const execution = await sandbox.runCode("1 / 0");
+    console.log(execution.error?.name);  // ZeroDivisionError
+    console.log(execution.error?.value); // division by zero
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    execution = sandbox.run_code("1 / 0")
+    print(execution.error.name)   # ZeroDivisionError
+    print(execution.error.value)  # division by zero
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    execution, err := sandbox.RunCode(ctx, "1 / 0", sdktypes.RunCodeOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(execution.Error.Name)  // ZeroDivisionError
+    fmt.Println(execution.Error.Value) // division by zero
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let execution = sandbox.run_code("1 / 0", RunCodeOptions::default())?;
+    if let Some(error) = &execution.error {
+        println!("{}", error.name);  // ZeroDivisionError
+        println!("{}", error.value); // division by zero
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Execution execution = sandbox.runCode("1 / 0");
+    System.out.println(execution.error.name);  // ZeroDivisionError
+    System.out.println(execution.error.value); // division by zero
+    ```
+  </TabItem>
+</Tabs>
+
+## Watch output while it runs
+
+Pass callbacks to see output as the code prints it, instead of waiting for the end. `onResult` gets each rich result, and `onError` gets the exception if the code raises one.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const code = `
+    import time
+    for i in range(3):
+        print(i)
+        time.sleep(1)
+    `;
+    await sandbox.runCode(code, {
+      onStdout: (text) => process.stdout.write(text),
+      onStderr: (text) => process.stderr.write(text),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    code = """
+    import time
+    for i in range(3):
+        print(i)
+        time.sleep(1)
+    """
+    sandbox.run_code(
+        code,
+        on_stdout=lambda text: print(text, end=""),
+        on_stderr=lambda text: print(text, end="", file=sys.stderr),
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    code := "import time\nfor i in range(3):\n    print(i)\n    time.sleep(1)\n"
+    _, err := sandbox.RunCode(ctx, code, sdktypes.RunCodeOptions{
+        OnStdout: func(text string) { fmt.Print(text) },
+        OnStderr: func(text string) { fmt.Fprint(os.Stderr, text) },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::sync::Arc;
+
+    let code = "import time\nfor i in range(3):\n    print(i)\n    time.sleep(1)\n";
+    sandbox.run_code(code, RunCodeOptions {
+        on_stdout: Some(Arc::new(|text| print!("{}", text))),
+        on_stderr: Some(Arc::new(|text| eprint!("{}", text))),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String code = "import time\nfor i in range(3):\n    print(i)\n    time.sleep(1)\n";
+    sandbox.runCode(code, new RunCodeOptions()
+        .setOnStdout(text -> System.out.print(text))
+        .setOnStderr(text -> System.err.print(text)));
+    ```
+  </TabItem>
+</Tabs>
+
+In TypeScript and async Python, the callbacks run on the event loop. In the other SDKs they run on a background thread. Keep them short: the next piece of output waits until your callback returns.
+
+## Charts and tables
+
+When your code shows a chart or a table, it comes back as a rich result. Each result has one or more formats, and `formats()` lists which ones it has:
+
+| Format | What it is |
+|---|---|
+| `text` | Plain text. |
+| `html` | HTML, for example a table. |
+| `markdown`, `latex` | Markdown or LaTeX text. |
+| `png`, `jpeg` | An image, as base64 text. |
+| `svg` | An SVG image. |
+| `pdf` | A PDF, as base64 text. |
+| `json` | A JSON object. |
+| `javascript` | JavaScript code. |
+| `data` | A table's data: each column name with its values. |
+
+- **Charts.** When your code makes a chart with matplotlib, each figure comes back as a `png` result.
+- **Tables.** When the last line of your code is a pandas DataFrame, it comes back as a main result with `text`, `html` and `data`.
+
+matplotlib and pandas are not required. The interpreter works without them, and turns their charts and tables into results only when your code uses them. Install them in your image, or with `pip install` in the sandbox, if you need them.
+
+This example draws a chart and saves it as `chart.png` on your machine:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { writeFileSync } from "node:fs";
+
+    const execution = await sandbox.runCode(`
+    import matplotlib.pyplot as plt
+    plt.plot([1, 2, 3], [1, 4, 9])
+    plt.show()
+    `);
+    for (const result of execution.results) {
+      console.log(result.formats()); // [ 'text', 'png' ]
+      if (result.png) writeFileSync("chart.png", Buffer.from(result.png, "base64"));
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import base64
+
+    execution = sandbox.run_code("""
+    import matplotlib.pyplot as plt
+    plt.plot([1, 2, 3], [1, 4, 9])
+    plt.show()
+    """)
+    for result in execution.results:
+        print(result.formats())  # ['text', 'png']
+        if result.png:
+            with open("chart.png", "wb") as f:
+                f.write(base64.b64decode(result.png))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    code := "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [1, 4, 9])\nplt.show()\n"
+    execution, err := sandbox.RunCode(ctx, code, sdktypes.RunCodeOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, result := range execution.Results {
+        fmt.Println(result.Formats()) // [text png]
+        if result.PNG != "" {
+            image, _ := base64.StdEncoding.DecodeString(result.PNG)
+            os.WriteFile("chart.png", image, 0o644)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // Needs the base64 crate in your Cargo.toml.
+    use base64::Engine;
+
+    let code = "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [1, 4, 9])\nplt.show()\n";
+    let execution = sandbox.run_code(code, RunCodeOptions::default())?;
+    for result in &execution.results {
+        println!("{:?}", result.formats()); // ["text", "png"]
+        if let Some(png) = &result.png {
+            let image = base64::engine::general_purpose::STANDARD.decode(png)?;
+            std::fs::write("chart.png", image)?;
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    String code = "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3], [1, 4, 9])\nplt.show()\n";
+    Execution execution = sandbox.runCode(code);
+    for (CodeResult result : execution.results) {
+        System.out.println(result.formats()); // [text, png]
+        if (result.png != null) {
+            Files.write(Path.of("chart.png"), Base64.getDecoder().decode(result.png));
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Use your own contexts
+
+A context is one interpreter process with its own variables. Every sandbox has a default context for each language, made the first time you use it. Make your own when you want separate state: for example, one context per user or per task, so their variables never mix.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const context = await sandbox.createCodeContext({ language: "python", cwd: "/workspace" });
+
+    await sandbox.runCode("import pandas as pd; df = pd.read_csv('sales.csv')", { context });
+    const execution = await sandbox.runCode("len(df)", { context });
+    console.log(execution.text);
+
+    console.log(await sandbox.listCodeContexts());      // your contexts
+    await sandbox.restartCodeContext(context);           // same context, no variables
+    await sandbox.deleteCodeContext(context);            // stop it and forget it
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    context = sandbox.create_code_context(language="python", cwd="/workspace")
+
+    sandbox.run_code("import pandas as pd; df = pd.read_csv('sales.csv')", context=context)
+    execution = sandbox.run_code("len(df)", context=context)
+    print(execution.text)
+
+    print(sandbox.list_code_contexts())       # your contexts
+    sandbox.restart_code_context(context)     # same context, no variables
+    sandbox.delete_code_context(context)      # stop it and forget it
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    codeCtx, err := sandbox.CreateCodeContext(ctx, sdktypes.CodeContextOptions{Language: "python", Cwd: "/workspace"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    opts := sdktypes.RunCodeOptions{ContextID: codeCtx.ID}
+    if _, err := sandbox.RunCode(ctx, "import pandas as pd; df = pd.read_csv('sales.csv')", opts); err != nil {
+        log.Fatal(err)
+    }
+    execution, err := sandbox.RunCode(ctx, "len(df)", opts)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(execution.Text())
+
+    contexts, _ := sandbox.ListCodeContexts(ctx)        // your contexts
+    _, _ = sandbox.RestartCodeContext(ctx, codeCtx.ID) // same context, no variables
+    _ = sandbox.DeleteCodeContext(ctx, codeCtx.ID)     // stop it and forget it
+    fmt.Println(len(contexts))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::CodeContextOptions;
+
+    let context = sandbox.create_code_context(CodeContextOptions {
+        language: Some("python".into()),
+        cwd: Some("/workspace".into()),
+    })?;
+    sandbox.run_code("import pandas as pd; df = pd.read_csv('sales.csv')", RunCodeOptions::in_context(&context))?;
+    let execution = sandbox.run_code("len(df)", RunCodeOptions::in_context(&context))?;
+    println!("{:?}", execution.text());
+
+    println!("{:?}", sandbox.list_code_contexts()?); // your contexts
+    sandbox.restart_code_context(&context.id)?;       // same context, no variables
+    sandbox.delete_code_context(&context.id)?;        // stop it and forget it
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CodeContext context = sandbox.createCodeContext(new CodeContextOptions()
+        .setLanguage("python")
+        .setCwd("/workspace"));
+
+    sandbox.runCode("import pandas as pd; df = pd.read_csv('sales.csv')", new RunCodeOptions().setContext(context));
+    Execution execution = sandbox.runCode("len(df)", new RunCodeOptions().setContext(context));
+    System.out.println(execution.getText());
+
+    System.out.println(sandbox.listCodeContexts());  // your contexts
+    sandbox.restartCodeContext(context.id);          // same context, no variables
+    sandbox.deleteCodeContext(context.id);           // stop it and forget it
+    ```
+  </TabItem>
+</Tabs>
+
+| Call | What it does |
+|---|---|
+| `createCodeContext` | Starts a new context. `language` defaults to `python`; `cwd` is the folder the code runs in. Each call makes a new context, so the SDKs never send it twice. |
+| `listCodeContexts` | Lists the contexts you made. The default contexts are not listed. |
+| `getCodeContext` | Returns one context. An unknown id is an error (HTTP 404). |
+| `restartCodeContext` | Starts the context's interpreter again: same id and folder, no variables. |
+| `deleteCodeContext` | Stops the interpreter and forgets the context. The default context cannot be deleted (HTTP 400). |
+
+A context has an `id`, `language`, `cwd`, `createdAt` and `active`. `active` is false after the interpreter stopped, for example because a run was killed. The next run in that context starts a fresh interpreter, without the old variables.
+
+To run in the default context of another language, pass `language` to `runCode` instead of a context: for example `language: "javascript"`. Set a context or a language, not both.
+
+One context runs one piece of code at a time. If you send more while one runs, they wait in line and run in order. To run code in parallel, use several contexts.
+
+You can also pass environment variables for one run with `envs`. They are set only while that run's code runs.
+
+## Stop code that runs too long
+
+Every run has a time limit. The default is 600 seconds (10 minutes). Set `timeoutSeconds` to change it, or to `0` for no limit.
+
+When the time runs out, the sandbox interrupts the code, like pressing Ctrl-C. If the code has not stopped 2 seconds later, the sandbox kills the interpreter. That context then loses its variables and starts fresh on its next run. The SDK raises a timeout error, and the error holds the output that arrived before the stop.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVMCodeTimeoutError } from "@aerol-ai/aerolvm-sdk";
+
+    try {
+      await sandbox.runCode("import time; time.sleep(60)", { timeoutSeconds: 5 });
+    } catch (err) {
+      if (err instanceof MicroVMCodeTimeoutError) {
+        console.log("too slow; output so far:", err.execution.logs.stdout);
+      } else {
+        throw err;
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVMCodeTimeoutError
+
+    try:
+        sandbox.run_code("import time; time.sleep(60)", timeout_seconds=5)
+    except MicroVMCodeTimeoutError as err:
+        print("too slow; output so far:", err.execution.logs.stdout)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    timeout := 5
+    execution, err := sandbox.RunCode(ctx, "import time; time.sleep(60)", sdktypes.RunCodeOptions{
+        TimeoutSeconds: &timeout,
+    })
+    if errors.Is(err, microvm.ErrCodeRunTimeout) {
+        fmt.Println("too slow; output so far:", execution.Logs.Stdout)
+    } else if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Error;
+
+    let options = RunCodeOptions { timeout_seconds: Some(5), ..Default::default() };
+    match sandbox.run_code("import time; time.sleep(60)", options) {
+        Err(Error::CodeRun(err)) if err.is_timeout() => {
+            println!("too slow; output so far: {:?}", err.execution().logs.stdout);
+        }
+        other => { other?; }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    try {
+        sandbox.runCode("import time; time.sleep(60)", new RunCodeOptions().setTimeoutSeconds(5));
+    } catch (MicroVMCodeTimeoutException err) {
+        System.out.println("too slow; output so far: " + err.getExecution().logs.stdout);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+You can also interrupt a run yourself. The run then returns normally, with `interrupted` set to true, and the context keeps its variables when the code stops cleanly. Closing your connection does **not** stop the code: it keeps running in the sandbox, and the next run in that context waits for it. So interrupt code you no longer want.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Aborting the signal sends the interrupt.
+    const execution = await sandbox.runCode("while True: pass", {
+      signal: AbortSignal.timeout(3_000),
+    });
+    console.log(execution.interrupted); // true
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import time
+
+    # start_code returns at once; interrupt() sends the interrupt.
+    handle = sandbox.start_code("while True: pass")
+    time.sleep(3)
+    handle.interrupt()
+    print(handle.wait().interrupted)  # True
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    // Cancelling ctx sends the interrupt.
+    runCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+    defer cancel()
+    execution, err := sandbox.RunCode(runCtx, "while True: pass", sdktypes.RunCodeOptions{})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(execution.Interrupted) // true
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // start_code returns at once; interrupt() sends the interrupt.
+    let handle = sandbox.start_code("while True: pass", RunCodeOptions::default())?;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    handle.interrupt()?;
+    println!("{}", handle.wait()?.interrupted); // true
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    // startCode returns at once; interrupt() sends the interrupt.
+    CodeRunHandle handle = sandbox.startCode("while True: pass", new RunCodeOptions());
+    Thread.sleep(3_000);
+    handle.interrupt();
+    System.out.println(handle.waitForResult().interrupted); // true
+    ```
+  </TabItem>
+</Tabs>
+
+If the sandbox does not confirm an interrupt within 5 seconds, the SDK gives up waiting and drops the connection: TypeScript rejects with the signal's reason, Go returns `ctx.Err()`. In Python, cancelling an `asyncio` task that awaits `run_code` interrupts the run the same way, and pressing Ctrl-C during a blocking `run_code` interrupts it before the `KeyboardInterrupt` goes on.
+
+## Languages
+
+| Language | Name to pass | The image needs |
+|---|---|---|
+| Python | `python` (the default) | `python3` or `python`. If IPython is installed, it is used, so `%magics` and `!ls` work. |
+| JavaScript | `javascript` (or `js`) | `node`. |
+| TypeScript | `typescript` (or `ts`) | `node` 22.13 or newer. Types are removed before the code runs; they are not checked. |
+| Bash | `bash` | `bash`. |
+| R | `r` | `Rscript`. |
+| Java | `java` | `java` 11 or newer, with the `jdk.jshell` module (a full JDK has it). |
+
+If the image does not have the interpreter, the call fails with an error that names the missing program. Use an image that has it, or install it in the sandbox first.
+
+## Which sandboxes can run it
+
+| Sandbox | Code interpreter |
+|---|---|
+| Docker and containerd | Works. |
+| gVisor | Works. |
+| Firecracker | Works. A Firecracker [template](/firecracker-templates/) built before this release keeps its old sandbox agent: rebuild the template. |
+| WebAssembly | Python only, on the standard `python` module. An interrupt or a timeout stops the whole interpreter, so the context loses its variables. |
+| V8 isolate | Refused (HTTP 501). An isolate has no interpreter process to keep open. |
+
+A sandbox whose agent is older than the code interpreter fails with an "unsupported feature" error that names `code.interpreter`, before anything is sent. Restart the sandbox to get the current agent, or rebuild its Firecracker template.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Contexts in one sandbox | 32 (4 on WebAssembly). One more is refused with HTTP 429 until you delete one. |
+| Runs waiting in line in one context | 128. |
+| Run time | 600 seconds unless you set `timeoutSeconds`. |
+| Idle contexts on WebAssembly | Stopped after 15 minutes without a run. The context stays, and its next run starts a fresh interpreter. |
+
+Contexts live in the sandbox's memory only. Stopping, restarting or moving the sandbox ends them all, the same as on Daytona and E2B.
+
+## Errors
+
+| What you see | Why |
+|---|---|
+| `execution.error` is set | Your code raised an exception. This is not an SDK error. |
+| A timeout error (`MicroVMCodeTimeoutError`, `ErrCodeRunTimeout`) | The run's time limit ran out. The error holds the output so far. |
+| A code run error with `context not found: <id>` | The context was deleted, or the id is wrong. |
+| A code run error with `worker process ended` | The interpreter stopped during the run, for example out of memory. The context starts fresh on its next run. |
+| HTTP 429 | The sandbox has too many contexts. Delete one first. |
+| HTTP 501 | The sandbox's runtime cannot run a code interpreter. See [Which sandboxes can run it](#which-sandboxes-can-run-it). |
+| An "unsupported feature" error naming `code.interpreter` | The sandbox's agent is too old. See above. |
+
+The SDKs send a run once and never retry it, because running code twice could do its work twice.
+
+## From the Daytona and E2B SDKs
+
+The same interpreter serves the other SDKs:
+
+- **Daytona:** `sandbox.codeInterpreter` (`runCode`, `createContext`, `listContexts`, `deleteContext`) works through the Daytona facade. See [Using the Daytona SDK](/using-daytona-sdk/).
+- **E2B:** the E2B Code Interpreter SDK (`@e2b/code-interpreter` and `e2b-code-interpreter`) works through the E2B facade, with charts and tables. See [Using the E2B SDK](/using-e2b-sdk/).
+
+## Next steps
+
+- [Run commands](/exec-streaming/): run a shell command once and read its output.
+- [Files](/file-system/): upload a data file before you analyze it, and download what your code writes.
+- [Terminal sessions](/sessions/): keep a program running after you disconnect.
