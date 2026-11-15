@@ -160,7 +160,7 @@ func TestPythonEndToEnd(t *testing.T) {
 	}
 
 	res = e.run(t, ExecuteRequest{Code: "print('a')\nx * 2", RichOutput: true})
-	if strings.Join(res.types(), ",") != "execution_count,stdout,result,control" || res.frames[2]["text"] != "10" {
+	if strings.Join(res.types(), ",") != "execution_count,stdout,result,control" || res.text("result") != "10" {
 		t.Fatalf("rich run = %v", res.frames)
 	}
 }
