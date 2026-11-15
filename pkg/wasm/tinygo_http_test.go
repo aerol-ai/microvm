@@ -3,68 +3,21 @@ package wasm
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/wasmtestguest"
 )
 
-const wasip1HTTPWasmName = "wasip1-http.wasm"
-
-func wasip1HTTPSourceDir() (string, error) {
-	base, err := filepath.Abs(filepath.Join("testdata", "aerolhttp"))
-	if err != nil {
-		return "", fmt.Errorf("resolve aerolhttp guest source: %w", err)
-	}
-	if st, err := os.Stat(base); err != nil || !st.IsDir() {
-		return "", fmt.Errorf("aerolhttp wasip1 guest source missing at %s", base)
-	}
-	return base, nil
-}
-
+// ensureWasip1HTTPWasm returns the wasip1 HTTP guest, compiled on demand by
+// the shared internal/wasmtestguest helper.
 func ensureWasip1HTTPWasm(t *testing.T) string {
 	t.Helper()
-	// Absolute output: the build runs with cmd.Dir = the guest source dir, so a
-	// relative -o would land next to the source instead of in pkg/wasm/testdata.
-	out, err := filepath.Abs(filepath.Join("testdata", wasip1HTTPWasmName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, err := os.Stat(out); err == nil && st.Size() > 0 {
-		return out
-	}
-	if runtime.GOOS == "windows" {
-		t.Skip("wasip1-http.wasm compile skipped on windows")
-	}
-	src, err := wasip1HTTPSourceDir()
-	if err != nil {
-		t.Skip(err)
-	}
-	// A missing toolchain is an environment limitation, not a defect under
-	// test — same class as Windows above. Checked before the build so the
-	// failure mode is a clear skip rather than a confusing exec error.
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go toolchain unavailable; cannot compile wasip1-http.wasm")
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ".")
-	cmd.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
-	cmd.Dir = src
-	if combined, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("compile wasip1-http.wasm: %v\n%s", err, combined)
-	}
-	return out
+	return wasmtestguest.Path(t, wasmtestguest.HTTP)
 }
 
 func TestTinygoHTTPModuleRequest(t *testing.T) {

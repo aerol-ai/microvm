@@ -37,12 +37,16 @@ type multiInstance struct {
 // cannot share sockets. wasip1 listeners and checkpoint/restore remain out of
 // scope for resident hosts.
 type MultiInstanceEngine struct {
-	mu                sync.Mutex
-	runtime           wazero.Runtime
-	compiled          wazero.CompiledModule
-	memoryMB          int
-	pages             uint32
-	instances         map[string]*multiInstance
+	mu        sync.Mutex
+	runtime   wazero.Runtime
+	compiled  wazero.CompiledModule
+	memoryMB  int
+	pages     uint32
+	instances map[string]*multiInstance
+	// running holds the long-lived Start runs by instance name. They are
+	// kept apart from instances: a run owns its module for its whole life
+	// and ends through Running.Kill, never through StopInstance or Run.
+	running           map[string]*Running
 	lastLoad          LoadTimings
 	netHost           *multiNetHost
 	netHostRegistered bool
@@ -62,6 +66,7 @@ func NewMultiInstanceEngine(ctx context.Context, memoryMB int) (*MultiInstanceEn
 		memoryMB:  memoryMB,
 		pages:     pages,
 		instances: make(map[string]*multiInstance),
+		running:   make(map[string]*Running),
 	}, nil
 }
 
@@ -334,8 +339,18 @@ func (m *MultiInstanceEngine) instanceModule(sandboxID string) api.Module {
 	return inst.mod
 }
 
-// Close tears down every instance, the compiled module, and the runtime.
+// Close tears down every run and instance, the compiled module, and the runtime.
 func (m *MultiInstanceEngine) Close(ctx context.Context) error {
+	m.mu.Lock()
+	runs := make(map[string]*Running, len(m.running))
+	for name, r := range m.running {
+		runs[name] = r
+	}
+	m.mu.Unlock()
+	// Stop the runs while the runtime still exists: a run unwinds through
+	// its own module, which closing the runtime first would pull away.
+	killRunning(runs)
+
 	m.mu.Lock()
 	instances := m.instances
 	m.instances = make(map[string]*multiInstance)

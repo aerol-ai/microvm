@@ -99,10 +99,13 @@ id_ed25519.pub
 .aws/
 credentials.json
 
-# Compiled on first test run from wazero wasip1 stdlib guest (~9MB).
+# Compiled on first test run from the wasip1 Go guests under pkg/wasm/testdata
+# (internal/wasmtestguest), plus that helper's in-flight temp builds.
 pkg/wasm/testdata/wasip1-http.wasm
 pkg/wasm/testdata/fsprobe.wasm
 pkg/wasm/testdata/fsprobe.wasm.*.tmp
+pkg/wasm/testdata/wasip1-stdio.wasm
+pkg/wasm/testdata/.wasip1-*
 ./*.wasm
 ./pkg/wasm/testdata/wasip1-http.wasm
 internal/store/invalid-dsn:::
