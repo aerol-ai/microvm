@@ -302,3 +302,45 @@ func TestRecreateCreateChecksOwnershipBeforeItStarts(t *testing.T) {
 		})
 	}
 }
+
+// The other three create paths (Firecracker, WASM, isolate) check before
+// they start too: with no fresh read and the leader down, each is refused
+// with ErrOwnershipFenced before admission, so no instance starts.
+func TestEveryCreatePathChecksOwnershipBeforeItStarts(t *testing.T) {
+	recreate := &models.Failover{Policy: models.FailoverPolicyRecreate}
+	for _, tc := range []struct {
+		name   string
+		create func(*Service) error
+	}{
+		{"firecracker", func(svc *Service) error {
+			_, err := svc.createFirecrackerSandbox(context.Background(), models.CreateSandboxRequest{
+				Runtime: models.RuntimeFirecracker, Image: "docker://alpine", Failover: recreate}, "sb-fc")
+			return err
+		}},
+		{"wasm", func(svc *Service) error {
+			_, err := svc.createWasmSandbox(context.Background(), models.CreateSandboxRequest{
+				Runtime: models.RuntimeWasm, ModuleRef: "file:///opt/app.wasm", Failover: recreate}, "sb-wasm")
+			return err
+		}},
+		{"isolate", func(svc *Service) error {
+			_, err := svc.createIsolateSandbox(context.Background(), models.CreateSandboxRequest{
+				Runtime: models.RuntimeIsolate, ModuleRef: models.JSBundleRefForNode("bundle-1", "worker-a"), Failover: recreate}, "sb-iso")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &createCountingRuntime{freezeRuntime: newFreezeRuntime()}
+			svc, _, lc := newLeaseService(t, rt)
+			svc.SetFirecrackerRuntime(rt)
+			svc.wasm, svc.isolate = rt, rt
+			svc.beginOwnershipLease(time.Now().Add(-time.Minute))
+			lc.down()
+			if err := tc.create(svc); !errors.Is(err, ErrOwnershipFenced) {
+				t.Fatalf("create = %v, want ErrOwnershipFenced", err)
+			}
+			if rt.creates.Load() != 0 {
+				t.Fatalf("runtime creates = %d, want none", rt.creates.Load())
+			}
+		})
+	}
+}
