@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,7 +332,7 @@ func TestRestartLaunchFailure(t *testing.T) {
 	_ = json.Unmarshal(e.do(http.MethodPost, "/contexts", `{}`).Body.Bytes(), &c)
 	e.l.setFail(errors.New("no memory"))
 	rec := e.do(http.MethodPost, "/contexts/"+c.ID+"/restart", "")
-	if rec.Code != http.StatusInternalServerError || rec.Body.String() != "Failed to restart context "+c.ID+": no memory" {
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != "Failed to restart context "+c.ID+": "+internalErrorText {
 		t.Fatalf("%d %q", rec.Code, rec.Body.String())
 	}
 }
@@ -420,6 +423,73 @@ func TestLaunchFailureAfterHeaders(t *testing.T) {
 	if got := splitLines(t, rec.Body.String()); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("lines = %q", got)
 	}
+}
+
+// Env the interpreter cannot hold is the caller's mistake: 400 text/plain
+// before the stream starts, as for E2B's other request errors. It used to
+// show as a 200 stream that ended in an error line.
+func TestExecuteInvalidEnv(t *testing.T) {
+	e := newTestEnv(t, time.Hour)
+	for _, env := range []string{`{"A=B":"c"}`, `{"":"c"}`, `{"A":"b\u0000c"}`} {
+		rec := e.do(http.MethodPost, "/execute", `{"code":"print x","env_vars":`+env+`}`)
+		if rec.Code != http.StatusBadRequest || !strings.HasPrefix(rec.Body.String(), "invalid environment variable") ||
+			!strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
+			t.Errorf("env %s = %d %q %q", env, rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+		}
+	}
+	if ks := e.l.kernels(); len(ks) != 0 {
+		t.Fatalf("an interpreter started for a refused run: %d", len(ks))
+	}
+}
+
+// Errors the adapter does not know can carry host paths (a WASM module
+// file in sandboxd's state, a driver script). They are logged whole; the
+// client gets a generic message. The known kinds keep theirs.
+func TestUnknownErrorsAreGeneric(t *testing.T) {
+	const secret = "open /var/lib/aerolvm/wasm/modules/python.wasm: permission denied"
+	e := newTestEnv(t, time.Hour)
+	var logs strings.Builder
+	var mu sync.Mutex
+	e.h.logger = slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil))
+	e.do(http.MethodGet, "/health", "") // registers the defaults, kernels not started
+	var c contextResponse
+	_ = json.Unmarshal(e.do(http.MethodPost, "/contexts", `{}`).Body.Bytes(), &c)
+	e.l.setFail(errors.New(secret))
+
+	if rec := e.do(http.MethodPost, "/contexts", `{}`); rec.Code != http.StatusInternalServerError ||
+		rec.Body.String() != "Failed to create context: "+internalErrorText {
+		t.Errorf("create = %d %q", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(http.MethodPost, "/contexts/"+c.ID+"/restart", ""); rec.Code != http.StatusInternalServerError ||
+		rec.Body.String() != "Failed to restart context "+c.ID+": "+internalErrorText {
+		t.Errorf("restart = %d %q", rec.Code, rec.Body.String())
+	}
+	// The python default's kernel starts on its first run, which fails.
+	rec := e.do(http.MethodPost, "/execute", `{"code":"x"}`)
+	want := `{"type":"error","name":"InterpreterError","value":"` + internalErrorText + `","traceback":""}`
+	if lines := splitLines(t, rec.Body.String()); len(lines) != 2 || lines[0] != want {
+		t.Errorf("execute = %q", lines)
+	}
+	mu.Lock()
+	logged := logs.String()
+	mu.Unlock()
+	if n := strings.Count(logged, "/var/lib/aerolvm/wasm/modules/python.wasm"); n != 3 {
+		t.Fatalf("log has the full error %d times, want 3: %q", n, logged)
+	}
+	if strings.Contains(rec.Body.String(), "/var/lib") {
+		t.Fatal("a host path reached the client")
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 func TestNewHandlerDefaults(t *testing.T) {
