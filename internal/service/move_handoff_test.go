@@ -1036,12 +1036,15 @@ type placementCluster struct {
 	state     cluster.PlacementState
 	lifetimes []string
 	err       error
-	reads     int
+	// errFrom, when set, is the first read that fails with err; the reads
+	// before it answer.
+	errFrom int
+	reads   int
 }
 
 func (c *placementCluster) AuthoritativePlacementsByIDs(_ context.Context, ids []string) (map[string]cluster.Placement, error) {
 	c.reads++
-	if c.err != nil {
+	if c.err != nil && c.reads >= c.errFrom {
 		return nil, c.err
 	}
 	inc := "inc-1"
@@ -1339,4 +1342,77 @@ func detachCluster(dst *Service) {
 	dst.clusterMu.Lock()
 	defer dst.clusterMu.Unlock()
 	dst.cluster = nil
+}
+
+// The move-in check's start reads the leader's placement again, under the
+// lifecycle lock (V1). Past the move's time, a failure of that read, or a
+// refusal because the placement changed since the check's own read, is
+// looked at again a retry later, never given up on: giving up would drop a
+// gVisor import's staged checkpoint, or write a stopped row of the old
+// lifetime, over a temporary error. Only the start itself failing gives up.
+func TestMoveInCheckRetriesAStartThatCouldNotCheck(t *testing.T) {
+	ctx := context.Background()
+	here := func(c *moveStubCluster) *moveStubCluster {
+		return &moveStubCluster{Noop: c.Noop, self: "worker-b", owner: "worker-b", srv: c.srv, spec: c.spec}
+	}
+	step := func(svc *Service, id string) error { return svc.checkMovedInOnce(ctx, moveInCheck{id: id}) }
+	t.Run("gVisor: the start's read fails", func(t *testing.T) {
+		dst, dstRT, dstC := importedGvisor(t, true, moveTimings{inFenceTTL: time.Minute})
+		importedAgo(t, dst, "sb-g", 90*time.Second) // the move's time is up
+		dst.AttachCluster(&placementCluster{moveStubCluster: here(dstC), err: errors.New("the leader is changing"), errFrom: 2})
+		if err := step(dst, "sb-g"); err == nil {
+			t.Fatal("the check ended; it must look again")
+		}
+		if _, err := dst.store.GetMovedInRow(ctx, "sb-g"); err != nil {
+			t.Fatalf("the import went: %v", err)
+		}
+		if _, err := dst.store.Get(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("given up: a row was written: %v", err)
+		}
+		if dstRT.dropped != 0 || len(dstRT.createRestored) != 0 {
+			t.Fatalf("the checkpoint was dropped (%d) or used (%v)", dstRT.dropped, dstRT.createRestored)
+		}
+	})
+	t.Run("Firecracker: the start's read fails", func(t *testing.T) {
+		dst, rt, c := importedFirecracker(t, moveTimings{inFenceTTL: time.Millisecond})
+		time.Sleep(10 * time.Millisecond) // the move's time is up
+		dst.AttachCluster(&placementCluster{moveStubCluster: here(c), err: errors.New("the leader is changing"), errFrom: 2})
+		if err := step(dst, "sb-vm"); err == nil {
+			t.Fatal("the check ended; it must look again")
+		}
+		sb, err := dst.store.Get(ctx, "sb-vm")
+		if err != nil || sb.StatusReason != statusReasonMovedIn || rt.startCount != 0 || rt.dropped != 0 {
+			t.Fatalf("given up or touched: %+v %v, starts %d, drops %d", sb, err, rt.startCount, rt.dropped)
+		}
+	})
+	t.Run("Firecracker: the placement changed lifetime after the check's read", func(t *testing.T) {
+		dst, rt, c := importedFirecracker(t, moveTimings{inFenceTTL: time.Millisecond})
+		time.Sleep(10 * time.Millisecond)
+		dst.AttachCluster(&placementCluster{moveStubCluster: here(c), lifetimes: []string{"inc-1", "inc-new"}})
+		if err := step(dst, "sb-vm"); err == nil {
+			t.Fatal("the check ended; it must look again")
+		}
+		if sb, err := dst.store.Get(ctx, "sb-vm"); err != nil || sb.StatusReason != statusReasonMovedIn || rt.startCount != 0 {
+			t.Fatalf("given up or started: %+v %v, starts %d", sb, err, rt.startCount)
+		}
+		// The next look reads the new lifetime itself, and drops the import.
+		if err := step(dst, "sb-vm"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dst.store.Get(ctx, "sb-vm"); !errors.Is(err, store.ErrNotFound) || rt.dropped != 1 {
+			t.Fatalf("the old lifetime's import: row %v, drops %d", err, rt.dropped)
+		}
+	})
+	t.Run("Firecracker: the start itself fails", func(t *testing.T) {
+		dst, rt, c := importedFirecracker(t, moveTimings{inFenceTTL: time.Millisecond})
+		time.Sleep(10 * time.Millisecond)
+		dst.AttachCluster(&placementCluster{moveStubCluster: here(c)})
+		rt.startErr = errors.New("no room for the VM")
+		if err := step(dst, "sb-vm"); err != nil {
+			t.Fatalf("a start that fails past the move's time is given up on: %v", err)
+		}
+		if sb, err := dst.store.Get(ctx, "sb-vm"); err != nil || sb.StatusReason != statusReasonMoveStartFailed {
+			t.Fatalf("given up without its status: %+v %v", sb, err)
+		}
+	})
 }
