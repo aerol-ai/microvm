@@ -92,6 +92,8 @@ type sessionSet struct {
 	sessions map[string]*session
 	used     int64     // log storage allocated, every command
 	retained list.List // finished commands still holding log storage, oldest first
+	// entry are live follows of the entrypoint's output (entrypoint.go).
+	entry map[*entrypointFollow]struct{}
 }
 
 type session struct {
@@ -306,9 +308,14 @@ func (s *sessionSet) close() {
 		}
 	}
 	s.sessions = map[string]*session{}
+	follows := s.entry
+	s.entry = nil
 	s.mu.Unlock()
 	for _, run := range runs {
 		_ = run.Close()
+	}
+	for f := range follows {
+		f.close()
 	}
 }
 

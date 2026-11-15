@@ -87,10 +87,10 @@ func (s sandboxSessions) Input(sessionID, commandID string, data []byte) error {
 	return set.input(sessionID, commandID, data)
 }
 
-func (s sandboxSessions) Entrypoint(context.Context, bool) (toolhost.EntrypointInfo, error) {
-	return toolhost.EntrypointInfo{}, toolhost.ErrEntrypointUnsupported
+func (s sandboxSessions) Entrypoint(ctx context.Context, logs bool) (toolhost.EntrypointInfo, error) {
+	return s.driver.entrypoint(ctx, s.id, logs)
 }
 
-func (s sandboxSessions) FollowEntrypoint(context.Context) (*toolhost.LogFollow, error) {
-	return nil, toolhost.ErrEntrypointUnsupported
+func (s sandboxSessions) FollowEntrypoint(ctx context.Context) (*toolhost.LogFollow, error) {
+	return s.driver.followEntrypoint(ctx, s.id)
 }
