@@ -90,7 +90,7 @@ func TestPythonPlainDriver(t *testing.T) {
 
 	ev := mustRun(t, k, "print('a')\ndisplay(1)\nprint('b')\nx * 2", "ok")
 	want := []string{"count:3", "out:a\n", "result:1:false", "out:b\n", "result:10:true"}
-	if got := ev.trace(); !reflect.DeepEqual(got, want) {
+	if got := merged(ev); !reflect.DeepEqual(got, want) {
 		t.Fatalf("events = %q, want %q", got, want)
 	}
 
@@ -273,6 +273,13 @@ func TestPythonCloseKillsChildren(t *testing.T) {
 }
 
 func isZombie(pid int) bool {
+	// Linux: the state follows the parenthesised command name. Slim images
+	// have no ps.
+	if stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat"); err == nil {
+		if i := strings.LastIndexByte(string(stat), ')'); i >= 0 && i+2 < len(stat) {
+			return stat[i+2] == 'Z'
+		}
+	}
 	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
 	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
