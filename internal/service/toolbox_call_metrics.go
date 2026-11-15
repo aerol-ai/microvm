@@ -17,7 +17,7 @@ import (
 // route class (key2) and status class (key3), so a release that breaks a
 // file, exec, watch or terminal call shows at once, and the 501s show which
 // unsupported features callers try (plans/agent-sandbox-feature-parity.md,
-// O4). Every class set is fixed and small: at most 5 x 8 x 5 series, with no
+// O4). Every class set is fixed and small: at most 5 x 9 x 5 series, with no
 // per-sandbox label.
 var toolboxCallsTotal = expvar.NewMap("aerolvm_toolbox_calls_total")
 
@@ -72,6 +72,10 @@ func toolboxRouteClass(path string) string {
 		return "pty"
 	case path == "/lsp" || strings.HasPrefix(path, "/lsp/"):
 		return "lsp"
+	case strings.HasPrefix(path, "/process/interpreter/") || strings.HasPrefix(path, "/interpreter/"):
+		// The code interpreter: Daytona's protocol and the AerolVM SDKs on
+		// /process/interpreter/, E2B's on /interpreter/e2b/.
+		return "interpreter"
 	}
 	return "other"
 }
