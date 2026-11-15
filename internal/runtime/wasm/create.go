@@ -225,9 +225,13 @@ func preopensFromBinds(workDir string, binds []mounts.ContainerBind) []wasmengin
 		if guest == "" || host == "" {
 			continue
 		}
+		// A read-only mount must stay read-only for a WASM guest too: the
+		// host directory under it is often writable, and only the
+		// container's bind made it read-only.
 		preopens = append(preopens, wasmengine.Preopen{
 			GuestPath: guest,
 			HostPath:  host,
+			ReadOnly:  b.ReadOnly,
 		})
 	}
 	return preopens

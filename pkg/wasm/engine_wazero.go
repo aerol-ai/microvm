@@ -14,6 +14,8 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
+	experimentalsysfs "github.com/tetratelabs/wazero/experimental/sysfs"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/tetratelabs/wazero/sys"
 )
@@ -222,14 +224,11 @@ func (e *wazeroEngine) instantiateLocked(ctx context.Context, caps Capabilities)
 		return fmt.Errorf("stop active module: %w", err)
 	}
 	cfg := e.moduleConfig(caps)
-	if fsCfg := e.fsConfigForCaps(caps); fsCfg != nil {
-		cfg = cfg.WithFSConfig(fsCfg)
-	}
 	instCtx := e.withNetworkContext(ctx, caps)
 	if err := e.ensureWasiCompatHosts(instCtx); err != nil {
 		return err
 	}
-	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
+	mod, err := instantiateWithPreopens(instCtx, e.runtime, e.compiled, cfg, caps)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
@@ -433,14 +432,11 @@ func (e *wazeroEngine) instantiateWithIOLocked(ctx context.Context, caps Capabil
 	if stderr != nil {
 		cfg = cfg.WithStderr(stderr)
 	}
-	if fsCfg := e.fsConfigForCaps(caps); fsCfg != nil {
-		cfg = cfg.WithFSConfig(fsCfg)
-	}
 	instCtx := e.withNetworkContext(ctx, caps)
 	if err := e.ensureWasiCompatHosts(instCtx); err != nil {
 		return err
 	}
-	mod, err := e.runtime.InstantiateModule(instCtx, e.compiled, cfg)
+	mod, err := instantiateWithPreopens(instCtx, e.runtime, e.compiled, cfg, caps)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
@@ -448,31 +444,85 @@ func (e *wazeroEngine) instantiateWithIOLocked(ctx context.Context, caps Capabil
 	return nil
 }
 
-// fsConfigForCaps builds wazero FS mounts. Directory preopens are mounted even
-// when a wasip1 listener is enabled, so an HTTP guest can also read /work. wazero
-// assigns dir fds before TCP listeners (InitFSContext), so the listener lands at
-// fd (3 + len(preopens)) rather than fd 3 — guests learn the right fd from the
-// AEROL_WASM_LISTEN_FD env var injected by moduleConfig (see listenerFD).
-func (e *wazeroEngine) fsConfigForCaps(caps Capabilities) wazero.FSConfig {
-	return fsConfigFor(caps)
-}
-
-// fsConfigFor builds directory preopens for a set of capabilities. Pure function
-// of caps (no engine state); shared with the MultiInstanceEngine.
-func fsConfigFor(caps Capabilities) wazero.FSConfig {
-	preopens := caps.Preopens
-	if len(preopens) == 0 {
-		return nil
+// fsConfigFor builds the directory preopens for a set of capabilities, each
+// mounted through a confinedFS (confined_fs.go) rather than wazero's
+// WithDirMount, whose DirFS lets a guest symlink carry a path out of the
+// directory. Directory preopens are mounted even when a wasip1 listener is
+// enabled, so an HTTP guest can also read /work. wazero assigns dir fds in
+// mount order and before TCP listeners (InitFSContext), so the listener lands
+// at fd (3 + len(preopens)) rather than fd 3 — guests learn the right fd from
+// the AEROL_WASM_LISTEN_FD env var injected by moduleConfigFor (see
+// ListenerFD).
+//
+// The caller closes the returned mounts once the module is gone (see
+// instantiateWithPreopens). Pure function of caps (no engine state); shared
+// with the MultiInstanceEngine.
+func fsConfigFor(caps Capabilities) (wazero.FSConfig, []*confinedFS, error) {
+	if len(caps.Preopens) == 0 {
+		return nil, nil, nil
 	}
-	fsCfg := wazero.NewFSConfig()
-	for _, p := range preopens {
+	cfg := wazero.NewFSConfig()
+	mounts := make([]*confinedFS, 0, len(caps.Preopens))
+	for _, p := range caps.Preopens {
 		guest := p.GuestPath
 		if guest == "" {
 			guest = "/work"
 		}
-		fsCfg = fsCfg.WithDirMount(p.HostPath, guest)
+		// WithSysFSMount is wazero's documented way to mount a custom
+		// sys.FS. It sits on an experimental interface the default FSConfig
+		// implements; if an upgrade drops it, fail rather than fall back to
+		// WithDirMount, which would drop the confinement.
+		sysCfg, ok := cfg.(experimentalsysfs.FSConfig)
+		if !ok {
+			return nil, nil, errors.New("wazero FSConfig cannot mount a confined file system (WithSysFSMount)")
+		}
+		m := newConfinedFS(p.HostPath, p.ReadOnly)
+		mounts = append(mounts, m)
+		cfg = sysCfg.WithSysFSMount(m, guest)
 	}
-	return fsCfg
+	return cfg, mounts, nil
+}
+
+// releaseMounts returns a func that closes mounts' directory handles once,
+// however many times it is called.
+func releaseMounts(mounts []*confinedFS) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for _, m := range mounts {
+				_ = m.Close()
+			}
+		})
+	}
+}
+
+// instantiateWithPreopens instantiates compiled with caps' directory preopens
+// mounted, releasing the mounts when the module closes.
+func instantiateWithPreopens(ctx context.Context, r wazero.Runtime, compiled wazero.CompiledModule, cfg wazero.ModuleConfig, caps Capabilities) (api.Module, error) {
+	fsCfg, mounts, err := fsConfigFor(caps)
+	if err != nil {
+		return nil, err
+	}
+	return instantiateReleasing(ctx, r, compiled, cfg, fsCfg, releaseMounts(mounts))
+}
+
+// instantiateReleasing instantiates compiled with fsCfg and calls release when
+// the module is done with it. Each mount holds a directory handle for the
+// module's lifetime; wazero has no close hook on a sys.FS, so release runs
+// from the module's close notifier, which wazero calls once however the
+// module ends (Close, proc_exit, context cancellation, runtime close). A
+// failed instantiation never gets a module, so it releases here.
+func instantiateReleasing(ctx context.Context, r wazero.Runtime, compiled wazero.CompiledModule, cfg wazero.ModuleConfig, fsCfg wazero.FSConfig, release func()) (api.Module, error) {
+	if fsCfg != nil {
+		cfg = cfg.WithFSConfig(fsCfg)
+		ctx = experimental.WithCloseNotifier(ctx, experimental.CloseNotifyFunc(func(context.Context, uint32) { release() }))
+	}
+	mod, err := r.InstantiateModule(ctx, compiled, cfg)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return mod, nil
 }
 
 func (e *wazeroEngine) callExport(ctx context.Context, name string) (int, error) {
