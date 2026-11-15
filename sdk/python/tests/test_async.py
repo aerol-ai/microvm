@@ -13,12 +13,14 @@ import unittest
 import unittest.mock
 
 from microvm import (
+    AsyncCodeRunHandle,
     AsyncExecStreamHandle,
     AsyncFileWatchHandle,
     AsyncMicroVM,
     AsyncSandbox,
     AsyncSessionAttachHandle,
     AsyncTokens,
+    CodeRunHandle,
     FileWatchHandle,
     MicroVM,
     MicroVMError,
@@ -85,6 +87,7 @@ class AsyncParityTests(unittest.TestCase):
         (client_module.ExecStreamHandle, AsyncExecStreamHandle),
         (client_module.SessionAttachHandle, AsyncSessionAttachHandle),
         (FileWatchHandle, AsyncFileWatchHandle),
+        (CodeRunHandle, AsyncCodeRunHandle),
     ]
 
     def test_public_calls_and_parameters_match(self):

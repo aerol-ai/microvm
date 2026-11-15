@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import datetime
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 if TYPE_CHECKING:
     from .image import Image
@@ -474,6 +474,100 @@ class FileEvent:
 
 
 FileEventCallback = Callable[[FileEvent], None]
+
+
+@dataclass(frozen=True)
+class CodeContext:
+    """A code interpreter context (:meth:`MicroVM.create_code_context`): one
+    interpreter process in the sandbox that keeps its variables, imports and
+    working folder between runs. ``created_at`` is the server's timestamp,
+    as sent. ``active`` is False after the interpreter stopped (a timeout
+    killed it, or it crashed); its next run starts a fresh one, with the
+    state lost."""
+
+    id: str
+    language: str = ""
+    cwd: str = ""
+    created_at: str = ""
+    active: bool = False
+
+
+# The order formats() lists a result's fields in; extra's keys follow.
+_CODE_RESULT_FORMATS = ("text", "html", "markdown", "svg", "png", "jpeg", "pdf", "latex", "json", "javascript", "data")
+
+
+@dataclass(frozen=True)
+class CodeResult:
+    """One rich result of a code run: the value of the last expression, a
+    displayed object, a chart (``png``, base64) or a table (``html`` and
+    ``data``). A field is None when the result has no such format.
+    ``is_main_result`` marks the value of the run's last expression, the one
+    :attr:`Execution.text` reads."""
+
+    text: Optional[str] = None
+    html: Optional[str] = None
+    markdown: Optional[str] = None
+    svg: Optional[str] = None
+    png: Optional[str] = None
+    jpeg: Optional[str] = None
+    pdf: Optional[str] = None
+    latex: Optional[str] = None
+    json: Optional[Any] = None
+    javascript: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    extra: Optional[Dict[str, Any]] = None
+    is_main_result: bool = False
+
+    def formats(self) -> List[str]:
+        """The formats this result has, such as ``["text", "png"]``, then
+        the keys of ``extra``."""
+        present = [name for name in _CODE_RESULT_FORMATS if getattr(self, name) is not None]
+        return present + sorted(self.extra or {})
+
+
+@dataclass(frozen=True)
+class ExecutionError:
+    """The exception the user's code raised. A run that raises still ends
+    normally: this is data on the :class:`Execution`, not an SDK error."""
+
+    name: str = ""
+    value: str = ""
+    traceback: str = ""
+
+
+@dataclass
+class ExecutionLogs:
+    """Everything the run printed, chunk by chunk, as it arrived."""
+
+    stdout: List[str] = field(default_factory=list)
+    stderr: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Execution:
+    """The outcome of :meth:`MicroVM.run_code`. ``execution_count`` is the
+    context's run counter (None when the server sent none). ``interrupted``
+    is True when the run was stopped by an interrupt."""
+
+    results: List[CodeResult] = field(default_factory=list)
+    logs: ExecutionLogs = field(default_factory=ExecutionLogs)
+    error: Optional[ExecutionError] = None
+    execution_count: Optional[int] = None
+    interrupted: bool = False
+
+    @property
+    def text(self) -> Optional[str]:
+        """The text of the main result (the last expression's value), or
+        None when the run had none."""
+        for result in self.results:
+            if result.is_main_result:
+                return result.text
+        return None
+
+
+CodeOutputCallback = Callable[[str], None]
+CodeResultCallback = Callable[[CodeResult], None]
+CodeErrorCallback = Callable[[ExecutionError], None]
 
 
 SessionStatus = Literal["running", "exited", "killed", "failed"]

@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
-from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, InvalidStateError, TimeoutError as FutureTimeoutError, wait as futures_wait
 from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -36,6 +36,11 @@ from .types import (
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
+    CodeContext,
+    CodeErrorCallback,
+    CodeOutputCallback,
+    CodeResult,
+    CodeResultCallback,
     CreateOptions,
     CreateSessionOptions,
     CreateTemplateOptions,
@@ -47,6 +52,8 @@ from .types import (
     ExecRequest,
     ExecResult,
     ExecStreamOptions,
+    Execution,
+    ExecutionError,
     ExposeProtocol,
     FileEvent,
     FileEventCallback,
@@ -143,6 +150,22 @@ _FEATURE_FILE_VERBS = "files.verbs"
 _FEATURE_WRITE_OPTIONS = "files.write_options"
 # The toolboxd feature behind upload's extract=true (upload_dir).
 _FEATURE_EXTRACT = "files.extract"
+# The toolboxd feature (on /version) behind the code interpreter routes. An
+# older agent answers them 501, and an old Firecracker template keeps its
+# old agent, so every interpreter call checks first.
+_FEATURE_CODE_INTERPRETER = "code.interpreter"
+# How long a cancelled code run waits for the server to confirm the
+# interrupt before it drops the connection. Longer than the server's own
+# 2 s grace between the interrupt and the kill, so a run that ignores the
+# interrupt still reports how it ended.
+_INTERRUPT_GRACE_SECONDS = 5.0
+# WebSocket close codes a code run ends with: 1000 (or a close frame with no
+# code, reported as 1005) is a finished run, 4008 is the server's run
+# timeout, 1006 is a connection lost without a close frame.
+_CLOSE_NORMAL = 1000
+_CLOSE_NO_STATUS = 1005
+_CLOSE_ABNORMAL = 1006
+_CLOSE_RUN_TIMEOUT = 4008
 # A safety cap on the pages one list reads (enough for 100k sandboxes at a
 # page size of 1), so a server that never ends a list cannot loop forever.
 _MAX_LIST_PAGES = 100000
@@ -331,6 +354,35 @@ class MicroVMFileTooLargeError(MicroVMError):
         self.path = path
         self.max_bytes = max_bytes
         super().__init__(f"{path} is larger than max_bytes ({max_bytes} bytes)")
+
+
+class MicroVMCodeRunError(MicroVMError):
+    """A code run (:meth:`MicroVM.run_code`) ended without finishing: the
+    connection closed with ``close_code`` (1008 for a bad request or an
+    unknown context, 1011 or 1001 when the interpreter failed, 1006 when the
+    connection was lost) and ``reason``. ``execution`` holds what the run
+    produced before that. An exception raised by the user's code is not
+    this error: it is :attr:`Execution.error`."""
+
+    def __init__(self, close_code: int, reason: str, execution: Execution, message: Optional[str] = None) -> None:
+        self.close_code = close_code
+        self.reason = reason
+        self.execution = execution
+        if message is None:
+            message = f"code run failed (close {close_code})" + (f": {reason}" if reason else "")
+        super().__init__(message)
+
+
+class MicroVMCodeTimeoutError(MicroVMCodeRunError, TimeoutError):
+    """The run went past its ``timeout_seconds`` and the server stopped it
+    (close code 4008). The context's interpreter was restarted, so its
+    variables are gone. ``execution`` holds the output from before the
+    timeout."""
+
+    def __init__(self, reason: str, execution: Execution) -> None:
+        super().__init__(
+            _CLOSE_RUN_TIMEOUT, reason, execution, "code run timed out" + (f": {reason}" if reason else "")
+        )
 
 
 class MicroVMHTTPError(MicroVMError):
@@ -729,6 +781,237 @@ class FileWatchHandle:
                 pass
 
 
+class CodeRunHandle:
+    """A running code run (:meth:`MicroVM.start_code`).
+
+    The callbacks run on a background thread, in the order the output
+    arrived. ``wait()`` returns the :class:`Execution` once the server ends
+    the run. A client disconnect does not stop a run in the sandbox;
+    ``interrupt()`` does (the run then ends with ``interrupted`` True).
+    ``close()`` drops the connection without stopping the run, and
+    ``wait()`` then raises :class:`MicroVMCodeRunError`.
+    """
+
+    def __init__(self, ws: Any, start: str, callbacks: Dict[str, Any]) -> None:
+        self._ws = ws
+        self._callbacks = callbacks
+        self._execution = Execution()
+        self._done: Future[Execution] = Future()
+        self._dropped = threading.Event()
+        # The start message goes out before anything else can be sent, so
+        # an interrupt() right after start_code returns never arrives first.
+        try:
+            ws.send(start)
+        except Exception as exc:
+            _close_quietly(ws)
+            raise MicroVMError(f"code run: sending the code failed: {exc}") from exc
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    @property
+    def done(self) -> Future[Execution]:
+        return self._done
+
+    def interrupt(self) -> None:
+        """Asks the server to stop the run, as Ctrl-C would. The run then
+        ends with ``interrupted`` True; the context keeps its state."""
+        self._ws.send(json.dumps({"type": "interrupt"}))
+
+    def close(self) -> None:
+        """Drops the connection. The run keeps going in the sandbox; use
+        ``interrupt()`` to stop it. Safe to call more than once."""
+        self._dropped.set()
+        abort = getattr(self._ws, "abort", None)
+        try:
+            # abort wakes the reader without the close handshake, which would
+            # race the reader for the socket's frames.
+            if callable(abort):
+                abort()
+            else:
+                self._ws.close()
+        except Exception:
+            pass
+
+    def wait(self, timeout: Optional[float] = None) -> Execution:
+        # Not Future.result(timeout): MicroVMCodeTimeoutError is a
+        # TimeoutError too, and must not read as the wait timing out.
+        futures_wait([self._done], timeout)
+        if not self._done.done():
+            raise TimeoutError("timed out waiting for the code run to end")
+        return self._done.result()
+
+    def _cancel(self) -> None:
+        """Interrupts the run, gives the server the grace to confirm it,
+        then drops the connection if it has not."""
+        try:
+            self.interrupt()
+        except Exception:
+            pass
+        futures_wait([self._done], _INTERRUPT_GRACE_SECONDS)
+        if not self._done.done():
+            self.close()
+
+    def _finish(self, error: Optional[BaseException]) -> None:
+        try:
+            if error is None:
+                self._done.set_result(self._execution)
+            else:
+                self._done.set_exception(error)
+        except InvalidStateError:
+            pass
+
+    def _call(self, name: str, arg: Any) -> None:
+        callback = self._callbacks.get(name)
+        if callback is not None:
+            callback(arg)
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    opcode, data = self._ws.recv_data()
+                except Exception as exc:
+                    reason = "the client closed the connection before the run ended" if self._dropped.is_set() else f"connection lost: {exc}"
+                    self._finish(MicroVMCodeRunError(_CLOSE_ABNORMAL, reason, self._execution))
+                    return
+                if opcode == _OPCODE_CLOSE:
+                    code, reason = _parse_close_frame(data)
+                    self._finish(_code_run_outcome(code, reason, self._execution))
+                    return
+                if opcode != _OPCODE_TEXT:
+                    # The server sends text frames only.
+                    continue
+                self._handle_frame(data.decode("utf-8", errors="replace") if isinstance(data, (bytes, bytearray)) else str(data))
+        except Exception as exc:
+            # A callback raised: the wait ends with its error. The run keeps
+            # going in the sandbox.
+            self._finish(exc)
+        finally:
+            _close_quietly(self._ws)
+            shutdown = getattr(self._ws, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    pass
+
+    def _handle_frame(self, payload: str) -> None:
+        try:
+            frame = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(frame, dict):
+            return
+        kind = frame.get("type")
+        execution = self._execution
+        if kind == "stdout" or kind == "stderr":
+            text = _str_or_empty(frame.get("text"))
+            (execution.logs.stdout if kind == "stdout" else execution.logs.stderr).append(text)
+            self._call("on_" + kind, text)
+        elif kind == "result":
+            result = _from_api_code_result(frame)
+            execution.results.append(result)
+            self._call("on_result", result)
+        elif kind == "execution_count":
+            count = frame.get("count")
+            if isinstance(count, int) and not isinstance(count, bool):
+                execution.execution_count = count
+        elif kind == "error":
+            error = ExecutionError(
+                name=_str_or_empty(frame.get("name")),
+                value=_str_or_empty(frame.get("value")),
+                traceback=_str_or_empty(frame.get("traceback")),
+            )
+            execution.error = error
+            self._call("on_error", error)
+        elif kind == "control":
+            if frame.get("text") == "interrupted":
+                execution.interrupted = True
+        # Unknown types are ignored: a newer server may add some. A control
+        # frame does not end the read: the close frame says how the run ended.
+
+
+def _wait_code_run(handle: CodeRunHandle) -> Execution:
+    """run_code's wait: Ctrl-C interrupts the run in the sandbox too, since
+    dropping the connection alone would leave it running there."""
+    try:
+        return handle.wait()
+    except KeyboardInterrupt:
+        handle._cancel()
+        raise
+
+
+_OPCODE_TEXT = 0x1
+_OPCODE_CLOSE = 0x8
+
+
+def _parse_close_frame(data: Any) -> Tuple[int, str]:
+    """The close code and reason in a close frame's payload; an empty
+    payload is "no status" (1005), as RFC 6455 reports it."""
+    raw = bytes(data or b"")
+    if len(raw) < 2:
+        return _CLOSE_NO_STATUS, ""
+    return int.from_bytes(raw[:2], "big"), raw[2:].decode("utf-8", errors="replace")
+
+
+def _code_run_outcome(code: int, reason: str, execution: Execution) -> Optional[BaseException]:
+    if code in (_CLOSE_NORMAL, _CLOSE_NO_STATUS):
+        return None
+    if code == _CLOSE_RUN_TIMEOUT:
+        return MicroVMCodeTimeoutError(reason, execution)
+    return MicroVMCodeRunError(code, reason, execution)
+
+
+def _str_or_empty(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _from_api_code_result(frame: Dict[str, Any]) -> CodeResult:
+    # Result frames always carry "text", empty when the result has no plain
+    # text, so an empty string means the format is absent.
+    def text(name: str) -> Optional[str]:
+        value = frame.get(name)
+        return value if isinstance(value, str) and value != "" else None
+
+    def obj(name: str) -> Optional[Dict[str, Any]]:
+        value = frame.get(name)
+        return value if isinstance(value, dict) else None
+
+    return CodeResult(
+        text=text("text"),
+        html=text("html"),
+        markdown=text("markdown"),
+        svg=text("svg"),
+        png=text("png"),
+        jpeg=text("jpeg"),
+        pdf=text("pdf"),
+        latex=text("latex"),
+        json=frame.get("json"),
+        javascript=text("javascript"),
+        data=obj("data"),
+        extra=obj("extra"),
+        is_main_result=frame.get("is_main_result") is True,
+    )
+
+
+def _from_api_code_context(payload: Any) -> CodeContext:
+    data = payload if isinstance(payload, dict) else {}
+    return CodeContext(
+        id=_str_or_empty(data.get("id")),
+        language=_str_or_empty(data.get("language")),
+        cwd=_str_or_empty(data.get("cwd")),
+        created_at=_str_or_empty(data.get("createdAt")),
+        active=data.get("active") is True,
+    )
+
+
+def _code_context_id(context: Union[str, CodeContext]) -> str:
+    context_id = context.id if isinstance(context, CodeContext) else context
+    if not isinstance(context_id, str) or context_id == "":
+        raise MicroVMError("a code context (or its id) is required")
+    return context_id
+
+
 class _SandboxBase:
     """The state Sandbox and AsyncSandbox share: the server's record of the
     sandbox, read as attributes, and the delete-on-exit flag."""
@@ -877,6 +1160,85 @@ class Sandbox(_SandboxBase):
     @_timed
     def attach_session(self, session_id: str, options: Optional[SessionAttachOptions] = None, *, timeout: Optional[float] = None) -> SessionAttachHandle:
         return self._client.attach_session(self.id, session_id, options)
+
+    @_timed
+    def create_code_context(self, *, language: Optional[str] = None, cwd: Optional[str] = None, timeout: Optional[float] = None) -> CodeContext:
+        """Start a code interpreter context; see :meth:`MicroVM.create_code_context`."""
+        return self._client.create_code_context(self.id, language=language, cwd=cwd)
+
+    @_timed
+    def list_code_contexts(self, *, timeout: Optional[float] = None) -> List[CodeContext]:
+        return self._client.list_code_contexts(self.id)
+
+    @_timed
+    def get_code_context(self, context_id: str, *, timeout: Optional[float] = None) -> CodeContext:
+        return self._client.get_code_context(self.id, context_id)
+
+    @_timed
+    def delete_code_context(self, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> None:
+        self._client.delete_code_context(self.id, context)
+
+    @_timed
+    def restart_code_context(self, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> CodeContext:
+        return self._client.restart_code_context(self.id, context)
+
+    def start_code(
+        self,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> CodeRunHandle:
+        """Start a code run and return its handle; see :meth:`MicroVM.start_code`."""
+        return self._client.start_code(
+            self.id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
+
+    def run_code(
+        self,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> Execution:
+        """Run code in this sandbox's code interpreter; see :meth:`MicroVM.run_code`."""
+        return self._client.run_code(
+            self.id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
 
     @_timed
     def upload_file(
@@ -1866,6 +2228,81 @@ class _MicroVMCore:
         ))
         return self._exec_stream_handle(websocket_module, ws, options)
 
+    def _interpreter_path(self, sandbox_id: str, suffix: str = "") -> str:
+        return f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/interpreter{suffix}"
+
+    def _code_context_path(self, sandbox_id: str, context: Union[str, CodeContext], suffix: str = "") -> str:
+        return self._interpreter_path(sandbox_id, f"/context/{urllib.parse.quote(_code_context_id(context), safe='')}{suffix}")
+
+    def _op_create_code_context(self, sandbox_id: str, language: Optional[str] = None, cwd: Optional[str] = None):
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+        body: Dict[str, Any] = {}
+        if language:
+            body["language"] = language
+        if cwd:
+            body["cwd"] = cwd
+        # Not idempotent: each create starts a new interpreter, so a re-sent
+        # create would leave a second one running.
+        payload = (yield _io("_do_json", "POST", self._interpreter_path(sandbox_id, "/context"), body, idempotent=False))
+        return _from_api_code_context(payload)
+
+    def _op_list_code_contexts(self, sandbox_id: str):
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+        payload = (yield _io("_do_json", "GET", self._interpreter_path(sandbox_id, "/context"), None))
+        contexts = payload.get("contexts") if isinstance(payload, dict) else None
+        return [_from_api_code_context(item) for item in contexts] if isinstance(contexts, list) else []
+
+    def _op_get_code_context(self, sandbox_id: str, context: Union[str, CodeContext]):
+        path = self._code_context_path(sandbox_id, context)
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+        return _from_api_code_context((yield _io("_do_json", "GET", path, None)))
+
+    def _op_delete_code_context(self, sandbox_id: str, context: Union[str, CodeContext]):
+        path = self._code_context_path(sandbox_id, context)
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+        yield _io("_do_json", "DELETE", path, None)
+
+    def _op_restart_code_context(self, sandbox_id: str, context: Union[str, CodeContext]):
+        path = self._code_context_path(sandbox_id, context, "/restart")
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+        # Not retried: a restart wipes the context's state, and a re-sent one
+        # could wipe what a run made after the first.
+        return _from_api_code_context((yield _io("_do_json", "POST", path, None, idempotent=False)))
+
+    def _op_start_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        callbacks: Optional[Dict[str, Any]] = None,
+    ):
+        start: Dict[str, Any] = {"code": code}
+        if context is not None:
+            if language:
+                raise MicroVMError("set context or language, not both")
+            start["contextId"] = _code_context_id(context)
+        elif language:
+            start["language"] = language
+        if envs:
+            start["envs"] = dict(envs)
+        if timeout_seconds is not None:
+            # 0 is sent: it means no timeout. Unset leaves the server's
+            # default (600 s).
+            start["timeout"] = int(timeout_seconds)
+        start["richOutput"] = True
+        yield from self._op_require_toolbox_features(sandbox_id, _FEATURE_CODE_INTERPRETER)
+
+        websocket_module = _load_websocket_module()
+        ws_url = _to_websocket_url(self._cell_base(sandbox_id), self._interpreter_path(sandbox_id, "/execute"))
+        # Only the connect runs on the worker thread. The code goes out once
+        # the caller holds the handle, so a caller cancelled while connecting
+        # never leaves a run going in the sandbox that nobody can interrupt.
+        ws = (yield _io("_blocking", _open_code_run, websocket_module, ws_url, self._websocket_headers(), self._ssl_context))
+        return self._code_run_handle(ws, json.dumps(start), callbacks or {})
+
     def _op_create_session(self, sandbox_id: str, options: CreateSessionOptions):
         session = (yield _io("_do_json", "POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/sessions", _to_api_create_session_options(options)))
         return _from_api_session(session)
@@ -2621,6 +3058,9 @@ class MicroVM(_MicroVMCore):
     def _file_watch_handle(self, ws: Any, on_event: FileEventCallback) -> FileWatchHandle:
         return FileWatchHandle(ws, on_event)
 
+    def _code_run_handle(self, ws: Any, start: str, callbacks: Dict[str, Any]) -> CodeRunHandle:
+        return CodeRunHandle(ws, start, callbacks)
+
     @_timed
     def create(self, options: Optional[CreateOptions] = None, *, timeout: Optional[float] = None, **fields: Any) -> Sandbox:
         return self._run(self._op_create(options, **fields))
@@ -3034,6 +3474,118 @@ class MicroVM(_MicroVMCore):
         timeout: Optional[float] = None,
     ) -> SessionAttachHandle:
         return self._run(self._op_attach_session(sandbox_id, session_id, options))
+
+    @_timed
+    def create_code_context(
+        self, sandbox_id: str, *, language: Optional[str] = None, cwd: Optional[str] = None, timeout: Optional[float] = None
+    ) -> CodeContext:
+        """Start a code interpreter context: an interpreter process in the
+        sandbox that keeps its variables between :meth:`run_code` calls.
+        ``language`` is ``python`` (the default), ``javascript``,
+        ``typescript``, ``bash``, ``r`` or ``java``; the sandbox's image needs
+        that interpreter. ``cwd`` is the folder the code runs in.
+
+        Needs a sandbox whose agent lists ``code.interpreter`` on /version;
+        an older one raises :class:`MicroVMUnsupportedFeatureError` before
+        anything is sent. Never retried once sent: each call starts a new
+        interpreter. Too many contexts at once is an HTTP 429."""
+        return self._run(self._op_create_code_context(sandbox_id, language, cwd))
+
+    @_timed
+    def list_code_contexts(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[CodeContext]:
+        """The sandbox's code interpreter contexts. The default context a
+        run without one uses is not listed."""
+        return self._run(self._op_list_code_contexts(sandbox_id))
+
+    @_timed
+    def get_code_context(self, sandbox_id: str, context_id: str, *, timeout: Optional[float] = None) -> CodeContext:
+        """One code interpreter context; :class:`MicroVMNotFoundError` when
+        there is no such context."""
+        return self._run(self._op_get_code_context(sandbox_id, context_id))
+
+    @_timed
+    def delete_code_context(self, sandbox_id: str, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> None:
+        """Stop a context's interpreter and forget the context. An unknown
+        context raises :class:`MicroVMNotFoundError`."""
+        return self._run(self._op_delete_code_context(sandbox_id, context))
+
+    @_timed
+    def restart_code_context(self, sandbox_id: str, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> CodeContext:
+        """Start the context's interpreter again: same id and folder, with
+        every variable gone. Never retried once sent."""
+        return self._run(self._op_restart_code_context(sandbox_id, context))
+
+    @_timed
+    def start_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> CodeRunHandle:
+        """Start a code run and return its handle at once; see
+        :meth:`run_code` for the arguments. ``handle.interrupt()`` stops the
+        run, ``handle.wait()`` returns its :class:`Execution`."""
+        callbacks = {"on_stdout": on_stdout, "on_stderr": on_stderr, "on_result": on_result, "on_error": on_error}
+        return self._run(self._op_start_code(sandbox_id, code, context, language, envs, timeout_seconds, callbacks))
+
+    def run_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> Execution:
+        """Run code in the sandbox's code interpreter and return the
+        :class:`Execution` once it ends. Variables stay in the context for
+        the next run.
+
+        ``context`` (a :class:`CodeContext` or its id) picks the context;
+        without one the code runs in the default context of ``language``
+        (python when unset). Set one or the other, not both. ``envs`` are
+        set for this run only. ``timeout_seconds`` stops the run on the
+        server (default 600, 0 for none) and raises
+        :class:`MicroVMCodeTimeoutError`. The callbacks get output as it
+        arrives, on a background thread. ``timeout`` bounds opening the run,
+        not the run itself.
+
+        An exception in the code is :attr:`Execution.error`, not an SDK
+        error; a run the server could not finish raises
+        :class:`MicroVMCodeRunError`. Needs a sandbox whose agent lists
+        ``code.interpreter`` (else :class:`MicroVMUnsupportedFeatureError`).
+        Never retried. A dropped connection does not stop the run in the
+        sandbox; Ctrl-C (or, on :class:`AsyncMicroVM`, cancelling the task)
+        interrupts it there too."""
+        handle = self.start_code(
+            sandbox_id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
+        return _wait_code_run(handle)
 
     def _require_toolbox_features(self, sandbox_id: str, *features: str) -> None:
         """Fail closed unless the sandbox's agent lists every feature.
@@ -3527,6 +4079,12 @@ def _open_exec_stream(websocket_module: Any, ws_url: str, headers: List[str], ss
     ws = _connect_websocket(websocket_module, ws_url, headers, "exec stream", ssl_context)
     ws.send(start)
     return ws
+
+
+def _open_code_run(websocket_module: Any, ws_url: str, headers: List[str], ssl_context: Any) -> Any:
+    """Opens a code run's socket. Blocking, like _open_exec_stream; the code
+    itself is sent by CodeRunHandle."""
+    return _connect_websocket(websocket_module, ws_url, headers, "code run", ssl_context)
 
 
 def _open_session_attach(websocket_module: Any, ws_url: str, headers: List[str], ssl_context: Any, resize: Optional[str]) -> Any:

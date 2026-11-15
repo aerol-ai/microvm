@@ -1474,6 +1474,125 @@ export interface FileWatchHandle {
   wait(): Promise<void>;
 }
 
+/**
+ * A code interpreter context: one interpreter process in the sandbox that
+ * keeps its variables, imports and working folder between runs.
+ */
+export interface CodeContext {
+  id: string;
+  /** `python`, `javascript`, `typescript`, `bash`, `r` or `java`. */
+  language: string;
+  /** The folder the context's code runs in. */
+  cwd: string;
+  /** When the context was made, as the server sent it (RFC 3339). */
+  createdAt: string;
+  /**
+   * False after the interpreter stopped (a run timed out and was killed, or
+   * the process died). The next run starts a fresh interpreter in the same
+   * context, without the old variables.
+   */
+  active: boolean;
+}
+
+export interface CreateCodeContextOptions {
+  /** Defaults to `python`. The sandbox's image must have the language's interpreter. */
+  language?: string;
+  /** The folder the context's code runs in. Defaults to the sandbox's working folder. */
+  cwd?: string;
+}
+
+/**
+ * One rich output of a run: the value of the last line, or something the code
+ * displayed (a matplotlib chart as `png`, a pandas table as `html` and
+ * `data`). Each field is set only when the output has that format.
+ */
+export interface CodeResult {
+  text?: string;
+  html?: string;
+  markdown?: string;
+  svg?: string;
+  /** Base64-encoded PNG image. */
+  png?: string;
+  /** Base64-encoded JPEG image. */
+  jpeg?: string;
+  pdf?: string;
+  latex?: string;
+  json?: unknown;
+  javascript?: string;
+  /** A table's data (a pandas DataFrame as column name to values). */
+  data?: Record<string, unknown>;
+  /** Formats the fields above do not name, by MIME type. */
+  extra?: Record<string, unknown>;
+  /** True for the value of the run's last line (what a notebook shows as the cell's output). */
+  isMainResult: boolean;
+  /** The formats this result has: `text`, `html`, ..., then the keys of `extra`. */
+  formats(): string[];
+}
+
+/** The exception the code raised. */
+export interface ExecutionError {
+  /** The exception's type, such as `ZeroDivisionError`. */
+  name: string;
+  /** The exception's message. */
+  value: string;
+  traceback: string;
+}
+
+export interface ExecutionLogs {
+  /** Standard output, in the chunks it arrived in. */
+  stdout: string[];
+  /** Standard error, in the chunks it arrived in. */
+  stderr: string[];
+}
+
+/** Everything one `runCode` produced. */
+export interface Execution {
+  results: CodeResult[];
+  logs: ExecutionLogs;
+  /** Set when the code raised an exception. The run itself still ended normally. */
+  error?: ExecutionError;
+  /** The interpreter's run counter (1 for the context's first run). */
+  executionCount?: number;
+  /** True when an interrupt stopped the code. */
+  interrupted: boolean;
+  /** The main result's text, if the run had a main result. */
+  readonly text: string | undefined;
+}
+
+export interface RunCodeOptions {
+  /**
+   * The context to run in (a {@link CodeContext} or its id). Without one the
+   * code runs in the sandbox's default context for `language`.
+   */
+  context?: CodeContext | string;
+  /**
+   * Run in this language's default context (default `python`). Set
+   * `context` or `language`, not both.
+   */
+  language?: string;
+  /** Environment variables for this run only. */
+  envs?: Record<string, string>;
+  /**
+   * Stop the code after this many seconds and reject with
+   * `MicroVMCodeTimeoutError`. The server's default is 600; 0 means no limit.
+   * Code that ignores the stop is killed, and its context starts again on
+   * its next run without its variables.
+   */
+  timeoutSeconds?: number;
+  onStdout?: (text: string) => void;
+  onStderr?: (text: string) => void;
+  onResult?: (result: CodeResult) => void;
+  /** Called when the code raises an exception. */
+  onError?: (error: ExecutionError) => void;
+  /**
+   * Aborting interrupts the code (like Ctrl-C). The call then resolves with
+   * `interrupted: true` once the sandbox confirms, or rejects with the
+   * signal's reason if it does not confirm within 5 seconds. Closing the
+   * connection alone would not stop the code.
+   */
+  signal?: AbortSignal;
+}
+
 export interface HealthStatus {
   status: string;
   sandboxes: number;

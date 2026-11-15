@@ -27,6 +27,7 @@ from .client import (
     _REPLY_LOST_STATUSES,
     _RETRY_STATUSES,
     DEFAULT_LIST_LIMIT,
+    CodeRunHandle,
     ExecStreamHandle,
     FileWatchHandle,
     MicroVM,
@@ -36,6 +37,7 @@ from .client import (
     SessionAttachHandle,
     Tokens,
     _call_deadline,
+    _INTERRUPT_GRACE_SECONDS,
     _cell_header,
     _deadline_error,
     _error_code,
@@ -57,6 +59,10 @@ from .types import (
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
+    CodeContext,
+    CodeErrorCallback,
+    CodeOutputCallback,
+    CodeResultCallback,
     CreateAPITokenOptions,
     CreateOptions,
     CreateSessionOptions,
@@ -72,6 +78,7 @@ from .types import (
     ExecRequest,
     ExecResult,
     ExecStreamOptions,
+    Execution,
     ExposeProtocol,
     ExposeResult,
     ExposeVisibility,
@@ -242,6 +249,55 @@ class AsyncFileWatchHandle:
 
     async def wait(self, timeout: Optional[float] = None) -> None:
         await _wait(self._done, timeout, "the file watch to end")
+
+
+class AsyncCodeRunHandle:
+    """A running code run (:meth:`AsyncMicroVM.start_code`). The callbacks
+    run on the event loop; a coroutine function is run as a task. As for
+    :class:`~microvm.client.CodeRunHandle`, ``interrupt()`` stops the run in
+    the sandbox and ``close()`` only drops the connection."""
+
+    def __init__(self, inner: CodeRunHandle) -> None:
+        self._inner = inner
+        self._done = asyncio.wrap_future(inner.done)
+
+    @property
+    def done(self) -> "asyncio.Future[Execution]":
+        return self._done
+
+    async def interrupt(self) -> None:
+        await asyncio.to_thread(self._inner.interrupt)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._inner.close)
+
+    async def wait(self, timeout: Optional[float] = None) -> Execution:
+        # Not _wait: MicroVMCodeTimeoutError is a TimeoutError too, and
+        # wait_for's handler would read it as this wait timing out.
+        await asyncio.wait({self._done}, timeout=timeout)
+        if not self._done.done():
+            raise TimeoutError("timed out waiting for the code run to end")
+        return self._done.result()
+
+    async def _wait_or_interrupt(self) -> Execution:
+        """run_code's wait: cancelling the caller interrupts the run in the
+        sandbox, since dropping the connection alone would leave it running
+        there. The interrupt gets the grace to be confirmed, then the
+        connection is dropped, and the cancellation goes on."""
+        try:
+            return await asyncio.shield(self._done)
+        except asyncio.CancelledError:
+            try:
+                await self.interrupt()
+            except Exception:
+                pass
+            await asyncio.wait({self._done}, timeout=_INTERRUPT_GRACE_SECONDS)
+            # Nobody awaits the outcome after this; retrieve it so an error
+            # (the dropped connection's, say) is not logged as unseen.
+            self._done.add_done_callback(lambda done: done.cancelled() or done.exception())
+            if not self._done.done():
+                await self.close()
+            raise
 
 
 class _Handoff:
@@ -468,6 +524,82 @@ class AsyncSandbox(_SandboxBase):
     async def attach_session(self, session_id: str, options: Optional[SessionAttachOptions] = None, *, timeout: Optional[float] = None) -> AsyncSessionAttachHandle:
         with _call_deadline(timeout):
             return await self._client.attach_session(self.id, session_id, options)
+
+    async def create_code_context(self, *, language: Optional[str] = None, cwd: Optional[str] = None, timeout: Optional[float] = None) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._client.create_code_context(self.id, language=language, cwd=cwd)
+
+    async def list_code_contexts(self, *, timeout: Optional[float] = None) -> List[CodeContext]:
+        with _call_deadline(timeout):
+            return await self._client.list_code_contexts(self.id)
+
+    async def get_code_context(self, context_id: str, *, timeout: Optional[float] = None) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._client.get_code_context(self.id, context_id)
+
+    async def delete_code_context(self, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> None:
+        with _call_deadline(timeout):
+            return await self._client.delete_code_context(self.id, context)
+
+    async def restart_code_context(self, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._client.restart_code_context(self.id, context)
+
+    async def start_code(
+        self,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> AsyncCodeRunHandle:
+        return await self._client.start_code(
+            self.id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
+
+    async def run_code(
+        self,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> Execution:
+        return await self._client.run_code(
+            self.id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
 
     async def upload_file(
         self,
@@ -902,6 +1034,10 @@ class AsyncMicroVM(_MicroVMCore):
     def _file_watch_handle(self, ws: Any, on_event: FileEventCallback) -> AsyncFileWatchHandle:
         return AsyncFileWatchHandle(FileWatchHandle(ws, _on_loop(asyncio.get_running_loop(), on_event)))
 
+    def _code_run_handle(self, ws: Any, start: str, callbacks: Dict[str, Any]) -> AsyncCodeRunHandle:  # type: ignore[override]
+        wrapped = _loop_options(callbacks, ("on_stdout", "on_stderr", "on_result", "on_error"))
+        return AsyncCodeRunHandle(CodeRunHandle(ws, start, wrapped))
+
     async def iter_pages(
         self,
         *,
@@ -1218,6 +1354,77 @@ class AsyncMicroVM(_MicroVMCore):
     ) -> AsyncSessionAttachHandle:
         with _call_deadline(timeout):
             return await self._run(self._op_attach_session(sandbox_id, session_id, options))
+
+    async def create_code_context(
+        self, sandbox_id: str, *, language: Optional[str] = None, cwd: Optional[str] = None, timeout: Optional[float] = None
+    ) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._run(self._op_create_code_context(sandbox_id, language, cwd))
+
+    async def list_code_contexts(self, sandbox_id: str, *, timeout: Optional[float] = None) -> List[CodeContext]:
+        with _call_deadline(timeout):
+            return await self._run(self._op_list_code_contexts(sandbox_id))
+
+    async def get_code_context(self, sandbox_id: str, context_id: str, *, timeout: Optional[float] = None) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._run(self._op_get_code_context(sandbox_id, context_id))
+
+    async def delete_code_context(self, sandbox_id: str, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> None:
+        with _call_deadline(timeout):
+            return await self._run(self._op_delete_code_context(sandbox_id, context))
+
+    async def restart_code_context(self, sandbox_id: str, context: Union[str, CodeContext], *, timeout: Optional[float] = None) -> CodeContext:
+        with _call_deadline(timeout):
+            return await self._run(self._op_restart_code_context(sandbox_id, context))
+
+    async def start_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> AsyncCodeRunHandle:
+        callbacks = {"on_stdout": on_stdout, "on_stderr": on_stderr, "on_result": on_result, "on_error": on_error}
+        with _call_deadline(timeout):
+            return await self._run(self._op_start_code(sandbox_id, code, context, language, envs, timeout_seconds, callbacks))
+
+    async def run_code(
+        self,
+        sandbox_id: str,
+        code: str,
+        *,
+        context: Union[str, CodeContext, None] = None,
+        language: Optional[str] = None,
+        envs: Optional[Dict[str, str]] = None,
+        timeout_seconds: Optional[int] = None,
+        on_stdout: Optional[CodeOutputCallback] = None,
+        on_stderr: Optional[CodeOutputCallback] = None,
+        on_result: Optional[CodeResultCallback] = None,
+        on_error: Optional[CodeErrorCallback] = None,
+        timeout: Optional[float] = None,
+    ) -> Execution:
+        handle = await self.start_code(
+            sandbox_id,
+            code,
+            context=context,
+            language=language,
+            envs=envs,
+            timeout_seconds=timeout_seconds,
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_result=on_result,
+            on_error=on_error,
+            timeout=timeout,
+        )
+        return await handle._wait_or_interrupt()
 
     async def _require_toolbox_features(self, sandbox_id: str, *features: str) -> None:
         await self._run(self._op_require_toolbox_features(sandbox_id, *features))

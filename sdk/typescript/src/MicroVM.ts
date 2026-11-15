@@ -8,7 +8,9 @@ import type {
   BuildImageOptions,
   BuildImageResult,
   CloneGeneration,
+  CodeContext,
   CreateAPITokenOptions,
+  CreateCodeContextOptions,
   CreatedAPIToken,
   CreateOptions,
   CreateSessionOptions,
@@ -18,6 +20,7 @@ import type {
   PushWasmModuleResult,
   ExecStreamHandle,
   ExecStreamOptions,
+  Execution,
   FileEvent,
   FileWatchHandle,
   HealthStatus,
@@ -46,6 +49,7 @@ import type {
   ListSnapshotsOptions,
   SnapshotList,
   ResizeOptions,
+  RunCodeOptions,
   Sandbox as SandboxData,
   SandboxSnapshot,
   Session,
@@ -442,6 +446,47 @@ export class MicroVM {
    */
   async watchFiles(sandboxID: string, path: string, onEvent: (event: FileEvent) => void, options: WatchFilesOptions = {}): Promise<FileWatchHandle> {
     return this.client.watchFiles(sandboxID, path, onEvent, options);
+  }
+
+  /**
+   * Start a code interpreter context in a sandbox: an interpreter process
+   * that keeps its variables between runs. Each call makes a new context and
+   * is never retried. A sandbox whose agent predates the code interpreter
+   * rejects with `MicroVMUnsupportedFeatureError`.
+   */
+  async createCodeContext(sandboxID: string, options: CreateCodeContextOptions = {}, call?: CallOptions): Promise<CodeContext> {
+    return this.clientFor(call).createCodeContext(sandboxID, options);
+  }
+
+  /** A sandbox's code interpreter contexts, without the default ones. */
+  async listCodeContexts(sandboxID: string, call?: CallOptions): Promise<CodeContext[]> {
+    return this.clientFor(call).listCodeContexts(sandboxID);
+  }
+
+  async getCodeContext(sandboxID: string, context: CodeContext | string, call?: CallOptions): Promise<CodeContext> {
+    return this.clientFor(call).getCodeContext(sandboxID, context);
+  }
+
+  /** Stop a context's interpreter and forget the context. An unknown context rejects with a 404. */
+  async deleteCodeContext(sandboxID: string, context: CodeContext | string, call?: CallOptions): Promise<void> {
+    await this.clientFor(call).deleteCodeContext(sandboxID, context);
+  }
+
+  /** Start a context's interpreter again: same id and folder, no variables. Never retried. */
+  async restartCodeContext(sandboxID: string, context: CodeContext | string, call?: CallOptions): Promise<CodeContext> {
+    return this.clientFor(call).restartCodeContext(sandboxID, context);
+  }
+
+  /**
+   * Run code in a sandbox's code interpreter. Variables stay in the context
+   * for the next run. Resolves with the run's output, results and the
+   * code's exception, if any, once it ends; `options.signal` interrupts it.
+   * Rejects with `MicroVMCodeTimeoutError` when its timeout stops it and
+   * `MicroVMCodeRunError` when the sandbox ends the run with an error. Never
+   * retried.
+   */
+  async runCode(sandboxID: string, code: string, options: RunCodeOptions = {}): Promise<Execution> {
+    return this.client.runCode(sandboxID, code, options);
   }
 
   async createSession(sandboxID: string, options: CreateSessionOptions, call?: CallOptions): Promise<Session> {

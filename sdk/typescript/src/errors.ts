@@ -1,3 +1,5 @@
+import type { Execution } from "./types.js";
+
 /**
  * An HTTP error response from the AerolVM server. `message` is the server's
  * message, or `request failed with status N` when the body carries none (a
@@ -114,6 +116,42 @@ function runtimeDisplayName(runtime: string): string {
   if (runtime === "wasm") return "WebAssembly";
   if (runtime === "isolate") return "V8 isolate";
   return runtime;
+}
+
+/**
+ * A `runCode` call ended without finishing: the sandbox closed the
+ * connection with an error (`closeCode` and `reason` say why, for example
+ * 1008 `context not found: <id>`), or the connection was lost (1006). The
+ * code's own exceptions are not this error: they come back in
+ * `Execution.error`. `execution` holds the output that arrived before the end.
+ */
+export class MicroVMCodeRunError extends Error {
+  /** The WebSocket close code. */
+  readonly closeCode: number;
+  /** The close reason the sandbox sent, or "". */
+  readonly reason: string;
+  /** The output that arrived before the run ended. */
+  readonly execution: Execution;
+
+  constructor(message: string, closeCode: number, reason: string, execution: Execution) {
+    super(message);
+    this.name = "MicroVMCodeRunError";
+    this.closeCode = closeCode;
+    this.reason = reason;
+    this.execution = execution;
+  }
+}
+
+/**
+ * The run's `timeoutSeconds` (or the server's default of 600 seconds) ran
+ * out and the sandbox stopped the code. `execution` holds the output that
+ * arrived before that.
+ */
+export class MicroVMCodeTimeoutError extends MicroVMCodeRunError {
+  constructor(message: string, closeCode: number, reason: string, execution: Execution) {
+    super(message, closeCode, reason, execution);
+    this.name = "MicroVMCodeTimeoutError";
+  }
 }
 
 /**

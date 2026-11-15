@@ -3,6 +3,15 @@ import { basename, join } from "node:path";
 import { gzipSync } from "node:zlib";
 
 import { tarArchive, type TarEntry } from "./tar.js";
+import {
+  ExecutionValue,
+  FEATURE_CODE_INTERPRETER,
+  INTERRUPT_GRACE_MS,
+  applyCodeFrame,
+  codeRunCloseError,
+  fromApiCodeContext,
+  runCodeStartFrame,
+} from "./codeInterpreter.js";
 
 import {
   PATH_PREFIX as V1_PATH_PREFIX,
@@ -41,6 +50,8 @@ import type {
   PushWasmModuleResult,
   CustomDomain,
   CloneGeneration,
+  CodeContext,
+  CreateCodeContextOptions,
   CustomDomainDNSRecords,
   CustomDomainStatus,
   ExecExitInfo,
@@ -48,6 +59,7 @@ import type {
   ExecResult,
   ExecStreamHandle,
   ExecStreamOptions,
+  Execution,
   ExposedPort,
   ExposePortOptions,
   ExposeProtocol,
@@ -106,6 +118,7 @@ import type {
   SnapshotList,
   SetNetworkLimitsOptions,
   ResizeOptions,
+  RunCodeOptions,
   Sandbox,
   SandboxSnapshot,
   Session,
@@ -1460,6 +1473,77 @@ export class APIClient {
     return decodeError(new Response(text, { status: response.status, headers: response.headers }));
   }
 
+  private interpreterPath(id: string, suffix: string): string {
+    return this.versioned(`/sandboxes/${encodeURIComponent(id)}/toolbox/process/interpreter${suffix}`);
+  }
+
+  private codeContextPath(id: string, context: CodeContext | string, suffix = ""): string {
+    const contextID = typeof context === "string" ? context : context.id;
+    return this.interpreterPath(id, `/context/${encodeURIComponent(contextID)}${suffix}`);
+  }
+
+  /**
+   * Starts a code interpreter context: an interpreter process that keeps its
+   * variables between runs. Each call makes a new one, so it is never
+   * retried once sent.
+   */
+  async createCodeContext(id: string, options: CreateCodeContextOptions = {}): Promise<CodeContext> {
+    await this.requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    const body: Record<string, string> = {};
+    if (options.language) body.language = options.language;
+    if (options.cwd) body.cwd = options.cwd;
+    const response = await this.doJSON<Record<string, unknown>>("POST", this.interpreterPath(id, "/context"), body, { idempotent: false });
+    return fromApiCodeContext(response);
+  }
+
+  /** The sandbox's code interpreter contexts. The default contexts are not listed. */
+  async listCodeContexts(id: string): Promise<CodeContext[]> {
+    await this.requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    const response = await this.doJSON<{ contexts?: Record<string, unknown>[] | null }>("GET", this.interpreterPath(id, "/context"));
+    return (response?.contexts ?? []).map(fromApiCodeContext);
+  }
+
+  async getCodeContext(id: string, context: CodeContext | string): Promise<CodeContext> {
+    await this.requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    return fromApiCodeContext(await this.doJSON<Record<string, unknown>>("GET", this.codeContextPath(id, context)));
+  }
+
+  /** Stops the context's interpreter and forgets the context. An unknown context is a 404. */
+  async deleteCodeContext(id: string, context: CodeContext | string): Promise<void> {
+    await this.requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    await this.doJSON<unknown>("DELETE", this.codeContextPath(id, context));
+  }
+
+  /**
+   * Starts the context's interpreter again: same id and folder, no
+   * variables. Not retried once sent, as a second restart would wipe what a
+   * run in between set.
+   */
+  async restartCodeContext(id: string, context: CodeContext | string): Promise<CodeContext> {
+    await this.requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    const response = await this.doJSON<Record<string, unknown>>("POST", this.codeContextPath(id, context, "/restart"), undefined, {
+      idempotent: false,
+    });
+    return fromApiCodeContext(response);
+  }
+
+  /**
+   * Runs code in a context and resolves with everything it produced once it
+   * ends. Output streams to the callbacks while it runs. An exception in the
+   * code is not a rejection: it is in `Execution.error`. Rejects with
+   * `MicroVMCodeTimeoutError` when the run's timeout stops it and
+   * `MicroVMCodeRunError` when the sandbox ends the run with an error. Never
+   * retried. Closing the connection does not stop the code; abort
+   * `options.signal` to interrupt it.
+   */
+  async runCode(id: string, code: string, options: RunCodeOptions = {}): Promise<Execution> {
+    const start = runCodeStartFrame(code, options);
+    options.signal?.throwIfAborted();
+    await this.withSignal(options.signal).requireToolboxFeatures(id, FEATURE_CODE_INTERPRETER);
+    const wsURL = this.baseURLFor(id).replace(/^http/, "ws") + this.interpreterPath(id, "/execute");
+    return openCodeRun(wsURL, this.patToken, start, options);
+  }
+
   async createSession(id: string, options: CreateSessionOptions): Promise<Session> {
     const response = await this.doJSON<ApiSession>("POST", `${this.versionPrefix}/sandboxes/${id}/sessions`, toApiCreateSessionOptions(options));
     return fromApiSession(response);
@@ -2536,6 +2620,32 @@ export class SandboxResource implements Sandbox {
     return this.client.watchFiles(this.id, path, onEvent, options);
   }
 
+  /** Start a code interpreter context; see {@link APIClient.createCodeContext}. */
+  async createCodeContext(options: CreateCodeContextOptions = {}, call?: CallOptions): Promise<CodeContext> {
+    return this.api(call).createCodeContext(this.id, options);
+  }
+
+  async listCodeContexts(call?: CallOptions): Promise<CodeContext[]> {
+    return this.api(call).listCodeContexts(this.id);
+  }
+
+  async getCodeContext(context: CodeContext | string, call?: CallOptions): Promise<CodeContext> {
+    return this.api(call).getCodeContext(this.id, context);
+  }
+
+  async deleteCodeContext(context: CodeContext | string, call?: CallOptions): Promise<void> {
+    await this.api(call).deleteCodeContext(this.id, context);
+  }
+
+  async restartCodeContext(context: CodeContext | string, call?: CallOptions): Promise<CodeContext> {
+    return this.api(call).restartCodeContext(this.id, context);
+  }
+
+  /** Run code in the code interpreter; see {@link APIClient.runCode}. */
+  async runCode(code: string, options: RunCodeOptions = {}): Promise<Execution> {
+    return this.client.runCode(this.id, code, options);
+  }
+
   async createSession(options: CreateSessionOptions, call?: CallOptions): Promise<Session> {
     return this.api(call).createSession(this.id, options);
   }
@@ -3566,6 +3676,108 @@ function openExecStream(
     },
     done,
   };
+}
+
+/**
+ * Runs one piece of code over the interpreter's WebSocket. The close frame,
+ * not the "completed" control frame, decides the outcome: a run the server's
+ * timeout stopped may report "interrupted" first and only then close with
+ * 4008.
+ */
+function openCodeRun(
+  wsURL: string,
+  patToken: string,
+  start: Record<string, unknown>,
+  options: RunCodeOptions,
+): Promise<Execution> {
+  const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+  if (!WS) {
+    return Promise.reject(new Error("WebSocket is not available in this runtime — Node 22+ or a browser is required"));
+  }
+  const signal = options.signal;
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason);
+  }
+
+  return new Promise<Execution>((resolve, reject) => {
+    // The PAT rides the subprotocol, as on execStream: browsers cannot set
+    // headers on a WebSocket handshake.
+    const ws = new WS(wsURL, ["sandbox.bearer", patToken]);
+    const execution = new ExecutionValue();
+    let opened = false;
+    let settled = false;
+    let lastErrorDetail = "";
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const interrupt = () => {
+      try {
+        ws.send(JSON.stringify({ type: "interrupt" }));
+      } catch {
+        // Already closing; the close event settles the run.
+      }
+    };
+
+    function onAbort() {
+      if (settled) return;
+      if (!opened) {
+        // The code was never sent, so nothing runs in the sandbox.
+        settle(() => reject(signal!.reason));
+        ws.close();
+        return;
+      }
+      interrupt();
+      graceTimer = setTimeout(() => {
+        settle(() => reject(signal!.reason));
+        ws.close();
+      }, INTERRUPT_GRACE_MS);
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    ws.addEventListener("open", () => {
+      if (settled) return;
+      opened = true;
+      ws.send(JSON.stringify(start));
+    });
+
+    ws.addEventListener("message", (event: MessageEvent) => {
+      if (settled || typeof event.data !== "string") return;
+      const notify = applyCodeFrame(execution, event.data, options);
+      if (!notify) return;
+      try {
+        notify();
+      } catch (err) {
+        // A throw must not escape a socket listener, where it is an
+        // uncaught exception: the run rejects with it instead. The code
+        // keeps running in the sandbox, as in the other SDKs; abort the
+        // signal to stop it.
+        settle(() => reject(err));
+        ws.close();
+      }
+    });
+
+    ws.addEventListener("error", (event) => {
+      const detail = describeWSError(event);
+      if (detail !== "") lastErrorDetail = detail;
+    });
+
+    ws.addEventListener("close", (event) => {
+      const { code, reason } = event as { code?: unknown; reason?: unknown };
+      const failure = codeRunCloseError(
+        execution,
+        typeof code === "number" ? code : 1006,
+        typeof reason === "string" ? reason : "",
+        lastErrorDetail,
+      );
+      settle(() => (failure ? reject(failure) : resolve(execution)));
+    });
+  });
 }
 
 function openSessionAttach(

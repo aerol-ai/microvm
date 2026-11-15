@@ -147,6 +147,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/sandbox-cloud-identity', '- Cloud identity (AWS, GCP, Azure)'),
       link('/durability', '- Durability and failover'),
       link('/exec-streaming', '- Run commands'),
+      link('/code-interpreter', '- Code interpreter'),
       link('/file-system', '- Handle Files'),
       link('/file-watching', '- Watch files'),
       link('/sessions', '- Terminal sessions'),
