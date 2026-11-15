@@ -66,6 +66,9 @@ type kernel struct {
 	frames  chan frame
 	exited  chan struct{}
 	closing chan struct{}
+	// drained is closed exitDrain after the exit: a frame nobody took by
+	// then is dropped, so the reader ends even if no run ever comes.
+	drained chan struct{}
 
 	mu      sync.Mutex
 	run     *activeRun
@@ -131,6 +134,7 @@ func startKernel(cmd *exec.Cmd, start StartFunc, nonce string) (*kernel, error) 
 		frames:  make(chan frame),
 		exited:  make(chan struct{}),
 		closing: make(chan struct{}),
+		drained: make(chan struct{}),
 	}
 	go k.readEvents()
 	go k.readPipe(0)
@@ -154,6 +158,7 @@ func (k *kernel) wait(wait func() error) {
 		_ = p.f.SetReadDeadline(deadline)
 	}
 	_ = k.reqW.Close()
+	time.AfterFunc(exitDrain, func() { close(k.drained) })
 }
 
 func (k *kernel) readEvents() {
@@ -168,6 +173,8 @@ func (k *kernel) readEvents() {
 		select {
 		case k.frames <- frame{kind, payload}:
 		case <-k.closing:
+			return
+		case <-k.drained:
 			return
 		}
 	}

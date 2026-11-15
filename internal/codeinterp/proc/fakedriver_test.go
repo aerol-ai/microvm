@@ -190,6 +190,11 @@ func runFakeDriver() int {
 		env = nil
 		sync()
 		_ = codeinterp.WriteFrame(ev, "DONE", []byte(status))
+		if strings.Contains(string(payload), "strayexit") {
+			// A frame nobody asked for, then death between runs.
+			_ = codeinterp.WriteFrame(ev, "COUNT", []byte("99"))
+			os.Exit(0)
+		}
 	}
 }
 

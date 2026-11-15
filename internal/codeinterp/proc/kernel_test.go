@@ -221,6 +221,25 @@ func TestKernelMarkerThatNeverComes(t *testing.T) {
 	}
 }
 
+func TestKernelStrayFrameAfterDeathIsDropped(t *testing.T) {
+	k := launchFake(t, "")
+	if out, _ := execute(t, k, "out x\nstrayexit", nil); out.Status != "ok" {
+		t.Fatalf("outcome = %+v", out)
+	}
+	waitClosed(t, k.Done(), "driver exit")
+	// No run will take the stray frame and nobody calls Close on a kernel
+	// that died on its own: the event reader must still end.
+	time.Sleep(exitDrain + 500*time.Millisecond)
+	select {
+	case fr, ok := <-k.frames:
+		if ok {
+			t.Fatalf("event reader still held a frame: %+v", fr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("event reader did not end")
+	}
+}
+
 func TestKernelBadSyncKillsDriver(t *testing.T) {
 	k := launchFake(t, "")
 	out, _ := execute(t, k, "badsync", nil)
