@@ -3,6 +3,8 @@ package containerd
 import (
 	"context"
 	"errors"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -87,14 +89,24 @@ func TestNormalizeContainerdEvent(t *testing.T) {
 			wantID:     "sb-3",
 		},
 		{
-			// GetContainerID must win over GetID. Task events carry BOTH: ID is
-			// the EXEC id there, so preferring it would attribute an exec's exit
-			// to a container named after the exec and destroy the wrong row.
-			name:       "exec exit is attributed to the container, not the exec id",
-			env:        mkEnvelope(t, runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-exec-owner", ID: "exec-42"}),
+			// The runc shim names the init process with the container's own
+			// ID, so a real init exit carries ID == ContainerID.
+			name:       "init exit (ID is the container's) maps to die",
+			env:        mkEnvelope(t, runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-init", ID: "sb-init", ExitStatus: 137}),
 			wantOK:     true,
 			wantAction: "die",
-			wantID:     "sb-exec-owner",
+			wantID:     "sb-init",
+		},
+		{
+			// Regression: an exec'd process ending is not the sandbox ending.
+			// Mapping it to "die" marked a running sandbox stopped, and the
+			// stop teardown lifted its block-all egress rule (seen live
+			// 2026-11-15 after `ctr task exec <sb> true`). Neither may it be
+			// attributed to a container named after the exec: ID is the exec's
+			// there, which is why GetContainerID wins in decodeTaskEvent.
+			name:   "exec exit is ignored (the container's init still runs)",
+			env:    mkEnvelope(t, runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-exec-owner", ID: "exec-42"}),
+			wantOK: false,
 		},
 		{
 			name:       "task oom maps to oom",
@@ -218,6 +230,55 @@ func TestStreamEventsClosedChannel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestStreamEventsDropsExecExits: an operator's exec into a sandbox ends
+// before the sandbox does. The stream forwards only the init's exit, so the
+// service sees one "die", when the sandbox really stops.
+func TestStreamEventsDropsExecExits(t *testing.T) {
+	envelope := func(topic string, payload any) *events.Envelope {
+		t.Helper()
+		any, err := typeurl.MarshalAny(payload)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return &events.Envelope{Topic: topic, Timestamp: time.Now(), Event: any}
+	}
+	tr := &scriptedSubscribeTransport{envelopes: []*events.Envelope{
+		envelope(runtime.TaskStartEventTopic, &apievents.TaskStart{ContainerID: "sb-x", Pid: 10}),
+		envelope(runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-x", ID: "dbg", Pid: 11}),
+		envelope(runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-x", ID: "sb-x", Pid: 10, ExitStatus: 143}),
+	}}
+	d := New(Config{}, nil, nil)
+	d.SetClient(NewTestClient("aerolvm", tr))
+	out := make(chan docker.DockerEvent, 8)
+	if err := d.StreamEvents(context.Background(), out); err != nil {
+		t.Fatalf("StreamEvents: %v", err)
+	}
+	close(out)
+	var got []string
+	for ev := range out {
+		got = append(got, ev.Action+"/"+ev.ContainerID+"/"+strconv.Itoa(ev.ExitCode))
+	}
+	if want := []string{"start/sb-x/0", "die/sb-x/143"}; !slices.Equal(got, want) {
+		t.Fatalf("forwarded %v, want %v (the exec's exit must not reach the service)", got, want)
+	}
+}
+
+// scriptedSubscribeTransport emits its envelopes in order, then ends the
+// stream.
+type scriptedSubscribeTransport struct {
+	fakeTransport
+	envelopes []*events.Envelope
+}
+
+func (s *scriptedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+	ch := make(chan *events.Envelope, len(s.envelopes))
+	for _, ev := range s.envelopes {
+		ch <- ev
+	}
+	close(ch)
+	return ch, make(chan error)
 }
 
 type closedSubscribeTransport struct{ fakeTransport }
