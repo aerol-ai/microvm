@@ -138,3 +138,50 @@ func TestNetstatsCountsTheFirstWindowAndSurvivesARestart(t *testing.T) {
 	lookup.off()
 	waitNetOut(t, st, "sb-burst", 6100)
 }
+
+// TestNetstatsSinkStoresAReadingWithoutRecheckingQuota: a restarted container
+// that has sent nothing yet still has its new reading stored, but its totals
+// did not move, so the sink neither reports usage nor re-runs the quota
+// block for it, even when the sandbox is already flagged over its cap.
+func TestNetstatsSinkStoresAReadingWithoutRecheckingQuota(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	seedNetstatsSandbox(t, st, &models.Sandbox{
+		ID:                   "sb-flagged",
+		Image:                "alpine:3.20",
+		Status:               models.SandboxStatusStarted,
+		ContainerID:          "ctr-flagged",
+		ContainerIP:          "10.0.0.21",
+		CPU:                  1,
+		MemoryMB:             256,
+		DiskGB:               5,
+		OSUser:               "root",
+		NetworkBytesOutLimit: 100,
+	})
+	if _, err := st.ApplyNetCounterDeltas(ctx, []storepkg.NetCounterDelta{{SandboxID: "sb-flagged", BytesOut: 150}}); err != nil {
+		t.Fatalf("seed counters: %v", err)
+	}
+	if err := st.MarkNetworkQuotaExceeded(ctx, "sb-flagged", time.Now().UTC()); err != nil {
+		t.Fatalf("flag quota: %v", err)
+	}
+
+	netstatsServiceSink{svc: svc}.handleNetworkSamples(ctx, []netstats.Sample{{
+		SandboxID: "sb-flagged", SampledAt: time.Now().UTC(), Seen: &netstats.Seen{PID: 77},
+	}})
+
+	got := netstatsServiceLister{svc: svc}.NetstatsTargets(ctx)
+	if len(got) != 1 || got[0].Seen != (netstats.Seen{PID: 77}) {
+		t.Fatalf("targets = %+v, want the new reading {77 0 0} stored", got)
+	}
+	sb, err := st.Get(ctx, "sb-flagged")
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if sb.NetworkBytesOut != 150 || !sb.NetworkQuotaExceeded {
+		t.Fatalf("out=%d flagged=%v, want 150 and still flagged", sb.NetworkBytesOut, sb.NetworkQuotaExceeded)
+	}
+	if len(rt.applyNetworkBlockAllCalls) != 0 {
+		t.Fatalf("quota block re-applied %v for a sample with no bytes", rt.applyNetworkBlockAllCalls)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -188,4 +189,43 @@ func TestApplyNetCounterDeltasStoresSeen(t *testing.T) {
 		t.Fatal("want the poisoned batch to fail")
 	}
 	check("after a failed batch", 9001, 5000, NetSeen{PID: 200, BytesIn: 1})
+}
+
+// TestNetSeenMigrationReturnsOtherErrors: migration 14 tolerates only a
+// column that is already there; any other failure stops the open.
+func TestNetSeenMigrationReturnsOtherErrors(t *testing.T) {
+	var m14 *schemaMigration
+	for i := range newerSchemaMigrations {
+		if newerSchemaMigrations[i].number == 14 {
+			m14 = &newerSchemaMigrations[i]
+		}
+	}
+	if m14 == nil || !m14.n1Safe || m14.applyTx == nil {
+		t.Fatalf("migration 14 = %+v, want an n1Safe applyTx migration", m14)
+	}
+	db := rawDB(t, filepath.Join(t.TempDir(), "no-sandboxes.db"))
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	if err := m14.applyTx(context.Background(), tx); err == nil || strings.Contains(err.Error(), "duplicate column name") {
+		t.Fatalf("migration 14 on a database without sandboxes = %v, want its error", err)
+	}
+}
+
+// TestListNetstatsTargetsReportsABadRow: a reading that is not a number is
+// an error, never a zero that would read as "unknown".
+func TestListNetstatsTargetsReportsABadRow(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Create(ctx, sampleSandbox("sb-bad")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandboxes SET net_seen_pid = 'not-a-pid' WHERE id = 'sb-bad'`); err != nil {
+		t.Fatalf("corrupt row: %v", err)
+	}
+	if got, err := st.ListNetstatsTargets(ctx); err == nil {
+		t.Fatalf("ListNetstatsTargets = %+v, want a scan error", got)
+	}
 }
