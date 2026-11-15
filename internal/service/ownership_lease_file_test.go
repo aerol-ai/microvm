@@ -206,7 +206,7 @@ func TestPersistSandboxCreateConfirmsFirst(t *testing.T) {
 		t.Fatalf("the refused create left its row: %v", err)
 	}
 
-	lc.up()
+	lc.up(selfPlacement("a"))
 	reads := lc.readCount()
 	if err := svc.persistSandboxCreate(ctx, leaseCreateRow("a", true)); err != nil {
 		t.Fatal(err)
