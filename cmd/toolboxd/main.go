@@ -98,6 +98,11 @@ type server struct {
 	// execLiveness overrides the exec-stream keepalive timings; the zero value
 	// means defaultExecStreamLiveness. Only tests set it.
 	execLiveness execStreamLiveness
+
+	// interp is the code interpreter's shared state, made on first use by
+	// codeInterp().
+	interpOnce sync.Once
+	interp     *codeInterpState
 }
 
 // servingRequests reports whether the agent may answer anything beyond
