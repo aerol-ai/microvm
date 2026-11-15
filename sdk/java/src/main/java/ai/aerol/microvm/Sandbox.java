@@ -7,6 +7,10 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CodeContext;
+import ai.aerol.microvm.model.CodeContextOptions;
+import ai.aerol.microvm.model.Execution;
+import ai.aerol.microvm.model.RunCodeOptions;
 import ai.aerol.microvm.model.CopyFileOptions;
 import ai.aerol.microvm.model.DeleteFileOptions;
 import ai.aerol.microvm.model.FileInfo;
@@ -124,6 +128,55 @@ public class Sandbox extends SandboxData implements AutoCloseable {
 
     public ExecStreamHandle execStream(ExecStreamOptions options) {
         return client.execStream(id, options);
+    }
+
+    /** See {@link MicroVMClient#createCodeContext(String, CodeContextOptions)}. */
+    public CodeContext createCodeContext(CodeContextOptions options) {
+        return client.createCodeContext(id, options);
+    }
+
+    /** Makes a Python context; see {@link MicroVMClient#createCodeContext(String, CodeContextOptions)}. */
+    public CodeContext createCodeContext() {
+        return client.createCodeContext(id, null);
+    }
+
+    public List<CodeContext> listCodeContexts() {
+        return client.listCodeContexts(id);
+    }
+
+    public CodeContext getCodeContext(String contextId) {
+        return client.getCodeContext(id, contextId);
+    }
+
+    public void deleteCodeContext(String contextId) {
+        client.deleteCodeContext(id, contextId);
+    }
+
+    public void deleteCodeContext(CodeContext context) {
+        client.deleteCodeContext(id, context);
+    }
+
+    public CodeContext restartCodeContext(String contextId) {
+        return client.restartCodeContext(id, contextId);
+    }
+
+    public CodeContext restartCodeContext(CodeContext context) {
+        return client.restartCodeContext(id, context);
+    }
+
+    /** See {@link MicroVMClient#runCode(String, String, RunCodeOptions)}. */
+    public Execution runCode(String code, RunCodeOptions options) {
+        return client.runCode(id, code, options);
+    }
+
+    /** Runs code in the default Python context; see {@link MicroVMClient#runCode(String, String, RunCodeOptions)}. */
+    public Execution runCode(String code) {
+        return client.runCode(id, code, null);
+    }
+
+    /** See {@link MicroVMClient#startCode(String, String, RunCodeOptions)}. */
+    public CodeRunHandle startCode(String code, RunCodeOptions options) {
+        return client.startCode(id, code, options);
     }
 
     public Session createSession(CreateSessionOptions options) {

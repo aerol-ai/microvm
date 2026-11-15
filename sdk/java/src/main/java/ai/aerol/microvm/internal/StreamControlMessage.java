@@ -29,4 +29,11 @@ public final class StreamControlMessage {
         message.type = "close";
         return message;
     }
+
+    /** Asks the code interpreter to stop the run in flight. */
+    public static StreamControlMessage interrupt() {
+        StreamControlMessage message = new StreamControlMessage();
+        message.type = "interrupt";
+        return message;
+    }
 }

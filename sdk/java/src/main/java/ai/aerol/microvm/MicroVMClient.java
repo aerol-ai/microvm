@@ -62,6 +62,10 @@ import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
 import ai.aerol.microvm.model.CloneGeneration;
+import ai.aerol.microvm.model.CodeContext;
+import ai.aerol.microvm.model.CodeContextOptions;
+import ai.aerol.microvm.model.Execution;
+import ai.aerol.microvm.model.RunCodeOptions;
 import ai.aerol.microvm.model.CreateSnapshotOptions;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
@@ -1361,6 +1365,13 @@ public class MicroVMClient {
     static final String FEATURE_EXTRACT = "files.extract";
 
     /**
+     * The toolboxd feature behind the code interpreter. An older agent
+     * answers its routes with 501, so every interpreter call checks first
+     * and fails with {@link MicroVMUnsupportedFeatureException} instead.
+     */
+    static final String FEATURE_CODE_INTERPRETER = "code.interpreter";
+
+    /**
      * Copies the local folder {@code localDir} into {@code remoteDir} in the
      * sandbox (made if missing). The folder is packed as a gzipped tar and the
      * sandbox unpacks it safely: no entry can land outside {@code remoteDir}.
@@ -1919,6 +1930,153 @@ public class MicroVMClient {
             return new MicroVMUnsupportedFeatureException(sandboxId, List.of("files.watch"), "");
         }
         return apiException(status, failure.header("Retry-After"), body);
+    }
+
+    /**
+     * Makes a code interpreter context: an interpreter process in the sandbox
+     * that keeps its variables between runs. Each call makes a new context, so
+     * a failed call is not re-sent once it may have reached the server.
+     * Needs an agent that lists {@code code.interpreter}; an older one throws
+     * {@link MicroVMUnsupportedFeatureException}. Too many contexts is HTTP 429.
+     */
+    public CodeContext createCodeContext(String sandboxId, CodeContextOptions options) {
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+        CodeContextOptions body = options == null ? new CodeContextOptions() : options;
+        return doJson("POST", interpreterPath(sandboxId, "/context"), body, CodeContext.class, RetryMode.UNSENT_ONLY);
+    }
+
+    /** Makes a Python context that starts in the sandbox's working folder. */
+    public CodeContext createCodeContext(String sandboxId) {
+        return createCodeContext(sandboxId, null);
+    }
+
+    /** The sandbox's code contexts. The default context of each language is not listed. */
+    public List<CodeContext> listCodeContexts(String sandboxId) {
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+        CodeContextList response = doJson("GET", interpreterPath(sandboxId, "/context"), null, CodeContextList.class);
+        if (response == null || response.contexts == null) {
+            return Collections.emptyList();
+        }
+        return response.contexts;
+    }
+
+    /** One code context; {@link MicroVMNotFoundException} when there is none with that id. */
+    public CodeContext getCodeContext(String sandboxId, String contextId) {
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+        return doJson("GET", interpreterPath(sandboxId, "/context/" + encodePathSegment(requireContextId(contextId))), null, CodeContext.class);
+    }
+
+    /**
+     * Deletes a code context and stops its interpreter.
+     * {@link MicroVMNotFoundException} when there is none with that id.
+     */
+    public void deleteCodeContext(String sandboxId, String contextId) {
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+        doNoContent("DELETE", interpreterPath(sandboxId, "/context/" + encodePathSegment(requireContextId(contextId))), null);
+    }
+
+    /** Same as {@link #deleteCodeContext(String, String)} with the context's id. */
+    public void deleteCodeContext(String sandboxId, CodeContext context) {
+        deleteCodeContext(sandboxId, context == null ? null : context.id);
+    }
+
+    /**
+     * Starts a fresh interpreter for a context: same id and folder, every
+     * variable gone. Not re-sent once it may have reached the server.
+     */
+    public CodeContext restartCodeContext(String sandboxId, String contextId) {
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+        return doJson("POST", interpreterPath(sandboxId, "/context/" + encodePathSegment(requireContextId(contextId)) + "/restart"),
+            null, CodeContext.class, RetryMode.UNSENT_ONLY);
+    }
+
+    /** Same as {@link #restartCodeContext(String, String)} with the context's id. */
+    public CodeContext restartCodeContext(String sandboxId, CodeContext context) {
+        return restartCodeContext(sandboxId, context == null ? null : context.id);
+    }
+
+    /**
+     * Runs code in a code context and waits for it to end. Variables, imports
+     * and the working folder stay for the context's next run. Output reaches
+     * the options' callbacks as it is printed. An exception the code raises
+     * is {@link Execution#error}, not a thrown error. Throws
+     * {@link MicroVMCodeTimeoutException} when the run's timeout fires and
+     * {@link MicroVMCodeRunException} when the run ends any other way than
+     * the server finishing it. Runs are never retried. Use
+     * {@link #startCode} to interrupt a run.
+     */
+    public Execution runCode(String sandboxId, String code, RunCodeOptions options) {
+        return startCode(sandboxId, code, options).waitForResult();
+    }
+
+    /** Runs code in the sandbox's default Python context; see {@link #runCode(String, String, RunCodeOptions)}. */
+    public Execution runCode(String sandboxId, String code) {
+        return runCode(sandboxId, code, null);
+    }
+
+    /**
+     * Starts a run and returns once the code is sent. The handle's
+     * {@link CodeRunHandle#interrupt()} stops the code; closing the handle
+     * only drops the connection, and the code keeps running in the sandbox.
+     * Needs an agent that lists {@code code.interpreter}; an older one throws
+     * {@link MicroVMUnsupportedFeatureException} and nothing is sent.
+     */
+    public CodeRunHandle startCode(String sandboxId, String code, RunCodeOptions options) {
+        RunCodeOptions effective = options == null ? new RunCodeOptions() : options;
+        String contextId = trimToNull(effective.contextId);
+        String language = trimToNull(effective.language);
+        if (contextId != null && language != null) {
+            throw new MicroVMException("set context or language, not both");
+        }
+        requireToolboxFeatures(sandboxId, FEATURE_CODE_INTERPRETER);
+
+        // A Map, not a model class: the interpreter speaks camelCase, which
+        // the client's snake_case mapper would rewrite.
+        Map<String, Object> start = new java.util.LinkedHashMap<>();
+        start.put("code", code == null ? "" : code);
+        if (contextId != null) {
+            start.put("contextId", contextId);
+        } else if (language != null) {
+            start.put("language", language);
+        }
+        if (effective.envs != null && !effective.envs.isEmpty()) {
+            start.put("envs", effective.envs);
+        }
+        if (effective.timeoutSeconds != null) {
+            start.put("timeout", effective.timeoutSeconds);
+        }
+        // Turns on the result and execution_count frames; Daytona's clients
+        // never send it and get Daytona's protocol unchanged.
+        start.put("richOutput", true);
+
+        CodeRunHandle handle = new CodeRunHandle(effective);
+        StreamingWebSocket socket;
+        try {
+            socket = webSocketConnector.connect(
+                webSocketUri(interpreterPath(sandboxId, "/execute")),
+                webSocketHeaders(),
+                handle.listener()
+            );
+        } catch (WebSocketHandshakeFailure failure) {
+            throw apiException(failure.getStatusCode(), failure.header("Retry-After"), failure.getBody().getBytes(StandardCharsets.UTF_8));
+        }
+        handle.attach(socket);
+        if (!handle.isDone()) {
+            socket.sendText(JsonSupport.write(start));
+        }
+        return handle;
+    }
+
+    private String interpreterPath(String sandboxId, String route) {
+        return sandboxPath(sandboxId) + "/toolbox/process/interpreter" + route;
+    }
+
+    private static String requireContextId(String contextId) {
+        String id = trimToNull(contextId);
+        if (id == null) {
+            throw new MicroVMException("context id is required");
+        }
+        return id;
     }
 
     public Session createSession(String sandboxId, CreateSessionOptions options) {
@@ -2691,6 +2849,11 @@ public class MicroVMClient {
 
     private static final class SessionListResponse {
         public List<Session> sessions;
+    }
+
+    @SuppressWarnings("unused")
+    private static final class CodeContextList {
+        public List<CodeContext> contexts;
     }
 
     @SuppressWarnings("unused")
