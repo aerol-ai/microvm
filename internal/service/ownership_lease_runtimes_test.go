@@ -598,7 +598,10 @@ func (r *fenceCheckRuntime) Stop(ctx context.Context, ref string) error {
 // without the lease file are unchanged.
 func TestRecreateVMOutsideItsGroupDoesNotRun(t *testing.T) {
 	ctx := context.Background()
-	svc, st, _ := newLeaseService(t, newFreezeRuntime())
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	// Each create's reservation names this node, as a real create's does:
+	// a recreate-policy create reads it before its row is written (V3).
+	lc.up(reservedFor("fc-nofile", "worker-a", ""), reservedFor("fc-out", "worker-a", ""), reservedFor("fc-in", "worker-a", ""))
 	fc := &fenceCheckRuntime{fenceGroupRuntime: &fenceGroupRuntime{newFreezeRuntime()}, err: errors.New("firecracker VM runs in the VMs' shared cgroup")}
 	svc.firecracker = fc
 	svc.admitter = capacity.New(capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384, SupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
