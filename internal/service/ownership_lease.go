@@ -182,6 +182,10 @@ type fencedSandbox struct {
 	// routesFenced: every public HTTP port answers 503. Until it is set,
 	// every check retries the swap.
 	routesFenced bool
+	// stopFailed: the last stop of a sandbox nothing can freeze failed
+	// (stopUnfenceable). Every check tries again, but a run of failures
+	// writes one audit record and one log line, not one per check.
+	stopFailed bool
 }
 
 // ownershipLeaseApplies reports whether this node runs a lease at all: only
@@ -474,6 +478,13 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	if err != nil {
 		return
 	}
+	// The caller listed the recreate-policy rows before taking this lock.
+	// A policy turned off since (disarmUnfencedRecreate, which holds the
+	// same lock) means nothing can recreate it elsewhere: it keeps running,
+	// unfenced. Before, the fence acted on the stale listing and stopped it.
+	if sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+		return
+	}
 	s.ownership.mu.Lock()
 	f := s.fenceLocked(id)
 	frozen, cannot, routed := f.frozen, f.cannotFreeze, f.routesFenced
@@ -497,7 +508,7 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 		// On a node that writes the lease file it is stopped instead
 		// (V4); a stop that failed is tried again at the next check.
 		if s.ownershipLeaseFileOn() {
-			s.stopUnfenceable(ctx, sb)
+			s.stopUnfenceable(ctx, sb, f)
 			return
 		}
 		s.ownership.mu.Lock()
@@ -512,7 +523,7 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	if err := fr.Freeze(ctx, s.runtimeRef(sb)); err != nil {
 		if errors.Is(err, runtime.ErrCannotFreeze) {
 			if s.ownershipLeaseFileOn() {
-				s.stopUnfenceable(ctx, sb)
+				s.stopUnfenceable(ctx, sb, f)
 				return
 			}
 			// This one cannot be frozen where it runs (a Firecracker VM
