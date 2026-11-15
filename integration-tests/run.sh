@@ -673,7 +673,8 @@ worktree_roots() {
 # could both hold "the" lock.
 #
 # A lease holds the lock for well under a second. Its holder writes
-# "<pid> <host>" to an owner file inside it, and a lock whose holder is no
+# "<pid> <host>" to an owner file inside it (the pid of the shell holding the
+# lock, see lease_lock_acquire), and a lock whose holder is no
 # longer running on this host was left by a run killed mid-lease and is
 # cleared at once. A lock with no owner file (one just made, or one an older
 # run.sh made) is cleared only once it is over a minute old. Using the
@@ -738,7 +739,13 @@ lease_lock_acquire() {
     fi
     sleep 0.1
   done
-  printf '%s %s\n' "$$" "$(uname -n)" > "${lock}/owner"
+  # The holder is this shell, which may be a subshell: a lease runs inside
+  # run_one's $(…), so $$ would name the parent run.sh, which outlives a
+  # lease subshell that died mid-lease, and the lock would look live for the
+  # whole run. BASHPID (bash 4+) names the subshell itself. bash 3.2 has no
+  # BASHPID and records $$: there, a lease subshell that died mid-lease
+  # leaves a lock that clears once its run.sh exits.
+  printf '%s %s\n' "${BASHPID:-$$}" "$(uname -n)" > "${lock}/owner"
   LEASE_LOCK="$lock"
 }
 

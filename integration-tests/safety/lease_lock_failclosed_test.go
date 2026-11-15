@@ -160,3 +160,53 @@ func TestLeaseClearsADeadHoldersFreshLockAtOnce(t *testing.T) {
 		t.Errorf("clearing a dead holder's lock took %s; want no wait for its age", took)
 	}
 }
+
+// A lease runs inside run_one's $(…). If that subshell dies mid-lease while
+// run.sh goes on, the lock must name the dead subshell, not the live parent,
+// or every other run waits its 3 minutes and fails for the rest of that run.
+// bash 3.2 has no BASHPID, so there the parent is recorded and the lock
+// clears once run.sh exits; the test needs bash 4 or newer.
+func TestLeaseLockOfADeadLeaseSubshellIsClearedAtOnce(t *testing.T) {
+	requireYQ(t)
+	if out, err := exec.Command("bash", "-c", `printf %s "${BASHPID:-}"`).Output(); err != nil || len(out) == 0 {
+		t.Skip("this bash has no BASHPID (bash 3.2): a lease records its parent run there")
+	}
+	a, b := twoWorktrees(t)
+	holder := exec.Command("bash", "-c", `set -euo pipefail
+REPO_ROOT="$1"
+`+leaseFuncs(t)+`
+( lease_lock_acquire ) # the lease subshell takes the lock and dies without releasing
+echo held
+sleep 60 # the run goes on
+`, "bash", a)
+	holder.Env = gitEnv()
+	var held strings.Builder
+	holder.Stdout = &held
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Process.Kill(); _, _ = holder.Process.Wait() }()
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(held.String(), "held") {
+		if time.Now().After(deadline) {
+			t.Fatal("the holder never took the lock")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	owner, err := os.ReadFile(filepath.Join(a, ".git", "aerol-itest-domain-lease.lock", "owner"))
+	if err != nil {
+		t.Fatalf("no owner file in the lock the subshell left: %v", err)
+	}
+	if strings.HasPrefix(string(owner), fmt.Sprintf("%d ", holder.Process.Pid)) {
+		t.Fatalf("the lock names the live parent run (%q), not the dead lease subshell", owner)
+	}
+
+	start := time.Now()
+	stdout, stderr, code := runBashScript(t, leaseScript(leaseFuncs(t), "s"), b, gitEnv())
+	if code != 0 || !strings.Contains(stdout, "itest.example.com") {
+		t.Fatalf("lease = %q (exit %d) beside a lock its dead subshell left: %s", stdout, code, stderr)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("clearing the dead subshell's lock took %s; want no wait", took)
+	}
+}
