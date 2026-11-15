@@ -47,11 +47,18 @@ const interpCreateTimeout = 10 * time.Minute
 // everything here goes through the toolbox proxy.
 func interpSandbox(t *testing.T, runtime, image string) *microvm.Sandbox {
 	t.Helper()
+	return interpSandboxCmd(t, runtime, image, nil)
+}
+
+// interpSandboxCmd creates the sandbox with cmd as its main program (the
+// image's own command when cmd is nil).
+func interpSandboxCmd(t *testing.T, runtime, image string, cmd []string) *microvm.Sandbox {
+	t.Helper()
 	c := client(t)
 	ctx, cancel := context.WithTimeout(context.Background(), interpCreateTimeout)
 	defer cancel()
 	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t), Runtime: runtime, Image: image,
+		Name: harness.UniqueName(sc, t), Runtime: runtime, Image: image, ContainerCommand: cmd,
 	})
 	if err != nil {
 		t.Fatalf("create a %s sandbox from %s: %v", runtime, image, err)
@@ -966,7 +973,13 @@ func langHint(lang, image string) string {
 // context kept its state.
 func interpLanguage(t *testing.T, lang, image string, steps []langStep) {
 	t.Helper()
-	sb := interpSandbox(t, "docker", image)
+	interpLanguageCmd(t, lang, image, nil, steps)
+}
+
+// interpLanguageCmd is interpLanguage with cmd as the sandbox's main program.
+func interpLanguageCmd(t *testing.T, lang, image string, cmd []string, steps []langStep) {
+	t.Helper()
+	sb := interpSandboxCmd(t, "docker", image, cmd)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	for _, step := range steps {
@@ -983,7 +996,12 @@ func interpLanguage(t *testing.T, lang, image string, steps []langStep) {
 		if exec.Error != nil {
 			t.Fatalf("%s: RunCode(%q) raised %s: %s\n%s\n%s", lang, step.code, exec.Error.Name, exec.Error.Value, exec.Error.Traceback, langHint(lang, image))
 		}
+		// R shows each visible value as a display result, not the main one
+		// (as E2B's R kernel does), so look at every result's text.
 		got := exec.Text() + "\n" + interpStdout(exec)
+		for _, r := range exec.Results {
+			got += "\n" + r.Text
+		}
 		if step.want != "" && !strings.Contains(got, step.want) {
 			t.Fatalf("%s: RunCode(%q) produced result %q and stdout %q, want %q in them", lang, step.code, exec.Text(), interpStdout(exec), step.want)
 		}
@@ -1026,7 +1044,11 @@ func TestCodeInterpLangBash(t *testing.T) {
 // UC-716 — R on r-base.
 func TestCodeInterpLangR(t *testing.T) {
 	harness.Require(t, sc, "UC-716")
-	interpLanguage(t, "r", "r-base:latest", []langStep{
+	// r-base's own command is `R`, which exits at once with an error when it
+	// has no terminal ("you must specify '--save', ..."), and a sandbox ends
+	// with its main program: the run then lost its connection (close 1006).
+	// Keep the sandbox up with a command that does not exit.
+	interpLanguageCmd(t, "r", "r-base:latest", []string{"sleep", "infinity"}, []langStep{
 		{code: "x <- 41", want: ""},
 		{code: "x + 1", want: "42"},
 	})
