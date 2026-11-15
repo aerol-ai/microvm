@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bytecodealliance/wasmtime-go/v37"
+	"github.com/aerol-ai/wasmtime-go/v37"
 )
 
 const defaultWasmtimeFuel uint64 = 10_000_000_000

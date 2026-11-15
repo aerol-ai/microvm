@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bytecodealliance/wasmtime-go/v37"
+	"github.com/aerol-ai/wasmtime-go/v37"
 )
 
 // The wasmtime engine's WASI preview-1 layer. wasmtime's C API cannot

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/bytecodealliance/wasmtime-go/v37"
+	"github.com/aerol-ai/wasmtime-go/v37"
 )
 
 type wasmtimeNetHost struct {
