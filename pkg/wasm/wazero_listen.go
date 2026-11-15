@@ -14,7 +14,35 @@ const (
 	fdPreopen int32 = 3
 )
 
-// ResolvedListenPort returns the host TCP port bound by a wasip1 pre-open listener.
+// ResolvedListenPorts returns the host TCP port bound by the listener at
+// each of fds (0 where there is none), looking each fd up exactly. The
+// listeners follow the dir preopens, so with many preopens they sit past
+// any fixed window a scan would cover. Not safe while the module runs:
+// wazero's fd table is the guest's to change.
+func ResolvedListenPorts(mod api.Module, fds []int) []int {
+	return resolveListenPortsAt(mod, fds)
+}
+
+func resolveListenPortsAt(mod api.Module, fds []int) []int {
+	ports := make([]int, len(fds))
+	if mod == nil {
+		return ports
+	}
+	for i, fd := range fds {
+		file, found := moduleLookupFile(mod, int32(fd))
+		if !found {
+			continue
+		}
+		if port, ok := tcpListenPort(file); ok {
+			ports[i] = port
+		}
+	}
+	return ports
+}
+
+// ResolvedListenPort returns the host TCP port bound by a wasip1 pre-open
+// listener, scanning fds 3-10. The engine uses ResolvedListenPorts with the
+// exact fds instead (Capabilities.Listeners / ListenerFDs).
 func ResolvedListenPort(mod api.Module) (port int, ok bool) {
 	if mod == nil {
 		return 0, false

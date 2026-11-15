@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,6 +99,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	if eng := strings.TrimSpace(cfg.WasmEngine); eng != "" && eng != "wazero" {
 		_ = os.Setenv("AEROL_WASM_ENGINE", eng)
 	}
+	_ = os.Setenv(worker.ListenFallbackEnv, strconv.FormatBool(cfg.WasmWasmtimeListenFallback))
 	if dir := effectiveWasmCompileCacheDir(cfg); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			logger.Warn("wasm compile cache dir not created", "dir", dir, "error", err)

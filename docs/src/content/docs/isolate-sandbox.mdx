@@ -269,6 +269,7 @@ Bundles stored in a registry, so that any worker can fetch them, are planned.
 ## Good to know
 
 - **No shell, no files, no programs.** `exec` only calls your fetch handler. The other toolbox calls (the toolbox is the helper the SDK talks to for files, sessions and processes) return `501 Not Implemented`. SSH is not available.
+- **No code interpreter.** The Daytona `codeInterpreter` and the E2B code interpreter return `501`. So do Daytona's `process.codeRun` and streaming exec. They need a shell or a running program, and an isolate has neither. Use `exec` to call your handler.
 - **No images or storage.** Container images, mounts and platform volumes are rejected.
 - **Lost on restart.** Isolates use `durability: "ephemeral"` by default. `passivatable` is rejected because there is nothing to save: the bundle is the whole sandbox. `durable` is not available yet.
 - **No GPU, no templates.** `gpus` and `template_id` are rejected.

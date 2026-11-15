@@ -5,41 +5,33 @@ import (
 	"strings"
 )
 
-// Sessions are intentionally unsupported on the WASM runtime, and every session
-// route fails closed with 501.
+// The native /sessions routes (create, list, get, delete, signal, resize,
+// log, recording, attach) are interactive terminals: a long-lived shell
+// with a pty, attach, resize and recordings. A WASM sandbox has no shell
+// and no terminal, and this toolhost runs IN-PROCESS in sandboxd on the
+// host, so it must never start one (#534 removed a host shell from here).
+// Every action answers 501, read-only ones too, so a caller cannot mistake
+// an empty session list for a working feature.
 //
-// Like code-run (coderun.go) and streaming exec (exec_stream.go), this toolhost
-// runs IN-PROCESS in sandboxd, on the host. The /sessions routes (create, list,
-// get, delete, signal, resize, log, recording, attach) and the Daytona-style
-// /process/session routes (create, list, get, delete, exec, and a command's
-// get / logs / input) were backed by the toolboxd sessions Manager, which starts
-// a session's shell and commands with exec.Command — on the host, as the daemon
-// user, in the daemon's environment, NOT inside the sandbox. A WASM sandbox has
-// no shell: the engine runs the sandbox's own module, and there is no in-engine
-// equivalent of a long-lived interactive process. So the host path is removed
-// rather than left dormant, and the driver no longer builds a Manager at all.
-//
-// Every action answers 501, read-only ones too, so a caller cannot mistake an
-// empty session list for a working feature. To run a command IN a wasm sandbox,
-// use the confined POST /process/execute, which runs the module inside the
-// engine. Sessions in docker / gvisor / firecracker sandboxes are served by
-// toolboxd inside the guest and are unaffected.
+// What does work on WASM, inside the engine: Daytona-style command
+// sessions (/process/session, process_session.go, issue #178), a streamed
+// command (GET /process/exec/stream) and a one-shot run (POST
+// /process/execute). Sessions in docker / gvisor / firecracker sandboxes
+// are served by toolboxd inside the guest and are unaffected.
 func (h *Host) handleSessions(w http.ResponseWriter, _ *http.Request) {
 	writeError(w, http.StatusNotImplemented,
-		"sessions are not supported on the wasm runtime; use POST /process/execute")
+		"interactive sessions (/sessions) are not supported on the wasm runtime: a wasm sandbox has no shell or terminal; "+
+			"use /process/session for command sessions or GET /process/exec/stream to stream a command")
 }
 
-// sessionRoots are the two session route families: the native toolbox one and
-// the Daytona-compatible one the Daytona and Runloop facades call.
-var sessionRoots = [...]string{"/sessions", "/process/session"}
+// isNativeSessionPath reports whether path is /sessions or under it. A
+// sibling such as /sessionsX is not, and falls through to the toolbox's 404.
+func isNativeSessionPath(path string) bool {
+	return path == "/sessions" || strings.HasPrefix(path, "/sessions/")
+}
 
-// isSessionPath reports whether path is a session root or under one. A sibling
-// such as /sessionsX is not, and falls through to the toolbox's 404.
-func isSessionPath(path string) bool {
-	for _, root := range sessionRoots {
-		if path == root || strings.HasPrefix(path, root+"/") {
-			return true
-		}
-	}
-	return false
+// isProcessSessionPath is the same for the Daytona-compatible family the
+// Daytona and Runloop facades call.
+func isProcessSessionPath(path string) bool {
+	return path == "/process/session" || strings.HasPrefix(path, "/process/session/")
 }

@@ -48,11 +48,55 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	conn, err := c.dialContext(ctx)
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := writeFrame(conn, env); err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	reply, err := readFrame(conn)
+	if err != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	return reply, nil
+}
+
+// contextErr is ctx.Err(), but also reports a deadline that has passed
+// before ctx's own timer fired. The connection carries the same deadline, so
+// its read can fail with an i/o timeout a moment before ctx notices; callers
+// must still see context.DeadlineExceeded, not the socket error.
+func contextErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// dialContext dials the worker, giving up when ctx ends. A nil ctx means
+// context.Background().
+func (c *Client) dialContext(ctx context.Context) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Avoid launching a dial goroutine for an already-cancelled request. Apart
 	// from unnecessary work, a custom/test dialer could otherwise outlive the
 	// call and retain resources after the caller has moved on.
 	if err := ctx.Err(); err != nil {
-		return Envelope{}, err
+		return nil, err
 	}
 	type dialResult struct {
 		conn net.Conn
@@ -76,34 +120,12 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 			}
 		}
 	}()
-	var res dialResult
 	select {
-	case res = <-ch:
+	case res := <-ch:
+		return res.conn, res.err
 	case <-ctx.Done():
-		return Envelope{}, ctx.Err()
+		return nil, ctx.Err()
 	}
-	if res.err != nil {
-		return Envelope{}, res.err
-	}
-	conn := res.conn
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	if err := writeFrame(conn, env); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Envelope{}, ctxErr
-		}
-		return Envelope{}, err
-	}
-	reply, err := readFrame(conn)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Envelope{}, ctxErr
-		}
-		return Envelope{}, err
-	}
-	return reply, nil
 }
 
 func (c *Client) expectOK(reply Envelope) error {
@@ -132,27 +154,57 @@ func (c *Client) Ping(sandboxID string) error {
 	return nil
 }
 
-// InstanceLoaded reports whether the worker currently has an engine/module loaded.
-func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+// InstanceStatus is a worker's answer about one sandbox's instance.
+type InstanceStatus struct {
+	// Loaded: the worker has its module loaded and, when Checked, holds the
+	// asked sandbox's instance (a resident host: has an instance for it).
+	Loaded bool
+	// SandboxID is the sandbox whose instance the worker says it holds.
+	SandboxID string
+	// Checked is false from a worker that predates identity answers: it
+	// cannot say whose instance it holds.
+	Checked bool
+}
+
+// Foreign reports whether the worker said it holds another sandbox's
+// instance than sandboxID's.
+func (s InstanceStatus) Foreign(sandboxID string) bool {
+	return s.Checked && sandboxID != "" && s.SandboxID != "" && s.SandboxID != sandboxID
+}
+
+// InstanceStatus asks the worker about sandboxID's instance ("" asks only
+// whether the module is loaded).
+func (c *Client) InstanceStatus(ctx context.Context, sandboxID string) (InstanceStatus, error) {
 	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgInstanceStatus, SandboxID: sandboxID})
 	if err != nil {
-		return false, err
+		return InstanceStatus{}, err
 	}
 	if reply.Type == MsgError {
 		var p errorPayload
 		if err := decodePayload(reply.Payload, &p); err != nil {
-			return false, err
+			return InstanceStatus{}, err
 		}
-		return false, fmt.Errorf("%s", p.Message)
+		return InstanceStatus{}, fmt.Errorf("%s", p.Message)
 	}
 	if reply.Type != MsgOK {
-		return false, fmt.Errorf("unexpected reply type %q", reply.Type)
+		return InstanceStatus{}, fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
 	var p instanceStatusPayload
 	if err := decodePayload(reply.Payload, &p); err != nil {
+		return InstanceStatus{}, err
+	}
+	return InstanceStatus{Loaded: p.Loaded, SandboxID: p.SandboxID, Checked: p.Checked}, nil
+}
+
+// InstanceLoaded reports whether the worker has its module loaded and, for a
+// sandboxID, still holds that sandbox's instance. A worker holding another
+// sandbox's instance answers false, here as well as in the worker.
+func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+	st, err := c.InstanceStatus(ctx, sandboxID)
+	if err != nil {
 		return false, err
 	}
-	return p.Loaded, nil
+	return st.Loaded && !st.Foreign(sandboxID), nil
 }
 
 // LoadModule compiles the module at path inside the worker process and returns

@@ -22,6 +22,25 @@ func ManagerOptions(l codeinterp.Launcher, lim *codeinterp.Limit) codeinterp.Opt
 	return managerOptions(l, lim, DefaultCwd, os.MkdirAll, os.Getwd)
 }
 
+// ManagerOptionsAt is ManagerOptions for a launcher whose kernels see a file
+// system of their own, such as a WASM sandbox's /work: contexts that name
+// no cwd start in cwd as given, since the agent can neither make nor check
+// a folder there. When the launcher can say which languages it has
+// drivers for (a Languages method), the others are refused up front, so
+// E2B's javascript default is never registered where it cannot run.
+func ManagerOptionsAt(l codeinterp.Launcher, lim *codeinterp.Limit, cwd string) codeinterp.Options {
+	opts := codeinterp.Options{
+		Launcher:     l,
+		Limit:        lim,
+		DefaultCwd:   cwd,
+		ListDefaults: true,
+	}
+	if ls, ok := l.(interface{ Languages() []string }); ok {
+		opts.Languages = ls.Languages()
+	}
+	return opts
+}
+
 func managerOptions(l codeinterp.Launcher, lim *codeinterp.Limit, cwd string,
 	mkdirAll func(string, os.FileMode) error, getwd func() (string, error)) codeinterp.Options {
 	return codeinterp.Options{

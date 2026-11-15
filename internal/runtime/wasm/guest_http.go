@@ -2,11 +2,11 @@ package wasm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/models"
-	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 // GuestListenPortSyncer hot-updates wasip1 listener caps after expose_port.
@@ -14,10 +14,10 @@ type GuestListenPortSyncer interface {
 	SyncGuestListenPorts(ctx context.Context, sandboxID string, ports []int) error
 }
 
-// SyncGuestListenPorts enables or disables the guest wasip1 listener to match
-// exposed HTTP ports. When multiple ports are exposed, the lowest port wins.
-// Port 0 requests an ephemeral guest bind; the resolved host port is stored on
-// the instance and ProxyHTTP dials via guestPort=0.
+// SyncGuestListenPorts makes the guest's wasip1 listeners match the exposed
+// HTTP ports: one listener per port, each on an ephemeral loopback port
+// (syncGuestListeners). A worker from an older release keeps one listener
+// for every port.
 func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, ports []int) error {
 	inst, err := d.instance(sandboxID)
 	if err != nil {
@@ -26,9 +26,12 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 	if inst.status != models.SandboxStatusStarted {
 		return nil
 	}
-	listenPort := wasip1ListenPort(ports)
+	// One sync per sandbox at a time, from here: two exposes at once would
+	// each migrate a resident sandbox, or each re-instantiate the guest.
+	inst.listenSync.Lock()
+	defer inst.listenSync.Unlock()
 	if inst.fromResidentHost {
-		if listenPort == wasmengine.WASIListenPortDisabled {
+		if len(desiredListenPorts(ports)) == 0 {
 			// Resident sandboxes are non-listen by construction — there is no
 			// listener to disable, so an unexpose is a no-op (do not send a
 			// listener op to the shared host, which rejects them).
@@ -42,8 +45,13 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 		}
 	}
 	client := d.newWorkerClient(inst.socketPath)
-	return d.syncGuestListenPort(ctx, inst, client, listenPort)
+	return d.syncGuestListeners(ctx, inst, client, ports)
 }
+
+// ErrGuestNotListening: the sandbox has no guest listener to take a request
+// for an exposed port yet (none was started, or starting it failed). The
+// HTTP gateway answers it with 503.
+var ErrGuestNotListening = errors.New("wasm guest is not listening for HTTP")
 
 func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	inst, err := d.instance(sandboxID)
@@ -53,11 +61,20 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 	if inst.status != models.SandboxStatusStarted {
 		return fmt.Errorf("wasm sandbox %q is not started", sandboxID)
 	}
-	client := d.newWorkerClient(inst.socketPath)
-	// Ephemeral wasip1 guests listen on resolvedListenPort; ProxyHTTP(0) dials caps.
-	proxyPort := guestPort
-	if inst.resolvedListenPort > 0 {
-		proxyPort = 0
+	st := inst.guestListen()
+	proxyPort := 0
+	switch {
+	case len(st.ports) > 0:
+		// A worker of this release routes the exposed port to its guest's
+		// own listener for it, and never dials a port it is sent.
+		proxyPort = guestPort
+	case st.primary > 0:
+		// Port 0 asks the worker for its own listener. The exposed port is
+		// never sent to a worker from an older release: it dials a port it
+		// is given on the host, where any process can listen on it.
+	default:
+		return fmt.Errorf("%w on port %d of sandbox %q", ErrGuestNotListening, guestPort, sandboxID)
 	}
+	client := d.newWorkerClient(inst.socketPath)
 	return client.ProxyHTTP(sandboxID, proxyPort, w, r)
 }

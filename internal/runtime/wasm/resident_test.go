@@ -414,7 +414,8 @@ func TestMigrateResidentToCold(t *testing.T) {
 	if inst.fromResidentHost {
 		t.Fatal("still resident after migrate")
 	}
-	if inst.workerKey != "sb-exp" || filepath.Base(inst.socketPath) != "worker.sock" {
+	// The cold worker's socket is in the driver's sockets dir, not in /work.
+	if inst.workerKey != "sb-exp" || inst.socketPath != d.workerSocketPath("sb-exp") {
 		t.Fatalf("routing not flipped to cold worker: workerKey=%q socket=%q", inst.workerKey, inst.socketPath)
 	}
 	if !client.stopped {
@@ -556,10 +557,11 @@ func TestExposeMigrationFailureLeavesResident(t *testing.T) {
 	d.SetModuleResolver(fakeResolver{path: modPath, digest: "deadbeef"})
 	d.SetWorkerSupervisor(perSandbox)
 	d.SetResidentHostSupervisor(resident)
-	// The cold worker socket ends in worker.sock — fail its Instantiate; the
-	// resident bucket socket uses the normal client so the create still succeeds.
+	// The cold worker socket is in the sockets dir — fail its Instantiate;
+	// the resident bucket socket uses the normal client so the create still
+	// succeeds.
 	d.SetWorkerClientFactory(func(socket string) WorkerClient {
-		if filepath.Base(socket) == "worker.sock" {
+		if filepath.Base(filepath.Dir(socket)) == socketsDirName {
 			return failing
 		}
 		return normal

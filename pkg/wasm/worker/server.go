@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -21,8 +22,68 @@ type Server struct {
 	net           *NetMediator
 	auditMu       sync.RWMutex
 	auditBindings map[string]egressAuditBinding
-	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick drains them.
+	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick
+	// drains them. netMu guards the map: connections are served
+	// concurrently, and a stream adds bytes while other messages run.
+	netMu     sync.Mutex
 	workerNet map[string]*workerNetUsage
+	// holder is the sandbox whose instance this worker holds, set by the
+	// first Instantiate or Restore that names one and kept for the process's
+	// life (refuseForeign). Atomic, not under mu: every message reads it,
+	// and mu is held across module compiles and checkpoints.
+	holder atomic.Pointer[string]
+	// modulePath and moduleMemoryMB record the last MsgLoadModule, so a
+	// stream that names no module runs the sandbox's own (guarded by mu).
+	modulePath     string
+	moduleMemoryMB int
+	streams        streamRegistry
+	entry          entrypointLog // the serving guest's output (entrypoint.go)
+	// loaded is the module eng runs and the engine it runs on, under mu
+	// (listen_engine.go).
+	loaded loadedEngine
+}
+
+// errForeignSandbox refuses a message for another sandbox than the one
+// whose instance the worker holds. It names neither sandbox: the error can
+// reach the caller of the request that carried the wrong id.
+var errForeignSandbox = errors.New("wasm worker holds another sandbox's instance")
+
+// holderID is the sandbox this worker holds, "" before its first instance.
+func (s *Server) holderID() string {
+	if p := s.holder.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// bindHolder records sandboxID as the holder once an instance of it is up.
+// The caller holds mu, which serializes Instantiate and Restore, and has
+// checked (refuseForeign) that no other sandbox holds the worker.
+func (s *Server) bindHolder(sandboxID string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID != "" && s.holder.Load() == nil {
+		s.holder.Store(&sandboxID)
+	}
+}
+
+// refuseForeign keeps a per-sandbox worker to its one sandbox. sandboxd
+// reaches a worker by its socket path, and a path can lead to the wrong
+// worker: a pre-upgrade sandbox's socket sits in its own /work, where the
+// guest can swap it for a link to another sandbox's socket. Once the worker
+// holds an instance, a message for any other sandbox is refused, so such a
+// swap breaks only the sandbox that made it. Ping and the status question
+// are answered for anyone: they reveal nothing and change nothing. Ids
+// are trimmed as MsgNetstatsTick trims them.
+func (s *Server) refuseForeign(env Envelope) error {
+	switch env.Type {
+	case MsgHealthPing, MsgInstanceStatus:
+		return nil
+	}
+	id := strings.TrimSpace(env.SandboxID)
+	if holder := s.holderID(); holder != "" && id != "" && id != holder {
+		return errForeignSandbox
+	}
+	return nil
 }
 
 type workerNetUsage struct {
@@ -31,6 +92,8 @@ type workerNetUsage struct {
 }
 
 func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
 	if s.workerNet == nil {
 		s.workerNet = make(map[string]*workerNetUsage)
 	}
@@ -51,12 +114,33 @@ func (s *Server) mediator() *NetMediator {
 	return s.net
 }
 
-// close stops the mediator's operator-file poll with the worker.
+// close stops the mediator's operator-file poll and every stream with the worker.
 func (s *Server) close() {
+	s.streams.closeAll()
 	s.mu.Lock()
 	m := s.net
 	s.mu.Unlock()
 	m.stopOperatorWatch()
+}
+
+// serverStreamHost adapts Server to the shared stream code, taking s.mu for
+// the lazily built mediator and the loaded module.
+type serverStreamHost struct{ s *Server }
+
+func (h serverStreamHost) mediator() *NetMediator {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.mediator()
+}
+
+func (h serverStreamHost) streamUsage(sandboxID string) *workerNetUsage {
+	return h.s.netUsageFor(sandboxID)
+}
+
+func (h serverStreamHost) ownModule() (string, int) {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.modulePath, h.s.moduleMemoryMB
 }
 
 func (s *Server) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
@@ -171,6 +255,16 @@ func (s *Server) Serve(conn net.Conn) error {
 		if err != nil {
 			return err
 		}
+		// Instantiate and Restore check in their own cases, under mu, where
+		// they bind the holder.
+		if env.Type != MsgInstantiate && env.Type != MsgRestore {
+			if refused := s.refuseForeign(env); refused != nil {
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+		}
 		switch env.Type {
 		case MsgHealthPing:
 			if err := writeFrame(conn, Envelope{Type: MsgPong, SandboxID: env.SandboxID}); err != nil {
@@ -180,7 +274,14 @@ func (s *Server) Serve(conn net.Conn) error {
 			s.mu.Lock()
 			loaded := s.eng != nil
 			s.mu.Unlock()
-			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded})
+			holder := s.holderID()
+			if asked := strings.TrimSpace(env.SandboxID); asked != "" && asked != holder {
+				// Asked about one sandbox, the worker answers for the
+				// instance it holds: a restarted sandboxd adopts a worker
+				// only for the sandbox that worker says it serves.
+				loaded = false
+			}
+			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded, SandboxID: holder, Checked: true})
 			if encErr != nil {
 				return encErr
 			}
@@ -197,11 +298,15 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			// A new module replaces the sandbox's code: its runs of the old
+			// code end with it.
+			s.streams.killSandbox(env.SandboxID)
 			s.mu.Lock()
 			if s.eng != nil {
 				_ = s.eng.Close(ctx)
 				s.eng = nil
 			}
+			s.modulePath = ""
 			newEngStart := time.Now()
 			s.eng, err = wasmengine.NewEngineFor(ctx, workerEngineName())
 			newEngDur := time.Since(newEngStart)
@@ -213,6 +318,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			err = s.eng.LoadModule(ctx, p.Path, wasmengine.LoadOptions{MemoryMB: p.MemoryMB})
+			s.noteLoadedLocked(p, err)
 			// Read the engine's sub-stage breakdown before releasing the lock; the
 			// worker owns the NewEngineFor cost, so we splice it in here.
 			var timings wasmengine.LoadTimings
@@ -220,6 +326,10 @@ func (s *Server) Serve(conn net.Conn) error {
 				timings = r.LastLoadTimings()
 			}
 			timings.NewEngine = newEngDur
+			if err == nil {
+				s.modulePath, s.moduleMemoryMB = p.Path, p.MemoryMB
+				s.entry.attach(s.eng)
+			}
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
@@ -242,8 +352,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
+			// Under mu, which serializes instantiations: of two first ones
+			// for different sandboxes, the second must not replace the
+			// instance the first one bound.
+			if refused := s.refuseForeign(env); refused != nil {
+				s.mu.Unlock()
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			if s.eng == nil {
 				s.mu.Unlock()
 				s.clearAuditBinding(env.SandboxID)
@@ -259,6 +379,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err == nil {
 				s.lastCaps = p.Caps
 				s.syncResolvedListenPort(&s.lastCaps)
+				s.bindHolder(env.SandboxID)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -343,7 +464,9 @@ func (s *Server) Serve(conn net.Conn) error {
 			eng := s.eng
 			s.mu.Unlock()
 			start := time.Now()
+			gen := s.entry.begin(env.SandboxID)
 			err = eng.InvokeExport(invokeCtx, p.Export)
+			s.entry.end(gen, err)
 			_ = time.Since(start) // wall time accounted on Exec path via RunResult
 			cancel()
 			if err != nil {
@@ -356,6 +479,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				return err
 			}
 		case MsgStopInstance:
+			s.streams.killSandbox(env.SandboxID)
 			s.mu.Lock()
 			if s.eng != nil {
 				err = s.eng.StopInstance(ctx)
@@ -427,8 +551,15 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
+			if refused := s.refuseForeign(env); refused != nil {
+				s.mu.Unlock()
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			if s.eng == nil {
 				s.mu.Unlock()
 				s.clearAuditBinding(env.SandboxID)
@@ -444,6 +575,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err == nil {
 				s.lastCaps = p.Caps
 				s.syncResolvedListenPort(&s.lastCaps)
+				s.bindHolder(env.SandboxID)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -543,15 +675,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			if p.Port != wasmengine.WASIListenPortDisabled && !s.eng.SupportsListen() {
-				s.mu.Unlock()
-				if replyErr(env.SandboxID, fmt.Errorf("HTTP ingress (expose_port) is not supported on the %q WASM engine; use SB_WASM_ENGINE=wazero", workerEngineName())) != nil {
-					return err
+			if p.Port != wasmengine.WASIListenPortDisabled {
+				if listenErr := s.ensureListenEngineLocked(ctx, env.SandboxID); listenErr != nil {
+					s.mu.Unlock()
+					if replyErr(env.SandboxID, listenErr) != nil {
+						return err
+					}
+					continue
 				}
-				continue
 			}
 			s.bindNetworkHook(env.SandboxID)
 			next := s.lastCaps
+			next.WASIListeners = nil
 			next.WASIListenPort = p.Port
 			if strings.TrimSpace(p.Host) != "" {
 				next.WASIListenHost = p.Host
@@ -604,6 +739,10 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := writeFrame(conn, Envelope{Type: MsgProxyHTTPResult, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
+		case MsgSetListenPorts, MsgListenPorts:
+			if err := s.serveListenPorts(ctx, conn, env); err != nil {
+				return err
+			}
 		case MsgNetstatsTick:
 			sandboxID := strings.TrimSpace(env.SandboxID)
 			u := s.netUsageFor(sandboxID)
@@ -618,6 +757,16 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: sandboxID, Payload: body}); err != nil {
 				return err
 			}
+		case MsgExecStart:
+			// The connection now belongs to the run; it closes when the run ends.
+			return s.streams.serve(serverStreamHost{s: s}, conn, env)
+		case MsgExecKill:
+			if err := s.streams.serveExecKill(conn, env); err != nil {
+				return err
+			}
+		case MsgEntrypointLogs:
+			// The connection may become a follow; it closes when that ends.
+			return s.entry.serve(conn, env)
 		default:
 			if err := writeFrame(conn, Envelope{
 				Type:      MsgInvokeResult,

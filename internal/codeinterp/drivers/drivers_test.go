@@ -52,6 +52,60 @@ func TestRegistry(t *testing.T) {
 	}
 }
 
+// checkDriver checks lang's registration: programs, file name, argv, and
+// that the script is the embedded one.
+func checkDriver(t *testing.T, lang string, programs []string, fileName string, wantArgs []string, marker string) {
+	t.Helper()
+	d, ok := Lookup(lang)
+	if !ok {
+		t.Fatalf("no %s driver", lang)
+	}
+	if d.Language != lang || !reflect.DeepEqual(d.Programs, programs) || d.FileName != fileName ||
+		!bytes.Contains(d.Script, []byte(marker)) {
+		t.Fatalf("%s driver = %+v", lang, d)
+	}
+	if got := d.Args("/bin/prog", "/d/"+fileName); !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("%s Args = %q, want %q", lang, got, wantArgs)
+	}
+}
+
+// checkDriverRefuses runs lang's script the wrong ways, outside fd mode
+// and in fd mode without descriptors 3 and 4: it must exit non-zero and
+// say why on stderr, not hang or start serving. Skipped without the
+// interpreter.
+func checkDriverRefuses(t *testing.T, lang string) {
+	t.Helper()
+	d, _ := Lookup(lang)
+	program := ""
+	for _, p := range d.Programs {
+		if path, err := exec.LookPath(p); err == nil {
+			program = path
+			break
+		}
+	}
+	if program == "" {
+		t.Skipf("no %s interpreter", lang)
+	}
+	script := filepath.Join(t.TempDir(), d.FileName)
+	if err := os.WriteFile(script, d.Script, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"stdio", "fd"} {
+		ctx, cancel := context.WithTimeout(context.Background(), codeinterp.LaunchTimeout)
+		args := d.Args(program, script)
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Env = append(os.Environ(), "AEROL_INTERP_MODE="+mode, "AEROL_INTERP_NONCE=n")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		timedOut := ctx.Err() != nil
+		cancel()
+		if err == nil || timedOut || !strings.Contains(stderr.String(), "aerolvm interpreter driver: ") {
+			t.Fatalf("%s driver in %s mode without descriptors: err %v, stderr %q", lang, mode, err, stderr.String())
+		}
+	}
+}
+
 func TestRegisterRejectsBadDrivers(t *testing.T) {
 	py, _ := Lookup(codeinterp.LangPython)
 	for name, d := range map[string]Driver{
@@ -231,6 +285,69 @@ func TestPythonDriverStdioMode(t *testing.T) {
 	checkStdioProtocol(t, &stdioDriver{t: t, w: stdin, fr: codeinterp.NewFrameReader(stdout)}, true)
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("driver exit after QUIT: %v (%s)", err, stderr.String())
+	}
+}
+
+// TestPythonDriverStdioCwd covers how a WASM kernel gets its cwd: started
+// with -c (no script file), it enters AEROL_INTERP_CWD before READY, and a
+// cwd that does not exist is a FATAL start.
+func TestPythonDriverStdioCwd(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("no python3")
+	}
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, cwd, code string
+		want            []string
+	}{
+		{name: "enters the cwd", cwd: cwd, code: "import os, sys\nprint(os.getcwd(), sys.path.count(''))",
+			want: []string{"READY", "OUT:" + cwd + " 1\n"}},
+		{name: "a missing cwd is fatal", cwd: filepath.Join(cwd, "missing"),
+			want: []string{"FATAL:FileNotFoundError"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(python, "-c", `import sys;exec(compile(sys.argv.pop(1),"<driver>","exec"))`, string(pythonDriver))
+			cmd.Env = append(os.Environ(), "AEROL_INTERP_MODE=stdio", "AEROL_INTERP_CWD="+tc.cwd)
+			var in bytes.Buffer
+			if tc.code != "" {
+				_ = codeinterp.WriteFrame(&in, "EXEC", []byte(tc.code))
+			}
+			cmd.Stdin = &in
+			out, _ := cmd.Output()
+			fr := codeinterp.NewFrameReader(bytes.NewReader(out))
+			var got []string
+			for {
+				kind, payload, err := fr.Read()
+				if err != nil {
+					break
+				}
+				switch kind {
+				case "READY":
+					got = append(got, kind)
+				case "OUT":
+					got = append(got, kind+":"+string(payload))
+				case "FATAL":
+					name, _, _ := strings.Cut(string(payload), ":")
+					got = append(got, kind+":"+name)
+				}
+			}
+			// OUT arrives as one frame per write: join them.
+			if len(got) > 2 && strings.HasPrefix(got[1], "OUT:") {
+				joinedOut := "OUT:"
+				for _, g := range got[1:] {
+					joinedOut += strings.TrimPrefix(g, "OUT:")
+				}
+				got = []string{got[0], joinedOut}
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("frames = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

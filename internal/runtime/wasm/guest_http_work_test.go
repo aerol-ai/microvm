@@ -23,8 +23,7 @@ func TestDriverWasip1HTTPServeWhileWorkPreopen(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-work")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {

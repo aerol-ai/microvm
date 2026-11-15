@@ -15,25 +15,25 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/gorilla/websocket"
 )
 
-// streamFramePrefixStdout / streamFramePrefixStderr are the first byte of
-// every server→client binary frame. Single-byte prefix avoids a JSON envelope
-// on the hot path (large stdout dumps, video streams, etc.).
+// The exec stream's wire format lives in internal/toolboxwire, shared with
+// the WASM toolhost so both servers speak the same protocol.
 const (
-	streamFramePrefixStdout byte = 0x01
-	streamFramePrefixStderr byte = 0x02
+	streamFramePrefixStdout = toolboxwire.FramePrefixStdout
+	streamFramePrefixStderr = toolboxwire.FramePrefixStderr
 )
 
-// Exec-stream liveness (plans/mcp-server-and-agent-cli.md, eng re-review RR1).
-// A dropped stream kills its command (execStreamKiller), so a healthy stream
-// that is merely silent must not read as dropped. toolboxd pings every
-// execStreamPingInterval, and the read deadline is execStreamPongWait,
-// extended by every pong and every client message. Proxies that close idle
-// WebSockets after about a minute see traffic every 30s, and a real drop is
-// noticed within 90s. Clients need no change: gorilla and browser WebSockets
-// answer pings on their own.
+type (
+	execStreamStartMsg   = toolboxwire.ExecStreamStart
+	execStreamControlIn  = toolboxwire.ExecStreamControlIn
+	execStreamControlOut = toolboxwire.ExecStreamControlOut
+)
+
+// execStreamLiveness is toolboxwire.Liveness with toolboxd's test override
+// (server.execLiveness); see toolboxwire.Liveness for why streams ping.
 type execStreamLiveness struct {
 	pingInterval  time.Duration
 	pongWait      time.Duration
@@ -41,9 +41,9 @@ type execStreamLiveness struct {
 }
 
 var defaultExecStreamLiveness = execStreamLiveness{
-	pingInterval:  30 * time.Second,
-	pongWait:      90 * time.Second,
-	pingWriteWait: 10 * time.Second,
+	pingInterval:  toolboxwire.DefaultLiveness.PingInterval,
+	pongWait:      toolboxwire.DefaultLiveness.PongWait,
+	pingWriteWait: toolboxwire.DefaultLiveness.PingWriteWait,
 }
 
 func (s *server) execStreamLiveness() execStreamLiveness {
@@ -57,45 +57,9 @@ func (s *server) execStreamLiveness() execStreamLiveness {
 	return cfg
 }
 
-var execStreamUpgrader = websocket.Upgrader{
-	// Auth happens in the HTTP handler before upgrade. Once upgraded the
-	// connection is private to the authenticated caller, so we don't need
-	// origin checks (also avoids breaking SDK / CLI clients that don't set
-	// Origin).
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	ReadBufferSize:  64 * 1024,
-	WriteBufferSize: 64 * 1024,
-	// Echo `sandbox.bearer` if the client offered it. The pattern lets
-	// browsers smuggle the bearer token through Sec-WebSocket-Protocol since
-	// they can't set Authorization on a WebSocket constructor.
-	Subprotocols: []string{"sandbox.bearer"},
-}
-
-type execStreamStartMsg struct {
-	Command string `json:"command"`
-	// Argv runs a program with these arguments instead of Command, with no
-	// shell parsing (E2); see exec_argv.go.
-	Argv    []string          `json:"argv,omitempty"`
-	Workdir string            `json:"workdir,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
-	TTY     bool              `json:"tty,omitempty"`
-	Cols    int               `json:"cols,omitempty"`
-	Rows    int               `json:"rows,omitempty"`
-}
-
-type execStreamControlIn struct {
-	Type   string `json:"type"`
-	Cols   int    `json:"cols,omitempty"`
-	Rows   int    `json:"rows,omitempty"`
-	Signal string `json:"signal,omitempty"`
-}
-
-type execStreamControlOut struct {
-	Type    string `json:"type"`
-	Code    int    `json:"code,omitempty"`
-	Signal  string `json:"signal,omitempty"`
-	Message string `json:"message,omitempty"`
-}
+// execStreamUpgrader echoes sandbox.bearer and skips origin checks; see
+// toolboxwire.NewExecStreamUpgrader. Argv (E2) is handled in exec_argv.go.
+var execStreamUpgrader = toolboxwire.NewExecStreamUpgrader()
 
 func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 	conn, err := execStreamUpgrader.Upgrade(w, r, nil)
@@ -108,7 +72,7 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 
 	// First message defines the process to run. Bound the wait so a stalled
 	// client can't hold a goroutine open indefinitely.
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(toolboxwire.StartTimeout)); err != nil {
 		return
 	}
 	var start execStreamStartMsg
@@ -171,30 +135,11 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 // deadline. extend must be called after every client message (it runs on the
 // reader goroutine, as does the pong handler). stop ends the pinger.
 func armExecStreamLiveness(conn *websocket.Conn, cfg execStreamLiveness) (extend func(), stop func()) {
-	extend = func() { _ = conn.SetReadDeadline(time.Now().Add(cfg.pongWait)) }
-	extend()
-	conn.SetPongHandler(func(string) error {
-		extend()
-		return nil
+	return toolboxwire.ArmLiveness(conn, toolboxwire.Liveness{
+		PingInterval:  cfg.pingInterval,
+		PongWait:      cfg.pongWait,
+		PingWriteWait: cfg.pingWriteWait,
 	})
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(cfg.pingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				// WriteControl is safe alongside the output pumps' writes.
-				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(cfg.pingWriteWait)); err != nil {
-					return
-				}
-			}
-		}
-	}()
-	var once sync.Once
-	return extend, func() { once.Do(func() { close(done) }) }
 }
 
 // execStreamKiller kills the command's process group when the client side of

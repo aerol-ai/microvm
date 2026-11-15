@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,7 +67,38 @@ func writeMinimalModule(t *testing.T, dir string) string {
 	return path
 }
 
-func TestProxyHTTPForwardsToGuestBackend(t *testing.T) {
+// sentinelListener listens on a loopback port and counts the connections it
+// gets, for tests that a request's port number is never dialed.
+func sentinelListener(t *testing.T) (port int, conns func() int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("sentinel listen: %v", err)
+	}
+	var n atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			_ = c.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+	return ln.Addr().(*net.TCPAddr).Port, n.Load
+}
+
+// The exposed port a request names is a routing key. Dialing it would reach
+// whatever listens on that port on the host, so the worker must refuse the
+// request when its guest has no listener rather than dial the port.
+func TestProxyHTTPNeverDialsTheRequestedPort(t *testing.T) {
 	client, cleanup := startTestWorker(t)
 	defer cleanup()
 
@@ -73,24 +107,7 @@ func TestProxyHTTPForwardsToGuestBackend(t *testing.T) {
 	if _, err := client.LoadModule(sandboxID, modPath, 0); err != nil {
 		t.Fatalf("LoadModule: %v", err)
 	}
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/hello" {
-			t.Fatalf("path = %q", r.URL.Path)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("from-guest"))
-	}))
-	defer backend.Close()
-
-	host, portStr, err := net.SplitHostPort(backend.Listener.Addr().String())
-	if err != nil {
-		t.Fatalf("SplitHostPort: %v", err)
-	}
-	var port int
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
-		t.Fatalf("parse port: %v", err)
-	}
-	_ = host
+	sentinel, conns := sentinelListener(t)
 
 	if err := client.Instantiate(sandboxID, wasmengine.Capabilities{
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
@@ -102,26 +119,40 @@ func TestProxyHTTPForwardsToGuestBackend(t *testing.T) {
 		t.Fatalf("SetListenPort disable: %v", err)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, "http://gateway/hello", nil)
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
+	for _, port := range []int{sentinel, 0} {
+		req, err := http.NewRequest(http.MethodGet, "http://gateway/hello", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		rec := httptest.NewRecorder()
+		err = client.ProxyHTTP(sandboxID, port, rec, req)
+		if err == nil || !strings.Contains(err.Error(), "not listening") {
+			t.Fatalf("ProxyHTTP(port %d) = %v (status %d), want a not-listening error", port, err, rec.Code)
+		}
 	}
-	rec := httptest.NewRecorder()
-	if err := client.ProxyHTTP(sandboxID, port, rec, req); err != nil {
-		t.Fatalf("ProxyHTTP: %v", err)
+	if n := conns(); n != 0 {
+		t.Fatalf("sentinel on the requested port got %d connections, want 0", n)
 	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%q", rec.Code, rec.Body.String())
+}
+
+// A worker with a live listener sends every request to it, whatever port
+// the request names.
+func TestProxyHTTPGoesToTheEngineListenerOnly(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("from-guest"))
+	}))
+	defer backend.Close()
+	sentinel, conns := sentinelListener(t)
+
+	s := &Server{eng: &fakeNetworkAwareEngine{port: backend.Listener.Addr().(*net.TCPAddr).Port}}
+	result, err := s.proxyGuestHTTPFromPayload(context.Background(), "sb", proxyHTTPPayload{
+		GuestPort: sentinel, Method: http.MethodGet, RequestURI: "/",
+	})
+	if err != nil || string(result.Body) != "from-guest" {
+		t.Fatalf("proxy = %q, %v", result.Body, err)
 	}
-	if got := rec.Body.String(); got != "from-guest" {
-		t.Fatalf("body = %q", got)
-	}
-	in, out, err := client.NetstatsTick(sandboxID)
-	if err != nil {
-		t.Fatalf("NetstatsTick: %v", err)
-	}
-	if in == 0 || out == 0 {
-		t.Fatalf("expected non-zero proxy byte counters in=%d out=%d", in, out)
+	if n := conns(); n != 0 {
+		t.Fatalf("sentinel on the requested port got %d connections, want 0", n)
 	}
 }
 
@@ -149,11 +180,8 @@ func TestSetListenPortDisabled(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	err = client.ProxyHTTP(sandboxID, 8080, rec, req)
-	if err != nil {
-		t.Fatalf("ProxyHTTP: %v", err)
-	}
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 when nothing listens", rec.Code)
+	if err == nil || !strings.Contains(err.Error(), "not listening") {
+		t.Fatalf("ProxyHTTP = %v, want a not-listening error when nothing listens", err)
 	}
 }
 

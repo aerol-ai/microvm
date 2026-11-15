@@ -1,5 +1,7 @@
 package wasm
 
+import "sort"
+
 // WASIListenPortDisabled means no wasip1 TCP listener is pre-opened (default).
 const WASIListenPortDisabled = -1
 
@@ -14,6 +16,9 @@ type Capabilities struct {
 	// When unset, use -1 to disable.
 	WASIListenPort int    `json:"wasi_listen_port,omitempty"`
 	WASIListenHost string `json:"wasi_listen_host,omitempty"`
+	// WASIListeners pre-opens one listener per exposed port (#177) and,
+	// when set, replaces the single WASIListenPort listener. See Listeners.
+	WASIListeners []WASIListener `json:"wasi_listeners,omitempty"`
 	// AuditCapability is host control metadata, never exposed in guest Env.
 	// It binds worker egress reports to exactly one sandbox incarnation.
 	AuditCapability  string `json:"audit_capability,omitempty"`
@@ -41,7 +46,33 @@ type Capabilities struct {
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.
 func (c Capabilities) ListenEnabled() bool {
-	return c.WASIListenPort >= 0
+	return c.WASIListenPort >= 0 || len(c.WASIListeners) > 0
+}
+
+// WASIListener is one pre-opened wasip1 TCP listener. GuestPort is the
+// exposed port it serves: a name the guest and the worker route by, never
+// bound itself (WASI has no getsockname, so the guest learns it from
+// ListenFDsEnv). HostPort is the loopback port bound for it, 0 for an
+// ephemeral one; the worker fills it in once bound.
+type WASIListener struct {
+	GuestPort int `json:"guest_port"`
+	HostPort  int `json:"host_port,omitempty"`
+}
+
+// Listeners is the listener set an instance gets, in fd order: the
+// WASIListeners ascending by guest port, else the one WASIListenPort
+// listener (guest port 0: it serves whichever port it is asked for), else
+// none. The first is the primary listener, the one ListenFDEnv names.
+func (c Capabilities) Listeners() []WASIListener {
+	if len(c.WASIListeners) > 0 {
+		out := append([]WASIListener(nil), c.WASIListeners...)
+		sort.SliceStable(out, func(i, j int) bool { return out[i].GuestPort < out[j].GuestPort })
+		return out
+	}
+	if c.WASIListenPort >= 0 {
+		return []WASIListener{{HostPort: c.WASIListenPort}}
+	}
+	return nil
 }
 
 // Preopen maps a host directory into the guest filesystem.

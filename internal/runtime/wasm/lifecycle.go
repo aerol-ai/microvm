@@ -132,6 +132,9 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
+	// The guest starts without listeners, maybe on a new worker: the
+	// service's port sync after a start sets them up again.
+	inst.resetGuestListen()
 	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
@@ -172,12 +175,16 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
+	socketPath, err := d.ownWorkerSocket(sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
 	inst := &sandboxInstance{
 		sandboxID:    sandbox.ID,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
 		moduleDigest: resolved.Digest,
-		socketPath:   filepath.Join(workDir, "worker.sock"),
+		socketPath:   socketPath,
 		workDir:      workDir,
 		workerKey:    sandbox.ID,
 		status:       models.SandboxStatusStopped,
@@ -205,6 +212,7 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
+	d.killStreams(inst)
 	client := d.newWorkerClient(inst.socketPath)
 	if err := client.StopInstance(sandboxID); err != nil {
 		return fmt.Errorf("stop instance: %w", err)
@@ -230,6 +238,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if d.net != nil {
 		d.net.ReleaseSandbox(sandboxID)
 	}
+	d.killStreams(inst)
 	if inst != nil && inst.fromResidentHost {
 		// Shared resident host — remove only this instance; NEVER kill the
 		// process (co-tenants depend on it). Best-effort: a dead host already
@@ -251,6 +260,14 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		workDir = inst.workDir
 	}
 	_ = os.RemoveAll(workDir)
+	// The socket and the record in the driver's own dirs are named for the
+	// sandbox alone; a worker stopped by a kill leaves its socket behind.
+	if socket := d.workerSocketPath(sandboxID); socket != "" {
+		_ = os.Remove(socket)
+	}
+	if record := d.instanceRecordPath(sandboxID); record != "" {
+		_ = os.Remove(record)
+	}
 	_ = os.RemoveAll(d.checkpointDir(sandboxID))
 	return nil
 }

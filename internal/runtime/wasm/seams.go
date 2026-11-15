@@ -44,6 +44,22 @@ type WorkerClient interface {
 	ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
+// workerExecStream is a live streaming run on a worker (*worker.ExecStream).
+type workerExecStream interface {
+	Recv() (worker.ExecEvent, error)
+	WriteStdin(p []byte) error
+	CloseStdin() error
+	Kill() error
+	Close() error
+}
+
+// streamingWorkerClient is the optional streaming-exec surface of a worker
+// client (issue #535). It is optional so test fakes written before it keep
+// compiling; a client without it answers ErrStreamingUnsupported.
+type streamingWorkerClient interface {
+	StartExec(ctx context.Context, sandboxID string, p worker.ExecStartPayload) (workerExecStream, error)
+}
+
 // WorkerClientFactory builds a client for a worker socket path.
 type WorkerClientFactory func(socketPath string) WorkerClient
 
@@ -61,6 +77,12 @@ func (a workerClientAdapter) Ping(sandboxID string) error {
 
 func (a workerClientAdapter) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
 	return a.client.InstanceLoaded(ctx, sandboxID)
+}
+
+// InstanceStatus also says whose instance the worker holds
+// (instanceStatusReader).
+func (a workerClientAdapter) InstanceStatus(ctx context.Context, sandboxID string) (worker.InstanceStatus, error) {
+	return a.client.InstanceStatus(ctx, sandboxID)
 }
 
 func (a workerClientAdapter) LoadModule(sandboxID, path string, memoryMB int) (wasmengine.LoadTimings, error) {
@@ -121,6 +143,41 @@ func (a workerClientAdapter) ResolvedListenPort(sandboxID string) (int, error) {
 	return a.client.ResolvedListenPort(sandboxID)
 }
 
+// StartExec is the optional streaming-exec hook (streamingWorkerClient).
+func (a workerClientAdapter) StartExec(ctx context.Context, sandboxID string, p worker.ExecStartPayload) (workerExecStream, error) {
+	st, err := a.client.StartExec(ctx, sandboxID, p)
+	if err != nil {
+		// Never wrap a nil *ExecStream in a non-nil interface.
+		return nil, err
+	}
+	return st, nil
+}
+
+// EntrypointLogs is the optional entrypoint hook (entrypointWorkerClient).
+func (a workerClientAdapter) EntrypointLogs(ctx context.Context, sandboxID string, logs bool) (worker.EntrypointLogs, error) {
+	return a.client.EntrypointLogs(ctx, sandboxID, logs)
+}
+
+// FollowEntrypoint is the optional entrypoint hook (entrypointWorkerClient).
+func (a workerClientAdapter) FollowEntrypoint(ctx context.Context, sandboxID string) (worker.EntrypointLogs, workerExecStream, error) {
+	logs, st, err := a.client.FollowEntrypoint(ctx, sandboxID)
+	if st == nil {
+		// Never wrap a nil *ExecStream in a non-nil interface.
+		return logs, nil, err
+	}
+	return logs, st, err
+}
+
 func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	return a.client.ProxyHTTP(sandboxID, guestPort, w, r)
+}
+
+// SetListenPorts and ListenPorts give a guest one listener per exposed
+// port (listenPortsClient).
+func (a workerClientAdapter) SetListenPorts(sandboxID string, ports []int, host string) (worker.ListenPorts, error) {
+	return a.client.SetListenPorts(sandboxID, ports, host)
+}
+
+func (a workerClientAdapter) ListenPorts(sandboxID string) (worker.ListenPorts, error) {
+	return a.client.ListenPorts(sandboxID)
 }

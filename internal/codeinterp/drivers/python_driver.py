@@ -822,6 +822,14 @@ def _setup(mode):
     _DRIVER_FILE = _setup.__code__.co_filename
     CHAN = Channel(mode, os.environ.pop("AEROL_INTERP_NONCE", ""))
 
+    # WASI has no working directory to inherit (a WASM kernel starts in
+    # "/"), so the launcher names the context's cwd and the driver enters
+    # it. A cwd that does not exist fails the start with FATAL. The process
+    # launcher sets the directory itself and leaves this unset.
+    cwd = os.environ.pop("AEROL_INTERP_CWD", "")
+    if cwd:
+        os.chdir(cwd)
+
     if mode == "fd":
         for stream in (sys.stdout, sys.stderr):
             try:
@@ -860,8 +868,9 @@ def _setup(mode):
     warnings.filterwarnings("ignore", message="Attempting to work in a virtualenv")
 
     # Imports resolve against the context's cwd, as in a REPL or a notebook,
-    # not against the folder that holds this script.
-    if sys.path and sys.path[0] == os.path.dirname(os.path.abspath(_DRIVER_FILE)):
+    # not against the folder that holds this script. Started with -c (WASM)
+    # sys.path[0] is "" already.
+    if sys.path and sys.path[0] in ("", os.path.dirname(os.path.abspath(_DRIVER_FILE))):
         sys.path[0] = ""
     else:
         sys.path.insert(0, "")

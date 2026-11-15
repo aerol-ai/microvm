@@ -320,6 +320,14 @@ func TestExecuteTimeoutDeathRestart(t *testing.T) {
 	if res = e.run(t, ExecuteRequest{Code: "print x\ndie", ContextID: info.ID}); res.closeCode != websocket.CloseGoingAway || res.closeReason != "worker process ended" || res.text("stdout") != "x" {
 		t.Fatalf("death = %v %d %q", res.frames, res.closeCode, res.closeReason)
 	}
+	// An interrupt that killed the interpreter (WASM) still ends as an
+	// interrupt; the context has lost its state.
+	if res = e.run(t, ExecuteRequest{Code: "print x\nkilled", ContextID: info.ID}); res.closeCode != websocket.CloseNormalClosure || res.text("control") != "interrupted" {
+		t.Fatalf("killed by interrupt = %v %d %q", res.frames, res.closeCode, res.closeReason)
+	}
+	if got, _ := e.m.Get(info.ID); got.Active {
+		t.Fatal("context active after an interrupt killed its kernel")
+	}
 
 	// Deleting the context under a run ends it with "context shutdown".
 	// The kernel that just died already counts one run, so wait for the

@@ -34,6 +34,62 @@ type execResultPayload struct {
 
 type errorPayload struct {
 	Message string `json:"message"`
+	// Code lets a client tell refusals apart without matching message text.
+	// Workers older than streaming exec never set it.
+	Code string `json:"code,omitempty"`
+}
+
+// Error codes carried by errorPayload.Code.
+const (
+	errCodeStreamingUnsupported = "streaming_unsupported"
+	errCodeStreamLimit          = "stream_limit"
+)
+
+// ExecStartPayload starts a streaming run (MsgExecStart). The run is a new
+// instance next to the sandbox's own, so it never replaces the serving guest.
+type ExecStartPayload struct {
+	// Caps are the run's args, env, preopens, memory and wall timeout, plus
+	// the sandbox's network blocks and egress policy, exactly as for MsgExec.
+	Caps wasmengine.Capabilities `json:"caps"`
+	// Export defaults to _start.
+	Export string `json:"export,omitempty"`
+	// ModulePath runs another module (a language runtime for code-run);
+	// empty runs the sandbox's own module.
+	ModulePath string `json:"module_path,omitempty"`
+	// NoDeadline drops the wall-clock budget; the run lasts until it exits
+	// or is killed. Caps.WallTimeoutNs is ignored then.
+	NoDeadline bool `json:"no_deadline,omitempty"`
+	// MaxOutputBytes keeps only the first N bytes of each of stdout and
+	// stderr and drops the rest (the guest never blocks on it). 0 = no cap.
+	MaxOutputBytes int64 `json:"max_output_bytes,omitempty"`
+	// Stdin opens the guest's stdin to exec_stdin frames. Without it the
+	// guest reads EOF at once.
+	Stdin bool `json:"stdin,omitempty"`
+}
+
+// execStartedPayload answers MsgExecStart with the run's id, which an
+// out-of-band exec_kill names.
+type execStartedPayload struct {
+	ID string `json:"id"`
+}
+
+// execKillPayload names the run an out-of-band exec_kill stops.
+type execKillPayload struct {
+	ID string `json:"id"`
+}
+
+// ExecExit ends a streaming run (MsgExecExit).
+type ExecExit struct {
+	// ExitCode is the guest's exit code; -1 when the run was killed or
+	// timed out.
+	ExitCode int  `json:"exit_code"`
+	Killed   bool `json:"killed,omitempty"`
+	TimedOut bool `json:"timed_out,omitempty"`
+	// Truncated is set when MaxOutputBytes dropped output.
+	Truncated bool `json:"truncated,omitempty"`
+	// Error is set when the guest trapped or could not run.
+	Error string                `json:"error,omitempty"`
+	Usage wasmengine.UsageStats `json:"usage,omitempty"`
 }
 
 type okPayload struct {
@@ -47,8 +103,17 @@ type loadModuleResultPayload struct {
 	Timings wasmengine.LoadTimings `json:"timings"`
 }
 
+// instanceStatusPayload is the MsgInstanceStatus reply. Workers outlive
+// sandboxd, so a restarted sandboxd also reads replies from workers that
+// predate the identity fields: they leave both out, and Checked is how the
+// reader tells "holds no instance" from "cannot say whose it holds".
 type instanceStatusPayload struct {
 	Loaded bool `json:"loaded"`
+	// SandboxID is the sandbox whose instance the worker holds, "" for
+	// none.
+	SandboxID string `json:"sandbox_id,omitempty"`
+	// Checked is set by every worker that tracks SandboxID.
+	Checked bool `json:"checked,omitempty"`
 }
 
 type checkpointPayload struct {

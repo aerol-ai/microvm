@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -120,29 +122,57 @@ func withFound(t *testing.T, found []worker.FoundWorker, err error) {
 	}
 }
 
+// TestInstanceRecordRoundTrip: a record goes to the driver's records dir,
+// outside the sandbox's /work, and reads back whole.
 func TestInstanceRecordRoundTrip(t *testing.T) {
 	d, _, _, _ := adoptDriver(t, true)
-	inst := &sandboxInstance{sandboxID: "sb-r", socketPath: "/run/x.sock", workerKey: "k", fromResidentHost: true,
+	bucket := residentBucketID("", "dd", 64)
+	sock := d.residentSocketPath(bucket, 0)
+	inst := &sandboxInstance{sandboxID: "sb-r", socketPath: sock, workerKey: bucket, fromResidentHost: true,
 		moduleRef: "python", modulePath: "/m.wasm", moduleDigest: "dd", entryExport: "_start", memoryMB: 64, resolvedListenPort: 31000}
-	if _, ok := d.readInstanceRecord("sb-r"); ok {
+	if _, _, ok := d.readInstanceRecord("sb-r"); ok {
 		t.Fatal("record read before one was written")
 	}
-	// No work dir yet: the write fails and is only logged.
+	// No work dir: the record does not need one.
 	d.recordInstance(inst)
-	if err := os.MkdirAll(d.sandboxDir("sb-r"), 0o700); err != nil {
-		t.Fatal(err)
+	rec, legacy, ok := d.readInstanceRecord("sb-r")
+	if !ok || legacy || rec.Socket != sock || !rec.Resident || rec.ListenPort != 31000 || rec.MemoryMB != 64 || rec.ModulePath != "/m.wasm" {
+		t.Fatalf("record = %+v, legacy %v, ok %v", rec, legacy, ok)
 	}
-	d.recordInstance(inst)
-	rec, ok := d.readInstanceRecord("sb-r")
-	if !ok || rec.Socket != "/run/x.sock" || !rec.Resident || rec.ListenPort != 31000 || rec.MemoryMB != 64 {
-		t.Fatalf("record = %+v, %v", rec, ok)
+	path := d.instanceRecordPath("sb-r")
+	if want := filepath.Join(d.cfg.RunDir, recordsDirName, "sb-r.json"); path != want {
+		t.Fatalf("record path = %q, want %q", path, want)
+	}
+	if strings.HasPrefix(path, d.sandboxDir("sb-r")+string(filepath.Separator)) {
+		t.Fatalf("record %q is under the sandbox's /work", path)
+	}
+	for _, dir := range []string{recordsDirName, socketsDirName} {
+		if st, err := os.Stat(filepath.Join(d.cfg.RunDir, dir)); err != nil || st.Mode().Perm() != 0o700 {
+			t.Fatalf("%s: %v, %v; want a 0700 dir", dir, st, err)
+		}
+	}
+	if st, err := os.Stat(path); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("record file %v, %v; want 0600", st, err)
 	}
 	// A record that names another sandbox is not this one's.
-	if err := os.WriteFile(d.instanceRecordPath("sb-r"), []byte(`{"sandbox_id":"other","socket":"/x"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"sandbox_id":"other","socket":"/x"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := d.readInstanceRecord("sb-r"); ok {
+	if _, _, ok := d.readInstanceRecord("sb-r"); ok {
 		t.Fatal("foreign record accepted")
+	}
+	// Ids that could name a path outside the dirs have no record.
+	for _, id := range []string{"../sb-r", "a/b", ".records", ""} {
+		if d.instanceRecordPath(id) != "" || d.workerSocketPath(id) != "" || d.legacyInstanceRecordPath(id) != "" || d.legacyWorkerSocketPath(id) != "" {
+			t.Fatalf("id %q has a path", id)
+		}
+		if _, _, ok := d.readInstanceRecord(id); ok {
+			t.Fatalf("id %q has a record", id)
+		}
+	}
+	d.recordInstance(&sandboxInstance{sandboxID: "../x", socketPath: sock}) // logged, not written
+	if _, err := os.Stat(filepath.Join(d.cfg.RunDir, "x.json")); !os.IsNotExist(err) {
+		t.Fatalf("record for a bad id written outside the records dir: %v", err)
 	}
 	(&Driver{}).recordInstance(inst) // no run dir: no-op
 	d.recordInstance(nil)
@@ -324,7 +354,7 @@ func TestAdoptSandboxOnResidentHost(t *testing.T) {
 		t.Fatalf("adopt of a lost instance = %v", err)
 	}
 	// A record naming a host that did not survive: not adopted.
-	d.recordInstance(&sandboxInstance{sandboxID: "sb-2", socketPath: d.residentSocketPath(bucket, 5), workerKey: bucket, fromResidentHost: true})
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-2", socketPath: d.residentSocketPath(bucket, 5), workerKey: d.residentHostKey(bucket, 5), fromResidentHost: true})
 	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-2"}, nil); !errors.Is(err, ErrNotAdopted) {
 		t.Fatalf("adopt on a gone host = %v", err)
 	}
@@ -402,6 +432,437 @@ func TestClaimWorkerRefused(t *testing.T) {
 	}
 }
 
+// provingClient is a worker from this release: it says whose instance it
+// holds, and answers "not loaded" for any other sandbox.
+type provingClient struct {
+	socketClient
+	holder string
+}
+
+func (c *provingClient) InstanceStatus(_ context.Context, id string) (worker.InstanceStatus, error) {
+	if c.err != nil {
+		return worker.InstanceStatus{}, c.err
+	}
+	loaded := c.loaded[id] && (id == "" || id == c.holder)
+	return worker.InstanceStatus{Loaded: loaded, SandboxID: c.holder, Checked: true}, nil
+}
+
+// legacyRecordDriver is an adoption driver whose clients are set per socket
+// and whose module resolver knows demo.wasm (digest "dig").
+func legacyRecordDriver(t *testing.T) (*Driver, *adoptingSupervisor, map[string]WorkerClient, string) {
+	t.Helper()
+	d, per, _, _ := adoptDriver(t, true)
+	modPath := wasmmod.WriteMinimalWasm(t, d.cfg.ModulesDir, "demo.wasm")
+	d.SetModuleResolver(fakeResolver{path: modPath, digest: "dig"})
+	workers := map[string]WorkerClient{}
+	d.SetWorkerClientFactory(func(sock string) WorkerClient {
+		if c := workers[sock]; c != nil {
+			return c
+		}
+		return &socketClient{loaded: map[string]bool{}}
+	})
+	return d, per, workers, modPath
+}
+
+// writeLegacyRecord puts a record where releases before the records dir
+// kept it: in the sandbox's /work, which its guest can write.
+func writeLegacyRecord(t *testing.T, d *Driver, sandboxID string, rec instanceRecord) string {
+	t.Helper()
+	if err := os.MkdirAll(d.sandboxDir(sandboxID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := d.legacyInstanceRecordPath(sandboxID)
+	if err := writeFileAtomic(path, rec); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestAdoptRefusesARecordInWorkNamingAnotherSandbox: a guest rewrites the
+// instance.json in its /work to name another sandbox's worker. A restarted
+// sandboxd does not hand it that worker: the record is refused, the other
+// sandbox's worker is neither claimed nor stopped, and that sandbox is
+// still adopted on its own record afterwards.
+func TestAdoptRefusesARecordInWorkNamingAnotherSandbox(t *testing.T) {
+	d, per, workers, _ := legacyRecordDriver(t)
+	victimOld := d.legacyWorkerSocketPath("sb-victim") // a pre-upgrade worker
+	victimNew := d.workerSocketPath("sb-victim")
+	// A pre-upgrade worker cannot say whose instance it holds: it answers
+	// loaded for any sandbox id.
+	workers[victimOld] = &socketClient{loaded: map[string]bool{"sb-victim": true, "sb-evil": true}}
+	workers[victimNew] = &provingClient{socketClient: socketClient{loaded: map[string]bool{"sb-victim": true}}, holder: "sb-victim"}
+	procs := map[string]*heldProc{victimOld: {pid: 7}, victimNew: {pid: 8}}
+	withFound(t, []worker.FoundWorker{
+		{PID: 7, Socket: victimOld, Proc: procs[victimOld]},
+		{PID: 8, Socket: victimNew, Proc: procs[victimNew]},
+	}, nil)
+	d.AdoptWorkers(context.Background())
+
+	for _, tc := range []struct {
+		name string
+		rec  instanceRecord
+	}{
+		{"victim's pre-upgrade socket, own key", instanceRecord{Socket: victimOld, WorkerKey: "sb-evil"}},
+		{"victim's pre-upgrade socket and key", instanceRecord{Socket: victimOld, WorkerKey: "sb-victim"}},
+		{"victim's socket and key", instanceRecord{Socket: victimNew, WorkerKey: "sb-victim"}},
+		{"victim's socket as a warm slot", instanceRecord{Socket: victimOld, WorkerKey: "sb-victim", WarmPool: true}},
+		{"victim's socket as a resident host", instanceRecord{Socket: victimOld, WorkerKey: "sb-victim", Resident: true}},
+		{"its own socket where only this release puts it", instanceRecord{Socket: d.workerSocketPath("sb-evil"), WorkerKey: "sb-evil"}},
+		{"a socket outside the run dir", instanceRecord{Socket: "/tmp/elsewhere.sock", WorkerKey: "sb-evil"}},
+	} {
+		tc.rec.SandboxID = "sb-evil"
+		path := writeLegacyRecord(t, d, "sb-evil", tc.rec)
+		if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-evil", ModuleRef: "demo.wasm", ModuleDigest: "dig"}, nil); !errors.Is(err, ErrNotAdopted) {
+			t.Fatalf("%s: AdoptSandbox = %v, want ErrNotAdopted", tc.name, err)
+		}
+		// Not a record of the driver's: left as the guest wrote it, unread.
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s: the guest's file was removed: %v", tc.name, err)
+		}
+	}
+	if len(per.adopted) != 0 || len(per.stoppedKs) != 0 || procs[victimOld].wasStopped() || procs[victimNew].wasStopped() {
+		t.Fatalf("victim's workers touched: adopted %v stopped %v", per.adopted, per.stoppedKs)
+	}
+	if _, err := d.instance("sb-evil"); err == nil {
+		t.Fatal("the guest's sandbox was registered")
+	}
+	// The victim still takes over its own worker.
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-victim", socketPath: victimNew, workerKey: "sb-victim"})
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-victim"}, nil); err != nil {
+		t.Fatalf("victim's own adoption = %v", err)
+	}
+	if per.adopted["sb-victim"] != victimNew {
+		t.Fatalf("supervisor adopted %v", per.adopted)
+	}
+}
+
+// TestAdoptMigratesAValidLegacyRecord: a record a pre-upgrade sandboxd left
+// in the sandbox's /work is used once, for which worker to take over only,
+// then moved to the driver's records dir. The fields a guest could have
+// rewritten (module path, memory, listen port, export) come from the row,
+// the resolver and the worker instead.
+func TestAdoptMigratesAValidLegacyRecord(t *testing.T) {
+	d, per, workers, modPath := legacyRecordDriver(t)
+	sock := d.legacyWorkerSocketPath("sb-old")
+	old := &socketClient{loaded: map[string]bool{"sb-old": true}}
+	old.resolvedPort = 41000
+	workers[sock] = old
+	proc := &heldProc{pid: 3}
+	withFound(t, []worker.FoundWorker{{PID: 3, Socket: sock, Proc: proc}}, nil)
+	d.AdoptWorkers(context.Background())
+	legacyPath := writeLegacyRecord(t, d, "sb-old", instanceRecord{
+		SandboxID: "sb-old", Socket: sock, WorkerKey: "sb-old",
+		ModuleRef: "evil", ModulePath: "/etc/shadow", ModuleDigest: "evil", ModuleSize: 1 << 40,
+		EntryExport: "evil", MemoryMB: 1 << 20, ListenPort: 2019,
+	})
+
+	sb := &models.Sandbox{ID: "sb-old", ModuleRef: "demo.wasm", ModuleDigest: "dig"}
+	if _, err := d.AdoptSandbox(context.Background(), sb, nil); err != nil {
+		t.Fatalf("AdoptSandbox = %v", err)
+	}
+	if per.adopted["sb-old"] != sock || proc.wasStopped() {
+		t.Fatalf("worker not taken over: adopted %v stopped %v", per.adopted, proc.wasStopped())
+	}
+	inst, _ := d.instance("sb-old")
+	if inst.modulePath != modPath || inst.moduleRef != "demo.wasm" || inst.moduleDigest != "dig" || inst.moduleSize != 1 ||
+		inst.memoryMB != 128 || inst.resolvedListenPort != 41000 || inst.entryExport != "_start" || inst.socketPath != sock {
+		t.Fatalf("adopted instance took a field from the guest's file: %+v", inst)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy record left in /work: %v", err)
+	}
+	rec, legacy, ok := d.readInstanceRecord("sb-old")
+	if !ok || legacy || rec.Socket != sock || rec.ModulePath != modPath || rec.ListenPort != 41000 || rec.MemoryMB != 128 {
+		t.Fatalf("moved record = %+v, legacy %v, ok %v", rec, legacy, ok)
+	}
+
+	// A pre-upgrade warm-slot worker and resident host are adopted the same
+	// way; a resident host confirms the instance itself.
+	slotSock := filepath.Join(wasmpool.New(d.cfg.RunDir, nil).SlotDir("dig", "pool-0123456789abcdef"), "worker.sock")
+	workers[slotSock] = &socketClient{loaded: map[string]bool{"sb-slot": true}}
+	bucket := residentBucketID("", "dig", 128)
+	resSock := d.residentSocketPath(bucket, 0)
+	workers[resSock] = &socketClient{loaded: map[string]bool{"": true, "sb-res": true}}
+	withFound(t, []worker.FoundWorker{
+		{PID: 4, Socket: slotSock, Proc: &heldProc{pid: 4}},
+		{PID: 5, Resident: true, Socket: resSock, Proc: &heldProc{pid: 5}},
+	}, nil)
+	d.AdoptWorkers(context.Background())
+	writeLegacyRecord(t, d, "sb-slot", instanceRecord{SandboxID: "sb-slot", Socket: slotSock, WorkerKey: "pool-0123456789abcdef", WarmPool: true})
+	writeLegacyRecord(t, d, "sb-res", instanceRecord{SandboxID: "sb-res", Socket: resSock, WorkerKey: bucket, Resident: true, ModulePath: "/etc/shadow"})
+	for _, id := range []string{"sb-slot", "sb-res"} {
+		if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: id, ModuleRef: "demo.wasm", ModuleDigest: "dig"}, nil); err != nil {
+			t.Fatalf("adopt %s = %v", id, err)
+		}
+		if inst, _ := d.instance(id); inst.modulePath != modPath {
+			t.Fatalf("%s module path = %q", id, inst.modulePath)
+		}
+	}
+	if inst, _ := d.instance("sb-slot"); !inst.fromWarmPool || inst.workerKey != "pool-0123456789abcdef" {
+		t.Fatalf("warm slot instance = %+v", inst)
+	}
+	if inst, _ := d.instance("sb-res"); !inst.fromResidentHost || !inst.residentSlotHeld {
+		t.Fatalf("resident instance = %+v", inst)
+	}
+}
+
+// TestAdoptLegacyRecordModuleUnresolved: a pre-upgrade record whose module
+// no longer resolves is not adopted, and its worker is left unclaimed for
+// FinishAdoption, so the restore that follows starts clean.
+func TestAdoptLegacyRecordModuleUnresolved(t *testing.T) {
+	d, per, workers, _ := legacyRecordDriver(t)
+	d.resolver = nil
+	sock := d.legacyWorkerSocketPath("sb-u")
+	workers[sock] = &socketClient{loaded: map[string]bool{"sb-u": true}}
+	withFound(t, []worker.FoundWorker{{PID: 3, Socket: sock, Proc: &heldProc{pid: 3}}}, nil)
+	d.AdoptWorkers(context.Background())
+	writeLegacyRecord(t, d, "sb-u", instanceRecord{SandboxID: "sb-u", Socket: sock, WorkerKey: "sb-u"})
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-u", ModuleRef: "demo.wasm"}, nil); !errors.Is(err, ErrNotAdopted) {
+		t.Fatalf("AdoptSandbox = %v", err)
+	}
+	if len(per.adopted) != 0 || !d.hasPendingWorker(sock) {
+		t.Fatalf("worker claimed though the module did not resolve: %v", per.adopted)
+	}
+	if _, err := d.moduleFromRow(context.Background(), &models.Sandbox{ID: "x"}); err == nil {
+		t.Fatal("module resolved with no resolver")
+	}
+	d.SetModuleResolver(fakeResolver{path: "/m.wasm"})
+	if _, err := d.moduleFromRow(context.Background(), &models.Sandbox{ID: "x"}); err == nil || !strings.Contains(err.Error(), "module_ref") {
+		t.Fatalf("module of a row without one = %v", err)
+	}
+}
+
+// TestLegacyRecordReadOnlyAsAPlainFile: the record in a guest's /work is
+// read only when it is a small regular file at that name: not through a
+// symlink (which could lead to any file on the host), not from a FIFO
+// (which would block the boot), not past the size cap.
+func TestLegacyRecordReadOnlyAsAPlainFile(t *testing.T) {
+	d, _, _, _ := legacyRecordDriver(t)
+	sock := d.legacyWorkerSocketPath("sb-l")
+	valid := instanceRecord{SandboxID: "sb-l", Socket: sock, WorkerKey: "sb-l"}
+	if err := os.MkdirAll(d.sandboxDir("sb-l"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := d.legacyInstanceRecordPath("sb-l")
+	elsewhere := filepath.Join(t.TempDir(), "valid.json")
+	if err := writeFileAtomic(elsewhere, valid); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		setup func() error
+	}{
+		{"symlink to a valid record", func() error { return os.Symlink(elsewhere, path) }},
+		{"fifo", func() error { return syscall.Mkfifo(path, 0o600) }},
+		{"directory", func() error { return os.Mkdir(path, 0o700) }},
+		{"over the cap", func() error {
+			raw := `{"sandbox_id":"sb-l","socket":"` + sock + `","worker_key":"sb-l"}` + strings.Repeat(" ", maxRecordBytes)
+			return os.WriteFile(path, []byte(raw), 0o600)
+		}},
+		{"not json", func() error { return os.WriteFile(path, []byte("my app's own instance.json"), 0o600) }},
+		{"another sandbox's record", func() error {
+			return writeFileAtomic(path, instanceRecord{SandboxID: "sb-x", Socket: d.legacyWorkerSocketPath("sb-x"), WorkerKey: "sb-x"})
+		}},
+	}
+	for _, tc := range cases {
+		_ = os.RemoveAll(path)
+		if err := tc.setup(); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if rec, _, ok := d.readInstanceRecord("sb-l"); ok {
+			t.Fatalf("%s: read %+v", tc.name, rec)
+		}
+	}
+	_ = os.RemoveAll(path)
+	if err := writeFileAtomic(path, valid); err != nil {
+		t.Fatal(err)
+	}
+	if rec, legacy, ok := d.readInstanceRecord("sb-l"); !ok || !legacy || !reflect.DeepEqual(rec, valid) {
+		t.Fatalf("plain legacy record = %+v, legacy %v, ok %v", rec, legacy, ok)
+	}
+	// A record of the driver's wins over one left in /work, and an
+	// unusable one is not passed over for it.
+	if err := os.MkdirAll(filepath.Join(d.cfg.RunDir, recordsDirName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(d.instanceRecordPath("sb-l"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := d.readInstanceRecord("sb-l"); ok {
+		t.Fatal("fell back to the /work record past a broken one of the driver's")
+	}
+}
+
+// TestAdoptRefusesAWorkerThatHoldsAnotherSandbox: whatever the record, the
+// worker must answer for the sandbox. One that says it holds another
+// sandbox's instance is not claimed and not stopped: it stays for that
+// sandbox, and FinishAdoption stops it if nobody claims it.
+func TestAdoptRefusesAWorkerThatHoldsAnotherSandbox(t *testing.T) {
+	d, per, workers, _ := legacyRecordDriver(t)
+	sock := d.workerSocketPath("sb-a")
+	wrong := &provingClient{socketClient: socketClient{loaded: map[string]bool{"sb-a": true, "sb-b": true}}, holder: "sb-b"}
+	workers[sock] = wrong
+	proc := &heldProc{pid: 3}
+	withFound(t, []worker.FoundWorker{{PID: 3, Socket: sock, Proc: proc}}, nil)
+	d.AdoptWorkers(context.Background())
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-a", socketPath: sock, workerKey: "sb-a"})
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-a"}, nil); !errors.Is(err, ErrNotAdopted) {
+		t.Fatalf("AdoptSandbox = %v", err)
+	}
+	if len(per.adopted) != 0 || len(per.stoppedKs) != 0 || proc.wasStopped() || !d.hasPendingWorker(sock) {
+		t.Fatalf("worker of another sandbox touched: adopted %v stopped %v", per.adopted, per.stoppedKs)
+	}
+	// Answering for the sandbox, it is taken over.
+	wrong.holder = "sb-a"
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-a"}, nil); err != nil {
+		t.Fatalf("AdoptSandbox once the worker answers for it = %v", err)
+	}
+	if per.adopted["sb-a"] != sock {
+		t.Fatalf("supervisor adopted %v", per.adopted)
+	}
+	// A worker that holds no instance yet is ours to stop, as before.
+	empty := d.workerSocketPath("sb-e")
+	workers[empty] = &provingClient{socketClient: socketClient{loaded: map[string]bool{"": true}}}
+	withFound(t, []worker.FoundWorker{{PID: 4, Socket: empty, Proc: &heldProc{pid: 4}}}, nil)
+	d.AdoptWorkers(context.Background())
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-e", socketPath: empty, workerKey: "sb-e"})
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-e"}, nil); !errors.Is(err, ErrNotAdopted) {
+		t.Fatalf("adopt of an empty worker = %v", err)
+	}
+	if len(per.stoppedKs) != 1 || per.stoppedKs[0] != "sb-e" {
+		t.Fatalf("stopped keys = %v", per.stoppedKs)
+	}
+	// A resident host that says it holds another sandbox (never the case
+	// for a working host) is not trusted either.
+	bucket := residentBucketID("", "dig", 128)
+	resSock := d.residentSocketPath(bucket, 0)
+	workers[resSock] = &provingClient{socketClient: socketClient{loaded: map[string]bool{"": true, "sb-r": true}}, holder: "sb-other"}
+	withFound(t, []worker.FoundWorker{{PID: 5, Resident: true, Socket: resSock, Proc: &heldProc{pid: 5}}}, nil)
+	d.AdoptWorkers(context.Background())
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-r", socketPath: resSock, workerKey: bucket, fromResidentHost: true})
+	if _, err := d.AdoptSandbox(context.Background(), &models.Sandbox{ID: "sb-r"}, nil); !errors.Is(err, ErrNotAdopted) {
+		t.Fatalf("adopt on a host naming another sandbox = %v", err)
+	}
+}
+
+// TestRecordRoutesValid: a record names a worker of the sandbox's own, a
+// warm slot of this run dir's pool, or a resident host of this run dir,
+// under the key that goes with it; a legacy record cannot name a socket
+// only this release uses.
+func TestRecordRoutesValid(t *testing.T) {
+	d := New(Config{RunDir: "/run/sandboxd/wasm"}, nil)
+	bucket := residentBucketID("", "dig", 128)
+	slot := filepath.Join(wasmpool.New(d.cfg.RunDir, nil).SlotDir("sha256:0123456789", "pool-0123456789abcdef"), "worker.sock")
+	cases := []struct {
+		name         string
+		rec          instanceRecord
+		owned, older bool // valid in the driver's dir; valid in /work
+	}{
+		{"own socket", instanceRecord{Socket: d.workerSocketPath("sb-1"), WorkerKey: "sb-1"}, true, false},
+		{"own pre-upgrade socket", instanceRecord{Socket: d.legacyWorkerSocketPath("sb-1"), WorkerKey: "sb-1"}, true, true},
+		{"own socket, other key", instanceRecord{Socket: d.workerSocketPath("sb-1"), WorkerKey: "sb-2"}, false, false},
+		{"other sandbox's socket", instanceRecord{Socket: d.workerSocketPath("sb-2"), WorkerKey: "sb-1"}, false, false},
+		{"other sandbox's pre-upgrade socket", instanceRecord{Socket: d.legacyWorkerSocketPath("sb-2"), WorkerKey: "sb-1"}, false, false},
+		{"no socket", instanceRecord{WorkerKey: "sb-1"}, false, false},
+		{"warm slot", instanceRecord{Socket: slot, WorkerKey: "pool-0123456789abcdef", WarmPool: true}, true, true},
+		{"warm slot, other key", instanceRecord{Socket: slot, WorkerKey: "sb-1", WarmPool: true}, false, false},
+		{"warm slot not flagged", instanceRecord{Socket: slot, WorkerKey: "pool-0123456789abcdef"}, false, false},
+		{"resident host", instanceRecord{Socket: d.residentSocketPath(bucket, 1), WorkerKey: d.residentHostKey(bucket, 1), Resident: true}, true, true},
+		{"resident host, other key", instanceRecord{Socket: d.residentSocketPath(bucket, 1), WorkerKey: bucket, Resident: true}, false, false},
+		{"resident and warm", instanceRecord{Socket: d.residentSocketPath(bucket, 0), WorkerKey: bucket, Resident: true, WarmPool: true}, false, false},
+		{"resident flag on own socket", instanceRecord{Socket: d.workerSocketPath("sb-1"), WorkerKey: "sb-1", Resident: true}, false, false},
+	}
+	for _, tc := range cases {
+		tc.rec.SandboxID = "sb-1"
+		if got := d.recordRoutesValid("sb-1", tc.rec, false); got != tc.owned {
+			t.Errorf("%s (driver's dir) = %v, want %v", tc.name, got, tc.owned)
+		}
+		if got := d.recordRoutesValid("sb-1", tc.rec, true); got != tc.older {
+			t.Errorf("%s (/work) = %v, want %v", tc.name, got, tc.older)
+		}
+	}
+}
+
+// TestDestroyRemovesHostState: the record and the socket in the driver's
+// dirs go with the sandbox.
+func TestDestroyRemovesHostState(t *testing.T) {
+	d, _, _, _ := adoptDriver(t, false)
+	sock, err := d.ownWorkerSocket("sb-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sock, nil, 0o600); err != nil { // a killed worker's leftover
+		t.Fatal(err)
+	}
+	d.recordInstance(&sandboxInstance{sandboxID: "sb-d", socketPath: sock, workerKey: "sb-d"})
+	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-d"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{sock, d.instanceRecordPath("sb-d")} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s left after destroy: %v", p, err)
+		}
+	}
+	if _, err := d.ownWorkerSocket("../x"); err == nil {
+		t.Fatal("socket for an id that is not a sandbox id")
+	}
+}
+
+// TestHostDirsUnavailable: when the driver's dirs cannot be made, a create
+// fails before it holds anything, and a record is only logged as missing.
+func TestHostDirsUnavailable(t *testing.T) {
+	d, _, _, _ := adoptDriver(t, false)
+	d.SetModuleResolver(fakeResolver{path: "/m.wasm", digest: "dig"})
+	if err := os.WriteFile(filepath.Join(d.cfg.RunDir, recordsDirName), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Create(context.Background(), models.CreateSandboxRequest{ModuleRef: "demo.wasm"}, "sb-h", "", nil); err == nil {
+		t.Fatal("create without the driver's dirs succeeded")
+	}
+	if _, err := d.StartSandbox(context.Background(), &models.Sandbox{ID: "sb-h", ModuleRef: "demo.wasm"}, nil); err == nil {
+		t.Fatal("start without the driver's dirs succeeded")
+	}
+	inst := &sandboxInstance{sandboxID: "sb-h", workDir: d.sandboxDir("sb-h"), modulePath: "/m.wasm", socketPath: d.residentSocketPath("b", 0)}
+	if err := d.migrateResidentToCold(context.Background(), inst); err == nil {
+		t.Fatal("migrate without the driver's dirs succeeded")
+	}
+	d.recordInstance(inst) // logged
+	if _, _, ok := d.readInstanceRecord("sb-h"); ok {
+		t.Fatal("record written without its dir")
+	}
+	if err := (&Driver{}).ensureHostDirs(); err == nil {
+		t.Fatal("host dirs without a run dir")
+	}
+	// The latch: once made, the dirs are not made again.
+	d2, _, _, _ := adoptDriver(t, false)
+	if err := d2.ensureHostDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(d2.cfg.RunDir, socketsDirName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.ensureHostDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(d2.cfg.RunDir, socketsDirName)); !os.IsNotExist(err) {
+		t.Fatalf("latched dirs made again: %v", err)
+	}
+}
+
+// TestWorkerListenPortAnswer: the listen port of a pre-upgrade worker comes
+// from the worker; none or a disabled listener is 0.
+func TestWorkerListenPortAnswer(t *testing.T) {
+	d, _, workers, _ := legacyRecordDriver(t)
+	c := &socketClient{loaded: map[string]bool{}}
+	workers["/s"] = c
+	for _, tc := range []struct{ port, want int }{{41000, 41000}, {-1, 0}, {0, 0}} {
+		c.resolvedPort = tc.port
+		if got := d.workerListenPort("/s", "sb"); got != tc.want {
+			t.Fatalf("port %d -> %d, want %d", tc.port, got, tc.want)
+		}
+	}
+}
+
 func TestHasWorkDir(t *testing.T) {
 	d, _, _, _ := adoptDriver(t, true)
 	if d.HasWorkDir("sb-h") || d.HasWorkDir("../x") || (&Driver{}).HasWorkDir("sb-h") {
@@ -438,7 +899,7 @@ func TestRestoreSandboxPicksTheCreatePath(t *testing.T) {
 	if res.ensureCalls != 1 || per.ensureCalls != 0 {
 		t.Fatalf("resident restore: resident %d per-sandbox %d", res.ensureCalls, per.ensureCalls)
 	}
-	if rec, ok := d.readInstanceRecord("sb-rs"); !ok || !rec.Resident {
+	if rec, _, ok := d.readInstanceRecord("sb-rs"); !ok || !rec.Resident {
 		t.Fatalf("restore left no resident record: %+v", rec)
 	}
 	yes := true

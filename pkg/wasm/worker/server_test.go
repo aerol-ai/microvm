@@ -146,6 +146,163 @@ func TestWorkerByteMeter(t *testing.T) {
 	}
 }
 
+// A per-sandbox worker answers for the one sandbox whose instance it holds,
+// bound by its first Instantiate: asked about another sandbox it says "not
+// loaded" and names the one it holds, and it refuses every message for
+// another sandbox, so a socket path that leads to the wrong worker cannot
+// drive it. Before it holds an instance (a warm slot), nothing is refused.
+func TestServerAnswersOnlyForItsSandbox(t *testing.T) {
+	s := &Server{eng: &successNetworkEngine{}}
+	roundTrip := func(req Envelope) Envelope {
+		t.Helper()
+		c1, c2 := net.Pipe()
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(c2) }()
+		if err := writeFrame(c1, req); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := readFrame(c1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c1.Close()
+		<-done
+		return reply
+	}
+	status := func(id string) instanceStatusPayload {
+		t.Helper()
+		reply := roundTrip(Envelope{Type: MsgInstanceStatus, SandboxID: id})
+		var p instanceStatusPayload
+		if reply.Type != MsgOK || decodePayload(reply.Payload, &p) != nil {
+			t.Fatalf("status(%q) reply = %+v", id, reply)
+		}
+		return p
+	}
+	refused := func(reply Envelope) bool {
+		var p errorPayload
+		return reply.Type == MsgError && decodePayload(reply.Payload, &p) == nil && p.Message == errForeignSandbox.Error()
+	}
+
+	if st := status(""); !st.Loaded || !st.Checked || st.SandboxID != "" {
+		t.Fatalf("unbound worker, module question = %+v", st)
+	}
+	if st := status("sb-a"); st.Loaded || !st.Checked || st.SandboxID != "" {
+		t.Fatalf("unbound worker asked about sb-a = %+v, want not loaded", st)
+	}
+	// A warm slot is driven under its slot id before a sandbox takes it.
+	if reply := roundTrip(Envelope{Type: MsgSetNetworkBlocks, SandboxID: "pool-0123456789abcdef", Payload: mustPayload(t, setNetworkBlocksPayload{})}); reply.Type != MsgOK {
+		t.Fatalf("unbound worker refused a slot message: %+v", reply)
+	}
+	inst := mustPayload(t, instantiatePayload{Caps: wasmengine.Capabilities{WASIListenPort: wasmengine.WASIListenPortDisabled}})
+	if reply := roundTrip(Envelope{Type: MsgInstantiate, SandboxID: "sb-a", Payload: inst}); reply.Type != MsgOK {
+		t.Fatalf("instantiate sb-a = %+v", reply)
+	}
+	if st := status("sb-a"); !st.Loaded || !st.Checked || st.SandboxID != "sb-a" {
+		t.Fatalf("status for its own sandbox = %+v", st)
+	}
+	if st := status("sb-b"); st.Loaded || !st.Checked || st.SandboxID != "sb-a" {
+		t.Fatalf("status for another sandbox = %+v, want not loaded, naming sb-a", st)
+	}
+	// The client refuses the wrong sandbox too.
+	c := NewClient("unused")
+	c.dial = func(string) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		go func() { _ = s.Serve(c2) }()
+		return c1, nil
+	}
+	if loaded, err := c.InstanceLoaded(context.Background(), "sb-b"); err != nil || loaded {
+		t.Fatalf("InstanceLoaded(sb-b) = %v, %v", loaded, err)
+	}
+	if st, err := c.InstanceStatus(context.Background(), "sb-a"); err != nil || !st.Loaded || !st.Checked || st.SandboxID != "sb-a" || st.Foreign("sb-a") || !st.Foreign("sb-b") || st.Foreign("") {
+		t.Fatalf("InstanceStatus(sb-a) = %+v, %v", st, err)
+	}
+
+	snapDir := t.TempDir()
+	if reply := roundTrip(Envelope{Type: MsgCheckpoint, SandboxID: "sb-a", Payload: mustPayload(t, checkpointPayload{OutDir: snapDir})}); reply.Type != MsgOK {
+		t.Fatalf("checkpoint sb-a = %+v", reply)
+	}
+	for _, msg := range []struct {
+		typ     MessageType
+		payload any
+	}{
+		{MsgLoadModule, loadModulePayload{Path: "/nowhere.wasm"}},
+		{MsgInstantiate, instantiatePayload{}},
+		{MsgRestore, restorePayload{Dir: snapDir}},
+		{MsgExec, execPayload{}},
+		{MsgInvoke, invokePayload{}},
+		{MsgStopInstance, nil},
+		{MsgCheckpoint, checkpointPayload{OutDir: t.TempDir()}},
+		{MsgSetCapability, setCapabilityPayload{}},
+		{MsgSetNetworkBlocks, setNetworkBlocksPayload{BlockEgress: true}},
+		{MsgSetEgressPolicy, setEgressPolicyPayload{}},
+		{MsgEgressLearned, nil},
+		{MsgSetListenPort, setListenPortPayload{Port: 8080}},
+		{MsgListenPort, nil},
+		{MsgProxyHTTP, proxyHTTPPayload{}},
+		{MsgNetstatsTick, nil},
+	} {
+		var body []byte
+		if msg.payload != nil {
+			body = mustPayload(t, msg.payload)
+		}
+		for _, id := range []string{"sb-b", " sb-b "} {
+			if reply := roundTrip(Envelope{Type: msg.typ, SandboxID: id, Payload: body}); !refused(reply) {
+				t.Errorf("%s for %q = %+v, want refused", msg.typ, id, reply)
+			}
+		}
+	}
+	// Still bound to sb-a, which is still served; ping is answered for anyone.
+	if st := status("sb-a"); !st.Loaded || st.SandboxID != "sb-a" {
+		t.Fatalf("after refusals, status = %+v", st)
+	}
+	if reply := roundTrip(Envelope{Type: MsgNetstatsTick, SandboxID: " sb-a "}); reply.Type != MsgOK {
+		t.Fatalf("netstats for its own sandbox = %+v", reply)
+	}
+	if reply := roundTrip(Envelope{Type: MsgRestore, SandboxID: "sb-a", Payload: mustPayload(t, restorePayload{Dir: snapDir})}); reply.Type != MsgOK {
+		t.Fatalf("restore of its own sandbox = %+v", reply)
+	}
+	if reply := roundTrip(Envelope{Type: MsgHealthPing, SandboxID: "sb-b"}); reply.Type != MsgPong {
+		t.Fatalf("ping for another sandbox = %+v", reply)
+	}
+}
+
+// A worker bound by Restore (a passivated sandbox's wake) holds that
+// sandbox as Instantiate would.
+func TestServerRestoreBindsItsSandbox(t *testing.T) {
+	eng := &successNetworkEngine{}
+	snapDir := t.TempDir()
+	capture, _ := eng.CaptureSnapshot(context.Background())
+	if err := wasmengine.WriteSnapshotDir(snapDir, capture); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{eng: eng}
+	c1, c2 := net.Pipe()
+	go func() { _ = s.Serve(c2) }()
+	defer c1.Close()
+	if err := writeFrame(c1, Envelope{Type: MsgRestore, SandboxID: "sb-r", Payload: mustPayload(t, restorePayload{Dir: snapDir})}); err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := readFrame(c1); err != nil || reply.Type != MsgOK {
+		t.Fatalf("restore = %+v, %v", reply, err)
+	}
+	if got := s.holderID(); got != "sb-r" {
+		t.Fatalf("holder after restore = %q", got)
+	}
+	s.bindHolder("sb-other") // the first binding stays
+	if got := s.holderID(); got != "sb-r" {
+		t.Fatalf("holder rebound to %q", got)
+	}
+}
+
+func mustPayload(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := encodePayload(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestMediatorDialer(t *testing.T) {
 	m := newNetMediator()
 	m.SetBlocks("sb1", false, true) // block egress

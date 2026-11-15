@@ -142,7 +142,7 @@ stripped), `html`, `markdown`, `svg`, `png`, `jpeg`, `pdf`, `latex`,
 | W2 | #535 | `/process/exec/stream` on WASM, wire-identical to toolboxd's (binary 0x01/0x02 frames, JSON exit). No TTY. |
 | W3 | #535 | `/process/code-run` on WASM: runs the language's standard module (`SB_WASM_CODERUN_MODULES`, defaults from `SB_WASM_STANDARD_MODULES`: python, javascript via QuickJS, ruby) on the sandbox's `/work`. |
 | W4 | #178 | Daytona `/process/session` family on WASM: a session is a series of confined runs that share `/work` and env; async commands stream logs and accept input. Entrypoint logs: the serving guest's output is kept in a capped ring buffer. Native `/sessions` (interactive terminals) stay 501: WASM has no shell. |
-| W5 | #178 | codeInterpreter on WASM: python contexts on `python.wasm` with the stdio-mode driver; Daytona, our SDKs and E2B (python) all work. |
+| W5 | #178 | codeInterpreter on WASM: python contexts on `python.wasm` with the stdio-mode driver; Daytona, our SDKs and E2B (python) all work. As built: the driver source goes in as a `-c` argument (nothing under `/work`), and the launcher passes the cwd in `AEROL_INTERP_CWD` because WASI has no cwd to inherit. E2B contexts default to `/work`, not `/home/user` (§4.2), which a WASM sandbox does not have. A running context holds one of the sandbox's streaming run slots. |
 | W6 | #177 | Several exposed ports: one pre-opened listener per exposed port, the guest learns which descriptor is which port from an env var, each port gets its own route. |
 | W7 | #175 | Listener on the wasmtime engine (design in section 6). |
 

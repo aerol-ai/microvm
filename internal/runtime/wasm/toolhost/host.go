@@ -3,9 +3,11 @@
 package toolhost
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -16,15 +18,33 @@ type Host struct {
 	authToken string
 	exec      Executor
 	stateKV   StateKV
+	procs     Processes
+	sessions  Sessions
+	liveness  toolboxwire.Liveness
+	interp    Interpreters
 }
 
-// Config wires a toolbox host for one sandbox.
+// Config wires a toolbox host for one sandbox. The host is rebuilt for every
+// request, so anything that outlives one (live runs, their cap, sessions) is
+// owned by the driver behind Procs and Sessions.
 type Config struct {
 	SandboxID string
 	WorkDir   string
 	AuthToken string
 	Exec      Executor
 	StateKV   StateKV
+	// Procs runs the exec stream and code-run inside the wasm engine. Nil
+	// answers those routes with 501.
+	Procs Processes
+	// Sessions serves /process/session inside the wasm engine. Nil answers
+	// those routes with 501.
+	Sessions Sessions
+	// StreamLiveness overrides the exec stream keepalive (tests); zero
+	// keeps toolboxwire.DefaultLiveness.
+	StreamLiveness toolboxwire.Liveness
+	// Interpreters serves the code interpreter (interpreter.go). Nil
+	// answers its routes with 501.
+	Interpreters Interpreters
 }
 
 // New constructs a toolbox host.
@@ -35,6 +55,10 @@ func New(cfg Config) *Host {
 		authToken: cfg.AuthToken,
 		exec:      cfg.Exec,
 		stateKV:   cfg.StateKV,
+		procs:     cfg.Procs,
+		sessions:  cfg.Sessions,
+		liveness:  cfg.StreamLiveness,
+		interp:    cfg.Interpreters,
 	}
 }
 
@@ -56,10 +80,10 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": version.Version})
 	case r.Method == http.MethodGet && r.URL.Path == "/version":
 		// The WASM host supports none of toolboxd's newer request options;
-		// an empty list makes the SDKs refuse them instead of sending them.
-		// "runtime" lets the SDKs say why: a restart or a new template, the
-		// advice for an older toolboxd, cannot add them here.
-		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": []string{}, "runtime": "wasm"})
+		// leaving them out makes the SDKs refuse them instead of sending
+		// them. "runtime" lets the SDKs say why: a restart or a new
+		// template, the advice for an older toolboxd, cannot add them here.
+		writeJSON(w, http.StatusOK, map[string]any{"version": version.Version, "features": h.features(), "runtime": "wasm"})
 	case r.Method == http.MethodPost && r.URL.Path == "/process/execute":
 		if !h.requireAuth(w, r) {
 			return
@@ -70,16 +94,26 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleCodeRun(w, r)
-	case strings.HasPrefix(r.URL.Path, "/process/interpreter/"):
+	case strings.HasPrefix(r.URL.Path, daytonaInterpreterPrefix+"/"):
 		if !h.requireAuth(w, r) {
 			return
 		}
-		writeError(w, http.StatusNotImplemented, "codeInterpreter is not implemented for wasm runtime")
-	case isSessionPath(r.URL.Path):
+		h.handleInterpreter(w, r, daytonaInterpreterPrefix)
+	case isE2BInterpreterPath(r.URL.Path):
+		if !h.requireAuth(w, r) {
+			return
+		}
+		h.handleInterpreter(w, r, e2bInterpreterPrefix)
+	case isNativeSessionPath(r.URL.Path):
 		if !h.requireAuth(w, r) {
 			return
 		}
 		h.handleSessions(w, r)
+	case isProcessSessionPath(r.URL.Path):
+		if !h.requireAuth(w, r) {
+			return
+		}
+		h.handleProcessSession(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 		if !h.requireAuth(w, r) {
 			return
@@ -159,7 +193,10 @@ func (h *Host) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != h.authToken {
+	// Constant time, so response timing does not leak how much of a guessed
+	// token matched.
+	presented := strings.TrimPrefix(authorization, prefix)
+	if !strings.HasPrefix(authorization, prefix) || subtle.ConstantTimeCompare([]byte(presented), []byte(h.authToken)) != 1 {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}

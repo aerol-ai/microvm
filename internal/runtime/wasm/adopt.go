@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -25,24 +29,31 @@ import (
 //
 //   - Workers start in the workers' cgroup (SetWorkerCgroup), outside
 //     sandboxd's unit, so systemd's stop of the unit does not reach them.
-//   - Each running instance keeps a record in its work dir
-//     (instance.json): which worker holds it and on which socket. It names
-//     no secrets; the sandbox row has the rest.
+//   - Each running instance keeps a record in the driver's records dir
+//     (recordsDirName): which worker holds it and on which socket. It names
+//     no secrets; the sandbox row has the rest. Releases before this kept
+//     it in the sandbox's work dir, the guest's /work; such a record is
+//     read once, checked, and moved (readInstanceRecord, AdoptSandbox).
 //   - At boot AdoptWorkers takes over the workers left in the cgroup: the
 //     resident hosts at once (they are shared), the per-sandbox workers
 //     only once a sandbox claims them.
 //   - The service then calls AdoptSandbox for each started WASM row: an
-//     instance its worker still holds is registered as if this sandboxd
-//     had made it. RestoreSandbox brings back one whose worker did not
-//     survive (an upgrade from a release before this, a crash), with its
-//     /work files, and FinishAdoption stops every worker nobody claimed.
+//     instance its worker still holds, and says it holds for that sandbox,
+//     is registered as if this sandboxd had made it. RestoreSandbox brings
+//     back one whose worker did not survive (an upgrade from a release
+//     before this, a crash), with its /work files, and FinishAdoption stops
+//     every worker nobody claimed.
 //
 // The run dir is on tmpfs (/run), so a reboot, which ends every worker,
 // also ends every record and every /work dir.
 
-// instanceRecordName is the record a running instance keeps in its work
-// dir.
-const instanceRecordName = "instance.json"
+// legacyInstanceRecordName is the record a running instance kept in its
+// work dir before records moved to recordsDirName.
+const legacyInstanceRecordName = "instance.json"
+
+// maxRecordBytes caps a record read. A record is a few hundred bytes; the
+// cap is for the one read from a guest's /work.
+const maxRecordBytes = 64 << 10
 
 // instanceRecord is what a running instance leaves for the next sandboxd.
 type instanceRecord struct {
@@ -57,8 +68,15 @@ type instanceRecord struct {
 	ModuleSize   int64  `json:"module_size,omitempty"`
 	EntryExport  string `json:"entry_export,omitempty"`
 	MemoryMB     int    `json:"memory_mb,omitempty"`
-	// ListenPort is the host port a serving guest listens on (expose_port).
+	// ListenPort is the host port a serving guest listens on (expose_port):
+	// its primary listener, the only one an older worker has.
 	ListenPort int `json:"listen_port,omitempty"`
+	// ListenPorts maps each exposed port to its listener's host port, from
+	// a worker that routes per port. A record with ListenPort and without
+	// ListenPorts is a worker with one listener for every port.
+	ListenPorts map[int]int `json:"listen_ports,omitempty"`
+	// ListenEngine is the engine the worker serves HTTP on, when it said.
+	ListenEngine string `json:"listen_engine,omitempty"`
 }
 
 // ErrNotAdopted: no running instance of the sandbox survived to adopt.
@@ -87,45 +105,163 @@ func (d *Driver) SetWorkerCgroup(cg *hostproc.Cgroup) {
 	d.workerCgroup = cg
 }
 
+// instanceRecordPath is a sandbox's record in the driver's records dir. ""
+// without a run dir or for an id that is not a sandbox id.
 func (d *Driver) instanceRecordPath(sandboxID string) string {
-	return filepath.Join(d.sandboxDir(sandboxID), instanceRecordName)
+	if d.cfg.RunDir == "" || models.ValidateSandboxID(sandboxID) != nil {
+		return ""
+	}
+	return filepath.Join(d.cfg.RunDir, recordsDirName, sandboxID+".json")
+}
+
+// legacyInstanceRecordPath is where releases before recordsDirName kept a
+// sandbox's record: in its work dir ("" as for instanceRecordPath).
+func (d *Driver) legacyInstanceRecordPath(sandboxID string) string {
+	if d.cfg.RunDir == "" || models.ValidateSandboxID(sandboxID) != nil {
+		return ""
+	}
+	return filepath.Join(d.sandboxDir(sandboxID), legacyInstanceRecordName)
 }
 
 // recordInstance writes inst's record, whole or not at all. Best-effort: a
 // sandbox without a record is restored fresh after a restart instead of
-// taken over, and says so in the log. The work dir is on tmpfs, so this is
+// taken over, and says so in the log. The run dir is on tmpfs, so this is
 // one small in-memory write.
 func (d *Driver) recordInstance(inst *sandboxInstance) {
 	if inst == nil || d.cfg.RunDir == "" {
 		return
 	}
+	path := d.instanceRecordPath(inst.sandboxID)
+	err := d.ensureHostDirs()
+	if err == nil && path == "" {
+		err = fmt.Errorf("not a sandbox id")
+	}
+	if err != nil {
+		if d.logger != nil {
+			d.logger.Warn("wasm: running instance not recorded; a sandboxd restart will restart it fresh",
+				"sandbox_id", inst.sandboxID, "error", err)
+		}
+		return
+	}
+	listen := inst.guestListen()
 	d.mu.Lock()
 	rec := instanceRecord{
 		SandboxID: inst.sandboxID, Socket: inst.socketPath, WorkerKey: inst.workerKey,
 		Resident: inst.fromResidentHost, WarmPool: inst.fromWarmPool,
 		ModuleRef: inst.moduleRef, ModulePath: inst.modulePath, ModuleDigest: inst.moduleDigest,
 		ModuleSize: inst.moduleSize, EntryExport: inst.entryExport, MemoryMB: inst.memoryMB,
-		ListenPort: inst.resolvedListenPort,
+		ListenPort: listen.primary, ListenPorts: listen.ports, ListenEngine: listen.engine,
 	}
 	d.mu.Unlock()
-	if err := writeFileAtomic(d.instanceRecordPath(inst.sandboxID), rec); err != nil && d.logger != nil {
+	if err := writeFileAtomic(path, rec); err != nil && d.logger != nil {
 		d.logger.Warn("wasm: running instance not recorded; a sandboxd restart will restart it fresh",
 			"sandbox_id", inst.sandboxID, "error", err)
 	}
 }
 
-// readInstanceRecord reads a sandbox's record; false when it has none or
-// it does not belong to the sandbox.
-func (d *Driver) readInstanceRecord(sandboxID string) (instanceRecord, bool) {
+// readInstanceRecord reads a sandbox's record. ok is false when it has
+// none, or none that names a worker this driver gives the sandbox
+// (recordRoutesValid). legacy marks a record read from the sandbox's work
+// dir, where releases before this kept it: the guest could have written
+// that file, so only its routing fields are kept (which worker, on which
+// socket), and AdoptSandbox takes the rest from the sandbox row and the
+// worker.
+func (d *Driver) readInstanceRecord(sandboxID string) (rec instanceRecord, legacy, ok bool) {
+	path := d.instanceRecordPath(sandboxID)
+	if path == "" {
+		return instanceRecord{}, false, false
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return d.readLegacyInstanceRecord(sandboxID)
+	}
+	if err == nil && json.Unmarshal(raw, &rec) == nil && rec.SandboxID == sandboxID && d.recordRoutesValid(sandboxID, rec, false) {
+		return rec, false, true
+	}
+	if d.logger != nil {
+		d.logger.Warn("wasm adopt: unusable instance record; the sandbox is restored instead",
+			"sandbox_id", sandboxID, "path", path, "error", err)
+	}
+	return instanceRecord{}, false, false
+}
+
+func (d *Driver) readLegacyInstanceRecord(sandboxID string) (instanceRecord, bool, bool) {
+	raw, err := readGuestFile(d.legacyInstanceRecordPath(sandboxID), maxRecordBytes)
+	if errors.Is(err, fs.ErrNotExist) {
+		return instanceRecord{}, false, false
+	}
 	var rec instanceRecord
-	raw, err := os.ReadFile(d.instanceRecordPath(sandboxID))
+	if err != nil || json.Unmarshal(raw, &rec) != nil || rec.SandboxID != sandboxID || !d.recordRoutesValid(sandboxID, rec, true) {
+		if d.logger != nil {
+			d.logger.Warn("wasm adopt: the record in the sandbox's work dir names no worker this driver gives it; the sandbox is restored instead",
+				"sandbox_id", sandboxID, "error", err)
+		}
+		return instanceRecord{}, false, false
+	}
+	return instanceRecord{SandboxID: rec.SandboxID, Socket: rec.Socket, WorkerKey: rec.WorkerKey,
+		Resident: rec.Resident, WarmPool: rec.WarmPool}, true, true
+}
+
+// readGuestFile reads a small file from a dir the guest can write: not
+// through a symlink at its name, which could lead anywhere on the host,
+// without blocking on a FIFO, and only a regular file of at most limit
+// bytes.
+func readGuestFile(path string, limit int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return rec, false
+		return nil, err
 	}
-	if json.Unmarshal(raw, &rec) != nil || rec.SandboxID != sandboxID || rec.Socket == "" {
-		return instanceRecord{}, false
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
 	}
-	return rec, true
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("%s is over %d bytes", path, limit)
+	}
+	return raw, nil
+}
+
+// recordRoutesValid reports whether a record names, consistently, a worker
+// this driver would give the sandbox:
+//   - its own worker: its own socket, under its id as the worker key. A
+//     legacy record can name only the socket in the sandbox's dir, where
+//     releases before this put it; a record of the driver's may name either
+//     (an adopted worker keeps the socket it was started on).
+//   - a warm-pool slot's worker: a slot socket of the pool over this run
+//     dir, under the slot's id. Slot ids are random and in no path a guest
+//     sees.
+//   - a resident host: one of this run dir's resident sockets, under the
+//     host's key. A resident host answers per sandbox whether it holds an
+//     instance (HasInstance), and did before any sandboxd adopted one, so
+//     naming one gets a record nothing the host does not confirm.
+//
+// So no record, wherever it was read, names another sandbox's own worker.
+func (d *Driver) recordRoutesValid(sandboxID string, rec instanceRecord, legacy bool) bool {
+	if rec.Socket == "" {
+		return false
+	}
+	switch {
+	case rec.Resident:
+		bucketID, index, ok := parseResidentSocket(d.cfg.RunDir, rec.Socket)
+		return ok && !rec.WarmPool && rec.WorkerKey == d.residentHostKey(bucketID, index)
+	case rec.WarmPool:
+		slotID, ok := wasmpool.SlotFromSocket(d.cfg.RunDir, rec.Socket)
+		return ok && rec.WorkerKey == slotID
+	case rec.WorkerKey != sandboxID:
+		return false
+	case rec.Socket == d.legacyWorkerSocketPath(sandboxID):
+		return true
+	default:
+		return !legacy && rec.Socket == d.workerSocketPath(sandboxID)
+	}
 }
 
 // writeFileAtomic writes v as JSON at path through a temp file and a
@@ -301,9 +437,30 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 		return state, nil
 	}
 	d.mu.Unlock()
-	rec, ok := d.readInstanceRecord(sb.ID)
+	rec, legacy, ok := d.readInstanceRecord(sb.ID)
 	if !ok {
 		return nil, ErrNotAdopted
+	}
+	modulePath, moduleSize, moduleDigest := rec.ModulePath, rec.ModuleSize, firstNonEmpty(rec.ModuleDigest, sb.ModuleDigest)
+	if legacy {
+		// It passed the checks, so it is one an older sandboxd wrote. It
+		// does not stay where the guest can write it: an adoption below
+		// records the instance in the driver's dir, and so does a restore.
+		_ = os.Remove(d.legacyInstanceRecordPath(sb.ID))
+		// The module comes from the row, as for a restore, never from a
+		// path the guest could have written. Before the worker is claimed:
+		// a failure leaves the worker to FinishAdoption and the sandbox to
+		// a restore, which resolves the same way.
+		resolved, err := d.moduleFromRow(ctx, sb)
+		if err != nil {
+			if d.logger != nil {
+				d.logger.Warn("wasm adopt: module of a pre-upgrade sandbox not resolved; it is restored instead",
+					"sandbox_id", sb.ID, "error", err)
+			}
+			return nil, ErrNotAdopted
+		}
+		modulePath, moduleSize = resolved.Path, resolved.SizeBytes
+		moduleDigest = firstNonEmpty(sb.ModuleDigest, resolved.Digest)
 	}
 	var host *residentHost
 	var bucket *residentBucket
@@ -311,26 +468,32 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 		if bucket, host = d.residentHostBySocket(rec.Socket); host == nil {
 			return nil, ErrNotAdopted
 		}
-	} else if !d.claimWorker(rec) {
-		return nil, ErrNotAdopted
-	}
-	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	loaded, err := d.newWorkerClient(rec.Socket).InstanceLoaded(checkCtx, sb.ID)
-	cancel()
-	if err != nil || !loaded {
-		if !rec.Resident && d.supervisor != nil {
-			_ = d.supervisor.Stop(rec.WorkerKey)
+		st, err := d.instanceStatus(ctx, rec.Socket, sb.ID)
+		if err != nil || !st.Loaded || st.Foreign(sb.ID) {
+			return nil, ErrNotAdopted
 		}
+	} else if !d.adoptOwnWorker(ctx, sb.ID, rec) {
 		return nil, ErrNotAdopted
 	}
+	listen := guestListenState{primary: rec.ListenPort, ports: rec.ListenPorts, engine: rec.ListenEngine}
+	if legacy && !rec.Resident {
+		// The worker's own answer, not a number the guest could have
+		// written. A record from /work is from a release whose workers have
+		// one listener for every port.
+		listen = guestListenState{primary: d.workerListenPort(rec.Socket, sb.ID)}
+	}
+	// A listener and no per-port map: a worker from an older release. It
+	// is never sent a port number (guestHTTPProxy) nor asked for per-port
+	// listeners.
+	listen.legacy = listen.primary > 0 && len(listen.ports) == 0
 
 	workDir := d.sandboxDir(sb.ID)
 	inst := &sandboxInstance{
 		sandboxID:          sb.ID,
 		moduleRef:          firstNonEmpty(rec.ModuleRef, sb.ModuleRef, sb.Image),
-		modulePath:         rec.ModulePath,
-		moduleSize:         rec.ModuleSize,
-		moduleDigest:       firstNonEmpty(rec.ModuleDigest, sb.ModuleDigest),
+		modulePath:         modulePath,
+		moduleSize:         moduleSize,
+		moduleDigest:       moduleDigest,
 		socketPath:         rec.Socket,
 		workDir:            workDir,
 		workerKey:          rec.WorkerKey,
@@ -345,7 +508,10 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 		memoryMB:           rec.MemoryMB,
 		diskGB:             sb.DiskGB,
 		durability:         sb.Durability,
-		resolvedListenPort: rec.ListenPort,
+		resolvedListenPort: listen.primary,
+		listenPorts:        listen.ports,
+		legacyListen:       listen.legacy,
+		listenEngine:       listen.engine,
 	}
 	if inst.memoryMB <= 0 {
 		inst.memoryMB = sb.MemoryMB
@@ -370,10 +536,97 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 	d.mu.Lock()
 	d.byID[sb.ID] = inst
 	d.mu.Unlock()
+	if legacy {
+		d.recordInstance(inst)
+	}
 	if d.logger != nil {
-		d.logger.Info("wasm adopt: running sandbox taken over", "sandbox_id", sb.ID, "resident", rec.Resident, "socket", rec.Socket)
+		d.logger.Info("wasm adopt: running sandbox taken over", "sandbox_id", sb.ID, "resident", rec.Resident,
+			"socket", rec.Socket, "record_moved", legacy)
 	}
 	return d.runtimeState(inst), nil
+}
+
+// moduleFromRow resolves the module a stored sandbox runs, pinned to the
+// digest it was created with, as StartSandbox does.
+func (d *Driver) moduleFromRow(ctx context.Context, sb *models.Sandbox) (*wasmmod.ResolvedModule, error) {
+	if d.resolver == nil {
+		return nil, fmt.Errorf("module resolver not configured")
+	}
+	ref := firstNonEmpty(strings.TrimSpace(sb.ModuleRef), strings.TrimSpace(sb.Image))
+	if ref == "" {
+		return nil, fmt.Errorf("module_ref is required")
+	}
+	return d.resolvePinned(wasmmod.WithCatalogueOwner(ctx, sb.OwnerRef), ref, sb.ModuleDigest, moduleAuthFromSandbox(sb))
+}
+
+// instanceStatusReader is the status question that also says whose
+// instance a worker holds (workerClientAdapter). A client without it
+// answers as a worker from before that would.
+type instanceStatusReader interface {
+	InstanceStatus(ctx context.Context, sandboxID string) (worker.InstanceStatus, error)
+}
+
+// instanceStatus asks the worker on socket about sandboxID's instance.
+func (d *Driver) instanceStatus(ctx context.Context, socket, sandboxID string) (worker.InstanceStatus, error) {
+	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	client := d.newWorkerClient(socket)
+	if r, ok := client.(instanceStatusReader); ok {
+		return r.InstanceStatus(checkCtx, sandboxID)
+	}
+	loaded, err := client.InstanceLoaded(checkCtx, sandboxID)
+	return worker.InstanceStatus{Loaded: loaded}, err
+}
+
+// adoptOwnWorker takes over the per-sandbox (or warm-slot) worker rec
+// names, once that worker answers for sandboxID.
+func (d *Driver) adoptOwnWorker(ctx context.Context, sandboxID string, rec instanceRecord) bool {
+	if !d.hasPendingWorker(rec.Socket) {
+		return false
+	}
+	// Asked before the claim: a worker that holds another sandbox's
+	// instance stays pending for that sandbox's own adoption, unclaimed and
+	// running.
+	st, err := d.instanceStatus(ctx, rec.Socket, sandboxID)
+	if err == nil && st.Foreign(sandboxID) {
+		if d.logger != nil {
+			d.logger.Warn("wasm adopt: the worker a record names holds another sandbox; not taken over",
+				"sandbox_id", sandboxID, "socket", rec.Socket)
+		}
+		return false
+	}
+	if !d.claimWorker(rec) {
+		return false
+	}
+	if err != nil || !st.Loaded {
+		_ = d.supervisor.Stop(rec.WorkerKey)
+		return false
+	}
+	// A worker from before identity answers (!st.Checked) cannot say whose
+	// instance it holds. It is taken on the record's word, and that word
+	// can only name this sandbox's own socket or a warm slot's
+	// (recordRoutesValid).
+	return true
+}
+
+// hasPendingWorker reports whether AdoptWorkers holds a worker on socket
+// that no sandbox has claimed yet.
+func (d *Driver) hasPendingWorker(socket string) bool {
+	d.residentMu.Lock()
+	defer d.residentMu.Unlock()
+	_, ok := d.pendingWorkers[socket]
+	return ok
+}
+
+// workerListenPort asks a worker which host port its guest listens on; 0
+// for none or no answer (the next port sync then starts the listener
+// again).
+func (d *Driver) workerListenPort(socket, sandboxID string) int {
+	port, err := d.newWorkerClient(socket).ResolvedListenPort(sandboxID)
+	if err != nil || port < 0 {
+		return 0
+	}
+	return port
 }
 
 // residentHostBySocket finds an adopted (or live) resident host.

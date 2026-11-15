@@ -2,6 +2,8 @@ package codeinterp
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -93,4 +95,38 @@ func ParseErrorPayload(p []byte) (name, value, traceback string) {
 		parts = append(parts, "")
 	}
 	return parts[0], parts[1], parts[2]
+}
+
+// EventFromFrame returns the Event a driver frame carries, so every kernel
+// (process or WASM) reads the event frames the same way. ok is false for a
+// frame that carries no event: READY, FATAL, SYNC, DONE, a COUNT or RESULT
+// that does not decode, and kinds a newer driver may add.
+func EventFromFrame(kind string, payload []byte) (Event, bool) {
+	switch kind {
+	case "COUNT":
+		if n, err := strconv.Atoi(string(payload)); err == nil {
+			return Event{Kind: EventCount, Count: n}, true
+		}
+	case "OUT":
+		return Event{Kind: EventStdout, Text: string(payload)}, true
+	case "ERR":
+		return Event{Kind: EventStderr, Text: string(payload)}, true
+	case "RESULT":
+		var r struct {
+			Data map[string]any `json:"data"`
+			Main bool           `json:"main"`
+		}
+		dec := json.NewDecoder(bytes.NewReader(payload))
+		// Numbers in application/json and table data keep their digits.
+		dec.UseNumber()
+		if err := dec.Decode(&r); err == nil && len(r.Data) > 0 {
+			return Event{Kind: EventResult, Bundle: r.Data, Main: r.Main}, true
+		}
+	case "TEXT":
+		return Event{Kind: EventResult, Main: true, Bundle: map[string]any{"text/plain": string(payload)}}, true
+	case "ERROR":
+		name, value, tb := ParseErrorPayload(payload)
+		return Event{Kind: EventError, ErrName: name, ErrValue: value, ErrTraceback: tb}, true
+	}
+	return Event{}, false
 }

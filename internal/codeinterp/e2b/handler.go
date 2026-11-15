@@ -71,7 +71,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) registerDefaults() {
 	for _, lang := range []string{codeinterp.LangPython, codeinterp.LangJavaScript} {
-		if _, err := h.m.Default(lang); err != nil {
+		// A language the Manager refuses (WASM runs python only) simply has
+		// no default context; that is not worth a warning per sandbox.
+		if _, err := h.m.Default(lang); err != nil && !errors.Is(err, codeinterp.ErrUnsupportedLanguage) {
 			// /execute registers it again on demand, so this is not fatal.
 			h.logger.Warn("e2b interpreter: default context not registered", "language", lang, "error", err)
 		}

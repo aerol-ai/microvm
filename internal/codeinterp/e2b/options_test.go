@@ -1,7 +1,9 @@
 package e2b
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,5 +56,39 @@ func TestManagerOptionsUsesHomeUser(t *testing.T) {
 	}
 	if got := ManagerOptions(newFakeLauncher(), nil).DefaultCwd; got != DefaultCwd {
 		t.Fatalf("DefaultCwd = %q", got)
+	}
+}
+
+// pythonOnly is a launcher that names its languages, as the WASM one does.
+type pythonOnly struct{ *fakeLauncher }
+
+func (pythonOnly) Languages() []string { return []string{codeinterp.LangPython} }
+
+func TestManagerOptionsAt(t *testing.T) {
+	lim := codeinterp.NewLimit(4)
+	l := pythonOnly{newFakeLauncher()}
+	opts := ManagerOptionsAt(l, lim, "/work")
+	if opts.DefaultCwd != "/work" || opts.Launcher != l || opts.Limit != lim || !opts.ListDefaults || opts.ProtectDefaults || opts.DefaultID != nil {
+		t.Fatalf("options = %+v", opts)
+	}
+	if len(opts.Languages) != 1 || opts.Languages[0] != codeinterp.LangPython {
+		t.Fatalf("languages = %v", opts.Languages)
+	}
+	if plain := ManagerOptionsAt(newFakeLauncher(), nil, "/srv"); plain.Languages != nil || plain.DefaultCwd != "/srv" {
+		t.Fatalf("options without Languages = %+v", plain)
+	}
+
+	// Defaults are registered only for the languages the launcher has: a
+	// python-only launcher lists one default and refuses javascript.
+	m := codeinterp.NewManager(opts)
+	t.Cleanup(m.Close)
+	e := &testEnv{m: m, h: newHandler(m, nil, KeepaliveInterval)}
+	rec := e.do(http.MethodGet, "/contexts", "")
+	var list []contextResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || len(list) != 1 || list[0].Language != "python" || list[0].Cwd != "/work" {
+		t.Fatalf("contexts = %s (%v)", rec.Body.String(), err)
+	}
+	if rec := e.do(http.MethodPost, "/execute", `{"code":"1","language":"javascript"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("javascript = %d %s", rec.Code, rec.Body.String())
 	}
 }

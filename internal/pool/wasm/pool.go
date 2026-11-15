@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -273,13 +275,45 @@ func NewSlotID() string {
 	return "pool-" + hex.EncodeToString(b[:])
 }
 
+// slotIDPattern is what NewSlotID mints.
+var slotIDPattern = regexp.MustCompile(`^pool-[0-9a-f]{16}$`)
+
+// slotSocketName is the worker socket in a slot's dir.
+const slotSocketName = "worker.sock"
+
 // SlotDir returns the on-disk directory for a pool slot.
 func (p *Pool) SlotDir(digest, slotID string) string {
+	return slotDir(p.runDir, digest, slotID)
+}
+
+func slotDir(runDir, digest, slotID string) string {
 	prefix := digest
 	if len(prefix) > 12 {
 		prefix = prefix[:12]
 	}
-	return filepath.Join(p.runDir, "pool", prefix, slotID)
+	return filepath.Join(runDir, "pool", prefix, slotID)
+}
+
+// SlotFromSocket reads a slot's id back off its worker socket path: the
+// path WarmOne gives a slot of a pool over runDir, and no other. The WASM
+// driver uses it to check that a record naming a warm slot names one of
+// this pool's (a restarted sandboxd adopts the slot's worker by that path).
+func SlotFromSocket(runDir, socket string) (string, bool) {
+	rel, err := filepath.Rel(filepath.Join(runDir, "pool"), socket)
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 3 || parts[2] != slotSocketName || !slotIDPattern.MatchString(parts[1]) {
+		return "", false
+	}
+	// The digest prefix is the one free-form part: it must be a plain name,
+	// and the path must be the one slotDir builds from it.
+	if prefix := parts[0]; prefix == "" || prefix == "." || prefix == ".." || len(prefix) > 12 ||
+		filepath.Join(slotDir(runDir, prefix, parts[1]), slotSocketName) != socket {
+		return "", false
+	}
+	return parts[1], true
 }
 
 // WarmOne spawns a single warm slot for digest/path. Used by the refill loop.
@@ -300,7 +334,7 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	socketPath := filepath.Join(dir, "worker.sock")
+	socketPath := filepath.Join(dir, slotSocketName)
 	if err := spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err

@@ -104,6 +104,35 @@ func TestResidentServer_LoadOnceInstantiateManyExec(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 }
 
+// A resident host holds many sandboxes' instances, so its status answer is
+// per sandbox: it names the asked sandbox back only when it holds it, and
+// never another one (a restarted sandboxd adopts on that answer).
+func TestResidentServer_StatusNamesOnlyTheAskedSandbox(t *testing.T) {
+	modPath := wasmmod.WriteMinimalWasm(t, t.TempDir(), "demo.wasm")
+	client, _ := serveResident(t)
+	if _, err := client.LoadModule("host", modPath, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Instantiate("sb-1", nonListenCaps("wasm")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, tc := range []struct {
+		id     string
+		loaded bool
+		holder string
+	}{
+		{"", true, ""},         // the module question
+		{"sb-1", true, "sb-1"}, // held
+		{"sb-2", false, ""},    // not held: no other sandbox named
+	} {
+		st, err := client.InstanceStatus(ctx, tc.id)
+		if err != nil || st.Loaded != tc.loaded || st.SandboxID != tc.holder || !st.Checked || st.Foreign(tc.id) {
+			t.Fatalf("InstanceStatus(%q) = %+v, %v", tc.id, st, err)
+		}
+	}
+}
+
 // TestResidentServer_RejectsListener confirms a listener (expose_port/HTTP)
 // Instantiate is rejected — the driver routes those to the per-sandbox cold path.
 func TestResidentServer_RejectsListener(t *testing.T) {
