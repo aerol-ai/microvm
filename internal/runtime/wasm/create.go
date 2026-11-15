@@ -59,6 +59,15 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	memoryMB := effectiveMemoryMB(req, d.cfg.DefaultMemoryMB)
 
+	// The worker socket and the instance record live in the driver's own
+	// dirs (ensureHostDirs): made once per process, so after the first create
+	// this is one atomic load. Before the warm-pool acquire, so a failure
+	// here holds no slot.
+	ownSocket, err := d.ownWorkerSocket(sandboxID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Resident-host fast path (opt-in, non-listen, known digest): instantiate
 	// into a shared compile-once/instantiate-many host instead of spawning a
 	// per-sandbox worker + compiling. Everything below is the untouched
@@ -85,7 +94,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
 
-	socketPath := filepath.Join(workDir, "worker.sock")
+	socketPath := ownSocket
 	workerKey := sandboxID
 	if warmSlot != nil {
 		socketPath = warmSlot.SocketPath
@@ -121,6 +130,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		_ = d.supervisor.Stop(workerKey)
 		if warmSlot != nil {
 			_ = os.RemoveAll(filepath.Dir(warmSlot.SocketPath))
+		} else {
+			_ = os.Remove(socketPath)
 		}
 		_ = os.RemoveAll(workDir)
 		d.mu.Lock()

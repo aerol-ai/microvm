@@ -48,23 +48,75 @@ func TestServeToolboxFileWatchUnsupported(t *testing.T) {
 	}
 }
 
-// Terminals and sessions answer 501 instead of falling through to the
-// fetch-handler exec that every other "/process" path reaches.
+// Terminals, sessions, the code interpreters, code-run and streaming exec
+// answer 501 instead of falling through to the fetch-handler exec that
+// every other "/process" path reaches: that exec answers 200 with the
+// handler's output, which their clients would take for a working terminal
+// or a program's output. The sandbox here has a handler that answers, so a
+// route that reached it would show as a 200, and the handler would have run.
 func TestServeToolboxTerminalsUnsupported(t *testing.T) {
-	d := New(Config{}, nil)
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/process/pty"},
-		{http.MethodGet, "/process/pty/t1/connect"},
-		{http.MethodPost, "/process/session"},
-		{http.MethodPost, "/process/session/s1/exec"},
-		{http.MethodPost, "/sessions"},
-		{http.MethodPost, "/sessions/s1/exec"},
+	sup := &fakeSupervisor{}
+	d := newCreateDriver(t, GroupPerTenant, sup)
+	ctx := context.Background()
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{ModuleRef: "a.js", TenantID: "acme"}, "sb-1", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	invoked := 0
+	sup.hosts[0].invokeFn = func(context.Context, string, *http.Request) (*http.Response, error) {
+		invoked++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("tenant output")), Header: make(http.Header)}, nil
+	}
+	const (
+		terminals   = "no shell"
+		interpreter = "code interpreter is not supported on V8 isolate sandboxes"
+		codeRun     = "code-run needs a shell"
+		stream      = "streaming exec needs a process"
+	)
+	for _, tc := range []struct {
+		method, path, want string
+		json               bool // answered in toolboxd's {"error": ...} shape
+	}{
+		{http.MethodPost, "/process/pty", terminals, false},
+		{http.MethodGet, "/process/pty/t1/connect", terminals, false},
+		{http.MethodPost, "/process/session", terminals, false},
+		{http.MethodPost, "/process/session/s1/exec", terminals, false},
+		{http.MethodPost, "/sessions", terminals, false},
+		{http.MethodPost, "/sessions/s1/exec", terminals, false},
+		// Daytona codeInterpreter.
+		{http.MethodPost, "/process/interpreter/context", interpreter, true},
+		{http.MethodGet, "/process/interpreter/context", interpreter, true},
+		{http.MethodDelete, "/process/interpreter/context/ctx-1", interpreter, true},
+		{http.MethodGet, "/process/interpreter/execute", interpreter, true},
+		// E2B code interpreter.
+		{http.MethodPost, "/interpreter/e2b/execute", interpreter, true},
+		{http.MethodGet, "/interpreter/e2b/contexts", interpreter, true},
+		{http.MethodGet, "/interpreter", interpreter, true},
+		{http.MethodPost, "/process/code-run", codeRun, true},
+		{http.MethodGet, "/process/exec/stream", stream, true},
 	} {
 		rec := httptest.NewRecorder()
-		d.ServeToolbox(context.Background(), "sb-1", "tok", rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}")))
-		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "no shell") {
-			t.Fatalf("%s %s = %d %q, want the terminals 501", tc.method, tc.path, rec.Code, rec.Body.String())
+		d.ServeToolbox(ctx, "sb-1", "tok", rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader("{}")))
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), tc.want) {
+			t.Fatalf("%s %s = %d %q, want a 501 saying %q", tc.method, tc.path, rec.Code, rec.Body.String(), tc.want)
 		}
+		if tc.json {
+			var body models.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Error == "" || rec.Header().Get("Content-Type") != "application/json" {
+				t.Fatalf("%s %s body %q (%v), want toolboxd's JSON error", tc.method, tc.path, rec.Body.String(), err)
+			}
+		}
+	}
+	if invoked != 0 {
+		t.Fatalf("the fetch handler ran %d times for unsupported routes", invoked)
+	}
+	// /process/execute, the one exec the isolate serves, still reaches the
+	// handler.
+	body, _ := json.Marshal(models.ExecRequest{Command: "/"})
+	rec := httptest.NewRecorder()
+	d.ServeToolbox(ctx, "sb-1", "tok", rec, httptest.NewRequest(http.MethodPost, "/process/execute", bytes.NewReader(body)))
+	var result models.ExecResult
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil || rec.Code != http.StatusOK || result.Stdout != "tenant output" || invoked != 1 {
+		t.Fatalf("/process/execute = %d %+v (%v), handler ran %d times", rec.Code, result, err, invoked)
 	}
 }
 

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -23,6 +24,54 @@ type Server struct {
 	auditBindings map[string]egressAuditBinding
 	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick drains them.
 	workerNet map[string]*workerNetUsage
+	// holder is the sandbox whose instance this worker holds, set by the
+	// first Instantiate or Restore that names one and kept for the process's
+	// life (refuseForeign). Atomic, not under mu: every message reads it,
+	// and mu is held across module compiles and checkpoints.
+	holder atomic.Pointer[string]
+}
+
+// errForeignSandbox refuses a message for another sandbox than the one
+// whose instance the worker holds. It names neither sandbox: the error can
+// reach the caller of the request that carried the wrong id.
+var errForeignSandbox = errors.New("wasm worker holds another sandbox's instance")
+
+// holderID is the sandbox this worker holds, "" before its first instance.
+func (s *Server) holderID() string {
+	if p := s.holder.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// bindHolder records sandboxID as the holder once an instance of it is up.
+// The caller holds mu, which serializes Instantiate and Restore, and has
+// checked (refuseForeign) that no other sandbox holds the worker.
+func (s *Server) bindHolder(sandboxID string) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID != "" && s.holder.Load() == nil {
+		s.holder.Store(&sandboxID)
+	}
+}
+
+// refuseForeign keeps a per-sandbox worker to its one sandbox. sandboxd
+// reaches a worker by its socket path, and a path can lead to the wrong
+// worker: a pre-upgrade sandbox's socket sits in its own /work, where the
+// guest can swap it for a link to another sandbox's socket. Once the worker
+// holds an instance, a message for any other sandbox is refused, so such a
+// swap breaks only the sandbox that made it. Ping and the status question
+// are answered for anyone: they reveal nothing and change nothing. Ids
+// are trimmed as MsgNetstatsTick trims them.
+func (s *Server) refuseForeign(env Envelope) error {
+	switch env.Type {
+	case MsgHealthPing, MsgInstanceStatus:
+		return nil
+	}
+	id := strings.TrimSpace(env.SandboxID)
+	if holder := s.holderID(); holder != "" && id != "" && id != holder {
+		return errForeignSandbox
+	}
+	return nil
 }
 
 type workerNetUsage struct {
@@ -171,6 +220,16 @@ func (s *Server) Serve(conn net.Conn) error {
 		if err != nil {
 			return err
 		}
+		// Instantiate and Restore check in their own cases, under mu, where
+		// they bind the holder.
+		if env.Type != MsgInstantiate && env.Type != MsgRestore {
+			if refused := s.refuseForeign(env); refused != nil {
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+		}
 		switch env.Type {
 		case MsgHealthPing:
 			if err := writeFrame(conn, Envelope{Type: MsgPong, SandboxID: env.SandboxID}); err != nil {
@@ -180,7 +239,14 @@ func (s *Server) Serve(conn net.Conn) error {
 			s.mu.Lock()
 			loaded := s.eng != nil
 			s.mu.Unlock()
-			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded})
+			holder := s.holderID()
+			if asked := strings.TrimSpace(env.SandboxID); asked != "" && asked != holder {
+				// Asked about one sandbox, the worker answers for the
+				// instance it holds: a restarted sandboxd adopts a worker
+				// only for the sandbox that worker says it serves.
+				loaded = false
+			}
+			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded, SandboxID: holder, Checked: true})
 			if encErr != nil {
 				return encErr
 			}
@@ -242,8 +308,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
+			// Under mu, which serializes instantiations: of two first ones
+			// for different sandboxes, the second must not replace the
+			// instance the first one bound.
+			if refused := s.refuseForeign(env); refused != nil {
+				s.mu.Unlock()
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			if s.eng == nil {
 				s.mu.Unlock()
 				s.clearAuditBinding(env.SandboxID)
@@ -259,6 +335,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err == nil {
 				s.lastCaps = p.Caps
 				s.syncResolvedListenPort(&s.lastCaps)
+				s.bindHolder(env.SandboxID)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -427,8 +504,15 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			s.setAuditBinding(env.SandboxID, p.Caps)
 			s.mu.Lock()
+			if refused := s.refuseForeign(env); refused != nil {
+				s.mu.Unlock()
+				if werr := replyErr(env.SandboxID, refused); werr != nil {
+					return werr
+				}
+				continue
+			}
+			s.setAuditBinding(env.SandboxID, p.Caps)
 			if s.eng == nil {
 				s.mu.Unlock()
 				s.clearAuditBinding(env.SandboxID)
@@ -444,6 +528,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err == nil {
 				s.lastCaps = p.Caps
 				s.syncResolvedListenPort(&s.lastCaps)
+				s.bindHolder(env.SandboxID)
 			}
 			s.mu.Unlock()
 			if err != nil {

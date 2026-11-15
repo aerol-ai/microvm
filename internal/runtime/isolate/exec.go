@@ -41,6 +41,16 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 		// answer 200 with the handler's output, which a Daytona terminal
 		// client cannot tell from a working terminal.
 		http.Error(w, "isolate runtime has no shell: terminals and sessions are not supported", http.StatusNotImplemented)
+	// The next three would also match the "/process" or "/exec" case below,
+	// which runs the tenant's fetch handler and answers 200. A code
+	// interpreter client (Daytona's codeInterpreter, E2B's) or a code-run
+	// caller would take that handler's output for its program's output.
+	case strings.Contains(path, "/process/interpreter") || path == "/interpreter" || strings.HasPrefix(path, "/interpreter/"):
+		writeToolboxError(w, http.StatusNotImplemented, "code interpreter is not supported on V8 isolate sandboxes")
+	case strings.Contains(path, "/process/code-run"):
+		writeToolboxError(w, http.StatusNotImplemented, "code-run needs a shell; not supported on V8 isolate sandboxes")
+	case strings.Contains(path, "/exec/stream"):
+		writeToolboxError(w, http.StatusNotImplemented, "streaming exec needs a process; not supported on V8 isolate sandboxes (use /process/execute)")
 	case strings.Contains(path, "/exec") || strings.Contains(path, "/process"):
 		d.serveExec(ctx, sandboxID, w, r)
 	case path == "/files" || strings.HasPrefix(path, "/files/"):

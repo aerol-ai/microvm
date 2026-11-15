@@ -172,12 +172,16 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
+	socketPath, err := d.ownWorkerSocket(sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
 	inst := &sandboxInstance{
 		sandboxID:    sandbox.ID,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
 		moduleDigest: resolved.Digest,
-		socketPath:   filepath.Join(workDir, "worker.sock"),
+		socketPath:   socketPath,
 		workDir:      workDir,
 		workerKey:    sandbox.ID,
 		status:       models.SandboxStatusStopped,
@@ -251,6 +255,14 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		workDir = inst.workDir
 	}
 	_ = os.RemoveAll(workDir)
+	// The socket and the record in the driver's own dirs are named for the
+	// sandbox alone; a worker stopped by a kill leaves its socket behind.
+	if socket := d.workerSocketPath(sandboxID); socket != "" {
+		_ = os.Remove(socket)
+	}
+	if record := d.instanceRecordPath(sandboxID); record != "" {
+		_ = os.Remove(record)
+	}
 	_ = os.RemoveAll(d.checkpointDir(sandboxID))
 	return nil
 }

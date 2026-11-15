@@ -173,7 +173,13 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				// Inspect can detect a gone instance after host respawn.
 				loaded = eng.HasInstance(env.SandboxID)
 			}
-			body, encErr := encodePayload(instanceStatusPayload{Loaded: loaded})
+			// A shared host holds many sandboxes' instances: it names the
+			// asked one back only when it holds it.
+			reply := instanceStatusPayload{Loaded: loaded, Checked: true}
+			if env.SandboxID != "" && loaded {
+				reply.SandboxID = env.SandboxID
+			}
+			body, encErr := encodePayload(reply)
 			if encErr != nil {
 				return encErr
 			}

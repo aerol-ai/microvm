@@ -47,8 +47,17 @@ type loadModuleResultPayload struct {
 	Timings wasmengine.LoadTimings `json:"timings"`
 }
 
+// instanceStatusPayload is the MsgInstanceStatus reply. Workers outlive
+// sandboxd, so a restarted sandboxd also reads replies from workers that
+// predate the identity fields: they leave both out, and Checked is how the
+// reader tells "holds no instance" from "cannot say whose it holds".
 type instanceStatusPayload struct {
 	Loaded bool `json:"loaded"`
+	// SandboxID is the sandbox whose instance the worker holds, "" for
+	// none.
+	SandboxID string `json:"sandbox_id,omitempty"`
+	// Checked is set by every worker that tracks SandboxID.
+	Checked bool `json:"checked,omitempty"`
 }
 
 type checkpointPayload struct {
