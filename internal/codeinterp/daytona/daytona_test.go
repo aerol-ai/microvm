@@ -322,11 +322,16 @@ func TestExecuteTimeoutDeathRestart(t *testing.T) {
 	}
 
 	// Deleting the context under a run ends it with "context shutdown".
+	// The kernel that just died already counts one run, so wait for the
+	// kernel the restart launches: checking l.last() alone passed before
+	// this run was even accepted, and the delete then beat it ("context
+	// not found" instead of "context shutdown").
+	dead := l.last()
 	conn := e.dial(t, nil)
 	if err := conn.WriteJSON(ExecuteRequest{Code: "sleep", ContextID: info.ID}); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, "run in flight", func() bool { k := l.last(); return k != nil && k.runs.Load() == 1 })
+	waitUntil(t, "run in flight", func() bool { k := l.last(); return k != dead && k.runs.Load() == 1 })
 	if status, _ := e.do(t, http.MethodDelete, "/context/"+info.ID, ""); status != http.StatusOK {
 		t.Fatalf("delete = %d", status)
 	}
