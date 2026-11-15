@@ -154,11 +154,11 @@ func TestSnapshotMoveBetweenTwoWorkers(t *testing.T) {
 		t.Fatal("the imported row is not held from the stale-ownership sweep")
 	}
 	// Not yet the target's: no start.
-	if err := dst.StartMoved(ctx, "sb-vm", nil); err == nil {
+	if err := dst.StartMoved(ctx, "sb-vm", "", nil); err == nil {
 		t.Fatal("started before the swap")
 	}
 	dstC.owner = "worker-b"
-	if err := dst.StartMoved(ctx, "sb-vm", nil); err != nil {
+	if err := dst.StartMoved(ctx, "sb-vm", "", nil); err != nil {
 		t.Fatalf("start after the swap: %v", err)
 	}
 	if row, _ := dst.store.Get(ctx, "sb-vm"); row.Status != models.SandboxStatusStarted || row.ContainerIP != "172.16.0.6" {
@@ -167,7 +167,7 @@ func TestSnapshotMoveBetweenTwoWorkers(t *testing.T) {
 	if dst.movesIn.held("sb-vm", time.Now()) {
 		t.Fatal("still held after its start")
 	}
-	if err := dst.DropMove(ctx, "sb-vm"); err == nil {
+	if err := dst.DropMove(ctx, "sb-vm", ""); err == nil {
 		t.Fatal("a sandbox that moved here was dropped")
 	}
 }
@@ -310,7 +310,7 @@ func TestCheckpointMoveBetweenTwoWorkers(t *testing.T) {
 	if _, err := dst.store.Get(ctx, "sb-g"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a row before the swap: %v", err)
 	}
-	if err := dst.StartMoved(ctx, "sb-g", gvisorRecreate(dstC)); err == nil {
+	if err := dst.StartMoved(ctx, "sb-g", "", gvisorRecreate(dstC)); err == nil {
 		t.Fatal("started before the swap")
 	}
 	// A bundle goes out once: a second pull is refused until a release
@@ -323,7 +323,7 @@ func TestCheckpointMoveBetweenTwoWorkers(t *testing.T) {
 		t.Fatalf("import again: %v", err)
 	}
 	dstC.owner = "worker-b"
-	if err := dst.StartMoved(ctx, "sb-g", gvisorRecreate(dstC)); err != nil {
+	if err := dst.StartMoved(ctx, "sb-g", "", gvisorRecreate(dstC)); err != nil {
 		t.Fatalf("start after the swap: %v", err)
 	}
 	row, err := dst.store.Get(ctx, "sb-g")
@@ -354,7 +354,7 @@ func TestCheckpointMoveFallsBackToItsImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	dstC.owner = "worker-b"
-	if err := dst.StartMoved(ctx, "sb-g", gvisorRecreate(dstC)); err != nil {
+	if err := dst.StartMoved(ctx, "sb-g", "", gvisorRecreate(dstC)); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	if !slicesEqual(dstRT.createRestored, []bool{true, false}) || dstRT.dropped == 0 {
@@ -403,10 +403,10 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	if err := dst.ImportMove(ctx, "sb-g", "worker-a", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := dst.DropMove(ctx, "sb-g"); err != nil || dstRT.dropped == 0 || dstRT.imported != nil {
+	if err := dst.DropMove(ctx, "sb-g", ""); err != nil || dstRT.dropped == 0 || dstRT.imported != nil {
 		t.Fatalf("drop: %v, dropped %d", err, dstRT.dropped)
 	}
-	if err := dst.DropMove(ctx, "sb-g"); err != nil {
+	if err := dst.DropMove(ctx, "sb-g", ""); err != nil {
 		t.Fatalf("a second drop: %v", err)
 	}
 	// No spec from the leader to rebuild from: the start fails and drops
@@ -417,7 +417,7 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	}
 	dstC.owner = "worker-b"
 	before := dstRT.dropped
-	if err := dst.StartMoved(ctx, "sb-g", nil); err == nil || dstRT.dropped == before {
+	if err := dst.StartMoved(ctx, "sb-g", "", nil); err == nil || dstRT.dropped == before {
 		t.Fatalf("start without a spec: %v, dropped %d", err, dstRT.dropped)
 	}
 }
