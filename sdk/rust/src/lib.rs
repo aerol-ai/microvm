@@ -1,4 +1,5 @@
 mod cells;
+mod code_interpreter;
 mod files;
 mod fleet;
 mod image;
@@ -24,6 +25,10 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 use cells::{CellHint, CellRoutes};
 
+pub use code_interpreter::{
+    CodeContext, CodeContextOptions, CodeResult, CodeResultCallback, CodeRunError, CodeRunHandle, Execution,
+    ExecutionError, ExecutionErrorCallback, ExecutionLogs, RunCodeOptions, TextCallback,
+};
 pub use files::{
     CopyFileOptions, DeleteFileOptions, FileInfo, FileList, FileMatch, ListFilesOptions, MakeDirOptions,
     DownloadFileOptions, MoveFileOptions, UploadFileOptions, DEFAULT_LIST_LIMIT,
@@ -144,6 +149,11 @@ pub enum Error {
     /// needs. An older agent would silently ignore the option (an overwrite
     /// guard, an output cap), so the SDK refuses instead of sending it.
     UnsupportedFeature(UnsupportedFeatureError),
+    /// A code run ([`Client::run_code`]) that did not end normally: the
+    /// server's run timeout fired ([`CodeRunError::is_timeout`]), the server
+    /// refused or ended the run, or the connection dropped. It carries what
+    /// the run produced before that.
+    CodeRun(CodeRunError),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -163,6 +173,7 @@ impl fmt::Display for Error {
             // The text these errors had as Error::Api(String) before 0.8.0.
             Error::Client(message) => write!(f, "API error: {}", message),
             Error::UnsupportedFeature(err) => write!(f, "{}", err),
+            Error::CodeRun(err) => write!(f, "{}", err),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -200,12 +211,14 @@ impl Error {
     }
 
     /// The call timed out: the server answered 408 or 504
-    /// ([`ApiError::is_timeout`]), or the HTTP client itself gave up
-    /// waiting (a connect or request timeout).
+    /// ([`ApiError::is_timeout`]), the HTTP client itself gave up waiting
+    /// (a connect or request timeout), or a code run hit its timeout
+    /// ([`CodeRunError::is_timeout`]).
     pub fn is_timeout(&self) -> bool {
         match self {
             Error::Api(err) => err.is_timeout(),
             Error::Reqwest(err) => err.is_timeout(),
+            Error::CodeRun(err) => err.is_timeout(),
             _ => false,
         }
     }
