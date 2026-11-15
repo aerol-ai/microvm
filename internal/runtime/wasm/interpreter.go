@@ -43,11 +43,11 @@ var interpreterBootstrap = `import sys;exec(compile(sys.argv.pop(1),"` + interpr
 // outside a run, to explain a driver that dies before READY.
 const interpreterStderrTail = 4 << 10
 
-// interpStream is the part of a Stream a kernel uses; tests fake it.
+// interpStream is the part of a Stream a kernel uses; tests fake it. There
+// is no Kill: closing the stream ends the run (see interpKernel.Close).
 type interpStream interface {
 	Recv() (StreamEvent, error)
 	WriteStdin(p []byte) error
-	Kill() error
 	Close() error
 }
 
@@ -217,17 +217,15 @@ func (k *interpKernel) pump() {
 	defer close(k.exited)
 	defer close(k.frames)
 	// The Manager forgets a kernel that died without closing it, so the
-	// kernel frees its run slot and connection itself.
+	// kernel frees its run slot and connection itself. Dropping the
+	// connection also ends an instance that is still running: one whose
+	// driver broke the protocol (a bad frame) cannot be trusted with
+	// another run.
 	defer k.st.Close()
 	fr := codeinterp.NewFrameReader(&interpStdout{k: k})
 	for {
 		kind, payload, err := fr.Read()
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				// A driver that breaks the protocol cannot be trusted with
-				// another run.
-				_ = k.st.Kill()
-			}
 			return
 		}
 		select {
@@ -335,9 +333,14 @@ func (k *interpKernel) exitedEarly() error {
 }
 
 // Interrupt kills the instance. WASI has no signals, so there is no way to
-// stop running code and keep the interpreter (D12): the run ends with
-// status "interrupted" and Died, the context reports active:false, and its
-// next run starts a new, empty interpreter.
+// stop running code and keep the interpreter (D12): the run ends at once
+// with status "interrupted" and Died, the context reports active:false,
+// and its next run starts a new, empty interpreter.
+//
+// It closes rather than waits for the worker's exit: the state is lost
+// either way, and wazero can take seconds to unwind a busy python.wasm
+// (about 2 s measured on a laptop), longer than an SDK waits for an
+// interrupt to be confirmed.
 func (k *interpKernel) Interrupt() error {
 	select {
 	case <-k.exited:
@@ -345,12 +348,13 @@ func (k *interpKernel) Interrupt() error {
 	default:
 	}
 	k.interrupted.Store(true)
-	return k.st.Kill()
+	return k.Close()
 }
 
 // Close ends the instance. Dropping the stream's connection is enough: the
 // worker kills a run whose connection goes, and no kill round trip holds up
-// a Manager closing many contexts.
+// a Manager closing many contexts. The stream's run slot is free at once;
+// the worker finishes the kill in the background.
 func (k *interpKernel) Close() error {
 	k.closeOnce.Do(func() {
 		close(k.closing)

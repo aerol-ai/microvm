@@ -23,21 +23,15 @@ type fakeInterpStream struct {
 	closed   chan struct{}
 	stdin    chan []byte
 	writeErr error
-	// exitOnKill makes Kill end the run the way the worker does.
-	exitOnKill bool
 
-	mu        sync.Mutex
-	kills     int
-	closes    int
 	closeOnce sync.Once
 }
 
 func newFakeInterpStream() *fakeInterpStream {
 	return &fakeInterpStream{
-		events:     make(chan StreamEvent, 64),
-		closed:     make(chan struct{}),
-		stdin:      make(chan []byte, 16),
-		exitOnKill: true,
+		events: make(chan StreamEvent, 64),
+		closed: make(chan struct{}),
+		stdin:  make(chan []byte, 16),
 	}
 }
 
@@ -58,28 +52,19 @@ func (f *fakeInterpStream) WriteStdin(p []byte) error {
 	return nil
 }
 
-func (f *fakeInterpStream) Kill() error {
-	f.mu.Lock()
-	f.kills++
-	f.mu.Unlock()
-	if f.exitOnKill {
-		f.events <- StreamEvent{Exit: &StreamExit{ExitCode: -1, Killed: true}}
-	}
-	return nil
-}
-
+// Close drops the connection, which the worker answers by killing the run.
 func (f *fakeInterpStream) Close() error {
-	f.mu.Lock()
-	f.closes++
-	f.mu.Unlock()
 	f.closeOnce.Do(func() { close(f.closed) })
 	return nil
 }
 
-func (f *fakeInterpStream) counts() (kills, closes int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.kills, f.closes
+func (f *fakeInterpStream) isClosed() bool {
+	select {
+	case <-f.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // out pushes frames as stdout bytes, split into the given chunks so frames
@@ -374,8 +359,8 @@ func TestInterpKernelRun(t *testing.T) {
 		t.Fatal("kernel done after a normal run")
 	default:
 	}
-	if kills, _ := st.counts(); kills != 0 {
-		t.Fatalf("%d kills", kills)
+	if st.isClosed() {
+		t.Fatal("a normal run ended the instance")
 	}
 }
 
@@ -392,7 +377,7 @@ func TestInterpKernelDeath(t *testing.T) {
 			t.Fatalf("outcome = %+v", out)
 		}
 		<-k.Done()
-		if _, closes := st.counts(); closes == 0 {
+		if !st.isClosed() {
 			t.Fatal("a dead kernel kept its stream")
 		}
 		// A dead kernel answers at once.
@@ -407,18 +392,19 @@ func TestInterpKernelDeath(t *testing.T) {
 		done := execAsync(k, codeinterp.Request{Code: "while True: pass"}, log)
 		st.request(t)
 		st.out(64, "COUNT", "1")
+		// The run ends at once, without waiting for the worker's exit.
 		if err := k.Interrupt(); err != nil {
 			t.Fatal(err)
 		}
 		if out := waitExec(t, done); !out.Died || !out.Interrupted() {
 			t.Fatalf("outcome = %+v", out)
 		}
+		if !st.isClosed() {
+			t.Fatal("interrupt left the instance running")
+		}
 		<-k.Done()
 		if err := k.Interrupt(); err != nil {
 			t.Fatal(err)
-		}
-		if kills, _ := st.counts(); kills != 1 {
-			t.Fatalf("%d kills, want 1 (none after the end)", kills)
 		}
 	})
 	t.Run("closed mid run", func(t *testing.T) {
@@ -453,13 +439,13 @@ func TestInterpKernelDeath(t *testing.T) {
 		if out := waitExec(t, done); !out.Died {
 			t.Fatalf("outcome = %+v", out)
 		}
-		if kills, _ := st.counts(); kills != 1 {
-			t.Fatalf("a protocol break left the instance running (%d kills)", kills)
+		<-k.Done()
+		if !st.isClosed() {
+			t.Fatal("a protocol break left the instance running")
 		}
 	})
 	t.Run("stderr while the run is closing", func(t *testing.T) {
 		st := newFakeInterpStream()
-		st.exitOnKill = false
 		k := launchReady(t, st)
 		done := execAsync(k, codeinterp.Request{Code: "x"}, &sinkLog{})
 		st.request(t)
