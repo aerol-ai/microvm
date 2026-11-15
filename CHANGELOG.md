@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 9 releases : v0.6.9 to v0.7.3
+    November 2026 : 11 releases : v0.6.9 to v0.7.5
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 4 | Nov 10, 2026 to Nov 12, 2026 | [v0.7.3](#v073-kubernetes-upgrades-work-and-every-worker-takes-gvisor-sandboxes) |
+| [0.7](#07-release-line) | 6 | Nov 10, 2026 to Nov 14, 2026 | [v0.7.5](#v075-v074-with-a-signed-helm-chart) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,47 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.5: v0.7.4 with a signed Helm chart
+
+*November 14, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.5)
+
+This release is v0.7.4 with a signed Helm chart. v0.7.4's chart was published, but the release's signing step failed, so it carries no signature. The AerolVM server, images and SDKs are the same as in v0.7.4: everything in [v0.7.4's notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.4) applies.
+
+- **The Helm chart is signed and attested.** Install it with `helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version 0.7.5`, and check it with `cosign verify` and `gh attestation verify` as `RELEASE-VERIFICATION.md` shows.
+- **Everything from v0.7.4.** The Kubernetes agent-sandbox API, the chart in a registry, WASM, V8-isolate and Firecracker sandboxes on Kubernetes workers, sandboxes that move with their memory, and the fixes from the Kubernetes review.
+
+**Before you upgrade:**
+
+- **From v0.7.4:** `helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version 0.7.5`. Nothing else changes.
+- **From v0.7.3 or older:** read v0.7.4's upgrade notes first. They apply to this release too.
+
+### v0.7.4: the Helm chart in a registry, the Kubernetes agent-sandbox API, and the review fixes
+
+*November 14, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.4)
+
+This release makes AerolVM on Kubernetes ready to install from a registry, adds the Kubernetes agent-sandbox API, and fixes everything an independent review of the Kubernetes stack found. The Helm chart is now published with each release, so an install no longer needs a copy of this repository.
+
+- **Install the chart from a registry.** Each release now publishes the Helm chart to `oci://ghcr.io/aerol-ai/charts/aerolvm`: `helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version 0.7.4`. The chart runs its own release's images. Before, a cloned v0.7.3 chart ran v0.7.1 images.
+- **`helm upgrade` updates AerolVM's CRDs.** Helm never updates a chart's CRDs on its own, so new fields were silently dropped. A short Job now updates AerolVM's two CRDs before each upgrade. It may change only those two.
+- **The Kubernetes agent-sandbox API.** With `cluster.agentSandboxAPI` on (it needs cert-manager), `kubectl` and agent-sandbox clients can manage AerolVM sandboxes as `Sandbox`, `SandboxTemplate`, `SandboxWarmPool` and `SandboxClaim` objects, following agent-sandbox v1.0.11 (the docs list which fields are supported and which are refused). Every write goes through AerolVM's own API, with the same permissions, quotas and audit as an SDK call. Warm pools keep sandboxes ready, so a claim can skip the cold start.
+- **More runtimes on Kubernetes workers.** WASM, V8-isolate and Firecracker sandboxes now run in worker pods (`worker.wasm.enabled`, `worker.isolate.enabled`, `worker.firecracker.enabled`; Firecracker needs machines with KVM). They keep running while the worker's `agent` container restarts or is upgraded.
+- **Sandboxes move with their memory when a machine is replaced.** When a worker is drained, a running gVisor or Firecracker sandbox without the `recreate` failover policy moves to another worker and resumes there with the same ID, link and files. Its programs keep running; open network connections drop. Before, it was stopped. Turn gVisor moves off with `worker.gvisor.checkpointMoves: false`.
+- **Use your own certificate authority.** With `cluster.externalCA.issuerRef`, each node gets its certificate from your cert-manager issuer, and the CA key never enters the cluster.
+- **Many cells.** Several cells can share one key (`cluster.federation`). A request that reaches the wrong cell is answered with 421 and the right cell's address.
+- **Fixes from the Kubernetes review.** An independent review found ways a sandbox could run in two places at once, be lost in a move, or wait far too long for a new node after a zone failed. All of them are fixed. Worker pods are now held until their sandboxes have moved, including during `kubectl drain`.
+
+**Before you upgrade:**
+
+- **Use v0.7.5 for a signed chart.** v0.7.4's Helm chart is published but not signed: the release's signing step failed. v0.7.5 is the same code with a signed and attested chart. The images and release files of v0.7.4 are signed as usual.
+- **Install from the registry.** Use `helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version 0.7.4` with your existing release name. The chart's version is the release number without the `v`.
+- **New sandbox IDs look different.** They keep the same shape (`sb-` and 16 hex digits), but the first byte no longer shows the cell in plain hex. Code that treats IDs as opaque strings is not affected.
+- **Draining a worker now waits.** Worker pods have a PodDisruptionBudget that allows no eviction, so `kubectl drain`, EKS managed node group updates and Karpenter wait until the operator has moved the sandboxes. To remove a pod by hand anyway, annotate it `aerolvm.io/force-delete=true`.
+- **Recreate-policy WASM and V8 sandboxes on Kubernetes.** On a Kubernetes worker, creating one with `failover.policy=recreate` is refused with 400, because they cannot be frozen when their lease runs out.
+- **Named pipes.** Downloading a named pipe used to stream what was written into it. It is now refused with 409, as in agent-sandbox v1.0.11.
+- **Raft log disk and rollback.** A server that uses a separate Raft log disk cannot be rolled back to a release older than v0.7.4: the older release refuses to start rather than open an empty log.
+- **SDKs.** SDK 0.8.3, published with this release, follows a cell's 421 answer to the right cell. An older SDK gets the 421 as an error, so update the SDKs before you add a second cell.
+- **Plain VM clusters and single nodes:** nothing to do.
 
 ### v0.7.3: Kubernetes upgrades work, and every worker takes gVisor sandboxes
 
