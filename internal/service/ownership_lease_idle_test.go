@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -340,6 +341,48 @@ func TestEveryCreatePathChecksOwnershipBeforeItStarts(t *testing.T) {
 			}
 			if rt.creates.Load() != 0 {
 				t.Fatalf("runtime creates = %d, want none", rt.creates.Load())
+			}
+		})
+	}
+}
+
+// V4's refusal and this check work together. On a node that writes the
+// lease file, a recreate-policy create of a runtime the supervisor cannot
+// freeze alone (WASM, V8 isolate) is refused by V4's field check before the
+// create picks its path, so it never reaches the start check and costs no
+// leader read, even with no fresh read to lean on. A container create on
+// the same node passes V4 and then reads.
+func TestUnfenceableRecreateIsRefusedBeforeAnyRead(t *testing.T) {
+	for _, tc := range []struct {
+		runtime   string
+		image     string
+		wantV4    bool
+		wantReads int
+	}{
+		{runtime: models.RuntimeWasm, image: "registry.example/mod:1", wantV4: true},
+		{runtime: models.RuntimeIsolate, image: models.JSBundleRefForNode("bundle-1", "worker-a"), wantV4: true},
+		{runtime: models.RuntimeDocker, image: "alpine:3.20", wantReads: 1},
+	} {
+		t.Run(tc.runtime, func(t *testing.T) {
+			rt := &createCountingRuntime{freezeRuntime: newFreezeRuntime()}
+			svc, _, lc := newLeaseService(t, rt)
+			svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "ownership-lease")
+			svc.beginOwnershipLease(time.Now().Add(-time.Minute))
+			lc.up(reservedFor("sb-v4", "worker-a", ""))
+			_, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+				Image: tc.image, Runtime: tc.runtime,
+				Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+			}, "sb-v4")
+			if got := lc.readCount(); got != tc.wantReads {
+				t.Fatalf("leader reads = %d (err %v), want %d", got, err, tc.wantReads)
+			}
+			if tc.wantV4 {
+				if err == nil || !strings.Contains(err.Error(), "failover.policy=recreate is not available for runtime \""+tc.runtime+"\"") {
+					t.Fatalf("create = %v, want V4's refusal", err)
+				}
+				if rt.creates.Load() != 0 {
+					t.Fatal("an unfenceable recreate create reached the runtime")
+				}
 			}
 		})
 	}
