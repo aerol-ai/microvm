@@ -26,7 +26,10 @@ package service
 // twice.
 //
 // Lock order: lifecycleLocks before destroyLocks. DestroySandbox and the
-// destroy event both take them in that order.
+// destroy event both take them in that order. The ownership lease's
+// actionMu comes before lifecycleLocks (enforceOwnershipLease holds it while
+// it fences each sandbox), so a step inside the boundary never reads
+// ownership: no readOwnership or persistSandboxCreate under a lifecycle lock.
 //
 // The lock is one per sandbox, not a shared stripe: a step can hold it across
 // a runtime start or stop (seconds, up to restartStartTimeout), and a shared

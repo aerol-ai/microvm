@@ -89,7 +89,10 @@ type ownershipLease struct {
 	routeRestore map[string]struct{}
 
 	// actionMu serializes the expiry check and the confirm, which both
-	// freeze or thaw runtime instances.
+	// freeze or thaw runtime instances. Lock order: actionMu, then a
+	// sandbox's lifecycle lock (enforceOwnershipLease takes them in that
+	// order). So nothing that holds a lifecycle lock may take actionMu:
+	// readOwnership, requireFreshOwnership and persistSandboxCreate all do.
 	actionMu sync.Mutex
 
 	// owned is what the last successful authoritative read proved, per
