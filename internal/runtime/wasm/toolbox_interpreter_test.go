@@ -221,7 +221,7 @@ func TestRealPythonInterpreterTimeoutRestartsEmpty(t *testing.T) {
 			}
 			break
 		}
-		if f["type"] == "stdout" && f["text"] == "spin" {
+		if text, _ := f["text"].(string); f["type"] == "stdout" && strings.HasPrefix(text, "spin") {
 			if err := conn.WriteJSON(map[string]string{"type": "interrupt"}); err != nil {
 				t.Fatal(err)
 			}

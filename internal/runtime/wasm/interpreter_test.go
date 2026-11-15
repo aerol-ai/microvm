@@ -161,17 +161,6 @@ type execResult struct {
 	err error
 }
 
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 func execAsync(k *interpKernel, req codeinterp.Request, log *sinkLog) chan execResult {
 	done := make(chan execResult, 1)
 	go func() {
