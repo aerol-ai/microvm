@@ -456,6 +456,50 @@ func TestStreamStartRefusals(t *testing.T) {
 	}
 }
 
+// TestStreamSlotIsFreeWhenTheCallerHearsBack: a caller that reads a
+// refusal or an exit and starts again at once must find its slot free.
+// The slot used to go back only after the reply was written, so at the
+// cap the next start could be refused for a run that was already over
+// (seen as a TestStreamStartRefusals flake under load).
+func TestStreamSlotIsFreeWhenTheCallerHearsBack(t *testing.T) {
+	guest := stdioGuest(t)
+	srv := &Server{}
+	c := startStreamWorker(t, srv)
+	ctx := context.Background()
+	if _, err := c.LoadModule("sb1", guest, 64); err != nil {
+		t.Fatal(err)
+	}
+	old := maxStreamsPerSandbox
+	maxStreamsPerSandbox = 1
+	t.Cleanup(func() { maxStreamsPerSandbox = old })
+
+	held := func() (slots, runs int) {
+		srv.streams.mu.Lock()
+		slots = srv.streams.slots["sb1"]
+		srv.streams.mu.Unlock()
+		return slots, srv.streams.count("sb1")
+	}
+	noExport := stdioStart("exit", "0")
+	noExport.Export = "no_such_export"
+	for round := 0; round < 20; round++ {
+		if _, err := c.StartExec(ctx, "sb1", noExport); err == nil {
+			t.Fatal("missing export accepted")
+		}
+		if slots, runs := held(); slots != 0 || runs != 0 {
+			t.Fatalf("round %d: after the refusal reached the caller: %d slots, %d runs held", round, slots, runs)
+		}
+		st, err := c.StartExec(ctx, "sb1", stdioStart("exit", "0"))
+		if err != nil {
+			t.Fatalf("round %d: start right after a refusal: %v", round, err)
+		}
+		collect(t, st)
+		if slots, runs := held(); slots != 0 || runs != 0 {
+			t.Fatalf("round %d: after the exit reached the caller: %d slots, %d runs held", round, slots, runs)
+		}
+		st.Close()
+	}
+}
+
 func TestStreamOutOfBandKill(t *testing.T) {
 	srv := &Server{}
 	c := startStreamWorker(t, srv)

@@ -369,7 +369,12 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	if err := r.reserve(sandboxID); err != nil {
 		return writeStreamError(conn, sandboxID, errCodeStreamLimit, err)
 	}
-	defer r.unreserve(sandboxID)
+	// The slot goes back before any reply that ends this run, not after:
+	// a caller that reads the refusal or the exit and starts again at once
+	// must find it free, or at the cap it is refused for a run that is
+	// already over. The defer covers every other way out.
+	freeSlot := sync.OnceFunc(func() { r.unreserve(sandboxID) })
+	defer freeSlot()
 
 	// The run gets the sandbox's network rules exactly as MsgExec applies
 	// them: blocks only ever added from caps, and the policy set from them.
@@ -380,6 +385,7 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	ctx := context.Background()
 	aux, err := r.acquire(ctx, key)
 	if err != nil {
+		freeSlot()
 		return writeStreamError(conn, sandboxID, "", err)
 	}
 	defer r.release(aux)
@@ -421,6 +427,7 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	if err != nil {
 		ws.writeMu.Unlock()
 		aux.eng.ClearNetworkHook(name)
+		freeSlot()
 		return writeStreamError(conn, sandboxID, "", err)
 	}
 	ws.run = run
@@ -486,6 +493,10 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	if runErr != nil && !exit.Killed && !exit.TimedOut {
 		exit.Error = runErr.Error()
 	}
+	// Same rule as the slot: once the caller sees the exit, the run is
+	// gone from the list too (remove is safe to repeat in the defer).
+	r.remove(ws)
+	freeSlot()
 	if body, err := encodePayload(exit); err == nil {
 		ws.writeMu.Lock()
 		_ = conn.SetWriteDeadline(time.Now().Add(streamExitWriteWait))
