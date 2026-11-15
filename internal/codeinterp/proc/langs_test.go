@@ -147,6 +147,9 @@ type langCase struct {
 	large, tail string
 	// child starts "sleep 60" in the background and prints its pid.
 	child string
+	// listFDs runs "ls -l /proc/self/fd" as a child process and prints its
+	// output: the descriptors a program the cell starts inherits.
+	listFDs string
 }
 
 var langCases = []langCase{
@@ -164,6 +167,7 @@ var langCases = []langCase{
 		large:     "process.stdout.write(Array.from({ length: 38400 }, (_, i) => String(i).padStart(7, '0') + '\\n').join(''))",
 		tail:      "console.log('tail')",
 		child:     "const cp = require('node:child_process').spawn('sleep', ['60'], { stdio: 'ignore' }); console.log(cp.pid)",
+		listFDs:   "process.stdout.write(require('node:child_process').execFileSync('ls', ['-l', '/proc/self/fd']).toString())",
 	},
 	{
 		lang:     codeinterp.LangTypeScript,
@@ -179,6 +183,7 @@ var langCases = []langCase{
 		large:     "process.stdout.write(Array.from({ length: 38400 }, (_, i: number) => String(i).padStart(7, '0') + '\\n').join(''))",
 		tail:      "console.log('tail')",
 		child:     "const cp = require('node:child_process').spawn('sleep', ['60'], { stdio: 'ignore' }); console.log(cp.pid)",
+		listFDs:   "process.stdout.write(require('node:child_process').execFileSync('ls', ['-l', '/proc/self/fd']).toString())",
 	},
 	{
 		lang:     codeinterp.LangBash,
@@ -193,6 +198,7 @@ var langCases = []langCase{
 		large:     `for ((i = 0; i < 38400; i++)); do printf '%07d\n' "$i"; done`,
 		tail:      "echo tail",
 		child:     "sleep 60 >/dev/null 2>&1 & echo $!",
+		listFDs:   "ls -l /proc/self/fd",
 	},
 	{
 		lang:     codeinterp.LangR,
@@ -208,6 +214,7 @@ var langCases = []langCase{
 		large:     `cat(sprintf("%07d\n", 0:38399), sep = "")`,
 		tail:      `cat("tail\n")`,
 		child:     `system("sleep 60 >/dev/null 2>&1 & echo $!")`,
+		listFDs:   `invisible(system("ls -l /proc/self/fd"))`,
 	},
 	{
 		lang:     codeinterp.LangJava,
@@ -224,6 +231,7 @@ var langCases = []langCase{
 		large:     `StringBuilder sb = new StringBuilder(); for (int i = 0; i < 38400; i++) sb.append(String.format("%07d%n", i)); System.out.print(sb);`,
 		tail:      `System.out.println("tail")`,
 		child:     `Process p = new ProcessBuilder("sleep", "60").start(); System.out.println(p.pid());`,
+		listFDs:   `System.out.print(new String(new ProcessBuilder("ls", "-l", "/proc/self/fd").start().getInputStream().readAllBytes()));`,
 	},
 }
 
@@ -328,6 +336,58 @@ func TestLanguageDrivers(t *testing.T) {
 				}
 				time.Sleep(50 * time.Millisecond)
 			}
+		})
+	}
+}
+
+// The request and event pipes belong to the driver. A program a cell
+// starts must not hold them: it could read the driver's requests or write
+// frames, and one left running in the background kept the pipes open after
+// the driver was gone. bash's descriptors from "exec {var}<&3" are not
+// close-on-exec, and R kept 3 and 4 open after reopening them, so both
+// leaked them to every child.
+func TestDriverChildrenGetNoProtocolPipes(t *testing.T) {
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("needs /proc (Linux)")
+	}
+	cases := append([]langCase{{lang: codeinterp.LangPython, set: "x = 5", listFDs: "import os\nos.system('ls -l /proc/self/fd')"}}, langCases...)
+	for _, tc := range cases {
+		t.Run(tc.lang, func(t *testing.T) {
+			t.Parallel()
+			k, _ := launchLang(t, tc.lang)
+			// A pipe's two ends share its inode, which /proc shows as
+			// "pipe:[inode]"; the host's ends name the driver's pipes.
+			var pipes []string
+			for _, f := range []*os.File{k.reqW, k.evR} {
+				info, err := f.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+				pipes = append(pipes, fmt.Sprintf("pipe:[%d]", info.Sys().(*syscall.Stat_t).Ino))
+			}
+			// The driver itself holds them, so the check below can fail.
+			var held strings.Builder
+			entries, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", k.pid))
+			for _, e := range entries {
+				target, _ := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", k.pid, e.Name()))
+				held.WriteString(target + "\n")
+			}
+			for _, p := range pipes {
+				if !strings.Contains(held.String(), p) {
+					t.Fatalf("the driver holds no %s: %q", p, held.String())
+				}
+			}
+			out := mustRun(t, k, tc.listFDs, "ok").stream(codeinterp.EventStdout)
+			if !strings.Contains(out, " 0 -> ") {
+				t.Fatalf("no descriptor list: %q", out)
+			}
+			for _, p := range pipes {
+				if strings.Contains(out, p) {
+					t.Errorf("a child holds the driver's %s:\n%s", p, out)
+				}
+			}
+			// The context still works afterwards.
+			mustRun(t, k, tc.set, "ok")
 		})
 	}
 }

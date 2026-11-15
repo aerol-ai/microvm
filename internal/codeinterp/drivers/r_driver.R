@@ -34,21 +34,36 @@ local({
 
   # Without the host's pipes, R's own script file may sit on fd 3. Linux
   # names a pipe "pipe:[inode]" there, a file by its path.
+  #
+  # Programs a cell starts (system(), pipe()) must not hold the protocol
+  # pipes. R opens connections without close-on-exec, but passes the mode
+  # to fopen, where "e" asks for it (glibc, musl and the BSDs); a libc that
+  # refuses it gets the plain mode.
+  reopen <- function(fd, mode) {
+    path <- sprintf("/dev/fd/%d", fd)
+    cloexec <- paste0(substr(mode, 1L, 1L), "e", substring(mode, 2L))
+    tryCatch(suppressWarnings(file(path, open = cloexec, raw = TRUE)),
+             error = function(e) file(path, open = mode, raw = TRUE))
+  }
   opened <- if (startsWith(Sys.readlink("/proc/self/fd/3"), "/")) {
     simpleError("fd 3 is not a pipe")
   } else tryCatch(list(
-    req = file("/dev/fd/3", open = "rb", raw = TRUE),
-    ev = file("/dev/fd/4", open = "wb", raw = TRUE),
+    req = reopen(3L, "rb"),
+    ev = reopen(4L, "wb"),
     # Private connections to fd 1 and 2 carry the markers, so sink() in a
     # cell cannot divert them.
-    out = file("/dev/fd/1", open = "wb", raw = TRUE),
-    err = file("/dev/fd/2", open = "wb", raw = TRUE)
+    out = reopen(1L, "wb"),
+    err = reopen(2L, "wb")
   ), error = function(e) e)
   if (inherits(opened, "error")) {
     cat("aerolvm interpreter driver: protocol descriptors 3 and 4 are not open:",
         conditionMessage(opened), "\n", file = stderr())
     quit(save = "no", status = 1)
   }
+  # Reopening made new descriptors; 3 and 4 themselves would still pass to
+  # every child. Base R cannot close a bare descriptor, the parallel package
+  # (part of every R install) can.
+  tryCatch(parallel:::closeFD(c(3L, 4L)), error = function(e) NULL)
   req <- opened$req
   ev <- opened$ev
   st <- new.env()
