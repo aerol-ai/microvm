@@ -123,9 +123,32 @@ func TestDestroyedRuleClearSurvivesServiceRestart(t *testing.T) {
 	// Restart boundary: a new Service with the same SQLite and host firewall,
 	// with none of the old Service's in-memory maps.
 	fresh := New(svc.cfg, svc.logger, svc.store, rt, nil, svc.caddy, svc.cipher, svc.mounts, nil)
-	loop, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	fresh.SuperviseEgressGateway(loop, time.Millisecond)
+	if list, err := fresh.store.ListPendingEgressRuleClears(ctx); err != nil || len(list) != 1 {
+		t.Fatalf("setup: the clear is not in the store across the restart: %+v %v", list, err)
+	}
+	// The restarted supervisor's first pass reads that clear from the store
+	// and removes the rule. Wait for it to finish rather than giving the
+	// loop a fixed 20 ms: the pass reads the store with the loop's context,
+	// so a pass still running at the deadline cleared nothing, and the test
+	// failed on a loaded machine (1 run in 400 under CPU load with
+	// GOMAXPROCS=1). The ledger entry goes only after the rule is gone; the
+	// rule itself is checked once the loop has stopped, since the rule
+	// backend is a plain map.
+	loop, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fresh.SuperviseEgressGateway(loop, time.Millisecond)
+	}()
+	settled := waitFor(10*time.Second, func() bool {
+		list, err := fresh.store.ListPendingEgressRuleClears(ctx)
+		return err == nil && len(list) == 0
+	})
 	cancel()
+	<-done
+	if !settled {
+		t.Fatal("the restarted supervisor never settled the pending rule clear")
+	}
 	if err := fresh.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
