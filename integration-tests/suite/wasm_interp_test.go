@@ -402,6 +402,15 @@ func TestWasmInterpTwoPorts(t *testing.T) {
 	// Without it the guest is pushed through the module API, which needs
 	// registry credentials the scenario does not carry by itself.
 	moduleRef := os.Getenv("AEROL_WASM_TWOPORT_MODULE")
+	if moduleRef != "" {
+		// In cluster mode placement only picks workers for a module the
+		// catalogue knows, so register the staged file first (live:
+		// single-node-wasm answered "no worker placement target" without
+		// it). A repeat registration of the same ref is fine to ignore.
+		if _, err := c.SDK().CreateWasmModule(ctx, sdktypes.CreateWasmModuleOptions{ModuleRef: moduleRef}); err != nil {
+			t.Logf("register %s: %v (continuing: it may already be registered)", moduleRef, err)
+		}
+	}
 	if moduleRef == "" {
 		user := os.Getenv("AEROL_WASM_REGISTRY_USER")
 		token := os.Getenv("AEROL_WASM_REGISTRY_TOKEN")
