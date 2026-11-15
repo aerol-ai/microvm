@@ -28,6 +28,19 @@ const (
 	e2bInterpreterPrefix     = "/interpreter/e2b"
 )
 
+// Limits the WASM driver builds the interpreter adapters with. On toolboxd
+// a request's code and the runs queued for a context are held in the
+// sandbox's own memory; here they are held in sandboxd's heap, shared by
+// every sandbox on the host, so the caps are far below toolboxd's (32 MiB
+// and 128 runs).
+const (
+	// InterpreterMaxRequestBytes caps one Daytona WebSocket message and one
+	// E2B request body.
+	InterpreterMaxRequestBytes = 8 << 20
+	// InterpreterQueueLimit caps the runs waiting for one context.
+	InterpreterQueueLimit = 8
+)
+
 // isE2BInterpreterPath reports whether path is under the E2B interpreter.
 func isE2BInterpreterPath(path string) bool {
 	return strings.HasPrefix(path, e2bInterpreterPrefix+"/")

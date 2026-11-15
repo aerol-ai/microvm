@@ -69,6 +69,13 @@ func TestBashDriver(t *testing.T) {
 	if got := stdoutOf(t, k, "exec 3>/dev/null 4>/dev/null; echo fds"); got != "fds\n" {
 		t.Fatalf("fd 3 and 4 = %q", got)
 	}
+	// A descriptor a cell opens with {var} stays the cell's in the next
+	// one: the protocol descriptors, closed while a cell runs, sit where
+	// such a descriptor never lands, so restoring them replaces nothing.
+	mustRun(t, k, "exec {logfd}>fds.log; echo \"$logfd\" >&2", "ok")
+	if got := stdoutOf(t, k, "echo kept >&\"$logfd\"; exec {logfd}>&-; cat fds.log"); got != "kept\n" {
+		t.Fatalf("a cell's own descriptor across cells = %q", got)
+	}
 	if got := stdoutOf(t, k, "echo a\x00b"); got != "ab\n" {
 		t.Fatalf("NUL = %q", got)
 	}

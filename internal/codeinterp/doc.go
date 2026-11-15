@@ -35,6 +35,12 @@
 //	SYNC   <decimal seq>            see markers below
 //	DONE   ok | error | interrupted
 //
+// Interrupts are SIGINT to the driver's process group. An idle driver drops
+// SIGINT, so a stray one never ends a context. From the moment it sends a
+// run's COUNT until its DONE, a driver turns SIGINT into an interrupt of
+// that run; the host sends an interrupt that came before COUNT (the driver
+// may not have read EXEC yet) again when COUNT arrives.
+//
 // There are two transport modes, picked by the AEROL_INTERP_MODE variable:
 //
 //   - "fd" (toolboxd): requests on file descriptor 3, events on 4. The

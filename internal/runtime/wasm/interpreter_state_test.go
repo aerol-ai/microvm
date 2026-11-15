@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
+	"github.com/aerol-ai/microvm/internal/codeinterp"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -209,6 +213,81 @@ func TestInterpreterIdleTTLStopsTheInterpreter(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// On WASM the adapters' buffers are sandboxd's heap, not the sandbox's: a
+// request's code and the runs queued for a context are held there. They
+// get far smaller caps than on toolboxd: 8 MiB a request and 8 runs
+// waiting per context.
+func TestInterpreterLimitsOnWasm(t *testing.T) {
+	big := strings.Repeat("x", 8<<20+1)
+
+	t.Run("e2b request body", func(t *testing.T) {
+		e := newInterpTestDriver(t, Config{})
+		e.state(t)
+		ip := sandboxInterpreters{driver: e.d, id: "sb-int"}
+		body, _ := json.Marshal(map[string]string{"code": big})
+		// Bounded: a run that was let through would wait for ever on the
+		// fake interpreter, until its client goes.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rec := httptest.NewRecorder()
+		ip.E2B().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/execute", strings.NewReader(string(body))).WithContext(ctx))
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("9 MiB execute = %d, want 413", rec.Code)
+		}
+	})
+
+	t.Run("daytona message", func(t *testing.T) {
+		e := newInterpTestDriver(t, Config{})
+		e.state(t)
+		ip := sandboxInterpreters{driver: e.d, id: "sb-int"}
+		ts := httptest.NewServer(ip.Daytona())
+		t.Cleanup(ts.Close)
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+"/execute", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.WriteJSON(map[string]string{"code": big})
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, _, err = conn.ReadMessage()
+		var ce *websocket.CloseError
+		if !errors.As(err, &ce) || ce.Code != websocket.CloseMessageTooBig {
+			t.Fatalf("9 MiB first message = %v, want close 1009", err)
+		}
+	})
+
+	t.Run("runs queued per context", func(t *testing.T) {
+		e := newInterpTestDriver(t, Config{})
+		st := e.state(t)
+		st.e2b()
+		m := st.e2bMgr
+		info, err := m.Default("python")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// The fake interpreter never answers a run: the first holds the
+		// context, the next eight wait.
+		var wg sync.WaitGroup
+		t.Cleanup(wg.Wait)
+		t.Cleanup(cancel)
+		for i := 0; i < 1+8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = m.Run(ctx, info.ID, codeinterp.Request{Code: "x"}, nil, codeinterp.RunPolicy{InterruptOnCancel: true})
+			}()
+		}
+		time.Sleep(200 * time.Millisecond)
+		short, stop := context.WithTimeout(ctx, 2*time.Second)
+		defer stop()
+		if _, err := m.Run(short, info.ID, codeinterp.Request{Code: "x"}, nil, codeinterp.RunPolicy{}); !errors.Is(err, codeinterp.ErrQueueFull) {
+			t.Fatalf("tenth run = %v, want ErrQueueFull", err)
+		}
+	})
 }
 
 func TestInterpreterSettings(t *testing.T) {

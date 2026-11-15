@@ -123,12 +123,15 @@ stripped), `html`, `markdown`, `svg`, `png`, `jpeg`, `pdf`, `latex`,
 ### 4.3 E2B facade changes
 
 - `pkg/api/e2b/runtime_proxy.go`: `E2b-Sandbox-Port: 49999` → toolbox path
-  `/interpreter/e2b` + path; accept `X-Access-Token` or
-  `E2B-Traffic-Access-Token` (constant-time compare against the sandbox's
-  toolbox token).
+  `/interpreter/e2b` + path. `X-Access-Token` (the toolbox token) opens
+  every path; `E2B-Traffic-Access-Token` opens only `/contexts`,
+  `/contexts/{id}`, `/contexts/{id}/restart` and `/health` on port 49999,
+  never `/execute` or envd. Constant-time compares.
 - Create and connect responses fill `trafficAccessToken` for secure
   sandboxes (the SDK sends it on `/contexts` calls, which never carry
-  `X-Access-Token`).
+  `X-Access-Token`). It is not the toolbox token: E2B treats the traffic
+  token as shareable, so it is HMAC-SHA256 keyed by the toolbox token over
+  `"e2b-traffic:" + sandboxID`, hex.
 - `POST /e2b/v2/sandboxes` and `POST /e2b/v2/sandboxes/{id}/connect`, so the
   current E2B SDKs (e2b >= 2.51) can create sandboxes at all.
 - `code-interpreter-v1` default template (D10).

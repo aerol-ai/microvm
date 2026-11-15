@@ -3,6 +3,9 @@ package e2b
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -136,39 +139,152 @@ func TestRuntimeProxyRoutesThePortHeader(t *testing.T) {
 	}
 }
 
+// runtimeCall is one request through /e2b/runtime: an interpreter call
+// (port 49999) or an envd call.
+type runtimeCall struct {
+	interpreter  bool
+	method, path string
+}
+
+var (
+	callContexts  = runtimeCall{true, http.MethodGet, "/contexts"}
+	callCreate    = runtimeCall{true, http.MethodPost, "/contexts"}
+	callDelete    = runtimeCall{true, http.MethodDelete, "/contexts/c1"}
+	callRestart   = runtimeCall{true, http.MethodPost, "/contexts/c1/restart"}
+	callHealth    = runtimeCall{true, http.MethodGet, "/health"}
+	callExecute   = runtimeCall{true, http.MethodPost, "/execute"}
+	callEnvd      = runtimeCall{false, http.MethodPost, "/process.Process/Start"}
+	callEnvdFiles = runtimeCall{false, http.MethodGet, "/files"}
+)
+
+func (e *interpreterEnv) call(c runtimeCall, headers map[string]string) int {
+	h := map[string]string{}
+	if c.interpreter {
+		h["E2b-Sandbox-Port"] = "49999"
+	}
+	for k, v := range headers {
+		h[k] = v
+	}
+	return e.runtimeRequest(c.method, c.path, h).Code
+}
+
+// The traffic token E2B hands out is shareable by E2B's design: it opens a
+// sandbox's ports, not envd. It used to be the envd token itself, and was
+// accepted on every runtime path, so whoever held it could run commands.
+// It is now its own value, and opens only the interpreter's context
+// routes and health check; /execute and envd take X-Access-Token.
 func TestRuntimeProxyTokenHeaders(t *testing.T) {
 	tb := &fakeToolbox{}
 	secure := newInterpreterEnv(t, tb, `{"templateID":"base"}`)
 	insecure := newInterpreterEnv(t, tb, `{"templateID":"base","secure":false}`)
-	token := secure.created.EnvdAccessToken
-	if token == "" {
-		t.Fatal("a secure sandbox must have an envd token")
+	envd := secure.created.EnvdAccessToken
+	if envd == "" || secure.created.TrafficAccessToken == nil {
+		t.Fatalf("a secure sandbox must have both tokens: %+v", secure.created)
 	}
+	traffic := *secure.created.TrafficAccessToken
+	if traffic == envd {
+		t.Fatal("the traffic token is the envd token")
+	}
+	const (
+		ok   = http.StatusOK
+		deny = http.StatusUnauthorized
+	)
 	cases := []struct {
 		name    string
 		env     *interpreterEnv
 		headers map[string]string
-		want    int
+		want    map[runtimeCall]int
 	}{
-		{name: "access token", env: secure, headers: map[string]string{"X-Access-Token": token}, want: http.StatusOK},
-		// The interpreter SDKs' /contexts calls carry only this one.
-		{name: "traffic token", env: secure, headers: map[string]string{"E2B-Traffic-Access-Token": token}, want: http.StatusOK},
-		{name: "wrong access token, right traffic token", env: secure, headers: map[string]string{"X-Access-Token": "nope", "E2B-Traffic-Access-Token": token}, want: http.StatusOK},
-		{name: "both wrong", env: secure, headers: map[string]string{"X-Access-Token": "nope", "E2B-Traffic-Access-Token": "nope"}, want: http.StatusUnauthorized},
-		{name: "a prefix of the token", env: secure, headers: map[string]string{"E2B-Traffic-Access-Token": token[:len(token)-1]}, want: http.StatusUnauthorized},
-		{name: "none", env: secure, headers: map[string]string{}, want: http.StatusUnauthorized},
-		{name: "insecure sandbox needs none", env: insecure, headers: map[string]string{}, want: http.StatusOK},
+		{name: "envd token", env: secure, headers: map[string]string{"X-Access-Token": envd},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: ok, callEnvd: ok, callEnvdFiles: ok}},
+		{name: "traffic token", env: secure, headers: map[string]string{"E2B-Traffic-Access-Token": traffic},
+			want: map[runtimeCall]int{
+				callContexts: ok, callCreate: ok, callDelete: ok, callRestart: ok, callHealth: ok,
+				callExecute: deny, callEnvd: deny, callEnvdFiles: deny,
+			}},
+		// What the SDKs send on /execute.
+		{name: "both tokens", env: secure, headers: map[string]string{"X-Access-Token": envd, "E2B-Traffic-Access-Token": traffic},
+			want: map[runtimeCall]int{callExecute: ok, callContexts: ok}},
+		{name: "traffic token as the access token", env: secure, headers: map[string]string{"X-Access-Token": traffic},
+			want: map[runtimeCall]int{callExecute: deny, callEnvd: deny, callContexts: deny}},
+		// Sessions that connected before the change hold the envd token as
+		// their traffic token.
+		{name: "envd token in the traffic header", env: secure, headers: map[string]string{"E2B-Traffic-Access-Token": envd},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: ok, callEnvd: ok}},
+		{name: "wrong access token, right traffic token", env: secure, headers: map[string]string{"X-Access-Token": "nope", "E2B-Traffic-Access-Token": traffic},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: deny}},
+		{name: "both wrong", env: secure, headers: map[string]string{"X-Access-Token": "nope", "E2B-Traffic-Access-Token": "nope"},
+			want: map[runtimeCall]int{callContexts: deny, callExecute: deny, callEnvd: deny}},
+		{name: "a prefix of a token", env: secure, headers: map[string]string{"E2B-Traffic-Access-Token": traffic[:len(traffic)-1]},
+			want: map[runtimeCall]int{callContexts: deny}},
+		{name: "none", env: secure, headers: map[string]string{},
+			want: map[runtimeCall]int{callContexts: deny, callHealth: deny, callExecute: deny, callEnvd: deny}},
+		{name: "insecure sandbox needs none", env: insecure, headers: map[string]string{},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: ok, callEnvd: ok}},
 	}
+	// An insecure sandbox with public traffic off: E2B asks for the traffic
+	// token on every port, the interpreter's included, /execute too. envd
+	// stays as open as on any insecure sandbox.
+	private := newInterpreterEnv(t, tb, `{"templateID":"base","secure":false,"network":{"allowPublicTraffic":false}}`)
+	if private.created.EnvdAccessToken != "" || private.created.TrafficAccessToken == nil {
+		t.Fatalf("insecure private sandbox tokens = %+v", private.created)
+	}
+	privateTraffic := *private.created.TrafficAccessToken
+	sb, err := private.svc.GetSandbox(context.Background(), private.created.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases = append(cases, []struct {
+		name    string
+		env     *interpreterEnv
+		headers map[string]string
+		want    map[runtimeCall]int
+	}{
+		{name: "private traffic, no token", env: private, headers: map[string]string{},
+			want: map[runtimeCall]int{callContexts: deny, callHealth: deny, callExecute: deny, callEnvd: ok, callEnvdFiles: ok}},
+		{name: "private traffic, traffic token", env: private, headers: map[string]string{"E2B-Traffic-Access-Token": privateTraffic},
+			want: map[runtimeCall]int{callContexts: ok, callRestart: ok, callExecute: ok, callEnvd: ok}},
+		{name: "private traffic, toolbox token", env: private, headers: map[string]string{"X-Access-Token": sb.ToolboxToken},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: ok}},
+		{name: "private traffic, another sandbox's traffic token", env: private, headers: map[string]string{"E2B-Traffic-Access-Token": traffic},
+			want: map[runtimeCall]int{callContexts: deny, callExecute: deny}},
+	}...)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			headers := map[string]string{"E2b-Sandbox-Port": "49999"}
-			for k, v := range tc.headers {
-				headers[k] = v
-			}
-			if rec := tc.env.runtimeRequest(http.MethodGet, "/contexts", headers); rec.Code != tc.want {
-				t.Fatalf("status = %d %s, want %d", rec.Code, rec.Body.String(), tc.want)
+			for c, want := range tc.want {
+				if got := tc.env.call(c, tc.headers); got != want {
+					t.Errorf("%s %s (interpreter %v) = %d, want %d", c.method, c.path, c.interpreter, got, want)
+				}
 			}
 		})
+	}
+	// No other spelling of a path takes the traffic token past /execute.
+	// The router answers a path that is not clean with a redirect to the
+	// clean one, where the check above applies; the others are refused.
+	tb.mu.Lock()
+	seen := len(tb.seen)
+	tb.mu.Unlock()
+	for _, p := range []string{"/contexts/../execute", "/contexts/c1/../../execute", "//execute", "/contexts/", "/contexts/c1/restart/x", "/execute/"} {
+		if got := secure.call(runtimeCall{true, http.MethodPost, p}, map[string]string{"E2B-Traffic-Access-Token": traffic}); got != deny && got != http.StatusTemporaryRedirect {
+			t.Errorf("POST %s with the traffic token = %d, want 401 or a redirect", p, got)
+		}
+	}
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if len(tb.seen) != seen {
+		t.Fatalf("a request reached the sandbox: %+v", tb.seen[seen:])
+	}
+}
+
+func TestTrafficTokenPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/contexts": true, "/contexts/c1": true, "/contexts/c1/restart": true, "/health": true,
+		"/execute": false, "/": false, "/contexts/": false, "/contexts/c1/other": false,
+		"/contexts/./c1": false, "/contexts/c1/restart/": false, "/healthz": false, "/contexts//restart": false,
+	} {
+		if got := trafficTokenPath(p); got != want {
+			t.Errorf("trafficTokenPath(%q) = %v, want %v", p, got, want)
+		}
 	}
 }
 
@@ -287,7 +403,7 @@ func TestRuntimeProxyInterpreterStreamsAndCancels(t *testing.T) {
 }
 
 func TestCreateAndConnectReturnTrafficToken(t *testing.T) {
-	_, _, handler := newE2BHandlerTestEnv(t)
+	svc, _, handler := newE2BHandlerTestEnv(t)
 	cases := []struct {
 		name      string
 		body      string
@@ -295,6 +411,9 @@ func TestCreateAndConnectReturnTrafficToken(t *testing.T) {
 	}{
 		{name: "secure", body: `{"templateID":"base"}`, wantToken: true},
 		{name: "insecure", body: `{"templateID":"base","secure":false,"metadata":{"k":"insecure"}}`},
+		// E2B gives one to any sandbox whose public traffic is off.
+		{name: "insecure, private traffic", body: `{"templateID":"base","secure":false,"network":{"allowPublicTraffic":false},"metadata":{"k":"private"}}`, wantToken: true},
+		{name: "secure, private traffic", body: `{"templateID":"base","network":{"allowPublicTraffic":false},"metadata":{"k":"secure-private"}}`, wantToken: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -310,12 +429,23 @@ func TestCreateAndConnectReturnTrafficToken(t *testing.T) {
 			if conn.Code != http.StatusOK {
 				t.Fatalf("connect: %d %s", conn.Code, conn.Body.String())
 			}
+			sb, err := svc.GetSandbox(context.Background(), created.SandboxID)
+			if err != nil || sb.ToolboxToken == "" {
+				t.Fatalf("sandbox: %+v %v", sb, err)
+			}
+			// HMAC-SHA256 keyed by the toolbox token, worked out here on
+			// its own so a change to the derivation shows.
+			mac := hmac.New(sha256.New, []byte(sb.ToolboxToken))
+			mac.Write([]byte("e2b-traffic:" + sb.ID))
+			want := hex.EncodeToString(mac.Sum(nil))
 			for what, raw := range map[string][]byte{"create": rec.Body.Bytes(), "connect": conn.Body.Bytes()} {
 				var got sandboxResponse
 				_ = json.Unmarshal(raw, &got)
 				switch {
-				case tc.wantToken && (got.TrafficAccessToken == nil || *got.TrafficAccessToken == "" || *got.TrafficAccessToken != got.EnvdAccessToken):
-					t.Fatalf("%s: trafficAccessToken = %v, want the envd token %q", what, got.TrafficAccessToken, got.EnvdAccessToken)
+				case tc.wantToken && (got.TrafficAccessToken == nil || *got.TrafficAccessToken != want):
+					t.Fatalf("%s: trafficAccessToken = %v, want %q", what, got.TrafficAccessToken, want)
+				case tc.wantToken && *got.TrafficAccessToken == got.EnvdAccessToken:
+					t.Fatalf("%s: the traffic token is the envd token", what)
 				case !tc.wantToken && strings.Contains(string(raw), "trafficAccessToken"):
 					t.Fatalf("%s: an insecure sandbox got a traffic token: %s", what, raw)
 				}
