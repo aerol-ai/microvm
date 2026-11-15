@@ -48,6 +48,9 @@ func (c Capabilities) ListenEnabled() bool {
 type Preopen struct {
 	GuestPath string `json:"guest_path"`
 	HostPath  string `json:"host_path"`
+	// ReadOnly lets the guest read the directory but not change it, as a
+	// read-only bind does for a container.
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 // UsageStats captures per-invocation metering for billing (UC-42a on wazero).

@@ -240,9 +240,13 @@ func TestPreopensFromBindsSkipsEmpty(t *testing.T) {
 		{HostPath: "", ContainerPath: "/skip"},
 		{HostPath: "/host", ContainerPath: ""},
 		{HostPath: "/real", ContainerPath: "/mnt"},
+		{HostPath: "/ro", ContainerPath: "/data", ReadOnly: true},
 	})
-	if len(pre) != 2 {
+	if len(pre) != 3 {
 		t.Fatalf("preopens = %#v", pre)
+	}
+	if pre[0].ReadOnly || pre[1].ReadOnly || !pre[2].ReadOnly {
+		t.Fatalf("read-only flags = %#v; only the read-only bind may be read-only", pre)
 	}
 }
 

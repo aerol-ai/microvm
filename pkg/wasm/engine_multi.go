@@ -159,10 +159,7 @@ func (m *MultiInstanceEngine) Instantiate(ctx context.Context, sandboxID string,
 	// wazero rejects two instances sharing a module name on one runtime, so key
 	// the instance name by sandboxID to keep co-tenants distinct.
 	cfg := moduleConfigFor(caps).WithName(sandboxID)
-	if fsCfg := fsConfigFor(caps); fsCfg != nil {
-		cfg = cfg.WithFSConfig(fsCfg)
-	}
-	mod, err := m.runtime.InstantiateModule(ctx, m.compiled, cfg)
+	mod, err := instantiateWithPreopens(ctx, m.runtime, m.compiled, cfg, caps)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
@@ -219,11 +216,8 @@ func (m *MultiInstanceEngine) Run(ctx context.Context, sandboxID string, caps Ca
 
 	var stdout, stderr bytes.Buffer
 	cfg := moduleConfigFor(caps).WithName(sandboxID).WithStdout(&stdout).WithStderr(&stderr)
-	if fsCfg := fsConfigFor(caps); fsCfg != nil {
-		cfg = cfg.WithFSConfig(fsCfg)
-	}
 	start := time.Now()
-	mod, err := runtime.InstantiateModule(invokeCtx, compiled, cfg)
+	mod, err := instantiateWithPreopens(invokeCtx, runtime, compiled, cfg, caps)
 	if err != nil {
 		return RunResult{}, fmt.Errorf("instantiate module: %w", err)
 	}

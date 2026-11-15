@@ -113,8 +113,14 @@ func (e *wasmtimeEngine) buildInstance(_ context.Context, caps Capabilities, std
 		if guest == "" {
 			guest = "/"
 		}
+		// wasmtime's WASI resolves preopens with cap-std, which already
+		// keeps every lookup inside the directory; only the access mode is
+		// ours to set.
 		dirPerms := wasmtime.DIR_READ | wasmtime.DIR_WRITE
 		filePerms := wasmtime.FILE_READ | wasmtime.FILE_WRITE
+		if p.ReadOnly {
+			dirPerms, filePerms = wasmtime.DIR_READ, wasmtime.FILE_READ
+		}
 		if err := wasi.PreopenDir(p.HostPath, guest, dirPerms, filePerms); err != nil {
 			wasi.Close()
 			store.Close()

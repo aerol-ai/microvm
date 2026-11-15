@@ -189,10 +189,22 @@ func TestWazeroEngine_RunExportNotFound(t *testing.T) {
 
 func TestWazeroEngine_FsConfigForPreopens(t *testing.T) {
 	caps := Capabilities{Preopens: []Preopen{{HostPath: "/tmp", GuestPath: "/work"}}}
-	cfg := fsConfigFor(caps)
-	if cfg == nil {
-		t.Fatal("expected non-nil FSConfig")
+	cfg, mounts, err := fsConfigFor(caps)
+	if err != nil || cfg == nil || len(mounts) != 1 {
+		t.Fatalf("expected one confined mount, got %v, %d, %v", cfg, len(mounts), err)
 	}
+	release := releaseMounts(mounts)
+	release()
+	release() // idempotent: the close notifier and a failed instantiate may both call it
+	if _, errno := mounts[0].Stat("."); errno == 0 {
+		t.Fatal("a released mount still serves paths")
+	}
+
+	cfg, mounts, err = fsConfigFor(Capabilities{})
+	if err != nil || cfg != nil || mounts != nil {
+		t.Fatalf("no preopens: cfg=%v mounts=%v err=%v; want nothing", cfg, mounts, err)
+	}
+	releaseMounts(mounts)()
 }
 
 func TestWazeroEngine_ListenerFD(t *testing.T) {
