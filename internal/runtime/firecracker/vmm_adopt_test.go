@@ -795,3 +795,54 @@ func TestDiscoverVMFailures(t *testing.T) {
 		t.Fatal("a VM the driver cannot lay out was discovered")
 	}
 }
+
+// FenceReady reports where a running VM actually is, not where config says
+// it should be: only a VM in its own group, aerolvm-vmm/<sandbox>, can be
+// frozen alone (review V4). No running VM has nothing to fence.
+func TestFenceReadyReadsWhereTheVMRuns(t *testing.T) {
+	d, _, _ := adoptDriver(t)
+	saved := vmmGroupOfPID
+	t.Cleanup(func() { vmmGroupOfPID = saved })
+	var child string
+	var in bool
+	var readErr error
+	vmmGroupOfPID = func(pid int) (string, bool, error) {
+		if pid != 42 {
+			t.Fatalf("read pid %d, want 42", pid)
+		}
+		return child, in, readErr
+	}
+	if err := d.FenceReady("sb-a"); err != nil {
+		t.Fatalf("no VM: %v", err)
+	}
+	d.vmms["sb-zero"] = &fakeVMM{}
+	if err := d.FenceReady("sb-zero"); err != nil {
+		t.Fatalf("a VM with no process yet: %v", err)
+	}
+	d.vmms["sb-a"] = &fakeVMM{pid: 42}
+	for _, tc := range []struct {
+		name  string
+		child string
+		in    bool
+		err   error
+		want  string
+	}{
+		{"its own group", "sb-a", true, nil, ""},
+		{"the shared group", "", true, nil, "in the VMs' shared cgroup"},
+		{"another VM's group", "warm-3", true, nil, "in group warm-3"},
+		{"outside the VMs' cgroup", "", false, nil, "outside the VMs' cgroup"},
+		{"unreadable", "", false, errors.New("no such file"), "cannot tell which cgroup"},
+	} {
+		child, in, readErr = tc.child, tc.in, tc.err
+		err := d.FenceReady("sb-a")
+		if tc.want == "" {
+			if err != nil {
+				t.Errorf("%s: %v", tc.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}

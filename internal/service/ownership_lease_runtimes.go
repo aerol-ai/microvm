@@ -2,10 +2,15 @@ package service
 
 import (
 	"context"
+	"errors"
+	"expvar"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -56,39 +61,288 @@ func (s *Service) leaseFreezable(chosenRuntime string) bool {
 	return true
 }
 
-// unfencedListedIDs is how many sandbox IDs warnUnfencedRecreate names.
-const unfencedListedIDs = 5
+// Sandboxes made before the refusal (review V4). refuseUnfencedRecreate
+// stops new recreate-policy creates of a runtime the supervisor cannot
+// freeze alone, but rows an older release made keep the policy and keep
+// running. If this node then lost its lease, nothing here could stop them
+// while the cluster recreated them elsewhere: two copies. Before, sandboxd
+// only logged them at start.
+//
+// Now each such sandbox has its failover policy turned off, and keeps
+// running: if its node dies it is lost, rather than possibly running twice.
+// The cluster's replicated spec changes first (an ordinary opUpsertSpec,
+// which every server applies, so no leader of any version recreates it
+// after), then the local row, then its status reason (on a running one),
+// an audit record and a log line. Each step reads what it changes, so a
+// retry or a restart repeats nothing that is done.
+//
+// The same applies to a Firecracker VM a release before the per-VM groups
+// left in the VMs' shared group, whose move into its own group failed at
+// adoption: it is running, and nothing can freeze it alone.
+//
+// Until the cluster takes the change (its leader out of reach at start),
+// the row keeps its policy and the lease still covers it. If the lease runs
+// out first, the fence stops it (stopUnfenceable): a stopped sandbox cannot
+// run twice.
 
-// warnUnfencedRecreate logs, once when the ownership lease starts on a node
-// that writes the lease file, the local recreate-policy sandboxes on a
-// runtime the supervisor cannot freeze alone. refuseUnfencedRecreate
-// refuses new ones, but rows made before it (an upgrade) keep running here
-// unfenced: if this node loses its lease, they run on while the cluster
-// recreates them elsewhere. One listing, at start; nothing changes.
-func (s *Service) warnUnfencedRecreate(ctx context.Context) {
-	if !s.ownershipLeaseFileOn() || s.logger == nil {
+const (
+	// statusReasonFailoverDisabled is the reason on a running sandbox
+	// whose recreate policy this node turned off.
+	statusReasonFailoverDisabled = "failover_disabled"
+	// statusReasonOwnershipLeaseExpired is the reason on a recreate-policy
+	// sandbox the fence stopped because nothing could freeze it.
+	statusReasonOwnershipLeaseExpired = "ownership_lease_expired"
+	// systemActionFailoverDisabled and systemActionLeaseStop are their audit
+	// records (SYSTEM <action>).
+	systemActionFailoverDisabled = "failover.disabled"
+	systemActionLeaseStop        = "failover.lease_stop"
+)
+
+var (
+	// failoverDisabledTotal counts recreate policies this node turned off.
+	failoverDisabledTotal = expvar.NewInt("aerolvm_failover_disabled_unfenceable_total")
+	// errSpecUnread: the cluster holds a placement, but its spec was not
+	// read (a worker's spec read reports a failed lookup as no spec).
+	errSpecUnread = errors.New("the cluster's copy of the sandbox's spec could not be read")
+	// errDisarmLater: the placement is between owners (reserved, or
+	// orphaned but this node's to claim back); the next pass tries again.
+	errDisarmLater = errors.New("its placement is between owners")
+)
+
+// unfenceableRecreate reports whether sb is a recreate-policy sandbox this
+// node cannot freeze alone: its runtime (leaseFreezable), or, for a running
+// Firecracker VM, the VM itself (recreateFenceReady).
+func (s *Service) unfenceableRecreate(sb *models.Sandbox) bool {
+	if sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+		return false
+	}
+	if !s.leaseFreezable(sb.Runtime) {
+		return true
+	}
+	return sb.Status == models.SandboxStatusStarted && s.recreateFenceReady(sb) != nil
+}
+
+// recreateFenceReady is nil unless sb is a recreate-policy sandbox on a node
+// that writes the lease file and its runtime reports a running instance
+// outside the group the supervisor freezes (runtime.FenceChecker: a
+// Firecracker VM whose move into aerolvm-vmm/<sandbox> failed). Only the
+// instance shows that; config says only where it should be.
+func (s *Service) recreateFenceReady(sb *models.Sandbox) error {
+	if !s.ownershipLeaseFileOn() || sb == nil || sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+		return nil
+	}
+	rt, err := s.runtimeForSandbox(sb)
+	if err != nil {
+		return nil
+	}
+	fc, ok := rt.(runtime.FenceChecker)
+	if !ok {
+		return nil
+	}
+	if err := fc.FenceReady(s.runtimeRef(sb)); err != nil {
+		return fmt.Errorf("failover.policy=recreate cannot run here: %w; if this node lost touch with the cluster, its runtime supervisor could not stop it while the cluster recreated it elsewhere", err)
+	}
+	return nil
+}
+
+// startDisarmUnfencedRecreate runs disarmUnfencedRecreate now and every
+// interval until a pass leaves nothing to do, in its own goroutine: a
+// leader out of reach must not hold up the daemon's start.
+func (s *Service) startDisarmUnfencedRecreate(ctx context.Context, every time.Duration) {
+	if !s.ownershipLeaseFileOn() {
 		return
+	}
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			pass, cancel := context.WithTimeout(ctx, every)
+			done := s.disarmUnfencedRecreate(pass)
+			cancel()
+			if done {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+}
+
+// disarmUnfencedRecreate turns off the recreate policy of every local
+// sandbox this node cannot freeze alone (unfenceableRecreate), on a node
+// that writes the lease file. It reports whether nothing is left to retry.
+// One authoritative read covers them all; a sandbox whose placement belongs
+// to another node or lifetime is left to the paths that remove stale rows.
+func (s *Service) disarmUnfencedRecreate(ctx context.Context) bool {
+	if !s.ownershipLeaseFileOn() {
+		return true
 	}
 	rows, err := s.localRecreateSandboxes(ctx)
 	if err != nil {
-		return
+		return false
 	}
-	var ids []string
-	n := 0
+	var todo []*models.Sandbox
 	for _, sb := range rows {
-		if s.leaseFreezable(sb.Runtime) {
-			continue
-		}
-		n++
-		if len(ids) < unfencedListedIDs {
-			ids = append(ids, sb.ID)
+		if s.unfenceableRecreate(sb) {
+			todo = append(todo, sb)
 		}
 	}
-	if n == 0 {
-		return
+	if len(todo) == 0 {
+		return true
 	}
-	s.logger.Warn("cluster: failover.policy=recreate sandboxes on a runtime the runtime supervisor cannot freeze alone (WASM, V8 isolates, or Firecracker outside the sandboxes' cgroup parent): they are not frozen if this node loses its ownership lease, and could run on while the cluster recreates them elsewhere; recreate them with failover.policy=none, or move them off this node",
-		"count", n, "sandbox_ids", strings.Join(ids, ","))
+	c := s.Cluster()
+	ids := make([]string, 0, len(todo))
+	for _, sb := range todo {
+		ids = append(ids, sb.ID)
+	}
+	placements, err := authoritativePlacementsForLease(ctx, c, ids)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: cannot turn off the recreate policy of sandboxes this node cannot freeze alone yet (no answer from the control plane); will retry, and the ownership lease stops them if it runs out first",
+				"count", len(todo), "error", err)
+		}
+		return false
+	}
+	self := strings.TrimSpace(c.SelfNodeID())
+	done := true
+	for _, sb := range todo {
+		p, placed := placements[sb.ID]
+		if err := s.disarmRecreate(ctx, c, sb.ID, p, placed, self); err != nil {
+			done = false
+			if s.logger != nil && !errors.Is(err, errDisarmLater) {
+				s.logger.Warn("cluster: could not turn off a recreate policy this node cannot enforce; will retry", "sandbox_id", sb.ID, "error", err)
+			}
+		}
+	}
+	return done
+}
+
+// disarmRecreate turns off id's recreate policy under its lifecycle
+// boundary: the cluster's spec first when the cluster holds a placement
+// this node owns, then the local row. Without a placement nothing in the
+// cluster can recreate it, and the ownership replay rebuilds the spec from
+// the row, so the row alone is enough.
+func (s *Service) disarmRecreate(ctx context.Context, c cluster.Client, id string, p cluster.Placement, placed bool, self string) error {
+	unlock, err := s.lifecycleLocks.lockCtx(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	sb, err := s.store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !s.unfenceableRecreate(sb) {
+		return nil
+	}
+	if placed {
+		local, remote := strings.TrimSpace(sb.AuditIncarnationID), strings.TrimSpace(p.IncarnationID)
+		switch {
+		case p.IsDeleting() || (local != "" && remote != "" && local != remote):
+			return nil
+		case p.IsOrphaned() || p.IsReserved():
+			if strings.TrimSpace(p.OwnerNodeID) == self || placementCanBeClaimedBySelf(p, self) {
+				return errDisarmLater
+			}
+			return nil
+		case strings.TrimSpace(p.OwnerNodeID) != self:
+			return nil
+		}
+		if err := s.writeFailoverNoneSpec(ctx, c, id); err != nil {
+			return err
+		}
+	}
+	changed, err := s.store.ClearRecreateFailover(ctx, id)
+	if err != nil || !changed {
+		return err
+	}
+	if sb.Status == models.SandboxStatusStarted {
+		if _, err := s.store.SetStatusReasonIfStatus(ctx, id, models.SandboxStatusStarted, statusReasonFailoverDisabled, nil); err != nil && s.logger != nil {
+			s.logger.Warn("cluster: recreate policy turned off, but its status reason was not recorded", "sandbox_id", id, "error", err)
+		}
+	}
+	why := "this node cannot freeze it alone if it loses touch with the cluster (" + s.unfenceableWhy(sb) + "), so a recreated copy could run beside it"
+	s.beginSystemActionReason(withAuditSubsystem(ctx, auditSubsystemFailover), id, systemActionFailoverDisabled, why)(nil)
+	failoverDisabledTotal.Add(1)
+	if s.logger != nil {
+		s.logger.Warn("cluster: failover.policy=recreate turned off for a sandbox this node cannot freeze alone; it keeps running, and is lost rather than recreated if this node dies",
+			"sandbox_id", id, "runtime", sb.Runtime, "reason", why)
+	}
+	return nil
+}
+
+// writeFailoverNoneSpec sets the cluster's spec of id to failover.policy=
+// none, under the spec lock (writeReplicatedSpec). A spec already without
+// the policy is left alone; a spec that could not be read is an error, so
+// the row is not changed on a guess.
+func (s *Service) writeFailoverNoneSpec(ctx context.Context, c cluster.Client, id string) error {
+	unlock, err := s.lockSpec(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return s.writeReplicatedSpec(commitCtx, c, id, func(spec *models.CreateSandboxRequest) (bool, error) {
+		if spec == nil {
+			return false, errSpecUnread
+		}
+		if !spec.ShouldRecreateOnFailover() {
+			return false, nil
+		}
+		spec.Failover = &models.Failover{Policy: models.FailoverPolicyNone}
+		return true, nil
+	})
+}
+
+// unfenceableWhy names why sb cannot be frozen alone, for its records.
+func (s *Service) unfenceableWhy(sb *models.Sandbox) string {
+	switch {
+	case sb.Runtime == models.RuntimeWasm || sb.Runtime == models.RuntimeIsolate:
+		return "its host process runs other sandboxes too"
+	case !s.leaseFreezable(sb.Runtime):
+		return "its VMs' cgroup is not under the sandboxes' cgroup parent"
+	}
+	if err := s.recreateFenceReady(sb); err != nil {
+		return "its VM is not in a group of its own"
+	}
+	return "its runtime cannot freeze it"
+}
+
+// stopUnfenceable stops sb, a recreate-policy sandbox the fence could not
+// freeze, on a node that writes the lease file: only a sandbox whose policy
+// disarmUnfencedRecreate has not turned off yet (new creates of such
+// sandboxes are refused). Its lease ran out, so the cluster may be
+// recreating it elsewhere, and a frozen-in-name sandbox would run on beside
+// the copy. Its policy stays; it stays stopped until someone starts it.
+// The caller holds the lifecycle boundary. It reports whether sb stopped.
+func (s *Service) stopUnfenceable(ctx context.Context, sb *models.Sandbox) bool {
+	if !s.ownershipLeaseFileOn() || sb.Status != models.SandboxStatusStarted {
+		return false
+	}
+	why := "no authoritative read from the control plane within the ownership lease, and this node cannot freeze it alone (" + s.unfenceableWhy(sb) + ")"
+	done := s.beginSystemActionReason(withAuditSubsystem(ctx, auditSubsystemFailover), sb.ID, systemActionLeaseStop, why)
+	_, err := s.stopSandboxLocked(ctx, sb.ID, stopModeManual, statusReasonOwnershipLeaseExpired)
+	done(err)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("cluster: could not stop a sandbox the ownership lease no longer covers and nothing can freeze; will retry", "sandbox_id", sb.ID, "error", err)
+		}
+		return false
+	}
+	if s.logger != nil {
+		s.logger.Warn("cluster: stopped a failover.policy=recreate sandbox the ownership lease no longer covers; nothing on this node could freeze it alone", "sandbox_id", sb.ID, "runtime", sb.Runtime)
+	}
+	return true
 }
 
 // refuseUnfencedRecreate refuses a failover.policy=recreate create, on a

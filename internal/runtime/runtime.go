@@ -264,6 +264,17 @@ type FenceGrouper interface {
 	FenceGroup(sandboxID string) string
 }
 
+// FenceChecker is a runtime that can say whether one running instance
+// actually sits in the group FenceGroup names. Config decides where an
+// instance should go; only the instance shows where it went (a Firecracker
+// VM whose move into its own group failed stays in the VMs' shared group,
+// where nothing can freeze it alone). FenceReady answers nil when the
+// instance is in its group or nothing of that ref is running, and an error
+// naming why when a running instance is outside it.
+type FenceChecker interface {
+	FenceReady(sandboxID string) error
+}
+
 // AsContainerRuntime returns the network-rule surface when rt implements it.
 // WASM and other host-mediated runtimes return false.
 func AsContainerRuntime(rt Runtime) (ContainerRuntime, bool) {

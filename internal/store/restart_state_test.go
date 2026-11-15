@@ -156,3 +156,41 @@ func TestSetStatusReasonIfStatus(t *testing.T) {
 		t.Fatal("closed store: no error")
 	}
 }
+
+// TestClearRecreateFailover: the policy goes from recreate to none in one
+// conditional write, once; a row with another policy, or none, is left as
+// it is (service review V4).
+func TestClearRecreateFailover(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	sb := sampleSandbox("sb-fo")
+	sb.Failover = &models.Failover{Policy: models.FailoverPolicyRecreate}
+	if err := st.Create(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.ClearRecreateFailover(ctx, sb.ID)
+	if err != nil || !changed {
+		t.Fatalf("recreate row: changed=%v err=%v", changed, err)
+	}
+	got, _ := st.Get(ctx, sb.ID)
+	if got.Failover != nil && got.Failover.ShouldRecreate() {
+		t.Fatalf("policy still recreate: %+v", got.Failover)
+	}
+	if changed, err := st.ClearRecreateFailover(ctx, sb.ID); err != nil || changed {
+		t.Fatalf("second clear: changed=%v err=%v", changed, err)
+	}
+	plain := sampleSandbox("sb-plain")
+	if err := st.Create(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := st.ClearRecreateFailover(ctx, plain.ID); err != nil || changed {
+		t.Fatalf("row without a policy: changed=%v err=%v", changed, err)
+	}
+	if changed, err := st.ClearRecreateFailover(ctx, "missing"); err != nil || changed {
+		t.Fatalf("missing row: changed=%v err=%v", changed, err)
+	}
+	_ = st.Close()
+	if _, err := st.ClearRecreateFailover(ctx, sb.ID); err == nil {
+		t.Fatal("closed store: no error")
+	}
+}
