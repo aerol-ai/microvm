@@ -24,6 +24,13 @@ type Config struct {
 	// ResidentHostIdleTTL reaps a resident host holding zero instances for this
 	// long; 0 disables the reaper (SB_WASM_RESIDENT_HOST_IDLE_TTL).
 	ResidentHostIdleTTL time.Duration
+	// MaxStreamsPerSandbox caps live streaming runs (exec streams and
+	// code-runs) per sandbox; 0 means defaultMaxStreamsPerSandbox.
+	// SB_WASM_MAX_STREAMS_PER_SANDBOX.
+	MaxStreamsPerSandbox int
+	// CodeRunModules maps a code-run language to the module ref that runs
+	// it (SB_WASM_CODERUN_MODULES).
+	CodeRunModules map[string]string
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -37,5 +44,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ResidentHostEnabled:      cfg.WasmResidentHostEnabled,
 		ResidentHostMaxInstances: cfg.WasmResidentHostMaxInstances,
 		ResidentHostIdleTTL:      cfg.WasmResidentHostIdleTTL,
+		MaxStreamsPerSandbox:     cfg.WasmMaxStreamsPerSandbox,
+		CodeRunModules:           cfg.WasmCodeRunModules,
 	}
 }

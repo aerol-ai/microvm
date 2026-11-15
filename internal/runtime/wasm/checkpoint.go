@@ -35,6 +35,12 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 	if err != nil {
 		return "", "", err
 	}
+	if stopAfter {
+		// Passivate and migrate end the sandbox here. Runs are not part of
+		// a checkpoint (only the serving guest's memory is), so they end
+		// first rather than write to /work while it is captured and moved.
+		d.killStreams(inst)
+	}
 
 	gen := clonegen.New("", d.logger)
 	gen.Bump(time.Now().UnixNano())

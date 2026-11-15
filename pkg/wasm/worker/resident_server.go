@@ -28,6 +28,21 @@ type ResidentServer struct {
 	lastCaps      map[string]wasmengine.Capabilities
 	auditMu       sync.RWMutex
 	auditBindings map[string]egressAuditBinding
+	streams       streamRegistry
+}
+
+// streamUsage and ownModule complete streamHost for the shared stream code.
+func (s *ResidentServer) streamUsage(sandboxID string) *workerNetUsage {
+	return s.netUsageFor(sandboxID)
+}
+
+func (s *ResidentServer) ownModule() (string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.eng == nil {
+		return "", 0
+	}
+	return s.loadedPath, s.eng.MemoryMB()
 }
 
 func (s *ResidentServer) mediator() *NetMediator {
@@ -41,8 +56,9 @@ func (s *ResidentServer) mediator() *NetMediator {
 	return s.net
 }
 
-// close stops the mediator's operator-file poll with the worker.
+// close stops the mediator's operator-file poll and every stream with the worker.
 func (s *ResidentServer) close() {
+	s.streams.closeAll()
 	s.mu.Lock()
 	m := s.net
 	s.mu.Unlock()
@@ -196,6 +212,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.streams.killSandbox(env.SandboxID)
 			// Hold the server lock across check+load so two concurrent
 			// different-path loads cannot both pass prev=="" (D8).
 			s.mu.Lock()
@@ -351,6 +368,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				return err
 			}
 		case MsgStopInstance:
+			s.streams.killSandbox(env.SandboxID)
 			eng := s.engine()
 			if eng != nil {
 				if err := eng.StopInstance(ctx, env.SandboxID); err != nil {
@@ -411,6 +429,13 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				return encErr
 			}
 			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: sandboxID, Payload: body}); err != nil {
+				return err
+			}
+		case MsgExecStart:
+			// The connection now belongs to the run; it closes when the run ends.
+			return s.streams.serve(s, conn, env)
+		case MsgExecKill:
+			if err := s.streams.serveExecKill(conn, env); err != nil {
 				return err
 			}
 		default:

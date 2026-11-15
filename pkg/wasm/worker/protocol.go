@@ -30,6 +30,26 @@ const (
 	MsgListenPort       MessageType = "listen_port"
 	MsgProxyHTTP        MessageType = "proxy_http"
 	MsgProxyHTTPResult  MessageType = "proxy_http_result"
+
+	// Streaming exec (issue #535). One connection carries one run: the
+	// client sends exec_start and gets exec_started (or an error); then the
+	// worker streams exec_chunk frames and ends with exec_exit, while the
+	// client may send exec_stdin, exec_stdin_close and exec_kill. exec_kill
+	// is also accepted on a fresh connection with the run's id, so a client
+	// can stop a run whose connection is stalled on stdin backpressure.
+	MsgExecStart      MessageType = "exec_start"
+	MsgExecStarted    MessageType = "exec_started"
+	MsgExecChunk      MessageType = "exec_chunk"
+	MsgExecStdin      MessageType = "exec_stdin"
+	MsgExecStdinClose MessageType = "exec_stdin_close"
+	MsgExecKill       MessageType = "exec_kill"
+	MsgExecExit       MessageType = "exec_exit"
+)
+
+// Stream ids on exec_chunk frames.
+const (
+	StreamStdout uint8 = 1
+	StreamStderr uint8 = 2
 )
 
 // Envelope is the on-wire message body (after the length prefix).
@@ -37,4 +57,8 @@ type Envelope struct {
 	Type      MessageType `json:"type"`
 	SandboxID string      `json:"sandbox_id,omitempty"`
 	Payload   []byte      `json:"payload,omitempty"`
+	// Stream marks an exec_chunk as stdout (1) or stderr (2). Chunk and
+	// stdin frames carry the bytes themselves as Payload, not a JSON
+	// document, so output that is not UTF-8 arrives unchanged.
+	Stream uint8 `json:"stream,omitempty"`
 }

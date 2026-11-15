@@ -2,58 +2,23 @@ package worker
 
 import (
 	"bytes"
-	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/wasmtestguest"
+
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
+// ensureWasip1HTTPWasm returns the wasip1 HTTP guest, compiled on demand by
+// the shared internal/wasmtestguest helper.
 func ensureWasip1HTTPWasm(t *testing.T) string {
 	t.Helper()
-	out, err := filepath.Abs(filepath.Join("..", "testdata", "wasip1-http.wasm"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, err := os.Stat(out); err == nil && st.Size() > 0 {
-		return out
-	}
-	if runtime.GOOS == "windows" {
-		t.Skip("wasip1-http.wasm compile skipped on windows")
-	}
-	src, err := filepath.Abs(filepath.Join("..", "testdata", "aerolhttp"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		t.Skip("aerolhttp wasip1 guest source missing")
-	}
-	// A missing toolchain is an environment limitation, not a defect under
-	// test — same class as Windows above. Checked before the build so the
-	// failure mode is a clear skip rather than a confusing exec error.
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("go toolchain unavailable; cannot compile wasip1-http.wasm")
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", out, ".")
-	cmd.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
-	cmd.Dir = src
-	if combined, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("compile wasip1-http.wasm: %v\n%s", err, combined)
-	}
-	return out
+	return wasmtestguest.Path(t, wasmtestguest.HTTP)
 }
 
 func TestGuestWasip1HTTPServerEndToEnd(t *testing.T) {

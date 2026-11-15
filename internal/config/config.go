@@ -814,6 +814,18 @@ type Config struct {
 	// Provisioned identically on every node by Ansible — the fleet-wide
 	// standard-module contract, deliberately NOT DB-backed. SB_WASM_STANDARD_MODULES.
 	WasmStandardModules map[string]string
+	// WasmCodeRunModules maps a /process/code-run language to the module
+	// that runs it on a WASM sandbox (e.g. "python=python,js=javascript").
+	// Values are module refs, normally standard-module aliases. Parsed like
+	// SB_WASM_STANDARD_MODULES; when unset it is derived from the standard
+	// modules (python, javascript via QuickJS, ruby). SB_WASM_CODERUN_MODULES.
+	WasmCodeRunModules map[string]string
+	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams and
+	// code-runs) one WASM sandbox may have at once. Each is a guest instance
+	// in the sandbox's worker; past the cap the toolbox answers HTTP 429.
+	// A worker never runs more than 32 per sandbox, whatever this says.
+	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
+	WasmMaxStreamsPerSandbox int
 	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
 	// the create request carries no per-tenant credentials. SB_WASM_REGISTRY_USERNAME.
 	WasmRegistryUsername string
@@ -2664,6 +2676,7 @@ func load(keyTool bool) (Config, error) {
 		WasmRegistryAllowlist:     parseImageGCWhitelist(getEnv("SB_WASM_REGISTRY_ALLOWLIST", "")),
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
+		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 8),
 		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
 		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
 		WasmRegistryPushHost:      getEnv("SB_WASM_REGISTRY_PUSH_HOST", ""),
@@ -2768,6 +2781,7 @@ func load(keyTool bool) (Config, error) {
 	if cfg.PATToken == "" {
 		return Config{}, errors.New("SB_PAT_TOKEN is required")
 	}
+	cfg.WasmCodeRunModules = wasmCodeRunModules(getEnv("SB_WASM_CODERUN_MODULES", ""), cfg.WasmStandardModules)
 	if cfg.NodeID != "" && !models.ValidClusterNodeID(cfg.NodeID) {
 		return Config{}, errors.New("SB_NODE_ID must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
 	}
@@ -4205,6 +4219,41 @@ func parseWasmStandardModules(raw string) map[string]string {
 			continue
 		}
 		out[alias] = filename
+	}
+	return out
+}
+
+// wasmCodeRunDefaults lists, per code-run language family, the request
+// languages it answers to and the standard-module aliases that provide it,
+// first match wins. The families are the ones the WASM driver knows how to
+// hand code to (python -c, qjs -e, ruby -e).
+var wasmCodeRunDefaults = []struct {
+	languages []string
+	aliases   []string
+}{
+	{languages: []string{"python", "python3", "py"}, aliases: []string{"python", "python3"}},
+	{languages: []string{"javascript", "js", "node"}, aliases: []string{"javascript", "quickjs", "js"}},
+	{languages: []string{"ruby", "rb"}, aliases: []string{"ruby"}},
+}
+
+// wasmCodeRunModules parses SB_WASM_CODERUN_MODULES, or derives the map from
+// the standard modules when it is unset, so a node that stages python.wasm
+// serves code-run for python with no extra setting.
+func wasmCodeRunModules(raw string, standard map[string]string) map[string]string {
+	if strings.TrimSpace(raw) != "" {
+		return parseWasmStandardModules(raw)
+	}
+	out := map[string]string{}
+	for _, family := range wasmCodeRunDefaults {
+		for _, alias := range family.aliases {
+			if _, ok := standard[alias]; !ok {
+				continue
+			}
+			for _, lang := range family.languages {
+				out[lang] = alias
+			}
+			break
+		}
 	}
 	return out
 }

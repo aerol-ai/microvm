@@ -209,6 +209,7 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
+	d.killStreams(inst)
 	client := d.newWorkerClient(inst.socketPath)
 	if err := client.StopInstance(sandboxID); err != nil {
 		return fmt.Errorf("stop instance: %w", err)
@@ -234,6 +235,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	if d.net != nil {
 		d.net.ReleaseSandbox(sandboxID)
 	}
+	d.killStreams(inst)
 	if inst != nil && inst.fromResidentHost {
 		// Shared resident host — remove only this instance; NEVER kill the
 		// process (co-tenants depend on it). Best-effort: a dead host already
