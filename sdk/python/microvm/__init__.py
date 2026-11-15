@@ -1,10 +1,13 @@
 from typing import TYPE_CHECKING, Any
 from .client import (
     DEFAULT_LIST_LIMIT,
+    CodeRunHandle,
     FileWatchHandle,
     MicroVM,
     MicroVMAuthError,
     MicroVMCapacityError,
+    MicroVMCodeRunError,
+    MicroVMCodeTimeoutError,
     MicroVMConflictError,
     MicroVMError,
     MicroVMFileTooLargeError,
@@ -47,10 +50,15 @@ from .types import (
     NetworkPolicyOptions,
     BuildImageResult,
     CloneGeneration,
+    CodeContext,
+    CodeResult,
     CustomDomain,
     CustomDomainDNSRecords,
     CustomDomainStatus,
     DNSRecord,
+    Execution,
+    ExecutionError,
+    ExecutionLogs,
     ExposeProtocol,
     ExposeResult,
     ExposeVisibility,
@@ -80,6 +88,7 @@ from .types import (
 
 __all__ = [
     "DEFAULT_LIST_LIMIT",
+    "AsyncCodeRunHandle",
     "AsyncExecStreamHandle",
     "AsyncFileWatchHandle",
     "AsyncMicroVM",
@@ -118,6 +127,9 @@ __all__ = [
     "BuildImagePushOptions",
     "BuildImageResult",
     "CloneGeneration",
+    "CodeContext",
+    "CodeResult",
+    "CodeRunHandle",
     "CustomDomain",
     "CustomDomainDNSRecords",
     "CustomDomainStatus",
@@ -126,6 +138,8 @@ __all__ = [
     "MicroVM",
     "MicroVMAuthError",
     "MicroVMCapacityError",
+    "MicroVMCodeRunError",
+    "MicroVMCodeTimeoutError",
     "MicroVMConflictError",
     "MicroVMError",
     "MicroVMFileTooLargeError",
@@ -133,6 +147,9 @@ __all__ = [
     "MicroVMNotFoundError",
     "MicroVMTimeoutError",
     "MicroVMUnsupportedFeatureError",
+    "Execution",
+    "ExecutionError",
+    "ExecutionLogs",
     "ExposeProtocol",
     "ExposeResult",
     "ExposeVisibility",
@@ -166,6 +183,7 @@ __all__ = [
 # `import microvm` as light as the sync client needs: with httpx installed,
 # an eager import took `import microvm` from about 58 ms to 212 ms.
 _ASYNC_NAMES = (
+    "AsyncCodeRunHandle",
     "AsyncExecStreamHandle",
     "AsyncFileWatchHandle",
     "AsyncMicroVM",
@@ -176,6 +194,7 @@ _ASYNC_NAMES = (
 
 if TYPE_CHECKING:  # pragma: no cover - for type checkers only
     from .aio import (
+        AsyncCodeRunHandle,
         AsyncExecStreamHandle,
         AsyncFileWatchHandle,
         AsyncMicroVM,
