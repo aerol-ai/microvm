@@ -393,7 +393,28 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
 		return
 	}
-	if req.Timeout <= 0 {
+	h.connect(w, r, req.Timeout)
+}
+
+// connectSandboxV2 is POST /v2/sandboxes/{id}/connect, which E2B SDKs from
+// 2.51 call. Its timeout may be left out (E2B then uses 300 s), and its
+// memory flag needs nothing: the facade's pause is a stop, so every resume
+// already boots from disk, which is what memory:false asks for.
+func (h *handlers) connectSandboxV2(w http.ResponseWriter, r *http.Request) {
+	var req connectSandboxV2Request
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	timeout := defaultSandboxTimeout
+	if req.Timeout != nil {
+		timeout = *req.Timeout
+	}
+	h.connect(w, r, timeout)
+}
+
+func (h *handlers) connect(w http.ResponseWriter, r *http.Request, timeoutSeconds int) {
+	if timeoutSeconds <= 0 {
 		WriteError(w, http.StatusBadRequest, "timeout must be greater than zero")
 		return
 	}
@@ -422,7 +443,7 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 	// change" when the new deadline is not later.
 	updated, changed, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
 		currentDeadline, hasDeadline := timeoutDeadline(sb, meta)
-		desiredLifecycle := lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout)
+		desiredLifecycle := lifecycleForTimeout(sb, meta.OnTimeout, timeoutSeconds)
 		desiredDeadline, _ := timeoutDeadline(&models.Sandbox{CreatedAt: sb.CreatedAt, Lifecycle: desiredLifecycle}, meta)
 		if hasDeadline && !desiredDeadline.After(currentDeadline) {
 			return models.Lifecycle{}, false, nil
@@ -438,7 +459,7 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 	// re-saving the blob wrote the same bytes and, since facade state rides
 	// the replicated spec (B11), cost a Raft write per reconnect.
 	if changed {
-		meta.TimeoutSeconds = req.Timeout
+		meta.TimeoutSeconds = timeoutSeconds
 	}
 
 	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
@@ -726,6 +747,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	wantsMCP, err := parseMCPOption(req.MCP)
 	if err != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
+	}
+	// Refused like network.rules (the only consumer of these tokens): the
+	// sandbox would start without the identity its code expects.
+	if req.IAM != nil && len(req.IAM.Tokens) > 0 {
+		return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("iam workload identity is not supported by this server")
 	}
 	// Translate E2B volumeMounts → the neutral platform-volume references the
 	// service resolves against the operator's shared backend. The facade only
@@ -1045,15 +1071,30 @@ func (h *handlers) resolveSnapshotDeleteTarget(ctx context.Context, snapshotID s
 }
 
 func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, meta sandboxMeta) sandboxResponse {
+	token := envdAccessToken(sandbox, meta)
 	return sandboxResponse{
-		ClientID:        h.clientID,
-		EnvdVersion:     h.defaultEnvdVer,
-		SandboxID:       sandbox.ID,
-		TemplateID:      firstNonEmpty(meta.TemplateID, sandbox.Image),
-		Alias:           meta.TemplateAlias,
-		Domain:          requestDomain(r),
-		EnvdAccessToken: envdAccessToken(sandbox, meta),
+		ClientID:           h.clientID,
+		EnvdVersion:        h.defaultEnvdVer,
+		SandboxID:          sandbox.ID,
+		TemplateID:         firstNonEmpty(meta.TemplateID, sandbox.Image),
+		Alias:              meta.TemplateAlias,
+		Domain:             requestDomain(r),
+		EnvdAccessToken:    token,
+		TrafficAccessToken: trafficAccessToken(token),
 	}
+}
+
+// trafficAccessToken is the envd token again. The code-interpreter SDKs
+// send only E2B-Traffic-Access-Token on their /contexts calls, never
+// X-Access-Token, so a secure sandbox's interpreter is unreachable without
+// it; the runtime proxy accepts either header against the same token, and
+// a response that already carries the envd token reveals nothing new.
+// Insecure sandboxes get none, as on E2B.
+func trafficAccessToken(envdToken string) *string {
+	if envdToken == "" {
+		return nil
+	}
+	return &envdToken
 }
 
 func (h *handlers) toListedSandboxResponse(sandbox *models.Sandbox, meta sandboxMeta) listedSandboxResponse {
@@ -1343,8 +1384,14 @@ func stringMap(input map[string]any, field string) (map[string]string, error) {
 	return result, nil
 }
 
+// defaultCodeInterpreterImage backs E2B's code-interpreter-v1, the template
+// the code-interpreter SDKs ask for by default. It needs only python3 for
+// Python contexts; an operator who wants E2B's other languages maps the
+// template to an image with node, R and Java (SB_E2B_TEMPLATE_MAP_JSON).
+const defaultCodeInterpreterImage = "python:3.12-slim"
+
 func loadTemplateMap(raw string, logger *slog.Logger) map[string]string {
-	aliases := map[string]string{"base": "ubuntu:22.04"}
+	aliases := map[string]string{"base": "ubuntu:22.04", "code-interpreter-v1": defaultCodeInterpreterImage}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return aliases
