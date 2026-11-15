@@ -338,7 +338,7 @@ test("runCode with an aborted signal makes no request", async () => {
   });
 });
 
-test("a throwing callback interrupts the run and rejects with its error", async () => {
+test("a throwing callback rejects the run with its error and closes the socket", async () => {
   await withFakeWebSocket(async () => {
     const { sdk } = fakeSandbox();
     const boom = new Error("boom");
@@ -350,7 +350,7 @@ test("a throwing callback interrupts the run and rejects with its error", async 
     const ws = await openedSocket();
     ws.frame({ type: "stdout", text: "1\n" });
     await assert.rejects(run, (err: unknown) => err === boom);
-    assert.deepEqual(ws.sentJSON()[1], { type: "interrupt" });
+    assert.equal(ws.sent.length, 1, "only the start frame goes out");
     assert.equal(ws.closed, true);
   });
 });

@@ -3754,9 +3754,9 @@ function openCodeRun(
         notify();
       } catch (err) {
         // A throw must not escape a socket listener, where it is an
-        // uncaught exception. The caller no longer wants this run, and a
-        // disconnect alone leaves the code running, so interrupt it too.
-        interrupt();
+        // uncaught exception: the run rejects with it instead. The code
+        // keeps running in the sandbox, as in the other SDKs; abort the
+        // signal to stop it.
         settle(() => reject(err));
         ws.close();
       }
