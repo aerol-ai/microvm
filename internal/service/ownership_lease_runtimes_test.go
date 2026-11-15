@@ -95,6 +95,17 @@ type specLeaseCluster struct {
 	unread   map[string]bool
 	writeErr error
 	writes   int
+	// afterRead, when set, runs after each authoritative read: a test
+	// moves a placement between a read and what follows it.
+	afterRead func()
+}
+
+func (c *specLeaseCluster) AuthoritativePlacementsByIDs(ctx context.Context, ids []string) (map[string]cluster.Placement, error) {
+	out, err := c.leaseCluster.AuthoritativePlacementsByIDs(ctx, ids)
+	if c.afterRead != nil {
+		c.afterRead()
+	}
+	return out, err
 }
 
 func newSpecLeaseCluster(lc *leaseCluster) *specLeaseCluster {
@@ -166,7 +177,9 @@ func seedRuntimeRow(t *testing.T, st interface {
 // before the refusal kept running with its policy after its node's lease
 // ran out, since nothing can freeze it alone. Now, at the lease's start,
 // its policy is turned off; it keeps running, and the cluster never
-// recreates it elsewhere.
+// recreates it elsewhere. The checks after the disarm, with the leader
+// still reachable, prove the switch itself: a lease stop alone would also
+// satisfy the review's last check (2f, #1299).
 func TestReviewLegacyWasmRecreateCannotRemainUnfenced(t *testing.T) {
 	ctx := context.Background()
 	svc, st, lc := newLeaseService(t, newFreezeRuntime())
@@ -178,6 +191,16 @@ func TestReviewLegacyWasmRecreateCannotRemainUnfenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.disarmUnfencedRecreate(ctx)
+	switched, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if switched.Failover != nil && switched.Failover.ShouldRecreate() {
+		t.Fatal("the disarm left the recreate policy on while the leader was reachable")
+	}
+	if switched.Status != models.SandboxStatusStarted {
+		t.Fatalf("the disarm changed its status to %s; it must keep running", switched.Status)
+	}
 	svc.beginOwnershipLease(now)
 	lc.down()
 	svc.enforceOwnershipLease(ctx, now.Add(time.Minute))
@@ -187,6 +210,10 @@ func TestReviewLegacyWasmRecreateCannotRemainUnfenced(t *testing.T) {
 	}
 	if got.Status == models.SandboxStatusStarted && got.Failover != nil && got.Failover.ShouldRecreate() {
 		t.Fatal("legacy WASM still executing with recreate policy after lease expiry; warning and request fencing do not stop its host process")
+	}
+	// Its policy is off, so the lease that ran out does not touch it.
+	if got.Status != models.SandboxStatusStarted {
+		t.Fatalf("a sandbox whose policy was turned off was stopped when the lease ran out: %s %q", got.Status, got.StatusReason)
 	}
 }
 
@@ -457,6 +484,137 @@ func TestLeaseStopsAnUnfenceableRecreateWhenItRunsOut(t *testing.T) {
 	}
 }
 
+// A placement can change owner between the pass's read and the spec write:
+// the leader reassigns a sandbox whose node gossip calls dead even while
+// that node's reads still reach it. The owner is read again under the spec
+// lock, on each write attempt, so this node never turns off the recreate
+// policy of a sandbox another node now owns (2f, #1299, point 3a).
+func TestDisarmLeavesASpecThatMovedAfterTheRead(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	svc.SetWasmRuntime(&fakeCapacityRuntime{})
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	sc := newSpecLeaseCluster(lc)
+	svc.AttachCluster(sc)
+	seedRuntimeRow(t, st, "wasm", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	sc.specs["wasm"] = &models.CreateSandboxRequest{Image: "alpine:3.20", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
+	lc.up(selfPlacement("wasm"))
+	moved := selfPlacement("wasm")
+	moved.OwnerNodeID = "worker-b"
+	reads := 0
+	sc.afterRead = func() {
+		reads++
+		if reads == 1 {
+			lc.up(moved)
+		}
+	}
+	if !svc.disarmUnfencedRecreate(ctx) {
+		t.Fatal("a sandbox that moved away is not this node's to retry")
+	}
+	if sc.writeCount() != 0 || !sc.specRecreates("wasm") {
+		t.Fatalf("another node's spec was rewritten: %d writes, recreate %v", sc.writeCount(), sc.specRecreates("wasm"))
+	}
+	if got, _ := st.Get(ctx, "wasm"); got.Failover == nil || !got.Failover.ShouldRecreate() {
+		t.Fatal("the stale local row changed; the stale-row paths own it")
+	}
+	if reads < 2 {
+		t.Fatalf("the owner was read %d times; it must be read again under the spec lock", reads)
+	}
+
+	// Orphaned in that window, but this node's to claim back: retried.
+	if err := st.Delete(ctx, "wasm"); err != nil {
+		t.Fatal(err)
+	}
+	seedRuntimeRow(t, st, "wasm-o", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	sc.specs["wasm-o"] = &models.CreateSandboxRequest{Image: "alpine:3.20", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}
+	orphaned := selfPlacement("wasm-o")
+	orphaned.OwnerNodeID, orphaned.OrphanedOwnerNodeID = "", "worker-a"
+	reads = 0
+	sc.afterRead = func() {
+		reads++
+		if reads == 1 {
+			lc.up(orphaned)
+		}
+	}
+	lc.up(selfPlacement("wasm-o"))
+	if svc.disarmUnfencedRecreate(ctx) {
+		t.Fatal("a placement this node can claim back must be retried")
+	}
+	if sc.writeCount() != 0 || !sc.specRecreates("wasm-o") {
+		t.Fatal("the spec of a placement between owners was rewritten")
+	}
+
+	// The second read fails: retried, nothing written. The placement is
+	// gone by the second read: left alone, nothing written.
+	for _, tc := range []struct {
+		name  string
+		after func()
+		done  bool
+	}{
+		{"the owner read fails", lc.down, false},
+		{"the placement is gone", func() { lc.up() }, true},
+	} {
+		reads = 0
+		sc.afterRead = func() {
+			reads++
+			if reads == 1 {
+				tc.after()
+			}
+		}
+		lc.up(selfPlacement("wasm-o"))
+		if got := svc.disarmUnfencedRecreate(ctx); got != tc.done {
+			t.Errorf("%s: done = %v, want %v", tc.name, got, tc.done)
+		}
+		if sc.writeCount() != 0 || !sc.specRecreates("wasm-o") {
+			t.Errorf("%s: the spec was rewritten", tc.name)
+		}
+	}
+}
+
+// 2f's race in #1299's review: enforceOwnershipLease lists the recreate
+// rows, then fences each one under its lifecycle lock. A disarm that turned
+// a sandbox's policy off in between left the fence acting on its stale
+// listing: it stopped a sandbox whose policy was already none, with reason
+// ownership_lease_expired, the opposite of "it keeps running". The fence
+// now reads the row again and fences only a row that still has the policy.
+func TestFenceSkipsARowDisarmedAfterTheListing(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	svc.SetWasmRuntime(&fakeCapacityRuntime{})
+	svc.AttachCluster(newSpecLeaseCluster(lc))
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	seedRuntimeRow(t, st, "wasm", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	svc.beginOwnershipLease(time.Unix(80_000, 0))
+
+	// The listing enforceOwnershipLease makes once the lease ran out.
+	rows, err := svc.localRecreateSandboxes(ctx)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("listing: %v %v", rows, err)
+	}
+	// The disarm lands in between.
+	lc.up()
+	if !svc.disarmUnfencedRecreate(ctx) {
+		t.Fatal("disarm left work to retry")
+	}
+	lc.down()
+	// The fence, from that listing.
+	svc.fenceSandbox(ctx, rows[0].ID)
+
+	got, err := st.Get(ctx, "wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.SandboxStatusStarted || got.StatusReason == statusReasonOwnershipLeaseExpired {
+		t.Fatalf("a sandbox whose policy was already off was stopped: status %s reason %q", got.Status, got.StatusReason)
+	}
+	if got.Failover != nil && got.Failover.ShouldRecreate() {
+		t.Fatal("the policy came back")
+	}
+	if svc.OwnershipFenced("wasm") {
+		t.Fatal("a sandbox without the recreate policy was fenced")
+	}
+}
+
 // stopErrRuntime is a runtime whose stop fails.
 type stopErrRuntime struct {
 	*fakeCapacityRuntime
@@ -494,7 +652,7 @@ func TestStopUnfenceableEdges(t *testing.T) {
 	if got, _ := st.Get(ctx, "wasm"); got.Status != models.SandboxStatusStopped {
 		t.Fatalf("the stop was not tried again: %s", got.Status)
 	}
-	if svc.stopUnfenceable(ctx, &models.Sandbox{ID: "x", Status: models.SandboxStatusStopped}) {
+	if svc.stopUnfenceable(ctx, &models.Sandbox{ID: "x", Status: models.SandboxStatusStopped}, &fencedSandbox{}) {
 		t.Fatal("stopped a sandbox that was not running")
 	}
 
@@ -510,6 +668,45 @@ func TestStopUnfenceableEdges(t *testing.T) {
 	got, _ := st2.Get(ctx, "ctr")
 	if got.Status != models.SandboxStatusStopped || got.StatusReason != statusReasonOwnershipLeaseExpired {
 		t.Fatalf("status %s reason %q, want stopped %q", got.Status, got.StatusReason, statusReasonOwnershipLeaseExpired)
+	}
+}
+
+// A stop that keeps failing is tried at every check (lease/15, 1 s by
+// default), but writes one audit record and one log line for the whole
+// run of failures, not one per check; the stop that finally works writes
+// its own record (2f, #1299, point 3b).
+func TestFailingLeaseStopRecordsOncePerRun(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	bad := &stopErrRuntime{fakeCapacityRuntime: &fakeCapacityRuntime{}, err: errors.New("host process gone")}
+	svc.SetWasmRuntime(bad)
+	svc.AttachCluster(newSpecLeaseCluster(lc))
+	sink := captureAudit(svc)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	seedRuntimeRow(t, st, "wasm", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	t0 := time.Unix(90_000, 0)
+	svc.beginOwnershipLease(t0)
+	lc.down()
+	for i := range 5 {
+		svc.enforceOwnershipLease(ctx, t0.Add(time.Duration(16+i)*time.Second))
+	}
+	records := systemRecords(sink, "wasm")
+	if len(records) != 1 || records[0].ref != sys(systemActionLeaseStop) || records[0].result == "ok" {
+		t.Fatalf("5 failed stops wrote %+v, want one failure record", records)
+	}
+	if c := strings.Count(logs.String(), "could not stop a sandbox the ownership lease no longer covers"); c != 1 {
+		t.Fatalf("logged the failure %d times, want once", c)
+	}
+	bad.err = nil
+	svc.enforceOwnershipLease(ctx, t0.Add(22*time.Second))
+	records = systemRecords(sink, "wasm")
+	if len(records) != 2 || records[1].result != "ok" {
+		t.Fatalf("the stop that worked: %+v", records)
+	}
+	if got, _ := st.Get(ctx, "wasm"); got.Status != models.SandboxStatusStopped {
+		t.Fatalf("status %s", got.Status)
 	}
 }
 
@@ -559,7 +756,7 @@ func TestDisarmUnfencedRecreateEdges(t *testing.T) {
 	if got, _ := st.Get(ctx, "wasm-2"); got.Failover == nil || !got.Failover.ShouldRecreate() {
 		t.Fatal("the row changed")
 	}
-	if err := svc.writeFailoverNoneSpec(cancelled, sc, "wasm-2"); err == nil {
+	if err := svc.writeFailoverNoneSpec(cancelled, sc, &models.Sandbox{ID: "wasm-2"}, self); err == nil {
 		t.Fatal("a cancelled spec write took the spec lock")
 	}
 	if svc.disarmUnfencedRecreate(cancelled) {
@@ -598,7 +795,10 @@ func (r *fenceCheckRuntime) Stop(ctx context.Context, ref string) error {
 // without the lease file are unchanged.
 func TestRecreateVMOutsideItsGroupDoesNotRun(t *testing.T) {
 	ctx := context.Background()
-	svc, st, _ := newLeaseService(t, newFreezeRuntime())
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	// Each create's reservation names this node, as a real create's does:
+	// a recreate-policy create reads it before its row is written (V3).
+	lc.up(reservedFor("fc-nofile", "worker-a", ""), reservedFor("fc-out", "worker-a", ""), reservedFor("fc-in", "worker-a", ""))
 	fc := &fenceCheckRuntime{fenceGroupRuntime: &fenceGroupRuntime{newFreezeRuntime()}, err: errors.New("firecracker VM runs in the VMs' shared cgroup")}
 	svc.firecracker = fc
 	svc.admitter = capacity.New(capacity.HostInfo{CPUCores: 8, MemoryTotalMB: 16384, SupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecracker}},

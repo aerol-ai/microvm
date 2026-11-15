@@ -111,6 +111,10 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 
+	// As on the docker path: no start before a recent ownership read (V3).
+	if err := s.requireOwnershipToStart(ctx, sandboxID, auditIncarnationID, req.Failover); err != nil {
+		return nil, err
+	}
 	releaseAdmission, err := s.admitCreate(sandboxID, req)
 	if err != nil {
 		return nil, err

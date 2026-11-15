@@ -2631,6 +2631,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// A recreate-policy create starts nothing before a recent read proves
+	// this node owns the sandbox (V3). Before admission, so a refusal has
+	// nothing to roll back.
+	if err := s.requireOwnershipToStart(ctx, sandboxID, secrets.IncarnationIDFromContext(ctx), req.Failover); err != nil {
+		return nil, err
+	}
+
 	// Admission check uses normalized values (req.CPU/MemoryMB are guaranteed
 	// > 0 by normalizeCreateRequest above), so a default-sized request still
 	// counts against the host budget. Reservation happens here; every failure
@@ -3158,6 +3165,11 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 
+	// As on the docker path: no start before a recent ownership read (V3).
+	if err := s.requireOwnershipToStart(ctx, sandboxID, secrets.IncarnationIDFromContext(ctx), req.Failover); err != nil {
+		return nil, err
+	}
+
 	// Admission check mirrors the docker path. The capacity model is
 	// runtime-agnostic — a firecracker VMM's vCPU/memory footprint
 	// is counted the same way as a docker container's.
@@ -3493,6 +3505,16 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 		}
 		defer s.clearPendingAuditIncarnation(sandbox.ID, incarnationID)
 		sandbox.AuditIncarnationID = incarnationID
+	}
+	// A recreate-policy row is written only on a lease a recent read proved,
+	// with its lifetime known (V3). Its create checked before it started
+	// (requireOwnershipToStart); this catches an image pull that outlasted
+	// that read. A clock read, plus one leader read when the last is older
+	// than two thirds of a lease.
+	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
+		if err := s.requireFreshOwnership(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
+			return err
+		}
 	}
 	sealed, err := s.sealEnv(sandbox.ID, sandbox.AuditIncarnationID, sandbox.Env)
 	if err != nil {
