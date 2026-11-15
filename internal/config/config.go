@@ -874,8 +874,10 @@ type Config struct {
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
 	// WasmWasmtimeListenFallback moves a sandbox on the wasmtime engine to
-	// wazero when it exposes a port: no wasmtime release can pre-open a
-	// guest listener (#175). Off keeps the old error. Default true.
+	// wazero when it exposes a port and the engine cannot serve one itself.
+	// The engine serves guest listeners from its own WASI socket layer on
+	// Linux and macOS (#175), so this only applies to a module that exports
+	// no memory, or another host OS. Off keeps the error. Default true.
 	// SB_WASM_WASMTIME_LISTEN_FALLBACK.
 	WasmWasmtimeListenFallback bool
 	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
