@@ -165,6 +165,83 @@ func TestPythonEndToEnd(t *testing.T) {
 	}
 }
 
+// TestLanguagesEndToEnd sends non-python runs through the WebSocket's
+// "language" field: each language gets its own default context, started
+// by the real process launcher, and its output, results and errors reach
+// the client as frames. A language whose interpreter is missing is skipped.
+func TestLanguagesEndToEnd(t *testing.T) {
+	type run struct {
+		code, stdout, result string
+		// fails: one error frame, named errName.
+		fails   bool
+		errName string
+	}
+	cases := []struct {
+		lang, program string
+		runs          []run
+	}{
+		{codeinterp.LangJavaScript, "node", []run{
+			{code: "let x = 5"},
+			{code: "console.log(x); x * 2", stdout: "5\n", result: "10"},
+			{code: "null.f()", fails: true, errName: "TypeError"},
+		}},
+		{codeinterp.LangTypeScript, "node", []run{
+			{code: "const message: string = 'Hello, World!'; console.log(message)", stdout: "Hello, World!\n"},
+		}},
+		{codeinterp.LangBash, "bash", []run{
+			{code: "x=7; cd /"},
+			{code: "echo $x; pwd", stdout: "7\n/\n"},
+			{code: "false", fails: true},
+		}},
+		{codeinterp.LangR, "Rscript", []run{
+			{code: "x <- 3"},
+			{code: "cat(x, '\\n'); x + 1", stdout: "3 \n", result: "[1] 4"},
+		}},
+		{codeinterp.LangJava, "java", []run{
+			{code: "int x = 9;"},
+			{code: "System.out.println(x);\nx + 1", stdout: "9\n", result: "10"},
+		}},
+	}
+	l := proc.New(proc.Config{DriverDir: t.TempDir()})
+	e := newTestEnv(t, l, func(o *codeinterp.Options) {
+		o.DefaultCwd = t.TempDir()
+		o.Limit = codeinterp.NewLimit(len(cases) + 1)
+	})
+	for _, tc := range cases {
+		t.Run(tc.lang, func(t *testing.T) {
+			if _, err := exec.LookPath(tc.program); err != nil {
+				t.Skipf("no %s", tc.program)
+			}
+			for _, r := range tc.runs {
+				res := e.run(t, ExecuteRequest{Code: r.code, Language: tc.lang, RichOutput: true})
+				var result, errName string
+				errs := 0
+				for _, f := range res.frames {
+					switch f["type"] {
+					case "result":
+						result, _ = f["text"].(string)
+					case "error":
+						errs++
+						errName, _ = f["name"].(string)
+					}
+				}
+				// Daytona ends a failed run as "completed" too.
+				if res.text("control") != "completed" || res.closeCode != websocket.CloseNormalClosure ||
+					res.text("stdout") != r.stdout || result != r.result || r.fails != (errs == 1) || errName != r.errName {
+					t.Fatalf("%s run %q: frames %v close %d %q", tc.lang, r.code, res.frames, res.closeCode, res.closeReason)
+				}
+			}
+		})
+	}
+	// Each language ran in its own default context; python's is untouched.
+	if _, err := exec.LookPath("python3"); err != nil {
+		return
+	}
+	if res := e.run(t, ExecuteRequest{Code: "print('x' in dir())"}); res.text("stdout") != "False\n" {
+		t.Fatalf("python default context = %v", res.frames)
+	}
+}
+
 func TestPythonEndToEndSDK(t *testing.T) {
 	e := pythonEnv(t)
 	ci := sdkClient(e)
