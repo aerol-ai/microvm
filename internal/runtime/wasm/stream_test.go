@@ -507,3 +507,26 @@ func TestStreamCloseKillsARunThatHasNotExited(t *testing.T) {
 		t.Fatalf("%d slots held after every run closed", n)
 	}
 }
+
+// TestMaxStreamsPerSandbox: every run may use the sandbox's whole memory
+// limit, so the default cap is low (4); a configured cap is used as given
+// up to the worker's own ceiling, past which a start would fail in the
+// worker as a server error rather than as this cap's 429.
+func TestMaxStreamsPerSandbox(t *testing.T) {
+	for _, tc := range []struct {
+		configured, want int
+	}{
+		{0, 4},
+		{1, 1},
+		{12, 12},
+		{worker.MaxStreamsPerSandbox, worker.MaxStreamsPerSandbox},
+		{worker.MaxStreamsPerSandbox + 1, worker.MaxStreamsPerSandbox},
+	} {
+		if got := New(Config{MaxStreamsPerSandbox: tc.configured}, nil).maxStreamsPerSandbox(); got != tc.want {
+			t.Errorf("cap for %d = %d, want %d", tc.configured, got, tc.want)
+		}
+	}
+	if defaultMaxStreamsPerSandbox > worker.MaxStreamsPerSandbox {
+		t.Fatal("the default cap is above the worker's ceiling")
+	}
+}

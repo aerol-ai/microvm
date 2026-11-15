@@ -27,7 +27,13 @@ var ErrStreamingUnsupported = worker.ErrStreamingUnsupported
 // ErrStreamLimit means the sandbox already has MaxStreamsPerSandbox runs.
 var ErrStreamLimit = errors.New("wasm sandbox already runs the maximum number of processes")
 
-const defaultMaxStreamsPerSandbox = 8
+// defaultMaxStreamsPerSandbox caps the runs (exec streams, code-runs,
+// session commands, interpreter contexts) one sandbox may have at once.
+// Each run is its own guest instance with the sandbox's full memory limit,
+// while admission reserves that limit once for the sandbox: a sandbox can
+// use up to (cap + 1) times its limit on the node. The cap is what bounds
+// that until runs share a memory budget, so it is kept low.
+const defaultMaxStreamsPerSandbox = 4
 
 // StreamSpec describes one streaming run.
 type StreamSpec struct {
@@ -191,9 +197,12 @@ func (d *Driver) streamSlotFree(sandboxID string) bool {
 	return set == nil || set.count() < d.maxStreamsPerSandbox()
 }
 
+// maxStreamsPerSandbox is the configured cap, never above the worker's
+// own ceiling: past that the worker refuses a start, which would reach the
+// caller as a server error instead of the 429 this cap answers.
 func (d *Driver) maxStreamsPerSandbox() int {
 	if d.cfg.MaxStreamsPerSandbox > 0 {
-		return d.cfg.MaxStreamsPerSandbox
+		return min(d.cfg.MaxStreamsPerSandbox, worker.MaxStreamsPerSandbox)
 	}
 	return defaultMaxStreamsPerSandbox
 }

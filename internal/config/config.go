@@ -820,11 +820,13 @@ type Config struct {
 	// SB_WASM_STANDARD_MODULES; when unset it is derived from the standard
 	// modules (python, javascript via QuickJS, ruby). SB_WASM_CODERUN_MODULES.
 	WasmCodeRunModules map[string]string
-	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams and
-	// code-runs) one WASM sandbox may have at once. Each is a guest instance
-	// in the sandbox's worker; past the cap the toolbox answers HTTP 429.
-	// A worker never runs more than 32 per sandbox, whatever this says.
-	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
+	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams,
+	// code-runs, session commands, interpreter contexts) one WASM sandbox
+	// may have at once. Each is a guest instance in the sandbox's worker
+	// that may use the sandbox's whole memory limit, so the cap also bounds
+	// a sandbox's memory at (cap + 1) times its limit; past it the toolbox
+	// answers HTTP 429. Values above the worker's ceiling (32) count as 32.
+	// Default 4. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
 	// WasmStreamMaxMessageBytes caps one client message on a WASM exec
 	// stream (a stdin chunk or a control frame). The stream is served by
@@ -2712,7 +2714,7 @@ func load(keyTool bool) (Config, error) {
 		WasmRegistryAllowlist:     parseImageGCWhitelist(getEnv("SB_WASM_REGISTRY_ALLOWLIST", "")),
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
-		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 8),
+		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 4),
 		WasmStreamMaxMessageBytes: getEnvInt64("SB_WASM_STREAM_MAX_MESSAGE_BYTES", 1<<20),
 		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),

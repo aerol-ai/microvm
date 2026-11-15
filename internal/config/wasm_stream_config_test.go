@@ -55,8 +55,8 @@ func TestLoadWasmStreamSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.WasmMaxStreamsPerSandbox != 8 {
-		t.Fatalf("default stream cap = %d, want 8", cfg.WasmMaxStreamsPerSandbox)
+	if cfg.WasmMaxStreamsPerSandbox != 4 {
+		t.Fatalf("default stream cap = %d, want 4", cfg.WasmMaxStreamsPerSandbox)
 	}
 	if cfg.WasmStreamMaxMessageBytes != 1<<20 {
 		t.Fatalf("default stream message cap = %d, want 1 MiB", cfg.WasmStreamMaxMessageBytes)

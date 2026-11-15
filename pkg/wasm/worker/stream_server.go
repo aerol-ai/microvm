@@ -25,11 +25,16 @@ import (
 // guest. A MultiInstanceEngine gives each run its own instance on one
 // compiled module, so runs and the serving guest never touch each other.
 
+// MaxStreamsPerSandbox is the worker's own ceiling on one sandbox's live
+// runs. sandboxd enforces a lower, configurable cap first
+// (SB_WASM_MAX_STREAMS_PER_SANDBOX, default 4) and never sets it above this
+// one, which only stops a client that skips sandboxd's cap from exhausting
+// the worker. Each run is an instance with the sandbox's full memory limit.
+const MaxStreamsPerSandbox = 32
+
 var (
-	// maxStreamsPerSandbox is the worker's own ceiling. sandboxd enforces a
-	// lower, configurable cap first (SB_WASM_MAX_STREAMS_PER_SANDBOX); this
-	// one only stops a client that skips it from exhausting the worker.
-	maxStreamsPerSandbox = 32
+	// maxStreamsPerSandbox is MaxStreamsPerSandbox, lowered by tests.
+	maxStreamsPerSandbox = MaxStreamsPerSandbox
 	// auxIdleTTL keeps a compiled aux module around between runs, so back
 	// to back code-runs pay an Instantiate instead of a compile.
 	auxIdleTTL = 2 * time.Minute

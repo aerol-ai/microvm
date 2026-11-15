@@ -24,9 +24,11 @@ type Config struct {
 	// ResidentHostIdleTTL reaps a resident host holding zero instances for this
 	// long; 0 disables the reaper (SB_WASM_RESIDENT_HOST_IDLE_TTL).
 	ResidentHostIdleTTL time.Duration
-	// MaxStreamsPerSandbox caps live streaming runs (exec streams and
-	// code-runs) per sandbox; 0 means defaultMaxStreamsPerSandbox.
-	// SB_WASM_MAX_STREAMS_PER_SANDBOX.
+	// MaxStreamsPerSandbox caps live streaming runs (exec streams,
+	// code-runs, session commands, interpreter contexts) per sandbox; 0
+	// means defaultMaxStreamsPerSandbox, and it never goes past the
+	// worker's worker.MaxStreamsPerSandbox. Each run may use the sandbox's
+	// whole memory limit. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	MaxStreamsPerSandbox int
 	// StreamMaxMessageBytes caps one client message on an exec stream (a
 	// stdin chunk or a control frame); 0 means toolhost's 1 MiB.
