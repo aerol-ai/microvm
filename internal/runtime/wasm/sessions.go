@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/logring"
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/toolhost"
@@ -45,6 +46,11 @@ const (
 	// queued without end, and at most this many queue per command.
 	maxFollowersPerCommand = 8
 	followerQueueBytes     = 256 << 10
+
+	// defaultSessionInputWait is how long /input waits for a command to
+	// take its bytes. A command that does not read its stdin would
+	// otherwise hold the request, and its body, for as long as it runs.
+	defaultSessionInputWait = 10 * time.Second
 )
 
 // sessionLimits are the caps (Config.Session*), defaults filled in.
@@ -53,14 +59,17 @@ type sessionLimits struct {
 	sessions int   // sessions per sandbox
 	kept     int   // finished commands kept per session; also commands waiting
 	budget   int64 // log storage per sandbox
+	// inputWait bounds an /input write (defaultSessionInputWait).
+	inputWait time.Duration
 }
 
 func (d *Driver) sessionLimits() sessionLimits {
 	l := sessionLimits{
-		logBytes: d.cfg.SessionLogBytes,
-		sessions: d.cfg.MaxSessionsPerSandbox,
-		kept:     d.cfg.SessionCommandsKept,
-		budget:   d.cfg.SessionLogBudget,
+		logBytes:  d.cfg.SessionLogBytes,
+		sessions:  d.cfg.MaxSessionsPerSandbox,
+		kept:      d.cfg.SessionCommandsKept,
+		budget:    d.cfg.SessionLogBudget,
+		inputWait: defaultSessionInputWait,
 	}
 	if l.logBytes <= 0 {
 		l.logBytes = defaultSessionLogBytes
@@ -119,8 +128,10 @@ const (
 )
 
 type sessionCommand struct {
-	id       string
-	text     string
+	id   string
+	text string
+	// argv is what the run starts with; it goes once the run has started
+	// or failed to, so a kept command holds its text once, not twice.
 	argv     []string
 	state    commandState
 	exitCode int32
@@ -129,10 +140,11 @@ type sessionCommand struct {
 	// followers are live log subscribers; nil once the command ended.
 	followers map[*logFollower]struct{}
 	run       *Stream
-	// stdinMu orders input writes, which happen outside the set's lock:
-	// a write blocks while the guest is not reading.
-	stdinMu  sync.Mutex
-	retained *list.Element
+	// stdinBusy is held by the one input write in flight, which happens
+	// outside the set's lock: a write blocks while the guest is not
+	// reading. Another input is refused while it is held, never queued.
+	stdinBusy chan struct{}
+	retained  *list.Element
 }
 
 // logFollower is one live subscriber's queue. Frames are queued under the
@@ -340,7 +352,8 @@ func (s *sessionSet) exec(ctx context.Context, sessionID string, cmd toolhost.Se
 		return toolhost.CommandResult{}, toolhost.ErrTooManyCommands
 	}
 	idle := sess.unfinished == 0
-	c := &sessionCommand{id: newSessionCommandID(), text: cmd.Text, argv: cmd.Argv, followers: map[*logFollower]struct{}{}}
+	c := &sessionCommand{id: newSessionCommandID(), text: cmd.Text, argv: cmd.Argv,
+		followers: map[*logFollower]struct{}{}, stdinBusy: make(chan struct{}, 1)}
 	sess.commands[c.id] = c
 	sess.order = append(sess.order, c)
 	sess.unfinished++
@@ -373,11 +386,13 @@ func (s *sessionSet) begin(ctx context.Context, sess *session, c *sessionCommand
 		return nil, ctx.Err()
 	}
 	run, err := s.start(ctx, c.argv)
+	s.mu.Lock()
+	c.argv = nil
 	if err != nil {
+		s.mu.Unlock()
 		<-sess.turn
 		return nil, err
 	}
-	s.mu.Lock()
 	if sess.deleted {
 		s.mu.Unlock()
 		killRun(run)
@@ -685,9 +700,15 @@ func (s *sessionSet) unfollow(c *sessionCommand, f *logFollower) {
 	f.left, f.queue, f.queued = true, nil, 0
 }
 
-// input writes to the running command's stdin. It blocks while the guest
-// does not read; deleting the session or stopping the sandbox frees it.
-func (s *sessionSet) input(sessionID, commandID string, data []byte) error {
+// input writes to the running command's stdin. The write itself blocks
+// while the guest does not read, so it runs on its own goroutine and the
+// caller waits for it at most inputWait, or until ctx ends: past that the
+// write stays pending (holding data, the command's one input in flight)
+// until the command reads it or ends, and further input is refused with
+// ErrInputPending instead of queuing. Ending the command (it exits, its
+// session is deleted, the sandbox stops) closes its run, which fails the
+// pending write.
+func (s *sessionSet) input(ctx context.Context, sessionID, commandID string, data []byte) error {
 	s.mu.Lock()
 	_, c, err := s.lookup(sessionID, commandID)
 	if err != nil {
@@ -700,9 +721,23 @@ func (s *sessionSet) input(sessionID, commandID string, data []byte) error {
 		return toolhost.ErrCommandNotRunning
 	}
 	s.mu.Unlock()
-	c.stdinMu.Lock()
-	defer c.stdinMu.Unlock()
-	if err := run.WriteStdin(data); err != nil {
+	select {
+	case c.stdinBusy <- struct{}{}:
+	default:
+		return toolhost.ErrInputPending
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer func() { <-c.stdinBusy }()
+		done <- run.WriteStdin(data)
+	}()
+	wait := time.NewTimer(s.limits.inputWait)
+	defer wait.Stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			return nil
+		}
 		// The command ended between the check and the write: the caller
 		// gets the same answer as if it had asked a moment later.
 		s.mu.Lock()
@@ -711,8 +746,11 @@ func (s *sessionSet) input(sessionID, commandID string, data []byte) error {
 			return toolhost.ErrCommandNotRunning
 		}
 		return err
+	case <-wait.C:
+		return toolhost.ErrInputTimeout
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return nil
 }
 
 // sessionsFor is the sandbox's session set, made on first use.

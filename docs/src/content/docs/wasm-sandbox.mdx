@@ -179,6 +179,8 @@ Each command is a run of the sandbox's own module, with your command line as its
 - **The same limit as streamed commands.** A running session command counts toward the 8 streamed commands and code runs a sandbox can have. One more fails with HTTP 429.
 - **Logs are capped.** The server keeps the last 1 MB of each command's output and of its error output. A longer log starts partway through, but its offsets still count from the start of the output.
 - **A sandbox has at most 16 sessions,** and each session keeps its last 64 finished commands.
+- **Size limits.** A command line can be up to 64 KB, a session id up to 128 characters, and a request up to 1 MB. Past these the server answers HTTP 400 (413 for a request that is too large).
+- **Input waits up to 10 seconds.** If the command has not read your input by then, the call fails with HTTP 408, and the input stays queued for the command. More input sent before the command reads it fails with HTTP 409.
 - **Sessions end with the sandbox.** Stopping, passivating or moving the sandbox ends them, as on other sandboxes.
 
 The entrypoint session (`process.getEntrypointSession`, `process.getEntrypointLogs`) is the sandbox's web server: the run of the module that serves its public port. Its logs are the last 1 MB that server printed. A sandbox that does not serve a port has no entrypoint, so these calls fail with HTTP 404.

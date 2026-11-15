@@ -61,7 +61,7 @@ func TestSessionsOnTheStdioGuest(t *testing.T) {
 		info, _ := set.command("s", echo)
 		return info.Running
 	})
-	if err := set.input("s", echo, []byte("ping\n")); err != nil {
+	if err := set.input(context.Background(), "s", echo, []byte("ping\n")); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "echoed input", func() bool {

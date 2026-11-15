@@ -79,12 +79,12 @@ func (s sandboxSessions) Follow(sessionID, commandID string) (*toolhost.LogFollo
 	return set.follow(sessionID, commandID)
 }
 
-func (s sandboxSessions) Input(sessionID, commandID string, data []byte) error {
+func (s sandboxSessions) Input(ctx context.Context, sessionID, commandID string, data []byte) error {
 	set, err := s.driver.sessionsFor(s.id)
 	if err != nil {
 		return err
 	}
-	return set.input(sessionID, commandID, data)
+	return set.input(ctx, sessionID, commandID, data)
 }
 
 func (s sandboxSessions) Entrypoint(ctx context.Context, logs bool) (toolhost.EntrypointInfo, error) {

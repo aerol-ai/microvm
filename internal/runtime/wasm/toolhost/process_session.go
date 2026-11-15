@@ -3,6 +3,8 @@ package toolhost
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -34,6 +36,35 @@ var logsUpgrader = toolboxwire.NewLogsUpgrader()
 
 // followCloseWait bounds the close frame sent after a follow ends.
 const followCloseWait = time.Second
+
+// Request caps. These routes run in sandboxd, and what a session keeps
+// (its id, each command's text) stays in sandboxd's heap until the
+// session or the command is dropped, so each is bounded where it enters.
+var (
+	// sessionMaxBody caps every session request body; an input's data is
+	// the only part that can use most of it.
+	sessionMaxBody int64 = 1 << 20
+	// sessionMaxCommand caps a command line, which the session keeps (as
+	// the text it lists) with every command it remembers.
+	sessionMaxCommand = 64 << 10
+	// sessionMaxID caps a session id, as models caps a sandbox id.
+	sessionMaxID = 128
+)
+
+// decodeSessionBody decodes a capped JSON body, answering 413 past the cap
+// and 400 for anything else that is not JSON.
+func decodeSessionBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, sessionMaxBody)).Decode(v); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body is larger than %d bytes", sessionMaxBody))
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
 
 func (h *Host) handleProcessSession(w http.ResponseWriter, r *http.Request) {
 	if h.sessions == nil {
@@ -144,13 +175,16 @@ func (h *Host) handleSessionCommandRoute(w http.ResponseWriter, r *http.Request,
 
 func (h *Host) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	var req toolboxwire.CreateSessionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeSessionBody(w, r, &req) {
 		return
 	}
 	sessionID := strings.TrimSpace(req.SessionID)
 	if sessionID == "" {
 		writeError(w, http.StatusBadRequest, "sessionId is required")
+		return
+	}
+	if len(sessionID) > sessionMaxID {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("sessionId is longer than %d bytes", sessionMaxID))
 		return
 	}
 	if sessionID == toolboxwire.EntrypointSessionID {
@@ -177,13 +211,16 @@ func (h *Host) handleSessionExec(w http.ResponseWriter, r *http.Request, session
 		return
 	}
 	var req toolboxwire.SessionExecuteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeSessionBody(w, r, &req) {
 		return
 	}
 	text := strings.TrimSpace(req.Command)
 	if text == "" {
 		writeError(w, http.StatusBadRequest, "command is required")
+		return
+	}
+	if len(text) > sessionMaxCommand {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("command is longer than %d bytes", sessionMaxCommand))
 		return
 	}
 	argv, err := splitShellWords(text)
@@ -237,6 +274,10 @@ func (h *Host) handleSessionCommandLogs(w http.ResponseWriter, r *http.Request, 
 
 // handleSessionCommandInput writes a line to the running command's stdin.
 // The checks run in toolboxd's order: command, then running, then body.
+// Unlike toolboxd's pipe write, it never waits without end on a command
+// that does not read: it answers 408 once the input has waited too long,
+// 409 while an earlier input still waits, and gives up when the client
+// does.
 func (h *Host) handleSessionCommandInput(w http.ResponseWriter, r *http.Request, sessionID, commandID string) {
 	info, err := h.sessions.Command(sessionID, commandID)
 	if err != nil {
@@ -248,11 +289,10 @@ func (h *Host) handleSessionCommandInput(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	var req toolboxwire.SessionInputRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeSessionBody(w, r, &req) {
 		return
 	}
-	if err := h.sessions.Input(sessionID, commandID, []byte(req.Line())); err != nil {
+	if err := h.sessions.Input(r.Context(), sessionID, commandID, []byte(req.Line())); err != nil {
 		writeSessionError(w, err)
 		return
 	}

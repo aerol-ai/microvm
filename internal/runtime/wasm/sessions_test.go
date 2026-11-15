@@ -246,7 +246,7 @@ func TestSessionInputAndLogs(t *testing.T) {
 	cmd := e.exec(t, "s", "mod echo", true).ID
 	run := e.stream(t, 0)
 
-	if err := e.set.input("s", cmd, []byte("hi\n")); err != nil {
+	if err := e.set.input(context.Background(), "s", cmd, []byte("hi\n")); err != nil {
 		t.Fatal(err)
 	}
 	run.mu.Lock()
@@ -279,20 +279,20 @@ func TestSessionInputAndLogs(t *testing.T) {
 	if out, _, _ := e.set.logs("s", cmd, toolboxwire.LogQuery{StdoutOffset: 6}); out.Text != "?" || out.End != 7 {
 		t.Fatalf("finished partial character = %+v", out)
 	}
-	if err := e.set.input("s", cmd, []byte("late\n")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
+	if err := e.set.input(context.Background(), "s", cmd, []byte("late\n")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
 		t.Fatalf("input after the end = %v", err)
 	}
 	if _, _, err := e.set.logs("s", "nope", toolboxwire.LogQuery{}); !errors.Is(err, toolhost.ErrCommandNotFound) {
 		t.Fatalf("logs of a missing command = %v", err)
 	}
-	if err := e.set.input("nope", cmd, nil); !errors.Is(err, toolhost.ErrSessionNotFound) {
+	if err := e.set.input(context.Background(), "nope", cmd, nil); !errors.Is(err, toolhost.ErrSessionNotFound) {
 		t.Fatalf("input to a missing session = %v", err)
 	}
 
 	// A command waiting for its turn takes no input either.
 	blocker := e.exec(t, "s", "mod block", true).ID
 	waiting := e.exec(t, "s", "mod next", true).ID
-	if err := e.set.input("s", waiting, []byte("x")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
+	if err := e.set.input(context.Background(), "s", waiting, []byte("x")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
 		t.Fatalf("input to a waiting command = %v", err)
 	}
 	e.stream(t, 1).events <- exitEvent(0)
@@ -311,7 +311,7 @@ func TestSessionInputRacingTheEnd(t *testing.T) {
 	run.mu.Lock()
 	run.stdinErr = errors.New("connection closed")
 	run.mu.Unlock()
-	if err := e.set.input("s", cmd, []byte("x")); err == nil || errors.Is(err, toolhost.ErrCommandNotRunning) {
+	if err := e.set.input(context.Background(), "s", cmd, []byte("x")); err == nil || errors.Is(err, toolhost.ErrCommandNotRunning) {
 		t.Fatalf("write error on a running command = %v, want it passed on", err)
 	}
 	run.events <- exitEvent(0)
@@ -330,7 +330,7 @@ func TestSessionInputRacingTheEnd(t *testing.T) {
 		e.set.mu.Unlock()
 	}
 	run.mu.Unlock()
-	if err := e.set.input("s", cmd, []byte("x")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
+	if err := e.set.input(context.Background(), "s", cmd, []byte("x")); !errors.Is(err, toolhost.ErrCommandNotRunning) {
 		t.Fatalf("write racing the end = %v", err)
 	}
 }
@@ -766,11 +766,138 @@ func TestSessionSyncExecCallerLeavesWhileWaiting(t *testing.T) {
 
 func TestSessionLimitsDefaults(t *testing.T) {
 	got := New(Config{}, nil).sessionLimits()
-	if got != (sessionLimits{logBytes: 1 << 20, sessions: 16, kept: 64, budget: 16 << 20}) {
+	if got != (sessionLimits{logBytes: 1 << 20, sessions: 16, kept: 64, budget: 16 << 20, inputWait: defaultSessionInputWait}) {
 		t.Fatalf("defaults = %+v", got)
 	}
 	got = New(Config{SessionLogBytes: 1, MaxSessionsPerSandbox: 2, SessionCommandsKept: 3, SessionLogBudget: 4}, nil).sessionLimits()
-	if got != (sessionLimits{logBytes: 1, sessions: 2, kept: 3, budget: 4}) {
+	if got != (sessionLimits{logBytes: 1, sessions: 2, kept: 3, budget: 4, inputWait: defaultSessionInputWait}) {
 		t.Fatalf("configured = %+v", got)
+	}
+}
+
+// TestSessionInputNeverHangs: input to a command that does not read its
+// stdin holds no request. The caller waits at most inputWait (408) or
+// until it leaves; the write stays pending, and input sent while it is
+// pending is refused at once (409) rather than queued with its body. The
+// pending write ends with the command.
+func TestSessionInputNeverHangs(t *testing.T) {
+	e := newSessionEnv(t, Config{})
+	_, _ = e.set.create("a")
+	_, _ = e.set.create("b")
+	stuck := func(session string, i int) (string, *fakeExecStream) {
+		id := e.exec(t, session, "mod block", true).ID
+		run := e.stream(t, i)
+		run.mu.Lock()
+		run.onStdin = func() { <-run.closed } // the guest never reads
+		run.mu.Unlock()
+		return id, run
+	}
+	input := func(ctx context.Context, session, cmd string) <-chan error {
+		out := make(chan error, 1)
+		go func() { out <- e.set.input(ctx, session, cmd, []byte("x\n")) }()
+		return out
+	}
+	within := func(what string, ch <-chan error, d time.Duration) error {
+		t.Helper()
+		select {
+		case err := <-ch:
+			return err
+		case <-time.After(d):
+			t.Fatalf("%s: input still waiting after %s", what, d)
+			return nil
+		}
+	}
+
+	// A caller that leaves gets its context's error at once.
+	e.set.limits.inputWait = time.Hour
+	cmdA, runA := stuck("a", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	pending := input(ctx, "a", cmdA)
+	waitFor(t, "the write to start", func() bool { runA.mu.Lock(); defer runA.mu.Unlock(); return len(runA.stdin) > 0 })
+	cancel()
+	if err := within("cancelled", pending, 5*time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled input = %v", err)
+	}
+	// Its write is still pending: the next input is refused, not queued.
+	if err := within("second", input(context.Background(), "a", cmdA), time.Second); !errors.Is(err, toolhost.ErrInputPending) {
+		t.Fatalf("input behind a pending one = %v, want ErrInputPending", err)
+	}
+
+	// A caller that stays gets 408 after inputWait.
+	e.set.limits.inputWait = 50 * time.Millisecond
+	cmdB, _ := stuck("b", 1)
+	if err := within("timed", input(context.Background(), "b", cmdB), 5*time.Second); !errors.Is(err, toolhost.ErrInputTimeout) {
+		t.Fatalf("input the command never reads = %v, want ErrInputTimeout", err)
+	}
+
+	// The command ends: its pending write fails and frees the slot.
+	runA.events <- exitEvent(0)
+	e.waitExit(t, "a", cmdA)
+	if err := within("after the end", input(context.Background(), "a", cmdA), time.Second); !errors.Is(err, toolhost.ErrCommandNotRunning) {
+		t.Fatalf("input after the end = %v", err)
+	}
+	e.set.mu.Lock()
+	c := e.set.sessions["a"].commands[cmdA]
+	e.set.mu.Unlock()
+	waitFor(t, "the pending write to end", func() bool { return len(c.stdinBusy) == 0 })
+}
+
+// TestSessionCommandKeepsItsTextOnce: a command's argv goes once its run
+// has started or failed to start, so a kept command holds its text once.
+// A queued async command whose start fails is a finished command like any
+// other: the finished-command cap drops the oldest of them.
+func TestSessionCommandKeepsItsTextOnce(t *testing.T) {
+	e := newSessionEnv(t, Config{SessionCommandsKept: 3})
+	_, _ = e.set.create("s")
+	argvOf := func(id string) []string {
+		e.set.mu.Lock()
+		defer e.set.mu.Unlock()
+		if c := e.set.sessions["s"].commands[id]; c != nil {
+			return c.argv
+		}
+		return nil
+	}
+	failStarts := func(fail bool) {
+		e.fake.mu.Lock()
+		defer e.fake.mu.Unlock()
+		e.fake.startErr = nil
+		if fail {
+			e.fake.startErr = errors.New("no free slot")
+		}
+	}
+	var last []string
+	for round := 0; round < 3; round++ {
+		failStarts(false)
+		blocker := e.exec(t, "s", "mod block", true).ID
+		run := e.stream(t, round)
+		if argv := argvOf(blocker); argv != nil {
+			t.Fatalf("started command keeps argv %q", argv)
+		}
+		// Two commands queue behind it, then fail to start.
+		queued := []string{
+			e.exec(t, "s", "mod queued "+strings.Repeat("x", 1024), true).ID,
+			e.exec(t, "s", "mod queued "+strings.Repeat("y", 1024), true).ID,
+		}
+		failStarts(true)
+		run.events <- exitEvent(0)
+		e.waitExit(t, "s", blocker)
+		for _, id := range queued {
+			if code := e.waitExit(t, "s", id); code != -1 {
+				t.Fatalf("refused start exit = %d", code)
+			}
+			if argv := argvOf(id); argv != nil {
+				t.Fatalf("refused command keeps argv %q", argv)
+			}
+		}
+		last = append([]string{blocker}, queued...)
+	}
+	info, _ := e.set.get("s")
+	if len(info.Commands) != 3 {
+		t.Fatalf("session keeps %d commands, want the 3 newest", len(info.Commands))
+	}
+	for i, c := range info.Commands {
+		if c.ID != last[i] {
+			t.Fatalf("kept %s at %d, want %s", c.ID, i, last[i])
+		}
 	}
 }
