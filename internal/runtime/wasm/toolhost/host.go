@@ -3,9 +3,11 @@
 package toolhost
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -16,15 +18,25 @@ type Host struct {
 	authToken string
 	exec      Executor
 	stateKV   StateKV
+	procs     Processes
+	liveness  toolboxwire.Liveness
 }
 
-// Config wires a toolbox host for one sandbox.
+// Config wires a toolbox host for one sandbox. The host is rebuilt for every
+// request, so anything that outlives one (live runs, their cap) is owned by
+// the driver behind Procs.
 type Config struct {
 	SandboxID string
 	WorkDir   string
 	AuthToken string
 	Exec      Executor
 	StateKV   StateKV
+	// Procs runs the exec stream and code-run inside the wasm engine. Nil
+	// answers those routes with 501.
+	Procs Processes
+	// StreamLiveness overrides the exec stream keepalive (tests); zero
+	// keeps toolboxwire.DefaultLiveness.
+	StreamLiveness toolboxwire.Liveness
 }
 
 // New constructs a toolbox host.
@@ -35,6 +47,8 @@ func New(cfg Config) *Host {
 		authToken: cfg.AuthToken,
 		exec:      cfg.Exec,
 		stateKV:   cfg.StateKV,
+		procs:     cfg.Procs,
+		liveness:  cfg.StreamLiveness,
 	}
 }
 
@@ -159,7 +173,10 @@ func (h *Host) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	}
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != h.authToken {
+	// Constant time, so response timing does not leak how much of a guessed
+	// token matched.
+	presented := strings.TrimPrefix(authorization, prefix)
+	if !strings.HasPrefix(authorization, prefix) || subtle.ConstantTimeCompare([]byte(presented), []byte(h.authToken)) != 1 {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}

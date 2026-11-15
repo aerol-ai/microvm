@@ -10,6 +10,8 @@
 //	block             read stdin until it fails; exit 0 on EOF, 3 on an error
 //	flood N           write N bytes of 'x' to stdout (N = 0: forever)
 //	write-work F T    write T to /work/F
+//	write-file P T    write T to the absolute path P (confinement tests)
+//	read-file P       print the file at the absolute path P
 //	env [KEY]         print KEY's value, or every KEY=VALUE line
 //	args              print each argument after the mode on its own line
 //	dial ADDR         dial ADDR through aerol/vm/net and print "dial=<code>"
@@ -80,6 +82,24 @@ func main() {
 			fmt.Fprintln(os.Stderr, "write:", err)
 			os.Exit(1)
 		}
+	case "write-file":
+		if len(rest) != 2 {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(rest[0], []byte(rest[1]), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "write:", err)
+			os.Exit(1)
+		}
+	case "read-file":
+		if len(rest) != 1 {
+			os.Exit(2)
+		}
+		b, err := os.ReadFile(rest[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "read:", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(b)
 	case "env":
 		if len(rest) > 0 {
 			fmt.Print(os.Getenv(rest[0]))

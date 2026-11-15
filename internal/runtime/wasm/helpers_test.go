@@ -114,9 +114,15 @@ func TestFromDaemonConfig(t *testing.T) {
 		WasmDefaultMemoryMB: 128,
 		WasmDefaultTimeout:  time.Minute,
 		WasmDrainTimeout:    30 * time.Second,
+		// Streaming runs (issue #535).
+		WasmMaxStreamsPerSandbox: 3,
+		WasmCodeRunModules:       map[string]string{"python": "python"},
 	})
 	if cfg.RunDir != "/run" || cfg.ModulesDir != "/mods" || cfg.DefaultMemoryMB != 128 {
 		t.Fatalf("cfg = %+v", cfg)
+	}
+	if cfg.MaxStreamsPerSandbox != 3 || cfg.CodeRunModules["python"] != "python" {
+		t.Fatalf("stream settings = %+v", cfg)
 	}
 }
 

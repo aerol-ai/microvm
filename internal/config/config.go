@@ -823,6 +823,7 @@ type Config struct {
 	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams and
 	// code-runs) one WASM sandbox may have at once. Each is a guest instance
 	// in the sandbox's worker; past the cap the toolbox answers HTTP 429.
+	// A worker never runs more than 32 per sandbox, whatever this says.
 	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
 	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
