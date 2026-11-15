@@ -24,6 +24,8 @@ func killCgroupStray(int) error { return errVMMAdoptionUnsupported }
 
 func procCmdline(int) ([]string, error) { return nil, errVMMAdoptionUnsupported }
 
+func vmmProcessGroup(int) (string, bool, error) { return "", false, errVMMAdoptionUnsupported }
+
 func setVMMGroupFrozen(string, bool) error {
 	return fmt.Errorf("%w: %w", errVMMAdoptionUnsupported, sbruntime.ErrCannotFreeze)
 }

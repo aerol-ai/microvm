@@ -12,30 +12,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## Recreate-policy WASM and isolate sandboxes made before the refusal run unfenced (cluster, Kubernetes)
-
-- **What:** on a node with `SB_OWNERSHIP_LEASE_FILE` (a Kubernetes worker), a
-  `failover.policy=recreate` create of WASM or a V8 isolate (or of
-  Firecracker when its VMs' cgroup is outside the sandboxes' parent) is now
-  refused, because the runtime supervisor cannot freeze one such sandbox
-  alone (`internal/service/ownership_lease_runtimes.go`,
-  `refuseUnfencedRecreate`). Rows made before that change keep running on
-  such nodes, and their lease-file entry names a group that does not exist,
-  so the supervisor freezes nothing for them. `StartOwnershipLease` only
-  warns, once, with their count and up to five IDs (`warnUnfencedRecreate`).
-- **Why:** if the node loses its lease, such a sandbox runs on while the
-  cluster recreates it elsewhere: two copies, the split brain the lease
-  exists to stop (review N2). New creates are closed; existing rows are not.
-- **Fix sketch:** at lease start, for each such row, either drop its
-  failover policy in the row and in the cluster's replicated spec (an
-  audited "failover.policy=none: this runtime cannot be fenced here" change
-  the owner can see), or stop it with a clear status reason until the owner
-  recreates it. Decide which with the product owner; neither may stop a
-  running workload silently.
-- **Effort:** human S / CC S. **Priority:** P2.
-
----
-
 ## An orphaned recreate-policy sandbox answers 410 while it waits for room (API, cluster)
 
 - **What:** a `failover.policy=recreate` sandbox orphaned because no node had
@@ -912,6 +888,13 @@ the skip.
 ---
 
 ## Done
+
+## Recreate-policy WASM and isolate sandboxes made before the refusal run unfenced (cluster, Kubernetes)
+
+- **Done (review V4):** on a node with `SB_OWNERSHIP_LEASE_FILE`, `StartOwnershipLease` turns off the recreate policy of every sandbox the runtime supervisor cannot freeze alone (WASM, V8 isolates, Firecracker outside the sandboxes' parent, and a running VM whose move into its own group failed): the cluster's spec first (an ordinary opUpsertSpec, so no leader recreates it), then the row, the status reason `failover_disabled`, a `SYSTEM failover.disabled` record and a log line. Retried every lease/3 until the control plane answers; until then a lease that runs out stops such a sandbox (`ownership_lease_expired`). A new recreate-policy VM outside its own group does not run (`recreateFenceReady`). `internal/service/ownership_lease_runtimes.go`: `disarmUnfencedRecreate`, `stopUnfenceable`, `recreateFenceReady`; `internal/runtime/firecracker/vmm_adopt.go`: `FenceReady`. The product owner chose "turn off failover" over stopping them.
+
+---
+
 
 Kept for the record. Each entry names the fix and where it lives.
 

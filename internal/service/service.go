@@ -3461,6 +3461,14 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
 	}
+	// A failover.policy=recreate VM that did not reach its own group, on a
+	// node that writes the lease file, cannot be frozen alone (review V4).
+	// Refused before its row exists, so the create's rollback destroys the
+	// VM: the same answer refuseUnfencedRecreate gives by config, here from
+	// where the VM actually runs. One small /proc read, for such VMs only.
+	if err := s.recreateFenceReady(sandbox); err != nil {
+		return err
+	}
 	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
 		sandbox.CreateRequestDigest = digests[0]
 	}
@@ -4102,6 +4110,17 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 	sandbox.UpdatedAt = time.Now().UTC()
 	if cause != startForRestart {
 		sandbox.LastActiveAt = time.Now().UTC()
+	}
+	// A failover.policy=recreate VM that did not reach its own group, on a
+	// node that writes the lease file, cannot be frozen alone if this node
+	// loses its lease (review V4): it does not run here. Rolled back as a
+	// failed egress restore is. One small /proc read, for such VMs only.
+	if err := s.recreateFenceReady(sandbox); err != nil {
+		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+		_ = s.mounts.UnmountAll(id)
+		releaseAdmission()
+		_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+		return nil, err
 	}
 	// Put the stored egress policy back before the start reports success or
 	// publishes a route: the stop event cleared it, since the IP can be

@@ -217,13 +217,14 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.resumeMovedIn(ctx)
 	// The move fences a previous process left in the rows (R11).
 	s.rearmMoveFences(ctx)
-	// Recreate-policy sandboxes made before creates of them were refused
-	// here, on a runtime the supervisor cannot freeze alone.
-	s.warnUnfencedRecreate(ctx)
 
 	lease := cluster.OwnershipLease(s.cfg)
 	probe := max(lease/3, 10*time.Millisecond)
 	check := max(lease/15, 10*time.Millisecond)
+	// Recreate-policy sandboxes made before creates of them were refused
+	// here, on a runtime the supervisor cannot freeze alone: their policy
+	// is turned off, retried every probe until the cluster takes it (V4).
+	s.startDisarmUnfencedRecreate(ctx, probe)
 	s.startPeriodic(ctx, probe, probe, func(c context.Context) {
 		_ = s.confirmOwnership(c, time.Now())
 	})
@@ -588,6 +589,12 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	}
 	fr, ok := rt.(runtime.Freezer)
 	if !ok {
+		// On a node that writes the lease file it is stopped instead
+		// (V4); a stop that failed is tried again at the next check.
+		if s.ownershipLeaseFileOn() {
+			s.stopUnfenceable(ctx, sb)
+			return
+		}
 		s.ownership.mu.Lock()
 		f.cannotFreeze = true
 		s.ownership.mu.Unlock()
@@ -599,6 +606,10 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	}
 	if err := fr.Freeze(ctx, s.runtimeRef(sb)); err != nil {
 		if errors.Is(err, runtime.ErrCannotFreeze) {
+			if s.ownershipLeaseFileOn() {
+				s.stopUnfenceable(ctx, sb)
+				return
+			}
 			// This one cannot be frozen where it runs (a Firecracker VM
 			// with no group of its own): refused, as for a runtime with no
 			// Freezer, not retried every check.
