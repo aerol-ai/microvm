@@ -855,6 +855,11 @@ type Config struct {
 	// WasmEngine selects the guest engine backend (wazero or wasmtime). Default wazero.
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
+	// WasmWasmtimeListenFallback moves a sandbox on the wasmtime engine to
+	// wazero when it exposes a port: no wasmtime release can pre-open a
+	// guest listener (#175). Off keeps the old error. Default true.
+	// SB_WASM_WASMTIME_LISTEN_FALLBACK.
+	WasmWasmtimeListenFallback bool
 	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
 	// SB_WASM_MAX_INSTANCES.
 	WasmMaxInstances int
@@ -2790,6 +2795,7 @@ func load(keyTool bool) (Config, error) {
 		FirecrackerRSSSamplerInterval:    getEnvDuration("SB_FIRECRACKER_RSS_SAMPLER_INTERVAL", 1*time.Second),
 		FirecrackerRSSWatermarkRatio:     getEnvFloat("SB_FIRECRACKER_RSS_WATERMARK_RATIO", 0),
 	}
+	cfg.WasmWasmtimeListenFallback = getEnvBool("SB_WASM_WASMTIME_LISTEN_FALLBACK", true)
 	if cfg.OTELMetricsEndpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) != "" {
 		cfg.OTELMetricsEnabled = true
 	}

@@ -33,8 +33,10 @@ type Engine interface {
 	ResolvedListenPort() (int, bool)
 	// SupportsListen reports whether the engine can host a wasip1 TCP listener
 	// (the HTTP ingress / expose_port path). wazero can; the wasmtime backend
-	// cannot yet (see plans/wasm-runtime.md "Still open"). Callers must reject
-	// listen requests up front rather than silently failing to resolve a port.
+	// cannot (no wasmtime release can pre-open a listener for a WASI guest),
+	// so the worker moves such a sandbox to wazero or, with that fallback
+	// off, rejects the request up front rather than silently failing to
+	// resolve a port (worker/listen_engine.go).
 	SupportsListen() bool
 }
 

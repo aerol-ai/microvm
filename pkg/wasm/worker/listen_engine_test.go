@@ -2,6 +2,7 @@ package worker
 
 import (
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -20,5 +21,14 @@ func TestLoadedEngineName(t *testing.T) {
 	s.noteLoadedLocked(loadModulePayload{Path: "/other.wasm"}, errors.New("compile"))
 	if s.loaded.modulePath != "" {
 		t.Fatalf("after a failed load: %+v", s.loaded)
+	}
+}
+
+// The fallback setting reaches worker processes through their allowlisted
+// environment.
+func TestWorkerEnvironmentCarriesListenFallback(t *testing.T) {
+	t.Setenv(ListenFallbackEnv, "false")
+	if !slices.Contains(workerEnvironment(), ListenFallbackEnv+"=false") {
+		t.Fatalf("worker environment lacks %s", ListenFallbackEnv)
 	}
 }

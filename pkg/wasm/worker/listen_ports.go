@@ -219,7 +219,7 @@ func (s *Server) listenReport() listenPortsPayload {
 // listenReportLocked reports the live listeners of the running instance.
 // The caller holds mu.
 func (s *Server) listenReportLocked() listenPortsPayload {
-	report := listenPortsPayload{Engine: s.engineNameLocked()}
+	report := listenPortsPayload{Engine: s.engineNameLocked(), FallbackFrom: s.loaded.fallbackFrom}
 	if s.eng == nil {
 		return report
 	}

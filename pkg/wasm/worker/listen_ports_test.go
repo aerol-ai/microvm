@@ -113,7 +113,7 @@ func TestSetListenPortsErrors(t *testing.T) {
 		{"bad payload", &Server{eng: &fakeMultiListenEngine{}}, []byte(`{`), "unexpected"},
 		{"bad port", &Server{eng: &fakeMultiListenEngine{}}, mustPayload(t, setListenPortsPayload{Ports: []int{70000}}), "invalid listen port"},
 		{"no engine", &Server{}, mustPayload(t, setListenPortsPayload{Ports: []int{8080}}), "engine not loaded"},
-		{"engine cannot listen", &Server{eng: &fakeMultiListenEngine{noListen: true}}, mustPayload(t, setListenPortsPayload{Ports: []int{8080}}), "not supported"},
+		{"engine cannot listen and has no module to move", &Server{eng: &fakeMultiListenEngine{noListen: true}}, mustPayload(t, setListenPortsPayload{Ports: []int{8080}}), "no module loaded"},
 		{"instantiate fails", &Server{eng: &fakeMultiListenEngine{instErr: errors.New("boom")}}, mustPayload(t, setListenPortsPayload{Ports: []int{8080}}), "boom"},
 	}
 	for _, tc := range cases {

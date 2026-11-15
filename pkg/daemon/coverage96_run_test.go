@@ -58,6 +58,8 @@ func TestCov96RunWasmWarmPoolClosedOnShutdown(t *testing.T) {
 	// subprocesses; t.Setenv restores them after the test.
 	t.Setenv("AEROL_WASM_ENGINE", "")
 	t.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", "")
+	t.Setenv("SB_WASM_WASMTIME_LISTEN_FALLBACK", "false")
+	t.Setenv("AEROL_WASM_WASMTIME_LISTEN_FALLBACK", "")
 
 	err, logs := runCapturingLogs(t, 500*time.Millisecond)
 	if err != nil {
@@ -65,6 +67,10 @@ func TestCov96RunWasmWarmPoolClosedOnShutdown(t *testing.T) {
 	}
 	if !strings.Contains(logs, "wasm warm pool enabled") {
 		t.Fatal("warm pool was not wired with the resident host disabled")
+	}
+	// The wasmtime listen fallback setting reaches the workers.
+	if got := os.Getenv("AEROL_WASM_WASMTIME_LISTEN_FALLBACK"); got != "false" {
+		t.Fatalf("worker listen fallback env = %q, want false", got)
 	}
 }
 
