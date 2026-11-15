@@ -69,7 +69,7 @@ func (d *Driver) interpreters(sandboxID string) *interpState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	inst := d.byID[sandboxID]
-	if inst == nil || inst.status != models.SandboxStatusStarted {
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.stopping > 0 {
 		return nil
 	}
 	if inst.interp == nil {

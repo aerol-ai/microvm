@@ -31,6 +31,7 @@ type fakeSessions struct {
 	stdout, stderr toolboxwire.LogWindow
 
 	inputs   []string
+	inputCtx context.Context
 	inputErr error
 
 	follow    *LogFollow
@@ -132,9 +133,10 @@ func (f *fakeSessions) Follow(sid, cid string) (*LogFollow, error) {
 	return f.follow, f.followErr
 }
 
-func (f *fakeSessions) Input(_, _ string, data []byte) error {
+func (f *fakeSessions) Input(ctx context.Context, _, _ string, data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.inputCtx = ctx
 	f.inputs = append(f.inputs, string(data))
 	return f.inputErr
 }
@@ -474,16 +476,79 @@ func TestSessionErrorStatus(t *testing.T) {
 		ErrNoEntrypoint:          http.StatusNotFound,
 		ErrCommandNotRunning:     http.StatusConflict,
 		ErrSessionStopped:        http.StatusConflict,
+		ErrInputPending:          http.StatusConflict,
+		ErrInputTimeout:          http.StatusRequestTimeout,
 		ErrTooManySessions:       http.StatusTooManyRequests,
 		ErrTooManyCommands:       http.StatusTooManyRequests,
 		ErrTooManyFollowers:      http.StatusTooManyRequests,
 		ErrTooManyProcesses:      http.StatusTooManyRequests,
 		ErrEntrypointUnsupported: http.StatusNotImplemented,
 		ErrStreamingUnsupported:  http.StatusNotImplemented,
+		ErrSandboxNotRunning:     http.StatusConflict,
 		errors.New("other"):      http.StatusInternalServerError,
 	} {
 		if got := sessionErrorStatus(err); got != want {
 			t.Errorf("%v -> %d, want %d", err, got, want)
 		}
+	}
+}
+
+// TestProcessSessionRequestCaps: what a session request carries ends up
+// in sandboxd's heap, so bodies (1 MiB), command lines (64 KiB) and
+// session ids (128) are capped, each with a status that says why.
+func TestProcessSessionRequestCaps(t *testing.T) {
+	f := newFakeSessions()
+	f.addCommand("s", CommandInfo{ID: "run", Command: "mod", Running: true})
+	jsonOf := func(field, value string) string { return `{"` + field + `":"` + value + `"}` }
+	big := strings.Repeat("a", int(sessionMaxBody))
+	tests := []struct {
+		name, path, body string
+		status           int
+		want             string
+	}{
+		{"create body over the cap", "/process/session", jsonOf("sessionId", big), http.StatusRequestEntityTooLarge, `{"error":"request body is larger than 1048576 bytes"}`},
+		{"id over the cap", "/process/session", jsonOf("sessionId", strings.Repeat("i", 129)), http.StatusBadRequest, `{"error":"sessionId is longer than 128 bytes"}`},
+		{"id at the cap", "/process/session", jsonOf("sessionId", strings.Repeat("i", 128)), http.StatusCreated, ""},
+		{"exec body over the cap", "/process/session/s/exec", jsonOf("command", big), http.StatusRequestEntityTooLarge, ""},
+		{"command over the cap", "/process/session/s/exec", jsonOf("command", "mod "+strings.Repeat("c", 64<<10)), http.StatusBadRequest, `{"error":"command is longer than 65536 bytes"}`},
+		{"command at the cap", "/process/session/s/exec", jsonOf("command", "mod "+strings.Repeat("c", 64<<10-4)), http.StatusOK, ""},
+		{"input body over the cap", "/process/session/s/command/run/input", jsonOf("data", big), http.StatusRequestEntityTooLarge, ""},
+		{"input just under the cap", "/process/session/s/command/run/input", jsonOf("data", big[:len(big)-16]), http.StatusOK, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantStatus(t, sessionCall(t, f, http.MethodPost, tt.path, tt.body), tt.status, tt.want)
+		})
+	}
+	if len(f.execs) != 1 || len(f.execs[0].Text) != 64<<10 {
+		t.Fatalf("execs that reached Sessions: %d", len(f.execs))
+	}
+	if len(f.inputs) != 1 || len(f.sessions) != 2 {
+		t.Fatalf("inputs %d, sessions %d: a refused request reached Sessions", len(f.inputs), len(f.sessions))
+	}
+}
+
+// TestProcessSessionInputGivesUp: input hands Sessions the request's
+// context, and a write the command does not take answers 408 (it waited
+// too long) or 409 (an earlier input still waits), not a hang.
+func TestProcessSessionInputGivesUp(t *testing.T) {
+	f := newFakeSessions()
+	f.addCommand("s", CommandInfo{ID: "run", Command: "mod", Running: true})
+	for _, tc := range []struct {
+		err    error
+		status int
+	}{
+		{ErrInputTimeout, http.StatusRequestTimeout},
+		{ErrInputPending, http.StatusConflict},
+	} {
+		f.inputErr = tc.err
+		rec := sessionCall(t, f, http.MethodPost, "/process/session/s/command/run/input", `{"data":"x"}`)
+		wantStatus(t, rec, tc.status, "")
+		if !strings.Contains(rec.Body.String(), tc.err.Error()) {
+			t.Fatalf("%v: body %s", tc.err, rec.Body.String())
+		}
+	}
+	if f.inputCtx == nil {
+		t.Fatal("input got no request context")
 	}
 }

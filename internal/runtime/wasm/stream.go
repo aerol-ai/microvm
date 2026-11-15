@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
@@ -26,7 +26,17 @@ var ErrStreamingUnsupported = worker.ErrStreamingUnsupported
 // ErrStreamLimit means the sandbox already has MaxStreamsPerSandbox runs.
 var ErrStreamLimit = errors.New("wasm sandbox already runs the maximum number of processes")
 
-const defaultMaxStreamsPerSandbox = 8
+// ErrSandboxNotRunning means the sandbox is stopped, or is being stopped or
+// passivated, so it takes no new runs.
+var ErrSandboxNotRunning = errors.New("wasm sandbox is not running")
+
+// defaultMaxStreamsPerSandbox caps the runs (exec streams, code-runs,
+// session commands, interpreter contexts) one sandbox may have at once.
+// Each run is its own guest instance with the sandbox's full memory limit,
+// while admission reserves that limit once for the sandbox: a sandbox can
+// use up to (cap + 1) times its limit on the node. The cap is what bounds
+// that until runs share a memory budget, so it is kept low.
+const defaultMaxStreamsPerSandbox = 4
 
 // StreamSpec describes one streaming run.
 type StreamSpec struct {
@@ -74,6 +84,10 @@ type Stream struct {
 	ws        workerExecStream
 	set       *streamSet
 	once      sync.Once
+	// exited is set once Recv has seen the exit, killed once a kill has
+	// reached the worker: either way Close need not send one.
+	exited atomic.Bool
+	killed atomic.Bool
 }
 
 // streamSet tracks a sandbox instance's live runs so stop, destroy,
@@ -186,9 +200,21 @@ func (d *Driver) streamSlotFree(sandboxID string) bool {
 	return set == nil || set.count() < d.maxStreamsPerSandbox()
 }
 
+// acceptsRuns reports whether the sandbox takes new runs now (started, and
+// not being stopped or passivated).
+func (d *Driver) acceptsRuns(sandboxID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	inst := d.byID[sandboxID]
+	return inst != nil && inst.acceptsRuns()
+}
+
+// maxStreamsPerSandbox is the configured cap, never above the worker's
+// own ceiling: past that the worker refuses a start, which would reach the
+// caller as a server error instead of the 429 this cap answers.
 func (d *Driver) maxStreamsPerSandbox() int {
 	if d.cfg.MaxStreamsPerSandbox > 0 {
-		return d.cfg.MaxStreamsPerSandbox
+		return min(d.cfg.MaxStreamsPerSandbox, worker.MaxStreamsPerSandbox)
 	}
 	return defaultMaxStreamsPerSandbox
 }
@@ -204,9 +230,9 @@ func (d *Driver) StartStream(ctx context.Context, sandboxID string, spec StreamS
 		d.mu.Unlock()
 		return nil, fmt.Errorf("wasm sandbox %q not found", sandboxID)
 	}
-	if inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+	if !inst.acceptsRuns() || inst.socketPath == "" {
 		d.mu.Unlock()
-		return nil, fmt.Errorf("wasm sandbox %q is not running", sandboxID)
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotRunning, sandboxID)
 	}
 	if inst.streams == nil {
 		inst.streams = &streamSet{}
@@ -261,7 +287,22 @@ func (d *Driver) StartStream(ctx context.Context, sandboxID string, spec StreamS
 	if ids, ok := ws.(interface{ RunID() string }); ok {
 		st.ID = ids.RunID()
 	}
-	set.add(st)
+	// Registered under Driver.mu, and only while the sandbox still takes
+	// runs: a Stop or passivate that began while the worker started this
+	// one marked the sandbox first and then ran its kill pass, which this
+	// run was not yet there for.
+	d.mu.Lock()
+	live := d.byID[sandboxID] == inst && inst.acceptsRuns()
+	if live {
+		set.add(st)
+	}
+	d.mu.Unlock()
+	if !live {
+		_ = ws.Kill()
+		_ = ws.Close()
+		set.unreserve()
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotRunning, sandboxID)
+	}
 	return st, nil
 }
 
@@ -279,6 +320,7 @@ func (s *Stream) Recv() (StreamEvent, error) {
 	}
 	// The slot frees as soon as the run has ended, not when the caller
 	// gets round to Close.
+	s.exited.Store(true)
 	s.set.drop(s)
 	recordWasmUsage(s.sandboxID, ev.Exit.Usage)
 	return StreamEvent{Exit: &StreamExit{
@@ -298,14 +340,28 @@ func (s *Stream) WriteStdin(p []byte) error { return s.ws.WriteStdin(p) }
 func (s *Stream) CloseStdin() error { return s.ws.CloseStdin() }
 
 // Kill ends the run; its exit still arrives on Recv.
-func (s *Stream) Kill() error { return s.ws.Kill() }
+func (s *Stream) Kill() error {
+	err := s.ws.Kill()
+	if err == nil {
+		s.killed.Store(true)
+	}
+	return err
+}
 
 // Close drops the run's connection, which ends a run still going, and
-// frees its slot.
+// frees its slot. A run that has not exited is also killed over a fresh
+// connection (best effort): the worker notices a dropped connection only
+// when it next reads from it, and it may not read again soon (a guest
+// that does not read its stdin backs the worker's reader up), while
+// sandboxd frees the run's slot here. The slot frees after the kill, so
+// sandboxd never counts fewer runs than the worker still has.
 func (s *Stream) Close() error {
 	var err error
 	s.once.Do(func() {
 		err = s.ws.Close()
+		if !s.exited.Load() && !s.killed.Load() {
+			_ = s.ws.Kill()
+		}
 		s.set.drop(s)
 	})
 	return err

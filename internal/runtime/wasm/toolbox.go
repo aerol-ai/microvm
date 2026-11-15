@@ -37,6 +37,9 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		Exec:      sandboxExecutor{driver: d, id: sandboxID},
 		Procs:     sandboxProcesses{driver: d, id: sandboxID},
 		Sessions:  sandboxSessions{driver: d, id: sandboxID},
+		// The exec stream runs in sandboxd: one client message is read
+		// whole into its heap.
+		StreamReadLimit: d.cfg.StreamMaxMessageBytes,
 		// The code interpreter's python.wasm instances are runs too.
 		Interpreters: sandboxInterpreters{driver: d, id: sandboxID},
 	}
@@ -56,6 +59,9 @@ type sandboxProcesses struct {
 }
 
 func (p sandboxProcesses) CanStart() error {
+	if !p.driver.acceptsRuns(p.id) {
+		return toolhost.ErrSandboxNotRunning
+	}
 	if !p.driver.streamSlotFree(p.id) {
 		return toolhost.ErrTooManyProcesses
 	}
@@ -97,6 +103,8 @@ func toolhostProcessError(err error) error {
 	switch {
 	case errors.Is(err, ErrStreamLimit):
 		return toolhost.ErrTooManyProcesses
+	case errors.Is(err, ErrSandboxNotRunning):
+		return toolhost.ErrSandboxNotRunning
 	case errors.Is(err, ErrStreamingUnsupported):
 		return toolhost.ErrStreamingUnsupported
 	case errors.As(err, &langErr):

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -22,6 +23,9 @@ type Host struct {
 	sessions  Sessions
 	liveness  toolboxwire.Liveness
 	interp    Interpreters
+
+	streamReadLimit int64
+	streamWriteWait time.Duration
 }
 
 // Config wires a toolbox host for one sandbox. The host is rebuilt for every
@@ -42,6 +46,13 @@ type Config struct {
 	// StreamLiveness overrides the exec stream keepalive (tests); zero
 	// keeps toolboxwire.DefaultLiveness.
 	StreamLiveness toolboxwire.Liveness
+	// StreamReadLimit caps one client message on the exec stream (a stdin
+	// chunk or a control frame); 0 keeps DefaultStreamReadLimit
+	// (SB_WASM_STREAM_MAX_MESSAGE_BYTES).
+	StreamReadLimit int64
+	// StreamWriteWait bounds each frame written to an exec stream client;
+	// 0 keeps defaultStreamWriteWait.
+	StreamWriteWait time.Duration
 	// Interpreters serves the code interpreter (interpreter.go). Nil
 	// answers its routes with 501.
 	Interpreters Interpreters
@@ -59,6 +70,9 @@ func New(cfg Config) *Host {
 		sessions:  cfg.Sessions,
 		liveness:  cfg.StreamLiveness,
 		interp:    cfg.Interpreters,
+
+		streamReadLimit: cfg.StreamReadLimit,
+		streamWriteWait: cfg.StreamWriteWait,
 	}
 }
 

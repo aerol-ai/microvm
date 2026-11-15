@@ -72,6 +72,33 @@ type sandboxInstance struct {
 	// interp is the sandbox's code interpreter (interpreter_state.go),
 	// made on first use under Driver.mu and closed with the streams.
 	interp *interpState
+
+	// stopping counts the Stops and passivating checkpoints under way,
+	// under Driver.mu. Each sets it before its kill pass ends the runs,
+	// sessions and interpreter state, so a request that arrives meanwhile
+	// cannot make new ones that the pass has already missed
+	// (acceptsRuns).
+	stopping int
+}
+
+// acceptsRuns reports whether new runs, a session set or interpreter state
+// may be made for inst: it is started and nothing is stopping it. Caller
+// holds Driver.mu.
+func (inst *sandboxInstance) acceptsRuns() bool {
+	return inst.status == models.SandboxStatusStarted && inst.stopping == 0
+}
+
+// beginStopping marks inst as being stopped; the returned func undoes it
+// (for a stop that fails and leaves the sandbox running).
+func (d *Driver) beginStopping(inst *sandboxInstance) func() {
+	d.mu.Lock()
+	inst.stopping++
+	d.mu.Unlock()
+	return func() {
+		d.mu.Lock()
+		inst.stopping--
+		d.mu.Unlock()
+	}
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {
@@ -91,12 +118,12 @@ const (
 
 // legacyWorkerSocketName is the socket a per-sandbox worker listened on in
 // the sandbox's dir before sockets moved to socketsDirName. Workers outlive
-// sandboxd, so an upgraded sandboxd still adopts workers there and talks to
-// them on it until they stop. Until then the socket is in the guest's
-// /work: deleting it or swapping it for a link cuts sandboxd off from that
-// sandbox's own worker, and a worker of this release that the link leads to
-// refuses requests for any sandbox but the one it holds
-// (worker.Server.refuseForeign).
+// sandboxd, so an upgraded sandboxd still finds workers listening there.
+// It never dials one: the socket is in the guest's /work, where the guest
+// can swap it for a link to another sandbox's socket, and a worker from
+// those releases answers for any sandbox id. AdoptSandbox stops such a
+// worker without a word to it and restores its sandbox on a socket of the
+// driver's own (retireWorkDirWorker).
 const legacyWorkerSocketName = "worker.sock"
 
 // workerSocketPath is the socket of a new worker of the sandbox's own. ""
@@ -110,7 +137,7 @@ func (d *Driver) workerSocketPath(sandboxID string) string {
 }
 
 // legacyWorkerSocketPath is where a per-sandbox worker from before
-// socketsDirName listens ("" as for workerSocketPath).
+// socketsDirName listens ("" as for workerSocketPath). Never dialed.
 func (d *Driver) legacyWorkerSocketPath(sandboxID string) string {
 	if d.cfg.RunDir == "" || models.ValidateSandboxID(sandboxID) != nil {
 		return ""

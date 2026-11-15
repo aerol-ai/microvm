@@ -153,7 +153,7 @@ A WASM sandbox has no operating system, so a few things work differently than on
 - **No shell.** Quotes group words, so `python -c 'print(1 + 2)'` gives the module three arguments. But `|`, `>`, `*` and `$NAME` are passed as plain text.
 - **The working folder** must be `/work` or a folder inside it. The module gets it in the `PWD` variable. Whether the module uses it depends on the module.
 - **No time limit.** A streamed command runs until it exits or you disconnect. Disconnecting ends it.
-- **A limit per sandbox.** A sandbox runs at most 8 streamed commands and code runs at a time (your operator can change this). One more fails with HTTP 429.
+- **A limit per sandbox.** A sandbox runs at most 4 streamed commands, code runs, session commands and code interpreters at a time (your operator can change this). One more fails with HTTP 429. Each one is a separate copy of the module and can use as much memory as the sandbox's memory limit.
 
 Stopping, passivating or moving the sandbox ends its streamed commands.
 
@@ -176,9 +176,11 @@ Each command is a run of the sandbox's own module, with your command line as its
 - **There is no shell.** `cd`, `export`, `&&` and `|` do nothing special. The working folder and environment variables do not carry over from one command to the next. Files under `/work` do.
 - **One command at a time.** Commands in one session run in order, one after another, as on other sandboxes.
 - **No time limit.** A command runs until it exits. Deleting the session ends it.
-- **The same limit as streamed commands.** A running session command counts toward the 8 streamed commands and code runs a sandbox can have. One more fails with HTTP 429.
+- **The same limit as streamed commands.** A running session command counts toward the 4 streamed commands and code runs a sandbox can have. One more fails with HTTP 429.
 - **Logs are capped.** The server keeps the last 1 MB of each command's output and of its error output. A longer log starts partway through, but its offsets still count from the start of the output.
 - **A sandbox has at most 16 sessions,** and each session keeps its last 64 finished commands.
+- **Size limits.** A command line can be up to 64 KB, a session id up to 128 characters, and a request up to 1 MB. Past these the server answers HTTP 400 (413 for a request that is too large).
+- **Input waits up to 10 seconds.** If the command has not read your input by then, the call fails with HTTP 408, and the input stays queued for the command. More input sent before the command reads it fails with HTTP 409.
 - **Sessions end with the sandbox.** Stopping, passivating or moving the sandbox ends them, as on other sandboxes.
 
 The entrypoint session (`process.getEntrypointSession`, `process.getEntrypointLogs`) is the sandbox's web server: the run of the module that serves its public port. Its logs are the last 1 MB that server printed. A sandbox that does not serve a port has no entrypoint, so these calls fail with HTTP 404.
@@ -191,9 +193,10 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 
 - **Contexts start in `/work`**, for E2B too (E2B's own default is `/home/user`).
 - **A timeout or an interrupt resets the context.** WebAssembly has no way to interrupt running code, so the sandbox stops the whole interpreter. The context stays, but its next run starts with no variables.
-- **At most 4 contexts** per sandbox. Each context whose interpreter is open counts toward the 8 streamed commands and code runs above.
+- **At most 4 contexts** per sandbox. Each context whose interpreter is open counts toward the 4 streamed commands and code runs above.
 - **Idle contexts stop after 15 minutes** without a run, which frees their memory. The context stays and starts fresh on its next run.
 - **Only Python's standard library.** No IPython, so no `%magics` or `!ls`; no pandas or matplotlib.
+- **`time.sleep` does not work yet.** It fails with `OSError: [Errno 58] Not supported`, because the WebAssembly engine cannot yet wait until a set time. Code that sleeps needs a container or VM sandbox for now.
 - Stopping, passivating or moving the sandbox ends all its contexts.
 
 ### What does not work
@@ -206,7 +209,8 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 | Setting | What it does | Default |
 |---|---|---|
 | `SB_WASM_CODERUN_MODULES` | Which module runs each code-run language, as `language=module,...`. Languages can be `python`, `python3`, `py`, `javascript`, `js`, `node`, `ruby` and `rb`. | Built from `SB_WASM_STANDARD_MODULES`: the `python`, `javascript` and `ruby` modules, when present |
-| `SB_WASM_MAX_STREAMS_PER_SANDBOX` | How many streamed commands, code runs and open code interpreters one WASM sandbox may run at a time. Each one uses memory on the server. | `8` |
+| `SB_WASM_MAX_STREAMS_PER_SANDBOX` | How many streamed commands, code runs, session commands and open code interpreters one WASM sandbox may run at a time. Each one is a separate copy of the module and can use up to the sandbox's memory limit, so a sandbox can use this many times its limit, plus its own guest. Values above 32 count as 32. | `4` |
+| `SB_WASM_STREAM_MAX_MESSAGE_BYTES` | The largest single message a client may send on a streamed command: one piece of input, or one control message. A bigger one closes the stream with code 1009 and ends the command. Send large input in several messages. | `1048576` (1 MiB) |
 | `SB_WASM_SESSION_LOG_BYTES` | How much of each Daytona session command's output, and of its error output, the server keeps. | `1048576` (1 MiB) |
 | `SB_WASM_MAX_SESSIONS_PER_SANDBOX` | How many Daytona sessions one WASM sandbox may have. | `16` |
 | `SB_WASM_SESSION_COMMANDS_KEPT` | How many finished commands a session keeps, and how many may wait for their turn. | `64` |
@@ -216,7 +220,7 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 
 Session logs live in the server's memory, which is why each part has a limit.
 
-A worker started by an older release cannot stream. Streamed commands, code runs, session commands, entrypoint logs and code interpreter contexts on its sandbox fail until the sandbox restarts (HTTP 501 for all but code interpreter contexts). Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer HTTP 501 too.
+A worker started by an older release cannot stream. On its sandbox, code runs, session commands and entrypoint logs answer HTTP 501, a streamed command ends with an error message on its stream, and code interpreter contexts fail to start, until the sandbox restarts. Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer the same way.
 
 ## Keep the sandbox across server restarts
 
