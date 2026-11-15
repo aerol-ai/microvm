@@ -73,11 +73,15 @@ type SnapshotMoveHandler interface {
 	// durably before it answers (a stopped row, or a stored row with rc for
 	// a runtime that rebuilds), so a restart before the start loses nothing.
 	ImportMove(ctx context.Context, id, source string, rc *MoveRecreate) error
-	// DropMove undoes ImportMove when the move does not happen.
-	DropMove(ctx context.Context, id string) error
-	// StartMoved starts id once the placement names this node. rc is what
+	// DropMove undoes ImportMove when the move does not happen. lifetime
+	// is the incarnation the leader moved ("" from an older leader): a
+	// late drop must never remove another lifetime's sandbox.
+	DropMove(ctx context.Context, id, lifetime string) error
+	// StartMoved starts id once the placement names this node. lifetime is
+	// the incarnation the leader moved ("" from an older leader): a late
+	// start must never run an old import as a newer lifetime. rc is what
 	// to rebuild it from, for a runtime that rebuilds rather than restarts.
-	StartMoved(ctx context.Context, id string, rc *MoveRecreate) error
+	StartMoved(ctx context.Context, id, lifetime string, rc *MoveRecreate) error
 }
 
 // MoveRecreate is RecreateInputs of a moved sandbox's placement, as the
@@ -206,7 +210,7 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	drop := func(why error) error {
 		dctx, cancel := context.WithTimeout(context.Background(), moveStepTimeout)
 		defer cancel()
-		if _, err := c.moveCall(dctx, tm, MoveAction{Action: "drop", IDs: []string{p.SandboxID}}); err != nil {
+		if _, err := c.moveCall(dctx, tm, MoveAction{Action: "drop", IDs: []string{p.SandboxID}, Incarnations: moveLifetime(p)}); err != nil {
 			c.logger.Warn("cluster: snapshot move: the target's copy was not dropped", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
 		}
 		return why
@@ -246,7 +250,7 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	sctx, cancel := context.WithTimeout(ctx, moveStartTimeout)
 	defer cancel()
 	for attempt := 1; ; attempt++ {
-		out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}, Recreate: moveRecreateFor(p)})
+		out, err = c.moveCall(sctx, tm, MoveAction{Action: "start-moved", IDs: []string{p.SandboxID}, Incarnations: moveLifetime(p), Recreate: moveRecreateFor(p)})
 		if err == nil && out.Error != "" {
 			err = errors.New(out.Error)
 		}
@@ -259,6 +263,18 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 	}
 	c.logger.Warn("cluster: snapshot move: moved, but the start on the target failed; the target's own check starts it", "sandbox_id", p.SandboxID, "target", tm.NodeID, "err", err)
 	return nil
+}
+
+// moveLifetime names the lifetime the leader is moving, for the target's
+// drop and start (MoveAction.Incarnations): a target checks it against its
+// import and the placement, so a late call from an old move cannot drop or
+// start another lifetime with the same id. A worker from before ignores it.
+func moveLifetime(p Placement) map[string]string {
+	inc := strings.TrimSpace(p.IncarnationID)
+	if inc == "" {
+		return nil
+	}
+	return map[string]string{p.SandboxID: inc}
 }
 
 // waitOrDone waits d, or until ctx ends: false when ctx ended first.
@@ -314,9 +330,9 @@ func runSnapshotMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (Mo
 		}
 		err = sh.ImportMove(ctx, id, strings.TrimSpace(a.Source), a.Recreate)
 	case "drop":
-		err = sh.DropMove(ctx, id)
+		err = sh.DropMove(ctx, id, strings.TrimSpace(a.Incarnations[id]))
 	case "start-moved":
-		err = sh.StartMoved(ctx, id, a.Recreate)
+		err = sh.StartMoved(ctx, id, strings.TrimSpace(a.Incarnations[id]), a.Recreate)
 	}
 	if err != nil {
 		return MoveActionResult{Error: err.Error()}, nil
