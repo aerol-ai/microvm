@@ -107,6 +107,9 @@ var (
 	// errDisarmLater: the placement is between owners (reserved, or
 	// orphaned but this node's to claim back); the next pass tries again.
 	errDisarmLater = errors.New("its placement is between owners")
+	// errPlacementMoved: read again under the spec lock, the placement
+	// names another node or lifetime. Not this node's to change.
+	errPlacementMoved = errors.New("its placement moved to another node or lifetime")
 )
 
 // unfenceableRecreate reports whether sb is a recreate-policy sandbox this
@@ -245,19 +248,14 @@ func (s *Service) disarmRecreate(ctx context.Context, c cluster.Client, id strin
 		return nil
 	}
 	if placed {
-		local, remote := strings.TrimSpace(sb.AuditIncarnationID), strings.TrimSpace(p.IncarnationID)
-		switch {
-		case p.IsDeleting() || (local != "" && remote != "" && local != remote):
-			return nil
-		case p.IsOrphaned() || p.IsReserved():
-			if strings.TrimSpace(p.OwnerNodeID) == self || placementCanBeClaimedBySelf(p, self) {
-				return errDisarmLater
-			}
-			return nil
-		case strings.TrimSpace(p.OwnerNodeID) != self:
+		err := disarmPlacementCheck(p, self, sb)
+		if err == nil {
+			err = s.writeFailoverNoneSpec(ctx, c, sb, self)
+		}
+		if errors.Is(err, errPlacementMoved) {
 			return nil
 		}
-		if err := s.writeFailoverNoneSpec(ctx, c, id); err != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -280,19 +278,61 @@ func (s *Service) disarmRecreate(ctx context.Context, c cluster.Client, id strin
 	return nil
 }
 
-// writeFailoverNoneSpec sets the cluster's spec of id to failover.policy=
+// disarmPlacementCheck says whether this node may turn off the recreate
+// policy in p, sb's placement: nil when p is placed on this node in sb's
+// lifetime, errDisarmLater while it is between owners and this node's
+// (reserved, or an orphan it can claim back), and errPlacementMoved when it
+// is another node's, another lifetime's, or being deleted. The stale-row
+// paths remove a local row in that last case.
+func disarmPlacementCheck(p cluster.Placement, self string, sb *models.Sandbox) error {
+	local, remote := strings.TrimSpace(sb.AuditIncarnationID), strings.TrimSpace(p.IncarnationID)
+	switch {
+	case p.IsDeleting() || (local != "" && remote != "" && local != remote):
+		return errPlacementMoved
+	case p.IsOrphaned() || p.IsReserved():
+		if strings.TrimSpace(p.OwnerNodeID) == self || placementCanBeClaimedBySelf(p, self) {
+			return errDisarmLater
+		}
+		return errPlacementMoved
+	case strings.TrimSpace(p.OwnerNodeID) != self:
+		return errPlacementMoved
+	}
+	return nil
+}
+
+// writeFailoverNoneSpec sets the cluster's spec of sb to failover.policy=
 // none, under the spec lock (writeReplicatedSpec). A spec already without
 // the policy is left alone; a spec that could not be read is an error, so
 // the row is not changed on a guess.
-func (s *Service) writeFailoverNoneSpec(ctx context.Context, c cluster.Client, id string) error {
-	unlock, err := s.lockSpec(ctx, id)
+//
+// The pass read sb's placement before it took any lock, and the leader can
+// hand a sandbox to another node meanwhile (a dead-owner reassign while
+// this node's reads still reach it). So each write attempt reads the owner
+// again, after it has read the spec's version: a reassign before that read
+// is seen here, and one after it moves the version, which the leader's
+// version check refuses (every server at the spec version fence), so the
+// next attempt sees it. The answer is disarmPlacementCheck's: a placement
+// gone or now another node's is errPlacementMoved.
+func (s *Service) writeFailoverNoneSpec(ctx context.Context, c cluster.Client, sb *models.Sandbox, self string) error {
+	unlock, err := s.lockSpec(ctx, sb.ID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	return s.writeReplicatedSpec(commitCtx, c, id, func(spec *models.CreateSandboxRequest) (bool, error) {
+	return s.writeReplicatedSpec(commitCtx, c, sb.ID, func(spec *models.CreateSandboxRequest) (bool, error) {
+		placements, err := c.AuthoritativePlacementsByIDs(commitCtx, []string{sb.ID})
+		if err != nil {
+			return false, err
+		}
+		p, ok := placements[sb.ID]
+		if !ok {
+			return false, errPlacementMoved
+		}
+		if err := disarmPlacementCheck(p, self, sb); err != nil {
+			return false, err
+		}
 		if spec == nil {
 			return false, errSpecUnread
 		}
@@ -324,21 +364,33 @@ func (s *Service) unfenceableWhy(sb *models.Sandbox) string {
 // sandboxes are refused). Its lease ran out, so the cluster may be
 // recreating it elsewhere, and a frozen-in-name sandbox would run on beside
 // the copy. Its policy stays; it stays stopped until someone starts it.
-// The caller holds the lifecycle boundary. It reports whether sb stopped.
-func (s *Service) stopUnfenceable(ctx context.Context, sb *models.Sandbox) bool {
+// The caller holds the lifecycle boundary; f is sb's fence entry. It
+// reports whether sb stopped.
+func (s *Service) stopUnfenceable(ctx context.Context, sb *models.Sandbox, f *fencedSandbox) bool {
 	if !s.ownershipLeaseFileOn() || sb.Status != models.SandboxStatusStarted {
 		return false
 	}
 	why := "no authoritative read from the control plane within the ownership lease, and this node cannot freeze it alone (" + s.unfenceableWhy(sb) + ")"
-	done := s.beginSystemActionReason(withAuditSubsystem(ctx, auditSubsystemFailover), sb.ID, systemActionLeaseStop, why)
+	record := func(err error) {
+		s.beginSystemActionReason(withAuditSubsystem(ctx, auditSubsystemFailover), sb.ID, systemActionLeaseStop, why)(err)
+	}
 	_, err := s.stopSandboxLocked(ctx, sb.ID, stopModeManual, statusReasonOwnershipLeaseExpired)
-	done(err)
+	s.ownership.mu.Lock()
+	firstFailure := err != nil && !f.stopFailed
+	f.stopFailed = err != nil
+	s.ownership.mu.Unlock()
 	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("cluster: could not stop a sandbox the ownership lease no longer covers and nothing can freeze; will retry", "sandbox_id", sb.ID, "error", err)
+		// Tried again at every check (lease/15, 1 s by default): one
+		// record and one log line for the run, not one per check.
+		if firstFailure {
+			record(err)
+			if s.logger != nil {
+				s.logger.Warn("cluster: could not stop a sandbox the ownership lease no longer covers and nothing can freeze; will retry", "sandbox_id", sb.ID, "error", err)
+			}
 		}
 		return false
 	}
+	record(nil)
 	if s.logger != nil {
 		s.logger.Warn("cluster: stopped a failover.policy=recreate sandbox the ownership lease no longer covers; nothing on this node could freeze it alone", "sandbox_id", sb.ID, "runtime", sb.Runtime)
 	}
