@@ -543,6 +543,32 @@ func TestDisarmLeavesASpecThatMovedAfterTheRead(t *testing.T) {
 	if sc.writeCount() != 0 || !sc.specRecreates("wasm-o") {
 		t.Fatal("the spec of a placement between owners was rewritten")
 	}
+
+	// The second read fails: retried, nothing written. The placement is
+	// gone by the second read: left alone, nothing written.
+	for _, tc := range []struct {
+		name  string
+		after func()
+		done  bool
+	}{
+		{"the owner read fails", lc.down, false},
+		{"the placement is gone", func() { lc.up() }, true},
+	} {
+		reads = 0
+		sc.afterRead = func() {
+			reads++
+			if reads == 1 {
+				tc.after()
+			}
+		}
+		lc.up(selfPlacement("wasm-o"))
+		if got := svc.disarmUnfencedRecreate(ctx); got != tc.done {
+			t.Errorf("%s: done = %v, want %v", tc.name, got, tc.done)
+		}
+		if sc.writeCount() != 0 || !sc.specRecreates("wasm-o") {
+			t.Errorf("%s: the spec was rewritten", tc.name)
+		}
+	}
 }
 
 // 2f's race in #1299's review: enforceOwnershipLease lists the recreate
