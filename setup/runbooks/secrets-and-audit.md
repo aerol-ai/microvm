@@ -724,6 +724,13 @@ and the stalled-outbox alert still show it.
    an authenticated generation-scoped DELETE ACK. Permanently destroyed nodes
    therefore leave a visible cleanup obligation; membership disappearance is
    never accepted as evidence that their disks no longer contain ciphertext.
+6. When a Kubernetes worker turns a sandbox's recreate policy off (it cannot
+   freeze that sandbox alone, status reason `failover_disabled`), the same
+   transaction journals a delete of the sealed copies on its backup nodes and
+   drops pending pushes to them. The owner keeps its own copy. Those deletes
+   go through the delete outbox above, so a backup that is down keeps a
+   pending obligation until it ACKs. `aerolvm_secret_backups_retired_total`
+   counts the backups journalled this way.
 
 The reconciler exposes `aerolvm_secret_delete_outbox_pending`,
 `aerolvm_secret_delete_outbox_oldest_age_seconds`,

@@ -68,6 +68,10 @@ var (
 	secretDeleteOutboxRetiredStandalone = expvar.NewInt("aerolvm_secret_delete_outbox_retired_standalone_total")
 	secretPutOutboxRetiredStandalone    = expvar.NewInt("aerolvm_secret_put_outbox_retired_standalone_total")
 	secretCiphertextRetiredTotal        = expvar.NewInt("aerolvm_secret_ciphertext_retired_total")
+	// secretBackupsRetiredTotal counts backup nodes whose sealed copy was
+	// journalled for deletion because the sandbox's recreate policy was
+	// turned off (clearRecreateFailover).
+	secretBackupsRetiredTotal = expvar.NewInt("aerolvm_secret_backups_retired_total")
 	// secretProviderCanaryOK is 1 after a successful external provider boot
 	// canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")

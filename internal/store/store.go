@@ -5444,6 +5444,85 @@ func (s *Store) ClearRecreateFailover(ctx context.Context, id string) (bool, err
 	return affected == 1, nil
 }
 
+// ClearRecreateFailoverRetiringBackups is ClearRecreateFailover that, in the
+// same transaction, also retires what only a recreate on another node
+// needed: the sealed copies of the sandbox's secrets on its backup nodes.
+// For the lifecycle incarnationID it journals a peer delete for every
+// recipient but selfID, at the copy's current seal generation (the durable
+// cluster_secret_delete_outbox job a destroy and a reseal also use), and
+// drops any push to them still pending. The owner's own copy stays, since
+// the sandbox keeps running here. One transaction, so a crash leaves either
+// the recreate policy and its backups, or neither: no window where the
+// policy is off and nothing will ever remove the copies.
+//
+// It changes nothing when the policy is not recreate (changed false), and
+// leaves the secrets alone when incarnationID or selfID is empty: without
+// them it cannot tell the backups from the owner's copy. retired is how many
+// peers the delete job names.
+func (s *Store) ClearRecreateFailoverRetiringBackups(ctx context.Context, id, incarnationID, selfID string) (changed bool, retired int, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, fmt.Errorf("begin clear sandbox recreate policy: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET failover_policy = '', updated_at = ?
+		WHERE id = ? AND failover_policy = ?
+	`, time.Now().UTC(), id, models.FailoverPolicyRecreate)
+	if err != nil {
+		return false, 0, fmt.Errorf("clear sandbox recreate policy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, 0, fmt.Errorf("clear sandbox recreate policy: %w", err)
+	}
+	if affected != 1 {
+		return false, 0, nil
+	}
+	incarnationID, selfID = strings.TrimSpace(incarnationID), strings.TrimSpace(selfID)
+	if incarnationID != "" && selfID != "" {
+		var recipientsJSON string
+		var generation int64
+		scanErr := tx.QueryRowContext(ctx, `
+			SELECT recipients_json, seal_generation FROM cluster_secrets
+			WHERE sandbox_id = ? AND ref = ?
+		`, id, secrets.FormatRef(id, incarnationID, secrets.RefVersion)).Scan(&recipientsJSON, &generation)
+		if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+			return false, 0, fmt.Errorf("read cluster secret before retiring its backups: %w", scanErr)
+		}
+		if scanErr == nil && generation > 0 {
+			var recipients []string
+			if recipientsJSON != "" {
+				if err := json.Unmarshal([]byte(recipientsJSON), &recipients); err != nil {
+					return false, 0, fmt.Errorf("decode cluster secret recipients: %w", err)
+				}
+			}
+			var peers []string
+			for _, r := range secrets.NormalizeRecipients(recipients) {
+				if r != selfID {
+					peers = append(peers, r)
+				}
+			}
+			if len(peers) > 0 {
+				if err := upsertSecretDeleteOutboxTx(ctx, tx, id, incarnationID, peers, nil, generation, false, time.Time{}); err != nil {
+					return false, 0, err
+				}
+				retired = len(peers)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM cluster_secret_put_outbox WHERE sandbox_id = ? AND incarnation_id = ?
+		`, id, incarnationID); err != nil {
+			return false, 0, fmt.Errorf("drop pending secret pushes: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, fmt.Errorf("commit clear sandbox recreate policy: %w", err)
+	}
+	return true, retired, nil
+}
+
 // ScheduleRestart records a pending restart on failure: the consecutive
 // failure count the backoff was computed from and when the restart is due.
 func (s *Store) ScheduleRestart(ctx context.Context, id string, failures int, at time.Time) error {
