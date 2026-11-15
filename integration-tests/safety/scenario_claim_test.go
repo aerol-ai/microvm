@@ -23,7 +23,7 @@ func claimFuncs(t *testing.T) string {
 	}
 	var fns strings.Builder
 	for _, name := range []string{
-		"worktree_roots", "lease_lock_path", "lease_lock_acquire", "lease_lock_release",
+		"in_git_checkout", "worktree_roots", "lease_lock_path", "lease_lock_stale", "lease_lock_acquire", "lease_lock_release",
 		"scenario_holders", "refuse_if_scenario_held", "claim_scenario", "release_scenario_claim",
 	} {
 		fns.WriteString(extractShellFunc(t, string(src), name))
@@ -120,9 +120,11 @@ func TestConcurrentClaimsOnOneScenarioGrantOne(t *testing.T) {
 			}
 		}
 		cmds := make([]*exec.Cmd, 2)
+		stderrs := make([]strings.Builder, 2)
 		for i, root := range []string{a, b} {
-			cmds[i] = exec.Command("bash", "-c", claimScript(fns, "s"), "bash", root)
+			cmds[i] = exec.Command("bash", "-c", claimScript(fns+lockTrace(), "s"), "bash", root)
 			cmds[i].Env = gitEnv()
+			cmds[i].Stderr = &stderrs[i]
 			if err := cmds[i].Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -134,7 +136,8 @@ func TestConcurrentClaimsOnOneScenarioGrantOne(t *testing.T) {
 			}
 		}
 		if granted != 1 {
-			t.Fatalf("round %d: %d worktrees got scenario s; want exactly 1", round, granted)
+			t.Fatalf("round %d: %d worktrees got scenario s; want exactly 1\nrun a:\n%s\nrun b:\n%s\nfiles:\n%s",
+				round, granted, stderrs[0].String(), stderrs[1].String(), treeState(a, b))
 		}
 	}
 }

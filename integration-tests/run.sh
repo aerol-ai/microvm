@@ -615,31 +615,48 @@ teardown() {
 # and the suite saw "sandbox not found" and 401 invalid_signature). A worktree
 # whose run.sh predates this still reads only its own pins.
 domains_in_use() {
-  local own="${1:-}"
-  domain_pins "$own" | cut -d' ' -f1
+  local own="${1:-}" pins
+  pins=$(domain_pins "$own") || return 1
+  printf '%s\n' "$pins" | cut -d' ' -f1
 }
 
 # domain_pins prints "<domain> <pin path>" for every pin held in any worktree
 # of this clone, except $1 (this scenario's own pin).
 domain_pins() {
-  local own="${1:-}" root f
+  local own="${1:-}" root f roots
+  roots=$(worktree_roots) || return 1
   while IFS= read -r root; do
     for f in "$root"/integration-tests/.tf/*/.leased-domain; do
       [[ -f "$f" ]] || continue
       [[ -n "$own" && "$f" == "$own" ]] && continue
       printf '%s %s\n' "$(tr -d '[:space:]' < "$f")" "$f"
     done
-  done < <(worktree_roots)
+  done <<<"$roots"
+}
+
+# in_git_checkout is true when REPO_ROOT is a clone (.git is a directory) or
+# one of its worktrees (.git is a file).
+in_git_checkout() {
+  [[ -e "${REPO_ROOT}/.git" ]]
 }
 
 # worktree_roots prints REPO_ROOT first (so its pins keep the exact paths the
 # own-pin check compares against), then every other existing worktree of this
 # clone, once each. Outside a git checkout (a test tree) it is REPO_ROOT alone.
+# Inside one, a failed `git worktree list` is an error, never "no other
+# worktrees": it used to be swallowed (`|| true`), and then a lease or claim
+# read only its own tree and could take a domain or scenario another worktree
+# held.
 worktree_roots() {
-  local self wt
+  local self wt list
   printf '%s\n' "$REPO_ROOT"
+  in_git_checkout || return 0
+  if ! list=$(git -C "$REPO_ROOT" worktree list --porcelain); then
+    echo "git worktree list failed in ${REPO_ROOT}; cannot see the other worktrees' pins and claims" >&2
+    return 1
+  fi
   self=$(cd "$REPO_ROOT" && pwd -P)
-  { git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null || true; } | sed -n 's/^worktree //p' |
+  sed -n 's/^worktree //p' <<<"$list" |
     while IFS= read -r wt; do
       [[ -d "$wt" ]] || continue
       [[ "$(cd "$wt" && pwd -P)" == "$self" ]] && continue
@@ -648,32 +665,87 @@ worktree_roots() {
 }
 
 # The lease lock spans "read every pin" to "write ours", so two runs started
-# in the same second cannot both pick the one free domain. It is a directory
-# (mkdir is atomic everywhere; macOS has no flock) in the clone's shared git
-# dir, which every worktree sees. A lease holds it for well under a second, so
-# one older than a minute was left by a run killed mid-lease and is cleared.
-# find's -mmin rounding differs (BSD rounds up, GNU truncates), so "older than
-# a minute" can mean up to two; the wait runs for three, so a lock a killed run
-# left behind delays the next run but never fails it.
+# in the same second cannot both pick the one free domain. It lives in the
+# clone's shared git dir, which every worktree sees. What makes a run the
+# holder is creating the lock's owner file with noclobber: bash opens it with
+# O_CREAT|O_EXCL itself, so exactly one run makes it (macOS has no flock).
+# mkdir alone is not enough: uutils coreutils' mkdir, the default on Ubuntu
+# 26.04 and on the CI runners, lets two calls racing on one path both succeed
+# (580 of 1,500 rounds of four racing mkdirs, against 0 for GNU mkdir), and
+# two worktrees then leased one domain (CI, 2026-11-15). The lock stays a
+# directory, made with mkdir first, so a run.sh that predates the owner file
+# still sees it as held. Inside a git checkout a failed
+# `rev-parse --git-common-dir` is an error: it used to fall back to a lock
+# under this worktree's own .tf, which no other worktree takes, so two runs
+# could both hold "the" lock.
+#
+# A lease holds the lock for well under a second. Its holder writes
+# "<pid> <host>" to an owner file inside it (the pid of the shell holding the
+# lock, see lease_lock_acquire), and a lock whose holder is no
+# longer running on this host was left by a run killed mid-lease and is
+# cleared at once. A lock with no owner file (one just made, or one an older
+# run.sh made) is cleared only once it is over a minute old. Using the
+# holder's pid, not the clock, means a clock that jumps forward cannot make a
+# live lock look old. A stale lock is cleared under a second lock, the
+# breaker (a file, made with noclobber too), so two runs can never both decide
+# one lock is stale and the second delete the fresh lock the first one just
+# took.
 lease_lock_path() {
   local gitdir
-  gitdir=$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null) || gitdir=""
-  if [[ -z "$gitdir" ]]; then
+  if ! in_git_checkout; then
     echo "${REPO_ROOT}/integration-tests/.tf/.domain-lease.lock"
-    return
+    return 0
+  fi
+  if ! gitdir=$(git -C "$REPO_ROOT" rev-parse --git-common-dir) || [[ -z "$gitdir" ]]; then
+    echo "domain lease: git rev-parse --git-common-dir failed in ${REPO_ROOT}; refusing to lease without the lock every worktree shares" >&2
+    return 1
   fi
   [[ "$gitdir" == /* ]] || gitdir="${REPO_ROOT}/${gitdir}"
   echo "${gitdir}/aerol-itest-domain-lease.lock"
 }
 
+# lease_lock_stale is true when the lock at $1 was left by a run that is gone.
+lease_lock_stale() {
+  local lock="$1" pid="" host=""
+  if [[ -f "${lock}/owner" ]]; then
+    read -r pid host < "${lock}/owner" 2>/dev/null || true
+    if [[ "$pid" =~ ^[0-9]+$ && "$host" == "$(uname -n)" ]]; then
+      # kill -0 also fails for a live process of another user; every run of
+      # one clone is the same user, so that case does not come up.
+      ! kill -0 "$pid" 2>/dev/null
+      return
+    fi
+  fi
+  [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]
+}
+
 lease_lock_acquire() {
-  local lock tries=0
-  lock=$(lease_lock_path)
+  local lock tries=0 me
+  lock=$(lease_lock_path) || return 1
   mkdir -p "$(dirname "$lock")"
-  until mkdir "$lock" 2>/dev/null; do
-    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
-      rmdir "$lock" 2>/dev/null || true
-      continue
+  # The holder is this shell, which may be a subshell: a lease runs inside
+  # run_one's $(…), so $$ would name the parent run.sh, which outlives a
+  # lease subshell that died mid-lease, and the lock would look live for the
+  # whole run. BASHPID (bash 4+) names the subshell itself. bash 3.2 has no
+  # BASHPID and records $$: there, a lease subshell that died mid-lease
+  # leaves a lock that clears once its run.sh exits.
+  me="${BASHPID:-$$} $(uname -n)"
+  until mkdir "$lock" 2>/dev/null && (set -o noclobber && printf '%s\n' "$me" > "${lock}/owner") 2>/dev/null; do
+    if lease_lock_stale "$lock"; then
+      # Only the breaker's holder may clear a lock, and it checks again with
+      # the breaker held, when nobody else can swap the lock under it. A
+      # breaker over a minute old was left by a run killed mid-clear.
+      if (set -o noclobber && : > "${lock}.break") 2>/dev/null; then
+        if lease_lock_stale "$lock"; then
+          rm -f "${lock}/owner"
+          rmdir "$lock" 2>/dev/null || true
+        fi
+        rm -f "${lock}.break"
+        continue
+      elif [[ -n "$(find "${lock}.break" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+        rm -f "${lock}.break"
+        continue
+      fi
     fi
     tries=$((tries + 1))
     if [[ "$tries" -gt 1800 ]]; then
@@ -687,6 +759,7 @@ lease_lock_acquire() {
 
 lease_lock_release() {
   if [[ -n "${LEASE_LOCK:-}" ]]; then
+    rm -f "${LEASE_LOCK}/owner"
     rmdir "$LEASE_LOCK" 2>/dev/null || true
   fi
   LEASE_LOCK=""
@@ -704,7 +777,8 @@ lease_lock_release() {
 
 # scenario_holders prints the claim and pin files other worktrees hold for $1.
 scenario_holders() {
-  local scenario="$1" root f first=1
+  local scenario="$1" root f first=1 roots
+  roots=$(worktree_roots) || return 1
   while IFS= read -r root; do
     if [[ "$first" == "1" ]]; then
       first=0 # REPO_ROOT itself: our own claim never blocks us
@@ -716,13 +790,16 @@ scenario_holders() {
         printf '%s\n' "$f"
       fi
     done
-  done < <(worktree_roots)
+  done <<<"$roots"
 }
 
 # refuse_if_scenario_held returns 1, saying why, when another worktree holds $1.
 refuse_if_scenario_held() {
   local scenario="$1" holders
-  holders=$(scenario_holders "$scenario")
+  if ! holders=$(scenario_holders "$scenario"); then
+    echo "scenario ${scenario}: could not read the other worktrees' claims, so this run will not touch integration/${scenario}/terraform.tfstate" >&2
+    return 1
+  fi
   [[ -z "$holders" ]] && return 0
   echo "scenario ${scenario}: another worktree holds it, so this run will not touch integration/${scenario}/terraform.tfstate:" >&2
   sed 's/^/  /' <<<"$holders" >&2
@@ -779,7 +856,7 @@ lease_domain() {
   # records at its own ingress and corrupted that run invisibly. The pool has
   # 3 entries and the matrix has 6 scenarios, so overlap is the normal
   # condition whenever two runs are in flight, not an edge case.
-  in_use="$(domains_in_use "$own_pin")"
+  in_use="$(domains_in_use "$own_pin")" || return 1
 
   idx=$(( RANDOM % n ))
   if [[ "$n" -gt 1 && "$idx" -eq "$last" ]]; then
