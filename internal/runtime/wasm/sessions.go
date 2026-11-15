@@ -615,7 +615,12 @@ func ringWindow(r *logring.Ring, from, limit int64, final bool) toolboxwire.LogW
 	base := r.Base()
 	lo := int(min(max(from-base, 0), int64(r.Len())))
 	hi := r.Len()
-	if limit > 0 && int64(hi-lo) > limit+1 {
+	// limit is the caller's, any non-negative int64. Compare it with the
+	// window before adding to it: limit+1 overflows at the largest int64,
+	// and the window then read as empty, so a reader asking for
+	// "everything" never moved forward. Past the check limit is below
+	// hi-lo, an int, so the conversion is exact.
+	if limit > 0 && limit < int64(hi-lo)-1 {
 		hi = lo + int(limit) + 1
 	}
 	w := toolboxwire.CutLogWindowAt(r.Slice(lo, hi), base+int64(lo), from, limit, final)
