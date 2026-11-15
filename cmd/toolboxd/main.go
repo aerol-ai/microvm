@@ -518,15 +518,13 @@ func (s *server) routes() http.Handler {
 			}
 			s.handleDaytonaCodeRun(w, r)
 		case strings.HasPrefix(r.URL.Path, "/process/interpreter/"):
-			// codeInterpreter.runCode() is Daytona's stateful Jupyter-kernel API.
-			// We don't host a kernel in the default toolbox image; without an
-			// explicit 501 here a WS upgrade GET would 404 with the default
-			// branch's "not found" body, which the SDK can't disambiguate from
-			// other "thing missing" failures. Hand back a clear 501.
+			// Daytona's codeInterpreter (and the AerolVM SDKs' interpreter):
+			// stateful contexts, one interpreter process each, started on
+			// first use (plans/code-interpreter.md).
 			if !s.requireAuth(w, r) {
 				return
 			}
-			writeError(w, http.StatusNotImplemented, "codeInterpreter is not implemented; use process.codeRun or process.executeCommand instead")
+			s.daytonaInterpreter().ServeHTTP(w, r)
 		case strings.HasPrefix(r.URL.Path, "/process/session"):
 			if !s.requireAuth(w, r) {
 				return

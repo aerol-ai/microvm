@@ -527,7 +527,7 @@ func TestRoutesDispatchCoverage(t *testing.T) {
 		{name: "envd_health", req: httptest.NewRequest(http.MethodGet, "/sb-test/envd/health", nil)},
 		{name: "process_execute", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/execute", strings.NewReader("{bad"))},
 		{name: "process_code_run", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/code-run", strings.NewReader("{bad"))},
-		{name: "process_interpreter", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/interpreter/python", nil)},
+		{name: "process_interpreter", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/interpreter/context", nil)},
 		{name: "process_session_list", req: httptest.NewRequest(http.MethodGet, "/sb-test/process/session", nil)},
 		{name: "process_session_create", req: httptest.NewRequest(http.MethodPost, "/sb-test/process/session", strings.NewReader("{bad"))},
 		{name: "files_upload", req: httptest.NewRequest(http.MethodPost, "/sb-test/files/upload", strings.NewReader("not multipart"))},

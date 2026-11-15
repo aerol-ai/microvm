@@ -55,6 +55,10 @@ func TestToolboxRouteClass(t *testing.T) {
 		"/process/pty":                                 "pty",
 		"/process/pty/s1/connect":                      "pty",
 		"/lsp/start":                                   "lsp",
+		"/process/interpreter/context":                 "interpreter",
+		"/process/interpreter/execute":                 "interpreter",
+		"/interpreter/e2b/execute":                     "interpreter",
+		"/process/interpreterx":                        "other",
 		"/git/status":                                  "other",
 		"/":                                            "other",
 	} {

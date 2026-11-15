@@ -34,6 +34,12 @@ var toolboxFeatures = map[string][]string{
 	"files.write_options": {"append", "atomic", "create_only", "mode"},
 	// F3: upload a tar and unpack it into a folder (extract=true).
 	"files.extract": {"extract"},
+	// The stateful code interpreter on /process/interpreter/
+	// (plans/code-interpreter.md, D13). An older agent answers the whole
+	// route with 501, so the SDKs check this before their first call. The
+	// options are the JSON fields of the context create body, the execute
+	// WebSocket's first message and its later messages.
+	"code.interpreter": {"code", "contextId", "cwd", "envs", "language", "richOutput", "timeout", "type"},
 }
 
 // baselineRequestOptions are the options toolboxd understood before /version

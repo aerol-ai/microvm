@@ -98,8 +98,9 @@ var toolboxRoutes = []toolboxRoute{
 	// reverse proxy; plain-HTTP session requests ride it without harm.
 	{path: "process/session/", prefix: true, bare: true, kind: toolboxProxy},
 	// /process/interpreter/execute is a WebSocket stream; the context
-	// endpoints are plain HTTP. The shipped toolboxd answers this prefix with
-	// 501 (daytona_code_run.go); custom toolbox builds can implement it.
+	// endpoints are plain HTTP. toolboxd serves the prefix itself
+	// (cmd/toolboxd/codeinterp.go, internal/codeinterp/daytona); an agent
+	// older than its code.interpreter feature answers 501.
 	{path: "process/interpreter/", prefix: true, kind: toolboxProxy},
 	// /process/pty (bare) covers list/create; /process/pty/{id}/connect is
 	// the WebSocket stream.
