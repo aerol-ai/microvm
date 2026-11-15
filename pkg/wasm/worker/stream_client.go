@@ -85,7 +85,7 @@ func (c *Client) StartExec(ctx context.Context, sandboxID string, p ExecStartPay
 		return readFrame(conn)
 	}()
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return nil, ctxErr
 		}
 		// The conn deadline can fire a moment before ctx's own timer.

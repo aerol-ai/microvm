@@ -66,7 +66,7 @@ func (c *Client) entrypointRequest(ctx context.Context, sandboxID string, p entr
 	}()
 	if err != nil {
 		_ = conn.Close()
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return nil, EntrypointLogs{}, ctxErr
 		}
 		return nil, EntrypointLogs{}, err
