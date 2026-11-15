@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -45,6 +46,11 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 	return d.syncGuestListenPort(ctx, inst, client, listenPort)
 }
 
+// ErrGuestNotListening: the sandbox has no guest listener to take a request
+// for an exposed port yet (none was started, or starting it failed). The
+// HTTP gateway answers it with 503.
+var ErrGuestNotListening = errors.New("wasm guest is not listening for HTTP")
+
 func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	inst, err := d.instance(sandboxID)
 	if err != nil {
@@ -53,11 +59,12 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 	if inst.status != models.SandboxStatusStarted {
 		return fmt.Errorf("wasm sandbox %q is not started", sandboxID)
 	}
-	client := d.newWorkerClient(inst.socketPath)
-	// Ephemeral wasip1 guests listen on resolvedListenPort; ProxyHTTP(0) dials caps.
-	proxyPort := guestPort
-	if inst.resolvedListenPort > 0 {
-		proxyPort = 0
+	// Port 0 asks the worker for its own listener. The exposed port is never
+	// sent: a worker from an older release dials a port it is given on the
+	// host, where any process can listen on it.
+	if inst.resolvedListenPort <= 0 {
+		return fmt.Errorf("%w on port %d of sandbox %q", ErrGuestNotListening, guestPort, sandboxID)
 	}
-	return client.ProxyHTTP(sandboxID, proxyPort, w, r)
+	client := d.newWorkerClient(inst.socketPath)
+	return client.ProxyHTTP(sandboxID, 0, w, r)
 }

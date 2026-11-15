@@ -238,6 +238,33 @@ func TestWazeroEngine_ResolvedListenPort_NoModule(t *testing.T) {
 	}
 }
 
+// Once wazero closes the module on its own (the guest exited, a deadline
+// fired), the listener is closed and its port free for any other bind on the
+// host, so the engine must stop naming it.
+func TestWazeroEngine_ResolvedListenPort_ClosedModule(t *testing.T) {
+	ctx := context.Background()
+	eng, err := newWazeroEngine(ctx)
+	if err != nil {
+		t.Fatalf("newWazeroEngine: %v", err)
+	}
+	defer eng.Close(ctx)
+	if err := eng.LoadModule(ctx, writeDummyWasm(t, t.TempDir()), LoadOptions{}); err != nil {
+		t.Fatalf("LoadModule: %v", err)
+	}
+	if err := eng.Instantiate(ctx, Capabilities{WASIListenPort: 0, WASIListenHost: "127.0.0.1"}); err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	if port, ok := eng.ResolvedListenPort(); !ok || port <= 0 {
+		t.Fatalf("ResolvedListenPort = (%d,%v), want a bound port", port, ok)
+	}
+	if err := eng.module.Close(ctx); err != nil {
+		t.Fatalf("module Close: %v", err)
+	}
+	if port, ok := eng.ResolvedListenPort(); ok {
+		t.Fatalf("ResolvedListenPort = (%d,%v) after the module closed, want none", port, ok)
+	}
+}
+
 func TestWazeroEngine_CloseNilModule(t *testing.T) {
 	ctx := context.Background()
 	eng, err := newWazeroEngine(ctx)

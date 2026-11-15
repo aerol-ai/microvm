@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,6 +57,36 @@ func TestWasmExposePortHTTPUsesHostMediator(t *testing.T) {
 	}
 	if ep.URL != url {
 		t.Fatalf("upstream = %q want %q", ep.URL, url)
+	}
+}
+
+// A WASM sandbox's ContainerIP is the host's loopback: a port probe there
+// would dial whatever listens on that port on the host. expose_port must
+// skip it.
+func TestWasmExposePortDoesNotProbeTheHostPort(t *testing.T) {
+	ctx := context.Background()
+	driver := wasmruntime.New(wasmruntime.Config{ModulesDir: t.TempDir()}, nil)
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(driver)
+	var probed []string
+	svc.probeContainerPortFn = func(_ context.Context, ip string, port int) error {
+		probed = append(probed, fmt.Sprintf("%s:%d", ip, port))
+		return nil
+	}
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-wasm-noprobe", Status: models.SandboxStatusStarted, Runtime: models.RuntimeWasm,
+		ContainerIP: "127.0.0.1", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.ExposePort(ctx, "sb-wasm-noprobe", 2019, "http"); err != nil {
+		t.Fatalf("ExposePort: %v", err)
+	}
+	if len(probed) != 0 {
+		t.Fatalf("expose_port probed %v on a WASM sandbox, want no probe", probed)
 	}
 }
 

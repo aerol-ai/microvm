@@ -125,9 +125,11 @@ func TestServer_ProxyGuestHTTPFromPayload(t *testing.T) {
 		t.Fatalf("parse backend port: %v", err)
 	}
 
-	s := &Server{}
+	// The engine's live listener is the backend; the request's guest port
+	// is only the exposed port it came in on.
+	s := &Server{eng: &fakeNetworkAwareEngine{port: port}}
 	p := proxyHTTPPayload{
-		GuestPort:  port,
+		GuestPort:  8080,
 		Method:     http.MethodGet,
 		RequestURI: "/test",
 		Header:     http.Header{"Accept": {"text/plain"}},

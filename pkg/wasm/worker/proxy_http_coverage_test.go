@@ -52,7 +52,7 @@ func TestCoverage95ProxyGuestHTTPFailureAndCounters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1", WASIListenPort: port}}
+	s := &Server{eng: &fakeNetworkAwareEngine{port: port}, lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1", WASIListenPort: port}}
 	req := httptest.NewRequest(http.MethodPost, "http://guest/x", strings.NewReader("request"))
 	rec := httptest.NewRecorder()
 	if err := s.proxyGuestHTTP(context.Background(), "sb", 0, rec, req); err != nil {
@@ -85,6 +85,7 @@ func TestCoverage95ProxyHTTPBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.lastCaps.WASIListenPort = port
+	s.eng = &fakeNetworkAwareEngine{port: port}
 	if err := s.proxyGuestHTTP(context.Background(), "sb", 0, rec, req); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +148,7 @@ func TestCoverage95ProxyGuestHTTPFromPayloadOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1", WASIListenPort: port}}
+	s := &Server{eng: &fakeNetworkAwareEngine{port: port}, lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1", WASIListenPort: port}}
 	_, err = s.proxyGuestHTTPFromPayload(context.Background(), "sb", proxyHTTPPayload{
 		Method: http.MethodGet, RequestURI: "/big", GuestPort: port,
 	})

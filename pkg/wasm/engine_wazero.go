@@ -47,6 +47,9 @@ type wazeroEngine struct {
 	netHook     *NetworkHook
 	netHost     *wazeroNetHost
 	wasiCompat  bool
+	// listen is the running instance's listeners (wazero_listeners.go),
+	// published and cleared with module under callMu.
+	listen *instanceListen
 	// lastLoad is the sub-stage breakdown of the most recent LoadModule, read
 	// back by the worker via LastLoadTimings() (LoadTimingReporter).
 	lastLoad LoadTimings
@@ -76,7 +79,7 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 		e.runtime = nil
 	}
 	pages := MemoryLimitPages(memoryMB)
-	r, err := newBaseRuntime(ctx, pages)
+	r, err := newBaseRuntimeWatched(ctx, pages, fdWatchFactory{w: e})
 	if err != nil {
 		return err
 	}
@@ -103,6 +106,14 @@ func wazeroCompileCacheDir() string {
 // MultiInstanceEngine (engine_multi.go) so both get identical runtime config —
 // notably the same compilation cache, which is what makes a warm compile cheap.
 func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
+	return newBaseRuntimeWatched(ctx, pages, nil)
+}
+
+// newBaseRuntimeWatched is newBaseRuntime with function listeners on the
+// wasip1 host module (wazero builds them only when that module is
+// compiled). The single-instance engine watches its guest's descriptors
+// through them (fdWatchFactory); nil adds none.
+func newBaseRuntimeWatched(ctx context.Context, pages uint32, watch experimental.FunctionListenerFactory) (wazero.Runtime, error) {
 	// Guests are untrusted. WithCloseOnContextDone is wazero's supported
 	// concurrent Module.Close path: cancellation/deadlines can preempt
 	// CPU-bound guest code rather than pinning an OS thread indefinitely.
@@ -124,7 +135,11 @@ func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
 		cfg = cfg.WithCompilationCache(cache)
 	}
 	r := wazero.NewRuntimeWithConfig(ctx, cfg)
-	if _, err := wasi_snapshot_preview1.Instantiate(ctx, r); err != nil {
+	wasiCtx := ctx
+	if watch != nil {
+		wasiCtx = experimental.WithFunctionListenerFactory(ctx, watch)
+	}
+	if _, err := wasi_snapshot_preview1.Instantiate(wasiCtx, r); err != nil {
 		_ = r.Close(ctx)
 		return nil, fmt.Errorf("wasi instantiate: %w", err)
 	}
@@ -236,7 +251,7 @@ func (e *wazeroEngine) instantiateLocked(ctx context.Context, caps Capabilities)
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
-	e.publishModule(mod)
+	e.publishModule(mod, resolveInstanceListen(mod, caps))
 	return nil
 }
 
@@ -256,10 +271,11 @@ func (e *wazeroEngine) ensureOpenLocked() error {
 	return nil
 }
 
-func (e *wazeroEngine) publishModule(mod api.Module) {
+func (e *wazeroEngine) publishModule(mod api.Module, listen *instanceListen) {
 	e.callMu.Lock()
 	instanceCtx, instanceEnd := context.WithCancel(context.Background())
 	e.module = mod
+	e.listen = listen
 	e.instanceCtx = instanceCtx
 	e.instanceEnd = instanceEnd
 	e.stopping = false
@@ -324,6 +340,7 @@ func (e *wazeroEngine) stopActiveLocked(ctx context.Context) error {
 	e.callMu.Lock()
 	if e.module == mod {
 		e.module = nil
+		e.listen = nil
 		e.instanceCtx = nil
 		e.instanceEnd = nil
 	}
@@ -444,7 +461,7 @@ func (e *wazeroEngine) instantiateWithIOLocked(ctx context.Context, caps Capabil
 	if err != nil {
 		return fmt.Errorf("instantiate module: %w", err)
 	}
-	e.publishModule(mod)
+	e.publishModule(mod, resolveInstanceListen(mod, caps))
 	return nil
 }
 
@@ -611,13 +628,34 @@ func (e *wazeroEngine) RestoreSnapshot(ctx context.Context, snap SnapshotRestore
 	return nil
 }
 
+// ResolvedListenPort is the host port of the running instance's listener,
+// while it is live. Safe to call while the guest runs: it reads what the
+// engine resolved at instantiation, not wazero's fd table.
 func (e *wazeroEngine) ResolvedListenPort() (int, bool) {
-	mod, _, done, err := e.beginCall(context.Background())
-	if err != nil {
+	live := e.liveListeners()
+	if len(live) == 0 {
 		return 0, false
 	}
+	return live[0].hostPort, true
+}
+
+// liveListeners are the running instance's listeners the guest still has.
+func (e *wazeroEngine) liveListeners() []boundListener {
+	mod, _, done, err := e.beginCall(context.Background())
+	if err != nil {
+		return nil
+	}
 	defer done()
-	return ResolvedListenPort(mod)
+	// A module wazero closed on its own (the guest exited, its call hit a
+	// deadline) has closed its listeners, and the ports they bound are free
+	// for any other bind on the host: no listener of this instance.
+	if mod.IsClosed() {
+		return nil
+	}
+	e.callMu.Lock()
+	listen := e.listen
+	e.callMu.Unlock()
+	return listen.live()
 }
 
 func (e *wazeroEngine) SupportsListen() bool { return true }

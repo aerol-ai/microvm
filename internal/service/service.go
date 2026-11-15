@@ -5568,11 +5568,14 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol,
 	}
 	// Probe the container port before routing traffic to it. Skipped on
 	// re-expose (existingBefore != nil — port was already reachable) and on
-	// WASM sandboxes (no direct container IP). Non-fatal: if the process has
-	// not yet bound we warn and proceed rather than holding the caller until
-	// it does; the operator can retry expose_port or the client can retry
-	// the request once the process is up.
-	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted && !skipPortProbe(ctx) {
+	// WASM sandboxes: their ContainerIP is the host's loopback, so the probe
+	// would dial whatever listens on that port on the host, and a WASM
+	// guest never binds the exposed port anyway (its worker routes to it).
+	// Non-fatal: if the process has not yet bound we warn and proceed
+	// rather than holding the caller until it does; the operator can retry
+	// expose_port or the client can retry the request once the process is
+	// up.
+	if existingBefore == nil && sandbox.ContainerIP != "" && sandbox.Status == models.SandboxStatusStarted && !s.isWasmSandbox(sandbox) && !skipPortProbe(ctx) {
 		probeFn := s.probeContainerPortFn
 		if probeFn == nil {
 			probeFn = probeContainerPort
