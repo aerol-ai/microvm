@@ -32,18 +32,20 @@ type Engine interface {
 	// ResolvedListenPort returns the host port for an ephemeral wasip1 listener (0 in caps).
 	ResolvedListenPort() (int, bool)
 	// SupportsListen reports whether the engine can host a wasip1 TCP listener
-	// (the HTTP ingress / expose_port path). wazero can; the wasmtime backend
-	// cannot (no wasmtime release can pre-open a listener for a WASI guest),
-	// so the worker moves such a sandbox to wazero or, with that fallback
-	// off, rejects the request up front rather than silently failing to
-	// resolve a port (worker/listen_engine.go).
+	// (the HTTP ingress / expose_port path) for the loaded module. wazero
+	// can. The wasmtime backend can on Linux and macOS for a module that
+	// exports its memory: wasmtime cannot pre-open a listener, so the
+	// engine serves the guest's sockets itself (wasmtime_sockets.go). For
+	// an engine that cannot, the worker moves the sandbox to wazero or,
+	// with that fallback off, rejects the request up front rather than
+	// silently failing to resolve a port (worker/listen_engine.go).
 	SupportsListen() bool
 }
 
 // MultiListenEngine is an Engine that pre-opens one wasip1 listener per
 // exposed port (Capabilities.WASIListeners, #177) and can tell which of
-// them its guest serves. Optional, so the wasmtime backend and test fakes
-// stay plain Engines; wazero implements it.
+// them its guest serves. Optional, so test fakes stay plain Engines;
+// wazero and wasmtime implement it.
 type MultiListenEngine interface {
 	Engine
 	// ResolvedListeners returns the running instance's live listeners with
