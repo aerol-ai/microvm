@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -71,7 +70,10 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return nil, err
 	}
-	socketPath := filepath.Join(workDir, "worker.sock")
+	socketPath, err := d.ownWorkerSocket(sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
 	workerKey := sandbox.ID
 
 	if err := d.supervisor.Ensure(ctx, workerKey, socketPath); err != nil {

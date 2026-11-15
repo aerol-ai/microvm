@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
@@ -48,6 +49,11 @@ type Driver struct {
 	// guards it.
 	workerCgroup   *hostproc.Cgroup
 	pendingWorkers map[string]worker.FoundWorker
+
+	// hostDirsReady latches once ensureHostDirs has made the driver's own
+	// dirs under the run dir; hostDirsMu single-flights the first call.
+	hostDirsReady atomic.Bool
+	hostDirsMu    sync.Mutex
 
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance

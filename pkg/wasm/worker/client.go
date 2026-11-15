@@ -132,27 +132,57 @@ func (c *Client) Ping(sandboxID string) error {
 	return nil
 }
 
-// InstanceLoaded reports whether the worker currently has an engine/module loaded.
-func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+// InstanceStatus is a worker's answer about one sandbox's instance.
+type InstanceStatus struct {
+	// Loaded: the worker has its module loaded and, when Checked, holds the
+	// asked sandbox's instance (a resident host: has an instance for it).
+	Loaded bool
+	// SandboxID is the sandbox whose instance the worker says it holds.
+	SandboxID string
+	// Checked is false from a worker that predates identity answers: it
+	// cannot say whose instance it holds.
+	Checked bool
+}
+
+// Foreign reports whether the worker said it holds another sandbox's
+// instance than sandboxID's.
+func (s InstanceStatus) Foreign(sandboxID string) bool {
+	return s.Checked && sandboxID != "" && s.SandboxID != "" && s.SandboxID != sandboxID
+}
+
+// InstanceStatus asks the worker about sandboxID's instance ("" asks only
+// whether the module is loaded).
+func (c *Client) InstanceStatus(ctx context.Context, sandboxID string) (InstanceStatus, error) {
 	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgInstanceStatus, SandboxID: sandboxID})
 	if err != nil {
-		return false, err
+		return InstanceStatus{}, err
 	}
 	if reply.Type == MsgError {
 		var p errorPayload
 		if err := decodePayload(reply.Payload, &p); err != nil {
-			return false, err
+			return InstanceStatus{}, err
 		}
-		return false, fmt.Errorf("%s", p.Message)
+		return InstanceStatus{}, fmt.Errorf("%s", p.Message)
 	}
 	if reply.Type != MsgOK {
-		return false, fmt.Errorf("unexpected reply type %q", reply.Type)
+		return InstanceStatus{}, fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
 	var p instanceStatusPayload
 	if err := decodePayload(reply.Payload, &p); err != nil {
+		return InstanceStatus{}, err
+	}
+	return InstanceStatus{Loaded: p.Loaded, SandboxID: p.SandboxID, Checked: p.Checked}, nil
+}
+
+// InstanceLoaded reports whether the worker has its module loaded and, for a
+// sandboxID, still holds that sandbox's instance. A worker holding another
+// sandbox's instance answers false, here as well as in the worker.
+func (c *Client) InstanceLoaded(ctx context.Context, sandboxID string) (bool, error) {
+	st, err := c.InstanceStatus(ctx, sandboxID)
+	if err != nil {
 		return false, err
 	}
-	return p.Loaded, nil
+	return st.Loaded && !st.Foreign(sandboxID), nil
 }
 
 // LoadModule compiles the module at path inside the worker process and returns

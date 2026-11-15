@@ -452,7 +452,10 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 		return fmt.Errorf("worker supervisor not configured")
 	}
 	residentSocket := inst.socketPath
-	coldSocket := filepath.Join(inst.workDir, "worker.sock")
+	coldSocket, err := d.ownWorkerSocket(inst.sandboxID)
+	if err != nil {
+		return err
+	}
 	client := d.newWorkerClient(coldSocket)
 
 	// 1) Bring up the dedicated cold worker + compile + instantiate (listener

@@ -644,3 +644,36 @@ func TestAcquireOrMissNonErrNoSlot(t *testing.T) {
 	// We assert coverage is ≥ 87% which accounts for this.
 	_ = sentinelErr
 }
+
+// ---------- slot sockets ----------
+
+// SlotFromSocket reads back exactly the socket WarmOne gives a slot, and
+// nothing else: the WASM driver trusts a record naming a warm slot only
+// when its socket passes this check.
+func TestSlotFromSocket(t *testing.T) {
+	run := "/run/sandboxd/wasm"
+	p := New(run, nil)
+	id := NewSlotID()
+	valid := filepath.Join(p.SlotDir("sha256:0123456789abcdef", id), slotSocketName)
+	if got, ok := SlotFromSocket(run, valid); !ok || got != id {
+		t.Fatalf("SlotFromSocket(%q) = %q, %v; want %q", valid, got, ok, id)
+	}
+	cases := []struct{ name, socket string }{
+		{"other run dir", "/elsewhere/pool/sha256:01234/" + id + "/worker.sock"},
+		{"not under pool", run + "/sb-1/" + id + "/worker.sock"},
+		{"other socket name", run + "/pool/sha256:01234/" + id + "/other.sock"},
+		{"slot id not minted", run + "/pool/sha256:01234/sb-victim/worker.sock"},
+		{"no digest prefix", run + "/pool/" + id + "/worker.sock"},
+		{"dot prefix", run + "/pool/./" + id + "/worker.sock"},
+		{"dot-dot prefix", run + "/pool/../" + id + "/worker.sock"},
+		{"prefix too long", run + "/pool/sha256:0123456789/" + id + "/worker.sock"},
+		{"unclean path", run + "/pool//sha256:01234/" + id + "/worker.sock"},
+		{"too deep", run + "/pool/a/b/" + id + "/worker.sock"},
+		{"relative", "pool/sha256:01234/" + id + "/worker.sock"},
+	}
+	for _, tc := range cases {
+		if got, ok := SlotFromSocket(run, tc.socket); ok {
+			t.Errorf("%s: SlotFromSocket(%q) = %q, accepted", tc.name, tc.socket, got)
+		}
+	}
+}

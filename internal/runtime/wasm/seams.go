@@ -63,6 +63,12 @@ func (a workerClientAdapter) InstanceLoaded(ctx context.Context, sandboxID strin
 	return a.client.InstanceLoaded(ctx, sandboxID)
 }
 
+// InstanceStatus also says whose instance the worker holds
+// (instanceStatusReader).
+func (a workerClientAdapter) InstanceStatus(ctx context.Context, sandboxID string) (worker.InstanceStatus, error) {
+	return a.client.InstanceStatus(ctx, sandboxID)
+}
+
 func (a workerClientAdapter) LoadModule(sandboxID, path string, memoryMB int) (wasmengine.LoadTimings, error) {
 	return a.client.LoadModule(sandboxID, path, memoryMB)
 }

@@ -32,6 +32,9 @@ func TestWorkerClientAdapterDelegates(t *testing.T) {
 	_ = adapter.SetNetworkBlocks("sb", false, false)
 	_ = adapter.SetListenPort("sb", 8080, "127.0.0.1")
 	_, _ = adapter.ResolvedListenPort("sb")
+	if _, err := adapter.InstanceStatus(context.Background(), "sb"); err == nil {
+		t.Fatal("status from a socket nobody serves")
+	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	_ = adapter.ProxyHTTP("sb", 8080, rec, req)

@@ -825,7 +825,7 @@ func TestBringUpResidentHostLoadError(t *testing.T) {
 func TestMigrateResidentToColdLoadError(t *testing.T) {
 	d, _, _, _ := residentTestDriver(t, true)
 	d.SetWorkerClientFactory(func(socket string) WorkerClient {
-		if filepath.Base(socket) == "worker.sock" {
+		if filepath.Base(filepath.Dir(socket)) == socketsDirName { // the cold worker
 			return &failLoadClient{}
 		}
 		return &recordingWorkerClient{}
@@ -848,7 +848,7 @@ func TestMigrateResidentToColdLoadError(t *testing.T) {
 func TestMigrateResidentToColdWaitError(t *testing.T) {
 	d, _, _, _ := residentTestDriver(t, true)
 	d.SetWorkerClientFactory(func(socket string) WorkerClient {
-		if filepath.Base(socket) == "worker.sock" {
+		if filepath.Base(filepath.Dir(socket)) == socketsDirName { // the cold worker
 			return &failPingClient{}
 		}
 		return &recordingWorkerClient{}
