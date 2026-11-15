@@ -78,6 +78,27 @@ var newerSchemaMigrations = []schemaMigration{
 		_, err := tx.ExecContext(ctx, createMovedInRowsTable)
 		return err
 	}},
+	// 14: the netstats reading each sandbox's counters were last credited up
+	// to (issue #69, see NetSeen). Added columns only, and their defaults are
+	// what the previous release's rows mean: net_seen_pid 0 is "unknown", so
+	// a row it writes is baselined exactly as it would baseline it. Safe at
+	// open, and needs no backfill. The reading is kept as offsets from the
+	// cumulative counters, so bytes the previous release credits after a
+	// rollback move it too and are not counted again after the roll forward.
+	// A database that has the columns without the record (its
+	// schema_migrations table was lost) keeps them as they are.
+	{number: 14, name: "sandbox_net_seen", n1Safe: true, applyTx: func(ctx context.Context, tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE sandboxes ADD COLUMN net_seen_pid INTEGER NOT NULL DEFAULT 0;`,
+			`ALTER TABLE sandboxes ADD COLUMN net_seen_in_offset INTEGER NOT NULL DEFAULT 0;`,
+			`ALTER TABLE sandboxes ADD COLUMN net_seen_out_offset INTEGER NOT NULL DEFAULT 0;`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // ErrSchemaFromNewerRelease is Open's error for a database on which a newer
