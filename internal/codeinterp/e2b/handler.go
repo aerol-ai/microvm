@@ -23,9 +23,24 @@ import (
 	"github.com/aerol-ai/microvm/internal/codeinterp"
 )
 
-// maxBodyBytes bounds a request body. Code is sent inline, so the bound is
-// the driver frame cap the code has to fit in anyway.
-const maxBodyBytes = codeinterp.MaxFramePayload
+// DefaultMaxBodyBytes bounds a request body. Code is sent inline, so on
+// toolboxd, where the buffer is the sandbox's own memory, the bound is the
+// driver frame cap the code has to fit in anyway. A host that buffers for
+// many sandboxes passes a smaller one (WithMaxBodyBytes).
+const DefaultMaxBodyBytes int64 = codeinterp.MaxFramePayload
+
+// Option tunes a handler.
+type Option func(*handler)
+
+// WithMaxBodyBytes bounds a request body; a larger one is answered 413.
+// n <= 0 keeps DefaultMaxBodyBytes.
+func WithMaxBodyBytes(n int64) Option {
+	return func(h *handler) {
+		if n > 0 {
+			h.maxBody = n
+		}
+	}
+}
 
 type handler struct {
 	m         *codeinterp.Manager
@@ -40,15 +55,19 @@ type handler struct {
 // NewHandler serves E2B's Code Interpreter routes from m, which should be
 // built with ManagerOptions. Paths are relative to the mount point; query
 // strings are ignored.
-func NewHandler(m *codeinterp.Manager, logger *slog.Logger) http.Handler {
-	return newHandler(m, logger, KeepaliveInterval)
+func NewHandler(m *codeinterp.Manager, logger *slog.Logger, opts ...Option) http.Handler {
+	h := newHandler(m, logger, KeepaliveInterval)
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func newHandler(m *codeinterp.Manager, logger *slog.Logger, keepalive time.Duration) *handler {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	h := &handler{m: m, logger: logger, keepalive: keepalive, maxBody: maxBodyBytes, now: time.Now}
+	h := &handler{m: m, logger: logger, keepalive: keepalive, maxBody: DefaultMaxBodyBytes, now: time.Now}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /execute", h.execute)
 	mux.HandleFunc("POST /contexts", h.createContext)

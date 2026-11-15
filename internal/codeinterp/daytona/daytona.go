@@ -91,12 +91,29 @@ type ClientMessage struct {
 // Daytona.
 const DefaultTimeout = 600 * time.Second
 
+// DefaultMaxMessageBytes caps one client WebSocket message; the first one
+// carries the run's code. On toolboxd the buffer is the sandbox's own
+// memory, so the cap is the driver frame cap the code has to fit in
+// anyway. A host that buffers for many sandboxes passes a smaller one
+// (WithMaxMessageBytes).
+const DefaultMaxMessageBytes int64 = codeinterp.MaxFramePayload
+
+// Option tunes a handler.
+type Option func(*handler)
+
+// WithMaxMessageBytes caps one client WebSocket message. n <= 0 keeps
+// DefaultMaxMessageBytes. A larger message ends the connection with 1009.
+func WithMaxMessageBytes(n int64) Option {
+	return func(h *handler) {
+		if n > 0 {
+			h.maxMessage = n
+		}
+	}
+}
+
 const (
 	// maxBody bounds a context request body.
 	maxBody = 1 << 20
-	// maxMessage bounds a client WebSocket message; the first one carries
-	// the code.
-	maxMessage = codeinterp.MaxFramePayload
 	// firstMessageWait bounds how long a client may take to send its run.
 	firstMessageWait = 10 * time.Second
 	// interruptGrace is how long an interrupted (timed out) run has to stop
@@ -125,18 +142,23 @@ type liveness struct {
 var defaultLiveness = liveness{interval: 30 * time.Second, pongWait: 90 * time.Second, writeWait: 30 * time.Second}
 
 type handler struct {
-	m         *codeinterp.Manager
-	logger    *slog.Logger
-	live      liveness
-	firstWait time.Duration
-	closeWait time.Duration
-	upgrader  websocket.Upgrader
+	m          *codeinterp.Manager
+	logger     *slog.Logger
+	live       liveness
+	firstWait  time.Duration
+	closeWait  time.Duration
+	maxMessage int64
+	upgrader   websocket.Upgrader
 }
 
 // NewHandler serves the protocol for m. Mount it with the /process/interpreter
 // prefix stripped.
-func NewHandler(m *codeinterp.Manager, logger *slog.Logger) http.Handler {
-	return newHandler(m, logger)
+func NewHandler(m *codeinterp.Manager, logger *slog.Logger, opts ...Option) http.Handler {
+	h := newHandler(m, logger)
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func newHandler(m *codeinterp.Manager, logger *slog.Logger) *handler {
@@ -144,11 +166,12 @@ func newHandler(m *codeinterp.Manager, logger *slog.Logger) *handler {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &handler{
-		m:         m,
-		logger:    logger,
-		live:      defaultLiveness,
-		firstWait: firstMessageWait,
-		closeWait: closeWait,
+		m:          m,
+		logger:     logger,
+		live:       defaultLiveness,
+		firstWait:  firstMessageWait,
+		closeWait:  closeWait,
+		maxMessage: DefaultMaxMessageBytes,
 		upgrader: websocket.Upgrader{
 			// The caller authenticated before the upgrade (toolboxd's bearer
 			// check), and SDK clients send no Origin.

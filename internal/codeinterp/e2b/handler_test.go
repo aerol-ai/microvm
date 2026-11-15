@@ -429,6 +429,14 @@ func TestNewHandlerDefaults(t *testing.T) {
 	if !ok || h.keepalive != KeepaliveInterval || h.maxBody != codeinterp.MaxFramePayload || h.logger == nil {
 		t.Fatalf("NewHandler = %+v", h)
 	}
+	// A host that buffers bodies for many sandboxes passes its own bound;
+	// zero keeps the default.
+	if small := NewHandler(m, nil, WithMaxBodyBytes(1024)).(*handler); small.maxBody != 1024 {
+		t.Fatalf("WithMaxBodyBytes(1024) = %d", small.maxBody)
+	}
+	if zero := NewHandler(m, nil, WithMaxBodyBytes(0)).(*handler); zero.maxBody != DefaultMaxBodyBytes {
+		t.Fatalf("WithMaxBodyBytes(0) = %d", zero.maxBody)
+	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {

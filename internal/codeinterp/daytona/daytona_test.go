@@ -436,8 +436,26 @@ func TestNewHandlerDefaults(t *testing.T) {
 	m := codeinterp.NewManager(ManagerOptions(&fakeLauncher{}, nil, ""))
 	defer m.Close()
 	h, ok := NewHandler(m, nil).(*handler)
-	if !ok || h.logger == nil || h.live != defaultLiveness || h.firstWait != firstMessageWait {
+	if !ok || h.logger == nil || h.live != defaultLiveness || h.firstWait != firstMessageWait || h.maxMessage != DefaultMaxMessageBytes {
 		t.Fatalf("handler = %+v", h)
+	}
+	if zero := NewHandler(m, nil, WithMaxMessageBytes(0)).(*handler); zero.maxMessage != DefaultMaxMessageBytes {
+		t.Fatalf("WithMaxMessageBytes(0) = %d", zero.maxMessage)
+	}
+}
+
+// A host that buffers messages for many sandboxes passes a smaller cap; a
+// first message over it ends the connection with 1009 and runs nothing.
+func TestExecuteMessageLimit(t *testing.T) {
+	l := &fakeLauncher{}
+	e := newTestEnv(t, l, nil)
+	WithMaxMessageBytes(1024)(e.h)
+	res := e.run(t, ExecuteRequest{Code: "print " + strings.Repeat("x", 2048)})
+	if res.closeCode != websocket.CloseMessageTooBig || len(res.frames) != 0 || l.launches != 0 {
+		t.Fatalf("2 KiB message = %d %q (frames %v, launches %d)", res.closeCode, res.closeReason, res.frames, l.launches)
+	}
+	if res := e.run(t, ExecuteRequest{Code: "print small"}); res.text("stdout") != "small" {
+		t.Fatalf("small message = %v", res.frames)
 	}
 }
 

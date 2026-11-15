@@ -197,7 +197,7 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	conn.SetReadLimit(maxMessage)
+	conn.SetReadLimit(h.maxMessage)
 
 	_ = conn.SetReadDeadline(time.Now().Add(h.firstWait))
 	_, data, err := conn.ReadMessage()
