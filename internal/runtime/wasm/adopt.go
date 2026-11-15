@@ -68,8 +68,15 @@ type instanceRecord struct {
 	ModuleSize   int64  `json:"module_size,omitempty"`
 	EntryExport  string `json:"entry_export,omitempty"`
 	MemoryMB     int    `json:"memory_mb,omitempty"`
-	// ListenPort is the host port a serving guest listens on (expose_port).
+	// ListenPort is the host port a serving guest listens on (expose_port):
+	// its primary listener, the only one an older worker has.
 	ListenPort int `json:"listen_port,omitempty"`
+	// ListenPorts maps each exposed port to its listener's host port, from
+	// a worker that routes per port. A record with ListenPort and without
+	// ListenPorts is a worker with one listener for every port.
+	ListenPorts map[int]int `json:"listen_ports,omitempty"`
+	// ListenEngine is the engine the worker serves HTTP on, when it said.
+	ListenEngine string `json:"listen_engine,omitempty"`
 }
 
 // ErrNotAdopted: no running instance of the sandbox survived to adopt.
@@ -136,13 +143,14 @@ func (d *Driver) recordInstance(inst *sandboxInstance) {
 		}
 		return
 	}
+	listen := inst.guestListen()
 	d.mu.Lock()
 	rec := instanceRecord{
 		SandboxID: inst.sandboxID, Socket: inst.socketPath, WorkerKey: inst.workerKey,
 		Resident: inst.fromResidentHost, WarmPool: inst.fromWarmPool,
 		ModuleRef: inst.moduleRef, ModulePath: inst.modulePath, ModuleDigest: inst.moduleDigest,
 		ModuleSize: inst.moduleSize, EntryExport: inst.entryExport, MemoryMB: inst.memoryMB,
-		ListenPort: inst.resolvedListenPort,
+		ListenPort: listen.primary, ListenPorts: listen.ports, ListenEngine: listen.engine,
 	}
 	d.mu.Unlock()
 	if err := writeFileAtomic(path, rec); err != nil && d.logger != nil {
@@ -467,12 +475,17 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 	} else if !d.adoptOwnWorker(ctx, sb.ID, rec) {
 		return nil, ErrNotAdopted
 	}
-	listenPort := rec.ListenPort
+	listen := guestListenState{primary: rec.ListenPort, ports: rec.ListenPorts, engine: rec.ListenEngine}
 	if legacy && !rec.Resident {
 		// The worker's own answer, not a number the guest could have
-		// written: the guest HTTP proxy dials the port it is given.
-		listenPort = d.workerListenPort(rec.Socket, sb.ID)
+		// written. A record from /work is from a release whose workers have
+		// one listener for every port.
+		listen = guestListenState{primary: d.workerListenPort(rec.Socket, sb.ID)}
 	}
+	// A listener and no per-port map: a worker from an older release. It
+	// is never sent a port number (guestHTTPProxy) nor asked for per-port
+	// listeners.
+	listen.legacy = listen.primary > 0 && len(listen.ports) == 0
 
 	workDir := d.sandboxDir(sb.ID)
 	inst := &sandboxInstance{
@@ -495,7 +508,10 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 		memoryMB:           rec.MemoryMB,
 		diskGB:             sb.DiskGB,
 		durability:         sb.Durability,
-		resolvedListenPort: listenPort,
+		resolvedListenPort: listen.primary,
+		listenPorts:        listen.ports,
+		legacyListen:       listen.legacy,
+		listenEngine:       listen.engine,
 	}
 	if inst.memoryMB <= 0 {
 		inst.memoryMB = sb.MemoryMB

@@ -106,6 +106,8 @@ pkg/wasm/testdata/fsprobe.wasm
 pkg/wasm/testdata/fsprobe.wasm.*.tmp
 pkg/wasm/testdata/wasip1-stdio.wasm
 pkg/wasm/testdata/.wasip1-*
+pkg/wasm/testdata/wasip1-http-*.wasm
+pkg/wasm/testdata/wasip1-http-*.tmp
 ./*.wasm
 ./pkg/wasm/testdata/wasip1-http.wasm
 internal/store/invalid-dsn:::

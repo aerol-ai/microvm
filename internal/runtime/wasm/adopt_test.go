@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -676,7 +677,7 @@ func TestLegacyRecordReadOnlyAsAPlainFile(t *testing.T) {
 	if err := writeFileAtomic(path, valid); err != nil {
 		t.Fatal(err)
 	}
-	if rec, legacy, ok := d.readInstanceRecord("sb-l"); !ok || !legacy || rec != valid {
+	if rec, legacy, ok := d.readInstanceRecord("sb-l"); !ok || !legacy || !reflect.DeepEqual(rec, valid) {
 		t.Fatalf("plain legacy record = %+v, legacy %v, ok %v", rec, legacy, ok)
 	}
 	// A record of the driver's wins over one left in /work, and an

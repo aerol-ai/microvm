@@ -196,6 +196,24 @@ func TestLoadCases(t *testing.T) {
 				if cfg.WasmPoolDepthDefault != 2 {
 					t.Fatalf("expected default WasmPoolDepthDefault=2, got %d", cfg.WasmPoolDepthDefault)
 				}
+				if !cfg.WasmWasmtimeListenFallback {
+					t.Fatalf("expected default WasmWasmtimeListenFallback=true, got false")
+				}
+			},
+		},
+		{
+			name: "wasmtime_listen_fallback_off",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_WASM_WASMTIME_LISTEN_FALLBACK", "false")
+				cfg, err := Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				if cfg.WasmWasmtimeListenFallback {
+					t.Fatalf("expected WasmWasmtimeListenFallback=false, got true")
+				}
 			},
 		},
 		{

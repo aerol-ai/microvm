@@ -67,6 +67,7 @@ func workerEnvironment() []string {
 		"PATH": {}, "TMPDIR": {}, "LANG": {}, "LC_ALL": {}, "TZ": {},
 		"SSL_CERT_FILE": {}, "SSL_CERT_DIR": {}, "LD_LIBRARY_PATH": {},
 		"AEROL_WASM_ENGINE": {}, "AEROL_WASM_COMPILE_CACHE_DIR": {},
+		ListenFallbackEnv:      {},
 		"SB_AUDIT_INGEST_PORT": {}, "SB_AUDIT_SPILL_DIR": {},
 		"SB_EGRESS_ATTRIBUTION_ENABLED": {}, "SB_NODE_ID": {},
 		"SB_EGRESS_OPERATOR_FILE": {},

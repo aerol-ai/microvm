@@ -46,8 +46,17 @@ type sandboxInstance struct {
 	diskGB           int
 	durability       string
 
-	// Guest HTTP: resolved host port after ephemeral wasip1 bind (0 in caps).
+	// Guest HTTP listeners (guestListenState says what each field is).
+	// listenSync serializes this sandbox's listener syncs: two exposes at
+	// once each re-instantiated the guest and raced on these fields.
+	// listenMu guards them and is never held across a worker call, so a
+	// proxied request never waits on a sync.
+	listenSync         sync.Mutex
+	listenMu           sync.Mutex
 	resolvedListenPort int
+	listenPorts        map[int]int
+	legacyListen       bool
+	listenEngine       string
 	runGeneration      uint64
 	guestServeGen      uint64
 	guestServeMu       sync.Mutex

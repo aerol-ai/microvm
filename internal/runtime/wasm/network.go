@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -248,7 +249,11 @@ func (g *networkGateway) serveHTTP(sandboxID string, guestPort int, w http.Respo
 	}
 	cw := &byteCountWriter{ResponseWriter: w, counter: &usage.bytesOut}
 	if err := proxy(sandboxID, guestPort, cw, r); err != nil {
-		http.Error(cw, err.Error(), http.StatusBadGateway)
+		status := http.StatusBadGateway
+		if errors.Is(err, ErrGuestNotListening) {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(cw, err.Error(), status)
 	}
 }
 

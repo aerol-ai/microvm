@@ -132,6 +132,9 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}
+	// The guest starts without listeners, maybe on a new worker: the
+	// service's port sync after a start sets them up again.
+	inst.resetGuestListen()
 	inst.status = models.SandboxStatusStarted
 	d.mu.Lock()
 	d.byID[sandboxID] = inst
