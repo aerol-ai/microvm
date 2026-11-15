@@ -32,7 +32,9 @@ type listenPortsPayload struct {
 	Primary int `json:"primary,omitempty"`
 	// Engine is the engine the instance runs on. FallbackFrom is the
 	// configured engine the worker left for this sandbox to serve HTTP on
-	// one that can (wasmtime cannot pre-open a listener; #175).
+	// one that can (listen_engine.go): empty while it runs the configured
+	// one, which is always so on wazero and, on Linux and macOS, on
+	// wasmtime too (#175).
 	Engine       string `json:"engine,omitempty"`
 	FallbackFrom string `json:"fallback_from,omitempty"`
 }

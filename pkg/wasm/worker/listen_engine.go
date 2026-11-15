@@ -12,8 +12,11 @@ import (
 )
 
 // ListenFallbackEnv carries SB_WASM_WASMTIME_LISTEN_FALLBACK to the worker:
-// "false" keeps a sandbox on the wasmtime engine from moving to wazero when
-// it needs a guest listener (ensureListenEngineLocked). Unset means on.
+// "false" keeps a sandbox whose engine cannot pre-open a guest listener
+// from moving to wazero when it needs one (ensureListenEngineLocked).
+// Unset means on. The wasmtime engine serves listeners itself on Linux and
+// macOS, so there the setting only matters for a module that exports no
+// memory.
 const ListenFallbackEnv = "AEROL_WASM_WASMTIME_LISTEN_FALLBACK"
 
 // loadedEngine is the module a per-sandbox worker runs and the engine it
@@ -72,15 +75,17 @@ var newListenEngine = func(ctx context.Context) (wasmengine.Engine, error) {
 // before one is asked for. The caller holds mu, has checked eng is set, and
 // instantiates right after.
 //
-// No wasmtime release can give a WASI guest a pre-opened TCP listener
-// (#175: the C API had one in v14-v19 only, wasmtime-go never wrapped it,
-// and preview-1 sock_accept is a stub there). So a sandbox on wasmtime that
-// exposes a port moves to wazero: this worker rebuilds the engine from the
-// module it loaded, and the caller instantiates the guest on it with the
-// same caps. Only this sandbox moves; wasmtime's instruction count is gone
-// for it from then on (wazero meters wall time only). The guest restarts,
-// as it does for any new listener. SB_WASM_WASMTIME_LISTEN_FALLBACK=false
-// keeps the old error instead.
+// wazero can, and so can the wasmtime engine, which serves the guest's
+// sockets from its own WASI layer (pkg/wasm/wasmtime_sockets.go, #175):
+// wasmtime itself cannot pre-open one. That layer runs on Linux and macOS
+// and needs a module that exports its memory, as every WASI guest does.
+// For an engine that still cannot (wasmtime anywhere else, or such an odd
+// module), the sandbox moves to wazero: this worker rebuilds the engine
+// from the module it loaded, and the caller instantiates the guest on it
+// with the same caps. Only this sandbox moves; wasmtime's instruction
+// count is gone for it from then on (wazero meters wall time only). The
+// guest restarts, as it does for any new listener.
+// SB_WASM_WASMTIME_LISTEN_FALLBACK=false keeps the error instead.
 func (s *Server) ensureListenEngineLocked(ctx context.Context, sandboxID string) error {
 	if s.eng.SupportsListen() {
 		return nil
