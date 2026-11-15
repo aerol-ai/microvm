@@ -441,6 +441,10 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 	if !ok {
 		return nil, ErrNotAdopted
 	}
+	if d.workerInWorkDir(sb.ID, rec) {
+		d.retireWorkDirWorker(sb.ID, rec, legacy)
+		return nil, ErrNotAdopted
+	}
 	modulePath, moduleSize, moduleDigest := rec.ModulePath, rec.ModuleSize, firstNonEmpty(rec.ModuleDigest, sb.ModuleDigest)
 	if legacy {
 		// It passed the checks, so it is one an older sandboxd wrote. It
@@ -578,6 +582,56 @@ func (d *Driver) instanceStatus(ctx context.Context, socket, sandboxID string) (
 	return worker.InstanceStatus{Loaded: loaded}, err
 }
 
+// workerInWorkDir reports whether rec names the sandbox's own worker on
+// the socket releases before socketsDirName used: in the sandbox's dir,
+// which is its guest's /work.
+func (d *Driver) workerInWorkDir(sandboxID string, rec instanceRecord) bool {
+	return !rec.Resident && !rec.WarmPool && rec.Socket != "" && rec.Socket == d.legacyWorkerSocketPath(sandboxID)
+}
+
+// retireWorkDirWorker stops the pre-upgrade worker rec names without ever
+// connecting to it, and the caller restores the sandbox fresh over its
+// kept /work, on a socket in the driver's own dir.
+//
+// Why not ask it, as adoptOwnWorker asks a worker: its socket is in the
+// guest's /work, so the guest can replace it with a (relative) link to
+// another sandbox's pre-upgrade socket. A worker of those releases answers
+// for any sandbox id and has no holder check, so whatever answers on that
+// path proves nothing, and adopting through it would route this sandbox to
+// another sandbox's guest. Checking the peer's pid on each connection
+// (SO_PEERCRED, LOCAL_PEERPID) would have to follow the worker through
+// every respawn, which would listen in /work again, and every dial path
+// (requests, streams, kills, the proxy); not dialing there at all closes
+// it for good. The worker to stop is found by its own command line
+// (FindWorkers), never through the path, so the one stopped is this
+// sandbox's. The cost is one fresh start, on the upgrade, for sandboxes
+// still on such a worker: their files stay, their memory does not.
+func (d *Driver) retireWorkDirWorker(sandboxID string, rec instanceRecord, legacy bool) {
+	d.residentMu.Lock()
+	f, found := d.pendingWorkers[rec.Socket]
+	if found {
+		delete(d.pendingWorkers, rec.Socket)
+	}
+	d.residentMu.Unlock()
+	if found {
+		stopProcess(f.Proc)
+	}
+	if legacy {
+		// It is ours (it passed the checks); it does not stay in /work.
+		_ = os.Remove(d.legacyInstanceRecordPath(sandboxID))
+	}
+	// The worker's socket goes too, so nothing finds it again. Anything
+	// else at that name (a link, a file) is the guest's, and stays.
+	if st, err := os.Lstat(rec.Socket); err == nil && st.Mode()&fs.ModeSocket != 0 {
+		_ = os.Remove(rec.Socket)
+	}
+	if d.logger != nil {
+		d.logger.Warn("wasm adopt: the sandbox's worker is from a release that kept its socket in the guest's /work; "+
+			"it is stopped without being contacted and the sandbox is restored over its files (memory is lost)",
+			"sandbox_id", sandboxID, "socket", rec.Socket, "worker_found", found)
+	}
+}
+
 // adoptOwnWorker takes over the per-sandbox (or warm-slot) worker rec
 // names, once that worker answers for sandboxID.
 func (d *Driver) adoptOwnWorker(ctx context.Context, sandboxID string, rec instanceRecord) bool {
@@ -604,8 +658,9 @@ func (d *Driver) adoptOwnWorker(ctx context.Context, sandboxID string, rec insta
 	}
 	// A worker from before identity answers (!st.Checked) cannot say whose
 	// instance it holds. It is taken on the record's word, and that word
-	// can only name this sandbox's own socket or a warm slot's
-	// (recordRoutesValid).
+	// can only name this sandbox's own socket in the driver's dir or a warm
+	// slot's (recordRoutesValid): none of them is in a guest's /work
+	// (workerInWorkDir).
 	return true
 }
 
