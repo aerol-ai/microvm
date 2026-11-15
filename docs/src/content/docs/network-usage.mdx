@@ -201,6 +201,7 @@ If the new cap is above the current count, traffic flows again at once. If it is
 ## Good to know
 
 - **Caps are checked on each reading.** The server reads the counters every 10 seconds by default. A fast transfer can go past a cap before the block starts.
+- **Traffic counts from the very start.** The first reading of a new sandbox includes everything it sent and received before that reading. A burst in its first seconds counts against its caps. A restart of the sandbox or of the server never counts the same bytes twice.
 - **Received bytes are counted after they arrive.** A cap stops further traffic. It cannot undo bytes the sandbox already received.
 - **A cap does not undo block-all.** Raising or removing the sent-bytes cap never lifts `networkBlockAll`. Both use the same block.
 - **IPv4 only.** The counters and caps cover IPv4 traffic, as with [Block or allow the internet](/network-access/).
