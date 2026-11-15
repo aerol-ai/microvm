@@ -204,10 +204,16 @@ type wsResult struct {
 	subprotocol string
 }
 
+// types lists the frame types, with adjacent stdout (or stderr) frames
+// counted once: a pipe may hand a real kernel's "a\n" over in two reads.
 func (r wsResult) types() []string {
 	var out []string
 	for _, f := range r.frames {
-		out = append(out, f["type"].(string))
+		typ := f["type"].(string)
+		if n := len(out); n > 0 && out[n-1] == typ && (typ == "stdout" || typ == "stderr") {
+			continue
+		}
+		out = append(out, typ)
 	}
 	return out
 }

@@ -52,6 +52,60 @@ func TestRegistry(t *testing.T) {
 	}
 }
 
+// checkDriver checks lang's registration: programs, file name, argv, and
+// that the script is the embedded one.
+func checkDriver(t *testing.T, lang string, programs []string, fileName string, wantArgs []string, marker string) {
+	t.Helper()
+	d, ok := Lookup(lang)
+	if !ok {
+		t.Fatalf("no %s driver", lang)
+	}
+	if d.Language != lang || !reflect.DeepEqual(d.Programs, programs) || d.FileName != fileName ||
+		!bytes.Contains(d.Script, []byte(marker)) {
+		t.Fatalf("%s driver = %+v", lang, d)
+	}
+	if got := d.Args("/bin/prog", "/d/"+fileName); !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("%s Args = %q, want %q", lang, got, wantArgs)
+	}
+}
+
+// checkDriverRefuses runs lang's script the wrong ways, outside fd mode
+// and in fd mode without descriptors 3 and 4: it must exit non-zero and
+// say why on stderr, not hang or start serving. Skipped without the
+// interpreter.
+func checkDriverRefuses(t *testing.T, lang string) {
+	t.Helper()
+	d, _ := Lookup(lang)
+	program := ""
+	for _, p := range d.Programs {
+		if path, err := exec.LookPath(p); err == nil {
+			program = path
+			break
+		}
+	}
+	if program == "" {
+		t.Skipf("no %s interpreter", lang)
+	}
+	script := filepath.Join(t.TempDir(), d.FileName)
+	if err := os.WriteFile(script, d.Script, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"stdio", "fd"} {
+		ctx, cancel := context.WithTimeout(context.Background(), codeinterp.LaunchTimeout)
+		args := d.Args(program, script)
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Env = append(os.Environ(), "AEROL_INTERP_MODE="+mode, "AEROL_INTERP_NONCE=n")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		timedOut := ctx.Err() != nil
+		cancel()
+		if err == nil || timedOut || !strings.Contains(stderr.String(), "aerolvm interpreter driver: ") {
+			t.Fatalf("%s driver in %s mode without descriptors: err %v, stderr %q", lang, mode, err, stderr.String())
+		}
+	}
+}
+
 func TestRegisterRejectsBadDrivers(t *testing.T) {
 	py, _ := Lookup(codeinterp.LangPython)
 	for name, d := range map[string]Driver{
