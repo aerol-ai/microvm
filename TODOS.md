@@ -134,30 +134,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## A worker's lease renewed without a read covers a sandbox started later (cluster)
-
-- **What:** a worker with no running `failover.policy=recreate` sandbox keeps
-  its ownership lease without asking the leader
-  (`internal/service/ownership_lease.go`, `confirmOwnership`: "nothing to
-  confirm"). If it is cut off from the servers and one of its recreate
-  sandboxes then starts there (a stopped one started again, or a create whose
-  image pull finishes), that sandbox runs on a lease the leader never saw, past
-  the grace, while the leader recreates it elsewhere: two copies.
-- **Why:** found while proving C19 live on kind (2026-11-12). C19's early
-  failover now refuses a node that was not reading until the leader last
-  heard from it, which closes it there except for a node whose recreate
-  sandboxes all stopped within one read interval (about 6 s) of being cut
-  off. The dead-owner grace path reaches it with no such limit, as on main
-  before Phase 2.
-- **Fix sketch:** a renewal without a read must not extend the lease; a
-  recreate sandbox that starts on a node whose lease is older than the lease
-  needs one authoritative read first (one leader round trip, only the first
-  start after the node was idle). That touches the boot path: use
-  `/touch-create-sandbox`.
-- **Effort:** human M / CC S. **Priority:** P1.
-
----
-
 ## The snapshot list is node-local on a cluster (API)
 
 `GET /v1/snapshots` (`pkg/api/v1/snapshot.go` `listSnapshots`) reads only the
@@ -938,6 +914,38 @@ the skip.
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### A worker's lease renewed without a read covers a sandbox started later (cluster) — FIXED
+
+- **What:** a worker with no running `failover.policy=recreate` sandbox keeps
+  its ownership lease without asking the leader
+  (`internal/service/ownership_lease.go`, `confirmOwnership`: "nothing to
+  confirm"). If it is cut off from the servers and one of its recreate
+  sandboxes then starts there (a stopped one started again, or a create whose
+  image pull finishes), that sandbox runs on a lease the leader never saw, past
+  the grace, while the leader recreates it elsewhere: two copies.
+- **Why:** found while proving C19 live on kind (2026-11-12). C19's early
+  failover now refuses a node that was not reading until the leader last
+  heard from it, which closes it there except for a node whose recreate
+  sandboxes all stopped within one read interval (about 6 s) of being cut
+  off. The dead-owner grace path reaches it with no such limit, as on main
+  before Phase 2.
+- **Fix sketch:** a renewal without a read must not extend the lease; a
+  recreate sandbox that starts on a node whose lease is older than the lease
+  needs one authoritative read first (one leader round trip, only the first
+  start after the node was idle). That touches the boot path: use
+  `/touch-create-sandbox`.
+- **Effort:** human M / CC S. **Priority:** P1.
+- **Fixed** (2026-11-15, review finding V3): a confirm with nothing to read
+  sends no read and now renews nothing, in the process or in the lease file
+  (`confirmOwnership`; the file is written again with the same read time,
+  `rewriteOwnershipFence`). A recreate-policy create needs an authoritative
+  read from the last two thirds of a lease (`requireFreshOwnership`, from
+  `persistSandboxCreate`); without one it reads first, with the new sandbox
+  in the read, and is refused if that read fails. Stopped recreate rows were
+  already in the lease's read, so the gap was an empty node with a create in
+  flight. Tests: `TestEmptyLeaseReadCannotAuthorizeDelayedCreate`,
+  `TestRecreateCreateReadsAfterAnIdleSpell`, `TestIdleConfirmDoesNotRenewTheLease`.
 
 ### A forwarded control-plane 4xx reaches the API caller as 500 (API) — FIXED
 
