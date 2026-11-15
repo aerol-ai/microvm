@@ -600,6 +600,7 @@ A sandbox whose agent is older than the code interpreter fails with an "unsuppor
 On a [WASM sandbox](/wasm-sandbox/), each context is CPython built for WebAssembly. It runs inside the sandbox's own WebAssembly engine, never as a program on the server. It sees the sandbox's `/work` folder and nothing else of the server's disk, and it follows the sandbox's network rules. A few things work differently:
 
 - **Python only.** Other languages fail with HTTP 400. Only Python's standard library is there: no IPython (so no `%magics` or `!ls`), no pandas, no matplotlib.
+- **`time.sleep` does not work yet.** It fails with `OSError: [Errno 58] Not supported`, because the WebAssembly engine cannot yet wait until a set time. Code that sleeps needs a container or VM sandbox for now.
 - **Contexts start in `/work`.** That is the only folder a WASM sandbox has. This holds for E2B contexts too, which start in `/home/user` on other sandboxes.
 - **A timeout or an interrupt resets the context.** WebAssembly has no way to stop code and keep going, so the sandbox stops the whole interpreter. The run still ends as on other sandboxes (a timeout error, or `interrupted` set to true), but the context loses its variables. Its next run starts a fresh interpreter in the same context. The same happens when an E2B client disconnects during a run.
 - **At most 4 contexts** in one sandbox, the default context included. One more is refused with HTTP 429.
