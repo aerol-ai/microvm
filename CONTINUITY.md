@@ -12,7 +12,7 @@ The two accounts that cover each other are [`sumansaurabh`](https://github.com/s
 
 Publishing a GitHub release starts [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds the release and uploads its assets. Dispatching [`.github/workflows/publish-sdks.yml`](.github/workflows/publish-sdks.yml) publishes the SDK packages. Registry tokens are GitHub Actions secrets. The workflow reads them, so the person publishing does not need a copy of the token.
 
-The default-branch ruleset requires one approval from a code owner who is not the pull request author, and it has no bypass. The remaining code owner accepts a change by approving a pull request that another person opened. [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) has write access and can open that pull request, as can any contributor.
+The default-branch ruleset requires one approval from a code owner who is not the pull request author, and it has no bypass. The remaining code owner accepts a change by approving a pull request that another person opened. Any contributor can open that pull request from a fork.
 
 Day to day, the maintainer publishes official releases. The release permission above is how a release still ships when the maintainer is the person who is unavailable.
 
