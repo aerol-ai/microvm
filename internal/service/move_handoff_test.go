@@ -1272,3 +1272,71 @@ func TestFailedFirecrackerDropStaysPending(t *testing.T) {
 		t.Fatalf("after the retry: pending %+v, read %v, %d bytes staged", st, err, len(rt.imported))
 	}
 }
+
+// A moved sandbox's start and drop refuse, and change nothing, when they
+// cannot do their checks: no cluster, a lock they cannot get before their
+// caller gives up, no row to start, or no leader read. An import over an
+// earlier one whose drop is refused is refused too.
+func TestMoveRPCsRefuseWithoutTheirChecks(t *testing.T) {
+	ctx := context.Background()
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	noLeader := func(dst *Service, c *moveStubCluster) {
+		dst.AttachCluster(&placementCluster{moveStubCluster: c, err: errors.New("no leader")})
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(dst *Service, c *moveStubCluster) (unlock func())
+		call  func(dst *Service) error
+	}{
+		{"a drop with no cluster", func(dst *Service, _ *moveStubCluster) func() { detachCluster(dst); return nil },
+			func(dst *Service) error { return dst.DropMove(ctx, "sb-vm", "") }},
+		{"a start with no cluster", func(dst *Service, _ *moveStubCluster) func() { detachCluster(dst); return nil },
+			func(dst *Service) error { return dst.StartMoved(ctx, "sb-vm", "", nil) }},
+		{"a drop that cannot get the lock", lockedFor(ctx),
+			func(dst *Service) error { return dst.DropMove(cancelled, "sb-vm", "") }},
+		{"a start that cannot get the lock", lockedFor(ctx),
+			func(dst *Service) error { return dst.StartMoved(cancelled, "sb-vm", "", nil) }},
+		{"a start with no row", nil,
+			func(dst *Service) error { return dst.StartMoved(ctx, "sb-none", "", nil) }},
+		{"a start with no leader read", func(dst *Service, c *moveStubCluster) func() { noLeader(dst, c); return nil },
+			func(dst *Service) error { return dst.StartMoved(ctx, "sb-vm", "inc-1", nil) }},
+		{"an import over an earlier one it cannot drop", func(dst *Service, c *moveStubCluster) func() { noLeader(dst, c); return nil },
+			func(dst *Service) error { return dst.ImportMove(ctx, "sb-vm", "worker-a", nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst, rt, c := importedFirecracker(t, moveTimings{})
+			if tc.setup != nil {
+				if unlock := tc.setup(dst, c); unlock != nil {
+					defer unlock()
+				}
+			}
+			if err := tc.call(dst); err == nil {
+				t.Fatal("went ahead")
+			}
+			sb, err := dst.store.Get(ctx, "sb-vm")
+			if err != nil || !awaitingMovedStart(sb) || rt.startCount != 0 || rt.dropped != 0 {
+				t.Fatalf("changed something: %+v %v, runtime starts %d, drops %d", sb, err, rt.startCount, rt.dropped)
+			}
+		})
+	}
+}
+
+// lockedFor holds sb-vm's lifecycle lock for the case, as a step in
+// flight would.
+func lockedFor(ctx context.Context) func(*Service, *moveStubCluster) func() {
+	return func(dst *Service, _ *moveStubCluster) func() {
+		unlock, err := dst.lifecycleLocks.lockCtx(ctx, "sb-vm")
+		if err != nil {
+			panic(err)
+		}
+		return unlock
+	}
+}
+
+// detachCluster takes dst out of cluster mode: AttachCluster ignores nil.
+func detachCluster(dst *Service) {
+	dst.clusterMu.Lock()
+	defer dst.clusterMu.Unlock()
+	dst.cluster = nil
+}
