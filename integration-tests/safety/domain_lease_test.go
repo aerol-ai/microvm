@@ -334,17 +334,17 @@ func TestConcurrentLeasesFromTwoWorktreesNeverShareADomain(t *testing.T) {
 			}
 		}
 		type run struct {
-			cmd *exec.Cmd
-			out strings.Builder
+			cmd    *exec.Cmd
+			out    strings.Builder
+			stderr strings.Builder
 		}
 		runs := []*run{{}, {}}
 		for i, root := range []string{a, b} {
 			r := runs[i]
-			r.cmd = exec.Command("bash", "-c", leaseScript(fns, "s"), "bash", root)
+			r.cmd = exec.Command("bash", "-c", leaseScript(fns+lockTrace(), "s"), "bash", root)
 			r.cmd.Env = gitEnv()
 			r.cmd.Stdout = &r.out
-			var stderr strings.Builder
-			r.cmd.Stderr = &stderr
+			r.cmd.Stderr = &r.stderr
 			if err := r.cmd.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -356,7 +356,8 @@ func TestConcurrentLeasesFromTwoWorktreesNeverShareADomain(t *testing.T) {
 		}
 		got := []string{strings.TrimSpace(runs[0].out.String()), strings.TrimSpace(runs[1].out.String())}
 		if got[0] == got[1] {
-			t.Fatalf("round %d: both worktrees leased %q", round, got[0])
+			t.Fatalf("round %d: both worktrees leased %q\nrun a:\n%s\nrun b:\n%s\nfiles:\n%s",
+				round, got[0], runs[0].stderr.String(), runs[1].stderr.String(), treeState(a, b))
 		}
 		for _, d := range got {
 			if !slices.Contains(leasePoolDomains, d) {

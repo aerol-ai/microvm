@@ -120,9 +120,11 @@ func TestConcurrentClaimsOnOneScenarioGrantOne(t *testing.T) {
 			}
 		}
 		cmds := make([]*exec.Cmd, 2)
+		stderrs := make([]strings.Builder, 2)
 		for i, root := range []string{a, b} {
-			cmds[i] = exec.Command("bash", "-c", claimScript(fns, "s"), "bash", root)
+			cmds[i] = exec.Command("bash", "-c", claimScript(fns+lockTrace(), "s"), "bash", root)
 			cmds[i].Env = gitEnv()
+			cmds[i].Stderr = &stderrs[i]
 			if err := cmds[i].Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -134,7 +136,8 @@ func TestConcurrentClaimsOnOneScenarioGrantOne(t *testing.T) {
 			}
 		}
 		if granted != 1 {
-			t.Fatalf("round %d: %d worktrees got scenario s; want exactly 1", round, granted)
+			t.Fatalf("round %d: %d worktrees got scenario s; want exactly 1\nrun a:\n%s\nrun b:\n%s\nfiles:\n%s",
+				round, granted, stderrs[0].String(), stderrs[1].String(), treeState(a, b))
 		}
 	}
 }
