@@ -77,6 +77,26 @@ func runtimeAuthorized(r *http.Request, sandbox *models.Sandbox, interpreter boo
 	return interpreter && trafficTokenPath(publicPath) && tokenIs(traffic, trafficAccessToken(sandbox))
 }
 
+// privateTraffic reports whether the sandbox was made with
+// network.allowPublicTraffic false.
+func privateTraffic(meta sandboxMeta) bool {
+	return meta.AllowPublicTraffic != nil && !*meta.AllowPublicTraffic
+}
+
+// privateInterpreterAuthorized is the check on the interpreter port of an
+// insecure sandbox whose public traffic is off. E2B asks for the traffic
+// token on every port of such a sandbox, 49999 included, so the
+// interpreter is not open to anyone who knows the sandbox id. Every
+// interpreter path takes it, /execute too: on an insecure sandbox envd
+// runs commands for anyone already, and the SDK has no other token to
+// send. envd itself stays as it is for every insecure sandbox.
+func privateInterpreterAuthorized(r *http.Request, sandbox *models.Sandbox) bool {
+	access := strings.TrimSpace(r.Header.Get(accessTokenHeader))
+	traffic := strings.TrimSpace(r.Header.Get(trafficTokenHeader))
+	return tokenIs(access, sandbox.ToolboxToken) || tokenIs(traffic, sandbox.ToolboxToken) ||
+		tokenIs(traffic, trafficAccessToken(sandbox))
+}
+
 // trafficTokenPath reports whether the traffic token may open publicPath on
 // the interpreter port: /contexts, /contexts/{id}, /contexts/{id}/restart
 // and /health. The list is closed, and a path that is not in clean form is
@@ -125,9 +145,17 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		publicPath = "/" + publicPath
 	}
 	interpreter := strings.TrimSpace(r.Header.Get(sandboxPortHeader)) == interpreterPort
-	if meta.Secure && !runtimeAuthorized(r, sandbox, interpreter, publicPath) {
-		WriteError(w, http.StatusUnauthorized, "Unauthorized")
-		return
+	switch {
+	case meta.Secure:
+		if !runtimeAuthorized(r, sandbox, interpreter, publicPath) {
+			WriteError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+	case interpreter && privateTraffic(meta):
+		if !privateInterpreterAuthorized(r, sandbox) {
+			WriteError(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
 	}
 
 	if interpreter && sandbox.Runtime == models.RuntimeIsolate {

@@ -1087,11 +1087,13 @@ func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, m
 // responseTrafficToken is the trafficAccessToken a create or connect hands
 // out. The code-interpreter SDKs send only E2B-Traffic-Access-Token on
 // their /contexts calls, never X-Access-Token, so a secure sandbox's
-// interpreter is unreachable without it. It is its own value, not the envd
-// token (trafficAccessToken in runtime_proxy.go). Insecure sandboxes get
+// interpreter is unreachable without it. An insecure sandbox whose public
+// traffic is off gets one too, as on E2B, which asks for it on that
+// sandbox's ports. It is its own value, not the envd token
+// (trafficAccessToken in runtime_proxy.go). Other insecure sandboxes get
 // none, as on E2B.
 func responseTrafficToken(sandbox *models.Sandbox, meta sandboxMeta) *string {
-	if !meta.Secure {
+	if !meta.Secure && !privateTraffic(meta) {
 		return nil
 	}
 	token := trafficAccessToken(sandbox)

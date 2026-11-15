@@ -222,6 +222,33 @@ func TestRuntimeProxyTokenHeaders(t *testing.T) {
 		{name: "insecure sandbox needs none", env: insecure, headers: map[string]string{},
 			want: map[runtimeCall]int{callContexts: ok, callExecute: ok, callEnvd: ok}},
 	}
+	// An insecure sandbox with public traffic off: E2B asks for the traffic
+	// token on every port, the interpreter's included, /execute too. envd
+	// stays as open as on any insecure sandbox.
+	private := newInterpreterEnv(t, tb, `{"templateID":"base","secure":false,"network":{"allowPublicTraffic":false}}`)
+	if private.created.EnvdAccessToken != "" || private.created.TrafficAccessToken == nil {
+		t.Fatalf("insecure private sandbox tokens = %+v", private.created)
+	}
+	privateTraffic := *private.created.TrafficAccessToken
+	sb, err := private.svc.GetSandbox(context.Background(), private.created.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases = append(cases, []struct {
+		name    string
+		env     *interpreterEnv
+		headers map[string]string
+		want    map[runtimeCall]int
+	}{
+		{name: "private traffic, no token", env: private, headers: map[string]string{},
+			want: map[runtimeCall]int{callContexts: deny, callHealth: deny, callExecute: deny, callEnvd: ok, callEnvdFiles: ok}},
+		{name: "private traffic, traffic token", env: private, headers: map[string]string{"E2B-Traffic-Access-Token": privateTraffic},
+			want: map[runtimeCall]int{callContexts: ok, callRestart: ok, callExecute: ok, callEnvd: ok}},
+		{name: "private traffic, toolbox token", env: private, headers: map[string]string{"X-Access-Token": sb.ToolboxToken},
+			want: map[runtimeCall]int{callContexts: ok, callExecute: ok}},
+		{name: "private traffic, another sandbox's traffic token", env: private, headers: map[string]string{"E2B-Traffic-Access-Token": traffic},
+			want: map[runtimeCall]int{callContexts: deny, callExecute: deny}},
+	}...)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			for c, want := range tc.want {
@@ -384,6 +411,9 @@ func TestCreateAndConnectReturnTrafficToken(t *testing.T) {
 	}{
 		{name: "secure", body: `{"templateID":"base"}`, wantToken: true},
 		{name: "insecure", body: `{"templateID":"base","secure":false,"metadata":{"k":"insecure"}}`},
+		// E2B gives one to any sandbox whose public traffic is off.
+		{name: "insecure, private traffic", body: `{"templateID":"base","secure":false,"network":{"allowPublicTraffic":false},"metadata":{"k":"private"}}`, wantToken: true},
+		{name: "secure, private traffic", body: `{"templateID":"base","network":{"allowPublicTraffic":false},"metadata":{"k":"secure-private"}}`, wantToken: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
