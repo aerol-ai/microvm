@@ -147,6 +147,15 @@ func checkStdioProtocol(t *testing.T, d *stdioDriver, full bool) {
 			t.Fatalf("stdio mode sent a marker: %+v", f)
 		}
 	}
+	// print() writes its text and its newline separately; a line must still
+	// reach the client as one chunk, and a partial line is flushed by the end
+	// of the run.
+	if f := d.run("print(x)"); !reflect.DeepEqual(kinds(f), []string{"COUNT", "OUT", "DONE"}) || f[1].payload != "5\n" {
+		t.Fatalf("print(x) frames = %+v, want one OUT frame", f)
+	}
+	if f := d.run("import sys\nsys.stdout.write('a')\nsys.stdout.write('b')"); joined(f, "OUT") != "ab" {
+		t.Fatalf("partial line frames = %+v", f)
+	}
 	var result struct {
 		Data map[string]any `json:"data"`
 		Main bool           `json:"main"`

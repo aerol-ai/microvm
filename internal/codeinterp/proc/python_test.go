@@ -350,3 +350,29 @@ func TestPythonIPythonDriver(t *testing.T) {
 		t.Fatalf("display(HTML) = %v", ev.list()[1].Bundle)
 	}
 }
+
+// TestPythonPrintIsOneChunkPerLine guards the driver's line buffering: with
+// PYTHONUNBUFFERED, print() made two writes (text, then newline) and a client
+// could see "5" and "\n" as two chunks.
+func TestPythonPrintIsOneChunkPerLine(t *testing.T) {
+	k, _ := launchPython(t, "0")
+	for round := 0; round < 5; round++ {
+		ev := mustRun(t, k, "for i in range(50):\n    print(i)", "ok")
+		n := 0
+		for _, e := range ev.list() {
+			if e.Kind != codeinterp.EventStdout {
+				continue
+			}
+			n++
+			if !strings.HasSuffix(e.Text, "\n") {
+				t.Fatalf("round %d: stdout chunk %q ends mid-line", round, e.Text)
+			}
+		}
+		if n == 0 {
+			t.Fatal("no stdout")
+		}
+	}
+	if got := mustRun(t, k, "import sys\nsys.stdout.write('partial')", "ok").stream(codeinterp.EventStdout); got != "partial" {
+		t.Fatalf("partial line = %q", got)
+	}
+}

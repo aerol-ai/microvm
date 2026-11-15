@@ -176,10 +176,14 @@ CHAN = None
 class _FrameBytes(object):
     """sys.stdout.buffer in stdio mode."""
 
-    def __init__(self, kind):
+    def __init__(self, kind, text=None):
         self._kind = kind
+        self._text = text
 
     def write(self, b):
+        # Text written before these bytes must reach the host first.
+        if self._text is not None:
+            self._text.flush()
         b = bytes(b)
         for i in range(0, len(b), MAX_OUTPUT_FRAME):
             CHAN.emit(self._kind, b[i:i + MAX_OUTPUT_FRAME])
@@ -196,8 +200,11 @@ class _FrameBytes(object):
 
 
 class _FrameText(io.TextIOBase):
-    """sys.stdout / sys.stderr in stdio mode: every write is one frame, so
-    output streams live (there is no pipe to read it from)."""
+    """sys.stdout / sys.stderr in stdio mode. Line buffered, like a terminal:
+    print() writes its text and its newline separately, and sending each as
+    its own frame split one line into two chunks for the client. Whole lines
+    go out at once; a partial line waits for its newline, a flush, or the
+    next event (sync flushes)."""
 
     encoding = "utf-8"
     errors = "backslashreplace"
@@ -205,7 +212,9 @@ class _FrameText(io.TextIOBase):
     def __init__(self, kind):
         io.TextIOBase.__init__(self)
         self._kind = kind
-        self.buffer = _FrameBytes(kind)
+        self._pending = []
+        self._pending_len = 0
+        self.buffer = _FrameBytes(kind, self)
 
     def writable(self):
         return True
@@ -216,12 +225,30 @@ class _FrameText(io.TextIOBase):
     def write(self, s):
         if not isinstance(s, str):
             raise TypeError("write() argument must be str, not %s" % type(s).__name__)
-        for i in range(0, len(s), MAX_OUTPUT_FRAME // 4):
-            CHAN.emit(self._kind, s[i:i + MAX_OUTPUT_FRAME // 4])
+        if not s:
+            return 0
+        self._pending.append(s)
+        self._pending_len += len(s)
+        if "\n" in s or self._pending_len >= MAX_OUTPUT_FRAME // 4:
+            data = "".join(self._pending)
+            cut = data.rfind("\n") + 1
+            if self._pending_len >= MAX_OUTPUT_FRAME // 4:
+                cut = len(data)
+            self._pending = [data[cut:]] if cut < len(data) else []
+            self._pending_len = len(data) - cut
+            self._emit(data[:cut])
         return len(s)
 
+    def _emit(self, s):
+        for i in range(0, len(s), MAX_OUTPUT_FRAME // 4):
+            CHAN.emit(self._kind, s[i:i + MAX_OUTPUT_FRAME // 4])
+
     def flush(self):
-        pass
+        if self._pending:
+            data = "".join(self._pending)
+            self._pending = []
+            self._pending_len = 0
+            self._emit(data)
 
 
 def _flush_user_streams():
@@ -800,6 +827,14 @@ def _setup(mode):
             try:
                 if (stream.encoding or "").lower().replace("-", "") != "utf8":
                     stream.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+            # PYTHONUNBUFFERED (kept for the code's python children) makes
+            # print() write its text and its newline as two writes, which the
+            # host could read as two chunks. Line buffering sends whole lines;
+            # sync() flushes a partial line before every event.
+            try:
+                stream.reconfigure(line_buffering=True, write_through=False)
             except Exception:
                 pass
     else:
