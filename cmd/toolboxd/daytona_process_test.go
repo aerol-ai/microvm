@@ -30,7 +30,10 @@ func newDaytonaTestServer(t *testing.T) *server {
 		t.Fatalf("sessions.New: %v", err)
 	}
 	t.Cleanup(mgr.Close)
-	return &server{sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
+	srv := &server{sessions: mgr, daytona: newDaytonaCompat(), logger: logger}
+	// Route probes may create an interpreter context; do not leave it running.
+	t.Cleanup(srv.closeCodeInterp)
+	return srv
 }
 
 func TestHandleDaytonaProcessRouteSessionLifecycle(t *testing.T) {

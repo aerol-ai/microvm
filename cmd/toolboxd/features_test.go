@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/codeinterp/daytona"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -68,7 +69,13 @@ func TestEveryRequestOptionIsListed(t *testing.T) {
 			t.Errorf("handler reads option %q, but no /version feature lists it; add it to toolboxFeatures", option)
 		}
 	}
-	for _, typ := range []reflect.Type{reflect.TypeOf(models.ExecRequest{}), reflect.TypeOf(execStreamStartMsg{})} {
+	requestTypes := []reflect.Type{
+		reflect.TypeOf(models.ExecRequest{}), reflect.TypeOf(execStreamStartMsg{}),
+		// The code interpreter's requests (internal/codeinterp/daytona).
+		reflect.TypeOf(daytona.CreateContextRequest{}), reflect.TypeOf(daytona.ExecuteRequest{}),
+		reflect.TypeOf(daytona.ClientMessage{}),
+	}
+	for _, typ := range requestTypes {
 		for i := 0; i < typ.NumField(); i++ {
 			name := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
 			if name != "" && name != "-" && !known[name] {

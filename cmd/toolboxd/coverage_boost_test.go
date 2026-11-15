@@ -174,16 +174,23 @@ func TestRoutesDefaultNotFound(t *testing.T) {
 	}
 }
 
-func TestRoutesCodeInterpreterNotImplemented(t *testing.T) {
+func TestRoutesCodeInterpreterServed(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, authToken: "", allowedPorts: map[int]struct{}{}}
+	t.Cleanup(s.closeCodeInterp)
 	h := authedRoutes(s)
 
+	// The interpreter answers for real now: an unknown sub-path is the
+	// adapter's JSON 404, the context list is an empty list.
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/process/interpreter/anything", nil)
-	h.ServeHTTP(rr, req)
-	if rr.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501", rr.Code)
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/process/interpreter/anything", nil))
+	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), `"error"`) {
+		t.Fatalf("unknown path = %d %s, want the adapter's 404", rr.Code, rr.Body.String())
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/process/interpreter/context", nil))
+	if rr.Code != http.StatusOK || strings.TrimSpace(rr.Body.String()) != `{"contexts":[]}` {
+		t.Fatalf("list = %d %s", rr.Code, rr.Body.String())
 	}
 }
 
