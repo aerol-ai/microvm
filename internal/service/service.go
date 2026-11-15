@@ -3457,6 +3457,16 @@ func (s *Service) attachWasmRegistryAuth(ctx context.Context, sandbox *models.Sa
 
 // persistSandboxCreate writes the sandbox row and its sealed environment in
 // the same transaction.
+//
+// Never call it while holding a sandbox's lifecycle lock. For a
+// recreate-policy row it reads ownership (requireFreshOwnership, then the
+// fence publish), which takes ownership.actionMu; the lease's expiry check
+// holds actionMu and then takes each listed sandbox's lifecycle lock
+// (enforceOwnershipLease, fenceSandbox). A caller holding a lifecycle lock
+// here would wait on actionMu while the expiry check waits on that lock.
+// Every caller today (the container, Firecracker, WASM and isolate creates,
+// WASM recreate and migrate) runs before the row exists, outside the
+// boundary.
 func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sandbox) error {
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")

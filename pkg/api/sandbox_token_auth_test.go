@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -216,7 +217,21 @@ func TestSandboxTokenCredentialRefusals(t *testing.T) {
 		c.IssuedAt, c.ExpiresAt = now.Unix(), now.Add(time.Minute).Unix()
 		return c
 	}())
-	tampered := tok.Token[:len(tok.Token)-3] + "AAA"
+	// Flip one bit of the signature itself. Overwriting the last three
+	// characters with "AAA" left the token unchanged about 1 run in 1,024:
+	// an Ed25519 signature ends with the top byte of S, which is below
+	// 2^253, so its high bits are always zero and those characters carry
+	// only 10 random bits. The unchanged token was then accepted (204).
+	dot := strings.LastIndexByte(tok.Token, '.')
+	sig, err := base64.RawURLEncoding.Strict().DecodeString(tok.Token[dot+1:])
+	if err != nil {
+		t.Fatalf("decode the signature: %v", err)
+	}
+	sig[0] ^= 0x01
+	tampered := tok.Token[:dot+1] + base64.RawURLEncoding.EncodeToString(sig)
+	if tampered == tok.Token {
+		t.Fatal("setup: tampering left the token unchanged")
+	}
 
 	for _, tc := range []struct {
 		name, bearer, reason string

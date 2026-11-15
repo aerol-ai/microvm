@@ -228,25 +228,25 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 type netstatsServiceLister struct{ svc *Service }
 
 func (l netstatsServiceLister) NetstatsTargets(ctx context.Context) []netstats.Target {
-	sandboxes, err := l.svc.store.List(ctx)
+	rows, err := l.svc.store.ListNetstatsTargets(ctx)
 	if err != nil {
 		l.svc.logger.Warn("netstats: list sandboxes failed", "error", err)
 		return nil
 	}
-	out := make([]netstats.Target, 0, len(sandboxes))
-	for _, sb := range sandboxes {
-		if sb == nil || sb.Status != models.SandboxStatusStarted {
-			continue
-		}
+	out := make([]netstats.Target, 0, len(rows))
+	for _, row := range rows {
 		// Sandboxes with both limits at 0 (unlimited) and counters already
 		// at 0 are still polled — operators expect /network/usage to reflect
-		// real traffic even before they set a limit. Skip empty container
-		// refs which would otherwise hit the PID lookup path uselessly.
-		ref := sb.ContainerID
+		// real traffic even before they set a limit.
+		ref := row.ContainerID
 		if ref == "" {
-			ref = sb.ID
+			ref = row.ID
 		}
-		out = append(out, netstats.Target{SandboxID: sb.ID, ContainerRef: ref})
+		out = append(out, netstats.Target{
+			SandboxID:    row.ID,
+			ContainerRef: ref,
+			Seen:         netstats.Seen{PID: row.Seen.PID, BytesIn: row.Seen.BytesIn, BytesOut: row.Seen.BytesOut},
+		})
 	}
 	return out
 }
@@ -273,12 +273,19 @@ func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples [
 		if sample.BytesIn > 0 || sample.BytesOut > 0 || sample.ActiveTCP {
 			k.svc.recordNetstatsActivity(sample.SandboxID, sample.SampledAt)
 		}
-		if sample.BytesIn == 0 && sample.BytesOut == 0 {
+		if sample.BytesIn == 0 && sample.BytesOut == 0 && sample.Seen == nil {
 			continue
 		}
-		deltas = append(deltas, store.NetCounterDelta{
+		delta := store.NetCounterDelta{
 			SandboxID: sample.SandboxID, BytesIn: sample.BytesIn, BytesOut: sample.BytesOut,
-		})
+		}
+		// The new reading goes in the same UPDATE as the bytes it produced
+		// (issue #69): if the batch fails, neither is stored, and the next
+		// poll measures from the old reading and credits these bytes then.
+		if sample.Seen != nil {
+			delta.Seen = &store.NetSeen{PID: sample.Seen.PID, BytesIn: sample.Seen.BytesIn, BytesOut: sample.Seen.BytesOut}
+		}
+		deltas = append(deltas, delta)
 		applied = append(applied, sample)
 	}
 
@@ -298,6 +305,12 @@ func (k netstatsServiceSink) handleNetworkSamples(ctx context.Context, samples [
 			k.svc.testAfterNetstatsUpdate()
 		}
 		sample := applied[t.Index]
+		if sample.BytesIn == 0 && sample.BytesOut == 0 {
+			// Only a new reading was stored (a restarted container that has
+			// not sent anything yet): the totals did not move, so there is
+			// no usage to report and no quota to re-check.
+			continue
+		}
 		// Mirror the per-tick byte deltas as egress/ingress usage samples.
 		// No-op without a reporter; the poller goroutine is already off the
 		// request path.

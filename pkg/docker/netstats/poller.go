@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
 	"time"
 )
 
@@ -27,31 +26,76 @@ type SandboxLister interface {
 type Target struct {
 	SandboxID    string
 	ContainerRef string
+	// Seen is the reading this sandbox's counters were last credited up to,
+	// as the sink stored it from an earlier Sample.Seen. The zero value is
+	// SeenUnknown, so a lister that does not track readings gets a baseline,
+	// never a whole counter credited twice.
+	Seen Seen
 }
+
+// Seen is a counter reading the store has credited. The poller keeps no
+// readings of its own: each tick measures against the stored one, and the
+// sink stores the new one with the bytes it credits, in one write. That is
+// what tells the cases apart that an in-memory baseline could not (issue
+// #69):
+//
+//   - a new sandbox (PID SeenNew): its network came up with the container,
+//     so the first reading is all of its traffic and is credited whole;
+//   - a sandboxd restart: the stored reading is still there, so the next
+//     reading is measured from it, including traffic while sandboxd was down;
+//   - a container restart (another PID): Docker gives the new container a
+//     new network namespace, so its counters begin again below the stored
+//     reading and are credited whole; the containerd engine keeps the
+//     namespace across a stop and start, so its counters carry on above the
+//     stored reading and only the difference is credited.
+//
+// A restarted Docker container that moves more than the old reading before
+// the first poll is taken for a carried-on counter and is credited the
+// difference: an undercount of at most the old reading, which was itself
+// already credited. Where the cases cannot be told apart, the poller picks
+// the one that counts less.
+type Seen struct {
+	// PID is SeenUnknown, SeenNew, or the PID the counters were read
+	// through.
+	PID      int
+	BytesIn  int64
+	BytesOut int64
+}
+
+const (
+	// SeenUnknown: nothing is known about what was credited (a row from
+	// before readings were stored), so the next reading is only a baseline.
+	SeenUnknown = 0
+	// SeenNew: a new sandbox with nothing credited yet.
+	SeenNew = -1
+)
 
 // SampleSink receives per-tick deltas. Implementations typically call into
 // the store to add deltas to the cumulative counters and check quotas.
-// Implementations MUST be safe to call from the poller goroutine.
+// Implementations MUST be safe to call from the poller goroutine, and MUST
+// store each non-nil Sample.Seen with that sample's bytes, atomically, for
+// the lister to return as Target.Seen: a sink that drops it gets the same
+// bytes again on the next tick.
 type SampleSink interface {
 	HandleSamples(ctx context.Context, samples []Sample)
 }
 
 // Sample is the per-sandbox delta the poller produces each tick.
-// BytesIn/BytesOut are non-negative deltas since the last successful sample
-// for the same (sandbox, PID) pair. The first observation of any new PID
-// produces a Sample with zero deltas — the cumulative reading at that point
-// is stored as the baseline so subsequent ticks compute meaningful diffs.
-// This makes the poller restart-safe: container restart → new PID → fresh
-// baseline → no spurious giant delta from the cumulative counter resetting
-// to a small number. ActiveTCP is the current socket-state observation, not a
-// delta, so the first sample can still carry "this sandbox has an established
-// TCP connection" even while byte deltas are zero.
+// BytesIn/BytesOut are the non-negative bytes to credit: the traffic since
+// Target.Seen (see Seen for how a new sandbox and a restart are told
+// apart). ActiveTCP is the current socket-state observation, not a delta, so
+// a sample can carry "this sandbox has an established TCP connection" even
+// while its byte deltas are zero.
 type Sample struct {
 	SandboxID string
 	BytesIn   int64
 	BytesOut  int64
 	ActiveTCP bool
 	SampledAt time.Time
+	// Seen is the reading to store as this sandbox's new Target.Seen, with
+	// these bytes. Nil when it equals the stored one (no traffic since), so
+	// an idle sandbox costs no write.
+	Seen *Seen
 }
 
 // Poller drives the netstats loop. Construct via NewPoller and call Start
@@ -63,14 +107,6 @@ type Poller struct {
 	lister   SandboxLister
 	sink     SampleSink
 	interval time.Duration
-
-	mu        sync.Mutex
-	baselines map[string]baseline // keyed by sandbox ID
-}
-
-type baseline struct {
-	pid      int
-	counters Counters
 }
 
 // NewPoller wires the dependencies together. interval <= 0 is rejected at
@@ -78,13 +114,12 @@ type baseline struct {
 // sandboxes can dial it down.
 func NewPoller(logger *slog.Logger, reader *Reader, lookup PIDLookup, lister SandboxLister, sink SampleSink, interval time.Duration) *Poller {
 	return &Poller{
-		logger:    logger,
-		reader:    reader,
-		lookup:    lookup,
-		lister:    lister,
-		sink:      sink,
-		interval:  interval,
-		baselines: make(map[string]baseline),
+		logger:   logger,
+		reader:   reader,
+		lookup:   lookup,
+		lister:   lister,
+		sink:     sink,
+		interval: interval,
 	}
 }
 
@@ -123,7 +158,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		recordPoll(time.Since(start), len(targets), sampleCount, dropped)
 	}()
 	if len(targets) == 0 {
-		p.gcBaselines(targets)
 		return
 	}
 
@@ -134,13 +168,9 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 			continue
 		}
 		// Per the SandboxLister contract, an empty ContainerRef means "not
-		// running this tick" — same semantics as a failed PID lookup or
-		// ErrNotRunning below. Drop the baseline so the next tick (when the
-		// container is up and the ref reappears) re-baselines from the new
-		// PID instead of diffing against a stale one. Without this, baselines
-		// for sandboxes stuck in not-yet-running states would accumulate.
+		// running this tick". Nothing is kept for it: the stored reading
+		// stays, and the next reading is measured against it.
 		if t.ContainerRef == "" {
-			p.dropBaseline(t.SandboxID)
 			dropped["empty_container_ref"]++
 			continue
 		}
@@ -152,7 +182,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 			continue
 		}
 		if pid <= 0 {
-			p.dropBaseline(t.SandboxID)
 			dropped["not_running"]++
 			continue
 		}
@@ -160,7 +189,6 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 		current, err := p.reader.Read(pid)
 		if err != nil {
 			if errors.Is(err, ErrNotRunning) {
-				p.dropBaseline(t.SandboxID)
 				dropped["not_running"]++
 				continue
 			}
@@ -169,17 +197,19 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		delta := p.diffAndUpdate(t.SandboxID, pid, current)
-		samples = append(samples, Sample{
+		in, out := credit(t.Seen, pid, current)
+		sample := Sample{
 			SandboxID: t.SandboxID,
-			BytesIn:   delta.BytesIn,
-			BytesOut:  delta.BytesOut,
-			ActiveTCP: delta.ActiveTCP,
+			BytesIn:   in,
+			BytesOut:  out,
+			ActiveTCP: current.ActiveTCP,
 			SampledAt: now,
-		})
+		}
+		if seen := (Seen{PID: pid, BytesIn: current.BytesIn, BytesOut: current.BytesOut}); seen != t.Seen {
+			sample.Seen = &seen
+		}
+		samples = append(samples, sample)
 	}
-
-	p.gcBaselines(targets)
 
 	// Always invoke the sink so alternate runtimes (WASM HTTP mediator) can
 	// drain byte counters even when no Docker targets produced deltas.
@@ -187,48 +217,25 @@ func (p *Poller) tick(ctx context.Context, now time.Time) {
 	p.sink.HandleSamples(ctx, samples)
 }
 
-// diffAndUpdate computes the delta against the stored baseline and rotates
-// the baseline forward. If PID changed (container restart) or no baseline
-// exists yet (first observation), returns a zero delta and stores `current`
-// as the new baseline — see Sample doc for why.
-func (p *Poller) diffAndUpdate(sandboxID string, pid int, current Counters) Counters {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	prev, ok := p.baselines[sandboxID]
-	p.baselines[sandboxID] = baseline{pid: pid, counters: current}
-	if !ok || prev.pid != pid {
-		return Counters{ActiveTCP: current.ActiveTCP}
+// credit returns the bytes a reading adds to what seen says was credited.
+// See Seen for the cases.
+func credit(seen Seen, pid int, current Counters) (in, out int64) {
+	switch {
+	case seen.PID == SeenNew:
+		return current.BytesIn, current.BytesOut
+	case seen.PID <= 0:
+		// SeenUnknown, or a value no build writes: baseline only.
+		return 0, 0
+	case seen.PID != pid && (current.BytesIn < seen.BytesIn || current.BytesOut < seen.BytesOut):
+		// Another process, and its counters are below the old reading: a
+		// new network namespace whose counters began at zero.
+		return current.BytesIn, current.BytesOut
+	default:
+		// The same counters as the stored reading, carried on. A counter
+		// that went down under the same process (an interface removed)
+		// credits nothing for that direction rather than guess.
+		return nonNegative(current.BytesIn - seen.BytesIn), nonNegative(current.BytesOut - seen.BytesOut)
 	}
-	return Counters{
-		BytesIn:   nonNegative(current.BytesIn - prev.counters.BytesIn),
-		BytesOut:  nonNegative(current.BytesOut - prev.counters.BytesOut),
-		ActiveTCP: current.ActiveTCP,
-	}
-}
-
-// dropBaseline forgets a sandbox so a future Start (and new PID) starts
-// clean. Called when the container is no longer running this tick.
-func (p *Poller) dropBaseline(sandboxID string) {
-	p.mu.Lock()
-	delete(p.baselines, sandboxID)
-	p.mu.Unlock()
-}
-
-// gcBaselines drops any baselines whose sandbox is no longer in the target
-// list — covers Destroy, where the sandbox is gone from the store before the
-// next tick.
-func (p *Poller) gcBaselines(targets []Target) {
-	keep := make(map[string]struct{}, len(targets))
-	for _, t := range targets {
-		keep[t.SandboxID] = struct{}{}
-	}
-	p.mu.Lock()
-	for id := range p.baselines {
-		if _, ok := keep[id]; !ok {
-			delete(p.baselines, id)
-		}
-	}
-	p.mu.Unlock()
 }
 
 func nonNegative(n int64) int64 {

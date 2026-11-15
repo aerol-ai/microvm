@@ -259,7 +259,7 @@ func (s *Service) disarmRecreate(ctx context.Context, c cluster.Client, id strin
 			return err
 		}
 	}
-	changed, err := s.store.ClearRecreateFailover(ctx, id)
+	changed, err := s.clearRecreateFailover(ctx, sb)
 	if err != nil || !changed {
 		return err
 	}
