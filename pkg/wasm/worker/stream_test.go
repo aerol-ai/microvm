@@ -649,3 +649,148 @@ func TestExecStreamClientEdges(t *testing.T) {
 		t.Fatal("kill without a worker succeeded")
 	}
 }
+
+// TestStreamHangUpEndsARunThatIgnoresStdin: stdin a guest never reads must
+// not keep the worker from seeing sandboxd hang up. Before, the frame
+// reader blocked writing that stdin into the guest's pipe, never read the
+// hang-up, and the run went on after sandboxd had freed its slot.
+func TestStreamHangUpEndsARunThatIgnoresStdin(t *testing.T) {
+	guest := stdioGuest(t)
+	for _, kind := range streamServers {
+		t.Run(kind.name, func(t *testing.T) {
+			srv := kind.new()
+			c := startStreamWorker(t, srv)
+			if _, err := c.LoadModule("sb1", guest, 64); err != nil {
+				t.Fatal(err)
+			}
+			p := stdioStart("spin") // never reads stdin
+			p.Stdin = true
+			p.NoDeadline = true
+			st, err := c.StartExec(context.Background(), "sb1", p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitStream(t, "run registered", func() bool { return srv.registry().count("sb1") == 1 })
+			for i := 0; i < 3; i++ {
+				if err := st.WriteStdin([]byte("unread input\n")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = st.Close()
+			waitStream(t, "run killed by the hang-up", func() bool { return srv.registry().count("sb1") == 0 })
+		})
+	}
+}
+
+// TestStreamKillFreesABackedUpStdin: past the stdin queue the frame reader
+// waits for room, so it can miss a hang-up; the out-of-band kill sandboxd
+// sends when it drops a run still ends it, and frees the reader and the
+// stdin writer behind it.
+func TestStreamKillFreesABackedUpStdin(t *testing.T) {
+	guest := stdioGuest(t)
+	srv := &Server{}
+	c := startStreamWorker(t, srv)
+	if _, err := c.LoadModule("sb1", guest, 64); err != nil {
+		t.Fatal(err)
+	}
+	p := stdioStart("spin")
+	p.Stdin = true
+	p.NoDeadline = true
+	st, err := c.StartExec(context.Background(), "sb1", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStream(t, "run registered", func() bool { return srv.streams.count("sb1") == 1 })
+	wrote := make(chan error, 1)
+	go func() { wrote <- st.WriteStdin(make([]byte, 8*stdinQueueMax)) }()
+	select {
+	case err := <-wrote:
+		t.Fatalf("8 queues' worth of stdin went through at once: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := st.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if got := collect(t, st); !got.exit.Killed {
+		t.Fatalf("exit = %+v", got.exit)
+	}
+	_ = st.Close()
+	select {
+	case <-wrote:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stdin writer still blocked after the run ended")
+	}
+	waitStream(t, "run removed", func() bool { return srv.streams.count("sb1") == 0 })
+}
+
+// TestStdinQueue: frames reach the guest in order and EOF after them; the
+// queue holds at most stdinQueueMax (one frame always fits), frames after
+// EOF are dropped, and end releases a waiting reader and a blocked feeder.
+func TestStdinQueue(t *testing.T) {
+	old := stdinQueueMax
+	stdinQueueMax = 8
+	t.Cleanup(func() { stdinQueueMax = old })
+
+	t.Run("order and EOF", func(t *testing.T) {
+		q := newStdinQueue()
+		r, w := io.Pipe()
+		go q.feed(w)
+		got := make(chan string, 1)
+		go func() { b, _ := io.ReadAll(r); got <- string(b) }()
+		q.push([]byte("one "))
+		q.push([]byte("two "))
+		q.push([]byte("a frame larger than the queue "))
+		q.closeInput()
+		q.push([]byte("dropped"))
+		select {
+		case s := <-got:
+			if s != "one two a frame larger than the queue " {
+				t.Fatalf("guest read %q", s)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("stdin never reached EOF")
+		}
+	})
+
+	t.Run("full queue waits, end releases", func(t *testing.T) {
+		q := newStdinQueue()
+		r, w := io.Pipe()
+		fed := make(chan struct{})
+		go func() { defer close(fed); q.feed(w) }()
+		q.push([]byte("12345678")) // the feeder takes it, then blocks: nobody reads
+		waitStream(t, "the feeder to take the frame", func() bool {
+			q.mu.Lock()
+			defer q.mu.Unlock()
+			return len(q.frames) == 0
+		})
+		pushed := make(chan struct{})
+		go func() { defer close(pushed); q.push([]byte("9")) }()
+		select {
+		case <-pushed:
+			t.Fatal("push went past a full queue")
+		case <-time.After(100 * time.Millisecond):
+		}
+		// The guest reads: room frees and the waiting push goes through.
+		buf := make([]byte, 8)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-pushed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("push still waiting after the guest read")
+		}
+		blocked := make(chan struct{})
+		go func() { defer close(blocked); q.push([]byte("abcdefgh")) }() // waits behind "9"
+		q.end()
+		_ = r.CloseWithError(io.ErrClosedPipe)
+		for _, ch := range []chan struct{}{blocked, fed} {
+			select {
+			case <-ch:
+			case <-time.After(5 * time.Second):
+				t.Fatal("end left a side waiting")
+			}
+		}
+		q.push([]byte("after the end")) // dropped, does not wait
+	})
+}

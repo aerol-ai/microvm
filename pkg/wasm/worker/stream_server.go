@@ -39,6 +39,11 @@ var (
 	// streamExitWriteWait bounds the final exec_exit write to a client that
 	// stopped reading.
 	streamExitWriteWait = 10 * time.Second
+	// stdinQueueMax is how much stdin may wait for a guest that is not
+	// reading (always at least one frame). Past it the frame reader waits
+	// for room, and sandboxd's writes back up behind it as they would
+	// behind a pipe.
+	stdinQueueMax = 1 << 20
 )
 
 // streamHost is what the shared stream code needs from a server.
@@ -395,8 +400,9 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 		caps.WallTimeoutNs = wasmengine.NoWallTimeout
 	}
 	stdinR, stdinW := io.Pipe()
+	stdin := newStdinQueue()
 	if !p.Stdin {
-		_ = stdinW.Close()
+		stdin.closeInput()
 	}
 
 	// Hold the write lock across Start and exec_started, so output the
@@ -423,7 +429,17 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	if err != nil {
 		run.Kill()
 	}
+	feederDone := make(chan struct{})
+	go func() {
+		defer close(feederDone)
+		stdin.feed(stdinW)
+	}()
 
+	// The frame reader never writes to the guest itself: stdin goes through
+	// the queue to the feeder, so a guest that never reads stdin does not
+	// stop the reader from seeing sandboxd hang up. Only a full queue makes
+	// it wait, and then sandboxd's exec_kill (sent on a fresh connection
+	// when it drops a run that has not exited) still ends the run.
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
@@ -438,9 +454,9 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 			switch f.Type {
 			case MsgExecStdin:
 				// A run without stdin, or one whose guest is gone, drops it.
-				_, _ = stdinW.Write(f.Payload)
+				stdin.push(f.Payload)
 			case MsgExecStdinClose:
-				_ = stdinW.Close()
+				stdin.closeInput()
 			case MsgExecKill:
 				run.Kill()
 			}
@@ -448,7 +464,9 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	}()
 
 	res, runErr := run.Wait()
-	// Free a reader goroutine blocked writing stdin the guest never read.
+	// Free the reader if it waits for queue room, and the feeder if it is
+	// blocked writing stdin the guest never read.
+	stdin.end()
 	_ = stdinR.CloseWithError(io.ErrClosedPipe)
 	exit := ExecExit{
 		ExitCode:  res.ExitCode,
@@ -471,7 +489,107 @@ func (r *streamRegistry) serve(h streamHost, conn net.Conn, env Envelope) error 
 	}
 	_ = conn.Close()
 	<-readerDone
+	<-feederDone
 	return nil
+}
+
+// stdinQueue is a run's stdin between the frame reader, which only queues,
+// and the feeder goroutine, which writes to the guest's stdin pipe. The
+// queue holds up to stdinQueueMax bytes (always at least one frame).
+type stdinQueue struct {
+	mu     sync.Mutex
+	frames [][]byte
+	bytes  int
+	eof    bool // stdin closed: later frames are dropped
+	ended  bool // the run is over: everything is dropped
+	// One waiter each, so a one-slot channel and a non-blocking send are
+	// enough to wake it; it then looks at the state again.
+	ready chan struct{} // feeder: frames or EOF to deliver
+	room  chan struct{} // reader: the queue shrank, or the run ended
+}
+
+func newStdinQueue() *stdinQueue {
+	return &stdinQueue{ready: make(chan struct{}, 1), room: make(chan struct{}, 1)}
+}
+
+func wake(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// push queues p for the guest, waiting while the queue is full.
+func (q *stdinQueue) push(p []byte) {
+	for {
+		q.mu.Lock()
+		switch {
+		case q.ended || q.eof:
+			q.mu.Unlock()
+			return
+		case q.bytes == 0 || q.bytes+len(p) <= stdinQueueMax:
+			q.frames = append(q.frames, p)
+			q.bytes += len(p)
+			q.mu.Unlock()
+			wake(q.ready)
+			return
+		}
+		q.mu.Unlock()
+		<-q.room
+	}
+}
+
+// closeInput ends the guest's stdin once what is queued is delivered.
+func (q *stdinQueue) closeInput() {
+	q.mu.Lock()
+	q.eof = true
+	q.mu.Unlock()
+	wake(q.ready)
+}
+
+// end drops what is queued and releases both sides; the run is over.
+func (q *stdinQueue) end() {
+	q.mu.Lock()
+	q.ended = true
+	q.frames, q.bytes = nil, 0
+	q.mu.Unlock()
+	wake(q.ready)
+	wake(q.room)
+}
+
+// feed writes queued frames to the guest in order, then closes its stdin
+// at EOF. It returns at EOF or when the run is over.
+func (q *stdinQueue) feed(w *io.PipeWriter) {
+	for {
+		q.mu.Lock()
+		switch {
+		case q.ended:
+			q.mu.Unlock()
+			return
+		case len(q.frames) > 0:
+			p := q.frames[0]
+			q.frames[0] = nil
+			q.frames = q.frames[1:]
+			q.mu.Unlock()
+			// Blocks while the guest is not reading; end's CloseWithError
+			// on the read side frees it. A failed write (the guest closed
+			// stdin) drops the frame, as a pipe to a gone reader would.
+			_, _ = w.Write(p)
+			q.mu.Lock()
+			if !q.ended {
+				q.bytes -= len(p)
+			}
+			q.mu.Unlock()
+			wake(q.room)
+			continue
+		case q.eof:
+			q.mu.Unlock()
+			_ = w.Close()
+			return
+		}
+		q.mu.Unlock()
+		<-q.ready
+	}
 }
 
 // serveExecKill handles an out-of-band exec_kill on a fresh connection.

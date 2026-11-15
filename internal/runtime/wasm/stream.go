@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -74,6 +75,10 @@ type Stream struct {
 	ws        workerExecStream
 	set       *streamSet
 	once      sync.Once
+	// exited is set once Recv has seen the exit, killed once a kill has
+	// reached the worker: either way Close need not send one.
+	exited atomic.Bool
+	killed atomic.Bool
 }
 
 // streamSet tracks a sandbox instance's live runs so stop, destroy,
@@ -279,6 +284,7 @@ func (s *Stream) Recv() (StreamEvent, error) {
 	}
 	// The slot frees as soon as the run has ended, not when the caller
 	// gets round to Close.
+	s.exited.Store(true)
 	s.set.drop(s)
 	recordWasmUsage(s.sandboxID, ev.Exit.Usage)
 	return StreamEvent{Exit: &StreamExit{
@@ -298,14 +304,28 @@ func (s *Stream) WriteStdin(p []byte) error { return s.ws.WriteStdin(p) }
 func (s *Stream) CloseStdin() error { return s.ws.CloseStdin() }
 
 // Kill ends the run; its exit still arrives on Recv.
-func (s *Stream) Kill() error { return s.ws.Kill() }
+func (s *Stream) Kill() error {
+	err := s.ws.Kill()
+	if err == nil {
+		s.killed.Store(true)
+	}
+	return err
+}
 
 // Close drops the run's connection, which ends a run still going, and
-// frees its slot.
+// frees its slot. A run that has not exited is also killed over a fresh
+// connection (best effort): the worker notices a dropped connection only
+// when it next reads from it, and it may not read again soon (a guest
+// that does not read its stdin backs the worker's reader up), while
+// sandboxd frees the run's slot here. The slot frees after the kill, so
+// sandboxd never counts fewer runs than the worker still has.
 func (s *Stream) Close() error {
 	var err error
 	s.once.Do(func() {
 		err = s.ws.Close()
+		if !s.exited.Load() && !s.killed.Load() {
+			_ = s.ws.Kill()
+		}
 		s.set.drop(s)
 	})
 	return err

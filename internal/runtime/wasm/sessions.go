@@ -323,9 +323,18 @@ func (s *sessionSet) close() {
 	follows := s.entry
 	s.entry = nil
 	s.mu.Unlock()
+	// In parallel: closing a run that has not exited is a kill round trip
+	// to the worker, and a hung worker must not stretch a stop by one
+	// timeout per session.
+	var wg sync.WaitGroup
 	for _, run := range runs {
-		_ = run.Close()
+		wg.Add(1)
+		go func(run *Stream) {
+			defer wg.Done()
+			_ = run.Close()
+		}(run)
 	}
+	wg.Wait()
 	for f := range follows {
 		f.close()
 	}
