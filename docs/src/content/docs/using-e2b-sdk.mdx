@@ -29,16 +29,18 @@ export E2B_API_KEY="$SB_PAT_TOKEN"
 Do not skip `E2B_SANDBOX_URL`. Without it, the E2B SDK builds addresses like `https://49983-<sandbox>.<domain>` to reach each sandbox. AerolVM does not serve those, so every command and file call fails.
 </Aside>
 
-## Use E2B SDK 2.50.0 or older
+## Which SDK versions work
 
-E2B SDK 2.51.0 and newer create sandboxes through a newer API call that AerolVM does not answer yet. With those versions, `Sandbox.create` fails with HTTP 405 (Method Not Allowed). This is true in both JavaScript and Python. Install version 2.50.0 until AerolVM supports the newer call.
+Current E2B SDK versions work, in JavaScript and in Python. E2B SDK 2.51.0 and newer create and connect to sandboxes through newer API calls (under `/v2`). AerolVM answers those calls as well as the older ones, so older versions keep working too.
+
+AerolVM servers from before these calls were added answer `Sandbox.create` from E2B SDK 2.51.0 or newer with HTTP 405 (Method Not Allowed). If you see that, install E2B SDK 2.50.0, or ask your operator to upgrade AerolVM.
 
 ## Run your first command
 
 In JavaScript or TypeScript:
 
 ```bash
-npm install e2b@2.50.0
+npm install e2b
 ```
 
 ```ts
@@ -54,7 +56,7 @@ await sandbox.kill();
 In Python:
 
 ```bash
-pip install "e2b==2.50.0"
+pip install e2b
 ```
 
 ```python
@@ -71,7 +73,60 @@ sandbox.kill()
 Hello from E2B on AerolVM
 ```
 
-We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks for its default template, `base`. On AerolVM that starts an `ubuntu:22.04` sandbox. See [Templates](#templates) for others.
+With no template, the E2B SDK asks for its default template, `base`. On AerolVM that starts an `ubuntu:22.04` sandbox. See [Templates](#templates) for others.
+
+## Run code with the Code Interpreter SDK
+
+E2B's Code Interpreter SDK runs code in a process that stays open, so variables live on from one run to the next. It works on AerolVM without changes. Use the same three variables as above.
+
+In JavaScript or TypeScript:
+
+```bash
+npm install @e2b/code-interpreter
+```
+
+```ts
+import { Sandbox } from "@e2b/code-interpreter";
+
+const sandbox = await Sandbox.create();
+await sandbox.runCode("x = 41");
+const execution = await sandbox.runCode("x + 1");
+
+console.log(execution.text);
+await sandbox.kill();
+```
+
+In Python:
+
+```bash
+pip install e2b-code-interpreter
+```
+
+```python
+from e2b_code_interpreter import Sandbox
+
+sandbox = Sandbox.create()
+sandbox.run_code("x = 41")
+execution = sandbox.run_code("x + 1")
+
+print(execution.text)
+sandbox.kill()
+```
+
+```text
+42
+```
+
+With no template, the Code Interpreter SDK asks for E2B's `code-interpreter-v1` template. On AerolVM that starts a `python:3.12-slim` sandbox. Here is what to know:
+
+- **Versions.** Use `@e2b/code-interpreter` 2.7.0 or newer, or `e2b-code-interpreter` 2.9.0 or newer. Older versions build addresses like `https://49999-<sandbox>.<domain>`, which AerolVM does not serve.
+- **Python works on any image with `python3`.** The other languages need their program in the image: `node` for JavaScript (`node` 22.13 or newer for TypeScript), `Rscript` for R, `java` 11 or newer for Java, and `bash` for Bash. If the program is missing, the run ends with an error that names it. To get them all, map `code-interpreter-v1` to your own image (see [Templates](#templates)).
+- **Contexts work.** `createCodeContext`, `listCodeContexts`, `restartCodeContext` and `removeCodeContext` (in Python, `create_code_context` and so on) behave as on E2B. Each context keeps its own variables. A context starts in `/home/user` unless you pass `cwd`; AerolVM makes that folder if the image has none.
+- **No time limit on the server.** When the SDK's own timeout ends a run, AerolVM stops the code, and the context keeps its variables.
+- **Charts come back as images.** A matplotlib figure arrives as a PNG result. The `chart` field, E2B's data form of a chart, stays empty.
+- **Contexts live in memory.** Pausing, restarting or moving the sandbox ends them. On E2B a pause keeps them; see [Pausing stops programs](#pausing-stops-programs).
+- **Not on V8 isolate sandboxes.** They answer HTTP 501, because they have no interpreters.
+- **Secure sandboxes need nothing extra.** Create and connect return a `trafficAccessToken`, which the SDK sends with every call.
 
 ## What works
 
@@ -98,6 +153,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | Commands: run, run in the background, list, send input, kill, reconnect | Works. |
 | Terminals (`sandbox.pty`) | Works. |
 | Files: read, write, list, get info, make a folder, rename, remove | Works. |
+| Code Interpreter SDK: `runCode` and contexts | Works. Python runs on any image with `python3`; other languages need their interpreter in the image. See [Run code with the Code Interpreter SDK](#run-code-with-the-code-interpreter-sdk). |
 | Watching a folder (`files.watchDir`) | Works on gVisor and Firecracker sandboxes only. Other runtimes refuse it (HTTP 501); [File watching](/file-watching/#which-sandboxes-can-watch) says why. E2B has no "events were lost" event, so a watch that loses events ends with an error instead (`resource_exhausted`); watch the folder again and list it to catch up. |
 
 ### Snapshots and templates
@@ -116,7 +172,8 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/advanced-network-rules/#allow-only-some-requests). |
 | `network.egressProxy` | Refused (HTTP 501). |
 | Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/). |
-| Traffic access tokens, metrics and logs | Not supported. |
+| Metrics and logs | Not supported. |
+| Private ports with a traffic access token | Not supported. Create returns a `trafficAccessToken`, but only the Code Interpreter SDK's calls use it; port addresses do not accept it. |
 | Volumes on WebAssembly sandboxes | Refused (HTTP 501), because they have no container file system. |
 
 ## MCP servers
@@ -142,7 +199,8 @@ The simplest way to run an MCP server on AerolVM is to start it yourself, with a
 A template is what E2B starts a sandbox from. On AerolVM the template can be:
 
 - **`base`**, which starts `ubuntu:22.04`.
-- **A name your operator has mapped to an image**, with `SB_E2B_TEMPLATE_MAP_JSON`.
+- **`code-interpreter-v1`**, the Code Interpreter SDK's default, which starts `python:3.12-slim`. That image has Python and Bash only. For JavaScript, R or Java, your operator can map `code-interpreter-v1` to an image that has them.
+- **A name your operator has mapped to an image**, with `SB_E2B_TEMPLATE_MAP_JSON`. A mapping for `base` or `code-interpreter-v1` replaces the default.
 - **An AerolVM [snapshot](/images-and-snapshots/#snapshots)** (a saved copy of a sandbox's files), by its name or ID.
 - **The ID of a registered [WASM module](/wasm-modules/)**, which starts a WebAssembly sandbox. You can also set the metadata keys `runtime` to `wasm` and `module_ref` to the module.
 
