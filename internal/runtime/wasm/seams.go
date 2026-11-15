@@ -171,3 +171,13 @@ func (a workerClientAdapter) FollowEntrypoint(ctx context.Context, sandboxID str
 func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	return a.client.ProxyHTTP(sandboxID, guestPort, w, r)
 }
+
+// SetListenPorts and ListenPorts give a guest one listener per exposed
+// port (listenPortsClient).
+func (a workerClientAdapter) SetListenPorts(sandboxID string, ports []int, host string) (worker.ListenPorts, error) {
+	return a.client.SetListenPorts(sandboxID, ports, host)
+}
+
+func (a workerClientAdapter) ListenPorts(sandboxID string) (worker.ListenPorts, error) {
+	return a.client.ListenPorts(sandboxID)
+}

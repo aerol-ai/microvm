@@ -21,24 +21,21 @@ const maxProxyHTTPBody = 32 << 20
 // has stopped since (an exec replaced it, the guest exited).
 var errGuestNotListening = errors.New("wasm guest is not listening for HTTP: its worker has no live listener")
 
-// guestHTTPTarget is the address of the listener the worker's engine bound
-// for the instance it runs now. Only that: the request's guestPort is the
-// exposed port the request came in on, a routing key, and as an address it
-// would name a port on the host, where anything can listen. Nor does the
-// worker trust the port it saw at bind time: once its instance stops, the
+// guestHTTPTarget is the address of a listener the worker's engine bound
+// for the instance it runs now: guestPort's own once the guest serves it,
+// else the primary one (listenerFor). Only that: the request's guestPort is
+// the exposed port the request came in on, a routing key, and as an address
+// it would name a port on the host, where anything can listen. Nor does the
+// worker trust a port it saw at bind time: once its instance stops, the
 // port is free and the next ephemeral bind on the node (another sandbox's
 // listener) can take it.
 func (s *Server) guestHTTPTarget(guestPort int) (string, error) {
-	_ = guestPort
 	s.mu.Lock()
 	eng := s.eng
 	host := s.lastCaps.WASIListenHost
 	s.mu.Unlock()
-	if eng == nil {
-		return "", errGuestNotListening
-	}
-	port, ok := eng.ResolvedListenPort()
-	if !ok || port <= 0 {
+	port := listenerFor(eng, guestPort)
+	if port <= 0 {
 		return "", errGuestNotListening
 	}
 	if host == "" {

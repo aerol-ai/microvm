@@ -38,6 +38,9 @@ type Server struct {
 	moduleMemoryMB int
 	streams        streamRegistry
 	entry          entrypointLog // the serving guest's output (entrypoint.go)
+	// loaded is the module eng runs and the engine it runs on, under mu
+	// (listen_engine.go).
+	loaded loadedEngine
 }
 
 // errForeignSandbox refuses a message for another sandbox than the one
@@ -315,6 +318,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			err = s.eng.LoadModule(ctx, p.Path, wasmengine.LoadOptions{MemoryMB: p.MemoryMB})
+			s.noteLoadedLocked(p, err)
 			// Read the engine's sub-stage breakdown before releasing the lock; the
 			// worker owns the NewEngineFor cost, so we splice it in here.
 			var timings wasmengine.LoadTimings
@@ -671,15 +675,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			if p.Port != wasmengine.WASIListenPortDisabled && !s.eng.SupportsListen() {
-				s.mu.Unlock()
-				if replyErr(env.SandboxID, fmt.Errorf("HTTP ingress (expose_port) is not supported on the %q WASM engine; use SB_WASM_ENGINE=wazero", workerEngineName())) != nil {
-					return err
+			if p.Port != wasmengine.WASIListenPortDisabled {
+				if listenErr := s.ensureListenEngineLocked(ctx, env.SandboxID); listenErr != nil {
+					s.mu.Unlock()
+					if replyErr(env.SandboxID, listenErr) != nil {
+						return err
+					}
+					continue
 				}
-				continue
 			}
 			s.bindNetworkHook(env.SandboxID)
 			next := s.lastCaps
+			next.WASIListeners = nil
 			next.WASIListenPort = p.Port
 			if strings.TrimSpace(p.Host) != "" {
 				next.WASIListenHost = p.Host
@@ -730,6 +737,10 @@ func (s *Server) Serve(conn net.Conn) error {
 				return encErr
 			}
 			if err := writeFrame(conn, Envelope{Type: MsgProxyHTTPResult, SandboxID: env.SandboxID, Payload: body}); err != nil {
+				return err
+			}
+		case MsgSetListenPorts, MsgListenPorts:
+			if err := s.serveListenPorts(ctx, conn, env); err != nil {
 				return err
 			}
 		case MsgNetstatsTick:

@@ -384,6 +384,9 @@ func moduleConfigFor(caps Capabilities) wazero.ModuleConfig {
 	// listener after dir preopens, so it is not always fd 3 once /work is mounted.
 	if caps.ListenEnabled() {
 		cfg = cfg.WithEnv(ListenFDEnv, strconv.Itoa(ListenerFD(caps)))
+		if len(caps.WASIListeners) > 0 {
+			cfg = cfg.WithEnv(ListenFDsEnv, listenFDsValue(caps))
+		}
 	}
 	return cfg
 }
@@ -391,12 +394,40 @@ func moduleConfigFor(caps Capabilities) wazero.ModuleConfig {
 // ListenFDEnv carries the wasip1 listener fd to AerolVM-aware guests. Guests that
 // hardcode fd 3 (the bare-wasip1 convention) keep working when no dir preopens are
 // configured; guests that also need /work read this env var to find the listener.
+// With one listener per exposed port it names the lowest port's.
 const ListenFDEnv = "AEROL_WASM_LISTEN_FD"
 
-// ListenerFD returns the fd wazero assigns the single wasip1 TCP listener:
-// stdio (0–2), then len(preopens) dir fds, then the listener (InitFSContext order).
+// ListenFDsEnv maps each exposed port to its listener's fd for a guest that
+// serves several ports, as "8080=4,9090=5" (ports ascending). WASI has no
+// getsockname, so a guest cannot ask a descriptor which port it is for.
+const ListenFDsEnv = "AEROL_WASM_LISTEN_FDS"
+
+// ListenerFD returns the fd wazero assigns the first wasip1 TCP listener:
+// stdio (0–2), then len(preopens) dir fds, then the listeners (InitFSContext order).
 func ListenerFD(caps Capabilities) int {
 	return int(fdPreopen) + len(caps.Preopens)
+}
+
+// ListenerFDs returns the fd of each of caps.Listeners(), in that order:
+// consecutive from ListenerFD.
+func ListenerFDs(caps Capabilities) []int {
+	listeners := caps.Listeners()
+	fds := make([]int, len(listeners))
+	for i := range listeners {
+		fds[i] = ListenerFD(caps) + i
+	}
+	return fds
+}
+
+// listenFDsValue is the ListenFDsEnv value for caps.
+func listenFDsValue(caps Capabilities) string {
+	listeners := caps.Listeners()
+	fds := ListenerFDs(caps)
+	parts := make([]string, len(listeners))
+	for i, l := range listeners {
+		parts[i] = strconv.Itoa(l.GuestPort) + "=" + strconv.Itoa(fds[i])
+	}
+	return strings.Join(parts, ",")
 }
 
 func (e *wazeroEngine) Run(ctx context.Context, caps Capabilities, export string) (RunResult, error) {
@@ -628,15 +659,38 @@ func (e *wazeroEngine) RestoreSnapshot(ctx context.Context, snap SnapshotRestore
 	return nil
 }
 
-// ResolvedListenPort is the host port of the running instance's listener,
-// while it is live. Safe to call while the guest runs: it reads what the
-// engine resolved at instantiation, not wazero's fd table.
+// ResolvedListenPort is the host port of the running instance's first
+// listener, while it is live. Safe to call while the guest runs: it reads
+// what the engine resolved at instantiation, not wazero's fd table.
 func (e *wazeroEngine) ResolvedListenPort() (int, bool) {
 	live := e.liveListeners()
 	if len(live) == 0 {
 		return 0, false
 	}
 	return live[0].hostPort, true
+}
+
+// ResolvedListeners is MultiListenEngine: the running instance's live
+// listeners, ascending by guest port.
+func (e *wazeroEngine) ResolvedListeners() []WASIListener {
+	live := e.liveListeners()
+	if len(live) == 0 {
+		return nil
+	}
+	out := make([]WASIListener, len(live))
+	for i, b := range live {
+		out[i] = WASIListener{GuestPort: b.guestPort, HostPort: b.hostPort}
+	}
+	return out
+}
+
+// ListenerAccepted is MultiListenEngine: whether the running guest has
+// called sock_accept on the listener for guestPort.
+func (e *wazeroEngine) ListenerAccepted(guestPort int) bool {
+	e.callMu.Lock()
+	listen := e.listen
+	e.callMu.Unlock()
+	return listen.acceptedOn(guestPort)
 }
 
 // liveListeners are the running instance's listeners the guest still has.

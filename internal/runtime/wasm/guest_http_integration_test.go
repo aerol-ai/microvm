@@ -155,8 +155,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-baseline")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {
 		for id := range sup.workers {
@@ -203,8 +202,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 func TestSetListenPortAfterColdInstantiate(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-setlisten")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {
 		for id := range sup.workers {
@@ -253,8 +251,7 @@ func TestDriverWasip1HTTPExposeEndToEnd(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-e2e")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {

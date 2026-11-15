@@ -38,6 +38,22 @@ type Engine interface {
 	SupportsListen() bool
 }
 
+// MultiListenEngine is an Engine that pre-opens one wasip1 listener per
+// exposed port (Capabilities.WASIListeners, #177) and can tell which of
+// them its guest serves. Optional, so the wasmtime backend and test fakes
+// stay plain Engines; wazero implements it.
+type MultiListenEngine interface {
+	Engine
+	// ResolvedListeners returns the running instance's live listeners with
+	// the host ports they are bound to, ascending by guest port (a single
+	// WASIListenPort listener has guest port 0). nil when it has none.
+	ResolvedListeners() []WASIListener
+	// ListenerAccepted reports whether the running guest has called
+	// sock_accept on the listener for guestPort: a guest written for one
+	// listener only ever accepts on the first.
+	ListenerAccepted(guestPort int) bool
+}
+
 // NewEngine constructs the default wazero-backed engine.
 func NewEngine(ctx context.Context) (Engine, error) {
 	return newWazeroEngine(ctx)

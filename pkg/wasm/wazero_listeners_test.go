@@ -2,9 +2,13 @@ package wasm
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+
+	"github.com/tetratelabs/wazero/api"
 )
 
 // wasiCallerWasm builds a module whose _start makes one wasip1 call,
@@ -192,7 +196,7 @@ func TestFdWatchFactoryIgnoresOtherFunctions(t *testing.T) {
 		}
 	}
 	for name, watched := range defs {
-		want := name == "fd_close" || name == "fd_renumber"
+		want := name == "fd_close" || name == "fd_renumber" || name == "sock_accept"
 		if watched != want {
 			t.Errorf("%s watched = %v, want %v", name, watched, want)
 		}
@@ -204,4 +208,143 @@ func TestFdWatchFactoryIgnoresOtherFunctions(t *testing.T) {
 	var l fdWatchListener
 	l.After(ctx, nil, nil, nil)
 	l.Abort(ctx, nil, nil, nil)
+	// A call with fewer params than the listener names reports nothing.
+	rec := &recordingFDWatcher{}
+	fdWatchListener{w: rec, params: []int{1}}.Before(ctx, nil, nil, []uint64{3}, nil)
+	if len(rec.gone)+len(rec.accepted) != 0 {
+		t.Fatalf("short params reported %+v", rec)
+	}
+}
+
+type recordingFDWatcher struct{ gone, accepted []int32 }
+
+func (r *recordingFDWatcher) fdGone(_ api.Module, fd int32)     { r.gone = append(r.gone, fd) }
+func (r *recordingFDWatcher) fdAccepted(_ api.Module, fd int32) { r.accepted = append(r.accepted, fd) }
+
+func TestCapabilitiesListeners(t *testing.T) {
+	cases := []struct {
+		name string
+		caps Capabilities
+		want []WASIListener
+		fds  []int
+		env  string
+	}{
+		{"disabled", Capabilities{WASIListenPort: WASIListenPortDisabled}, nil, []int{}, ""},
+		{"single ephemeral", Capabilities{WASIListenPort: 0}, []WASIListener{{}}, []int{3}, "0=3"},
+		{"single fixed after a preopen", Capabilities{WASIListenPort: 7000, Preopens: []Preopen{{GuestPath: "/work"}}},
+			[]WASIListener{{HostPort: 7000}}, []int{4}, "0=4"},
+		{"per port, sorted, replacing the single one",
+			Capabilities{WASIListenPort: 0, Preopens: []Preopen{{GuestPath: "/work"}},
+				WASIListeners: []WASIListener{{GuestPort: 9090}, {GuestPort: 8080, HostPort: 41000}}},
+			[]WASIListener{{GuestPort: 8080, HostPort: 41000}, {GuestPort: 9090}}, []int{4, 5}, "8080=4,9090=5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.caps.Listeners()
+			if len(got) != len(tc.want) {
+				t.Fatalf("Listeners = %+v, want %+v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("Listeners = %+v, want %+v", got, tc.want)
+				}
+			}
+			if tc.caps.ListenEnabled() != (len(tc.want) > 0) {
+				t.Fatalf("ListenEnabled = %v", tc.caps.ListenEnabled())
+			}
+			fds := ListenerFDs(tc.caps)
+			if len(fds) != len(tc.fds) {
+				t.Fatalf("ListenerFDs = %v, want %v", fds, tc.fds)
+			}
+			for i := range fds {
+				if fds[i] != tc.fds[i] {
+					t.Fatalf("ListenerFDs = %v, want %v", fds, tc.fds)
+				}
+			}
+			if got := listenFDsValue(tc.caps); got != tc.env {
+				t.Fatalf("listenFDsValue = %q, want %q", got, tc.env)
+			}
+		})
+	}
+	// The caller's slice is not reordered.
+	caps := Capabilities{WASIListeners: []WASIListener{{GuestPort: 9090}, {GuestPort: 8080}}}
+	_ = caps.Listeners()
+	if caps.WASIListeners[0].GuestPort != 9090 {
+		t.Fatal("Listeners sorted the caps' own slice")
+	}
+}
+
+// Every listener resolves at its exact fd, however many dir preopens come
+// first: the old fd 3-10 scan missed a listener behind eight of them.
+func TestWazeroEngineResolvesListenersBehindManyPreopens(t *testing.T) {
+	var preopens []Preopen
+	for i := 0; i < 9; i++ {
+		dir := t.TempDir()
+		preopens = append(preopens, Preopen{GuestPath: "/p" + string(rune('a'+i)), HostPath: dir})
+	}
+	caps := Capabilities{
+		Preopens:       preopens,
+		WASIListenPort: WASIListenPortDisabled,
+		WASIListenHost: "127.0.0.1",
+		WASIListeners:  []WASIListener{{GuestPort: 9090}, {GuestPort: 8080}},
+	}
+	eng := newListeningEngine(t, writeDummyWasm(t, t.TempDir()), caps)
+	got := eng.ResolvedListeners()
+	if len(got) != 2 || got[0].GuestPort != 8080 || got[1].GuestPort != 9090 || got[0].HostPort <= 0 || got[1].HostPort <= 0 || got[0].HostPort == got[1].HostPort {
+		t.Fatalf("ResolvedListeners = %+v", got)
+	}
+	if port, ok := eng.ResolvedListenPort(); !ok || port != got[0].HostPort {
+		t.Fatalf("ResolvedListenPort = (%d,%v), want the 8080 listener %d", port, ok, got[0].HostPort)
+	}
+	if _, ok := ResolvedListenPort(eng.module); ok {
+		t.Fatal("the fd 3-10 scan now finds a listener at fd 12; this test no longer covers the exact lookup")
+	}
+	ports := ResolvedListenPorts(eng.module, ListenerFDs(caps))
+	if len(ports) != 2 || ports[0] != got[0].HostPort || ports[1] != got[1].HostPort {
+		t.Fatalf("ResolvedListenPorts = %v", ports)
+	}
+	if ports := ResolvedListenPorts(nil, []int{3}); ports[0] != 0 {
+		t.Fatalf("ResolvedListenPorts(nil) = %v", ports)
+	}
+}
+
+// The engine reports a listener as accepted once the guest calls
+// sock_accept on its fd; the others stay unaccepted.
+func TestWazeroEngineListenerAccepted(t *testing.T) {
+	caps := Capabilities{
+		WASIListenPort: WASIListenPortDisabled,
+		WASIListenHost: "127.0.0.1",
+		WASIListeners:  []WASIListener{{GuestPort: 8080}, {GuestPort: 9090}},
+	}
+	fds := ListenerFDs(caps)
+	eng := newListeningEngine(t, wasiCallerWasm(t, "sock_accept", int32(fds[1]), 0, 16), caps)
+	if eng.ListenerAccepted(8080) || eng.ListenerAccepted(9090) {
+		t.Fatal("a listener counts as accepted before the guest ran")
+	}
+	// The listener blocks in accept: queue a connection so the guest's one
+	// sock_accept returns.
+	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(eng.ResolvedListeners()[1].HostPort)))
+	if err != nil {
+		t.Fatalf("dial the 9090 listener: %v", err)
+	}
+	defer conn.Close()
+	if err := eng.InvokeExport(context.Background(), "_start"); err != nil {
+		t.Fatalf("_start: %v", err)
+	}
+	if eng.ListenerAccepted(8080) || !eng.ListenerAccepted(9090) || eng.ListenerAccepted(0) || eng.ListenerAccepted(7070) {
+		t.Fatalf("accepted 8080=%v 9090=%v", eng.ListenerAccepted(8080), eng.ListenerAccepted(9090))
+	}
+	// A listener the guest accepted on and then gave up is not accepted.
+	eng.listen.fdGone(int32(fds[1]))
+	if eng.ListenerAccepted(9090) {
+		t.Fatal("a closed listener still counts as accepted")
+	}
+	var nilListen *instanceListen
+	nilListen.fdAccepted(3)
+	if nilListen.acceptedOn(8080) {
+		t.Fatal("nil listen accepted")
+	}
+	if got := (&wazeroEngine{}).ResolvedListeners(); got != nil {
+		t.Fatalf("ResolvedListeners with no instance = %+v", got)
+	}
 }

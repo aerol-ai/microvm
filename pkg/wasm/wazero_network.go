@@ -46,12 +46,17 @@ func (e *wazeroEngine) ClearNetworkHook() {
 
 func (e *wazeroEngine) withNetworkContext(ctx context.Context, caps Capabilities) context.Context {
 	ctx = withWasip1Meter(ctx, e.netHook)
-	if caps.ListenEnabled() {
+	if listeners := caps.Listeners(); len(listeners) > 0 {
 		host := caps.WASIListenHost
 		if host == "" {
 			host = "127.0.0.1"
 		}
-		sockCfg := experimentalsock.NewConfig().WithTCPListener(host, caps.WASIListenPort)
+		// WithTCPListener appends: wazero pre-opens the listeners in this
+		// order, on consecutive fds after the dir preopens (ListenerFDs).
+		sockCfg := experimentalsock.NewConfig()
+		for _, l := range listeners {
+			sockCfg = sockCfg.WithTCPListener(host, l.HostPort)
+		}
 		ctx = experimentalsock.WithConfig(ctx, sockCfg)
 	}
 	return ctx
