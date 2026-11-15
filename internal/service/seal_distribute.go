@@ -953,6 +953,13 @@ func (s *Service) prepareSecretRefanoutRecord(ctx context.Context, rec store.Clu
 		if ownerID := strings.TrimSpace(placement.OwnerNodeID); ownerID == "" || ownerID != s.selfNodeID() {
 			return nil, nil
 		}
+		// Its recreate policy was turned off here (clearRecreateFailover):
+		// its backups were retired, so neither seed holders that would push
+		// to them or reseal onto new nodes, nor retransmit. One local row
+		// read, for an owned row with backups only.
+		if len(rec.Recipients) > 1 && s.recreateTurnedOff(ctx, rec.SandboxID, parsed.IncarnationID) {
+			return nil, nil
+		}
 	}
 	if len(rec.Recipients) == 0 {
 		return nil, nil

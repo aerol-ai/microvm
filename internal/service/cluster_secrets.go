@@ -408,6 +408,59 @@ func (s *Service) deleteClusterSecretsOriginator(ctx context.Context, sandboxID,
 	return nil
 }
 
+// clearRecreateFailover turns sb's failover.policy=recreate off in its row
+// and, in the same store transaction, retires what only a recreate on
+// another node needed: the sealed copies of its secrets on its backup nodes,
+// and any push to them still pending. The owner's own copy stays (the
+// sandbox keeps running here). It is the one place a sandbox stops being
+// recreate-policy after its create; failover.policy is otherwise fixed at
+// create, so there is no API path that needs it.
+//
+// The peer deletes go through the durable delete outbox: the first attempt
+// runs now, and the outbox's reconciler retries a backup node that is down
+// until it acknowledges, as it does for a destroy. The holder sets are
+// cleared so the possession refresh neither re-pushes to those nodes nor
+// reseals onto new ones, and prepareSecretRefanoutRecord skips the row at
+// boot for the same reason. Standalone nodes have no backups: only the
+// policy changes.
+func (s *Service) clearRecreateFailover(ctx context.Context, sb *models.Sandbox) (bool, error) {
+	incarnationID := strings.TrimSpace(sb.AuditIncarnationID)
+	selfID := ""
+	if s.cfg.EnableCluster {
+		selfID = s.selfNodeID()
+	}
+	unlock := lockSecretSandboxOps(sb.ID)
+	changed, retired, err := s.store.ClearRecreateFailoverRetiringBackups(ctx, sb.ID, incarnationID, selfID)
+	if err == nil && changed && incarnationID != "" && selfID != "" {
+		clearSecretFanoutHoldersForIncarnation(sb.ID, incarnationID)
+	}
+	unlock()
+	if err != nil || !changed {
+		return changed, err
+	}
+	if retired > 0 {
+		secretBackupsRetiredTotal.Add(int64(retired))
+		s.maybeAsyncDeleteFanout(sb.ID, incarnationID)
+	}
+	return true, nil
+}
+
+// recreateTurnedOff reports whether this node's row for sandboxID, in the
+// lifecycle incarnationID, has a policy other than recreate. A boot refan-out
+// must not hand such a sandbox's retired backups their copy again
+// (clearRecreateFailover). A missing or unreadable row, or another
+// lifecycle's, says nothing: the caller goes on as before.
+func (s *Service) recreateTurnedOff(ctx context.Context, sandboxID, incarnationID string) bool {
+	if s == nil || s.store == nil {
+		return false
+	}
+	sb, err := s.store.Get(ctx, sandboxID)
+	if err != nil || sb == nil || strings.TrimSpace(sb.AuditIncarnationID) != strings.TrimSpace(incarnationID) {
+		return false
+	}
+	return sb.Failover == nil || !sb.Failover.ShouldRecreate()
+}
+
 // DeleteClusterSecretsLocal applies an authenticated peer DELETE with
 // generation gating and a local tombstone so delayed PUTs cannot resurrect
 // deleted credentials. In cluster mode the mTLS peer must be either the
