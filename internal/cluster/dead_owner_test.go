@@ -285,6 +285,50 @@ func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
 	}
 }
 
+// A worker that cannot freeze a recreate-policy sandbox alone turns its
+// policy off with an ordinary spec write (service review V4): opUpsertSpec,
+// which every server applies, carrying no spec version while some server
+// predates the version check. From then on the leader orphans the sandbox
+// when its owner dies instead of recreating it elsewhere, so no leader, of
+// any version that reads the spec, starts a second copy beside it.
+func TestEvictDeadOwnerOrphansASandboxWhoseRecreateWasTurnedOff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
+
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-off", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
+		IncarnationID: "inc-off",
+		Spec: &models.CreateSandboxRequest{
+			Image: "module", Runtime: models.RuntimeWasm, CPU: 0.5, MemoryMB: 256,
+			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+		},
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	spec := c.SpecOf("sb-off")
+	spec.Failover = &models.Failover{Policy: models.FailoverPolicyNone}
+	if err := c.UpsertSpec(ctx, "sb-off", spec, PlacementSecrets{}); err != nil {
+		t.Fatalf("UpsertSpec: %v", err)
+	}
+	if p, _ := c.fsm.get("sb-off"); placementWantsFailoverRecreate(p) || p.FailoverRecreate {
+		t.Fatalf("the placement still asks to be recreated: %+v", p.Spec.Failover)
+	}
+
+	c.evictDeadOwner(ctx, "dead-node")
+	if _, err := c.OwnerOf("sb-off"); err != ErrOrphaned {
+		t.Fatalf("post-evict OwnerOf err = %v, want ErrOrphaned (not recreated)", err)
+	}
+}
+
 // newEvictFenceCluster is a single-node leader that can own sandboxes and
 // has capacity, so every failover reassign targets the leader itself. The
 // dead owner is not in gossip, which reads as not alive. The gossip refresh

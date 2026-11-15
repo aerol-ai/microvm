@@ -5324,6 +5324,29 @@ func (s *Store) SetStatusReasonIfStatus(ctx context.Context, id string, status m
 	return affected == 1, nil
 }
 
+// ClearRecreateFailover turns a sandbox's failover.policy=recreate off: the
+// row's policy becomes none (stored as ""). One conditional UPDATE of that
+// column alone, so a row whose policy already changed is left as it is.
+// The caller holds the sandbox's lifecycle boundary, so no whole-row write
+// built from an older read is in flight. changed reports whether this call turned it off (false for a row with
+// another policy, or gone). A node that cannot freeze such a sandbox alone
+// uses it (service review V4).
+func (s *Store) ClearRecreateFailover(ctx context.Context, id string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE sandboxes
+		SET failover_policy = '', updated_at = ?
+		WHERE id = ? AND failover_policy = ?
+	`, time.Now().UTC(), id, models.FailoverPolicyRecreate)
+	if err != nil {
+		return false, fmt.Errorf("clear sandbox recreate policy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear sandbox recreate policy: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // ScheduleRestart records a pending restart on failure: the consecutive
 // failure count the backoff was computed from and when the restart is due.
 func (s *Store) ScheduleRestart(ctx context.Context, id string, failures int, at time.Time) error {
