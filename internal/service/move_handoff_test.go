@@ -689,9 +689,10 @@ func TestCheckMovedInOnceUnfinished(t *testing.T) {
 		}
 	})
 	t.Run("a drop that fails: tried again, then given up", func(t *testing.T) {
-		dst, _, dstC := importedGvisor(t, true, moveTimings{inFenceTTL: time.Minute})
-		// This node's own view already names it; the leader's does not.
-		dst.AttachCluster(&splitViewCluster{moveStubCluster: dstC, leaderOwner: "worker-a"})
+		dst, dstRT, _ := importedGvisor(t, true, moveTimings{inFenceTTL: time.Minute})
+		// The leader's placement still names the source; the runtime will
+		// not drop the staged checkpoint.
+		dstRT.dropErr = errors.New("busy")
 		importedAgo(t, dst, "sb-g", 90*time.Second) // the move's time is up
 		if err := step(dst, "sb-g"); err == nil {
 			t.Fatal("a drop that failed ended the check")
@@ -1220,6 +1221,17 @@ func TestDropMoveTouchesOnlyItsImport(t *testing.T) {
 			t.Fatal("dropped a sandbox that moved here")
 		}
 		kept(t, dst, rt)
+	})
+	t.Run("the cached view names this node, the leader's the source", func(t *testing.T) {
+		// The leader decides, not the cached view: the swap did not happen.
+		dst, rt, c := importedFirecracker(t, moveTimings{})
+		dst.AttachCluster(&splitViewCluster{moveStubCluster: c, leaderOwner: "worker-a"})
+		if err := dst.DropMove(ctx, "sb-vm", "inc-1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dst.store.Get(ctx, "sb-vm"); !errors.Is(err, store.ErrNotFound) || rt.dropped != 1 {
+			t.Fatalf("drop: row %v, runtime drops %d", err, rt.dropped)
+		}
 	})
 	t.Run("the placement cannot be read", func(t *testing.T) {
 		dst, rt, c := importedFirecracker(t, moveTimings{})
