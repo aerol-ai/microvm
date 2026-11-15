@@ -686,12 +686,29 @@ func (s *Service) StartMoved(ctx context.Context, id, lifetime string, rc *clust
 // lifetime than the import here.
 var errMoveOtherLifetime = errors.New("another lifetime of this sandbox")
 
+// errMoveStartUnsettled marks a moved sandbox's start that could not
+// confirm the leader's placement: the read failed, or the placement no
+// longer names this import here (another owner or lifetime, reserved, or
+// being deleted) since the caller looked. The move-in check looks again a
+// retry later instead of giving up: its next read decides between a start
+// and a drop, and giving up would drop a gVisor import's staged checkpoint,
+// or write a stopped row of an old lifetime, over a temporary state.
+var errMoveStartUnsettled = errors.New("the placement could not be confirmed for this start")
+
 // movedStartAllowed reports why id's import, of local lifetime, must not
 // start now, or nil: this node must own id's placement in the leader's
 // view, not reserved or being deleted, with the import's lifetime, and the
 // lifetime the leader named, if it named one. The caller holds id's
-// lifecycle lock.
+// lifecycle lock. Every refusal wraps errMoveStartUnsettled.
 func (s *Service) movedStartAllowed(ctx context.Context, id, expected, local string) error {
+	if err := s.movedStartRefusal(ctx, id, expected, local); err != nil {
+		return fmt.Errorf("%w: %w", errMoveStartUnsettled, err)
+	}
+	return nil
+}
+
+// movedStartRefusal is movedStartAllowed's check, unwrapped.
+func (s *Service) movedStartRefusal(ctx context.Context, id, expected, local string) error {
 	c := s.Cluster()
 	if c == nil {
 		return errors.New("snapshot moves need cluster mode")
@@ -905,7 +922,10 @@ func (s *Service) checkMovedInOnce(ctx context.Context, ck moveInCheck) error {
 		err = s.dropImport(ctx, id, st.lifetime)
 	case ok && strings.TrimSpace(p.OwnerNodeID) == c.SelfNodeID():
 		if err := s.StartMoved(ctx, id, st.lifetime, nil); err != nil {
-			if errors.Is(err, errMoveNoSpec) || !time.Now().Before(st.until) {
+			// A start that could not confirm the placement, its read failing
+			// or the placement changing since this check's read, is looked at
+			// again: only a start that itself failed is given up on.
+			if !errors.Is(err, errMoveStartUnsettled) && (errors.Is(err, errMoveNoSpec) || !time.Now().Before(st.until)) {
 				return s.giveUpMovedIn(ctx, id, err)
 			}
 			return fmt.Errorf("start: %w", err)
