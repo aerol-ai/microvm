@@ -2294,8 +2294,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			status_reason, exit_code,
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
-			tokens_not_before
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			tokens_not_before,
+			net_seen_pid
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2362,6 +2363,11 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		int64(sandbox.Lifecycle.DestroyAfterExitFor),
 		nullableTime(sandbox.ProgramExitedAt),
 		sandbox.TokensNotBefore,
+		// A new row has had nothing credited, so the poller's first reading
+		// of it is all of its traffic. Upsert never writes the column: a
+		// row it creates is "unknown" and baselined, and a row it updates
+		// keeps its reading.
+		NetSeenNew,
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -3377,6 +3383,82 @@ type NetCounterDelta struct {
 	SandboxID string
 	BytesIn   int64
 	BytesOut  int64
+	// Seen, when set, is the kernel counter reading these bytes were
+	// measured up to. It is written by the same UPDATE as the bytes, so the
+	// store never holds a credit without the reading it came from, nor the
+	// other way round: a crash or a failed batch leaves both as they were,
+	// and the next poll measures from the old reading again. Nil keeps the
+	// stored reading.
+	Seen *NetSeen
+}
+
+// NetSeen is the netstats reading a sandbox's cumulative counters were last
+// credited up to (issue #69). The poller measures the next reading against
+// it, so traffic is neither dropped at a sandbox's start nor counted twice
+// after a sandboxd restart.
+//
+// PID tells three states apart: NetSeenUnknown (the column default, so every
+// row written before the column existed, or by a build that does not write
+// it), NetSeenNew (a row Create made, nothing credited yet), or the PID of
+// the process the counters were read through.
+//
+// The row keeps BytesIn/BytesOut as offsets from its cumulative counters
+// (net_seen_in_offset = reading - net_bytes_in, written with the bytes), and
+// ListNetstatsTargets adds the counters back. Bytes credited with no reading
+// therefore raise the reading by the same amount: a build that does not
+// write readings (the previous release, after a rollback) credits traffic,
+// and the next reading here counts only what that build did not.
+type NetSeen struct {
+	PID      int
+	BytesIn  int64
+	BytesOut int64
+}
+
+const (
+	// NetSeenUnknown: what the row has been credited is not known, so the
+	// next reading is only a baseline (the behaviour before #69).
+	NetSeenUnknown = 0
+	// NetSeenNew: nothing has been credited, so the next reading is all of
+	// the sandbox's traffic since its network came up.
+	NetSeenNew = -1
+)
+
+// NetstatsTarget is one started sandbox for the netstats poller, with the
+// reading its counters were last credited up to.
+type NetstatsTarget struct {
+	ID          string
+	ContainerID string
+	Seen        NetSeen
+}
+
+// ListNetstatsTargets returns every started sandbox's id, container id and
+// last credited netstats reading. The poller runs this every tick (issue
+// #70): it reads five columns of the started rows and nothing else, where a
+// full List decoded every row of every status and attached its ports.
+func (s *Store) ListNetstatsTargets(ctx context.Context) ([]NetstatsTarget, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT id, container_id, net_seen_pid,
+			CASE WHEN net_seen_pid > 0 THEN net_bytes_in + net_seen_in_offset ELSE 0 END,
+			CASE WHEN net_seen_pid > 0 THEN net_bytes_out + net_seen_out_offset ELSE 0 END
+		FROM sandboxes
+		WHERE status = ?
+	`, string(models.SandboxStatusStarted))
+	if err != nil {
+		return nil, fmt.Errorf("list netstats targets: %w", err)
+	}
+	defer rows.Close()
+	var out []NetstatsTarget
+	for rows.Next() {
+		var t NetstatsTarget
+		if err := rows.Scan(&t.ID, &t.ContainerID, &t.Seen.PID, &t.Seen.BytesIn, &t.Seen.BytesOut); err != nil {
+			return nil, fmt.Errorf("scan netstats target: %w", err)
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list netstats targets: %w", err)
+	}
+	return out, nil
 }
 
 // NetCounterTotals is a sandbox's cumulative counters, caps and quota flag
@@ -3405,9 +3487,12 @@ const netCounterBatchRows = 64
 
 // ApplyNetCounterDeltas adds each delta to its sandbox's cumulative counters
 // and returns the totals right after, for every sandbox that still exists.
-// A sandbox deleted since the poll, or a zero delta, is skipped without an
-// error. Any negative delta rejects the whole call before anything is
-// written.
+// A sandbox deleted since the poll, or a zero delta with no Seen, is skipped
+// without an error. A zero delta with a Seen still records the reading (a
+// restarted container whose counters began again). Any negative delta, or a
+// Seen that is not a real reading, rejects the whole call before anything is
+// written: a Seen with a PID of NetSeenNew would make the next poll credit a
+// container's whole counter again.
 //
 // Deltas are applied netCounterBatchRows at a time, one transaction each.
 // The netstats poller used to pay one commit plus a four-query re-read per
@@ -3419,6 +3504,9 @@ func (s *Store) ApplyNetCounterDeltas(ctx context.Context, deltas []NetCounterDe
 	for _, d := range deltas {
 		if d.BytesIn < 0 || d.BytesOut < 0 {
 			return nil, fmt.Errorf("net counter deltas must be non-negative (sandbox=%s in=%d out=%d)", d.SandboxID, d.BytesIn, d.BytesOut)
+		}
+		if d.Seen != nil && (d.Seen.PID <= 0 || d.Seen.BytesIn < 0 || d.Seen.BytesOut < 0) {
+			return nil, fmt.Errorf("net seen reading must have a pid and non-negative counters (sandbox=%s pid=%d in=%d out=%d)", d.SandboxID, d.Seen.PID, d.Seen.BytesIn, d.Seen.BytesOut)
 		}
 	}
 	totals := make([]NetCounterTotals, 0, len(deltas))
@@ -3441,10 +3529,15 @@ func (s *Store) applyNetCounterBatch(ctx context.Context, deltas []NetCounterDel
 	defer tx.Rollback()
 	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE sandboxes
-		SET net_bytes_in = net_bytes_in + ?,
-		    net_bytes_out = net_bytes_out + ?,
-		    updated_at = ?
-		WHERE id = ?
+		SET net_bytes_in = net_bytes_in + ?1,
+		    net_bytes_out = net_bytes_out + ?2,
+		    -- SET reads the row as it was, so net_bytes_in + ?1 is the new
+		    -- total. A NULL reading leaves the offsets as they were.
+		    net_seen_pid = COALESCE(?3, net_seen_pid),
+		    net_seen_in_offset = COALESCE(?4 - (net_bytes_in + ?1), net_seen_in_offset),
+		    net_seen_out_offset = COALESCE(?5 - (net_bytes_out + ?2), net_seen_out_offset),
+		    updated_at = ?6
+		WHERE id = ?7
 		RETURNING owner_ref, net_bytes_in, net_bytes_out,
 			net_bytes_in_limit, net_bytes_out_limit, net_quota_exceeded
 	`)
@@ -3454,11 +3547,15 @@ func (s *Store) applyNetCounterBatch(ctx context.Context, deltas []NetCounterDel
 	defer stmt.Close()
 	now := time.Now().UTC()
 	for i, d := range deltas {
-		if d.BytesIn == 0 && d.BytesOut == 0 {
+		if d.BytesIn == 0 && d.BytesOut == 0 && d.Seen == nil {
 			continue
 		}
+		var seenPID, seenIn, seenOut any
+		if d.Seen != nil {
+			seenPID, seenIn, seenOut = d.Seen.PID, d.Seen.BytesIn, d.Seen.BytesOut
+		}
 		t := NetCounterTotals{Index: offset + i, SandboxID: d.SandboxID}
-		err := stmt.QueryRowContext(ctx, d.BytesIn, d.BytesOut, now, d.SandboxID).Scan(
+		err := stmt.QueryRowContext(ctx, d.BytesIn, d.BytesOut, seenPID, seenIn, seenOut, now, d.SandboxID).Scan(
 			&t.OwnerRef, &t.BytesIn, &t.BytesOut, &t.BytesInLimit, &t.BytesOutLimit, &t.QuotaExceeded)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
