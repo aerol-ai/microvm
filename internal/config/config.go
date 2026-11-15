@@ -826,6 +826,11 @@ type Config struct {
 	// A worker never runs more than 32 per sandbox, whatever this says.
 	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
+	// WasmStreamMaxMessageBytes caps one client message on a WASM exec
+	// stream (a stdin chunk or a control frame). The stream is served by
+	// sandboxd, which reads each message whole. Default 1 MiB.
+	// SB_WASM_STREAM_MAX_MESSAGE_BYTES.
+	WasmStreamMaxMessageBytes int64
 	// Daytona-style process sessions on WASM keep their state in sandboxd's
 	// heap, so each part is capped. WasmSessionLogBytes is the output kept
 	// per stream per command, the newest bytes (default 1 MiB,
@@ -2708,6 +2713,7 @@ func load(keyTool bool) (Config, error) {
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
 		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 8),
+		WasmStreamMaxMessageBytes: getEnvInt64("SB_WASM_STREAM_MAX_MESSAGE_BYTES", 1<<20),
 		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),
 		WasmSessionCommandsKept:   getEnvInt("SB_WASM_SESSION_COMMANDS_KEPT", 64),

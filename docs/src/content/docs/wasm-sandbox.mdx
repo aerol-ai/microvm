@@ -207,6 +207,7 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 |---|---|---|
 | `SB_WASM_CODERUN_MODULES` | Which module runs each code-run language, as `language=module,...`. Languages can be `python`, `python3`, `py`, `javascript`, `js`, `node`, `ruby` and `rb`. | Built from `SB_WASM_STANDARD_MODULES`: the `python`, `javascript` and `ruby` modules, when present |
 | `SB_WASM_MAX_STREAMS_PER_SANDBOX` | How many streamed commands, code runs and open code interpreters one WASM sandbox may run at a time. Each one uses memory on the server. | `8` |
+| `SB_WASM_STREAM_MAX_MESSAGE_BYTES` | The largest single message a client may send on a streamed command: one piece of input, or one control message. A bigger one closes the stream with code 1009 and ends the command. Send large input in several messages. | `1048576` (1 MiB) |
 | `SB_WASM_SESSION_LOG_BYTES` | How much of each Daytona session command's output, and of its error output, the server keeps. | `1048576` (1 MiB) |
 | `SB_WASM_MAX_SESSIONS_PER_SANDBOX` | How many Daytona sessions one WASM sandbox may have. | `16` |
 | `SB_WASM_SESSION_COMMANDS_KEPT` | How many finished commands a session keeps, and how many may wait for their turn. | `64` |

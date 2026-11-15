@@ -255,3 +255,45 @@ func workerEvent(stdout, stderr string) worker.ExecEvent {
 func workerExit(code int) worker.ExecEvent {
 	return worker.ExecEvent{Exit: &worker.ExecExit{ExitCode: code}}
 }
+
+// TestToolboxExecStreamMessageCap: the driver hands the toolhost its cap
+// on one exec stream message (SB_WASM_STREAM_MAX_MESSAGE_BYTES); past it
+// the stream closes with 1009 and the run ends with it.
+func TestToolboxExecStreamMessageCap(t *testing.T) {
+	d, id := streamDriver(t, Config{StreamMaxMessageBytes: 64}, models.CreateSandboxRequest{})
+	base := toolboxServer(t, d, id)
+	dialer := websocket.Dialer{Subprotocols: []string{toolboxwire.BearerSubprotocol}}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(base, "http")+"/process/exec/stream", http.Header{"Authorization": {"Bearer tok"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	if err := conn.WriteJSON(toolboxwire.ExecStreamStart{Command: "aerolstdio echo"}); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := d.instance(id)
+	runs := func() int {
+		d.mu.Lock()
+		set := inst.streams
+		d.mu.Unlock()
+		if set == nil {
+			return 0
+		}
+		return set.count()
+	}
+	waitFor(t, "the run to start", func() bool { return runs() == 1 })
+	_ = conn.WriteMessage(websocket.BinaryMessage, make([]byte, 65))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		var closeErr *websocket.CloseError
+		if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
+			t.Fatalf("read = %v, want close 1009", err)
+		}
+		break
+	}
+	waitFor(t, "the run's slot to free", func() bool { return runs() == 0 })
+}

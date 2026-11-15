@@ -115,8 +115,9 @@ func TestFromDaemonConfig(t *testing.T) {
 		WasmDefaultTimeout:  time.Minute,
 		WasmDrainTimeout:    30 * time.Second,
 		// Streaming runs (issue #535).
-		WasmMaxStreamsPerSandbox: 3,
-		WasmCodeRunModules:       map[string]string{"python": "python"},
+		WasmMaxStreamsPerSandbox:  3,
+		WasmStreamMaxMessageBytes: 4096,
+		WasmCodeRunModules:        map[string]string{"python": "python"},
 		// Daytona sessions (issue #178).
 		WasmSessionLogBytes:       10,
 		WasmMaxSessionsPerSandbox: 11,
@@ -126,7 +127,7 @@ func TestFromDaemonConfig(t *testing.T) {
 	if cfg.RunDir != "/run" || cfg.ModulesDir != "/mods" || cfg.DefaultMemoryMB != 128 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
-	if cfg.MaxStreamsPerSandbox != 3 || cfg.CodeRunModules["python"] != "python" {
+	if cfg.MaxStreamsPerSandbox != 3 || cfg.StreamMaxMessageBytes != 4096 || cfg.CodeRunModules["python"] != "python" {
 		t.Fatalf("stream settings = %+v", cfg)
 	}
 	if cfg.SessionLogBytes != 10 || cfg.MaxSessionsPerSandbox != 11 || cfg.SessionCommandsKept != 12 || cfg.SessionLogBudget != 13 {

@@ -484,3 +484,148 @@ func TestRequireAuthComparesTokens(t *testing.T) {
 		}
 	}
 }
+
+// tunedStreamServer is streamServer with the host's stream settings
+// tuned, and a channel that receives once per handler that returned.
+func tunedStreamServer(t *testing.T, procs Processes, ctx context.Context, tune func(*Config)) (string, <-chan struct{}) {
+	t.Helper()
+	handled := make(chan struct{}, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { handled <- struct{}{} }()
+		if ctx != nil {
+			r = r.WithContext(ctx)
+		}
+		cfg := Config{SandboxID: "sb", WorkDir: t.TempDir(), AuthToken: "tok", Procs: procs,
+			// Long enough that only the setting under test ends a stream.
+			StreamLiveness: toolboxwire.Liveness{PingInterval: time.Minute, PongWait: time.Minute}}
+		if tune != nil {
+			tune(&cfg)
+		}
+		New(cfg).Handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/process/exec/stream", handled
+}
+
+func waitHandled(t *testing.T, handled <-chan struct{}, within time.Duration) {
+	t.Helper()
+	select {
+	case <-handled:
+	case <-time.After(within):
+		t.Fatalf("the stream handler did not return within %s", within)
+	}
+}
+
+// fillUntilStuck feeds a run's output to a client that never reads, until
+// the handler's write blocks (the run's event queue stays full).
+func fillUntilStuck(t *testing.T, run *fakeRun) {
+	t.Helper()
+	chunk := make([]byte, 1<<20)
+	for i := 0; i < 512; i++ {
+		select {
+		case run.events <- ProcessEvent{Stdout: chunk}:
+		case <-time.After(300 * time.Millisecond):
+			return
+		case <-run.closed:
+			t.Fatal("the run ended before the handler's write blocked")
+		}
+	}
+	t.Fatal("the handler never blocked writing to a client that does not read")
+}
+
+// TestExecStreamCapsClientMessages: one client message is read whole
+// into sandboxd's heap, so its size is capped (1 MiB by default, close
+// code 1009 past it) and the run ends with the stream.
+func TestExecStreamCapsClientMessages(t *testing.T) {
+	if got := (&Host{}).streamReadLimitBytes(); got != DefaultStreamReadLimit || DefaultStreamReadLimit != 1<<20 {
+		t.Fatalf("default read limit = %d", got)
+	}
+	for _, tc := range []struct {
+		name  string
+		limit int64
+		size  int
+	}{
+		{"default", 0, 1<<20 + 1},
+		{"configured", 1024, 1025},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			procs := &fakeProcs{}
+			url, handled := tunedStreamServer(t, procs, nil, func(c *Config) { c.StreamReadLimit = tc.limit })
+			conn := dialStream(t, url)
+			if err := conn.WriteJSON(toolboxwire.ExecStreamStart{Command: "cat"}); err != nil {
+				t.Fatal(err)
+			}
+			run := procs.run(t, 0)
+			// At the limit is fine.
+			if err := conn.WriteMessage(websocket.BinaryMessage, make([]byte, tc.size-1)); err != nil {
+				t.Fatal(err)
+			}
+			waitUntil(t, "stdin at the limit", func() bool { in, _, _ := run.snapshot(); return len(in) == tc.size-1 })
+			_ = conn.WriteMessage(websocket.BinaryMessage, make([]byte, tc.size))
+			_, _, err := conn.ReadMessage()
+			var closeErr *websocket.CloseError
+			if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig {
+				t.Fatalf("read after an oversized message = %v, want close 1009", err)
+			}
+			run.waitClosed(t)
+			waitHandled(t, handled, 5*time.Second)
+			if in, _, kills := run.snapshot(); len(in) != tc.size-1 || kills != 1 {
+				t.Fatalf("stdin %d bytes, kills %d: the oversized message reached the run", len(in), kills)
+			}
+		})
+	}
+}
+
+// TestExecStreamCutsOffAClientThatStopsReading: each frame has a write
+// deadline, so a client that stops reading (but keeps its connection up)
+// ends the stream and the run instead of holding the handler forever.
+func TestExecStreamCutsOffAClientThatStopsReading(t *testing.T) {
+	if got := (&Host{}).streamWriteWaitTime(); got != defaultStreamWriteWait {
+		t.Fatalf("default write wait = %s", got)
+	}
+	procs := &fakeProcs{}
+	url, handled := tunedStreamServer(t, procs, nil, func(c *Config) { c.StreamWriteWait = 200 * time.Millisecond })
+	conn := dialStream(t, url)
+	if err := conn.WriteJSON(toolboxwire.ExecStreamStart{Command: "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	run := procs.run(t, 0)
+	chunk := make([]byte, 1<<20)
+	go func() {
+		for {
+			select {
+			case run.events <- ProcessEvent{Stdout: chunk}:
+			case <-run.closed:
+				return
+			}
+		}
+	}()
+	run.waitClosed(t)
+	waitHandled(t, handled, 5*time.Second)
+	if _, _, kills := run.snapshot(); kills != 1 {
+		t.Fatalf("kills = %d, want 1", kills)
+	}
+}
+
+// TestExecStreamSandboxStopFreesAStuckWriter: a sandbox that stops while
+// the handler is stuck writing to a client that stopped reading closes the
+// client's connection (after a short grace), so the handler returns well
+// before its write deadline.
+func TestExecStreamSandboxStopFreesAStuckWriter(t *testing.T) {
+	procs := &fakeProcs{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	url, handled := tunedStreamServer(t, procs, ctx, func(c *Config) { c.StreamWriteWait = time.Hour })
+	conn := dialStream(t, url)
+	if err := conn.WriteJSON(toolboxwire.ExecStreamStart{Command: "yes"}); err != nil {
+		t.Fatal(err)
+	}
+	run := procs.run(t, 0)
+	fillUntilStuck(t, run)
+	cancel()
+	run.waitClosed(t)
+	waitHandled(t, handled, streamStopGrace+5*time.Second)
+	if _, _, kills := run.snapshot(); kills != 1 {
+		t.Fatalf("kills = %d, want 1", kills)
+	}
+}
