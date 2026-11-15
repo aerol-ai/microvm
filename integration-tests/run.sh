@@ -665,9 +665,16 @@ worktree_roots() {
 }
 
 # The lease lock spans "read every pin" to "write ours", so two runs started
-# in the same second cannot both pick the one free domain. It is a directory
-# (mkdir is atomic everywhere; macOS has no flock) in the clone's shared git
-# dir, which every worktree sees. Inside a git checkout a failed
+# in the same second cannot both pick the one free domain. It lives in the
+# clone's shared git dir, which every worktree sees. What makes a run the
+# holder is creating the lock's owner file with noclobber: bash opens it with
+# O_CREAT|O_EXCL itself, so exactly one run makes it (macOS has no flock).
+# mkdir alone is not enough: uutils coreutils' mkdir, the default on Ubuntu
+# 26.04 and on the CI runners, lets two calls racing on one path both succeed
+# (580 of 1,500 rounds of four racing mkdirs, against 0 for GNU mkdir), and
+# two worktrees then leased one domain (CI, 2026-11-15). The lock stays a
+# directory, made with mkdir first, so a run.sh that predates the owner file
+# still sees it as held. Inside a git checkout a failed
 # `rev-parse --git-common-dir` is an error: it used to fall back to a lock
 # under this worktree's own .tf, which no other worktree takes, so two runs
 # could both hold "the" lock.
@@ -680,8 +687,9 @@ worktree_roots() {
 # run.sh made) is cleared only once it is over a minute old. Using the
 # holder's pid, not the clock, means a clock that jumps forward cannot make a
 # live lock look old. A stale lock is cleared under a second lock, the
-# breaker, so two runs can never both decide one lock is stale and the second
-# delete the fresh lock the first one just took.
+# breaker (a file, made with noclobber too), so two runs can never both decide
+# one lock is stale and the second delete the fresh lock the first one just
+# took.
 lease_lock_path() {
   local gitdir
   if ! in_git_checkout; then
@@ -712,23 +720,30 @@ lease_lock_stale() {
 }
 
 lease_lock_acquire() {
-  local lock tries=0
+  local lock tries=0 me
   lock=$(lease_lock_path) || return 1
   mkdir -p "$(dirname "$lock")"
-  until mkdir "$lock" 2>/dev/null; do
+  # The holder is this shell, which may be a subshell: a lease runs inside
+  # run_one's $(…), so $$ would name the parent run.sh, which outlives a
+  # lease subshell that died mid-lease, and the lock would look live for the
+  # whole run. BASHPID (bash 4+) names the subshell itself. bash 3.2 has no
+  # BASHPID and records $$: there, a lease subshell that died mid-lease
+  # leaves a lock that clears once its run.sh exits.
+  me="${BASHPID:-$$} $(uname -n)"
+  until mkdir "$lock" 2>/dev/null && (set -o noclobber && printf '%s\n' "$me" > "${lock}/owner") 2>/dev/null; do
     if lease_lock_stale "$lock"; then
       # Only the breaker's holder may clear a lock, and it checks again with
       # the breaker held, when nobody else can swap the lock under it. A
       # breaker over a minute old was left by a run killed mid-clear.
-      if mkdir "${lock}.break" 2>/dev/null; then
+      if (set -o noclobber && : > "${lock}.break") 2>/dev/null; then
         if lease_lock_stale "$lock"; then
           rm -f "${lock}/owner"
           rmdir "$lock" 2>/dev/null || true
         fi
-        rmdir "${lock}.break" 2>/dev/null || true
+        rm -f "${lock}.break"
         continue
       elif [[ -n "$(find "${lock}.break" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
-        rmdir "${lock}.break" 2>/dev/null || true
+        rm -f "${lock}.break"
         continue
       fi
     fi
@@ -739,13 +754,6 @@ lease_lock_acquire() {
     fi
     sleep 0.1
   done
-  # The holder is this shell, which may be a subshell: a lease runs inside
-  # run_one's $(…), so $$ would name the parent run.sh, which outlives a
-  # lease subshell that died mid-lease, and the lock would look live for the
-  # whole run. BASHPID (bash 4+) names the subshell itself. bash 3.2 has no
-  # BASHPID and records $$: there, a lease subshell that died mid-lease
-  # leaves a lock that clears once its run.sh exits.
-  printf '%s %s\n' "${BASHPID:-$$}" "$(uname -n)" > "${lock}/owner"
   LEASE_LOCK="$lock"
 }
 
