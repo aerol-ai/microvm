@@ -22,7 +22,12 @@ import (
 // in-process worker.
 func streamDriver(t *testing.T, cfg Config, req models.CreateSandboxRequest) (*Driver, string) {
 	t.Helper()
-	guest := wasmtestguest.Path(t, wasmtestguest.Stdio)
+	return streamDriverWith(t, cfg, req, wasmtestguest.Path(t, wasmtestguest.Stdio))
+}
+
+// streamDriverWith is streamDriver with the sandbox's own module at guest.
+func streamDriverWith(t *testing.T, cfg Config, req models.CreateSandboxRequest, guest string) (*Driver, string) {
+	t.Helper()
 	t.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", streamCompileCache(t))
 	runDir := filepath.Join(os.TempDir(), fmt.Sprintf("aw-stream-%d", time.Now().UnixNano()))
 	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
@@ -302,6 +307,10 @@ type fakeExecStream struct {
 	stdin     []byte
 	stdinEOF  bool
 	kills     int
+	// stdinErr fails stdin writes; onStdin runs inside a write, which then
+	// fails (a run ending under the write).
+	stdinErr error
+	onStdin  func()
 }
 
 func (s *fakeExecStream) Recv() (worker.ExecEvent, error) {
@@ -318,9 +327,14 @@ func (s *fakeExecStream) Recv() (worker.ExecEvent, error) {
 
 func (s *fakeExecStream) WriteStdin(p []byte) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.stdin = append(s.stdin, p...)
-	return nil
+	hook, err := s.onStdin, s.stdinErr
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+		return io.ErrClosedPipe
+	}
+	return err
 }
 
 func (s *fakeExecStream) CloseStdin() error {

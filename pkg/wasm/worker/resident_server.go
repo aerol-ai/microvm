@@ -438,6 +438,8 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 			if err := s.streams.serveExecKill(conn, env); err != nil {
 				return err
 			}
+		case MsgEntrypointLogs:
+			return serveNoEntrypoint(conn, env)
 		default:
 			// Checkpoint/Restore and listener ops are not served by a resident host.
 			if unsupported(env.SandboxID, string(env.Type)) != nil {

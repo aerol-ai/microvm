@@ -117,12 +117,20 @@ func TestFromDaemonConfig(t *testing.T) {
 		// Streaming runs (issue #535).
 		WasmMaxStreamsPerSandbox: 3,
 		WasmCodeRunModules:       map[string]string{"python": "python"},
+		// Daytona sessions (issue #178).
+		WasmSessionLogBytes:       10,
+		WasmMaxSessionsPerSandbox: 11,
+		WasmSessionCommandsKept:   12,
+		WasmSessionLogBudget:      13,
 	})
 	if cfg.RunDir != "/run" || cfg.ModulesDir != "/mods" || cfg.DefaultMemoryMB != 128 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if cfg.MaxStreamsPerSandbox != 3 || cfg.CodeRunModules["python"] != "python" {
 		t.Fatalf("stream settings = %+v", cfg)
+	}
+	if cfg.SessionLogBytes != 10 || cfg.MaxSessionsPerSandbox != 11 || cfg.SessionCommandsKept != 12 || cfg.SessionLogBudget != 13 {
+		t.Fatalf("session settings = %+v", cfg)
 	}
 }
 

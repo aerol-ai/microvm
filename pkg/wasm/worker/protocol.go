@@ -44,6 +44,11 @@ const (
 	MsgExecStdinClose MessageType = "exec_stdin_close"
 	MsgExecKill       MessageType = "exec_kill"
 	MsgExecExit       MessageType = "exec_exit"
+
+	// MsgEntrypointLogs reads the serving guest's kept output (issue #178,
+	// entrypoint.go). With follow, the connection then carries exec_chunk
+	// frames until an exec_exit when the entrypoint ends.
+	MsgEntrypointLogs MessageType = "entrypoint_logs"
 )
 
 // Stream ids on exec_chunk frames.

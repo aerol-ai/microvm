@@ -19,12 +19,13 @@ type Host struct {
 	exec      Executor
 	stateKV   StateKV
 	procs     Processes
+	sessions  Sessions
 	liveness  toolboxwire.Liveness
 }
 
 // Config wires a toolbox host for one sandbox. The host is rebuilt for every
-// request, so anything that outlives one (live runs, their cap) is owned by
-// the driver behind Procs.
+// request, so anything that outlives one (live runs, their cap, sessions) is
+// owned by the driver behind Procs and Sessions.
 type Config struct {
 	SandboxID string
 	WorkDir   string
@@ -34,6 +35,9 @@ type Config struct {
 	// Procs runs the exec stream and code-run inside the wasm engine. Nil
 	// answers those routes with 501.
 	Procs Processes
+	// Sessions serves /process/session inside the wasm engine. Nil answers
+	// those routes with 501.
+	Sessions Sessions
 	// StreamLiveness overrides the exec stream keepalive (tests); zero
 	// keeps toolboxwire.DefaultLiveness.
 	StreamLiveness toolboxwire.Liveness
@@ -48,6 +52,7 @@ func New(cfg Config) *Host {
 		exec:      cfg.Exec,
 		stateKV:   cfg.StateKV,
 		procs:     cfg.Procs,
+		sessions:  cfg.Sessions,
 		liveness:  cfg.StreamLiveness,
 	}
 }
@@ -89,11 +94,16 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusNotImplemented, "codeInterpreter is not implemented for wasm runtime")
-	case isSessionPath(r.URL.Path):
+	case isNativeSessionPath(r.URL.Path):
 		if !h.requireAuth(w, r) {
 			return
 		}
 		h.handleSessions(w, r)
+	case isProcessSessionPath(r.URL.Path):
+		if !h.requireAuth(w, r) {
+			return
+		}
+		h.handleProcessSession(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/files/upload":
 		if !h.requireAuth(w, r) {
 			return

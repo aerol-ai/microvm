@@ -167,9 +167,25 @@ The Daytona SDK's `process.codeRun` works for `python`, `javascript` and `ruby`,
 - The first run of a language on a server compiles its module, which takes a few seconds (up to about 20 for Ruby). Later runs start fast.
 - Any other language fails with HTTP 400. The error lists the languages this server can run.
 
+### Daytona sessions
+
+The Daytona SDK's sessions work on WASM sandboxes. You can create a session, run commands in it, wait for a command or let it run in the background, read its logs or follow them live, send it input, and delete the session.
+
+Each command is a run of the sandbox's own module, with your command line as its arguments. The line is split the same way as for a [streamed command](#stream-a-command). That means:
+
+- **There is no shell.** `cd`, `export`, `&&` and `|` do nothing special. The working folder and environment variables do not carry over from one command to the next. Files under `/work` do.
+- **One command at a time.** Commands in one session run in order, one after another, as on other sandboxes.
+- **No time limit.** A command runs until it exits. Deleting the session ends it.
+- **The same limit as streamed commands.** A running session command counts toward the 8 streamed commands and code runs a sandbox can have. One more fails with HTTP 429.
+- **Logs are capped.** The server keeps the last 1 MB of each command's output and of its error output. A longer log starts partway through, but its offsets still count from the start of the output.
+- **A sandbox has at most 16 sessions,** and each session keeps its last 64 finished commands.
+- **Sessions end with the sandbox.** Stopping, passivating or moving the sandbox ends them, as on other sandboxes.
+
+The entrypoint session (`process.getEntrypointSession`, `process.getEntrypointLogs`) is the sandbox's web server: the run of the module that serves its public port. Its logs are the last 1 MB that server printed. A sandbox that does not serve a port has no entrypoint, so these calls fail with HTTP 404.
+
 ### What does not work
 
-- [Terminal sessions](/sessions/), including Daytona SDK sessions. The server answers HTTP 501.
+- Interactive [terminal sessions](/sessions/) and Daytona terminals (`process.createPty`). The server answers HTTP 501. Use [Daytona sessions](#daytona-sessions) or a [streamed command](#stream-a-command) instead.
 - [SSH logins](/ssh-access/). A login opens a terminal session, so it fails too.
 
 ### For server operators
@@ -178,8 +194,14 @@ The Daytona SDK's `process.codeRun` works for `python`, `javascript` and `ruby`,
 |---|---|---|
 | `SB_WASM_CODERUN_MODULES` | Which module runs each code-run language, as `language=module,...`. Languages can be `python`, `python3`, `py`, `javascript`, `js`, `node`, `ruby` and `rb`. | Built from `SB_WASM_STANDARD_MODULES`: the `python`, `javascript` and `ruby` modules, when present |
 | `SB_WASM_MAX_STREAMS_PER_SANDBOX` | How many streamed commands and code runs one WASM sandbox may run at a time. Each one uses memory on the server. | `8` |
+| `SB_WASM_SESSION_LOG_BYTES` | How much of each Daytona session command's output, and of its error output, the server keeps. | `1048576` (1 MiB) |
+| `SB_WASM_MAX_SESSIONS_PER_SANDBOX` | How many Daytona sessions one WASM sandbox may have. | `16` |
+| `SB_WASM_SESSION_COMMANDS_KEPT` | How many finished commands a session keeps, and how many may wait for their turn. | `64` |
+| `SB_WASM_SESSION_LOG_BUDGET_BYTES` | How much session log one WASM sandbox may keep in total. Past it, the logs of the oldest finished commands are dropped first. | `16777216` (16 MiB) |
 
-A worker started by an older release cannot stream. Streamed commands and code runs on its sandbox fail with HTTP 501 until the sandbox restarts. Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer HTTP 501 too.
+Session logs live in the server's memory, which is why each part has a limit.
+
+A worker started by an older release cannot stream. Streamed commands, code runs, session commands and entrypoint logs on its sandbox fail with HTTP 501 until the sandbox restarts. Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer HTTP 501 too.
 
 ## Keep the sandbox across server restarts
 

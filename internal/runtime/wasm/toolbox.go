@@ -25,16 +25,18 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		return
 	}
 	// Every command path runs inside the wasm engine (the sandbox's worker):
-	// buffered exec, and the exec stream and code-run through Procs. Nothing
-	// here may start a host process: this handler runs in sandboxd, so a
-	// host shell would run as the daemon, not in the sandbox. That is why
-	// there is no sessions Manager (toolhost/sessions.go).
+	// buffered exec, the exec stream and code-run through Procs, and
+	// session commands through Sessions. Nothing here may start a host
+	// process: this handler runs in sandboxd, so a host shell would run as
+	// the daemon, not in the sandbox. That is why there is no toolboxd
+	// sessions Manager (toolhost/sessions.go).
 	cfg := toolhost.Config{
 		SandboxID: sandboxID,
 		WorkDir:   inst.workDir,
 		AuthToken: token,
 		Exec:      sandboxExecutor{driver: d, id: sandboxID},
 		Procs:     sandboxProcesses{driver: d, id: sandboxID},
+		Sessions:  sandboxSessions{driver: d, id: sandboxID},
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV

@@ -11,10 +11,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// sessionRoutes is every action of both session families, as the v1, SSH,
-// Daytona and Runloop surfaces call them. The bodies carry a command, as a
-// real caller's would; nothing may run it.
-var sessionRoutes = []struct {
+// nativeSessionRoutes is every action of the native /sessions family, as
+// the v1 and SSH surfaces call them. The bodies carry a command, as a real
+// caller's would; nothing may run it.
+var nativeSessionRoutes = []struct {
 	method, path, body string
 }{
 	{http.MethodPost, "/sessions", `{"name":"s1","command":"id"}`},
@@ -27,28 +27,18 @@ var sessionRoutes = []struct {
 	{http.MethodGet, "/sessions/s1/log", ""},
 	{http.MethodGet, "/sessions/s1/recording", ""},
 	{http.MethodGet, "/sessions/s1/attach", ""},
-	{http.MethodPost, "/process/session", `{"sessionId":"s1"}`},
-	{http.MethodGet, "/process/session", ""},
-	{http.MethodGet, "/process/session/s1", ""},
-	{http.MethodDelete, "/process/session/s1", ""},
-	{http.MethodPost, "/process/session/s1/exec", `{"command":"id","runAsync":true}`},
-	{http.MethodGet, "/process/session/s1/command/c1", ""},
-	{http.MethodGet, "/process/session/s1/command/c1/logs", ""},
-	{http.MethodGet, "/process/session/s1/command/c1/logs?follow=true", ""},
-	{http.MethodPost, "/process/session/s1/command/c1/input", `{"data":"id"}`},
-	{http.MethodGet, "/process/session/entrypoint", ""},
-	{http.MethodGet, "/process/session/entrypoint/logs", ""},
 	// The sandbox-prefixed form the proxy may pass through.
 	{http.MethodPost, "/sb-test/sessions", `{"command":"id"}`},
 }
 
-// Sessions must fail closed on the wasm toolhost: it runs in-process in
-// sandboxd, and a session was a host shell. Every action answers 501 behind
-// auth, so the route never reaches anything that could start a process.
-func TestSessionRoutesReturn501(t *testing.T) {
-	h := New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok"})
+// Interactive sessions fail closed on the wasm toolhost: it runs in-process
+// in sandboxd, and such a session is a host shell with a terminal. Every
+// action answers 501 behind auth, even with Sessions wired, and the error
+// points at what does work.
+func TestNativeSessionRoutesReturn501(t *testing.T) {
+	h := New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok", Sessions: &fakeSessions{}})
 
-	for _, tc := range sessionRoutes {
+	for _, tc := range nativeSessionRoutes {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
@@ -61,8 +51,10 @@ func TestSessionRoutesReturn501(t *testing.T) {
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatalf("body %q is not a JSON error: %v", rec.Body.String(), err)
 			}
-			if !strings.Contains(body["error"], "not supported on the wasm runtime") {
-				t.Fatalf("error = %q, want a not-supported message", body["error"])
+			for _, want := range []string{"not supported on the wasm runtime", "/process/session", "/process/exec/stream"} {
+				if !strings.Contains(body["error"], want) {
+					t.Fatalf("error = %q, want it to mention %q", body["error"], want)
+				}
 			}
 
 			// Without the token the route answers 401 first, as before.
@@ -76,45 +68,60 @@ func TestSessionRoutesReturn501(t *testing.T) {
 	}
 }
 
-// The attach and follow-logs routes were WebSocket upgrades onto a running
-// host process. A real handshake must be refused with 501, not upgraded.
-func TestSessionWebSocketRoutesDoNotUpgrade(t *testing.T) {
-	srv := httptest.NewServer(New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok"}).Handler())
-	defer srv.Close()
-
-	header := http.Header{"Authorization": {"Bearer tok"}}
-	for _, path := range []string{
-		"/sessions/s1/attach",
-		"/process/session/s1/command/c1/logs?follow=true",
-	} {
-		conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+path, header)
-		if err == nil {
-			conn.Close()
-			t.Fatalf("%s: WebSocket upgraded, want a refused handshake", path)
+// Without Sessions (a host built without the driver), the Daytona-style
+// family answers 501 too, behind auth.
+func TestProcessSessionRoutesWithoutSessions(t *testing.T) {
+	h := New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok"})
+	for _, path := range []string{"/process/session", "/process/session/s1/exec", "/process/session/entrypoint/logs"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		h.serveHTTP(rec, req)
+		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "not available") {
+			t.Fatalf("%s = %d %s", path, rec.Code, rec.Body.String())
 		}
-		if !errors.Is(err, websocket.ErrBadHandshake) || resp == nil || resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("%s: err = %v, resp = %+v, want a 501 bad handshake", path, err, resp)
+		rec = httptest.NewRecorder()
+		h.serveHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s unauthenticated = %d", path, rec.Code)
 		}
-		resp.Body.Close()
 	}
 }
 
-func TestIsSessionPath(t *testing.T) {
-	for path, want := range map[string]bool{
-		"/sessions":                      true,
-		"/sessions/":                     true,
-		"/sessions/s1/attach":            true,
-		"/process/session":               true,
-		"/process/session/s1/exec":       true,
-		"/sessionsX":                     false,
-		"/process/sessionX":              false,
-		"/process/sessions":              false,
-		"/process/execute":               false,
-		"/":                              false,
-		"/files/download?path=/sessions": false,
+// The attach route was a WebSocket upgrade onto a running host process. A
+// real handshake must be refused with 501, not upgraded.
+func TestNativeSessionAttachDoesNotUpgrade(t *testing.T) {
+	srv := httptest.NewServer(New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok", Sessions: &fakeSessions{}}).Handler())
+	defer srv.Close()
+
+	header := http.Header{"Authorization": {"Bearer tok"}}
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/sessions/s1/attach", header)
+	if err == nil {
+		conn.Close()
+		t.Fatal("WebSocket upgraded, want a refused handshake")
+	}
+	if !errors.Is(err, websocket.ErrBadHandshake) || resp == nil || resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("err = %v, resp = %+v, want a 501 bad handshake", err, resp)
+	}
+	resp.Body.Close()
+}
+
+func TestSessionPathPredicates(t *testing.T) {
+	for path, want := range map[string][2]bool{
+		"/sessions":                      {true, false},
+		"/sessions/":                     {true, false},
+		"/sessions/s1/attach":            {true, false},
+		"/process/session":               {false, true},
+		"/process/session/s1/exec":       {false, true},
+		"/sessionsX":                     {false, false},
+		"/process/sessionX":              {false, false},
+		"/process/sessions":              {false, false},
+		"/process/execute":               {false, false},
+		"/":                              {false, false},
+		"/files/download?path=/sessions": {false, false},
 	} {
-		if got := isSessionPath(path); got != want {
-			t.Errorf("isSessionPath(%q) = %v, want %v", path, got, want)
+		if got := [2]bool{isNativeSessionPath(path), isProcessSessionPath(path)}; got != want {
+			t.Errorf("%q: native/process = %v, want %v", path, got, want)
 		}
 	}
 }

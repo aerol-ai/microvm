@@ -56,6 +56,9 @@ type sandboxInstance struct {
 	// first use under Driver.mu. Stop, Destroy and a passivating checkpoint
 	// end them.
 	streams *streamSet
+	// sessions are its Daytona-style process sessions (sessions.go), made
+	// on first use under Driver.mu and ended with the streams.
+	sessions *sessionSet
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

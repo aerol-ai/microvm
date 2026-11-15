@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -226,5 +227,25 @@ func TestClient_MoreMethods(t *testing.T) {
 				t.Fatalf("expected error: %v, got: %v", tt.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestContextErrReportsPassedDeadline(t *testing.T) {
+	if contextErr(context.Background()) != nil {
+		t.Fatal("background context has no error")
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if !errors.Is(contextErr(ctx), context.DeadlineExceeded) {
+		t.Fatal("a passed deadline must read as DeadlineExceeded")
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel2()
+	if contextErr(ctx2) != nil {
+		t.Fatal("a future deadline is not an error")
+	}
+	cancel2()
+	if !errors.Is(contextErr(ctx2), context.Canceled) {
+		t.Fatal("cancel must read as Canceled")
 	}
 }

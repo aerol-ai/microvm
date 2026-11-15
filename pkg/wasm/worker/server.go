@@ -37,6 +37,7 @@ type Server struct {
 	modulePath     string
 	moduleMemoryMB int
 	streams        streamRegistry
+	entry          entrypointLog // the serving guest's output (entrypoint.go)
 }
 
 // errForeignSandbox refuses a message for another sandbox than the one
@@ -323,6 +324,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			timings.NewEngine = newEngDur
 			if err == nil {
 				s.modulePath, s.moduleMemoryMB = p.Path, p.MemoryMB
+				s.entry.attach(s.eng)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -458,7 +460,9 @@ func (s *Server) Serve(conn net.Conn) error {
 			eng := s.eng
 			s.mu.Unlock()
 			start := time.Now()
+			gen := s.entry.begin(env.SandboxID)
 			err = eng.InvokeExport(invokeCtx, p.Export)
+			s.entry.end(gen, err)
 			_ = time.Since(start) // wall time accounted on Exec path via RunResult
 			cancel()
 			if err != nil {
@@ -749,6 +753,9 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := s.streams.serveExecKill(conn, env); err != nil {
 				return err
 			}
+		case MsgEntrypointLogs:
+			// The connection may become a follow; it closes when that ends.
+			return s.entry.serve(conn, env)
 		default:
 			if err := writeFrame(conn, Envelope{
 				Type:      MsgInvokeResult,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strconv"
@@ -49,6 +50,9 @@ type wazeroEngine struct {
 	// lastLoad is the sub-stage breakdown of the most recent LoadModule, read
 	// back by the worker via LastLoadTimings() (LoadTimingReporter).
 	lastLoad LoadTimings
+	// instOut and instErr receive the serving instance's output
+	// (engine_output.go); nil drops it, as wazero does by default.
+	instOut, instErr io.Writer
 }
 
 func newWazeroEngine(ctx context.Context) (*wazeroEngine, error) {
@@ -223,7 +227,7 @@ func (e *wazeroEngine) instantiateLocked(ctx context.Context, caps Capabilities)
 	if err := e.stopActiveLocked(ctx); err != nil {
 		return fmt.Errorf("stop active module: %w", err)
 	}
-	cfg := e.moduleConfig(caps)
+	cfg := e.withInstanceOutput(e.moduleConfig(caps))
 	instCtx := e.withNetworkContext(ctx, caps)
 	if err := e.ensureWasiCompatHosts(instCtx); err != nil {
 		return err
