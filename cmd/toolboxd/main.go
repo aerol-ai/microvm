@@ -99,6 +99,11 @@ type server struct {
 	// means defaultExecStreamLiveness. Only tests set it.
 	execLiveness execStreamLiveness
 
+	// e2bInterp serves E2B's Code Interpreter, made on first use by
+	// e2bInterpreter().
+	e2bInterpOnce sync.Once
+	e2bInterp     http.Handler
+
 	// interp is the code interpreter's shared state, made on first use by
 	// codeInterp().
 	interpOnce sync.Once
@@ -636,6 +641,11 @@ func (s *server) routes() http.Handler {
 			if !s.handleSessionsRoute(w, r) {
 				writeRouteNotFound(w)
 			}
+		case strings.HasPrefix(r.URL.Path, e2bInterpPrefix+"/"):
+			if !s.requireAuth(w, r) {
+				return
+			}
+			s.e2bInterpreter().ServeHTTP(w, r)
 		default:
 			writeRouteNotFound(w)
 		}
@@ -748,6 +758,8 @@ func isKnownToolboxPath(path string) bool {
 	case strings.HasPrefix(path, "/envd/"):
 		return true
 	case path == "/sessions" || strings.HasPrefix(path, "/sessions/"):
+		return true
+	case strings.HasPrefix(path, e2bInterpPrefix+"/"):
 		return true
 	default:
 		return false
