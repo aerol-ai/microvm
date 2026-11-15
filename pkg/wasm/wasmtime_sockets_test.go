@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/wasmtestguest"
-	"github.com/bytecodealliance/wasmtime-go/v37"
+	"github.com/aerol-ai/wasmtime-go/v37"
 )
 
 // These run the real wasmtime engine against real guests: the Go wasip1

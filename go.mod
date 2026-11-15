@@ -3,7 +3,7 @@ module github.com/aerol-ai/microvm
 go 1.26.11
 
 require (
-	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0
+	github.com/aerol-ai/wasmtime-go/v37 v37.0.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/creack/pty v1.1.24
 	github.com/daytonaio/daytona/libs/api-client-go v0.177.0

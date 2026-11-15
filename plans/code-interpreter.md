@@ -197,10 +197,12 @@ guest's sockets itself (pkg/wasm/wasip1_sockets*.go, wasmtime_sockets.go):
 - Needs Linux or macOS and a guest that exports a 32-bit memory; anything
   else still moves to wazero when it exposes a port (the first fix, kept as
   a fallback; `SB_WASM_WASMTIME_LISTEN_FALLBACK=false` refuses instead).
-- The `-tags wasmtime` build is broken on Go 1.26 (LLVM bitcode in the
-  bundled `libwasmtime.a`; on Linux the section is refused even outside the
-  module cache). Planned separately in #1307; the tagged tests run with a
-  local copy of the bindings.
+- Go 1.26 refuses upstream wasmtime-go's bundled `libwasmtime.a` (it
+  carries LLVM bitcode). #1307 moved the build to
+  `github.com/aerol-ai/wasmtime-go/v37`, the same v37.0.0 release with the
+  bitcode stripped (the fork's README says how to rebuild and check it).
+  The `wasmtime-engine` CI job builds sandboxd with the tag and runs the
+  real-engine tests on Linux amd64 and arm64.
 
 ## 7. Safety axes (pr-review.md)
 
@@ -238,4 +240,3 @@ guest's sockets itself (pkg/wasm/wasip1_sockets*.go, wasmtime_sockets.go):
 - Daytona browser/Deno TS clients and the Ruby SDK (they authenticate with
   preview tokens the facade does not read; same gap as PTY today).
 - Contexts surviving a sandbox restart or move.
-- Fixing the `-tags wasmtime` build on Go 1.26 (#1307).
