@@ -155,6 +155,7 @@ func TestToolboxProcessErrorMapping(t *testing.T) {
 	}{
 		{ErrStreamLimit, http.StatusTooManyRequests},
 		{ErrStreamingUnsupported, http.StatusNotImplemented},
+		{ErrSandboxNotRunning, http.StatusConflict},
 		{&CodeRunLanguageError{Language: "x"}, http.StatusBadRequest},
 		{errors.New("other"), http.StatusInternalServerError},
 	}
@@ -167,6 +168,8 @@ func TestToolboxProcessErrorMapping(t *testing.T) {
 			got = http.StatusTooManyRequests
 		case errors.Is(mapped, toolhost.ErrStreamingUnsupported):
 			got = http.StatusNotImplemented
+		case errors.Is(mapped, toolhost.ErrSandboxNotRunning):
+			got = http.StatusConflict
 		case errors.As(mapped, &langErr):
 			got = http.StatusBadRequest
 		}

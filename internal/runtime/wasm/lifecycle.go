@@ -212,13 +212,16 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
+	// Stopping from here on: a request that arrives while the runs are
+	// killed and the worker is asked to stop must not start new ones.
+	defer d.beginStopping(inst)()
 	d.killStreams(inst)
 	client := d.newWorkerClient(inst.socketPath)
 	if err := client.StopInstance(sandboxID); err != nil {
 		return fmt.Errorf("stop instance: %w", err)
 	}
-	inst.status = models.SandboxStatusStopped
 	d.mu.Lock()
+	inst.status = models.SandboxStatusStopped
 	d.byID[sandboxID] = inst
 	d.mu.Unlock()
 	return nil

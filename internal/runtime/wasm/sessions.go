@@ -762,13 +762,18 @@ func (s *sessionSet) input(ctx context.Context, sessionID, commandID string, dat
 	}
 }
 
-// sessionsFor is the sandbox's session set, made on first use.
+// sessionsFor is the sandbox's session set, made on first use. A sandbox
+// that is stopped, or being stopped, has none: a set made then would
+// outlive the stop's kill pass, and a restart would find its sessions.
 func (d *Driver) sessionsFor(sandboxID string) (*sessionSet, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	inst := d.byID[sandboxID]
 	if inst == nil {
 		return nil, fmt.Errorf("wasm sandbox %q not found", sandboxID)
+	}
+	if !inst.acceptsRuns() {
+		return nil, toolhost.ErrSessionStopped
 	}
 	if inst.sessions == nil {
 		inst.sessions = newSessionSet(func(ctx context.Context, argv []string) (*Stream, error) {

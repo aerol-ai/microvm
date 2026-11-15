@@ -38,7 +38,10 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 	if stopAfter {
 		// Passivate and migrate end the sandbox here. Runs are not part of
 		// a checkpoint (only the serving guest's memory is), so they end
-		// first rather than write to /work while it is captured and moved.
+		// first rather than write to /work while it is captured and moved,
+		// and none may start after: every way out below unregisters the
+		// instance, so it stays stopping.
+		d.beginStopping(inst)
 		d.killStreams(inst)
 		// Every way out below unregisters the instance; interpreter state a
 		// racing request made after the kill must not outlive it.

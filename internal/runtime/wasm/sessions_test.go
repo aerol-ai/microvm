@@ -697,6 +697,14 @@ func TestSandboxEndEndsSessions(t *testing.T) {
 				// Destroy and passivate take the instance away.
 				return
 			}
+			// A stopped sandbox has no sessions; a restarted one starts
+			// with none.
+			if _, err := e.d.sessionsFor("sb"); !errors.Is(err, toolhost.ErrSessionStopped) {
+				t.Fatalf("sessions of a stopped sandbox = %v", err)
+			}
+			e.d.mu.Lock()
+			e.d.byID["sb"].status = models.SandboxStatusStarted
+			e.d.mu.Unlock()
 			fresh, err := e.d.sessionsFor("sb")
 			if err != nil || fresh == e.set || len(fresh.list()) != 0 {
 				t.Fatalf("after %s: set %p (old %p) sessions %v %v", op, fresh, e.set, fresh.list(), err)

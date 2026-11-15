@@ -484,6 +484,7 @@ func TestSessionErrorStatus(t *testing.T) {
 		ErrTooManyProcesses:      http.StatusTooManyRequests,
 		ErrEntrypointUnsupported: http.StatusNotImplemented,
 		ErrStreamingUnsupported:  http.StatusNotImplemented,
+		ErrSandboxNotRunning:     http.StatusConflict,
 		errors.New("other"):      http.StatusInternalServerError,
 	} {
 		if got := sessionErrorStatus(err); got != want {

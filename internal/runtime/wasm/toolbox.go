@@ -59,6 +59,9 @@ type sandboxProcesses struct {
 }
 
 func (p sandboxProcesses) CanStart() error {
+	if !p.driver.acceptsRuns(p.id) {
+		return toolhost.ErrSandboxNotRunning
+	}
 	if !p.driver.streamSlotFree(p.id) {
 		return toolhost.ErrTooManyProcesses
 	}
@@ -100,6 +103,8 @@ func toolhostProcessError(err error) error {
 	switch {
 	case errors.Is(err, ErrStreamLimit):
 		return toolhost.ErrTooManyProcesses
+	case errors.Is(err, ErrSandboxNotRunning):
+		return toolhost.ErrSandboxNotRunning
 	case errors.Is(err, ErrStreamingUnsupported):
 		return toolhost.ErrStreamingUnsupported
 	case errors.As(err, &langErr):

@@ -78,6 +78,9 @@ var (
 	ErrStreamingUnsupported = errors.New("streaming runs are not supported by this wasm sandbox's worker; restarting the sandbox on a wazero node fixes it")
 	// ErrTooManyProcesses: the sandbox is at its run cap. HTTP 429.
 	ErrTooManyProcesses = errors.New("this wasm sandbox already runs the maximum number of processes (SB_WASM_MAX_STREAMS_PER_SANDBOX)")
+	// ErrSandboxNotRunning: the sandbox is stopped, or is being stopped or
+	// passivated, and takes no new runs. HTTP 409.
+	ErrSandboxNotRunning = errors.New("the wasm sandbox is not running")
 )
 
 // CodeRunLanguageError is a code-run language the node cannot run. HTTP 400.
@@ -95,6 +98,8 @@ func processErrorStatus(err error) int {
 		return http.StatusTooManyRequests
 	case errors.Is(err, ErrStreamingUnsupported):
 		return http.StatusNotImplemented
+	case errors.Is(err, ErrSandboxNotRunning):
+		return http.StatusConflict
 	case errors.As(err, &langErr):
 		return http.StatusBadRequest
 	}

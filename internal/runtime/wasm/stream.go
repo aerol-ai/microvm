@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
@@ -26,6 +25,10 @@ var ErrStreamingUnsupported = worker.ErrStreamingUnsupported
 
 // ErrStreamLimit means the sandbox already has MaxStreamsPerSandbox runs.
 var ErrStreamLimit = errors.New("wasm sandbox already runs the maximum number of processes")
+
+// ErrSandboxNotRunning means the sandbox is stopped, or is being stopped or
+// passivated, so it takes no new runs.
+var ErrSandboxNotRunning = errors.New("wasm sandbox is not running")
 
 // defaultMaxStreamsPerSandbox caps the runs (exec streams, code-runs,
 // session commands, interpreter contexts) one sandbox may have at once.
@@ -197,6 +200,15 @@ func (d *Driver) streamSlotFree(sandboxID string) bool {
 	return set == nil || set.count() < d.maxStreamsPerSandbox()
 }
 
+// acceptsRuns reports whether the sandbox takes new runs now (started, and
+// not being stopped or passivated).
+func (d *Driver) acceptsRuns(sandboxID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	inst := d.byID[sandboxID]
+	return inst != nil && inst.acceptsRuns()
+}
+
 // maxStreamsPerSandbox is the configured cap, never above the worker's
 // own ceiling: past that the worker refuses a start, which would reach the
 // caller as a server error instead of the 429 this cap answers.
@@ -218,9 +230,9 @@ func (d *Driver) StartStream(ctx context.Context, sandboxID string, spec StreamS
 		d.mu.Unlock()
 		return nil, fmt.Errorf("wasm sandbox %q not found", sandboxID)
 	}
-	if inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+	if !inst.acceptsRuns() || inst.socketPath == "" {
 		d.mu.Unlock()
-		return nil, fmt.Errorf("wasm sandbox %q is not running", sandboxID)
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotRunning, sandboxID)
 	}
 	if inst.streams == nil {
 		inst.streams = &streamSet{}
@@ -275,7 +287,22 @@ func (d *Driver) StartStream(ctx context.Context, sandboxID string, spec StreamS
 	if ids, ok := ws.(interface{ RunID() string }); ok {
 		st.ID = ids.RunID()
 	}
-	set.add(st)
+	// Registered under Driver.mu, and only while the sandbox still takes
+	// runs: a Stop or passivate that began while the worker started this
+	// one marked the sandbox first and then ran its kill pass, which this
+	// run was not yet there for.
+	d.mu.Lock()
+	live := d.byID[sandboxID] == inst && inst.acceptsRuns()
+	if live {
+		set.add(st)
+	}
+	d.mu.Unlock()
+	if !live {
+		_ = ws.Kill()
+		_ = ws.Close()
+		set.unreserve()
+		return nil, fmt.Errorf("%w: %q", ErrSandboxNotRunning, sandboxID)
+	}
 	return st, nil
 }
 

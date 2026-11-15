@@ -72,6 +72,33 @@ type sandboxInstance struct {
 	// interp is the sandbox's code interpreter (interpreter_state.go),
 	// made on first use under Driver.mu and closed with the streams.
 	interp *interpState
+
+	// stopping counts the Stops and passivating checkpoints under way,
+	// under Driver.mu. Each sets it before its kill pass ends the runs,
+	// sessions and interpreter state, so a request that arrives meanwhile
+	// cannot make new ones that the pass has already missed
+	// (acceptsRuns).
+	stopping int
+}
+
+// acceptsRuns reports whether new runs, a session set or interpreter state
+// may be made for inst: it is started and nothing is stopping it. Caller
+// holds Driver.mu.
+func (inst *sandboxInstance) acceptsRuns() bool {
+	return inst.status == models.SandboxStatusStarted && inst.stopping == 0
+}
+
+// beginStopping marks inst as being stopped; the returned func undoes it
+// (for a stop that fails and leaves the sandbox running).
+func (d *Driver) beginStopping(inst *sandboxInstance) func() {
+	d.mu.Lock()
+	inst.stopping++
+	d.mu.Unlock()
+	return func() {
+		d.mu.Lock()
+		inst.stopping--
+		d.mu.Unlock()
+	}
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {
