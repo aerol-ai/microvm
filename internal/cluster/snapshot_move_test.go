@@ -33,6 +33,9 @@ type fakeSnapshotMoves struct {
 	duringStart func()
 	// importRecreate is the recreate inputs the last import carried.
 	importRecreate *MoveRecreate
+	// dropLifetimes and startLifetimes are the lifetimes each drop and
+	// start named, in order.
+	dropLifetimes, startLifetimes []string
 }
 
 func (f *fakeSnapshotMoves) note(s string) {
@@ -60,12 +63,18 @@ func (f *fakeSnapshotMoves) ImportMove(_ context.Context, id, source string, rc 
 	return f.importErr
 }
 
-func (f *fakeSnapshotMoves) DropMove(_ context.Context, id string) error {
+func (f *fakeSnapshotMoves) DropMove(_ context.Context, id, lifetime string) error {
 	f.note("drop " + id)
+	f.mu.Lock()
+	f.dropLifetimes = append(f.dropLifetimes, lifetime)
+	f.mu.Unlock()
 	return nil
 }
 
-func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id string, rc *MoveRecreate) error {
+func (f *fakeSnapshotMoves) StartMoved(_ context.Context, id, lifetime string, rc *MoveRecreate) error {
+	f.mu.Lock()
+	f.startLifetimes = append(f.startLifetimes, lifetime)
+	f.mu.Unlock()
 	if rc == nil {
 		f.note("start " + id + " without a spec")
 		return nil
@@ -141,6 +150,11 @@ func TestSnapshotMoveSourceTakesItBackDuringTheImport(t *testing.T) {
 	if got := strings.Join(target.calls, "; "); got != "import sb-vm from "+c.nodeID+"; drop sb-vm" {
 		t.Fatalf("target calls: %s", got)
 	}
+	// The drop names the lifetime moved, so a late one cannot remove
+	// another lifetime's sandbox on the target (V2).
+	if got := strings.Join(target.dropLifetimes, ","); got != "inc-sb-vm" {
+		t.Fatalf("the drop named lifetime %q, want inc-sb-vm", got)
+	}
 }
 
 // A moved sandbox's start that fails on the target, its agent restarting
@@ -164,6 +178,11 @@ func TestSnapshotMoveRetriesTheStartOnTheTarget(t *testing.T) {
 	}
 	if got := strings.Count(strings.Join(target.calls, "; "), "start sb-vm"); got != 3 {
 		t.Fatalf("starts on the target = %d, want 3: %v", got, target.calls)
+	}
+	// Each start names the lifetime moved, so a late one cannot start an
+	// old import as a newer lifetime (V1).
+	if got := strings.Join(target.startLifetimes, ","); got != "inc-sb-vm,inc-sb-vm,inc-sb-vm" {
+		t.Fatalf("the starts named lifetimes %q", got)
 	}
 	// The import carried the recreate inputs a target stores (N4).
 	if rc := target.importRecreate; rc == nil || rc.Spec.Image != "alpine" {
@@ -469,6 +488,20 @@ func TestRunSnapshotMoveAction(t *testing.T) {
 	if got := strings.Join(h.calls, "; "); got != "release sb for b; import sb from a; drop sb; start sb from alpine" {
 		t.Fatalf("calls: %s", got)
 	}
+	// A drop and a start pass on the lifetime the leader named; one from an
+	// older leader names none.
+	named := map[string]string{"sb": "inc-7"}
+	for _, a := range []MoveAction{
+		{Action: "drop", IDs: []string{"sb"}, Incarnations: named},
+		{Action: "start-moved", IDs: []string{"sb"}, Incarnations: named},
+	} {
+		if _, err := RunMoveAction(ctx, h, a); err != nil {
+			t.Fatalf("%s: %v", a.Action, err)
+		}
+	}
+	if d, s := strings.Join(h.dropLifetimes, ","), strings.Join(h.startLifetimes, ","); d != ",inc-7" || s != ",inc-7" {
+		t.Fatalf("lifetimes passed on: drops %q, starts %q", d, s)
+	}
 	for _, a := range []MoveAction{
 		{Action: "release-snapshot", IDs: []string{"sb"}},
 		{Action: "import", IDs: []string{"sb"}},
@@ -575,5 +608,16 @@ func TestRecreateInputs(t *testing.T) {
 	got.Image = "changed"
 	if p.Spec.Image != "alpine" {
 		t.Fatal("the inputs share the placement's spec")
+	}
+}
+
+// moveLifetime names the placement's lifetime for the target, and nothing
+// for a placement from before incarnations.
+func TestMoveLifetime(t *testing.T) {
+	if got := moveLifetime(Placement{SandboxID: "sb", IncarnationID: " inc-1 "}); len(got) != 1 || got["sb"] != "inc-1" {
+		t.Fatalf("moveLifetime = %v", got)
+	}
+	if got := moveLifetime(Placement{SandboxID: "sb"}); got != nil {
+		t.Fatalf("moveLifetime with no incarnation = %v, want nil", got)
 	}
 }

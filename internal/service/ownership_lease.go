@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,10 @@ type ownershipLease struct {
 	// confirmed is when the last successful authoritative read was sent
 	// (process start before the first). Zero: the lease has not begun.
 	confirmed time.Time
+	// read is when the last successful authoritative read was sent, and
+	// zero until one has: unlike confirmed it never counts the start. It
+	// is what a new recreate-policy sandbox needs (requireFreshOwnership).
+	read time.Time
 	// confirmedSinceStart is set by the first successful read after start.
 	// That read also thaws what a previous process may have left frozen.
 	confirmedSinceStart bool
@@ -182,6 +187,10 @@ type fencedSandbox struct {
 	// routesFenced: every public HTTP port answers 503. Until it is set,
 	// every check retries the swap.
 	routesFenced bool
+	// stopFailed: the last stop of a sandbox nothing can freeze failed
+	// (stopUnfenceable). Every check tries again, but a run of failures
+	// writes one audit record and one log line, not one per check.
+	stopFailed bool
 }
 
 // ownershipLeaseApplies reports whether this node runs a lease at all: only
@@ -212,13 +221,14 @@ func (s *Service) StartOwnershipLease(ctx context.Context) {
 	s.resumeMovedIn(ctx)
 	// The move fences a previous process left in the rows (R11).
 	s.rearmMoveFences(ctx)
-	// Recreate-policy sandboxes made before creates of them were refused
-	// here, on a runtime the supervisor cannot freeze alone.
-	s.warnUnfencedRecreate(ctx)
 
 	lease := cluster.OwnershipLease(s.cfg)
 	probe := max(lease/3, 10*time.Millisecond)
 	check := max(lease/15, 10*time.Millisecond)
+	// Recreate-policy sandboxes made before creates of them were refused
+	// here, on a runtime the supervisor cannot freeze alone: their policy
+	// is turned off, retried every probe until the cluster takes it (V4).
+	s.startDisarmUnfencedRecreate(ctx, probe)
 	s.startPeriodic(ctx, probe, probe, func(c context.Context) {
 		_ = s.confirmOwnership(c, time.Now())
 	})
@@ -293,17 +303,32 @@ func (s *Service) unfenceLocked(id string) {
 
 // confirmOwnership is one authoritative read, sent at sent. On success the
 // lease runs from sent, and every fenced sandbox whose placement proves this
-// node still owns it is thawed. A node with no recreate-policy sandbox has
-// nothing to confirm and keeps its lease without a read.
+// node still owns it is thawed.
 func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
+	_, err := s.readOwnership(ctx, sent)
+	return err
+}
+
+// readOwnership is confirmOwnership that also returns what the leader
+// answered. extra names sandboxes with no row yet that the read must cover
+// too (requireFreshOwnership), so their placements are in the answer.
+//
+// A node with no recreate-policy sandbox has nothing to read, so it sends
+// no read, and then nothing is proven: the lease is not renewed and the
+// file's read time stays where it was (V3). Renewing it anyway let a late
+// create on an idle node, cut off from the servers, start on a lease the
+// leader never saw, while the leader recreated the sandbox elsewhere. Such
+// a node's lease runs out, which fences nothing until it has a
+// recreate-policy sandbox, and that sandbox's create reads first.
+func (s *Service) readOwnership(ctx context.Context, sent time.Time, extra ...string) (map[string]cluster.Placement, error) {
 	if !s.ownershipLeaseApplies() {
-		return nil
+		return nil, nil
 	}
 	s.ownership.actionMu.Lock()
 	defer s.ownership.actionMu.Unlock()
 	live, err := s.localLiveSandboxes(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	rows := recreateSandboxes(live)
 	// The lease itself needs only the recreate-policy sandboxes: no other
@@ -315,30 +340,40 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 		read = live
 	}
 	c := s.Cluster()
+	ids := make([]string, 0, len(read)+len(extra))
+	for _, sb := range read {
+		ids = append(ids, sb.ID)
+	}
+	ids = append(ids, extra...)
+	// proven: a read went out and the leader answered it.
+	proven := len(ids) > 0
 	var placements map[string]cluster.Placement
-	if len(read) > 0 {
-		ids := make([]string, 0, len(read))
-		for _, sb := range read {
-			ids = append(ids, sb.ID)
-		}
+	if proven {
 		placements, err = authoritativePlacementsForLease(ctx, c, ids)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Debug("cluster: ownership lease read failed", "sandboxes", len(ids), "error", err)
 			}
-			return err
+			return nil, err
 		}
 	}
 
 	self := strings.TrimSpace(c.SelfNodeID())
-	// The file first, so the runtime supervisor thaws a group it froze
-	// before the thaws below resume the tasks in it.
-	s.recordOwnershipRead(ctx, sent, rows, placements, self)
+	if proven {
+		// The file first, so the runtime supervisor thaws a group it froze
+		// before the thaws below resume the tasks in it.
+		s.recordOwnershipRead(ctx, sent, rows, placements, self)
+	} else {
+		s.rewriteOwnershipFence(ctx)
+	}
 	s.ownership.mu.Lock()
-	if sent.After(s.ownership.confirmed) {
+	if proven && sent.After(s.ownership.confirmed) {
 		s.ownership.confirmed = sent
 	}
-	if s.ownerFastPathEnabled() && sent.After(s.ownership.ownedAt) {
+	if proven && sent.After(s.ownership.read) {
+		s.ownership.read = sent
+	}
+	if proven && s.ownerFastPathEnabled() && sent.After(s.ownership.ownedAt) {
 		owned := make(map[string]uint64, len(read))
 		for _, sb := range read {
 			if p, ok := placements[sb.ID]; ownershipProven(p, ok, self, sb) && p.OwnerEpoch != 0 {
@@ -396,7 +431,72 @@ func (s *Service) confirmOwnership(ctx context.Context, sent time.Time) error {
 		}
 	}
 	s.restoreFencedRoutes(ctx)
+	return placements, nil
+}
+
+// requireFreshOwnership is what a new failover.policy=recreate sandbox needs,
+// on the create, recreate and moved-in paths alike: an authoritative read
+// sent within the last two thirds of a lease. It runs twice: before the
+// create starts anything (requireOwnershipToStart) and again before its row
+// is written (persistSandboxCreate), for a create whose image pull outlasted
+// the first read.
+//
+// A node that runs recreate-policy sandboxes reads every lease/3, so it has
+// a fresh read and this costs a clock read. A node that had none (its
+// confirms send no read), or whose reads fail, or that has not read since it
+// started, reads now with id in the read, and the answer must still give id
+// to this node: a placement that exists, is not orphaned or being deleted,
+// names this node, and is incarnation's lifetime when both carry one (a
+// reservation counts: a new create's placement is one). Otherwise the create
+// fails. A node cut off from the servers while a create waited must not
+// start it on a lease the leader never saw, nor after the leader gave the
+// sandbox to another node meanwhile (V3). Two thirds, not the whole lease:
+// the next regular read (every lease/3) then lands before the lease runs
+// out, so a new sandbox is never frozen just because its node was idle.
+func (s *Service) requireFreshOwnership(ctx context.Context, id, incarnation string) error {
+	if !s.ownershipLeaseApplies() {
+		return nil
+	}
+	lease := cluster.OwnershipLease(s.cfg)
+	s.ownership.mu.Lock()
+	read := s.ownership.read
+	s.ownership.mu.Unlock()
+	if !read.IsZero() && time.Since(read) <= lease-lease/3 {
+		return nil
+	}
+	placements, err := s.readOwnership(ctx, time.Now(), id)
+	if err != nil {
+		return fmt.Errorf("start a failover.policy=recreate sandbox: this node has no recent ownership read and a new one failed (%v): %w", err, ErrOwnershipFenced)
+	}
+	p, ok := placements[id]
+	self := strings.TrimSpace(s.Cluster().SelfNodeID())
+	if !placementGivesStart(p, ok, self, incarnation) {
+		return fmt.Errorf("start a failover.policy=recreate sandbox: the leader does not give %s to this node (owner %q, state %q): %w",
+			id, strings.TrimSpace(p.OwnerNodeID), p.State, ErrOwnershipFenced)
+	}
 	return nil
+}
+
+// placementGivesStart reports whether the leader's placement p lets this node
+// start sandbox p.SandboxID now: like ownershipProven, but a reservation
+// counts, since a new create's placement is one until the create answers.
+func placementGivesStart(p cluster.Placement, ok bool, self, incarnation string) bool {
+	if !ok || p.IsOrphaned() || p.IsDeleting() || strings.TrimSpace(p.OwnerNodeID) != self {
+		return false
+	}
+	local, placed := strings.TrimSpace(incarnation), strings.TrimSpace(p.IncarnationID)
+	return local == "" || placed == "" || local == placed
+}
+
+// requireOwnershipToStart is requireFreshOwnership for a create that is
+// about to reserve capacity and start its instance: called just before
+// admitCreate on every create path, so a refusal has nothing to roll back
+// and no executor ever ran. Only failover.policy=recreate creates.
+func (s *Service) requireOwnershipToStart(ctx context.Context, id, incarnation string, failover *models.Failover) error {
+	if failover == nil || !failover.ShouldRecreate() {
+		return nil
+	}
+	return s.requireFreshOwnership(ctx, id, incarnation)
 }
 
 // ownershipProven reports whether a placement proves this node still owns the
@@ -473,6 +573,13 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	if err != nil {
 		return
 	}
+	// The caller listed the recreate-policy rows before taking this lock.
+	// A policy turned off since (disarmUnfencedRecreate, which holds the
+	// same lock) means nothing can recreate it elsewhere: it keeps running,
+	// unfenced. Before, the fence acted on the stale listing and stopped it.
+	if sb.Failover == nil || !sb.Failover.ShouldRecreate() {
+		return
+	}
 	s.ownership.mu.Lock()
 	f := s.fenceLocked(id)
 	frozen, cannot, routed := f.frozen, f.cannotFreeze, f.routesFenced
@@ -493,6 +600,12 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	}
 	fr, ok := rt.(runtime.Freezer)
 	if !ok {
+		// On a node that writes the lease file it is stopped instead
+		// (V4); a stop that failed is tried again at the next check.
+		if s.ownershipLeaseFileOn() {
+			s.stopUnfenceable(ctx, sb, f)
+			return
+		}
 		s.ownership.mu.Lock()
 		f.cannotFreeze = true
 		s.ownership.mu.Unlock()
@@ -504,6 +617,10 @@ func (s *Service) fenceSandbox(ctx context.Context, id string) {
 	}
 	if err := fr.Freeze(ctx, s.runtimeRef(sb)); err != nil {
 		if errors.Is(err, runtime.ErrCannotFreeze) {
+			if s.ownershipLeaseFileOn() {
+				s.stopUnfenceable(ctx, sb, f)
+				return
+			}
 			// This one cannot be frozen where it runs (a Firecracker VM
 			// with no group of its own): refused, as for a runtime with no
 			// Freezer, not retried every check.

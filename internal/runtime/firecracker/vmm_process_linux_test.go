@@ -748,3 +748,35 @@ func TestVMMCgroupUnderAParent(t *testing.T) {
 		t.Fatal("a process in the machine's root group counted as one of this pod's VMs")
 	}
 }
+
+// vmmProcessGroup reads which VM group a process runs in from its own
+// /proc/<pid>/cgroup: its own group, the VMs' shared group, somewhere else,
+// or an unreadable file (review V4's FenceReady).
+func TestVMMProcessGroup(t *testing.T) {
+	root := withProcRoot(t)
+	write := func(pid int, cgroup string) {
+		dir := filepath.Join(root, strconv.Itoa(pid))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cgroup"), []byte(cgroup), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(10, "0::/aerolvm-vmm/sb-a\n")
+	write(11, "0::/aerolvm-vmm\n")
+	write(12, "0::/system.slice/sandboxd.service\n")
+	for _, tc := range []struct {
+		pid   int
+		child string
+		in    bool
+	}{{10, "sb-a", true}, {11, "", true}, {12, "", false}} {
+		child, in, err := vmmProcessGroup(tc.pid)
+		if err != nil || child != tc.child || in != tc.in {
+			t.Errorf("pid %d: %q %v %v, want %q %v", tc.pid, child, in, err, tc.child, tc.in)
+		}
+	}
+	if _, _, err := vmmProcessGroup(99); err == nil {
+		t.Error("a process with no cgroup file was read")
+	}
+}
