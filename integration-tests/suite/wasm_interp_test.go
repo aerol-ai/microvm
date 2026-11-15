@@ -393,28 +393,37 @@ func previewBody(t *testing.T, url string) string {
 // which needs registry credentials the scenario does not carry by itself.
 func TestWasmInterpTwoPorts(t *testing.T) {
 	harness.Require(t, sc, "UC-728")
-	user := os.Getenv("AEROL_WASM_REGISTRY_USER")
-	token := os.Getenv("AEROL_WASM_REGISTRY_TOKEN")
-	if user == "" || token == "" {
-		t.Skip("AEROL_WASM_REGISTRY_USER / AEROL_WASM_REGISTRY_TOKEN not set: the two-port guest is pushed through POST /v1/wasm-modules/push, which needs registry credentials (as UC-52)")
-	}
-	module := buildWasmPortsGuest(t)
 	c := client(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
-	pushed, err := c.SDK().PushWasmModule(ctx, sdktypes.PushWasmModuleOptions{
-		Name: "aerol-itest-wasmports", Tag: fmt.Sprintf("uc728-%d", time.Now().Unix()),
-		Module: module, RegistryUsername: user, RegistryToken: token,
-	})
-	if err != nil || pushed.ModuleRef == "" {
-		t.Fatalf("push the two-port guest: %+v, %v", pushed, err)
+	// AEROL_WASM_TWOPORT_MODULE names a copy of the guest already on the
+	// node (a bare file name in its modules dir, staged with
+	// scripts/stage-to-node.sh; the operator PAT may use host module refs).
+	// Without it the guest is pushed through the module API, which needs
+	// registry credentials the scenario does not carry by itself.
+	moduleRef := os.Getenv("AEROL_WASM_TWOPORT_MODULE")
+	if moduleRef == "" {
+		user := os.Getenv("AEROL_WASM_REGISTRY_USER")
+		token := os.Getenv("AEROL_WASM_REGISTRY_TOKEN")
+		if user == "" || token == "" {
+			t.Skip("set AEROL_WASM_TWOPORT_MODULE (a guest staged on the node), or AEROL_WASM_REGISTRY_USER / AEROL_WASM_REGISTRY_TOKEN to push it through POST /v1/wasm-modules/push (as UC-52)")
+		}
+		module := buildWasmPortsGuest(t)
+		pushed, err := c.SDK().PushWasmModule(ctx, sdktypes.PushWasmModuleOptions{
+			Name: "aerol-itest-wasmports", Tag: fmt.Sprintf("uc728-%d", time.Now().Unix()),
+			Module: module, RegistryUsername: user, RegistryToken: token,
+		})
+		if err != nil || pushed.ModuleRef == "" {
+			t.Fatalf("push the two-port guest: %+v, %v", pushed, err)
+		}
+		moduleRef = pushed.ModuleRef
 	}
 	public := true
 	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
-		Name: harness.UniqueName(sc, t), Runtime: "wasm", Image: pushed.ModuleRef, ModuleRef: pushed.ModuleRef, AllowPublicTraffic: &public,
+		Name: harness.UniqueName(sc, t), Runtime: "wasm", Image: moduleRef, ModuleRef: moduleRef, AllowPublicTraffic: &public,
 	})
 	if err != nil {
-		t.Fatalf("create a WASM sandbox on %s: %v", pushed.ModuleRef, err)
+		t.Fatalf("create a WASM sandbox on %s: %v", moduleRef, err)
 	}
 	t.Cleanup(func() { destroyBest(c, sb.ID) })
 	waitRunning(t, sb)
