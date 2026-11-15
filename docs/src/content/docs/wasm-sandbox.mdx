@@ -220,7 +220,7 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 
 Session logs live in the server's memory, which is why each part has a limit.
 
-A worker started by an older release cannot stream. Streamed commands, code runs, session commands, entrypoint logs and code interpreter contexts on its sandbox fail until the sandbox restarts (HTTP 501 for all but code interpreter contexts). Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer HTTP 501 too.
+A worker started by an older release cannot stream. On its sandbox, code runs, session commands and entrypoint logs answer HTTP 501, a streamed command ends with an error message on its stream, and code interpreter contexts fail to start, until the sandbox restarts. Servers that use the `wasmtime` engine (`SB_WASM_ENGINE=wasmtime`) answer the same way.
 
 ## Keep the sandbox across server restarts
 
