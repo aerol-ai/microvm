@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -254,13 +255,166 @@ func TestDriverScriptWrittenOnce(t *testing.T) {
 		t.Fatalf("default dir = %s", filepath.Dir(p))
 	}
 
-	// A folder that cannot be made is an error.
+	// With no private folder to be had at all, the launch fails.
 	blocker := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("TMPDIR", filepath.Join(blocker, "tmp"))
 	if _, err := New(Config{DriverDir: filepath.Join(blocker, "sub")}).script(d); err == nil {
 		t.Fatal("script in an impossible folder succeeded")
+	}
+}
+
+// The driver folder holds scripts toolboxd runs; whoever can write to it
+// picks the code. A configured folder that is not a private one (a real
+// directory owned by this user, mode 0700) is not used: the scripts go to
+// a fresh folder from os.MkdirTemp instead. The same goes for a folder that
+// was fine once but was removed and replaced since.
+func TestDriverDirMustBePrivate(t *testing.T) {
+	d := drivers.Driver{FileName: "x.py", Script: []byte("print(1)\n")}
+	cases := []struct {
+		name string
+		// setup returns the configured folder.
+		setup func(t *testing.T) string
+		// fresh is true when the script must go to a new temp folder.
+		fresh bool
+	}{
+		{name: "new folder", fresh: false, setup: func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "new")
+		}},
+		{name: "own folder, mode 0755, tightened", fresh: false, setup: func(t *testing.T) string {
+			dir := filepath.Join(t.TempDir(), "wide")
+			mustMkdir(t, dir, 0o755)
+			return dir
+		}},
+		{name: "symlink to another folder", fresh: true, setup: func(t *testing.T) string {
+			target := t.TempDir()
+			link := filepath.Join(t.TempDir(), "link")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		}},
+		{name: "folder others can write to", fresh: true, setup: func(t *testing.T) string {
+			dir := filepath.Join(t.TempDir(), "shared")
+			mustMkdir(t, dir, 0o777)
+			return dir
+		}},
+		{name: "a file", fresh: true, setup: func(t *testing.T) string {
+			file := filepath.Join(t.TempDir(), "file")
+			if err := os.WriteFile(file, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return file
+		}},
+		{name: "another user's folder", fresh: true, setup: func(t *testing.T) string {
+			if os.Geteuid() != 0 {
+				t.Skip("needs root to give a folder away")
+			}
+			dir := filepath.Join(t.TempDir(), "theirs")
+			mustMkdir(t, dir, 0o700)
+			if err := os.Chown(dir, 4242, 4242); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			configured := tc.setup(t)
+			l := New(Config{DriverDir: configured})
+			path, err := l.script(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Dir(path)
+			if got := dir == configured; got == tc.fresh {
+				t.Fatalf("script written to %s (configured %s), want fresh folder: %v", path, configured, tc.fresh)
+			}
+			if tc.fresh && !strings.HasPrefix(filepath.Base(dir), "aerolvm-codeinterp-") {
+				t.Fatalf("fallback folder = %s", dir)
+			}
+			checkPrivate(t, dir)
+		})
+	}
+}
+
+func TestDriverDirReplacedBySymlink(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	d := drivers.Driver{FileName: "x.py", Script: []byte("print(1)\n")}
+	l := New(Config{})
+	first, err := l.script(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The private temp folder goes (a /tmp cleaner) and someone puts a link
+	// to their own folder in its place.
+	dir := filepath.Dir(first)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	theirs := t.TempDir()
+	if err := os.Symlink(theirs, dir); err != nil {
+		t.Fatal(err)
+	}
+	again, err := l.script(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(again) == dir {
+		t.Fatalf("script written through the planted link: %s", again)
+	}
+	if entries, _ := os.ReadDir(theirs); len(entries) != 0 {
+		t.Fatalf("the planted folder got %d files", len(entries))
+	}
+	checkPrivate(t, filepath.Dir(again))
+}
+
+func TestCheckOwnerAndMode(t *testing.T) {
+	me := uint32(os.Geteuid())
+	dir := uint32(syscall.S_IFDIR)
+	cases := []struct {
+		name      string
+		mode, uid uint32
+		tighten   bool
+		ok        bool
+	}{
+		{"private", dir | 0o700, me, false, true},
+		{"readable by others", dir | 0o755, me, false, false},
+		{"readable by others, to tighten", dir | 0o755, me, true, true},
+		{"writable by the group, to tighten", dir | 0o770, me, true, false},
+		{"someone else's", dir | 0o700, me + 1, true, false},
+		{"a file", uint32(syscall.S_IFREG) | 0o700, me, true, false},
+		{"a symlink", uint32(syscall.S_IFLNK) | 0o700, me, false, false},
+	}
+	for _, tc := range cases {
+		if err := checkOwnerAndMode(tc.mode, tc.uid, tc.tighten); (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v, want ok %v", tc.name, err, tc.ok)
+		}
+	}
+}
+
+func mustMkdir(t *testing.T, dir string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Mkdir(dir, mode); err != nil {
+		t.Fatal(err)
+	}
+	// Mkdir's mode passes through the umask.
+	if err := os.Chmod(dir, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func checkPrivate(t *testing.T, dir string) {
+	t.Helper()
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("%s mode = %v, want a 0700 directory", dir, info.Mode())
 	}
 }
 

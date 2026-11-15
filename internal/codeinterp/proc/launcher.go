@@ -38,7 +38,8 @@ type Config struct {
 	// env plus the sandbox env). Interpreters are looked up on its PATH.
 	Env func() []string
 	// DriverDir holds the driver scripts, written on first use with mode
-	// 0700. Empty means a directory under os.TempDir().
+	// 0700. Empty, or a folder that cannot be kept private to this user,
+	// means a fresh directory under os.TempDir() (see driverDir).
 	DriverDir string
 }
 
@@ -253,13 +254,11 @@ func (l *Launcher) script(d drivers.Driver) (string, error) {
 	}
 	path := filepath.Join(dir, name)
 	if l.written[path] {
-		// A cleaner of /tmp may have removed it since.
-		if _, err := os.Stat(path); err == nil {
+		// A cleaner of /tmp may have removed it since. The folder is
+		// private, so a script still there is the one written.
+		if _, err := os.Lstat(path); err == nil {
 			return path, nil
 		}
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("codeinterp: driver folder: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".driver-*")
 	if err != nil {
@@ -283,29 +282,85 @@ func (l *Launcher) script(d drivers.Driver) (string, error) {
 	return path, nil
 }
 
+// driverDir returns the folder the driver scripts go in, checked on every
+// use. Whoever can write to it chooses the code toolboxd runs, so it must
+// be private: a real directory (not a symlink) owned by this process's
+// user, mode 0700. The configured folder is used when it is, or can be
+// made, private; otherwise, and with none configured, a fresh folder from
+// os.MkdirTemp is. A fixed name under a shared /tmp could be planted by
+// another user of the sandbox, and a folder that was private once can be
+// removed (a /tmp cleaner) and replaced, so a folder that no longer passes
+// is never written to again.
 func (l *Launcher) driverDir() (string, error) {
-	if l.dir != "" {
+	if l.dir != "" && isPrivateDir(l.dir) == nil {
 		return l.dir, nil
 	}
-	if l.cfg.DriverDir == "" {
-		// A fresh private folder: a fixed name under a shared /tmp could be
-		// planted by another user of the sandbox before toolboxd made it.
-		dir, err := os.MkdirTemp("", "aerolvm-codeinterp-")
-		if err != nil {
-			return "", fmt.Errorf("codeinterp: driver folder: %w", err)
+	if l.cfg.DriverDir != "" && claimDir(l.cfg.DriverDir) == nil {
+		l.dir = l.cfg.DriverDir
+		return l.dir, nil
+	}
+	dir, err := os.MkdirTemp("", "aerolvm-codeinterp-")
+	if err != nil {
+		return "", fmt.Errorf("codeinterp: driver folder: %w", err)
+	}
+	l.dir = dir
+	return dir, nil
+}
+
+// claimDir makes dir when it is missing and makes sure it is private. A
+// folder of ours that only others could read is tightened to 0700 (MkdirAll
+// leaves an existing folder's mode alone); one others could write to is
+// refused, since they may have put files in it already.
+func claimDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// O_NOFOLLOW: the checks and the chmod act on the folder itself, never
+	// on what a symlink in its place points to.
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if err := checkOwnerAndMode(uint32(st.Mode), st.Uid, true); err != nil {
+		return err
+	}
+	if st.Mode&0o777 != 0o700 {
+		if err := syscall.Fchmod(fd, 0o700); err != nil {
+			return err
 		}
-		l.dir = dir
-		return dir, nil
 	}
-	if err := os.MkdirAll(l.cfg.DriverDir, 0o700); err != nil {
-		return "", fmt.Errorf("codeinterp: driver folder: %w", err)
+	return nil
+}
+
+// isPrivateDir reports why dir is not a private folder, or nil.
+func isPrivateDir(dir string) error {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(dir, &st); err != nil {
+		return err
 	}
-	// MkdirAll leaves an existing folder's mode alone.
-	if err := os.Chmod(l.cfg.DriverDir, 0o700); err != nil {
-		return "", fmt.Errorf("codeinterp: driver folder: %w", err)
+	return checkOwnerAndMode(uint32(st.Mode), st.Uid, false)
+}
+
+// checkOwnerAndMode checks a stat of a would-be driver folder. With
+// tighten, only the group and other write bits disqualify it (the caller
+// fixes the rest); without, the mode must be 0700 exactly.
+func checkOwnerAndMode(mode, uid uint32, tighten bool) error {
+	switch {
+	case mode&syscall.S_IFMT != syscall.S_IFDIR:
+		return errors.New("not a directory")
+	case int(uid) != os.Geteuid():
+		return fmt.Errorf("owned by uid %d, not %d", uid, os.Geteuid())
+	case tighten && mode&0o022 != 0:
+		return fmt.Errorf("mode %#o lets others write to it", mode&0o777)
+	case !tighten && mode&0o777 != 0o700:
+		return fmt.Errorf("mode %#o, not 0700", mode&0o777)
 	}
-	l.dir = l.cfg.DriverDir
-	return l.dir, nil
+	return nil
 }
 
 // readyDrain bounds how long a launch that failed waits for the driver's
