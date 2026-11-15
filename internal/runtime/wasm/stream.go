@@ -150,17 +150,22 @@ func (s *streamSet) killAll() {
 	wg.Wait()
 }
 
-// killStreams ends an instance's live streaming runs. The worker also ends
-// them on StopInstance, but sandboxd's side of each run (its connection,
-// its slot, the toolbox request waiting on it) must go now, and a worker
-// process that is about to be killed sends no exit at all.
+// killStreams ends an instance's live streaming runs and its sessions. The
+// worker also ends the runs on StopInstance, but sandboxd's side of each
+// run (its connection, its slot, the toolbox request waiting on it) must go
+// now, and a worker process that is about to be killed sends no exit at
+// all. Sessions do not outlive the sandbox, as they do not outlive
+// toolboxd: a restarted sandbox starts with none.
 func (d *Driver) killStreams(inst *sandboxInstance) {
 	if inst == nil {
 		return
 	}
 	d.mu.Lock()
 	set := inst.streams
+	sessions := inst.sessions
+	inst.sessions = nil
 	d.mu.Unlock()
+	sessions.close()
 	set.killAll()
 }
 

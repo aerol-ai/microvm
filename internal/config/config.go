@@ -826,6 +826,21 @@ type Config struct {
 	// A worker never runs more than 32 per sandbox, whatever this says.
 	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
+	// Daytona-style process sessions on WASM keep their state in sandboxd's
+	// heap, so each part is capped. WasmSessionLogBytes is the output kept
+	// per stream per command, the newest bytes (default 1 MiB,
+	// SB_WASM_SESSION_LOG_BYTES). WasmMaxSessionsPerSandbox caps sessions
+	// (default 16, SB_WASM_MAX_SESSIONS_PER_SANDBOX). WasmSessionCommandsKept
+	// is the finished commands a session keeps, oldest dropped first, and
+	// the commands that may wait to run (default 64,
+	// SB_WASM_SESSION_COMMANDS_KEPT). WasmSessionLogBudget caps all session
+	// log storage of one sandbox; finished commands' logs are dropped,
+	// oldest first, to stay under it (default 16 MiB,
+	// SB_WASM_SESSION_LOG_BUDGET_BYTES).
+	WasmSessionLogBytes       int
+	WasmMaxSessionsPerSandbox int
+	WasmSessionCommandsKept   int
+	WasmSessionLogBudget      int64
 	// WasmRegistryUsername is the AOCR login used for oci:// module pulls when
 	// the create request carries no per-tenant credentials. SB_WASM_REGISTRY_USERNAME.
 	WasmRegistryUsername string
@@ -2677,6 +2692,10 @@ func load(keyTool bool) (Config, error) {
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
 		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 8),
+		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
+		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),
+		WasmSessionCommandsKept:   getEnvInt("SB_WASM_SESSION_COMMANDS_KEPT", 64),
+		WasmSessionLogBudget:      getEnvInt64("SB_WASM_SESSION_LOG_BUDGET_BYTES", 16<<20),
 		WasmRegistryUsername:      getEnv("SB_WASM_REGISTRY_USERNAME", ""),
 		WasmRegistryPATPath:       getEnv("SB_WASM_REGISTRY_PAT_PATH", ""),
 		WasmRegistryPushHost:      getEnv("SB_WASM_REGISTRY_PUSH_HOST", ""),

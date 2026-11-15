@@ -31,6 +31,17 @@ type Config struct {
 	// CodeRunModules maps a code-run language to the module ref that runs
 	// it (SB_WASM_CODERUN_MODULES).
 	CodeRunModules map[string]string
+	// Daytona-style session caps (sessions.go); 0 means the default.
+	// SessionLogBytes is kept per stream per command
+	// (SB_WASM_SESSION_LOG_BYTES), MaxSessionsPerSandbox caps sessions
+	// (SB_WASM_MAX_SESSIONS_PER_SANDBOX), SessionCommandsKept caps the
+	// finished commands a session keeps and the ones waiting to run
+	// (SB_WASM_SESSION_COMMANDS_KEPT), and SessionLogBudget caps all
+	// session log storage of one sandbox (SB_WASM_SESSION_LOG_BUDGET_BYTES).
+	SessionLogBytes       int
+	MaxSessionsPerSandbox int
+	SessionCommandsKept   int
+	SessionLogBudget      int64
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -46,5 +57,9 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ResidentHostIdleTTL:      cfg.WasmResidentHostIdleTTL,
 		MaxStreamsPerSandbox:     cfg.WasmMaxStreamsPerSandbox,
 		CodeRunModules:           cfg.WasmCodeRunModules,
+		SessionLogBytes:          cfg.WasmSessionLogBytes,
+		MaxSessionsPerSandbox:    cfg.WasmMaxSessionsPerSandbox,
+		SessionCommandsKept:      cfg.WasmSessionCommandsKept,
+		SessionLogBudget:         cfg.WasmSessionLogBudget,
 	}
 }
