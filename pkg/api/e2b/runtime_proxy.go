@@ -1,11 +1,15 @@
 package e2b
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/observability"
@@ -27,22 +31,69 @@ const (
 	interpreterToolboxPrefix = "/interpreter/e2b"
 )
 
-// runtimeTokenHeaders are the headers that may carry the sandbox's access
-// token. The interpreter SDKs send X-Access-Token only on /execute and the
-// traffic token on every call, so either one admits a request.
-var runtimeTokenHeaders = []string{"X-Access-Token", "E2B-Traffic-Access-Token"}
+const (
+	accessTokenHeader  = "X-Access-Token"
+	trafficTokenHeader = "E2B-Traffic-Access-Token"
+)
 
-// runtimeTokenOK reports whether r carries the sandbox's toolbox token in
-// any token header. The token is this route's only credential (envd has no
-// platform auth), so each compare is constant time.
-func runtimeTokenOK(r *http.Request, want string) bool {
-	for _, header := range runtimeTokenHeaders {
-		got := strings.TrimSpace(r.Header.Get(header))
-		if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
-			return true
-		}
+// trafficAccessToken is the sandbox's E2B traffic access token. E2B treats
+// it as shareable: it lets a caller reach the sandbox's ports, not envd. So
+// it is not the toolbox token, which is the envd access token and runs
+// commands. An HMAC keyed by the toolbox token is stable for the sandbox's
+// life (create and connect hand out the same value), cannot be made
+// without the toolbox token, and does not give the toolbox token away.
+// A sandbox with no toolbox token gets none: the HMAC would be keyed by
+// nothing.
+func trafficAccessToken(sandbox *models.Sandbox) string {
+	if sandbox == nil || sandbox.ToolboxToken == "" {
+		return ""
 	}
-	return false
+	mac := hmac.New(sha256.New, []byte(sandbox.ToolboxToken))
+	mac.Write([]byte("e2b-traffic:" + sandbox.ID))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// tokenIs compares a presented token in constant time: the tokens are this
+// route's only credential (envd has no platform auth).
+func tokenIs(got, want string) bool {
+	return got != "" && want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// runtimeAuthorized decides whether r may reach the secure sandbox's
+// runtime. The toolbox token (envd's X-Access-Token) opens every path. The
+// traffic token opens only the interpreter's context routes and health
+// check (trafficTokenPath): the interpreter SDKs send it alone there, and
+// send X-Access-Token on /execute, which runs code, as on every envd call.
+func runtimeAuthorized(r *http.Request, sandbox *models.Sandbox, interpreter bool, publicPath string) bool {
+	access := strings.TrimSpace(r.Header.Get(accessTokenHeader))
+	traffic := strings.TrimSpace(r.Header.Get(trafficTokenHeader))
+	// The toolbox token is also taken in the traffic header: SDK sessions
+	// that connected before the traffic token had its own value hold the
+	// toolbox token as their traffic token, and whoever holds it could send
+	// it as X-Access-Token anyway.
+	if tokenIs(access, sandbox.ToolboxToken) || tokenIs(traffic, sandbox.ToolboxToken) {
+		return true
+	}
+	return interpreter && trafficTokenPath(publicPath) && tokenIs(traffic, trafficAccessToken(sandbox))
+}
+
+// trafficTokenPath reports whether the traffic token may open publicPath on
+// the interpreter port: /contexts, /contexts/{id}, /contexts/{id}/restart
+// and /health. The list is closed, and a path that is not in clean form is
+// refused, so no spelling of /execute gets through.
+func trafficTokenPath(p string) bool {
+	if path.Clean(p) != p {
+		return false
+	}
+	if p == "/contexts" || p == "/health" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(p, "/contexts/")
+	if !ok {
+		return false
+	}
+	id, tail, _ := strings.Cut(rest, "/")
+	return id != "" && (tail == "" || tail == "restart")
 }
 
 func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
@@ -66,12 +117,19 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	if meta.Secure && !runtimeTokenOK(r, sandbox.ToolboxToken) {
+	publicPath := strings.TrimPrefix(r.URL.Path, runtimeProxyPrefix)
+	if publicPath == "" {
+		publicPath = "/"
+	}
+	if !strings.HasPrefix(publicPath, "/") {
+		publicPath = "/" + publicPath
+	}
+	interpreter := strings.TrimSpace(r.Header.Get(sandboxPortHeader)) == interpreterPort
+	if meta.Secure && !runtimeAuthorized(r, sandbox, interpreter, publicPath) {
 		WriteError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
 
-	interpreter := strings.TrimSpace(r.Header.Get(sandboxPortHeader)) == interpreterPort
 	if interpreter && sandbox.Runtime == models.RuntimeIsolate {
 		// An isolate runs one tenant fetch handler and no interpreters
 		// (plans/code-interpreter.md D9): say so plainly instead of letting
@@ -80,13 +138,6 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publicPath := strings.TrimPrefix(r.URL.Path, runtimeProxyPrefix)
-	if publicPath == "" {
-		publicPath = "/"
-	}
-	if !strings.HasPrefix(publicPath, "/") {
-		publicPath = "/" + publicPath
-	}
 	toolboxPath := "/envd" + publicPath
 	if interpreter {
 		toolboxPath = interpreterToolboxPrefix + publicPath

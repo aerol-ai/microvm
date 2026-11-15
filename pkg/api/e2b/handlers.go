@@ -1080,21 +1080,25 @@ func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, m
 		Alias:              meta.TemplateAlias,
 		Domain:             requestDomain(r),
 		EnvdAccessToken:    token,
-		TrafficAccessToken: trafficAccessToken(token),
+		TrafficAccessToken: responseTrafficToken(sandbox, meta),
 	}
 }
 
-// trafficAccessToken is the envd token again. The code-interpreter SDKs
-// send only E2B-Traffic-Access-Token on their /contexts calls, never
-// X-Access-Token, so a secure sandbox's interpreter is unreachable without
-// it; the runtime proxy accepts either header against the same token, and
-// a response that already carries the envd token reveals nothing new.
-// Insecure sandboxes get none, as on E2B.
-func trafficAccessToken(envdToken string) *string {
-	if envdToken == "" {
+// responseTrafficToken is the trafficAccessToken a create or connect hands
+// out. The code-interpreter SDKs send only E2B-Traffic-Access-Token on
+// their /contexts calls, never X-Access-Token, so a secure sandbox's
+// interpreter is unreachable without it. It is its own value, not the envd
+// token (trafficAccessToken in runtime_proxy.go). Insecure sandboxes get
+// none, as on E2B.
+func responseTrafficToken(sandbox *models.Sandbox, meta sandboxMeta) *string {
+	if !meta.Secure {
 		return nil
 	}
-	return &envdToken
+	token := trafficAccessToken(sandbox)
+	if token == "" {
+		return nil
+	}
+	return &token
 }
 
 func (h *handlers) toListedSandboxResponse(sandbox *models.Sandbox, meta sandboxMeta) listedSandboxResponse {
