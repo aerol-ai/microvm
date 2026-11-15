@@ -276,11 +276,14 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		s.finish(CloseTimeout, "execution timed out")
 	case res.Restarted:
 		s.finish(websocket.CloseGoingAway, "context shutdown")
-	case res.Died:
-		s.finish(websocket.CloseGoingAway, "worker process ended")
 	case res.Interrupted():
+		// Before Died: a WASM kernel has no signals, so its interrupt kills
+		// the interpreter (the run is both). The client asked for the stop
+		// and gets the usual answer; the context reports active:false.
 		s.send(control("interrupted"))
 		s.finish(websocket.CloseNormalClosure, "")
+	case res.Died:
+		s.finish(websocket.CloseGoingAway, "worker process ended")
 	default:
 		s.send(control("completed"))
 		s.finish(websocket.CloseNormalClosure, "")
