@@ -28,7 +28,7 @@ func AsToolboxHost(rt any) (ToolboxHost, bool) {
 // ServeToolbox implements ToolboxHost for the isolate driver.
 func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w http.ResponseWriter, r *http.Request) {
 	_ = token
-	path := r.URL.Path
+	path := trimSandboxPrefix(r.URL.Path, sandboxID)
 	switch {
 	case path == "/files/watch" || strings.HasSuffix(path, "/files/watch"):
 		// Same answer toolboxd gives on a shared kernel: watching is offered
@@ -45,7 +45,7 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 	// which runs the tenant's fetch handler and answers 200. A code
 	// interpreter client (Daytona's codeInterpreter, E2B's) or a code-run
 	// caller would take that handler's output for its program's output.
-	case strings.Contains(path, "/process/interpreter") || path == "/interpreter" || strings.HasPrefix(path, "/interpreter/"):
+	case isInterpreterPath(path):
 		writeToolboxError(w, http.StatusNotImplemented, "code interpreter is not supported on V8 isolate sandboxes")
 	case strings.Contains(path, "/process/code-run"):
 		writeToolboxError(w, http.StatusNotImplemented, "code-run needs a shell; not supported on V8 isolate sandboxes")
@@ -61,6 +61,33 @@ func (d *Driver) ServeToolbox(ctx context.Context, sandboxID, token string, w ht
 	default:
 		writeToolboxError(w, http.StatusNotImplemented, "isolate runtime does not support this toolbox endpoint (no shell/filesystem; use exec as invoke-handler)")
 	}
+}
+
+// trimSandboxPrefix drops a leading "/<sandboxID>" from path, as toolboxd
+// and the WASM toolbox host do before they route: a client may address the
+// toolbox as /<id>/process/..., and toolboxd serves that path.
+func trimSandboxPrefix(path, sandboxID string) string {
+	if sandboxID == "" {
+		return path
+	}
+	prefix := "/" + sandboxID
+	if path == prefix {
+		return "/"
+	}
+	if rest, ok := strings.CutPrefix(path, prefix+"/"); ok {
+		return "/" + rest
+	}
+	return path
+}
+
+// isInterpreterPath reports a code interpreter route: Daytona's
+// /process/interpreter/... and E2B's /interpreter/e2b/.... Like the other
+// refusals it matches the route under any prefix (the /v1 toolbox route
+// may still be in front): a path that slipped past it would reach the
+// "/exec" match below, since "/execute" contains it, and run the tenant's
+// fetch handler.
+func isInterpreterPath(path string) bool {
+	return strings.Contains(path, "/interpreter/") || strings.HasSuffix(path, "/interpreter")
 }
 
 // writeToolboxError answers in toolboxd's error shape ({"error": ...}).
