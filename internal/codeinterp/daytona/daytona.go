@@ -305,6 +305,7 @@ func (h *handler) restart(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func (h *handler) writeManagerError(w http.ResponseWriter, err error, id string) {
+	var missing *codeinterp.MissingInterpreterError
 	switch {
 	case errors.Is(err, codeinterp.ErrNotFound):
 		writeError(w, http.StatusNotFound, "context not found: "+id)
@@ -314,11 +315,14 @@ func (h *handler) writeManagerError(w http.ResponseWriter, err error, id string)
 		writeError(w, http.StatusTooManyRequests, err.Error())
 	case errors.Is(err, codeinterp.ErrClosed):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.As(err, &missing):
+		// It says which programs to install in the image.
+		writeError(w, http.StatusInternalServerError, missing.Error())
 	default:
-		// A missing interpreter, a bad cwd or a driver that failed: the
-		// message says which.
+		// A bad cwd or a driver that failed. The message may name host
+		// paths (closeFor), so only the log has it.
 		h.logger.Warn("code interpreter context failed", "context", id, "error", err)
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, internalErrorText)
 	}
 }
 

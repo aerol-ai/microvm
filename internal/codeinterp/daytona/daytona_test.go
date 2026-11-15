@@ -2,9 +2,13 @@ package daytona
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -141,7 +145,7 @@ func TestContextRouteFailures(t *testing.T) {
 
 	id := e.m.List()[0].ID
 	l.setFail(errors.New("driver broke"))
-	if status, body = e.do(t, http.MethodPost, "/context/"+id+"/restart", ""); status != http.StatusInternalServerError || body["error"] != "driver broke" {
+	if status, body = e.do(t, http.MethodPost, "/context/"+id+"/restart", ""); status != http.StatusInternalServerError || body["error"] != internalErrorText {
 		t.Fatalf("failed restart = %d %v", status, body)
 	}
 
@@ -438,17 +442,22 @@ func TestNewHandlerDefaults(t *testing.T) {
 }
 
 func TestCloseFor(t *testing.T) {
+	h := newHandler(nil, nil)
 	for _, tc := range []struct {
-		err  error
-		code int
+		err    error
+		code   int
+		reason string
 	}{
-		{codeinterp.ErrNotFound, websocket.ClosePolicyViolation},
-		{codeinterp.ErrQueueFull, websocket.ClosePolicyViolation},
-		{codeinterp.ErrClosed, websocket.CloseGoingAway},
-		{errors.New("driver broke"), websocket.CloseInternalServerErr},
+		{codeinterp.ErrNotFound, websocket.ClosePolicyViolation, "context not found: id"},
+		{codeinterp.ErrQueueFull, websocket.ClosePolicyViolation, codeinterp.ErrQueueFull.Error()},
+		{fmt.Errorf("%w: empty name", codeinterp.ErrInvalidEnv), websocket.ClosePolicyViolation, "invalid environment variable: empty name"},
+		{codeinterp.ErrClosed, websocket.CloseGoingAway, codeinterp.ErrClosed.Error()},
+		{fmt.Errorf("launch: %w", &codeinterp.MissingInterpreterError{Language: "r", Programs: []string{"Rscript"}}),
+			websocket.CloseInternalServerErr, "r interpreter not found in the sandbox (looked for [Rscript])"},
+		{errors.New("driver /tmp/x/driver.py broke"), websocket.CloseInternalServerErr, internalErrorText},
 	} {
-		if code, _ := closeFor(tc.err, "id"); code != tc.code {
-			t.Errorf("closeFor(%v) = %d, want %d", tc.err, code, tc.code)
+		if code, reason := h.closeFor(tc.err, "id"); code != tc.code || reason != tc.reason {
+			t.Errorf("closeFor(%v) = %d %q, want %d %q", tc.err, code, reason, tc.code, tc.reason)
 		}
 	}
 }
@@ -462,4 +471,142 @@ func TestCloseReason(t *testing.T) {
 	if len(got) > maxCloseReason || !strings.HasPrefix(long, got) || len(got) != 122 {
 		t.Fatalf("closeReason cut to %d bytes: %q", len(got), got)
 	}
+}
+
+// A client's {"type":"interrupt"} stops its own run only. It used to call
+// Manager.Interrupt, which stops whatever run the context has, so a client
+// still waiting in the queue stopped another client's run.
+func TestExecuteInterruptHitsOnlyItsOwnRun(t *testing.T) {
+	l := &fakeLauncher{}
+	e := newTestEnv(t, l, nil)
+	info, err := e.m.Create(t.Context(), "python", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := e.dial(t, nil)
+	if err := busy.WriteJSON(ExecuteRequest{Code: "print a\nsleep", ContextID: info.ID}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "first run in flight", func() bool { k := l.last(); return k != nil && k.runs.Load() == 1 })
+	queued := e.dial(t, nil)
+	if err := queued.WriteJSON(ExecuteRequest{Code: "print b\nsleep", ContextID: info.ID}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	// The queued client gives up on its run.
+	if err := queued.WriteMessage(websocket.TextMessage, []byte(`{"type":"interrupt"}`)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := l.last().finished.Load(); n != 0 {
+		t.Fatalf("the running client's run ended (%d finished): the interrupt reached it", n)
+	}
+	// The running client stops its own run; the queued one then starts and
+	// ends at once, interrupted as its client asked.
+	if err := busy.WriteMessage(websocket.TextMessage, []byte(`{"type":"interrupt"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if res := readAll(t, busy, nil); res.text("stdout") != "a" || res.text("control") != "interrupted" {
+		t.Fatalf("running client = %v", res.frames)
+	}
+	if res := readAll(t, queued, nil); res.text("control") != "interrupted" || res.closeCode != websocket.CloseNormalClosure {
+		t.Fatalf("queued client = %v %d", res.frames, res.closeCode)
+	}
+	// An interrupt after the run is over is ignored, and the context is fine.
+	if res := e.run(t, ExecuteRequest{Code: "print c", ContextID: info.ID}); res.text("control") != "completed" {
+		t.Fatalf("next run = %v", res.frames)
+	}
+}
+
+// Daytona's Go SDK reads close codes 1000 and 1001 as a normal end. A run
+// whose interpreter died, or whose context was restarted or deleted, sends
+// an error frame first, so the client sees a failure.
+func TestExecuteKernelLossIsAnErrorFrame(t *testing.T) {
+	l := &fakeLauncher{}
+	e := newTestEnv(t, l, nil)
+	info, err := e.m.Create(t.Context(), "python", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := e.run(t, ExecuteRequest{Code: "print x\ndie", ContextID: info.ID})
+	want := map[string]any{"type": "error", "text": "", "name": "WorkerProcessEnded", "value": "worker process ended", "traceback": ""}
+	if got := res.types(); !reflect.DeepEqual(got, []string{"stdout", "error"}) || !reflect.DeepEqual(res.frames[1], want) ||
+		res.closeCode != websocket.CloseGoingAway || res.closeReason != "worker process ended" {
+		t.Fatalf("death = %v %d %q", res.frames, res.closeCode, res.closeReason)
+	}
+
+	// A fresh context, so the run below is the only one its kernel saw.
+	other, err := e.m.Create(t.Context(), "python", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := e.dial(t, nil)
+	if err := conn.WriteJSON(ExecuteRequest{Code: "sleep", ContextID: other.ID}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "run in flight", func() bool { k := l.last(); return k != nil && k.runs.Load() == 1 })
+	if _, err := e.m.Restart(t.Context(), other.ID); err != nil {
+		t.Fatal(err)
+	}
+	res = readAll(t, conn, nil)
+	want = map[string]any{"type": "error", "text": "", "name": "ContextRestarting", "value": "context shutdown", "traceback": ""}
+	if len(res.frames) != 1 || !reflect.DeepEqual(res.frames[0], want) ||
+		res.closeCode != websocket.CloseGoingAway || res.closeReason != "context shutdown" {
+		t.Fatalf("restarted under the run = %v %d %q", res.frames, res.closeCode, res.closeReason)
+	}
+}
+
+// Env the interpreter cannot set is the client's mistake: 1008, as for
+// other bad requests, not 1011.
+func TestExecuteInvalidEnv(t *testing.T) {
+	e := newTestEnv(t, &fakeLauncher{}, nil)
+	res := e.run(t, map[string]any{"code": "print x", "envs": map[string]string{"A=B": "c"}})
+	if res.closeCode != websocket.ClosePolicyViolation || !strings.HasPrefix(res.closeReason, "invalid environment variable") || len(res.frames) != 0 {
+		t.Fatalf("invalid env = %v %d %q", res.frames, res.closeCode, res.closeReason)
+	}
+}
+
+// An error the adapter does not know can carry host paths (a WASM module
+// file, a driver script): it is logged whole and the client gets a generic
+// reason. A missing interpreter keeps its message, which says what to
+// install.
+func TestUnknownErrorsAreGeneric(t *testing.T) {
+	l := &fakeLauncher{}
+	e := newTestEnv(t, l, nil)
+	var logs strings.Builder
+	var mu sync.Mutex
+	e.h.logger = slog.New(slog.NewTextHandler(lockedWriter{&mu, &logs}, nil))
+	const secret = "open /var/lib/aerolvm/wasm/modules/python.wasm: permission denied"
+	l.setFail(errors.New(secret))
+
+	res := e.run(t, ExecuteRequest{Code: "x"})
+	if res.closeCode != websocket.CloseInternalServerErr || res.closeReason != "code interpreter internal error" {
+		t.Fatalf("execute = %d %q", res.closeCode, res.closeReason)
+	}
+	status, body := e.do(t, http.MethodPost, "/context", "{}")
+	if status != http.StatusInternalServerError || body["error"] != "code interpreter internal error" {
+		t.Fatalf("create = %d %v", status, body)
+	}
+	mu.Lock()
+	logged := logs.String()
+	mu.Unlock()
+	if strings.Count(logged, "/var/lib/aerolvm/wasm/modules/python.wasm") != 2 {
+		t.Fatalf("log = %q, want the full error twice", logged)
+	}
+
+	l.setFail(&codeinterp.MissingInterpreterError{Language: "python", Programs: []string{"python3"}})
+	if res := e.run(t, ExecuteRequest{Code: "x"}); !strings.HasPrefix(res.closeReason, "python interpreter not found") {
+		t.Fatalf("missing interpreter = %d %q", res.closeCode, res.closeReason)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
