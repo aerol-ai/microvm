@@ -65,6 +65,10 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	h := newHandlers(d)
 
 	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Route(permWrite, http.HandlerFunc(h.createSandbox)))
+	// E2B SDKs from 2.51 create and connect through /v2 only; the body is
+	// the v1 one minus secure (create) and with an optional timeout
+	// (connect), so both share the v1 handlers' code.
+	mux.Handle("POST "+PathPrefix+"/v2/sandboxes", d.Route(permWrite, http.HandlerFunc(h.createSandbox)))
 	mux.Handle("GET "+PathPrefix+"/sandboxes", d.Route(permRead, http.HandlerFunc(h.listSandboxes)))
 	mux.Handle("GET "+PathPrefix+"/v2/sandboxes", d.Route(permRead, http.HandlerFunc(h.listSandboxes)))
 	// The detail carries the envd access token, which opens the toolbox; a
@@ -74,6 +78,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// Connect resumes the sandbox and hands back the envd token so the SDK
 	// can run commands in it: sandbox.exec.
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/connect", d.Route(permExec, h.clusterForwardWrap(http.HandlerFunc(h.connectSandbox))))
+	mux.Handle("POST "+PathPrefix+"/v2/sandboxes/{id}/connect", d.Route(permExec, h.clusterForwardWrap(http.HandlerFunc(h.connectSandboxV2))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/pause", d.Route(permWrite, h.clusterForwardWrap(http.HandlerFunc(h.pauseSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/timeout", d.Route(permWrite, h.clusterForwardWrap(http.HandlerFunc(h.updateTimeout))))
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/network", d.Route(permWrite, h.clusterForwardWrap(http.HandlerFunc(h.updateNetwork))))

@@ -17,6 +17,34 @@ import (
 
 const runtimeProxyPrefix = PathPrefix + "/runtime"
 
+// The E2B SDKs reach every in-sandbox server through E2B_SANDBOX_URL and
+// name the sandbox port in a header; the code-interpreter SDKs use port
+// 49999, envd is everything else. toolboxd serves the interpreter under
+// interpreterToolboxPrefix (plans/code-interpreter.md D7).
+const (
+	sandboxPortHeader        = "E2b-Sandbox-Port"
+	interpreterPort          = "49999"
+	interpreterToolboxPrefix = "/interpreter/e2b"
+)
+
+// runtimeTokenHeaders are the headers that may carry the sandbox's access
+// token. The interpreter SDKs send X-Access-Token only on /execute and the
+// traffic token on every call, so either one admits a request.
+var runtimeTokenHeaders = []string{"X-Access-Token", "E2B-Traffic-Access-Token"}
+
+// runtimeTokenOK reports whether r carries the sandbox's toolbox token in
+// any token header. The token is this route's only credential (envd has no
+// platform auth), so each compare is constant time.
+func runtimeTokenOK(r *http.Request, want string) bool {
+	for _, header := range runtimeTokenHeaders {
+		got := strings.TrimSpace(r.Header.Get(header))
+		if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 	sandboxID := strings.TrimSpace(r.Header.Get("E2b-Sandbox-Id"))
 	if sandboxID == "" {
@@ -38,14 +66,18 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	if meta.Secure {
-		// The access token is this route's only credential (envd has no
-		// platform auth), so compare it in constant time.
-		accessToken := strings.TrimSpace(r.Header.Get("X-Access-Token"))
-		if accessToken == "" || subtle.ConstantTimeCompare([]byte(accessToken), []byte(sandbox.ToolboxToken)) != 1 {
-			WriteError(w, http.StatusUnauthorized, "Unauthorized")
-			return
-		}
+	if meta.Secure && !runtimeTokenOK(r, sandbox.ToolboxToken) {
+		WriteError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	interpreter := strings.TrimSpace(r.Header.Get(sandboxPortHeader)) == interpreterPort
+	if interpreter && sandbox.Runtime == models.RuntimeIsolate {
+		// An isolate runs one tenant fetch handler and no interpreters
+		// (plans/code-interpreter.md D9): say so plainly instead of letting
+		// the SDK read an unrelated proxy failure.
+		WriteError(w, http.StatusNotImplemented, "code interpreter is not supported on V8 isolate sandboxes")
+		return
 	}
 
 	publicPath := strings.TrimPrefix(r.URL.Path, runtimeProxyPrefix)
@@ -56,6 +88,9 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		publicPath = "/" + publicPath
 	}
 	toolboxPath := "/envd" + publicPath
+	if interpreter {
+		toolboxPath = interpreterToolboxPrefix + publicPath
+	}
 
 	userAuthorization := strings.TrimSpace(r.Header.Get("Authorization"))
 	if strings.HasPrefix(userAuthorization, "Basic ") {

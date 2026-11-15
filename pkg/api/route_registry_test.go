@@ -205,6 +205,8 @@ var routePermissions = map[string]string{
 	"POST /e2b/sandboxes/{id}/pause":                          "sandbox.write",
 	"POST /e2b/sandboxes/{id}/snapshots":                      "sandbox.write",
 	"POST /e2b/sandboxes/{id}/timeout":                        "sandbox.write",
+	"POST /e2b/v2/sandboxes":                                  "sandbox.write",
+	"POST /e2b/v2/sandboxes/{id}/connect":                     "sandbox.exec",
 	"POST /v1/admin/reconcile":                                "fleet.admin",
 	"POST /v1/audit/verify":                                   "audit.verify",
 	"POST /v1/cluster/internal/apply":                         "cluster.internal",

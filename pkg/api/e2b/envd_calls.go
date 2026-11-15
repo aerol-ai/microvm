@@ -27,3 +27,17 @@ func EnvdCalls() []EnvdCall {
 	}
 	return calls
 }
+
+// InterpreterCalls lists, as toolboxd paths, the Code Interpreter routes the
+// E2B code-interpreter SDKs call on sandbox port 49999 (runtime_proxy.go
+// forwards them under interpreterToolboxPrefix). "c1" stands for a context
+// id. The toolboxd route inventory test checks toolboxd answers each one.
+func InterpreterCalls() []EnvdCall {
+	return []EnvdCall{
+		{Method: http.MethodPost, Path: interpreterToolboxPrefix + "/execute"},
+		{Method: http.MethodPost, Path: interpreterToolboxPrefix + "/contexts"},
+		{Method: http.MethodGet, Path: interpreterToolboxPrefix + "/contexts"},
+		{Method: http.MethodDelete, Path: interpreterToolboxPrefix + "/contexts/c1"},
+		{Method: http.MethodPost, Path: interpreterToolboxPrefix + "/contexts/c1/restart"},
+	}
+}

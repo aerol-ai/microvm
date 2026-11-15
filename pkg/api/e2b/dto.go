@@ -2,18 +2,32 @@ package e2b
 
 import "encoding/json"
 
+// createSandboxRequest is E2B's NewSandbox (POST /sandboxes) and NewSandboxV2
+// (POST /v2/sandboxes, E2B SDK 2.51 and newer). V2 drops secure, which
+// changes nothing here: an omitted secure already means a secured sandbox.
+// AutoPauseMemory false asks for a pause that keeps only the files; the
+// facade's pause is a stop, which never keeps memory, so the value changes
+// nothing.
 type createSandboxRequest struct {
 	TemplateID          string                     `json:"templateID"`
 	AllowInternetAccess *bool                      `json:"allow_internet_access,omitempty"`
 	AutoPause           *bool                      `json:"autoPause,omitempty"`
+	AutoPauseMemory     *bool                      `json:"autoPauseMemory,omitempty"`
 	AutoResume          *sandboxAutoResumeRequest  `json:"autoResume,omitempty"`
 	EnvVars             map[string]any             `json:"envVars,omitempty"`
+	IAM                 *sandboxIAMRequest         `json:"iam,omitempty"`
 	MCP                 any                        `json:"mcp,omitempty"`
 	Metadata            map[string]any             `json:"metadata,omitempty"`
 	Network             *sandboxNetworkRequest     `json:"network,omitempty"`
 	Secure              *bool                      `json:"secure,omitempty"`
 	Timeout             *int                       `json:"timeout,omitempty"`
 	VolumeMounts        []sandboxVolumeMountCreate `json:"volumeMounts,omitempty"`
+}
+
+// sandboxIAMRequest is E2B's SandboxIam: workload identity tokens the
+// sandbox could mint. A non-empty tokens map turns the feature on.
+type sandboxIAMRequest struct {
+	Tokens map[string]json.RawMessage `json:"tokens,omitempty"`
 }
 
 type sandboxAutoResumeRequest struct {
@@ -46,6 +60,13 @@ type sandboxVolumeMountCreate struct {
 
 type connectSandboxRequest struct {
 	Timeout int `json:"timeout"`
+}
+
+// connectSandboxV2Request is E2B's ConnectSandboxV2. Memory false asks to
+// resume from the files only; see connectSandboxV2 for why it needs nothing.
+type connectSandboxV2Request struct {
+	Timeout *int  `json:"timeout,omitempty"`
+	Memory  *bool `json:"memory,omitempty"`
 }
 
 type timeoutRequest struct {
