@@ -353,6 +353,17 @@ func vmmChildGroup(procCgroup []byte) (child string, in bool) {
 	return "", false
 }
 
+// vmmProcessGroup reads which VM group pid runs in (vmmChildGroup): in is
+// false outside the VMs' cgroup, child is "" in the VMs' cgroup itself.
+func vmmProcessGroup(pid int) (child string, in bool, err error) {
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return "", false, err
+	}
+	child, in = vmmChildGroup(raw)
+	return child, in, nil
+}
+
 // procCmdline is pid's argv.
 func procCmdline(pid int) ([]string, error) {
 	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cmdline"))

@@ -79,6 +79,7 @@ var (
 	killStrayVMM    = killCgroupStray
 	processCmdline  = procCmdline
 	sweepVMMGroups  = removeEmptyVMMGroups
+	vmmGroupOfPID   = vmmProcessGroup
 )
 
 // vmmRecord is what a running VM leaves for the next sandboxd.
@@ -141,6 +142,40 @@ func (d *Driver) placeVMM(sandboxID string, pid int) {
 	}
 }
 
+// FenceReady (sbruntime.FenceChecker) reports whether sandboxID's running
+// VM sits in its own group, aerolvm-vmm/<sandbox>: the one Freeze freezes
+// and the runtime supervisor freezes with sandboxd down (FenceGroup).
+// placeVMM only warns when the move fails, because a VM outside its group
+// still runs and serves; whether that is acceptable depends on the
+// sandbox's failover policy, which the driver does not know. The service
+// asks here before it lets a failover.policy=recreate VM run on a node that
+// writes the ownership lease file (review V4). It reads the VM's own
+// /proc/<pid>/cgroup, so it reports where the VM is, not where config says
+// it should be. nil when no VM of that ID is running: nothing to fence.
+func (d *Driver) FenceReady(sandboxID string) error {
+	d.mu.Lock()
+	h, ok := d.vmms[sandboxID]
+	d.mu.Unlock()
+	if !ok || h == nil || h.Pid() <= 0 {
+		return nil
+	}
+	child, in, err := vmmGroupOfPID(h.Pid())
+	if err != nil {
+		return fmt.Errorf("firecracker VM %s: cannot tell which cgroup it runs in: %w", sandboxID, err)
+	}
+	if !in || child != sandboxID {
+		where := "outside the VMs' cgroup"
+		switch {
+		case in && child == "":
+			where = "in the VMs' shared cgroup"
+		case in:
+			where = "in group " + child
+		}
+		return fmt.Errorf("firecracker VM %s runs %s, not in its own group %s, so it cannot be frozen alone", sandboxID, where, d.FenceGroup(sandboxID))
+	}
+	return nil
+}
+
 // Freeze stops a sandbox's VM where it stands: its own cgroup frozen. The
 // cluster ownership fence calls it when sandboxd's lease runs out
 // (internal/service/ownership_lease.go); the runtime supervisor freezes the
@@ -173,6 +208,7 @@ func (d *Driver) FenceGroup(sandboxID string) string {
 var (
 	_ sbruntime.Freezer      = (*Driver)(nil)
 	_ sbruntime.FenceGrouper = (*Driver)(nil)
+	_ sbruntime.FenceChecker = (*Driver)(nil)
 )
 
 func (d *Driver) unregister(sandboxID string) (VMMHandle, bool) {
