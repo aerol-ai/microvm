@@ -139,6 +139,10 @@ func streamStartError(reply Envelope) error {
 	return errors.New(p.Message)
 }
 
+// RunID is the run's id (ID), for callers that hold the stream behind an
+// interface.
+func (s *ExecStream) RunID() string { return s.ID }
+
 // Recv returns the next output chunk or, last, the exit. After the exit it
 // returns io.EOF.
 func (s *ExecStream) Recv() (ExecEvent, error) {

@@ -58,6 +58,11 @@ type Driver struct {
 	mu   sync.Mutex
 	byID map[string]*sandboxInstance
 
+	// codeRunPaths caches the resolved module path per code-run language
+	// (coderun.go); codeRunMu guards it.
+	codeRunMu    sync.Mutex
+	codeRunPaths map[string]string
+
 	rehydrate sync.Map // sandboxID -> *sync.Mutex single-flight gates
 }
 

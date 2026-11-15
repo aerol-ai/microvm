@@ -51,6 +51,11 @@ type sandboxInstance struct {
 	runGeneration      uint64
 	guestServeGen      uint64
 	guestServeMu       sync.Mutex
+
+	// streams are the sandbox's live streaming runs (stream.go), created on
+	// first use under Driver.mu. Stop, Destroy and a passivating checkpoint
+	// end them.
+	streams *streamSet
 }
 
 func (d *Driver) sandboxDir(sandboxID string) string {

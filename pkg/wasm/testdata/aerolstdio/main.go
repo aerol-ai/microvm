@@ -15,6 +15,9 @@
 //	dial ADDR         dial ADDR through aerol/vm/net and print "dial=<code>"
 //	dial-read ADDR    dial ADDR, then block reading it; print "read=<n>"
 //	pwd               print the working directory
+//	-c CODE [ARGS] / -e CODE [ARGS]
+//	                  stand in for an interpreter's eval flag: print
+//	                  "eval:CODE" then "|ARG" for each argument
 package main
 
 import (
@@ -106,6 +109,14 @@ func main() {
 		fmt.Println("dialed")
 		n := tcpRead(uint32(id), uint32(uintptr(unsafe.Pointer(&buf[0]))), uint32(len(buf)))
 		fmt.Printf("read=%d", n)
+	case "-c", "-e":
+		if len(rest) == 0 {
+			os.Exit(2)
+		}
+		fmt.Print("eval:", rest[0])
+		for _, a := range rest[1:] {
+			fmt.Print("|", a)
+		}
 	case "pwd":
 		wd, err := os.Getwd()
 		if err != nil {

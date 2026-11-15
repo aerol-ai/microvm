@@ -44,6 +44,22 @@ type WorkerClient interface {
 	ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
+// workerExecStream is a live streaming run on a worker (*worker.ExecStream).
+type workerExecStream interface {
+	Recv() (worker.ExecEvent, error)
+	WriteStdin(p []byte) error
+	CloseStdin() error
+	Kill() error
+	Close() error
+}
+
+// streamingWorkerClient is the optional streaming-exec surface of a worker
+// client (issue #535). It is optional so test fakes written before it keep
+// compiling; a client without it answers ErrStreamingUnsupported.
+type streamingWorkerClient interface {
+	StartExec(ctx context.Context, sandboxID string, p worker.ExecStartPayload) (workerExecStream, error)
+}
+
 // WorkerClientFactory builds a client for a worker socket path.
 type WorkerClientFactory func(socketPath string) WorkerClient
 
@@ -125,6 +141,16 @@ func (a workerClientAdapter) SetListenPort(sandboxID string, port int, host stri
 
 func (a workerClientAdapter) ResolvedListenPort(sandboxID string) (int, error) {
 	return a.client.ResolvedListenPort(sandboxID)
+}
+
+// StartExec is the optional streaming-exec hook (streamingWorkerClient).
+func (a workerClientAdapter) StartExec(ctx context.Context, sandboxID string, p worker.ExecStartPayload) (workerExecStream, error) {
+	st, err := a.client.StartExec(ctx, sandboxID, p)
+	if err != nil {
+		// Never wrap a nil *ExecStream in a non-nil interface.
+		return nil, err
+	}
+	return st, nil
 }
 
 func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
