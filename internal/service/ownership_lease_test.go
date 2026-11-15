@@ -296,8 +296,11 @@ func TestOwnershipLeaseIsANoOpInSingleNodeMode(t *testing.T) {
 }
 
 // A worker with no recreate-policy sandbox has nothing two nodes could both
-// run: it keeps its lease without a read (an empty read is no round trip), so
-// the first such sandbox it gets starts with a whole lease.
+// run, so its confirm sends no read (an empty read is no round trip). It
+// proves nothing either, so it does not renew the lease (V3): a recreate
+// sandbox that turns up later without its create's read is fenced once the
+// lease, counted from the last proof, runs out. Before the fix the empty
+// confirm renewed the lease and this sandbox ran on.
 func TestOwnershipLeaseWithoutRecreateSandboxesNeedsNoRead(t *testing.T) {
 	ctx := context.Background()
 	svc, st, lc := newLeaseService(t, newFreezeRuntime())
@@ -312,9 +315,13 @@ func TestOwnershipLeaseWithoutRecreateSandboxesNeedsNoRead(t *testing.T) {
 		t.Fatalf("control-plane reads = %d, want 0", lc.readCount())
 	}
 	seedLeaseRow(t, st, "sb-ha", true, models.SandboxStatusStarted)
-	svc.enforceOwnershipLease(ctx, t0.Add(20*time.Second))
+	svc.enforceOwnershipLease(ctx, t0.Add(14*time.Second))
 	if svc.OwnershipFenced("sb-ha") {
-		t.Fatal("fenced 10s into the lease that the empty confirm renewed")
+		t.Fatal("fenced inside the lease the start gave")
+	}
+	svc.enforceOwnershipLease(ctx, t0.Add(20*time.Second))
+	if !svc.OwnershipFenced("sb-ha") {
+		t.Fatal("not fenced 20s after the last proof: the empty confirm renewed the lease")
 	}
 }
 

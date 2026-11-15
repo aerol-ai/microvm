@@ -75,6 +75,24 @@ func (s *Service) recordOwnershipRead(ctx context.Context, sent time.Time, rows 
 	_ = s.writeOwnershipLeaseFileLocked(ctx)
 }
 
+// rewriteOwnershipFence writes the file again under the same read, with the
+// fence listed now: what a confirm with nothing to read does instead of
+// recordOwnershipRead. ConfirmedUnixMs stays and WrittenUnixMs moves on, so
+// the supervisor's countdown only shrinks; the fence still drops sandboxes
+// that are gone. Nothing before this process's first read.
+func (s *Service) rewriteOwnershipFence(ctx context.Context) {
+	if !s.ownershipLeaseFileOn() {
+		return
+	}
+	f := &s.ownershipFile
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.confirmed.IsZero() {
+		return
+	}
+	_ = s.writeOwnershipLeaseFileLocked(ctx)
+}
+
 // publishOwnershipFence writes the file with every local recreate-policy
 // sandbox in the fence, the one whose row was just written included, before
 // that create is answered (R9). The answer is what lets its placement be

@@ -3449,6 +3449,14 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	if s == nil || s.store == nil {
 		return errors.New("store is not configured")
 	}
+	// A recreate-policy sandbox starts only on a lease a recent read proved
+	// (V3): a clock read, plus one leader read when this node has had none
+	// lately (it ran no recreate-policy sandbox, or its reads failed).
+	if sandbox.Failover != nil && sandbox.Failover.ShouldRecreate() {
+		if err := s.requireFreshOwnership(ctx, sandbox.ID); err != nil {
+			return err
+		}
+	}
 	if digests := createRequestDigestsFrom(ctx); sandbox.CreateRequestDigest == "" && len(digests) > 0 {
 		sandbox.CreateRequestDigest = digests[0]
 	}
