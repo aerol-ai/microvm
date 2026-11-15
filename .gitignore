@@ -101,6 +101,8 @@ credentials.json
 
 # Compiled on first test run from wazero wasip1 stdlib guest (~9MB).
 pkg/wasm/testdata/wasip1-http.wasm
+pkg/wasm/testdata/fsprobe.wasm
+pkg/wasm/testdata/fsprobe.wasm.*.tmp
 ./*.wasm
 ./pkg/wasm/testdata/wasip1-http.wasm
 internal/store/invalid-dsn:::
