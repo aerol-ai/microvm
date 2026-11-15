@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,28 +124,35 @@ func TestCreate_ToolboxLoopbackOffPublishesNothing(t *testing.T) {
 	}
 }
 
+// A container that never asked for the loopback binding fails at once, with
+// no re-inspect: waiting cannot make Docker publish it. (A requested binding
+// with no host port yet is the Docker Desktop race, which waits; see
+// TestToolboxLoopbackWaitsForDockerToPublishThePort.)
 func TestCreate_ToolboxLoopbackWithoutLoopbackBindingFails(t *testing.T) {
 	for name, inspect := range map[string]string{
 		"no_binding":           inspectBody("cid", "/sb", unroutableContainerIP, true, "running", 7),
 		"all_interfaces":       loopbackInspectBody("0.0.0.0", 49153),
-		"empty_host_port":      strings.Replace(loopbackInspectBody(toolboxLoopbackHost, 1), `"HostPort":"1"`, `"HostPort":""`, 1),
 		"other_container_port": strings.Replace(loopbackInspectBody(toolboxLoopbackHost, 49153), `"2280/tcp"`, `"8080/tcp"`, 1),
 	} {
 		t.Run(name, func(t *testing.T) {
+			inspects := 0
 			d := &fakeDaemon{
 				t:            t,
 				imageInspect: imagePresent,
 				create:       func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid"}) },
 				start:        func() *http.Response { return textResponse(http.StatusNoContent, "") },
-				containerGet: func() *http.Response { return textResponse(http.StatusOK, inspect) },
+				containerGet: func() *http.Response { inspects++; return textResponse(http.StatusOK, inspect) },
 			}
 			c := newCreateClient(t, d, true, func(c *Client) {
 				c.toolboxLoopback = true
 				c.toolboxPort = 2280
 			})
 			_, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: "registry.example/app:v1"}, "sb", "tok", nil)
-			if err == nil || !strings.Contains(err.Error(), "is not published on 127.0.0.1") {
-				t.Fatalf("Create() error = %v, want unpublished-toolbox error", err)
+			if err == nil || !strings.Contains(err.Error(), "is not published on 127.0.0.1") || !strings.Contains(err.Error(), "created without that binding") {
+				t.Fatalf("Create() error = %v, want unpublished-toolbox error naming the missing binding", err)
+			}
+			if inspects != 1 {
+				t.Fatalf("container inspected %d times, want 1: a binding never requested is not waited for", inspects)
 			}
 			if d.removeCalls != 1 {
 				t.Fatalf("container must be removed on failure, removeCalls = %d", d.removeCalls)
@@ -188,6 +196,165 @@ func TestStart_ToolboxLoopback(t *testing.T) {
 			t.Fatalf("Start() error = %v, want unpublished-toolbox error", err)
 		}
 	})
+}
+
+// requestedLoopbackInspectBody is a container created with the loopback
+// binding (HostConfig.PortBindings, as Docker echoes it back), whose live
+// NetworkSettings.Ports entry for the toolbox port is ports. With ports
+// "[]" and running true it is what Docker Desktop reports for a moment
+// after start (the Nov 15 Inspect run: 1 create in 6 failed on it).
+func requestedLoopbackInspectBody(running bool, ports string) string {
+	return fmt.Sprintf(`{"Id":"cid","Name":"/sb","State":{"Running":%t,"Status":"running","Pid":7},`+
+		`"NetworkSettings":{"Networks":{"bridge":{"IPAddress":%q}},"Ports":{"2280/tcp":%s}},`+
+		`"HostConfig":{"PortBindings":{"2280/tcp":[{"HostIp":"127.0.0.1","HostPort":"0"}]}}}`,
+		running, unroutableContainerIP, ports)
+}
+
+// inspectStep is one answer of a container inspect sequence; status 0 is 200.
+type inspectStep struct {
+	status int
+	body   string
+}
+
+// inspectSequence answers successive container inspects with steps in order,
+// repeating the last one, and counts the calls.
+func inspectSequence(steps []inspectStep, calls *int) func() *http.Response {
+	return func() *http.Response {
+		step := steps[min(*calls, len(steps)-1)]
+		*calls++
+		if step.status == 0 {
+			step.status = http.StatusOK
+		}
+		return textResponse(step.status, step.body)
+	}
+}
+
+// Docker Desktop can report a just-started container as running before it
+// has published the requested 127.0.0.1 toolbox port. The create and start
+// paths re-inspect briefly instead of failing on the first read, and pay
+// nothing extra when the first inspect already shows the port.
+func TestToolboxLoopbackWaitsForDockerToPublishThePort(t *testing.T) {
+	_, hostPort, closeFn := toolboxServer(t, okToolbox)
+	defer closeFn()
+	published := loopbackInspectBody(toolboxLoopbackHost, hostPort)
+	race := requestedLoopbackInspectBody(true, `[]`)
+
+	for _, tc := range []struct {
+		name         string
+		start        bool // Start (waitForRuntime) instead of Create
+		steps        []inspectStep
+		wantErr      string
+		wantInspects int // 0: at least 2 (only checked on success)
+	}{
+		{name: "published_at_once_no_extra_inspect", steps: []inspectStep{{body: published}}, wantInspects: 1},
+		{name: "empty_port_list_then_published", steps: []inspectStep{{body: race}, {body: race}, {body: published}}, wantInspects: 3},
+		{
+			name: "placeholder_port_then_published",
+			steps: []inspectStep{
+				{body: requestedLoopbackInspectBody(true, `[{"HostIp":"127.0.0.1","HostPort":"0"}]`)},
+				{body: requestedLoopbackInspectBody(true, `[{"HostIp":"127.0.0.1","HostPort":""}]`)},
+				{body: published},
+			},
+			wantInspects: 3,
+		},
+		{
+			// An engine that leaves HostConfig out is recognized by the
+			// exposed-but-unbound port alone.
+			name:         "exposed_without_host_config_then_published",
+			steps:        []inspectStep{{body: strings.Replace(race, `,"HostConfig":{"PortBindings":{"2280/tcp":[{"HostIp":"127.0.0.1","HostPort":"0"}]}}`, "", 1)}, {body: published}},
+			wantInspects: 2,
+		},
+		{name: "start_empty_port_list_then_published", start: true, steps: []inspectStep{{body: race}, {body: published}}, wantInspects: 2},
+		{name: "never_published_is_bounded", steps: []inspectStep{{body: race}}, wantErr: "docker has not published toolbox port 2280/tcp of running container cid on 127.0.0.1 after waiting 60ms"},
+		{name: "stops_while_waiting", steps: []inspectStep{{body: race}, {body: requestedLoopbackInspectBody(false, `[]`)}}, wantErr: "the container is not running"},
+		{name: "reinspect_fails", steps: []inspectStep{{body: race}, {status: http.StatusNotFound, body: `{"message":"no such container"}`}}, wantErr: "inspect container"},
+		{name: "start_never_published", start: true, steps: []inspectStep{{body: race}}, wantErr: "has not published toolbox port"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inspects := 0
+			d := &fakeDaemon{
+				t:            t,
+				imageInspect: imagePresent,
+				create:       func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid"}) },
+				start:        func() *http.Response { return textResponse(http.StatusNoContent, "") },
+				containerGet: inspectSequence(tc.steps, &inspects),
+			}
+			c := newCreateClient(t, d, true, func(c *Client) {
+				c.toolboxLoopback = true
+				c.toolboxPort = 2280
+				c.toolboxPublishWait = 60 * time.Millisecond
+				c.readinessPollInit = 5 * time.Millisecond
+				c.readinessPollMax = 10 * time.Millisecond
+			})
+
+			var err error
+			if tc.start {
+				_, err = c.Start(context.Background(), "sb")
+			} else {
+				_, err = c.Create(context.Background(), models.CreateSandboxRequest{Image: "registry.example/app:v1"}, "sb", "tok", nil)
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tc.wantErr)
+				}
+				if !tc.start && d.removeCalls != 1 {
+					t.Fatalf("a create that cannot reach its toolbox must remove the container, removeCalls = %d", d.removeCalls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("error = %v (toolbox must be reached via 127.0.0.1:%d once Docker publishes it)", err, hostPort)
+			}
+			if inspects != tc.wantInspects {
+				t.Fatalf("container inspected %d times, want %d", inspects, tc.wantInspects)
+			}
+			if d.removeCalls != 0 {
+				t.Fatalf("removeCalls = %d on success", d.removeCalls)
+			}
+		})
+	}
+}
+
+// The wait honors the caller's context, and a container that is not running
+// fails without one.
+func TestToolboxAddrLoopbackWaitStops(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name    string
+		ctx     context.Context
+		inspect string
+		wantErr error
+		wantMsg string
+	}{
+		{name: "context_cancelled", ctx: cancelled, inspect: requestedLoopbackInspectBody(true, `[]`), wantErr: context.Canceled},
+		{name: "not_running", ctx: context.Background(), inspect: requestedLoopbackInspectBody(false, `null`), wantMsg: "toolbox port 2280/tcp is not published on 127.0.0.1 for container cid: the container is not running"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{
+				toolboxPort:     2280,
+				toolboxLoopback: true,
+				httpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					t.Fatalf("unexpected docker call %s %s", r.Method, r.URL.Path)
+					return nil, nil
+				})},
+			}
+			var inspect containerInspect
+			if err := json.Unmarshal([]byte(tc.inspect), &inspect); err != nil {
+				t.Fatalf("inspect body: %v", err)
+			}
+			_, err := c.toolboxAddr(tc.ctx, "", inspect, "")
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Fatalf("toolboxAddr() error = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantMsg != "" && (err == nil || err.Error() != tc.wantMsg) {
+				t.Fatalf("toolboxAddr() error = %v, want %q", err, tc.wantMsg)
+			}
+		})
+	}
+	if got := (&Client{}).toolboxPublishWaitLimit(); got != defaultToolboxPublishWait {
+		t.Fatalf("zero toolboxPublishWait = %s, want the %s default", got, defaultToolboxPublishWait)
+	}
 }
 
 func TestToolboxAddress(t *testing.T) {

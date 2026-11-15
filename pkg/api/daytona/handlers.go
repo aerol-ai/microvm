@@ -373,7 +373,21 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// SDKs from 0.180 read a cursor page, older clients the bare array
+	// (list_cursor.go).
+	cursorList := wantsCursorList(r)
+	var page cursorListPage
+	if cursorList {
+		if page, err = parseCursorListPage(r); err != nil {
+			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	if h.deps.Service == nil {
+		if cursorList {
+			apihttp.WriteJSON(w, http.StatusOK, cursorSandboxPage(nil, page))
+			return
+		}
 		apihttp.WriteJSON(w, http.StatusOK, []sandboxResponse{})
 		return
 	}
@@ -395,13 +409,22 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
 
-	// The unpaginated Daytona list returns every sandbox the caller owns: the
-	// SDK reads a bare array with no cursor field, so a next-page token in a
-	// response header is invisible to it. In a cluster the merge is
+	// The unpaginated Daytona list returns every sandbox the caller owns: an
+	// older client reads a bare array with no cursor field, so a next-page
+	// token in a response header is invisible to it, and a cursor page is
+	// cut from the same whole list. In a cluster the merge is
 	// placement-paged, so walk all pages and concatenate instead of returning
 	// only the first page (~100) and stranding the rest (B10). Single node
 	// returns its one page (all local rows) in a single iteration.
-	items, cov, ok := gatherAllClusterPages(r, localItems, func(it sandboxResponse) string { return it.ID }, h.listFacadeClusterItems)
+	gatherReq := r
+	if cursorList {
+		// A cursor page's limit and cursor shape the reply only. Left in,
+		// the placement walk would read limit as its own page size: a
+		// limit of 1 would take one placement per page and stop at
+		// maxUnpaginatedListPages sandboxes.
+		gatherReq = withoutQueryKeys(r, "limit", "cursor")
+	}
+	items, cov, ok := gatherAllClusterPages(gatherReq, localItems, func(it sandboxResponse) string { return it.ID }, h.listFacadeClusterItems)
 	if !ok {
 		w.Header().Set("Retry-After", "1")
 		clusterlist.WriteCoverageHeaders(w, cov, "")
@@ -411,6 +434,10 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	// The whole list was gathered, so there is no next-page token to surface;
 	// coverage headers still report any owner node that did not answer.
 	clusterlist.WriteCoverageHeaders(w, cov, "")
+	if cursorList {
+		apihttp.WriteJSON(w, http.StatusOK, cursorSandboxPage(items, page))
+		return
+	}
 	apihttp.WriteJSON(w, http.StatusOK, items)
 }
 
@@ -458,6 +485,18 @@ func withPageToken(r *http.Request, token string) *http.Request {
 	clone := r.Clone(r.Context())
 	q := clone.URL.Query()
 	q.Set("page_token", token)
+	clone.URL.RawQuery = q.Encode()
+	return clone
+}
+
+// withoutQueryKeys returns a shallow clone of r without the given query
+// keys, leaving the caller's request untouched.
+func withoutQueryKeys(r *http.Request, keys ...string) *http.Request {
+	clone := r.Clone(r.Context())
+	q := clone.URL.Query()
+	for _, key := range keys {
+		q.Del(key)
+	}
 	clone.URL.RawQuery = q.Encode()
 	return clone
 }
