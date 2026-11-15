@@ -2,9 +2,12 @@ package proc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -175,6 +178,107 @@ func TestKernelInterrupt(t *testing.T) {
 	}
 	if out, _ := execute(t, k, "out still alive", nil); out.Status != "ok" {
 		t.Fatalf("kernel did not survive the interrupt: %+v", out)
+	}
+}
+
+// An interrupt that comes after the run was handed to the kernel, but
+// before the driver read it, reaches an idle driver, which drops SIGINT on
+// purpose. The kernel sends it again when the run's COUNT arrives.
+func TestKernelInterruptBeforeTheDriverReadTheRun(t *testing.T) {
+	// The driver sleeps 300ms after READY (and after each DONE) before it
+	// reads, so the run below waits in the pipe meanwhile.
+	k := launchFake(t, "slowread")
+	done := make(chan codeinterp.Outcome, 1)
+	go func() {
+		out, _ := k.Execute(codeinterp.Request{Code: "sleep 5s"}, nil)
+		done <- out
+	}()
+	waitUntilKernel(t, "run handed to the kernel", func() bool {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		return k.run != nil
+	})
+	time.Sleep(50 * time.Millisecond)
+	if err := k.Interrupt(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case out := <-done:
+		if !out.Interrupted() || out.Died {
+			t.Fatalf("outcome = %+v, want interrupted", out)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("the interrupt was lost: the run went on")
+	}
+	// The interrupt belonged to that run only.
+	if out, _ := execute(t, k, "sleep 500ms", nil); out.Status != "ok" {
+		t.Fatalf("next run = %+v, want ok", out)
+	}
+}
+
+func waitUntilKernel(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// openFDs lists the descriptors below max this process has open. fstat
+// answers EBADF for a closed one, on Linux and macOS alike.
+func openFDs(max int) map[int]bool {
+	fds := map[int]bool{}
+	var st syscall.Stat_t
+	for fd := 0; fd < max; fd++ {
+		if syscall.Fstat(fd, &st) == nil {
+			fds[fd] = true
+		}
+	}
+	return fds
+}
+
+// When the third of startKernel's four pipes cannot be made, the two made
+// before it were left open: every failed launch on a full descriptor table
+// leaked four more. A lowered RLIMIT_NOFILE makes the third pipe fail.
+func TestStartKernelClosesPipesWhenOneFails(t *testing.T) {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Skipf("getrlimit: %v", err)
+	}
+	const probe = 4096
+	before := openFDs(probe)
+	// Room for exactly five new descriptors: /dev/null and two pipes. New
+	// descriptors take the lowest free numbers, so count free numbers.
+	limit, free := 0, 0
+	for free < 5 {
+		if !before[limit] {
+			free++
+		}
+		limit++
+	}
+	low := lim
+	low.Cur = uint64(limit)
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &low); err != nil {
+		t.Skipf("setrlimit: %v", err)
+	}
+	_, err := startKernel(exec.Command("true"), nil, "nonce")
+	if rerr := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim); rerr != nil {
+		t.Fatalf("restore rlimit: %v", rerr)
+	}
+	if !errors.Is(err, syscall.EMFILE) {
+		t.Fatalf("startKernel = %v, want EMFILE", err)
+	}
+	var leaked []int
+	for fd := range openFDs(probe) {
+		if !before[fd] {
+			leaked = append(leaked, fd)
+		}
+	}
+	if len(leaked) > 0 {
+		t.Fatalf("descriptors left open after the failed start: %v", leaked)
 	}
 }
 

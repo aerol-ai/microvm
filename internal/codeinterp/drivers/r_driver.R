@@ -253,8 +253,13 @@ local({
       st$saved <- apply_env(pairs)
       st$running <- TRUE
       st$done <- FALSE
-      emit("COUNT", format(st$count, scientific = FALSE))
     })
+    # The run takes interrupts from its COUNT on (doc.go): the host sends
+    # an early interrupt again when COUNT arrives. quietly would drop one
+    # that lands while COUNT is written, so COUNT goes out with interrupts
+    # only held back, and R raises a pending one at its first check in the
+    # cell (or here, which ends the run as interrupted all the same).
+    suspendInterrupts(emit("COUNT", format(st$count, scientific = FALSE)))
     status <- tryCatch(run_cell(code), interrupt = function(i) "interrupted")
     finish(status)
   }

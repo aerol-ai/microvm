@@ -138,6 +138,10 @@ __aerol_begin() {
 		builtin export "$name=${pair#*=}"
 	done
 	__aerol_env=()
+	# The run takes interrupts from its COUNT on (doc.go): the host sends an
+	# early interrupt again when COUNT arrives, which must not find SIGINT
+	# still ignored. Caught here, it ends the cell before its first command.
+	builtin trap '__aerol_on_int' INT
 	__aerol_emit COUNT "$__aerol_count"
 }
 
@@ -215,7 +219,6 @@ __aerol_emit READY 1
 # one-pass for loop takes them: the cell just ends there. A "break 2" or
 # more still ends the context.
 while __aerol_next; do
-	trap '__aerol_on_int' INT
 	for __aerol_once in 1; do
 		. <(builtin printf '%s\n' "$__aerol_code")
 	done
