@@ -568,7 +568,18 @@ func e2bCreateInterpSandbox(t *testing.T, ctx context.Context) e2bInterp {
 	if created.EnvdAccessToken == "" || created.TrafficAccessToken == "" {
 		t.Fatalf("a secure E2B sandbox came back without its tokens: %s", body)
 	}
-	st, body = fcDo(t, ctx, http.MethodPost, "", "/e2b/v2/sandboxes/"+created.SandboxID+"/connect", map[string]any{"timeout": 1200}, nil)
+	// On a cluster the public address can land this call on a node that has
+	// not yet seen the brand-new sandbox's placement, which answers 404 for
+	// a moment (live: UC-712 on cluster-hetero-lite, 1 s after the create).
+	// That catch-up window is the cluster's, not the facade's, so wait it
+	// out briefly instead of failing the case.
+	for deadline := time.Now().Add(30 * time.Second); ; {
+		st, body = fcDo(t, ctx, http.MethodPost, "", "/e2b/v2/sandboxes/"+created.SandboxID+"/connect", map[string]any{"timeout": 1200}, nil)
+		if st != http.StatusNotFound || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	var connected struct {
 		SandboxID          string `json:"sandboxID"`
 		TrafficAccessToken string `json:"trafficAccessToken"`
