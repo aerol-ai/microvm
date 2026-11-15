@@ -358,6 +358,92 @@ func TestPythonIPythonDriver(t *testing.T) {
 	}
 }
 
+// TestPythonDisplayFromThreads guards the driver's frame lock: display()
+// from several threads at once interleaved the header and payload of their
+// frames, and the host, which cannot read a broken frame, killed the
+// kernel. A short switch interval makes the threads trade the GIL between
+// any two writes.
+func TestPythonDisplayFromThreads(t *testing.T) {
+	env := pythonEnv(t)
+	for _, ipython := range []string{"0", "1"} {
+		t.Run("ipython="+ipython, func(t *testing.T) {
+			if ipython == "1" && !pythonHas(t, env, "IPython") {
+				t.Skip("no IPython")
+			}
+			k, _ := launchPython(t, ipython)
+			code := `import sys, threading
+sys.setswitchinterval(1e-6)
+def show(n):
+    for i in range(200):
+        display({"thread": n, "i": i, "pad": "x" * 256})
+threads = [threading.Thread(target=show, args=(n,)) for n in range(8)]
+for th in threads: th.start()
+for th in threads: th.join()
+sys.setswitchinterval(0.005)
+print("joined")`
+			// Not mustRun: its failure message would list 1600 results.
+			out, ev := execute(t, k, code, nil)
+			if out.Status != "ok" || out.Died {
+				t.Fatalf("outcome = %+v after %d events", out, len(ev.list()))
+			}
+			if n := len(results(ev)); n != 8*200 {
+				t.Fatalf("results = %d, want %d", n, 8*200)
+			}
+			if got := ev.stream(codeinterp.EventStdout); got != "joined\n" {
+				t.Fatalf("stdout = %q", got)
+			}
+			if got := mustRun(t, k, "print('alive')", "ok").stream(codeinterp.EventStdout); got != "alive\n" {
+				t.Fatalf("next run = %q", got)
+			}
+		})
+	}
+}
+
+// TestPythonIdleThreadResultIsDropped: a thread that shows a value after
+// its run ended has no run to send it to. Its frames used to wait in the
+// event pipe and came out at the start of the next run, before its count.
+func TestPythonIdleThreadResultIsDropped(t *testing.T) {
+	k, _ := launchPython(t, "0")
+	mustRun(t, k, `import threading, time
+shown = threading.Event()
+def late():
+    time.sleep(0.3)
+    display("late")
+    shown.set()
+threading.Thread(target=late).start()`, "ok")
+	time.Sleep(time.Second)
+	ev := mustRun(t, k, "shown.is_set()", "ok")
+	if got := results(ev); !reflect.DeepEqual(got, []string{"main:True"}) {
+		t.Fatalf("results of the next run = %q, want only its own value (events %q)", got, ev.trace())
+	}
+	if got := ev.trace(); got[0] != "count:2" {
+		t.Fatalf("the next run does not start with its count: %q", got)
+	}
+}
+
+// An env the driver cannot set is the run's error; it used to escape the
+// driver's loop and end the kernel. The host checks env first
+// (codeinterp.ValidateEnv); the driver must not depend on that.
+func TestPythonBadEnvIsARunError(t *testing.T) {
+	k, _ := launchPython(t, "0")
+	mustRun(t, k, "x = 1", "ok")
+	out, ev := execute(t, k, "x + 1", map[string]string{"AAA_OK": "kept?", "BAD": "a\x00b"})
+	if out.Status != "error" || out.Died {
+		t.Fatalf("outcome = %+v (%q)", out, ev.trace())
+	}
+	if e := lastEvent(ev); e.Kind != codeinterp.EventError || e.ErrName != "ValueError" {
+		t.Fatalf("last event = %+v (%q)", e, ev.trace())
+	}
+	if got := ev.trace(); got[0] != "count:2" {
+		t.Fatalf("events = %q", got)
+	}
+	// The kernel lives on with its state, and the variable set before the
+	// failure was put back.
+	if got := mustRun(t, k, "import os\n(x, os.environ.get('AAA_OK'), os.environ.get('BAD'))", "ok").trace(); got[1] != "result:(1, None, None):true" {
+		t.Fatalf("after the failed run = %q", got)
+	}
+}
+
 // TestPythonPrintIsOneChunkPerLine guards the driver's line buffering: with
 // PYTHONUNBUFFERED, print() made two writes (text, then newline) and a client
 // could see "5" and "\n" as two chunks.
