@@ -15,7 +15,7 @@ AerolVM uses a single-maintainer model. The maintainer makes the final decision 
 | :--- | :--- | :--- |
 | Maintainer | [`sumansaurabh`](https://github.com/sumansaurabh) | Final say on direction, disputes, and releases. Approve pull requests. Publish official releases and the SDK packages. Change branch rules, Actions secrets, and security settings. Triage reports sent to [security@aerol.ai](mailto:security@aerol.ai). |
 | Code owner | [`sumansaurabh`](https://github.com/sumansaurabh), [`akanshasinha19`](https://github.com/akanshasinha19) | Review pull requests. A code owner other than the author approves a change to the default branch. |
-| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19), [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Push branches and open pull requests. Official releases stay with the maintainer. |
+| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19) | Push branches and open pull requests. Official releases stay with the maintainer. |
 | Contributor | Anyone else | Open issues and pull requests. No access to Actions secrets, branch rules, or release publishing. |
 
 Who can reach Actions secrets and release publishing is also listed under [Access to sensitive resources](README.md#access-to-sensitive-resources).

@@ -108,8 +108,18 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 		// ignored by the consumer; parity requires the same here.
 		return docker.DockerEvent{}, false
 	}
-	id, exitCode, exitedAt := decodeTaskEvent(ev)
-	if id == "" {
+	te := decodeTaskEvent(ev)
+	if te.containerID == "" {
+		return docker.DockerEvent{}, false
+	}
+	if te.execID != "" {
+		// A process exec'd into the container ended (`ctr task exec`,
+		// `nerdctl exec`, `crictl exec` on the node); the container's init,
+		// and so the sandbox, is still running. Docker reports these as
+		// exec_die, which its event filter drops. Mapping them to "die" made
+		// the service mark a running sandbox stopped, and the stop teardown
+		// removed its netrules (lifting a block-all egress policy), its route
+		// and its netstats polling while the workload kept running.
 		return docker.DockerEvent{}, false
 	}
 	// An exit is stamped with when the shim saw the process exit, not when
@@ -117,14 +127,14 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 	// late publish of the previous task's exit can come after the start of
 	// the next task (DockerEvent.Time, internal/service/run_starts.go).
 	at := ev.Timestamp
-	if !exitedAt.IsZero() {
-		at = exitedAt
+	if !te.exitedAt.IsZero() {
+		at = te.exitedAt
 	}
 	return docker.DockerEvent{
-		ContainerID: id,
-		SandboxID:   id, // enriched with sandbox_id label in StreamEvents
+		ContainerID: te.containerID,
+		SandboxID:   te.containerID, // enriched with sandbox_id label in StreamEvents
 		Action:      action,
-		ExitCode:    exitCode,
+		ExitCode:    te.exitCode,
 		Time:        at,
 	}, true
 }
@@ -138,45 +148,59 @@ func containerIDFromEvent(ev *events.Envelope) string {
 }
 
 func containerIDAndExitFromEvent(ev *events.Envelope) (string, int) {
-	id, exitCode, _ := decodeTaskEvent(ev)
-	return id, exitCode
+	te := decodeTaskEvent(ev)
+	return te.containerID, te.exitCode
 }
 
-// decodeTaskEvent decodes the payload once: the container ID, the exit
-// status, and, for a TaskExit, when the process exited (zero when the shim
-// gave none).
-func decodeTaskEvent(ev *events.Envelope) (string, int, time.Time) {
+// taskEvent is one decoded event payload.
+type taskEvent struct {
+	containerID string
+	// execID is set when the event is about a process exec'd into the
+	// container, not its init. A shim puts the process's own ID in a task
+	// event's ID: the container's ID for init (containerd-shim-runc-v2
+	// creates init with the container's ID), the exec ID for an exec. So an
+	// ID that is set and differs from ContainerID names an exec. "" for init,
+	// for a shim that leaves ID empty, and for events with no process.
+	execID   string
+	exitCode int
+	// exitedAt is when a TaskExit's process exited; zero when the shim gave
+	// none, and for every other event.
+	exitedAt time.Time
+}
+
+// decodeTaskEvent decodes the payload once.
+func decodeTaskEvent(ev *events.Envelope) taskEvent {
+	var te taskEvent
 	if ev == nil || ev.Event == nil {
-		return "", 0, time.Time{}
+		return te
 	}
 	decoded, err := typeurl.UnmarshalAny(ev.Event)
 	if err != nil {
-		return "", 0, time.Time{}
+		return te
 	}
-	id := ""
 	if g, ok := decoded.(interface{ GetContainerID() string }); ok {
-		id = g.GetContainerID()
+		te.containerID = g.GetContainerID()
 	}
 	// ContainerDelete names the container with GetID(), not GetContainerID().
-	// Order matters: task events ALSO have GetID(), where it is the EXEC id
-	// ("" for the init process), so GetContainerID must win whenever present or
-	// an exec's exit would be attributed to a container named after the exec.
-	if id == "" {
-		if g, ok := decoded.(interface{ GetID() string }); ok {
-			id = g.GetID()
+	// Order matters: task events ALSO have GetID(), the process's ID, so
+	// GetContainerID must win whenever present or an exec's event would be
+	// attributed to a container named after the exec.
+	if g, ok := decoded.(interface{ GetID() string }); ok {
+		if te.containerID == "" {
+			te.containerID = g.GetID()
+		} else if pid := g.GetID(); pid != "" && pid != te.containerID {
+			te.execID = pid
 		}
 	}
-	exitCode := 0
 	if g, ok := decoded.(interface{ GetExitStatus() uint32 }); ok {
-		exitCode = int(g.GetExitStatus())
+		te.exitCode = int(g.GetExitStatus())
 	}
-	var exitedAt time.Time
 	if exit, ok := decoded.(*apievents.TaskExit); ok {
 		if ts := exit.GetExitedAt(); ts != nil {
-			exitedAt = ts.AsTime()
+			te.exitedAt = ts.AsTime()
 		}
 	}
-	return id, exitCode, exitedAt
+	return te
 }
 
 // ContainerPID returns the init PID for a running task. "Not running here"
