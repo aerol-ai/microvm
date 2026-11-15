@@ -8,24 +8,24 @@ import (
 	"time"
 )
 
-func TestTickEmptyContainerRefDropsBaseline(t *testing.T) {
-	mfs := fstest.MapFS{
-		"100/net/dev": &fstest.MapFile{Data: []byte(sampleProcNetDev)},
-	}
-	reader := NewReaderFS(mfs)
-	lookup := &fakeLookup{pids: map[string]int{"ref": 100}}
-	lister := &fakeLister{targets: []Target{{SandboxID: "sb-1", ContainerRef: "ref"}}}
-	sink := &fakeSink{}
-	p := NewPoller(slog.Default(), reader, lookup, lister, sink, time.Second)
+// TestTickEmptyContainerRefKeepsTheReading: a sandbox with no container this
+// tick is skipped, and its stored reading is left for the next one.
+func TestTickEmptyContainerRefKeepsTheReading(t *testing.T) {
+	mfs := fstest.MapFS{"100/net/dev": netDev(9000, 5000)}
+	st := newSeenStore()
+	st.refs["sb-1"] = ""
+	st.seen["sb-1"] = Seen{PID: 100, BytesIn: 8000, BytesOut: 4000}
+	p := NewPoller(slog.Default(), NewReaderFS(mfs), &fakeLookup{pids: map[string]int{"c-1": 100}}, st, st, time.Second)
 
+	before := mapValue(pollDroppedTotal, "empty_container_ref")
 	p.tick(context.Background(), time.Unix(1000, 0))
-	if len(p.baselines) != 1 {
-		t.Fatalf("expected baseline after first tick, got %d", len(p.baselines))
+	if got := mapValue(pollDroppedTotal, "empty_container_ref") - before; got != 1 {
+		t.Fatalf("dropped empty_container_ref delta = %d, want 1", got)
 	}
 
-	lister.targets = []Target{{SandboxID: "sb-1", ContainerRef: ""}}
+	st.refs["sb-1"] = "c-1"
 	p.tick(context.Background(), time.Unix(1001, 0))
-	if len(p.baselines) != 0 {
-		t.Fatalf("expected baseline dropped on empty container ref, got %d", len(p.baselines))
+	if got := st.total("sb-1"); got != [2]int64{1000, 1000} {
+		t.Fatalf("credited %v, want 1000/1000 measured from the kept reading", got)
 	}
 }
