@@ -16,5 +16,16 @@ import (
 func TestMain(m *testing.M) {
 	nodeCheck = func(netip.AddrPort) error { return nil }
 	egresspolicy.SetNodeAddrsSource(func() ([]net.Addr, error) { return nil, nil })
-	os.Exit(m.Run())
+	// One wazero compile cache for the stream tests (stream_test.go), which
+	// compile the stdio guest on two engines per test.
+	if dir, err := os.MkdirTemp("", "aerol-wasm-stream-cache-"); err == nil {
+		streamCompileCacheDir = dir
+	}
+	code := m.Run()
+	if streamCompileCacheDir != "" {
+		_ = os.RemoveAll(streamCompileCacheDir)
+	}
+	os.Exit(code)
 }
+
+var streamCompileCacheDir string

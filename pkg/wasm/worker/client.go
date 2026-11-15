@@ -48,11 +48,41 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	conn, err := c.dialContext(ctx)
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := writeFrame(conn, env); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	reply, err := readFrame(conn)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Envelope{}, ctxErr
+		}
+		return Envelope{}, err
+	}
+	return reply, nil
+}
+
+// dialContext dials the worker, giving up when ctx ends. A nil ctx means
+// context.Background().
+func (c *Client) dialContext(ctx context.Context) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Avoid launching a dial goroutine for an already-cancelled request. Apart
 	// from unnecessary work, a custom/test dialer could otherwise outlive the
 	// call and retain resources after the caller has moved on.
 	if err := ctx.Err(); err != nil {
-		return Envelope{}, err
+		return nil, err
 	}
 	type dialResult struct {
 		conn net.Conn
@@ -76,34 +106,12 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 			}
 		}
 	}()
-	var res dialResult
 	select {
-	case res = <-ch:
+	case res := <-ch:
+		return res.conn, res.err
 	case <-ctx.Done():
-		return Envelope{}, ctx.Err()
+		return nil, ctx.Err()
 	}
-	if res.err != nil {
-		return Envelope{}, res.err
-	}
-	conn := res.conn
-	defer conn.Close()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	if err := writeFrame(conn, env); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Envelope{}, ctxErr
-		}
-		return Envelope{}, err
-	}
-	reply, err := readFrame(conn)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return Envelope{}, ctxErr
-		}
-		return Envelope{}, err
-	}
-	return reply, nil
 }
 
 func (c *Client) expectOK(reply Envelope) error {

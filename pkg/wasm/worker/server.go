@@ -22,13 +22,21 @@ type Server struct {
 	net           *NetMediator
 	auditMu       sync.RWMutex
 	auditBindings map[string]egressAuditBinding
-	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick drains them.
+	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick
+	// drains them. netMu guards the map: connections are served
+	// concurrently, and a stream adds bytes while other messages run.
+	netMu     sync.Mutex
 	workerNet map[string]*workerNetUsage
 	// holder is the sandbox whose instance this worker holds, set by the
 	// first Instantiate or Restore that names one and kept for the process's
 	// life (refuseForeign). Atomic, not under mu: every message reads it,
 	// and mu is held across module compiles and checkpoints.
 	holder atomic.Pointer[string]
+	// modulePath and moduleMemoryMB record the last MsgLoadModule, so a
+	// stream that names no module runs the sandbox's own (guarded by mu).
+	modulePath     string
+	moduleMemoryMB int
+	streams        streamRegistry
 }
 
 // errForeignSandbox refuses a message for another sandbox than the one
@@ -80,6 +88,8 @@ type workerNetUsage struct {
 }
 
 func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
 	if s.workerNet == nil {
 		s.workerNet = make(map[string]*workerNetUsage)
 	}
@@ -100,12 +110,33 @@ func (s *Server) mediator() *NetMediator {
 	return s.net
 }
 
-// close stops the mediator's operator-file poll with the worker.
+// close stops the mediator's operator-file poll and every stream with the worker.
 func (s *Server) close() {
+	s.streams.closeAll()
 	s.mu.Lock()
 	m := s.net
 	s.mu.Unlock()
 	m.stopOperatorWatch()
+}
+
+// serverStreamHost adapts Server to the shared stream code, taking s.mu for
+// the lazily built mediator and the loaded module.
+type serverStreamHost struct{ s *Server }
+
+func (h serverStreamHost) mediator() *NetMediator {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.mediator()
+}
+
+func (h serverStreamHost) streamUsage(sandboxID string) *workerNetUsage {
+	return h.s.netUsageFor(sandboxID)
+}
+
+func (h serverStreamHost) ownModule() (string, int) {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.modulePath, h.s.moduleMemoryMB
 }
 
 func (s *Server) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
@@ -263,11 +294,15 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			// A new module replaces the sandbox's code: its runs of the old
+			// code end with it.
+			s.streams.killSandbox(env.SandboxID)
 			s.mu.Lock()
 			if s.eng != nil {
 				_ = s.eng.Close(ctx)
 				s.eng = nil
 			}
+			s.modulePath = ""
 			newEngStart := time.Now()
 			s.eng, err = wasmengine.NewEngineFor(ctx, workerEngineName())
 			newEngDur := time.Since(newEngStart)
@@ -286,6 +321,9 @@ func (s *Server) Serve(conn net.Conn) error {
 				timings = r.LastLoadTimings()
 			}
 			timings.NewEngine = newEngDur
+			if err == nil {
+				s.modulePath, s.moduleMemoryMB = p.Path, p.MemoryMB
+			}
 			s.mu.Unlock()
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
@@ -433,6 +471,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				return err
 			}
 		case MsgStopInstance:
+			s.streams.killSandbox(env.SandboxID)
 			s.mu.Lock()
 			if s.eng != nil {
 				err = s.eng.StopInstance(ctx)
@@ -701,6 +740,13 @@ func (s *Server) Serve(conn net.Conn) error {
 				return encErr
 			}
 			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: sandboxID, Payload: body}); err != nil {
+				return err
+			}
+		case MsgExecStart:
+			// The connection now belongs to the run; it closes when the run ends.
+			return s.streams.serve(serverStreamHost{s: s}, conn, env)
+		case MsgExecKill:
+			if err := s.streams.serveExecKill(conn, env); err != nil {
 				return err
 			}
 		default:
