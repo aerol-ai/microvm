@@ -193,7 +193,7 @@ Each context is a copy of the Python module that stays open in the sandbox's Web
 
 - **Contexts start in `/work`**, for E2B too (E2B's own default is `/home/user`).
 - **A timeout or an interrupt resets the context.** WebAssembly has no way to interrupt running code, so the sandbox stops the whole interpreter. The context stays, but its next run starts with no variables.
-- **At most 4 contexts** per sandbox. Each context whose interpreter is open counts toward the 8 streamed commands and code runs above.
+- **At most 4 contexts** per sandbox. Each context whose interpreter is open counts toward the 4 streamed commands and code runs above.
 - **Idle contexts stop after 15 minutes** without a run, which frees their memory. The context stays and starts fresh on its next run.
 - **Only Python's standard library.** No IPython, so no `%magics` or `!ls`; no pandas or matplotlib.
 - **`time.sleep` does not work yet.** It fails with `OSError: [Errno 58] Not supported`, because the WebAssembly engine cannot yet wait until a set time. Code that sleeps needs a container or VM sandbox for now.
