@@ -199,10 +199,9 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 		}
 	}()
 
-	var writeMu sync.Mutex
+	// Only this goroutine writes frames; the pinger's WriteControl is safe
+	// alongside it.
 	write := func(prefix byte, data []byte) error {
-		writeMu.Lock()
-		defer writeMu.Unlock()
 		return conn.WriteMessage(websocket.BinaryMessage, append([]byte{prefix}, data...))
 	}
 	for {
@@ -212,9 +211,7 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 			if ctx.Err() != nil {
 				msg = "the sandbox stopped"
 			}
-			writeMu.Lock()
 			writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: msg})
-			writeMu.Unlock()
 			return
 		}
 		if ev.Exit != nil {
@@ -228,9 +225,7 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 				// own; say what happened before the exit.
 				_ = write(toolboxwire.FramePrefixStderr, []byte(ev.Exit.Error+"\n"))
 			}
-			writeMu.Lock()
 			writeStreamControl(conn, out)
-			writeMu.Unlock()
 			return
 		}
 		if len(ev.Stdout) > 0 {
