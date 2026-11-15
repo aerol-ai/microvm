@@ -457,6 +457,125 @@ func TestLeaseStopsAnUnfenceableRecreateWhenItRunsOut(t *testing.T) {
 	}
 }
 
+// stopErrRuntime is a runtime whose stop fails.
+type stopErrRuntime struct {
+	*fakeCapacityRuntime
+	err error
+}
+
+func (r *stopErrRuntime) Stop(context.Context, string) error { return r.err }
+
+// The fence's stop is tried again while it fails; a sandbox that cannot be
+// frozen where it runs (ErrCannotFreeze, a VM with no group of its own) is
+// stopped the same way on a node that writes the lease file; a sandbox not
+// running is not stopped.
+func TestStopUnfenceableEdges(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	bad := &stopErrRuntime{fakeCapacityRuntime: &fakeCapacityRuntime{}, err: errors.New("host process gone")}
+	svc.SetWasmRuntime(bad)
+	svc.AttachCluster(newSpecLeaseCluster(lc))
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	seedRuntimeRow(t, st, "wasm", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	t0 := time.Unix(70_000, 0)
+	svc.beginOwnershipLease(t0)
+	lc.down()
+	svc.enforceOwnershipLease(ctx, t0.Add(16*time.Second))
+	if got, _ := st.Get(ctx, "wasm"); got.Status != models.SandboxStatusStarted {
+		t.Fatalf("a failed stop left status %s", got.Status)
+	}
+	if !strings.Contains(logs.String(), "could not stop a sandbox the ownership lease no longer covers") {
+		t.Fatalf("no warning: %s", logs.String())
+	}
+	bad.err = nil
+	svc.enforceOwnershipLease(ctx, t0.Add(17*time.Second))
+	if got, _ := st.Get(ctx, "wasm"); got.Status != models.SandboxStatusStopped {
+		t.Fatalf("the stop was not tried again: %s", got.Status)
+	}
+	if svc.stopUnfenceable(ctx, &models.Sandbox{ID: "x", Status: models.SandboxStatusStopped}) {
+		t.Fatal("stopped a sandbox that was not running")
+	}
+
+	rt := newFreezeRuntime()
+	rt.freezeErr = fmt.Errorf("vm has no group of its own: %w", runtime.ErrCannotFreeze)
+	svc2, st2, lc2 := newLeaseService(t, rt)
+	svc2.AttachCluster(newSpecLeaseCluster(lc2))
+	svc2.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	seedLeaseRow(t, st2, "ctr", true, models.SandboxStatusStarted)
+	svc2.beginOwnershipLease(t0)
+	lc2.down()
+	svc2.enforceOwnershipLease(ctx, t0.Add(16*time.Second))
+	got, _ := st2.Get(ctx, "ctr")
+	if got.Status != models.SandboxStatusStopped || got.StatusReason != statusReasonOwnershipLeaseExpired {
+		t.Fatalf("status %s reason %q, want stopped %q", got.Status, got.StatusReason, statusReasonOwnershipLeaseExpired)
+	}
+}
+
+// The pass's edges: nothing to do without the lease file or without a
+// sandbox it cannot freeze; a row gone, changed, or placed as another
+// node's orphan by the time the lock is held is left alone; a cancelled
+// pass changes nothing.
+func TestDisarmUnfencedRecreateEdges(t *testing.T) {
+	ctx := context.Background()
+	svc, st, lc := newLeaseService(t, newFreezeRuntime())
+	svc.SetWasmRuntime(&fakeCapacityRuntime{})
+	sc := newSpecLeaseCluster(lc)
+	svc.AttachCluster(sc)
+	seedRuntimeRow(t, st, "wasm", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	if !svc.disarmUnfencedRecreate(ctx) {
+		t.Fatal("without the lease file there is nothing to do")
+	}
+	svc.cfg.OwnershipLeaseFile = filepath.Join(t.TempDir(), "lease")
+	if err := st.Delete(ctx, "wasm"); err != nil {
+		t.Fatal(err)
+	}
+	seedLeaseRow(t, st, "ctr", true, models.SandboxStatusStarted)
+	if !svc.disarmUnfencedRecreate(ctx) {
+		t.Fatal("only freezable sandboxes: nothing to do")
+	}
+
+	self := "worker-a"
+	if err := svc.disarmRecreate(ctx, sc, "gone", cluster.Placement{}, false, self); err != nil {
+		t.Fatalf("a row gone: %v", err)
+	}
+	if err := svc.disarmRecreate(ctx, sc, "ctr", cluster.Placement{}, false, self); err != nil {
+		t.Fatalf("a freezable row: %v", err)
+	}
+	if got, _ := st.Get(ctx, "ctr"); got.Failover == nil || !got.Failover.ShouldRecreate() {
+		t.Fatal("a freezable row lost its policy")
+	}
+	seedRuntimeRow(t, st, "wasm-2", models.RuntimeWasm, models.SandboxStatusStarted, true)
+	orphan := cluster.Placement{SandboxID: "wasm-2", IncarnationID: "inc-wasm-2", OrphanedOwnerNodeID: "worker-b"}
+	if err := svc.disarmRecreate(ctx, sc, "wasm-2", orphan, true, self); err != nil {
+		t.Fatalf("another node's orphan: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := svc.disarmRecreate(cancelled, sc, "wasm-2", cluster.Placement{}, false, self); err == nil {
+		t.Fatal("a cancelled pass took the lock")
+	}
+	if got, _ := st.Get(ctx, "wasm-2"); got.Failover == nil || !got.Failover.ShouldRecreate() {
+		t.Fatal("the row changed")
+	}
+	if err := svc.writeFailoverNoneSpec(cancelled, sc, "wasm-2"); err == nil {
+		t.Fatal("a cancelled spec write took the spec lock")
+	}
+	if svc.disarmUnfencedRecreate(cancelled) {
+		t.Fatal("a cancelled pass reported nothing left to do")
+	}
+
+	// The check itself: no policy, no row, a runtime this node lacks.
+	if svc.unfenceableRecreate(nil) || svc.unfenceableRecreate(&models.Sandbox{Runtime: models.RuntimeWasm}) {
+		t.Fatal("a sandbox without the recreate policy counted")
+	}
+	svc.firecracker = nil
+	if err := svc.recreateFenceReady(&models.Sandbox{ID: "fc", Runtime: models.RuntimeFirecracker, Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}}); err != nil {
+		t.Fatalf("no Firecracker driver: %v", err)
+	}
+}
+
 // fenceCheckRuntime is a Firecracker driver's stand-in that reports where
 // each VM runs (runtime.FenceChecker): err for every VM.
 type fenceCheckRuntime struct {
