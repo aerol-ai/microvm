@@ -14,3 +14,17 @@ import Default from '@astrojs/starlight/components/Head.astro'
   if (document.readyState === 'complete') smoothScroll()
   else addEventListener('load', smoothScroll, { once: true })
 </script>
+
+<script>
+  // Amplitude analytics. A browser API key is public by design: every reader's
+  // browser sees it. Only the live site reports (its host is `site` in
+  // astro.config.mjs), so `astro dev`, local previews, Cloudflare's PR
+  // previews (*.workers.dev) and forks never add to the numbers.
+  // The SDK is a separate chunk loaded after the page, off the first paint.
+  // autocapture: true matches Amplitude's own install snippet; the dashboard's
+  // remote config can turn parts of it off without a rebuild.
+  const AMPLITUDE_API_KEY = '2d6ec3cc2ad83a947ee7ea16e4f52233'
+  if (import.meta.env.PROD && location.hostname === new URL(import.meta.env.SITE).hostname) {
+    import('@amplitude/analytics-browser').then(({ init }) => init(AMPLITUDE_API_KEY, { autocapture: true }))
+  }
+</script>
