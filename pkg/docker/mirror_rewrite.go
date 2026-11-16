@@ -135,10 +135,13 @@ func RewriteImageRefForMirror(ref string, cfg MirrorConfig) MirrorRewrite {
 
 	mirrorRepo := "aocr/" + short + "/" + repoOnly
 	rewrittenRef := mirrorHost + "/" + mirrorRepo
-	if tag != "" {
-		rewrittenRef += ":" + tag
-	} else if digest != "" {
+	// The digest wins over a tag beside it, as in any pull by digest:
+	// pulling the tag instead would start whatever it points at now, not
+	// the content the caller pinned.
+	if digest != "" {
 		rewrittenRef += "@" + digest
+	} else if tag != "" {
+		rewrittenRef += ":" + tag
 	}
 
 	return MirrorRewrite{

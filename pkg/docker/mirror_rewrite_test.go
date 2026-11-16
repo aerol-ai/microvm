@@ -209,3 +209,14 @@ func TestSplitRepoRefTag(t *testing.T) {
 		}
 	}
 }
+
+// A tag beside a digest decides nothing: the mirror pulls the digest, as
+// dockerd does for the same name without a mirror. Pulling the tag would
+// start whatever it points at now, not the content the caller pinned.
+func TestRewriteImageRefForMirror_TagAndDigestPullsTheDigest(t *testing.T) {
+	digest := "sha256:aabbccdd"
+	r := RewriteImageRefForMirror("ghcr.io/acme/app:1.4@"+digest, defaultMirrorCfg())
+	if want := "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest; !r.Rewritten || r.RewrittenRef != want {
+		t.Fatalf("rewrite = %+v, want %s", r, want)
+	}
+}
