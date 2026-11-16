@@ -139,3 +139,35 @@ func TestTypeScriptDriver(t *testing.T) {
 		t.Fatalf("type syntax error = %+v", e)
 	}
 }
+
+// Node's warm-up warnings (the vm loader constant, and stripTypeScriptTypes
+// for TypeScript) must never reach stderr. The host drops output printed
+// before READY only if its pipe reader has read it by then; on a busy host
+// the reader can lag, and the warning landed in the first run's stderr
+// (TestLanguageDrivers on main, 2 of 5 runs). With nothing printed there is
+// nothing to race. What an idle kernel read from stderr is in its tail.
+func TestNodeDriversPrintNoWarmUpWarnings(t *testing.T) {
+	for _, lang := range []string{codeinterp.LangJavaScript, codeinterp.LangTypeScript} {
+		t.Run(lang, func(t *testing.T) {
+			k, _ := launchLang(t, lang)
+			// The driver flushed its warm-up before READY; give the pipe
+			// reader time to take whatever it printed.
+			time.Sleep(300 * time.Millisecond)
+			k.mu.Lock()
+			tail := string(k.tail)
+			k.mu.Unlock()
+			if strings.Contains(tail, "Warning") {
+				t.Fatalf("driver printed before READY: %q", tail)
+			}
+			// The first run's stderr stays empty too.
+			if got := mustRun(t, k, "1", "ok").stream(codeinterp.EventStderr); got != "" {
+				t.Fatalf("first run stderr = %q", got)
+			}
+			// Node's printer is back for the user's own warnings.
+			got := mustRun(t, k, "process.emitWarning('from the cell')\nawait new Promise((r) => setImmediate(r))", "ok").stream(codeinterp.EventStderr)
+			if !strings.Contains(got, "Warning: from the cell") {
+				t.Fatalf("user warning stderr = %q", got)
+			}
+		})
+	}
+}
