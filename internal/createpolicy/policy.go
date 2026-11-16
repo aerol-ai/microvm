@@ -126,7 +126,7 @@ func Parse(raw []byte) (*Policy, error) {
 			if pat == "" || strings.ContainsAny(pat, " \t\r\n") {
 				return nil, fmt.Errorf("create policy file: images.allowed: %q is not an image pattern", pat)
 			}
-			p.patterns = append(p.patterns, pat)
+			p.patterns = append(p.patterns, untagDigestPattern(pat))
 		}
 	}
 	if f.Runtimes != nil {
@@ -306,6 +306,30 @@ func (p *Policy) CheckImage(image string, localOnly, imageID bool) error {
 		}
 	}
 	return deny(RuleImages, "image %q is not on this server's list of allowed images", full)
+}
+
+// untagDigestPattern reads an exact pinned image written with its tag
+// ("python:3.12@sha256:...") without the tag, the way CheckImage reads the
+// image. Kept as written, it could never match: the one image it names is
+// judged as "python@sha256:...". A pattern with a "*" is left alone; its
+// author chose what it spans.
+func untagDigestPattern(pat string) string {
+	if strings.Contains(pat, "*") {
+		return pat
+	}
+	named, err := reference.ParseNormalizedNamed(pat)
+	if err != nil {
+		return pat
+	}
+	pinned, digested := named.(reference.Digested)
+	if _, tagged := named.(reference.Tagged); !digested || !tagged {
+		return pat
+	}
+	untagged, err := reference.WithDigest(reference.TrimNamed(named), pinned.Digest())
+	if err != nil {
+		return pat
+	}
+	return reference.FamiliarString(untagged)
 }
 
 func deny(rule, format string, args ...any) error {
