@@ -5,7 +5,7 @@
 # machine.
 #
 #   AEROL_K8S_MODE=cluster AEROL_KIND_CLUSTER=aerolvm-drills AEROL_K8S_EDGE=1 \
-#     HELM=<helm 3.8 or later> scripts/k8s-dev.sh
+#     AEROL_K8S_IDENTITY=1 HELM=<helm 3.8 or later> scripts/k8s-dev.sh
 #   KUBECTL_CONTEXT=kind-aerolvm-drills HELM=<helm> \
 #     integration-tests/k8s/drills-local.sh <state-dir> setup static pull-storm slo-breach
 #   integration-tests/k8s/drills-local.sh <state-dir> teardown
@@ -17,7 +17,8 @@
 #               kube-prometheus-stack (pinned) with Alertmanager routed as
 #               setup/alertmanager/sandboxd-alertmanager-example.yml says, to
 #               an echo receiver; the bank-like values (drills-local/
-#               values-bank-kind.yaml) over the install; the sandboxd alerts
+#               values-bank-kind.yaml) over the install, with a viewer token
+#               on every team as Prometheus's scrape token; the sandboxd alerts
 #               (setup/prometheus/sandboxd-alerts.yml, which the chart does
 #               not ship) as a PrometheusRule; a client pod; and in each
 #               worker pod a forwarder, so the pod pulls from localhost:5000
@@ -318,6 +319,23 @@ YAML
   { printf 'apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n  name: sandboxd-alerts\n  namespace: monitoring\n  labels: { release: kube-prometheus-stack }\nspec:\n'
     sed 's/^/  /' "$ROOT/setup/prometheus/sandboxd-alerts.yml"; } | kc apply -f - >/dev/null
 
+  # The scrape token is a viewer token, which a node without API tokens
+  # refuses. A pod reads identity.enabled when it is made, so the install
+  # must have set it (AEROL_K8S_IDENTITY=1); the upgrade below reaches only
+  # pods made after it.
+  local missing="" spec nsx comp pod
+  for spec in "$ns server" "$ns gateway" "$workers worker"; do
+    read -r nsx comp <<<"$spec"
+    for pod in $(kc -n "$nsx" get pods -l "app.kubernetes.io/component=$comp" -o jsonpath='{.items[*].metadata.name}'); do
+      [[ "$(kc -n "$nsx" get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_IDENTITY_ENABLED")].value}')" == true ]] ||
+        missing="$missing $pod"
+    done
+  done
+  if [[ -n "$missing" ]]; then
+    result FAIL setup "API tokens are off on$missing: install with AEROL_K8S_IDENTITY=1 (a pod reads identity.enabled when it is made)"
+    return 1
+  fi
+
   # The bank-like values, and the registry's address let out of the worker
   # pods, as a bank adds its own registry's range.
   hm upgrade "$release" "$ROOT/charts/aerolvm" -n "$ns" --reuse-values -f "$L/values-bank-kind.yaml" \
@@ -356,6 +374,20 @@ spec:
     - { name: work, emptyDir: {} }
 YAML
   kc -n drills wait --for=condition=Ready pod/drills-client --timeout=180s >/dev/null
+  # Prometheus's scrape token, as values-bank-eks.yaml asks: a viewer on
+  # every team, made with the admin token, in the Secret
+  # values-bank-kind.yaml names. A new one each setup: names are unique.
+  local made
+  made="$(api POST /v1/tokens "{\"name\": \"prometheus-drills-$(date +%s)\", \"role\": \"viewer\", \"team\": \"*\", \"expires_in\": \"30d\"}")"
+  if [[ "$(jf "$made" 'd["code"], (d["body"] or {}).get("role"), (d["body"] or {}).get("team")')" != "201 viewer *" ]]; then
+    result FAIL setup "making the viewer scrape token: $(jf "$made" 'd["code"], (d["body"] or {}).get("error")')"
+    return 1
+  fi
+  # No newline: Prometheus sends the Secret's bytes as they are, and one
+  # fails every scrape (invalid header field value for "Authorization").
+  ( umask 077; jf "$made" 'd["body"]["token"]' | tr -d '\n' > "$sd/scrape-token" )
+  kc -n "$ns" create secret generic aerolvm-metrics-token --from-file=token="$sd/scrape-token" \
+    --dry-run=client -o yaml | kc apply -f - >/dev/null
   forwarders
   keep_forward monitoring svc/kube-prometheus-stack-prometheus "$prom_port" 9090 /-/healthy
   local want up _
@@ -371,7 +403,7 @@ print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"
   local code
   code="$(smoke)"
   if [[ "$up" -ge "$want" && "$code" == 201 ]]; then
-    result PASS setup "registry at $pip behind the fault proxy; $up of $want AerolVM pods scraped; a create from localhost:5000 answered $code"
+    result PASS setup "registry at $pip behind the fault proxy; $up of $want AerolVM pods scraped with a viewer token on every team; a create from localhost:5000 answered $code"
   else
     result FAIL setup "$up of $want AerolVM pods scraped (a refused ServiceMonitor shows in the Prometheus Operator's log); smoke create answered $code"
   fi

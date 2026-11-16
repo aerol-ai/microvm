@@ -15,6 +15,9 @@
 #                                  # the same in external-CA mode (C23): every
 #                                  # node's certificate from a cert-manager CA
 #                                  # issuer that stands in for a bank's
+#   AEROL_K8S_IDENTITY=1 ...       # with API tokens on every node
+#                                  # (identity.enabled): a pod reads it when
+#                                  # it is made, so set it at the install
 #
 # Needs Docker, kind, kubectl and Helm 3.8 or later (HELM names another).
 # sandboxd links glibc, so it is compiled in a golang container; toolboxd, the
@@ -31,6 +34,8 @@ case "$mode" in
 esac
 edge="${AEROL_K8S_EDGE:-0}"
 external_ca="${AEROL_K8S_EXTERNAL_CA:-0}"
+identity_flags=()
+[[ "${AEROL_K8S_IDENTITY:-0}" == 1 ]] && identity_flags=(--set identity.enabled=true)
 # The images' tag, and in cluster mode the version sandboxd reports: an
 # AerolCluster's version is a release tag, and the operator upgrades any
 # node that reports another (AEROL_K8S_VERSION=v0.0.0-dev.2 builds a
@@ -191,7 +196,7 @@ VALUES
   kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null
   "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
     -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never \
-    ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"}
+    ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"}
   # The operator replaces nothing a new image changes on its own: restart it
   # so a rebuilt operator runs.
   kubectl --context "kind-$cluster" -n "$namespace" rollout restart deployment/aerolvm-operator >/dev/null
@@ -217,7 +222,7 @@ kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kube
 existing=0
 kubectl --context "kind-$cluster" -n "$namespace" get pod aerolvm-0 >/dev/null 2>&1 && existing=1
 "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
-  --set image.tag=dev --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"}
+  --set image.tag=dev --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"}
 if [[ "$existing" == 1 ]]; then
   kubectl --context "kind-$cluster" -n "$namespace" delete pod aerolvm-0 --wait=true --timeout=2m >/dev/null
 fi
