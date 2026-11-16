@@ -117,6 +117,15 @@ func TestCheckCreatePerRule(t *testing.T) {
 func TestCheckImageRules(t *testing.T) {
 	registriesOnly := mustParse(t, "version: 1\nimages:\n  allowed_registries: [docker.io]\n")
 	patternsOnly := mustParse(t, "version: 1\nimages:\n  allowed: [\"ghcr.io/acme/*\"]\n")
+	tagPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python:3.12*\"]\n")
+	pinnedDigest := "sha256:" + strings.Repeat("b", 64)
+	digestPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python@"+pinnedDigest+"\"]\n")
+	// The common way to write one exact image. The image is judged without
+	// its tag, so the pattern is read without it too, or it could never
+	// match the one image it names.
+	taggedDigestPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python:3.12@"+pinnedDigest+"\", \"ghcr.io/acme/app:1@"+pinnedDigest+"\"]\n")
+	// A "*" pattern is the author's own span, read as written.
+	globDigestPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python:3.12*@sha256:*\"]\n")
 	cases := []struct {
 		name      string
 		p         *Policy
@@ -131,6 +140,21 @@ func TestCheckImageRules(t *testing.T) {
 		{"pattern matches nested path", patternsOnly, "ghcr.io/acme/team/app:1", true, true},
 		{"pattern is anchored", patternsOnly, "evil.io/ghcr.io/acme/app", false, false},
 		{"hub image refused without a rule", patternsOnly, "python:3.12", false, false},
+		{"tag pattern passes its tag", tagPattern, "python:3.12-slim", false, true},
+		// The pull goes by the digest and ignores the tag, so the tag must
+		// not vouch for whatever manifest the digest names.
+		{"tag pattern does not vouch for a digest", tagPattern, "python:3.12@" + pinnedDigest, false, false},
+		{"tag pattern refuses a bare digest", tagPattern, "python@" + pinnedDigest, false, false},
+		{"digest pattern passes that digest", digestPattern, "python@" + pinnedDigest, false, true},
+		{"digest pattern passes it with a decorative tag", digestPattern, "python:3.12@" + pinnedDigest, false, true},
+		{"digest pattern refuses another digest", digestPattern, "python@sha256:" + strings.Repeat("c", 64), false, false},
+		{"registry rule passes a tagged digest", registriesOnly, "python:3.12@" + pinnedDigest, false, true},
+		{"tagged digest pattern passes its image", taggedDigestPattern, "python:3.12@" + pinnedDigest, false, true},
+		{"tagged digest pattern passes it untagged", taggedDigestPattern, "docker.io/library/python@" + pinnedDigest, false, true},
+		{"tagged digest pattern passes another tag on that digest", taggedDigestPattern, "python:3.13@" + pinnedDigest, false, true},
+		{"tagged digest pattern with a registry passes its image", taggedDigestPattern, "ghcr.io/acme/app@" + pinnedDigest, false, true},
+		{"tagged digest pattern refuses another digest", taggedDigestPattern, "python:3.12@sha256:" + strings.Repeat("c", 64), false, false},
+		{"glob pattern with a tag never vouches for a digest", globDigestPattern, "python:3.12@" + pinnedDigest, false, false},
 	}
 	for _, tc := range cases {
 		err := tc.p.CheckImage(tc.image, tc.localOnly, false)

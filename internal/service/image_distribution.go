@@ -288,7 +288,9 @@ func (s *Service) HoldsSnapshotNamed(ctx context.Context, name string) (bool, er
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
 // create request's image-distribution metadata before placement decisions are
 // made. The method is intentionally side-effect free: it does not pull, push,
-// or verify image contents. Its result is a fixed point: a request it has
+// or verify image contents; an image_digest is enforced by naming it in the
+// image (pinImageDigest), so the runtime's pull checks it. Its result is a
+// fixed point: a request it has
 // already resolved resolves to itself, so callers that run it twice get the
 // same answer and the same authorization.
 func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *models.CreateSandboxRequest) error {
@@ -296,6 +298,9 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		return nil
 	}
 	req.Image = strings.TrimSpace(req.Image)
+	// fromRegistry: a node without the snapshot starts its pushed
+	// registry copy, so the image is resolved here, not replayed.
+	fromRegistry := false
 
 	if s != nil && s.store != nil && req.Image != "" {
 		owner, scoped := ownerScope(ctx)
@@ -312,7 +317,6 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		var err error
 		dist := req.ImageDistribution()
 		pushed := dist.Mode == models.ImageDistributionAOCR && dist.RegistryRef != ""
-		fromRegistry := false
 		switch {
 		case docker.IsSnapshotImageRef(req.Image):
 			// A snapshot's committed image, named by its tag. The tag
@@ -433,6 +437,29 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		return err
 	}
 	req.ApplyImageDistribution(normalized)
+	// A failover recreate starts the image its first create stored. A spec
+	// stored since digests were enforced already names its digest, so a
+	// replay has nothing to pin; one stored before carries a caller's
+	// digest nothing ever checked (an image id, another platform's
+	// manifest), and pinning it now would fail the pull and lose a sandbox
+	// that ran fine. The one image a replay resolves itself is a pushed
+	// snapshot's registry copy, and its digest is the one AerolVM pushed
+	// it under, so that copy is pinned.
+	if isStoredSpecReplay(ctx) && !fromRegistry {
+		return nil
+	}
+	// Last, so the registry ref above keeps the caller's tagged name and
+	// the image the runtime pulls is the one the digest names.
+	if err := pinImageDigest(req); err != nil {
+		if !isStoredSpecReplay(ctx) {
+			return err
+		}
+		// An intake rule: a replay is never refused for a digest that
+		// cannot hold; the copy starts as the first create started it.
+		if s != nil && s.logger != nil {
+			s.logger.Warn("failover recreate: image_digest not applied", "image", req.Image, "error", err)
+		}
+	}
 	return nil
 }
 

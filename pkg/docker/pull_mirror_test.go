@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -348,3 +350,144 @@ func key32DockerTest(b byte) []byte {
 	return out
 }
 func b64DockerTest(k []byte) string { return base64.StdEncoding.EncodeToString(k) }
+
+// A create pinned to a digest on a node with the AOCR mirror (#83). dockerd
+// stores a pull under the name it was pulled by and refuses to tag a digest
+// name, and it finds repo@digest only under the repository it was pulled
+// from (checked against dockerd 20.10). So the mirror pull of
+// ghcr.io/acme/app@sha256:... lands as mirror.../app@sha256:... only, and
+// Create must inspect and start it by that name, or it 404s after a pull
+// that worked.
+func TestCreatePinnedImageThroughTheMirrorStartsTheMirrorName(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, tc := range []struct {
+		name, image, pulled, started string
+	}{
+		{"tag", "ghcr.io/acme/app:1", "mirror.aocr.aerol.ai/aocr/ghcr/acme/app:1", "ghcr.io/acme/app:1"},
+		{"digest", "ghcr.io/acme/app@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest},
+		// The digest decides, not the tag beside it.
+		{"tag and digest", "ghcr.io/acme/app:1@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest},
+		// Not rewritten: pulled and found by its own name.
+		{"hub digest", "python@" + digest, "python@" + digest, "python@" + digest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			local := map[string]bool{}
+			var pulled []string
+			started := ""
+			base := &fakeDaemon{t: t,
+				create: func() *http.Response { return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid"}) },
+				start:  func() *http.Response { return textResponse(http.StatusNoContent, "") },
+			}
+			inner := base.transport()
+			c := newCreateClient(t, base, true, nil)
+			rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				p := r.URL.Path
+				switch {
+				case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/") && strings.HasSuffix(p, "/json"):
+					// dockerd looks a name up exactly as it was stored.
+					name := strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")
+					if local[name] {
+						return jsonResponse(http.StatusOK, map[string]any{"Config": map[string]any{}}), nil
+					}
+					return textResponse(http.StatusNotFound, "no such image: "+name), nil
+				case r.Method == http.MethodPost && p == "/images/create":
+					from := r.URL.Query().Get("fromImage")
+					pulled = append(pulled, from)
+					local[from] = true
+					return textResponse(http.StatusOK, `{"status":"done"}`), nil
+				case r.Method == http.MethodPost && strings.HasSuffix(p, "/tag"):
+					q := r.URL.Query()
+					if strings.Contains(q.Get("tag"), ":") {
+						return textResponse(http.StatusBadRequest, "refusing to create a tag with a digest reference"), nil
+					}
+					local[q.Get("repo")+":"+q.Get("tag")] = true
+					return textResponse(http.StatusCreated, ""), nil
+				case r.Method == http.MethodPost && p == "/containers/create":
+					body, _ := io.ReadAll(r.Body)
+					var spec struct{ Image string }
+					_ = json.Unmarshal(body, &spec)
+					started = spec.Image
+					r.Body = io.NopCloser(strings.NewReader(string(body)))
+				}
+				return inner(r)
+			})
+			c.httpClient = &http.Client{Transport: rt}
+			c.streamClient = &http.Client{Transport: rt}
+			c.ConfigureMirror(defaultMirrorCfg(), nil)
+
+			if _, err := c.Create(context.Background(), models.CreateSandboxRequest{Image: tc.image}, "sb-1", "tok", nil); err != nil {
+				t.Fatalf("Create(%q) = %v; images on the node: %v", tc.image, err, local)
+			}
+			if len(pulled) != 1 || pulled[0] != tc.pulled {
+				t.Fatalf("pulled %v, want [%s]", pulled, tc.pulled)
+			}
+			if started != tc.started {
+				t.Fatalf("container image = %q, want %q", started, tc.started)
+			}
+		})
+	}
+}
+
+// The warm pool parks for a key a cold miss registered, so a pinned create
+// through the mirror makes it park "ghcr.io/acme/app@sha256:...". The
+// parked container must name the image as dockerd stores it, or every
+// refill fails with "No such image" until the target is evicted.
+func TestParkPinnedImageThroughTheMirrorUsesTheMirrorName(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pinned := "ghcr.io/acme/app@" + digest
+	mirrorName := "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest
+	d := &poolFakeDaemon{t: t}
+	d.create = func() *http.Response {
+		var req struct{ Image string }
+		_ = json.Unmarshal(d.createBodies[len(d.createBodies)-1], &req)
+		if req.Image != mirrorName {
+			return textResponse(http.StatusNotFound, `{"message":"No such image: `+req.Image+`"}`)
+		}
+		return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid-park"})
+	}
+	c := newPoolClient(t, d, func(c *Client) { c.readyDir = coverageReadyDir(t) })
+	c.logger = slog.Default()
+	c.ConfigureMirror(defaultMirrorCfg(), nil)
+	_, _ = c.parkContainer(context.Background(), "park-1", dockerpool.Key{Image: pinned, Runtime: models.RuntimeDocker})
+	if len(d.createBodies) == 0 {
+		t.Fatal("parkContainer never created a container")
+	}
+	var req struct{ Image string }
+	_ = json.Unmarshal(d.createBodies[0], &req)
+	if req.Image != mirrorName {
+		t.Fatalf("parked container image = %q, want %q", req.Image, mirrorName)
+	}
+}
+
+// Image GC removes the image a sandbox row names. A digest pulled through
+// the mirror is stored under its mirror name only, so the delete must name
+// that: the caller's name 404s, RemoveImage reads it as already gone, the
+// ledger row is dropped and the image stays on disk.
+func TestRemovePinnedImageThroughTheMirrorDeletesTheMirrorName(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, tc := range []struct{ image, deleted string }{
+		{"ghcr.io/acme/app@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest},
+		// A tag keeps its own name: aliasMirrorPull tagged it.
+		{"ghcr.io/acme/app:1", "ghcr.io/acme/app:1"},
+	} {
+		var deleted string
+		rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodDelete {
+				deleted = strings.TrimPrefix(r.URL.Path, "/images/")
+				return jsonResponse(http.StatusOK, []map[string]string{}), nil
+			}
+			return textResponse(http.StatusNotFound, ""), nil
+		})
+		c := &Client{logger: slog.Default(), httpClient: &http.Client{Transport: rt}, imageIDs: newImageIDCache(0)}
+		c.ConfigureMirror(defaultMirrorCfg(), nil)
+		if err := c.RemoveImage(context.Background(), tc.image); err != nil {
+			t.Fatalf("RemoveImage(%q): %v", tc.image, err)
+		}
+		if deleted != tc.deleted {
+			t.Fatalf("RemoveImage(%q) deleted %q, want %q", tc.image, deleted, tc.deleted)
+		}
+	}
+}

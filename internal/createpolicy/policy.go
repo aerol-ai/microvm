@@ -126,7 +126,7 @@ func Parse(raw []byte) (*Policy, error) {
 			if pat == "" || strings.ContainsAny(pat, " \t\r\n") {
 				return nil, fmt.Errorf("create policy file: images.allowed: %q is not an image pattern", pat)
 			}
-			p.patterns = append(p.patterns, pat)
+			p.patterns = append(p.patterns, untagDigestPattern(pat))
 		}
 	}
 	if f.Runtimes != nil {
@@ -284,8 +284,17 @@ func (p *Policy) CheckImage(image string, localOnly, imageID bool) error {
 	if err != nil {
 		return deny(RuleImages, "image %q is not a valid image reference", image)
 	}
-	if _, digested := named.(reference.Digested); !digested {
+	if pinned, digested := named.(reference.Digested); !digested {
 		named = reference.TagNameOnly(named)
+	} else if _, tagged := named.(reference.Tagged); tagged {
+		// A pull by digest ignores the tag (Docker, containerd and skopeo
+		// all fetch the digest), so "python:3.12@sha256:..." can be any
+		// manifest in the python repository. Judge it without the tag, or
+		// a "python:3.12*" pattern would admit every python image anyone
+		// names by digest.
+		if named, err = reference.WithDigest(reference.TrimNamed(named), pinned.Digest()); err != nil {
+			return deny(RuleImages, "image %q is not a valid image reference", image)
+		}
 	}
 	full, short := named.String(), reference.FamiliarString(named)
 	if !localOnly && p.registries[strings.ToLower(reference.Domain(named))] {
@@ -297,6 +306,30 @@ func (p *Policy) CheckImage(image string, localOnly, imageID bool) error {
 		}
 	}
 	return deny(RuleImages, "image %q is not on this server's list of allowed images", full)
+}
+
+// untagDigestPattern reads an exact pinned image written with its tag
+// ("python:3.12@sha256:...") without the tag, the way CheckImage reads the
+// image. Kept as written, it could never match: the one image it names is
+// judged as "python@sha256:...". A pattern with a "*" is left alone; its
+// author chose what it spans.
+func untagDigestPattern(pat string) string {
+	if strings.Contains(pat, "*") {
+		return pat
+	}
+	named, err := reference.ParseNormalizedNamed(pat)
+	if err != nil {
+		return pat
+	}
+	pinned, digested := named.(reference.Digested)
+	if _, tagged := named.(reference.Tagged); !digested || !tagged {
+		return pat
+	}
+	untagged, err := reference.WithDigest(reference.TrimNamed(named), pinned.Digest())
+	if err != nil {
+		return pat
+	}
+	return reference.FamiliarString(untagged)
 }
 
 func deny(rule, format string, args ...any) error {

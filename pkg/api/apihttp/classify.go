@@ -303,6 +303,8 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusNotImplemented, Message: err.Error()}
 	case errors.Is(err, service.ErrBuildInvalid):
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrImageDigest):
+		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error())}
 
 	// Firecracker template + wasm module + js bundle sentinels.
 	case errors.Is(err, store.ErrTemplateIDConflict), errors.Is(err, store.ErrTemplateInUse):

@@ -284,7 +284,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	}
 
 	createRequest := map[string]any{
-		"Image":      key.Image,
+		"Image":      c.imageNameOnNode(key.Image),
 		"WorkingDir": workingDir,
 		"Entrypoint": []string{c.toolboxMountPath},
 		"Cmd":        userCommand,

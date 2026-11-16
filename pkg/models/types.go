@@ -704,10 +704,16 @@ type CreateSandboxRequest struct {
 	// worker (external_registry/aocr) or is pinned to the local node
 	// (local_only). Empty is resolved by the service from snapshot metadata
 	// or by the default image distribution provider.
-	ImageDistributionMode string     `json:"image_distribution_mode,omitempty"`
-	ImageDigest           string     `json:"image_digest,omitempty"`
-	ImageRegistryRef      string     `json:"image_registry_ref,omitempty"`
-	ImageVerifiedAt       *time.Time `json:"image_verified_at,omitempty"`
+	ImageDistributionMode string `json:"image_distribution_mode,omitempty"`
+	// ImageDigest, when set, is the manifest digest (sha256:...) the
+	// sandbox must start. Normalization rewrites a registry Image to
+	// repo@digest, so the runtime pulls and checks exactly that manifest;
+	// an Image naming another digest is refused. An image only on this
+	// node (a build, a committed snapshot, or any image of a local_only
+	// create) is not pulled, so its digest is not looked at.
+	ImageDigest      string     `json:"image_digest,omitempty"`
+	ImageRegistryRef string     `json:"image_registry_ref,omitempty"`
+	ImageVerifiedAt  *time.Time `json:"image_verified_at,omitempty"`
 	// CPU is the number of CPU cores to allocate. Fractional values are
 	// supported (e.g. 0.5 = half a core, 1.5 = one and a half cores).
 	// Translates to Docker's CpuQuota at 100ms periods.

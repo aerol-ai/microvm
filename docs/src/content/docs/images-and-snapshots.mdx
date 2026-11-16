@@ -94,6 +94,57 @@ A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`
 
 This works for container sandboxes. The server uses the login only to download the image, and keeps the password encrypted.
 
+### Pin an image to one exact version
+
+A tag such as `:1.4` is only a label. Whoever controls the registry can move it to a different image at any time, so two sandboxes made from `app:1.4` a week apart may not run the same code.
+
+A digest never moves. It is a fingerprint of the image's contents, such as `sha256:3f1c…`, and it names exactly one version. Put it after an `@` in the image name:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ghcr.io/your-org/app@sha256:3f1c6a0d5b7e4c2a9f8d1e0b6c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ghcr.io/your-org/app@sha256:3f1c6a0d5b7e4c2a9f8d1e0b6c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ghcr.io/your-org/app@sha256:3f1c6a0d5b7e4c2a9f8d1e0b6c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ghcr.io/your-org/app@sha256:3f1c6a0d5b7e4c2a9f8d1e0b6c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c".into(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ghcr.io/your-org/app@sha256:3f1c6a0d5b7e4c2a9f8d1e0b6c5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c"));
+    ```
+  </TabItem>
+</Tabs>
+
+The server downloads the image by its digest and checks that the contents match it. If the registry sends anything else, the download fails and no sandbox starts. A copy already on the server is reused only if it has that digest.
+
+- **Find the digest** on your registry's page for the image, or run `docker images --digests` on a machine that has pulled it.
+- **A tag next to the digest is ignored.** In `app:1.4@sha256:…` only the digest decides what is downloaded.
+- **Create policies see the digest, not the tag.** A rule such as `app:1.4*` does not allow a pinned image, because the tag no longer decides what runs. Allow the registry, or list the digest. See [Create policy](/enterprise/create-policy/).
+- **Snapshots from the registry are pinned for you.** A server that does not hold a snapshot, for example after a failover, downloads it from your cluster's registry. It gets the exact version that was saved, even if a newer snapshot has reused the name in the registry since. If that version has been deleted, the start fails instead of running the newer one.
+
 ## Snapshots
 
 A snapshot is a saved copy of a sandbox's files and installed software, stored as an image with a short name. Use snapshots to skip slow setup steps, like installing packages, every time you create a sandbox. Container and Firecracker sandboxes support them; V8 isolate sandboxes do not.

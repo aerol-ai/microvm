@@ -525,7 +525,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	createRequest := map[string]any{
-		"Image":      req.Image,
+		"Image":      c.imageNameOnNode(req.Image),
 		"WorkingDir": workingDir,
 		"Entrypoint": []string{c.toolboxMountPath},
 		"Cmd":        userCommand,
@@ -1400,9 +1400,9 @@ func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.Re
 //   - The rewrite actually fired (Rewritten=true). Passthrough pulls
 //     (Docker Hub, unknown host, mirror disabled) already land under
 //     the original ref — no alias needed.
-//   - The original ref is tag-based, not digest-based. Digest pulls
-//     are content-addressable and inspect resolves them via image ID
-//     regardless of which name they were pulled under.
+//   - The original ref is tag-based, not digest-based. dockerd refuses
+//     to tag a digest name, so a digest pull is found by its mirror name
+//     instead (imageNameOnNode).
 func (c *Client) aliasMirrorPull(ctx context.Context, rewrite MirrorRewrite) error {
 	if !rewrite.Rewritten {
 		return nil
@@ -1837,8 +1837,23 @@ func (c *Client) inspectContainer(ctx context.Context, id string) (containerInsp
 
 func (c *Client) inspectImage(ctx context.Context, imageRef string) (imageInspect, error) {
 	var inspect imageInspect
-	err := c.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(imageRef)+"/json", nil, nil, nil, &inspect)
+	err := c.doJSON(ctx, http.MethodGet, "/images/"+url.PathEscape(c.imageNameOnNode(imageRef))+"/json", nil, nil, nil, &inspect)
 	return inspect, err
+}
+
+// imageNameOnNode is the name dockerd finds a pulled image under. A pull
+// is stored under the name it was pulled by, and aliasMirrorPull tags a
+// mirror pull back to the caller's name; but dockerd cannot tag a digest
+// name ("refusing to create a tag with a digest reference"), and it finds
+// "repo@digest" only under the repository it was pulled from, not by the
+// digest alone. So an image pinned by digest that the mirror rewrites is
+// found, and started, by its mirror name. Every other name is unchanged.
+func (c *Client) imageNameOnNode(imageRef string) string {
+	rewrite := RewriteImageRefForMirror(imageRef, c.mirrorCfg)
+	if rewrite.Rewritten && strings.Contains(rewrite.OriginalRef, "@") {
+		return rewrite.RewrittenRef
+	}
+	return imageRef
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, query url.Values, requestBody any, headers map[string]string, responseBody any) error {
@@ -2098,7 +2113,10 @@ func (c *Client) RemoveImage(ctx context.Context, imageRef string) error {
 	// Flush before the delete: even a 404/409 outcome means the cached
 	// resolution is no longer trustworthy, and a re-inspect is cheap.
 	c.imageIDs.Flush(imageRef)
-	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(imageRef), nil, nil, nil, nil)
+	// By the name the image is stored under (imageNameOnNode): a digest
+	// pulled through the mirror has no other, and deleting the caller's
+	// name would 404, read as already gone, and leave it on disk.
+	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(c.imageNameOnNode(imageRef)), nil, nil, nil, nil)
 	if err == nil {
 		return nil
 	}
