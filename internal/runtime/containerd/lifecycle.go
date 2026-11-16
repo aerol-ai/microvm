@@ -1239,6 +1239,18 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
 	}
+	// From here on this is a registry pull request, reported under the same
+	// aerolvm_image_pull_* names as the dockerd engine's (pkg/docker): the
+	// image-pull alerts and the image-pull-storm runbook read nothing else.
+	finishMetric := dockerpkg.BeginImagePullMetric()
+	image, err := d.pullImage(ctx, client, ref, auth)
+	finishMetric(err)
+	return image, err
+}
+
+// pullImage is ensureImage's registry half: the image is not in the local
+// store under ref.
+func (d *Driver) pullImage(ctx context.Context, client *Client, ref string, auth *models.RegistryAuth) (cntr.Image, error) {
 	// Recent-failure backoff: don't hammer a registry that just rejected us on
 	// a burst of cold creates for the same missing/erroring ref.
 	if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
@@ -1246,20 +1258,37 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		until, ok := d.pullFailUntil[ref]
 		d.pullFailMu.Unlock()
 		if ok && time.Now().Before(until) {
+			dockerpkg.RecordImagePullBackoffReject()
 			return nil, fmt.Errorf("image pull for %q backing off after recent failure", ref)
 		}
 	}
 	// Single-flight: N concurrent cold creates of the same missing image
 	// collapse to one registry pull. Concurrency across distinct refs is
-	// capped by the pull semaphore.
+	// capped by the pull semaphore. Only the flight's leader runs the func,
+	// so a caller that never ran it was answered by another's pull.
+	led := false
 	res, err, _ := d.pullGroup.Do(ref, func() (any, error) {
+		led = true
 		if d.pullSem != nil {
 			select {
 			case d.pullSem <- struct{}{}:
-				defer func() { <-d.pullSem }()
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			default:
+				// Every slot is busy: this pull waits in the queue the
+				// SandboxdImagePullQueueBacklog alert watches.
+				doneQueued := dockerpkg.BeginImagePullQueued()
+				select {
+				case d.pullSem <- struct{}{}:
+					doneQueued()
+				case <-ctx.Done():
+					doneQueued()
+					return nil, ctx.Err()
+				}
 			}
+			doneInflight := dockerpkg.BeginImagePullInflight()
+			defer func() {
+				<-d.pullSem
+				doneInflight()
+			}()
 		}
 		// Re-check inside the flight: a sibling create may have unpacked it.
 		if image, getErr := client.GetImage(ctx, ref); getErr == nil {
@@ -1295,6 +1324,9 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		}
 		return image, pullErr
 	})
+	if !led {
+		dockerpkg.RecordImagePullDedupWaiter()
+	}
 	if err != nil {
 		if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
 			d.pullFailMu.Lock()

@@ -63,6 +63,40 @@ func recordImagePullBackoffReject() {
 	imagePullBackoffRejects.Add(1)
 }
 
+// The image-pull metrics belong to every engine, not only dockerd: the
+// SandboxdImagePull* alerts and the image-pull-storm runbook read these
+// names whatever engine pulled. The containerd engine (the Kubernetes
+// worker's, and the default on VMs) has its own dedup, slot cap and backoff,
+// and reports them through the hooks below; expvar allows one owner per
+// name, so the names stay here.
+
+// BeginImagePullMetric counts one registry pull request; call the returned
+// func with the request's outcome. A request a dedup waiter or the failure
+// backoff answered is still a request, as on the dockerd path.
+func BeginImagePullMetric() func(error) { return beginImagePullMetric() }
+
+// RecordImagePullDedupWaiter counts a request answered by another request's
+// pull of the same image.
+func RecordImagePullDedupWaiter() { recordImagePullDedupWaiter() }
+
+// RecordImagePullBackoffReject counts a request refused by the per-image
+// failure backoff.
+func RecordImagePullBackoffReject() { recordImagePullBackoffReject() }
+
+// BeginImagePullQueued counts a pull waiting for a free pull slot until the
+// returned func runs.
+func BeginImagePullQueued() func() {
+	imagePullQueued.Add(1)
+	return func() { imagePullQueued.Add(-1) }
+}
+
+// BeginImagePullInflight counts a pull holding a pull slot until the
+// returned func runs.
+func BeginImagePullInflight() func() {
+	imagePullInflight.Add(1)
+	return func() { imagePullInflight.Add(-1) }
+}
+
 func classifyImagePullError(err error) string {
 	if err == nil {
 		return ""
@@ -85,7 +119,8 @@ func classifyImagePullError(err error) string {
 		return "not_found"
 	case strings.Contains(msg, "too many requests"), strings.Contains(msg, "rate limit"):
 		return "rate_limited"
-	case strings.Contains(msg, "backoff"):
+	// "backing off" is the containerd engine's wording (ensureImage).
+	case strings.Contains(msg, "backoff"), strings.Contains(msg, "backing off"):
 		return "backoff"
 	default:
 		return "error"

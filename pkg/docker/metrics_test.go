@@ -30,6 +30,7 @@ func TestClassifyImagePullError(t *testing.T) {
 		{name: "string_too_many_requests", err: errors.New("too many requests"), want: "rate_limited"},
 		{name: "string_rate_limit", err: errors.New("rate limit exceeded"), want: "rate_limited"},
 		{name: "string_backoff", err: errors.New("pull backoff"), want: "backoff"},
+		{name: "containerd_backing_off", err: errors.New(`image pull for "localhost:5000/drill/app:v1" backing off after recent failure`), want: "backoff"},
 		{name: "unknown_error", err: errors.New("some unexpected failure"), want: "error"},
 	}
 
