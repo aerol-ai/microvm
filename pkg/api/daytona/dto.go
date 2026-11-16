@@ -133,6 +133,15 @@ type paginatedSandboxesResponse struct {
 	NextPageToken string            `json:"nextPageToken,omitempty"`
 }
 
+// cursorSandboxesResponse is Daytona's ListSandboxesResponse, one page of
+// GET /sandbox as Daytona SDKs from 0.180 read it (list_cursor.go). Items
+// is never null and nextCursor is always present, null on the last page:
+// the Python SDK rejects the page otherwise.
+type cursorSandboxesResponse struct {
+	Items      []sandboxResponse `json:"items"`
+	NextCursor *string           `json:"nextCursor"`
+}
+
 type toolboxProxyURLResponse struct {
 	URL string `json:"url"`
 }
