@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -156,6 +158,37 @@ func TestWriteStoreAwareErrorKeyStoreClasses(t *testing.T) {
 		wantRetry := errors.Is(class, secrets.ErrProviderThrottled) || errors.Is(class, secrets.ErrProviderUnavailable)
 		if got := rec.Header().Get("Retry-After") != ""; got != wantRetry {
 			t.Fatalf("%v: Retry-After %q", class, rec.Header().Get("Retry-After"))
+		}
+	}
+}
+
+// An image-pull 503 is logged as the catch-all 400 it replaced was: the
+// image-pull-storm runbook greps the worker's log for the failing image and
+// registry (issue #1343: on the first build with the 503 the log had none).
+func TestClassifyImagePullUnavailableIsLogged(t *testing.T) {
+	err := fmt.Errorf("%w: failed to resolve reference %q: 429 Too Many Requests", models.ErrImagePullUnavailable, "r.example/a:1")
+	if c := Classify(err); !c.Log || c.LogLevel != slog.LevelWarn {
+		t.Fatalf("Classify(%v) logs=%v at %v, want a warning", err, c.Log, c.LogLevel)
+	}
+}
+
+// An image-pull 503's Retry-After is the node's own wait when the error
+// carries it (its SB_IMAGE_PULL_FAILURE_BACKOFF, or what is left of a
+// running backoff), rounded up to seconds; 30 s otherwise.
+func TestClassifyImagePullRetryAfterIsTheNodesBackoff(t *testing.T) {
+	cause := errors.New("429 Too Many Requests")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"the node's backoff", &models.ImagePullUnavailableError{Err: cause, RetryAfter: 2 * time.Minute}, 120},
+		{"part of a second", fmt.Errorf("create: %w", &models.ImagePullUnavailableError{Err: cause, RetryAfter: 1500 * time.Millisecond}), 2},
+		{"no wait carried", &models.ImagePullUnavailableError{Err: cause}, imagePullRetryAfterSeconds},
+		{"bare mark", fmt.Errorf("%w: %w", models.ErrImagePullUnavailable, cause), imagePullRetryAfterSeconds},
+	} {
+		if c := Classify(tc.err); c.Status != http.StatusServiceUnavailable || c.RetryAfter != tc.want {
+			t.Errorf("%s: status %d, Retry-After %d; want 503 and %d", tc.name, c.Status, c.RetryAfter, tc.want)
 		}
 	}
 }
