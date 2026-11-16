@@ -26,7 +26,7 @@
     "typescript": "^7.0.2"
   },
   "devDependencies": {
-    "prettier": "^3.9.10",
+    "prettier": "^3.10.1",
     "prettier-plugin-astro": "^1.1.2",
     "wrangler": "4.161.0"
   },
