@@ -1,6 +1,7 @@
 package daytona
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -1562,5 +1563,53 @@ func TestHTTPListHandlers_ExtraErrorsAndPagination(t *testing.T) {
 	handler2.ServeHTTP(rr7, req7)
 	if rr7.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d (body: %s)", rr7.Code, rr7.Body.String())
+	}
+}
+
+// The Daytona Python SDK refuses a sandbox whose cpu, gpu, memory or disk is
+// not a whole number (StrictInt), so a WASM sandbox (256 MB) or a container
+// with half a CPU could not even be created from it. The facade rounds CPU
+// and memory up and always sends integers.
+func TestSandboxResponseSendsWholeResources(t *testing.T) {
+	h := newHandlers(Deps{})
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	for _, tc := range []struct {
+		name            string
+		cpu             float64
+		memoryMB        int
+		wantCPU, wantGB float64
+	}{
+		{"wasm sized", 1, 256, 1, 1},
+		{"half a cpu", 0.5, 512, 1, 1},
+		{"already whole", 2, 4096, 2, 4},
+		{"one and a half", 1.5, 1536, 2, 2},
+		{"unset", 0, 0, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &models.Sandbox{ID: "sb-whole", CPU: tc.cpu, MemoryMB: tc.memoryMB, DiskGB: 3}
+			raw, err := json.Marshal(h.toSandboxResponse(req, sb, sandboxMeta{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
+			var fields map[string]any
+			if err := dec.Decode(&fields); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]float64{"cpu": tc.wantCPU, "memory": tc.wantGB, "disk": 3, "gpu": 0}
+			for key, w := range want {
+				n, ok := fields[key].(json.Number)
+				if !ok {
+					t.Fatalf("%s = %v, want a number: %s", key, fields[key], raw)
+				}
+				if _, err := n.Int64(); err != nil {
+					t.Fatalf("%s = %s, want a whole number (Daytona's Python SDK refuses fractions)", key, n)
+				}
+				if got, _ := n.Float64(); got != w {
+					t.Fatalf("%s = %v, want %v", key, got, w)
+				}
+			}
+		})
 	}
 }
