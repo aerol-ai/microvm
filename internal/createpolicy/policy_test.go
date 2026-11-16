@@ -117,6 +117,9 @@ func TestCheckCreatePerRule(t *testing.T) {
 func TestCheckImageRules(t *testing.T) {
 	registriesOnly := mustParse(t, "version: 1\nimages:\n  allowed_registries: [docker.io]\n")
 	patternsOnly := mustParse(t, "version: 1\nimages:\n  allowed: [\"ghcr.io/acme/*\"]\n")
+	tagPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python:3.12*\"]\n")
+	pinnedDigest := "sha256:" + strings.Repeat("b", 64)
+	digestPattern := mustParse(t, "version: 1\nimages:\n  allowed: [\"python@"+pinnedDigest+"\"]\n")
 	cases := []struct {
 		name      string
 		p         *Policy
@@ -131,6 +134,15 @@ func TestCheckImageRules(t *testing.T) {
 		{"pattern matches nested path", patternsOnly, "ghcr.io/acme/team/app:1", true, true},
 		{"pattern is anchored", patternsOnly, "evil.io/ghcr.io/acme/app", false, false},
 		{"hub image refused without a rule", patternsOnly, "python:3.12", false, false},
+		{"tag pattern passes its tag", tagPattern, "python:3.12-slim", false, true},
+		// The pull goes by the digest and ignores the tag, so the tag must
+		// not vouch for whatever manifest the digest names.
+		{"tag pattern does not vouch for a digest", tagPattern, "python:3.12@" + pinnedDigest, false, false},
+		{"tag pattern refuses a bare digest", tagPattern, "python@" + pinnedDigest, false, false},
+		{"digest pattern passes that digest", digestPattern, "python@" + pinnedDigest, false, true},
+		{"digest pattern passes it with a decorative tag", digestPattern, "python:3.12@" + pinnedDigest, false, true},
+		{"digest pattern refuses another digest", digestPattern, "python@sha256:" + strings.Repeat("c", 64), false, false},
+		{"registry rule passes a tagged digest", registriesOnly, "python:3.12@" + pinnedDigest, false, true},
 	}
 	for _, tc := range cases {
 		err := tc.p.CheckImage(tc.image, tc.localOnly, false)

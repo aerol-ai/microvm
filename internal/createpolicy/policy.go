@@ -284,8 +284,17 @@ func (p *Policy) CheckImage(image string, localOnly, imageID bool) error {
 	if err != nil {
 		return deny(RuleImages, "image %q is not a valid image reference", image)
 	}
-	if _, digested := named.(reference.Digested); !digested {
+	if pinned, digested := named.(reference.Digested); !digested {
 		named = reference.TagNameOnly(named)
+	} else if _, tagged := named.(reference.Tagged); tagged {
+		// A pull by digest ignores the tag (Docker, containerd and skopeo
+		// all fetch the digest), so "python:3.12@sha256:..." can be any
+		// manifest in the python repository. Judge it without the tag, or
+		// a "python:3.12*" pattern would admit every python image anyone
+		// names by digest.
+		if named, err = reference.WithDigest(reference.TrimNamed(named), pinned.Digest()); err != nil {
+			return deny(RuleImages, "image %q is not a valid image reference", image)
+		}
 	}
 	full, short := named.String(), reference.FamiliarString(named)
 	if !localOnly && p.registries[strings.ToLower(reference.Domain(named))] {
