@@ -159,6 +159,8 @@ helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> -
 
 `monitoring.labels` must match what your Prometheus selects. kube-prometheus-stack selects objects labelled with its own release name, shown here as `kube-prometheus-stack`.
 
+In cluster mode, Prometheus also needs [a scrape token](#use-a-read-only-scrape-token). The install stops until you name one.
+
 You get:
 
 - **Scraping.** A ServiceMonitor per kind of pod. Prometheus reads [`/v1/metrics`](/dashboard/#collect-metrics-with-prometheus) on every AerolVM pod, once each.
@@ -174,14 +176,33 @@ Good to know:
 
 ### Use a read-only scrape token
 
-Prometheus needs a token to read `/v1/metrics`. By default it uses the API token, which can do everything. If you turned on API tokens (`SB_IDENTITY_ENABLED: "true"` in `worker.extraEnv`), make a read-only token and put it in a Secret in the release namespace:
+Prometheus needs a token to read `/v1/metrics`. Give it one that can only read.
+
+First, turn on AerolVM's own API tokens on every node, and name the Secret the token will live in:
+
+```bash title="Your machine"
+helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> --namespace <namespace> --reuse-values \
+  --set identity.enabled=true \
+  --set monitoring.scrapeToken.existingSecret=aerolvm-metrics-token
+```
+
+Then sign in as admin (`aerolvm login <API URL> --token-stdin`), make the token, and put it in that Secret, in the release namespace:
 
 ```bash title="Your machine"
 kubectl -n <namespace> create secret generic aerolvm-metrics-token \
   --from-literal=token="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
 ```
 
-Then set `monitoring.scrapeToken.existingSecret=aerolvm-metrics-token`. Make a new token before this one expires.
+Prometheus reads the pods once the Secret exists. Make a new token before this one expires.
+
+This token cannot create, change, stop or run anything, read secrets, or make tokens. It is read-only, but not metrics-only: on every node it can also read every team's sandbox details (never their env) and audit records. No gateway or worker gets the admin token.
+
+Good to know:
+
+- **Cluster mode requires a scrape token.** With monitoring on and no `monitoring.scrapeToken.existingSecret`, the install stops and prints these steps. You may name `<cluster name>-admin`, the admin token's Secret, instead. That token can do everything.
+- **Single mode** uses the API token when you name no Secret.
+- **Turn API tokens on with `identity.enabled`.** `SB_IDENTITY_ENABLED` in `worker.extraEnv` reaches workers only, so servers and gateways would refuse the token. Cluster mode refuses that setting.
+- **A new token works on a gateway or worker a few seconds after you make it,** once that node's copy of the token list catches up. Prometheus may miss one scrape.
 
 ## Usage per team
 
