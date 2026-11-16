@@ -288,7 +288,9 @@ func (s *Service) HoldsSnapshotNamed(ctx context.Context, name string) (bool, er
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
 // create request's image-distribution metadata before placement decisions are
 // made. The method is intentionally side-effect free: it does not pull, push,
-// or verify image contents. Its result is a fixed point: a request it has
+// or verify image contents; an image_digest is enforced by naming it in the
+// image (pinImageDigest), so the runtime's pull checks it. Its result is a
+// fixed point: a request it has
 // already resolved resolves to itself, so callers that run it twice get the
 // same answer and the same authorization.
 func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *models.CreateSandboxRequest) error {
@@ -433,6 +435,19 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		return err
 	}
 	req.ApplyImageDistribution(normalized)
+	// Last, so the registry ref above keeps the caller's tagged name and
+	// the image the runtime pulls is the one the digest names.
+	if err := pinImageDigest(req); err != nil {
+		if !isStoredSpecReplay(ctx) {
+			return err
+		}
+		// An intake rule: a spec replicated before digests were checked
+		// may carry one that cannot hold. Refusing its failover recreate
+		// would only lose the sandbox, so it starts as it first did.
+		if s != nil && s.logger != nil {
+			s.logger.Warn("failover recreate: image_digest not applied", "image", req.Image, "error", err)
+		}
+	}
 	return nil
 }
 

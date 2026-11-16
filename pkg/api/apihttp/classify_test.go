@@ -79,6 +79,7 @@ func TestClassify(t *testing.T) {
 		{"builder unavailable", service.ErrBuilderUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
 		{"build not implemented", service.ErrBuildNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
 		{"build invalid", service.ErrBuildInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
+		{"image digest", fmt.Errorf("%w: image %q names digest sha256:aa, but image_digest is sha256:bb", service.ErrImageDigest, "acme/app@sha256:aa"), http.StatusBadRequest, 0, "", ErrKindOther},
 		{"egress gateway", service.ErrEgressGatewayUnavailable, http.StatusServiceUnavailable, 5, models.ErrorCodeEgressGatewayUnavailable, ErrKindOther},
 		{"egress inspect recreate", service.ErrEgressInspectRecreate, http.StatusConflict, 0, "", ErrKindOther},
 		{"capacity", cluster.ErrCapacityExceeded, http.StatusServiceUnavailable, cluster.CapacityRetryAfterSeconds, "", ErrKindOther},
