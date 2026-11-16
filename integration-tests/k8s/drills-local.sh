@@ -10,6 +10,12 @@
 #     integration-tests/k8s/drills-local.sh <state-dir> setup static pull-storm slo-breach
 #   integration-tests/k8s/drills-local.sh <state-dir> teardown
 #
+# It refuses any kubectl context but a local kind cluster's (kind-<name>,
+# listed by kind get clusters), whatever the step: the steps delete pods,
+# fill workers and break a gateway's Caddy. If a step dies midway, the EXIT
+# trap clears the registry's faults, stops the callers and puts Caddy's
+# admin API back on its port.
+#
 # Needs Docker, kind, kubectl, Helm and python3 on this machine. Steps (each
 # prints PASS or FAIL lines into <state-dir>/drills.txt):
 #   setup       a registry:2 behind a fault proxy (drills-local/faultproxy.py)
@@ -68,6 +74,12 @@ sd="${1:?usage: drills-local.sh <state-dir> <step> [step...]}"; shift
 mkdir -p "$sd/evidence"
 ctx="${KUBECTL_CONTEXT:-kind-aerolvm-drills}"
 kind_cluster="${ctx#kind-}"
+# Every step deletes pods, fills workers and breaks a gateway's Caddy: only
+# ever on a local kind cluster, whatever step was asked for.
+if [[ "$ctx" != kind-* ]] || ! kind get clusters 2>/dev/null | grep -qx "$kind_cluster"; then
+  echo "drills-local.sh: refusing to run against context \"$ctx\": only a local kind cluster (kind-<name>, listed by kind get clusters)" >&2
+  exit 2
+fi
 ns="${AEROL_NS:-aerolvm-system}"
 workers="${AEROL_WORKER_NS:-aerolvm-workers}"
 release="${AEROL_HELM_RELEASE:-aerolvm}"
@@ -92,7 +104,17 @@ iso() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 prom() { python3 "$L/prom.py" --url "http://127.0.0.1:$prom_port" "$@"; }
 # val <expr>: the first series' value, or 0 when there is none.
 val() { prom query "$1" | awk 'NR==1 {print $NF} END {if (NR==0) print 0}'; }
-proxy() { curl -fsS -X POST "http://127.0.0.1:$ctl_port/$1" >/dev/null; }
+# What a step breaks, so the EXIT trap can put it back if the step dies.
+faults_set=0
+storms=()
+caddy_moved_on=""
+proxy() {
+  case "$1" in
+    mode/clear) faults_set=0 ;;
+    mode\?*) faults_set=1 ;;
+  esac
+  curl -fsS -X POST "http://127.0.0.1:$ctl_port/$1" >/dev/null
+}
 run_id() { cat "$sd/run"; }
 sum() { python3 "$L/summarize.py" "$@"; }
 # jf <json> <python expression over d>
@@ -126,6 +148,18 @@ keep_forward() {
 }
 watcher=""
 cleanup() {
+  # Best effort, for a step that died midway: the registry's faults off,
+  # the callers stopped, Caddy's admin API back on its port.
+  if [[ "$faults_set" == 1 ]]; then
+    proxy mode/clear 2>/dev/null || true
+  fi
+  local s
+  for s in ${storms[@]+"${storms[@]}"}; do
+    storm_stop "$s" >/dev/null 2>&1 || true
+  done
+  if [[ -n "$caddy_moved_on" ]]; then
+    caddy_admin "$caddy_moved_on" 2020 /config/admin/listen '"localhost:2019"' >/dev/null 2>&1 || true
+  fi
   [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true
   local p kids
   for p in ${keepers[@]+"${keepers[@]}"}; do
@@ -162,6 +196,7 @@ watch_stop() { [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true; watch
 # more than a laptop port-forward carries.
 storm_start() {
   local name="$1"; shift
+  storms+=("$name")
   kc -n drills exec drills-client -- sh -c "cd /work && nohup python -u /drill/storm.py --url \"\$AEROL_URL\" \
     --token-file /token/token --run $name --out /work/$name.jsonl $* > /work/$name.out 2>&1 & echo \$! > /work/$name.pid"
 }
@@ -342,8 +377,7 @@ YAML
     --set-json "networkPolicy.extraEgressCIDRs=[\"$pip/32\"]" >/dev/null
 
   kc create namespace drills --dry-run=client -o yaml | kc apply -f - >/dev/null
-  kc -n "$ns" get secret "$cluster_name-admin" -o jsonpath='{.data.token}' | base64 -d > "$sd/token"
-  chmod 600 "$sd/token"
+  ( umask 077; kc -n "$ns" get secret "$cluster_name-admin" -o jsonpath='{.data.token}' | base64 -d > "$sd/token" )
   kc -n drills create secret generic drills-token --from-file=token="$sd/token" --dry-run=client -o yaml | kc apply -f - >/dev/null
   kc -n drills create configmap drills-scripts --from-file=storm.py="$L/storm.py" \
     --from-file=load.py="$HERE/cell/load.py" --dry-run=client -o yaml | kc apply -f - >/dev/null
@@ -671,6 +705,7 @@ step_slo_breach() {
   # answers nothing fails each pull after containerd's 30 s.)
   proxy "mode?name=slow&delay=1&bps=2000&repo=drill/hang"
   proxy "mode?name=ratelimit&repo=drill/hot"
+  caddy_moved_on="$gw"
   echo "move admin: $(caddy_admin "$gw" 2019 /config/admin/listen '"localhost:2020"')" > "$out/caddy-admin.txt"
   storm_start "hang-$run" --images "localhost:5000/drill/hang:$run" --runtime gvisor --cpu 0.05 --memory-mb 64 \
     --concurrency 130 --pause 1 --delete --client-timeout 700 --duration $(( minutes * 60 ))
@@ -704,6 +739,7 @@ step_slo_breach() {
   storm_stop "hang-$run"; storm_stop "err-$run"; storm_stop "pub-$run"
   proxy mode/clear
   kc -n "$ns" delete pod "$gw" --wait=false >/dev/null
+  caddy_moved_on=""
   local _
   for _ in $(seq 1 60); do
     gw_new="$(kc -n "$ns" get pods -l app.kubernetes.io/component=gateway --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[*].ready}{"\n"}{end}' | grep -v "^$gw " | grep -c "true true$" || true)"
