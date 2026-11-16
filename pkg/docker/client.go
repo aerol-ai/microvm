@@ -2113,7 +2113,10 @@ func (c *Client) RemoveImage(ctx context.Context, imageRef string) error {
 	// Flush before the delete: even a 404/409 outcome means the cached
 	// resolution is no longer trustworthy, and a re-inspect is cheap.
 	c.imageIDs.Flush(imageRef)
-	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(imageRef), nil, nil, nil, nil)
+	// By the name the image is stored under (imageNameOnNode): a digest
+	// pulled through the mirror has no other, and deleting the caller's
+	// name would 404, read as already gone, and leave it on disk.
+	err := c.doJSON(ctx, http.MethodDelete, "/images/"+url.PathEscape(c.imageNameOnNode(imageRef)), nil, nil, nil, nil)
 	if err == nil {
 		return nil
 	}

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -427,5 +428,66 @@ func TestCreatePinnedImageThroughTheMirrorStartsTheMirrorName(t *testing.T) {
 				t.Fatalf("container image = %q, want %q", started, tc.started)
 			}
 		})
+	}
+}
+
+// The warm pool parks for a key a cold miss registered, so a pinned create
+// through the mirror makes it park "ghcr.io/acme/app@sha256:...". The
+// parked container must name the image as dockerd stores it, or every
+// refill fails with "No such image" until the target is evicted.
+func TestParkPinnedImageThroughTheMirrorUsesTheMirrorName(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	pinned := "ghcr.io/acme/app@" + digest
+	mirrorName := "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest
+	d := &poolFakeDaemon{t: t}
+	d.create = func() *http.Response {
+		var req struct{ Image string }
+		_ = json.Unmarshal(d.createBodies[len(d.createBodies)-1], &req)
+		if req.Image != mirrorName {
+			return textResponse(http.StatusNotFound, `{"message":"No such image: `+req.Image+`"}`)
+		}
+		return jsonResponse(http.StatusCreated, map[string]string{"Id": "cid-park"})
+	}
+	c := newPoolClient(t, d, func(c *Client) { c.readyDir = coverageReadyDir(t) })
+	c.logger = slog.Default()
+	c.ConfigureMirror(defaultMirrorCfg(), nil)
+	_, _ = c.parkContainer(context.Background(), "park-1", dockerpool.Key{Image: pinned, Runtime: models.RuntimeDocker})
+	if len(d.createBodies) == 0 {
+		t.Fatal("parkContainer never created a container")
+	}
+	var req struct{ Image string }
+	_ = json.Unmarshal(d.createBodies[0], &req)
+	if req.Image != mirrorName {
+		t.Fatalf("parked container image = %q, want %q", req.Image, mirrorName)
+	}
+}
+
+// Image GC removes the image a sandbox row names. A digest pulled through
+// the mirror is stored under its mirror name only, so the delete must name
+// that: the caller's name 404s, RemoveImage reads it as already gone, the
+// ledger row is dropped and the image stays on disk.
+func TestRemovePinnedImageThroughTheMirrorDeletesTheMirrorName(t *testing.T) {
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, tc := range []struct{ image, deleted string }{
+		{"ghcr.io/acme/app@" + digest, "mirror.aocr.aerol.ai/aocr/ghcr/acme/app@" + digest},
+		// A tag keeps its own name: aliasMirrorPull tagged it.
+		{"ghcr.io/acme/app:1", "ghcr.io/acme/app:1"},
+	} {
+		var deleted string
+		rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodDelete {
+				deleted = strings.TrimPrefix(r.URL.Path, "/images/")
+				return jsonResponse(http.StatusOK, []map[string]string{}), nil
+			}
+			return textResponse(http.StatusNotFound, ""), nil
+		})
+		c := &Client{logger: slog.Default(), httpClient: &http.Client{Transport: rt}, imageIDs: newImageIDCache(0)}
+		c.ConfigureMirror(defaultMirrorCfg(), nil)
+		if err := c.RemoveImage(context.Background(), tc.image); err != nil {
+			t.Fatalf("RemoveImage(%q): %v", tc.image, err)
+		}
+		if deleted != tc.deleted {
+			t.Fatalf("RemoveImage(%q) deleted %q, want %q", tc.image, deleted, tc.deleted)
+		}
 	}
 }
