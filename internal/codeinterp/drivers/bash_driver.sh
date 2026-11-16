@@ -20,14 +20,26 @@ if [ "${AEROL_INTERP_MODE:-}" != fd ]; then
 	exit 1
 fi
 
-# The protocol descriptors move above 9 and 3 and 4 close: scripts use
+# The protocol descriptors move to 250-253 and 3 and 4 close: scripts use
 # "exec 3>file" freely, and that must not cut the context off. Private
 # copies of fd 1 and 2 carry the markers, so they still reach the host's
 # pipes after the user's "exec >file".
-if ! exec {__aerol_req}<&3 {__aerol_ev}>&4 {__aerol_out}>&1 {__aerol_err}>&2 3<&- 4>&-; then
-	echo "aerolvm interpreter driver: protocol descriptors 3 and 4 are not open" >&2
+#
+# Bash has no close-on-exec for descriptors it opens, so every cell runs
+# with these four closed (the loop at the end) and the programs it starts
+# never hold the protocol pipes. Bash keeps its own copies meanwhile, and
+# those are close-on-exec. The numbers are fixed and high (below the 255
+# bash reads this script from): a cell's "exec {fd}>file" takes the lowest
+# free number from 10, so it never lands on one of them while it is
+# closed, where bash's restore after the cell would replace it.
+if ! exec 250<&3 251>&4 252>&1 253>&2 3<&- 4>&-; then
+	echo "aerolvm interpreter driver: protocol descriptors 3 and 4 are not open, or 250-253 are over the open-file limit" >&2
 	exit 1
 fi
+__aerol_req=250
+__aerol_ev=251
+__aerol_out=252
+__aerol_err=253
 __aerol_nonce=${AEROL_INTERP_NONCE:-}
 unset AEROL_INTERP_MODE AEROL_INTERP_NONCE
 
@@ -138,6 +150,10 @@ __aerol_begin() {
 		builtin export "$name=${pair#*=}"
 	done
 	__aerol_env=()
+	# The run takes interrupts from its COUNT on (doc.go): the host sends an
+	# early interrupt again when COUNT arrives, which must not find SIGINT
+	# still ignored. Caught here, it ends the cell before its first command.
+	builtin trap '__aerol_on_int' INT
 	__aerol_emit COUNT "$__aerol_count"
 }
 
@@ -213,11 +229,11 @@ __aerol_emit READY 1
 # stay (a function would make declare local), and "return" ends it. Source
 # does not hide this loop from the cell's "break" and "continue", so the
 # one-pass for loop takes them: the cell just ends there. A "break 2" or
-# more still ends the context.
+# more still ends the context. The protocol descriptors are closed for the
+# cell and restored after it (see the top).
 while __aerol_next; do
-	trap '__aerol_on_int' INT
 	for __aerol_once in 1; do
-		. <(builtin printf '%s\n' "$__aerol_code")
+		. <(builtin printf '%s\n' "$__aerol_code") 250<&- 251>&- 252>&- 253>&-
 	done
 	__aerol_finish "$?"
 done

@@ -108,7 +108,7 @@ You can add the domain before you call `exposePort`. Once the port is exposed, t
   | `AEROL_WASM_LISTEN_FD` | `4` | The listener of the lowest exposed port. |
   | `AEROL_WASM_LISTEN_FDS` | `8080=4,9090=5` | Each exposed port and its listener, ports from low to high. |
 
-  Do not assume the listener is number 3. When the module also has the `/work` folder open, the listeners come after it, so the first one is usually 4.
+  Do not assume the listener is number 3. When the module also has the `/work` folder open, the listeners come after it, so the first one is usually 4. On the `wasmtime` engine the numbers are much larger, such as `16777216`. Always read the variables.
 - **Make outgoing connections** through the server. Outbound TCP and UDP go through `aerol/vm/net`, a set of network functions the server gives the module. See [WASM architecture](/wasm-architecture/).
 
 ## Serve several ports
@@ -159,11 +159,16 @@ When you expose a new port, the server restarts the module once so it can hand o
 
 ## Engines
 
-The server runs WASM modules on the `wazero` engine by default (`SB_WASM_ENGINE=wazero`). An operator can choose the optional `wasmtime` engine instead. No `wasmtime` release can hand a module a pre-opened listener, so a sandbox on `wasmtime` cannot serve web requests by itself.
+The server runs WASM modules on the `wazero` engine by default (`SB_WASM_ENGINE=wazero`). An operator can choose the optional `wasmtime` engine instead. Both engines serve web requests by themselves, so the module and the steps above are the same on either one.
 
-When such a sandbox exposes a port, the server moves that one sandbox onto `wazero` and serves the port from there. Other sandboxes stay on `wasmtime`. A sandbox that moved loses `wasmtime`'s instruction count in its usage numbers. The server log says when a sandbox moves.
+`wasmtime` itself cannot hand a module a pre-opened listener. On `wasmtime`, the server opens the listeners and runs the socket functions for the module. This works on Linux and macOS servers. A sandbox on `wasmtime` keeps its instruction count in its usage numbers while it serves web requests.
 
-To turn the move off, set `SB_WASM_WASMTIME_LISTEN_FALLBACK=false`. `exposePort` then still returns a URL, but requests to it fail and the server log says the engine cannot serve HTTP.
+In a few cases the server still moves a sandbox from `wasmtime` to `wazero` when it exposes a port:
+
+- the server runs on an operating system other than Linux or macOS, or
+- the module does not export its memory under the name `memory`. Every module built for WASI does, so this is rare.
+
+Only that one sandbox moves. It loses `wasmtime`'s instruction count in its usage numbers, and the server log says when it moves. To turn the move off, set `SB_WASM_WASMTIME_LISTEN_FALLBACK=false`. In those cases `exposePort` then still returns a URL, but requests to it fail and the server log says the engine cannot serve HTTP. A sandbox that `wasmtime` serves by itself never moves, so the setting does not change it.
 
 ## Limits
 

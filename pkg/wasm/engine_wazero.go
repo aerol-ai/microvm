@@ -419,10 +419,14 @@ func ListenerFDs(caps Capabilities) []int {
 	return fds
 }
 
-// listenFDsValue is the ListenFDsEnv value for caps.
+// listenFDsValue is the ListenFDsEnv value for caps on wazero.
 func listenFDsValue(caps Capabilities) string {
-	listeners := caps.Listeners()
-	fds := ListenerFDs(caps)
+	return listenFDsValueFor(caps.Listeners(), ListenerFDs(caps))
+}
+
+// listenFDsValueFor is the ListenFDsEnv value for listeners at fds (same
+// order). The wasmtime engine numbers its listeners differently.
+func listenFDsValueFor(listeners []WASIListener, fds []int) string {
 	parts := make([]string, len(listeners))
 	for i, l := range listeners {
 		parts[i] = strconv.Itoa(l.GuestPort) + "=" + strconv.Itoa(fds[i])

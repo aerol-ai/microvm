@@ -1126,6 +1126,13 @@ func parseSnapshotListFilters(r *http.Request) (snapshotListFilters, float32, fl
 	return filters, page, limit, nil
 }
 
+// wholeUnits rounds a sandbox's CPU or memory (in GB) up to a whole number.
+// Daytona only has whole CPUs and GB, and its Python SDK refuses anything
+// else (the fields are StrictInt). A WASM sandbox's 256 MB (0.25 GB) or a
+// container's half CPU made every sandbox call from that SDK fail. Up, not
+// down, so the answer never says a sandbox has less than it has.
+func wholeUnits(v float64) float32 { return float32(math.Ceil(v)) }
+
 func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, meta sandboxMeta) sandboxResponse {
 	name := firstNonEmpty(meta.Name, sandbox.ID)
 	user := firstNonEmpty(meta.User, sandbox.OSUser)
@@ -1151,9 +1158,9 @@ func (h *handlers) toSandboxResponse(r *http.Request, sandbox *models.Sandbox, m
 		NetworkBlockAll:     sandbox.NetworkBlockAll,
 		NetworkAllowList:    cloneStringPtr(meta.NetworkAllowList),
 		Target:              meta.Target,
-		CPU:                 float32(sandbox.CPU),
+		CPU:                 wholeUnits(sandbox.CPU),
 		GPU:                 gpu,
-		Memory:              float32(sandbox.MemoryMB) / 1024,
+		Memory:              wholeUnits(float64(sandbox.MemoryMB) / 1024),
 		Disk:                float32(sandbox.DiskGB),
 		State:               state,
 		ErrorReason:         errorReason,

@@ -820,12 +820,19 @@ type Config struct {
 	// SB_WASM_STANDARD_MODULES; when unset it is derived from the standard
 	// modules (python, javascript via QuickJS, ruby). SB_WASM_CODERUN_MODULES.
 	WasmCodeRunModules map[string]string
-	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams and
-	// code-runs) one WASM sandbox may have at once. Each is a guest instance
-	// in the sandbox's worker; past the cap the toolbox answers HTTP 429.
-	// A worker never runs more than 32 per sandbox, whatever this says.
-	// Default 8. SB_WASM_MAX_STREAMS_PER_SANDBOX.
+	// WasmMaxStreamsPerSandbox caps the streaming runs (exec streams,
+	// code-runs, session commands, interpreter contexts) one WASM sandbox
+	// may have at once. Each is a guest instance in the sandbox's worker
+	// that may use the sandbox's whole memory limit, so the cap also bounds
+	// a sandbox's memory at (cap + 1) times its limit; past it the toolbox
+	// answers HTTP 429. Values above the worker's ceiling (32) count as 32.
+	// Default 4. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
+	// WasmStreamMaxMessageBytes caps one client message on a WASM exec
+	// stream (a stdin chunk or a control frame). The stream is served by
+	// sandboxd, which reads each message whole. Default 1 MiB.
+	// SB_WASM_STREAM_MAX_MESSAGE_BYTES.
+	WasmStreamMaxMessageBytes int64
 	// Daytona-style process sessions on WASM keep their state in sandboxd's
 	// heap, so each part is capped. WasmSessionLogBytes is the output kept
 	// per stream per command, the newest bytes (default 1 MiB,
@@ -867,8 +874,10 @@ type Config struct {
 	// wasmtime requires building sandboxd with -tags wasmtime. SB_WASM_ENGINE.
 	WasmEngine string
 	// WasmWasmtimeListenFallback moves a sandbox on the wasmtime engine to
-	// wazero when it exposes a port: no wasmtime release can pre-open a
-	// guest listener (#175). Off keeps the old error. Default true.
+	// wazero when it exposes a port and the engine cannot serve one itself.
+	// The engine serves guest listeners from its own WASI socket layer on
+	// Linux and macOS (#175), so this only applies to a module that exports
+	// no memory, or another host OS. Off keeps the error. Default true.
 	// SB_WASM_WASMTIME_LISTEN_FALLBACK.
 	WasmWasmtimeListenFallback bool
 	// WasmMaxInstances caps live WASM sandboxes on this host. 0 = unlimited.
@@ -2707,7 +2716,8 @@ func load(keyTool bool) (Config, error) {
 		WasmRegistryAllowlist:     parseImageGCWhitelist(getEnv("SB_WASM_REGISTRY_ALLOWLIST", "")),
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
-		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 8),
+		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 4),
+		WasmStreamMaxMessageBytes: getEnvInt64("SB_WASM_STREAM_MAX_MESSAGE_BYTES", 1<<20),
 		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),
 		WasmSessionCommandsKept:   getEnvInt("SB_WASM_SESSION_COMMANDS_KEPT", 64),

@@ -50,6 +50,36 @@ CO_COROUTINE = 0x80
 TOP_LEVEL_AWAIT = getattr(ast, "PyCF_ALLOW_TOP_LEVEL_AWAIT", 0)
 
 
+class _NoLock(object):
+    """Stands in for the frame lock where there are no threads to guard
+    against (CPython for WASI may not ship _thread)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+try:
+    import threading
+
+    # One frame at a time on the event stream. User code may call display()
+    # from its own threads; two frames written at once interleave, and the
+    # host, which cannot read a broken frame, kills the kernel. Re-entrant:
+    # a frame announced by SYNC is written with the lock already held.
+    _LOCK = threading.RLock()
+    _MAIN = threading.get_ident()
+
+    def _on_main_thread():
+        return threading.get_ident() == _MAIN
+except Exception:
+    _LOCK = _NoLock()
+
+    def _on_main_thread():
+        return True
+
+
 class _State(object):
     # running: an EXEC is in progress. user: user code is on the stack, so a
     # SIGINT may raise KeyboardInterrupt right now. pending: a SIGINT came
@@ -135,18 +165,12 @@ class Channel(object):
 
     def emit(self, kind, payload):
         payload = _to_bytes(payload)
-        prev = S.user
-        S.user = False
-        try:
-            self.ev.write(("%s %d\n" % (kind, len(payload))).encode("ascii"))
-            if payload:
-                self.ev.write(payload)
-            self.ev.flush()
-        finally:
-            S.user = prev
-        if prev and S.pending:
-            S.pending = False
-            raise KeyboardInterrupt
+        with _Quiet():
+            with _LOCK:
+                self.ev.write(("%s %d\n" % (kind, len(payload))).encode("ascii"))
+                if payload:
+                    self.ev.write(payload)
+                self.ev.flush()
 
     def sync(self):
         """Order user output before the next event.
@@ -154,20 +178,60 @@ class Channel(object):
         In fd mode the host reads fd 1 and 2 from pipes; it forwards every
         byte before the marker before it handles the frame after SYNC.
         """
+        with _Quiet():
+            with _LOCK:
+                self._sync_locked()
+
+    def _sync_locked(self):
         _flush_user_streams()
         if self.mode != "fd":
             return
         self.seq += 1
         seq = str(self.seq)
         mark = b"\x1e" + self.nonce + b":" + seq.encode("ascii") + b"\x1e"
-        prev = S.user
-        S.user = False
-        try:
-            _write_all(self.out_fd, mark)
-            _write_all(self.err_fd, mark)
-        finally:
-            S.user = prev
+        _write_all(self.out_fd, mark)
+        _write_all(self.err_fd, mark)
         self.emit("SYNC", seq)
+
+    def event(self, kind, payload, run_only=False):
+        """Send an event after SYNC, as one unit: a SYNC from another thread
+        between the two would announce this frame as its own.
+
+        run_only drops the event when no run is in progress: a value a
+        user thread shows between runs has no run to go to, and its frames
+        would otherwise wait in the pipe and open the next run, before its
+        COUNT. The check is under the lock that also orders COUNT and DONE.
+        """
+        with _Quiet():
+            with _LOCK:
+                if run_only and not S.running:
+                    return
+                self._sync_locked()
+                self.emit(kind, payload)
+
+
+class _Quiet(object):
+    """Holds back a SIGINT while the main thread writes frames, so a frame
+    is never cut in half; it is raised once the writes are done if the main
+    thread was in user code. Other threads leave the state alone: a SIGINT
+    is only ever handled on the main thread, and the user code it should
+    stop runs there."""
+
+    def __enter__(self):
+        self.main = _on_main_thread()
+        if self.main:
+            self.prev = S.user
+            S.user = False
+        return self
+
+    def __exit__(self, etype, exc, tb):
+        if not self.main:
+            return False
+        S.user = self.prev
+        if self.prev and S.pending and etype is None:
+            S.pending = False
+            raise KeyboardInterrupt
+        return False
 
 
 CHAN = None
@@ -400,8 +464,7 @@ def emit_result(bundle, main):
     if not data:
         return
     payload = _encode_result(data, main)
-    CHAN.sync()
-    CHAN.emit("RESULT", payload)
+    CHAN.event("RESULT", payload, run_only=True)
 
 
 def _encode_result(data, main):
@@ -494,8 +557,7 @@ def _safe_str(value):
 
 def emit_error(name, value, tb_text):
     payload = name + US + value[:MAX_ERROR] + US + tb_text[-MAX_ERROR:]
-    CHAN.sync()
-    CHAN.emit("ERROR", payload)
+    CHAN.event("ERROR", payload)
 
 
 def emit_exception(exc):
@@ -737,8 +799,10 @@ class IPythonRunner(object):
 # ------------------------------------------------------------------- loop
 
 
-def _apply_env(pairs):
-    saved = {}
+def _apply_env(pairs, saved):
+    """Set the run's env, recording in saved what to put back. saved is
+    filled as it goes, so a pair that fails (a NUL in a value) leaves the
+    ones set before it restorable."""
     for pair in pairs:
         name, _, value = pair.partition("=")
         if not name:
@@ -746,7 +810,6 @@ def _apply_env(pairs):
         if name not in saved:
             saved[name] = os.environ.get(name)
         os.environ[name] = value
-    return saved
 
 
 def _restore_env(saved):
@@ -757,28 +820,50 @@ def _restore_env(saved):
             os.environ[name] = value
 
 
-def execute(runner, code, env_pairs):
+def _start_run():
     S.count += 1
-    S.running = True
     S.pending = False
-    saved = _apply_env(env_pairs)
+    # running and COUNT change together under the frame lock, so a result
+    # from a user thread lands either before the run (dropped) or after its
+    # COUNT, never ahead of it.
+    with _LOCK:
+        S.running = True
+        CHAN.emit("COUNT", str(S.count))
+
+
+def _end_run(status):
+    S.user = False
+    S.pending = False
+    with _LOCK:
+        S.running = False
+        CHAN.event("DONE", status)
+
+
+def execute(runner, code, env_pairs):
+    _start_run()
+    saved = {}
     status = "interrupted"
     try:
-        CHAN.emit("COUNT", str(S.count))
-        status = runner.run(code, S.count)
         try:
-            in_user(emit_figures)
-        except KeyboardInterrupt:
-            status = "interrupted"
-        except BaseException:
-            traceback.print_exc()
+            # Inside the run: an env the process cannot hold is this run's
+            # error, not an exception that ends the driver's loop and with
+            # it the context.
+            _apply_env(env_pairs, saved)
+        except Exception as exc:
+            emit_exception(exc)
+            status = "error"
+        else:
+            status = runner.run(code, S.count)
+            try:
+                in_user(emit_figures)
+            except KeyboardInterrupt:
+                status = "interrupted"
+            except BaseException:
+                traceback.print_exc()
     finally:
         S.user = False
-        S.running = False
-        S.pending = False
         _restore_env(saved)
-    CHAN.sync()
-    CHAN.emit("DONE", status)
+    _end_run(status)
 
 
 def _exit(code):
@@ -807,10 +892,7 @@ def serve(runner):
                 if not done:
                     # An interrupt landed in the driver's own bookkeeping,
                     # outside user code. The run still ends with one DONE.
-                    S.user = False
-                    S.running = False
-                    CHAN.sync()
-                    CHAN.emit("DONE", "interrupted")
+                    _end_run("interrupted")
         except KeyboardInterrupt:
             S.user = False
             S.running = False

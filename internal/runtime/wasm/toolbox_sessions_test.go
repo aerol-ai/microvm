@@ -1,6 +1,7 @@
 package wasm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -103,7 +104,7 @@ func TestServeToolboxSessionsUnknownSandbox(t *testing.T) {
 	if _, err := s.Follow("x", "y"); err == nil {
 		t.Fatal("follow on an unknown sandbox")
 	}
-	if err := s.Input("x", "y", nil); err == nil {
+	if err := s.Input(context.Background(), "x", "y", nil); err == nil {
 		t.Fatal("input on an unknown sandbox")
 	}
 }

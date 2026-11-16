@@ -53,6 +53,13 @@ type pipe struct {
 type activeRun struct {
 	out  [2]chan []byte
 	done chan struct{}
+
+	// Under kernel.mu. counted is set once the run's COUNT was handled:
+	// from then on the driver takes SIGINT as an interrupt of the run.
+	// Before it, the driver may still be idle and drop SIGINT on purpose,
+	// so interrupted records an Interrupt to send again at COUNT.
+	counted     bool
+	interrupted bool
 }
 
 type kernel struct {
@@ -98,7 +105,11 @@ func startKernel(cmd *exec.Cmd, start StartFunc, nonce string) (*kernel, error) 
 	for i := range pipes {
 		r, w, err := os.Pipe()
 		if err != nil {
-			closeAll(parent)
+			// The pipes made so far are in neither list yet. A launch that
+			// fails on a full descriptor table must not make it fuller.
+			for _, p := range pipes[:i] {
+				closeAll(p[:])
+			}
 			closeAll(child)
 			return nil, err
 		}
@@ -213,17 +224,47 @@ func (k *kernel) readPipe(i int) {
 	}
 }
 
-// Interrupt sends SIGINT to the kernel's process group.
+// Interrupt sends SIGINT to the kernel's process group. When a run was
+// handed over but its COUNT has not come yet, the driver may not have read
+// it and drops the signal as idle, so it is sent again at COUNT.
 func (k *kernel) Interrupt() error {
 	select {
 	case <-k.exited:
 		return nil
 	default:
 	}
+	k.mu.Lock()
+	if r := k.run; r != nil && !r.counted {
+		r.interrupted = true
+	}
+	k.mu.Unlock()
+	return k.sigint()
+}
+
+func (k *kernel) sigint() error {
 	if err := syscall.Kill(-k.pid, syscall.SIGINT); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
 	return nil
+}
+
+// onCount records that the run's COUNT arrived, and sends an interrupt
+// that came before it again.
+func (x *execution) onCount() {
+	k := x.k
+	k.mu.Lock()
+	again := !x.run.counted && x.run.interrupted
+	x.run.counted = true
+	k.mu.Unlock()
+	if !again {
+		return
+	}
+	select {
+	case <-k.exited:
+		// Reaped: the group id may be someone else's now.
+	default:
+		_ = k.sigint()
+	}
 }
 
 // Close kills the kernel's process group and releases its descriptors.
@@ -442,6 +483,9 @@ func (x *execution) handle(fr frame) (codeinterp.Outcome, bool) {
 		return codeinterp.Outcome{Status: string(fr.payload)}, true
 	}
 	defer x.release(x.k.synced)
+	if fr.kind == "COUNT" {
+		x.onCount()
+	}
 	// READY, FATAL and kinds a newer driver may add mean nothing mid-run.
 	if ev, ok := codeinterp.EventFromFrame(fr.kind, fr.payload); ok {
 		x.sink(ev)

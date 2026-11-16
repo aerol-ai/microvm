@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -344,7 +343,7 @@ func TestAdoptRestoresGuestListeners(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d, _, _, clients := adoptDriver(t, true)
-			sock := filepath.Join(d.cfg.RunDir, "sb-w", "worker.sock")
+			sock := d.workerSocketPath("sb-w")
 			clients[sock] = &socketClient{loaded: map[string]bool{"sb-w": true}}
 			withFound(t, []worker.FoundWorker{{PID: 3, Socket: sock, Proc: &heldProc{pid: 3}}}, nil)
 			d.AdoptWorkers(context.Background())

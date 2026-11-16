@@ -14,8 +14,9 @@ import (
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
-// noListenEngine is a minimal Engine whose SupportsListen() is false — mirroring
-// the wasmtime backend, which cannot yet host a wasip1 TCP listener.
+// noListenEngine is a minimal Engine whose SupportsListen() is false — as
+// the wasmtime backend is for a module that exports no memory, or on a host
+// other than Linux and macOS.
 type noListenEngine struct{}
 
 func (noListenEngine) LoadModule(context.Context, string, wasmengine.LoadOptions) error { return nil }
@@ -94,7 +95,8 @@ func TestSetListenPortRejectedWhenEngineLacksListen(t *testing.T) {
 }
 
 // noListenServer is a worker whose engine cannot pre-open a listener (as
-// wasmtime), with a real module loaded the way load_module records it.
+// wasmtime for a module it cannot serve), with a real module loaded the way
+// load_module records it.
 func noListenServer(t *testing.T) (*Server, *Client) {
 	t.Helper()
 	t.Setenv("AEROL_WASM_ENGINE", "wasmtime")

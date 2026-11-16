@@ -31,8 +31,10 @@ type Sessions interface {
 	Logs(sessionID, commandID string, q toolboxwire.LogQuery) (stdout, stderr toolboxwire.LogWindow, err error)
 	// Follow is the command's output so far, then its live output.
 	Follow(sessionID, commandID string) (*LogFollow, error)
-	// Input writes to the running command's stdin.
-	Input(sessionID, commandID string, data []byte) error
+	// Input writes to the running command's stdin. It gives up when ctx
+	// ends, and answers ErrInputTimeout when the command does not take the
+	// bytes in time or ErrInputPending while an earlier input still waits.
+	Input(ctx context.Context, sessionID, commandID string, data []byte) error
 	// Entrypoint is the sandbox's serving guest, and with logs its output.
 	Entrypoint(ctx context.Context, logs bool) (EntrypointInfo, error)
 	// FollowEntrypoint is the entrypoint's output so far, then its live
@@ -111,6 +113,16 @@ var (
 	ErrEntrypointUnsupported = errors.New("entrypoint logs are not available for this wasm sandbox: its worker predates them or runs the wasmtime engine")
 	// ErrSessionStopped: the sandbox stopped while the request was served.
 	ErrSessionStopped = errors.New("the wasm sandbox stopped")
+
+	// ErrInputPending: an earlier input to the command is still waiting
+	// for it to read. A second one is refused rather than queued behind
+	// it, so input a command never reads cannot pile up in sandboxd. HTTP
+	// 409.
+	ErrInputPending = errors.New("the command has not read its earlier input yet")
+	// ErrInputTimeout: the command did not take the input in time; it
+	// stays queued for the command, and later input waits behind it. HTTP
+	// 408.
+	ErrInputTimeout = errors.New("the command did not read its input in time")
 )
 
 // sessionErrorStatus maps a Sessions error to its HTTP status.
@@ -118,8 +130,10 @@ func sessionErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, ErrSessionNotFound), errors.Is(err, ErrCommandNotFound), errors.Is(err, ErrNoEntrypoint):
 		return http.StatusNotFound
-	case errors.Is(err, ErrCommandNotRunning), errors.Is(err, ErrSessionStopped):
+	case errors.Is(err, ErrCommandNotRunning), errors.Is(err, ErrSessionStopped), errors.Is(err, ErrInputPending):
 		return http.StatusConflict
+	case errors.Is(err, ErrInputTimeout):
+		return http.StatusRequestTimeout
 	case errors.Is(err, ErrTooManySessions), errors.Is(err, ErrTooManyCommands), errors.Is(err, ErrTooManyFollowers):
 		return http.StatusTooManyRequests
 	case errors.Is(err, ErrEntrypointUnsupported):

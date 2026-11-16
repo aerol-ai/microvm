@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/codeinterp"
 	"github.com/aerol-ai/microvm/internal/codeinterp/daytona"
 	"github.com/aerol-ai/microvm/internal/codeinterp/e2b"
+	"github.com/aerol-ai/microvm/internal/runtime/wasm/toolhost"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -68,7 +69,7 @@ func (d *Driver) interpreters(sandboxID string) *interpState {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	inst := d.byID[sandboxID]
-	if inst == nil || inst.status != models.SandboxStatusStarted {
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.stopping > 0 {
 		return nil
 	}
 	if inst.interp == nil {
@@ -123,8 +124,10 @@ func (s *interpState) daytona() http.Handler {
 	if s.daytonaH == nil {
 		opts := daytona.ManagerOptions(s.launcher, s.limit, interpreterDefaultCwd)
 		opts.IdleTTL = s.idleTTL
+		opts.QueueLimit = toolhost.InterpreterQueueLimit
 		s.daytonaMgr = codeinterp.NewManager(opts)
-		s.daytonaH = daytona.NewHandler(s.daytonaMgr, s.logger)
+		s.daytonaH = daytona.NewHandler(s.daytonaMgr, s.logger,
+			daytona.WithMaxMessageBytes(toolhost.InterpreterMaxRequestBytes))
 	}
 	return s.daytonaH
 }
@@ -141,8 +144,10 @@ func (s *interpState) e2b() http.Handler {
 	if s.e2bH == nil {
 		opts := e2b.ManagerOptionsAt(s.launcher, s.limit, interpreterDefaultCwd)
 		opts.IdleTTL = s.idleTTL
+		opts.QueueLimit = toolhost.InterpreterQueueLimit
 		s.e2bMgr = codeinterp.NewManager(opts)
-		s.e2bH = e2b.NewHandler(s.e2bMgr, s.logger)
+		s.e2bH = e2b.NewHandler(s.e2bMgr, s.logger,
+			e2b.WithMaxBodyBytes(toolhost.InterpreterMaxRequestBytes))
 	}
 	return s.e2bH
 }

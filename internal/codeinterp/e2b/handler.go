@@ -23,9 +23,24 @@ import (
 	"github.com/aerol-ai/microvm/internal/codeinterp"
 )
 
-// maxBodyBytes bounds a request body. Code is sent inline, so the bound is
-// the driver frame cap the code has to fit in anyway.
-const maxBodyBytes = codeinterp.MaxFramePayload
+// DefaultMaxBodyBytes bounds a request body. Code is sent inline, so on
+// toolboxd, where the buffer is the sandbox's own memory, the bound is the
+// driver frame cap the code has to fit in anyway. A host that buffers for
+// many sandboxes passes a smaller one (WithMaxBodyBytes).
+const DefaultMaxBodyBytes int64 = codeinterp.MaxFramePayload
+
+// Option tunes a handler.
+type Option func(*handler)
+
+// WithMaxBodyBytes bounds a request body; a larger one is answered 413.
+// n <= 0 keeps DefaultMaxBodyBytes.
+func WithMaxBodyBytes(n int64) Option {
+	return func(h *handler) {
+		if n > 0 {
+			h.maxBody = n
+		}
+	}
+}
 
 type handler struct {
 	m         *codeinterp.Manager
@@ -40,15 +55,19 @@ type handler struct {
 // NewHandler serves E2B's Code Interpreter routes from m, which should be
 // built with ManagerOptions. Paths are relative to the mount point; query
 // strings are ignored.
-func NewHandler(m *codeinterp.Manager, logger *slog.Logger) http.Handler {
-	return newHandler(m, logger, KeepaliveInterval)
+func NewHandler(m *codeinterp.Manager, logger *slog.Logger, opts ...Option) http.Handler {
+	h := newHandler(m, logger, KeepaliveInterval)
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func newHandler(m *codeinterp.Manager, logger *slog.Logger, keepalive time.Duration) *handler {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	h := &handler{m: m, logger: logger, keepalive: keepalive, maxBody: maxBodyBytes, now: time.Now}
+	h := &handler{m: m, logger: logger, keepalive: keepalive, maxBody: DefaultMaxBodyBytes, now: time.Now}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /execute", h.execute)
 	mux.HandleFunc("POST /contexts", h.createContext)
@@ -116,6 +135,12 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		writeText(w, http.StatusBadRequest, "Only one of context_id or language can be provided")
 		return
 	}
+	// Manager.Run checks env too, but only once the stream has started;
+	// here the caller's mistake gets E2B's plain-text 400 instead.
+	if err := codeinterp.ValidateEnv(req.EnvVars); err != nil {
+		writeText(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var info codeinterp.ContextInfo
 	var err error
@@ -148,7 +173,7 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		codeinterp.RunPolicy{InterruptOnCancel: true})
 	switch {
 	case err != nil:
-		out.send(newErrorLine(runErrorName(err), err.Error(), ""))
+		out.send(newErrorLine(runErrorName(err), h.publicMessage(err, "run", "context_id", info.ID), ""))
 	case res.Restarted:
 		out.send(newErrorLine(errNameRestarting, errTextRestarting, ""))
 	case res.Died:
@@ -187,11 +212,35 @@ func (h *handler) writeLookupError(w http.ResponseWriter, contextID string, err 
 	}
 }
 
+// internalErrorText replaces the message of an error publicMessage does
+// not know.
+const internalErrorText = "code interpreter internal error"
+
+// publicMessage is what a client is told about err. The kinds the Manager
+// and the launchers define keep their messages, which name nothing of the
+// host's (a missing interpreter names the programs to install). Anything
+// else can carry host paths, such as a WASM module file in sandboxd's state
+// or a driver script, so it is logged whole and the client gets
+// internalErrorText.
+func (h *handler) publicMessage(err error, what string, attrs ...any) string {
+	var missing *codeinterp.MissingInterpreterError
+	switch {
+	case errors.As(err, &missing):
+		return missing.Error()
+	case codeinterp.IsNotFound(err), errors.Is(err, codeinterp.ErrLimit), errors.Is(err, codeinterp.ErrQueueFull),
+		errors.Is(err, codeinterp.ErrUnsupportedLanguage), errors.Is(err, codeinterp.ErrClosed),
+		errors.Is(err, codeinterp.ErrInvalidEnv), errors.Is(err, codeinterp.ErrDefaultContext):
+		return err.Error()
+	}
+	h.logger.Warn("e2b interpreter: "+what+" failed", append(attrs, "error", err)...)
+	return internalErrorText
+}
+
 // writeCreateError answers a failed context create. A full sandbox is 429
 // (plans/code-interpreter.md D11); the SDKs show the status and body
 // whatever it is.
 func (h *handler) writeCreateError(w http.ResponseWriter, err error) {
-	msg := "Failed to create context: " + err.Error()
+	msg := "Failed to create context: " + h.publicMessage(err, "context create")
 	switch {
 	case errors.Is(err, codeinterp.ErrUnsupportedLanguage):
 		writeText(w, http.StatusBadRequest, msg)
@@ -200,7 +249,6 @@ func (h *handler) writeCreateError(w http.ResponseWriter, err error) {
 	case errors.Is(err, codeinterp.ErrClosed):
 		writeText(w, http.StatusServiceUnavailable, msg)
 	default:
-		h.logger.Warn("e2b interpreter: context create failed", "error", err)
 		writeText(w, http.StatusInternalServerError, msg)
 	}
 }
@@ -255,10 +303,9 @@ func (h *handler) writeContextError(w http.ResponseWriter, id, verb string, err 
 	status := http.StatusInternalServerError
 	if errors.Is(err, codeinterp.ErrClosed) {
 		status = http.StatusServiceUnavailable
-	} else {
-		h.logger.Warn("e2b interpreter: context "+verb+" failed", "context_id", id, "error", err)
 	}
-	writeText(w, status, fmt.Sprintf("Failed to %s context %s: %v", verb, id, err))
+	msg := h.publicMessage(err, "context "+verb, "context_id", id)
+	writeText(w, status, fmt.Sprintf("Failed to %s context %s: %s", verb, id, msg))
 }
 
 func (h *handler) health(w http.ResponseWriter, _ *http.Request) {

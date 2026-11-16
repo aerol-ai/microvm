@@ -123,12 +123,15 @@ stripped), `html`, `markdown`, `svg`, `png`, `jpeg`, `pdf`, `latex`,
 ### 4.3 E2B facade changes
 
 - `pkg/api/e2b/runtime_proxy.go`: `E2b-Sandbox-Port: 49999` → toolbox path
-  `/interpreter/e2b` + path; accept `X-Access-Token` or
-  `E2B-Traffic-Access-Token` (constant-time compare against the sandbox's
-  toolbox token).
+  `/interpreter/e2b` + path. `X-Access-Token` (the toolbox token) opens
+  every path; `E2B-Traffic-Access-Token` opens only `/contexts`,
+  `/contexts/{id}`, `/contexts/{id}/restart` and `/health` on port 49999,
+  never `/execute` or envd. Constant-time compares.
 - Create and connect responses fill `trafficAccessToken` for secure
   sandboxes (the SDK sends it on `/contexts` calls, which never carry
-  `X-Access-Token`).
+  `X-Access-Token`). It is not the toolbox token: E2B treats the traffic
+  token as shareable, so it is HMAC-SHA256 keyed by the toolbox token over
+  `"e2b-traffic:" + sandboxID`, hex.
 - `POST /e2b/v2/sandboxes` and `POST /e2b/v2/sandboxes/{id}/connect`, so the
   current E2B SDKs (e2b >= 2.51) can create sandboxes at all.
 - `code-interpreter-v1` default template (D10).
@@ -175,20 +178,31 @@ the way, so every exposed port reaches the same listener.
 - Fixed on the way: concurrent exposes of two ports raced on the instance;
   the listener lookup stopped at fd 10.
 
-**#175 finding.** No wasmtime release (checked v37 to v50, the newest) can
-give a WASI guest a pre-opened TCP listener: the C API had
+**#175.** No wasmtime release (checked v37 to v50, the newest) can give a
+WASI guest a pre-opened TCP listener on its own: the C API had
 `wasi_config_preopen_socket` only in v14-v19, wasmtime-go never wrapped it,
-and wasmtime's preview-1 `sock_accept` is a stub. So a standard wasip1
-server cannot listen on wasmtime. We ship what is possible:
-- When a sandbox on the wasmtime engine exposes a port, its worker rebuilds
-  that sandbox's engine as wazero and serves HTTP there (instruction metering
-  is off for that sandbox, and the sandbox reports which engine it runs).
-  Operators can turn the fallback off (`SB_WASM_WASMTIME_LISTEN_FALLBACK`),
-  which keeps today's clear error.
-- The `-tags wasmtime` build itself is broken on Go 1.26 (the bundled
-  `libwasmtime.a` carries LLVM bitcode, which cmd/go now refuses). That needs
-  a decision outside this work (fork the bindings with stripped libraries);
-  it is listed in "Not in this work".
+and wasmtime's preview-1 `sock_accept` is a stub. So the engine serves the
+guest's sockets itself (pkg/wasm/wasip1_sockets*.go, wasmtime_sockets.go):
+- The guest's linker defines WASI, then shadows the preview-1 calls that can
+  see a socket (sock_accept/recv/send/shutdown, fd_read/write/close,
+  fd_fdstat_get/set_flags, fd_filestat_get, fd_renumber, poll_oneoff) with Go
+  versions. Socket fds live from 1<<24 up, a range wasmtime never hands out;
+  the guest learns them from AEROL_WASM_LISTEN_FD / AEROL_WASM_LISTEN_FDS.
+- Every other fd goes to wasmtime's own implementation through a small
+  trampoline module in the same store that imports the guest's memory, so
+  both share one WASI fd table.
+- poll_oneoff waits on the guest's host sockets plus a stop pipe (ppoll on
+  Linux, poll on macOS), so stop, close and the wall timeout end a guest that
+  is waiting.
+- Needs Linux or macOS and a guest that exports a 32-bit memory; anything
+  else still moves to wazero when it exposes a port (the first fix, kept as
+  a fallback; `SB_WASM_WASMTIME_LISTEN_FALLBACK=false` refuses instead).
+- Go 1.26 refuses upstream wasmtime-go's bundled `libwasmtime.a` (it
+  carries LLVM bitcode). #1307 moved the build to
+  `github.com/aerol-ai/wasmtime-go/v37`, the same v37.0.0 release with the
+  bitcode stripped (the fork's README says how to rebuild and check it).
+  The `wasmtime-engine` CI job builds sandboxd with the tag and runs the
+  real-engine tests on Linux amd64 and arm64.
 
 ## 7. Safety axes (pr-review.md)
 
@@ -226,7 +240,3 @@ server cannot listen on wasmtime. We ship what is possible:
 - Daytona browser/Deno TS clients and the Ruby SDK (they authenticate with
   preview tokens the facade does not read; same gap as PTY today).
 - Contexts surviving a sandbox restart or move.
-- Fixing the `-tags wasmtime` build on Go 1.26 (needs a fork of
-  wasmtime-go with bitcode-free libraries; owner decision).
-- A true wasip1 listener inside the wasmtime engine (not possible with any
-  wasmtime release; a WASI-import wrapper is a multi-week spike).
