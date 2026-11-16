@@ -2507,8 +2507,10 @@ throttling and auth failures, image layers big enough to fill a disk or
 saturate a link, 32-CPU workers and the alert thresholds at 60 workers
 (`> 100` creates in flight is about 2 per worker there), the operator
 actually getting machines when no worker can admit (here its new workers
-stayed Pending), gVisor on Amazon Linux, an internal NLB in front of the gateways,
-and a viewer-only scrape token.
+stayed Pending), gVisor on Amazon Linux, and an internal NLB in front of
+the gateways. The viewer-only scrape token is proven on kind (F40): the
+harness's setup scrapes all 10 pods with one; the drills themselves ran
+with the admin token, before that fix.
 
 ### Phase 5 results
 
