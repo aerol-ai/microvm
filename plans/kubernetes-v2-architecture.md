@@ -2410,17 +2410,30 @@ Findings, each fixed on this branch unless it says otherwise:
 - F40. With `monitoring.enabled` and no `monitoring.scrapeToken`, the
   cluster-mode ServiceMonitors read `aerolvm-api-token`, which only single
   mode makes. The Prometheus Operator refused all three ("unable to get
-  secret"), so no sandboxd was scraped. They now read the operator's
-  `<cluster.name>-admin`. The bank values set a scrape token and were not
-  affected.
+  secret"), so no sandboxd was scraped. The bank values named a viewer
+  token, but nothing turned API tokens on beyond the workers: server and
+  gateway pods take only `SB_CLUSTER_*` from `worker.extraEnv`, and on
+  kind a viewer token got 401 on every gateway and server. Now
+  `identity.enabled` turns tokens on for servers, gateways and workers
+  (the bank values set it), and cluster mode with monitoring on fails the
+  render unless `monitoring.scrapeToken.existingSecret` names a Secret,
+  with the commands that make a viewer token. Naming `<cluster.name>-admin`
+  stays the operator's own choice; it is no default, since it can do
+  everything. A pod reads `identity.enabled` when it is made: on kind,
+  turning it on with `helm upgrade` reached no running pod until each was
+  replaced, so it belongs in the install. The drills above scraped with
+  the admin token, before this fix. The harness's setup now makes a
+  viewer token and its Secret, and on kind Prometheus read all 10 pods
+  with it.
 - F41. After Caddy's admin API came back, a gateway kept reporting route
   lag (32 on `main`) until the next create: a pass counted as installed
   only the highest version still in its view, so the versions of sandboxes
   created and deleted during the outage stayed "seen", and a quiet cluster
   would keep `SandboxdIngressRouteLag` firing after the fix. A successful
-  pass now records the version of the view it read: on a server the FSM's
-  applied index, on a gateway the placement feed's cursor, which the point
-  reads a gateway makes on every routed call never move. On dev.3 the lag
+  pass now records the version its view was read at, returned with the
+  view: on a server the FSM's applied index; on a gateway the placement
+  feed's cursor, or without the feed its page walks' version. The point
+  reads a gateway makes on every routed call never move it. On dev.3 the lag
   went from 2,732 to 0 within a minute of Caddy's restart, with no create.
 - F42. Every create that met registry trouble answered 400: a 429, no
   response headers within containerd's 30 s, and every create the backoff
