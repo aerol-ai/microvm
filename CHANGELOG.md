@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 11 releases : v0.6.9 to v0.7.5
+    November 2026 : 12 releases : v0.6.9 to v0.7.6
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 6 | Nov 10, 2026 to Nov 14, 2026 | [v0.7.5](#v075-v074-with-a-signed-helm-chart) |
+| [0.7](#07-release-line) | 7 | Nov 10, 2026 to Nov 16, 2026 | [v0.7.6](#v076-a-code-interpreter-and-a-full-toolbox-for-wasm-sandboxes) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,30 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.6: a code interpreter, and a full toolbox for WASM sandboxes
+
+*November 16, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.6)
+
+This release adds a code interpreter: code runs in a program that stays open inside the sandbox, so a variable set in one run is still there in the next. It works from the Daytona SDK and E2B's Code Interpreter SDK, on container, Firecracker and WebAssembly (WASM) sandboxes. WASM sandboxes also get streamed commands, Daytona sessions and more than one open port.
+
+- **A code interpreter.** Make a context, run code in it, and its variables stay for the next run. Container and Firecracker sandboxes run Python, JavaScript, TypeScript, Bash, R and Java, as long as the image has the language's program (`python3`, `node`, `bash`, `Rscript` or `java`). WASM sandboxes run Python. Runs stream their output, show errors, and stop on a timeout or when you interrupt them. V8-isolate sandboxes answer 501. See the new [Code interpreter](https://microvm.aerol.ai/code-interpreter/) page.
+- **E2B's current SDKs work.** E2B SDKs from 2.51 could not create a sandbox at all (HTTP 405). They now can, E2B's Code Interpreter SDK runs code, and the `code-interpreter-v1` template starts a `python:3.12-slim` sandbox.
+- **WASM sandboxes catch up.** Streamed commands (`execStream`), Daytona command sessions and entrypoint logs, Daytona's `codeRun`, and one listener for each exposed port now work on WASM sandboxes. Every run happens inside the sandbox's own engine, never as a program on the server.
+- **WASM file calls stay in their folders.** A file call from WASM code can no longer follow a link out of its shared folder, and a read-only mount stays read-only.
+- **Debug commands no longer open the firewall on containerd.** A command run inside a sandbox from the node (for example `ctr task exec`) made AerolVM think the sandbox had stopped, so it removed the sandbox's firewall rules while the sandbox kept running. A sandbox set to block outbound traffic could then send data out. Now only the sandbox's own process ending counts as a stop.
+- **Network caps count from the first byte.** A sandbox's send and receive caps missed its traffic until the server's first reading, up to 10 seconds after each start or restart. That traffic is now counted.
+
+**Before you upgrade:**
+
+- **AerolVM SDKs.** The published AerolVM SDKs (0.8.3) don't have the code interpreter calls yet. Use the Daytona or E2B SDK for it for now. SDK 0.8.3 keeps working with this release.
+- **Firecracker templates built before v0.7.6** keep the agent they were built with, which has no code interpreter. Rebuild a template to use it there. On other runtimes, restart a sandbox that predates the upgrade to give it the current agent.
+- **Install the language in the image.** The code interpreter starts the language's own program in the sandbox. Without it, a run fails with "interpreter not found in the sandbox".
+- **WASM: 4 runs per sandbox by default, was 8.** Each run can use the sandbox's whole memory limit. Raise it with `SB_WASM_MAX_STREAMS_PER_SANDBOX` (at most 32).
+- **WASM: links that leave a folder are refused.** A link with an absolute target or a `..` in it now fails with a permission error inside WASM shared folders. WASM workers that keep running across the upgrade get this when they next restart.
+- **E2B traffic token.** If you used the traffic token for anything other than the code interpreter, use the sandbox's access token instead.
+- **Daytona sizes are whole numbers.** A sandbox with 512 MB shows 1 GB of memory, and half a CPU shows as 1, in every answer.
+- **Plain VM clusters and single nodes:** nothing else to do.
 
 ### v0.7.5: v0.7.4 with a signed Helm chart
 
