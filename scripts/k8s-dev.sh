@@ -203,7 +203,11 @@ VALUES
   done
   kubectl --context "kind-$cluster" -n "$namespace" get aerolcluster,aerolnodes >&2
   [[ "$phase" == Ready ]] || { echo "k8s-dev: the AerolCluster is $phase, not Ready" >&2; exit 1; }
-  echo "k8s-dev: ready. Next: kubectl -n $namespace port-forward svc/aerolvm-gateway 21212:21212" >&2
+  # With the edge the gateway Service carries only 443, 80 and 2220 (the
+  # edge serves the API on 443), so the API port is the servers' Service.
+  api_svc=aerolvm-gateway
+  [[ "$edge" == 1 ]] && api_svc=aerolvm-api
+  echo "k8s-dev: ready. Next: kubectl -n $namespace port-forward svc/$api_svc 21212:21212" >&2
   exit 0
 fi
 
