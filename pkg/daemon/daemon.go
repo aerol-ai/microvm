@@ -329,6 +329,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		MemoryOverProvisionFactor: cfg.MemoryOverProvisionFactor,
 		RSSWatermarkRatio:         cfg.FirecrackerRSSWatermarkRatio,
 	}, memProbe, rssSource)
+	// A cluster server or gateway keeps an admitter (gossip and /v1/capacity
+	// read it) but turns every create away: it publishes can_admit 0.
+	admitter.SetOwnsSandboxes(cfg.OwnsSandboxes())
 	logger.Info("capacity admission configured",
 		"host_cpu_cores", host.CPUCores,
 		"host_memory_mb", host.MemoryTotalMB,

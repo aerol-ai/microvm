@@ -3795,6 +3795,12 @@ func (c Config) IsServer() bool { return c.hasRole(NodeRoleServer) }
 // return false; mixed and any hybrid that includes "worker" return true.
 func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 
+// OwnsSandboxes reports whether this daemon runs sandboxes itself: any
+// single node, and a cluster node with the worker role. A cluster server or
+// gateway refuses every create (createSandbox's no-placement-target gate),
+// so its capacity gauge must not say it can admit one.
+func (c Config) OwnsSandboxes() bool { return !c.EnableCluster || c.IsWorker() }
+
 // cgroupV2Mount is where cgroup v2 is mounted.
 const cgroupV2Mount = "/sys/fs/cgroup"
 

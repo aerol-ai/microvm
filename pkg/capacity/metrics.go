@@ -43,7 +43,10 @@ var (
 	hostPressureRSSWatermark        = expvar.NewInt("aerolvm_host_pressure_rss_watermark_mb")
 )
 
-func recordHostPressure(s Snapshot) {
+// recordHostPressure publishes a snapshot. ownsSandboxes is false on a node
+// that turns every create away (Admitter.SetOwnsSandboxes): its can_admit
+// is 0.
+func recordHostPressure(s Snapshot, ownsSandboxes bool) {
 	hostPressureSandboxes.Set(int64(s.SandboxesActive))
 	hostPressureReservedCPU.Set(millicores(s.ReservedCPU))
 	hostPressureCPUBudget.Set(millicores(s.CPUBudget))
@@ -59,7 +62,7 @@ func recordHostPressure(s Snapshot) {
 	hostPressureActualRSS.Set(int64(s.ActualRSSMB))
 	hostPressureEffectiveMemoryFree.Set(int64(s.EffectiveMemoryFreeMB))
 	hostPressureRSSWatermark.Set(int64(s.RSSWatermarkMB))
-	if s.CanAdmit {
+	if s.CanAdmit && ownsSandboxes {
 		hostPressureCanAdmit.Set(1)
 	} else {
 		hostPressureCanAdmit.Set(0)

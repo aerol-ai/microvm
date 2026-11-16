@@ -955,3 +955,28 @@ func TestSnapshotAdvertisesMediatedEgress(t *testing.T) {
 		t.Fatalf("a peer that omits the field must read as not enforcing: %+v, %v", old, err)
 	}
 }
+
+// A cluster server or gateway has room on paper but turns every create
+// away: it publishes can_admit 0, so SandboxdNoAdmitWorkers, which sums the
+// gauge over every node, sees only the workers (issue #1343). Its snapshot
+// still answers for its resources; placement skips the role on its own.
+func TestSnapshotCanAdmitGaugeZeroWhenNodeOwnsNoSandboxes(t *testing.T) {
+	a := New(HostInfo{CPUCores: 4, MemoryTotalMB: 4096}, Limits{
+		CPUReservationRatio:    1.0,
+		MemoryReservationRatio: 1.0,
+	}, nil)
+
+	if snap := a.Snapshot(); !snap.CanAdmit || hostPressureCanAdmit.Value() != 1 {
+		t.Fatalf("a node that owns sandboxes, with room: CanAdmit=%v gauge=%d, want true and 1",
+			snap.CanAdmit, hostPressureCanAdmit.Value())
+	}
+	a.SetOwnsSandboxes(false)
+	if snap := a.Snapshot(); !snap.CanAdmit || hostPressureCanAdmit.Value() != 0 {
+		t.Fatalf("a server or gateway: CanAdmit=%v gauge=%d, want true (its own resources) and 0",
+			snap.CanAdmit, hostPressureCanAdmit.Value())
+	}
+	a.SetOwnsSandboxes(true)
+	if a.Snapshot(); hostPressureCanAdmit.Value() != 1 {
+		t.Fatalf("back to a worker: gauge=%d, want 1", hostPressureCanAdmit.Value())
+	}
+}
