@@ -113,6 +113,10 @@ containers:
       {{- if $kubeAPI }}
       {{- include "aerolvm.agentSandboxEnv" $root | nindent 6 }}
       {{- end }}
+      {{- /* API tokens, as on the workers: a gateway or server without
+      them refuses a token the workers take. Never the admin token on a
+      gateway: that stays a server's alone (above). */}}
+      {{- with include "aerolvm.identityEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
       {{- if or (hasPrefix "SB_CLUSTER_" $k) (eq $k "SB_DEAD_OWNER_GRACE") }}
       - { name: {{ $k }}, value: {{ $v | quote }} }

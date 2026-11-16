@@ -12,10 +12,14 @@
 #   - Kubernetes NetworkPolicies around the worker pods, and sandboxes kept
 #     off private addresses;
 #   - API and sandbox links over HTTPS, the certificate from your issuer;
-#   - Prometheus monitoring, alerts and dashboards;
+#   - Prometheus monitoring, alerts and dashboards, read with a token that
+#     can only read;
+#   - AerolVM's own API tokens on every node, so people and CI can hold
+#     tokens that do less than the admin token;
 #   - worker machines replaced every 30 days.
 #
 # What it cannot set, and you must:
+#   - The scrape token's Secret, after the install (see monitoring below).
 #   - Pod Security: label the release namespace `restricted` (above). The
 #     chart makes the worker namespace and labels it `privileged`: worker
 #     pods are the one exception, and only that namespace allows it.
@@ -73,12 +77,20 @@ edge:
     # Your own certificate authority, or Let's Encrypt with DNS-01.
     issuerRef: { name: "<issuer>", kind: ClusterIssuer }
 
+# AerolVM's own API tokens on every server, gateway and worker: the scrape
+# token below is one, and every node refuses tokens without this.
+identity:
+  enabled: true
+
 monitoring:
   enabled: true
   # kube-prometheus-stack reads objects labelled with its release name.
   labels: { release: kube-prometheus-stack }
-  # A token that can only read metrics (`aerolvm token create --name
-  # prometheus --role viewer --team '*'`), in a Secret in this namespace.
+  # A token that can only read, in a Secret in this namespace. Install,
+  # then make it (signed in as admin; the install's notes show how):
+  #   kubectl -n aerolvm-system create secret generic <prometheus-token-secret> \
+  #     --from-literal=token="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
+  # Make a new one before it expires.
   scrapeToken:
     existingSecret: "<prometheus-token-secret>"
     key: token

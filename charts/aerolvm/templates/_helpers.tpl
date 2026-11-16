@@ -79,6 +79,27 @@ namespace's (servers, gateways, the operator) and the workers. */ -}}
 {{- end -}}
 
 {{/*
+API tokens (identity.enabled), on every node of the install alike. A node
+with them off refuses every token, so a cluster that had them on its
+workers alone (worker.extraEnv, the only way before) answered a scrape
+token 401 on its servers and gateways (issue #1343). worker.extraEnv may
+not set them in cluster mode for that reason, nor beside identity.enabled.
+*/}}
+{{- define "aerolvm.identityEnv" -}}
+{{- $identity := .Values.identity | default dict }}
+{{- $extra := hasKey (.Values.worker.extraEnv | default dict) "SB_IDENTITY_ENABLED" }}
+{{- if and $extra (ne .Values.mode "single") }}
+{{- fail "worker.extraEnv.SB_IDENTITY_ENABLED turns API tokens on for workers only: servers and gateways would refuse every token. Set identity.enabled=true instead; it reaches every node." }}
+{{- end }}
+{{- if and $extra $identity.enabled }}
+{{- fail "API tokens are set twice: keep identity.enabled and remove worker.extraEnv.SB_IDENTITY_ENABLED." }}
+{{- end }}
+{{- if $identity.enabled }}
+- { name: SB_IDENTITY_ENABLED, value: "true" }
+{{- end }}
+{{- end -}}
+
+{{/*
 The agent-sandbox API's settings (C17), on every node: gateways serve it,
 nodes with sandboxes report their run state.
 */}}

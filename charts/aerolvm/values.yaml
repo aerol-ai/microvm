@@ -22,6 +22,18 @@ image:
 apiToken:
   existingSecret: ""
 
+# AerolVM's own API tokens (`aerolvm token create`): each has a role and a
+# team, can do less than the admin token, and expires. On, every node takes
+# them: the worker in single mode; servers, gateways and workers in cluster
+# mode (SB_IDENTITY_ENABLED). A token works on a gateway or worker a few
+# seconds after it is made, once that node's copy of the token list catches
+# up. Off, only the admin token works. Turn it on for a read-only scrape
+# token (monitoring.scrapeToken). Do not set SB_IDENTITY_ENABLED in
+# worker.extraEnv instead: that reaches workers only, and servers and
+# gateways would refuse every token.
+identity:
+  enabled: false
+
 worker:
   # The runtime container's budget is the sandboxes' budget: every sandbox
   # runs in its cgroup (C7), capped below this limit with a reserve kept for
@@ -237,11 +249,18 @@ monitoring:
   # The namespace Prometheus runs in. In cluster mode the workers'
   # NetworkPolicy lets it, and only it, read their metrics.
   prometheusNamespace: monitoring
-  # /v1/metrics needs a token allowed to read metrics. Empty uses the API
-  # token, which can do everything. Better, with API tokens on
-  # (SB_IDENTITY_ENABLED): a token that can only read, `aerolvm token
-  # create --name prometheus --role viewer --team '*'`, kept in a Secret in
-  # this namespace and named here.
+  # /v1/metrics needs a token allowed to read metrics, kept in a Secret in
+  # this namespace and named here. Use one that can only read: turn on
+  # identity.enabled, then
+  #   aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d
+  # It reads metrics, sandbox details (never their env) and audit logs; it
+  # cannot create, change, run or read anything secret. Make a new one
+  # before it expires. The Secret may come after the install: Prometheus
+  # reads the pods once it exists.
+  # Single mode: empty uses the API token, which can do everything.
+  # Cluster mode: required. Naming <cluster.name>-admin, the operator's
+  # admin token, works too, but gives Prometheus a token that can do
+  # everything.
   scrapeToken:
     existingSecret: ""
     key: token

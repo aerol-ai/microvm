@@ -895,6 +895,7 @@ jobs:
         run: |
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
+          scripts/chart-pod-templates.sh --set identity.enabled=true > "$RUNNER_TEMP/pod-templates-identity.yaml"
           helm template t charts/aerolvm --namespace aerolvm-system \
             --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
             --set 'cluster.workerPools[0].name=general' \
@@ -922,6 +923,7 @@ jobs:
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
+          AEROLVM_POD_TEMPLATES_IDENTITY: ${{ runner.temp }}/pod-templates-identity.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
           AEROLVM_CHART_CRD_UPGRADE: ${{ runner.temp }}/chart-crd-upgrade.yaml
         run: |
@@ -1035,6 +1037,9 @@ jobs:
             grep -q "kind: $kind" <<<"$out" || { echo "::error::the bank preset rendered no $kind"; exit 1; }
           done
           grep -q 'SB_CONTAINER_RUNTIME, value: "gvisor"' <<<"$out"
+          # Its scrape token is a viewer token, which a node without API
+          # tokens refuses: servers, gateways and workers all turn them on.
+          test "$(grep -c 'SB_IDENTITY_ENABLED, value: "true"' <<<"$out")" -eq 3
 
       # The chart's alerts, recording rules and dashboards (P6, P9): every
       # metric they read is registered in the Go code (or is the

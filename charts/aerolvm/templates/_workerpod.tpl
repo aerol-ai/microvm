@@ -298,6 +298,7 @@ containers:
       {{- else }}
       - { name: SB_ENABLE_CADDY, value: "false" }
       {{- end }}
+      {{- with include "aerolvm.identityEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
       - { name: {{ $k }}, value: {{ $v | quote }} }
       {{- end }}

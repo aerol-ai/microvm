@@ -139,6 +139,14 @@ envelope.
   callers. Only servers hold it, from a Secret the operator makes in the
   release namespace.
 - **Callers** use AerolVM's own API tokens, SSO and roles, as on any install.
+  `identity.enabled` turns tokens on for servers, gateways and workers
+  alike; it gives no node the admin token.
+- **Prometheus reads metrics with a token you make.** In cluster mode the
+  chart has no default scrape token: you name its Secret
+  (`monitoring.scrapeToken`). The bank preset uses a viewer token for every
+  team. On every node it may read metrics, sandbox details (never their
+  env) and audit logs. It cannot create, change, stop or run anything,
+  read secrets, or make tokens, and it expires.
 
 **Or, with your own CA** (`cluster.externalCA.issuerRef`, external-CA mode):
 

@@ -23,6 +23,21 @@ the cluster: the first server, the other servers, then gateways and workers.
 {{- end }}
 
    kubectl -n {{ .Release.Namespace }} get secret {{ .Values.cluster.name }}-admin -o jsonpath='{.data.token}' | base64 -d
+{{- $scrape := .Values.monitoring.scrapeToken }}
+{{- if and .Values.monitoring.enabled (ne $scrape.existingSecret (printf "%s-admin" .Values.cluster.name)) }}
+
+4. Prometheus reads every node's metrics with the token in the Secret
+   {{ $scrape.existingSecret }}, and reads nothing until it exists. Make it with
+   a token that can only read, signed in as admin (aerolvm login <API URL> --token-stdin):
+
+   kubectl -n {{ .Release.Namespace }} create secret generic {{ $scrape.existingSecret }} \
+     --from-literal={{ $scrape.key }}="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
+
+   Make a new one before it expires.
+{{- if not (.Values.identity | default dict).enabled }}
+   identity.enabled is false: every node refuses such a token. Turn it on.
+{{- end }}
+{{- end }}
 
 Health: every AerolNode says Serving; a worker that says Failed names the
 machine check it failed. Check the install against the security evidence pack

@@ -887,3 +887,141 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 		t.Error("a server got a service account")
 	}
 }
+
+// podTemplates is the pod-templates ConfigMap's data: each role's template
+// as the operator reads it.
+func podTemplates(t *testing.T, docs []map[string]any) map[string]string {
+	t.Helper()
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		d, ok := cm["data"].(map[string]any)
+		if !ok || d["server"] == nil || d["gateway"] == nil || d["worker"] == nil {
+			continue
+		}
+		out := map[string]string{}
+		for role, body := range d {
+			out[role], _ = body.(string)
+		}
+		return out
+	}
+	t.Fatal("no pod-template ConfigMap")
+	return nil
+}
+
+// API tokens and the scrape token in cluster mode (issue #1343):
+// identity.enabled reaches servers, gateways and workers alike (the admin
+// token stays the servers'), worker.extraEnv may not turn tokens on for
+// workers alone, and monitoring has no default scrape token: the API
+// token Secret is single mode's, and the admin token is no default to
+// hand Prometheus. A Secret named explicitly, the admin one included,
+// renders. Single mode keeps its default.
+func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	const identityOn = `SB_IDENTITY_ENABLED, value: "true"`
+
+	// Identity: off by default on every role; on, on every role.
+	for _, tc := range []struct {
+		sets []string
+		want bool
+	}{{nil, false}, {[]string{"identity.enabled=true"}, true}} {
+		docs, err := renderChart(t, root, helm, with(tc.sets...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		templates := podTemplates(t, docs)
+		for _, role := range []string{"server", "gateway", "worker"} {
+			if got := strings.Contains(templates[role], identityOn); got != tc.want {
+				t.Errorf("identity %v: the %s template turns API tokens on = %v", tc.sets, role, got)
+			}
+			if got := strings.Contains(templates[role], "SB_PAT_TOKEN"); got != (role == "server") {
+				t.Errorf("identity %v: the %s template holds the admin token = %v; only servers may", tc.sets, role, got)
+			}
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED=true")...); err == nil ||
+		!strings.Contains(err.Error(), "Set identity.enabled=true instead") {
+		t.Errorf("cluster mode took worker.extraEnv.SB_IDENTITY_ENABLED, which reaches workers only: %v", err)
+	}
+
+	// Single mode: the value reaches the worker; worker.extraEnv alone still
+	// works as before; both at once is refused.
+	docs, err := renderChart(t, root, helm, "identity.enabled=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts := docsOfKind(docs, "StatefulSet")
+	if len(sts) != 1 || !envHas(dig(sts[0], "spec", "template", "spec", "containers"), "SB_IDENTITY_ENABLED", "true") {
+		t.Error("single mode: identity.enabled did not reach the worker")
+	}
+	docs, err = renderChart(t, root, helm, "worker.extraEnv.SB_IDENTITY_ENABLED=true")
+	if err != nil || !envHas(dig(docsOfKind(docs, "StatefulSet")[0], "spec", "template", "spec", "containers"), "SB_IDENTITY_ENABLED", "true") {
+		t.Errorf("single mode: worker.extraEnv.SB_IDENTITY_ENABLED no longer works: %v", err)
+	}
+	if _, err := renderChart(t, root, helm, "identity.enabled=true", "worker.extraEnv.SB_IDENTITY_ENABLED=true"); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("single mode: API tokens set twice rendered: %v", err)
+	}
+
+	// The scrape token: cluster mode refuses none, with the command that
+	// makes a read-only one.
+	_, err = renderChart(t, root, helm, with("monitoring.enabled=true")...)
+	for _, want := range []string{"monitoring.scrapeToken.existingSecret", "identity.enabled=true",
+		"aerolvm token create --name prometheus --role viewer --team '*'", "aerolvm-admin"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("cluster mode with no scrape token: %v; want a refusal naming %q", err, want)
+		}
+	}
+	for _, secret := range []string{"prom", "aerolvm-admin"} {
+		docs, err := renderChart(t, root, helm, with("monitoring.enabled=true", "monitoring.scrapeToken.existingSecret="+secret)...)
+		if err != nil {
+			t.Fatalf("scrape token %s: %v", secret, err)
+		}
+		monitors := docsOfKind(docs, "ServiceMonitor")
+		if len(monitors) != 4 {
+			t.Fatalf("cluster mode rendered %d ServiceMonitors, want 4", len(monitors))
+		}
+		for _, sm := range monitors {
+			name, _ := dig(sm, "metadata", "name").(string)
+			cred := dig(sm, "spec", "endpoints", 0, "authorization", "credentials")
+			if strings.HasSuffix(name, "-operator") {
+				if cred != nil {
+					t.Errorf("the operator's ServiceMonitor sends a token: %v", cred)
+				}
+				continue
+			}
+			if dig(cred, "name") != secret || dig(cred, "key") != "token" {
+				t.Errorf("%s reads %v, want the Secret %s", name, cred, secret)
+			}
+		}
+	}
+
+	// The bank preset relies on a viewer token, so turns tokens on everywhere.
+	bank, err := runTool(t, root, helm, "template", "t", filepath.Join(root, "charts", "aerolvm"),
+		"-f", filepath.Join(root, "charts", "aerolvm", "values-bank-eks.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(bank, identityOn); n != 3 {
+		t.Errorf("the bank preset turns API tokens on in %d pod templates, want 3", n)
+	}
+}
+
+// envHas reports whether any container in containers sets name to value.
+func envHas(containers any, name, value string) bool {
+	list, _ := containers.([]any)
+	for _, c := range list {
+		env, _ := dig(c, "env").([]any)
+		for _, e := range env {
+			if dig(e, "name") == name && dig(e, "value") == value {
+				return true
+			}
+		}
+	}
+	return false
+}

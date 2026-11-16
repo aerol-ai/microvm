@@ -81,6 +81,74 @@ func TestRenderedChartTemplates(t *testing.T) {
 	}
 }
 
+// With identity.enabled every role's stamped pod turns API tokens on: in
+// the agent, and in the setup container, which writes the pod's SB_
+// settings to sandboxd.env. The admin token stays the servers' alone.
+// Before, only worker.extraEnv could turn them on, which reaches workers
+// only, so every gateway and server refused Prometheus's viewer token
+// (issue #1343). Off, no role carries the setting. CI renders the chart
+// with the value on into AEROLVM_POD_TEMPLATES_IDENTITY and off into
+// AEROLVM_POD_TEMPLATES; without them the test skips.
+func TestRenderedIdentityReachesEveryRole(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want string
+	}{{"AEROLVM_POD_TEMPLATES_IDENTITY", "true"}, {"AEROLVM_POD_TEMPLATES", ""}} {
+		t.Run(tc.env, func(t *testing.T) {
+			path := os.Getenv(tc.env)
+			if path == "" {
+				t.Skip(tc.env + " not set: no rendered chart to check")
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cm corev1.ConfigMap
+			if err := yaml.Unmarshal(raw, &cm); err != nil {
+				t.Fatal(err)
+			}
+			c := testCluster()
+			for _, role := range []string{TemplateServer, TemplateGateway, TemplateWorker} {
+				tm, err := ParsePodTemplate(cm.Data[role])
+				if err != nil {
+					t.Fatalf("%s: %v", role, err)
+				}
+				in := StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-"+role+"-0", role, "general", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"}
+				if role == TemplateWorker {
+					in.Pool = &c.Spec.WorkerPools[0]
+				}
+				pod, err := Stamp(tm, in)
+				if err != nil {
+					t.Fatalf("%s stamp: %v", role, err)
+				}
+				agent := pod.Spec.Containers[containerIndex(pod.Spec.Containers, AgentContainer)]
+				if got := envValue(agent.Env, "SB_IDENTITY_ENABLED"); got != tc.want {
+					t.Errorf("%s agent: SB_IDENTITY_ENABLED = %q, want %q", role, got, tc.want)
+				}
+				setup := -1
+				for i, ic := range pod.Spec.InitContainers {
+					if ic.Name == SetupContainer {
+						setup = i
+					}
+				}
+				if setup < 0 {
+					t.Fatalf("%s: no setup container", role)
+				}
+				if got := envValue(pod.Spec.InitContainers[setup].Env, "SB_IDENTITY_ENABLED"); got != tc.want {
+					t.Errorf("%s setup (sandboxd.env): SB_IDENTITY_ENABLED = %q, want %q", role, got, tc.want)
+				}
+				hasPAT := false
+				for _, e := range agent.Env {
+					hasPAT = hasPAT || e.Name == "SB_PAT_TOKEN"
+				}
+				if hasPAT != (role == TemplateServer) {
+					t.Errorf("%s: holds the admin token (SB_PAT_TOKEN) = %v; only servers may", role, hasPAT)
+				}
+			}
+		})
+	}
+}
+
 // renderedWorker is the worker pod template from a pod-templates ConfigMap
 // the chart rendered (scripts/chart-pod-templates.sh), named by env. CI
 // renders it; without env set the test skips.
