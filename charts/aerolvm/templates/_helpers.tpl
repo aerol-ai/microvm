@@ -87,9 +87,13 @@ not set them in cluster mode for that reason, nor beside identity.enabled.
 */}}
 {{- define "aerolvm.identityEnv" -}}
 {{- $identity := .Values.identity | default dict }}
-{{- $extra := hasKey (.Values.worker.extraEnv | default dict) "SB_IDENTITY_ENABLED" }}
-{{- if and $extra (ne .Values.mode "single") }}
-{{- fail "worker.extraEnv.SB_IDENTITY_ENABLED turns API tokens on for workers only: servers and gateways would refuse every token. Set identity.enabled=true instead; it reaches every node." }}
+{{- $env := .Values.worker.extraEnv | default dict }}
+{{- $extra := hasKey $env "SB_IDENTITY_ENABLED" }}
+{{- /* A false value (strconv.ParseBool's, which sandboxd reads with) turns
+nothing on, so cluster mode lets it be. */}}
+{{- $off := has (index $env "SB_IDENTITY_ENABLED" | toString | trim) (list "false" "False" "FALSE" "0" "f" "F") }}
+{{- if and $extra (not $off) (ne .Values.mode "single") }}
+{{- fail (printf "worker.extraEnv.SB_IDENTITY_ENABLED (%v) reaches workers only, so servers and gateways would not match it: in cluster mode API tokens are set for every node with identity.enabled. Remove it, and set identity.enabled=true to turn them on." (index $env "SB_IDENTITY_ENABLED")) }}
 {{- end }}
 {{- if and $extra $identity.enabled }}
 {{- fail "API tokens are set twice: keep identity.enabled and remove worker.extraEnv.SB_IDENTITY_ENABLED." }}

@@ -22,21 +22,25 @@ image:
 apiToken:
   existingSecret: ""
 
-# AerolVM's own API tokens (`aerolvm token create`): each has a role and a
-# team, can do less than the admin token, and expires. On, every node takes
-# them: the worker in single mode; servers, gateways and workers in cluster
-# mode (SB_IDENTITY_ENABLED). A token works on a gateway or worker a few
-# seconds after it is made, once that node's copy of the token list catches
-# up. Off, only the admin token works. Turn it on for a read-only scrape
-# token (monitoring.scrapeToken). Do not set SB_IDENTITY_ENABLED in
-# worker.extraEnv instead: that reaches workers only, and servers and
-# gateways would refuse every token.
+# AerolVM's own API tokens (`aerolvm token create`): each has a role (viewer,
+# runner, auditor or admin) and a team, and expires; a viewer or runner can
+# do less than the admin token, an admin token on every team as much. On,
+# every node takes them: the worker in single mode; servers, gateways and
+# workers in cluster mode (SB_IDENTITY_ENABLED). A token works on a gateway
+# or worker a few seconds after it is made, once that node's copy of the
+# token list catches up. Off, a node takes no API token: the admin token
+# works, and so do sandbox tokens, which need no setting. Turn it on for a
+# read-only scrape token (monitoring.scrapeToken). Do not set
+# SB_IDENTITY_ENABLED in worker.extraEnv instead: that reaches workers only,
+# and servers and gateways would refuse every token.
 # A pod reads this when it is made, so set it at install. Turned on later,
 # it reaches only pods made after the change; the others refuse tokens
-# until they are replaced. Cluster mode: delete each gateway pod, and each
-# server pod one at a time, and the operator makes them again with it;
-# replace workers as for any machine change (cordon). Single mode: delete
-# the aerolvm-0 pod.
+# until they are replaced. Cluster mode: delete the gateway pods one at a
+# time, each after the last one's replacement says Serving (deleting them
+# all at once takes down the API and every sandbox link), then the server
+# pods one at a time the same way; the operator makes each again with it.
+# Replace workers as for any machine change (cordon). Single mode: delete
+# the aerolvm-0 pod, which ends every sandbox on it.
 identity:
   enabled: false
 

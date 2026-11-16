@@ -945,8 +945,18 @@ func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
 		}
 	}
 	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED=true")...); err == nil ||
-		!strings.Contains(err.Error(), "Set identity.enabled=true instead") {
+		!strings.Contains(err.Error(), "set identity.enabled=true to turn them on") {
 		t.Errorf("cluster mode took worker.extraEnv.SB_IDENTITY_ENABLED, which reaches workers only: %v", err)
+	}
+	// A false value turns nothing on: cluster mode lets it be (PR 2 review).
+	for _, off := range []string{"false", "0"} {
+		if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED="+off)...); err != nil {
+			t.Errorf("cluster mode refused worker.extraEnv.SB_IDENTITY_ENABLED=%s, which turns nothing on: %v", off, err)
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("identity.enabled=true", "worker.extraEnv.SB_IDENTITY_ENABLED=false")...); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("identity.enabled beside a false worker.extraEnv one (workers would end up off) rendered: %v", err)
 	}
 
 	// Single mode: the value reaches the worker; worker.extraEnv alone still
@@ -972,7 +982,10 @@ func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
 	// makes a read-only one.
 	_, err = renderChart(t, root, helm, with("monitoring.enabled=true")...)
 	for _, want := range []string{"monitoring.scrapeToken.existingSecret", "identity.enabled=true",
-		"aerolvm token create --name prometheus --role viewer --team '*'", "aerolvm-admin"} {
+		"aerolvm token create --name prometheus --role viewer --team '*'", "aerolvm-admin",
+		// An existing install meets this on helm upgrade: its running pods
+		// must be replaced before the token works on them (PR 2 review).
+		"replace its pods", "gateway pods one at a time"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("cluster mode with no scrape token: %v; want a refusal naming %q", err, want)
 		}
@@ -1024,4 +1037,72 @@ func envHas(containers any, name, value string) bool {
 		}
 	}
 	return false
+}
+
+// renderNotes renders the chart's NOTES.txt as Helm prints it after an
+// install, or after an upgrade with isUpgrade: helm template skips NOTES, so
+// a copy of the chart carries it as a template.
+func renderNotes(t *testing.T, root, helm string, isUpgrade bool, sets ...string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "aerolvm")
+	if err := os.CopyFS(dir, os.DirFS(filepath.Join(root, "charts", "aerolvm"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "templates", "NOTES.txt"), filepath.Join(dir, "notes.txt")); err != nil {
+		t.Fatal(err)
+	}
+	tpl := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes}\ndata:\n  notes: |\n{{- tpl (.Files.Get \"notes.txt\") . | nindent 4 }}\n"
+	if err := os.WriteFile(filepath.Join(dir, "templates", "zz-notes.yaml"), []byte(tpl), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"template", "t", dir, "--namespace", "aerolvm-system", "--show-only", "templates/zz-notes.yaml"}
+	if isUpgrade {
+		args = append(args, "--is-upgrade")
+	}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	out, err := runTool(t, root, helm, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// After an upgrade with identity on, the notes say the running pods must be
+// replaced (a pod reads identity.enabled when it is made), in both modes;
+// after an install, or with identity off, they say nothing of it (PR 2
+// review). Single mode's says replacing its pod ends every sandbox.
+func TestKubernetesChartNotesOnTurningIdentityOn(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	for _, tc := range []struct {
+		name    string
+		upgrade bool
+		sets    []string
+		want    []string
+	}{
+		{"cluster upgrade, identity on", true, append(cluster, "identity.enabled=true"),
+			[]string{"replace the running pods", "gateway pods one at a time", "kubectl cordon"}},
+		{"cluster install, identity on", false, append(cluster, "identity.enabled=true"), nil},
+		{"cluster upgrade, identity off", true, cluster, nil},
+		{"single upgrade, identity on", true, []string{"identity.enabled=true"}, []string{"delete pod t-0", "ends every sandbox"}},
+		{"single upgrade, identity off", true, nil, nil},
+	} {
+		notes := renderNotes(t, root, helm, tc.upgrade, tc.sets...)
+		said := strings.Contains(notes, "API tokens (identity.enabled) reach")
+		if said != (tc.want != nil) {
+			t.Errorf("%s: the notes speak of replacing pods = %v, want %v", tc.name, said, tc.want != nil)
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(notes, w) {
+				t.Errorf("%s: the notes lack %q", tc.name, w)
+			}
+		}
+	}
 }

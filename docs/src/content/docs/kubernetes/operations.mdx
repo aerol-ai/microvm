@@ -188,11 +188,11 @@ helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> -
 
 A pod reads `identity.enabled` when it is made, and the chart never restarts a pod. On a cluster that is already running, the pods made before the change refuse tokens until you replace them:
 
-- **Gateways:** delete each gateway pod. The operator makes a new gateway, with the setting.
+- **Gateways:** delete one gateway pod, wait until the new gateway's AerolNode says `Serving`, then do the next. The operator makes each new gateway with the setting. Deleting them all at once takes down the API and every sandbox link.
 - **Servers:** delete one server pod, wait until its AerolNode says `Serving` again, then do the next. Each comes back with its own disk.
 - **Workers:** replace them as in [Replace a machine](#replace-a-machine). Deleting a worker pod would end its sandboxes.
 
-In single mode, delete the `aerolvm-0` pod when you are ready. On a new install, set `identity.enabled` from the start and skip this.
+In single mode, delete the `aerolvm-0` pod when you are ready. That ends every sandbox on it, so pick a time when none is running. On a new install, set `identity.enabled` from the start and skip this.
 
 Then sign in as admin (`aerolvm login <API URL> --token-stdin`), make the token, and put it in that Secret, in the release namespace:
 
