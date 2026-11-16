@@ -14,3 +14,21 @@ import Default from '@astrojs/starlight/components/Head.astro'
   if (document.readyState === 'complete') smoothScroll()
   else addEventListener('load', smoothScroll, { once: true })
 </script>
+
+<script>
+  // Amplitude analytics. The key comes from PUBLIC_AMPLITUDE_API_KEY at build
+  // time, so forks and builds without it send nothing. `astro dev` never sends
+  // either, even with the key set, so local clicks stay out of the numbers.
+  // The SDK is a separate chunk loaded after the page, off the first paint.
+  // autocapture: true matches Amplitude's own install snippet; the dashboard's
+  // remote config can turn parts of it off without a rebuild.
+  const apiKey = import.meta.env.PUBLIC_AMPLITUDE_API_KEY
+  if (apiKey && import.meta.env.PROD) {
+    import('@amplitude/analytics-browser').then(({ init }) =>
+      init(apiKey, {
+        serverZone: import.meta.env.PUBLIC_AMPLITUDE_SERVER_ZONE === 'EU' ? 'EU' : 'US',
+        autocapture: true,
+      })
+    )
+  }
+</script>
