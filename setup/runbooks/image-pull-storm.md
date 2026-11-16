@@ -103,8 +103,12 @@ Pick the smallest action that stops amplification:
      http://127.0.0.1:21212/v1/cluster/nodes/<node-id>/drain
    ```
 
-   On Kubernetes, decommission the worker instead (cordon its machine; see
-   `setup/runbooks/kubernetes.md`). Do not delete the worker pod.
+   On Kubernetes, use `aerolvm cordon <node>` (the worker's AerolNode name).
+   It sets the same drain mark: no new sandboxes land on the worker, and
+   the ones it runs keep running. Run `aerolvm uncordon <node>` once the
+   storm is over. Do not `kubectl cordon` its machine: that starts a full
+   decommission, which moves every sandbox and adds pulls on the other
+   workers in the middle of the storm. Do not delete the worker pod.
 
 Do not raise `SB_IMAGE_PULL_MAX_CONCURRENT` during registry rate limiting.
 That increases pressure. Raise it only when the registry is healthy and the
@@ -165,9 +169,15 @@ worker has idle network/disk capacity.
 
    On Kubernetes they are worker settings in the chart's `worker.extraEnv`
    (`helm upgrade --reuse-values --set-string
-   worker.extraEnv.SB_IMAGE_PULL_FAILURE_BACKOFF=2m`). sandboxd reads them
-   when it starts, so they apply as each worker's `agent` container is
-   restarted with them. The issue #1343 drill did not need to change them.
+   worker.extraEnv.SB_IMAGE_PULL_FAILURE_BACKOFF=2m`), and a worker pod
+   takes them only when it is made. In cluster mode the operator reads the
+   pod template only when it makes a pod, and an upgrade swaps only the
+   agent's image, so running workers keep the old values; only new worker
+   pods get the new ones, and a new worker starts with no image cached,
+   which adds pulls in a storm. In single mode the pod changes only when
+   it is deleted, which ends every sandbox. So in a storm, change them only
+   if new workers are coming anyway. The issue #1343 drill did not need to
+   change them.
 
 4. Restore defaults after error rate is stable for 30 minutes.
 
