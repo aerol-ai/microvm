@@ -186,6 +186,14 @@ helm upgrade aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> -
   --set monitoring.scrapeToken.existingSecret=aerolvm-metrics-token
 ```
 
+A pod reads `identity.enabled` when it is made, and the chart never restarts a pod. On a cluster that is already running, the pods made before the change refuse tokens until you replace them:
+
+- **Gateways:** delete each gateway pod. The operator makes a new gateway, with the setting.
+- **Servers:** delete one server pod, wait until its AerolNode says `Serving` again, then do the next. Each comes back with its own disk.
+- **Workers:** replace them as in [Replace a machine](#replace-a-machine). Deleting a worker pod would end its sandboxes.
+
+In single mode, delete the `aerolvm-0` pod when you are ready. On a new install, set `identity.enabled` from the start and skip this.
+
 Then sign in as admin (`aerolvm login <API URL> --token-stdin`), make the token, and put it in that Secret, in the release namespace:
 
 ```bash title="Your machine"
@@ -201,6 +209,7 @@ Good to know:
 
 - **Cluster mode requires a scrape token.** With monitoring on and no `monitoring.scrapeToken.existingSecret`, the install stops and prints these steps. You may name `<cluster name>-admin`, the admin token's Secret, instead. That token can do everything.
 - **Single mode** uses the API token when you name no Secret.
+- **Keep the token on one line.** Prometheus sends the Secret's bytes as they are. A trailing newline, such as from a file that `echo` wrote and `--from-file` read, fails every scrape with `invalid header field value for "Authorization"`. The command above adds none.
 - **Turn API tokens on with `identity.enabled`.** `SB_IDENTITY_ENABLED` in `worker.extraEnv` reaches workers only, so servers and gateways would refuse the token. Cluster mode refuses that setting.
 - **A new token works on a gateway or worker a few seconds after you make it,** once that node's copy of the token list catches up. Prometheus may miss one scrape.
 

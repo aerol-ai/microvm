@@ -35,7 +35,8 @@ the cluster: the first server, the other servers, then gateways and workers.
 
    Make a new one before it expires.
 {{- if not (.Values.identity | default dict).enabled }}
-   identity.enabled is false: every node refuses such a token. Turn it on.
+   identity.enabled is false: every node refuses such a token. Turn it on, then
+   replace the running pods: a pod reads it when it is made.
 {{- end }}
 {{- end }}
 

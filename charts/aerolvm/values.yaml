@@ -31,6 +31,12 @@ apiToken:
 # token (monitoring.scrapeToken). Do not set SB_IDENTITY_ENABLED in
 # worker.extraEnv instead: that reaches workers only, and servers and
 # gateways would refuse every token.
+# A pod reads this when it is made, so set it at install. Turned on later,
+# it reaches only pods made after the change; the others refuse tokens
+# until they are replaced. Cluster mode: delete each gateway pod, and each
+# server pod one at a time, and the operator makes them again with it;
+# replace workers as for any machine change (cordon). Single mode: delete
+# the aerolvm-0 pod.
 identity:
   enabled: false
 

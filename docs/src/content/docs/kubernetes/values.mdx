@@ -14,7 +14,7 @@ Set these with `--set` or a values file (`-f values.yaml`). The chart's own [`va
 | `image.tag` | The image version. In cluster mode, the operator's image; set `cluster.version` to the same value. Use a digest-pinned tag in production. | The chart's `appVersion` |
 | `image.pullPolicy` | The pull policy for every AerolVM container. | `IfNotPresent` |
 | `apiToken.existingSecret` | Single mode: your own token Secret (key `SB_PAT_TOKEN`), instead of the one the chart makes. | none |
-| `identity.enabled` | Turn on AerolVM's own [API tokens](/cli/#manage-api-tokens) on every node: the worker in single mode; servers, gateways and workers in cluster mode. A [read-only scrape token](/kubernetes/operations/#use-a-read-only-scrape-token) needs it. | `false` |
+| `identity.enabled` | Turn on AerolVM's own [API tokens](/cli/#manage-api-tokens) on every node: the worker in single mode; servers, gateways and workers in cluster mode. A [read-only scrape token](/kubernetes/operations/#use-a-read-only-scrape-token) needs it. A pod reads it when it is made, so set it at install. | `false` |
 
 ## Worker pods
 
