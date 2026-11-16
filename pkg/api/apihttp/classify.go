@@ -32,6 +32,9 @@ const (
 const (
 	createInProgressRetryAfterSeconds = 5
 	reservationGoneRetryAfterSeconds  = 1
+	// The default per-image pull backoff (SB_IMAGE_PULL_FAILURE_BACKOFF):
+	// asking sooner only meets the backoff again.
+	imagePullRetryAfterSeconds = 30
 )
 
 // ErrKind names the few service errors a facade words differently for its own
@@ -116,6 +119,13 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusForbidden, Code: models.ErrorCodeCreatePolicyDenied, Message: truncate(err.Error())}
 	case errors.Is(err, service.ErrCreatePolicyInvalid):
 		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeCreatePolicyInvalid, Message: service.ErrCreatePolicyInvalid.Error(), Log: true, LogLevel: slog.LevelError}
+
+	// An image pull the registry failed for a reason that passes (rate
+	// limit, 5xx, no answer in time, or the per-image backoff after one):
+	// 503 + Retry-After, so SDKs back off and retry instead of taking the
+	// catch-all 400 as final (issue #1343, every create of a storm).
+	case errors.Is(err, models.ErrImagePullUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: imagePullRetryAfterSeconds, Code: models.ErrorCodeImagePullUnavailable, Message: truncate(err.Error())}
 
 	// A sandbox whose container engine is not wired on this node: host
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.

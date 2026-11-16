@@ -4,13 +4,18 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	cntr "github.com/containerd/containerd/v2/client"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/errdefs"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // The containerd engine reports its pulls under the aerolvm_image_pull_*
@@ -68,11 +73,13 @@ func TestEnsureImagePullMetricsErrorsAndBackoff(t *testing.T) {
 	client := NewTestClient("aerolvm", tr)
 	before := readPullCounters()
 
-	if _, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil); err == nil {
-		t.Fatal("first pull: want the registry's error")
+	// Both are registry trouble that passes: the API's 503 + Retry-After,
+	// not the catch-all 400.
+	if _, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil); !errors.Is(err, models.ErrImagePullUnavailable) {
+		t.Fatalf("first pull: %v, want the registry's error marked ErrImagePullUnavailable", err)
 	}
-	if _, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil); err == nil {
-		t.Fatal("second pull: want the backoff's refusal")
+	if _, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil); !errors.Is(err, models.ErrImagePullUnavailable) {
+		t.Fatalf("second pull: %v, want the backoff's refusal marked ErrImagePullUnavailable", err)
 	}
 
 	after := readPullCounters()
@@ -89,6 +96,87 @@ func TestEnsureImagePullMetricsErrorsAndBackoff(t *testing.T) {
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+}
+
+// A missing tag is the caller's to fix: neither its failure nor the backoff
+// refusals after it are marked as registry trouble that passes, so the API
+// keeps answering 400, not a 503 to retry.
+func TestEnsureImageMissingTagStaysCallerError(t *testing.T) {
+	tr := newFakeTransport()
+	tr.getImageFn = func(context.Context, string) (cntr.Image, error) { return nil, errdefs.ErrNotFound }
+	tr.pullImageFn = func(context.Context, string, ...cntr.RemoteOpt) (cntr.Image, error) {
+		return nil, errors.New(`failed to resolve reference "localhost:5000/drill/app:v1": localhost:5000/drill/app:v1: not found`)
+	}
+	d := New(Config{PullFailureBackoff: time.Minute}, nil, nil)
+	client := NewTestClient("aerolvm", tr)
+	for i, what := range []string{"the failed pull", "the backoff refusal"} {
+		_, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil)
+		if err == nil || errors.Is(err, models.ErrImagePullUnavailable) {
+			t.Fatalf("%s (%d): %v, want an error not marked ErrImagePullUnavailable", what, i, err)
+		}
+		if i == 1 && !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("the backoff refusal does not name its cause: %v", err)
+		}
+	}
+}
+
+// A permanent failure that is neither a missing tag nor a refused login
+// stays a 400 through its whole backoff (issue #1343 review): the refusal's
+// own wording used to be classified, not its cause, so every create in the
+// 30 s after it was a 503 with Retry-After, which steady traffic re-armed.
+func TestEnsureImageBackoffOfPermanentFailureStays400(t *testing.T) {
+	tr := newFakeTransport()
+	tr.getImageFn = func(context.Context, string) (cntr.Image, error) { return nil, errdefs.ErrNotFound }
+	tr.pullImageFn = func(context.Context, string, ...cntr.RemoteOpt) (cntr.Image, error) {
+		// containerd 2 refuses Docker schema-1 manifests.
+		return nil, errors.New("failed to pull: converting from schema 1 manifests is not supported (media type application/vnd.docker.distribution.manifest.v1+prettyjws)")
+	}
+	d := New(Config{PullFailureBackoff: time.Minute}, nil, nil)
+	client := NewTestClient("aerolvm", tr)
+	for i, what := range []string{"the failed pull", "the backoff refusal"} {
+		_, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil)
+		if err == nil || errors.Is(err, models.ErrImagePullUnavailable) {
+			t.Errorf("%s (%d): %v: marked ErrImagePullUnavailable (503); the same permanent cause stays 400", what, i, err)
+		}
+	}
+}
+
+// A ref's backoff entry keeps a short cause, never the registry's error
+// itself, and expired entries go (issue #1343 review): containerd's
+// ErrUnexpectedStatus holds up to 64 KB of the registry's body, and nothing
+// pruned the entries, so creates of many distinct failing refs grew the
+// worker's heap without bound.
+func TestEnsureImagePullFailuresArePrunedAndCapped(t *testing.T) {
+	tr := newFakeTransport()
+	tr.getImageFn = func(context.Context, string) (cntr.Image, error) { return nil, errdefs.ErrNotFound }
+	body := make([]byte, 64000)
+	tr.pullImageFn = func(_ context.Context, ref string, _ ...cntr.RemoteOpt) (cntr.Image, error) {
+		return nil, fmt.Errorf("failed to resolve reference %q: %w", ref, remoteerrors.ErrUnexpectedStatus{
+			Status: "500 Internal Server Error", StatusCode: 500, Body: body,
+			RequestURL: "https://evil.example/v2/x/manifests/" + ref + "/" + strings.Repeat("a", 2000), RequestMethod: "GET"})
+	}
+	d := New(Config{PullFailureBackoff: time.Millisecond}, nil, nil)
+	client := NewTestClient("aerolvm", tr)
+	const n = 200
+	for i := range n {
+		_, _ = d.ensureImage(context.Background(), client, fmt.Sprintf("evil.example/x:%d", i), nil)
+	}
+	time.Sleep(10 * time.Millisecond) // every backoff has run out
+	_, err := d.ensureImage(context.Background(), client, "evil.example/x:last", nil)
+	if !errors.Is(err, models.ErrImagePullUnavailable) {
+		t.Fatalf("a registry 500: %v, want the 503 mark", err)
+	}
+
+	d.pullFailMu.Lock()
+	defer d.pullFailMu.Unlock()
+	if len(d.pullFails) != 1 {
+		t.Errorf("%d backoff entries after %d expired and one new failure, want 1", len(d.pullFails), n)
+	}
+	for ref, f := range d.pullFails {
+		if len(f.cause) > 600 || !f.transient {
+			t.Errorf("%s: cause %d bytes, transient %v; want a capped cause of a transient failure", ref, len(f.cause), f.transient)
 		}
 	}
 }

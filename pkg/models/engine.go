@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Host-level container engine identifiers. Distinct from Sandbox.Runtime (OCI
@@ -81,6 +82,35 @@ func ResolveContainerEngineOrDocker(value string) string {
 // engine driver that was not wired at daemon boot (e.g. containerd row on a
 // docker-only node).
 var ErrContainerEngineNotRegistered = errors.New("container engine driver not registered on this node")
+
+// ErrImagePullUnavailable marks a create whose image pull failed for a
+// reason that passes: the registry rate-limited it, failed (5xx, refused
+// connection), took too long, or failed so recently that the per-image
+// backoff refused to ask it again. The API answers 503 with Retry-After
+// (ErrorCodeImagePullUnavailable), so SDKs back off and retry; a missing
+// image or refused credentials stay the caller's 400. Engines wrap with
+// docker.TransientPullError.
+var ErrImagePullUnavailable = errors.New("image registry unavailable")
+
+// ImagePullUnavailableError is ErrImagePullUnavailable with the failure and
+// how long the node waits before it asks the registry again (its
+// SB_IMAGE_PULL_FAILURE_BACKOFF), which the API sends as Retry-After.
+type ImagePullUnavailableError struct {
+	Err        error
+	RetryAfter time.Duration
+}
+
+func (e *ImagePullUnavailableError) Error() string {
+	return ErrImagePullUnavailable.Error() + ": " + e.Err.Error()
+}
+
+// Unwrap lists the failure first: a reader that walks one branch down to
+// the cause (docker's pull-error class) meets the failure, not the mark.
+func (e *ImagePullUnavailableError) Unwrap() []error { return []error{e.Err, ErrImagePullUnavailable} }
+
+// PullRetryAfter is the wait the API sends as Retry-After; zero leaves the
+// API's default.
+func (e *ImagePullUnavailableError) PullRetryAfter() time.Duration { return e.RetryAfter }
 
 // ErrBuildKitUnavailable is returned by image-build endpoints when the host
 // engine is containerd but buildkitd is not wired yet (Phase 3). Clear error,

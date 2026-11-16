@@ -57,6 +57,10 @@ func TestClassify(t *testing.T) {
 		{"platform volume delete_with_sandbox conflict", models.ErrPlatformVolumeConflict, http.StatusConflict, 0, "", ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
+		// A registry failure that passes, as the engines mark it: retryable,
+		// never the catch-all 400 every create of a pull storm used to get
+		// (issue #1343).
+		{"image pull unavailable", fmt.Errorf("%w: image pull for %q backing off after recent failure", models.ErrImagePullUnavailable, "r.example/a:1"), http.StatusServiceUnavailable, imagePullRetryAfterSeconds, models.ErrorCodeImagePullUnavailable, ErrKindOther},
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"wake circuit open", service.ErrWakeCircuitOpen, http.StatusServiceUnavailable, 60, "", ErrKindOther},
 		{"manually stopped", service.ErrSandboxManuallyStopped, http.StatusConflict, 0, "", ErrKindOther},

@@ -4,10 +4,20 @@ import (
 	"context"
 	"errors"
 	"expvar"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"strings"
+	"syscall"
 	"time"
+	"unicode/utf8"
+
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
+	"github.com/containerd/errdefs"
 
 	"github.com/aerol-ai/microvm/internal/scaleobs"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 var (
@@ -55,6 +65,84 @@ func beginImagePullMetric() func(error) {
 	}
 }
 
+// PullBackoffError is a create the per-image failure backoff refused: the
+// same image failed moments ago, Cause says how (flattened and capped, as
+// it is kept per failing image until the backoff ends), and Until is when
+// the node asks the registry again. It is registry trouble that passes, the
+// API's 503, only when that failure was (Transient); a backoff of a missing
+// tag or a refused login stays a 400.
+type PullBackoffError struct {
+	Image     string
+	Until     time.Time
+	Cause     string
+	Transient bool
+}
+
+func (e *PullBackoffError) Error() string {
+	return fmt.Sprintf("image pull for %q backing off after recent failure: %s", e.Image, e.Cause)
+}
+
+// Is makes a refusal of trouble that passes an ErrImagePullUnavailable.
+func (e *PullBackoffError) Is(target error) bool {
+	return e.Transient && target == models.ErrImagePullUnavailable
+}
+
+// PullRetryAfter is what is left of the backoff.
+func (e *PullBackoffError) PullRetryAfter() time.Duration { return time.Until(e.Until) }
+
+// maxPullCauseBytes caps a backoff's kept cause: it lives per failing image
+// for the whole backoff, and a registry's error (containerd's
+// ErrUnexpectedStatus) can hold up to 64 KB of response body.
+const maxPullCauseBytes = 512
+
+// FlattenPullCause is err as the short text a backoff keeps.
+func FlattenPullCause(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if len(msg) <= maxPullCauseBytes {
+		return msg
+	}
+	cut := maxPullCauseBytes
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + "..."
+}
+
+// TransientPullFailure reports whether a pull failed for a reason that
+// passes: the registry rate-limited it, failed (5xx, refused or reset the
+// connection), or did not answer in time. Only the failure's cause is
+// judged, typed where it can be, never text that carries the image name.
+func TransientPullFailure(err error) bool {
+	switch classifyImagePullError(err) {
+	case "rate_limited", "timeout", "unavailable":
+		return true
+	case "backoff":
+		var b *PullBackoffError
+		return errors.As(err, &b) && b.Transient
+	}
+	return false
+}
+
+// TransientPullError marks err for the API's 503 with Retry-After when the
+// pull failed for a reason that passes (TransientPullFailure), and returns
+// it as it is otherwise: a missing image, a refused login, a cancelled
+// create, a refusal of a backoff whose cause was any of those. backoff is
+// the node's SB_IMAGE_PULL_FAILURE_BACKOFF, the Retry-After.
+func TransientPullError(err error, backoff time.Duration) error {
+	if err == nil || errors.Is(err, models.ErrImagePullUnavailable) {
+		// A backoff refusal of transient trouble is one already.
+		return err
+	}
+	var refusal *PullBackoffError
+	if errors.As(err, &refusal) || !TransientPullFailure(err) {
+		return err
+	}
+	return &models.ImagePullUnavailableError{Err: err, RetryAfter: backoff}
+}
+
 func recordImagePullDedupWaiter() {
 	imagePullDedupWaitersTotal.Add(1)
 }
@@ -97,9 +185,20 @@ func BeginImagePullInflight() func() {
 	return func() { imagePullInflight.Add(-1) }
 }
 
+// classifyImagePullError is a failed pull's reason (the metric's label, and
+// TransientPullFailure's input). It judges the cause only: typed errors
+// first (a backoff refusal, the context, the registry's HTTP status, a
+// network timeout, a refused or reset connection), then the text of the
+// innermost error with every image reference, URL and address taken out, so
+// a ref named "timeout-proxy" or a "linux/arm64" platform cannot pick the
+// class. Permanent classes win over transient ones on text.
 func classifyImagePullError(err error) string {
 	if err == nil {
 		return ""
+	}
+	var refusal *PullBackoffError
+	if errors.As(err, &refusal) {
+		return "backoff"
 	}
 	if errors.Is(err, context.Canceled) {
 		return "canceled"
@@ -107,22 +206,102 @@ func classifyImagePullError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "context canceled"):
-		return "canceled"
-	case strings.Contains(msg, "deadline exceeded"), strings.Contains(msg, "timeout"), strings.Contains(msg, "timed out"):
-		return "timeout"
-	case strings.Contains(msg, "unauthorized"), strings.Contains(msg, "authentication required"), strings.Contains(msg, "denied"):
-		return "auth"
-	case strings.Contains(msg, "manifest unknown"), strings.Contains(msg, "not found"), strings.Contains(msg, "no such image"):
+	var status remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &status) {
+		switch {
+		case status.StatusCode == http.StatusUnauthorized || status.StatusCode == http.StatusForbidden:
+			return "auth"
+		case status.StatusCode == http.StatusNotFound:
+			return "not_found"
+		case status.StatusCode == http.StatusTooManyRequests:
+			return "rate_limited"
+		case status.StatusCode == http.StatusRequestTimeout:
+			return "timeout"
+		case status.StatusCode >= 500:
+			return "unavailable"
+		default:
+			return "error"
+		}
+	}
+	if errdefs.IsNotFound(err) {
 		return "not_found"
-	case strings.Contains(msg, "too many requests"), strings.Contains(msg, "rate limit"):
+	}
+	if errdefs.IsUnauthorized(err) || errdefs.IsPermissionDenied(err) {
+		return "auth"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unavailable"
+	}
+	msg := strings.ToLower(withoutImageNames(innermostError(err).Error()))
+	has := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(msg, w) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("context canceled"):
+		return "canceled"
+	case has("unauthorized", "authentication required", "denied", "forbidden"):
+		return "auth"
+	case has("manifest unknown", "not found", "no such image", "does not exist"):
+		return "not_found"
+	case has("too many requests", "toomanyrequests", "rate limit"):
 		return "rate_limited"
-	// "backing off" is the containerd engine's wording (ensureImage).
-	case strings.Contains(msg, "backoff"), strings.Contains(msg, "backing off"):
-		return "backoff"
+	case has("deadline exceeded", "timeout", "timed out"):
+		return "timeout"
+	case has("500 internal server error", "502 bad gateway", "503 service unavailable",
+		"connection refused", "connection reset", "unexpected eof"):
+		return "unavailable"
 	default:
 		return "error"
 	}
+}
+
+// innermostError is the error at the bottom of err's chain (the first
+// branch of a join): the failure itself, without the wrappers that name
+// the image or the step.
+func innermostError(err error) error {
+	for {
+		switch u := err.(type) {
+		case interface{ Unwrap() error }:
+			next := u.Unwrap()
+			if next == nil {
+				return err
+			}
+			err = next
+		case interface{ Unwrap() []error }:
+			errs := u.Unwrap()
+			if len(errs) == 0 || errs[0] == nil {
+				return err
+			}
+			err = errs[0]
+		default:
+			return err
+		}
+	}
+}
+
+// withoutImageNames drops every word of msg that can name an image, a
+// registry or an address: anything with a slash, an @, or a colon before
+// its end ("docker.io/acme/timeout-proxy:v9", "alpine:3.20",
+// "10.0.0.9:5000:", "https://r/v2/"). What is left is the error's own
+// wording.
+func withoutImageNames(msg string) string {
+	words := strings.Fields(msg)
+	kept := words[:0]
+	for _, w := range words {
+		body := strings.TrimRight(w, ":,")
+		if strings.ContainsAny(body, "/@") || strings.Contains(body, ":") {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	return strings.Join(kept, " ")
 }

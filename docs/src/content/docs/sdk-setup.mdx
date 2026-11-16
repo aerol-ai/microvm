@@ -718,6 +718,7 @@ Some codes you may see:
 | `egress_floor_not_ready` | `503` | The node has not yet set up the rules that keep sandboxes away from cloud metadata and blocked addresses. | Try again after the wait. The node fixes this by itself. |
 | `node_guard_not_ready` | `503` | The node has not yet set up the rules that keep sandboxes away from the node's own services. | Try again after the wait. |
 | `key_store_unavailable` | `503` | The server could not reach the key store that protects sandbox secrets. | Try again after the wait. |
+| `image_pull_unavailable` | `503` | The image's registry turned the pull away for now: it rate-limited it, failed, or took too long, or did so moments ago and the node is waiting before it asks again. | The SDK already tried again. Try again after the wait. A missing image or wrong registry login is a `400` instead. |
 | `key_revoked` | `503` | The key that protects sandbox secrets was turned off or deleted in the key store. | Ask the key's owner to restore it. |
 | `network_policy_unenforced` | `501` | This node cannot enforce the network rules you asked for. | Drop the rules, or ask the operator to turn on the host firewall. |
 | `idempotency_key_reused` | `422` | The create's idempotency key was already used with other options. | Send the first options again, or use a new key. See [Retry a create safely](/sandboxes/#retry-a-create-safely). |
