@@ -50,6 +50,14 @@ func TestPinImageDigest(t *testing.T) {
 		// send the runtime to that registry for an image it has locally.
 		{name: "local_only create with a registry name is left alone", image: "alpine:3.20", digest: testDigestA, mode: models.ImageDistributionLocalOnly, wantImage: "alpine:3.20", wantDigest: testDigestA},
 		{name: "digest of a local image is not looked at", image: docker.BuiltImageNamespace + "/abc:latest", digest: "nope", wantImage: docker.BuiltImageNamespace + "/abc:latest", wantDigest: "nope"},
+		// A tag beside a digest decides nothing, and skopeo refuses a name
+		// with both, so it is dropped with or without image_digest.
+		{name: "tag beside the same digest is dropped", image: "ghcr.io/acme/app:1@" + testDigestA, digest: testDigestA, wantImage: "ghcr.io/acme/app@" + testDigestA, wantDigest: testDigestA},
+		{name: "tag beside a digest is dropped without image_digest", image: "docker.io/library/python:3.12@" + testDigestA, wantImage: "python@" + testDigestA},
+		{name: "digest image without image_digest keeps its spelling", image: "docker.io/library/python@" + testDigestA, wantImage: "docker.io/library/python@" + testDigestA},
+		{name: "image id without image_digest is left to validation", image: testDigestB, wantImage: testDigestB},
+		{name: "unparseable digest image without image_digest is left to validation", image: "Not/Valid@" + testDigestA, wantImage: "Not/Valid@" + testDigestA},
+		{name: "tagged snapshot copy beside a digest is left for the local check", image: docker.SnapshotImageTag("snap") + "@" + testDigestA, wantImage: docker.SnapshotImageTag("snap") + "@" + testDigestA},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,13 +125,18 @@ func TestNormalizeCreateImageDistributionPinsTheDigest(t *testing.T) {
 		t.Fatalf("contradicting digests: error = %v, want ErrImageDigest", err)
 	}
 
-	// A failover recreate replays a spec replicated before digests were
-	// checked: a digest that cannot hold is a warning there, not a lost
-	// sandbox, and the image starts as it first did.
+	// A failover recreate starts the image its first create stored. A spec
+	// stored since this change is already pinned; one stored before carries
+	// a digest nothing ever checked, which may not be the manifest's (an
+	// image id, another platform's manifest). Pinning it now would fail the
+	// pull and lose a sandbox that ran fine, so the replay leaves it as it
+	// first started, well-formed or not.
 	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	for _, replay := range []models.CreateSandboxRequest{
+		{Image: "ghcr.io/acme/app:1.4", ImageDigest: testDigestA},
 		{Image: "ghcr.io/acme/app:1.4", ImageDigest: "not-a-digest"},
 		{Image: "ghcr.io/acme/app@" + testDigestB, ImageDigest: testDigestA},
+		{Image: "ghcr.io/acme/app@" + testDigestA, ImageDigest: testDigestA},
 	} {
 		image := replay.Image
 		if err := svc.NormalizeCreateImageDistribution(contextWithStoredSpecReplay(ctx), &replay); err != nil {
@@ -132,11 +145,6 @@ func TestNormalizeCreateImageDistributionPinsTheDigest(t *testing.T) {
 		if replay.Image != image {
 			t.Fatalf("replay changed the image %q to %q", image, replay.Image)
 		}
-	}
-	// A good digest is still pinned on a replay.
-	good := models.CreateSandboxRequest{Image: "ghcr.io/acme/app:1.4", ImageDigest: testDigestA}
-	if err := svc.NormalizeCreateImageDistribution(contextWithStoredSpecReplay(ctx), &good); err != nil || good.Image != "ghcr.io/acme/app@"+testDigestA {
-		t.Fatalf("replay with a good digest = (%q, %v), want it pinned", good.Image, err)
 	}
 }
 
@@ -186,6 +194,72 @@ func TestNormalizeCreateImageDistributionPinsAPushedSnapshotCopy(t *testing.T) {
 	}
 	if err := svc.NormalizeCreateImageDistribution(ctx, &wrongArch); err == nil {
 		t.Fatalf("foreign-arch copy pinned to a digest was accepted as %q", wrongArch.Image)
+	}
+
+	// A failover recreate that lands on a node without the snapshot
+	// resolves the copy itself, so it is pinned to the digest the snapshot
+	// was pushed under, not whatever the copy's tag points at by then.
+	replay := models.CreateSandboxRequest{
+		Image:                 docker.SnapshotImageTag("my-snap"),
+		ImageDistributionMode: models.ImageDistributionAOCR,
+		ImageRegistryRef:      copyRef,
+		ImageDigest:           testDigestA,
+	}
+	if err := svc.NormalizeCreateImageDistribution(contextWithStoredSpecReplay(ctx), &replay); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if want := "aocr.test/cluster/c1/snapshots/my-snap@" + testDigestA; replay.Image != want {
+		t.Fatalf("replay Image = %q, want %q", replay.Image, want)
+	}
+	// A digest that cannot hold does not lose the sandbox: the copy starts
+	// by its tag, as it did before digests were checked.
+	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	malformed := replay
+	malformed.Image = docker.SnapshotImageTag("my-snap")
+	malformed.ImageDigest = "not-a-digest"
+	if err := svc.NormalizeCreateImageDistribution(contextWithStoredSpecReplay(ctx), &malformed); err != nil || malformed.Image != copyRef {
+		t.Fatalf("replay with a malformed digest = (%q, %v), want (%q, nil)", malformed.Image, err, copyRef)
+	}
+}
+
+// The sandbox row keeps only the image a create started, so a spec rebuilt
+// from it (AssertOwnership, when a placement holds no spec) has a pinned
+// snapshot copy and no tagged ref. The arch guard cannot read an arch from
+// a digest; calling it amd64 refused the replay on every arm64 node.
+func TestReplayOfARowRebuiltPinnedCopyPassesTheArchGuard(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			old := hostGOARCH
+			t.Cleanup(func() { hostGOARCH = old })
+			hostGOARCH = arch
+
+			ctx := context.Background()
+			st := openImageDistributionStore(t)
+			defer st.Close()
+			svc := &Service{store: st}
+
+			req := models.CreateSandboxRequest{
+				Image:                 docker.SnapshotImageTag("my-snap"),
+				ImageDistributionMode: models.ImageDistributionAOCR,
+				// The production AOCR host: a rebuilt spec has no mode, and
+				// only this host classifies as AOCR, which runs the guard.
+				ImageRegistryRef: "aocr.aerol.ai/cluster/c1/snapshots/my-snap:latest" + archTagSuffix(arch),
+				ImageDigest:      testDigestA,
+			}
+			if err := svc.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+				t.Fatalf("create on a node without the snapshot: %v", err)
+			}
+			spec, err := svc.specFromSandbox(ctx, &models.Sandbox{ID: "sb-1", Image: req.Image})
+			if err != nil {
+				t.Fatalf("specFromSandbox: %v", err)
+			}
+			if err := svc.NormalizeCreateImageDistribution(contextWithStoredSpecReplay(ctx), spec); err != nil {
+				t.Fatalf("replay of the row-rebuilt spec: %v", err)
+			}
+			if spec.Image != req.Image || spec.ImageDistributionMode != models.ImageDistributionAOCR {
+				t.Fatalf("replay = (%q, mode %q), want (%q, aocr)", spec.Image, spec.ImageDistributionMode, req.Image)
+			}
+		})
 	}
 }
 

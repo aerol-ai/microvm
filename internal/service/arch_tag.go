@@ -66,10 +66,21 @@ func validateClusterArtifactRefArch(ref, hostArch string) error {
 
 // archFromImageRef parses the --arch-<goarch> suffix from a registry ref tag.
 // Refs without an arch suffix are treated as amd64 (legacy x86 snapshots).
+//
+// A ref pinned to a digest with no tag (repo@sha256:..., what an
+// image_digest pins a pushed copy to) has no tag to read, so its arch is
+// unknown (""), not amd64: the copy was pushed by whichever node made it.
+// A tag beside a digest is still read.
 func archFromImageRef(ref string) string {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return snapshotArchAMD64
+	}
+	if name, _, pinned := strings.Cut(ref, "@"); pinned {
+		ref = name
+		if slash := strings.LastIndex(ref, "/"); !strings.Contains(ref[slash+1:], ":") {
+			return ""
+		}
 	}
 	tag := ref
 	if i := strings.LastIndex(ref, ":"); i >= 0 {
@@ -85,8 +96,18 @@ func archFromImageRef(ref string) string {
 
 // ValidateSnapshotRefArch rejects foreign-arch AOCR refs at resume/pull time.
 // Defense-in-depth for homogeneous per-arch clusters (see plans/arm64-firecracker-hosts.md D5).
+//
+// A digest-pinned ref of unknown arch passes. A create reads the tagged
+// ref before pinning (it keeps it in ImageRegistryRef); a spec rebuilt
+// from a sandbox row keeps only the pinned image, which already ran on its
+// owner, and a cluster is one arch (D5). Calling it amd64, as an untagged
+// ref is, would only strand that sandbox on arm64; a foreign copy, were
+// one ever there, fails at its first exec instead.
 func ValidateSnapshotRefArch(ref, hostArch string) error {
 	refArch := archFromImageRef(ref)
+	if refArch == "" {
+		return nil
+	}
 	hostArch = strings.TrimSpace(hostArch)
 	if hostArch == "" {
 		hostArch = hostSnapshotArch()

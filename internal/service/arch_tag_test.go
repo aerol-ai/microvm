@@ -2,6 +2,7 @@ package service
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,12 @@ func TestArchFromImageRef(t *testing.T) {
 		{"aocr.test/cluster/c1/snapshots/snap:latest--arch-arm64", snapshotArchARM64},
 		{"aocr.test/cluster/c1/snapshots/snap:latest--arch-arm64--ttl-1h", snapshotArchARM64},
 		{"aocr.test/cluster/c1/snapshots/snap:latest--ttl-1h--arch-amd64", snapshotArchAMD64},
+		// A digest is not a tag: the tag beside it is read, and a ref with
+		// no tag has no arch to read.
+		{"aocr.test/cluster/c1/snapshots/snap:latest--arch-arm64@sha256:" + strings.Repeat("a", 64), snapshotArchARM64},
+		{"aocr.test/cluster/c1/snapshots/snap:latest@sha256:" + strings.Repeat("a", 64), snapshotArchAMD64},
+		{"aocr.test/cluster/c1/snapshots/snap@sha256:" + strings.Repeat("a", 64), ""},
+		{"aocr.test:5000/cluster/c1/snapshots/snap@sha256:" + strings.Repeat("a", 64), ""},
 	}
 	for _, tc := range cases {
 		if got := archFromImageRef(tc.ref); got != tc.want {
@@ -73,6 +80,15 @@ func TestValidateSnapshotRefArch(t *testing.T) {
 	}
 	if err := ValidateSnapshotRefArch(sameRef, ""); err != nil {
 		t.Fatalf("empty hostArch should default to host arch: %v", err)
+	}
+	pinned := "aocr.test/cluster/c1/snapshots/snap@sha256:" + strings.Repeat("a", 64)
+	for _, arch := range []string{snapshotArchAMD64, snapshotArchARM64} {
+		if err := ValidateSnapshotRefArch(pinned, arch); err != nil {
+			t.Fatalf("a digest-pinned ref has no arch to refuse on %s: %v", arch, err)
+		}
+	}
+	if err := ValidateSnapshotRefArch("aocr.test/cluster/c1/snapshots/snap:latest--arch-"+foreign+"@sha256:"+strings.Repeat("a", 64), host); err == nil {
+		t.Fatalf("a foreign arch tag beside a digest should still be refused")
 	}
 }
 

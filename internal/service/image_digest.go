@@ -42,33 +42,54 @@ var ErrImageDigest = errors.New("image_digest")
 // it would send the runtime to that registry). A pushed snapshot's registry
 // copy, when a node starts that copy, is a registry image and is pinned.
 //
+// A tag written next to a digest (`repo:tag@sha256:...`) is dropped the
+// same way, with or without image_digest: every engine pulls the digest
+// either way (the Docker mirror rewrite included), so the image names what
+// really runs and skopeo can pull it.
+//
 // In memory only, and a fixed point: an image already pinned to the same
 // digest is left as it is, so running normalization twice changes nothing.
 func pinImageDigest(req *models.CreateSandboxRequest) error {
 	want := strings.TrimSpace(req.ImageDigest)
-	if want == "" {
-		return nil
-	}
 	image := strings.TrimSpace(req.Image)
 	if image == "" || docker.IsLocalOnlyImageRef(image) || req.ImageDistributionMode == models.ImageDistributionLocalOnly {
 		return nil
 	}
-	d, err := digest.Parse(want)
-	if err != nil {
-		return fmt.Errorf("%w: %q is not an image digest (sha256:<64 hex digits>): %v", ErrImageDigest, want, err)
+	if want == "" && !strings.Contains(image, "@") {
+		return nil
 	}
-	req.ImageDigest = d.String()
+	var d digest.Digest
+	if want != "" {
+		var err error
+		if d, err = digest.Parse(want); err != nil {
+			return fmt.Errorf("%w: %q is not an image digest (sha256:<64 hex digits>): %v", ErrImageDigest, want, err)
+		}
+		req.ImageDigest = d.String()
+	}
 	if docker.LooksLikeImageID(image) {
+		if want == "" {
+			return nil
+		}
 		return fmt.Errorf("%w: image %q is an image id; name the registry image the digest belongs to", ErrImageDigest, image)
 	}
 	named, err := reference.ParseNormalizedNamed(image)
 	if err != nil {
+		if want == "" {
+			// Not ours to judge: the image validators refuse it with
+			// their own message.
+			return nil
+		}
 		return fmt.Errorf("%w: image %q is not a registry image name: %v", ErrImageDigest, image, err)
 	}
 	if pinned, ok := named.(reference.Digested); ok {
-		if pinned.Digest() != d {
+		if want != "" && pinned.Digest() != d {
 			return fmt.Errorf("%w: image %q names digest %s, but image_digest is %s", ErrImageDigest, image, pinned.Digest(), d)
 		}
+		if _, tagged := named.(reference.Tagged); !tagged {
+			return nil
+		}
+		d = pinned.Digest()
+	} else if want == "" {
 		return nil
 	}
 	pinned, err := reference.WithDigest(reference.TrimNamed(named), d)
