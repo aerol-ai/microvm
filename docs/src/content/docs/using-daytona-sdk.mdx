@@ -64,7 +64,7 @@ We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona exam
 
 | Daytona feature | On AerolVM |
 |---|---|
-| Create, get, list (also page by page), start, stop, delete | Works. `daytona.list()` reads the list a page at a time, up to 200 sandboxes a page, newest first. Older Daytona clients that read the whole list in one reply still get it that way. In a list, CPU, memory and disk are rounded up to whole numbers, because Daytona's list has no fractions. Getting one sandbox returns the exact values. |
+| Create, get, list (also page by page), start, stop, delete | Works. `daytona.list()` reads the list a page at a time, up to 200 sandboxes a page, newest first. Older Daytona clients that read the whole list in one reply still get it that way. CPU and memory are rounded up to whole numbers, in a list and for one sandbox, because Daytona's SDKs accept no fractions. Half a CPU shows as 1, and 512 MB shows as 1 GB. |
 | Resize CPU, memory and disk | Works. Memory is in GB, as on Daytona. |
 | Create from a snapshot name or an image name | Works. With neither, the sandbox uses `ubuntu:22.04`, or the image your operator chose. |
 | Create from a Dockerfile (Daytona's `Image` builder) | Works. A one-line `FROM image` needs nothing extra. Longer Dockerfiles are built on the server. Builds that upload local files need your operator to turn on `SB_IMAGE_BUILD_CONTEXT_ENABLED`. |

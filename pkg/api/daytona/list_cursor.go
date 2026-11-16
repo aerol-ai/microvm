@@ -3,7 +3,6 @@ package daytona
 import (
 	"encoding/base64"
 	"errors"
-	"math"
 	"net/http"
 	"slices"
 	"sort"
@@ -176,30 +175,12 @@ func cursorSandboxPage(items []sandboxResponse, page cursorListPage) cursorSandb
 		})
 	}
 	end := min(start+page.limit, len(sorted))
-	out := cursorSandboxesResponse{Items: make([]sandboxResponse, 0, end-start)}
-	for _, item := range sorted[start:end] {
-		out.Items = append(out.Items, asSandboxListItem(item))
-	}
+	// Items is never null. Daytona's SandboxListItem needs whole cpu, gpu,
+	// memory and disk; toSandboxResponse already rounds them (wholeUnits).
+	out := cursorSandboxesResponse{Items: append(make([]sandboxResponse, 0, end-start), sorted[start:end]...)}
 	if end < len(sorted) {
 		next := encodeListCursor(listCursorKeyOf(sorted[end-1]))
 		out.NextCursor = &next
 	}
 	return out
-}
-
-// asSandboxListItem fits a sandbox to Daytona's SandboxListItem, whose cpu,
-// gpu, memory and disk are whole numbers: the Python SDK checks them
-// strictly and rejects the whole page on a fraction. AerolVM allows half a
-// CPU and memory in MB (512 MB is 0.5 GB), so a list item rounds them up;
-// GET /sandbox/{id} still returns the exact values.
-func asSandboxListItem(item sandboxResponse) sandboxResponse {
-	item.CPU = ceilFloat32(item.CPU)
-	item.GPU = ceilFloat32(item.GPU)
-	item.Memory = ceilFloat32(item.Memory)
-	item.Disk = ceilFloat32(item.Disk)
-	return item
-}
-
-func ceilFloat32(v float32) float32 {
-	return float32(math.Ceil(float64(v)))
 }

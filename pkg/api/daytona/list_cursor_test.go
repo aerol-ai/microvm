@@ -260,8 +260,8 @@ func TestListSandboxesCursorRejectsBadPageParams(t *testing.T) {
 }
 
 // Daytona's SandboxListItem has whole-number cpu, gpu, memory and disk, which
-// the Python SDK checks strictly; the bare array and GET /sandbox/{id} keep
-// AerolVM's exact values.
+// the Python SDK checks strictly. Half a CPU and 1.5 GB round up in both list
+// shapes, the same as in GET /sandbox/{id} (wholeUnits).
 func TestListSandboxesCursorItemsUseWholeResourceNumbers(t *testing.T) {
 	_, st, _, handler := newHandlerExtraTestEnv(t)
 	sb := listSandbox("sb-small", time.Now().UTC(), nil)
@@ -279,8 +279,8 @@ func TestListSandboxesCursorItemsUseWholeResourceNumbers(t *testing.T) {
 		t.Fatalf("list item numbers must encode as integers: %s", raw)
 	}
 	_, array, raw := getSandboxList(t, handler, "", nil)
-	if len(array.array) != 1 || array.array[0].CPU != 0.5 || array.array[0].Memory != 1.5 {
-		t.Fatalf("array list must keep exact values: %s", raw)
+	if len(array.array) != 1 || array.array[0].CPU != 1 || array.array[0].Memory != 2 {
+		t.Fatalf("array list must round cpu and memory up like the cursor page: %s", raw)
 	}
 }
 
