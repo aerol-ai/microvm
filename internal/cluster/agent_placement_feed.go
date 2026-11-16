@@ -324,15 +324,24 @@ func (a *Agent) applyPlacementChanges(f *agentPlacementFeed, resp PlacementChang
 // (staleViewPlacement); the page walk is not a way out, since its own cache
 // is older still.
 func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) {
+	rows, _, ok := a.feedView(filter)
+	return rows, ok
+}
+
+// feedView is feedPlacements with the cursor the rows are current to, read
+// under the same lock: a cursor read on its own can belong to a feed that
+// no longer answers (unsynced after a Resnapshot), whose rows the caller
+// never got.
+func (a *Agent) feedView(filter PlacementShardFilter) ([]Placement, uint64, bool) {
 	if a == nil || a.feed == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	f := a.feed
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	stale := f.staleLocked(f.now())
 	if !f.synced && !stale {
-		return nil, false
+		return nil, 0, false
 	}
 	filter = filter.Normalize()
 	want := make(map[int]struct{}, len(filter.Shards))
@@ -352,7 +361,7 @@ func (a *Agent) feedPlacements(filter PlacementShardFilter) ([]Placement, bool) 
 		}
 		out = append(out, p)
 	}
-	return clonePlacements(out), true
+	return clonePlacements(out), f.cursor, true
 }
 
 // inFluxPlacement is p with the owner's addresses blanked: what the two

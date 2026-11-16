@@ -211,7 +211,14 @@ type Agent struct {
 	// placementVersion tracks the highest placement version observed via
 	// shard/page/point reads. It keeps PlacementVersion() off the full-map
 	// endpoint on worker/ingress-only agents.
-	placementVersion          atomic.Uint64
+	placementVersion atomic.Uint64
+	// walkVersion is the highest version a fresh page walk of
+	// PlacementViewForShards was current to. A later walk is newer server
+	// state than every walk that finished before it started, so it is
+	// current to this too: a sandbox an earlier walk saw and that is gone
+	// now was deleted after it, a delete the new view already holds. Point
+	// reads and the cached view never move it.
+	walkVersion               atomic.Uint64
 	lastNoControlPlaneLogUnix atomic.Int64
 	// contact is the last successful control-plane exchange, for /ready
 	// (readiness.go).
@@ -1248,18 +1255,36 @@ func (a *Agent) Placements() []Placement {
 // Paging the page endpoint keeps every response bounded by
 // MaxPlacementPageLimit rows instead of raising the ceiling.
 func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
+	out, _ := a.PlacementViewForShards(filter)
+	return out
+}
+
+// PlacementViewForShards is PlacementsForShards with the version the view
+// it returns is current to (Client.PlacementViewForShards), decided by the
+// path that produced it: the feed's cursor read with its rows, a fresh
+// walk's highest row or the walks that finished before it started
+// (walkVersion), or the cached view's own highest row when the walk failed. A point read (PlacementOf; OwnerOf on every routed API call)
+// moves PlacementVersion and never this.
+func (a *Agent) PlacementViewForShards(filter PlacementShardFilter) ([]Placement, uint64) {
 	start := time.Now()
 	filter = filter.Normalize()
 	if filter.noShards() {
 		// This node serves no public routes. Not a cache miss, not an empty
-		// fleet — simply no work, and no control-plane read either.
-		return nil
+		// fleet — simply no work, and no control-plane read either. With
+		// nothing to install, its empty view is current to everything it
+		// has seen.
+		return nil, a.PlacementVersion()
 	}
-	if out, ok := a.feedPlacements(filter); ok {
-		// The delta feed keeps the whole view current: no page walk.
+	if out, cursor, ok := a.feedView(filter); ok {
+		// The delta feed keeps the whole view current: no page walk. Its
+		// cursor counts deletes too, which no row in the view carries.
 		recordPlacementCacheRefresh(time.Since(start), len(out), a.shardCacheEntryCount(), nil)
-		return out
+		return out, cursor
 	}
+	// Read before the walk starts: only walks that finished by now are
+	// older server state than this one. One that finishes while this walk
+	// runs may have seen rows this view holds no trace of.
+	priorWalks := a.walkVersion.Load()
 	out, err := a.fetchPlacementPages(filter)
 	if err != nil {
 		// Age limit (plan C4 part 3, invariant I7), as the feed has. Without
@@ -1285,7 +1310,9 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 			"err", err, "shards", len(filter.Shards), "all_shards", filter.allShards(),
 			"since_last_answer", age.Round(time.Millisecond), "in_flux", inFlux)
 		recordPlacementCacheRefresh(time.Since(start), len(cached), a.shardCacheEntryCount(), err)
-		return cached
+		// Current only to its own rows: the cache may be far older than a
+		// feed cursor or another filter's walk.
+		return cached, maxPlacementVersion(cached)
 	}
 	a.cacheMu.Lock()
 	if start.After(a.placementWalkAnswered) {
@@ -1299,7 +1326,11 @@ func (a *Agent) PlacementsForShards(filter PlacementShardFilter) []Placement {
 	a.cacheMu.Unlock()
 	a.observePlacementVersions(out)
 	recordPlacementCacheRefresh(time.Since(start), len(out), shardEntries, nil)
-	return out
+	// Its own rows count no delete; the walks before it count the deletes
+	// of rows they saw (walkVersion).
+	v := max(priorWalks, maxPlacementVersion(out))
+	raiseVersion(&a.walkVersion, v)
+	return out, v
 }
 
 // maxPlacementPages bounds the page walk. At MaxPlacementPageLimit rows per
@@ -1571,25 +1602,32 @@ func (a *Agent) lookupPlacement(ctx context.Context, sandboxID string) (Placemen
 }
 
 func (a *Agent) observePlacementVersions(placements []Placement) {
-	var max uint64
-	for _, p := range placements {
-		if p.Version > max {
-			max = p.Version
-		}
-	}
-	a.observePlacementVersion(max)
+	a.observePlacementVersion(maxPlacementVersion(placements))
 }
 
 func (a *Agent) observePlacementVersion(version uint64) {
+	raiseVersion(&a.placementVersion, version)
+}
+
+func maxPlacementVersion(placements []Placement) uint64 {
+	var top uint64
+	for _, p := range placements {
+		top = max(top, p.Version)
+	}
+	return top
+}
+
+// raiseVersion moves v up to version, never down.
+func raiseVersion(v *atomic.Uint64, version uint64) {
 	if version == 0 {
 		return
 	}
 	for {
-		cur := a.placementVersion.Load()
+		cur := v.Load()
 		if version <= cur {
 			return
 		}
-		if a.placementVersion.CompareAndSwap(cur, version) {
+		if v.CompareAndSwap(cur, version) {
 			return
 		}
 	}

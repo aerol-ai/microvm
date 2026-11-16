@@ -2229,6 +2229,13 @@ func (c *Cluster) PlacementVersion() uint64 {
 	return c.fsm.currentVersion()
 }
 
+// PlacementViewForShards on a Raft node: the view is the local FSM. The
+// applied index is read first, so the view is current to at least it.
+func (c *Cluster) PlacementViewForShards(filter PlacementShardFilter) ([]Placement, uint64) {
+	v := c.PlacementVersion()
+	return c.PlacementsForShards(filter), v
+}
+
 // SubscribePlacement returns a buffered (cap=1) wake channel that fires after
 // every FSM apply on this node. Cancelling ctx removes the subscriber. See the
 // Client.SubscribePlacement contract for semantics.

@@ -150,6 +150,12 @@ func (s *serviceClusterStub) PlacementsForShards(cluster.PlacementShardFilter) [
 	return s.Placements()
 }
 
+// PlacementViewForShards is the view the reconciler reads, with the
+// version it is current to (cluster.Client).
+func (s *serviceClusterStub) PlacementViewForShards(filter cluster.PlacementShardFilter) ([]cluster.Placement, uint64) {
+	return s.PlacementsForShards(filter), s.PlacementVersion()
+}
+
 func (s *serviceClusterStub) SpecOf(id string) *models.CreateSandboxRequest {
 	if s.specs == nil {
 		return nil

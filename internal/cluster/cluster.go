@@ -1045,6 +1045,19 @@ type Client interface {
 	// Zero means "no version data" (Noop or fresh cluster).
 	PlacementVersion() uint64
 
+	// PlacementViewForShards is PlacementsForShards with the placement
+	// version that view is current to, decided with the view itself: the
+	// FSM's applied index read before the view on a Raft node; on an Agent
+	// the delta feed's cursor read with its rows (deletes included), a
+	// fresh page walk's highest row or the highest of the walks that
+	// finished before it started (deletes of rows they saw), or, when the
+	// walk failed, the cached view's own highest row. Point reads (PlacementOf, OwnerOf,
+	// PlacementsByIDs) never count, though they move PlacementVersion: a
+	// row a point read saw may not be in the view yet. The ingress
+	// reconciler records it as installed after a good pass. Zero means "no
+	// version data" (Noop).
+	PlacementViewForShards(filter PlacementShardFilter) ([]Placement, uint64)
+
 	// SubscribePlacement returns a buffered (cap=1) channel that receives a
 	// signal after every FSM apply on this node. The channel is fed directly
 	// from FSM.Apply, so a leader-side commit reaches every node's

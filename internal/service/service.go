@@ -8445,7 +8445,19 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 		return nil
 	}
 	shardFilter := s.clusterIngressShardFilter(c, self)
-	placements := c.PlacementsForShards(shardFilter)
+	// The view and the version it is current to, decided together: a pass
+	// that succeeds has installed everything up to that version, including
+	// the placements created and deleted since the last good pass (their
+	// routes went with them). Counting only the highest version still in
+	// the view left the lag above zero after a Caddy outage, until the next
+	// create (issue #1343: 32 behind for good on a converged gateway). It
+	// is the view's version, never PlacementVersion: on a gateway that one
+	// also moves with point reads (OwnerOf on every routed API call), for
+	// rows the view may not hold yet; and a version read apart from the
+	// view could belong to a feed that stopped answering mid-failover while
+	// the view came from an older cache. Either would claim a route that
+	// was never installed (node_installed_version, the lag).
+	placements, seen := c.PlacementViewForShards(shardFilter)
 
 	// Idle-skip: hash the relevant slice of the placement view. If nothing
 	// changed since the last successful reconcile, return without touching
@@ -8460,7 +8472,8 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	viewHash, routeCounts, maxVersion := hashPlacementView(self, placements)
 	audit := s.shouldRunClusterIngressFullGC()
 	if viewHash == s.ingressLastHash.Load() && viewHash != 0 && !audit {
-		recordIngressReconcile(reconcileSkipped, time.Since(start), routeCounts, maxVersion)
+		recordIngressReconcile(reconcileSkipped, time.Since(start), routeCounts, max(maxVersion, seen))
+		SetIngressRouteLag(c.PlacementVersion())
 		return nil
 	}
 
@@ -8489,7 +8502,7 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	// minute.
 	if firstErr == nil {
 		s.ingressLastHash.Store(viewHash)
-		recordIngressReconcile(reconcileApplied, time.Since(start), routeCounts, maxVersion)
+		recordIngressReconcile(reconcileApplied, time.Since(start), routeCounts, max(maxVersion, seen))
 	} else {
 		s.ingressLastHash.Store(0)
 		if audit {

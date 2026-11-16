@@ -457,6 +457,11 @@ func (n *Noop) AuthoritativePlacementsByIDs(context.Context, []string) (map[stri
 // no need to wake an ingress reconciler that isn't running.
 func (n *Noop) PlacementVersion() uint64 { return 0 }
 
+// PlacementViewForShards has no view in single-node mode. A test fake that
+// embeds Noop and overrides PlacementsForShards must override this too: the
+// ingress reconciler reads its view here, and would read Noop's empty one.
+func (n *Noop) PlacementViewForShards(PlacementShardFilter) ([]Placement, uint64) { return nil, 0 }
+
 // SubscribePlacement returns nil in single-node mode. Selecting on a nil
 // channel never proceeds, so an ingress reconciler that select{}s on this
 // channel + a slow ticker just behaves as if the cluster never has
