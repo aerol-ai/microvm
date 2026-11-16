@@ -2334,6 +2334,169 @@ each server used about 6% of one core and 160 MB (E5 above).
   latency on a worker is not a real worker's; the bench measures the
   control plane.
 
+**The image-pull storm and SLO-breach drills on kind** (2026-11-16 UTC,
+issue #1343, `integration-tests/k8s/drills-local.sh`; no cloud). Kind
+v0.33 (Kubernetes 1.37), one control-plane node and three workers labelled
+zones z-a, z-b and z-c, on Docker Desktop on an arm64 Mac (5 CPUs, 11 GiB).
+AerolVM in cluster mode from `scripts/k8s-dev.sh` with the edge on: 3
+servers, 3 gateways, 3 workers (pool `general`, runc and gVisor, 4 CPUs
+and 8 GiB each), the operator. Over it, the parts of
+`charts/aerolvm/values-bank-eks.yaml` kind can carry
+(`drills-local/values-bank-kind.yaml`): gVisor creates, a create policy
+that allows only the drill registry (any other is refused 403),
+NetworkPolicies with the registry's address let out of the worker pods,
+and monitoring through kube-prometheus-stack 92.17.0. Alertmanager ran
+`setup/alertmanager/sandboxd-alertmanager-example.yml` as shipped, its two
+webhooks pointed at an echo receiver. The chart does not ship the
+`Sandboxd*` alerts (F43), so the drill loads
+`setup/prometheus/sandboxd-alerts.yml` as a PrometheusRule. The registry:
+`registry:2` behind a fault proxy (`drills-local/faultproxy.py`) that
+rate-limits (429), answers slowly or crawls, per repository; worker pods
+reach it as `localhost:5000` (a forwarder in each pod) because containerd
+speaks plain HTTP only to localhost. Builds: `v0.0.0-dev.1` is `main`
+(6f7810565), on which F38 to F40 were found; the drills below ran on this
+branch: the pull storm on `v0.0.0-dev.3` (`main` plus the F38 to F42
+fixes), the SLO drill on `v0.0.0-dev.4` (plus the F42 logging fix).
+
+| Drill line | Result | Measured |
+|---|---|---|
+| Static: each drilled alert's metric is exported | pass (after F38, F39, F40) | every metric registered in Go and scraped from all 10 pods; a cold create moves `aerolvm_image_pull_requests_total` 0 to 1 (on `main` it stayed 0 after a real pull) |
+| Pulls of one image are shared | pass | 24 creates of one cold image from a slow registry, on 3 workers: each worker fetched each part once (3 GETs), 21 creates waited on another's pull (`aerolvm_image_pull_dedup_waiters_total`) |
+| `SandboxdImagePullBackoffRejects` fires | pass | storm from 18:42:45: pending 18:43:19, firing 18:48:20 (+5m35s) |
+| `SandboxdImagePullQueueBacklog` fires | pass | pending 18:43:19, firing 18:53:22 (+10m37s); up to 10 pulls queued, never more than 4 at once on a worker (the cap) |
+| `SandboxdImagePullErrors` fires | pass | pending 18:43:49, firing 18:53:52 (+11m07s); peak 0.29 errors/s (`rate_limited`), 0.13/s (`timeout`) |
+| Backoff as the runbook says | pass | 226 creates of the rate-limited image; the registry saw 7 attempts from 3 workers, at least 290 s apart per worker (30 s backoff plus waiting for a pull slot behind the slow images); every refused create answered 503 with Retry-After (F42) |
+| Recovery by the runbook | pass | callers paused and the registry fixed at 18:53:48; after the 30 s backoff a create of the failing image answered 201; QueueBacklog resolved +0m42s, the other two +4m27s (their 5-minute rate windows); then queue 0, pull errors and backoff rejects 0 for 15 minutes |
+| Alerts reach the receiver | pass | each of the three reached `/sandboxd` (the warning receiver) once, firing |
+
+The SLO drill (second run, 19:48:53 to about 20:20 UTC on dev.4; the first
+run, from 19:21:39, fired all four too but lost one notice, see the
+harness note below):
+
+| Drill line | Result | Measured |
+|---|---|---|
+| `SandboxdCreateQueueBacklog` fires | pass | 130 creates at once of an image the registry sends at 2 kB/s: up to 132 creates in flight on the workers; pending 19:51:24, firing 19:56:27 |
+| `SandboxdCreateErrors` fires | pass | 6 callers on a rate-limited image, and the creates the 600 s timeout ended: up to 5.7 errors/s; pending 19:51:24, firing 20:01:28 |
+| `SandboxdIngressRouteLag` fires | pass | Caddy's admin API moved off `127.0.0.1:2019` on one gateway at 19:49:57 while public sandboxes came and went: lag up to 6,741 (Raft entries); pending 19:51:54, firing 19:56:57 |
+| `SandboxdNoAdmitWorkers` fires | pass | every worker filled to its last CPU (8-, 4-, 2- and 1-CPU sandboxes); pending 20:06:59, firing 20:12:00; servers and gateways read 0 throughout (F39). The operator asked for 3 more workers, which stayed Pending (no room on kind) |
+| Alertmanager routes each to its receiver | pass | the echo receiver logged the three warnings at `/sandboxd` (19:56:38, 19:57:00, 20:01:38) and `SandboxdNoAdmitWorkers`, the critical one, at `/sandboxd-critical` (20:12:08) |
+| Following `slo-breach.md` clears them | pass | callers paused, registry fixed and the gateway replaced at 20:01:38: route lag 0 by 20:02:58, create errors resolved by 20:06:59 (their 5-minute rate window; the backlog had cleared in the timeout wave at 19:59:27 and did not fire again); fillers deleted at 20:12:11: `SandboxdNoAdmitWorkers` resolved by 20:13:00. The receiver got each resolved notice (the critical one at 20:17:08, one `group_interval` later), and a create and delete answered 201 |
+
+The runbook's steps, as run: the first-five-minutes evidence (leader, members,
+metrics), then its branches. Image-pull metrics were high, so the image-pull
+runbook's containment (callers paused, registry fixed). Caddy's admin calls
+failed and nothing converged, so Caddy was restarted, which on Kubernetes
+means deleting the gateway pod: the operator had a new one ready in 72 s
+(both runs), and the route lag was 0 by then. No worker could admit: the capacity
+check showed every worker full and nothing drained, and freeing room (the
+fillers deleted; on a cell, more workers) cleared it in under a minute.
+
+Findings, each fixed on this branch unless it says otherwise:
+
+- F38. The containerd engine (every Kubernetes worker, and the default on
+  VMs) has its own pull dedup, slot cap and failure backoff, and moved none
+  of the `aerolvm_image_pull_*` metrics: only the dockerd engine did. So
+  the three image-pull alerts could never fire on Kubernetes; on `main` a
+  real pull left `aerolvm_image_pull_requests_total` at 0 on every pod. It
+  now reports them under the same names and meaning as dockerd.
+- F39. `SandboxdNoAdmitWorkers` (`sum(aerolvm_host_pressure_can_admit) ==
+  0`) could not fire on any cluster with dedicated servers or gateways:
+  each has a capacity admitter with room on paper and published 1 (all six
+  did on kind). A node that turns every create away now publishes 0
+  (`Config.OwnsSandboxes`, the rule `createSandbox` already uses). The
+  chart's dashboard had worked around it with `aerolvm_component="worker"`;
+  VM installs have no such label. The d6 Grafana dashboard counts the
+  nodes that can admit (a `sum`); its `min` read 0 on any such cluster.
+- F40. With `monitoring.enabled` and no `monitoring.scrapeToken`, the
+  cluster-mode ServiceMonitors read `aerolvm-api-token`, which only single
+  mode makes. The Prometheus Operator refused all three ("unable to get
+  secret"), so no sandboxd was scraped. They now read the operator's
+  `<cluster.name>-admin`. The bank values set a scrape token and were not
+  affected.
+- F41. After Caddy's admin API came back, a gateway kept reporting route
+  lag (32 on `main`) until the next create: a pass counted as installed
+  only the highest version still in its view, so the versions of sandboxes
+  created and deleted during the outage stayed "seen", and a quiet cluster
+  would keep `SandboxdIngressRouteLag` firing after the fix. A successful
+  pass now records the version of the view it read: on a server the FSM's
+  applied index, on a gateway the placement feed's cursor, which the point
+  reads a gateway makes on every routed call never move. On dev.3 the lag
+  went from 2,732 to 0 within a minute of Caddy's restart, with no create.
+- F42. Every create that met registry trouble answered 400: a 429, no
+  response headers within containerd's 30 s, and every create the backoff
+  then refused. SDKs do not retry a 400. These now answer 503 with the
+  code `image_pull_unavailable` and `Retry-After` set to the worker's
+  backoff (30 s by default), logged as the 400 was (the first build with
+  the 503 logged nothing, which the runbook's log check needs). A missing
+  tag, refused credentials or another failure that will not pass stay
+  400, and so do the backoff's refusals after one: only the failure's
+  cause is judged, typed where it can be, never the refusal's wording or
+  the image's name. Both engines' backoff refusals name a capped cause,
+  and containerd drops expired backoff entries.
+- F43 (not fixed). The chart's PrometheusRule ships only the `AerolVM*`
+  alerts, none of the `Sandboxd*` alerts the image-pull and SLO runbooks
+  are written for, so a bank on `values-bank-eks.yaml` gets none of the
+  seven drilled here. The runbooks now say to load
+  `setup/prometheus/sandboxd-alerts.yml`. Proposal: ship the create,
+  capacity, ingress and image-pull groups in the chart behind a value.
+- F44 (not fixed). `SandboxdSecretProviderCanaryFailing`
+  (`aerolvm_secret_provider_canary_ok == 0`) fires on every node without
+  an external key store: the gauge is set only when one is configured. It
+  reached the drill's receiver 14 times during the pull storm alone.
+  Proposal: publish 1 when there is no external store to check, or join
+  the rule on `aerolvm_key_custody`.
+- Alert windows (not changed). The three image-pull alerts fired one
+  evaluation after their `for:` windows (5, 10 and 10 minutes): fine for
+  warnings. `SandboxdCreateErrors` fired 12.5 minutes into a storm, after
+  the others: acceptable. Two proposals: `SandboxdCreateQueueBacklog`
+  flaps under a crawling registry, because the 600 s create timeout ends
+  every stuck create at once and the backlog dips for a few minutes every
+  10 (both runs), so give it `keep_firing_for: 10m`; and
+  `SandboxdIngressRouteLag` counts Raft log entries, not "placement
+  revisions" as its text says (one create after a busy hour reads
+  thousands), so after F41 the threshold should be `> 0` with the
+  description corrected.
+- Not investigated: when no worker could admit, the operator added 3
+  workers, which never got a machine (no room on kind). At 19:41 it
+  started decommissioning them ("never got a machine, and its zone has its
+  workers and room again"); 40 minutes later all 3 were still
+  Decommissioning with Pending pods, past the pool's 5-minute deadline, and
+  the operator had logged nothing more about them. On a cell that gets
+  machines this may not arise.
+- Behaviour worth knowing (runbooks updated): containerd gives up on a
+  registry request after 30 s without response headers, so a registry
+  that is slow to answer makes errors, not a queue. The per-worker pull cap
+  is shared by every image, so a failing image's creates waited about
+  260 s for a slot behind slow pulls before failing together on one 429.
+  Under a Caddy outage the gateway logged about 8 failed reconciles a
+  second (6,143 lines in 13 minutes).
+- Harness and environment: `k8s-dev.sh`'s hint named a Service without
+  the API port when the edge is on (fixed). The drills' own bugs, found
+  on the way and fixed: a finished caller is a zombie in the client pod
+  (the wait polled it for 10 minutes), a name shadowed the worker
+  namespace, the result lines lost their text to a quoting error, a 3 s
+  port-forward wait was too short once (the first admin move was redone
+  by hand, a minute in), the capacity fill twice stopped one or two CPUs
+  short and was topped up by hand (it now tops up for itself), and the
+  first run mitigated `SandboxdNoAdmitWorkers` 37 s after it fired,
+  inside Alertmanager's 30 s `group_wait`, so no notice was sent (the
+  drill now waits for each notice before it mitigates). On this machine
+  `golang:1.26` was an amd64 image and the Go toolchain crashed under
+  emulation (k8s-dev ran from a copy using `golang:1.26.11`), and Docker
+  Desktop's Docker Hub lookups, pushes and builds stalled for minutes: the
+  drill pushes its images over the registry API, and dev builds were laid
+  over a saved image.
+
+What kind cannot prove, and an EKS cell would: a real HTTPS registry
+with its own name and certificate (here plain HTTP through a forwarder in
+each pod, so the bank's CA trust path is untested), ECR or Artifactory
+throttling and auth failures, image layers big enough to fill a disk or
+saturate a link, 32-CPU workers and the alert thresholds at 60 workers
+(`> 100` creates in flight is about 2 per worker there), the operator
+actually getting machines when no worker can admit (here its new workers
+stayed Pending), gVisor on Amazon Linux, an internal NLB in front of the gateways,
+and a viewer-only scrape token.
+
 ### Phase 5 results
 
 **C14 on kind** (2026-11-13, `scripts/k8s-dev.sh` single mode with
