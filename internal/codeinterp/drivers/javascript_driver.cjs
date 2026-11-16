@@ -480,13 +480,23 @@ async function setup() {
   outFd = reopen(1, fs.constants.O_WRONLY);
   errFd = reopen(2, fs.constants.O_WRONLY);
 
+  // The warm-ups below make Node print its one-time ExperimentalWarnings
+  // (stripTypeScriptTypes, the vm loader constant) now rather than in a
+  // run. Printed, they still reached the first run: the host drops output
+  // from before READY only if its pipe reader has read it by then, and on
+  // a busy host it may not have. So Node's warning printer is detached for
+  // the warm-up and put back before READY, where the user's own warnings
+  // print as usual.
+  const warningListeners = process.listeners('warning');
+  process.removeAllListeners('warning');
+
   if (language === 'typescript') {
     stripTypeScriptTypes = Module.stripTypeScriptTypes;
     if (typeof stripTypeScriptTypes !== 'function') {
       fatal('typescript needs Node.js 22.13 or newer (module.stripTypeScriptTypes); this is ' + process.version);
     }
-    // The first call prints an ExperimentalWarning; better now, before
-    // READY, where the host drops it, than in the user's first run.
+    // The first call raises an ExperimentalWarning; raise it now, while
+    // nothing prints it, not in the user's first run.
     stripTypes('let warm: number = 1');
   }
 
@@ -508,13 +518,18 @@ async function setup() {
   });
 
   // Warm the module loader up: the first dynamic import from a script
-  // prints an ExperimentalWarning on some versions.
+  // raises an ExperimentalWarning on some versions.
   try {
     await compile('import("node:path")').runInThisContext();
   } catch (err) {
     // Only a warm-up.
   }
+  // A warning is delivered on the next tick, so by setImmediate every
+  // warm-up warning has gone to no listener; then the printer comes back.
   await new Promise((resolve) => setImmediate(resolve));
+  for (const listener of warningListeners) {
+    process.on('warning', listener);
+  }
   await Promise.all([flushStream(process.stdout), flushStream(process.stderr)]);
   return new Requests(reqFd);
 }
