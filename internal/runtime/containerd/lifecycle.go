@@ -1327,7 +1327,17 @@ func (d *Driver) pullImage(ctx context.Context, client *Client, ref string, auth
 		dockerpkg.RecordImagePullDedupWaiter()
 	}
 	if err != nil {
-		d.recordPullFailure(ref, err, time.Now())
+		// Only the registry's failure starts the backoff, once per flight
+		// (by its leader, whose ctx the pull ran on). A caller that left,
+		// cancelled or out of its own deadline, says nothing about the
+		// registry; the backoff would refuse every create of a healthy
+		// image after it, as a 400 since a cancel is not transient. The
+		// ctx tells, the error cannot: the registry's response-header
+		// timeout is a context.DeadlineExceeded too, and that one is the
+		// registry's (dockerd skips both, its errors arrive as text).
+		if led && ctx.Err() == nil {
+			d.recordPullFailure(ref, err, time.Now())
+		}
 		return nil, err
 	}
 	return res.(cntr.Image), nil

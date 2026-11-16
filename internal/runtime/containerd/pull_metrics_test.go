@@ -5,6 +5,8 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +17,7 @@ import (
 	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/errdefs"
 
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -178,6 +181,124 @@ func TestEnsureImagePullFailuresArePrunedAndCapped(t *testing.T) {
 		if len(f.cause) > 600 || !f.transient {
 			t.Errorf("%s: cause %d bytes, transient %v; want a capped cause of a transient failure", ref, len(f.cause), f.transient)
 		}
+	}
+}
+
+// A create whose caller left starts no backoff (issue #1343 review): the
+// containerd engine used to record the leader's context.Canceled as the
+// image's failure, so every create of that healthy image for the next
+// backoff was refused, as a 400. dockerd already skipped it. A create that
+// shared the flight gets the leader's cancel with its own ctx alive, so it
+// must not record it either.
+func TestEnsureImageCallerGoneStartsNoBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ctx    func() (context.Context, context.CancelFunc, func())
+		waiter bool
+	}{
+		{"cancelled", func() (context.Context, context.CancelFunc, func()) {
+			ctx, cancel := context.WithCancel(context.Background())
+			return ctx, cancel, cancel
+		}, false},
+		{"cancelled, with a create sharing its pull", func() (context.Context, context.CancelFunc, func()) {
+			ctx, cancel := context.WithCancel(context.Background())
+			return ctx, cancel, cancel
+		}, true},
+		{"its own deadline ran out", func() (context.Context, context.CancelFunc, func()) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			return ctx, cancel, func() {}
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTransport()
+			var gets atomic.Int64
+			tr.getImageFn = func(context.Context, string) (cntr.Image, error) {
+				gets.Add(1)
+				return nil, errdefs.ErrNotFound
+			}
+			var pulls atomic.Int64
+			started := make(chan struct{}, 1)
+			tr.pullImageFn = func(ctx context.Context, _ string, _ ...cntr.RemoteOpt) (cntr.Image, error) {
+				if pulls.Add(1) == 1 {
+					started <- struct{}{}
+					<-ctx.Done() // the registry is slow; the caller leaves
+					return nil, fmt.Errorf("failed to resolve reference: %w", ctx.Err())
+				}
+				return &fakeImage{name: pullMetricsRef}, nil
+			}
+			d := New(Config{PullFailureBackoff: time.Minute}, nil, nil)
+			client := NewTestClient("aerolvm", tr)
+
+			ctx, cancel, leave := tc.ctx()
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := d.ensureImage(ctx, client, pullMetricsRef, nil)
+				done <- err
+			}()
+			<-started
+			waited := make(chan error, 1)
+			if tc.waiter {
+				go func() {
+					_, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil)
+					waited <- err
+				}()
+				// The leader looked twice and once in the flight; the
+				// waiter looks twice, then joins (as in the dedup test).
+				waitForCounter(t, "image lookups", gets.Load, 5)
+				time.Sleep(50 * time.Millisecond)
+			}
+			leave()
+			if err := <-done; err == nil {
+				t.Fatal("the pull whose caller left succeeded")
+			}
+			if tc.waiter {
+				if err := <-waited; !errors.Is(err, context.Canceled) {
+					t.Fatalf("the create sharing the pull: %v, want the leader's cancel", err)
+				}
+			}
+			if _, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil); err != nil {
+				t.Fatalf("the next create of the image: %v, want a fresh pull", err)
+			}
+			if got := pulls.Load(); got != 2 {
+				t.Errorf("registry pulls = %d, want 2: the next create was not let through to the registry", got)
+			}
+		})
+	}
+}
+
+// The registry not answering in time still starts the backoff, though its
+// error is a context.DeadlineExceeded too (net/http's response-header
+// timeout): only the caller's own context ending skips it. This is the
+// image-pull-storm drill's hanging registry, which the backoff must shed.
+func TestEnsureImageRegistryHeaderTimeoutBacksOff(t *testing.T) {
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-stall }))
+	defer srv.Close()
+	defer close(stall)
+	hc := &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 20 * time.Millisecond}}
+	_, headerTimeout := hc.Head(srv.URL + "/v2/drill/app/manifests/v1")
+	if !errors.Is(headerTimeout, context.DeadlineExceeded) {
+		t.Fatalf("net/http's header timeout %v is not a context.DeadlineExceeded; this test's premise is gone", headerTimeout)
+	}
+
+	tr := newFakeTransport()
+	tr.getImageFn = func(context.Context, string) (cntr.Image, error) { return nil, errdefs.ErrNotFound }
+	var pulls atomic.Int64
+	tr.pullImageFn = func(context.Context, string, ...cntr.RemoteOpt) (cntr.Image, error) {
+		pulls.Add(1)
+		return nil, fmt.Errorf("failed to resolve reference %q: failed to do request: %w", pullMetricsRef, headerTimeout)
+	}
+	d := New(Config{PullFailureBackoff: time.Minute}, nil, nil)
+	client := NewTestClient("aerolvm", tr)
+	_, _ = d.ensureImage(context.Background(), client, pullMetricsRef, nil)
+	_, err := d.ensureImage(context.Background(), client, pullMetricsRef, nil)
+	var refusal *dockerpkg.PullBackoffError
+	if !errors.As(err, &refusal) || !errors.Is(err, models.ErrImagePullUnavailable) {
+		t.Fatalf("after the registry timed out: %v, want the backoff's refusal, a 503", err)
+	}
+	if got := pulls.Load(); got != 1 {
+		t.Errorf("registry pulls = %d, want 1 while the backoff runs", got)
 	}
 }
 
