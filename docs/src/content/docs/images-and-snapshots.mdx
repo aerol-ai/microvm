@@ -143,7 +143,7 @@ The server downloads the image by its digest and checks that the contents match 
 - **Find the digest** on your registry's page for the image, or run `docker images --digests` on a machine that has pulled it.
 - **A tag next to the digest is ignored.** In `app:1.4@sha256:…` only the digest decides what is downloaded.
 - **Create policies see the digest, not the tag.** A rule such as `app:1.4*` does not allow a pinned image, because the tag no longer decides what runs. Allow the registry, or list the digest. See [Create policy](/enterprise/create-policy/).
-- **Snapshots are pinned for you.** When another server starts a snapshot from your cluster's registry, for example after a failover, it downloads the exact version that was saved, even if a newer snapshot has reused the name since. If that version has been deleted from the registry, the start fails instead of running the newer one.
+- **Snapshots from the registry are pinned for you.** A server that does not hold a snapshot, for example after a failover, downloads it from your cluster's registry. It gets the exact version that was saved, even if a newer snapshot has reused the name in the registry since. If that version has been deleted, the start fails instead of running the newer one.
 
 ## Snapshots
 
