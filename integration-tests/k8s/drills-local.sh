@@ -138,8 +138,11 @@ trap cleanup EXIT
 # watch_start <dir>: a line a 30 s of the drilled metrics and alerts.
 drilled_alerts=(SandboxdImagePullQueueBacklog SandboxdImagePullBackoffRejects SandboxdImagePullErrors
   SandboxdCreateQueueBacklog SandboxdCreateErrors SandboxdNoAdmitWorkers SandboxdIngressRouteLag)
+# The watcher is exec'd in its subshell, so $! is python itself: a shell
+# function sent to the background is a subshell, and killing that left the
+# python running after the step (three were left over from the first runs).
 watch_start() {
-  prom watch --out "$1/timeline.jsonl" --interval 30 --alerts "${drilled_alerts[@]}" --exprs \
+  ( exec python3 "$L/prom.py" --url "http://127.0.0.1:$prom_port" watch --out "$1/timeline.jsonl" --interval 30 --alerts "${drilled_alerts[@]}" --exprs \
     'queued=sum by (aerolvm_component) (aerolvm_image_pull_queued)' \
     'inflight=max by (pod) (aerolvm_image_pull_inflight{aerolvm_component="worker"})' \
     'pull_errors_5m=sum by (key) (rate(aerolvm_image_pull_errors_total[5m]))' \
@@ -149,7 +152,7 @@ watch_start() {
     'create_errors_5m=sum by (key) (rate(aerolvm_create_errors_total[5m]))' \
     'can_admit=sum by (aerolvm_component) (aerolvm_host_pressure_can_admit)' \
     'route_lag=max by (pod) (aerolvm_ingress_route_lag_versions{aerolvm_component="gateway"})' \
-    'caddy_reconcile_errors=sum(aerolvm_ingress_reconcile_errors_total)' &
+    'caddy_reconcile_errors=sum(aerolvm_ingress_reconcile_errors_total)' ) &
   watcher=$!
 }
 watch_stop() { [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true; watcher=""; }
