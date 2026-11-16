@@ -28,6 +28,7 @@ import (
 //	sleep             block until interrupted or closed
 //	ignore            block until closed (ignores interrupts)
 //	die               the kernel dies mid-run
+//	killed            the kernel is killed by an interrupt (WASM)
 //	wait D            sleep for duration D, then go on
 //	env / cwd         print the run's K variable / the context's cwd
 type fakeKernel struct {
@@ -78,6 +79,10 @@ func (k *fakeKernel) Execute(req codeinterp.Request, sink codeinterp.Sink) (code
 		case "die":
 			_ = k.Close()
 			return codeinterp.Outcome{Died: true}, nil
+		case "killed":
+			// A WASM kernel's interrupt: the interpreter is killed.
+			_ = k.Close()
+			return codeinterp.Outcome{Status: "interrupted", Died: true}, nil
 		case "wait":
 			d, _ := time.ParseDuration(arg)
 			time.Sleep(d)
@@ -199,10 +204,16 @@ type wsResult struct {
 	subprotocol string
 }
 
+// types lists the frame types, with adjacent stdout (or stderr) frames
+// counted once: a pipe may hand a real kernel's "a\n" over in two reads.
 func (r wsResult) types() []string {
 	var out []string
 	for _, f := range r.frames {
-		out = append(out, f["type"].(string))
+		typ := f["type"].(string)
+		if n := len(out); n > 0 && out[n-1] == typ && (typ == "stdout" || typ == "stderr") {
+			continue
+		}
+		out = append(out, typ)
 	}
 	return out
 }

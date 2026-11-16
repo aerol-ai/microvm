@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/bytecodealliance/wasmtime-go/v37"
+	"github.com/aerol-ai/wasmtime-go/v37"
 )
 
 type wasmtimeNetHost struct {
@@ -29,46 +29,59 @@ func (e *wasmtimeEngine) ClearNetworkHook() {
 	e.netHook = nil
 }
 
-func (e *wasmtimeEngine) ensureNetworkHost(linker *wasmtime.Linker) error {
+// newNetworkHost defines the mediated egress functions in linker for one
+// instance, or nothing when no hook dials for the sandbox. Each instance
+// gets its own host, so stopping one closes only its connections.
+func (e *wasmtimeEngine) newNetworkHost(linker *wasmtime.Linker) (*wasmtimeNetHost, error) {
 	if e.netHook == nil || e.netHook.Dial == nil {
-		return nil
-	}
-	if e.netHost != nil {
-		e.netHost.mu.Lock()
-		e.netHost.hook = e.netHook
-		e.netHost.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	host := &wasmtimeNetHost{
 		hook:  e.netHook,
 		conns: make(map[uint64]net.Conn),
 	}
 	if err := linker.FuncWrap("aerol/vm/net", "tcp_dial", host.tcpDial); err != nil {
-		return fmt.Errorf("aerol/vm/net tcp_dial: %w", err)
+		return nil, fmt.Errorf("aerol/vm/net tcp_dial: %w", err)
 	}
 	if err := linker.FuncWrap("aerol/vm/net", "tcp_close", host.tcpClose); err != nil {
-		return fmt.Errorf("aerol/vm/net tcp_close: %w", err)
+		return nil, fmt.Errorf("aerol/vm/net tcp_close: %w", err)
 	}
 	if err := linker.FuncWrap("aerol/vm/net", "tcp_read", host.tcpRead); err != nil {
-		return fmt.Errorf("aerol/vm/net tcp_read: %w", err)
+		return nil, fmt.Errorf("aerol/vm/net tcp_read: %w", err)
 	}
 	if err := linker.FuncWrap("aerol/vm/net", "tcp_write", host.tcpWrite); err != nil {
-		return fmt.Errorf("aerol/vm/net tcp_write: %w", err)
+		return nil, fmt.Errorf("aerol/vm/net tcp_write: %w", err)
 	}
 	if err := linker.FuncWrap("wasi:sockets", "tcp_connect", host.tcpDial); err != nil {
-		return fmt.Errorf("wasi:sockets tcp_connect: %w", err)
+		return nil, fmt.Errorf("wasi:sockets tcp_connect: %w", err)
 	}
 	if err := linker.FuncWrap("wasi:sockets", "stream_read", host.tcpRead); err != nil {
-		return fmt.Errorf("wasi:sockets stream_read: %w", err)
+		return nil, fmt.Errorf("wasi:sockets stream_read: %w", err)
 	}
 	if err := linker.FuncWrap("wasi:sockets", "stream_write", host.tcpWrite); err != nil {
-		return fmt.Errorf("wasi:sockets stream_write: %w", err)
+		return nil, fmt.Errorf("wasi:sockets stream_write: %w", err)
 	}
 	if err := linker.FuncWrap("wasi:sockets", "stream_close", host.tcpClose); err != nil {
-		return fmt.Errorf("wasi:sockets stream_close: %w", err)
+		return nil, fmt.Errorf("wasi:sockets stream_close: %w", err)
 	}
-	e.netHost = host
-	return nil
+	return host, nil
+}
+
+// shutdown refuses further dials and closes every connection, so a guest
+// blocked reading one returns and its instance can be released (the
+// wazero engine's closeConns does the same before a stop).
+func (h *wasmtimeNetHost) shutdown() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.closed = true
+	conns := h.conns
+	h.conns = make(map[uint64]net.Conn)
+	h.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 func (h *wasmtimeNetHost) tcpDial(caller *wasmtime.Caller, addrPtr, addrLen int32) int32 {

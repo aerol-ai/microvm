@@ -10,16 +10,17 @@ func TestGuestHTTPTarget_Errors(t *testing.T) {
 	s := &Server{}
 
 	s.lastCaps.WASIListenPort = -1
-	_, err := s.guestHTTPTarget(0)
-	if err == nil {
-		t.Error("expected error on negative port")
+	if _, err := s.guestHTTPTarget(0); err == nil {
+		t.Error("expected error without an engine")
 	}
 
-	// Test host == ""
+	// The target is the engine's listener whatever port the request names,
+	// on loopback when caps name no host.
+	s.eng = &fakeNetworkAwareEngine{port: 80}
 	s.lastCaps.WASIListenHost = ""
-	target, _ := s.guestHTTPTarget(80)
-	if target != "127.0.0.1:80" {
-		t.Errorf("expected 127.0.0.1:80, got %v", target)
+	target, err := s.guestHTTPTarget(9999)
+	if err != nil || target != "127.0.0.1:80" {
+		t.Errorf("expected 127.0.0.1:80, got %v, %v", target, err)
 	}
 
 	// Test url.Parse error by using a bad host

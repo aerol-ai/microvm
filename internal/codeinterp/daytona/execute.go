@@ -75,6 +75,13 @@ type session struct {
 	gone       chan struct{}
 	goneOnce   sync.Once
 	stopPing   chan struct{}
+
+	// interrupt is closed when the client asks to stop this run. It is the
+	// run's RunPolicy.Interrupt, so it reaches this run and no other: a run
+	// still in the queue is stopped as soon as it starts, and one that is
+	// over is left alone.
+	interrupt     chan struct{}
+	interruptOnce sync.Once
 }
 
 func (s *session) markGone() { s.goneOnce.Do(func() { close(s.gone) }) }
@@ -106,7 +113,7 @@ func (s *session) writer() {
 
 // reader reads after the first message: it answers pings (gorilla does that
 // inside reads), extends the deadline, and takes interrupts.
-func (s *session) reader(contextID string) {
+func (s *session) reader() {
 	defer close(s.readerDone)
 	defer s.markGone()
 	extend := func() { _ = s.conn.SetReadDeadline(time.Now().Add(s.h.live.pongWait)) }
@@ -123,9 +130,7 @@ func (s *session) reader(contextID string) {
 		extend()
 		var msg ClientMessage
 		if json.Unmarshal(data, &msg) == nil && msg.Type == "interrupt" {
-			if err := s.h.m.Interrupt(contextID); err != nil {
-				s.h.logger.Debug("code interpreter interrupt failed", "context", contextID, "error", err)
-			}
+			s.interruptOnce.Do(func() { close(s.interrupt) })
 		}
 	}
 }
@@ -192,7 +197,7 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	conn.SetReadLimit(maxMessage)
+	conn.SetReadLimit(h.maxMessage)
 
 	_ = conn.SetReadDeadline(time.Now().Add(h.firstWait))
 	_, data, err := conn.ReadMessage()
@@ -229,7 +234,7 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		info, err = h.m.Default(req.Language)
 	}
 	if err != nil {
-		code, reason := closeFor(err, req.ContextID)
+		code, reason := h.closeFor(err, req.ContextID)
 		h.closeEarly(conn, code, reason)
 		return
 	}
@@ -242,9 +247,10 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		readerDone: make(chan struct{}),
 		gone:       make(chan struct{}),
 		stopPing:   make(chan struct{}),
+		interrupt:  make(chan struct{}),
 	}
 	go s.writer()
-	go s.reader(info.ID)
+	go s.reader()
 	go s.pinger()
 
 	sink := func(ev codeinterp.Event) {
@@ -266,38 +272,67 @@ func (h *handler) execute(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	res, err := h.m.Run(runContext(r), info.ID, codeinterp.Request{Code: req.Code, Env: req.Envs}, sink,
-		codeinterp.RunPolicy{Timeout: timeout, Grace: interruptGrace})
+		codeinterp.RunPolicy{Timeout: timeout, Grace: interruptGrace, Interrupt: s.interrupt})
 	switch {
 	case err != nil:
-		code, reason := closeFor(err, info.ID)
+		code, reason := h.closeFor(err, info.ID)
 		s.finish(code, reason)
 	case res.TimedOut:
 		s.send(control("interrupted"))
 		s.finish(CloseTimeout, "execution timed out")
 	case res.Restarted:
-		s.finish(websocket.CloseGoingAway, "context shutdown")
-	case res.Died:
-		s.finish(websocket.CloseGoingAway, "worker process ended")
+		s.lost(errNameRestarting, closeRestarted)
 	case res.Interrupted():
+		// Before Died: a WASM kernel has no signals, so its interrupt kills
+		// the interpreter (the run is both). The client asked for the stop
+		// and gets the usual answer; the context reports active:false.
 		s.send(control("interrupted"))
 		s.finish(websocket.CloseNormalClosure, "")
+	case res.Died:
+		s.lost(errNameWorkerEnded, closeWorkerEnded)
 	default:
 		s.send(control("completed"))
 		s.finish(websocket.CloseNormalClosure, "")
 	}
 }
 
+// A run whose interpreter went away ends with 1001, as on Daytona. Daytona's
+// Go SDK takes 1000 and 1001 for a normal end, so an error frame goes
+// first: without it a crash or a restart under the run read as success.
+const (
+	errNameWorkerEnded = "WorkerProcessEnded"
+	closeWorkerEnded   = "worker process ended"
+	errNameRestarting  = "ContextRestarting"
+	closeRestarted     = "context shutdown"
+)
+
+func (s *session) lost(name, reason string) {
+	s.send(outputFrame{Type: "error", Name: name, Value: reason})
+	s.finish(websocket.CloseGoingAway, reason)
+}
+
+// internalErrorText replaces the message of an error the adapter does not
+// know. Such an error can carry host paths (a WASM module file in
+// sandboxd's state, a driver script), so the client gets this and the log
+// gets the error.
+const internalErrorText = "code interpreter internal error"
+
 // closeFor maps a Manager error to a close code: the client's fault is
 // 1008, a failed interpreter start 1011.
-func closeFor(err error, id string) (int, string) {
+func (h *handler) closeFor(err error, id string) (int, string) {
+	var missing *codeinterp.MissingInterpreterError
 	switch {
 	case errors.Is(err, codeinterp.ErrNotFound):
 		return websocket.ClosePolicyViolation, "context not found: " + id
 	case errors.Is(err, codeinterp.ErrQueueFull), errors.Is(err, codeinterp.ErrLimit),
-		errors.Is(err, codeinterp.ErrUnsupportedLanguage):
+		errors.Is(err, codeinterp.ErrUnsupportedLanguage), errors.Is(err, codeinterp.ErrInvalidEnv):
 		return websocket.ClosePolicyViolation, err.Error()
 	case errors.Is(err, codeinterp.ErrClosed):
 		return websocket.CloseGoingAway, err.Error()
+	case errors.As(err, &missing):
+		// It names the programs to install, nothing of the host's.
+		return websocket.CloseInternalServerErr, missing.Error()
 	}
-	return websocket.CloseInternalServerErr, err.Error()
+	h.logger.Warn("code interpreter run failed", "context", id, "error", err)
+	return websocket.CloseInternalServerErr, internalErrorText
 }

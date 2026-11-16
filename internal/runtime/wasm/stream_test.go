@@ -22,7 +22,12 @@ import (
 // in-process worker.
 func streamDriver(t *testing.T, cfg Config, req models.CreateSandboxRequest) (*Driver, string) {
 	t.Helper()
-	guest := wasmtestguest.Path(t, wasmtestguest.Stdio)
+	return streamDriverWith(t, cfg, req, wasmtestguest.Path(t, wasmtestguest.Stdio))
+}
+
+// streamDriverWith is streamDriver with the sandbox's own module at guest.
+func streamDriverWith(t *testing.T, cfg Config, req models.CreateSandboxRequest, guest string) (*Driver, string) {
+	t.Helper()
 	t.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", streamCompileCache(t))
 	runDir := filepath.Join(os.TempDir(), fmt.Sprintf("aw-stream-%d", time.Now().UnixNano()))
 	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
@@ -302,6 +307,10 @@ type fakeExecStream struct {
 	stdin     []byte
 	stdinEOF  bool
 	kills     int
+	// stdinErr fails stdin writes; onStdin runs inside a write, which then
+	// fails (a run ending under the write).
+	stdinErr error
+	onStdin  func()
 }
 
 func (s *fakeExecStream) Recv() (worker.ExecEvent, error) {
@@ -318,9 +327,14 @@ func (s *fakeExecStream) Recv() (worker.ExecEvent, error) {
 
 func (s *fakeExecStream) WriteStdin(p []byte) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.stdin = append(s.stdin, p...)
-	return nil
+	hook, err := s.onStdin, s.stdinErr
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+		return io.ErrClosedPipe
+	}
+	return err
 }
 
 func (s *fakeExecStream) CloseStdin() error {
@@ -435,5 +449,84 @@ func TestCheckpointPassivateEndsStreams(t *testing.T) {
 	}
 	if _, err := st.Recv(); err == nil {
 		t.Fatal("closed run still delivers")
+	}
+}
+
+// TestStreamCloseKillsARunThatHasNotExited: dropping a run's connection is
+// not enough on its own (a worker whose reader is backed up behind stdin
+// the guest never reads does not see it), so Close also sends a kill when
+// the run has not exited and was not killed already. Its slot frees after.
+func TestStreamCloseKillsARunThatHasNotExited(t *testing.T) {
+	d := New(Config{}, nil)
+	d.byID["sb"] = &sandboxInstance{sandboxID: "sb", status: models.SandboxStatusStarted, socketPath: "/tmp/x.sock", workDir: t.TempDir()}
+	fake := &fakeStreamingClient{}
+	d.SetWorkerClientFactory(func(string) WorkerClient { return fake })
+	start := func() *Stream {
+		t.Helper()
+		st, err := d.StartStream(context.Background(), "sb", StreamSpec{Args: []string{"aerolstdio", "spin"}, Stdin: true, NoDeadline: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	kills := func(i int) int {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		fs := fake.streams[i]
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+		return fs.kills
+	}
+
+	dropped := start()
+	_ = dropped.Close()
+	_ = dropped.Close()
+	if n := kills(0); n != 1 {
+		t.Fatalf("a run closed before its exit was killed %d times, want 1", n)
+	}
+
+	exited := start()
+	fake.streams[1].events <- worker.ExecEvent{Exit: &worker.ExecExit{ExitCode: 0}}
+	if ev, err := exited.Recv(); err != nil || ev.Exit == nil {
+		t.Fatalf("Recv = %+v, %v", ev, err)
+	}
+	_ = exited.Close()
+	if n := kills(1); n != 0 {
+		t.Fatalf("a run that exited was killed %d times", n)
+	}
+
+	killed := start()
+	if err := killed.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = killed.Close()
+	if n := kills(2); n != 1 {
+		t.Fatalf("a killed run was killed %d times on close, want 1 in all", n)
+	}
+	if n := d.byID["sb"].streams.count(); n != 0 {
+		t.Fatalf("%d slots held after every run closed", n)
+	}
+}
+
+// TestMaxStreamsPerSandbox: every run may use the sandbox's whole memory
+// limit, so the default cap is low (4); a configured cap is used as given
+// up to the worker's own ceiling, past which a start would fail in the
+// worker as a server error rather than as this cap's 429.
+func TestMaxStreamsPerSandbox(t *testing.T) {
+	for _, tc := range []struct {
+		configured, want int
+	}{
+		{0, 4},
+		{1, 1},
+		{12, 12},
+		{worker.MaxStreamsPerSandbox, worker.MaxStreamsPerSandbox},
+		{worker.MaxStreamsPerSandbox + 1, worker.MaxStreamsPerSandbox},
+	} {
+		if got := New(Config{MaxStreamsPerSandbox: tc.configured}, nil).maxStreamsPerSandbox(); got != tc.want {
+			t.Errorf("cap for %d = %d, want %d", tc.configured, got, tc.want)
+		}
+	}
+	if defaultMaxStreamsPerSandbox > worker.MaxStreamsPerSandbox {
+		t.Fatal("the default cap is above the worker's ceiling")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -48,26 +49,128 @@ func (c *Client) publishToolboxLoopback(createRequest, hostConfig map[string]any
 	}
 }
 
+// defaultToolboxPublishWait bounds how long toolboxAddr re-inspects a running
+// container whose requested 127.0.0.1 binding Docker has not reported yet.
+// Docker Desktop can report a just-started container as running while its
+// port list is still empty ({"2280/tcp":[]}) and fill the host port in a
+// moment later; reading the ports once at that instant failed about one
+// create in six. Only that race waits: a container whose first inspect shows
+// the port pays nothing extra, and one that never asked for the binding, or
+// is not running, fails at once.
+const defaultToolboxPublishWait = 2 * time.Second
+
+// toolboxPublishWaitLimit is the wait's cap: Client.toolboxPublishWait
+// (tests shorten it), or defaultToolboxPublishWait when that is zero.
+func (c *Client) toolboxPublishWaitLimit() time.Duration {
+	if c.toolboxPublishWait > 0 {
+		return c.toolboxPublishWait
+	}
+	return defaultToolboxPublishWait
+}
+
+// loopbackToolboxAddr is the container's current 127.0.0.1 toolbox binding,
+// when Docker reports one. "0" is the "any port" placeholder Docker echoes
+// from the request, not a bound port.
+func (c *Client) loopbackToolboxAddr(inspect containerInspect) (string, bool) {
+	for _, b := range inspect.NetworkSettings.Ports[c.toolboxPortKey()] {
+		if b.HostIP == toolboxLoopbackHost && b.HostPort != "" && b.HostPort != "0" {
+			return net.JoinHostPort(toolboxLoopbackHost, b.HostPort), true
+		}
+	}
+	return "", false
+}
+
+// requestsToolboxLoopback reports whether the container was created to
+// publish the toolbox port on 127.0.0.1 (publishToolboxLoopback). Then a
+// missing host port means Docker has not bound it yet, not that the
+// container predates SB_DOCKER_TOOLBOX_LOOPBACK. Docker keeps the request in
+// HostConfig.PortBindings. NetworkSettings.Ports shows it too, before the
+// bind, as an empty list or a 127.0.0.1 entry with no port; an engine that
+// leaves HostConfig out is still recognized by that.
+func (c *Client) requestsToolboxLoopback(inspect containerInspect) bool {
+	key := c.toolboxPortKey()
+	for _, b := range inspect.HostConfig.PortBindings[key] {
+		if b.HostIP == toolboxLoopbackHost {
+			return true
+		}
+	}
+	live, exposed := inspect.NetworkSettings.Ports[key]
+	if exposed && len(live) == 0 {
+		return true
+	}
+	for _, b := range live {
+		if b.HostIP == toolboxLoopbackHost {
+			return true
+		}
+	}
+	return false
+}
+
+func containerNotRunning(inspect containerInspect) bool {
+	return inspect.State != nil && !inspect.State.Running
+}
+
 // toolboxAddr resolves the host:port sandboxd dials to reach toolboxd in the
-// inspected container.
-func (c *Client) toolboxAddr(inspect containerInspect, containerIP string) (string, error) {
+// inspected container. ref is the name or ID the caller inspected; it is
+// inspected again while Docker has yet to publish a requested binding.
+func (c *Client) toolboxAddr(ctx context.Context, ref string, inspect containerInspect, containerIP string) (string, error) {
 	if !c.toolboxLoopback {
 		return c.containerToolboxAddr(containerIP), nil
 	}
-	for _, b := range inspect.NetworkSettings.Ports[c.toolboxPortKey()] {
-		if b.HostIP == toolboxLoopbackHost && b.HostPort != "" {
-			return net.JoinHostPort(toolboxLoopbackHost, b.HostPort), nil
+	if addr, ok := c.loopbackToolboxAddr(inspect); ok {
+		return addr, nil
+	}
+	if !c.requestsToolboxLoopback(inspect) {
+		return "", fmt.Errorf("toolbox port %s is not published on %s for container %s: the container was created without that binding (before SB_DOCKER_TOOLBOX_LOOPBACK was enabled?); recreate the sandbox",
+			c.toolboxPortKey(), toolboxLoopbackHost, inspect.ID)
+	}
+	if containerNotRunning(inspect) {
+		return "", c.toolboxNotRunningErr(inspect.ID)
+	}
+	if ref == "" {
+		ref = inspect.ID
+	}
+	limit := c.toolboxPublishWaitLimit()
+	deadline := time.Now().Add(limit)
+	sleep := c.readinessPollInterval()
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		timer := time.NewTimer(min(sleep(), remaining))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		next, err := c.inspectContainer(ctx, ref)
+		if err != nil {
+			return "", fmt.Errorf("inspect container: %w", err)
+		}
+		if addr, ok := c.loopbackToolboxAddr(next); ok {
+			return addr, nil
+		}
+		if containerNotRunning(next) {
+			return "", c.toolboxNotRunningErr(inspect.ID)
 		}
 	}
-	return "", fmt.Errorf("toolbox port %s is not published on %s for container %s (created before SB_DOCKER_TOOLBOX_LOOPBACK was enabled? recreate the sandbox)",
-		c.toolboxPortKey(), toolboxLoopbackHost, inspect.ID)
+	return "", fmt.Errorf("docker has not published toolbox port %s of running container %s on %s after waiting %s",
+		c.toolboxPortKey(), inspect.ID, toolboxLoopbackHost, limit)
+}
+
+func (c *Client) toolboxNotRunningErr(containerID string) error {
+	return fmt.Errorf("toolbox port %s is not published on %s for container %s: the container is not running",
+		c.toolboxPortKey(), toolboxLoopbackHost, containerID)
 }
 
 // ToolboxAddress returns the host:port at which sandboxd reaches the
 // sandbox's toolboxd. By default that is ContainerIP:ToolboxPort. With
 // SB_DOCKER_TOOLBOX_LOOPBACK it is the container's current 127.0.0.1
 // binding, read with one inspect per call because the port changes on every
-// start.
+// start (more only while Docker has yet to publish a just-started
+// container's port; see defaultToolboxPublishWait).
 func (c *Client) ToolboxAddress(ctx context.Context, sandbox *models.Sandbox) (string, error) {
 	if sandbox == nil {
 		return "", errors.New("sandbox is nil")
@@ -86,7 +189,7 @@ func (c *Client) ToolboxAddress(ctx context.Context, sandbox *models.Sandbox) (s
 	if err != nil {
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
-	return c.toolboxAddr(inspect, "")
+	return c.toolboxAddr(ctx, ref, inspect, "")
 }
 
 // toolboxAddrForIP is toolboxAddr for callers that only hold the container

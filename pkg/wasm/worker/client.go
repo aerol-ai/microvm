@@ -57,19 +57,33 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 		_ = conn.SetDeadline(deadline)
 	}
 	if err := writeFrame(conn, env); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return Envelope{}, ctxErr
 		}
 		return Envelope{}, err
 	}
 	reply, err := readFrame(conn)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return Envelope{}, ctxErr
 		}
 		return Envelope{}, err
 	}
 	return reply, nil
+}
+
+// contextErr is ctx.Err(), but also reports a deadline that has passed
+// before ctx's own timer fired. The connection carries the same deadline, so
+// its read can fail with an i/o timeout a moment before ctx notices; callers
+// must still see context.DeadlineExceeded, not the socket error.
+func contextErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 // dialContext dials the worker, giving up when ctx ends. A nil ctx means

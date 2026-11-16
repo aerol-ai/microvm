@@ -69,6 +69,7 @@ type Client struct {
 	networkRules       *netrules.Manager
 	waitTimeout        time.Duration
 	toolboxWaitTimeout time.Duration
+	toolboxPublishWait time.Duration // toolboxPublishWaitLimit
 	readyEnabled       bool
 	readyDir           string
 	readinessPollInit  time.Duration
@@ -830,7 +831,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 
-	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
+	toolboxAddr, err := c.toolboxAddr(ctx, created.ID, inspect, containerIP)
 	if err != nil {
 		removeWorkload(created.ID)
 		return nil, err
@@ -1638,7 +1639,7 @@ func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*Sand
 	if err != nil {
 		return nil, err
 	}
-	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
+	toolboxAddr, err := c.toolboxAddr(ctx, containerRef, inspect, containerIP)
 	if err != nil {
 		return nil, err
 	}
@@ -1994,6 +1995,9 @@ type containerInspect struct {
 		Binds       []string          `json:"Binds"`
 		NetworkMode string            `json:"NetworkMode"`
 		Sysctls     map[string]string `json:"Sysctls"`
+		// PortBindings is what the create asked Docker to publish; the
+		// live host ports are in NetworkSettings.Ports.
+		PortBindings map[string][]portBinding `json:"PortBindings"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Source      string `json:"Source"`

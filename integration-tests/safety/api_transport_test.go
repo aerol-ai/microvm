@@ -31,6 +31,7 @@ var nonAPIClients = map[string]string{
 	"networking_more_test.go:probeStatus":                                                "a sandbox's public route, not the API domain",
 	"networking_test.go:TestPreviewURLReachable":                                         "a sandbox's public route, not the API domain",
 	"agent_cli_mcp_test.go:fetchEventually":                                              "a sandbox's public route, not the API domain",
+	"wasm_interp_test.go:previewBody":                                                    "a sandbox's public route, not the API domain",
 	"sims/expose.go:waitHTTP200":                                                         "a sandbox's public route, not the API domain",
 	"ingress_routing_test.go:TestIngressRoutingChurnGate":                                "a sandbox's public route, one new connection per request",
 	"ingress_routing_test.go:waitFirst200":                                               "a sandbox's public route, one new connection per attempt (it times expose to first 200)",

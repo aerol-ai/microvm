@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/gorilla/websocket"
 )
@@ -415,14 +416,14 @@ func TestDaytonaCommandStreamDropsFramesForFullSubscriber(t *testing.T) {
 	}
 	stream.finish()
 	initial, _, finished := stream.subscribe()
-	if !finished || len(initial) != len(daytonaStdoutPrefix)+cap(ch)+10 {
+	if !finished || len(initial) != len(toolboxwire.LogStdoutMarker)+cap(ch)+10 {
 		t.Fatalf("replay len=%d finished=%v; dropped live frames must still be in the replay", len(initial), finished)
 	}
 }
 
 // runDaytonaSessionCommandIn runs command in a fresh pipe-mode shell
 // session built from argv.
-func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string) (*daytonaSessionExecuteResponse, *daytonaCommandState) {
+func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string) (*toolboxwire.SessionExecuteResponse, *daytonaCommandState) {
 	t.Helper()
 	srv := newDaytonaTestServer(t)
 	sess, err := srv.sessions.Create(context.Background(), models.CreateSessionRequest{Name: "cov96b-" + id, Argv: argv})
@@ -435,7 +436,7 @@ func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string)
 	state.addCommand(cmd)
 
 	type result struct {
-		resp *daytonaSessionExecuteResponse
+		resp *toolboxwire.SessionExecuteResponse
 		err  error
 	}
 	done := make(chan result, 1)

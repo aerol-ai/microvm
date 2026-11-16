@@ -5,9 +5,9 @@ description: Give a web server running in a WASM sandbox a public URL or your ow
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A [WASM sandbox](/wasm-sandbox/) has no network card of its own. The AerolVM server handles its network traffic for it. For incoming web requests, AerolVM's web proxy sends each request to a small relay on the server. The relay passes it to the listener your module serves on.
+A [WASM sandbox](/wasm-sandbox/) has no network card of its own. The AerolVM server handles its network traffic for it. For incoming web requests, AerolVM's web proxy sends each request to a small relay on the server. The relay passes it to a listener the server opened for your module.
 
-So the port number you pass to `exposePort` is a label for the public URL. It is not a TCP port your module opens inside the sandbox.
+So the port number you pass to `exposePort` is a name for the public URL. Your module does not open that port itself. For each exposed port, the server opens one listener and hands it to the module before the module starts. The module learns which listener belongs to which port from an environment variable (see [What your module must do](#what-your-module-must-do)).
 
 ## Share a web server
 
@@ -100,14 +100,80 @@ You can add the domain before you call `exposePort`. Once the port is exposed, t
 
 ## What your module must do
 
-- **Serve incoming requests** on the TCP listener the server opens for the module before it starts (a pre-opened socket). Find it with the WASI socket functions (WASI is the standard system interface for WebAssembly programs). TinyGo and other real-world modules do this.
+- **Serve incoming requests** on the listeners the server opens for the module before it starts (pre-opened sockets). Your module accepts connections on them with the WASI socket functions (WASI is the standard system interface for WebAssembly programs). Go's `GOOS=wasip1` port, TinyGo and other real-world modules can do this.
+- **Find the listeners by their numbers.** A file descriptor is the number a program uses for an open file or socket. The server tells the module the numbers in two environment variables:
+
+  | Variable | Example | What it holds |
+  |---|---|---|
+  | `AEROL_WASM_LISTEN_FD` | `4` | The listener of the lowest exposed port. |
+  | `AEROL_WASM_LISTEN_FDS` | `8080=4,9090=5` | Each exposed port and its listener, ports from low to high. |
+
+  Do not assume the listener is number 3. When the module also has the `/work` folder open, the listeners come after it, so the first one is usually 4. On the `wasmtime` engine the numbers are much larger, such as `16777216`. Always read the variables.
 - **Make outgoing connections** through the server. Outbound TCP and UDP go through `aerol/vm/net`, a set of network functions the server gives the module. See [WASM architecture](/wasm-architecture/).
-- **Do not assume the listener's number.** A file descriptor is the number a program uses for an open file or socket. When the module also has the `/work` folder open, the listener's number may be above 3. Find it with the WASI socket functions. Some test modules expect it at 3, but they are meant only for testing the engine.
+
+## Serve several ports
+
+Expose each port your module serves, such as an API on `8080` and metrics on `9090`. Each one gets its own public URL and its own listener.
+
+A module that reads `AEROL_WASM_LISTEN_FDS` serves each port on its own listener. This Go program, built with `GOOS=wasip1 GOARCH=wasm`, runs one web server per exposed port. It is code that runs inside the sandbox, not an SDK call:
+
+```go
+package main
+
+import (
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+)
+
+func main() {
+	done := make(chan error)
+	// "8080=4,9090=5": one port=fd pair per exposed port.
+	for _, pair := range strings.Split(os.Getenv("AEROL_WASM_LISTEN_FDS"), ",") {
+		port, fdText, _ := strings.Cut(pair, "=")
+		fd, err := strconv.Atoi(fdText)
+		if err != nil {
+			continue
+		}
+		syscall.SetNonblock(fd, true)
+		ln, err := net.FileListener(os.NewFile(uintptr(fd), "listener-"+port))
+		if err != nil {
+			continue
+		}
+		go func() {
+			done <- http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte("hello from port " + port + "\n"))
+			}))
+		}()
+	}
+	<-done
+}
+```
+
+A module that reads only `AEROL_WASM_LISTEN_FD` keeps working when you expose more than one port. It accepts on the lowest port's listener, and the server sends the requests for every exposed port there. Your module then sees all of them on one server and can tell them apart by path.
+
+When you expose a new port, the server restarts the module once so it can hand over the new listener. The module's memory starts fresh; files in `/work` stay. Exposing a port that is already exposed changes nothing. When you unexpose a port, its URL stops answering at once, and its listener goes away the next time the module restarts.
+
+## Engines
+
+The server runs WASM modules on the `wazero` engine by default (`SB_WASM_ENGINE=wazero`). An operator can choose the optional `wasmtime` engine instead. Both engines serve web requests by themselves, so the module and the steps above are the same on either one.
+
+`wasmtime` itself cannot hand a module a pre-opened listener. On `wasmtime`, the server opens the listeners and runs the socket functions for the module. This works on Linux and macOS servers. A sandbox on `wasmtime` keeps its instruction count in its usage numbers while it serves web requests.
+
+In a few cases the server still moves a sandbox from `wasmtime` to `wazero` when it exposes a port:
+
+- the server runs on an operating system other than Linux or macOS, or
+- the module does not export its memory under the name `memory`. Every module built for WASI does, so this is rare.
+
+Only that one sandbox moves. It loses `wasmtime`'s instruction count in its usage numbers, and the server log says when it moves. To turn the move off, set `SB_WASM_WASMTIME_LISTEN_FALLBACK=false`. In those cases `exposePort` then still returns a URL, but requests to it fail and the server log says the engine cannot serve HTTP. A sandbox that `wasmtime` serves by itself never moves, so the setting does not change it.
 
 ## Limits
 
 - **No TCP or TLS ports.** `exposePort` with `tcp` or `tls` (encrypted TCP) fails with `runtime not implemented` on WASM.
-- **No WASI Preview 2.** Modules built for WASI Preview 2 (the Component Model) cannot take incoming connections on the default `wazero` engine.
+- **No WASI Preview 2.** Modules built for WASI Preview 2 (the Component Model) cannot take incoming connections.
 - **Custom domains and TCP or TLS ports do not mix** on one sandbox. This is the same rule as for container sandboxes.
 
 ## Next steps

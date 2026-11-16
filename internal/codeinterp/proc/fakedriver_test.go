@@ -90,6 +90,11 @@ func runFakeDriver() int {
 	var env []string
 	count := 0
 	for {
+		if os.Getenv("AEROL_FAKE_MODE") == "slowread" {
+			// Busy between runs: a request waits in the pipe a while
+			// before the driver reads it.
+			time.Sleep(300 * time.Millisecond)
+		}
 		kind, payload, err := fr.Read()
 		if err != nil {
 			return 0
@@ -103,6 +108,11 @@ func runFakeDriver() int {
 		case "EXEC":
 		default:
 			continue
+		}
+		// Like a real driver, a SIGINT that came while idle means nothing:
+		// the run takes interrupts from its COUNT on (doc.go).
+		for len(sigs) > 0 {
+			<-sigs
 		}
 		count++
 		_ = codeinterp.WriteFrame(ev, "COUNT", []byte(strconv.Itoa(count)))
@@ -151,13 +161,14 @@ func runFakeDriver() int {
 				sort.Strings(env)
 				fmt.Fprint(os.Stdout, strings.Join(env, ","))
 			case "sleep":
-				for len(sigs) > 0 {
-					<-sigs
+				d, err := time.ParseDuration(arg)
+				if err != nil {
+					d = 20 * time.Second
 				}
 				select {
 				case <-sigs:
 					status = "interrupted"
-				case <-time.After(20 * time.Second):
+				case <-time.After(d):
 				}
 			case "ignore":
 				signal.Ignore(os.Interrupt)

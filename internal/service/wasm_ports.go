@@ -45,6 +45,13 @@ func (s *Service) releaseWasmHTTPListener(sandboxID string, guestPort int) {
 	pg.ReleaseHTTPListener(sandboxID, guestPort)
 }
 
+// syncWasmAllowedPorts pushes the sandbox's exposed ports to the WASM
+// gateway's allowed set and the guest's listeners. Like the container path
+// (syncAllowedPorts) it reads the ports from the store under allowlistLocks:
+// two exposes at once each pushed the ports of the row they had read
+// earlier, and the later push of an older row dropped the other's port from
+// both. The listener sync stays under the lock too, so a sandbox's guest is
+// re-instantiated by one sync at a time.
 func (s *Service) syncWasmAllowedPorts(ctx context.Context, sandbox *models.Sandbox) {
 	if sandbox == nil {
 		return
@@ -53,8 +60,19 @@ func (s *Service) syncWasmAllowedPorts(ctx context.Context, sandbox *models.Sand
 	if err != nil {
 		return
 	}
-	ports := make([]int, 0, len(sandbox.ExposedPorts))
-	for _, p := range sandbox.ExposedPorts {
+	unlock := s.allowlistLocks.lock(sandbox.ID)
+	exposed := sandbox.ExposedPorts
+	if s.store != nil {
+		if exposed, err = s.store.ListPorts(ctx, sandbox.ID); err != nil {
+			unlock()
+			// Push nothing rather than the old copy; the next push fixes it.
+			s.logger.Warn("wasm allowed ports not synced: could not read the exposed ports", "sandbox_id", sandbox.ID, "error", err)
+			return
+		}
+	}
+	s.afterRouteGateRead(gateReadAllowlist)
+	ports := make([]int, 0, len(exposed))
+	for _, p := range exposed {
 		ports = append(ports, p.Port)
 	}
 	pg.SyncAllowedPorts(sandbox.ID, ports)
@@ -63,6 +81,7 @@ func (s *Service) syncWasmAllowedPorts(ctx context.Context, sandbox *models.Sand
 			s.logger.Warn("failed to sync wasm guest listen ports", "sandbox_id", sandbox.ID, "error", err)
 		}
 	}
+	unlock()
 	if err := s.syncWasmCustomDomainRoutes(ctx, sandbox); err != nil {
 		s.logger.Warn("failed to sync wasm custom-domain routes", "sandbox_id", sandbox.ID, "error", err)
 	}

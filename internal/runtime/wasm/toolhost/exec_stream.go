@@ -31,6 +31,22 @@ import (
 
 var execStreamUpgrader = toolboxwire.NewExecStreamUpgrader()
 
+const (
+	// DefaultStreamReadLimit caps one client message on the exec stream.
+	// The stream runs in sandboxd, and gorilla's own default is no limit:
+	// one message, however large, is read whole into the daemon's heap.
+	// stdin goes to the worker in chunks of at most this size anyway, and
+	// control frames are a few bytes.
+	DefaultStreamReadLimit int64 = 1 << 20
+	// defaultStreamWriteWait bounds each frame written to the client. A
+	// client that stops reading would otherwise hold the handler (and the
+	// run's slot) in a write for as long as its connection stays up.
+	defaultStreamWriteWait = 10 * time.Second
+	// streamStopGrace is how long a stopping sandbox's stream has to tell
+	// the client why before its connection is closed under it.
+	streamStopGrace = time.Second
+)
+
 // streamSignals are the signal names toolboxd delivers; on WASM each ends
 // the run. Unknown names are ignored, as toolboxd ignores them.
 var streamSignals = map[string]bool{
@@ -55,23 +71,25 @@ func (h *Host) handleExecStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	// Before the first read, so the start message is bounded too.
+	conn.SetReadLimit(h.streamReadLimitBytes())
 
 	if err := conn.SetReadDeadline(time.Now().Add(toolboxwire.StartTimeout)); err != nil {
 		return
 	}
 	var start toolboxwire.ExecStreamStart
 	if err := conn.ReadJSON(&start); err != nil {
-		writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: "invalid start message"})
+		h.writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: "invalid start message"})
 		return
 	}
 	spec, msg := wasmStreamSpec(start)
 	if msg != "" {
-		writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: msg})
+		h.writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: msg})
 		return
 	}
 	st, err := h.procs.StartStream(r.Context(), spec)
 	if err != nil {
-		writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: err.Error()})
+		h.writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: err.Error()})
 		if errors.Is(err, ErrTooManyProcesses) {
 			_ = conn.WriteControl(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "too many processes"), time.Now().Add(time.Second))
@@ -140,6 +158,20 @@ func (h *Host) streamLiveness() toolboxwire.Liveness {
 	return toolboxwire.DefaultLiveness
 }
 
+func (h *Host) streamReadLimitBytes() int64 {
+	if h.streamReadLimit > 0 {
+		return h.streamReadLimit
+	}
+	return DefaultStreamReadLimit
+}
+
+func (h *Host) streamWriteWaitTime() time.Duration {
+	if h.streamWriteWait > 0 {
+		return h.streamWriteWait
+	}
+	return defaultStreamWriteWait
+}
+
 // pumpExecStream moves stdin and control frames to the run and its output
 // to the client until the run exits, the client drops, or ctx ends (the
 // sandbox is stopping).
@@ -147,17 +179,25 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 	var exited atomic.Bool
 	// A dropped client and a stopping sandbox both end the run: nobody can
 	// see its output any more. Kill first: Close alone cannot reach a run
-	// whose stdin is backed up.
+	// whose stdin is backed up. Then close the client's connection, which
+	// frees a write stuck on a client that stopped reading: with the run
+	// gone, nothing else would. A stopping sandbox first gives the client
+	// a moment to read why (the error frame below).
 	var endOnce sync.Once
-	end := func() {
+	end := func(grace time.Duration) {
 		endOnce.Do(func() {
 			if !exited.Load() {
 				_ = st.Kill()
 			}
 			_ = st.Close()
+			if grace <= 0 {
+				_ = conn.Close()
+				return
+			}
+			time.AfterFunc(grace, func() { _ = conn.Close() })
 		})
 	}
-	stopWatch := context.AfterFunc(ctx, end)
+	stopWatch := context.AfterFunc(ctx, func() { end(streamStopGrace) })
 	defer stopWatch()
 	extend, stopLiveness := toolboxwire.ArmLiveness(conn, h.streamLiveness())
 	defer stopLiveness()
@@ -175,7 +215,9 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
-				end()
+				// Gone, silent past the pong wait, or a message over the
+				// read limit (gorilla has sent close 1009 for that).
+				end(0)
 				return
 			}
 			extend()
@@ -200,8 +242,11 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 	}()
 
 	// Only this goroutine writes frames; the pinger's WriteControl is safe
-	// alongside it.
+	// alongside it. Each frame has its own deadline.
 	write := func(prefix byte, data []byte) error {
+		if err := conn.SetWriteDeadline(time.Now().Add(h.streamWriteWaitTime())); err != nil {
+			return err
+		}
 		return conn.WriteMessage(websocket.BinaryMessage, append([]byte{prefix}, data...))
 	}
 	for {
@@ -211,7 +256,7 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 			if ctx.Err() != nil {
 				msg = "the sandbox stopped"
 			}
-			writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: msg})
+			h.writeStreamControl(conn, toolboxwire.ExecStreamControlOut{Type: "error", Message: msg})
 			return
 		}
 		if ev.Exit != nil {
@@ -225,24 +270,27 @@ func (h *Host) pumpExecStream(ctx context.Context, conn *websocket.Conn, st Proc
 				// own; say what happened before the exit.
 				_ = write(toolboxwire.FramePrefixStderr, []byte(ev.Exit.Error+"\n"))
 			}
-			writeStreamControl(conn, out)
+			h.writeStreamControl(conn, out)
 			return
 		}
 		if len(ev.Stdout) > 0 {
 			if write(toolboxwire.FramePrefixStdout, ev.Stdout) != nil {
-				end()
+				end(0)
 				return
 			}
 		}
 		if len(ev.Stderr) > 0 {
 			if write(toolboxwire.FramePrefixStderr, ev.Stderr) != nil {
-				end()
+				end(0)
 				return
 			}
 		}
 	}
 }
 
-func writeStreamControl(conn *websocket.Conn, msg toolboxwire.ExecStreamControlOut) {
+func (h *Host) writeStreamControl(conn *websocket.Conn, msg toolboxwire.ExecStreamControlOut) {
+	if conn.SetWriteDeadline(time.Now().Add(h.streamWriteWaitTime())) != nil {
+		return
+	}
 	_ = conn.WriteJSON(msg)
 }

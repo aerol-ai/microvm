@@ -41,9 +41,10 @@ func TestDriverHTTPGatewayInvokesWorkerProxy(t *testing.T) {
 	d.newWorkerClient = func(string) WorkerClient { return proxyClient }
 	d.mu.Lock()
 	d.byID["sb-proxy"] = &sandboxInstance{
-		sandboxID:  "sb-proxy",
-		socketPath: "/tmp/fake.sock",
-		status:     models.SandboxStatusStarted,
+		sandboxID:          "sb-proxy",
+		socketPath:         "/tmp/fake.sock",
+		status:             models.SandboxStatusStarted,
+		resolvedListenPort: 18080,
 	}
 	d.mu.Unlock()
 
@@ -66,8 +67,44 @@ func TestDriverHTTPGatewayInvokesWorkerProxy(t *testing.T) {
 	if string(body) != "via-worker" {
 		t.Fatalf("body=%q", body)
 	}
-	if proxyClient.proxyCalls != 1 || proxyClient.lastPort != 8080 {
+	// Port 0 asks the worker for its own listener: the exposed port is never
+	// sent, since an older worker would dial it on the host.
+	if proxyClient.proxyCalls != 1 || proxyClient.lastPort != 0 {
 		t.Fatalf("proxy calls=%d port=%d", proxyClient.proxyCalls, proxyClient.lastPort)
+	}
+}
+
+// A sandbox whose guest listener was never started (or failed to start)
+// answers 503 and its worker is not asked: the driver never hands a worker
+// the exposed port to dial instead.
+func TestDriverHTTPGatewayWithoutGuestListener(t *testing.T) {
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	proxyClient := &recordingProxyWorkerClient{}
+	d.newWorkerClient = func(string) WorkerClient { return proxyClient }
+	d.mu.Lock()
+	d.byID["sb-nolisten"] = &sandboxInstance{
+		sandboxID:  "sb-nolisten",
+		socketPath: "/tmp/fake.sock",
+		status:     models.SandboxStatusStarted,
+	}
+	d.mu.Unlock()
+
+	dial, err := d.EnsureHTTPListener(context.Background(), "sb-nolisten", 8080)
+	if err != nil {
+		t.Fatalf("EnsureHTTPListener: %v", err)
+	}
+	d.SyncAllowedPorts("sb-nolisten", []int{8080})
+	resp, err := http.Get("http://" + dial + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || !bytes.Contains(body, []byte("not listening")) {
+		t.Fatalf("status=%d body=%q, want 503 not listening", resp.StatusCode, body)
+	}
+	if proxyClient.proxyCalls != 0 {
+		t.Fatalf("worker proxied %d requests (last port %d), want none", proxyClient.proxyCalls, proxyClient.lastPort)
 	}
 }
 
@@ -118,8 +155,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-baseline")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {
 		for id := range sup.workers {
@@ -166,8 +202,7 @@ func TestWorkerClientWasip1HTTPBaseline(t *testing.T) {
 func TestSetListenPortAfterColdInstantiate(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-setlisten")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {
 		for id := range sup.workers {
@@ -216,8 +251,7 @@ func TestDriverWasip1HTTPExposeEndToEnd(t *testing.T) {
 	absMod := ensureWasip1HTTPWasm(t)
 
 	dir := t.TempDir()
-	runDir := filepath.Join(os.TempDir(), "aw-http-e2e")
-	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	runDir := shortRunDir(t)
 
 	sup := newInProcessSupervisor()
 	t.Cleanup(func() {

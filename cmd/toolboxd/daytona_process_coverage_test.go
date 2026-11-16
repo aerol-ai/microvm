@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
+	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/gorilla/websocket"
 )
 
@@ -45,7 +46,7 @@ func TestStreamDaytonaLogsWriteFail(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"command": "printf 'hello-from-logs'", "runAsync": async})
 	execRec := httptest.NewRecorder()
 	srv.handleDaytonaSessionExec(execRec, httptest.NewRequest(http.MethodPost, "/process/session/logs-fail/exec", bytes.NewReader(body)), "logs-fail")
-	var resp daytonaSessionExecuteResponse
+	var resp toolboxwire.SessionExecuteResponse
 	_ = json.Unmarshal(execRec.Body.Bytes(), &resp)
 	if resp.CmdID == "" {
 		t.Fatal("expected cmd id")
@@ -221,7 +222,7 @@ func TestStreamDaytonaSessionCommandLogsBranches(t *testing.T) {
 	if execRec.Code != http.StatusOK {
 		t.Fatalf("async exec = %d body=%s", execRec.Code, execRec.Body.String())
 	}
-	var resp daytonaSessionExecuteResponse
+	var resp toolboxwire.SessionExecuteResponse
 	_ = json.Unmarshal(execRec.Body.Bytes(), &resp)
 	if resp.CmdID == "" {
 		t.Fatal("expected cmd id")

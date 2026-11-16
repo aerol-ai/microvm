@@ -37,6 +37,10 @@ type Server struct {
 	modulePath     string
 	moduleMemoryMB int
 	streams        streamRegistry
+	entry          entrypointLog // the serving guest's output (entrypoint.go)
+	// loaded is the module eng runs and the engine it runs on, under mu
+	// (listen_engine.go).
+	loaded loadedEngine
 }
 
 // errForeignSandbox refuses a message for another sandbox than the one
@@ -314,6 +318,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			err = s.eng.LoadModule(ctx, p.Path, wasmengine.LoadOptions{MemoryMB: p.MemoryMB})
+			s.noteLoadedLocked(p, err)
 			// Read the engine's sub-stage breakdown before releasing the lock; the
 			// worker owns the NewEngineFor cost, so we splice it in here.
 			var timings wasmengine.LoadTimings
@@ -323,6 +328,7 @@ func (s *Server) Serve(conn net.Conn) error {
 			timings.NewEngine = newEngDur
 			if err == nil {
 				s.modulePath, s.moduleMemoryMB = p.Path, p.MemoryMB
+				s.entry.attach(s.eng)
 			}
 			s.mu.Unlock()
 			if err != nil {
@@ -458,7 +464,9 @@ func (s *Server) Serve(conn net.Conn) error {
 			eng := s.eng
 			s.mu.Unlock()
 			start := time.Now()
+			gen := s.entry.begin(env.SandboxID)
 			err = eng.InvokeExport(invokeCtx, p.Export)
+			s.entry.end(gen, err)
 			_ = time.Since(start) // wall time accounted on Exec path via RunResult
 			cancel()
 			if err != nil {
@@ -667,15 +675,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			if p.Port != wasmengine.WASIListenPortDisabled && !s.eng.SupportsListen() {
-				s.mu.Unlock()
-				if replyErr(env.SandboxID, fmt.Errorf("HTTP ingress (expose_port) is not supported on the %q WASM engine; use SB_WASM_ENGINE=wazero", workerEngineName())) != nil {
-					return err
+			if p.Port != wasmengine.WASIListenPortDisabled {
+				if listenErr := s.ensureListenEngineLocked(ctx, env.SandboxID); listenErr != nil {
+					s.mu.Unlock()
+					if replyErr(env.SandboxID, listenErr) != nil {
+						return err
+					}
+					continue
 				}
-				continue
 			}
 			s.bindNetworkHook(env.SandboxID)
 			next := s.lastCaps
+			next.WASIListeners = nil
 			next.WASIListenPort = p.Port
 			if strings.TrimSpace(p.Host) != "" {
 				next.WASIListenHost = p.Host
@@ -728,6 +739,10 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := writeFrame(conn, Envelope{Type: MsgProxyHTTPResult, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
+		case MsgSetListenPorts, MsgListenPorts:
+			if err := s.serveListenPorts(ctx, conn, env); err != nil {
+				return err
+			}
 		case MsgNetstatsTick:
 			sandboxID := strings.TrimSpace(env.SandboxID)
 			u := s.netUsageFor(sandboxID)
@@ -749,6 +764,9 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := s.streams.serveExecKill(conn, env); err != nil {
 				return err
 			}
+		case MsgEntrypointLogs:
+			// The connection may become a follow; it closes when that ends.
+			return s.entry.serve(conn, env)
 		default:
 			if err := writeFrame(conn, Envelope{
 				Type:      MsgInvokeResult,

@@ -120,6 +120,65 @@ func TestServeToolboxTerminalsUnsupported(t *testing.T) {
 	}
 }
 
+// The interpreter's 501 holds for a path that still carries the sandbox id
+// (toolboxd strips "/<id>" and so serves the interpreter there) or the /v1
+// toolbox route, as the other refusals do. Such a path used to fall
+// through to the "/exec" match and run the tenant's fetch handler, whose
+// output the interpreter client took for its run's.
+func TestServeToolboxInterpreterUnderAPrefix(t *testing.T) {
+	sup := &fakeSupervisor{}
+	d := newCreateDriver(t, GroupPerTenant, sup)
+	ctx := context.Background()
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{ModuleRef: "a.js", TenantID: "acme"}, "sb-1", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	invoked := 0
+	sup.hosts[0].invokeFn = func(context.Context, string, *http.Request) (*http.Response, error) {
+		invoked++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("tenant output")), Header: make(http.Header)}, nil
+	}
+	for _, path := range []string{
+		"/sb-1/interpreter/e2b/execute",
+		"/sb-1/interpreter/e2b/contexts",
+		"/sb-1/interpreter",
+		"/sb-1/process/interpreter/execute",
+		"/sb-1/process/interpreter/context",
+		"/v1/sandboxes/sb-1/toolbox/interpreter/e2b/execute",
+		"/sb-1/process/code-run",
+		"/sb-1/process/exec/stream",
+	} {
+		rec := httptest.NewRecorder()
+		d.ServeToolbox(ctx, "sb-1", "tok", rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"code":"x"}`)))
+		if rec.Code != http.StatusNotImplemented {
+			t.Errorf("POST %s = %d %q, want 501", path, rec.Code, rec.Body.String())
+		}
+	}
+	if invoked != 0 {
+		t.Fatalf("the fetch handler ran %d times for interpreter routes", invoked)
+	}
+	// The one exec the isolate serves still works under the prefix.
+	body, _ := json.Marshal(models.ExecRequest{Command: "/"})
+	rec := httptest.NewRecorder()
+	d.ServeToolbox(ctx, "sb-1", "tok", rec, httptest.NewRequest(http.MethodPost, "/sb-1/process/execute", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK || invoked != 1 {
+		t.Fatalf("/sb-1/process/execute = %d, handler ran %d times", rec.Code, invoked)
+	}
+}
+
+func TestTrimSandboxPrefix(t *testing.T) {
+	for _, tc := range []struct{ path, id, want string }{
+		{"/sb-1/process/execute", "sb-1", "/process/execute"},
+		{"/sb-1", "sb-1", "/"},
+		{"/sb-10/process/execute", "sb-1", "/sb-10/process/execute"},
+		{"/process/execute", "sb-1", "/process/execute"},
+		{"/sb-1/x", "", "/sb-1/x"},
+	} {
+		if got := trimSandboxPrefix(tc.path, tc.id); got != tc.want {
+			t.Errorf("trimSandboxPrefix(%q, %q) = %q, want %q", tc.path, tc.id, got, tc.want)
+		}
+	}
+}
+
 // Every file call, the SDK verbs of plan F1 included, is a 501 with a JSON
 // reason the SDKs can show, as on WASM sandboxes.
 func TestServeToolboxFileRoutesAnswerJSON501(t *testing.T) {

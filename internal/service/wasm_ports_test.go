@@ -3,8 +3,14 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,6 +62,186 @@ func TestWasmExposePortHTTPUsesHostMediator(t *testing.T) {
 	}
 	if ep.URL != url {
 		t.Fatalf("upstream = %q want %q", ep.URL, url)
+	}
+}
+
+// A WASM sandbox's ContainerIP is the host's loopback: a port probe there
+// would dial whatever listens on that port on the host. expose_port must
+// skip it.
+func TestWasmExposePortDoesNotProbeTheHostPort(t *testing.T) {
+	ctx := context.Background()
+	driver := wasmruntime.New(wasmruntime.Config{ModulesDir: t.TempDir()}, nil)
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(driver)
+	var probed []string
+	svc.probeContainerPortFn = func(_ context.Context, ip string, port int) error {
+		probed = append(probed, fmt.Sprintf("%s:%d", ip, port))
+		return nil
+	}
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-wasm-noprobe", Status: models.SandboxStatusStarted, Runtime: models.RuntimeWasm,
+		ContainerIP: "127.0.0.1", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.ExposePort(ctx, "sb-wasm-noprobe", 2019, "http"); err != nil {
+		t.Fatalf("ExposePort: %v", err)
+	}
+	if len(probed) != 0 {
+		t.Fatalf("expose_port probed %v on a WASM sandbox, want no probe", probed)
+	}
+}
+
+// portsRecordingWasmRuntime records the port sets the service pushes to a
+// WASM sandbox's gateway and guest listeners.
+type portsRecordingWasmRuntime struct {
+	wasmModuleAPINoopRuntime
+	noopWasmPortGateway
+	mu      sync.Mutex
+	allowed map[string][]int
+	listen  map[string][]int
+	syncing atomic.Int32
+	overlap atomic.Bool
+}
+
+func newPortsRecordingWasmRuntime() *portsRecordingWasmRuntime {
+	return &portsRecordingWasmRuntime{allowed: map[string][]int{}, listen: map[string][]int{}}
+}
+
+func (r *portsRecordingWasmRuntime) SyncAllowedPorts(id string, ports []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.allowed[id] = append([]int(nil), ports...)
+}
+
+func (r *portsRecordingWasmRuntime) SyncGuestListenPorts(_ context.Context, id string, ports []int) error {
+	if r.syncing.Add(1) > 1 {
+		r.overlap.Store(true)
+	}
+	defer r.syncing.Add(-1)
+	// A listener sync re-instantiates the guest: give a racing one time
+	// to overlap.
+	time.Sleep(5 * time.Millisecond)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.listen[id] = append([]int(nil), ports...)
+	return nil
+}
+
+func (r *portsRecordingWasmRuntime) last(id string) (allowed, listen []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	allowed = append([]int(nil), r.allowed[id]...)
+	listen = append([]int(nil), r.listen[id]...)
+	sort.Ints(allowed)
+	sort.Ints(listen)
+	return allowed, listen
+}
+
+// A sync from a row read before another expose stored its port must not
+// shrink the set: the ports come from the store, read under the lock.
+func TestSyncWasmAllowedPortsReadsTheStore(t *testing.T) {
+	ctx := context.Background()
+	rt := newPortsRecordingWasmRuntime()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(rt)
+	svc.probeContainerPortFn = func(context.Context, string, int) error { return nil }
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-wasm-stale", Status: models.SandboxStatusStarted, Runtime: models.RuntimeWasm,
+		ContainerIP: "127.0.0.1", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for _, port := range []int{8080, 9090} {
+		if _, err := svc.ExposePort(ctx, "sb-wasm-stale", port, "http"); err != nil {
+			t.Fatalf("ExposePort %d: %v", port, err)
+		}
+	}
+	stale := &models.Sandbox{ID: "sb-wasm-stale", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted,
+		ContainerIP: "127.0.0.1", ExposedPorts: []models.ExposedPort{{Port: 8080}}}
+	svc.syncWasmAllowedPorts(ctx, stale)
+	if allowed, listen := rt.last("sb-wasm-stale"); fmt.Sprint(allowed) != "[8080 9090]" || fmt.Sprint(listen) != "[8080 9090]" {
+		t.Fatalf("after a stale sync: allowed %v, listen %v", allowed, listen)
+	}
+	// WASM exposes route through the gateway and never take a host port
+	// from the TCP pool.
+	rows, err := st.ListPorts(ctx, "sb-wasm-stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.HostPort != 0 {
+			t.Fatalf("port %d took host port %d", row.Port, row.HostPort)
+		}
+	}
+}
+
+// Two exposes at once end with both ports allowed and listened on, and the
+// guest's listeners are synced by one of them at a time.
+func TestWasmConcurrentExposesRouteBothPorts(t *testing.T) {
+	ctx := context.Background()
+	for round := 0; round < 10; round++ {
+		rt := newPortsRecordingWasmRuntime()
+		svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+		svc.cfg.EnableWasm = true
+		svc.SetWasmRuntime(rt)
+		svc.probeContainerPortFn = func(context.Context, string, int) error { return nil }
+		id := fmt.Sprintf("sb-wasm-race-%d", round)
+		now := time.Now().UTC()
+		if err := st.Create(ctx, &models.Sandbox{
+			ID: id, Status: models.SandboxStatusStarted, Runtime: models.RuntimeWasm,
+			ContainerIP: "127.0.0.1", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		var wg sync.WaitGroup
+		urls := make([]string, 2)
+		errs := make([]error, 2)
+		for i, port := range []int{8080, 9090} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp, err := svc.ExposePort(ctx, id, port, "http")
+				urls[i], errs[i] = resp.PublicURL, err
+			}()
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d expose %d: %v", round, i, err)
+			}
+		}
+		if allowed, listen := rt.last(id); fmt.Sprint(allowed) != "[8080 9090]" || fmt.Sprint(listen) != "[8080 9090]" {
+			t.Fatalf("round %d: allowed %v, listen %v", round, allowed, listen)
+		}
+		if rt.overlap.Load() {
+			t.Fatalf("round %d: two listener syncs ran at once", round)
+		}
+		// Re-expose is idempotent: the same URL.
+		again, err := svc.ExposePort(ctx, id, 9090, "http")
+		if err != nil || again.PublicURL != urls[1] {
+			t.Fatalf("round %d: re-expose = %q, %v; first %q", round, again.PublicURL, err, urls[1])
+		}
+	}
+}
+
+// A store read that fails pushes nothing rather than a stale set.
+func TestSyncWasmAllowedPortsStoreError(t *testing.T) {
+	rt := newPortsRecordingWasmRuntime()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc.SetWasmRuntime(rt)
+	_ = st.Close()
+	svc.syncWasmAllowedPorts(context.Background(), &models.Sandbox{ID: "sb-closed", Runtime: models.RuntimeWasm,
+		ExposedPorts: []models.ExposedPort{{Port: 8080}}})
+	if allowed, listen := rt.last("sb-closed"); len(allowed) != 0 || len(listen) != 0 {
+		t.Fatalf("pushed allowed %v, listen %v after a failed read", allowed, listen)
 	}
 }
 

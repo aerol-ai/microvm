@@ -35,6 +35,12 @@
 //	SYNC   <decimal seq>            see markers below
 //	DONE   ok | error | interrupted
 //
+// Interrupts are SIGINT to the driver's process group. An idle driver drops
+// SIGINT, so a stray one never ends a context. From the moment it sends a
+// run's COUNT until its DONE, a driver turns SIGINT into an interrupt of
+// that run; the host sends an interrupt that came before COUNT (the driver
+// may not have read EXEC yet) again when COUNT arrives.
+//
 // There are two transport modes, picked by the AEROL_INTERP_MODE variable:
 //
 //   - "fd" (toolboxd): requests on file descriptor 3, events on 4. The
@@ -49,4 +55,7 @@
 //   - "stdio" (WASM, which has no child processes and no extra
 //     descriptors): requests on stdin, events on stdout, and the driver
 //     wraps the user's output into OUT and ERR frames itself. No markers.
+//     WASI has no working directory to inherit, so the launcher passes the
+//     context's cwd in AEROL_INTERP_CWD and the driver enters it before
+//     READY (FATAL when it cannot).
 package codeinterp
