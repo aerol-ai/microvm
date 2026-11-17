@@ -297,6 +297,11 @@ func TestRemoteSessionRecordedByOwner(t *testing.T) {
 				if !ok {
 					t.Fatalf("%s is not attested as this gateway acting for sb-remote's key: %v", c.route, c.header)
 				}
+				// It names the key the client logged in with, which the owner
+				// checks against the sandbox's key.
+				if call.KeyFingerprint != ssh.FingerprintSHA256(signer.PublicKey()) {
+					t.Fatalf("%s names key %q, not the login's", c.route, call.KeyFingerprint)
+				}
 				if call.Open {
 					opened = append(opened, c.route)
 					if call.Session != tc.wantSession {

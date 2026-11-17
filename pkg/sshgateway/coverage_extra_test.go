@@ -27,7 +27,7 @@ func TestFetchRemoteSandboxBranches(t *testing.T) {
 		}))
 		defer srv.Close()
 		g.remoteBaseURL = srv.URL
-		sb, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd")
+		sb, _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd", "")
 		if err != nil || sb != nil {
 			t.Fatalf("non-2xx = %v, %v", sb, err)
 		}
@@ -40,7 +40,7 @@ func TestFetchRemoteSandboxBranches(t *testing.T) {
 		}))
 		defer srv.Close()
 		g.remoteBaseURL = srv.URL
-		if _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd"); err == nil {
+		if _, _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd", ""); err == nil {
 			t.Fatal("expected decode error")
 		}
 	})
@@ -59,7 +59,7 @@ func TestFetchRemoteSandboxBranches(t *testing.T) {
 		}))
 		defer srv.Close()
 		g.remoteBaseURL = srv.URL
-		sb, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd-9")
+		sb, _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd-9", "")
 		if err != nil || sb == nil || sb.ID != "sb-1" {
 			t.Fatalf("success = %v, %v", sb, err)
 		}
@@ -306,7 +306,7 @@ func TestHandleRemoteSessionEnvAndWindowChange(t *testing.T) {
 
 func TestFetchRemoteSandboxRequestError(t *testing.T) {
 	g := &Gateway{remoteBaseURL: "://bad-url"}
-	if _, err := g.fetchRemoteSandbox(context.Background(), "sb", "fwd"); err == nil {
+	if _, _, err := g.fetchRemoteSandbox(context.Background(), "sb", "fwd", ""); err == nil {
 		t.Fatal("expected request construction error")
 	}
 }

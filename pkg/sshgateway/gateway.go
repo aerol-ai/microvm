@@ -228,6 +228,9 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 		mode = serverConn.Permissions.Extensions["mode"]
 		sessionName = serverConn.Permissions.Extensions["session_name"]
 		remoteOwned = serverConn.Permissions.Extensions["remote"] == "1"
+		if remoteOwned {
+			ctx = withBridgeKey(ctx, serverConn.Permissions.Extensions["key_fp"])
+		}
 	}
 	g.logger.Info("ssh connection accepted", "remote", remote, "sandbox_id", sandboxID, "mode", mode, "session_name", sessionName, "remote_owned", remoteOwned)
 

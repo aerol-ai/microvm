@@ -97,7 +97,7 @@ func TestHandleRemoteSessionWindowChangeAndDrain(t *testing.T) {
 
 func TestFetchRemoteSandboxNetworkError(t *testing.T) {
 	g := &Gateway{remoteBaseURL: "http://127.0.0.1:1"}
-	if _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd"); err == nil {
+	if _, _, err := g.fetchRemoteSandbox(context.Background(), "sb-1", "fwd", ""); err == nil {
 		t.Fatal("expected network error")
 	}
 }

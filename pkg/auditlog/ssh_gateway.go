@@ -35,6 +35,11 @@ type SSHGatewayCall struct {
 	// Session is the toolbox session the SSH session attached to ("" for a
 	// one-shot exec), as the ssh record's target. Only with Open.
 	Session string
+	// KeyFingerprint is the SHA256 fingerprint of the key the SSH client
+	// proved it holds (ssh.FingerprintSHA256). The owner checks it against
+	// the sandbox's key before it serves a call a node bridged as itself:
+	// a node that never saw the key cannot name it.
+	KeyFingerprint string
 }
 
 // Wire form keys. A url query keeps the value one header line whatever the
@@ -42,6 +47,7 @@ type SSHGatewayCall struct {
 const (
 	sshGatewaySandboxKey = "sandbox"
 	sshGatewayOpenKey    = "open"
+	sshGatewayKeyKey     = "key"
 )
 
 // Encode is c's header value: "sandbox=<id>", plus "&open=<session>" on the
@@ -50,6 +56,9 @@ func (c SSHGatewayCall) Encode() string {
 	v := url.Values{sshGatewaySandboxKey: {strings.TrimSpace(c.SandboxID)}}
 	if c.Open {
 		v.Set(sshGatewayOpenKey, c.Session)
+	}
+	if fp := strings.TrimSpace(c.KeyFingerprint); fp != "" {
+		v.Set(sshGatewayKeyKey, fp)
 	}
 	return v.Encode()
 }
@@ -62,7 +71,7 @@ func ParseSSHGatewayCall(raw string) (SSHGatewayCall, bool) {
 		return SSHGatewayCall{}, false
 	}
 	v, err := url.ParseQuery(raw)
-	if err != nil || len(v[sshGatewaySandboxKey]) != 1 || len(v[sshGatewayOpenKey]) > 1 {
+	if err != nil || len(v[sshGatewaySandboxKey]) != 1 || len(v[sshGatewayOpenKey]) > 1 || len(v[sshGatewayKeyKey]) > 1 {
 		return SSHGatewayCall{}, false
 	}
 	c := SSHGatewayCall{SandboxID: strings.TrimSpace(v.Get(sshGatewaySandboxKey))}
@@ -72,8 +81,18 @@ func ParseSSHGatewayCall(raw string) (SSHGatewayCall, bool) {
 	if v.Has(sshGatewayOpenKey) {
 		c.Open, c.Session = true, v.Get(sshGatewayOpenKey)
 	}
+	c.KeyFingerprint = strings.TrimSpace(v.Get(sshGatewayKeyKey))
 	return c, true
 }
+
+// The SSH gateway's key check against a sandbox another node owns: the
+// gateway names the key the client offered (its SHA256 fingerprint) on the
+// sandbox read, and an owner that knows these headers answers whether it is
+// the sandbox's key instead of sending the key to a node.
+const (
+	SSHOfferedKeyHeader = "X-Aerol-Ssh-Offered-Key"
+	SSHKeyMatchHeader   = "X-Aerol-Ssh-Key-Match"
+)
 
 type sshGatewayKey struct{}
 
