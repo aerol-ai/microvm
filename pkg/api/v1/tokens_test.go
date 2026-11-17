@@ -104,9 +104,24 @@ type tokenFeedCluster struct {
 	*cluster.Noop
 	writeErr error
 	changed  bool
+	writes   int
+}
+
+// AuditCallerWritesAllowed: every server runs a build that records callers.
+func (c *tokenFeedCluster) AuditCallerWritesAllowed() bool { return true }
+
+// tokenAuditSink keeps the records the handler had the service write.
+type tokenAuditSink struct{ events []service.SecretAuditEvent }
+
+func (k *tokenAuditSink) Emit(ev service.SecretAuditEvent) { k.events = append(k.events, ev) }
+
+// IsTokenWritePeer plays the admitted roles: wkr-1 is a worker.
+func (c *tokenFeedCluster) IsTokenWritePeer(peerID string) bool {
+	return peerID != "" && peerID != "wkr-1"
 }
 
 func (c *tokenFeedCluster) WriteAPIToken(_ context.Context, req cluster.APITokenWriteRequest) (cluster.APITokenWriteResponse, error) {
+	c.writes++
 	if c.writeErr != nil {
 		return cluster.APITokenWriteResponse{}, c.writeErr
 	}
@@ -126,6 +141,8 @@ func TestV1TokensClusterInternal(t *testing.T) {
 	svc := service.New(config.Config{EnableCluster: true}, logger, nil, nil, nil, nil, nil, nil, nil)
 	stub := &tokenFeedCluster{Noop: cluster.NewNoop("srv", "http://srv", "")}
 	svc.AttachCluster(stub)
+	sink := &tokenAuditSink{}
+	svc.UseAuditSinkForTest(sink)
 	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
 	serve := func(fn http.HandlerFunc, method, target, body string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
@@ -137,11 +154,34 @@ func TestV1TokensClusterInternal(t *testing.T) {
 		return rec
 	}
 
-	write := func(body string) *httptest.ResponseRecorder {
-		return serve(h.clusterInternalAPITokenWrite, http.MethodPost, cluster.PublicInternalAPITokenWritePath, body)
+	writeFrom := func(peer, body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, cluster.PublicInternalAPITokenWritePath, strings.NewReader(body))
+		h.clusterInternalAPITokenWrite(rec, req.WithContext(context.WithValue(req.Context(), clusterPeerNodeIDContextKey{}, peer)))
+		return rec
+	}
+	write := func(body string) *httptest.ResponseRecorder { return writeFrom("gw-1", body) }
+
+	// Token writes come only from servers and gateways: a worker's, or one
+	// with no peer at all, is refused before it reaches the cluster.
+	forged := `{"token":{"id":"tok_aaaaaaaaaaaa","name":"prometheus-2","role":"admin","created_by":"operator","expires_at":"2200-01-01T00:00:00Z"}}`
+	for _, peer := range []string{"wkr-1", ""} {
+		if rr := writeFrom(peer, forged); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"code":"writer_refused"`) || stub.writes != 0 {
+			t.Fatalf("a token write from %q: %d %s, %d writes reached the cluster", peer, rr.Code, rr.Body.String(), stub.writes)
+		}
+	}
+	// Each refusal is on the record, naming the node and the created_by
+	// the forged record claims.
+	if len(sink.events) != 2 || sink.events[0].Caller == nil || sink.events[0].Caller.ID != "node:wkr-1" ||
+		sink.events[0].Kind != service.KindAPITokenPeerWrite || sink.events[0].Result != "denied" ||
+		sink.events[0].Reason != "created_by=operator" {
+		t.Fatalf("refused writes recorded: %+v", sink.events)
 	}
 	if rr := write(`{"token":{"id":"tok_aaaaaaaaaaaa"}}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "tok_aaaaaaaaaaaa") {
 		t.Fatalf("write: %d %s", rr.Code, rr.Body.String())
+	}
+	if last := sink.events[len(sink.events)-1]; last.Caller.ID != "node:gw-1" || last.Result != "ok" || last.Request.Target != "tok_aaaaaaaaaaaa" {
+		t.Fatalf("a gateway's write recorded: %+v %+v", last, last.Request)
 	}
 	stub.writeErr = cluster.ErrAPITokenNameTaken
 	if rr := write(`{}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"code":"name_taken"`) {
@@ -193,6 +233,60 @@ func TestV1TokensClusterInternal(t *testing.T) {
 	for _, fn := range []http.HandlerFunc{plain.clusterInternalAPITokenWrite, plain.clusterInternalAPITokenChanges, plain.clusterInternalAPITokenPage} {
 		if rr := serve(fn, http.MethodGet, "/", "{}"); rr.Code != http.StatusServiceUnavailable {
 			t.Fatalf("not served here: %d", rr.Code)
+		}
+	}
+}
+
+// forwardingCluster is a worker's cluster: ForwardToServer plays the
+// server's answer.
+type forwardingCluster struct {
+	*cluster.Noop
+	forwarded []string
+}
+
+func (c *forwardingCluster) ForwardToServer(w http.ResponseWriter, r *http.Request) {
+	c.forwarded = append(c.forwarded, r.Method+" "+r.Header.Get("Authorization"))
+	w.WriteHeader(http.StatusCreated)
+}
+
+// A worker sends a caller's token create or revoke on to a server with the
+// caller's own credential (PR 2 review: a cluster whose API address
+// reaches only worker,ingress nodes must still create and revoke tokens).
+// A call with no credential of its own is refused, never sent as the node.
+// A gateway and a server write tokens themselves.
+func TestV1TokenWritesForwardFromAWorker(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		role     string
+		forwards bool
+	}{{"worker", true}, {"worker,ingress", true}, {"ingress", false}, {"server", false}} {
+		svc := service.New(config.Config{EnableCluster: true, NodeRole: tc.role}, logger, nil, nil, nil, nil, nil, nil, nil)
+		stub := &forwardingCluster{Noop: cluster.NewNoop("n-1", "http://n-1", "")}
+		svc.AttachCluster(stub)
+		h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+		send := func(fn http.HandlerFunc, method, path, bearer string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(method, path, strings.NewReader(`{"name":"ci","role":"runner","team":"payments","expires_in":"30d"}`))
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			rr := httptest.NewRecorder()
+			fn(rr, req)
+			return rr
+		}
+		create := send(h.createToken, http.MethodPost, "/v1/tokens", "avm_caller")
+		send(h.revokeToken, http.MethodDelete, "/v1/tokens/tok_aaaaaaaaaaaa", "avm_caller")
+		if !tc.forwards {
+			if len(stub.forwarded) != 0 {
+				t.Errorf("%s: forwarded %v; it writes tokens itself", tc.role, stub.forwarded)
+			}
+			continue
+		}
+		if create.Code != http.StatusCreated || len(stub.forwarded) != 2 ||
+			stub.forwarded[0] != "POST Bearer avm_caller" || stub.forwarded[1] != "DELETE Bearer avm_caller" {
+			t.Fatalf("%s: %d, forwarded %v", tc.role, create.Code, stub.forwarded)
+		}
+		if rr := send(h.createToken, http.MethodPost, "/v1/tokens", ""); rr.Code != http.StatusBadRequest || len(stub.forwarded) != 2 {
+			t.Fatalf("%s: a call with no credential of its own: %d, forwarded %v", tc.role, rr.Code, stub.forwarded)
 		}
 	}
 }

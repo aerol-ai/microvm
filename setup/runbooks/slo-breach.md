@@ -4,6 +4,15 @@ Use this for any sandboxd SLO alert that does not have a more specific active
 incident runbook. Start here, then branch to backup/restore, lost quorum, or
 image-pull storm if the signals point there.
 
+**On Kubernetes** the chart's PrometheusRule ships the `AerolVM*` alerts
+(`setup/runbooks/kubernetes.md`), not the `Sandboxd*` alerts this runbook
+covers. Load `setup/prometheus/sandboxd-alerts.yml` as a PrometheusRule of
+your own, labelled for your Prometheus.
+`setup/alertmanager/sandboxd-alertmanager-example.yml` works as
+kube-prometheus-stack's `alertmanager.config` with your receiver URLs: the
+issue #1343 drill on kind delivered each alert below to its receiver, the
+critical one to the critical receiver, and each resolved notice after.
+
 ## SLO Surfaces
 
 | Area | Primary signals |
@@ -20,7 +29,8 @@ image-pull storm if the signals point there.
 
 1. Freeze deploys and topology changes.
 2. Identify alert group and affected cluster.
-3. Open Grafana dashboard `sandboxd SLOs`.
+3. Open Grafana dashboard `sandboxd SLOs` (`setup/grafana/sandboxd-slo-dashboard.json`;
+   the chart ships only its Kubernetes dashboards, so import this one).
 4. Capture evidence:
 
    ```bash
@@ -31,6 +41,17 @@ image-pull storm if the signals point there.
      http://127.0.0.1:21212/v1/cluster/members | jq .
    curl -fsS -H "Authorization: Bearer $SB_PAT_TOKEN" \
      http://127.0.0.1:21212/v1/metrics > /tmp/sandboxd.metrics
+   ```
+
+   On Kubernetes the token is in the operator's Secret
+   `<cluster>-admin` (key `token`), and the servers' Service `<cluster>-api`
+   carries the API port (with the edge on, the gateway Service has only
+   443, 80 and 2220). `/v1/metrics` is one pod's numbers; read the
+   cluster's in Prometheus instead.
+
+   ```bash
+   export SB_PAT_TOKEN="$(kubectl -n aerolvm-system get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+   kubectl -n aerolvm-system port-forward svc/aerolvm-api 21212:21212 &
    ```
 
 5. Decide the branch:
@@ -46,10 +67,10 @@ image-pull storm if the signals point there.
 | `SandboxdRaftApplyErrors` | Inspect leader logs and recent deploys. | any create/expose writes fail. |
 | `SandboxdRaftApplyStuck` | Stop new deploys; inspect leader CPU/disk/network. | in-flight apply remains > 5 minutes. |
 | `SandboxdWorkerLeaseStale` | Check worker health and mTLS/gossip connectivity. | stale age keeps rising or all workers stale. |
-| `SandboxdNoAdmitWorkers` | Check capacity, disk, and drains. | all creates fail or no workers can uncordon. |
+| `SandboxdNoAdmitWorkers` | Check capacity, disk, and drains. `aerolvm top nodes` or `/v1/cluster/members` shows each worker's free CPU now; on Kubernetes the AerolNode FREE CPU column lagged behind it in the drill. Servers and gateways count 0 (they never take a sandbox); before the issue #1343 fix they counted 1 and this alert could not fire. | all creates fail or no workers can uncordon. |
 | `SandboxdSandboxDiskHigh` | Find what fills the node's sandbox volume ([Sandbox disk](#sandbox-disk)). | free space nears `SB_DISK_FLOOR_RATIO`, or several nodes fire at once. |
-| `SandboxdCreateQueueBacklog` | Determine if backlog is image, capacity, or Raft bound. | queue grows for > 10 minutes. |
-| `SandboxdIngressRouteLag` | Check Caddy admin errors and ingress CPU. | route lag increases while creates continue. |
+| `SandboxdCreateQueueBacklog` | Determine if backlog is image, capacity, or Raft bound. A registry that sends too slowly holds creates until `SB_CREATE_TIMEOUT_SEC` (600 s) ends them together, so the backlog, and this alert, can clear for a few minutes and come back every 10. | queue grows for > 10 minutes. |
+| `SandboxdIngressRouteLag` | Check Caddy admin errors and ingress CPU. The lag counts Raft log entries between the newest placement the node has seen and the newest it installed, not placements: one create after a busy hour can make it thousands. | route lag increases while creates continue. |
 | `SandboxdCaddyAdminErrors` | Check Caddy service and admin endpoint. | public URLs fail or route lag grows. |
 | `SandboxdOwnerForwardErrors` | Check owner node health and advertise URLs. | many sandboxes fail cross-node operations. |
 | `SandboxdSecretDecryptErrors` | Check credential encryption key consistency. | failover/recreate workloads cannot start. |
@@ -153,6 +174,21 @@ sudo systemctl status caddy --no-pager || true
 sudo journalctl -u caddy --since "30 minutes ago" --no-pager || true
 ```
 
+On Kubernetes, Caddy is the `edge` container of each gateway pod, and the
+gateway's `agent` container logs every failed reconcile:
+
+```bash
+kubectl -n aerolvm-system logs <gateway-pod> -c agent --since=30m | grep 'cluster ingress reconcile failed'
+kubectl -n aerolvm-system logs <gateway-pod> -c edge --since=30m
+```
+
+A line such as `bootstrap caddy layer4: get /config/apps/layer4: ...
+connection refused` means sandboxd cannot reach Caddy's admin API on
+`127.0.0.1:2019`. To restart Caddy there, delete the gateway pod; the
+operator starts another, and clients carry on through the other gateways.
+After a restart sandboxd puts back Caddy's `:443` listener (the layer4
+app) within seconds; the Caddyfile alone does not have it.
+
 Mitigation:
 
 - Restart Caddy only if admin calls fail and the route table is not actively
@@ -237,6 +273,12 @@ Within 24 hours:
 4. Add a staging drill if the response required improvisation.
 
 ## SLO Drill
+
+A drill must hold each condition until the receiver has the notice:
+Alertmanager sends nothing for an alert that fires and resolves within the
+route's `group_wait` (30 s in the example), and the issue #1343 drill lost
+one notice that way. `integration-tests/k8s/drills-local.sh slo-breach`
+runs this drill on a kind cluster.
 
 | Field | Value |
 |---|---|

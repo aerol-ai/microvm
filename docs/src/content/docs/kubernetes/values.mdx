@@ -14,6 +14,10 @@ Set these with `--set` or a values file (`-f values.yaml`). The chart's own [`va
 | `image.tag` | The image version. In cluster mode, the operator's image; set `cluster.version` to the same value. Use a digest-pinned tag in production. | The chart's `appVersion` |
 | `image.pullPolicy` | The pull policy for every AerolVM container. | `IfNotPresent` |
 | `apiToken.existingSecret` | Single mode: your own token Secret (key `SB_PAT_TOKEN`), instead of the one the chart makes. | none |
+| `identity.enabled` | Turn on AerolVM's own [API tokens](/cli/#manage-api-tokens) on every node: the worker in single mode; servers, gateways and workers in cluster mode. A [read-only scrape token](/kubernetes/operations/#use-a-read-only-scrape-token) needs it. A pod reads it when it is made, so set it at install. | `false` |
+| `identity.tokenMaxTTL` | The longest an API token may last, on every node, such as `2160h` (90 days). The leader's value binds every token write. | sandboxd's: 365 days, 90 in enterprise mode |
+| `identity.file` | The [identity file](/enterprise/sso/) for SSO, on every node: `content` (the chart makes the ConfigMap), or `existingConfigMap` you made (in cluster mode, in both namespaces), and its `key`. Needs `identity.enabled`. With `networkPolicy.enabled`, add an identity provider on a private address to `networkPolicy.extraEgressCIDRs`, or the workers cannot reach it. | none |
+| `enterprise.enabled` | [Enterprise mode](/enterprise/enterprise-mode/) on every node. Needs `identity.enabled`. It does not start on Kubernetes yet: every node also needs the admin token limited to the host and cluster peers (`SB_PAT_SCOPE=host`), an audit witness and an off-node audit export, which the chart does not set. | `false` |
 
 ## Worker pods
 
@@ -76,7 +80,7 @@ These shape every worker pod: the single-mode pod, and every cluster-mode worker
 | `monitoring.interval` | How often Prometheus scrapes each pod. | `30s` |
 | `monitoring.scrapeTimeout` | The scrape timeout. | `10s` |
 | `monitoring.prometheusNamespace` | Cluster mode: the namespace Prometheus runs in. Only it may read the workers' metrics. | `monitoring` |
-| `monitoring.scrapeToken` | `existingSecret` and `key`: a Secret with a [read-only token](/kubernetes/operations/#use-a-read-only-scrape-token) for Prometheus. | The API token |
+| `monitoring.scrapeToken` | `existingSecret` and `key`: a Secret with a [read-only token](/kubernetes/operations/#use-a-read-only-scrape-token) for Prometheus. Cluster mode requires it. | Single mode: the API token |
 | `monitoring.prometheusRule` | `enabled`: add the alerts. `disabledAlerts`: alerts to leave out, by name. | `true`, none |
 | `monitoring.grafanaDashboards` | Add the two Grafana dashboards as ConfigMaps. | `true` |
 | `monitoring.dashboardsNamespace` | Where the dashboard ConfigMaps go. Your Grafana sidecar must watch it. | The release namespace |

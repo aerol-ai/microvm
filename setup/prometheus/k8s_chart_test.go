@@ -887,3 +887,331 @@ func TestKubernetesChartRendersTheAgentSandboxAPI(t *testing.T) {
 		t.Error("a server got a service account")
 	}
 }
+
+// podTemplates is the pod-templates ConfigMap's data: each role's template
+// as the operator reads it.
+func podTemplates(t *testing.T, docs []map[string]any) map[string]string {
+	t.Helper()
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		d, ok := cm["data"].(map[string]any)
+		if !ok || d["server"] == nil || d["gateway"] == nil || d["worker"] == nil {
+			continue
+		}
+		out := map[string]string{}
+		for role, body := range d {
+			out[role], _ = body.(string)
+		}
+		return out
+	}
+	t.Fatal("no pod-template ConfigMap")
+	return nil
+}
+
+// API tokens and the scrape token in cluster mode (issue #1343):
+// identity.enabled reaches servers, gateways and workers alike (the admin
+// token stays the servers'), worker.extraEnv may not turn tokens on for
+// workers alone, and monitoring has no default scrape token: the API
+// token Secret is single mode's, and the admin token is no default to
+// hand Prometheus. A Secret named explicitly, the admin one included,
+// renders. Single mode keeps its default.
+func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	const identityOn = `SB_IDENTITY_ENABLED, value: "true"`
+
+	// Identity: off by default on every role; on, on every role.
+	for _, tc := range []struct {
+		sets []string
+		want bool
+	}{{nil, false}, {[]string{"identity.enabled=true"}, true}} {
+		docs, err := renderChart(t, root, helm, with(tc.sets...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		templates := podTemplates(t, docs)
+		for _, role := range []string{"server", "gateway", "worker"} {
+			if got := strings.Contains(templates[role], identityOn); got != tc.want {
+				t.Errorf("identity %v: the %s template turns API tokens on = %v", tc.sets, role, got)
+			}
+			if got := strings.Contains(templates[role], "SB_PAT_TOKEN"); got != (role == "server") {
+				t.Errorf("identity %v: the %s template holds the admin token = %v; only servers may", tc.sets, role, got)
+			}
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED=true")...); err == nil ||
+		!strings.Contains(err.Error(), "Remove it, and set identity.enabled.") {
+		t.Errorf("cluster mode took worker.extraEnv.SB_IDENTITY_ENABLED, which reaches workers only: %v", err)
+	}
+	// A false value turns nothing on: cluster mode lets it be (PR 2 review).
+	for _, off := range []string{"false", "0"} {
+		if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED="+off)...); err != nil {
+			t.Errorf("cluster mode refused worker.extraEnv.SB_IDENTITY_ENABLED=%s, which turns nothing on: %v", off, err)
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("identity.enabled=true", "worker.extraEnv.SB_IDENTITY_ENABLED=false")...); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("identity.enabled beside a false worker.extraEnv one (workers would end up off) rendered: %v", err)
+	}
+
+	// Single mode: the value reaches the worker; worker.extraEnv alone still
+	// works as before; both at once is refused.
+	docs, err := renderChart(t, root, helm, "identity.enabled=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts := docsOfKind(docs, "StatefulSet")
+	if len(sts) != 1 || !envHas(dig(sts[0], "spec", "template", "spec", "containers"), "SB_IDENTITY_ENABLED", "true") {
+		t.Error("single mode: identity.enabled did not reach the worker")
+	}
+	docs, err = renderChart(t, root, helm, "worker.extraEnv.SB_IDENTITY_ENABLED=true")
+	if err != nil || !envHas(dig(docsOfKind(docs, "StatefulSet")[0], "spec", "template", "spec", "containers"), "SB_IDENTITY_ENABLED", "true") {
+		t.Errorf("single mode: worker.extraEnv.SB_IDENTITY_ENABLED no longer works: %v", err)
+	}
+	if _, err := renderChart(t, root, helm, "identity.enabled=true", "worker.extraEnv.SB_IDENTITY_ENABLED=true"); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("single mode: API tokens set twice rendered: %v", err)
+	}
+
+	// The scrape token: cluster mode refuses none, with the command that
+	// makes a read-only one.
+	_, err = renderChart(t, root, helm, with("monitoring.enabled=true")...)
+	for _, want := range []string{"monitoring.scrapeToken.existingSecret", "identity.enabled=true",
+		"aerolvm token create --name prometheus --role viewer --team '*'", "aerolvm-admin",
+		// An existing install meets this on helm upgrade: its running pods
+		// must be replaced before the token works on them (PR 2 review).
+		"replace its pods", "gateway pods one at a time"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("cluster mode with no scrape token: %v; want a refusal naming %q", err, want)
+		}
+	}
+	for _, secret := range []string{"prom", "aerolvm-admin"} {
+		docs, err := renderChart(t, root, helm, with("monitoring.enabled=true", "monitoring.scrapeToken.existingSecret="+secret)...)
+		if err != nil {
+			t.Fatalf("scrape token %s: %v", secret, err)
+		}
+		monitors := docsOfKind(docs, "ServiceMonitor")
+		if len(monitors) != 4 {
+			t.Fatalf("cluster mode rendered %d ServiceMonitors, want 4", len(monitors))
+		}
+		for _, sm := range monitors {
+			name, _ := dig(sm, "metadata", "name").(string)
+			cred := dig(sm, "spec", "endpoints", 0, "authorization", "credentials")
+			if strings.HasSuffix(name, "-operator") {
+				if cred != nil {
+					t.Errorf("the operator's ServiceMonitor sends a token: %v", cred)
+				}
+				continue
+			}
+			if dig(cred, "name") != secret || dig(cred, "key") != "token" {
+				t.Errorf("%s reads %v, want the Secret %s", name, cred, secret)
+			}
+		}
+	}
+
+	// The bank preset relies on a viewer token, so turns tokens on everywhere.
+	bank, err := runTool(t, root, helm, "template", "t", filepath.Join(root, "charts", "aerolvm"),
+		"-f", filepath.Join(root, "charts", "aerolvm", "values-bank-eks.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(bank, identityOn); n != 3 {
+		t.Errorf("the bank preset turns API tokens on in %d pod templates, want 3", n)
+	}
+}
+
+// envHas reports whether any container in containers sets name to value.
+func envHas(containers any, name, value string) bool {
+	list, _ := containers.([]any)
+	for _, c := range list {
+		env, _ := dig(c, "env").([]any)
+		for _, e := range env {
+			if dig(e, "name") == name && dig(e, "value") == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// renderNotes renders the chart's NOTES.txt as Helm prints it after an
+// install, or after an upgrade with isUpgrade: helm template skips NOTES, so
+// a copy of the chart carries it as a template.
+func renderNotes(t *testing.T, root, helm string, isUpgrade bool, sets ...string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "aerolvm")
+	if err := os.CopyFS(dir, os.DirFS(filepath.Join(root, "charts", "aerolvm"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(dir, "templates", "NOTES.txt"), filepath.Join(dir, "notes.txt")); err != nil {
+		t.Fatal(err)
+	}
+	tpl := "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: notes}\ndata:\n  notes: |\n{{- tpl (.Files.Get \"notes.txt\") . | nindent 4 }}\n"
+	if err := os.WriteFile(filepath.Join(dir, "templates", "zz-notes.yaml"), []byte(tpl), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"template", "t", dir, "--namespace", "aerolvm-system", "--show-only", "templates/zz-notes.yaml"}
+	if isUpgrade {
+		args = append(args, "--is-upgrade")
+	}
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	out, err := runTool(t, root, helm, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// After an upgrade with identity on, the notes say the running pods must be
+// replaced (a pod reads identity.enabled when it is made), in both modes;
+// after an install, or with identity off, they say nothing of it (PR 2
+// review). Single mode's says replacing its pod ends every sandbox.
+func TestKubernetesChartNotesOnTurningIdentityOn(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	for _, tc := range []struct {
+		name    string
+		upgrade bool
+		sets    []string
+		want    []string
+	}{
+		{"cluster upgrade, identity on", true, append(cluster, "identity.enabled=true"),
+			[]string{"replace the running pods", "gateway pods one at a time", "kubectl cordon"}},
+		{"cluster install, identity on", false, append(cluster, "identity.enabled=true"), nil},
+		{"cluster upgrade, identity off", true, cluster, nil},
+		{"single upgrade, identity on", true, []string{"identity.enabled=true"}, []string{"delete pod t-0", "ends every sandbox"}},
+		{"single upgrade, identity off", true, nil, nil},
+	} {
+		notes := renderNotes(t, root, helm, tc.upgrade, tc.sets...)
+		said := strings.Contains(notes, "API tokens (identity.enabled) reach")
+		if said != (tc.want != nil) {
+			t.Errorf("%s: the notes speak of replacing pods = %v, want %v", tc.name, said, tc.want != nil)
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(notes, w) {
+				t.Errorf("%s: the notes lack %q", tc.name, w)
+			}
+		}
+	}
+}
+
+// identity.tokenMaxTTL, identity.file and enterprise.enabled reach every
+// node, as identity.enabled does (issue #1343): a cap or an identity file on
+// the workers alone binds nodes that take no token write. The identity file
+// is a ConfigMap in every namespace a node runs in, mounted on each.
+// worker.extraEnv may not set any of them in cluster mode. The bank preset
+// caps tokens at 90 days everywhere and leaves enterprise mode off.
+func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	docs, err := renderChart(t, root, helm, with("identity.enabled=true", "identity.tokenMaxTTL=2160h",
+		"identity.file.content=version: 1", "enterprise.enabled=true")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates := podTemplates(t, docs)
+	for _, role := range []string{"server", "gateway", "worker"} {
+		for _, want := range []string{`SB_TOKEN_MAX_TTL, value: "2160h"`, `SB_IDENTITY_FILE, value: "/etc/aerolvm/identity/identity.yaml"`,
+			`SB_ENTERPRISE_MODE, value: "true"`, "name: identity-file, mountPath: /etc/aerolvm/identity", "name: t-identity"} {
+			if !strings.Contains(templates[role], want) {
+				t.Errorf("the %s template lacks %q", role, want)
+			}
+		}
+	}
+	namespaces := map[any]bool{}
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		if dig(cm, "metadata", "name") == "t-identity" && dig(cm, "data", "identity.yaml") != nil {
+			namespaces[dig(cm, "metadata", "namespace")] = true
+		}
+	}
+	if !namespaces["aerolvm"] || !namespaces["aerolvm-workers"] || len(namespaces) != 2 {
+		t.Errorf("the identity file's ConfigMap is in %v, want the release and worker namespaces", namespaces)
+	}
+	// Off by default: nothing set, nothing mounted.
+	docs, err = renderChart(t, root, helm, with("identity.enabled=true")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, body := range podTemplates(t, docs) {
+		for _, never := range []string{"SB_TOKEN_MAX_TTL", "SB_IDENTITY_FILE", "SB_ENTERPRISE_MODE", "identity-file"} {
+			if strings.Contains(body, never) {
+				t.Errorf("by default the %s template carries %s", role, never)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		sets []string
+		want string
+	}{
+		{[]string{"worker.extraEnv.SB_TOKEN_MAX_TTL=2160h"}, "worker.extraEnv.SB_TOKEN_MAX_TTL (2160h) reaches workers only"},
+		{[]string{"worker.extraEnv.SB_IDENTITY_FILE=/x"}, "set identity.file"},
+		{[]string{"worker.extraEnv.SB_ENTERPRISE_MODE=true"}, "set enterprise.enabled"},
+		{[]string{"identity.enabled=true", "identity.tokenMaxTTL=90d"}, "is not a duration sandboxd reads"},
+		{[]string{"identity.file.content=x"}, "identity.file needs identity.enabled=true"},
+		{[]string{"enterprise.enabled=true"}, "enterprise.enabled needs identity.enabled=true"},
+	} {
+		if _, err := renderChart(t, root, helm, with(tc.sets...)...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v rendered or failed otherwise: %v; want %q", tc.sets, err, tc.want)
+		}
+	}
+	// Enterprise mode refuses a cap over 90 days at boot, so the render
+	// does too, whatever the units (PR 3 review, round 3).
+	for ttl, refused := range map[string]bool{"2161h": true, "2159h59m61s": true, "7776001s": true, "2160h": false, "1h30m": false} {
+		_, err := renderChart(t, root, helm, with("identity.enabled=true", "enterprise.enabled=true", "identity.tokenMaxTTL="+ttl)...)
+		if got := err != nil && strings.Contains(err.Error(), "longer than enterprise mode allows"); got != refused {
+			t.Errorf("enterprise mode with tokenMaxTTL %s: refused %v (%v), want %v", ttl, got, err, refused)
+		}
+	}
+	// The scrape token the refusal and the notes tell you to make lasts
+	// no longer than the cap, or 90 days without one.
+	for ttl, want := range map[string]string{"720h": "--expires-in 720h", "": "--expires-in 90d"} {
+		sets := with("monitoring.enabled=true", "identity.enabled=true")
+		if ttl != "" {
+			sets = append(sets, "identity.tokenMaxTTL="+ttl)
+		}
+		if _, err := renderChart(t, root, helm, sets...); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("the scrape-token refusal with tokenMaxTTL %q: %v; want %q", ttl, err, want)
+		}
+		notes := renderNotes(t, root, helm, false, append(sets, "monitoring.scrapeToken.existingSecret=aerolvm-metrics-token")...)
+		if !strings.Contains(notes, want) {
+			t.Errorf("the notes with tokenMaxTTL %q lack %q", ttl, want)
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_ENTERPRISE_MODE=false")...); err != nil {
+		t.Errorf("a false worker.extraEnv.SB_ENTERPRISE_MODE, which turns nothing on, was refused: %v", err)
+	}
+	// Single mode: the worker carries them, and worker.extraEnv still may,
+	// but not both.
+	if _, err := renderChart(t, root, helm, "identity.enabled=true", "identity.tokenMaxTTL=2160h", "worker.extraEnv.SB_TOKEN_MAX_TTL=1h"); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("single mode took SB_TOKEN_MAX_TTL twice: %v", err)
+	}
+
+	bank, err := runTool(t, root, helm, "template", "t", filepath.Join(root, "charts", "aerolvm"),
+		"-f", filepath.Join(root, "charts", "aerolvm", "values-bank-eks.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(bank, `SB_TOKEN_MAX_TTL, value: "2160h"`); n != 3 {
+		t.Errorf("the bank preset caps tokens at 90 days in %d pod templates, want 3", n)
+	}
+}

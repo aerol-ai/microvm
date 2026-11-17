@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"expvar"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // API action records (plans/identity-and-access.md §5.9). The API edge
@@ -124,6 +126,90 @@ func (s *Service) RecordAPICall(ctx context.Context, call APICall) {
 	ev := s.apiEvent(ctx, call)
 	ev.Caller = AuditCallerFromContext(ctx)
 	s.emitAPIEvent(ev, call.Durable && s.cfg.AuditAPIDurable)
+}
+
+// KindAPITokenPeerWrite is the record of one API token write a cluster
+// node sent over /v1/cluster/internal/tokens/write. A new Kind and no new
+// field, like key_custody_changed, so every build, older ones included,
+// re-marshals it byte for byte: the caller is the sending node
+// (node:<id>, from its certificate), Request names the route, the token
+// (Target) and for a create its role and team (Grant), Reason holds the
+// record's created_by, and Dropped the refused writes folded into this one.
+const KindAPITokenPeerWrite = "api_token.peer_write"
+
+// peerDenialWindow is how often a refused internal token write from one
+// node is recorded: at most once a minute, like auth_denied's per address.
+const peerDenialWindow = time.Minute
+
+// auditPeerTokenWriteDeniedSuppressed counts refused internal token writes
+// folded into a later record instead of one of their own.
+var auditPeerTokenWriteDeniedSuppressed = expvar.NewInt("aerolvm_audit_peer_token_write_denied_suppressed_total")
+
+// peerDenialLimiter lets one refused-write record per node through per
+// window and counts the rest, which the node's next record carries. The
+// senders are cluster nodes with valid certificates, so the map stays small.
+type peerDenialLimiter struct {
+	mu     sync.Mutex
+	last   map[string]time.Time
+	folded map[string]int64
+}
+
+// admit reports whether a refused write from peer gets a record at now,
+// and how many refusals that record stands for.
+func (l *peerDenialLimiter) admit(peer string, now time.Time) (int64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.last == nil {
+		l.last, l.folded = map[string]time.Time{}, map[string]int64{}
+	}
+	if at, ok := l.last[peer]; ok && now.Sub(at) < peerDenialWindow {
+		l.folded[peer]++
+		return 0, false
+	}
+	count := l.folded[peer] + 1
+	l.last[peer] = now
+	delete(l.folded, peer)
+	return count, true
+}
+
+// RecordInternalTokenWrite records one API token write a peer sent over
+// /v1/cluster/internal/tokens/write, allowed or refused, as a
+// KindAPITokenPeerWrite record. The public create is recorded on the node
+// that took it; this is the server tier's own account, so a write that
+// never came through a public create still leaves one. A refused write is
+// recorded at most once a minute per sending node.
+func (s *Service) RecordInternalTokenWrite(ctx context.Context, peerID string, req cluster.APITokenWriteRequest, status int, denied bool) {
+	if s == nil || s.apiRecordsMode() == config.AuditAPIRecordsOff || !s.auditCallerWritesAllowed() {
+		return
+	}
+	peerID = strings.TrimSpace(peerID)
+	count := int64(1)
+	if denied {
+		n, ok := s.peerTokenWriteDenials.admit(peerID, time.Now())
+		if !ok {
+			auditPeerTokenWriteDeniedSuppressed.Add(1)
+			return
+		}
+		count = n
+	}
+	call := APICall{Method: http.MethodPost, Route: cluster.PublicInternalAPITokenWritePath, Status: status,
+		Target: req.ID, Denied: denied}
+	if !req.Delete {
+		call.Target = req.Token.ID
+		call.Grant = &auditlog.Grant{Role: string(req.Token.Role), Team: req.Token.Team()}
+	}
+	ev := s.apiEvent(ctx, call)
+	ev.Kind = KindAPITokenPeerWrite
+	if req.Delete {
+		ev.Reason = "revoke"
+	} else {
+		ev.Reason = "created_by=" + strings.TrimSpace(req.Token.CreatedBy)
+	}
+	ev.Caller = &auditlog.Caller{Kind: string(controlplane.PrincipalNode), ID: "node:" + peerID}
+	if count > 1 {
+		ev.Dropped = count - 1
+	}
+	s.emitAPIEvent(ev, !denied && s.cfg.AuditAPIDurable)
 }
 
 // apiEvent builds the record for call, without its caller.

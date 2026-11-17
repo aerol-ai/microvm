@@ -213,6 +213,9 @@ type Service struct {
 	secretAuditBootVerify  sync.WaitGroup
 	secretAuditInitErr     error // retained so daemon boot can fail closed
 	secretAuditOnce        sync.Once
+	// peerTokenWriteDenials limits the records of refused internal token
+	// writes to one per sending node per minute (RecordInternalTokenWrite).
+	peerTokenWriteDenials peerDenialLimiter
 	// apiFlood is the api record flood control and its shared-node
 	// evaluator (api_audit.go, api_audit_flood.go).
 	apiFlood               apiFloodState
