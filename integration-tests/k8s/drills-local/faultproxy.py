@@ -130,6 +130,11 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             # keep them pointing back here.
             if k.lower() == "location" and v.startswith(self.upstream):
                 v = v[len(self.upstream):]
+            # A header copied from the registry's answer never carries a line
+            # break (http.client parses one header per line), but strip any so
+            # the copy can never start a header or body of its own.
+            k = k.replace("\r", "").replace("\n", "")
+            v = v.replace("\r", "").replace("\n", "")
             self.send_header(k, v)
         if chunked:
             self.send_header("Connection", "close")
