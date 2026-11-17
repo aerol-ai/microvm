@@ -618,3 +618,66 @@ func TestCallsSentOnToServersByRole(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateOperatorTokenName: a name kept for the Kubernetes operator's
+// own tokens (identitywire.OperatorTokenPrefix) is created only by the
+// admin token, or by such a token making its successor. Anyone else gets
+// ErrAPITokenNameReserved (403) and nothing is written; a name that only
+// looks like one is ordinary.
+func TestCreateOperatorTokenName(t *testing.T) {
+	svc := newTokenService(t, true)
+	if err := svc.StartAPITokens(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	as := func(a controlplane.Access) context.Context {
+		return controlplane.ContextWithAccess(context.Background(), a)
+	}
+	exp := tokenSvcNow.Add(time.Hour)
+	opToken := controlplane.TokenAccess("tok_7Hq2aBcDeFgH", "aerolvm-operator-1", controlplane.RoleAdmin, controlplane.FleetTeam, exp)
+	ciAdmin := controlplane.TokenAccess("tok_8Hq2aBcDeFgH", "ci-admin", controlplane.RoleAdmin, controlplane.FleetTeam, exp)
+	sso := controlplane.OIDCAccess(controlplane.Principal{Kind: controlplane.PrincipalOIDC, ID: "oidc:okta:ana", Name: "ana"},
+		[]controlplane.TeamBinding{{Role: controlplane.RoleAdmin, Team: controlplane.FleetTeam}}, exp)
+	for _, tc := range []struct {
+		name   string
+		ctx    context.Context
+		token  string
+		reserv bool
+	}{
+		{"the admin token", adminCtx(), "aerolvm-operator-10", false},
+		{"the operator's token making its successor", as(opToken), "aerolvm-operator-11", false},
+		{"an ordinary admin token", as(ciAdmin), "aerolvm-operator-12", true},
+		{"an ordinary admin token, padded name", as(ciAdmin), "  aerolvm-operator-13 ", true},
+		{"an admin signed in with SSO", as(sso), "aerolvm-operator-14", true},
+		{"a server node as itself", as(controlplane.NodeAccess("srv-1", controlplane.NodeRoleServer)), "aerolvm-operator-15", true},
+		{"a system caller", controlplane.ContextWithSystemCaller(context.Background(), "bootstrap"), "aerolvm-operator-16", true},
+		{"no caller", context.Background(), "aerolvm-operator-17", true},
+		{"an ordinary admin token, another case", as(ciAdmin), "Aerolvm-operator-18", false},
+		{"an ordinary admin token, no dash", as(ciAdmin), "aerolvm-operator", false},
+		{"an ordinary admin token, a prefix before it", as(ciAdmin), "my-aerolvm-operator-19", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.CreateAPIToken(tc.ctx, createReq(tc.token, "admin", "*", "30d"))
+			if tc.reserv {
+				if !errors.Is(err, ErrAPITokenNameReserved) || errors.Is(err, ErrAPITokenInvalid) {
+					t.Fatalf("err = %v, want reserved", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+		})
+	}
+	list, err := svc.ListAPITokens(adminCtx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tok := range list.Tokens {
+		names = append(names, tok.Name)
+	}
+	want := []string{"Aerolvm-operator-18", "aerolvm-operator", "aerolvm-operator-10", "aerolvm-operator-11", "my-aerolvm-operator-19"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("written: %v, want %v", names, want)
+	}
+}

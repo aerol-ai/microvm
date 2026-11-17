@@ -225,6 +225,7 @@ aerolvm token create --name ci-deploy --role runner --team payments --expires-in
 - **Every token expires.** `expiresIn` takes days (`90d`) or hours (`720h`). The server sets the longest allowed time: 365 days by default, and 90 days in [enterprise mode](/enterprise/enterprise-mode/).
 - **`auditor` and `admin` need `team: "*"`.**
 - **Names are unique within a team.** Creating the same name twice fails with `409 Conflict`. A 409 can also mean an earlier try worked, but its answer was lost. That secret cannot be shown again. Revoke the token by its ID and create it again.
+- **Names that start with `aerolvm-operator-` belong to the Kubernetes operator.** Only the admin token can create one (and the operator's own token, when it replaces itself); anyone else gets `403 Forbidden`. A token with such a name works only when sent straight to a server.
 - **Secret scanners can find leaked tokens.** Every token starts with `avm_` and ends with a checksum. The pattern is `avm_[0-9A-Za-z]{12}_[0-9A-Za-z_-]{43}_[0-9A-Za-z]{6}`.
 
 To use the token, put it where your code reads its credential. `SB_API_TOKEN` and `SB_PAT_TOKEN` both work in every SDK and in the CLI. If both are set, `SB_PAT_TOKEN` wins.

@@ -117,6 +117,7 @@ func TestClassify(t *testing.T) {
 		{"reservation gone", service.ErrReservedPlacementGone, http.StatusServiceUnavailable, reservationGoneRetryAfterSeconds, "", ErrKindOther},
 		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
 		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
+		{"token name kept for the operator", service.ErrAPITokenNameReserved, http.StatusForbidden, 0, "", ErrKindOther},
 		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},
 		{"token store unavailable", service.ErrAPITokensUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"key revoked", secrets.ErrKeyRevoked, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyRevoked, ErrKindOther},

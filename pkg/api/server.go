@@ -79,6 +79,10 @@ type Server struct {
 	// nil with no limit.
 	listGate       *apihttp.Gate
 	clusterEnabled bool
+	// takesOperatorTokens is a single node or a cluster server: the only
+	// nodes the Kubernetes operator's own API token works on
+	// (operator_token.go).
+	takesOperatorTokens bool
 	// pprofEnabled mounts /debug/pprof/ for fleet.admin (SB_ENABLE_PPROF,
 	// pprof.go).
 	pprofEnabled bool
@@ -187,7 +191,9 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		mcpResource:     options.mcpResource,
 		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
-		pprofEnabled:    cfg.EnablePprof,
+		// A single node is its own server.
+		takesOperatorTokens: !cfg.EnableCluster || cfg.IsServer(),
+		pprofEnabled:        cfg.EnablePprof,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
 			OperatorRate: cfg.AuditRateLimitOperator,

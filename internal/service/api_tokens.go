@@ -33,6 +33,10 @@ var (
 	// ErrAPITokenNameTaken is a create whose name another token in the team
 	// already holds (409). Two live tokens never share a name.
 	ErrAPITokenNameTaken = errors.New("token name already used in this team")
+	// ErrAPITokenNameReserved is a create of a name kept for the Kubernetes
+	// operator's own tokens by anyone it is not kept for (403).
+	ErrAPITokenNameReserved = errors.New("token names starting with " + identitywire.OperatorTokenPrefix +
+		" are kept for the Kubernetes operator's own tokens: only the admin token can create one; pick another name")
 	// ErrAPITokenClusterVersion is a token write before every Raft server
 	// runs a build that applies token ops (409).
 	ErrAPITokenClusterVersion = errors.New("not every server supports API tokens yet: upgrade every server first")
@@ -137,6 +141,9 @@ func (s *Service) apiTokenRecordFor(ctx context.Context, req models.CreateAPITok
 	if !identitywire.ValidTokenName(name) {
 		return identity.TokenRecord{}, fmt.Errorf("%w: name must be 1 to 64 characters of A-Z, a-z, 0-9, '.', '_' and '-'", ErrAPITokenInvalid)
 	}
+	if identitywire.IsOperatorTokenName(name) && !mayCreateOperatorToken(ctx) {
+		return identity.TokenRecord{}, ErrAPITokenNameReserved
+	}
 	role := controlplane.Role(strings.TrimSpace(req.Role))
 	if !role.Valid() {
 		return identity.TokenRecord{}, fmt.Errorf("%w: role must be viewer, runner, auditor or admin", ErrAPITokenInvalid)
@@ -203,6 +210,28 @@ func (s *Service) tokenMaxTTL() time.Duration {
 
 // apiTokenCreator is the principal id of the caller minting a token, so
 // "who minted this admin token" has an answer in the list itself.
+// mayCreateOperatorToken reports whether the caller may create a token
+// with a name kept for the operator (identitywire.OperatorTokenPrefix): the
+// admin token, which the operator makes its first one with, or one of the
+// operator's own tokens making its successor (a rotation). Not an admin's
+// own token or sign-in: the name would add nothing for them, and the
+// operator's sweep revokes every such token it did not make. A node in a
+// rolling upgrade that predates this rule may still create one; the
+// servers then take it like the operator's, and nothing else does.
+func mayCreateOperatorToken(ctx context.Context) bool {
+	access, ok := controlplane.AccessFromContext(ctx)
+	if !ok {
+		return false
+	}
+	switch access.Principal.Kind {
+	case controlplane.PrincipalOperator:
+		return true
+	case controlplane.PrincipalToken:
+		return identitywire.IsOperatorTokenName(access.Principal.Name)
+	}
+	return false
+}
+
 func apiTokenCreator(ctx context.Context) string {
 	if access, ok := controlplane.AccessFromContext(ctx); ok && access.Principal.ID != "" {
 		return access.Principal.ID

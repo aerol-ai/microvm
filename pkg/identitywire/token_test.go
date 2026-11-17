@@ -172,6 +172,16 @@ func TestNameRules(t *testing.T) {
 			t.Errorf("ValidTeamName(%q) = %v, want %v", team, got, want)
 		}
 	}
+	// The operator's names: the prefix exactly, case and all.
+	operator := map[string]bool{
+		"aerolvm-operator-1763380000000000000": true, "aerolvm-operator-": true,
+		"aerolvm-operator": false, "Aerolvm-operator-1": false, "my-aerolvm-operator-1": false, "ci": false,
+	}
+	for name, want := range operator {
+		if got := IsOperatorTokenName(name); got != want {
+			t.Errorf("IsOperatorTokenName(%q) = %v, want %v", name, got, want)
+		}
+	}
 }
 
 func TestParseTokenTTL(t *testing.T) {

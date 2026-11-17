@@ -22,6 +22,7 @@ import (
 
 	v1 "github.com/aerol-ai/microvm/operator/api/v1alpha1"
 	"github.com/aerol-ai/microvm/operator/internal/aerolapi"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
 // The operator's own admin API token (issue #1349). In enterprise mode every
@@ -71,7 +72,9 @@ const (
 	// view does not hold it yet. Past the revoke wait with room to spare;
 	// a crash's leftover goes on a later sweep.
 	operatorTokenSweepGrace = 15 * time.Minute
-	operatorTokenPrefix     = "aerolvm-operator-"
+	// operatorTokenPrefix names the operator's tokens: only servers take
+	// them, and only the admin token or the current one makes one.
+	operatorTokenPrefix = identitywire.OperatorTokenPrefix
 )
 
 // Keys of the operator token's Secret.

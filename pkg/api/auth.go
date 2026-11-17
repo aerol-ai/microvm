@@ -336,6 +336,10 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 			continue
 		}
 		if err == nil {
+			// Where the credential is taken at all, before what it may do.
+			err = s.operatorTokenPlace(r, access)
+		}
+		if err == nil {
 			if access, err = runPostMatchSteps(r, access); err != nil {
 				// The credential itself was good: a post-match step refused
 				// the request (a team it is not bound to). The caller is
@@ -700,6 +704,8 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_origin", message: patScopeMessage}
 	case errors.Is(err, errLocalToken):
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "local_only"}
+	case errors.Is(err, errOperatorTokenPlace):
+		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "servers_only"}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
