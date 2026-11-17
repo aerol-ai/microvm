@@ -971,6 +971,100 @@ you need a different base image.
 | `AEROL_WASM_MODULE_REF` | *(unset)* | staged `.wasm` ref; wasm latency skips without it |
 | `AEROL_WASM_POOL_DEPTH` | `2` | warm wasm workers per module digest (provision-time; `0` when wasm off) |
 
+## Bank run on EKS (issues #1343 and #1349)
+
+`k8s/eks-bank.sh` installs `charts/aerolvm/values-bank-eks.yaml` on a real
+three-zone EKS cell, as a bank would, and runs the checks kind cannot:
+enterprise mode with IRSA against an S3 Object Lock bucket, the internal
+NLB, gVisor on Amazon Linux 2023, `aerolvm k8s verify` on the live install,
+the image-pull and SLO-breach drills against an HTTPS registry under a
+private CA (trusted through the chart's `worker.registryCA`), a 3 GiB
+image layer, real Amazon ECR throttling, 11 gateways with the shard-aware
+opt-in, and the operator buying machines when the cell is full (6, then 60
+workers for an hour, then back). It costs money: run it from a checkout of
+the commit under test, with AWS credentials.
+
+```bash
+cd integration-tests/k8s
+./eks-bank.sh bank-1 estimate            # the cost table; makes nothing
+DRY_RUN=1 ./eks-bank.sh bank-1 all       # every call it would make; makes nothing
+HELM=<helm 3.8+> ./eks-bank.sh bank-1 all   # up ... scale, then down
+./eks-bank.sh bank-1 down                # if a run stopped early
+```
+
+Each step can run alone (`up build install enterprise nlb gvisor verify
+drills gateways11 scale down`); results go to `.state/<name>/bank.txt` and
+`.state/<name>/drills/drills.txt`, evidence under `.state/<name>/evidence/`.
+
+Cost guards:
+
+- **Estimate first.** `up` prints the planned and worst-case cost and
+  refuses past `EKS_BANK_CEILING` (default $45), or when the plan outlasts
+  the teardown timer (`EKS_BANK_TTL`, default 6h). The default plan is about
+  $31, the worst case about $40.
+- **Nothing made for a commit that cannot pass.** Before Terraform, `up`
+  renders the chart and refuses one that does not give every node template
+  enterprise mode and the audit witness and export.
+- **The account's own costs.** `up` reads, without changing anything,
+  whether Inspector scans ECR images (about $18 for this run), AWS Config
+  records (about $4) or GuardDuty runtime monitoring is on (about $2, and
+  its VPC endpoint can keep the VPC from being deleted), and refuses unless
+  `EKS_BANK_ACCEPT_ACCOUNT_COSTS=1`, still within the ceiling.
+- **A failure tears the run down.** `all` runs `down` when a step fails or
+  is interrupted (`EKS_BANK_KEEP=1` keeps the run up instead), but only a
+  run this process made with `cluster.sh up` or passed the gate for: never
+  after a refusal, and never a state an earlier run left. `up` refuses a
+  name whose state still holds resources or whose EKS cluster exists.
+- **One account, one region.** `cluster.sh up` records the AWS account in
+  the run's inputs; Terraform refuses any other (`allowed_account_ids`), and
+  `cluster.sh down` and `eks-bank.sh down` check it before anything else.
+  These runs are us-east-1 only (prices, account checks): the region is
+  written into the run's inputs, and a `TF_VAR_region` other than us-east-1
+  is refused.
+- **Teardown timer in AWS.** `cluster.sh up --teardown` makes a Lambda that
+  EventBridge Scheduler calls at the TTL (machines, node groups, load
+  balancers) and 30 and 60 minutes later (the cluster). A dead laptop
+  cannot leave the cell running.
+- **The 60-worker hour is time-boxed** (`EKS_BANK_SCALE_MINUTES`, 60): it
+  starts only with the box, the way back and 30 minutes left before the
+  teardown timer; the Karpenter NodePool's CPU limit caps the machines; any
+  exit, Ctrl-C included, stops the peak drills and sets the floor back to
+  6; and a one-time schedule runs the Lambda's `scale-cap` phase
+  (Karpenter's rights removed, its machines ended twice, a minute apart) if
+  the script is gone 15 minutes after the way back should have ended.
+- **Everything is tagged** `aerol:run`, `aerol:ttl` and `aerol:purpose`:
+  Terraform's resources, Karpenter's machines and disks, the load balancer
+  controller's load balancers, and the volumes of the `gp3` class.
+  `make integration-reap` (which runs `k8s/reap.sh`) removes what runs
+  left, each thing judged on its own tags: it goes only when it carries
+  `aerol:purpose=k8s-phase0` and its own `aerol:ttl` has passed, so an
+  older run's leftover never takes a live run of the same name with it.
+  Machines, load balancers, node groups and clusters, the teardown Lambda
+  and its log group, ECR repositories, the OIDC provider, IAM roles,
+  volumes, the audit buckets and VPCs (once no cluster uses them); spent
+  teardown schedules by their own time. A thing of this harness without a
+  TTL is reported, not removed. `down` lists anything of the run still
+  there afterwards and fails if something is.
+
+The witness bucket is locked in GOVERNANCE mode for 30 days, not COMPLIANCE:
+the node role cannot delete a head (it is denied
+`s3:BypassGovernanceRetention`, and the witness's boot canary proves it),
+while `cluster.sh down` and `reap.sh` empty the bucket with
+`--bypass-governance-retention` and delete it at once. A lifecycle rule
+expires anything left after the lock ends.
+
+Both scripts only ever talk to the kubeconfig `cluster.sh` wrote for the
+named run, and only if it names that EKS cluster, the run was made with
+`--bank-drills`, and this machine's AWS credentials are that cluster's
+account; never `KUBECONFIG`, `KUBECTL_CONTEXT` or a kind cluster.
+`drills-local.sh` keeps its own gate (local kind clusters only).
+
+The run's Terraform state lives in `k8s/.state/<name>/` of the checkout
+that ran `up` (git-ignored). Do not remove that checkout or its ignored
+files (a worktree cleanup, `git clean -x`) while the run is up: `down` needs
+the state. If it is lost anyway, `reap.sh` finds every part of the run by
+its tags once its TTL has passed.
+
 ## What runs where
 
 | Layer | Command | Needs AWS? |

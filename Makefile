@@ -725,8 +725,11 @@ integration-destroy:
 
 # Cost safety net: terminate leaked itest instances past their ttl. Faster than
 # integration-destroy but instance-only — leaves VPC/S3/IAM + TF state behind.
+# Also the EKS runs (integration-tests/k8s/reap.sh): clusters, Karpenter
+# machines, load balancers and audit buckets past their aerol:ttl.
 integration-reap:
 	scripts/integration-reap.sh
+	integration-tests/k8s/reap.sh
 
 # Reset the domain-lease STATE so the next run re-leases from the CURRENT
 # domains.yml pool. Use this when a run is stuck re-picking a stale domain after

@@ -108,23 +108,31 @@ func TestDrillsLocalExitPutsBackWhatAStepBroke(t *testing.T) {
 	}
 }
 
-// The admin token and the scrape token the drills keep on disk are written
-// readable by this user only.
-func TestDrillsLocalTokensWrittenPrivately(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(integrationDir(t), "k8s", "drills-local.sh"))
-	if err != nil {
-		t.Fatal(err)
+// The admin token, the API tokens and the scrape token the drills keep on
+// disk are written readable by this user only, in every drill script.
+func TestDrillsTokensWrittenPrivately(t *testing.T) {
+	want := map[string]int{
+		"drills-local.sh": 1, // the admin token
+		"drills-lib.sh":   1, // the scrape token
+		"drills-eks.sh":   2, // DRILL_TOKEN_FILE's copy, or one made for the run
+		"eks-bank.sh":     2, // the run's API token (and a dry run's stand-in)
 	}
-	found := 0
-	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.Contains(line, `> "$sd/token"`) || strings.Contains(line, `> "$sd/scrape-token"`) {
-			found++
-			if !strings.Contains(line, "umask 077") {
-				t.Errorf("a token file is written without umask 077: %s", strings.TrimSpace(line))
+	for file, n := range want {
+		raw, err := os.ReadFile(filepath.Join(integrationDir(t), "k8s", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := 0
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, `> "$sd/token"`) || strings.Contains(line, `> "$sd/scrape-token"`) || strings.Contains(line, `> "$sd/api-token"`) {
+				found++
+				if !strings.Contains(line, "umask 077") {
+					t.Errorf("%s writes a token file without umask 077: %s", file, strings.TrimSpace(line))
+				}
 			}
 		}
-	}
-	if found != 2 {
-		t.Fatalf("found %d token writes, want 2 (the admin token, the scrape token)", found)
+		if found != n {
+			t.Errorf("%s: found %d token writes, want %d", file, found, n)
+		}
 	}
 }

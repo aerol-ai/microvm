@@ -6,6 +6,7 @@ good or bad, is one line in --out, because the drills count them.
 
   storm.py --url U --token-file F --images localhost:5000/drill/app:v1 \
       --concurrency 20 --duration 600 --run R --out storm.jsonl [--delete]
+      [--registry-auth-file auth.json]
 
 --images takes several refs and spreads the callers over them (caller i
 uses image i mod n). --public asks for public links, which the gateways'
@@ -53,6 +54,8 @@ def caller(args, token, i, fh):
             body["runtime"] = args.runtime
         if args.public:
             body["allow_public_traffic"] = True
+        if args.registry_auth:
+            body["registry"] = args.registry_auth
         t0 = time.time()
         code, out = call(args.url, token, "POST", "/v1/sandboxes", body, timeout=args.client_timeout)
         row = {"t0": round(t0, 3), "ms": int((time.time() - t0) * 1000), "caller": i,
@@ -90,7 +93,11 @@ def main():
     p.add_argument("--once", action="store_true")
     # Public sandboxes get ingress routes on every gateway (route-lag drill).
     p.add_argument("--public", action="store_true")
+    # A private registry's credentials (Amazon ECR on EKS): a JSON file of
+    # {"server", "username", "password"}, sent as each create's registry.
+    p.add_argument("--registry-auth-file", default="")
     args = p.parse_args()
+    args.registry_auth = json.load(open(args.registry_auth_file)) if args.registry_auth_file else None
     token = open(args.token_file).read().strip()
     with open(args.out, "a") as fh, concurrent.futures.ThreadPoolExecutor(args.concurrency) as ex:
         for f in [ex.submit(caller, args, token, i, fh) for i in range(args.concurrency)]:

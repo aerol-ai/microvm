@@ -7,7 +7,7 @@
 #                          [--release 1.36.5-20261031] [--karpenter]
 #                          [--zones 2] [--system 1] [--system-type t3.medium]
 #                          [--imds-hop-limit 1] [--ebs-csi] [--ecr aerolvm,aerolvm-runtime]
-#                          [--network-policy]
+#                          [--network-policy] [--bank-drills] [--teardown]
 #   cluster.sh down <name>
 #   cluster.sh kubeconfig <name>      # prints the kubeconfig path
 #   cluster.sh allow-ip <name>        # let this machine's current address in
@@ -16,6 +16,12 @@
 # runs never share state, and `down` removes exactly what `up` made. `up`
 # tags everything with an aerol:ttl, and reap.sh deletes clusters past it if
 # a run dies before `down`.
+#
+# --workers 0 makes no worker node group (Karpenter makes every worker
+# machine). --bank-drills adds terraform/bank.tf (eks-bank.sh): IRSA, the
+# audit buckets and their role, the load balancer controller's role.
+# --teardown has AWS itself tear the compute down at the TTL
+# (terraform/teardown.tf), so a dead laptop cannot leave it running.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +47,28 @@ ttl_from_now() {
 
 state_dir() { echo "$HERE/.state/$1"; }
 
+# region_only: these runs are us-east-1 only (prices, account checks, the
+# Terraform variable's validation). run.tfvars.json pins it, so a
+# TF_VAR_region set in the shell can never point a destroy elsewhere.
+region_only() {
+  [[ -z "${TF_VAR_region:-}" || "${TF_VAR_region}" == us-east-1 ]] ||
+    die "TF_VAR_region=$TF_VAR_region: these runs are us-east-1 only; unset it"
+}
+
+# same_account <run.tfvars.json>: this machine's AWS credentials are the
+# account the run was made in (an older run that recorded none is let
+# through, with a warning).
+same_account() {
+  local want got
+  want="$(jq -r '.aws_account // ""' "$1")"
+  if [[ -z "$want" ]]; then
+    echo "down: $1 names no AWS account (made before cluster.sh recorded one); not checked" >&2
+    return 0
+  fi
+  got="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+  [[ "$got" == "$want" ]] || die "this machine's AWS credentials are for account \"$got\"; the run was made in $want. Nothing was changed"
+}
+
 tf() {
   local name="$1"; shift
   local sd; sd="$(state_dir "$name")"
@@ -55,6 +83,7 @@ cmd_up() {
   local release="" karpenter=false
   # The Phase 2 cell (cell.sh); the defaults are the spikes' shape.
   local zones=2 system=1 system_type="t3.medium" hop=0 ebs=false ecr="" netpol=false
+  local bank=false teardown=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       # The worker node group's AMI release; S5 starts one behind to upgrade.
@@ -73,22 +102,35 @@ cmd_up() {
       --ebs-csi) ebs=true; shift ;;
       --ecr) ecr="$2"; shift 2 ;;
       --network-policy) netpol=true; shift ;;
+      --bank-drills) bank=true; shift ;;
+      --teardown) teardown=true; shift ;;
       *) die "unknown flag $1" ;;
     esac
   done
   [[ "$name" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || die "name must be 3-31 chars of a-z, 0-9 and -"
+  [[ "$workers" =~ ^[0-9]+$ ]] || die "--workers wants a number"
+  region_only
+  # The account this run is made in, kept with its inputs: Terraform
+  # refuses any other (allowed_account_ids), and down checks it first.
+  local account; account="$(aws sts get-caller-identity --query Account --output text)"
+  [[ "$account" =~ ^[0-9]{12}$ ]] || die "could not read this machine's AWS account"
   local ip; ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')"
   [[ "$ip" =~ ^[0-9.]+$ ]] || die "could not learn this machine's public address"
   local sd; sd="$(state_dir "$name")"
   mkdir -p "$sd"
   # The run's inputs are saved, so `down` destroys with the same values `up`
   # applied (the zone list, for one, depends on the worker type).
-  jq -n --arg name "$name" --arg ttl "$(ttl_from_now "$ttl")" --arg ami "$ami" \
+  local ttl_at; ttl_at="$(ttl_from_now "$ttl")"
+  local teardown_at=""; [[ "$teardown" == true ]] && teardown_at="$ttl_at"
+  jq -n --arg name "$name" --arg ttl "$ttl_at" --arg ami "$ami" \
     --arg type "$type" --argjson workers "$workers" --arg version "$version" --arg cidr "${ip}/32" \
     --arg release "$release" --argjson karpenter "$karpenter" \
     --argjson zones "$zones" --argjson system "$system" --arg system_type "$system_type" \
     --argjson hop "$hop" --argjson ebs "$ebs" --arg ecr "$ecr" --argjson netpol "$netpol" \
+    --argjson bank "$bank" --arg teardown_at "$teardown_at" --arg account "$account" \
     '{name: $name, ttl: $ttl, worker_ami_type: $ami, worker_instance_type: $type,
+      aws_account: $account, region: "us-east-1",
+      bank_drills: $bank, teardown_at: $teardown_at,
       worker_count: $workers, kubernetes_version: $version, api_allowed_cidrs: [$cidr],
       worker_release_version: $release, karpenter: $karpenter,
       zone_count: $zones, system_count: $system, system_instance_type: $system_type,
@@ -131,6 +173,31 @@ remove_leftovers() {
     aws ec2 delete-network-interface --region "$region" --network-interface-id "$id" &&
       echo "down: removed a network interface the VPC CNI left behind: $id"
   done
+  # The AWS Load Balancer Controller's security groups and target groups,
+  # when its load balancer was deleted without it (the teardown Lambda,
+  # reap.sh): a security group holds the VPC.
+  for id in $(aws elbv2 describe-target-groups --region "$region" --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null); do
+    if [[ "$(aws elbv2 describe-tags --region "$region" --resource-arns "$id" \
+        --query "TagDescriptions[0].Tags[?Key=='elbv2.k8s.aws/cluster'].Value | [0]" --output text 2>/dev/null)" == "$name" ]]; then
+      aws elbv2 delete-target-group --region "$region" --target-group-arn "$id" 2>/dev/null &&
+        echo "down: removed a target group the load balancer controller left: $id"
+    fi
+  done
+  for id in $(aws ec2 describe-security-groups --region "$region" \
+      --filters "Name=tag:elbv2.k8s.aws/cluster,Values=$name" --query 'SecurityGroups[].GroupId' --output text 2>/dev/null); do
+    aws ec2 delete-security-group --region "$region" --group-id "$id" 2>/dev/null &&
+      echo "down: removed a security group the load balancer controller left: $id"
+  done
+  # Volumes the CSI driver made for the run's claims (the gp3 class tags
+  # them with the run's name and TTL), left unattached when the cluster
+  # went first. This run's TTL too: an older run's of the same name are
+  # reap.sh's to judge.
+  local ttl; ttl="$(jq -r '.ttl // ""' "$(state_dir "$name")/run.tfvars.json" 2>/dev/null || true)"
+  for id in $(aws ec2 describe-volumes --region "$region" --filters "Name=tag:aerol:run,Values=$name" "Name=tag:aerol:ttl,Values=$ttl" \
+      Name=tag:aerol:purpose,Values=k8s-phase0 Name=status,Values=available --query 'Volumes[].VolumeId' --output text 2>/dev/null); do
+    aws ec2 delete-volume --region "$region" --volume-id "$id" 2>/dev/null &&
+      echo "down: removed a volume the run's claims left: $id"
+  done
   [[ "${3:-}" == with-cluster-sg ]] || return 0
   for id in $(aws ec2 describe-security-groups --region "$region" \
       --filters "Name=tag:aws:eks:cluster-name,Values=$name" --query 'SecurityGroups[].GroupId' --output text); do
@@ -139,10 +206,22 @@ remove_leftovers() {
   done
 }
 
+# The bank drills' audit buckets are emptied with lib/common.sh's
+# empty_versioned_bucket (run.sh's, tested in safety/empty_bucket_test.go):
+# every version and delete marker, with the governance bypass, a refusal
+# reported instead of looped on, the rounds capped. The witness bucket is
+# GOVERNANCE-locked for that: the node role cannot do this (it has no bypass
+# right), the person tearing the run down can.
+# shellcheck source=../lib/common.sh
+source "$HERE/../lib/common.sh"
+
 cmd_down() {
   local name="${1:-}"; [[ -n "$name" ]] || usage
   local sd; sd="$(state_dir "$name")"
   [[ -f "$sd/terraform.tfstate" ]] || die "no state for $name in $sd"
+  # Before anything is read or changed: the run's account and region.
+  region_only
+  same_account "$sd/run.tfvars.json"
   local state=(-input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json")
   local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region 2>/dev/null || echo "${AWS_REGION:-us-east-1}")"
   tf "$name" init -input=false -backend=false >/dev/null
@@ -156,23 +235,42 @@ cmd_down() {
     KUBECONFIG="$sd/kubeconfig" kubectl delete ec2nodeclasses.karpenter.k8s.aws --all --timeout=5m >/dev/null 2>&1 || true
     local left; left="$(aws ec2 describe-instances --region "$region" \
       --filters "Name=tag:kubernetes.io/cluster/$name,Values=owned" "Name=tag-key,Values=karpenter.sh/nodepool" \
+        "Name=tag:aerol:ttl,Values=$(jq -r .ttl "$sd/run.tfvars.json")" \
         Name=instance-state-name,Values=pending,running,stopping,stopped \
       --query 'Reservations[].Instances[].InstanceId' --output text)"
     if [[ -n "$left" ]]; then
       echo "down: ending machines Karpenter left: $left"
       # shellcheck disable=SC2086
-      aws ec2 terminate-instances --region "$region" --instance-ids $left >/dev/null
+      aws ec2 terminate-instances --region "$region" --instance-ids $left >/dev/null || echo "down: ending them failed; reap.sh ends them by tag" >&2
       # shellcheck disable=SC2086
-      aws ec2 wait instance-terminated --region "$region" --instance-ids $left
+      aws ec2 wait instance-terminated --region "$region" --instance-ids $left || true
     fi
   fi
-  # Machines first, then what they left, then the rest.
-  tf "$name" destroy "${state[@]}" -target=aws_eks_node_group.worker -target=aws_eks_node_group.system
+  # Machines first, then what they left, then the rest. Nothing here may
+  # stop the destroy: a step that fails is reported, and what it leaves is
+  # tagged for reap.sh.
+  tf "$name" destroy "${state[@]}" -target=aws_eks_node_group.worker -target=aws_eks_node_group.system ||
+    echo "down: destroying the node groups failed; going on" >&2
+  # The audit buckets, after the nodes (nothing writes to them any more).
+  # One that cannot be emptied does not block the destroy: Terraform removes
+  # everything else and leaves that bucket, which reap.sh empties and deletes
+  # once the run's TTL has passed (its lifecycle rule expires what is left).
+  local kept=""
+  if jq -e '.bank_drills == true' "$sd/run.tfvars.json" >/dev/null 2>&1; then
+    local b
+    for b in witness_bucket export_bucket; do
+      b="$(tf "$name" output -state="$sd/terraform.tfstate" -raw "$b" 2>/dev/null || true)"
+      [[ -n "$b" ]] || continue
+      empty_versioned_bucket "$b" aws --region "$region" || kept="$kept s3://$b"
+    done
+  fi
   remove_leftovers "$name" "$region"
   if ! tf "$name" destroy "${state[@]}"; then
     echo "down: destroy failed; removing leftovers and trying once more" >&2
     remove_leftovers "$name" "$region" with-cluster-sg
-    tf "$name" destroy "${state[@]}"
+    if ! tf "$name" destroy "${state[@]}"; then
+      die "destroy failed again${kept:+ (not emptied:$kept)}; run cluster.sh down $name again, or reap.sh once its TTL has passed"
+    fi
   fi
   if [[ -f "$sd/started-at" ]]; then
     echo "down: $name; ran from $(cat "$sd/started-at") to $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -195,15 +293,19 @@ cmd_allow_ip() {
   local name="${1:-}"; [[ -n "$name" ]] || usage
   local sd; sd="$(state_dir "$name")"
   [[ -f "$sd/run.tfvars.json" ]] || die "no saved inputs for $name"
+  # A write to the cluster: the run's account and region first.
+  region_only
+  same_account "$sd/run.tfvars.json"
   local ip; ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')"
   [[ "$ip" =~ ^[0-9.]+$ ]] || die "could not learn this machine's public address"
   if jq -e --arg c "${ip}/32" '.api_allowed_cidrs | index($c)' "$sd/run.tfvars.json" >/dev/null; then
     echo "allow-ip: ${ip}/32 is already allowed"; return 0
   fi
   local cidrs; cidrs="$(jq -r --arg c "${ip}/32" '(.api_allowed_cidrs + [$c]) | join(",")' "$sd/run.tfvars.json")"
-  local id; id="$(aws eks update-cluster-config --name "$name" \
+  local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region 2>/dev/null || echo "${AWS_REGION:-us-east-1}")"
+  local id; id="$(aws eks update-cluster-config --region "$region" --name "$name" \
     --resources-vpc-config "publicAccessCidrs=$cidrs" --query update.id --output text)"
-  while [[ "$(aws eks describe-update --name "$name" --update-id "$id" --query update.status --output text)" == InProgress ]]; do
+  while [[ "$(aws eks describe-update --region "$region" --name "$name" --update-id "$id" --query update.status --output text)" == InProgress ]]; do
     sleep 15
   done
   jq --arg c "${ip}/32" '.api_allowed_cidrs += [$c]' "$sd/run.tfvars.json" > "$sd/run.tfvars.json.new"

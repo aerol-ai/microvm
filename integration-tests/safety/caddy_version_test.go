@@ -94,6 +94,16 @@ func caddyBuilders(p caddyPins) map[string][]string {
 			`--with "$(pin CADDY_DNS_CLOUDFLARE_MODULE)"`,
 			`--with "$(pin CADDY_STORAGE_S3_MODULE)"`,
 		},
+		// The edge image for the EKS cell (cell.sh build, AEROL_BUILD_EDGE=1)
+		// reads the pins from the commit it builds.
+		"integration-tests/k8s/cell/build-job.yaml": {
+			`pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" scripts/install.sh; }`,
+			`build "$(pin CADDY_BUILD_VERSION)"`,
+			"--with " + caddyPlugin + " \\",
+			`--with "$(pin CADDY_L4_MODULE)"`,
+			`--with "$(pin CADDY_DNS_CLOUDFLARE_MODULE)"`,
+			`--with "$(pin CADDY_STORAGE_S3_MODULE)"`,
+		},
 		"Makefile": {
 			"CADDY_E2E_VERSION ?= " + v + "\n",
 			"--with " + p.l4 + ";",

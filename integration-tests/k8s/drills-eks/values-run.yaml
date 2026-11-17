@@ -1,0 +1,82 @@
+# The bank run's chart values (eks-bank.sh install), laid over the chart's
+# own charts/aerolvm/values-bank-eks.yaml: only what a throwaway run must
+# fill in or cannot have. Placeholders in @@...@@ are filled by eks-bank.sh;
+# install refuses a render that still holds one of the preset's <...>.
+#
+# Changed from the preset, and why:
+#   - machines are m7i.xlarge (4 CPU, 16 GiB), not 32-CPU ones: the run's
+#     budget. minWorkers and maxWorkers are EKS_BANK_BASE_WORKERS (6, 2 a
+#     zone) and EKS_BANK_PEAK_WORKERS (60): the scale step.
+#   - decommission drains in 2 minutes, not 15: the scale step's way back
+#     to 6 has to fit its time box.
+#   - servers keep 10 GiB, not 50: nothing here fills them.
+#   - createPolicy allows the drill registry, the run's ECR registry and
+#     public.ecr.aws, with sandboxes up to 2 CPU and 4 GiB (a quarter of a
+#     machine).
+#   - the shard-aware opt-in is on every node from the start, so the
+#     gateways11 step only has to add gateways (a node reads it when made).
+image:
+  registry: "@@REGISTRY@@"
+  tag: "@@TAG@@"
+
+worker:
+  # The drill registry's private CA: every worker trusts it, as a bank's
+  # workers trust its own registry's.
+  registryCA:
+    existingConfigMap: drills-registry-ca
+    key: ca.crt
+  extraEnv:
+    SB_CLUSTER_SHARD_AWARE_INGRESS: "true"
+
+edge:
+  domain: "@@DOMAIN@@"
+  certManager:
+    issuerRef: { name: aerolvm-drills-ca, kind: ClusterIssuer }
+
+audit:
+  witness:
+    bucket: "@@WITNESS@@"
+    region: "@@REGION@@"
+  export:
+    backend: s3
+    s3:
+      bucket: "@@EXPORT@@"
+      region: "@@REGION@@"
+  credentials:
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: "@@AUDIT_ROLE@@"
+
+monitoring:
+  # drills-eks.sh setup makes this viewer token's Secret.
+  scrapeToken:
+    existingSecret: aerolvm-metrics-token
+
+cluster:
+  version: "@@TAG@@"
+  zones: [@@ZONES@@]
+  servers:
+    storage: { size: 10Gi }
+  workerPools:
+    - name: gvisor-general
+      runtimes: [gvisor]
+      nodeSelector: { aerolvm.io/pool: gvisor-general }
+      tolerations: [{ key: aerolvm.io/pool, operator: Exists, effect: NoSchedule }]
+      machine: { cpu: 4, memoryGiB: 16 }
+      minWorkers: @@BASE_WORKERS@@
+      maxWorkers: @@PEAK_WORKERS@@
+      headroomPercent: 15
+      zoneLossReservePercent: 10
+      provisioner: karpenter
+      decommission: { drainWindow: 2m, deadline: 10m }
+      maxMachineAge: 720h
+  createPolicy:
+    version: 1
+    images:
+      # The drill registry, the run's ECR registry, and Amazon's public
+      # mirror (the gvisor step's alpine), standing in for a bank's mirror.
+      allowed_registries: ["drills-registry.drills.svc", "@@ECR_HOST@@", "public.ecr.aws"]
+    runtimes: [gvisor]
+    limits: { max_cpu: 2, max_memory_mb: 4096, max_disk_gb: 20 }
+    allow_gpu: false
