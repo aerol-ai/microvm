@@ -49,12 +49,6 @@ func TestGetSandboxAuditRateLimit429RetryAfter(t *testing.T) {
 		OperatorRate: 1,
 		NodeRate:     1,
 	})
-	// Exhaust burst quickly.
-	for i := 0; i < 120; i++ {
-		if _, ok := limiter.allow("operator"); !ok {
-			break
-		}
-	}
 	h, sbID := newAuditTestHandler(t, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
@@ -68,6 +62,14 @@ func TestGetSandboxAuditRateLimit429RetryAfter(t *testing.T) {
 			})
 		},
 	})
+	// Exhaust the burst right before the request, after the setup above:
+	// the limiter refills one request a second, so a setup that takes over
+	// a second on a busy machine would hand the request a fresh token.
+	for i := 0; i < 120; i++ {
+		if _, ok := limiter.allow("operator"); !ok {
+			break
+		}
+	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/"+sbID+"/audit", nil)
 	req.Header.Set("Authorization", "Bearer x")
 	rr := httptest.NewRecorder()
