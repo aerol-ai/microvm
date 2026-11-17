@@ -54,7 +54,7 @@ func hostCapableCases(t *testing.T) []hostCase {
 	token, oidc := controlplane.PrincipalToken, controlplane.PrincipalOIDC
 	return []hostCase{
 		{"operator (PAT)", accessCtx(controlplane.OperatorAccess()), true},
-		{"node", accessCtx(controlplane.NodeAccess("n2")), true},
+		{"node", accessCtx(controlplane.NodeAccess("n2", controlplane.NodeRoleServer)), true},
 		{"internal (no Access)", context.Background(), true},
 		{"system loop", accessCtx(controlplane.Access{Fleet: true, Principal: controlplane.Principal{Kind: controlplane.PrincipalSystem, ID: "system:lifecycle"}}), true},
 		{"admin (oidc)", boundCtx(oidc, controlplane.RoleAdmin, controlplane.FleetTeam), true},

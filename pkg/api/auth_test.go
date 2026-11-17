@@ -27,7 +27,18 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // peerTLS is the connection state of a request that arrived over the
 // cluster's mTLS listener from node id: a verified leaf with a node:<id> SAN.
 func peerTLS(id string) *tls.ConnectionState {
-	cert := &x509.Certificate{DNSNames: []string{"node:" + id}}
+	return peerTLSRole(id, controlplane.NodeRoleServer)
+}
+
+// peerTLSRole is a verified peer certificate for node id signed for role
+// (DNS:role:<role>, as the join service signs it); "" names no role, as a
+// certificate from before roles does.
+func peerTLSRole(id, role string) *tls.ConnectionState {
+	names := []string{"node:" + id}
+	if role != "" {
+		names = append(names, "role:"+role)
+	}
+	cert := &x509.Certificate{DNSNames: names}
 	return &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}, VerifiedChains: [][]*x509.Certificate{{cert}}}
 }
 
@@ -125,7 +136,7 @@ func TestPrincipalInvariants(t *testing.T) {
 		},
 		{
 			name: "PAT plus mTLS peer, not forwarded", token: "pat-token", peer: true,
-			want: controlplane.NodeAccess("peer-test"),
+			want: controlplane.NodeAccess("peer-test", controlplane.NodeRoleServer),
 		},
 		{
 			name: "managed provider token", validator: validator, token: "managed-token",
@@ -203,7 +214,9 @@ func TestPrincipalInvariants(t *testing.T) {
 }
 
 func TestPATAuthenticator(t *testing.T) {
-	pat := patAuthenticator{token: "pat-token"}
+	pat := patAuthenticator{token: "pat-token", nodeRole: func(r *http.Request, _ string) string {
+		return cluster.ExtractPeerRole(r.TLS.PeerCertificates[0])
+	}}
 	cases := []struct {
 		name        string
 		bearer      string
@@ -243,6 +256,24 @@ func TestPATAuthenticator(t *testing.T) {
 	}
 	if _, matched, _ := (patAuthenticator{}).Authenticate(httptest.NewRequest(http.MethodGet, "/", nil), ""); matched {
 		t.Fatal("an unset PAT must never match an empty bearer")
+	}
+	// The PAT over mTLS is the node acting for itself, with what its role
+	// needs: a worker's or gateway's node holds no role, whatever token it
+	// sends, and so does a peer whose role cannot be read.
+	for _, role := range []string{controlplane.NodeRoleWorker, controlplane.NodeRoleIngress, ""} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.TLS = peerTLSRole("w3", role)
+		access, matched, err := pat.Authenticate(req, "pat-token")
+		if err != nil || !matched || access.Principal.Kind != controlplane.PrincipalNode || access.Role != "" ||
+			access.NodeRole != role || !access.NodeLimited() || access.Can(controlplane.PermFleetAdmin) {
+			t.Fatalf("PAT over mTLS from a %q node = %+v %v %v", role, access, matched, err)
+		}
+	}
+	// Without a role reader every peer's role is unknown: least.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.TLS = peerTLS("n3")
+	if access, _, _ := (patAuthenticator{token: "pat-token"}).Authenticate(req, "pat-token"); !access.NodeLimited() {
+		t.Fatalf("a node whose role is unread must hold the least: %+v", access)
 	}
 }
 
@@ -337,7 +368,7 @@ func TestPostMatchSteps(t *testing.T) {
 		{name: "malformed team header", access: payments, req: req{team: "Payments!"}, wantErr: errBadTeamHeader},
 		{name: "team name too long", access: payments, req: req{team: strings.Repeat("a", 64)}, wantErr: errBadTeamHeader},
 		{name: "PAT ignores the header, even a bad one (L8)", access: controlplane.OperatorAccess(), req: req{team: "Bad Team"}, wantNoErr: true},
-		{name: "node ignores the header", access: controlplane.NodeAccess("n1"), req: req{team: "checkout"}, wantNoErr: true},
+		{name: "node ignores the header", access: controlplane.NodeAccess("n1", controlplane.NodeRoleServer), req: req{team: "checkout"}, wantNoErr: true},
 		{name: "managed caller ignores the header (L8)", access: managed, req: req{team: "checkout"}, wantNoErr: true},
 	}
 	for _, tc := range cases {

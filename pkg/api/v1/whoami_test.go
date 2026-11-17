@@ -31,7 +31,7 @@ func TestWhoAmI(t *testing.T) {
 			body: `{"principal":{"kind":"operator","id":"operator","name":"operator"},"role":"admin","team":"*"}`,
 		},
 		{
-			name: "node", access: ptr(controlplane.NodeAccess("n3")), status: http.StatusOK,
+			name: "node", access: ptr(controlplane.NodeAccess("n3", controlplane.NodeRoleServer)), status: http.StatusOK,
 			body: `{"principal":{"kind":"node","id":"node:n3","name":"node:n3"},"role":"admin","team":"*"}`,
 		},
 		{
@@ -119,7 +119,8 @@ func TestWhoAmIExplain(t *testing.T) {
 			`{"bindings_apply":true,"matched":[{"index":2,"text":"okta group=\"payments-eng\" -> runner/payments","in_effect":true},` +
 				`{"index":3,"text":"okta group=\"billing-eng\" -> viewer/billing"}]}`},
 		{"operator", controlplane.OperatorAccess(), "explain=1", `{"bindings_apply":false,"note":"the operator token (SB_PAT_TOKEN) acts as admin on every team` + tail},
-		{"node", controlplane.NodeAccess("n3"), "explain=1", `{"bindings_apply":false,"note":"a cluster peer's certificate acts as admin on every team` + tail},
+		{"node", controlplane.NodeAccess("n3", controlplane.NodeRoleServer), "explain=1",
+			`{"bindings_apply":false,"note":"a cluster peer's certificate gets what its role needs: a server's acts as admin on every team, a worker's or gateway's reaches only the cluster routes its role needs` + tail},
 		{"managed", managed, "explain=1", `{"bindings_apply":false,"note":"the managed control plane sets this account's role` + tail},
 		{"API token", controlplane.Access{Role: controlplane.RoleRunner, Principal: controlplane.Principal{Kind: controlplane.PrincipalToken, ID: "tok_1"}}, "explain=1",
 			`{"bindings_apply":false,"note":"an API token carries its own role and team` + tail},

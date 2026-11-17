@@ -15,6 +15,8 @@ import (
 // profileStubCluster stands in for a server's replicated profile store.
 type profileStubCluster struct {
 	*cluster.Noop
+	// A server: it takes settings writes from peers settingsPeers allows.
+	settingsPeers
 	writeErr error
 	readErr  error
 	wrote    cluster.EgressProfileWriteRequest

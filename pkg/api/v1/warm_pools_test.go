@@ -138,6 +138,8 @@ func TestV1WarmPoolOnImageChange(t *testing.T) {
 // warmPoolStubCluster stands in for a server's replicated entry store.
 type warmPoolStubCluster struct {
 	*cluster.Noop
+	// A server: it takes settings writes from peers settingsPeers allows.
+	settingsPeers
 	writeErr error
 	readErr  error
 	wrote    cluster.WarmPoolWriteRequest
@@ -249,7 +251,7 @@ func TestCapacityHidesWarmPoolsFromNonAdmins(t *testing.T) {
 		"fleet viewer": {fleetToken(controlplane.RoleViewer), true},
 		"admin":        {fleetToken(controlplane.RoleAdmin), false},
 		"operator":     {controlplane.OperatorAccess(), false},
-		"peer":         {controlplane.NodeAccess("n2"), false},
+		"peer":         {controlplane.NodeAccess("n2", controlplane.NodeRoleServer), false},
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/v1/capacity", nil)
 		req = req.WithContext(controlplane.ContextWithAccess(req.Context(), tc.access))

@@ -28,6 +28,10 @@ func ApplyErrorStatus(err error) int {
 		return http.StatusNoContent
 	case errors.Is(err, ErrNotLeader):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrPeerProposalRefused):
+		// The sender's role may not propose this op: final, whichever
+		// server answers (peer_proposals.go).
+		return http.StatusForbidden
 	case errors.Is(err, ErrCreateBackpressure):
 		return http.StatusTooManyRequests
 	case errors.Is(err, ErrTeamQuotaExceeded):

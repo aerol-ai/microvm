@@ -1054,9 +1054,18 @@ func (a *Agent) IsNodeDrained(nodeID string) bool {
 	return resp.Drained
 }
 
+// ApplyEncoded sends an encoded command to the server tier. A peer's raw
+// apply that reached this node's listener (ContextWithApplyPeer) is not
+// sent on: a worker or gateway holds no Raft state, and relaying would
+// make the peer's proposal this node's own, whose role may allow more
+// (peer_proposals.go). It answers ErrNotLeader, so the peer tries the next
+// server, as it does for a server that is not the leader.
 func (a *Agent) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if _, err := decodeCommand(payload); err != nil {
 		return fmt.Errorf("cluster: decode forwarded command: %w", err)
+	}
+	if _, fromPeer := applyPeerFromContext(ctx); fromPeer {
+		return ErrNotLeader
 	}
 	return a.applyEncodedToControlPlane(ctx, payload)
 }

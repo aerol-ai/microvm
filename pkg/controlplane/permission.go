@@ -38,7 +38,9 @@ const (
 	// DNS, /debug/vars.
 	PermFleetAdmin Permission = "fleet.admin"
 	// PermClusterInternal: /v1/cluster/internal/*. Held only by the node:
-	// principal (a peer's PAT over mTLS, on its own behalf), never by a role.
+	// principal (a peer's certificate, or its PAT over mTLS, on its own
+	// behalf), never by a role. Every node role holds it; a route that only
+	// some roles may use checks the peer's role itself.
 	PermClusterInternal Permission = "cluster.internal"
 	// PermAuthenticated is the pseudo-permission of the two routes that need
 	// only a valid principal: GET /v1/whoami (it describes the caller) and
@@ -145,7 +147,9 @@ func (a Access) Can(p Permission) bool {
 // HostCapable reports whether the caller may use host-side powers: raw host
 // mounts, file:// bundle refs read off the host, and custom domains on the
 // operator's trusted DNS path (eng review D3, D7). True for the PAT
-// (operator), a cluster peer (node:), a system loop, and the admin role.
+// (operator), a cluster peer (node:, whatever its role: the node-to-node
+// routes recreate and move sandboxes as they were made), a system loop, and
+// the admin role.
 // False for viewer, runner (team or fleet), auditor and managed identities:
 // fleet scope is which owners a caller sees, never host power.
 func (a Access) HostCapable() bool {

@@ -95,7 +95,7 @@ func clusterIdentityError(err error) error {
 	switch {
 	case errors.Is(err, cluster.ErrIdentityKeysConflict):
 		return fmt.Errorf("%w: %v", ErrIdentityKeysConflict, err)
-	case errors.Is(err, cluster.ErrIdentityInvalid):
+	case errors.Is(err, cluster.ErrIdentityInvalid), errors.Is(err, cluster.ErrIdentityWriterRefused):
 		return fmt.Errorf("%w: %v", ErrIdentityInvalid, err)
 	}
 	return fmt.Errorf("%w: %v", ErrIdentityUnavailable, err)

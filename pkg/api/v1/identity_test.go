@@ -193,6 +193,8 @@ func TestV1IdentityOff(t *testing.T) {
 // identityStubCluster stands in for a server's replicated identity store.
 type identityStubCluster struct {
 	*cluster.Noop
+	// A server: it takes settings writes from peers settingsPeers allows.
+	settingsPeers
 	writeErr error
 	readErr  error
 }

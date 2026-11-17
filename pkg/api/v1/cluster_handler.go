@@ -3,6 +3,7 @@ package v1
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1110,6 +1111,9 @@ func (h *handlers) clusterInternalEgressProfileWrite(w http.ResponseWriter, r *h
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
+	if h.refuseSettingsWriter(w, r, "egress profiles") {
+		return
+	}
 	var req cluster.EgressProfileWriteRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1318,7 +1322,14 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 		apihttp.WriteError(w, http.StatusBadRequest, "empty raft command body")
 		return
 	}
-	if err := c.ApplyEncoded(r.Context(), body); err != nil {
+	// The leader checks what the sending peer's role may propose
+	// (cluster.ContextWithApplyPeer); withInternalMTLS verified both.
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	var leaf *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf = r.TLS.PeerCertificates[0]
+	}
+	if err := c.ApplyEncoded(cluster.ContextWithApplyPeer(r.Context(), peerID, leaf), body); err != nil {
 		if errors.Is(err, cluster.ErrNotLeader) {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return

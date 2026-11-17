@@ -1669,6 +1669,11 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		// tables; a raw forward could move a rollout past both.
 		return errRolloutOpNotForwardable
 	}
+	// What no peer may forward is refused above; what only a server may
+	// propose is refused here, by the sender's admitted role.
+	if err := c.checkPeerProposal(ctx, cmd); err != nil {
+		return err
+	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil

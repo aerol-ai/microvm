@@ -14,6 +14,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/x509"
 	"errors"
 	"net/http"
 	"strconv"
@@ -136,7 +137,23 @@ func (s *Server) sandboxTokenAuth() sandboxTokenAuthenticator {
 // patAuth is the server's PAT authenticator.
 func (s *Server) patAuth() patAuthenticator {
 	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, sha256: s.patSHA256, local: s.localToken,
-		hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
+		hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol, nodeRole: s.nodeRole}
+}
+
+// nodeRole is the role the peer whose verified certificate r carries was
+// admitted with, as this node can tell (cluster.PeerRole): it decides what
+// that peer may do as a node principal (controlplane.NodeAccess). A node
+// with no cluster cannot tell, and an unknown role gets the least.
+func (s *Server) nodeRole(r *http.Request, peer string) string {
+	var c cluster.Client
+	if s != nil && s.service != nil {
+		c = s.service.Cluster()
+	}
+	var leaf *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf = r.TLS.PeerCertificates[0]
+	}
+	return cluster.PeerRole(c, peer, leaf)
 }
 
 // patAuthenticator recognises the operator token (PAT).
@@ -160,6 +177,17 @@ type patAuthenticator struct {
 	// trustClientIP is SB_L4_FALLBACK_PROXY_PROTOCOL: Caddy's
 	// X-AerolVM-Client-IP then marks its loopback traffic as public.
 	trustClientIP bool
+	// nodeRole reads a peer's admitted role (Server.nodeRole); nil reads
+	// none, and an unknown role gets the least.
+	nodeRole func(r *http.Request, peer string) string
+}
+
+// roleOf is p.nodeRole, or "" without one.
+func (p patAuthenticator) roleOf(r *http.Request, peer string) string {
+	if p.nodeRole == nil {
+		return ""
+	}
+	return p.nodeRole(r, peer)
 }
 
 // matches compares in constant time: the PAT grants fleet-wide access, so a
@@ -208,10 +236,10 @@ func localCaller(r *http.Request) bool {
 
 // Authenticate splits the PAT into its two principals (§5.1). A cluster peer
 // that proves itself with its mTLS certificate and is NOT forwarding a user's
-// request is acting for itself: node:<peer>. Everyone else, including a peer
+// request is acting for itself: node:<peer>, with what its admitted role
+// allows (controlplane.NodeAccess). Everyone else, including a peer
 // forwarding a user's PAT request, is the operator; forward attribution then
-// records the edge node in Via. Both get today's powers; only the name
-// differs.
+// records the edge node in Via.
 //
 // Under SB_PAT_SCOPE=host it also refuses a PAT from a public origin (the
 // public socket, or a TCP peer that is not loopback), and a PAT a peer
@@ -241,7 +269,7 @@ func (p patAuthenticator) Authenticate(r *http.Request, bearer string) (controlp
 	}
 	if !isForwarded(r) {
 		if peer, ok := mtlsPeer(r); ok {
-			return controlplane.NodeAccess(peer), true, nil
+			return controlplane.NodeAccess(peer, p.roleOf(r, peer)), true, nil
 		}
 	}
 	return controlplane.OperatorAccess(), true, nil
@@ -293,7 +321,7 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 		return access, nil
 	}
 	if bearer == "" {
-		if access, ok := nodeCertAccess(r); ok {
+		if access, ok := nodeCertAccess(r, s.nodeRole); ok {
 			access, err := runPostMatchSteps(r, access)
 			if err != nil {
 				return controlplane.Access{}, mapAuthFailure(string(controlplane.PrincipalNode), err)
@@ -345,13 +373,14 @@ func runPostMatchSteps(r *http.Request, access controlplane.Access) (controlplan
 
 // nodeCertAccess is a cluster peer calling with its node cert and no bearer
 // (internal/cluster/peer_cert_auth.go): a node joined without the operator
-// PAT calls its peers this way. It is node:<peer>, the same principal a peer
-// sending the PAT over mTLS gets. The internal listener's mark says the
-// peer passed the live-member, deny and admitted-key checks; the verified
-// cert must name the same node. A forward counts only when the edge said it
-// speaks for the call itself (a local tool's request, cluster.HeaderCaller):
-// a forward that merely lost the user's credential stays a 401.
-func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
+// PAT calls its peers this way. It is node:<peer> with what its admitted
+// role allows (roleOf), the same principal a peer sending the PAT over
+// mTLS gets. The internal listener's mark says the peer passed the
+// live-member, deny and admitted-key checks; the verified cert must name
+// the same node. A forward counts only when the edge said it speaks for
+// the call itself (a local tool's request, cluster.HeaderCaller): a
+// forward that merely lost the user's credential stays a 401.
+func nodeCertAccess(r *http.Request, roleOf func(*http.Request, string) string) (controlplane.Access, bool) {
 	peer, ok := cluster.InternalPeerFromContext(r.Context())
 	if !ok {
 		return controlplane.Access{}, false
@@ -362,10 +391,14 @@ func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
 	if isForwarded(r) && r.Header.Get(cluster.HeaderCaller) != cluster.CallerNode {
 		return controlplane.Access{}, false
 	}
-	if onBehalf := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOf)); onBehalf != "" {
-		return onBehalfAccess(r, peer, onBehalf)
+	role := ""
+	if roleOf != nil {
+		role = roleOf(r, peer)
 	}
-	return controlplane.NodeAccess(peer), true
+	if onBehalf := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOf)); onBehalf != "" {
+		return onBehalfAccess(r, peer, role, onBehalf)
+	}
+	return controlplane.NodeAccess(peer, role), true
 }
 
 // onBehalfAccess is a forward the edge spoke for on behalf of a caller it
@@ -373,7 +406,15 @@ func nodeCertAccess(r *http.Request) (controlplane.Access, bool) {
 // Kubernetes user, C17). The call gets that caller's access, one owner with
 // the runner role, never the node's own: the stamp can only narrow what the
 // edge, a node, could already do. Anything malformed is a 401.
-func onBehalfAccess(r *http.Request, peer, onBehalf string) (controlplane.Access, bool) {
+//
+// Only a node whose role serves that API may speak for its callers: a
+// gateway, which runs it, or a server. A worker's certificate gets only
+// what its role needs, and it serves no caller it could vouch for, so its
+// stamp is a 401 like any other malformed one.
+func onBehalfAccess(r *http.Request, peer, role, onBehalf string) (controlplane.Access, bool) {
+	if role != controlplane.NodeRoleIngress && role != controlplane.NodeRoleServer {
+		return controlplane.Access{}, false
+	}
 	owner := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOwner))
 	name, isKube := strings.CutPrefix(onBehalf, "kubernetes:")
 	if !isForwarded(r) || owner == "" || !isKube || strings.TrimSpace(name) == "" {

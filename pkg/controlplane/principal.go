@@ -111,16 +111,52 @@ func OperatorAccess() Access {
 	}
 }
 
-// NodeAccess is the PAT presented by a cluster peer over mTLS on its own
-// behalf. It has the operator's powers (as today); only the name differs, so
-// audit records say which node acted instead of "operator".
-func NodeAccess(nodeID string) Access {
+// The roles a node principal can carry: the role its node was admitted
+// with (cluster join roles server, worker and ingress; a mixed node is a
+// server). They are strings here because internal/cluster imports this
+// package.
+const (
+	NodeRoleServer  = "server"
+	NodeRoleWorker  = "worker"
+	NodeRoleIngress = "ingress"
+)
+
+// NodeAccess is a cluster peer acting on its own behalf: its node
+// certificate with no bearer, or the PAT over mTLS. role is the role its
+// node was admitted with, as the receiving node reads it (cluster.PeerRole).
+//
+// Node certificates get only what their role needs (least privilege). A
+// server holds the PAT anyway, so a server peer keeps the operator's powers
+// under its own name: audit records say which node acted. Any other role,
+// or a role this node cannot read (""), holds no role at all: only
+// cluster.internal, which every peer needs, and the few routes that grant
+// its role by name (apihttp.Router.RouteForNodes). Fleet stays set: the
+// node-to-node routes act on every team.
+func NodeAccess(nodeID, role string) Access {
 	id := "node:" + nodeID
-	return Access{
+	a := Access{
 		Fleet:     true,
-		Role:      RoleAdmin,
 		Principal: Principal{Kind: PrincipalNode, ID: id, Name: id},
+		NodeRole:  role,
 	}
+	if role == NodeRoleServer {
+		a.Role = RoleAdmin
+	}
+	return a
+}
+
+// NodeLimited reports whether a is a node principal whose role is not
+// server: a worker, a gateway, or a node whose role could not be read.
+func (a Access) NodeLimited() bool {
+	return a.Principal.Kind == PrincipalNode && a.NodeRole != NodeRoleServer
+}
+
+// NodeID is a node principal's node id ("" for any other caller).
+func (a Access) NodeID() string {
+	if a.Principal.Kind != PrincipalNode {
+		return ""
+	}
+	return strings.TrimPrefix(a.Principal.ID, "node:")
 }
 
 // TokenAccess is a scoped API token (avm_…, plans/identity-and-access.md

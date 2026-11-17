@@ -95,11 +95,6 @@ func (h *handlers) refuseNodeTokenWrite(w http.ResponseWriter, r *http.Request, 
 	return true
 }
 
-// tokenServerForwarder is a worker's way to a server (Agent.ForwardToServer).
-type tokenServerForwarder interface {
-	ForwardToServer(http.ResponseWriter, *http.Request)
-}
-
 // forwardTokenWrite sends a caller's token create or revoke on to a server
 // when this node does not write tokens (a worker), so a cluster whose API
 // address reaches only workers can still create and revoke them. Only with
@@ -107,19 +102,10 @@ type tokenServerForwarder interface {
 // and a call that carries none is refused here, never sent as this node.
 // It reports whether it answered.
 func (h *handlers) forwardTokenWrite(w http.ResponseWriter, r *http.Request) bool {
-	if !h.deps.Service.ForwardsAPITokenWrites() {
+	if !h.deps.Service.ForwardsSettingsWrites() {
 		return false
 	}
-	if scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " "); !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(cred) == "" {
-		apihttp.WriteError(w, http.StatusBadRequest, "this worker node sends token writes on to a server with your own credential, and this call carries none: send it with an Authorization header, or to a server or gateway")
-		return true
-	}
-	fw, ok := h.deps.Service.Cluster().(tokenServerForwarder)
-	if !ok {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoServerForward.Error())
-		return true
-	}
-	fw.ForwardToServer(w, r)
+	h.sendToServer(w, r, "token writes")
 	return true
 }
 

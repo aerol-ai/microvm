@@ -596,3 +596,25 @@ func TestAPITokenWritesOnAWorker(t *testing.T) {
 		}
 	}
 }
+
+// Which nodes send their callers' calls on to a server (node certificates
+// get only what their role needs): every node with no Raft state sends the
+// operator calls; only a worker sends the cluster-wide settings writes (a
+// gateway writes those itself). A server and a single node send nothing.
+func TestCallsSentOnToServersByRole(t *testing.T) {
+	for _, tc := range []struct {
+		cfg                config.Config
+		operator, settings bool
+	}{
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker}, true, true},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleIngress}, true, false},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, false, false},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, false, false},
+		{config.Config{NodeRole: config.NodeRoleWorker}, false, false},
+	} {
+		s := &Service{cfg: tc.cfg}
+		if s.SendsOperatorCallsToServers() != tc.operator || s.ForwardsSettingsWrites() != tc.settings {
+			t.Errorf("%+v: operator %v settings %v", tc.cfg.NodeRole, s.SendsOperatorCallsToServers(), s.ForwardsSettingsWrites())
+		}
+	}
+}

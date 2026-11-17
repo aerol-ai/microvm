@@ -76,6 +76,8 @@ func IdentityWriteOutcome(err error) IdentityWriteResponse {
 		return IdentityWriteResponse{Code: identityCodeInvalid, Message: err.Error()}
 	case errors.Is(err, ErrClusterVersion):
 		return IdentityWriteResponse{Code: identityCodeClusterVersion, Message: err.Error()}
+	case errors.Is(err, ErrIdentityWriterRefused):
+		return IdentityWriteResponse{Code: identityCodeWriterRefused, Message: err.Error()}
 	}
 	return IdentityWriteResponse{}
 }
@@ -91,6 +93,8 @@ func (r IdentityWriteResponse) err() error {
 		sentinel = ErrIdentityInvalid
 	case identityCodeClusterVersion:
 		sentinel = ErrClusterVersion
+	case identityCodeWriterRefused:
+		sentinel = ErrIdentityWriterRefused
 	default:
 		return fmt.Errorf("cluster: identity write: %s: %s", r.Code, r.Message)
 	}

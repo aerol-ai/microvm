@@ -500,6 +500,18 @@ func (c *Cluster) liveMemberHoldsID(nodeID, keyHash string) error {
 	return fmt.Errorf("%w: %s is a live member", ErrNodeIDInUse, nodeID)
 }
 
+// JoinTokenManager creates, lists and revokes join tokens. Implemented by
+// Cluster; not part of Client (Noop has no cluster to join). A worker or
+// gateway holds no Raft state, and its own certificate gets only what its
+// role needs, so it sends an operator's join-token call on to a server
+// with the operator's own credential (pkg/api/v1 server_tier.go) and never
+// asks for a token as itself.
+type JoinTokenManager interface {
+	CreateJoinToken(ctx context.Context, req JoinTokenCreateRequest) (JoinTokenCreated, error)
+	ListJoinTokens(ctx context.Context) (JoinTokenList, error)
+	RevokeJoinToken(ctx context.Context, id string) error
+}
+
 // IsJoinWritePeer reports whether peerID may call the join write route: a
 // configured Raft server whose admitted role (when it has one) is server.
 // Workers never propose join state.

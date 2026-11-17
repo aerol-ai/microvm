@@ -84,8 +84,8 @@ func TestClusterInternalNeedsTheNodePrincipal(t *testing.T) {
 	}{
 		"admin token over mTLS": {fleetToken(controlplane.RoleAdmin), "peer-test", http.StatusForbidden},
 		"operator over mTLS":    {controlplane.OperatorAccess(), "peer-test", http.StatusForbidden},
-		"live node":             {controlplane.NodeAccess("peer-test"), "peer-test", http.StatusOK},
-		"node not a member":     {controlplane.NodeAccess("ghost"), "ghost", http.StatusForbidden},
+		"live node":             {controlplane.NodeAccess("peer-test", controlplane.NodeRoleServer), "peer-test", http.StatusOK},
+		"node not a member":     {controlplane.NodeAccess("ghost", controlplane.NodeRoleServer), "ghost", http.StatusForbidden},
 	} {
 		caller = tc.access
 		req := httptest.NewRequest(http.MethodGet, cluster.PublicInternalDrainedNodesPath, nil)
@@ -156,7 +156,7 @@ func TestAuditIdentityKeyForFleetPrincipals(t *testing.T) {
 	if got := key(controlplane.OperatorAccess()); got != auditRateLimitIdentityKey {
 		t.Errorf("operator key = %q", got)
 	}
-	if got := key(controlplane.NodeAccess("n1")); got != auditRateLimitIdentityKey {
+	if got := key(controlplane.NodeAccess("n1", controlplane.NodeRoleServer)); got != auditRateLimitIdentityKey {
 		t.Errorf("node key = %q", got)
 	}
 	if got := key(fleetToken(controlplane.RoleAuditor)); got != "principal:tok_auditor" {

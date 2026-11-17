@@ -56,6 +56,11 @@ func (d Denial) Message() string {
 		return hint
 	}
 	switch {
+	case d.Access.NodeLimited() && d.Permission != controlplane.PermClusterInternal:
+		// Node certificates get only what their role needs. The text names
+		// the node and its role, which the peer already knows, and what to
+		// send instead.
+		return nodeLimitedMessage(d.Access)
 	case teamVerb(d.Permission):
 		return string(d.Permission) + " permission required"
 	case d.Permission == controlplane.PermClusterInternal && d.Access.Principal.Kind == controlplane.PrincipalOperator:
@@ -66,6 +71,17 @@ func (d Denial) Message() string {
 		return "cluster internal endpoints serve cluster nodes only"
 	}
 	return OperatorRequiredMessage
+}
+
+// nodeLimitedMessage is the 403 text for a node principal whose role holds
+// no fleet powers, refused a route that does not grant its role.
+func nodeLimitedMessage(a controlplane.Access) string {
+	role := a.NodeRole
+	if role == "" {
+		role = "unknown"
+	}
+	return a.Principal.ID + " (role " + role + ") may not make this call as itself: a node's certificate reaches only the cluster routes its role needs; " +
+		"send the call with an operator token or a user token, or to a server"
 }
 
 // teamVerb reports whether p was open to every authenticated caller before
@@ -131,7 +147,24 @@ type Router struct {
 
 // Route returns next behind authenticate → authorize(perm) → audit seam.
 func (rt Router) Route(perm controlplane.Permission, next http.Handler) http.Handler {
-	return rt.build(string(perm), func(*http.Request) controlplane.Permission { return perm }, next)
+	return rt.build(string(perm), func(*http.Request) controlplane.Permission { return perm }, nil, next)
+}
+
+// NodeGrant reports whether a node principal whose role holds no fleet
+// powers (controlplane.Access.NodeLimited: a worker, a gateway, or a node
+// of unknown role) may make this request. Node certificates get only what
+// their role needs: such a node holds cluster.internal and nothing else,
+// and a public route it needs says so here, by role and by request (a node
+// acting on itself only, say). It is asked only for such a node, never for
+// any other caller.
+type NodeGrant func(r *http.Request, a controlplane.Access) bool
+
+// RouteForNodes is Route for a public route that some node roles call as
+// themselves: perm decides every other caller, and grant decides a node
+// principal whose role holds no fleet powers. Every grant is a reviewed
+// exception (pkg/api's node grant registry test pins the list).
+func (rt Router) RouteForNodes(perm controlplane.Permission, grant NodeGrant, next http.Handler) http.Handler {
+	return rt.build(string(perm), func(*http.Request) controlplane.Permission { return perm }, grant, next)
 }
 
 // RouteBy is Route for a route whose permission depends on the request:
@@ -141,20 +174,26 @@ func (rt Router) Route(perm controlplane.Permission, next http.Handler) http.Han
 // classify must return a permission for every request; an unknown path
 // should get the strictest team verb, never authenticated.
 func (rt Router) RouteBy(tag string, classify func(*http.Request) controlplane.Permission, next http.Handler) http.Handler {
-	return rt.build(tag, classify, next)
+	return rt.build(tag, classify, nil, next)
 }
 
-func (rt Router) build(tag string, classify func(*http.Request) controlplane.Permission, next http.Handler) http.Handler {
+// RouteByForNodes is RouteBy with a grant to node principals whose role
+// holds no fleet powers (RouteForNodes).
+func (rt Router) RouteByForNodes(tag string, classify func(*http.Request) controlplane.Permission, grant NodeGrant, next http.Handler) http.Handler {
+	return rt.build(tag, classify, grant, next)
+}
+
+func (rt Router) build(tag string, classify func(*http.Request) controlplane.Permission, grant NodeGrant, next http.Handler) http.Handler {
 	deny := rt.Deny
 	if deny == nil {
 		deny = WriteForbidden
 	}
-	authorized := authorize(classify, deny, rt.Audit, next)
+	authorized := authorize(classify, grant, deny, rt.Audit, next)
 	serve := authorized
 	if rt.Authenticate != nil {
 		serve = stampRoutePermission(classify, rt.Authenticate(authorized))
 	}
-	return &RouteHandler{tag: tag, classify: classify, authenticates: rt.Authenticate != nil, serve: serve}
+	return &RouteHandler{tag: tag, classify: classify, grant: grant, authenticates: rt.Authenticate != nil, serve: serve}
 }
 
 // stampRoutePermission puts the route's permission on the request before
@@ -171,7 +210,7 @@ func stampRoutePermission(classify func(*http.Request) controlplane.Permission, 
 // production it always finds the caller's Access. Without an authenticator
 // (unit tests only) it keeps the pre-T2 contract: routes that were behind
 // d.Auth stay open, and the routes the operator gate guarded stay refused.
-func authorize(classify func(*http.Request) controlplane.Permission, deny DenyWriter, audit AuditHook, next http.Handler) http.Handler {
+func authorize(classify func(*http.Request) controlplane.Permission, grant NodeGrant, deny DenyWriter, audit AuditHook, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		perm := classify(r)
 		if span := oteltrace.SpanFromContext(r.Context()); span.IsRecording() {
@@ -182,7 +221,7 @@ func authorize(classify func(*http.Request) controlplane.Permission, deny DenyWr
 		access, ok := controlplane.AccessFromContext(r.Context())
 		call := RouteCall{Permission: perm, Access: access, HasAccess: ok}
 		if ok {
-			call.Allowed = access.Can(perm)
+			call.Allowed = access.Can(perm) || (grant != nil && access.NodeLimited() && grant(r, access))
 		} else {
 			call.Allowed = teamVerb(perm)
 		}
@@ -206,6 +245,7 @@ func authorize(classify func(*http.Request) controlplane.Permission, deny DenyWr
 type RouteHandler struct {
 	tag           string
 	classify      func(*http.Request) controlplane.Permission
+	grant         NodeGrant
 	authenticates bool
 	serve         http.Handler
 }
@@ -221,6 +261,11 @@ func (h *RouteHandler) PermissionFor(r *http.Request) controlplane.Permission { 
 
 // Authenticates reports whether the route authenticates before authorizing.
 func (h *RouteHandler) Authenticates() bool { return h.authenticates }
+
+// NodeGrant is the route's grant to node principals whose role holds no
+// fleet powers (RouteForNodes), or nil: such a node holds only
+// cluster.internal there.
+func (h *RouteHandler) NodeGrant() NodeGrant { return h.grant }
 
 // PreAuth registers a handler that runs checks of its own before handing the
 // request to a Route-built handler, as remote MCP's origin and host checks
