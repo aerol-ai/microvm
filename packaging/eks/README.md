@@ -9,7 +9,7 @@ and installs AerolVM in cluster mode on it. The customer docs are
 | Part | Made by | Notes |
 |---|---|---|
 | VPC, 3 public + 3 private subnets, 1 NAT gateway | CloudFormation | One NAT keeps it cheap; its zone is a single point for outbound traffic. |
-| IAM roles: cluster, node, Karpenter, EBS CSI, installer, helper | CloudFormation | Karpenter's and the installer's delete rights are limited to this cluster's tags. |
+| IAM roles: cluster, node, Karpenter, EBS CSI, installer, helper | CloudFormation | Karpenter's role is its reference policy, limited to this cluster's tags; the installer's delete rights are limited the same way. |
 | EKS cluster, 3 system machines (managed node group), add-ons, access entries | CloudFormation | IMDSv2 with hop limit 1 everywhere. VPC CNI with network policy on. |
 | cert-manager, Karpenter, the worker NodePool, the AerolVM chart | The installer (CodeBuild) | Same steps as `docs/.../kubernetes/production.mdx`. |
 | A first gVisor sandbox, then `aerolvm k8s verify` | The installer | The verify result is the `InstallCheck` output. It does not fail the stack. |

@@ -1,6 +1,8 @@
 package safety
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -339,5 +341,77 @@ func TestEKSStackWorkerTypesHaveSizes(t *testing.T) {
 	}
 	if d := node(stack, "Parameters", "WorkerInstanceType", "Default"); d == nil || !slices.Contains(sizes, d.Value) {
 		t.Errorf("the default worker type has no size")
+	}
+}
+
+// TestEKSStackKarpenterRoleIsScoped keeps Karpenter's role to its reference
+// policy's limits. Karpenter's service account is a pod's credential, so an
+// unscoped write there reaches the whole account: CreateTags on any
+// instance let it tag a stranger's machine as this cluster's and then
+// terminate it, instance-profile writes on any profile could strip the IAM
+// role from unrelated machines, and ssm:GetParameter on "*" reads
+// SecureString secrets.
+func TestEKSStackKarpenterRoleIsScoped(t *testing.T) {
+	policies := node(eksStack(t), "Resources", "KarpenterRole", "Properties", "Policies")
+	if policies == nil || policies.Kind != yaml.SequenceNode || len(policies.Content) == 0 {
+		t.Fatal("KarpenterRole has no inline policies")
+	}
+	type statement struct {
+		Sid       string
+		Effect    string
+		Action    any
+		Resource  any
+		Condition map[string]any
+	}
+	list := func(v any) []string {
+		switch v := v.(type) {
+		case string:
+			return []string{v}
+		case []any:
+			out := make([]string, 0, len(v))
+			for _, s := range v {
+				out = append(out, fmt.Sprint(s))
+			}
+			return out
+		}
+		return nil
+	}
+	readOnly := regexp.MustCompile(`^[a-z0-9-]+:(Describe|Get|List)[A-Za-z]*$`)
+	mustBeConditioned := regexp.MustCompile(`^(ec2:(CreateTags|TerminateInstances|DeleteLaunchTemplate)|iam:(Create|Tag|AddRoleTo|RemoveRoleFrom|Delete)InstanceProfile)$`)
+	seen := 0
+	for _, p := range policies.Content {
+		doc := node(p, "PolicyDocument")
+		if doc == nil {
+			t.Fatal("a KarpenterRole policy has no PolicyDocument")
+		}
+		var body struct{ Statement []statement }
+		if err := json.Unmarshal([]byte(doc.Value), &body); err != nil {
+			t.Fatalf("KarpenterRole policy is not JSON: %v", err)
+		}
+		for _, s := range body.Statement {
+			seen++
+			actions, resources := list(s.Action), list(s.Resource)
+			if s.Effect != "Allow" {
+				continue
+			}
+			for _, a := range actions {
+				if slices.Contains(resources, "*") && !readOnly.MatchString(a) && len(s.Condition) == 0 {
+					t.Errorf("%s: %s on every resource with no condition", s.Sid, a)
+				}
+				if mustBeConditioned.MatchString(a) && len(s.Condition) == 0 {
+					t.Errorf("%s: %s has no condition; limit it to this cluster's tags", s.Sid, a)
+				}
+				if a == "ssm:GetParameter" {
+					for _, r := range resources {
+						if !strings.HasSuffix(r, ":parameter/aws/service/*") {
+							t.Errorf("%s: ssm:GetParameter on %s; Karpenter needs only parameter/aws/service/*", s.Sid, r)
+						}
+					}
+				}
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("KarpenterRole's policies have no statements")
 	}
 }
