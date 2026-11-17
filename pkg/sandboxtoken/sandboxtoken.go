@@ -17,12 +17,15 @@
 //
 // # Keys
 //
-// There is no key store of its own. The signing key is derived (HKDF-SHA256,
-// its own label) from the server key ring that already seals secrets and
-// keys the idempotency digests (pkg/secrets token_keys.go). Every node of a
-// cluster holds the same ring, so every node derives the same key pair and
-// verifies a token any node issued. A key-store revoke drops the ring, and
-// with it every token: nothing signs or verifies until the key is back.
+// There is no key store of its own. On a single node the signing key is
+// derived (HKDF-SHA256, its own label) from the server key ring that
+// already seals secrets and keys the idempotency digests (pkg/secrets
+// token_keys.go). In a cluster whose servers sign, the key is derived from
+// a seed only servers hold (secrets.ServerTokenKey), and the other nodes
+// check tokens with its public half (internal/service server_signing.go).
+// The token names its key either way (kid). A key-store revoke drops the
+// ring, and with it every token: nothing signs or verifies until the key
+// is back.
 //
 // # Threat model
 //

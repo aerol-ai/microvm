@@ -26,6 +26,11 @@ type signingServer struct {
 	leader     bool
 	placements map[string]cluster.Placement
 	writes     int
+	// waiting is the gate's list of members; forced records a write past it.
+	waiting []string
+	forced  bool
+	// endAt is the leader's clock for an end of old tokens.
+	endAt int64
 }
 
 func newSigningServer(id string) *signingServer {
@@ -41,14 +46,30 @@ func (c *signingServer) ServerSigningRecord() (cluster.ServerSigning, bool) {
 	return *c.rec, true
 }
 
-func (c *signingServer) ServerSigningAllowed() bool { return c.allowed }
-func (c *signingServer) IsLeader() bool             { return c.leader }
+func (c *signingServer) ServerSigningGate(force bool) cluster.ServerSigningGate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	g := cluster.ServerSigningGate{ActiveFV: cluster.ServerSigningFSMOpsVersion, Waiting: c.waiting, RolesInCertificates: true, Allowed: c.allowed || force}
+	if !g.Allowed {
+		g.Reason = "held for the test"
+	}
+	return g
+}
+func (c *signingServer) IsLeader() bool { return c.leader }
 
-func (c *signingServer) WriteServerSigning(_ context.Context, w cluster.ServerSigningWrite) (cluster.ServerSigning, error) {
+func (c *signingServer) WriteServerSigning(_ context.Context, w cluster.ServerSigningWrite, force bool) (cluster.ServerSigning, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.writes++
+	c.forced = c.forced || force
 	switch {
+	case w.EndOldTokens:
+		if c.rec == nil {
+			return cluster.ServerSigning{}, cluster.ErrServerSigningConflict
+		}
+		if c.rec.OldTokensEndUnixNano == 0 {
+			c.rec.OldTokensEndUnixNano = max(c.endAt, c.rec.SinceUnixNano)
+		}
 	case c.rec == nil && len(w.Expect) == 0:
 		rec := w.Signing
 		c.rec = &rec
@@ -315,33 +336,42 @@ func TestSigningKeyMirror(t *testing.T) {
 	feed := cluster.SigningKeys{SinceUnixNano: 5, TokenKeys: map[uint32][]byte{secrets.ServerKeyIDBit | 1: make([]byte, 32), 7: make([]byte, 32), secrets.ServerKeyIDBit | 2: []byte("short")}}
 	var fail error
 	m := &signingKeyMirror{fetch: func(context.Context) (cluster.SigningKeys, error) { reads++; return feed, fail }, now: func() time.Time { return now }}
-	known, since, pub := m.state(secrets.ServerKeyIDBit | 1)
-	if !known || since != 5 || pub == nil || reads != 1 {
-		t.Fatalf("first read: %v %d %v %d", known, since, pub, reads)
+	v := m.view(secrets.ServerKeyIDBit | 1)
+	if !v.mode.known || v.mode.since != 5 || v.key == nil || reads != 1 {
+		t.Fatalf("first read: %+v %d", v, reads)
 	}
 	if m.keys[7] != nil || m.keys[secrets.ServerKeyIDBit|2] != nil {
 		t.Fatal("kept a ring id or a short key")
 	}
-	m.state(secrets.ServerKeyIDBit | 9)
-	m.state(secrets.ServerKeyIDBit | 9)
+	m.view(secrets.ServerKeyIDBit | 9)
+	m.view(secrets.ServerKeyIDBit | 9)
 	if reads != 1 {
 		t.Fatalf("unknown key inside the window read %d times", reads)
 	}
 	now = now.Add(signingKeysRetryWait)
-	m.state(secrets.ServerKeyIDBit | 9)
+	m.view(secrets.ServerKeyIDBit | 9)
 	if reads != 2 {
 		t.Fatalf("unknown key after the window: %d reads", reads)
 	}
-	// A server behind the others (Since 0) never takes the mode back.
+	// A server behind the others (Since 0) never takes the mode back, nor
+	// the end of old tokens.
+	feed.SinceUnixNano, feed.OldTokensEndUnixNano = 7, 9
+	now = now.Add(signingKeysRetryWait)
+	m.view(secrets.ServerKeyIDBit | 9)
+	feed.OldTokensEndUnixNano = 0
+	now = now.Add(signingKeysRetryWait)
+	if v := m.view(secrets.ServerKeyIDBit | 9); v.mode.since != 7 || v.mode.oldTokensEnd != 9 {
+		t.Fatalf("the end went back: %+v", v.mode)
+	}
 	feed.SinceUnixNano = 0
 	now = now.Add(signingKeysRetryWait)
-	if _, since, _ := m.state(secrets.ServerKeyIDBit | 9); since != 5 {
-		t.Fatalf("since went back to %d", since)
+	if v := m.view(secrets.ServerKeyIDBit | 9); v.mode.since != 7 || v.mode.oldTokensEnd != 9 {
+		t.Fatalf("went back to %+v", v.mode)
 	}
 	// A failed read keeps what is known.
 	fail = errors.New("down")
 	now = now.Add(signingKeysRetryWait)
-	if known, since, _ := m.state(secrets.ServerKeyIDBit | 9); !known || since != 5 {
+	if v := m.view(secrets.ServerKeyIDBit | 9); !v.mode.known || v.mode.since != 7 {
 		t.Fatal("a failed read lost the state")
 	}
 }

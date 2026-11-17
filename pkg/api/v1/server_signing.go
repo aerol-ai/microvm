@@ -1,18 +1,15 @@
 package v1
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
-	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // The node-to-node routes of signing only servers do (least privilege;
@@ -83,26 +80,58 @@ func signStatus(err error) int {
 	return http.StatusServiceUnavailable
 }
 
-// identityCreateGoesToServer reports whether a create this node received
-// asks for a cloud identity once servers sign: a server places it then,
-// because only a server puts an identity into a placement's spec
-// (cluster/peer_proposals.go), and a server signs the sandbox's tokens from
-// it. A create a server already placed and sent here (the create target
-// header) stays. The body is read once and put back for the handler.
-func (h *handlers) identityCreateGoesToServer(r *http.Request) bool {
-	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) != "" || !h.deps.Service.ServerSigningOn() {
-		return false
+// clusterServerSigning answers whether only servers sign yet, and serves
+// the operator's two calls on it (upgradewire.ClusterUpgradeSigningPath),
+// on the leader: the gate reads the leader's view of the members, and only
+// the leader writes the record. The calls are audited as upgrade calls.
+func (h *handlers) clusterServerSigning(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.onLeader(w, r); !ok {
+		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, apihttp.MaxJSONBodyBytes+1))
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	svc := h.deps.Service
+	var err error
+	route := ""
+	switch r.URL.Path {
+	case upgradewire.ClusterUpgradeSigningStartPath:
+		route = "signing-start"
+		_, err = svc.StartServerSigning(r.Context())
+	case upgradewire.ClusterUpgradeSigningEndOldTokensPath:
+		route = "signing-end-old-tokens"
+		_, err = svc.EndOldSandboxTokens(r.Context())
+	}
+	if route != "" {
+		h.auditUpgrade(r, route, "", err)
+	}
+	if errors.Is(err, service.ErrServerSigningOff) {
+		writeUpgradeError(w, http.StatusConflict, "server_signing_off", "servers do not sign yet: there are no old tokens to end", "aerolvm upgrade signing")
+		return
+	}
 	if err != nil {
-		return false
+		writeRolloutError(w, err)
+		return
 	}
-	var probe struct {
-		Identity json.RawMessage `json:"identity"`
+	rec, g, on, err := svc.ServerSigningStatus()
+	if err != nil {
+		writeRolloutError(w, err)
+		return
 	}
-	if json.Unmarshal(body, &probe) != nil {
-		return false
+	apihttp.WriteJSON(w, http.StatusOK, serverSigningStatusView(rec, g, on))
+}
+
+// serverSigningStatusView renders the record and the gate.
+func serverSigningStatusView(rec cluster.ServerSigning, g cluster.ServerSigningGate, on bool) upgradewire.ServerSigningStatus {
+	out := upgradewire.ServerSigningStatus{On: on, ActiveFSMOpsVersion: g.ActiveFV, NeedsFSMOpsVersion: cluster.ServerSigningFSMOpsVersion, Waiting: g.Waiting}
+	at := func(n int64) *time.Time {
+		if n <= 0 {
+			return nil
+		}
+		t := time.Unix(0, n).UTC()
+		return &t
 	}
-	return len(probe.Identity) > 0 && string(probe.Identity) != "null"
+	if on {
+		out.Since, out.OldTokensEnd = at(rec.SinceUnixNano), at(rec.OldTokensEndUnixNano)
+	} else if !g.Allowed {
+		out.Blocked = g.Reason
+	}
+	return out
 }

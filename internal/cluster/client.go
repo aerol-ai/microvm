@@ -75,6 +75,8 @@ type Cluster struct {
 	// transport (via raftSetupConfig.TLS) and the internal HTTPS listener.
 	// Configuration validation requires TLS in cluster mode.
 	tls *ClusterTLS
+	// selfCertRole replaces tls.SelfRole in tests; nil in production.
+	selfCertRole func() string
 	// internalServer is the mTLS HTTPS listener that accepts leader-forwarded
 	// raft applies from peers. nil when tls is nil. Owned by Close.
 	internalServer *internalServer

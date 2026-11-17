@@ -152,7 +152,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// POST /sandboxes is special: placement happens in the wrapper before any
 	// local handler runs. The wrapper falls through to createSandbox when this
 	// node is the chosen owner.
-	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Route(permWrite, h.viaServers(h.identityCreateGoesToServer, http.HandlerFunc(h.clusterCreateWrap))))
+	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Route(permWrite, http.HandlerFunc(h.clusterCreateWrap)))
 	// GET /sandboxes is cluster-wide: clusterListWrap fans out to peers and
 	// merges with the local list so the "any node accepts any request"
 	// invariant covers list, not just per-sandbox routes. Single-node and
@@ -368,6 +368,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("PUT "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
 	mux.Handle("HEAD "+upgradewire.ClusterUpgradeFilesPath+"/{sha256}", op(http.HandlerFunc(h.clusterUpgradeFile)))
 	mux.Handle("POST "+upgradewire.ClusterLeaderTransferPath, op(http.HandlerFunc(h.clusterLeaderTransfer)))
+	mux.Handle("GET "+upgradewire.ClusterUpgradeSigningPath, op(http.HandlerFunc(h.clusterServerSigning)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeSigningStartPath, op(http.HandlerFunc(h.clusterServerSigning)))
+	mux.Handle("POST "+upgradewire.ClusterUpgradeSigningEndOldTokensPath, op(http.HandlerFunc(h.clusterServerSigning)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.NodeUpgradeStepSuffix, internalOp(http.HandlerFunc(h.clusterNodeUpgradeStep)))
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}"+cluster.MoveSuffix, internalOp(http.HandlerFunc(h.clusterNodeMove)))
 	mux.Handle("GET "+cluster.PublicInternalMovePath+"{id}/bundle", internalOp(http.HandlerFunc(h.clusterInternalMoveBundle)))

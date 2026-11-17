@@ -57,9 +57,10 @@ func (s *Service) SSHKeyMatches(ctx context.Context, sandboxID, fingerprint stri
 }
 
 // CheckSSHBridgeKey refuses a bridged call that does not name the
-// sandbox's key, once every member runs a build that names it.
+// sandbox's key, once every member runs a build that names it, or while
+// this owner cannot tell whether they all do (it fails closed).
 func (s *Service) CheckSSHBridgeKey(ctx context.Context, sandboxID, fingerprint string) error {
-	if strings.TrimSpace(fingerprint) == "" && !s.ServerSigningOn() {
+	if strings.TrimSpace(fingerprint) == "" && !s.serversMaySign() {
 		return nil
 	}
 	ok, err := s.SSHKeyMatches(ctx, sandboxID, fingerprint)
@@ -74,7 +75,8 @@ func (s *Service) CheckSSHBridgeKey(ctx context.Context, sandboxID, fingerprint 
 
 // KeepsSSHKeyFrom reports whether a node caller's sandbox read keeps the
 // sandbox's SSH key: only an older gateway's, which checks the key itself,
-// while one may still be running (offered says the caller is new).
+// while one may still be running (offered says the caller is new). An
+// owner that cannot tell whether one may sends no key.
 func (s *Service) KeepsSSHKeyFrom(offered bool) bool {
-	return !offered && !s.ServerSigningOn()
+	return !offered && !s.serversMaySign()
 }

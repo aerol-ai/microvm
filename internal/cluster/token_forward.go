@@ -23,6 +23,10 @@ import (
 // server.
 var ErrNoServerForward = errors.New("cluster: no server to send the call to")
 
+// ErrPeerCertNotServer is a peer whose certificate does not name the server
+// role (ServerClientForPeer): the handshake fails before anything is sent.
+var ErrPeerCertNotServer = errors.New("cluster tls: the peer's certificate is not a server's")
+
 // ServerClientForPeer is ClientForPeer that also requires the peer's
 // certificate to name the server role (DNS:role:server). A caller's
 // credential is forwarded only to a node that proves it is a server, never
@@ -50,7 +54,7 @@ func ServerClientForPeer(base *http.Client, nodeID string) *http.Client {
 			return fmt.Errorf("cluster tls: parse peer certificate: %w", err)
 		}
 		if role := ExtractPeerRole(cert); role != JoinRoleServer {
-			return fmt.Errorf("cluster tls: node:%s holds a %q certificate, not a server's", strings.TrimSpace(nodeID), role)
+			return fmt.Errorf("%w: node:%s holds a %q certificate", ErrPeerCertNotServer, strings.TrimSpace(nodeID), role)
 		}
 		return nil
 	}

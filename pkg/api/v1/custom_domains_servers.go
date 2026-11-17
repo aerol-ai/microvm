@@ -51,8 +51,15 @@ func (h *handlers) attachGoesToServer(r *http.Request) bool {
 // createGoesToServer reports whether this worker or gateway sends a create
 // to a server: one with custom_domains that no node placed yet.
 func (h *handlers) createGoesToServer(r *http.Request, req models.CreateSandboxRequest) bool {
-	return len(req.CustomDomains) > 0 && h.deps.Service != nil && h.deps.Service.SendsOperatorCallsToServers() &&
-		strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" && !isForward(r)
+	if h.deps.Service == nil || !h.deps.Service.SendsOperatorCallsToServers() ||
+		strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) != "" || isForward(r) {
+		return false
+	}
+	// Once servers sign, a cloud identity in a placement's spec is what a
+	// server signs the sandbox's tokens from, so only a server puts one
+	// there (cluster peer_proposals.go): a create that asks for one goes
+	// to a server too. Only such a create reads the signing mode.
+	return len(req.CustomDomains) > 0 || (req.Identity != nil && h.deps.Service.ServerSigningOn())
 }
 
 // asEdge returns r as this server's own edge call when a worker or gateway

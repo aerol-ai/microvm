@@ -11,7 +11,7 @@ import (
 )
 
 // TestRolloutAlertRules lints the rollout alert group
-// (plans/kubectl-style-cluster-ops.md §10.1): the four alerts exist with
+// (plans/kubectl-style-cluster-ops.md §10.1): the five alerts exist with
 // their severities, every rule is complete, every metric it queries is
 // registered in the Go tree, labels are the positional key an expvar map
 // exports, and every runbook_url lands on a heading of
@@ -41,6 +41,7 @@ func TestRolloutAlertRules(t *testing.T) {
 		"SandboxdRolloutStuck":             "warning",
 		"SandboxdRolloutNodeWaiting":       "warning",
 		"SandboxdMemberBelowActiveVersion": "warning",
+		"SandboxdServerSigningHeld":        "warning",
 	}
 	registered := goMetricLiterals(t, root)
 	metricRE := regexp.MustCompile(`aerolvm_[a-z0-9_]+`)

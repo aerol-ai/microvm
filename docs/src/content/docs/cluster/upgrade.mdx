@@ -96,10 +96,11 @@ On each node, `sandboxd` stops for a few seconds while it swaps its files. The s
 | Attached cloud storage | Keeps working. |
 | The node's API | Down for a few seconds. Calls to that node fail for that time. |
 
-Four things to know:
+Five things to know:
 
 - **Upgrade every worker and ingress node.** The checks between nodes apply in full once all nodes run this release. Until an ingress node or worker is upgraded, adding a custom domain through it, or creating a sandbox with `custom_domains` through it, fails with `403`: send that call to a server. A reservation an earlier leader made waits out its time limit, about 120 seconds. The [node certificates](/cluster/security/#which-nodes-hold-the-admin-token) page has more.
-- **When the upgrade finalizes, the servers start signing.** Two minutes later they sign every new [sandbox token](/sandbox-tokens/) and cloud identity token. Tokens made before that keep working until they expire. From then on, a create that names a [platform volume](/platform-volumes/) goes through a server, so give the servers the same volume settings as the workers before you finalize. A node on an earlier release cannot check the tokens the servers sign, which is one more reason `rollback` stops working at finalize (below).
+- **When the upgrade finalizes, the servers start signing.** Two minutes later they sign every new [sandbox token](/sandbox-tokens/) and cloud identity token. Tokens made before that keep working until they expire, at most `SB_SANDBOX_TOKEN_MAX_TTL` (24 hours by default) later. Run `aerolvm upgrade signing end-old-tokens` to end them sooner. From then on, a create that names a [platform volume](/platform-volumes/) goes through a server, so give the servers the same volume settings as the workers before you finalize. `aerolvm upgrade signing` shows whether the servers sign yet, and which nodes hold it back.
+- **There is no way back once the servers sign.** An older release cannot check the tokens the servers sign, cannot open the cloud identity key the servers hold, and forgets the servers' signing seed. Going back would break every token the servers signed, and an upgrade after that would start over with a new seed. Fix forward instead. A node that was down when the servers took over and comes back on its old release keeps the old token and SSH rules for the sandboxes it runs, and the `SandboxdMemberBelowActiveVersion` alert fires for it: upgrade it, or [drain](/cluster/nodes/#empty-a-node) and delete it.
 - **The first upgrade from a release before v0.7.0** restarts WebAssembly and V8 isolate sandboxes once. A WebAssembly sandbox keeps its files. An isolate starts fresh on its next request. To avoid that, [drain](/cluster/nodes/#empty-a-node) the node first.
 - **The helper inside a running sandbox stays the old one.** Sandboxes you create after the upgrade get the new one.
 
@@ -116,6 +117,8 @@ With DNS records alone, visitors that DNS sends to a node while it restarts get 
 | Go on after a stop, or after a failed node is fixed | `aerolvm upgrade apply v0.7.1 --wait` again, with the same version |
 | Put every node back on the old version | `aerolvm upgrade rollback --wait` |
 | Upgrade more workers at a time | `aerolvm upgrade apply v0.7.1 --batch 25%` |
+| See whether only servers sign tokens yet, and what holds it back | `aerolvm upgrade signing` |
+| End the tokens made before the servers signed | `aerolvm upgrade signing end-old-tokens` |
 
 Each of these is safe to run again.
 

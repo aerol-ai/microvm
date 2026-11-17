@@ -117,6 +117,23 @@ type ClusterTLS struct {
 	nodeID string
 }
 
+// SelfRole is the role this node's own certificate names
+// (ExtractPeerRole), "" when it names none or cannot be read.
+func (t *ClusterTLS) SelfRole() string {
+	if t == nil {
+		return ""
+	}
+	cert, err := t.certificateForHandshake()
+	if err != nil {
+		return ""
+	}
+	leaf, err := leafCertificate(cert)
+	if err != nil {
+		return ""
+	}
+	return ExtractPeerRole(leaf)
+}
+
 // NodeID returns the node-bound identity extracted from the local node cert.
 func (t *ClusterTLS) NodeID() string {
 	if t == nil {

@@ -29,9 +29,11 @@ type signingServerStub struct {
 func (s *signingServerStub) ServerSigningRecord() (cluster.ServerSigning, bool) {
 	return cluster.ServerSigning{Sealed: []byte("x"), SinceUnixNano: 1}, true
 }
-func (s *signingServerStub) ServerSigningAllowed() bool { return true }
-func (s *signingServerStub) IsLeader() bool             { return true }
-func (s *signingServerStub) WriteServerSigning(context.Context, cluster.ServerSigningWrite) (cluster.ServerSigning, error) {
+func (s *signingServerStub) ServerSigningGate(bool) cluster.ServerSigningGate {
+	return cluster.ServerSigningGate{Allowed: true}
+}
+func (s *signingServerStub) IsLeader() bool { return true }
+func (s *signingServerStub) WriteServerSigning(context.Context, cluster.ServerSigningWrite, bool) (cluster.ServerSigning, error) {
 	return cluster.ServerSigning{}, errors.New("not here")
 }
 

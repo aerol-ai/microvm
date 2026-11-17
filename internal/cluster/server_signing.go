@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,9 @@ const (
 type SigningKeys struct {
 	SinceUnixNano int64             `json:"since_unix_nano"`
 	TokenKeys     map[uint32][]byte `json:"token_keys,omitempty"`
+	// OldTokensEndUnixNano is the record's (ServerSigning): once set, no
+	// token signed the old way counts.
+	OldTokensEndUnixNano int64 `json:"old_tokens_end_unix_nano,omitempty"`
 }
 
 // SandboxTokenSignRequest is a token's claims, as the sandbox's owner made
@@ -65,26 +69,105 @@ func (c *Cluster) ServerSigningRecord() (ServerSigning, bool) {
 	return c.fsm.serverSigningRecord()
 }
 
-// ServerSigningAllowed reports whether the record may be written: every
-// member runs a build that verifies what servers sign. Two views must agree:
-// the active cluster version (Raft-backed, forward-only, so a rollout that
-// could still roll back has not reached it), and every live member's
-// gossiped version, because the active version's first write ever counts
-// only the servers (active_version.go), which an old worker would not.
+// ServerSigningGate is whether the leader may write the record, and why
+// not; once it may, Waiting is for the operator to see.
+type ServerSigningGate struct {
+	// ActiveFV is the active cluster version's fv (0: never written).
+	ActiveFV int
+	// FirstWrite: the active version is its first write, which counted
+	// only the servers (active_version.go).
+	FirstWrite bool
+	// Waiting names the live members that report a version below the one
+	// servers sign from, or none at all (0: their meta is not seen).
+	Waiting []string
+	// RolesInCertificates is whether this server's certificate names its
+	// role: in a cluster signed before roles, no peer can prove it is a
+	// server, so servers never take over.
+	RolesInCertificates bool
+	// Allowed and, when not, Reason.
+	Allowed bool
+	Reason  string
+}
+
+// ServerSigningGate reads the gate. The record is written once the active
+// cluster version reaches serverSigningFSMOpsVersion: Raft-backed and
+// forward-only, it moves there only when a rollout that brought every
+// member is finalized, or once every live member reports it (no rollout),
+// so every member verifies what servers sign. Gossip, each member's own
+// word, does not hold it then; its laggards are listed (Waiting) and
+// alerted on (membersBelowActive). The one exception is the active
+// version's first write, which counts only the servers: then every live
+// member must report the version too, or the operator starts it anyway
+// (force; aerolvm upgrade signing start).
+func (c *Cluster) ServerSigningGate(force bool) ServerSigningGate {
+	g := ServerSigningGate{RolesInCertificates: c.certNamesServerRole()}
+	if c == nil || c.fsm == nil {
+		g.Reason = "no cluster"
+		return g
+	}
+	g.ActiveFV = c.fsm.activeFVValue()
+	if av, ok := c.fsm.activeVersionView(); ok {
+		g.FirstWrite = av.FromFV == 0 && strings.TrimSpace(av.RolloutID) == ""
+	}
+	g.Waiting = c.membersBelow(serverSigningFSMOpsVersion)
+	switch {
+	case g.ActiveFV < serverSigningFSMOpsVersion:
+		g.Reason = fmt.Sprintf("the active cluster version is %d; servers sign from %d: finish the upgrade (aerolvm upgrade finalize)", g.ActiveFV, serverSigningFSMOpsVersion)
+	case !g.RolesInCertificates:
+		g.Reason = "this cluster's certificates name no role, so no node can prove a server is one: tokens are signed as before"
+	case g.FirstWrite && len(g.Waiting) > 0 && !force:
+		g.Reason = fmt.Sprintf("these members report a version below %d, or none: %s; upgrade them, or start server signing anyway (aerolvm upgrade signing start)",
+			serverSigningFSMOpsVersion, strings.Join(g.Waiting, ", "))
+	default:
+		g.Allowed = true
+	}
+	return g
+}
+
+// ServerSigningAllowed reports whether the record may be written now.
 func (c *Cluster) ServerSigningAllowed() bool {
-	return c != nil && c.fsm != nil && c.fsm.activeFVValue() >= serverSigningFSMOpsVersion &&
-		c.gossip.liveMembersAtLeast(serverSigningFSMOpsVersion)
+	return c.ServerSigningGate(false).Allowed
+}
+
+// certNamesServerRole reports whether this node's certificate names the
+// server role. A cluster with no TLS (tests) counts as one that does.
+func (c *Cluster) certNamesServerRole() bool {
+	if c == nil {
+		return false
+	}
+	if c.selfCertRole != nil {
+		return c.selfCertRole() == JoinRoleServer
+	}
+	return c.tls == nil || c.tls.SelfRole() == JoinRoleServer
+}
+
+// membersBelow names the live members that report an fv below v, or none
+// (0), sorted.
+func (c *Cluster) membersBelow(v int) []string {
+	if c == nil || c.gossip == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range c.gossip.members() {
+		if m.Alive && m.NodeID != c.nodeID && m.FSMOpsVersion < v {
+			out = append(out, m.NodeID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // WriteServerSigning proposes a write of the record on this leader: the
 // first write, or a reseal. Only the leader writes it; another server
 // answers ErrNotLeader and the caller retries on its next pass.
-func (c *Cluster) WriteServerSigning(ctx context.Context, w ServerSigningWrite) (ServerSigning, error) {
+func (c *Cluster) WriteServerSigning(ctx context.Context, w ServerSigningWrite, force bool) (ServerSigning, error) {
 	if !c.IsLeader() {
 		return ServerSigning{}, ErrNotLeader
 	}
-	if len(w.Expect) == 0 && !c.ServerSigningAllowed() {
-		return ServerSigning{}, fmt.Errorf("%w: the active cluster version is below %d", ErrClusterVersion, serverSigningFSMOpsVersion)
+	if len(w.Expect) == 0 && !w.EndOldTokens {
+		if g := c.ServerSigningGate(force); !g.Allowed {
+			return ServerSigning{}, fmt.Errorf("%w: %s", ErrClusterVersion, g.Reason)
+		}
 	}
 	payload, err := encodeCommand(command{Op: opPutServerSigning, StampUnixNano: time.Now().UnixNano(), ServerSigning: &w})
 	if err != nil {
@@ -98,11 +181,64 @@ func (c *Cluster) WriteServerSigning(ctx context.Context, w ServerSigningWrite) 
 	return out.Record, nil
 }
 
+// The feed and the two sign calls go only to a peer whose certificate
+// names the server role (ServerClientForPeer): the feed says which keys
+// this node takes tokens signed with, so it is never read from a member
+// that only says it is a server in gossip. In a cluster whose certificates
+// name no role (signed by cluster-sign-node.sh), no peer proves it, and
+// the leader never writes the record either (Cluster.ServerSigningAllowed):
+// tokens are signed as before.
+
+// doServerJSON is doControlPlaneJSON to the server-role members that prove
+// it. A peer that does not, or cannot be reached, is skipped for the next:
+// the handshake fails before the request is sent.
+func (a *Agent) doServerJSON(ctx context.Context, method, path string, in, out any) error {
+	var body []byte
+	if in != nil {
+		var err error
+		if body, err = json.Marshal(in); err != nil {
+			return err
+		}
+	}
+	members := a.controlPlaneMembers()
+	if len(members) == 0 {
+		a.logNoControlPlaneMembers(method, path, path)
+		return errors.New("cluster agent: no live server-role control-plane members")
+	}
+	var firstErr error
+	for _, m := range members {
+		err := a.tryServerMember(ctx, m, method, path, body, out)
+		if err == nil {
+			a.contact.record(time.Now())
+			return nil
+		}
+		if firstErr == nil || errors.Is(firstErr, ErrPeerCertNotServer) {
+			firstErr = err
+		}
+		if errors.Is(err, ErrPeerCertNotServer) || isStatus(err, http.StatusServiceUnavailable) || errors.Is(err, ErrNotLeader) || neverReachedPeer(err) {
+			continue
+		}
+		return err
+	}
+	return firstErr
+}
+
+func (a *Agent) tryServerMember(ctx context.Context, m Member, method, path string, body []byte, out any) error {
+	if a.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
+		return ErrPeerInternalURLRequired
+	}
+	client := a.serverClients.getWith(a.internalClient, m.NodeID, ServerClientForPeer)
+	if client == nil || client == a.internalClient {
+		return fmt.Errorf("%w: no pinned client for node:%s", ErrPeerCertNotServer, m.NodeID)
+	}
+	return a.doHTTPRequest(ctx, client, strings.TrimRight(m.InternalURL, "/")+path, method, body, out)
+}
+
 // FetchSigningKeys asks the server tier for the feed. A server tier from
 // before it answers 404: no record anywhere, the ring signs.
 func (a *Agent) FetchSigningKeys(ctx context.Context) (SigningKeys, error) {
 	var out SigningKeys
-	err := a.doControlPlaneJSON(ctx, http.MethodGet, PublicInternalSigningKeysPath, PublicInternalSigningKeysPath, nil, &out)
+	err := a.doServerJSON(ctx, http.MethodGet, PublicInternalSigningKeysPath, nil, &out)
 	if isStatus(err, http.StatusNotFound) {
 		return SigningKeys{}, nil
 	}
@@ -112,7 +248,7 @@ func (a *Agent) FetchSigningKeys(ctx context.Context) (SigningKeys, error) {
 // SignSandboxToken has a server sign claims for a sandbox this node owns.
 func (a *Agent) SignSandboxToken(ctx context.Context, req SandboxTokenSignRequest) (SandboxTokenSignResponse, error) {
 	var out SandboxTokenSignResponse
-	err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalSandboxTokenSignPath, PublicInternalSandboxTokenSignPath, req, &out)
+	err := a.doServerJSON(ctx, http.MethodPost, PublicInternalSandboxTokenSignPath, req, &out)
 	return out, err
 }
 
@@ -125,7 +261,7 @@ var ErrIdentityRoleGone = errors.New("cluster: the role tag is no longer allowed
 func (a *Agent) SignIdentityToken(ctx context.Context, req IdentityTokenSignRequest) (IdentityTokenSignResponse, error) {
 	var out IdentityTokenSignResponse
 	req.SandboxID = strings.TrimSpace(req.SandboxID)
-	err := a.doControlPlaneJSON(ctx, http.MethodPost, PublicInternalIdentityTokenSignPath, PublicInternalIdentityTokenSignPath, req, &out)
+	err := a.doServerJSON(ctx, http.MethodPost, PublicInternalIdentityTokenSignPath, req, &out)
 	if isStatus(err, http.StatusGone) {
 		return out, fmt.Errorf("%w: %v", ErrIdentityRoleGone, err)
 	}

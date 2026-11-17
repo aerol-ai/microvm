@@ -281,10 +281,15 @@ Making a token needs the `sandbox.exec` permission on that sandbox: the `runner`
 
 ## For server operators
 
-There is no separate key store for tokens. Each token is signed with an Ed25519 key that every server works out from its **server key** (the key that also seals secrets). Every server of a cluster holds the same server key, so a token made through one server works through every other.
+There is no separate key store for tokens. A single node signs each token with an Ed25519 key it works out from its **server key** (the key that also seals secrets).
 
-- **In a cluster, only servers sign.** Once every node runs this release, the servers sign tokens with a key only servers hold. A worker or ingress node asks a server to sign each new token, and it checks tokens with the servers' public keys, which it fetches and keeps. The servers start two minutes after the last node is upgraded. Tokens made before then keep working until they expire.
-- **A worker that cannot reach a server** keeps checking tokens with the public keys it already has, so tokens already made keep working. A worker that restarts while no server answers refuses tokens until it reaches one. Making a new token always needs a server.
+In a cluster, only servers sign. The servers share a signing seed that only they hold, and work out the token keys from it. A worker or ingress node asks a server to sign each new token, and checks tokens with the servers' public keys, which it reads from the servers every 30 seconds.
+
+- **When servers take over.** Two minutes after the cluster version reaches 22: after `aerolvm upgrade finalize`, or once every live node runs the new release. `aerolvm upgrade signing` shows whether they have, since when, and which nodes hold it back. If the cluster had no cluster version before this release, every live node must also report the new release; `aerolvm upgrade signing start` starts it anyway.
+- **Tokens made before then** keep working until they expire, at most `SB_SANDBOX_TOKEN_MAX_TTL` after the servers took over. To end them all at once, run `aerolvm upgrade signing end-old-tokens` once you no longer need them. Both calls are recorded in the audit log.
+- **Clusters whose node certificates name no role** (signed with `cluster-sign-node.sh` before roles existed) cannot prove which node is a server, so servers never take over there: tokens are signed as before. Nodes that joined with a join token have roles.
+- **A worker that cannot reach a server** keeps checking tokens with the public keys it already has, so tokens already made keep working. If it last read that servers did not sign yet, and that read is more than a minute old, it takes only tokens made before servers could have taken over, until a server answers. A worker that restarts while no server answers refuses tokens until it reaches one. Making a new token always needs a server.
+- **No way back.** Once servers sign, do not roll the cluster back to an older release: an older node cannot check the tokens servers signed. See [Upgrade a cluster](/cluster/upgrade/).
 - **Key rotation.** After `sandboxd key rotate --promote`, new tokens are signed with the new key and old tokens keep working. Retiring the old key ends every token it signed, so wait at least `SB_SANDBOX_TOKEN_MAX_TTL` after the promote before you retire. See [Key custody](/enterprise/key-custody/).
 - **Key revoke.** If your key store revokes the server key, no token works until the key is back.
 - **Setting.** `SB_SANDBOX_TOKEN_MAX_TTL` caps a token's lifetime. Default `24h`, at most `720h` (30 days).

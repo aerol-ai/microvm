@@ -1225,6 +1225,8 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			// Preserve the previously-replicated spec — never erase it via a
 			// later opPlace that omits the payload.
 			spec = existing.Spec
+		} else if exists {
+			spec = f.specKeepingIdentityLocked(cmd.Spec, existing.Spec)
 		}
 		// Same preservation rule as Spec: a partial replay must not erase the
 		// secret provider handle the original create stored.
@@ -1674,7 +1676,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.claimNameLocked(cmd.SandboxID, newName)
 			}
 			existing.Name = newName
-			existing.Spec = cmd.Spec
+			existing.Spec = f.specKeepingIdentityLocked(cmd.Spec, existing.Spec)
 		}
 		if cmd.hasSecretUpdate() {
 			secrets := applyCommandSecretUpdate(existing, true, cmd)
@@ -1734,7 +1736,7 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 				f.claimNameLocked(cmd.SandboxID, newName)
 			}
 			existing.Name = newName
-			existing.Spec = cmd.Spec
+			existing.Spec = f.specKeepingIdentityLocked(cmd.Spec, existing.Spec)
 		}
 		// Replace the provider handle only when the caller supplied one.
 		// Resize / lifecycle write-throughs leave it empty, preserving the

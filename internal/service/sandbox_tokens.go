@@ -237,7 +237,7 @@ func (s *Service) VerifySandboxToken(raw string) (sandboxtoken.Claims, error) {
 	if err != nil {
 		return claims, err
 	}
-	if !legacyTokenAllowed(s.currentSigningMode(), claims) {
+	if !legacyTokenAllowed(s.currentSigningMode(), claims, sandboxTokenNow()) {
 		return sandboxtoken.Claims{}, sandboxtoken.ErrInvalidSignature
 	}
 	return claims, nil

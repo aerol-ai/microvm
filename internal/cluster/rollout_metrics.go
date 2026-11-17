@@ -65,6 +65,15 @@ var (
 	// obsoleteServersRemoved counts servers taken out of Raft because they
 	// run below the active version.
 	obsoleteServersRemoved = expvar.NewInt("aerolvm_obsolete_servers_removed_total")
+	// serverSigningOn is 1 once servers sign (fsm_server_signing.go);
+	// serverSigningHeld is 1 while the active version allows it and the
+	// gate still holds the record back (ServerSigningGate: its reason is
+	// in the leader's log and in aerolvm upgrade signing);
+	// serverSigningWaiting counts the live members that report a version
+	// below it, or none.
+	serverSigningOn      = expvar.NewInt("aerolvm_server_signing_on")
+	serverSigningHeld    = expvar.NewInt("aerolvm_server_signing_held")
+	serverSigningWaiting = expvar.NewInt("aerolvm_server_signing_waiting_members")
 )
 
 func init() {
@@ -89,6 +98,7 @@ func (c *Cluster) refreshRolloutGauges() {
 	r, active := c.fsm.rolloutView()
 	activeFSMOpsGauge.Set(int64(active.FV))
 	membersBelowActive.Set(int64(c.membersBelowActive()))
+	c.refreshServerSigningGauges()
 	if r == nil {
 		rolloutStateSince.Set(0)
 		rolloutWaitingSince.Set(0)
@@ -115,4 +125,20 @@ func recordNodeUpgrade(seconds float64) {
 	nodeUpgradeSeconds.Add(seconds)
 	nodeUpgradesTotal.Add(1)
 	nodeUpgradeLast.Set(seconds)
+}
+
+// refreshServerSigningGauges sets the server signing gauges.
+func (c *Cluster) refreshServerSigningGauges() {
+	_, on := c.ServerSigningRecord()
+	g := c.ServerSigningGate(false)
+	serverSigningOn.Set(boolGauge(on))
+	serverSigningHeld.Set(boolGauge(!on && g.ActiveFV >= serverSigningFSMOpsVersion && !g.Allowed))
+	serverSigningWaiting.Set(int64(len(g.Waiting)))
+}
+
+func boolGauge(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }

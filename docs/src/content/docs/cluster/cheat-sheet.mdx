@@ -90,6 +90,7 @@ aerolvm upgrade resume                # go on after a pause
 aerolvm upgrade stop                  # start no more nodes (apply again to go on)
 aerolvm upgrade rollback --wait       # every node back (while paused, stopped or failed)
 aerolvm upgrade finalize              # after --hold: turn the new version on
+aerolvm upgrade signing               # do only servers sign tokens yet?
 aerolvm release pull v0.7.1 -o aerolvm-v0.7.1.tgz
 aerolvm upgrade apply v0.7.1 --from aerolvm-v0.7.1.tgz --wait
 ```
