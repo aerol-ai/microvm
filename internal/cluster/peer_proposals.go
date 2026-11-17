@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -290,7 +291,30 @@ func (s leaderProposalState) clusterHostname(host string) bool {
 	if s.c == nil {
 		return true
 	}
-	return models.ReservedCustomDomain(host, s.c.cfg.Domain, s.c.cfg.PublicHost, s.c.cfg.IngressAdvertiseHost)
+	if models.ReservedCustomDomain(host, s.c.cfg.Domain, s.c.cfg.PublicHost, s.c.cfg.IngressAdvertiseHost) {
+		return true
+	}
+	// A server may run with no domain of its own (on Kubernetes only the
+	// gateways serve the edge), so the names the members serve count too:
+	// each member's public host, and every name under it.
+	if s.c.gossip == nil {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, m := range s.c.gossip.members() {
+		pub := strings.TrimSpace(m.PublicHost)
+		if pub == "" || seen[pub] {
+			continue
+		}
+		seen[pub] = true
+		if h, _, err := net.SplitHostPort(pub); err == nil {
+			pub = h
+		}
+		if models.ReservedCustomDomain(host, pub, pub) {
+			return true
+		}
+	}
+	return false
 }
 
 // peerMayPropose is the rule (see the table above). A server proposes

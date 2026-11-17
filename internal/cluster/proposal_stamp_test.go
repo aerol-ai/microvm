@@ -208,3 +208,28 @@ func TestLeaderChecksWorkerDomainProof(t *testing.T) {
 		t.Fatalf("proofs asked %v", prover.proved)
 	}
 }
+
+// A leader with no domain of its own (a Kubernetes server: only gateways
+// serve the edge) still refuses the names its members serve.
+func TestWorkerCannotBindMembersPublicNames(t *testing.T) {
+	gw := workerMember("gw-1", "")
+	gw.Role = config.NodeRoleIngress
+	gw.PublicHost = "edge.example.net:443"
+	c, cleanup := newTestCluster(t, "ldr-members-names", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedGossipView(t, c, []Member{workerMember("wkr-9", ""), gw})
+	w := workerApplyCtx("wkr-9")
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-m", OwnerNodeID: "wkr-9", IncarnationID: "inc-m",
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+	if err := c.ApplyEncoded(w, place); err != nil {
+		t.Fatal(err)
+	}
+	for host, refused := range map[string]bool{"edge.example.net": true, "sb-x.edge.example.net": true, "app.customer.com": false} {
+		add, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-m", Hostname: host, ExpectedIncarnationID: "inc-m"})
+		err := c.ApplyEncoded(w, add)
+		if refused != errors.Is(err, ErrPeerProposalRefused) {
+			t.Errorf("bind %s = %v", host, err)
+		}
+	}
+}
