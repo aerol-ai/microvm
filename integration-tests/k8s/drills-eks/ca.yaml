@@ -1,0 +1,26 @@
+# The bank run's private certificate authority (eks-bank.sh install), made
+# by cert-manager: a self-signed root, and a ClusterIssuer that signs with
+# it. It signs the edge's certificate (the API and sandbox links behind the
+# internal NLB) and the drill registry's (drills-eks/registry.yaml). The
+# workers trust it for the registry through the chart's worker.registryCA.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: aerolvm-drills-selfsigned }
+spec: { selfSigned: {} }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: aerolvm-drills-ca, namespace: cert-manager }
+spec:
+  isCA: true
+  commonName: AerolVM bank drills CA
+  secretName: aerolvm-drills-ca
+  duration: 720h
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { name: aerolvm-drills-selfsigned, kind: ClusterIssuer }
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: aerolvm-drills-ca }
+spec:
+  ca: { secretName: aerolvm-drills-ca }

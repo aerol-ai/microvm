@@ -9,6 +9,12 @@ plain HTTP to it as it would HTTPS to a bank's registry.
 
   faultproxy.py --upstream http://drills-registry:5000 --listen 5000 --control 5001
 
+On EKS (drills-eks.sh) it listens over HTTPS, with a certificate a private
+CA signed, which the workers trust through the chart's worker.registryCA:
+
+  faultproxy.py --upstream http://127.0.0.1:5000 --listen 443 --control 5001 \
+      --tls-cert /tls/tls.crt --tls-key /tls/tls.key
+
 Modes, set with  curl -X POST 'http://127.0.0.1:<control>/mode?name=slow&delay=20&bps=20000'
 (add &repo=drill/hot to set one repository's mode; without it, the mode of
 every repository that has none of its own):
@@ -27,6 +33,7 @@ Each request is also one JSON line on stdout.
 """
 import argparse
 import http.client
+import ssl
 import http.server
 import json
 import socketserver
@@ -218,11 +225,22 @@ def main():
     p.add_argument("--upstream", required=True)
     p.add_argument("--listen", type=int, default=5000)
     p.add_argument("--control", type=int, default=5001)
+    p.add_argument("--tls-cert", default="")
+    p.add_argument("--tls-key", default="")
     args = p.parse_args()
     Proxy.upstream = args.upstream.rstrip("/")
     threading.Thread(target=Server(("0.0.0.0", args.control), Control).serve_forever, daemon=True).start()
-    log(listening=args.listen, upstream=Proxy.upstream)
-    Server(("0.0.0.0", args.listen), Proxy).serve_forever()
+    srv = Server(("0.0.0.0", args.listen), Proxy)
+    if args.tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Registries and containerd speak TLS 1.2+; never offer older.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(args.tls_cert, args.tls_key)
+        # The handshake in each request's own thread, not in the accept
+        # loop: one slow client must not hold up every other.
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    log(listening=args.listen, upstream=Proxy.upstream, tls=bool(args.tls_cert))
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

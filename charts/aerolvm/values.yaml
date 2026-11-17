@@ -188,6 +188,15 @@ worker:
   # 100.64.0.0/10 for pods, for example) needs it. Needs
   # blockPrivateByDefault: true.
   egressPrivateRanges: []
+  # Your own certificate authority, for a registry whose HTTPS certificate it
+  # signed: a ConfigMap in the worker namespace (cluster mode) or the release
+  # namespace (single mode) holding the CA certificate (PEM) under key.
+  # Workers then trust it, beside the public CAs, for every image pull, and
+  # for everything else the agent connects to over HTTPS. Empty: public CAs
+  # only.
+  registryCA:
+    existingConfigMap: ""
+    key: ca.crt
   # Any other sandboxd setting, as SB_NAME: value.
   extraEnv: {}
 

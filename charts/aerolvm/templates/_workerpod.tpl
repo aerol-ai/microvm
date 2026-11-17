@@ -218,6 +218,11 @@ containers:
       - { name: SB_TOOLBOX_BINARY_PATH, value: /opt/aerolvm/toolbox/toolboxd }
       - { name: SB_TOOLBOX_MOUNT_PATH, value: /usr/local/bin/toolboxd }
       - { name: SB_TOOLBOX_PORT, value: "2280" }
+      {{- with $root.Values.worker.registryCA.existingConfigMap }}
+      # worker.registryCA: Go reads the CAs in these folders beside the
+      # image's own bundle, so image pulls trust the registry's CA.
+      - { name: SSL_CERT_DIR, value: "/etc/ssl/certs:/etc/aerolvm/registry-ca" }
+      {{- end }}
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
@@ -320,6 +325,9 @@ containers:
       - { name: run-aerolvm, mountPath: /run/aerolvm }
       - { name: run-sandboxd, mountPath: /run/sandboxd }
       - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
+      {{- if $root.Values.worker.registryCA.existingConfigMap }}
+      - { name: registry-ca, mountPath: /etc/aerolvm/registry-ca, readOnly: true }
+      {{- end }}
       {{- if $cluster }}
       - { name: etc, mountPath: /etc/sandboxd }
       {{- end }}
@@ -424,6 +432,14 @@ volumes:
   - { name: run-aerolvm, emptyDir: {} }
   - { name: run-sandboxd, emptyDir: {} }
   - { name: toolbox, emptyDir: {} }
+  {{- with $root.Values.worker.registryCA.existingConfigMap }}
+  # Only the CA key: anything else the ConfigMap holds stays out.
+  - name: registry-ca
+    configMap:
+      name: {{ . }}
+      items:
+        - { key: {{ $root.Values.worker.registryCA.key | default "ca.crt" | quote }}, path: registry-ca.crt }
+  {{- end }}
   - { name: cni-state, emptyDir: {} }
   - { name: netns, emptyDir: {} }
   {{- if $externalStorage }}

@@ -1215,3 +1215,56 @@ func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
 		t.Errorf("the bank preset caps tokens at 90 days in %d pod templates, want 3", n)
 	}
 }
+
+// worker.registryCA: the worker's agent trusts a bank's own CA for image
+// pulls (Go reads SSL_CERT_DIR's folders beside the image's bundle), in
+// both modes, with only the CA's key mounted. Off, nothing changes. The
+// EKS bank drills' registry is HTTPS under a private CA through it.
+func TestKubernetesChartRegistryCA(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	const env = `SSL_CERT_DIR, value: "/etc/ssl/certs:/etc/aerolvm/registry-ca"`
+	for _, mode := range [][]string{cluster, nil} {
+		on, err := renderChart(t, root, helm, append(append([]string{}, mode...), "worker.registryCA.existingConfigMap=bank-ca", "worker.registryCA.key=root.pem")...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		off, err := renderChart(t, root, helm, mode...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker := func(docs []map[string]any) string {
+			if mode != nil {
+				return podTemplates(t, docs)["worker"]
+			}
+			b, _ := yaml.Marshal(docsOfKind(docs, "StatefulSet")[0])
+			return string(b)
+		}
+		w := worker(on)
+		for _, want := range []string{"SSL_CERT_DIR", "/etc/ssl/certs:/etc/aerolvm/registry-ca", "registry-ca", "/etc/aerolvm/registry-ca", "bank-ca", "root.pem", "registry-ca.crt"} {
+			if !strings.Contains(w, want) {
+				t.Errorf("mode %v: the worker lacks %q", mode, want)
+			}
+		}
+		if mode != nil && !strings.Contains(w, env) {
+			t.Errorf("cluster mode: the worker template lacks %s", env)
+		}
+		for role, body := range map[string]string{"worker": worker(off)} {
+			if strings.Contains(body, "SSL_CERT_DIR") || strings.Contains(body, "registry-ca") {
+				t.Errorf("mode %v, off: the %s carries the registry CA", mode, role)
+			}
+		}
+		if mode != nil {
+			for _, role := range []string{"server", "gateway"} {
+				if strings.Contains(podTemplates(t, on)[role], "registry-ca") {
+					t.Errorf("the %s pulls no images, yet trusts the registry CA", role)
+				}
+			}
+		}
+	}
+}

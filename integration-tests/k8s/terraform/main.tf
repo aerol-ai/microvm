@@ -13,11 +13,21 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.50"
     }
+    # teardown.tf zips the teardown Lambda.
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
   }
 }
 
 provider "aws" {
   region = var.region
+  # The account cluster.sh up ran in (run.tfvars.json): any other
+  # credentials, on a destroy too, are refused before anything is read or
+  # changed, so another account's run is never touched and this run's
+  # state is never emptied by a refresh that finds nothing.
+  allowed_account_ids = var.aws_account == "" ? null : [var.aws_account]
   default_tags {
     tags = {
       "aerol:purpose" = "k8s-phase0"
@@ -73,13 +83,16 @@ resource "aws_subnet" "public" {
   availability_zone       = local.zones[count.index]
   cidr_block              = cidrsubnet(aws_vpc.this.cidr_block, 4, count.index)
   map_public_ip_on_launch = true
-  tags = {
+  tags = merge({
     Name                                = "${var.name}-${local.zones[count.index]}"
     "kubernetes.io/cluster/${var.name}" = "shared"
     "kubernetes.io/role/elb"            = "1"
     # Karpenter's EC2NodeClass finds the subnets by this (spike S5).
     "karpenter.sh/discovery" = var.name
-  }
+    # The bank drills' internal NLB: the AWS Load Balancer Controller puts an
+    # internal load balancer only in subnets tagged for one. No NAT here, so
+    # the subnets stay public; an internal NLB gets private addresses in them.
+  }, var.bank_drills ? { "kubernetes.io/role/internal-elb" = "1" } : {})
 }
 
 resource "aws_route_table" "public" {
@@ -165,7 +178,10 @@ resource "aws_eks_cluster" "this" {
     public_access_cidrs     = var.api_allowed_cidrs
   }
 
-  depends_on = [aws_iam_role_policy_attachment.cluster]
+  # The teardown timer (teardown.tf) outlives the cluster on a destroy:
+  # Terraform removes the cluster first, then the schedules and the rights
+  # that would remove it.
+  depends_on = [aws_iam_role_policy_attachment.cluster, aws_scheduler_schedule.teardown, aws_iam_role_policy.teardown]
 }
 
 # One small untainted node for the system add-ons (CoreDNS), so the worker
@@ -177,6 +193,9 @@ resource "aws_eks_node_group" "system" {
   subnet_ids      = aws_subnet.public[*].id
   ami_type        = "AL2023_x86_64_STANDARD"
   instance_types  = [var.system_instance_type]
+  # The bank drills push a 3 GiB image layer from a pod here; EKS's default
+  # 20 GiB leaves kubelet evicting at that.
+  disk_size = var.bank_drills ? 50 : null
   scaling_config {
     desired_size = var.system_count
     min_size     = var.system_count
@@ -185,7 +204,9 @@ resource "aws_eks_node_group" "system" {
   depends_on = [aws_iam_role_policy_attachment.node]
 }
 
+# None with --workers 0: the bank drills' workers all come from Karpenter.
 resource "aws_eks_node_group" "worker" {
+  count           = var.worker_count > 0 ? 1 : 0
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "worker-${lower(replace(var.worker_ami_type, "_", "-"))}"
   node_role_arn   = aws_iam_role.node.arn
