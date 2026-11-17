@@ -23,8 +23,10 @@ import (
 //	op                                     a worker or gateway may send it when
 //	place, claim orphan                    it names the sender as the owner (a
 //	                                       claim also only of the sender's
-//	                                       orphan); never a gateway, which owns
-//	                                       no sandbox
+//	                                       orphan; a place on a row that exists
+//	                                       only from its owner, for a
+//	                                       reservation its target); never a
+//	                                       gateway, which owns no sandbox
 //	spec, ports, custom domains            the sender owns the sandbox now
 //	secret recipients, delete, begin       the write is fenced on the sender as
 //	delete, move abort                     the owner (the FSM checks the fence)
@@ -45,7 +47,10 @@ import (
 //	                                       (the attach and create routes go
 //	                                       there first)
 //	reserve                                any: a reservation never enters
-//	                                       the owner index (fsm.go)
+//	                                       the owner index (fsm.go); a retry
+//	                                       of a live one only from the node
+//	                                       that reserved it or its target, and
+//	                                       never naming another account
 //	cancel reserve                         the reservation is the sender's:
 //	                                       it reserved it or is its target
 //	volume rows and attachments            any (tenant rows, not a node's)
@@ -268,10 +273,20 @@ type proposalState interface {
 	reclaimAdoptable(cur VolumeReclaim, sender string) bool
 	// serversSign reports whether the server signing record exists.
 	serversSign() bool
+	// proposalNowUnix is the leader's clock, for whether a reservation is
+	// still live.
+	proposalNowUnix() int64
 	// volumeForProposal and volumeByNameForProposal read one volume row
 	// (volume_proposals.go).
 	volumeForProposal(tenant, id string) (models.Volume, bool)
 	volumeByNameForProposal(tenant, name string) (models.Volume, bool)
+}
+
+func (s leaderProposalState) proposalNowUnix() int64 {
+	if s.now.IsZero() {
+		return time.Now().Unix()
+	}
+	return s.now.Unix()
 }
 
 func (s leaderProposalState) serversSign() bool {
@@ -373,7 +388,15 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 	}
 	switch cmd.Op {
 	case opPlace:
-		return is(cmd.OwnerNodeID)
+		if !is(cmd.OwnerNodeID) {
+			return false
+		}
+		// Only the node that runs a row places it again: a reservation's
+		// target, a placement's owner.
+		p, ok := st.placementForProposal(cmd.SandboxID, false)
+		return !ok || is(p.OwnerNodeID)
+	case opReserve:
+		return reserveRetryBound(cmd, sender, st)
 	case opClaimOrphan:
 		if !is(cmd.OwnerNodeID) {
 			return false
@@ -446,9 +469,28 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 		cur, ok := st.volumeReclaimForProposal(*cmd.VolumeReclaim)
 		return !ok || is(cur.NodeID)
 	}
-	// opReserve and the tenant volume rows and attachments: open to any
-	// node (see the table above).
+	// The tenant volume rows and attachments before servers sign: open to
+	// any node (see the table above).
 	return true
+}
+
+// reserveRetryBound reports whether a worker's or gateway's reserve may
+// go to the FSM. A new reservation, or one over an expired row, is open to
+// any node. A reserve that names a live reservation's target is a retry
+// (fsm.go isReservationRetry): it comes only from the node that reserved
+// it or the target, as a cancel does, and names no other account, which
+// would change whose create it is.
+func reserveRetryBound(cmd command, sender string, st proposalState) bool {
+	p, ok := st.placementForProposal(cmd.SandboxID, false)
+	if !ok || !p.IsReserved() || p.OwnerNodeID != cmd.OwnerNodeID || st.proposalNowUnix() > p.ExpiresUnix {
+		return true // the FSM answers a new reservation, or a conflict
+	}
+	is := func(id string) bool { id = strings.TrimSpace(id); return id != "" && id == sender }
+	if !is(p.OwnerNodeID) && !is(p.ReservedBy) {
+		return false
+	}
+	ref := strings.TrimSpace(cmd.OwnerRef)
+	return ref == "" || ref == strings.TrimSpace(p.OwnerRef)
 }
 
 // placementForProposal reads one placement for the rule; withSpec resolves

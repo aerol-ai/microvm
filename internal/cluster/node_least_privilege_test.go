@@ -113,6 +113,8 @@ type fakeProposalState struct {
 	signing bool
 	// volumes are the volume rows by volumeKey.
 	volumes map[string]models.Volume
+	// now is the leader's clock in Unix seconds; 0 is time.Now.
+	now int64
 }
 
 func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
@@ -120,6 +122,13 @@ func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
 }
 
 func (f fakeProposalState) serversSign() bool { return f.signing }
+
+func (f fakeProposalState) proposalNowUnix() int64 {
+	if f.now != 0 {
+		return f.now
+	}
+	return time.Now().Unix()
+}
 
 func (f fakeProposalState) volumeForProposal(tenant, id string) (models.Volume, bool) {
 	v, ok := f.volumes[volumeKey(tenant, id)]
@@ -179,9 +188,12 @@ func TestPeerMayPropose(t *testing.T) {
 	reclaim := VolumeReclaim{Tenant: "t", VolumeID: "v", NodeID: "wkr-1", RecordedUnixNano: 7}
 	otherReclaim := VolumeReclaim{Tenant: "t", VolumeID: "v2", NodeID: "wkr-2", RecordedUnixNano: 7}
 	heldReclaim := VolumeReclaim{Tenant: "t", VolumeID: "v3", NodeID: "wkr-2", RecordedUnixNano: 7}
+	live := time.Now().Add(time.Hour).Unix()
 	reserved := func(id, target, by string) Placement {
-		return Placement{SandboxID: id, OwnerNodeID: target, State: PlacementStateReserved, ReservedBy: by}
+		return Placement{SandboxID: id, OwnerNodeID: target, State: PlacementStateReserved, ReservedBy: by, OwnerRef: "team:a", ExpiresUnix: live}
 	}
+	expired := reserved("sb-res-old", "wkr-2", "wkr-3")
+	expired.ExpiresUnix = time.Now().Add(-time.Minute).Unix()
 	st := fakeProposalState{
 		adoptable: map[string]bool{otherReclaim.key(): true},
 		placements: map[string]Placement{
@@ -189,6 +201,7 @@ func TestPeerMayPropose(t *testing.T) {
 			"sb-res-target":  reserved("sb-res-target", "wkr-1", "srv-1"),
 			"sb-res-theirs":  reserved("sb-res-theirs", "wkr-2", "wkr-3"),
 			"sb-res-legacy":  reserved("sb-res-legacy", "wkr-2", ""),
+			"sb-res-old":     expired,
 			"sb-mine":        {SandboxID: "sb-mine", OwnerNodeID: "wkr-1", CustomHostnames: []string{"bound.customer.com"}},
 			"sb-theirs":      {SandboxID: "sb-theirs", OwnerNodeID: "wkr-2"},
 			"sb-my-orphan":   {SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-1"},
@@ -266,6 +279,19 @@ func TestPeerMayPropose(t *testing.T) {
 		{"ack a reclaim already gone", command{Op: opAckVolumeReclaim, VolumeReclaim: &VolumeReclaim{Tenant: "t", VolumeID: "gone"}}, true},
 		{"ack with no reclaim", command{Op: opAckVolumeReclaim}, false},
 		{"reserve on another node", command{Op: opReserve, SandboxID: "sb-new", OwnerNodeID: "wkr-2"}, true},
+		{"place a reservation that targets it", command{Op: opPlace, SandboxID: "sb-res-target", OwnerNodeID: "wkr-1"}, true},
+		{"place a reservation it made for another node", command{Op: opPlace, SandboxID: "sb-res-mine", OwnerNodeID: "wkr-1"}, false},
+		{"place another node's reservation", command{Op: opPlace, SandboxID: "sb-res-theirs", OwnerNodeID: "wkr-1"}, false},
+		{"place its own sandbox again", command{Op: opPlace, SandboxID: "sb-mine", OwnerNodeID: "wkr-1"}, true},
+		{"place another node's sandbox", command{Op: opPlace, SandboxID: "sb-theirs", OwnerNodeID: "wkr-1"}, false},
+		{"retry a reservation it made", command{Op: opReserve, SandboxID: "sb-res-mine", OwnerNodeID: "wkr-2"}, true},
+		{"retry a reservation that targets it", command{Op: opReserve, SandboxID: "sb-res-target", OwnerNodeID: "wkr-1"}, true},
+		{"retry another node's reservation", command{Op: opReserve, SandboxID: "sb-res-theirs", OwnerNodeID: "wkr-2"}, false},
+		{"retry a reservation that names no sender", command{Op: opReserve, SandboxID: "sb-res-legacy", OwnerNodeID: "wkr-2"}, false},
+		{"retry its reservation for its own account", command{Op: opReserve, SandboxID: "sb-res-mine", OwnerNodeID: "wkr-2", OwnerRef: "team:a"}, true},
+		{"retry its reservation for another account", command{Op: opReserve, SandboxID: "sb-res-mine", OwnerNodeID: "wkr-2", OwnerRef: "team:b"}, false},
+		{"reserve over an expired reservation", command{Op: opReserve, SandboxID: "sb-res-old", OwnerNodeID: "wkr-2", OwnerRef: "team:b"}, true},
+		{"reserve a live reservation for another target", command{Op: opReserve, SandboxID: "sb-res-theirs", OwnerNodeID: "wkr-1"}, true},
 		{"cancel an unknown reservation", command{Op: opCancelReserve, SandboxID: "sb-new"}, true},
 		{"cancel a placed sandbox (a no-op)", command{Op: opCancelReserve, SandboxID: "sb-theirs"}, true},
 		{"cancel its own reservation", command{Op: opCancelReserve, SandboxID: "sb-res-mine"}, true},
