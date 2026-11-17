@@ -959,6 +959,8 @@ Every action that changes something is recorded, with one exception. Calls in th
 | `SB_IDENTITY_MAX_STALE` | `60s` | After this long without a sync, a server refuses API tokens, except to read metrics. |
 | `SB_PAT_SCOPE` | `any` | `host` limits the server token to the server and cluster servers. Enterprise mode requires it. |
 | `SB_PUBLIC_API_SOCKET` | `/run/sandboxd-public/api.sock` | The socket Caddy uses when `SB_PAT_SCOPE=host`. |
+| `SB_PAT_LOCAL_LISTEN` | Empty | With `SB_PAT_SCOPE=host`, a loopback listener of its own (`127.0.0.1:<port>`) where the server token works; the API port then takes it from no one, loopback included. The node's own tools (`sandboxd key rotate`, the upgrade check, `sandboxd init`, `join` and `adopt`) send the server token there. Pick a port no other listener uses: the node refuses one that is (21213 is the ingress proxy's) or one in `SB_L4_PORT_RANGE_START`..`END`. The Helm chart sets `127.0.0.1:21219` in enterprise mode, since a mesh sidecar delivers outside callers from loopback. |
+| `SB_PUBLIC_API_SOCKET_GROUP` | `caddy` | The group that may use that socket: Caddy's. A name, or a number (the Helm chart sets `65532`). |
 | `SB_PAT_TOKEN_PREVIOUS` | Empty | A second server token, accepted only while you rotate the main one. |
 | `SB_OPERATOR_VOLUME_SCOPE` | Empty | Pins where the operator's platform volumes live, so a token rotation does not move them. |
 | `SB_L4_FALLBACK_PROXY_PROTOCOL` | `false` | Passes callers' real addresses through Caddy. Set by `install.sh --l4-proxy-protocol`. |

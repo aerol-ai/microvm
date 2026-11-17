@@ -17,9 +17,13 @@
 #   - AerolVM's own API tokens on every node, so people and CI can hold
 #     tokens that do less than the admin token, each lasting at most 90
 #     days (identity.tokenMaxTTL);
-#   - worker machines replaced every 30 days.
-#   Enterprise mode stays off: on Kubernetes it cannot start yet (the
-#   operator's admin-token calls, an audit witness and an off-node export).
+#   - worker machines replaced every 30 days;
+#   - enterprise mode on every node: each refuses to start unless every
+#     strict security rule holds. The admin token works only from a server
+#     pod itself (`kubectl port-forward`); people and tools use SSO or an
+#     API token. Every node writes its audit chain's head to an S3 bucket
+#     with Object Lock and ships its audit records to a second bucket,
+#     through an IAM role (IRSA).
 #
 # What it cannot set, and you must:
 #   - The scrape token's Secret, after the install (see monitoring below).
@@ -38,6 +42,17 @@
 #     data (`modprobe br_netfilter`, listed in /etc/modules-load.d). Stock
 #     Amazon Linux 2023 does not; each worker's preflight checks it.
 #   - cert-manager, and kube-prometheus-stack (or the Prometheus Operator).
+#   - The two audit buckets and the nodes' IAM role (audit, below). The
+#     witness bucket is made with Object Lock and a COMPLIANCE default
+#     retention of at least 30 days; the role's witness rights, and the
+#     deletes it must not have, are in the docs (Enterprise mode, "Give the
+#     server role its permissions"). Add s3:PutObject on the export bucket.
+#     The role trusts the cluster's OIDC provider for the service account
+#     aerolvm-node in both namespaces:
+#     system:serviceaccount:aerolvm-system:aerolvm-node and
+#     system:serviceaccount:aerolvm-workers:aerolvm-node; with
+#     cluster.agentSandboxAPI on, also the gateways' own account,
+#     system:serviceaccount:aerolvm-system:aerolvm-gateway.
 
 mode: cluster
 
@@ -88,15 +103,40 @@ identity:
   # the leader holds every token write to it.
   tokenMaxTTL: 2160h
 
-# enterprise.enabled stays off here until the chart can satisfy enterprise
-# mode's start-up checks on Kubernetes (see values.yaml, enterprise).
+# Enterprise mode on every node (docs: Enterprise mode). The admin token
+# then works only from a server pod itself:
+#   kubectl -n aerolvm-system port-forward pod/aerolvm-server-0 21212:21219
+# Sign in as admin that way to make the scrape token below and your own
+# tokens; the operator makes its own.
+enterprise:
+  enabled: true
+
+# Audit evidence off the nodes, which enterprise mode requires: the witness
+# (each node's audit chain head, in a bucket a node cannot delete from) and
+# the export (every audit record). Each node reaches S3 through the IAM role
+# below.
+audit:
+  witness:
+    bucket: "<audit-witness-bucket>"
+    region: "<eu-west-1>"
+  export:
+    backend: s3
+    s3:
+      bucket: "<audit-export-bucket>"
+      region: "<eu-west-1>"
+  credentials:
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: "<arn:aws:iam::111122223333:role/aerolvm-audit>"
 
 monitoring:
   enabled: true
   # kube-prometheus-stack reads objects labelled with its release name.
   labels: { release: kube-prometheus-stack }
   # A token that can only read, in a Secret in this namespace. Install,
-  # then make it (signed in as admin; the install's notes show how):
+  # then make it (signed in as admin through the port-forward above; the
+  # install's notes show how):
   #   kubectl -n aerolvm-system create secret generic <prometheus-token-secret> \
   #     --from-literal=token="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
   # Make a new one before it expires.

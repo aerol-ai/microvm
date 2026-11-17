@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"net/http"
+	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -48,11 +50,126 @@ type fakeAPI struct {
 	applyErr   error
 	applied    []string
 	rolledBack int
+
+	// The token routes (operator_token.go): every call with the base URL
+	// and credential its client was made with.
+	tokenCalls []tokenCall
+	createErr  error
+	revokeErr  error
+	// whoami answers GET /v1/whoami for a credential; nil takes any.
+	whoami  func(Credentials) error
+	tokSeq  int
+	tokNow  func() time.Time
+	clients []tokenCall
+	// liveTokens are the tokens ListTokens returns, by id, with their names.
+	liveTokens map[string]string
+	// liveCreated is a listed token's created_at, by id, when a test sets
+	// one (the servers send it; names alone carry the operator's).
+	liveCreated map[string]time.Time
+	listErr     error
+}
+
+// tokenCall is one token-route call, or one client made (op "client").
+type tokenCall struct {
+	op, base, name, expiresIn, id string
+	cred                          Credentials
 }
 
 func newFakeAPI() *fakeAPI { return &fakeAPI{ready: true, nodes: map[string]aerolapi.Node{}} }
 
-func (f *fakeAPI) factory(string, string) AerolAPI { return f }
+func (f *fakeAPI) factory(base string, cred Credentials) AerolAPI {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clients = append(f.clients, tokenCall{op: "client", base: base, cred: cred})
+	return &fakeBound{fakeAPI: f, base: base, cred: cred}
+}
+
+// fakeBound is the fake API as one client sees it: its base URL and
+// credential, which the token routes record.
+type fakeBound struct {
+	*fakeAPI
+	base string
+	cred Credentials
+}
+
+func (b *fakeBound) CreateToken(_ context.Context, name, role, team, expiresIn string) (aerolapi.CreatedAPIToken, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokenCalls = append(b.tokenCalls, tokenCall{op: "create", base: b.base, name: name, expiresIn: expiresIn, cred: b.cred})
+	if b.createErr != nil {
+		return aerolapi.CreatedAPIToken{}, b.createErr
+	}
+	if role != "admin" || team != "*" {
+		return aerolapi.CreatedAPIToken{}, &aerolapi.Error{Status: http.StatusBadRequest, Reason: "want an admin token for every team"}
+	}
+	life, err := time.ParseDuration(expiresIn)
+	if err != nil {
+		return aerolapi.CreatedAPIToken{}, &aerolapi.Error{Status: http.StatusBadRequest, Reason: err.Error()}
+	}
+	now := time.Now()
+	if b.tokNow != nil {
+		now = b.tokNow()
+	}
+	b.tokSeq++
+	if b.liveTokens == nil {
+		b.liveTokens = map[string]string{}
+	}
+	b.liveTokens["tok_"+strconv.Itoa(b.tokSeq)] = name
+	return aerolapi.CreatedAPIToken{
+		APIToken: aerolapi.APIToken{ID: "tok_" + strconv.Itoa(b.tokSeq), Name: name, Role: role, Team: team,
+			CreatedAt: now.Truncate(time.Second), ExpiresAt: now.Truncate(time.Second).Add(life)},
+		Token: "avm_secret_" + strconv.Itoa(b.tokSeq),
+	}, nil
+}
+
+func (b *fakeBound) RevokeToken(_ context.Context, id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokenCalls = append(b.tokenCalls, tokenCall{op: "revoke", base: b.base, id: id, cred: b.cred})
+	if b.revokeErr == nil {
+		delete(b.liveTokens, id)
+	}
+	return b.revokeErr
+}
+
+// ListTokens lists the tokens this fake made and has not revoked, and any a
+// test put in liveTokens itself.
+func (b *fakeBound) ListTokens(context.Context) ([]aerolapi.APIToken, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokenCalls = append(b.tokenCalls, tokenCall{op: "list", base: b.base, cred: b.cred})
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
+	var out []aerolapi.APIToken
+	for id, name := range b.liveTokens {
+		out = append(out, aerolapi.APIToken{ID: id, Name: name, CreatedAt: b.liveCreated[id]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (b *fakeBound) WhoAmI(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tokenCalls = append(b.tokenCalls, tokenCall{op: "whoami", base: b.base, cred: b.cred})
+	if b.whoami != nil {
+		return b.whoami(b.cred)
+	}
+	return nil
+}
+
+// fakeAPI's own token routes, for a client used without the factory.
+func (f *fakeAPI) CreateToken(ctx context.Context, name, role, team, expiresIn string) (aerolapi.CreatedAPIToken, error) {
+	return (&fakeBound{fakeAPI: f}).CreateToken(ctx, name, role, team, expiresIn)
+}
+func (f *fakeAPI) RevokeToken(ctx context.Context, id string) error {
+	return (&fakeBound{fakeAPI: f}).RevokeToken(ctx, id)
+}
+func (f *fakeAPI) WhoAmI(ctx context.Context) error { return (&fakeBound{fakeAPI: f}).WhoAmI(ctx) }
+func (f *fakeAPI) ListTokens(ctx context.Context) ([]aerolapi.APIToken, error) {
+	return (&fakeBound{fakeAPI: f}).ListTokens(ctx)
+}
 
 func (f *fakeAPI) Ready(context.Context) bool { return f.ready }
 func (f *fakeAPI) Adopt(context.Context) error {

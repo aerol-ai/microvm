@@ -1,12 +1,28 @@
 {{- if eq .Values.mode "cluster" -}}
-AerolVM is starting in {{ .Release.Namespace }} (cluster mode). The operator builds
+{{- $enterprise := (.Values.enterprise | default dict).enabled -}}
+AerolVM is starting in {{ .Release.Namespace }} (cluster mode{{ if $enterprise }}, enterprise mode on{{ end }}). The operator builds
 the cluster: the first server, the other servers, then gateways and workers.
 
 1. Watch it until the AerolCluster says Ready:
 
    kubectl -n {{ .Release.Namespace }} get aerolcluster,aerolnodes
 
-{{ if .Values.edge.enabled -}}
+{{ if $enterprise -}}
+2. Enterprise mode: the admin token works only from inside a server pod, on
+   its port 21219. Reach one (leave the port-forward running in a second
+   terminal), and sign in with the admin token:
+
+   kubectl -n {{ .Release.Namespace }} port-forward pod/{{ .Values.cluster.name }}-server-0 21212:21219
+   kubectl -n {{ .Release.Namespace }} get secret {{ .Values.cluster.name }}-admin -o jsonpath='{.data.token}' | base64 -d \
+     | aerolvm login http://127.0.0.1:21212 --token-stdin
+
+3. Make your own API tokens there (or set up SSO, identity.file), and use them
+   everywhere else{{ if .Values.edge.enabled }}, such as https://{{ .Values.edge.domain }} once
+   {{ .Values.edge.domain }} and *.{{ .Values.edge.domain }} point at the Service
+   {{ .Values.cluster.name }}-gateway{{ end }}:
+
+   aerolvm token create --name <you> --role admin --team '*' --expires-in {{ include "aerolvm.scrapeTokenExpiresIn" . }}
+{{- else if .Values.edge.enabled -}}
 2. Point {{ .Values.edge.domain }} and *.{{ .Values.edge.domain }} at the gateways' Service:
 
    kubectl -n {{ .Release.Namespace }} get svc {{ .Values.cluster.name }}-gateway
@@ -21,14 +37,16 @@ the cluster: the first server, the other servers, then gateways and workers.
 
 3. Read the admin token, then point an SDK at http://127.0.0.1:21212 with it:
 {{- end }}
+{{- if not $enterprise }}
 
    kubectl -n {{ .Release.Namespace }} get secret {{ .Values.cluster.name }}-admin -o jsonpath='{.data.token}' | base64 -d
+{{- end }}
 {{- $scrape := .Values.monitoring.scrapeToken }}
 {{- if and .Values.monitoring.enabled (ne $scrape.existingSecret (printf "%s-admin" .Values.cluster.name)) }}
 
 4. Prometheus reads every node's metrics with the token in the Secret
    {{ $scrape.existingSecret }}, and reads nothing until it exists. Make it with
-   a token that can only read, signed in as admin (aerolvm login <API URL> --token-stdin):
+   a token that can only read, signed in as admin ({{ if $enterprise }}through the port-forward above{{ else }}aerolvm login <API URL> --token-stdin{{ end }}):
 
    kubectl -n {{ .Release.Namespace }} create secret generic {{ $scrape.existingSecret }} \
      --from-literal={{ $scrape.key }}="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in {{ include "aerolvm.scrapeTokenExpiresIn" . }})"
@@ -46,6 +64,40 @@ If this upgrade turned them on, replace the running pods, or they keep refusing
 every token: the gateway pods one at a time, then the server pods one at a
 time, each after the last one's replacement says Serving, and the workers by
 replacing their machines (kubectl cordon <node>).
+{{- end }}
+{{- if and .Release.IsUpgrade $enterprise }}
+
+Enterprise mode, like API tokens, reaches only pods made after it was turned
+on. Turn it on in an upgrade of its own, after any version upgrade has
+finished (the AerolCluster's RUNNING column shows the new version): a pod
+made again mid-rollout keeps its old version, which cannot start in
+enterprise mode. If this upgrade turned it on, first move every tool that
+uses the admin token over the network to an API token or SSO: on a new pod
+the admin token works only from inside the pod. The operator makes its own API token on a
+server for its calls. Then replace the running pods in the same order: the
+gateway pods one at a time, then the server pods one at a time, each after the
+last one's replacement says Serving, then the workers by replacing their
+machines. Do it soon: the edge's settings already point at the new pods'
+private socket, so an old pod whose edge restarts answers the API with 502.
+To turn enterprise mode off later, replace the pods in the same order after
+that upgrade too, the server pods at the least: the operator stops renewing
+its own API token, and once that expires (within 30 days) it can reach no
+server still in enterprise mode.
+{{- end }}
+{{- /* The pod templates still in the cluster while helm upgrade renders
+these notes are the previous release's: SB_PAT_SCOPE in their server
+template means this upgrade is the one that turned enterprise mode off.
+Nothing secret is read, and a later upgrade says nothing. */}}
+{{- $previous := dict }}
+{{- if and .Release.IsUpgrade (not $enterprise) }}
+{{- $previous = lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-pod-templates" (include "aerolvm.name" .)) | default dict }}
+{{- end }}
+{{- if contains "SB_PAT_SCOPE" (index ($previous.data | default dict) "server" | default "") }}
+
+This upgrade turned enterprise mode off: replace the running pods as you
+did to turn it on, the server pods at the least. The operator no longer
+renews its own API token, and once that expires (within 30 days) it can
+reach no server still in enterprise mode.
 {{- end }}
 
 Health: every AerolNode says Serving; a worker that says Failed names the

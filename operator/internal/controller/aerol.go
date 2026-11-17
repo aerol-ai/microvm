@@ -23,13 +23,29 @@ type AerolAPI interface {
 	Rollout(ctx context.Context) (*upgradewire.Rollout, error)
 	ApplyImages(ctx context.Context, version string, req upgradewire.ApplyRequest) (*upgradewire.Rollout, error)
 	Rollback(ctx context.Context) error
+	// The operator's own admin API token (operator_token.go).
+	CreateToken(ctx context.Context, name, role, team, expiresIn string) (aerolapi.CreatedAPIToken, error)
+	ListTokens(ctx context.Context) ([]aerolapi.APIToken, error)
+	RevokeToken(ctx context.Context, id string) error
+	WhoAmI(ctx context.Context) error
 }
 
 var _ AerolAPI = (*aerolapi.Client)(nil)
 
+// Credentials is what the operator calls one cluster's servers with: Token,
+// and Fallback once if a server answers Token with 401 (apiCredentials).
+type Credentials struct {
+	Token    string
+	Fallback string
+}
+
 // APIFactory makes the admin API client for one cluster, from its API
-// Service URL and admin token.
-type APIFactory func(baseURL, token string) AerolAPI
+// Service URL and credentials.
+type APIFactory func(baseURL string, cred Credentials) AerolAPI
 
 // DefaultAPIFactory is the real client.
-func DefaultAPIFactory(baseURL, token string) AerolAPI { return aerolapi.New(baseURL, token) }
+func DefaultAPIFactory(baseURL string, cred Credentials) AerolAPI {
+	c := aerolapi.New(baseURL, cred.Token)
+	c.Fallback = cred.Fallback
+	return c
+}

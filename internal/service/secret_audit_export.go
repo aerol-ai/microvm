@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -273,10 +274,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 		secretAuditExportLagBytes.Set(0)
 		return 0, nil
 	}
-	nodeID := ""
-	if c := s.Cluster(); c != nil {
-		nodeID = c.SelfNodeID()
-	}
+	nodeID := s.auditExportNodeID()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -471,4 +469,23 @@ func (s *Service) AuditExportHealthy(ctx context.Context) error {
 		return nil
 	}
 	return b.Healthy(ctx)
+}
+
+// auditExportNodeID names this node's export batches (the key prefix
+// node=<id>): the cluster's id for it. Until boot attaches the cluster, the
+// service holds the single-node stand-in, named "standalone", and a cluster
+// node that restarts ships its backlog then: it went under that name instead
+// of its own, outside the node's records (issue #1349's kind run). The
+// cluster takes SB_NODE_ID as the node's id, so that is the name until then.
+func (s *Service) auditExportNodeID() string {
+	c := s.Cluster()
+	if _, standIn := c.(*cluster.Noop); (c == nil || standIn) && s.cfg.EnableCluster {
+		if id := strings.TrimSpace(s.cfg.NodeID); id != "" {
+			return id
+		}
+	}
+	if c == nil {
+		return ""
+	}
+	return c.SelfNodeID()
 }

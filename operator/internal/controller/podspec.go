@@ -468,13 +468,17 @@ func setupEnv(agent []corev1.EnvVar) []corev1.EnvVar {
 	env := []corev1.EnvVar{podIPEnv()}
 	for _, e := range agent {
 		// Setup writes every SB_ setting to a file on the node's disk; the
-		// federation key stays in the agent's own environment instead.
-		if e.Name != "POD_IP" && e.Name != "SB_CELL_ID_KEY" {
+		// secrets it never needs stay in the agent's own environment.
+		if e.Name != "POD_IP" && !agentOnlyEnv[e.Name] {
 			env = append(env, e)
 		}
 	}
 	return env
 }
+
+// agentOnlyEnv are secrets setup never reads: the federation key, and the
+// audit collector's bearer token (the chart's audit.export.webhook).
+var agentOnlyEnv = map[string]bool{"SB_CELL_ID_KEY": true, "SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN": true}
 
 // holdServer swaps sandboxd for a process that holds the pod (C22), so a
 // person can `kubectl exec` into it and run backup, restore or

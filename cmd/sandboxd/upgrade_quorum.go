@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
@@ -96,19 +96,13 @@ func readStopGuardEnv(envFile string) stopGuardEnv {
 			env[k] = v
 		}
 	}
-	host := strings.TrimSpace(env["SB_API_HOST"])
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	port := strings.TrimSpace(env["SB_API_PORT"])
-	if port == "" {
-		port = "21212"
-	}
 	return stopGuardEnv{
 		cluster: strings.EqualFold(strings.TrimSpace(env["SB_ENABLE_CLUSTER"]), "true") || strings.TrimSpace(env["SB_ENABLE_CLUSTER"]) == "1",
 		nodeID:  strings.TrimSpace(env["SB_NODE_ID"]),
-		apiURL:  "http://" + net.JoinHostPort(host, port),
-		pat:     strings.TrimSpace(env["SB_PAT_TOKEN"]),
+		// Where this node takes its admin token: its own listener when it
+		// has one (SB_PAT_LOCAL_LISTEN), else the API port.
+		apiURL: config.LocalAdminURLFromEnv(func(k string) string { return env[k] }),
+		pat:    strings.TrimSpace(env["SB_PAT_TOKEN"]),
 	}
 }
 

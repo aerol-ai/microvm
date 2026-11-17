@@ -65,13 +65,80 @@ identity:
 
 # Enterprise mode on every node (SB_ENTERPRISE_MODE): sandboxd refuses to
 # start unless every strict security rule holds (docs: Enterprise mode).
-# Needs identity.enabled. Not yet bootable on Kubernetes: every node then
-# also needs the admin token limited to the host and cluster peers
-# (SB_PAT_SCOPE=host, which the operator's calls to the servers cannot
-# meet yet), an S3 Object Lock audit witness and an off-node audit export,
-# and the chart sets none of these.
+# Cluster mode only. Needs identity.enabled, audit.witness and an off-node
+# audit.export. It also limits the admin token to the pod itself and the
+# cluster's own nodes (SB_PAT_SCOPE=host) on every node, on a loopback
+# port of its own (21219): the edge reaches sandboxd on a socket where the
+# admin token is refused, the operator calls the servers with an admin API
+# token of its own, and you reach a server with the admin token only
+# through `kubectl port-forward pod/<server> 21212:21219`. Use SSO or an
+# API token for everything else. A pod reads this when it is made: turn it
+# on in an upgrade of its own, after any version upgrade has finished, then
+# replace the running pods as for identity.enabled (the install's notes list
+# the steps). More than 10 gateways also needs
+# worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS: "true", and a router in
+# front of them that sends each request to its sandbox's gateway.
 enterprise:
   enabled: false
+
+# Audit evidence kept off the nodes (docs: Audit evidence). Every node writes
+# to them, so each needs the bucket's rights (credentials, below).
+audit:
+  # The audit witness: an S3 bucket with Object Lock, where each node writes
+  # its audit chain's head so a node cannot rewrite its own history
+  # (SB_AUDIT_WITNESS_*). Enterprise mode requires it. The bucket needs
+  # versioning, Object Lock with a default retention of at least the audit
+  # retention (30 days unless changed), and a node role with s3:ListBucket
+  # and no delete rights. Empty bucket: off.
+  witness:
+    bucket: ""
+    # Key prefix; empty keeps sandboxd's.
+    prefix: ""
+    region: ""
+    # An S3-compatible store's address instead of AWS (https in enterprise
+    # mode), with path-style addressing if it needs it.
+    endpoint: ""
+    pathStyle: false
+  # Where each node ships its audit records (SB_AUDIT_EXPORT_*): s3 (a
+  # bucket, any S3-compatible store) or webhook (your collector, over
+  # https in enterprise mode). Enterprise mode requires one of them.
+  export:
+    backend: ""
+    s3:
+      bucket: ""
+      prefix: ""
+      region: ""
+      endpoint: ""
+      pathStyle: false
+    webhook:
+      url: ""
+      # A Secret in each namespace a node runs in, holding the collector's
+      # bearer token (at least 32 bytes in enterprise mode).
+      bearerTokenSecret: ""
+      bearerTokenKey: token
+  # How every node signs in to S3 for the witness and an s3 export: AWS's
+  # usual order (keys in the environment, then the pod's IAM role).
+  credentials:
+    # IRSA: the chart makes the service account <release>-node in each
+    # namespace a node runs in, with these annotations
+    # (eks.amazonaws.com/role-arn), and runs every node under it; the role
+    # reaches each pod's agent container only. That account holds no
+    # Kubernetes rights. A gateway with cluster.agentSandboxAPI keeps its
+    # own, <cluster>-gateway, which holds that API's two rights and gets the
+    # same annotations: trust it in the role too. (EKS Pod Identity is not
+    # supported: the workers' egress NetworkPolicy keeps them off its agent's
+    # link-local address.)
+    serviceAccount:
+      create: false
+      annotations: {}
+    # Or a Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, in each
+    # namespace a node runs in.
+    existingSecret: ""
+    # A ConfigMap in each namespace a node runs in that holds the CA
+    # certificate (PEM) of a private S3 endpoint (AWS_CA_BUNDLE).
+    caBundle:
+      existingConfigMap: ""
+      key: ca.crt
 
 worker:
   # The runtime container's budget is the sandboxes' budget: every sandbox

@@ -95,6 +95,14 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
+  {{- if and (eq $ns $.Release.Namespace) ($.Values.enterprise | default dict).enabled }}
+  # Enterprise mode: the servers take the admin token only from their own
+  # pod, so the operator makes its own API token through a port-forward to
+  # one (a server's API port, from this namespace only).
+  - apiGroups: [""]
+    resources: [pods/portforward]
+    verbs: [create]
+  {{- end }}
   - apiGroups: [aerolvm.io]
     resources: [aerolclusters, aerolnodes]
     verbs: [get, list, watch, create, update, patch, delete]

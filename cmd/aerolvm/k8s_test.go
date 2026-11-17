@@ -258,6 +258,11 @@ func TestK8sVerifyFailures(t *testing.T) {
 		{name: "a join identity token", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"join-identity","projected":{"sources":[{"serviceAccountToken":{"audience":"aerolvm.io/join","expirationSeconds":600,"path":"token"}}]}}`, 1)
 		})}, check: "no Kubernetes API credential in the pods", want: "pass"},
+		// AWS's token for the node's IAM role (IRSA), which EKS adds to a
+		// pod under an annotated service account: the API server refuses it.
+		{name: "an IRSA token", f: &fakeK8s{pods: podsWith(func(s string) string {
+			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"aws-iam-token","projected":{"sources":[{"serviceAccountToken":{"audience":"sts.amazonaws.com","expirationSeconds":86400,"path":"token"}}]}}`, 1)
+		})}, check: "no Kubernetes API credential in the pods", want: "pass"},
 		{name: "a token for the API server's audience", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `{"name":"containerd","emptyDir":{}}`, `{"name":"join-identity","projected":{"sources":[{"serviceAccountToken":{"audience":"https://kubernetes.default.svc","path":"token"}}]}}`, 1)
 		})}, check: "no Kubernetes API credential in the pods", want: "fail: aerolvm-0: volume join-identity holds a service account token"},

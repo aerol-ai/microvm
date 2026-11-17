@@ -528,14 +528,20 @@ func k8sNoAPIRights(pods []k8sPod, releaseNamespace string) k8sCheck {
 // operator (plans/kubernetes-v2-architecture.md §15.2).
 const k8sJoinAudience = "aerolvm.io/join"
 
-// k8sJoinIdentityToken says whether a projected token is a joining pod's
-// proof of who it is: made for the operator's audience alone, which the API
-// server refuses, so it opens nothing in the Kubernetes API.
+// k8sOtherAudiences are tokens made for someone other than the API server,
+// which refuses them: AWS's, for a node's IAM role through IRSA or EKS Pod
+// Identity (the chart's audit.credentials.serviceAccount), which EKS adds
+// to the pod.
+var k8sOtherAudiences = map[string]bool{k8sJoinAudience: true, "sts.amazonaws.com": true, "pods.eks.amazonaws.com": true}
+
+// k8sJoinIdentityToken says whether a projected token is for an audience
+// the API server refuses, so it opens nothing in the Kubernetes API: a
+// joining pod's proof of who it is, for the operator, or AWS's.
 func k8sJoinIdentityToken(raw json.RawMessage) bool {
 	var sat struct {
 		Audience string `json:"audience"`
 	}
-	return json.Unmarshal(raw, &sat) == nil && sat.Audience == k8sJoinAudience
+	return json.Unmarshal(raw, &sat) == nil && k8sOtherAudiences[sat.Audience]
 }
 
 // k8sPrivileged checks privilege stays where §7 and §15.1 put it: in the

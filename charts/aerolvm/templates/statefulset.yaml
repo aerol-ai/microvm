@@ -30,6 +30,10 @@ spec:
     metadata:
       labels:
         {{- include "aerolvm.selector" . | nindent 8 }}
+      {{- with include "aerolvm.nodePodAnnotations" (dict "root" . "role" "worker") | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
       {{- include "aerolvm.workerPodSpec" (dict "root" . "cluster" false) | nindent 6 }}
 {{- end }}

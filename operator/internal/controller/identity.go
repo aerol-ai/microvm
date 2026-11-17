@@ -369,12 +369,12 @@ func (h *JoinIssuer) issue(ctx context.Context, req *http.Request) (JoinGrant, *
 		}
 		pod = fresh
 	}
-	admin, err := adminToken(ctx, h.Client, &c)
+	cred, err := apiCredentials(ctx, h.Client, &c, h.now())
 	if err != nil {
 		h.unmark(ctx, marked)
 		return JoinGrant{}, marked, retry("reading the admin credential: %v", err)
 	}
-	tok, err := h.API(apiURL(&c), admin).MintJoinToken(ctx, sandboxdRole(n.Spec.Role), joinTokenLife.String(), "aerolvm-operator:"+n.Name)
+	tok, err := h.API(apiURL(&c), cred).MintJoinToken(ctx, sandboxdRole(n.Spec.Role), joinTokenLife.String(), "aerolvm-operator:"+n.Name)
 	if err != nil {
 		// Minting needs a Raft leader. The pod asks again; unmark it so
 		// the next request is not refused as a second one.

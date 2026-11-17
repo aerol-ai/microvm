@@ -20,6 +20,7 @@ import (
 // patScopeRequest is one request in the listener-split tables.
 type patScopeRequest struct {
 	socket    bool   // the public Unix socket (PublicHandler)
+	remoteAPI bool   // the API port beside SB_PAT_LOCAL_LISTEN (RemoteHandler)
 	remote    string // the TCP peer; "" keeps a socket's empty address
 	peer      bool   // a verified mTLS cluster peer
 	forwarded bool   // X-Cluster-Forwarded: 1
@@ -61,6 +62,9 @@ func (p patScopeRequest) serve(srv *Server) *httptest.ResponseRecorder {
 	h := srv.Handler()
 	if p.socket {
 		h = srv.PublicHandler()
+	}
+	if p.remoteAPI {
+		h = srv.RemoteHandler()
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -118,6 +122,21 @@ func TestPATScopeListenerSplit(t *testing.T) {
 			host: ok(controlplane.PrincipalToken), any: ok(controlplane.PrincipalToken)},
 		{name: "a wrong token stays a bare 401", req: patScopeRequest{remote: "127.0.0.1:5555", bearer: "nope"},
 			host: refused, any: refused},
+		// Review S3: a mesh sidecar relays outside callers from other
+		// loopback addresses (Istio: 127.0.0.6). Only 127.0.0.1 and ::1 are
+		// this host.
+		{name: "PAT relayed by Istio's sidecar (127.0.0.6)", req: patScopeRequest{remote: "127.0.0.6:41234", bearer: "pat-token"},
+			host: refused, any: ok(controlplane.PrincipalOperator)},
+		{name: "PAT from elsewhere in 127.0.0.0/8", req: patScopeRequest{remote: "127.1.2.3:41234", bearer: "pat-token"},
+			host: refused, any: ok(controlplane.PrincipalOperator)},
+		{name: "PAT from a v4-mapped 127.0.0.1", req: patScopeRequest{remote: "[::ffff:127.0.0.1]:5555", bearer: "pat-token"},
+			host: ok(controlplane.PrincipalOperator), any: ok(controlplane.PrincipalOperator)},
+		// With SB_PAT_LOCAL_LISTEN the API port takes it from no one: a
+		// Linkerd sidecar delivers outside callers from 127.0.0.1 itself.
+		{name: "PAT from 127.0.0.1 on the API port beside the admin listener", req: patScopeRequest{remoteAPI: true, remote: "127.0.0.1:5555", bearer: "pat-token"},
+			host: refused, any: ok(controlplane.PrincipalOperator)},
+		{name: "an avm_ token on the API port beside the admin listener", req: patScopeRequest{remoteAPI: true, remote: "10.0.0.5:4000", bearer: "avm_fleet"},
+			host: ok(controlplane.PrincipalToken), any: ok(controlplane.PrincipalToken)},
 	}
 	for _, scope := range []string{config.PATScopeHost, config.PATScopeAny} {
 		for _, tc := range cases {
@@ -299,6 +318,9 @@ func TestClientAddress(t *testing.T) {
 		{name: "a remote caller picking its own address", trust: true, req: patScopeRequest{remote: "198.51.100.7:4000", clientIP: "10.1.1.1"}, want: "198.51.100.7", counts: true},
 		{name: "a cluster peer never sets it", trust: true, req: patScopeRequest{remote: "10.0.0.9:7002", peer: true, clientIP: "10.1.1.1"}, want: "10.0.0.9", counts: true},
 		{name: "not an IP", trust: true, req: patScopeRequest{remote: "127.0.0.1:5555", clientIP: "attacker.example"}, want: "127.0.0.1", counts: true},
+		// Review S3: a mesh sidecar's loopback address is not Caddy.
+		{name: "a caller relayed by Istio's sidecar picking its own address", trust: true,
+			req: patScopeRequest{remote: "127.0.0.6:41234", clientIP: "10.1.1.1"}, want: "127.0.0.6", counts: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

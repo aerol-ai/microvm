@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // nodeEnv is what the node's env files say: sandboxd.env with cluster.env
@@ -57,10 +58,12 @@ func (e nodeEnv) clusterMode() bool {
 
 func (e nodeEnv) apiPort() string { return e.getOr("SB_API_PORT", defaultAPIPort) }
 
-// localAPI is this node's API on loopback.
+// localAPI is this node's API on loopback, where it takes the admin token:
+// the admin token's own listener when the node has one
+// (SB_PAT_LOCAL_LISTEN), else the API port.
 func (e nodeEnv) localAPI(base string) *localAPI {
 	if base == "" {
-		base = "http://127.0.0.1:" + e.apiPort()
+		base = config.LocalAdminURLFromEnv(e.get)
 	}
 	return &localAPI{base: base, pat: e.get("SB_PAT_TOKEN")}
 }

@@ -1862,6 +1862,16 @@ type Config struct {
 	// PATScopeHost: every request on it is public, so a PAT there is
 	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
 	PublicAPISocket string
+	// PublicAPISocketGroup is the group that may reach PublicAPISocket
+	// (Caddy's): a name, or a numeric gid used as is. Default "caddy".
+	// SB_PUBLIC_API_SOCKET_GROUP.
+	PublicAPISocketGroup string
+	// PATLocalListen, under PATScopeHost, is a loopback listener of its own
+	// (127.0.0.1:<port> or [::1]:<port>) where the PAT is taken from this
+	// host; the API port then counts no peer as this host, loopback
+	// included. Empty: the API port's loopback peers count as this host,
+	// as on a VM. SB_PAT_LOCAL_LISTEN.
+	PATLocalListen string
 	// LivenessSocket is the Unix socket sandboxd answers liveness on from
 	// the first moment of its boot, for the install.sh watchdog. It does no
 	// I/O and takes no lock, so a daemon busy serving the API still answers

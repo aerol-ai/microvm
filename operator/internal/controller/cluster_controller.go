@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -72,14 +73,31 @@ type ClusterReconciler struct {
 	// Reader reads past the manager's cache: the API server's Service and
 	// addresses live in default (syncEgressFloor). Nil uses the client.
 	Reader client.Reader
+	// Forward opens a port-forward to a pod (portforward.go), for the
+	// operator's first API token in enterprise mode (operator_token.go).
+	Forward PortForwarder
 	// Now is the clock; tests replace it.
 	Now func() time.Time
+
+	// When each cluster's operator tokens were last swept
+	// (sweepOperatorTokens).
+	sweepMu sync.Mutex
+	sweptAt map[types.UID]time.Time
+}
+
+func (r *ClusterReconciler) now() time.Time {
+	if r.Now == nil {
+		return time.Now()
+	}
+	return r.Now()
 }
 
 // +kubebuilder:rbac:groups=aerolvm.io,resources=aerolclusters;aerolnodes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=aerolvm.io,resources=aerolclusters/status;aerolnodes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=secrets;services;persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// In enterprise mode only: the operator's first API token (operator_token.go).
+// +kubebuilder:rbac:groups="",resources=pods/portforward,verbs=create
 
 // Reconcile brings one AerolCluster's objects to its spec.
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -98,8 +116,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	// Fixed: the status update at the end of this pass clears it.
 	meta.RemoveStatusCondition(&c.Status.Conditions, CondRefused)
-	token, err := r.ensureAdminSecret(ctx, &c)
-	if err != nil {
+	if _, err := r.ensureAdminSecret(ctx, &c); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.ensureServices(ctx, &c); err != nil {
@@ -124,7 +141,19 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureServers(ctx, &c, nodes); err != nil {
 		return ctrl.Result{}, err
 	}
-	api := r.API(apiURL(&c), token)
+	// Before any call: in enterprise mode the servers refuse the admin
+	// token over the API Service. A failure is retried. The calls below use
+	// the token it returns, not a re-read of the cache, which may not show
+	// a token just stored.
+	held, err := r.ensureOperatorToken(ctx, &c)
+	if err != nil {
+		logger.Info("the operator's API token is not ready; retrying", "err", err.Error())
+	}
+	cred, err := credentialsFor(ctx, r.Client, &c, r.now(), held)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	api := r.API(apiURL(&c), cred)
 	bootstrapped := meta.IsStatusConditionTrue(c.Status.Conditions, CondBootstrapped)
 	if !bootstrapped {
 		// The rest needs a running control plane: join tokens come from it.

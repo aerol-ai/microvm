@@ -11,7 +11,9 @@ Usage:
 
 Options:
   --node NODE       Node ID. Defaults to SB_NODE_ID from env files.
-  --api-url URL     sandboxd API URL. Defaults to http://127.0.0.1:${SB_API_PORT:-21212}.
+  --api-url URL     sandboxd API URL. Defaults to http://127.0.0.1:${SB_API_PORT:-21212},
+                    or http://${SB_PAT_LOCAL_LISTEN} where the node has the admin
+                    token's own listener (SB_PAT_SCOPE=host).
   --env-file PATH   Env file to source. May be repeated.
   --wait-empty      After drain, wait until the node owns zero placements.
   --timeout SEC     Wait timeout. pre-role-change defaults to 3600; drain defaults to 0.
@@ -97,7 +99,22 @@ for env_file in "${env_files[@]}"; do
 done
 
 node_id="${node_arg:-${SB_NODE_ID:-}}"
-api_url="${api_url_arg:-http://127.0.0.1:${SB_API_PORT:-21212}}"
+# The admin token's own listener when the node has one: its API port then
+# refuses the admin token, from loopback too (sandboxd's LocalAdminURL).
+# Only a loopback literal, as sandboxd takes it: anything else in an env
+# file would send the admin token off the machine.
+# The API port as sandboxd reads it: a whole number 1-65535, else 21212
+# (a value such as 21212@collector.example would make 127.0.0.1:21212 the
+# userinfo of another host).
+api_port="$(tr -d '[:space:]' <<<"${SB_API_PORT:-}")"
+[[ "$api_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( api_port <= 65535 )) || api_port=21212
+default_api_url="http://127.0.0.1:${api_port}"
+listen="$(tr -d '[:space:]' <<<"${SB_PAT_LOCAL_LISTEN:-}")"
+if [[ "$(tr '[:upper:]' '[:lower:]' <<<"${SB_PAT_SCOPE:-}" | tr -d '[:space:]')" == host ]] &&
+	[[ "$listen" =~ ^(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$ ]] && (( BASH_REMATCH[2] <= 65535 )); then
+	default_api_url="http://${listen}"
+fi
+api_url="${api_url_arg:-$default_api_url}"
 api_url="${api_url%/}"
 
 if [[ -z "$node_id" ]]; then

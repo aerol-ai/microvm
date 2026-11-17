@@ -3,6 +3,7 @@ package aerolapi
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -177,5 +178,142 @@ func TestCallTimeout(t *testing.T) {
 	defer cancel()
 	if c.Ready(ctx) {
 		t.Fatal("ready from a server that never answers")
+	}
+}
+
+// A credential the server refuses with 401 is sent once more as Fallback,
+// with the same body: servers made before and after enterprise mode was
+// turned on take different ones. Any other refusal, or a fallback equal to
+// the token, is not retried.
+func TestFallbackCredential(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seen = append(seen, auth+" "+string(body))
+		switch {
+		case r.URL.Path == "/v1/cluster/nodes/busy/cordon":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case auth == "new":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "old")
+	c.Fallback = "new"
+	if _, err := c.MintJoinToken(context.Background(), "worker", "10m", "op"); err != nil {
+		t.Fatalf("mint with a refused token and a good fallback: %v", err)
+	}
+	if len(seen) != 2 || !strings.HasPrefix(seen[0], "old {") || seen[1] != "new"+seen[0][len("old"):] {
+		t.Fatalf("calls = %q: want the token, then the fallback with the same body", seen)
+	}
+	seen = nil
+	if err := c.Cordon(context.Background(), "busy"); !IsStatus(err, http.StatusServiceUnavailable) || len(seen) != 1 {
+		t.Fatalf("a 503 was retried: %v %q", err, seen)
+	}
+	seen = nil
+	c.Token, c.Fallback = "bad", "bad"
+	if err := c.WhoAmI(context.Background()); !IsStatus(err, http.StatusUnauthorized) || len(seen) != 1 {
+		t.Fatalf("the same credential was sent twice: %v %q", err, seen)
+	}
+	seen = nil
+	c.Fallback = ""
+	if err := c.WhoAmI(context.Background()); !IsStatus(err, http.StatusUnauthorized) || len(seen) != 1 {
+		t.Fatalf("no fallback: %v %q", err, seen)
+	}
+}
+
+// The token routes the operator's own API token uses.
+func TestTokenRoutes(t *testing.T) {
+	var calls []string
+	created := `{"id":"tok_1","name":"aerolvm-operator-1","role":"admin","team":"*","created_at":"2026-11-17T12:00:00Z","expires_at":"2026-12-17T12:00:00Z","token":"avm_s"}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls = append(calls, r.Method+" "+r.URL.Path+" "+string(body))
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(string(body), `"name":"empty"`):
+			_, _ = w.Write([]byte(`{"id":"tok_2"}`))
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(created))
+		case r.URL.Path == "/v1/tokens/tok_gone":
+			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/v1/tokens/tok_err":
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/v1/whoami":
+			_, _ = w.Write([]byte(`{"principal":"token:tok_1"}`))
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "tok")
+	got, err := c.CreateToken(context.Background(), "aerolvm-operator-1", "admin", "*", "720h0m0s")
+	if err != nil || got.ID != "tok_1" || got.Token != "avm_s" || !got.ExpiresAt.Equal(time.Date(2026, 12, 17, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("create = %+v %v", got, err)
+	}
+	var req map[string]string
+	if err := json.Unmarshal([]byte(strings.SplitN(calls[0], " ", 3)[2]), &req); err != nil ||
+		req["name"] != "aerolvm-operator-1" || req["role"] != "admin" || req["team"] != "*" || req["expires_in"] != "720h0m0s" {
+		t.Fatalf("create body = %v %v", req, err)
+	}
+	if _, err := c.CreateToken(context.Background(), "empty", "admin", "*", "1h"); err == nil {
+		t.Fatal("a created token without its secret was taken")
+	}
+	for id, ok := range map[string]bool{"tok_1": true, "tok_gone": true, "tok_err": false} {
+		if err := c.RevokeToken(context.Background(), id); (err == nil) != ok {
+			t.Errorf("revoke %s: %v", id, err)
+		}
+	}
+	if err := c.WhoAmI(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A server that refuses the fallback as an admin token sent from off its
+// own pod (SB_PAT_SCOPE=host) does not get it again from this client
+// (review S1).
+func TestFallbackStopsAfterAHostScopeRefusal(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		seen = append(seen, auth)
+		w.WriteHeader(http.StatusUnauthorized)
+		if auth == "pat" {
+			_, _ = w.Write([]byte(`{"error":"the operator token works only on this host; sign in with ` + "`aerolvm login --sso`" + ` or use a named token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"error":"unauthorized","reason":"unknown_or_revoked"}`))
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "tok")
+	c.Fallback = "pat"
+	for i := 0; i < 3; i++ {
+		_ = c.WhoAmI(context.Background())
+	}
+	if strings.Join(seen, ",") != "tok,pat,tok,tok" {
+		t.Fatalf("sent %q: the admin token went again after the server refused it as off-host", seen)
+	}
+}
+
+// Any other refusal of the fallback (an unknown token, a server catching
+// up) does not stop the next call from sending it.
+func TestFallbackKeptAfterAnotherRefusal(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized","reason":"unknown_or_revoked"}`))
+	}))
+	defer srv.Close()
+	c := New(srv.URL, "tok")
+	c.Fallback = "pat"
+	_ = c.WhoAmI(context.Background())
+	_ = c.WhoAmI(context.Background())
+	if strings.Join(seen, ",") != "tok,pat,tok,pat" {
+		t.Fatalf("sent %q", seen)
 	}
 }

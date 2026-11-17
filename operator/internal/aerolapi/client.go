@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/upgradewire"
@@ -25,9 +26,20 @@ type Client struct {
 	// BaseURL is the servers' API Service, such as
 	// http://prod-api.aerolvm-system.svc:21212.
 	BaseURL string
-	// Token is the cluster's admin token (SB_PAT_TOKEN).
+	// Token is the credential every call carries: the cluster's admin
+	// token (SB_PAT_TOKEN), or the operator's own admin API token where
+	// the servers take the admin token only from their own pod.
 	Token string
-	HTTP  *http.Client
+	// Fallback, when set, is sent once if the server answers Token with
+	// 401. While enterprise mode is turned on or off, servers made before
+	// the change take one credential and servers made after it the other.
+	// A 401 is answered before the call does anything, so sending it again
+	// is safe.
+	Fallback string
+	HTTP     *http.Client
+	// fallbackRefused: a server refused Fallback as an admin token from off
+	// its own pod; it is not sent again.
+	fallbackRefused atomic.Bool
 	// CallTimeout bounds every call but an evacuate pass (zero: only the
 	// HTTP client's own bound).
 	CallTimeout time.Duration
@@ -86,25 +98,50 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return c.call(ctx, method, path, body, out)
 }
 
-// call makes a call bounded only by ctx and the HTTP client.
+// call makes a call bounded only by ctx and the HTTP client: with Token,
+// then once with Fallback if Token is refused as unauthenticated.
 func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
-	var rd io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if raw, err = json.Marshal(body); err != nil {
 			return err
 		}
-		rd = bytes.NewReader(raw)
+	}
+	err := c.send(ctx, method, path, raw, body != nil, out, c.Token)
+	if c.Fallback != "" && c.Fallback != c.Token && !c.fallbackRefused.Load() && IsStatus(err, http.StatusUnauthorized) {
+		ferr := c.send(ctx, method, path, raw, body != nil, out, c.Fallback)
+		if isHostScopeRefusal(ferr) {
+			// The server takes the admin token only from its own pod: the
+			// rest of this client's calls do not send it again.
+			c.fallbackRefused.Store(true)
+		}
+		return ferr
+	}
+	return err
+}
+
+// isHostScopeRefusal reports a 401 for an admin token sent from off the
+// server's own pod (SB_PAT_SCOPE=host).
+func isHostScopeRefusal(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == http.StatusUnauthorized && strings.Contains(e.Reason, "works only on this host")
+}
+
+func (c *Client) send(ctx context.Context, method, path string, body []byte, hasBody bool, out any, token string) error {
+	var rd io.Reader
+	if hasBody {
+		rd = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, rd)
 	if err != nil {
 		return err
 	}
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	hc := c.HTTP
 	if hc == nil {
@@ -306,4 +343,57 @@ func (c *Client) ApplyImages(ctx context.Context, version string, req upgradewir
 // Rollback sends the current rollout back to the previous version.
 func (c *Client) Rollback(ctx context.Context) error {
 	return c.do(ctx, http.MethodPost, upgradewire.ClusterUpgradeRollbackPath+operatorDriver, nil, nil)
+}
+
+// APIToken is an API token as the server lists it: never its secret.
+type APIToken struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Role      string    `json:"role"`
+	Team      string    `json:"team"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// CreatedAPIToken is a new token with its secret, which the server shows
+// this once.
+type CreatedAPIToken struct {
+	APIToken
+	Token string `json:"token"`
+}
+
+// CreateToken makes an API token (POST /v1/tokens). expiresIn is a Go
+// duration or a number of days ("30d").
+func (c *Client) CreateToken(ctx context.Context, name, role, team, expiresIn string) (CreatedAPIToken, error) {
+	var out CreatedAPIToken
+	err := c.do(ctx, http.MethodPost, "/v1/tokens",
+		map[string]string{"name": name, "role": role, "team": team, "expires_in": expiresIn}, &out)
+	if err == nil && (out.Token == "" || out.ID == "") {
+		err = errors.New("aerolvm: a created token came back without its id or secret")
+	}
+	return out, err
+}
+
+// ListTokens is every API token (GET /v1/tokens), never a secret.
+func (c *Client) ListTokens(ctx context.Context) ([]APIToken, error) {
+	var out struct {
+		Tokens []APIToken `json:"tokens"`
+	}
+	err := c.do(ctx, http.MethodGet, "/v1/tokens", nil, &out)
+	return out.Tokens, err
+}
+
+// RevokeToken deletes an API token; one already gone is not an error.
+func (c *Client) RevokeToken(ctx context.Context, id string) error {
+	err := c.do(ctx, http.MethodDelete, "/v1/tokens/"+url.PathEscape(id), nil, nil)
+	if IsStatus(err, http.StatusNotFound) {
+		return nil
+	}
+	return err
+}
+
+// WhoAmI checks the client's credential (GET /v1/whoami): nil when the
+// server takes it.
+func (c *Client) WhoAmI(ctx context.Context) error {
+	return c.do(ctx, http.MethodGet, "/v1/whoami", nil, nil)
 }

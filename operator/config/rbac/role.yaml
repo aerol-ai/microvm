@@ -36,6 +36,12 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  - pods/portforward
+  verbs:
+  - create
+- apiGroups:
   - aerolvm.io
   resources:
   - aerolclusters

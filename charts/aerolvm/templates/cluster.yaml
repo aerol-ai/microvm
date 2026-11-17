@@ -55,18 +55,30 @@ data:
     metadata:
       labels:
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- with include "aerolvm.nodePodAnnotations" (dict "root" . "role" "server") | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
       {{- include "aerolvm.controlPodSpec" (dict "root" . "role" "server") | nindent 6 }}
   gateway: |
     metadata:
       labels:
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- with include "aerolvm.nodePodAnnotations" (dict "root" . "role" "gateway") | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
       {{- include "aerolvm.controlPodSpec" (dict "root" . "role" "gateway") | nindent 6 }}
   worker: |
     metadata:
       labels:
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- with include "aerolvm.nodePodAnnotations" (dict "root" . "role" "worker") | trim }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
       {{- include "aerolvm.workerPodSpec" (dict "root" . "cluster" true) | nindent 6 }}
 ---
