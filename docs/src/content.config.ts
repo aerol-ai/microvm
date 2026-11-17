@@ -66,6 +66,7 @@ const clusterPages = [
 const kubernetesPages = [
   ...[
     ['single-node', 'Single mode (quick start)'],
+    ['eks', 'One-click EKS'],
     ['production', 'Production install'],
     ['networking', 'HTTPS and networking'],
     ['security', 'Security'],

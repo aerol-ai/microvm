@@ -9,6 +9,10 @@ In cluster mode, the chart installs an **operator** and one `AerolCluster` objec
 
 This page installs it on EKS with Karpenter. Notes for AKS and fixed node groups are inline. Plan about an hour.
 
+<Aside>
+**Starting from nothing on AWS?** [One-click EKS](/kubernetes/eks/) does every step on this page for you, on a new EKS cluster, from one CloudFormation stack.
+</Aside>
+
 ```mermaid
 flowchart TB
     App["Your app (SDK, CLI or kubectl)"] --> Svc["Service aerolvm-gateway"]
@@ -146,6 +150,15 @@ spec:
 
 ```bash title="Your machine"
 kubectl apply -f karpenter-aerolvm.yaml
+```
+
+Then lower Karpenter's memory guess. Before it starts a machine, Karpenter guesses how much memory the machine will have, and by default it takes 7.5% off for the system. On EKS the real loss is 3.5 to 4.1%. The worker pod asks for nearly the whole machine, so with the default, Karpenter thinks it fits no machine on `m7i.4xlarge` and larger, and never starts one. Set the guess to 4%. This setting belongs to the Karpenter install, not the NodePool:
+
+```bash title="Your machine"
+# Keep the namespace and version of your Karpenter install.
+helm upgrade karpenter oci://public.ecr.aws/karpenter/karpenter \
+  --namespace kube-system --version <your Karpenter version> \
+  --reuse-values --set settings.vmMemoryOverheadPercent=0.04
 ```
 
 Every worker pod carries `karpenter.sh/do-not-disrupt`, so Karpenter never takes a machine that runs one. When a machine drifts (a new AMI, a changed NodePool), the operator moves its sandboxes off, then lets Karpenter replace it.
@@ -357,6 +370,7 @@ Start with `kubectl -n aerolvm-system get aerolcluster,aerolnodes`. Most problem
 | What you see | Why, and what to do |
 |---|---|
 | A server or gateway stays `Pending` | No machine has room. `kubectl -n aerolvm-system get aerolnodes` shows the scheduler's reason, such as `Insufficient cpu`. Use machines with 4 or more CPUs for AerolVM's own pods. |
+| A worker pod stays `Pending` and Karpenter starts no machine | `kubectl -n aerolvm-workers describe pod <name>` shows `no instance type has enough resources`. Karpenter's memory guess is too high for the worker pod: set `settings.vmMemoryOverheadPercent` to `0.04` ([Karpenter](#karpenter)). |
 | A server's PVC stays `Pending` | The StorageClass is missing, or binds `Immediate` instead of `WaitForFirstConsumer`. |
 | A worker's state is `Failed` | Its machine failed a check. `kubectl -n aerolvm-system get aerolnode <name> -o jsonpath='{.status.reason}'` names it, for example `preflight failed: br_netfilter: ...`. The operator starts a worker on another machine, and the bad pod stays on its machine so nothing else lands there. Fix the machine, or delete it. |
 | A node has the condition `IdentityDenied` | The operator refused the pod's identity. `kubectl -n aerolvm-system describe aerolnode <name>` says why. Check the cluster runs Kubernetes 1.30 or later. |
