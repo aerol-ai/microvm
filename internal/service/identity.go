@@ -270,7 +270,7 @@ func (s *Service) loadIdentitySigner(ctx context.Context, create bool) (*identit
 		return nil, fmt.Errorf("%w: read signing keys: %v", ErrIdentityUnavailable, err)
 	}
 	if _, ok := set.Active(); !ok {
-		if !create {
+		if !create || !s.mayMakeIdentityKeys() {
 			return nil, fmt.Errorf("%w: no signing key yet", ErrIdentityUnavailable)
 		}
 		if set, err = s.writeIdentityKeys(ctx, func(cur cloudidentity.KeySet) (cloudidentity.KeySet, bool, error) {
@@ -327,6 +327,24 @@ func (s *Service) writeIdentityKeys(ctx context.Context, decide func(cloudidenti
 }
 
 func (s *Service) newIdentityKeyRecord() (cloudidentity.KeyRecord, error) {
+	// Once servers sign (server_signing.go), a key is sealed with their own
+	// key, and only a server makes one.
+	sealer, err := s.identityServerSealer()
+	if err != nil {
+		return cloudidentity.KeyRecord{}, fmt.Errorf("%w: %v", ErrIdentityUnavailable, err)
+	}
+	if sealer != nil {
+		key, err := cloudidentity.GenerateKey(s.identityRand())
+		if err != nil {
+			return cloudidentity.KeyRecord{}, err
+		}
+		rec, err := cloudidentity.NewKeyRecord(key, s.identityNow(), sealer.Seal)
+		rec.Seal = cloudidentity.SealServer
+		return rec, err
+	}
+	if s.currentSigningMode().on {
+		return cloudidentity.KeyRecord{}, fmt.Errorf("%w: only servers make signing keys", ErrIdentityUnavailable)
+	}
 	if s.cipher == nil {
 		return cloudidentity.KeyRecord{}, fmt.Errorf("%w: no server key to seal the signing key with", ErrIdentityUnavailable)
 	}
@@ -338,10 +356,20 @@ func (s *Service) newIdentityKeyRecord() (cloudidentity.KeyRecord, error) {
 }
 
 func (s *Service) openIdentityKey(rec cloudidentity.KeyRecord) (*rsa.PrivateKey, error) {
-	if s.cipher == nil {
+	if s.cipher == nil && rec.Seal != cloudidentity.SealServer {
 		return nil, fmt.Errorf("%w: no server key to open the signing key with", ErrIdentityUnavailable)
 	}
-	der, err := s.cipher.DecryptWithAAD(rec.SealedPrivate, cloudidentity.SealAAD(rec.ID))
+	var der []byte
+	var err error
+	if rec.Seal == cloudidentity.SealServer {
+		sealer, serr := s.identityServerSealer()
+		if serr != nil || sealer == nil {
+			return nil, fmt.Errorf("%w: signing key %s is sealed for servers, and this node is not one", ErrIdentityUnavailable, rec.ID)
+		}
+		der, err = sealer.Open(rec.SealedPrivate, cloudidentity.SealAAD(rec.ID))
+	} else {
+		der, err = s.cipher.DecryptWithAAD(rec.SealedPrivate, cloudidentity.SealAAD(rec.ID))
+	}
 	if err != nil {
 		// Never the bytes: only which key could not be opened.
 		return nil, fmt.Errorf("%w: open signing key %s: %v", ErrIdentityUnavailable, rec.ID, err)

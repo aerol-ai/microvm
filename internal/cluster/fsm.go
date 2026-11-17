@@ -64,8 +64,8 @@ const (
 	// are the join ops (fsm_join.go); 48-50 are the active version and
 	// rollout ops (fsm_rollout.go); 51 is opSetRunStates (fsm_run_state.go);
 	// 52 is opAdmitNodeByCert (fsm_join.go); 53 is opSetKubeWarmDepths
-	// (fsm_kube_warm.go); 54 is opMoveHandoff (fsm_move_handoff.go).
-	// The next free code is 55.
+	// (fsm_kube_warm.go); 54 is opMoveHandoff (fsm_move_handoff.go); 55 is
+	// opPutServerSigning (fsm_server_signing.go). The next free code is 56.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -252,6 +252,8 @@ type command struct {
 	WarmPool *WarmPoolRecord `json:"warm_pool,omitempty"`
 	// KubeWarm carries opSetKubeWarmDepths' whole set (fsm_kube_warm.go).
 	KubeWarm []KubeWarmDepth `json:"kube_warm,omitempty"`
+	// ServerSigning carries opPutServerSigning (fsm_server_signing.go).
+	ServerSigning *ServerSigningWrite `json:"server_signing,omitempty"`
 	// RunStates carries opSetRunStates' batch (fsm_run_state.go).
 	RunStates []RunStateReport `json:"run_states,omitempty"`
 	// IdentityKeys carries opPutIdentityKeys; IdentityRole carries
@@ -672,6 +674,9 @@ type placementFSM struct {
 	// their swap must carry (fsm_move_handoff.go, snapshotted). One entry
 	// per move, cleared by its swap, an abort, an orphaning or a delete.
 	moveHandoffs map[string]string
+	// serverSigning is the servers' signing seed, sealed
+	// (fsm_server_signing.go, snapshotted). nil until the first write.
+	serverSigning *ServerSigning
 	// identity is the cloud-identity signing keys and role allow lists
 	// (fsm_identity.go, snapshotted). nil until the first write.
 	identity *identityState
@@ -2131,6 +2136,12 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return nil
 	case opMoveHandoff:
 		return f.applyMoveHandoffLocked(cmd)
+	case opPutServerSigning:
+		result, err := f.applyPutServerSigningLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
 	case opSetKubeWarmDepths:
 		result, err := f.applySetKubeWarmDepthsLocked(cmd)
 		if err != nil {
@@ -4241,6 +4252,11 @@ type fsmSnapshotPayload struct {
 	// an older build ignores it, which is safe because none is written
 	// until every server applies opMoveHandoff (moveHandoffFSMOpsVersion).
 	MoveHandoffs map[string]string
+	// ServerSigning is the servers' signing seed, sealed. Optional; an
+	// older snapshot decodes it as nil, "no record", and an older build
+	// ignores it, which is safe because none is written until the active
+	// cluster version reaches serverSigningFSMOpsVersion.
+	ServerSigning *ServerSigning
 	// IdentityKeys and IdentityRoles are the cloud-identity signing keys
 	// (sealed) and role allow lists. Optional; an older snapshot decodes
 	// them as nil, which reads as "no keys, no roles".
@@ -4361,6 +4377,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		warmPools:          f.warmPoolsSnapshotLocked(),
 		kubeWarm:           f.kubeWarmSnapshotLocked(),
 		moveHandoffs:       f.moveHandoffsSnapshotLocked(),
+		serverSigning:      f.serverSigningSnapshotLocked(),
 		identityKeys:       identityKeys,
 		identityRoles:      identityRoles,
 		deniedNodes:        f.deniedNodesSnapshotLocked(),
@@ -4562,6 +4579,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	}
 	// After the rows: a handoff of a placement the snapshot lacks is dropped.
 	f.restoreMoveHandoffsLocked(payload.MoveHandoffs)
+	f.restoreServerSigningLocked(payload.ServerSigning)
 	// Pre-drain snapshots have a nil DrainedNodes — initialize empty so the
 	// add path can write without a nil-map panic. Active drains carried in
 	// the envelope are copied across verbatim; raft will apply any
@@ -4634,6 +4652,7 @@ type fsmSnapshot struct {
 	warmPools          []WarmPoolRecord
 	kubeWarm           []KubeWarmDepth
 	moveHandoffs       map[string]string
+	serverSigning      *ServerSigning
 	identityKeys       *cloudidentity.KeySet
 	identityRoles      []IdentityRoleRecord
 	teamQuotas         []TeamQuotaRecord
@@ -4685,6 +4704,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		WarmPools:          s.warmPools,
 		KubeWarm:           s.kubeWarm,
 		MoveHandoffs:       s.moveHandoffs,
+		ServerSigning:      s.serverSigning,
 		IdentityKeys:       s.identityKeys,
 		IdentityRoles:      s.identityRoles,
 		TeamQuotas:         s.teamQuotas,

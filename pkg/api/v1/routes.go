@@ -152,7 +152,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// POST /sandboxes is special: placement happens in the wrapper before any
 	// local handler runs. The wrapper falls through to createSandbox when this
 	// node is the chosen owner.
-	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Route(permWrite, http.HandlerFunc(h.clusterCreateWrap)))
+	mux.Handle("POST "+PathPrefix+"/sandboxes", d.Route(permWrite, h.viaServers(h.identityCreateGoesToServer, http.HandlerFunc(h.clusterCreateWrap))))
 	// GET /sandboxes is cluster-wide: clusterListWrap fans out to peers and
 	// merges with the local list so the "any node accepts any request"
 	// invariant covers list, not just per-sandbox routes. Single-node and
@@ -401,6 +401,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalTeamQuotaReadPath, internalOp(http.HandlerFunc(h.clusterInternalTeamQuotaRead)))
 	mux.Handle("POST "+cluster.PublicInternalIdentityWritePath, internalOp(http.HandlerFunc(h.clusterInternalIdentityWrite)))
 	mux.Handle("POST "+cluster.PublicInternalIdentityReadPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityRead)))
+	mux.Handle("GET "+cluster.PublicInternalSigningKeysPath, internalOp(http.HandlerFunc(h.clusterInternalSigningKeys)))
+	mux.Handle("POST "+cluster.PublicInternalSandboxTokenSignPath, internalOp(http.HandlerFunc(h.clusterInternalSandboxTokenSign)))
+	mux.Handle("POST "+cluster.PublicInternalIdentityTokenSignPath, internalOp(http.HandlerFunc(h.clusterInternalIdentityTokenSign)))
 	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolWritePath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolWrite)))
 	mux.Handle("POST "+cluster.PublicInternalWarmPoolReadPath, internalOp(http.HandlerFunc(h.clusterInternalWarmPoolRead)))

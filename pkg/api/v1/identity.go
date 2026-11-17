@@ -161,5 +161,17 @@ func (h *handlers) clusterInternalIdentityRead(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	// Once servers sign (internal/service/server_signing.go), a worker or
+	// gateway needs the public keys only: it neither signs nor keeps them.
+	if resp.Keys != nil && h.deps.Service.ServerSigningOn() {
+		peerID, leaf := internalPeer(r)
+		if cluster.PeerRole(h.deps.Service.Cluster(), peerID, leaf) != cluster.JoinRoleServer {
+			public := resp.Keys.Clone()
+			for i := range public.Keys {
+				public.Keys[i].SealedPrivate = nil
+			}
+			resp.Keys = &public
+		}
+	}
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }

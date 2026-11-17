@@ -109,11 +109,15 @@ type fakeProposalState struct {
 	reclaims   map[string]VolumeReclaim
 	// adoptable is the reclaim keys the sender may take over now.
 	adoptable map[string]bool
+	// signing is whether the server signing record exists.
+	signing bool
 }
 
 func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
 	return f.adoptable[cur.key()]
 }
+
+func (f fakeProposalState) serversSign() bool { return f.signing }
 
 func (f fakeProposalState) placementForProposal(id string, _ bool) (Placement, bool) {
 	p, ok := f.placements[id]
@@ -143,7 +147,7 @@ func TestPeerMayPropose(t *testing.T) {
 		opDeleteWarmPool, opSetKubeWarmDepths, opSetRunStates, opRetireNodeStorage, opRevokeNodeStorage,
 		opOrphanOwner, opPruneAuditACL, opReserveBatch, opAllocateArtifactEpoch, opDenyNode,
 		opPutJoinToken, opDeleteJoinToken, opAdmitNode, opAdoptNodes, opRekeyNode, opAdmitNodeByCert,
-		opSetActiveVersion, opRolloutCommand, opRolloutNode,
+		opSetActiveVersion, opRolloutCommand, opRolloutNode, opPutServerSigning,
 	}
 	var none fakeProposalState
 	for _, op := range serverOnly {

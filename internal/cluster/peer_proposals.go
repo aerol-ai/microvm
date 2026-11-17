@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -216,6 +217,32 @@ func (c *Cluster) memberRecord(nodeID string) (Member, bool) {
 	return c.gossip.lookupMember(nodeID)
 }
 
+// identityKeptBy reports whether a worker's or gateway's cmd leaves a
+// placement's cloud identity and owner as a server set them: a reservation
+// carries no identity; a place or spec write carries none or the one the
+// placement has; a place names no other owner. Dropping an identity is
+// allowed: it only stops the tokens.
+func identityKeptBy(cmd command, st proposalState) bool {
+	wants := cmd.Spec != nil && cmd.Spec.Identity != nil
+	switch cmd.Op {
+	case opReserve:
+		return !wants
+	case opPlace, opUpsertSpec:
+		if cmd.Op == opPlace && strings.TrimSpace(cmd.OwnerRef) != "" {
+			if cur, ok := st.placementForProposal(cmd.SandboxID, false); ok && strings.TrimSpace(cur.OwnerRef) != strings.TrimSpace(cmd.OwnerRef) {
+				return false
+			}
+		}
+		if !wants {
+			return true
+		}
+		cur, ok := st.placementForProposal(cmd.SandboxID, true)
+		return ok && cur.Spec != nil && cur.Spec.Identity != nil &&
+			cloudidentity.Request(*cur.Spec.Identity).Normalize() == cloudidentity.Request(*cmd.Spec.Identity).Normalize()
+	}
+	return true
+}
+
 // proposalState is what the rule reads from the leader: its FSM, its
 // membership view and its configuration (leaderProposalState).
 type proposalState interface {
@@ -226,6 +253,16 @@ type proposalState interface {
 	// node that holds it now, by the rule the listing applies
 	// (volumeReclaimsFor).
 	reclaimAdoptable(cur VolumeReclaim, sender string) bool
+	// serversSign reports whether the server signing record exists.
+	serversSign() bool
+}
+
+func (s leaderProposalState) serversSign() bool {
+	if s.placementFSM == nil {
+		return false
+	}
+	_, ok := s.serverSigningRecord()
+	return ok
 }
 
 // leaderProposalState is the leader's proposalState: its FSM, plus its
@@ -304,6 +341,12 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 		if role == JoinRoleIngress {
 			return false
 		}
+	}
+	// Once servers sign (fsm_server_signing.go), a cloud identity in a
+	// placement's spec, and the placement's owner, are what a server signs
+	// the sandbox's identity tokens from: only a server sets either.
+	if st.serversSign() && !identityKeptBy(cmd, st) {
+		return false
 	}
 	switch cmd.Op {
 	case opPlace:

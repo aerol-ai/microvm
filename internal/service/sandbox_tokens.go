@@ -1,12 +1,15 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -86,7 +89,7 @@ func (s *Service) IssueSandboxToken(ctx context.Context, sandboxID string, req m
 	// A token issued in the same second as a revoke is lifted to the
 	// revoke's not-before, so the revoke refuses only the tokens before it.
 	now := sandboxtoken.IssueTime(sandboxTokenNow(), sandbox.TokensNotBefore)
-	raw, claims, err := sandboxtoken.Sign(s.cipher, sandboxtoken.Claims{
+	raw, claims, err := s.signSandboxToken(ctx, sandboxtoken.Claims{
 		TokenID:    id,
 		SandboxID:  sandbox.ID,
 		Owner:      sandbox.OwnerRef,
@@ -220,11 +223,116 @@ func (s *Service) sandboxTokenTTL(raw string) (time.Duration, error) {
 // with no store read. It does not check the scope against a request: the
 // caller does that with Claims.Allows, because only it knows the request.
 // The error is one of pkg/sandboxtoken's sentinels and never holds the token.
+//
+// In a cluster whose servers sign (server_signing.go), a token signed with
+// a server key ring key counts only if it was issued before they took over;
+// a worker that cannot tell when that was takes none.
 func (s *Service) VerifySandboxToken(raw string) (sandboxtoken.Claims, error) {
-	if s == nil || s.cipher == nil {
-		// No key: nothing can verify, so a token reads as a bad signature,
-		// never as a reason to let the request through.
+	if s == nil {
 		return sandboxtoken.Claims{}, sandboxtoken.ErrInvalidSignature
 	}
-	return sandboxtoken.Verify(s.cipher, raw, sandboxTokenNow(), s.sandboxTokenMaxTTL())
+	// No key at all: nothing can verify, so a token reads as a bad
+	// signature, never as a reason to let the request through.
+	claims, err := sandboxtoken.Verify(s.sandboxTokenKeys(), raw, sandboxTokenNow(), s.sandboxTokenMaxTTL())
+	if err != nil {
+		return claims, err
+	}
+	if !legacyTokenAllowed(s.currentSigningMode(), claims) {
+		return sandboxtoken.Claims{}, sandboxtoken.ErrInvalidSignature
+	}
+	return claims, nil
+}
+
+// signSandboxToken signs c with the key this node signs with: the server
+// key ring's until servers sign; then a server key, here on a server, or
+// by a server for the sandbox's owner (SignSandboxTokenFor).
+func (s *Service) signSandboxToken(ctx context.Context, c sandboxtoken.Claims) (string, sandboxtoken.Claims, error) {
+	mode := s.currentSigningMode()
+	if !mode.known {
+		return "", c, fmt.Errorf("%w: the server tier did not say which key signs tokens", ErrSandboxTokensUnavailable)
+	}
+	if !mode.on {
+		return sandboxtoken.Sign(s.cipher, c)
+	}
+	switch cl := s.Cluster().(type) {
+	case serverSigningCluster:
+		k, err := s.openServerKeys()
+		if err != nil {
+			return "", c, err
+		}
+		if k == nil {
+			return "", c, ErrServerSigningOff
+		}
+		return sandboxtoken.Sign(k, c)
+	case signingFeedCluster:
+		body, err := json.Marshal(c)
+		if err != nil {
+			return "", c, err
+		}
+		resp, err := cl.SignSandboxToken(ctx, cluster.SandboxTokenSignRequest{Claims: body})
+		if err != nil {
+			return "", c, fmt.Errorf("a server did not sign the token: %w", err)
+		}
+		// What came back must be a token this node takes, for these claims.
+		got, err := s.VerifySandboxToken(resp.Token)
+		if err != nil || got.TokenID != c.TokenID || got.SandboxID != c.SandboxID {
+			return "", c, fmt.Errorf("a server signed a token this node does not take: %v", err)
+		}
+		return resp.Token, got, nil
+	}
+	return "", c, ErrServerSigningOff
+}
+
+// SignSandboxTokenFor signs claims a node sent for a sandbox it owns, on a
+// server (POST /v1/cluster/internal/sandbox-tokens/sign). The owner checked
+// its caller and built the claims from its row, as it always has; this
+// checks what the owner cannot be trusted with alone: that the sandbox is
+// the sender's (a server may ask for any), that the owner in the claims is
+// the sandbox's, and that the lifetime and issue time are ones this server
+// would give. It signs with the servers' key, which the owner does not hold.
+func (s *Service) SignSandboxTokenFor(ctx context.Context, peerID string, peerIsServer bool, raw []byte) (cluster.SandboxTokenSignResponse, error) {
+	k, err := s.openServerKeys()
+	if err != nil {
+		return cluster.SandboxTokenSignResponse{}, err
+	}
+	if k == nil {
+		return cluster.SandboxTokenSignResponse{}, ErrServerSigningOff
+	}
+	var c sandboxtoken.Claims
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: claims: %v", ErrSandboxTokenInvalid, err)
+	}
+	cl := s.Cluster()
+	if cl == nil {
+		return cluster.SandboxTokenSignResponse{}, ErrServerSigningOff
+	}
+	p, ok := cl.PlacementOf(strings.TrimSpace(c.SandboxID))
+	if !ok || p.IsDeleting() {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: sandbox %s", store.ErrNotFound, c.SandboxID)
+	}
+	if !peerIsServer && (strings.TrimSpace(peerID) == "" || strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(peerID)) {
+		return cluster.SandboxTokenSignResponse{}, ErrSignNotOwner
+	}
+	if c.Owner != strings.TrimSpace(p.OwnerRef) {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: the claims name another owner than the sandbox's", ErrSignNotOwner)
+	}
+	now := sandboxTokenNow()
+	iat := time.Unix(c.IssuedAt, 0)
+	if iat.After(now.Add(sandboxtoken.ClockSkew)) || iat.Before(now.Add(-sandboxtoken.ClockSkew)) {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: issued at %s, not now", ErrSandboxTokenInvalid, iat.UTC())
+	}
+	if c.ExpiresAt-c.IssuedAt > int64(s.sandboxTokenMaxTTL()/time.Second) {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: lives longer than this server allows (SB_SANDBOX_TOKEN_MAX_TTL)", ErrSandboxTokenInvalid)
+	}
+	token, signed, err := sandboxtoken.Sign(k, c)
+	if err != nil {
+		return cluster.SandboxTokenSignResponse{}, fmt.Errorf("%w: %v", ErrSandboxTokenInvalid, err)
+	}
+	if s.logger != nil {
+		s.logger.Info("sandbox token signed for its owner", "sandbox_id", signed.SandboxID, "token_id", signed.TokenID,
+			"key_id", signed.KeyID, "owner_node", p.OwnerNodeID, "expires_at", signed.Expiry())
+	}
+	return cluster.SandboxTokenSignResponse{Token: token, KeyID: signed.KeyID}, nil
 }
