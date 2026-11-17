@@ -46,3 +46,21 @@ func TestHasAuditExporterAndExportEvents(t *testing.T) {
 		t.Fatalf("custom ExportEvents = %q %v", next, err)
 	}
 }
+
+func TestContextWithoutHostPowers(t *testing.T) {
+	ctx := context.Background()
+	if WithoutHostPowers(ctx) || WithoutHostPowers(nil) || !HostCapable(ctx) {
+		t.Fatal("an unmarked context")
+	}
+	marked := ContextWithoutHostPowers(ctx)
+	if !WithoutHostPowers(marked) || HostCapable(marked) {
+		t.Fatal("a marked context keeps host powers")
+	}
+	// Whatever Access it carries: the operator's included.
+	if HostCapable(ContextWithAccess(marked, Access{Principal: Principal{Kind: PrincipalOperator}})) {
+		t.Fatal("an operator Access restored host powers")
+	}
+	if !WithoutHostPowers(ContextWithoutHostPowers(nil)) {
+		t.Fatal("a nil context was not marked")
+	}
+}

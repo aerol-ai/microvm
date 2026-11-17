@@ -26,6 +26,7 @@ func TestWorkerPlacesOnlyOnItself(t *testing.T) {
 	c, cleanup := newTestCluster(t, "lp-place", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
+	seedGossipView(t, c, []Member{workerMember("wkr-9", "")})
 	inc, err := MintIncarnationID()
 	if err != nil {
 		t.Fatal(err)
@@ -57,6 +58,7 @@ func TestWorkerReassignsOnlyAWasmSandboxToItself(t *testing.T) {
 	c, cleanup := newTestCluster(t, "lp-own", true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
+	seedGossipView(t, c, []Member{workerMember("wkr-9", "")})
 	server := ContextWithApplyPeer(context.Background(), "lp-own", roleCert("lp-own", ""))
 	place := func(id, runtime string) string {
 		inc, _ := MintIncarnationID()

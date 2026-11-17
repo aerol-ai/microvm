@@ -113,7 +113,7 @@ func TestEnsureWasmSandboxRowImportWave20(t *testing.T) {
 	}
 	svc.cluster = &wasmMigrateClusterStub{
 		Noop: cluster.NewNoop("self", "http://self", ""),
-		spec: &models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "file:///x.wasm", Image: ""},
+		spec: &models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "oci://registry.example/x:1", Image: ""},
 	}
 	if err := svc.ensureWasmSandboxRowForImport(ctx, "sb-new2", snap, "/ckpt", "g1"); err != nil {
 		t.Fatalf("import with cluster spec: %v", err)

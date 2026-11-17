@@ -142,6 +142,9 @@ type command struct {
 	// op; promotion via opPlace clears the reservation's expiry implicitly by
 	// transitioning State back to Placed.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// ReservedBy is the node that sent an opReserve or opReserveBatch. The
+	// leader writes it (stampProposal), whatever the sender put here.
+	ReservedBy string `json:"reserved_by,omitempty"`
 	// AuditIndexMax caps the retained post-delete audit index. Carried in the
 	// command (not read from node config) so every replica evicts identically;
 	// zero means the compiled-in default.
@@ -1346,7 +1349,9 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			return err
 		}
 		for _, r := range cmd.Reservations {
-			if err := f.reservePlacementLocked(commandFromReservation(r), now); err != nil {
+			item := commandFromReservation(r)
+			item.ReservedBy = cmd.ReservedBy
+			if err := f.reservePlacementLocked(item, now); err != nil {
 				return err
 			}
 		}
@@ -2615,6 +2620,7 @@ func (f *placementFSM) reservePlacementLocked(cmd command, now int64) error {
 		OwnerRef:             strings.TrimSpace(cmd.OwnerRef),
 		State:                PlacementStateReserved,
 		ExpiresUnix:          cmd.ExpiresUnix,
+		ReservedBy:           strings.TrimSpace(cmd.ReservedBy),
 	}
 	if err := f.storePlacementLocked(cmd.SandboxID, p); err != nil {
 		return err

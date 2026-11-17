@@ -125,6 +125,7 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 				}
 				_ = c.tryReassignStuckPlacement(ctx, id, p)
 			},
+			refused: rebuildRefusalReport{selfNodeID: c.nodeID, logger: c.logger, recreator: r, runStates: c}.report,
 		}, id, p)
 	}
 }
@@ -142,6 +143,9 @@ type ownerRecreateDeps struct {
 	// with the last recreate error. The server does it through its own FSM; a
 	// worker asks the leader.
 	escalate func(context.Context, string, Placement, error)
+	// refused reports a rebuild this node will never do (ErrHostOnlySpec),
+	// once (rebuildRefusalReport).
+	refused func(context.Context, string, Placement, error)
 }
 
 // refusedForCapacity reports whether a recreate failed because this node's
@@ -198,6 +202,18 @@ func recreateOwnedPlacement(ctx context.Context, deps ownerRecreateDeps, id stri
 		}
 		return
 	}
+	// A spec this node will not rebuild without host powers
+	// (rebuild_refusal.go) is the same on every node: never retried here,
+	// never moved on, and reported once so it shows why it is not running.
+	if errors.Is(err, ErrHostOnlySpec) {
+		if deps.failures != nil {
+			deps.failures.markPermanent(id)
+		}
+		if deps.refused != nil {
+			deps.refused(ctx, id, p, err)
+		}
+		return
+	}
 	// Recipient-denied cannot be fixed by reassigning to another
 	// arbitrary node (D5 / outside-voice #7) — stop churn permanently.
 	if errors.Is(err, secrets.ErrRecipientDenied) {
@@ -242,6 +258,13 @@ var ErrNoReassignTarget = errors.New("cluster: no alternate node available for s
 // the caller's "reassigned" bookkeeping reflects something that happened.
 func (c *Cluster) tryReassignStuckPlacement(ctx context.Context, id string, p Placement) error {
 	if !placementWantsFailoverRecreate(p) {
+		return ErrNoReassignTarget
+	}
+	if refusal := hostOnlyRefusal(p); refusal != nil {
+		// Another node would refuse to rebuild it (rebuild_refusal.go), so
+		// it is not moved: it stays where it is.
+		c.logger.Warn("cluster: not moving a stuck placement with host-only settings; it stays on its owner",
+			"sandbox_id", id, "owner", strings.TrimSpace(p.OwnerNodeID), "err", refusal)
 		return ErrNoReassignTarget
 	}
 	stuckOwner := strings.TrimSpace(p.OwnerNodeID)

@@ -49,17 +49,23 @@ type FailoverRefusalRecorder interface {
 // bounded by the placements involved, never per create.
 func (c *Cluster) reportFailoverRefused(p Placement, fromNodeID string, cause error) {
 	reason := "unknown"
-	if errors.Is(cause, ErrPlacementUnsatisfiable) {
+	rule := ""
+	switch {
+	case errors.Is(cause, ErrPlacementUnsatisfiable):
 		reason = FailoverRefusalReasonPlacement
+		if p.Spec != nil {
+			rule = models.FormatLabels(p.Spec.Placement.RequiredLabels())
+		}
+	case errors.Is(cause, ErrHostOnlySpec):
+		reason, rule = FailoverRefusalReasonHostOnly, cause.Error()
 	}
 	scaleobs.Add(clusterFailoverRefused, reason, 1)
-	rule := ""
-	if p.Spec != nil {
-		rule = models.FormatLabels(p.Spec.Placement.RequiredLabels())
-	}
 	if c.logger != nil {
-		c.logger.Warn("cluster: failover refused; the sandbox's placement rule excludes every live node",
-			"sandbox_id", p.SandboxID, "from_node", fromNodeID, "rule", rule)
+		msg := "cluster: failover refused; the sandbox's placement rule excludes every live node"
+		if reason == FailoverRefusalReasonHostOnly {
+			msg = "cluster: failover refused; the sandbox has host-only settings, which are not rebuilt on another node"
+		}
+		c.logger.Warn(msg, "sandbox_id", p.SandboxID, "from_node", fromNodeID, "rule", rule)
 	}
 	if rec, ok := c.currentRecreator().(FailoverRefusalRecorder); ok {
 		rec.RecordFailoverRefused(FailoverRefusal{

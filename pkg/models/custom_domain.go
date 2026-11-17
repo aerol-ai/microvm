@@ -220,3 +220,31 @@ func ValidateCustomDomainList(hosts []string, baseDomain string) ([]string, erro
 	}
 	return out, nil
 }
+
+// ReservedCustomDomain reports whether host may not be a sandbox's custom
+// hostname on a deployment whose base domain is baseDomain and whose API is
+// served at apiHosts (each a host or host:port; empty ones are skipped):
+// it is the base domain or a name under it, an API host, or not a custom
+// hostname at all (NormalizeCustomDomain refuses it, or it is not already
+// in the canonical form the cluster stores). Gateways put custom hostnames
+// ahead of every other TLS route, so the cluster's own names must never be
+// among them.
+func ReservedCustomDomain(host, baseDomain string, apiHosts ...string) bool {
+	canon, err := NormalizeCustomDomain(host, baseDomain)
+	if err != nil || canon != host {
+		return true
+	}
+	for _, api := range apiHosts {
+		api = strings.TrimSpace(api)
+		if api == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(api); err == nil {
+			api = h
+		}
+		if strings.TrimSuffix(strings.ToLower(api), ".") == canon {
+			return true
+		}
+	}
+	return false
+}

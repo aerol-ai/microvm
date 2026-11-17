@@ -270,9 +270,17 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID || p.IsDeleting() {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p, source) {
+		if placementRebuildsElsewhere(p) || placementWantsSnapshotMove(p, source) {
 			movable = append(movable, p)
 		} else {
+			if refusal := hostOnlyRefusal(p); refusal != nil && placementWantsFailoverRecreate(p) {
+				// Refused up front: another node would not rebuild it
+				// (rebuild_refusal.go). It stays with the others below.
+				if res.Failed == nil {
+					res.Failed = make(map[string]string)
+				}
+				res.Failed[id] = "not moved: " + refusal.Error()
+			}
 			others = append(others, id)
 			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
 				othersLifetimes[id] = inc
@@ -343,7 +351,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID {
 			continue
 		}
-		if placementWantsFailoverRecreate(p) || placementWantsSnapshotMove(p, source) {
+		if placementRebuildsElsewhere(p) || placementWantsSnapshotMove(p, source) {
 			res.RemainingMovable++
 		} else {
 			res.Remaining++

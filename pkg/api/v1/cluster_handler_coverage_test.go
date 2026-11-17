@@ -872,7 +872,7 @@ func newV1WasmMigrateHarness(t *testing.T, importServer *httptest.Server) (*hand
 		targetURL:    targetURL,
 		importClient: importClient,
 		spec: &models.CreateSandboxRequest{
-			Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm",
+			Runtime: models.RuntimeWasm, ModuleRef: "oci://registry.example/demo:1",
 		},
 	})
 	seedV1WasmSandbox(t, st, "sb-handoff")

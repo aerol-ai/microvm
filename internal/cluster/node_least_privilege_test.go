@@ -101,11 +101,22 @@ func TestPeerRole(t *testing.T) {
 	}
 }
 
-// fakeProposalState is the leader's FSM for the proposal rule.
+// fakeProposalState is the leader's FSM, membership view and configuration
+// for the proposal rule.
 type fakeProposalState struct {
 	placements map[string]Placement
 	snapshots  map[string]string
 	reclaims   map[string]VolumeReclaim
+	// adoptable is the reclaim keys the sender may take over now.
+	adoptable map[string]bool
+}
+
+func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
+	return f.adoptable[cur.key()]
+}
+
+func (f fakeProposalState) clusterHostname(host string) bool {
+	return models.ReservedCustomDomain(host, "sb.example.com", "api.example.com:443")
 }
 
 func (f fakeProposalState) placementForProposal(id string, _ bool) (Placement, bool) {
@@ -151,8 +162,17 @@ func TestPeerMayPropose(t *testing.T) {
 	}
 	reclaim := VolumeReclaim{Tenant: "t", VolumeID: "v", NodeID: "wkr-1", RecordedUnixNano: 7}
 	otherReclaim := VolumeReclaim{Tenant: "t", VolumeID: "v2", NodeID: "wkr-2", RecordedUnixNano: 7}
+	heldReclaim := VolumeReclaim{Tenant: "t", VolumeID: "v3", NodeID: "wkr-2", RecordedUnixNano: 7}
+	reserved := func(id, target, by string) Placement {
+		return Placement{SandboxID: id, OwnerNodeID: target, State: PlacementStateReserved, ReservedBy: by}
+	}
 	st := fakeProposalState{
+		adoptable: map[string]bool{otherReclaim.key(): true},
 		placements: map[string]Placement{
+			"sb-res-mine":    reserved("sb-res-mine", "wkr-2", "wkr-1"),
+			"sb-res-target":  reserved("sb-res-target", "wkr-1", "srv-1"),
+			"sb-res-theirs":  reserved("sb-res-theirs", "wkr-2", "wkr-3"),
+			"sb-res-legacy":  reserved("sb-res-legacy", "wkr-2", ""),
 			"sb-mine":        {SandboxID: "sb-mine", OwnerNodeID: "wkr-1"},
 			"sb-theirs":      {SandboxID: "sb-theirs", OwnerNodeID: "wkr-2"},
 			"sb-my-orphan":   {SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-1"},
@@ -162,7 +182,7 @@ func TestPeerMayPropose(t *testing.T) {
 			"sb-docker":      {SandboxID: "sb-docker", OwnerNodeID: "wkr-2", Spec: &models.CreateSandboxRequest{Runtime: "docker"}},
 		},
 		snapshots: map[string]string{"snap-mine": "wkr-1", "snap-theirs": "wkr-2"},
-		reclaims:  map[string]VolumeReclaim{reclaim.key(): reclaim, otherReclaim.key(): otherReclaim},
+		reclaims:  map[string]VolumeReclaim{reclaim.key(): reclaim, otherReclaim.key(): otherReclaim, heldReclaim.key(): heldReclaim},
 	}
 	fenced := func(op opCode, owner string) command {
 		return command{Op: op, SandboxID: "sb-x", ExpectedOwnerNodeID: owner, ExpectedOwnerNodeIDSet: true}
@@ -191,6 +211,12 @@ func TestPeerMayPropose(t *testing.T) {
 		{"port on another node's", command{Op: opAddExposedPort, SandboxID: "sb-theirs"}, false},
 		{"port removal on another node's", command{Op: opRemoveExposedPort, SandboxID: "sb-theirs"}, false},
 		{"domain on another node's", command{Op: opAddCustomDomain, SandboxID: "sb-theirs"}, false},
+		{"customer domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "app.customer.com"}, true},
+		{"the base domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "sb.example.com"}, false},
+		{"a name under the base domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "sb-other.sb.example.com"}, false},
+		{"the API host on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "api.example.com"}, false},
+		{"a name not in canonical form on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "App.Customer.com"}, false},
+		{"domain removal on its own", command{Op: opRemoveCustomDomain, SandboxID: "sb-mine", Hostname: "api.example.com"}, true},
 		{"domain removal on another node's", command{Op: opRemoveCustomDomain, SandboxID: "sb-theirs"}, false},
 		{"delete fenced on itself", fenced(opDelete, "wkr-1"), true},
 		{"delete fenced on another node", fenced(opDelete, "wkr-2"), false},
@@ -212,14 +238,23 @@ func TestPeerMayPropose(t *testing.T) {
 		{"its obligation report", command{Op: opReportStorageObligations, ObligationReports: []StorageObligationReport{{Reporter: "wkr-1"}}}, true},
 		{"another node's obligation report", command{Op: opReportStorageObligations, ObligationReports: []StorageObligationReport{{Reporter: "wkr-1"}, {Reporter: "srv-1"}}}, false},
 		{"an empty obligation report", command{Op: opReportStorageObligations}, false},
-		{"claim a reclaim for itself", command{Op: opClaimVolumeReclaim, VolumeReclaim: &otherReclaim, NodeID: "wkr-1"}, true},
+		{"claim a reclaim it may adopt", command{Op: opClaimVolumeReclaim, VolumeReclaim: &otherReclaim, NodeID: "wkr-1"}, true},
+		{"claim a reclaim its holder keeps", command{Op: opClaimVolumeReclaim, VolumeReclaim: &heldReclaim, NodeID: "wkr-1"}, false},
+		{"claim its own reclaim", command{Op: opClaimVolumeReclaim, VolumeReclaim: &reclaim, NodeID: "wkr-1"}, true},
+		{"claim a reclaim already gone", command{Op: opClaimVolumeReclaim, VolumeReclaim: &VolumeReclaim{Tenant: "t", VolumeID: "gone"}, NodeID: "wkr-1"}, true},
+		{"claim with no reclaim", command{Op: opClaimVolumeReclaim, NodeID: "wkr-1"}, false},
 		{"claim a reclaim for another node", command{Op: opClaimVolumeReclaim, VolumeReclaim: &reclaim, NodeID: "wkr-3"}, false},
 		{"ack its own reclaim", command{Op: opAckVolumeReclaim, VolumeReclaim: &reclaim}, true},
 		{"ack another node's reclaim", command{Op: opAckVolumeReclaim, VolumeReclaim: &otherReclaim}, false},
 		{"ack a reclaim already gone", command{Op: opAckVolumeReclaim, VolumeReclaim: &VolumeReclaim{Tenant: "t", VolumeID: "gone"}}, true},
 		{"ack with no reclaim", command{Op: opAckVolumeReclaim}, false},
 		{"reserve on another node", command{Op: opReserve, SandboxID: "sb-new", OwnerNodeID: "wkr-2"}, true},
-		{"cancel a reservation", command{Op: opCancelReserve, SandboxID: "sb-new"}, true},
+		{"cancel an unknown reservation", command{Op: opCancelReserve, SandboxID: "sb-new"}, true},
+		{"cancel a placed sandbox (a no-op)", command{Op: opCancelReserve, SandboxID: "sb-theirs"}, true},
+		{"cancel its own reservation", command{Op: opCancelReserve, SandboxID: "sb-res-mine"}, true},
+		{"cancel a reservation that targets it", command{Op: opCancelReserve, SandboxID: "sb-res-target"}, true},
+		{"cancel another node's reservation", command{Op: opCancelReserve, SandboxID: "sb-res-theirs"}, false},
+		{"cancel a reservation that names no sender", command{Op: opCancelReserve, SandboxID: "sb-res-legacy"}, false},
 	} {
 		for _, role := range []string{JoinRoleWorker, JoinRoleIngress, ""} {
 			want := tc.want

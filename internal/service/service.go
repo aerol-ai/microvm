@@ -1852,6 +1852,14 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 		if err != nil {
 			return true, fmt.Errorf("recreate %s: %w", id, err)
 		}
+		if _, gerr := s.store.Get(ctx, id); errors.Is(gerr, store.ErrNotFound) {
+			// Restored here for the first time: without host powers, like
+			// the create below (rebuild_host_settings.go).
+			if merged, err = s.rebuildSpecWithoutHostPowers(ctx, id, merged); err != nil {
+				return true, fmt.Errorf("recreate %s: %w", id, err)
+			}
+			ctx = rebuildContext(ctx)
+		}
 		attempted, err := s.recreateWasmDurableSandbox(ctx, id, s.placementIncarnation(id, secrets), merged, exposedPorts, ownerSinceUnixNano)
 		if err != nil {
 			return true, err
@@ -1902,7 +1910,13 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if err != nil {
 		return true, fmt.Errorf("recreate %s: %w", id, err)
 	}
-	if _, err := s.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), merged, id); err != nil {
+	// This node never had it: rebuild it without host powers
+	// (rebuild_host_settings.go).
+	merged, err = s.rebuildSpecWithoutHostPowers(ctx, id, merged)
+	if err != nil {
+		return true, fmt.Errorf("recreate %s: %w", id, err)
+	}
+	if _, err := s.CreateSandboxWithID(rebuildContext(contextWithStoredSpecReplay(ctx)), merged, id); err != nil {
 		return true, err
 	}
 	s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
@@ -2081,7 +2095,10 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	// Operator/PAT, admin and internal replay/failover callers pass. A runner
 	// bound to every team is unscoped but not a host operator, so it is
 	// refused like a tenant (hostCapable, eng review D3).
-	if !hostCapable(ctx) && len(mounts) > 0 {
+	// A rebuild on a node that never had the sandbox has no host powers;
+	// its mounts are the owner's platform volumes, rebuilt from this node's
+	// configuration (rebuildSpecWithoutHostPowers), and nothing else.
+	if !hostCapable(ctx) && len(mounts) > 0 && !isRebuiltSpec(ctx) {
 		return models.ErrMountOperatorOnly
 	}
 	for i := range mounts {
@@ -8140,7 +8157,7 @@ func (s *Service) addClusterIngressExpectedRoutes(expectedHTTP, expectedTCPServe
 			// pass and ingress_delta would re-install them on the next
 			// tick — visible as route flapping and a churn-storm of Caddy
 			// PATCHes.
-			for _, hostname := range p.CustomHostnames {
+			for _, hostname := range s.routableCustomHostnames(p) {
 				expectedTLSRoutes[caddy.IngressCustomDomainSNIRouteID(p.SandboxID, hostname)] = struct{}{}
 			}
 		} else {

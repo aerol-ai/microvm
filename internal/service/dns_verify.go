@@ -46,6 +46,26 @@ func customDomainProofToken(ctx context.Context, sandboxOwner string) string {
 	return customDomainOwnerToken(sandboxOwner)
 }
 
+// ProveCustomDomain is the Raft leader's check of a custom hostname a
+// worker or gateway adds to a sandbox it owns (cluster.CustomDomainProver):
+// the TXT record bound to the sandbox's owner, or the operator's owner-less
+// record, either of which the owner itself accepts from its callers.
+func (s *Service) ProveCustomDomain(ctx context.Context, hostname, ownerRef string) error {
+	resolver := s.dnsResolver
+	if resolver == nil {
+		resolver = &DefaultDNSResolver{}
+	}
+	prefix, valuePrefix := s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix
+	err := verifyCustomDomainOwnership(ctx, resolver, hostname, prefix, valuePrefix, customDomainOwnerToken(ownerRef))
+	if err == nil || strings.TrimSpace(ownerRef) == "" {
+		return err
+	}
+	if verifyCustomDomainOwnership(ctx, resolver, hostname, prefix, valuePrefix, "") == nil {
+		return nil
+	}
+	return err
+}
+
 // DNSResolver is an interface to allow mocking of net.Resolver in tests.
 type DNSResolver interface {
 	LookupTXT(ctx context.Context, name string) ([]string, error)

@@ -141,6 +141,11 @@ func (s *Service) ensureWasmSandboxRowForImport(ctx context.Context, sandboxID s
 		return s.store.UpdateWasmCheckpoint(ctx, sandboxID, existing.AuditIncarnationID, string(models.SandboxStatusPassivated), checkpointPath, cloneGen, "")
 	}
 	spec := s.clusterSpecForImport(sandboxID, snap)
+	// This node never had it: take only what it may rebuild without host
+	// powers (rebuild_host_settings.go), so no module from a host path.
+	if _, err := s.rebuildSpecWithoutHostPowers(ctx, sandboxID, spec); err != nil {
+		return fmt.Errorf("import %s: %w", sandboxID, err)
+	}
 	now := time.Now().UTC()
 	row := &models.Sandbox{
 		ID:                 sandboxID,
@@ -213,6 +218,13 @@ func (s *Service) MigrateWasmSandboxToNode(ctx context.Context, sandboxID, targe
 	owner, err := c.OwnerOf(sandboxID)
 	if err != nil {
 		return nil, err
+	}
+	// Refused up front: the target would not rebuild it
+	// (cluster/rebuild_refusal.go).
+	if p, ok := c.PlacementOf(sandboxID); ok {
+		if why := cluster.HostOnlySettings(p); len(why) > 0 {
+			return nil, fmt.Errorf("%w: %s", cluster.ErrHostOnlySpec, strings.Join(why, ", "))
+		}
 	}
 	if owner.NodeID == targetNodeID {
 		return nil, fmt.Errorf("target node already owns sandbox %s", sandboxID)

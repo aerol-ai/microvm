@@ -56,6 +56,32 @@ func evictCustomDomainNegativeCache(hostname string) {
 	}
 }
 
+// routableCustomHostnames is p's custom hostnames a gateway routes to the
+// owner: every one but a name of the cluster's own, its base domain, a name
+// under it or the API host (models.ReservedCustomDomain). Custom hostnames
+// go ahead of every other TLS route, so such a name, whatever wrote it into
+// the placement, would take the API host's or another sandbox's traffic.
+// The leader refuses them from workers and gateways (peer_proposals.go);
+// this is the gateway's own check.
+func (s *Service) routableCustomHostnames(p cluster.Placement) []string {
+	if len(p.CustomHostnames) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.CustomHostnames))
+	for _, h := range p.CustomHostnames {
+		if models.ReservedCustomDomain(h, s.cfg.Domain, s.cfg.PublicHost, s.cfg.IngressAdvertiseHost) {
+			// Debug, not Warn: every ingress tick builds the set again.
+			if s.logger != nil {
+				s.logger.Debug("cluster ingress: not routing a custom hostname that is one of the cluster's own names",
+					"sandbox_id", p.SandboxID, "hostname", h)
+			}
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // sandboxCustomHostnamesList returns just the operator-attached hostnames
 // (without per-domain ports) for cluster-FSM replay and similar consumers
 // that only care about the ownership binding, not the routing dial target.
@@ -538,7 +564,10 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 	// recreate has no caller who could provision DNS. hostCapable covers all
 	// three (eng review D3). Verify every hostname first, so a create takes
 	// all of its domains or none.
-	if !hostCapable(ctx) {
+	// A rebuild without host powers keeps only the hostnames the cluster
+	// already binds to this sandbox (rebuildSpecWithoutHostPowers), so it
+	// claims nothing new and proves nothing again.
+	if !hostCapable(ctx) && !isRebuiltSpec(ctx) {
 		ownerToken := customDomainProofToken(ctx, ownerRefForCreate(ctx))
 		for _, h := range hostnames {
 			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken); err != nil {

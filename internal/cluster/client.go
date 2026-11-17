@@ -1610,6 +1610,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
+		if payload, cmd, err = c.stampProposal(payload, cmd, c.nodeID, true); err != nil {
+			return err
+		}
 		if isRawObligationReport(cmd) {
 			// Queued, not applied: the batcher folds every owner's report
 			// into one entry per window.
@@ -1671,8 +1674,17 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	}
 	// What no peer may forward is refused above; what only a server may
 	// propose is refused here, by the sender's admitted role.
-	if err := c.checkPeerProposal(ctx, cmd); err != nil {
+	sender, role, err := c.checkPeerProposal(ctx, cmd)
+	if err != nil {
 		return err
+	}
+	if payload, cmd, err = c.stampProposal(payload, cmd, sender, role == JoinRoleServer); err != nil {
+		return err
+	}
+	if cmd.Op == opAddCustomDomain && role != JoinRoleServer {
+		if err := c.proveCustomDomain(ctx, cmd); err != nil {
+			return err
+		}
 	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)

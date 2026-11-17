@@ -163,9 +163,13 @@ func (a Access) HostCapable() bool {
 }
 
 // HostCapable is Access.HostCapable for a request context. A context with no
-// Access is an internal call that never crossed the API edge (failover
-// recreate, background loops), so it keeps the host powers it always had.
+// Access is an internal call that never crossed the API edge (background
+// loops), so it keeps the host powers it always had; one marked by
+// ContextWithoutHostPowers has none, whatever Access it carries.
 func HostCapable(ctx context.Context) bool {
+	if WithoutHostPowers(ctx) {
+		return false
+	}
 	access, ok := AccessFromContext(ctx)
 	if !ok {
 		return true
@@ -242,4 +246,30 @@ func ContextWithRoutePermission(ctx context.Context, p Permission) context.Conte
 func RoutePermissionFromContext(ctx context.Context) (Permission, bool) {
 	p, ok := ctx.Value(routePermissionKey{}).(Permission)
 	return p, ok
+}
+
+type noHostPowersKey struct{}
+
+// ContextWithoutHostPowers marks ctx as work that must not use host-side
+// powers (HostCapable is false under it): a node rebuilding, from the
+// replicated spec, a sandbox it never had (a failover recreate, a move, a
+// WASM import). No caller is behind such a rebuild, and the spec it reads
+// was written by the sandbox's last owner, so the host-only settings a
+// host-capable caller may set (raw mounts, file:// bundles, host module
+// paths) are refused there rather than taken on that owner's word.
+func ContextWithoutHostPowers(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, noHostPowersKey{}, true)
+}
+
+// WithoutHostPowers reports whether ctx was marked by
+// ContextWithoutHostPowers.
+func WithoutHostPowers(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(noHostPowersKey{}).(bool)
+	return v
 }

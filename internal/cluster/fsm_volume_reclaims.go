@@ -256,6 +256,27 @@ func mayAdoptVolumeReclaim(key, nodeID string, adopters []string) bool {
 	return false
 }
 
+// volumeReclaimAdoptableBy reports whether nodeID may take r over from the
+// node that holds it: one that never drains (the leader that expired an
+// abandoned delete) at once, one that is dead or unknown once r is
+// volumeReclaimAdoptAfter old, and only for r's adopters
+// (mayAdoptVolumeReclaim). A live node that drains keeps its own. The
+// listing below offers exactly these, and the leader holds a worker's claim
+// to the same rule (peer_proposals.go).
+func volumeReclaimAdoptableBy(r VolumeReclaim, nodeID string, state reclaimNodeState, adopters []string, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	alive, drains := state(r.NodeID)
+	if alive && drains {
+		return false
+	}
+	if !alive && now.Sub(time.Unix(0, r.RecordedUnixNano)) < volumeReclaimAdoptAfter {
+		return false
+	}
+	return mayAdoptVolumeReclaim(r.key(), nodeID, adopters)
+}
+
 // volumeReclaimsFor returns up to limit entries nodeID should drain: its
 // own first, then the ones it may take over, each group oldest first. An
 // entry may be taken over from a live node that never drains (the leader
@@ -282,16 +303,11 @@ func (f *placementFSM) volumeReclaimsFor(nodeID string, state reclaimNodeState, 
 		if state == nil {
 			continue
 		}
-		alive, drains := state(node)
-		if alive && drains {
+		if alive, drains := state(node); alive && drains {
 			continue
 		}
 		for key := range keys {
-			r := f.volumeReclaims[key]
-			if !alive && now.Sub(time.Unix(0, r.RecordedUnixNano)) < volumeReclaimAdoptAfter {
-				continue
-			}
-			if mayAdoptVolumeReclaim(key, nodeID, adopters) {
+			if r := f.volumeReclaims[key]; volumeReclaimAdoptableBy(r, nodeID, state, adopters, now) {
 				adopt = append(adopt, r)
 			}
 		}

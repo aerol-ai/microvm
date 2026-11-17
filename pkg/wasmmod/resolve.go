@@ -136,6 +136,34 @@ func (r *ModuleResolver) SetDigestMode(mode string) {
 	}
 }
 
+// HostPathRef reports whether ref would resolve from a raw host path (step
+// 4: file://, an absolute path or a bare filename under ModulesDir): it is
+// not a reserved keyword, not an oci:// ref, and not a catalogue id in the
+// owner namespace ctx pins (WithCatalogueOwner). It reads nothing but the
+// catalogue, and pulls nothing. A node that rebuilds a sandbox it never
+// had takes no module from a host path (WithHostPathsDenied), and asks
+// this first so it can say so instead of failing the boot.
+func (r *ModuleResolver) HostPathRef(ctx context.Context, ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false
+	}
+	if !strings.Contains(ref, "/") && !strings.Contains(ref, "://") {
+		if _, ok := r.Reserved[strings.ToLower(ref)]; ok {
+			return false
+		}
+	}
+	if strings.HasPrefix(ref, "oci://") {
+		return false
+	}
+	if r.CatalogueLookup != nil {
+		if _, _, ok := r.CatalogueLookup(ctx, ref); ok {
+			return false
+		}
+	}
+	return true
+}
+
 // Resolve resolves ref using the default Auth.
 func (r *ModuleResolver) Resolve(ctx context.Context, ref string) (*ResolvedModule, error) {
 	return r.ResolveWithAuth(ctx, ref, nil)
