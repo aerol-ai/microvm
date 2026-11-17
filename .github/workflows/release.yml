@@ -803,9 +803,6 @@ jobs:
             echo "GitHub's latest release is $latest, so aerolvm/latest.txt stays as it is."
             exit 0
           fi
-          # The docs' "Launch Stack" link reads this copy of the EKS stack.
-          aws s3 cp dist/aerolvm-eks.yaml "s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml" \
-            --content-type text/yaml --cache-control no-cache --only-show-errors --no-progress
           printf '%s\n' "$VERSION" > latest.txt
           aws s3 cp latest.txt "s3://${MIRROR_BUCKET}/aerolvm/latest.txt" \
             --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
@@ -848,6 +845,55 @@ jobs:
 
       - name: Check Terraform installs every provider from the mirror alone
         run: src/scripts/mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"
+
+  # The docs' "Launch Stack" button reads aerolvm/latest/aerolvm-eks.yaml,
+  # and that stack installs this release's Helm chart. The release job does
+  # not wait for the chart job, so the copy moves only once the chart is
+  # published: if it moved first, every new stack would fail at "installing
+  # AerolVM" while the chart is late or missing. Like mirror, a job of its
+  # own that holds back nothing else, and only for GitHub's latest release.
+  eks-launch-stack:
+    name: Point the Launch Stack button at this release
+    needs: [mirror, chart]
+    if: vars.AEROLVM_MIRROR_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      MIRROR_BUCKET: aerolvm-downloads
+    steps:
+      - name: Download the stack from the release and check it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$VERSION" --dir dist --pattern aerolvm-eks.yaml --pattern checksums.txt
+          cd dist
+          grep -E '^[0-9a-f]{64}  aerolvm-eks\.yaml$' checksums.txt | sha256sum --check --strict
+
+      - name: Get AWS credentials for the mirror (GitHub OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AEROLVM_MIRROR_ROLE_ARN }}
+          role-session-name: release-eks-stack-${{ github.run_id }}
+          role-duration-seconds: 900
+          aws-region: us-east-1
+
+      - name: Copy the stack to aerolvm/latest/, if this is GitHub's latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "GitHub's latest release is $latest, so the Launch Stack button stays as it is."
+            exit 0
+          fi
+          aws s3 cp dist/aerolvm-eks.yaml "s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml" \
+            --content-type text/yaml --cache-control no-cache --only-show-errors --no-progress
+          echo "The Launch Stack button now installs $VERSION"
 
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.

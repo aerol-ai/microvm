@@ -75,6 +75,10 @@ The installer's log is in CloudWatch, log group `/aerolvm/<stack>/installer`.
 default set to the release (the line that ends in `# release-version`). So it
 ships as a release file and goes to the download mirror at
 `aerolvm/<tag>/aerolvm-eks.yaml`. When the release is GitHub's latest, the
-mirror job also writes `aerolvm/latest/aerolvm-eks.yaml`. That is the S3 URL
-the docs' "Launch Stack" link uses. CloudFormation reads a template only from
+`eks-launch-stack` job then writes `aerolvm/latest/aerolvm-eks.yaml`, the S3
+URL the docs' "Launch Stack" link uses. That job waits for the `chart` job,
+because the stack installs the release's chart: a copy made earlier could
+send every new stack to a chart that is not published yet.
+`scripts/mirror-sync.sh --release` makes the same copy when it marks a
+release latest. CloudFormation reads a template only from
 S3, never from a GitHub URL.

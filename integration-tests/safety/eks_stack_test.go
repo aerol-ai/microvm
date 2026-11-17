@@ -219,10 +219,68 @@ func TestEKSStackVersionDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"packaging/eks/aerolvm-eks.yaml", "# release-version", "dist/aerolvm-eks.yaml", `"s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml"`} {
+	for _, want := range []string{"packaging/eks/aerolvm-eks.yaml", "# release-version", "dist/aerolvm-eks.yaml"} {
 		if !strings.Contains(string(wf), want) {
-			t.Errorf("release.yml does not mention %s: the stack must ship with each release and its latest copy must move with latest.txt", want)
+			t.Errorf("release.yml does not mention %s: the stack must ship with each release", want)
 		}
+	}
+}
+
+// TestEKSStackLaunchCopyWaitsForTheChart pins the job that moves the
+// Launch Stack button's copy (aerolvm/latest/aerolvm-eks.yaml). That stack
+// installs the release's Helm chart, and the release job does not wait for
+// the chart job, so a copy made any earlier would point every new stack at
+// a chart that may never be published.
+func TestEKSStackLaunchCopyWaitsForTheChart(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf workflowFile
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatal(err)
+	}
+	const dest = `"s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml"`
+	for name, job := range wf.Jobs {
+		for _, s := range job.Steps {
+			if strings.Contains(s.Run, "aerolvm/latest/aerolvm-eks.yaml") && name != "eks-launch-stack" {
+				t.Errorf("job %s writes the Launch Stack copy; only eks-launch-stack may, after the chart job", name)
+			}
+		}
+	}
+	job, ok := wf.Jobs["eks-launch-stack"]
+	if !ok {
+		t.Fatal("release.yml has no eks-launch-stack job")
+	}
+	var needs []string
+	switch n := job.Needs.(type) {
+	case string:
+		needs = []string{n}
+	case []any:
+		for _, v := range n {
+			needs = append(needs, fmt.Sprint(v))
+		}
+	}
+	for _, want := range []string{"chart", "mirror"} {
+		if !slices.Contains(needs, want) {
+			t.Errorf("eks-launch-stack needs %v; it must need %s", needs, want)
+		}
+	}
+	if !strings.Contains(job.If, "vars.AEROLVM_MIRROR_ROLE_ARN") {
+		t.Errorf("eks-launch-stack if = %q; it must be skipped when the mirror role is unset", job.If)
+	}
+	if len(job.Permissions) != 2 || job.Permissions["contents"] != "read" || job.Permissions["id-token"] != "write" {
+		t.Errorf("eks-launch-stack permissions = %v, want exactly contents: read, id-token: write", job.Permissions)
+	}
+	check := slices.IndexFunc(job.Steps, func(s workflowStep) bool {
+		return strings.Contains(s.Run, "checksums.txt") && strings.Contains(s.Run, "sha256sum --check --strict")
+	})
+	copyStep := slices.IndexFunc(job.Steps, func(s workflowStep) bool { return strings.Contains(s.Run, dest) })
+	if check < 0 || copyStep < 0 || check > copyStep {
+		t.Fatalf("eks-launch-stack must check the stack against checksums.txt (step %d) before copying it to %s (step %d)", check, dest, copyStep)
+	}
+	if run := job.Steps[copyStep].Run; !strings.Contains(run, `gh release view --json tagName`) || !strings.Contains(run, `"$latest" != "$VERSION"`) {
+		t.Errorf("the copy step does not check that this release is GitHub's latest:\n%s", run)
 	}
 }
 
