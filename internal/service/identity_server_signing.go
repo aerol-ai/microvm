@@ -90,7 +90,22 @@ func (s *Service) UpkeepServerIdentityKeys(ctx context.Context) error {
 		}
 		return err
 	}
-	return nil
+	// A key sealed for servers that no server opens: the seed it was
+	// sealed with is gone (the cluster went back to a build from before
+	// this record and dropped it, then came forward again with a new one).
+	// It can sign nothing, so a new key takes its place.
+	sealer, err := s.identityServerSealer()
+	if err != nil || sealer == nil {
+		return err
+	}
+	if _, openErr := s.openIdentityKey(active); openErr == nil {
+		return nil
+	}
+	_, err = s.RotateIdentityKey(ctx, active.ID)
+	if err == nil && s.logger != nil {
+		s.logger.Warn("identity: no server can open the signing key; a new one replaces it", "previous_key_id", active.ID)
+	}
+	return err
 }
 
 // ErrIdentityNotOnSandbox is a sign request for a sandbox with no identity.

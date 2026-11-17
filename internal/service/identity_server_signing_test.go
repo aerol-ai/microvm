@@ -151,3 +151,48 @@ func TestIdentityOnceServersSign(t *testing.T) {
 		t.Fatal("exported refusal")
 	}
 }
+
+// A key sealed for servers that no server can open (its seed is gone, as
+// after going back to a build from before the record and forward again)
+// is replaced by the leader's upkeep.
+func TestUpkeepReplacesAKeyNoServerOpens(t *testing.T) {
+	h, _, srv, _ := identityPair(t)
+	ctx := context.Background()
+	if err := h.svc.EnsureIdentityKeysReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	turnOnServerSigning(t, h.svc, time.Now())
+	if err := h.svc.UpkeepServerIdentityKeys(ctx); err != nil {
+		t.Fatal(err)
+	}
+	set, _ := h.st.ReadIdentityKeys(ctx)
+	sealed, _ := set.Active()
+	if _, err := h.svc.openIdentityKey(sealed); err != nil {
+		t.Fatalf("the server cannot open its own key: %v", err)
+	}
+	// A new seed: the key sealed with the first one opens no more.
+	srv.mu.Lock()
+	srv.rec = nil
+	srv.mu.Unlock()
+	turnOnServerSigning(t, h.svc, time.Now())
+	if _, err := h.svc.openIdentityKey(sealed); err == nil {
+		t.Fatal("a key sealed with the old seed still opens")
+	}
+	if err := h.svc.UpkeepServerIdentityKeys(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := h.st.ReadIdentityKeys(ctx)
+	active, _ := after.Active()
+	if active.ID == sealed.ID || active.Seal != cloudidentity.SealServer {
+		t.Fatalf("not replaced: active %s sealed %q", active.ID, active.Seal)
+	}
+	if _, err := h.svc.openIdentityKey(active); err != nil {
+		t.Fatalf("the new key does not open: %v", err)
+	}
+	if err := h.svc.UpkeepServerIdentityKeys(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := h.st.ReadIdentityKeys(ctx); again.Generation != after.Generation {
+		t.Fatal("a key that opens was replaced")
+	}
+}

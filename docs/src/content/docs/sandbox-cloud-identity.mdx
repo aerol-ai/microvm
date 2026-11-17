@@ -338,7 +338,7 @@ When you take a tag off the list, sandboxes that use it keep the token they have
 - **Only an admin can add a tag,** and each tag names the lowest role that may use it.
 - **No one can fetch a token through the API.** Only the sandbox receives it. The route that delivers it is closed to API callers, and it needs the sandbox's own toolbox token, which only the AerolVM server holds.
 - **The signing key never leaves the server.** It is encrypted with the server key on disk and in the cluster, never logged, and never returned by any API. The public documents hold public keys only.
-- **In a cluster, only servers sign.** Once every node runs this release, the signing key is encrypted so that only servers can open it, and a worker asks a server to sign each token for a sandbox it runs. The server checks that the worker runs that sandbox and that the sandbox still has that identity. Key writes and rotation go to a server too.
+- **In a cluster, only servers sign.** Once every node runs this release, the signing key is encrypted so that only servers can open it, and a worker asks a server to sign each token for a sandbox it runs. The server checks that the worker runs that sandbox and that the sandbox still has that identity. Key writes and rotation go to a server too. There is no going back to an older release after that: it cannot open the key. If the servers ever lose the seed the key was sealed with, the leader makes a new key, and the old one leaves the public keys two hours later.
 - **Every token is recorded.** Each delivery adds an `identity.token_issued` record to the sandbox's audit log, with the role tag, key ID, token ID and expiry. The token itself is never recorded.
 
 ### Turning access off
