@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -377,6 +378,25 @@ type Admitter struct {
 	slotLimit  SlotLimit
 	slotUsed   int
 	slotParked int
+
+	// ownsNoSandboxes marks a cluster server or gateway (SetOwnsSandboxes):
+	// it keeps an admitter, whose snapshot gossip and /v1/capacity read,
+	// but it turns every create away.
+	ownsNoSandboxes atomic.Bool
+}
+
+// SetOwnsSandboxes says whether this node ever runs a sandbox itself: false
+// on a cluster node without the worker role, which refuses every create
+// (createSandbox's no-placement-target gate). Such a node then publishes
+// aerolvm_host_pressure_can_admit 0, whatever its own resources would
+// allow: the gauge answers "can this node take a new sandbox now", and
+// SandboxdNoAdmitWorkers sums it over every node Prometheus reads. Before
+// this, each server and gateway published 1, so on a cluster with
+// dedicated servers or gateways the sum never reached 0 and the alert
+// could not fire (issue #1343). Snapshot.CanAdmit is unchanged: placement
+// already skips these roles.
+func (a *Admitter) SetOwnsSandboxes(owns bool) {
+	a.ownsNoSandboxes.Store(!owns)
 }
 
 // ParkReclaimer gives up to slots warm-pool slots back to the admitter and
@@ -923,7 +943,7 @@ func (a *Admitter) Snapshot() Snapshot {
 		snap.DiskFloorRatio = a.limits.DiskFloorRatio
 	}
 	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1}, true)
-	recordHostPressure(snap)
+	recordHostPressure(snap, !a.ownsNoSandboxes.Load())
 	return snap
 }
 

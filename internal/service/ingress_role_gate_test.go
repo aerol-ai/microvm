@@ -39,6 +39,12 @@ func (c *shardRecordingCluster) PlacementsForShards(filter cluster.PlacementShar
 	return append([]cluster.Placement(nil), c.rows...)
 }
 
+// PlacementViewForShards is the view the reconciler reads, with the
+// version it is current to (cluster.Client).
+func (c *shardRecordingCluster) PlacementViewForShards(filter cluster.PlacementShardFilter) ([]cluster.Placement, uint64) {
+	return c.PlacementsForShards(filter), c.PlacementVersion()
+}
+
 func (c *shardRecordingCluster) LocalMembers() []cluster.Member {
 	c.mu.Lock()
 	defer c.mu.Unlock()

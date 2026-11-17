@@ -113,6 +113,9 @@ type imagePullFailure struct {
 	err       error
 	retryAt   time.Time
 	createdAt time.Time
+	// transient is TransientPullFailure(err), decided when it failed: a
+	// refusal in the backoff is a 503 only if this is.
+	transient bool
 }
 
 func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Client, error) {
@@ -1435,7 +1438,10 @@ func (c *Client) firePullObserver(ctx context.Context, rewrite MirrorRewrite, au
 	c.pullObserver(ctx, sandboxID)
 }
 
-func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *models.RegistryAuth) (retErr error) {
+	// A registry failure that passes is a 503 with Retry-After for the
+	// caller, not the catch-all 400 (TransientPullError).
+	defer func() { retErr = TransientPullError(retErr, c.pullBackoff) }()
 	finishMetric := beginImagePullMetric()
 	var resultErr error
 	defer func() { finishMetric(resultErr) }()
@@ -1469,7 +1475,10 @@ func (c *Client) pullImageDedup(ctx context.Context, imageRef string, auth *mode
 	if failure, blocked := c.pullBackoffFailureLocked(key, time.Now()); blocked {
 		recordImagePullBackoffReject()
 		c.pullMu.Unlock()
-		resultErr = fmt.Errorf("pull image %s suppressed by failure backoff until %s: %w", imageRef, failure.retryAt.Format(time.RFC3339), failure.err)
+		// The refusal is typed and carries whether its cause passes, so a
+		// backoff of a missing tag stays the 400 the tag itself was.
+		resultErr = &PullBackoffError{Image: imageRef, Until: failure.retryAt,
+			Cause: FlattenPullCause(failure.err), Transient: failure.transient}
 		return resultErr
 	}
 	inFlight := &imagePull{done: make(chan struct{})}
@@ -1533,6 +1542,7 @@ func (c *Client) recordPullFailureLocked(key string, err error) {
 		err:       err,
 		createdAt: now,
 		retryAt:   now.Add(c.pullBackoff),
+		transient: TransientPullFailure(err),
 	}
 	// Opportunistically prune entries whose backoff window has already
 	// elapsed: they would normally be deleted lazily on the next pull of the

@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -122,8 +123,10 @@ func TestPullImageDedupBacksOffAfterFailure(t *testing.T) {
 	if err := client.pullImageDedup(context.Background(), "registry.example/app:bad", nil); err == nil {
 		t.Fatalf("first pull expected error")
 	}
-	if err := client.pullImageDedup(context.Background(), "registry.example/app:bad", nil); err == nil || !strings.Contains(err.Error(), "backoff") {
-		t.Fatalf("second pull expected backoff error, got %v", err)
+	err := client.pullImageDedup(context.Background(), "registry.example/app:bad", nil)
+	var refusal *PullBackoffError
+	if !errors.As(err, &refusal) || !strings.Contains(err.Error(), "too many requests") {
+		t.Fatalf("second pull expected the backoff's refusal naming its cause, got %v", err)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("pull calls = %d, want 1 while backoff is active", got)

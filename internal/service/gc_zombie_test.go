@@ -84,6 +84,12 @@ func (s *stubIngressCluster) PlacementsForShards(filter cluster.PlacementShardFi
 	return out
 }
 
+// PlacementViewForShards is the view the reconciler reads, with the
+// version it is current to (cluster.Client).
+func (s *stubIngressCluster) PlacementViewForShards(filter cluster.PlacementShardFilter) ([]cluster.Placement, uint64) {
+	return s.PlacementsForShards(filter), s.PlacementVersion()
+}
+
 func newGCCaddyFake() *gcCaddyFake {
 	return &gcCaddyFake{
 		httpRouteIDs:   map[string]struct{}{},

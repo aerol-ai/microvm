@@ -98,12 +98,15 @@ type Driver struct {
 	client   *Client
 
 	// pullGroup collapses concurrent pulls of the same ref; pullSem caps
-	// concurrent pulls of distinct refs; pullFailUntil rate-limits retries of
-	// a ref that just failed. Together they replace dockerd's pull dedup.
-	pullGroup     singleflight.Group
-	pullSem       chan struct{}
-	pullFailMu    sync.Mutex
-	pullFailUntil map[string]time.Time
+	// concurrent pulls of distinct refs; pullFails rate-limits retries of a
+	// ref that just failed. Together they replace dockerd's pull dedup.
+	pullGroup  singleflight.Group
+	pullSem    chan struct{}
+	pullFailMu sync.Mutex
+	// pullFails is each ref that failed within the backoff (see
+	// pullFailure). Expired entries go at every new failure, so refs that
+	// fail once and are never asked for again cannot grow it.
+	pullFails map[string]pullFailure
 
 	// aocrPullAuth is the node-local cluster PAT presented on a cache-miss pull
 	// of an AOCR `cluster/...` ref when the caller supplied no credential (the
@@ -173,11 +176,11 @@ func New(cfg Config, rules *netrules.Manager, logger *slog.Logger) *Driver {
 		sem = make(chan struct{}, cfg.PullMaxConcurrent)
 	}
 	return &Driver{
-		logger:        logger,
-		cfg:           cfg,
-		networkRules:  rules,
-		pullSem:       sem,
-		pullFailUntil: make(map[string]time.Time),
+		logger:       logger,
+		cfg:          cfg,
+		networkRules: rules,
+		pullSem:      sem,
+		pullFails:    make(map[string]pullFailure),
 	}
 }
 

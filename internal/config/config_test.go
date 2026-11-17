@@ -1421,6 +1421,28 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 	})
 
+	t.Run("owns_sandboxes", func(t *testing.T) {
+		cases := []struct {
+			cluster bool
+			role    string
+			want    bool
+		}{
+			{false, NodeRoleServer, true}, // single node: the role is not read
+			{true, NodeRoleMixed, true},
+			{true, NodeRoleWorker, true},
+			{true, "worker,ingress", true},
+			{true, NodeRoleServer, false},
+			{true, NodeRoleIngress, false},
+			{true, "server,ingress", false},
+		}
+		for _, tc := range cases {
+			c := Config{EnableCluster: tc.cluster, NodeRole: tc.role}
+			if got := c.OwnsSandboxes(); got != tc.want {
+				t.Errorf("cluster=%v role=%q: OwnsSandboxes=%v, want %v", tc.cluster, tc.role, got, tc.want)
+			}
+		}
+	})
+
 	t.Run("accepts_hybrid_worker_ingress", func(t *testing.T) {
 		setClusterDefaults(t)
 		t.Setenv("SB_NODE_ROLE", "worker,ingress")

@@ -58,8 +58,8 @@ func TestNewInitializesPullState(t *testing.T) {
 	if cap(d.pullSem) != 3 {
 		t.Fatalf("pull semaphore cap = %d, want 3", cap(d.pullSem))
 	}
-	if d.pullFailUntil == nil {
-		t.Fatal("pullFailUntil map not initialized")
+	if d.pullFails == nil {
+		t.Fatal("pullFails map not initialized")
 	}
 	d2 := New(Config{}, nil, nil)
 	if d2.pullSem != nil {

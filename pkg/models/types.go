@@ -1769,6 +1769,14 @@ const ErrorCodeMountsUnavailable = "mounts_unavailable"
 // recovery; nothing is wrong with the request.
 const ErrorCodeOverloaded = "overloaded"
 
+// ErrorCodeImagePullUnavailable is returned (503, with Retry-After) for a
+// create whose image the registry could not serve just now: it
+// rate-limited the pull, failed, or did not answer in time, or it did so
+// moments ago and the node's per-image backoff (SB_IMAGE_PULL_FAILURE_BACKOFF)
+// is holding off a new pull. Retrying after Retry-After is the recovery;
+// the request is fine. A missing image or refused credentials are 400.
+const ErrorCodeImagePullUnavailable = "image_pull_unavailable"
+
 // ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
 // own tenant already runs its share of the node's requests of that kind
 // (cluster-wide sandbox lists): the node has room, but not for one more from

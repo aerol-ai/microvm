@@ -1239,27 +1239,55 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 	if image, err := client.GetImage(ctx, ref); err == nil {
 		return image, nil
 	}
+	// From here on this is a registry pull request, reported under the same
+	// aerolvm_image_pull_* names as the dockerd engine's (pkg/docker): the
+	// image-pull alerts and the image-pull-storm runbook read nothing else.
+	finishMetric := dockerpkg.BeginImagePullMetric()
+	image, err := d.pullImage(ctx, client, ref, auth)
+	finishMetric(err)
+	// A registry failure that passes is a 503 with Retry-After for the
+	// caller, not the catch-all 400.
+	return image, dockerpkg.TransientPullError(err, d.cfg.PullFailureBackoff)
+}
+
+// pullImage is ensureImage's registry half: the image is not in the local
+// store under ref.
+func (d *Driver) pullImage(ctx context.Context, client *Client, ref string, auth *models.RegistryAuth) (cntr.Image, error) {
 	// Recent-failure backoff: don't hammer a registry that just rejected us on
 	// a burst of cold creates for the same missing/erroring ref.
-	if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
-		d.pullFailMu.Lock()
-		until, ok := d.pullFailUntil[ref]
-		d.pullFailMu.Unlock()
-		if ok && time.Now().Before(until) {
-			return nil, fmt.Errorf("image pull for %q backing off after recent failure", ref)
-		}
+	if fail, ok := d.pullFailureOf(ref, time.Now()); ok {
+		dockerpkg.RecordImagePullBackoffReject()
+		// Typed, with whether its cause passes: a backoff of a missing
+		// tag stays the 400 the tag itself was (docker.TransientPullError).
+		return nil, &dockerpkg.PullBackoffError{Image: ref, Until: fail.until, Cause: fail.cause, Transient: fail.transient}
 	}
 	// Single-flight: N concurrent cold creates of the same missing image
 	// collapse to one registry pull. Concurrency across distinct refs is
-	// capped by the pull semaphore.
+	// capped by the pull semaphore. Only the flight's leader runs the func,
+	// so a caller that never ran it was answered by another's pull.
+	led := false
 	res, err, _ := d.pullGroup.Do(ref, func() (any, error) {
+		led = true
 		if d.pullSem != nil {
 			select {
 			case d.pullSem <- struct{}{}:
-				defer func() { <-d.pullSem }()
-			case <-ctx.Done():
-				return nil, ctx.Err()
+			default:
+				// Every slot is busy: this pull waits in the queue the
+				// SandboxdImagePullQueueBacklog alert watches.
+				doneQueued := dockerpkg.BeginImagePullQueued()
+				select {
+				case d.pullSem <- struct{}{}:
+					doneQueued()
+				case <-ctx.Done():
+					doneQueued()
+					return nil, ctx.Err()
+				}
 			}
+			doneInflight := dockerpkg.BeginImagePullInflight()
+			defer func() {
+				<-d.pullSem
+				doneInflight()
+			}()
 		}
 		// Re-check inside the flight: a sibling create may have unpacked it.
 		if image, getErr := client.GetImage(ctx, ref); getErr == nil {
@@ -1295,15 +1323,73 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		}
 		return image, pullErr
 	})
+	if !led {
+		dockerpkg.RecordImagePullDedupWaiter()
+	}
 	if err != nil {
-		if backoff := d.cfg.PullFailureBackoff; backoff > 0 {
-			d.pullFailMu.Lock()
-			d.pullFailUntil[ref] = time.Now().Add(backoff)
-			d.pullFailMu.Unlock()
+		// Only the registry's failure starts the backoff, once per flight
+		// (by its leader, whose ctx the pull ran on). A caller that left,
+		// cancelled or out of its own deadline, says nothing about the
+		// registry; the backoff would refuse every create of a healthy
+		// image after it, as a 400 since a cancel is not transient. The
+		// ctx tells, the error cannot: the registry's response-header
+		// timeout is a context.DeadlineExceeded too, and that one is the
+		// registry's (dockerd skips both, its errors arrive as text).
+		if led && ctx.Err() == nil {
+			d.recordPullFailure(ref, err, time.Now())
 		}
 		return nil, err
 	}
 	return res.(cntr.Image), nil
+}
+
+// pullFailure is why a ref is in its backoff and until when. The cause is
+// short text, capped (docker.FlattenPullCause): it is kept for the whole
+// backoff, and the registry's error can carry up to 64 KB of response body.
+// transient is docker.TransientPullFailure of the failure, decided when it
+// failed: the backoff's refusals are a 503 only if it is.
+type pullFailure struct {
+	until     time.Time
+	cause     string
+	transient bool
+}
+
+// pullFailureOf is ref's backoff, if it still runs at now.
+func (d *Driver) pullFailureOf(ref string, now time.Time) (pullFailure, bool) {
+	if d.cfg.PullFailureBackoff <= 0 {
+		return pullFailure{}, false
+	}
+	d.pullFailMu.Lock()
+	defer d.pullFailMu.Unlock()
+	fail, ok := d.pullFails[ref]
+	if ok && !now.Before(fail.until) {
+		delete(d.pullFails, ref)
+		return pullFailure{}, false
+	}
+	return fail, ok
+}
+
+// recordPullFailure starts ref's backoff, and drops every entry whose
+// backoff has run out: failures are rare enough for the walk, and a ref
+// that failed once and is never asked for again would otherwise stay.
+func (d *Driver) recordPullFailure(ref string, err error, now time.Time) {
+	backoff := d.cfg.PullFailureBackoff
+	if backoff <= 0 {
+		return
+	}
+	fail := pullFailure{until: now.Add(backoff), cause: dockerpkg.FlattenPullCause(err),
+		transient: dockerpkg.TransientPullFailure(err)}
+	d.pullFailMu.Lock()
+	defer d.pullFailMu.Unlock()
+	if d.pullFails == nil {
+		d.pullFails = make(map[string]pullFailure)
+	}
+	for k, f := range d.pullFails {
+		if !now.Before(f.until) {
+			delete(d.pullFails, k)
+		}
+	}
+	d.pullFails[ref] = fail
 }
 
 // refHasTag reports whether the ref's final path component carries a :tag or

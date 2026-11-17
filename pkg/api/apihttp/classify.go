@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -32,7 +33,24 @@ const (
 const (
 	createInProgressRetryAfterSeconds = 5
 	reservationGoneRetryAfterSeconds  = 1
+	// The default per-image pull backoff (SB_IMAGE_PULL_FAILURE_BACKOFF):
+	// asking sooner only meets the backoff again. An error that carries
+	// the node's own wait overrides it (imagePullRetryAfter).
+	imagePullRetryAfterSeconds = 30
 )
+
+// imagePullRetryAfter is the Retry-After for an image-pull 503: the wait
+// the error carries (models.ImagePullUnavailableError, docker's backoff
+// refusal), rounded up to whole seconds, else the default backoff.
+func imagePullRetryAfter(err error) int {
+	var hint interface{ PullRetryAfter() time.Duration }
+	if errors.As(err, &hint) {
+		if d := hint.PullRetryAfter(); d > 0 {
+			return int((d + time.Second - 1) / time.Second)
+		}
+	}
+	return imagePullRetryAfterSeconds
+}
 
 // ErrKind names the few service errors a facade words differently for its own
 // SDK (otherwise it uses Classification.Message verbatim). Every other error
@@ -116,6 +134,18 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusForbidden, Code: models.ErrorCodeCreatePolicyDenied, Message: truncate(err.Error())}
 	case errors.Is(err, service.ErrCreatePolicyInvalid):
 		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeCreatePolicyInvalid, Message: service.ErrCreatePolicyInvalid.Error(), Log: true, LogLevel: slog.LevelError}
+
+	// An image pull the registry failed for a reason that passes (rate
+	// limit, 5xx, no answer in time, or the per-image backoff after one):
+	// 503 + Retry-After, so SDKs back off and retry instead of taking the
+	// catch-all 400 as final (issue #1343, every create of a storm).
+	// Logged like that 400 was: the image-pull-storm runbook reads the
+	// worker's log for which image and registry fail, which the metrics do
+	// not name.
+	// Retry-After is the node's own wait when the error carries it (its
+	// SB_IMAGE_PULL_FAILURE_BACKOFF, or what is left of a running backoff).
+	case errors.Is(err, models.ErrImagePullUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: imagePullRetryAfter(err), Code: models.ErrorCodeImagePullUnavailable, Message: truncate(err.Error()), Log: true, LogLevel: slog.LevelWarn}
 
 	// A sandbox whose container engine is not wired on this node: host
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.

@@ -1727,6 +1727,12 @@ func (c *cb96Cluster) PlacementsForShards(cluster.PlacementShardFilter) []cluste
 	return out
 }
 
+// PlacementViewForShards is the view the reconciler reads, with the
+// version it is current to (cluster.Client).
+func (c *cb96Cluster) PlacementViewForShards(filter cluster.PlacementShardFilter) ([]cluster.Placement, uint64) {
+	return c.PlacementsForShards(filter), c.PlacementVersion()
+}
+
 type cb96PingRuntime struct {
 	*fakeCapacityRuntime
 	err error

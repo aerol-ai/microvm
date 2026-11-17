@@ -61,6 +61,43 @@ func TestDashboardMetricsExistInFixture(t *testing.T) {
 	}
 }
 
+// TestCanAdmitIsCountedNotMinned: aerolvm_host_pressure_can_admit is 0 on
+// every cluster server and gateway (they never take a sandbox; issue
+// #1343), so min() or avg() of it across nodes reads 0 on any cluster that
+// has one, however much room the workers have. A panel sums it (how many
+// nodes can admit) or keeps to the workers.
+func TestCanAdmitIsCountedNotMinned(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root := filepath.Join(filepath.Dir(filename), "..", "..")
+	minned := regexp.MustCompile(`\b(min|avg)\s*(\(\s*|by\s*\([^)]*\)\s*\(\s*)aerolvm_host_pressure_can_admit\b`)
+	found := 0
+	for _, dir := range []string{filepath.Join(root, "setup", "grafana"), filepath.Join(root, "charts", "aerolvm", "dashboards")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, ent.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			found += strings.Count(string(raw), "aerolvm_host_pressure_can_admit")
+			if m := minned.FindString(string(raw)); m != "" {
+				t.Errorf("%s: %q reads 0 whenever a server or gateway is scraped; sum it, or keep to the workers", ent.Name(), m)
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatal("no dashboard reads aerolvm_host_pressure_can_admit: the check found nothing to check")
+	}
+}
+
 // TestIdentityRowMetricsAreRegistered keeps the "Identity and access" row of
 // the D9 dashboard (plans/identity-and-access.md §5.15) real past the
 // fixture: every aerolvm_* name its panels query must be registered in the

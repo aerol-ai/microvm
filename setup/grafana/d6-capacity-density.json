@@ -21,8 +21,8 @@
       "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
       "id": 2,
       "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "targets": [{ "expr": "min(aerolvm_host_pressure_can_admit)", "legendFormat": "can admit", "refId": "A" }],
-      "title": "Can Admit (min across nodes)",
+      "targets": [{ "expr": "sum(aerolvm_host_pressure_can_admit)", "legendFormat": "nodes", "refId": "A" }],
+      "title": "Nodes That Can Admit",
       "type": "stat"
     },
     {

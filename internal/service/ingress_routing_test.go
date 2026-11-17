@@ -445,6 +445,12 @@ func (c *churnIngressCluster) PlacementsForShards(cluster.PlacementShardFilter) 
 	return c.snapshot()
 }
 
+// PlacementViewForShards is the view the reconciler reads, with the
+// version it is current to (cluster.Client).
+func (c *churnIngressCluster) PlacementViewForShards(filter cluster.PlacementShardFilter) ([]cluster.Placement, uint64) {
+	return c.PlacementsForShards(filter), c.PlacementVersion()
+}
+
 // put and drop change the view and stream the change, as a create or a
 // destroy on some worker does.
 func (c *churnIngressCluster) put(p cluster.Placement) {
