@@ -137,6 +137,27 @@ func TestRenderedIdentityReachesEveryRole(t *testing.T) {
 				if got := envValue(pod.Spec.InitContainers[setup].Env, "SB_IDENTITY_ENABLED"); got != tc.want {
 					t.Errorf("%s setup (sandboxd.env): SB_IDENTITY_ENABLED = %q, want %q", role, got, tc.want)
 				}
+				// The identity render also sets the token cap and an identity
+				// file: both reach the agent and sandboxd.env, and the file's
+				// ConfigMap is mounted where SB_IDENTITY_FILE points.
+				if tc.want != "" {
+					for name, want := range map[string]string{"SB_TOKEN_MAX_TTL": "2160h", "SB_IDENTITY_FILE": "/etc/aerolvm/identity/identity.yaml"} {
+						if envValue(agent.Env, name) != want || envValue(pod.Spec.InitContainers[setup].Env, name) != want {
+							t.Errorf("%s: %s = %q in the agent, %q in setup; want %q", role, name,
+								envValue(agent.Env, name), envValue(pod.Spec.InitContainers[setup].Env, name), want)
+						}
+					}
+					mounted, volume := false, false
+					for _, m := range agent.VolumeMounts {
+						mounted = mounted || (m.Name == "identity-file" && m.MountPath == "/etc/aerolvm/identity")
+					}
+					for _, v := range pod.Spec.Volumes {
+						volume = volume || (v.Name == "identity-file" && v.ConfigMap != nil)
+					}
+					if !mounted || !volume {
+						t.Errorf("%s: identity file mounted %v, volume %v", role, mounted, volume)
+					}
+				}
 				hasPAT := false
 				for _, e := range agent.Env {
 					hasPAT = hasPAT || e.Name == "SB_PAT_TOKEN"

@@ -201,7 +201,7 @@ kubectl -n <namespace> create secret generic aerolvm-metrics-token \
   --from-literal=token="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
 ```
 
-Prometheus reads the pods once the Secret exists. Make a new token before this one expires.
+Prometheus reads the pods once the Secret exists. Make a new token before this one expires. If you set `identity.tokenMaxTTL` below 90 days, use it for `--expires-in` instead.
 
 This token cannot create, change, stop or run anything, read secrets, or make tokens. It is read-only, but not metrics-only: on every node it can also read every team's sandbox details (never their env) and audit records. No gateway or worker gets the admin token.
 

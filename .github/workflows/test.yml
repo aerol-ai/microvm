@@ -895,7 +895,8 @@ jobs:
         run: |
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
-          scripts/chart-pod-templates.sh --set identity.enabled=true > "$RUNNER_TEMP/pod-templates-identity.yaml"
+          scripts/chart-pod-templates.sh --set identity.enabled=true --set identity.tokenMaxTTL=2160h \
+            --set-string identity.file.content='version: 1' > "$RUNNER_TEMP/pod-templates-identity.yaml"
           helm template t charts/aerolvm --namespace aerolvm-system \
             --set mode=cluster --set 'cluster.zones={z-a,z-b,z-c}' \
             --set 'cluster.workerPools[0].name=general' \
@@ -1040,6 +1041,8 @@ jobs:
           # Its scrape token is a viewer token, which a node without API
           # tokens refuses: servers, gateways and workers all turn them on.
           test "$(grep -c 'SB_IDENTITY_ENABLED, value: "true"' <<<"$out")" -eq 3
+          # Its tokens last at most 90 days on every node.
+          test "$(grep -c 'SB_TOKEN_MAX_TTL, value: "2160h"' <<<"$out")" -eq 3
 
       # The chart's alerts, recording rules and dashboards (P6, P9): every
       # metric they read is registered in the Go code (or is the

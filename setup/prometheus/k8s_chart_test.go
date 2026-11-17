@@ -945,7 +945,7 @@ func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
 		}
 	}
 	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ENABLED=true")...); err == nil ||
-		!strings.Contains(err.Error(), "set identity.enabled=true to turn them on") {
+		!strings.Contains(err.Error(), "Remove it, and set identity.enabled.") {
 		t.Errorf("cluster mode took worker.extraEnv.SB_IDENTITY_ENABLED, which reaches workers only: %v", err)
 	}
 	// A false value turns nothing on: cluster mode lets it be (PR 2 review).
@@ -1104,5 +1104,114 @@ func TestKubernetesChartNotesOnTurningIdentityOn(t *testing.T) {
 				t.Errorf("%s: the notes lack %q", tc.name, w)
 			}
 		}
+	}
+}
+
+// identity.tokenMaxTTL, identity.file and enterprise.enabled reach every
+// node, as identity.enabled does (issue #1343): a cap or an identity file on
+// the workers alone binds nodes that take no token write. The identity file
+// is a ConfigMap in every namespace a node runs in, mounted on each.
+// worker.extraEnv may not set any of them in cluster mode. The bank preset
+// caps tokens at 90 days everywhere and leaves enterprise mode off.
+func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	docs, err := renderChart(t, root, helm, with("identity.enabled=true", "identity.tokenMaxTTL=2160h",
+		"identity.file.content=version: 1", "enterprise.enabled=true")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates := podTemplates(t, docs)
+	for _, role := range []string{"server", "gateway", "worker"} {
+		for _, want := range []string{`SB_TOKEN_MAX_TTL, value: "2160h"`, `SB_IDENTITY_FILE, value: "/etc/aerolvm/identity/identity.yaml"`,
+			`SB_ENTERPRISE_MODE, value: "true"`, "name: identity-file, mountPath: /etc/aerolvm/identity", "name: t-identity"} {
+			if !strings.Contains(templates[role], want) {
+				t.Errorf("the %s template lacks %q", role, want)
+			}
+		}
+	}
+	namespaces := map[any]bool{}
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		if dig(cm, "metadata", "name") == "t-identity" && dig(cm, "data", "identity.yaml") != nil {
+			namespaces[dig(cm, "metadata", "namespace")] = true
+		}
+	}
+	if !namespaces["aerolvm"] || !namespaces["aerolvm-workers"] || len(namespaces) != 2 {
+		t.Errorf("the identity file's ConfigMap is in %v, want the release and worker namespaces", namespaces)
+	}
+	// Off by default: nothing set, nothing mounted.
+	docs, err = renderChart(t, root, helm, with("identity.enabled=true")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, body := range podTemplates(t, docs) {
+		for _, never := range []string{"SB_TOKEN_MAX_TTL", "SB_IDENTITY_FILE", "SB_ENTERPRISE_MODE", "identity-file"} {
+			if strings.Contains(body, never) {
+				t.Errorf("by default the %s template carries %s", role, never)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		sets []string
+		want string
+	}{
+		{[]string{"worker.extraEnv.SB_TOKEN_MAX_TTL=2160h"}, "worker.extraEnv.SB_TOKEN_MAX_TTL (2160h) reaches workers only"},
+		{[]string{"worker.extraEnv.SB_IDENTITY_FILE=/x"}, "set identity.file"},
+		{[]string{"worker.extraEnv.SB_ENTERPRISE_MODE=true"}, "set enterprise.enabled"},
+		{[]string{"identity.enabled=true", "identity.tokenMaxTTL=90d"}, "is not a duration sandboxd reads"},
+		{[]string{"identity.file.content=x"}, "identity.file needs identity.enabled=true"},
+		{[]string{"enterprise.enabled=true"}, "enterprise.enabled needs identity.enabled=true"},
+	} {
+		if _, err := renderChart(t, root, helm, with(tc.sets...)...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v rendered or failed otherwise: %v; want %q", tc.sets, err, tc.want)
+		}
+	}
+	// Enterprise mode refuses a cap over 90 days at boot, so the render
+	// does too, whatever the units (PR 3 review, round 3).
+	for ttl, refused := range map[string]bool{"2161h": true, "2159h59m61s": true, "7776001s": true, "2160h": false, "1h30m": false} {
+		_, err := renderChart(t, root, helm, with("identity.enabled=true", "enterprise.enabled=true", "identity.tokenMaxTTL="+ttl)...)
+		if got := err != nil && strings.Contains(err.Error(), "longer than enterprise mode allows"); got != refused {
+			t.Errorf("enterprise mode with tokenMaxTTL %s: refused %v (%v), want %v", ttl, got, err, refused)
+		}
+	}
+	// The scrape token the refusal and the notes tell you to make lasts
+	// no longer than the cap, or 90 days without one.
+	for ttl, want := range map[string]string{"720h": "--expires-in 720h", "": "--expires-in 90d"} {
+		sets := with("monitoring.enabled=true", "identity.enabled=true")
+		if ttl != "" {
+			sets = append(sets, "identity.tokenMaxTTL="+ttl)
+		}
+		if _, err := renderChart(t, root, helm, sets...); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("the scrape-token refusal with tokenMaxTTL %q: %v; want %q", ttl, err, want)
+		}
+		notes := renderNotes(t, root, helm, false, append(sets, "monitoring.scrapeToken.existingSecret=aerolvm-metrics-token")...)
+		if !strings.Contains(notes, want) {
+			t.Errorf("the notes with tokenMaxTTL %q lack %q", ttl, want)
+		}
+	}
+	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_ENTERPRISE_MODE=false")...); err != nil {
+		t.Errorf("a false worker.extraEnv.SB_ENTERPRISE_MODE, which turns nothing on, was refused: %v", err)
+	}
+	// Single mode: the worker carries them, and worker.extraEnv still may,
+	// but not both.
+	if _, err := renderChart(t, root, helm, "identity.enabled=true", "identity.tokenMaxTTL=2160h", "worker.extraEnv.SB_TOKEN_MAX_TTL=1h"); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("single mode took SB_TOKEN_MAX_TTL twice: %v", err)
+	}
+
+	bank, err := runTool(t, root, helm, "template", "t", filepath.Join(root, "charts", "aerolvm"),
+		"-f", filepath.Join(root, "charts", "aerolvm", "values-bank-eks.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(bank, `SB_TOKEN_MAX_TTL, value: "2160h"`); n != 3 {
+		t.Errorf("the bank preset caps tokens at 90 days in %d pod templates, want 3", n)
 	}
 }

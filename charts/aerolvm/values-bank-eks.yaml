@@ -15,8 +15,11 @@
 #   - Prometheus monitoring, alerts and dashboards, read with a token that
 #     can only read;
 #   - AerolVM's own API tokens on every node, so people and CI can hold
-#     tokens that do less than the admin token;
+#     tokens that do less than the admin token, each lasting at most 90
+#     days (identity.tokenMaxTTL);
 #   - worker machines replaced every 30 days.
+#   Enterprise mode stays off: on Kubernetes it cannot start yet (the
+#   operator's admin-token calls, an audit witness and an off-node export).
 #
 # What it cannot set, and you must:
 #   - The scrape token's Secret, after the install (see monitoring below).
@@ -81,6 +84,12 @@ edge:
 # token below is one, and every node refuses tokens without this.
 identity:
   enabled: true
+  # API tokens last at most 90 days, enterprise mode's cap, on every node:
+  # the leader holds every token write to it.
+  tokenMaxTTL: 2160h
+
+# enterprise.enabled stays off here until the chart can satisfy enterprise
+# mode's start-up checks on Kubernetes (see values.yaml, enterprise).
 
 monitoring:
   enabled: true

@@ -153,6 +153,7 @@ containers:
       {{- if and $gateway $kubeAPI }}
       - { name: agent-sandbox-tls, mountPath: /etc/aerolvm/agent-sandbox-api, readOnly: true }
       {{- end }}
+      {{- with include "aerolvm.identityFileMount" $root }}{{ . | nindent 6 }}{{ end }}
   {{- if $edge }}
   - name: edge
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-edge") }}
@@ -174,6 +175,7 @@ containers:
       - { name: edge-state, mountPath: /config }
   {{- end }}
 volumes:
+  {{- with include "aerolvm.identityFileVolume" $root }}{{ . | nindent 2 }}{{ end }}
   - { name: etc, emptyDir: {} }
   - { name: state, emptyDir: {} }
   - { name: run, emptyDir: {} }

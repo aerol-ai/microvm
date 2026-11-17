@@ -31,7 +31,7 @@ the cluster: the first server, the other servers, then gateways and workers.
    a token that can only read, signed in as admin (aerolvm login <API URL> --token-stdin):
 
    kubectl -n {{ .Release.Namespace }} create secret generic {{ $scrape.existingSecret }} \
-     --from-literal={{ $scrape.key }}="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d)"
+     --from-literal={{ $scrape.key }}="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in {{ include "aerolvm.scrapeTokenExpiresIn" . }})"
 
    Make a new one before it expires.
 {{- if not (.Values.identity | default dict).enabled }}

@@ -323,6 +323,7 @@ containers:
       {{- if $cluster }}
       - { name: etc, mountPath: /etc/sandboxd }
       {{- end }}
+      {{- with include "aerolvm.identityFileMount" $root }}{{ . | nindent 6 }}{{ end }}
       # The CNI host-local plugin's record of the addresses it gave
       # out. In the container's own filesystem it was lost on an agent
       # restart, and the next warm slot got a running sandbox's
@@ -414,6 +415,7 @@ containers:
       - { name: run-aerolvm, mountPath: /run/aerolvm }
       - { name: egress-state, mountPath: /var/lib/aerolvm-egress }
 volumes:
+  {{- with include "aerolvm.identityFileVolume" $root }}{{ . | nindent 2 }}{{ end }}
   - name: containerd
     {{- toYaml $root.Values.worker.containerdVolume | nindent 4 }}
   - name: state

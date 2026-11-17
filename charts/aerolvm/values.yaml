@@ -43,6 +43,35 @@ apiToken:
 # the aerolvm-0 pod, which ends every sandbox on it.
 identity:
   enabled: false
+  # The longest an API token may last, on every node (SB_TOKEN_MAX_TTL): a
+  # Go duration such as 2160h (90 days). The leader's value binds every
+  # token write, wherever it was made. Empty keeps sandboxd's default: 365
+  # days, or 90 in enterprise mode, which refuses anything longer.
+  tokenMaxTTL: ""
+  # The identity file (SB_IDENTITY_FILE): the SSO issuers this cluster
+  # trusts and their group-to-role bindings (docs: Enterprise, SSO). It
+  # holds no secret, so it lives in a ConfigMap, mounted on every node at
+  # /etc/aerolvm/identity/<key>. Give its content here and the chart makes
+  # the ConfigMap, in the worker namespace too in cluster mode; or name one
+  # you made in existingConfigMap (in cluster mode, in both namespaces).
+  # Needs identity.enabled. A pod reads it when it is made, like
+  # identity.enabled. Every node fetches the issuers' keys: with
+  # networkPolicy.enabled, a worker reaches an identity provider on a
+  # private address only once networkPolicy.extraEgressCIDRs lists it.
+  file:
+    content: ""
+    existingConfigMap: ""
+    key: identity.yaml
+
+# Enterprise mode on every node (SB_ENTERPRISE_MODE): sandboxd refuses to
+# start unless every strict security rule holds (docs: Enterprise mode).
+# Needs identity.enabled. Not yet bootable on Kubernetes: every node then
+# also needs the admin token limited to the host and cluster peers
+# (SB_PAT_SCOPE=host, which the operator's calls to the servers cannot
+# meet yet), an S3 Object Lock audit witness and an off-node audit export,
+# and the chart sets none of these.
+enterprise:
+  enabled: false
 
 worker:
   # The runtime container's budget is the sandboxes' budget: every sandbox
@@ -263,6 +292,7 @@ monitoring:
   # this namespace and named here. Use one that can only read: turn on
   # identity.enabled, then
   #   aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d
+  # (no longer than identity.tokenMaxTTL when you set it).
   # It reads metrics, sandbox details (never their env) and audit logs; it
   # cannot create, change, run or read anything secret. Make a new one
   # before it expires. The Secret may come after the install: Prometheus
