@@ -233,6 +233,8 @@ def main():
     srv = Server(("0.0.0.0", args.listen), Proxy)
     if args.tls_cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        # Registries and containerd speak TLS 1.2+; never offer older.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(args.tls_cert, args.tls_key)
         # The handshake in each request's own thread, not in the accept
         # loop: one slow client must not hold up every other.
