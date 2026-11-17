@@ -1268,12 +1268,38 @@ func (c *Cluster) collectMemberKeys(ctx context.Context) ([]AdmittedNode, map[st
 			unreachable[m.NodeID] = "unreachable: " + err.Error()
 			continue
 		}
+		role, why := c.adoptRole(m)
+		if role == "" {
+			unreachable[m.NodeID] = why
+			continue
+		}
 		nodes = append(nodes, AdmittedNode{
-			NodeID: m.NodeID, Role: joinRoleForNodeRole(m.Role), KeyHash: CertKeyHash(leaf),
+			NodeID: m.NodeID, Role: role, KeyHash: CertKeyHash(leaf),
 			NotAfterUnixNano: leaf.NotAfter.UnixNano(),
 		})
 	}
 	return nodes, unreachable
+}
+
+// adoptRole is the role adopt admits a member with. Node certificates get
+// only what their role needs, and an admitted server role is what every
+// server-only check reads, so it is never taken from gossip, which any
+// member can set: a member is a server only when it is a configured Raft
+// server. A member whose gossip says server (or mixed, or nothing) but
+// that Raft does not count is not admitted; it joins with a join token
+// instead. Worker and ingress come from gossip as before: they are the
+// least a member can be. why says what to fix when it is "".
+func (c *Cluster) adoptRole(m Member) (role, why string) {
+	role = joinRoleForNodeRole(m.Role)
+	if role != JoinRoleServer {
+		return role, ""
+	}
+	if c.raft != nil && c.raft.raft != nil {
+		if _, ok := c.configuredServer(m.NodeID); ok {
+			return JoinRoleServer, ""
+		}
+	}
+	return "", "not a Raft server: adopt admits a server only from Raft membership; join this node with a join token"
 }
 
 // currentLeaf is this node's cert as served.

@@ -111,7 +111,7 @@ func (c *nodeRoleCluster) LookupMember(id string) (cluster.Member, bool) {
 }
 
 func (c *nodeRoleCluster) IsJoinWritePeer(id string) bool  { return id == "srv-2" }
-func (c *nodeRoleCluster) IsTokenWritePeer(id string) bool { return id == "srv-2" || id == "gw-1" }
+func (c *nodeRoleCluster) IsTokenWritePeer(id string) bool { return id == "srv-2" }
 
 // The fleet calls of the table test, with another team's sandbox.
 var fleetCalls = []struct{ method, path, body string }{
@@ -267,26 +267,37 @@ func TestNodeCertificateGrantedCalls(t *testing.T) {
 }
 
 // A forward that speaks for a Kubernetes user (the agent-sandbox API) is
-// honoured only from a node whose role runs that API: a gateway, or a
-// server. A worker's stamp is a 401 like any malformed one.
+// honoured only from a node whose role runs that API (a gateway, or a
+// server) and only on the calls that API makes: create, delete, start and
+// stop. A worker's stamp, or one on any other route, is a 401 like any
+// malformed one.
 func TestOnBehalfOnlyFromGatewaysAndServers(t *testing.T) {
 	for _, tc := range []struct {
-		role string
-		want bool
+		role    string
+		pattern string
+		want    bool
 	}{
-		{controlplane.NodeRoleIngress, true},
-		{controlplane.NodeRoleServer, true},
-		{controlplane.NodeRoleWorker, false},
-		{"", false},
+		{controlplane.NodeRoleIngress, "DELETE /v1/sandboxes/{id}", true},
+		{controlplane.NodeRoleIngress, "POST /v1/sandboxes", true},
+		{controlplane.NodeRoleIngress, "POST /v1/sandboxes/{id}/start", true},
+		{controlplane.NodeRoleIngress, "POST /v1/sandboxes/{id}/stop", true},
+		{controlplane.NodeRoleServer, "DELETE /v1/sandboxes/{id}", true},
+		{controlplane.NodeRoleWorker, "DELETE /v1/sandboxes/{id}", false},
+		{"", "DELETE /v1/sandboxes/{id}", false},
+		{controlplane.NodeRoleIngress, "GET /v1/sandboxes/{id}", false},
+		{controlplane.NodeRoleIngress, "/v1/sandboxes/{id}/toolbox/{path...}", false},
+		{controlplane.NodeRoleIngress, "GET /v1/sandboxes", false},
+		{controlplane.NodeRoleIngress, "GET /v1/whoami", false},
 	} {
 		req := asNode(httptest.NewRequest(http.MethodGet, "/v1/sandboxes/sb-1", nil), "peer-x", tc.role)
+		req.Pattern = tc.pattern
 		req.Header.Set(cluster.HeaderForwarded, "1")
 		req.Header.Set(cluster.HeaderCaller, cluster.CallerNode)
 		req.Header.Set(cluster.HeaderOnBehalfOf, "kubernetes:ana")
 		req.Header.Set(cluster.HeaderOnBehalfOwner, "team:payments")
 		access, ok := nodeCertAccess(req, func(r *http.Request, _ string) string { return cluster.ExtractPeerRole(r.TLS.PeerCertificates[0]) })
 		if ok != tc.want {
-			t.Fatalf("on-behalf from a %q node = %v, want %v", tc.role, ok, tc.want)
+			t.Fatalf("on-behalf from a %q node on %s = %v, want %v", tc.role, tc.pattern, ok, tc.want)
 		}
 		if ok && (access.Principal.Kind != controlplane.PrincipalKubernetes || access.Role != controlplane.RoleRunner || access.Identity.OwnerRef != "team:payments") {
 			t.Fatalf("on-behalf access = %+v", access)

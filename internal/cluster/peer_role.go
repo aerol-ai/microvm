@@ -17,21 +17,27 @@ import (
 // The role is read from what the cluster signed or decided, never from
 // gossip, which any member can claim anything in:
 //
-//	server node  ─► its FSM's admitted record ─► Raft membership ─► the cert
-//	other nodes  ─► the cert (they hold no FSM)
+//	server node  ─► server only while a configured Raft server; otherwise
+//	                the admitted record's role, else the certificate's
+//	other nodes  ─► the certificate (they hold no FSM and no Raft view)
+//
+// On a server, the server role always needs Raft membership: an admitted
+// record or a certificate that says server, for a node Raft does not
+// count, reads as no role. Raft membership is what every server-only check
+// already binds to (peerIsServer), and it cannot be claimed in gossip.
 //
 // The certificate's role is the cluster CA's DNS:role:<role>, which the
-// join service signs from the join token's role, or an external CA's one
-// aerolvm-role:<role> URI (ExtractPeerRole). A certificate signed before
-// roles were (cluster-sign-node.sh) names none: on a server, the admitted
-// record or Raft membership still names the role; elsewhere it is unknown,
-// and unknown gets the least.
+// join service signs from the join token's role, or an external CA's
+// aerolvm-role:<role> URI (ExtractPeerRole; both forms must agree). A
+// certificate signed before roles were (cluster-sign-node.sh) names none:
+// on a server, the admitted record or Raft membership still names the
+// role; elsewhere it is unknown, and unknown gets the least.
 
-// PeerRoleReader is what a server node knows about a peer's role beyond
-// its certificate: its admitted record and Raft membership. Implemented by
+// PeerRoleReader is what a server node knows about a peer beyond its
+// certificate: its admitted record and Raft membership. Implemented by
 // Cluster; an Agent holds neither, so it reads the certificate alone.
 type PeerRoleReader interface {
-	AdmittedPeerRole(nodeID string) (string, bool)
+	PeerRoleFor(nodeID, certRole string) string
 }
 
 // PeerRole returns the role nodeID was admitted with, as this node can
@@ -42,33 +48,39 @@ func PeerRole(c Client, nodeID string, leaf *x509.Certificate) string {
 	if nodeID == "" {
 		return ""
 	}
+	certRole := ExtractPeerRole(leaf)
 	if reader, ok := c.(PeerRoleReader); ok {
-		if role, ok := reader.AdmittedPeerRole(nodeID); ok {
-			return role
-		}
+		return reader.PeerRoleFor(nodeID, certRole)
 	}
-	return ExtractPeerRole(leaf)
+	return certRole
 }
 
-// AdmittedPeerRole is a server's answer: the admitted record's role when
-// there is one (it is what every server-only check reads, Codex eng
-// finding 1), else server for a configured Raft server (a scripted cluster
-// before adopt, whose certificates name no role). It reports false when
-// neither says, and PeerRole falls back to the certificate.
-func (c *Cluster) AdmittedPeerRole(nodeID string) (string, bool) {
+// PeerRoleFor is a server's answer (see the table above): server only for
+// a configured Raft server whose admitted record, if any, says server; the
+// admitted record's other roles as they are; otherwise the certificate's
+// role, never server.
+func (c *Cluster) PeerRoleFor(nodeID, certRole string) string {
 	if c == nil || c.fsm == nil {
-		return "", false
+		return ""
+	}
+	nodeID = strings.TrimSpace(nodeID)
+	inRaft := c.raft != nil && c.raft.raft != nil
+	if inRaft {
+		_, inRaft = c.configuredServer(nodeID)
 	}
 	if rec, ok := c.fsm.admittedNode(nodeID); ok && ValidJoinRole(rec.Role) {
-		return rec.Role, true
+		if rec.Role == JoinRoleServer && !inRaft {
+			return ""
+		}
+		return rec.Role
 	}
-	if c.raft == nil || c.raft.raft == nil {
-		return "", false
+	if inRaft {
+		return JoinRoleServer
 	}
-	if _, ok := c.configuredServer(nodeID); ok {
-		return JoinRoleServer, true
+	if certRole == JoinRoleServer {
+		return ""
 	}
-	return "", false
+	return certRole
 }
 
 // PeerIsServer reports whether PeerRole names nodeID a server.

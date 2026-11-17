@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,11 +157,21 @@ func TestJoinServiceFailurePaths(t *testing.T) {
 	if _, err := c.Adopt(ctx, AdoptRequest{}); err == nil {
 		t.Fatal("adopt with an unreadable CA store succeeded")
 	}
-	// Adopt with members but no Raft: the write fails after the CA is in.
+	// Adopt with no Raft: a member that gossips server is not admitted (a
+	// server comes only from Raft membership) and nothing is written.
 	c2 := edgeCluster(t, "fail-2")
 	c2.gossip = &gossipNode{memberIndex: newGossipMemberIndex()}
 	c2.gossip.memberIndex.upsert(Member{NodeID: "fail-2", Alive: true, Role: config.NodeRoleServer})
-	if _, err := c2.Adopt(ctx, AdoptRequest{CAKey: string(sharedCAKeyPEM(t))}); err == nil {
+	if res, err := c2.Adopt(ctx, AdoptRequest{CAKey: string(sharedCAKeyPEM(t))}); err != nil || len(res.Admitted) != 0 ||
+		!strings.Contains(res.Skipped["fail-2"], "not a Raft server") {
+		t.Fatalf("adopt of a member that gossips server, with no Raft = %+v %v", res, err)
+	}
+	// With a member adopt does admit (a worker), the write fails after the
+	// CA is in.
+	c3 := edgeCluster(t, "fail-3")
+	c3.gossip = &gossipNode{memberIndex: newGossipMemberIndex()}
+	c3.gossip.memberIndex.upsert(Member{NodeID: "fail-3", Alive: true, Role: config.NodeRoleWorker})
+	if _, err := c3.Adopt(ctx, AdoptRequest{CAKey: string(sharedCAKeyPEM(t))}); err == nil {
 		t.Fatal("adopt without Raft succeeded")
 	}
 	// The FSM adopt rule for a key another node holds, and a second rekey

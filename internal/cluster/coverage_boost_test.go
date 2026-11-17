@@ -131,7 +131,9 @@ func TestLeaderApplyEncodedSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if err := c.ApplyEncoded(context.Background(), payload); err != nil {
+	// A raw apply arrives from a peer; this one from a server (the leader
+	// itself): node certificates get only what their role needs.
+	if err := c.ApplyEncoded(ContextWithApplyPeer(context.Background(), c.nodeID, nil), payload); err != nil {
 		t.Fatalf("ApplyEncoded on leader: %v", err)
 	}
 	if _, err := c.OwnerOf("sb-apply-encoded"); err != nil {

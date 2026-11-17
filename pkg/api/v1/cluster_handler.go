@@ -1111,7 +1111,7 @@ func (h *handlers) clusterInternalEgressProfileWrite(w http.ResponseWriter, r *h
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
-	if h.refuseSettingsWriter(w, r, "egress profiles") {
+	if h.refuseSettingsWriter(w, r, "egress profiles", false) {
 		return
 	}
 	var req cluster.EgressProfileWriteRequest
@@ -2191,6 +2191,16 @@ func (h *handlers) clusterInternalWasmMigrateExport(w http.ResponseWriter, r *ht
 	}
 	if !owner.IsSelf {
 		apihttp.WriteError(w, http.StatusConflict, "sandbox is not owned by this node")
+		return
+	}
+	// The export is a sandbox's whole memory. Node certificates get only
+	// what their role needs: a migration a node runs as itself over HTTP is
+	// the operator's, which a worker or gateway sends on to a server
+	// (server_tier.go), and a draining owner exports its own sandboxes
+	// without a call (service MigrateWasmSandboxToNode). So only a server
+	// is served one.
+	if peerID, leaf := internalPeer(r); !cluster.PeerIsServer(c, peerID, leaf) {
+		apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("cluster: a WASM migration export goes only to a server: node %q is not one; send the migration to a server", peerID))
 		return
 	}
 	var buf bytes.Buffer

@@ -173,20 +173,13 @@ func (s *Service) apiTokenRecordFor(ctx context.Context, req models.CreateAPITok
 	}, nil
 }
 
-// ForwardsSettingsWrites reports whether this node sends its callers'
-// writes of cluster-wide settings (API tokens, identity roles and keys,
-// egress profiles, team quotas, warm pools) on to a server (the API
-// handler does, with the caller's own credential) instead of writing them:
-// a cluster worker. Those writes come only from servers and gateways
-// (cluster.IsTokenWritePeer, cluster.IsSettingsWriter).
-func (s *Service) ForwardsSettingsWrites() bool {
-	return s.cfg.EnableCluster && s.cfg.IsWorker() && !s.cfg.IsServer()
-}
-
-// SendsOperatorCallsToServers reports whether this node sends the operator
-// calls it cannot serve itself (join tokens, node lifecycle of another
-// node, storage retirement) on to a server with the caller's credential: a
-// cluster node that holds no Raft state, a worker or a gateway.
+// SendsOperatorCallsToServers reports whether this node sends the calls it
+// does not serve itself on to a server with the caller's own credential: a
+// cluster node that holds no Raft state, a worker or a gateway. Those are
+// the operator calls (join tokens, node lifecycle of another node, storage
+// retirement) and the cluster-wide settings writes (API tokens, identity
+// roles and keys, egress profiles, team quotas, warm pools), which only a
+// server writes (cluster.IsTokenWritePeer, cluster.IsSettingsWritePeer).
 func (s *Service) SendsOperatorCallsToServers() bool {
 	return s.cfg.EnableCluster && !s.cfg.IsServer()
 }
@@ -195,8 +188,8 @@ func (s *Service) SendsOperatorCallsToServers() bool {
 // service on a worker without the handler's forward: the server tier would
 // refuse this node's write, so it is a clear 400, not an unknown outcome.
 func (s *Service) takesAPITokenWrites() error {
-	if s.ForwardsSettingsWrites() {
-		return fmt.Errorf("%w: this is a worker node, which sends token writes on to a server; send the request to a server or a gateway", ErrAPITokenInvalid)
+	if s.SendsOperatorCallsToServers() {
+		return fmt.Errorf("%w: this is a worker or gateway node, which sends token writes on to a server; send the request to a server", ErrAPITokenInvalid)
 	}
 	return nil
 }

@@ -120,7 +120,7 @@ func TestClusterApplyEncodedReservePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if err := c.ApplyEncoded(context.Background(), payload); err != nil {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(context.Background(), c.nodeID, nil), payload); err != nil {
 		t.Fatalf("ApplyEncoded(opReserve): %v", err)
 	}
 	p, ok := c.PlacementOf("sb-encoded-reserve")

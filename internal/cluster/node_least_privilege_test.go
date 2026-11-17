@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // roleCert is a verified node certificate for id signed for role
@@ -45,8 +46,10 @@ func admittedLog(t *testing.T) *joinLog {
 
 // The role a peer was admitted with, as a node can tell, never from
 // gossip: on a server the admitted record wins over the certificate (a
-// certificate cannot raise a worker), then Raft membership, then the
-// certificate; a worker or gateway (no FSM) reads the certificate alone.
+// certificate cannot raise a worker), the server role needs Raft
+// membership whatever the record or certificate says, and a node with
+// neither reads its certificate; a worker or gateway (no FSM) reads the
+// certificate alone.
 func TestPeerRole(t *testing.T) {
 	c := &Cluster{fsm: admittedLog(t).f}
 	for _, tc := range []struct {
@@ -56,8 +59,9 @@ func TestPeerRole(t *testing.T) {
 	}{
 		{"wkr-1", roleCert("wkr-1", JoinRoleServer), JoinRoleWorker},
 		{"gw-1", roleCert("gw-1", ""), JoinRoleIngress},
-		{"srv-2", roleCert("srv-2", JoinRoleWorker), JoinRoleServer},
+		{"srv-2", roleCert("srv-2", JoinRoleServer), ""}, // admitted as a server, not in Raft
 		{"new-1", roleCert("new-1", JoinRoleWorker), JoinRoleWorker},
+		{"new-2", roleCert("new-2", JoinRoleServer), ""}, // a server's certificate, not in Raft
 		{"old-1", roleCert("old-1", ""), ""},
 		{"old-1", nil, ""},
 		{"", roleCert("x", JoinRoleServer), ""},
@@ -73,29 +77,58 @@ func TestPeerRole(t *testing.T) {
 	if got := PeerRole(nil, "wkr-1", roleCert("wkr-1", JoinRoleWorker)); got != JoinRoleWorker {
 		t.Errorf("no cluster reads the certificate: %q", got)
 	}
-	if !PeerIsServer(c, "srv-2", nil) || PeerIsServer(c, "wkr-1", roleCert("wkr-1", JoinRoleServer)) {
-		t.Error("PeerIsServer")
+	if PeerIsServer(c, "srv-2", nil) || PeerIsServer(c, "wkr-1", roleCert("wkr-1", JoinRoleServer)) {
+		t.Error("PeerIsServer without Raft membership")
 	}
-	if _, ok := (*Cluster)(nil).AdmittedPeerRole("srv-2"); ok {
-		t.Error("a nil cluster names a role")
+	if got := (*Cluster)(nil).PeerRoleFor("srv-2", JoinRoleServer); got != "" {
+		t.Errorf("a nil cluster names a role: %q", got)
 	}
 
-	// A Raft server with no admitted record (a scripted cluster before
-	// adopt, whose certificates name no role) is a server.
+	// A Raft server is a server, with no admitted record (a scripted
+	// cluster before adopt, whose certificates name no role) or with one
+	// that says server. A record that says worker wins over Raft.
 	rc, cleanup := newTestCluster(t, "role-peer-a", true, nil)
 	defer cleanup()
 	waitForLeader(t, rc, 10*time.Second)
 	if got := PeerRole(rc, "role-peer-a", roleCert("role-peer-a", "")); got != JoinRoleServer {
 		t.Errorf("Raft server = %q", got)
 	}
-	if got := PeerRole(rc, "stranger", roleCert("stranger", "")); got != "" {
-		t.Errorf("a node neither admitted nor in Raft = %q", got)
+	if got := PeerRole(rc, "stranger", roleCert("stranger", JoinRoleServer)); got != "" {
+		t.Errorf("a node neither admitted nor in Raft, with a server's certificate = %q", got)
 	}
+	if got := PeerRole(rc, "stranger", roleCert("stranger", JoinRoleIngress)); got != JoinRoleIngress {
+		t.Errorf("a gateway's certificate, no record = %q", got)
+	}
+}
+
+// fakeProposalState is the leader's FSM for the proposal rule.
+type fakeProposalState struct {
+	placements map[string]Placement
+	snapshots  map[string]string
+	reclaims   map[string]VolumeReclaim
+}
+
+func (f fakeProposalState) placementForProposal(id string, _ bool) (Placement, bool) {
+	p, ok := f.placements[id]
+	return p, ok
+}
+
+func (f fakeProposalState) snapshotHomeForProposal(name string) (string, bool) {
+	n, ok := f.snapshots[name]
+	return n, ok
+}
+
+func (f fakeProposalState) volumeReclaimForProposal(r VolumeReclaim) (VolumeReclaim, bool) {
+	cur, ok := f.reclaims[r.key()]
+	return cur, ok
 }
 
 // What each role may propose through the raw apply routes: a server
 // anything; a worker, a gateway or an unknown role only the Agent ops,
-// and its drain mark only for itself.
+// each bound to the sender (peer_proposals.go): it places and claims only
+// for itself, changes only the sandboxes it owns, reassigns only a WASM
+// sandbox to itself, and names only itself as a snapshot home, catalogue
+// publisher, obligation reporter, reclaim claimer or drained node.
 func TestPeerMayPropose(t *testing.T) {
 	serverOnly := []opCode{
 		opPutAPIToken, opDeleteAPIToken, opPutIdentityKeys, opPutIdentityRole, opDeleteIdentityRole,
@@ -105,30 +138,115 @@ func TestPeerMayPropose(t *testing.T) {
 		opPutJoinToken, opDeleteJoinToken, opAdmitNode, opAdoptNodes, opRekeyNode, opAdmitNodeByCert,
 		opSetActiveVersion, opRolloutCommand, opRolloutNode,
 	}
+	var none fakeProposalState
 	for _, op := range serverOnly {
-		if !peerMayPropose(JoinRoleServer, "srv-2", command{Op: op}) {
+		if !peerMayPropose(JoinRoleServer, "srv-2", command{Op: op}, none) {
 			t.Errorf("a server may not propose op %d", op)
 		}
 		for _, role := range []string{JoinRoleWorker, JoinRoleIngress, ""} {
-			if peerMayPropose(role, "wkr-1", command{Op: op}) {
+			if peerMayPropose(role, "wkr-1", command{Op: op, NodeID: "wkr-1", OwnerNodeID: "wkr-1"}, none) {
 				t.Errorf("a %q node may propose op %d", role, op)
 			}
 		}
 	}
-	for op := range agentProposableOps {
-		cmd := command{Op: op, NodeID: "wkr-1"}
+	reclaim := VolumeReclaim{Tenant: "t", VolumeID: "v", NodeID: "wkr-1", RecordedUnixNano: 7}
+	otherReclaim := VolumeReclaim{Tenant: "t", VolumeID: "v2", NodeID: "wkr-2", RecordedUnixNano: 7}
+	st := fakeProposalState{
+		placements: map[string]Placement{
+			"sb-mine":        {SandboxID: "sb-mine", OwnerNodeID: "wkr-1"},
+			"sb-theirs":      {SandboxID: "sb-theirs", OwnerNodeID: "wkr-2"},
+			"sb-my-orphan":   {SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-1"},
+			"sb-their-orph":  {SandboxID: "sb-their-orph", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-2"},
+			"sb-no-orph-own": {SandboxID: "sb-no-orph-own"},
+			"sb-wasm":        {SandboxID: "sb-wasm", OwnerNodeID: "wkr-2", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeWasm}},
+			"sb-docker":      {SandboxID: "sb-docker", OwnerNodeID: "wkr-2", Spec: &models.CreateSandboxRequest{Runtime: "docker"}},
+		},
+		snapshots: map[string]string{"snap-mine": "wkr-1", "snap-theirs": "wkr-2"},
+		reclaims:  map[string]VolumeReclaim{reclaim.key(): reclaim, otherReclaim.key(): otherReclaim},
+	}
+	fenced := func(op opCode, owner string) command {
+		return command{Op: op, SandboxID: "sb-x", ExpectedOwnerNodeID: owner, ExpectedOwnerNodeIDSet: true}
+	}
+	for _, tc := range []struct {
+		name string
+		cmd  command
+		want bool
+	}{
+		{"place for itself", command{Op: opPlace, SandboxID: "sb-new", OwnerNodeID: "wkr-1"}, true},
+		{"place for another node", command{Op: opPlace, SandboxID: "sb-new", OwnerNodeID: "srv-1"}, false},
+		{"claim its own orphan", command{Op: opClaimOrphan, SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1"}, true},
+		{"claim another node's orphan", command{Op: opClaimOrphan, SandboxID: "sb-their-orph", OwnerNodeID: "wkr-1"}, false},
+		{"claim an orphan with no recorded owner", command{Op: opClaimOrphan, SandboxID: "sb-no-orph-own", OwnerNodeID: "wkr-1"}, false},
+		{"claim for another node", command{Op: opClaimOrphan, SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-2"}, false},
+		{"claim of an unknown sandbox", command{Op: opClaimOrphan, SandboxID: "sb-gone", OwnerNodeID: "wkr-1"}, true},
+		{"reassign a WASM sandbox to itself", command{Op: opReassign, SandboxID: "sb-wasm", OwnerNodeID: "wkr-1"}, true},
+		{"reassign a container sandbox to itself", command{Op: opReassign, SandboxID: "sb-docker", OwnerNodeID: "wkr-1"}, false},
+		{"reassign to another node", command{Op: opReassign, SandboxID: "sb-wasm", OwnerNodeID: "wkr-3"}, false},
+		{"reassign with a move token", command{Op: opReassign, SandboxID: "sb-wasm", OwnerNodeID: "wkr-1", ExpectedMoveToken: "t"}, false},
+		{"reassign of an unknown sandbox", command{Op: opReassign, SandboxID: "sb-gone", OwnerNodeID: "wkr-1"}, false},
+		{"spec of its own sandbox", command{Op: opUpsertSpec, SandboxID: "sb-mine"}, true},
+		{"spec of another node's", command{Op: opUpsertSpec, SandboxID: "sb-theirs"}, false},
+		{"spec of an unknown sandbox", command{Op: opUpsertSpec, SandboxID: "sb-gone"}, false},
+		{"port on its own", command{Op: opAddExposedPort, SandboxID: "sb-mine"}, true},
+		{"port on another node's", command{Op: opAddExposedPort, SandboxID: "sb-theirs"}, false},
+		{"port removal on another node's", command{Op: opRemoveExposedPort, SandboxID: "sb-theirs"}, false},
+		{"domain on another node's", command{Op: opAddCustomDomain, SandboxID: "sb-theirs"}, false},
+		{"domain removal on another node's", command{Op: opRemoveCustomDomain, SandboxID: "sb-theirs"}, false},
+		{"delete fenced on itself", fenced(opDelete, "wkr-1"), true},
+		{"delete fenced on another node", fenced(opDelete, "wkr-2"), false},
+		{"delete with no owner fence", command{Op: opDelete, SandboxID: "sb-mine"}, false},
+		{"begin delete fenced on another node", fenced(opBeginDelete, "wkr-2"), false},
+		{"secret recipients fenced on itself", fenced(opUpdateSecretRecipients, "wkr-1"), true},
+		{"secret recipients fenced on no owner", fenced(opUpdateSecretRecipients, ""), false},
+		{"move abort for itself", fenced(opMoveHandoff, "wkr-1"), true},
+		{"move begin (a token)", func() command { c := fenced(opMoveHandoff, "wkr-1"); c.MoveToken = "t"; return c }(), false},
+		{"own drain mark", command{Op: opSetNodeDrainState, NodeID: "wkr-1"}, true},
+		{"another node's drain mark", command{Op: opSetNodeDrainState, NodeID: "gw-1"}, false},
+		{"snapshot home on itself", command{Op: opRegisterSnapshotNode, SnapshotName: "s", NodeID: "wkr-1"}, true},
+		{"snapshot home on another node", command{Op: opRegisterSnapshotNode, SnapshotName: "s", NodeID: "srv-1"}, false},
+		{"forget its own snapshot home", command{Op: opForgetSnapshotNode, SnapshotName: "snap-mine"}, true},
+		{"forget another node's", command{Op: opForgetSnapshotNode, SnapshotName: "snap-theirs"}, false},
+		{"forget an unknown name", command{Op: opForgetSnapshotNode, SnapshotName: "snap-none"}, true},
+		{"its catalogue slice", command{Op: opPublishArtifactCatalog, NodeID: "wkr-1"}, true},
+		{"another node's catalogue slice", command{Op: opPublishArtifactCatalog, NodeID: "srv-1"}, false},
+		{"its obligation report", command{Op: opReportStorageObligations, ObligationReports: []StorageObligationReport{{Reporter: "wkr-1"}}}, true},
+		{"another node's obligation report", command{Op: opReportStorageObligations, ObligationReports: []StorageObligationReport{{Reporter: "wkr-1"}, {Reporter: "srv-1"}}}, false},
+		{"an empty obligation report", command{Op: opReportStorageObligations}, false},
+		{"claim a reclaim for itself", command{Op: opClaimVolumeReclaim, VolumeReclaim: &otherReclaim, NodeID: "wkr-1"}, true},
+		{"claim a reclaim for another node", command{Op: opClaimVolumeReclaim, VolumeReclaim: &reclaim, NodeID: "wkr-3"}, false},
+		{"ack its own reclaim", command{Op: opAckVolumeReclaim, VolumeReclaim: &reclaim}, true},
+		{"ack another node's reclaim", command{Op: opAckVolumeReclaim, VolumeReclaim: &otherReclaim}, false},
+		{"ack a reclaim already gone", command{Op: opAckVolumeReclaim, VolumeReclaim: &VolumeReclaim{Tenant: "t", VolumeID: "gone"}}, true},
+		{"ack with no reclaim", command{Op: opAckVolumeReclaim}, false},
+		{"reserve on another node", command{Op: opReserve, SandboxID: "sb-new", OwnerNodeID: "wkr-2"}, true},
+		{"cancel a reservation", command{Op: opCancelReserve, SandboxID: "sb-new"}, true},
+	} {
 		for _, role := range []string{JoinRoleWorker, JoinRoleIngress, ""} {
-			if !peerMayPropose(role, "wkr-1", cmd) {
-				t.Errorf("a %q node may not propose agent op %d", role, op)
+			want := tc.want
+			if role == JoinRoleIngress && (tc.cmd.Op == opPlace || tc.cmd.Op == opClaimOrphan || tc.cmd.Op == opReassign) {
+				want = false
+			}
+			if got := peerMayPropose(role, "wkr-1", tc.cmd, st); got != want {
+				t.Errorf("%s (%q sender): %v, want %v", tc.name, role, got, want)
 			}
 		}
+		if !peerMayPropose(JoinRoleServer, "srv-2", tc.cmd, st) {
+			t.Errorf("%s: a server may not propose it", tc.name)
+		}
 	}
-	drainOther := command{Op: opSetNodeDrainState, NodeID: "gw-1", Drained: true}
-	if peerMayPropose(JoinRoleWorker, "wkr-1", drainOther) || peerMayPropose(JoinRoleWorker, "", command{Op: opSetNodeDrainState}) {
-		t.Error("a worker may drain another node")
+	if peerMayPropose(JoinRoleWorker, "", command{Op: opPlace}, st) {
+		t.Error("a proposal with no sender passed")
 	}
-	if !peerMayPropose(JoinRoleServer, "srv-2", drainOther) {
-		t.Error("a server may not drain another node")
+	// A gateway owns no sandbox: it never places, claims or takes one, not
+	// even for itself.
+	for _, cmd := range []command{
+		{Op: opPlace, SandboxID: "sb-new", OwnerNodeID: "wkr-1"},
+		{Op: opClaimOrphan, SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1"},
+		{Op: opReassign, SandboxID: "sb-wasm", OwnerNodeID: "wkr-1"},
+	} {
+		if peerMayPropose(JoinRoleIngress, "wkr-1", cmd, st) {
+			t.Errorf("a gateway may send op %d", cmd.Op)
+		}
 	}
 }
 
@@ -331,9 +449,17 @@ func TestAgentDoesNotRelayAPeersApply(t *testing.T) {
 func TestSettingsWriters(t *testing.T) {
 	l := admittedLog(t)
 	c := &Cluster{fsm: l.f}
-	for peer, want := range map[string]bool{"gw-1": true, "srv-2": true, "wkr-1": false, "nobody": false} {
-		if got := c.IsSettingsWritePeer(peer, roleCert(peer, "")); got != want {
+	// Only a server writes settings; srv-2 is admitted as one but this
+	// cluster has no Raft, so nothing here is a server. A gateway also
+	// writes the agent-sandbox API's warm depths.
+	for peer, want := range map[string][2]bool{
+		"gw-1": {false, true}, "srv-2": {false, false}, "wkr-1": {false, false}, "nobody": {false, false},
+	} {
+		if got := c.IsSettingsWritePeer(peer, roleCert(peer, "")); got != want[0] {
 			t.Errorf("IsSettingsWritePeer(%s) = %v", peer, got)
+		}
+		if got := c.IsKubeWarmWritePeer(peer, roleCert(peer, "")); got != want[1] {
+			t.Errorf("IsKubeWarmWritePeer(%s) = %v", peer, got)
 		}
 	}
 	now := time.Unix(1700000000, 0)
@@ -351,8 +477,8 @@ func TestSettingsWriters(t *testing.T) {
 	}{
 		{"worker role write", "wkr-1", role, ErrIdentityWriterRefused},
 		{"worker role delete", "wkr-1", IdentityWriteRequest{Role: role.Role, DeleteRole: true}, ErrIdentityWriterRefused},
-		{"gateway role write", "gw-1", role, nil},
-		{"server role write", "srv-2", role, nil},
+		{"gateway role write", "gw-1", role, ErrIdentityWriterRefused},
+		{"gateway first key", "gw-1", keys(0, first), nil},
 		{"worker first key", "wkr-1", keys(0, first), nil},
 		{"worker two first keys", "wkr-1", keys(0, first, identityKeyRec(t, 1, now)), ErrIdentityWriterRefused},
 		{"worker stale generation", "wkr-1", keys(3, first), ErrIdentityKeysConflict},
@@ -388,8 +514,8 @@ func TestSettingsWriters(t *testing.T) {
 		if err := c.CheckIdentityWriter("wkr-1", roleCert("wkr-1", ""), tc.req); !errors.Is(err, tc.want) || (tc.want == nil) != (err == nil) {
 			t.Errorf("worker %s: %v, want %v", tc.name, err, tc.want)
 		}
-		if err := c.CheckIdentityWriter("gw-1", roleCert("gw-1", ""), tc.req); err != nil {
-			t.Errorf("gateway %s: %v", tc.name, err)
+		if err := c.CheckIdentityWriter("gw-1", roleCert("gw-1", ""), tc.req); !errors.Is(err, tc.want) || (tc.want == nil) != (err == nil) {
+			t.Errorf("gateway %s: %v, want %v", tc.name, err, tc.want)
 		}
 	}
 	if err := (*Cluster)(nil).CheckIdentityWriter("wkr-1", nil, keys(0, first)); !errors.Is(err, ErrIdentityWriterRefused) {

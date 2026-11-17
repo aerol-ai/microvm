@@ -15,7 +15,7 @@ import (
 )
 
 // tokenServerCluster is a server node's cluster for the public token
-// routes: wkr-1 and gw-1 are live members, gw-1 and srv-1 write tokens,
+// routes: wkr-1, gw-1 and srv-1 are live members, only srv-1 writes tokens,
 // and a token write lands here as this server's own Raft write.
 type tokenServerCluster struct {
 	*cluster.Noop
@@ -31,7 +31,7 @@ func (c *tokenServerCluster) LookupMember(id string) (cluster.Member, bool) {
 	return c.Noop.LookupMember(id)
 }
 
-func (c *tokenServerCluster) IsTokenWritePeer(id string) bool { return id == "gw-1" || id == "srv-1" }
+func (c *tokenServerCluster) IsTokenWritePeer(id string) bool { return id == "srv-1" }
 
 func (c *tokenServerCluster) WriteAPIToken(_ context.Context, req cluster.APITokenWriteRequest) (cluster.APITokenWriteResponse, error) {
 	c.mu.Lock()
@@ -44,13 +44,12 @@ func (c *tokenServerCluster) ListAPITokens(context.Context) ([]identity.TokenRec
 	return nil, nil
 }
 
-// Token writes come only from servers and gateways (defense in depth): a
-// token create or revoke a worker makes as itself, with no caller's
+// Token writes come only from servers (defense in depth): a token create
+// or revoke a worker or gateway makes as itself, with no caller's
 // credential or with the PAT over mTLS, is refused and nothing is written.
-// A caller's own credential a worker forwarded is that caller and passes.
-// A gateway writes tokens through the node-to-node route; its certificate
-// on the public route gets only what its role needs, which is not this.
-func TestTokenWritesComeOnlyFromServersAndGateways(t *testing.T) {
+// A caller's own credential a worker or gateway forwarded is that caller
+// and passes.
+func TestTokenWritesComeOnlyFromServers(t *testing.T) {
 	cfg := config.Config{EnableCluster: true, IdentityEnabled: true, NodeRole: config.NodeRoleServer, PATToken: "operator-pat-token"}
 	svc := service.New(cfg, discardLogger(), nil, nil, nil, nil, nil, nil, nil)
 	cl := &tokenServerCluster{Noop: cluster.NewNoop("server-0", "http://server-0", "")}

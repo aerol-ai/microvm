@@ -560,17 +560,17 @@ func (countingTokenServer) CountAPITokens(time.Time) map[controlplane.Role]int {
 	return map[controlplane.Role]int{controlplane.RoleAuditor: 3}
 }
 
-// A cluster worker takes no token create or revoke (PR 2 review): the
-// server tier refuses its node's token writes, so it says so with a 400
-// instead of an unknown outcome, and nothing reaches the cluster. A server,
-// a gateway and a mixed node still take them; the leader's two new
-// verdicts are 400s too.
+// A cluster worker or gateway takes no token create or revoke (node
+// certificates get only what their role needs): the server tier refuses
+// their nodes' token writes, so they say so with a 400 instead of an
+// unknown outcome, and nothing reaches the cluster. A server and a mixed
+// node still take them; the leader's two new verdicts are 400s too.
 func TestAPITokenWritesOnAWorker(t *testing.T) {
 	ctx := adminCtx()
 	for _, tc := range []struct {
 		role string
 		ok   bool
-	}{{"worker", false}, {"worker,ingress", false}, {"ingress", true}, {"server", true}, {"mixed", true}} {
+	}{{"worker", false}, {"worker,ingress", false}, {"ingress", false}, {"server", true}, {"mixed", true}} {
 		fc := newFakeTokenCluster()
 		svc := newTokenService(t, true)
 		svc.cfg.EnableCluster, svc.cfg.NodeRole = true, tc.role
@@ -597,24 +597,24 @@ func TestAPITokenWritesOnAWorker(t *testing.T) {
 	}
 }
 
-// Which nodes send their callers' calls on to a server (node certificates
-// get only what their role needs): every node with no Raft state sends the
-// operator calls; only a worker sends the cluster-wide settings writes (a
-// gateway writes those itself). A server and a single node send nothing.
+// Which nodes send their callers' operator calls and settings writes on to
+// a server (node certificates get only what their role needs): every
+// cluster node that holds no Raft state, a worker or a gateway. A server,
+// a mixed node and a single node send nothing.
 func TestCallsSentOnToServersByRole(t *testing.T) {
 	for _, tc := range []struct {
-		cfg                config.Config
-		operator, settings bool
+		cfg  config.Config
+		want bool
 	}{
-		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker}, true, true},
-		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleIngress}, true, false},
-		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, false, false},
-		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, false, false},
-		{config.Config{NodeRole: config.NodeRoleWorker}, false, false},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleWorker}, true},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleIngress}, true},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleServer}, false},
+		{config.Config{EnableCluster: true, NodeRole: config.NodeRoleMixed}, false},
+		{config.Config{NodeRole: config.NodeRoleWorker}, false},
 	} {
 		s := &Service{cfg: tc.cfg}
-		if s.SendsOperatorCallsToServers() != tc.operator || s.ForwardsSettingsWrites() != tc.settings {
-			t.Errorf("%+v: operator %v settings %v", tc.cfg.NodeRole, s.SendsOperatorCallsToServers(), s.ForwardsSettingsWrites())
+		if s.SendsOperatorCallsToServers() != tc.want {
+			t.Errorf("%+v: %v", tc.cfg.NodeRole, s.SendsOperatorCallsToServers())
 		}
 	}
 }

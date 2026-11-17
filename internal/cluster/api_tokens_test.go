@@ -409,9 +409,9 @@ func TestAPITokenLeaderCapsTheLifetime(t *testing.T) {
 	}
 }
 
-// TestIsTokenWritePeer: who may send token writes: a gateway (admitted as
-// ingress) and a server, not a worker. A node with no admitted record
-// passes only as a Raft server.
+// TestIsTokenWritePeer: who may send token writes: a server (its admitted
+// role and Raft membership), not a worker or a gateway. A node with no
+// admitted record passes only as a Raft server.
 func TestIsTokenWritePeer(t *testing.T) {
 	l := newJoinLog(t)
 	for i, n := range []struct{ id, role string }{{"gw-1", JoinRoleIngress}, {"wkr-1", JoinRoleWorker}, {"srv-2", JoinRoleServer}} {
@@ -422,7 +422,7 @@ func TestIsTokenWritePeer(t *testing.T) {
 		}
 	}
 	noRaft := &Cluster{fsm: l.f}
-	for peer, want := range map[string]bool{"gw-1": true, "wkr-1": false, "srv-2": false, "nobody": false} {
+	for peer, want := range map[string]bool{"gw-1": false, "wkr-1": false, "srv-2": false, "nobody": false} {
 		if got := noRaft.IsTokenWritePeer(peer); got != want {
 			t.Errorf("without Raft, %s: %v, want %v", peer, got, want)
 		}

@@ -230,6 +230,32 @@ func parsePublicJWK(raw json.RawMessage) (*rsa.PublicKey, error) {
 	return pub, nil
 }
 
+// ErrKeyMismatch is a key record whose private key is not the one its id
+// and public key name.
+var ErrKeyMismatch = errors.New("cloudidentity: the private key does not match the record's id and public key")
+
+// CheckPrivate reports whether key is the private half of r: its public key
+// is r's public JWK and its thumbprint is r's id. A record whose sealed key
+// is another key would sign with a key the JWKS does not publish, or
+// publish one nobody signs with.
+func (r KeyRecord) CheckPrivate(key *rsa.PrivateKey) error {
+	if key == nil {
+		return ErrKeyMismatch
+	}
+	pub, err := parsePublicJWK(r.PublicJWK)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrKeyMismatch, err)
+	}
+	if !pub.Equal(&key.PublicKey) {
+		return ErrKeyMismatch
+	}
+	kid, err := KeyID(&key.PublicKey)
+	if err != nil || kid != r.ID {
+		return ErrKeyMismatch
+	}
+	return nil
+}
+
 // MarshalPrivateKey is the private key as PKCS#8 DER, for the caller to seal
 // at once. It is the only place the private key leaves memory.
 func MarshalPrivateKey(key *rsa.PrivateKey) ([]byte, error) {

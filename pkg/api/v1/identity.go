@@ -111,7 +111,15 @@ func (h *handlers) clusterInternalIdentityWrite(w http.ResponseWriter, r *http.R
 		return
 	}
 	peerID, leaf := internalPeer(r)
-	if err := writer.CheckIdentityWriter(peerID, leaf, req); err != nil {
+	err := writer.CheckIdentityWriter(peerID, leaf, req)
+	if err == nil && req.Keys != nil && !cluster.PeerIsServer(h.deps.Service.Cluster(), peerID, leaf) {
+		// A node that may only keep the keys: this server opens each one
+		// and checks it is the key its record publishes.
+		if kerr := h.deps.Service.CheckIdentityKeyRecords(req.Keys.Keys); kerr != nil {
+			err = fmt.Errorf("%w: %v", cluster.ErrIdentityWriterRefused, kerr)
+		}
+	}
+	if err != nil {
 		out := cluster.IdentityWriteOutcome(err)
 		if out.Code == "" {
 			out = cluster.IdentityWriteOutcome(fmt.Errorf("%w: %v", cluster.ErrIdentityWriterRefused, err))

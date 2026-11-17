@@ -13,34 +13,41 @@ import (
 // Who writes cluster-wide settings on the internal write routes (node
 // certificates get only what their role needs, peer_role.go):
 //
-//	API tokens        servers and gateways (IsTokenWritePeer)
-//	egress profiles   servers and gateways
-//	team quotas       servers and gateways
-//	warm pools        servers and gateways (a gateway's agent-sandbox API
-//	                  also keeps its warm depths there)
-//	identity          servers and gateways; a worker only keeps the
-//	                  signing keys: it makes the deployment's first key,
-//	                  and reseals the keys onto a new server key
+//	API tokens        servers (IsTokenWritePeer)
+//	egress profiles   servers
+//	team quotas       servers
+//	warm pools        servers; a gateway also writes the agent-sandbox
+//	                  API's warm depths (WarmPoolWriteRequest.Kube) only
+//	identity          servers; any other node only keeps the signing keys:
+//	                  it makes the deployment's first key, and reseals the
+//	                  keys onto a new server key
 //
-// A gateway is the API edge: it takes these calls from callers it
-// authenticated, as it does token writes. A worker sends its callers'
-// writes on to a server with the caller's own credential (pkg/api/v1
-// server_tier.go), so its own certificate needs none of them. Only a
-// server answers these routes; a worker or gateway that receives one
-// refuses it rather than send it on as itself.
+// A record in these carries its own reach (a token's role and team, a
+// team's quota, a team's egress), so only a server's certificate, which
+// holds the PAT anyway, may write one as itself. A worker or gateway sends
+// its callers' writes on to a server with the caller's own credential
+// (pkg/api/v1 server_tier.go), so its own certificate needs none of them.
+// Only a server answers these routes; a worker or gateway that receives
+// one refuses it rather than send it on as itself.
 
 // ErrIdentityWriterRefused is an identity write a node may not send: a
 // role write or a key change other than the first key or a reseal, from a
 // node that is not a server or a gateway.
-var ErrIdentityWriterRefused = errors.New("cluster: only servers and gateways write identity roles and rotate keys")
+var ErrIdentityWriterRefused = errors.New("cluster: only servers write identity roles and rotate keys")
 
 // identityCodeWriterRefused carries ErrIdentityWriterRefused in a 200 body.
 const identityCodeWriterRefused = "writer_refused"
 
 // IsSettingsWritePeer reports whether peerID, whose verified certificate is
-// leaf, may write cluster-wide settings: a server or a gateway by its
-// admitted role (PeerRole).
+// leaf, may write cluster-wide settings: a server (PeerRole).
 func (c *Cluster) IsSettingsWritePeer(peerID string, leaf *x509.Certificate) bool {
+	return PeerRole(c, peerID, leaf) == JoinRoleServer
+}
+
+// IsKubeWarmWritePeer reports whether peerID may write the agent-sandbox
+// API's warm depths: a server, or a gateway, which runs that API and keeps
+// its depths there (internal/kubeapi kubewarm.go).
+func (c *Cluster) IsKubeWarmWritePeer(peerID string, leaf *x509.Certificate) bool {
 	switch PeerRole(c, peerID, leaf) {
 	case JoinRoleServer, JoinRoleIngress:
 		return true
@@ -49,8 +56,7 @@ func (c *Cluster) IsSettingsWritePeer(peerID string, leaf *x509.Certificate) boo
 }
 
 // CheckIdentityWriter refuses an identity write peerID may not send. A
-// server or gateway may send any. Anyone else may only keep the signing
-// keys (identityKeyUpkeep), judged against this server's key set at the
+// server may send any. Anyone else may only keep the signing keys (identityKeyUpkeep), judged against this server's key set at the
 // write's expected generation: the set at a generation is the same on every
 // server, and the leader's compare-and-set applies the write only on top of
 // that generation. A server that has not caught up to it answers a keys
@@ -65,13 +71,13 @@ func (c *Cluster) CheckIdentityWriter(peerID string, leaf *x509.Certificate, req
 	}
 	err := identityKeyUpkeep(c.fsm.identityKeys(), req)
 	if err != nil && errors.Is(err, ErrIdentityWriterRefused) && c.logger != nil {
-		c.logger.Warn("cluster: refused an identity write from a node that is not a server or gateway",
+		c.logger.Warn("cluster: refused an identity write from a node that is not a server",
 			"peer", strings.TrimSpace(peerID), "role", PeerRole(c, peerID, leaf))
 	}
 	return err
 }
 
-// identityKeyUpkeep allows the two key writes a worker makes
+// identityKeyUpkeep allows the two key writes a worker or gateway makes
 // (internal/service identity.go and identity_push.go): the deployment's
 // first signing key when cur has no active key, and a reseal, which keeps
 // every key, its id, public key and times, and changes only the sealed

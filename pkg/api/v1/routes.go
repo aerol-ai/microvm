@@ -210,23 +210,23 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/learned", d.Route(permRead, wrap(http.HandlerFunc(h.getNetworkLearned))))
 	// Named egress profiles (D21). Not sandbox-scoped, so no owner
 	// forwarding; in a cluster the service writes them through Raft.
-	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.settingsViaServers(http.HandlerFunc(h.putEgressProfile))))
+	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.viaServers(nil, http.HandlerFunc(h.putEgressProfile))))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
-	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.settingsViaServers(http.HandlerFunc(h.deleteEgressProfile))))
+	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.viaServers(nil, http.HandlerFunc(h.deleteEgressProfile))))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
 	// Team quotas (plan item P2): an admin caps what a team may hold. Not
 	// sandbox-scoped; in a cluster the service writes them through Raft.
-	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.putTeamQuota))))
+	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putTeamQuota))))
 	mux.Handle("GET "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.getTeamQuota)))
-	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.deleteTeamQuota))))
+	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteTeamQuota))))
 	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
 	// role-tag allow list is admin only (D1.5), key rotation is the
 	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
 	// the service writes them through Raft. No route returns a token.
-	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.putIdentityRole))))
-	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.deleteIdentityRole))))
+	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putIdentityRole))))
+	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteIdentityRole))))
 	mux.Handle("GET "+PathPrefix+"/identity/roles", d.Route(permFleet, http.HandlerFunc(h.listIdentityRoles)))
-	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.rotateIdentityKey))))
+	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.rotateIdentityKey))))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
 	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
@@ -236,8 +236,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// the rest of the path, so an image's slashes need no escaping.
 	mux.Handle("GET "+PathPrefix+"/warm-pools", d.Route(permFleet, http.HandlerFunc(h.listWarmPools)))
 	mux.Handle("GET "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.getWarmPool)))
-	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.putWarmPool))))
-	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.settingsViaServers(http.HandlerFunc(h.deleteWarmPool))))
+	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putWarmPool))))
+	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteWarmPool))))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Route(controlplane.PermAuditRead, withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -373,11 +373,11 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
 	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
 	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
-	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(h.viaServers(nil, http.HandlerFunc(h.clusterWasmMigrate))))
 	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
 	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
 	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", op(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(http.HandlerFunc(h.clusterDeleteOrphan)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(h.viaServers(nil, http.HandlerFunc(h.clusterDeleteOrphan))))
 	mux.Handle("POST "+cluster.PublicInternalApplyPath, internalOp(http.HandlerFunc(h.clusterInternalApply)))
 	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", internalOp(http.HandlerFunc(h.clusterInternalPlacementByName)))

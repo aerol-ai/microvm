@@ -98,7 +98,12 @@ func TestIngressTokenRefusesNonTokenWriterNodes(t *testing.T) {
 	stub.tokenPeers = map[string]bool{"srv-2": true, "gw-1": true}
 	stub.created = cluster.JoinTokenCreated{ID: "abcdef", Role: "ingress"}
 	mux := joinRoutesMux(t, stub, joinOperator())
-	node := func(id string) *x509.Certificate { return &x509.Certificate{DNSNames: []string{"node:" + id}} }
+	// The role is the admitted one (cluster.PeerRole): here, the role the
+	// stub's certificates are signed for.
+	roles := map[string]string{"wkr-1": "worker", "gw-1": "ingress", "srv-2": "server"}
+	node := func(id string) *x509.Certificate {
+		return &x509.Certificate{DNSNames: []string{"node:" + id, "role:" + roles[id]}}
+	}
 	for _, tc := range []struct {
 		name      string
 		body      string
@@ -107,6 +112,7 @@ func TestIngressTokenRefusesNonTokenWriterNodes(t *testing.T) {
 		want      int
 	}{
 		{"operator, no node cert", `{"role":"ingress"}`, nil, false, http.StatusCreated},
+		{"gateway forwarding an operator", `{"role":"ingress"}`, node("gw-1"), true, http.StatusCreated},
 		{"worker cert", `{"role":"ingress"}`, node("wkr-1"), false, http.StatusForbidden},
 		{"worker cert, odd case", `{"role":" Ingress "}`, node("wkr-1"), false, http.StatusForbidden},
 		{"worker forwarding an operator", `{"role":"ingress"}`, node("wkr-1"), true, http.StatusForbidden},

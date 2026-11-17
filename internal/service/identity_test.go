@@ -973,3 +973,49 @@ type staticKeys struct {
 func (s staticKeys) ReadIdentityKeys(context.Context) (cloudidentity.KeySet, error) {
 	return s.set, nil
 }
+
+// A signing key opens only as the key its record publishes, and a server
+// checks every key a node that only keeps the keys sends (node
+// certificates get only what their role needs): a record whose sealed
+// part holds another key, sealed under this record's id, is refused, and
+// never used to sign.
+func TestIdentityKeyRecordsMatchTheirPublicHalf(t *testing.T) {
+	h := newIdentityHarness(t)
+	if h.svc.cipher == nil {
+		t.Fatal("harness has no server key")
+	}
+	a, err := h.svc.newIdentityKeyRecord()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.svc.newIdentityKeyRecord()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.CheckIdentityKeyRecords([]cloudidentity.KeyRecord{a, b}); err != nil {
+		t.Fatalf("matching records: %v", err)
+	}
+	bKey, err := h.svc.openIdentityKey(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := cloudidentity.MarshalPrivateKey(bKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapped := a.Clone()
+	if swapped.SealedPrivate, err = h.svc.cipher.EncryptWithAAD(der, cloudidentity.SealAAD(a.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.openIdentityKey(swapped); !errors.Is(err, ErrIdentityUnavailable) || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a record holding another key opened: %v", err)
+	}
+	if err := h.svc.CheckIdentityKeyRecords([]cloudidentity.KeyRecord{a, swapped}); err == nil {
+		t.Fatal("a record holding another key passed the check")
+	}
+	garbled := a.Clone()
+	garbled.SealedPrivate = []byte("not sealed")
+	if err := h.svc.CheckIdentityKeyRecords([]cloudidentity.KeyRecord{garbled}); err == nil {
+		t.Fatal("an unopenable record passed the check")
+	}
+}

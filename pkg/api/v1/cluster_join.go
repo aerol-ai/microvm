@@ -107,21 +107,24 @@ func (h *handlers) refuseNonServerNode(w http.ResponseWriter, r *http.Request, w
 
 // refuseNonTokenWriterNode stops an ingress join token asked over a
 // connection that proves a node identity, unless that node is a server or a
-// gateway (cluster.IsTokenWritePeer). An ingress node writes API tokens, and
-// token writes come only from servers and gateways (defense in depth), so
-// only those may create the token an ingress node joins with. An operator calling with the PAT
-// and no node cert is not affected. It reports whether it answered.
+// gateway by its admitted role (cluster.PeerRole). An operator's call a
+// gateway sends on to a server arrives over the gateway's connection with
+// the operator's own credential and passes; a worker's does not, as
+// before. An operator calling with the PAT and no node cert is not
+// affected. It reports whether it answered.
 func (h *handlers) refuseNonTokenWriterNode(w http.ResponseWriter, r *http.Request, what string) bool {
 	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
 		return false
 	}
 	peer, err := cluster.AuthenticatedPeerNodeID(r)
-	checker, ok := h.deps.Service.Cluster().(tokenWritePeerChecker)
-	if err == nil && ok && checker.IsTokenWritePeer(peer) {
-		return false
+	if err == nil {
+		switch cluster.PeerRole(h.deps.Service.Cluster(), peer, r.TLS.PeerCertificates[0]) {
+		case cluster.JoinRoleServer, cluster.JoinRoleIngress:
+			return false
+		}
 	}
 	if h.deps.Logger != nil {
-		h.deps.Logger.Warn("cluster: refused a join token for a token-writing role from a node that is not a server or gateway", "what", what, "peer", peer)
+		h.deps.Logger.Warn("cluster: refused an ingress join token over a connection from a node that is not a server or gateway", "what", what, "peer", peer)
 	}
 	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("cluster: only server and gateway nodes may ask for %s: node %q is not an admitted server or gateway; ask a server with the operator token", what, peer))
 	return true

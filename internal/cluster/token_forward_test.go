@@ -153,6 +153,13 @@ func TestExtractPeerRoleReadsBothForms(t *testing.T) {
 		{"an unknown role", &x509.Certificate{URIs: []*url.URL{uri("aerolvm-role:admin")}}, ""},
 		{"none", &x509.Certificate{DNSNames: []string{"node:s"}}, ""},
 		{"nil", nil, ""},
+		// Node certificates get only what their role needs: a DNS role and
+		// a URI role that disagree name none, whichever comes first.
+		{"DNS server, URI worker", &x509.Certificate{DNSNames: []string{"node:w", "role:server"}, URIs: []*url.URL{uri("aerolvm-role:worker")}}, ""},
+		{"DNS worker, URI server", &x509.Certificate{DNSNames: []string{"node:w", "role:worker"}, URIs: []*url.URL{uri("aerolvm-role:server")}}, ""},
+		{"DNS and URI agree", &x509.Certificate{DNSNames: []string{"node:w", "role:worker"}, URIs: []*url.URL{uri("aerolvm-role:worker")}}, JoinRoleWorker},
+		{"two DNS roles", &x509.Certificate{DNSNames: []string{"node:w", "role:worker", "role:server"}}, ""},
+		{"an unknown DNS role beside a known one", &x509.Certificate{DNSNames: []string{"node:w", "role:admin", "role:worker"}}, ""},
 	} {
 		if got := ExtractPeerRole(tc.cert); got != tc.want {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)

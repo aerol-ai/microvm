@@ -410,9 +410,13 @@ func nodeCertAccess(r *http.Request, roleOf func(*http.Request, string) string) 
 // Only a node whose role serves that API may speak for its callers: a
 // gateway, which runs it, or a server. A worker's certificate gets only
 // what its role needs, and it serves no caller it could vouch for, so its
-// stamp is a 401 like any other malformed one.
+// stamp is a 401 like any other malformed one. And only on the calls that
+// API makes (onBehalfRoutes): create, delete, start and stop.
 func onBehalfAccess(r *http.Request, peer, role, onBehalf string) (controlplane.Access, bool) {
 	if role != controlplane.NodeRoleIngress && role != controlplane.NodeRoleServer {
+		return controlplane.Access{}, false
+	}
+	if !onBehalfRoutes[r.Pattern] {
 		return controlplane.Access{}, false
 	}
 	owner := strings.TrimSpace(r.Header.Get(cluster.HeaderOnBehalfOwner))
@@ -426,6 +430,17 @@ func onBehalfAccess(r *http.Request, peer, role, onBehalf string) (controlplane.
 		Principal: controlplane.Principal{Kind: controlplane.PrincipalKubernetes, ID: onBehalf, Name: name},
 		Via:       peer,
 	}, true
+}
+
+// onBehalfRoutes are the calls the agent-sandbox API makes for its
+// Kubernetes callers (pkg/api kube_backend.go: Create, Delete, SetRunning),
+// as the mux matched them on the owner: the only routes a forward that
+// speaks for such a caller is honoured on.
+var onBehalfRoutes = map[string]bool{
+	"POST /v1/sandboxes":            true,
+	"DELETE /v1/sandboxes/{id}":     true,
+	"POST /v1/sandboxes/{id}/start": true,
+	"POST /v1/sandboxes/{id}/stop":  true,
 }
 
 // isForwarded reports whether a peer reverse-proxied this request on a

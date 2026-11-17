@@ -17,13 +17,14 @@ import (
 // as itself: the server authenticates the caller, and its record names the
 // caller with this node as the hop (Via).
 //
-//	on any worker or gateway   join tokens; node delete; storage retirement;
-//	                           member removal, node detail, drain, cordon and
-//	                           uncordon of another node
-//	on a worker only           the cluster-wide settings: API tokens (#1350),
-//	                           identity roles and key rotation, egress
-//	                           profiles, team quotas, warm pools (a gateway
-//	                           writes those itself, as it does tokens)
+//	the operator calls      join tokens; node delete; storage retirement;
+//	                        orphan delete; WASM migration; member removal,
+//	                        node detail, drain, cordon and uncordon of
+//	                        another node
+//	the settings writes     API tokens, identity roles and key rotation,
+//	                        egress profiles, team quotas, warm pools: only a
+//	                        server writes those (internal/cluster
+//	                        settings_writers.go)
 //
 // The same calls about this node stay here: draining this node first moves
 // its own WASM sandboxes, and a node's own tools use its node-local token,
@@ -45,18 +46,6 @@ func (h *handlers) viaServers(when func(*http.Request) bool, next http.Handler) 
 			return
 		}
 		h.sendToServer(w, r, "this call")
-	})
-}
-
-// settingsViaServers sends a cluster-wide settings write on to a server
-// when this node is a worker (Service.ForwardsSettingsWrites).
-func (h *handlers) settingsViaServers(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.deps.Service == nil || !h.deps.Service.ForwardsSettingsWrites() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		h.sendToServer(w, r, "this write")
 	})
 }
 
@@ -92,6 +81,7 @@ func (h *handlers) sendToServer(w http.ResponseWriter, r *http.Request, what str
 // peer's write rather than send it on as itself.
 type settingsWritePeerChecker interface {
 	IsSettingsWritePeer(peerID string, leaf *x509.Certificate) bool
+	IsKubeWarmWritePeer(peerID string, leaf *x509.Certificate) bool
 }
 
 // internalPeer is the peer withInternalMTLS verified, and its certificate.
@@ -107,20 +97,21 @@ func internalPeer(r *http.Request) (string, *x509.Certificate) {
 // refuseSettingsWriter answers an egress profile, team quota or warm pool
 // write this node may not take from this peer, and reports whether it did:
 // 503 on a node with no Raft state (the writer tries a server), 403 from a
-// peer that is neither a server nor a gateway.
-func (h *handlers) refuseSettingsWriter(w http.ResponseWriter, r *http.Request, what string) bool {
+// peer that is not a server. kubeWarm marks the one write a gateway also
+// sends as itself: the agent-sandbox API's warm depths.
+func (h *handlers) refuseSettingsWriter(w http.ResponseWriter, r *http.Request, what string, kubeWarm bool) bool {
 	checker, ok := h.deps.Service.Cluster().(settingsWritePeerChecker)
 	if !ok {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state; send "+what+" to a server")
 		return true
 	}
 	peerID, leaf := internalPeer(r)
-	if checker.IsSettingsWritePeer(peerID, leaf) {
+	if checker.IsSettingsWritePeer(peerID, leaf) || (kubeWarm && checker.IsKubeWarmWritePeer(peerID, leaf)) {
 		return false
 	}
 	if h.deps.Logger != nil {
-		h.deps.Logger.Warn("cluster: refused a settings write from a node that is not a server or gateway", "what", what, "peer", peerID)
+		h.deps.Logger.Warn("cluster: refused a settings write from a node that is not a server", "what", what, "peer", peerID)
 	}
-	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("cluster: only server and gateway nodes write %s: node %q is neither; send the caller's call to a server", what, peerID))
+	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("cluster: only server nodes write %s: node %q is not one; send the caller's call to a server", what, peerID))
 	return true
 }

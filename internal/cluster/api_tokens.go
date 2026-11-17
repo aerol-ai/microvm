@@ -53,8 +53,8 @@ var (
 	// which refuses the same request before it gets here).
 	ErrAPITokenTTL = errors.New("cluster: API token lifetime is longer than the leader's SB_TOKEN_MAX_TTL")
 	// ErrAPITokenWriterRefused is a token write sent by a node that may not
-	// send one: anything but a server or an ingress (gateway) node.
-	ErrAPITokenWriterRefused = errors.New("cluster: only servers and ingress (gateway) nodes write API tokens")
+	// send one: anything but a server.
+	ErrAPITokenWriterRefused = errors.New("cluster: only servers write API tokens")
 )
 
 // apiTokenTTLSkew is how far the leader's clock may lag the node that took
@@ -184,20 +184,15 @@ func (c *Cluster) checkAPITokenTTL(rec identity.TokenRecord, now time.Time) erro
 	return nil
 }
 
-// IsTokenWritePeer reports whether peerID may write API tokens: a node
-// admitted as ingress (a gateway, which takes public token creates and
-// revokes) or a server (peerIsServer: its admitted role, and Raft
-// membership). Token writes come only from servers and gateways, as
-// defense in depth; a worker sends its callers' token writes on to a
-// server with their own credentials (Agent.ForwardToServer). The same rule
-// covers ingress join tokens. A node with no admitted record (a scripted
-// cluster before adopt) passes only as a Raft server.
+// IsTokenWritePeer reports whether peerID may write API tokens: a server
+// (peerIsServer: its admitted role, and Raft membership). Node
+// certificates get only what their role needs, and a token record carries
+// its own role and team, so only a server's certificate may store one; a
+// worker or gateway sends its callers' token writes on to a server with
+// their own credentials (Agent.ForwardToServer).
 func (c *Cluster) IsTokenWritePeer(peerID string) bool {
 	if c == nil || c.fsm == nil {
 		return false
-	}
-	if rec, ok := c.fsm.admittedNode(peerID); ok && rec.Role == JoinRoleIngress {
-		return true
 	}
 	return c.peerIsServer(peerID)
 }

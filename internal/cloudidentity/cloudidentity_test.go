@@ -454,3 +454,34 @@ func ids(keys []KeyRecord) []string {
 	}
 	return out
 }
+
+// CheckPrivate holds a record to its key: the same public key and id.
+func TestKeyRecordCheckPrivate(t *testing.T) {
+	ks := keys(t, 2)
+	now := time.Unix(1700000000, 0)
+	rec := record(t, ks[0], now)
+	if err := rec.CheckPrivate(ks[0]); err != nil {
+		t.Fatalf("its own key: %v", err)
+	}
+	if err := rec.CheckPrivate(ks[1]); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("another key: %v", err)
+	}
+	if err := rec.CheckPrivate(nil); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("no key: %v", err)
+	}
+	renamed := rec
+	renamed.ID = "another-id"
+	if err := renamed.CheckPrivate(ks[0]); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("another id: %v", err)
+	}
+	swapped := rec
+	swapped.PublicJWK = record(t, ks[1], now).PublicJWK // its id kept, another key's public half
+	if err := swapped.CheckPrivate(ks[0]); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("another public key under its id: %v", err)
+	}
+	broken := rec
+	broken.PublicJWK = []byte(`{"kty":"oct"}`)
+	if err := broken.CheckPrivate(ks[0]); !errors.Is(err, ErrKeyMismatch) {
+		t.Fatalf("an unreadable public key: %v", err)
+	}
+}
