@@ -10,6 +10,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
 // VolumeReclaimer deletes the backend bytes of a deleted platform volume. The
@@ -244,6 +245,14 @@ func (s *Service) reclaimOne(ctx context.Context, p volumeObligation) {
 	if live {
 		// A recreated volume now owns this source; do not delete its data.
 		// Drop the stale obligation so we stop re-checking it.
+		s.clearVolumeObligation(ctx, p)
+		return
+	}
+	// Only a volume's own coordinate on this node's storage: the source is
+	// replicated, and bytes anywhere else are not a volume's to delete.
+	if !volumes.SourceUnderRoot(volumeBackendFor(s.cfg.PlatformVolumes, p.Backend), p.Source) {
+		s.logger.Warn("volume reclaim skipped: the source is not a platform volume on this node's storage; dropping the obligation",
+			"volume_id", p.VolumeID, "backend", p.Backend, "source", p.Source)
 		s.clearVolumeObligation(ctx, p)
 		return
 	}

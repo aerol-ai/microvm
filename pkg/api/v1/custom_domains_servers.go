@@ -2,7 +2,6 @@ package v1
 
 import (
 	"bytes"
-	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -37,18 +36,10 @@ func isForward(r *http.Request) bool {
 // edge, which binds the name and routes the call to the owner, and not the
 // owner's half of it, which only a server sends.
 func (h *handlers) sentOnToThisServer(r *http.Request) bool {
-	if !isForward(r) || h.deps.Service == nil || !h.deps.Service.BindsCustomDomainsForCallers() {
+	if h.deps.Service == nil || !h.deps.Service.BindsCustomDomainsForCallers() {
 		return false
 	}
-	peer, err := cluster.AuthenticatedPeerNodeID(r)
-	if err != nil {
-		return false
-	}
-	var leaf *x509.Certificate
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		leaf = r.TLS.PeerCertificates[0]
-	}
-	return cluster.PeerRole(h.deps.Service.Cluster(), peer, leaf) != cluster.JoinRoleServer
+	return cluster.SentOnByNonServer(h.deps.Service.Cluster(), r)
 }
 
 // attachGoesToServer: a worker's or gateway's domain attach goes to a

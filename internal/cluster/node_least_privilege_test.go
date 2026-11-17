@@ -111,6 +111,8 @@ type fakeProposalState struct {
 	adoptable map[string]bool
 	// signing is whether the server signing record exists.
 	signing bool
+	// volumes are the volume rows by volumeKey.
+	volumes map[string]models.Volume
 }
 
 func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
@@ -118,6 +120,20 @@ func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
 }
 
 func (f fakeProposalState) serversSign() bool { return f.signing }
+
+func (f fakeProposalState) volumeForProposal(tenant, id string) (models.Volume, bool) {
+	v, ok := f.volumes[volumeKey(tenant, id)]
+	return v, ok
+}
+
+func (f fakeProposalState) volumeByNameForProposal(tenant, name string) (models.Volume, bool) {
+	for _, v := range f.volumes {
+		if v.Tenant == tenant && v.Name == name {
+			return v, true
+		}
+	}
+	return models.Volume{}, false
+}
 
 func (f fakeProposalState) placementForProposal(id string, _ bool) (Placement, bool) {
 	p, ok := f.placements[id]

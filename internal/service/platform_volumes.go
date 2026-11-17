@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -86,22 +87,8 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 		}
 		resolved := byName[safeName]
 		if resolved.vol == nil {
-			id, err := generateVolumeID()
+			vol, created, err := s.getOrCreateVolumeRow(ctx, pv, tenant, safeName, ref)
 			if err != nil {
-				return nil, fmt.Errorf("generate platform volume id: %w", err)
-			}
-			// Freeze the backend coordinate at creation (see CreatePlatformVolume).
-			row, err := firstUseVolumeRow(pv, tenant, safeName)
-			if err != nil {
-				return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
-			}
-			row.ID = id
-			row.DeleteWithSandbox = ref.DeleteWithSandbox
-			vol, created, err := s.volumeMeta().GetOrCreate(ctx, row, pv.MaxPerTenant)
-			if err != nil {
-				if errors.Is(err, store.ErrVolumeQuotaExceeded) {
-					return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
-				}
 				return nil, err
 			}
 			resolved = resolvedVolume{vol: vol, created: created}
@@ -110,13 +97,8 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 				made = append(made, models.VolumeAttachment{Tenant: tenant, VolumeID: vol.ID, CreatedVolume: true})
 			}
 		}
-		// delete_with_sandbox belongs to the volume, fixed when it was made.
-		// A reference that disagrees would either delete a volume its maker
-		// meant to keep or keep one meant to go, so it is refused instead of
-		// quietly following the stored value.
-		if resolved.vol.DeleteWithSandbox != ref.DeleteWithSandbox {
-			return nil, fmt.Errorf("%w: platform volume %q has delete_with_sandbox=%t; pass the same value, or use another name",
-				models.ErrPlatformVolumeConflict, ref.Name, resolved.vol.DeleteWithSandbox)
+		if err := volumeRefAgrees(resolved.vol, ref); err != nil {
+			return nil, err
 		}
 		spec, err := mountSpecForVolume(volumeBackendFor(pv, resolved.vol.Backend), resolved.vol, tenant, safeName, ref.Path, ref.ReadOnly)
 		if err != nil {
@@ -132,6 +114,47 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 		})
 	}
 	return attachments, nil
+}
+
+// getOrCreateVolumeRow is tenant's row for the volume named safeName, made
+// on first use with the coordinate frozen from pv (see CreatePlatformVolume).
+// created reports whether this call made it. Once servers sign, only a
+// server makes a row (cluster volume_proposals.go): a worker's upsert of a
+// row that is not there is refused, which surfaces here.
+func (s *Service) getOrCreateVolumeRow(ctx context.Context, pv config.PlatformVolumesConfig, tenant, safeName string, ref models.PlatformVolumeMount) (*models.Volume, bool, error) {
+	id, err := generateVolumeID()
+	if err != nil {
+		return nil, false, fmt.Errorf("generate platform volume id: %w", err)
+	}
+	row, err := firstUseVolumeRow(pv, tenant, safeName)
+	if err != nil {
+		return nil, false, fmt.Errorf("platform volume %q: %w", ref.Name, err)
+	}
+	row.ID = id
+	row.DeleteWithSandbox = ref.DeleteWithSandbox
+	vol, created, err := s.volumeMeta().GetOrCreate(ctx, row, pv.MaxPerTenant)
+	switch {
+	case errors.Is(err, store.ErrVolumeQuotaExceeded):
+		return nil, false, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
+	case errors.Is(err, cluster.ErrPeerProposalRefused):
+		return nil, false, fmt.Errorf("%w: platform volume %q has no record yet, and a server makes it: send the create through a server", models.ErrPlatformVolumeConflict, ref.Name)
+	case err != nil:
+		return nil, false, err
+	}
+	return vol, created, nil
+}
+
+// volumeRefAgrees refuses a reference whose delete_with_sandbox differs
+// from the volume's. It belongs to the volume, fixed when it was made: a
+// reference that disagrees would either delete a volume its maker meant to
+// keep or keep one meant to go, so it is refused instead of quietly
+// following the stored value.
+func volumeRefAgrees(vol *models.Volume, ref models.PlatformVolumeMount) error {
+	if vol.DeleteWithSandbox != ref.DeleteWithSandbox {
+		return fmt.Errorf("%w: platform volume %q has delete_with_sandbox=%t; pass the same value, or use another name",
+			models.ErrPlatformVolumeConflict, ref.Name, vol.DeleteWithSandbox)
+	}
+	return nil
 }
 
 // mountSpecForVolume builds the mount for a resolved volume from its frozen

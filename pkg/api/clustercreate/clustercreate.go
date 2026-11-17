@@ -16,6 +16,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -195,6 +196,19 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 
+	// A worker or gateway sends a create that names a platform volume to a
+	// server, which makes the volume rows (service
+	// platform_volumes_servers.go). A server such a node sent a create on to
+	// is that create's edge: the forward marker would make it refuse to send
+	// the create on to its node (a loop).
+	if svc.CreateVolumeRowsGoToServers(req) {
+		sendCreateToServer(w, r, c, writeMsg)
+		return Decision{}, false
+	}
+	if svc.IsClusterServer() && cluster.SentOnByNonServer(c, r) {
+		r.Header.Del(cluster.HeaderForwarded)
+	}
+
 	// A create naming a snapshot's committed tag that another node holds goes
 	// to that node: only its catalogue row can resolve and authorize the tag.
 	// This node skips the image normalization it cannot do (it would answer a
@@ -341,7 +355,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
-		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		forwardWithVolumeRows(w, r, svc, req, writeError, func(fw http.ResponseWriter) {
+			c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, fw, r)
+		})
 		return Decision{}, false
 	}
 
@@ -511,9 +527,103 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID, request: after, reserveStages: stages}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
-		sandboxID, opts.PreferredSandboxID == "", opts.Logger, stages)
+	if !forwardWithVolumeRows(w, r, svc, req, writeError, func(fw http.ResponseWriter) {
+		forwardReservedCreate(fw, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
+			sandboxID, opts.PreferredSandboxID == "", opts.Logger, stages)
+	}) {
+		cancelReservation(context.WithoutCancel(r.Context()), c, opts.Logger, sandboxID)
+	}
 	return Decision{}, false
+}
+
+// onceServerForwarder is a worker's or gateway's way to a server
+// (cluster.Agent): ForwardToServerOnce for a create that may not run twice,
+// ForwardToServer for a keyed one, which replays on a retry.
+type onceServerForwarder interface {
+	ForwardToServer(http.ResponseWriter, *http.Request)
+	ForwardToServerOnce(http.ResponseWriter, *http.Request)
+}
+
+// sendCreateToServer sends r, with the caller's own credential, to a
+// server. A call that carries none is refused here, never sent as this
+// node.
+func sendCreateToServer(w http.ResponseWriter, r *http.Request, c cluster.Client, writeMsg func(http.ResponseWriter, int, string)) {
+	scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+	bearer := strings.EqualFold(scheme, "Bearer") && strings.TrimSpace(cred) != ""
+	if !bearer && strings.TrimSpace(r.Header.Get("X-API-KEY")) == "" {
+		writeMsg(w, http.StatusBadRequest, "this node sends a create that names a platform volume on to a server with your own credential, and the call carries none: send it with your API key, or to a server")
+		return
+	}
+	fw, ok := c.(onceServerForwarder)
+	if !ok {
+		writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoServerForward.Error())
+		return
+	}
+	if strings.TrimSpace(r.Header.Get(HeaderIdempotencyKey)) != "" {
+		fw.ForwardToServer(w, r)
+		return
+	}
+	fw.ForwardToServerOnce(w, r)
+}
+
+// forwardWithVolumeRows runs forward, the create's send to another node,
+// after this server made the rows the create's platform volumes need, and
+// removes the rows it made if that node refuses or fails the create. ok is
+// false when it answered an error and forward did not run.
+func forwardWithVolumeRows(w http.ResponseWriter, r *http.Request, svc *service.Service, req models.CreateSandboxRequest, writeError ErrorWriter, forward func(http.ResponseWriter)) bool {
+	undo, err := svc.MakeCreateVolumeRows(r.Context(), req)
+	if err != nil {
+		cl := apihttp.Classify(err)
+		cl.SetRetryAfter(w)
+		writeError(w, cl.Status, cl.Code, cl.Message)
+		return false
+	}
+	if undo == nil {
+		forward(w)
+		return true
+	}
+	answer := &answerStatus{ResponseWriter: w}
+	forward(answer)
+	if answer.refused() {
+		undo()
+	}
+	return true
+}
+
+// answerStatus records the status a forwarded create was answered with,
+// as set by WriteHeader. A body with no WriteHeader is the implicit 200 and
+// leaves status 0, which keeps the rows as no answer does: only an error
+// answer undoes them. The body goes straight to the embedded writer;
+// nothing here reads or copies it.
+type answerStatus struct {
+	http.ResponseWriter
+	status int
+}
+
+func (a *answerStatus) WriteHeader(code int) {
+	if a.status == 0 {
+		a.status = code
+	}
+	a.ResponseWriter.WriteHeader(code)
+}
+
+func (a *answerStatus) Flush() {
+	if f, ok := a.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// refused reports a definite failure: the node answered the create with an
+// error (a 4xx, or a 5xx such as 500 or 501, after which it rolled the
+// create back). No answer, or 502 to 504, is unknown: the create may have
+// landed, or not reached the node at all. Status 0 is no answer or the
+// implicit 200.
+func (a *answerStatus) refused() bool {
+	switch a.status {
+	case 0, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return false
+	}
+	return a.status >= 400
 }
 
 // snapshotTagHome returns the node a create is forwarded to because its image

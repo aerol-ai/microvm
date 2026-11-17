@@ -124,7 +124,9 @@ containers:
       {{- with include "aerolvm.identityEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- with include "aerolvm.auditEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
-      {{- if or (hasPrefix "SB_CLUSTER_" $k) (eq $k "SB_DEAD_OWNER_GRACE") }}
+      {{- /* A server makes a platform volume's record, from the same
+      settings the workers mount it with; a gateway needs none. */}}
+      {{- if or (hasPrefix "SB_CLUSTER_" $k) (eq $k "SB_DEAD_OWNER_GRACE") (and (not $gateway) (hasPrefix "SB_PLATFORM_VOLUMES_" $k)) }}
       - { name: {{ $k }}, value: {{ $v | quote }} }
       {{- end }}
       {{- end }}

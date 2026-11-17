@@ -162,6 +162,19 @@ func (c *Cluster) stampProposal(payload []byte, cmd command, sender string, serv
 			cmd.ReservedBy, changed = sender, true
 		}
 	}
+	if !server && cmd.Op == opUpsertVolume && cmd.Volume != nil {
+		// Once servers sign, a worker's upsert passes only for a row that
+		// exists (volume_proposals.go). The command carries that row, not
+		// the sender's: should the row go between this check and the
+		// apply, the get-or-create makes it again as a server made it,
+		// never from a source the sender chose.
+		if (leaderProposalState{placementFSM: c.fsm, c: c}).serversSign() {
+			if row, ok := c.fsm.volumeByNameForProposal(cmd.Volume.Tenant, cmd.Volume.Name); ok && *cmd.Volume != row {
+				row := row
+				cmd.Volume, changed = &row, true
+			}
+		}
+	}
 	if !server {
 		switch cmd.Op {
 		case opPlace, opClaimOrphan, opReassign, opReserve:
@@ -255,6 +268,10 @@ type proposalState interface {
 	reclaimAdoptable(cur VolumeReclaim, sender string) bool
 	// serversSign reports whether the server signing record exists.
 	serversSign() bool
+	// volumeForProposal and volumeByNameForProposal read one volume row
+	// (volume_proposals.go).
+	volumeForProposal(tenant, id string) (models.Volume, bool)
+	volumeByNameForProposal(tenant, name string) (models.Volume, bool)
 }
 
 func (s leaderProposalState) serversSign() bool {
@@ -347,6 +364,12 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 	// the sandbox's identity tokens from: only a server sets either.
 	if st.serversSign() && !identityKeptBy(cmd, st) {
 		return false
+	}
+	switch cmd.Op {
+	case opUpsertVolume, opDeleteVolume, opPutVolumeAttach, opDeleteVolumeAttach:
+		if st.serversSign() {
+			return volumeWriteBound(cmd, sender, st)
+		}
 	}
 	switch cmd.Op {
 	case opPlace:

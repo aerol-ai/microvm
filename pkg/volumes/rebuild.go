@@ -179,3 +179,55 @@ func platformSourceSegments(m models.MountSpec) ([]string, bool) {
 	}
 	return strings.Split(src, "/"), true
 }
+
+// SourceUnderRoot reports whether source is a platform volume's coordinate
+// on backend b: under b's bucket and prefix (s3) or server and export
+// (nfs), followed by exactly a tenant or operator scope and a volume name.
+// A node deletes a volume's bytes only for such a source (the reclaim
+// sweep): a row's source is replicated, and a source anywhere else is not
+// a volume this node's storage holds.
+func SourceUnderRoot(b Backend, source string) bool {
+	var root string
+	switch b.Kind {
+	case BackendS3:
+		if strings.TrimSpace(b.S3Bucket) == "" {
+			return false
+		}
+		root = path.Join(b.S3Bucket, strings.Trim(b.S3Prefix, "/")) + "/"
+	case BackendNFS:
+		if strings.TrimSpace(b.NFSServer) == "" {
+			return false
+		}
+		root = b.NFSServer + ":/"
+		if export := strings.Trim(b.NFSExport, "/"); export != "" {
+			root += export + "/"
+		}
+	default:
+		return false
+	}
+	rest, ok := strings.CutPrefix(source, root)
+	if !ok || rest == "" || path.Clean(rest) != rest {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	if len(segs) != 2 {
+		return false
+	}
+	scope, name := segs[0], segs[1]
+	if clean, err := SanitizeVolumeName(name); err != nil || clean != name {
+		return false
+	}
+	if strings.HasPrefix(scope, operatorScopePrefix) {
+		return ValidateOperatorScope(scope) == nil
+	}
+	hex, ok := strings.CutPrefix(scope, "t-")
+	if !ok || len(hex) != 16 {
+		return false
+	}
+	for _, r := range hex {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
