@@ -812,6 +812,9 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 		if call, ok := sshGatewayCall(r, access); ok {
 			ctx = auditlog.ContextWithSSHGatewayCall(ctx, call)
 		}
+		if bound, ok := s.customDomainsBound(r); ok {
+			ctx = cluster.ContextWithCustomDomainsBound(ctx, bound)
+		}
 		switch access.Principal.Kind {
 		case controlplane.PrincipalOperator, controlplane.PrincipalNode:
 			// Where this node accepted the PAT, for the

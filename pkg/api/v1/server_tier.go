@@ -25,6 +25,9 @@ import (
 //	                        egress profiles, team quotas, warm pools: only a
 //	                        server writes those (internal/cluster
 //	                        settings_writers.go)
+//	custom domains          an attach, and a create with custom_domains:
+//	                        only a server binds a new name
+//	                        (custom_domains_servers.go)
 //
 // The same calls about this node stay here: draining this node first moves
 // its own WASM sandboxes, and a node's own tools use its node-local token,
@@ -63,11 +66,29 @@ func (h *handlers) otherNode(r *http.Request) bool {
 // and grants it only what its role needs. A call with no Authorization at
 // all is refused here, never sent as this node.
 func (h *handlers) sendToServer(w http.ResponseWriter, r *http.Request, what string) {
+	h.sendToServerWith(w, r, what, false)
+}
+
+// serverOnceForwarder is the forward for a call not safe to run twice
+// (cluster.Agent.ForwardToServerOnce): a 5xx is the caller's answer, not a
+// reason to try the next server.
+type serverOnceForwarder interface {
+	ForwardToServerOnce(http.ResponseWriter, *http.Request)
+}
+
+// sendToServerWith is sendToServer; once sends a call that is not safe to
+// run twice, such as a create with no Idempotency-Key.
+func (h *handlers) sendToServerWith(w http.ResponseWriter, r *http.Request, what string, once bool) {
 	if scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " "); !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(cred) == "" {
 		apihttp.WriteError(w, http.StatusBadRequest, "this node sends "+what+" on to a server with your own credential, and the call carries none: send it with an Authorization header, or to a server")
 		return
 	}
-	fw, ok := h.deps.Service.Cluster().(serverForwarder)
+	c := h.deps.Service.Cluster()
+	if fw, ok := c.(serverOnceForwarder); ok && once {
+		fw.ForwardToServerOnce(w, r)
+		return
+	}
+	fw, ok := c.(serverForwarder)
 	if !ok {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoServerForward.Error())
 		return

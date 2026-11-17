@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/volumes"
@@ -19,9 +21,15 @@ import (
 // check, with its own volume and module configuration, before it creates
 // anything:
 //
-//	mounts         each must be one of the sandbox's own platform volumes on
-//	               this node's backend; it is mounted as this node builds it
-//	               (volumes.PlatformMountFor). Any other mount is refused.
+//	mounts         each must be one of the sandbox's own platform volumes:
+//	               one the cluster's volume records attach to this sandbox,
+//	               of its tenant (or, for an operator's sandbox, of an
+//	               operator scope), at the location the volume's record froze
+//	               when it was made (volumes.PlatformMountFromRecord); for a
+//	               sandbox with no such record, the location this node's
+//	               configuration gives (volumes.PlatformMountFor). It is
+//	               mounted with this node's backend options. Any other mount
+//	               is refused.
 //	module_ref     a WASM module from a host path, or a JS bundle from a
 //	               file, is refused (the resolver would refuse it anyway
 //	               under WithHostPathsDenied; this says why first).
@@ -67,17 +75,23 @@ func (s *Service) rebuildSpecWithoutHostPowers(ctx context.Context, id string, s
 	ownerRef := s.tenantOwnerRefForRecreate(ctx, id)
 	placement := cluster.Placement{SandboxID: id, OwnerRef: ownerRef, Spec: &spec}
 	var held []string
+	incarnation := ""
 	if c := s.Cluster(); c != nil {
 		if p, ok := c.PlacementOf(id); ok {
-			held = p.CustomHostnames
+			held, incarnation = p.CustomHostnames, strings.TrimSpace(p.IncarnationID)
 		}
 	}
 	refused := cluster.HostOnlySettings(placement)
 	if len(spec.Mounts) > 0 && !slices.Contains(refused, "mounts") {
-		mounts, ok := s.rebuildPlatformMounts(ownerRef, spec.Mounts)
-		if ok {
+		mounts, ok, err := s.rebuildPlatformMounts(ctx, id, incarnation, ownerRef, spec.Mounts)
+		switch {
+		case err != nil:
+			// The records could not be read: not a refusal, the owner
+			// watcher tries again.
+			return spec, err
+		case ok:
 			spec.Mounts = mounts
-		} else {
+		default:
 			refused = append(refused, "mounts")
 		}
 	}
@@ -107,30 +121,71 @@ func (s *Service) rebuildSpecWithoutHostPowers(ctx context.Context, id string, s
 	return spec, nil
 }
 
-// rebuildPlatformMounts maps every mount to the platform volume of the
-// sandbox's owner it stands for, as this node builds it. ok is false when
-// one is not such a volume, or this node serves none.
-func (s *Service) rebuildPlatformMounts(ownerRef string, mounts []models.MountSpec) ([]models.MountSpec, bool) {
+// rebuildPlatformMounts maps every mount of sandbox id to the platform
+// volume of its owner it stands for, as this node mounts it. ok is false
+// when one is not such a volume, or this node serves none; err is a volume
+// record that could not be read.
+//
+// The volume's record comes first: it holds the location the volume was
+// made at and its own tenant, so a volume made before the operator changed
+// the bucket, prefix or export, and an operator's volume on a node with no
+// operator token or pinned scope, rebuild here too. Only a mount with no
+// record (a sandbox from before the cluster kept them) falls back to the
+// location this node's configuration gives.
+func (s *Service) rebuildPlatformMounts(ctx context.Context, id, incarnation, ownerRef string, mounts []models.MountSpec) ([]models.MountSpec, bool, error) {
 	pv := s.cfg.PlatformVolumes
 	if !pv.Enabled {
-		return nil, false
-	}
-	tenant := volumes.TenantForOwnerRef(ownerRef)
-	if tenant == "" {
-		scope, err := volumes.OperatorScope(s.cfg.OperatorVolumeScope, s.cfg.PATToken)
-		if err != nil {
-			return nil, false
-		}
-		tenant = scope
+		return nil, false, nil
 	}
 	b := backendFromConfig(pv)
+	tenant := volumes.TenantForOwnerRef(ownerRef)
+	atts, err := s.volumeMeta().AttachmentsForSandbox(ctx, id)
+	if err != nil {
+		return nil, false, fmt.Errorf("cluster: read the sandbox's volume attachments: %w", err)
+	}
 	out := make([]models.MountSpec, 0, len(mounts))
 	for _, m := range mounts {
-		rebuilt, ok := volumes.PlatformMountFor(b, tenant, m)
-		if !ok {
-			return nil, false
+		rebuilt, found, err := s.platformMountFromRecord(ctx, b, tenant, incarnation, atts, m)
+		if err != nil {
+			return nil, false, err
+		}
+		if !found {
+			scope := tenant
+			if scope == "" {
+				if scope, err = volumes.OperatorScope(s.cfg.OperatorVolumeScope, s.cfg.PATToken); err != nil {
+					return nil, false, nil
+				}
+			}
+			if rebuilt, found = volumes.PlatformMountFor(b, scope, m); !found {
+				return nil, false, nil
+			}
 		}
 		out = append(out, rebuilt)
 	}
-	return out, true
+	return out, true, nil
+}
+
+// platformMountFromRecord is m as the volume record attached to this
+// sandbox at m's source and target builds it. found is false when no
+// attachment of this incarnation names m, or its volume is gone.
+func (s *Service) platformMountFromRecord(ctx context.Context, b volumes.Backend, tenant, incarnation string, atts []models.VolumeAttachment, m models.MountSpec) (models.MountSpec, bool, error) {
+	for _, att := range atts {
+		if att.Source != m.Source || att.Target != m.Target {
+			continue
+		}
+		if incarnation != "" && att.IncarnationID != "" && att.IncarnationID != incarnation {
+			continue
+		}
+		vol, err := s.volumeMeta().ByID(ctx, att.Tenant, att.VolumeID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return models.MountSpec{}, false, fmt.Errorf("cluster: read platform volume %s: %w", att.VolumeID, err)
+		}
+		if out, ok := volumes.PlatformMountFromRecord(b, tenant, *vol, att, m); ok {
+			return out, true, nil
+		}
+	}
+	return models.MountSpec{}, false, nil
 }

@@ -36,8 +36,13 @@ import (
 //	reclaim claim                          also one the sender may adopt now:
 //	                                       the rule the reclaim listing
 //	                                       applies (mayAdoptVolumeReclaim)
-//	custom domain add                      also not a name of the cluster's
-//	                                       own: its base domain or API host
+//	custom domain add                      also a name the sandbox already
+//	                                       holds (a replay, a rebuild, the
+//	                                       owner's half of an attach): a new
+//	                                       name is bound by a server, which
+//	                                       checks the caller's DNS proof
+//	                                       (the attach and create routes go
+//	                                       there first)
 //	reserve                                any: a reservation never enters
 //	                                       the owner index (fsm.go)
 //	cancel reserve                         the reservation is the sender's:
@@ -198,46 +203,6 @@ func (c *Cluster) stampProposal(payload []byte, cmd command, sender string, serv
 	return out, cmd, nil
 }
 
-// CustomDomainProver is the optional half of SandboxRecreator that checks a
-// custom hostname's DNS proof for a sandbox owned by ownerRef: the TXT
-// record bound to that owner, or the operator's record. The service
-// implements it.
-type CustomDomainProver interface {
-	ProveCustomDomain(ctx context.Context, hostname, ownerRef string) error
-}
-
-// customDomainProofTimeout bounds the leader's DNS lookup for one add.
-const customDomainProofTimeout = 5 * time.Second
-
-// proveCustomDomain checks, on the leader, the DNS proof of a custom
-// hostname a worker or gateway adds to a sandbox it owns. The owner checks
-// the proof before it proposes; the leader checks it again because the
-// owner is the one asking. A name the sandbox already holds (a replay, a
-// rebuild) is not checked again. With no prover attached (a leader whose
-// service is not wired, as in tests), nothing more is checked.
-func (c *Cluster) proveCustomDomain(ctx context.Context, cmd command) error {
-	p, ok := c.fsm.placementForProposal(cmd.SandboxID, false)
-	if !ok {
-		return nil // the FSM answers ErrUnknownSandbox
-	}
-	host := strings.TrimSpace(cmd.Hostname)
-	for _, held := range p.CustomHostnames {
-		if held == host {
-			return nil
-		}
-	}
-	prover, ok := c.currentRecreator().(CustomDomainProver)
-	if !ok {
-		return nil
-	}
-	pctx, cancel := context.WithTimeout(ctx, customDomainProofTimeout)
-	defer cancel()
-	if err := prover.ProveCustomDomain(pctx, host, strings.TrimSpace(p.OwnerRef)); err != nil {
-		return fmt.Errorf("%w: custom hostname %q has no DNS proof for this sandbox's owner: %w", ErrPeerProposalRefused, host, err)
-	}
-	return nil
-}
-
 // memberRecord is nodeID's member record as this leader's gossip view has
 // it: this node's own, or the gossiped one. ok is false for a node with no
 // record.
@@ -261,15 +226,10 @@ type proposalState interface {
 	// node that holds it now, by the rule the listing applies
 	// (volumeReclaimsFor).
 	reclaimAdoptable(cur VolumeReclaim, sender string) bool
-	// clusterHostname reports whether host is a name of the cluster's own
-	// (the base domain, a name under it, or the API host), or not a valid
-	// custom hostname at all.
-	clusterHostname(host string) bool
 }
 
 // leaderProposalState is the leader's proposalState: its FSM, plus its
-// membership view for the reclaim rule and its configuration for the
-// cluster's own names.
+// membership view for the reclaim rule.
 type leaderProposalState struct {
 	*placementFSM
 	c   *Cluster
@@ -287,21 +247,27 @@ func (s leaderProposalState) reclaimAdoptable(cur VolumeReclaim, sender string) 
 	return volumeReclaimAdoptableBy(cur, sender, gossipReclaimNodeState(g), gossipReclaimAdopters(g), s.now)
 }
 
-func (s leaderProposalState) clusterHostname(host string) bool {
-	if s.c == nil {
+// IsClusterHostname reports whether host is a name of the cluster's own, or
+// not a valid custom hostname at all: the base domain or a name under it,
+// the API host, or a member's public host or a name under it. Custom
+// hostnames route ahead of the API host and the per-sandbox routes on every
+// gateway (the tls-mux inserts them first), so a server binds none of these
+// for a caller (service BindCustomDomain).
+func (c *Cluster) IsClusterHostname(host string) bool {
+	if c == nil {
 		return true
 	}
-	if models.ReservedCustomDomain(host, s.c.cfg.Domain, s.c.cfg.PublicHost, s.c.cfg.IngressAdvertiseHost) {
+	if models.ReservedCustomDomain(host, c.cfg.Domain, c.cfg.PublicHost, c.cfg.IngressAdvertiseHost) {
 		return true
 	}
 	// A server may run with no domain of its own (on Kubernetes only the
 	// gateways serve the edge), so the names the members serve count too:
 	// each member's public host, and every name under it.
-	if s.c.gossip == nil {
+	if c.gossip == nil {
 		return false
 	}
 	seen := map[string]bool{}
-	for _, m := range s.c.gossip.members() {
+	for _, m := range c.gossip.members() {
 		pub := strings.TrimSpace(m.PublicHost)
 		if pub == "" || seen[pub] {
 			continue
@@ -365,10 +331,10 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 		if !ok || !is(p.OwnerNodeID) {
 			return false
 		}
-		// A name of the cluster's own would route ahead of the API host and
-		// the per-sandbox routes on every gateway (the tls-mux inserts
-		// custom names first): only a server binds one.
-		return cmd.Op != opAddCustomDomain || !st.clusterHostname(cmd.Hostname)
+		// A new name is bound by a server, after the caller's DNS proof: the
+		// owner writes only the sandbox, so its word on whose name it is
+		// proves nothing. The owner re-adds what the sandbox holds.
+		return cmd.Op != opAddCustomDomain || existingHasHostname(p, strings.TrimSpace(cmd.Hostname))
 	case opUpdateSecretRecipients, opDelete, opBeginDelete:
 		return fencedOnSender
 	case opMoveHandoff:

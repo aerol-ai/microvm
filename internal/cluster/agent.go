@@ -1996,12 +1996,18 @@ func (e statusError) Error() string {
 	return fmt.Sprintf("cluster control-plane request failed with status %d: %s", e.status, e.message)
 }
 
-// Is lets errors.Is match ErrMembershipPending against the two refusals the
-// internal server's peer check issues for a node it does not currently see:
-// 403 "cluster peer not in membership" and the pre-gossip 503. Matching on
-// the server's own wording keeps every other 403 (a bad PAT, a revoked
-// certificate's handshake never gets this far) out of the retryable class.
+// Is lets errors.Is match ErrPeerProposalRefused against the leader's 403
+// for a proposal this node's role may not make, and ErrMembershipPending
+// against the two refusals the internal server's peer check issues for a
+// node it does not currently see: 403 "cluster peer not in membership" and
+// the pre-gossip 503. Matching on the server's own wording keeps every
+// other 403 (a bad PAT, a revoked certificate's handshake never gets this
+// far) out of the retryable class.
 func (e statusError) Is(target error) bool {
+	if target == ErrPeerProposalRefused {
+		// The leader's role check (peer_proposals.go), relayed by a server.
+		return e.status == http.StatusForbidden && strings.Contains(e.message, ErrPeerProposalRefused.Error())
+	}
 	if target != ErrMembershipPending {
 		return false
 	}

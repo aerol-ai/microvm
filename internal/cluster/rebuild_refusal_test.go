@@ -89,7 +89,7 @@ func TestStuckReassignKeepsHostOnlySandbox(t *testing.T) {
 		}
 		return inc
 	}
-	inc := place("sb-host", models.MountSpec{Type: models.MountTypeS3, Source: "s3://host-role-bucket", Target: "/data"})
+	inc := place("sb-host", models.MountSpec{Type: models.MountTypeS3, Source: "s3://other-bucket", Target: "/data"})
 	if err := c.ReassignStuckPlacement(context.Background(), "wkr-9", "sb-host", inc, false); !errors.Is(err, ErrNoReassignTarget) {
 		t.Fatalf("reassign of a host-only sandbox = %v, want ErrNoReassignTarget", err)
 	}
@@ -114,7 +114,7 @@ func TestDeadOwnerOrphansHostOnlySandbox(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 	seedGossipView(t, c, []Member{recreateCandidate("wkr-b", config.NodeRoleWorker, 100)})
 	for id, mount := range map[string]models.MountSpec{
-		"sb-host": {Type: models.MountTypeS3, Source: "s3://host-role-bucket", Target: "/data"},
+		"sb-host": {Type: models.MountTypeS3, Source: "s3://other-bucket", Target: "/data"},
 		"sb-vol":  platformMount("team:payments", "data"),
 	} {
 		raw, _ := encodeCommand(command{Op: opPlace, SandboxID: id, OwnerNodeID: "wkr-dead", IncarnationID: "inc-" + id,

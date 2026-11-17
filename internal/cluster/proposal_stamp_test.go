@@ -31,37 +31,69 @@ func workerMember(id, dataPlaneHost string) Member {
 	return m
 }
 
-// A worker binds a customer's hostname to a sandbox it owns, but never one
-// of the cluster's own names: the base domain, a name under it (another
-// sandbox's, or the API's), or the API host.
-func TestWorkerCannotBindClusterHostnames(t *testing.T) {
+// A worker or gateway binds no new hostname, whatever team it records as
+// its sandbox's owner: the owner writes that record itself, so its word on
+// whose name a hostname is proves nothing. A server binds a new name after
+// the caller's DNS proof; the owner then re-adds it (the owner's half of an
+// attach, a replay), and may remove it.
+func TestWorkerBindsNoNewHostname(t *testing.T) {
 	c := stampLeader(t, "ldr-names", workerMember("wkr-9", "10.0.0.9"))
+	// A recreator that would prove any name: the leader asks it nothing.
+	dns := &anyProofRecreator{recordingRecreator: recordingRecreator{calls: map[string]recordedRecreate{}}}
+	c.AttachRecreator(dns)
 	w := workerApplyCtx("wkr-9")
-	inc, _ := MintIncarnationID()
 	public := true
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-w", OwnerNodeID: "wkr-9", IncarnationID: inc,
-		Spec: &models.CreateSandboxRequest{Image: "alpine", AllowPublicTraffic: &public}})
+	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-w", OwnerNodeID: "wkr-9", IncarnationID: "inc-w",
+		OwnerRef: "team:payments", Spec: &models.CreateSandboxRequest{Image: "alpine", AllowPublicTraffic: &public}})
 	if err := c.ApplyEncoded(w, place); err != nil {
 		t.Fatalf("place: %v", err)
 	}
-	for _, host := range []string{"api.sb.example.com", "sb-other.sb.example.com", "sb.example.com", "api.example.com"} {
-		add, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-w", Hostname: host, ExpectedIncarnationID: inc})
-		if err := c.ApplyEncoded(w, add); !errors.Is(err, ErrPeerProposalRefused) {
-			t.Errorf("bind %s = %v, want ErrPeerProposalRefused", host, err)
+	add := func(ctx context.Context, host string) error {
+		raw, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-w", Hostname: host, ExpectedIncarnationID: "inc-w"})
+		return c.ApplyEncoded(ctx, raw)
+	}
+	for _, host := range []string{"app.payments.example", "api.sb.example.com", "sb-other.sb.example.com", "sb.example.com", "api.example.com"} {
+		if err := add(w, host); !errors.Is(err, ErrPeerProposalRefused) {
+			t.Errorf("worker binds %s = %v, want ErrPeerProposalRefused", host, err)
 		}
 	}
-	add, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-w", Hostname: "app.customer.com", ExpectedIncarnationID: inc})
-	if err := c.ApplyEncoded(w, add); err != nil {
-		t.Fatalf("bind a customer hostname: %v", err)
+	if p, _ := c.fsm.get("sb-w"); len(p.CustomHostnames) != 0 {
+		t.Fatalf("custom hostnames after the worker's adds: %v", p.CustomHostnames)
 	}
-	if p, _ := c.fsm.get("sb-w"); len(p.CustomHostnames) != 1 || p.CustomHostnames[0] != "app.customer.com" {
+	if len(dns.asked) != 0 {
+		t.Fatalf("the leader looked up proofs for a worker: %v", dns.asked)
+	}
+	// A server binds it; the worker's re-add and its removal then pass.
+	if err := add(ContextWithApplyPeer(context.Background(), c.nodeID, nil), "app.payments.example"); err != nil {
+		t.Fatalf("server binds: %v", err)
+	}
+	if err := add(w, "app.payments.example"); err != nil {
+		t.Fatalf("worker re-adds a held name: %v", err)
+	}
+	if p, _ := c.fsm.get("sb-w"); len(p.CustomHostnames) != 1 || p.CustomHostnames[0] != "app.payments.example" {
 		t.Fatalf("custom hostnames %v", p.CustomHostnames)
+	}
+	remove, _ := encodeCommand(command{Op: opRemoveCustomDomain, SandboxID: "sb-w", Hostname: "app.payments.example", ExpectedIncarnationID: "inc-w"})
+	if err := c.ApplyEncoded(w, remove); err != nil {
+		t.Fatalf("worker removes its sandbox's name: %v", err)
+	}
+	if err := add(w, "app.payments.example"); !errors.Is(err, ErrPeerProposalRefused) {
+		t.Fatalf("worker binds a released name again = %v", err)
 	}
 }
 
-// Where a worker's sandbox is reached comes from the leader's member
-// records, not from what the worker wrote; a reservation records who sent
-// it, and only that node, its target or a server cancels it.
+// anyProofRecreator is a recreator that would prove any custom hostname,
+// and records each one it is asked about.
+type anyProofRecreator struct {
+	recordingRecreator
+	asked []string
+}
+
+func (a *anyProofRecreator) ProveCustomDomain(_ context.Context, host, owner string) error {
+	a.asked = append(a.asked, host+"@"+owner)
+	return nil
+}
+
 func TestLeaderStampsWorkerProposals(t *testing.T) {
 	thin := workerMember("wkr-thin", "")
 	thin.APIURL = ""
@@ -165,71 +197,25 @@ func TestWorkerClaimsOnlyAdoptableReclaims(t *testing.T) {
 	}
 }
 
-// proverRecreator is a recreator that also checks DNS proofs.
-type proverRecreator struct {
-	recordingRecreator
-	proved []string
-}
-
-func (p *proverRecreator) ProveCustomDomain(_ context.Context, host, owner string) error {
-	p.proved = append(p.proved, host+"@"+owner)
-	if host == "noproof.customer.com" {
-		return errors.New("no TXT record")
-	}
-	return nil
-}
-
-// The leader checks the DNS proof of a hostname a worker adds, against the
-// sandbox's owner, and does not ask again for one the sandbox holds.
-func TestLeaderChecksWorkerDomainProof(t *testing.T) {
-	c := stampLeader(t, "ldr-proof", workerMember("wkr-9", ""))
-	prover := &proverRecreator{recordingRecreator: recordingRecreator{calls: map[string]recordedRecreate{}}}
-	c.AttachRecreator(prover)
-	w := workerApplyCtx("wkr-9")
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-d", OwnerNodeID: "wkr-9", IncarnationID: "inc-d", OwnerRef: "team:payments",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
-	if err := c.ApplyEncoded(w, place); err != nil {
-		t.Fatal(err)
-	}
-	add := func(host string) error {
-		raw, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-d", Hostname: host, ExpectedIncarnationID: "inc-d"})
-		return c.ApplyEncoded(w, raw)
-	}
-	if err := add("noproof.customer.com"); !errors.Is(err, ErrPeerProposalRefused) {
-		t.Fatalf("add without a proof = %v", err)
-	}
-	if err := add("app.customer.com"); err != nil {
-		t.Fatalf("add with a proof: %v", err)
-	}
-	if err := add("app.customer.com"); err != nil {
-		t.Fatalf("add again: %v", err)
-	}
-	if len(prover.proved) != 2 || prover.proved[1] != "app.customer.com@team:payments" {
-		t.Fatalf("proofs asked %v", prover.proved)
-	}
-}
-
-// A leader with no domain of its own (a Kubernetes server: only gateways
-// serve the edge) still refuses the names its members serve.
-func TestWorkerCannotBindMembersPublicNames(t *testing.T) {
+// The names a server never binds for a caller: its own base domain and
+// API host, and, for a server with no domain of its own (a Kubernetes
+// server: only the gateways serve the edge), each member's public host and
+// every name under it.
+func TestClusterHostnames(t *testing.T) {
 	gw := workerMember("gw-1", "")
 	gw.Role = config.NodeRoleIngress
 	gw.PublicHost = "edge.example.net:443"
-	c, cleanup := newTestCluster(t, "ldr-members-names", true, nil)
-	defer cleanup()
-	waitForLeader(t, c, 10*time.Second)
-	seedGossipView(t, c, []Member{workerMember("wkr-9", ""), gw})
-	w := workerApplyCtx("wkr-9")
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-m", OwnerNodeID: "wkr-9", IncarnationID: "inc-m",
-		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
-	if err := c.ApplyEncoded(w, place); err != nil {
-		t.Fatal(err)
-	}
-	for host, refused := range map[string]bool{"edge.example.net": true, "sb-x.edge.example.net": true, "app.customer.com": false} {
-		add, _ := encodeCommand(command{Op: opAddCustomDomain, SandboxID: "sb-m", Hostname: host, ExpectedIncarnationID: "inc-m"})
-		err := c.ApplyEncoded(w, add)
-		if refused != errors.Is(err, ErrPeerProposalRefused) {
-			t.Errorf("bind %s = %v", host, err)
+	c := stampLeader(t, "ldr-members-names", workerMember("wkr-9", ""), gw)
+	for host, ours := range map[string]bool{
+		"sb.example.com": true, "sb-x.sb.example.com": true, "api.example.com": true,
+		"edge.example.net": true, "sb-x.edge.example.net": true,
+		"App.Customer.com": true, "app.customer.com": false,
+	} {
+		if got := c.IsClusterHostname(host); got != ours {
+			t.Errorf("IsClusterHostname(%s) = %v, want %v", host, got, ours)
 		}
+	}
+	if !(*Cluster)(nil).IsClusterHostname("app.customer.com") {
+		t.Error("a nil cluster must treat every name as its own")
 	}
 }

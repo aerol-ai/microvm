@@ -193,7 +193,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// with clusterForwardWrap so a request addressing a remote-owned
 	// sandbox follows the same forward path as every other per-sandbox
 	// route — the owner is the only node with the row to mutate.
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permWrite, wrap(http.HandlerFunc(h.addCustomDomain))))
+	// A server binds a new custom hostname, after the caller's DNS proof: a
+	// worker or gateway sends the attach to one (custom_domains_servers.go).
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permWrite, h.viaServers(h.attachGoesToServer, h.bindCustomDomainFirst(wrap(http.HandlerFunc(h.addCustomDomain))))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permRead, wrap(http.HandlerFunc(h.listCustomDomains))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Route(permWrite, wrap(http.HandlerFunc(h.removeCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains/dns", d.Route(permRead, wrap(http.HandlerFunc(h.customDomainDNS))))

@@ -63,6 +63,7 @@ var reviewedOwnerScopeUses = map[string]scopeUse{
 	"Service.CountSnapshots":                   {1, whyVisibility},
 	"wasmModuleVisible":                        {1, whyVisibility},
 	"identityRoleOwner":                        {1, whyNamespace + ": the team whose identity allow list a roles call reads or writes"},
+	"Service.BindCustomDomain":                 {1, whyVisibility + ": a server binds a name for a scoped caller only on its own team's sandbox"},
 }
 
 // reviewedHostCapableUses lists every function that asks hostCapable: the
@@ -73,6 +74,7 @@ var reviewedHostCapableUses = map[string]scopeUse{
 	"Service.validateCreateMounts":         {1, "raw host-side mounts"},
 	"Service.createIsolateSandbox":         {1, "file:// bundle refs read off the host"},
 	"Service.persistCustomDomainsOnCreate": {1, "custom domains on create without a DNS proof"},
+	"Service.BindCreateCustomDomains":      {1, "custom domains on create without a DNS proof, on the server that binds them"},
 	"customDomainProofToken":               {1, "the owner-less legacy DNS proof on attach"},
 	"wasmResolveContext":                   {1, "#537: raw host-path WASM module refs read off the host"},
 	"Service.DeleteWasmModule":             {1, "#537: reclaiming WASM module bytes on delete"},

@@ -54,7 +54,7 @@ func TestPlatformMountFor(t *testing.T) {
 		"another bucket":    {Type: models.MountTypeS3, Source: "other/pfx/" + tenant + "/data", Target: "/d"},
 		"another prefix":    {Type: models.MountTypeS3, Source: "vols/x/" + tenant + "/data", Target: "/d"},
 		"another tenant":    {Type: models.MountTypeS3, Source: "vols/pfx/t-0000000000000000/data", Target: "/d"},
-		"another nfs host":  {Type: models.MountTypeNFS, Source: "evil:/exports/" + tenant + "/data", Target: "/d"},
+		"another nfs host":  {Type: models.MountTypeNFS, Source: "nfs2.internal:/exports/" + tenant + "/data", Target: "/d"},
 		"a bad volume name": {Type: models.MountTypeS3, Source: "vols/pfx/" + tenant + "/..", Target: "/d"},
 		"no target":         {Type: models.MountTypeS3, Source: "vols/pfx/" + tenant + "/data"},
 		"another type":      {Type: "rclone", Source: "vols/pfx/" + tenant + "/data", Target: "/d"},
@@ -69,5 +69,81 @@ func TestPlatformMountFor(t *testing.T) {
 	}
 	if _, ok := PlatformMountFor(Backend{}, tenant, s3); ok {
 		t.Error("no backend: taken")
+	}
+}
+
+// A volume's record gives its location and tenant: a volume made before the
+// operator changed the bucket mounts at the location it was made at, with
+// this node's options; nothing but a record of the sandbox's own tenant (or
+// an operator scope, for an operator's sandbox) that names exactly this
+// mount counts.
+func TestPlatformMountFromRecord(t *testing.T) {
+	tenant := TenantForOwnerRef("team:a")
+	b := Backend{Kind: BackendS3, S3Bucket: "vols-new", S3Prefix: "p2", S3Region: "eu-west-1"}
+	old := "vols-old/p1/" + tenant + "/data"
+	vol := models.Volume{ID: "v1", Tenant: tenant, Name: "data", Backend: BackendS3, Source: old}
+	att := models.VolumeAttachment{Tenant: tenant, VolumeID: "v1", SandboxID: "sb-1", Target: "/data", Source: old}
+	m := models.MountSpec{Type: models.MountTypeS3, Source: old, Target: "/data", ReadOnly: true, Options: map[string]string{"endpoint": "http://elsewhere.example"}}
+	got, ok := PlatformMountFromRecord(b, tenant, vol, att, m)
+	if !ok || got.Source != old || got.Target != "/data" || !got.ReadOnly || got.Options["endpoint"] != "" || got.Options["region"] != "eu-west-1" {
+		t.Fatalf("old location: %+v %v", got, ok)
+	}
+	opVol := models.Volume{ID: "v2", Tenant: "op-main", Name: "shared", Backend: BackendS3, Source: "vols-old/p1/op-main/shared"}
+	opAtt := models.VolumeAttachment{Tenant: "op-main", VolumeID: "v2", Target: "/shared", Source: opVol.Source}
+	opMount := models.MountSpec{Type: models.MountTypeS3, Source: opVol.Source, Target: "/shared"}
+	if _, ok := PlatformMountFromRecord(b, "", opVol, opAtt, opMount); !ok {
+		t.Fatal("an operator's volume, from its own record")
+	}
+	// A record from before the source was kept: the location this node
+	// builds for it.
+	legacy := vol
+	legacy.Source = ""
+	here := "vols-new/p2/" + tenant + "/data"
+	legacyAtt := att
+	legacyAtt.Source = here
+	if _, ok := PlatformMountFromRecord(b, tenant, legacy, legacyAtt, models.MountSpec{Type: models.MountTypeS3, Source: here, Target: "/data"}); !ok {
+		t.Fatal("a record with no source")
+	}
+	with := func(f func(v *models.Volume, a *models.VolumeAttachment, m *models.MountSpec), tenant string) bool {
+		v, a, mm := vol, att, m
+		f(&v, &a, &mm)
+		_, ok := PlatformMountFromRecord(b, tenant, v, a, mm)
+		return ok
+	}
+	for name, f := range map[string]func(v *models.Volume, a *models.VolumeAttachment, m *models.MountSpec){
+		"another volume's attachment":     func(_ *models.Volume, a *models.VolumeAttachment, _ *models.MountSpec) { a.VolumeID = "v9" },
+		"an attachment at another target": func(_ *models.Volume, a *models.VolumeAttachment, _ *models.MountSpec) { a.Target = "/other" },
+		"an attachment at another source": func(_ *models.Volume, a *models.VolumeAttachment, _ *models.MountSpec) {
+			a.Source = "x/" + tenant + "/data"
+		},
+		"another tenant's volume": func(v *models.Volume, a *models.VolumeAttachment, _ *models.MountSpec) {
+			v.Tenant, a.Tenant = "t-0000000000000000", "t-0000000000000000"
+		},
+		"a source not ending in its tenant": func(v *models.Volume, a *models.VolumeAttachment, m *models.MountSpec) {
+			v.Source, a.Source, m.Source = "b/x/data", "b/x/data", "b/x/data"
+		},
+		"a source not ending in its name": func(v *models.Volume, a *models.VolumeAttachment, m *models.MountSpec) {
+			src := "b/" + tenant + "/other"
+			v.Source, a.Source, m.Source = src, src, src
+		},
+		"a mount the record does not name": func(_ *models.Volume, _ *models.VolumeAttachment, m *models.MountSpec) {
+			m.Source = "vols-new/p2/" + tenant + "/data"
+		},
+		"another backend":         func(v *models.Volume, _ *models.VolumeAttachment, _ *models.MountSpec) { v.Backend = BackendNFS },
+		"a mount of another type": func(_ *models.Volume, _ *models.VolumeAttachment, m *models.MountSpec) { m.Type = models.MountTypeNFS },
+		"a source that is not clean": func(v *models.Volume, a *models.VolumeAttachment, m *models.MountSpec) {
+			src := "b/../" + tenant + "/data"
+			v.Source, a.Source, m.Source = src, src, src
+		},
+	} {
+		if with(f, tenant) {
+			t.Errorf("%s: taken", name)
+		}
+	}
+	if with(func(*models.Volume, *models.VolumeAttachment, *models.MountSpec) {}, "") {
+		t.Error("a team's volume taken for an operator's sandbox")
+	}
+	if _, ok := PlatformMountFromRecord(Backend{Kind: BackendS3}, tenant, legacy, legacyAtt, models.MountSpec{Type: models.MountTypeS3, Source: here, Target: "/data"}); ok {
+		t.Error("a record with no source, on a node with no bucket")
 	}
 }

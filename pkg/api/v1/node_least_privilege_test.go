@@ -138,6 +138,12 @@ func (f *forwardRecorder) ForwardToServer(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusTeapot)
 }
 
+// ForwardToServerOnce records a call sent with no retry on a 5xx.
+func (f *forwardRecorder) ForwardToServerOnce(w http.ResponseWriter, r *http.Request) {
+	f.sent = append(f.sent, "once "+r.Method+" "+r.URL.Path)
+	w.WriteHeader(http.StatusTeapot)
+}
+
 // The operator calls and settings writes a worker or gateway takes go on to
 // a server with the caller's own credential; the same calls about this
 // node, and every call on a server or mixed node, stay where they are.

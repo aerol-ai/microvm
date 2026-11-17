@@ -91,6 +91,48 @@ func PlatformMountFor(b Backend, tenant string, m models.MountSpec) (models.Moun
 	return out, true
 }
 
+// PlatformMountFromRecord reports whether m is the mount of platform volume
+// vol, attached to the sandbox being rebuilt at att, for a sandbox whose
+// tenant scope is tenant ("" for an operator's sandbox, which takes the
+// volume's own operator scope). The source is the one the volume's record
+// froze at creation (vol.Source), so a volume made before the operator
+// changed the bucket, prefix or export keeps its location, as on delete and
+// reclaim; a record from before that field has the location b builds for
+// it. The source must end in the record's own tenant and name. It returns
+// the mount as b builds it for that source (b's options and credentials,
+// m's target and read-only flag).
+func PlatformMountFromRecord(b Backend, tenant string, vol models.Volume, att models.VolumeAttachment, m models.MountSpec) (models.MountSpec, bool) {
+	if att.VolumeID != vol.ID || att.Tenant != vol.Tenant || att.Source != m.Source || att.Target != m.Target {
+		return models.MountSpec{}, false
+	}
+	if tenant != "" && vol.Tenant != tenant || tenant == "" && ValidateOperatorScope(vol.Tenant) != nil {
+		return models.MountSpec{}, false
+	}
+	// The node mounts with its own backend, which must be the volume's.
+	if vol.Backend != b.Kind || string(m.Type) != vol.Backend {
+		return models.MountSpec{}, false
+	}
+	src := vol.Source
+	if src == "" {
+		var err error
+		if src, err = MountSource(b, vol.Tenant, vol.Name); err != nil {
+			return models.MountSpec{}, false
+		}
+	}
+	if src != m.Source {
+		return models.MountSpec{}, false
+	}
+	segs, ok := platformSourceSegments(m)
+	if !ok || len(segs) < 2 || segs[len(segs)-2] != vol.Tenant || segs[len(segs)-1] != vol.Name {
+		return models.MountSpec{}, false
+	}
+	out, err := BuildMountSpecForSource(b, src, m.Target, m.ReadOnly)
+	if err != nil {
+		return models.MountSpec{}, false
+	}
+	return out, true
+}
+
 // platformSourceSegments splits a platform mount's source into its path
 // segments: "bucket/prefix/tenant/name" for s3, the path after
 // "server:/" for nfs. ok is false for any other type or form, a scheme

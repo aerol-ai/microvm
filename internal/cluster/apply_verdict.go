@@ -149,6 +149,9 @@ func forwardApplyStatus(status int, message string) error {
 		if strings.Contains(message, PeerNotInMembershipMessage) {
 			return fmt.Errorf("%w: leader-forward apply: %s", ErrMembershipPending, message)
 		}
+		if strings.Contains(message, ErrPeerProposalRefused.Error()) {
+			return fmt.Errorf("%w: %s", ErrPeerProposalRefused, message)
+		}
 	case http.StatusServiceUnavailable:
 		switch {
 		case strings.Contains(message, ErrCapacityExceeded.Error()):

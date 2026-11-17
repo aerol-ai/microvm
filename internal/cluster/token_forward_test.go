@@ -254,3 +254,71 @@ func TestForwardToServerRefusals(t *testing.T) {
 		}
 	}
 }
+
+// A call not safe to run twice (a create with no Idempotency-Key) goes to
+// the next server only when the first never got it: a 5xx, or a server
+// that took the call and gave no answer, is the caller's answer.
+func TestForwardToServerOnce(t *testing.T) {
+	ca, base := tokenForwardCA(t)
+	var mu sync.Mutex
+	var hits []string
+	answer := func(node string, code int) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			mu.Lock()
+			hits = append(hits, node)
+			mu.Unlock()
+			if code == 0 {
+				// Took the call, then dropped the connection.
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+				return
+			}
+			w.WriteHeader(code)
+		})
+	}
+	closed := tokenForwardServer(t, ca, "srv-gone", JoinRoleServer, nil)
+	closed.Close()
+	agentWith := func(members ...Member) *Agent {
+		index := newGossipMemberIndex()
+		for _, m := range members {
+			m.Alive, m.Role = true, config.NodeRoleServer
+			index.upsert(m)
+		}
+		return &Agent{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), nodeID: "wkr-1", internalClient: base,
+			gossip: &gossipNode{memberIndex: index}}
+	}
+	server := func(node string, code int) Member {
+		return Member{NodeID: node, InternalURL: tokenForwardServer(t, ca, node, JoinRoleServer, answer(node, code)).URL}
+	}
+	for _, tc := range []struct {
+		name     string
+		members  []Member
+		want     int
+		wantHits []string
+	}{
+		// The agent tries servers in a random order: each case holds either way.
+		{"a 503 is the answer", []Member{server("srv-a", 503), server("srv-b", 503)}, 503, []string{"one"}},
+		{"an unreachable server, then one that answers", []Member{{NodeID: "srv-gone", InternalURL: closed.URL}, server("srv-b", 201)}, 201, []string{"srv-b"}},
+		{"a server that took it and gave no answer", []Member{server("srv-a", 0), server("srv-b", 0)}, http.StatusBadGateway, []string{"one"}},
+	} {
+		mu.Lock()
+		hits = nil
+		mu.Unlock()
+		req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine"}`))
+		rr := httptest.NewRecorder()
+		agentWith(tc.members...).ForwardToServerOnce(rr, req)
+		mu.Lock()
+		got := strings.Join(hits, ",")
+		mu.Unlock()
+		want := strings.Join(tc.wantHits, ",")
+		if want == "one" && len(hits) == 1 {
+			want = got
+		}
+		if rr.Code != tc.want || got != want {
+			t.Errorf("%s: %d after %q, want %d after %v", tc.name, rr.Code, got, tc.want, tc.wantHits)
+		}
+	}
+}

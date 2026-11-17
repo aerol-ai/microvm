@@ -46,26 +46,6 @@ func customDomainProofToken(ctx context.Context, sandboxOwner string) string {
 	return customDomainOwnerToken(sandboxOwner)
 }
 
-// ProveCustomDomain is the Raft leader's check of a custom hostname a
-// worker or gateway adds to a sandbox it owns (cluster.CustomDomainProver):
-// the TXT record bound to the sandbox's owner, or the operator's owner-less
-// record, either of which the owner itself accepts from its callers.
-func (s *Service) ProveCustomDomain(ctx context.Context, hostname, ownerRef string) error {
-	resolver := s.dnsResolver
-	if resolver == nil {
-		resolver = &DefaultDNSResolver{}
-	}
-	prefix, valuePrefix := s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix
-	err := verifyCustomDomainOwnership(ctx, resolver, hostname, prefix, valuePrefix, customDomainOwnerToken(ownerRef))
-	if err == nil || strings.TrimSpace(ownerRef) == "" {
-		return err
-	}
-	if verifyCustomDomainOwnership(ctx, resolver, hostname, prefix, valuePrefix, "") == nil {
-		return nil
-	}
-	return err
-}
-
 // DNSResolver is an interface to allow mocking of net.Resolver in tests.
 type DNSResolver interface {
 	LookupTXT(ctx context.Context, name string) ([]string, error)
@@ -99,6 +79,10 @@ func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, host
 		if isDNSNotFound(err) {
 			return fmt.Errorf("%w: TXT record not found at %s", models.ErrCustomDomainVerificationFailed, verifyDomain)
 		}
+		if dnsLookupMayPass(ctx, err) {
+			// No answer is not a "no": the caller tries again (503).
+			return fmt.Errorf("%w: TXT lookup at %s: %v", models.ErrCustomDomainProofUnavailable, verifyDomain, err)
+		}
 		return fmt.Errorf("%w: failed to lookup TXT record at %s: %v", models.ErrCustomDomainVerificationFailed, verifyDomain, err)
 	}
 
@@ -109,6 +93,17 @@ func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, host
 	}
 
 	return fmt.Errorf("%w: found TXT records but none matched %q at %s", models.ErrCustomDomainVerificationFailed, expectedValue, verifyDomain)
+}
+
+// dnsLookupMayPass reports whether a failed lookup is one a retry can
+// answer: it ran out of time (the lookup's or the call's), or the resolver
+// says the failure is temporary.
+func dnsLookupMayPass(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && (dnsErr.IsTimeout || dnsErr.IsTemporary)
 }
 
 func isDNSNotFound(err error) bool {

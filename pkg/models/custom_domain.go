@@ -92,6 +92,10 @@ var (
 	ErrCustomDomainPerSandboxCap = fmt.Errorf("at most %d custom domains per sandbox", MaxCustomDomainsPerSandbox)
 	// ErrCustomDomainVerificationFailed is returned when the DNS TXT record check fails.
 	ErrCustomDomainVerificationFailed = errors.New("custom domain TXT record verification failed")
+	// ErrCustomDomainProofUnavailable is a TXT lookup that got no answer in
+	// time, or a temporary resolver failure: not a refusal, so a 503 the
+	// caller retries.
+	ErrCustomDomainProofUnavailable = errors.New("custom domain TXT record could not be checked right now")
 	// ErrCustomDomainInvalidTargetPort is returned when AddCustomDomainRequest
 	// carries a target_port outside [0, 65535]. Zero is the toolbox-default
 	// sentinel; anything else must be a real TCP port number. Surfaced as 400.

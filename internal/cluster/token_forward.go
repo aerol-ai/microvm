@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
+	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
@@ -56,8 +58,9 @@ func ServerClientForPeer(base *http.Client, nodeID string) *http.Client {
 	return &http.Client{Transport: cloned, CheckRedirect: client.CheckRedirect, Jar: client.Jar, Timeout: client.Timeout}
 }
 
-// maxTokenForwardBody bounds the token write a worker holds to resend: a
-// create or revoke body is a few hundred bytes.
+// maxTokenForwardBody bounds the call a worker holds to resend: the API's
+// own body cap (apihttp.MaxJSONBodyBytes). A token write is a few hundred
+// bytes; a sandbox create with custom domains is the largest call sent.
 const maxTokenForwardBody = 1 << 20
 
 // ForwardToServer reverse-proxies r, a caller's token write with the
@@ -70,6 +73,18 @@ const maxTokenForwardBody = 1 << 20
 // asking the others would only repeat that). A create retried after a 5xx
 // whose write did land meets name_taken (409) on the next server.
 func (a *Agent) ForwardToServer(w http.ResponseWriter, r *http.Request) {
+	a.forwardToServer(w, r, true)
+}
+
+// ForwardToServerOnce is ForwardToServer for a call that is not safe to run
+// twice: a sandbox create with no Idempotency-Key. Only a server that could
+// not be reached at all hands it to the next one; any answer, a 5xx
+// included, is the caller's, since the create may have landed.
+func (a *Agent) ForwardToServerOnce(w http.ResponseWriter, r *http.Request) {
+	a.forwardToServer(w, r, false)
+}
+
+func (a *Agent) forwardToServer(w http.ResponseWriter, r *http.Request, retry5xx bool) {
 	if a == nil {
 		http.Error(w, ErrNoServerForward.Error(), http.StatusServiceUnavailable)
 		return
@@ -102,17 +117,29 @@ func (a *Agent) ForwardToServer(w http.ResponseWriter, r *http.Request) {
 		}
 		failed, node := false, m.NodeID
 		proxy.ModifyResponse = func(resp *http.Response) error {
-			if resp.StatusCode >= http.StatusInternalServerError {
+			if retry5xx && resp.StatusCode >= http.StatusInternalServerError {
 				return fmt.Errorf("server %s answered %d", node, resp.StatusCode)
 			}
 			return nil
 		}
 		// Nothing is written to w on a failed try: ModifyResponse runs
 		// before the proxy copies a response, so the next server may answer.
-		proxy.ErrorHandler = func(_ http.ResponseWriter, _ *http.Request, err error) { failed, lastErr = true, err }
+		// A call not safe to run twice moves on only if this server never
+		// got it (it was not written: no connection, or no TLS handshake).
+		var sent atomic.Bool
+		proxy.ErrorHandler = func(ew http.ResponseWriter, _ *http.Request, err error) {
+			if !retry5xx && sent.Load() {
+				auditlog.MarkForwardFailed(r.Context())
+				http.Error(ew, fmt.Sprintf("cluster: server %s took the call and gave no answer, so it may have run: %v", node, err), http.StatusBadGateway)
+				return
+			}
+			failed, lastErr = true, err
+		}
 		r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
 		tried++
-		proxy.ServeHTTP(w, r)
+		proxy.ServeHTTP(w, r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) { sent.Store(true) },
+		})))
 		if !failed {
 			return
 		}

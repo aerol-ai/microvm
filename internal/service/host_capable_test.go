@@ -107,6 +107,15 @@ func TestHostCapableGates(t *testing.T) {
 				t.Errorf("custom domain on create without DNS proof: err = %v, host %v", err, tc.host)
 			}
 
+			// Gate 3, on a cluster server: the server that binds a create's
+			// custom domains skips the proof for the same callers
+			// (custom_domain_bind.go BindCreateCustomDomains).
+			bsvc, bc := bindServer(t)
+			_, err = bsvc.BindCreateCustomDomains(tc.ctx, "sb-new", "inc-new", []string{"none.customer.com"})
+			if tc.host != (err == nil) || (!tc.host && !errors.Is(err, models.ErrCustomDomainVerificationFailed)) || tc.host != (len(bc.bound) == 1) {
+				t.Errorf("custom domain bound on create without DNS proof: err = %v, bound %v, host %v", err, bc.bound, tc.host)
+			}
+
 			// Gate 4: the owner-less legacy TXT record on attach
 			// (dns_verify.go customDomainProofToken).
 			want := customDomainOwnerToken("team:payments")

@@ -942,6 +942,18 @@ func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
 }
 
+// AddCustomDomainForIncarnation binds hostname to sandboxID's placement at
+// incarnationID. A server's bind for a caller uses it (service
+// BindCustomDomain): the incarnation comes from the placement the server
+// read, or from the reservation a create just wrote, which this node's FSM
+// copy may not show yet.
+func (c *Cluster) AddCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
+	if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" || strings.TrimSpace(hostname) == "" {
+		return fmt.Errorf("%w: a custom domain bind names the sandbox, its incarnation and the hostname", ErrIncarnationConflict)
+	}
+	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
+}
+
 func (c *Cluster) addCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
 	hostname = strings.ToLower(strings.TrimSpace(hostname))
 	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
@@ -1680,11 +1692,6 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	}
 	if payload, cmd, err = c.stampProposal(payload, cmd, sender, role == JoinRoleServer); err != nil {
 		return err
-	}
-	if cmd.Op == opAddCustomDomain && role != JoinRoleServer {
-		if err := c.proveCustomDomain(ctx, cmd); err != nil {
-			return err
-		}
 	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)

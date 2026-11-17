@@ -144,6 +144,18 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// can read it.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" {
+		r = h.asEdge(r)
+	}
+	if h.createGoesToServer(r, req) {
+		// A server binds a create's custom hostnames, after the caller's
+		// DNS proof (service custom_domain_bind.go). A create with an
+		// Idempotency-Key replays on a retry; one without may not run
+		// twice, so a server's 5xx is the answer.
+		keyed := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) != ""
+		h.sendToServerWith(w, r, "a create with custom domains", !keyed)
+		return
+	}
 	r = withIdempotencyKey(r)
 	// A create forwarded by the node that placed it carries the digests that
 	// node took of the client's request; its body here already has the
@@ -191,10 +203,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		MetricPrefix:       "v1.create",
 		OnForwardStale:     cluster.RecordOwnerForwardStale,
 		Logger:             h.deps.Logger,
+		AfterReserve:       h.bindCreateCustomDomains(req),
 	})
 	if !ok {
 		return
 	}
+	r = decision.Request(r)
 	// The router's steps before create;dur (cluster_place, cluster_reserve)
 	// go on the recorder createSandboxOnSelectedNode picks up, so the
 	// response's Server-Timing covers them (plan PR #1000 item L1).

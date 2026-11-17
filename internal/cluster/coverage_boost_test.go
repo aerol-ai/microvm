@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,13 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	defer cleanupFollower()
 	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
 
+	// The stand-in records the sending peer, as both apply listeners do
+	// after their peer checks. Without it the leader refuses the apply (a
+	// raw apply with no peer is an unknown role), the follower reads the
+	// 503 as "not the leader" and retries, and the test passes only once
+	// gossip replaces this URL with the leader's real one: it then tests
+	// nothing here, and waits on the real listener's timing.
+	var served atomic.Int32
 	internalSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != InternalAPIPath {
 			http.NotFound(w, r)
@@ -52,10 +60,11 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := leader.ApplyEncoded(r.Context(), body); err != nil {
+		if err := leader.ApplyEncoded(ContextWithApplyPeer(r.Context(), follower.nodeID, nil), body); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
+		served.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer internalSrv.Close()
@@ -81,6 +90,9 @@ func TestFollowerForwardApplyInternalChannel(t *testing.T) {
 	forwardApplyEventually(t, follower, payload)
 	if _, err := leader.OwnerOf("sb-int-fwd"); err != nil {
 		t.Fatalf("leader OwnerOf after internal forward: %v", err)
+	}
+	if served.Load() == 0 {
+		t.Fatal("the forward was not applied through the internal channel under test")
 	}
 }
 

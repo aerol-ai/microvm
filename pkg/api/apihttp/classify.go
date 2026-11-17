@@ -39,6 +39,11 @@ const (
 	imagePullRetryAfterSeconds = 30
 )
 
+// customDomainProofRetryAfterSeconds is the Retry-After for a custom
+// domain's TXT lookup that got no answer: a resolver timeout or a
+// temporary failure usually clears within seconds.
+const customDomainProofRetryAfterSeconds = 5
+
 // imagePullRetryAfter is the Retry-After for an image-pull 503: the wait
 // the error carries (models.ImagePullUnavailableError, docker's backoff
 // refusal), rounded up to whole seconds, else the default backoff.
@@ -367,6 +372,8 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
 	case errors.Is(err, models.ErrCustomDomainVerificationFailed):
 		return Classification{Status: http.StatusForbidden, Message: err.Error()}
+	case errors.Is(err, models.ErrCustomDomainProofUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: customDomainProofRetryAfterSeconds, Message: err.Error()}
 	case errors.Is(err, models.ErrMountOperatorOnly):
 		return Classification{Status: http.StatusForbidden, Message: err.Error()}
 

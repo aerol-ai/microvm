@@ -115,10 +115,6 @@ func (f fakeProposalState) reclaimAdoptable(cur VolumeReclaim, _ string) bool {
 	return f.adoptable[cur.key()]
 }
 
-func (f fakeProposalState) clusterHostname(host string) bool {
-	return models.ReservedCustomDomain(host, "sb.example.com", "api.example.com:443")
-}
-
 func (f fakeProposalState) placementForProposal(id string, _ bool) (Placement, bool) {
 	p, ok := f.placements[id]
 	return p, ok
@@ -173,7 +169,7 @@ func TestPeerMayPropose(t *testing.T) {
 			"sb-res-target":  reserved("sb-res-target", "wkr-1", "srv-1"),
 			"sb-res-theirs":  reserved("sb-res-theirs", "wkr-2", "wkr-3"),
 			"sb-res-legacy":  reserved("sb-res-legacy", "wkr-2", ""),
-			"sb-mine":        {SandboxID: "sb-mine", OwnerNodeID: "wkr-1"},
+			"sb-mine":        {SandboxID: "sb-mine", OwnerNodeID: "wkr-1", CustomHostnames: []string{"bound.customer.com"}},
 			"sb-theirs":      {SandboxID: "sb-theirs", OwnerNodeID: "wkr-2"},
 			"sb-my-orphan":   {SandboxID: "sb-my-orphan", OwnerNodeID: "wkr-1", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-1"},
 			"sb-their-orph":  {SandboxID: "sb-their-orph", OwnerState: PlacementOwnerStateOrphaned, OrphanedOwnerNodeID: "wkr-2"},
@@ -211,11 +207,12 @@ func TestPeerMayPropose(t *testing.T) {
 		{"port on another node's", command{Op: opAddExposedPort, SandboxID: "sb-theirs"}, false},
 		{"port removal on another node's", command{Op: opRemoveExposedPort, SandboxID: "sb-theirs"}, false},
 		{"domain on another node's", command{Op: opAddCustomDomain, SandboxID: "sb-theirs"}, false},
-		{"customer domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "app.customer.com"}, true},
+		{"a name its sandbox holds, again", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "bound.customer.com"}, true},
+		{"a new customer domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "app.customer.com"}, false},
 		{"the base domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "sb.example.com"}, false},
 		{"a name under the base domain on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "sb-other.sb.example.com"}, false},
 		{"the API host on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "api.example.com"}, false},
-		{"a name not in canonical form on its own", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "App.Customer.com"}, false},
+		{"a held name not in canonical form", command{Op: opAddCustomDomain, SandboxID: "sb-mine", Hostname: "Bound.Customer.com"}, false},
 		{"domain removal on its own", command{Op: opRemoveCustomDomain, SandboxID: "sb-mine", Hostname: "api.example.com"}, true},
 		{"domain removal on another node's", command{Op: opRemoveCustomDomain, SandboxID: "sb-theirs"}, false},
 		{"delete fenced on itself", fenced(opDelete, "wkr-1"), true},

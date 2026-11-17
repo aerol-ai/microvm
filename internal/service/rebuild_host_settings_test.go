@@ -88,7 +88,7 @@ func TestRebuildSpecWithoutHostPowers(t *testing.T) {
 		{name: "the owner's name in another bucket", owner: owner, refused: "mounts", spec: models.CreateSandboxRequest{Image: "alpine",
 			Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "other-bucket/pfx/" + tenant + "/data", Target: "/d"}}}},
 		{name: "a raw mount", owner: owner, refused: "mounts", spec: models.CreateSandboxRequest{Image: "alpine",
-			Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://host-role-bucket", Target: "/d"}}}},
+			Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://other-bucket", Target: "/d"}}}},
 		{name: "a wasm module staged on the host", owner: owner, refused: "module_ref", spec: models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "staged.wasm"}},
 		{name: "a wasm module from a file", owner: owner, refused: "module_ref", spec: models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "file:///etc/x.wasm"}},
 		{name: "a wasm keyword", owner: owner, spec: models.CreateSandboxRequest{Runtime: models.RuntimeWasm, ModuleRef: "python"}},
@@ -157,7 +157,7 @@ func TestRecreateRefusesHostOnlySettings(t *testing.T) {
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 	spec := models.CreateSandboxRequest{Image: "alpine:3.20", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
-		Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://host-role-bucket", Target: "/loot"}}}
+		Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://other-bucket", Target: "/data"}}}
 	err := svc.RecreateSandbox(ctx, "sb-host", spec, cluster.PlacementSecrets{}, nil)
 	if !errors.Is(err, cluster.ErrHostOnlySpec) {
 		t.Fatalf("recreate = %v, want ErrHostOnlySpec", err)
@@ -222,35 +222,6 @@ func (r txtRecords) LookupTXT(_ context.Context, name string) ([]string, error) 
 	return nil, errors.New("no such host")
 }
 
-// The leader accepts a worker's custom hostname with the owner's TXT
-// record or the operator's, and nothing else.
-func TestProveCustomDomain(t *testing.T) {
-	svc := &Service{cfg: config.Config{CustomDomainVerifyPrefix: "_aerolvm", CustomDomainVerifyValuePrefix: "aerolvm="}}
-	owner := "team:payments"
-	svc.SetDNSResolver(txtRecords{
-		"_aerolvm.owned.customer.com":  {models.CustomDomainTXTValue("aerolvm=", customDomainOwnerToken(owner), "owned.customer.com")},
-		"_aerolvm.ops.customer.com":    {models.CustomDomainTXTValue("aerolvm=", "", "ops.customer.com")},
-		"_aerolvm.theirs.customer.com": {models.CustomDomainTXTValue("aerolvm=", customDomainOwnerToken("team:other"), "theirs.customer.com")},
-	})
-	ctx := context.Background()
-	for host, want := range map[string]bool{"owned.customer.com": true, "ops.customer.com": true, "theirs.customer.com": false, "none.customer.com": false} {
-		if err := svc.ProveCustomDomain(ctx, host, owner); (err == nil) != want {
-			t.Errorf("%s for %s: %v", host, owner, err)
-		}
-	}
-	// An operator's sandbox proves with the operator's record only.
-	if err := svc.ProveCustomDomain(ctx, "ops.customer.com", ""); err != nil {
-		t.Errorf("operator record for an operator sandbox: %v", err)
-	}
-	if err := svc.ProveCustomDomain(ctx, "owned.customer.com", ""); err == nil {
-		t.Error("a team's record proved an operator sandbox's hostname")
-	}
-	// No resolver set: the system one is used, and finds nothing here.
-	if err := (&Service{}).ProveCustomDomain(ctx, "none.invalid", owner); err == nil {
-		t.Error("no record, no resolver: proved")
-	}
-}
-
 // A failover recreate's create runs without host powers, and its custom
 // hostnames the cluster already binds to it need no new DNS proof.
 func TestRecreateRunsWithoutHostPowers(t *testing.T) {
@@ -270,5 +241,77 @@ func TestRecreateRunsWithoutHostPowers(t *testing.T) {
 	}
 	if err := svc.persistCustomDomainsOnCreate(rebuildContext(ctx), "sb-plain", []string{"app.customer.com"}); err != nil {
 		t.Fatalf("a rebuild's held hostname: %v", err)
+	}
+}
+
+// A platform volume rebuilds from its record: a volume made before the
+// operator changed the bucket mounts where it was made, and an operator's
+// volume rebuilds on a node with no operator token or pinned scope. A
+// mount no record of this sandbox's incarnation names falls back to this
+// node's configuration; a record that cannot be read is retried, not
+// refused.
+func TestRebuildPlatformMountsFromRecords(t *testing.T) {
+	const owner = "team:payments"
+	tenant := volumes.TenantForOwnerRef(owner)
+	old := "vols-old/p0/" + tenant + "/data"
+	vol := models.Volume{ID: "v1", Tenant: tenant, Name: "data", Backend: config.PlatformVolumesBackendS3, Source: old}
+	att := models.VolumeAttachment{Tenant: tenant, VolumeID: "v1", SandboxID: "sb-v", IncarnationID: "inc-v", Target: "/data", Source: old}
+	oldMount := models.MountSpec{Type: models.MountTypeS3, Source: old, Target: "/data"}
+	here := models.MountSpec{Type: models.MountTypeS3, Source: "vols/pfx/" + tenant + "/data", Target: "/data"}
+	rebuild := func(t *testing.T, ownerRef string, meta *scriptedVolumeMeta, mounts ...models.MountSpec) (models.CreateSandboxRequest, error) {
+		t.Helper()
+		svc := rebuildService(t, cluster.Placement{SandboxID: "sb-v", IncarnationID: "inc-v", OwnerRef: ownerRef})
+		svc.testVolumeMeta = meta
+		return svc.rebuildSpecWithoutHostPowers(context.Background(), "sb-v", models.CreateSandboxRequest{Image: "alpine", Mounts: mounts})
+	}
+	got, err := rebuild(t, owner, &scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{att}, byID: &vol}, oldMount)
+	if err != nil || got.Mounts[0].Source != old || got.Mounts[0].Options["region"] != "eu-west-1" {
+		t.Fatalf("a volume made before the bucket changed: %+v %v", got.Mounts, err)
+	}
+
+	opVol := models.Volume{ID: "v2", Tenant: "op-other", Name: "shared", Backend: config.PlatformVolumesBackendS3, Source: "vols/pfx/op-other/shared"}
+	opAtt := models.VolumeAttachment{Tenant: "op-other", VolumeID: "v2", SandboxID: "sb-v", Target: "/shared", Source: opVol.Source}
+	svc := rebuildService(t, cluster.Placement{SandboxID: "sb-v", IncarnationID: "inc-v"})
+	svc.cfg.OperatorVolumeScope, svc.cfg.PATToken = "", ""
+	svc.testVolumeMeta = &scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{opAtt}, byID: &opVol}
+	if _, err := svc.rebuildSpecWithoutHostPowers(context.Background(), "sb-v", models.CreateSandboxRequest{Image: "alpine",
+		Mounts: []models.MountSpec{{Type: models.MountTypeS3, Source: opVol.Source, Target: "/shared"}}}); err != nil {
+		t.Fatalf("an operator's volume on a node with no operator scope: %v", err)
+	}
+
+	otherInc := att
+	otherInc.IncarnationID = "inc-earlier"
+	for name, tc := range map[string]struct {
+		meta    *scriptedVolumeMeta
+		mount   models.MountSpec
+		refused bool
+	}{
+		"another incarnation's record, the old location": {&scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{otherInc}, byID: &vol}, oldMount, true},
+		"no record, this node's location":                {&scriptedVolumeMeta{}, here, false},
+		"no record, the old location":                    {&scriptedVolumeMeta{}, oldMount, true},
+		"the volume is gone":                             {&scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{att}, byIDErr: storepkg.ErrNotFound}, oldMount, true},
+	} {
+		_, err := rebuild(t, owner, tc.meta, tc.mount)
+		if tc.refused != errors.Is(err, cluster.ErrHostOnlySpec) || !tc.refused && err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// A record another team's sandbox holds is not this sandbox's.
+	if _, err := rebuild(t, "team:other", &scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{att}, byID: &vol}, oldMount); !errors.Is(err, cluster.ErrHostOnlySpec) {
+		t.Fatalf("another team's volume = %v", err)
+	}
+	for name, meta := range map[string]*scriptedVolumeMeta{
+		"attachments": {forSandboxErr: errors.New("control plane unreachable")},
+		"the volume":  {forSandbox: []models.VolumeAttachment{att}, byIDErr: errors.New("control plane unreachable")},
+	} {
+		if _, err := rebuild(t, owner, meta, oldMount); err == nil || errors.Is(err, cluster.ErrHostOnlySpec) {
+			t.Errorf("%s unreadable = %v, want a retryable error", name, err)
+		}
+	}
+	// A node with no platform volumes rebuilds none.
+	svc = rebuildService(t, cluster.Placement{SandboxID: "sb-v", IncarnationID: "inc-v", OwnerRef: owner})
+	svc.cfg.PlatformVolumes.Enabled = false
+	if _, err := svc.rebuildSpecWithoutHostPowers(context.Background(), "sb-v", models.CreateSandboxRequest{Image: "alpine", Mounts: []models.MountSpec{here}}); !errors.Is(err, cluster.ErrHostOnlySpec) {
+		t.Fatalf("platform volumes off = %v", err)
 	}
 }
