@@ -266,6 +266,7 @@ In this version, the server sets every new domain to `pending_dns` and does not 
 | `404 Not Found` | You tried to remove a domain that is not attached to this sandbox. |
 | `409 Conflict` | The domain is attached to another sandbox (each domain can be on only one sandbox), the sandbox is still private, the sandbox has a TCP or TLS port, it already has the most domains allowed (25 by default), or you added the same domain again with a different port. |
 | `412 Precondition Failed` | Custom domains are off on this server, or the server has no domain. |
+| `503 Service Unavailable` | The server's DNS lookup of the TXT record got no answer in time. Try again after the `Retry-After` seconds. |
 
 ## Good to know
 
@@ -277,7 +278,9 @@ Certificates for custom domains are issued on demand. The first HTTPS visit to a
 
 When you remove a domain, the server deletes its route and its record. The certificate ages out of storage at renewal time.
 
-**In a cluster,** every server knows which domain belongs to which sandbox. That list is shared through Raft (the system the cluster servers use to agree on shared data). Any server that accepts public traffic can take a request for a custom domain. If another server runs the sandbox, it passes the encrypted connection to that server unchanged, using the name the visitor asked for. A shared certificate store in S3 lets one server request each certificate instead of every server racing to do it. Turn it on before you enable custom domains on any cluster with more than one server. See [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md).
+**In a cluster,** a server checks the TXT record and adds the domain. A worker or ingress node passes the call to a server first, so it takes one extra hop. A create from an image only one node holds, such as a local build, cannot take `custom_domains` when another node runs it (`400`): create the sandbox, then add each domain.
+
+Every server knows which domain belongs to which sandbox. That list is shared through Raft (the system the cluster servers use to agree on shared data). Any server that accepts public traffic can take a request for a custom domain. If another server runs the sandbox, it passes the encrypted connection to that server unchanged, using the name the visitor asked for. A shared certificate store in S3 lets one server request each certificate instead of every server racing to do it. Turn it on before you enable custom domains on any cluster with more than one server. See [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md).
 
 ## Next steps
 
