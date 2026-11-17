@@ -429,3 +429,22 @@ func checkJoinsFromOperator(t *testing.T, p *corev1.Pod, role string) {
 		}
 	}
 }
+
+// Setup gets the agent's settings but not the secrets it never reads, which
+// it would write to the node's disk with the rest (sandboxd.env).
+func TestSetupEnvKeepsSecretsOut(t *testing.T) {
+	secret := &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "token"}}
+	got := setupEnv([]corev1.EnvVar{
+		{Name: "SB_AUDIT_EXPORT_BACKEND", Value: "webhook"},
+		{Name: "SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN", ValueFrom: secret},
+		{Name: "SB_CELL_ID_KEY", ValueFrom: secret},
+		{Name: "POD_IP", Value: "stale"},
+	})
+	var names []string
+	for _, e := range got {
+		names = append(names, e.Name)
+	}
+	if strings.Join(names, ",") != "POD_IP,SB_AUDIT_EXPORT_BACKEND" || got[0].ValueFrom == nil {
+		t.Fatalf("setup env = %v", names)
+	}
+}

@@ -161,8 +161,12 @@ func wire(mgr ctrl.Manager, o options, scheme *runtime.Scheme) error {
 		return err
 	}
 	rec := mgr.GetEventRecorderFor("aerolvm-operator")
+	forward, err := controller.NewPortForwarder(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
 	if err := (&controller.ClusterReconciler{Client: mgr.GetClient(), Scheme: scheme, Recorder: rec, WorkerNamespace: o.workerNamespace,
-		Templates: o.templates, Reader: mgr.GetAPIReader()}).SetupWithManager(mgr); err != nil {
+		Templates: o.templates, Reader: mgr.GetAPIReader(), Forward: forward}).SetupWithManager(mgr); err != nil {
 		return err
 	}
 	if err := (&controller.NodeReconciler{

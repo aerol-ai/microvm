@@ -143,11 +143,11 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(r.Delete(ctx, &n))
 	}
-	token, err := adminToken(ctx, r.Client, &c)
+	cred, err := apiCredentials(ctx, r.Client, &c, r.now())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	api := r.API(apiURL(&c), token)
+	api := r.API(apiURL(&c), cred)
 	before := n.Status.DeepCopy()
 	defer func() {
 		if err == nil && !statusEqual(before, &n.Status) {

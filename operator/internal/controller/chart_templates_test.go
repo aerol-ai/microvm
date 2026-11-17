@@ -289,3 +289,77 @@ func propagation(m corev1.VolumeMount) corev1.MountPropagationMode {
 	}
 	return *m.MountPropagation
 }
+
+// Enterprise mode's render (issue #1349): the operator reads the server
+// template as host-scoped, so it makes its own API token, and each stamped
+// pod keeps the chart's settings, its service account and the socket
+// folder. Setup writes every SB_ setting to the node's disk, except the
+// audit collector's bearer token, which stays a Secret reference in the
+// agent alone. CI renders it into AEROLVM_POD_TEMPLATES_ENTERPRISE (with a
+// webhook export); without it the test skips.
+func TestRenderedEnterpriseTemplates(t *testing.T) {
+	path := os.Getenv("AEROLVM_POD_TEMPLATES_ENTERPRISE")
+	if path == "" {
+		t.Skip("AEROLVM_POD_TEMPLATES_ENTERPRISE not set: no rendered chart to check")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := yaml.Unmarshal(raw, &cm); err != nil {
+		t.Fatal(err)
+	}
+	c := testCluster()
+	for _, role := range []string{TemplateServer, TemplateGateway, TemplateWorker} {
+		tm, err := ParsePodTemplate(cm.Data[role])
+		if err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if !hostScopedServers(tm) {
+			t.Errorf("%s: the operator does not read the template as host-scoped", role)
+		}
+		in := StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-"+role+"-0", role, "general", "z-a"), Namespace: testNS, Version: "v0.7.2", PVC: "data-x"}
+		if role == TemplateWorker {
+			in.Pool = &c.Spec.WorkerPools[0]
+		}
+		pod, err := Stamp(tm, in)
+		if err != nil {
+			t.Fatalf("%s stamp: %v", role, err)
+		}
+		if pod.Spec.ServiceAccountName != "t-node" {
+			t.Errorf("%s: service account %q", role, pod.Spec.ServiceAccountName)
+		}
+		agent := pod.Spec.Containers[containerIndex(pod.Spec.Containers, AgentContainer)]
+		var setup corev1.Container
+		for _, ic := range pod.Spec.InitContainers {
+			if ic.Name == SetupContainer {
+				setup = ic
+			}
+		}
+		for _, name := range []string{"SB_PAT_SCOPE", "SB_PUBLIC_API_SOCKET", "SB_AUDIT_WITNESS_S3_BUCKET", "SB_AUDIT_EXPORT_BACKEND", "SB_SECRET_AUDIT_EXPORT_URL"} {
+			if envValue(agent.Env, name) == "" || envValue(setup.Env, name) != envValue(agent.Env, name) {
+				t.Errorf("%s: %s = %q in the agent, %q in setup", role, name, envValue(agent.Env, name), envValue(setup.Env, name))
+			}
+		}
+		bearer := false
+		for _, e := range agent.Env {
+			bearer = bearer || (e.Name == "SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN" && e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil)
+		}
+		for _, e := range setup.Env {
+			if e.Name == "SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN" {
+				t.Errorf("%s: setup gets the collector's bearer token, and would write it to disk", role)
+			}
+		}
+		if !bearer {
+			t.Errorf("%s: the agent lacks the bearer token's Secret reference", role)
+		}
+		socket := false
+		for _, m := range agent.VolumeMounts {
+			socket = socket || (m.Name == "public-api" && m.MountPath == "/run/sandboxd-public")
+		}
+		if !socket {
+			t.Errorf("%s: the agent has no public socket folder", role)
+		}
+	}
+}

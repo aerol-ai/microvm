@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"os"
@@ -486,5 +487,43 @@ func TestAuditFileGenerationAndLargeBatchDrain(t *testing.T) {
 	}
 	if err := svc.drainSecretAuditExport(context.Background()); !errors.Is(err, failing.err) {
 		t.Fatalf("drain error = %v", err)
+	}
+}
+
+// A cluster node ships under its own id even before boot attaches the
+// cluster (a restart's backlog), never the single-node stand-in's
+// "standalone"; a single server keeps "standalone" whatever SB_NODE_ID says.
+func TestSecretAuditExportNodeIDBeforeTheClusterIsAttached(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  config.Config
+		want string
+	}{
+		{"cluster node before attach", config.Config{EnableCluster: true, NodeID: " aerolvm-server-0 "}, "aerolvm-server-0"},
+		{"cluster node without an id", config.Config{EnableCluster: true}, "standalone"},
+		{"single server with an id", config.Config{NodeID: "web-1"}, "standalone"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.DBPath = filepath.Join(t.TempDir(), "state.db")
+			svc := &Service{cfg: tc.cfg, cluster: cluster.NewNoop("standalone", "", "")}
+			t.Cleanup(svc.CloseSecretAuditSink)
+			if err := svc.secretAuditSink().(*fileAuditSink).EmitDurable(SecretAuditEvent{EventID: "e-1", SandboxID: "sb", Result: secretAuditResultSuccess}); err != nil {
+				t.Fatal(err)
+			}
+			exporter := &maliciousOffsetExporter{}
+			setAuditExporter(svc, exporter)
+			if err := svc.exportSecretAuditBatch(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(exporter.batches) != 1 || exporter.batches[0].NodeID != tc.want {
+				t.Fatalf("batches = %+v, want node %q", exporter.batches, tc.want)
+			}
+		})
+	}
+	if got := (&Service{cfg: config.Config{EnableCluster: true, NodeID: "n1"}}).auditExportNodeID(); got != "n1" {
+		t.Fatalf("no cluster client at all: %q", got)
+	}
+	if got := (&Service{}).auditExportNodeID(); got != "" {
+		t.Fatalf("no cluster, no id: %q", got)
 	}
 }

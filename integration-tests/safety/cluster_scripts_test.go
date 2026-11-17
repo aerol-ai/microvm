@@ -143,3 +143,76 @@ func TestClusterJoinNewFormIsSandboxdJoin(t *testing.T) {
 		t.Fatalf("old form gave no notice:\n%s", out)
 	}
 }
+
+// sandboxd-node-lifecycle.sh sends the admin token to this node: to the
+// admin token's own listener when the node has one (SB_PAT_LOCAL_LISTEN
+// under SB_PAT_SCOPE=host; its API port then refuses the admin token), else
+// the API port, as sandboxd's LocalAdminURL does (round-2 review, item 1).
+func TestNodeLifecycleUsesTheAdminListener(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	for _, tc := range []struct{ env, want string }{
+		{"", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_API_PORT=9000\n", "http://127.0.0.1:9000/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=127.0.0.1:21219\n", "http://127.0.0.1:21219/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=any\nSB_PAT_LOCAL_LISTEN=127.0.0.1:21219\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=[::1]:21219\n", "http://[::1]:21219/v1/cluster/nodes/n1/uncordon"},
+		// Only a loopback literal (round 3): anything else would send the
+		// admin token off the machine; the API port on loopback instead.
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=collector.example:80\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=10.0.0.5:21219\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=127.0.0.1:0\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=127.0.0.1:99999\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		// The API port as sandboxd reads it, 1-65535, else 21212 (round 4).
+		{"SB_API_PORT=21212@collector.example\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_API_PORT=0\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+		{"SB_API_PORT=65536\n", "http://127.0.0.1:21212/v1/cluster/nodes/n1/uncordon"},
+	} {
+		dir := t.TempDir()
+		envFile := filepath.Join(dir, "sandboxd.env")
+		if err := os.WriteFile(envFile, []byte("SB_PAT_TOKEN=pat\nSB_NODE_ID=n1\n"+tc.env), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		curl := "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > " + filepath.Join(dir, "curl.txt") + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "curl"), []byte(curl), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", clusterScript(t, "sandboxd-node-lifecycle.sh"), "uncordon", "--env-file", envFile)
+		cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%q: %v\n%s", tc.env, err, out)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "curl.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if args := string(raw); !strings.Contains(args, tc.want+"\n") || !strings.Contains(args, "Authorization: Bearer pat") {
+			t.Errorf("%q: curl %q, want %s", tc.env, args, tc.want)
+		}
+	}
+}
+
+// cluster-join.sh's diagnostics take the admin listener by the same
+// loopback rule as sandboxd-node-lifecycle.sh (and sandboxd's
+// LocalAdminURL): the same pattern, in both.
+func TestNodeScriptsShareTheAdminListenerRule(t *testing.T) {
+	const rule = `[[ "$listen" =~ ^(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$ ]] && (( BASH_REMATCH[2] <= 65535 ))`
+	// And the API port to sandboxd's reading of it (round 4).
+	ports := map[string]string{
+		"sandboxd-node-lifecycle.sh": `[[ "$api_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( api_port <= 65535 )) || api_port=21212`,
+		"cluster-join.sh":            `[[ "$SB_API_PORT_DEFAULT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SB_API_PORT_DEFAULT <= 65535 )) || SB_API_PORT_DEFAULT=21212`,
+	}
+	for _, s := range []string{"sandboxd-node-lifecycle.sh", "cluster-join.sh"} {
+		raw, err := os.ReadFile(clusterScript(t, s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), rule) {
+			t.Errorf("%s does not hold the admin listener to %s", s, rule)
+		}
+		if !strings.Contains(string(raw), ports[s]) {
+			t.Errorf("%s does not hold the API port to %s", s, ports[s])
+		}
+	}
+}

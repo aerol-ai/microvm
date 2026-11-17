@@ -121,6 +121,8 @@ The bucket holds fingerprints only, never audit records. It cannot rebuild a los
 
 ## Turn it on
 
+On Kubernetes, do steps 1 to 4 here, then set the Helm values in [Turn on enterprise mode](/kubernetes/security/#turn-on-enterprise-mode) instead of steps 5 and 6.
+
 ### Step 1: Create the bucket with Object Lock on
 
 Create a new S3 bucket and turn on Object Lock as you create it. That also turns on versioning, which Object Lock needs. Use this bucket for the witness and nothing else, because its lock applies to every object in it.

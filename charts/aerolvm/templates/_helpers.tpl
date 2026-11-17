@@ -199,3 +199,212 @@ nodes with sandboxes report their run state.
 - { name: SB_AGENT_SANDBOX_API_NAMESPACES, value: {{ join "," $pairs | quote }} }
 {{- end }}
 {{- end -}}
+
+{{/*
+Enterprise mode's admin-token rule and the audit evidence settings, on every
+node of a cluster alike (issue #1349). Each check fails the render where
+sandboxd would refuse to start, so a mistake shows at `helm install`, not as
+crash-looping pods.
+*/}}
+{{- define "aerolvm.publicSocketDir" -}}/run/sandboxd-public{{- end -}}
+{{- /* One folder down: the volume's own root belongs to root, and sandboxd,
+not root on a server or gateway, sets its socket folder's owner and mode. */ -}}
+{{- define "aerolvm.publicSocket" -}}{{ include "aerolvm.publicSocketDir" . }}/api/api.sock{{- end -}}
+
+{{- define "aerolvm.nodeServiceAccount" -}}
+{{- printf "%s-node" (include "aerolvm.name" .) -}}
+{{- end -}}
+
+{{- define "aerolvm.auditEnv" -}}
+{{- $enterprise := (.Values.enterprise | default dict).enabled }}
+{{- $audit := .Values.audit | default dict }}
+{{- $w := $audit.witness | default dict }}
+{{- $x := $audit.export | default dict }}
+{{- $xs3 := $x.s3 | default dict }}
+{{- $hook := $x.webhook | default dict }}
+{{- $creds := $audit.credentials | default dict }}
+{{- $ca := $creds.caBundle | default dict }}
+{{- $backend := $x.backend | default "" | lower | trim }}
+{{- if $enterprise }}
+{{- if ne .Values.mode "cluster" }}
+{{- fail "enterprise.enabled needs mode=cluster: on Kubernetes enterprise mode runs in cluster mode only." }}
+{{- end }}
+{{- if not $w.bucket }}
+{{- fail "enterprise.enabled needs audit.witness.bucket: enterprise mode refuses to start without an S3 Object Lock audit witness." }}
+{{- end }}
+{{- if not (has $backend (list "s3" "webhook")) }}
+{{- fail "enterprise.enabled needs audit.export.backend s3 or webhook: enterprise mode refuses to start while audit records stay on the node." }}
+{{- end }}
+{{- /* Enterprise mode refuses to start past 10 live gateways unless the
+traffic in front of them is shard-aware (SB_CLUSTER_SHARD_AWARE_INGRESS,
+which worker.extraEnv gives every node). The operator keeps minReplicas
+gateways, or one per zone if that is more. */}}
+{{- $gateways := max (int .Values.cluster.gateways.minReplicas) (len .Values.cluster.zones) }}
+{{- /* sandboxd reads it with strconv.ParseBool. */}}
+{{- $shardAware := has (toString (index (.Values.worker.extraEnv | default dict) "SB_CLUSTER_SHARD_AWARE_INGRESS" | default "") | trim) (list "1" "t" "T" "true" "TRUE" "True") }}
+{{- if and (gt (int $gateways) 10) (not $shardAware) }}
+{{- fail (printf "enterprise.enabled with %d gateways: enterprise mode refuses to start past 10 unless the traffic in front of them is shard-aware. Keep cluster.gateways.minReplicas at 10 or fewer, or, if your router uses /v1/cluster/ingress-route/{id}, set worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS=\"true\" (it reaches every node)." (int $gateways)) }}
+{{- end }}
+{{- $endpoints := dict "audit.witness.endpoint" $w.endpoint }}
+{{- if eq $backend "s3" }}{{ $_ := set $endpoints "audit.export.s3.endpoint" $xs3.endpoint }}{{ end }}
+{{- if eq $backend "webhook" }}{{ $_ := set $endpoints "audit.export.webhook.url" $hook.url }}{{ end }}
+{{- range $what, $endpoint := $endpoints }}
+{{- if and $endpoint (not (hasPrefix "https://" (lower (toString $endpoint)))) }}
+{{- fail (printf "%s %s must be https in enterprise mode: every node refuses to start otherwise." $what $endpoint) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if not (has $backend (list "" "s3" "webhook")) }}
+{{- fail (printf "audit.export.backend %q: the chart sets s3 or webhook (or leave it empty)." $backend) }}
+{{- end }}
+{{- if and (eq $backend "s3") (not $xs3.bucket) }}
+{{- fail "audit.export.backend s3 needs audit.export.s3.bucket." }}
+{{- end }}
+{{- if and (eq $backend "webhook") (not $hook.url) }}
+{{- fail "audit.export.backend webhook needs audit.export.webhook.url." }}
+{{- end }}
+{{- if and (eq $backend "webhook") $enterprise (not $hook.bearerTokenSecret) }}
+{{- fail "audit.export.webhook in enterprise mode needs bearerTokenSecret: every node refuses an unauthenticated collector." }}
+{{- end }}
+{{- $keys := list }}
+{{- if $enterprise }}
+{{- $keys = concat $keys (list "SB_PAT_SCOPE" "SB_PUBLIC_API_SOCKET" "SB_PUBLIC_API_SOCKET_GROUP" "SB_PAT_LOCAL_LISTEN") }}
+{{- end }}
+{{- if $creds.existingSecret }}
+{{- $keys = concat $keys (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") }}
+{{- end }}
+{{- if $ca.existingConfigMap }}
+{{- $keys = append $keys "AWS_CA_BUNDLE" }}
+{{- end }}
+{{- if $w.bucket }}
+{{- $keys = concat $keys (list "SB_AUDIT_WITNESS_BACKEND" "SB_AUDIT_WITNESS_S3_BUCKET" "SB_AUDIT_WITNESS_S3_PREFIX" "SB_AUDIT_WITNESS_S3_REGION" "SB_AUDIT_WITNESS_S3_ENDPOINT" "SB_AUDIT_WITNESS_S3_PATH_STYLE") }}
+{{- end }}
+{{- if $backend }}
+{{- $keys = concat $keys (list "SB_AUDIT_EXPORT_BACKEND" "SB_AUDIT_EXPORT_S3_BUCKET" "SB_AUDIT_EXPORT_S3_PREFIX" "SB_AUDIT_EXPORT_S3_REGION" "SB_AUDIT_EXPORT_S3_ENDPOINT" "SB_AUDIT_EXPORT_S3_PATH_STYLE" "SB_SECRET_AUDIT_EXPORT_URL" "SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN") }}
+{{- end }}
+{{- range $k := $keys }}
+{{- if hasKey ($.Values.worker.extraEnv | default dict) $k }}
+{{- fail (printf "%s is set twice: the chart sets it from enterprise and audit; remove worker.extraEnv.%s." $k $k) }}
+{{- end }}
+{{- end }}
+{{- if $enterprise }}
+# The admin token works only from this pod itself and the cluster's own
+# nodes: the edge reaches sandboxd on the public socket, where it is
+# refused, and the operator calls with an API token of its own.
+- { name: SB_PAT_SCOPE, value: host }
+- { name: SB_PUBLIC_API_SOCKET, value: {{ include "aerolvm.publicSocket" . | quote }} }
+# The edge's group: a number, which the image names no group for.
+- { name: SB_PUBLIC_API_SOCKET_GROUP, value: "65532" }
+# The admin token works on this loopback listener only, never on the API
+# port: a mesh sidecar would deliver outside callers there from loopback.
+# The operator and `kubectl port-forward` reach it inside the pod.
+- { name: SB_PAT_LOCAL_LISTEN, value: "127.0.0.1:21219" }
+{{- end }}
+{{- with $w.bucket }}
+- { name: SB_AUDIT_WITNESS_BACKEND, value: s3 }
+- { name: SB_AUDIT_WITNESS_S3_BUCKET, value: {{ . | quote }} }
+{{- with $w.prefix }}
+- { name: SB_AUDIT_WITNESS_S3_PREFIX, value: {{ . | quote }} }
+{{- end }}
+{{- with $w.region }}
+- { name: SB_AUDIT_WITNESS_S3_REGION, value: {{ . | quote }} }
+{{- end }}
+{{- with $w.endpoint }}
+- { name: SB_AUDIT_WITNESS_S3_ENDPOINT, value: {{ . | quote }} }
+{{- end }}
+{{- if $w.pathStyle }}
+- { name: SB_AUDIT_WITNESS_S3_PATH_STYLE, value: "true" }
+{{- end }}
+{{- end }}
+{{- if eq $backend "s3" }}
+- { name: SB_AUDIT_EXPORT_BACKEND, value: s3 }
+- { name: SB_AUDIT_EXPORT_S3_BUCKET, value: {{ $xs3.bucket | quote }} }
+{{- with $xs3.prefix }}
+- { name: SB_AUDIT_EXPORT_S3_PREFIX, value: {{ . | quote }} }
+{{- end }}
+{{- with $xs3.region }}
+- { name: SB_AUDIT_EXPORT_S3_REGION, value: {{ . | quote }} }
+{{- end }}
+{{- with $xs3.endpoint }}
+- { name: SB_AUDIT_EXPORT_S3_ENDPOINT, value: {{ . | quote }} }
+{{- end }}
+{{- if $xs3.pathStyle }}
+- { name: SB_AUDIT_EXPORT_S3_PATH_STYLE, value: "true" }
+{{- end }}
+{{- else if eq $backend "webhook" }}
+- { name: SB_AUDIT_EXPORT_BACKEND, value: webhook }
+- { name: SB_SECRET_AUDIT_EXPORT_URL, value: {{ $hook.url | quote }} }
+{{- with $hook.bearerTokenSecret }}
+- name: SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN
+  valueFrom:
+    secretKeyRef: { name: {{ . | quote }}, key: {{ $hook.bearerTokenKey | default "token" | quote }} }
+{{- end }}
+{{- end }}
+{{- with $creds.existingSecret }}
+- name: AWS_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef: { name: {{ . | quote }}, key: AWS_ACCESS_KEY_ID }
+- name: AWS_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef: { name: {{ . | quote }}, key: AWS_SECRET_ACCESS_KEY }
+{{- end }}
+{{- with $ca.existingConfigMap }}
+- { name: AWS_CA_BUNDLE, value: {{ printf "/etc/aerolvm/aws-ca/%s" ($ca.key | default "ca.crt") | quote }} }
+{{- end }}
+{{- end -}}
+
+{{- /* The public socket's folder (enterprise mode), for sandboxd and the edge. */ -}}
+{{- define "aerolvm.publicSocketMount" -}}
+{{- if (.Values.enterprise | default dict).enabled }}
+- { name: public-api, mountPath: {{ include "aerolvm.publicSocketDir" . }} }
+{{- end }}
+{{- end -}}
+
+{{- define "aerolvm.auditMount" -}}
+{{- include "aerolvm.publicSocketMount" . }}
+{{- with ((.Values.audit | default dict).credentials | default dict).caBundle }}
+{{- if .existingConfigMap }}
+- { name: aws-ca, mountPath: /etc/aerolvm/aws-ca, readOnly: true }
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "aerolvm.auditVolume" -}}
+{{- if (.Values.enterprise | default dict).enabled }}
+- { name: public-api, emptyDir: {} }
+{{- end }}
+{{- with ((.Values.audit | default dict).credentials | default dict).caBundle }}
+{{- if .existingConfigMap }}
+- name: aws-ca
+  configMap:
+    name: {{ .existingConfigMap }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- /* The node service account (audit.credentials.serviceAccount), when the
+chart makes one. */ -}}
+{{- define "aerolvm.nodeServiceAccountName" -}}
+{{- $sa := ((.Values.audit | default dict).credentials | default dict).serviceAccount | default dict }}
+{{- if $sa.create }}{{ include "aerolvm.nodeServiceAccount" . }}{{ end }}
+{{- end -}}
+
+{{/*
+The annotations of a node pod, if any (callers trim the result and leave
+the annotations key out when it is empty). In enterprise mode, no service
+mesh sidecar (review S3): a sidecar delivers outside callers to sandboxd
+from loopback, where they would count as the pod itself, and its own mTLS
+would sit between nodes that already speak mTLS. Off, the pods are as
+before. With IRSA (audit.credentials.serviceAccount), the audit store's
+role reaches the agent container only (review S4).
+*/}}
+{{- define "aerolvm.nodePodAnnotations" -}}
+{{- $sa := ((.root.Values.audit | default dict).credentials | default dict).serviceAccount | default dict }}
+{{- if (.root.Values.enterprise | default dict).enabled }}
+sidecar.istio.io/inject: "false"
+linkerd.io/inject: disabled
+{{- end }}
+{{- if $sa.create }}
+eks.amazonaws.com/skip-containers: {{ get (dict "server" "setup" "gateway" "edge,setup" "worker" "runtime,edge,egress,preflight,setup") .role | quote }}
+{{- end }}
+{{- end -}}

@@ -253,3 +253,33 @@ func TestFetchRingGate(t *testing.T) {
 		t.Fatal("single node waits for no one")
 	}
 }
+
+// On a node with the admin token's own listener (SB_PAT_LOCAL_LISTEN,
+// Kubernetes enterprise mode) the API port refuses the admin token: the
+// gate asks the listener instead (round-2 review, item 1).
+func TestFetchRingGateUsesTheAdminListener(t *testing.T) {
+	refused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "the operator token works only on this host", http.StatusUnauthorized)
+	}))
+	defer refused.Close()
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/cluster/members" || r.Header.Get("Authorization") != "Bearer pat" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"members":[],"server_key_ring_ready":true}`))
+	}))
+	defer admin.Close()
+	_, apiPort, _ := net.SplitHostPort(strings.TrimPrefix(refused.URL, "http://"))
+	p, _ := strconv.Atoi(apiPort)
+	cfg := config.Config{APIHost: "0.0.0.0", APIPort: p, PATToken: "pat", PATScope: config.PATScopeHost,
+		PATLocalListen: strings.TrimPrefix(admin.URL, "http://")}
+	if ready, known, _, err := fetchRingGate(context.Background(), cfg); err != nil || !ready || !known {
+		t.Fatalf("through the admin listener: ready %v known %v err %v", ready, known, err)
+	}
+	// Without the listener, the API port (which here refuses it).
+	cfg.PATLocalListen = ""
+	if _, _, _, err := fetchRingGate(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("through the API port: %v", err)
+	}
+}

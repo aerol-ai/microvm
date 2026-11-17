@@ -60,6 +60,9 @@ The operator's Kubernetes rights, all named in the chart's
   TokenReviews, to check which pod, on which machine, asks for a join token.
 - **In `default`:** read the `kubernetes` Service and its EndpointSlice, by
   name, to keep sandboxes away from the API server.
+- **In enterprise mode only:** open a port-forward to a pod in its own
+  namespace (`pods/portforward`), to make its own admin API token on a
+  server: there a server takes the admin token only from inside its pod.
 - **Not:** `pods/exec`, any other namespace, cluster roles, or anything in
   cert-manager.
 
@@ -138,6 +141,13 @@ envelope.
 - **Workers hold no admin token.** They know only its fingerprint, to check
   callers. Only servers hold it, from a Secret the operator makes in the
   release namespace.
+- **In enterprise mode the admin token never works from outside a pod.**
+  Every node takes it only from inside its own pod and from the cluster's
+  own nodes; the edge reaches AerolVM on a socket where it is refused. A
+  person uses it through `kubectl port-forward` to a server. The operator
+  makes an admin API token for itself that way, keeps it in a Secret in the
+  release namespace, and replaces it before a third of its life (30 days at
+  most) is left.
 - **Callers** use AerolVM's own API tokens, SSO and roles, as on any install.
   `identity.enabled` turns tokens on for servers, gateways and workers
   alike; it gives no node the admin token.
@@ -217,7 +227,12 @@ with network policy turned on, or Calico or Cilium).
 - **Audit.** Every create, delete, command, file access, port change,
   snapshot and token call, every refused call, and every secret opened is
   written to a hash-chained audit log, which can be shipped to your SIEM and
-  witnessed in an S3 bucket with Object Lock (docs: Audit evidence).
+  witnessed in an S3 bucket with Object Lock (docs: Audit evidence). In
+  enterprise mode both are required, and every node writes to them
+  (`audit.witness`, `audit.export`), signing in to S3 through IRSA: the IAM
+  role of a service account the chart makes, with no Kubernetes rights
+  (a gateway serving the agent-sandbox API keeps its own account, which
+  has that API's two rights), reaching each pod's agent container only.
 
 ## 6. Threat model
 
@@ -287,10 +302,11 @@ AerolVM. The machine's own cloud identity stays unreachable from sandboxes.
 
 `values-bank-eks.yaml` in this chart turns all of this on: cluster mode over
 three zones, gVisor only, NetworkPolicies, HTTPS, the create policy,
-monitoring and machine replacement every 30 days. Its header lists what you
-set outside the chart: the namespace label, the worker NodePool, the
-EC2NodeClass's metadata settings, `br_netfilter` on worker machines,
-cert-manager and Prometheus.
+monitoring, machine replacement every 30 days, and enterprise mode with the
+audit witness and an S3 export. Its header lists what you set outside the
+chart: the namespace label, the worker NodePool, the EC2NodeClass's
+metadata settings, `br_netfilter` on worker machines, cert-manager,
+Prometheus, and the two audit buckets with the nodes' IAM role.
 
 ## What `aerolvm k8s verify` checks
 

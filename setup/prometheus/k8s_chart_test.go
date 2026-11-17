@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1112,7 +1113,7 @@ func TestKubernetesChartNotesOnTurningIdentityOn(t *testing.T) {
 // the workers alone binds nodes that take no token write. The identity file
 // is a ConfigMap in every namespace a node runs in, mounted on each.
 // worker.extraEnv may not set any of them in cluster mode. The bank preset
-// caps tokens at 90 days everywhere and leaves enterprise mode off.
+// caps tokens at 90 days everywhere.
 func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
 	root := repoRoot(t)
 	helm := chartTool(t, "HELM", "helm")
@@ -1122,8 +1123,8 @@ func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
 	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
 		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
 	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
-	docs, err := renderChart(t, root, helm, with("identity.enabled=true", "identity.tokenMaxTTL=2160h",
-		"identity.file.content=version: 1", "enterprise.enabled=true")...)
+	docs, err := renderChart(t, root, helm, with(append([]string{"identity.enabled=true", "identity.tokenMaxTTL=2160h",
+		"identity.file.content=version: 1"}, enterpriseSets...)...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1176,7 +1177,7 @@ func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
 	// Enterprise mode refuses a cap over 90 days at boot, so the render
 	// does too, whatever the units (PR 3 review, round 3).
 	for ttl, refused := range map[string]bool{"2161h": true, "2159h59m61s": true, "7776001s": true, "2160h": false, "1h30m": false} {
-		_, err := renderChart(t, root, helm, with("identity.enabled=true", "enterprise.enabled=true", "identity.tokenMaxTTL="+ttl)...)
+		_, err := renderChart(t, root, helm, with(append([]string{"identity.enabled=true", "identity.tokenMaxTTL=" + ttl}, enterpriseSets...)...)...)
 		if got := err != nil && strings.Contains(err.Error(), "longer than enterprise mode allows"); got != refused {
 			t.Errorf("enterprise mode with tokenMaxTTL %s: refused %v (%v), want %v", ttl, got, err, refused)
 		}
@@ -1213,6 +1214,378 @@ func TestKubernetesChartTokenSettingsOnEveryNode(t *testing.T) {
 	}
 	if n := strings.Count(bank, `SB_TOKEN_MAX_TTL, value: "2160h"`); n != 3 {
 		t.Errorf("the bank preset caps tokens at 90 days in %d pod templates, want 3", n)
+	}
+}
+
+// enterpriseSets are the least an enterprise install renders with: API
+// tokens, the audit witness and an off-node export.
+var enterpriseSets = []string{"enterprise.enabled=true", "audit.witness.bucket=witness",
+	"audit.export.backend=s3", "audit.export.s3.bucket=audit"}
+
+// containerNamed is the container (or init container) name in a template.
+func containerNamed(tpl map[string]any, name string) map[string]any {
+	for _, list := range []string{"containers", "initContainers"} {
+		cs, _ := dig(tpl, "spec", list).([]any)
+		for _, c := range cs {
+			if dig(c, "name") == name {
+				m, _ := c.(map[string]any)
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func envValue(c map[string]any, name string) (string, bool) {
+	env, _ := dig(c, "env").([]any)
+	for _, e := range env {
+		if dig(e, "name") == name {
+			v, _ := dig(e, "value").(string)
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func mounts(c map[string]any) map[string]string {
+	out := map[string]string{}
+	list, _ := dig(c, "volumeMounts").([]any)
+	for _, m := range list {
+		out[fmt.Sprint(dig(m, "name"))] = fmt.Sprint(dig(m, "mountPath"))
+	}
+	return out
+}
+
+// Enterprise mode on Kubernetes (issue #1349). Every node takes the admin
+// token only from its own pod (SB_PAT_SCOPE=host) and opens the public
+// socket, on a folder its edge shares, for group 65532; the edge's
+// Caddyfile, in both namespaces, sends the API there. The audit witness,
+// the export and their credentials reach every node; the nodes run under
+// a service account of their own with the IRSA annotation (the gateway's
+// own, with the agent-sandbox API, gets it too). The operator may
+// port-forward in its own namespace only, and only in enterprise mode.
+// Off, none of it renders. Each setting sandboxd would refuse at start is
+// refused here.
+func TestKubernetesChartEnterpriseMode(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32",
+		"edge.enabled=true", "edge.domain=sb.example.test", "edge.existingTLSSecret=edge-tls"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	on := with(append([]string{"identity.enabled=true", "audit.witness.region=eu-west-1",
+		"audit.witness.endpoint=https://s3.example.test", "audit.witness.pathStyle=true", "audit.witness.prefix=w/",
+		"audit.export.s3.region=eu-west-1", "audit.export.s3.endpoint=https://s3.example.test", "audit.export.s3.pathStyle=true",
+		"audit.export.s3.prefix=x/", "audit.credentials.existingSecret=aws-keys", "audit.credentials.caBundle.existingConfigMap=s3-ca",
+		"audit.credentials.serviceAccount.create=true", "audit.credentials.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::1:role/a",
+		"cluster.agentSandboxAPI.enabled=true"}, enterpriseSets...)...)
+	docs, err := renderChart(t, root, helm, on...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnv := map[string]string{
+		"SB_PAT_SCOPE": "host", "SB_PUBLIC_API_SOCKET": "/run/sandboxd-public/api/api.sock", "SB_PUBLIC_API_SOCKET_GROUP": "65532",
+		"SB_PAT_LOCAL_LISTEN":      "127.0.0.1:21219",
+		"SB_ENTERPRISE_MODE":       "true",
+		"SB_AUDIT_WITNESS_BACKEND": "s3", "SB_AUDIT_WITNESS_S3_BUCKET": "witness", "SB_AUDIT_WITNESS_S3_REGION": "eu-west-1",
+		"SB_AUDIT_WITNESS_S3_ENDPOINT": "https://s3.example.test", "SB_AUDIT_WITNESS_S3_PATH_STYLE": "true", "SB_AUDIT_WITNESS_S3_PREFIX": "w/",
+		"SB_AUDIT_EXPORT_BACKEND": "s3", "SB_AUDIT_EXPORT_S3_BUCKET": "audit", "SB_AUDIT_EXPORT_S3_REGION": "eu-west-1",
+		"SB_AUDIT_EXPORT_S3_ENDPOINT": "https://s3.example.test", "SB_AUDIT_EXPORT_S3_PATH_STYLE": "true", "SB_AUDIT_EXPORT_S3_PREFIX": "x/",
+		"AWS_CA_BUNDLE": "/etc/aerolvm/aws-ca/ca.crt",
+	}
+	for role, body := range podTemplates(t, docs) {
+		var tpl map[string]any
+		if err := yaml.Unmarshal([]byte(body), &tpl); err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		agent := containerNamed(tpl, "agent")
+		for k, v := range wantEnv {
+			if got, ok := envValue(agent, k); !ok || got != v {
+				t.Errorf("%s: %s = %q (set %v), want %q", role, k, got, ok, v)
+			}
+		}
+		// The admin listener's port is no other listener's in the pod: the
+		// first choice, 21213, was the gateway's ingress proxy, and every
+		// gateway failed to start. internal/config refuses sandboxd's own
+		// defaults; this covers the addresses and ports the chart sets.
+		if _, adminPort, err := net.SplitHostPort(wantEnv["SB_PAT_LOCAL_LISTEN"]); err == nil {
+			env, _ := dig(agent, "env").([]any)
+			for _, e := range env {
+				name, _ := dig(e, "name").(string)
+				v, _ := dig(e, "value").(string)
+				if name == "SB_PAT_LOCAL_LISTEN" {
+					continue
+				}
+				_, p, err := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(v, "http://"), "https://"))
+				if (err == nil && p == adminPort) || (strings.HasSuffix(name, "_PORT") && v == adminPort) {
+					t.Errorf("%s: %s=%q takes the admin listener's port %s", role, name, v, adminPort)
+				}
+			}
+			for _, c := range []string{"agent", "edge"} {
+				ports, _ := dig(containerNamed(tpl, c), "ports").([]any)
+				for _, p := range ports {
+					if fmt.Sprint(dig(p, "containerPort")) == adminPort {
+						t.Errorf("%s: container %s opens the admin listener's port %s", role, c, adminPort)
+					}
+				}
+			}
+		}
+		for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+			if _, ok := envValue(agent, k); !ok || !strings.Contains(body, "name: \"aws-keys\", key: "+k) {
+				t.Errorf("%s: %s does not come from the Secret aws-keys", role, k)
+			}
+		}
+		if m := mounts(agent); m["public-api"] != "/run/sandboxd-public" || m["aws-ca"] != "/etc/aerolvm/aws-ca" {
+			t.Errorf("%s: agent mounts %v", role, m)
+		}
+		if edge := containerNamed(tpl, "edge"); role != "server" && mounts(edge)["public-api"] != "/run/sandboxd-public" {
+			t.Errorf("%s: the edge does not share the socket folder: %v", role, mounts(edge))
+		}
+		if !strings.Contains(body, "name: public-api, emptyDir: {}") || !strings.Contains(body, "name: s3-ca") {
+			t.Errorf("%s: no socket or CA volume", role)
+		}
+		// Review S3, S4: no mesh sidecar; IRSA's role in the agent alone.
+		skip := map[string]string{"server": "setup", "gateway": "edge,setup", "worker": "runtime,edge,egress,preflight,setup"}[role]
+		for k, v := range map[string]string{"sidecar.istio.io/inject": "false", "linkerd.io/inject": "disabled", "eks.amazonaws.com/skip-containers": skip} {
+			if got := dig(tpl, "metadata", "annotations", k); got != v {
+				t.Errorf("%s: annotation %s = %v, want %q", role, k, got, v)
+			}
+		}
+		wantSA := "t-node"
+		if role == "gateway" {
+			wantSA = "aerolvm-gateway"
+		}
+		if got := dig(tpl, "spec", "serviceAccountName"); got != wantSA {
+			t.Errorf("%s: service account %v, want %s", role, got, wantSA)
+		}
+	}
+	accounts := map[string]any{}
+	for _, sa := range docsOfKind(docs, "ServiceAccount") {
+		accounts[fmt.Sprint(dig(sa, "metadata", "namespace"), "/", dig(sa, "metadata", "name"))] =
+			dig(sa, "metadata", "annotations", "eks.amazonaws.com/role-arn")
+	}
+	for _, sa := range []string{"aerolvm/t-node", "aerolvm-workers/t-node", "<nil>/aerolvm-gateway"} {
+		if accounts[sa] != "arn:aws:iam::1:role/a" {
+			t.Errorf("service account %s: role annotation %v (accounts %v)", sa, accounts[sa], accounts)
+		}
+	}
+	caddy := 0
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		if f, ok := dig(cm, "data", "Caddyfile").(string); ok {
+			caddy++
+			if !strings.Contains(f, "reverse_proxy unix//run/sandboxd-public/api/api.sock {") || strings.Contains(f, "127.0.0.1:21212") ||
+				!strings.Contains(f, "@api path /health /ready /v1 /v1/*") {
+				t.Errorf("%v: Caddyfile does not send the API to the public socket:\n%s", dig(cm, "metadata", "namespace"), f)
+			}
+		}
+	}
+	if caddy != 2 {
+		t.Errorf("%d Caddyfiles, want the release and worker namespaces'", caddy)
+	}
+	portForward := func(docs []map[string]any) map[any]bool {
+		out := map[any]bool{}
+		for _, role := range docsOfKind(docs, "Role") {
+			rules, _ := dig(role, "rules").([]any)
+			for _, r := range rules {
+				if fmt.Sprint(dig(r, "resources")) == "[pods/portforward]" && fmt.Sprint(dig(r, "verbs")) == "[create]" {
+					out[dig(role, "metadata", "namespace")] = true
+				}
+			}
+		}
+		return out
+	}
+	if got := portForward(docs); len(got) != 1 || !got["aerolvm"] {
+		t.Errorf("port-forward granted in %v, want the release namespace alone", got)
+	}
+
+	// Off: none of it, and Caddy on 127.0.0.1.
+	docs, err = renderChart(t, root, helm, with("identity.enabled=true")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, body := range podTemplates(t, docs) {
+		// No annotations at all: with enterprise mode off a node pod is as
+		// it was before it (round-2 review).
+		var tpl map[string]any
+		if err := yaml.Unmarshal([]byte(body), &tpl); err != nil {
+			t.Fatalf("%s: %v", role, err)
+		}
+		if a := dig(tpl, "metadata", "annotations"); a != nil {
+			t.Errorf("off: the %s template has annotations %v", role, a)
+		}
+		for _, never := range []string{"SB_PAT_SCOPE", "SB_PUBLIC_API_SOCKET", "SB_PAT_LOCAL_LISTEN", "public-api", "SB_AUDIT_", "AWS_", "serviceAccountName: t-node", "skip-containers", "sidecar.istio.io", "linkerd.io"} {
+			if strings.Contains(body, never) {
+				t.Errorf("off: the %s template carries %s", role, never)
+			}
+		}
+	}
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		if f, ok := dig(cm, "data", "Caddyfile").(string); ok && !strings.Contains(f, "reverse_proxy 127.0.0.1:21212 {") {
+			t.Errorf("off: Caddyfile:\n%s", f)
+		}
+	}
+	if got := portForward(docs); len(got) != 0 {
+		t.Errorf("off: port-forward granted in %v", got)
+	}
+	if len(docsOfKind(docs, "ServiceAccount")) != 2 {
+		t.Errorf("off: %d service accounts, want the operator's and the CRD job's", len(docsOfKind(docs, "ServiceAccount")))
+	}
+
+	// The witness and the export work without enterprise mode too; a
+	// webhook export takes its token from a Secret.
+	docs, err = renderChart(t, root, helm, with("audit.witness.bucket=w", "audit.export.backend=webhook",
+		"audit.export.webhook.url=http://collector:8080/x", "audit.export.webhook.bearerTokenSecret=hook")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for role, body := range podTemplates(t, docs) {
+		for _, want := range []string{`SB_AUDIT_WITNESS_S3_BUCKET, value: "w"`, "SB_AUDIT_EXPORT_BACKEND, value: webhook",
+			`SB_SECRET_AUDIT_EXPORT_URL, value: "http://collector:8080/x"`, `secretKeyRef: { name: "hook", key: "token" }`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("open-source witness and webhook: the %s template lacks %q", role, want)
+			}
+		}
+		if strings.Contains(body, "SB_PAT_SCOPE") {
+			t.Errorf("%s: host scope without enterprise mode", role)
+		}
+	}
+
+	for _, tc := range []struct {
+		sets []string
+		want string
+	}{
+		{[]string{"identity.enabled=true", "enterprise.enabled=true", "audit.export.backend=s3", "audit.export.s3.bucket=a"}, "needs audit.witness.bucket"},
+		{[]string{"identity.enabled=true", "enterprise.enabled=true", "audit.witness.bucket=w"}, "needs audit.export.backend s3 or webhook"},
+		{append([]string{"identity.enabled=true", "audit.witness.endpoint=http://minio:9000"}, enterpriseSets...), "audit.witness.endpoint http://minio:9000 must be https"},
+		{append([]string{"identity.enabled=true", "audit.export.s3.endpoint=http://minio:9000"}, enterpriseSets...), "audit.export.s3.endpoint http://minio:9000 must be https"},
+		{[]string{"identity.enabled=true", "enterprise.enabled=true", "audit.witness.bucket=w", "audit.export.backend=webhook",
+			"audit.export.webhook.url=https://c"}, "needs bearerTokenSecret"},
+		{[]string{"identity.enabled=true", "enterprise.enabled=true", "audit.witness.bucket=w", "audit.export.backend=webhook",
+			"audit.export.webhook.url=http://c", "audit.export.webhook.bearerTokenSecret=h"}, "audit.export.webhook.url http://c must be https"},
+		{[]string{"audit.export.backend=stdout"}, `audit.export.backend "stdout"`},
+		{[]string{"audit.export.backend=s3"}, "needs audit.export.s3.bucket"},
+		{[]string{"audit.export.backend=webhook"}, "needs audit.export.webhook.url"},
+		{append([]string{"identity.enabled=true", "worker.extraEnv.SB_PAT_SCOPE=any"}, enterpriseSets...), "SB_PAT_SCOPE is set twice"},
+		{append([]string{"identity.enabled=true", "worker.extraEnv.SB_PAT_LOCAL_LISTEN=127.0.0.1:1"}, enterpriseSets...), "SB_PAT_LOCAL_LISTEN is set twice"},
+		{[]string{"audit.credentials.existingSecret=k", "worker.extraEnv.AWS_ACCESS_KEY_ID=x"}, "AWS_ACCESS_KEY_ID is set twice"},
+		{[]string{"audit.credentials.caBundle.existingConfigMap=c", "worker.extraEnv.AWS_CA_BUNDLE=/x"}, "AWS_CA_BUNDLE is set twice"},
+		{[]string{"audit.witness.bucket=w", "worker.extraEnv.SB_AUDIT_WITNESS_S3_BUCKET=x"}, "SB_AUDIT_WITNESS_S3_BUCKET is set twice"},
+		// Past 10 gateways enterprise mode needs shard-aware traffic in
+		// front of them, which only the bank can vouch for.
+		{append([]string{"identity.enabled=true", "cluster.gateways.minReplicas=11"}, enterpriseSets...), "enterprise.enabled with 11 gateways"},
+		{append([]string{"identity.enabled=true", "cluster.gateways.minReplicas=11", "worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS=false"}, enterpriseSets...), "enterprise.enabled with 11 gateways"},
+		// One gateway per zone at least.
+		{append([]string{"identity.enabled=true", "cluster.zones={a,b,c,d,e,f,g,h,i,j,k}"}, enterpriseSets...), "enterprise.enabled with 11 gateways"},
+	} {
+		if _, err := renderChart(t, root, helm, with(tc.sets...)...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: %v; want a refusal naming %q", tc.sets, err, tc.want)
+		}
+	}
+	for _, sets := range [][]string{{"cluster.gateways.minReplicas=10"}, {"cluster.gateways.minReplicas=11", "worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS=true"},
+		// sandboxd reads the opt-in with ParseBool; the chart reads it the same.
+		{"cluster.gateways.minReplicas=11", "worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS=TRUE"},
+		{"cluster.gateways.minReplicas=11", "worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS=1"},
+		// A URL's scheme is not case-sensitive.
+		{"audit.witness.endpoint=HTTPS://s3.example.test"},
+		// Only the export backend in use is held to https.
+		{"audit.export.s3.endpoint=http://unused.example", "audit.export.backend=webhook", "audit.export.webhook.url=https://c", "audit.export.webhook.bearerTokenSecret=h"},
+	} {
+		if _, err := renderChart(t, root, helm, with(append(append([]string{"identity.enabled=true"}, enterpriseSets...), sets...)...)...); err != nil {
+			t.Errorf("enterprise mode with %v: %v", sets, err)
+		}
+	}
+	// Single mode never runs enterprise mode: its pod has no annotations,
+	// as before, unless the chart makes the IRSA account; then only IRSA's.
+	single, err := renderChart(t, root, helm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sts := docsOfKind(single, "StatefulSet"); len(sts) != 1 || dig(sts[0], "spec", "template", "metadata", "annotations") != nil {
+		t.Errorf("single mode: the worker pod has annotations")
+	}
+	single, err = renderChart(t, root, helm, "audit.credentials.serviceAccount.create=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sts := docsOfKind(single, "StatefulSet"); len(sts) != 1 || !reflect.DeepEqual(dig(sts[0], "spec", "template", "metadata", "annotations"),
+		map[string]any{"eks.amazonaws.com/skip-containers": "runtime,edge,egress,preflight,setup"}) {
+		t.Errorf("single mode with IRSA: annotations %v", dig(docsOfKind(single, "StatefulSet")[0], "spec", "template", "metadata", "annotations"))
+	}
+	// Single mode has no operator to make a token for: refused.
+	if _, err := renderChart(t, root, helm, append([]string{"identity.enabled=true"}, enterpriseSets...)...); err == nil ||
+		!strings.Contains(err.Error(), "enterprise.enabled needs mode=cluster") {
+		t.Errorf("single mode took enterprise mode: %v", err)
+	}
+
+	// The bank preset runs enterprise mode, with the witness, an s3 export
+	// and IRSA.
+	bank, err := runTool(t, root, helm, "template", "t", filepath.Join(root, "charts", "aerolvm"),
+		"-f", filepath.Join(root, "charts", "aerolvm", "values-bank-eks.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for want, n := range map[string]int{`SB_ENTERPRISE_MODE, value: "true"`: 3, "SB_PAT_SCOPE, value: host": 3,
+		`SB_AUDIT_WITNESS_S3_BUCKET, value: "<audit-witness-bucket>"`: 3, "SB_AUDIT_EXPORT_BACKEND, value: s3": 3,
+		"serviceAccountName: t-node": 3, "eks.amazonaws.com/role-arn:": 2, "reverse_proxy unix//run/sandboxd-public/api/api.sock": 2} {
+		if got := strings.Count(bank, want); got != n {
+			t.Errorf("the bank preset renders %q %d times, want %d", want, got, n)
+		}
+	}
+}
+
+// In enterprise mode the notes say the admin token works only through a
+// port-forward to a server pod, with no step that sends it to the public
+// address; after an upgrade they list the pods to replace (issue #1349).
+func TestKubernetesChartNotesInEnterpriseMode(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	sets := append([]string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32",
+		"edge.enabled=true", "edge.domain=sb.example.test", "edge.existingTLSSecret=edge-tls", "identity.enabled=true"}, enterpriseSets...)
+	install := renderNotes(t, root, helm, false, sets...)
+	for _, want := range []string{"enterprise mode on", "port-forward pod/aerolvm-server-0 21212:21219",
+		"aerolvm login http://127.0.0.1:21212 --token-stdin", "aerolvm token create --name <you> --role admin"} {
+		if !strings.Contains(install, want) {
+			t.Errorf("install notes lack %q:\n%s", want, install)
+		}
+	}
+	if strings.Contains(install, "point an SDK at https://sb.example.test with it") || strings.Contains(install, "reaches only pods made after it was turned") ||
+		strings.Count(install, "{.data.token}' | base64 -d") != 1 {
+		t.Errorf("install notes send the admin token to the public address, or speak of an upgrade:\n%s", install)
+	}
+	upgrade := renderNotes(t, root, helm, true, sets...)
+	for _, want := range []string{"Enterprise mode, like API tokens, reaches only pods made after", "gateway pods one at a time", "502",
+		// Review F2: never in the same upgrade as a version upgrade.
+		"after any version upgrade has", "finished",
+		// Round 2: turning it off needs the pods replaced too.
+		"To turn enterprise mode off later", "the server pods at the least", "stops renewing"} {
+		if !strings.Contains(upgrade, want) {
+			t.Errorf("upgrade notes lack %q", want)
+		}
+	}
+	// Round 3: the turned-off note comes from the previous release's pod
+	// templates (still in the cluster while helm upgrade renders the notes),
+	// never from a Secret: helm template has no cluster to ask, so the
+	// source holds the rule.
+	notesSrc, err := os.ReadFile(filepath.Join(root, "charts", "aerolvm", "templates", "NOTES.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(notesSrc), `lookup "v1" "Secret"`) ||
+		!strings.Contains(string(notesSrc), `lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-pod-templates" (include "aerolvm.name" .))`) ||
+		!strings.Contains(string(notesSrc), `contains "SB_PAT_SCOPE" (index ($previous.data | default dict) "server" | default "")`) {
+		t.Error("NOTES.txt does not tell an upgrade that turned enterprise mode off by the previous pod templates alone")
+	}
+	off := renderNotes(t, root, helm, true, sets[:len(sets)-len(enterpriseSets)]...)
+	if strings.Contains(off, "Enterprise mode") || strings.Contains(off, "port-forward pod/") ||
+		!strings.Contains(off, "point an SDK at https://sb.example.test with it") {
+		t.Errorf("enterprise off, the notes changed:\n%s", off)
 	}
 }
 

@@ -268,8 +268,11 @@ case "$DECODED_LEN" in
 		;;
 esac
 
-SB_API_PORT_DEFAULT="$(read_sandboxd_env_value SB_API_PORT)"
-SB_API_PORT_DEFAULT="${SB_API_PORT_DEFAULT:-21212}"
+# The API port as sandboxd reads it: a whole number 1-65535, else 21212
+# (a value such as 21212@collector.example would make 127.0.0.1:21212 the
+# userinfo of another host in the URLs below).
+SB_API_PORT_DEFAULT="$(read_sandboxd_env_value SB_API_PORT | tr -d '[:space:]')"
+[[ "$SB_API_PORT_DEFAULT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SB_API_PORT_DEFAULT <= 65535 )) || SB_API_PORT_DEFAULT=21212
 
 primary_ip() {
 	if command -v ip >/dev/null 2>&1; then
@@ -511,16 +514,26 @@ restart_sandboxd_with_diagnostics() {
 		echo "[cluster-join] local /health"
 		curl -sS --max-time 5 "http://127.0.0.1:${SB_API_PORT_DEFAULT}/health" || true
 		echo
-		local pat
+		local pat admin listen
 		pat="$(read_sandboxd_env_value SB_PAT_TOKEN)"
+		# The admin token's own listener when the node has one: its API
+		# port then refuses the admin token (sandboxd's LocalAdminURL).
+		admin="http://127.0.0.1:${SB_API_PORT_DEFAULT}"
+		listen="$(read_sandboxd_env_value SB_PAT_LOCAL_LISTEN | tr -d '[:space:]')"
+		# Only a loopback literal, as sandboxd takes it: anything else would
+		# send the admin token off the machine.
+		if [[ "$(read_sandboxd_env_value SB_PAT_SCOPE | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" == host ]] &&
+			[[ "$listen" =~ ^(127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$ ]] && (( BASH_REMATCH[2] <= 65535 )); then
+			admin="http://${listen}"
+		fi
 		if [[ -n "$pat" ]]; then
 			echo "[cluster-join] local /v1/cluster/members"
 			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
-				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/members" || true
+				"${admin}/v1/cluster/members" || true
 			echo
 			echo "[cluster-join] local /v1/cluster/leader"
 			curl -sS --max-time 5 -H "Authorization: Bearer ${pat}" \
-				"http://127.0.0.1:${SB_API_PORT_DEFAULT}/v1/cluster/leader" || true
+				"${admin}/v1/cluster/leader" || true
 			echo
 		fi
 	fi

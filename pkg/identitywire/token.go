@@ -169,6 +169,22 @@ func ValidTokenName(name string) bool {
 	return true
 }
 
+// OperatorTokenPrefix starts the name of every API token the Kubernetes
+// operator makes for itself (aerolvm-operator-<unix nanoseconds>): its
+// admin credential, which it sends only to servers. So a token with such a
+// name works only on a server (pkg/api operator_token.go), and only the
+// admin token, or such a token making its successor, may create one
+// (internal/service CreateAPIToken). The name adds no power anywhere: it
+// only narrows where the token works and who may make it.
+const OperatorTokenPrefix = "aerolvm-operator-"
+
+// IsOperatorTokenName reports whether name is kept for the operator's own
+// tokens. Exact case, like the operator's own sweep: "Aerolvm-operator-x"
+// is an ordinary name.
+func IsOperatorTokenName(name string) bool {
+	return strings.HasPrefix(name, OperatorTokenPrefix)
+}
+
 // ValidTeamName reports whether team is 1 to 63 characters of a-z, 0-9 and
 // '-'. "*" (every team) is not a team name; callers check it separately.
 func ValidTeamName(team string) bool {

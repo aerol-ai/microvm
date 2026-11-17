@@ -9,6 +9,13 @@ package api
 //	API TCP, any other peer   public   no
 //	public Unix socket        public   no (Caddy's upstream under host scope)
 //
+// "Loopback" is 127.0.0.1 or ::1 exactly: a mesh sidecar relays outside
+// callers from other loopback addresses (Istio's inbound passthrough uses
+// 127.0.0.6), and those are not this host. With SB_PAT_LOCAL_LISTEN (the
+// Helm chart's enterprise mode) the admin token works only on that
+// loopback listener: the API port counts no peer as this host, loopback
+// included, since a sidecar can relay any caller to it from 127.0.0.1.
+//
 // With SB_L4_FALLBACK_PROXY_PROTOCOL on, Caddy also stamps
 // X-AerolVM-Client-IP with the address the caddy-l4 PROXY header gave it. A
 // loopback request carrying that header is Caddy relaying a public caller,
@@ -67,6 +74,27 @@ var (
 
 type publicListenerKey struct{}
 
+// noHostListenerKey marks the API port's requests when the admin token has
+// a listener of its own (SB_PAT_LOCAL_LISTEN): none of them is this host.
+type noHostListenerKey struct{}
+
+// RemoteHandler is the API handler for the API port when the admin token
+// works only on its own loopback listener (SB_PAT_LOCAL_LISTEN): every
+// request on it is from off the host, loopback peers included, since a
+// mesh sidecar delivers outside callers from loopback. The mark rides the
+// request context, which no client can set.
+func (s *Server) RemoteHandler() http.Handler {
+	next := s.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), noHostListenerKey{}, true)))
+	})
+}
+
+func onNoHostListener(r *http.Request) bool {
+	off, _ := r.Context().Value(noHostListenerKey{}).(bool)
+	return off
+}
+
 // PublicHandler is the API handler for the public Unix socket
 // (SB_PUBLIC_API_SOCKET) Caddy uses under SB_PAT_SCOPE=host. Every request
 // on it is public, whatever its RemoteAddr says, so a PAT there is refused.
@@ -83,13 +111,20 @@ func onPublicSocket(r *http.Request) bool {
 	return public
 }
 
-// loopbackPeer reports whether the TCP peer is a loopback address.
+// loopbackPeer reports whether the TCP peer is this host's own loopback
+// address, 127.0.0.1 or ::1. Not the rest of 127.0.0.0/8: Istio's sidecar
+// relays outside callers from 127.0.0.6.
 func loopbackPeer(r *http.Request) bool {
-	if addr, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
-		return addr.Addr().Unmap().IsLoopback()
+	var addr netip.Addr
+	if ap, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
+		addr = ap.Addr()
+	} else if a, err := netip.ParseAddr(r.RemoteAddr); err == nil {
+		addr = a
+	} else {
+		return false
 	}
-	addr, err := netip.ParseAddr(r.RemoteAddr)
-	return err == nil && addr.Unmap().IsLoopback()
+	addr = addr.Unmap()
+	return addr == netip.AddrFrom4([4]byte{127, 0, 0, 1}) || addr == netip.IPv6Loopback()
 }
 
 // requestOrigin classifies a request: peer (a verified mTLS cluster peer),
@@ -101,7 +136,7 @@ func requestOrigin(r *http.Request, trustClientIP bool) string {
 	if _, ok := mtlsPeer(r); ok {
 		return originPeer
 	}
-	if onPublicSocket(r) || !loopbackPeer(r) {
+	if onPublicSocket(r) || onNoHostListener(r) || !loopbackPeer(r) {
 		return originPublic
 	}
 	if trustClientIP && r.Header.Get(headerClientIPKey) != "" {

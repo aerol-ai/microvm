@@ -1070,6 +1070,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// taken and behaviour is unchanged.
 		if cfg.EnableCluster {
 			sshCfg.RemoteAPIBaseURL = loopbackAPIBaseURL(cfg.ListenAddr())
+			if cfg.PATLocalOnly() {
+				// Its token works only on the admin token's listener.
+				sshCfg.RemoteAPIBaseURL = "http://" + cfg.PATLocalListen
+			}
 			sshCfg.RemoteAPIToken = cfg.PATToken
 		}
 		gw, err := sshgateway.New(logger, sshCfg, svc, dockerClient)
@@ -1145,15 +1149,30 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	var publicServer *http.Server
 	var publicLn net.Listener
 	if cfg.PATScopeHostOnly() {
-		publicLn, err = listenPublicAPISocket(cfg.PublicAPISocket, publicAPISocketGroup)
+		publicLn, err = listenPublicAPISocket(cfg.PublicAPISocket, cfg.PublicAPISocketGroup)
 		if err != nil {
 			return err
 		}
 		publicServer = newPublicAPIServer(server.PublicHandler())
 	}
+	// SB_PAT_LOCAL_LISTEN: the admin token's own loopback listener, and the
+	// API port then counts no caller as this host (a mesh sidecar delivers
+	// outside callers to it from loopback). Opened before the API listener,
+	// so a port in use fails the boot.
+	apiHandler := server.Handler()
+	var localServer *http.Server
+	var localLn net.Listener
+	if cfg.PATLocalOnly() {
+		localLn, err = net.Listen("tcp", cfg.PATLocalListen)
+		if err != nil {
+			return fmt.Errorf("admin token listener %s (SB_PAT_LOCAL_LISTEN): %w", cfg.PATLocalListen, err)
+		}
+		localServer = newPublicAPIServer(server.Handler())
+		apiHandler = server.RemoteHandler()
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
-		Handler:           server.Handler(),
+		Handler:           apiHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 		// No ReadTimeout/WriteTimeout: exec/log streams and WebSocket
 		// attaches are long-lived by design. IdleTimeout only reaps
@@ -1177,6 +1196,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// it runs on the key store's background budget, never a create's.
 	svc.StartKeyCustody(ctx)
 	live.setPhase(livenessPhaseServing)
+	if localServer != nil {
+		logger.Info("admin token listener: the operator token works here only, from this pod", "addr", cfg.PATLocalListen)
+		go func() {
+			if err := localServer.Serve(localLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("admin token listener stopped unexpectedly", "error", err)
+				cancel()
+			}
+		}()
+	}
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {
@@ -1321,6 +1349,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if publicServer != nil {
 		if err := publicServer.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("public API socket graceful shutdown failed", "error", err)
+		}
+	}
+	if localServer != nil {
+		if err := localServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("admin token listener graceful shutdown failed", "error", err)
 		}
 	}
 	if ingressServer != nil {

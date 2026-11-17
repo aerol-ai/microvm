@@ -20,6 +20,11 @@ cluster files (init or join --files-only, F14).
 serviceAccountName: {{ $root.Values.cluster.name }}-gateway
 automountServiceAccountToken: true
 {{- else }}
+{{- with include "aerolvm.nodeServiceAccountName" $root }}
+# The audit store's credentials (IRSA): no Kubernetes rights, and no
+# Kubernetes API token in the pod.
+serviceAccountName: {{ . }}
+{{- end }}
 automountServiceAccountToken: false
 {{- end }}
 enableServiceLinks: false
@@ -117,6 +122,7 @@ containers:
       them refuses a token the workers take. Never the admin token on a
       gateway: that stays a server's alone (above). */}}
       {{- with include "aerolvm.identityEnv" $root }}{{ . | nindent 6 }}{{ end }}
+      {{- with include "aerolvm.auditEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
       {{- if or (hasPrefix "SB_CLUSTER_" $k) (eq $k "SB_DEAD_OWNER_GRACE") }}
       - { name: {{ $k }}, value: {{ $v | quote }} }
@@ -154,6 +160,7 @@ containers:
       - { name: agent-sandbox-tls, mountPath: /etc/aerolvm/agent-sandbox-api, readOnly: true }
       {{- end }}
       {{- with include "aerolvm.identityFileMount" $root }}{{ . | nindent 6 }}{{ end }}
+      {{- with include "aerolvm.auditMount" $root }}{{ . | nindent 6 }}{{ end }}
   {{- if $edge }}
   - name: edge
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-edge") }}
@@ -173,9 +180,11 @@ containers:
       - { name: edge-tls, mountPath: /etc/aerolvm/tls, readOnly: true }
       - { name: edge-data, mountPath: /data }
       - { name: edge-state, mountPath: /config }
+      {{- with include "aerolvm.publicSocketMount" $root }}{{ . | nindent 6 }}{{ end }}
   {{- end }}
 volumes:
   {{- with include "aerolvm.identityFileVolume" $root }}{{ . | nindent 2 }}{{ end }}
+  {{- with include "aerolvm.auditVolume" $root }}{{ . | nindent 2 }}{{ end }}
   - { name: etc, emptyDir: {} }
   - { name: state, emptyDir: {} }
   - { name: run, emptyDir: {} }

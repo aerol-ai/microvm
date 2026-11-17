@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -38,13 +36,11 @@ const ringGateTimeout = 10 * time.Second
 // build that reads a ring (cluster.ServerKeyRingAllowed); tests replace it.
 // lagging names the live members on an older build.
 var fetchRingGate = func(ctx context.Context, cfg config.Config) (ready, known bool, lagging []string, err error) {
-	host := cfg.APIHost
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
 	ctx, cancel := context.WithTimeout(ctx, ringGateTimeout)
 	defer cancel()
-	url := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.APIPort)) + "/v1/cluster/members"
+	// The admin token's own listener on a node that has one (Kubernetes
+	// enterprise mode): its API port refuses the admin token.
+	url := cfg.LocalAdminURL() + "/v1/cluster/members"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, false, nil, err

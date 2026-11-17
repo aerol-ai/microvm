@@ -29,10 +29,6 @@ import (
 // owners and modes (§11): a socket Caddy cannot reach is a 502 for the whole
 // public API, and one any local user can reach is a way around Caddy.
 
-// publicAPISocketGroup is the group Caddy runs as (the stock package's
-// caddy user). A variable so tests can use their own primary group.
-var publicAPISocketGroup = "caddy"
-
 // lookupPublicAPISocketGroup resolves the group (a seam for tests).
 var lookupPublicAPISocketGroup = user.LookupGroup
 
@@ -43,14 +39,11 @@ const (
 
 // listenPublicAPISocket makes the socket directory and the socket with
 // their owners and modes, replacing a socket a previous run left behind.
+// groupName is Caddy's group (SB_PUBLIC_API_SOCKET_GROUP): a name, or a gid.
 func listenPublicAPISocket(path, groupName string) (net.Listener, error) {
-	group, err := lookupPublicAPISocketGroup(groupName)
+	gid, err := publicAPISocketGID(groupName)
 	if err != nil {
-		return nil, fmt.Errorf("public API socket: group %q (Caddy's): %w", groupName, err)
-	}
-	gid, err := strconv.Atoi(group.Gid)
-	if err != nil {
-		return nil, fmt.Errorf("public API socket: group %q: gid %q: %w", groupName, group.Gid, err)
+		return nil, err
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, publicAPISocketDirMode); err != nil {
@@ -90,6 +83,27 @@ func listenPublicAPISocket(path, groupName string) (net.Listener, error) {
 	return ln, nil
 }
 
+// publicAPISocketGID is groupName's gid. A number is taken as it is: a
+// Kubernetes pod's edge runs as a bare uid and gid that the image's
+// /etc/group never names, so a lookup there could only fail.
+func publicAPISocketGID(groupName string) (int, error) {
+	if gid, err := strconv.Atoi(groupName); err == nil {
+		if gid < 0 {
+			return 0, fmt.Errorf("public API socket: group %q (Caddy's): a gid is not negative", groupName)
+		}
+		return gid, nil
+	}
+	group, err := lookupPublicAPISocketGroup(groupName)
+	if err != nil {
+		return 0, fmt.Errorf("public API socket: group %q (Caddy's): %w", groupName, err)
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return 0, fmt.Errorf("public API socket: group %q: gid %q: %w", groupName, group.Gid, err)
+	}
+	return gid, nil
+}
+
 // removeStaleSocket removes a socket a previous run left at path. Anything
 // else there is refused, never deleted: the path came from configuration.
 func removeStaleSocket(path string) error {
@@ -116,7 +130,7 @@ func removeStaleSocket(path string) error {
 func logPATBootSettings(logger *slog.Logger, cfg config.Config) {
 	if cfg.PATScopeHostOnly() {
 		logger.Info("operator token confined to this host and cluster peers (SB_PAT_SCOPE=host); Caddy must proxy to the public socket",
-			"public_socket", cfg.PublicAPISocket)
+			"public_socket", cfg.PublicAPISocket, "group", cfg.PublicAPISocketGroup)
 	}
 	if cfg.PATTokenPrevious != "" {
 		logger.Info("previous operator token accepted during a rotation (SB_PAT_TOKEN_PREVIOUS); remove it once every node runs the new one")

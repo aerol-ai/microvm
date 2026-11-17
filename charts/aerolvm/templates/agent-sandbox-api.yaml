@@ -13,6 +13,12 @@ metadata:
   name: {{ $name }}-gateway
   labels:
     {{- include "aerolvm.labels" . | nindent 4 }}
+  {{- /* The gateways reach the audit store under this account too. */}}
+  {{- $sa := ((.Values.audit | default dict).credentials | default dict).serviceAccount | default dict }}
+  {{- if and $sa.create $sa.annotations }}
+  annotations:
+    {{- toYaml $sa.annotations | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

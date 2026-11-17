@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 // ownGroup is the test process's primary group: a group it may chown to
@@ -67,9 +68,7 @@ func statOwner(t *testing.T, path string) (fs.FileMode, int) {
 func setEnterpriseCredentialEnv(t *testing.T) {
 	t.Helper()
 	group, _ := ownGroup(t)
-	old := publicAPISocketGroup
-	publicAPISocketGroup = group
-	t.Cleanup(func() { publicAPISocketGroup = old })
+	t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", group)
 	t.Setenv("SB_IDENTITY_ENABLED", "true")
 	t.Setenv("SB_PAT_SCOPE", "host")
 	t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "pub", "api.sock"))
@@ -182,6 +181,33 @@ func TestListenPublicAPISocketPermissions(t *testing.T) {
 			t.Fatal("want the listen error")
 		}
 	})
+	// A Kubernetes pod's edge has a gid and no group name: a number is the
+	// gid itself, never looked up.
+	t.Run("a numeric gid needs no group name", func(t *testing.T) {
+		old := lookupPublicAPISocketGroup
+		lookupPublicAPISocketGroup = func(name string) (*user.Group, error) {
+			t.Errorf("looked up %q", name)
+			return nil, user.UnknownGroupError(name)
+		}
+		t.Cleanup(func() { lookupPublicAPISocketGroup = old })
+		path := filepath.Join(shortDir(t), "pub", "api.sock")
+		ln, err := listenPublicAPISocket(path, strconv.Itoa(gid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		if mode, g := statOwner(t, filepath.Dir(path)); mode.Perm() != 0o750 || g != gid {
+			t.Fatalf("directory = %v gid %d, want 0750 gid %d", mode.Perm(), g, gid)
+		}
+		if mode, g := statOwner(t, path); mode.Perm() != 0o660 || g != gid {
+			t.Fatalf("socket = %v gid %d, want 0660 gid %d", mode.Perm(), g, gid)
+		}
+	})
+	t.Run("a negative gid is refused", func(t *testing.T) {
+		if _, err := listenPublicAPISocket(filepath.Join(shortDir(t), "api.sock"), "-1"); err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Fatalf("err = %v, want the gid refused", err)
+		}
+	})
 	t.Run("a group with a non-numeric gid", func(t *testing.T) {
 		old := lookupPublicAPISocketGroup
 		lookupPublicAPISocketGroup = func(string) (*user.Group, error) { return &user.Group{Gid: "x", Name: "caddy"}, nil }
@@ -198,9 +224,7 @@ func TestListenPublicAPISocketPermissions(t *testing.T) {
 func TestRunPublicSocketRefusesThePAT(t *testing.T) {
 	_ = setBaseRunEnv(t)
 	group, _ := ownGroup(t)
-	old := publicAPISocketGroup
-	publicAPISocketGroup = group
-	t.Cleanup(func() { publicAPISocketGroup = old })
+	t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", group)
 	path := filepath.Join(shortDir(t), "pub", "api.sock")
 	t.Setenv("SB_PAT_SCOPE", "host")
 	t.Setenv("SB_PUBLIC_API_SOCKET", path)
@@ -252,9 +276,7 @@ func TestRunPublicSocketRefusesThePAT(t *testing.T) {
 // create the socket".
 func TestRunPublicSocketFailureStopsBoot(t *testing.T) {
 	_ = setBaseRunEnv(t)
-	old := publicAPISocketGroup
-	publicAPISocketGroup = "aerolvm-no-such-group-x"
-	t.Cleanup(func() { publicAPISocketGroup = old })
+	t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", "aerolvm-no-such-group-x")
 	t.Setenv("SB_PAT_SCOPE", "host")
 	t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "api.sock"))
 	err := runUntilBootFails(t, nil)
@@ -295,5 +317,103 @@ func TestLogPATBootSettings(t *testing.T) {
 	patFree := config.Config{PATToken: "own-token", PATTokenSHA256: []string{config.PATSHA256("pat")}}
 	if got := logs(patFree); strings.Count(got, "SB_PAT_TOKEN_SHA256") != 1 || !strings.Contains(got, "hashes=1") {
 		t.Errorf("a node without the PAT logs:\n%s", got)
+	}
+}
+
+// TestRunAdminTokenListener drives the real boot with SB_PAT_LOCAL_LISTEN
+// (review S3): the admin token works on that loopback listener and is
+// refused on the API port even from 127.0.0.1, where a mesh sidecar
+// delivers outside callers. Without it (a VM), the API port's loopback
+// peer still counts as this host.
+func TestRunAdminTokenListener(t *testing.T) {
+	whoami := func(t *testing.T, addr string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/whoami", nil)
+		req.Header.Set("Authorization", "Bearer test-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err.Error()
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	for _, tc := range []struct {
+		name  string
+		local bool
+	}{{"kubernetes: a listener of its own", true}, {"a VM: the API port's loopback", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = setBaseRunEnv(t)
+			group, _ := ownGroup(t)
+			t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", group)
+			t.Setenv("SB_PAT_SCOPE", "host")
+			t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "pub", "api.sock"))
+			api := testport.Reserve(t, false)
+			t.Setenv("SB_API_PORT", strconv.Itoa(api))
+			apiAddr := "127.0.0.1:" + strconv.Itoa(api)
+			local := testport.Addr(t)
+			if tc.local {
+				t.Setenv("SB_PAT_LOCAL_LISTEN", local)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- Run(ctx, testLogger(), nil) }()
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				if code, _ := whoami(t, apiAddr); code != 0 {
+					break
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("Run returned before serving: %v", err)
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the API port never served")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			code, body := whoami(t, apiAddr)
+			if tc.local {
+				if code != http.StatusUnauthorized || !strings.Contains(body, "works only on this host") {
+					t.Errorf("the admin token on the API port from 127.0.0.1 = %d %s, want refused", code, body)
+				}
+				if code, body := whoami(t, local); code != http.StatusOK {
+					t.Errorf("the admin token on its own listener = %d %s", code, body)
+				}
+			} else {
+				if code != http.StatusOK {
+					t.Errorf("a VM: the admin token from the API port's loopback = %d %s", code, body)
+				}
+				if code, _ := whoami(t, local); code != 0 {
+					t.Errorf("a VM opened the admin token listener (answered %d)", code)
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Run: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("Run did not shut down")
+			}
+		})
+	}
+	// A port already taken stops the boot.
+	_ = setBaseRunEnv(t)
+	group, _ := ownGroup(t)
+	t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", group)
+	t.Setenv("SB_PAT_SCOPE", "host")
+	t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "pub2", "api.sock"))
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	t.Setenv("SB_PAT_LOCAL_LISTEN", held.Addr().String())
+	if err := runUntilBootFails(t, nil); err == nil || !strings.Contains(err.Error(), "SB_PAT_LOCAL_LISTEN") {
+		t.Fatalf("Run err = %v, want the listener refused", err)
 	}
 }

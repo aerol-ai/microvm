@@ -12,6 +12,10 @@ and cluster mode's pod template, which the operator stamps per worker
 {{- $cluster := .cluster -}}
 # No Kubernetes API rights (plan §8.7, wall 4).
 automountServiceAccountToken: false
+{{- with include "aerolvm.nodeServiceAccountName" $root }}
+# The audit store's credentials (IRSA): no Kubernetes rights either.
+serviceAccountName: {{ . }}
+{{- end }}
 enableServiceLinks: false
 {{- $externalStorage := $root.Values.worker.externalStorage.enabled }}
 {{- if or $externalStorage $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled $root.Values.worker.firecracker.enabled }}
@@ -304,6 +308,7 @@ containers:
       - { name: SB_ENABLE_CADDY, value: "false" }
       {{- end }}
       {{- with include "aerolvm.identityEnv" $root }}{{ . | nindent 6 }}{{ end }}
+      {{- with include "aerolvm.auditEnv" $root }}{{ . | nindent 6 }}{{ end }}
       {{- range $k, $v := $root.Values.worker.extraEnv }}
       - { name: {{ $k }}, value: {{ $v | quote }} }
       {{- end }}
@@ -332,6 +337,7 @@ containers:
       - { name: etc, mountPath: /etc/sandboxd }
       {{- end }}
       {{- with include "aerolvm.identityFileMount" $root }}{{ . | nindent 6 }}{{ end }}
+      {{- with include "aerolvm.auditMount" $root }}{{ . | nindent 6 }}{{ end }}
       # The CNI host-local plugin's record of the addresses it gave
       # out. In the container's own filesystem it was lost on an agent
       # restart, and the next warm slot got a running sandbox's
@@ -383,6 +389,7 @@ containers:
       - { name: edge-tls, mountPath: /etc/aerolvm/tls, readOnly: true }
       - { name: edge-data, mountPath: /data }
       - { name: edge-state, mountPath: /config }
+      {{- with include "aerolvm.publicSocketMount" $root }}{{ . | nindent 6 }}{{ end }}
   {{- end }}
   - name: egress
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
@@ -424,6 +431,7 @@ containers:
       - { name: egress-state, mountPath: /var/lib/aerolvm-egress }
 volumes:
   {{- with include "aerolvm.identityFileVolume" $root }}{{ . | nindent 2 }}{{ end }}
+  {{- with include "aerolvm.auditVolume" $root }}{{ . | nindent 2 }}{{ end }}
   - name: containerd
     {{- toYaml $root.Values.worker.containerdVolume | nindent 4 }}
   - name: state

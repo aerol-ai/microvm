@@ -251,8 +251,24 @@ func TestReadStopGuardEnv(t *testing.T) {
 	os.WriteFile(envFile, []byte("SB_PAT_TOKEN=pat-1\nSB_API_PORT=9999\nSB_API_HOST=0.0.0.0\n"), 0o600)
 	os.WriteFile(filepath.Join(dir, "cluster.env"), []byte("SB_ENABLE_CLUSTER=true\nSB_NODE_ID=s2\nSB_API_HOST=10.0.0.5\n"), 0o600)
 	e := readStopGuardEnv(envFile)
-	if !e.cluster || e.nodeID != "s2" || e.pat != "pat-1" || e.apiURL != "http://10.0.0.5:9999" {
+	// SB_API_HOST=10.0.0.5: the admin token stays on loopback (round 3).
+	if !e.cluster || e.nodeID != "s2" || e.pat != "pat-1" || e.apiURL != "http://127.0.0.1:9999" {
 		t.Fatalf("env = %+v", e)
+	}
+	// The admin token's own listener, when the node has one: its API port
+	// refuses the admin token (round-2 review, item 1). Only under host
+	// scope, where a node can have one at all.
+	for _, tc := range []struct{ env, want string }{
+		{"SB_PAT_SCOPE=host\nSB_PAT_LOCAL_LISTEN=127.0.0.1:21219\nSB_API_PORT=21212\n", "http://127.0.0.1:21219"},
+		{"SB_PAT_SCOPE=HOST\nSB_PAT_LOCAL_LISTEN=[::1]:21219\n", "http://[::1]:21219"},
+		{"SB_PAT_SCOPE=any\nSB_PAT_LOCAL_LISTEN=127.0.0.1:21219\n", "http://127.0.0.1:21212"},
+		{"SB_PAT_SCOPE=host\nSB_API_HOST=::\nSB_API_PORT=9000\n", "http://127.0.0.1:9000"},
+	} {
+		d := t.TempDir()
+		os.WriteFile(filepath.Join(d, "sandboxd.env"), []byte(tc.env), 0o600)
+		if got := readStopGuardEnv(filepath.Join(d, "sandboxd.env")).apiURL; got != tc.want {
+			t.Errorf("%q: apiURL %s, want %s", tc.env, got, tc.want)
+		}
 	}
 	// No files: off cluster mode, default local API.
 	e = readStopGuardEnv(filepath.Join(t.TempDir(), "sandboxd.env"))

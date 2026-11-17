@@ -44,3 +44,25 @@ func TestPickAdvertise(t *testing.T) {
 		})
 	}
 }
+
+// The installer's init, join and adopt send the admin token to this node:
+// to the admin token's own listener when it has one (its API port refuses
+// the admin token then), else the API port (round-2 review, item 1).
+func TestLocalAPIUsesTheAdminListener(t *testing.T) {
+	for _, tc := range []struct {
+		env  map[string]string
+		want string
+	}{
+		{map[string]string{}, "http://127.0.0.1:21212"},
+		{map[string]string{"SB_API_PORT": "9000", "SB_API_HOST": "0.0.0.0"}, "http://127.0.0.1:9000"},
+		{map[string]string{"SB_PAT_SCOPE": "host", "SB_PAT_LOCAL_LISTEN": "127.0.0.1:21219"}, "http://127.0.0.1:21219"},
+		{map[string]string{"SB_PAT_LOCAL_LISTEN": "127.0.0.1:21219"}, "http://127.0.0.1:21212"},
+	} {
+		if got := (nodeEnv{merged: tc.env}).localAPI("").base; got != tc.want {
+			t.Errorf("%v: %s, want %s", tc.env, got, tc.want)
+		}
+	}
+	if got := (nodeEnv{merged: map[string]string{}}).localAPI("http://x:1").base; got != "http://x:1" {
+		t.Errorf("a given base is kept: %s", got)
+	}
+}

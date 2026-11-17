@@ -56,6 +56,7 @@ The chart's `templates/operator.yaml` names every one:
 - **Cluster-wide:** create TokenReviews, to check which pod is asking to join.
 - **In `default`:** read the `kubernetes` Service and its EndpointSlice, to keep sandboxes away from the API server.
 - **In external-CA mode only:** create and delete cert-manager `Certificate` objects in its two namespaces, one per node.
+- **In enterprise mode only:** open a port-forward to a pod in its own namespace, to make its own API token on a server ([below](#turn-on-enterprise-mode)).
 - **Not:** `pods/exec`, any other namespace, or any RBAC object.
 
 During a cluster-mode `helm upgrade`, a short Job also runs with rights to get and update the two AerolVM CRDs, by name, and nothing else. Helm deletes it, with its role, when it succeeds. If it fails, its pod stays: delete it once fixed, or `aerolvm k8s verify` counts it as a pod holding an API credential.
@@ -116,13 +117,75 @@ Each cloud machine has a metadata service that hands out the machine's own cloud
 
 Karpenter sets both by default. EKS managed node groups with a custom launch template default to a hop limit of 2: set it to 1 there.
 
+## Turn on enterprise mode
+
+[Enterprise mode](/enterprise/enterprise-mode/) makes every server, gateway and worker refuse to start unless every strict security rule holds. On Kubernetes it runs in cluster mode, and it needs three things the chart sets for you once you give it the values:
+
+- **API tokens on every node** (`identity.enabled`).
+- **An audit witness** (`audit.witness`): an S3 bucket with Object Lock, where each node writes the head of its audit chain. Make the bucket and the node role as [Turn it on](/enterprise/enterprise-mode/#turn-it-on) shows.
+- **An audit export** that leaves the node (`audit.export`): a second S3 bucket, or your collector over https.
+
+Each node signs in to S3 through IRSA: a service account the chart makes (`audit.credentials.serviceAccount`, with your role in its annotations), whose role reaches only the AerolVM server container of each pod. That account has no Kubernetes rights. With `cluster.agentSandboxAPI`, the gateways run as `<cluster>-gateway` instead, which has that API's two rights and gets the same annotations, so the role must trust it too. Keys in a Secret work as well. EKS Pod Identity does not: the workers' egress policy keeps them off its agent's link-local address. With `networkPolicy.enabled`, a private S3 address, such as an interface VPC endpoint, also goes in `networkPolicy.extraEgressCIDRs`.
+
+```yaml title="values.yaml"
+identity:
+  enabled: true
+enterprise:
+  enabled: true
+audit:
+  witness:
+    bucket: my-audit-witness
+    region: eu-west-1
+  export:
+    backend: s3
+    s3:
+      bucket: my-audit-export
+      region: eu-west-1
+  credentials:
+    serviceAccount:
+      create: true
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/aerolvm-audit
+```
+
+The chart refuses to render if a setting is missing that a node would refuse at start. That includes more than 10 gateways: past 10, enterprise mode needs a router in front of the gateways that sends each request to the gateway serving its sandbox. If yours does, set `worker.extraEnv.SB_CLUSTER_SHARD_AWARE_INGRESS: "true"`, which reaches every node.
+
+### The admin token stays inside the servers
+
+In enterprise mode a node takes the admin token only from inside its own pod, on a port of its own (21219, bound to the pod's loopback), and from the cluster's own nodes. The edge reaches the AerolVM server on a private socket where the admin token is refused, so the admin token never works from the internet. Node pods also opt out of Istio and Linkerd sidecars: a sidecar delivers outside callers to the server from loopback. To use the admin token, open a port-forward to a server and sign in there:
+
+```bash title="Your machine"
+kubectl -n aerolvm-system port-forward pod/aerolvm-server-0 21212:21219
+# In a second terminal:
+kubectl -n aerolvm-system get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d \
+  | aerolvm login http://127.0.0.1:21212 --token-stdin
+aerolvm token create --name ci --role runner --team payments --expires-in 90d
+```
+
+Use [SSO](/enterprise/sso/) or API tokens for everything else, the Prometheus scrape token included. `aerolvm k8s verify` needs an admin API token, or the port-forward.
+
+The operator needs admin rights for its own calls. It makes an admin API token for itself the same way: through a port-forward to a Ready server, the one time it needs the admin token. It keeps it in the Secret `<cluster>-operator-token`, makes a new one before a third of its 30-day life is left (shorter if `identity.tokenMaxTTL` is), and revokes the old one five minutes later. If the servers stop taking it, it checks it on a server itself before it makes another. Every other token named `aerolvm-operator-*` it finds is revoked, so none is left live after a crash. That name is kept for the operator: only the admin token, or the operator's current token when it makes the next one, can create such a token, and the token works only when sent straight to a server, never through a gateway. The admin token goes over the network only while a server pod still takes it there, while enterprise mode is being turned on.
+
+### On a running install
+
+A pod reads these settings when it is made. Turn enterprise mode on in a `helm upgrade` of its own, after any version upgrade has finished (the AerolCluster's `RUNNING` column shows the new version): a pod made again mid-rollout keeps its old version, which cannot start in enterprise mode. After that upgrade:
+
+1. Move every tool that uses the admin token over the network to SSO or an API token.
+2. Delete the gateway pods one at a time. Wait until each replacement's AerolNode says `Serving` before the next.
+3. Do the same for the server pods.
+4. Replace the worker machines, as for any machine change (`kubectl cordon`).
+
+Do it soon after the upgrade: the edge's new settings already point at the private socket, so an old pod whose edge container restarts answers the API with 502.
+
+To turn enterprise mode off, do the same after that upgrade: replace the gateway pods, then the server pods, then the worker machines. Do not skip the server pods. Once enterprise mode is off the operator stops renewing its own API token, and when that token expires (within 30 days) the operator can no longer reach a server still running in enterprise mode.
+
 ## Check a live install
 
 `aerolvm k8s verify` checks a running install against the rules above. It needs:
 
 - the [`aerolvm` CLI](/cli/#install), v0.7.1 or later;
 - a kubectl context that can read pods, NetworkPolicies, namespaces and nodes;
-- `SB_API_URL` and `SB_PAT_TOKEN` pointing at the install. It makes two test sandboxes, and deletes them after.
+- `SB_API_URL` and `SB_PAT_TOKEN` pointing at the install. It makes two test sandboxes, and deletes them after. In enterprise mode, use an admin API token, or point it at a server through `kubectl port-forward`.
 
 ```bash title="Your machine, cluster mode"
 aerolvm k8s verify --namespace aerolvm-system --worker-namespace aerolvm-workers --release aerolvm --cluster aerolvm

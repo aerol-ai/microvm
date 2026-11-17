@@ -15,13 +15,19 @@ import (
 // +kubebuilder:rbac marker goes here too.
 var clusterScoped = []string{"nodes", "nodeclaims", "servicecidrs", "tokenreviews"}
 
+// releaseOnly are rights the operator uses only in its own namespace, where
+// the servers run: the chart grants them there and not in the worker
+// namespace.
+var releaseOnly = []string{"pods/portforward"}
+
 // The chart grants the operator every right its +kubebuilder:rbac markers
 // ask for (config/rbac/role.yaml, generated): cluster-scoped ones in its
 // ClusterRole, the rest in both namespaces it works in, and the default
 // namespace's in a Role there. A right only the markers have fails live,
 // on a real cluster, and nowhere else. CI renders templates/operator.yaml
 // with every gated right on (external-CA mode's Certificates) and points
-// AEROLVM_CHART_OPERATOR at it; without it the test skips.
+// AEROLVM_CHART_OPERATOR at it; without it the test skips. Enterprise
+// mode's port-forward right is gated too, so CI renders with it on.
 func TestChartGrantsGeneratedRBAC(t *testing.T) {
 	path := os.Getenv("AEROLVM_CHART_OPERATOR")
 	if path == "" {
@@ -40,6 +46,12 @@ func TestChartGrantsGeneratedRBAC(t *testing.T) {
 					return
 				}
 				for _, ns := range []string{releaseNS, workerNS} {
+					if ns == workerNS && slices.Contains(releaseOnly, res) {
+						if grants(chart.clusterRoles, group, res, verb, nil) || grants(chart.roles[ns], group, res, verb, nil) {
+							t.Errorf("the chart grants %s %s/%s in %s; the operator needs it only in its own namespace", verb, group, res, ns)
+						}
+						continue
+					}
 					if !grants(chart.clusterRoles, group, res, verb, nil) && !grants(chart.roles[ns], group, res, verb, nil) {
 						t.Errorf("the chart lacks %s %s/%s in %s", verb, group, res, ns)
 					}
