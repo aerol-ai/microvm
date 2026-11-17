@@ -136,7 +136,10 @@ func (h *handlers) bindCreateCustomDomains(req models.CreateSandboxRequest) func
 	}
 }
 
-// statusCapture records the status a handler answered with.
+// statusCapture records the status a handler set with WriteHeader. A
+// handler that writes its body without one answers 200, which leaves
+// status 0: only a 4xx matters to the caller. The body goes straight to
+// the embedded writer; nothing here reads or copies it.
 type statusCapture struct {
 	http.ResponseWriter
 	status int
@@ -147,13 +150,6 @@ func (c *statusCapture) WriteHeader(code int) {
 		c.status = code
 	}
 	c.ResponseWriter.WriteHeader(code)
-}
-
-func (c *statusCapture) Write(b []byte) (int, error) {
-	if c.status == 0 {
-		c.status = http.StatusOK
-	}
-	return c.ResponseWriter.Write(b)
 }
 
 func (c *statusCapture) Flush() {

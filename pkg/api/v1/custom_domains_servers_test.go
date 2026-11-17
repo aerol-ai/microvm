@@ -131,6 +131,11 @@ func TestServerBindsTheAttachFirst(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			if ownerStatus == 0 {
+				// A body with no WriteHeader: the implicit 200.
+				_, _ = w.Write([]byte(`{"hostname":"app.customer.com"}`))
+				return
+			}
 			w.WriteHeader(ownerStatus)
 		})
 		mux := http.NewServeMux()
@@ -156,6 +161,7 @@ func TestServerBindsTheAttachFirst(t *testing.T) {
 		wantMarked  bool
 	}{
 		{name: "the owner takes it", body: attach, owner: http.StatusCreated, wantCode: http.StatusCreated, wantBound: 1, wantMarked: true},
+		{name: "the owner answers with a body only", body: attach, owner: 0, wantCode: http.StatusOK, wantBound: 1, wantMarked: true},
 		{name: "the owner refuses it", body: attach, owner: http.StatusConflict, wantCode: http.StatusConflict, wantBound: 1, wantRemoved: 1, wantMarked: true},
 		{name: "the outcome is unknown", body: attach, owner: http.StatusBadGateway, wantCode: http.StatusBadGateway, wantBound: 1, wantMarked: true},
 		{name: "the owner's half", body: attach, forwarded: true, owner: http.StatusCreated, wantCode: http.StatusCreated},
