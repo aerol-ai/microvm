@@ -9,6 +9,10 @@ In cluster mode, the chart installs an **operator** and one `AerolCluster` objec
 
 This page installs it on EKS with Karpenter. Notes for AKS and fixed node groups are inline. Plan about an hour.
 
+<Aside>
+**Starting from nothing on AWS?** [One-click EKS](/kubernetes/eks/) does every step on this page for you, on a new EKS cluster, from one CloudFormation stack.
+</Aside>
+
 ```mermaid
 flowchart TB
     App["Your app (SDK, CLI or kubectl)"] --> Svc["Service aerolvm-gateway"]
