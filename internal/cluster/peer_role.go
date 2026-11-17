@@ -24,7 +24,11 @@ import (
 // On a server, the server role always needs Raft membership: an admitted
 // record or a certificate that says server, for a node Raft does not
 // count, reads as no role. Raft membership is what every server-only check
-// already binds to (peerIsServer), and it cannot be claimed in gossip.
+// already binds to (peerIsServer). Once a node has an admitted record,
+// gossip does not change it (admittedNonServer). Before that, the leader
+// adds any member without an admitted record that gossips a Raft address
+// (handleMemberJoin, voter_autojoin.go), so in a cluster whose members
+// were never adopted, Raft membership follows what members gossip.
 //
 // The certificate's role is the cluster CA's DNS:role:<role>, which the
 // join service signs from the join token's role, or an external CA's

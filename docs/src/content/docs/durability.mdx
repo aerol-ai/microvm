@@ -253,6 +253,7 @@ Good to know:
 
 - **The image must be reachable from every node.** Recreate is refused for an image that exists on only one node. Examples are a local build, or a [snapshot](/images-and-snapshots/#snapshots) (a saved copy of a sandbox) that was not shared.
 - **The sandbox's own disk is still lost.** Put data you need on attached storage.
+- **Some settings are not rebuilt on another node.** These are settings only the operator or an admin may use: an [external storage](/external-storage/) mount, a WebAssembly module read from a file on the server, or a JavaScript bundle read from a file. A sandbox with one of them does not move when its node dies; it waits for that node to return. If one reaches another node anyway, that node does not start it: the sandbox shows as failed, with the reason. [Platform volumes](/platform-volumes/) do move with the sandbox.
 
 ### Expose a port again by hand
 

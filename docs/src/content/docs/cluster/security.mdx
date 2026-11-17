@@ -36,8 +36,11 @@ A node's certificate gets only what its role needs:
 
 - **A server or mixed node's certificate** can do what the admin token can. Those nodes hold the admin token anyway.
 - **A worker or ingress node's certificate** reaches only the calls nodes make to each other, plus a few reads: who is in the cluster, and which server leads. A node may also drain, read or remove itself, and carry the SSH sessions its SSH gateway opens for a sandbox's key holder. Everything else it asks for as itself is refused with `403`.
-- **An ingress node's certificate** also does the work of the [Kubernetes agent-sandbox API](/kubernetes/kubectl/), which runs there: it creates, deletes, starts and stops sandboxes for the Kubernetes users that API checked, each with that user's team only, and it keeps that API's warm pool sizes.
+- **An ingress node's certificate** also does the work of the [Kubernetes agent-sandbox API](/kubernetes/kubectl/), which runs there: it creates, deletes, starts and stops sandboxes for the Kubernetes users that API checked, and it keeps that API's warm pool sizes.
+- **Custom domains:** a worker adds one to a sandbox it runs only when the server that leads finds the domain's DNS proof itself. No node but a server binds the cluster's own names (your cluster domain, a name under it, or the API host), and ingress nodes never route those names to a sandbox.
 - **API tokens, identity roles, egress profiles, team quotas and warm pools** (apart from those agent-sandbox sizes) are written only by servers. When you send one of those, or an operator call such as making a join token or draining another node, to a worker or ingress node, it passes the call on to a server with your own token. The server checks your token and records you as the caller.
+
+While a worker or ingress node still runs an earlier release, it passes other nodes' changes to the cluster state on to the leader. The leader checks each such change as one from that node, so until that node is upgraded, another node can change the sandboxes that node runs. Upgrade every node to close this.
 
 In a cluster built the old way, with `cluster-sign-node.sh` (Terraform's `one_line_join = false`), node certificates name no role. A worker or ingress node there cannot pass those calls on to a server, so send them to a server yourself.
 
