@@ -84,9 +84,23 @@ type ServerSigningGate struct {
 	// role: in a cluster signed before roles, no peer can prove it is a
 	// server, so servers never take over.
 	RolesInCertificates bool
+	// ServersAtVersion: every Raft server runs a build at the version
+	// servers sign from, so each one applies the record. RolloutInFlight:
+	// a rollout is under way, whose finalize moves the active version.
+	ServersAtVersion bool
+	RolloutInFlight  bool
 	// Allowed and, when not, Reason.
 	Allowed bool
 	Reason  string
+}
+
+// Held reports whether the record waits on something only the operator
+// can resolve: the active version allows it, or every server runs the
+// build with no rollout to move the active version, and still the gate
+// is shut (the gauge aerolvm_server_signing_held, its alert, and the
+// leader's log).
+func (g ServerSigningGate) Held() bool {
+	return !g.Allowed && (g.ActiveFV >= serverSigningFSMOpsVersion || g.ServersAtVersion && !g.RolloutInFlight)
 }
 
 // ServerSigningGate reads the gate. The record is written once the active
@@ -99,6 +113,12 @@ type ServerSigningGate struct {
 // version's first write, which counts only the servers: then every live
 // member must report the version too, or the operator starts it anyway
 // (force; aerolvm upgrade signing start).
+//
+// Below the version, an upgrade with no rollout (install.sh, sandboxd
+// upgrade node) moves the active version only once every live member
+// reports the new build, so one member on an older build, or one that
+// reports none, keeps it there. Once every Raft server runs the build,
+// each applies the record, so the operator may start it anyway then too.
 func (c *Cluster) ServerSigningGate(force bool) ServerSigningGate {
 	g := ServerSigningGate{RolesInCertificates: c.certNamesServerRole()}
 	if c == nil || c.fsm == nil {
@@ -110,9 +130,19 @@ func (c *Cluster) ServerSigningGate(force bool) ServerSigningGate {
 		g.FirstWrite = av.FromFV == 0 && strings.TrimSpace(av.RolloutID) == ""
 	}
 	g.Waiting = c.membersBelow(serverSigningFSMOpsVersion)
+	if g.ActiveFV < serverSigningFSMOpsVersion {
+		g.ServersAtVersion = c.raftServersRunAtLeast(serverSigningFSMOpsVersion, "server signing") == nil
+		r, _ := c.fsm.rolloutView()
+		g.RolloutInFlight = !rolloutTerminal(r)
+	}
 	switch {
-	case g.ActiveFV < serverSigningFSMOpsVersion:
-		g.Reason = fmt.Sprintf("the active cluster version is %d; servers sign from %d: finish the upgrade (aerolvm upgrade finalize)", g.ActiveFV, serverSigningFSMOpsVersion)
+	case g.ActiveFV < serverSigningFSMOpsVersion && !g.ServersAtVersion:
+		g.Reason = fmt.Sprintf("the active cluster version is %d and servers sign from %d: upgrade every server first", g.ActiveFV, serverSigningFSMOpsVersion)
+	case g.ActiveFV < serverSigningFSMOpsVersion && g.RolloutInFlight && !force:
+		g.Reason = fmt.Sprintf("the active cluster version is %d and servers sign from %d: finish the upgrade (aerolvm upgrade finalize)", g.ActiveFV, serverSigningFSMOpsVersion)
+	case g.ActiveFV < serverSigningFSMOpsVersion && !force:
+		g.Reason = fmt.Sprintf("the active cluster version is %d and servers sign from %d: it moves there once every live member runs the new build, and these report an older version, or none: %s; upgrade them, or start server signing anyway (aerolvm upgrade signing start)",
+			g.ActiveFV, serverSigningFSMOpsVersion, strings.Join(g.Waiting, ", "))
 	case !g.RolesInCertificates:
 		g.Reason = "this cluster's certificates name no role, so no node can prove a server is one: tokens are signed as before"
 	case g.FirstWrite && len(g.Waiting) > 0 && !force:
@@ -184,10 +214,17 @@ func (c *Cluster) WriteServerSigning(ctx context.Context, w ServerSigningWrite, 
 // The feed and the two sign calls go only to a peer whose certificate
 // names the server role (ServerClientForPeer): the feed says which keys
 // this node takes tokens signed with, so it is never read from a member
-// that only says it is a server in gossip. In a cluster whose certificates
-// name no role (signed by cluster-sign-node.sh), no peer proves it, and
-// the leader never writes the record either (Cluster.ServerSigningAllowed):
-// tokens are signed as before.
+// that only says it is a server in gossip. In a cluster whose servers'
+// certificates name no role (signed by cluster-sign-node.sh), no server
+// proves it, and no server can sign either: the leader writes the record
+// only with a certificate that names its role (Cluster.ServerSigningGate).
+// So when every server answers with a certificate that names no role at
+// all, the feed's answer is that there is no record, as on a server tier
+// from before the feed, and tokens are signed as before. This node's own
+// certificate does not decide it: a node joined with a role, in a cluster
+// whose servers still hold certificates from before roles, reads the
+// same, and one from before roles, among servers that prove theirs,
+// follows them.
 
 // doServerJSON is doControlPlaneJSON to the server-role members that prove
 // it. A peer that does not, or cannot be reached, is skipped for the next:
@@ -206,12 +243,14 @@ func (a *Agent) doServerJSON(ctx context.Context, method, path string, in, out a
 		return errors.New("cluster agent: no live server-role control-plane members")
 	}
 	var firstErr error
+	roleLess := true
 	for _, m := range members {
 		err := a.tryServerMember(ctx, m, method, path, body, out)
 		if err == nil {
 			a.contact.record(time.Now())
 			return nil
 		}
+		roleLess = roleLess && errors.Is(err, ErrPeerCertNamesNoRole)
 		if firstErr == nil || errors.Is(firstErr, ErrPeerCertNotServer) {
 			firstErr = err
 		}
@@ -220,8 +259,15 @@ func (a *Agent) doServerJSON(ctx context.Context, method, path string, in, out a
 		}
 		return err
 	}
+	if roleLess {
+		return fmt.Errorf("%w: %v", ErrServersNameNoRole, firstErr)
+	}
 	return firstErr
 }
+
+// ErrServersNameNoRole is a server-only call no server could take because
+// every one answered with a certificate that names no role (doServerJSON).
+var ErrServersNameNoRole = errors.New("cluster agent: every server's certificate names no role")
 
 func (a *Agent) tryServerMember(ctx context.Context, m Member, method, path string, body []byte, out any) error {
 	if a.internalClient == nil || strings.TrimSpace(m.InternalURL) == "" {
@@ -235,11 +281,12 @@ func (a *Agent) tryServerMember(ctx context.Context, m Member, method, path stri
 }
 
 // FetchSigningKeys asks the server tier for the feed. A server tier from
-// before it answers 404: no record anywhere, the ring signs.
+// before it answers 404, and one whose certificates name no role cannot
+// sign (see above): no record anywhere, the ring signs.
 func (a *Agent) FetchSigningKeys(ctx context.Context) (SigningKeys, error) {
 	var out SigningKeys
 	err := a.doServerJSON(ctx, http.MethodGet, PublicInternalSigningKeysPath, nil, &out)
-	if isStatus(err, http.StatusNotFound) {
+	if isStatus(err, http.StatusNotFound) || errors.Is(err, ErrServersNameNoRole) {
 		return SigningKeys{}, nil
 	}
 	return out, err

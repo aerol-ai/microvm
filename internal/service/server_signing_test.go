@@ -31,6 +31,14 @@ type signingServer struct {
 	forced  bool
 	// endAt is the leader's clock for an end of old tokens.
 	endAt int64
+	// stale: this server lost contact with the leader.
+	stale bool
+}
+
+func (c *signingServer) PlacementViewStale() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stale
 }
 
 func newSigningServer(id string) *signingServer {
@@ -49,7 +57,9 @@ func (c *signingServer) ServerSigningRecord() (cluster.ServerSigning, bool) {
 func (c *signingServer) ServerSigningGate(force bool) cluster.ServerSigningGate {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	g := cluster.ServerSigningGate{ActiveFV: cluster.ServerSigningFSMOpsVersion, Waiting: c.waiting, RolesInCertificates: true, Allowed: c.allowed || force}
+	// An upgrade with no rollout that one member holds below the version,
+	// every server on it: the operator may start it.
+	g := cluster.ServerSigningGate{ActiveFV: cluster.ServerSigningFSMOpsVersion - 1, ServersAtVersion: true, Waiting: c.waiting, RolesInCertificates: true, Allowed: c.allowed || force}
 	if !g.Allowed {
 		g.Reason = "held for the test"
 	}

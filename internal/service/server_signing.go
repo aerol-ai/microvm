@@ -224,6 +224,9 @@ func (s *Service) SigningKeysFeed() (cluster.SigningKeys, error) {
 	if _, ok := s.Cluster().(serverSigningCluster); !ok {
 		return cluster.SigningKeys{}, ErrServerSigningOff
 	}
+	if err := s.signingViewFresh(); err != nil {
+		return cluster.SigningKeys{}, err
+	}
 	k, err := s.openServerKeys()
 	if err != nil || k == nil {
 		return cluster.SigningKeys{}, err
@@ -238,6 +241,19 @@ func (s *Service) SigningKeysFeed() (cluster.SigningKeys, error) {
 		}
 	}
 	return out, nil
+}
+
+// signingViewFresh refuses an answer from a server cut off from the
+// leader: its FSM stopped where it lost contact, so it would keep saying
+// servers do not sign, or sign for a sandbox's owner of before, with a
+// fresh answer each time. The bound is the placement reads'
+// (cluster.PlacementViewFresh). The caller answers 503, and the node tries
+// the next server (the leader is never stale).
+func (s *Service) signingViewFresh() error {
+	if !cluster.PlacementViewFresh(s.Cluster()) {
+		return cluster.ErrStalePlacementView
+	}
+	return nil
 }
 
 // UpkeepServerSigning is one pass of the leader's upkeep: write the record
@@ -272,11 +288,11 @@ func (s *Service) UpkeepServerSigning(ctx context.Context) error {
 // signingHeldLogEvery is how often the leader repeats why the record waits.
 const signingHeldLogEvery = 10 * time.Minute
 
-// logSigningHeld logs why the record waits, once the active version allows
-// it (before that a rollout is simply not finished): on a new reason, then
-// every signingHeldLogEvery.
+// logSigningHeld logs why the record waits, once it waits on the operator
+// (cluster.ServerSigningGate.Held; before that an upgrade is simply not
+// finished): on a new reason, then every signingHeldLogEvery.
 func (s *Service) logSigningHeld(g cluster.ServerSigningGate) {
-	if g.ActiveFV < cluster.ServerSigningFSMOpsVersion {
+	if !g.Held() {
 		return
 	}
 	st := &s.serverSigning
@@ -322,9 +338,9 @@ func (s *Service) writeServerSigningRecord(ctx context.Context, c serverSigningC
 var ErrServerSigningNotLeader = errors.New("only the cluster leader starts server signing or ends old tokens")
 
 // StartServerSigning writes the record now, past members that report an
-// older or unknown version (the operator's override of the one gossip
-// check, cluster.ServerSigningGate). The active cluster version still has
-// to allow it. A record that exists is answered as it is.
+// older or unknown version (the operator's override of the gossip checks,
+// cluster.ServerSigningGate). Every Raft server still has to run the
+// build that applies it. A record that exists is answered as it is.
 func (s *Service) StartServerSigning(ctx context.Context) (cluster.ServerSigning, error) {
 	c, ok := s.Cluster().(serverSigningCluster)
 	if !ok || !c.IsLeader() {

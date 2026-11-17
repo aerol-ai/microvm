@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/raft"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
 
 // Regression tests for the servers' signing record in the FSM (CLAUDE.md
@@ -140,18 +141,46 @@ func TestServerSigningGate(t *testing.T) {
 	}
 	c.selfCertRole = func() string { return JoinRoleServer }
 
-	// Below the version: never, forced or not.
+	// Below the version, every server at it and no rollout (an upgrade
+	// with install.sh): the members that hold the active version are
+	// named, the gate is held, and the operator may start it.
 	c.fsm.mu.Lock()
 	c.fsm.activeVersion = nil
 	c.fsm.publishActiveLocked()
 	c.fsm.mu.Unlock()
 	setActive(t, c, 2, serverSigningFSMOpsVersion-1, 0, "")
-	if g := c.ServerSigningGate(true); g.Allowed || !strings.Contains(g.Reason, "aerolvm upgrade finalize") {
-		t.Fatalf("below the version: %+v", g)
+	if g := c.ServerSigningGate(false); g.Allowed || !g.ServersAtVersion || g.RolloutInFlight || !g.Held() ||
+		!strings.Contains(g.Reason, "wkr-quiet") || !strings.Contains(g.Reason, "aerolvm upgrade signing start") {
+		t.Fatalf("below the version, no rollout: %+v", g)
+	}
+	if !c.ServerSigningGate(true).Allowed {
+		t.Fatal("the operator could not start it with every server at the version")
+	}
+	// A rollout under way: its finalize moves the version; not held.
+	c.fsm.mu.Lock()
+	c.fsm.rollout = &RolloutRecord{ID: "r-9", State: upgradewire.StateDone}
+	c.fsm.mu.Unlock()
+	if g := c.ServerSigningGate(false); g.Allowed || !g.RolloutInFlight || g.Held() || !strings.Contains(g.Reason, "aerolvm upgrade finalize") {
+		t.Fatalf("below the version, a rollout under way: %+v", g)
+	}
+	c.fsm.mu.Lock()
+	c.fsm.rollout = nil
+	c.fsm.mu.Unlock()
+	// A server below the version: never, forced or not.
+	if err := c.raft.raft.AddNonvoter("srv-old", "127.0.0.1:1", 0, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	seedGossipView(t, c, []Member{self, member("wkr-quiet", 0), member("srv-old", serverSigningFSMOpsVersion-1)})
+	if g := c.ServerSigningGate(true); g.Allowed || g.ServersAtVersion || g.Held() || !strings.Contains(g.Reason, "upgrade every server first") {
+		t.Fatalf("a server below the version: %+v", g)
 	}
 	if _, err := c.WriteServerSigning(ctx, w, true); !errors.Is(err, ErrClusterVersion) {
-		t.Fatalf("a forced write below the version = %v", err)
+		t.Fatalf("a forced write with a server below the version = %v", err)
 	}
+	if err := c.raft.raft.RemoveServer("srv-old", 0, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	seedGossipView(t, c, []Member{self, member("wkr-quiet", 0), member("wkr-new", serverSigningFSMOpsVersion)})
 
 	// Moved there from a written version: gossip does not hold it.
 	setActive(t, c, 3, serverSigningFSMOpsVersion, serverSigningFSMOpsVersion-1, "")

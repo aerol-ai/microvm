@@ -363,3 +363,74 @@ func BenchmarkSigningModeFromAFreshCopy(b *testing.B) {
 		}
 	}
 }
+
+// A server cut off from the leader answers neither the feed nor a sign
+// call: its view stopped when it lost contact. The node tries the next
+// server; the leader is never cut off from itself.
+func TestACutOffServerAnswersNoSigningCall(t *testing.T) {
+	h, _, srv, _ := identityPair(t)
+	ctx := context.Background()
+	h.allow(t, "payments", "deploy", "runner")
+	if err := h.svc.EnsureIdentityKeysReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	turnOnServerSigning(t, h.svc, time.Now())
+	srv.placements["sb-1"] = cluster.Placement{SandboxID: "sb-1", OwnerNodeID: "wkr-1", OwnerRef: "team:payments",
+		Spec: &models.CreateSandboxRequest{Identity: &models.IdentityRequest{RoleTag: "deploy"}}}
+	setSandboxTokenClock(t, time.Now())
+	claims := func() []byte {
+		raw, _ := jsonMarshal(sandboxtoken.Claims{Version: 1, TokenID: mustTokenID(t), SandboxID: "sb-1", Owner: "team:payments",
+			IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(10 * time.Minute).Unix()})
+		return raw
+	}
+	srv.mu.Lock()
+	srv.stale = true
+	srv.mu.Unlock()
+	if _, err := h.svc.SigningKeysFeed(); !errors.Is(err, cluster.ErrStalePlacementView) {
+		t.Fatalf("feed from a cut-off server = %v", err)
+	}
+	if _, err := h.svc.SignSandboxTokenFor(ctx, "wkr-1", false, claims()); !errors.Is(err, cluster.ErrStalePlacementView) {
+		t.Fatalf("token sign on a cut-off server = %v", err)
+	}
+	if _, err := h.svc.SignIdentityTokenFor(ctx, "wkr-1", false, cluster.IdentityTokenSignRequest{SandboxID: "sb-1"}); !errors.Is(err, cluster.ErrStalePlacementView) {
+		t.Fatalf("identity sign on a cut-off server = %v", err)
+	}
+	srv.mu.Lock()
+	srv.stale = false
+	srv.mu.Unlock()
+	if feed, err := h.svc.SigningKeysFeed(); err != nil || feed.SinceUnixNano == 0 {
+		t.Fatalf("feed once in contact = %+v %v", feed, err)
+	}
+	if _, err := h.svc.SignSandboxTokenFor(ctx, "wkr-1", false, claims()); err != nil {
+		t.Fatalf("token sign once in contact = %v", err)
+	}
+	if _, err := h.svc.SignIdentityTokenFor(ctx, "wkr-1", false, cluster.IdentityTokenSignRequest{SandboxID: "sb-1"}); err != nil {
+		t.Fatalf("identity sign once in contact = %v", err)
+	}
+}
+
+// In a cluster whose servers' certificates name no role, the feed answers
+// that servers do not sign (cluster.Agent.FetchSigningKeys), on every
+// read: a worker goes on signing and checking tokens itself, through every
+// refresh, as before this release.
+func TestTokensWhereEveryServerNamesNoRole(t *testing.T) {
+	server, worker, _, wk, st := signingPair(t)
+	seedTokenSandbox(t, st, "sb-1", "team:a", models.SandboxStatusStarted)
+	setSandboxTokenClock(t, time.Now())
+	for i := 0; i < 3; i++ {
+		tok, err := worker.IssueSandboxToken(teamCtx("a"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"})
+		if err != nil {
+			t.Fatalf("pass %d: issue = %v", i, err)
+		}
+		for name, svc := range map[string]*Service{"worker": worker, "server": server} {
+			c, err := svc.VerifySandboxToken(tok.Token)
+			if err != nil || c.KeyID&secrets.ServerKeyIDBit != 0 {
+				t.Fatalf("pass %d: %s checks %+v %v", i, name, c, err)
+			}
+		}
+		ageMirror(t, worker, 10*time.Minute)
+	}
+	if wk.fetches < 3 {
+		t.Fatalf("the worker read the feed %d times", wk.fetches)
+	}
+}

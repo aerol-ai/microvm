@@ -291,6 +291,9 @@ func (s *Service) signSandboxToken(ctx context.Context, c sandboxtoken.Claims) (
 // the sandbox's, and that the lifetime and issue time are ones this server
 // would give. It signs with the servers' key, which the owner does not hold.
 func (s *Service) SignSandboxTokenFor(ctx context.Context, peerID string, peerIsServer bool, raw []byte) (cluster.SandboxTokenSignResponse, error) {
+	if err := s.signingViewFresh(); err != nil {
+		return cluster.SandboxTokenSignResponse{}, err
+	}
 	k, err := s.openServerKeys()
 	if err != nil {
 		return cluster.SandboxTokenSignResponse{}, err

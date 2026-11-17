@@ -1137,10 +1137,10 @@ groups:
           description: "{{ $value }} live member(s) run a build older than the cluster's active version. They take no new sandboxes and old servers stay out of Raft. Upgrade them (`sudo sandboxd upgrade node` on the node, or a new rollout), or delete them."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#member-below-the-active-version"
 
-      # The active cluster version lets servers sign, and the leader still
+      # Every server runs the build that signs (or the active cluster
+      # version allows it), no rollout is under way, and the leader still
       # does not write the record: its log line and `aerolvm upgrade
-      # signing` say why (members on an older build, or reporting none,
-      # after the active version's first write).
+      # signing` say why (members on an older build, or reporting none).
       - alert: SandboxdServerSigningHeld
         expr: max(aerolvm_server_signing_held) > 0
         for: 30m
@@ -1148,6 +1148,6 @@ groups:
           severity: warning
           component: rollout
         annotations:
-          summary: "servers do not sign sandbox tokens yet, though the cluster version allows it"
+          summary: "servers do not sign sandbox tokens yet, though every server could"
           description: "Nodes still sign sandbox tokens with the shared server key. `aerolvm upgrade signing` names the members that hold it back. Upgrade or delete them, or start server signing anyway (`aerolvm upgrade signing start`)."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#server-signing-held"

@@ -124,6 +124,9 @@ func (s *Service) SignIdentityTokenFor(ctx context.Context, peerID string, peerI
 	if c == nil {
 		return cluster.IdentityTokenSignResponse{}, ErrServerSigningOff
 	}
+	if err := s.signingViewFresh(); err != nil {
+		return cluster.IdentityTokenSignResponse{}, err
+	}
 	p, ok := c.PlacementOf(strings.TrimSpace(req.SandboxID))
 	if !ok || p.IsDeleting() {
 		return cluster.IdentityTokenSignResponse{}, fmt.Errorf("%w: sandbox %s", store.ErrNotFound, req.SandboxID)

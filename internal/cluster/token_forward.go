@@ -27,6 +27,10 @@ var ErrNoServerForward = errors.New("cluster: no server to send the call to")
 // role (ServerClientForPeer): the handshake fails before anything is sent.
 var ErrPeerCertNotServer = errors.New("cluster tls: the peer's certificate is not a server's")
 
+// ErrPeerCertNamesNoRole is ErrPeerCertNotServer for a certificate that
+// names no role at all: one signed before roles were (cluster-sign-node.sh).
+var ErrPeerCertNamesNoRole = errors.New("cluster tls: the peer's certificate names no role")
+
 // ServerClientForPeer is ClientForPeer that also requires the peer's
 // certificate to name the server role (DNS:role:server). A caller's
 // credential is forwarded only to a node that proves it is a server, never
@@ -54,6 +58,9 @@ func ServerClientForPeer(base *http.Client, nodeID string) *http.Client {
 			return fmt.Errorf("cluster tls: parse peer certificate: %w", err)
 		}
 		if role := ExtractPeerRole(cert); role != JoinRoleServer {
+			if certNamesNoRole(cert) {
+				return fmt.Errorf("%w: %w: node:%s", ErrPeerCertNotServer, ErrPeerCertNamesNoRole, strings.TrimSpace(nodeID))
+			}
 			return fmt.Errorf("%w: node:%s holds a %q certificate", ErrPeerCertNotServer, strings.TrimSpace(nodeID), role)
 		}
 		return nil
@@ -61,6 +68,17 @@ func ServerClientForPeer(base *http.Client, nodeID string) *http.Client {
 	cloned := tr.Clone()
 	cloned.TLSClientConfig = tlsCfg
 	return &http.Client{Transport: cloned, CheckRedirect: client.CheckRedirect, Jar: client.Jar, Timeout: client.Timeout}
+}
+
+// certNamesNoRole reports whether cert names no role in any form, neither
+// the cluster CA's DNS:role:<role> nor an external CA's URI role.
+func certNamesNoRole(cert *x509.Certificate) bool {
+	for _, name := range cert.DNSNames {
+		if strings.HasPrefix(strings.TrimSpace(name), nodeRoleSANprefix) {
+			return false
+		}
+	}
+	return len(ExtractCertRoles(cert)) == 0
 }
 
 // maxTokenForwardBody bounds the call a worker holds to resend: the API's

@@ -96,11 +96,15 @@ sandboxes it runs, until it is upgraded. Upgrade it, or drain it
 `SandboxdServerSigningHeld`. From cluster version 22 only servers sign
 sandbox tokens and cloud-identity tokens. The leader starts it once the
 active cluster version reaches 22 (a finalize, or every live member on the
-new build). If the active version was first written by this release
-(the cluster had none before), every live member must also report version
-22. `aerolvm upgrade signing` shows whether servers sign, since when, and
-which members hold it back. Upgrade or delete those members, or run
-`aerolvm upgrade signing start` to start it anyway: a member on an older
+new build). After an upgrade without a rollout (install.sh, `sandboxd
+upgrade node`), one live member on an older build, or one that reports no
+version, keeps the active version below 22; and if the active version was
+first written by this release (the cluster had none before), every live
+member must report 22 too. The alert fires once every server runs the new
+build and the record is still missing. `aerolvm upgrade signing` shows
+whether servers sign, since when, and which members hold it back. Upgrade
+or delete those members, or run `aerolvm upgrade signing start` to start
+it anyway (every server must run the new build): a member on an older
 build then cannot check the tokens servers sign.
 
 Tokens signed before servers took over keep working until they expire (at

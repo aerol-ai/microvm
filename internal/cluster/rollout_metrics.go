@@ -66,9 +66,9 @@ var (
 	// run below the active version.
 	obsoleteServersRemoved = expvar.NewInt("aerolvm_obsolete_servers_removed_total")
 	// serverSigningOn is 1 once servers sign (fsm_server_signing.go);
-	// serverSigningHeld is 1 while the active version allows it and the
-	// gate still holds the record back (ServerSigningGate: its reason is
-	// in the leader's log and in aerolvm upgrade signing);
+	// serverSigningHeld is 1 while the gate holds the record back on
+	// something only the operator can resolve (ServerSigningGate.Held:
+	// its reason is in the leader's log and in aerolvm upgrade signing);
 	// serverSigningWaiting counts the live members that report a version
 	// below it, or none.
 	serverSigningOn      = expvar.NewInt("aerolvm_server_signing_on")
@@ -132,7 +132,7 @@ func (c *Cluster) refreshServerSigningGauges() {
 	_, on := c.ServerSigningRecord()
 	g := c.ServerSigningGate(false)
 	serverSigningOn.Set(boolGauge(on))
-	serverSigningHeld.Set(boolGauge(!on && g.ActiveFV >= serverSigningFSMOpsVersion && !g.Allowed))
+	serverSigningHeld.Set(boolGauge(!on && g.Held()))
 	serverSigningWaiting.Set(int64(len(g.Waiting)))
 }
 
