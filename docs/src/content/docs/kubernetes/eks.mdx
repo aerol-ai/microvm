@@ -1,0 +1,232 @@
+---
+title: One-click EKS
+description: Launch AerolVM on a new Amazon EKS cluster with one CloudFormation stack. About 25 minutes, and nothing to install first.
+---
+
+import { Tabs, TabItem, Aside, LinkButton } from '@astrojs/starlight/components';
+
+This page launches AerolVM on a **new** EKS cluster with one CloudFormation stack. The stack does the [production install](/kubernetes/production/) for you. It builds the network, the EKS cluster and Karpenter, then installs AerolVM in cluster mode with gVisor sandboxes. At the end it creates a test sandbox and runs the security check.
+
+It takes about 25 minutes, mostly while AWS builds the EKS cluster. AerolVM itself installs in about 6. You need only an AWS account. To delete it all, you delete the stack.
+
+<LinkButton href="https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=https%3A%2F%2Faerolvm-downloads.s3.us-east-1.amazonaws.com%2Faerolvm%2Flatest%2Faerolvm-eks.yaml&stackName=aerolvm" icon="external">Launch Stack in AWS</LinkButton>
+
+<Aside>
+**Already run EKS?** This stack always makes a new VPC and a new cluster. To add AerolVM to a cluster you already have, use the [production install](/kubernetes/production/).
+</Aside>
+
+## What the stack makes
+
+| Part | What it is |
+|---|---|
+| Network | A new VPC over the three zones you pick. Machines live in private subnets. One NAT gateway gives them outbound internet. |
+| EKS cluster | Your chosen Kubernetes version. Its API endpoint is public, limited to the addresses you allow, and also private. |
+| System machines | Three machines, one per zone, as an EKS managed node group. They run AerolVM's servers, gateways and operator, plus Karpenter and cert-manager. |
+| Worker machines | Karpenter starts one per zone, and more as sandboxes fill them, up to your maximum. Each runs one AerolVM worker pod with many gVisor sandboxes. |
+| Add-ons | VPC CNI with network policy on, EBS CSI driver, EKS Pod Identity Agent. |
+| AerolVM | The Helm chart in cluster mode, in the namespaces `aerolvm-system` and `aerolvm-workers`. The API is private: reach it with `kubectl port-forward` or from inside the cluster. |
+
+Every machine allows only IMDSv2 with a hop limit of 1, so no pod and no sandbox can use a machine's IAM role.
+
+## What it costs
+
+With the defaults in us-east-1, about **$1.40 an hour** (about $1,000 a month) at on-demand prices: six `m7i.xlarge` machines, the EKS cluster, one NAT gateway and the disks. Traffic through the NAT gateway costs extra. More worker machines cost more. AerolVM itself is free.
+
+## Before you start
+
+- **An AWS identity that can create IAM roles, a VPC and an EKS cluster.** In practice, an admin of the account. The identity that creates the stack becomes the cluster's admin.
+- **Room in your EC2 quota** for at least 24 vCPUs of standard instances (six 4-vCPU machines). New accounts sometimes have less. Check **Service Quotas > Amazon EC2 > Running On-Demand Standard instances**.
+- **On your machine**, to connect afterward: the AWS CLI v2 and kubectl.
+
+## Step 1: Launch the stack
+
+Click **Launch Stack in AWS** above. In the AWS console:
+
+1. Pick the region at the top right.
+2. Under **Three Availability Zones**, pick exactly three zones.
+3. Leave the other settings as they are, or change them (see [Settings](#settings)).
+4. Tick **I acknowledge that AWS CloudFormation might create IAM resources**.
+5. Click **Create stack**.
+
+The stack name becomes the EKS cluster's name. The stack is done when its status is `CREATE_COMPLETE`.
+
+You can also launch it from a terminal:
+
+```bash title="Your machine"
+aws cloudformation create-stack --stack-name aerolvm \
+  --template-url https://aerolvm-downloads.s3.us-east-1.amazonaws.com/aerolvm/latest/aerolvm-eks.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters ParameterKey=Zones,ParameterValue='us-east-1a\,us-east-1b\,us-east-1c'
+
+aws cloudformation wait stack-create-complete --stack-name aerolvm
+```
+
+## Settings
+
+| Setting | Default | What it does |
+|---|---|---|
+| Three Availability Zones | none | Where the cluster runs. One AerolVM server goes in each zone, so the cluster keeps working when one zone fails. You cannot change it later. |
+| AerolVM version | the latest release | The release to install. Change it later to upgrade. |
+| Kubernetes version | 1.36 | The EKS version. |
+| Worker machine type | `m7i.xlarge` | The machine type for sandboxes: `m7i.xlarge`, `2xlarge`, `4xlarge` or `8xlarge`. Bigger machines hold more sandboxes each. |
+| Most worker machines | 6 | AerolVM keeps one worker machine per zone and adds more as sandboxes fill them, up to this number. |
+| Worker disk (GiB) | 100 | Disk on each worker machine, for images and sandbox files. |
+| System machine type | `m7i.xlarge` | The three machines for AerolVM's own pods. Four CPUs or more. |
+| Who may reach the Kubernetes API | `0.0.0.0/0` | Addresses that may reach the cluster's API from the internet. EKS still checks credentials. Narrow it to your office or VPN. |
+| Another cluster admin | none | An IAM role or user that also gets cluster admin, such as your team's SSO role. |
+
+## Step 2: Connect
+
+The stack's **Outputs** tab has these three commands, filled in for your stack. Run them on your machine:
+
+```bash title="Your machine"
+# 1. Point kubectl at the cluster.
+aws eks update-kubeconfig --region <region> --name aerolvm
+
+# 2. Read the admin API token.
+export SB_PAT_TOKEN="$(kubectl -n aerolvm-system get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+
+# 3. Forward the API to your machine.
+kubectl -n aerolvm-system port-forward svc/aerolvm-gateway 21212:21212 &
+export SB_API_URL=http://127.0.0.1:21212
+```
+
+Apps inside the cluster use `http://aerolvm-gateway.aerolvm-system:21212` instead. To reach the API from outside with your own domain and HTTPS, see [HTTPS and networking](/kubernetes/networking/).
+
+## Step 3: Create a sandbox
+
+This sandbox uses gVisor and asks to start again on another machine if its machine dies:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      runtime: "gvisor",
+      failover: { policy: "recreate" },
+    });
+    const result = await sandbox.exec("echo hello from the cluster");
+    console.log(result.stdout);
+
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        runtime="gvisor",
+        failover={"policy": "recreate"},
+    )
+    result = sandbox.exec("echo hello from the cluster")
+    print(result["stdout"])
+
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Runtime:  sdktypes.RuntimeGvisor,
+        Failover: &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sandbox.Destroy(ctx)
+
+    result, err := sandbox.ExecCommand(ctx, "echo hello from the cluster")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions, Failover};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        runtime: Some("gvisor".into()),
+        failover: Some(Failover { policy: "recreate".into() }),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("echo hello from the cluster")?;
+    print!("{}", result.stdout);
+
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("gvisor")
+            .setFailover(new Failover().setPolicy("recreate"))
+    );
+    ExecResult result = sandbox.exec("echo hello from the cluster");
+    System.out.print(result.stdout);
+
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+## What the stack checked
+
+At the end of the install, the stack did two checks:
+
+- It created a gVisor sandbox, ran a command in it, and deleted it. If that failed, the stack failed.
+- It ran `aerolvm k8s verify`, the [security check](/kubernetes/security/#check-a-live-install). Its result is the **InstallCheck** output: `passed`, or `failed` with where to read why. A failed check does not fail the stack.
+
+The stack skips one check: image signatures, because it has no `cosign`. To run every check, install [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) and run:
+
+```bash title="Your machine"
+aerolvm k8s verify --namespace aerolvm-system --worker-namespace aerolvm-workers --cluster aerolvm
+```
+
+## Change, upgrade or delete
+
+- **Upgrade AerolVM:** update the stack and change **AerolVM version**. The stack runs `helm upgrade` and waits for the cluster to be ready again. Sandboxes keep running ([how upgrades work](/kubernetes/operations/#upgrade)). If the upgrade fails, CloudFormation rolls the stack back, and the stack installs the previous version again: that is the same as a `helm upgrade` back to the old version.
+- **More or bigger workers:** update the stack and change **Most worker machines** or **Worker machine type**. AerolVM moves sandboxes off old machines before Karpenter replaces them.
+- **Delete everything:** delete the stack. It removes AerolVM, the worker machines, the cluster and the network. This takes about 25 minutes. Every sandbox and its files are gone.
+
+## If something goes wrong
+
+The stack's **Events** tab shows which part failed. For the install itself, the reason names the step, such as `installing AerolVM 0.7.6`. The **InstallerLog** output links to the installer's full log in CloudWatch. When a step fails, the log ends with the state of the cluster's nodes and pods.
+
+| What you see | Why, and what to do |
+|---|---|
+| The cluster or node group fails with an instance or capacity error | The zones or the account cannot run the machine type. Pick other zones, or ask AWS to raise your EC2 vCPU quota. |
+| The stack fails at `waiting for the AerolVM cluster to be Ready` | Usually a worker machine did not start. In the log, look at `nodeclaims` and the `aerolvm-workers` pods. |
+| A create fails with `no worker placement target available` | The create named no runtime. This stack's workers run gVisor only, so name it: `runtime: "gvisor"`, as in [Step 3](#step-3-create-a-sandbox). |
+| The stack is stuck in `DELETE_FAILED` | Something outside the stack still uses the VPC. The failed resource's reason names it. Remove it, then delete the stack again. |
+
+## What this stack does not do
+
+It is a fast, safe start, not every setup. For these, use the [production install](/kubernetes/production/) on a cluster you manage:
+
+- An existing VPC or EKS cluster.
+- runc or Firecracker sandboxes. This stack runs gVisor only.
+- The regulated preset, `values-bank-eks.yaml`, with HTTPS, monitoring and a create policy.
+- A NAT gateway in every zone. Here, if the NAT gateway's zone fails, the other zones lose outbound internet until it is back.

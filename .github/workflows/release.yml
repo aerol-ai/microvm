@@ -615,6 +615,17 @@ jobs:
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
           chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
+      # The one-click EKS stack (packaging/eks), installing this release by
+      # default. The mirror job puts it on S3, where CloudFormation can read
+      # it: a "Launch Stack" link must name an S3 URL. Before release.json
+      # and checksums.txt, so both cover it; integration-tests/safety
+      # TestEKSStackVersionDefault keeps the stamp's target line in place.
+      - name: Stamp the EKS stack with this release
+        run: |
+          sed -E 's/^(    Default: )"[^"]*"( # release-version)$/\1"'"${VERSION#v}"'"\2/' \
+            packaging/eks/aerolvm-eks.yaml > dist/aerolvm-eks.yaml
+          grep -qxF "    Default: \"${VERSION#v}\" # release-version" dist/aerolvm-eks.yaml
+
       # release.json says which versions may upgrade straight to this one and
       # what the upgrade changes (plans/kubectl-style-cluster-ops.md §6.5). It
       # is generated from the tagged tree through the pkg/release type, never
@@ -834,6 +845,55 @@ jobs:
 
       - name: Check Terraform installs every provider from the mirror alone
         run: src/scripts/mirror-sync.sh --tf-providers --check --bucket "$MIRROR_BUCKET"
+
+  # The docs' "Launch Stack" button reads aerolvm/latest/aerolvm-eks.yaml,
+  # and that stack installs this release's Helm chart. The release job does
+  # not wait for the chart job, so the copy moves only once the chart is
+  # published: if it moved first, every new stack would fail at "installing
+  # AerolVM" while the chart is late or missing. Like mirror, a job of its
+  # own that holds back nothing else, and only for GitHub's latest release.
+  eks-launch-stack:
+    name: Point the Launch Stack button at this release
+    needs: [mirror, chart]
+    if: vars.AEROLVM_MIRROR_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      MIRROR_BUCKET: aerolvm-downloads
+    steps:
+      - name: Download the stack from the release and check it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release download "$VERSION" --dir dist --pattern aerolvm-eks.yaml --pattern checksums.txt
+          cd dist
+          grep -E '^[0-9a-f]{64}  aerolvm-eks\.yaml$' checksums.txt | sha256sum --check --strict
+
+      - name: Get AWS credentials for the mirror (GitHub OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AEROLVM_MIRROR_ROLE_ARN }}
+          role-session-name: release-eks-stack-${{ github.run_id }}
+          role-duration-seconds: 900
+          aws-region: us-east-1
+
+      - name: Copy the stack to aerolvm/latest/, if this is GitHub's latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "GitHub's latest release is $latest, so the Launch Stack button stays as it is."
+            exit 0
+          fi
+          aws s3 cp dist/aerolvm-eks.yaml "s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml" \
+            --content-type text/yaml --cache-control no-cache --only-show-errors --no-progress
+          echo "The Launch Stack button now installs $VERSION"
 
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.

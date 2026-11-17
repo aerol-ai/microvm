@@ -166,7 +166,7 @@ sync_release() {
 		done
 		echo "  each checked against the release's checksums.txt first"
 		if [[ "$mark" == "yes" ]]; then
-			echo "Then point s3://${BUCKET}/aerolvm/latest.txt at ${tag}."
+			echo "Then point s3://${BUCKET}/aerolvm/latest.txt at ${tag}, and copy its aerolvm-eks.yaml, if any, to aerolvm/latest/."
 		fi
 		return 0
 	fi
@@ -194,6 +194,13 @@ sync_release() {
 	fi
 	aws s3 sync "$dir" "$dest" "${opts[@]}"
 	if [[ "$mark" == "yes" ]]; then
+		# The docs' "Launch Stack" link reads this fixed path, as in the
+		# release workflow's mirror job. Releases before the stack lack it.
+		if [[ -f "$dir/aerolvm-eks.yaml" ]]; then
+			aws s3 cp "$dir/aerolvm-eks.yaml" "s3://${BUCKET}/aerolvm/latest/aerolvm-eks.yaml" --region "$REGION" \
+				--content-type text/yaml --cache-control no-cache --only-show-errors --no-progress
+			echo "aerolvm/latest/aerolvm-eks.yaml is now ${tag}'s"
+		fi
 		printf '%s\n' "$tag" >"$WORK/latest.txt"
 		# latest.txt moves only after every file of the release is up, so
 		# an install that reads it never finds a release half uploaded.

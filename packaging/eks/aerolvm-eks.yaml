@@ -1,0 +1,1368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AerolVM on Amazon EKS in one stack: a VPC over three zones, an EKS cluster,
+  Karpenter for the worker machines, and AerolVM in cluster mode with gVisor
+  sandboxes. Delete the stack to remove all of it.
+  Guide: https://microvm.aerol.ai/kubernetes/eks/
+
+# How it works (packaging/eks/README.md has more):
+# - CloudFormation makes the AWS parts: network, IAM roles, the EKS cluster,
+#   three system machines, add-ons and access entries.
+# - CloudFormation cannot run helm or kubectl, so a CodeBuild project (the
+#   "installer") does the in-cluster part: cert-manager, Karpenter and its
+#   worker NodePool, then the AerolVM chart. It ends with a first sandbox
+#   and `aerolvm k8s verify`. On delete it removes AerolVM and the worker
+#   machines first, because Karpenter's machines, launch templates and
+#   instance profiles are not CloudFormation's and would block the rest.
+# - A Lambda starts the installer. The build itself answers CloudFormation
+#   when it ends, because an install takes longer than a Lambda may run.
+# - The same Lambda, as a second custom resource, removes network interfaces
+#   left behind after the cluster is deleted and before the subnets are.
+#   An "available" interface from the VPC CNI holds its subnet, and EKS
+#   keeps its cluster security group while one uses it.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Where }
+        Parameters: [Zones]
+      - Label: { default: What to install }
+        Parameters: [AerolvmVersion, KubernetesVersion]
+      - Label: { default: Machines }
+        Parameters: [WorkerInstanceType, MaxWorkers, WorkerDiskGiB, SystemInstanceType]
+      - Label: { default: Access }
+        Parameters: [ApiAccessCidr, AdminPrincipalArn]
+    ParameterLabels:
+      Zones: { default: Three Availability Zones }
+      AerolvmVersion: { default: AerolVM version }
+      KubernetesVersion: { default: Kubernetes version }
+      WorkerInstanceType: { default: Worker machine type }
+      MaxWorkers: { default: Most worker machines }
+      WorkerDiskGiB: { default: Worker disk (GiB) }
+      SystemInstanceType: { default: System machine type }
+      ApiAccessCidr: { default: Who may reach the Kubernetes API }
+      AdminPrincipalArn: { default: Another cluster admin (optional) }
+
+Parameters:
+  Zones:
+    Type: List<AWS::EC2::AvailabilityZone::Name>
+    Description: Pick exactly three zones. AerolVM puts one server in each, so the cluster keeps working when one zone fails.
+  AerolvmVersion:
+    Type: String
+    # The release workflow sets this to the release it ships with, on the
+    # line that ends in "# release-version".
+    Default: "0.7.6" # release-version
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+    Description: The AerolVM release to install, without the "v". Change it later to upgrade.
+  KubernetesVersion:
+    Type: String
+    Default: "1.36"
+    AllowedValues: ["1.35", "1.36"]
+    Description: The EKS version. The installer's Karpenter (1.15.1) is tested on 1.36.
+  WorkerInstanceType:
+    Type: String
+    Default: m7i.xlarge
+    AllowedValues: [m7i.xlarge, m7i.2xlarge, m7i.4xlarge, m7i.8xlarge]
+    Description: The machine type for sandboxes. Each worker machine runs one AerolVM worker pod that holds many sandboxes.
+  MaxWorkers:
+    Type: Number
+    Default: 6
+    MinValue: 3
+    MaxValue: 300
+    Description: AerolVM keeps at least one worker machine per zone and adds more as sandboxes fill them, up to this many.
+  WorkerDiskGiB:
+    Type: Number
+    Default: 100
+    MinValue: 50
+    MaxValue: 16000
+    Description: Disk on each worker machine, for images and sandbox files.
+  SystemInstanceType:
+    Type: String
+    Default: m7i.xlarge
+    AllowedValues: [m7i.xlarge, m7i.2xlarge, m6i.xlarge, m6i.2xlarge]
+    Description: Three machines, one per zone, for the AerolVM servers, gateways and operator, Karpenter and cert-manager. Four CPUs or more.
+  ApiAccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[1-2][0-9]|3[0-2])$'
+    Description: Addresses that may reach the EKS cluster's Kubernetes API from the internet (it also checks credentials). Narrow it to your office or VPN.
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$'
+    Description: An IAM role or user that also gets cluster admin, such as your team's SSO role. The identity that creates the stack always gets it.
+
+Conditions:
+  HasAdmin: !Not [!Equals [!Ref AdminPrincipalArn, ""]]
+
+# The worker pod is sized from the machine (operator/internal/controller
+# workerPodSize), so the chart is told each type's CPUs and memory.
+Mappings:
+  WorkerMachine:
+    m7i.xlarge: { Cpu: "4", MemoryGiB: "16" }
+    m7i.2xlarge: { Cpu: "8", MemoryGiB: "32" }
+    m7i.4xlarge: { Cpu: "16", MemoryGiB: "64" }
+    m7i.8xlarge: { Cpu: "32", MemoryGiB: "128" }
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  # Public subnets hold only the NAT gateway. Every machine, the cluster's
+  # endpoint and the installer live in the private subnets.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !Ref Zones]
+      CidrBlock: 10.0.0.0/22
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-1" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !Ref Zones]
+      CidrBlock: 10.0.4.0/22
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-2" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !Ref Zones]
+      CidrBlock: 10.0.8.0/22
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-3" }
+        - { Key: kubernetes.io/role/elb, Value: "1" }
+
+  # Large private subnets: the VPC CNI gives every pod a VPC address.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !Ref Zones]
+      CidrBlock: 10.0.64.0/18
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-1" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+        - { Key: karpenter.sh/discovery, Value: !Ref AWS::StackName }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !Ref Zones]
+      CidrBlock: 10.0.128.0/18
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-2" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+        - { Key: karpenter.sh/discovery, Value: !Ref AWS::StackName }
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [2, !Ref Zones]
+      CidrBlock: 10.0.192.0/18
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-3" }
+        - { Key: kubernetes.io/role/internal-elb, Value: "1" }
+        - { Key: karpenter.sh/discovery, Value: !Ref AWS::StackName }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnet3Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet3, RouteTableId: !Ref PublicRouteTable }
+
+  # One NAT gateway, to keep a small install cheap. If its zone fails, the
+  # other zones lose outbound internet (image pulls, sandbox egress) until
+  # it is back.
+  NatAddress:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatAddress.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private" }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+
+  PrivateSubnet2Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  PrivateSubnet3Routes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet3, RouteTableId: !Ref PrivateRouteTable }
+
+  # Deleted after the cluster and the installer, before the subnets and the
+  # installer's security group (the DependsOn chains below set that order).
+  # Its DependsOn also keeps the way out to the internet until then: the
+  # installer's delete path downloads helm and kubectl and calls AWS
+  # through the NAT gateway. A resource nothing depends on is deleted first,
+  # and the first live delete lost PublicDefaultRoute in its first two
+  # seconds, so the installer hung with no network
+  # (TestEKSStackEveryResourceOutlivesTheInstaller).
+  NetworkCleanup:
+    Type: Custom::AerolvmNetworkCleanup
+    DependsOn:
+      - PublicDefaultRoute
+      - PrivateSubnet1Routes
+      - PrivateSubnet2Routes
+      - PrivateSubnet3Routes
+      - PrivateDefaultRoute
+      - PublicSubnet1Routes
+      - PublicSubnet2Routes
+      - PublicSubnet3Routes
+    Properties:
+      ServiceToken: !GetAtt Helper.Arn
+      Kind: network-cleanup
+      VpcId: !Ref Vpc
+      ClusterName: !Ref AWS::StackName
+      InstallerSecurityGroup: !Ref InstallerSecurityGroup
+
+  # ------------------------------------------------------------------ IAM
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # Every machine uses this role: the system node group's and the ones
+  # Karpenter launches. No pod can use it: IMDSv2 with a hop limit of 1.
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # Karpenter's controller, through EKS Pod Identity. The policy is the one
+  # the live EKS runs proved (integration-tests/k8s/terraform/karpenter.tf),
+  # with terminate and delete limited to this cluster's Karpenter machines.
+  KarpenterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      Policies:
+        # Karpenter's reference controller policy for v1.15
+        # (website/content/en/v1.15/getting-started/getting-started-with-karpenter/
+        # cloudformation.yaml in aws/karpenter-provider-aws), with this stack's
+        # names and without the interruption-queue statement (no queue here).
+        # Every write is limited to this cluster's tags: in particular CreateTags
+        # on an existing instance may add only its name tags, so nothing can tag
+        # another instance as this cluster's and then terminate it.
+        - PolicyName: karpenter-controller
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "AllowScopedEC2InstanceAccessActions",
+                  "Effect": "Allow",
+                  "Action": ["ec2:RunInstances", "ec2:CreateFleet"],
+                  "Resource": [
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:security-group/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:subnet/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:capacity-reservation/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:placement-group/*"
+                  ]
+                },
+                {
+                  "Sid": "AllowScopedEC2LaunchTemplateAccessActions",
+                  "Effect": "Allow",
+                  "Action": ["ec2:RunInstances", "ec2:CreateFleet"],
+                  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:launch-template/*",
+                  "Condition": {
+                    "StringEquals": { "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned" },
+                    "StringLike": { "aws:ResourceTag/karpenter.sh/nodepool": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedEC2InstanceActionsWithTags",
+                  "Effect": "Allow",
+                  "Action": ["ec2:RunInstances", "ec2:CreateFleet", "ec2:CreateLaunchTemplate"],
+                  "Resource": [
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:fleet/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:volume/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:network-interface/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:launch-template/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:spot-instances-request/*"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:RequestTag/eks:eks-cluster-name": "${AWS::StackName}"
+                    },
+                    "StringLike": { "aws:RequestTag/karpenter.sh/nodepool": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedResourceCreationTagging",
+                  "Effect": "Allow",
+                  "Action": "ec2:CreateTags",
+                  "Resource": [
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:fleet/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:volume/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:network-interface/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:launch-template/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:spot-instances-request/*"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:RequestTag/eks:eks-cluster-name": "${AWS::StackName}",
+                      "ec2:CreateAction": ["RunInstances", "CreateFleet", "CreateLaunchTemplate"]
+                    },
+                    "StringLike": { "aws:RequestTag/karpenter.sh/nodepool": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedResourceTagging",
+                  "Effect": "Allow",
+                  "Action": "ec2:CreateTags",
+                  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+                  "Condition": {
+                    "StringEquals": { "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned" },
+                    "StringLike": { "aws:ResourceTag/karpenter.sh/nodepool": "*" },
+                    "StringEqualsIfExists": { "aws:RequestTag/eks:eks-cluster-name": "${AWS::StackName}" },
+                    "ForAllValues:StringEquals": { "aws:TagKeys": ["eks:eks-cluster-name", "karpenter.sh/nodeclaim", "Name"] }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedDeletion",
+                  "Effect": "Allow",
+                  "Action": ["ec2:TerminateInstances", "ec2:DeleteLaunchTemplate"],
+                  "Resource": [
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:instance/*",
+                    "arn:${AWS::Partition}:ec2:${AWS::Region}:*:launch-template/*"
+                  ],
+                  "Condition": {
+                    "StringEquals": { "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned" },
+                    "StringLike": { "aws:ResourceTag/karpenter.sh/nodepool": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowPassingInstanceRole",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": "${NodeRole.Arn}",
+                  "Condition": { "StringEquals": { "iam:PassedToService": ["ec2.amazonaws.com", "ec2.amazonaws.com.cn"] } }
+                },
+                {
+                  "Sid": "AllowScopedInstanceProfileCreationActions",
+                  "Effect": "Allow",
+                  "Action": "iam:CreateInstanceProfile",
+                  "Resource": "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:RequestTag/eks:eks-cluster-name": "${AWS::StackName}",
+                      "aws:RequestTag/topology.kubernetes.io/region": "${AWS::Region}"
+                    },
+                    "StringLike": { "aws:RequestTag/karpenter.k8s.aws/ec2nodeclass": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedInstanceProfileTagActions",
+                  "Effect": "Allow",
+                  "Action": "iam:TagInstanceProfile",
+                  "Resource": "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:ResourceTag/topology.kubernetes.io/region": "${AWS::Region}",
+                      "aws:RequestTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:RequestTag/eks:eks-cluster-name": "${AWS::StackName}",
+                      "aws:RequestTag/topology.kubernetes.io/region": "${AWS::Region}"
+                    },
+                    "StringLike": {
+                      "aws:ResourceTag/karpenter.k8s.aws/ec2nodeclass": "*",
+                      "aws:RequestTag/karpenter.k8s.aws/ec2nodeclass": "*"
+                    }
+                  }
+                },
+                {
+                  "Sid": "AllowScopedInstanceProfileActions",
+                  "Effect": "Allow",
+                  "Action": ["iam:AddRoleToInstanceProfile", "iam:RemoveRoleFromInstanceProfile", "iam:DeleteInstanceProfile"],
+                  "Resource": "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned",
+                      "aws:ResourceTag/topology.kubernetes.io/region": "${AWS::Region}"
+                    },
+                    "StringLike": { "aws:ResourceTag/karpenter.k8s.aws/ec2nodeclass": "*" }
+                  }
+                },
+                {
+                  "Sid": "AllowAPIServerEndpointDiscovery",
+                  "Effect": "Allow",
+                  "Action": "eks:DescribeCluster",
+                  "Resource": "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${AWS::StackName}"
+                },
+                {
+                  "Sid": "AllowZonalShiftStatusReadOnly",
+                  "Effect": "Allow",
+                  "Action": "arc-zonal-shift:GetManagedResource",
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "arc-zonal-shift:ResourceIdentifier": "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${AWS::StackName}"
+                    }
+                  }
+                },
+                {
+                  "Sid": "AllowRegionalReadActions",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:DescribeCapacityReservations", "ec2:DescribeImages", "ec2:DescribeInstances",
+                    "ec2:DescribeInstanceStatus", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",
+                    "ec2:DescribeLaunchTemplates", "ec2:DescribePlacementGroups", "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeSpotPriceHistory", "ec2:DescribeSubnets"
+                  ],
+                  "Resource": "*",
+                  "Condition": { "StringEquals": { "aws:RequestedRegion": "${AWS::Region}" } }
+                },
+                {
+                  "Sid": "AllowSSMReadActions",
+                  "Effect": "Allow",
+                  "Action": "ssm:GetParameter",
+                  "Resource": "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/*"
+                },
+                { "Sid": "AllowPricingReadActions", "Effect": "Allow", "Action": "pricing:GetProducts", "Resource": "*" },
+                { "Sid": "AllowUnscopedInstanceProfileListAction", "Effect": "Allow", "Action": "iam:ListInstanceProfiles", "Resource": "*" },
+                {
+                  "Sid": "AllowInstanceProfileReadActions",
+                  "Effect": "Allow",
+                  "Action": "iam:GetInstanceProfile",
+                  "Resource": "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*"
+                }
+              ]
+            }
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+
+  # The installer (CodeBuild). Cluster admin comes from its access entry;
+  # the AWS rights here are what CodeBuild needs inside the VPC, and what
+  # the delete path needs to remove Karpenter's leftovers, limited to this
+  # cluster. ec2:DeleteNetworkInterface is the one exception: CodeBuild
+  # checks it with no VPC in the request, so a VPC condition refuses the
+  # build before it starts (the first live run, "CLIENT_ERROR" in QUEUED).
+  InstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: aerolvm-installer
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "Logs",
+                  "Effect": "Allow",
+                  "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                  "Resource": "${InstallerLogs.Arn}"
+                },
+                { "Sid": "Cluster", "Effect": "Allow", "Action": "eks:DescribeCluster", "Resource": "*" },
+                {
+                  "Sid": "CodeBuildInTheVpc",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:CreateNetworkInterface", "ec2:DescribeDhcpOptions", "ec2:DescribeNetworkInterfaces",
+                    "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups", "ec2:DescribeVpcs",
+                    "ec2:DescribeInstances", "ec2:DescribeLaunchTemplates"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "CodeBuildRemovesItsInterfaces",
+                  "Effect": "Allow",
+                  "Action": "ec2:DeleteNetworkInterface",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "CodeBuildInterfacePermission",
+                  "Effect": "Allow",
+                  "Action": "ec2:CreateNetworkInterfacePermission",
+                  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*",
+                  "Condition": {
+                    "StringEquals": { "ec2:AuthorizedService": "codebuild.amazonaws.com" },
+                    "ArnEquals": {
+                      "ec2:Subnet": [
+                        "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet1}",
+                        "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet2}",
+                        "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnet3}"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "Sid": "RemoveKarpenterMachines",
+                  "Effect": "Allow",
+                  "Action": "ec2:TerminateInstances",
+                  "Resource": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*",
+                  "Condition": {
+                    "StringEquals": { "aws:ResourceTag/kubernetes.io/cluster/${AWS::StackName}": "owned" },
+                    "StringLike": { "aws:ResourceTag/karpenter.sh/nodepool": "*" }
+                  }
+                },
+                {
+                  "Sid": "RemoveKarpenterLaunchTemplates",
+                  "Effect": "Allow",
+                  "Action": "ec2:DeleteLaunchTemplate",
+                  "Resource": "*",
+                  "Condition": { "StringEquals": { "aws:ResourceTag/karpenter.k8s.aws/cluster": "${AWS::StackName}" } }
+                },
+                {
+                  "Sid": "FindKarpenterInstanceProfiles",
+                  "Effect": "Allow",
+                  "Action": "iam:ListInstanceProfilesForRole",
+                  "Resource": "${NodeRole.Arn}"
+                },
+                {
+                  "Sid": "RemoveKarpenterInstanceProfiles",
+                  "Effect": "Allow",
+                  "Action": ["iam:RemoveRoleFromInstanceProfile", "iam:DeleteInstanceProfile"],
+                  "Resource": "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/${AWS::StackName}_*"
+                }
+              ]
+            }
+
+  # The helper Lambda starts the installer and runs the network clean-up.
+  HelperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: aerolvm-helper
+          PolicyDocument: !Sub |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "StartTheInstaller",
+                  "Effect": "Allow",
+                  "Action": ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"],
+                  "Resource": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-installer"
+                },
+                {
+                  "Sid": "Look",
+                  "Effect": "Allow",
+                  "Action": ["ec2:DescribeNetworkInterfaces", "ec2:DescribeSecurityGroups"],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "CleanOnlyThisVpc",
+                  "Effect": "Allow",
+                  "Action": ["ec2:DeleteNetworkInterface", "ec2:DeleteSecurityGroup"],
+                  "Resource": "*",
+                  "Condition": { "ArnEquals": { "ec2:Vpc": "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}" } }
+                }
+              ]
+            }
+
+  # ------------------------------------------------------------------ EKS
+  Cluster:
+    Type: AWS::EKS::Cluster
+    DependsOn: NetworkCleanup
+    Properties:
+      Name: !Ref AWS::StackName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        # The identity that creates the stack becomes cluster admin.
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs: [!Ref ApiAccessCidr]
+
+  # IMDSv2 only, hop limit 1: no pod can reach the machine's IAM role.
+  # (Karpenter's machines get the same from their EC2NodeClass.)
+  SystemLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 50, VolumeType: gp3, Encrypted: true }
+
+  SystemNodes:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: VpcCniAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+      AmiType: AL2023_x86_64_STANDARD
+      InstanceTypes: [!Ref SystemInstanceType]
+      LaunchTemplate:
+        Id: !Ref SystemLaunchTemplate
+        Version: !GetAtt SystemLaunchTemplate.LatestVersionNumber
+      ScalingConfig: { MinSize: 3, DesiredSize: 3, MaxSize: 3 }
+      Labels: { aerolvm.io/role: system }
+
+  # Network policy on, so the chart's NetworkPolicies are enforced.
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: '{"enableNetworkPolicy":"true"}'
+
+  PodIdentityAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: [SystemNodes, PodIdentityAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - { ServiceAccount: ebs-csi-controller-sa, RoleArn: !GetAtt EbsCsiRole.Arn }
+
+  KarpenterIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: kube-system
+      ServiceAccount: karpenter
+      RoleArn: !GetAtt KarpenterRole.Arn
+
+  InstallerAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !GetAtt InstallerRole.Arn
+      AccessPolicies:
+        - PolicyArn: !Sub arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: { Type: cluster }
+
+  AdminAccess:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdmin
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref AdminPrincipalArn
+      AccessPolicies:
+        - PolicyArn: !Sub arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: { Type: cluster }
+
+  # ------------------------------------------------------------- Installer
+  InstallerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: The AerolVM installer (CodeBuild)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  # The installer reaches the cluster's private endpoint, so it keeps
+  # working when ApiAccessCidr shuts the public one to everyone else.
+  InstallerToClusterApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref InstallerSecurityGroup
+      Description: The AerolVM installer
+
+  InstallerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aerolvm/${AWS::StackName}/installer
+      RetentionInDays: 30
+
+  Installer:
+    Type: AWS::CodeBuild::Project
+    DependsOn: NetworkCleanup
+    Properties:
+      Name: !Sub ${AWS::StackName}-installer
+      Description: Installs AerolVM into the stack's EKS cluster, and removes it when the stack is deleted.
+      ServiceRole: !GetAtt InstallerRole.Arn
+      TimeoutInMinutes: 55
+      Artifacts: { Type: NO_ARTIFACTS }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref InstallerLogs }
+      VpcConfig:
+        VpcId: !Ref Vpc
+        Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]
+        SecurityGroupIds: [!Ref InstallerSecurityGroup]
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: CLUSTER_NAME, Value: !Ref Cluster }
+          - { Name: NODE_ROLE, Value: !Ref NodeRole }
+          - { Name: CLUSTER_SECURITY_GROUP, Value: !GetAtt Cluster.ClusterSecurityGroupId }
+          - { Name: LOG_GROUP, Value: !Ref InstallerLogs }
+      Source:
+        Type: NO_SOURCE
+        # The installer script. integration-tests/safety/eks_stack_test.go
+        # runs bash -n (and shellcheck, when it is installed) on it.
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            build:
+              commands:
+                - |
+                  set -Eeuo pipefail
+
+                  # Pinned downloads. Bump a version and its checksum together.
+                  HELM_VERSION=v3.22.1
+                  HELM_SHA256=896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+                  KUBECTL_VERSION=v1.36.6
+                  KUBECTL_SHA256=29818b6729dc9262b692307470d0558d027725e738be5dd47c760261868a2634
+                  CERT_MANAGER_VERSION=v1.21.3
+                  CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
+                  KARPENTER_VERSION=1.15.1
+                  # From ECR Public, not Docker Hub, which limits pulls per address.
+                  PROBE_IMAGE=public.ecr.aws/docker/library/alpine:3.20
+
+                  STEP="starting"
+                  CONNECTED=false
+                  WARNINGS=""
+                  PF=""
+
+                  # respond STATUS REASON [VERIFY] answers CloudFormation. The Lambda
+                  # that started this build has long returned, so the build answers.
+                  respond() {
+                    STATUS="$1" REASON="$2" VERIFY="${3:-}" python3 -c '
+                  import json, os
+                  print(json.dumps({
+                      "Status": os.environ["STATUS"],
+                      "Reason": os.environ["REASON"][:3500],
+                      "PhysicalResourceId": os.environ["PHYSICAL_RESOURCE_ID"],
+                      "StackId": os.environ["STACK_ID"],
+                      "RequestId": os.environ["REQUEST_ID"],
+                      "LogicalResourceId": os.environ["LOGICAL_RESOURCE_ID"],
+                      "Data": {"Verify": os.environ.get("VERIFY", "")},
+                  }))' > /tmp/response.json
+                    curl -fsS --retry 5 --retry-all-errors -X PUT -H 'Content-Type:' \
+                      --data-binary @/tmp/response.json "$RESPONSE_URL" >/dev/null
+                  }
+
+                  warn() { echo "WARNING: $*"; WARNINGS="${WARNINGS}${WARNINGS:+; }$*"; }
+
+                  diagnose() {
+                    echo "---- the cluster when the installer stopped ----"
+                    kubectl get nodes -o wide || true
+                    kubectl get nodeclaims -o wide || true
+                    kubectl -n aerolvm-system get aerolcluster,aerolnodes -o wide || true
+                    kubectl -n aerolvm-system get pods -o wide || true
+                    kubectl -n aerolvm-workers get pods -o wide || true
+                    kubectl -n kube-system get pods -o wide || true
+                    kubectl get events -A --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+                  }
+
+                  on_exit() {
+                    local rc=$?
+                    trap - EXIT
+                    [ -n "$PF" ] && kill "$PF" 2>/dev/null
+                    [ "$rc" -eq 0 ] && return 0
+                    [ "$CONNECTED" = true ] && diagnose
+                    respond FAILED "The AerolVM installer stopped while ${STEP}. Its log: CodeBuild build ${CODEBUILD_BUILD_ID}, log group ${LOG_GROUP}." || true
+                  }
+                  trap on_exit EXIT
+                  # A CodeBuild timeout ends the build with SIGTERM. Exit through
+                  # on_exit, so CloudFormation still hears FAILED.
+                  trap 'exit 143' TERM INT
+
+                  fetch() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$1" "$2"; }
+                  checksum() { echo "$1  $2" | sha256sum --check --quiet --strict -; }
+
+                  k8s_tools() {
+                    fetch /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" &&
+                      checksum "$HELM_SHA256" /tmp/helm.tgz &&
+                      tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm &&
+                      install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm &&
+                      fetch /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" &&
+                      checksum "$KUBECTL_SHA256" /tmp/kubectl &&
+                      install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+                  }
+
+                  # The aerolvm CLI of the release being installed, checked against
+                  # that release's checksums.txt. GitHub first, then the download
+                  # mirror (GitHub release downloads failed for hours on 2026-11-08).
+                  aerolvm_cli() {
+                    local base
+                    for base in "https://github.com/aerol-ai/microvm/releases/download/v${AEROLVM_VERSION}" \
+                      "https://aerolvm-downloads.s3.us-east-1.amazonaws.com/aerolvm/v${AEROLVM_VERSION}"; do
+                      if fetch /tmp/checksums.txt "$base/checksums.txt" && fetch /tmp/aerolvm_linux_amd64 "$base/aerolvm_linux_amd64"; then
+                        (cd /tmp && grep ' aerolvm_linux_amd64$' checksums.txt | sha256sum --check --quiet --strict -)
+                        install -m 0755 /tmp/aerolvm_linux_amd64 /usr/local/bin/aerolvm
+                        return 0
+                      fi
+                    done
+                    return 1
+                  }
+
+                  connect() {
+                    # Returns 1 on failure: remove_aerolvm calls it inside an if, where set -e is off.
+                    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null || return 1
+                    CONNECTED=true
+                  }
+
+                  install_aerolvm() {
+                    STEP="downloading helm, kubectl and the aerolvm CLI"
+                    k8s_tools
+                    aerolvm_cli
+
+                    STEP="connecting to the EKS cluster"
+                    connect
+                    kubectl wait --for=condition=Ready nodes --all --timeout=10m
+
+                    STEP="adding the gp3 disk class for the servers"
+                    kubectl apply -f - <<'EOF'
+                  apiVersion: storage.k8s.io/v1
+                  kind: StorageClass
+                  metadata:
+                    name: aerolvm-gp3
+                  provisioner: ebs.csi.aws.com
+                  volumeBindingMode: WaitForFirstConsumer
+                  allowVolumeExpansion: true
+                  reclaimPolicy: Delete
+                  parameters:
+                    type: gp3
+                    encrypted: "true"
+                  EOF
+
+                    STEP="installing cert-manager ${CERT_MANAGER_VERSION}"
+                    fetch /tmp/cert-manager.yaml "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+                    checksum "$CERT_MANAGER_SHA256" /tmp/cert-manager.yaml
+                    kubectl apply --server-side --force-conflicts -f /tmp/cert-manager.yaml >/dev/null
+                    kubectl -n cert-manager wait --for=condition=Available deployment --all --timeout=5m
+
+                    # vmMemoryOverheadPercent: the worker pod asks for nearly the whole
+                    # machine (operator workerPodSize), and Karpenter buys a machine
+                    # only if its own guess of the machine's room fits the pod. Its
+                    # default guess, 7.5% of memory lost to the VM, refuses the worker
+                    # pod of an m7i.4xlarge or 8xlarge ("no instance type has enough
+                    # resources", live run aerolvm-lt1). Measured on that run: an
+                    # m7i.xlarge loses 4.1% and an m7i.4xlarge 3.5%, so 4% buys every
+                    # size offered here and each worker pod still fits.
+                    STEP="installing Karpenter ${KARPENTER_VERSION}"
+                    helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+                      --version "$KARPENTER_VERSION" --namespace kube-system \
+                      --set settings.clusterName="$CLUSTER_NAME" \
+                      --set settings.vmMemoryOverheadPercent=0.04 --wait --timeout 10m
+
+                    # The worker machines (docs: kubernetes/production, step 1).
+                    # expireAfter Never and no terminationGracePeriod: the operator
+                    # replaces machines itself (maxMachineAge), moving sandboxes first.
+                    # The user data loads br_netfilter, which AL2023 does not load and
+                    # without which the worker refuses to start.
+                    STEP="adding the worker NodePool"
+                    kubectl apply -f - <<EOF
+                  apiVersion: karpenter.k8s.aws/v1
+                  kind: EC2NodeClass
+                  metadata:
+                    name: aerolvm-workers
+                  spec:
+                    amiSelectorTerms: [{ alias: al2023@latest }]
+                    role: ${NODE_ROLE}
+                    subnetSelectorTerms: [{ tags: { karpenter.sh/discovery: ${CLUSTER_NAME} } }]
+                    securityGroupSelectorTerms: [{ id: ${CLUSTER_SECURITY_GROUP} }]
+                    metadataOptions: { httpEndpoint: enabled, httpTokens: required, httpPutResponseHopLimit: 1 }
+                    blockDeviceMappings:
+                      - deviceName: /dev/xvda
+                        ebs: { volumeSize: ${WORKER_DISK_GIB}Gi, volumeType: gp3, encrypted: true }
+                    tags: { aerolvm.io/stack: ${CLUSTER_NAME} }
+                    userData: |
+                      MIME-Version: 1.0
+                      Content-Type: multipart/mixed; boundary="//"
+
+                      --//
+                      Content-Type: text/x-shellscript; charset="us-ascii"
+
+                      #!/bin/bash
+                      echo br_netfilter > /etc/modules-load.d/br_netfilter.conf
+                      modprobe br_netfilter
+
+                      --//--
+                  ---
+                  apiVersion: karpenter.sh/v1
+                  kind: NodePool
+                  metadata:
+                    name: aerolvm-gvisor-general
+                  spec:
+                    template:
+                      metadata:
+                        labels: { aerolvm.io/pool: gvisor-general }
+                      spec:
+                        nodeClassRef: { group: karpenter.k8s.aws, kind: EC2NodeClass, name: aerolvm-workers }
+                        taints: [{ key: aerolvm.io/pool, value: gvisor-general, effect: NoSchedule }]
+                        expireAfter: Never
+                        requirements:
+                          - { key: node.kubernetes.io/instance-type, operator: In, values: [${WORKER_INSTANCE_TYPE}] }
+                          - { key: karpenter.sh/capacity-type, operator: In, values: [on-demand] }
+                    disruption:
+                      consolidationPolicy: WhenEmpty
+                      consolidateAfter: 5m
+                  EOF
+
+                    STEP="installing AerolVM ${AEROLVM_VERSION}"
+                    kubectl create namespace aerolvm-system --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+                    kubectl label namespace aerolvm-system pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null
+                    local z1 z2 z3
+                    IFS=, read -r z1 z2 z3 <<<"$ZONES"
+                    cat > /tmp/values.yaml <<EOF
+                  mode: cluster
+                  worker:
+                    defaultRuntime: gvisor
+                  cluster:
+                    zones: [${z1}, ${z2}, ${z3}]
+                    servers:
+                      count: 3
+                      storage: { storageClassName: aerolvm-gp3 }
+                    gateways:
+                      minReplicas: 3
+                      # Private: reach the API with kubectl port-forward, or from inside
+                      # the cluster, until you turn on HTTPS (docs: kubernetes/networking).
+                      service: { type: ClusterIP }
+                    workerPools:
+                      - name: gvisor-general
+                        runtimes: [gvisor]
+                        nodeSelector: { aerolvm.io/pool: gvisor-general }
+                        tolerations: [{ key: aerolvm.io/pool, operator: Exists, effect: NoSchedule }]
+                        machine: { cpu: ${WORKER_CPU}, memoryGiB: ${WORKER_MEMORY_GIB} }
+                        minWorkers: 3
+                        maxWorkers: ${MAX_WORKERS}
+                        headroomPercent: 15
+                        provisioner: karpenter
+                        maxMachineAge: 720h
+                  EOF
+                    helm upgrade --install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm \
+                      --version "$AEROLVM_VERSION" --namespace aerolvm-system -f /tmp/values.yaml --wait --timeout 10m
+
+                    STEP="waiting for the AerolVM cluster to be Ready"
+                    kubectl -n aerolvm-system wait aerolcluster/aerolvm --for=jsonpath='{.status.phase}'=Ready --timeout=25m
+
+                    STEP="creating a first sandbox"
+                    SB_PAT_TOKEN="$(kubectl -n aerolvm-system get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+                    export SB_PAT_TOKEN SB_API_URL=http://127.0.0.1:21212
+                    kubectl -n aerolvm-system port-forward svc/aerolvm-gateway 21212:21212 >/tmp/port-forward.log 2>&1 &
+                    PF=$!
+                    local name out i
+                    name="launch-check-$(date +%s)"
+                    # Workers may still be joining when the cluster turns Ready.
+                    for i in $(seq 1 40); do
+                      aerolvm create --name "$name" --image "$PROBE_IMAGE" --runtime gvisor >/dev/null && break
+                      [ "$i" -eq 40 ] && return 1
+                      sleep 15
+                    done
+                    out="$(aerolvm exec "$name" -- echo hello-from-aerolvm)"
+                    aerolvm destroy "$name" >/dev/null
+                    [ "$out" = hello-from-aerolvm ]
+                    echo "A gVisor sandbox ran and was destroyed."
+
+                    # The security checks of docs/kubernetes/security. They do not stop
+                    # the stack: their result is the stack's InstallCheck output.
+                    # Image signatures are skipped (no cosign here).
+                    STEP="checking the install with aerolvm k8s verify"
+                    local verify="passed"
+                    if ! aerolvm k8s verify --namespace aerolvm-system --worker-namespace aerolvm-workers \
+                      --skip-signatures --probe-runtimes gvisor --probe-image "$PROBE_IMAGE"; then
+                      verify="failed: read the installer log (log group ${LOG_GROUP})"
+                    fi
+
+                    trap - EXIT
+                    kill "$PF" 2>/dev/null || true
+                    respond SUCCESS "AerolVM ${AEROLVM_VERSION} is running." "$verify"
+                  }
+
+                  # Delete: AerolVM first (its operator would otherwise ask for new
+                  # machines), then Karpenter's machines. What Karpenter made is not
+                  # CloudFormation's: a machine holds its subnet and an instance
+                  # profile holds the node role, and either stops the stack delete.
+                  # Steps inside the cluster are best effort; the AWS ones must work.
+                  remove_aerolvm() {
+                    STEP="removing AerolVM and Karpenter from the cluster"
+                    if aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1 && k8s_tools && connect; then
+                      if helm status aerolvm --namespace aerolvm-system >/dev/null 2>&1; then
+                        helm uninstall aerolvm --namespace aerolvm-system --wait --timeout 10m || warn "helm uninstall aerolvm failed"
+                      fi
+                      # Helm keeps these on purpose (docs: kubernetes/production, Uninstall).
+                      kubectl delete namespace aerolvm-workers aerolvm-system --ignore-not-found --timeout=10m ||
+                        warn "the AerolVM namespaces were not deleted in time"
+                      kubectl delete crd aerolclusters.aerolvm.io aerolnodes.aerolvm.io --ignore-not-found --timeout=2m ||
+                        warn "the AerolVM CRDs were not deleted"
+                      local i pvs gone=false
+                      for i in $(seq 1 60); do
+                        # A failed get is not "no disks left" (set -e is off in here).
+                        if pvs="$(kubectl get pv -o jsonpath='{.items[?(@.spec.storageClassName=="aerolvm-gp3")].metadata.name}')" &&
+                          [ -z "$pvs" ]; then
+                          gone=true
+                          break
+                        fi
+                        sleep 10
+                      done
+                      [ "$gone" = true ] || warn "some server disks may remain: EBS volumes tagged kubernetes.io/created-for/pvc/namespace=aerolvm-system"
+                      kubectl delete nodepools.karpenter.sh --all --timeout=10m || warn "the Karpenter NodePools were not deleted in time"
+                      kubectl delete ec2nodeclasses.karpenter.k8s.aws --all --timeout=5m || warn "the EC2NodeClasses were not deleted in time"
+                      helm uninstall karpenter --namespace kube-system --wait --timeout 5m || warn "helm uninstall karpenter failed"
+                    else
+                      warn "the cluster could not be reached, so only the AWS clean-up ran"
+                    fi
+
+                    STEP="removing machines Karpenter left behind"
+                    # Each list is assigned before its loop, so a failed AWS call stops
+                    # the script (set -e) and answers FAILED instead of skipping it.
+                    local ids lts lt profiles profile
+                    ids="$(aws ec2 describe-instances --region "$AWS_REGION" \
+                      --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" "Name=tag-key,Values=karpenter.sh/nodepool" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                      --query 'Reservations[].Instances[].InstanceId' --output text)"
+                    if [ -n "$ids" ]; then
+                      # shellcheck disable=SC2086 # a list of instance ids
+                      aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids $ids >/dev/null
+                      # shellcheck disable=SC2086
+                      aws ec2 wait instance-terminated --region "$AWS_REGION" --instance-ids $ids
+                    fi
+
+                    STEP="removing launch templates and instance profiles Karpenter left behind"
+                    lts="$(aws ec2 describe-launch-templates --region "$AWS_REGION" \
+                      --filters "Name=tag:karpenter.k8s.aws/cluster,Values=${CLUSTER_NAME}" \
+                      --query 'LaunchTemplates[].LaunchTemplateId' --output text)"
+                    for lt in $lts; do
+                      aws ec2 delete-launch-template --region "$AWS_REGION" --launch-template-id "$lt" >/dev/null
+                    done
+                    profiles="$(aws iam list-instance-profiles-for-role --role-name "$NODE_ROLE" \
+                      --query 'InstanceProfiles[].InstanceProfileName' --output text)"
+                    for profile in $profiles; do
+                      case "$profile" in
+                        "${CLUSTER_NAME}_"*)
+                          aws iam remove-role-from-instance-profile --instance-profile-name "$profile" --role-name "$NODE_ROLE"
+                          aws iam delete-instance-profile --instance-profile-name "$profile"
+                          ;;
+                      esac
+                    done
+
+                    trap - EXIT
+                    respond SUCCESS "AerolVM is removed.${WARNINGS:+ Warnings: $WARNINGS}"
+                  }
+
+                  case "$ACTION" in
+                    Create | Update) install_aerolvm ;;
+                    Delete) remove_aerolvm ;;
+                    *) STEP="reading ACTION ($ACTION)" && exit 1 ;;
+                  esac
+
+  # ----------------------------------------------------------------- Helper
+  Helper:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts the AerolVM installer, and removes leftover network interfaces on delete.
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 900
+      Role: !GetAtt HelperRole.Arn
+      # Into the stack's own log group: the default /aws/lambda/<name> group
+      # is made by Lambda, not CloudFormation, and outlived the live runs'
+      # stack deletes.
+      LoggingConfig: { LogGroup: !Ref InstallerLogs, LogFormat: Text }
+      Environment:
+        Variables:
+          PROJECT: !Sub ${AWS::StackName}-installer
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import urllib.request
+
+          import boto3
+
+
+          def physical_id(event):
+              return event.get("PhysicalResourceId") or "%s-%s" % (
+                  event["LogicalResourceId"], event["StackId"].rsplit("/", 1)[-1])
+
+
+          def respond(event, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or status)[:3500],
+                  "PhysicalResourceId": physical_id(event),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": ""})
+              urllib.request.urlopen(req, timeout=30)
+
+
+          def start_installer(event, context):
+              # The build answers CloudFormation itself: an install runs longer
+              # than a Lambda may. Until its script runs, this answers for it:
+              # a build that fails before its BUILD phase (IAM, the VPC, the
+              # build image) never runs the script, and CloudFormation would
+              # wait out ServiceTimeout (the first live run).
+              env = {k: str(v) for k, v in event["ResourceProperties"].items()
+                     if k not in ("ServiceToken", "ServiceTimeout")}
+              env.update(ACTION=event["RequestType"], RESPONSE_URL=event["ResponseURL"],
+                         STACK_ID=event["StackId"], REQUEST_ID=event["RequestId"],
+                         LOGICAL_RESOURCE_ID=event["LogicalResourceId"],
+                         PHYSICAL_RESOURCE_ID=physical_id(event))
+              cb = boto3.client("codebuild")
+              build = None
+              try:
+                  build = cb.start_build(
+                      projectName=os.environ["PROJECT"],
+                      environmentVariablesOverride=[
+                          {"name": k, "value": v, "type": "PLAINTEXT"} for k, v in env.items()],
+                  )["build"]["id"]
+                  print("started", build)
+                  while context.get_remaining_time_in_millis() > 30000:
+                      b = cb.batch_get_builds(ids=[build])["builds"][0]
+                      phases = b.get("phases", [])
+                      if any(ph["phaseType"] == "BUILD" for ph in phases):
+                          return
+                      if b["buildStatus"] != "IN_PROGRESS":
+                          why = [c["message"] for ph in phases for c in ph.get("contexts", []) if c.get("message")]
+                          respond(event, "FAILED", "The installer build %s did not start: %s" % (
+                              build, "; ".join(why) or b["buildStatus"]))
+                          return
+                      time.sleep(10)
+                  why = "did not start in time"
+              except Exception as err:
+                  why = "could not be watched: %s: %s" % (type(err).__name__, err)
+              # Giving up on a build that may still start: stop it first, or
+              # it could later run an install next to the rollback's delete
+              # build, and answer a second time.
+              if build:
+                  try:
+                      cb.stop_build(id=build)
+                  except Exception as err:
+                      print("stop_build", build, err)
+              respond(event, "FAILED", "The installer build %s %s" % (build or "(not started)", why))
+
+
+          def clean_network(props, context):
+              # Runs after the cluster and its machines are deleted. A network
+              # interface the VPC CNI or CodeBuild left "available" holds its
+              # subnet, and EKS keeps its cluster security group while one uses
+              # it. Interfaces still detaching become available within minutes.
+              ec2 = boto3.client("ec2")
+              vpc = props["VpcId"]
+              quiet = 0
+              while context.get_remaining_time_in_millis() > 120000 and quiet < 3:
+                  enis = ec2.describe_network_interfaces(
+                      Filters=[{"Name": "vpc-id", "Values": [vpc]}])["NetworkInterfaces"]
+                  stale = [e for e in enis if e["Status"] == "available"]
+                  leaving = [e for e in enis if e["Status"] != "available" and (
+                      e.get("Description", "").startswith("aws-K8S-")
+                      or any(g["GroupId"] == props["InstallerSecurityGroup"] for g in e.get("Groups", [])))]
+                  for e in stale:
+                      try:
+                          ec2.delete_network_interface(NetworkInterfaceId=e["NetworkInterfaceId"])
+                          print("deleted", e["NetworkInterfaceId"], e.get("Description", ""))
+                      except Exception as err:
+                          print("could not delete", e["NetworkInterfaceId"], err)
+                  quiet = quiet + 1 if not stale and not leaving else 0
+                  time.sleep(20)
+              groups = ec2.describe_security_groups(Filters=[
+                  {"Name": "vpc-id", "Values": [vpc]},
+                  {"Name": "tag:aws:eks:cluster-name", "Values": [props["ClusterName"]]},
+              ])["SecurityGroups"]
+              for g in groups:
+                  try:
+                      ec2.delete_security_group(GroupId=g["GroupId"])
+                      print("deleted the cluster security group", g["GroupId"])
+                  except ec2.exceptions.ClientError as err:
+                      # EKS may delete it at the same moment.
+                      if err.response["Error"]["Code"] != "InvalidGroup.NotFound":
+                          raise
+
+
+          def handler(event, context):
+              print(json.dumps({k: event.get(k) for k in ("RequestType", "LogicalResourceId")}))
+              try:
+                  props = event["ResourceProperties"]
+                  if props.get("Kind") == "network-cleanup":
+                      if event["RequestType"] == "Delete":
+                          clean_network(props, context)
+                      respond(event, "SUCCESS")
+                  else:
+                      start_installer(event, context)
+              except Exception as err:
+                  respond(event, "FAILED", "%s: %s" % (type(err).__name__, err))
+
+  # Runs the installer on create and on every change of these properties
+  # (an upgrade is a new AerolvmVersion), and its delete path on delete.
+  Install:
+    Type: Custom::AerolvmInstall
+    DependsOn:
+      - Installer
+      - SystemNodes
+      - EbsCsiAddon
+      - KarpenterIdentity
+      - InstallerAccess
+      - InstallerToClusterApi
+    Properties:
+      ServiceToken: !GetAtt Helper.Arn
+      # The installer answers within its 55-minute build timeout.
+      ServiceTimeout: 3600
+      # Bump to re-run the installer on stacks updated to this template.
+      INSTALLER_REVISION: "1"
+      AEROLVM_VERSION: !Ref AerolvmVersion
+      ZONES: !Join [",", [!Select [0, !Ref Zones], !Select [1, !Ref Zones], !Select [2, !Ref Zones]]]
+      WORKER_INSTANCE_TYPE: !Ref WorkerInstanceType
+      WORKER_CPU: !FindInMap [WorkerMachine, !Ref WorkerInstanceType, Cpu]
+      WORKER_MEMORY_GIB: !FindInMap [WorkerMachine, !Ref WorkerInstanceType, MemoryGiB]
+      WORKER_DISK_GIB: !Ref WorkerDiskGiB
+      MAX_WORKERS: !Ref MaxWorkers
+
+Outputs:
+  ClusterName:
+    Description: The EKS cluster.
+    Value: !Ref Cluster
+  InstallCheck:
+    Description: The result of aerolvm k8s verify, run at the end of the install.
+    Value: !GetAtt Install.Verify
+  Step1Kubeconfig:
+    Description: Point kubectl at the cluster.
+    Value: !Sub aws eks update-kubeconfig --region ${AWS::Region} --name ${Cluster}
+  Step2Token:
+    Description: The admin API token (SB_PAT_TOKEN).
+    Value: export SB_PAT_TOKEN="$(kubectl -n aerolvm-system get secret aerolvm-admin -o jsonpath='{.data.token}' | base64 -d)"
+  Step3Api:
+    Description: Reach the API from your machine (SB_API_URL=http://127.0.0.1:21212). Apps in the cluster use InClusterApiUrl.
+    Value: kubectl -n aerolvm-system port-forward svc/aerolvm-gateway 21212:21212
+  InClusterApiUrl:
+    Description: The API address for apps that run in the cluster.
+    Value: http://aerolvm-gateway.aerolvm-system:21212
+  InstallerLog:
+    Description: The installer's and the helper Lambda's log, for when something goes wrong.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${InstallerLogs}
