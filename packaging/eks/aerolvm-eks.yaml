@@ -328,8 +328,8 @@ Resources:
             Principal: { Service: pods.eks.amazonaws.com }
             Action: [sts:AssumeRole, sts:TagSession]
       Policies:
-        # Karpenter's reference controller policy for v1.15
-        # (website/content/en/v1.15/getting-started/getting-started-with-karpenter/
+        # Karpenter's reference controller policy at tag v1.15.1
+        # (website/content/en/docs/getting-started/getting-started-with-karpenter/
         # cloudformation.yaml in aws/karpenter-provider-aws), with this stack's
         # names and without the interruption-queue statement (no queue here).
         # Every write is limited to this cluster's tags: in particular CreateTags
