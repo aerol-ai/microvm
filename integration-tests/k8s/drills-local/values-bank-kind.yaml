@@ -1,0 +1,46 @@
+# The parts of charts/aerolvm/values-bank-eks.yaml a kind cluster can
+# carry, laid over scripts/k8s-dev.sh's cluster-mode install with
+# `helm upgrade --reuse-values` (drills-local.sh setup). Left out, and why:
+#   - three real zones, Karpenter, the internal NLB, 32-CPU machines: kind
+#     has three nodes on one laptop (k8s-dev.sh's zones z-a, z-b, z-c);
+#   - the bank's issuer: k8s-dev.sh's self-signed cert-manager issuer;
+#   - an HTTPS registry: the pods reach the drill registry as
+#     localhost:5000, plain HTTP (see fwd.py).
+# networkPolicy.extraEgressCIDRs (the registry's address) is set by
+# drills-local.sh, as a bank adds its own registry's range.
+worker:
+  defaultRuntime: gvisor
+  blockPrivateByDefault: true
+  usageMetrics:
+    enabled: true
+  externalStorage:
+    enabled: false
+
+networkPolicy:
+  enabled: true
+
+# API tokens on every node, as the bank's: the scrape token is one. A pod
+# reads this when it is made, so the install sets it too
+# (AEROL_K8S_IDENTITY=1); this keeps it on for pods made later.
+identity:
+  enabled: true
+
+monitoring:
+  enabled: true
+  # kube-prometheus-stack reads objects labelled with its release name.
+  labels: { release: kube-prometheus-stack }
+  # A viewer token on every team, as the bank's: drills-local.sh setup
+  # makes it and this Secret after the upgrade.
+  scrapeToken:
+    existingSecret: aerolvm-metrics-token
+    key: token
+
+cluster:
+  createPolicy:
+    version: 1
+    images:
+      # The bank's own registry; here the drill registry.
+      allowed_registries: ["localhost:5000"]
+    runtimes: [gvisor]
+    limits: { max_cpu: 8, max_memory_mb: 16384, max_disk_gb: 100 }
+    allow_gpu: false

@@ -23,6 +23,30 @@ the cluster: the first server, the other servers, then gateways and workers.
 {{- end }}
 
    kubectl -n {{ .Release.Namespace }} get secret {{ .Values.cluster.name }}-admin -o jsonpath='{.data.token}' | base64 -d
+{{- $scrape := .Values.monitoring.scrapeToken }}
+{{- if and .Values.monitoring.enabled (ne $scrape.existingSecret (printf "%s-admin" .Values.cluster.name)) }}
+
+4. Prometheus reads every node's metrics with the token in the Secret
+   {{ $scrape.existingSecret }}, and reads nothing until it exists. Make it with
+   a token that can only read, signed in as admin (aerolvm login <API URL> --token-stdin):
+
+   kubectl -n {{ .Release.Namespace }} create secret generic {{ $scrape.existingSecret }} \
+     --from-literal={{ $scrape.key }}="$(aerolvm token create --name prometheus --role viewer --team '*' --expires-in {{ include "aerolvm.scrapeTokenExpiresIn" . }})"
+
+   Make a new one before it expires.
+{{- if not (.Values.identity | default dict).enabled }}
+   identity.enabled is false: every node refuses such a token. Turn it on, then
+   replace the running pods: a pod reads it when it is made.
+{{- end }}
+{{- end }}
+{{- if and .Release.IsUpgrade (.Values.identity | default dict).enabled }}
+
+API tokens (identity.enabled) reach only pods made after they were turned on.
+If this upgrade turned them on, replace the running pods, or they keep refusing
+every token: the gateway pods one at a time, then the server pods one at a
+time, each after the last one's replacement says Serving, and the workers by
+replacing their machines (kubectl cordon <node>).
+{{- end }}
 
 Health: every AerolNode says Serving; a worker that says Failed names the
 machine check it failed. Check the install against the security evidence pack
@@ -71,4 +95,10 @@ sandbox. To move sandboxd to a new image, change the agent container in place;
 only it restarts, and the sandboxes keep running:
 
    kubectl -n {{ .Release.Namespace }} set image pod/{{ include "aerolvm.name" . }}-0 agent=<image>
+{{- if and .Release.IsUpgrade (.Values.identity | default dict).enabled }}
+
+API tokens (identity.enabled) reach the worker pod only when it is made again.
+If this upgrade turned them on, delete pod {{ include "aerolvm.name" . }}-0 when no sandbox is running:
+that ends every sandbox on it.
+{{- end }}
 {{- end }}

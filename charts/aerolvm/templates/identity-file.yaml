@@ -1,0 +1,22 @@
+{{- $file := (.Values.identity | default dict).file | default dict }}
+{{- if $file.content }}
+{{- /* The identity file (identity.file.content), in every namespace a node
+runs in: a ConfigMap volume reads its own namespace only. */}}
+{{- $namespaces := list .Release.Namespace }}
+{{- if eq .Values.mode "cluster" }}
+{{- $namespaces = append $namespaces .Values.cluster.workerNamespace }}
+{{- end }}
+{{- range $namespaces }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aerolvm.identityFileConfigMap" $ }}
+  namespace: {{ . }}
+  labels:
+    {{- include "aerolvm.labels" $ | nindent 4 }}
+data:
+  {{ $file.key | default "identity.yaml" }}: |
+    {{- $file.content | nindent 4 }}
+{{- end }}
+{{- end }}
