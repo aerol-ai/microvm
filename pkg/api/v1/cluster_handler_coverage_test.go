@@ -872,7 +872,7 @@ func newV1WasmMigrateHarness(t *testing.T, importServer *httptest.Server) (*hand
 		targetURL:    targetURL,
 		importClient: importClient,
 		spec: &models.CreateSandboxRequest{
-			Runtime: models.RuntimeWasm, ModuleRef: "file:///tmp/demo.wasm",
+			Runtime: models.RuntimeWasm, ModuleRef: "oci://registry.example/demo:1",
 		},
 	})
 	seedV1WasmSandbox(t, st, "sb-handoff")
@@ -905,7 +905,7 @@ func TestClusterWasmMigrateSuccess(t *testing.T) {
 
 func TestClusterInternalWasmMigrateExportSuccess(t *testing.T) {
 	h, _ := newV1WasmMigrateHarness(t, nil)
-	req := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil)
+	req := asRolePeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil), "srv-a", cluster.JoinRoleServer)
 	req.SetPathValue("id", "sb-handoff")
 	rr := httptest.NewRecorder()
 	h.clusterInternalWasmMigrateExport(rr, req)
@@ -944,7 +944,7 @@ func TestClusterInternalWasmMigrateImportSuccess(t *testing.T) {
 	h, st := newV1WasmMigrateHarness(t, nil)
 
 	exportRR := httptest.NewRecorder()
-	exportReq := httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil)
+	exportReq := asRolePeer(httptest.NewRequest(http.MethodGet, cluster.PublicInternalWasmMigratePath+"sb-handoff/export", nil), "srv-a", cluster.JoinRoleServer)
 	exportReq.SetPathValue("id", "sb-handoff")
 	h.clusterInternalWasmMigrateExport(exportRR, exportReq)
 	if exportRR.Code != http.StatusOK {

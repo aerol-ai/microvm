@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,17 +9,18 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
-	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // A forward the edge speaks for on behalf of a Kubernetes caller (C17) gets
 // that caller's access on the peer, one owner and the runner role, never
-// the node's own; anything malformed, or not from a vouched-for peer, is a
-// refusal.
+// the node's own, and only on the calls the agent-sandbox API makes;
+// anything malformed, or not from a vouched-for peer, is a refusal.
 func TestOnBehalfForwards(t *testing.T) {
 	srv := patFreeServer(t, config.PATScopeAny)
+	path := "/v1/sandboxes/sb-missing"
+	method := http.MethodDelete
 	call := func(headers map[string]string, peer, internal bool) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/v1/whoami", nil)
+		req := httptest.NewRequest(method, path, nil)
 		req.RemoteAddr = "10.0.0.9:7002"
 		if peer {
 			req.TLS = peerTLS("peer-test")
@@ -31,18 +31,37 @@ func TestOnBehalfForwards(t *testing.T) {
 		if internal {
 			req = req.WithContext(cluster.ContextWithInternalPeer(req.Context(), "peer-test"))
 		}
-		rec := httptest.NewRecorder()
-		srv.Handler().ServeHTTP(rec, req)
+		// This node has no store: a call that gets past authentication may
+		// stop in its handler, which is not what this test is about.
+		rec, _ := serveRecover(srv.Handler(), req)
 		return rec
 	}
 	full := map[string]string{cluster.HeaderForwarded: "1", cluster.HeaderCaller: cluster.CallerNode,
 		cluster.HeaderOnBehalfOf: "kubernetes:alice", cluster.HeaderOnBehalfOwner: "team:dev"}
-	rec := call(full, true, true)
-	var who models.WhoAmI
-	_ = json.Unmarshal(rec.Body.Bytes(), &who)
-	if rec.Code != http.StatusOK || who.Principal.Kind != string(controlplane.PrincipalKubernetes) || who.Principal.ID != "kubernetes:alice" {
-		t.Fatalf("on behalf = %d %+v", rec.Code, who)
+	// Authenticated as the caller, owner team:dev: the delete reaches the
+	// handler (not a 401 or 403).
+	if rec := call(full, true, true); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Fatalf("on behalf = %d %s", rec.Code, rec.Body.String())
 	}
+	// Who it is, through the edge's own in-process check of the principal.
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Pattern = "DELETE /v1/sandboxes/{id}"
+	req.TLS = peerTLS("peer-test")
+	for k, v := range full {
+		req.Header.Set(k, v)
+	}
+	req = req.WithContext(cluster.ContextWithInternalPeer(req.Context(), "peer-test"))
+	who, ok := nodeCertAccess(req, srv.nodeRole)
+	if !ok || who.Principal.Kind != controlplane.PrincipalKubernetes || who.Principal.ID != "kubernetes:alice" ||
+		who.Identity.OwnerRef != "team:dev" || who.Role != controlplane.RoleRunner {
+		t.Fatalf("on behalf access = %+v %v", who, ok)
+	}
+	// Any other route, whoami included, is not one the API calls.
+	method, path = http.MethodGet, "/v1/whoami"
+	if rec := call(full, true, true); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("on behalf on whoami = %d, want 401", rec.Code)
+	}
+	method, path = http.MethodDelete, "/v1/sandboxes/sb-missing"
 	without := func(key string) map[string]string {
 		out := map[string]string{}
 		for k, v := range full {

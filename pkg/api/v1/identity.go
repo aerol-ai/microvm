@@ -2,7 +2,9 @@ package v1
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -89,11 +91,15 @@ func (h *handlers) rotateIdentityKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // clusterInternalIdentityWrite takes an identity write from a peer (a
-// follower forwarding to the leader, or a worker). FSM refusals answer 200
-// with a code so the sentinel survives every hop; 503 means retry elsewhere.
+// follower forwarding to the leader, a gateway, or a worker keeping the
+// signing keys). FSM refusals answer 200 with a code so the sentinel
+// survives every hop; 503 means retry elsewhere. Only a server answers it
+// (cluster.Cluster.CheckIdentityWriter says what each role may send); a
+// worker or gateway refuses rather than send a peer's write on as itself.
 func (h *handlers) clusterInternalIdentityWrite(w http.ResponseWriter, r *http.Request) {
 	writer, ok := h.deps.Service.Cluster().(interface {
 		WriteIdentity(context.Context, cluster.IdentityWriteRequest) (cluster.IdentityWriteResponse, error)
+		CheckIdentityWriter(peerID string, leaf *x509.Certificate, req cluster.IdentityWriteRequest) error
 	})
 	if !ok {
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
@@ -102,6 +108,23 @@ func (h *handlers) clusterInternalIdentityWrite(w http.ResponseWriter, r *http.R
 	var req cluster.IdentityWriteRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	peerID, leaf := internalPeer(r)
+	err := writer.CheckIdentityWriter(peerID, leaf, req)
+	if err == nil && req.Keys != nil && !cluster.PeerIsServer(h.deps.Service.Cluster(), peerID, leaf) {
+		// A node that may only keep the keys: this server opens each one
+		// and checks it is the key its record publishes.
+		if kerr := h.deps.Service.CheckIdentityKeyRecords(req.Keys.Keys); kerr != nil {
+			err = fmt.Errorf("%w: %v", cluster.ErrIdentityWriterRefused, kerr)
+		}
+	}
+	if err != nil {
+		out := cluster.IdentityWriteOutcome(err)
+		if out.Code == "" {
+			out = cluster.IdentityWriteOutcome(fmt.Errorf("%w: %v", cluster.ErrIdentityWriterRefused, err))
+		}
+		apihttp.WriteJSON(w, http.StatusOK, out)
 		return
 	}
 	resp, err := writer.WriteIdentity(r.Context(), req)

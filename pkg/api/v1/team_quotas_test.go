@@ -65,13 +65,17 @@ func TestTeamQuotaHandlersSingleNode(t *testing.T) {
 
 type quotaWriterCluster struct {
 	*cluster.Noop
+	// A server: it takes settings writes from peers settingsPeers allows.
+	settingsPeers
 	resp    cluster.TeamQuotaWriteResponse
 	err     error
 	read    cluster.TeamQuotaReadResponse
 	readErr error
+	wrote   cluster.TeamQuotaWriteRequest
 }
 
-func (c *quotaWriterCluster) WriteTeamQuota(context.Context, cluster.TeamQuotaWriteRequest) (cluster.TeamQuotaWriteResponse, error) {
+func (c *quotaWriterCluster) WriteTeamQuota(_ context.Context, req cluster.TeamQuotaWriteRequest) (cluster.TeamQuotaWriteResponse, error) {
+	c.wrote = req
 	return c.resp, c.err
 }
 

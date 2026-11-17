@@ -347,7 +347,30 @@ func (s *Service) openIdentityKey(rec cloudidentity.KeyRecord) (*rsa.PrivateKey,
 		return nil, fmt.Errorf("%w: open signing key %s: %v", ErrIdentityUnavailable, rec.ID, err)
 	}
 	defer clear(der)
-	return cloudidentity.ParsePrivateKey(der)
+	key, err := cloudidentity.ParsePrivateKey(der)
+	if err != nil {
+		return nil, err
+	}
+	// The sealed key must be the one the record publishes: a node that
+	// keeps the keys (a reseal) changes only the sealed part.
+	if err := rec.CheckPrivate(key); err != nil {
+		return nil, fmt.Errorf("%w: signing key %s: %v", ErrIdentityUnavailable, rec.ID, err)
+	}
+	return key, nil
+}
+
+// CheckIdentityKeyRecords opens every key in keys with this node's server
+// key and checks each is the private half of its record (id and public
+// key). A server runs it on a key write from a node that may only keep the
+// keys (cluster.Cluster.CheckIdentityWriter): node certificates get only
+// what their role needs, and keeping a key never changes which key it is.
+func (s *Service) CheckIdentityKeyRecords(keys []cloudidentity.KeyRecord) error {
+	for _, rec := range keys {
+		if _, err := s.openIdentityKey(rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IdentityDiscovery is the OIDC discovery document.

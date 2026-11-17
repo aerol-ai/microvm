@@ -56,6 +56,32 @@ func evictCustomDomainNegativeCache(hostname string) {
 	}
 }
 
+// routableCustomHostnames is p's custom hostnames a gateway routes to the
+// owner: every one but a name of the cluster's own, its base domain, a name
+// under it or the API host (models.ReservedCustomDomain). Custom hostnames
+// go ahead of every other TLS route, so such a name, whatever wrote it into
+// the placement, would take the API host's or another sandbox's traffic.
+// The leader refuses them from workers and gateways (peer_proposals.go);
+// this is the gateway's own check.
+func (s *Service) routableCustomHostnames(p cluster.Placement) []string {
+	if len(p.CustomHostnames) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.CustomHostnames))
+	for _, h := range p.CustomHostnames {
+		if models.ReservedCustomDomain(h, s.cfg.Domain, s.cfg.PublicHost, s.cfg.IngressAdvertiseHost) {
+			// Debug, not Warn: every ingress tick builds the set again.
+			if s.logger != nil {
+				s.logger.Debug("cluster ingress: not routing a custom hostname that is one of the cluster's own names",
+					"sandbox_id", p.SandboxID, "hostname", h)
+			}
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // sandboxCustomHostnamesList returns just the operator-attached hostnames
 // (without per-domain ports) for cluster-FSM replay and similar consumers
 // that only care about the ownership binding, not the routing dial target.
@@ -180,6 +206,12 @@ func (s *Service) recordClusterCustomDomain(ctx context.Context, sandboxID, host
 		if errors.Is(err, cluster.ErrCustomHostnameConflict) {
 			return store.ErrCustomDomainConflict
 		}
+		if errors.Is(err, cluster.ErrPeerProposalRefused) {
+			// A worker or gateway re-adds only a name the sandbox holds;
+			// a new one is bound by the server that checks the caller's
+			// proof, which this call did not pass through.
+			return fmt.Errorf("%w: the cluster has not bound %q to this sandbox: add the domain through a server, which checks the DNS proof and binds it", models.ErrCustomDomainVerificationFailed, hostname)
+		}
 		return fmt.Errorf("cluster: record custom domain: %w", err)
 	}
 	return nil
@@ -246,9 +278,13 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	// keyed to the hostname, not the sandbox ID, so users can provision it
 	// once and attach the hostname to any sandbox (including a recreated
 	// one with a new ID). No lock is held across this lookup: it can take
-	// as long as the resolver's timeout.
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
-		return err
+	// as long as the resolver's timeout. In a cluster the server that took
+	// the call checked the same proof and bound the name before sending
+	// the call here (custom_domain_bind.go), so it is not looked up again.
+	if !customDomainBoundForCall(ctx, sandboxID, canonical) {
+		if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
+			return err
+		}
 	}
 
 	// The custom-domain route dials the port directly, around the ingress
@@ -415,6 +451,14 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 		}
 	}
 	if !owned {
+		// A name the cluster binds to this sandbox with no row here: a
+		// server bound it for an attach whose outcome it never learned
+		// (custom_domain_bind.go). Detaching it releases it.
+		if c := s.Cluster(); c != nil {
+			if p, ok := c.PlacementOf(sandbox.ID); ok && placementHoldsHostname(p, canonical) {
+				return s.removeClusterCustomDomain(ctx, sandbox.ID, canonical)
+			}
+		}
 		return store.ErrNotFound
 	}
 	// From the row delete to the route delete: a route writer that read
@@ -538,9 +582,18 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 	// recreate has no caller who could provision DNS. hostCapable covers all
 	// three (eng review D3). Verify every hostname first, so a create takes
 	// all of its domains or none.
-	if !hostCapable(ctx) {
+	// A rebuild without host powers keeps only the hostnames the cluster
+	// already binds to this sandbox (rebuildSpecWithoutHostPowers), so it
+	// claims nothing new and proves nothing again.
+	// In a cluster the server that took the create checked the same proofs
+	// and bound the names to the create's reservation before sending it
+	// here (custom_domain_bind.go), so they are not looked up again.
+	if !hostCapable(ctx) && !isRebuiltSpec(ctx) {
 		ownerToken := customDomainProofToken(ctx, ownerRefForCreate(ctx))
 		for _, h := range hostnames {
+			if customDomainBoundForCall(ctx, sandboxID, h) {
+				continue
+			}
 			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken); err != nil {
 				return err
 			}

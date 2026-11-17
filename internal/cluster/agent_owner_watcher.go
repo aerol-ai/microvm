@@ -136,6 +136,7 @@ func (a *Agent) recreateOwnedSandboxes(ctx context.Context) {
 		failures:  a.recreateFailures,
 		logger:    a.logger,
 		escalate:  a.requestReassignStuckPlacement,
+		refused:   rebuildRefusalReport{selfNodeID: a.nodeID, logger: a.logger, recreator: r, runStates: a}.report,
 	}
 	// Resume where the last tick stopped. An empty filtered page is NOT the
 	// end of the walk: OwnedRecoveryPlacements pages the owner index and then

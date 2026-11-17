@@ -529,6 +529,11 @@ type Placement struct {
 	// cancels expired reservations and completes abandoned exact-lifecycle
 	// deletes after their finalization lease expires.
 	ExpiresUnix int64 `json:"expires_unix,omitempty"`
+	// ReservedBy is the node that sent a reservation, as the leader saw it
+	// (stampProposal); with the reservation's target, the only worker or
+	// gateway that may cancel it (peer_proposals.go). Empty on a placed row
+	// and on a reservation from before the leader recorded it.
+	ReservedBy string `json:"reserved_by,omitempty"`
 	// RunState is the run state the owner last reported (opSetRunStates,
 	// fsm_run_state.go); empty until it reports one. RunStateIndex is the
 	// Raft index of that report. Neither moves Version: merge two copies of

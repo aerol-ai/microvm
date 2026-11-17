@@ -103,6 +103,11 @@ type Access struct {
 	// they do not cover, and Can grants it sandbox.exec only. nil for every
 	// other credential.
 	SandboxToken *sandboxtoken.Claims
+	// NodeRole is the admitted role of a node principal (PrincipalNode):
+	// NodeRoleServer, NodeRoleWorker, NodeRoleIngress, or "" when the
+	// receiving node could not read it. Only a server's holds a role
+	// (NodeAccess). Empty for every other credential.
+	NodeRole string
 }
 
 type accessCtxKey struct{}

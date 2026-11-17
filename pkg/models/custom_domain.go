@@ -92,6 +92,10 @@ var (
 	ErrCustomDomainPerSandboxCap = fmt.Errorf("at most %d custom domains per sandbox", MaxCustomDomainsPerSandbox)
 	// ErrCustomDomainVerificationFailed is returned when the DNS TXT record check fails.
 	ErrCustomDomainVerificationFailed = errors.New("custom domain TXT record verification failed")
+	// ErrCustomDomainProofUnavailable is a TXT lookup that got no answer in
+	// time, or a temporary resolver failure: not a refusal, so a 503 the
+	// caller retries.
+	ErrCustomDomainProofUnavailable = errors.New("custom domain TXT record could not be checked right now")
 	// ErrCustomDomainInvalidTargetPort is returned when AddCustomDomainRequest
 	// carries a target_port outside [0, 65535]. Zero is the toolbox-default
 	// sentinel; anything else must be a real TCP port number. Surfaced as 400.
@@ -219,4 +223,32 @@ func ValidateCustomDomainList(hosts []string, baseDomain string) ([]string, erro
 		out = append(out, canon)
 	}
 	return out, nil
+}
+
+// ReservedCustomDomain reports whether host may not be a sandbox's custom
+// hostname on a deployment whose base domain is baseDomain and whose API is
+// served at apiHosts (each a host or host:port; empty ones are skipped):
+// it is the base domain or a name under it, an API host, or not a custom
+// hostname at all (NormalizeCustomDomain refuses it, or it is not already
+// in the canonical form the cluster stores). Gateways put custom hostnames
+// ahead of every other TLS route, so the cluster's own names must never be
+// among them.
+func ReservedCustomDomain(host, baseDomain string, apiHosts ...string) bool {
+	canon, err := NormalizeCustomDomain(host, baseDomain)
+	if err != nil || canon != host {
+		return true
+	}
+	for _, api := range apiHosts {
+		api = strings.TrimSpace(api)
+		if api == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(api); err == nil {
+			api = h
+		}
+		if strings.TrimSuffix(strings.ToLower(api), ".") == canon {
+			return true
+		}
+	}
+	return false
 }

@@ -13,8 +13,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/aerol-ai/microvm/internal/config"
 )
 
 // Node cert renewal (cert_renew.go): due at two thirds of life, the same
@@ -282,52 +280,9 @@ func TestAgentRenewViaServers(t *testing.T) {
 	}
 }
 
-// A worker forwards join-token routes to the server tier and gets the
-// server's refusals back as sentinels.
-func TestAgentJoinTokensViaServers(t *testing.T) {
-	reply := func(w http.ResponseWriter, r *http.Request) bool {
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == PublicJoinTokensPath:
-			var req JoinTokenCreateRequest
-			_ = json.NewDecoder(r.Body).Decode(&req)
-			if req.TTL == "0" {
-				w.WriteHeader(http.StatusForbidden)
-				_ = json.NewEncoder(w).Encode(map[string]string{"error": ErrJoinTTLNeedsWrappedCustody.Error()})
-				return true
-			}
-			_ = json.NewEncoder(w).Encode(JoinTokenCreated{ID: "abcdef", Role: req.Role, Token: "abcdef." + strings.Repeat("a", 32)})
-		case r.Method == http.MethodGet && r.URL.Path == PublicJoinTokensPath:
-			_ = json.NewEncoder(w).Encode(JoinTokenList{Tokens: []JoinTokenInfo{{ID: "abcdef"}}})
-		case r.Method == http.MethodDelete && r.URL.Path == PublicJoinTokensPath+"/abcdef":
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			return false
-		}
-		return true
-	}
-	capture := &agentControlPlaneCapture{}
-	agent := newAgentControlPlaneHarness(t, capture.handler(t, reply), Member{NodeID: "w2", Alive: true, Role: config.NodeRoleWorker})
-	ctx := context.Background()
-	var mgr JoinTokenManager = agent
-	created, err := mgr.CreateJoinToken(ctx, JoinTokenCreateRequest{Role: JoinRoleWorker})
-	if err != nil || created.ID != "abcdef" {
-		t.Fatalf("create = %+v %v", created, err)
-	}
-	if _, err := mgr.CreateJoinToken(ctx, JoinTokenCreateRequest{Role: JoinRoleWorker, TTL: "0"}); !errors.Is(err, ErrJoinTTLNeedsWrappedCustody) {
-		t.Fatalf("refused create = %v", err)
-	}
-	if list, err := mgr.ListJoinTokens(ctx); err != nil || len(list.Tokens) != 1 {
-		t.Fatalf("list = %+v %v", list, err)
-	}
-	if err := mgr.RevokeJoinToken(ctx, "abcdef"); err != nil {
-		t.Fatalf("revoke = %v", err)
-	}
-	if err := mgr.RevokeJoinToken(ctx, "BAD!"); !errors.Is(err, ErrJoinBadRequest) {
-		t.Fatalf("revoke bad id = %v", err)
-	}
-	if agentJoinError(nil) != nil || agentJoinError(errors.New("x")).Error() != "x" {
-		t.Fatal("agentJoinError passthrough")
-	}
+// A server's join refusals come back to a joiner as sentinels; another
+// server may answer what one refused only when it is not ready.
+func TestPeerJoinErrors(t *testing.T) {
 	if !isPeerRetryable(ErrNoCASigner) || !isPeerRetryable(statusError{status: http.StatusServiceUnavailable}) || isPeerRetryable(ErrNotAdmitted) {
 		t.Fatal("isPeerRetryable")
 	}

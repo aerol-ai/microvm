@@ -15,9 +15,21 @@ func TestAccessConstructors(t *testing.T) {
 	if !op.Fleet || op.Role != RoleAdmin || op.Principal != (Principal{Kind: PrincipalOperator, ID: "operator", Name: "operator"}) || op.Via != "" {
 		t.Fatalf("OperatorAccess = %+v", op)
 	}
-	node := NodeAccess("n3")
-	if !node.Fleet || node.Role != RoleAdmin || node.Principal != (Principal{Kind: PrincipalNode, ID: "node:n3", Name: "node:n3"}) {
+	node := NodeAccess("n3", NodeRoleServer)
+	if !node.Fleet || node.Role != RoleAdmin || node.Principal != (Principal{Kind: PrincipalNode, ID: "node:n3", Name: "node:n3"}) ||
+		node.NodeRole != NodeRoleServer || node.NodeLimited() {
 		t.Fatalf("NodeAccess = %+v", node)
+	}
+	// Node certificates get only what their role needs: any role but
+	// server, or one the receiving node could not read, holds no role.
+	for _, role := range []string{NodeRoleWorker, NodeRoleIngress, "", "mixed"} {
+		limited := NodeAccess("n4", role)
+		if !limited.Fleet || limited.Role != "" || limited.Principal.ID != "node:n4" || limited.NodeRole != role || !limited.NodeLimited() {
+			t.Fatalf("NodeAccess(%q) = %+v", role, limited)
+		}
+	}
+	if op.NodeLimited() || op.NodeID() != "" || node.NodeID() != "n3" {
+		t.Fatalf("NodeID: operator %q, node %q", op.NodeID(), node.NodeID())
 	}
 	if op.Team() != FleetTeam || node.Team() != FleetTeam {
 		t.Fatalf("fleet callers act on every team: %q %q", op.Team(), node.Team())

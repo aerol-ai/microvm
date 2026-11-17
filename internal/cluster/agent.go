@@ -1054,9 +1054,18 @@ func (a *Agent) IsNodeDrained(nodeID string) bool {
 	return resp.Drained
 }
 
+// ApplyEncoded sends an encoded command to the server tier. A peer's raw
+// apply that reached this node's listener (ContextWithApplyPeer) is not
+// sent on: a worker or gateway holds no Raft state, and relaying would
+// make the peer's proposal this node's own, whose role may allow more
+// (peer_proposals.go). It answers ErrNotLeader, so the peer tries the next
+// server, as it does for a server that is not the leader.
 func (a *Agent) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if _, err := decodeCommand(payload); err != nil {
 		return fmt.Errorf("cluster: decode forwarded command: %w", err)
+	}
+	if _, fromPeer := applyPeerFromContext(ctx); fromPeer {
+		return ErrNotLeader
 	}
 	return a.applyEncodedToControlPlane(ctx, payload)
 }
@@ -1987,12 +1996,18 @@ func (e statusError) Error() string {
 	return fmt.Sprintf("cluster control-plane request failed with status %d: %s", e.status, e.message)
 }
 
-// Is lets errors.Is match ErrMembershipPending against the two refusals the
-// internal server's peer check issues for a node it does not currently see:
-// 403 "cluster peer not in membership" and the pre-gossip 503. Matching on
-// the server's own wording keeps every other 403 (a bad PAT, a revoked
-// certificate's handshake never gets this far) out of the retryable class.
+// Is lets errors.Is match ErrPeerProposalRefused against the leader's 403
+// for a proposal this node's role may not make, and ErrMembershipPending
+// against the two refusals the internal server's peer check issues for a
+// node it does not currently see: 403 "cluster peer not in membership" and
+// the pre-gossip 503. Matching on the server's own wording keeps every
+// other 403 (a bad PAT, a revoked certificate's handshake never gets this
+// far) out of the retryable class.
 func (e statusError) Is(target error) bool {
+	if target == ErrPeerProposalRefused {
+		// The leader's role check (peer_proposals.go), relayed by a server.
+		return e.status == http.StatusForbidden && strings.Contains(e.message, ErrPeerProposalRefused.Error())
+	}
 	if target != ErrMembershipPending {
 		return false
 	}

@@ -69,16 +69,16 @@ func (h *handlers) revokeToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // tokenWritePeerChecker is the role binding for token writes
-// (Cluster.IsTokenWritePeer): servers and ingress (gateway) nodes.
+// (Cluster.IsTokenWritePeer): servers.
 type tokenWritePeerChecker interface {
 	IsTokenWritePeer(peerID string) bool
 }
 
 // refuseNodeTokenWrite answers a token write a node makes on its own behalf
 // (a node principal: its certificate, or the PAT over mTLS) unless the node
-// is a server or a gateway: token writes come only from those (defense in
-// depth). A caller's own credential that a worker forwarded is that caller,
-// not the node, and passes. It reports whether it answered.
+// is a server: token writes come only from servers (defense in depth). A
+// caller's own credential that a worker or gateway forwarded is that
+// caller, not the node, and passes. It reports whether it answered.
 func (h *handlers) refuseNodeTokenWrite(w http.ResponseWriter, r *http.Request, what string) bool {
 	access, ok := controlplane.AccessFromContext(r.Context())
 	if !ok || access.Principal.Kind != controlplane.PrincipalNode {
@@ -91,42 +91,29 @@ func (h *handlers) refuseNodeTokenWrite(w http.ResponseWriter, r *http.Request, 
 	if h.deps.Logger != nil {
 		h.deps.Logger.Warn("cluster: refused a token write a node made for itself", "what", what, "peer", peer)
 	}
-	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("%s by node %q: a node's own identity cannot write tokens here, only a server's or a gateway's; send the call with an operator token or a user token", what, peer))
+	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("%s by node %q: a node's own identity cannot write tokens here, only a server's; send the call with an operator token or a user token", what, peer))
 	return true
 }
 
-// tokenServerForwarder is a worker's way to a server (Agent.ForwardToServer).
-type tokenServerForwarder interface {
-	ForwardToServer(http.ResponseWriter, *http.Request)
-}
-
 // forwardTokenWrite sends a caller's token create or revoke on to a server
-// when this node does not write tokens (a worker), so a cluster whose API
-// address reaches only workers can still create and revoke them. Only with
+// when this node does not write tokens (a worker or a gateway), so a
+// cluster whose API address reaches only those can still create and revoke
+// them. Only with
 // the caller's own credential: the server authenticates the caller itself,
 // and a call that carries none is refused here, never sent as this node.
 // It reports whether it answered.
 func (h *handlers) forwardTokenWrite(w http.ResponseWriter, r *http.Request) bool {
-	if !h.deps.Service.ForwardsAPITokenWrites() {
+	if !h.deps.Service.SendsOperatorCallsToServers() {
 		return false
 	}
-	if scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " "); !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(cred) == "" {
-		apihttp.WriteError(w, http.StatusBadRequest, "this worker node sends token writes on to a server with your own credential, and this call carries none: send it with an Authorization header, or to a server or gateway")
-		return true
-	}
-	fw, ok := h.deps.Service.Cluster().(tokenServerForwarder)
-	if !ok {
-		apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoServerForward.Error())
-		return true
-	}
-	fw.ForwardToServer(w, r)
+	h.sendToServer(w, r, "token writes")
 	return true
 }
 
 // clusterInternalAPITokenWrite applies a peer's token write on the leader,
 // or forwards it one hop there. FSM verdicts travel in a 200 body so they
 // survive the hops; anything else is a 503 the caller retries elsewhere.
-// Only a server or a gateway may send one (IsTokenWritePeer). Every write
+// Only a server may send one (IsTokenWritePeer). Every write
 // is recorded here with the sending node and the record's created_by, a
 // refused one at most once a minute per node (RecordInternalTokenWrite):
 // the cluster.internal routes are otherwise never recorded (api_audit.go).
@@ -152,7 +139,7 @@ func (h *handlers) clusterInternalAPITokenWrite(w http.ResponseWriter, r *http.R
 		}
 		h.deps.Service.RecordInternalTokenWrite(r.Context(), peerID, req, http.StatusForbidden, true)
 		apihttp.WriteJSON(w, http.StatusOK, cluster.APITokenWriteOutcome(
-			fmt.Errorf("%w: node %q is not a server or an ingress node", cluster.ErrAPITokenWriterRefused, peerID)))
+			fmt.Errorf("%w: node %q is not a server", cluster.ErrAPITokenWriterRefused, peerID)))
 		return
 	}
 	resp, err := writer.WriteAPIToken(r.Context(), req)

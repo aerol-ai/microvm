@@ -80,7 +80,8 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 	is := &internalServer{logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+InternalAPIPath, func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := is.authorizePeerRequest(w, r); !ok {
+		peerID, ok := is.authorizePeerRequest(w, r)
+		if !ok {
 			return
 		}
 		// The TLS handshake verifies the chain and authorizePeerRequest binds
@@ -91,7 +92,10 @@ func startInternalServer(bindAddr string, ct *ClusterTLS, applyHandler func(cont
 			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if applyErr := applyHandler(r.Context(), body); applyErr != nil {
+		// The apply side checks what this peer's role may propose
+		// (peer_proposals.go), so it needs the peer and its certificate.
+		ctx := ContextWithApplyPeer(r.Context(), peerID, r.TLS.PeerCertificates[0])
+		if applyErr := applyHandler(ctx, body); applyErr != nil {
 			// 503 on ErrNotLeader mirrors the public-API leader-forward
 			// semantics: the forwarder retries against a refreshed leader
 			// URL. The rest of the mapping is shared with the v1 apply

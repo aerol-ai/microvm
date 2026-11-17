@@ -62,7 +62,7 @@ func TestLeaderRefusesReservationsPastTheLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	if err := c.ApplyEncoded(context.Background(), payload); !errors.Is(err, ErrCreateBackpressure) {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(context.Background(), c.nodeID, nil), payload); !errors.Is(err, ErrCreateBackpressure) {
 		t.Fatalf("a reservation with every slot held = %v", err)
 	}
 	if took := time.Since(start); took > time.Second {
@@ -72,7 +72,7 @@ func TestLeaderRefusesReservationsPastTheLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.ApplyEncoded(context.Background(), other); err != nil {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(context.Background(), c.nodeID, nil), other); err != nil {
 		t.Fatalf("a non-reservation op with every slot held = %v", err)
 	}
 	hold()

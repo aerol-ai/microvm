@@ -76,6 +76,14 @@ const (
 	// from a live mTLS peer, and StampForward sets it only from the request
 	// context (ContextWithOwnerEpoch).
 	HeaderOwnerEpoch = "X-Cluster-Owner-Epoch"
+	// HeaderCustomDomainsBound names the custom hostnames the server that
+	// forwards a domain attach, or a create with custom_domains, bound to
+	// the sandbox for this call after the caller's DNS proof
+	// (CustomDomainsBound). The owner then does not look the proof up
+	// again. Like every X-Cluster-* header it is honoured only from a live
+	// mTLS peer, pkg/api honours it only from a server, and StampForward
+	// sets it only from the request context (ContextWithCustomDomainsBound).
+	HeaderCustomDomainsBound = "X-Cluster-Custom-Domains-Bound"
 )
 
 type ownerEpochCtxKey struct{}
@@ -182,6 +190,9 @@ func PATOriginFromContext(ctx context.Context) string {
 //     same way as HeaderSurface.
 //   - HeaderOwnerEpoch, the owner epoch the edge read for its target
 //     (ContextWithOwnerEpoch). Removed from every other request.
+//   - HeaderCustomDomainsBound, the custom hostnames this server bound for
+//     the call (ContextWithCustomDomainsBound). Removed from every other
+//     request.
 //   - HeaderCaller, for a request a local tool made with this node's own
 //     token (ContextWithLocalCaller): the credential, which no peer would
 //     accept, is dropped, and the edge node speaks for the call
@@ -238,6 +249,11 @@ func StampForward(out *http.Request, access controlplane.Access) {
 		out.Header.Set(HeaderOwnerEpoch, strconv.FormatUint(epoch, 10))
 	} else {
 		out.Header.Del(HeaderOwnerEpoch)
+	}
+	if bound, ok := CustomDomainsBoundFromContext(out.Context()); ok {
+		out.Header.Set(HeaderCustomDomainsBound, bound.encode())
+	} else {
+		out.Header.Del(HeaderCustomDomainsBound)
 	}
 	stampCaller(out, access)
 	auditlog.MarkForwarded(out.Context())

@@ -168,3 +168,27 @@ func TestValidateCustomDomainTargetPort(t *testing.T) {
 		t.Error("port 65536: want error")
 	}
 }
+
+func TestReservedCustomDomain(t *testing.T) {
+	for host, want := range map[string]bool{
+		"app.customer.com":  false,
+		"sb.example.com":    true,
+		"x.sb.example.com":  true,
+		"api.example.com":   true,
+		"api.example.org":   true,
+		"App.Customer.com":  true,
+		"app.customer.com.": true,
+		"localhost":         true,
+		"10.0.0.1":          true,
+		"":                  true,
+		"nodot":             true,
+		"other.example.com": false,
+	} {
+		if got := ReservedCustomDomain(host, "sb.example.com", "api.example.com:443", "", "API.example.org."); got != want {
+			t.Errorf("%q: %v, want %v", host, got, want)
+		}
+	}
+	if ReservedCustomDomain("app.customer.com", "") {
+		t.Error("no base domain, no API host: a customer name is reserved")
+	}
+}

@@ -4,10 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/upgradewire"
 )
@@ -48,6 +50,51 @@ func (d Deps) Route(perm controlplane.Permission, h http.Handler) http.Handler {
 // RouteBy is Route for a route whose permission depends on the request.
 func (d Deps) RouteBy(tag string, classify func(*http.Request) controlplane.Permission, h http.Handler) http.Handler {
 	return d.router().RouteBy(tag, classify, h)
+}
+
+// RouteByForNodes is RouteBy with a grant to some node roles (RouteForNodes).
+func (d Deps) RouteByForNodes(tag string, classify func(*http.Request) controlplane.Permission, grant apihttp.NodeGrant, h http.Handler) http.Handler {
+	return d.router().RouteByForNodes(tag, classify, grant, h)
+}
+
+// RouteForNodes is Route for a route some node roles call as themselves
+// (apihttp.Router.RouteForNodes): node certificates get only what their
+// role needs, and grant names what a worker's or gateway's needs here.
+func (d Deps) RouteForNodes(perm controlplane.Permission, grant apihttp.NodeGrant, h http.Handler) http.Handler {
+	return d.router().RouteForNodes(perm, grant, h)
+}
+
+// What a worker's or gateway's certificate may call on the public API, as
+// itself (node certificates get only what their role needs; everything
+// not granted here is 403 for it, and cluster.internal is open to every
+// role). Each grant names the call that needs it.
+
+// nodeGrantAny: any worker or gateway, for a read every node makes in the
+// background (membership, the leader, a node's capacity).
+func nodeGrantAny(*http.Request, controlplane.Access) bool { return true }
+
+// nodeGrantSelf: only when the route's {id} is the calling node: a node
+// leaving the cluster, or reading itself (sandboxd-node-lifecycle.sh with
+// the node's own token).
+func nodeGrantSelf(r *http.Request, a controlplane.Access) bool {
+	id := strings.TrimSpace(r.PathValue("id"))
+	return id != "" && id == a.NodeID()
+}
+
+// nodeGrantSandboxRow: one sandbox's row without its env, which the SSH
+// gateway reads through its own node to check a key (the read reaches the
+// owner as that node).
+func nodeGrantSandboxRow(r *http.Request, _ controlplane.Access) bool {
+	return !apihttp.IncludeEnvRequested(r)
+}
+
+// nodeGrantSSHBridge: the sessions routes, only for a call the SSH gateway
+// bridged for that sandbox's key holder (the edge's X-Cluster-Ssh-Gateway,
+// which pkg/api accepted for this sandbox and put on the context).
+func nodeGrantSSHBridge(r *http.Request, _ controlplane.Access) bool {
+	call, ok := auditlog.SSHGatewayCallFromContext(r.Context())
+	id := strings.TrimSpace(r.PathValue("id"))
+	return ok && id != "" && call.SandboxID == id
 }
 
 func (d Deps) router() apihttp.Router {
@@ -97,7 +144,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/tokens", d.Route(controlplane.PermTokenWrite, http.HandlerFunc(h.createToken)))
 	mux.Handle("GET "+PathPrefix+"/tokens", d.Route(controlplane.PermTokenRead, http.HandlerFunc(h.listTokens)))
 	mux.Handle("DELETE "+PathPrefix+"/tokens/{id}", d.Route(controlplane.PermTokenWrite, http.HandlerFunc(h.revokeToken)))
-	mux.Handle("GET "+PathPrefix+"/capacity", d.Route(permRead, http.HandlerFunc(h.capacity)))
+	// A server reads each owner's capacity as itself (capacity leases).
+	mux.Handle("GET "+PathPrefix+"/capacity", d.RouteForNodes(permRead, nodeGrantAny, http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Route(permFleet, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Route(permWrite, http.HandlerFunc(h.clusterBuildImageWrap)))
 
@@ -117,7 +165,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// pass-through. The permission is checked on the edge before forwarding,
 	// and again on the owner, which mounts the same handler.
 	wrap := h.clusterForwardWrap
-	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", readOrSecrets(wrap(http.HandlerFunc(h.getSandbox))))
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.RouteByForNodes(apihttp.ReadOrSecretsTag, apihttp.ReadOrSecrets, nodeGrantSandboxRow, wrap(http.HandlerFunc(h.getSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Route(permWrite, wrap(http.HandlerFunc(h.startSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Route(permWrite, wrap(http.HandlerFunc(h.stopSandbox))))
 	// DELETE goes through clusterForwardWrap (forward to owner if not us)
@@ -145,7 +193,11 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// with clusterForwardWrap so a request addressing a remote-owned
 	// sandbox follows the same forward path as every other per-sandbox
 	// route — the owner is the only node with the row to mutate.
-	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permWrite, wrap(http.HandlerFunc(h.addCustomDomain))))
+	// A server binds a new custom hostname, after the caller's DNS proof: a
+	// worker or gateway sends the attach to one (custom_domains_servers.go).
+	// A server's 5xx is the answer (a TXT lookup with no answer is 503 with
+	// Retry-After), not a reason to ask the next server.
+	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permWrite, h.viaServersWith(h.attachGoesToServer, true, h.bindCustomDomainFirst(wrap(http.HandlerFunc(h.addCustomDomain))))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains", d.Route(permRead, wrap(http.HandlerFunc(h.listCustomDomains))))
 	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}/custom-domains/{hostname}", d.Route(permWrite, wrap(http.HandlerFunc(h.removeCustomDomain))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/custom-domains/dns", d.Route(permRead, wrap(http.HandlerFunc(h.customDomainDNS))))
@@ -162,23 +214,23 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/learned", d.Route(permRead, wrap(http.HandlerFunc(h.getNetworkLearned))))
 	// Named egress profiles (D21). Not sandbox-scoped, so no owner
 	// forwarding; in a cluster the service writes them through Raft.
-	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.putEgressProfile)))
+	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.viaServers(nil, http.HandlerFunc(h.putEgressProfile))))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Route(permRead, http.HandlerFunc(h.getEgressProfile)))
-	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, http.HandlerFunc(h.deleteEgressProfile)))
+	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Route(permWrite, h.viaServers(nil, http.HandlerFunc(h.deleteEgressProfile))))
 	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Route(permRead, http.HandlerFunc(h.listEgressProfiles)))
 	// Team quotas (plan item P2): an admin caps what a team may hold. Not
 	// sandbox-scoped; in a cluster the service writes them through Raft.
-	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.putTeamQuota)))
+	mux.Handle("PUT "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putTeamQuota))))
 	mux.Handle("GET "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.getTeamQuota)))
-	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, http.HandlerFunc(h.deleteTeamQuota)))
+	mux.Handle("DELETE "+PathPrefix+"/teams/{team}/quota", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteTeamQuota))))
 	// Cloud identity (plans/sandbox-cloud-identity.md): each team's
 	// role-tag allow list is admin only (D1.5), key rotation is the
 	// operator's. Not sandbox-scoped, so no owner forwarding; in a cluster
 	// the service writes them through Raft. No route returns a token.
-	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.putIdentityRole)))
-	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, http.HandlerFunc(h.deleteIdentityRole)))
+	mux.Handle("PUT "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putIdentityRole))))
+	mux.Handle("DELETE "+PathPrefix+"/identity/roles/{tag}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteIdentityRole))))
 	mux.Handle("GET "+PathPrefix+"/identity/roles", d.Route(permFleet, http.HandlerFunc(h.listIdentityRoles)))
-	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, http.HandlerFunc(h.rotateIdentityKey)))
+	mux.Handle("POST "+PathPrefix+"/identity/keys/rotate", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.rotateIdentityKey))))
 	// Pure policy evaluation: no sandbox, no state change, so a read.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Route(permRead, http.HandlerFunc(h.checkNetworkPolicy)))
 	// Warm pools (plans/agent-sandbox-feature-parity.md W1): fleet-wide
@@ -188,8 +240,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// the rest of the path, so an image's slashes need no escaping.
 	mux.Handle("GET "+PathPrefix+"/warm-pools", d.Route(permFleet, http.HandlerFunc(h.listWarmPools)))
 	mux.Handle("GET "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.getWarmPool)))
-	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.putWarmPool)))
-	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, http.HandlerFunc(h.deleteWarmPool)))
+	mux.Handle("PUT "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.putWarmPool))))
+	mux.Handle("DELETE "+PathPrefix+"/warm-pools/{image...}", d.Route(permFleet, h.viaServers(nil, http.HandlerFunc(h.deleteWarmPool))))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Route(controlplane.PermAuditRead, withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -238,8 +290,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// /v1/sandboxes/{id}/sessions/... → toolbox /sessions/...
 	// The whole toolbox proxy is one permission, sandbox.exec, whatever the
 	// sub-path: file reads included, since files can hold secrets.
-	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.Route(permExec, wrap(http.HandlerFunc(h.sessionsProxy))))
-	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions/{path...}", d.Route(permExec, wrap(http.HandlerFunc(h.sessionsProxy))))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions", d.RouteForNodes(permExec, nodeGrantSSHBridge, wrap(http.HandlerFunc(h.sessionsProxy))))
+	mux.Handle(PathPrefix+"/sandboxes/{id}/sessions/{path...}", d.RouteForNodes(permExec, nodeGrantSSHBridge, wrap(http.HandlerFunc(h.sessionsProxy))))
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox", d.Route(permExec, wrap(http.HandlerFunc(h.toolboxProxy))))
 	mux.Handle(PathPrefix+"/sandboxes/{id}/toolbox/{path...}", d.Route(permExec, wrap(http.HandlerFunc(h.toolboxProxy))))
 
@@ -252,9 +304,11 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	internalOp := func(next http.Handler) http.Handler {
 		return d.Route(permInternal, withInternalMTLS(d, next))
 	}
-	mux.Handle("GET "+PathPrefix+"/cluster/members", op(http.HandlerFunc(h.clusterMembers)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", op(http.HandlerFunc(h.clusterRemoveMember)))
-	mux.Handle("GET "+PathPrefix+"/cluster/leader", op(http.HandlerFunc(h.clusterLeader)))
+	// Workers and gateways read membership and the leader as themselves,
+	// and a node may remove or read itself; nothing else here.
+	mux.Handle("GET "+PathPrefix+"/cluster/members", d.RouteForNodes(permFleet, nodeGrantAny, http.HandlerFunc(h.clusterMembers)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/members/{id}", d.RouteForNodes(permFleet, nodeGrantSelf, h.viaServers(h.otherNode, http.HandlerFunc(h.clusterRemoveMember))))
+	mux.Handle("GET "+PathPrefix+"/cluster/leader", d.RouteForNodes(permFleet, nodeGrantAny, http.HandlerFunc(h.clusterLeader)))
 	mux.Handle("GET "+PathPrefix+"/cluster/placements/{id}", op(http.HandlerFunc(h.clusterPlacement)))
 	// Fleet-admin only, like every other /cluster route: the recipient set
 	// names which nodes hold a tenant's sealed secret, which is fleet
@@ -269,14 +323,14 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/cluster/sandboxes/{id}/secret-holders", op(wrap(http.HandlerFunc(h.clusterSecretHolders))))
 	mux.Handle("GET "+PathPrefix+"/cluster/sandbox-index", op(http.HandlerFunc(h.clusterSandboxIndex)))
 	mux.Handle("GET "+PathPrefix+"/cluster/ingress-route/{id}", op(http.HandlerFunc(h.clusterIngressRoute)))
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(http.HandlerFunc(h.clusterDrainNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/drain", op(h.viaServers(h.otherNode, http.HandlerFunc(h.clusterDrainNode))))
 	// cordon is drain's clear name (`aerolvm cordon`): the same admission-
 	// only mark. /drain stays for older clients and the lifecycle script.
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/cordon", op(http.HandlerFunc(h.clusterDrainNode)))
-	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterGetNode)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/cordon", op(h.viaServers(h.otherNode, http.HandlerFunc(h.clusterDrainNode))))
+	mux.Handle("GET "+PathPrefix+"/cluster/nodes/{id}", d.RouteForNodes(permFleet, nodeGrantSelf, h.viaServers(h.otherNode, http.HandlerFunc(h.clusterGetNode))))
 	// Any role. DELETE /cluster/members/{id} keeps its servers-only answers.
-	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(http.HandlerFunc(h.clusterDeleteNode)))
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(http.HandlerFunc(h.clusterUncordonNode)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}", op(h.viaServers(nil, http.HandlerFunc(h.clusterDeleteNode))))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/uncordon", op(h.viaServers(h.otherNode, http.HandlerFunc(h.clusterUncordonNode))))
 	// The operator's "this node's machine is gone" (C19): the leader may
 	// fail it over at its ownership lease limit instead of after the grace.
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/gone", op(http.HandlerFunc(h.clusterNodeGone)))
@@ -284,8 +338,8 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// recreate-policy sandboxes, tells the owners of the rest, and at the
 	// deadline stops them. The operator calls it until done.
 	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/evacuate", op(http.HandlerFunc(h.clusterEvacuateNode)))
-	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRetireNodeStorage)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(http.HandlerFunc(h.clusterRevokeNodeStorageRetirement)))
+	mux.Handle("POST "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(h.viaServers(nil, http.HandlerFunc(h.clusterRetireNodeStorage))))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/nodes/{id}/storage-retired", op(h.viaServers(nil, http.HandlerFunc(h.clusterRevokeNodeStorageRetirement))))
 	mux.Handle("GET "+PathPrefix+"/cluster/storage-retirements", op(http.HandlerFunc(h.clusterListNodeStorageRetirements)))
 	// Single-node upgrade (plans/kubectl-style-cluster-ops.md §6.1): upload
 	// release files, start `sandboxd upgrade node`, read its progress. 409
@@ -298,9 +352,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// adopt for operators; renewal, the CA key and join writes for peers.
 	// The new machine's own calls never reach this mux: they go to the join
 	// listener (:7003) on servers.
-	mux.Handle("POST "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterCreateJoinToken)))
-	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(http.HandlerFunc(h.clusterListJoinTokens)))
-	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(http.HandlerFunc(h.clusterRevokeJoinToken)))
+	mux.Handle("POST "+cluster.PublicJoinTokensPath, op(h.viaServers(nil, http.HandlerFunc(h.clusterCreateJoinToken))))
+	mux.Handle("GET "+cluster.PublicJoinTokensPath, op(h.viaServers(nil, http.HandlerFunc(h.clusterListJoinTokens))))
+	mux.Handle("DELETE "+cluster.PublicJoinTokensPath+"/{id}", op(h.viaServers(nil, http.HandlerFunc(h.clusterRevokeJoinToken))))
 	mux.Handle("POST "+cluster.PublicAdoptPath, op(http.HandlerFunc(h.clusterAdopt)))
 	// Cluster upgrades (plans/kubectl-style-cluster-ops.md §6,
 	// cluster_upgrade.go): the rollout for operators; the node step, the
@@ -323,11 +377,11 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalJoinWritePath, internalOp(http.HandlerFunc(h.clusterInternalJoinWrite)))
 	mux.Handle("POST "+cluster.PublicInternalRenewCertPath, internalOp(http.HandlerFunc(h.clusterInternalRenewCert)))
 	mux.Handle("POST "+cluster.PublicInternalCAKeyPath, internalOp(http.HandlerFunc(h.clusterInternalCAKey)))
-	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(http.HandlerFunc(h.clusterWasmMigrate)))
+	mux.Handle("POST "+cluster.PublicWasmMigratePath, op(h.viaServers(nil, http.HandlerFunc(h.clusterWasmMigrate))))
 	mux.Handle("GET "+cluster.PublicInternalWasmMigratePath+"{id}/export", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateExport)))
 	mux.Handle("PUT "+cluster.PublicInternalWasmMigratePath+"{id}/import", internalOp(http.HandlerFunc(h.clusterInternalWasmMigrateImport)))
 	mux.Handle("POST "+PathPrefix+"/cluster/orphans/{id}/reclaim-local", op(http.HandlerFunc(h.clusterReclaimOrphanLocal)))
-	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(http.HandlerFunc(h.clusterDeleteOrphan)))
+	mux.Handle("DELETE "+PathPrefix+"/cluster/orphans/{id}", op(h.viaServers(nil, http.HandlerFunc(h.clusterDeleteOrphan))))
 	mux.Handle("POST "+cluster.PublicInternalApplyPath, internalOp(http.HandlerFunc(h.clusterInternalApply)))
 	mux.Handle("GET "+cluster.PublicInternalPlacementPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalPlacementByNamePath+"{name}", internalOp(http.HandlerFunc(h.clusterInternalPlacementByName)))

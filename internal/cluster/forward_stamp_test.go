@@ -41,7 +41,7 @@ func TestStampForward(t *testing.T) {
 		{"team-bound OIDC token with a correlation id", oidc, "corr-42", "checkout"},
 		{"fleet-bound token has no team to select", fleetToken, "", ""},
 		{"operator", controlplane.OperatorAccess(), "corr-op", ""},
-		{"node", controlplane.NodeAccess("n3"), "", ""},
+		{"node", controlplane.NodeAccess("n3", controlplane.NodeRoleServer), "", ""},
 		{"managed account is never a team", managed, "", ""},
 		{"no access at all", controlplane.Access{}, "", ""},
 	}
@@ -101,7 +101,7 @@ func TestStampForwardPATOrigin(t *testing.T) {
 		{name: "operator from the public side", access: controlplane.OperatorAccess(), origin: PATOriginPublic, want: PATOriginPublic},
 		{name: "operator with no recorded origin is public", access: controlplane.OperatorAccess(), want: PATOriginPublic},
 		{name: "an unknown origin value is public", access: controlplane.OperatorAccess(), origin: "somewhere", want: PATOriginPublic},
-		{name: "node acting for itself", access: controlplane.NodeAccess("n3"), origin: PATOriginHost, want: PATOriginHost},
+		{name: "node acting for itself", access: controlplane.NodeAccess("n3", controlplane.NodeRoleServer), origin: PATOriginHost, want: PATOriginHost},
 		{name: "a stale public marker is replaced", access: controlplane.OperatorAccess(), origin: PATOriginHost, stale: PATOriginPublic, want: PATOriginHost},
 		{name: "a token carries no origin", access: teamToken("payments"), origin: PATOriginHost, want: ""},
 		{name: "a stale marker never rides on a token", access: teamToken("payments"), stale: PATOriginHost, want: ""},

@@ -411,7 +411,7 @@ func TestFlowOf(t *testing.T) {
 	}{
 		{"no Access (an internal call)", context.Background(), OperatorFlow},
 		{"the operator PAT", withAccess(controlplane.OperatorAccess()), OperatorFlow},
-		{"a peer node", withAccess(controlplane.NodeAccess("n2")), OperatorFlow},
+		{"a peer node", withAccess(controlplane.NodeAccess("n2", controlplane.NodeRoleServer)), OperatorFlow},
 		{"a fleet-wide token", team("tok_fleet", controlplane.FleetTeam), OperatorFlow},
 		{"a scoped Access with no owner", withAccess(controlplane.Access{Role: controlplane.RoleViewer}), OperatorFlow},
 		{"a team token", team("tok_1", "payments"), "owner:team:payments"},

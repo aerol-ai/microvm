@@ -529,7 +529,7 @@ func TestRecreateSandboxWasmDurableFailoverE2E(t *testing.T) {
 	spec := models.CreateSandboxRequest{
 		Runtime:              models.RuntimeWasm,
 		Durability:           models.DurabilityDurable,
-		ModuleRef:            "file:///tmp/demo.wasm",
+		ModuleRef:            "oci://registry.example/demo:1",
 		CreateRequestDigests: []string{"hmac:0:failover"},
 	}
 	if err := svc.RecreateSandbox(ctx, "sb-failover-e2e", spec, cluster.PlacementSecrets{IncarnationID: "inc-sb-failover-e2e"}, nil); err != nil {

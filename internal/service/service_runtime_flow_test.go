@@ -39,6 +39,8 @@ type recordingRuntime struct {
 	lastCreateMounts []mounts.ContainerBind
 	lastCreateID     string
 	lastToolboxToken string
+	// lastCreateHostCapable is whether the last create ran with host powers.
+	lastCreateHostCapable bool
 
 	startState *models.SandboxRuntimeState
 	startErr   error
@@ -76,8 +78,9 @@ type leaderCluster struct {
 
 func (c *leaderCluster) Leader() string { return c.leader }
 
-func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *recordingRuntime) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.createCalls++
+	r.lastCreateHostCapable = hostCapable(ctx)
 	r.lastCreateReq = req
 	r.lastCreateMounts = binds
 	r.lastCreateID = sandboxID

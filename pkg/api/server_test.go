@@ -259,7 +259,9 @@ func TestClusterControlHeadersAllowLiveAuthenticatedPeer(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer pat-token")
 	request.Header.Set("X-Cluster-Create-Target", "node-a")
 	request.Header.Set(cluster.PeerNodeIDHeader, "peer-test")
-	cert := &x509.Certificate{DNSNames: []string{"node:peer-test"}}
+	// A server peer: a create is a fleet power, which a server's
+	// certificate keeps (node certificates get only what their role needs).
+	cert := &x509.Certificate{DNSNames: []string{"node:peer-test", "role:server"}}
 	request.TLS = &tls.ConnectionState{
 		PeerCertificates: []*x509.Certificate{cert},
 		VerifiedChains:   [][]*x509.Certificate{{cert}},

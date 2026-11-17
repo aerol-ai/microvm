@@ -226,21 +226,34 @@ func validKeyHash(s string) bool {
 }
 
 // ExtractPeerRole returns the role a node cert was signed for: the cluster
-// CA's DNS:role:<role>, or an external-CA certificate's one URI
+// CA's DNS:role:<role>, or an external-CA certificate's URI
 // aerolvm-role:<role> (ExtractCertRoles, plan §15.2.1). "" for a cert that
-// names none (one signed before the join service, cluster-sign-node.sh) or
-// more than one URI role.
+// names none (one signed before the join service, cluster-sign-node.sh),
+// and "" when the cert names more than one role in any mix of the two
+// forms: a join by certificate admits from the URI, so a DNS role that
+// says otherwise must not win, and neither may a URI that disagrees with
+// the CA's DNS role. Node certificates get only what their role needs, so
+// an unclear role reads as none.
 func ExtractPeerRole(cert *x509.Certificate) string {
 	if cert == nil {
 		return ""
 	}
+	roles := map[string]bool{}
 	for _, name := range cert.DNSNames {
-		if role, ok := strings.CutPrefix(strings.TrimSpace(name), nodeRoleSANprefix); ok && ValidJoinRole(role) {
-			return role
+		if role, ok := strings.CutPrefix(strings.TrimSpace(name), nodeRoleSANprefix); ok {
+			roles[strings.TrimSpace(role)] = true
 		}
 	}
-	if roles := ExtractCertRoles(cert); len(roles) == 1 && ValidJoinRole(roles[0]) {
-		return roles[0]
+	for _, role := range ExtractCertRoles(cert) {
+		roles[role] = true
+	}
+	if len(roles) != 1 {
+		return ""
+	}
+	for role := range roles {
+		if ValidJoinRole(role) {
+			return role
+		}
 	}
 	return ""
 }

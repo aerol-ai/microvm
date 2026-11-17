@@ -74,6 +74,12 @@ func (h *handlers) clusterInternalWarmPoolWrite(w http.ResponseWriter, r *http.R
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// A gateway sends one warm-pool write as itself: the agent-sandbox
+	// API's depths, a whole set and nothing else.
+	kubeOnly := req.Kube != nil && !req.Delete && req.Pool == (cluster.WarmPoolRecord{})
+	if h.refuseSettingsWriter(w, r, "warm pools", kubeOnly) {
+		return
+	}
 	resp, err := writer.WriteWarmPool(r.Context(), req)
 	if err != nil {
 		if out := cluster.WarmPoolWriteOutcome(err); out.Code != "" {

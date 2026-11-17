@@ -38,7 +38,9 @@ const (
 	// DNS, /debug/vars.
 	PermFleetAdmin Permission = "fleet.admin"
 	// PermClusterInternal: /v1/cluster/internal/*. Held only by the node:
-	// principal (a peer's PAT over mTLS, on its own behalf), never by a role.
+	// principal (a peer's certificate, or its PAT over mTLS, on its own
+	// behalf), never by a role. Every node role holds it; a route that only
+	// some roles may use checks the peer's role itself.
 	PermClusterInternal Permission = "cluster.internal"
 	// PermAuthenticated is the pseudo-permission of the two routes that need
 	// only a valid principal: GET /v1/whoami (it describes the caller) and
@@ -145,7 +147,9 @@ func (a Access) Can(p Permission) bool {
 // HostCapable reports whether the caller may use host-side powers: raw host
 // mounts, file:// bundle refs read off the host, and custom domains on the
 // operator's trusted DNS path (eng review D3, D7). True for the PAT
-// (operator), a cluster peer (node:), a system loop, and the admin role.
+// (operator), a cluster peer (node:, whatever its role: the node-to-node
+// routes recreate and move sandboxes as they were made), a system loop, and
+// the admin role.
 // False for viewer, runner (team or fleet), auditor and managed identities:
 // fleet scope is which owners a caller sees, never host power.
 func (a Access) HostCapable() bool {
@@ -159,9 +163,13 @@ func (a Access) HostCapable() bool {
 }
 
 // HostCapable is Access.HostCapable for a request context. A context with no
-// Access is an internal call that never crossed the API edge (failover
-// recreate, background loops), so it keeps the host powers it always had.
+// Access is an internal call that never crossed the API edge (background
+// loops), so it keeps the host powers it always had; one marked by
+// ContextWithoutHostPowers has none, whatever Access it carries.
 func HostCapable(ctx context.Context) bool {
+	if WithoutHostPowers(ctx) {
+		return false
+	}
 	access, ok := AccessFromContext(ctx)
 	if !ok {
 		return true
@@ -238,4 +246,30 @@ func ContextWithRoutePermission(ctx context.Context, p Permission) context.Conte
 func RoutePermissionFromContext(ctx context.Context) (Permission, bool) {
 	p, ok := ctx.Value(routePermissionKey{}).(Permission)
 	return p, ok
+}
+
+type noHostPowersKey struct{}
+
+// ContextWithoutHostPowers marks ctx as work that must not use host-side
+// powers (HostCapable is false under it): a node rebuilding, from the
+// replicated spec, a sandbox it never had (a failover recreate, a move, a
+// WASM import). No caller is behind such a rebuild, and the spec it reads
+// was written by the sandbox's last owner, so the host-only settings a
+// host-capable caller may set (raw mounts, file:// bundles, host module
+// paths) are refused there rather than taken on that owner's word.
+func ContextWithoutHostPowers(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, noHostPowersKey{}, true)
+}
+
+// WithoutHostPowers reports whether ctx was marked by
+// ContextWithoutHostPowers.
+func WithoutHostPowers(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(noHostPowersKey{}).(bool)
+	return v
 }

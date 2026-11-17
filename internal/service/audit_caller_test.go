@@ -58,7 +58,7 @@ func TestAuditCallerFromContext(t *testing.T) {
 			&auditlog.Caller{Kind: "operator", ID: "operator"}},
 		{"operator forwarded by a peer", controlplane.ContextWithAccess(context.Background(), withVia(controlplane.OperatorAccess(), "edge-1")),
 			&auditlog.Caller{Kind: "operator", ID: "operator", Via: "edge-1"}},
-		{"a node acting for itself", controlplane.ContextWithAccess(context.Background(), controlplane.NodeAccess("n3")),
+		{"a node acting for itself", controlplane.ContextWithAccess(context.Background(), controlplane.NodeAccess("n3", controlplane.NodeRoleServer)),
 			&auditlog.Caller{Kind: "node", ID: "node:n3"}},
 		{"team token forwarded through an edge", controlplane.ContextWithAccess(context.Background(), forwarded),
 			&auditlog.Caller{Kind: "token", ID: "tok_7Hq2", Name: "ci-deploy", Team: "payments", Via: "edge-1"}},

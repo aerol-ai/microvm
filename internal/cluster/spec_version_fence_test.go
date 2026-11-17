@@ -170,7 +170,7 @@ func TestClusterSpecWritesCarryTheVersionCheck(t *testing.T) {
 	}
 	forwarded, _ := encodeCommand(command{Op: opUpsertSpec, SandboxID: id, IncarnationID: "inc-v", ExpectedIncarnationID: "inc-v",
 		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 3}, ExpectedPlacementVersion: v1})
-	if err := c.ApplyEncoded(ctx, forwarded); !errors.Is(err, ErrSpecVersionConflict) {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(ctx, c.nodeID, nil), forwarded); !errors.Is(err, ErrSpecVersionConflict) {
 		t.Fatalf("forwarded write at an old version = %v, want ErrSpecVersionConflict", err)
 	}
 	if cpuNow() != 2 {
@@ -200,7 +200,7 @@ func TestClusterSpecWritesCarryTheVersionCheck(t *testing.T) {
 	}
 	// A worker's gate sees only live members, so the leader drops a
 	// version that reaches it anyway.
-	if err := c.ApplyEncoded(ctx, forwarded); err != nil || cpuNow() != 3 {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(ctx, c.nodeID, nil), forwarded); err != nil || cpuNow() != 3 {
 		t.Fatalf("forwarded versioned write during the upgrade = %v, CPU %v; want applied without the check", err, cpuNow())
 	}
 	if (*Cluster)(nil).specVersionFenceReplicated() || (&Cluster{}).specVersionFenceReplicated() {

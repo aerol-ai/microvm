@@ -115,9 +115,10 @@ type tokenAuditSink struct{ events []service.SecretAuditEvent }
 
 func (k *tokenAuditSink) Emit(ev service.SecretAuditEvent) { k.events = append(k.events, ev) }
 
-// IsTokenWritePeer plays the admitted roles: wkr-1 is a worker.
+// IsTokenWritePeer plays the rule (cluster.Cluster.IsTokenWritePeer): only
+// a server writes tokens; srv-* are servers, wkr-1 a worker, gw-1 a gateway.
 func (c *tokenFeedCluster) IsTokenWritePeer(peerID string) bool {
-	return peerID != "" && peerID != "wkr-1"
+	return strings.HasPrefix(peerID, "srv-")
 }
 
 func (c *tokenFeedCluster) WriteAPIToken(_ context.Context, req cluster.APITokenWriteRequest) (cluster.APITokenWriteResponse, error) {
@@ -160,19 +161,21 @@ func TestV1TokensClusterInternal(t *testing.T) {
 		h.clusterInternalAPITokenWrite(rec, req.WithContext(context.WithValue(req.Context(), clusterPeerNodeIDContextKey{}, peer)))
 		return rec
 	}
-	write := func(body string) *httptest.ResponseRecorder { return writeFrom("gw-1", body) }
+	write := func(body string) *httptest.ResponseRecorder { return writeFrom("srv-1", body) }
 
-	// Token writes come only from servers and gateways: a worker's, or one
-	// with no peer at all, is refused before it reaches the cluster.
+	// Token writes come only from servers: a worker's, a gateway's, or one
+	// with no peer at all, is refused before it reaches the cluster. A
+	// record carries its own role and team, so a node that is not a server
+	// never stores one as itself (an admin record for every team included).
 	forged := `{"token":{"id":"tok_aaaaaaaaaaaa","name":"prometheus-2","role":"admin","created_by":"operator","expires_at":"2200-01-01T00:00:00Z"}}`
-	for _, peer := range []string{"wkr-1", ""} {
+	for _, peer := range []string{"wkr-1", "gw-1", ""} {
 		if rr := writeFrom(peer, forged); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"code":"writer_refused"`) || stub.writes != 0 {
 			t.Fatalf("a token write from %q: %d %s, %d writes reached the cluster", peer, rr.Code, rr.Body.String(), stub.writes)
 		}
 	}
 	// Each refusal is on the record, naming the node and the created_by
 	// the forged record claims.
-	if len(sink.events) != 2 || sink.events[0].Caller == nil || sink.events[0].Caller.ID != "node:wkr-1" ||
+	if len(sink.events) != 3 || sink.events[0].Caller == nil || sink.events[0].Caller.ID != "node:wkr-1" ||
 		sink.events[0].Kind != service.KindAPITokenPeerWrite || sink.events[0].Result != "denied" ||
 		sink.events[0].Reason != "created_by=operator" {
 		t.Fatalf("refused writes recorded: %+v", sink.events)
@@ -180,8 +183,8 @@ func TestV1TokensClusterInternal(t *testing.T) {
 	if rr := write(`{"token":{"id":"tok_aaaaaaaaaaaa"}}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "tok_aaaaaaaaaaaa") {
 		t.Fatalf("write: %d %s", rr.Code, rr.Body.String())
 	}
-	if last := sink.events[len(sink.events)-1]; last.Caller.ID != "node:gw-1" || last.Result != "ok" || last.Request.Target != "tok_aaaaaaaaaaaa" {
-		t.Fatalf("a gateway's write recorded: %+v %+v", last, last.Request)
+	if last := sink.events[len(sink.events)-1]; last.Caller.ID != "node:srv-1" || last.Result != "ok" || last.Request.Target != "tok_aaaaaaaaaaaa" {
+		t.Fatalf("a server's write recorded: %+v %+v", last, last.Request)
 	}
 	stub.writeErr = cluster.ErrAPITokenNameTaken
 	if rr := write(`{}`); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"code":"name_taken"`) {
@@ -253,13 +256,15 @@ func (c *forwardingCluster) ForwardToServer(w http.ResponseWriter, r *http.Reque
 // caller's own credential (PR 2 review: a cluster whose API address
 // reaches only worker,ingress nodes must still create and revoke tokens).
 // A call with no credential of its own is refused, never sent as the node.
-// A gateway and a server write tokens themselves.
+// A gateway sends them on too (node certificates get only what their role
+// needs: only a server writes tokens); a server and a mixed node write them
+// themselves.
 func TestV1TokenWritesForwardFromAWorker(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for _, tc := range []struct {
 		role     string
 		forwards bool
-	}{{"worker", true}, {"worker,ingress", true}, {"ingress", false}, {"server", false}} {
+	}{{"worker", true}, {"worker,ingress", true}, {"ingress", true}, {"server", false}, {"mixed", false}} {
 		svc := service.New(config.Config{EnableCluster: true, NodeRole: tc.role}, logger, nil, nil, nil, nil, nil, nil, nil)
 		stub := &forwardingCluster{Noop: cluster.NewNoop("n-1", "http://n-1", "")}
 		svc.AttachCluster(stub)

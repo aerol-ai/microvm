@@ -98,7 +98,7 @@ func notApplicable(kind controlplane.PrincipalKind) string {
 	case controlplane.PrincipalControlPlane:
 		return "the managed control plane sets this account's role; identity-file bindings don't apply"
 	case controlplane.PrincipalNode:
-		return "a cluster peer's certificate acts as admin on every team; identity-file bindings don't apply"
+		return "a cluster peer's certificate gets what its role needs: a server's acts as admin on every team, a worker's or gateway's reaches only the cluster routes its role needs; identity-file bindings don't apply"
 	}
 	return "identity-file bindings don't apply to this credential"
 }

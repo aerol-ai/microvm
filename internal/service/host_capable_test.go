@@ -54,7 +54,7 @@ func hostCapableCases(t *testing.T) []hostCase {
 	token, oidc := controlplane.PrincipalToken, controlplane.PrincipalOIDC
 	return []hostCase{
 		{"operator (PAT)", accessCtx(controlplane.OperatorAccess()), true},
-		{"node", accessCtx(controlplane.NodeAccess("n2")), true},
+		{"node", accessCtx(controlplane.NodeAccess("n2", controlplane.NodeRoleServer)), true},
 		{"internal (no Access)", context.Background(), true},
 		{"system loop", accessCtx(controlplane.Access{Fleet: true, Principal: controlplane.Principal{Kind: controlplane.PrincipalSystem, ID: "system:lifecycle"}}), true},
 		{"admin (oidc)", boundCtx(oidc, controlplane.RoleAdmin, controlplane.FleetTeam), true},
@@ -105,6 +105,15 @@ func TestHostCapableGates(t *testing.T) {
 			err = dsvc.persistCustomDomainsOnCreate(tc.ctx, "sb-dom", []string{"app.example.com"})
 			if tc.host != (err == nil) || (!tc.host && !errors.Is(err, models.ErrCustomDomainVerificationFailed)) {
 				t.Errorf("custom domain on create without DNS proof: err = %v, host %v", err, tc.host)
+			}
+
+			// Gate 3, on a cluster server: the server that binds a create's
+			// custom domains skips the proof for the same callers
+			// (custom_domain_bind.go BindCreateCustomDomains).
+			bsvc, bc := bindServer(t)
+			_, err = bsvc.BindCreateCustomDomains(tc.ctx, "sb-new", "inc-new", []string{"none.customer.com"})
+			if tc.host != (err == nil) || (!tc.host && !errors.Is(err, models.ErrCustomDomainVerificationFailed)) || tc.host != (len(bc.bound) == 1) {
+				t.Errorf("custom domain bound on create without DNS proof: err = %v, bound %v, host %v", err, bc.bound, tc.host)
 			}
 
 			// Gate 4: the owner-less legacy TXT record on attach

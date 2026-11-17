@@ -233,10 +233,10 @@ func TestSSHGatewayCallFromANode(t *testing.T) {
 		}
 		return req
 	}
-	if got, ok := sshGatewayCall(mk(true), controlplane.NodeAccess("peer-test")); !ok || got.SandboxID != "sb-1" {
+	if got, ok := sshGatewayCall(mk(true), controlplane.NodeAccess("peer-test", controlplane.NodeRoleServer)); !ok || got.SandboxID != "sb-1" {
 		t.Fatalf("a node's forward = %+v %v, want the call", got, ok)
 	}
-	if _, ok := sshGatewayCall(mk(false), controlplane.NodeAccess("peer-test")); ok {
+	if _, ok := sshGatewayCall(mk(false), controlplane.NodeAccess("peer-test", controlplane.NodeRoleServer)); ok {
 		t.Fatal("a node calling as itself was taken for a gateway call")
 	}
 	if _, ok := sshGatewayCall(mk(true), controlplane.Access{Principal: controlplane.Principal{Kind: controlplane.PrincipalToken}}); ok {

@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,18 +63,18 @@ func TestAgentVolumeReclaimRoundTripThroughServer(t *testing.T) {
 	if err := agent.ClaimVolumeReclaim(ctx, mine[0], ""); err == nil {
 		t.Fatal("claim without a node must fail")
 	}
-	if err := agent.ClaimVolumeReclaim(ctx, mine[0], "wkr-next"); err != nil {
-		t.Fatalf("claim: %v", err)
+	// Node certificates get only what their role needs: a worker claims a
+	// reclaim only for itself, and acks only its own.
+	if err := agent.ClaimVolumeReclaim(ctx, mine[0], "wkr-next"); err == nil || !strings.Contains(err.Error(), "may not propose") {
+		t.Fatalf("a worker's claim for another node = %v", err)
 	}
-	if err := agent.ClaimVolumeReclaim(ctx, mine[0], "wkr-third"); err == nil {
-		t.Fatal("a second claim of the old holder must be refused")
+	if err := agent.ClaimVolumeReclaim(ctx, mine[0], "wkr-agent-rec"); err != nil {
+		t.Fatalf("claim for itself: %v", err)
 	}
-	if left, err := agent.VolumeReclaimsFor(ctx, "wkr-agent-rec", 10); err != nil || len(left) != 0 {
-		t.Fatalf("after hand-over the old holder still lists %+v, %v", left, err)
+	if left, err := agent.VolumeReclaimsFor(ctx, "wkr-agent-rec", 10); err != nil || len(left) != 1 {
+		t.Fatalf("the holder lists %+v, %v", left, err)
 	}
-	moved := mine[0]
-	moved.NodeID = "wkr-next"
-	if err := agent.AckVolumeReclaim(ctx, moved); err != nil {
+	if err := agent.AckVolumeReclaim(ctx, mine[0]); err != nil {
 		t.Fatal(err)
 	}
 	if all := server.fsm.VolumeReclaims(); len(all) != 0 {

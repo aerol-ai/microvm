@@ -306,7 +306,7 @@ func TestClusterMoveHandoffThroughRaft(t *testing.T) {
 		t.Fatalf("abort during the upgrade = %v", err)
 	}
 	forwarded, _ := encodeCommand(abortMoveHandoffCommand(id, "inc-h", c.nodeID))
-	if err := c.ApplyEncoded(ctx, forwarded); !errors.Is(err, ErrClusterVersion) {
+	if err := c.ApplyEncoded(ContextWithApplyPeer(ctx, c.nodeID, nil), forwarded); !errors.Is(err, ErrClusterVersion) {
 		t.Fatalf("forwarded abort during the upgrade = %v, want ErrClusterVersion", err)
 	}
 	// The leader's own proposal is refused the same way.

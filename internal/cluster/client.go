@@ -942,6 +942,18 @@ func (c *Cluster) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
 }
 
+// AddCustomDomainForIncarnation binds hostname to sandboxID's placement at
+// incarnationID. A server's bind for a caller uses it (service
+// BindCustomDomain): the incarnation comes from the placement the server
+// read, or from the reservation a create just wrote, which this node's FSM
+// copy may not show yet.
+func (c *Cluster) AddCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
+	if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(incarnationID) == "" || strings.TrimSpace(hostname) == "" {
+		return fmt.Errorf("%w: a custom domain bind names the sandbox, its incarnation and the hostname", ErrIncarnationConflict)
+	}
+	return c.addCustomDomainForIncarnation(ctx, sandboxID, incarnationID, hostname)
+}
+
 func (c *Cluster) addCustomDomainForIncarnation(ctx context.Context, sandboxID, incarnationID, hostname string) error {
 	hostname = strings.ToLower(strings.TrimSpace(hostname))
 	cmd := command{Op: opAddCustomDomain, SandboxID: sandboxID, ExpectedIncarnationID: incarnationID, Hostname: hostname}
@@ -1610,6 +1622,9 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		return fmt.Errorf("cluster: encode command: %w", err)
 	}
 	if c.raft.raft.State() == raft.Leader {
+		if payload, cmd, err = c.stampProposal(payload, cmd, c.nodeID, true); err != nil {
+			return err
+		}
 		if isRawObligationReport(cmd) {
 			// Queued, not applied: the batcher folds every owner's report
 			// into one entry per window.
@@ -1668,6 +1683,15 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 		// leader's rollout code, after its upgrade gate and the transition
 		// tables; a raw forward could move a rollout past both.
 		return errRolloutOpNotForwardable
+	}
+	// What no peer may forward is refused above; what only a server may
+	// propose is refused here, by the sender's admitted role.
+	sender, role, err := c.checkPeerProposal(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	if payload, cmd, err = c.stampProposal(payload, cmd, sender, role == JoinRoleServer); err != nil {
+		return err
 	}
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)

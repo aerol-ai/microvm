@@ -54,6 +54,9 @@ func (h *handlers) clusterInternalTeamQuotaWrite(w http.ResponseWriter, r *http.
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
+	if h.refuseSettingsWriter(w, r, "team quotas", false) {
+		return
+	}
 	var req cluster.TeamQuotaWriteRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")

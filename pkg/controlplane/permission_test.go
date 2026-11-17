@@ -67,7 +67,13 @@ func TestRolePermissionMatrix(t *testing.T) {
 		// The PAT and a peer node are admins on every team; only the node
 		// holds cluster.internal (§5.3: "only the node: principal").
 		{"operator (PAT)", OperatorAccess(), set(r, s, w, x, ar, av, tr, tw, m, fa, au)},
-		{"node", NodeAccess("n3"), set(r, s, w, x, ar, av, tr, tw, m, fa, ci, au)},
+		{"node", NodeAccess("n3", NodeRoleServer), set(r, s, w, x, ar, av, tr, tw, m, fa, ci, au)},
+		// Node certificates get only what their role needs: a worker, a
+		// gateway or a role the node could not read holds cluster.internal
+		// only (a route may grant a role more, apihttp.RouteForNodes).
+		{"worker node", NodeAccess("w1", NodeRoleWorker), set(ci, au)},
+		{"gateway node", NodeAccess("g1", NodeRoleIngress), set(ci, au)},
+		{"node of unknown role", NodeAccess("u1", ""), set(ci, au)},
 		// A managed caller is a runner (or viewer) on its account: today's
 		// owner-scoped verb set, never metrics or fleet routes (L8).
 		{"managed runner", mustControlPlane(t, Identity{OwnerRef: "acct", ExternalID: "u1"}), set(r, s, w, x, ar, au)},
@@ -140,7 +146,8 @@ func TestHostCapable(t *testing.T) {
 		want   bool
 	}{
 		{"operator", OperatorAccess(), true},
-		{"node", NodeAccess("n1"), true},
+		{"node", NodeAccess("n1", NodeRoleServer), true},
+		{"worker node", NodeAccess("w1", NodeRoleWorker), true},
 		{"system loop", Access{Fleet: true, Principal: Principal{Kind: PrincipalSystem, ID: "system:lifecycle"}}, true},
 		{"admin (oidc)", boundAccess(PrincipalOIDC, RoleAdmin, FleetTeam), true},
 		{"admin (token)", boundAccess(PrincipalToken, RoleAdmin, FleetTeam), true},
@@ -220,7 +227,8 @@ func TestDenyHint(t *testing.T) {
 		{"no role grants it", boundAccess(PrincipalToken, RoleViewer, "payments"), Permission("made.up"),
 			"role viewer on team payments cannot made.up"},
 		{"operator gets no hint", OperatorAccess(), PermClusterInternal, ""},
-		{"node gets no hint", NodeAccess("n1"), PermFleetAdmin, ""},
+		{"node gets no hint", NodeAccess("n1", NodeRoleServer), PermFleetAdmin, ""},
+		{"worker node gets no hint", NodeAccess("w1", NodeRoleWorker), PermFleetAdmin, ""},
 		{"managed caller gets no hint", mustControlPlane(t, Identity{OwnerRef: "acct", Role: RoleViewer}), PermSandboxExec, ""},
 		{"pre-roles literal gets no hint", Access{Identity: Identity{OwnerRef: "acct"}}, PermFleetAdmin, ""},
 	}

@@ -337,6 +337,13 @@ func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reas
 		if !placementWantsFailoverRecreate(p) {
 			continue
 		}
+		if refusal := hostOnlyRefusal(p); refusal != nil {
+			// Not rebuilt elsewhere (rebuild_refusal.go): orphaned below
+			// like a sandbox without the recreate policy, so its own node
+			// takes it back when it returns.
+			c.reportFailoverRefused(p, nodeID, refusal)
+			continue
+		}
 		target, err := c.selectFailoverTarget(p, nodeID)
 		if err != nil {
 			// A placement rule no live node satisfies is not a reason to

@@ -290,7 +290,7 @@ func TestWasmFailoverRecreateSetsTokensNotBefore(t *testing.T) {
 	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.SetWasmRuntime(rt)
 	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
-	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
+	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "oci://registry.example/demo:1"}
 	if err := svc.RecreateSandbox(ctx, "sb-wasm-tok", spec, cluster.PlacementSecrets{IncarnationID: "inc-sb-wasm-tok"}, nil); err != nil {
 		t.Fatalf("RecreateSandbox: %v", err)
 	}
@@ -461,7 +461,7 @@ func wasmFailbackService(t *testing.T, path string) (*Service, *store.Store, mod
 	// still owns (failoverRecreateStillOwned), as the owner watcher's does.
 	svc.AttachCluster(newRecreateOwnerCluster("self"))
 	svc.AttachWasmCheckpointPusher(&fakeWasmCheckpointStore{pullSrc: remoteSnap})
-	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "file:///tmp/demo.wasm"}
+	spec := models.CreateSandboxRequest{Runtime: models.RuntimeWasm, Durability: models.DurabilityDurable, ModuleRef: "oci://registry.example/demo:1"}
 	secrets := cluster.PlacementSecrets{IncarnationID: "inc-sb-wasm-failback"}
 	if err := svc.RecreateSandbox(context.Background(), "sb-wasm-failback", spec, secrets, nil); err != nil {
 		t.Fatalf("RecreateSandbox: %v", err)

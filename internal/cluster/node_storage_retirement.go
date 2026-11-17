@@ -277,42 +277,23 @@ func (c *Cluster) NodeStorageRetirementsForPeer() NodeStorageRetirementsResponse
 	}
 }
 
-// RetireNodeStorage forwards the attestation to the control plane. Agents hold
-// no FSM, so the command rides the same leader-forwarding path as every other
-// write an agent issues.
-func (a *Agent) RetireNodeStorage(ctx context.Context, nodeID, actor, reason string, attestedAt time.Time) error {
-	nodeID = strings.TrimSpace(nodeID)
-	if a == nil {
-		return fmt.Errorf("cluster: RetireNodeStorage requires an agent")
-	}
-	if nodeID == "" {
-		return fmt.Errorf("cluster: RetireNodeStorage requires non-empty nodeID")
-	}
-	if attestedAt.IsZero() {
-		attestedAt = time.Now()
-	}
-	return a.applyCommand(ctx, command{
-		Op:     opRetireNodeStorage,
-		NodeID: nodeID,
-		StorageRetirement: &NodeStorageRetirement{
-			NodeID:           nodeID,
-			Actor:            strings.TrimSpace(actor),
-			Reason:           strings.TrimSpace(reason),
-			AttestedUnixNano: attestedAt.UTC().UnixNano(),
-		},
-	})
+// ErrOperatorCallOnServer refuses, on a worker or gateway, an operator's
+// write that only a server takes from it: the API sends such a call on to
+// a server with the operator's own credential (pkg/api/v1 server_tier.go),
+// so reaching this is a bug, and the node's own certificate gets only what
+// its role needs, which is not this.
+var ErrOperatorCallOnServer = errors.New("cluster: this is an operator's call: a worker or gateway sends it on to a server with the caller's own credential")
+
+// RetireNodeStorage is an operator attestation. A worker or gateway never
+// proposes it as itself (peer_proposals.go); its API sends the operator's
+// call on to a server.
+func (a *Agent) RetireNodeStorage(context.Context, string, string, string, time.Time) error {
+	return ErrOperatorCallOnServer
 }
 
-// RevokeNodeStorageRetirement withdraws the attestation cluster-wide.
-func (a *Agent) RevokeNodeStorageRetirement(ctx context.Context, nodeID string) error {
-	nodeID = strings.TrimSpace(nodeID)
-	if a == nil {
-		return fmt.Errorf("cluster: RevokeNodeStorageRetirement requires an agent")
-	}
-	if nodeID == "" {
-		return fmt.Errorf("cluster: RevokeNodeStorageRetirement requires non-empty nodeID")
-	}
-	return a.applyCommand(ctx, command{Op: opRevokeNodeStorage, NodeID: nodeID})
+// RevokeNodeStorageRetirement is the same: a server's call.
+func (a *Agent) RevokeNodeStorageRetirement(context.Context, string) error {
+	return ErrOperatorCallOnServer
 }
 
 // NodeStorageRetirements reads the replicated set from the server tier. An

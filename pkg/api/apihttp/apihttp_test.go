@@ -246,6 +246,15 @@ func TestWriteStoreAwareError_CustomDomainVerificationFailed(t *testing.T) {
 	}
 }
 
+// A TXT lookup that got no answer is not a refusal: 503 with Retry-After.
+func TestWriteStoreAwareError_CustomDomainProofUnavailable(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w: TXT lookup timed out", models.ErrCustomDomainProofUnavailable))
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "5" {
+		t.Errorf("status = %d, Retry-After %q; want 503 and 5", rr.Code, rr.Header().Get("Retry-After"))
+	}
+}
+
 func TestWriteStoreAwareError_CapacityExceeded(t *testing.T) {
 	rr := httptest.NewRecorder()
 	WriteStoreAwareError(discardLogger(), rr, capacity.ErrCapacityExceeded)

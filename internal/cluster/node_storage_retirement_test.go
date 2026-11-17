@@ -117,27 +117,16 @@ func TestAgentNodeStorageRetirementRoundTrip(t *testing.T) {
 	}))
 	ctx := context.Background()
 
-	attestedAt := time.Unix(1700000000, 0)
-	if err := agent.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed", attestedAt); err != nil {
+	// An attestation is an operator's call: a worker or gateway sends it on
+	// to a server with the operator's credential and never proposes it.
+	if err := agent.RetireNodeStorage(ctx, "node-gone", "op", "disk destroyed", time.Unix(1700000000, 0)); !errors.Is(err, ErrOperatorCallOnServer) {
 		t.Fatalf("RetireNodeStorage: %v", err)
 	}
-	if len(applied) != 1 || applied[0].Op != opRetireNodeStorage || applied[0].StorageRetirement == nil {
-		t.Fatalf("forwarded commands = %+v", applied)
-	}
-	if got := applied[0].StorageRetirement.AttestedUnixNano; got != attestedAt.UTC().UnixNano() {
-		t.Fatalf("attested unix = %d, want %d; every replica fences against the same time", got, attestedAt.UTC().UnixNano())
-	}
-	if err := agent.RetireNodeStorage(ctx, "", "op", "", attestedAt); err == nil {
-		t.Fatal("an attestation with no node id was forwarded")
-	}
-	if err := agent.RevokeNodeStorageRetirement(ctx, "node-gone"); err != nil {
+	if err := agent.RevokeNodeStorageRetirement(ctx, "node-gone"); !errors.Is(err, ErrOperatorCallOnServer) {
 		t.Fatalf("RevokeNodeStorageRetirement: %v", err)
 	}
-	if len(applied) != 2 || applied[1].Op != opRevokeNodeStorage {
-		t.Fatalf("revoke was not forwarded: %+v", applied)
-	}
-	if err := agent.RevokeNodeStorageRetirement(ctx, " "); err == nil {
-		t.Fatal("a revoke with no node id was forwarded")
+	if len(applied) != 0 {
+		t.Fatalf("an agent proposed an attestation: %+v", applied)
 	}
 
 	recs, err := agent.NodeStorageRetirements(ctx)

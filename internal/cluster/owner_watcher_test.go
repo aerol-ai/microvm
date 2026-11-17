@@ -323,7 +323,7 @@ func failoverWasmRecreateSpec() *models.CreateSandboxRequest {
 	return &models.CreateSandboxRequest{
 		Runtime:    models.RuntimeWasm,
 		Durability: models.DurabilityDurable,
-		ModuleRef:  "file:///tmp/demo.wasm",
+		ModuleRef:  "oci://registry.example/demo:1",
 		CPU:        1,
 		MemoryMB:   256,
 		Failover:   &models.Failover{Policy: models.FailoverPolicyRecreate},

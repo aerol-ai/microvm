@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +44,12 @@ func TestAgentDelegatesSnapshotHomeToControlPlane(t *testing.T) {
 	if _, found, err := agent.SnapshotHomeNode(ctx, "snap-agent"); err != nil || found {
 		t.Fatalf("home before register = found=%v err=%v, want not-found", found, err)
 	}
-	if err := agent.RegisterSnapshotNode(ctx, "snap-agent", "node-x"); err != nil {
+	// Node certificates get only what their role needs: a worker names
+	// only itself as a snapshot's home.
+	if err := agent.RegisterSnapshotNode(ctx, "snap-agent", "node-x"); err == nil || !strings.Contains(err.Error(), "may not propose") {
+		t.Fatalf("a worker naming another node a snapshot's home = %v", err)
+	}
+	if err := agent.RegisterSnapshotNode(ctx, "snap-agent", "wkr-agent-snap"); err != nil {
 		t.Fatalf("agent RegisterSnapshotNode: %v", err)
 	}
 	var node string
@@ -55,8 +61,8 @@ func TestAgentDelegatesSnapshotHomeToControlPlane(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !found || node != "node-x" {
-		t.Fatalf("agent SnapshotHomeNode after register = %q,%v, want node-x/true", node, found)
+	if !found || node != "wkr-agent-snap" {
+		t.Fatalf("agent SnapshotHomeNode after register = %q,%v, want wkr-agent-snap/true", node, found)
 	}
 	if err := agent.ForgetSnapshotNode(ctx, "snap-agent"); err != nil {
 		t.Fatalf("agent ForgetSnapshotNode: %v", err)
@@ -65,7 +71,7 @@ func TestAgentDelegatesSnapshotHomeToControlPlane(t *testing.T) {
 	// query string both ways, as a worker's push worker and an ingress router
 	// use it.
 	localKey := SnapshotLocalOnlyKey("tenant-a", "snap-agent")
-	if err := agent.RegisterSnapshotNode(ctx, localKey, "node-y"); err != nil {
+	if err := agent.RegisterSnapshotNode(ctx, localKey, "wkr-agent-snap"); err != nil {
 		t.Fatalf("agent RegisterSnapshotNode(local-only): %v", err)
 	}
 	found = false
@@ -76,7 +82,7 @@ func TestAgentDelegatesSnapshotHomeToControlPlane(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !found || node != "node-y" {
+	if !found || node != "wkr-agent-snap" {
 		t.Fatalf("agent SnapshotHomeNode(local-only) = %q,%v, want node-y/true", node, found)
 	}
 	if err := agent.ForgetSnapshotNode(ctx, localKey); err != nil {

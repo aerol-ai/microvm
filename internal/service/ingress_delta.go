@@ -98,7 +98,7 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 				// every ingress node converges on the same matcher set without
 				// per-node state. Version is in the fingerprint so add/remove
 				// of a hostname triggers a single PATCH on the next delta tick.
-				for _, hostname := range p.CustomHostnames {
+				for _, hostname := range s.routableCustomHostnames(p) {
 					hostname := hostname
 					customRouteID := caddy.IngressCustomDomainSNIRouteID(p.SandboxID, hostname)
 					intents[ingressIntentKey(ingressSurfaceTLS, customRouteID)] = ingressRouteIntent{
@@ -121,7 +121,7 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 			// UpsertSandboxRoute, but the IP-mode peer-forwarding path is
 			// path-based, not host-based; the service layer also rejects
 			// custom domains in IP mode, so this set is always empty today.
-			customHostnames := p.CustomHostnames
+			customHostnames := s.routableCustomHostnames(p)
 			intents[ingressIntentKey(ingressSurfaceHTTP, routeID)] = ingressRouteIntent{
 				key:         ingressIntentKey(ingressSurfaceHTTP, routeID),
 				surface:     ingressSurfaceHTTP,

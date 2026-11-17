@@ -15,7 +15,7 @@ import (
 )
 
 // tokenServerCluster is a server node's cluster for the public token
-// routes: wkr-1 and gw-1 are live members, gw-1 and srv-1 write tokens,
+// routes: wkr-1, gw-1 and srv-1 are live members, only srv-1 writes tokens,
 // and a token write lands here as this server's own Raft write.
 type tokenServerCluster struct {
 	*cluster.Noop
@@ -31,7 +31,7 @@ func (c *tokenServerCluster) LookupMember(id string) (cluster.Member, bool) {
 	return c.Noop.LookupMember(id)
 }
 
-func (c *tokenServerCluster) IsTokenWritePeer(id string) bool { return id == "gw-1" || id == "srv-1" }
+func (c *tokenServerCluster) IsTokenWritePeer(id string) bool { return id == "srv-1" }
 
 func (c *tokenServerCluster) WriteAPIToken(_ context.Context, req cluster.APITokenWriteRequest) (cluster.APITokenWriteResponse, error) {
 	c.mu.Lock()
@@ -44,12 +44,12 @@ func (c *tokenServerCluster) ListAPITokens(context.Context) ([]identity.TokenRec
 	return nil, nil
 }
 
-// Token writes come only from servers and gateways (defense in depth): a
-// token create or revoke a worker makes as itself, with no caller's
+// Token writes come only from servers (defense in depth): a token create
+// or revoke a worker or gateway makes as itself, with no caller's
 // credential or with the PAT over mTLS, is refused and nothing is written.
-// A caller's own credential a worker forwarded is that caller and passes,
-// and so does a gateway.
-func TestTokenWritesComeOnlyFromServersAndGateways(t *testing.T) {
+// A caller's own credential a worker or gateway forwarded is that caller
+// and passes.
+func TestTokenWritesComeOnlyFromServers(t *testing.T) {
 	cfg := config.Config{EnableCluster: true, IdentityEnabled: true, NodeRole: config.NodeRoleServer, PATToken: "operator-pat-token"}
 	svc := service.New(cfg, discardLogger(), nil, nil, nil, nil, nil, nil, nil)
 	cl := &tokenServerCluster{Noop: cluster.NewNoop("server-0", "http://server-0", "")}
@@ -66,7 +66,8 @@ func TestTokenWritesComeOnlyFromServersAndGateways(t *testing.T) {
 		{"worker cert with the PAT, for itself: create", http.MethodPost, "/v1/tokens", create, "wkr-1", "operator-pat-token", false, http.StatusForbidden},
 		{"worker forwarding an operator's PAT: create", http.MethodPost, "/v1/tokens", create, "wkr-1", "operator-pat-token", true, http.StatusCreated},
 		{"worker forwarding an operator's PAT: revoke", http.MethodDelete, "/v1/tokens/tok_aaaaaaaaaaaa", "", "wkr-1", "operator-pat-token", true, http.StatusNoContent},
-		{"gateway cert: create", http.MethodPost, "/v1/tokens", create, "gw-1", "", false, http.StatusCreated},
+		{"gateway cert: create", http.MethodPost, "/v1/tokens", create, "gw-1", "", false, http.StatusForbidden},
+		{"server cert: create", http.MethodPost, "/v1/tokens", create, "srv-1", "", false, http.StatusCreated},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cl.mu.Lock()
@@ -74,7 +75,7 @@ func TestTokenWritesComeOnlyFromServersAndGateways(t *testing.T) {
 			cl.mu.Unlock()
 			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			req.RemoteAddr = "10.0.0.9:7002"
-			req.TLS = peerTLS(tc.peer)
+			req.TLS = peerTLSRole(tc.peer, map[string]string{"wkr-1": "worker", "gw-1": "ingress", "srv-1": "server"}[tc.peer])
 			req = req.WithContext(cluster.ContextWithInternalPeer(req.Context(), tc.peer))
 			if tc.bearer != "" {
 				req.Header.Set("Authorization", "Bearer "+tc.bearer)

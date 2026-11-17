@@ -79,6 +79,10 @@ func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, host
 		if isDNSNotFound(err) {
 			return fmt.Errorf("%w: TXT record not found at %s", models.ErrCustomDomainVerificationFailed, verifyDomain)
 		}
+		if dnsLookupMayPass(ctx, err) {
+			// No answer is not a "no": the caller tries again (503).
+			return fmt.Errorf("%w: TXT lookup at %s: %v", models.ErrCustomDomainProofUnavailable, verifyDomain, err)
+		}
 		return fmt.Errorf("%w: failed to lookup TXT record at %s: %v", models.ErrCustomDomainVerificationFailed, verifyDomain, err)
 	}
 
@@ -89,6 +93,17 @@ func verifyCustomDomainOwnership(ctx context.Context, resolver DNSResolver, host
 	}
 
 	return fmt.Errorf("%w: found TXT records but none matched %q at %s", models.ErrCustomDomainVerificationFailed, expectedValue, verifyDomain)
+}
+
+// dnsLookupMayPass reports whether a failed lookup is one a retry can
+// answer: it ran out of time (the lookup's or the call's), or the resolver
+// says the failure is temporary.
+func dnsLookupMayPass(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && (dnsErr.IsTimeout || dnsErr.IsTemporary)
 }
 
 func isDNSNotFound(err error) bool {

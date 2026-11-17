@@ -175,7 +175,7 @@ func (c *Cluster) retryOrphanedRecoveries(ctx context.Context) int {
 // the pass ends, and the row stays orphaned for the next one.
 func (c *Cluster) retryOrphan(ctx context.Context, id string, now time.Time) (moved, stop bool) {
 	p, ok := c.fsm.get(id)
-	if !ok || !p.IsOrphaned() || !placementWantsFailoverRecreate(p) {
+	if !ok || !p.IsOrphaned() || !placementRebuildsElsewhere(p) {
 		return false, false
 	}
 	prev := strings.TrimSpace(p.OrphanedOwnerNodeID)

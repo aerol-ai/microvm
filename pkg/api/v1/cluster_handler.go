@@ -3,6 +3,7 @@ package v1
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -143,6 +144,18 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// can read it.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
+	if strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" {
+		r = h.asEdge(r)
+	}
+	if h.createGoesToServer(r, req) {
+		// A server binds a create's custom hostnames, after the caller's
+		// DNS proof (service custom_domain_bind.go). A create with an
+		// Idempotency-Key replays on a retry; one without may not run
+		// twice, so a server's 5xx is the answer.
+		keyed := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) != ""
+		h.sendToServerWith(w, r, "a create with custom domains", !keyed)
+		return
+	}
 	r = withIdempotencyKey(r)
 	// A create forwarded by the node that placed it carries the digests that
 	// node took of the client's request; its body here already has the
@@ -190,10 +203,12 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		MetricPrefix:       "v1.create",
 		OnForwardStale:     cluster.RecordOwnerForwardStale,
 		Logger:             h.deps.Logger,
+		AfterReserve:       h.bindCreateCustomDomains(req),
 	})
 	if !ok {
 		return
 	}
+	r = decision.Request(r)
 	// The router's steps before create;dur (cluster_place, cluster_reserve)
 	// go on the recorder createSandboxOnSelectedNode picks up, so the
 	// response's Server-Timing covers them (plan PR #1000 item L1).
@@ -1110,6 +1125,9 @@ func (h *handlers) clusterInternalEgressProfileWrite(w http.ResponseWriter, r *h
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
 		return
 	}
+	if h.refuseSettingsWriter(w, r, "egress profiles", false) {
+		return
+	}
 	var req cluster.EgressProfileWriteRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
@@ -1318,7 +1336,14 @@ func (h *handlers) clusterInternalApply(w http.ResponseWriter, r *http.Request) 
 		apihttp.WriteError(w, http.StatusBadRequest, "empty raft command body")
 		return
 	}
-	if err := c.ApplyEncoded(r.Context(), body); err != nil {
+	// The leader checks what the sending peer's role may propose
+	// (cluster.ContextWithApplyPeer); withInternalMTLS verified both.
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	var leaf *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf = r.TLS.PeerCertificates[0]
+	}
+	if err := c.ApplyEncoded(cluster.ContextWithApplyPeer(r.Context(), peerID, leaf), body); err != nil {
 		if errors.Is(err, cluster.ErrNotLeader) {
 			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not leader")
 			return
@@ -2180,6 +2205,16 @@ func (h *handlers) clusterInternalWasmMigrateExport(w http.ResponseWriter, r *ht
 	}
 	if !owner.IsSelf {
 		apihttp.WriteError(w, http.StatusConflict, "sandbox is not owned by this node")
+		return
+	}
+	// The export is a sandbox's whole memory. Node certificates get only
+	// what their role needs: a migration a node runs as itself over HTTP is
+	// the operator's, which a worker or gateway sends on to a server
+	// (server_tier.go), and a draining owner exports its own sandboxes
+	// without a call (service MigrateWasmSandboxToNode). So only a server
+	// is served one.
+	if peerID, leaf := internalPeer(r); !cluster.PeerIsServer(c, peerID, leaf) {
+		apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("cluster: a WASM migration export goes only to a server: node %q is not one; send the migration to a server", peerID))
 		return
 	}
 	var buf bytes.Buffer

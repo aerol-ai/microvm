@@ -66,6 +66,9 @@ type ErrorWriter func(w http.ResponseWriter, status int, code, message string)
 
 type Decision struct {
 	ReservationID string
+	// request is the request the create goes on with when AfterReserve
+	// gave one (Request).
+	request *http.Request
 	// reserveStages is how long the router took to pick this node and to
 	// write the reservation, both before the create's create;dur starts.
 	// Set only when Prepare reserved on this node itself.
@@ -83,6 +86,15 @@ type reserveStage struct {
 // time before create;dur started. Nil-safe; a Decision from a forwarded
 // create carries none (the router reports its own, see
 // forwardReservedCreate).
+// Request is the request the local create goes on with: the one
+// AfterReserve returned, or r.
+func (d Decision) Request(r *http.Request) *http.Request {
+	if d.request != nil {
+		return d.request
+	}
+	return r
+}
+
 func (d Decision) RecordReserveStages(timing *createtiming.CreateTiming) {
 	for _, st := range d.reserveStages {
 		timing.RecordStage(st.name, st.d)
@@ -111,6 +123,14 @@ type PrepareOptions struct {
 	MetricPrefix string
 	// OnForwardStale fires when a forwarded create lands on the wrong node.
 	OnForwardStale func()
+	// AfterReserve, when set, runs once the reservation is written and
+	// before the create goes to its node, with the reservation's id and
+	// incarnation (v1 binds a create's custom hostnames there). It returns
+	// the request to go on with; false means it wrote the answer, and the
+	// reservation is cancelled. A create that takes no reservation (an
+	// image only one node holds) and goes to another node is refused when
+	// it carries custom_domains: there is no reservation to bind them to.
+	AfterReserve func(w http.ResponseWriter, r *http.Request, sandboxID, incarnationID string) (*http.Request, bool)
 	// Logger, when set, records placement decisions worth tracing.
 	Logger *slog.Logger
 }
@@ -314,6 +334,11 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			opts.Logger.Info("cluster create: forwarding built local image to selected worker",
 				"image", req.Image, "target", target.NodeID)
 		}
+		if opts.AfterReserve != nil && len(req.CustomDomains) > 0 {
+			writeMsg(w, http.StatusBadRequest, "custom_domains: this create's image is held by node "+target.NodeID+
+				", which creates it without a reservation to bind the domains to: create the sandbox, then add each domain")
+			return Decision{}, false
+		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
 		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
@@ -379,6 +404,17 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		reserveOwner = service.OwnerRefForCreate(r.Context())
 	}
 	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: reserveOwner}
+	if opts.AfterReserve != nil {
+		// Minted here rather than by ReserveOnTarget so AfterReserve can
+		// name the reservation's incarnation, which this node's copy of
+		// the FSM may not show yet.
+		inc, err := cluster.MintIncarnationID()
+		if err != nil {
+			writeMsg(w, http.StatusInternalServerError, "cluster: mint incarnation: "+err.Error())
+			return Decision{}, false
+		}
+		reserveSecrets.IncarnationID = inc
+	}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	reserveStart := time.Now()
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
@@ -461,9 +497,18 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	r.Header.Set(HeaderTarget, target.NodeID)
 	r.Header.Set(HeaderID, sandboxID)
+	var after *http.Request
+	if opts.AfterReserve != nil {
+		next, ok := opts.AfterReserve(w, r, sandboxID, reserveSecrets.IncarnationID)
+		if !ok {
+			cancelReservation(context.WithoutCancel(r.Context()), c, opts.Logger, sandboxID)
+			return Decision{}, false
+		}
+		r, after = next, next
+	}
 	if target.IsSelf {
 		service.RecordCreateReservationState("reserve_local")
-		return Decision{ReservationID: sandboxID, reserveStages: stages}, true
+		return Decision{ReservationID: sandboxID, request: after, reserveStages: stages}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
 	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
