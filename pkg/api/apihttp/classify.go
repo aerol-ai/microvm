@@ -301,6 +301,8 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusConflict, Message: service.ErrAPITokenNameTaken.Error()}
 	case errors.Is(err, service.ErrAPITokenNameReserved):
 		return Classification{Status: http.StatusForbidden, Message: service.ErrAPITokenNameReserved.Error()}
+	case errors.Is(err, service.ErrAPITokenOperatorSuccessorOnly):
+		return Classification{Status: http.StatusForbidden, Message: service.ErrAPITokenOperatorSuccessorOnly.Error()}
 	case errors.Is(err, service.ErrAPITokenClusterVersion):
 		return Classification{Status: http.StatusConflict, Message: service.ErrAPITokenClusterVersion.Error()}
 	case errors.Is(err, service.ErrAPITokensUnavailable):

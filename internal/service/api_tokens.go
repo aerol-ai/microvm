@@ -37,6 +37,12 @@ var (
 	// operator's own tokens by anyone it is not kept for (403).
 	ErrAPITokenNameReserved = errors.New("token names starting with " + identitywire.OperatorTokenPrefix +
 		" are kept for the Kubernetes operator's own tokens: only the admin token can create one; pick another name")
+	// ErrAPITokenOperatorSuccessorOnly is a create by one of the operator's
+	// own tokens of any name but its successor's (403). The operator's token
+	// works only on servers; a token it made under another name would work
+	// everywhere.
+	ErrAPITokenOperatorSuccessorOnly = errors.New("the Kubernetes operator's own token creates only its successor, a token named " +
+		identitywire.OperatorTokenPrefix + "...; create other tokens with the admin token or your own")
 	// ErrAPITokenClusterVersion is a token write before every Raft server
 	// runs a build that applies token ops (409).
 	ErrAPITokenClusterVersion = errors.New("not every server supports API tokens yet: upgrade every server first")
@@ -144,6 +150,9 @@ func (s *Service) apiTokenRecordFor(ctx context.Context, req models.CreateAPITok
 	if identitywire.IsOperatorTokenName(name) && !mayCreateOperatorToken(ctx) {
 		return identity.TokenRecord{}, ErrAPITokenNameReserved
 	}
+	if callerIsOperatorToken(ctx) && !identitywire.IsOperatorTokenName(name) {
+		return identity.TokenRecord{}, ErrAPITokenOperatorSuccessorOnly
+	}
 	role := controlplane.Role(strings.TrimSpace(req.Role))
 	if !role.Valid() {
 		return identity.TokenRecord{}, fmt.Errorf("%w: role must be viewer, runner, auditor or admin", ErrAPITokenInvalid)
@@ -230,6 +239,13 @@ func mayCreateOperatorToken(ctx context.Context) bool {
 		return identitywire.IsOperatorTokenName(access.Principal.Name)
 	}
 	return false
+}
+
+// callerIsOperatorToken reports whether the caller is one of the operator's
+// own tokens, which may create only its successor.
+func callerIsOperatorToken(ctx context.Context) bool {
+	access, ok := controlplane.AccessFromContext(ctx)
+	return ok && access.Principal.Kind == controlplane.PrincipalToken && identitywire.IsOperatorTokenName(access.Principal.Name)
 }
 
 func apiTokenCreator(ctx context.Context) string {

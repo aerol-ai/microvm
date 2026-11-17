@@ -681,3 +681,36 @@ func TestCreateOperatorTokenName(t *testing.T) {
 		t.Fatalf("written: %v, want %v", names, want)
 	}
 }
+
+// The operator's own token works only on servers, so it creates only its
+// successor: any other name, whatever the role, is refused and nothing is
+// written. Its successor still is.
+func TestOperatorTokenCreatesOnlyItsSuccessor(t *testing.T) {
+	svc := newTokenService(t, true)
+	if err := svc.StartAPITokens(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	exp := tokenSvcNow.Add(time.Hour)
+	op := controlplane.ContextWithAccess(context.Background(),
+		controlplane.TokenAccess("tok_9Hq2aBcDeFgH", "aerolvm-operator-1", controlplane.RoleAdmin, controlplane.FleetTeam, exp))
+	for _, tc := range []struct{ name, role, team string }{
+		{"laundered", "admin", "*"},
+		{"viewer-x", "viewer", "*"},
+		{"team-runner", "runner", "payments"},
+		{"my-aerolvm-operator-2", "admin", "*"},
+	} {
+		if _, err := svc.CreateAPIToken(op, createReq(tc.name, tc.role, tc.team, "30d")); !errors.Is(err, ErrAPITokenOperatorSuccessorOnly) {
+			t.Fatalf("%s: err = %v, want successor-only", tc.name, err)
+		}
+	}
+	if _, err := svc.CreateAPIToken(op, createReq("aerolvm-operator-2", "admin", "*", "30d")); err != nil {
+		t.Fatalf("successor: %v", err)
+	}
+	list, err := svc.ListAPITokens(adminCtx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Tokens) != 1 || list.Tokens[0].Name != "aerolvm-operator-2" {
+		t.Fatalf("written: %+v, want only the successor", list.Tokens)
+	}
+}
