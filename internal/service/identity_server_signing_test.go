@@ -86,6 +86,27 @@ func TestIdentityOnceServersSign(t *testing.T) {
 	if err := worker.resealIdentityKeys(ctx, func(uint32, bool) {}, func() { t.Fatal("a worker tried a reseal") }); err != nil {
 		t.Fatal(err)
 	}
+	// A server's reseal after a ring rotation moves only the ring-sealed
+	// key; the servers' key does not depend on the ring.
+	rotateTestRing(t, h.svc.cipher)
+	if err := h.svc.resealIdentityKeys(ctx, func(uint32, bool) {}, func() { t.Fatal("a key could not be opened") }); err != nil {
+		t.Fatal(err)
+	}
+	resealed, _ := h.st.ReadIdentityKeys(ctx)
+	for _, k := range resealed.Keys {
+		was := set.Keys[0]
+		if set.Keys[1].ID == k.ID {
+			was = set.Keys[1]
+		}
+		if k.Seal == cloudidentity.SealServer && string(k.SealedPrivate) != string(was.SealedPrivate) {
+			t.Fatal("the servers' key was resealed with the ring")
+		}
+		if k.Seal == "" && string(k.SealedPrivate) == string(was.SealedPrivate) {
+			t.Fatal("the ring-sealed key was not moved to the new ring key")
+		}
+	}
+	set = resealed
+	active, _ = set.Active()
 
 	// The worker's sandbox, placed by a server with an identity.
 	srv.placements["sb-1"] = cluster.Placement{SandboxID: "sb-1", OwnerNodeID: "wkr-1", IncarnationID: "inc-1", OwnerRef: "team:payments",

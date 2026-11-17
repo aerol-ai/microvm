@@ -75,6 +75,9 @@ type signingWorker struct {
 	signErr  error
 	fetches  int
 	asServer bool
+	// rewrite, when set, changes the claims on the way to the server, as a
+	// server that signs something else would.
+	rewrite func(sandboxtoken.Claims) sandboxtoken.Claims
 }
 
 func (c *signingWorker) FetchSigningKeys(context.Context) (cluster.SigningKeys, error) {
@@ -88,6 +91,13 @@ func (c *signingWorker) FetchSigningKeys(context.Context) (cluster.SigningKeys, 
 func (c *signingWorker) SignSandboxToken(ctx context.Context, req cluster.SandboxTokenSignRequest) (cluster.SandboxTokenSignResponse, error) {
 	if c.signErr != nil {
 		return cluster.SandboxTokenSignResponse{}, c.signErr
+	}
+	if c.rewrite != nil {
+		var claims sandboxtoken.Claims
+		if err := json.Unmarshal(req.Claims, &claims); err != nil {
+			return cluster.SandboxTokenSignResponse{}, err
+		}
+		req.Claims, _ = json.Marshal(c.rewrite(claims))
 	}
 	return c.server.SignSandboxTokenFor(ctx, c.SelfNodeID(), c.asServer, req.Claims)
 }
@@ -337,3 +347,100 @@ func TestSigningKeyMirror(t *testing.T) {
 }
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+// The cutover is exact: a token signed with the ring and issued in the
+// second before Since counts, one issued at Since does not.
+func TestRingTokensAroundTheCutover(t *testing.T) {
+	server, worker, _, _, _ := signingPair(t)
+	since := time.Unix(1_800_000_100, 0)
+	turnOnServerSigning(t, server, since)
+	ring := func(iat time.Time) string {
+		raw, _, err := sandboxtoken.Sign(worker.cipher, sandboxtoken.Claims{TokenID: mustTokenID(t), SandboxID: "sb-1", Owner: "team:a",
+			IssuedAt: iat.Unix(), ExpiresAt: iat.Add(10 * time.Minute).Unix()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	setSandboxTokenClock(t, since.Add(time.Minute))
+	before, at := ring(since.Add(-time.Second)), ring(since)
+	for name, svc := range map[string]*Service{"server": server, "worker": worker} {
+		if _, err := svc.VerifySandboxToken(before); err != nil {
+			t.Errorf("%s: issued the second before Since = %v", name, err)
+		}
+		if _, err := svc.VerifySandboxToken(at); !errors.Is(err, sandboxtoken.ErrInvalidSignature) {
+			t.Errorf("%s: issued at Since = %v", name, err)
+		}
+	}
+}
+
+// A brief server outage does not stop tokens already issued: a worker that
+// has read the feed keeps checking them with what it read. Only a worker
+// that never read it (it restarted during the outage) refuses them until
+// the servers answer, and then takes them again.
+func TestTokensAcrossAServerOutage(t *testing.T) {
+	server, worker, srv, wk, st := signingPair(t)
+	seedTokenSandbox(t, st, "sb-1", "team:payments", models.SandboxStatusStarted)
+	srv.placements["sb-1"] = cluster.Placement{SandboxID: "sb-1", OwnerNodeID: "wkr-1", OwnerRef: "team:payments"}
+	base := time.Unix(1_800_000_000, 0)
+	setSandboxTokenClock(t, base)
+	old, err := worker.IssueSandboxToken(teamCtx("payments"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnOnServerSigning(t, server, base.Add(time.Minute))
+	worker.serverSigning.mirror = nil
+	signed, err := worker.IssueSandboxToken(teamCtx("payments"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The servers go away; the worker's copy of the feed is still good.
+	wk.feedErr = errors.New("server tier down")
+	worker.serverSigning.mirror.fetchedAt = time.Time{}
+	for name, tok := range map[string]string{"server-signed": signed.Token, "ring-signed before Since": old.Token} {
+		if _, err := worker.VerifySandboxToken(tok); err != nil {
+			t.Errorf("during the outage, %s = %v", name, err)
+		}
+	}
+	// A worker that restarted during the outage knows nothing yet.
+	worker.serverSigning.mirror = nil
+	for name, tok := range map[string]string{"server-signed": signed.Token, "ring-signed before Since": old.Token} {
+		if _, err := worker.VerifySandboxToken(tok); !errors.Is(err, sandboxtoken.ErrInvalidSignature) {
+			t.Errorf("restarted during the outage, %s = %v", name, err)
+		}
+	}
+	// The servers answer again (after the retry wait): both work.
+	wk.feedErr = nil
+	worker.serverSigning.mirror.triedAt = time.Time{}
+	for name, tok := range map[string]string{"server-signed": signed.Token, "ring-signed before Since": old.Token} {
+		if _, err := worker.VerifySandboxToken(tok); err != nil {
+			t.Errorf("after the outage, %s = %v", name, err)
+		}
+	}
+}
+
+// The owner hands out only a token for the claims it asked for: one a
+// server signed for other claims is refused.
+func TestOwnerRefusesATokenForOtherClaims(t *testing.T) {
+	server, worker, srv, wk, st := signingPair(t)
+	seedTokenSandbox(t, st, "sb-1", "team:payments", models.SandboxStatusStarted)
+	srv.placements["sb-1"] = cluster.Placement{SandboxID: "sb-1", OwnerNodeID: "wkr-1", OwnerRef: "team:payments"}
+	base := time.Unix(1_800_000_000, 0)
+	setSandboxTokenClock(t, base)
+	turnOnServerSigning(t, server, base.Add(time.Minute))
+	wk.rewrite = func(c sandboxtoken.Claims) sandboxtoken.Claims {
+		c.TokenID = mustTokenID(t)
+		return c
+	}
+	if _, err := worker.IssueSandboxToken(teamCtx("payments"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"}); err == nil {
+		t.Fatal("the owner handed out a token for other claims")
+	}
+	wk.rewrite = nil
+	if _, err := worker.IssueSandboxToken(teamCtx("payments"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"}); err != nil {
+		t.Fatalf("the claims it asked for: %v", err)
+	}
+	wk.signErr = errors.New("no server answered")
+	if _, err := worker.IssueSandboxToken(teamCtx("payments"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"}); err == nil {
+		t.Fatal("issued with no server to sign")
+	}
+}

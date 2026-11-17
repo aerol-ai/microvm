@@ -109,6 +109,27 @@ func TestWriteServerSigningOnTheLeader(t *testing.T) {
 	if !c.ServerSigningAllowed() {
 		t.Fatal("not allowed at the active version")
 	}
+	// A live member on an older build (the active version's first write
+	// counts only servers) holds it back.
+	member := func(id string, fv int) Member {
+		m := recreateCandidate(id, "worker", 10)
+		m.FSMOpsVersion = fv
+		return m
+	}
+	self := c.gossip.selfMember()
+	self.FSMOpsVersion = fsmOpsVersion
+	self.Alive = true
+	seedGossipView(t, c, []Member{self, member("wkr-old", serverSigningFSMOpsVersion-1)})
+	if c.ServerSigningAllowed() {
+		t.Fatal("allowed with a live member on an older build")
+	}
+	if _, err := c.WriteServerSigning(ctx, w); !errors.Is(err, ErrClusterVersion) {
+		t.Fatalf("write with an older member = %v", err)
+	}
+	seedGossipView(t, c, []Member{self, member("wkr-new", serverSigningFSMOpsVersion)})
+	if !c.ServerSigningAllowed() {
+		t.Fatal("not allowed once every member runs the build")
+	}
 	rec, err := c.WriteServerSigning(ctx, w)
 	if err != nil || string(rec.Sealed) != "sealed" {
 		t.Fatalf("write = %+v %v", rec, err)

@@ -65,11 +65,15 @@ func (c *Cluster) ServerSigningRecord() (ServerSigning, bool) {
 	return c.fsm.serverSigningRecord()
 }
 
-// ServerSigningAllowed reports whether the record may be written: the
-// active cluster version says every member runs a build that verifies what
-// servers sign.
+// ServerSigningAllowed reports whether the record may be written: every
+// member runs a build that verifies what servers sign. Two views must agree:
+// the active cluster version (Raft-backed, forward-only, so a rollout that
+// could still roll back has not reached it), and every live member's
+// gossiped version, because the active version's first write ever counts
+// only the servers (active_version.go), which an old worker would not.
 func (c *Cluster) ServerSigningAllowed() bool {
-	return c != nil && c.fsm != nil && c.fsm.activeFVValue() >= serverSigningFSMOpsVersion
+	return c != nil && c.fsm != nil && c.fsm.activeFVValue() >= serverSigningFSMOpsVersion &&
+		c.gossip.liveMembersAtLeast(serverSigningFSMOpsVersion)
 }
 
 // WriteServerSigning proposes a write of the record on this leader: the

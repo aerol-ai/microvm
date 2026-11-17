@@ -557,6 +557,14 @@ func TestSettingsWriters(t *testing.T) {
 	if err := (*Cluster)(nil).CheckIdentityWriter("wkr-1", nil, keys(0, first)); !errors.Is(err, ErrIdentityWriterRefused) {
 		t.Errorf("a node with no FSM: %v", err)
 	}
+	// Once servers sign (fsm_server_signing.go), only a server keeps the
+	// keys: not even a reseal comes from anyone else.
+	l.apply(command{Op: opPutServerSigning, ServerSigning: &ServerSigningWrite{Signing: ServerSigning{Sealed: []byte("seed"), SinceUnixNano: 1}}})
+	for _, peer := range []string{"wkr-1", "gw-1"} {
+		if err := c.CheckIdentityWriter(peer, roleCert(peer, ""), keys(gen, resealed)); !errors.Is(err, ErrIdentityWriterRefused) {
+			t.Errorf("%s reseal once servers sign: %v", peer, err)
+		}
+	}
 	// The refusal survives the wire as its own code.
 	out := IdentityWriteOutcome(ErrIdentityWriterRefused)
 	if out.Code != identityCodeWriterRefused || !errors.Is(out.err(), ErrIdentityWriterRefused) {
