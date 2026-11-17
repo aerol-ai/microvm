@@ -136,7 +136,7 @@ func TestServerSigningGate(t *testing.T) {
 
 	// Certificates that name no role: never.
 	setActive(t, c, 1, serverSigningFSMOpsVersion, 0, "r-1")
-	if g := c.ServerSigningGate(true); g.Allowed || g.RolesInCertificates || !strings.Contains(g.Reason, "name no role") {
+	if g := c.ServerSigningGate(true); g.Allowed || g.RolesInCertificates || !strings.Contains(g.Reason, "names no role") {
 		t.Fatalf("role-less certificates: %+v", g)
 	}
 	c.selfCertRole = func() string { return JoinRoleServer }
@@ -219,6 +219,49 @@ func TestServerSigningGate(t *testing.T) {
 	if !c.ServerSigningAllowed() {
 		t.Fatal("not allowed after a finalize")
 	}
+
+	// Every other Raft server's certificate must name the server role too,
+	// forced or not: part way through moving onto roles, a server whose
+	// certificate names none could be all a node reaches.
+	if err := c.raft.raft.AddNonvoter("srv-2", "127.0.0.1:1", 0, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	seedGossipView(t, c, []Member{self, member("wkr-quiet", 0), member("srv-2", fsmOpsVersion)})
+	for _, tc := range []struct {
+		role string
+		err  error
+		want string
+	}{
+		{"", nil, "srv-2's certificate names \"\""},
+		{JoinRoleWorker, nil, "srv-2's certificate names \"worker\""},
+		{"", errors.New("no answer"), "srv-2's certificate could not be read"},
+	} {
+		tc := tc
+		c.peerCertRoleHook = func(m Member) (string, error) { return tc.role, tc.err }
+		c.serverCertCheck.at = time.Time{}
+		if g := c.ServerSigningGate(true); g.Allowed || g.RolesInCertificates || !strings.Contains(g.Reason, tc.want) {
+			t.Fatalf("another server's certificate %q %v: %+v", tc.role, tc.err, g)
+		}
+		if _, err := c.WriteServerSigning(ctx, w, true); !errors.Is(err, ErrClusterVersion) {
+			t.Fatalf("a write with another server's certificate %q = %v", tc.role, err)
+		}
+	}
+	// The reading stands for a while; then a server that proves its role.
+	reads := 0
+	c.peerCertRoleHook = func(m Member) (string, error) { reads++; return JoinRoleServer, nil }
+	if c.ServerSigningAllowed() {
+		t.Fatal("a reading was not kept")
+	}
+	c.serverCertCheck.at = time.Now().Add(-2 * serverCertCheckEvery) // it has run out
+	if !c.ServerSigningAllowed() || !c.ServerSigningAllowed() || reads != 1 {
+		t.Fatalf("every server proves its role: allowed %v, %d readings", c.ServerSigningAllowed(), reads)
+	}
+	c.peerCertRoleHook = nil
+	if err := c.raft.raft.RemoveServer("srv-2", 0, 2*time.Second).Error(); err != nil {
+		t.Fatal(err)
+	}
+	c.serverCertCheck.at = time.Time{}
+	seedGossipView(t, c, []Member{self, member("wkr-quiet", 0)})
 	rec, err := c.WriteServerSigning(ctx, w, false)
 	if err != nil || string(rec.Sealed) != "sealed" {
 		t.Fatalf("write = %+v %v", rec, err)

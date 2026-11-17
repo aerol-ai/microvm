@@ -120,7 +120,7 @@ func (g ServerSigningGate) Held() bool {
 // reports none, keeps it there. Once every Raft server runs the build,
 // each applies the record, so the operator may start it anyway then too.
 func (c *Cluster) ServerSigningGate(force bool) ServerSigningGate {
-	g := ServerSigningGate{RolesInCertificates: c.certNamesServerRole()}
+	var g ServerSigningGate
 	if c == nil || c.fsm == nil {
 		g.Reason = "no cluster"
 		return g
@@ -143,13 +143,17 @@ func (c *Cluster) ServerSigningGate(force bool) ServerSigningGate {
 	case g.ActiveFV < serverSigningFSMOpsVersion && !force:
 		g.Reason = fmt.Sprintf("the active cluster version is %d and servers sign from %d: it moves there once every live member runs the new build, and these report an older version, or none: %s; upgrade them, or start server signing anyway (aerolvm upgrade signing start)",
 			g.ActiveFV, serverSigningFSMOpsVersion, strings.Join(g.Waiting, ", "))
-	case !g.RolesInCertificates:
-		g.Reason = "this cluster's certificates name no role, so no node can prove a server is one: tokens are signed as before"
 	case g.FirstWrite && len(g.Waiting) > 0 && !force:
 		g.Reason = fmt.Sprintf("these members report a version below %d, or none: %s; upgrade them, or start server signing anyway (aerolvm upgrade signing start)",
 			serverSigningFSMOpsVersion, strings.Join(g.Waiting, ", "))
 	default:
-		g.Allowed = true
+		// Last, as it reads every server's certificate.
+		var why string
+		if g.RolesInCertificates, why = c.serverCertsNameRole(); g.RolesInCertificates {
+			g.Allowed = true
+		} else {
+			g.Reason = why
+		}
 	}
 	return g
 }
@@ -169,6 +173,78 @@ func (c *Cluster) certNamesServerRole() bool {
 		return c.selfCertRole() == JoinRoleServer
 	}
 	return c.tls == nil || c.tls.SelfRole() == JoinRoleServer
+}
+
+// serverCertCheckEvery is how long a reading of the servers' certificates
+// stands: the gate is read on every upkeep pass and gauge refresh until
+// the record exists.
+const serverCertCheckEvery = 30 * time.Second
+
+// serverCertsNameRole reports whether every Raft server's certificate,
+// this one's included, names the server role, and why not. A worker or
+// gateway reads the feed only from a server that proves its role, and
+// reads "servers do not sign" when every server it reaches proves none
+// (FetchSigningKeys): with one Raft server whose certificate names no
+// role, as part way through moving a cluster from before roles onto them
+// (adopt, then each certificate's renewal gives it its role), such a
+// server could be all a node reaches. So servers sign only once each one
+// proves its role. Read by a TLS handshake with each server, as adopt
+// reads keys (peerLeaf).
+func (c *Cluster) serverCertsNameRole() (bool, string) {
+	if !c.certNamesServerRole() {
+		return false, "this server's certificate names no role, so no node can prove a server is one: tokens are signed as before"
+	}
+	if c.raft == nil || c.raft.raft == nil {
+		return true, ""
+	}
+	cc := &c.serverCertCheck
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if !cc.at.IsZero() && time.Since(cc.at) < serverCertCheckEvery {
+		return cc.ok, cc.why
+	}
+	cc.ok, cc.why = c.readServerCertRoles()
+	cc.at = time.Now()
+	return cc.ok, cc.why
+}
+
+func (c *Cluster) readServerCertRoles() (bool, string) {
+	future := c.raft.raft.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return false, fmt.Sprintf("the Raft configuration could not be read: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), joinDialTimeout)
+	defer cancel()
+	for _, srv := range future.Configuration().Servers {
+		id := string(srv.ID)
+		if id == c.nodeID {
+			continue
+		}
+		role, err := c.peerCertRole(ctx, id)
+		if err != nil {
+			return false, fmt.Sprintf("server %s's certificate could not be read (%v): servers sign once every server's certificate names its role", id, err)
+		}
+		if role != JoinRoleServer {
+			return false, fmt.Sprintf("server %s's certificate names %q, not the server role: servers sign once it does (a renewal gives a certificate its role) or the server leaves Raft", id, role)
+		}
+	}
+	return true, ""
+}
+
+// peerCertRole is the role Raft server id's certificate names.
+func (c *Cluster) peerCertRole(ctx context.Context, id string) (string, error) {
+	m, ok := c.memberRecord(id)
+	if !ok {
+		return "", errors.New("not in this server's member view")
+	}
+	if c.peerCertRoleHook != nil {
+		return c.peerCertRoleHook(m)
+	}
+	leaf, err := c.peerLeaf(ctx, m)
+	if err != nil {
+		return "", err
+	}
+	return ExtractPeerRole(leaf), nil
 }
 
 // membersBelow names the live members that report an fv below v, or none
@@ -217,7 +293,8 @@ func (c *Cluster) WriteServerSigning(ctx context.Context, w ServerSigningWrite, 
 // that only says it is a server in gossip. In a cluster whose servers'
 // certificates name no role (signed by cluster-sign-node.sh), no server
 // proves it, and no server can sign either: the leader writes the record
-// only with a certificate that names its role (Cluster.ServerSigningGate).
+// only once every Raft server's certificate names its role
+// (Cluster.ServerSigningGate).
 // So when every server answers with a certificate that names no role at
 // all, the feed's answer is that there is no record, as on a server tier
 // from before the feed, and tokens are signed as before. This node's own
@@ -280,16 +357,52 @@ func (a *Agent) tryServerMember(ctx context.Context, m Member, method, path stri
 	return a.doHTTPRequest(ctx, client, strings.TrimRight(m.InternalURL, "/")+path, method, body, out)
 }
 
-// FetchSigningKeys asks the server tier for the feed. A server tier from
-// before it answers 404, and one whose certificates name no role cannot
-// sign (see above): no record anywhere, the ring signs.
+// FetchSigningKeys asks the server tier for the feed. A record from any
+// server wins: one server's "no record" (Since 0, or a 404 from a build
+// before the feed, such as a server that was down when the others
+// switched and came back on its old build) never hides another's, so the
+// servers are read until one reports it. The answer is "no record" only
+// when no reachable server reports one and at least one answered so; or,
+// for a server tier that cannot sign, when every server's certificate
+// names no role (see above), unless one has ever proven its role to this
+// node. A server that answers anything else (503, or a body that is not
+// a feed) is passed over.
 func (a *Agent) FetchSigningKeys(ctx context.Context) (SigningKeys, error) {
-	var out SigningKeys
-	err := a.doServerJSON(ctx, http.MethodGet, PublicInternalSigningKeysPath, nil, &out)
-	if isStatus(err, http.StatusNotFound) || errors.Is(err, ErrServersNameNoRole) {
+	members := a.controlPlaneMembers()
+	if len(members) == 0 {
+		a.logNoControlPlaneMembers(http.MethodGet, PublicInternalSigningKeysPath, PublicInternalSigningKeysPath)
+		return SigningKeys{}, errors.New("cluster agent: no live server-role control-plane members")
+	}
+	var firstErr error
+	noRecord, roleLess := false, true
+	for _, m := range members {
+		var out SigningKeys
+		err := a.tryServerMember(ctx, m, http.MethodGet, PublicInternalSigningKeysPath, nil, &out)
+		switch {
+		case err == nil && out.SinceUnixNano > 0:
+			a.contact.record(time.Now())
+			a.serverProven.Store(true)
+			return out, nil
+		case err == nil:
+			a.serverProven.Store(true)
+			noRecord, roleLess = true, false
+		case isStatus(err, http.StatusNotFound):
+			noRecord, roleLess = true, false
+		default:
+			roleLess = roleLess && errors.Is(err, ErrPeerCertNamesNoRole)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if noRecord || roleLess && !a.serverProven.Load() {
+		a.contact.record(time.Now())
 		return SigningKeys{}, nil
 	}
-	return out, err
+	if roleLess {
+		return SigningKeys{}, fmt.Errorf("%w: and a server proved its role before: %v", ErrServersNameNoRole, firstErr)
+	}
+	return SigningKeys{}, firstErr
 }
 
 // SignSandboxToken has a server sign claims for a sandbox this node owns.

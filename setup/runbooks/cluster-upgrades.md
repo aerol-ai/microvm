@@ -105,7 +105,11 @@ build and the record is still missing. `aerolvm upgrade signing` shows
 whether servers sign, since when, and which members hold it back. Upgrade
 or delete those members, or run `aerolvm upgrade signing start` to start
 it anyway (every server must run the new build): a member on an older
-build then cannot check the tokens servers sign.
+build then cannot check the tokens servers sign. Servers also wait until
+every Raft server's certificate names the server role (a cluster moving
+off certificates from before roles: adopt, then each renewal gives a
+certificate its role); the reason names the server, and there is no
+override for it.
 
 Tokens signed before servers took over keep working until they expire (at
 most the token max TTL, 24 hours by default, after the cutover). Once

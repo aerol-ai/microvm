@@ -201,6 +201,10 @@ type Agent struct {
 	// the peer's certificate (ServerClientForPeer): for the calls only a
 	// server may answer, never one a member merely claims in gossip.
 	serverClients peerClientCache
+	// serverProven is set once a server has proven its role to this node:
+	// from then on, servers whose certificates name no role never stand
+	// for the whole server tier (FetchSigningKeys).
+	serverProven atomic.Bool
 
 	cacheMu        sync.RWMutex
 	placementCache []Placement

@@ -242,3 +242,65 @@ func TestSigningFeedPassesOverACutOffServer(t *testing.T) {
 		t.Fatal("a cut-off server's 503 read as an answer")
 	}
 }
+
+// A record from any server wins: a server that answers "no record" (one
+// behind the others, or a build from before the feed that answers 404,
+// such as one that came back on its old build after the switch) never
+// hides it, whichever server is read first. "No record" is the answer
+// only when no reachable server reports one; a body that is not a feed is
+// passed over.
+func TestARecordFromAnyServerWins(t *testing.T) {
+	ca, base := tokenForwardCA(t)
+	serve := func(id string, h http.HandlerFunc) Member {
+		return Member{NodeID: id, InternalURL: tokenForwardServer(t, ca, id, JoinRoleServer, h).URL, Alive: true, Role: config.NodeRoleServer}
+	}
+	oldBuild := serve("srv-old", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	behind := serve("srv-behind", func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(SigningKeys{}) })
+	garbled := serve("srv-garbled", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("not a feed")) })
+	var signs atomic.Int32
+	curURL, _ := signingPeer(t, ca, "srv-1", JoinRoleServer, 7, &signs)
+	current := Member{NodeID: "srv-1", InternalURL: curURL, Alive: true, Role: config.NodeRoleServer}
+	ctx := context.Background()
+	for name, members := range map[string][]Member{
+		"an old build's 404":       {oldBuild, current},
+		"a server behind":          {behind, current},
+		"a body that is no feed":   {garbled, current},
+		"all three beside the one": {oldBuild, behind, garbled, current},
+	} {
+		a := signingAgent(base, members...)
+		for i := 0; i < 40; i++ {
+			if got, err := a.FetchSigningKeys(ctx); err != nil || got.SinceUnixNano != 7 {
+				t.Fatalf("%s, read %d: %+v %v", name, i, got, err)
+			}
+		}
+	}
+	for name, tc := range map[string]struct {
+		members  []Member
+		noRecord bool
+	}{
+		"only an old build":                       {[]Member{oldBuild}, true},
+		"only a server behind":                    {[]Member{behind, oldBuild}, true},
+		"only a body that is no":                  {[]Member{garbled}, false},
+		"an old build and a body that is no feed": {[]Member{oldBuild, garbled}, true},
+	} {
+		got, err := signingAgent(base, tc.members...).FetchSigningKeys(ctx)
+		if tc.noRecord && (err != nil || got.SinceUnixNano != 0) || !tc.noRecord && err == nil {
+			t.Errorf("%s: %+v %v", name, got, err)
+		}
+	}
+	// Once a server has proven its role to this node, servers whose
+	// certificates name no role no longer stand for the whole tier.
+	feed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(SigningKeys{}) })
+	roleLess := Member{NodeID: "srv-9", InternalURL: roleLessPeer(t, ca, "srv-9", feed), Alive: true, Role: config.NodeRoleServer}
+	a := signingAgent(base, current)
+	if got, err := a.FetchSigningKeys(ctx); err != nil || got.SinceUnixNano != 7 {
+		t.Fatalf("first read: %+v %v", got, err)
+	}
+	a.gossip = signingAgent(base, roleLess).gossip
+	if got, err := a.FetchSigningKeys(ctx); !errors.Is(err, ErrServersNameNoRole) || got.SinceUnixNano != 0 {
+		t.Fatalf("role-less servers after a proven one: %+v %v", got, err)
+	}
+	if got, err := signingAgent(base, roleLess).FetchSigningKeys(ctx); err != nil || got.SinceUnixNano != 0 {
+		t.Fatalf("role-less servers, none ever proven: %+v %v", got, err)
+	}
+}
