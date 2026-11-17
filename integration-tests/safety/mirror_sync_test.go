@@ -185,7 +185,8 @@ func checksumsFor(files map[string]string) string {
 
 func TestMirrorSyncReleaseUploadsOnlyAVerifiedRelease(t *testing.T) {
 	const repo, tag = "aerol-ai/microvm", "v1.2.3"
-	assets := map[string]string{"sandboxd_linux_amd64": "sandboxd", "install.sh": "#!/bin/sh\n", "v1.2.3_install.sh": "#!/bin/sh\n"}
+	assets := map[string]string{"sandboxd_linux_amd64": "sandboxd", "install.sh": "#!/bin/sh\n", "v1.2.3_install.sh": "#!/bin/sh\n",
+		"aerolvm-eks.yaml": "AWSTemplateFormatVersion: \"2010-09-09\"\n"}
 	for _, tc := range []struct {
 		name       string
 		latest     string // GitHub's latest release
@@ -201,6 +202,17 @@ func TestMirrorSyncReleaseUploadsOnlyAVerifiedRelease(t *testing.T) {
 		{name: "--no-latest", latest: tag, args: []string{"--no-latest"}},
 		{name: "--latest", latest: "v1.2.4", args: []string{"--latest"}, wantLatest: true},
 		{name: "--bucket", latest: tag, args: []string{"--bucket", "other-bucket"}, bucket: "other-bucket", wantLatest: true},
+		{name: "a release from before the EKS stack: latest.txt only", latest: tag, wantLatest: true,
+			mutate: func(f map[string]string) {
+				delete(f, "aerolvm-eks.yaml")
+				rest := map[string]string{}
+				for k, v := range f {
+					if k != "checksums.txt" {
+						rest[k] = v
+					}
+				}
+				f["checksums.txt"] = checksumsFor(rest)
+			}},
 		{name: "the provenance bundle needs no checksum line", latest: tag, wantLatest: true,
 			mutate: func(f map[string]string) { f[tag+".intoto.jsonl"] = "{}" }},
 		{name: "a file that does not match checksums.txt: nothing uploaded", latest: tag, wantCode: 1,
@@ -257,6 +269,17 @@ func TestMirrorSyncReleaseUploadsOnlyAVerifiedRelease(t *testing.T) {
 			}
 			if tc.wantLatest && strings.Index(r.logs, "latest.txt s3://") < strings.Index(r.logs, "aws s3 sync") {
 				t.Error("latest.txt moved before the release's files were up")
+			}
+			// The docs' Launch Stack link reads aerolvm/latest/aerolvm-eks.yaml,
+			// so it follows latest.txt: only for the latest release, and only
+			// after the release's files are up.
+			stack, hasStack := got[bucket+"/aerolvm/latest/aerolvm-eks.yaml"]
+			released, inRelease := files["aerolvm-eks.yaml"]
+			if hasStack != (tc.wantLatest && inRelease) || (hasStack && stack != released) {
+				t.Errorf("latest/aerolvm-eks.yaml = %q (present %v), want present %v and as released", stack, hasStack, tc.wantLatest && inRelease)
+			}
+			if hasStack && strings.Index(r.logs, "aerolvm-eks.yaml s3://") < strings.Index(r.logs, "aws s3 sync") {
+				t.Error("latest/aerolvm-eks.yaml moved before the release's files were up")
 			}
 			if strings.Contains(r.logs, "curl ") {
 				t.Error("release files must come through gh, not github.com download links")
