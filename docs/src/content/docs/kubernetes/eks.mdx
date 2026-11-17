@@ -207,7 +207,7 @@ aerolvm k8s verify --namespace aerolvm-system --worker-namespace aerolvm-workers
 
 ## Change, upgrade or delete
 
-- **Upgrade AerolVM:** update the stack and change **AerolVM version**. The stack runs `helm upgrade` and waits for the cluster to be ready again. Sandboxes keep running.
+- **Upgrade AerolVM:** update the stack and change **AerolVM version**. The stack runs `helm upgrade` and waits for the cluster to be ready again. Sandboxes keep running ([how upgrades work](/kubernetes/operations/#upgrade)). If the upgrade fails, CloudFormation rolls the stack back, and the stack installs the previous version again: that is the same as a `helm upgrade` back to the old version.
 - **More or bigger workers:** update the stack and change **Most worker machines** or **Worker machine type**. AerolVM moves sandboxes off old machines before Karpenter replaces them.
 - **Delete everything:** delete the stack. It removes AerolVM, the worker machines, the cluster and the network. This takes about 25 minutes. Every sandbox and its files are gone.
 

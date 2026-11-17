@@ -652,7 +652,7 @@ Resources:
                 {
                   "Sid": "StartTheInstaller",
                   "Effect": "Allow",
-                  "Action": ["codebuild:StartBuild", "codebuild:BatchGetBuilds"],
+                  "Action": ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"],
                   "Resource": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-installer"
                 },
                 {
@@ -825,7 +825,7 @@ Resources:
           - { Name: LOG_GROUP, Value: !Ref InstallerLogs }
       Source:
         Type: NO_SOURCE
-        # The installer script. integration-tests/safety/eks_template_test.go
+        # The installer script. integration-tests/safety/eks_stack_test.go
         # runs bash -n (and shellcheck, when it is installed) on it.
         BuildSpec: |
           version: 0.2
@@ -927,7 +927,8 @@ Resources:
                   }
 
                   connect() {
-                    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null
+                    # Returns 1 on failure: remove_aerolvm calls it inside an if, where set -e is off.
+                    aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null || return 1
                     CONNECTED=true
                   }
 
@@ -1115,9 +1116,11 @@ Resources:
                         warn "the AerolVM namespaces were not deleted in time"
                       kubectl delete crd aerolclusters.aerolvm.io aerolnodes.aerolvm.io --ignore-not-found --timeout=2m ||
                         warn "the AerolVM CRDs were not deleted"
-                      local i gone=false
+                      local i pvs gone=false
                       for i in $(seq 1 60); do
-                        if [ -z "$(kubectl get pv -o jsonpath='{.items[?(@.spec.storageClassName=="aerolvm-gp3")].metadata.name}')" ]; then
+                        # A failed get is not "no disks left" (set -e is off in here).
+                        if pvs="$(kubectl get pv -o jsonpath='{.items[?(@.spec.storageClassName=="aerolvm-gp3")].metadata.name}')" &&
+                          [ -z "$pvs" ]; then
                           gone=true
                           break
                         fi
@@ -1132,7 +1135,9 @@ Resources:
                     fi
 
                     STEP="removing machines Karpenter left behind"
-                    local ids lt profile
+                    # Each list is assigned before its loop, so a failed AWS call stops
+                    # the script (set -e) and answers FAILED instead of skipping it.
+                    local ids lts lt profiles profile
                     ids="$(aws ec2 describe-instances --region "$AWS_REGION" \
                       --filters "Name=tag:kubernetes.io/cluster/${CLUSTER_NAME},Values=owned" "Name=tag-key,Values=karpenter.sh/nodepool" \
                         "Name=instance-state-name,Values=pending,running,stopping,stopped" \
@@ -1145,13 +1150,15 @@ Resources:
                     fi
 
                     STEP="removing launch templates and instance profiles Karpenter left behind"
-                    for lt in $(aws ec2 describe-launch-templates --region "$AWS_REGION" \
+                    lts="$(aws ec2 describe-launch-templates --region "$AWS_REGION" \
                       --filters "Name=tag:karpenter.k8s.aws/cluster,Values=${CLUSTER_NAME}" \
-                      --query 'LaunchTemplates[].LaunchTemplateId' --output text); do
+                      --query 'LaunchTemplates[].LaunchTemplateId' --output text)"
+                    for lt in $lts; do
                       aws ec2 delete-launch-template --region "$AWS_REGION" --launch-template-id "$lt" >/dev/null
                     done
-                    for profile in $(aws iam list-instance-profiles-for-role --role-name "$NODE_ROLE" \
-                      --query 'InstanceProfiles[].InstanceProfileName' --output text); do
+                    profiles="$(aws iam list-instance-profiles-for-role --role-name "$NODE_ROLE" \
+                      --query 'InstanceProfiles[].InstanceProfileName' --output text)"
+                    for profile in $profiles; do
                       case "$profile" in
                         "${CLUSTER_NAME}_"*)
                           aws iam remove-role-from-instance-profile --instance-profile-name "$profile" --role-name "$NODE_ROLE"
@@ -1229,24 +1236,37 @@ Resources:
                          LOGICAL_RESOURCE_ID=event["LogicalResourceId"],
                          PHYSICAL_RESOURCE_ID=physical_id(event))
               cb = boto3.client("codebuild")
-              build = cb.start_build(
-                  projectName=os.environ["PROJECT"],
-                  environmentVariablesOverride=[
-                      {"name": k, "value": v, "type": "PLAINTEXT"} for k, v in env.items()],
-              )["build"]["id"]
-              print("started", build)
-              while context.get_remaining_time_in_millis() > 30000:
-                  b = cb.batch_get_builds(ids=[build])["builds"][0]
-                  phases = b.get("phases", [])
-                  if any(ph["phaseType"] == "BUILD" for ph in phases):
-                      return
-                  if b["buildStatus"] != "IN_PROGRESS":
-                      why = [c["message"] for ph in phases for c in ph.get("contexts", []) if c.get("message")]
-                      respond(event, "FAILED", "The installer build %s did not start: %s" % (
-                          build, "; ".join(why) or b["buildStatus"]))
-                      return
-                  time.sleep(10)
-              respond(event, "FAILED", "The installer build %s did not start in time" % build)
+              build = None
+              try:
+                  build = cb.start_build(
+                      projectName=os.environ["PROJECT"],
+                      environmentVariablesOverride=[
+                          {"name": k, "value": v, "type": "PLAINTEXT"} for k, v in env.items()],
+                  )["build"]["id"]
+                  print("started", build)
+                  while context.get_remaining_time_in_millis() > 30000:
+                      b = cb.batch_get_builds(ids=[build])["builds"][0]
+                      phases = b.get("phases", [])
+                      if any(ph["phaseType"] == "BUILD" for ph in phases):
+                          return
+                      if b["buildStatus"] != "IN_PROGRESS":
+                          why = [c["message"] for ph in phases for c in ph.get("contexts", []) if c.get("message")]
+                          respond(event, "FAILED", "The installer build %s did not start: %s" % (
+                              build, "; ".join(why) or b["buildStatus"]))
+                          return
+                      time.sleep(10)
+                  why = "did not start in time"
+              except Exception as err:
+                  why = "could not be watched: %s: %s" % (type(err).__name__, err)
+              # Giving up on a build that may still start: stop it first, or
+              # it could later run an install next to the rollback's delete
+              # build, and answer a second time.
+              if build:
+                  try:
+                      cb.stop_build(id=build)
+                  except Exception as err:
+                      print("stop_build", build, err)
+              respond(event, "FAILED", "The installer build %s %s" % (build or "(not started)", why))
 
 
           def clean_network(props, context):
