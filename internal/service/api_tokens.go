@@ -95,6 +95,9 @@ func (s *Service) apiTokenNow() time.Time {
 // ErrAPITokenNameTaken, so the secret of the first create was shown once
 // and is never shown again.
 func (s *Service) CreateAPIToken(ctx context.Context, req models.CreateAPITokenRequest) (models.CreatedAPIToken, error) {
+	if err := s.takesAPITokenWrites(); err != nil {
+		return models.CreatedAPIToken{}, err
+	}
 	rec, err := s.apiTokenRecordFor(ctx, req)
 	if err != nil {
 		return models.CreatedAPIToken{}, err
@@ -170,6 +173,24 @@ func (s *Service) apiTokenRecordFor(ctx context.Context, req models.CreateAPITok
 	}, nil
 }
 
+// ForwardsAPITokenWrites reports whether this node sends its callers'
+// token creates and revokes on to a server (the API handler does, with the
+// caller's own credential) instead of writing them: a cluster worker. Token
+// writes come only from servers and gateways (cluster.IsTokenWritePeer).
+func (s *Service) ForwardsAPITokenWrites() bool {
+	return s.cfg.EnableCluster && s.cfg.IsWorker() && !s.cfg.IsServer()
+}
+
+// takesAPITokenWrites is the backstop for a token write that reached the
+// service on a worker without the handler's forward: the server tier would
+// refuse this node's write, so it is a clear 400, not an unknown outcome.
+func (s *Service) takesAPITokenWrites() error {
+	if s.ForwardsAPITokenWrites() {
+		return fmt.Errorf("%w: this is a worker node, which sends token writes on to a server; send the request to a server or a gateway", ErrAPITokenInvalid)
+	}
+	return nil
+}
+
 func (s *Service) tokenMaxTTL() time.Duration {
 	if s.cfg.TokenMaxTTL > 0 {
 		return s.cfg.TokenMaxTTL
@@ -208,6 +229,9 @@ func (s *Service) ListAPITokens(ctx context.Context) (models.APITokenList, error
 // error: revoke is idempotent, so a retried or repeated revoke is a 204.
 // The evidence of who revoked it is the api record of the call (T5).
 func (s *Service) RevokeAPIToken(ctx context.Context, id string) error {
+	if err := s.takesAPITokenWrites(); err != nil {
+		return err
+	}
 	id = strings.TrimSpace(id)
 	if !identitywire.ValidAPITokenID(id) {
 		return fmt.Errorf("%w: a token id looks like tok_ followed by 12 letters or digits", ErrAPITokenInvalid)
@@ -471,7 +495,8 @@ func clusterAPITokenError(err error) error {
 		return errAPITokenIDCollision
 	case errors.Is(err, cluster.ErrClusterVersion):
 		return fmt.Errorf("%w: %v", ErrAPITokenClusterVersion, err)
-	case errors.Is(err, identity.ErrInvalidTokenRecord):
+	case errors.Is(err, identity.ErrInvalidTokenRecord), errors.Is(err, cluster.ErrAPITokenTTL),
+		errors.Is(err, cluster.ErrAPITokenWriterRefused):
 		return fmt.Errorf("%w: %v", ErrAPITokenInvalid, err)
 	}
 	return fmt.Errorf("%w: %v", ErrAPITokensUnavailable, err)

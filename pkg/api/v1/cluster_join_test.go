@@ -33,6 +33,8 @@ type joinStubCluster struct {
 	adopt      cluster.AdoptResponse
 	adoptErr   error
 	writePeers map[string]bool
+	// tokenPeers are the nodes that write API tokens (servers, gateways).
+	tokenPeers map[string]bool
 	writeReq   cluster.JoinWriteRequest
 	writeResp  cluster.JoinWriteResponse
 	writeErr   error
@@ -70,6 +72,8 @@ func (c *joinStubCluster) WriteJoin(_ context.Context, req cluster.JoinWriteRequ
 }
 
 func (c *joinStubCluster) IsJoinWritePeer(id string) bool { return c.writePeers[id] }
+
+func (c *joinStubCluster) IsTokenWritePeer(id string) bool { return c.tokenPeers[id] }
 
 func (c *joinStubCluster) RenewNodeCert(_ context.Context, peer string, _ *x509.Certificate, csr []byte) (cluster.RenewCertResponse, error) {
 	c.renewPeer, c.renewCSR = peer, string(csr)

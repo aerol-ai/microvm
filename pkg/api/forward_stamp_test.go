@@ -54,7 +54,7 @@ var peerRequestBuilders = []string{
 //     peerRequestBuilders;
 //   - the reverse-proxy Director behind cluster.ForwardHTTP (clusterroute,
 //     clustercreate, runloop forwardToNode, js-bundle and template routing)
-//     stamps through StampForward;
+//     and Agent.ForwardToServer stamps through StampForward;
 //   - nothing outside StampForward sets X-Cluster-Forwarded itself, so the
 //     marker and the headers that travel with it can never come apart.
 func TestForwardPathsCallStampForward(t *testing.T) {
@@ -74,15 +74,16 @@ func TestForwardPathsCallStampForward(t *testing.T) {
 		t.Errorf("peer request builders = %v\nwant %v (add a new fan-out client to peerRequestBuilders after making it call cluster.StampForward)", builders, peerRequestBuilders)
 	}
 
-	// The reverse-proxy Director.
+	// The reverse-proxy Director, which every forward to a peer builds
+	// (ForwardHTTP's cache, and a worker's token forward to a server).
 	directorStamps := false
 	forEachGoFunc(t, "../../internal/cluster", func(_, file, fn string, body *ast.BlockStmt) {
-		if filepath.Base(file) == "forward.go" && fn == "getForPeer" && callsIdent(body, "stampForwardFromContext") {
+		if filepath.Base(file) == "forward.go" && fn == "newPeerReverseProxy" && callsIdent(body, "stampForwardFromContext") {
 			directorStamps = true
 		}
 	})
 	if !directorStamps {
-		t.Error("the ForwardHTTP reverse-proxy Director (internal/cluster/forward.go getForPeer) no longer stamps through StampForward")
+		t.Error("the peer reverse-proxy Director (internal/cluster/forward.go newPeerReverseProxy) no longer stamps through StampForward")
 	}
 
 	// Only StampForward sets the forwarded marker.

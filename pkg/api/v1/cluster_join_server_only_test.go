@@ -88,6 +88,53 @@ func TestServerTokenAndAdoptRefuseNonServerNodes(t *testing.T) {
 	}
 }
 
+// An ingress join token is refused to a caller whose verified cert names a
+// node that is neither a server nor a gateway, directly or as a forward:
+// an ingress node writes API tokens, and those come only from servers and
+// gateways (defense in depth). A server, a gateway and an operator with no
+// node cert get one.
+func TestIngressTokenRefusesNonTokenWriterNodes(t *testing.T) {
+	stub := newJoinStub()
+	stub.tokenPeers = map[string]bool{"srv-2": true, "gw-1": true}
+	stub.created = cluster.JoinTokenCreated{ID: "abcdef", Role: "ingress"}
+	mux := joinRoutesMux(t, stub, joinOperator())
+	node := func(id string) *x509.Certificate { return &x509.Certificate{DNSNames: []string{"node:" + id}} }
+	for _, tc := range []struct {
+		name      string
+		body      string
+		cert      *x509.Certificate
+		forwarded bool
+		want      int
+	}{
+		{"operator, no node cert", `{"role":"ingress"}`, nil, false, http.StatusCreated},
+		{"worker cert", `{"role":"ingress"}`, node("wkr-1"), false, http.StatusForbidden},
+		{"worker cert, odd case", `{"role":" Ingress "}`, node("wkr-1"), false, http.StatusForbidden},
+		{"worker forwarding an operator", `{"role":"ingress"}`, node("wkr-1"), true, http.StatusForbidden},
+		{"cert with no node identity", `{"role":"ingress"}`, &x509.Certificate{DNSNames: []string{"aerolvm-cluster-node"}}, false, http.StatusForbidden},
+		{"gateway cert", `{"role":"ingress"}`, node("gw-1"), false, http.StatusCreated},
+		{"server cert", `{"role":"ingress"}`, node("srv-2"), false, http.StatusCreated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub.createReq = cluster.JoinTokenCreateRequest{}
+			req := httptest.NewRequest(http.MethodPost, cluster.PublicJoinTokensPath, strings.NewReader(tc.body))
+			if tc.cert != nil {
+				addVerifiedClientCertificate(req, tc.cert)
+			}
+			if tc.forwarded {
+				req.Header.Set(cluster.HeaderForwarded, "1")
+			}
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, req)
+			if rr.Code != tc.want {
+				t.Fatalf("= %d %s, want %d", rr.Code, rr.Body.String(), tc.want)
+			}
+			if tc.want == http.StatusForbidden && (stub.createReq.Role != "" || !strings.Contains(rr.Body.String(), "not an admitted server or gateway")) {
+				t.Fatalf("refusal reached the cluster: %s %+v", rr.Body.String(), stub.createReq)
+			}
+		})
+	}
+}
+
 // tokenOnlyCluster manages join tokens but has no Raft view, like a
 // worker's agent.
 type tokenOnlyCluster struct {

@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -23,6 +25,9 @@ import (
 
 // createToken mints a token. The plaintext is in this response only.
 func (h *handlers) createToken(w http.ResponseWriter, r *http.Request) {
+	if h.refuseNodeTokenWrite(w, r, "an API token create") || h.forwardTokenWrite(w, r) {
+		return
+	}
 	var req models.CreateAPITokenRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
@@ -53,6 +58,9 @@ func (h *handlers) listTokens(w http.ResponseWriter, r *http.Request) {
 // revokeToken deletes a token. A malformed id is a 400, so a mistyped id is
 // never silently "revoked"; a well-formed one that is gone is a 204.
 func (h *handlers) revokeToken(w http.ResponseWriter, r *http.Request) {
+	if h.refuseNodeTokenWrite(w, r, "an API token revoke") || h.forwardTokenWrite(w, r) {
+		return
+	}
 	if err := h.deps.Service.RevokeAPIToken(r.Context(), r.PathValue("id")); err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -60,9 +68,68 @@ func (h *handlers) revokeToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// tokenWritePeerChecker is the role binding for token writes
+// (Cluster.IsTokenWritePeer): servers and ingress (gateway) nodes.
+type tokenWritePeerChecker interface {
+	IsTokenWritePeer(peerID string) bool
+}
+
+// refuseNodeTokenWrite answers a token write a node makes on its own behalf
+// (a node principal: its certificate, or the PAT over mTLS) unless the node
+// is a server or a gateway: token writes come only from those (defense in
+// depth). A caller's own credential that a worker forwarded is that caller,
+// not the node, and passes. It reports whether it answered.
+func (h *handlers) refuseNodeTokenWrite(w http.ResponseWriter, r *http.Request, what string) bool {
+	access, ok := controlplane.AccessFromContext(r.Context())
+	if !ok || access.Principal.Kind != controlplane.PrincipalNode {
+		return false
+	}
+	peer := strings.TrimPrefix(access.Principal.ID, "node:")
+	if checker, ok := h.deps.Service.Cluster().(tokenWritePeerChecker); ok && checker.IsTokenWritePeer(peer) {
+		return false
+	}
+	if h.deps.Logger != nil {
+		h.deps.Logger.Warn("cluster: refused a token write a node made for itself", "what", what, "peer", peer)
+	}
+	apihttp.WriteError(w, http.StatusForbidden, fmt.Sprintf("%s by node %q: a node's own identity cannot write tokens here, only a server's or a gateway's; send the call with an operator token or a user token", what, peer))
+	return true
+}
+
+// tokenServerForwarder is a worker's way to a server (Agent.ForwardToServer).
+type tokenServerForwarder interface {
+	ForwardToServer(http.ResponseWriter, *http.Request)
+}
+
+// forwardTokenWrite sends a caller's token create or revoke on to a server
+// when this node does not write tokens (a worker), so a cluster whose API
+// address reaches only workers can still create and revoke them. Only with
+// the caller's own credential: the server authenticates the caller itself,
+// and a call that carries none is refused here, never sent as this node.
+// It reports whether it answered.
+func (h *handlers) forwardTokenWrite(w http.ResponseWriter, r *http.Request) bool {
+	if !h.deps.Service.ForwardsAPITokenWrites() {
+		return false
+	}
+	if scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " "); !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(cred) == "" {
+		apihttp.WriteError(w, http.StatusBadRequest, "this worker node sends token writes on to a server with your own credential, and this call carries none: send it with an Authorization header, or to a server or gateway")
+		return true
+	}
+	fw, ok := h.deps.Service.Cluster().(tokenServerForwarder)
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, cluster.ErrNoServerForward.Error())
+		return true
+	}
+	fw.ForwardToServer(w, r)
+	return true
+}
+
 // clusterInternalAPITokenWrite applies a peer's token write on the leader,
 // or forwards it one hop there. FSM verdicts travel in a 200 body so they
 // survive the hops; anything else is a 503 the caller retries elsewhere.
+// Only a server or a gateway may send one (IsTokenWritePeer). Every write
+// is recorded here with the sending node and the record's created_by, a
+// refused one at most once a minute per node (RecordInternalTokenWrite):
+// the cluster.internal routes are otherwise never recorded (api_audit.go).
 func (h *handlers) clusterInternalAPITokenWrite(w http.ResponseWriter, r *http.Request) {
 	writer, ok := h.deps.Service.Cluster().(interface {
 		WriteAPIToken(context.Context, cluster.APITokenWriteRequest) (cluster.APITokenWriteResponse, error)
@@ -76,16 +143,40 @@ func (h *handlers) clusterInternalAPITokenWrite(w http.ResponseWriter, r *http.R
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	peerID, _ := r.Context().Value(clusterPeerNodeIDContextKey{}).(string)
+	checker, ok := h.deps.Service.Cluster().(tokenWritePeerChecker)
+	if !ok || !checker.IsTokenWritePeer(peerID) {
+		if h.deps.Logger != nil {
+			h.deps.Logger.Warn("cluster: refused an API token write from a node that may not send one", "peer", peerID,
+				"token_id", tokenWriteID(req), "created_by", req.Token.CreatedBy)
+		}
+		h.deps.Service.RecordInternalTokenWrite(r.Context(), peerID, req, http.StatusForbidden, true)
+		apihttp.WriteJSON(w, http.StatusOK, cluster.APITokenWriteOutcome(
+			fmt.Errorf("%w: node %q is not a server or an ingress node", cluster.ErrAPITokenWriterRefused, peerID)))
+		return
+	}
 	resp, err := writer.WriteAPIToken(r.Context(), req)
 	if err != nil {
 		if out := cluster.APITokenWriteOutcome(err); out.Code != "" {
+			h.deps.Service.RecordInternalTokenWrite(r.Context(), peerID, req, http.StatusConflict, false)
 			apihttp.WriteJSON(w, http.StatusOK, out)
 			return
 		}
+		h.deps.Service.RecordInternalTokenWrite(r.Context(), peerID, req, http.StatusServiceUnavailable, false)
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: API token write failed: "+err.Error())
 		return
 	}
+	h.deps.Service.RecordInternalTokenWrite(r.Context(), peerID, req, http.StatusOK, false)
 	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// tokenWriteID is the token a write names: the record's for a create, the
+// id for a revoke.
+func tokenWriteID(req cluster.APITokenWriteRequest) string {
+	if req.Delete {
+		return req.ID
+	}
+	return req.Token.ID
 }
 
 // apiTokenFeed is what a Raft server serves its peers' token mirrors from.

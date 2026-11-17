@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -557,4 +558,41 @@ type countingTokenServer struct{ *cluster.Noop }
 
 func (countingTokenServer) CountAPITokens(time.Time) map[controlplane.Role]int {
 	return map[controlplane.Role]int{controlplane.RoleAuditor: 3}
+}
+
+// A cluster worker takes no token create or revoke (PR 2 review): the
+// server tier refuses its node's token writes, so it says so with a 400
+// instead of an unknown outcome, and nothing reaches the cluster. A server,
+// a gateway and a mixed node still take them; the leader's two new
+// verdicts are 400s too.
+func TestAPITokenWritesOnAWorker(t *testing.T) {
+	ctx := adminCtx()
+	for _, tc := range []struct {
+		role string
+		ok   bool
+	}{{"worker", false}, {"worker,ingress", false}, {"ingress", true}, {"server", true}, {"mixed", true}} {
+		fc := newFakeTokenCluster()
+		svc := newTokenService(t, true)
+		svc.cfg.EnableCluster, svc.cfg.NodeRole = true, tc.role
+		svc.cluster = fakeTokenServer{fc}
+		_, err := svc.CreateAPIToken(ctx, createReq("ci", "runner", "payments", "30d"))
+		rerr := svc.RevokeAPIToken(ctx, "tok_aaaaaaaaaaaa")
+		if tc.ok != (err == nil) || tc.ok != (rerr == nil) || (!tc.ok && (!errors.Is(err, ErrAPITokenInvalid) || !errors.Is(rerr, ErrAPITokenInvalid))) {
+			t.Errorf("%s: create %v, revoke %v (want taken %v)", tc.role, err, rerr, tc.ok)
+		}
+		if !tc.ok && len(fc.writes) != 0 {
+			t.Errorf("%s: %d writes reached the cluster", tc.role, len(fc.writes))
+		}
+	}
+
+	fc := newFakeTokenCluster()
+	svc := newTokenService(t, true)
+	svc.cfg.EnableCluster = true
+	svc.cluster = fakeTokenServer{fc}
+	for i, sentinel := range []error{cluster.ErrAPITokenTTL, cluster.ErrAPITokenWriterRefused} {
+		fc.writeErr = []error{fmt.Errorf("%w (leader)", sentinel)}
+		if _, err := svc.CreateAPIToken(ctx, createReq(fmt.Sprintf("ci-%d", i), "runner", "payments", "30d")); !errors.Is(err, ErrAPITokenInvalid) {
+			t.Errorf("%v: %v, want a 400", sentinel, err)
+		}
+	}
 }

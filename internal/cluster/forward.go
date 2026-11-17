@@ -70,11 +70,22 @@ func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (
 	if p, ok := pc.proxies[cacheKey]; ok {
 		return p, nil
 	}
+	rp, err := newPeerReverseProxy(baseURL, rt)
+	if err != nil {
+		return nil, err
+	}
+	pc.proxies[cacheKey] = rp
+	return rp, nil
+}
+
+// newPeerReverseProxy is the reverse proxy every forward to a peer uses:
+// it stamps the forward markers and records a failed forward at the edge.
+func newPeerReverseProxy(baseURL string, rt http.RoundTripper) (*httputil.ReverseProxy, error) {
 	target, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	rp := &httputil.ReverseProxy{
+	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
@@ -94,9 +105,7 @@ func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (
 			auditlog.MarkForwardFailed(r.Context())
 			http.Error(w, "cluster: forward to "+baseURL+" failed: "+err.Error(), http.StatusBadGateway)
 		},
-	}
-	pc.proxies[cacheKey] = rp
-	return rp, nil
+	}, nil
 }
 
 // ForwardHTTP reverse-proxies r to target and writes the response into w. The

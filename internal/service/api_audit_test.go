@@ -8,6 +8,7 @@ import (
 	"expvar"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -648,5 +650,81 @@ func TestListSecretAuditCallerFilter(t *testing.T) {
 	}
 	if !secretAuditCallerMatches(SecretAuditEvent{Kind: "x"}, "") {
 		t.Fatal("an empty filter matches everything")
+	}
+}
+
+// Every API token write a peer sends over the internal route leaves a
+// record (PR 2 review): the cluster.internal routes are otherwise never
+// recorded. It is a new Kind built only from existing fields, so older
+// builds verify it: the sending node as caller, the token, for a create its
+// role and team, and created_by in Reason. A refused one is denied, and
+// recorded at most once a minute per node, the next record carrying the
+// refusals folded into it.
+func TestRecordInternalTokenWrite(t *testing.T) {
+	s, sink := apiAuditService(t, config.Config{})
+	create := cluster.APITokenWriteRequest{Token: identity.TokenRecord{ID: "tok_aaaaaaaaaaaa", Role: controlplane.RoleAdmin,
+		CreatedBy: "operator"}}
+	s.RecordInternalTokenWrite(context.Background(), "wkr-1", create, http.StatusForbidden, true)
+	s.RecordInternalTokenWrite(context.Background(), "gw-1", cluster.APITokenWriteRequest{Delete: true, ID: "tok_bbbbbbbbbbbb"}, http.StatusOK, false)
+	evs := sink.Events()
+	if len(evs) != 2 {
+		t.Fatalf("%d records, want 2", len(evs))
+	}
+	ref := "POST " + cluster.PublicInternalAPITokenWritePath
+	got, rev := evs[0], evs[1]
+	if got.Kind != KindAPITokenPeerWrite || got.Ref != ref || got.Result != auditlog.APIResultDenied ||
+		got.Caller == nil || got.Caller.Kind != "node" || got.Caller.ID != "node:wkr-1" || got.Request == nil ||
+		got.Request.Target != "tok_aaaaaaaaaaaa" || got.Reason != "created_by=operator" ||
+		got.Request.Grant == nil || got.Request.Grant.Role != "admin" || got.Request.Grant.Team != controlplane.FleetTeam {
+		t.Fatalf("refused create: %+v caller %+v request %+v", got, got.Caller, got.Request)
+	}
+	if rev.Kind != KindAPITokenPeerWrite || rev.Result != auditlog.APIResultOK || rev.Caller.ID != "node:gw-1" ||
+		rev.Request.Target != "tok_bbbbbbbbbbbb" || rev.Request.Grant != nil || rev.Reason != "revoke" {
+		t.Fatalf("revoke: %+v request %+v", rev, rev.Request)
+	}
+	off, offSink := apiAuditService(t, config.Config{AuditAPIRecords: config.AuditAPIRecordsOff})
+	off.RecordInternalTokenWrite(context.Background(), "gw-1", create, http.StatusOK, false)
+	if n := len(offSink.Events()); n != 0 {
+		t.Fatalf("SB_AUDIT_API_RECORDS=off still recorded %d", n)
+	}
+}
+
+// Refused internal token writes from one node: one record a minute, the
+// next one standing for those folded in between (Dropped). Another node,
+// and allowed writes, are not held back.
+func TestRecordInternalTokenWriteDenialsAreLimited(t *testing.T) {
+	s, sink := apiAuditService(t, config.Config{})
+	refused := cluster.APITokenWriteRequest{Token: identity.TokenRecord{ID: "tok_aaaaaaaaaaaa", Role: controlplane.RoleAdmin}}
+	for range 5 {
+		s.RecordInternalTokenWrite(context.Background(), "wkr-1", refused, http.StatusForbidden, true)
+	}
+	s.RecordInternalTokenWrite(context.Background(), "wkr-2", refused, http.StatusForbidden, true)
+	for range 3 {
+		s.RecordInternalTokenWrite(context.Background(), "gw-1", refused, http.StatusOK, false)
+	}
+	if n := len(sink.Events()); n != 5 {
+		t.Fatalf("%d records, want 5 (wkr-1 once, wkr-2 once, gw-1's three allowed)", n)
+	}
+	// The minute ends: wkr-1's next refusal is recorded and stands for the
+	// four folded since.
+	s.peerTokenWriteDenials.mu.Lock()
+	s.peerTokenWriteDenials.last["wkr-1"] = time.Now().Add(-2 * peerDenialWindow)
+	s.peerTokenWriteDenials.mu.Unlock()
+	s.RecordInternalTokenWrite(context.Background(), "wkr-1", refused, http.StatusForbidden, true)
+	if evs := sink.Events(); len(evs) != 6 || evs[5].Caller.ID != "node:wkr-1" || evs[5].Dropped != 4 {
+		t.Fatalf("the next minute's record: %+v", evs[len(evs)-1])
+	}
+	var l peerDenialLimiter
+	at := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	if n, ok := l.admit("wkr-1", at); !ok || n != 1 {
+		t.Fatalf("first: %d %v", n, ok)
+	}
+	for i := range 4 {
+		if _, ok := l.admit("wkr-1", at.Add(time.Duration(i+1)*time.Second)); ok {
+			t.Fatalf("refusal %d within the minute was recorded", i+2)
+		}
+	}
+	if n, ok := l.admit("wkr-1", at.Add(peerDenialWindow)); !ok || n != 5 {
+		t.Fatalf("the next minute's record stands for %d (%v), want 5", n, ok)
 	}
 }

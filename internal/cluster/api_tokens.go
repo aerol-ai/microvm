@@ -43,7 +43,24 @@ const (
 	apiTokenCodeNameTaken      = "name_taken"
 	apiTokenCodeIDTaken        = "id_taken"
 	apiTokenCodeClusterVersion = "cluster_version"
+	apiTokenCodeTTL            = "ttl"
+	apiTokenCodeWriterRefused  = "writer_refused"
 )
+
+var (
+	// ErrAPITokenTTL is a token create the leader refused because the token
+	// would outlive the leader's SB_TOKEN_MAX_TTL (400 on the public path,
+	// which refuses the same request before it gets here).
+	ErrAPITokenTTL = errors.New("cluster: API token lifetime is longer than the leader's SB_TOKEN_MAX_TTL")
+	// ErrAPITokenWriterRefused is a token write sent by a node that may not
+	// send one: anything but a server or an ingress (gateway) node.
+	ErrAPITokenWriterRefused = errors.New("cluster: only servers and ingress (gateway) nodes write API tokens")
+)
+
+// apiTokenTTLSkew is how far the leader's clock may lag the node that took
+// the create: that node sets ExpiresAt from its own clock, so a token made
+// at the full SB_TOKEN_MAX_TTL there must still pass here.
+const apiTokenTTLSkew = 5 * time.Minute
 
 // APITokenWriteRequest creates a token (Delete false, Token set) or revokes
 // one (Delete true, ID set). A create carries the secret's hash only.
@@ -71,6 +88,10 @@ func APITokenWriteOutcome(err error) APITokenWriteResponse {
 		return APITokenWriteResponse{Code: apiTokenCodeIDTaken, Message: err.Error()}
 	case errors.Is(err, ErrClusterVersion):
 		return APITokenWriteResponse{Code: apiTokenCodeClusterVersion, Message: err.Error()}
+	case errors.Is(err, ErrAPITokenTTL):
+		return APITokenWriteResponse{Code: apiTokenCodeTTL, Message: err.Error()}
+	case errors.Is(err, ErrAPITokenWriterRefused):
+		return APITokenWriteResponse{Code: apiTokenCodeWriterRefused, Message: err.Error()}
 	}
 	return APITokenWriteResponse{}
 }
@@ -86,6 +107,10 @@ func (r APITokenWriteResponse) err() error {
 		sentinel = ErrAPITokenIDTaken
 	case apiTokenCodeClusterVersion:
 		sentinel = ErrClusterVersion
+	case apiTokenCodeTTL:
+		sentinel = ErrAPITokenTTL
+	case apiTokenCodeWriterRefused:
+		sentinel = ErrAPITokenWriterRefused
 	default:
 		return fmt.Errorf("cluster: API token write: %s: %s", r.Code, r.Message)
 	}
@@ -109,7 +134,13 @@ func (c *Cluster) WriteAPIToken(ctx context.Context, req APITokenWriteRequest) (
 	if err := c.raftServersSupport(apiTokenFSMOpsVersion, "API tokens"); err != nil {
 		return APITokenWriteResponse{}, err
 	}
-	cmd := command{Op: opPutAPIToken, StampUnixNano: time.Now().UnixNano()}
+	now := time.Now()
+	if !req.Delete {
+		if err := c.checkAPITokenTTL(req.Token, now); err != nil {
+			return APITokenWriteResponse{}, err
+		}
+	}
+	cmd := command{Op: opPutAPIToken, StampUnixNano: now.UnixNano()}
 	if req.Delete {
 		cmd.Op, cmd.APITokenID = opDeleteAPIToken, req.ID
 	} else {
@@ -128,6 +159,47 @@ func (c *Cluster) WriteAPIToken(ctx context.Context, req APITokenWriteRequest) (
 		return APITokenWriteResponse{Token: applied.Token}, nil
 	}
 	return APITokenWriteResponse{}, nil
+}
+
+// checkAPITokenTTL is the leader's cap on a new token's lifetime: its own
+// SB_TOKEN_MAX_TTL (90 days in enterprise mode), whatever the node that took
+// the create runs. That node already refused a longer expires_in, but a
+// record that reaches the leader from a peer is otherwise taken as written,
+// so a node with a looser setting, or a forged write, could store a token
+// for centuries. Only new writes are checked, here before the proposal and
+// never in the FSM's apply: replaying the log or a snapshot after a leader
+// change or restart applies every stored token as it was, and a token
+// already stored with a longer lifetime keeps working until it expires.
+func (c *Cluster) checkAPITokenTTL(rec identity.TokenRecord, now time.Time) error {
+	limit := c.cfg.TokenMaxTTL
+	if limit <= 0 {
+		limit = 365 * 24 * time.Hour
+	}
+	if life := rec.ExpiresAt.Sub(rec.CreatedAt); life > limit {
+		return fmt.Errorf("%w: it lasts %s, more than %s", ErrAPITokenTTL, life, limit)
+	}
+	if latest := now.Add(limit + apiTokenTTLSkew); rec.ExpiresAt.After(latest) {
+		return fmt.Errorf("%w: it expires %s, after %s", ErrAPITokenTTL, rec.ExpiresAt.UTC().Format(time.RFC3339), latest.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// IsTokenWritePeer reports whether peerID may write API tokens: a node
+// admitted as ingress (a gateway, which takes public token creates and
+// revokes) or a server (peerIsServer: its admitted role, and Raft
+// membership). Token writes come only from servers and gateways, as
+// defense in depth; a worker sends its callers' token writes on to a
+// server with their own credentials (Agent.ForwardToServer). The same rule
+// covers ingress join tokens. A node with no admitted record (a scripted
+// cluster before adopt) passes only as a Raft server.
+func (c *Cluster) IsTokenWritePeer(peerID string) bool {
+	if c == nil || c.fsm == nil {
+		return false
+	}
+	if rec, ok := c.fsm.admittedNode(peerID); ok && rec.Role == JoinRoleIngress {
+		return true
+	}
+	return c.peerIsServer(peerID)
 }
 
 // LookupToken answers the request path on a server node from its own

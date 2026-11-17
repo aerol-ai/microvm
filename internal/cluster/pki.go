@@ -225,8 +225,11 @@ func validKeyHash(s string) bool {
 	return err == nil
 }
 
-// ExtractPeerRole returns the role a node cert was signed for (DNS:role:x),
-// or "" for a cert signed before the join service (cluster-sign-node.sh).
+// ExtractPeerRole returns the role a node cert was signed for: the cluster
+// CA's DNS:role:<role>, or an external-CA certificate's one URI
+// aerolvm-role:<role> (ExtractCertRoles, plan §15.2.1). "" for a cert that
+// names none (one signed before the join service, cluster-sign-node.sh) or
+// more than one URI role.
 func ExtractPeerRole(cert *x509.Certificate) string {
 	if cert == nil {
 		return ""
@@ -235,6 +238,9 @@ func ExtractPeerRole(cert *x509.Certificate) string {
 		if role, ok := strings.CutPrefix(strings.TrimSpace(name), nodeRoleSANprefix); ok && ValidJoinRole(role) {
 			return role
 		}
+	}
+	if roles := ExtractCertRoles(cert); len(roles) == 1 && ValidJoinRole(roles[0]) {
+		return roles[0]
 	}
 	return ""
 }

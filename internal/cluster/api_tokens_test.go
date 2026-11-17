@@ -17,6 +17,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
 // TestAPITokenWritesGate is the rolling-upgrade gate for ops 31/32: a
@@ -340,5 +341,113 @@ func TestAgentAPITokenServerErrors(t *testing.T) {
 	}
 	if _, err := noMembers.ListAPITokens(ctx); err == nil {
 		t.Fatal("no server tier: list fails")
+	}
+}
+
+// TestAPITokenLeaderCapsTheLifetime: the leader refuses a token that
+// outlives its own SB_TOKEN_MAX_TTL (here enterprise mode's 90 days),
+// whatever the node that took the create runs. Before, a record that
+// reached the leader was stored with the lifetime it carried.
+func TestAPITokenLeaderCapsTheLifetime(t *testing.T) {
+	cfg := testClusterConfig(t, "tok-ttl-a", true, nil, fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)), t.TempDir())
+	cfg.TokenMaxTTL = 90 * 24 * time.Hour
+	c, cleanup := newTestClusterFromConfig(t, cfg)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	day := 24 * time.Hour
+	admin := func(name string, created, expires time.Time) identity.TokenRecord {
+		rec := newTokenRecord(t, name, controlplane.FleetTeam, controlplane.RoleAdmin)
+		rec.CreatedAt, rec.ExpiresAt = created, expires
+		return rec
+	}
+	for _, tc := range []struct {
+		name string
+		rec  identity.TokenRecord
+		ok   bool
+	}{
+		{"an admin token expiring in 2200", admin("forged", now, time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)), false},
+		{"91 days", admin("long", now, now.Add(91*day)), false},
+		{"a created_at in the future hiding a far expiry", admin("future", now.Add(10*365*day), now.Add(10*365*day+day)), false},
+		{"exactly 90 days", admin("max", now, now.Add(90*day)), true},
+		{"90 days from a node whose clock is 4 minutes ahead", admin("skew", now.Add(4*time.Minute), now.Add(4*time.Minute+90*day)), true},
+	} {
+		_, err := c.WriteAPIToken(ctx, APITokenWriteRequest{Token: tc.rec})
+		if tc.ok != (err == nil) || (!tc.ok && !errors.Is(err, ErrAPITokenTTL)) {
+			t.Errorf("%s: %v (want stored %v)", tc.name, err, tc.ok)
+		}
+		if _, found, _ := c.LookupToken(tc.rec.ID); found != tc.ok {
+			t.Errorf("%s: stored = %v, want %v", tc.name, found, tc.ok)
+		}
+	}
+	// A revoke carries no lifetime and is never capped.
+	if _, err := c.WriteAPIToken(ctx, APITokenWriteRequest{Delete: true, ID: "tok_aaaaaaaaaaaa"}); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// Replay: an entry already in the log (or a snapshot) from before the
+	// cap applies as it always did, here straight through Raft as a
+	// replayed entry would, and its token keeps working until it expires.
+	tok, err := identitywire.NewAPIToken(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := tok.SecretHash()
+	old := identity.TokenRecord{ID: tok.ID, Name: "before-the-cap", Role: controlplane.RoleViewer, CreatedBy: "operator",
+		CreatedAt: tokenTestEpoch, ExpiresAt: time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC), SecretHash: hash[:]}
+	payload, err := encodeCommand(command{Op: opPutAPIToken, StampUnixNano: time.Now().UnixNano(), APIToken: &old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.applyEncodedLocal(ctx, payload); err != nil {
+		t.Fatalf("a stored long-lived token's entry no longer applies: %v", err)
+	}
+	access, matched, err := identity.NewTokenAuthenticator(c, nil).Authenticate(httptest.NewRequest(http.MethodGet, "/v1/metrics", nil), tok.Plaintext())
+	if !matched || err != nil || !access.ExpiresAt.Equal(old.ExpiresAt) {
+		t.Fatalf("a token stored before the cap stops working: matched=%v err=%v expires=%v", matched, err, access.ExpiresAt)
+	}
+}
+
+// TestIsTokenWritePeer: who may send token writes: a gateway (admitted as
+// ingress) and a server, not a worker. A node with no admitted record
+// passes only as a Raft server.
+func TestIsTokenWritePeer(t *testing.T) {
+	l := newJoinLog(t)
+	for i, n := range []struct{ id, role string }{{"gw-1", JoinRoleIngress}, {"wkr-1", JoinRoleWorker}, {"srv-2", JoinRoleServer}} {
+		_, tok := testJoinToken(t, n.role, 100, time.Hour, true)
+		l.apply(putTokenCmd(tok, 100))
+		if _, ok := l.apply(admitCmd(tok.ID, n.id, n.role, testKey(n.id), int64(101+i))).(JoinAdmitResult); !ok {
+			t.Fatalf("admit %s", n.id)
+		}
+	}
+	noRaft := &Cluster{fsm: l.f}
+	for peer, want := range map[string]bool{"gw-1": true, "wkr-1": false, "srv-2": false, "nobody": false} {
+		if got := noRaft.IsTokenWritePeer(peer); got != want {
+			t.Errorf("without Raft, %s: %v, want %v", peer, got, want)
+		}
+	}
+	if (*Cluster)(nil).IsTokenWritePeer("gw-1") {
+		t.Error("a nil cluster lets a peer write")
+	}
+
+	c, cleanup := newTestCluster(t, "tok-peer-a", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	if !c.IsTokenWritePeer("tok-peer-a") {
+		t.Error("a Raft server with no admitted record (a scripted cluster before adopt) is refused")
+	}
+	if c.IsTokenWritePeer("not-a-member") {
+		t.Error("a node that is neither admitted nor a Raft server may write")
+	}
+}
+
+// The two new verdicts survive the forwarding hops like the FSM's.
+func TestAPITokenWriteOutcomeNewCodes(t *testing.T) {
+	for _, sentinel := range []error{ErrAPITokenTTL, ErrAPITokenWriterRefused} {
+		out := APITokenWriteOutcome(fmt.Errorf("%w: detail", sentinel))
+		if out.Code == "" || !errors.Is(out.err(), sentinel) {
+			t.Errorf("%v: outcome %+v, back %v", sentinel, out, out.err())
+		}
 	}
 }
