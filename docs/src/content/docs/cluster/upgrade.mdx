@@ -96,9 +96,10 @@ On each node, `sandboxd` stops for a few seconds while it swaps its files. The s
 | Attached cloud storage | Keeps working. |
 | The node's API | Down for a few seconds. Calls to that node fail for that time. |
 
-Three things to know:
+Four things to know:
 
 - **Upgrade every worker and ingress node.** The checks between nodes apply in full once all nodes run this release. Until an ingress node or worker is upgraded, adding a custom domain through it, or creating a sandbox with `custom_domains` through it, fails with `403`: send that call to a server. A reservation an earlier leader made waits out its time limit, about 120 seconds. The [node certificates](/cluster/security/#which-nodes-hold-the-admin-token) page has more.
+- **When the upgrade finalizes, the servers start signing.** Two minutes later they sign every new [sandbox token](/sandbox-tokens/) and cloud identity token. Tokens made before that keep working until they expire. From then on, a create that names a [platform volume](/platform-volumes/) goes through a server, so give the servers the same volume settings as the workers before you finalize. A node on an earlier release cannot check the tokens the servers sign, which is one more reason `rollback` stops working at finalize (below).
 - **The first upgrade from a release before v0.7.0** restarts WebAssembly and V8 isolate sandboxes once. A WebAssembly sandbox keeps its files. An isolate starts fresh on its next request. To avoid that, [drain](/cluster/nodes/#empty-a-node) the node first.
 - **The helper inside a running sandbox stays the old one.** Sandboxes you create after the upgrade get the new one.
 

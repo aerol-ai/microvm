@@ -283,6 +283,8 @@ Making a token needs the `sandbox.exec` permission on that sandbox: the `runner`
 
 There is no separate key store for tokens. Each token is signed with an Ed25519 key that every server works out from its **server key** (the key that also seals secrets). Every server of a cluster holds the same server key, so a token made through one server works through every other.
 
+- **In a cluster, only servers sign.** Once every node runs this release, the servers sign tokens with a key only servers hold. A worker or ingress node asks a server to sign each new token, and it checks tokens with the servers' public keys, which it fetches and keeps. The servers start two minutes after the last node is upgraded. Tokens made before then keep working until they expire.
+- **A worker that cannot reach a server** keeps checking tokens with the public keys it already has, so tokens already made keep working. A worker that restarts while no server answers refuses tokens until it reaches one. Making a new token always needs a server.
 - **Key rotation.** After `sandboxd key rotate --promote`, new tokens are signed with the new key and old tokens keep working. Retiring the old key ends every token it signed, so wait at least `SB_SANDBOX_TOKEN_MAX_TTL` after the promote before you retire. See [Key custody](/enterprise/key-custody/).
 - **Key revoke.** If your key store revokes the server key, no token works until the key is back.
 - **Setting.** `SB_SANDBOX_TOKEN_MAX_TTL` caps a token's lifetime. Default `24h`, at most `720h` (30 days).
