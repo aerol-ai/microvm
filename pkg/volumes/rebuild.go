@@ -180,43 +180,42 @@ func platformSourceSegments(m models.MountSpec) ([]string, bool) {
 	return strings.Split(src, "/"), true
 }
 
-// SourceUnderRoot reports whether source is a platform volume's coordinate
-// on backend b: under b's bucket and prefix (s3) or server and export
-// (nfs), followed by exactly a tenant or operator scope and a volume name.
-// A node deletes a volume's bytes only for such a source (the reclaim
-// sweep): a row's source is replicated, and a source anywhere else is not
-// a volume this node's storage holds.
-func SourceUnderRoot(b Backend, source string) bool {
-	var root string
-	switch b.Kind {
-	case BackendS3:
-		if strings.TrimSpace(b.S3Bucket) == "" {
-			return false
-		}
-		root = path.Join(b.S3Bucket, strings.Trim(b.S3Prefix, "/")) + "/"
-	case BackendNFS:
-		if strings.TrimSpace(b.NFSServer) == "" {
-			return false
-		}
-		root = b.NFSServer + ":/"
-		if export := strings.Trim(b.NFSExport, "/"); export != "" {
-			root += export + "/"
-		}
-	default:
+// ReclaimableSource reports whether a node may delete the bytes at source
+// for the deleted volume tenant/name (the reclaim sweep; name may be empty). The source is the
+// volume's own record, frozen when it was made, so a volume made before a
+// prefix or export change is deleted where it lives; it must still be that
+// volume's coordinate (its scope and name last, a clean path) on this
+// node's platform store (its bucket, or its server), as a rebuild mounts it
+// (PlatformMountFromRecord). A source the record names anywhere else is
+// not a volume this node's storage holds.
+func ReclaimableSource(b Backend, tenant, name, source string) bool {
+	if b.Kind != BackendS3 && b.Kind != BackendNFS {
 		return false
 	}
-	rest, ok := strings.CutPrefix(source, root)
-	if !ok || rest == "" || path.Clean(rest) != rest {
+	m := models.MountSpec{Type: models.MountType(b.Kind), Source: source}
+	// On the store, then the scope and name last: an s3 source is the
+	// bucket, then any prefix, then the two; an nfs path, the two at least.
+	segs, ok := platformSourceSegments(m)
+	least := 2
+	if b.Kind == BackendS3 {
+		least = 3
+	}
+	if !ok || len(segs) < least || !onPlatformStore(b, m) {
 		return false
 	}
-	segs := strings.Split(rest, "/")
-	if len(segs) != 2 {
+	scope, vol := segs[len(segs)-2], segs[len(segs)-1]
+	// An entry recorded without its name (an older build's) is matched on
+	// its scope alone.
+	if scope != tenant || (name != "" && vol != name) || !validVolumeScope(scope) {
 		return false
 	}
-	scope, name := segs[0], segs[1]
-	if clean, err := SanitizeVolumeName(name); err != nil || clean != name {
-		return false
-	}
+	clean, err := SanitizeVolumeName(vol)
+	return err == nil && clean == vol
+}
+
+// validVolumeScope reports whether scope is a tenant's (t- and 16 hex) or
+// an operator's.
+func validVolumeScope(scope string) bool {
 	if strings.HasPrefix(scope, operatorScopePrefix) {
 		return ValidateOperatorScope(scope) == nil
 	}

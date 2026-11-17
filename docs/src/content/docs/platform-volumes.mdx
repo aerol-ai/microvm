@@ -247,7 +247,7 @@ On [Kubernetes](/kubernetes/), workers mount nothing until the operator sets the
 How it is laid out and kept safe:
 
 - **Each volume is one folder in the store:** `<bucket>/<prefix>/<account>/<name>` on S3, or `<export>/<account>/<name>` on NFS. The account part is a hash made on the server, so callers cannot pick or guess another account's folder.
-- **A volume's folder is fixed when the volume is made.** If you later change the bucket, prefix or export, existing volumes keep mounting from their old folder, with the current keys.
+- **A volume's folder is fixed when the volume is made.** If you later change the bucket, prefix or export, existing volumes keep mounting from their old folder, with the current keys. Deleting such a volume deletes its files in the old folder too, as long as it is in the bucket or on the NFS server the nodes use now. Files in an old bucket, or on an old NFS server, are left for you to remove.
 - **The store's keys stay on the server.** They are saved encrypted in the server's database with each mount. No read API returns them, and they never enter a sandbox, because the mount runs on the server.
 - **You own and pay for the store.** Set any lifecycle or retention rules on it yourself.
 - **In a cluster, the servers make each volume's record, so they need the same volume settings as the workers.** A record names the volume's folder, and only a server writes one. A create that names a volume and reaches a worker or ingress node goes to a server first, with your own token. The server makes the records, then sends the create on. That takes one extra hop. On [Kubernetes](/kubernetes/), the `SB_PLATFORM_VOLUMES_*` settings you put in `worker.extraEnv` reach the servers too. This starts once every node runs this release.

@@ -191,35 +191,49 @@ func TestRebuildFromRecordStaysOnThePlatformStore(t *testing.T) {
 	}
 }
 
-func TestSourceUnderRoot(t *testing.T) {
+// A deleted volume's bytes are deleted at its own record's source, on this
+// node's platform store: under any prefix or export there (one made before
+// a prefix change), never another bucket or server, and only as that
+// volume's coordinate.
+func TestReclaimableSource(t *testing.T) {
 	tenant := TenantForOwnerRef("team:a")
 	s3 := Backend{Kind: BackendS3, S3Bucket: "vols", S3Prefix: "/pfx/"}
 	nfs := Backend{Kind: BackendNFS, NFSServer: "nfs.local", NFSExport: "/exports"}
-	nfsRoot := Backend{Kind: BackendNFS, NFSServer: "nfs.local", NFSExport: "/"}
 	for _, tc := range []struct {
-		b      Backend
-		source string
-		want   bool
+		b            Backend
+		tenant, name string
+		source       string
+		want         bool
 	}{
-		{s3, "vols/pfx/" + tenant + "/data", true},
-		{s3, "vols/pfx/op-main/data", true},
-		{s3, "vols/pfx/" + tenant, false},
-		{s3, "vols/pfx/" + tenant + "/data/more", false},
-		{s3, "other/pfx/" + tenant + "/data", false},
-		{s3, "vols/pfx/t-xyz/data", false},
-		{s3, "vols/pfx/t-0123456789abcdeg/data", false},
-		{s3, "vols/pfx/../" + tenant + "/data", false},
-		{s3, "vols/pfx/" + tenant + "/Data", false},
-		{s3, "vols/pfx/op-/data", false},
-		{nfs, "nfs.local:/exports/" + tenant + "/data", true},
-		{nfs, "nfs2.internal:/exports/" + tenant + "/data", false},
-		{nfsRoot, "nfs.local:/" + tenant + "/data", true},
-		{Backend{Kind: BackendS3}, "vols/" + tenant + "/data", false},
-		{Backend{Kind: BackendNFS}, "nfs.local:/" + tenant + "/data", false},
-		{Backend{Kind: "rclone"}, "x", false},
+		{s3, tenant, "data", "vols/pfx/" + tenant + "/data", true},
+		{s3, tenant, "data", "vols/pfx-v1/" + tenant + "/data", true},
+		{s3, tenant, "data", "vols/" + tenant + "/data", true},
+		{s3, "op-main", "data", "vols/pfx/op-main/data", true},
+		{s3, tenant, "", "vols/pfx/" + tenant + "/data", true},
+		{s3, tenant, "data", "vols/pfx/" + tenant, false},
+		{s3, tenant, "data", tenant + "/data", false},
+		{Backend{Kind: BackendS3, S3Bucket: "op-main"}, "op-main", "data", "op-main/data", false},
+		{Backend{Kind: BackendS3, S3Bucket: "op-main"}, "op-main", "data", "op-main/op-main/data", true},
+		{s3, tenant, "more", "vols/pfx/" + tenant + "/data/more", false},
+		{s3, tenant, "data", "other/pfx/" + tenant + "/data", false},
+		{s3, tenant, "data", "vols/pfx/" + TenantForOwnerRef("team:b") + "/data", false},
+		{s3, tenant, "data2", "vols/pfx/" + tenant + "/data", false},
+		{s3, "t-xyz", "data", "vols/pfx/t-xyz/data", false},
+		{s3, "t-0123456789abcdeg", "data", "vols/pfx/t-0123456789abcdeg/data", false},
+		{s3, tenant, "data", "vols/pfx/../" + tenant + "/data", false},
+		{s3, tenant, "Data", "vols/pfx/" + tenant + "/Data", false},
+		{s3, "op-", "data", "vols/pfx/op-/data", false},
+		{s3, tenant, "data", "s3://vols/pfx/" + tenant + "/data", false},
+		{nfs, tenant, "data", "nfs.local:/exports/" + tenant + "/data", true},
+		{nfs, tenant, "data", "nfs.local:/old-exports/" + tenant + "/data", true},
+		{nfs, tenant, "data", "nfs.local:/" + tenant + "/data", true},
+		{nfs, tenant, "data", "nfs2.internal:/exports/" + tenant + "/data", false},
+		{Backend{Kind: BackendS3}, tenant, "data", "vols/" + tenant + "/data", false},
+		{Backend{Kind: BackendNFS}, tenant, "data", "nfs.local:/" + tenant + "/data", false},
+		{Backend{Kind: "rclone"}, tenant, "data", "x", false},
 	} {
-		if got := SourceUnderRoot(tc.b, tc.source); got != tc.want {
-			t.Errorf("%s on %+v: %v, want %v", tc.source, tc.b, got, tc.want)
+		if got := ReclaimableSource(tc.b, tc.tenant, tc.name, tc.source); got != tc.want {
+			t.Errorf("%s (%s/%s) on %+v: %v, want %v", tc.source, tc.tenant, tc.name, tc.b, got, tc.want)
 		}
 	}
 }

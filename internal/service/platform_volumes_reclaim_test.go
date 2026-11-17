@@ -147,7 +147,7 @@ func TestStartVolumeReclaimNoOpWithoutReclaimer(t *testing.T) {
 
 // The sweep deletes only a volume's own coordinate on this node's storage:
 // an obligation naming any other source is dropped, its bytes untouched.
-func TestRunVolumeReclaimSkipsSourcesOutsideTheRoot(t *testing.T) {
+func TestRunVolumeReclaimSkipsSourcesOffTheStore(t *testing.T) {
 	s := enabledVolumeService(t)
 	s.logger = slog.Default()
 	fr := &fakeReclaimer{}
@@ -157,14 +157,34 @@ func TestRunVolumeReclaimSkipsSourcesOutsideTheRoot(t *testing.T) {
 		"v-bucket": "other-bucket/" + testVolTenant + "/data",
 		"v-root":   "aerol-volumes/volumes",
 		"v-deep":   "aerol-volumes/volumes/" + testVolTenant + "/data/../../x",
+		"v-name":   "aerol-volumes/volumes/" + testVolTenant + "/other",
+		"v-scope":  "aerol-volumes/volumes/" + volumes.TenantForOwnerRef("team:b") + "/data",
 	} {
-		seedDeletedVolume(t, s, id, id, source)
+		seedDeletedVolume(t, s, id, "data", source)
 	}
 	s.runVolumeReclaim(ctx)
 	if len(fr.calls) != 0 {
 		t.Fatalf("reclaimed %+v", fr.calls)
 	}
 	if pending, _ := s.store.ListPendingVolumeDeletions(ctx); len(pending) != 0 {
+		t.Fatalf("obligations left: %+v", pending)
+	}
+}
+
+// A volume made before the operator moved the prefix is deleted where its
+// own record says it lives, on this node's bucket.
+func TestRunVolumeReclaimAfterAPrefixChange(t *testing.T) {
+	s := enabledVolumeService(t) // bucket aerol-volumes, prefix volumes
+	s.logger = slog.Default()
+	fr := &fakeReclaimer{}
+	s.SetVolumeReclaimer(fr)
+	old := "aerol-volumes/volumes-v1/" + testVolTenant + "/data"
+	seedDeletedVolume(t, s, "v-old-prefix", "data", old)
+	s.runVolumeReclaim(context.Background())
+	if len(fr.calls) != 1 || fr.calls[0].source != old {
+		t.Fatalf("reclaimed %+v, want %s", fr.calls, old)
+	}
+	if pending, _ := s.store.ListPendingVolumeDeletions(context.Background()); len(pending) != 0 {
 		t.Fatalf("obligations left: %+v", pending)
 	}
 }
