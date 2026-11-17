@@ -23,6 +23,7 @@
 #           worker pod are deleted. Passes with zero lost creates, zero
 #           duplicates and every recreate sandbox back.
 # verify    aerolvm k8s verify, every rule (signatures skipped: dev images).
+#           AEROL_BUILD_EDGE=1 builds the edge image (Caddy) too.
 # build2    the same commit's images as <tag>.2: a second version to upgrade
 #           to, for the rollout drill.
 # drills    drills.sh's Phase 3 drills (§19) on this cell, or the named ones.
@@ -113,7 +114,8 @@ build() {
   # In a sed replacement & means "what matched": the presigned URL's own
   # & signs must be escaped, or S3 refuses the mangled URL with 400.
   sed -e "s|@@SOURCE_URL@@|${url//&/\\&}|" -e "s|@@REGISTRY@@|$registry|g" -e "s|@@TAG@@|$tag|g" \
-    -e "s|@@SHA@@|$sha|g" -e "s|@@SHORT@@|$short|g" "$HERE/cell/build-job.yaml" | kubectl apply -f - >/dev/null
+    -e "s|@@SHA@@|$sha|g" -e "s|@@SHORT@@|$short|g" -e "s|@@EDGE@@|${AEROL_BUILD_EDGE:-0}|g" \
+    "$HERE/cell/build-job.yaml" | kubectl apply -f - >/dev/null
   local job="job/images-$short" st=""
   for _ in $(seq 1 120); do
     st="$(kubectl -n aerolvm-build get "$job" -o jsonpath='{.status.succeeded}/{.status.failed}')"

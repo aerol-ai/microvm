@@ -9,8 +9,19 @@ variable "ttl" {
 }
 
 variable "region" {
-  type    = string
-  default = "us-east-1"
+  description = "us-east-1 only: the bank run's prices and account checks are us-east-1's. cluster.sh writes it into run.tfvars.json, so a TF_VAR_region never moves a run."
+  type        = string
+  default     = "us-east-1"
+  validation {
+    condition     = var.region == "us-east-1"
+    error_message = "These runs are us-east-1 only."
+  }
+}
+
+variable "aws_account" {
+  description = "The AWS account cluster.sh up ran in; the provider refuses any other. Empty (an older run) checks nothing."
+  type        = string
+  default     = ""
 }
 
 variable "kubernetes_version" {
@@ -100,4 +111,24 @@ variable "network_policy" {
   description = "Manage the VPC CNI add-on with network policy turned on, so the chart's NetworkPolicies are enforced (the cell). Off, they are ignored."
   type        = bool
   default     = false
+}
+
+# --- The bank drills (eks-bank.sh) ----------------------------------------
+
+variable "bank_drills" {
+  description = "Add the bank drills' AWS side (bank.tf): IRSA, the audit witness and export buckets and their role, and the AWS Load Balancer Controller's role for the internal NLB."
+  type        = bool
+  default     = false
+}
+
+variable "audit_lock_days" {
+  description = "The witness bucket's default GOVERNANCE retention, in days: at least the nodes' audit retention (SB_SECRET_AUDIT_RETENTION_DAYS, 30), or the witness refuses the bucket. GOVERNANCE lets the teardown delete it at once."
+  type        = number
+  default     = 30
+}
+
+variable "teardown_at" {
+  description = "RFC 3339 time at which AWS itself tears the run's compute down (teardown.tf); empty for none. cluster.sh --teardown sets it to the run's TTL."
+  type        = string
+  default     = ""
 }

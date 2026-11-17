@@ -60,6 +60,19 @@ spec:
               (cd operator && CGO_ENABLED=0 go build -trimpath -o "$out/aerolvm-operator" ./cmd/aerolvm-operator)
               CGO_ENABLED=1 go build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=@@TAG@@" \
                 -o "$out/sandboxd" ./cmd/sandboxd
+              # The edge image (enterprise mode's gateways serve the API
+              # through it): the release's Caddy, from the pins install.sh
+              # keeps, as scripts/k8s-dev.sh builds it for kind.
+              if [ "@@EDGE@@" = 1 ]; then
+                pin() { sed -n "s/^$1=\"\(.*\)\"$/\1/p" scripts/install.sh; }
+                GOBIN=/work/bin go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
+                CGO_ENABLED=0 GOOS=linux GOARCH=amd64 /work/bin/xcaddy \
+                  build "$(pin CADDY_BUILD_VERSION)" --output "$out/caddy" \
+                  --with github.com/aerol-ai/microvm/caddymod=./caddymod \
+                  --with "$(pin CADDY_L4_MODULE)" --with "$(pin CADDY_DNS_CLOUDFLARE_MODULE)" \
+                  --with "$(pin CADDY_STORAGE_S3_MODULE)"
+                "$out/caddy" list-modules | grep -qx 'http.reverse_proxy.upstreams.aerolvm_route'
+              fi
               ls -la "$out"
           resources:
             requests: { cpu: "1", memory: 3Gi }
@@ -79,7 +92,9 @@ spec:
                 case "$k" in ''|\#*) continue ;; esac
                 args="$args --opt build-arg:$k=$v"
               done < packaging/images/versions.env
-              for image in aerolvm aerolvm-runtime aerolvm-operator; do
+              images="aerolvm aerolvm-runtime aerolvm-operator"
+              [ "@@EDGE@@" = 1 ] && images="$images aerolvm-edge"
+              for image in $images; do
                 file="${image#aerolvm-}.Dockerfile"
                 [ "$image" = aerolvm ] && file=aerolvm.Dockerfile
                 echo "images: @@REGISTRY@@/$image:@@TAG@@"

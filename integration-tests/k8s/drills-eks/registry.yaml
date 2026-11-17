@@ -1,0 +1,113 @@
+# The drill registry on EKS (drills-eks.sh): registry:2 behind the fault
+# proxy (drills-local/faultproxy.py), which serves HTTPS with a certificate
+# the run's private CA signed. The workers trust that CA through the chart's
+# worker.registryCA, as they would a bank's own registry. Its disk is an EBS
+# volume: the large-layer drill pushes a few GB. Placeholders in @@...@@ are
+# filled by drills-eks.sh.
+apiVersion: v1
+kind: Namespace
+metadata: { name: drills }
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: drills-registry-tls, namespace: drills }
+spec:
+  secretName: drills-registry-tls
+  dnsNames: [drills-registry.drills.svc, drills-registry.drills.svc.cluster.local]
+  privateKey: { algorithm: ECDSA, size: 256 }
+  issuerRef: { name: "@@CA_ISSUER@@", kind: ClusterIssuer }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: drills-registry, namespace: drills }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gp3
+  resources: { requests: { storage: 100Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: drills-registry, namespace: drills }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: drills-registry } }
+  template:
+    metadata: { labels: { app: drills-registry } }
+    spec:
+      containers:
+        - name: registry
+          image: public.ecr.aws/docker/library/registry:2
+          env:
+            - { name: REGISTRY_HTTP_ADDR, value: "127.0.0.1:5000" }
+            - { name: REGISTRY_STORAGE_DELETE_ENABLED, value: "true" }
+          volumeMounts: [{ name: data, mountPath: /var/lib/registry }]
+        - name: faultproxy
+          image: public.ecr.aws/docker/library/python:3.12-slim
+          command: [python, -u, /proxy/faultproxy.py, --upstream, "http://127.0.0.1:5000", --listen, "443",
+                    --control, "5001", --tls-cert, /tls/tls.crt, --tls-key, /tls/tls.key]
+          ports: [{ containerPort: 443 }, { containerPort: 5001 }]
+          readinessProbe: { tcpSocket: { port: 443 } }
+          volumeMounts:
+            - { name: proxy, mountPath: /proxy }
+            - { name: tls, mountPath: /tls, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: drills-registry }
+        - name: proxy
+          configMap: { name: drills-faultproxy }
+        - name: tls
+          secret: { secretName: drills-registry-tls }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: drills-registry, namespace: drills }
+spec:
+  selector: { app: drills-registry }
+  ports:
+    - { name: https, port: 443, targetPort: 443 }
+    - { name: control, port: 5001, targetPort: 5001 }
+---
+# The worker pods reach the registry, as a bank opens its own registry's
+# range: a policy of their own beside the chart's (policies add up).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: drills-registry-egress, namespace: "@@WORKER_NS@@" }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: aerolvm, app.kubernetes.io/component: worker }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: drills } }
+          podSelector: { matchLabels: { app: drills-registry } }
+      ports: [{ protocol: TCP, port: 443 }]
+---
+# The pusher: push.py runs here, inside the cluster, so no image layer
+# crosses this machine's uplink (the large-layer drill pushes gigabytes).
+apiVersion: v1
+kind: Pod
+metadata: { name: drills-pusher, namespace: drills }
+spec:
+  containers:
+    - name: pusher
+      image: public.ecr.aws/docker/library/python:3.12-slim
+      command: [sleep, infinity]
+      # A streamed layer is written to TMPDIR first: the emptyDir, not the
+      # container's own disk.
+      env: [{ name: TMPDIR, value: /work }]
+      resources: { requests: { cpu: "1", memory: 1Gi, ephemeral-storage: 8Gi }, limits: { memory: 2Gi, ephemeral-storage: 12Gi } }
+      volumeMounts:
+        - { name: scripts, mountPath: /drill }
+        - { name: ca, mountPath: /ca }
+        - { name: ecr, mountPath: /ecr }
+        - { name: work, mountPath: /work }
+  volumes:
+    - name: scripts
+      configMap: { name: drills-pusher }
+    - name: ca
+      configMap: { name: drills-registry-ca }
+    - name: ecr
+      secret: { secretName: drills-ecr, optional: true }
+    - name: work
+      emptyDir: {}
