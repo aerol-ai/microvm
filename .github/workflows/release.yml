@@ -615,6 +615,17 @@ jobs:
           cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
           chmod 0755 dist/install.sh dist/uninstall.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
+      # The one-click EKS stack (packaging/eks), installing this release by
+      # default. The mirror job puts it on S3, where CloudFormation can read
+      # it: a "Launch Stack" link must name an S3 URL. Before release.json
+      # and checksums.txt, so both cover it; integration-tests/safety
+      # TestEKSStackVersionDefault keeps the stamp's target line in place.
+      - name: Stamp the EKS stack with this release
+        run: |
+          sed -E 's/^(    Default: )"[^"]*"( # release-version)$/\1"'"${VERSION#v}"'"\2/' \
+            packaging/eks/aerolvm-eks.yaml > dist/aerolvm-eks.yaml
+          grep -qxF "    Default: \"${VERSION#v}\" # release-version" dist/aerolvm-eks.yaml
+
       # release.json says which versions may upgrade straight to this one and
       # what the upgrade changes (plans/kubectl-style-cluster-ops.md §6.5). It
       # is generated from the tagged tree through the pkg/release type, never
@@ -792,6 +803,9 @@ jobs:
             echo "GitHub's latest release is $latest, so aerolvm/latest.txt stays as it is."
             exit 0
           fi
+          # The docs' "Launch Stack" link reads this copy of the EKS stack.
+          aws s3 cp dist/aerolvm-eks.yaml "s3://${MIRROR_BUCKET}/aerolvm/latest/aerolvm-eks.yaml" \
+            --content-type text/yaml --cache-control no-cache --only-show-errors --no-progress
           printf '%s\n' "$VERSION" > latest.txt
           aws s3 cp latest.txt "s3://${MIRROR_BUCKET}/aerolvm/latest.txt" \
             --content-type text/plain --cache-control no-cache --only-show-errors --no-progress
