@@ -73,14 +73,15 @@ func TestPlatformMountFor(t *testing.T) {
 }
 
 // A volume's record gives its location and tenant: a volume made before the
-// operator changed the bucket mounts at the location it was made at, with
-// this node's options; nothing but a record of the sandbox's own tenant (or
-// an operator scope, for an operator's sandbox) that names exactly this
-// mount counts.
+// operator changed the prefix mounts at the location it was made at, with
+// this node's options, in this node's own bucket; nothing but a record of
+// the sandbox's own tenant (or an operator scope, for an operator's
+// sandbox) that names exactly this mount counts. A volume from before a
+// bucket change falls back to the configuration check.
 func TestPlatformMountFromRecord(t *testing.T) {
 	tenant := TenantForOwnerRef("team:a")
 	b := Backend{Kind: BackendS3, S3Bucket: "vols-new", S3Prefix: "p2", S3Region: "eu-west-1"}
-	old := "vols-old/p1/" + tenant + "/data"
+	old := "vols-new/p1/" + tenant + "/data"
 	vol := models.Volume{ID: "v1", Tenant: tenant, Name: "data", Backend: BackendS3, Source: old}
 	att := models.VolumeAttachment{Tenant: tenant, VolumeID: "v1", SandboxID: "sb-1", Target: "/data", Source: old}
 	m := models.MountSpec{Type: models.MountTypeS3, Source: old, Target: "/data", ReadOnly: true, Options: map[string]string{"endpoint": "http://elsewhere.example"}}
@@ -88,7 +89,16 @@ func TestPlatformMountFromRecord(t *testing.T) {
 	if !ok || got.Source != old || got.Target != "/data" || !got.ReadOnly || got.Options["endpoint"] != "" || got.Options["region"] != "eu-west-1" {
 		t.Fatalf("old location: %+v %v", got, ok)
 	}
-	opVol := models.Volume{ID: "v2", Tenant: "op-main", Name: "shared", Backend: BackendS3, Source: "vols-old/p1/op-main/shared"}
+	otherBucket := vol
+	otherBucket.Source = "vols-old/p1/" + tenant + "/data"
+	otherAtt := att
+	otherAtt.Source = otherBucket.Source
+	otherMount := m
+	otherMount.Source = otherBucket.Source
+	if _, ok := PlatformMountFromRecord(b, tenant, otherBucket, otherAtt, otherMount); ok {
+		t.Fatal("a record in another bucket: rebuilt from the record")
+	}
+	opVol := models.Volume{ID: "v2", Tenant: "op-main", Name: "shared", Backend: BackendS3, Source: "vols-new/p1/op-main/shared"}
 	opAtt := models.VolumeAttachment{Tenant: "op-main", VolumeID: "v2", Target: "/shared", Source: opVol.Source}
 	opMount := models.MountSpec{Type: models.MountTypeS3, Source: opVol.Source, Target: "/shared"}
 	if _, ok := PlatformMountFromRecord(b, "", opVol, opAtt, opMount); !ok {
@@ -145,5 +155,38 @@ func TestPlatformMountFromRecord(t *testing.T) {
 	}
 	if _, ok := PlatformMountFromRecord(Backend{Kind: BackendS3}, tenant, legacy, legacyAtt, models.MountSpec{Type: models.MountTypeS3, Source: here, Target: "/data"}); ok {
 		t.Error("a record with no source, on a node with no bucket")
+	}
+}
+
+// A rebuild from a volume's record keeps a volume made before a prefix or
+// export change, but only on this node's own platform store: the record's
+// bucket must be the node's bucket and its NFS server the node's server.
+func TestRebuildFromRecordStaysOnThePlatformStore(t *testing.T) {
+	s3 := Backend{Kind: BackendS3, S3Bucket: "platform-volumes", S3Prefix: "vols",
+		S3AccessKeyID: "AKIANODE", S3SecretAccessKey: "node-secret"}
+	nfs := Backend{Kind: BackendNFS, NFSServer: "nfs.platform", NFSExport: "/exports", NFSOptions: "vers=4.1"}
+
+	for _, tc := range []struct {
+		name string
+		b    Backend
+		vol  models.Volume
+		want bool
+	}{
+		{"s3: another bucket", s3, models.Volume{ID: "v1", Tenant: "op-x", Name: "data", Backend: BackendS3,
+			Source: "other-bucket/any/op-x/data"}, false},
+		{"nfs: another server", nfs, models.Volume{ID: "v2", Tenant: "op-x", Name: "data", Backend: BackendNFS,
+			Source: "10.0.9.9:/srv/other/op-x/data"}, false},
+		// Same store, older prefix or export: still rebuilt from the record.
+		{"s3: same bucket, older prefix", s3, models.Volume{ID: "v3", Tenant: "op-x", Name: "data", Backend: BackendS3,
+			Source: "platform-volumes/old-prefix/op-x/data"}, true},
+		{"nfs: same server, older export", nfs, models.Volume{ID: "v4", Tenant: "op-x", Name: "data", Backend: BackendNFS,
+			Source: "nfs.platform:/old-exports/op-x/data"}, true},
+	} {
+		m := models.MountSpec{Type: models.MountType(tc.vol.Backend), Source: tc.vol.Source, Target: "/data"}
+		att := models.VolumeAttachment{Tenant: tc.vol.Tenant, VolumeID: tc.vol.ID, SandboxID: "sb-w", Source: m.Source, Target: m.Target}
+		out, ok := PlatformMountFromRecord(tc.b, "", tc.vol, att, m)
+		if ok != tc.want {
+			t.Errorf("%s: ok = %v (mount %q), want %v", tc.name, ok, out.Source, tc.want)
+		}
 	}
 }

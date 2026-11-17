@@ -98,7 +98,7 @@ On each node, `sandboxd` stops for a few seconds while it swaps its files. The s
 
 Three things to know:
 
-- **Upgrade every worker and ingress node.** The checks between nodes apply in full once all nodes run this release. Until an ingress node is upgraded, adding a custom domain through it to a sandbox on a worker fails with `403`: send that call to a server. A reservation an earlier leader made waits out its time limit, about 120 seconds. The [node certificates](/cluster/security/#which-nodes-hold-the-admin-token) page has more.
+- **Upgrade every worker and ingress node.** The checks between nodes apply in full once all nodes run this release. Until an ingress node or worker is upgraded, adding a custom domain through it, or creating a sandbox with `custom_domains` through it, fails with `403`: send that call to a server. A reservation an earlier leader made waits out its time limit, about 120 seconds. The [node certificates](/cluster/security/#which-nodes-hold-the-admin-token) page has more.
 - **The first upgrade from a release before v0.7.0** restarts WebAssembly and V8 isolate sandboxes once. A WebAssembly sandbox keeps its files. An isolate starts fresh on its next request. To avoid that, [drain](/cluster/nodes/#empty-a-node) the node first.
 - **The helper inside a running sandbox stays the old one.** Sandboxes you create after the upgrade get the new one.
 

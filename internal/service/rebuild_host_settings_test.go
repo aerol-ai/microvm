@@ -245,7 +245,8 @@ func TestRecreateRunsWithoutHostPowers(t *testing.T) {
 }
 
 // A platform volume rebuilds from its record: a volume made before the
-// operator changed the bucket mounts where it was made, and an operator's
+// operator changed the prefix mounts where it was made, in this node's own
+// bucket, and an operator's
 // volume rebuilds on a node with no operator token or pinned scope. A
 // mount no record of this sandbox's incarnation names falls back to this
 // node's configuration; a record that cannot be read is retried, not
@@ -253,7 +254,7 @@ func TestRecreateRunsWithoutHostPowers(t *testing.T) {
 func TestRebuildPlatformMountsFromRecords(t *testing.T) {
 	const owner = "team:payments"
 	tenant := volumes.TenantForOwnerRef(owner)
-	old := "vols-old/p0/" + tenant + "/data"
+	old := "vols/p0/" + tenant + "/data"
 	vol := models.Volume{ID: "v1", Tenant: tenant, Name: "data", Backend: config.PlatformVolumesBackendS3, Source: old}
 	att := models.VolumeAttachment{Tenant: tenant, VolumeID: "v1", SandboxID: "sb-v", IncarnationID: "inc-v", Target: "/data", Source: old}
 	oldMount := models.MountSpec{Type: models.MountTypeS3, Source: old, Target: "/data"}
@@ -266,7 +267,7 @@ func TestRebuildPlatformMountsFromRecords(t *testing.T) {
 	}
 	got, err := rebuild(t, owner, &scriptedVolumeMeta{forSandbox: []models.VolumeAttachment{att}, byID: &vol}, oldMount)
 	if err != nil || got.Mounts[0].Source != old || got.Mounts[0].Options["region"] != "eu-west-1" {
-		t.Fatalf("a volume made before the bucket changed: %+v %v", got.Mounts, err)
+		t.Fatalf("a volume made before the prefix changed: %+v %v", got.Mounts, err)
 	}
 
 	opVol := models.Volume{ID: "v2", Tenant: "op-other", Name: "shared", Backend: config.PlatformVolumesBackendS3, Source: "vols/pfx/op-other/shared"}

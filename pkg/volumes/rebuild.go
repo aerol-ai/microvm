@@ -126,11 +126,32 @@ func PlatformMountFromRecord(b Backend, tenant string, vol models.Volume, att mo
 	if !ok || len(segs) < 2 || segs[len(segs)-2] != vol.Tenant || segs[len(segs)-1] != vol.Name {
 		return models.MountSpec{}, false
 	}
+	// The record keeps a volume made before a prefix or export change, but
+	// never another bucket or server: the node's own platform store only.
+	// A volume made before the bucket or server itself changed falls back
+	// to the configuration check, as one with no record does.
+	if !onPlatformStore(b, m) {
+		return models.MountSpec{}, false
+	}
 	out, err := BuildMountSpecForSource(b, src, m.Target, m.ReadOnly)
 	if err != nil {
 		return models.MountSpec{}, false
 	}
 	return out, true
+}
+
+// onPlatformStore reports whether m names this node's platform store: for
+// s3 the configured bucket, for nfs the configured server.
+func onPlatformStore(b Backend, m models.MountSpec) bool {
+	switch m.Type {
+	case models.MountTypeS3:
+		bucket, _, _ := strings.Cut(m.Source, "/")
+		return b.S3Bucket != "" && bucket == b.S3Bucket
+	case models.MountTypeNFS:
+		server, _, ok := strings.Cut(m.Source, ":/")
+		return ok && b.NFSServer != "" && server == b.NFSServer
+	}
+	return false
 }
 
 // platformSourceSegments splits a platform mount's source into its path
