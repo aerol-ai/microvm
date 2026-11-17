@@ -30,7 +30,7 @@ No cloud secret is stored in AerolVM, in the sandbox, or in your code.
 
 ## What you need
 
-- **An AerolVM server with a public HTTPS address.** Your cloud downloads the public keys from it. The operator sets `SB_IDENTITY_ISSUER_URL` to that address, for example `https://api.example.com`, on every server. The address must use HTTPS and have no path. To check it, open `https://api.example.com/.well-known/openid-configuration` in a browser. You should see a short JSON page.
+- **An AerolVM server with a public HTTPS address.** Your cloud downloads the public keys from it. The operator sets `SB_IDENTITY_ISSUER_URL` to that address, for example `https://api.example.com`, on every node of the cluster: servers, gateways and workers. On Kubernetes, set the chart value `cloudIdentity.issuerURL` instead. The address must use HTTPS and have no path. To check it, open `https://api.example.com/.well-known/openid-configuration` in a browser. You should see a short JSON page.
 - **An admin.** Only an admin can choose which role tags a team may use.
 - **A container or Firecracker sandbox.** Docker, containerd, gVisor and Firecracker sandboxes can have an identity. WASM and V8 isolate sandboxes cannot, because they have no file a cloud SDK could read.
 

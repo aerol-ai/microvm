@@ -32,6 +32,7 @@ Where every node keeps its [audit evidence](/enterprise/audit-evidence/) off the
 | `audit.credentials.serviceAccount` | IRSA: `create: true` makes the service account `<release>-node` in each namespace a node runs in, with your `annotations` (`eks.amazonaws.com/role-arn`), and runs every node under it. The role reaches each pod's AerolVM server container only. That account has no Kubernetes rights. With `cluster.agentSandboxAPI` the gateways keep their own account, `<cluster>-gateway`, which has that API's rights and gets the same annotations: trust it in the role too. EKS Pod Identity is not supported. | off |
 | `audit.credentials.existingSecret` | Or a Secret with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, in each namespace a node runs in. | none |
 | `audit.credentials.caBundle` | `existingConfigMap` and `key`: the CA certificate of a private S3 endpoint, in each namespace a node runs in. | none |
+| `cloudIdentity.issuerURL` | Turn on [sandbox cloud identity](/sandbox-cloud-identity/) on every node: the HTTPS address, with no path, your clouds fetch the public keys from, such as `https://api.example.com`. In cluster mode the servers sign the tokens and the gateways serve the keys, so do not set `SB_IDENTITY_ISSUER_URL` in `worker.extraEnv`. A pod reads it when it is made. | none |
 
 ## Worker pods
 

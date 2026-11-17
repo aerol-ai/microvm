@@ -140,6 +140,16 @@ audit:
       existingConfigMap: ""
       key: ca.crt
 
+# Sandbox cloud identity (SB_IDENTITY_ISSUER_URL; docs: Sandbox cloud
+# identity): the HTTPS address, with no path, your clouds fetch AerolVM's
+# public keys from, such as https://api.example.com. Empty turns it off. In
+# cluster mode the servers sign each sandbox's token and the gateways serve
+# the public keys, so every node takes this one value; worker.extraEnv
+# reaches workers only and is refused for it. A pod reads it when it is
+# made, as identity.enabled.
+cloudIdentity:
+  issuerURL: ""
+
 worker:
   # The runtime container's budget is the sandboxes' budget: every sandbox
   # runs in its cgroup (C7), capped below this limit with a reserve kept for

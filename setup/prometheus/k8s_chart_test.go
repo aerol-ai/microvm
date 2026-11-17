@@ -1026,6 +1026,81 @@ func TestKubernetesChartIdentityAndScrapeToken(t *testing.T) {
 	}
 }
 
+// The settings a server needs once the servers sign. cloudIdentity.issuerURL
+// reaches every role: the servers sign each sandbox's cloud-identity token,
+// the gateways serve the public keys, the workers take the creates.
+// worker.extraEnv may not set it for the workers alone in cluster mode, and
+// an issuer sandboxd refuses at boot does not render. The
+// SB_PLATFORM_VOLUMES_* settings in worker.extraEnv reach the servers, which
+// make platform-volume records, and not the gateways.
+func TestKubernetesChartServerSigningSettings(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	with := func(sets ...string) []string { return append(append([]string{}, cluster...), sets...) }
+	const url = "https://api.example.test"
+	issuerOn := `SB_IDENTITY_ISSUER_URL, value: "` + url + `"`
+
+	for _, tc := range []struct {
+		sets []string
+		want bool
+	}{{nil, false}, {[]string{"cloudIdentity.issuerURL=" + url}, true}} {
+		docs, err := renderChart(t, root, helm, with(tc.sets...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		templates := podTemplates(t, docs)
+		for _, role := range []string{"server", "gateway", "worker"} {
+			if got := strings.Contains(templates[role], issuerOn); got != tc.want {
+				t.Errorf("cloud identity %v: the %s template carries the issuer = %v", tc.sets, role, got)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		set, want string
+	}{
+		{"worker.extraEnv.SB_IDENTITY_ISSUER_URL=" + url, "Remove it, and set cloudIdentity.issuerURL."},
+		{"cloudIdentity.issuerURL=http://api.example.test", "not an HTTPS address with no path"},
+		{"cloudIdentity.issuerURL=" + url + "/v1", "not an HTTPS address with no path"},
+	} {
+		if _, err := renderChart(t, root, helm, with(tc.set)...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("cluster mode with %s: %v; want a refusal naming %q", tc.set, err, tc.want)
+		}
+	}
+	// An empty one turns nothing on: cluster mode lets it be.
+	if _, err := renderChart(t, root, helm, with("worker.extraEnv.SB_IDENTITY_ISSUER_URL=")...); err != nil {
+		t.Errorf("cluster mode refused an empty worker.extraEnv.SB_IDENTITY_ISSUER_URL: %v", err)
+	}
+
+	// Single mode: the value reaches the worker; worker.extraEnv alone still
+	// works as before; both at once is refused.
+	for _, set := range []string{"cloudIdentity.issuerURL=" + url, "worker.extraEnv.SB_IDENTITY_ISSUER_URL=" + url} {
+		docs, err := renderChart(t, root, helm, set)
+		if err != nil || !envHas(dig(docsOfKind(docs, "StatefulSet")[0], "spec", "template", "spec", "containers"), "SB_IDENTITY_ISSUER_URL", url) {
+			t.Errorf("single mode with %s: the worker has no issuer (%v)", set, err)
+		}
+	}
+	if _, err := renderChart(t, root, helm, "cloudIdentity.issuerURL="+url, "worker.extraEnv.SB_IDENTITY_ISSUER_URL="+url); err == nil ||
+		!strings.Contains(err.Error(), "set twice") {
+		t.Errorf("single mode: the issuer set twice rendered: %v", err)
+	}
+
+	docs, err := renderChart(t, root, helm, with("worker.extraEnv.SB_PLATFORM_VOLUMES_ENABLED=true", "worker.extraEnv.SB_PLATFORM_VOLUMES_S3_BUCKET=vols")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	templates := podTemplates(t, docs)
+	for role, want := range map[string]bool{"server": true, "gateway": false, "worker": true} {
+		if got := strings.Contains(templates[role], `SB_PLATFORM_VOLUMES_S3_BUCKET, value: "vols"`); got != want {
+			t.Errorf("the %s template carries the platform-volume settings = %v, want %v", role, got, want)
+		}
+	}
+}
+
 // envHas reports whether any container in containers sets name to value.
 func envHas(containers any, name, value string) bool {
 	list, _ := containers.([]any)
