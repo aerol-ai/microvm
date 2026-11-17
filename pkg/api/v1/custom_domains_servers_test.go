@@ -51,8 +51,8 @@ func TestCustomDomainCallsGoToServers(t *testing.T) {
 			}()
 			return rr.Code, len(rec.sent) > sent
 		}
-		if code, sent := call("/v1/sandboxes/sb-1/custom-domains", `{"hostname":"app.customer.com"}`, nil); !sent || code != http.StatusTeapot {
-			t.Errorf("%s attach: %d sent=%v", role, code, sent)
+		if code, sent := call("/v1/sandboxes/sb-1/custom-domains", `{"hostname":"app.customer.com"}`, nil); !sent || code != http.StatusTeapot || rec.sent[len(rec.sent)-1] != "once POST /v1/sandboxes/sb-1/custom-domains" {
+			t.Errorf("%s attach: %d sent=%v %v", role, code, sent, rec.sent)
 		}
 		if _, sent := call("/v1/sandboxes/sb-1/custom-domains", `{"hostname":"app.customer.com"}`, map[string]string{cluster.HeaderForwarded: "1"}); sent {
 			t.Errorf("%s: the owner's half of an attach went back to a server", role)

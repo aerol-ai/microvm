@@ -19,8 +19,9 @@ import (
 // with the caller's own credential, on to a server, which authenticates
 // the caller itself.
 
-// ErrNoServerForward is a token write a worker could not hand to a server.
-var ErrNoServerForward = errors.New("cluster: no server to send the token write to")
+// ErrNoServerForward is a call a worker or gateway could not hand to a
+// server.
+var ErrNoServerForward = errors.New("cluster: no server to send the call to")
 
 // ServerClientForPeer is ClientForPeer that also requires the peer's
 // certificate to name the server role (DNS:role:server). A caller's

@@ -43,12 +43,18 @@ type serverForwarder interface {
 // viaServers sends the call on to a server when this node holds no Raft
 // state and when(r) says so; otherwise next serves it here.
 func (h *handlers) viaServers(when func(*http.Request) bool, next http.Handler) http.Handler {
+	return h.viaServersWith(when, false, next)
+}
+
+// viaServersWith is viaServers; once makes a server's 5xx the caller's
+// answer instead of a reason to try the next server (sendToServerWith).
+func (h *handlers) viaServersWith(when func(*http.Request) bool, once bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.deps.Service == nil || !h.deps.Service.SendsOperatorCallsToServers() || (when != nil && !when(r)) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		h.sendToServer(w, r, "this call")
+		h.sendToServerWith(w, r, "this call", once)
 	})
 }
 
