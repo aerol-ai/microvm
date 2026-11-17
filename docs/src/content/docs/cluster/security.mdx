@@ -32,6 +32,12 @@ Keep each of them like a password: in a password manager or an encrypted store. 
 
 If someone breaks into a worker or ingress node, they do not get your admin token. They do get the Cloudflare token, and the key that opens stored secrets, unless you use [wrapped key custody](/enterprise/key-custody/). The node's own `SB_PAT_TOKEN`, in `/etc/sandboxd/sandboxd.env`, is a random token for that node alone. It works only for tools on that machine.
 
+A node's certificate gets only what its role needs:
+
+- **A server or mixed node's certificate** can do what the admin token can. Those nodes hold the admin token anyway.
+- **A worker or ingress node's certificate** reaches only the calls nodes make to each other, plus a few reads: who is in the cluster, and which server leads. A node may also drain, read or remove itself, and carry the SSH sessions its SSH gateway opens for a sandbox's key holder. Everything else it asks for as itself is refused with `403`.
+- **When you send an operator call to a worker or ingress node,** such as making a join token or draining another node, it passes the call on to a server with your own token. The server checks your token and records you as the caller.
+
 There is one exception. While any node still runs a release before v0.7.0, every new worker and ingress node gets the admin token. Once every node runs v0.7.0 or later, fix those nodes. On each one, run `sudo sandboxd reset --yes`, then join it again with a new join command. It then holds the fingerprint of the admin token, not the token.
 
 ## Join tokens
