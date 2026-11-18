@@ -132,13 +132,13 @@ func TestStaleCopyReadAgainWhileServersDoNotSign(t *testing.T) {
 		t.Fatal(err)
 	}
 	ageMirror(t, worker, 10*time.Minute)
-	before := wk.fetches
+	before := wk.fetchCount()
 	tok, err := worker.IssueSandboxToken(teamCtx("a"), "sb-1", models.CreateSandboxTokenRequest{ExpiresIn: "30m"})
 	if err != nil {
 		t.Fatalf("an idle worker could not sign while servers do not: %v", err)
 	}
-	if wk.fetches != before+1 {
-		t.Fatalf("the stale copy was not read again: %d reads", wk.fetches-before)
+	if got := wk.fetchCount(); got != before+1 {
+		t.Fatalf("the stale copy was not read again: %d reads", got-before)
 	}
 	if _, err := server.VerifySandboxToken(tok.Token); err != nil {
 		t.Fatalf("its token = %v", err)
@@ -164,7 +164,7 @@ func TestStaleCopyWithNoServerAssumesServersMaySign(t *testing.T) {
 	turnOffSigningFor(t, worker)
 	ageMirror(t, worker, 10*time.Minute)
 	read := worker.serverSigning.mirror.fetchedAt
-	wk.feedErr = errors.New("no server answers")
+	wk.setFeedErr(errors.New("no server answers"))
 	earliest := read.Add(signingKeysStaleOff)
 	ring := func(iat time.Time) string {
 		raw, _, _ := sandboxtoken.Sign(worker.cipher, sandboxtoken.Claims{TokenID: mustTokenID(t), SandboxID: "sb-1", Owner: "team:a",
@@ -199,7 +199,7 @@ func TestSSHBridgeGateWhenTheModeIsUnknown(t *testing.T) {
 	}
 	turnOnServerSigning(t, server, now)
 	worker.serverSigning.mirror = nil
-	wk.feedErr = errors.New("no server answers")
+	wk.setFeedErr(errors.New("no server answers"))
 	if err := worker.CheckSSHBridgeKey(ctx, "sb-ssh", ""); !errors.Is(err, ErrSSHBridgeKey) {
 		t.Fatalf("a key-less bridged call with the mode unknown = %v", err)
 	}
@@ -338,8 +338,8 @@ func TestWorkerReadsTheFeedFromBoot(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	cancel()
-	if wk.fetches < 1 {
-		t.Fatalf("fetches = %d", wk.fetches)
+	if got := wk.fetchCount(); got < 1 {
+		t.Fatalf("fetches = %d", got)
 	}
 	single, _, _ := testTokenService(t, time.Hour)
 	single.StartServerSigningUpkeep(context.Background())
@@ -430,7 +430,7 @@ func TestTokensWhereEveryServerNamesNoRole(t *testing.T) {
 		}
 		ageMirror(t, worker, 10*time.Minute)
 	}
-	if wk.fetches < 3 {
-		t.Fatalf("the worker read the feed %d times", wk.fetches)
+	if got := wk.fetchCount(); got < 3 {
+		t.Fatalf("the worker read the feed %d times", got)
 	}
 }

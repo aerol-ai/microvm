@@ -10,6 +10,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 func TestOwnerTableMutations(t *testing.T) {
@@ -148,15 +149,15 @@ func TestIngressIndexIncrementalUpdates(t *testing.T) {
 // A failed bind must not leak the other socket, or a retry can never
 // succeed ("address already in use" on our own leaked TCP listener).
 func TestResponderListenAndServeReleasesPortsOnFailureAndCancel(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
+	// The test frees this port and binds it again several times. A ":0"
+	// pick comes from the ephemeral range, where any other socket can take
+	// it in between; on a busy machine the old pick often found the UDP
+	// side taken and skipped the test. testport's port sits below that
+	// range and goes to no other test.
+	addr := testport.UDPAddr(t)
 	held, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		t.Skipf("udp %s busy: %v", addr, err)
+		t.Fatalf("hold udp %s: %v", addr, err)
 	}
 	r := newTestResponder()
 	if err := r.ListenAndServe(context.Background(), addr); err == nil {
@@ -204,4 +205,40 @@ func TestResponderListenAndServeReleasesPortsOnFailureAndCancel(t *testing.T) {
 			t.Fatalf("%s port not released after cancel: %v", network, err)
 		}
 	}
+}
+
+// When one server fails, serve returns its error, and only after the other
+// server has returned too, so the UDP port is free. serve has already read
+// the failed server's error, so it must wait for one more: waiting for two
+// would hang here.
+func TestServeReturnsAServerErrorAndReleasesTheOtherPort(t *testing.T) {
+	addr := testport.UDPAddr(t)
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	// A closed listener makes the TCP server's first Accept fail, while the
+	// UDP server runs normally.
+	_ = ln.Close()
+	done := make(chan error, 1)
+	go func() { done <- newTestResponder().serve(context.Background(), pc, ln) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the TCP server failed")
+		}
+	case <-time.After(5 * time.Second):
+		_ = pc.Close()
+		t.Fatal("serve did not return after the TCP server failed")
+	}
+	again, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatalf("udp port not released after a server failed: %v", err)
+	}
+	_ = again.Close()
 }
