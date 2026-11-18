@@ -157,6 +157,8 @@ setup_token() {
   ( umask 077; jf "$made" 'd["token"]' | tr -d '\n' > "$sd/token" )
 }
 
+# The steps drills_step runs (drills_main sends it only these).
+drills_own_steps="large-layers ecr-push ecr-storm thresholds fill unfill shard-routes teardown"
 drills_step() {
   case "$1" in
     large-layers) step_large_layers ;;
@@ -222,10 +224,14 @@ ecr_secret() {
     --dry-run=client -o yaml | kc apply -f - >/dev/null
   # A secret volume refreshes within a kubelet sync: wait until the pusher
   # and the client both hold the new token.
-  local _
+  # Each copy is read whole, then compared in the shell: no grep -q on a
+  # pipe (an early exit ends the writer, and pipefail makes that a miss),
+  # and the token never in a process's arguments.
+  local _ auth reg
   for _ in $(seq 1 36); do
-    [[ "$(kc -n drills exec drills-pusher -- cat /ecr/auth 2>/dev/null)" == "AWS:$pw" ]] &&
-      kc -n drills exec drills-client -- cat /ecr/registry.json 2>/dev/null | grep -qF -f <(printf '%s\n' "$pw") && return 0
+    auth="$(kc -n drills exec drills-pusher -- cat /ecr/auth 2>/dev/null || true)"
+    reg="$(kc -n drills exec drills-client -- cat /ecr/registry.json 2>/dev/null || true)"
+    [[ "$auth" == "AWS:$pw" && "$reg" == *"$pw"* ]] && return 0
     sleep 5
   done
   say "the ECR token did not reach the drill pods in 3 minutes"
@@ -262,7 +268,11 @@ step_ecr_push() {
 # in their errors (verdicts.py ecr). ECR not throttling is INCONCLUSIVE.
 step_ecr_storm() {
   keep_forward monitoring svc/kube-prometheus-stack-prometheus "$prom_port" 9090 /-/healthy
-  [[ -f "$sd/ecr-run" ]] || step_ecr_push
+  # Not `[[ -f ... ]] || step_ecr_push`: under || bash ignores set -e in the
+  # step, and a failed push would carry on to a PASS.
+  if [[ ! -f "$sd/ecr-run" ]]; then
+    step_ecr_push
+  fi
   local out="$sd/evidence/ecr-storm" run n layers i images=() t0 t1 r after mins rl rlq after_ok v
   read -r run n layers < "$sd/ecr-run"
   ecr_secret

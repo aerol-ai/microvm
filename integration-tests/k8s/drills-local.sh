@@ -190,6 +190,8 @@ step_teardown() {
   say "registry and proxy removed; the kind cluster: AEROL_KIND_CLUSTER=$kind_cluster scripts/k8s-dev.sh down"
 }
 
+# The steps drills_step runs (drills_main sends it only these).
+drills_own_steps="teardown"
 drills_step() {
   case "$1" in
     teardown) step_teardown ;;

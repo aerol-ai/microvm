@@ -314,9 +314,10 @@ YAML
   want=$(( $(kc -n "$ns" get pods -l app.kubernetes.io/name=aerolvm --no-headers | wc -l) + \
     $(kc -n "$workers" get pods -l app.kubernetes.io/name=aerolvm --no-headers | wc -l) ))
   for _ in $(seq 1 60); do
-    up="$(curl -fsS "http://127.0.0.1:$prom_port/api/v1/targets?state=active" | python3 -c '
+    # A Prometheus that does not answer yet counts 0 up, and the wait goes on.
+    up="$(curl -fsS "http://127.0.0.1:$prom_port/api/v1/targets?state=active" 2>/dev/null | python3 -c '
 import json, sys
-print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"].get("aerolvm_component") and t["health"] == "up"))')"
+print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"].get("aerolvm_component") and t["health"] == "up"))' 2>/dev/null || echo 0)"
     [[ "$up" -ge "$want" ]] && break
     sleep 10
   done
@@ -339,7 +340,8 @@ step_static() {
   for a in "${drilled_alerts[@]}"; do
     expr="$(awk -v a="$a" '$0 ~ "alert: "a"$" {f=1; next} f && /expr:/ {sub(/.*expr: */, ""); print; exit}' "$ROOT/setup/prometheus/sandboxd-alerts.yml")"
     for m in $(grep -oE 'aerolvm_[a-z0-9_]+' <<<"$expr" | sort -u); do
-      reg="$(grep -rlE "\"$m\"" --include='*.go' "$ROOT/cmd" "$ROOT/internal" "$ROOT/pkg" | grep -v _test.go | head -1 || true)"
+      reg="$(grep -rlE "\"$m\"" --include='*.go' "$ROOT/cmd" "$ROOT/internal" "$ROOT/pkg" | grep -v _test.go || true)"
+      reg="$(head -1 <<<"$reg")"
       comps="$(prom query "count by (aerolvm_component) ($m)" | tr '\n' ' ')"
       echo "$a | $expr | $m | registered: ${reg#"$ROOT/"} | scraped: ${comps:-none}" >> "$out/static.txt"
       if [[ -z "$reg" ]]; then
@@ -649,7 +651,8 @@ step_slo_breach() {
   for size in 8 4 2 1; do
     refused=0
     for _ in $(seq 1 14); do
-      code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $size, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+      # A call that fails on the way (kubectl exec) counts as a refusal.
+      code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $size, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
       if [[ "$code" == 201 ]]; then
         n=$((n + 1)) refused=0
       else
@@ -669,9 +672,9 @@ step_slo_breach() {
     admitting="$(api GET /v1/cluster/members | python3 -c '
 import json, sys
 d = json.load(sys.stdin)["body"] or {}
-print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") and (m.get("capacity") or {}).get("can_admit")))')"
+print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") and (m.get("capacity") or {}).get("can_admit")))' 2>/dev/null || true)"
     [[ "$admitting" == 0 ]] && break
-    code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": 1, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+    code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": 1, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
     [[ "$code" == 201 ]] && n=$((n + 1))
     sleep 5
   done
@@ -724,10 +727,10 @@ print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") a
 }
 
 # drills_main <script> <step>...: the steps both clusters share; anything
-# else goes to drills_step, the calling script's own (teardown on kind).
-# drills_step returns 127 for a step it does not know. drills_begin, if the
-# caller defines it, runs first (drills-eks.sh: the fault proxy's control
-# port, which a later run of the script needs again).
+# else goes to drills_step, the calling script's own (teardown on kind),
+# which drills_own_steps names. A step that fails ends the script (set -e).
+# drills_begin, if the caller defines it, runs first (drills-eks.sh: the
+# fault proxy's control port, which a later run of the script needs again).
 drills_main() {
   local script="$1" step rc; shift
   if declare -F drills_begin >/dev/null; then drills_begin "$@"; fi
@@ -738,8 +741,14 @@ drills_main() {
       pull-storm) step_pull_storm ;;
       slo-breach) step_slo_breach ;;
       *)
-        rc=0; drills_step "$step" || rc=$?
-        if [[ "$rc" == 127 ]]; then echo "$script: unknown step $step" >&2; exit 2; fi ;;
+        # The caller's own steps, as its drills_own_steps lists them. Called
+        # plainly, never under ||, && or if: bash ignores set -e in anything
+        # run there, so a failed push or create would carry on to a PASS.
+        if [[ " ${drills_own_steps:-} " != *" $step "* ]]; then
+          echo "$script: unknown step $step" >&2
+          exit 2
+        fi
+        drills_step "$step" ;;
     esac
   done
 }
