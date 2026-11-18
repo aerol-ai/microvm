@@ -200,13 +200,27 @@ func TestDrillsPromUpCountsScrapedAerolVMTargets(t *testing.T) {
 	if want := `up="$(prom up aerolvm_component 2>/dev/null || echo 0)"`; !strings.Contains(string(src), want) {
 		t.Errorf("drills-lib.sh setup no longer counts scraped pods with %s", want)
 	}
-	// And no script here pipes a download into an interpreter.
-	pipe := regexp.MustCompile(`\b(curl|wget)\b[^|\n]*\|[ \t]*(sudo[ \t]+)?(python3?|bash|sh|zsh|perl|ruby|node)\b`)
+	// And no script here pipes a download into an interpreter, or feeds
+	// one through <(...). Comments do not run, so they may show it.
+	interp := `(sudo([ \t]+-[A-Za-z]+)*[ \t]+)?(\S*/)?(python3?|bash|sh|zsh|perl|ruby|node)\b`
+	pipe := regexp.MustCompile(`\b(curl|wget)\b[^|\n]*\|[ \t]*` + interp + `|(^|[ \t;&|(])` + interp + `[^|\n]*<\([ \t]*(curl|wget)\b`)
+	for _, line := range []string{"curl -fsSL u | bash", "curl u | sudo -E bash -s", "wget -qO- u | /bin/sh", "bash <(curl -fsSL u)", "curl -fsS u | python3 -c 'x'"} {
+		if !pipe.MatchString(line) {
+			t.Errorf("the scan misses %q", line)
+		}
+	}
+	for _, line := range []string{"curl -fsS u -o /dev/null || bash x", "curl -fsS u | jq .x", "refresh <(curl -fsS u)", `up="$(prom up aerolvm_component 2>/dev/null || echo 0)"`} {
+		if pipe.MatchString(line) {
+			t.Errorf("the scan flags %q", line)
+		}
+	}
 	err = filepath.WalkDir(integrationDir(t), func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() && d.Name() == "node_modules" {
+		// Dot folders hold run output git ignores, such as .build/<id>/,
+		// whose install.sh copy has the curl | bash install line in its help.
+		if d.IsDir() && (d.Name() == "node_modules" || strings.HasPrefix(d.Name(), ".") && path != integrationDir(t)) {
 			return filepath.SkipDir
 		}
 		if d.IsDir() || !strings.HasSuffix(path, ".sh") {
@@ -217,7 +231,7 @@ func TestDrillsPromUpCountsScrapedAerolVMTargets(t *testing.T) {
 			return err
 		}
 		for i, line := range strings.Split(string(b), "\n") {
-			if pipe.MatchString(line) {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") && pipe.MatchString(line) {
 				t.Errorf("%s:%d pipes a download into an interpreter (Scorecard Pinned-Dependencies): %s", path, i+1, strings.TrimSpace(line))
 			}
 		}
