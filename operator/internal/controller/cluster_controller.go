@@ -335,11 +335,15 @@ func (r *ClusterReconciler) ensureServices(ctx context.Context, c *v1.AerolClust
 		}
 		gw.Spec.Selector = map[string]string{LabelCluster: c.Name, LabelComponent: v1.RoleGateway}
 		// With the edge, the gateways' Caddy serves the API and the
-		// sandbox links on 443 (and 80 for redirects). Without it nothing
-		// listens there, so the Service carries sandboxd's own API port
-		// instead, for in-cluster clients and a port-forward.
+		// sandbox links on 443 only: like a domain install on a VM, it
+		// sends no redirect from 80, so a port 80 here would lead nowhere
+		// and fail a load balancer's health checks. Without the edge
+		// nothing listens on 443, so the Service carries sandboxd's own
+		// API port instead, for in-cluster clients and a port-forward.
+		// Setting the whole list also drops 80 from a Service an older
+		// operator made.
 		if c.Spec.Edge.Domain != "" {
-			gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("http", 80), port("ssh", 2220)}
+			gw.Spec.Ports = []corev1.ServicePort{port("https", 443), port("ssh", 2220)}
 		} else {
 			gw.Spec.Ports = []corev1.ServicePort{port("api", APIPort), port("ssh", 2220)}
 		}

@@ -31,9 +31,9 @@ shareProcessNamespace: true
 {{- end }}
 {{- if $root.Values.edge.enabled }}
 # The edge container is not root, and Kubernetes gives a non-root
-# container no ambient capabilities, so ports 80 and 443 are opened
-# to every user in the pod's network instead (a namespaced sysctl
-# Kubernetes counts as safe).
+# container no ambient capabilities, so port 443 is opened to every
+# user in the pod's network instead (a namespaced sysctl Kubernetes
+# counts as safe).
 securityContext:
   sysctls:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
@@ -300,7 +300,7 @@ containers:
       - { name: SB_L4_TLS_LISTEN, value: ":443" }
       - { name: SB_L4_TLS_FALLBACK, value: "127.0.0.1:8443" }
       - { name: SB_TLS_CERT_WATCH_FILE, value: /etc/aerolvm/tls/tls.crt }
-      # The internet reaches 80 and 443 through the edge Service, and
+      # The internet reaches 443 through the edge Service, and
       # so does a sandbox's traffic to the public name; the pod's own
       # ports stay closed to sandboxes (C24).
       - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
@@ -381,7 +381,6 @@ containers:
         drop: ["ALL"]
     ports:
       - { name: https, containerPort: 443 }
-      - { name: http, containerPort: 80 }
     resources:
       {{- toYaml $root.Values.edge.resources | nindent 6 }}
     volumeMounts:

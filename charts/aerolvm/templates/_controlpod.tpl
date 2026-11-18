@@ -35,7 +35,7 @@ securityContext:
   fsGroup: 65532
   seccompProfile: { type: RuntimeDefault }
   {{- if $edge }}
-  # The edge binds 80 and 443 as a non-root user: a namespaced sysctl
+  # The edge binds 443 as a non-root user: a namespaced sysctl
   # Kubernetes counts as safe, allowed under `restricted`.
   sysctls:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
@@ -174,7 +174,6 @@ containers:
       capabilities: { drop: ["ALL"] }
     ports:
       - { name: https, containerPort: 443 }
-      - { name: http, containerPort: 80 }
     resources:
       {{- toYaml $root.Values.edge.resources | nindent 6 }}
     volumeMounts:
