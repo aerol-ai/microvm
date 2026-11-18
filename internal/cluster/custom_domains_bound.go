@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"crypto/x509"
+	"net/http"
 	"strings"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -75,4 +77,24 @@ func ContextWithCustomDomainsBound(ctx context.Context, b CustomDomainsBound) co
 func CustomDomainsBoundFromContext(ctx context.Context) (CustomDomainsBound, bool) {
 	b, ok := ctx.Value(customDomainsBoundKey{}).(CustomDomainsBound)
 	return b, ok
+}
+
+// SentOnByNonServer reports whether r is a call a worker or gateway sent on
+// to this node with the caller's credential (Agent.ForwardToServer): a
+// forward over a verified mTLS connection from a peer whose role is not
+// server. A server it reaches is then the call's edge, which routes it,
+// and not the owner's half of it, which only a server sends.
+func SentOnByNonServer(c Client, r *http.Request) bool {
+	if r == nil || r.Header.Get(HeaderForwarded) != "1" {
+		return false
+	}
+	peer, err := AuthenticatedPeerNodeID(r)
+	if err != nil {
+		return false
+	}
+	var leaf *x509.Certificate
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		leaf = r.TLS.PeerCertificates[0]
+	}
+	return PeerRole(c, peer, leaf) != JoinRoleServer
 }

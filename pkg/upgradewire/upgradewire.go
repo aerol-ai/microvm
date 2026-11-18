@@ -38,6 +38,15 @@ const (
 	// ClusterLeaderTransferPath: POST hands Raft leadership to another
 	// voter (LeaderTransferRequest) and answers LeaderTransferResponse.
 	ClusterLeaderTransferPath = "/v1/cluster/leader/transfer"
+	// ClusterUpgradeSigningPath: GET answers ServerSigningStatus, whether
+	// only servers sign sandbox tokens and cloud-identity tokens yet (from
+	// cluster version 22). ...SigningStartPath starts it past members that
+	// report an older version, or none; ...SigningEndOldTokensPath ends
+	// every sandbox token signed before it, at once. Both take an empty
+	// body, answer the status, and are recorded in the audit log.
+	ClusterUpgradeSigningPath             = "/v1/cluster/upgrade/signing"
+	ClusterUpgradeSigningStartPath        = "/v1/cluster/upgrade/signing/start"
+	ClusterUpgradeSigningEndOldTokensPath = "/v1/cluster/upgrade/signing/end-old-tokens"
 
 	// NodeUpgradePath is the single-node route (no cluster mode): POST
 	// starts an upgrade of this node (NodeUpgradeRequest) and answers 202
@@ -194,6 +203,29 @@ type Rollout struct {
 	// is finalized, so two builds of one tree share it.
 	ActiveFSMOpsVersion int           `json:"active_fsm_ops_version,omitempty"`
 	Nodes               []RolloutNode `json:"nodes"`
+}
+
+// ServerSigningStatus is ClusterUpgradeSigningPath's answer.
+type ServerSigningStatus struct {
+	// On: only servers sign sandbox tokens and cloud-identity tokens.
+	On bool `json:"on"`
+	// Since is when a token signed the old way, if issued from then on,
+	// stopped counting; one issued before counts until it expires, or
+	// until OldTokensEnd.
+	Since *time.Time `json:"since,omitempty"`
+	// OldTokensEnd is when every token signed the old way stopped
+	// counting (end-old-tokens), whenever it was issued.
+	OldTokensEnd *time.Time `json:"old_tokens_end,omitempty"`
+	// ActiveFSMOpsVersion is the active cluster version's op number;
+	// NeedsFSMOpsVersion the one servers sign from.
+	ActiveFSMOpsVersion int `json:"active_fsm_ops_version"`
+	NeedsFSMOpsVersion  int `json:"needs_fsm_ops_version"`
+	// Waiting names the live members that report an older version, or
+	// none. Before servers sign they may hold it back (Blocked says when);
+	// after, they still need upgrading.
+	Waiting []string `json:"waiting,omitempty"`
+	// Blocked is why the leader does not start it yet, when it does not.
+	Blocked string `json:"blocked,omitempty"`
 }
 
 // RolloutNode is one node's progress.

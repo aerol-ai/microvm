@@ -2,7 +2,6 @@ package v1
 
 import (
 	"bytes"
-	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -37,18 +36,10 @@ func isForward(r *http.Request) bool {
 // edge, which binds the name and routes the call to the owner, and not the
 // owner's half of it, which only a server sends.
 func (h *handlers) sentOnToThisServer(r *http.Request) bool {
-	if !isForward(r) || h.deps.Service == nil || !h.deps.Service.BindsCustomDomainsForCallers() {
+	if h.deps.Service == nil || !h.deps.Service.BindsCustomDomainsForCallers() {
 		return false
 	}
-	peer, err := cluster.AuthenticatedPeerNodeID(r)
-	if err != nil {
-		return false
-	}
-	var leaf *x509.Certificate
-	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-		leaf = r.TLS.PeerCertificates[0]
-	}
-	return cluster.PeerRole(h.deps.Service.Cluster(), peer, leaf) != cluster.JoinRoleServer
+	return cluster.SentOnByNonServer(h.deps.Service.Cluster(), r)
 }
 
 // attachGoesToServer: a worker's or gateway's domain attach goes to a
@@ -60,8 +51,15 @@ func (h *handlers) attachGoesToServer(r *http.Request) bool {
 // createGoesToServer reports whether this worker or gateway sends a create
 // to a server: one with custom_domains that no node placed yet.
 func (h *handlers) createGoesToServer(r *http.Request, req models.CreateSandboxRequest) bool {
-	return len(req.CustomDomains) > 0 && h.deps.Service != nil && h.deps.Service.SendsOperatorCallsToServers() &&
-		strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) == "" && !isForward(r)
+	if h.deps.Service == nil || !h.deps.Service.SendsOperatorCallsToServers() ||
+		strings.TrimSpace(r.Header.Get(clustercreate.HeaderTarget)) != "" || isForward(r) {
+		return false
+	}
+	// Once servers sign, a cloud identity in a placement's spec is what a
+	// server signs the sandbox's tokens from, so only a server puts one
+	// there (cluster peer_proposals.go): a create that asks for one goes
+	// to a server too. Only such a create reads the signing mode.
+	return len(req.CustomDomains) > 0 || (req.Identity != nil && h.deps.Service.ServerSigningOn())
 }
 
 // asEdge returns r as this server's own edge call when a worker or gateway

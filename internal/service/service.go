@@ -556,6 +556,10 @@ type Service struct {
 	// identity is the cloud-identity issuer state: signing keys, the lazy
 	// bootstrap latch and in-flight token pushes (identity.go).
 	identity identityState
+	// serverSigning is this node's view of the signing only servers do:
+	// a server's opened seed and keys, a worker's mirror of the public
+	// keys (server_signing.go).
+	serverSigning serverSigningState
 
 	// Warm-pool entries (warm_pools.go). warmPoolStore replaces the backend
 	// in tests; nil picks the store or the cluster. warmPoolTargets are this

@@ -54,7 +54,14 @@ type KeyRecord struct {
 	// RetiredUnixNano is when a rotation replaced this key; 0 while it is
 	// the active key.
 	RetiredUnixNano int64 `json:"retired_unix_nano,omitempty"`
+	// Seal names what sealed the private key: SealServer for the key only
+	// servers hold (secrets.ServerSealer), empty for the server key ring
+	// every node holds.
+	Seal string `json:"seal,omitempty"`
 }
+
+// SealServer marks a key sealed with the servers' own key.
+const SealServer = "server"
 
 // Active reports whether r is the key that signs.
 func (r KeyRecord) Active() bool { return r.RetiredUnixNano == 0 }

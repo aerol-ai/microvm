@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -106,6 +107,10 @@ var errIdentityToolboxTooOld = errors.New("this sandbox's toolboxd is too old to
 // errIdentityRoleRemoved is a sandbox whose role tag was taken off its
 // owner's allow list after it was created: it gets no new token.
 var errIdentityRoleRemoved = errors.New("the role tag was removed from the allow list; no new token")
+
+// ErrIdentityRoleRemoved is errIdentityRoleRemoved for the API layer: a
+// server's refusal to sign for a tag no longer allowed (410).
+var ErrIdentityRoleRemoved = errIdentityRoleRemoved
 
 // pushIdentityTokenSoon delivers a token to one sandbox in the background,
 // retrying while its toolbox comes up (the first token after a create, and
@@ -219,16 +224,9 @@ func (s *Service) pushIdentityToken(ctx context.Context, sb *models.Sandbox, row
 	if err := s.identityRoleStillAllowed(ctx, sb.OwnerRef, row.RoleTag); err != nil {
 		return err
 	}
-	signer, err := s.currentIdentitySigner(ctx)
+	tok, err := s.signIdentityToken(ctx, sb, row)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errIdentitySign, err)
-	}
-	tok, err := signer.signer.Issue(cloudidentity.IssueRequest{
-		Issuer: s.cfg.IdentityIssuerURL, OwnerRef: sb.OwnerRef, SandboxID: sb.ID,
-		RoleTag: row.RoleTag, Audience: row.Audience, Now: s.identityNow(), Rand: s.identity.rand,
-	})
-	if err != nil {
-		return fmt.Errorf("%w: %v", errIdentitySign, err)
+		return err
 	}
 	if err := s.deliverIdentityToken(ctx, sb, tok.Raw); err != nil {
 		return err
@@ -240,6 +238,34 @@ func (s *Service) pushIdentityToken(ctx context.Context, sb *models.Sandbox, row
 	identityTokensIssued.Add(why, 1)
 	s.recordIdentityTokenIssued(sb, row.RoleTag, tok)
 	return nil
+}
+
+// signIdentityToken signs sb's token: here, until servers sign or on a
+// server; else by a server, which builds the claims from the sandbox's
+// placement and checks this node owns it (SignIdentityTokenFor).
+func (s *Service) signIdentityToken(ctx context.Context, sb *models.Sandbox, row store.SandboxIdentity) (cloudidentity.Token, error) {
+	if agent, ok := s.Cluster().(signingFeedCluster); ok && s.currentSigningMode().on {
+		resp, err := agent.SignIdentityToken(ctx, cluster.IdentityTokenSignRequest{SandboxID: sb.ID, IncarnationID: sb.AuditIncarnationID})
+		switch {
+		case errors.Is(err, cluster.ErrIdentityRoleGone):
+			return cloudidentity.Token{}, errIdentityRoleRemoved
+		case err != nil:
+			return cloudidentity.Token{}, fmt.Errorf("%w: a server did not sign: %v", errIdentitySign, err)
+		}
+		return cloudidentity.Token{Raw: resp.Token, KeyID: resp.KeyID, Claims: resp.Claims}, nil
+	}
+	signer, err := s.currentIdentitySigner(ctx)
+	if err != nil {
+		return cloudidentity.Token{}, fmt.Errorf("%w: %v", errIdentitySign, err)
+	}
+	tok, err := signer.signer.Issue(cloudidentity.IssueRequest{
+		Issuer: s.cfg.IdentityIssuerURL, OwnerRef: sb.OwnerRef, SandboxID: sb.ID,
+		RoleTag: row.RoleTag, Audience: row.Audience, Now: s.identityNow(), Rand: s.identity.rand,
+	})
+	if err != nil {
+		return cloudidentity.Token{}, fmt.Errorf("%w: %v", errIdentitySign, err)
+	}
+	return tok, nil
 }
 
 var (
@@ -424,6 +450,10 @@ func (s *Service) resealIdentityKeys(ctx context.Context, count func(uint32, boo
 	if s.identity.backend == nil && !s.ClusterEnabled() && s.store == nil {
 		return nil
 	}
+	if !s.mayMakeIdentityKeys() {
+		// Servers keep the keys once they sign (server_signing.go).
+		return nil
+	}
 	backend := s.identityBackend()
 	set, err := backend.ReadIdentityKeys(ctx)
 	if err != nil {
@@ -442,6 +472,10 @@ func (s *Service) resealIdentityKeys(ctx context.Context, count func(uint32, boo
 	next := set.Clone()
 	var moved []uint32
 	for i, k := range next.Keys {
+		if k.Seal == cloudidentity.SealServer {
+			// Sealed with the servers' own key, not the ring.
+			continue
+		}
 		out, from, changed, err := s.cipher.Reseal(k.SealedPrivate, cloudidentity.SealAAD(k.ID))
 		switch {
 		case errors.Is(err, secrets.ErrKeyRevoked):

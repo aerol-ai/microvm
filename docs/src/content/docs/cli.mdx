@@ -242,6 +242,8 @@ aerolvm upgrade apply v0.7.0 --wait
 | Finish the nodes in progress and start no more | `aerolvm upgrade stop` |
 | Put every node back on the old version | `aerolvm upgrade rollback --wait` |
 | Keep new features off until you say so | `aerolvm upgrade apply v0.7.0 --hold`, later `aerolvm upgrade finalize` |
+| See whether only servers sign tokens yet, and what holds it back | `aerolvm upgrade signing` |
+| End the tokens made before the servers signed | `aerolvm upgrade signing end-old-tokens` |
 
 **No internet on the nodes?** Pull the release into one file on a machine that has internet, carry it over, and upgrade from it:
 

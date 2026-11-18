@@ -153,7 +153,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 		// Idempotency-Key replays on a retry; one without may not run
 		// twice, so a server's 5xx is the answer.
 		keyed := strings.TrimSpace(r.Header.Get(clustercreate.HeaderIdempotencyKey)) != ""
-		h.sendToServerWith(w, r, "a create with custom domains", !keyed)
+		h.sendToServerWith(w, r, "a create with custom domains or a cloud identity", !keyed)
 		return
 	}
 	r = withIdempotencyKey(r)

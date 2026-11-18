@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -230,6 +231,16 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
+	}
+	// The SSH gateway's key check (service/ssh_bridge_key.go): the answer
+	// for the key it offers, and to a node no key.
+	offered := strings.TrimSpace(r.Header.Get(auditlog.SSHOfferedKeyHeader))
+	if offered != "" {
+		ok, _ := h.deps.Service.SSHKeyMatches(r.Context(), sandbox.ID, offered)
+		w.Header().Set(auditlog.SSHKeyMatchHeader, strconv.FormatBool(ok))
+	}
+	if access, ok := controlplane.AccessFromContext(r.Context()); ok && access.NodeLimited() && !h.deps.Service.KeepsSSHKeyFrom(offered != "") {
+		sandbox.SSHPublicKey = ""
 	}
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }

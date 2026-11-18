@@ -81,7 +81,8 @@ namespace's (servers, gateways, the operator) and the workers. */ -}}
 {{/*
 API tokens and the settings that go with them, on every node of the install
 alike: identity.enabled, identity.tokenMaxTTL, identity.file and
-enterprise.enabled. A node with tokens off refuses every token, so a cluster
+enterprise.enabled; and cloudIdentity.issuerURL, which the servers sign
+sandbox tokens for and the gateways serve the public keys of. A node with tokens off refuses every token, so a cluster
 that had them on its workers alone (worker.extraEnv, the only way before)
 answered a scrape token 401 on its servers and gateways (issue #1343), and a
 cap or an identity file there bound workers only, which take no token write.
@@ -94,14 +95,15 @@ switch turns nothing on and passes), nor beside its chart value.
 {{- $file := $identity.file | default dict }}
 {{- $fileOn := or $file.content $file.existingConfigMap }}
 {{- $env := .Values.worker.extraEnv | default dict }}
-{{- $values := dict "SB_IDENTITY_ENABLED" "identity.enabled" "SB_TOKEN_MAX_TTL" "identity.tokenMaxTTL" "SB_IDENTITY_FILE" "identity.file" "SB_ENTERPRISE_MODE" "enterprise.enabled" }}
-{{- $set := dict "SB_IDENTITY_ENABLED" $identity.enabled "SB_TOKEN_MAX_TTL" $identity.tokenMaxTTL "SB_IDENTITY_FILE" $fileOn "SB_ENTERPRISE_MODE" $enterprise.enabled }}
+{{- $issuer := (.Values.cloudIdentity | default dict).issuerURL | default "" | toString | trim }}
+{{- $values := dict "SB_IDENTITY_ENABLED" "identity.enabled" "SB_TOKEN_MAX_TTL" "identity.tokenMaxTTL" "SB_IDENTITY_FILE" "identity.file" "SB_ENTERPRISE_MODE" "enterprise.enabled" "SB_IDENTITY_ISSUER_URL" "cloudIdentity.issuerURL" }}
+{{- $set := dict "SB_IDENTITY_ENABLED" $identity.enabled "SB_TOKEN_MAX_TTL" $identity.tokenMaxTTL "SB_IDENTITY_FILE" $fileOn "SB_ENTERPRISE_MODE" $enterprise.enabled "SB_IDENTITY_ISSUER_URL" $issuer }}
 {{- range $key, $value := $values }}
 {{- if hasKey $env $key }}
 {{- $given := index $env $key | toString | trim }}
 {{- /* A false value (strconv.ParseBool's, which sandboxd reads with) of a
-switch turns nothing on, so cluster mode lets it be. */}}
-{{- $off := and (has $key (list "SB_IDENTITY_ENABLED" "SB_ENTERPRISE_MODE")) (has $given (list "false" "False" "FALSE" "0" "f" "F")) }}
+switch, or an empty issuer, turns nothing on, so cluster mode lets it be. */}}
+{{- $off := or (and (has $key (list "SB_IDENTITY_ENABLED" "SB_ENTERPRISE_MODE")) (has $given (list "false" "False" "FALSE" "0" "f" "F"))) (and (eq $key "SB_IDENTITY_ISSUER_URL") (eq $given "")) }}
 {{- if and (not $off) (ne $.Values.mode "single") }}
 {{- fail (printf "worker.extraEnv.%s (%s) reaches workers only, so servers and gateways would not match it: in cluster mode it is set for every node with %s. Remove it, and set %s." $key $given $value $value) }}
 {{- end }}
@@ -109,6 +111,11 @@ switch turns nothing on, so cluster mode lets it be. */}}
 {{- fail (printf "%s is set twice: keep %s and remove worker.extraEnv.%s." $key $value $key) }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- /* sandboxd refuses at boot an issuer that is not an HTTPS address
+with no path (cloudidentity.ValidateIssuerURL): every pod would crash. */}}
+{{- if and $issuer (not (regexMatch "^https://[^/?#@[:space:]]+/?$" $issuer)) }}
+{{- fail (printf "cloudIdentity.issuerURL %q is not an HTTPS address with no path, such as https://api.example.com: every node would refuse to start." $issuer) }}
 {{- end }}
 {{- if and $fileOn (not $identity.enabled) }}
 {{- fail "identity.file needs identity.enabled=true: with API tokens off, sandboxd never reads the identity file." }}
@@ -146,6 +153,9 @@ its Go units. */}}
 {{- end }}
 {{- if $enterprise.enabled }}
 - { name: SB_ENTERPRISE_MODE, value: "true" }
+{{- end }}
+{{- with $issuer }}
+- { name: SB_IDENTITY_ISSUER_URL, value: {{ . | quote }} }
 {{- end }}
 {{- end -}}
 

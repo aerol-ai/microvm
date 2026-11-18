@@ -9,7 +9,12 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
+
+// testVolTenant is a tenant scope as volumes.TenantScope makes one: the
+// reclaim sweep deletes only sources shaped like a volume's.
+var testVolTenant = volumes.TenantForOwnerRef("team:a")
 
 type fakeReclaimer struct {
 	mu    sync.Mutex
@@ -34,10 +39,10 @@ func (f *fakeReclaimer) Reclaim(_ context.Context, backend, source string) error
 func seedDeletedVolume(t *testing.T, s *Service, id, name, source string) {
 	t.Helper()
 	ctx := context.Background()
-	if err := s.store.CreateVolume(ctx, &models.Volume{ID: id, Tenant: "t-a", Name: name, Backend: "s3", Source: source}); err != nil {
+	if err := s.store.CreateVolume(ctx, &models.Volume{ID: id, Tenant: testVolTenant, Name: name, Backend: "s3", Source: source}); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := s.store.DeleteVolumeIfUnattached(ctx, "t-a", id, ""); err != nil {
+	if err := s.store.DeleteVolumeIfUnattached(ctx, testVolTenant, id, ""); err != nil {
 		t.Fatalf("DeleteVolumeIfUnattached: %v", err)
 	}
 }
@@ -49,11 +54,11 @@ func TestRunVolumeReclaimDeletesBackendThenLedger(t *testing.T) {
 	s.SetVolumeReclaimer(fr)
 	ctx := context.Background()
 
-	seedDeletedVolume(t, s, "v1", "data", "aerol-volumes/volumes/t-a/data")
+	seedDeletedVolume(t, s, "v1", "data", "aerol-volumes/volumes/"+testVolTenant+"/data")
 
 	s.runVolumeReclaim(ctx)
 
-	if len(fr.calls) != 1 || fr.calls[0].source != "aerol-volumes/volumes/t-a/data" {
+	if len(fr.calls) != 1 || fr.calls[0].source != "aerol-volumes/volumes/"+testVolTenant+"/data" {
 		t.Fatalf("reclaimer calls = %+v, want one for the source", fr.calls)
 	}
 	pending, _ := s.store.ListPendingVolumeDeletions(ctx)
@@ -69,10 +74,10 @@ func TestRunVolumeReclaimSkipsLiveSource(t *testing.T) {
 	s.SetVolumeReclaimer(fr)
 	ctx := context.Background()
 
-	source := "aerol-volumes/volumes/t-a/data"
+	source := "aerol-volumes/volumes/" + testVolTenant + "/data"
 	seedDeletedVolume(t, s, "v-old", "data", source)
 	// Recreate the same name → new live row pointing at the same source.
-	if _, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: "v-new", Tenant: "t-a", Name: "data", Backend: "s3", Source: source}, 0); err != nil {
+	if _, _, err := s.store.GetOrCreateVolume(ctx, &models.Volume{ID: "v-new", Tenant: testVolTenant, Name: "data", Backend: "s3", Source: source}, 0); err != nil {
 		t.Fatalf("recreate: %v", err)
 	}
 
@@ -118,7 +123,7 @@ func TestRunVolumeReclaimKeepsLedgerWhenDeleteStillApplying(t *testing.T) {
 func TestRunVolumeReclaimRetainsRowOnFailure(t *testing.T) {
 	s := enabledVolumeService(t)
 	s.logger = slog.Default()
-	source := "aerol-volumes/volumes/t-a/data"
+	source := "aerol-volumes/volumes/" + testVolTenant + "/data"
 	fr := &fakeReclaimer{fail: map[string]error{source: errors.New("backend down")}}
 	s.SetVolumeReclaimer(fr)
 	ctx := context.Background()
@@ -138,4 +143,48 @@ func TestStartVolumeReclaimNoOpWithoutReclaimer(t *testing.T) {
 	s.logger = slog.Default()
 	// No reclaimer wired → must not panic or start anything.
 	s.StartVolumeReclaim(context.Background())
+}
+
+// The sweep deletes only a volume's own coordinate on this node's storage:
+// an obligation naming any other source is dropped, its bytes untouched.
+func TestRunVolumeReclaimSkipsSourcesOffTheStore(t *testing.T) {
+	s := enabledVolumeService(t)
+	s.logger = slog.Default()
+	fr := &fakeReclaimer{}
+	s.SetVolumeReclaimer(fr)
+	ctx := context.Background()
+	for id, source := range map[string]string{
+		"v-bucket": "other-bucket/" + testVolTenant + "/data",
+		"v-root":   "aerol-volumes/volumes",
+		"v-deep":   "aerol-volumes/volumes/" + testVolTenant + "/data/../../x",
+		"v-name":   "aerol-volumes/volumes/" + testVolTenant + "/other",
+		"v-scope":  "aerol-volumes/volumes/" + volumes.TenantForOwnerRef("team:b") + "/data",
+	} {
+		seedDeletedVolume(t, s, id, "data", source)
+	}
+	s.runVolumeReclaim(ctx)
+	if len(fr.calls) != 0 {
+		t.Fatalf("reclaimed %+v", fr.calls)
+	}
+	if pending, _ := s.store.ListPendingVolumeDeletions(ctx); len(pending) != 0 {
+		t.Fatalf("obligations left: %+v", pending)
+	}
+}
+
+// A volume made before the operator moved the prefix is deleted where its
+// own record says it lives, on this node's bucket.
+func TestRunVolumeReclaimAfterAPrefixChange(t *testing.T) {
+	s := enabledVolumeService(t) // bucket aerol-volumes, prefix volumes
+	s.logger = slog.Default()
+	fr := &fakeReclaimer{}
+	s.SetVolumeReclaimer(fr)
+	old := "aerol-volumes/volumes-v1/" + testVolTenant + "/data"
+	seedDeletedVolume(t, s, "v-old-prefix", "data", old)
+	s.runVolumeReclaim(context.Background())
+	if len(fr.calls) != 1 || fr.calls[0].source != old {
+		t.Fatalf("reclaimed %+v, want %s", fr.calls, old)
+	}
+	if pending, _ := s.store.ListPendingVolumeDeletions(context.Background()); len(pending) != 0 {
+		t.Fatalf("obligations left: %+v", pending)
+	}
 }

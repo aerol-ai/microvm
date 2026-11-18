@@ -3,6 +3,7 @@ package sshgateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -43,7 +44,8 @@ func newForwardID() string { return uuid.NewString()[:8] }
 // caller collapses to "permission denied" without leaking which step failed.
 func (g *Gateway) authorizeRemoteSSH(ctx context.Context, sandboxID, mode, sessionName string, key ssh.PublicKey) (*ssh.Permissions, bool) {
 	forwardID := newForwardID()
-	remote, err := g.fetchRemoteSandbox(ctx, sandboxID, forwardID)
+	fingerprint := ssh.FingerprintSHA256(key)
+	remote, match, err := g.fetchRemoteSandbox(ctx, sandboxID, forwardID, fingerprint)
 	if err != nil || remote == nil {
 		g.logger.Info("ssh auth: remote owner lookup failed", "sandbox_id", sandboxID, "forward_id", forwardID, "error", err)
 		return nil, false
@@ -56,7 +58,17 @@ func (g *Gateway) authorizeRemoteSSH(ctx context.Context, sandboxID, mode, sessi
 		g.logger.Info("ssh auth: remote sandbox has no shell", "sandbox_id", sandboxID, "forward_id", forwardID, "error", err)
 		return nil, false
 	}
-	if authErr := authorizeKey(remote.SSHPublicKey, key); authErr != nil {
+	// An owner that knows the offered-key header answers whether it is the
+	// sandbox's key and sends no key; an older owner sends the key, and the
+	// check is made here as before.
+	authErr := authorizeKey(remote.SSHPublicKey, key)
+	if match != "" {
+		authErr = nil
+		if match != "true" {
+			authErr = errSSHKeyMismatch
+		}
+	}
+	if authErr != nil {
 		g.logger.Info("ssh auth: remote sandbox not authorized", "sandbox_id", sandboxID, "forward_id", forwardID, "error", authErr)
 		return nil, false
 	}
@@ -66,6 +78,7 @@ func (g *Gateway) authorizeRemoteSSH(ctx context.Context, sandboxID, mode, sessi
 			"mode":         mode,
 			"session_name": sessionName,
 			"remote":       "1",
+			"key_fp":       fingerprint,
 		},
 	}, true
 }
@@ -75,14 +88,17 @@ func (g *Gateway) authorizeRemoteSSH(ctx context.Context, sandboxID, mode, sessi
 // owner and returns its sandbox row (which includes ssh_public_key + status).
 // A 404 (unknown sandbox) or any non-2xx yields a nil sandbox and no error so
 // the caller treats it as a clean auth failure.
-func (g *Gateway) fetchRemoteSandbox(ctx context.Context, sandboxID, forwardID string) (*models.Sandbox, error) {
+func (g *Gateway) fetchRemoteSandbox(ctx context.Context, sandboxID, forwardID, fingerprint string) (*models.Sandbox, string, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	endpoint := g.remoteBaseURL + "/v1/sandboxes/" + url.PathEscape(sandboxID)
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	if fingerprint != "" {
+		req.Header.Set(auditlog.SSHOfferedKeyHeader, fingerprint)
 	}
 	if g.remotePAT != "" {
 		req.Header.Set("Authorization", "Bearer "+g.remotePAT)
@@ -92,18 +108,18 @@ func (g *Gateway) fetchRemoteSandbox(ctx context.Context, sandboxID, forwardID s
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Not found / not ours / not ready — not an authorization for this key.
-		return nil, nil
+		return nil, "", nil
 	}
 	var sandbox models.Sandbox
 	if err := json.NewDecoder(resp.Body).Decode(&sandbox); err != nil {
-		return nil, fmt.Errorf("decode remote sandbox: %w", err)
+		return nil, "", fmt.Errorf("decode remote sandbox: %w", err)
 	}
-	return &sandbox, nil
+	return &sandbox, resp.Header.Get(auditlog.SSHKeyMatchHeader), nil
 }
 
 // bridgedSession is one remote session channel's attribution. Every call
@@ -120,10 +136,13 @@ type bridgedSession struct {
 	session      string
 	ownerRecords bool
 	opened       atomic.Bool
+	// keyFingerprint is the key the client proved it holds: the owner
+	// checks every bridged call against the sandbox's key.
+	keyFingerprint string
 }
 
 func (b *bridgedSession) attest(h http.Header) {
-	call := auditlog.SSHGatewayCall{SandboxID: b.sandboxID}
+	call := auditlog.SSHGatewayCall{SandboxID: b.sandboxID, KeyFingerprint: b.keyFingerprint}
 	if b.ownerRecords && b.opened.CompareAndSwap(false, true) {
 		call.Open, call.Session = true, b.session
 	}
@@ -139,7 +158,7 @@ func (b *bridgedSession) attest(h http.Header) {
 // to an owner that would drop the marker. Either way the session gets
 // exactly one record, and the call to decide is an in-process gate read.
 func (g *Gateway) bridgeSession(ctx context.Context, sandboxID, mode, sessionName string) *bridgedSession {
-	b := &bridgedSession{sandboxID: sandboxID, session: sessionRecordTarget(mode, sessionName)}
+	b := &bridgedSession{sandboxID: sandboxID, session: sessionRecordTarget(mode, sessionName), keyFingerprint: bridgeKeyFrom(ctx)}
 	if o, ok := g.svc.(OwnerSessionRecorder); ok && o.SSHSessionsRecordedByOwner() {
 		b.ownerRecords = true
 		return b
@@ -311,4 +330,21 @@ func httpToWS(u string) string {
 	default:
 		return u
 	}
+}
+
+// errSSHKeyMismatch is an owner's answer that the offered key is not the
+// sandbox's.
+var errSSHKeyMismatch = errors.New("the offered key is not the sandbox's key")
+
+type bridgeKeyCtx struct{}
+
+// withBridgeKey carries the fingerprint of the key an SSH connection
+// authenticated with to the sessions it bridges.
+func withBridgeKey(ctx context.Context, fingerprint string) context.Context {
+	return context.WithValue(ctx, bridgeKeyCtx{}, fingerprint)
+}
+
+func bridgeKeyFrom(ctx context.Context) string {
+	fp, _ := ctx.Value(bridgeKeyCtx{}).(string)
+	return fp
 }

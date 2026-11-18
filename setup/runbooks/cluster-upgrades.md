@@ -83,7 +83,39 @@ build). It gets no new sandboxes, and if it is a server it is kept out of
 Raft so it never replays an op it cannot apply. Upgrade it with
 `sudo sandboxd upgrade node <version>` (or `install.sh`), or delete it.
 It joins Raft and placement again by itself once it runs the active
-version.
+version. A member that reports no version at all counts too: its gossip
+is not seen yet (it just joined), or it does not say.
+
+A member that was down when servers took over signing (below) and comes
+back on its old build keeps the old sandbox token and SSH rules for the
+sandboxes it runs, until it is upgraded. Upgrade it, or drain it
+(`aerolvm drain`) and delete it.
+
+## Server signing held
+
+`SandboxdServerSigningHeld`. From cluster version 22 only servers sign
+sandbox tokens and cloud-identity tokens. The leader starts it once the
+active cluster version reaches 22 (a finalize, or every live member on the
+new build). After an upgrade without a rollout (install.sh, `sandboxd
+upgrade node`), one live member on an older build, or one that reports no
+version, keeps the active version below 22; and if the active version was
+first written by this release (the cluster had none before), every live
+member must report 22 too. The alert fires once every server runs the new
+build and the record is still missing. `aerolvm upgrade signing` shows
+whether servers sign, since when, and which members hold it back. Upgrade
+or delete those members, or run `aerolvm upgrade signing start` to start
+it anyway (every server must run the new build): a member on an older
+build then cannot check the tokens servers sign. Servers also wait until
+every Raft server's certificate names the server role (a cluster moving
+off certificates from before roles: adopt, then each renewal gives a
+certificate its role); the reason names the server, and there is no
+override for it.
+
+Tokens signed before servers took over keep working until they expire (at
+most the token max TTL, 24 hours by default, after the cutover). Once
+every token you rely on is new, end the old ones at once with
+`aerolvm upgrade signing end-old-tokens`. Both calls are recorded in the
+audit log.
 
 ## Join failing
 

@@ -80,6 +80,8 @@ Watch it: `kubectl -n aerolvm-system get aerolcluster` shows `VERSION` (wanted) 
 
 **To roll back**, run `helm upgrade` again with the old `--version`, or set `cluster.version` back. A `helm rollback` works too, and keeps the newer CRDs: their new fields do no harm to an older operator.
 
+**Not after the servers sign.** From cluster version 22 on, only the servers sign [sandbox tokens](/sandbox-tokens/) and cloud identity tokens, two minutes after the upgrade finalizes. An older release cannot check those tokens or open the servers' cloud identity key, so a rollback after that breaks them. Fix forward instead. `aerolvm upgrade signing` shows whether the servers sign yet.
+
 The operator owns the version here, so `aerolvm upgrade apply` and `aerolvm upgrade rollback` refuse. `status`, `stop`, `resume` and `finalize` work as usual.
 
 **If someone else manages your CRDs**, set `cluster.operator.upgradeCRDs: false`, and apply them yourself before each upgrade:

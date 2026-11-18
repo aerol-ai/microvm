@@ -179,3 +179,54 @@ func platformSourceSegments(m models.MountSpec) ([]string, bool) {
 	}
 	return strings.Split(src, "/"), true
 }
+
+// ReclaimableSource reports whether a node may delete the bytes at source
+// for the deleted volume tenant/name (the reclaim sweep; name may be empty). The source is the
+// volume's own record, frozen when it was made, so a volume made before a
+// prefix or export change is deleted where it lives; it must still be that
+// volume's coordinate (its scope and name last, a clean path) on this
+// node's platform store (its bucket, or its server), as a rebuild mounts it
+// (PlatformMountFromRecord). A source the record names anywhere else is
+// not a volume this node's storage holds.
+func ReclaimableSource(b Backend, tenant, name, source string) bool {
+	if b.Kind != BackendS3 && b.Kind != BackendNFS {
+		return false
+	}
+	m := models.MountSpec{Type: models.MountType(b.Kind), Source: source}
+	// On the store, then the scope and name last: an s3 source is the
+	// bucket, then any prefix, then the two; an nfs path, the two at least.
+	segs, ok := platformSourceSegments(m)
+	least := 2
+	if b.Kind == BackendS3 {
+		least = 3
+	}
+	if !ok || len(segs) < least || !onPlatformStore(b, m) {
+		return false
+	}
+	scope, vol := segs[len(segs)-2], segs[len(segs)-1]
+	// An entry recorded without its name (an older build's) is matched on
+	// its scope alone.
+	if scope != tenant || (name != "" && vol != name) || !validVolumeScope(scope) {
+		return false
+	}
+	clean, err := SanitizeVolumeName(vol)
+	return err == nil && clean == vol
+}
+
+// validVolumeScope reports whether scope is a tenant's (t- and 16 hex) or
+// an operator's.
+func validVolumeScope(scope string) bool {
+	if strings.HasPrefix(scope, operatorScopePrefix) {
+		return ValidateOperatorScope(scope) == nil
+	}
+	hex, ok := strings.CutPrefix(scope, "t-")
+	if !ok || len(hex) != 16 {
+		return false
+	}
+	for _, r := range hex {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}

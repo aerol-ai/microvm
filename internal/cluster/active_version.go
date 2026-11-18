@@ -243,14 +243,16 @@ func (c *Cluster) removeObsoleteServers() {
 }
 
 // membersBelowActive counts live members below the active version, for
-// the alert (§10.1).
+// the alert (§10.1). A member that reports no version (0) counts too: its
+// meta is not seen, or it chose not to say, and either needs a look (the
+// alert waits 15 minutes, past a join's first gossip).
 func (c *Cluster) membersBelowActive() int {
 	if c == nil || c.gossip == nil || c.fsm.activeFVValue() == 0 {
 		return 0
 	}
 	n := 0
 	for _, m := range c.gossip.members() {
-		if m.Alive && m.FSMOpsVersion > 0 && c.memberObsolete(m.FSMOpsVersion) {
+		if m.Alive && m.NodeID != c.nodeID && (m.FSMOpsVersion == 0 || c.memberObsolete(m.FSMOpsVersion)) {
 			n++
 		}
 	}
