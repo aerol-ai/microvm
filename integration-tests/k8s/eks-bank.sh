@@ -47,12 +47,13 @@
 #              after a failed setup the rest are recorded as skipped).
 #   gateways11 11 gateways (the shard-aware opt-in is on every node), then
 #              drills-eks.sh shard-routes, then back to 3.
-#   scale      fills the cell until the operator buys machines, then 60
-#              workers; ecr-storm and thresholds at 60; back to 6. Time-boxed
-#              (EKS_BANK_SCALE_MINUTES, 60) with three guards: the NodePool's
-#              CPU limit, an EXIT trap that scales back, and an AWS schedule
-#              that runs the teardown Lambda's scale-cap phase if this
-#              machine is gone.
+#   scale      fills the cell past its workers' free CPU (fillers sized from
+#              the members and the create policy) until the operator adds
+#              a worker, then 60 workers; ecr-storm and thresholds at 60;
+#              back to 6. Time-boxed (EKS_BANK_SCALE_MINUTES, 60) with
+#              three guards: the NodePool's CPU limit, an EXIT trap that
+#              scales back, and an AWS schedule that runs the teardown
+#              Lambda's scale-cap phase if this machine is gone.
 #   down       the chart (its load balancer and volumes first), the scale-cap
 #              schedule, then cell.sh down (cluster.sh down: Terraform
 #              destroy, the GOVERNANCE-locked witness bucket emptied with the
@@ -94,6 +95,10 @@ HELM="${HELM:-helm}"
 # credentials and a time limit (HELM_FETCH_SECONDS).
 # shellcheck source=helm-fetch.sh
 source "$HERE/helm-fetch.sh"
+# pf_start / pf_stop: every port-forward the run makes is kubectl itself,
+# waited for until it forwards, on a local port nothing else answers on.
+# shellcheck source=port-forward.sh
+source "$HERE/port-forward.sh"
 # 0 or 1 only: any other spelling ("true", "yes") would start a live run.
 case "${DRY_RUN:-0}" in
   0|1) dry="${DRY_RUN:-0}" ;;
@@ -115,6 +120,11 @@ peak_workers="${EKS_BANK_PEAK_WORKERS:-60}"
 scale_minutes="${EKS_BANK_SCALE_MINUTES:-60}"
 back_minutes="${EKS_BANK_BACK_MINUTES:-20}"
 gateways_peak="${EKS_BANK_GATEWAYS:-11}"
+# The local ports of the run's port-forwards: server-0's admin port (the
+# admin token's calls), a gateway's API port (the API token's), and verify's.
+admin_lport=19219
+gw_lport=19212
+verify_lport=19220
 ns=aerolvm-system
 workers=aerolvm-workers
 release=aerolvm
@@ -137,10 +147,12 @@ mkdir -p "$sd"
 # on_exit's mark that a teardown follows (check_exit reads it): never one an
 # earlier run left.
 rm -f "$sd/.teardown-next"
-# Where this run's lines begin in bank.txt (an earlier run's FAIL lines are
-# not this run's answer).
+# Where this run's lines begin in bank.txt and in the drills' drills.txt (an
+# earlier run's FAIL lines are not this run's answer).
 bank_mark=0
 [[ ! -f "$sd/bank.txt" ]] || bank_mark="$(wc -l < "$sd/bank.txt" | tr -d ' ')"
+drills_mark=0
+[[ ! -f "$sd/drills/drills.txt" ]] || drills_mark="$(wc -l < "$sd/drills/drills.txt" | tr -d ' ')"
 log="$sd/bank.log"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$log" >&2; }
 result() {
@@ -520,18 +532,18 @@ YAML
 # --- the admin credential -----------------------------------------------------------
 # admin_call <method> <path> [json]: one call with the admin token, through a
 # port-forward to server-0's admin port: in enterprise mode the only place
-# it works. Prints the HTTP code, then the body.
+# it works. Prints the HTTP code, then the body. A port-forward that does
+# not open answers 000 with the reason as the body.
 admin_call() {
   [[ "$dry" == 1 ]] && { echo "dry-run: admin token $1 $2 (port-forward to $cname-server-0:21219)" >&2; echo 200; echo '{}'; return 0; }
   local pat pf out
   pat="$(kr -n "$ns" get secret "$cname-admin" -o jsonpath='{.data.token}' | base64 -d | tr -d '\n')"
-  kubectl --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$cname-server-0" 19219:21219 >/dev/null 2>&1 &
-  pf=$!
-  sleep 3
+  if ! pf_start pf "$admin_lport" --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$cname-server-0" "$admin_lport:21219" 2>/dev/null; then
+    echo 000; jq -cn --arg e "$pf_error" '{error: $e}'; return 0
+  fi
   out="$(curl -sS -m 60 -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $pat" -H 'Content-Type: application/json' \
-    ${3:+-d "$3"} "http://127.0.0.1:19219$2" || true)"
-  kill "$pf" 2>/dev/null || true
-  wait "$pf" 2>/dev/null || true
+    ${3:+-d "$3"} "http://127.0.0.1:$admin_lport$2" || true)"
+  pf_stop "$pf"
   tail -1 <<<"$out"; sed '$d' <<<"$out"
 }
 api_token() {
@@ -669,7 +681,7 @@ PY
 
 # --- gvisor -----------------------------------------------------------------------
 # gw_call <method> <path> [json]: one call with the run's API token, through
-# a port-forward to a gateway pod's API port.
+# a port-forward to a gateway pod's API port. Answers as admin_call does.
 gw_call() {
   [[ "$dry" == 1 ]] && { echo "dry-run: API token $1 $2 (port-forward to a gateway)" >&2; echo 200; echo '{}'; return 0; }
   local gw pf out
@@ -677,13 +689,12 @@ gw_call() {
   # No gateway pod: an answer the caller records, never a port-forward to
   # "pod/".
   [[ -n "$gw" ]] || { echo 000; echo '{"error": "no gateway pod to call through"}'; return 0; }
-  kubectl --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$gw" 19212:21212 >/dev/null 2>&1 &
-  pf=$!
-  sleep 3
+  if ! pf_start pf "$gw_lport" --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$gw" "$gw_lport:21212" 2>/dev/null; then
+    echo 000; jq -cn --arg e "$pf_error" '{error: $e}'; return 0
+  fi
   out="$(curl -sS -m 300 -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $(cat "$sd/api-token")" \
-    -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:19212$2" || true)"
-  kill "$pf" 2>/dev/null || true
-  wait "$pf" 2>/dev/null || true
+    -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:$gw_lport$2" || true)"
+  pf_stop "$pf"
   tail -1 <<<"$out"; sed '$d' <<<"$out"
 }
 # sandbox_machine <sandbox id> <out dir>: the worker pod and machine a
@@ -756,14 +767,15 @@ step_verify() {
   cli="$sd/aerolvm"
   (cd "$src" && go build -o "$cli" ./cmd/aerolvm)
   pat="$(kr -n "$ns" get secret "$cname-admin" -o jsonpath='{.data.token}' | base64 -d | tr -d '\n')"
-  kubectl --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$cname-server-0" 19220:21219 >/dev/null 2>&1 &
-  pf=$!
-  sleep 3
-  KUBECONFIG="$sd/kubeconfig" SB_API_URL=http://127.0.0.1:19220 SB_PAT_TOKEN="$pat" "$cli" k8s verify \
+  if ! pf_start pf "$verify_lport" --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$cname-server-0" "$verify_lport:21219" 2>/dev/null; then
+    result FAIL verify "no port-forward to $cname-server-0's admin port: $pf_error"
+    return 0
+  fi
+  KUBECONFIG="$sd/kubeconfig" SB_API_URL="http://127.0.0.1:$verify_lport" SB_PAT_TOKEN="$pat" "$cli" k8s verify \
     --namespace "$ns" --worker-namespace "$workers" --release "$release" --cluster "$cname" \
     --skip-signatures --probe-runtimes gvisor --probe-image "$probe" \
     > "$out/verify.txt" 2>&1 || rc=$?
-  kill "$pf" 2>/dev/null || true
+  pf_stop "$pf"
   if [[ "$rc" == 0 ]]; then
     result PASS verify "aerolvm k8s verify passed on the live enterprise install (signatures skipped: dev images) ($out/verify.txt)"
   else
@@ -914,9 +926,13 @@ step_scale() {
   say "scale: time box $scale_minutes min; AWS's scale-cap at $cap_at UTC"
   nodepool $(( 4 * (peak_workers + 2) ))
 
-  # 1. The cell fills: sandboxes of 1 CPU, 8 a round, until the operator
-  #    buys machines past the base (EKS_BANK_FILL_TARGET, 12 workers).
-  local target="${EKS_BANK_FILL_TARGET:-12}" fill_until=$(( t0 + 15 * 60 ))
+  # 1. The cell fills past what its workers hold, so the operator must add
+  #    one (EKS_BANK_FILL_TARGET, the base and one more). Each round is
+  #    sized from the members and the create policy (fill_plan): fillers
+  #    of the policy's largest CPU, as many as every worker's free CPU
+  #    takes, and one more. The fifth run's rounds of 8 1-CPU fillers made
+  #    80 CPUs in 15 min, short of six workers of 18: no 7th served.
+  local target="${EKS_BANK_FILL_TARGET:-$(( base_workers + 1 ))}" fill_until=$(( t0 + 15 * 60 )) plan fcpu fcount filled=""
   timeline start
   while [[ "$dry" != 1 && $(now) -lt $fill_until ]]; do
     read_workers || { sleep 15; continue; }
@@ -924,8 +940,14 @@ step_scale() {
     if [[ "$p" == 0 && $(( $(now) - last_fill )) -ge 90 ]]; then
       rounds=$(( rounds + 1 )); last_fill=$(now)
       local frc=0
-      DRILL_FILL_COUNT=8 drills fill || frc=$?
-      [[ "$frc" == 0 ]] || say "scale: fill round $rounds: drills-eks.sh fill exited $frc"
+      if plan="$(fill_plan "$out")"; then
+        read -r fcpu fcount <<<"$plan"
+        filled="${filled:+$filled, }$fcount of $fcpu CPU"
+        DRILL_FILL_COUNT="$fcount" DRILL_FILL_CPU="$fcpu" drills fill || frc=$?
+        [[ "$frc" == 0 ]] || say "scale: fill round $rounds: drills-eks.sh fill exited $frc"
+      else
+        say "scale: fill round $rounds: no fill plan (the members were not read)"
+      fi
       timeline "fill round $rounds"
     fi
     sleep 15
@@ -933,7 +955,7 @@ step_scale() {
   done
   read_workers
   result "$([[ "$dry" == 1 || "$w" -ge "$target" ]] && echo PASS || echo FAIL)" scale-full \
-    "$rounds fill rounds of 8 sandboxes (1 CPU each): the operator added workers and Karpenter bought machines until $w workers served ($m machines) in $(( $(now) - t0 ))s ($out/timeline.txt)"
+    "$rounds fill rounds (${filled:-none}, sized from the members' free CPU and the create policy): the operator added workers and Karpenter bought machines until $w workers served ($m machines; $target wanted) in $(( $(now) - t0 ))s ($out/timeline.txt)"
 
   # 2. To the peak: the floor to 60.
   local tp
@@ -992,6 +1014,21 @@ step_scale() {
   fi
   x aws scheduler delete-schedule --region "$(tfout region)" --name "$name-scale-cap" >/dev/null 2>&1 || true
   in_scale=""
+}
+# fill_plan <out dir>: the next scale fill round, "<cpu> <count>":
+# drills-local/fillplan.py over the members (gw_call) and the create policy
+# (the <cluster>-create-policy ConfigMap), both kept in <out>, with one
+# filler past what the workers' free CPU takes. 1 when the members were not
+# read.
+fill_plan() {
+  local out="$1" members
+  members="$(gw_call GET /v1/cluster/members)"
+  [[ "$(head -1 <<<"$members")" == 200 ]] || return 1
+  sed 1d <<<"$members" > "$out/members.json"
+  kr -n "$ns" get configmap "$cname-create-policy" -o jsonpath='{.data.policy\.yaml}' > "$out/create-policy.yaml" 2>/dev/null ||
+    : > "$out/create-policy.yaml"
+  python3 -I "$HERE/drills-local/fillplan.py" "$out/members.json" "$out/create-policy.yaml" --past 1 > "$out/fill-plan.json" || return 1
+  jq -r '"\(.cpu) \(.count)"' "$out/fill-plan.json"
 }
 # end_extra_machines: past the way back, the machines above the base are
 # ended directly: every Karpenter machine of this run but those under the
@@ -1101,6 +1138,7 @@ check_undo=""
 failed_checks=()
 run_check() {
   local step="$1"; shift
+  rm -f "$sd/.check-exit"
   set +e
   (
     set -e
@@ -1127,10 +1165,13 @@ run_check() {
 # inherited: a drills-eks.sh the undo starts could then never be stopped
 # (its port-forward loop outlived the run). When on_exit tears the run down
 # next ($sd/.teardown-next), only the peak drills are stopped: the rest goes
-# with the cluster, and a long undo would only delay the teardown.
+# with the cluster, and a long undo would only delay the teardown. Its first
+# act is the mark $sd/.check-exit: stop_check leaves an undo that has begun
+# to finish (killing its tree then would kill the undo's own children).
 check_exit() {
   local rc=$?
   trap : INT TERM
+  : > "$sd/.check-exit"
   if [[ -f "$sd/.teardown-next" ]]; then
     stop_scale_drills
   else
@@ -1139,13 +1180,28 @@ check_exit() {
   fi
   exit "$rc"
 }
-# stop_check: on_exit's first act while a check runs: the check and
-# everything under it are stopped (kill_tree, by PID), and its own exit
-# handler finishes before anything is torn down.
+# stop_check: on_exit's first act while a check runs. TERM to the check
+# alone; its trap runs check_exit, whose first act is the mark
+# $sd/.check-exit. With the mark there the undo has begun, and it is left to
+# finish: a Ctrl-C reaches the check and this shell together, so the check
+# may already be undoing, and kill_tree then killed the undo's own children
+# (gateways_back's Helm, the floor's kubectl patch). No mark within 5 s: the
+# check is held by a foreground child (a drill, a wait), whose end bash
+# waits for before it runs a trap; the whole tree goes (kill_tree), and the
+# undo starts after. Either way its exit handler finishes before anything
+# is torn down.
 stop_check() {
   [[ -n "$check_pid" ]] || return 0
   if kill -0 "$check_pid" 2>/dev/null; then
-    kill_tree "$check_pid"
+    kill -TERM "$check_pid" 2>/dev/null || true
+    local _
+    for _ in $(seq 1 50); do
+      if [[ -f "$sd/.check-exit" ]] || ! kill -0 "$check_pid" 2>/dev/null; then break; fi
+      sleep 0.1
+    done
+    if [[ ! -f "$sd/.check-exit" ]] && kill -0 "$check_pid" 2>/dev/null; then
+      kill_tree "$check_pid"
+    fi
     wait "$check_pid" 2>/dev/null || true
   fi
   check_pid=""
@@ -1180,11 +1236,13 @@ downed=0
 made_here=0
 gated=0
 on_exit() {
-  local rc=$? teardown=0
-  # From here no INT or TERM stops this script, and the teardown's own
-  # commands (Terraform's destroy among them) ignore them too: a second
-  # Ctrl-C used to end the run before down. Everything the teardown starts
-  # ends by itself; nothing in it loops.
+  local rc=$? teardown=0 down_pid
+  # From here no INT or TERM stops this script: a second Ctrl-C used to end
+  # the run before down. Its children inherit INT and TERM ignored, but a
+  # program may turn them back on: Terraform does, so a second Ctrl-C could
+  # still stop its destroy. The teardown therefore runs as a job of its own
+  # (below). Everything the teardown starts ends by itself; nothing in it
+  # loops.
   trap - EXIT
   trap '' INT TERM
   if [[ "$rc" != 0 && "$run_all" == 1 && "$refused" != 1 && "$downed" != 1 && "${EKS_BANK_KEEP:-0}" != 1 && -f "$sd/terraform.tfstate" ]] &&
@@ -1195,9 +1253,17 @@ on_exit() {
   stop_check
   if [[ "$teardown" == 1 ]]; then
     say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)"
-    # Best effort, under ||: down goes on past a part that fails, and
-    # says what is left.
-    step_down || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
+    # A job of its own (set -m): its own process group, so a Ctrl-C at the
+    # terminal, which goes to this script's group, reaches no part of the
+    # teardown, Terraform included. Its stdin is /dev/null: a job outside
+    # the terminal's group that read the terminal would be stopped for
+    # good. Best effort, under ||: down goes on past a part that fails,
+    # and says what is left.
+    set -m
+    { step_down || exit 1; } < /dev/null &
+    down_pid=$!
+    set +m
+    wait "$down_pid" || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
@@ -1236,11 +1302,14 @@ for step in "${steps[@]}"; do
   esac
 done
 # Every step ran. Any FAIL this run wrote makes its answer 1 (down, if asked
-# for, has run): a check that exited non-zero, and a FAIL a check recorded
-# itself before returning 0 (enterprise, nlb, verify, scale-full, ...).
+# for, has run): a check that exited non-zero, a FAIL a check recorded
+# itself before returning 0 (enterprise, nlb, verify, scale-full, ...), and
+# a FAIL a drill wrote in drills.txt (slo-alerts, shard-routes, ...: the
+# fifth run's closing line named only gvisor and scale-full).
 fails="$( { [[ ! -f "$sd/bank.txt" ]] || tail -n +$(( bank_mark + 1 )) "$sd/bank.txt" | awk '$1 == "FAIL" {print $2}'
+  [[ ! -f "$sd/drills/drills.txt" ]] || tail -n +$(( drills_mark + 1 )) "$sd/drills/drills.txt" | awk '$1 == "FAIL" {print $2}'
   printf '%s\n' ${failed_checks[@]+"${failed_checks[@]}"}; } | sed '/^$/d' | sort -u | tr '\n' ' ')"
 if [[ -n "$fails" ]]; then
-  say "eks-bank.sh: checks that failed: ${fails% } ($sd/bank.txt)"
+  say "eks-bank.sh: checks that failed: ${fails% } ($sd/bank.txt, $sd/drills/drills.txt)"
   exit 1
 fi

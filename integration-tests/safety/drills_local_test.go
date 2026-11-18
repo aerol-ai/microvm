@@ -21,10 +21,12 @@ func drillStubs(t *testing.T) ([]string, string) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "calls.log")
 	for name, body := range map[string]string{
-		"kubectl": `echo "kubectl $*" >> "$STUB_LOG"`,
-		"curl":    `echo "curl $*" >> "$STUB_LOG"`,
-		"docker":  `echo "docker $*" >> "$STUB_LOG"`,
-		"kind":    `echo "kind $*" >> "$STUB_LOG"; [ "$1 $2" = "get clusters" ] && echo aerolvm-drills; exit 0`,
+		// A port-forward says it forwards (pf_start waits for that line).
+		"kubectl": `echo "kubectl $*" >> "$STUB_LOG"
+case " $* " in *" port-forward "*) for a in "$@"; do last="$a"; done; echo "Forwarding from 127.0.0.1:${last%%:*} -> ${last#*:}" ;; esac`,
+		"curl":   `echo "curl $*" >> "$STUB_LOG"`,
+		"docker": `echo "docker $*" >> "$STUB_LOG"`,
+		"kind":   `echo "kind $*" >> "$STUB_LOG"; [ "$1 $2" = "get clusters" ] && echo aerolvm-drills; exit 0`,
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
 			t.Fatal(err)

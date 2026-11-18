@@ -20,6 +20,11 @@ JSON object, {"verdict": PASS|FAIL|INCONCLUSIVE, "detail": ...}.
       the creates said so.
   verdicts.py shard <dir> <gateway>...
       shard-routes, over <dir>/routes.jsonl and <dir>/caddy-<gateway>.json.
+      FAIL also when a gateway's config could not be read (an empty file:
+      caddy_unread), or when two gateways the routes give different
+      sandboxes have the same config (caddy_identical): that config came
+      from one gateway through a forward that answered for both (the fifth
+      EKS run's 11 identical files were one gateway's).
   verdicts.py admit <can-admit.txt> <query-exit> <workers>
       large-layers' "every worker still admits": the query answered, with
       one series per worker, none 0.
@@ -103,6 +108,13 @@ def shard(d, gws):
     for g in gws:
         p = os.path.join(d, "caddy-%s.json" % g)
         caddy[g] = open(p).read() if os.path.exists(p) else ""
+    unread = [g for g in gws if not caddy[g].strip()]
+    owned = {g: frozenset(sid for sid, ow in routes.items() if g in ow) for g in gws}
+    same = collections.defaultdict(list)
+    for g in gws:
+        if g not in unread:
+            same[caddy[g]].append(g)
+    identical = [sorted(gs) for gs in same.values() if len({owned[g] for g in gs}) > 1]
     checked, wrong, nowhere = 0, [], 0
     for sid, owners in list(routes.items())[:6]:
         has = {g for g in gws if sid in caddy[g]}
@@ -114,9 +126,10 @@ def shard(d, gws):
             wrong.append("%s: in %s, owners %s" % (sid, sorted(has), sorted(owners)))
     detail = {"sandboxes": len(routes), "gateways": len(gws), "rings": sorted(map(str, rings)),
               "owned_per_gateway": dict(cover), "unowned": [g for g in gws if g not in cover], "bad": bad[:5],
-              "caddy_checked": checked, "caddy_wrong": wrong, "caddy_route_nowhere": nowhere}
+              "caddy_checked": checked, "caddy_wrong": wrong, "caddy_route_nowhere": nowhere,
+              "caddy_unread": unread, "caddy_identical": identical}
     ok = (routes and not bad and len(rings) == 1 and all(g in cover for g in gws) and not wrong
-          and checked > 0 and nowhere == 0)
+          and checked > 0 and nowhere == 0 and not unread and not identical)
     return out("PASS" if ok else "FAIL", detail)
 
 

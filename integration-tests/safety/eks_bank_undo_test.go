@@ -18,9 +18,18 @@ import (
 
 // undoHarness is a bash script holding eks-bank.sh's real functions around
 // stubs that log to $OUT/log. RUN_ALL decides whether on_exit tears down;
-// $OUT/workers holds the worker counts ("fail" fails one read); the drills
-// stub sleeps DRILL_SLEEP seconds and fails ecr-storm when ECR_FAIL is set.
+// $OUT/workers holds the worker counts ("fail" fails one read, then the
+// counts are $OUT/workers-after-fail's, or 12 0 12); the drills stub sleeps
+// DRILL_SLEEP seconds, fails ecr-storm when ECR_FAIL is set, and with
+// BACK_FAIL set makes the first read on the way back fail. extra is bash
+// that runs after the real functions (more stubs, a check of the test's
+// own).
 func undoHarness(t *testing.T, check string) string {
+	t.Helper()
+	return undoHarnessWith(t, "", check)
+}
+
+func undoHarnessWith(t *testing.T, extra, check string) string {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString(`set -euo pipefail
@@ -50,9 +59,10 @@ gateways_back() { log gateways_back; }
 step_down() { log down-start; command sleep 2; log down-done; }
 workers_now() {
   local v; v="$(cat "$OUT/workers")"
-  if [[ "$v" == fail ]]; then echo "12 0 12" > "$OUT/workers"; log "workers_now failed"; return 1; fi
+  if [[ "$v" == fail ]]; then cat "$OUT/workers-after-fail" 2>/dev/null > "$OUT/workers" || echo "12 0 12" > "$OUT/workers"; log "workers_now failed"; return 1; fi
   echo "$v"
 }
+fill_plan() { echo "2 55"; }
 drills() {
   log "drills $1"
   # INTERRUPT_UNFILL: a TERM lands on the check while its normal end runs
@@ -63,7 +73,7 @@ drills() {
   fi
   case "$1" in
     ecr-storm) [[ -z "${ECR_FAIL:-}" ]] || return 3 ;;
-    thresholds) echo "6 0 6" > "$OUT/workers" ;;
+    thresholds) if [[ -n "${BACK_FAIL:-}" ]]; then echo "6 0 6" > "$OUT/workers-after-fail"; echo fail > "$OUT/workers"; else echo "6 0 6" > "$OUT/workers"; fi ;;
   esac
   # What a drills-eks.sh the undo starts would inherit for TERM.
   [[ "$1" != unfill ]] || bash -c 'trap -p TERM' > "$OUT/unfill-term"
@@ -74,7 +84,9 @@ drills() {
 		"stop_scale_drills", "scale_back", "read_workers", "step_scale", "step_gateways11"} {
 		b.WriteString(shellFunc(t, "eks-bank.sh", fn))
 	}
-	b.WriteString(`# The scale step's normal end alone: scale_back, as step_scale calls it.
+	b.WriteString(extra)
+	b.WriteString(`
+# The scale step's normal end alone: scale_back, as step_scale calls it.
 scale_ending() { in_scale=1; scaled_back=0; scale_back; in_scale=""; }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
@@ -95,6 +107,11 @@ type undoRun struct {
 // the run must not hang the test on a pipe.
 func startUndo(t *testing.T, check, workers string, env ...string) undoRun {
 	t.Helper()
+	return startUndoWith(t, "", check, workers, env...)
+}
+
+func startUndoWith(t *testing.T, extra, check, workers string, env ...string) undoRun {
+	t.Helper()
 	dir := t.TempDir()
 	for f, body := range map[string]string{
 		"run.tfvars.json":   `{"name": "bank-1", "ttl": "2099-01-01T00:00:00Z"}`,
@@ -110,7 +127,7 @@ func startUndo(t *testing.T, check, workers string, env ...string) undoRun {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { out.Close() })
-	cmd := exec.Command("bash", "-c", undoHarness(t, check))
+	cmd := exec.Command("bash", "-c", undoHarnessWith(t, extra, check))
 	cmd.Env = append(append(os.Environ(), "OUT="+dir), env...)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

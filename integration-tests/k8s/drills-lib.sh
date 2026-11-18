@@ -18,7 +18,9 @@
 #   setup_values          the bank-like Helm values over the install
 #   setup_token           an admin credential in $sd/token
 #   push_tags <tag>...    fresh images over drill/app:v1, as push.py makes them
-#   push_images <run>     push_tags for one run's images
+#   push_images <run> [cold]
+#                         push_tags for one run's images (that many cold
+#                         ones, 12)
 #   forwarders            whatever the worker pods need to reach the registry
 #   registry_log <since>  the fault proxy's request lines since <since>
 #   drills_step <step>    the caller's own steps; 127 for an unknown one
@@ -35,6 +37,12 @@ HELM="${HELM:-helm}"
 # helm_fetch: the chart fetch with no registry credentials and a time limit.
 # shellcheck source=helm-fetch.sh
 source "$HERE/helm-fetch.sh"
+# pf_start / pf_stop: a one-call port-forward that is kubectl itself, waited
+# for until it forwards, on a local port nothing else answers on.
+# shellcheck source=port-forward.sh
+source "$HERE/port-forward.sh"
+# caddy_admin's local port.
+caddy_admin_lport=12019
 # kube-prometheus-stack, pinned (2026-10-31).
 kps_version="${DRILL_KPS_VERSION:-92.17.0}"
 prom_port="${DRILL_PROM_PORT:-19090}"
@@ -106,7 +114,8 @@ keep_forward() {
 watcher=""
 cleanup() {
   # Best effort, for a step that died midway: the registry's faults off,
-  # the callers stopped, Caddy's admin API back on its port.
+  # the callers stopped, Caddy's admin API back on its port, the worker
+  # pool's maxWorkers back (hold_workers).
   if [[ "$faults_set" == 1 ]]; then
     proxy mode/clear 2>/dev/null || true
   fi
@@ -117,6 +126,7 @@ cleanup() {
   if [[ -n "$caddy_moved_on" ]]; then
     caddy_admin "$caddy_moved_on" 2020 /config/admin/listen '"localhost:2019"' >/dev/null 2>&1 || true
   fi
+  release_workers >/dev/null 2>&1 || true
   [[ -z "$watcher" ]] || kill -KILL "$watcher" 2>/dev/null || true
   # Each keeper is stopped (STOP) before its children are listed, so it
   # cannot start another port-forward in between; then all go with KILL,
@@ -402,7 +412,11 @@ step_pull_storm() {
   # Fresh images for every run of the step: a rerun must pull cold too.
   run="$(date +%m%d%H%M%S)"
   echo "$run" > "$out/run"
-  push_images "$run"
+  # The storm's cold creates, and its cold images (thresholds sizes both
+  # for the worker count; one image each there, so no create waits on
+  # another's pull).
+  local ncold="${DRILL_STORM_COLD:-24}" nimages="${DRILL_STORM_COLD_IMAGES:-12}"
+  push_images "$run" "$nimages"
   forwarders
   watch_start "$out"
   proxy mode/clear; proxy stats/reset
@@ -439,15 +453,15 @@ step_pull_storm() {
   #    request after 30 s without response headers, which makes a storm of
   #    errors, not a queue; the first run found that.)
   local minutes="${DRILL_STORM_MINUTES:-25}" cold="" i
-  for i in $(seq 1 12); do cold="$cold $drill_reg/drill/cold:$run-$i"; done
+  for i in $(seq 1 "$nimages"); do cold="$cold $drill_reg/drill/cold:$run-$i"; done
   proxy stats/reset
   proxy "mode?name=ratelimit&repo=drill/hot"
   proxy "mode?name=slow&delay=20&bps=20000&repo=drill/cold"
   t0=$(now)
   echo "$t0" > "$out/storm-start"
-  say "storm: 6 callers on drill/hot (429), 24 on 12 slow drill/cold images, up to $minutes min"
+  say "storm: 6 callers on drill/hot (429), $ncold on $nimages slow drill/cold images, up to $minutes min"
   storm_start "hot-$run" --images "$drill_reg/drill/hot:$run" --runtime gvisor --concurrency 6 --pause 1 --delete --duration $(( minutes * 60 ))
-  storm_start "cold-$run" --images $cold --runtime gvisor --concurrency 24 --pause 1 --delete --duration $(( minutes * 60 ))
+  storm_start "cold-$run" --images $cold --runtime gvisor --concurrency "$ncold" --pause 1 --delete --duration $(( minutes * 60 ))
   prom wait SandboxdImagePullQueueBacklog SandboxdImagePullBackoffRejects SandboxdImagePullErrors \
     --state firing --timeout $(( minutes * 60 )) > "$out/fired.jsonl" || true
   t1=$(now)
@@ -567,23 +581,86 @@ sys.exit(0 if want <= got else 1)' "$path" "$status" "$@"; then
 }
 
 # --- slo-breach --------------------------------------------------------------------
+# fill_plan <out>: the next fill, as drills-local/fillplan.py sizes it from
+# the members (GET /v1/cluster/members) and the create policy (the
+# <cluster>-create-policy ConfigMap); both copies stay in <out>. 1 when the
+# members could not be read.
+fill_plan() {
+  api GET /v1/cluster/members > "$1/members-fill.json" || return 1
+  kc -n "$ns" get configmap "$cluster_name-create-policy" -o jsonpath='{.data.policy\.yaml}' > "$1/create-policy.yaml" 2>/dev/null ||
+    : > "$1/create-policy.yaml"
+  python3 -I "$L/fillplan.py" "$1/members-fill.json" "$1/create-policy.yaml"
+}
+# fill_one <out> <tag> <cpu>: one filler that stays (tagged drill-run=<tag>);
+# prints the answer's HTTP code, empty when the call failed on the way.
+fill_one() {
+  api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $3, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"$2\"}}" |
+    tee -a "$1/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true
+}
+# hold_workers <out>: the worker pool's maxWorkers down to the workers
+# serving now (never under its minWorkers), so the operator adds none while
+# a drill fills the cell. Its old value goes to $sd/workers-held first;
+# release_workers puts it back, at the drill's end or in cleanup when the
+# drill dies (drills_main also puts back one an earlier run left). A
+# cluster without an AerolCluster (or one the patch is refused on) is
+# filled without a hold, and the evidence says so.
+hold_workers() {
+  local out="$1" max min now cap
+  release_workers
+  max="$(kc -n "$ns" get aerolcluster "$cluster_name" -o jsonpath='{.spec.workerPools[0].maxWorkers}' 2>/dev/null || true)"
+  min="$(kc -n "$ns" get aerolcluster "$cluster_name" -o jsonpath='{.spec.workerPools[0].minWorkers}' 2>/dev/null || true)"
+  now="$(kc -n "$ns" get aerolnodes -o json 2>/dev/null | python3 -c '
+import json, sys
+print(sum(1 for n in json.load(sys.stdin)["items"] if n["spec"].get("role") == "worker" and n.get("status", {}).get("state") == "Serving"))' 2>/dev/null || true)"
+  if ! [[ "$max" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
+    echo "no worker pool to hold (maxWorkers \"$max\", minWorkers \"$min\", serving \"$now\"): filled without a hold" > "$out/workers-held.txt"
+    return 0
+  fi
+  cap=$(( now > min ? now : min ))
+  echo "$max" > "$sd/workers-held"
+  if kc -n "$ns" patch aerolcluster "$cluster_name" --type json \
+      -p "[{\"op\": \"replace\", \"path\": \"/spec/workerPools/0/maxWorkers\", \"value\": $cap}]" >/dev/null; then
+    echo "maxWorkers $max -> $cap ($now serving, minWorkers $min) for the fill" > "$out/workers-held.txt"
+  else
+    rm -f "$sd/workers-held"
+    echo "the maxWorkers patch to $cap was refused: filled without a hold" > "$out/workers-held.txt"
+  fi
+}
+# release_workers: maxWorkers back to the value hold_workers kept, then the
+# mark goes. A patch that fails keeps the mark for the next try.
+release_workers() {
+  [[ -f "$sd/workers-held" ]] || return 0
+  local max
+  max="$(cat "$sd/workers-held")"
+  [[ "$max" =~ ^[0-9]+$ ]] || { rm -f "$sd/workers-held"; return 0; }
+  if kc -n "$ns" patch aerolcluster "$cluster_name" --type json \
+      -p "[{\"op\": \"replace\", \"path\": \"/spec/workerPools/0/maxWorkers\", \"value\": $max}]" >/dev/null; then
+    rm -f "$sd/workers-held"
+  else
+    say "maxWorkers could not be put back to $max; $sd/workers-held keeps it"
+  fi
+}
 # caddy_admin <gateway pod> <admin port> <path> [json body]: one call to
-# Caddy's admin API inside the pod, over a port-forward.
+# Caddy's admin API inside the pod, over a port-forward; prints the HTTP
+# code. A fixed 3 s was too short once on a new gateway pod: the call got no
+# answer (000) and Caddy was never moved. pf_start waits until the forward
+# listens, and refuses a port another forward holds (a call through it
+# would move another gateway's Caddy); then the answer is 000.
 caddy_admin() {
-  local pod="$1" from="$2" path="$3" body="${4:-}" k
-  kubectl --context "$ctx" -n "$ns" port-forward "pod/$pod" "12019:$from" >/dev/null 2>&1 &
-  k=$!
-  # A fixed 3 s was too short once on a new gateway pod: the call got no
-  # answer (000) and Caddy was never moved. Wait for the admin API.
+  local pod="$1" from="$2" path="$3" body="${4:-}" fwd
+  if ! pf_start fwd "$caddy_admin_lport" --context "$ctx" -n "$ns" port-forward "pod/$pod" "$caddy_admin_lport:$from"; then
+    echo 000
+    return 0
+  fi
+  # And Caddy's admin API itself answers (the pod may be new).
   local _
   for _ in $(seq 1 20); do
-    curl -s -m 2 -o /dev/null -H "Host: localhost:$from" "http://127.0.0.1:12019/config/admin" && break
+    curl -s -m 2 -o /dev/null -H "Host: localhost:$from" "http://127.0.0.1:$caddy_admin_lport/config/admin" && break
     sleep 1
   done
   curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H "Host: localhost:$from" -H 'Content-Type: application/json' \
-    ${body:+-d "$body"} "http://127.0.0.1:12019$path" 2>/dev/null || true
-  kill "$k" 2>/dev/null || true
-  wait "$k" 2>/dev/null || true
+    ${body:+-d "$body"} "http://127.0.0.1:$caddy_admin_lport$path" 2>/dev/null || true
+  pf_stop "$fwd"
 }
 step_slo_breach() {
   keep_forward monitoring svc/kube-prometheus-stack-prometheus "$prom_port" 9090 /-/healthy
@@ -656,39 +733,40 @@ step_slo_breach() {
     cleanup_run "$s-$run"
   done
 
-  # B. No worker can admit: fill every worker's CPU, largest first.
+  # B. No worker can admit. The worker count is held first: the operator
+  #    adds a worker as the cell fills (the fifth EKS run's fill brought a
+  #    7th, with 18 CPUs free). Then fillers sized from the live members and
+  #    the create policy (fill_plan): the fixed 8, 4, 2 and 1 CPU sizes met
+  #    a 2-CPU limit and workers of 18, and left every worker admitting.
   say "slo B: filling every worker"
-  # A size is done after two refusals in a row: one transient error (a
-  # gateway just replaced) must not leave a worker with a CPU to spare.
-  local size n=0 code refused
+  hold_workers "$out"
+  local plan size count n=0 code refused=0 admitting="" i
   : > "$out/fill.txt"
-  for size in 8 4 2 1; do
-    refused=0
-    for _ in $(seq 1 14); do
-      # A call that fails on the way (kubectl exec) counts as a refusal.
-      code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $size, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
-      if [[ "$code" == 201 ]]; then
-        n=$((n + 1)) refused=0
-      else
-        refused=$((refused + 1))
-        [[ "$refused" -ge 2 ]] && break
-      fi
-    done
+  plan="$(fill_plan "$out")" || plan='{"cpu": 1, "count": 0}'
+  echo "$plan" > "$out/fill-plan.json"
+  size="$(jf "$plan" 'd["cpu"]')"
+  count="$(jf "$plan" 'd["count"]')"
+  # The plan's size, as many as the free CPU takes. Done after two
+  # refusals in a row: one transient error (a gateway just replaced) must
+  # not end it, and a call that fails on the way counts as a refusal.
+  for (( i = 0; i < count; i++ )); do
+    code="$(fill_one "$out" "fill-$run" "$size")"
+    if [[ "$code" == 201 ]]; then
+      n=$((n + 1)) refused=0
+    else
+      refused=$((refused + 1))
+      [[ "$refused" -ge 2 ]] && break
+    fi
   done
-  # Placement can refuse the last CPU on a worker for a moment after the
-  # creates before it (its view of the worker trails them), which stopped
-  # the first run's fill one CPU short with that worker still admitting.
-  # Top up until every worker says it has no room, one CPU at a time: the
-  # second run needed 14 (placement refused the first 1-CPU creates for a
-  # moment), more than a budget of 12.
-  local admitting
-  for _ in $(seq 1 40); do
-    admitting="$(api GET /v1/cluster/members | python3 -c '
-import json, sys
-d = json.load(sys.stdin)["body"] or {}
-print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") and (m.get("capacity") or {}).get("can_admit")))' 2>/dev/null || true)"
+  # Then one at a time, each sized from the members as they are, until no
+  # worker admits: placement can refuse a worker's last CPUs for a moment
+  # after the creates before it (its view trails them), which stopped the
+  # first run's fill one CPU short.
+  for (( i = 0; i < count + 20; i++ )); do
+    plan="$(fill_plan "$out")" || { sleep 5; continue; }
+    admitting="$(jf "$plan" 'd["admitting"]')"
     [[ "$admitting" == 0 ]] && break
-    code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": 1, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
+    code="$(fill_one "$out" "fill-$run" "$(jf "$plan" 'd["topup_cpu"]')")"
     [[ "$code" == 201 ]] && n=$((n + 1))
     sleep 5
   done
@@ -704,6 +782,7 @@ print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") a
   api GET /v1/cluster/members > "$out/members-full.json" || true
   echo "$(now)" > "$out/mitigate-b"
   cleanup_run "fill-$run"
+  release_workers
 
   prom wait SandboxdCreateQueueBacklog SandboxdCreateErrors SandboxdIngressRouteLag SandboxdNoAdmitWorkers \
     --state inactive --timeout 1500 > "$out/resolved.jsonl" || true
@@ -748,6 +827,8 @@ print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") a
 drills_main() {
   local script="$1" step; shift
   if declare -F drills_begin >/dev/null; then drills_begin "$@"; fi
+  # A worker hold an earlier run of a drill left (killed past its cleanup).
+  release_workers
   for step in "$@"; do
     case "$step" in
       setup) step_setup ;;
