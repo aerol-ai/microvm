@@ -348,6 +348,12 @@ func TestRunAdminTokenListener(t *testing.T) {
 			t.Setenv("SB_PUBLIC_API_SOCKET_GROUP", group)
 			t.Setenv("SB_PAT_SCOPE", "host")
 			t.Setenv("SB_PUBLIC_API_SOCKET", filepath.Join(shortDir(t), "pub", "api.sock"))
+			// testport hands out ports from 20000-32000, and the node
+			// refuses a local listener inside its L4 range (22000-23000 by
+			// default): move the range out of the way, or one draw in about
+			// twelve lands in it and the node refuses to start.
+			t.Setenv("SB_L4_PORT_RANGE_START", "1024")
+			t.Setenv("SB_L4_PORT_RANGE_END", "1100")
 			api := testport.Reserve(t, false)
 			t.Setenv("SB_API_PORT", strconv.Itoa(api))
 			apiAddr := "127.0.0.1:" + strconv.Itoa(api)
