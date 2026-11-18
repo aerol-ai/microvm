@@ -44,7 +44,8 @@
 #   verify     aerolvm k8s verify on the live enterprise install.
 #   drills     drills-eks.sh, once for each of setup static pull-storm
 #              slo-breach large-layers ecr-push (each a check of its own;
-#              after a failed setup the rest are recorded as skipped).
+#              after a failed setup the rest are recorded as skipped), or
+#              only those EKS_BANK_DRILLS names.
 #   gateways11 11 gateways (the shard-aware opt-in is on every node), then
 #              drills-eks.sh shard-routes, then back to 3.
 #   scale      fills the cell past its workers' free CPU (fillers sized from
@@ -74,6 +75,9 @@
 # EKS_BANK_TTL (6h), EKS_BANK_SYSTEM (6), EKS_BANK_BASE_WORKERS (6),
 # EKS_BANK_PEAK_WORKERS (60), EKS_BANK_SCALE_MINUTES (60),
 # EKS_BANK_BACK_MINUTES (20), EKS_BANK_GATEWAYS (11), EKS_BANK_PRICE_*.
+# EKS_BANK_DRILLS: the drills the drills step runs, names separated by
+# commas or spaces (unset: all six); setup always runs, first; estimate
+# prices only these.
 # EKS_BANK_KEEP=1: `all` leaves the run up when a step fails (by default it
 # tears it down). EKS_BANK_ACCEPT_ACCOUNT_COSTS=1: go on although the
 # account adds costs of its own (up names them). EKS_BANK_CHART_DIR: a chart
@@ -120,6 +124,35 @@ peak_workers="${EKS_BANK_PEAK_WORKERS:-60}"
 scale_minutes="${EKS_BANK_SCALE_MINUTES:-60}"
 back_minutes="${EKS_BANK_BACK_MINUTES:-20}"
 gateways_peak="${EKS_BANK_GATEWAYS:-11}"
+# The drills step's drills: EKS_BANK_DRILLS, or all of them. They run in
+# this order whatever order they are named in, and setup is always one of
+# them, first: every other drill needs its registry, Prometheus, receiver
+# and client pod, and a run's cell is new. An unknown name refuses the run
+# here, before any step (no AWS call).
+all_drills=(setup static pull-storm slo-breach large-layers ecr-push)
+run_drills_list=("${all_drills[@]}")
+if [[ -n "${EKS_BANK_DRILLS:-}" ]]; then
+  IFS=', ' read -r -a asked_drills <<<"$EKS_BANK_DRILLS"
+  for d in ${asked_drills[@]+"${asked_drills[@]}"}; do
+    [[ -n "$d" ]] || continue
+    [[ " ${all_drills[*]} " == *" $d "* ]] ||
+      { echo "eks-bank.sh: EKS_BANK_DRILLS: \"$d\" is not a drill (setup static pull-storm slo-breach large-layers ecr-push); nothing ran" >&2; exit 2; }
+  done
+  run_drills_list=()
+  for d in "${all_drills[@]}"; do
+    if [[ "$d" == setup || " ${asked_drills[*]-} " == *" $d "* ]]; then run_drills_list+=("$d"); fi
+  done
+fi
+# Each drill's hours for the estimate: the fifth run's times (setup 4.5 min,
+# static 1.5, pull-storm 35, slo-breach 49, large-layers 3.5, ecr-push 51),
+# each rounded up to 0.05 h with its drills-eks.sh start. All six: 2.6 h
+# (that run's drills step took 2.4).
+drill_hours() {
+  case "$1" in
+    setup) echo 0.1 ;; static) echo 0.05 ;; pull-storm) echo 0.6 ;;
+    slo-breach) echo 0.85 ;; large-layers) echo 0.1 ;; ecr-push) echo 0.9 ;;
+  esac
+}
 # The local ports of the run's port-forwards: server-0's admin port (the
 # admin token's calls), a gateway's API port (the API token's), and verify's.
 admin_lport=19219
@@ -232,7 +265,10 @@ same_account() {
 # S3 storage, CloudWatch logs, the Lambda, and cross-zone traffic (the 3 GiB
 # layer drill moves about 18 GB across zones).
 estimate() {
-  EKS_BANK_STEPS="up=0.4 build=0.25 install=0.3 checks=0.25 drills=2.0 gateways11=0.25 scale=$(awk "BEGIN {print ($scale_minutes + $back_minutes) / 60}") down=0.3" \
+  local d dh=0
+  for d in "${run_drills_list[@]}"; do dh="$(awk "BEGIN {print $dh + $(drill_hours "$d")}")"; done
+  EKS_BANK_STEPS="up=0.4 build=0.25 install=0.3 checks=0.25 drills=$dh gateways11=0.25 scale=$(awk "BEGIN {print ($scale_minutes + $back_minutes) / 60}") down=0.3" \
+  EKS_BANK_DRILLS_PRICED="${run_drills_list[*]}" \
   EKS_BANK_ESTIMATE_JSON="$sd/estimate.json" \
   python3 -I - "$ceiling" "$ttl" "$system_nodes" "$base_workers" "$peak_workers" "$scale_minutes" "$back_minutes" <<'PY' | tee "$sd/estimate.txt"
 import os, sys
@@ -263,7 +299,7 @@ for step, h in steps:
     if step == "drills":
         c += drill_extra_h * h
     planned += c
-    print(f"{step:<12}{h:>7.2f}{c:>9.2f}")
+    print(f"{step:<12}{h:>7.2f}{c:>9.2f}" + (f"   ({os.environ['EKS_BANK_DRILLS_PRICED']})" if step == "drills" else ""))
 planned += allowance
 # Worst case: nothing torn down until the teardown timer (compute at the
 # TTL, the control plane 30-60 min later), and the 60 workers held until
@@ -1206,12 +1242,13 @@ stop_check() {
   fi
   check_pid=""
 }
-# run_drills: drills-eks.sh once per drill, each a check of its own, so one
-# that fails does not skip the rest. All of them need setup: after a failed
-# setup the rest are recorded as skipped.
+# run_drills: drills-eks.sh once per drill (run_drills_list: EKS_BANK_DRILLS,
+# or all six), each a check of its own, so one that fails does not skip the
+# rest. All of them need setup: after a failed setup the rest are recorded
+# as skipped.
 run_drills() {
   local d skip=""
-  for d in setup static pull-storm slo-breach large-layers ecr-push; do
+  for d in "${run_drills_list[@]}"; do
     if [[ -n "$skip" ]]; then
       result FAIL "drills-$d" "skipped: drills-eks.sh setup exited $skip"
       failed_checks+=("drills-$d")

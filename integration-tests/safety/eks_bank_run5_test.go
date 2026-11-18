@@ -761,3 +761,72 @@ func TestScaleWayBackWaitsOutAFailedRead(t *testing.T) {
 		t.Errorf("a failed read on the way back ended the step:\n%s\n%s", bank, log)
 	}
 }
+
+// EKS_BANK_DRILLS: the drills step runs only the drills named (setup always,
+// first, in the drills' own order), an unknown name refuses the run before
+// any call, and estimate prices only those drills.
+func TestEKSBankDrillsSubset(t *testing.T) {
+	needTools(t, "python3", "jq")
+	// drills-eks.sh <name> <state-dir> <step>: it notes the drill and passes.
+	runDrills := func(drills string) (string, string, int) {
+		k8s := bankRun(t, "bank-1", "arn:aws:eks:us-east-1:111122223333:cluster/bank-1", true)
+		st := filepath.Join(k8s, ".state", "bank-1")
+		if err := os.WriteFile(filepath.Join(st, "api-token"), []byte("avm_x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ran := filepath.Join(st, "ran")
+		stub := "#!/bin/sh\necho \"$3\" >> \"" + ran + "\"\nmkdir -p \"$2\"; echo \"PASS $3 ok\" >> \"$2/drills.txt\"\n"
+		if err := os.WriteFile(filepath.Join(k8s, "drills-eks.sh"), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env, _ := eksStubs(t)
+		cmd := exec.Command("bash", filepath.Join(k8s, "eks-bank.sh"), "bank-1", "drills")
+		cmd.Env = append(env, "EKS_BANK_DRILLS="+drills)
+		out, _ := cmd.CombinedOutput()
+		return readLog(t, ran), string(out), cmd.ProcessState.ExitCode()
+	}
+	for _, tc := range []struct{ drills, want string }{
+		{"setup,slo-breach", "setup\nslo-breach\n"},
+		{"slo-breach", "setup\nslo-breach\n"},             // setup is added
+		{"ecr-push, static", "setup\nstatic\necr-push\n"}, // the drills' own order
+		{"", "setup\nstatic\npull-storm\nslo-breach\nlarge-layers\necr-push\n"},
+	} {
+		if ran, out, code := runDrills(tc.drills); ran != tc.want || code != 0 {
+			t.Errorf("EKS_BANK_DRILLS=%q: exit %d, ran %q, want %q:\n%s", tc.drills, code, ran, tc.want, out)
+		}
+	}
+
+	// An unknown name: refused before any step, with no call made.
+	k8s := bankRun(t, "bank-1", "arn:aws:eks:us-east-1:111122223333:cluster/bank-1", true)
+	env, log := eksStubs(t)
+	cmd := exec.Command("bash", filepath.Join(k8s, "eks-bank.sh"), "bank-1", "all")
+	cmd.Env = append(env, "EKS_BANK_DRILLS=setup,slo-breech")
+	out, _ := cmd.CombinedOutput()
+	if cmd.ProcessState.ExitCode() != 2 || !strings.Contains(string(out), `EKS_BANK_DRILLS: "slo-breech" is not a drill`) ||
+		strings.Contains(string(out), "--- up") || strings.TrimSpace(readLog(t, log)) != "" {
+		t.Errorf("an unknown drill: exit %d, calls %q:\n%s", cmd.ProcessState.ExitCode(), readLog(t, log), out)
+	}
+
+	// estimate prices the drills named, and only those.
+	estimate := func(drills string) (string, float64) {
+		env, log := eksStubs(t)
+		cmd := exec.Command("bash", k8sFile(t, "eks-bank.sh"), "bank-1", "estimate")
+		cmd.Env = append(env, "DRY_RUN=1", "EKS_BANK_DRY_DIR="+t.TempDir(), "EKS_BANK_DRILLS="+drills)
+		out, err := cmd.CombinedOutput()
+		if err != nil || strings.TrimSpace(readLog(t, log)) != "" {
+			t.Fatalf("estimate: %v, calls %q:\n%s", err, readLog(t, log), out)
+		}
+		row := regexp.MustCompile(`(?m)^drills +([0-9.]+) +[0-9.]+ +\(([a-z -]+)\)$`).FindStringSubmatch(string(out))
+		planned := regexp.MustCompile(`planned: \$([0-9.]+)`).FindStringSubmatch(string(out))
+		if row == nil || planned == nil {
+			t.Fatalf("no drills row or plan:\n%s", out)
+		}
+		p, _ := strconv.ParseFloat(planned[1], 64)
+		return row[1] + " " + row[2], p
+	}
+	sub, subPlanned := estimate("setup,slo-breach")
+	all, allPlanned := estimate("")
+	if sub != "0.95 setup slo-breach" || all != "2.60 setup static pull-storm slo-breach large-layers ecr-push" || subPlanned >= allPlanned {
+		t.Errorf("estimate: subset %q ($%.2f), all %q ($%.2f)", sub, subPlanned, all, allPlanned)
+	}
+}

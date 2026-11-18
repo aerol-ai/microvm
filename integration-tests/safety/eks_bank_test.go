@@ -216,7 +216,7 @@ func TestEKSBankEstimateGuardsUp(t *testing.T) {
 		t.Fatalf("dry run: exit %d, calls %q:\n%s", code, calls, out)
 	}
 	m := regexp.MustCompile(`planned: \$([0-9.]+) .* worst case \(teardown timer at 6 h\): \$([0-9.]+); ceiling \$45\.00`).FindStringSubmatch(out)
-	if m != nil && (m[1] != "30.98" || m[2] != "40.05") {
+	if m != nil && (m[1] != "32.85" || m[2] != "40.05") {
 		t.Errorf("the estimate moved: planned $%s, worst $%s (update the report and this test together)", m[1], m[2])
 	}
 	if m == nil {
