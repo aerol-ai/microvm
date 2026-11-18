@@ -37,6 +37,9 @@ sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; relea
 base_workers=6; peak_workers=60; scale_minutes=60; back_minutes=20; gateways_peak=11
 run_all="$RUN_ALL"; refused=0; downed=0; made_here=1; gated=1
 in_scale=""; drill_pid=""; check_pid=""; check_rc=0; check_undo=""; failed_checks=()
+step_drills=(setup static pull-storm slo-breach large-layers ecr-push); peak_drills=(ecr-storm thresholds)
+all_drills=("${step_drills[@]}" "${peak_drills[@]}"); run_drills_list=("${step_drills[@]}"); run_peak_list=("${peak_drills[@]}")
+refused=0; refuse() { log "refused: $*"; refused=1; exit 2; }
 log() { echo "$*" >> "$OUT/log"; }
 say() { :; }
 result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
@@ -84,6 +87,11 @@ drills() {
 		"stop_scale_drills", "scale_back", "read_workers", "step_scale", "step_gateways11"} {
 		b.WriteString(shellFunc(t, "eks-bank.sh", fn))
 	}
+	// Newer than some of the tests that use this harness: the code before
+	// them runs without (and those tests show what it did).
+	for _, fn := range []string{"peak_unfinished", "parse_drills"} {
+		b.WriteString(shellFuncIf(t, "eks-bank.sh", fn))
+	}
 	b.WriteString(extra)
 	b.WriteString(`
 # The scale step's normal end alone: scale_back, as step_scale calls it.
@@ -128,7 +136,7 @@ func startUndoWith(t *testing.T, extra, check, workers string, env ...string) un
 	}
 	t.Cleanup(func() { out.Close() })
 	cmd := exec.Command("bash", "-c", undoHarnessWith(t, extra, check))
-	cmd.Env = append(append(os.Environ(), "OUT="+dir), env...)
+	cmd.Env = append(append(cleanEnviron(), "OUT="+dir), env...)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -295,7 +303,7 @@ kr() { case "$*" in *aerolnodes*) echo '{"items": [{"spec": {"role": "worker"}, 
 workers_now
 `
 		cmd := exec.Command("bash", "-c", script)
-		cmd.Env = append(os.Environ(), "SERVING="+tc.serving)
+		cmd.Env = append(cleanEnviron(), "SERVING="+tc.serving)
 		out, _ := cmd.CombinedOutput()
 		if cmd.ProcessState.ExitCode() != tc.code || strings.TrimSpace(string(out)) != tc.want {
 			t.Errorf("serving %q: exit %d %q, want %d %q", tc.serving, cmd.ProcessState.ExitCode(), out, tc.code, tc.want)
@@ -345,7 +353,7 @@ echo "${keepers[*]}" > "$OUT/keepers"
 			t.Fatal(err)
 		}
 		cmd := exec.Command("bash", "-c", `trap '' INT TERM; exec bash "$0"`, caller)
-		cmd.Env = append(os.Environ(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-lib.sh")),
+		cmd.Env = append(cleanEnviron(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-lib.sh")),
 			"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 		cmd.Stdout, cmd.Stderr = out, out
 		// In this test's process group, not one of its own: a group that

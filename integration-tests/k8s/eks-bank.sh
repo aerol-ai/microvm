@@ -47,11 +47,15 @@
 #              after a failed setup the rest are recorded as skipped), or
 #              only those EKS_BANK_DRILLS names.
 #   gateways11 11 gateways (the shard-aware opt-in is on every node), then
-#              drills-eks.sh shard-routes, then back to 3.
+#              drills-eks.sh shard-routes, then back to 3. shard-routes is
+#              part of this step, not an EKS_BANK_DRILLS name: it runs
+#              whenever gateways11 does.
 #   scale      fills the cell past its workers' free CPU (fillers sized from
 #              the members and the create policy) until the operator adds
-#              a worker, then 60 workers; ecr-storm and thresholds at 60;
-#              back to 6. Time-boxed (EKS_BANK_SCALE_MINUTES, 60) with
+#              a worker, then 60 workers; ecr-storm and thresholds at 60
+#              (or those of them EKS_BANK_DRILLS names; the other is a SKIP
+#              line); back to 6. A peak drill the time box cuts off, or
+#              that never starts, is a FAIL line. Time-boxed (EKS_BANK_SCALE_MINUTES, 60) with
 #              three guards: the NodePool's CPU limit, an EXIT trap that
 #              scales back, and an AWS schedule that runs the teardown
 #              Lambda's scale-cap phase if this machine is gone.
@@ -75,9 +79,15 @@
 # EKS_BANK_TTL (6h), EKS_BANK_SYSTEM (6), EKS_BANK_BASE_WORKERS (6),
 # EKS_BANK_PEAK_WORKERS (60), EKS_BANK_SCALE_MINUTES (60),
 # EKS_BANK_BACK_MINUTES (20), EKS_BANK_GATEWAYS (11), EKS_BANK_PRICE_*.
-# EKS_BANK_DRILLS: the drills the drills step runs, names separated by
-# commas or spaces (unset: all six); setup always runs, first; estimate
-# prices only these.
+# EKS_BANK_DRILLS: the drills to run, names separated by commas, spaces or
+# newlines; unset or empty: all of them. The drills step's: setup static
+# pull-storm slo-breach large-layers ecr-push; the scale step's peak:
+# ecr-storm thresholds. setup always runs, and ecr-storm brings ecr-push
+# (its images, pushed at 6 workers, not at the peak). estimate prices only
+# these. A value with no names in it, or a name that is not a drill,
+# refuses the run (exit 2), before any AWS call; it is read only when the
+# steps include up, estimate, drills, scale or all, so a value left over in
+# the shell never stops down.
 # EKS_BANK_KEEP=1: `all` leaves the run up when a step fails (by default it
 # tears it down). EKS_BANK_ACCEPT_ACCOUNT_COSTS=1: go on although the
 # account adds costs of its own (up names them). EKS_BANK_CHART_DIR: a chart
@@ -124,25 +134,41 @@ peak_workers="${EKS_BANK_PEAK_WORKERS:-60}"
 scale_minutes="${EKS_BANK_SCALE_MINUTES:-60}"
 back_minutes="${EKS_BANK_BACK_MINUTES:-20}"
 gateways_peak="${EKS_BANK_GATEWAYS:-11}"
-# The drills step's drills: EKS_BANK_DRILLS, or all of them. They run in
-# this order whatever order they are named in, and setup is always one of
-# them, first: every other drill needs its registry, Prometheus, receiver
-# and client pod, and a run's cell is new. An unknown name refuses the run
-# here, before any step (no AWS call).
-all_drills=(setup static pull-storm slo-breach large-layers ecr-push)
-run_drills_list=("${all_drills[@]}")
-if [[ -n "${EKS_BANK_DRILLS:-}" ]]; then
-  IFS=', ' read -r -a asked_drills <<<"$EKS_BANK_DRILLS"
-  for d in ${asked_drills[@]+"${asked_drills[@]}"}; do
+# The drills each step runs (parse_drills): the drills step's, in this
+# order, and the scale step's peak drills. Without EKS_BANK_DRILLS, all.
+step_drills=(setup static pull-storm slo-breach large-layers ecr-push)
+peak_drills=(ecr-storm thresholds)
+all_drills=("${step_drills[@]}" "${peak_drills[@]}")
+run_drills_list=("${step_drills[@]}")
+run_peak_list=("${peak_drills[@]}")
+# parse_drills: EKS_BANK_DRILLS into run_drills_list and run_peak_list. The
+# drills run in the order above whatever order they are named in. setup is
+# always one of them, first: every other drill needs its registry,
+# Prometheus, receiver and client pod, and a run's cell is new. ecr-storm
+# brings ecr-push: without its images, ecr-storm pushed 200 of them itself
+# at the peak, and the time box ended it mid-push with no result. Unset or
+# empty: all of them. No names, or a name that is not a drill: refused.
+parse_drills() {
+  [[ -n "${EKS_BANK_DRILLS:-}" ]] || return 0
+  local asked=() named=" " d
+  IFS=$', \t\n' read -r -d '' -a asked <<<"$EKS_BANK_DRILLS" || true
+  for d in ${asked[@]+"${asked[@]}"}; do
     [[ -n "$d" ]] || continue
     [[ " ${all_drills[*]} " == *" $d "* ]] ||
-      { echo "eks-bank.sh: EKS_BANK_DRILLS: \"$d\" is not a drill (setup static pull-storm slo-breach large-layers ecr-push); nothing ran" >&2; exit 2; }
+      refuse "EKS_BANK_DRILLS: \"$d\" is not a drill (${all_drills[*]})"
+    named+="$d "
   done
+  [[ "$named" != " " ]] || refuse "EKS_BANK_DRILLS has no drill names in it (${all_drills[*]}); unset it to run them all"
+  [[ "$named" != *" ecr-storm "* ]] || named+="ecr-push "
   run_drills_list=()
-  for d in "${all_drills[@]}"; do
-    if [[ "$d" == setup || " ${asked_drills[*]-} " == *" $d "* ]]; then run_drills_list+=("$d"); fi
+  for d in "${step_drills[@]}"; do
+    if [[ "$d" == setup || "$named" == *" $d "* ]]; then run_drills_list+=("$d"); fi
   done
-fi
+  run_peak_list=()
+  for d in "${peak_drills[@]}"; do
+    if [[ "$named" == *" $d "* ]]; then run_peak_list+=("$d"); fi
+  done
+}
 # Each drill's hours for the estimate: the fifth run's times (setup 4.5 min,
 # static 1.5, pull-storm 35, slo-breach 49, large-layers 3.5, ecr-push 51),
 # each rounded up to 0.05 h with its drills-eks.sh start. All six: 2.6 h
@@ -189,7 +215,11 @@ drills_mark=0
 log="$sd/bank.log"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$log" >&2; }
 result() {
-  if [[ "$dry" == 1 ]]; then echo "dry-run: (no result in a dry run) $2" >&2; return 0; fi
+  if [[ "$dry" == 1 ]]; then
+    # A SKIP is decided before anything runs, so a dry run can show it.
+    if [[ "$1" == SKIP ]]; then echo "dry-run: SKIP $2 $3" >&2; else echo "dry-run: (no result in a dry run) $2" >&2; fi
+    return 0
+  fi
   echo "$1 $2 $3" | tee -a "$sd/bank.txt" "$log"
 }
 now() { date +%s; }
@@ -1003,18 +1033,30 @@ step_scale() {
   result "$([[ "$dry" == 1 || "$w" -ge "$peak_workers" ]] && echo PASS || echo FAIL)" scale-peak \
     "minWorkers $peak_workers: $w workers serving on $m machines $(( $(now) - tp ))s later"
 
-  # 3. At the peak, until the box ends: the ECR storm and the thresholds.
+  # 3. At the peak, until the box ends: the ECR storm and the thresholds,
+  #    those of them run_peak_list holds (EKS_BANK_DRILLS); one it leaves
+  #    out is a SKIP line.
+  local d peak="$out/peak"
+  for d in "${peak_drills[@]}"; do
+    [[ " ${run_peak_list[*]-} " == *" $d "* ]] || result SKIP "$d" "not in EKS_BANK_DRILLS"
+  done
   if [[ "$dry" == 1 ]]; then
-    drills ecr-storm
-    drills thresholds
+    for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do drills "$d"; done
   else
-    # Two runs of drills-eks.sh, so one that fails does not skip the
-    # other; a run that fails is recorded here (its own PASS or FAIL lines
-    # go to drills/drills.txt).
+    # One run of drills-eks.sh each, so one that fails does not skip the
+    # next; a run that fails is recorded here (its own PASS or FAIL lines
+    # go to drills/drills.txt). Each marks its start and its end, so one
+    # the time box cuts off, or never starts, gets a FAIL line too
+    # (peak_unfinished): the fifth-run fix's re-run plan would have lost
+    # both without a word.
+    mkdir -p "$peak"
+    rm -f "$peak"/*.started "$peak"/*.ended
     (
-      for d in ecr-storm thresholds; do
+      for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do
+        now > "$peak/$d.started"
         rc=0
         drills "$d" || rc=$?
+        : > "$peak/$d.ended"
         [[ "$rc" == 0 ]] || result FAIL "$d" "drills-eks.sh $d exited $rc"
       done
     ) &
@@ -1029,6 +1071,7 @@ step_scale() {
     done
     wait "$drill_pid" 2>/dev/null || true
     drill_pid=""
+    peak_unfinished "$peak"
   fi
 
   # 4. Back: the floor to the base, the fill gone; the operator decommissions
@@ -1065,6 +1108,19 @@ fill_plan() {
     : > "$out/create-policy.yaml"
   python3 -I "$HERE/drills-local/fillplan.py" "$out/members.json" "$out/create-policy.yaml" --past 1 > "$out/fill-plan.json" || return 1
   jq -r '"\(.cpu) \(.count)"' "$out/fill-plan.json"
+}
+# peak_unfinished <dir>: a FAIL line for each peak drill that did not end:
+# cut off by the time box (it started) or not started at all.
+peak_unfinished() {
+  local d
+  for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do
+    [[ ! -f "$1/$d.ended" ]] || continue
+    if [[ -f "$1/$d.started" ]]; then
+      result FAIL "$d" "cut off by the time box after $(( $(now) - $(cat "$1/$d.started") ))s"
+    else
+      result FAIL "$d" "not started: the time box ended first"
+    fi
+  done
 }
 # end_extra_machines: past the way back, the machines above the base are
 # ended directly: every Karpenter machine of this run but those under the
@@ -1312,6 +1368,9 @@ if [[ "$1" == all ]]; then
   run_all=1
   steps=(up build install enterprise nlb gvisor verify drills gateways11 scale down)
 fi
+# EKS_BANK_DRILLS matters to these steps only (up runs estimate): a value
+# left in the shell never stops down, or a run of the other steps.
+if [[ " ${steps[*]} " =~ \ (up|estimate|drills|scale)\  ]]; then parse_drills; fi
 for step in "${steps[@]}"; do
   case "$step" in
     up|estimate) ;;

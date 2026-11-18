@@ -52,7 +52,7 @@ exit 1`
 			t.Fatal(err)
 		}
 	}
-	env := append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log, "HELM=helm")
+	env := append(cleanEnviron(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log, "HELM=helm")
 	return env, log
 }
 
@@ -432,7 +432,7 @@ func TestEKSBankTeardownLambdaPhases(t *testing.T) {
 		cmd := exec.Command("python3", "-I", "-c",
 			"import sys; sys.path[:0] = sys.argv[1:3]; import teardown; print(teardown.handler({'phase': sys.argv[3]}, None))",
 			fake, lambdaDir, phase)
-		cmd.Env = append(os.Environ(), "CLUSTER=bank-1", "KARPENTER_ROLE=bank-1-karpenter", "FAKE_LOG="+log, "FAKE_STATE="+string(raw),
+		cmd.Env = append(cleanEnviron(), "CLUSTER=bank-1", "KARPENTER_ROLE=bank-1-karpenter", "FAKE_LOG="+log, "FAKE_STATE="+string(raw),
 			"SECOND_SWEEP_DELAY=0", "TTL=2026-11-18T00:00:00Z")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", phase, err, out)
