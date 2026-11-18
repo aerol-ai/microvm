@@ -375,20 +375,42 @@ func (k *kernel) awaitReady(ctx context.Context, language string) error {
 		if !ok {
 			return k.exitedEarly(language)
 		}
-		switch fr.kind {
-		case "READY":
-			return nil
-		case "FATAL":
-			return fmt.Errorf("codeinterp: %s driver failed to start: %s", language, strings.TrimSpace(string(fr.payload)))
-		}
-		return fmt.Errorf("codeinterp: %s driver sent %s before READY", language, fr.kind)
+		return readyFrame(language, fr)
 	case <-k.exited:
+		// A driver that writes FATAL and exits at once can be seen to exit
+		// before the event reader hands that frame over (k.frames is
+		// unbuffered), and the frame carries the reason. Take what the
+		// event pipe still holds, bounded like the stderr drain: the
+		// reader ends at EOF, or at its read deadline if a background
+		// child holds the pipe. READY from a driver that already exited is
+		// still an early exit.
+		drain := time.NewTimer(readyDrain)
+		defer drain.Stop()
+		select {
+		case fr, ok := <-k.frames:
+			if ok && fr.kind != "READY" {
+				return readyFrame(language, fr)
+			}
+		case <-drain.C:
+		}
 		return k.exitedEarly(language)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
 		return fmt.Errorf("codeinterp: %s driver did not start within %s", language, codeinterp.LaunchTimeout)
 	}
+}
+
+// readyFrame turns the driver's first frame into Launch's answer: nil for
+// READY, its reason for FATAL, an error for anything else.
+func readyFrame(language string, fr frame) error {
+	switch fr.kind {
+	case "READY":
+		return nil
+	case "FATAL":
+		return fmt.Errorf("codeinterp: %s driver failed to start: %s", language, strings.TrimSpace(string(fr.payload)))
+	}
+	return fmt.Errorf("codeinterp: %s driver sent %s before READY", language, fr.kind)
 }
 
 // exitedEarly explains a driver that ended before READY: most often the
