@@ -139,7 +139,7 @@ In a cluster, one server runs each sandbox, but SSH logins arrive at any ingress
 ssh -i sandbox_key -p 2220 sb-0123456789abcdef@sandbox.example.com
 ```
 
-When a login reaches a server that does not run the sandbox, that server checks the key against the server that does. It then passes the session there over the cluster's private, encrypted channel. Only the sandbox's public key and the session itself cross between servers. The key is checked on every login and never cached, so a changed key takes effect at once.
+When a login reaches a server that does not run the sandbox, that server asks the server that does whether the key the client logged in with is the sandbox's key. It sends the key's fingerprint, and the sandbox's key does not leave the server that runs it. The session then goes there over the cluster's private, encrypted channel, and each of its calls names the key again: the server that runs the sandbox serves it only for the sandbox's key. The key is checked on every login and never cached, so a changed key takes effect at once.
 
 ## Next steps
 

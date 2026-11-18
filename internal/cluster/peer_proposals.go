@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -22,8 +23,10 @@ import (
 //	op                                     a worker or gateway may send it when
 //	place, claim orphan                    it names the sender as the owner (a
 //	                                       claim also only of the sender's
-//	                                       orphan); never a gateway, which owns
-//	                                       no sandbox
+//	                                       orphan; a place on a row that exists
+//	                                       only from its owner, for a
+//	                                       reservation its target); never a
+//	                                       gateway, which owns no sandbox
 //	spec, ports, custom domains            the sender owns the sandbox now
 //	secret recipients, delete, begin       the write is fenced on the sender as
 //	delete, move abort                     the owner (the FSM checks the fence)
@@ -44,7 +47,10 @@ import (
 //	                                       (the attach and create routes go
 //	                                       there first)
 //	reserve                                any: a reservation never enters
-//	                                       the owner index (fsm.go)
+//	                                       the owner index (fsm.go); a retry
+//	                                       of a live one only from the node
+//	                                       that reserved it or its target, and
+//	                                       never naming another account
 //	cancel reserve                         the reservation is the sender's:
 //	                                       it reserved it or is its target
 //	volume rows and attachments            any (tenant rows, not a node's)
@@ -161,6 +167,19 @@ func (c *Cluster) stampProposal(payload []byte, cmd command, sender string, serv
 			cmd.ReservedBy, changed = sender, true
 		}
 	}
+	if !server && cmd.Op == opUpsertVolume && cmd.Volume != nil {
+		// Once servers sign, a worker's upsert passes only for a row that
+		// exists (volume_proposals.go). The command carries that row, not
+		// the sender's: should the row go between this check and the
+		// apply, the get-or-create makes it again as a server made it,
+		// never from a source the sender chose.
+		if (leaderProposalState{placementFSM: c.fsm, c: c}).serversSign() {
+			if row, ok := c.fsm.volumeByNameForProposal(cmd.Volume.Tenant, cmd.Volume.Name); ok && *cmd.Volume != row {
+				row := row
+				cmd.Volume, changed = &row, true
+			}
+		}
+	}
 	if !server {
 		switch cmd.Op {
 		case opPlace, opClaimOrphan, opReassign, opReserve:
@@ -216,6 +235,32 @@ func (c *Cluster) memberRecord(nodeID string) (Member, bool) {
 	return c.gossip.lookupMember(nodeID)
 }
 
+// identityKeptBy reports whether a worker's or gateway's cmd leaves a
+// placement's cloud identity and owner as a server set them: a reservation
+// carries no identity; a place or spec write carries none or the one the
+// placement has; a place names no other owner. Dropping an identity is
+// allowed: it only stops the tokens.
+func identityKeptBy(cmd command, st proposalState) bool {
+	wants := cmd.Spec != nil && cmd.Spec.Identity != nil
+	switch cmd.Op {
+	case opReserve:
+		return !wants
+	case opPlace, opUpsertSpec:
+		if cmd.Op == opPlace && strings.TrimSpace(cmd.OwnerRef) != "" {
+			if cur, ok := st.placementForProposal(cmd.SandboxID, false); ok && strings.TrimSpace(cur.OwnerRef) != strings.TrimSpace(cmd.OwnerRef) {
+				return false
+			}
+		}
+		if !wants {
+			return true
+		}
+		cur, ok := st.placementForProposal(cmd.SandboxID, true)
+		return ok && cur.Spec != nil && cur.Spec.Identity != nil &&
+			cloudidentity.Request(*cur.Spec.Identity).Normalize() == cloudidentity.Request(*cmd.Spec.Identity).Normalize()
+	}
+	return true
+}
+
 // proposalState is what the rule reads from the leader: its FSM, its
 // membership view and its configuration (leaderProposalState).
 type proposalState interface {
@@ -226,6 +271,30 @@ type proposalState interface {
 	// node that holds it now, by the rule the listing applies
 	// (volumeReclaimsFor).
 	reclaimAdoptable(cur VolumeReclaim, sender string) bool
+	// serversSign reports whether the server signing record exists.
+	serversSign() bool
+	// proposalNowUnix is the leader's clock, for whether a reservation is
+	// still live.
+	proposalNowUnix() int64
+	// volumeForProposal and volumeByNameForProposal read one volume row
+	// (volume_proposals.go).
+	volumeForProposal(tenant, id string) (models.Volume, bool)
+	volumeByNameForProposal(tenant, name string) (models.Volume, bool)
+}
+
+func (s leaderProposalState) proposalNowUnix() int64 {
+	if s.now.IsZero() {
+		return time.Now().Unix()
+	}
+	return s.now.Unix()
+}
+
+func (s leaderProposalState) serversSign() bool {
+	if s.placementFSM == nil {
+		return false
+	}
+	_, ok := s.serverSigningRecord()
+	return ok
 }
 
 // leaderProposalState is the leader's proposalState: its FSM, plus its
@@ -305,9 +374,29 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 			return false
 		}
 	}
+	// Once servers sign (fsm_server_signing.go), a cloud identity in a
+	// placement's spec, and the placement's owner, are what a server signs
+	// the sandbox's identity tokens from: only a server sets either.
+	if st.serversSign() && !identityKeptBy(cmd, st) {
+		return false
+	}
+	switch cmd.Op {
+	case opUpsertVolume, opDeleteVolume, opPutVolumeAttach, opDeleteVolumeAttach:
+		if st.serversSign() {
+			return volumeWriteBound(cmd, sender, st)
+		}
+	}
 	switch cmd.Op {
 	case opPlace:
-		return is(cmd.OwnerNodeID)
+		if !is(cmd.OwnerNodeID) {
+			return false
+		}
+		// Only the node that runs a row places it again: a reservation's
+		// target, a placement's owner.
+		p, ok := st.placementForProposal(cmd.SandboxID, false)
+		return !ok || is(p.OwnerNodeID)
+	case opReserve:
+		return reserveRetryBound(cmd, sender, st)
 	case opClaimOrphan:
 		if !is(cmd.OwnerNodeID) {
 			return false
@@ -380,9 +469,28 @@ func peerMayPropose(role, sender string, cmd command, st proposalState) bool {
 		cur, ok := st.volumeReclaimForProposal(*cmd.VolumeReclaim)
 		return !ok || is(cur.NodeID)
 	}
-	// opReserve and the tenant volume rows and attachments: open to any
-	// node (see the table above).
+	// The tenant volume rows and attachments before servers sign: open to
+	// any node (see the table above).
 	return true
+}
+
+// reserveRetryBound reports whether a worker's or gateway's reserve may
+// go to the FSM. A new reservation, or one over an expired row, is open to
+// any node. A reserve that names a live reservation's target is a retry
+// (fsm.go isReservationRetry): it comes only from the node that reserved
+// it or the target, as a cancel does, and names no other account, which
+// would change whose create it is.
+func reserveRetryBound(cmd command, sender string, st proposalState) bool {
+	p, ok := st.placementForProposal(cmd.SandboxID, false)
+	if !ok || !p.IsReserved() || p.OwnerNodeID != cmd.OwnerNodeID || st.proposalNowUnix() > p.ExpiresUnix {
+		return true // the FSM answers a new reservation, or a conflict
+	}
+	is := func(id string) bool { id = strings.TrimSpace(id); return id != "" && id == sender }
+	if !is(p.OwnerNodeID) && !is(p.ReservedBy) {
+		return false
+	}
+	ref := strings.TrimSpace(cmd.OwnerRef)
+	return ref == "" || ref == strings.TrimSpace(p.OwnerRef)
 }
 
 // placementForProposal reads one placement for the rule; withSpec resolves

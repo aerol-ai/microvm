@@ -61,6 +61,10 @@ type ActiveVersion struct {
 	Release     string `json:"release,omitempty"`
 	RolloutID   string `json:"rollout_id,omitempty"`
 	SetUnixNano int64  `json:"set_unix_nano"`
+	// FromFV is the version this one moved from: 0 for the first write,
+	// which counts only the servers (active_version.go). A finalize
+	// (RolloutID) or a later move counted every member.
+	FromFV int `json:"from_fv,omitempty"`
 }
 
 // ActiveVersionCommand is opSetActiveVersion: move the active version from
@@ -240,7 +244,7 @@ func (f *placementFSM) applySetActiveVersionLocked(cmd command) (any, error) {
 	if cur != nil && in.FV == curFV && in.Release == cur.Release {
 		return activeVersionApplyResult{Active: *cur}, nil
 	}
-	next := ActiveVersion{FV: in.FV, Release: strings.TrimSpace(in.Release), SetUnixNano: cmd.StampUnixNano}
+	next := ActiveVersion{FV: in.FV, Release: strings.TrimSpace(in.Release), SetUnixNano: cmd.StampUnixNano, FromFV: curFV}
 	f.activeVersion = &next
 	f.publishActiveLocked()
 	return activeVersionApplyResult{Active: next, Changed: true}, nil
@@ -361,6 +365,7 @@ func (f *placementFSM) applyRolloutCommandLocked(cmd command) (any, error) {
 					a := *in.Active
 					a.RolloutID = next.ID
 					a.SetUnixNano = stamp
+					a.FromFV = curFV
 					f.activeVersion = &a
 					f.publishActiveLocked()
 				}

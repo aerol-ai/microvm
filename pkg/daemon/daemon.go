@@ -821,6 +821,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
 	wireCloudIdentity(ctx, cfg, svc, logger)
+	// Servers keep the cluster's server-only signing record (a no-op on
+	// any other node and outside a cluster).
+	svc.StartServerSigningUpkeep(ctx)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means

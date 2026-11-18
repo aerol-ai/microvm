@@ -13,8 +13,13 @@ type peerClientCache struct {
 }
 
 func (c *peerClientCache) get(base *http.Client, nodeID string) *http.Client {
+	return c.getWith(base, nodeID, ClientForPeer)
+}
+
+// getWith is get for a cache whose clients make builds.
+func (c *peerClientCache) getWith(base *http.Client, nodeID string, make func(*http.Client, string) *http.Client) *http.Client {
 	if c == nil {
-		return ClientForPeer(base, nodeID)
+		return make(base, nodeID)
 	}
 	nodeID = strings.TrimSpace(nodeID)
 	if base == nil || nodeID == "" {
@@ -25,7 +30,7 @@ func (c *peerClientCache) get(base *http.Client, nodeID string) *http.Client {
 			return client
 		}
 	}
-	client := ClientForPeer(base, nodeID)
+	client := make(base, nodeID)
 	if client == nil || client == base {
 		return client
 	}

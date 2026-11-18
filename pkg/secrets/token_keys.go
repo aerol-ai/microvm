@@ -14,9 +14,9 @@ import (
 const sandboxTokenKeyInfo = "aerolvm-sandbox-token/v1"
 
 // deriveSandboxTokenKey turns a 32-byte server key into its token signing
-// key. Deterministic on purpose: every node of a cluster holds the same
-// server key ring, so every node derives the same key pair from it and can
-// check a token any node signed, with no key distribution of its own.
+// key. Deterministic on purpose: a node that holds the ring derives the
+// same key pair from it each time, with no key store of its own. A cluster
+// whose servers sign uses the servers' keys instead (server_keys.go).
 func deriveSandboxTokenKey(key []byte) (ed25519.PrivateKey, error) {
 	seed, err := hkdf.Key(sha256.New, key, nil, sandboxTokenKeyInfo, ed25519.SeedSize)
 	if err != nil {

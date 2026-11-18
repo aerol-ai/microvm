@@ -103,11 +103,12 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// operator enabled platform volumes (412 when off), so the SDK still gets a
 	// clear signal on deployments that haven't configured a backend.
 	// Volume metadata is replicated through the cluster FSM (or local SQLite in
-	// single-node mode), so any node answers these consistently — no per-tenant
-	// owner routing needed.
+	// single-node mode), so any node answers the reads consistently — no
+	// per-tenant owner routing needed. A worker or gateway sends the writes
+	// on to a server (volumes_via_servers.go).
 	mux.Handle("GET "+PathPrefix+"/volumes", d.Route(permRead, http.HandlerFunc(h.listVolumes)))
-	mux.Handle("POST "+PathPrefix+"/volumes", d.Route(permWrite, http.HandlerFunc(h.createVolume)))
+	mux.Handle("POST "+PathPrefix+"/volumes", d.Route(permWrite, h.volumeWritesViaServers(http.HandlerFunc(h.createVolume))))
 	mux.Handle("GET "+PathPrefix+"/volumes/{volumeId}", d.Route(permRead, http.HandlerFunc(h.getVolume)))
-	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Route(permWrite, http.HandlerFunc(h.deleteVolume)))
+	mux.Handle("DELETE "+PathPrefix+"/volumes/{volumeId}", d.Route(permWrite, h.volumeWritesViaServers(http.HandlerFunc(h.deleteVolume))))
 	mux.Handle("GET "+PathPrefix+"/volumes/by-name/{name}", d.Route(permRead, http.HandlerFunc(h.getVolumeByName)))
 }

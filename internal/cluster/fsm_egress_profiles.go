@@ -31,7 +31,7 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 21
+	fsmOpsVersion              = 22
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
@@ -82,7 +82,9 @@ const (
 // opAdmitNodeByCert (externalCAFSMOpsVersion in fsm_join.go); 20 is
 // opSetKubeWarmDepths (kubeWarmFSMOpsVersion in fsm_kube_warm.go); 21 is
 // opMoveHandoff and opReassign's ExpectedMoveToken (moveHandoffFSMOpsVersion
-// in fsm_move_handoff.go). Versions
+// in fsm_move_handoff.go); 22 is opPutServerSigning and the server-only
+// signing it carries (serverSigningFSMOpsVersion in fsm_server_signing.go).
+// Versions
 // 6 to 8 are the gates in the block above.
 
 // FSMOpsVersion returns fsmOpsVersion, so `sandboxd version` can print it

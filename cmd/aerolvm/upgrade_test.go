@@ -579,3 +579,37 @@ func TestUpgradeRefusalShapes(t *testing.T) {
 		t.Fatal("transient")
 	}
 }
+
+// upgrade signing: the status, then the operator's start and end of old
+// tokens; a single node has none of it.
+func TestUpgradeSigning(t *testing.T) {
+	f := newFakeUpgrade(t, true, "v0.7.7")
+	f.signing = upgradewire.ServerSigningStatus{ActiveFSMOpsVersion: 22, NeedsFSMOpsVersion: 22, Waiting: []string{"wkr-quiet"},
+		Blocked: "these members report a version below 22, or none: wkr-quiet"}
+	h := upgradeHarness(t, f)
+	for _, s := range []struct {
+		args []string
+		code int
+		want []string
+	}{
+		{[]string{"upgrade", "signing", "end-old-tokens"}, exitError, []string{"no old tokens to end"}},
+		{[]string{"upgrade", "signing"}, exitOK, []string{"servers do not sign sandbox tokens yet (cluster version 22, they sign from 22)", "why: these members", "reporting none: wkr-quiet"}},
+		{[]string{"upgrade", "signing", "start"}, exitOK, []string{"servers sign sandbox tokens and cloud-identity tokens since 2026-11-07T10:00:01Z", "work until they expire"}},
+		{[]string{"upgrade", "signing", "end-old-tokens"}, exitOK, []string{"stopped working at 2026-11-07T10:00:02Z"}},
+		{[]string{"upgrade", "signing", "-o", "json"}, exitOK, []string{`"on": true`, `"old_tokens_end": "2026-11-07T10:00:02Z"`}},
+		{[]string{"upgrade", "signing", "now"}, exitUsage, []string{"signing takes start, end-old-tokens or nothing"}},
+		{[]string{"upgrade", "signing", "-o", "wide"}, exitUsage, []string{"-o must be json or yaml"}},
+	} {
+		code := h.run(s.args...)
+		out := h.stdout.String() + h.stderr.String()
+		for _, want := range s.want {
+			if code != s.code || !strings.Contains(out, want) {
+				t.Errorf("%v = %d %q, want %q", s.args, code, out, want)
+			}
+		}
+	}
+	single := upgradeHarness(t, newFakeUpgrade(t, false, "v0.7.7"))
+	if code := single.run("upgrade", "signing"); code != exitError || !strings.Contains(single.stderr.String(), "signs its own sandbox tokens") {
+		t.Fatalf("single node = %d %q", code, single.stderr.String())
+	}
+}

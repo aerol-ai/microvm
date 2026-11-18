@@ -40,6 +40,7 @@ Usage: aerolvm upgrade plan <version> [--from <dir>|<bundle.tgz>] [--batch <n|n%
        aerolvm upgrade resume
        aerolvm upgrade finalize
        aerolvm upgrade rollback [--wait]
+       aerolvm upgrade signing [start|end-old-tokens]
 
 plan prints what apply would do, and changes nothing: each node's role and
 version, whether the jump is allowed (and the releases to step through when
@@ -62,6 +63,15 @@ stop finishes the nodes in progress and starts no new one. resume continues
 a paused rollout. finalize turns on the new cluster version after a --hold
 rollout. rollback puts every node back on the previous version (only before
 finalize). Each one succeeds again when repeated.
+
+signing shows whether only servers sign sandbox tokens and cloud-identity
+tokens yet (cluster version 22 on), since when, and which members hold it
+back. "signing start" starts it anyway, past members that report an older
+version or none: those members then cannot check the new tokens.
+"signing end-old-tokens" stops every token signed before servers took
+over, at once; without it they work until they expire (at most the token
+max TTL after the cutover). Both are recorded in the audit log, and there
+is no way back from either.
 
 Flags (plan, apply):
   --from <dir|tgz>     take the files from a directory (with its
@@ -124,10 +134,78 @@ func runUpgrade(ctx context.Context, a *app, args []string) int {
 		return a.rolloutCommand(ctx, args, "finalize", upgradewire.ClusterUpgradeFinalizePath)
 	case "rollback":
 		return runUpgradeRollback(ctx, a, args)
+	case "signing":
+		return runUpgradeSigning(ctx, a, args)
 	case "":
-		return a.usageError(nil, "upgrade", "expected a subcommand: plan, apply, status, stop, resume, finalize or rollback")
+		return a.usageError(nil, "upgrade", "expected a subcommand: plan, apply, status, stop, resume, finalize, rollback or signing")
 	}
-	return a.usageError(nil, "upgrade", "unknown subcommand %q: expected plan, apply, status, stop, resume, finalize or rollback", sub)
+	return a.usageError(nil, "upgrade", "unknown subcommand %q: expected plan, apply, status, stop, resume, finalize, rollback or signing", sub)
+}
+
+// runUpgradeSigning shows whether only servers sign yet, or runs one of
+// the two operator calls on it.
+func runUpgradeSigning(ctx context.Context, a *app, args []string) int {
+	fs, c := a.newFlagSet("upgrade signing")
+	var output string
+	fs.StringVar(&output, "o", "", "")
+	fs.StringVar(&output, "output", "", "")
+	pos, _, err := parseArgs(fs, args)
+	if err != nil {
+		return a.flagError(c, "upgrade", err)
+	}
+	call := upgradeCall{method: http.MethodGet, path: upgradewire.ClusterUpgradeSigningPath, timeout: upgradeCallTimeout}
+	switch {
+	case len(pos) == 0:
+	case len(pos) == 1 && pos[0] == "start":
+		call.method, call.path = http.MethodPost, upgradewire.ClusterUpgradeSigningStartPath
+	case len(pos) == 1 && pos[0] == "end-old-tokens":
+		call.method, call.path = http.MethodPost, upgradewire.ClusterUpgradeSigningEndOldTokensPath
+	default:
+		return a.usageError(c, "upgrade", "signing takes start, end-old-tokens or nothing, got %q", strings.Join(pos, " "))
+	}
+	format, ok := outputFormat(c, output, "json", "yaml")
+	if !ok {
+		return a.usageError(c, "upgrade", "-o must be json or yaml, got %q", format)
+	}
+	t, err := a.upgradeTarget(ctx, c)
+	if err != nil {
+		return a.fail(c, err, exitError)
+	}
+	if !t.cluster {
+		return a.fail(c, &agenttools.Error{Code: upgradewire.ErrCodeNotClusterMode,
+			Message: "this sandboxd is a single node: it signs its own sandbox tokens"}, exitError)
+	}
+	var st upgradewire.ServerSigningStatus
+	call.out = &st
+	if _, err := a.upgradeDo(ctx, c, t.conn, call); err != nil {
+		return a.fail(c, err, exitError)
+	}
+	if format != "" {
+		a.printValue(format, st)
+		return exitOK
+	}
+	a.printServerSigning(st)
+	return exitOK
+}
+
+// printServerSigning prints the status in a few lines.
+func (a *app) printServerSigning(st upgradewire.ServerSigningStatus) {
+	if st.On {
+		fmt.Fprintf(a.stdout, "servers sign sandbox tokens and cloud-identity tokens since %s\n", st.Since.Format(time.RFC3339))
+		if st.OldTokensEnd != nil {
+			fmt.Fprintf(a.stdout, "tokens signed before that stopped working at %s\n", st.OldTokensEnd.Format(time.RFC3339))
+		} else {
+			fmt.Fprintln(a.stdout, "tokens signed before that work until they expire (end them now: aerolvm upgrade signing end-old-tokens)")
+		}
+	} else {
+		fmt.Fprintf(a.stdout, "servers do not sign sandbox tokens yet (cluster version %d, they sign from %d)\n", st.ActiveFSMOpsVersion, st.NeedsFSMOpsVersion)
+		if st.Blocked != "" {
+			fmt.Fprintf(a.stdout, "why: %s\n", st.Blocked)
+		}
+	}
+	if len(st.Waiting) > 0 {
+		fmt.Fprintf(a.stdout, "members on an older version, or reporting none: %s\n", strings.Join(st.Waiting, ", "))
+	}
 }
 
 // upgradeTarget is the sandboxd the command talks to.

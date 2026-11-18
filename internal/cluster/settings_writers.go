@@ -69,6 +69,14 @@ func (c *Cluster) CheckIdentityWriter(peerID string, leaf *x509.Certificate, req
 	if c == nil || c.fsm == nil {
 		return fmt.Errorf("%w: node holds no placement state", ErrIdentityWriterRefused)
 	}
+	if _, serversSign := c.fsm.serverSigningRecord(); serversSign {
+		// The keys are sealed with the servers' own key now
+		// (fsm_server_signing.go): only a server makes or keeps them.
+		if c.logger != nil {
+			c.logger.Warn("cluster: refused an identity key write from a node that is not a server", "peer", strings.TrimSpace(peerID))
+		}
+		return fmt.Errorf("%w: only servers keep the signing keys", ErrIdentityWriterRefused)
+	}
 	err := identityKeyUpkeep(c.fsm.identityKeys(), req)
 	if err != nil && errors.Is(err, ErrIdentityWriterRefused) && c.logger != nil {
 		c.logger.Warn("cluster: refused an identity write from a node that is not a server",

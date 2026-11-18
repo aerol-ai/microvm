@@ -32,6 +32,7 @@ Where every node keeps its [audit evidence](/enterprise/audit-evidence/) off the
 | `audit.credentials.serviceAccount` | IRSA: `create: true` makes the service account `<release>-node` in each namespace a node runs in, with your `annotations` (`eks.amazonaws.com/role-arn`), and runs every node under it. The role reaches each pod's AerolVM server container only. That account has no Kubernetes rights. With `cluster.agentSandboxAPI` the gateways keep their own account, `<cluster>-gateway`, which has that API's rights and gets the same annotations: trust it in the role too. EKS Pod Identity is not supported. | off |
 | `audit.credentials.existingSecret` | Or a Secret with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, in each namespace a node runs in. | none |
 | `audit.credentials.caBundle` | `existingConfigMap` and `key`: the CA certificate of a private S3 endpoint, in each namespace a node runs in. | none |
+| `cloudIdentity.issuerURL` | Turn on [sandbox cloud identity](/sandbox-cloud-identity/) on every node: the HTTPS address, with no path, your clouds fetch the public keys from, such as `https://api.example.com`. In cluster mode the servers sign the tokens and the gateways serve the keys, so do not set `SB_IDENTITY_ISSUER_URL` in `worker.extraEnv`. A pod reads it when it is made. | none |
 
 ## Worker pods
 
@@ -54,7 +55,7 @@ These shape every worker pod: the single-mode pod, and every cluster-mode worker
 | `worker.registryCA` | Your own CA, for a registry whose HTTPS certificate it signed: `existingConfigMap` (in the worker namespace in cluster mode) and its `key`. Workers trust it beside the public CAs for image pulls, and for anything else the AerolVM server connects to over HTTPS. | public CAs only |
 | `worker.egressDenyFloor` | [Addresses no sandbox can ever reach](/kubernetes/networking/#tell-aerolvm-your-clusters-addresses), such as the Kubernetes API server. | none |
 | `worker.egressPrivateRanges` | Your pod, Service and node CIDRs. Closed to sandboxes unless an egress profile opens one. Needs `worker.blockPrivateByDefault`. | none |
-| `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. | none |
+| `worker.extraEnv` | Any other server setting, as `SB_NAME: value`. In cluster mode the `SB_CLUSTER_*` settings reach the servers and gateways too, and the `SB_PLATFORM_VOLUMES_*` settings reach the servers, which make [platform volume](/platform-volumes/) records. | none |
 | `worker.containerdVolume` | A volume source for images and sandbox files. Use a [local disk](/kubernetes/single-node/#keep-data-across-restarts) for real work. | `emptyDir` |
 | `worker.stateVolume` | A volume source for the server's database. | `emptyDir` |
 | `worker.nodeSelector`, `worker.tolerations`, `worker.affinity` | Single mode: where the pod runs. In cluster mode, each worker pool's own `nodeSelector` and `tolerations` decide. | none |

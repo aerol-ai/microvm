@@ -181,6 +181,8 @@ type fakeUpgrade struct {
 	applyReqs             []upgradewire.ApplyRequest
 	manual                map[string]bool
 	nextID                int
+	// signing is the server signing status the signing routes answer.
+	signing upgradewire.ServerSigningStatus
 }
 
 func newFakeUpgrade(t *testing.T, cluster bool, running string) *fakeUpgrade {
@@ -253,6 +255,8 @@ func (f *fakeUpgrade) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.nodeStatus(w, r)
+	case strings.HasPrefix(path, upgradewire.ClusterUpgradeSigningPath) && f.cluster:
+		f.serveSigning(w, r, path)
 	case strings.HasPrefix(path, upgradewire.ClusterUpgradePath):
 		if !f.cluster {
 			f.refuse(w, http.StatusConflict, upgradewire.ErrCodeNotClusterMode, "this sandboxd is a single node", "")
@@ -642,4 +646,29 @@ func stdFleet(f *fakeUpgrade, from string) {
 		{"node_id": "wkr-2", "role": "worker", "alive": true, "version": from},
 		{"node_id": "wkr-3", "role": "worker", "alive": true, "version": from},
 	}
+}
+
+// serveSigning answers the server signing routes.
+func (f *fakeUpgrade) serveSigning(w http.ResponseWriter, r *http.Request, path string) {
+	switch {
+	case r.Method == http.MethodGet && path == upgradewire.ClusterUpgradeSigningPath:
+	case r.Method == http.MethodPost && path == upgradewire.ClusterUpgradeSigningStartPath:
+		if !f.signing.On {
+			since := f.tick()
+			f.signing.On, f.signing.Since, f.signing.Blocked = true, &since, ""
+		}
+	case r.Method == http.MethodPost && path == upgradewire.ClusterUpgradeSigningEndOldTokensPath:
+		if !f.signing.On {
+			f.refuse(w, http.StatusConflict, "server_signing_off", "servers do not sign yet: there are no old tokens to end", "aerolvm upgrade signing")
+			return
+		}
+		if f.signing.OldTokensEnd == nil {
+			end := f.tick()
+			f.signing.OldTokensEnd = &end
+		}
+	default:
+		writeFakeJSON(w, http.StatusNotFound, map[string]string{"error": "no route"})
+		return
+	}
+	writeFakeJSON(w, http.StatusOK, f.signing)
 }
