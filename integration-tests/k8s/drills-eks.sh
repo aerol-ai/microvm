@@ -157,6 +157,8 @@ setup_token() {
   ( umask 077; jf "$made" 'd["token"]' | tr -d '\n' > "$sd/token" )
 }
 
+# The steps drills_step runs (drills_main sends it only these).
+drills_own_steps="large-layers ecr-push ecr-storm thresholds fill unfill shard-routes teardown"
 drills_step() {
   case "$1" in
     large-layers) step_large_layers ;;
@@ -222,10 +224,14 @@ ecr_secret() {
     --dry-run=client -o yaml | kc apply -f - >/dev/null
   # A secret volume refreshes within a kubelet sync: wait until the pusher
   # and the client both hold the new token.
-  local _
+  # Each copy is read whole, then compared in the shell: no grep -q on a
+  # pipe (an early exit ends the writer, and pipefail makes that a miss),
+  # and the token never in a process's arguments.
+  local _ auth reg
   for _ in $(seq 1 36); do
-    [[ "$(kc -n drills exec drills-pusher -- cat /ecr/auth 2>/dev/null)" == "AWS:$pw" ]] &&
-      kc -n drills exec drills-client -- cat /ecr/registry.json 2>/dev/null | grep -qF -f <(printf '%s\n' "$pw") && return 0
+    auth="$(kc -n drills exec drills-pusher -- cat /ecr/auth 2>/dev/null || true)"
+    reg="$(kc -n drills exec drills-client -- cat /ecr/registry.json 2>/dev/null || true)"
+    [[ "$auth" == "AWS:$pw" && "$reg" == *"$pw"* ]] && return 0
     sleep 5
   done
   say "the ECR token did not reach the drill pods in 3 minutes"
@@ -262,7 +268,11 @@ step_ecr_push() {
 # in their errors (verdicts.py ecr). ECR not throttling is INCONCLUSIVE.
 step_ecr_storm() {
   keep_forward monitoring svc/kube-prometheus-stack-prometheus "$prom_port" 9090 /-/healthy
-  [[ -f "$sd/ecr-run" ]] || step_ecr_push
+  # Not `[[ -f ... ]] || step_ecr_push`: under || bash ignores set -e in the
+  # step, and a failed push would carry on to a PASS.
+  if [[ ! -f "$sd/ecr-run" ]]; then
+    step_ecr_push
+  fi
   local out="$sd/evidence/ecr-storm" run n layers i images=() t0 t1 r after mins rl rlq after_ok v
   read -r run n layers < "$sd/ecr-run"
   ecr_secret
@@ -334,7 +344,10 @@ step_thresholds() {
   run="$(date +%m%d%H%M%S)"
   n="$(kc -n "$workers" get pods -l app.kubernetes.io/component=worker --no-headers | wc -l | tr -d ' ')"
   say "thresholds: $quiet min of healthy creates on $n workers; no drilled alert may fire"
-  proxy mode/clear
+  # A fault proxy that does not answer (drills_begin carries on without its
+  # port) does not end the 60-worker window: the quiet window needs no
+  # proxy, and a fault still set there fails it (it is never a PASS).
+  proxy mode/clear || say "thresholds: the fault proxy did not answer mode/clear; any fault an earlier drill set is still on"
   watch_start "$out"
   # The earlier steps' alerts must have cleared first: one still firing
   # from them would fail a window that was quiet.
@@ -401,7 +414,11 @@ step_shard_routes() {
   storm_fetch "$run" "$out" > /dev/null
   ids="$(python3 -I -c 'import json, sys; print(" ".join(r["id"] for r in map(json.loads, open(sys.argv[1])) if r.get("id")))' "$out/$run.jsonl")"
   : > "$out/routes.jsonl"
-  for id in $ids; do api GET "/v1/cluster/ingress-route/$id" >> "$out/routes.jsonl"; done
+  # One read that fails on the way is an answer of code 0 for that sandbox,
+  # which the verdict counts against the PASS; it does not end the step.
+  for id in $ids; do
+    api GET "/v1/cluster/ingress-route/$id" >> "$out/routes.jsonl" || echo '{"code": 0, "body": null}' >> "$out/routes.jsonl"
+  done
   sleep 30 # the owners install the routes
   for gw in $gws; do caddy_get "$gw" > "$out/caddy-$gw.json"; done
   # shellcheck disable=SC2086

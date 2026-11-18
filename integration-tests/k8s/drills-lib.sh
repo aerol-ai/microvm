@@ -70,22 +70,31 @@ jf() { python3 -c "import json, sys; d = json.loads(sys.argv[1]); print($2)" "$1
 
 # A port-forward that comes back: kubectl port-forward quits on the first
 # broken connection, and the Prometheus pod may move.
+#
+# The loop ends with the script that started it ($owner), even when that
+# script was killed without running its cleanup, and its port-forwards are
+# ended with KILL: a script started with TERM ignored (signals ignored are
+# inherited) once left this loop restarting kubectl forever, holding the
+# caller's output open. Its own output goes nowhere for the same reason.
 keepers=()
 keep_forward() {
-  local nsx="$1" target="$2" lport="$3" rport="$4" path="$5"
+  local nsx="$1" target="$2" lport="$3" rport="$4" path="$5" owner=$$
   (
     k=""
-    trap '[[ -z "$k" ]] || kill "$k" 2>/dev/null; exit 0' TERM
-    while :; do
+    trap '[[ -z "$k" ]] || kill -KILL "$k" 2>/dev/null; exit 0' TERM
+    while kill -0 "$owner" 2>/dev/null; do
       kubectl --context "$ctx" -n "$nsx" port-forward "$target" "$lport:$rport" >/dev/null 2>&1 &
       k=$!
       sleep 3
-      while kill -0 "$k" 2>/dev/null && curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$lport$path" 2>/dev/null; do sleep 5; done
-      kill "$k" 2>/dev/null || true
+      while kill -0 "$owner" 2>/dev/null && kill -0 "$k" 2>/dev/null &&
+          curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$lport$path" 2>/dev/null; do
+        sleep 5
+      done
+      kill -KILL "$k" 2>/dev/null || true
       wait "$k" 2>/dev/null || true
       sleep 1
     done
-  ) 2>/dev/null &
+  ) >/dev/null 2>&1 &
   keepers+=($!)
   local _
   for _ in $(seq 1 30); do
@@ -108,12 +117,17 @@ cleanup() {
   if [[ -n "$caddy_moved_on" ]]; then
     caddy_admin "$caddy_moved_on" 2020 /config/admin/listen '"localhost:2019"' >/dev/null 2>&1 || true
   fi
-  [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true
+  [[ -z "$watcher" ]] || kill -KILL "$watcher" 2>/dev/null || true
+  # Each keeper is stopped (STOP) before its children are listed, so it
+  # cannot start another port-forward in between; then all go with KILL,
+  # which no inherited ignored signal can block.
   local p kids
   for p in ${keepers[@]+"${keepers[@]}"}; do
+    kill -STOP "$p" 2>/dev/null || true
     kids="$(pgrep -P "$p" 2>/dev/null || true)"
-    kill "$p" 2>/dev/null || true
-    [[ -z "$kids" ]] || kill $kids 2>/dev/null || true
+    # shellcheck disable=SC2086
+    [[ -z "$kids" ]] || kill -KILL $kids 2>/dev/null || true
+    kill -KILL "$p" 2>/dev/null || true
   done
 }
 trap cleanup EXIT
@@ -138,7 +152,7 @@ watch_start() {
     'caddy_reconcile_errors=sum(aerolvm_ingress_reconcile_errors_total)' ) &
   watcher=$!
 }
-watch_stop() { [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true; watcher=""; }
+watch_stop() { [[ -z "$watcher" ]] || kill -KILL "$watcher" 2>/dev/null || true; watcher=""; }
 
 # The client pod runs the creates: more than a hundred held for minutes is
 # more than a laptop port-forward carries.
@@ -314,9 +328,10 @@ YAML
   want=$(( $(kc -n "$ns" get pods -l app.kubernetes.io/name=aerolvm --no-headers | wc -l) + \
     $(kc -n "$workers" get pods -l app.kubernetes.io/name=aerolvm --no-headers | wc -l) ))
   for _ in $(seq 1 60); do
-    up="$(curl -fsS "http://127.0.0.1:$prom_port/api/v1/targets?state=active" | python3 -c '
+    # A Prometheus that does not answer yet counts 0 up, and the wait goes on.
+    up="$(curl -fsS "http://127.0.0.1:$prom_port/api/v1/targets?state=active" 2>/dev/null | python3 -c '
 import json, sys
-print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"].get("aerolvm_component") and t["health"] == "up"))')"
+print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"].get("aerolvm_component") and t["health"] == "up"))' 2>/dev/null || echo 0)"
     [[ "$up" -ge "$want" ]] && break
     sleep 10
   done
@@ -339,7 +354,8 @@ step_static() {
   for a in "${drilled_alerts[@]}"; do
     expr="$(awk -v a="$a" '$0 ~ "alert: "a"$" {f=1; next} f && /expr:/ {sub(/.*expr: */, ""); print; exit}' "$ROOT/setup/prometheus/sandboxd-alerts.yml")"
     for m in $(grep -oE 'aerolvm_[a-z0-9_]+' <<<"$expr" | sort -u); do
-      reg="$(grep -rlE "\"$m\"" --include='*.go' "$ROOT/cmd" "$ROOT/internal" "$ROOT/pkg" | grep -v _test.go | head -1 || true)"
+      reg="$(grep -rlE "\"$m\"" --include='*.go' "$ROOT/cmd" "$ROOT/internal" "$ROOT/pkg" | grep -v _test.go || true)"
+      reg="$(head -1 <<<"$reg")"
       comps="$(prom query "count by (aerolvm_component) ($m)" | tr '\n' ' ')"
       echo "$a | $expr | $m | registered: ${reg#"$ROOT/"} | scraped: ${comps:-none}" >> "$out/static.txt"
       if [[ -z "$reg" ]]; then
@@ -649,7 +665,8 @@ step_slo_breach() {
   for size in 8 4 2 1; do
     refused=0
     for _ in $(seq 1 14); do
-      code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $size, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+      # A call that fails on the way (kubectl exec) counts as a refusal.
+      code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": $size, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
       if [[ "$code" == 201 ]]; then
         n=$((n + 1)) refused=0
       else
@@ -669,9 +686,9 @@ step_slo_breach() {
     admitting="$(api GET /v1/cluster/members | python3 -c '
 import json, sys
 d = json.load(sys.stdin)["body"] or {}
-print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") and (m.get("capacity") or {}).get("can_admit")))')"
+print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") and (m.get("capacity") or {}).get("can_admit")))' 2>/dev/null || true)"
     [[ "$admitting" == 0 ]] && break
-    code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": 1, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])')"
+    code="$(api POST /v1/sandboxes "{\"image\": \"$drill_reg/drill/app:v1\", \"runtime\": \"gvisor\", \"cpu\": 1, \"memory_mb\": 128, \"tags\": {\"drill-run\": \"fill-$run\"}}" | tee -a "$out/fill.txt" | python3 -c 'import json,sys; print(json.load(sys.stdin)["code"])' 2>/dev/null || true)"
     [[ "$code" == 201 ]] && n=$((n + 1))
     sleep 5
   done
@@ -724,12 +741,12 @@ print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") a
 }
 
 # drills_main <script> <step>...: the steps both clusters share; anything
-# else goes to drills_step, the calling script's own (teardown on kind).
-# drills_step returns 127 for a step it does not know. drills_begin, if the
-# caller defines it, runs first (drills-eks.sh: the fault proxy's control
-# port, which a later run of the script needs again).
+# else goes to drills_step, the calling script's own (teardown on kind),
+# which drills_own_steps names. A step that fails ends the script (set -e).
+# drills_begin, if the caller defines it, runs first (drills-eks.sh: the
+# fault proxy's control port, which a later run of the script needs again).
 drills_main() {
-  local script="$1" step rc; shift
+  local script="$1" step; shift
   if declare -F drills_begin >/dev/null; then drills_begin "$@"; fi
   for step in "$@"; do
     case "$step" in
@@ -738,8 +755,14 @@ drills_main() {
       pull-storm) step_pull_storm ;;
       slo-breach) step_slo_breach ;;
       *)
-        rc=0; drills_step "$step" || rc=$?
-        if [[ "$rc" == 127 ]]; then echo "$script: unknown step $step" >&2; exit 2; fi ;;
+        # The caller's own steps, as its drills_own_steps lists them. Called
+        # plainly, never under ||, && or if: bash ignores set -e in anything
+        # run there, so a failed push or create would carry on to a PASS.
+        if [[ " ${drills_own_steps:-} " != *" $step "* ]]; then
+          echo "$script: unknown step $step" >&2
+          exit 2
+        fi
+        drills_step "$step" ;;
     esac
   done
 }
