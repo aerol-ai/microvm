@@ -6,6 +6,7 @@
   prom.py --url U wait NAME [NAME ...] --state firing --timeout 1500
   prom.py --url U watch --out timeline.jsonl --interval 30 --alerts A B --exprs name=EXPR ...
   prom.py --url U history NAME --since UNIX # when ALERTS{alertname=NAME} was pending/firing
+  prom.py --url U up LABEL                  # active targets with LABEL whose last scrape worked
 
 query prints one line per series: its labels, then the value. wait exits 0
 once every named alert is in that state ("inactive" waits for it to be
@@ -34,6 +35,11 @@ def query(url, expr):
     for s in get(url, "/api/v1/query", query=expr)["result"]:
         out.append((s["metric"], float(s["value"][1])))
     return out
+
+
+def up(url, label):
+    return sum(1 for t in get(url, "/api/v1/targets", state="active")["activeTargets"]
+               if t["labels"].get(label) and t["health"] == "up")
 
 
 def alerts(url):
@@ -66,6 +72,8 @@ def main():
     h = sub.add_parser("history")
     h.add_argument("name")
     h.add_argument("--since", type=float, required=True)
+    u = sub.add_parser("up")
+    u.add_argument("label")
     args = p.parse_args()
 
     if args.cmd == "query":
@@ -121,6 +129,8 @@ def main():
             ts = [float(t) for t, _ in s["values"]]
             print(json.dumps({"alert": args.name, "state": s["metric"].get("alertstate"),
                               "first": round(min(ts)), "last": round(max(ts)), "samples": len(ts)}))
+    elif args.cmd == "up":
+        print(up(args.url, args.label))
     return 0
 
 

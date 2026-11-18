@@ -339,9 +339,9 @@ YAML
     $(kc -n "$workers" get pods -l app.kubernetes.io/name=aerolvm --no-headers | wc -l) ))
   for _ in $(seq 1 60); do
     # A Prometheus that does not answer yet counts 0 up, and the wait goes on.
-    up="$(curl -fsS "http://127.0.0.1:$prom_port/api/v1/targets?state=active" 2>/dev/null | python3 -c '
-import json, sys
-print(sum(1 for t in json.load(sys.stdin)["data"]["activeTargets"] if t["labels"].get("aerolvm_component") and t["health"] == "up"))' 2>/dev/null || echo 0)"
+    # prom.py fetches the targets itself: Scorecard reads curl piped into
+    # python3 as a downloaded script being run (Pinned-Dependencies).
+    up="$(prom up aerolvm_component 2>/dev/null || echo 0)"
     [[ "$up" -ge "$want" ]] && break
     sleep 10
   done
