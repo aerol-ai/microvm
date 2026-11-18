@@ -344,7 +344,10 @@ step_thresholds() {
   run="$(date +%m%d%H%M%S)"
   n="$(kc -n "$workers" get pods -l app.kubernetes.io/component=worker --no-headers | wc -l | tr -d ' ')"
   say "thresholds: $quiet min of healthy creates on $n workers; no drilled alert may fire"
-  proxy mode/clear
+  # A fault proxy that does not answer (drills_begin carries on without its
+  # port) does not end the 60-worker window: the quiet window needs no
+  # proxy, and a fault still set there fails it (it is never a PASS).
+  proxy mode/clear || say "thresholds: the fault proxy did not answer mode/clear; any fault an earlier drill set is still on"
   watch_start "$out"
   # The earlier steps' alerts must have cleared first: one still firing
   # from them would fail a window that was quiet.
@@ -411,7 +414,11 @@ step_shard_routes() {
   storm_fetch "$run" "$out" > /dev/null
   ids="$(python3 -I -c 'import json, sys; print(" ".join(r["id"] for r in map(json.loads, open(sys.argv[1])) if r.get("id")))' "$out/$run.jsonl")"
   : > "$out/routes.jsonl"
-  for id in $ids; do api GET "/v1/cluster/ingress-route/$id" >> "$out/routes.jsonl"; done
+  # One read that fails on the way is an answer of code 0 for that sandbox,
+  # which the verdict counts against the PASS; it does not end the step.
+  for id in $ids; do
+    api GET "/v1/cluster/ingress-route/$id" >> "$out/routes.jsonl" || echo '{"code": 0, "body": null}' >> "$out/routes.jsonl"
+  done
   sleep 30 # the owners install the routes
   for gw in $gws; do caddy_get "$gw" > "$out/caddy-$gw.json"; done
   # shellcheck disable=SC2086

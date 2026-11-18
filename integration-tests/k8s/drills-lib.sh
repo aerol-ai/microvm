@@ -70,22 +70,31 @@ jf() { python3 -c "import json, sys; d = json.loads(sys.argv[1]); print($2)" "$1
 
 # A port-forward that comes back: kubectl port-forward quits on the first
 # broken connection, and the Prometheus pod may move.
+#
+# The loop ends with the script that started it ($owner), even when that
+# script was killed without running its cleanup, and its port-forwards are
+# ended with KILL: a script started with TERM ignored (signals ignored are
+# inherited) once left this loop restarting kubectl forever, holding the
+# caller's output open. Its own output goes nowhere for the same reason.
 keepers=()
 keep_forward() {
-  local nsx="$1" target="$2" lport="$3" rport="$4" path="$5"
+  local nsx="$1" target="$2" lport="$3" rport="$4" path="$5" owner=$$
   (
     k=""
-    trap '[[ -z "$k" ]] || kill "$k" 2>/dev/null; exit 0' TERM
-    while :; do
+    trap '[[ -z "$k" ]] || kill -KILL "$k" 2>/dev/null; exit 0' TERM
+    while kill -0 "$owner" 2>/dev/null; do
       kubectl --context "$ctx" -n "$nsx" port-forward "$target" "$lport:$rport" >/dev/null 2>&1 &
       k=$!
       sleep 3
-      while kill -0 "$k" 2>/dev/null && curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$lport$path" 2>/dev/null; do sleep 5; done
-      kill "$k" 2>/dev/null || true
+      while kill -0 "$owner" 2>/dev/null && kill -0 "$k" 2>/dev/null &&
+          curl -fsS --max-time 5 -o /dev/null "http://127.0.0.1:$lport$path" 2>/dev/null; do
+        sleep 5
+      done
+      kill -KILL "$k" 2>/dev/null || true
       wait "$k" 2>/dev/null || true
       sleep 1
     done
-  ) 2>/dev/null &
+  ) >/dev/null 2>&1 &
   keepers+=($!)
   local _
   for _ in $(seq 1 30); do
@@ -108,12 +117,17 @@ cleanup() {
   if [[ -n "$caddy_moved_on" ]]; then
     caddy_admin "$caddy_moved_on" 2020 /config/admin/listen '"localhost:2019"' >/dev/null 2>&1 || true
   fi
-  [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true
+  [[ -z "$watcher" ]] || kill -KILL "$watcher" 2>/dev/null || true
+  # Each keeper is stopped (STOP) before its children are listed, so it
+  # cannot start another port-forward in between; then all go with KILL,
+  # which no inherited ignored signal can block.
   local p kids
   for p in ${keepers[@]+"${keepers[@]}"}; do
+    kill -STOP "$p" 2>/dev/null || true
     kids="$(pgrep -P "$p" 2>/dev/null || true)"
-    kill "$p" 2>/dev/null || true
-    [[ -z "$kids" ]] || kill $kids 2>/dev/null || true
+    # shellcheck disable=SC2086
+    [[ -z "$kids" ]] || kill -KILL $kids 2>/dev/null || true
+    kill -KILL "$p" 2>/dev/null || true
   done
 }
 trap cleanup EXIT
@@ -138,7 +152,7 @@ watch_start() {
     'caddy_reconcile_errors=sum(aerolvm_ingress_reconcile_errors_total)' ) &
   watcher=$!
 }
-watch_stop() { [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true; watcher=""; }
+watch_stop() { [[ -z "$watcher" ]] || kill -KILL "$watcher" 2>/dev/null || true; watcher=""; }
 
 # The client pod runs the creates: more than a hundred held for minutes is
 # more than a laptop port-forward carries.
@@ -732,7 +746,7 @@ print(sum(1 for m in d.get("members", []) if "worker" in (m.get("role") or "") a
 # drills_begin, if the caller defines it, runs first (drills-eks.sh: the
 # fault proxy's control port, which a later run of the script needs again).
 drills_main() {
-  local script="$1" step rc; shift
+  local script="$1" step; shift
   if declare -F drills_begin >/dev/null; then drills_begin "$@"; fi
   for step in "$@"; do
     case "$step" in

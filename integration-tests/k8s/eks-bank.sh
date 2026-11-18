@@ -134,6 +134,13 @@ if [[ "$dry" == 1 ]]; then
   sd="${EKS_BANK_DRY_DIR:-$(mktemp -d)}"
 fi
 mkdir -p "$sd"
+# on_exit's mark that a teardown follows (check_exit reads it): never one an
+# earlier run left.
+rm -f "$sd/.teardown-next"
+# Where this run's lines begin in bank.txt (an earlier run's FAIL lines are
+# not this run's answer).
+bank_mark=0
+[[ ! -f "$sd/bank.txt" ]] || bank_mark="$(wc -l < "$sd/bank.txt" | tr -d ' ')"
 log="$sd/bank.log"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$log" >&2; }
 result() {
@@ -825,13 +832,16 @@ workers_now() { # live workers, pending ones, Karpenter's machines
   say "scale: the cluster did not answer the worker count three times"
   return 1
 }
-# read_workers: workers_now into the caller's w, p and m. An assignment
-# first, so a count the cluster did not give ends the step (set -e): read
-# from "$(workers_now)" directly would take empty values and carry on, and
-# an empty m passes "m <= base".
+# read_workers: workers_now into the caller's w, p and m; 1 when the
+# cluster did not give the counts (read from "$(workers_now)" directly, a
+# failure left them empty, and an empty m passed "m <= base"). The polling
+# loops wait and read again (`read_workers || { sleep 15; continue; }`):
+# a minute of API errors must not end the most expensive step. The reads a
+# result is written from are plain calls, so there a failure ends the step
+# (set -e).
 read_workers() {
   local counts
-  counts="$(workers_now)"
+  counts="$(workers_now)" || return 1
   read -r w p m <<<"$counts"
 }
 timeline() { echo "$(date -u +%H:%M:%S) $1 workers/pending/machines $(workers_now)" >> "$sd/evidence/scale/timeline.txt"; }
@@ -849,21 +859,29 @@ kill_tree() {
 }
 drill_pid=""
 in_scale=""
-scale_back() {
-  # The scale step's normal end, and the exit handler's while it runs: the
-  # peak drills stopped, the floor back to the base, the fill sandboxes
-  # gone, the NodePool's limit back down.
-  [[ "${scaled_back:-0}" == 1 ]] && return 0
-  scaled_back=1
+# stop_scale_drills: the peak drills (ecr-storm, thresholds) stopped, the
+# whole tree, so each drills-eks.sh runs its own cleanup.
+stop_scale_drills() {
   if [[ -n "$drill_pid" ]] && kill -0 "$drill_pid" 2>/dev/null; then
     kill_tree "$drill_pid"
     wait "$drill_pid" 2>/dev/null || true
   fi
   drill_pid=""
+}
+scale_back() {
+  # The scale step's normal end, and its exit handler's (check_exit): the
+  # peak drills stopped, the floor back to the base, the fill sandboxes
+  # gone, the NodePool's limit back down. Marked done only at its end: a
+  # TERM that lands while the normal end runs it (the peak drills, once
+  # killed, end the step's wait for them) must leave the exit handler the
+  # rest to do. Each part can run twice.
+  [[ "${scaled_back:-0}" == 1 ]] && return 0
+  stop_scale_drills
   say "scale: back to $base_workers workers"
   set_min_workers "$base_workers" || true
   drills unfill || true
   nodepool $(( 4 * (base_workers + 2) )) || true
+  scaled_back=1
 }
 cap_schedule() { # cap_schedule <UTC time>: AWS ends Karpenter's machines then
   x aws scheduler create-schedule --region "$(tfout region)" --name "$name-scale-cap" \
@@ -901,7 +919,7 @@ step_scale() {
   local target="${EKS_BANK_FILL_TARGET:-12}" fill_until=$(( t0 + 15 * 60 ))
   timeline start
   while [[ "$dry" != 1 && $(now) -lt $fill_until ]]; do
-    read_workers
+    read_workers || { sleep 15; continue; }
     [[ "$w" -ge "$target" ]] && break
     if [[ "$p" == 0 && $(( $(now) - last_fill )) -ge 90 ]]; then
       rounds=$(( rounds + 1 )); last_fill=$(now)
@@ -962,7 +980,7 @@ step_scale() {
   scale_back
   while [[ "$dry" != 1 && $(( $(now) - tb )) -lt $(( back_minutes * 60 )) ]]; do
     timeline back
-    read_workers
+    read_workers || { sleep 30; continue; }
     [[ "$m" -le "$base_workers" ]] && break
     sleep 30
   done
@@ -1102,13 +1120,23 @@ run_check() {
   fi
   return 0
 }
-# check_exit: the check subshell's EXIT trap. Signals are ignored from here:
-# the scale-back must finish.
+# check_exit: the check subshell's EXIT trap, which stops and undoes what
+# the check left: the scale step's floor (in_scale), gateways11's 11
+# gateways (check_undo). INT and TERM are caught and dropped from here so
+# the undo finishes; caught, not ignored, because an ignored signal is
+# inherited: a drills-eks.sh the undo starts could then never be stopped
+# (its port-forward loop outlived the run). When on_exit tears the run down
+# next ($sd/.teardown-next), only the peak drills are stopped: the rest goes
+# with the cluster, and a long undo would only delay the teardown.
 check_exit() {
   local rc=$?
-  trap '' INT TERM
-  if [[ -n "$in_scale" ]]; then scale_back || true; fi
-  if [[ -n "$check_undo" ]]; then "$check_undo" || true; fi
+  trap : INT TERM
+  if [[ -f "$sd/.teardown-next" ]]; then
+    stop_scale_drills
+  else
+    if [[ -n "$in_scale" ]]; then scale_back || true; fi
+    if [[ -n "$check_undo" ]]; then "$check_undo" || true; fi
+  fi
   exit "$rc"
 }
 # stop_check: on_exit's first act while a check runs: the check and
@@ -1140,10 +1168,10 @@ run_drills() {
 }
 
 # --- main ---------------------------------------------------------------------------
-# on_exit: whatever ends the script, a failed step or Ctrl-C, scales back a
-# scale step in progress and, for `all`, tears the run down (unless
-# EKS_BANK_KEEP=1), so a failure never leaves the cell running until the
-# teardown timer.
+# on_exit: whatever ends the script, a failed step or Ctrl-C, stops a check
+# in progress (which puts back what it changed) and, for `all`, tears the
+# run down (unless EKS_BANK_KEEP=1), so a failure never leaves the cell
+# running until the teardown timer.
 run_all=0
 downed=0
 # Set when this process called cluster.sh up, or passed the gate: only then
@@ -1152,15 +1180,26 @@ downed=0
 made_here=0
 gated=0
 on_exit() {
-  local rc=$?
-  trap - EXIT INT TERM
-  stop_check
-  if [[ -n "$in_scale" ]]; then scale_back || true; fi
+  local rc=$? teardown=0
+  # From here no INT or TERM stops this script, and the teardown's own
+  # commands (Terraform's destroy among them) ignore them too: a second
+  # Ctrl-C used to end the run before down. Everything the teardown starts
+  # ends by itself; nothing in it loops.
+  trap - EXIT
+  trap '' INT TERM
   if [[ "$rc" != 0 && "$run_all" == 1 && "$refused" != 1 && "$downed" != 1 && "${EKS_BANK_KEEP:-0}" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || "$gated" == 1 ]]; then
+    teardown=1
+    : > "$sd/.teardown-next"
+  fi
+  stop_check
+  if [[ "$teardown" == 1 ]]; then
     say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)"
+    # Best effort, under ||: down goes on past a part that fails, and
+    # says what is left.
     step_down || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
   fi
+  rm -f "$sd/.teardown-next"
   exit "$rc"
 }
 trap on_exit EXIT
@@ -1196,9 +1235,12 @@ for step in "${steps[@]}"; do
     *) echo "eks-bank.sh: unknown step $step" >&2; exit 2 ;;
   esac
 done
-# Every step ran; a check that failed makes the run's answer 1 (down, if
-# asked for, has run).
-if [[ "${#failed_checks[@]}" -gt 0 ]]; then
-  say "eks-bank.sh: checks that failed: ${failed_checks[*]} ($sd/bank.txt)"
+# Every step ran. Any FAIL this run wrote makes its answer 1 (down, if asked
+# for, has run): a check that exited non-zero, and a FAIL a check recorded
+# itself before returning 0 (enterprise, nlb, verify, scale-full, ...).
+fails="$( { [[ ! -f "$sd/bank.txt" ]] || tail -n +$(( bank_mark + 1 )) "$sd/bank.txt" | awk '$1 == "FAIL" {print $2}'
+  printf '%s\n' ${failed_checks[@]+"${failed_checks[@]}"}; } | sed '/^$/d' | sort -u | tr '\n' ' ')"
+if [[ -n "$fails" ]]; then
+  say "eks-bank.sh: checks that failed: ${fails% } ($sd/bank.txt)"
   exit 1
 fi
