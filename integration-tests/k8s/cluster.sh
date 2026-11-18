@@ -33,6 +33,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TF_DIR="$HERE/terraform"
+# helm_fetch: a chart fetch with no registry credentials and a time limit.
+# shellcheck source=helm-fetch.sh
+source "$HERE/helm-fetch.sh"
 KARPENTER_VERSION=1.15.1
 
 die() { echo "cluster.sh: $*" >&2; exit 1; }
@@ -290,10 +293,15 @@ cmd_up() {
     hv="$("$helm" version --short 2>/dev/null | sed -E 's/^v([0-9]+)\.([0-9]+).*/\1 \2/')"
     read -r hmaj hmin <<<"${hv:-0 0}"
     (( hmaj > 3 || (hmaj == 3 && hmin >= 8) )) || die "Karpenter's chart needs Helm 3.8 or newer; $helm is ${hv:-missing} (set HELM=)"
+    # The chart is fetched first, with no credentials and a time limit
+    # (helm-fetch.sh), then installed from the file.
+    helm_fetch "$helm" "$sd" "Karpenter's chart (oci://public.ecr.aws/karpenter/karpenter $KARPENTER_VERSION)" \
+      oci://public.ecr.aws/karpenter/karpenter --version "$KARPENTER_VERSION" ||
+      die "could not fetch Karpenter's chart; nothing was installed"
     # One replica: the chart's two want two machines, and the only machine
     # without the worker taint is the one system node.
-    KUBECONFIG="$sd/kubeconfig" "$helm" upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
-      --version "$KARPENTER_VERSION" --namespace kube-system \
+    KUBECONFIG="$sd/kubeconfig" "$helm" upgrade --install karpenter "$sd/karpenter-$KARPENTER_VERSION.tgz" \
+      --namespace kube-system \
       --set settings.clusterName="$name" --set replicas=1 --wait >/dev/null
     echo "up: Karpenter $KARPENTER_VERSION installed"
   fi

@@ -628,7 +628,7 @@ func TestEKSBankChartGuard(t *testing.T) {
 func TestClusterDownWithABucketS3Keeps(t *testing.T) {
 	needTools(t, "jq", "python3")
 	root := t.TempDir()
-	for _, f := range []string{"k8s/cluster.sh", "lib/common.sh", "lib/stage.sh"} {
+	for _, f := range []string{"k8s/cluster.sh", "k8s/helm-fetch.sh", "lib/common.sh", "lib/stage.sh"} {
 		raw, err := os.ReadFile(filepath.Join(integrationDir(t), f))
 		if err != nil {
 			t.Fatal(err)
@@ -780,7 +780,7 @@ func TestDownRefusesAnotherAccount(t *testing.T) {
 
 	// cluster.sh down, the real one, against stubs.
 	root := t.TempDir()
-	for _, f := range []string{"k8s/cluster.sh", "lib/common.sh", "lib/stage.sh"} {
+	for _, f := range []string{"k8s/cluster.sh", "k8s/helm-fetch.sh", "lib/common.sh", "lib/stage.sh"} {
 		raw, err := os.ReadFile(filepath.Join(integrationDir(t), f))
 		if err != nil {
 			t.Fatal(err)

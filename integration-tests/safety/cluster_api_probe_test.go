@@ -29,18 +29,24 @@ type apiProbe struct {
 	// allow-list ("" = ip/32).
 	ip, later, cidr string
 	wait, round     string
+	// helm replaces the stub Helm's body (after its version answer);
+	// env adds to cluster.sh's environment.
+	helm string
+	env  []string
 }
 
 type apiProbeResult struct {
 	code     int
 	out, log string
+	// world is the stubs' folder (STUB_DIR), for what they recorded.
+	world string
 }
 
 func runClusterUp(t *testing.T, p apiProbe) apiProbeResult {
 	t.Helper()
 	needTools(t, "jq", "awk")
 	root := t.TempDir()
-	for _, f := range []string{"k8s/cluster.sh", "lib/common.sh", "lib/stage.sh"} {
+	for _, f := range []string{"k8s/cluster.sh", "k8s/helm-fetch.sh", "lib/common.sh", "lib/stage.sh"} {
 		raw, err := os.ReadFile(filepath.Join(integrationDir(t), f))
 		if err != nil {
 			t.Fatal(err)
@@ -112,7 +118,7 @@ echo "kubectl $*" >> "$STUB_LOG"
 addr=$(echo "$*" | sed -n 's#.*--server https://\[\{0,1\}\([0-9a-fA-F.:]*\)\]\{0,1\} .*#\1#p')
 case "$*" in *"--tls-server-name ABCD1234.yl4.us-east-1.eks.amazonaws.com"*"get --raw /version"*) at api "$addr" ;; *) exit 1 ;; esac`,
 		"helm": `case "$1" in version) echo v3.20.2+g8fb76d6; exit 0 ;; esac
-echo "helm $*" >> "$STUB_LOG"`,
+echo "helm $*" >> "$STUB_LOG"` + "\n" + p.helm,
 	}
 	for n, b := range stubs {
 		if err := os.WriteFile(filepath.Join(bin, n), []byte("#!/bin/sh\n"+b+"\n"), 0o755); err != nil {
@@ -123,8 +129,9 @@ echo "helm $*" >> "$STUB_LOG"`,
 	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+log, "STUB_DIR="+world, "STUB_IP="+p.ip, "STUB_IP_LATER="+p.later, "STUB_CIDR="+p.cidr,
 		"CLUSTER_API_WAIT="+p.wait, "CLUSTER_API_ROUND="+p.round, "HELM=helm", "TF_VAR_region=")
+	cmd.Env = append(cmd.Env, p.env...)
 	out, _ := cmd.CombinedOutput()
-	return apiProbeResult{code: cmd.ProcessState.ExitCode(), out: string(out), log: readLog(t, log)}
+	return apiProbeResult{code: cmd.ProcessState.ExitCode(), out: string(out), log: readLog(t, log), world: world}
 }
 
 // helmInstalled reports whether up went on to the Karpenter install, and

@@ -82,6 +82,10 @@ name="${1:?usage: eks-bank.sh <name> <step> [step...] (estimate up build install
 shift
 [[ $# -gt 0 ]] || { echo "eks-bank.sh: name the steps (or all)" >&2; exit 2; }
 HELM="${HELM:-helm}"
+# helm_fetch: every chart this run fetches comes through it, with no registry
+# credentials and a time limit (HELM_FETCH_SECONDS).
+# shellcheck source=helm-fetch.sh
+source "$HERE/helm-fetch.sh"
 # 0 or 1 only: any other spelling ("true", "yes") would start a live run.
 case "${DRY_RUN:-0}" in
   0|1) dry="${DRY_RUN:-0}" ;;
@@ -444,7 +448,8 @@ parameters:
 YAML
 
   say "install: the AWS Load Balancer Controller $LBC_CHART_VERSION (its role through EKS Pod Identity)"
-  x "$HELM" pull aws-load-balancer-controller --repo https://aws.github.io/eks-charts --version "$LBC_CHART_VERSION" -d "$sd"
+  x helm_fetch "$HELM" "$sd" "the AWS Load Balancer Controller's chart $LBC_CHART_VERSION" \
+    aws-load-balancer-controller --repo https://aws.github.io/eks-charts --version "$LBC_CHART_VERSION"
   [[ "$dry" == 1 ]] || echo "$LBC_CHART_SHA256  $sd/aws-load-balancer-controller-$LBC_CHART_VERSION.tgz" | shasum -a 256 -c - >/dev/null
   # Pods cannot reach instance metadata (hop limit 1): region and VPC are
   # given. Every AWS object it makes carries the run's tags.
@@ -460,8 +465,10 @@ YAML
 
   say "install: kube-prometheus-stack (Alertmanager to the drills' receiver comes with drills-eks.sh setup)"
   k create namespace monitoring --dry-run=client -o yaml | k apply -f - >/dev/null
-  hm upgrade --install kube-prometheus-stack kube-prometheus-stack \
-    --repo https://prometheus-community.github.io/helm-charts --version "${DRILL_KPS_VERSION:-92.17.0}" \
+  local kps="${DRILL_KPS_VERSION:-92.17.0}"
+  x helm_fetch "$HELM" "$sd" "kube-prometheus-stack's chart $kps" \
+    kube-prometheus-stack --repo https://prometheus-community.github.io/helm-charts --version "$kps"
+  hm upgrade --install kube-prometheus-stack "$sd/kube-prometheus-stack-$kps.tgz" \
     -n monitoring -f "$HERE/drills-local/kps-values.yaml" --wait --timeout 10m >/dev/null
 
   say "install: the namespaces, and the CA every worker trusts for the drill registry"

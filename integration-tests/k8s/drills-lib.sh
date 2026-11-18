@@ -32,6 +32,9 @@ workers="${AEROL_WORKER_NS:-aerolvm-workers}"
 release="${AEROL_HELM_RELEASE:-aerolvm}"
 cluster_name="${AEROL_CLUSTER_NAME:-aerolvm}"
 HELM="${HELM:-helm}"
+# helm_fetch: the chart fetch with no registry credentials and a time limit.
+# shellcheck source=helm-fetch.sh
+source "$HERE/helm-fetch.sh"
 # kube-prometheus-stack, pinned (2026-10-31).
 kps_version="${DRILL_KPS_VERSION:-92.17.0}"
 prom_port="${DRILL_PROM_PORT:-19090}"
@@ -200,8 +203,9 @@ step_setup() {
   push_images "$(run_id)"
 
   kc create namespace monitoring --dry-run=client -o yaml | kc apply -f - >/dev/null
-  hm upgrade --install kube-prometheus-stack kube-prometheus-stack \
-    --repo https://prometheus-community.github.io/helm-charts --version "$kps_version" \
+  helm_fetch "$HELM" "$sd" "kube-prometheus-stack's chart $kps_version" \
+    kube-prometheus-stack --repo https://prometheus-community.github.io/helm-charts --version "$kps_version"
+  hm upgrade --install kube-prometheus-stack "$sd/kube-prometheus-stack-$kps_version.tgz" \
     -n monitoring -f "$L/kps-values.yaml" --wait --timeout 10m >/dev/null
   kc -n monitoring create configmap alert-echo --from-file=echo.py="$L/echo.py" --dry-run=client -o yaml | kc apply -f - >/dev/null
   kc apply -f - >/dev/null <<YAML

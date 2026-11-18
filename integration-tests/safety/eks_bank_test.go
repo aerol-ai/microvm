@@ -65,7 +65,7 @@ func bankRun(t *testing.T, name, ctx string, bank bool) string {
 	if err := os.MkdirAll(k8s, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"drills-eks.sh", "eks-bank.sh", "terraform/lb-controller-iam-policy.json"} {
+	for _, f := range []string{"drills-eks.sh", "eks-bank.sh", "helm-fetch.sh", "terraform/lb-controller-iam-policy.json"} {
 		raw, err := os.ReadFile(filepath.Join(integrationDir(t), "k8s", f))
 		if err != nil {
 			t.Fatal(err)
@@ -245,6 +245,14 @@ func TestEKSBankDryRunCallsNothing(t *testing.T) {
 		"cluster.sh up bank-1",
 		"cell.sh bank-1 build",
 		"upgrade --install aws-load-balancer-controller",
+		// Every chart fetch goes through helm_fetch (no credentials, a
+		// time limit), printed here and never run; the installs read the
+		// fetched files.
+		"dry-run: helm_fetch ",
+		"aws-load-balancer-controller --repo https://aws.github.io/eks-charts --version 3.6.2",
+		"kube-prometheus-stack --repo https://prometheus-community.github.io/helm-charts --version 92.17.0",
+		"upgrade --install kube-prometheus-stack ",
+		"kube-prometheus-stack-92.17.0.tgz",
 		"upgrade --install aerolvm",
 		"drills-eks.sh bank-1",
 		"aws scheduler create-schedule",
