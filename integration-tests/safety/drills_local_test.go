@@ -6,9 +6,14 @@
 package safety
 
 import (
+	"encoding/json"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -136,5 +141,103 @@ func TestDrillsTokensWrittenPrivately(t *testing.T) {
 		if found != n {
 			t.Errorf("%s: found %d token writes, want %d", file, found, n)
 		}
+	}
+}
+
+// Scorecard alert 1697 (Pinned-Dependencies, downloadThenRun): setup's wait
+// for scraped AerolVM pods piped curl into python3, which Scorecard reads as
+// a downloaded script being run. prom.py up fetches the targets itself now.
+func TestDrillsPromUpCountsScrapedAerolVMTargets(t *testing.T) {
+	needTools(t, "python3")
+	targets := []map[string]any{
+		{"labels": map[string]string{"aerolvm_component": "server"}, "health": "up"},
+		{"labels": map[string]string{"aerolvm_component": "worker"}, "health": "up"},
+		{"labels": map[string]string{"aerolvm_component": "worker"}, "health": "down"},
+		{"labels": map[string]string{"aerolvm_component": "worker"}, "health": "unknown"},
+		{"labels": map[string]string{"job": "kubelet"}, "health": "up"},
+	}
+	asked := make(chan string, 1)
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/targets" {
+			http.NotFound(w, r)
+			return
+		}
+		select {
+		case asked <- r.URL.Query().Get("state"):
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "success",
+			"data": map[string]any{"activeTargets": targets, "droppedTargets": []any{}}})
+	}))
+	upCmd := func() *exec.Cmd {
+		return exec.Command("python3", "-I", k8sFile(t, "drills-local", "prom.py"), "--url", prom.URL, "up", "aerolvm_component")
+	}
+	// Only AerolVM targets whose last scrape worked count: not a down or
+	// not-yet-scraped one, and not another job's.
+	out, err := upCmd().CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "2" {
+		t.Errorf("prom.py up: %v %q, want 2", err, out)
+	}
+	select {
+	case st := <-asked:
+		if st != "active" {
+			t.Errorf("prom.py up asked for state=%q, want active", st)
+		}
+	default:
+		t.Error("prom.py up never asked for the targets")
+	}
+	// A Prometheus that does not answer prints no count and fails, so
+	// setup's `|| echo 0` counts 0 and keeps waiting.
+	prom.Close()
+	if out, err := upCmd().Output(); err == nil || len(out) != 0 {
+		t.Errorf("prom.py up with Prometheus gone: %v %q, want a failure and no output", err, out)
+	}
+
+	src, err := os.ReadFile(k8sFile(t, "drills-lib.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `up="$(prom up aerolvm_component 2>/dev/null || echo 0)"`; !strings.Contains(string(src), want) {
+		t.Errorf("drills-lib.sh setup no longer counts scraped pods with %s", want)
+	}
+	// And no script here pipes a download into an interpreter, or feeds
+	// one through <(...). Comments do not run, so they may show it.
+	interp := `(sudo([ \t]+-[A-Za-z]+)*[ \t]+)?(\S*/)?(python3?|bash|sh|zsh|perl|ruby|node)\b`
+	pipe := regexp.MustCompile(`\b(curl|wget)\b[^|\n]*\|[ \t]*` + interp + `|(^|[ \t;&|(])` + interp + `[^|\n]*<\([ \t]*(curl|wget)\b`)
+	for _, line := range []string{"curl -fsSL u | bash", "curl u | sudo -E bash -s", "wget -qO- u | /bin/sh", "bash <(curl -fsSL u)", "curl -fsS u | python3 -c 'x'"} {
+		if !pipe.MatchString(line) {
+			t.Errorf("the scan misses %q", line)
+		}
+	}
+	for _, line := range []string{"curl -fsS u -o /dev/null || bash x", "curl -fsS u | jq .x", "refresh <(curl -fsS u)", `up="$(prom up aerolvm_component 2>/dev/null || echo 0)"`} {
+		if pipe.MatchString(line) {
+			t.Errorf("the scan flags %q", line)
+		}
+	}
+	err = filepath.WalkDir(integrationDir(t), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Dot folders hold run output git ignores, such as .build/<id>/,
+		// whose install.sh copy has the curl | bash install line in its help.
+		if d.IsDir() && (d.Name() == "node_modules" || strings.HasPrefix(d.Name(), ".") && path != integrationDir(t)) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".sh") {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "#") && pipe.MatchString(line) {
+				t.Errorf("%s:%d pipes a download into an interpreter (Scorecard Pinned-Dependencies): %s", path, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
