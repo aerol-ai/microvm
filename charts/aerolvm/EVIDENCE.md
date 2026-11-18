@@ -44,7 +44,7 @@ nothing else.
 | Pod | Runs as | Rights | Kubernetes API |
 |---|---|---|---|
 | Server | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | None: no service account token for the API is mounted. Its `setup` container alone gets a 10-minute token for the operator's audience, which the API refuses (section 3) |
-| Gateway | user 65532, not root | Same as a server. With the edge on, its Caddy container is also user 65532 with no capabilities; ports 80 and 443 open through the namespaced `ip_unprivileged_port_start` sysctl, which `restricted` allows | None |
+| Gateway | user 65532, not root | Same as a server. With the edge on, its Caddy container is also user 65532 with no capabilities; port 443 opens through the namespaced `ip_unprivileged_port_start` sysctl, which `restricted` allows | None |
 | Operator | user 65532, not root | No capabilities, no privilege escalation, read-only root disk, `RuntimeDefault` seccomp | See below |
 | CRD upgrade Job (during a `helm upgrade` only) | user 65532, not root | Same as the operator | Get and update two CustomResourceDefinitions, by name: `aerolclusters.aerolvm.io` and `aerolnodes.aerolvm.io`. Nothing else, and it cannot create one. Its ClusterRole, binding and service account are Helm hooks, deleted when it succeeds (`templates/crd-upgrade.yaml`). Off with `cluster.operator.upgradeCRDs: false` |
 
@@ -175,7 +175,7 @@ envelope.
 
 | From | To | Allowed | Enforced by |
 |---|---|---|---|
-| Clients | Gateways | The client ports only (the API, SSH, and 443 and 80 with the edge), through the gateways' load balancer or your own Gateway API Gateway | Your load balancer; NetworkPolicy `<release>-gateway-ingress` |
+| Clients | Gateways | The client ports only (the API, SSH, and 443 with the edge; no port 80), through the gateways' load balancer or your own Gateway API Gateway | Your load balancer; NetworkPolicy `<release>-gateway-ingress` |
 | Anything but AerolVM's pods | Gateways' cluster ports, servers | Nothing (Prometheus may read the servers' metrics) | NetworkPolicies `<release>-gateway-ingress`, `<release>-server-ingress` |
 | The API server | The operator | Its webhook port only | NetworkPolicy `<release>-operator-ingress` |
 | Gateways | Workers | Forwarded requests, over mutual TLS | NetworkPolicy `<release>-worker-ingress`; mTLS |

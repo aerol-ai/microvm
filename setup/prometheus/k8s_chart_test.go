@@ -1764,7 +1764,12 @@ func TestKubernetesChartEdgePortsAreServed(t *testing.T) {
 					}
 				}
 			}
-			served := edgeSitePorts(t, docs)
+			served, sites := edgeSitePorts(t, docs)
+			// The API site and the wildcard site: fewer means the parser
+			// stopped matching the file, and an empty port set proves nothing.
+			if sites < 2 {
+				t.Fatalf("read %d sites from the edge Caddyfile, want at least 2", sites)
+			}
 			edgePods := 0
 			for role, tpl := range pods {
 				c := containerNamed(tpl, "edge")
@@ -1794,11 +1799,12 @@ func TestKubernetesChartEdgePortsAreServed(t *testing.T) {
 			}
 			if tc.name == "single" {
 				// The edge Service's ports name the edge container's.
-				tpl := pods[fmt.Sprint(dig(docsOfKind(docs, "StatefulSet")[0], "metadata", "name"))]
 				named := map[string]bool{}
-				ports, _ := dig(containerNamed(tpl, "edge"), "ports").([]any)
-				for _, p := range ports {
-					named[fmt.Sprint(dig(p, "name"))] = true
+				for _, tpl := range pods {
+					ports, _ := dig(containerNamed(tpl, "edge"), "ports").([]any)
+					for _, p := range ports {
+						named[fmt.Sprint(dig(p, "name"))] = true
+					}
 				}
 				found := false
 				for _, svc := range docsOfKind(docs, "Service") {
@@ -1840,8 +1846,9 @@ func TestKubernetesChartEdgePortsAreServed(t *testing.T) {
 }
 
 // edgeSitePorts is the ports the edge Caddyfile's sites listen on beyond the
-// pod itself: a site with `bind 127.0.0.1` serves only caddy-l4's fallback.
-func edgeSitePorts(t *testing.T, docs []map[string]any) map[int]bool {
+// pod itself (a site with `bind 127.0.0.1` serves only caddy-l4's fallback),
+// and how many sites it read.
+func edgeSitePorts(t *testing.T, docs []map[string]any) (map[int]bool, int) {
 	t.Helper()
 	for _, cm := range docsOfKind(docs, "ConfigMap") {
 		file, _ := dig(cm, "data", "Caddyfile").(string)
@@ -1850,7 +1857,8 @@ func edgeSitePorts(t *testing.T, docs []map[string]any) map[int]bool {
 		}
 		out := map[int]bool{}
 		site := regexp.MustCompile(`(?m)^(\S+) \{\n((?:\t.*\n|\n)*?)\}`)
-		for _, m := range site.FindAllStringSubmatch(file, -1) {
+		matches := site.FindAllStringSubmatch(file, -1)
+		for _, m := range matches {
 			addr, body := m[1], m[2]
 			if strings.Contains(body, "\tbind 127.0.0.1") {
 				continue
@@ -1864,27 +1872,32 @@ func edgeSitePorts(t *testing.T, docs []map[string]any) map[int]bool {
 			}
 			out[port] = true
 		}
-		return out
+		return out, len(matches)
 	}
 	t.Fatal("no edge Caddyfile")
-	return nil
+	return nil, 0
 }
 
 // edgeSitePorts reads a site's port from its address, and skips a site
-// bound to the pod's loopback.
-func TestEdgeSitePorts(t *testing.T) {
+// bound to the pod's loopback. (Named for the CI job that runs the chart
+// tests: `-run '^TestKubernetesChart'`.)
+func TestKubernetesChartEdgeSitePorts(t *testing.T) {
 	for _, tc := range []struct {
-		file string
-		want map[int]bool
+		file  string
+		want  map[int]bool
+		sites int
 	}{
-		{"{\n\tadmin localhost:2019\n}\n\nhttps://a.test:8443 {\n\tbind 127.0.0.1\n\thandle {\n\t\trespond 404\n\t}\n}\n", map[int]bool{}},
-		{"http:// {\n\tredir https://{host}{uri} 308\n}\n", map[int]bool{80: true}},
-		{":8080 {\n\n\trespond 404\n}\n", map[int]bool{8080: true}},
-		{"https://a.test {\n\trespond 404\n}\nhttps://*.a.test:8443 {\n\tbind 127.0.0.1\n}\n", map[int]bool{443: true}},
+		{"{\n\tadmin localhost:2019\n}\n\nhttps://a.test:8443 {\n\tbind 127.0.0.1\n\thandle {\n\t\trespond 404\n\t}\n}\n", map[int]bool{}, 1},
+		{"http:// {\n\tredir https://{host}{uri} 308\n}\n", map[int]bool{80: true}, 1},
+		{":8080 {\n\n\trespond 404\n}\n", map[int]bool{8080: true}, 1},
+		{"https://a.test {\n\trespond 404\n}\nhttps://*.a.test:8443 {\n\tbind 127.0.0.1\n}\n", map[int]bool{443: true}, 2},
+		// Spaces instead of tabs: no site is read, and the count says so.
+		{"https://a.test:8443 {\n    bind 127.0.0.1\n}\n", map[int]bool{}, 0},
 	} {
 		docs := []map[string]any{{"kind": "ConfigMap", "data": map[string]any{"Caddyfile": tc.file}}}
-		if got := edgeSitePorts(t, docs); !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("edgeSitePorts(%q) = %v, want %v", tc.file, got, tc.want)
+		got, sites := edgeSitePorts(t, docs)
+		if !reflect.DeepEqual(got, tc.want) || sites != tc.sites {
+			t.Errorf("edgeSitePorts(%q) = %v, %d sites; want %v, %d", tc.file, got, sites, tc.want, tc.sites)
 		}
 	}
 }
