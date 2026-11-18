@@ -52,7 +52,7 @@ exit 1`
 			t.Fatal(err)
 		}
 	}
-	env := append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log, "HELM=helm")
+	env := append(cleanEnviron(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log, "HELM=helm")
 	return env, log
 }
 
@@ -216,7 +216,7 @@ func TestEKSBankEstimateGuardsUp(t *testing.T) {
 		t.Fatalf("dry run: exit %d, calls %q:\n%s", code, calls, out)
 	}
 	m := regexp.MustCompile(`planned: \$([0-9.]+) .* worst case \(teardown timer at 6 h\): \$([0-9.]+); ceiling \$45\.00`).FindStringSubmatch(out)
-	if m != nil && (m[1] != "30.98" || m[2] != "40.05") {
+	if m != nil && (m[1] != "32.85" || m[2] != "40.05") {
 		t.Errorf("the estimate moved: planned $%s, worst $%s (update the report and this test together)", m[1], m[2])
 	}
 	if m == nil {
@@ -432,7 +432,7 @@ func TestEKSBankTeardownLambdaPhases(t *testing.T) {
 		cmd := exec.Command("python3", "-I", "-c",
 			"import sys; sys.path[:0] = sys.argv[1:3]; import teardown; print(teardown.handler({'phase': sys.argv[3]}, None))",
 			fake, lambdaDir, phase)
-		cmd.Env = append(os.Environ(), "CLUSTER=bank-1", "KARPENTER_ROLE=bank-1-karpenter", "FAKE_LOG="+log, "FAKE_STATE="+string(raw),
+		cmd.Env = append(cleanEnviron(), "CLUSTER=bank-1", "KARPENTER_ROLE=bank-1-karpenter", "FAKE_LOG="+log, "FAKE_STATE="+string(raw),
 			"SECOND_SWEEP_DELAY=0", "TTL=2026-11-18T00:00:00Z")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("%s: %v\n%s", phase, err, out)

@@ -32,7 +32,7 @@ case " $* " in *" port-forward "*) for a in "$@"; do last="$a"; done; echo "Forw
 			t.Fatal(err)
 		}
 	}
-	env := append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log)
+	env := append(cleanEnviron(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log)
 	return env, log
 }
 

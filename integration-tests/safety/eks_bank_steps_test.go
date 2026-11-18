@@ -135,7 +135,7 @@ echo teardown >> "$OUT/log"
 echo "failed: ${failed_checks[*]}" >> "$OUT/log"
 `
 	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = append(os.Environ(), "OUT="+dir)
+	cmd.Env = append(cleanEnviron(), "OUT="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("the harness failed: %v\n%s", err, out)
 	}
@@ -248,7 +248,7 @@ echo finished >> "$OUT/calls"
 	} {
 		dir := t.TempDir()
 		cmd := exec.Command("bash", "-c", harness)
-		cmd.Env = append(os.Environ(), "OUT="+dir, "PLACE_CODE="+tc.code, "PLACE_BODY="+tc.body, "NODE="+tc.node)
+		cmd.Env = append(cleanEnviron(), "OUT="+dir, "PLACE_CODE="+tc.code, "PLACE_BODY="+tc.body, "NODE="+tc.node)
 		out, err := cmd.CombinedOutput()
 		calls := readLog(t, filepath.Join(dir, "calls"))
 		if err != nil || !strings.Contains(calls, "finished") {
@@ -289,7 +289,7 @@ drills_main drills-test.sh "$@"
 `
 	run := func(steps ...string) (int, string) {
 		cmd := exec.Command("bash", append([]string{"-c", caller, "bash"}, steps...)...)
-		cmd.Env = append(os.Environ(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-lib.sh")))
+		cmd.Env = append(cleanEnviron(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-lib.sh")))
 		out, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(out)
 	}
@@ -344,7 +344,7 @@ curl() { echo "curl $*" >> "$OUT/calls"; }
 gw_call GET /v1/whoami
 `
 	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = append(os.Environ(), "OUT="+dir)
+	cmd.Env = append(cleanEnviron(), "OUT="+dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil || !strings.HasPrefix(string(out), "000\n") || strings.Contains(readLog(t, filepath.Join(dir, "calls")), "kubectl") {
 		t.Errorf("gw_call with no gateway: %v %q, calls %q", err, out, readLog(t, filepath.Join(dir, "calls")))
@@ -368,7 +368,7 @@ step_nlb
 echo finished >> "$OUT/calls"
 `
 	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = append(os.Environ(), "OUT="+dir)
+	cmd.Env = append(cleanEnviron(), "OUT="+dir)
 	out, err := cmd.CombinedOutput()
 	calls := readLog(t, filepath.Join(dir, "calls"))
 	if err != nil || !strings.Contains(calls, "finished") || strings.Contains(calls, "describe-target-groups") {
@@ -460,7 +460,7 @@ log finished
 			t.Fatal(err)
 		}
 		cmd := exec.Command("bash", "-c", tc.script)
-		cmd.Env = append(os.Environ(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-eks.sh")))
+		cmd.Env = append(cleanEnviron(), "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "drills-eks.sh")))
 		out, err := cmd.CombinedOutput()
 		log := readLog(t, filepath.Join(dir, "log"))
 		if err != nil || !strings.Contains(log, tc.want) {

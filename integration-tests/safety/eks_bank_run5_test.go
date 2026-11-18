@@ -36,6 +36,21 @@ import (
 // the code before the fix (except the way-back one, which holds code that
 // was right).
 
+// cleanEnviron is os.Environ() without the bank run's own settings
+// (EKS_BANK_*, DRILL_*, DRY_RUN): a value the caller exported, such as an
+// EKS_BANK_DRILLS left over from a re-run, must not change what a test runs
+// (TestEKSBankEstimateGuardsUp failed with one exported).
+func cleanEnviron() []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "EKS_BANK_") || strings.HasPrefix(e, "DRILL_") || strings.HasPrefix(e, "DRY_RUN=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	return env
+}
+
 // freePort is a local port nothing listens on (taken, then let go).
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -135,7 +150,7 @@ func runBash(t *testing.T, script string, env ...string) (string, error) {
 		t.Fatal(err)
 	}
 	cmd := exec.CommandContext(ctx, "bash", f)
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(cleanEnviron(), env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -564,10 +579,13 @@ func TestScaleFullNeedsAnotherWorker(t *testing.T) {
 		fns.WriteString(shellFunc(t, "eks-bank.sh", fn))
 	}
 	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "fill_plan"))
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_results"))
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_unfinished"))
 	script := `set -euo pipefail
 sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HERE="$K8S"
 base_workers=6; peak_workers=60; scale_minutes=60; back_minutes=20
 in_scale=""; drill_pid=""; scaled_back=0
+peak_drills=(ecr-storm thresholds); run_peak_list=("${peak_drills[@]}")
 cell() { python3 "$CELL" "$OUT/cell.json" "$@"; }
 say() { echo "$*" >> "$OUT/say"; }
 result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
@@ -759,5 +777,367 @@ func TestScaleWayBackWaitsOutAFailedRead(t *testing.T) {
 	}
 	if !strings.Contains(bank, "PASS scale-back") || strings.Contains(bank, "FAIL scale exited") || !strings.Contains(log, "after the check") {
 		t.Errorf("a failed read on the way back ended the step:\n%s\n%s", bank, log)
+	}
+}
+
+// EKS_BANK_DRILLS: the drills step runs only the drills named (setup always,
+// first, in the drills' own order), an unknown name refuses the run before
+// any call, and estimate prices only those drills.
+func TestEKSBankDrillsSubset(t *testing.T) {
+	needTools(t, "python3", "jq")
+	// drills-eks.sh <name> <state-dir> <step>: it notes the drill and passes.
+	runDrills := func(drills string) (string, string, int) {
+		k8s := bankRun(t, "bank-1", "arn:aws:eks:us-east-1:111122223333:cluster/bank-1", true)
+		st := filepath.Join(k8s, ".state", "bank-1")
+		if err := os.WriteFile(filepath.Join(st, "api-token"), []byte("avm_x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ran := filepath.Join(st, "ran")
+		stub := "#!/bin/sh\necho \"$3\" >> \"" + ran + "\"\nmkdir -p \"$2\"; echo \"PASS $3 ok\" >> \"$2/drills.txt\"\n"
+		if err := os.WriteFile(filepath.Join(k8s, "drills-eks.sh"), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env, _ := eksStubs(t)
+		cmd := exec.Command("bash", filepath.Join(k8s, "eks-bank.sh"), "bank-1", "drills")
+		cmd.Env = append(env, "EKS_BANK_DRILLS="+drills)
+		out, _ := cmd.CombinedOutput()
+		return readLog(t, ran), string(out), cmd.ProcessState.ExitCode()
+	}
+	for _, tc := range []struct{ drills, want string }{
+		{"setup,slo-breach", "setup\nslo-breach\n"},
+		{"slo-breach", "setup\nslo-breach\n"},             // setup is added
+		{"ecr-push, static", "setup\nstatic\necr-push\n"}, // the drills' own order
+		{"ecr-storm", "setup\necr-push\n"},                // its images, pushed at 6 workers
+		{"", "setup\nstatic\npull-storm\nslo-breach\nlarge-layers\necr-push\n"},
+	} {
+		if ran, out, code := runDrills(tc.drills); ran != tc.want || code != 0 {
+			t.Errorf("EKS_BANK_DRILLS=%q: exit %d, ran %q, want %q:\n%s", tc.drills, code, ran, tc.want, out)
+		}
+	}
+
+	// An unknown name: refused before any step, with no call made.
+	k8s := bankRun(t, "bank-1", "arn:aws:eks:us-east-1:111122223333:cluster/bank-1", true)
+	env, log := eksStubs(t)
+	cmd := exec.Command("bash", filepath.Join(k8s, "eks-bank.sh"), "bank-1", "all")
+	cmd.Env = append(env, "EKS_BANK_DRILLS=setup,slo-breech")
+	out, _ := cmd.CombinedOutput()
+	if cmd.ProcessState.ExitCode() != 2 || !strings.Contains(string(out), `EKS_BANK_DRILLS: "slo-breech" is not a drill`) ||
+		strings.Contains(string(out), "--- up") || strings.TrimSpace(readLog(t, log)) != "" {
+		t.Errorf("an unknown drill: exit %d, calls %q:\n%s", cmd.ProcessState.ExitCode(), readLog(t, log), out)
+	}
+
+	// estimate prices the drills named, and only those.
+	estimate := func(drills string) (string, float64) {
+		env, log := eksStubs(t)
+		cmd := exec.Command("bash", k8sFile(t, "eks-bank.sh"), "bank-1", "estimate")
+		cmd.Env = append(env, "DRY_RUN=1", "EKS_BANK_DRY_DIR="+t.TempDir(), "EKS_BANK_DRILLS="+drills)
+		out, err := cmd.CombinedOutput()
+		if err != nil || strings.TrimSpace(readLog(t, log)) != "" {
+			t.Fatalf("estimate: %v, calls %q:\n%s", err, readLog(t, log), out)
+		}
+		row := regexp.MustCompile(`(?m)^drills +([0-9.]+) +[0-9.]+ +\(([a-z -]+)\)$`).FindStringSubmatch(string(out))
+		planned := regexp.MustCompile(`planned: \$([0-9.]+)`).FindStringSubmatch(string(out))
+		if row == nil || planned == nil {
+			t.Fatalf("no drills row or plan:\n%s", out)
+		}
+		p, _ := strconv.ParseFloat(planned[1], 64)
+		return row[1] + " " + row[2], p
+	}
+	sub, subPlanned := estimate("setup,slo-breach")
+	all, allPlanned := estimate("")
+	if sub != "0.95 setup slo-breach" || all != "2.60 setup static pull-storm slo-breach large-layers ecr-push" || subPlanned >= allPlanned {
+		t.Errorf("estimate: subset %q ($%.2f), all %q ($%.2f)", sub, subPlanned, all, allPlanned)
+	}
+}
+
+// parseFirst runs parse_drills (with the caller's EKS_BANK_DRILLS) before
+// the check, where eks-bank.sh has it; the code before it had none.
+const parseFirst = `
+if declare -F parse_drills >/dev/null; then parse_drills; fi
+`
+
+// (#1366 review, 1) The scale step runs only the peak drills EKS_BANK_DRILLS
+// names, and writes a SKIP line for the other. Before: with
+// EKS_BANK_DRILLS=setup,slo-breach it still ran ecr-storm, which pushed its
+// own 200 images at the peak until the time box ended it, and thresholds
+// never started; neither wrote a line.
+func TestScaleStepRunsOnlyTheNamedPeakDrills(t *testing.T) {
+	for _, tc := range []struct {
+		drills    string
+		ran, skip []string
+	}{
+		{"setup,slo-breach", nil, []string{"ecr-storm", "thresholds"}},
+		{"slo-breach thresholds", []string{"thresholds"}, []string{"ecr-storm"}},
+		{"", []string{"ecr-storm", "thresholds"}, nil}, // unset: both, as before
+	} {
+		// The floor back to 6 is the cell back to 6 (thresholds, which set
+		// that in the harness, may not run here).
+		extra := parseFirst + `set_min_workers() { log "set_min_workers $1"; [[ "$1" != 6 ]] || echo "6 0 6" > "$OUT/workers"; }
+`
+		r := startUndoWith(t, extra, "scale step_scale", "12 0 12", "RUN_ALL=0", "EKS_BANK_DRILLS="+tc.drills)
+		r.end(t)
+		log, bank := readLog(t, filepath.Join(r.dir, "log")), readLog(t, filepath.Join(r.dir, "bank.txt"))
+		for _, d := range []string{"ecr-storm", "thresholds"} {
+			ran := strings.Contains(log, "drills "+d+"\n")
+			skipped := strings.Contains(bank, "SKIP "+d+" not in EKS_BANK_DRILLS\n")
+			want := false
+			for _, w := range tc.ran {
+				want = want || w == d
+			}
+			if ran != want || skipped == want {
+				t.Errorf("EKS_BANK_DRILLS=%q: %s ran %v, skipped %v (want ran %v):\n%s\n%s", tc.drills, d, ran, skipped, want, log, bank)
+			}
+		}
+		if !strings.Contains(log, "after the check") {
+			t.Errorf("EKS_BANK_DRILLS=%q: the scale step did not end:\n%s", tc.drills, log)
+		}
+	}
+}
+
+// (#1366 review, 1) A peak drill the time box cuts off, or that never
+// starts, writes a FAIL line, so the closing line counts it. The clock is
+// a file each sleep moves on; the box is 1 minute and ecr-storm outlasts it.
+func TestPeakDrillsTheTimeBoxEndsAreRecorded(t *testing.T) {
+	extra := `
+date +%s > "$OUT/clock"
+now() { cat "$OUT/clock"; }
+sleep() { command sleep 0.2; echo $(( $(cat "$OUT/clock") + ${1%.*} )) > "$OUT/clock"; }
+scale_minutes=1
+drills() {
+  log "drills $1"
+  case "$1" in
+    # wait $!: killed, the drill answers 143, as drills-eks.sh does.
+    ecr-storm) command sleep 20 & echo $! >> "$OUT/drill-sleeps"; wait $! ;;
+    unfill) echo "6 0 6" > "$OUT/workers" ;;
+  esac
+}
+`
+	r := startUndoWith(t, extra, "scale step_scale", "12 0 12", "RUN_ALL=0")
+	r.end(t)
+	bank := readLog(t, filepath.Join(r.dir, "bank.txt"))
+	if !regexp.MustCompile(`(?m)^FAIL ecr-storm cut off by the time box after [0-9]+s$`).MatchString(bank) ||
+		!strings.Contains(bank, "FAIL thresholds not started: the time box ended first\n") {
+		t.Errorf("bank.txt:\n%s\n%s", bank, readLog(t, filepath.Join(r.dir, "log")))
+	}
+	if strings.Contains(readLog(t, filepath.Join(r.dir, "log")), "drills thresholds") || !r.sleepsGone(t) {
+		t.Errorf("thresholds ran after the box, or ecr-storm outlived it:\n%s", readLog(t, filepath.Join(r.dir, "log")))
+	}
+}
+
+// bankDown runs `eks-bank.sh bank-1 <steps>` on stubs that end down cleanly
+// (an aws that lists nothing), with env added; it returns the output, the
+// exit code and the scripts called.
+func bankDown(t *testing.T, steps []string, env ...string) (string, int, string) {
+	t.Helper()
+	k8s := bankRun(t, "bank-1", "arn:aws:eks:us-east-1:111122223333:cluster/bank-1", true)
+	calls := filepath.Join(k8s, "scripts.log")
+	stub := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> \"" + calls + "\"\nexit 0\n"
+	for _, s := range []string{"cluster.sh", "cell.sh"} {
+		if err := os.WriteFile(filepath.Join(k8s, s), []byte(stub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(k8s, ".state", "bank-1", "terraform.tfstate"), []byte(`{"resources": [{"type": "aws_vpc"}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base, _ := eksStubs(t)
+	awsDir := t.TempDir()
+	awsStub := "#!/bin/sh\ncase \"$*\" in *\"sts get-caller-identity\"*) echo 111122223333 ;; *\"s3api head-bucket\"*) exit 254 ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(awsDir, "aws"), []byte(awsStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, e := range base {
+		if strings.HasPrefix(e, "PATH=") {
+			base[i] = "PATH=" + awsDir + string(os.PathListSeparator) + strings.TrimPrefix(e, "PATH=")
+		}
+	}
+	cmd := exec.Command("bash", append([]string{filepath.Join(k8s, "eks-bank.sh"), "bank-1"}, steps...)...)
+	cmd.Env = append(base, env...)
+	out, _ := cmd.CombinedOutput()
+	return string(out), cmd.ProcessState.ExitCode(), readLog(t, calls)
+}
+
+// (#1366 review, 2) EKS_BANK_DRILLS is read only by the steps it is for
+// (up, estimate, drills, scale, all). A bad value left in the shell never
+// stops down. Before: every step list exited 2 on it, down too.
+func TestEKSBankDownRunsWithABadDrillsValue(t *testing.T) {
+	needTools(t, "python3", "jq")
+	out, code, calls := bankDown(t, []string{"down"}, "EKS_BANK_DRILLS=no-such-drill")
+	if code != 0 || !strings.Contains(calls, "cell.sh bank-1 down") || !strings.Contains(out, "down: nothing of bank-1 is left") {
+		t.Errorf("down with a bad EKS_BANK_DRILLS: exit %d, scripts %q:\n%s", code, calls, out)
+	}
+	// The steps it is for still refuse it, before any call.
+	out, code, calls = bankDown(t, []string{"drills", "down"}, "EKS_BANK_DRILLS=no-such-drill")
+	if code != 2 || calls != "" || !strings.Contains(out, `"no-such-drill" is not a drill`) {
+		t.Errorf("drills with a bad EKS_BANK_DRILLS: exit %d, scripts %q:\n%s", code, calls, out)
+	}
+}
+
+// (#1366 review, 3) A value with no drill names in it is refused like an
+// unknown name; newlines separate names as commas and spaces do. Before:
+// "," and " " ran setup alone, and a second line was dropped.
+func TestEKSBankDrillsNeedNames(t *testing.T) {
+	needTools(t, "python3", "jq")
+	for _, v := range []string{",", " ", " , ", "\n"} {
+		out, code, calls := bankDown(t, []string{"drills"}, "EKS_BANK_DRILLS="+v)
+		if code != 2 || calls != "" || !strings.Contains(out, "EKS_BANK_DRILLS has no drill names in it") {
+			t.Errorf("EKS_BANK_DRILLS=%q: exit %d, scripts %q:\n%s", v, code, calls, out)
+		}
+	}
+	cmd := exec.Command("bash", k8sFile(t, "eks-bank.sh"), "bank-1", "estimate")
+	cmd.Env = append(cleanEnviron(), "DRY_RUN=1", "EKS_BANK_DRY_DIR="+t.TempDir(), "EKS_BANK_DRILLS=setup\nslo-breach")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "(setup slo-breach)") {
+		t.Errorf("names on two lines: %v\n%s", err, out)
+	}
+}
+
+// (#1366 review, 4) The refusal lists the names the script takes, from the
+// list it checks against: each listed name is taken, ecr-storm and
+// thresholds among them. Before: a hand-typed copy of six names.
+func TestEKSBankDrillsErrorNamesEveryDrill(t *testing.T) {
+	needTools(t, "python3")
+	run := func(drills string) (string, error) {
+		cmd := exec.Command("bash", k8sFile(t, "eks-bank.sh"), "bank-1", "estimate")
+		cmd.Env = append(cleanEnviron(), "DRY_RUN=1", "EKS_BANK_DRY_DIR="+t.TempDir(), "EKS_BANK_DRILLS="+drills)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	out, _ := run("nope")
+	m := regexp.MustCompile(`"nope" is not a drill \(([a-z -]+)\)`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no list of drills in the refusal:\n%s", out)
+	}
+	names := strings.Fields(m[1])
+	if !strings.Contains(" "+m[1]+" ", " ecr-storm ") || !strings.Contains(" "+m[1]+" ", " thresholds ") {
+		t.Errorf("the list leaves out the peak drills: %v", names)
+	}
+	for _, n := range names {
+		if out, err := run(n); err != nil {
+			t.Errorf("%q, listed as a drill, is refused: %v\n%s", n, err, out)
+		}
+	}
+}
+
+// (#1366 review, 5) The tests' environment holds none of the caller's bank
+// run settings: an exported EKS_BANK_DRILLS (or ceiling, or timer) failed
+// TestEKSBankEstimateGuardsUp.
+func TestBankTestEnvDropsCallerSettings(t *testing.T) {
+	needTools(t, "python3")
+	t.Setenv("EKS_BANK_DRILLS", "no-such-drill")
+	t.Setenv("EKS_BANK_CEILING", "1")
+	t.Setenv("EKS_BANK_TTL", "1h")
+	t.Setenv("DRILL_STORM_MINUTES", "1")
+	env, log := eksStubs(t)
+	for _, e := range env {
+		if strings.HasPrefix(e, "EKS_BANK_") || strings.HasPrefix(e, "DRILL_") || strings.HasPrefix(e, "DRY_RUN=") {
+			t.Errorf("the stubs' environment keeps the caller's %s", e)
+		}
+	}
+	cmd := exec.Command("bash", k8sFile(t, "eks-bank.sh"), "bank-1", "estimate")
+	cmd.Env = append(env, "DRY_RUN=1", "EKS_BANK_DRY_DIR="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "worst case (teardown timer at 6 h): $40.05; ceiling $45.00") || strings.TrimSpace(readLog(t, log)) != "" {
+		t.Errorf("the default estimate under the caller's settings: %v\n%s", err, out)
+	}
+}
+
+// (#1366 re-review, 1) The peak drills' result lines come from one place,
+// peak_results, and from marks written whole. Before, the drills' subshell
+// wrote its end mark, then its FAIL line: a kill between the two left no
+// line (3 of 400 stress runs). And it wrote the start time through a
+// redirect that empties the file first: a kill there left it empty, and
+// the arithmetic on it ended the scale step (1 of 400: "FAIL scale exited
+// 1", scale-back lost). Each case here is a state those kills can leave.
+func TestPeakResultsFromTheMarks(t *testing.T) {
+	fn := shellFuncIf(t, "eks-bank.sh", "peak_results")
+	call := `peak_results "$OUT/peak" "$BOXED"`
+	if fn == "" {
+		// The code before it: peak_unfinished <dir>, after the subshell had
+		// written its own exit lines.
+		fn, call = shellFunc(t, "eks-bank.sh", "peak_unfinished"), `peak_unfinished "$OUT/peak"`
+	}
+	for _, tc := range []struct {
+		desc, boxed string
+		marks       map[string]string // file in peak/ -> contents
+		want        string
+	}{
+		{"ended 0", "0", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "0"}, ""},
+		{"ended 3", "0", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "3"}, "FAIL ecr-storm drills-eks.sh ecr-storm exited 3\n"},
+		{"killed by the box: exit 143", "1", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "143"}, "FAIL ecr-storm cut off by the time box after 60s\n"},
+		{"killed by the box before its end mark", "1", map[string]string{"ecr-storm.started": "100"}, "FAIL ecr-storm cut off by the time box after 60s\n"},
+		{"a start mark the kill left empty", "1", map[string]string{"ecr-storm.started": ""}, "FAIL ecr-storm cut off by the time box\n"},
+		{"never started", "1", map[string]string{}, "FAIL ecr-storm not started: the time box ended first\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "peak"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for f, body := range tc.marks {
+			if err := os.WriteFile(filepath.Join(dir, "peak", f), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		script := `set -euo pipefail
+run_peak_list=(ecr-storm)
+now() { echo 160; }
+result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
+` + fn + call + "\necho finished >> \"$OUT/log\"\n"
+		out, err := runBash(t, script, "OUT="+dir, "BOXED="+tc.boxed)
+		if err != nil || readLog(t, filepath.Join(dir, "log")) != "finished\n" {
+			t.Errorf("%s: died: %v\n%s", tc.desc, err, out)
+			continue
+		}
+		if got := readLog(t, filepath.Join(dir, "bank.txt")); got != tc.want {
+			t.Errorf("%s: recorded %q, want %q", tc.desc, got, tc.want)
+		}
+	}
+}
+
+// (#1366 re-review, 2) A scale fill that runs past a short time box passes
+// a negative limit to the wait for the peak's workers. That is no wait at
+// all now. Before: `seq 1 <negative>` counts down on macOS, so the step
+// checked and slept about as long as the overrun. The clock is a file.
+func TestScaleWaitAfterAFillPastTheBox(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "run.tfvars.json"), []byte(`{"ttl": "2099-01-01T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "clock"), []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var fns strings.Builder
+	for _, fn := range []string{"wait_until", "kill_tree", "stop_scale_drills", "scale_back", "read_workers", "step_scale"} {
+		fns.WriteString(shellFunc(t, "eks-bank.sh", fn))
+	}
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_results"))
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_unfinished"))
+	// A 10-minute box; the workers never reach the fill's target, so the
+	// fill runs its whole 15 minutes, past the box.
+	script := `set -euo pipefail
+sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HERE="$K8S"
+base_workers=6; peak_workers=60; scale_minutes=10; back_minutes=20
+in_scale=""; drill_pid=""; scaled_back=0
+peak_drills=(ecr-storm thresholds); run_peak_list=()
+say() { echo "$*" >> "$OUT/say"; }
+result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
+now() { cat "$OUT/clock"; }
+sleep() { echo $(( $(cat "$OUT/clock") + ${1%.*} )) > "$OUT/clock"; }
+api_token() { :; }; cap_schedule() { :; }; nodepool() { :; }; timeline() { :; }; set_min_workers() { :; }
+end_extra_machines() { :; }; x() { :; }; tfout() { echo us-east-1; }
+fill_plan() { echo "2 1"; }
+workers_now() { echo "6 0 6"; }
+drills() { :; }
+at_least() { echo check >> "$OUT/checks"; return 1; }
+` + fns.String() + `
+step_scale
+echo finished >> "$OUT/log"
+`
+	out, err := runBash(t, script, "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "eks-bank.sh")))
+	if err != nil || readLog(t, filepath.Join(dir, "log")) != "finished\n" {
+		t.Fatalf("the scale step died: %v\n%s", err, out)
+	}
+	if checks := strings.Count(readLog(t, filepath.Join(dir, "checks")), "check"); checks != 0 {
+		t.Errorf("waited for the peak's workers %d times after the box had ended (want 0):\n%s", checks, readLog(t, filepath.Join(dir, "say")))
 	}
 }

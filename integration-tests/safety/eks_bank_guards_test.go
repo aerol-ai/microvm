@@ -670,7 +670,7 @@ exit 0`,
 		}
 	}
 	cmd := exec.Command("bash", filepath.Join(root, "k8s", "cluster.sh"), "down", "bank-1")
-	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log)
+	cmd.Env = append(cleanEnviron(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_LOG="+log)
 	done := make(chan struct{})
 	var out []byte
 	go func() { out, _ = cmd.CombinedOutput(); close(done) }()
