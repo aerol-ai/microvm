@@ -39,8 +39,10 @@
 #   thresholds    at the current worker count: DRILL_QUIET_MINUTES (10) of
 #                 healthy traffic with none of the 7 drilled alerts firing,
 #                 each alert's value against its threshold; then the
-#                 pull-storm drill for DRILL_STORM_MINUTES (10), whose 3
-#                 alerts must fire. Run it at 60 workers (eks-bank.sh scale)
+#                 pull-storm drill for DRILL_STORM_MINUTES (15), sized for
+#                 the workers (pull cap + 2 cold creates a worker, each on
+#                 an image of its own), whose 3 alerts must fire. Run it at
+#                 60 workers (eks-bank.sh scale)
 #   fill unfill   DRILL_FILL_COUNT (8) more sandboxes of 1 CPU and 2 GiB that
 #                 stay, to fill the cell (eks-bank.sh scale); unfill deletes them
 #   shard-routes  past 10 gateways: each sandbox's routes on its 2 owner
@@ -85,6 +87,10 @@ mkdir -p "$sd/evidence"
 drill_reg=drills-registry.drills.svc
 ctl_port="${DRILL_PROXY_CONTROL_PORT:-15011}"
 ctl_url="http://127.0.0.1:$ctl_port"
+# The local ports of the one-call port-forwards (pf_start, port-forward.sh):
+# server-0's admin port (setup_token), a gateway's Caddy admin (caddy_get).
+token_lport=19213
+caddy_lport=12020
 ca_issuer="${DRILL_CA_ISSUER:-aerolvm-drills-ca}"
 client_image=public.ecr.aws/docker/library/python:3.12-slim
 client_pull=IfNotPresent
@@ -101,10 +107,11 @@ vfield() { jf "$1" "d[\"$2\"]"; }
 # pusher <args>: push.py inside the cluster.
 pusher() { kc -n drills exec drills-pusher -- python -u /drill/push.py --registry "https://$drill_reg" --cafile /ca/ca.crt "$@"; }
 push_tags() { pusher --base drill/app:v1 "$@"; }
+# push_images <run> [cold]: the run's images, with that many cold ones (12).
 push_images() {
   local run="$1" tags=() i
   tags=("drill/dedup:$run" "drill/hot:$run" "drill/hang:$run")
-  for i in $(seq 1 12); do tags+=("drill/cold:$run-$i"); done
+  for i in $(seq 1 "${2:-12}"); do tags+=("drill/cold:$run-$i"); done
   push_tags "${tags[@]}" >/dev/null
   say "images pushed for run $run"
 }
@@ -148,12 +155,14 @@ setup_token() {
   fi
   local pat pf made
   pat="$(kc -n "$ns" get secret "$cluster_name-admin" -o jsonpath='{.data.token}' | base64 -d | tr -d '\n')"
-  kc -n "$ns" port-forward pod/"$cluster_name"-server-0 19213:21219 >/dev/null 2>&1 & pf=$!
-  sleep 3
+  if ! pf_start pf "$token_lport" --context "$ctx" -n "$ns" port-forward "pod/$cluster_name-server-0" "$token_lport:21219"; then
+    result FAIL setup "making the admin API token: $pf_error"
+    return 1
+  fi
   made="$(curl -fsS -m 30 -H "Authorization: Bearer $pat" -H 'Content-Type: application/json' \
     -d "{\"name\": \"drills-admin-$(date +%s)\", \"role\": \"admin\", \"team\": \"*\", \"expires_in\": \"24h\"}" \
-    http://127.0.0.1:19213/v1/tokens)"
-  kill "$pf" 2>/dev/null || true
+    "http://127.0.0.1:$token_lport/v1/tokens" || true)"
+  pf_stop "$pf"
   ( umask 077; jf "$made" 'd["token"]' | tr -d '\n' > "$sd/token" )
 }
 
@@ -365,34 +374,54 @@ step_thresholds() {
   watch_stop
   # drills-lib.sh read the hold when sourced; step_pull_storm sees this one.
   local hold_min="${DRILL_HOLD_MINUTES:-5}"
-  DRILL_STORM_MINUTES="${DRILL_STORM_MINUTES:-10}" step_pull_storm
+  # The storm sized for the workers. The fifth EKS run's 6-worker storm (24
+  # cold creates over 12 images, 10 min) on 60 workers queued no pull (at
+  # most 2 at once on a worker, the cap is 4), and its 10 min ended before
+  # the backlog and error alerts could fire: each holds 10 min, and at 6
+  # workers they fired 10m47s and 11m20s in. Now cap + 2 cold creates per
+  # worker, each on an image of its own (no create waits on another's pull),
+  # for 15 min.
+  local cold=$(( (pull_cap + 2) * n ))
+  (( cold >= 24 )) || cold=24
+  DRILL_STORM_MINUTES="${DRILL_STORM_MINUTES:-15}" DRILL_STORM_COLD="$cold" DRILL_STORM_COLD_IMAGES="$cold" step_pull_storm
 }
 
-# fill: DRILL_FILL_COUNT (8) more sandboxes of 1 CPU and 2 GiB that stay,
-# all tagged drill-run=fill (eks-bank.sh scale fills the cell with them,
-# round by round, until the operator buys machines). unfill deletes them.
+# fill: DRILL_FILL_COUNT (8) more sandboxes of DRILL_FILL_CPU (1) CPU and
+# 2 GiB that stay, all tagged drill-run=fill (eks-bank.sh's scale step sizes
+# each round from the members, fill_plan, until the operator buys
+# machines). unfill deletes them.
 step_fill() {
-  local out="$sd/evidence/scale" n="${DRILL_FILL_COUNT:-8}"
+  local out="$sd/evidence/scale" n="${DRILL_FILL_COUNT:-8}" cpu="${DRILL_FILL_CPU:-1}"
   mkdir -p "$out"
-  storm_start fill --images "$drill_reg/drill/app:v1" --runtime gvisor --cpu 1 --memory-mb 2048 \
+  storm_start fill --images "$drill_reg/drill/app:v1" --runtime gvisor --cpu "$cpu" --memory-mb 2048 \
     --concurrency "$n" --once --client-timeout 600 --duration 600
   storm_wait fill 130 || true
   storm_fetch fill "$out" > /dev/null
-  say "fill: $n more sandboxes of 1 CPU and 2 GiB; every fill create so far: $(sum storm "$out/fill.jsonl")"
+  say "fill: $n more sandboxes of $cpu CPU and 2 GiB; every fill create so far: $(sum storm "$out/fill.jsonl")"
 }
 
-# caddy_get <gateway pod>: its edge Caddy's whole config, over a port-forward.
+# caddy_get <gateway pod>: its edge Caddy's whole config, over a port-forward
+# of its own (pf_start: kubectl itself, so pf_stop ends it; `kc … &` was a
+# subshell, and its kubectl outlived the read and answered every later one).
+# Returns 1, with the reason on stderr, when the forward does not open (the
+# port already in use among them) or Caddy does not answer: never another
+# gateway's config.
 caddy_get() {
-  local k _
-  kc -n "$ns" port-forward "pod/$1" 12020:2019 >/dev/null 2>&1 &
-  k=$!
-  for _ in $(seq 1 20); do
-    curl -s -m 2 -o /dev/null -H "Host: localhost:2019" http://127.0.0.1:12020/config/admin && break
-    sleep 1
+  local k rc=0
+  pf_start k "$caddy_lport" --context "$ctx" -n "$ns" port-forward "pod/$1" "$caddy_lport:2019" || return 1
+  curl -fsS -m 30 -H "Host: localhost:2019" "http://127.0.0.1:$caddy_lport/config/" || rc=$?
+  pf_stop "$k"
+  return "$rc"
+}
+# read_caddy <out dir> <gateway pod>...: each gateway's config into
+# <out>/caddy-<pod>.json; one that could not be read is an empty file, which
+# the shard verdict names (caddy_unread), and the reason goes to
+# <out>/caddy-errors.txt.
+read_caddy() {
+  local out="$1" gw; shift
+  for gw in "$@"; do
+    caddy_get "$gw" > "$out/caddy-$gw.json" 2>> "$out/caddy-errors.txt" || : > "$out/caddy-$gw.json"
   done
-  curl -sS -m 30 -H "Host: localhost:2019" http://127.0.0.1:12020/config/ 2>/dev/null || true
-  kill "$k" 2>/dev/null || true
-  wait "$k" 2>/dev/null || true
 }
 
 # shard-routes: past 10 gateways (eks-bank.sh gateways11, the shard-aware
@@ -420,13 +449,17 @@ step_shard_routes() {
     api GET "/v1/cluster/ingress-route/$id" >> "$out/routes.jsonl" || echo '{"code": 0, "body": null}' >> "$out/routes.jsonl"
   done
   sleep 30 # the owners install the routes
-  for gw in $gws; do caddy_get "$gw" > "$out/caddy-$gw.json"; done
+  : > "$out/caddy-errors.txt"
+  # shellcheck disable=SC2086
+  read_caddy "$out" $gws
   # shellcheck disable=SC2086
   v="$(verdict shard "$out" $gws)"
-  # A route not yet in any gateway's Caddy: once more, half a minute on.
-  if [[ "$(jf "$v" 'd["detail"]["caddy_route_nowhere"]')" != 0 ]]; then
+  # A route not yet in any gateway's Caddy, or a config not read: once
+  # more, half a minute on.
+  if [[ "$(jf "$v" 'bool(d["detail"]["caddy_route_nowhere"] or d["detail"]["caddy_unread"])')" == True ]]; then
     sleep 30
-    for gw in $gws; do caddy_get "$gw" > "$out/caddy-$gw.json"; done
+    # shellcheck disable=SC2086
+    read_caddy "$out" $gws
     # shellcheck disable=SC2086
     v="$(verdict shard "$out" $gws)"
   fi

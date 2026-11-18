@@ -42,7 +42,7 @@ var assignment = regexp.MustCompile(`^\s*(local\s+|export\s+)?[A-Za-z_][A-Za-z0-
 // (a) No assignment in the bank run's scripts takes a pipeline into head,
 // grep -m or grep -q: the output is read whole, then cut.
 func TestEKSBankNoAssignmentFromAnEarlyReader(t *testing.T) {
-	for _, f := range []string{"eks-bank.sh", "drills-eks.sh", "drills-lib.sh", "cluster.sh", "helm-fetch.sh"} {
+	for _, f := range []string{"eks-bank.sh", "drills-eks.sh", "drills-lib.sh", "cluster.sh", "helm-fetch.sh", "port-forward.sh"} {
 		raw, err := os.ReadFile(k8sFile(t, f))
 		if err != nil {
 			t.Fatal(err)
@@ -72,8 +72,9 @@ func TestEKSBankNoAssignmentFromAnEarlyReader(t *testing.T) {
 	// And no step or check runs under ||, &&, if, while or !, where bash
 	// ignores set -e inside it (ecr-storm called ecr-push as
 	// `[[ -f … ]] || step_ecr_push`; a run_check there would carry on past
-	// a failed command). The one exception is on_exit's teardown,
-	// `step_down || say …`, which is best effort on purpose and says so.
+	// a failed command). The one exception is on_exit's teardown job,
+	// `{ step_down || exit 1; } … &`, which is best effort on purpose and
+	// says so.
 	call := `(step_[a-z_]+|run_check|run_drills)\b`
 	underList := regexp.MustCompile(`(\|\||&&|\bif\s+!?|\bwhile\s+!?|\buntil\s+|!)\s*` + call + `|` + call + `[^#]*?(\|\||&&)`)
 	for _, f := range []string{"eks-bank.sh", "drills-eks.sh", "drills-lib.sh", "drills-local.sh"} {
@@ -86,7 +87,7 @@ func TestEKSBankNoAssignmentFromAnEarlyReader(t *testing.T) {
 			if strings.HasPrefix(code, "#") || regexp.MustCompile(`^(step_[a-z_]+|run_check|run_drills)\(\)`).MatchString(code) {
 				continue
 			}
-			if underList.MatchString(code) && !strings.HasPrefix(code, `step_down || say "all: down did not finish`) {
+			if underList.MatchString(code) && !strings.HasPrefix(code, `{ step_down || exit 1; } < /dev/null &`) {
 				t.Errorf("%s:%d: a step or check run under a list or condition: %s", f, i+1, code)
 			}
 		}
@@ -429,12 +430,13 @@ storm_fetch() { printf '{"id": "sb-1"}\n{"id": "sb-2"}\n' > "$2/$1.jsonl"; }
 api() { case "$2" in */sb-2) return 1 ;; esac
   echo '{"code": 200, "body": {"sandbox_id": "sb-1", "owners": [{"node_id": "gw-a"}, {"node_id": "gw-b"}], "ring_version": "r1"}}'; }
 caddy_get() { echo sb-1; }
-` + shellFunc(t, "drills-eks.sh", "step_shard_routes") + `
+` + shellFunc(t, "drills-eks.sh", "read_caddy") + shellFunc(t, "drills-eks.sh", "step_shard_routes") + `
 step_shard_routes
 log finished
 `
 	thresholds := common + `
 drilled_alerts=(SandboxdImagePullErrors)
+pull_cap=4
 keep_forward() { :; }
 kc() { printf 'w1\nw2\nw3\n'; }
 proxy() { log "proxy $1"; return 7; }

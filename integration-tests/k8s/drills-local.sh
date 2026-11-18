@@ -115,11 +115,12 @@ print(sum(1 for s in p["status"].get("ephemeralContainerStatuses", []) if s["nam
   done
 }
 
-# push_images <run>: fresh images for one run, each the base image plus a
-# layer of random bytes, so every pull of the run is a cold one. Docker
-# builds only the base (alpine plus a file), once; drills-local/push.py
-# writes the rest over the registry's API: Docker Desktop spent 45 s on
-# each push to "localhost" (a name lookup) and stalled on others for good.
+# push_images <run> [cold]: fresh images for one run (that many cold ones,
+# 12), each the base image plus a layer of random bytes, so every pull of
+# the run is a cold one. Docker builds only the base (alpine plus a file),
+# once; drills-local/push.py writes the rest over the registry's API:
+# Docker Desktop spent 45 s on each push to "localhost" (a name lookup)
+# and stalled on others for good.
 push_images() {
   local run="$1" d tags=() i
   if ! curl -fsS -o /dev/null "http://127.0.0.1:$reg_port/v2/drill/app/manifests/v1" \
@@ -132,7 +133,7 @@ push_images() {
     rm -rf "$d"
   fi
   tags=("drill/dedup:$run" "drill/hot:$run" "drill/hang:$run")
-  for i in $(seq 1 12); do tags+=("drill/cold:$run-$i"); done
+  for i in $(seq 1 "${2:-12}"); do tags+=("drill/cold:$run-$i"); done
   push_tags "${tags[@]}" >/dev/null
   say "images pushed for run $run"
 }

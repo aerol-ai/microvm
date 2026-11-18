@@ -65,7 +65,7 @@ func bankRun(t *testing.T, name, ctx string, bank bool) string {
 	if err := os.MkdirAll(k8s, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"drills-eks.sh", "eks-bank.sh", "helm-fetch.sh", "terraform/lb-controller-iam-policy.json"} {
+	for _, f := range []string{"drills-eks.sh", "eks-bank.sh", "helm-fetch.sh", "port-forward.sh", "terraform/lb-controller-iam-policy.json"} {
 		raw, err := os.ReadFile(filepath.Join(integrationDir(t), "k8s", f))
 		if err != nil {
 			t.Fatal(err)
