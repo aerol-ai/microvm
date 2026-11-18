@@ -102,19 +102,40 @@ func (c *signingServer) PlacementOf(id string) (cluster.Placement, bool) {
 type signingWorker struct {
 	*cluster.Noop
 	server   *Service
-	feedErr  error
 	signErr  error
-	fetches  int
 	asServer bool
 	// rewrite, when set, changes the claims on the way to the server, as a
 	// server that signs something else would.
 	rewrite func(sandboxtoken.Claims) sandboxtoken.Claims
+
+	// mu guards feedErr and fetches. The mirror also reads the feed from a
+	// background refresh (signingKeyMirror.view), which can still be
+	// running when the test changes feedErr or counts reads. Use
+	// setFeedErr and fetchCount, not the fields.
+	mu      sync.Mutex
+	feedErr error
+	fetches int
+}
+
+func (c *signingWorker) setFeedErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.feedErr = err
+}
+
+func (c *signingWorker) fetchCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fetches
 }
 
 func (c *signingWorker) FetchSigningKeys(context.Context) (cluster.SigningKeys, error) {
+	c.mu.Lock()
 	c.fetches++
-	if c.feedErr != nil {
-		return cluster.SigningKeys{}, c.feedErr
+	err := c.feedErr
+	c.mu.Unlock()
+	if err != nil {
+		return cluster.SigningKeys{}, err
 	}
 	return c.server.SigningKeysFeed()
 }
@@ -266,7 +287,7 @@ func TestSandboxTokensOnceServersSign(t *testing.T) {
 	}
 	// A worker that cannot read the feed takes no ring token, and issues none.
 	worker.serverSigning.mirror = nil
-	wk.feedErr = errors.New("server tier down")
+	wk.setFeedErr(errors.New("server tier down"))
 	if _, err := worker.VerifySandboxToken(legacy.Token); !errors.Is(err, sandboxtoken.ErrInvalidSignature) {
 		t.Fatalf("legacy with no feed = %v", err)
 	}
@@ -435,7 +456,7 @@ func TestTokensAcrossAServerOutage(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The servers go away; the worker's copy of the feed is still good.
-	wk.feedErr = errors.New("server tier down")
+	wk.setFeedErr(errors.New("server tier down"))
 	worker.serverSigning.mirror.fetchedAt = time.Time{}
 	for name, tok := range map[string]string{"server-signed": signed.Token, "ring-signed before Since": old.Token} {
 		if _, err := worker.VerifySandboxToken(tok); err != nil {
@@ -450,7 +471,7 @@ func TestTokensAcrossAServerOutage(t *testing.T) {
 		}
 	}
 	// The servers answer again (after the retry wait): both work.
-	wk.feedErr = nil
+	wk.setFeedErr(nil)
 	worker.serverSigning.mirror.triedAt = time.Time{}
 	for name, tok := range map[string]string{"server-signed": signed.Token, "ring-signed before Since": old.Token} {
 		if _, err := worker.VerifySandboxToken(tok); err != nil {
