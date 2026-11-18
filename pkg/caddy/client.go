@@ -1159,8 +1159,9 @@ func (c *Client) reconcileOnDemandIssuer(ctx context.Context, idx int, stored js
 // site, the on-demand-TLS catch-all, etc.). caddy-l4 routes by SNI for
 // sandbox subdomains and forwards the rest of the traffic — including ACME
 // TLS-ALPN-01 cert validation (the acme-tls/1 handshake on :443) and any
-// non-sandbox hostname — to the fallback. Empty tlsFallback with non-empty tlsListen is
-// rejected; the service layer surfaces it as a config error at boot.
+// non-sandbox hostname — to the fallback. Empty tlsFallback with non-empty
+// tlsListen is rejected; the service layer surfaces it as a config error at
+// boot.
 func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string) error {
 	if !c.enabled {
 		return nil
