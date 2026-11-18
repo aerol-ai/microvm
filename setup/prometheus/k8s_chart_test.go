@@ -1716,3 +1716,175 @@ func TestKubernetesChartRegistryCA(t *testing.T) {
 		}
 	}
 }
+
+// The edge opens no port its Caddy does not serve. Caddy takes 443 through
+// caddy-l4 (SB_L4_TLS_LISTEN), and its sites bind 127.0.0.1:8443 behind it;
+// with `auto_https disable_redirects` and no http:// site it listens on no
+// port 80. The chart once exposed 80 anyway, on the edge Service, the edge
+// container and the gateways' NetworkPolicy: on EKS the load balancer found
+// every gateway unhealthy on it (issue #1343). A Service, container or open
+// policy port must be one the edge or the agent listens on.
+func TestKubernetesChartEdgePortsAreServed(t *testing.T) {
+	root := repoRoot(t)
+	helm := chartTool(t, "HELM", "helm")
+	if v, _ := runTool(t, root, helm, "version", "--short"); !helmAtLeast(v, 3, 8) {
+		t.Skipf("helm %s is older than 3.8, the chart's minimum", strings.TrimSpace(v))
+	}
+	edge := []string{"edge.enabled=true", "edge.domain=sb.example.test", "edge.existingTLSSecret=edge-tls"}
+	cluster := []string{"mode=cluster", "cluster.zones={a}", "cluster.workerPools[0].name=g",
+		"cluster.workerPools[0].machine.cpu=8", "cluster.workerPools[0].machine.memoryGiB=32"}
+	for _, tc := range []struct {
+		name string
+		sets []string
+	}{
+		{"single", edge},
+		{"cluster", append(append([]string{}, cluster...), edge...)},
+		{"cluster with the agent-sandbox API", append(append(append([]string{}, cluster...), edge...), "cluster.agentSandboxAPI.enabled=true")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			docs, err := renderChart(t, root, helm, tc.sets...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The pods that run the edge: the single-mode worker, or each
+			// role's template the operator reads.
+			pods := map[string]map[string]any{}
+			if strings.HasPrefix(tc.name, "cluster") {
+				for role, body := range podTemplates(t, docs) {
+					var tpl map[string]any
+					if err := yaml.Unmarshal([]byte(body), &tpl); err != nil {
+						t.Fatalf("%s: %v", role, err)
+					}
+					pods[role] = tpl
+				}
+			} else {
+				for _, sts := range docsOfKind(docs, "StatefulSet") {
+					if tpl, ok := dig(sts, "spec", "template").(map[string]any); ok && containerNamed(tpl, "edge") != nil {
+						pods[fmt.Sprint(dig(sts, "metadata", "name"))] = tpl
+					}
+				}
+			}
+			served := edgeSitePorts(t, docs)
+			edgePods := 0
+			for role, tpl := range pods {
+				c := containerNamed(tpl, "edge")
+				if c == nil {
+					continue
+				}
+				edgePods++
+				listen, ok := envValue(containerNamed(tpl, "agent"), "SB_L4_TLS_LISTEN")
+				if !ok {
+					t.Fatalf("%s: the agent sets no SB_L4_TLS_LISTEN", role)
+				}
+				_, l4, err := net.SplitHostPort(listen)
+				if err != nil {
+					t.Fatalf("%s: SB_L4_TLS_LISTEN=%q: %v", role, listen, err)
+				}
+				l4Port, _ := strconv.Atoi(l4)
+				ports, _ := dig(c, "ports").([]any)
+				for _, p := range ports {
+					n, _ := dig(p, "containerPort").(int)
+					if n != l4Port && !served[n] {
+						t.Errorf("%s: the edge container declares port %d, which its Caddy does not serve (caddy-l4 on %d, sites on %v)", role, n, l4Port, served)
+					}
+				}
+			}
+			if edgePods == 0 {
+				t.Fatal("no pod runs the edge")
+			}
+			if tc.name == "single" {
+				// The edge Service's ports name the edge container's.
+				tpl := pods[fmt.Sprint(dig(docsOfKind(docs, "StatefulSet")[0], "metadata", "name"))]
+				named := map[string]bool{}
+				ports, _ := dig(containerNamed(tpl, "edge"), "ports").([]any)
+				for _, p := range ports {
+					named[fmt.Sprint(dig(p, "name"))] = true
+				}
+				found := false
+				for _, svc := range docsOfKind(docs, "Service") {
+					if name, _ := dig(svc, "metadata", "name").(string); !strings.HasSuffix(name, "-edge") {
+						continue
+					}
+					found = true
+					sp, _ := dig(svc, "spec", "ports").([]any)
+					for _, p := range sp {
+						if tp := fmt.Sprint(dig(p, "targetPort")); !named[tp] {
+							t.Errorf("the edge Service's port %v targets %q, which the edge container does not declare", dig(p, "port"), tp)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("no edge Service")
+				}
+				return
+			}
+			// The gateways' ports open to all: each one the gateway's
+			// agent or edge listens on.
+			gw := pods["gateway"]
+			listening := map[int]bool{}
+			for _, name := range []string{"agent", "edge"} {
+				ports, _ := dig(containerNamed(gw, name), "ports").([]any)
+				for _, p := range ports {
+					if n, ok := dig(p, "containerPort").(int); ok {
+						listening[n] = true
+					}
+				}
+			}
+			for port := range gatewayOpenPorts(t, docs) {
+				if !listening[port] {
+					t.Errorf("the gateway-ingress policy opens port %d, which no gateway container listens on (%v)", port, listening)
+				}
+			}
+		})
+	}
+}
+
+// edgeSitePorts is the ports the edge Caddyfile's sites listen on beyond the
+// pod itself: a site with `bind 127.0.0.1` serves only caddy-l4's fallback.
+func edgeSitePorts(t *testing.T, docs []map[string]any) map[int]bool {
+	t.Helper()
+	for _, cm := range docsOfKind(docs, "ConfigMap") {
+		file, _ := dig(cm, "data", "Caddyfile").(string)
+		if file == "" {
+			continue
+		}
+		out := map[int]bool{}
+		site := regexp.MustCompile(`(?m)^(\S+) \{\n((?:\t.*\n|\n)*?)\}`)
+		for _, m := range site.FindAllStringSubmatch(file, -1) {
+			addr, body := m[1], m[2]
+			if strings.Contains(body, "\tbind 127.0.0.1") {
+				continue
+			}
+			port := 443
+			if strings.HasPrefix(addr, "http://") {
+				port = 80
+			}
+			if n, err := strconv.Atoi(addr[strings.LastIndex(addr, ":")+1:]); err == nil {
+				port = n
+			}
+			out[port] = true
+		}
+		return out
+	}
+	t.Fatal("no edge Caddyfile")
+	return nil
+}
+
+// edgeSitePorts reads a site's port from its address, and skips a site
+// bound to the pod's loopback.
+func TestEdgeSitePorts(t *testing.T) {
+	for _, tc := range []struct {
+		file string
+		want map[int]bool
+	}{
+		{"{\n\tadmin localhost:2019\n}\n\nhttps://a.test:8443 {\n\tbind 127.0.0.1\n\thandle {\n\t\trespond 404\n\t}\n}\n", map[int]bool{}},
+		{"http:// {\n\tredir https://{host}{uri} 308\n}\n", map[int]bool{80: true}},
+		{":8080 {\n\n\trespond 404\n}\n", map[int]bool{8080: true}},
+		{"https://a.test {\n\trespond 404\n}\nhttps://*.a.test:8443 {\n\tbind 127.0.0.1\n}\n", map[int]bool{443: true}},
+	} {
+		docs := []map[string]any{{"kind": "ConfigMap", "data": map[string]any{"Caddyfile": tc.file}}}
+		if got := edgeSitePorts(t, docs); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("edgeSitePorts(%q) = %v, want %v", tc.file, got, tc.want)
+		}
+	}
+}

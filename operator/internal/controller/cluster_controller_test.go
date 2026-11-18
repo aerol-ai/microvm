@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -189,8 +190,10 @@ func TestGatewayServiceBehindGatewayRef(t *testing.T) {
 	}
 }
 
-// The gateway Service's ports follow the edge: Caddy's 443 and 80 with it,
-// sandboxd's API port without it (nothing listens on 443 then).
+// The gateway Service's ports follow the edge: Caddy's 443 with it,
+// sandboxd's API port without it (nothing listens on 443 then). Port 80 is
+// never one: the edge serves no plain HTTP, and a Service an older operator
+// made with 80 loses it on the next reconcile.
 func TestGatewayServicePorts(t *testing.T) {
 	names := func(svc corev1.Service) string {
 		var out []string
@@ -203,7 +206,7 @@ func TestGatewayServicePorts(t *testing.T) {
 		name, domain, want string
 	}{
 		{name: "no edge", want: "api:21212,ssh:2220"},
-		{name: "edge", domain: "sandboxes.bank.example", want: "https:443,http:80,ssh:2220"},
+		{name: "edge", domain: "sandboxes.bank.example", want: "https:443,ssh:2220"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := testCluster()
@@ -217,6 +220,18 @@ func TestGatewayServicePorts(t *testing.T) {
 			}
 			if got := names(svc); got != tc.want {
 				t.Fatalf("ports = %s, want %s", got, tc.want)
+			}
+			// An older operator's Service: the next reconcile drops 80.
+			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{Name: "http", Port: 80, TargetPort: intstr.FromInt32(80), Protocol: corev1.ProtocolTCP})
+			if err := cl.Update(context.Background(), &svc); err != nil {
+				t.Fatal(err)
+			}
+			reconcileCluster(t, r)
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "prod-gateway"}, &svc); err != nil {
+				t.Fatal(err)
+			}
+			if got := names(svc); got != tc.want {
+				t.Fatalf("after a Service with port 80: ports = %s, want %s", got, tc.want)
 			}
 		})
 	}

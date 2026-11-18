@@ -25,7 +25,9 @@ The edge is AerolVM's build of Caddy, in a container named `edge`. Where it runs
 |---|---|---|
 | The `edge` container runs in | The worker pod `aerolvm-0` | Every gateway pod |
 | Point DNS at the Service | `aerolvm-edge` | `aerolvm-gateway` |
-| Ports on that Service | 443 and 80 | 443, 80 and 2220 (SSH). Port 21212 closes. |
+| Ports on that Service | 443 | 443 and 2220 (SSH). Port 21212 closes. |
+
+The edge serves HTTPS only. There is no port 80 and no redirect from `http://`, so clients use `https://` addresses.
 
 ### Step 1: Get a certificate
 

@@ -174,7 +174,6 @@ spec:
         - { protocol: TCP, port: 21212 }
         - { protocol: TCP, port: 2220 }
         - { protocol: TCP, port: 443 }
-        - { protocol: TCP, port: 80 }
         {{- if .Values.cluster.agentSandboxAPI.enabled }}
         - { protocol: TCP, port: 9443 }
         {{- end }}
