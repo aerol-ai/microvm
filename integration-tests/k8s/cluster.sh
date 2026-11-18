@@ -22,6 +22,13 @@
 # audit buckets and their role, the load balancer controller's role.
 # --teardown has AWS itself tear the compute down at the TTL
 # (terraform/teardown.tf), so a dead laptop cannot leave it running.
+#
+# Once the cluster is made, `up` waits until every address its API name
+# resolves to has answered from this machine three rounds in a row
+# (wait_api_reachable) before the first kubectl or Helm call, and fails if
+# that never happens: CLUSTER_API_WAIT seconds (600), a round every
+# CLUSTER_API_ROUND (15, at least 1). It fails at once when the API no
+# longer allows this machine's address.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +76,135 @@ same_account() {
   [[ "$got" == "$want" ]] || die "this machine's AWS credentials are for account \"$got\"; the run was made in $want. Nothing was changed"
 }
 
+# --- the cluster API, from this machine ------------------------------------
+# bank-1's first run stopped 17 minutes in: of the two addresses the new
+# cluster's API name resolved to, one never answered from the run's machine,
+# and the Karpenter install, the first call, timed out on it. kubectl and
+# Helm pick an address per connection, so one dead address fails calls at
+# random for the whole run. So before the first call every address must
+# answer: a TCP connect to 443, then /version with the run's kubeconfig,
+# through that address, IPv4 and IPv6 alike.
+#
+# One clean round is not enough: the name need not hand out every address
+# in every answer. The name is resolved again each round, every address
+# seen since the streak began is probed, and up goes on only after
+# api_clean clean rounds in a row in which no new address appeared. Any
+# address that does not answer starts the streak over. Every round is
+# logged.
+api_wait="${CLUSTER_API_WAIT:-600}"
+api_round="${CLUSTER_API_ROUND:-15}"
+api_clean=3
+
+# check_api_settings: whole seconds, a round of at least one second, and a
+# wait with room for api_clean rounds.
+check_api_settings() {
+  [[ "$api_wait" =~ ^(0|[1-9][0-9]*)$ && "$api_round" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    die "CLUSTER_API_WAIT and CLUSTER_API_ROUND want whole seconds"
+  (( api_round >= 1 )) || die "CLUSTER_API_ROUND must be at least 1 second"
+  (( api_wait >= (api_clean - 1) * api_round )) ||
+    die "CLUSTER_API_WAIT (${api_wait}s) must leave room for $api_clean rounds of CLUSTER_API_ROUND (${api_round}s): at least $(( (api_clean - 1) * api_round ))s"
+}
+
+# tcp_open <address> <port>: a TCP connect within 5 s. macOS's nc bounds
+# the connect only with -G; -w alone waits out the system's ~75 s. nc -h
+# exits 1 there, so its text is read whole, never through a pipe that
+# pipefail would fail.
+tcp_open() {
+  local help; help="$(nc -h 2>&1 || true)"
+  if [[ "$help" == *"-G conntimo"* ]]; then
+    nc -z -G 5 -w 5 "$1" "$2"
+  else
+    nc -z -w 5 "$1" "$2"
+  fi
+}
+
+# api_addresses <host>: the name's IPv4 and IPv6 addresses, one a line (dig
+# prints a CNAME's target first; that is no address).
+api_addresses() {
+  { dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' || true
+    dig +short AAAA "$1" 2>/dev/null | grep -E '^[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*$' || true; } | sort -u
+}
+
+# api_answers <kubeconfig> <host> <address>: the API answers /version
+# through that one address, with the run's credentials and CA. Prints why
+# not.
+api_answers() {
+  local url="https://$3"
+  [[ "$3" == *:* ]] && url="https://[$3]"
+  tcp_open "$3" 443 >/dev/null 2>&1 || { echo "no TCP connect on 443"; return 1; }
+  kubectl --kubeconfig "$1" --server "$url" --tls-server-name "$2" --request-timeout=10s \
+    get --raw /version >/dev/null 2>&1 || { echo "no answer to /version"; return 1; }
+}
+
+# check_api_cidrs <allowed CIDRs, space-separated> <name>: fails up at once
+# when this machine's address now is not one the API allows: every call
+# would time out, and waiting would not change that. up allowed the address
+# it started from; a connection's address can change (S3's sixth run).
+check_api_cidrs() {
+  local cidrs="$1" name="$2" ip c
+  ip="$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ ! "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    echo "up: could not learn this machine's public address again; the cluster API allows: ${cidrs:-nothing}" >&2
+    return 0
+  fi
+  for c in $cidrs; do
+    if [[ "$c" == "${ip}/32" || "$c" == 0.0.0.0/0 ]]; then
+      echo "up: the cluster API allows this machine's address ${ip}/32" >&2
+      return 0
+    fi
+  done
+  die "this machine's address is now ${ip}/32, which the cluster API does not allow (it allows: ${cidrs:-nothing}); cluster.sh allow-ip $name adds it"
+}
+
+# wait_api_reachable <name> <state dir> <region>: returns once every address
+# of the cluster API has answered api_clean rounds in a row; fails up after
+# api_wait seconds otherwise.
+wait_api_reachable() {
+  local name="$1" sd="$2" region="$3" desc host cidrs
+  desc="$(aws eks describe-cluster --region "$region" --name "$name" --output json)"
+  host="$(jq -r '.cluster.endpoint // ""' <<<"$desc")"
+  host="${host#https://}"; host="${host%%[:/]*}"
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || die "could not read the cluster API's name for $name"
+  cidrs="$(jq -r '.cluster.resourcesVpcConfig.publicAccessCidrs // [] | join(" ")' <<<"$desc")"
+  check_api_cidrs "$cidrs" "$name"
+  local deadline=$(( $(date +%s) + api_wait )) round=0 clean=0 seen="" ever=""
+  local addrs a why grew answer missing dead
+  while :; do
+    round=$((round + 1)); answer=""; missing=""; dead=""; grew=0
+    addrs="$(api_addresses "$host")"
+    for a in $addrs; do
+      ever=1
+      [[ " $seen " == *" $a "* ]] || { seen="${seen:+$seen }$a"; grew=1; }
+    done
+    for a in $seen; do
+      if why="$(api_answers "$sd/kubeconfig" "$host" "$a")"; then
+        answer="$answer $a"
+      else
+        missing="$missing $a ($why)"; dead="$dead $a"
+      fi
+    done
+    if [[ -z "$seen" || -n "$missing" ]]; then
+      clean=0; seen=""
+    elif (( grew )); then
+      clean=1
+    else
+      clean=$((clean + 1))
+    fi
+    echo "up: cluster API $host, round $round: answers:${answer:- none}; does not answer:${missing:- none}; clean rounds in a row: $clean of $api_clean" >&2
+    if (( clean >= api_clean )); then
+      echo "up: every cluster API address answers from this machine, $api_clean rounds in a row:$answer"
+      return 0
+    fi
+    (( $(date +%s) + api_round <= deadline )) || break
+    sleep "$api_round"
+  done
+  [[ -n "$ever" ]] || die "the cluster API name $host resolves to no address from this machine (waited ${api_wait}s)"
+  [[ -n "$dead" ]] || die "the cluster API did not answer $api_clean rounds in a row from this machine (waited ${api_wait}s, $round rounds; last answered:${answer:- none})"
+  local d msg=""
+  for d in $dead; do msg="${msg:+$msg; }the cluster API address $d does not answer from this machine"; done
+  die "$msg (waited ${api_wait}s, $round rounds:$missing)"
+}
+
 tf() {
   local name="$1"; shift
   local sd; sd="$(state_dir "$name")"
@@ -110,6 +246,10 @@ cmd_up() {
   [[ "$name" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || die "name must be 3-31 chars of a-z, 0-9 and -"
   [[ "$workers" =~ ^[0-9]+$ ]] || die "--workers wants a number"
   region_only
+  # Before anything is made: the API probe's tools and settings.
+  local tool
+  for tool in dig nc kubectl; do command -v "$tool" >/dev/null || die "up needs $tool (the cluster API probe)"; done
+  check_api_settings
   # The account this run is made in, kept with its inputs: Terraform
   # refuses any other (allowed_account_ids), and down checks it first.
   local account; account="$(aws sts get-caller-identity --query Account --output text)"
@@ -141,6 +281,8 @@ cmd_up() {
   tf "$name" apply -input=false -auto-approve -state="$sd/terraform.tfstate" -var-file="$sd/run.tfvars.json"
   local region; region="$(tf "$name" output -state="$sd/terraform.tfstate" -raw region)"
   aws eks update-kubeconfig --name "$name" --region "$region" --kubeconfig "$sd/kubeconfig" >/dev/null
+  # Before the first kubectl or Helm call: every API address answers.
+  wait_api_reachable "$name" "$sd" "$region"
   if [[ "$karpenter" == true ]]; then
     # Karpenter's chart is only on an OCI registry, which Helm reads from
     # 3.8 on (the first S5 run stopped here on 3.6). HELM picks the binary.
