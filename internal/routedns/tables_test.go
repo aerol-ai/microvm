@@ -206,3 +206,39 @@ func TestResponderListenAndServeReleasesPortsOnFailureAndCancel(t *testing.T) {
 		}
 	}
 }
+
+// When one server fails, serve returns its error, and only after the other
+// server has returned too, so the UDP port is free. serve has already read
+// the failed server's error, so it must wait for one more: waiting for two
+// would hang here.
+func TestServeReturnsAServerErrorAndReleasesTheOtherPort(t *testing.T) {
+	addr := testport.UDPAddr(t)
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		_ = pc.Close()
+		t.Fatal(err)
+	}
+	// A closed listener makes the TCP server's first Accept fail, while the
+	// UDP server runs normally.
+	_ = ln.Close()
+	done := make(chan error, 1)
+	go func() { done <- newTestResponder().serve(context.Background(), pc, ln) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil after the TCP server failed")
+		}
+	case <-time.After(5 * time.Second):
+		_ = pc.Close()
+		t.Fatal("serve did not return after the TCP server failed")
+	}
+	again, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatalf("udp port not released after a server failed: %v", err)
+	}
+	_ = again.Close()
+}
