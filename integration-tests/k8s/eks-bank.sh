@@ -38,10 +38,13 @@
 #              private addresses only; through it, from a pod, the API over
 #              the run's CA answers, the admin token is refused, an API token
 #              works. Makes the run's admin API token ($sd/api-token).
-#   gvisor     a sandbox runs under gVisor on Amazon Linux 2023; runc refused.
+#   gvisor     a sandbox runs under gVisor on Amazon Linux 2023 (its worker
+#              from the placement route, /v1/cluster/placements/{id});
+#              runc refused.
 #   verify     aerolvm k8s verify on the live enterprise install.
-#   drills     drills-eks.sh: setup static pull-storm slo-breach
-#              large-layers ecr-push.
+#   drills     drills-eks.sh, once for each of setup static pull-storm
+#              slo-breach large-layers ecr-push (each a check of its own;
+#              after a failed setup the rest are recorded as skipped).
 #   gateways11 11 gateways (the shard-aware opt-in is on every node), then
 #              drills-eks.sh shard-routes, then back to 3.
 #   scale      fills the cell until the operator buys machines, then 60
@@ -54,6 +57,11 @@
 #              schedule, then cell.sh down (cluster.sh down: Terraform
 #              destroy, the GOVERNANCE-locked witness bucket emptied with the
 #              bypass). Then lists anything left tagged with the run.
+#
+# up, build and install are what every later step needs: one that fails
+# ends the run (and `all` tears it down). The steps after them are checks:
+# one that fails is recorded "FAIL <step> exited N", and the run goes on to
+# the next one, then down; `all` then exits 1 (run_check).
 #
 # The gate: every step after up talks only to the kubeconfig cluster.sh
 # wrote for <name>, and only if its context is that EKS cluster, the run
@@ -126,6 +134,13 @@ if [[ "$dry" == 1 ]]; then
   sd="${EKS_BANK_DRY_DIR:-$(mktemp -d)}"
 fi
 mkdir -p "$sd"
+# on_exit's mark that a teardown follows (check_exit reads it): never one an
+# earlier run left.
+rm -f "$sd/.teardown-next"
+# Where this run's lines begin in bank.txt (an earlier run's FAIL lines are
+# not this run's answer).
+bank_mark=0
+[[ ! -f "$sd/bank.txt" ]] || bank_mark="$(wc -l < "$sd/bank.txt" | tr -d ' ')"
 log="$sd/bank.log"
 say() { echo "$(date -u +%H:%M:%S) $*" | tee -a "$log" >&2; }
 result() {
@@ -590,7 +605,15 @@ step_nlb() {
   host="$(kr -n "$ns" get svc "$release-gateway" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
   aws elbv2 describe-load-balancers --region "$region" --output json |
     jq --arg h "$host" '.LoadBalancers[] | select(.DNSName == $h)' > "$out/lb.json"
-  arn="$(jq -r .LoadBalancerArn "$out/lb.json")"; scheme="$(jq -r .Scheme "$out/lb.json")"; lbtype="$(jq -r .Type "$out/lb.json")"
+  arn="$(jq -r '.LoadBalancerArn // ""' "$out/lb.json")"; scheme="$(jq -r '.Scheme // ""' "$out/lb.json")"; lbtype="$(jq -r '.Type // ""' "$out/lb.json")"
+  # No load balancer with the Service's name: a FAIL, not target-group
+  # calls with an empty ARN. Every target group the controller made is
+  # checked, whatever its port (443 and 2220 since the gateways stopped
+  # exposing 80).
+  if [[ -z "$arn" ]]; then
+    result FAIL nlb "no load balancer in $region has the gateway Service's name $host"
+    return 0
+  fi
   wait_until 600 "every NLB target healthy" bash -c "
     for tg in \$(aws elbv2 describe-target-groups --region $region --load-balancer-arn $arn --query 'TargetGroups[].TargetGroupArn' --output text); do
       aws elbv2 describe-target-health --region $region --target-group-arn \$tg --query 'TargetHealthDescriptions[].TargetHealth.State' --output text | tr '\t' '\n' | grep -qv '^healthy$' && exit 1
@@ -650,7 +673,10 @@ PY
 gw_call() {
   [[ "$dry" == 1 ]] && { echo "dry-run: API token $1 $2 (port-forward to a gateway)" >&2; echo 200; echo '{}'; return 0; }
   local gw pf out
-  gw="$(kr -n "$ns" get pods -l app.kubernetes.io/component=gateway -o jsonpath='{.items[0].metadata.name}')"
+  gw="$(kr -n "$ns" get pods -l app.kubernetes.io/component=gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  # No gateway pod: an answer the caller records, never a port-forward to
+  # "pod/".
+  [[ -n "$gw" ]] || { echo 000; echo '{"error": "no gateway pod to call through"}'; return 0; }
   kubectl --kubeconfig "$sd/kubeconfig" -n "$ns" port-forward "pod/$gw" 19212:21212 >/dev/null 2>&1 &
   pf=$!
   sleep 3
@@ -660,33 +686,61 @@ gw_call() {
   wait "$pf" 2>/dev/null || true
   tail -1 <<<"$out"; sed '$d' <<<"$out"
 }
+# sandbox_machine <sandbox id> <out dir>: the worker pod and machine a
+# sandbox runs on, into <out>/placement.json and <out>/machine.txt. The v1
+# sandbox answer names no node: its owner is the placement record's
+# (/v1/cluster/placements/{id}, owner.node_id). On Kubernetes a node's id is
+# its AerolNode's name, which is also its worker pod's name (the operator
+# sets SB_NODE_ID to it). Prints the worker pod's name; returns 1, with the
+# reason in machine.txt, when any name along the way is empty: kubectl is
+# never asked for a resource with no name.
+sandbox_machine() {
+  local id="$1" out="$2" placed wpod node
+  placed="$(admin_call GET "/v1/cluster/placements/$id")"
+  sed 1d <<<"$placed" > "$out/placement.json"
+  wpod="$(jq -r '.owner.node_id // ""' "$out/placement.json" 2>/dev/null || true)"
+  if [[ -z "$wpod" ]]; then
+    echo "no owner node: the placement route answered $(head -1 <<<"$placed"): $(sed 1d <<<"$placed" | cut -c1-200)" > "$out/machine.txt"
+    return 1
+  fi
+  node="$(kr -n "$workers" get pod "$wpod" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+  if [[ -z "$node" ]]; then
+    echo "worker pod $wpod (the owner node) has no machine in $workers" > "$out/machine.txt"
+    return 1
+  fi
+  kr get node "$node" -o jsonpath='{.status.nodeInfo.osImage} | kernel {.status.nodeInfo.kernelVersion} | {.status.nodeInfo.containerRuntimeVersion}' \
+    > "$out/machine.txt" 2>&1 || true
+  echo "$wpod"
+}
 step_gvisor() {
-  local out="$sd/evidence/gvisor" made id node wpod runc
+  local out="$sd/evidence/gvisor" made id wpod="" runc
   mkdir -p "$out"
   api_token
-  [[ "$dry" == 1 ]] && { echo "dry-run: a gVisor sandbox on an AL2023 worker; runc refused" >&2; return 0; }
+  [[ "$dry" == 1 ]] && { echo "dry-run: a gVisor sandbox on an AL2023 worker (its owner from /v1/cluster/placements/{id}); runc refused" >&2; return 0; }
   made="$(gw_call POST /v1/sandboxes '{"image": "public.ecr.aws/docker/library/alpine:3.20", "runtime": "gvisor", "cpu": 0.5, "memory_mb": 512, "tags": {"drill-run": "gvisor"}}')"
   echo "$made" > "$out/create.txt"
-  id="$(sed 1d <<<"$made" | jq -r '.id // ""')"
-  [[ -n "$id" ]] || { result FAIL gvisor "create answered $(head -1 <<<"$made"): $(sed 1d <<<"$made" | cut -c1-200)"; return 1; }
+  id="$(sed 1d <<<"$made" | jq -r '.id // ""' 2>/dev/null || true)"
+  [[ -n "$id" ]] || { result FAIL gvisor "create answered $(head -1 <<<"$made"): $(sed 1d <<<"$made" | cut -c1-200)"; return 0; }
   gw_call POST "/v1/sandboxes/$id/toolbox/process/execute" '{"command": "sh -c \"dmesg | head -3; uname -r\""}' > "$out/exec.txt"
   # The exec answered 200 and its own output names gVisor (an error body
-  # that quotes the command must not pass).
-  local exec_code started
+  # that quotes the command must not pass). Read whole, then searched: no
+  # assignment takes a pipeline that a reader stopping early can end.
+  local exec_code stdout started
   exec_code="$(head -1 "$out/exec.txt")"
-  started="$(sed 1d "$out/exec.txt" | jq -r '.stdout // ""' 2>/dev/null | grep -m1 'Starting gVisor' || true)"
-  gw_call GET "/v1/sandboxes/$id" | sed 1d > "$out/sandbox.json"
-  node="$(jq -r '.node_id // ""' "$out/sandbox.json")"
-  wpod="$node"
-  kr get node "$(kr -n "$workers" get pod "$wpod" -o jsonpath='{.spec.nodeName}')" \
-    -o jsonpath='{.status.nodeInfo.osImage} | kernel {.status.nodeInfo.kernelVersion} | {.status.nodeInfo.containerRuntimeVersion}' > "$out/machine.txt" || true
+  stdout="$(sed 1d "$out/exec.txt" | jq -r '.stdout // ""' 2>/dev/null || true)"
+  started="$(grep 'Starting gVisor' <<<"$stdout" || true)"
+  started="$(head -1 <<<"$started")"
+  wpod="$(sandbox_machine "$id" "$out" || true)"
   gw_call DELETE "/v1/sandboxes/$id" > /dev/null || true
-  runc="$(gw_call POST /v1/sandboxes '{"image": "public.ecr.aws/docker/library/alpine:3.20", "runtime": "runc"}' | head -1)"
+  runc="$(gw_call POST /v1/sandboxes '{"image": "public.ecr.aws/docker/library/alpine:3.20", "runtime": "runc"}')"
+  runc="$(head -1 <<<"$runc")"
   echo "a runc create: $runc" >> "$out/exec.txt"
-  if [[ "$exec_code" == 200 && -n "$started" ]] && grep -q 'Amazon Linux 2023' "$out/machine.txt" && [[ "$runc" =~ ^(400|403|422)$ ]]; then
+  if [[ "$exec_code" == 200 && -n "$started" && -n "$wpod" ]] && grep -q 'Amazon Linux 2023' "$out/machine.txt" && [[ "$runc" =~ ^(400|403|422)$ ]]; then
     result PASS gvisor "sandbox $id ran under gVisor ($started) on worker $wpod, a machine running $(cat "$out/machine.txt"); a runc create answered $runc"
   else
-    result FAIL gvisor "exec: $(cut -c1-300 "$out/exec.txt"); machine: $(cat "$out/machine.txt"); runc create: $runc"
+    # One line in bank.txt: the exec's answer and the machine with their
+    # newlines folded.
+    result FAIL gvisor "exec: $(tr '\n' ' ' < "$out/exec.txt" | cut -c1-300); machine: $(tr '\n' ' ' < "$out/machine.txt"); runc create: $runc"
   fi
 }
 
@@ -739,23 +793,56 @@ step_gateways11() {
   fi
   t0=$(now)
   say "gateways11: $gateways_peak gateways, enterprise mode, the shard-aware opt-in"
+  # From here, an end of the step for any reason puts the gateways back to
+  # 3 (run_check's exit handler runs check_undo).
+  check_undo=gateways_back
   hm upgrade "$release" "$chart" -n "$ns" --reuse-values --set "cluster.gateways.minReplicas=$gateways_peak" >/dev/null
   wait_until 900 "$gateways_peak gateways Serving" at_least gateway "$gateways_peak" || { result FAIL gateways11 "$(serving gateway) of $gateways_peak gateways serve after $(( $(now) - t0 ))s"; }
   kr -n "$ns" get pods -l app.kubernetes.io/component=gateway -o wide > "$out/gateways.txt" 2>&1 || true
   [[ "$dry" == 1 ]] || say "gateways11: $(serving gateway) gateways serve, $(( $(now) - t0 ))s; the chart without the opt-in: $(grep -o 'refuses to start past 10[^.]*' "$out/refused.txt" | head -1)"
-  drills shard-routes
-  hm upgrade "$release" "$chart" -n "$ns" --reuse-values --set cluster.gateways.minReplicas=3 >/dev/null
+  local rc=0
+  drills shard-routes || rc=$?
+  [[ "$rc" == 0 ]] || result FAIL shard-routes "drills-eks.sh shard-routes exited $rc"
+  gateways_back
+  check_undo=""
+}
+# gateways_back: the gateways back to 3 (the end of gateways11, or its exit
+# handler).
+gateways_back() {
+  hm upgrade "$release" "$(chart_dir)" -n "$ns" --reuse-values --set cluster.gateways.minReplicas=3 >/dev/null || return 1
   wait_until 900 "the gateways back to 3" bash -c "[[ \$(kubectl --kubeconfig '$sd/kubeconfig' -n $ns get pods -l app.kubernetes.io/component=gateway --no-headers | wc -l) -le 3 ]]" || true
 }
 
 # --- scale --------------------------------------------------------------------------
 workers_now() { # live workers, pending ones, Karpenter's machines
   [[ "$dry" == 1 ]] && { echo "0 0 0"; return 0; }
-  local w p m
-  w="$(serving worker)"
-  p="$(kr -n "$ns" get aerolnodes -o json | jq '[.items[] | select(.spec.role == "worker" and .status.state != "Serving" and .metadata.deletionTimestamp == null)] | length')"
-  m="$(kr get nodeclaims -o json | jq '[.items[] | select(.metadata.labels["karpenter.sh/nodepool"] == "gvisor-general")] | length')"
-  echo "$w $p $m"
+  # Read three times before giving up: one failed API read in an hour of
+  # polling must not end the scale step.
+  local w p m _
+  for _ in 1 2 3; do
+    if w="$(serving worker)" &&
+       p="$(kr -n "$ns" get aerolnodes -o json | jq '[.items[] | select(.spec.role == "worker" and .status.state != "Serving" and .metadata.deletionTimestamp == null)] | length')" &&
+       m="$(kr get nodeclaims -o json | jq '[.items[] | select(.metadata.labels["karpenter.sh/nodepool"] == "gvisor-general")] | length')" &&
+       [[ "$w" =~ ^[0-9]+$ && "$p" =~ ^[0-9]+$ && "$m" =~ ^[0-9]+$ ]]; then
+      echo "$w $p $m"
+      return 0
+    fi
+    sleep 5
+  done
+  say "scale: the cluster did not answer the worker count three times"
+  return 1
+}
+# read_workers: workers_now into the caller's w, p and m; 1 when the
+# cluster did not give the counts (read from "$(workers_now)" directly, a
+# failure left them empty, and an empty m passed "m <= base"). The polling
+# loops wait and read again (`read_workers || { sleep 15; continue; }`):
+# a minute of API errors must not end the most expensive step. The reads a
+# result is written from are plain calls, so there a failure ends the step
+# (set -e).
+read_workers() {
+  local counts
+  counts="$(workers_now)" || return 1
+  read -r w p m <<<"$counts"
 }
 timeline() { echo "$(date -u +%H:%M:%S) $1 workers/pending/machines $(workers_now)" >> "$sd/evidence/scale/timeline.txt"; }
 set_min_workers() {
@@ -772,21 +859,29 @@ kill_tree() {
 }
 drill_pid=""
 in_scale=""
-scale_back() {
-  # The scale step's normal end, and the exit handler's while it runs: the
-  # peak drills stopped, the floor back to the base, the fill sandboxes
-  # gone, the NodePool's limit back down.
-  [[ "${scaled_back:-0}" == 1 ]] && return 0
-  scaled_back=1
+# stop_scale_drills: the peak drills (ecr-storm, thresholds) stopped, the
+# whole tree, so each drills-eks.sh runs its own cleanup.
+stop_scale_drills() {
   if [[ -n "$drill_pid" ]] && kill -0 "$drill_pid" 2>/dev/null; then
     kill_tree "$drill_pid"
     wait "$drill_pid" 2>/dev/null || true
   fi
   drill_pid=""
+}
+scale_back() {
+  # The scale step's normal end, and its exit handler's (check_exit): the
+  # peak drills stopped, the floor back to the base, the fill sandboxes
+  # gone, the NodePool's limit back down. Marked done only at its end: a
+  # TERM that lands while the normal end runs it (the peak drills, once
+  # killed, end the step's wait for them) must leave the exit handler the
+  # rest to do. Each part can run twice.
+  [[ "${scaled_back:-0}" == 1 ]] && return 0
+  stop_scale_drills
   say "scale: back to $base_workers workers"
   set_min_workers "$base_workers" || true
   drills unfill || true
   nodepool $(( 4 * (base_workers + 2) )) || true
+  scaled_back=1
 }
 cap_schedule() { # cap_schedule <UTC time>: AWS ends Karpenter's machines then
   x aws scheduler create-schedule --region "$(tfout region)" --name "$name-scale-cap" \
@@ -824,17 +919,19 @@ step_scale() {
   local target="${EKS_BANK_FILL_TARGET:-12}" fill_until=$(( t0 + 15 * 60 ))
   timeline start
   while [[ "$dry" != 1 && $(now) -lt $fill_until ]]; do
-    read -r w p m <<<"$(workers_now)"
+    read_workers || { sleep 15; continue; }
     [[ "$w" -ge "$target" ]] && break
     if [[ "$p" == 0 && $(( $(now) - last_fill )) -ge 90 ]]; then
       rounds=$(( rounds + 1 )); last_fill=$(now)
-      DRILL_FILL_COUNT=8 drills fill
+      local frc=0
+      DRILL_FILL_COUNT=8 drills fill || frc=$?
+      [[ "$frc" == 0 ]] || say "scale: fill round $rounds: drills-eks.sh fill exited $frc"
       timeline "fill round $rounds"
     fi
     sleep 15
     timeline poll
   done
-  read -r w p m <<<"$(workers_now)"
+  read_workers
   result "$([[ "$dry" == 1 || "$w" -ge "$target" ]] && echo PASS || echo FAIL)" scale-full \
     "$rounds fill rounds of 8 sandboxes (1 CPU each): the operator added workers and Karpenter bought machines until $w workers served ($m machines) in $(( $(now) - t0 ))s ($out/timeline.txt)"
 
@@ -843,16 +940,26 @@ step_scale() {
   tp=$(now)
   set_min_workers "$peak_workers"
   wait_until $(( deadline - $(now) > 1200 ? 1200 : deadline - $(now) )) "$peak_workers workers Serving" at_least worker "$peak_workers" || true
-  read -r w p m <<<"$(workers_now)"
+  read_workers
   timeline peak
   result "$([[ "$dry" == 1 || "$w" -ge "$peak_workers" ]] && echo PASS || echo FAIL)" scale-peak \
     "minWorkers $peak_workers: $w workers serving on $m machines $(( $(now) - tp ))s later"
 
   # 3. At the peak, until the box ends: the ECR storm and the thresholds.
   if [[ "$dry" == 1 ]]; then
-    drills ecr-storm thresholds
+    drills ecr-storm
+    drills thresholds
   else
-    drills ecr-storm thresholds &
+    # Two runs of drills-eks.sh, so one that fails does not skip the
+    # other; a run that fails is recorded here (its own PASS or FAIL lines
+    # go to drills/drills.txt).
+    (
+      for d in ecr-storm thresholds; do
+        rc=0
+        drills "$d" || rc=$?
+        [[ "$rc" == 0 ]] || result FAIL "$d" "drills-eks.sh $d exited $rc"
+      done
+    ) &
     drill_pid=$!
     while kill -0 "$drill_pid" 2>/dev/null; do
       if [[ $(now) -ge $deadline ]]; then
@@ -873,11 +980,11 @@ step_scale() {
   scale_back
   while [[ "$dry" != 1 && $(( $(now) - tb )) -lt $(( back_minutes * 60 )) ]]; do
     timeline back
-    read -r w p m <<<"$(workers_now)"
+    read_workers || { sleep 30; continue; }
     [[ "$m" -le "$base_workers" ]] && break
     sleep 30
   done
-  read -r w p m <<<"$(workers_now)"
+  read_workers
   result "$([[ "$dry" == 1 || "$m" -le "$base_workers" ]] && echo PASS || echo INCOMPLETE)" scale-back \
     "$(( ($(now) - tb) / 60 )) min after the floor went back to $base_workers: $w workers, $m machines"
   if [[ "$dry" != 1 && "$m" -gt "$base_workers" ]]; then
@@ -970,11 +1077,101 @@ step_down() {
   fi
 }
 
+# --- checks -------------------------------------------------------------------------
+# run_check <step> <cmd...>: one check of the run. A check that fails is
+# recorded "FAIL <step> exited N" and the run goes on; up, build and install
+# are not checks (everything after needs them).
+#
+# The check runs in a subshell with set -e on, started plainly: bash ignores
+# set -e in anything run under if, while, ||, && or !, subshells and
+# functions included, so a check must never be called from one (it would
+# carry on past a failed command). The subshell runs in the background and
+# is waited for: bash runs this script's trap for a signal only when a
+# foreground command ends, but `wait` returns at once, and on_exit then
+# stops the check (stop_check) before it tears anything down.
+#
+# What a check leaves for later steps lives in files under $sd (the API
+# token, the values, the results), never in shell variables, which the
+# subshell keeps to itself. Its own unfinished business (the scale step's
+# floor, gateways11's 11 gateways) is undone by check_exit, the subshell's
+# EXIT trap. The status is in check_rc; run_check itself always returns 0.
+check_pid=""
+check_rc=0
+check_undo=""
+failed_checks=()
+run_check() {
+  local step="$1"; shift
+  set +e
+  (
+    set -e
+    trap check_exit EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    "$@"
+  ) &
+  check_pid=$!
+  wait "$check_pid"
+  check_rc=$?
+  check_pid=""
+  set -e
+  if [[ "$check_rc" != 0 ]]; then
+    result FAIL "$step" "exited $check_rc"
+    failed_checks+=("$step")
+  fi
+  return 0
+}
+# check_exit: the check subshell's EXIT trap, which stops and undoes what
+# the check left: the scale step's floor (in_scale), gateways11's 11
+# gateways (check_undo). INT and TERM are caught and dropped from here so
+# the undo finishes; caught, not ignored, because an ignored signal is
+# inherited: a drills-eks.sh the undo starts could then never be stopped
+# (its port-forward loop outlived the run). When on_exit tears the run down
+# next ($sd/.teardown-next), only the peak drills are stopped: the rest goes
+# with the cluster, and a long undo would only delay the teardown.
+check_exit() {
+  local rc=$?
+  trap : INT TERM
+  if [[ -f "$sd/.teardown-next" ]]; then
+    stop_scale_drills
+  else
+    if [[ -n "$in_scale" ]]; then scale_back || true; fi
+    if [[ -n "$check_undo" ]]; then "$check_undo" || true; fi
+  fi
+  exit "$rc"
+}
+# stop_check: on_exit's first act while a check runs: the check and
+# everything under it are stopped (kill_tree, by PID), and its own exit
+# handler finishes before anything is torn down.
+stop_check() {
+  [[ -n "$check_pid" ]] || return 0
+  if kill -0 "$check_pid" 2>/dev/null; then
+    kill_tree "$check_pid"
+    wait "$check_pid" 2>/dev/null || true
+  fi
+  check_pid=""
+}
+# run_drills: drills-eks.sh once per drill, each a check of its own, so one
+# that fails does not skip the rest. All of them need setup: after a failed
+# setup the rest are recorded as skipped.
+run_drills() {
+  local d skip=""
+  for d in setup static pull-storm slo-breach large-layers ecr-push; do
+    if [[ -n "$skip" ]]; then
+      result FAIL "drills-$d" "skipped: drills-eks.sh setup exited $skip"
+      failed_checks+=("drills-$d")
+      continue
+    fi
+    run_check "drills-$d" drills "$d"
+    if [[ "$d" == setup && "$check_rc" != 0 ]]; then skip="$check_rc"; fi
+  done
+  return 0
+}
+
 # --- main ---------------------------------------------------------------------------
-# on_exit: whatever ends the script, a failed step or Ctrl-C, scales back a
-# scale step in progress and, for `all`, tears the run down (unless
-# EKS_BANK_KEEP=1), so a failure never leaves the cell running until the
-# teardown timer.
+# on_exit: whatever ends the script, a failed step or Ctrl-C, stops a check
+# in progress (which puts back what it changed) and, for `all`, tears the
+# run down (unless EKS_BANK_KEEP=1), so a failure never leaves the cell
+# running until the teardown timer.
 run_all=0
 downed=0
 # Set when this process called cluster.sh up, or passed the gate: only then
@@ -983,14 +1180,26 @@ downed=0
 made_here=0
 gated=0
 on_exit() {
-  local rc=$?
-  trap - EXIT INT TERM
-  if [[ -n "$in_scale" ]]; then scale_back || true; fi
+  local rc=$? teardown=0
+  # From here no INT or TERM stops this script, and the teardown's own
+  # commands (Terraform's destroy among them) ignore them too: a second
+  # Ctrl-C used to end the run before down. Everything the teardown starts
+  # ends by itself; nothing in it loops.
+  trap - EXIT
+  trap '' INT TERM
   if [[ "$rc" != 0 && "$run_all" == 1 && "$refused" != 1 && "$downed" != 1 && "${EKS_BANK_KEEP:-0}" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || "$gated" == 1 ]]; then
+    teardown=1
+    : > "$sd/.teardown-next"
+  fi
+  stop_check
+  if [[ "$teardown" == 1 ]]; then
     say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)"
+    # Best effort, under ||: down goes on past a part that fails, and
+    # says what is left.
     step_down || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
   fi
+  rm -f "$sd/.teardown-next"
   exit "$rc"
 }
 trap on_exit EXIT
@@ -1015,14 +1224,23 @@ for step in "${steps[@]}"; do
     up) step_up ;;
     build) step_build ;;
     install) step_install ;;
-    enterprise) step_enterprise ;;
-    nlb) step_nlb ;;
-    gvisor) step_gvisor ;;
-    verify) step_verify ;;
-    drills) drills setup static pull-storm slo-breach large-layers ecr-push ;;
-    gateways11) step_gateways11 ;;
-    scale) step_scale ;;
+    enterprise) run_check enterprise step_enterprise ;;
+    nlb) run_check nlb step_nlb ;;
+    gvisor) run_check gvisor step_gvisor ;;
+    verify) run_check verify step_verify ;;
+    drills) run_drills ;;
+    gateways11) run_check gateways11 step_gateways11 ;;
+    scale) run_check scale step_scale ;;
     down) step_down ;;
     *) echo "eks-bank.sh: unknown step $step" >&2; exit 2 ;;
   esac
 done
+# Every step ran. Any FAIL this run wrote makes its answer 1 (down, if asked
+# for, has run): a check that exited non-zero, and a FAIL a check recorded
+# itself before returning 0 (enterprise, nlb, verify, scale-full, ...).
+fails="$( { [[ ! -f "$sd/bank.txt" ]] || tail -n +$(( bank_mark + 1 )) "$sd/bank.txt" | awk '$1 == "FAIL" {print $2}'
+  printf '%s\n' ${failed_checks[@]+"${failed_checks[@]}"}; } | sed '/^$/d' | sort -u | tr '\n' ' ')"
+if [[ -n "$fails" ]]; then
+  say "eks-bank.sh: checks that failed: ${fails% } ($sd/bank.txt)"
+  exit 1
+fi
