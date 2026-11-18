@@ -55,10 +55,11 @@
 #              a worker, then 60 workers; ecr-storm and thresholds at 60
 #              (or those of them EKS_BANK_DRILLS names; the other is a SKIP
 #              line); back to 6. A peak drill the time box cuts off, or
-#              that never starts, is a FAIL line. Time-boxed (EKS_BANK_SCALE_MINUTES, 60) with
-#              three guards: the NodePool's CPU limit, an EXIT trap that
-#              scales back, and an AWS schedule that runs the teardown
-#              Lambda's scale-cap phase if this machine is gone.
+#              that never starts, is a FAIL line. Time-boxed
+#              (EKS_BANK_SCALE_MINUTES, 60) with three guards: the
+#              NodePool's CPU limit, an EXIT trap that scales back, and an
+#              AWS schedule that runs the teardown Lambda's scale-cap phase
+#              if this machine is gone.
 #   down       the chart (its load balancer and volumes first), the scale-cap
 #              schedule, then cell.sh down (cluster.sh down: Terraform
 #              destroy, the GOVERNANCE-locked witness bucket emptied with the
@@ -487,10 +488,15 @@ src_tree() { (cd "$HERE" && sd="$sd" bash -c 'source ./lib.sh; source_tree "$0"'
 image_tag() { echo "v0.0.0-cell.$(build_sha | cut -c1-8)"; }
 
 # --- install ----------------------------------------------------------------------
-wait_until() { # wait_until <seconds> <what> <cmd...>
-  local secs="$1" what="$2"; shift 2
+# wait_until <seconds> <what> <cmd...>: <cmd> every 10 s until it passes,
+# up to <seconds>. A limit under 0 is 0: a scale fill that ran past a short
+# time box passed one, and `seq 1 <negative>` counts down on macOS, so it
+# waited about as long as the overrun.
+wait_until() {
+  local secs="$1" what="$2" i; shift 2
+  (( secs > 0 )) || secs=0
   [[ "$dry" == 1 ]] && { echo "dry-run: wait up to ${secs}s for $what" >&2; return 0; }
-  for _ in $(seq 1 $(( secs / 10 ))); do "$@" >/dev/null 2>&1 && return 0; sleep 10; done
+  for (( i = 0; i < secs / 10; i++ )); do "$@" >/dev/null 2>&1 && return 0; sleep 10; done
   say "timed out after ${secs}s waiting for $what"
   return 1
 }
@@ -1044,26 +1050,29 @@ step_scale() {
     for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do drills "$d"; done
   else
     # One run of drills-eks.sh each, so one that fails does not skip the
-    # next; a run that fails is recorded here (its own PASS or FAIL lines
-    # go to drills/drills.txt). Each marks its start and its end, so one
-    # the time box cuts off, or never starts, gets a FAIL line too
-    # (peak_unfinished): the fifth-run fix's re-run plan would have lost
-    # both without a word.
+    # next (its own PASS or FAIL lines go to drills/drills.txt). The
+    # subshell only marks each drill's start time and its exit code, each
+    # file written whole (a temporary file, then mv), because the time box
+    # can kill it between any two commands. peak_results, here, writes
+    # every result line from the marks: the fifth-run fix's re-run plan
+    # would have lost both drills without a word, and lines written in the
+    # subshell went missing when a kill landed between a mark and a line.
+    local boxed=0
     mkdir -p "$peak"
-    rm -f "$peak"/*.started "$peak"/*.ended
+    rm -f "$peak"/*.started "$peak"/*.ended "$peak"/*.tmp
     (
       for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do
-        now > "$peak/$d.started"
+        now > "$peak/$d.started.tmp" && mv -f "$peak/$d.started.tmp" "$peak/$d.started"
         rc=0
         drills "$d" || rc=$?
-        : > "$peak/$d.ended"
-        [[ "$rc" == 0 ]] || result FAIL "$d" "drills-eks.sh $d exited $rc"
+        echo "$rc" > "$peak/$d.ended.tmp" && mv -f "$peak/$d.ended.tmp" "$peak/$d.ended"
       done
     ) &
     drill_pid=$!
     while kill -0 "$drill_pid" 2>/dev/null; do
       if [[ $(now) -ge $deadline ]]; then
         say "scale: the time box ended; stopping the drills at the peak"
+        boxed=1
         kill_tree "$drill_pid"
         break
       fi
@@ -1071,7 +1080,7 @@ step_scale() {
     done
     wait "$drill_pid" 2>/dev/null || true
     drill_pid=""
-    peak_unfinished "$peak"
+    peak_results "$peak" "$boxed"
   fi
 
   # 4. Back: the floor to the base, the fill gone; the operator decommissions
@@ -1109,14 +1118,32 @@ fill_plan() {
   python3 -I "$HERE/drills-local/fillplan.py" "$out/members.json" "$out/create-policy.yaml" --past 1 > "$out/fill-plan.json" || return 1
   jq -r '"\(.cpu) \(.count)"' "$out/fill-plan.json"
 }
-# peak_unfinished <dir>: a FAIL line for each peak drill that did not end:
-# cut off by the time box (it started) or not started at all.
-peak_unfinished() {
-  local d
+# peak_results <dir> <boxed>: the one place the peak drills' result lines
+# are written, from the marks the drills' subshell left in <dir>: <d>.started
+# (its start time) and <d>.ended (its exit code).
+#   ended 0                  nothing here (its own lines are in drills.txt)
+#   ended N, not killed      FAIL <d> drills-eks.sh <d> exited N
+#   killed by the time box   FAIL <d> cut off by the time box after Ns
+#     (<boxed> 1 and: no end mark, or an exit code over 128, a signal's)
+#   never started            FAIL <d> not started: the time box ended first
+# A start time that is not a number (cannot happen with the mv, but a FAIL
+# line must not depend on it) leaves the seconds out.
+peak_results() {
+  local d rc started
   for d in ${run_peak_list[@]+"${run_peak_list[@]}"}; do
-    [[ ! -f "$1/$d.ended" ]] || continue
-    if [[ -f "$1/$d.started" ]]; then
-      result FAIL "$d" "cut off by the time box after $(( $(now) - $(cat "$1/$d.started") ))s"
+    rc=""; started=""
+    [[ ! -f "$1/$d.ended" ]] || rc="$(cat "$1/$d.ended")"
+    [[ ! -f "$1/$d.started" ]] || started="$(cat "$1/$d.started")"
+    if [[ "$rc" == 0 ]]; then
+      continue
+    elif [[ "$rc" =~ ^[0-9]+$ && ( "$2" != 1 || "$rc" -le 128 ) ]]; then
+      result FAIL "$d" "drills-eks.sh $d exited $rc"
+    elif [[ -f "$1/$d.started" ]]; then
+      if [[ "$started" =~ ^[0-9]+$ ]]; then
+        result FAIL "$d" "cut off by the time box after $(( $(now) - started ))s"
+      else
+        result FAIL "$d" "cut off by the time box"
+      fi
     else
       result FAIL "$d" "not started: the time box ended first"
     fi

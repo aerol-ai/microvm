@@ -579,6 +579,7 @@ func TestScaleFullNeedsAnotherWorker(t *testing.T) {
 		fns.WriteString(shellFunc(t, "eks-bank.sh", fn))
 	}
 	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "fill_plan"))
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_results"))
 	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_unfinished"))
 	script := `set -euo pipefail
 sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HERE="$K8S"
@@ -905,7 +906,8 @@ scale_minutes=1
 drills() {
   log "drills $1"
   case "$1" in
-    ecr-storm) command sleep 20 & echo $! >> "$OUT/drill-sleeps"; wait ;;
+    # wait $!: killed, the drill answers 143, as drills-eks.sh does.
+    ecr-storm) command sleep 20 & echo $! >> "$OUT/drill-sleeps"; wait $! ;;
     unfill) echo "6 0 6" > "$OUT/workers" ;;
   esac
 }
@@ -1037,5 +1039,105 @@ func TestBankTestEnvDropsCallerSettings(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "worst case (teardown timer at 6 h): $40.05; ceiling $45.00") || strings.TrimSpace(readLog(t, log)) != "" {
 		t.Errorf("the default estimate under the caller's settings: %v\n%s", err, out)
+	}
+}
+
+// (#1366 re-review, 1) The peak drills' result lines come from one place,
+// peak_results, and from marks written whole. Before, the drills' subshell
+// wrote its end mark, then its FAIL line: a kill between the two left no
+// line (3 of 400 stress runs). And it wrote the start time through a
+// redirect that empties the file first: a kill there left it empty, and
+// the arithmetic on it ended the scale step (1 of 400: "FAIL scale exited
+// 1", scale-back lost). Each case here is a state those kills can leave.
+func TestPeakResultsFromTheMarks(t *testing.T) {
+	fn := shellFuncIf(t, "eks-bank.sh", "peak_results")
+	call := `peak_results "$OUT/peak" "$BOXED"`
+	if fn == "" {
+		// The code before it: peak_unfinished <dir>, after the subshell had
+		// written its own exit lines.
+		fn, call = shellFunc(t, "eks-bank.sh", "peak_unfinished"), `peak_unfinished "$OUT/peak"`
+	}
+	for _, tc := range []struct {
+		desc, boxed string
+		marks       map[string]string // file in peak/ -> contents
+		want        string
+	}{
+		{"ended 0", "0", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "0"}, ""},
+		{"ended 3", "0", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "3"}, "FAIL ecr-storm drills-eks.sh ecr-storm exited 3\n"},
+		{"killed by the box: exit 143", "1", map[string]string{"ecr-storm.started": "100", "ecr-storm.ended": "143"}, "FAIL ecr-storm cut off by the time box after 60s\n"},
+		{"killed by the box before its end mark", "1", map[string]string{"ecr-storm.started": "100"}, "FAIL ecr-storm cut off by the time box after 60s\n"},
+		{"a start mark the kill left empty", "1", map[string]string{"ecr-storm.started": ""}, "FAIL ecr-storm cut off by the time box\n"},
+		{"never started", "1", map[string]string{}, "FAIL ecr-storm not started: the time box ended first\n"},
+	} {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "peak"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for f, body := range tc.marks {
+			if err := os.WriteFile(filepath.Join(dir, "peak", f), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		script := `set -euo pipefail
+run_peak_list=(ecr-storm)
+now() { echo 160; }
+result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
+` + fn + call + "\necho finished >> \"$OUT/log\"\n"
+		out, err := runBash(t, script, "OUT="+dir, "BOXED="+tc.boxed)
+		if err != nil || readLog(t, filepath.Join(dir, "log")) != "finished\n" {
+			t.Errorf("%s: died: %v\n%s", tc.desc, err, out)
+			continue
+		}
+		if got := readLog(t, filepath.Join(dir, "bank.txt")); got != tc.want {
+			t.Errorf("%s: recorded %q, want %q", tc.desc, got, tc.want)
+		}
+	}
+}
+
+// (#1366 re-review, 2) A scale fill that runs past a short time box passes
+// a negative limit to the wait for the peak's workers. That is no wait at
+// all now. Before: `seq 1 <negative>` counts down on macOS, so the step
+// checked and slept about as long as the overrun. The clock is a file.
+func TestScaleWaitAfterAFillPastTheBox(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "run.tfvars.json"), []byte(`{"ttl": "2099-01-01T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "clock"), []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var fns strings.Builder
+	for _, fn := range []string{"wait_until", "kill_tree", "stop_scale_drills", "scale_back", "read_workers", "step_scale"} {
+		fns.WriteString(shellFunc(t, "eks-bank.sh", fn))
+	}
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_results"))
+	fns.WriteString(shellFuncIf(t, "eks-bank.sh", "peak_unfinished"))
+	// A 10-minute box; the workers never reach the fill's target, so the
+	// fill runs its whole 15 minutes, past the box.
+	script := `set -euo pipefail
+sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HERE="$K8S"
+base_workers=6; peak_workers=60; scale_minutes=10; back_minutes=20
+in_scale=""; drill_pid=""; scaled_back=0
+peak_drills=(ecr-storm thresholds); run_peak_list=()
+say() { echo "$*" >> "$OUT/say"; }
+result() { echo "$1 $2 $3" >> "$OUT/bank.txt"; }
+now() { cat "$OUT/clock"; }
+sleep() { echo $(( $(cat "$OUT/clock") + ${1%.*} )) > "$OUT/clock"; }
+api_token() { :; }; cap_schedule() { :; }; nodepool() { :; }; timeline() { :; }; set_min_workers() { :; }
+end_extra_machines() { :; }; x() { :; }; tfout() { echo us-east-1; }
+fill_plan() { echo "2 1"; }
+workers_now() { echo "6 0 6"; }
+drills() { :; }
+at_least() { echo check >> "$OUT/checks"; return 1; }
+` + fns.String() + `
+step_scale
+echo finished >> "$OUT/log"
+`
+	out, err := runBash(t, script, "OUT="+dir, "K8S="+filepath.Dir(k8sFile(t, "eks-bank.sh")))
+	if err != nil || readLog(t, filepath.Join(dir, "log")) != "finished\n" {
+		t.Fatalf("the scale step died: %v\n%s", err, out)
+	}
+	if checks := strings.Count(readLog(t, filepath.Join(dir, "checks")), "check"); checks != 0 {
+		t.Errorf("waited for the peak's workers %d times after the box had ended (want 0):\n%s", checks, readLog(t, filepath.Join(dir, "say")))
 	}
 }

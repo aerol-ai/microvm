@@ -89,7 +89,7 @@ drills() {
 	}
 	// Newer than some of the tests that use this harness: the code before
 	// them runs without (and those tests show what it did).
-	for _, fn := range []string{"peak_unfinished", "parse_drills"} {
+	for _, fn := range []string{"peak_results", "peak_unfinished", "parse_drills"} {
 		b.WriteString(shellFuncIf(t, "eks-bank.sh", fn))
 	}
 	b.WriteString(extra)
