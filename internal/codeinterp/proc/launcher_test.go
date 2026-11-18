@@ -423,3 +423,44 @@ func TestLanguages(t *testing.T) {
 		t.Fatalf("Languages = %v", got)
 	}
 }
+
+// TestAwaitReadyAfterExit pins the order a fast driver can produce: it
+// writes its last frame and exits, and the exit is seen before the event
+// reader hands that frame over. The frame still decides the error.
+func TestAwaitReadyAfterExit(t *testing.T) {
+	cases := []struct {
+		name    string
+		send    *frame // sent after the exit is seen; nil: the pipe ends with no frame
+		wantErr string
+	}{
+		{name: "fatal after the exit", send: &frame{"FATAL", []byte("cannot set up\n")}, wantErr: "failed to start: cannot set up"},
+		{name: "a frame before READY after the exit", send: &frame{"COUNT", []byte("1")}, wantErr: "sent COUNT before READY"},
+		{name: "READY after the exit is still an early exit", send: &frame{"READY", nil}, wantErr: "exited before it was ready: exit status 1"},
+		{name: "no frame", wantErr: "exited before it was ready: exit status 1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eof := make(chan struct{})
+			close(eof)
+			k := &kernel{
+				pipes:   [2]*pipe{{eof: eof}, {eof: eof}},
+				frames:  make(chan frame),
+				exited:  make(chan struct{}),
+				waitErr: errors.New("exit status 1"),
+			}
+			close(k.exited)
+			go func() {
+				// Late enough that awaitReady has already seen the exit.
+				time.Sleep(50 * time.Millisecond)
+				if tc.send != nil {
+					k.frames <- *tc.send
+				}
+				close(k.frames)
+			}()
+			err := k.awaitReady(context.Background(), codeinterp.LangPython)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
