@@ -359,18 +359,28 @@ func (r *Responder) serve(ctx context.Context, pc net.PacketConn, ln net.Listene
 	errc := make(chan error, 2)
 	go func() { errc <- udp.ActivateAndServe() }()
 	go func() { errc <- tcp.ActivateAndServe() }()
-	stop := func() {
+	// stop also waits for the servers still running (pending) to return.
+	// Our own Close calls are not enough: dns.Server closes its socket again
+	// in its own goroutine (serveUDP's deferred Close), and when two Close
+	// calls meet on one socket, only the first waits for the kernel close;
+	// the other returns at once. So ours could return while the UDP port
+	// was still bound, and a bind right after ListenAndServe failed with
+	// "address already in use" (CI run 44239594609).
+	stop := func(pending int) {
 		_ = udp.Shutdown()
 		_ = tcp.Shutdown()
 		_ = pc.Close()
 		_ = ln.Close()
+		for ; pending > 0; pending-- {
+			<-errc
+		}
 	}
 	select {
 	case <-ctx.Done():
-		stop()
+		stop(2)
 		return nil
 	case err := <-errc:
-		stop()
+		stop(1)
 		return err
 	}
 }

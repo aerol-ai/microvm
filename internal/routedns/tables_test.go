@@ -10,6 +10,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/testport"
 )
 
 func TestOwnerTableMutations(t *testing.T) {
@@ -148,15 +149,15 @@ func TestIngressIndexIncrementalUpdates(t *testing.T) {
 // A failed bind must not leak the other socket, or a retry can never
 // succeed ("address already in use" on our own leaked TCP listener).
 func TestResponderListenAndServeReleasesPortsOnFailureAndCancel(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
+	// The test frees this port and binds it again several times. A ":0"
+	// pick comes from the ephemeral range, where any other socket can take
+	// it in between; on a busy machine the old pick often found the UDP
+	// side taken and skipped the test. testport's port sits below that
+	// range and goes to no other test.
+	addr := testport.UDPAddr(t)
 	held, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		t.Skipf("udp %s busy: %v", addr, err)
+		t.Fatalf("hold udp %s: %v", addr, err)
 	}
 	r := newTestResponder()
 	if err := r.ListenAndServe(context.Background(), addr); err == nil {
