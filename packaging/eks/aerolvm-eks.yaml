@@ -51,7 +51,7 @@ Parameters:
     Type: String
     # The release workflow sets this to the release it ships with, on the
     # line that ends in "# release-version".
-    Default: "0.7.6" # release-version
+    Default: "0.7.7" # release-version
     AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
     Description: The AerolVM release to install, without the "v". Change it later to upgrade.
   KubernetesVersion:
