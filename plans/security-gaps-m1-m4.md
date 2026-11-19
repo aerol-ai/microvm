@@ -432,8 +432,8 @@ Each is small and stands alone. Together they shrink the root surface now.
 
 | # | Change | Size |
 |---|---|---|
-| Q1 | WASM workers and resident hosts drop to a normal user, with no-new-privs and a seccomp filter, at spawn. Copy what `pkg/isolate/shim_linux.go` already does for workerd. This was the riskiest finding: an engine escape is root today. | S |
-| Q2 | Allowlists for NFS `opts` and for each mount tool's `extra_args`. A refused flag gets a clear `400`. Today only credential-shaped words and a leading dash are refused. | S |
+| Q1 | WASM workers and resident hosts drop to a normal user, with no-new-privs and a seccomp filter. This was the riskiest finding: an engine escape is root today. **Resized (2026-11-20):** workers open files by path under two root-only folders (`/var/lib/sandboxd`, `/run/sandboxd`), so a plain uid drop either breaks them or loosens that hardening. Design approved by the owner: the worker starts as root, opens its socket, compile cache and its own spill folder, then drops uid/gid, no-new-privs, dumpable=0 and seccomp; sandboxd opens each path a message names (modules, work dirs, mount folders, snapshots) and passes the open file; each worker gets its own PID namespace; an unreadable floor file fails closed; the compile cache cannot be poisoned across tenants. S3/rclone mounts keep working through passed files. | M |
+| Q2 | Allowlists for NFS `opts` and for each mount tool's `extra_args`. A refused flag gets a clear `400`. Today only credential-shaped words and a leading dash are refused. Review added (2026-11-20): rclone backends are allowlisted in the source and in `rclone_conf` (no `local`, no wrappers around it, no options that run commands or read host paths); the operator's platform-volume settings are checked once at daemon start; stored specs are re-checked on start and restart. | S–M |
 | Q3 | Image build contexts unpack in a child process with no rights, into a folder it owns. (The builds themselves move to rootless BuildKit in M1 PR 10b, eng review D14.) | S |
 | Q4 | Multipart parts are written to a temp folder only the API can use, cleaned up per request. | S |
 
@@ -451,7 +451,9 @@ Each is small and stands alone. Together they shrink the root surface now.
    root.
 8. Mounts (closes the F13 follow-up).
 9. Host processes: WASM, V8, Firecracker jailer and TAP (closes C14).
-10b. Builds (eng review D14): buildkitd runs rootless (BuildKit's rootless
+10b. Builds (eng review D14). First step done separately (PR #1371): build
+    steps run on the sandboxes' CNI network behind the egress floor and node
+    guard. Then: buildkitd runs rootless (BuildKit's rootless
     mode, OCI worker) with its own network that gets the sandboxes' egress
     rules. A build exports an OCI archive that the agent imports through the
     gate's allowed transfer import. The agent then holds no root-level socket
