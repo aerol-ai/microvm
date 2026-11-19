@@ -36,7 +36,7 @@ The start times come from our AWS test servers. Each runtime was measured on a d
 | Runtime | Save and restore | Warm pool |
 |---|---|---|
 | Container | Save its files as a [snapshot](/images-and-snapshots/#snapshots). | Yes, off by default. See [Warm pools](/warm-pools/). |
-| gVisor | Save its files as a snapshot. On Kubernetes, it moves to a new machine with its memory when a machine is replaced. | Yes, when gVisor is the server's default runtime. Off by default. |
+| gVisor | No snapshots yet: gVisor keeps a sandbox's file changes in its own layer, and saving them to an image is not proven. Use a container or Firecracker sandbox when you need one. On Kubernetes, it moves to a new machine with its memory when a machine is replaced. | Yes, when gVisor is the server's default runtime. Off by default. |
 | Firecracker | Save its disk as a snapshot. Stop saves the whole VM, memory too. A template saves a booted VM. On Kubernetes, it moves with its memory. | Templates give fast starts. A pool of paused VMs exists, but is off by default. |
 | WebAssembly | With `durability: "passivatable"`, a clean server shutdown saves its memory and state to disk. | Yes, on by default: warm workers for each module. |
 | V8 isolate | None. The code bundle is the whole sandbox. | Yes, on by default: blank `workerd` processes wait for a tenant's first create. |
