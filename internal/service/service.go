@@ -577,6 +577,10 @@ type Service struct {
 	warmPoolKick     chan struct{}
 	warmPoolKickOnce sync.Once
 
+	// runtimeOffers caches the cluster's runtime offers for GET
+	// /v1/runtimes (runtimes.go).
+	runtimeOffers runtimeOffersCache
+
 	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
 	// index the request path reads; apiTokenMirror is the token copy on a
 	// cluster node without Raft state (nil elsewhere). apiTokenEntropy and
