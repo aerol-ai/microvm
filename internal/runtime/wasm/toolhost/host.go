@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/internal/version"
 )
@@ -23,6 +24,7 @@ type Host struct {
 	sessions  Sessions
 	liveness  toolboxwire.Liveness
 	interp    Interpreters
+	uploads   *multipartspool.Spool
 
 	streamReadLimit int64
 	streamWriteWait time.Duration
@@ -56,6 +58,11 @@ type Config struct {
 	// Interpreters serves the code interpreter (interpreter.go). Nil
 	// answers its routes with 501.
 	Interpreters Interpreters
+	// UploadSpool takes upload parts too big for memory, in a private
+	// folder per request: this host runs in sandboxd, so the stdlib's
+	// default would put them in the host's shared temp folder. Nil keeps
+	// every part in memory and refuses an upload that does not fit.
+	UploadSpool *multipartspool.Spool
 }
 
 // New constructs a toolbox host.
@@ -70,6 +77,7 @@ func New(cfg Config) *Host {
 		sessions:  cfg.Sessions,
 		liveness:  cfg.StreamLiveness,
 		interp:    cfg.Interpreters,
+		uploads:   cfg.UploadSpool,
 
 		streamReadLimit: cfg.StreamReadLimit,
 		streamWriteWait: cfg.StreamWriteWait,
