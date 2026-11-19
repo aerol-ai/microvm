@@ -471,6 +471,25 @@ func TestLoadCases(t *testing.T) {
 			},
 		},
 		{
+			// WASM workers drop by default, to a uid of their own; with the
+			// drop off its uid is not checked.
+			name: "wasm_worker_drop_defaults",
+			run: func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("SB_PAT_TOKEN", "token")
+				t.Setenv("SB_ENABLE_WASM", "true")
+				cfg, err := Load()
+				if err != nil || !cfg.WasmWorkerDropPrivs || cfg.WasmWorkerUID != DefaultWasmWorkerID || cfg.WasmWorkerGID != DefaultWasmWorkerID {
+					t.Fatalf("defaults = %v %d/%d, %v", cfg.WasmWorkerDropPrivs, cfg.WasmWorkerUID, cfg.WasmWorkerGID, err)
+				}
+				t.Setenv("SB_WASM_WORKER_DROP_PRIVS", "false")
+				t.Setenv("SB_WASM_WORKER_UID", "0")
+				if cfg, err := Load(); err != nil || cfg.WasmWorkerDropPrivs {
+					t.Fatalf("drop off = %v, %v", cfg.WasmWorkerDropPrivs, err)
+				}
+			},
+		},
+		{
 			// A jailed-but-root workerd defeats the point of the jail; uid/gid
 			// 0 is a misconfiguration, not a privilege drop.
 			name: "rejects_root_isolate_jail_uid",
@@ -1838,6 +1857,17 @@ func TestEnterpriseModeRequiresStrongPAT(t *testing.T) {
 	} else if cfg.IsolateJailPidsMax != 512 {
 		t.Fatalf("IsolateJailPidsMax = %d, want the bounded 512 default", cfg.IsolateJailPidsMax)
 	}
+	// Enterprise may run WASM only with workers that drop root.
+	t.Setenv("SB_ENABLE_WASM", "true")
+	t.Setenv("SB_WASM_WORKER_DROP_PRIVS", "false")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_WASM_WORKER_DROP_PRIVS must be true") {
+		t.Fatalf("Load error = %v, want drop-required-in-enterprise", err)
+	}
+	t.Setenv("SB_WASM_WORKER_DROP_PRIVS", "")
+	if cfg, err := Load(); err != nil || !cfg.WasmWorkerDropPrivs {
+		t.Fatalf("dropped WASM workers in enterprise: cfg=%+v err=%v", cfg.WasmWorkerDropPrivs, err)
+	}
+	t.Setenv("SB_ENABLE_WASM", "")
 	t.Setenv("SB_ENABLE_ISOLATE", "false")
 	t.Setenv("SB_ISOLATE_SECCOMP_MODE", "")
 

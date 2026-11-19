@@ -34,7 +34,7 @@ func DefaultSpawner(ctx context.Context, socketPath string) (*exec.Cmd, error) {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, exe, WorkerFlag, socketPath)
-	cmd.Env = workerEnvironment()
+	cmd.Env = workerEnvironment(ctx)
 	// The worker writes straight to sandboxd's stdout and stderr (the
 	// journal), never to a pipe sandboxd reads: a worker that outlives
 	// sandboxd would get SIGPIPE on its next write to a pipe whose reader
@@ -54,7 +54,7 @@ func DefaultResidentSpawner(ctx context.Context, socketPath string) (*exec.Cmd, 
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, exe, ResidentHostFlag, socketPath)
-	cmd.Env = workerEnvironment()
+	cmd.Env = workerEnvironment(ctx)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
@@ -62,11 +62,13 @@ func DefaultResidentSpawner(ctx context.Context, socketPath string) (*exec.Cmd, 
 
 // workerEnvironment is an allowlist. A worker does not need the daemon PAT,
 // encryption/KMS credentials, registry credentials, or the audit master key.
-func workerEnvironment() []string {
+// Nor the node-wide compile cache (AEROL_WASM_COMPILE_CACHE_DIR): a worker
+// gets its owner's cache from ctx (WithCompileCache), or none.
+func workerEnvironment(ctx context.Context) []string {
 	allowed := map[string]struct{}{
 		"PATH": {}, "TMPDIR": {}, "LANG": {}, "LC_ALL": {}, "TZ": {},
 		"SSL_CERT_FILE": {}, "SSL_CERT_DIR": {}, "LD_LIBRARY_PATH": {},
-		"AEROL_WASM_ENGINE": {}, "AEROL_WASM_COMPILE_CACHE_DIR": {},
+		"AEROL_WASM_ENGINE":    {},
 		ListenFallbackEnv:      {},
 		"SB_AUDIT_INGEST_PORT": {}, "SB_AUDIT_SPILL_DIR": {},
 		"SB_EGRESS_ATTRIBUTION_ENABLED": {}, "SB_NODE_ID": {},
@@ -90,6 +92,9 @@ func workerEnvironment() []string {
 		if _, ok := allowed[name]; ok {
 			out = append(out, entry)
 		}
+	}
+	if dir := compileCacheFrom(ctx); dir != "" {
+		out = append(out, cacheDirEnv+"="+dir)
 	}
 	return out
 }
@@ -118,7 +123,11 @@ type Supervisor struct {
 type slotState struct {
 	sandboxID  string
 	socketPath string
-	cmd        *exec.Cmd
+	// spec is what the slot's worker was started with (its cache, its
+	// spill folder, whether it stays root): a respawn after a crash keeps
+	// it.
+	spec spawnSpec
+	cmd  *exec.Cmd
 	// proc is a worker a previous sandboxd started and this one adopted.
 	// It has no cmd: it is waited on and signalled through its pidfd.
 	proc       hostproc.Process
@@ -203,6 +212,7 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 	st := &slotState{
 		sandboxID:  sandboxID,
 		socketPath: socketPath,
+		spec:       specFrom(ctx),
 		cmd:        cmd,
 		done:       make(chan struct{}),
 	}
@@ -240,7 +250,7 @@ func (s *Supervisor) exited(st *slotState) {
 		return
 	}
 	// Auto-respawn once after a crash — enough for D10; Phase 2 adds durability policy.
-	_ = s.startLocked(context.Background(), st.sandboxID, st.socketPath)
+	_ = s.startLocked(withSpec(context.Background(), st.spec), st.sandboxID, st.socketPath)
 }
 
 // Adopt takes over a running worker a previous sandboxd started (found at
@@ -296,6 +306,7 @@ func (s *Supervisor) Stop(sandboxID string) error {
 			return err
 		}
 		<-st.done
+		st.removeSpill()
 		return nil
 	}
 	if st.cmd == nil || st.cmd.Process == nil {
@@ -305,7 +316,19 @@ func (s *Supervisor) Stop(sandboxID string) error {
 		return err
 	}
 	<-st.done
+	st.removeSpill()
 	return nil
+}
+
+// removeSpill removes the stopped worker's own spill folder, so warm-pool
+// slots and resident hosts do not each leave one behind. An adopted
+// worker's spec is not known: its folder is the one named for its socket
+// (a warm slot's, a resident host's); a sandbox's own is removed with the
+// sandbox.
+func (st *slotState) removeSpill() {
+	if !st.spec.rootOnly {
+		RemoveSpillFolder(spillLabel(st.spec, st.socketPath))
+	}
 }
 
 // RunCLI is the `--wasm-worker <socket>` entrypoint shared by sandboxd and tests.
@@ -313,8 +336,5 @@ func RunCLI(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: --wasm-worker <socket-path>")
 	}
-	if err := loadWorkerGuards(); err != nil {
-		return err
-	}
-	return ServeSocketPath(args[0])
+	return runWorker(args[0], &Server{})
 }

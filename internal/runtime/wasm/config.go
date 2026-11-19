@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // Config holds host-side WASM runtime settings.
@@ -54,6 +55,19 @@ type Config struct {
 	// InterpIdleTTL stops an idle context's interpreter; 0 means
 	// defaultInterpIdleTTL. SB_WASM_INTERP_IDLE_TTL.
 	InterpIdleTTL time.Duration
+	// Worker is the uid/gid workers drop to (workerfs.go): what the driver
+	// hands them on the host. Zero (the drop is off, or sandboxd is not
+	// root on Linux) hands them nothing.
+	Worker worker.Confinement
+	// CompileCacheDir is the root of the per-owner compile caches
+	// (compileCacheFor); empty, no cache.
+	CompileCacheDir string
+	// GuestListenHost is the loopback address workers bind the guests'
+	// listeners on; empty, 127.0.0.1. pkg/daemon sets it while the WASM
+	// worker fence is on (workerfence.GuestListenHost): the fence lets the
+	// worker uid reach that address, where its own guest listens, and no
+	// other loopback one.
+	GuestListenHost string
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.

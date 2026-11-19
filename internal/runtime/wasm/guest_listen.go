@@ -218,7 +218,7 @@ func (d *Driver) syncListenPorts(ctx context.Context, inst *sandboxInstance, cli
 	inst.bumpRunGeneration()
 	host := ""
 	if len(ports) > 0 {
-		host = wasmLoopbackIP
+		host = d.guestListenHost()
 	}
 	got, err := lc.SetListenPorts(inst.sandboxID, ports, host)
 	if err != nil {
@@ -231,7 +231,7 @@ func (d *Driver) syncListenPorts(ctx context.Context, inst *sandboxInstance, cli
 	if len(ports) == 0 {
 		return nil
 	}
-	return d.serveGuest(ctx, inst, client, wasmLoopbackIP, got.Primary)
+	return d.serveGuest(ctx, inst, client, host, got.Primary)
 }
 
 // coversPorts reports whether have has a listener for every port of want.

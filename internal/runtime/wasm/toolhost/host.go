@@ -23,6 +23,7 @@ type Host struct {
 	sessions  Sessions
 	liveness  toolboxwire.Liveness
 	interp    Interpreters
+	owner     Owner
 
 	streamReadLimit int64
 	streamWriteWait time.Duration
@@ -56,7 +57,20 @@ type Config struct {
 	// Interpreters serves the code interpreter (interpreter.go). Nil
 	// answers its routes with 501.
 	Interpreters Interpreters
+	// Owner is who the guest's files belong to on the host: the uid its
+	// worker runs as. What this host writes into the workdir it hands to
+	// Owner, or the guest could not change or remove it. Zero leaves
+	// files as sandboxd made them (workers run as sandboxd).
+	Owner Owner
 }
+
+// Owner is a uid/gid pair; the zero value is nobody in particular.
+type Owner struct {
+	UID int
+	GID int
+}
+
+func (o Owner) set() bool { return o.UID > 0 && o.GID > 0 }
 
 // New constructs a toolbox host.
 func New(cfg Config) *Host {
@@ -70,6 +84,7 @@ func New(cfg Config) *Host {
 		sessions:  cfg.Sessions,
 		liveness:  cfg.StreamLiveness,
 		interp:    cfg.Interpreters,
+		owner:     cfg.Owner,
 
 		streamReadLimit: cfg.StreamReadLimit,
 		streamWriteWait: cfg.StreamWriteWait,

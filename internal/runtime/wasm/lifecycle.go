@@ -108,7 +108,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if workerKey == "" {
 		workerKey = sandboxID
 	}
-	if err := d.supervisor.Ensure(ctx, workerKey, inst.socketPath); err != nil {
+	if err := d.supervisor.Ensure(d.workerStartCtx(ctx, sandboxID, inst.ownerRef, inst.legacyRoot), workerKey, inst.socketPath); err != nil {
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
 	client := d.newWorkerClient(inst.socketPath)
@@ -171,8 +171,9 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 		return nil, err
 	}
 
+	d.ensureSharedCompiled(ctx, resolved)
 	workDir := d.sandboxDir(sandbox.ID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
 	socketPath, err := d.ownWorkerSocket(sandbox.ID)
@@ -181,6 +182,8 @@ func (d *Driver) StartSandbox(ctx context.Context, sandbox *models.Sandbox, host
 	}
 	inst := &sandboxInstance{
 		sandboxID:    sandbox.ID,
+		ownerRef:     sandbox.OwnerRef,
+		legacyRoot:   d.legacyRoot(sandbox.ID, hostMounts),
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
 		moduleDigest: resolved.Digest,
@@ -263,6 +266,8 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		workDir = inst.workDir
 	}
 	_ = os.RemoveAll(workDir)
+	worker.RemoveSpillFolder(sandboxSpillLabel(sandboxID))
+	d.legacyLogged.Delete(sandboxID)
 	// The socket and the record in the driver's own dirs are named for the
 	// sandbox alone; a worker stopped by a kill leaves its socket behind.
 	if socket := d.workerSocketPath(sandboxID); socket != "" {

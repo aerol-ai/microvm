@@ -270,7 +270,7 @@ func TestInstallOperatorGuard(t *testing.T) {
 		return !g.Strict && len(g.DenyFloor) == 1+len(egresspolicy.MetadataPrefixes)
 	})
 	found := false
-	for _, kv := range workerEnvironment() {
+	for _, kv := range workerEnvironment(nil) {
 		if strings.HasPrefix(kv, "SB_EGRESS_OPERATOR_FILE=") {
 			found = true
 		}

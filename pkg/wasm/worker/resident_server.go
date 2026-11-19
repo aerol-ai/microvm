@@ -172,7 +172,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 	}
 
 	for {
-		env, err := readFrame(conn)
+		env, err := readGrantedFrame(conn)
 		if err != nil {
 			return err
 		}
@@ -382,6 +382,11 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				_, _ = s.mediator().DrainUsage(env.SandboxID)
 				s.mediator().ForgetLearned(env.SandboxID)
 			}
+			// A resident host outlives its sandboxes: their /work, mounts and
+			// runtime modules are not its to keep open.
+			if env.SandboxID != "" {
+				wasmengine.ReleaseHostGrants(env.SandboxID)
+			}
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}
@@ -460,15 +465,7 @@ func ServeSocketPathResident(socketPath string) error {
 	defer ln.Close()
 	srv := &ResidentServer{}
 	defer srv.close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go func(c net.Conn) {
-			_ = srv.Serve(c)
-		}(conn)
-	}
+	return serveListener(ln, srv)
 }
 
 // RunCLIResident is the `--wasm-resident-host <socket>` entrypoint.
@@ -476,8 +473,5 @@ func RunCLIResident(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: --wasm-resident-host <socket-path>")
 	}
-	if err := loadWorkerGuards(); err != nil {
-		return err
-	}
-	return ServeSocketPathResident(args[0])
+	return runWorker(args[0], &ResidentServer{})
 }

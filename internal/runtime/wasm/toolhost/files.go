@@ -48,11 +48,11 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if err := root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
+	if err := mkdirAllOwned(root, filepath.Dir(rel), h.owner); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := atomicWriteFile(root, rel, file); err != nil {
+	if err := atomicWriteFile(root, rel, file, h.owner); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -178,9 +178,37 @@ func writeOpenError(w http.ResponseWriter, err error) {
 	writeError(w, status, err.Error())
 }
 
+// mkdirAllOwned is root.MkdirAll that hands each directory it makes to
+// owner (when set). Directories that were there are left as they are.
+func mkdirAllOwned(root *os.Root, rel string, owner Owner) error {
+	if !owner.set() {
+		return root.MkdirAll(rel, 0o755)
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." {
+		return nil
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i := range parts {
+		dir := filepath.Join(parts[:i+1]...)
+		err := root.Mkdir(dir, 0o755)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := root.Lchown(dir, owner.UID, owner.GID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // atomicWriteFile writes rel inside root via a temp file in the same
-// directory and a rename, both through the root.
-func atomicWriteFile(root *os.Root, rel string, src multipart.File) error {
+// directory and a rename, both through the root. The file is owner's
+// (when set) before it gets its name.
+func atomicWriteFile(root *os.Root, rel string, src multipart.File, owner Owner) error {
 	var suffix [8]byte
 	_, _ = rand.Read(suffix[:])
 	tmpName := filepath.Join(filepath.Dir(rel), ".upload-"+hex.EncodeToString(suffix[:]))
@@ -201,6 +229,12 @@ func atomicWriteFile(root *os.Root, rel string, src multipart.File) error {
 	if err := root.Chmod(tmpName, 0o644); err != nil {
 		cleanup()
 		return err
+	}
+	if owner.set() {
+		if err := root.Lchown(tmpName, owner.UID, owner.GID); err != nil {
+			cleanup()
+			return err
+		}
 	}
 	if err := root.Rename(tmpName, rel); err != nil {
 		cleanup()

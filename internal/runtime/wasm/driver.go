@@ -50,6 +50,17 @@ type Driver struct {
 	workerCgroup   *hostproc.Cgroup
 	pendingWorkers map[string]worker.FoundWorker
 
+	// The shared compile cache (sharedcache.go): precompile is the trusted
+	// compile step, sharedState single-flights it per module digest, and
+	// precompileMu runs one compile at a time.
+	precompile   precompileFunc
+	sharedMu     sync.Mutex
+	sharedState  map[string]*sharedCompile
+	precompileMu sync.Mutex
+
+	// legacyLogged holds the sandboxes legacyRoot has spoken for.
+	legacyLogged sync.Map
+
 	// hostDirsReady latches once ensureHostDirs has made the driver's own
 	// dirs under the run dir; hostDirsMu single-flights the first call.
 	hostDirsReady atomic.Bool
@@ -75,6 +86,7 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		cfg:             cfg,
 		logger:          logger,
 		newWorkerClient: defaultWorkerClientFactory,
+		precompile:      worker.Precompile,
 		byID:            make(map[string]*sandboxInstance),
 	}
 	d.net = newNetworkGateway()

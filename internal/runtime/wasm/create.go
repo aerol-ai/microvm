@@ -72,7 +72,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// into a shared compile-once/instantiate-many host instead of spawning a
 	// per-sandbox worker + compiling. Everything below is the untouched
 	// per-sandbox path used when the flag is off (the default).
-	if d.residentHostEnabled() && !createWantsPublicExpose(req) && resolved.Digest != "" {
+	legacyRoot := d.legacyRoot(sandboxID, hostMounts)
+	if d.residentHostEnabled() && !createWantsPublicExpose(req) && resolved.Digest != "" && !legacyRoot {
 		return d.createOnResidentHost(ctx, req, sandboxID, ref, resolved, memoryMB, hostMounts, timing)
 	}
 
@@ -90,7 +91,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	workDir := d.sandboxDir(sandboxID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
 
@@ -103,6 +104,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	inst := &sandboxInstance{
 		sandboxID:    sandboxID,
+		ownerRef:     ownerRefFromCreateCtx(ctx),
+		legacyRoot:   legacyRoot,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
 		moduleSize:   resolved.SizeBytes,
@@ -142,7 +145,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	client := d.newWorkerClient(socketPath)
 	if warmSlot == nil {
 		spawnStart := time.Now()
-		if err := d.supervisor.Ensure(ctx, sandboxID, socketPath); err != nil {
+		// An operator module is compiled once into the shared cache, before
+		// the worker that loads it starts, so that worker reads it back.
+		d.ensureSharedCompiled(ctx, resolved)
+		if err := d.supervisor.Ensure(d.workerStartCtx(ctx, sandboxID, inst.ownerRef, inst.legacyRoot), sandboxID, socketPath); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("start worker: %w", err)
 		}

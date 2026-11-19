@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -281,7 +282,8 @@ func (d *Driver) bringUpResidentHost(ctx context.Context, b *residentBucket, h *
 		return fmt.Errorf("mkdir resident dir: %w", err)
 	}
 	key := d.residentHostKey(b.id, h.index)
-	if err := d.residentSupervisor.Ensure(ctx, key, h.socket); err != nil {
+	cache := worker.WithCompileCache(ctx, d.compileCacheNamed(residentCacheName(b.id)))
+	if err := d.residentSupervisor.Ensure(cache, key, h.socket); err != nil {
 		return fmt.Errorf("start resident host: %w", err)
 	}
 	client := d.newWorkerClient(h.socket)
@@ -315,6 +317,7 @@ func (d *Driver) PrewarmResidentHosts(ctx context.Context, refs []string) {
 			}
 			continue
 		}
+		d.ensureSharedCompiled(ctx, resolved)
 		// Prewarm the operator/global bucket (empty owner) at default memory.
 		// reserve=false: prewarm compiles the module on the host but instantiates
 		// no sandbox, so it must NOT hold a live slot (Finding P1-2).
@@ -350,13 +353,14 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 		d.releaseResidentSlotFor(old)
 	}
 
+	d.ensureSharedCompiled(ctx, resolved)
 	bucket, host, err := d.ensureResidentHost(ctx, ownerRef, resolved.Digest, resolved.Path, memoryMB, true)
 	if err != nil {
 		return nil, err
 	}
 
 	workDir := d.sandboxDir(sandboxID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		// Release the slot ensureResidentHost just reserved (Finding P1-2).
 		d.releaseResidentSlot(host.socket)
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
@@ -365,6 +369,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	workerKey := d.residentHostKey(bucket.id, host.index)
 	inst := &sandboxInstance{
 		sandboxID:        sandboxID,
+		ownerRef:         ownerRef,
 		moduleRef:        ref,
 		modulePath:       resolved.Path,
 		moduleSize:       resolved.SizeBytes,
@@ -460,7 +465,7 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 
 	// 1) Bring up the dedicated cold worker + compile + instantiate (listener
 	//    disabled; the caller's syncGuestListenPort enables it right after).
-	if err := d.supervisor.Ensure(ctx, inst.sandboxID, coldSocket); err != nil {
+	if err := d.supervisor.Ensure(d.workerStartCtx(ctx, inst.sandboxID, inst.ownerRef, inst.legacyRoot), inst.sandboxID, coldSocket); err != nil {
 		return fmt.Errorf("start cold worker: %w", err)
 	}
 	if err := d.waitWorker(ctx, client, inst.sandboxID); err != nil {

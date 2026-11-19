@@ -12,8 +12,23 @@ import (
 
 const wasmLoopbackIP = "127.0.0.1"
 
+// guestListenHost is where this release's workers bind guest listeners
+// (Config.GuestListenHost). Workers of an older release bind on
+// wasmLoopbackIP: they run as root, which the worker fence leaves alone.
+func (d *Driver) guestListenHost() string {
+	if h := d.cfg.GuestListenHost; h != "" {
+		return h
+	}
+	return wasmLoopbackIP
+}
+
 type sandboxInstance struct {
-	sandboxID    string
+	sandboxID string
+	// ownerRef picks the compile cache the sandbox's own workers use
+	// (compileCacheFor).
+	ownerRef string
+	// legacyRoot keeps the sandbox's worker root (Driver.legacyRoot).
+	legacyRoot   bool
 	moduleRef    string
 	modulePath   string
 	moduleSize   int64
@@ -51,7 +66,10 @@ type sandboxInstance struct {
 	// once each re-instantiated the guest and raced on these fields.
 	// listenMu guards them and is never held across a worker call, so a
 	// proxied request never waits on a sync.
-	listenSync         sync.Mutex
+	listenSync sync.Mutex
+	// checkpointMu serializes the sandbox's checkpoints over its one
+	// staging folder (stageCheckpoint).
+	checkpointMu       sync.Mutex
 	listenMu           sync.Mutex
 	resolvedListenPort int
 	listenPorts        map[int]int

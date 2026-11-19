@@ -3,45 +3,216 @@ package worker
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"os"
+	"syscall"
+
+	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
 const maxFrameSize = 16 << 20 // 16 MiB — generous for Phase 1 control messages
 
-func writeFrame(w io.Writer, env Envelope) error {
+// maxFrameFiles caps the descriptors one frame carries: a module, a
+// sandbox's /work, its mount folders and four snapshot files fit with room
+// to spare. The reader's control buffer is sized for it, so a frame never
+// arrives with some of its descriptors cut off.
+const maxFrameFiles = 32
+
+func encodeFrame(env Envelope) ([]byte, error) {
 	body, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxFrameSize {
+		return nil, fmt.Errorf("frame too large: %d bytes", len(body))
+	}
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
+	copy(frame[4:], body)
+	return frame, nil
+}
+
+func writeFrame(w io.Writer, env Envelope) error {
+	frame, err := encodeFrame(env)
 	if err != nil {
 		return err
 	}
-	if len(body) > maxFrameSize {
-		return fmt.Errorf("frame too large: %d bytes", len(body))
-	}
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if _, err := w.Write(frame[:4]); err != nil {
 		return err
 	}
-	_, err = w.Write(body)
+	_, err = w.Write(frame[4:])
+	return err
+}
+
+// writeFrameFiles writes env with files' descriptors attached, which the
+// kernel delivers with the frame's first byte. env.FDPaths must name the
+// files in order. A connection that cannot carry descriptors (not a Unix
+// socket) gets the frame without them, and the worker opens the paths.
+func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
+	uc, ok := w.(*net.UnixConn)
+	if len(files) == 0 || !ok {
+		env.FDPaths = nil
+		return writeFrame(w, env)
+	}
+	if len(files) != len(env.FDPaths) || len(files) > maxFrameFiles {
+		return fmt.Errorf("frame names %d paths for %d descriptors", len(env.FDPaths), len(files))
+	}
+	frame, err := encodeFrame(env)
+	if err != nil {
+		return err
+	}
+	fds := make([]int, len(files))
+	for i, f := range files {
+		fds[i] = int(f.Fd())
+	}
+	n, _, err := uc.WriteMsgUnix(frame, syscall.UnixRights(fds...), nil)
+	if err != nil {
+		return err
+	}
+	if n < len(frame) {
+		_, err = uc.Write(frame[n:])
+	}
 	return err
 }
 
 func readFrame(r io.Reader) (Envelope, error) {
+	env, files, err := readFrameFiles(r)
+	closeFiles(files)
+	return env, err
+}
+
+// readFrameFiles reads one frame and the descriptors that came with it,
+// named by env.FDPaths. Descriptors that do not match the names one for
+// one (a truncated control message, a sender bug) are all closed: the
+// worker then opens the paths itself, as it would for an older sandboxd.
+func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
+	uc, ok := r.(*net.UnixConn)
+	if !ok {
+		return readFrameFrom(r.Read, nil)
+	}
+	var fds []int
+	truncated := false
+	oob := make([]byte, syscall.CmsgSpace(maxFrameFiles*4))
+	read := func(b []byte) (int, error) {
+		n, oobn, flags, _, err := uc.ReadMsgUnix(b, oob)
+		if oobn > 0 {
+			got, perr := parseRights(oob[:oobn])
+			fds = append(fds, got...)
+			truncated = truncated || perr != nil
+		}
+		truncated = truncated || flags&syscall.MSG_CTRUNC != 0
+		return n, err
+	}
+	env, files, err := readFrameFrom(read, func() []int { return fds })
+	if err != nil {
+		closeFiles(files)
+		return env, nil, err
+	}
+	if truncated || len(files) != len(env.FDPaths) {
+		closeFiles(files)
+		return env, nil, nil
+	}
+	return env, files, nil
+}
+
+func readFrameFrom(read func([]byte) (int, error), received func() []int) (Envelope, []*os.File, error) {
+	var files []*os.File
+	collect := func() {
+		if received == nil {
+			return
+		}
+		for _, fd := range received()[len(files):] {
+			files = append(files, os.NewFile(uintptr(fd), "granted"))
+		}
+	}
+	readFull := func(buf []byte, first bool) error {
+		got := 0
+		for got < len(buf) {
+			n, err := read(buf[got:])
+			got += n
+			collect()
+			if err == nil && n == 0 {
+				err = io.EOF
+			}
+			if err != nil {
+				if got >= len(buf) {
+					return nil
+				}
+				// As io.ReadFull reports it: EOF before a frame, a short
+				// frame after its start.
+				if errors.Is(err, io.EOF) {
+					if got > 0 || !first {
+						return io.ErrUnexpectedEOF
+					}
+					return io.EOF
+				}
+				return err
+			}
+		}
+		return nil
+	}
 	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return Envelope{}, err
+	if err := readFull(hdr[:], true); err != nil {
+		return Envelope{}, files, err
 	}
 	size := binary.BigEndian.Uint32(hdr[:])
 	if size == 0 || size > maxFrameSize {
-		return Envelope{}, fmt.Errorf("invalid frame size %d", size)
+		return Envelope{}, files, fmt.Errorf("invalid frame size %d", size)
 	}
 	body := make([]byte, size)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return Envelope{}, err
+	if err := readFull(body, false); err != nil {
+		return Envelope{}, files, err
 	}
 	var env Envelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return Envelope{}, err
+		return Envelope{}, files, err
+	}
+	return env, files, nil
+}
+
+// parseRights takes the descriptors out of a control message.
+func parseRights(oob []byte) ([]int, error) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil, err
+	}
+	var fds []int
+	for i := range msgs {
+		got, err := syscall.ParseUnixRights(&msgs[i])
+		if err != nil {
+			return fds, err
+		}
+		fds = append(fds, got...)
+	}
+	return fds, nil
+}
+
+func closeFiles(files []*os.File) {
+	for _, f := range files {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
+}
+
+// readGrantedFrame reads a frame and records the descriptors it carries
+// as grants (wasmengine.GrantHostPath), so the engine reaches those paths
+// through them. A module belongs to the worker; everything else to the
+// sandbox the message names, whose stop releases it in a resident host.
+func readGrantedFrame(conn net.Conn) (Envelope, error) {
+	env, files, err := readFrameFiles(conn)
+	if err != nil {
+		return env, err
+	}
+	scope := env.SandboxID
+	if env.Type == MsgLoadModule {
+		scope = ""
+	}
+	for i, f := range files {
+		wasmengine.GrantHostPath(scope, env.FDPaths[i], f)
 	}
 	return env, nil
 }

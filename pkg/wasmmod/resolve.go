@@ -181,7 +181,11 @@ func (r *ModuleResolver) ResolveWithAuth(ctx context.Context, ref string, authOv
 	// 1. Reserved keyword (exact, case-insensitive, no scheme/slash).
 	if !strings.Contains(ref, "/") && !strings.Contains(ref, "://") {
 		if filename, ok := r.Reserved[strings.ToLower(ref)]; ok {
-			return r.file.Resolve(ctx, filename)
+			resolved, err := r.file.Resolve(ctx, filename)
+			if err == nil {
+				resolved.Operator = r.inModulesDir(resolved.Path)
+			}
+			return resolved, err
 		}
 	}
 
@@ -220,7 +224,22 @@ func (r *ModuleResolver) ResolveWithAuth(ctx context.Context, ref string, authOv
 		}
 		return nil, err
 	}
+	// Only a host-capable caller gets here, and a file in the modules dir
+	// (outside the pull cache) is one the operator staged.
+	resolved.Operator = r.inModulesDir(resolved.Path)
 	return resolved, nil
+}
+
+// inModulesDir reports whether path is a file the operator staged: one
+// directly in the modules dir. Its subfolders hold what others wrote: the
+// pull cache, and each sandbox's checkpoint (ModulesDir/<id>/mem.snap),
+// whose bytes come from the sandbox's worker.
+func (r *ModuleResolver) inModulesDir(path string) bool {
+	if r == nil || r.file == nil || r.file.ModulesDir == "" || path == "" {
+		return false
+	}
+	dir := filepath.Clean(r.file.ModulesDir)
+	return filepath.Dir(filepath.Clean(path)) == dir && (r.CacheDir == "" || filepath.Clean(r.CacheDir) != dir)
 }
 
 // resolveOCI enforces the allowlist, resolves the manifest digest with the

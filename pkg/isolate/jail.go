@@ -63,20 +63,6 @@ const (
 	SeccompOff     = "off"
 )
 
-// SeccompArgMask is one argument test: (args[Arg] & Mask) != 0.
-type SeccompArgMask struct {
-	Arg  int
-	Mask uint32
-}
-
-// SeccompArgRule denies Syscall when every mask in DenyIfAll is non-zero on
-// the call's arguments and allows it otherwise. It is how --jitless keeps
-// mprotect (the loader's RELRO needs it) while refusing PROT_EXEC flips.
-type SeccompArgRule struct {
-	Syscall   string
-	DenyIfAll []SeccompArgMask
-}
-
 // JailRealizable is the exported platform-capability check the daemon logs at
 // boot so operators can see whether SB_ISOLATE_USE_JAIL can actually be honored
 // on this host (Linux) or whether isolate creates will fail closed until it is

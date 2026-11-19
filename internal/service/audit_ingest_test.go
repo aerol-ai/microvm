@@ -259,9 +259,14 @@ func TestAuditIngestServerLifecycleAndScopedRequest(t *testing.T) {
 	if n, err := strconv.Atoi(port); err != nil || n <= 0 {
 		t.Fatalf("published ingest port = %q, want non-zero integer", port)
 	}
-	wantSpill := filepath.Join(filepath.Dir(dbPath), "audit")
+	// Workers spill into a folder of their own inside the audit directory,
+	// never into the audit directory itself.
+	wantSpill := filepath.Join(filepath.Dir(dbPath), "audit", auditlog.WorkerSpillDirName)
 	if got := os.Getenv("SB_AUDIT_SPILL_DIR"); got != wantSpill {
 		t.Fatalf("published spill dir = %q, want %q", got, wantSpill)
+	}
+	if st, err := os.Stat(wantSpill); err != nil || !st.IsDir() || st.Mode().Perm() != 0o700 {
+		t.Fatalf("worker spill folder = %v, %v; want a 0700 folder", st, err)
 	}
 	if got := svc.auditIngestToken(); got != "lifecycle-master-key" {
 		t.Fatalf("auditIngestToken = %q", got)

@@ -71,4 +71,11 @@ type Envelope struct {
 	// stdin frames carry the bytes themselves as Payload, not a JSON
 	// document, so output that is not UTF-8 arrives unchanged.
 	Stream uint8 `json:"stream,omitempty"`
+	// FDPaths names, in order, the host paths whose open descriptors ride
+	// this frame (SCM_RIGHTS): sandboxd opened them as root so a worker
+	// that dropped its privileges can still use exactly those
+	// (wasmengine.GrantHostPath). A worker from before descriptors ignores
+	// the field and the descriptors, and opens the paths in the payload
+	// itself, as it always did.
+	FDPaths []string `json:"fd_paths,omitempty"`
 }

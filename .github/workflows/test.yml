@@ -273,6 +273,19 @@ jobs:
           scripts/go-test-split.sh -count=1 -timeout 20m -- $PACKAGES
           go tool cover -func=coverage.out | tail -n 1
 
+      # The confined WASM worker end to end (worker uid, no_new_privs, the
+      # seccomp filter, its own PID namespace) and the worker fence (an
+      # nftables table: the worker uid cannot reach loopback or metadata)
+      # need root, which the run above does not have: run those two tests
+      # under sudo, so the x86-64 filter and the fence run somewhere.
+      # Advisory, not a gate.
+      - name: Confined WASM worker as root (advisory)
+        if: matrix.group == 'rest'
+        continue-on-error: true
+        run: |
+          sudo env "PATH=$PATH" "GOMODCACHE=$(go env GOMODCACHE)" GOCACHE=/tmp/root-go-build \
+            go test -count=1 -run '^(TestConfinedWorkerEndToEnd|TestWorkerFenceBlocksConfinedWorker)$' -v ./pkg/wasm/worker
+
       - name: Upload coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

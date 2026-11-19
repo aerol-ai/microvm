@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -19,6 +20,10 @@ type SupervisorSpawner struct {
 	Supervisor *worker.Supervisor
 	PingWait   time.Duration
 	MemoryMB   int
+	// CompileCache, when set, names the compile cache for the worker of the
+	// slot whose folder it is given (the WASM driver's SlotCompileCache).
+	// Without one the worker compiles every module from scratch.
+	CompileCache func(slotDir string) string
 }
 
 // NewSupervisorSpawner constructs a spawner backed by worker.Supervisor.
@@ -36,6 +41,11 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 	}
 	if memoryMB <= 0 {
 		memoryMB = s.MemoryMB
+	}
+	if s.CompileCache != nil {
+		if dir := s.CompileCache(filepath.Dir(socketPath)); dir != "" {
+			ctx = worker.WithCompileCache(ctx, dir)
+		}
 	}
 	if err := s.Supervisor.Ensure(ctx, slotID, socketPath); err != nil {
 		return fmt.Errorf("ensure worker: %w", err)

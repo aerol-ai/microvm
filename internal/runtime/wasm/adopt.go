@@ -494,6 +494,8 @@ func (d *Driver) AdoptSandbox(ctx context.Context, sb *models.Sandbox, hostMount
 	workDir := d.sandboxDir(sb.ID)
 	inst := &sandboxInstance{
 		sandboxID:          sb.ID,
+		ownerRef:           sb.OwnerRef,
+		legacyRoot:         d.legacyRoot(sb.ID, hostMounts),
 		moduleRef:          firstNonEmpty(rec.ModuleRef, sb.ModuleRef, sb.Image),
 		modulePath:         modulePath,
 		moduleSize:         moduleSize,
@@ -763,7 +765,7 @@ func (d *Driver) RestoreSandbox(ctx context.Context, sb *models.Sandbox, hostMou
 		return nil, fmt.Errorf("restore: nil sandbox")
 	}
 	public := sb.AllowPublicTraffic != nil && *sb.AllowPublicTraffic
-	if !d.residentHostEnabled() || public || len(sb.ExposedPorts) > 0 || d.resolver == nil {
+	if !d.residentHostEnabled() || public || len(sb.ExposedPorts) > 0 || d.resolver == nil || d.legacyRoot(sb.ID, hostMounts) {
 		return d.StartSandbox(ctx, sb, hostMounts)
 	}
 	ref := firstNonEmpty(strings.TrimSpace(sb.ModuleRef), strings.TrimSpace(sb.Image))

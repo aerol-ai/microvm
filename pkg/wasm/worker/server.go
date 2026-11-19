@@ -251,7 +251,7 @@ func (s *Server) Serve(conn net.Conn) error {
 	}
 
 	for {
-		env, err := readFrame(conn)
+		env, err := readGrantedFrame(conn)
 		if err != nil {
 			return err
 		}
@@ -521,7 +521,10 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			capture.Config = p.Meta
-			if err := wasmengine.WriteSnapshotDir(p.OutDir, capture); err != nil {
+			// Through the directory sandboxd granted for the checkpoint.
+			if err := wasmengine.WithHostPath(p.OutDir, func(out string) error {
+				return wasmengine.WriteSnapshotDir(out, capture)
+			}); err != nil {
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}
@@ -788,13 +791,5 @@ func ServeSocketPath(socketPath string) error {
 	defer ln.Close()
 	srv := &Server{}
 	defer srv.close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go func(c net.Conn) {
-			_ = srv.Serve(c)
-		}(conn)
-	}
+	return serveListener(ln, srv)
 }

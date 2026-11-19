@@ -86,7 +86,7 @@ func TestWorkerNodeAllowedPorts(t *testing.T) {
 	if got := egresspolicy.NodeAllowedPorts(); !slices.Equal(got, []uint16{80, 443}) {
 		t.Fatalf("allowed ports = %v", got)
 	}
-	if !slices.ContainsFunc(workerEnvironment(), func(e string) bool { return strings.HasPrefix(e, egresspolicy.NodePortsEnv+"=") }) {
+	if !slices.ContainsFunc(workerEnvironment(nil), func(e string) bool { return strings.HasPrefix(e, egresspolicy.NodePortsEnv+"=") }) {
 		t.Fatal("the worker environment must carry the node ports")
 	}
 	t.Setenv(egresspolicy.NodePortsEnv, "")
@@ -107,7 +107,7 @@ func TestWorkerEgressRanges(t *testing.T) {
 	t.Setenv(egresspolicy.DenyFloorEnv, "10.96.0.1")
 	t.Setenv(egresspolicy.PrivateRangesEnv, "198.18.0.0/15")
 	t.Setenv(egresspolicy.BlockPrivateEnv, "true")
-	env := workerEnvironment()
+	env := workerEnvironment(nil)
 	for _, name := range []string{egresspolicy.DenyFloorEnv, egresspolicy.PrivateRangesEnv, egresspolicy.BlockPrivateEnv} {
 		if !slices.ContainsFunc(env, func(e string) bool { return strings.HasPrefix(e, name+"=") }) {
 			t.Fatalf("the worker environment must carry %s", name)
@@ -192,6 +192,7 @@ func firstLocalIPv4() (netip.Addr, bool) {
 func TestWorkerFloorFile(t *testing.T) {
 	prevFloor, prevPrivate, prevFile := egresspolicy.ExtraDenyFloor(), egresspolicy.ExtraPrivateRanges(), egresspolicy.FileFloor()
 	t.Cleanup(func() { egresspolicy.SetRanges(prevFloor, prevPrivate); egresspolicy.SetFileFloor(prevFile) })
+	t.Cleanup(stopWorkerFloorWatch)
 	prevPoll := operatorPoll
 	operatorPoll = 5 * time.Millisecond
 	t.Cleanup(func() { operatorPoll = prevPoll })
@@ -202,7 +203,7 @@ func TestWorkerFloorFile(t *testing.T) {
 	t.Setenv(egresspolicy.DenyFloorEnv, "")
 	t.Setenv(egresspolicy.PrivateRangesEnv, "")
 	t.Setenv(egresspolicy.FloorFileEnv, path)
-	if !slices.Contains(workerEnvironment(), egresspolicy.FloorFileEnv+"="+path) {
+	if !slices.Contains(workerEnvironment(nil), egresspolicy.FloorFileEnv+"="+path) {
 		t.Fatal("the worker environment must carry the floor file")
 	}
 	if err := loadWorkerGuards(); err != nil {
