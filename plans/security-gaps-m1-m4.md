@@ -339,6 +339,28 @@ allowlist (eng review D6).
   builds every spec shape the agent makes and checks the gate accepts it.
   Another mutates each field and checks the gate refuses it.
 - Namespaces: only AerolVM's containerd namespace, and no default labels.
+- **What building the gate taught us (T1, 2026-11-20).**
+  - **Root-read paths live in root's folders.** Host files the spec binds
+    in (hosts, resolv.conf), ready sockets, stdio FIFOs, the moves folder
+    and the runsc config files are opened later by runc, runsc or the
+    shim, as root. If they sat in a folder the agent can write, a broken
+    agent could swap one for a symlink between the check and the open;
+    a swapped runsc config names the binary runsc runs as root. So the
+    helper creates these files in folders only root can write, and the
+    agent only reads or opens them (FIFOs: helper-made, mode 0660 to the
+    agent's group). This is part of T2.
+  - **Pulls run in the agent.** containerd's Go client pulls by writing
+    content, preparing and committing snapshots and calling Diff.Apply,
+    not through the transfer service; the gate checks those writes.
+  - **Exec and Checkpoint are refused at the gate.** Exec goes through
+    toolboxd inside the sandbox; gVisor checkpoint runs `runsc` directly
+    and becomes the helper's `Checkpoint` call.
+  - **Seccomp is compared exactly** with containerd's default profile.
+    The helper ships with each release (D4), so its containerd library
+    matches the agent's.
+  - The allowlist is 41 methods (listed in the gate's code with a reason
+    each); Diff.Diff, Tasks.Update device rules, the restart monitor's
+    log URI and stdio URIs are checked too.
 - **Containerd upgrades.** A test pins the fields of each allowed request
   message, so a containerd bump that adds one fails the build until the gate
   decides about it. At run time, an unknown non-empty field is refused.
