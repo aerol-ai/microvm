@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 12 releases : v0.6.9 to v0.7.6
+    November 2026 : 13 releases : v0.6.9 to v0.7.7
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.7](#07-release-line) | 7 | Nov 10, 2026 to Nov 16, 2026 | [v0.7.6](#v076-a-code-interpreter-and-a-full-toolbox-for-wasm-sandboxes) |
+| [0.7](#07-release-line) | 8 | Nov 10, 2026 to Nov 19, 2026 | [v0.7.7](#v077-one-click-eks-enterprise-mode-on-kubernetes-and-cluster-nodes-with-only-the-access-their-role-needs) |
 | [0.6](#06-release-line) | 14 | Sep 28, 2026 to Nov 9, 2026 | [v0.6.13](#v0613-cluster-writes-that-never-hang-creates-right-after-a-leader-change-and-a-mirror-fallback-for-terraform-nodes) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
@@ -28,6 +28,36 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.7 release line
+
+### v0.7.7: one-click EKS, enterprise mode on Kubernetes, and cluster nodes with only the access their role needs
+
+*November 19, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.7.7)
+
+This release gives each cluster node only the access its role needs, and gets AerolVM on Kubernetes ready for a locked-down install: a one-click EKS stack, enterprise mode on Kubernetes, API tokens on every node, and image-pull and SLO alerts tested on EKS.
+
+> **Read the upgrade notes before you upgrade a cluster.** Upgrade servers first. After the upgrade finalizes, servers take over token signing, and you can't roll back to an older release after that.
+
+- **One-click EKS.** A Launch Stack button builds a new EKS cluster with AerolVM installed and checked, in about 25 minutes. Deleting the stack removes everything. See [One-click EKS](https://microvm.aerol.ai/kubernetes/eks/).
+- **Cluster nodes get only what their role needs.** A worker's or gateway's node certificate now reaches only the calls nodes make to each other, plus a short list of reads. A change a node proposes to the cluster is tied to that node. After the upgrade finalizes, only servers sign sandbox tokens and cloud-identity tokens and make platform-volume records. Workers and gateways check tokens with public keys.
+- **Enterprise mode starts on Kubernetes.** `enterprise.enabled` now works on every server, gateway and worker. The admin token works only on a loopback listener inside each pod, audit records go to an S3 Object Lock witness and an off-node export, and the operator uses an API token of its own. The bank preset turns it on.
+- **API tokens on every Kubernetes node.** API tokens, their maximum lifetime, the SSO identity file and enterprise mode are now chart settings that reach servers, gateways and workers. Cluster monitoring scrapes with a read-only token you name.
+- **Image digests are enforced.** A create that names an image digest now downloads exactly that image, and fails if the registry sends anything else. A tag pattern in the create policy no longer approves an image named by digest.
+- **Short-lived registry problems answer 503.** When an image pull hits a rate limit, a timeout, a registry 5xx or a refused connection, the create now answers `503` with `Retry-After`, so clients retry. A missing tag, refused credentials or a wrong platform still answer `400`.
+- **The image-pull and SLO alerts work on Kubernetes.** containerd now reports image pulls, servers and gateways no longer hide a full worker tier, and the route-lag alert clears once a gateway catches up. All 7 alerts were tested on kind and on EKS. The steps to clear them are in `setup/runbooks/image-pull-storm.md` and `setup/runbooks/slo-breach.md`.
+
+**Before you upgrade:**
+
+- **Upgrade servers first, then every gateway and worker.** Until every node runs v0.7.7, some calls through an older node answer `403`. Send those to a server.
+- **No rollback after the signing switch.** Two minutes after the upgrade finalizes, servers sign every new token, and an older release can't check them. Fix forward. Tokens made before the switch work until they expire (at most `SB_SANDBOX_TOKEN_MAX_TTL`, 24 h by default). To end them at once, run `aerolvm upgrade signing end-old-tokens`. Clusters whose node certificates name no role (made with `cluster-sign-node.sh`) keep the old signing.
+- **Helm: move `worker.extraEnv.SB_IDENTITY_ISSUER_URL` to `cloudIdentity.issuerURL`.** In cluster mode, `helm upgrade` refuses to render with the old setting.
+- **Servers need the `SB_PLATFORM_VOLUMES_*` settings.** Only servers make platform-volume records now, so give servers the same `SB_PLATFORM_VOLUMES_*` settings as workers. The chart passes them on from `worker.extraEnv`.
+- **Helm: cluster monitoring needs a scrape token.** A cluster install with `monitoring.enabled` and no `monitoring.scrapeToken.existingSecret` now fails `helm upgrade`, and the message gives the steps. It scraped nothing before.
+- **The edge no longer exposes port 80.** Point clients and health checks at HTTPS on 443.
+- **Retry a `503` from create.** A client that treated every failed create as final should retry a `503` after its `Retry-After`.
+- **Sandboxes with host-only settings stay on their node.** A sandbox with a raw mount, a WASM module from a host path or a `file://` bundle, and `failover.policy = "recreate"`, now waits for its node to come back instead of being rebuilt on another node. Platform volumes still move with the sandbox.
+- **Enterprise mode on Kubernetes: turn it on in an upgrade of its own,** after the version upgrade, then replace the pods (gateways one at a time). The admin token then works only on `127.0.0.1:21219` inside each pod, so sign in as admin through `kubectl port-forward`.
+- **New chart settings reach only new pods.** After you change API token or enterprise settings, replace the running pods (gateways one at a time).
+- **Single nodes:** nothing else to do.
 
 ### v0.7.6: a code interpreter, and a full toolbox for WASM sandboxes
 
