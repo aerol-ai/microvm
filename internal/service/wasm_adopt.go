@@ -131,7 +131,7 @@ func (s *Service) adoptWasmSandbox(ctx context.Context, adopter wasmAdopter, sb 
 		s.logger.Warn("wasm adopt: mounts not readable; sandbox left to reconcile", "sandbox_id", sb.ID, "error", err)
 		return wasmSkipped
 	} else if len(specs) > 0 && s.mounts != nil {
-		if err := s.mounts.Reestablish(ctx, sb.ID, specs); err != nil {
+		if err := s.reestablishMounts(ctx, sb.ID, specs); err != nil {
 			s.logger.Warn("wasm adopt: mounts not re-established; sandbox left to reconcile", "sandbox_id", sb.ID, "error", err)
 			return wasmSkipped
 		}

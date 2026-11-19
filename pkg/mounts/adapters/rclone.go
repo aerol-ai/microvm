@@ -8,9 +8,11 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// Rclone mounts any rclone-supported remote using the user-supplied
-// rclone.conf as a credentials file. The config is unlinked after the mount
-// becomes ready; rclone keeps it in memory.
+// Rclone mounts an rclone remote using the user-supplied rclone.conf as a
+// credentials file. The config is unlinked after the mount becomes ready;
+// rclone keeps it in memory. Which backends and backend options the source
+// and the config may use is the allow list in MountSpec.ValidateToolOptions,
+// enforced before any mount runs.
 type Rclone struct{}
 
 func (Rclone) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (Plan, error) {
