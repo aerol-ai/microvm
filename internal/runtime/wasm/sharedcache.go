@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,11 @@ import (
 
 // sharedCacheName is the shared cache's folder under the cache root.
 const sharedCacheName = "shared"
+
+// sharedStageName is where each trusted compile writes before its entries
+// join the shared cache: under the cache root, root's (0700), so on the
+// shared cache's device and out of every worker's reach.
+const sharedStageName = ".shared-stage"
 
 // sharedCompileTimeout bounds one trusted compile.
 const sharedCompileTimeout = 10 * time.Minute
@@ -88,20 +94,7 @@ func (d *Driver) runSharedCompile(st *sharedCompile, resolved *wasmmod.ResolvedM
 	defer close(st.done)
 	ctx, cancel := context.WithTimeout(context.Background(), sharedCompileTimeout)
 	defer cancel()
-	// One compile at a time: sealing reads the whole folder.
-	d.precompileMu.Lock()
-	defer d.precompileMu.Unlock()
-	dir := d.sharedCacheDir()
-	err := os.MkdirAll(dir, 0o700)
-	if err == nil {
-		err = os.Chmod(dir, 0o700)
-	}
-	if err == nil {
-		err = d.precompile(ctx, dir, resolved.Path)
-	}
-	if serr := sealShared(dir); err == nil {
-		err = serr
-	}
+	err := d.compileShared(ctx, resolved.Path)
 	st.err = err
 	if err != nil {
 		// Let a later create try again.
@@ -114,11 +107,75 @@ func (d *Driver) runSharedCompile(st *sharedCompile, resolved *wasmmod.ResolvedM
 	}
 }
 
-// sealShared makes the shared cache read-only to everyone but root. wazero
-// keeps its entries in a folder per version ("wazero-<version>-<arch>-<os>")
-// under the cache folder: those folders become 0700, their entries 0444,
-// and anything an interrupted compile left is removed. A worker only ever
-// sees sealed entries (linkShared runs after).
+// compileShared compiles one module into a staging folder of its own,
+// seals it there and moves its entries into the shared cache. Each compile
+// has its own folder, so different modules compile at the same time (a
+// first create of one never waits on another's compile) and sealing one
+// never sees another's half-written files. A rename is atomic, so linkShared
+// only ever finds whole, sealed entries.
+func (d *Driver) compileShared(ctx context.Context, modulePath string) error {
+	shared := d.sharedCacheDir()
+	stageRoot := filepath.Join(d.cfg.CompileCacheDir, sharedStageName)
+	d.stageSweep.Do(func() { _ = os.RemoveAll(stageRoot) })
+	for _, dir := range []string{shared, stageRoot} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	stage, err := os.MkdirTemp(stageRoot, "c-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	if err := d.precompile(ctx, stage, modulePath); err != nil {
+		return err
+	}
+	if err := sealShared(stage); err != nil {
+		return err
+	}
+	return publishShared(stage, shared)
+}
+
+// publishShared moves each sealed entry of stage into the same version
+// folder of shared. An entry that is there already (the same bytes compiled
+// for another module name) is replaced by an identical one; links a worker
+// cache already holds keep the old inode.
+func publishShared(stage, shared string) error {
+	versions, err := os.ReadDir(stage)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, v := range versions {
+		if !v.IsDir() {
+			continue
+		}
+		dst := filepath.Join(shared, v.Name())
+		if err := os.Mkdir(dst, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			errs = append(errs, err)
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(stage, v.Name()))
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, e := range entries {
+			errs = append(errs, os.Rename(filepath.Join(stage, v.Name(), e.Name()), filepath.Join(dst, e.Name())))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sealShared makes a compile's staging folder read-only to everyone but
+// root before its entries join the shared cache. wazero keeps its entries
+// in a folder per version ("wazero-<version>-<arch>-<os>") under the cache
+// folder: those folders become 0700, their entries 0444, and anything an
+// interrupted write left is removed. A worker only ever sees sealed
+// entries (publishShared moves them in whole, linkShared runs after).
 func sealShared(dir string) error {
 	versions, err := os.ReadDir(dir)
 	if err != nil {

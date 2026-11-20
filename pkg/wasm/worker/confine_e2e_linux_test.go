@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,8 +74,8 @@ func TestConfinedConnectChild(t *testing.T) {
 // TestWorkerFenceBlocksConfinedWorker installs the WASM worker fence
 // (internal/network/workerfence) for the worker uid and checks it in the
 // kernel: a confined worker cannot connect to a service on 127.0.0.1, nor
-// to one on the metadata address, that root connects to, and still reaches
-// a listener on the guest listen address, where its own guests listen. The
+// to one on the metadata address, nor to one on the guest listen address,
+// that root connects to: it opens no connection on loopback at all. The
 // fence drops the worker's SYN, so its connect times out (TCP retransmits a
 // dropped SYN rather than failing it); root's, to the same listener, gets
 // through at once.
@@ -87,17 +86,7 @@ func TestWorkerFenceBlocksConfinedWorker(t *testing.T) {
 	if !canMakePIDNamespace() {
 		t.Skip("needs a host (or privileged container) that allows new PID namespaces, as sandboxd's does")
 	}
-	be := workerfence.NewBackend()
-	rules, err := workerfence.Plan(workerfence.Spec{UID: e2eWorkerUID, Allow: []workerfence.Allow{{
-		Proto: "tcp", Prefix: netip.MustParsePrefix(workerfence.GuestListenHost + "/32"), PortLo: 1024, PortHi: 65535, Why: "guest listeners",
-	}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := be.Apply(rules); err != nil {
-		t.Fatalf("install the fence (needs nf_tables and CAP_NET_ADMIN, as sandboxd has): %v", err)
-	}
-	t.Cleanup(func() { _ = be.Remove() })
+	be, rules := installFence(t)
 	if in, err := be.Check(rules); err != nil || !in {
 		t.Fatalf("fence not in the kernel after Apply: %v %v", in, err)
 	}
@@ -163,7 +152,7 @@ func TestWorkerFenceBlocksConfinedWorker(t *testing.T) {
 		addr, result, _ := strings.Cut(line, " ")
 		got[addr] = result
 	}
-	for addr, want := range map[string]string{admin: "i/o timeout", metadata: "i/o timeout", guest: "ok"} {
+	for addr, want := range map[string]string{admin: "i/o timeout", metadata: "i/o timeout", guest: "i/o timeout"} {
 		if !strings.Contains(got[addr], want) {
 			t.Errorf("confined worker dial %s = %q, want %q (all: %s)", addr, got[addr], want, out)
 		}

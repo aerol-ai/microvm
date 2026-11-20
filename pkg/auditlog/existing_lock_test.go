@@ -1,6 +1,7 @@
 package auditlog
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,6 +30,24 @@ func TestWithExistingFileLock(t *testing.T) {
 	}
 	if ok, err := WithExistingFileLock(lock, fn); !ok || err != nil || ran != 1 {
 		t.Fatalf("existing lock = %v, %v (ran %d)", ok, err, ran)
+	}
+	// Held by someone else (a worker): never waited for.
+	holder, err := os.OpenFile(lock, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := lockExclusive(holder); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := WithExistingFileLock(lock, fn); ok || !errors.Is(err, ErrLockBusy) || ran != 1 {
+		t.Fatalf("held lock = %v, %v (ran %d)", ok, err, ran)
+	}
+	if err := unlock(holder); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := WithExistingFileLock(lock, fn); !ok || err != nil || ran != 2 {
+		t.Fatalf("released lock = %v, %v (ran %d)", ok, err, ran)
 	}
 	link := filepath.Join(dir, "link.lock")
 	if err := os.Symlink(lock, link); err != nil {

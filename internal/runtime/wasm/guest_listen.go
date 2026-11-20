@@ -134,6 +134,21 @@ type guestListenState struct {
 	engine string
 }
 
+// listenerPorts are the host ports of every listener st knows: the only
+// ones sandboxd connects to for this sandbox.
+func (st guestListenState) listenerPorts() []int {
+	out := make([]int, 0, len(st.ports)+1)
+	if st.primary > 0 {
+		out = append(out, st.primary)
+	}
+	for _, p := range st.ports {
+		if p > 0 {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (inst *sandboxInstance) guestListen() guestListenState {
 	inst.listenMu.Lock()
 	defer inst.listenMu.Unlock()

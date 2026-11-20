@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"syscall"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -240,18 +241,78 @@ func (d *Driver) compileCacheNamed(name string) string {
 	return d.prepareCompileCache(filepath.Join(d.cfg.CompileCacheDir, "owners", name))
 }
 
-// SlotCompileCache is the compile cache of a warm-pool slot's worker: a
-// folder of its own inside the slot's folder, so it goes when the slot
-// does (the pool and Destroy remove that folder). A slot is warmed before
-// any create takes it, so it cannot have its owner's cache, and a cache
-// that slots shared would let the tenant who takes one plant compiled code
-// the tenant who takes the next one loads. Operator modules are still a
-// cache read: the shared cache's entries are linked in.
+// SlotCompileCache is the compile cache of a warm-pool slot's worker. A
+// slot is warmed before any create takes it, so it cannot have its owner's
+// cache, and a cache that slots shared would let the tenant who takes one
+// plant compiled code the tenant who takes the next one loads: each slot
+// gets one of its own. Operator modules are still a cache read: the shared
+// cache's entries are linked in.
+//
+// It lives under the cache root, not in the slot's folder: the run dir,
+// where slots live, is usually another device (a tmpfs), and a hard link
+// to a shared entry cannot cross devices (EXDEV), so a slot's worker would
+// compile every operator module again into memory. A cache whose slot
+// folder is gone (the slot was taken and its sandbox destroyed, or
+// dropped) is removed by a later call (sweepSlotCaches); this runs when
+// the pool refills, never on a create.
 func (d *Driver) SlotCompileCache(slotDir string) string {
 	if d.cfg.CompileCacheDir == "" || slotDir == "" {
 		return ""
 	}
-	return d.prepareCompileCache(filepath.Join(slotDir, "cache"))
+	d.sweepSlotCaches()
+	home := filepath.Join(d.cfg.CompileCacheDir, slotCachesName, shortHash(slotDir))
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		d.logger.Warn("wasm slot compile cache not created; the slot compiles without it", "dir", home, "error", err)
+		return ""
+	}
+	if err := os.WriteFile(filepath.Join(home, slotCacheOwnerFile), []byte(slotDir), 0o600); err != nil {
+		d.logger.Warn("wasm slot compile cache not created; the slot compiles without it", "dir", home, "error", err)
+		return ""
+	}
+	return d.prepareCompileCache(filepath.Join(home, "cache"))
+}
+
+// The slot caches live in slotCachesName under the cache root, one folder
+// (root's) per slot holding the worker's "cache" and slotCacheOwnerFile,
+// which names the slot's folder.
+const (
+	slotCachesName     = "slots"
+	slotCacheOwnerFile = "slot"
+	// slotCacheSweepEvery paces sweepSlotCaches.
+	slotCacheSweepEvery = time.Minute
+	// slotCacheOrphanAge is how old a slot cache with no owner file (a
+	// crash between its two writes) must be before a sweep removes it.
+	slotCacheOrphanAge = time.Hour
+)
+
+// sweepSlotCaches removes the caches of slots whose folder is gone, at most
+// once per slotCacheSweepEvery.
+func (d *Driver) sweepSlotCaches() {
+	d.slotSweepMu.Lock()
+	if !d.slotSweepAt.IsZero() && time.Since(d.slotSweepAt) < slotCacheSweepEvery {
+		d.slotSweepMu.Unlock()
+		return
+	}
+	d.slotSweepAt = time.Now()
+	d.slotSweepMu.Unlock()
+	root := filepath.Join(d.cfg.CompileCacheDir, slotCachesName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		home := filepath.Join(root, e.Name())
+		raw, err := os.ReadFile(filepath.Join(home, slotCacheOwnerFile))
+		if err != nil {
+			if info, ierr := e.Info(); ierr == nil && time.Since(info.ModTime()) > slotCacheOrphanAge {
+				_ = os.RemoveAll(home)
+			}
+			continue
+		}
+		if _, err := os.Lstat(string(raw)); errors.Is(err, fs.ErrNotExist) {
+			_ = os.RemoveAll(home)
+		}
+	}
 }
 
 // prepareCompileCache makes dir (whose parent is root's) for the worker uid

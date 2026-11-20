@@ -181,7 +181,7 @@ func TestReadGrantedFrame(t *testing.T) {
 	go func() {
 		_ = writeGranted(client, Envelope{Type: MsgLoadModule, SandboxID: "sb-g"}, []string{module})
 	}()
-	env, err := readGrantedFrame(server)
+	env, _, err := readGrantedFrame(server)
 	if err != nil || env.Type != MsgLoadModule {
 		t.Fatalf("frame = %+v, %v", env, err)
 	}
@@ -199,7 +199,7 @@ func TestReadGrantedFrame(t *testing.T) {
 		t.Fatal("released grant still read")
 	}
 	_ = client.Close()
-	if _, err := readGrantedFrame(server); err == nil {
+	if _, _, err := readGrantedFrame(server); err == nil {
 		t.Fatal("closed socket read")
 	}
 }

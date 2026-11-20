@@ -66,7 +66,11 @@ func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
 	}
 	fds := make([]int, len(files))
 	for i, f := range files {
-		fds[i] = int(f.Fd())
+		fd, err := rawFD(f)
+		if err != nil {
+			return err
+		}
+		fds[i] = fd
 	}
 	n, _, err := uc.WriteMsgUnix(frame, syscall.UnixRights(fds...), nil)
 	if err != nil {
@@ -202,10 +206,15 @@ func closeFiles(files []*os.File) {
 // as grants (wasmengine.GrantHostPath), so the engine reaches those paths
 // through them. A module belongs to the worker; everything else to the
 // sandbox the message names, whose stop releases it in a resident host.
-func readGrantedFrame(conn net.Conn) (Envelope, error) {
+// A proxy_http carries a connected socket instead (guest_conn.go): that is
+// returned to the caller, never granted as a path.
+func readGrantedFrame(conn net.Conn) (Envelope, []*os.File, error) {
 	env, files, err := readFrameFiles(conn)
 	if err != nil {
-		return env, err
+		return env, nil, err
+	}
+	if env.Type == MsgProxyHTTP {
+		return env, files, nil
 	}
 	scope := env.SandboxID
 	if env.Type == MsgLoadModule {
@@ -214,5 +223,5 @@ func readGrantedFrame(conn net.Conn) (Envelope, error) {
 	for i, f := range files {
 		wasmengine.GrantHostPath(scope, env.FDPaths[i], f)
 	}
-	return env, nil
+	return env, nil, nil
 }

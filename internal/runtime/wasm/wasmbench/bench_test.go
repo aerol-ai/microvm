@@ -7,6 +7,8 @@
 //	(ii)  a second create in the same resident bucket
 //	(iii) a warm-pool hit, resident host off
 //	(iv)  cold: an empty compile cache, resident host on
+//	(v)   eight different operator modules created at once on a fresh node
+//	      (each one's first create), resident host on
 //
 // It is behind the wasmbench tag (make test never runs it) and needs Linux
 // root in a container that allows new PID namespaces when workers drop:
@@ -29,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -94,6 +97,15 @@ func newEnv(t *testing.T, base, cacheRoot string, resident bool) *env {
 	}
 	resolver := wasmmod.NewModuleResolver(e.modules, "")
 	resolver.Reserved = map[string]string{"stdio": "aerolstdio.wasm"}
+	// concurrentModules distinct operator modules for (v): the same guest
+	// with a custom section that differs, so each compiles on its own.
+	for i := range concurrentModules {
+		name := fmt.Sprintf("m%d.wasm", i)
+		if err := os.WriteFile(filepath.Join(e.modules, name), withCustomSection(raw, i), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		resolver.Reserved[fmt.Sprintf("m%d", i)] = name
+	}
 	cfg := wasm.Config{
 		RunDir:                   e.runDir,
 		ModulesDir:               e.modules,
@@ -108,25 +120,48 @@ func newEnv(t *testing.T, base, cacheRoot string, resident bool) *env {
 }
 
 func (e *env) create(t *testing.T, owner, id string) time.Duration {
+	return e.createImage(t, owner, "stdio", id)
+}
+
+// concurrentModules is how many different modules (v) creates at once.
+const concurrentModules = 8
+
+// withCustomSection appends a custom section ("bench", one byte n) to a
+// module: the same code under a different digest.
+func withCustomSection(raw []byte, n int) []byte {
+	body := append([]byte{5}, "bench"...)
+	body = append(body, byte(n))
+	return append(append(append([]byte(nil), raw...), 0, byte(len(body))), body...)
+}
+
+func (e *env) createImage(t *testing.T, owner, image, id string) time.Duration {
 	t.Helper()
 	ctx, tm := createtiming.With(wasmmod.WithCatalogueOwner(context.Background(), owner))
 	start := time.Now()
-	if _, err := e.driver.Create(ctx, models.CreateSandboxRequest{Image: "stdio"}, id, "tok", nil); err != nil {
-		t.Fatalf("create %s: %v", id, err)
+	if _, err := e.driver.Create(ctx, models.CreateSandboxRequest{Image: image}, id, "tok", nil); err != nil {
+		t.Errorf("create %s: %v", id, err)
+		return 0
 	}
 	took := time.Since(start)
+	stageMu.Lock()
 	for _, st := range tm.Stages() {
 		stageLog[st.Name] = append(stageLog[st.Name], st.DurMS)
 	}
+	stageMu.Unlock()
 	dstart := time.Now()
 	if err := e.driver.Destroy(context.Background(), &models.Sandbox{ID: id}); err != nil {
-		t.Fatalf("destroy %s: %v", id, err)
+		t.Errorf("destroy %s: %v", id, err)
 	}
+	stageMu.Lock()
 	stageLog["bench_destroy"] = append(stageLog["bench_destroy"], float64(time.Since(dstart).Microseconds())/1000)
+	stageMu.Unlock()
 	return took
 }
 
-var stageLog = map[string][]float64{}
+var (
+	stageMu  sync.Mutex
+	stageLog = map[string][]float64{}
+)
 
 type result struct {
 	Scenario string    `json:"scenario"`
@@ -215,6 +250,27 @@ func TestCreateLatency(t *testing.T) {
 		cold = append(cold, fresh.create(t, "cold-owner", fmt.Sprintf("sb-iv-%d", k)))
 	}
 	results = append(results, summarize("iv_cold_empty_cache", cold))
+
+	// (v): a fresh node each time, eight different operator modules created
+	// at once: no module's first create may wait on another's compile.
+	var each, wall []time.Duration
+	for k := range min(runs, 10) {
+		fresh := newEnv(t, t.TempDir(), filepath.Join(t.TempDir(), "cache"), true)
+		took := make([]time.Duration, concurrentModules)
+		var wg sync.WaitGroup
+		start := time.Now()
+		for i := range concurrentModules {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				took[i] = fresh.createImage(t, "conc-owner", fmt.Sprintf("m%d", i), fmt.Sprintf("sb-v-%d-%d", k, i))
+			}()
+		}
+		wg.Wait()
+		wall = append(wall, time.Since(start))
+		each = append(each, took...)
+	}
+	results = append(results, summarize("v_concurrent8_each", each), summarize("v_concurrent8_wall", wall))
 
 	for _, r := range results {
 		t.Logf("%-26s runs=%d p50=%.1fms p95=%.1fms", r.Scenario, r.Runs, r.P50ms, r.P95ms)

@@ -59,10 +59,15 @@ func WithFileLock(lockPath string, fn func() error) error {
 	return fn()
 }
 
+// ErrLockBusy: someone else holds the lock, and the caller would not wait.
+var ErrLockBusy = errors.New("audit lock is held by another process")
+
 // WithExistingFileLock is WithFileLock for a lock in a folder someone less
 // trusted writes (the WASM workers' spill folder): it never creates the
 // lock, which would leave it root's and shut the workers out of it, and
-// never follows a link to one. ok is false when there is no lock to take.
+// never follows a link to one. It never waits for the lock either: a held
+// lock is ErrLockBusy, since the holder may be a worker that keeps it on
+// purpose. ok is false when there is no lock to take.
 func WithExistingFileLock(lockPath string, fn func() error) (ok bool, err error) {
 	if lockPath == "" {
 		return false, errors.New("audit lock path is unset")
@@ -78,7 +83,7 @@ func WithExistingFileLock(lockPath string, fn func() error) (ok bool, err error)
 	if st, err := lf.Stat(); err != nil || !st.Mode().IsRegular() {
 		return false, fmt.Errorf("audit lock %s is not a regular file", lockPath)
 	}
-	if err := lockExclusive(lf); err != nil {
+	if err := tryLockExclusive(lf); err != nil {
 		return false, err
 	}
 	defer func() { _ = unlock(lf) }()

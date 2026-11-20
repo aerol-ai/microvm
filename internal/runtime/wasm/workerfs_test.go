@@ -342,3 +342,58 @@ func TestPromoteCheckpointResetsModes(t *testing.T) {
 		}
 	}
 }
+
+// F-F: when workers drop, the run dir is made 0700 at the first create, and
+// one that is not this process's is refused.
+func TestEnsureHostDirsClosesRunDir(t *testing.T) {
+	run := filepath.Join(t.TempDir(), "run")
+	if err := os.MkdirAll(run, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(run, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	d := New(Config{RunDir: run, Worker: worker.Confinement{UID: 61000, GID: 61000}}, nil)
+	if err := d.ensureHostDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(run); err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatalf("run dir = %v, %v", st.Mode(), err)
+	}
+	// Workers that keep root: left as the operator set it.
+	open := filepath.Join(t.TempDir(), "open")
+	if err := os.MkdirAll(open, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(Config{RunDir: open}, nil).ensureHostDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(open); st.Mode().Perm() != 0o755 {
+		t.Fatalf("root workers' run dir changed to %v", st.Mode())
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeRunDir(file); err == nil {
+		t.Fatal("a file taken as the run dir")
+	}
+	if err := closeRunDir(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("a missing run dir passed")
+	}
+	if os.Geteuid() == 0 {
+		theirs := filepath.Join(t.TempDir(), "theirs")
+		if err := os.Mkdir(theirs, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(theirs, 61000, 61000); err != nil {
+			t.Fatal(err)
+		}
+		if err := closeRunDir(theirs); err == nil {
+			t.Fatal("a run dir the worker uid owns passed")
+		}
+	}
+}

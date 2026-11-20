@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // grantWorker is a worker uid/gid that is not the test's own, so the test's
@@ -129,5 +131,52 @@ func TestOpenGrantPathConfined(t *testing.T) {
 	_ = f.Close()
 	if _, err := openGrantPath(fifo, false); err == nil {
 		t.Fatal("unconfined open took a FIFO")
+	}
+}
+
+// F-G: a folder or file the worker owns counts as one it can write whatever
+// its mode (it can chmod it back), and so does one that carries an access
+// ACL, which the mode bits do not show.
+func TestWorkerWritable(t *testing.T) {
+	me := Confinement{UID: os.Getuid(), GID: 4242}
+	other := grantWorker
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	fd, err := syscall.Open(dir, syscall.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
+	if !workerWritable(fd, st, me) {
+		t.Fatal("a read-only folder the worker owns counted as safe")
+	}
+	if workerWritable(fd, st, other) {
+		t.Fatal("a read-only folder of another uid counted as writable")
+	}
+	prev := hasAccessACL
+	t.Cleanup(func() { hasAccessACL = prev })
+	hasAccessACL = func(int) bool { return true }
+	if !workerWritable(fd, st, other) {
+		t.Fatal("a folder with an ACL counted as safe")
+	}
+	hasAccessACL = prev
+	if hasAccessACL(fd) {
+		t.Fatal("a plain temp folder has an access ACL")
+	}
+	group, world := st, st
+	group.Mode &^= 0o777
+	group.Mode |= 0o020
+	group.Gid = uint32(other.GID)
+	world.Mode &^= 0o777
+	world.Mode |= 0o002
+	if !workerWritable(-1, group, other) || !workerWritable(-1, world, other) {
+		t.Fatal("a group- or world-writable folder counted as safe")
 	}
 }

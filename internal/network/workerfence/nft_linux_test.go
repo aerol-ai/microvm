@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/google/nftables"
@@ -22,96 +23,133 @@ func testRules(t *testing.T) []Rule {
 	t.Helper()
 	rules, err := Plan(Spec{UID: 61000, Allow: []Allow{
 		{Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 4100, PortHi: 4100, Why: "audit ingest"},
-		{Proto: "tcp", Prefix: netip.MustParsePrefix(GuestListenHost + "/32"), PortLo: 32768, PortHi: 60999, Why: "guest listeners"},
 		{Proto: "udp", Prefix: netip.MustParsePrefix("::1/128"), PortLo: 53, PortHi: 53, Why: "name server"},
-	}})
+	}, Floor: []netip.Prefix{netip.MustParsePrefix("10.96.0.1/32")}, NodePorts: []uint16{443}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return rules
 }
 
-// TestRuleExprs pins the bytecode: the sending socket's uid, the address
-// family, the protocol and ports for an exception, the destination under
-// its mask, a counter and the verdict.
+// kinds names each expression of a rule, in order, so a test can pin the
+// shape of its bytecode.
+func kinds(exprs []expr.Any) []string {
+	out := make([]string, len(exprs))
+	for i, e := range exprs {
+		switch e := e.(type) {
+		case *expr.Meta:
+			out[i] = map[expr.MetaKey]string{expr.MetaKeySKUID: "skuid", expr.MetaKeyNFPROTO: "nfproto", expr.MetaKeyL4PROTO: "l4proto"}[e.Key]
+		case *expr.Ct:
+			out[i] = map[expr.CtKey]string{expr.CtKeyDIRECTION: "ct-direction", expr.CtKeySTATUS: "ct-status"}[e.Key]
+		case *expr.Fib:
+			if e.FlagDADDR && e.ResultADDRTYPE {
+				out[i] = "fib-daddr-type"
+			}
+		case *expr.Payload:
+			out[i] = map[expr.PayloadBase]string{expr.PayloadBaseNetworkHeader: "daddr", expr.PayloadBaseTransportHeader: "dport"}[e.Base]
+		case *expr.Bitwise:
+			out[i] = "mask"
+		case *expr.Cmp:
+			out[i] = "cmp"
+		case *expr.Counter:
+			out[i] = "counter"
+		case *expr.Verdict:
+			out[i] = map[expr.VerdictKind]string{expr.VerdictAccept: "accept", expr.VerdictDrop: "drop"}[e.Kind]
+		}
+	}
+	return out
+}
+
+// TestRuleExprs pins the bytecode of each kind of rule: the sending
+// socket's uid first, then what the kind matches, a counter and the
+// verdict.
 func TestRuleExprs(t *testing.T) {
 	uid := binaryutil.NativeEndian.PutUint32(61000)
+	pfx := netip.MustParsePrefix
 	for _, tc := range []struct {
-		name   string
-		rule   Rule
-		family byte
-		offset uint32
-		mask   []byte // nil: no bitwise (a single address)
-		ports  []expr.CmpOp
-		accept bool
+		name string
+		rule Rule
+		want string
+		// checks on particular expressions, by index
+		check func(t *testing.T, exprs []expr.Any)
 	}{
-		{"loopback drop", Rule{UID: 61000, Prefix: netip.MustParsePrefix("127.0.0.0/8")}, unix.NFPROTO_IPV4, 16, []byte{0xff, 0, 0, 0}, nil, false},
-		{"link-local v6 drop", Rule{UID: 61000, Prefix: netip.MustParsePrefix("fe80::/10")}, unix.NFPROTO_IPV6, 24, append([]byte{0xff, 0xc0}, make([]byte, 14)...), nil, false},
-		{"metadata v6 drop", Rule{UID: 61000, Prefix: netip.MustParsePrefix("fd00:ec2::254/128")}, unix.NFPROTO_IPV6, 24, nil, nil, false},
-		{"one port", Rule{UID: 61000, Accept: true, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 4100, PortHi: 4100}, unix.NFPROTO_IPV4, 16, nil, []expr.CmpOp{expr.CmpOpEq}, true},
-		{"port range", Rule{UID: 61000, Accept: true, Proto: "udp", Prefix: netip.MustParsePrefix("127.0.97.1/32"), PortLo: 32768, PortHi: 60999}, unix.NFPROTO_IPV4, 16, nil, []expr.CmpOp{expr.CmpOpGte, expr.CmpOpLte}, true},
+		{"loopback drop", Rule{UID: 61000, Prefix: pfx("127.0.0.0/8")},
+			"skuid cmp nfproto cmp daddr mask cmp counter drop", func(t *testing.T, e []expr.Any) {
+				if c := e[3].(*expr.Cmp); !bytes.Equal(c.Data, []byte{unix.NFPROTO_IPV4}) {
+					t.Fatalf("family = %v", c.Data)
+				}
+				if p := e[4].(*expr.Payload); p.Offset != 16 || p.Len != 4 {
+					t.Fatalf("daddr = %+v", p)
+				}
+				if b := e[5].(*expr.Bitwise); !bytes.Equal(b.Mask, []byte{0xff, 0, 0, 0}) {
+					t.Fatalf("mask = %x", b.Mask)
+				}
+			}},
+		{"metadata v6 drop", Rule{UID: 61000, Prefix: pfx("fd00:ec2::254/128")},
+			"skuid cmp nfproto cmp daddr cmp counter drop", func(t *testing.T, e []expr.Any) {
+				if p := e[4].(*expr.Payload); p.Offset != 24 || p.Len != 16 {
+					t.Fatalf("daddr = %+v", p)
+				}
+			}},
+		{"reply v4", Rule{UID: 61000, Kind: KindReply, Prefix: pfx("127.0.0.0/8")},
+			"skuid cmp nfproto cmp ct-direction cmp daddr mask cmp counter accept", func(t *testing.T, e []expr.Any) {
+				if c := e[5].(*expr.Cmp); !bytes.Equal(c.Data, []byte{1}) {
+					t.Fatalf("direction = %v, want reply (1)", c.Data)
+				}
+			}},
+		{"one port", Rule{UID: 61000, Kind: KindAllow, Proto: "tcp", Prefix: pfx("127.0.0.1/32"), PortLo: 4100, PortHi: 4100},
+			"skuid cmp nfproto cmp l4proto cmp daddr cmp dport cmp counter accept", func(t *testing.T, e []expr.Any) {
+				if c := e[5].(*expr.Cmp); !bytes.Equal(c.Data, []byte{unix.IPPROTO_TCP}) {
+					t.Fatalf("proto = %v", c.Data)
+				}
+				if c := e[9].(*expr.Cmp); c.Op != expr.CmpOpEq || !bytes.Equal(c.Data, []byte{0x10, 0x04}) {
+					t.Fatalf("port = %+v", c)
+				}
+			}},
+		{"port range", Rule{UID: 61000, Kind: KindAllow, Proto: "udp", Prefix: pfx("::1/128"), PortLo: 53, PortHi: 54},
+			"skuid cmp nfproto cmp l4proto cmp daddr cmp dport cmp cmp counter accept", func(t *testing.T, e []expr.Any) {
+				if e[9].(*expr.Cmp).Op != expr.CmpOpGte || e[10].(*expr.Cmp).Op != expr.CmpOpLte {
+					t.Fatal("range not lo..hi")
+				}
+			}},
+		{"nat'd", Rule{UID: 61000, Kind: KindAllowNAT, Proto: "udp", Prefix: pfx("127.0.0.11/32")},
+			"skuid cmp nfproto cmp l4proto cmp ct-status mask cmp daddr cmp counter accept", func(t *testing.T, e []expr.Any) {
+				if b := e[7].(*expr.Bitwise); !bytes.Equal(b.Mask, binaryutil.NativeEndian.PutUint32(1<<5)) {
+					t.Fatalf("status mask = %x, want IPS_DST_NAT", b.Mask)
+				}
+				if c := e[8].(*expr.Cmp); c.Op != expr.CmpOpNeq {
+					t.Fatalf("status cmp = %+v", c)
+				}
+			}},
+		{"node port", Rule{UID: 61000, Kind: KindLocalPort, PortLo: 443, PortHi: 443},
+			"skuid cmp l4proto cmp fib-daddr-type cmp dport cmp counter accept", func(t *testing.T, e []expr.Any) {
+				if c := e[5].(*expr.Cmp); !bytes.Equal(c.Data, binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)) {
+					t.Fatalf("fib type = %v, want local", c.Data)
+				}
+			}},
+		{"local drop", Rule{UID: 61000, Kind: KindLocalDrop}, "skuid cmp fib-daddr-type cmp counter drop", nil},
 	} {
 		exprs, err := ruleExprs(tc.rule)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		i := 0
-		next := func() expr.Any { e := exprs[i]; i++; return e }
-		if m, ok := next().(*expr.Meta); !ok || m.Key != expr.MetaKeySKUID {
-			t.Fatalf("%s: does not start with meta skuid", tc.name)
+		if got := strings.Join(kinds(exprs), " "); got != tc.want {
+			t.Fatalf("%s:\n got %s\nwant %s", tc.name, got, tc.want)
 		}
-		if c, ok := next().(*expr.Cmp); !ok || !bytes.Equal(c.Data, uid) {
+		if c := exprs[1].(*expr.Cmp); !bytes.Equal(c.Data, uid) {
 			t.Fatalf("%s: uid cmp = %#v", tc.name, c)
 		}
-		if m, ok := next().(*expr.Meta); !ok || m.Key != expr.MetaKeyNFPROTO {
-			t.Fatalf("%s: no nfproto", tc.name)
-		}
-		if c, ok := next().(*expr.Cmp); !ok || !bytes.Equal(c.Data, []byte{tc.family}) {
-			t.Fatalf("%s: family = %#v", tc.name, c)
-		}
-		if tc.rule.Proto != "" {
-			if m, ok := next().(*expr.Meta); !ok || m.Key != expr.MetaKeyL4PROTO {
-				t.Fatalf("%s: no l4proto", tc.name)
-			}
-			next()
-		}
-		if p, ok := next().(*expr.Payload); !ok || p.Base != expr.PayloadBaseNetworkHeader || p.Offset != tc.offset {
-			t.Fatalf("%s: daddr load = %#v", tc.name, p)
-		}
-		if tc.mask != nil {
-			if b, ok := next().(*expr.Bitwise); !ok || !bytes.Equal(b.Mask, tc.mask) {
-				t.Fatalf("%s: mask = %#v", tc.name, b)
-			}
-		}
-		if c, ok := next().(*expr.Cmp); !ok || !bytes.Equal(c.Data, tc.rule.Prefix.Masked().Addr().AsSlice()) {
-			t.Fatalf("%s: daddr cmp = %#v", tc.name, c)
-		}
-		if tc.ports != nil {
-			if p, ok := next().(*expr.Payload); !ok || p.Base != expr.PayloadBaseTransportHeader || p.Offset != 2 || p.Len != 2 {
-				t.Fatalf("%s: dport load = %#v", tc.name, p)
-			}
-			for _, op := range tc.ports {
-				if c, ok := next().(*expr.Cmp); !ok || c.Op != op {
-					t.Fatalf("%s: port cmp = %#v", tc.name, c)
-				}
-			}
-		}
-		if _, ok := next().(*expr.Counter); !ok {
-			t.Fatalf("%s: no counter", tc.name)
-		}
-		want := expr.VerdictDrop
-		if tc.accept {
-			want = expr.VerdictAccept
-		}
-		if v, ok := next().(*expr.Verdict); !ok || v.Kind != want || i != len(exprs) {
-			t.Fatalf("%s: verdict = %#v (%d of %d exprs)", tc.name, v, i, len(exprs))
+		if tc.check != nil {
+			tc.check(t, exprs)
 		}
 	}
 	for _, bad := range []Rule{
 		{Prefix: netip.MustParsePrefix("127.0.0.0/8")},
 		{UID: 1},
-		{UID: 1, Proto: "sctp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 1, PortHi: 1},
-		{UID: 1, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32")},
+		{UID: 1, Kind: KindAllow, Proto: "sctp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 1, PortHi: 1},
+		{UID: 1, Kind: KindAllow, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32")},
+		{UID: 1, Kind: KindLocalPort},
+		{UID: 1, Kind: RuleKind(99), Prefix: netip.MustParsePrefix("127.0.0.1/32")},
 	} {
 		if _, err := ruleExprs(bad); err == nil {
 			t.Errorf("rule %+v accepted", bad)
@@ -270,7 +308,7 @@ func TestCheck(t *testing.T) {
 			k.rules[len(k.rules)-1].UserData = userdata.AppendString(nil, userdata.TypeComment, "something else")
 		},
 		"chain moved to another hook": func(k *fakeKernel) { k.chains[1].Hooknum = nftables.ChainHookInput },
-		"chain priority changed":      func(k *fakeKernel) { k.chains[1].Priority = nftables.ChainPriorityFilter },
+		"chain back before conntrack": func(k *fakeKernel) { k.chains[1].Priority = nftables.ChainPriorityRaw },
 		"chain lost its hook":         func(k *fakeKernel) { k.chains[1].Hooknum = nil },
 		"chain policy drop":           func(k *fakeKernel) { drop := nftables.ChainPolicyDrop; k.chains[1].Policy = &drop },
 	} {
@@ -299,5 +337,15 @@ func TestCheck(t *testing.T) {
 		if ok, _ := NewBackend().Check(rules); ok {
 			t.Fatal("an empty kernel holds the fence")
 		}
+	}
+}
+
+// The chain runs after conntrack, so the reply rule can see a direction:
+// before it (raw) every packet would look new and guest listeners could
+// not answer anyone.
+func TestChainAfterConntrack(t *testing.T) {
+	c := chain(table())
+	if *c.Priority != *nftables.ChainPriorityFilter || *c.Hooknum != *nftables.ChainHookOutput {
+		t.Fatalf("chain hook %v priority %v", *c.Hooknum, *c.Priority)
 	}
 }

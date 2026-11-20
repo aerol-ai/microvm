@@ -137,7 +137,7 @@ func walkOpen(path string, p GrantPolicy, strict bool) (*os.File, error) {
 	case unix.S_IFDIR:
 		// The last name may be the worker's own folder.
 	case unix.S_IFREG:
-		if uint64(st.Nlink) != 1 || workerWritable(st, p.Worker) || strict && int(st.Uid) != os.Geteuid() {
+		if uint64(st.Nlink) != 1 || workerWritable(fd, st, p.Worker) || strict && int(st.Uid) != os.Geteuid() {
 			_ = unix.Close(fd)
 			return nil, fmt.Errorf("%s: %w: a file the worker may change, or one with another name", path, errGrantRefused)
 		}
@@ -155,17 +155,31 @@ func checkFolder(fd int, name string, c Confinement) error {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return &os.PathError{Op: "stat", Path: name, Err: err}
 	}
-	if workerWritable(st, c) {
+	if workerWritable(fd, st, c) {
 		return fmt.Errorf("%s: %w: a folder the worker can write", name, errGrantRefused)
 	}
 	return nil
 }
 
 // workerWritable reports whether the worker uid (with only its own group)
-// may write what st describes.
-func workerWritable(st unix.Stat_t, c Confinement) bool {
+// may write what fd is, st its stat: by the mode bits, by owning it (an
+// owner may chmod it writable again, whatever the bits say now), or
+// through a POSIX ACL, which the mode bits do not show (any access ACL
+// beyond the bits counts: sandboxd does not read its entries).
+func workerWritable(fd int, st unix.Stat_t, c Confinement) bool {
 	mode := uint32(st.Mode)
-	return int(st.Uid) == c.UID && mode&0o200 != 0 ||
+	return int(st.Uid) == c.UID ||
 		int(st.Gid) == c.GID && mode&0o020 != 0 ||
-		mode&0o002 != 0
+		mode&0o002 != 0 ||
+		hasAccessACL(fd)
+}
+
+// posixACLAccess is the xattr an access ACL beyond the mode bits lives in.
+const posixACLAccess = "system.posix_acl_access"
+
+// hasAccessACL reports whether fd carries an access ACL. A file system
+// without them (or a platform: macOS names its ACLs differently) has none.
+var hasAccessACL = func(fd int) bool {
+	n, err := unix.Fgetxattr(fd, posixACLAccess, nil)
+	return err == nil && n > 0
 }

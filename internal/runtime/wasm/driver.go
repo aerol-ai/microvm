@@ -51,12 +51,18 @@ type Driver struct {
 	pendingWorkers map[string]worker.FoundWorker
 
 	// The shared compile cache (sharedcache.go): precompile is the trusted
-	// compile step, sharedState single-flights it per module digest, and
-	// precompileMu runs one compile at a time.
-	precompile   precompileFunc
-	sharedMu     sync.Mutex
-	sharedState  map[string]*sharedCompile
-	precompileMu sync.Mutex
+	// compile step and sharedState single-flights it per module digest;
+	// different modules compile at once, each in a staging folder of its
+	// own, which stageSweep clears of a crashed run's once per process.
+	precompile  precompileFunc
+	sharedMu    sync.Mutex
+	sharedState map[string]*sharedCompile
+	stageSweep  sync.Once
+
+	// The warm slots' compile caches (SlotCompileCache): swept of slots
+	// that are gone at most once per slotCacheSweepEvery.
+	slotSweepMu sync.Mutex
+	slotSweepAt time.Time
 
 	// legacyLogged holds the sandboxes legacyRoot has spoken for.
 	legacyLogged sync.Map

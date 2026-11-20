@@ -3,6 +3,7 @@
 package auditlog
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/windows"
@@ -15,6 +16,15 @@ import (
 
 func lockExclusive(f *os.File) error {
 	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, new(windows.Overlapped))
+}
+
+// tryLockExclusive takes the lock only if no one holds it (ErrLockBusy).
+func tryLockExclusive(f *os.File) error {
+	err := windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, new(windows.Overlapped))
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+		return ErrLockBusy
+	}
+	return err
 }
 
 func unlock(f *os.File) error {

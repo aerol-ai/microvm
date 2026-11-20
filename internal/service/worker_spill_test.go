@@ -275,3 +275,88 @@ func TestMountCtxFor(t *testing.T) {
 		t.Fatal("a consumer with the drop off")
 	}
 }
+
+// A worker holding its spill lock never stalls the drain: the drain runs on
+// the audit writer holding spillMu and the audit lock, so it skips that
+// folder for this round (counted) and takes it once the lock is free.
+func TestDrainSkipsWorkerHeldSpillLock(t *testing.T) {
+	s, root := workerSpillSink(t)
+	s.workerScanEvery = 0
+	wdir := filepath.Join(root, "sb-held")
+	if err := os.Mkdir(wdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cov96aWrite(t, filepath.Join(wdir, auditlog.SpillFileName), gapLine(t, "held"))
+	lock := filepath.Join(wdir, auditlog.LockFileName)
+	cov96aWrite(t, lock, nil)
+	f, err := os.OpenFile(lock, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	busy := auditWorkerSpillBusyTotal.Value()
+	done := make(chan bool, 1)
+	go func() { done <- s.drainSpill() }()
+	select {
+	case drained := <-done:
+		if drained {
+			t.Fatal("drained a folder whose lock a worker holds")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain waited for a worker's lock")
+	}
+	if auditWorkerSpillBusyTotal.Value() != busy+1 {
+		t.Fatalf("busy count %d -> %d", busy, auditWorkerSpillBusyTotal.Value())
+	}
+	// The daemon's own spill still goes in meanwhile.
+	app := make(chan error, 1)
+	go func() { app <- s.appendSpillRecords(auditlog.SpillRecord{Event: SecretAuditEvent{EventID: "daemon"}}) }()
+	select {
+	case err := <-app:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the daemon's spill waited for a worker's lock")
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	for s.drainSpill() {
+	}
+	if _, err := os.Stat(filepath.Join(wdir, auditlog.SpillFileName)); !os.IsNotExist(err) {
+		t.Fatalf("the folder was not drained once its lock was free: %v", err)
+	}
+	if out, _ := os.ReadFile(s.path); !strings.Contains(string(out), "ae-") && !strings.Contains(string(out), "held") {
+		t.Fatalf("audit log = %s", out)
+	}
+}
+
+// A folder note left by a crash between claimSpillFrom's note and its
+// rename never names the next segment's sandbox: the daemon's own spill is
+// drained as the daemon's.
+func TestDrainIgnoresStaleFolderNote(t *testing.T) {
+	s, _ := workerSpillSink(t)
+	s.spillVerify = func(capability string, _ time.Time) (string, string, error) {
+		return capability, "inc-" + capability, nil
+	}
+	cov96aWrite(t, s.spillWorkingPath+spillFromSuffix, []byte("sb-victim"))
+	line, err := json.Marshal(auditlog.SpillRecord{Event: SecretAuditEvent{EventID: "e1", Kind: secretAuditKindEgress, Destination: "daemon.example:443"}, Capability: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cov96aWrite(t, s.spillPath, append(line, '\n'))
+	for s.drainSpill() {
+	}
+	out, err := os.ReadFile(s.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "daemon.example:443") {
+		t.Fatalf("the daemon's record was bound to the stale note's sandbox: %s", out)
+	}
+	if _, err := os.Stat(s.spillWorkingPath + spillFromSuffix); !os.IsNotExist(err) {
+		t.Fatalf("stale note kept: %v", err)
+	}
+}

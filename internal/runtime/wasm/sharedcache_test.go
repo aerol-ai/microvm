@@ -118,14 +118,15 @@ func TestSharedCompileCache(t *testing.T) {
 	if got, _ := os.ReadDir(elsewhere); len(got) != 0 {
 		t.Fatalf("a link was made through the worker's symlink: %v", got)
 	}
-	// A warm-pool slot gets a cache of its own in its folder, with the
-	// shared entries linked in; it goes when the slot's folder does.
+	// A warm-pool slot gets a cache of its own, on the cache root's device
+	// (the run dir is often a tmpfs, where a link to a shared entry fails),
+	// with the shared entries linked in.
 	slotDir := filepath.Join(t.TempDir(), "pool", "abc", "pool-1")
 	if err := os.MkdirAll(slotDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	slotCache := d.SlotCompileCache(slotDir)
-	if slotCache != filepath.Join(slotDir, "cache") || slotCache == d.SlotCompileCache(t.TempDir()) {
+	if slotCache != filepath.Join(root, slotCachesName, shortHash(slotDir), "cache") || slotCache == d.SlotCompileCache(t.TempDir()) {
 		t.Fatalf("slot cache = %q", slotCache)
 	}
 	if linked := mustStat(t, filepath.Join(slotCache, "wazero-test", "entry-python.wasm")); !os.SameFile(linked, mustStat(t, entry)) {
@@ -277,5 +278,144 @@ func TestLegacyRootMounts(t *testing.T) {
 	}
 	if _, said := d.legacyLogged.Load("sb-legacy"); said {
 		t.Fatal("a destroyed sandbox stays in the legacy log set")
+	}
+}
+
+// Different modules compile at the same time, each in its own staging
+// folder; creates of one module still share its one compile.
+func TestSharedCompilesRunInParallel(t *testing.T) {
+	root := t.TempDir()
+	// A crashed run's staging folder is cleared by the first compile.
+	leftover := filepath.Join(root, sharedStageName, "c-old")
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	d := New(Config{CompileCacheDir: root}, nil)
+	var calls, running, peak atomic.Int32
+	gate := make(chan struct{})
+	inner := fakePrecompile(&calls, nil)
+	d.precompile = func(ctx context.Context, dir, path string) error {
+		n := running.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		<-gate
+		defer running.Add(-1)
+		return inner(ctx, dir, path)
+	}
+	var wg sync.WaitGroup
+	for i := range 8 {
+		m := &wasmmod.ResolvedModule{Path: "/modules/m" + string(rune('a'+i%4)) + ".wasm", Digest: "d" + string(rune('a'+i%4)), Operator: true}
+		wg.Add(1)
+		go func() { defer wg.Done(); d.ensureSharedCompiled(context.Background(), m) }()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for peak.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+	wg.Wait()
+	if peak.Load() != 4 || calls.Load() != 4 {
+		t.Fatalf("peak %d compiles at once, %d in all: want 4 and 4", peak.Load(), calls.Load())
+	}
+	for _, m := range []string{"a", "b", "c", "d"} {
+		if st, err := os.Stat(filepath.Join(root, sharedCacheName, "wazero-test", "entry-m"+m+".wasm")); err != nil || st.Mode().Perm() != 0o444 {
+			t.Fatalf("entry m%s = %v, %v", m, st, err)
+		}
+	}
+	if got, _ := os.ReadDir(filepath.Join(root, sharedStageName)); len(got) != 0 {
+		t.Fatalf("staging left behind: %v", got)
+	}
+}
+
+func TestPublishSharedErrors(t *testing.T) {
+	if err := publishShared(filepath.Join(t.TempDir(), "missing"), t.TempDir()); err == nil {
+		t.Fatal("published a missing stage")
+	}
+	stage, shared := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(stage, "v1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "file"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "v1", "entry"), nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// The version's name is taken by a file in the shared cache.
+	if err := os.WriteFile(filepath.Join(shared, "v1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishShared(stage, shared); err == nil {
+		t.Fatal("published into a file")
+	}
+	// The cache root is a file: no staging folder can be made.
+	file := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(Config{CompileCacheDir: file}, nil).compileShared(context.Background(), "/m.wasm"); err == nil {
+		t.Fatal("compiled under a file")
+	}
+}
+
+// A slot's cache goes once its folder does (the slot was taken and its
+// sandbox destroyed, or dropped); a live slot's stays, and a sweep runs at
+// most once a minute.
+func TestSweepSlotCaches(t *testing.T) {
+	root := t.TempDir()
+	d := New(Config{CompileCacheDir: root}, nil)
+	live := filepath.Join(t.TempDir(), "live")
+	gone := filepath.Join(t.TempDir(), "gone")
+	for _, dir := range []string{live, gone} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if d.SlotCompileCache(dir) == "" {
+			t.Fatal("no slot cache")
+		}
+	}
+	// A cache whose owner file never got written: kept while young.
+	young := filepath.Join(root, slotCachesName, "young")
+	old := filepath.Join(root, slotCachesName, "old")
+	for _, dir := range []string{young, old} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := time.Now().Add(-2 * slotCacheOrphanAge)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	d.sweepSlotCaches() // within the minute: nothing
+	if _, err := os.Stat(filepath.Join(root, slotCachesName, shortHash(gone))); err != nil {
+		t.Fatal("swept within the interval")
+	}
+	d.slotSweepAt = time.Time{}
+	d.sweepSlotCaches()
+	for dir, want := range map[string]bool{
+		filepath.Join(root, slotCachesName, shortHash(live)): true,
+		filepath.Join(root, slotCachesName, shortHash(gone)): false,
+		young: true,
+		old:   false,
+	} {
+		if _, err := os.Stat(dir); (err == nil) != want {
+			t.Errorf("%s kept=%v, want %v", dir, err == nil, want)
+		}
+	}
+	// No slot caches yet, or a cache root that cannot be made.
+	New(Config{CompileCacheDir: t.TempDir()}, nil).sweepSlotCaches()
+	file := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if New(Config{CompileCacheDir: file}, nil).SlotCompileCache(live) != "" {
+		t.Fatal("a slot cache under a file")
 	}
 }

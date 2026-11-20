@@ -54,6 +54,13 @@ const (
 	// port (listen_ports.go).
 	MsgSetListenPorts MessageType = "set_listen_ports"
 	MsgListenPorts    MessageType = "listen_ports"
+
+	// MsgGuestListener asks for the listener an exposed port's request goes
+	// to; the worker answers with that listening socket attached
+	// (guest_conn.go). sandboxd checks it, connects to it as root and sends
+	// the connected socket with the proxy_http that follows on the same
+	// connection: a worker never opens a connection to a guest listener.
+	MsgGuestListener MessageType = "guest_listener"
 )
 
 // Stream ids on exec_chunk frames.

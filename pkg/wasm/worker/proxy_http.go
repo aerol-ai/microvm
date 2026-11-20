@@ -44,11 +44,26 @@ func (s *Server) guestHTTPTarget(guestPort int) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
+// proxyGuestHTTP serves a request by dialing the guest's listener from the
+// worker: only a worker that kept root does that (a worker that dropped its
+// privileges takes the connection from sandboxd, proxyGuestHTTPOn).
 func (s *Server) proxyGuestHTTP(ctx context.Context, sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
+	if workerConfined() {
+		return errGuestConnRequired
+	}
 	addr, err := s.guestHTTPTarget(guestPort)
 	if err != nil {
 		return err
 	}
+	return s.proxyGuestHTTPVia(ctx, sandboxID, addr, func(dctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(dctx, "tcp", addr)
+	}, w, r)
+}
+
+// proxyGuestHTTPVia proxies r to the guest listener at addr over the
+// connection dial makes, counting its bytes as the sandbox's.
+func (s *Server) proxyGuestHTTPVia(ctx context.Context, sandboxID, addr string, dial func(context.Context) (net.Conn, error), w http.ResponseWriter, r *http.Request) error {
 	target, err := url.Parse("http://" + addr)
 	if err != nil {
 		return err
@@ -71,9 +86,8 @@ func (s *Server) proxyGuestHTTP(ctx context.Context, sandboxID string, guestPort
 		return nil
 	}
 	proxy.Transport = &http.Transport{
-		DialContext: func(dctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{}
-			conn, dialErr := d.DialContext(dctx, network, address)
+		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
+			conn, dialErr := dial(dctx)
 			if dialErr != nil {
 				return nil, dialErr
 			}
@@ -90,13 +104,29 @@ func (s *Server) proxyGuestHTTP(ctx context.Context, sandboxID string, guestPort
 }
 
 func (s *Server) proxyGuestHTTPFromPayload(ctx context.Context, sandboxID string, p proxyHTTPPayload) (proxyHTTPResultPayload, error) {
+	return s.proxyPayload(ctx, p, func(w http.ResponseWriter, req *http.Request) error {
+		return s.proxyGuestHTTP(ctx, sandboxID, p.GuestPort, w, req)
+	})
+}
+
+// proxyGuestHTTPPayloadVia is proxyGuestHTTPFromPayload over the
+// connection dial makes.
+func (s *Server) proxyGuestHTTPPayloadVia(ctx context.Context, sandboxID string, p proxyHTTPPayload, addr string, dial func(context.Context) (net.Conn, error)) (proxyHTTPResultPayload, error) {
+	return s.proxyPayload(ctx, p, func(w http.ResponseWriter, req *http.Request) error {
+		return s.proxyGuestHTTPVia(ctx, sandboxID, addr, dial, w, req)
+	})
+}
+
+// proxyPayload runs serve for the request p carries and records the
+// response, up to maxProxyHTTPBody.
+func (s *Server) proxyPayload(ctx context.Context, p proxyHTTPPayload, serve func(http.ResponseWriter, *http.Request) error) (proxyHTTPResultPayload, error) {
 	req, err := http.NewRequestWithContext(ctx, p.Method, "http://guest"+p.RequestURI, bytes.NewReader(p.Body))
 	if err != nil {
 		return proxyHTTPResultPayload{}, err
 	}
 	req.Header = p.Header
 	rec := newLimitedProxyResponseRecorder(maxProxyHTTPBody)
-	if err := s.proxyGuestHTTP(ctx, sandboxID, p.GuestPort, rec, req); err != nil {
+	if err := serve(rec, req); err != nil {
 		return proxyHTTPResultPayload{}, err
 	}
 	if rec.Overflowed() {
@@ -278,7 +308,9 @@ func (c *Client) ResolvedListenPort(sandboxID string) (int, error) {
 	return p.Port, nil
 }
 
-// ProxyHTTP forwards one HTTP request to the guest wasip1 listener inside the worker.
+// ProxyHTTP forwards one HTTP request to the guest wasip1 listener inside
+// the worker, which dials it itself: the path for a worker from an older
+// release (ProxyHTTPDialed is the one for this release's).
 func (c *Client) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	payload, err := buildProxyHTTPPayload(guestPort, r)
 	if err != nil {
@@ -292,20 +324,5 @@ func (c *Client) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWrite
 	if err != nil {
 		return err
 	}
-	if reply.Type == MsgError {
-		var p errorPayload
-		if err := decodePayload(reply.Payload, &p); err != nil {
-			return err
-		}
-		return fmt.Errorf("%s", p.Message)
-	}
-	if reply.Type != MsgProxyHTTPResult {
-		return fmt.Errorf("unexpected reply type %q", reply.Type)
-	}
-	var result proxyHTTPResultPayload
-	if err := decodePayload(reply.Payload, &result); err != nil {
-		return err
-	}
-	writeProxyHTTPResult(w, result)
-	return nil
+	return finishProxyHTTP(reply, w)
 }

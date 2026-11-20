@@ -4,6 +4,7 @@ package wasmbench_test
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"os"
 	"testing"
@@ -40,8 +41,18 @@ func newBenchDriver(t *testing.T, cfg wasm.Config, e *env, resolver *wasmmod.Mod
 	// The worker fence and its gate, as pkg/daemon wires them when workers
 	// drop (BENCH_NO_FENCE=1 leaves them out, to measure what they cost).
 	if confine.Enabled() && os.Getenv("BENCH_NO_FENCE") != "1" {
+		// No exception for the guest listeners: only root connects to them.
 		fence := workerfence.New(workerfence.NewBackend(), func() (workerfence.Spec, error) {
-			return workerfence.Spec{UID: confine.UID, Allow: []workerfence.Allow{{Proto: "tcp", Prefix: netip.MustParsePrefix(workerfence.GuestListenHost + "/32"), PortLo: 1024, PortHi: 65535}}}, nil
+			var local []netip.Addr
+			addrs, _ := net.InterfaceAddrs()
+			for _, a := range addrs {
+				if n, ok := a.(*net.IPNet); ok {
+					if ip, ok := netip.AddrFromSlice(n.IP); ok {
+						local = append(local, ip.Unmap())
+					}
+				}
+			}
+			return workerfence.Spec{UID: confine.UID, Local: local}, nil
 		}, nil)
 		if err := fence.Ensure(); err != nil {
 			t.Fatal(err)

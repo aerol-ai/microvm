@@ -229,8 +229,26 @@ func TestWorkerSeccompPolicy(t *testing.T) {
 	if p.Actions["clone3"] != hostproc.SeccompRetErrno(errnoENOSYS) || p.Default != hostproc.SeccompRetErrno(errnoEPERM) || p.RuleDeny != hostproc.SeccompRetKillProcess {
 		t.Fatalf("clone3/default/rule deny = %#x %#x %#x", p.Actions["clone3"], p.Default, p.RuleDeny)
 	}
-	if len(p.Rules) != 1 || p.Rules[0].Syscall != "clone" || p.Rules[0].DenyIfAll[0].Mask&0x10000000 == 0 {
+	if len(p.Rules) != 2 || p.Rules[0].Syscall != "clone" || p.Rules[0].DenyIfAll[0].Mask&0x10000000 == 0 {
 		t.Fatalf("clone rule = %+v", p.Rules)
+	}
+	// socket keeps IPv4, IPv6 and route netlink only; anything else fails
+	// with EAFNOSUPPORT, not a kill (the Go runtime probes families).
+	sock := p.Rules[1]
+	if sock.Syscall != "socket" || sock.Deny != hostproc.SeccompRetErrno(errnoEAFNOSUPPORT) || len(sock.AllowIfAny) != 3 {
+		t.Fatalf("socket rule = %+v", sock)
+	}
+	families := map[uint32]bool{}
+	for _, entry := range sock.AllowIfAny {
+		families[entry[0].Value] = true
+		if entry[0].Value == linuxAFNetlink && (len(entry) != 2 || entry[1] != (hostproc.SeccompArgEq{Arg: 2, Value: linuxNetlinkRoute})) {
+			t.Fatalf("netlink not narrowed to route: %+v", entry)
+		}
+	}
+	for _, f := range []uint32{1 /* AF_UNIX */, 17 /* AF_PACKET */, 38 /* AF_ALG */, 40 /* AF_VSOCK */} {
+		if families[f] {
+			t.Fatalf("family %d allowed", f)
+		}
 	}
 	for _, arch := range []uint32{hostproc.AuditArchX86_64, hostproc.AuditArchAARCH64} {
 		if _, _, err := hostproc.BuildSeccomp(arch, map[string]int{"read": 0}, p); err != nil {

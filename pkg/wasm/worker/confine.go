@@ -413,8 +413,19 @@ func confineFromEnv() error {
 	if err != nil {
 		return err
 	}
-	return applyConfinement(c)
+	if err := applyConfinement(c); err != nil {
+		return err
+	}
+	confined.Store(true)
+	return nil
 }
+
+// confined is set once the worker has dropped its privileges: from then on
+// it opens no connection to its guest's listeners (the fence would drop
+// it), and takes the ones sandboxd opens.
+var confined atomic.Bool
+
+func workerConfined() bool { return confined.Load() }
 
 // serveListener serves each connection on ln with srv until ln fails.
 func serveListener(ln net.Listener, srv workerServer) error {
@@ -444,7 +455,8 @@ var workerSeccompAllow = []string{
 	"dup", "dup2", "dup3", "fcntl", "ioctl",
 	"copy_file_range", "sendfile", "splice", "tee",
 	// Sockets: the worker's own, the guest's mediated ones, DNS, and the
-	// audit ingest on loopback.
+	// audit ingest on loopback. socket is narrowed by family
+	// (workerSocketFamilies).
 	"socket", "socketpair", "connect", "bind", "listen", "accept", "accept4",
 	"sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "sendto", "recvfrom", "shutdown",
 	"getsockname", "getpeername", "getsockopt", "setsockopt",
@@ -502,9 +514,35 @@ const cloneNamespaceFlags = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 
 
 // Errnos the filter answers with.
 const (
-	errnoEPERM  = 1
-	errnoENOSYS = 38
+	errnoEPERM        = 1
+	errnoENOSYS       = 38
+	errnoEAFNOSUPPORT = 97
 )
+
+// Linux address families and the netlink protocol the socket rule names
+// (the same on every Linux architecture; x/sys/unix would give the build
+// platform's values).
+const (
+	linuxAFInet       = 2
+	linuxAFInet6      = 10
+	linuxAFNetlink    = 16
+	linuxNetlinkRoute = 0
+)
+
+// workerSocketFamilies are the sockets a worker may make once it has
+// dropped: IPv4 and IPv6 for the guests' mediated connections, DNS and the
+// audit ingest, and a route netlink socket, which Go's net package opens to
+// list the node's own addresses (the egress node guard refuses dials to
+// them). Every other family (AF_UNIX, AF_NETLINK for any other protocol,
+// AF_PACKET, AF_ALG, AF_VSOCK...) fails with EAFNOSUPPORT: a worker binds
+// its own Unix socket before it drops and makes none after, and the rest
+// are kernel code no worker needs. With AF_UNIX gone a worker cannot reach
+// the abstract Unix sockets of the node's network namespace either.
+var workerSocketFamilies = [][]hostproc.SeccompArgEq{
+	{{Arg: 0, Value: linuxAFInet}},
+	{{Arg: 0, Value: linuxAFInet6}},
+	{{Arg: 0, Value: linuxAFNetlink}, {Arg: 2, Value: linuxNetlinkRoute}},
+}
 
 // workerSeccompPolicy is the worker's filter. clone3 takes its flags in
 // memory the filter cannot read, so it answers ENOSYS and the C library
@@ -516,9 +554,12 @@ func workerSeccompPolicy() hostproc.SeccompPolicy {
 	}
 	actions["clone3"] = hostproc.SeccompRetErrno(errnoENOSYS)
 	return hostproc.SeccompPolicy{
-		Allow:    append(append([]string(nil), workerSeccompAllow...), "clone"),
-		Actions:  actions,
-		Rules:    []hostproc.SeccompArgRule{{Syscall: "clone", DenyIfAll: []hostproc.SeccompArgMask{{Arg: 0, Mask: cloneNamespaceFlags}}}},
+		Allow:   append(append([]string(nil), workerSeccompAllow...), "clone"),
+		Actions: actions,
+		Rules: []hostproc.SeccompArgRule{
+			{Syscall: "clone", DenyIfAll: []hostproc.SeccompArgMask{{Arg: 0, Mask: cloneNamespaceFlags}}},
+			{Syscall: "socket", AllowIfAny: workerSocketFamilies, Deny: hostproc.SeccompRetErrno(errnoEAFNOSUPPORT)},
+		},
 		RuleDeny: hostproc.SeccompRetKillProcess,
 		Default:  hostproc.SeccompRetErrno(errnoEPERM),
 	}

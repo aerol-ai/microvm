@@ -11,6 +11,7 @@ import (
 	"expvar"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -99,6 +100,9 @@ const (
 var (
 	auditEventsDroppedTotal  = expvar.NewInt("aerolvm_audit_events_dropped_total")
 	auditSpillMalformedTotal = expvar.NewInt("aerolvm_audit_spill_malformed_total")
+	// auditWorkerSpillBusyTotal counts worker spill folders the drain
+	// skipped because their worker held the lock (claimSpillFrom).
+	auditWorkerSpillBusyTotal = expvar.NewInt("aerolvm_audit_worker_spill_busy_total")
 	// auditSpillUnauthenticatedTotal counts egress spill lines whose
 	// capability was missing, forged, or expired. Each becomes a gap marker;
 	// a non-zero rate on a healthy node is a worker writing under a name it
@@ -1096,6 +1100,15 @@ func (s *fileAuditSink) claimSpillFrom(dir, label, working string) (bool, error)
 		claimed = true
 		return nil
 	})
+	if errors.Is(err, auditlog.ErrLockBusy) {
+		// The drain runs on the audit writer holding spillMu and the audit
+		// lock, so it never waits for a worker's lock: a worker holds it
+		// for one append, and one that escaped its engine could hold it
+		// forever. The folder is tried again on the next listing.
+		auditWorkerSpillBusyTotal.Add(1)
+		slog.Debug("audit drain: a worker holds its spill lock; folder skipped this round", "folder", label)
+		return false, nil
+	}
 	return claimed, err
 }
 
@@ -1152,6 +1165,13 @@ func (s *fileAuditSink) drainSpill() bool {
 		if st, err := os.Stat(working); err == nil && st.Size() > 0 {
 			hasWork = true
 			return nil
+		}
+		// No segment is in progress, so a folder note beside working is
+		// stale (a crash between claimSpillFrom writing it and its rename):
+		// it must not bind the next segment, the daemon's own included, to
+		// that worker's sandbox.
+		if err := os.Remove(working + spillFromSuffix); err != nil && !os.IsNotExist(err) {
+			return err
 		}
 		st, err := os.Stat(s.spillPath)
 		if err != nil && !os.IsNotExist(err) {

@@ -203,3 +203,106 @@ func TestSeccompPolicyActionsAndRuleDeny(t *testing.T) {
 		t.Fatalf("twin actions = %d instructions, %v", len(prog), err)
 	}
 }
+
+// runBPF runs a seccomp program on one call, as the kernel would: a tiny
+// interpreter for the instructions BuildSeccomp emits.
+func runBPF(t *testing.T, prog []SockFilter, arch uint32, nr int, args ...uint32) uint32 {
+	t.Helper()
+	data := map[uint32]uint32{seccompDataNR: uint32(nr), seccompDataArch: arch}
+	for i, a := range args {
+		data[uint32(seccompDataArgs+8*i)] = a
+	}
+	var acc uint32
+	for pc := 0; pc < len(prog); pc++ {
+		in := prog[pc]
+		switch in.Code {
+		case bpfLD | bpfW | bpfABS:
+			acc = data[in.K]
+		case bpfALU | bpfAND | bpfK:
+			acc &= in.K
+		case bpfJMP | bpfJEQ | bpfK:
+			if acc == in.K {
+				pc += int(in.Jt)
+			} else {
+				pc += int(in.Jf)
+			}
+		case bpfJMP | bpfJGE | bpfK:
+			if acc >= in.K {
+				pc += int(in.Jt)
+			} else {
+				pc += int(in.Jf)
+			}
+		case bpfRET | bpfK:
+			return in.K
+		default:
+			t.Fatalf("instruction %d: unknown code %#x", pc, in.Code)
+		}
+	}
+	t.Fatal("program fell off its end")
+	return 0
+}
+
+// AllowIfAny keeps a call for the argument values it lists, and gives the
+// rule's own result for any other.
+func TestSeccompAllowIfAny(t *testing.T) {
+	table := map[string]int{"socket": 41, "read": 0, "clone": 56}
+	const eafnosupport = 97
+	prog, _, err := BuildSeccomp(AuditArchX86_64, table, SeccompPolicy{
+		Allow: []string{"read", "socket", "clone"},
+		Rules: []SeccompArgRule{
+			{Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{{Arg: 0, Value: 2}}, {{Arg: 0, Value: 10}}, {{Arg: 0, Value: 16}, {Arg: 2, Value: 0}}}, Deny: SeccompRetErrno(eafnosupport)},
+			{Syscall: "clone", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 0x20000000}}},
+		},
+		RuleDeny: SeccompRetKillProcess,
+		Default:  SeccompRetErrno(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		nr   int
+		args []uint32
+		want uint32
+	}{
+		{"AF_INET", 41, []uint32{2, 1, 0}, SeccompRetAllow},
+		{"AF_INET6", 41, []uint32{10, 2, 0}, SeccompRetAllow},
+		{"AF_NETLINK route", 41, []uint32{16, 3, 0}, SeccompRetAllow},
+		{"AF_NETLINK netfilter", 41, []uint32{16, 3, 12}, SeccompRetErrno(eafnosupport)},
+		{"AF_UNIX", 41, []uint32{1, 1, 0}, SeccompRetErrno(eafnosupport)},
+		{"AF_PACKET", 41, []uint32{17, 3, 0}, SeccompRetErrno(eafnosupport)},
+		{"AF_ALG", 41, []uint32{38, 5, 0}, SeccompRetErrno(eafnosupport)},
+		{"AF_VSOCK", 41, []uint32{40, 1, 0}, SeccompRetErrno(eafnosupport)},
+		{"route proto, wrong family", 41, []uint32{0, 0, 0}, SeccompRetErrno(eafnosupport)},
+		{"read untouched", 0, nil, SeccompRetAllow},
+		{"clone thread", 56, []uint32{0x3d0f00}, SeccompRetAllow},
+		{"clone new pid ns", 56, []uint32{0x20000000}, SeccompRetKillProcess},
+		{"not listed", 99, nil, SeccompRetErrno(1)},
+	} {
+		if got := runBPF(t, prog, AuditArchX86_64, tc.nr, tc.args...); got != tc.want {
+			t.Errorf("%s: %#x, want %#x", tc.name, got, tc.want)
+		}
+	}
+	if got := runBPF(t, prog, AuditArchAARCH64, 41, 2); got != SeccompRetKillProcess {
+		t.Errorf("foreign arch: %#x", got)
+	}
+
+	for name, r := range map[string]SeccompArgRule{
+		"both kinds":  {Syscall: "socket", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 1}}, AllowIfAny: [][]SeccompArgEq{{{Arg: 0, Value: 2}}}},
+		"empty entry": {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{}}},
+		"bad arg":     {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{{Arg: 6, Value: 2}}}},
+		"seven tests": {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{make([]SeccompArgEq, 7)}},
+		"too long": {Syscall: "socket", AllowIfAny: func() [][]SeccompArgEq {
+			e := make([][]SeccompArgEq, 90)
+			for i := range e {
+				e[i] = []SeccompArgEq{{Value: uint32(i)}}
+			}
+			return e
+		}()},
+		"no tests at all": {Syscall: "socket"},
+	} {
+		if _, _, err := BuildSeccomp(AuditArchX86_64, table, SeccompPolicy{Allow: []string{"socket"}, Rules: []SeccompArgRule{r}}); err == nil {
+			t.Errorf("%s: rule accepted", name)
+		}
+	}
+}

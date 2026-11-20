@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	goruntime "runtime"
@@ -13,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/network/workerfence"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -26,7 +28,7 @@ var (
 	newWorkerFenceBackend = workerfence.NewBackend
 	workerFenceGOOS       = goruntime.GOOS
 	resolvConfPath        = "/etc/resolv.conf"
-	localPortRangePath    = "/proc/sys/net/ipv4/ip_local_port_range"
+	nodeInterfaceAddrs    = net.InterfaceAddrs
 )
 
 // wireWasmWorkerFence installs the WASM worker fence (internal/network/
@@ -68,32 +70,24 @@ func wireWasmWorkerFence(ctx context.Context, cfg config.Config, c worker.Confin
 	return workerfence.GuestListenHost
 }
 
-// workerFenceSpec is what the worker uid may still reach inside the fenced
-// ranges, read again on every sync:
+// workerFenceSpec is what the worker uid may still reach, and what else it
+// may not, read again on every sync:
 //
-//   - its guests' listeners, on GuestListenHost and the ephemeral ports a
-//     listener bound to port 0 gets: a worker proxies an exposed port's
-//     requests to its own guest's listener;
 //   - the audit ingest (SB_AUDIT_INGEST_PORT on 127.0.0.1), where workers
 //     post egress records;
-//   - a name server resolv.conf lists on loopback or link-local
-//     (systemd-resolved's 127.0.0.53, Amazon's 169.254.169.253), on port
-//     53: workers resolve the names guests dial;
-//   - the operator's upstream proxy, when the operator file names it by a
-//     loopback or link-local address or "localhost".
+//   - a name server resolv.conf lists, on port 53: workers resolve the
+//     names guests dial;
+//   - the operator's upstream proxy, when the operator file names it by an
+//     address or "localhost".
 //
-// Plan drops every exception outside the fenced ranges, so a name server
-// or proxy elsewhere adds nothing.
+// Guest listeners need no exception: only sandboxd opens connections to
+// them, and the fence lets the worker uid answer on those (workerfence's
+// reply rule). The deny floor is the one every dial guard holds (the
+// operator file's deny_cidrs, the metadata endpoints, SB_EGRESS_DENY_FLOOR_
+// CIDRS and the floor file), and the node ports are the ones guests may
+// still reach on the node's own addresses.
 func workerFenceSpec(cfg config.Config, c worker.Confinement) workerfence.Spec {
-	spec := workerfence.Spec{UID: c.UID}
-	lo, hi := uint16(1024), uint16(65535)
-	if raw, err := os.ReadFile(localPortRangePath); err == nil {
-		if l, h, err := workerfence.PortRange(raw); err == nil {
-			lo, hi = l, h
-		}
-	}
-	listen := netip.MustParseAddr(workerfence.GuestListenHost)
-	spec.Allow = append(spec.Allow, workerfence.Allow{Proto: "tcp", Prefix: netip.PrefixFrom(listen, 32), PortLo: lo, PortHi: hi, Why: "guest listeners"})
+	spec := workerfence.Spec{UID: c.UID, NodePorts: egresspolicy.NodeAllowedPorts()}
 	if port, err := strconv.ParseUint(strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_PORT")), 10, 16); err == nil && port > 0 {
 		spec.Allow = append(spec.Allow, workerfence.Allow{Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: uint16(port), PortHi: uint16(port), Why: "audit ingest"})
 	}
@@ -104,16 +98,41 @@ func workerFenceSpec(cfg config.Config, c worker.Confinement) workerfence.Spec {
 			}
 		}
 	}
+	var op *operator.Operator
 	if path := strings.TrimSpace(cfg.EgressOperatorFile); path != "" {
-		if op, err := operator.Load(path); err == nil {
+		if loaded, err := operator.Load(path); err == nil {
+			op = loaded
 			spec.Allow = append(spec.Allow, upstreamAllows(op.Upstream())...)
 		}
 	}
+	// A nil operator's floor is the metadata endpoints and the node's
+	// extra floor; the floor file's ranges are this process's current copy
+	// (wireEgressFloorFile keeps it).
+	spec.Floor = append(op.DenyFloor(), egresspolicy.FileFloor()...)
+	spec.Local = localAddrs()
 	return spec
 }
 
-// upstreamAllows lets the worker uid reach the operator's upstream proxy
-// when it sits inside the fenced ranges.
+// localAddrs are the node's own addresses, which the fence lists itself on
+// a kernel without nft fib. A failed read lists none: the fib rules, where
+// the kernel has them, need no list.
+func localAddrs() []netip.Addr {
+	addrs, err := nodeInterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out
+}
+
+// upstreamAllows lets the worker uid reach the operator's upstream proxy.
 func upstreamAllows(up *operator.UpstreamProxy) []workerfence.Allow {
 	if up == nil || up.URL == nil {
 		return nil

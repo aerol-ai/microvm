@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // GuestListenPortSyncer hot-updates wasip1 listener caps after expose_port.
@@ -76,5 +77,24 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 		return fmt.Errorf("%w on port %d of sandbox %q", ErrGuestNotListening, guestPort, sandboxID)
 	}
 	client := d.newWorkerClient(inst.socketPath)
+	if hc, ok := client.(hostDialProxyClient); ok && !st.legacy {
+		// This release's worker takes the connection to its guest from
+		// here (only root opens connections to guest listeners); the
+		// listener must be one of the ports this sandbox's state names.
+		err := hc.ProxyHTTPDialed(sandboxID, proxyPort, d.guestListenHost(), st.listenerPorts(), w, r)
+		if !errors.Is(err, worker.ErrHostDialUnsupported) {
+			return err
+		}
+		// A worker from an older release: it dials its listener itself,
+		// as it always did (it runs as root).
+	}
 	return client.ProxyHTTP(sandboxID, proxyPort, w, r)
+}
+
+// hostDialProxyClient is a worker client that connects to the guest's
+// listener itself and hands the worker the connection
+// (worker.Client.ProxyHTTPDialed). Optional, so test fakes without it take
+// the plain ProxyHTTP path.
+type hostDialProxyClient interface {
+	ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, w http.ResponseWriter, r *http.Request) error
 }
