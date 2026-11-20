@@ -102,12 +102,21 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, log *slog.
 		stop()
 		return err // a stop while containerd was still starting is no error
 	}
+	stopped := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		stop()
+		close(stopped)
 	}()
 	log.Info("root helper serving", "socket", cfg.Socket, "containerd", cfg.ContainerdSocket, "namespace", cfg.Policy.Namespace)
-	return srv.Serve()
+	err = srv.Serve()
+	if ctx.Err() != nil {
+		// Serve returns as soon as the stop begins. Return only once it
+		// has ended, so the socket is gone and no call is running when
+		// the process exits.
+		<-stopped
+	}
+	return err
 }
 
 // verifyNamespace refuses to serve over a containerd namespace whose

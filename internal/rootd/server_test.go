@@ -30,7 +30,7 @@ import (
 
 // shortDir is a folder for a socket. A socket path must fit in sun_path
 // (104 bytes on macOS), and t.TempDir's often does not.
-func shortDir(t *testing.T) string {
+func shortDir(t testing.TB) string {
 	t.Helper()
 	d, err := os.MkdirTemp("", "rd")
 	if err != nil {
@@ -56,13 +56,31 @@ func testPolicy() rootpolicy.Policy {
 	}
 }
 
-func testConfig(t *testing.T) Config {
-	return Config{
-		Socket:    filepath.Join(shortDir(t), "root.sock"),
+func testConfig(t testing.TB) Config {
+	dir := shortDir(t)
+	return withFiles(Config{
+		// The socket's folder holds the socket alone (TestSocketModeAndGroup).
+		Socket:    filepath.Join(dir, "sock", "root.sock"),
 		SocketGID: os.Getgid(),
 		AgentUID:  uint32(os.Getuid()),
 		Policy:    testPolicy(),
+	}, dir)
+}
+
+// withFiles puts the helper's folders for the files it makes under base,
+// with the policy entries that let the gate accept them, as
+// ConfigFromEnv lays them out under the state and run folders.
+func withFiles(c Config, base string) Config {
+	c.Files = FileDirs{
+		Hosts:      filepath.Join(base, "state", "hosts"),
+		Ready:      filepath.Join(base, "run", "ready"),
+		Runsc:      filepath.Join(base, "state", "runsc"),
+		AgentReady: filepath.Join(base, "agent", "ready"),
 	}
+	c.Policy.FIFODir = filepath.Join(base, "run", "fifo")
+	c.Policy.BindRoots = append(c.Policy.BindRoots, c.Files.Hosts, c.Files.Ready)
+	c.Policy.RunscConfigPaths = []string{c.Files.runscPath(runscDefaultFile), c.Files.runscPath(runscRestoreFile)}
+	return c
 }
 
 // stubContainerd stands where the gate goes: it records each call handed
@@ -98,7 +116,7 @@ func (s *stubContainerd) methods() []string {
 }
 
 type rig struct {
-	t          *testing.T
+	t          testing.TB
 	cfg        Config
 	srv        *Server
 	containerd *stubContainerd
@@ -110,7 +128,7 @@ type rig struct {
 // newRig serves a helper on a real socket. The peer check is
 // egress.UnixPeerCheck for this process's uid: the real one on Linux, a
 // pass-through elsewhere (peer_linux_test.go has the refusals).
-func newRig(t *testing.T, mutate func(*Config, *Options)) *rig {
+func newRig(t testing.TB, mutate func(*Config, *Options)) *rig {
 	t.Helper()
 	r := &rig{t: t, cfg: testConfig(t), containerd: &stubContainerd{}}
 	opts := Options{
@@ -144,7 +162,7 @@ func newRig(t *testing.T, mutate func(*Config, *Options)) *rig {
 	return r
 }
 
-func dialSocket(t *testing.T, sock string) *grpc.ClientConn {
+func dialSocket(t testing.TB, sock string) *grpc.ClientConn {
 	t.Helper()
 	conn, err := grpc.NewClient("passthrough:///rootd", grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
@@ -164,7 +182,7 @@ func (r *rig) refused() []Refusal {
 	return slices.Clone(r.refusals)
 }
 
-func callCtx(t *testing.T) context.Context {
+func callCtx(t testing.TB) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	return ctx
@@ -183,9 +201,10 @@ func TestVersion(t *testing.T) {
 	if resp.GetHelperVersion() != version.Version || resp.GetApi() != rootdpb.APIVersion {
 		t.Fatalf("Version = %v", resp)
 	}
-	// EnsureHost is a placeholder, so this helper serves no feature yet.
-	if len(resp.GetFeatures()) != 0 {
-		t.Fatalf("features %v, want none", resp.GetFeatures())
+	// EnsureHost is a placeholder, so it is the one call not served.
+	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool { return f == rootdpb.FeatureEnsureHost })
+	if !slices.Equal(resp.GetFeatures(), want) {
+		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
 	}
 	if m := r.containerd.methods(); len(m) != 0 {
 		t.Fatalf("the helper's own call reached containerd: %v", m)
@@ -307,6 +326,12 @@ func TestCallsRunInParallel(t *testing.T) {
 	}
 }
 
+func mkdir(dir string) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		panic(err)
+	}
+}
+
 func TestNewRefuses(t *testing.T) {
 	ok := func(*Config, *Options) {}
 	for _, tc := range []struct {
@@ -320,17 +345,36 @@ func TestNewRefuses(t *testing.T) {
 		{"no group", func(c *Config, _ *Options) { c.SocketGID = -1 }, "want a gid"},
 		{"policy without limits", func(c *Config, _ *Options) { c.Policy.Limits = rootpolicy.Limits{} }, "limits"},
 		{"a file where the socket goes", func(c *Config, _ *Options) {
+			mkdir(filepath.Dir(c.Socket))
 			if err := os.WriteFile(c.Socket, nil, 0o600); err != nil {
 				panic(err)
 			}
 		}, "not a socket"},
 		{"a socket folder that is a file", func(c *Config, _ *Options) {
+			mkdir(filepath.Dir(c.Socket))
 			f := filepath.Join(filepath.Dir(c.Socket), "f")
 			if err := os.WriteFile(f, nil, 0o600); err != nil {
 				panic(err)
 			}
 			c.Socket = filepath.Join(f, "root.sock")
 		}, "socket folder"},
+		{"no folders for the files", func(c *Config, _ *Options) { c.Files = FileDirs{} }, "hosts folder"},
+		{"a hosts folder that is not a bind root", func(c *Config, _ *Options) { c.Policy.BindRoots = c.Policy.BindRoots[1:] }, "bind roots"},
+		{"runsc configs the policy does not name", func(c *Config, _ *Options) { c.Policy.RunscConfigPaths = []string{"/x/config.toml"} }, "runsc configs"},
+		// A layout someone else can write stops the helper before any agent
+		// reaches it, and leaves no socket.
+		{"a hosts folder others can write", func(c *Config, _ *Options) {
+			mkdir(c.Files.Hosts)
+			if err := os.Chmod(c.Files.Hosts, 0o777); err != nil {
+				panic(err)
+			}
+		}, "written by others"},
+		{"a FIFO folder under a file", func(c *Config, _ *Options) {
+			mkdir(filepath.Dir(c.Policy.FIFODir))
+			if err := os.WriteFile(c.Policy.FIFODir, nil, 0o600); err != nil {
+				panic(err)
+			}
+		}, "fifo"},
 		{"sound config", ok, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,6 +391,9 @@ func TestNewRefuses(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("New = %v, want an error naming %q", err, tc.want)
+			}
+			if _, err := os.Lstat(cfg.Socket); err == nil && tc.name != "a file where the socket goes" {
+				t.Fatalf("a refused helper left its socket at %s", cfg.Socket)
 			}
 		})
 	}

@@ -77,7 +77,10 @@ func shortDir(t *testing.T) string {
 
 // helperEnv is the helper's own environment for a test: its socket and
 // containerd's in dir, the namespace given.
-func helperEnv(dir, namespace string) func(string) string {
+func helperEnv(t *testing.T, dir, namespace string) func(string) string {
+	// The helper's own folders sit apart from both sockets' folder, in
+	// which no sandbox may bind anything.
+	files := shortDir(t)
 	e := map[string]string{
 		"SB_ROOTD_SOCKET":         filepath.Join(dir, "root.sock"),
 		"SB_ROOTD_SOCKET_GROUP":   strconv.Itoa(os.Getgid()),
@@ -85,6 +88,11 @@ func helperEnv(dir, namespace string) func(string) string {
 		"SB_CONTAINERD_SOCKET":    filepath.Join(dir, "containerd.sock"),
 		"SB_CONTAINERD_NAMESPACE": namespace,
 		"SB_HOST_MEMORY_MB":       "1024",
+		// The helper's own folders, made at start.
+		"SB_ROOTD_STATE_DIR": filepath.Join(files, "state"),
+		"SB_ROOTD_FIFO_DIR":  filepath.Join(files, "run", "fifo"),
+		"SB_ROOTD_READY_DIR": filepath.Join(files, "run", "ready"),
+		"SB_MOUNTS_CRED_DIR": filepath.Join(files, "agent"),
 	}
 	return func(k string) string { return e[k] }
 }
@@ -117,6 +125,16 @@ func serving(t *testing.T, cfg rootd.Config, logs *syncBuffer) {
 	// SO_PEERCRED check for its uid.
 	opts := rootd.Options{Peer: egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, "")}
 	go func() { done <- serve(ctx, cfg, opts, slog.New(slog.NewTextHandler(logs, nil))) }()
+	// serve makes the helper's folders, then its socket, in the background:
+	// wait for the socket, or the first dial below races it.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if _, err := os.Lstat(cfg.Socket); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no socket at %s", cfg.Socket)
+		}
+	}
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -140,7 +158,7 @@ func ctxT(t *testing.T) context.Context {
 // any other namespace is refused, and the refusal is logged.
 func TestPolicyComesFromTheHelpersEnv(t *testing.T) {
 	dir := shortDir(t)
-	cfg, err := rootd.ConfigFromEnv(helperEnv(dir, "tenant-x"))
+	cfg, err := rootd.ConfigFromEnv(helperEnv(t, dir, "tenant-x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +195,7 @@ func TestPolicyComesFromTheHelpersEnv(t *testing.T) {
 // serve over it.
 func TestServeRefusesADefaultingNamespace(t *testing.T) {
 	dir := shortDir(t)
-	cfg, err := rootd.ConfigFromEnv(helperEnv(dir, "aerolvm"))
+	cfg, err := rootd.ConfigFromEnv(helperEnv(t, dir, "aerolvm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +219,7 @@ func TestServeWaitsForContainerd(t *testing.T) {
 
 	t.Run("containerd comes up", func(t *testing.T) {
 		dir := shortDir(t)
-		cfg, err := rootd.ConfigFromEnv(helperEnv(dir, "aerolvm"))
+		cfg, err := rootd.ConfigFromEnv(helperEnv(t, dir, "aerolvm"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +242,7 @@ func TestServeWaitsForContainerd(t *testing.T) {
 	})
 	t.Run("stopped while waiting", func(t *testing.T) {
 		dir := shortDir(t)
-		cfg, err := rootd.ConfigFromEnv(helperEnv(dir, "aerolvm"))
+		cfg, err := rootd.ConfigFromEnv(helperEnv(t, dir, "aerolvm"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +274,7 @@ func TestRun(t *testing.T) {
 	serveContainerd(t, filepath.Join(dir, "containerd.sock"), &fakeContainerd{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, helperEnv(dir, "aerolvm"), slog.New(slog.DiscardHandler)) }()
+	go func() { done <- run(ctx, helperEnv(t, dir, "aerolvm"), slog.New(slog.DiscardHandler)) }()
 	if runtime.GOOS != "linux" {
 		if err := <-done; err == nil || !strings.Contains(err.Error(), "Linux only") {
 			t.Fatalf("run off Linux = %v", err)

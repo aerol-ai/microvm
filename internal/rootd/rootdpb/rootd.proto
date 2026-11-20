@@ -1,7 +1,7 @@
 // The root helper's own API (plans/security-gaps-m1-m4.md §3.3).
 //
 // The agent, sandboxd running as a user with no rights, calls it over
-// /run/aerolvm-rootd/root.sock. containerd's own API shares that socket
+// /run/aerolvm-rootd/sock/root.sock. containerd's own API shares that socket
 // and that gRPC server, behind the gate (internal/rootd/gate), so one peer
 // check covers both (eng review D3).
 //
@@ -27,6 +27,39 @@ service RootHelper {
   // fence. Not built yet: the helper answers Unimplemented and leaves it
   // out of Version's features.
   rpc EnsureHost(EnsureHostRequest) returns (EnsureHostResponse);
+
+  // The calls below make the files runc, runsc and the containerd shim
+  // later open as root: in folders only root can write, so the agent can
+  // never swap one for a link between the gate's check and root's open.
+  // The agent sends typed values; the helper checks them, writes the files
+  // itself and answers with the paths to put in specs. No request names a
+  // path or carries a file root would trust. Each call is safe to retry
+  // and to repeat: "make sure this exists" or "make sure this is gone".
+
+  // EnsureHostFiles makes sure a container's hostname, hosts and
+  // resolv.conf files (and the egress CA, when asked) exist with this
+  // content, and drops an egress CA the request no longer asks for.
+  rpc EnsureHostFiles(EnsureHostFilesRequest) returns (EnsureHostFilesResponse);
+
+  // EnsureTaskFIFOs makes fresh stdout and stderr FIFOs for a container's
+  // next task, at that container's fixed paths. Call it once per task,
+  // before opening them: a task's old readers keep the old FIFOs.
+  rpc EnsureTaskFIFOs(EnsureTaskFIFOsRequest) returns (EnsureTaskFIFOsResponse);
+
+  // EnsureRunscConfig makes sure one of the runsc shim configs the helper
+  // owns exists. The helper writes its whole content.
+  rpc EnsureRunscConfig(EnsureRunscConfigRequest) returns (EnsureRunscConfigResponse);
+
+  // EnsureReadySocket gives the agent's ready socket for a container a
+  // name in the helper's folder, for the spec to bind. The agent binds and
+  // keeps the socket in its own ready folder, as before; the helper links
+  // that socket into its own folder and checks, after linking, that it is
+  // a socket the agent owns.
+  rpc EnsureReadySocket(EnsureReadySocketRequest) returns (EnsureReadySocketResponse);
+
+  // RemoveContainerFiles makes sure everything the helper made for a
+  // container is gone: host files, FIFOs and ready socket names.
+  rpc RemoveContainerFiles(RemoveContainerFilesRequest) returns (RemoveContainerFilesResponse);
 }
 
 message VersionRequest {
@@ -51,6 +84,85 @@ message VersionResponse {
 message EnsureHostRequest {}
 
 message EnsureHostResponse {}
+
+// HostEntry is one line of a container's hosts file.
+message HostEntry {
+  // An IPv4 or IPv6 address, without a zone.
+  string address = 1;
+  // The names for it, each a host name.
+  repeated string names = 2;
+}
+
+message EnsureHostFilesRequest {
+  // The container the files are for (a sandbox or a warm-pool slot ID).
+  string container_id = 1;
+  // The hostname file's one line.
+  string hostname = 2;
+  // The hosts file, one line each, in order.
+  repeated HostEntry hosts = 3;
+  // resolv.conf: nameserver addresses (no zones), search domains and
+  // options, rendered by internal/runtime/resolvconf.
+  repeated string nameservers = 4;
+  repeated string search = 5;
+  repeated string dns_options = 6;
+  // The node's egress TLS inspection CA certificate, DER. Empty: none.
+  bytes egress_ca_der = 7;
+}
+
+message EnsureHostFilesResponse {
+  string hostname_path = 1;
+  string hosts_path = 2;
+  string resolv_conf_path = 3;
+  // Empty when the request had no egress CA.
+  string egress_ca_path = 4;
+}
+
+message EnsureTaskFIFOsRequest {
+  string container_id = 1;
+}
+
+message EnsureTaskFIFOsResponse {
+  // Root's FIFOs, readable by the agent's group: the shim writes, the
+  // agent reads.
+  string stdout_path = 1;
+  string stderr_path = 2;
+}
+
+// RunscConfig names a runsc shim config the helper writes.
+enum RunscConfig {
+  RUNSC_CONFIG_UNSPECIFIED = 0;
+  // Every gVisor sandbox: host-uds=open, for the ready socket.
+  RUNSC_CONFIG_DEFAULT = 1;
+  // A gVisor sandbox restored from a move: the default flags, and
+  // aerolvm-runsc as the runsc the shim runs.
+  RUNSC_CONFIG_RESTORE = 2;
+}
+
+message EnsureRunscConfigRequest {
+  RunscConfig config = 1;
+}
+
+message EnsureRunscConfigResponse {
+  string path = 1;
+}
+
+message EnsureReadySocketRequest {
+  string container_id = 1;
+  // The ready socket's nonce (hex) for a create's socket, which the agent
+  // names <container_id>.<nonce>.sock; empty for a warm-pool slot's park
+  // socket, <container_id>.sock.
+  string nonce = 2;
+}
+
+message EnsureReadySocketResponse {
+  string path = 1;
+}
+
+message RemoveContainerFilesRequest {
+  string container_id = 1;
+}
+
+message RemoveContainerFilesResponse {}
 
 // HelperUnavailable marks a call that failed because the agent's client
 // could not reach the helper. It never crosses the socket: the client adds

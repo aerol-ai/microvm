@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 // TestGeneratedCodeIsCurrent: gen.sh records a checksum of rootd.proto and
@@ -67,12 +69,22 @@ func TestAPIConstants(t *testing.T) {
 	for _, m := range RootHelper_ServiceDesc.Methods {
 		calls = append(calls, m.MethodName)
 	}
-	for _, f := range []string{FeatureEnsureHost} {
+	features := Features()
+	for _, f := range features {
 		if !slices.Contains(calls, f) {
 			t.Errorf("feature %q is not a RootHelper call (%v)", f, calls)
 		}
 	}
-	for _, full := range []string{RootHelper_Version_FullMethodName, RootHelper_EnsureHost_FullMethodName} {
+	// Every call but Version is a feature, so the agent can ask about it.
+	for _, c := range calls {
+		if c != "Version" && !slices.Contains(features, c) {
+			t.Errorf("call %s has no feature name", c)
+		}
+	}
+	for _, full := range []string{RootHelper_Version_FullMethodName, RootHelper_EnsureHost_FullMethodName,
+		RootHelper_EnsureHostFiles_FullMethodName, RootHelper_EnsureTaskFIFOs_FullMethodName,
+		RootHelper_EnsureRunscConfig_FullMethodName, RootHelper_EnsureReadySocket_FullMethodName,
+		RootHelper_RemoveContainerFiles_FullMethodName} {
 		if !strings.HasPrefix(full, ServicePrefix) {
 			t.Errorf("%s is not under %s", full, ServicePrefix)
 		}
@@ -97,6 +109,18 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.EnsureHostResponse": nil,
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
 		"aerolvm.rootd.v1.HelperUnsupported":  {"reason=1:string"},
+		"aerolvm.rootd.v1.HostEntry":          {"address=1:string", "names=2:repeated string"},
+		"aerolvm.rootd.v1.EnsureHostFilesRequest": {"container_id=1:string", "hostname=2:string", "hosts=3:repeated message",
+			"nameservers=4:repeated string", "search=5:repeated string", "dns_options=6:repeated string", "egress_ca_der=7:bytes"},
+		"aerolvm.rootd.v1.EnsureHostFilesResponse":      {"hostname_path=1:string", "hosts_path=2:string", "resolv_conf_path=3:string", "egress_ca_path=4:string"},
+		"aerolvm.rootd.v1.EnsureTaskFIFOsRequest":       {"container_id=1:string"},
+		"aerolvm.rootd.v1.EnsureTaskFIFOsResponse":      {"stdout_path=1:string", "stderr_path=2:string"},
+		"aerolvm.rootd.v1.EnsureRunscConfigRequest":     {"config=1:enum"},
+		"aerolvm.rootd.v1.EnsureRunscConfigResponse":    {"path=1:string"},
+		"aerolvm.rootd.v1.EnsureReadySocketRequest":     {"container_id=1:string", "nonce=2:string"},
+		"aerolvm.rootd.v1.EnsureReadySocketResponse":    {"path=1:string"},
+		"aerolvm.rootd.v1.RemoveContainerFilesRequest":  {"container_id=1:string"},
+		"aerolvm.rootd.v1.RemoveContainerFilesResponse": nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -118,9 +142,29 @@ func TestWireIsAppendOnly(t *testing.T) {
 			t.Errorf("%s fields %v, pinned %v", m.FullName(), got, w)
 		}
 	}
+
+	// Enum values are wire numbers too.
+	wantEnums := map[protoreflect.FullName][]string{
+		"aerolvm.rootd.v1.RunscConfig": {"RUNSC_CONFIG_UNSPECIFIED=0", "RUNSC_CONFIG_DEFAULT=1", "RUNSC_CONFIG_RESTORE=2"},
+	}
+	enums := File_rootd_proto.Enums()
+	if enums.Len() != len(wantEnums) {
+		t.Fatalf("rootd.proto has %d enums, the table %d", enums.Len(), len(wantEnums))
+	}
+	for i := range enums.Len() {
+		e := enums.Get(i)
+		var got []string
+		for j := range e.Values().Len() {
+			v := e.Values().Get(j)
+			got = append(got, fmt.Sprintf("%s=%d", v.Name(), v.Number()))
+		}
+		if w, ok := wantEnums[e.FullName()]; !ok || !slices.Equal(got, w) {
+			t.Errorf("%s values %v, pinned %v", e.FullName(), got, w)
+		}
+	}
 }
 
-// fakeHelper serves only Version; EnsureHost falls to the generated
+// fakeHelper serves only Version; every other call falls to the generated
 // default, which every helper that has not built a call answers with.
 type fakeHelper struct{ UnimplementedRootHelperServer }
 
@@ -129,9 +173,13 @@ func (fakeHelper) Version(_ context.Context, r *VersionRequest) (*VersionRespons
 }
 
 // TestStubsRoundTrip runs the generated client and server against each
-// other, with and without an interceptor, and checks a message survives
-// the wire.
+// other, with and without an interceptor, for every call, and checks a
+// message survives the wire.
 func TestStubsRoundTrip(t *testing.T) {
+	var calls []string
+	for _, m := range RootHelper_ServiceDesc.Methods {
+		calls = append(calls, m.MethodName)
+	}
 	for _, intercept := range []bool{false, true} {
 		t.Run(fmt.Sprint("interceptor=", intercept), func(t *testing.T) {
 			lis := bufconn.Listen(1 << 16)
@@ -158,54 +206,118 @@ func TestStubsRoundTrip(t *testing.T) {
 			if err != nil || v.GetHelperVersion() != "v-a" || v.GetApi() != APIVersion || !slices.Equal(v.GetFeatures(), []string{FeatureEnsureHost}) {
 				t.Fatalf("Version = %v, %v", v, err)
 			}
-			if _, err := c.EnsureHost(context.Background(), &EnsureHostRequest{}); status.Code(err) != codes.Unimplemented {
-				t.Fatalf("EnsureHost = %v, want Unimplemented", err)
+			want := []string{RootHelper_Version_FullMethodName}
+			for _, name := range calls[1:] {
+				m := reflect.ValueOf(c).MethodByName(name)
+				req := reflect.New(m.Type().In(1).Elem())
+				out := m.Call([]reflect.Value{reflect.ValueOf(context.Background()), req})
+				if err, _ := out[1].Interface().(error); status.Code(err) != codes.Unimplemented {
+					t.Fatalf("%s = %v, want Unimplemented", name, err)
+				}
+				want = append(want, "/aerolvm.rootd.v1.RootHelper/"+name)
 			}
-			if intercept && !slices.Equal(seen, []string{RootHelper_Version_FullMethodName, RootHelper_EnsureHost_FullMethodName}) {
-				t.Fatalf("interceptor saw %v", seen)
+			if intercept && !slices.Equal(seen, want) {
+				t.Fatalf("interceptor saw %v, want %v", seen, want)
 			}
 		})
 	}
 
-	// Each message's generated methods, and a nil message's getters,
-	// which a decoder can hand back.
-	for _, m := range []interface {
-		proto.Message
-		Reset()
-		String() string
-		ProtoMessage()
-		Descriptor() ([]byte, []int)
-	}{
-		&VersionRequest{AgentVersion: "a", AgentApi: 1},
-		&VersionResponse{HelperVersion: "h", Api: 1, Features: []string{"x"}},
-		&EnsureHostRequest{},
-		&EnsureHostResponse{},
-		&HelperUnavailable{},
-		&HelperUnsupported{Reason: "upgrade the helper"},
-	} {
-		b, err := proto.Marshal(m)
+	// Each message's generated methods and getters, set and nil: a decoder
+	// can hand back a nil message.
+	msgs := File_rootd_proto.Messages()
+	for i := range msgs.Len() {
+		mt, err := protoregistry.GlobalTypes.FindMessageByName(msgs.Get(i).FullName())
 		if err != nil {
 			t.Fatal(err)
 		}
-		back := m.ProtoReflect().New().Interface()
-		if err := proto.Unmarshal(b, back); err != nil || !proto.Equal(m, back) {
-			t.Fatalf("%T round trip: %v", m, err)
+		m := mt.New()
+		fillMessage(m)
+		b, err := proto.Marshal(m.Interface())
+		if err != nil {
+			t.Fatal(err)
 		}
-		m.ProtoMessage()
-		if _, idx := m.Descriptor(); len(idx) != 1 {
-			t.Fatalf("%T descriptor index %v", m, idx)
+		back := mt.New().Interface()
+		if err := proto.Unmarshal(b, back); err != nil || !proto.Equal(m.Interface(), back) {
+			t.Fatalf("%s round trip: %v", mt.Descriptor().FullName(), err)
 		}
-		_ = m.String()
-		m.Reset()
+		g := m.Interface().(interface {
+			Reset()
+			String() string
+			ProtoMessage()
+			Descriptor() ([]byte, []int)
+		})
+		g.ProtoMessage()
+		if _, idx := g.Descriptor(); len(idx) != 1 {
+			t.Fatalf("%T descriptor index %v", g, idx)
+		}
+		_ = g.String()
+		rv := reflect.ValueOf(g)
+		for j := range rv.NumMethod() {
+			name := rv.Type().Method(j).Name
+			if !strings.HasPrefix(name, "Get") || rv.Method(j).Type().NumIn() != 0 {
+				continue
+			}
+			if rv.Method(j).Call(nil)[0].IsZero() {
+				t.Errorf("%T.%s of a filled message is zero", g, name)
+			}
+			nilMsg := reflect.Zero(rv.Type())
+			if !nilMsg.MethodByName(name).Call(nil)[0].IsZero() {
+				t.Errorf("a nil %T's %s is not zero", g, name)
+			}
+		}
+		g.Reset()
 	}
-	var vr *VersionRequest
-	var vs *VersionResponse
-	if vr.GetAgentVersion() != "" || vr.GetAgentApi() != 0 || vs.GetHelperVersion() != "" || vs.GetApi() != 0 || vs.GetFeatures() != nil {
-		t.Fatal("a nil message's getters return zero values")
+	for _, v := range []RunscConfig{RunscConfig_RUNSC_CONFIG_DEFAULT, RunscConfig_RUNSC_CONFIG_RESTORE} {
+		if v.Enum() == nil || *v.Enum() != v || v.String() == "" || v.Number() != protoreflect.EnumNumber(v) ||
+			v.Descriptor().FullName() != "aerolvm.rootd.v1.RunscConfig" || v.Type() == nil {
+			t.Fatalf("enum %v methods", v)
+		}
+		if _, idx := v.EnumDescriptor(); len(idx) != 1 {
+			t.Fatalf("enum descriptor index %v", idx)
+		}
 	}
 	var u UnimplementedRootHelperServer
-	if _, err := u.Version(context.Background(), nil); status.Code(err) != codes.Unimplemented {
-		t.Fatalf("Unimplemented Version = %v", err)
+	ru := reflect.ValueOf(u)
+	for _, name := range calls {
+		m := ru.MethodByName(name)
+		out := m.Call([]reflect.Value{reflect.ValueOf(context.Background()), reflect.Zero(m.Type().In(1))})
+		if err, _ := out[1].Interface().(error); status.Code(err) != codes.Unimplemented {
+			t.Fatalf("Unimplemented %s = %v", name, err)
+		}
+	}
+}
+
+// fillMessage sets every field of m to something other than its zero.
+func fillMessage(m protoreflect.Message) {
+	fields := m.Descriptor().Fields()
+	for i := range fields.Len() {
+		fd := fields.Get(i)
+		var v protoreflect.Value
+		switch fd.Kind() {
+		case protoreflect.StringKind:
+			v = protoreflect.ValueOfString("x")
+		case protoreflect.BytesKind:
+			v = protoreflect.ValueOfBytes([]byte{1})
+		case protoreflect.Uint32Kind:
+			v = protoreflect.ValueOfUint32(1)
+		case protoreflect.EnumKind:
+			v = protoreflect.ValueOfEnum(1)
+		case protoreflect.MessageKind:
+			sub := m.NewField(fd)
+			if fd.IsList() {
+				sub = protoreflect.ValueOfMessage(m.NewField(fd).List().NewElement().Message())
+			}
+			fillMessage(sub.Message())
+			v = sub
+		default:
+			panic("fillMessage: add kind " + fd.Kind().String())
+		}
+		if fd.IsList() {
+			l := m.Mutable(fd).List()
+			l.Append(v)
+			continue
+		}
+		m.Set(fd, v)
 	}
 }
 
@@ -241,5 +353,39 @@ func TestHelperUnsupportedIsTheError(t *testing.T) {
 	var nilDetail *HelperUnsupported
 	if nilDetail.GetReason() != "" {
 		t.Fatal("nil getter")
+	}
+}
+
+// TestRequestsNameNoPaths: no request the agent sends names a path, a
+// folder or a file, or carries bytes for root to write, beyond the egress
+// CA's DER, which the helper parses as a certificate and writes itself.
+// The helper builds every path from IDs it checks (plans/security-gaps
+// §3: the agent sends typed values, never a path for root to trust). A
+// field that breaks this must be argued for here, not slipped in.
+func TestRequestsNameNoPaths(t *testing.T) {
+	msgs := File_rootd_proto.Messages()
+	bytesOK := map[protoreflect.FullName]bool{"aerolvm.rootd.v1.EnsureHostFilesRequest.egress_ca_der": true}
+	var check func(m protoreflect.MessageDescriptor)
+	check = func(m protoreflect.MessageDescriptor) {
+		for i := range m.Fields().Len() {
+			f := m.Fields().Get(i)
+			name := strings.ToLower(string(f.Name()))
+			for _, bad := range []string{"path", "dir", "file", "folder", "content", "toml", "body"} {
+				if strings.Contains(name, bad) {
+					t.Errorf("%s: a request field named like a path or a file's content", f.FullName())
+				}
+			}
+			if f.Kind() == protoreflect.BytesKind && !bytesOK[f.FullName()] {
+				t.Errorf("%s: raw bytes in a request", f.FullName())
+			}
+			if f.Kind() == protoreflect.MessageKind {
+				check(f.Message())
+			}
+		}
+	}
+	for i := range msgs.Len() {
+		if m := msgs.Get(i); strings.HasSuffix(string(m.Name()), "Request") {
+			check(m)
+		}
 	}
 }

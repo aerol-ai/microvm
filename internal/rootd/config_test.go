@@ -45,14 +45,15 @@ func TestConfigFromEnv(t *testing.T) {
 			Snapshotter:     "overlayfs",
 			SnapshotterRoot: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
 			NetnsDir:        "/run/netns",
+			// Binds come from the helper's own folders, never from the
+			// agent's run dir, ready dir or database folder (T2b).
 			BindRoots: []string{
-				"/var/lib/sandboxd/containerd/hosts",
+				"/var/lib/aerolvm-rootd/hosts",
 				"/var/lib/sandboxd/mounts",
-				"/run/sandboxd/docker/ready",
-				"/var/lib/sandboxd/egress-ca",
+				"/run/aerolvm-rootd/ready",
 			},
 			BindFiles:      []string{"/usr/local/bin/toolboxd"},
-			ForbiddenRoots: []string{"/run/aerolvm-rootd", "/run/containerd"},
+			ForbiddenRoots: []string{"/run/aerolvm-rootd/sock", "/run/containerd"},
 			// What root reads on the agent's word lives in the helper's
 			// own folders, never the agent's (review H2).
 			MovesDir: "/var/lib/aerolvm-rootd/moves",
@@ -64,6 +65,12 @@ func TestConfigFromEnv(t *testing.T) {
 			// Pids: gVisor's host limit for the node's 4096 (pkg/gvisorpids:
 			// two host tasks per sandbox task, plus headroom).
 			Limits: rootpolicy.Limits{MemoryBytes: 8192 << 20, Pids: 2*4096 + 1024, CPUs: float64(runtime.NumCPU())},
+		},
+		Files: FileDirs{
+			Hosts:      "/var/lib/aerolvm-rootd/hosts",
+			Ready:      "/run/aerolvm-rootd/ready",
+			Runsc:      "/var/lib/aerolvm-rootd/runsc",
+			AgentReady: "/run/sandboxd/docker/ready",
 		},
 	}
 	for _, tc := range []struct {
@@ -93,14 +100,16 @@ func TestConfigFromEnv(t *testing.T) {
 			"SB_DB_PATH":                  "/data/state/state.db",
 			"SB_TOOLBOX_BINARY_PATH":      "/opt/aerolvm/toolboxd",
 			"SB_ROOTD_FIFO_DIR":           "/run/rootd-io",
+			"SB_ROOTD_READY_DIR":          "/run/rootd-ready",
 			"SB_ROOTD_STATE_DIR":          "/data/rootd",
 		}, func(c *Config) {
 			p := &c.Policy
 			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/var/run/netns"
-			p.BindRoots = []string{"/data/ctr/hosts", "/data/mounts", "/run/sbd/docker/ready", "/data/state/egress-ca"}
+			p.BindRoots = []string{"/data/rootd/hosts", "/data/mounts", "/run/rootd-ready"}
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
+			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready"}
 		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
@@ -114,7 +123,7 @@ func TestConfigFromEnv(t *testing.T) {
 		}},
 		{"paths written untidily are used clean", map[string]string{
 			"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/",
-			"SB_ROOTD_SOCKET":    "/run//aerolvm-rootd/./root.sock",
+			"SB_ROOTD_SOCKET":    "/run//aerolvm-rootd/./sock/root.sock",
 		}, func(*Config) {}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,6 +184,10 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"runsc configs in the agent's run dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd/containerd/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
 		{"the helper's state in the agent's data dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd", "SB_HOST_MEMORY_MB": "1"}, nil, "which the agent writes"},
 		{"FIFOs in the agent's run folder", map[string]string{"SB_ROOTD_FIFO_DIR": "/run/sandboxd/fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
+		{"ready names in the agent's ready folder", map[string]string{"SB_ROOTD_READY_DIR": "/run/sandboxd/docker/ready/helper", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_READY_DIR"},
+		// The socket's folder is no bind root's: the ready names are binds.
+		{"ready names beside the socket", map[string]string{"SB_ROOTD_READY_DIR": "/run/aerolvm-rootd/sock/ready", "SB_HOST_MEMORY_MB": "1"}, nil, "forbidden"},
+		{"a relative ready folder", map[string]string{"SB_ROOTD_READY_DIR": "ready", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_READY_DIR"},
 		{"the socket in the agent's mounts", map[string]string{"SB_ROOTD_SOCKET": "/var/lib/sandboxd/mounts/root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
 		// Review N6: the same folder written another way is the same folder.
 		{"the agent's run dir with a trailing slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_CONTAINERD_RUN_DIR": "/srv/ctr/", "SB_ROOTD_STATE_DIR": "/srv/ctr/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},

@@ -391,14 +391,28 @@ func TestContainerdsOwnUnavailablePassesThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = filepath.Join(dir, "root.sock")
-	srv, err := rootd.New(rootd.Config{
+	cfg := rootd.Config{
 		Socket: p, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
 		Policy: rootpolicy.Policy{
 			Namespace: "aerolvm", Snapshotter: "overlayfs", SnapshotterRoot: "/var/lib/containerd/snap",
-			NetnsDir: "/run/netns", MovesDir: "/var/lib/aerolvm-rootd/moves", FIFODir: "/run/aerolvm-rootd/fifo",
+			NetnsDir: "/run/netns", MovesDir: "/var/lib/aerolvm-rootd/moves",
 			Limits: rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
 		},
-	}, rootd.Options{
+	}
+	// The helper's own folders, which every helper needs (the file calls
+	// are not what this test is about).
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Files = rootd.FileDirs{
+		Hosts: filepath.Join(base, "state", "hosts"), Ready: filepath.Join(base, "run", "ready"),
+		Runsc: filepath.Join(base, "state", "runsc"), AgentReady: filepath.Join(base, "agent", "ready"),
+	}
+	cfg.Policy.FIFODir = filepath.Join(base, "run", "fifo")
+	cfg.Policy.BindRoots = []string{cfg.Files.Hosts, cfg.Files.Ready}
+	cfg.Policy.RunscConfigPaths = []string{filepath.Join(cfg.Files.Runsc, "config.toml"), filepath.Join(cfg.Files.Runsc, "restore.toml")}
+	srv, err := rootd.New(cfg, rootd.Options{
 		Containerd: func(_ any, ss grpc.ServerStream) error {
 			_ = ss.RecvMsg(&emptypb.Empty{})
 			return status.Error(codes.Unavailable, "snapshotter overlayfs not loaded")
