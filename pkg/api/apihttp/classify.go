@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -229,6 +230,18 @@ func Classify(err error) Classification {
 	// cause (a netlink error) is for the node's log, not the caller.
 	case errors.Is(err, service.ErrIPv6FenceNotReady):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeIPv6FenceNotReady, Message: service.ErrIPv6FenceNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+
+	// The node's root helper (internal/rootclient): down, or one release
+	// older than this agent and missing a call. Both pass: the supervisor
+	// restarts a helper that died, and swaps in the one the agent staged
+	// (plans/security-gaps-m1-m4.md, eng review D4). The unavailable cause
+	// names the socket and gRPC's error, which are for the node's log; the
+	// unsupported text names the call and the helper's version, which tell
+	// the caller why.
+	case errors.Is(err, rootclient.ErrUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: "the node's root helper is unavailable; retry shortly", Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, rootclient.ErrUnsupported):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error()), Log: true, LogLevel: slog.LevelWarn}
 
 	// An option this runtime/build can't honor is 501, not 400.
 	case errors.Is(err, models.ErrRuntimeNotImplemented):
