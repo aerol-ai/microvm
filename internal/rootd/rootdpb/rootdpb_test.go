@@ -96,6 +96,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
 		"aerolvm.rootd.v1.EnsureHostResponse": nil,
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
+		"aerolvm.rootd.v1.HelperUnsupported":  {"reason=1:string"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -180,6 +181,7 @@ func TestStubsRoundTrip(t *testing.T) {
 		&EnsureHostRequest{},
 		&EnsureHostResponse{},
 		&HelperUnavailable{},
+		&HelperUnsupported{Reason: "upgrade the helper"},
 	} {
 		b, err := proto.Marshal(m)
 		if err != nil {
@@ -225,5 +227,19 @@ func TestHelperUnavailableIsTheError(t *testing.T) {
 	}
 	if e, ok := back[0].(error); !ok || !errors.Is(e, ErrHelperUnavailable) {
 		t.Fatalf("detail after the trip: %T %v", back[0], back[0])
+	}
+}
+
+func TestHelperUnsupportedIsTheError(t *testing.T) {
+	var d error = &HelperUnsupported{Reason: "root helper v1 speaks API 0: upgrade the helper"}
+	if !errors.Is(d, ErrHelperUnsupported) || errors.Is(d, ErrHelperUnavailable) || d.Error() != "root helper v1 speaks API 0: upgrade the helper" {
+		t.Fatalf("detail %v", d)
+	}
+	if (&HelperUnsupported{}).Error() != ErrHelperUnsupported.Error() {
+		t.Fatal("an empty reason says what the error is")
+	}
+	var nilDetail *HelperUnsupported
+	if nilDetail.GetReason() != "" {
+		t.Fatal("nil getter")
 	}
 }

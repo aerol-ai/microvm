@@ -129,3 +129,74 @@ func TestListenRaceAgent(t *testing.T) {
 		}
 	}
 }
+
+// asAgent runs a shell line as the agent: uid 65531, in the socket's group.
+func asAgent(t *testing.T, script string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65531, Gid: 65531, Groups: []uint32{4242}}}
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// TestListenUnderAStickyFolder: a root-owned sticky folder above the
+// socket's (as /tmp) is allowed, since the agent cannot rename root's
+// folder in it; an open one is not. And a link the agent puts in an open
+// folder on the way makes root create nothing where it points (review
+// N2; in a sticky folder the kernel's protected_symlinks already stops
+// root following it).
+func TestListenUnderAStickyFolder(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to run the agent as another user")
+	}
+	dir := shortDir(t)
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(dir, "run")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sockDir := filepath.Join(parent, "rootd")
+	if err := os.Mkdir(sockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := unix.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if ln, _, err := listen(filepath.Join(sockDir, "root.sock"), 4242); err == nil {
+		_ = ln.Close()
+		t.Fatal("listen took a socket folder under one anyone can write")
+	}
+
+	if err := unix.Chmod(parent, 0o1777); err != nil {
+		t.Fatal(err)
+	}
+	ln, _, err := listen(filepath.Join(sockDir, "root.sock"), 4242)
+	if err != nil {
+		t.Fatalf("a sticky folder above: %v", err)
+	}
+	defer ln.Close()
+	if out, err := asAgent(t, "mv "+sockDir+" "+parent+"/stolen"); err == nil {
+		t.Fatalf("the agent renamed root's socket folder: %s", out)
+	}
+
+	elsewhere := filepath.Join(dir, "elsewhere")
+	if err := os.Mkdir(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := asAgent(t, "ln -s "+elsewhere+" "+parent+"/aerolvm"); err != nil {
+		t.Fatalf("agent link: %s %v", out, err)
+	}
+	if ln, _, err := listen(filepath.Join(parent, "aerolvm", "rootd", "root.sock"), 4242); err == nil {
+		_ = ln.Close()
+		t.Fatal("listen followed the agent's link")
+	}
+	if _, err := os.Lstat(filepath.Join(elsewhere, "rootd")); err == nil {
+		t.Fatal("root made a folder through the agent's link")
+	}
+}

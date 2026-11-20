@@ -15,17 +15,24 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/services/events/v1"
 	versionapi "github.com/containerd/containerd/api/services/version/v1"
 	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/rootclient"
+	"github.com/aerol-ai/microvm/internal/rootd"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
@@ -277,4 +284,175 @@ func TestEventStreamCutByAGoneHelperIs503(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the subscription outlived the helper")
 	}
+}
+
+// slowHelper answers Version after slow, speaking api, and hands every
+// other call to containerd.
+type slowHelper struct {
+	rootdpb.UnimplementedRootHelperServer
+	api      uint32
+	slow     time.Duration
+	versions *atomic.Int32
+}
+
+func (h slowHelper) Version(context.Context, *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
+	if h.versions != nil {
+		h.versions.Add(1)
+	}
+	time.Sleep(h.slow)
+	return &rootdpb.VersionResponse{HelperVersion: "h", Api: h.api}, nil
+}
+
+func serveWith(t *testing.T, p string, h slowHelper, containerd grpc.StreamHandler) {
+	t.Helper()
+	ln, err := net.Listen("unix", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.UnknownServiceHandler(containerd))
+	rootdpb.RegisterRootHelperServer(srv, h)
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(srv.Stop)
+}
+
+func answerVersion(_ any, ss grpc.ServerStream) error {
+	if err := ss.RecvMsg(&emptypb.Empty{}); err != nil {
+		return err
+	}
+	return ss.SendMsg(&versionapi.VersionResponse{Version: "2.1.4"})
+}
+
+// TestSharedHandshakeOutlivesTheFirstCaller is review N1: callers share
+// one handshake, and the one that started it giving up (its request
+// cancelled) does not fail the others. Each still ends on its own
+// context.
+func TestSharedHandshakeOutlivesTheFirstCaller(t *testing.T) {
+	p := sock(t)
+	var versions atomic.Int32
+	serveWith(t, p, slowHelper{api: rootdpb.APIVersion, slow: 300 * time.Millisecond, versions: &versions}, answerVersion)
+	c := client(t, p, 2*time.Second)
+
+	first, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- c.Ensure(first) }()
+	time.Sleep(50 * time.Millisecond) // the first caller's handshake is in flight
+	second := make(chan error, 1)
+	go func() { second <- c.Ensure(ctx5(t)) }()
+	time.Sleep(50 * time.Millisecond)
+	cancelFirst()
+
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the first caller got %v, want its own cancel", err)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("the first caller kept waiting after its cancel")
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("a caller with 5 s left failed with the first caller's cancel: %v", err)
+	}
+	if n := versions.Load(); n != 1 {
+		t.Fatalf("%d handshakes, want 1 shared", n)
+	}
+}
+
+// TestTooOldHelperOnContainerdPathIsUnsupported is review N5: on the
+// containerd path a helper older than MinHelperAPI is unsupported, with
+// its reason (upgrade it), as on the helper's own calls; not "unavailable".
+func TestTooOldHelperOnContainerdPathIsUnsupported(t *testing.T) {
+	p := sock(t)
+	serveWith(t, p, slowHelper{api: rootdpb.MinHelperAPI - 1}, answerVersion)
+	_, err := containerd(t, client(t, p, time.Second)).Version(ctx5(t))
+	cl := apihttp.Classify(err)
+	if !errors.Is(err, rootclient.ErrUnsupported) || errors.Is(err, rootclient.ErrUnavailable) || cl.Status != http.StatusServiceUnavailable {
+		t.Fatalf("Version = %v; Is Unsupported %v, Is Unavailable %v, status %d", err,
+			errors.Is(err, rootclient.ErrUnsupported), errors.Is(err, rootclient.ErrUnavailable), cl.Status)
+	}
+	if !strings.Contains(cl.Message, "upgrade the helper") {
+		t.Fatalf("the API message %q does not say what to do", cl.Message)
+	}
+	// The same through containerd's error conversion.
+	_, err = containerd(t, client(t, p, time.Second)).ContainerService().List(ctx5(t))
+	if !errors.Is(err, rootclient.ErrUnsupported) {
+		t.Fatalf("Containers.List = %v, want ErrUnsupported", err)
+	}
+}
+
+// TestContainerdsOwnUnavailablePassesThrough is review N4: Unavailable
+// that the helper answered (containerd's own error, passed on by the gate)
+// keeps containerd's meaning; only a failure to reach the helper is the
+// helper unavailable. This needs the helper's real server, which marks
+// every call it answers.
+func TestContainerdsOwnUnavailablePassesThrough(t *testing.T) {
+	p := sock(t)
+	dir, err := filepath.EvalSymlinks(filepath.Dir(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p = filepath.Join(dir, "root.sock")
+	srv, err := rootd.New(rootd.Config{
+		Socket: p, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
+		Policy: rootpolicy.Policy{
+			Namespace: "aerolvm", Snapshotter: "overlayfs", SnapshotterRoot: "/var/lib/containerd/snap",
+			NetnsDir: "/run/netns", MovesDir: "/var/lib/aerolvm-rootd/moves", FIFODir: "/run/aerolvm-rootd/fifo",
+			Limits: rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
+		},
+	}, rootd.Options{
+		Containerd: func(_ any, ss grpc.ServerStream) error {
+			_ = ss.RecvMsg(&emptypb.Empty{})
+			return status.Error(codes.Unavailable, "snapshotter overlayfs not loaded")
+		},
+		Peer: egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+
+	_, err = containerd(t, client(t, p, time.Second)).ContainerService().List(ctx5(t))
+	if errors.Is(err, rootclient.ErrUnavailable) || !errdefs.IsUnavailable(err) || !strings.Contains(err.Error(), "snapshotter overlayfs not loaded") {
+		t.Fatalf("Containers.List = %v; Is helper unavailable %v; want containerd's own Unavailable", err, errors.Is(err, rootclient.ErrUnavailable))
+	}
+	if strings.Contains(apihttp.Classify(err).Message, "root helper") {
+		t.Fatalf("the API blames the helper: %q", apihttp.Classify(err).Message)
+	}
+}
+
+// TestDeadlinesOnContainerdPathAre503 is review N3: a deadline that runs
+// out on the containerd path is a 503, as on the helper's own calls.
+func TestDeadlinesOnContainerdPathAre503(t *testing.T) {
+	t.Run("the helper stuck in a call", func(t *testing.T) {
+		p := sock(t)
+		serveWith(t, p, slowHelper{api: rootdpb.APIVersion}, func(_ any, ss grpc.ServerStream) error {
+			<-ss.Context().Done()
+			return ss.Context().Err()
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, err := containerd(t, client(t, p, time.Second)).ContainerService().List(ctx)
+		want503(t, "Containers.List", err, p)
+	})
+	t.Run("a hung handshake and a shorter caller deadline", func(t *testing.T) {
+		p := sock(t)
+		ln, err := net.Listen("unix", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				t.Cleanup(func() { _ = c.Close() })
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		_, err = containerd(t, client(t, p, 2*time.Second)).ContainerService().List(ctx)
+		want503(t, "Containers.List", err, p)
+	})
 }

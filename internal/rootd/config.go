@@ -49,6 +49,11 @@ const (
 	defaultJailUID = 1000
 	// nobodyUID is shared by every daemon that runs as nobody.
 	nobodyUID = 65534
+	// imageUID is what the chart and the images run the egress gateway
+	// (setpriv), edge, the operator and preflight as. The helper's
+	// environment names none of them on Kubernetes, so it is refused by
+	// number.
+	imageUID = 65532
 )
 
 // Config is the helper's own configuration. It comes from the helper's own
@@ -143,17 +148,34 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
-	socket := get("SB_ROOTD_SOCKET", DefaultSocket)
-	containerdSocket := get("SB_CONTAINERD_SOCKET", defaultContainerdSocket)
+	// Every path is cleaned before it is compared or used: /srv/ctr/ and
+	// /srv/ctr name one folder, and a prefix test on the raw text would
+	// tell them apart (review N6). A relative path is refused.
+	var pathErr error
+	path := func(k, def string) string {
+		raw := get(k, def)
+		if !filepath.IsAbs(raw) && pathErr == nil {
+			pathErr = fmt.Errorf("%s=%q: want an absolute path", k, raw)
+		}
+		return filepath.Clean(raw)
+	}
+	socket := path("SB_ROOTD_SOCKET", DefaultSocket)
+	containerdSocket := path("SB_CONTAINERD_SOCKET", defaultContainerdSocket)
 	// The agent's containerd driver keeps its per-sandbox host files under
 	// its run dir (internal/runtime/containerd hosts.go);
 	// TestHelperPolicyMatchesDriverLayout there pins the names.
-	runDir := get("SB_CONTAINERD_RUN_DIR", defaultRunDir)
-	mountsRoot := get("SB_MOUNTS_ROOT", defaultMountsRoot)
-	credDir := get("SB_MOUNTS_CRED_DIR", defaultCredDir)
-	dataDir := filepath.Dir(get("SB_DB_PATH", defaultDBPath))
-	stateDir := get("SB_ROOTD_STATE_DIR", DefaultStateDir)
-	fifoDir := get("SB_ROOTD_FIFO_DIR", defaultFIFODir)
+	runDir := path("SB_CONTAINERD_RUN_DIR", defaultRunDir)
+	mountsRoot := path("SB_MOUNTS_ROOT", defaultMountsRoot)
+	credDir := path("SB_MOUNTS_CRED_DIR", defaultCredDir)
+	dataDir := filepath.Dir(path("SB_DB_PATH", defaultDBPath))
+	stateDir := path("SB_ROOTD_STATE_DIR", DefaultStateDir)
+	fifoDir := path("SB_ROOTD_FIFO_DIR", defaultFIFODir)
+	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
+	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
+	netnsDir := path("SB_NETNS_DIR", defaultNetnsDir)
+	if pathErr != nil {
+		return Config{}, pathErr
+	}
 	// The agent owns its folders and can rename anything below them, a
 	// folder root made included, so nothing root trusts may sit there.
 	for _, h := range []struct{ name, dir string }{
@@ -176,8 +198,8 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		Policy: rootpolicy.Policy{
 			Namespace:       get("SB_CONTAINERD_NAMESPACE", defaultNamespace),
 			Snapshotter:     "overlayfs",
-			SnapshotterRoot: get("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot),
-			NetnsDir:        get("SB_NETNS_DIR", defaultNetnsDir),
+			SnapshotterRoot: snapshotterRoot,
+			NetnsDir:        netnsDir,
 			CgroupParent:    strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
 			BindRoots: []string{
 				filepath.Join(runDir, "hosts"),
@@ -187,7 +209,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 				filepath.Join(credDir, "docker", "ready"),
 				filepath.Join(dataDir, "egress-ca"),
 			},
-			BindFiles: []string{get("SB_TOOLBOX_BINARY_PATH", defaultToolbox)},
+			BindFiles: []string{toolbox},
 			// The two sockets that are as good as root: this helper's and
 			// containerd's.
 			ForbiddenRoots: []string{filepath.Dir(socket), filepath.Dir(containerdSocket)},
@@ -309,15 +331,17 @@ func lookupGroup(s string) (int, error) {
 }
 
 // checkAgentUIDIsItsOwn refuses an agent uid another AerolVM process runs
-// as, among those this config names. The peer check goes by uid, so on a
-// shared uid that other process, which may parse tenant traffic (the
-// egress gateway does), would pass for the agent (review H3). The edge
-// and the operator run as 65532 in their images, which no config here
-// names; the chart keeps the agent off it.
+// as: those this config names, and 65532, which the chart and images use
+// for several. The peer check goes by uid, so on a shared uid that other
+// process, which may parse tenant traffic (the egress gateway does), would
+// pass for the agent (review H3).
 func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
 	var who []string
-	if uid == nobodyUID {
+	switch uid {
+	case nobodyUID:
 		who = append(who, "nobody")
+	case imageUID:
+		who = append(who, "the egress gateway, edge and the operator in the chart and images")
 	}
 	for _, k := range []string{"SB_ISOLATE_JAIL_UID", "SB_JAILER_UID"} {
 		n, err := envInt(getenv, k, defaultJailUID)

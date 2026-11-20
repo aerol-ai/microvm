@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -171,9 +172,13 @@ func callCtx(t *testing.T) context.Context {
 
 func TestVersion(t *testing.T) {
 	r := newRig(t, nil)
-	resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{AgentVersion: "v9", AgentApi: rootdpb.APIVersion})
+	var trailer metadata.MD
+	resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{AgentVersion: "v9", AgentApi: rootdpb.APIVersion}, grpc.Trailer(&trailer))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(trailer.Get(rootdpb.AnsweredTrailer)) == 0 {
+		t.Fatal("Version carries no answered trailer")
 	}
 	if resp.GetHelperVersion() != version.Version || resp.GetApi() != rootdpb.APIVersion {
 		t.Fatalf("Version = %v", resp)
@@ -216,9 +221,14 @@ func TestRoute(t *testing.T) {
 	} {
 		t.Run(tc.method, func(t *testing.T) {
 			r := newRig(t, nil)
-			err := r.conn.Invoke(callCtx(t), tc.method, &emptypb.Empty{}, &emptypb.Empty{})
+			var trailer metadata.MD
+			err := r.conn.Invoke(callCtx(t), tc.method, &emptypb.Empty{}, &emptypb.Empty{}, grpc.Trailer(&trailer))
 			if status.Code(err) != tc.code {
 				t.Fatalf("err %v, want %v", err, tc.code)
+			}
+			// Every answer, an error included, says the helper gave it.
+			if len(trailer.Get(rootdpb.AnsweredTrailer)) == 0 {
+				t.Fatalf("no %s trailer on %v", rootdpb.AnsweredTrailer, err)
 			}
 			if got := slices.Contains(r.containerd.methods(), tc.method); got != tc.containerd {
 				t.Fatalf("containerd saw it: %v, want %v", got, tc.containerd)

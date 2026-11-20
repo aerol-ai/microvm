@@ -267,6 +267,53 @@ func (*HelperUnavailable) Descriptor() ([]byte, []int) {
 	return file_rootd_proto_rawDescGZIP(), []int{4}
 }
 
+// HelperUnsupported marks, the same way, a call that failed because the
+// helper is older than the agent. reason says which helper and what to do
+// (upgrade it). In Go it is an error that matches ErrHelperUnsupported.
+type HelperUnsupported struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Reason        string                 `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HelperUnsupported) Reset() {
+	*x = HelperUnsupported{}
+	mi := &file_rootd_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HelperUnsupported) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HelperUnsupported) ProtoMessage() {}
+
+func (x *HelperUnsupported) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HelperUnsupported.ProtoReflect.Descriptor instead.
+func (*HelperUnsupported) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *HelperUnsupported) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 var File_rootd_proto protoreflect.FileDescriptor
 
 const file_rootd_proto_rawDesc = "" +
@@ -281,7 +328,9 @@ const file_rootd_proto_rawDesc = "" +
 	"\bfeatures\x18\x03 \x03(\tR\bfeatures\"\x13\n" +
 	"\x11EnsureHostRequest\"\x14\n" +
 	"\x12EnsureHostResponse\"\x13\n" +
-	"\x11HelperUnavailable2\xb5\x01\n" +
+	"\x11HelperUnavailable\"+\n" +
+	"\x11HelperUnsupported\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason2\xb5\x01\n" +
 	"\n" +
 	"RootHelper\x12N\n" +
 	"\aVersion\x12 .aerolvm.rootd.v1.VersionRequest\x1a!.aerolvm.rootd.v1.VersionResponse\x12W\n" +
@@ -300,13 +349,14 @@ func file_rootd_proto_rawDescGZIP() []byte {
 	return file_rootd_proto_rawDescData
 }
 
-var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_rootd_proto_goTypes = []any{
 	(*VersionRequest)(nil),     // 0: aerolvm.rootd.v1.VersionRequest
 	(*VersionResponse)(nil),    // 1: aerolvm.rootd.v1.VersionResponse
 	(*EnsureHostRequest)(nil),  // 2: aerolvm.rootd.v1.EnsureHostRequest
 	(*EnsureHostResponse)(nil), // 3: aerolvm.rootd.v1.EnsureHostResponse
 	(*HelperUnavailable)(nil),  // 4: aerolvm.rootd.v1.HelperUnavailable
+	(*HelperUnsupported)(nil),  // 5: aerolvm.rootd.v1.HelperUnsupported
 }
 var file_rootd_proto_depIdxs = []int32{
 	0, // 0: aerolvm.rootd.v1.RootHelper.Version:input_type -> aerolvm.rootd.v1.VersionRequest
@@ -331,7 +381,7 @@ func file_rootd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rootd_proto_rawDesc), len(file_rootd_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

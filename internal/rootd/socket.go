@@ -27,14 +27,12 @@ import (
 // container can write). A plain file the agent left at the socket's name
 // cannot happen either, so it cannot stop the helper starting.
 //
-// The folder is opened once, one name at a time with no link followed,
-// and the chown, chmod and rename go through that open folder, not a path.
-// The rename replaces a socket left by a run that died, in one step.
+// The folder is opened once, one name at a time with no link followed, and
+// made where missing through the folder above it, never by path. The
+// chown, chmod and rename go through that open folder too. The rename
+// replaces a socket left by a run that died, in one step.
 func listen(path string, gid int) (*net.UnixListener, os.FileInfo, error) {
 	dir, name := filepath.Dir(path), filepath.Base(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, nil, fmt.Errorf("root helper: socket folder: %w", err)
-	}
 	dfd, err := openFolder(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("root helper: socket folder: %w", err)
@@ -97,6 +95,11 @@ func listen(path string, gid int) (*net.UnixListener, os.FileInfo, error) {
 // dir itself must be root's, or this process's user's in tests, and closed
 // to everyone else; a folder above it may instead be sticky (/tmp), where
 // no one else can rename what root put in it.
+//
+// A missing folder is made through the open, checked folder above it
+// (mkdirat), then opened and checked like the rest. Making the path first
+// and checking after would follow a link someone put on the way, and root
+// would make folders wherever it points before refusing (review N2).
 func openFolder(dir string) (int, error) {
 	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
 		return -1, fmt.Errorf("%s: want a clean absolute path", dir)
@@ -125,6 +128,14 @@ func openFolder(dir string) (int, error) {
 	for i, name := range parts {
 		at += "/" + name
 		next, err := unix.Openat(fd, name, folderFlags, 0)
+		if errors.Is(err, unix.ENOENT) {
+			// EEXIST is fine: the open below judges whatever is there.
+			if merr := unix.Mkdirat(fd, name, 0o755); merr != nil && !errors.Is(merr, unix.EEXIST) {
+				_ = unix.Close(fd)
+				return -1, fmt.Errorf("make %s: %w", at, merr)
+			}
+			next, err = unix.Openat(fd, name, folderFlags, 0)
+		}
 		_ = unix.Close(fd)
 		if err != nil {
 			return -1, fmt.Errorf("open %s without following a link: %w", at, err)

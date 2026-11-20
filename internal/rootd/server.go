@@ -29,6 +29,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -123,7 +124,9 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.ln, s.sock = ln, sock
 	sopts := append(slices.Clone(opts.ServerOptions),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
-		grpc.UnknownServiceHandler(s.route))
+		grpc.UnknownServiceHandler(s.route),
+		grpc.ChainUnaryInterceptor(answeredUnary),
+		grpc.ChainStreamInterceptor(answeredStream))
 	s.srv = grpc.NewServer(sopts...)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log})
 	return s, nil
@@ -160,6 +163,23 @@ func (s *Server) Shutdown(ctx context.Context) {
 			_ = os.Remove(s.cfg.Socket)
 		}
 	})
+}
+
+// answered is the trailer that says this server handled the call
+// (rootdpb.AnsweredTrailer), so the agent can tell containerd's own
+// Unavailable, passed on by the gate, from a helper it could not reach.
+var answered = metadata.Pairs(rootdpb.AnsweredTrailer, "1")
+
+func answeredUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+	_ = grpc.SetTrailer(ctx, answered)
+	return h(ctx, req)
+}
+
+// answeredStream covers the gate too: gRPC runs stream interceptors for
+// the unknown-service handler.
+func answeredStream(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, h grpc.StreamHandler) error {
+	ss.SetTrailer(answered)
+	return h(srv, ss)
 }
 
 func (s *Server) peerRefused(err error) {

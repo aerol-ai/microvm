@@ -112,6 +112,10 @@ func TestConfigFromEnv(t *testing.T) {
 		{"privileged, not in enterprise mode", map[string]string{"SB_CONTAINER_PRIVILEGED": "true", "SB_ENTERPRISE_MODE": "false"}, func(c *Config) {
 			c.Policy.Privileged = true
 		}},
+		{"paths written untidily are used clean", map[string]string{
+			"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/",
+			"SB_ROOTD_SOCKET":    "/run//aerolvm-rootd/./root.sock",
+		}, func(*Config) {}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := map[string]string{"SB_ROOTD_SOCKET_GROUP": gid}
@@ -152,12 +156,16 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"no pids limit", map[string]string{"SB_SANDBOX_PIDS_LIMIT": "0"}, nil, "above 0"},
 		{"memory not detected", map[string]string{}, errors.New("no /proc/meminfo"), "no /proc/meminfo"},
 		{"memory not detected, no reason", map[string]string{}, nil, "not detected"},
-		{"a relative socket", map[string]string{"SB_ROOTD_SOCKET": "root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "clean absolute path"},
-		{"a relative netns folder", map[string]string{"SB_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "netns dir"},
+		{"a relative socket", map[string]string{"SB_ROOTD_SOCKET": "root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
+		{"a relative netns folder", map[string]string{"SB_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_NETNS_DIR"},
+		{"a relative agent run dir", map[string]string{"SB_CONTAINERD_RUN_DIR": "data/ctr", "SB_HOST_MEMORY_MB": "1"}, nil, "want an absolute path"},
 		{"more memory than an int64 of bytes", map[string]string{"SB_HOST_MEMORY_MB": "9007199254740992"}, nil, "more than a machine can have"},
 		// Review H3: the peer check goes by uid, so the agent's must be its
 		// own.
 		{"the agent as nobody", map[string]string{"SB_ROOTD_AGENT_UID": "65534", "SB_HOST_MEMORY_MB": "1"}, nil, "nobody"},
+		// 65532 is the chart's egress gateway, edge and operator, though
+		// the helper's own environment names none of them.
+		{"the agent as the chart's shared uid", map[string]string{"SB_ROOTD_AGENT_UID": "65532", "SB_HOST_MEMORY_MB": "1"}, nil, "egress gateway, edge and the operator"},
 		{"the agent as the egress gateway", map[string]string{"SB_ROOTD_AGENT_UID": "65532", "SB_EGRESS_GATEWAY_USER": "65532", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_EGRESS_GATEWAY_USER"},
 		{"the agent as the egress gateway, uid:gid", map[string]string{"SB_ROOTD_AGENT_UID": "4000", "SB_EGRESS_GATEWAY_USER": "4000:4001", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_EGRESS_GATEWAY_USER"},
 		{"the agent as the jails' default user", map[string]string{"SB_ROOTD_AGENT_UID": "1000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
@@ -168,6 +176,11 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"the helper's state in the agent's data dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd", "SB_HOST_MEMORY_MB": "1"}, nil, "which the agent writes"},
 		{"FIFOs in the agent's run folder", map[string]string{"SB_ROOTD_FIFO_DIR": "/run/sandboxd/fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
 		{"the socket in the agent's mounts", map[string]string{"SB_ROOTD_SOCKET": "/var/lib/sandboxd/mounts/root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
+		// Review N6: the same folder written another way is the same folder.
+		{"the agent's run dir with a trailing slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_CONTAINERD_RUN_DIR": "/srv/ctr/", "SB_ROOTD_STATE_DIR": "/srv/ctr/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
+		{"the agent's mounts with a doubled slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_MOUNTS_ROOT": "/srv//mounts", "SB_ROOTD_STATE_DIR": "/srv/mounts/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
+		{"FIFOs through a dot", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_ROOTD_FIFO_DIR": "/data/./fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
+		{"the helper's state reached by climbing out", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/../sandboxd/x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubHost(t, 0, tc.host)

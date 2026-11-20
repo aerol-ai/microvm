@@ -24,6 +24,13 @@ const (
 	FeatureEnsureHost = "EnsureHost"
 )
 
+// AnsweredTrailer is the trailer the helper's server puts on every call it
+// handles, its own and the gate's. A failed call that carries it is the
+// helper's answer (a refusal, or containerd's own error passed on); one
+// without it failed between the agent and the helper. The agent's client
+// marks only the second kind as the helper unavailable.
+const AnsweredTrailer = "aerolvm-rootd-answered"
+
 // ErrHelperUnavailable: the helper could not be reached or did not answer.
 // internal/rootclient exports it as ErrUnavailable; it lives here so the
 // HelperUnavailable detail can match it.
@@ -36,3 +43,18 @@ func (*HelperUnavailable) Error() string { return ErrHelperUnavailable.Error() }
 // Is matches ErrHelperUnavailable, so errors.Is holds on the error
 // containerd's client returns.
 func (*HelperUnavailable) Is(target error) bool { return target == ErrHelperUnavailable }
+
+// ErrHelperUnsupported: the helper is older than the agent and lacks what
+// it asked for. internal/rootclient exports it as ErrUnsupported.
+var ErrHelperUnsupported = errors.New("root helper does not support this")
+
+// Error is the reason, so it reaches the API's message.
+func (d *HelperUnsupported) Error() string {
+	if d.GetReason() == "" {
+		return ErrHelperUnsupported.Error()
+	}
+	return d.GetReason()
+}
+
+// Is matches ErrHelperUnsupported.
+func (*HelperUnsupported) Is(target error) bool { return target == ErrHelperUnsupported }

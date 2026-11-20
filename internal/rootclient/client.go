@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"sync"
@@ -39,7 +40,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
@@ -68,7 +71,7 @@ var ErrUnavailable = rootdpb.ErrHelperUnavailable
 // ErrUnsupported: the helper is older than this agent and lacks what the
 // agent asked for. The API maps it to 503 too: the agent stages the newer
 // helper and the supervisor swaps it in (eng review D4).
-var ErrUnsupported = errors.New("root helper does not support this")
+var ErrUnsupported = rootdpb.ErrHelperUnsupported
 
 // Info is what the helper said in the handshake.
 type Info struct {
@@ -148,6 +151,10 @@ type Client struct {
 	sess     atomic.Pointer[session]
 	dials    atomic.Uint64 // successful dials of the helper's own connection
 	closed   bool
+	// tooOld is the last handshake's verdict when it found the helper too
+	// old, else nil. gRPC passes a dialer's error on as text only, so this
+	// is how a containerd call the dialer refused learns why (review N5).
+	tooOld atomic.Pointer[UnsupportedError]
 }
 
 // New returns a client. It does not dial: the first call does.
@@ -193,8 +200,9 @@ func (c *Client) Info() (Info, bool) {
 // handshake runs Version once for everyone who needs it now. With stale
 // set it runs it again on that session, unless another caller replaced the
 // session while this one waited. The mutex guards only the bookkeeping:
-// the call itself runs outside it, and callers that arrive during it wait
-// for its result (or their own context) instead of queueing a call each.
+// the call itself runs in its own goroutine (start), and every caller, the
+// one that started it included, waits for its result or its own context,
+// whichever ends first (review M2, N1).
 func (c *Client) handshake(ctx context.Context, stale *session) error {
 	c.mu.Lock()
 	if c.closed {
@@ -206,16 +214,32 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if a := c.inflight; a != nil {
-		c.mu.Unlock()
-		select {
-		case <-a.done:
-			return a.err
-		case <-ctx.Done():
-			return c.unavailable(ctx.Err())
+	a := c.inflight
+	if a == nil {
+		var err error
+		if a, err = c.startLocked(ctx, cur); err != nil {
+			c.mu.Unlock()
+			return err
 		}
 	}
-	conn, rpc, fresh := (*grpc.ClientConn)(nil), rootdpb.RootHelperClient(nil), cur == nil
+	c.mu.Unlock()
+	select {
+	case <-a.done:
+		return a.err
+	case <-ctx.Done():
+		return c.unavailable(ctx.Err())
+	}
+}
+
+// startLocked starts a handshake on cur's connection, or a new one. It runs
+// on ctx's values but not its cancel or deadline, bounded by the client's
+// timeout instead: the callers who share it each have their own deadline,
+// and the first one giving up (its request cancelled) must not fail the
+// rest (review N1).
+func (c *Client) startLocked(ctx context.Context, cur *session) (*attempt, error) {
+	fresh := cur == nil
+	var conn *grpc.ClientConn
+	var rpc rootdpb.RootHelperClient
 	if fresh {
 		var err error
 		conn, err = grpc.NewClient("passthrough:///aerolvm-rootd",
@@ -223,8 +247,7 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithConnectParams(connectParams(c.timeout)))
 		if err != nil {
-			c.mu.Unlock()
-			return c.unavailable(err)
+			return nil, c.unavailable(err)
 		}
 		rpc = rootdpb.NewRootHelperClient(conn)
 	} else {
@@ -232,8 +255,13 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 	}
 	a := &attempt{done: make(chan struct{}), conn: conn}
 	c.inflight = a
-	c.mu.Unlock()
+	go c.run(context.WithoutCancel(ctx), a, cur, rpc, fresh)
+	return a, nil
+}
 
+// run is one handshake. It records the result under the mutex and wakes
+// everyone waiting on a.
+func (c *Client) run(ctx context.Context, a *attempt, cur *session, rpc rootdpb.RootHelperClient, fresh bool) {
 	before := c.dials.Load()
 	hctx, cancel := context.WithTimeout(ctx, c.timeout)
 	resp, err := rpc.Version(hctx, &rootdpb.VersionRequest{AgentVersion: c.agentVersion, AgentApi: rootdpb.APIVersion})
@@ -252,6 +280,12 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 	case resp.GetApi() < rootdpb.MinHelperAPI:
 		err = &UnsupportedError{Helper: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}}
 	}
+	var ue *UnsupportedError
+	if errors.As(err, &ue) {
+		c.tooOld.Store(ue)
+	} else {
+		c.tooOld.Store(nil)
+	}
 	if err != nil {
 		// Drop the connection rather than keep it: gRPC would sit in its
 		// reconnect backoff, and the next caller should dial the moment
@@ -260,9 +294,9 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 		if cur != nil && c.sess.Load() == cur {
 			c.sess.Store(nil)
 		}
-		_ = conn.Close()
+		_ = a.conn.Close()
 		a.err = err
-		return err
+		return
 	}
 	// A dial other than the handshake's own, before or after its answer,
 	// may have reached a newer helper than the one that answered: leave
@@ -271,10 +305,9 @@ func (c *Client) handshake(ctx context.Context, stale *session) error {
 	if (fresh && after != before+1) || (!fresh && after != before) {
 		gen = 0
 	}
-	c.sess.Store(&session{conn: conn, rpc: rpc, gen: gen,
+	c.sess.Store(&session{conn: a.conn, rpc: rpc, gen: gen,
 		info: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}})
 	c.ready.Store(true)
-	return nil
 }
 
 // Require connects if needed and checks that the helper serves feature.
@@ -410,64 +443,102 @@ func (c *Client) DialContainerd(ctx context.Context, _ string) (net.Conn, error)
 // ContainerdOptions make containerd's Go client reach containerd through
 // the helper: cntr.New(c.Socket(), append(c.ContainerdOptions(), ...)...).
 // They come as extra dial options, after the client's own, so this dialer
-// and backoff replace containerd's; the interceptors mark a call the helper
-// did not answer (helperDown).
+// and backoff replace containerd's; the interceptors mark a call that
+// failed for want of the helper (markFailure).
 func (c *Client) ContainerdOptions() []cntr.Opt {
 	return []cntr.Opt{cntr.WithExtraDialOpts([]grpc.DialOption{
 		grpc.WithContextDialer(c.DialContainerd),
 		grpc.WithConnectParams(connectParams(c.timeout)),
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-			return markHelperDown(invoker(ctx, method, req, reply, cc, opts...))
+			var trailer metadata.MD
+			err := invoker(ctx, method, req, reply, cc, append(opts, grpc.Trailer(&trailer))...)
+			return c.markFailure(err, trailer)
 		}),
 		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 			s, err := streamer(ctx, desc, cc, method, opts...)
 			if err != nil {
-				return nil, markHelperDown(err)
+				return nil, c.markFailure(err, nil)
 			}
-			return markedStream{s}, nil
+			return markedStream{s, c}, nil
 		}),
 	})}
 }
 
-// markHelperDown marks a containerd call that failed with Unavailable on
-// the helper's socket, so the API answers 503 (review M1). containerd's
-// client rebuilds most errors from the gRPC status (errgrpc.ToNative),
-// which drops any Go error chain but keeps status details that are
-// errors. So the mark rides twice: as a detail of the status
-// (rootdpb.HelperUnavailable, an error that matches ErrUnavailable), for
-// the calls containerd converts, and in the chain of the error returned,
-// for the calls it hands back as they are.
-func markHelperDown(err error) error {
-	var marked *helperDown
-	if errors.As(err, &marked) {
+// markFailure marks a containerd call that failed for want of the helper,
+// so the API answers it as it answers the helper's own calls:
+//
+//   - a helper older than this agent (the dialer's handshake said so, in
+//     the error or in c.tooOld): ErrUnsupported, with the reason, "upgrade
+//     the helper" (review N5);
+//   - a deadline that ran out: ErrUnavailable, as for a typed call (N3);
+//   - Unavailable that the helper did not answer itself: the connection to
+//     it failed, so ErrUnavailable. Unavailable that it did answer (its
+//     trailer, rootdpb.AnsweredTrailer, is on the call) is containerd's own
+//     error passed on by the gate, and keeps containerd's meaning (N4).
+//
+// containerd's client rebuilds most errors from the gRPC status
+// (errgrpc.ToNative), which drops any Go error chain but keeps status
+// details that are errors. So the mark rides twice: as a detail of the
+// status (rootdpb.HelperUnavailable or HelperUnsupported), for the calls
+// containerd converts, and in the chain of the error returned, for the
+// calls it hands back as they are (review M1).
+func (c *Client) markFailure(err error, trailer metadata.MD) error {
+	var already *marked
+	if err == nil || errors.As(err, &already) {
 		return err
 	}
-	// An error whose chain already holds ErrUnavailable (gRPC keeps the
-	// dialer's error on some paths) is marked too: the chain does not
-	// survive containerd's conversion; only the detail does.
 	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.Unavailable {
+	if !ok {
 		return err
 	}
-	if withDetail, derr := st.WithDetails(&rootdpb.HelperUnavailable{}); derr == nil {
-		st = withDetail
+	ue, unreached := (*UnsupportedError)(nil), st.Code() == codes.Unavailable && len(trailer.Get(rootdpb.AnsweredTrailer)) == 0
+	if !errors.As(err, &ue) && unreached {
+		ue = c.tooOld.Load()
 	}
-	return &helperDown{st: st}
+	switch {
+	case ue != nil:
+		return mark(st, &rootdpb.HelperUnsupported{Reason: ue.Error()}, ErrUnsupported)
+	case unreached, st.Code() == codes.DeadlineExceeded:
+		return mark(st, &rootdpb.HelperUnavailable{}, ErrUnavailable)
+	}
+	return err
 }
 
-// helperDown is a failed call's status, marked.
-type helperDown struct{ st *status.Status }
+func mark(st *status.Status, detail protoadapt.MessageV1, is error) error {
+	if withDetail, err := st.WithDetails(detail); err == nil {
+		st = withDetail
+	}
+	return &marked{st: st, is: is}
+}
 
-func (e *helperDown) Error() string              { return e.st.Err().Error() }
-func (e *helperDown) GRPCStatus() *status.Status { return e.st }
-func (e *helperDown) Is(target error) bool       { return target == ErrUnavailable }
+// marked is a failed call's status, with the mark.
+type marked struct {
+	st *status.Status
+	is error
+}
+
+func (e *marked) Error() string              { return e.st.Err().Error() }
+func (e *marked) GRPCStatus() *status.Status { return e.st }
+func (e *marked) Is(target error) bool       { return target == e.is }
 
 // markedStream marks the errors of a streaming call (an event
-// subscription, a container list) as markHelperDown does.
-type markedStream struct{ grpc.ClientStream }
+// subscription, a container list) as markFailure does. The trailer is read
+// only after a receive failed, when gRPC has it; a failed send is the
+// connection's.
+type markedStream struct {
+	grpc.ClientStream
+	c *Client
+}
 
-func (s markedStream) RecvMsg(m any) error { return markHelperDown(s.ClientStream.RecvMsg(m)) }
-func (s markedStream) SendMsg(m any) error { return markHelperDown(s.ClientStream.SendMsg(m)) }
+func (s markedStream) RecvMsg(m any) error {
+	err := s.ClientStream.RecvMsg(m)
+	if err == nil || errors.Is(err, io.EOF) {
+		return err
+	}
+	return s.c.markFailure(err, s.Trailer())
+}
+
+func (s markedStream) SendMsg(m any) error { return s.c.markFailure(s.ClientStream.SendMsg(m), nil) }
 
 func connectParams(timeout time.Duration) grpc.ConnectParams {
 	bc := backoff.DefaultConfig

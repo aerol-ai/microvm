@@ -59,3 +59,10 @@ message EnsureHostResponse {}
 // errors (internal/rootclient). In Go it is an error that matches
 // ErrHelperUnavailable.
 message HelperUnavailable {}
+
+// HelperUnsupported marks, the same way, a call that failed because the
+// helper is older than the agent. reason says which helper and what to do
+// (upgrade it). In Go it is an error that matches ErrHelperUnsupported.
+message HelperUnsupported {
+  string reason = 1;
+}

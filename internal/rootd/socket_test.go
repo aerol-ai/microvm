@@ -121,3 +121,64 @@ func TestListenLeavesNothingBehindOnAFailedRename(t *testing.T) {
 		t.Fatalf("the folder is gone: %v", err)
 	}
 }
+
+// TestListenMakesNothingThroughALink is review N2: a missing socket folder
+// is made through the checked folder above it, never by path, so a link on
+// the way is refused before root makes anything where it points.
+func TestListenMakesNothingThroughALink(t *testing.T) {
+	dir := shortDir(t)
+	elsewhere := filepath.Join(dir, "elsewhere")
+	if err := os.Mkdir(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(dir, "aerolvm")); err != nil {
+		t.Fatal(err)
+	}
+	ln, _, err := listen(filepath.Join(dir, "aerolvm", "rootd", "root.sock"), os.Getgid())
+	if err == nil {
+		_ = ln.Close()
+		t.Fatal("listen followed the link")
+	}
+	if _, err := os.Lstat(filepath.Join(elsewhere, "rootd")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a folder was made through the link: %v", err)
+	}
+}
+
+// TestListenMakesMissingFolders: missing folders are made root's (here:
+// this test's user's) and closed, and the socket goes in the last.
+func TestListenMakesMissingFolders(t *testing.T) {
+	dir := shortDir(t)
+	path := filepath.Join(dir, "a", "b", "root.sock")
+	ln, _, err := listen(path, os.Getgid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	for _, d := range []string{filepath.Join(dir, "a"), filepath.Join(dir, "a", "b")} {
+		fi, err := os.Lstat(d)
+		if err != nil || !fi.IsDir() || fi.Mode().Perm()&0o022 != 0 {
+			t.Fatalf("%s: %v, %v", d, fi, err)
+		}
+	}
+}
+
+// TestMakeFolderFails: a name that cannot be made (a read-only folder) is
+// an error naming it.
+func TestMakeFolderFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only folder")
+	}
+	dir := shortDir(t)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	ln, _, err := listen(filepath.Join(dir, "new", "root.sock"), os.Getgid())
+	if err == nil {
+		_ = ln.Close()
+		t.Fatal("listen made a folder in a read-only one")
+	}
+	if !strings.Contains(err.Error(), "make "+filepath.Join(dir, "new")) {
+		t.Fatalf("listen = %v", err)
+	}
+}
