@@ -480,7 +480,8 @@ func (m *Manager) Discard(sandboxID string) {
 		_ = m.UnmountAll(sandboxID)
 		return
 	}
-	if models.ValidateSandboxID(sandboxID) != nil {
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
 		return
 	}
 	done, _ := m.claimOrphan(sandboxID)
@@ -488,7 +489,6 @@ func (m *Manager) Discard(sandboxID string) {
 		return
 	}
 	defer m.releaseOrphan(sandboxID, done)
-	dir := filepath.Join(m.rootDir, sandboxID)
 	if _, err := os.Stat(dir); err != nil {
 		return
 	}
