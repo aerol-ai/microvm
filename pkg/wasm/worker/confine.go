@@ -320,6 +320,11 @@ func (s *ResidentServer) prepare() { s.mediator() }
 
 // runWorker is RunCLI and RunCLIResident: the start-up above, then serve.
 func runWorker(socketPath string, srv workerServer) error {
+	// The worker resolves the names guests dial (the mediator dials by
+	// name). Go's own resolver keeps the C library's name-service modules,
+	// which load code at run time, out of a process under a syscall filter.
+	// Set first, before any goroutine of the worker can resolve a name.
+	net.DefaultResolver.PreferGo = true
 	if err := loadWorkerGuards(); err != nil {
 		return err
 	}
@@ -329,10 +334,6 @@ func runWorker(socketPath string, srv workerServer) error {
 	}
 	defer ln.Close()
 	defer srv.close()
-	// The worker resolves the names guests dial (the mediator dials by
-	// name). Go's own resolver keeps the C library's name-service modules,
-	// which load code at run time, out of a process under a syscall filter.
-	net.DefaultResolver.PreferGo = true
 	openWorkerDirs()
 	srv.prepare()
 	if err := confineFromEnv(); err != nil {

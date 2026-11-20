@@ -333,10 +333,10 @@ func directResolver(addr string) *net.Resolver {
 func waitRouteProbe(ctx context.Context, resolver *net.Resolver, timeout time.Duration, served <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		attempt := 2 * time.Second
-		if left := time.Until(deadline); left > 0 && left < attempt {
-			attempt = left
-		}
+		// Each probe gets what is left of the timeout, at most 2s; once
+		// the timeout has passed, none (it then fails at once and the wait
+		// ends), so a probe never runs past ProbeTimeout.
+		attempt := min(2*time.Second, max(time.Until(deadline), 0))
 		pctx, cancel := context.WithTimeout(ctx, attempt)
 		err := checkRouteResolver(pctx, resolver)
 		cancel()

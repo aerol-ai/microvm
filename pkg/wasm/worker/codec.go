@@ -72,13 +72,17 @@ func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
 		}
 		fds[i] = fd
 	}
-	n, _, err := uc.WriteMsgUnix(frame, syscall.UnixRights(fds...), nil)
+	// The descriptors ride the 4-byte header (sendmsg); the body goes with
+	// a plain write. The reader takes the header with recvmsg and the body
+	// with read (readFrameFiles): Go's race detector counts a write and a
+	// read on a descriptor as ordering the two goroutines, and does not
+	// count sendmsg or recvmsg, so a frame sent and read whole with those
+	// would leave the ordering the socket gives invisible to it.
+	n, _, err := uc.WriteMsgUnix(frame[:4], syscall.UnixRights(fds...), nil)
 	if err != nil {
 		return err
 	}
-	if n < len(frame) {
-		_, err = uc.Write(frame[n:])
-	}
+	_, err = uc.Write(frame[n:])
 	return err
 }
 
@@ -95,7 +99,7 @@ func readFrame(r io.Reader) (Envelope, error) {
 func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
 	uc, ok := r.(*net.UnixConn)
 	if !ok {
-		return readFrameFrom(r.Read, nil)
+		return readFrameFrom(r.Read, r.Read, nil)
 	}
 	var fds []int
 	truncated := false
@@ -110,7 +114,9 @@ func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
 		truncated = truncated || flags&syscall.MSG_CTRUNC != 0
 		return n, err
 	}
-	env, files, err := readFrameFrom(read, func() []int { return fds })
+	// Descriptors arrive with the header (writeFrameFiles); the body is
+	// read with read(2), which the race detector sees (see there).
+	env, files, err := readFrameFrom(read, uc.Read, func() []int { return fds })
 	if err != nil {
 		closeFiles(files)
 		return env, nil, err
@@ -122,7 +128,9 @@ func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
 	return env, files, nil
 }
 
-func readFrameFrom(read func([]byte) (int, error), received func() []int) (Envelope, []*os.File, error) {
+// readFrameFrom reads the 4-byte header with readHdr and the body with
+// readBody; received lists the descriptors read so far.
+func readFrameFrom(readHdr, readBody func([]byte) (int, error), received func() []int) (Envelope, []*os.File, error) {
 	var files []*os.File
 	collect := func() {
 		if received == nil {
@@ -132,7 +140,7 @@ func readFrameFrom(read func([]byte) (int, error), received func() []int) (Envel
 			files = append(files, os.NewFile(uintptr(fd), "granted"))
 		}
 	}
-	readFull := func(buf []byte, first bool) error {
+	readFull := func(read func([]byte) (int, error), buf []byte, first bool) error {
 		got := 0
 		for got < len(buf) {
 			n, err := read(buf[got:])
@@ -159,7 +167,7 @@ func readFrameFrom(read func([]byte) (int, error), received func() []int) (Envel
 		return nil
 	}
 	var hdr [4]byte
-	if err := readFull(hdr[:], true); err != nil {
+	if err := readFull(readHdr, hdr[:], true); err != nil {
 		return Envelope{}, files, err
 	}
 	size := binary.BigEndian.Uint32(hdr[:])
@@ -167,7 +175,7 @@ func readFrameFrom(read func([]byte) (int, error), received func() []int) (Envel
 		return Envelope{}, files, fmt.Errorf("invalid frame size %d", size)
 	}
 	body := make([]byte, size)
-	if err := readFull(body, false); err != nil {
+	if err := readFull(readBody, body, false); err != nil {
 		return Envelope{}, files, err
 	}
 	var env Envelope
