@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // A sandbox's mount folder (rootDir/<id>) holds its mount points. Removing
@@ -29,6 +31,23 @@ var errStillMounted = errors.New("still mounted")
 
 // mountInfoPath lists this process's mounts. A var so tests can stand one in.
 var mountInfoPath = "/proc/self/mountinfo"
+
+// mountFolder is sandboxID's mount folder, rootDir/<id>, or false for an id
+// mountSet would refuse. The id reaches here from API and cluster routes,
+// and code scanning (go/path-injection) does not count ValidateSandboxID
+// as a path check: it trusts only a cleaned path seen to keep its prefix,
+// so that is the value returned.
+func (m *Manager) mountFolder(sandboxID string) (string, bool) {
+	if models.ValidateSandboxID(sandboxID) != nil {
+		return "", false
+	}
+	root := filepath.Clean(m.rootDir)
+	dir := filepath.Clean(filepath.Join(root, sandboxID))
+	if !strings.HasPrefix(dir, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return dir, true
+}
 
 // clearMountDir removes dir, one sandbox's mount folder, once nothing is
 // mounted under it. Anything that still is gets its helpers stopped and is

@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -273,11 +272,10 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		for _, s := range established {
 			_ = m.tearDownState(s)
 		}
-		// The id was validated at entry; the prefix check keeps this
-		// removal inside rootDir on its own. clearMountDir also takes down
-		// a mount the loop had not reached (in adopt mode, a live one a
-		// previous sandboxd left) before it removes anything.
-		if dir := filepath.Clean(filepath.Join(m.rootDir, sandboxID)); strings.HasPrefix(dir, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
+		// clearMountDir also takes down a mount the loop had not reached
+		// (in adopt mode, a live one a previous sandboxd left) before it
+		// removes anything.
+		if dir, ok := m.mountFolder(sandboxID); ok {
 			_ = m.clearMountDir(dir)
 		}
 		return nil, failed
@@ -306,10 +304,11 @@ func (m *Manager) UnmountAll(sandboxID string) error {
 		}
 	}
 	// No folder was ever made for an id mountSet would refuse.
-	if models.ValidateSandboxID(sandboxID) != nil {
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
 		return firstErr
 	}
-	if err := m.clearMountDir(filepath.Join(m.rootDir, sandboxID)); err != nil && firstErr == nil {
+	if err := m.clearMountDir(dir); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr

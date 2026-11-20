@@ -314,3 +314,33 @@ func TestUnmountAllBadIDAndNoFolder(t *testing.T) {
 		t.Fatalf("UnmountAll(no folder) = %v", err)
 	}
 }
+
+// TestMountFolder: the folder of a valid id is the cleaned rootDir/<id>,
+// and an id that could leave rootDir, or that mountSet would refuse, has
+// none, so UnmountAll and the rollback never build a path from it.
+func TestMountFolder(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{rootDir: root + string(filepath.Separator) + "." + string(filepath.Separator)}
+	cases := []struct {
+		id     string
+		want   string
+		wantOK bool
+	}{
+		{"sb-1234abcd", filepath.Join(root, "sb-1234abcd"), true},
+		{"caller_chosen-ID", filepath.Join(root, "caller_chosen-ID"), true},
+		{"", "", false},
+		{".", "", false},
+		{"..", "", false},
+		{"../escape", "", false},
+		{"a/b", "", false},
+		{"/etc", "", false},
+		{"sb 1", "", false},
+		{strings.Repeat("a", 129), "", false},
+	}
+	for _, c := range cases {
+		got, ok := m.mountFolder(c.id)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("mountFolder(%q) = %q, %v; want %q, %v", c.id, got, ok, c.want, c.wantOK)
+		}
+	}
+}
