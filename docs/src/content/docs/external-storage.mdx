@@ -130,7 +130,7 @@ Files your code writes to `/workspace` go straight to the bucket, and stay there
 | `s3` | An Amazon S3 bucket, or any S3-compatible store | `s3://bucket/prefix` or just `bucket` | `access_key_id`, `secret_access_key`, `session_token` (all optional) |
 | `nfs` | A shared folder on your network (NFS) | `host:/exports/path` | None |
 | `sshfs` | A folder on any server you can reach with SSH | `user@host:/path` | `private_key_pem` (required) |
-| `rclone` | Any storage that rclone supports, such as Google Drive or Azure | `remote:path` | `rclone_conf` (the text of an `rclone.conf` file) |
+| `rclone` | Remote storage that rclone supports, such as Google Drive or Azure. See [which rclone storage is accepted](#which-rclone-storage-is-accepted). | `remote:path`, where `remote` is a section of `rclone_conf`, or `:backend:path` | `rclone_conf` (the text of an `rclone.conf` file) |
 
 With no S3 credentials, the server uses its own AWS access, such as a cloud machine role, if it has one.
 
@@ -153,9 +153,48 @@ For example, an NFS share that code can read but not change is `{ type: "nfs", s
 |---|---|---|
 | `s3` | `region` | The bucket's region, such as `us-east-1`. |
 | `s3` | `endpoint` | The address of an S3-compatible store, such as MinIO or Cloudflare R2. |
-| `s3` | `extra_args` | More `mount-s3` flags, separated by spaces. |
-| `nfs` | `opts` | NFS mount options, separated by commas. The default is `rw`. |
-| `rclone` | `vfs_cache_mode` | rclone's file cache mode. The default is `writes`. |
+| `s3` | `extra_args` | More `mount-s3` flags, separated by spaces, such as `--allow-delete --uid 1000`. Only the flags listed below are accepted. |
+| `nfs` | `opts` | NFS mount options, separated by commas, such as `vers=4.1,hard`. The default is `rw`. Only the options listed below are accepted. |
+| `rclone` | `vfs_cache_mode` | rclone's file cache mode: `off`, `minimal`, `writes` or `full`. The default is `writes`. |
+
+### Which flags are accepted
+
+The server runs the mount program itself, with full rights on its own machine. So it accepts only flags that change how your storage is reached, read and written. It refuses a flag that names a file or folder on the server, uses the server's own credentials or settings, sends data somewhere else, or starts another program. A refused flag gets a `400` error that names the flag.
+
+In `extra_args`, write a flag as `--flag value` or `--flag=value`. Short forms such as `-d` are refused.
+
+| `mount-s3` flags in `extra_args` | |
+|---|---|
+| What the sandbox may do | `--allow-delete`, `--allow-overwrite`, `--incremental-upload`, `--read-only`, `--allow-other`, `--allow-root`, `--uid`, `--gid`, `--dir-mode`, `--file-mode` |
+| Reaching the bucket | `--region`, `--endpoint-url`, `--force-path-style`, `--transfer-acceleration`, `--dual-stack`, `--requester-pays`, `--no-sign-request`, `--bucket-type`, `--expected-bucket-owner` |
+| Writing new objects | `--storage-class`, `--sse`, `--sse-kms-key-id`, `--upload-checksums`, `--infer-content-type` |
+| Speed | `--maximum-throughput-gbps`, `--max-threads`, `--memory-target`, `--part-size`, `--read-part-size`, `--write-part-size`, `--metadata-ttl`, `--negative-metadata-ttl` |
+| Refused, for example | `--cache`, `--log-directory`, `--ca-bundle`, `--profile`, `--otlp-endpoint`, `--bind`, `--debug`, `--prefix` (use `source` for the prefix) |
+
+| NFS options in `opts` | |
+|---|---|
+| Version and network | `vers` and `nfsvers` (`3`, `4`, `4.0`, `4.1`, `4.2`), `minorversion`, `proto` and `mountproto` (`tcp`, `udp`, `rdma`, `tcp6`, `udp6`, `rdma6`), `port`, `mountport`, `mountvers`, `nconnect`, `max_connect`, `tcp`, `udp`, `rdma`, `resvport`, `noresvport`, `sec` (`sys`, `krb5`, `krb5i`, `krb5p`, joined with `:`) |
+| Timeouts and retries | `hard`, `soft`, `softerr`, `softreval`, `nosoftreval`, `intr`, `nointr`, `timeo`, `retrans`, `retry` |
+| Sizes and caching | `rsize`, `wsize`, `bsize`, `namlen`, `ac`, `noac`, `acregmin`, `acregmax`, `acdirmin`, `acdirmax`, `actimeo`, `cto`, `nocto`, `lookupcache` (`all`, `none`, `pos`, `positive`), `sharecache`, `nosharecache`, `rdirplus`, `nordirplus` |
+| Locking and ACLs | `lock`, `nolock`, `local_lock` (`all`, `flock`, `posix`, `none`), `acl`, `noacl` |
+| General | `ro`, `rw`, `sync`, `async`, `atime`, `noatime`, `diratime`, `nodiratime`, `relatime`, `norelatime`, `strictatime`, `nostrictatime`, `lazytime`, `nolazytime`, `exec`, `noexec`, `nosuid`, `nodev`, `nosymfollow`, `_netdev`, `nofail` |
+| Refused, for example | `suid`, `dev`, `defaults`, `remount`, `bind`, `loop`, `helper`, `context`, `x-mount.mkdir`, `bg`, `fsc`, `clientaddr` |
+
+- **Options that take a number take digits only,** such as `timeo=600` or `--uid 1000`. `opts` may not hold spaces or quotes.
+- **Every NFS mount gets `nosuid,nodev`,** whatever `opts` says. A program on the share cannot gain extra rights, and a device file on it does not work.
+- **`extra_args` is for S3 mounts only, and `opts` for NFS mounts only.** The server refuses them on other types. SSH and rclone mounts take no extra flags.
+- **The same rules apply when a sandbox starts again.** A sandbox made before a flag was refused does not start with it: the start fails with an error that names the mount and the flag. Create the sandbox again without that flag.
+
+### Which rclone storage is accepted
+
+rclone takes no flags from you, but `source` and `rclone_conf` pick a storage type (a backend) and set its options. So both are checked: the backend that `source` names, and every `[section]` of `rclone_conf`, whether `source` uses it or not.
+
+- **Accepted backends reach storage over the network:** `s3`, `b2`, `gcs` (or `google cloud storage`), `drive`, `dropbox`, `onedrive`, `box`, `azureblob`, `azurefiles`, `swift`, `sftp`, `ftp`, `http`, `webdav`, `smb`, `pcloud`, `mega`, `jottacloud`, `koofr`, `yandex`, `mailru`, `opendrive`, `pikpak`, `putio`, `qingstor`, `seafile`, `sharefile`, `storj`, `sugarsync`, `zoho`, `hidrive`, `internetarchive`, `netstorage`, `oracleobjectstorage`, `protondrive`, `quatrix`, `filefabric`, `fichier`, `premiumizeme`, `linkbox`, `pixeldrain` and `gphotos` (or `google photos`).
+- **`alias`, `crypt`, `chunker`, `compress` and `hasher` are accepted when they wrap one of those:** their `remote` must be another section of `rclone_conf` or `:backend:path`.
+- **Refused backends:** `local` (a folder on the server), `union`, `combine`, `cache`, `hdfs`, and any backend not listed.
+- **Refused options:** `ssh` and any option ending in `_command` (they run a program), any option ending in `_file`, `_path` or `_dir` (a file or folder on the server, such as `key_file`), `key_use_agent`, `profile`, and any `global.` or `override.` option. Put key material in the config itself instead, for example `key_pem` for `sftp`.
+- **In `source`, settings after a comma are checked the same way** (`remote,key_file=...:path` is refused), and `type`, `remote` and `upstreams` cannot be set there.
+- **`rclone_conf` must be plain:** `[section]` lines and `key = value` lines. An encrypted `rclone.conf` is refused, since its settings cannot be checked.
 
 ## What happens when the sandbox stops
 
@@ -182,7 +221,7 @@ stateDiagram-v2
 - **So every secret belongs in `credentials`.** The server refuses a create that puts a secret-like name in `options` or `source`. Examples are an `extra_args` flag like `--s3-secret-access-key` or `--key`, a word like `AWS_SECRET_ACCESS_KEY=...`, or an rclone source like `:s3,secret_access_key=...:bucket`. It also refuses an AWS access key id, and a link with a user name or password in it (`https://user:pass@host`). The error names the field to use instead, never the secret.
 
 <Aside type="caution" title="Anyone with an API token is trusted with the server">
-The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server itself, outside every sandbox, as the server's own user. They receive your `source` and `options` as given. The server refuses a `source` that a mount program could mistake for one of its own options. Still, give API tokens only to people you would trust to run the server.
+The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server itself, outside every sandbox, as the server's own user. They receive your `source` and `options`. The server refuses a `source` that a mount program could mistake for one of its own options, and accepts only the [flags](#which-flags-are-accepted) and [rclone storage](#which-rclone-storage-is-accepted) listed above. Still, give API tokens only to people you would trust to run the server.
 </Aside>
 
 ## Good to know

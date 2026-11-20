@@ -2081,8 +2081,10 @@ func failoverCreatedAtFrom(ctx context.Context) time.Time {
 // validateCreateMounts applies the mount policy to a create request. The
 // placement rule (credentials must be in Credentials, never in Source or
 // Options, which are replicated in the clear) is enforced on new requests and
-// only logged on a stored-spec replay — see storedSpecReplayKey.
-func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string) error {
+// only logged on a stored-spec replay — see storedSpecReplayKey. platform is
+// the attachments resolvePlatformVolumes made for this create (nil when it
+// made none).
+func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string, platform []models.VolumeAttachment) error {
 	if len(mounts) > models.MaxMountsPerSandbox {
 		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
 	}
@@ -2121,6 +2123,17 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	}
 	if err := validateUniqueMountTargets(mounts); err != nil {
 		return err
+	}
+	// The mount-tool allow lists hold on every create, a replay included:
+	// unlike a misplaced credential, a refused flag is only harmless if it
+	// never runs. They are for the caller's mounts: platform names the
+	// mounts this create made from platform volumes, and a rebuild's mounts
+	// are all platform volumes built here (rebuildSpecWithoutHostPowers
+	// refuses any other), both from configuration daemon start checked.
+	if !isRebuiltSpec(ctx) {
+		if err := s.checkCallerMountTools(ctx, sandboxID, mounts, platform); err != nil {
+			return err
+		}
 	}
 	// A node that cannot keep a mount where the sandbox is built (a
 	// Kubernetes worker pod with external storage off, F13) refuses here,
@@ -2553,7 +2566,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
+	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride, platformAttachments); err != nil {
 		return nil, err
 	}
 
@@ -4026,7 +4039,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 			return nil, loadErr
 		}
 		if len(specs) > 0 {
-			if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+			if err := s.reestablishMounts(ctx, id, specs); err != nil {
 				return nil, fmt.Errorf("reestablish mounts: %w", err)
 			}
 			wasmRehydrateBinds = s.mounts.HostBindsFor(id)
@@ -4071,7 +4084,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 		return nil, err
 	}
 	if len(specs) > 0 {
-		if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+		if err := s.reestablishMounts(ctx, id, specs); err != nil {
 			releaseAdmission()
 			return nil, fmt.Errorf("reestablish mounts: %w", err)
 		}
@@ -7371,7 +7384,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
 			} else if len(specs) > 0 {
-				if err := s.mounts.Reestablish(ctx, sandbox.ID, specs); err != nil {
+				if err := s.reestablishMounts(ctx, sandbox.ID, specs); err != nil {
 					s.logger.Warn("reestablish mounts", "sandbox_id", sandbox.ID, "error", err)
 				}
 			}

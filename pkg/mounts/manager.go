@@ -461,6 +461,41 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 	}
 }
 
+// Discard tears down every mount of sandboxID and mounts nothing: the ones
+// this process tracks, and whatever a previous sandboxd left serving them
+// (a helper still running, a kernel mount still in place). The service
+// calls it when it refuses to run a sandbox's stored mounts again, so a
+// refused helper does not keep running after a restart. The untracked part
+// is claimed the way Sweep claims an orphan, so a MountAll in flight for
+// the ID keeps its directory: Discard leaves it to that call. Either way
+// the folder goes through clearMountDir, never through a live mount.
+func (m *Manager) Discard(sandboxID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	_, tracked := m.state[sandboxID]
+	m.mu.Unlock()
+	if tracked {
+		_ = m.UnmountAll(sandboxID)
+		return
+	}
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return
+	}
+	done, _ := m.claimOrphan(sandboxID)
+	if done == nil {
+		return
+	}
+	defer m.releaseOrphan(sandboxID, done)
+	if _, err := os.Stat(dir); err != nil {
+		return
+	}
+	m.logger.Info("mounts: discarding refused mounts", "sandbox_id", sandboxID, "path", dir)
+	m.cleanupOrphanDir(dir)
+}
+
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
 // missing. Called by the reconciler at startup and periodically. It mounts
 // only through mountSet, so its mounts are owned against Sweep the same way.
