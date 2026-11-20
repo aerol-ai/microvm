@@ -431,6 +431,12 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 		HasSnapshot: true, HasOverlay: true, SnapshotMemoryPath: "/tmp/snap.mem", SnapshotStatePath: "/tmp/snap.state", SnapshotChecksum: "abc", SnapshotVsockCID: 200,
 	})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-path", Image: "alpine", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
+	// Snapshot artifacts but no rootfs: LoadSnapshot could not open the
+	// root drive, so the pool must not try.
+	mustCreateTemplate(&models.Template{
+		ID: "tpl-no-rootfs", Image: "alpine", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now,
+		HasSnapshot: true, SnapshotMemoryPath: "/tmp/r.mem", SnapshotStatePath: "/tmp/r.state", SnapshotVsockCID: 201,
+	})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-snap", Image: "alpine", Status: models.TemplateStatusReadyNoSnapshot, CreatedAt: now, UpdatedAt: now, HasSnapshot: false})
 	mustCreateTemplate(&models.Template{ID: "tpl-pending", Image: "alpine", Status: models.TemplateStatusPending, CreatedAt: now, UpdatedAt: now, HasSnapshot: true, SnapshotMemoryPath: "/tmp/x", SnapshotStatePath: "/tmp/y"})
 
@@ -441,7 +447,7 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("len(ListWarmableTemplates) = %d, want 1 (%+v)", len(got), got)
 	}
-	if got[0].TemplateID != "tpl-warm" || got[0].SnapshotMemoryPath == "" || got[0].SnapshotStatePath == "" || got[0].VsockCID != 200 || !got[0].HasOverlay {
+	if got[0].TemplateID != "tpl-warm" || got[0].RootfsPath != "/tmp/rootfs.ext4" || got[0].SnapshotMemoryPath == "" || got[0].SnapshotStatePath == "" || got[0].VsockCID != 200 || !got[0].HasOverlay {
 		t.Fatalf("unexpected warmable template: %+v", got[0])
 	}
 }

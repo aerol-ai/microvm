@@ -34,9 +34,16 @@ func TestWarmSpawn_ExtraCoverage(t *testing.T) {
 		t.Errorf("expected missing paths error, got %v", err)
 	}
 
+	// Missing template rootfs
+	if _, err := d.WarmSpawn(context.Background(), WarmSpawnRequest{
+		SlotID: "slot1", SnapshotMemoryPath: "/mem", SnapshotStatePath: "/state", VsockCID: 3,
+	}); err == nil || !strings.Contains(err.Error(), "template rootfs path is required") {
+		t.Errorf("expected missing rootfs error, got %v", err)
+	}
+
 	// Invalid CID
 	if _, err := d.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot1", SnapshotMemoryPath: "/mem", SnapshotStatePath: "/state", VsockCID: 2,
+		SlotID: "slot1", RootfsPath: "/rootfs", SnapshotMemoryPath: "/mem", SnapshotStatePath: "/state", VsockCID: 2,
 	}); err == nil || !strings.Contains(err.Error(), "VsockCID=2 is reserved") {
 		t.Errorf("expected invalid CID error, got %v", err)
 	}
