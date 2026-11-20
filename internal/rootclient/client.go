@@ -6,9 +6,15 @@
 // (Service.EnsureLayer4Ready): an atomic.Bool latch for the steady state, a
 // sync.Mutex so a burst of first callers dials and shakes hands once, and a
 // failed handshake leaves the latch unset so the next caller tries again.
-// A helper that is down fails a call at once, or within Config.Timeout if
-// it hangs, with an error that wraps ErrUnavailable, which the API turns
-// into a 503; it never hangs a create.
+// The mutex is not held across the handshake itself: callers that arrive
+// during it wait for its result, so all of them finish within
+// Config.Timeout even when the helper hangs (review M2).
+//
+// A helper that is down, hung or not root fails a call at once, or within
+// Config.Timeout, with an error that wraps ErrUnavailable, which the API
+// turns into a 503; it never hangs a create. That holds on the containerd
+// path too: a call containerd's client makes through the helper carries
+// ErrUnavailable through containerd's own error conversion (review M1).
 //
 // Agent N must work with helper N-1 (eng review D5). The handshake reads
 // which calls this helper serves; a call it lacks is refused here, before
@@ -35,15 +41,17 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
 const (
 	// DefaultSocket is where the helper listens (internal/rootd).
-	DefaultSocket = "/run/aerolvm/root.sock"
-	// DefaultTimeout bounds one connect and handshake. The helper is a
-	// local process; anything slower is a helper that is stuck.
+	DefaultSocket = "/run/aerolvm-rootd/root.sock"
+	// DefaultTimeout bounds one connect, one handshake, and a typed call
+	// whose context has no deadline. The helper is a local process;
+	// anything slower is a helper that is stuck.
 	DefaultTimeout = 2 * time.Second
 	// maxReconnectDelay caps gRPC's reconnect backoff. Its default grows to
 	// two minutes, and containerd's client to ten seconds; a helper that
@@ -52,9 +60,10 @@ const (
 	maxReconnectDelay = time.Second
 )
 
-// ErrUnavailable: the helper could not be reached or did not answer. The
-// API maps it to 503: the supervisor restarts a helper that died.
-var ErrUnavailable = errors.New("root helper unavailable")
+// ErrUnavailable: the helper could not be reached, did not answer in time,
+// or is not root. The API maps it to 503: the supervisor restarts a helper
+// that died.
+var ErrUnavailable = rootdpb.ErrHelperUnavailable
 
 // ErrUnsupported: the helper is older than this agent and lacks what the
 // agent asked for. The API maps it to 503 too: the agent stages the newer
@@ -94,12 +103,17 @@ func (e *UnsupportedError) Is(target error) bool { return target == ErrUnsupport
 type Config struct {
 	// Socket is the helper's socket. Empty means DefaultSocket.
 	Socket string
-	// Timeout bounds each connect and each handshake. Zero means
-	// DefaultTimeout.
+	// Timeout bounds each connect, each handshake, and each typed call
+	// whose context has no deadline. Zero means DefaultTimeout.
 	Timeout time.Duration
 	// AgentVersion goes into the handshake, for the helper's log. Empty
 	// means this build's version.
 	AgentVersion string
+	// HelperUID is the uid the process serving the socket must run as,
+	// read with SO_PEERCRED on Linux: 0, root, outside tests. Whatever can
+	// bind the socket's path otherwise gets every containerd spec the agent
+	// sends and answers for the helper (review M3).
+	HelperUID uint32
 }
 
 // session is one connection to the helper and what its handshake said.
@@ -107,9 +121,18 @@ type session struct {
 	conn *grpc.ClientConn
 	rpc  rootdpb.RootHelperClient
 	info Info
-	// gen is the count of dials when the handshake ran. A later dial means
-	// the helper may have been swapped for a newer one.
+	// gen is the count of dials when the handshake ran, or 0 when a dial
+	// may have come between the handshake and that count. A later dial
+	// means the helper may have been swapped for a newer one.
 	gen uint64
+}
+
+// attempt is a handshake in flight; callers that arrive during it share
+// its result.
+type attempt struct {
+	done chan struct{}
+	conn *grpc.ClientConn // closed by Close, to end the attempt at once
+	err  error
 }
 
 // Client talks to the helper. It is safe for concurrent use.
@@ -117,17 +140,20 @@ type Client struct {
 	socket       string
 	timeout      time.Duration
 	agentVersion string
+	peer         egress.PeerCheck
 
-	ready  atomic.Bool // latch: a handshake succeeded on the current session
-	mu     sync.Mutex  // single flight for handshakes; guards closed and session swaps
-	sess   atomic.Pointer[session]
-	dials  atomic.Uint64 // successful dials of the helper's own connection
-	closed bool
+	ready    atomic.Bool // latch: a handshake succeeded on the current session
+	mu       sync.Mutex  // single flight: guards inflight, closed and session swaps
+	inflight *attempt
+	sess     atomic.Pointer[session]
+	dials    atomic.Uint64 // successful dials of the helper's own connection
+	closed   bool
 }
 
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
-	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, agentVersion: cfg.AgentVersion}
+	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, agentVersion: cfg.AgentVersion,
+		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, "")}
 	if c.socket == "" {
 		c.socket = DefaultSocket
 	}
@@ -164,57 +190,91 @@ func (c *Client) Info() (Info, bool) {
 	return Info{}, false
 }
 
-// handshake runs Version under the single flight. With stale set it runs
-// it again on the live session, unless another caller already replaced that
-// session while this one waited for the lock.
+// handshake runs Version once for everyone who needs it now. With stale
+// set it runs it again on that session, unless another caller replaced the
+// session while this one waited. The mutex guards only the bookkeeping:
+// the call itself runs outside it, and callers that arrive during it wait
+// for its result (or their own context) instead of queueing a call each.
 func (c *Client) handshake(ctx context.Context, stale *session) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
-		return fmt.Errorf("%w: the client is closed", ErrUnavailable)
+		c.mu.Unlock()
+		return c.closedErr()
 	}
-	s := c.sess.Load()
-	if stale == nil && c.ready.Load() {
+	cur := c.sess.Load()
+	if (stale == nil && c.ready.Load()) || (stale != nil && cur != stale) {
+		c.mu.Unlock()
 		return nil
 	}
-	if stale != nil && s != stale {
-		return nil
+	if a := c.inflight; a != nil {
+		c.mu.Unlock()
+		select {
+		case <-a.done:
+			return a.err
+		case <-ctx.Done():
+			return c.unavailable(ctx.Err())
+		}
 	}
-	if s == nil {
-		conn, err := grpc.NewClient("passthrough:///aerolvm-rootd",
+	conn, rpc, fresh := (*grpc.ClientConn)(nil), rootdpb.RootHelperClient(nil), cur == nil
+	if fresh {
+		var err error
+		conn, err = grpc.NewClient("passthrough:///aerolvm-rootd",
 			grpc.WithContextDialer(c.dialOwn),
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithConnectParams(connectParams(c.timeout)))
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrUnavailable, err)
+			c.mu.Unlock()
+			return c.unavailable(err)
 		}
-		s = &session{conn: conn, rpc: rootdpb.NewRootHelperClient(conn)}
+		rpc = rootdpb.NewRootHelperClient(conn)
+	} else {
+		conn, rpc = cur.conn, cur.rpc
 	}
+	a := &attempt{done: make(chan struct{}), conn: conn}
+	c.inflight = a
+	c.mu.Unlock()
+
+	before := c.dials.Load()
 	hctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	resp, err := s.rpc.Version(hctx, &rootdpb.VersionRequest{AgentVersion: c.agentVersion, AgentApi: rootdpb.APIVersion})
+	resp, err := rpc.Version(hctx, &rootdpb.VersionRequest{AgentVersion: c.agentVersion, AgentApi: rootdpb.APIVersion})
+	cancel()
+	after := c.dials.Load()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inflight = nil
+	defer close(a.done)
+	switch {
+	case c.closed:
+		err = c.closedErr()
+	case err != nil:
+		err = c.unavailable(err)
+	case resp.GetApi() < rootdpb.MinHelperAPI:
+		err = &UnsupportedError{Helper: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}}
+	}
 	if err != nil {
 		// Drop the connection rather than keep it: gRPC would sit in its
 		// reconnect backoff, and the next caller should dial the moment
 		// the helper is back.
-		c.dropLocked(s)
-		return c.unavailable(err)
+		c.ready.Store(false)
+		if cur != nil && c.sess.Load() == cur {
+			c.sess.Store(nil)
+		}
+		_ = conn.Close()
+		a.err = err
+		return err
 	}
-	info := Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}
-	if info.API < rootdpb.MinHelperAPI {
-		c.dropLocked(s)
-		return &UnsupportedError{Helper: info}
+	// A dial other than the handshake's own, before or after its answer,
+	// may have reached a newer helper than the one that answered: leave
+	// gen 0, so the next missing feature asks again (review L4).
+	gen := after
+	if (fresh && after != before+1) || (!fresh && after != before) {
+		gen = 0
 	}
-	c.sess.Store(&session{conn: s.conn, rpc: s.rpc, info: info, gen: c.dials.Load()})
+	c.sess.Store(&session{conn: conn, rpc: rpc, gen: gen,
+		info: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}})
 	c.ready.Store(true)
 	return nil
-}
-
-// dropLocked forgets s and unlatches, so the next caller dials afresh.
-func (c *Client) dropLocked(s *session) {
-	c.ready.Store(false)
-	c.sess.Store(nil)
-	_ = s.conn.Close()
 }
 
 // Require connects if needed and checks that the helper serves feature.
@@ -260,23 +320,45 @@ func (c *Client) EnsureHost(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.rpc.EnsureHost(ctx, &rootdpb.EnsureHostRequest{})
-	return c.callErr(s, rootdpb.FeatureEnsureHost, err)
+	cctx, cancel := c.callContext(ctx)
+	defer cancel()
+	_, err = s.rpc.EnsureHost(cctx, &rootdpb.EnsureHostRequest{})
+	return c.callErr(ctx, s, rootdpb.FeatureEnsureHost, err)
 }
 
-// callErr turns a typed call's gRPC error into the client's own: a helper
-// that went away is ErrUnavailable, a call it turns out not to have is an
-// UnsupportedError. Anything else is the helper's answer, as it came.
-func (c *Client) callErr(s *session, feature string, err error) error {
+// callContext bounds a typed call by the client's timeout when the caller
+// set no deadline: a helper stuck inside a call must not hang a create
+// (review M4).
+func (c *Client) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.timeout)
+}
+
+// callErr turns a typed call's gRPC error into the client's own. A helper
+// that went away, did not answer in time, or whose connection this client
+// closed under the call (a failed re-handshake) is ErrUnavailable; a call
+// it turns out not to have is an UnsupportedError. A cancel that is the
+// caller's own, and anything else the helper answered, comes back as it is.
+func (c *Client) callErr(ctx context.Context, s *session, feature string, err error) error {
 	switch status.Code(err) {
 	case codes.OK:
 		return nil
-	case codes.Unavailable:
+	case codes.Unavailable, codes.DeadlineExceeded:
 		return c.unavailable(err)
+	case codes.Canceled:
+		if ctx.Err() == nil {
+			return c.unavailable(err)
+		}
 	case codes.Unimplemented:
 		return &UnsupportedError{Feature: feature, Helper: s.info}
 	}
 	return err
+}
+
+func (c *Client) closedErr() error {
+	return fmt.Errorf("%w: the client is closed", ErrUnavailable)
 }
 
 func (c *Client) noSession() error {
@@ -284,6 +366,9 @@ func (c *Client) noSession() error {
 }
 
 func (c *Client) unavailable(err error) error {
+	if errors.Is(err, ErrUnavailable) {
+		return err
+	}
 	return fmt.Errorf("%w at %s: %w", ErrUnavailable, c.socket, err)
 }
 
@@ -296,9 +381,19 @@ func (c *Client) dialOwn(ctx context.Context, _ string) (net.Conn, error) {
 	return conn, err
 }
 
+// dial connects to the socket and checks that root serves it. Every error
+// wraps ErrUnavailable.
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	d := net.Dialer{Timeout: c.timeout}
-	return d.DialContext(ctx, "unix", c.socket)
+	conn, err := d.DialContext(ctx, "unix", c.socket)
+	if err != nil {
+		return nil, c.unavailable(err)
+	}
+	if err := c.peer(conn); err != nil {
+		_ = conn.Close()
+		return nil, c.unavailable(fmt.Errorf("the process serving it is not the helper: %w", err))
+	}
+	return conn, nil
 }
 
 // DialContainerd is the dialer containerd's client uses: it makes sure
@@ -315,13 +410,64 @@ func (c *Client) DialContainerd(ctx context.Context, _ string) (net.Conn, error)
 // ContainerdOptions make containerd's Go client reach containerd through
 // the helper: cntr.New(c.Socket(), append(c.ContainerdOptions(), ...)...).
 // They come as extra dial options, after the client's own, so this dialer
-// and backoff replace containerd's.
+// and backoff replace containerd's; the interceptors mark a call the helper
+// did not answer (helperDown).
 func (c *Client) ContainerdOptions() []cntr.Opt {
 	return []cntr.Opt{cntr.WithExtraDialOpts([]grpc.DialOption{
 		grpc.WithContextDialer(c.DialContainerd),
 		grpc.WithConnectParams(connectParams(c.timeout)),
+		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			return markHelperDown(invoker(ctx, method, req, reply, cc, opts...))
+		}),
+		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			s, err := streamer(ctx, desc, cc, method, opts...)
+			if err != nil {
+				return nil, markHelperDown(err)
+			}
+			return markedStream{s}, nil
+		}),
 	})}
 }
+
+// markHelperDown marks a containerd call that failed with Unavailable on
+// the helper's socket, so the API answers 503 (review M1). containerd's
+// client rebuilds most errors from the gRPC status (errgrpc.ToNative),
+// which drops any Go error chain but keeps status details that are
+// errors. So the mark rides twice: as a detail of the status
+// (rootdpb.HelperUnavailable, an error that matches ErrUnavailable), for
+// the calls containerd converts, and in the chain of the error returned,
+// for the calls it hands back as they are.
+func markHelperDown(err error) error {
+	var marked *helperDown
+	if errors.As(err, &marked) {
+		return err
+	}
+	// An error whose chain already holds ErrUnavailable (gRPC keeps the
+	// dialer's error on some paths) is marked too: the chain does not
+	// survive containerd's conversion; only the detail does.
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Unavailable {
+		return err
+	}
+	if withDetail, derr := st.WithDetails(&rootdpb.HelperUnavailable{}); derr == nil {
+		st = withDetail
+	}
+	return &helperDown{st: st}
+}
+
+// helperDown is a failed call's status, marked.
+type helperDown struct{ st *status.Status }
+
+func (e *helperDown) Error() string              { return e.st.Err().Error() }
+func (e *helperDown) GRPCStatus() *status.Status { return e.st }
+func (e *helperDown) Is(target error) bool       { return target == ErrUnavailable }
+
+// markedStream marks the errors of a streaming call (an event
+// subscription, a container list) as markHelperDown does.
+type markedStream struct{ grpc.ClientStream }
+
+func (s markedStream) RecvMsg(m any) error { return markHelperDown(s.ClientStream.RecvMsg(m)) }
+func (s markedStream) SendMsg(m any) error { return markHelperDown(s.ClientStream.SendMsg(m)) }
 
 func connectParams(timeout time.Duration) grpc.ConnectParams {
 	bc := backoff.DefaultConfig
@@ -330,15 +476,20 @@ func connectParams(timeout time.Duration) grpc.ConnectParams {
 	return grpc.ConnectParams{Backoff: bc, MinConnectTimeout: timeout}
 }
 
-// Close closes the helper's connection. Calls after it fail with
-// ErrUnavailable. containerd's client has its own connection, which its
-// Close closes.
+// Close closes the helper's connection, and ends a handshake in flight.
+// Calls after it fail with ErrUnavailable. containerd's client has its own
+// connection, which its Close closes.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
+	c.ready.Store(false)
 	if s := c.sess.Load(); s != nil {
-		c.dropLocked(s)
+		c.sess.Store(nil)
+		_ = s.conn.Close()
+	}
+	if a := c.inflight; a != nil {
+		_ = a.conn.Close()
 	}
 	return nil
 }

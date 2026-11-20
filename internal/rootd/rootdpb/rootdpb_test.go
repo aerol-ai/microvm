@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -94,6 +95,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.VersionResponse":    {"helper_version=1:string", "api=2:uint32", "features=3:repeated string"},
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
 		"aerolvm.rootd.v1.EnsureHostResponse": nil,
+		"aerolvm.rootd.v1.HelperUnavailable":  nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -177,6 +179,7 @@ func TestStubsRoundTrip(t *testing.T) {
 		&VersionResponse{HelperVersion: "h", Api: 1, Features: []string{"x"}},
 		&EnsureHostRequest{},
 		&EnsureHostResponse{},
+		&HelperUnavailable{},
 	} {
 		b, err := proto.Marshal(m)
 		if err != nil {
@@ -201,5 +204,26 @@ func TestStubsRoundTrip(t *testing.T) {
 	var u UnimplementedRootHelperServer
 	if _, err := u.Version(context.Background(), nil); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("Unimplemented Version = %v", err)
+	}
+}
+
+// TestHelperUnavailableIsTheError: the detail the agent's client adds is an
+// error matching ErrHelperUnavailable, and stays one after a trip through
+// a gRPC status's details, which is how containerd's client hands it back.
+func TestHelperUnavailableIsTheError(t *testing.T) {
+	var d error = &HelperUnavailable{}
+	if !errors.Is(d, ErrHelperUnavailable) || d.Error() != ErrHelperUnavailable.Error() || errors.Is(d, errors.New("x")) {
+		t.Fatalf("detail %v does not match ErrHelperUnavailable", d)
+	}
+	st, err := status.New(codes.Unavailable, "down").WithDetails(&HelperUnavailable{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := status.Convert(st.Err()).Details()
+	if len(back) != 1 {
+		t.Fatalf("details %v", back)
+	}
+	if e, ok := back[0].(error); !ok || !errors.Is(e, ErrHelperUnavailable) {
+		t.Fatalf("detail after the trip: %T %v", back[0], back[0])
 	}
 }

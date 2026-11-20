@@ -3,9 +3,11 @@ package rootclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,10 @@ func sockPath(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	// The helper follows no link to its socket (macOS: /var is one).
+	if d, err = filepath.EvalSymlinks(d); err != nil {
+		t.Fatal(err)
+	}
 	return filepath.Join(d, "root.sock")
 }
 
@@ -115,7 +121,8 @@ func serveFake(t *testing.T, sock string, f *fakeHelper) *running {
 
 func newClient(t *testing.T, sock string) *Client {
 	t.Helper()
-	c := New(Config{Socket: sock, Timeout: 500 * time.Millisecond, AgentVersion: "agent-test"})
+	// The test's own process serves the fakes, so it stands in for root.
+	c := New(Config{Socket: sock, Timeout: 500 * time.Millisecond, AgentVersion: "agent-test", HelperUID: uint32(os.Getuid())})
 	t.Cleanup(func() { _ = c.Close() })
 	return c
 }
@@ -468,11 +475,44 @@ func TestContainerdDialFailsFast(t *testing.T) {
 	defer ctr.Close()
 	start := time.Now()
 	_, err = ctr.Version(ctxT(t))
-	if err == nil || !strings.Contains(err.Error(), ErrUnavailable.Error()) {
-		t.Fatalf("Version = %v, want the helper named unavailable", err)
+	if !errors.Is(err, ErrUnavailable) || status.Code(err) != codes.Unavailable {
+		t.Fatalf("Version = %v, want ErrUnavailable with code Unavailable", err)
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("took %v", d)
+	}
+}
+
+// TestDefaultSocketIsTheHelpers: the agent dials where the helper listens.
+func TestDefaultSocketIsTheHelpers(t *testing.T) {
+	if DefaultSocket != rootd.DefaultSocket {
+		t.Fatalf("agent dials %s, the helper listens on %s", DefaultSocket, rootd.DefaultSocket)
+	}
+}
+
+// TestServerMustBeRoot is review M3: on Linux the client reads who serves
+// the socket and talks only to the configured uid (root, outside tests).
+// Anyone else that binds the path gets nothing: no handshake, and no
+// containerd call.
+func TestServerMustBeRoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("SO_PEERCRED is Linux only")
+	}
+	sock := sockPath(t)
+	f := helperAt(rootdpb.APIVersion, rootdpb.FeatureEnsureHost)
+	serveFake(t, sock, f)
+	c := New(Config{Socket: sock, Timeout: 500 * time.Millisecond, HelperUID: uint32(os.Getuid()) + 1})
+	defer c.Close()
+	err := c.Ensure(ctxT(t))
+	if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "not the helper") {
+		t.Fatalf("Ensure against a non-root server = %v", err)
+	}
+	if conn, err := c.DialContainerd(ctxT(t), ""); err == nil {
+		_ = conn.Close()
+		t.Fatal("DialContainerd reached a non-root server")
+	}
+	if v, _ := f.counts(); v != 0 {
+		t.Fatalf("%d handshakes reached the impostor", v)
 	}
 }
 
@@ -521,5 +561,101 @@ func eventually(t *testing.T, fn func() error) {
 			t.Fatalf("still failing: %v", err)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// hangingSocket accepts connections and never answers, like a helper that
+// is stuck.
+func hangingSocket(t *testing.T, sock string) {
+	t.Helper()
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+}
+
+// TestWaitingCallers: callers that arrive during a handshake wait for it,
+// but no longer than their own context, and Close ends it for everyone.
+func TestWaitingCallers(t *testing.T) {
+	t.Run("a waiter's own deadline", func(t *testing.T) {
+		sock := sockPath(t)
+		hangingSocket(t, sock)
+		c := New(Config{Socket: sock, Timeout: 5 * time.Second, HelperUID: uint32(os.Getuid())})
+		defer c.Close()
+		go func() { _ = c.Ensure(context.Background()) }()
+		eventually(t, func() error {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.inflight == nil {
+				return errors.New("no handshake in flight yet")
+			}
+			return nil
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if err := c.Ensure(ctx); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Ensure = %v, want ErrUnavailable", err)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("the waiter waited %v past its 100ms deadline", d)
+		}
+	})
+	t.Run("Close during a handshake", func(t *testing.T) {
+		sock := sockPath(t)
+		hangingSocket(t, sock)
+		c := New(Config{Socket: sock, Timeout: 5 * time.Second, HelperUID: uint32(os.Getuid())})
+		done := make(chan error, 1)
+		go func() { done <- c.Ensure(context.Background()) }()
+		eventually(t, func() error {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.inflight == nil {
+				return errors.New("no handshake in flight yet")
+			}
+			return nil
+		})
+		_ = c.Close()
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "closed") {
+				t.Fatalf("Ensure = %v, want the closed client's ErrUnavailable", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("Close did not end the handshake")
+		}
+	})
+}
+
+// TestRefreshOnAGoneHelper: a missing call on a connection that has
+// dropped asks the helper again; with the helper gone that is
+// ErrUnavailable, and the next call dials afresh.
+func TestRefreshOnAGoneHelper(t *testing.T) {
+	sock := sockPath(t)
+	h := serveFake(t, sock, helperAt(rootdpb.MinHelperAPI))
+	c := newClient(t, sock)
+	if err := c.Ensure(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.Stop()
+	_ = os.Remove(sock)
+	eventually(t, func() error {
+		if err := c.Require(ctxT(t), rootdpb.FeatureEnsureHost); !errors.Is(err, ErrUnavailable) {
+			return fmt.Errorf("Require = %v, want ErrUnavailable", err)
+		}
+		return nil
+	})
+	if c.ready.Load() {
+		t.Fatal("a failed refresh must unlatch")
 	}
 }

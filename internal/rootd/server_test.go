@@ -36,6 +36,10 @@ func shortDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	// The helper follows no link to its socket (macOS: /var is one).
+	if d, err = filepath.EvalSymlinks(d); err != nil {
+		t.Fatal(err)
+	}
 	return d
 }
 

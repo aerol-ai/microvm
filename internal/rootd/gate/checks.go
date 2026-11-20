@@ -38,6 +38,9 @@ func (g *Gate) checkContainer(ctx context.Context, c rootpolicy.Container) error
 	if err := g.checkBinds(c); err != nil {
 		return err
 	}
+	if err := g.checkReads(c); err != nil {
+		return err
+	}
 	return g.checkNetns(ctx, c)
 }
 

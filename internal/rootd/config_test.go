@@ -52,12 +52,14 @@ func TestConfigFromEnv(t *testing.T) {
 				"/var/lib/sandboxd/egress-ca",
 			},
 			BindFiles:      []string{"/usr/local/bin/toolboxd"},
-			ForbiddenRoots: []string{"/run/aerolvm", "/run/containerd"},
-			MovesDir:       "/var/lib/sandboxd/containerd/moves",
-			FIFODir:        "/run/aerolvm/fifo",
+			ForbiddenRoots: []string{"/run/aerolvm-rootd", "/run/containerd"},
+			// What root reads on the agent's word lives in the helper's
+			// own folders, never the agent's (review H2).
+			MovesDir: "/var/lib/aerolvm-rootd/moves",
+			FIFODir:  "/run/aerolvm-rootd/fifo",
 			RunscConfigPaths: []string{
-				"/var/lib/sandboxd/containerd/runsc/config.toml",
-				"/var/lib/sandboxd/containerd/runsc/restore.toml",
+				"/var/lib/aerolvm-rootd/runsc/config.toml",
+				"/var/lib/aerolvm-rootd/runsc/restore.toml",
 			},
 			// Pids: gVisor's host limit for the node's 4096 (pkg/gvisorpids:
 			// two host tasks per sandbox task, plus headroom).
@@ -90,14 +92,15 @@ func TestConfigFromEnv(t *testing.T) {
 			"SB_MOUNTS_CRED_DIR":          "/run/sbd",
 			"SB_DB_PATH":                  "/data/state/state.db",
 			"SB_TOOLBOX_BINARY_PATH":      "/opt/aerolvm/toolboxd",
-			"SB_ROOTD_FIFO_DIR":           "/run/aerolvm/io",
+			"SB_ROOTD_FIFO_DIR":           "/run/rootd-io",
+			"SB_ROOTD_STATE_DIR":          "/data/rootd",
 		}, func(c *Config) {
 			p := &c.Policy
 			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/var/run/netns"
 			p.BindRoots = []string{"/data/ctr/hosts", "/data/mounts", "/run/sbd/docker/ready", "/data/state/egress-ca"}
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
-			p.MovesDir, p.FIFODir = "/data/ctr/moves", "/run/aerolvm/io"
-			p.RunscConfigPaths = []string{"/data/ctr/runsc/config.toml", "/data/ctr/runsc/restore.toml"}
+			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
+			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
 		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
@@ -151,6 +154,20 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"memory not detected, no reason", map[string]string{}, nil, "not detected"},
 		{"a relative socket", map[string]string{"SB_ROOTD_SOCKET": "root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "clean absolute path"},
 		{"a relative netns folder", map[string]string{"SB_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "netns dir"},
+		{"more memory than an int64 of bytes", map[string]string{"SB_HOST_MEMORY_MB": "9007199254740992"}, nil, "more than a machine can have"},
+		// Review H3: the peer check goes by uid, so the agent's must be its
+		// own.
+		{"the agent as nobody", map[string]string{"SB_ROOTD_AGENT_UID": "65534", "SB_HOST_MEMORY_MB": "1"}, nil, "nobody"},
+		{"the agent as the egress gateway", map[string]string{"SB_ROOTD_AGENT_UID": "65532", "SB_EGRESS_GATEWAY_USER": "65532", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_EGRESS_GATEWAY_USER"},
+		{"the agent as the egress gateway, uid:gid", map[string]string{"SB_ROOTD_AGENT_UID": "4000", "SB_EGRESS_GATEWAY_USER": "4000:4001", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_EGRESS_GATEWAY_USER"},
+		{"the agent as the jails' default user", map[string]string{"SB_ROOTD_AGENT_UID": "1000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
+		{"the agent as the jailer", map[string]string{"SB_ROOTD_AGENT_UID": "2000", "SB_JAILER_UID": "2000", "SB_ISOLATE_JAIL_UID": "3000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_JAILER_UID"},
+		{"a jail uid that does not parse", map[string]string{"SB_ISOLATE_JAIL_UID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
+		// Review H2: what root reads must not sit where the agent writes.
+		{"runsc configs in the agent's run dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd/containerd/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
+		{"the helper's state in the agent's data dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd", "SB_HOST_MEMORY_MB": "1"}, nil, "which the agent writes"},
+		{"FIFOs in the agent's run folder", map[string]string{"SB_ROOTD_FIFO_DIR": "/run/sandboxd/fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
+		{"the socket in the agent's mounts", map[string]string{"SB_ROOTD_SOCKET": "/var/lib/sandboxd/mounts/root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubHost(t, 0, tc.host)
@@ -292,9 +309,9 @@ func TestListenFails(t *testing.T) {
 			if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 				t.Fatalf("something was left at %s: %v", path, err)
 			}
-			leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".rootd-*"))
+			leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".root.sock.*"))
 			if len(leftovers) != 0 {
-				t.Fatalf("private folders left: %v", leftovers)
+				t.Fatalf("half-made sockets left: %v", leftovers)
 			}
 		})
 	}

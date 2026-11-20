@@ -94,7 +94,7 @@ func TestPeerCheckOtherUsers(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to run callers as other users")
 	}
-	const agent, group = 65532, 4242
+	const agent, group = 65531, 4242
 	// The child runs this binary, which sits in a folder only root can
 	// read: copy it where the other users can run it.
 	exe, err := os.Executable()

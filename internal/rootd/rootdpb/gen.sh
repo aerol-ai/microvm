@@ -22,6 +22,13 @@ protoc \
 	--go-grpc_out=. --go-grpc_opt=paths=source_relative \
 	rootd.proto
 
+# The generated headers name the protoc that made them. Drop that line so
+# any protoc that produces the same code passes rootd-proto-check.
+for f in rootd.pb.go rootd_grpc.pb.go; do
+	grep -v -E '^//[[:space:]]+(- )?protoc[[:space:]]+v[0-9]' "$f" >"$bin/$f"
+	mv "$bin/$f" "$f"
+done
+
 if command -v sha256sum >/dev/null 2>&1; then
 	sha256sum rootd.proto rootd.pb.go rootd_grpc.pb.go >rootd.sum
 else

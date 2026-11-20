@@ -68,6 +68,10 @@ func shortDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	// The helper follows no link to its socket (macOS: /var is one).
+	if d, err = filepath.EvalSymlinks(d); err != nil {
+		t.Fatal(err)
+	}
 	return d
 }
 
@@ -144,7 +148,7 @@ func TestPolicyComesFromTheHelpersEnv(t *testing.T) {
 	var logs syncBuffer
 	serving(t, cfg, &logs)
 
-	agent := rootclient.New(rootclient.Config{Socket: cfg.Socket})
+	agent := rootclient.New(rootclient.Config{Socket: cfg.Socket, HelperUID: uint32(os.Getuid())})
 	defer agent.Close()
 	for _, tc := range []struct {
 		namespace string
@@ -205,7 +209,7 @@ func TestServeWaitsForContainerd(t *testing.T) {
 		serving(t, cfg, &logs)
 		time.Sleep(50 * time.Millisecond)
 		serveContainerd(t, cfg.ContainerdSocket, &fakeContainerd{})
-		agent := rootclient.New(rootclient.Config{Socket: cfg.Socket, Timeout: 200 * time.Millisecond})
+		agent := rootclient.New(rootclient.Config{Socket: cfg.Socket, Timeout: 200 * time.Millisecond, HelperUID: uint32(os.Getuid())})
 		defer agent.Close()
 		deadline := time.Now().Add(5 * time.Second)
 		for agent.Ensure(ctxT(t)) != nil {

@@ -1,9 +1,9 @@
 // The root helper's own API (plans/security-gaps-m1-m4.md §3.3).
 //
 // The agent, sandboxd running as a user with no rights, calls it over
-// /run/aerolvm/root.sock. containerd's own API shares that socket and that
-// gRPC server, behind the gate (internal/rootd/gate), so one peer check
-// covers both (eng review D3).
+// /run/aerolvm-rootd/root.sock. containerd's own API shares that socket
+// and that gRPC server, behind the gate (internal/rootd/gate), so one peer
+// check covers both (eng review D3).
 //
 // Agent N must work with helper N-1 (eng review D5, D22): the helper is
 // swapped after the agent, so for a while a new agent talks to the old
@@ -51,3 +51,11 @@ message VersionResponse {
 message EnsureHostRequest {}
 
 message EnsureHostResponse {}
+
+// HelperUnavailable marks a call that failed because the agent's client
+// could not reach the helper. It never crosses the socket: the client adds
+// it to the failed call's gRPC status, because containerd's Go client
+// rebuilds every error from the status and keeps only details that are
+// errors (internal/rootclient). In Go it is an error that matches
+// ErrHelperUnavailable.
+message HelperUnavailable {}

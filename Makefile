@@ -84,9 +84,10 @@ build-rootd:
 	CGO_ENABLED=0 $(GO) build -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o $(BIN_DIR)/aerolvm-rootd ./cmd/aerolvm-rootd
 
 # The root helper's gRPC code, from internal/rootd/rootdpb/rootd.proto.
-# Needs protoc. make test checks the checked-in code against the proto
-# without it (rootdpb TestGeneratedCodeIsCurrent); the check target
-# regenerates and fails on any difference.
+# Needs protoc (any version: gen.sh drops the line naming it). make test
+# checks the checked-in code against the proto without it (rootdpb
+# TestGeneratedCodeIsCurrent); the check target regenerates and fails on
+# any difference.
 rootd-proto:
 	$(GO) generate ./internal/rootd/rootdpb
 

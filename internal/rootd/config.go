@@ -3,6 +3,7 @@ package rootd
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -15,13 +16,23 @@ import (
 )
 
 // Defaults for the socket and its peer (plans/security-gaps-m1-m4.md §3.3).
-// The policy's folders default to sandboxd's own defaults (internal/config),
-// so a helper beside an agent with default settings needs none either.
+// The folders the agent fills default to sandboxd's own defaults
+// (internal/config), so a helper beside an agent with default settings
+// needs none either. The files root itself reads or runs default to the
+// helper's own folders, which the agent cannot write (review H2).
 const (
-	DefaultSocket      = "/run/aerolvm/root.sock"
+	// DefaultSocket sits in a folder of the helper's own: the socket's
+	// folder must be root's alone (listen), and /run/aerolvm, where it was
+	// first meant to go, is an emptyDir every worker container can write.
+	DefaultSocket      = "/run/aerolvm-rootd/root.sock"
 	DefaultSocketGroup = "aerolvm"
-	// DefaultAgentUID is the agent's uid on Kubernetes (runAsUser 65532).
-	DefaultAgentUID = 65532
+	// DefaultAgentUID is a uid nothing else in AerolVM runs as. The peer
+	// check goes by uid, so the agent's must be its own: 65532 is the
+	// egress gateway's, edge's and the operator's, and 65534 is nobody's.
+	DefaultAgentUID = 65531
+	// DefaultStateDir holds what root reads on the agent's word: the runsc
+	// configs and the gVisor moves folder.
+	DefaultStateDir = "/var/lib/aerolvm-rootd"
 
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 	defaultNamespace        = "aerolvm"
@@ -32,8 +43,12 @@ const (
 	defaultCredDir          = "/run/sandboxd"
 	defaultDBPath           = "/var/lib/sandboxd/state.db"
 	defaultToolbox          = "/usr/local/bin/toolboxd"
-	defaultFIFODir          = "/run/aerolvm/fifo"
+	defaultFIFODir          = "/run/aerolvm-rootd/fifo"
 	defaultPidsLimit        = 4096
+	// sandboxd's defaults for the users its jails run as.
+	defaultJailUID = 1000
+	// nobodyUID is shared by every daemon that runs as nobody.
+	nobodyUID = 65534
 )
 
 // Config is the helper's own configuration. It comes from the helper's own
@@ -73,6 +88,9 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// maxMemoryMB keeps the node's memory in bytes within an int64.
+const maxMemoryMB = math.MaxInt64 >> 20
+
 // detectHost reads the node's memory and CPUs; tests replace it.
 var detectHost = capacity.DetectHost
 
@@ -81,8 +99,11 @@ var detectHost = capacity.DetectHost
 // this config bounds what root does for the agent.
 //
 // The policy's names match sandboxd's (SB_CONTAINERD_NAMESPACE,
-// SB_CONTAINERD_RUN_DIR, SB_CONTAINER_PRIVILEGED, ...) so one setting in the
-// chart or the unit reaches both processes, but each reads its own copy.
+// SB_CONTAINERD_RUN_DIR, SB_CONTAINER_PRIVILEGED, ...) so the operator sets
+// one value for both processes, but each reads its own copy. The helper's
+// copy must come from somewhere only root can write: an env file the agent
+// can edit (sandboxd's own, or one its upgrade path rewrites) would let it
+// set SB_CONTAINER_PRIVILEGED for root.
 func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	get := func(k, def string) string {
 		if v := strings.TrimSpace(getenv(k)); v != "" {
@@ -103,6 +124,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		// root process on the host would pass the peer check.
 		return Config{}, errors.New("SB_ROOTD_AGENT_UID: the agent must not run as root")
 	}
+	if err := checkAgentUIDIsItsOwn(getenv, uid); err != nil {
+		return Config{}, err
+	}
 	privileged, err := envBool(getenv, "SB_CONTAINER_PRIVILEGED")
 	if err != nil {
 		return Config{}, err
@@ -121,11 +145,28 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 
 	socket := get("SB_ROOTD_SOCKET", DefaultSocket)
 	containerdSocket := get("SB_CONTAINERD_SOCKET", defaultContainerdSocket)
-	// The agent's containerd driver keeps its per-sandbox files under its
-	// run dir (internal/runtime/containerd: hosts.go, gvisor_move.go,
-	// runsc_config.go); TestHelperPolicyMatchesDriverLayout there pins
-	// these names.
+	// The agent's containerd driver keeps its per-sandbox host files under
+	// its run dir (internal/runtime/containerd hosts.go);
+	// TestHelperPolicyMatchesDriverLayout there pins the names.
 	runDir := get("SB_CONTAINERD_RUN_DIR", defaultRunDir)
+	mountsRoot := get("SB_MOUNTS_ROOT", defaultMountsRoot)
+	credDir := get("SB_MOUNTS_CRED_DIR", defaultCredDir)
+	dataDir := filepath.Dir(get("SB_DB_PATH", defaultDBPath))
+	stateDir := get("SB_ROOTD_STATE_DIR", DefaultStateDir)
+	fifoDir := get("SB_ROOTD_FIFO_DIR", defaultFIFODir)
+	// The agent owns its folders and can rename anything below them, a
+	// folder root made included, so nothing root trusts may sit there.
+	for _, h := range []struct{ name, dir string }{
+		{"SB_ROOTD_SOCKET", filepath.Dir(socket)},
+		{"SB_ROOTD_STATE_DIR", stateDir},
+		{"SB_ROOTD_FIFO_DIR", fifoDir},
+	} {
+		for _, a := range []string{runDir, mountsRoot, credDir, dataDir} {
+			if h.dir == a || strings.HasPrefix(h.dir, a+"/") {
+				return Config{}, fmt.Errorf("%s: %s is inside %s, which the agent writes", h.name, h.dir, a)
+			}
+		}
+	}
 	cfg := Config{
 		Socket:           socket,
 		SocketGID:        gid,
@@ -140,21 +181,21 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			CgroupParent:    strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
 			BindRoots: []string{
 				filepath.Join(runDir, "hosts"),
-				get("SB_MOUNTS_ROOT", defaultMountsRoot),
+				mountsRoot,
 				// config.DockerReadySocketDir and the egress CA beside the
 				// database (internal/service/egress_inspect.go).
-				filepath.Join(get("SB_MOUNTS_CRED_DIR", defaultCredDir), "docker", "ready"),
-				filepath.Join(filepath.Dir(get("SB_DB_PATH", defaultDBPath)), "egress-ca"),
+				filepath.Join(credDir, "docker", "ready"),
+				filepath.Join(dataDir, "egress-ca"),
 			},
 			BindFiles: []string{get("SB_TOOLBOX_BINARY_PATH", defaultToolbox)},
 			// The two sockets that are as good as root: this helper's and
 			// containerd's.
 			ForbiddenRoots: []string{filepath.Dir(socket), filepath.Dir(containerdSocket)},
-			MovesDir:       filepath.Join(runDir, "moves"),
-			FIFODir:        get("SB_ROOTD_FIFO_DIR", defaultFIFODir),
+			MovesDir:       filepath.Join(stateDir, "moves"),
+			FIFODir:        fifoDir,
 			RunscConfigPaths: []string{
-				filepath.Join(runDir, "runsc", "config.toml"),
-				filepath.Join(runDir, "runsc", "restore.toml"),
+				filepath.Join(stateDir, "runsc", "config.toml"),
+				filepath.Join(stateDir, "runsc", "restore.toml"),
 			},
 			Privileged: privileged,
 			Limits:     limits,
@@ -183,6 +224,9 @@ func limitsFromEnv(getenv func(string) string) (rootpolicy.Limits, error) {
 	pids, err := envInt(getenv, "SB_SANDBOX_PIDS_LIMIT", defaultPidsLimit)
 	if err != nil {
 		return rootpolicy.Limits{}, err
+	}
+	if memMB > maxMemoryMB {
+		return rootpolicy.Limits{}, fmt.Errorf("SB_HOST_MEMORY_MB=%d is more than a machine can have", memMB)
 	}
 	if pids <= 0 {
 		// The gate requires every sandbox to have a pids limit; with none
@@ -262,4 +306,49 @@ func lookupGroup(s string) (int, error) {
 		return 0, fmt.Errorf("group %s has gid %q", s, g.Gid)
 	}
 	return int(n), nil
+}
+
+// checkAgentUIDIsItsOwn refuses an agent uid another AerolVM process runs
+// as, among those this config names. The peer check goes by uid, so on a
+// shared uid that other process, which may parse tenant traffic (the
+// egress gateway does), would pass for the agent (review H3). The edge
+// and the operator run as 65532 in their images, which no config here
+// names; the chart keeps the agent off it.
+func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
+	var who []string
+	if uid == nobodyUID {
+		who = append(who, "nobody")
+	}
+	for _, k := range []string{"SB_ISOLATE_JAIL_UID", "SB_JAILER_UID"} {
+		n, err := envInt(getenv, k, defaultJailUID)
+		if err != nil {
+			return err
+		}
+		if uint32(n) == uid {
+			who = append(who, k)
+		}
+	}
+	if gw, ok := gatewayUID(strings.TrimSpace(getenv("SB_EGRESS_GATEWAY_USER"))); ok && gw == uid {
+		who = append(who, "SB_EGRESS_GATEWAY_USER")
+	}
+	if len(who) > 0 {
+		return fmt.Errorf("SB_ROOTD_AGENT_UID: uid %d is also the uid of %s; the agent needs one of its own", uid, strings.Join(who, " and "))
+	}
+	return nil
+}
+
+// gatewayUID reads SB_EGRESS_GATEWAY_USER as sandboxd does: "uid",
+// "uid:gid" or a user name (default aerolvm-egress). A name this machine
+// does not know is a gateway in another container, which says nothing
+// about this uid.
+func gatewayUID(v string) (uint32, bool) {
+	if v == "" {
+		v = "aerolvm-egress"
+	}
+	uidText, _, _ := strings.Cut(v, ":")
+	if n, err := strconv.ParseUint(uidText, 10, 32); err == nil {
+		return uint32(n), true
+	}
+	n, err := lookupUser(v)
+	return n, err == nil
 }

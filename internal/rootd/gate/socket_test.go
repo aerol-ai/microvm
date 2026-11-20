@@ -29,6 +29,10 @@ func socketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) (*rig, 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	// The helper follows no link to its socket (macOS: /var is one).
+	if dir, err = filepath.EvalSymlinks(dir); err != nil {
+		t.Fatal(err)
+	}
 	sock := filepath.Join(dir, "root.sock")
 	srv, err := rootd.New(
 		rootd.Config{Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()), Policy: p},
@@ -46,7 +50,7 @@ func socketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) (*rig, 
 		defer cancel()
 		srv.Shutdown(ctx)
 	})
-	agent := rootclient.New(rootclient.Config{Socket: sock})
+	agent := rootclient.New(rootclient.Config{Socket: sock, HelperUID: uint32(os.Getuid())})
 	t.Cleanup(func() { _ = agent.Close() })
 	r.dial = agent.DialContainerd
 	r.conn = bufConn(t, r.dial)
