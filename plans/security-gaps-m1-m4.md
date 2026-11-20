@@ -595,6 +595,40 @@ Enclaves on, AL2023 kernel 6.18.51-120.162 or later, a 4 GiB pool.
 Go if steps 1–4 pass and a cold create is under 2 s end to end. Write the
 numbers into this plan, as the Kubernetes plan does for its spikes.
 
+**Results so far (2026-11-20, partial).** SP-A ran on plain EC2 machines,
+not an EKS node pool: sandboxd from main 04552baa0, KVM Firecracker, 20 runs
+per step. SP-B did not produce numbers: its machine came up, but the run
+stopped before step 1.
+
+| SP-A, p50 (p99) | c5.metal, bare metal | m8i.xlarge, nested virtualization |
+|---|---|---|
+| Cold create (image → rootfs → boot) | 1,322 ms (1,360) | 1,376 ms (1,605) |
+| Template-snapshot create | 54 ms (1,354) | 88 ms (428) |
+| Pause (stop writes a memory snapshot) | 5,395 ms | 4,262 ms |
+| Resume (start restores it) | 1,360 ms | 445 ms |
+| First exec after resume | 4.4 ms | 11.4 ms |
+| Pause/resume cycles intact | 20 of 20 | **14 of 20** |
+| Warm-pool create | not measured | not measured |
+| Move | not run | not run |
+
+- **Nested resume loses sandboxes.** On the m8i, 6 of 20 starts failed with
+  `vsock handshake: vsock read: EOF` and a retry did not help: those
+  sandboxes were lost. The c5.metal lost none. This fails SP-A's
+  "pause/resume pass" bar, and has to be explained before (a) ships. It may be
+  a guest-side vsock timing problem under nested virtualization, not a
+  hardware limit.
+- **Warm pool not measured.** Every warm spawn failed on both machines with
+  `LoadSnapshot ... rootfs.ext4: No such file or directory`, so all 20
+  creates missed the pool. Whether that is the spike's setup or a bug in
+  the warm-VMM pool's snapshot path is not known yet.
+- **Spend:** at most about $5 of the $15 the owner approved: six instances
+  (CloudTrail launch and terminate times; the c5.metal ran 11 minutes, the
+  others shut themselves down within hours). Every `owner=aerolvm-spike`
+  instance is terminated.
+- **Next:** rerun SP-A with the warm pool fixed and moves added, chase the
+  nested vsock EOF, then run SP-B steps 1–4. Until then neither (a) nor (b)
+  has a go.
+
 ### 4.3 Building (b): one driver, two backends
 
 | Change | Where |
