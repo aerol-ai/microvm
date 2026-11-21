@@ -287,7 +287,7 @@ func (d *Driver) bringUpResidentHost(ctx context.Context, b *residentBucket, h *
 		return fmt.Errorf("start resident host: %w", err)
 	}
 	client := d.newWorkerClient(h.socket)
-	if err := d.waitWorker(ctx, client, key); err != nil {
+	if err := d.waitWorker(ctx, client, key, workerReady(d.residentSupervisor, key)); err != nil {
 		return err
 	}
 	if _, err := client.LoadModule(key, path, memoryMB); err != nil {
@@ -468,7 +468,7 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 	if err := d.supervisor.Ensure(d.workerStartCtx(ctx, inst.sandboxID, inst.ownerRef, inst.legacyRoot), inst.sandboxID, coldSocket); err != nil {
 		return fmt.Errorf("start cold worker: %w", err)
 	}
-	if err := d.waitWorker(ctx, client, inst.sandboxID); err != nil {
+	if err := d.waitWorker(ctx, client, inst.sandboxID, workerReady(d.supervisor, inst.sandboxID)); err != nil {
 		_ = d.supervisor.Stop(inst.sandboxID)
 		return err
 	}

@@ -94,7 +94,17 @@ func TestProxyHTTPDialedEndToEnd(t *testing.T) {
 	if err := proxyOverConn(t.Context(), conn, ln.Addr().String(), &win, &wout, wrec, httptest.NewRequest(http.MethodPost, "http://gateway/x", strings.NewReader("hello"))); err != nil {
 		t.Fatal(err)
 	}
-	if in.Load() == 0 || out.Load() == 0 || in.Load() != win.Load() || out.Load() != wout.Load() {
+	// The HTTP transport counts what it wrote in its own goroutine, once
+	// the write returned, which can be a moment after the relay itself
+	// returned (sandboxd drains usage later, so a late count is not lost):
+	// compare the totals once they settle.
+	settled := func() bool {
+		return in.Load() != 0 && out.Load() != 0 && in.Load() == win.Load() && out.Load() == wout.Load()
+	}
+	for deadline := time.Now().Add(2 * time.Second); !settled() && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !settled() {
 		t.Fatalf("counted in %d out %d, a worker counts in %d out %d", in.Load(), out.Load(), win.Load(), wout.Load())
 	}
 	if u := s.netUsageFor("sb"); u.bytesIn.Load() != 0 || u.bytesOut.Load() != 0 {

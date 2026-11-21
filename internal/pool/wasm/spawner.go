@@ -52,6 +52,9 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 	}
 	client := worker.NewClient(socketPath)
 	deadline := time.Now().Add(s.PingWait)
+	// The worker's ready signal wakes the wait early, once; it is polled as
+	// before when it does not signal (worker.Supervisor.Ready).
+	ready := s.Supervisor.Ready(slotID)
 	attempt := 0
 	for {
 		if err := client.Ping(slotID); err == nil {
@@ -63,7 +66,9 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 		if time.Now().After(deadline) {
 			return fmt.Errorf("worker not ready at %s", socketPath)
 		}
-		worker.ReadyPollSleep(ctx, attempt)
+		if worker.ReadyPollSleepOr(ctx, attempt, ready) {
+			ready = nil
+		}
 		attempt++
 	}
 	if _, err := client.LoadModule(slotID, modulePath, memoryMB); err != nil {

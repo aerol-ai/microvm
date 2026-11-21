@@ -112,7 +112,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
 	client := d.newWorkerClient(inst.socketPath)
-	if err := d.waitWorker(ctx, client, sandboxID); err != nil {
+	if err := d.waitWorker(ctx, client, sandboxID, workerReady(d.supervisor, workerKey)); err != nil {
 		return nil, err
 	}
 	d.noteWorkerSpawnCount(inst)
@@ -332,6 +332,6 @@ func ctxDone(ctx context.Context, deadline time.Time) bool {
 	return time.Now().After(deadline)
 }
 
-func sleepBrief(ctx context.Context, attempt int) {
-	worker.ReadyPollSleep(ctx, attempt)
-}
+// pollSleep waits between readiness pings, ending early when the worker
+// signals (waitWorker).
+var pollSleep = worker.ReadyPollSleepOr

@@ -726,7 +726,7 @@ func (c *flakyPingClient) Ping(string) error {
 func TestWaitWorkerRetriesUntilPingSucceeds(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	client := &flakyPingClient{}
-	if err := d.waitWorker(context.Background(), client, "sb"); err != nil {
+	if err := d.waitWorker(context.Background(), client, "sb", nil); err != nil {
 		t.Fatalf("waitWorker: %v", err)
 	}
 	if client.calls < 2 {

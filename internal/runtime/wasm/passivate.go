@@ -80,7 +80,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
 	client := d.newWorkerClient(socketPath)
-	if err := d.waitWorker(ctx, client, sandbox.ID); err != nil {
+	if err := d.waitWorker(ctx, client, sandbox.ID, workerReady(d.supervisor, workerKey)); err != nil {
 		return nil, err
 	}
 	spawnCount := 0

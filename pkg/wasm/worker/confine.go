@@ -325,6 +325,15 @@ func runWorker(socketPath string, srv workerServer) error {
 	// which load code at run time, out of a process under a syscall filter.
 	// Set first, before any goroutine of the worker can resolve a name.
 	net.DefaultResolver.PreferGo = true
+	// Before the drop: it checks what the descriptor is (ready.go).
+	ready := takeReadyFD()
+	defer func() {
+		// A start that fails closes it unwritten: sandboxd sees the end of
+		// the pipe, not a ready byte.
+		if ready != nil {
+			_ = ready.Close()
+		}
+	}()
 	if err := loadWorkerGuards(); err != nil {
 		return err
 	}
@@ -342,6 +351,9 @@ func runWorker(socketPath string, srv workerServer) error {
 	// A worker whose own log stream broke (it shut it, or journald went
 	// away) loses lines, not its sandboxes.
 	hostproc.CatchSIGPIPE()
+	// Dropped, filtered and listening: the next accept serves.
+	signalReady(ready)
+	ready = nil
 	return serveListener(ln, srv)
 }
 

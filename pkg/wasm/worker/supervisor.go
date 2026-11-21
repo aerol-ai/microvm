@@ -142,6 +142,17 @@ type slotState struct {
 	// quarantined: the worker broke the protocol (reaper.go). It was killed
 	// and is not restarted; the slot refuses Ensure until Stop.
 	quarantined bool
+	// ready closes once the worker said it serves; readyR is the pipe it
+	// says so on (ready.go). Both nil for an adopted worker.
+	ready  chan struct{}
+	readyR *os.File
+}
+
+// closeReady ends the slot's ready watcher, if it still waits.
+func (st *slotState) closeReady() {
+	if st.readyR != nil {
+		_ = st.readyR.Close()
+	}
 }
 
 // alive reports whether the slot's worker is still running.
@@ -229,12 +240,24 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 	// journal): sandboxd's copies of it close once the start is done.
 	var opened []*os.File
 	defer func() { closeFiles(opened) }()
+	// A ready pipe per command built (a cgroup start may build twice): the
+	// started one's read end is kept, every other end closes after the
+	// start (ready.go).
+	type readyPipe struct {
+		cmd  *exec.Cmd
+		r, w *os.File
+	}
+	var pipes []readyPipe
 	build := func() (*exec.Cmd, error) {
 		cmd, err := s.spawn(spawnCtx, socketPath)
 		if err != nil {
 			return nil, err
 		}
 		opened = append(opened, hostproc.OwnOutput(cmd, workerLogIdentifier)...)
+		// Without a pipe the worker is found by the poll, as before.
+		if r, w, err := attachReadyPipe(cmd); err == nil {
+			pipes = append(pipes, readyPipe{cmd: cmd, r: r, w: w})
+		}
 		return cmd, nil
 	}
 	var cmd *exec.Cmd
@@ -243,6 +266,15 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 		cmd, err = s.cgroup.Start(build)
 	} else if cmd, err = build(); err == nil {
 		err = cmd.Start()
+	}
+	var readyR *os.File
+	for _, p := range pipes {
+		_ = p.w.Close()
+		if err == nil && p.cmd == cmd {
+			readyR = p.r
+		} else {
+			_ = p.r.Close()
+		}
 	}
 	if err != nil {
 		return err
@@ -253,6 +285,10 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 		spec:       specFrom(ctx),
 		cmd:        cmd,
 		done:       make(chan struct{}),
+	}
+	if readyR != nil {
+		st.readyR, st.ready = readyR, make(chan struct{})
+		go watchReady(readyR, st.ready)
 	}
 	if prev, ok := s.slots[sandboxID]; ok {
 		st.spawnCount = prev.spawnCount + 1
@@ -266,6 +302,7 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 
 func (s *Supervisor) watch(st *slotState) {
 	_ = st.cmd.Wait()
+	st.closeReady()
 	close(st.done)
 	s.exited(st)
 }
@@ -317,6 +354,19 @@ func (s *Supervisor) Adopt(sandboxID, socketPath string, proc hostproc.Process) 
 	return true
 }
 
+// Ready is closed once the worker for sandboxID says it serves (ready.go):
+// a hint to ping it now. nil when there is no such signal to wait for (no
+// slot, or a worker adopted from a previous sandboxd), and never closed
+// for a worker that does not say so: callers keep polling either way.
+func (s *Supervisor) Ready(sandboxID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.slots[sandboxID]; ok && st.ready != nil {
+		return st.ready
+	}
+	return nil
+}
+
 // SpawnCount returns how many times the worker for sandboxID has been started.
 func (s *Supervisor) SpawnCount(sandboxID string) int {
 	s.mu.Lock()
@@ -341,6 +391,7 @@ func (s *Supervisor) Stop(sandboxID string) error {
 		return nil
 	}
 	defer quarantined.Delete(st.socketPath)
+	st.closeReady()
 	if st.proc != nil {
 		if err := st.proc.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, hostproc.ErrGone) {
 			return err
