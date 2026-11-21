@@ -18,11 +18,20 @@ package rootd
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/aerol-ai/microvm/internal/network/cni"
+	"github.com/aerol-ai/microvm/internal/network/nsbuild"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
@@ -42,9 +51,12 @@ type firewallBench struct {
 	m  *netrules.Manager
 	c  *rootclient.Client
 	tb testing.TB
+	// single are sandboxd's own steps in single mode (netns.Host): no
+	// marks, a blocking flock, CNI with no process group.
+	single nsbuild.Steps
 }
 
-func newFirewallBench(tb testing.TB) *firewallBench {
+func newFirewallBench(tb testing.TB, sopts ...grpc.ServerOption) *firewallBench {
 	tb.Helper()
 	k, _ := kernelRig(tb)
 	if os.Getenv("AEROL_KT_CNI_DIR") == "" {
@@ -60,6 +72,7 @@ func newFirewallBench(tb testing.TB) *firewallBench {
 		c.Policy.NetnsDir = k.netnsDir
 		c.Firewall.Backend = "netlink"
 		o.Network = k
+		o.ServerOptions = append(o.ServerOptions, sopts...)
 	})
 	m, err := newRulesManager("netlink")
 	if err != nil {
@@ -79,12 +92,23 @@ func newFirewallBench(tb testing.TB) *firewallBench {
 	if _, err := c.EnsureHostFirewall(context.Background()); err != nil {
 		tb.Fatal(err)
 	}
-	return &firewallBench{k: k, r: r, m: m, c: c, tb: tb}
+	single := k.steps
+	if dir := os.Getenv("AEROL_KT_CNI_DIR"); dir != "" {
+		runner, err := cni.NewExecRunner(cni.Config{PluginDir: dir, ConfPath: filepath.Join(k.confDir, k.confName)})
+		if err != nil {
+			tb.Fatal(err)
+		}
+		single.Runner = runner
+	}
+	root := k.netnsDir
+	single.Create = func(_ context.Context, name string) error { return nsbuild.CreateNamed(root, name) }
+	single.FlushConntrack, single.StopOnCancel = nil, false
+	return &firewallBench{k: k, r: r, m: m, c: c, tb: tb, single: single}
 }
 
 // singleCold is a cold create's root work in process.
 func (f *firewallBench) singleCold(ctx context.Context, name string) (string, error) {
-	_, ip, err := f.k.steps.Realize(ctx, name)
+	_, ip, err := f.single.Realize(ctx, name)
 	if err != nil {
 		return "", err
 	}
@@ -241,4 +265,151 @@ func BenchmarkKernelFirewallCreate100(b *testing.B) {
 		b.ReportMetric(float64(percentileOf(m.got, 0.99).Microseconds()), m.name+"-p99-us")
 	}
 	b.ReportMetric(float64(percentileOf(first, 0.5).Microseconds()), "first-p50-us")
+}
+
+// TestKernelCreateBudget is the create's root work, split against single,
+// as a paired measurement: every round runs both, in turns (which goes
+// first turns each time), so load on the machine falls on both alike. It
+// splits split mode's extra into the time inside the helper's call
+// (PrepareSandbox's handler, server side) and the client's round trip
+// around it. Runs only with AEROL_BUDGET_ROUNDS set (and
+// AEROL_BUDGET_PER_ROUND, default 5), as root, with the real CNI plugins
+// for the real numbers:
+//
+//	AEROL_KT_CNI_DIR=/opt/cni/bin AEROL_BUDGET_ROUNDS=25 go test -run TestKernelCreateBudget -v ./internal/rootd/
+func TestKernelCreateBudget(t *testing.T) {
+	rounds, _ := strconv.Atoi(os.Getenv("AEROL_BUDGET_ROUNDS"))
+	if rounds <= 0 {
+		t.Skip("a measurement: set AEROL_BUDGET_ROUNDS")
+	}
+	per := 5
+	if v, err := strconv.Atoi(os.Getenv("AEROL_BUDGET_PER_ROUND")); err == nil && v > 0 {
+		per = v
+	}
+	// The handler's own time, for the call the test just made (calls here
+	// are one at a time).
+	var handler atomic.Int64
+	f := newFirewallBench(t, grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		t0 := time.Now()
+		resp, err := h(ctx, req)
+		handler.Store(int64(time.Since(t0)))
+		return resp, err
+	}))
+	ctx := context.Background()
+	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+	type series struct{ single, split, inside []float64 }
+	var cold, warm series
+	var loads []float64
+	n := 0
+	for r := range rounds {
+		loads = append(loads, budgetLoad())
+		var cs, cp, ci, ws, wp, wi []float64
+		for k := range per {
+			for _, split := range [][]bool{{false, true}, {true, false}}[(r+k)%2] {
+				n++
+				name := fmt.Sprintf("c%d", n)
+				t0 := time.Now()
+				var ip string
+				var err error
+				if split {
+					ip, err = f.splitCold(ctx, f.c, name)
+				} else {
+					ip, err = f.singleCold(ctx, name)
+				}
+				d := time.Since(t0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if split {
+					cp, ci = append(cp, ms(d)), append(ci, ms(time.Duration(handler.Load())))
+				} else {
+					cs = append(cs, ms(d))
+				}
+				if err := f.splitRelease(ctx, name, ip); err != nil {
+					t.Fatal(err)
+				}
+
+				name = fmt.Sprintf("w%d", n)
+				if _, ip, err = f.k.steps.Realize(ctx, name); err != nil {
+					t.Fatal(err)
+				}
+				t0 = time.Now()
+				if split {
+					err = f.splitWarm(ctx, name, ip)
+				} else {
+					err = f.singleRules(ip)
+				}
+				d = time.Since(t0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if split {
+					wp, wi = append(wp, ms(d)), append(wi, ms(time.Duration(handler.Load())))
+				} else {
+					ws = append(ws, ms(d))
+				}
+				if err := f.splitRelease(ctx, name, ip); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		cold.single, cold.split, cold.inside = append(cold.single, budgetMedian(cs)), append(cold.split, budgetMedian(cp)), append(cold.inside, budgetMedian(ci))
+		warm.single, warm.split, warm.inside = append(warm.single, budgetMedian(ws)), append(warm.split, budgetMedian(wp)), append(warm.inside, budgetMedian(wi))
+	}
+	for _, s := range []struct {
+		name string
+		s    series
+	}{{"cold create (namespace, CNI, block-all, policy)", cold}, {"warm create (block-all, policy)", warm}} {
+		t.Logf("%s: %s", s.name, budgetPaired(s.s.single, s.s.split))
+		t.Logf("  inside the helper's call vs single: %s", budgetPaired(s.s.single, s.s.inside))
+		t.Logf("  the client's round trip (split - inside): %s", budgetPaired(s.s.inside, s.s.split))
+	}
+	t.Logf("load average (1 min) over the rounds: %.2f to %.2f", slices.Min(loads), slices.Max(loads))
+}
+
+func budgetMedian(v []float64) float64 {
+	s := slices.Clone(v)
+	slices.Sort(s)
+	if len(s)%2 == 1 {
+		return s[len(s)/2]
+	}
+	return (s[len(s)/2-1] + s[len(s)/2]) / 2
+}
+
+// budgetPaired: each side's median of round medians, and the per-round
+// difference (b - a): its mean with a 95% confidence interval (Student
+// t), and its median.
+func budgetPaired(a, b []float64) string {
+	d := make([]float64, len(a))
+	var mean float64
+	for i := range a {
+		d[i] = b[i] - a[i]
+		mean += d[i]
+	}
+	mean /= float64(len(d))
+	var ss float64
+	for _, x := range d {
+		ss += (x - mean) * (x - mean)
+	}
+	table := []float64{12.71, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145,
+		2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042}
+	half := 0.0
+	if df := len(d) - 1; df >= 1 {
+		tc := 1.96
+		if df <= len(table) {
+			tc = table[df-1]
+		}
+		half = tc * math.Sqrt(ss/float64(df)) / math.Sqrt(float64(len(d)))
+	}
+	return fmt.Sprintf("%.2f vs %.2f ms; per round mean %+.2f ms (95%% CI %+.2f to %+.2f), median %+.2f ms, %d rounds",
+		budgetMedian(a), budgetMedian(b), mean, mean-half, mean+half, budgetMedian(d), len(d))
+}
+
+func budgetLoad() float64 {
+	raw, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return -1
+	}
+	v, _ := strconv.ParseFloat(strings.Fields(string(raw))[0], 64)
+	return v
 }
