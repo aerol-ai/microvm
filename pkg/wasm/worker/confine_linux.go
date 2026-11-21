@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"syscall"
 
 	"github.com/aerol-ai/microvm/pkg/hostproc"
@@ -23,6 +24,13 @@ func applyConfinement(c Confinement) error {
 	if err != nil {
 		return fmt.Errorf("wasm worker: %w", err)
 	}
+	// One thread for the drop and the load: no_new_privs, which an
+	// unprivileged filter load needs, is set on the calling thread
+	// (DropPrivileges), and a goroutine that moved threads in between would
+	// load from one without it. TSYNC then gives every thread the filter and
+	// no_new_privs.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := hostproc.DropPrivileges(c.UID, c.GID); err != nil {
 		return fmt.Errorf("wasm worker: %w", err)
 	}

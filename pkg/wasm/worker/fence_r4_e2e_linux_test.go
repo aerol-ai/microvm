@@ -450,7 +450,15 @@ wait:
 	if returned != n {
 		t.Fatalf("%d of %d calls never returned", n-returned, n)
 	}
-	if after > before+8 {
+	// A thread held per call would add one per call (n). The race
+	// detector's runtime starts more threads of its own on a busy machine
+	// (11 -> 28 seen with every call returned), so it gets more room, still
+	// short of n.
+	slack := 8
+	if raceEnabled {
+		slack = 24
+	}
+	if after > before+slack {
 		t.Fatalf("threads went from %d to %d", before, after)
 	}
 	err = NewClient(sock).ProxyHTTPDialed("sb", 8080, workerfence.GuestListenHost, []int{1}, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
