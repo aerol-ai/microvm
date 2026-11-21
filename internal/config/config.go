@@ -1238,6 +1238,16 @@ type Config struct {
 	// their snapshot state; only the per-clone path is bypassed.
 	// SB_FIRECRACKER_OVERLAY_ENABLED.
 	FirecrackerOverlayEnabled bool
+	// FirecrackerNestedVirt lets Firecracker guests see the CPU's
+	// virtualization extensions (Intel VMX, AMD SVM), so a sandbox can run
+	// a VM of its own. Default false: every VM this node boots gets a CPU
+	// config that hides them, which keeps KVM's nested-virtualization code
+	// out of a guest's reach; almost no workload needs it. A node that
+	// hides them loads only template snapshots saved the same way, and
+	// rebuilds the rest; stopped sandboxes keep the CPU they started with.
+	// x86_64 only (arm64 guests get no EL2 from Firecracker).
+	// SB_FIRECRACKER_NESTED_VIRT.
+	FirecrackerNestedVirt bool
 	// FirecrackerOverlayMkfs makes the host run `mkfs.ext4 -F` on each
 	// per-sandbox overlay.ext4 right after the sparse allocation and
 	// before PutDrive/PatchDrive. Default false — the guest is normally
@@ -2845,6 +2855,7 @@ func load(keyTool bool) (Config, error) {
 		FirecrackerSnapshotVerifyMode:       strings.ToLower(getEnv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "once")),
 
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
+		FirecrackerNestedVirt:                getEnvBool("SB_FIRECRACKER_NESTED_VIRT", false),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
 		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
 
