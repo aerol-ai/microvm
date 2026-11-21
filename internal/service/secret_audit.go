@@ -1091,11 +1091,16 @@ func (s *fileAuditSink) claimSpillFrom(dir, label, working string) (bool, error)
 			_ = os.Remove(working + spillFromSuffix)
 			return err
 		}
-		if st, err := os.Lstat(working); err != nil || !plainSpillFile(st) {
+		st, err = os.Lstat(working)
+		if err != nil || !plainSpillFile(st) {
 			auditSpillMalformedTotal.Add(1)
 			_ = os.Remove(working)
 			_ = os.Remove(working + spillFromSuffix)
 			return nil
+		}
+		// A worker may still hold the segment open and write on (keepSpillClaim).
+		if err := keepSpillClaim(working, st.Size()); err != nil {
+			return err
 		}
 		claimed = true
 		return nil
@@ -1115,6 +1120,38 @@ func (s *fileAuditSink) claimSpillFrom(dir, label, working string) (bool, error)
 // spillFromSuffix names the file beside a working segment that says which
 // worker folder it came from.
 const spillFromSuffix = ".from"
+
+// spillSizeSuffix names the file beside a working segment that holds its
+// size when it was claimed: the drain reads that much of it and no more.
+// A renamed file is the same file, so a worker that kept its handle on its
+// segment can write to it after the claim; without the bound the drain
+// would chain what it wrote later and, on the audit writer, follow a
+// writer that never stops, holding every audit write on the node. What it
+// writes past the claim is never read, and goes with the segment.
+const spillSizeSuffix = ".size"
+
+// keepSpillClaim records size as working's claimed size.
+func keepSpillClaim(working string, size int64) error {
+	return writeFileAtomicDurable(working+spillSizeSuffix, []byte(strconv.FormatInt(size, 10)+"\n"), 0o600)
+}
+
+// spillClaim is working's claimed size (keepSpillClaim). A segment claimed
+// before sizes were kept, or by a drain that crashed before it kept one,
+// is claimed now at the size it has.
+func spillClaim(working string) (int64, error) {
+	if raw, err := os.ReadFile(working + spillSizeSuffix); err == nil {
+		if n, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); perr == nil && n >= 0 {
+			return n, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return 0, err
+	}
+	st, err := os.Lstat(working)
+	if err != nil {
+		return 0, err
+	}
+	return st.Size(), keepSpillClaim(working, st.Size())
+}
 
 // spillSandbox is the sandbox a segment's folder is named for ("sb-<id>"),
 // "" when it is not one sandbox's.
@@ -1169,9 +1206,11 @@ func (s *fileAuditSink) drainSpill() bool {
 		// No segment is in progress, so a folder note beside working is
 		// stale (a crash between claimSpillFrom writing it and its rename):
 		// it must not bind the next segment, the daemon's own included, to
-		// that worker's sandbox.
-		if err := os.Remove(working + spillFromSuffix); err != nil && !os.IsNotExist(err) {
-			return err
+		// that worker's sandbox. Nor may an old claimed size bound it.
+		for _, note := range []string{working + spillFromSuffix, working + spillSizeSuffix} {
+			if err := os.Remove(note); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		st, err := os.Stat(s.spillPath)
 		if err != nil && !os.IsNotExist(err) {
@@ -1185,7 +1224,8 @@ func (s *fileAuditSink) drainSpill() bool {
 					return err
 				}
 				hasWork = true
-				return nil
+				_, err := spillClaim(working)
+				return err
 			}
 		}
 		claimed, err := s.claimWorkerSpill(working)
@@ -1199,6 +1239,10 @@ func (s *fileAuditSink) drainSpill() bool {
 	offsetPath := working + ".off"
 	start := loadSpillOffset(offsetPath)
 	folderSandbox := spillSandbox(working)
+	claimed, err := spillClaim(working)
+	if err != nil {
+		return false
+	}
 	f, err := os.Open(working)
 	if err != nil {
 		return false
@@ -1209,7 +1253,7 @@ func (s *fileAuditSink) drainSpill() bool {
 			return false
 		}
 	}
-	br := bufio.NewReaderSize(f, 64*1024)
+	br := bufio.NewReaderSize(io.LimitReader(f, max(claimed-start, 0)), 64*1024)
 	var consumed int64
 	batch := make([]SecretAuditEvent, 0, 256)
 	flush := func() bool {
@@ -1272,6 +1316,7 @@ func (s *fileAuditSink) drainSpill() bool {
 	if err := s.withAuditFileLock(func() error {
 		_ = os.Remove(offsetPath)
 		_ = os.Remove(working + spillFromSuffix)
+		_ = os.Remove(working + spillSizeSuffix)
 		return os.Remove(working)
 	}); err != nil {
 		return false
