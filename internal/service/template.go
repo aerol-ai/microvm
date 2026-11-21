@@ -331,6 +331,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusSnapshotting, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: status update to snapshotting failed", "template_id", id, "error", uerr)
 		}
+		unlockSnapshot := s.lockTemplateSnapshot(id)
 		snap, snapErr := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
 			TemplateID:    id,
 			RootfsPath:    rootfsOut,
@@ -340,6 +341,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			MemoryMB:      s.cfg.FirecrackerTemplateMemoryMB,
 			VCPU:          s.cfg.FirecrackerTemplateVCPU,
 		})
+		unlockSnapshot()
 		if snapErr != nil {
 			// Snapshot phase failed but rootfs is fine. Release the CID
 			// so the next snapshot attempt (after a manual recovery)

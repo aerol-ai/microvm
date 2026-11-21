@@ -13,9 +13,10 @@ template pipeline has three stages and they fail in distinct ways:
 
 Snapshot corruption observed on the boot path flips the row to `unhealthy`
 and the rebuild path (`RebuildTemplateSnapshot`) re-runs stage 1's snapshot
-substep in the background. The rebuild saves to new file names, so clones
-still running on the old snapshot keep their files; the next daemon start
-removes the files a ready template no longer uses.
+substep in the background. The rebuild saves to new file names and then
+removes the old pair; clones still running on the old snapshot keep it
+(their jail holds a hard link, or Firecracker keeps it mapped). Only one VM
+saves a given template's snapshot at a time.
 
 A template whose snapshot was saved under another `SB_FIRECRACKER_NESTED_VIRT`
 setting than the node's (every template saved before v0.7.8) is saved again

@@ -295,3 +295,118 @@ func TestIsTemplateSnapshotFile(t *testing.T) {
 		}
 	}
 }
+
+// A re-save and a rebuild of one template never run their snapshot VMs at
+// once: both use the VM id tpl-snap-<id>, its TAP slot and its run dir.
+// The re-save, which lost the row to the rebuild, drops its files.
+func TestTemplateSnapshotVMsOfOneTemplateTakeTurns(t *testing.T) {
+	templateGOARCH = "amd64"
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-turns")
+	entered, release := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	snapper := &serialSnapshotter{inner: &fakeTemplateSnapshotter{done: make(chan struct{}, 2), nestedVirt: "off"}}
+	snapper.hook = func(TemplateSnapshotRequest) {
+		if first.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	svc.SetTemplateSnapshotter(snapper)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	resaveErr := make(chan error, 1)
+	go func() { resaveErr <- svc.resaveTemplateSnapshot(ctx, tpl) }()
+	<-entered
+	if _, err := st.MarkTemplateUnhealthy(ctx, tpl.ID, "operator-requested"); err != nil {
+		t.Fatal(err)
+	}
+	rebuildErr := make(chan error, 1)
+	go func() { rebuildErr <- svc.RebuildTemplateSnapshot(ctx, tpl.ID) }()
+	time.Sleep(20 * time.Millisecond) // the rebuild is now waiting for its turn
+	close(release)
+
+	if err := <-resaveErr; !errors.Is(err, errTemplateMovedOn) {
+		t.Fatalf("re-save = %v, want errTemplateMovedOn (the rebuild took the row)", err)
+	}
+	if err := <-rebuildErr; err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if snapper.most.Load() != 1 || snapper.inner.calls != 2 {
+		t.Fatalf("snapshot VMs: %d at once (want 1), %d in all (want 2)", snapper.most.Load(), snapper.inner.calls)
+	}
+	got, _ := st.GetTemplate(ctx, tpl.ID)
+	if got.Status != models.TemplateStatusReady || got.SnapshotNestedVirt != "off" {
+		t.Fatalf("after both: %+v", got)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(tpl.RootfsPath))
+	snapshots := 0
+	for _, e := range entries {
+		if isTemplateSnapshotFile(e.Name()) {
+			snapshots++
+		}
+	}
+	if snapshots != 2 {
+		t.Fatalf("%d snapshot files left, want the rebuild's 2 (the old pair and the dropped re-save's are gone)", snapshots)
+	}
+}
+
+// A re-save reads the row again under the lock, and does nothing for a
+// template that no longer needs it.
+func TestResaveSkipsATemplateThatNoLongerNeedsIt(t *testing.T) {
+	templateGOARCH = "amd64"
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	listed := seedReadyTemplate(t, st, templatesDir, "tpl-fixed")
+	// Saved again with this node's setting after the sweep listed it.
+	if err := st.UpdateTemplateSnapshotReady(ctx, listed.ID, listed.SnapshotMemoryPath, listed.SnapshotStatePath,
+		listed.SnapshotSizeBytes, listed.SnapshotChecksum, listed.SnapshotVsockCID, true, "off"); err != nil {
+		t.Fatal(err)
+	}
+	snapper := &fakeTemplateSnapshotter{done: make(chan struct{}, 1)}
+	svc.SetTemplateSnapshotter(snapper)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+	if err := svc.resaveTemplateSnapshot(ctx, listed); !errors.Is(err, errTemplateMovedOn) || snapper.calls != 0 {
+		t.Fatalf("re-save of a template already saved with this setting = %v, %d VMs booted; want errTemplateMovedOn, 0", err, snapper.calls)
+	}
+	if err := st.DeleteTemplate(ctx, "tpl-fixed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.resaveTemplateSnapshot(ctx, listed); err == nil {
+		t.Fatal("re-save of a deleted template returned no error")
+	}
+}
+
+// A rebuild saves to new names and then removes the old pair, so repeated
+// rebuilds (rotation) do not pile memory files up.
+func TestRebuildRemovesTheOldSnapshotFiles(t *testing.T) {
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-rotate")
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 2), nestedVirt: "off"})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+	for round := 0; round < 2; round++ {
+		before, _ := st.GetTemplate(ctx, tpl.ID)
+		if _, err := st.MarkTemplateUnhealthy(ctx, tpl.ID, "rotation"); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.RebuildTemplateSnapshot(ctx, tpl.ID); err != nil {
+			t.Fatalf("rebuild %d: %v", round, err)
+		}
+		got, _ := st.GetTemplate(ctx, tpl.ID)
+		if got.SnapshotMemoryPath == before.SnapshotMemoryPath {
+			t.Fatalf("rebuild %d wrote the old name in place", round)
+		}
+		for _, p := range []string{before.SnapshotMemoryPath, before.SnapshotStatePath} {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Fatalf("rebuild %d left %s: %v", round, p, err)
+			}
+		}
+		for _, p := range []string{got.SnapshotMemoryPath, got.SnapshotStatePath} {
+			if _, err := os.Stat(p); err != nil {
+				t.Fatalf("rebuild %d: new file %s: %v", round, p, err)
+			}
+		}
+	}
+}
