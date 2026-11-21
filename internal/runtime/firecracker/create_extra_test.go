@@ -18,6 +18,7 @@ func TestCreate_ExtraRESTErrors(t *testing.T) {
 		errStr string
 	}{
 		{"PutMachineConfig", func(c *fakeClient) { c.machineErr = os.ErrPermission }, "PutMachineConfig"},
+		{"PutCPUConfig", func(c *fakeClient) { c.cpuErr = os.ErrPermission }, "PutCPUConfig"},
 		{"PutDrive", func(c *fakeClient) { c.driveErr = os.ErrPermission }, "PutDrive root"},
 		{"PutNetworkInterface", func(c *fakeClient) { c.nicErr = os.ErrPermission }, "PutNetworkInterface"},
 		{"PutVsock", func(c *fakeClient) { c.vsockErr = os.ErrPermission }, "PutVsock"},

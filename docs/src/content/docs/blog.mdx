@@ -23,6 +23,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [How AerolVM keeps everything safe](/engineering-security-overview/) | The whole security picture, with diagrams: every door into a server, the secrets, the cluster, the audit log, monitoring and the releases. |
 | [Where secrets live](/engineering-trust-boundary/) | Which secrets AerolVM encrypts, where mounts and network rules run, and what the host does and does not protect against. |
 | [How AerolVM isolates sandboxes](/engineering-isolation/) | The wall each runtime puts between a sandbox and the server, root inside the sandbox, and resource limits. |
+| [Why Firecracker sandboxes cannot start VMs by default](/engineering-nested-virtualization/) | Why AerolVM hides the CPU's virtualization features from Firecracker sandboxes, how a saved VM keeps its CPU, and what changes for users and server owners. |
 | [What a sandbox can see on disk](/engineering-sandbox-filesystem/) | Mounts, the file API, what snapshots copy, and where images come from. |
 | [How AerolVM fences a sandbox's network](/engineering-network-defenses/) | What a sandbox can reach by default, and the DNS tricks the filter stops. |
 | [Keeping API keys out of the sandbox](/engineering-secret-handling/) | How variables are sealed, how inject rules keep keys out, and what the audit trail records. |
