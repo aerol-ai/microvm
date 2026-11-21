@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -456,42 +455,62 @@ func TestTemplateSaveTimeoutStartsOnceTheLockIsHeld(t *testing.T) {
 	}
 }
 
-// The lock table holds an entry only while someone holds or waits on it,
-// and callers of one template still take turns.
+// lockRefs is the number of callers holding or waiting on a template's
+// lock, 0 when it has no entry.
+func lockRefs(svc *Service, id string) int {
+	svc.templateSnapshotLocksMu.Lock()
+	defer svc.templateSnapshotLocksMu.Unlock()
+	if l := svc.templateSnapshotLocks[id]; l != nil {
+		return l.refs
+	}
+	return 0
+}
+
+func waitForRefs(t *testing.T, svc *Service, id string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for lockRefs(svc, id) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d callers on the lock, want %d", id, lockRefs(svc, id), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The lock table drops an entry only when its last holder or waiter is
+// gone. A waiter that takes the lock over keeps the entry, so a caller who
+// arrives later waits for it rather than getting a second lock for the
+// same template; once everyone is done, the table is empty.
 func TestTemplateSnapshotLockTableEmptiesAndExcludes(t *testing.T) {
 	svc := &Service{}
-	var inside, most atomic.Int32
-	var wg sync.WaitGroup
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			unlock := svc.lockTemplateSnapshot(id)
-			n := inside.Add(1)
-			for {
-				m := most.Load()
-				if n <= m || most.CompareAndSwap(m, n) {
-					break
-				}
-			}
-			time.Sleep(time.Millisecond)
-			inside.Add(-1)
-			unlock()
-		}("tpl-one")
+	unlockFirst := svc.lockTemplateSnapshot("tpl-one")
+
+	waiterHolds := make(chan func())
+	go func() { waiterHolds <- svc.lockTemplateSnapshot("tpl-one") }()
+	waitForRefs(t, svc, "tpl-one", 2)
+	unlockFirst()
+	unlockWaiter := <-waiterHolds
+
+	// The waiter holds the lock now. A caller who comes later must wait.
+	lateHolds := make(chan func(), 1)
+	go func() { lateHolds <- svc.lockTemplateSnapshot("tpl-one") }()
+	waitForRefs(t, svc, "tpl-one", 2)
+	select {
+	case unlock := <-lateHolds:
+		unlock()
+		t.Fatal("a later caller took the template's lock while the waiter held it: two locks for one template")
+	case <-time.After(50 * time.Millisecond):
 	}
-	wg.Wait()
-	if most.Load() != 1 {
-		t.Fatalf("%d callers held one template's lock at once", most.Load())
+	unlockWaiter()
+	(<-lateHolds)()
+
+	if n := lockRefs(svc, "tpl-one"); n != 0 {
+		t.Fatalf("%d callers left on the lock after everyone unlocked", n)
 	}
-	unlock := svc.lockTemplateSnapshot("tpl-two")
-	svc.templateSnapshotLocksMu.Lock()
-	held := len(svc.templateSnapshotLocks)
-	svc.templateSnapshotLocksMu.Unlock()
-	unlock()
 	svc.templateSnapshotLocksMu.Lock()
 	left := len(svc.templateSnapshotLocks)
 	svc.templateSnapshotLocksMu.Unlock()
-	if held != 1 || left != 0 {
-		t.Fatalf("lock table: %d entries while held (want 1), %d after (want 0)", held, left)
+	if left != 0 {
+		t.Fatalf("lock table has %d entries after everyone unlocked, want 0", left)
 	}
 }

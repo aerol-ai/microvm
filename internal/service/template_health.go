@@ -480,11 +480,12 @@ func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
 }
 
 // RebuildTemplateSnapshot reruns the snapshot phase against an
-// existing rootfs. Synchronous (the caller — typically
-// kickSnapshotRebuild — provides its own goroutine + timeout).
-// Exported because future phases (snapshot rotation in PR 6-D,
-// operator-triggered repair via an API endpoint) will call it
-// directly.
+// existing rootfs, under the template's snapshot lock. Synchronous; the
+// caller provides the goroutine and the timeout. The background path,
+// kickSnapshotRebuild, calls rebuildTemplateSnapshotLocked through
+// withTemplateSnapshotLock instead, so its timeout starts once it holds the
+// lock; this entry point is for a caller that wants to wait on the
+// rebuild directly.
 //
 // Precondition: template must exist and be in status=unhealthy.
 // (ready_no_snapshot rebuilds need a different entry point — they
