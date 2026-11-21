@@ -39,6 +39,12 @@ var connectDialFn = func(socket, namespace string) (rawAPI, error) {
 
 // Connect dials the system containerd socket and scopes to namespace.
 func Connect(socket, namespace string) (*Client, error) {
+	return connectVia(socket, namespace, connectDialFn)
+}
+
+// connectVia is Connect with its dialer: containerd's own socket, or the
+// root helper's (privilege_split.go).
+func connectVia(socket, namespace string, dial func(socket, namespace string) (rawAPI, error)) (*Client, error) {
 	socket = strings.TrimSpace(socket)
 	if socket == "" {
 		return nil, fmt.Errorf("containerd socket path is required")
@@ -47,7 +53,7 @@ func Connect(socket, namespace string) (*Client, error) {
 	if ns == "" {
 		return nil, fmt.Errorf("containerd namespace is required")
 	}
-	raw, err := connectDialFn(socket, ns)
+	raw, err := dial(socket, ns)
 	if err != nil {
 		return nil, fmt.Errorf("dial containerd: %w", err)
 	}

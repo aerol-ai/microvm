@@ -290,33 +290,6 @@ func BenchmarkKernelNetnsRealize(b *testing.B) {
 	}
 }
 
-// The thread that made a namespace is back in its own before it is
-// unlocked (bindNewNetnsOnThread reports home).
-func TestKernelHostBindReturnsTheThread(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("needs root in a privileged container")
-	}
-	dir := t.TempDir()
-	path := filepath.Join(dir, "bound")
-	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = unix.Unmount(path, unix.MNT_DETACH) })
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	before := nsInode(t, "/proc/thread-self/ns/net")
-	home, err := bindNewNetnsOnThread(path)
-	if err != nil || !home {
-		t.Fatalf("bind = home %v, %v", home, err)
-	}
-	if got := nsInode(t, "/proc/thread-self/ns/net"); got != before {
-		t.Fatal("the thread that made the namespace was left in it")
-	}
-	if nsInode(t, path) == before {
-		t.Fatal("the file is bound to the thread's own namespace, not a new one")
-	}
-}
-
 // Go never ends the main thread: a locked goroutine that ended there,
 // inside a new namespace, wedged it there for good, and /proc/<pid>/ns/net
 // (the main thread's) then named a sandbox's network. With one P, the

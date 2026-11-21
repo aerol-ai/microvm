@@ -28,7 +28,20 @@ func netrulesUserChain(cfg config.Config) string {
 // SB_CONTAINER_ENGINE=containerd. On the docker default path it only wires the
 // events source to the docker client, leaving behavior byte-identical.
 func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store, dockerClient *docker.Client, dockerRules *netrules.Manager, admitter *capacity.Admitter) (*containerdEngineWiring, error) {
-	_ = ctx
+	return wireContainerEngineWith(ctx, cfg, logger, svc, st, dockerClient, dockerRules, admitter, nil)
+}
+
+// rootHelper is the root helper as the containerd engine uses it in
+// privilege mode split (*rootclient.Client): containerd through its gate,
+// and its network calls.
+type rootHelper interface {
+	cntr.RootHelper
+	netnsHelper
+}
+
+// wireContainerEngineWith is wireContainerEngine with the root helper in
+// privilege mode split; nil is single mode, unchanged.
+func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store, dockerClient *docker.Client, dockerRules *netrules.Manager, admitter *capacity.Admitter, helper rootHelper) (*containerdEngineWiring, error) {
 	_ = dockerRules // docker driver keeps its own DOCKER-USER manager (daemon.go)
 	if cfg.ContainerEngine != models.ContainerEngineContainerd {
 		svc.SetEventsSource(dockerClient)
@@ -59,11 +72,16 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	prepareBlockSets(ctdRules, netrules.ChainAerolvmUser, logger)
 	reassertStop := startChainReassert(ctx, ctdRules, logger)
 	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
+	var netHelper netnsHelper
+	if helper != nil {
+		driver.SetRootHelper(helper)
+		netHelper = helper
+	}
 	// Same cluster-PAT pull credential the docker client got in Run (see
 	// configureAOCRPullAuth in daemon.go). Installed here, before the warm pool
 	// starts refilling, because ensureImage reads it without a lock.
 	configureAOCRPullAuth(logger, cfg, models.ContainerEngineContainerd, driver)
-	netnsPool, err := wireContainerdNativeNetnsPool(ctx, cfg, logger, st, driver)
+	netnsPool, err := wireNetnsPool(ctx, cfg, logger, st, driver, netHelper)
 	if err != nil {
 		return nil, err
 	}

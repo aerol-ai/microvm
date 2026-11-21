@@ -23,7 +23,7 @@ const maxBridgePorts = capacity.BridgeMaxPorts
 type containerdNetnsPool struct {
 	refiller *netns.Refiller
 	pool     *netns.Pool
-	host     *netns.Host
+	host     netns.HostManager
 }
 
 var ensureForwardingSysctls = hostnet.EnsureForwardingSysctls
@@ -71,6 +71,15 @@ func netnsSlotOwnerLive(prober netnsOwnerProber, logger *slog.Logger) netns.Live
 // wireContainerdNativeNetnsPool seeds the SQLite-backed netns pool, runs boot
 // reconcile, starts the refill ticker, and wires the driver handoff.
 func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logger *slog.Logger, st *store.Store, driver *cntr.Driver) (*containerdNetnsPool, error) {
+	return wireNetnsPool(ctx, cfg, logger, st, driver, nil)
+}
+
+// wireNetnsPool is wireContainerdNativeNetnsPool with the root helper in
+// privilege mode split: the pool's bookkeeping stays here, and every
+// namespace build, teardown and read goes to the helper (helperNetnsHost),
+// which also wrote the CNI config and set the forwarding sysctls at boot
+// (resolveSplitBridgeSubnet). nil is single mode: all of it in process.
+func wireNetnsPool(ctx context.Context, cfg config.Config, logger *slog.Logger, st *store.Store, driver *cntr.Driver, helper netnsHelper) (*containerdNetnsPool, error) {
 	if cfg.ContainerEngine != models.ContainerEngineContainerd || !cfg.ContainerdNativeNetnsPoolEnabled {
 		return nil, nil
 	}
@@ -110,6 +119,40 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: poolSize}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)
 	}
+	var host netns.HostManager
+	var exists netns.NetnsExists
+	if helper != nil {
+		h := newHelperNetnsHost(helper, subnet, logger)
+		host, exists = h, h.exists
+	} else {
+		inProcess, err := inProcessNetnsHost(cfg, subnet)
+		if err != nil {
+			return nil, err
+		}
+		host = inProcess
+	}
+	if reaped, err := pool.Reconcile(ctx, host, netnsSlotOwnerLive(driver, logger), exists, now); err != nil {
+		return nil, fmt.Errorf("reconcile containerd netns pool: %w", err)
+	} else if reaped > 0 {
+		logger.Warn("containerd netns pool reconcile reaped orphans", "count", reaped)
+	}
+	driver.SetNetnsHandoff(netns.NewRuntimeHandoff(pool, host))
+	refiller := netns.NewRefiller(pool, host, cfg.ContainerdNetnsPoolDepth, cfg.ContainerdNetnsPoolRefillInterval)
+	go refiller.Run(ctx)
+	logger.Info("containerd native netns pool enabled",
+		"pool_size", poolSize,
+		"warm_depth", cfg.ContainerdNetnsPoolDepth,
+		"refill_interval", cfg.ContainerdNetnsPoolRefillInterval,
+		"cni_plugin_dir", cfg.ContainerdCNIPluginDir,
+		"cni_conf", cfg.ContainerdCNIConfPath,
+		"root_helper", helper != nil,
+	)
+	return &containerdNetnsPool{refiller: refiller, pool: pool, host: host}, nil
+}
+
+// inProcessNetnsHost is single mode's: sandboxd writes the CNI config,
+// sets the forwarding sysctls and runs CNI itself, as root.
+func inProcessNetnsHost(cfg config.Config, subnet string) (*netns.Host, error) {
 	// Generate the bridge+host-local conflist (bridge, IPAM, outbound NAT) if
 	// absent — nothing else ships it, and without it the first CNI ADD fails on
 	// a missing conf. Size the bridge MTU to the host uplink so egress isn't
@@ -132,21 +175,5 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	if err := ensureForwardingSysctls(); err != nil {
 		return nil, fmt.Errorf("host forwarding sysctls: %w", err)
 	}
-	host := &netns.Host{Runner: runner}
-	if reaped, err := pool.Reconcile(ctx, host, netnsSlotOwnerLive(driver, logger), nil, now); err != nil {
-		return nil, fmt.Errorf("reconcile containerd netns pool: %w", err)
-	} else if reaped > 0 {
-		logger.Warn("containerd netns pool reconcile reaped orphans", "count", reaped)
-	}
-	driver.SetNetnsHandoff(netns.NewRuntimeHandoff(pool, host))
-	refiller := netns.NewRefiller(pool, host, cfg.ContainerdNetnsPoolDepth, cfg.ContainerdNetnsPoolRefillInterval)
-	go refiller.Run(ctx)
-	logger.Info("containerd native netns pool enabled",
-		"pool_size", poolSize,
-		"warm_depth", cfg.ContainerdNetnsPoolDepth,
-		"refill_interval", cfg.ContainerdNetnsPoolRefillInterval,
-		"cni_plugin_dir", cfg.ContainerdCNIPluginDir,
-		"cni_conf", cfg.ContainerdCNIConfPath,
-	)
-	return &containerdNetnsPool{refiller: refiller, pool: pool, host: host}, nil
+	return &netns.Host{Runner: runner}, nil
 }

@@ -119,7 +119,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := checkHostProcessesOutliveAgent(cfg); err != nil {
 		return err
 	}
-	mountsOff := mountsOffReason(cfg)
+	if err := checkPrivilegeMode(cfg); err != nil {
+		return err
+	}
+	mountsOff := mountsOffFor(cfg)
 	if mountsOff != "" {
 		logger.Info("external storage is refused on this node: a create with mounts answers 501 mounts_unavailable", "reason", mountsOff)
 	}
@@ -396,15 +399,29 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc.RecordKeyCustody()
 	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
+	// Privilege mode split: the root helper does the root work (nil in
+	// single mode, which takes none of the branches below).
+	helper := newRootHelper(cfg, svc)
+	var engineHelper rootHelper
+	if helper != nil {
+		defer func() { _ = helper.Close() }()
+		engineHelper = helper
+	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
-		subnet, err := resolveContainerdBridgeSubnet(cfg, logger)
+		var subnet string
+		var err error
+		if helper != nil {
+			subnet, err = resolveSplitBridgeSubnet(ctx, cfg, helper, logger)
+		} else {
+			subnet, err = resolveContainerdBridgeSubnet(cfg, logger)
+		}
 		if err != nil {
 			return err
 		}
 		cfg.ContainerdBridgeSubnet = subnet
 	}
 	var ctdWiring *containerdEngineWiring
-	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
+	if ctd, err := wireContainerEngineWith(ctx, cfg, logger, svc, db, dockerClient, rules, admitter, engineHelper); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
 	} else if ctd != nil {
 		ctdWiring = ctd

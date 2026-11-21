@@ -80,6 +80,7 @@ func TestClassify(t *testing.T) {
 		// The root helper: down, or older than the agent (M1). Both clear
 		// on their own (a restart, the staged helper's swap), so 503.
 		{"root helper unavailable", fmt.Errorf("%w at /run/aerolvm/root.sock: connection refused", rootclient.ErrUnavailable), http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		{"root helper busy", fmt.Errorf("%w: rpc error: code = ResourceExhausted", rootclient.ErrBusy), http.StatusServiceUnavailable, 1, "", ErrKindOther},
 		{"root helper lacks a call", &rootclient.UnsupportedError{Feature: "EnsureHost", Helper: rootclient.Info{HelperVersion: "v0.7.7", API: 1}}, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		// A refusal by the helper or its gate (eng review D9): drift or a
 		// compromised agent, so 500, never the 400 catch-all its

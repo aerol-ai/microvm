@@ -84,7 +84,9 @@ func TestAPIConstants(t *testing.T) {
 	for _, full := range []string{RootHelper_Version_FullMethodName, RootHelper_EnsureHost_FullMethodName,
 		RootHelper_EnsureHostFiles_FullMethodName, RootHelper_EnsureTaskFIFOs_FullMethodName,
 		RootHelper_EnsureRunscConfig_FullMethodName, RootHelper_EnsureReadySocket_FullMethodName,
-		RootHelper_RemoveContainerFiles_FullMethodName} {
+		RootHelper_RemoveContainerFiles_FullMethodName, RootHelper_EnsureHostNetwork_FullMethodName,
+		RootHelper_RealizeNetns_FullMethodName, RootHelper_RemoveNetns_FullMethodName,
+		RootHelper_DisableNetnsIPv6_FullMethodName, RootHelper_NetnsAddrs_FullMethodName} {
 		if !strings.HasPrefix(full, ServicePrefix) {
 			t.Errorf("%s is not under %s", full, ServicePrefix)
 		}
@@ -122,6 +124,16 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.EnsureReadySocketResponse":    {"path=1:string"},
 		"aerolvm.rootd.v1.RemoveContainerFilesRequest":  {"container_id=1:string"},
 		"aerolvm.rootd.v1.RemoveContainerFilesResponse": nil,
+		"aerolvm.rootd.v1.EnsureHostNetworkRequest":     nil,
+		"aerolvm.rootd.v1.EnsureHostNetworkResponse":    {"subnet=1:string"},
+		"aerolvm.rootd.v1.RealizeNetnsRequest":          {"netns_name=1:string"},
+		"aerolvm.rootd.v1.RealizeNetnsResponse":         {"netns_path=1:string", "container_ip=2:string"},
+		"aerolvm.rootd.v1.RemoveNetnsRequest":           {"netns_name=1:string", "container_ip=2:string"},
+		"aerolvm.rootd.v1.RemoveNetnsResponse":          nil,
+		"aerolvm.rootd.v1.DisableNetnsIPv6Request":      {"netns_name=1:string"},
+		"aerolvm.rootd.v1.DisableNetnsIPv6Response":     nil,
+		"aerolvm.rootd.v1.NetnsAddrsRequest":            {"netns_name=1:string"},
+		"aerolvm.rootd.v1.NetnsAddrsResponse":           {"exists=1:bool", "ipv4=2:repeated string"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -301,6 +313,8 @@ func fillMessage(m protoreflect.Message) {
 			v = protoreflect.ValueOfBytes([]byte{1})
 		case protoreflect.Uint32Kind:
 			v = protoreflect.ValueOfUint32(1)
+		case protoreflect.BoolKind:
+			v = protoreflect.ValueOfBool(true)
 		case protoreflect.EnumKind:
 			v = protoreflect.ValueOfEnum(1)
 		case protoreflect.MessageKind:

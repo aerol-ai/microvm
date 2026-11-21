@@ -1007,6 +1007,458 @@ func (x *HelperRefused) GetReason() string {
 	return ""
 }
 
+type EnsureHostNetworkRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EnsureHostNetworkRequest) Reset() {
+	*x = EnsureHostNetworkRequest{}
+	mi := &file_rootd_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnsureHostNetworkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnsureHostNetworkRequest) ProtoMessage() {}
+
+func (x *EnsureHostNetworkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnsureHostNetworkRequest.ProtoReflect.Descriptor instead.
+func (*EnsureHostNetworkRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{18}
+}
+
+type EnsureHostNetworkResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The IPv4 range the helper's CNI config hands sandboxes, as a prefix
+	// ("10.88.0.0/16").
+	Subnet        string `protobuf:"bytes,1,opt,name=subnet,proto3" json:"subnet,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EnsureHostNetworkResponse) Reset() {
+	*x = EnsureHostNetworkResponse{}
+	mi := &file_rootd_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnsureHostNetworkResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnsureHostNetworkResponse) ProtoMessage() {}
+
+func (x *EnsureHostNetworkResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnsureHostNetworkResponse.ProtoReflect.Descriptor instead.
+func (*EnsureHostNetworkResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *EnsureHostNetworkResponse) GetSubnet() string {
+	if x != nil {
+		return x.Subnet
+	}
+	return ""
+}
+
+type RealizeNetnsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The namespace's netns-pool name: a sandbox, slot or warm-park ID. It
+	// is also the CNI container ID its address lease and NAT chain are
+	// keyed by.
+	NetnsName     string `protobuf:"bytes,1,opt,name=netns_name,json=netnsName,proto3" json:"netns_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RealizeNetnsRequest) Reset() {
+	*x = RealizeNetnsRequest{}
+	mi := &file_rootd_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RealizeNetnsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RealizeNetnsRequest) ProtoMessage() {}
+
+func (x *RealizeNetnsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RealizeNetnsRequest.ProtoReflect.Descriptor instead.
+func (*RealizeNetnsRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *RealizeNetnsRequest) GetNetnsName() string {
+	if x != nil {
+		return x.NetnsName
+	}
+	return ""
+}
+
+type RealizeNetnsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The namespace, for the sandbox's spec: built by the helper.
+	NetnsPath string `protobuf:"bytes,1,opt,name=netns_path,json=netnsPath,proto3" json:"netns_path,omitempty"`
+	// The sandbox's IPv4 address on the bridge.
+	ContainerIp   string `protobuf:"bytes,2,opt,name=container_ip,json=containerIp,proto3" json:"container_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RealizeNetnsResponse) Reset() {
+	*x = RealizeNetnsResponse{}
+	mi := &file_rootd_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RealizeNetnsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RealizeNetnsResponse) ProtoMessage() {}
+
+func (x *RealizeNetnsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RealizeNetnsResponse.ProtoReflect.Descriptor instead.
+func (*RealizeNetnsResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *RealizeNetnsResponse) GetNetnsPath() string {
+	if x != nil {
+		return x.NetnsPath
+	}
+	return ""
+}
+
+func (x *RealizeNetnsResponse) GetContainerIp() string {
+	if x != nil {
+		return x.ContainerIp
+	}
+	return ""
+}
+
+type RemoveNetnsRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	NetnsName string                 `protobuf:"bytes,1,opt,name=netns_name,json=netnsName,proto3" json:"netns_name,omitempty"`
+	// The address the pool recorded for the namespace, whose NAT chain and
+	// connection tracking go with it. Empty when none was recorded. It must
+	// be a sandbox address in the helper's range.
+	ContainerIp   string `protobuf:"bytes,2,opt,name=container_ip,json=containerIp,proto3" json:"container_ip,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveNetnsRequest) Reset() {
+	*x = RemoveNetnsRequest{}
+	mi := &file_rootd_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveNetnsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveNetnsRequest) ProtoMessage() {}
+
+func (x *RemoveNetnsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveNetnsRequest.ProtoReflect.Descriptor instead.
+func (*RemoveNetnsRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *RemoveNetnsRequest) GetNetnsName() string {
+	if x != nil {
+		return x.NetnsName
+	}
+	return ""
+}
+
+func (x *RemoveNetnsRequest) GetContainerIp() string {
+	if x != nil {
+		return x.ContainerIp
+	}
+	return ""
+}
+
+type RemoveNetnsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveNetnsResponse) Reset() {
+	*x = RemoveNetnsResponse{}
+	mi := &file_rootd_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveNetnsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveNetnsResponse) ProtoMessage() {}
+
+func (x *RemoveNetnsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveNetnsResponse.ProtoReflect.Descriptor instead.
+func (*RemoveNetnsResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{23}
+}
+
+type DisableNetnsIPv6Request struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NetnsName     string                 `protobuf:"bytes,1,opt,name=netns_name,json=netnsName,proto3" json:"netns_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DisableNetnsIPv6Request) Reset() {
+	*x = DisableNetnsIPv6Request{}
+	mi := &file_rootd_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DisableNetnsIPv6Request) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DisableNetnsIPv6Request) ProtoMessage() {}
+
+func (x *DisableNetnsIPv6Request) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DisableNetnsIPv6Request.ProtoReflect.Descriptor instead.
+func (*DisableNetnsIPv6Request) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *DisableNetnsIPv6Request) GetNetnsName() string {
+	if x != nil {
+		return x.NetnsName
+	}
+	return ""
+}
+
+type DisableNetnsIPv6Response struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DisableNetnsIPv6Response) Reset() {
+	*x = DisableNetnsIPv6Response{}
+	mi := &file_rootd_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DisableNetnsIPv6Response) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DisableNetnsIPv6Response) ProtoMessage() {}
+
+func (x *DisableNetnsIPv6Response) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DisableNetnsIPv6Response.ProtoReflect.Descriptor instead.
+func (*DisableNetnsIPv6Response) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{25}
+}
+
+type NetnsAddrsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NetnsName     string                 `protobuf:"bytes,1,opt,name=netns_name,json=netnsName,proto3" json:"netns_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetnsAddrsRequest) Reset() {
+	*x = NetnsAddrsRequest{}
+	mi := &file_rootd_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetnsAddrsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetnsAddrsRequest) ProtoMessage() {}
+
+func (x *NetnsAddrsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetnsAddrsRequest.ProtoReflect.Descriptor instead.
+func (*NetnsAddrsRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *NetnsAddrsRequest) GetNetnsName() string {
+	if x != nil {
+		return x.NetnsName
+	}
+	return ""
+}
+
+type NetnsAddrsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Whether a namespace by that name exists.
+	Exists bool `protobuf:"varint,1,opt,name=exists,proto3" json:"exists,omitempty"`
+	// Its IPv4 addresses, loopback aside, in the kernel's link order.
+	Ipv4          []string `protobuf:"bytes,2,rep,name=ipv4,proto3" json:"ipv4,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NetnsAddrsResponse) Reset() {
+	*x = NetnsAddrsResponse{}
+	mi := &file_rootd_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetnsAddrsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetnsAddrsResponse) ProtoMessage() {}
+
+func (x *NetnsAddrsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetnsAddrsResponse.ProtoReflect.Descriptor instead.
+func (*NetnsAddrsResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *NetnsAddrsResponse) GetExists() bool {
+	if x != nil {
+		return x.Exists
+	}
+	return false
+}
+
+func (x *NetnsAddrsResponse) GetIpv4() []string {
+	if x != nil {
+		return x.Ipv4
+	}
+	return nil
+}
+
 var File_rootd_proto protoreflect.FileDescriptor
 
 const file_rootd_proto_rawDesc = "" +
@@ -1062,11 +1514,36 @@ const file_rootd_proto_rawDesc = "" +
 	"\x11HelperUnsupported\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason\"'\n" +
 	"\rHelperRefused\x12\x16\n" +
-	"\x06reason\x18\x01 \x01(\tR\x06reason*_\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\"\x1a\n" +
+	"\x18EnsureHostNetworkRequest\"3\n" +
+	"\x19EnsureHostNetworkResponse\x12\x16\n" +
+	"\x06subnet\x18\x01 \x01(\tR\x06subnet\"4\n" +
+	"\x13RealizeNetnsRequest\x12\x1d\n" +
+	"\n" +
+	"netns_name\x18\x01 \x01(\tR\tnetnsName\"X\n" +
+	"\x14RealizeNetnsResponse\x12\x1d\n" +
+	"\n" +
+	"netns_path\x18\x01 \x01(\tR\tnetnsPath\x12!\n" +
+	"\fcontainer_ip\x18\x02 \x01(\tR\vcontainerIp\"V\n" +
+	"\x12RemoveNetnsRequest\x12\x1d\n" +
+	"\n" +
+	"netns_name\x18\x01 \x01(\tR\tnetnsName\x12!\n" +
+	"\fcontainer_ip\x18\x02 \x01(\tR\vcontainerIp\"\x15\n" +
+	"\x13RemoveNetnsResponse\"8\n" +
+	"\x17DisableNetnsIPv6Request\x12\x1d\n" +
+	"\n" +
+	"netns_name\x18\x01 \x01(\tR\tnetnsName\"\x1a\n" +
+	"\x18DisableNetnsIPv6Response\"2\n" +
+	"\x11NetnsAddrsRequest\x12\x1d\n" +
+	"\n" +
+	"netns_name\x18\x01 \x01(\tR\tnetnsName\"@\n" +
+	"\x12NetnsAddrsResponse\x12\x16\n" +
+	"\x06exists\x18\x01 \x01(\bR\x06exists\x12\x12\n" +
+	"\x04ipv4\x18\x02 \x03(\tR\x04ipv4*_\n" +
 	"\vRunscConfig\x12\x1c\n" +
 	"\x18RUNSC_CONFIG_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14RUNSC_CONFIG_DEFAULT\x10\x01\x12\x18\n" +
-	"\x14RUNSC_CONFIG_RESTORE\x10\x022\xd8\x05\n" +
+	"\x14RUNSC_CONFIG_RESTORE\x10\x022\xc5\t\n" +
 	"\n" +
 	"RootHelper\x12N\n" +
 	"\aVersion\x12 .aerolvm.rootd.v1.VersionRequest\x1a!.aerolvm.rootd.v1.VersionResponse\x12W\n" +
@@ -1076,7 +1553,13 @@ const file_rootd_proto_rawDesc = "" +
 	"\x0fEnsureTaskFIFOs\x12(.aerolvm.rootd.v1.EnsureTaskFIFOsRequest\x1a).aerolvm.rootd.v1.EnsureTaskFIFOsResponse\x12l\n" +
 	"\x11EnsureRunscConfig\x12*.aerolvm.rootd.v1.EnsureRunscConfigRequest\x1a+.aerolvm.rootd.v1.EnsureRunscConfigResponse\x12l\n" +
 	"\x11EnsureReadySocket\x12*.aerolvm.rootd.v1.EnsureReadySocketRequest\x1a+.aerolvm.rootd.v1.EnsureReadySocketResponse\x12u\n" +
-	"\x14RemoveContainerFiles\x12-.aerolvm.rootd.v1.RemoveContainerFilesRequest\x1a..aerolvm.rootd.v1.RemoveContainerFilesResponseB4Z2github.com/aerol-ai/microvm/internal/rootd/rootdpbb\x06proto3"
+	"\x14RemoveContainerFiles\x12-.aerolvm.rootd.v1.RemoveContainerFilesRequest\x1a..aerolvm.rootd.v1.RemoveContainerFilesResponse\x12l\n" +
+	"\x11EnsureHostNetwork\x12*.aerolvm.rootd.v1.EnsureHostNetworkRequest\x1a+.aerolvm.rootd.v1.EnsureHostNetworkResponse\x12]\n" +
+	"\fRealizeNetns\x12%.aerolvm.rootd.v1.RealizeNetnsRequest\x1a&.aerolvm.rootd.v1.RealizeNetnsResponse\x12Z\n" +
+	"\vRemoveNetns\x12$.aerolvm.rootd.v1.RemoveNetnsRequest\x1a%.aerolvm.rootd.v1.RemoveNetnsResponse\x12i\n" +
+	"\x10DisableNetnsIPv6\x12).aerolvm.rootd.v1.DisableNetnsIPv6Request\x1a*.aerolvm.rootd.v1.DisableNetnsIPv6Response\x12W\n" +
+	"\n" +
+	"NetnsAddrs\x12#.aerolvm.rootd.v1.NetnsAddrsRequest\x1a$.aerolvm.rootd.v1.NetnsAddrsResponseB4Z2github.com/aerol-ai/microvm/internal/rootd/rootdpbb\x06proto3"
 
 var (
 	file_rootd_proto_rawDescOnce sync.Once
@@ -1091,7 +1574,7 @@ func file_rootd_proto_rawDescGZIP() []byte {
 }
 
 var file_rootd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_rootd_proto_goTypes = []any{
 	(RunscConfig)(0),                     // 0: aerolvm.rootd.v1.RunscConfig
 	(*VersionRequest)(nil),               // 1: aerolvm.rootd.v1.VersionRequest
@@ -1112,6 +1595,16 @@ var file_rootd_proto_goTypes = []any{
 	(*HelperUnavailable)(nil),            // 16: aerolvm.rootd.v1.HelperUnavailable
 	(*HelperUnsupported)(nil),            // 17: aerolvm.rootd.v1.HelperUnsupported
 	(*HelperRefused)(nil),                // 18: aerolvm.rootd.v1.HelperRefused
+	(*EnsureHostNetworkRequest)(nil),     // 19: aerolvm.rootd.v1.EnsureHostNetworkRequest
+	(*EnsureHostNetworkResponse)(nil),    // 20: aerolvm.rootd.v1.EnsureHostNetworkResponse
+	(*RealizeNetnsRequest)(nil),          // 21: aerolvm.rootd.v1.RealizeNetnsRequest
+	(*RealizeNetnsResponse)(nil),         // 22: aerolvm.rootd.v1.RealizeNetnsResponse
+	(*RemoveNetnsRequest)(nil),           // 23: aerolvm.rootd.v1.RemoveNetnsRequest
+	(*RemoveNetnsResponse)(nil),          // 24: aerolvm.rootd.v1.RemoveNetnsResponse
+	(*DisableNetnsIPv6Request)(nil),      // 25: aerolvm.rootd.v1.DisableNetnsIPv6Request
+	(*DisableNetnsIPv6Response)(nil),     // 26: aerolvm.rootd.v1.DisableNetnsIPv6Response
+	(*NetnsAddrsRequest)(nil),            // 27: aerolvm.rootd.v1.NetnsAddrsRequest
+	(*NetnsAddrsResponse)(nil),           // 28: aerolvm.rootd.v1.NetnsAddrsResponse
 }
 var file_rootd_proto_depIdxs = []int32{
 	5,  // 0: aerolvm.rootd.v1.EnsureHostFilesRequest.hosts:type_name -> aerolvm.rootd.v1.HostEntry
@@ -1123,15 +1616,25 @@ var file_rootd_proto_depIdxs = []int32{
 	10, // 6: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:input_type -> aerolvm.rootd.v1.EnsureRunscConfigRequest
 	12, // 7: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:input_type -> aerolvm.rootd.v1.EnsureReadySocketRequest
 	14, // 8: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:input_type -> aerolvm.rootd.v1.RemoveContainerFilesRequest
-	2,  // 9: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
-	4,  // 10: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
-	7,  // 11: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
-	9,  // 12: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
-	11, // 13: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
-	13, // 14: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
-	15, // 15: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
-	9,  // [9:16] is the sub-list for method output_type
-	2,  // [2:9] is the sub-list for method input_type
+	19, // 9: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:input_type -> aerolvm.rootd.v1.EnsureHostNetworkRequest
+	21, // 10: aerolvm.rootd.v1.RootHelper.RealizeNetns:input_type -> aerolvm.rootd.v1.RealizeNetnsRequest
+	23, // 11: aerolvm.rootd.v1.RootHelper.RemoveNetns:input_type -> aerolvm.rootd.v1.RemoveNetnsRequest
+	25, // 12: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:input_type -> aerolvm.rootd.v1.DisableNetnsIPv6Request
+	27, // 13: aerolvm.rootd.v1.RootHelper.NetnsAddrs:input_type -> aerolvm.rootd.v1.NetnsAddrsRequest
+	2,  // 14: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
+	4,  // 15: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
+	7,  // 16: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
+	9,  // 17: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
+	11, // 18: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
+	13, // 19: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
+	15, // 20: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
+	20, // 21: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:output_type -> aerolvm.rootd.v1.EnsureHostNetworkResponse
+	22, // 22: aerolvm.rootd.v1.RootHelper.RealizeNetns:output_type -> aerolvm.rootd.v1.RealizeNetnsResponse
+	24, // 23: aerolvm.rootd.v1.RootHelper.RemoveNetns:output_type -> aerolvm.rootd.v1.RemoveNetnsResponse
+	26, // 24: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:output_type -> aerolvm.rootd.v1.DisableNetnsIPv6Response
+	28, // 25: aerolvm.rootd.v1.RootHelper.NetnsAddrs:output_type -> aerolvm.rootd.v1.NetnsAddrsResponse
+	14, // [14:26] is the sub-list for method output_type
+	2,  // [2:14] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -1148,7 +1651,7 @@ func file_rootd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rootd_proto_rawDesc), len(file_rootd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   18,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
