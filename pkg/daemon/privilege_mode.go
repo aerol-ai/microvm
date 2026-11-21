@@ -86,12 +86,25 @@ func newRootHelper(cfg config.Config, svc *service.Service) *rootclient.Client {
 	if cfg.PrivilegeMode != privmode.Split {
 		return nil
 	}
-	c := rootclient.Config{Socket: cfg.RootdSocket, HelperUID: rootHelperUID}
+	c := rootHelperConfig(cfg)
 	if svc != nil {
 		c.OnRefusal = svc.RecordRootRefusal
 	}
 	return rootclient.New(c)
 }
+
+// rootHelperConfig is how sandboxd reaches the helper. The network calls
+// get their own bound (PR 4 review): a namespace build queues behind a
+// burst's others for seconds, and the two seconds of the connect and the
+// handshake would fail most of a burst that single mode serves.
+func rootHelperConfig(cfg config.Config) rootclient.Config {
+	return rootclient.Config{Socket: cfg.RootdSocket, HelperUID: rootHelperUID,
+		Timeout: rootclient.DefaultTimeout, NetworkTimeout: helperNetworkTimeout}
+}
+
+// helperNetworkTimeout bounds one network call to the helper whose caller
+// set no deadline (the netns pool's refiller and the create path set none).
+var helperNetworkTimeout = rootclient.DefaultNetworkTimeout
 
 // rootHelperUID is the uid that must serve the helper's socket: root. Tests,
 // whose own process serves it, set their uid.
@@ -164,11 +177,37 @@ func newHelperNetnsHost(h netnsHelper, subnet string, log *slog.Logger) *helperN
 	return &helperNetnsHost{h: h, subnet: p.Masked(), log: log}
 }
 
+// Realize answers a namespace the helper built, or leaves none behind
+// (PR 4 review). A build the agent gave up on (its deadline, a cancel, a
+// dropped answer) or that failed inside the helper may have left a part:
+// a namespace, an address lease. The pool records nothing for a failed
+// build, and a create's slot goes back to the free list under another
+// name, so nothing would ever name it again; it is removed here, under
+// the name it was built under. The helper takes that name's lock, so the
+// removal runs only once the build has stopped. A build the helper never
+// ran (refused, too old, at its limit of calls) has nothing to remove.
 func (n *helperNetnsHost) Realize(ctx context.Context, slot netns.Slot) (string, string, error) {
 	if strings.TrimSpace(slot.SandboxID) == "" {
 		return "", "", errors.New("netns host: sandbox_id is required")
 	}
-	return n.h.RealizeNetns(ctx, slot.NetnsName())
+	name := slot.NetnsName()
+	path, ip, err := n.h.RealizeNetns(ctx, name)
+	if err == nil || !mayHaveRun(err) {
+		return path, ip, err
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), helperNetworkTimeout)
+	defer cancel()
+	if rerr := n.h.RemoveNetns(rctx, name, ""); rerr != nil {
+		n.log.Warn("containerd netns build failed and its leftovers could not be removed; a create of the same sandbox ID clears them",
+			"slot_id", slot.SlotID, "netns", name, "build_error", err, "error", rerr)
+	}
+	return "", "", err
+}
+
+// mayHaveRun: a failed helper call that the helper may have run, in part.
+func mayHaveRun(err error) bool {
+	var refused *rootclient.RefusedError
+	return !errors.As(err, &refused) && !errors.Is(err, rootclient.ErrUnsupported) && !errors.Is(err, rootclient.ErrBusy)
 }
 
 // Remove sends the address the pool recorded only when it is a sandbox

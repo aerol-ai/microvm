@@ -3,11 +3,13 @@
 package nsbuild
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -35,22 +37,51 @@ var (
 // share the root, create the file, bind a new netns onto it. An existing
 // file is success, as the "File exists" the old exec wrapper ignored was.
 func CreateNamed(root, name string) error {
+	return createNamed(nil, root, name, nil)
+}
+
+// Mark is how the root helper (privilege mode split) marks what it makes,
+// so that it can tell its own from anything else in its netns folder
+// whatever state a build was cut short in. Both run before the namespace
+// is in the folder: a build cut short leaves nothing unmarked.
+type Mark struct {
+	// File runs on the new, empty file before it gets its name.
+	File func(fd int) error
+	// Netns runs on the building thread, inside the new namespace, before
+	// the namespace is bound to the file.
+	Netns func() error
+}
+
+// CreateNamedMarked is CreateNamed for the root helper, with two
+// differences. The file and the namespace carry m's marks from the moment
+// each is in the folder: the file is made unnamed (O_TMPFILE), marked, and
+// only then linked to its name. And the wait for the netns folder's flock
+// ends with ctx: it polls a non-blocking lock instead of sleeping in
+// flock(2), which would hold an OS thread for as long as another process
+// held the lock.
+func CreateNamedMarked(ctx context.Context, root, name string, m Mark) error {
+	return createNamed(ctx, root, name, &m)
+}
+
+// createNamed is both; a nil ctx is CreateNamed's blocking flock, a nil m
+// its unmarked file.
+func createNamed(ctx context.Context, root, name string, m *Mark) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("create netns dir %s: %w", root, err)
 	}
-	if err := shareNetnsRoot(root); err != nil {
+	if err := shareNetnsRoot(ctx, root); err != nil {
 		return err
 	}
 	path := filepath.Join(root, name)
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.EEXIST) {
-		return nil
+	made, err := createFile(root, path, m)
+	if !made || err != nil {
+		return err
 	}
-	if err != nil {
-		return fmt.Errorf("create netns file %s: %w", path, err)
+	var inside func() error
+	if m != nil {
+		inside = m.Netns
 	}
-	_ = unix.Close(fd)
-	if err := bindNewNetns(path); err != nil {
+	if err := bindNewNetns(path, inside); err != nil {
 		// Never leave the empty file behind (iproute2 deletes it too): the
 		// next add of this name would take it for a live netns.
 		_ = unix.Unmount(path, unix.MNT_DETACH)
@@ -58,6 +89,83 @@ func CreateNamed(root, name string) error {
 		return err
 	}
 	return nil
+}
+
+// createFile makes the empty file a namespace is bound to. made is false
+// when a file by that name is there already.
+func createFile(root, path string, m *Mark) (made bool, err error) {
+	if m == nil || m.File == nil {
+		fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.EEXIST) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("create netns file %s: %w", path, err)
+		}
+		_ = unix.Close(fd)
+		return true, nil
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return false, nil
+	}
+	fd, err := openUnnamed(root)
+	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EISDIR) {
+		// A filesystem without unnamed files (overlayfs before Linux 6.6).
+		return createMarkedNamed(root, path, m)
+	}
+	if err != nil {
+		return false, fmt.Errorf("create netns file in %s: %w", root, err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := m.File(fd); err != nil {
+		return false, fmt.Errorf("mark netns file %s: %w", path, err)
+	}
+	// Linking through /proc needs no capability beyond the folder's write
+	// right; AT_EMPTY_PATH would need CAP_DAC_READ_SEARCH.
+	return linkNew(fmt.Sprintf("/proc/self/fd/%d", fd), path, unix.AT_SYMLINK_FOLLOW)
+}
+
+// openUnnamed opens a new file in dir with no name (O_TMPFILE); a seam, so
+// tests take the way without it on any filesystem.
+var openUnnamed = func(dir string) (int, error) {
+	return unix.Open(dir, unix.O_TMPFILE|unix.O_WRONLY|unix.O_CLOEXEC, 0)
+}
+
+// createMarkedNamed is createFile's way without O_TMPFILE: the file is
+// made and marked under a name no namespace has (a dot first, which a
+// namespace name may not hold), then linked to its own. A build cut short
+// in between leaves that marked, empty file, which no call ever names.
+func createMarkedNamed(root, path string, m *Mark) (bool, error) {
+	tmp := filepath.Join(root, fmt.Sprintf(".%s.%d.new", filepath.Base(path), unix.Gettid()))
+	fd, err := unix.Open(tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.EEXIST) {
+		// One a build cut short left: the folder is root's alone.
+		_ = unix.Unlink(tmp)
+		fd, err = unix.Open(tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	}
+	if err != nil {
+		return false, fmt.Errorf("create netns file %s: %w", tmp, err)
+	}
+	defer func() { _ = unix.Unlink(tmp) }()
+	merr := m.File(fd)
+	_ = unix.Close(fd)
+	if merr != nil {
+		return false, fmt.Errorf("mark netns file %s: %w", path, merr)
+	}
+	return linkNew(tmp, path, 0)
+}
+
+// linkNew gives the marked file its name; a name already there is no
+// error, and nothing is made.
+func linkNew(from, path string, flags int) (bool, error) {
+	err := unix.Linkat(unix.AT_FDCWD, from, unix.AT_FDCWD, path, flags)
+	if errors.Is(err, unix.EEXIST) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("create netns file %s: %w", path, err)
+	}
+	return true, nil
 }
 
 // shareNetnsRoot makes root a shared mount, so a netns bound under it shows
@@ -68,14 +176,24 @@ func CreateNamed(root, name string) error {
 // (https://bugs.debian.org/949235). flock locks belong to the open file, so
 // it also orders this daemon's own concurrent builds (a refill and a
 // create's miss) and any `ip netns add` run beside them.
-func shareNetnsRoot(root string) error {
+//
+// With ctx (the root helper) the lock is polled without blocking, and the
+// wait gives up when ctx ends.
+func shareNetnsRoot(ctx context.Context, root string) error {
 	lock, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open netns dir %s: %w", root, err)
 	}
 	defer func() { _ = unix.Close(lock) }()
-	// iproute2 warns and goes on when the lock fails; so does this.
-	if unix.Flock(lock, unix.LOCK_EX) == nil {
+	if ctx == nil {
+		// iproute2 warns and goes on when the lock fails; so does this.
+		if unix.Flock(lock, unix.LOCK_EX) == nil {
+			defer func() { _ = unix.Flock(lock, unix.LOCK_UN) }()
+		}
+	} else {
+		if err := flockPolling(ctx, lock); err != nil {
+			return fmt.Errorf("lock netns dir %s: %w", root, err)
+		}
 		defer func() { _ = unix.Flock(lock, unix.LOCK_UN) }()
 	}
 	madeMount := false
@@ -92,6 +210,27 @@ func shareNetnsRoot(root string) error {
 			return fmt.Errorf("mount --bind %s %s: %w", root, root, err)
 		}
 		madeMount = true
+	}
+}
+
+// flockPoll paces the polling lock; tests shorten it.
+var flockPoll = 2 * time.Millisecond
+
+// flockPolling takes an exclusive flock on fd without ever sleeping in the
+// kernel: a held lock is tried again every flockPoll until ctx ends.
+func flockPolling(ctx context.Context, fd int) error {
+	for {
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			return err
+		}
+		t := time.NewTimer(flockPoll)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 }
 
@@ -113,11 +252,11 @@ func shareNetnsRoot(root string) error {
 // Only when the way back fails does the thread stay locked and end with
 // the goroutine: no other goroutine may run on a thread in a sandbox's
 // namespace.
-func bindNewNetns(path string) error {
+func bindNewNetns(path string, inside func() error) error {
 	errc := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		home, err := bindNewNetnsOnThread(path)
+		home, err := bindNewNetnsOnThread(path, inside)
 		if home {
 			runtime.UnlockOSThread()
 		}
@@ -128,8 +267,10 @@ func bindNewNetns(path string) error {
 
 // bindNewNetnsOnThread is bindNewNetns on the calling thread, which the
 // caller has locked. home reports that the thread is back in the namespace
-// it started in (or never left it), so it may be unlocked.
-func bindNewNetnsOnThread(path string) (home bool, err error) {
+// it started in (or never left it), so it may be unlocked. inside, when
+// set, runs in the new namespace before the bind; its failure binds
+// nothing.
+func bindNewNetnsOnThread(path string, inside func() error) (home bool, err error) {
 	orig, err := nsGet()
 	if err != nil {
 		return true, fmt.Errorf("open this thread's netns: %w", err)
@@ -142,8 +283,15 @@ func bindNewNetnsOnThread(path string) (home bool, err error) {
 	// thread's.
 	self := fmt.Sprintf("/proc/self/task/%d/ns/net", unix.Gettid())
 	var bindErr error
-	if merr := mount(self, path, "none", unix.MS_BIND, ""); merr != nil {
-		bindErr = fmt.Errorf("bind %s -> %s: %w", self, path, merr)
+	if inside != nil {
+		if ierr := inside(); ierr != nil {
+			bindErr = fmt.Errorf("mark the new netns for %s: %w", path, ierr)
+		}
+	}
+	if bindErr == nil {
+		if merr := mount(self, path, "none", unix.MS_BIND, ""); merr != nil {
+			bindErr = fmt.Errorf("bind %s -> %s: %w", self, path, merr)
+		}
 	}
 	if serr := nsSet(orig); serr != nil {
 		return false, errors.Join(bindErr, fmt.Errorf("return to the original netns after binding %s: %w", path, serr))

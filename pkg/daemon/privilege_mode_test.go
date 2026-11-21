@@ -127,6 +127,13 @@ func TestNewRootHelper(t *testing.T) {
 		t.Fatalf("split mode client %v", c)
 	}
 	_ = c.Close()
+	// PR 4 review: the network calls are bounded by the network timeout,
+	// which the helper's own burst test and benchmark run with too (they
+	// build their client with rootclient's defaults).
+	got := rootHelperConfig(cfg)
+	if got.Timeout != rootclient.DefaultTimeout || got.NetworkTimeout != rootclient.DefaultNetworkTimeout || got.NetworkTimeout < 30*time.Second {
+		t.Fatalf("helper client bounds: call %v, network %v", got.Timeout, got.NetworkTimeout)
+	}
 }
 
 // fakeHostNetwork answers EnsureHostNetwork from a list.
@@ -285,6 +292,63 @@ func TestHelperNetnsHost(t *testing.T) {
 	if !h.exists(path) {
 		t.Fatal("a helper error reaped a slot")
 	}
+}
+
+// TestHelperNetnsHostCleansUpAFailedBuild (PR 4 review): a build the agent
+// gave up on may have left a namespace and a lease that nothing would name
+// again; Realize removes them under the build's name, with a context of
+// its own. A build the helper never ran is not followed by a removal.
+func TestHelperNetnsHostCleansUpAFailedBuild(t *testing.T) {
+	refused := &rootclient.RefusedError{Refusal: rootclient.Refusal{Call: "RealizeNetns", Reason: "not_sandbox_netns"}, Err: errors.New("no")}
+	for _, c := range []struct {
+		name    string
+		err     error
+		removed bool
+	}{
+		{"timed out", fmt.Errorf("%w: deadline exceeded", rootclient.ErrUnavailable), true},
+		{"cancelled", context.Canceled, true},
+		{"failed in the helper", errors.New("cni add: exit status 1"), true},
+		{"refused", refused, false},
+		{"too old", &rootclient.UnsupportedError{Feature: "RealizeNetns"}, false},
+		{"busy", fmt.Errorf("%w: 64 running", rootclient.ErrBusy), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &failingRealize{err: c.err}
+			h := newHelperNetnsHost(f, "10.88.0.0/16", testLogger())
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // the caller's own context has ended; the removal must not use it
+			if _, _, err := h.Realize(ctx, netns.Slot{SlotID: "s-1", SandboxID: "sb-1"}); !errors.Is(err, c.err) && err != c.err {
+				t.Fatalf("Realize = %v, want %v", err, c.err)
+			}
+			want := []string(nil)
+			if c.removed {
+				want = []string{"sb-1"}
+			}
+			if !slices.Equal(f.removed, want) {
+				t.Fatalf("removed %v, want %v", f.removed, want)
+			}
+			if c.removed && f.removeCtxErr != nil {
+				t.Fatalf("the removal ran on an ended context: %v", f.removeCtxErr)
+			}
+		})
+	}
+}
+
+type failingRealize struct {
+	memHelper
+	err          error
+	removed      []string
+	removeCtxErr error
+}
+
+func (f *failingRealize) RealizeNetns(context.Context, string) (string, string, error) {
+	return "", "", f.err
+}
+
+func (f *failingRealize) RemoveNetns(ctx context.Context, name, _ string) error {
+	f.removed = append(f.removed, name)
+	f.removeCtxErr = ctx.Err()
+	return nil
 }
 
 // TestWireNetnsPoolThroughTheHelper: in split mode the pool is seeded and

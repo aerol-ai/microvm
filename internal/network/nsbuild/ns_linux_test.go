@@ -90,12 +90,12 @@ func TestBindNewNetnsUnprivilegedStaysHome(t *testing.T) {
 		t.Skip("as root the unshare succeeds: TestBindReturnsTheThread covers it")
 	}
 	path := filepath.Join(t.TempDir(), "sb-1")
-	if err := bindNewNetns(path); err == nil || !strings.Contains(err.Error(), "unshare a new netns") {
+	if err := bindNewNetns(path, nil); err == nil || !strings.Contains(err.Error(), "unshare a new netns") {
 		t.Fatalf("unprivileged bind = %v, want the unshare error", err)
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	home, err := bindNewNetnsOnThread(path)
+	home, err := bindNewNetnsOnThread(path, nil)
 	if !home || err == nil {
 		t.Fatalf("unprivileged bind on this thread = home %v, %v; want home with an error", home, err)
 	}
@@ -158,7 +158,7 @@ func TestBindReturnsTheThread(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	before := inode(t, "/proc/thread-self/ns/net")
-	home, err := bindNewNetnsOnThread(path)
+	home, err := bindNewNetnsOnThread(path, nil)
 	if err != nil || !home {
 		t.Fatalf("bind = home %v, %v", home, err)
 	}

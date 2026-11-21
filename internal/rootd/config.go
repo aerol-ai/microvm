@@ -39,11 +39,16 @@ const (
 	// DefaultStateDir holds what root reads on the agent's word: the runsc
 	// configs and the gVisor moves folder.
 	DefaultStateDir = "/var/lib/aerolvm-rootd"
+	// DefaultNetnsDir holds the sandboxes' network namespaces in split
+	// mode: the helper's own folder, root's alone (mode 0700), never the
+	// node's shared /run/netns. Anything a name in it points at is then
+	// what the helper made, never an operator's `ip netns add`, and no
+	// other user can open the folder, to read it or to hold its lock.
+	DefaultNetnsDir = "/run/aerolvm-rootd/netns"
 
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 	defaultNamespace        = "aerolvm"
 	defaultSnapshotterRoot  = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"
-	defaultNetnsDir         = "/run/netns"
 	defaultRunDir           = "/var/lib/sandboxd/containerd"
 	defaultMountsRoot       = "/var/lib/sandboxd/mounts"
 	defaultCredDir          = "/run/sandboxd"
@@ -93,6 +98,10 @@ type Config struct {
 	// in Policy.NetnsDir.
 	Network NetworkConfig
 }
+
+// sharedNetnsDirs are the folders iproute2, systemd units and CNI tools
+// share on a node; SB_ROOTD_NETNS_DIR may name none of them.
+var sharedNetnsDirs = map[string]bool{"/run/netns": true, "/var/run/netns": true}
 
 // FileDirs are the helper's own folders for the files it makes for
 // containers. Each must be root's alone: the agent can rename anything in a
@@ -248,11 +257,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	readyDir := path("SB_ROOTD_READY_DIR", defaultReadyDir)
 	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
-	netnsDir := path("SB_NETNS_DIR", defaultNetnsDir)
+	netnsDir := path("SB_ROOTD_NETNS_DIR", DefaultNetnsDir)
 	cniPlugins := path("SB_CONTAINERD_CNI_PLUGIN_DIR", defaultCNIPluginDir)
 	cniConf := path("SB_CONTAINERD_CNI_CONF_PATH", defaultCNIConfPath)
 	if pathErr != nil {
 		return Config{}, pathErr
+	}
+	if sharedNetnsDirs[netnsDir] {
+		return Config{}, fmt.Errorf("SB_ROOTD_NETNS_DIR: %s is the node's shared namespace folder (`ip netns`); "+
+			"the helper keeps sandboxes' namespaces in a folder of its own", netnsDir)
 	}
 	dirs := FileDirs{
 		Hosts: filepath.Join(stateDir, "hosts"),
@@ -270,7 +283,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		{"SB_ROOTD_READY_DIR", readyDir},
 		// Root makes sandboxes' namespaces, runs the CNI plugins and reads
 		// the CNI config that names them.
-		{"SB_NETNS_DIR", netnsDir},
+		{"SB_ROOTD_NETNS_DIR", netnsDir},
 		{"SB_CONTAINERD_CNI_PLUGIN_DIR", cniPlugins},
 		{"SB_CONTAINERD_CNI_CONF_PATH", filepath.Dir(cniConf)},
 	} {

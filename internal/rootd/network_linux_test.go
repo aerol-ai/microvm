@@ -77,8 +77,21 @@ func TestOpenNetwork(t *testing.T) {
 	if st.Mode&0o777 != 0o644 || int(st.Uid) != os.Geteuid() {
 		t.Fatalf("config mode %o uid %d", st.Mode&0o777, st.Uid)
 	}
-	if fi, err := os.Stat(l.cfg.Policy.NetnsDir); err != nil || !fi.IsDir() {
-		t.Fatalf("netns folder not made: %v", err)
+	// PR 4 review: closed to every other user, who could otherwise open
+	// it to hold the lock every build takes on it.
+	if fi, err := os.Stat(l.cfg.Policy.NetnsDir); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("netns folder not made closed: %v %v", fi.Mode(), err)
+	}
+	// One made open before (an operator's, or a hostPath's default) is
+	// closed at the next open.
+	if err := os.Chmod(l.cfg.Policy.NetnsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openNetwork(l.cfg); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(l.cfg.Policy.NetnsDir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("an open netns folder stayed %v", fi.Mode().Perm())
 	}
 	// A second open reads the config already there, untouched.
 	before, _ := os.ReadFile(l.cfg.Network.ConfPath)
@@ -330,7 +343,7 @@ func kernelRig(t testing.TB) (*kernelNetwork, *countingRunner) {
 			Policy:  testPolicy(),
 			Network: NetworkConfig{PluginDir: dir, ConfPath: filepath.Join(base, "net.d", "aerolvm.conflist"), Subnet: "10.79.0.0/16"},
 		}
-		cfg.Policy.NetnsDir = filepath.Join(base, "netns")
+		cfg.Policy.NetnsDir = tmpfsFolder(t, filepath.Join(base, "netns"))
 		h, err := openNetwork(cfg)
 		if err != nil {
 			t.Fatalf("openNetwork with the real plugins: %v", err)
@@ -354,7 +367,7 @@ func kernelRig(t testing.TB) (*kernelNetwork, *countingRunner) {
 		}
 	})
 	dir := t.TempDir()
-	root := filepath.Join(dir, "netns")
+	root := tmpfsFolder(t, filepath.Join(dir, "netns"))
 	self, err := netns.GetFromPath("/proc/self/ns/net")
 	if err != nil {
 		t.Fatal(err)
@@ -365,6 +378,24 @@ func kernelRig(t testing.TB) (*kernelNetwork, *countingRunner) {
 	k.steps = k.stepsWith(c)
 	t.Cleanup(func() { cleanNetns(k) })
 	return k, c
+}
+
+// tmpfsFolder makes dir a tmpfs of its own, root's alone, as the helper's
+// netns folder is on a node (/run): it holds the marks (trusted.*
+// attributes, O_TMPFILE) whatever the test's own folder is on.
+func tmpfsFolder(t testing.TB, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount("tmpfs", dir, "tmpfs", 0, "mode=0700"); err != nil {
+		t.Fatalf("tmpfs at %s: %v", dir, err)
+	}
+	t.Cleanup(func() {
+		for unix.Unmount(dir, unix.MNT_DETACH) == nil {
+		}
+	})
+	return dir
 }
 
 // cleanNetns removes every namespace a test left, then the folder's mount.
@@ -394,12 +425,27 @@ func TestKernelInspect(t *testing.T) {
 		t.Fatalf("realized: %+v %v (want %s)", st, err, ip)
 	}
 
-	// A namespace with loopback alone: a build not attached yet.
-	if err := nsbuild.CreateNamed(k.netnsDir, "fresh"); err != nil {
+	// A namespace with loopback alone and the helper's mark: a build not
+	// attached yet.
+	if err := k.steps.Create(ctx, "fresh"); err != nil {
 		t.Fatal(err)
 	}
 	if st, err := k.Inspect(filepath.Join(k.netnsDir, "fresh")); err != nil || !st.Exists || st.Foreign != "" || len(st.IPv4) != 0 {
 		t.Fatalf("fresh: %+v %v", st, err)
+	}
+	// PR 4 review: the same without the mark is anyone's `ip netns add`,
+	// and so is the mark of another name.
+	if err := nsbuild.CreateNamed(k.netnsDir, "unmarked"); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := k.Inspect(filepath.Join(k.netnsDir, "unmarked")); err != nil || !st.Exists || st.Foreign == "" {
+		t.Fatalf("an unmarked loopback-only namespace: %+v %v", st, err)
+	}
+	if err := os.Rename(filepath.Join(k.netnsDir, "fresh"), filepath.Join(k.netnsDir, "moved")); err == nil {
+		if st, _ := k.Inspect(filepath.Join(k.netnsDir, "moved")); st.Foreign == "" {
+			t.Fatal("a namespace marked for another name passed")
+		}
+		_ = os.Rename(filepath.Join(k.netnsDir, "moved"), filepath.Join(k.netnsDir, "fresh"))
 	}
 	// Someone else's: a dummy link, and a veth not on the helper's bridge.
 	foreign := func(name string, add func(h *netlink.Handle) error) string {
@@ -445,14 +491,18 @@ func TestKernelInspect(t *testing.T) {
 			t.Fatalf("%s: %+v %v", p, st, err)
 		}
 	}
-	// A plain empty file is a build cut short before its bind; a file with
-	// content or a link is no namespace of the helper's.
-	half := filepath.Join(k.netnsDir, "half")
-	if err := os.WriteFile(half, nil, 0o444); err != nil {
-		t.Fatal(err)
-	}
+	// A plain empty file with the helper's mark is a build cut short
+	// before its bind; without it, or with content, or a link, it is no
+	// namespace of the helper's.
+	half := markedEmptyFile(t, k.netnsDir, "half")
 	if st, err := k.Inspect(half); err != nil || !st.Exists || st.Foreign != "" {
 		t.Fatalf("half made: %+v %v", st, err)
+	}
+	if err := os.WriteFile(filepath.Join(k.netnsDir, "empty"), nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := k.Inspect(filepath.Join(k.netnsDir, "empty")); st.Foreign == "" {
+		t.Fatal("an unmarked empty file passed as a build cut short")
 	}
 	if err := os.WriteFile(filepath.Join(k.netnsDir, "full"), []byte("x"), 0o444); err != nil {
 		t.Fatal(err)
@@ -604,7 +654,9 @@ func BenchmarkKernelCreate100(b *testing.B) {
 	}{
 		{"single", inProcess(func(p string) error { _, err := hostnet.NetnsIPv4Addrs(p); return err }), nil},
 		{"split", func(i int) func(j int) error {
-			c := rootclient.New(rootclient.Config{Socket: r.cfg.Socket, Timeout: 60 * time.Second, HelperUID: uint32(os.Geteuid())})
+			// The client sandboxd builds: rootclient's defaults, as
+			// pkg/daemon's rootHelperConfig sets them (PR 4 review).
+			c := rootclient.New(rootclient.Config{Socket: r.cfg.Socket, HelperUID: uint32(os.Geteuid())})
 			b.Cleanup(func() { _ = c.Close() })
 			t0 := time.Now()
 			if _, _, err := c.RealizeNetns(ctx, fmt.Sprintf("f%d", i)); err != nil {
@@ -644,7 +696,7 @@ func BenchmarkKernelCreateOne(b *testing.B) {
 		o.Network = k
 	})
 	ctx := context.Background()
-	c := rootclient.New(rootclient.Config{Socket: r.cfg.Socket, Timeout: 30 * time.Second, HelperUID: uint32(os.Geteuid())})
+	c := rootclient.New(rootclient.Config{Socket: r.cfg.Socket, HelperUID: uint32(os.Geteuid())})
 	b.Cleanup(func() { _ = c.Close() })
 	for _, mode := range []string{"single", "split"} {
 		b.Run(mode, func(b *testing.B) {
@@ -715,6 +767,32 @@ func TestNetworkCallsNeedTheAgentsUID(t *testing.T) {
 	}
 }
 
+// markedEmptyFile leaves an empty file with the helper's mark at
+// dir/name, as a build cut short before its bind does. Without root it
+// uses a user.* attribute: trusted.* needs CAP_SYS_ADMIN.
+func markedEmptyFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		orig := netnsMarkAttr
+		netnsMarkAttr = "user.aerolvm-rootd.netns"
+		t.Cleanup(func() { netnsMarkAttr = orig })
+	}
+	p := filepath.Join(dir, name)
+	// Writable by its owner: a user.* attribute needs that.
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := markFile(name)(fd); err != nil {
+		t.Skipf("no extended attributes here (%v)", err)
+	}
+	return p
+}
+
 // TestInspectFiles: what is in the netns folder, read without rights: a
 // missing name, a build cut short before its bind (an empty plain file),
 // and things that are no namespace of the helper's (a link, a file with
@@ -727,11 +805,15 @@ func TestInspectFiles(t *testing.T) {
 	if st, err := k.Inspect(filepath.Join(dir, "none")); err != nil || st.Exists {
 		t.Fatalf("missing: %+v %v", st, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "half"), nil, 0o444); err != nil {
-		t.Fatal(err)
-	}
+	markedEmptyFile(t, dir, "half")
 	if st, err := k.Inspect(filepath.Join(dir, "half")); err != nil || !st.Exists || st.Foreign != "" {
 		t.Fatalf("half made: %+v %v", st, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "empty"), nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := k.Inspect(filepath.Join(dir, "empty")); err != nil || !st.Exists || st.Foreign == "" {
+		t.Fatalf("an unmarked empty file: %+v %v", st, err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "full"), []byte("x"), 0o444); err != nil {
 		t.Fatal(err)
@@ -761,5 +843,52 @@ func TestInspectFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "half")); !os.IsNotExist(err) {
 		t.Fatalf("half-made file left: %v", err)
+	}
+}
+
+// TestNetnsBoundOnTheKernel (finding 5): the gate lets a container join a
+// namespace the helper made, and no other: not an operator's loopback-only
+// one in the folder, and not one that is not there.
+func TestNetnsBoundOnTheKernel(t *testing.T) {
+	k, _ := kernelRig(t)
+	r := newRig(t, func(c *Config, o *Options) {
+		c.Policy.NetnsDir = k.netnsDir
+		o.Network = k
+	})
+	ctx := callCtx(t)
+	if _, err := rootdpb.NewRootHelperClient(r.conn).RealizeNetns(ctx, &rootdpb.RealizeNetnsRequest{NetnsName: "sb-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.steps.Create(ctx, "warm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := nsbuild.CreateNamed(k.netnsDir, "offline"); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"sb-1": true, "warm": true, "offline": false, "never": false} {
+		if ok, err := r.srv.NetnsBound(ctx, name, "sb-1"); ok != want || err != nil {
+			t.Errorf("%s: %v %v, want %v", name, ok, err, want)
+		}
+	}
+}
+
+// BenchmarkNetnsBound is what the gate's namespace check adds to a split
+// create (PR 4 review, finding 5): one read of the namespace, under its
+// lock, per container create that joins a named namespace.
+func BenchmarkNetnsBound(b *testing.B) {
+	k, _ := kernelRig(b)
+	r := newRig(b, func(c *Config, o *Options) {
+		c.Policy.NetnsDir = k.netnsDir
+		o.Network = k
+	})
+	ctx := context.Background()
+	if _, _, err := k.steps.Realize(ctx, "sb-1"); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if ok, err := r.srv.NetnsBound(ctx, "sb-1", "sb-1"); !ok || err != nil {
+			b.Fatal(ok, err)
+		}
 	}
 }

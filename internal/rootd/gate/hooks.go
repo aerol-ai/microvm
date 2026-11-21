@@ -39,12 +39,14 @@ type ReadChecker interface {
 	CheckRead(r rootpolicy.RootRead) error
 }
 
-// NetnsBinding says whether a named network namespace is the one the helper
-// made for a container. The netns pool moves into the helper in T2; until it
-// is wired, Config.NetnsBinding is nil and only the name's form is checked
-// (rootpolicy.CheckNetnsPath), so a broken agent can put one sandbox in
-// another's namespace. That is not root: a broken agent already reaches
-// every sandbox on its node (plans/security-gaps-m1-m4.md, R9).
+// NetnsBinding says whether a named network namespace is one the helper
+// made for a container to join. cmd/aerolvm-rootd wires the helper's own
+// check (rootd.Server.NetnsBound): the helper made it, and it is still a
+// sandbox's. Which sandbox's is the agent's netns pool's to say, so a
+// broken agent can still put one sandbox in another's namespace. That is
+// not root: a broken agent already reaches every sandbox on its node
+// (plans/security-gaps-m1-m4.md, R9). Nil checks the name's form only
+// (rootpolicy.CheckNetnsPath): a gate with no helper network.
 type NetnsBinding interface {
 	Bound(ctx context.Context, netns, containerID string) (bool, error)
 }

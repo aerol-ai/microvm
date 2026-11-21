@@ -67,6 +67,14 @@ const (
 	// whose context has no deadline. The helper is a local process;
 	// anything slower is a helper that is stuck.
 	DefaultTimeout = 2 * time.Second
+	// DefaultNetworkTimeout bounds a network call whose context has no
+	// deadline. A namespace build runs CNI plugins and waits on host-wide
+	// locks (the IPAM plugin's, the xtables lock), so under a burst of
+	// creates it queues behind the others for seconds, as it does in
+	// single mode, where nothing bounds it at all (PR 4 review: at the
+	// 2 s of DefaultTimeout, 90 of 100 parallel builds failed while the
+	// helper still finished them).
+	DefaultNetworkTimeout = time.Minute
 	// maxReconnectDelay caps gRPC's reconnect backoff. Its default grows to
 	// two minutes, and containerd's client to ten seconds; a helper that
 	// restarts (a crash, or the signed swap of eng review D4) is back in
@@ -78,6 +86,12 @@ const (
 // or is not root. The API maps it to 503: the supervisor restarts a helper
 // that died.
 var ErrUnavailable = rootdpb.ErrHelperUnavailable
+
+// ErrBusy: the helper has as many network calls running and waiting as it
+// takes, and answered this one at once without running it. The API maps
+// it to 503; it is not tried again here, since the load that caused it is
+// still there.
+var ErrBusy = errors.New("root helper: at its limit of network calls in flight")
 
 // ErrUnsupported: the helper is older than this agent and lacks what the
 // agent asked for. The API maps it to 503 too: the agent stages the newer
@@ -118,8 +132,12 @@ type Config struct {
 	// Socket is the helper's socket. Empty means DefaultSocket.
 	Socket string
 	// Timeout bounds each connect, each handshake, and each typed call
-	// whose context has no deadline. Zero means DefaultTimeout.
+	// whose context has no deadline, the network calls aside. Zero means
+	// DefaultTimeout.
 	Timeout time.Duration
+	// NetworkTimeout bounds a network call (networkCalls) whose context
+	// has no deadline. Zero means DefaultNetworkTimeout.
+	NetworkTimeout time.Duration
 	// AgentVersion goes into the handshake, for the helper's log. Empty
 	// means this build's version.
 	AgentVersion string
@@ -168,6 +186,7 @@ type attempt struct {
 type Client struct {
 	socket       string
 	timeout      time.Duration
+	netTimeout   time.Duration
 	agentVersion string
 	peer         egress.PeerCheck
 	onRefusal    RefusalFunc
@@ -186,13 +205,16 @@ type Client struct {
 
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
-	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, agentVersion: cfg.AgentVersion,
+	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, netTimeout: cfg.NetworkTimeout, agentVersion: cfg.AgentVersion,
 		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal}
 	if c.socket == "" {
 		c.socket = DefaultSocket
 	}
 	if c.timeout <= 0 {
 		c.timeout = DefaultTimeout
+	}
+	if c.netTimeout <= 0 {
+		c.netTimeout = DefaultNetworkTimeout
 	}
 	if c.agentVersion == "" {
 		c.agentVersion = version.Version
@@ -487,7 +509,7 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 			}
 			return zero, err
 		}
-		cctx, cancel := c.callContext(ctx)
+		cctx, cancel := c.callContext(ctx, feature)
 		var trailer metadata.MD
 		resp, err := rpc(s.rpc, cctx, req, grpc.Trailer(&trailer))
 		cancel()
@@ -611,12 +633,25 @@ func (c *Client) isClosed() bool {
 
 // callContext bounds a typed call by the client's timeout when the caller
 // set no deadline: a helper stuck inside a call must not hang a create
-// (review M4).
-func (c *Client) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+// (review M4). A network call gets the network timeout.
+func (c *Client) callContext(ctx context.Context, feature string) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
+	if networkCalls[feature] {
+		return context.WithTimeout(ctx, c.netTimeout)
+	}
 	return context.WithTimeout(ctx, c.timeout)
+}
+
+// networkCalls are the calls bounded by the network timeout: they run CNI
+// plugins, or wait for a namespace's lock behind one that does.
+var networkCalls = map[string]bool{
+	rootdpb.FeatureEnsureHostNetwork: true,
+	rootdpb.FeatureRealizeNetns:      true,
+	rootdpb.FeatureRemoveNetns:       true,
+	rootdpb.FeatureDisableNetnsIPv6:  true,
+	rootdpb.FeatureNetnsAddrs:        true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal
@@ -633,6 +668,8 @@ func (c *Client) callErr(ctx context.Context, s *session, feature string, err er
 	switch status.Code(err) {
 	case codes.OK:
 		return nil
+	case codes.ResourceExhausted:
+		return fmt.Errorf("%w: %w", ErrBusy, err)
 	case codes.Unavailable, codes.DeadlineExceeded:
 		return c.unavailable(err)
 	case codes.Canceled:

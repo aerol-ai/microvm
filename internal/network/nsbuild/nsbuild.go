@@ -35,6 +35,12 @@ type Steps struct {
 	Delete     func(ctx context.Context, name string) error
 	// DisableIPv6 turns IPv6 off inside the namespace at a path.
 	DisableIPv6 func(path string) error
+	// FlushConntrack drops the connection tracking of an address; nil is
+	// hostnet.FlushConntrackForIP.
+	FlushConntrack func(ctx context.Context, ip string) error
+	// StopOnCancel ends a teardown between steps once ctx is done, so no
+	// step (no child process) starts for a call its caller gave up on.
+	StopOnCancel bool
 }
 
 // Realize builds name's namespace and attaches it to the bridge, and
@@ -92,6 +98,9 @@ func (s Steps) Realize(ctx context.Context, name string) (string, string, error)
 // keeps a slot out of circulation until Remove succeeds.
 func (s Steps) Remove(ctx context.Context, name, path, ip string) error {
 	delErr := s.Runner.Del(ctx, path, name)
+	if s.StopOnCancel && ctx.Err() != nil {
+		return errors.Join(delErr, ctx.Err())
+	}
 	// The bridge plugin's DEL removes the masquerade chain only for addresses
 	// it still finds on the container interface. gVisor (runsc, network=sandbox)
 	// moves the address into its own netstack and deletes it from that
@@ -101,7 +110,14 @@ func (s Steps) Remove(ctx context.Context, name, path, ip string) error {
 	if t, ok := s.Runner.(cni.IPMasqTeardown); ok {
 		masqErr = t.TeardownIPMasq(ctx, name, ip)
 	}
-	_ = hostnet.FlushConntrackForIP(ip)
+	if s.FlushConntrack != nil {
+		if s.StopOnCancel && ctx.Err() != nil {
+			return errors.Join(delErr, masqErr, ctx.Err())
+		}
+		_ = s.FlushConntrack(ctx, ip)
+	} else {
+		_ = hostnet.FlushConntrackForIP(ip)
+	}
 	rmErr := s.Delete(ctx, name)
 	return errors.Join(delErr, masqErr, rmErr)
 }

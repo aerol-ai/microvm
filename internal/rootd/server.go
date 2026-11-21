@@ -130,6 +130,9 @@ type Server struct {
 	containerd grpc.StreamHandler
 	onRefusal  RefusalFunc
 	stopOnce   sync.Once
+	// net serves the network calls and the gate's namespace check; nil
+	// with no network configuration.
+	net *network
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -177,16 +180,64 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	}
 	s.files, s.ln, s.sock = f, ln, sock
 	sopts := append(slices.Clone(opts.ServerOptions),
+		grpc.MaxConcurrentStreams(maxStreams),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
 		grpc.UnknownServiceHandler(s.route),
 		grpc.ChainUnaryInterceptor(answeredUnary),
 		grpc.ChainStreamInterceptor(answeredStream, s.endOnDrain))
 	s.srv = grpc.NewServer(sopts...)
 	locks := &keyedLocks{}
-	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
-		net: newNetwork(cfg, opts.Network, locks)})
+	s.net = newNetwork(cfg, opts.Network, locks)
+	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks, net: s.net})
 	return s, nil
 }
+
+// NetnsBound is the containerd gate's namespace check (gate.NetnsBinding,
+// PR 4 review): a container may join a named namespace only when the
+// helper made it and it is still a sandbox's, by the same reading of the
+// kernel the network calls make (an attached sandbox, or the helper's mark;
+// NetworkHost.Inspect). So no spec puts a container in an operator's
+// namespace, or in anything else in the folder that is not the helper's.
+//
+// Which of the helper's namespaces belongs to which sandbox is the agent's
+// netns pool's to say, in its own store: a namespace is named after the
+// warm slot that built it, not the sandbox that claims it, and the helper
+// keeps no ledger of its own. A broken agent can still put one sandbox in
+// another's namespace, which gains it no root: it reaches every sandbox
+// on its node already (plans/security-gaps-m1-m4.md, R9).
+func (s *Server) NetnsBound(ctx context.Context, name, _ string) (bool, error) {
+	if s.net == nil {
+		return false, errors.New("this helper has no sandbox network configuration")
+	}
+	path, err := s.net.path(name)
+	if err != nil {
+		return false, nil
+	}
+	h, err := s.net.opened()
+	if err != nil {
+		return false, err
+	}
+	unlock, err := s.net.locks.lock(ctx, netnsKey(name))
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	st, err := h.Inspect(path)
+	if err != nil {
+		return false, err
+	}
+	return st.Exists && st.Foreign == "", nil
+}
+
+// maxStreams bounds the calls one connection has open at once (PR 4
+// review): past it the agent's gRPC client holds a call until one ends,
+// so no connection grows the helper's goroutines without end. The agent
+// has one connection for the helper's calls (the network calls are bounded
+// further, maxNetworkCalls) and containerd's client one through the gate,
+// where every create makes a few calls and the event subscription stays
+// open. Far above what a node's creates hold open at once, which is the
+// point: a bound, not a throttle.
+const maxStreams = 1024
 
 // Serve serves until Shutdown. It returns nil after a Shutdown, also one
 // that came first.
@@ -353,16 +404,22 @@ func (helper) EnsureHost(context.Context, *rootdpb.EnsureHostRequest) (*rootdpb.
 }
 
 func (h helper) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {
-	unlock := h.locks.lock(containerKey(req.GetContainerId()))
-	resp, err := h.files.ensureHostFiles(req)
-	unlock()
+	unlock, err := h.locks.lock(ctx, containerKey(req.GetContainerId()))
+	var resp *rootdpb.EnsureHostFilesResponse
+	if err == nil {
+		resp, err = h.files.ensureHostFiles(req)
+		unlock()
+	}
 	return answer(ctx, h, rootdpb.RootHelper_EnsureHostFiles_FullMethodName, resp, err)
 }
 
 func (h helper) EnsureTaskFIFOs(ctx context.Context, req *rootdpb.EnsureTaskFIFOsRequest) (*rootdpb.EnsureTaskFIFOsResponse, error) {
-	unlock := h.locks.lock(containerKey(req.GetContainerId()))
-	resp, err := h.files.ensureTaskFIFOs(req)
-	unlock()
+	unlock, err := h.locks.lock(ctx, containerKey(req.GetContainerId()))
+	var resp *rootdpb.EnsureTaskFIFOsResponse
+	if err == nil {
+		resp, err = h.files.ensureTaskFIFOs(req)
+		unlock()
+	}
 	return answer(ctx, h, rootdpb.RootHelper_EnsureTaskFIFOs_FullMethodName, resp, err)
 }
 
@@ -372,16 +429,22 @@ func (h helper) EnsureRunscConfig(ctx context.Context, req *rootdpb.EnsureRunscC
 }
 
 func (h helper) EnsureReadySocket(ctx context.Context, req *rootdpb.EnsureReadySocketRequest) (*rootdpb.EnsureReadySocketResponse, error) {
-	unlock := h.locks.lock(containerKey(req.GetContainerId()))
-	resp, err := h.files.ensureReadySocket(req)
-	unlock()
+	unlock, err := h.locks.lock(ctx, containerKey(req.GetContainerId()))
+	var resp *rootdpb.EnsureReadySocketResponse
+	if err == nil {
+		resp, err = h.files.ensureReadySocket(req)
+		unlock()
+	}
 	return answer(ctx, h, rootdpb.RootHelper_EnsureReadySocket_FullMethodName, resp, err)
 }
 
 func (h helper) RemoveContainerFiles(ctx context.Context, req *rootdpb.RemoveContainerFilesRequest) (*rootdpb.RemoveContainerFilesResponse, error) {
-	unlock := h.locks.lock(containerKey(req.GetContainerId()))
-	resp, err := h.files.removeContainerFiles(req)
-	unlock()
+	unlock, err := h.locks.lock(ctx, containerKey(req.GetContainerId()))
+	var resp *rootdpb.RemoveContainerFilesResponse
+	if err == nil {
+		resp, err = h.files.removeContainerFiles(req)
+		unlock()
+	}
 	return answer(ctx, h, rootdpb.RootHelper_RemoveContainerFiles_FullMethodName, resp, err)
 }
 
@@ -413,7 +476,7 @@ func (h helper) DisableNetnsIPv6(ctx context.Context, req *rootdpb.DisableNetnsI
 	if h.net == nil {
 		return nil, noNetwork(rootdpb.FeatureDisableNetnsIPv6)
 	}
-	resp, err := h.net.disableIPv6(req)
+	resp, err := h.net.disableIPv6(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_DisableNetnsIPv6_FullMethodName, resp, err)
 }
 
@@ -421,7 +484,7 @@ func (h helper) NetnsAddrs(ctx context.Context, req *rootdpb.NetnsAddrsRequest) 
 	if h.net == nil {
 		return nil, noNetwork(rootdpb.FeatureNetnsAddrs)
 	}
-	resp, err := h.net.addrs(req)
+	resp, err := h.net.addrs(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_NetnsAddrs_FullMethodName, resp, err)
 }
 
@@ -448,6 +511,12 @@ func answer[T any](ctx context.Context, h helper, method string, resp T, err err
 		}
 		h.onRefusal(ctx, Refusal{Method: method, Reason: fe.reason, Detail: fe.msg})
 		return zero, rootdpb.Refused(fe.code, fe.reason, fe.msg)
+	case ctx.Err() != nil:
+		// Its caller gave up, or its deadline passed, and the call stopped
+		// where it was (its child processes with it): not the helper's
+		// failure. The agent cleans up after a call it gave up on.
+		h.log.Warn("root helper: call ended by its caller", "call", method, "error", err)
+		return zero, status.FromContextError(ctx.Err()).Err()
 	}
 	h.log.Error("root helper: call failed", "call", method, "error", err)
 	return zero, status.Error(codes.Internal, err.Error())

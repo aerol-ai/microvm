@@ -306,3 +306,55 @@ func TestCreate100(t *testing.T) {
 		seen[addrs[0]] = true
 	}
 }
+
+// slowNetHelper answers RealizeNetns after wait, or when its context ends.
+type slowNetHelper struct {
+	swapHelper
+	wait time.Duration
+}
+
+func (h *slowNetHelper) RealizeNetns(ctx context.Context, req *rootdpb.RealizeNetnsRequest) (*rootdpb.RealizeNetnsResponse, error) {
+	select {
+	case <-time.After(h.wait):
+		return &rootdpb.RealizeNetnsResponse{NetnsPath: "/run/aerolvm-rootd/netns/" + req.GetNetnsName(), ContainerIp: "10.88.0.2"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestNetworkCallsHaveTheirOwnBound (PR 4 review): a namespace build that
+// queues behind a burst's others for longer than the client's timeout
+// still succeeds; the network timeout bounds it instead, and the other
+// calls keep the client's timeout.
+func TestNetworkCallsHaveTheirOwnBound(t *testing.T) {
+	if c := New(Config{}); c.netTimeout != DefaultNetworkTimeout || c.timeout != DefaultTimeout {
+		t.Fatalf("defaults: %v %v", c.timeout, c.netTimeout)
+	}
+	sock := newOwnedSocket(t)
+	h := &slowNetHelper{swapHelper: swapHelper{name: "h", hostFiles: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}, wait: 400 * time.Millisecond}
+	sock.serve(t, h)
+	c := New(Config{Socket: sock.path, Timeout: 150 * time.Millisecond, NetworkTimeout: 5 * time.Second, HelperUID: uint32(os.Getuid())})
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.Ensure(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ip, err := c.RealizeNetns(context.Background(), "sb-1"); err != nil || ip != "10.88.0.2" {
+		t.Fatalf("a build past the client's timeout = %q, %v", ip, err)
+	}
+	start := time.Now()
+	if _, err := c.EnsureHostFiles(context.Background(), &rootdpb.EnsureHostFilesRequest{ContainerId: "sb-1"}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a stuck file call = %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a file call took %v; its bound is the client's timeout", d)
+	}
+	h.wait = time.Hour
+	c2 := New(Config{Socket: sock.path, NetworkTimeout: 200 * time.Millisecond, HelperUID: uint32(os.Getuid())})
+	t.Cleanup(func() { _ = c2.Close() })
+	if _, _, err := c2.RealizeNetns(context.Background(), "sb-2"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a build past the network timeout = %v", err)
+	}
+}

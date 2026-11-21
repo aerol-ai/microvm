@@ -44,7 +44,7 @@ func TestConfigFromEnv(t *testing.T) {
 			Namespace:       "aerolvm",
 			Snapshotter:     "overlayfs",
 			SnapshotterRoot: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
-			NetnsDir:        "/run/netns",
+			NetnsDir:        DefaultNetnsDir,
 			// Binds come from the external mounts and the helper's own
 			// files, never from the agent's run dir, ready dir or
 			// database folder (T2b).
@@ -97,7 +97,7 @@ func TestConfigFromEnv(t *testing.T) {
 			"SB_CONTAINERD_RUN_DIR":       "/data/ctr",
 			"SB_CONTAINERD_CGROUP_PARENT": "/aerolvm.slice",
 			"SB_ROOTD_SNAPSHOTTER_ROOT":   "/data/containerd/snap",
-			"SB_NETNS_DIR":                "/var/run/netns",
+			"SB_ROOTD_NETNS_DIR":          "/run/rootd-netns",
 			"SB_MOUNTS_ROOT":              "/data/mounts",
 			"SB_MOUNTS_CRED_DIR":          "/run/sbd",
 			"SB_DB_PATH":                  "/data/state/state.db",
@@ -107,7 +107,7 @@ func TestConfigFromEnv(t *testing.T) {
 			"SB_ROOTD_STATE_DIR":          "/data/rootd",
 		}, func(c *Config) {
 			p := &c.Policy
-			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/var/run/netns"
+			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/run/rootd-netns"
 			p.BindRoots, p.HelperFileRoots = []string{"/data/mounts"}, []string{"/data/rootd/hosts", "/run/rootd-ready"}
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
@@ -209,7 +209,11 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"memory not detected", map[string]string{}, errors.New("no /proc/meminfo"), "no /proc/meminfo"},
 		{"memory not detected, no reason", map[string]string{}, nil, "not detected"},
 		{"a relative socket", map[string]string{"SB_ROOTD_SOCKET": "root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
-		{"a relative netns folder", map[string]string{"SB_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_NETNS_DIR"},
+		{"a relative netns folder", map[string]string{"SB_ROOTD_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_NETNS_DIR"},
+		// PR 4 review: the node's shared folder holds namespaces that are
+		// not the helper's.
+		{"the shared netns folder", map[string]string{"SB_ROOTD_NETNS_DIR": "/run/netns", "SB_HOST_MEMORY_MB": "1"}, nil, "shared namespace folder"},
+		{"the shared netns folder by its old name", map[string]string{"SB_ROOTD_NETNS_DIR": "/var/run/netns", "SB_HOST_MEMORY_MB": "1"}, nil, "shared namespace folder"},
 		{"a relative agent run dir", map[string]string{"SB_CONTAINERD_RUN_DIR": "data/ctr", "SB_HOST_MEMORY_MB": "1"}, nil, "want an absolute path"},
 		{"a relative CNI plugin folder", map[string]string{"SB_CONTAINERD_CNI_PLUGIN_DIR": "cni/bin", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_PLUGIN_DIR"},
 		{"a sandbox range that is no network", map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "10.88.0.1/16", "SB_HOST_MEMORY_MB": "1"}, nil, "sandbox range"},
@@ -217,7 +221,7 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"a sandbox range too small", map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "10.88.0.0/28", "SB_HOST_MEMORY_MB": "1"}, nil, "sandbox range"},
 		// The agent writes its own folders; root must not run or trust
 		// anything in them.
-		{"the netns folder in the agent's", map[string]string{"SB_NETNS_DIR": "/var/lib/sandboxd/netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_NETNS_DIR"},
+		{"the netns folder in the agent's", map[string]string{"SB_ROOTD_NETNS_DIR": "/var/lib/sandboxd/netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_NETNS_DIR"},
 		{"CNI plugins in the agent's folder", map[string]string{"SB_CONTAINERD_CNI_PLUGIN_DIR": "/run/sandboxd/cni", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_PLUGIN_DIR"},
 		{"the CNI config in the agent's folder", map[string]string{"SB_CONTAINERD_CNI_CONF_PATH": "/var/lib/sandboxd/cni/a.conflist", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_CONF_PATH"},
 		{"more memory than an int64 of bytes", map[string]string{"SB_HOST_MEMORY_MB": "9007199254740992"}, nil, "more than a machine can have"},

@@ -49,7 +49,7 @@ func testPolicy() rootpolicy.Policy {
 		Namespace:       "aerolvm",
 		Snapshotter:     "overlayfs",
 		SnapshotterRoot: defaultSnapshotterRoot,
-		NetnsDir:        defaultNetnsDir,
+		NetnsDir:        DefaultNetnsDir,
 		MovesDir:        defaultRunDir + "/moves",
 		FIFODir:         defaultFIFODir,
 		Limits:          rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},

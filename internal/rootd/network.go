@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
@@ -21,8 +22,9 @@ import (
 // a namespace by its pool name; the helper does the root work:
 //
 //   - The path is the helper's: <NetnsDir>/<name>, from a name the rules
-//     pass (rootpolicy.NetnsPath). The netns folder is root's alone, so a
-//     name in it is what root left there.
+//     pass (rootpolicy.NetnsPath). The netns folder is the helper's own
+//     (never the node's shared /run/netns) and root's alone, so a name in
+//     it is what root left there.
 //   - CNI runs with the helper's own config and plugins, from folders only
 //     root can write: CNI plugins run as root, so the agent must never be
 //     able to place one or edit the config that names one.
@@ -30,11 +32,11 @@ import (
 //     tracking) must be a sandbox's, in the helper's range
 //     (rootpolicy.CheckSandboxAddress).
 //   - A namespace that already exists is touched only when the kernel says
-//     it is a sandbox's: loopback (and the tunnel devices the kernel puts
-//     in every new namespace) alone, or veths whose peers sit on the
-//     helper's bridge (NetnsState.Foreign). The helper keeps no state of its
-//     own; on a VM /run/netns is shared with anything else that uses `ip
-//     netns`, and the agent must not reach those namespaces through it.
+//     it is a sandbox's: veths whose peers sit on the helper's bridge, or
+//     loopback (and the tunnel devices the kernel puts in every new
+//     namespace) alone with the helper's mark on it (NetnsState.Foreign).
+//     The helper keeps no state of its own: the kernel keeps the marks,
+//     and no other user can set them.
 //
 // Every call is safe to retry after a dropped connection, and to repeat
 // (rootclient retrySafe): RealizeNetns answers a namespace it already
@@ -126,6 +128,7 @@ type network struct {
 	open   func(Config) (NetworkHost, error)
 	whole  Config
 	locks  *keyedLocks
+	limit  *callLimit
 
 	ready atomic.Bool
 	mu    sync.Mutex
@@ -136,11 +139,60 @@ func newNetwork(cfg Config, injected NetworkHost, locks *keyedLocks) *network {
 	if injected == nil && !cfg.Network.configured() {
 		return nil
 	}
-	n := &network{policy: cfg.Policy, open: openNetworkFn, whole: cfg, locks: locks, host: injected}
+	n := &network{policy: cfg.Policy, open: openNetworkFn, whole: cfg, locks: locks, host: injected,
+		limit: newCallLimit(maxNetworkCalls, maxNetworkWaiting)}
 	if injected != nil {
 		n.ready.Store(true)
 	}
 	return n
+}
+
+// The network calls that change the kernel (realize, remove, IPv6 off) in
+// flight at once, and waiting for a turn (PR 4 review). Each runs CNI
+// plugins and waits on host-wide locks (the netns folder's flock, the IPAM
+// plugin's, the xtables lock), so more at once only queue there; a turn is
+// waited for off any OS thread, and for no longer than the call's context.
+// Past maxNetworkWaiting a call is answered ResourceExhausted at once,
+// which the agent does not retry and the API answers 503: a burst that
+// large is load to shed, not to hold, and no burst can grow the helper's
+// threads or memory without end.
+const (
+	maxNetworkCalls   = 64
+	maxNetworkWaiting = 1024
+)
+
+// callLimit is a counting semaphore with a bounded queue.
+type callLimit struct {
+	turns   chan struct{}
+	waiting atomic.Int64
+	maxWait int64
+}
+
+func newCallLimit(running, waiting int) *callLimit {
+	return &callLimit{turns: make(chan struct{}, running), maxWait: int64(waiting)}
+}
+
+// enter takes a turn, waiting for one while the queue has room and ctx
+// lasts, and returns its release.
+func (l *callLimit) enter(ctx context.Context) (func(), error) {
+	release := func() { <-l.turns }
+	select {
+	case l.turns <- struct{}{}:
+		return release, nil
+	default:
+	}
+	if l.waiting.Add(1) > l.maxWait {
+		l.waiting.Add(-1)
+		return nil, &fileError{code: codes.ResourceExhausted,
+			msg: fmt.Sprintf("root helper: %d network calls running and %d waiting; try again shortly", cap(l.turns), l.maxWait)}
+	}
+	defer l.waiting.Add(-1)
+	select {
+	case l.turns <- struct{}{}:
+		return release, nil
+	case <-ctx.Done():
+		return nil, ctxError(ctx)
+	}
 }
 
 // openNetworkFn opens the helper's own network; tests replace it.
@@ -234,7 +286,16 @@ func (n *network) realize(ctx context.Context, req *rootdpb.RealizeNetnsRequest)
 	if err != nil {
 		return nil, err
 	}
-	defer n.locks.lock(netnsKey(name))()
+	release, err := n.limit.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	unlock, err := n.locks.lock(ctx, netnsKey(name))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	st, err := inspect(h, name, path)
 	if err != nil {
 		return nil, err
@@ -290,7 +351,16 @@ func (n *network) remove(ctx context.Context, req *rootdpb.RemoveNetnsRequest) (
 			return nil, refusedRule(codes.InvalidArgument, err)
 		}
 	}
-	defer n.locks.lock(netnsKey(name))()
+	release, err := n.limit.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	unlock, err := n.locks.lock(ctx, netnsKey(name))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if _, err := inspect(h, name, path); err != nil {
 		return nil, err
 	}
@@ -300,7 +370,7 @@ func (n *network) remove(ctx context.Context, req *rootdpb.RemoveNetnsRequest) (
 	return &rootdpb.RemoveNetnsResponse{}, nil
 }
 
-func (n *network) disableIPv6(req *rootdpb.DisableNetnsIPv6Request) (*rootdpb.DisableNetnsIPv6Response, error) {
+func (n *network) disableIPv6(ctx context.Context, req *rootdpb.DisableNetnsIPv6Request) (*rootdpb.DisableNetnsIPv6Response, error) {
 	name := req.GetNetnsName()
 	path, err := n.path(name)
 	if err != nil {
@@ -310,7 +380,16 @@ func (n *network) disableIPv6(req *rootdpb.DisableNetnsIPv6Request) (*rootdpb.Di
 	if err != nil {
 		return nil, err
 	}
-	defer n.locks.lock(netnsKey(name))()
+	release, err := n.limit.enter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	unlock, err := n.locks.lock(ctx, netnsKey(name))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	st, err := inspect(h, name, path)
 	if err != nil {
 		return nil, err
@@ -324,7 +403,7 @@ func (n *network) disableIPv6(req *rootdpb.DisableNetnsIPv6Request) (*rootdpb.Di
 	return &rootdpb.DisableNetnsIPv6Response{}, nil
 }
 
-func (n *network) addrs(req *rootdpb.NetnsAddrsRequest) (*rootdpb.NetnsAddrsResponse, error) {
+func (n *network) addrs(ctx context.Context, req *rootdpb.NetnsAddrsRequest) (*rootdpb.NetnsAddrsResponse, error) {
 	name := req.GetNetnsName()
 	path, err := n.path(name)
 	if err != nil {
@@ -334,7 +413,11 @@ func (n *network) addrs(req *rootdpb.NetnsAddrsRequest) (*rootdpb.NetnsAddrsResp
 	if err != nil {
 		return nil, err
 	}
-	defer n.locks.lock(netnsKey(name))()
+	unlock, err := n.locks.lock(ctx, netnsKey(name))
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	st, err := inspect(h, name, path)
 	if err != nil {
 		return nil, err
@@ -351,16 +434,20 @@ type keyedLocks struct {
 	m  map[string]*keyedLock
 }
 
+// keyedLock is held by holding the one place in its channel, so a wait
+// for it can end with the call's context (PR 4 review): a call its caller
+// gave up on stops waiting, and no wait sits on an OS thread.
 type keyedLock struct {
-	mu      sync.Mutex
+	ch      chan struct{}
 	waiters int
 }
 
-// lock takes key's lock and returns its release. A nil keyedLocks (a
-// helper value built by hand in a test) locks nothing.
-func (k *keyedLocks) lock(key string) (unlock func()) {
+// lock takes key's lock and returns its release, or the call's context
+// error once ctx ends first. A nil keyedLocks (a helper value built by
+// hand in a test) locks nothing.
+func (k *keyedLocks) lock(ctx context.Context, key string) (unlock func(), err error) {
 	if k == nil {
-		return func() {}
+		return func() {}, nil
 	}
 	k.mu.Lock()
 	if k.m == nil {
@@ -368,20 +455,34 @@ func (k *keyedLocks) lock(key string) (unlock func()) {
 	}
 	l := k.m[key]
 	if l == nil {
-		l = &keyedLock{}
+		l = &keyedLock{ch: make(chan struct{}, 1)}
 		k.m[key] = l
 	}
 	l.waiters++
 	k.mu.Unlock()
-	l.mu.Lock()
-	return func() {
-		l.mu.Unlock()
+	leave := func() {
 		k.mu.Lock()
 		if l.waiters--; l.waiters == 0 {
 			delete(k.m, key)
 		}
 		k.mu.Unlock()
 	}
+	select {
+	case l.ch <- struct{}{}:
+		return func() {
+			<-l.ch
+			leave()
+		}, nil
+	case <-ctx.Done():
+		leave()
+		return nil, ctxError(ctx)
+	}
+}
+
+// ctxError is a call that ended because its caller gave up (or its
+// deadline passed) while it waited: no failure of the helper's.
+func ctxError(ctx context.Context) error {
+	return &fileError{code: status.FromContextError(ctx.Err()).Code(), msg: "root helper: " + ctx.Err().Error()}
 }
 
 // held is how many keys have a call holding or waiting; for tests.

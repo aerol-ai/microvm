@@ -143,6 +143,86 @@ func TestRemove(t *testing.T) {
 	})
 }
 
+// TestRemoveForTheHelper (PR 4 review): the root helper's teardown flushes
+// connection tracking through its own runner, with the call's context, and
+// starts no step once that context has ended (a call its caller gave up
+// on, or one cut by a helper swap): the retry, or the next build of the
+// slot, does the rest.
+func TestRemoveForTheHelper(t *testing.T) {
+	t.Run("the flush is the helper's, with the call's context", func(t *testing.T) {
+		r := &recorder{}
+		st := r.steps(cni.NewFakeRunner())
+		var flushed []string
+		st.FlushConntrack = func(ctx context.Context, ip string) error {
+			flushed = append(flushed, ip)
+			return ctx.Err()
+		}
+		st.StopOnCancel = true
+		if err := st.Remove(context.Background(), "sb-1", "/run/netns/sb-1", "10.88.0.9"); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(flushed, []string{"10.88.0.9"}) || !slices.Equal(r.calls, []string{"delete sb-1"}) {
+			t.Fatalf("flushed %v, steps %v", flushed, r.calls)
+		}
+	})
+	t.Run("a cancel during CNI DEL starts nothing after it", func(t *testing.T) {
+		r := &recorder{}
+		ctx, cancel := context.WithCancel(context.Background())
+		runner := &cancellingDel{FakeRunner: cni.NewFakeRunner(), cancel: cancel}
+		st := r.steps(runner)
+		st.FlushConntrack = func(context.Context, string) error {
+			t.Fatal("a flush ran after the cancel")
+			return nil
+		}
+		st.StopOnCancel = true
+		if err := st.Remove(ctx, "sb-1", "/run/netns/sb-1", "10.88.0.9"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Remove = %v", err)
+		}
+		if len(r.calls) != 0 || len(runner.MasqTeardowns()) != 0 {
+			t.Fatalf("steps after the cancel: %v, NAT %v", r.calls, runner.MasqTeardowns())
+		}
+	})
+	t.Run("a cancel during the NAT teardown starts no flush", func(t *testing.T) {
+		r := &recorder{}
+		ctx, cancel := context.WithCancel(context.Background())
+		runner := &cancellingMasq{FakeRunner: cni.NewFakeRunner(), cancel: cancel}
+		st := r.steps(runner)
+		st.FlushConntrack = func(context.Context, string) error {
+			t.Fatal("a flush ran after the cancel")
+			return nil
+		}
+		st.StopOnCancel = true
+		if err := st.Remove(ctx, "sb-1", "/run/netns/sb-1", "10.88.0.9"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Remove = %v", err)
+		}
+		if len(r.calls) != 0 {
+			t.Fatalf("steps after the cancel: %v", r.calls)
+		}
+	})
+}
+
+// cancellingDel ends the call's context while CNI DEL runs.
+type cancellingDel struct {
+	*cni.FakeRunner
+	cancel context.CancelFunc
+}
+
+func (c *cancellingDel) Del(ctx context.Context, path, id string) error {
+	c.cancel()
+	return c.FakeRunner.Del(ctx, path, id)
+}
+
+// cancellingMasq ends it during the NAT teardown.
+type cancellingMasq struct {
+	*cni.FakeRunner
+	cancel context.CancelFunc
+}
+
+func (c *cancellingMasq) TeardownIPMasq(ctx context.Context, id, ip string) error {
+	c.cancel()
+	return c.FakeRunner.TeardownIPMasq(ctx, id, ip)
+}
+
 // delOnly is a CNI runner without cni.IPMasqTeardown.
 type delOnly struct{}
 

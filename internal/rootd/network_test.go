@@ -525,20 +525,37 @@ func TestCallsForOneSandboxRunInOrder(t *testing.T) {
 
 func TestKeyedLocks(t *testing.T) {
 	var k keyedLocks
-	a := k.lock("a")
-	b := k.lock("b")
+	ctx := context.Background()
+	lock := func(key string) func() {
+		t.Helper()
+		unlock, err := k.lock(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return unlock
+	}
+	a := lock("a")
+	b := lock("b")
 	if k.held() != 2 {
 		t.Fatalf("held %d", k.held())
 	}
 	got := make(chan struct{})
 	go func() {
-		defer k.lock("a")()
+		unlock, _ := k.lock(ctx, "a")
+		defer unlock()
 		close(got)
 	}()
 	select {
 	case <-got:
 		t.Fatal("a second holder of a got in")
 	case <-time.After(20 * time.Millisecond):
+	}
+	// PR 4 review: a wait ends with the call's context, and leaves no
+	// entry behind.
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := k.lock(cctx, "b"); status.Code(asStatus(err)) != codes.DeadlineExceeded {
+		t.Fatalf("a wait past its deadline = %v", err)
 	}
 	a()
 	<-got
@@ -547,5 +564,60 @@ func TestKeyedLocks(t *testing.T) {
 		t.Fatalf("entries left: %d", k.held())
 	}
 	var none *keyedLocks
-	none.lock("x")()
+	unlock, err := none.lock(ctx, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+}
+
+// asStatus is a helper error as the agent gets it.
+func asStatus(err error) error {
+	var fe *fileError
+	if errors.As(err, &fe) {
+		return status.Error(fe.code, fe.msg)
+	}
+	return err
+}
+
+// TestCallLimit (PR 4 review): past its turns a call waits, off any
+// thread, for no longer than its context; past its queue it is answered
+// ResourceExhausted at once.
+func TestCallLimit(t *testing.T) {
+	l := newCallLimit(2, 1)
+	ctx := context.Background()
+	r1, err := l.enter(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := l.enter(ctx)
+	waited := make(chan error, 1)
+	go func() {
+		r, err := l.enter(ctx)
+		if err == nil {
+			r()
+		}
+		waited <- err
+	}()
+	for l.waiting.Load() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := l.enter(ctx); status.Code(asStatus(err)) != codes.ResourceExhausted {
+		t.Fatalf("past the queue: %v", err)
+	}
+	r1()
+	if err := <-waited; err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	r3, _ := l.enter(ctx)
+	if _, err := l.enter(cctx); status.Code(asStatus(err)) != codes.Canceled {
+		t.Fatalf("a cancelled wait: %v", err)
+	}
+	r2()
+	r3()
+	if l.waiting.Load() != 0 || len(l.turns) != 0 {
+		t.Fatalf("left: %d waiting, %d turns", l.waiting.Load(), len(l.turns))
+	}
 }

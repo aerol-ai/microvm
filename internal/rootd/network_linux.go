@@ -48,7 +48,9 @@ type kernelNetwork struct {
 // agent could place what root then runs or trusts:
 //
 //   - the netns folder (made where missing): a name in it is what root
-//     left there, never a link the agent put to another namespace;
+//     left there, never a link the agent put to another namespace. It is
+//     closed to everyone but root (0700), so no other user can open it to
+//     read it or to hold the flock every build takes on it;
 //   - the CNI plugin folder and the plugins the config names (bridge and
 //     its IPAM plugin): root runs them, so each must be root's file that no
 //     one else can write;
@@ -64,11 +66,9 @@ func openNetwork(cfg Config) (NetworkHost, error) {
 	}
 	owner := uint32(os.Geteuid())
 	k := &kernelNetwork{netnsDir: cfg.Policy.NetnsDir, confDir: filepath.Dir(n.ConfPath), confName: filepath.Base(n.ConfPath), owner: owner}
-	fd, err := openFolder(k.netnsDir)
-	if err != nil {
+	if err := closeFolder(k.netnsDir); err != nil {
 		return nil, fmt.Errorf("netns folder %s: %w", k.netnsDir, err)
 	}
-	_ = unix.Close(fd)
 	pfd, err := walkFolder(n.PluginDir, false, func(at string, st *unix.Stat_t, last bool) error {
 		return rootfolder.CheckFolder(at, uint32(st.Mode), st.Uid, owner, !last)
 	})
@@ -104,7 +104,7 @@ func openNetwork(cfg Config) (NetworkHost, error) {
 			return nil, err
 		}
 	}
-	runner, err := cni.NewExecRunner(cni.Config{PluginDir: n.PluginDir, ConfPath: n.ConfPath})
+	runner, err := cni.NewExecRunner(cni.Config{PluginDir: n.PluginDir, ConfPath: n.ConfPath, ProcessGroup: true})
 	if err != nil {
 		return nil, err
 	}
@@ -115,15 +115,103 @@ func openNetwork(cfg Config) (NetworkHost, error) {
 	return k, nil
 }
 
-// stepsWith are nsbuild's steps in the helper's netns folder.
+// closeFolder opens the netns folder (made where missing, root's, no one
+// else can write it) and closes it to everyone but root. The folder is the
+// helper's alone (Load refuses the node's shared one), so closing it costs
+// no one: containerd, its shims and the CNI plugins open namespaces in it
+// as root.
+func closeFolder(dir string) error {
+	fd, err := openFolder(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&0o077 == 0 {
+		return nil
+	}
+	// fd is an O_PATH handle, which fchmod refuses; its /proc name is the
+	// folder that was opened and checked, not the path again.
+	if err := unix.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), 0o700); err != nil {
+		return fmt.Errorf("close it to other users: %w", err)
+	}
+	return nil
+}
+
+// The helper's marks on what it makes (PR 4 review). A namespace that is
+// not attached yet holds loopback alone, and a build cut short before its
+// bind leaves an empty file; anyone's `ip netns add` makes the same. So the
+// helper marks both before they are in the folder (nsbuild.Mark), and a
+// namespace or file without its mark is not the helper's:
+//
+//   - the file carries the attribute netnsMarkAttr. trusted.* attributes
+//     are set and read with CAP_SYS_ADMIN alone, so no other user can copy
+//     the mark onto a file of theirs, and none can see it to try;
+//   - the namespace's loopback carries the alias netnsMark(name), set from
+//     inside the namespace before it is bound: no other process is in it
+//     until the bind, and no sandbox is in it until it is attached, which
+//     makes it the helper's by its veth from then on.
+//
+// Both name the namespace, so one moved to another name is no longer the
+// helper's under that name.
+
+// netnsMarkAttr is the file's mark; tests that run without root use a
+// user.* attribute instead.
+var netnsMarkAttr = "trusted.aerolvm-rootd.netns"
+
+// netnsMark is the value of both marks for the namespace name.
+func netnsMark(name string) string { return "aerolvm-rootd:" + name }
+
+// markFile marks the namespace file name before it gets its name.
+func markFile(name string) func(fd int) error {
+	return func(fd int) error {
+		return unix.Fsetxattr(fd, netnsMarkAttr, []byte(netnsMark(name)), unix.XATTR_CREATE)
+	}
+}
+
+// markLoopback marks the namespace the calling thread is in, which is the
+// new one (nsbuild.Mark.Netns): a netlink socket opened now is in it.
+func markLoopback(name string) func() error {
+	return func() error {
+		h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+		if err != nil {
+			return err
+		}
+		defer h.Close()
+		lo, err := h.LinkByName("lo")
+		if err != nil {
+			return err
+		}
+		return h.LinkSetAlias(lo, netnsMark(name))
+	}
+}
+
+// fileMarked reports whether the file open at fd carries name's mark.
+func fileMarked(fd int, name string) bool {
+	want := netnsMark(name)
+	buf := make([]byte, len(want)+1)
+	n, err := unix.Fgetxattr(fd, netnsMarkAttr, buf)
+	return err == nil && string(buf[:n]) == want
+}
+
+// stepsWith are nsbuild's steps in the helper's netns folder: the marked
+// build, a flock wait that ends with the call, and a teardown whose child
+// processes end with the call too and that starts no step once it has.
 func (k *kernelNetwork) stepsWith(runner cni.Runner) nsbuild.Steps {
 	root := k.netnsDir
 	return nsbuild.Steps{
 		Runner: runner, Root: root,
-		Create:      func(_ context.Context, name string) error { return nsbuild.CreateNamed(root, name) },
-		LoopbackUp:  func(_ context.Context, name string) error { return nsbuild.LoopbackUp(filepath.Join(root, name)) },
-		Delete:      func(_ context.Context, name string) error { return nsbuild.DeleteNamed(root, name) },
-		DisableIPv6: hostnet.DisableIPv6InNetns,
+		Create: func(ctx context.Context, name string) error {
+			return nsbuild.CreateNamedMarked(ctx, root, name, nsbuild.Mark{File: markFile(name), Netns: markLoopback(name)})
+		},
+		LoopbackUp:     func(_ context.Context, name string) error { return nsbuild.LoopbackUp(filepath.Join(root, name)) },
+		Delete:         func(_ context.Context, name string) error { return nsbuild.DeleteNamed(root, name) },
+		DisableIPv6:    hostnet.DisableIPv6InNetns,
+		FlushConntrack: hostnet.FlushConntrackContext,
+		StopOnCancel:   true,
 	}
 }
 
@@ -245,12 +333,14 @@ func (k *kernelNetwork) EnsureHost() error {
 // Inspect reads the namespace at path without following a link: whether it
 // is there, whether everything in it is the helper's, and its addresses.
 //
-// The helper's own are a namespace with loopback alone (a build not yet
-// attached), veths whose peers are on the helper's bridge in the helper's
-// namespace (an attached sandbox, gVisor's included: runsc takes the
-// address but leaves the link), and an empty plain file (a build cut short
-// before the bind). Anything else in the netns folder is someone else's.
+// The helper's own are a namespace with veths whose peers are on the
+// helper's bridge in the helper's namespace (an attached sandbox, gVisor's
+// included: runsc takes the address but leaves the link), a namespace with
+// loopback alone that carries the helper's mark (a build not yet attached),
+// and an empty plain file that carries it (a build cut short before the
+// bind). Anything else in the netns folder is someone else's.
 func (k *kernelNetwork) Inspect(path string) (NetnsState, error) {
+	name := filepath.Base(path)
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	switch {
 	case errors.Is(err, unix.ENOENT):
@@ -271,7 +361,10 @@ func (k *kernelNetwork) Inspect(path string) (NetnsState, error) {
 			return NetnsState{}, err
 		}
 		if st.Mode&unix.S_IFMT == unix.S_IFREG && st.Size == 0 && (st.Uid == 0 || st.Uid == k.owner) {
-			return NetnsState{Exists: true}, nil
+			if fileMarked(fd, name) {
+				return NetnsState{Exists: true}, nil
+			}
+			return NetnsState{Exists: true, Foreign: "an empty file without the helper's mark"}, nil
 		}
 		return NetnsState{Exists: true, Foreign: "not a namespace"}, nil
 	}
@@ -286,9 +379,14 @@ func (k *kernelNetwork) Inspect(path string) (NetnsState, error) {
 	}
 	st := NetnsState{Exists: true}
 	hostID, bridge := -1, -1
+	marked, attached := false, false
 	for _, l := range links {
 		a := l.Attrs()
-		if a.Flags&net.FlagLoopback != 0 || fallbackTunnel(l) {
+		if a.Flags&net.FlagLoopback != 0 {
+			marked = marked || a.Alias == netnsMark(name)
+			continue
+		}
+		if fallbackTunnel(l) {
 			continue
 		}
 		if bridge < 0 {
@@ -306,6 +404,7 @@ func (k *kernelNetwork) Inspect(path string) (NetnsState, error) {
 			st.IPv4 = nil
 			return st, nil
 		}
+		attached = true
 		addrs, err := h.AddrList(l, netlink.FAMILY_V4)
 		if err != nil {
 			return NetnsState{}, err
@@ -315,6 +414,9 @@ func (k *kernelNetwork) Inspect(path string) (NetnsState, error) {
 				st.IPv4 = append(st.IPv4, ip.String())
 			}
 		}
+	}
+	if !marked && !attached {
+		st.Foreign = "a namespace without the helper's mark"
 	}
 	return st, nil
 }
