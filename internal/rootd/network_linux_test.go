@@ -337,6 +337,8 @@ func (c *countingRunner) TeardownIPMasq(ctx context.Context, id, ip string) erro
 func kernelRig(t testing.TB) (*kernelNetwork, *countingRunner) {
 	t.Helper()
 	needRoot(t)
+	// Registered first, so it runs after every other cleanup of the test.
+	hostLinksKept(t)
 	if dir := os.Getenv("AEROL_KT_CNI_DIR"); dir != "" {
 		base := t.TempDir()
 		cfg := Config{
@@ -398,14 +400,50 @@ func tmpfsFolder(t testing.TB, dir string) string {
 	return dir
 }
 
-// cleanNetns removes every namespace a test left, then the folder's mount.
+// cleanNetns removes what a test left in the netns folder. Only the
+// helper's own namespaces go through Remove (CNI DEL): a test's link or
+// foreign namespace there could name another namespace, the test's own
+// included, and CNI DEL would delete its eth0 (the helper's calls refuse
+// such entries; a test's cleanup must too).
 func cleanNetns(k *kernelNetwork) {
 	entries, _ := os.ReadDir(k.netnsDir)
 	for _, e := range entries {
-		_ = k.Remove(context.Background(), e.Name(), filepath.Join(k.netnsDir, e.Name()), "")
+		p := filepath.Join(k.netnsDir, e.Name())
+		if e.Type()&os.ModeSymlink != 0 {
+			_ = os.Remove(p)
+			continue
+		}
+		if st, err := k.Inspect(p); err == nil && st.Exists && st.Foreign == "" {
+			_ = k.Remove(context.Background(), e.Name(), p, "")
+		}
 		_ = nsbuild.DeleteNamed(k.netnsDir, e.Name())
+		_ = os.Remove(p)
 	}
 	_ = unix.Unmount(k.netnsDir, unix.MNT_DETACH)
+}
+
+// hostLinksKept fails the test if a link of the test's own namespace (the
+// host's, in a privileged container: its eth0 and its default route) is
+// gone when the test ends: the next test, or the next run, would find the
+// node without its uplink.
+func hostLinksKept(t testing.TB) {
+	names := func() map[string]bool {
+		out := map[string]bool{}
+		links, _ := netlink.LinkList()
+		for _, l := range links {
+			out[l.Attrs().Name] = true
+		}
+		return out
+	}
+	before := names()
+	t.Cleanup(func() {
+		after := names()
+		for n := range before {
+			if !after[n] && (n == "eth0" || n == "lo") {
+				t.Errorf("the test's own link %s is gone", n)
+			}
+		}
+	})
 }
 
 // TestKernelInspect: the kernel's own view decides what is a sandbox's.
