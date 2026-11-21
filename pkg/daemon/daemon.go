@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -39,6 +40,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	fcapi "github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/oci"
@@ -612,7 +614,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}
 			vmmPool.SetDefaultDepth(warmDepth)
 			fcDriver.SetWarmPool(vmmPool)
-			lister := &vmmTemplateListerAdapter{svc: svc}
+			lister := &vmmTemplateListerAdapter{svc: svc, nestedVirt: cfg.FirecrackerNestedVirt,
+				checkNestedVirt: fcapi.NestedVirtApplies(goruntime.GOARCH)}
 			spawner := fcruntime.NewPoolSpawner(fcDriver)
 			// The same adapter tears down a released slot the pool has no
 			// handle for (every slot a restart left behind), so the reap
@@ -1045,6 +1048,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// rebuilds find a working snapshot pipeline.
 		if cfg.EnableFirecracker {
 			svc.RekickUnhealthyTemplatesAtStart(ctx)
+			// After the rekick, so no template is kicked twice: this one
+			// moves only ready rows, those saved under another
+			// SB_FIRECRACKER_NESTED_VIRT setting.
+			svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
 		}
 		if cfg.AutoImportEnabled {
 			// Wire the post-pull trigger: when the docker client finishes a
@@ -1099,7 +1106,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// dockerd path passes nil and NewServer falls back to the docker client.
 	var apiBuilder *cntr.ImageBuilder
 	if ctdWiring != nil {
-		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger))
+		build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
+		// Logs, here at start, what would otherwise fail every build later,
+		// and clears build folders a previous run left (in the background).
+		_ = build.CheckContextUnpacker()
+		_ = build.SweepBuildDirs()
+		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, build)
 	}
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
@@ -2330,6 +2342,7 @@ func (a *templateResolverAdapter) Resolve(ctx context.Context, id string) (*fcru
 		SnapshotStatePath:  t.SnapshotStatePath,
 		SnapshotChecksum:   t.SnapshotChecksum,
 		SnapshotVsockCID:   t.SnapshotVsockCID,
+		SnapshotNestedVirt: fcapi.NestedVirt(t.SnapshotNestedVirt),
 	}, nil
 }
 
@@ -2361,6 +2374,7 @@ func (a *firecrackerTemplateSnapshotterAdapter) SnapshotTemplate(ctx context.Con
 		MemorySizeBytes: res.MemorySizeBytes,
 		StateSizeBytes:  res.StateSizeBytes,
 		Checksum:        res.Checksum,
+		NestedVirt:      res.NestedVirt,
 	}, nil
 }
 
@@ -2399,6 +2413,12 @@ func (a *firecrackerCIDAllocatorAdapter) ReleaseForTemplate(ctx context.Context,
 // daemon-level adapter brokers the call.
 type vmmTemplateListerAdapter struct {
 	svc *service.Service
+	// nestedVirt is SB_FIRECRACKER_NESTED_VIRT: a template saved under the
+	// other setting is not warmed (its snapshot would hand each clone that
+	// setting's CPU) until the service saves it again. checkNestedVirt is
+	// false where nothing is hidden (fcapi.NestedVirtApplies).
+	nestedVirt      bool
+	checkNestedVirt bool
 }
 
 func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([]vmmpool.TemplateWarmInput, error) {
@@ -2414,6 +2434,15 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		// The rootfs is a load input too: the snapshot's root drive is
 		// backed by it. templateResolverAdapter rejects a row without one.
 		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" || t.RootfsPath == "" {
+			continue
+		}
+		if a.checkNestedVirt && !fcapi.NestedVirt(t.SnapshotNestedVirt).Matches(a.nestedVirt) {
+			continue
+		}
+		// A snapshot from before the overlay placeholder holds the root
+		// drive read-write, and template rootfs files are staged read-only:
+		// it would not load. The service saves it again at start.
+		if !t.HasOverlay {
 			continue
 		}
 		out = append(out, vmmpool.TemplateWarmInput{

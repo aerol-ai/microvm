@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	fcapi "github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -273,6 +274,11 @@ func TestTemplateResolverAdapter_Resolve(t *testing.T) {
 	mustCreateTemplate(&models.Template{ID: "tpl-ready", Image: "alpine", Status: models.TemplateStatusReadyNoSnapshot, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
 	mustCreateTemplate(&models.Template{ID: "tpl-pending", Image: "alpine", Status: models.TemplateStatusPending, RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-rootfs", Image: "alpine", Status: models.TemplateStatusReady, RootfsPath: "", CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
+	mustCreateTemplate(&models.Template{ID: "tpl-snap", Image: "alpine", Status: models.TemplateStatusReady, RootfsPath: "/tmp/rootfs.ext4",
+		CreatedAt: now, UpdatedAt: now, HasSnapshot: true, SnapshotChecksum: "c", SnapshotNestedVirt: "off"})
+	if res, err := a.Resolve(ctx, "tpl-snap"); err != nil || res.SnapshotNestedVirt != fcapi.NestedVirtOff {
+		t.Fatalf("Resolve tpl-snap = %+v, %v; the driver needs the snapshot's nested virt record", res, err)
+	}
 
 	res, err := a.Resolve(ctx, "tpl-ready")
 	if err != nil {
@@ -415,7 +421,7 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	st := openTestStore(t)
 	logger := testLogger()
 	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
-	a := &vmmTemplateListerAdapter{svc: svc}
+	a := &vmmTemplateListerAdapter{svc: svc, checkNestedVirt: true}
 
 	now := time.Now().UTC()
 	mustCreateTemplate := func(tpl *models.Template) {
@@ -429,6 +435,26 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 		ID: "tpl-warm", Image: "alpine", Status: models.TemplateStatusReady,
 		RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now,
 		HasSnapshot: true, HasOverlay: true, SnapshotMemoryPath: "/tmp/snap.mem", SnapshotStatePath: "/tmp/snap.state", SnapshotChecksum: "abc", SnapshotVsockCID: 200,
+		SnapshotNestedVirt: "off",
+	})
+	// Saved before the record, and saved on: each would hand clones nested
+	// virtualization, which this node (SB_FIRECRACKER_NESTED_VIRT unset)
+	// hides, so neither is warmed.
+	for _, saved := range []string{"", "on"} {
+		mustCreateTemplate(&models.Template{
+			ID: "tpl-nv-" + saved, Image: "alpine", Status: models.TemplateStatusReady,
+			RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now,
+			HasSnapshot: true, HasOverlay: true, SnapshotMemoryPath: "/tmp/m", SnapshotStatePath: "/tmp/s", SnapshotChecksum: "c-" + saved,
+			SnapshotNestedVirt: saved,
+		})
+	}
+	// Snapshotted before the overlay placeholder: its root drive is saved
+	// read-write and would not load; never warmed.
+	mustCreateTemplate(&models.Template{
+		ID: "tpl-pre-overlay", Image: "alpine", Status: models.TemplateStatusReady,
+		RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now,
+		HasSnapshot: true, HasOverlay: false, SnapshotMemoryPath: "/tmp/m", SnapshotStatePath: "/tmp/s", SnapshotChecksum: "c-old",
+		SnapshotNestedVirt: "off",
 	})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-path", Image: "alpine", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
 	// Snapshot artifacts but no rootfs: LoadSnapshot could not open the
@@ -449,6 +475,27 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	}
 	if got[0].TemplateID != "tpl-warm" || got[0].RootfsPath != "/tmp/rootfs.ext4" || got[0].SnapshotMemoryPath == "" || got[0].SnapshotStatePath == "" || got[0].VsockCID != 200 || !got[0].HasOverlay {
 		t.Fatalf("unexpected warmable template: %+v", got[0])
+	}
+
+	// A node that allows nested virtualization warms the other two, and
+	// not the one saved with it hidden.
+	allows := &vmmTemplateListerAdapter{svc: svc, nestedVirt: true, checkNestedVirt: true}
+	got, err = allows.ListWarmableTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListWarmableTemplates: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, tpl := range got {
+		ids[tpl.TemplateID] = true
+	}
+	if len(got) != 2 || !ids["tpl-nv-"] || !ids["tpl-nv-on"] {
+		t.Fatalf("a node that allows nested virt warms %v, want tpl-nv- and tpl-nv-on", ids)
+	}
+
+	// Where nothing is hidden (arm64), records are not checked.
+	arm := &vmmTemplateListerAdapter{svc: svc}
+	if got, err = arm.ListWarmableTemplates(ctx); err != nil || len(got) != 3 {
+		t.Fatalf("arm64 lister warms %d templates (%v), want all 3 with snapshots", len(got), err)
 	}
 }
 

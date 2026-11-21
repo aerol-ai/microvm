@@ -2009,6 +2009,22 @@ func TestRunsSSHGateway(t *testing.T) {
 	}
 }
 
+// Multipart uploads spill next to the database (plans/security-gaps-m1-m4.md
+// Q4), never into the shared temp folder; with no database there is no
+// spool.
+func TestUploadSpoolDir(t *testing.T) {
+	for _, tc := range []struct{ dbPath, want string }{
+		{"/var/lib/sandboxd/state.db", "/var/lib/sandboxd/upload-spool"},
+		{"state.db", "upload-spool"},
+		{"", ""},
+		{"   ", ""},
+	} {
+		if got := (Config{DBPath: tc.dbPath}).UploadSpoolDir(); got != tc.want {
+			t.Fatalf("UploadSpoolDir(%q) = %q, want %q", tc.dbPath, got, tc.want)
+		}
+	}
+}
+
 // The server-key ring path (plans/customer-key-custody.md §13) and the
 // cluster key check, which accepts a ring once key 0 has left the key file.
 func TestKeyRingPathAndClusterCheck(t *testing.T) {

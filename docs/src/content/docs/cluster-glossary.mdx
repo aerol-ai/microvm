@@ -179,6 +179,7 @@ Firecracker runs each sandbox in a **microVM**: a small, fast virtual machine. T
 | `SB_FIRECRACKER_TEMPLATES_DIR` | Where Firecracker keeps templates on disk. | `/var/lib/sandboxd/firecracker/templates` |
 | `SB_FIRECRACKER_TAP_BASE_CIDR` | The IP address range for the virtual network cards that link microVMs to the machine. | `172.16.0.0/20` |
 | `SB_FIRECRACKER_TAP_POOL_SIZE` | How many of those virtual network cards to set aside. This is the most Firecracker sandboxes the node runs at once. | `256` |
+| `SB_FIRECRACKER_NESTED_VIRT` | `true` lets code in a microVM start a VM of its own. Off, every microVM the node starts has the CPU's virtualization features hidden. See [Firecracker sandboxes](/firecracker-sandbox/#good-to-know). | `false` |
 
 ### Warm microVM pool
 
