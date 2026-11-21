@@ -1,8 +1,10 @@
 package netrules
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -137,5 +139,54 @@ func TestFloorFoundAfterARestart(t *testing.T) {
 	user := second.filterChain()
 	if be.first(user) != "-j "+FloorChainFor(subnet) || containsRule(be.chains[user], "-j "+floorSlotB(FloorChainFor(subnet))) {
 		t.Fatalf("after a restart the user chain is %q", be.chains[user])
+	}
+}
+
+// liveFloorBackend reads each floor chain's drops from a table.
+type liveFloorBackend struct {
+	*orderedBackend
+	drops map[string][]netip.Prefix
+	err   error
+}
+
+func (b *liveFloorBackend) FloorDrops(chain string, _ netip.Prefix) ([]netip.Prefix, error) {
+	return b.drops[chain], b.err
+}
+
+// TestLiveFloor: what the floor drops now is read from every floor chain
+// the user chain jumps to, either slot or both (a change cut short), each
+// destination once; nothing without a floor or a backend that can read
+// one.
+func TestLiveFloor(t *testing.T) {
+	subnet := netip.MustParsePrefix("10.79.0.0/16")
+	a := FloorChainFor(subnet)
+	p := netip.MustParsePrefix
+	be := &liveFloorBackend{orderedBackend: &orderedBackend{chains: map[string][]string{}}, drops: map[string][]netip.Prefix{
+		a:             {p("169.254.169.254/32"), p("203.0.113.0/24")},
+		floorSlotB(a): {p("169.254.169.254/32"), p("198.51.100.0/24")},
+	}}
+	m := NewWithBackend(be)
+	if got, err := m.LiveFloor(subnet); err != nil || len(got) != 0 {
+		t.Fatalf("no jump = %v %v", got, err)
+	}
+	be.chains[m.filterChain()] = []string{"-j " + floorSlotB(a)}
+	if got, _ := m.LiveFloor(subnet); !slices.Equal(got, be.drops[floorSlotB(a)]) {
+		t.Fatalf("slot B = %v", got)
+	}
+	be.chains[m.filterChain()] = []string{"-j " + a, "-j " + floorSlotB(a)}
+	want := []netip.Prefix{p("169.254.169.254/32"), p("203.0.113.0/24"), p("198.51.100.0/24")}
+	if got, _ := m.LiveFloor(subnet); !slices.Equal(got, want) {
+		t.Fatalf("both slots = %v, want %v", got, want)
+	}
+	be.err = errors.New("listing")
+	if _, err := m.LiveFloor(subnet); err == nil {
+		t.Fatal("a read failure hidden")
+	}
+	if got, err := NewWithBackend(&orderedBackend{chains: map[string][]string{}}).LiveFloor(subnet); err != nil || got != nil {
+		t.Fatalf("no reader = %v %v", got, err)
+	}
+	var off *Manager
+	if got, err := off.LiveFloor(subnet); err != nil || got != nil {
+		t.Fatalf("nil manager = %v %v", got, err)
 	}
 }

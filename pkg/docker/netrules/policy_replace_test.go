@@ -3,6 +3,7 @@ package netrules
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
@@ -28,24 +29,6 @@ func (l *listedBackend) ClearCommented(chains []string, ip, comment string) erro
 		})
 	}
 	return nil
-}
-
-// PolicyState reads as the kernel backends do; clears counts ClearCommented
-// calls, writes counts every rule written.
-func (l *listedBackend) PolicyState(chain, ip, comment string, specs [][]string) (int, bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var got []string
-	for _, r := range l.chains[chain] {
-		if f := strings.Fields(r); addressRuleKeyed(f, ip) && hasComment(f, comment) {
-			got = append(got, r)
-		}
-	}
-	want := make([]string, len(specs))
-	for i, sp := range specs {
-		want[i] = strings.Join(sp, " ")
-	}
-	return len(got), slices.Equal(got, want), nil
 }
 
 type batchListed struct{ *listedBackend }
@@ -85,19 +68,14 @@ func (b batchListed) ReplaceBlock(_ context.Context, chain string, pos int, ip, 
 
 // TestReplaceEgressPolicy (PR 5 review, R4): a policy replaces the last,
 // whatever wrote it, so lists sent one after another never pile up; its
-// rules and their order are ApplyEgressPolicy's, written rule by rule or
-// one block per chain.
+// rules and their order are ApplyEgressPolicy's, one block per chain.
 func TestReplaceEgressPolicy(t *testing.T) {
 	// AEROLVM-INPUT starts with its established-return rule, as the kernel
 	// backends make it: position 2 is below it.
 	est := "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
-	for _, batch := range []bool{false, true} {
+	for _, batch := range []bool{true} {
 		lb := &listedBackend{orderedBackend: &orderedBackend{chains: map[string][]string{ChainAerolvmInput: {est}}}}
-		var be RuleBackend = lb
-		if batch {
-			be = batchListed{lb}
-		}
-		m := NewWithBackend(be)
+		m := NewWithBackend(batchListed{lb})
 		var ref *Manager
 		ip := "10.88.0.5"
 		ctx := context.Background()
@@ -136,8 +114,8 @@ func TestReplaceEgressPolicy(t *testing.T) {
 		if !slices.Contains(user, strings.Join(holdSpec(ip), " ")) || len(policyOf(user, "10.88.0.6")) != 1 {
 			t.Fatalf("batch=%v: a replace touched other rules: %q", batch, user)
 		}
-		if batch && lb.blocks == 0 {
-			t.Fatal("the batching backend was written rule by rule")
+		if lb.blocks == 0 {
+			t.Fatal("no block was written")
 		}
 		if err := m.ClearEgressPolicyOf(ip); err != nil || len(policyOf(lb.chains[m.filterChain()], ip)) != 0 {
 			t.Fatalf("batch=%v: clear: %v %q", batch, err, lb.chains[m.filterChain()])
@@ -157,22 +135,12 @@ func policyOf(rules []string, ip string) []string {
 	return out
 }
 
-// TestReplaceEgressPolicyStopsWithItsContext: rule by rule, a replace whose
-// context ends writes no further rule.
-func TestReplaceEgressPolicyStopsWithItsContext(t *testing.T) {
-	lb := &listedBackend{orderedBackend: &orderedBackend{chains: map[string][]string{}}}
-	m := NewWithBackend(lb)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := m.ReplaceEgressPolicy(ctx, "10.88.0.5", []string{"1.2.3.4/32"}, nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("a cancelled replace = %v", err)
-	}
-	if n := len(policyOf(lb.chains[m.filterChain()], "10.88.0.5")); n != 0 {
-		t.Fatalf("%d rules written after the cancel", n)
-	}
-	// A backend that cannot list refuses, before anything.
+// TestReplaceEgressPolicyNeedsAWriter: a backend that cannot replace a
+// policy whole, or list one to clear it, refuses before writing anything;
+// a nil manager does nothing.
+func TestReplaceEgressPolicyNeedsAWriter(t *testing.T) {
 	if err := NewWithBackend(&orderedBackend{chains: map[string][]string{}}).ReplaceEgressPolicy(context.Background(), "10.88.0.5", nil, []string{"1.2.3.4/32"}); err == nil {
-		t.Fatal("a backend that cannot list replaced a policy")
+		t.Fatal("a backend that cannot replace replaced a policy")
 	}
 	if err := NewWithBackend(&orderedBackend{chains: map[string][]string{}}).ClearEgressPolicyOf("10.88.0.5"); err == nil {
 		t.Fatal("a backend that cannot list cleared a policy")
@@ -227,6 +195,16 @@ func TestExecBackendPolicyAndJumpCalls(t *testing.T) {
 			t.Fatalf("clear removed %v", spec)
 		}
 	}
+	// A chain that was never made has no jump to it.
+	if ok, err := be.HasJump(ChainAerolvmUser, "AEROLVM-FLOOR-x"); ok || err != nil {
+		t.Fatalf("HasJump to a missing chain = %v, %v", ok, err)
+	}
+	if err := be.DeleteJump(ChainAerolvmUser, "AEROLVM-FLOOR-x"); err != nil {
+		t.Fatalf("DeleteJump to a missing chain = %v", err)
+	}
+	if err := be.EnsureUserChain("AEROLVM-FLOOR-x"); err != nil {
+		t.Fatal(err)
+	}
 	if ok, err := be.HasJump(ChainAerolvmUser, "AEROLVM-FLOOR-x"); !ok || err != nil {
 		t.Fatalf("HasJump = %v, %v", ok, err)
 	}
@@ -249,55 +227,41 @@ func TestExecBackendPolicyAndJumpCalls(t *testing.T) {
 	}
 }
 
-// countingListed counts the clears and rule writes a replace makes.
-type countingListed struct {
-	*listedBackend
-	clears, writes int
-}
-
-func (c *countingListed) ClearCommented(chains []string, ip, comment string) error {
-	c.clears++
-	return c.listedBackend.ClearCommented(chains, ip, comment)
-}
-
-func (c *countingListed) Insert(table, chain string, pos int, spec ...string) error {
-	c.writes++
-	return c.listedBackend.Insert(table, chain, pos, spec...)
-}
-
 // TestReplaceEgressPolicyInPlaceWritesNothing: the routine reapply (start,
 // reconcile) of the policy an address has writes nothing, so the address
-// is never without it; a fresh address skips the clear; a change clears
-// and writes.
+// is never without it; a fresh address and a change write each chain
+// that changes.
 func TestReplaceEgressPolicyInPlaceWritesNothing(t *testing.T) {
 	est := "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
-	be := &countingListed{listedBackend: &listedBackend{orderedBackend: &orderedBackend{chains: map[string][]string{ChainAerolvmInput: {est}}}}}
-	m := NewWithBackend(be)
+	lb := &listedBackend{orderedBackend: &orderedBackend{chains: map[string][]string{ChainAerolvmInput: {est}}}}
+	m := NewWithBackend(batchListed{lb})
 	ctx := context.Background()
 	ip := "10.88.0.5"
 	for _, step := range []struct {
-		name          string
-		allow, deny   []string
-		clears, write int
+		name        string
+		allow, deny []string
+		writes      int
 	}{
-		{"fresh address", []string{"1.2.3.4/32", "5.6.7.0/24"}, nil, 0, 6},
-		{"same policy", []string{"1.2.3.4/32", "5.6.7.0/24"}, nil, 0, 0},
-		{"a change", []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}, 1, 2},
-		{"the change again", []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}, 0, 0},
+		{"fresh address", []string{"1.2.3.4/32", "5.6.7.0/24"}, nil, 2},
+		{"same policy", []string{"1.2.3.4/32", "5.6.7.0/24"}, nil, 0},
+		{"a change (its host-input rules go)", []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}, 2},
+		{"the change again", []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}, 0},
 	} {
-		be.clears, be.writes = 0, 0
+		lb.blocks = 0
 		if err := m.ReplaceEgressPolicy(ctx, ip, step.allow, step.deny); err != nil {
 			t.Fatal(err)
 		}
-		if be.clears != step.clears || be.writes != step.write {
-			t.Fatalf("%s: %d clears, %d writes; want %d, %d", step.name, be.clears, be.writes, step.clears, step.write)
+		if lb.blocks != step.writes {
+			t.Fatalf("%s: %d chains written, want %d", step.name, lb.blocks, step.writes)
 		}
 	}
 }
 
-// TestExecPolicyState: the exec backend reads a policy back from
-// `iptables -S`, where a host address carries its /32.
-func TestExecPolicyState(t *testing.T) {
+// TestExecReplaceBlock: the exec backend swaps an address's policy in one
+// iptables-restore transaction: the old rules (as listed) out first, then
+// the new ones in at pos, bottom first; a policy in place writes nothing;
+// a caller that gave up writes nothing.
+func TestExecReplaceBlock(t *testing.T) {
 	script, _ := writeBootstrapIPTables(t)
 	t.Setenv("FAKE_IPTABLES_FAIL", "")
 	ipt, err := iptables.New(iptables.Path(script))
@@ -305,30 +269,100 @@ func TestExecPolicyState(t *testing.T) {
 		t.Fatal(err)
 	}
 	be := newExecBackend(ipt)
-	if n, same, err := be.PolicyState("AEROLVM-NOPE", "10.0.0.5", "sbx-egress", nil); n != 0 || !same || err != nil {
-		t.Fatalf("missing chain = %d %v %v", n, same, err)
+	var restores []string
+	var restoreErr error
+	orig := runRestore
+	runRestore = func(_ context.Context, input string) error { restores = append(restores, input); return restoreErr }
+	t.Cleanup(func() { runRestore = orig })
+	ctx := context.Background()
+	ip := "10.0.0.5"
+	rule := func(dst, verdict string) []string {
+		return []string{"-s", ip, "-d", dst, "-m", "comment", "--comment", "sbx-egress", "-j", verdict}
+	}
+	// A chain that is not there yet: the new rules go in at its top.
+	if err := be.ReplaceBlock(ctx, "AEROLVM-NOPE", 2, ip, "sbx-egress", [][]string{rule("1.1.1.1/32", "ACCEPT")}); err != nil {
+		t.Fatal(err)
+	}
+	if want := "*filter\n-I AEROLVM-NOPE 1 -s 10.0.0.5 -d 1.1.1.1/32 -m comment --comment sbx-egress -j ACCEPT\nCOMMIT\n"; restores[0] != want {
+		t.Fatalf("restore %q, want %q", restores[0], want)
 	}
 	if err := be.EnsureUserChain(ChainAerolvmUser); err != nil {
 		t.Fatal(err)
 	}
-	spec := []string{"-s", "10.0.0.5", "-d", "1.1.1.1/32", "-m", "comment", "--comment", "sbx-egress", "-j", "ACCEPT"}
-	// As the kernel prints it.
-	if err := be.Insert("filter", ChainAerolvmUser, 1, listedForm(spec)...); err != nil {
+	for _, spec := range [][]string{{"-j", "AEROLVM-FLOOR-x"}, listedForm(rule("1.1.1.1/32", "ACCEPT")), listedForm(rule("2.2.2.2/32", "DROP"))} {
+		if err := be.Insert("filter", ChainAerolvmUser, 1, spec...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := [][]string{rule("1.1.1.1/32", "ACCEPT"), rule("2.2.2.2/32", "DROP")} // the fake lists in insertion order
+	restores = nil
+	if err := be.ReplaceBlock(ctx, ChainAerolvmUser, 2, ip, "sbx-egress", old); err != nil || len(restores) != 0 {
+		t.Fatalf("a policy in place: %v, %q", err, restores)
+	}
+	next := [][]string{rule("3.3.3.3/32", "ACCEPT"), rule("4.4.4.4/32", "DROP")}
+	if err := be.ReplaceBlock(ctx, ChainAerolvmUser, 2, ip, "sbx-egress", next); err != nil {
 		t.Fatal(err)
 	}
-	if n, same, err := be.PolicyState(ChainAerolvmUser, "10.0.0.5", "sbx-egress", [][]string{spec}); n != 1 || !same || err != nil {
-		t.Fatalf("in place = %d %v %v", n, same, err)
+	want := "*filter\n" +
+		"-D AEROLVM-USER -s 10.0.0.5/32 -d 1.1.1.1/32 -m comment --comment sbx-egress -j ACCEPT\n" +
+		"-D AEROLVM-USER -s 10.0.0.5/32 -d 2.2.2.2/32 -m comment --comment sbx-egress -j DROP\n" +
+		"-I AEROLVM-USER 2 -s 10.0.0.5 -d 4.4.4.4/32 -m comment --comment sbx-egress -j DROP\n" +
+		"-I AEROLVM-USER 2 -s 10.0.0.5 -d 3.3.3.3/32 -m comment --comment sbx-egress -j ACCEPT\n" +
+		"COMMIT\n"
+	if len(restores) != 1 || restores[0] != want {
+		t.Fatalf("restore %q, want %q", restores, want)
 	}
-	other := slices.Clone(spec)
-	other[3] = "2.2.2.2/32"
-	if n, same, _ := be.PolicyState(ChainAerolvmUser, "10.0.0.5", "sbx-egress", [][]string{other}); n != 1 || same {
-		t.Fatalf("a different policy read as in place: %d %v", n, same)
+	// Given up before: nothing; the restore's failure: reported.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	restores = nil
+	if err := be.ReplaceBlock(cctx, ChainAerolvmUser, 2, ip, "sbx-egress", next); !errors.Is(err, context.Canceled) || len(restores) != 0 {
+		t.Fatalf("cancelled = %v, %q", err, restores)
 	}
-	if _, same, _ := be.PolicyState(ChainAerolvmUser, "10.0.0.5", "sbx-egress", nil); same {
-		t.Fatal("no policy read as in place over one rule")
+	restoreErr = errors.New("restore")
+	if err := be.ReplaceBlock(ctx, ChainAerolvmUser, 2, ip, "sbx-egress", next); err == nil {
+		t.Fatal("restore failure hidden")
 	}
 	t.Setenv("FAKE_IPTABLES_FAIL", "chain")
-	if _, _, err := be.PolicyState(ChainAerolvmUser, "10.0.0.5", "sbx-egress", nil); err == nil {
+	if err := be.ReplaceBlock(ctx, ChainAerolvmUser, 2, ip, "sbx-egress", next); err == nil {
+		t.Fatal("listing failure hidden")
+	}
+}
+
+// TestExecFloorDrops: the exec backend reads a floor chain's DROPs from a
+// subnet by destination, a host as its /32.
+func TestExecFloorDrops(t *testing.T) {
+	script, _ := writeBootstrapIPTables(t)
+	t.Setenv("FAKE_IPTABLES_FAIL", "")
+	ipt, err := iptables.New(iptables.Path(script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := newExecBackend(ipt)
+	src := netip.MustParsePrefix("10.79.0.0/16")
+	if got, err := be.FloorDrops("AEROLVM-FLOOR-x", src); err != nil || len(got) != 0 {
+		t.Fatalf("missing chain = %v %v", got, err)
+	}
+	if err := be.EnsureUserChain("AEROLVM-FLOOR-x"); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range [][]string{
+		{"-s", "10.79.0.0/16", "-d", "203.0.113.0/24", "-j", "DROP"},
+		{"-s", "10.79.0.0/16", "-d", "169.254.169.254", "-j", "DROP"},
+		{"-s", "10.80.0.0/16", "-d", "198.51.100.0/24", "-j", "DROP"},
+		{"-s", "10.79.0.0/16", "-d", "192.0.2.0/24", "-j", "ACCEPT"},
+	} {
+		if err := be.Insert("filter", "AEROLVM-FLOOR-x", 1, spec...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := be.FloorDrops("AEROLVM-FLOOR-x", src)
+	want := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("169.254.169.254/32")}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("= %v %v, want %v", got, err, want)
+	}
+	t.Setenv("FAKE_IPTABLES_FAIL", "chain")
+	if _, err := be.FloorDrops("AEROLVM-FLOOR-x", src); err == nil {
 		t.Fatal("listing failure hidden")
 	}
 }

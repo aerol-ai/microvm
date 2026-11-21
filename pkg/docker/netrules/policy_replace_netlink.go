@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"slices"
 
 	"github.com/google/nftables"
@@ -198,4 +200,80 @@ func (b *netlinkBackend) jumpRules(parent, child string) ([]*nftables.Rule, erro
 		}
 	}
 	return out, nil
+}
+
+// FloorDrops implements floorReader: chain's DROP rules from src, by
+// destination, read from their expressions (the netlink backend's and
+// iptables-nft's alike); a chain that does not exist has none.
+func (b *netlinkBackend) FloorDrops(chain string, src netip.Prefix) ([]netip.Prefix, error) {
+	tbl, ch, err := lookupTableChain("filter", chain)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := b.newConn()
+	if err != nil {
+		return nil, err
+	}
+	rules, err := conn.GetRules(tbl, ch)
+	if err != nil {
+		if isNetlinkNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("nft get %s rules: %w", chain, err)
+	}
+	var out []netip.Prefix
+	for _, r := range rules {
+		if !ruleDrops(r.Exprs) {
+			continue
+		}
+		s, okS := rulePrefixAt(r.Exprs, 12)
+		d, okD := rulePrefixAt(r.Exprs, 16)
+		if okS && okD && s == src.Masked() {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func ruleDrops(exprs []expr.Any) bool {
+	for _, e := range exprs {
+		if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+			return true
+		}
+	}
+	return false
+}
+
+// rulePrefixAt is the IPv4 prefix a rule matches at a network-header
+// offset (12 source, 16 destination): a payload load of 1 to 4 bytes, an
+// optional mask, and an equality compare (iptables-nft loads only a
+// prefix's whole bytes; the netlink backend masks).
+func rulePrefixAt(exprs []expr.Any, offset uint32) (netip.Prefix, bool) {
+	for i, e := range exprs {
+		p, ok := e.(*expr.Payload)
+		if !ok || p.Base != expr.PayloadBaseNetworkHeader || p.Offset != offset || p.Len < 1 || p.Len > 4 || i+1 >= len(exprs) {
+			continue
+		}
+		bits := int(p.Len) * 8
+		next := exprs[i+1]
+		if bw, ok := next.(*expr.Bitwise); ok {
+			if len(bw.Mask) != int(p.Len) || i+2 >= len(exprs) {
+				return netip.Prefix{}, false
+			}
+			ones, size := net.IPMask(bw.Mask).Size()
+			if size == 0 {
+				return netip.Prefix{}, false // not a prefix mask
+			}
+			bits = ones
+			next = exprs[i+2]
+		}
+		c, ok := next.(*expr.Cmp)
+		if !ok || c.Op != expr.CmpOpEq || len(c.Data) != int(p.Len) {
+			return netip.Prefix{}, false
+		}
+		var a [4]byte
+		copy(a[:], c.Data)
+		return netip.PrefixFrom(netip.AddrFrom4(a), bits).Masked(), true
+	}
+	return netip.Prefix{}, false
 }

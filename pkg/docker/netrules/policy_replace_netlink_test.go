@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
+	"slices"
 	"syscall"
 	"testing"
 
@@ -243,5 +245,61 @@ func TestNetlinkJumpCalls(t *testing.T) {
 	f.delErr = errors.New("del boom")
 	if err := b.DeleteJump(ChainAerolvmUser, "AEROLVM-FLOOR-x"); err == nil {
 		t.Fatal("delete error hidden")
+	}
+}
+
+// TestNetlinkFloorDrops: a floor chain's DROPs from the subnet are read
+// back by destination, from the netlink backend's own rules (a mask) and
+// from iptables-nft's (whole bytes loaded, no mask).
+func TestNetlinkFloorDrops(t *testing.T) {
+	f := newChainNFT()
+	chain := "AEROLVM-FLOOR-x"
+	f.add(chain, "-s", "10.79.0.0/16", "-d", "203.0.113.0/24", "-j", "DROP")
+	f.add(chain, "-s", "10.79.0.0/16", "-d", "169.254.169.254", "-j", "DROP")
+	f.add(chain, "-s", "10.80.0.0/16", "-d", "198.51.100.0/24", "-j", "DROP")
+	f.add(chain, "-s", "10.79.0.0/16", "-d", "192.0.2.0/24", "-j", "ACCEPT")
+	// As iptables-nft writes -s 10.79.0.0/16 -d 100.64.0.0/10 -j DROP: the
+	// source's two whole bytes, the destination's mask on its first byte.
+	tbl := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: "filter"}
+	f.mu.Lock()
+	f.next++
+	f.chains[chain] = append(f.chains[chain], &nftables.Rule{Table: tbl, Chain: &nftables.Chain{Name: chain, Table: tbl}, Handle: f.next,
+		Exprs: []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 2},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{10, 79}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 2},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 2, Mask: []byte{255, 192}, Xor: []byte{0, 0}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{100, 64}},
+			&expr.Counter{},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		}})
+	f.mu.Unlock()
+	b := netlinkChainBackend(f)
+	got, err := b.FloorDrops(chain, netip.MustParsePrefix("10.79.0.0/16"))
+	want := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("169.254.169.254/32"), netip.MustParsePrefix("100.64.0.0/10")}
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("= %v %v, want %v", got, err, want)
+	}
+	// Not prefixes: a mask with a hole, a compare of another length.
+	for _, exprs := range [][]expr.Any{
+		{&expr.Payload{Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4}, &expr.Bitwise{Len: 4, Mask: []byte{255, 0, 255, 0}}, &expr.Cmp{Op: expr.CmpOpEq, Data: []byte{1, 0, 1, 0}}},
+		{&expr.Payload{Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4}, &expr.Cmp{Op: expr.CmpOpEq, Data: []byte{1, 2}}},
+		{&expr.Payload{Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4}, &expr.Bitwise{Len: 4, Mask: []byte{255, 255, 255, 0}}},
+		{&expr.Payload{Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4}},
+	} {
+		if p, ok := rulePrefixAt(exprs, 16); ok {
+			t.Errorf("%v read as %v", exprs, p)
+		}
+	}
+	if got, err := b.FloorDrops("AEROLVM-NOPE", netip.MustParsePrefix("10.79.0.0/16")); err != nil || len(got) != 0 {
+		t.Fatalf("an empty chain = %v %v", got, err)
+	}
+	f.getErr = syscall.ENOENT
+	if got, err := b.FloorDrops(chain, netip.MustParsePrefix("10.79.0.0/16")); err != nil || len(got) != 0 {
+		t.Fatalf("a missing chain = %v %v", got, err)
+	}
+	f.getErr = errors.New("boom")
+	if _, err := b.FloorDrops(chain, netip.MustParsePrefix("10.79.0.0/16")); err == nil {
+		t.Fatal("list error hidden")
 	}
 }

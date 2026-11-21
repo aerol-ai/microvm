@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -145,6 +146,49 @@ func deleteJump(m *Manager, parent, child string) error {
 		return jb.DeleteJump(parent, child)
 	}
 	return m.deleteUntilGone("filter", parent, "-j", child)
+}
+
+// floorReader reads a floor chain's DROP destinations from a source (the
+// sandbox subnet), as the kernel has them.
+type floorReader interface {
+	FloorDrops(chain string, src netip.Prefix) ([]netip.Prefix, error)
+}
+
+// LiveFloor is what subnet's floor drops in the kernel now: the
+// destinations of every floor chain the user chain jumps to (one, or both
+// slots mid-change), each once. None on a kernel with no floor, or with a
+// backend that cannot list one. A process that starts on a kernel an
+// earlier one filled (the root helper after a restart) keeps these until
+// it is told the floor, so a restart never drops one of them.
+func (m *Manager) LiveFloor(subnet netip.Prefix) ([]netip.Prefix, error) {
+	if !m.Enabled() || !subnet.IsValid() {
+		return nil, nil
+	}
+	fr, ok := m.ipt.(floorReader)
+	if !ok {
+		return nil, nil
+	}
+	chain := FloorChainFor(subnet)
+	var out []netip.Prefix
+	for _, c := range []string{chain, floorSlotB(chain)} {
+		jumped, err := hasJump(m, m.filterChain(), c)
+		if err != nil {
+			return nil, fmt.Errorf("egress floor: find the jump to %s: %w", c, err)
+		}
+		if !jumped {
+			continue
+		}
+		drops, err := fr.FloorDrops(c, subnet.Masked())
+		if err != nil {
+			return nil, fmt.Errorf("egress floor: read %s: %w", c, err)
+		}
+		for _, d := range drops {
+			if !slices.Contains(out, d) {
+				out = append(out, d)
+			}
+		}
+	}
+	return out, nil
 }
 
 // floorSlotB is the second of a subnet's two floor chains: a floor is
