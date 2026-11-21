@@ -15,7 +15,9 @@ import (
 	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -256,4 +258,28 @@ func (n *helperNetnsHost) exists(path string) bool {
 	}
 	ok, _, err := n.h.NetnsAddrs(context.Background(), filepath.Base(path))
 	return ok || err != nil
+}
+
+// imageBuilderFor is the image builder the API gets on the containerd
+// engine (nil without one). In privilege mode split a build is refused by
+// name: buildkitd's socket is root's and writes into containerd past the
+// gate, and the build-context unpacker runs as uids of its own, root work
+// the helper does not do yet (plan PR 10b). Image reads, pushes and
+// removals keep working: they go through the driver's containerd client,
+// which split mode points at the gate.
+func imageBuilderFor(cfg config.Config, b *cntr.ImageBuilder) service.ImageBuilder {
+	if b == nil {
+		return nil
+	}
+	if cfg.PrivilegeMode == privmode.Split {
+		return splitImageBuilder{b}
+	}
+	return b
+}
+
+// splitImageBuilder refuses builds and passes everything else through.
+type splitImageBuilder struct{ service.ImageBuilder }
+
+func (splitImageBuilder) BuildImage(context.Context, docker.BuildImageRequest) error {
+	return privmode.NotYet("build an image", privmode.StepBuilds)
 }

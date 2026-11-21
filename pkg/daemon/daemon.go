@@ -25,6 +25,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
@@ -1126,17 +1127,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
 		// Logs, here at start, what would otherwise fail every build later,
 		// and clears build folders a previous run left (in the background).
-		_ = build.CheckContextUnpacker()
-		_ = build.SweepBuildDirs()
+		// Both are root work: privilege mode split refuses builds instead
+		// (imageBuilderFor).
+		if cfg.PrivilegeMode != privmode.Split {
+			_ = build.CheckContextUnpacker()
+			_ = build.SweepBuildDirs()
+		}
 		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, build)
 	}
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	var builder service.ImageBuilder
-	if apiBuilder != nil {
-		builder = apiBuilder
-	}
+	builder := imageBuilderFor(cfg, apiBuilder)
 	// Scoped API tokens (plans/identity-and-access.md §5.4). With identity
 	// off this does nothing and NewServer drops the authenticator, so the
 	// server is byte for byte the PAT-only one (L8). With it on: a single
