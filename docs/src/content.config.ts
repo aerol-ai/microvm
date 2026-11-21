@@ -124,6 +124,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     label: 'Runtimes',
     category: NavigationCategory.RUNTIMES,
     entries: [
+      link('/choose-isolation', '- Choose a runtime'),
       link('/container-sandbox', '- Containers (Docker)'),
       link('/gpu-sandboxes', '- GPU'),
       link('/gvisor-sandbox', '- gVisor'),
