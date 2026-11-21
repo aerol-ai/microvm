@@ -3765,6 +3765,16 @@ func (c Config) KeyRingPath() string {
 	return c.CredentialEncryptionKeyPath + ".ring"
 }
 
+// UploadSpoolDir is where multipart uploads too big for memory spill
+// (internal/multipartspool): a folder of the daemon's own next to its
+// database, never the host's shared temp folder. "" without a DBPath.
+func (c Config) UploadSpoolDir() string {
+	if strings.TrimSpace(c.DBPath) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(c.DBPath), "upload-spool")
+}
+
 func (c Config) ListenAddr() string {
 	return fmt.Sprintf("%s:%d", c.APIHost, c.APIPort)
 }
