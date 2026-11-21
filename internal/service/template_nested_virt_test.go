@@ -417,3 +417,102 @@ func TestRebuildRemovesTheOldSnapshotFiles(t *testing.T) {
 		}
 	}
 }
+
+// A save queued behind another save of the same template gets its whole
+// timeout: the clock starts once it holds the lock. Here the lock is held
+// for longer than the timeout; both the rebuild and the re-save still
+// finish.
+func TestTemplateSaveTimeoutStartsOnceTheLockIsHeld(t *testing.T) {
+	setTemplateGOARCH(t, "amd64")
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	// Long enough for a rebuild's own store writes under a loaded CI
+	// runner; the lock is held half as long again, past it.
+	svc.cfg.FirecrackerTemplateBuildTimeout = time.Second
+	seedReadyTemplate(t, st, templatesDir, "tpl-rebuild")
+	seedReadyTemplate(t, st, templatesDir, "tpl-resave")
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 4), nestedVirt: "off"})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	unlockRebuild := svc.lockTemplateSnapshot("tpl-rebuild")
+	unlockResave := svc.lockTemplateSnapshot("tpl-resave")
+	if err := svc.MarkSnapshotCorrupt(ctx, "tpl-rebuild", "rotation"); err != nil {
+		t.Fatal(err)
+	}
+	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+	time.Sleep(1500 * time.Millisecond) // longer than the timeout
+	unlockRebuild()
+	unlockResave()
+	if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+		t.Fatal("saves did not finish")
+	}
+	for id, want := range map[string]string{"tpl-rebuild": "", "tpl-resave": "off"} {
+		got, _ := st.GetTemplate(ctx, id)
+		if got.Status != models.TemplateStatusReady || !got.HasSnapshot {
+			t.Fatalf("%s after waiting longer than its timeout: %+v; the wait used up its time", id, got)
+		}
+		if want != "" && got.SnapshotNestedVirt != want {
+			t.Fatalf("%s record = %q, want %q", id, got.SnapshotNestedVirt, want)
+		}
+	}
+}
+
+// lockRefs is the number of callers holding or waiting on a template's
+// lock, 0 when it has no entry.
+func lockRefs(svc *Service, id string) int {
+	svc.templateSnapshotLocksMu.Lock()
+	defer svc.templateSnapshotLocksMu.Unlock()
+	if l := svc.templateSnapshotLocks[id]; l != nil {
+		return l.refs
+	}
+	return 0
+}
+
+func waitForRefs(t *testing.T, svc *Service, id string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for lockRefs(svc, id) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d callers on the lock, want %d", id, lockRefs(svc, id), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The lock table drops an entry only when its last holder or waiter is
+// gone. A waiter that takes the lock over keeps the entry, so a caller who
+// arrives later waits for it rather than getting a second lock for the
+// same template; once everyone is done, the table is empty.
+func TestTemplateSnapshotLockTableEmptiesAndExcludes(t *testing.T) {
+	svc := &Service{}
+	unlockFirst := svc.lockTemplateSnapshot("tpl-one")
+
+	waiterHolds := make(chan func())
+	go func() { waiterHolds <- svc.lockTemplateSnapshot("tpl-one") }()
+	waitForRefs(t, svc, "tpl-one", 2)
+	unlockFirst()
+	unlockWaiter := <-waiterHolds
+
+	// The waiter holds the lock now. A caller who comes later must wait.
+	lateHolds := make(chan func(), 1)
+	go func() { lateHolds <- svc.lockTemplateSnapshot("tpl-one") }()
+	waitForRefs(t, svc, "tpl-one", 2)
+	select {
+	case unlock := <-lateHolds:
+		unlock()
+		t.Fatal("a later caller took the template's lock while the waiter held it: two locks for one template")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlockWaiter()
+	(<-lateHolds)()
+
+	if n := lockRefs(svc, "tpl-one"); n != 0 {
+		t.Fatalf("%d callers left on the lock after everyone unlocked", n)
+	}
+	svc.templateSnapshotLocksMu.Lock()
+	left := len(svc.templateSnapshotLocks)
+	svc.templateSnapshotLocksMu.Unlock()
+	if left != 0 {
+		t.Fatalf("lock table has %d entries after everyone unlocked, want 0", left)
+	}
+}

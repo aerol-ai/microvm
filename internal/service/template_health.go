@@ -199,9 +199,9 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 	go func() {
 		defer s.templateRebuildWG.Done()
 		for _, tpl := range stale {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			err := s.resaveTemplateSnapshot(ctx, tpl)
-			cancel()
+			err := s.withTemplateSnapshotLock(tpl.ID, timeout, func(ctx context.Context) error {
+				return s.resaveTemplateSnapshotLocked(ctx, tpl)
+			})
 			if err != nil {
 				s.logger.Warn("template snapshot not saved again; it keeps its old snapshot until the next start",
 					"template_id", tpl.ID, "error", err)
@@ -222,6 +222,12 @@ var errTemplateMovedOn = errors.New("the template changed while its snapshot was
 // node's setting without taking the template out of service.
 func (s *Service) resaveTemplateSnapshot(ctx context.Context, listed *models.Template) error {
 	defer s.lockTemplateSnapshot(listed.ID)()
+	return s.resaveTemplateSnapshotLocked(ctx, listed)
+}
+
+// resaveTemplateSnapshotLocked is resaveTemplateSnapshot for a caller that
+// holds the template's snapshot lock.
+func (s *Service) resaveTemplateSnapshotLocked(ctx context.Context, listed *models.Template) error {
 	// Read the row again under the lock: a rebuild or another save may have
 	// replaced the snapshot since the sweep listed it.
 	tpl, err := s.store.GetTemplate(ctx, listed.ID)
@@ -281,10 +287,46 @@ func (s *Service) resaveTemplateSnapshot(ctx context.Context, listed *models.Tem
 // They all use the VM id tpl-snap-<id>, with its TAP slot, run dir and API
 // socket, so two at once would tear each other down. Returns the unlock.
 func (s *Service) lockTemplateSnapshot(templateID string) func() {
-	v, _ := s.templateSnapshotLocks.LoadOrStore(templateID, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	s.templateSnapshotLocksMu.Lock()
+	if s.templateSnapshotLocks == nil {
+		s.templateSnapshotLocks = make(map[string]*templateSnapshotLock)
+	}
+	l := s.templateSnapshotLocks[templateID]
+	if l == nil {
+		l = &templateSnapshotLock{}
+		s.templateSnapshotLocks[templateID] = l
+	}
+	l.refs++
+	s.templateSnapshotLocksMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.templateSnapshotLocksMu.Lock()
+		// The entry goes with its last holder or waiter, so the map holds
+		// only templates being saved, never every id ever seen. A waiter
+		// counted in refs keeps it, so two callers never get two locks.
+		if l.refs--; l.refs == 0 {
+			delete(s.templateSnapshotLocks, templateID)
+		}
+		s.templateSnapshotLocksMu.Unlock()
+	}
+}
+
+// templateSnapshotLock is one template's lock and the number of callers
+// holding or waiting on it.
+type templateSnapshotLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// withTemplateSnapshotLock runs fn under the template's snapshot lock, with
+// a timeout that starts once the lock is held: a save that waited behind
+// another save of the same template still gets its whole time.
+func (s *Service) withTemplateSnapshotLock(templateID string, timeout time.Duration, fn func(ctx context.Context) error) error {
+	defer s.lockTemplateSnapshot(templateID)()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return fn(ctx)
 }
 
 // newTemplateSnapshotPaths names a new snapshot of a template in its
@@ -404,9 +446,13 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 	s.templateRebuildWG.Add(1)
 	go func() {
 		defer s.templateRebuildWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		if err := s.RebuildTemplateSnapshot(ctx, templateID); err != nil {
+		// The timeout starts once the template's snapshot lock is held: a
+		// rebuild queued behind a re-save of the same template still gets
+		// its whole time.
+		err := s.withTemplateSnapshotLock(templateID, timeout, func(ctx context.Context) error {
+			return s.rebuildTemplateSnapshotLocked(ctx, templateID)
+		})
+		if err != nil {
 			s.logger.Warn("snapshot rebuild failed",
 				"template_id", templateID, "error", err)
 		}
@@ -434,11 +480,12 @@ func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
 }
 
 // RebuildTemplateSnapshot reruns the snapshot phase against an
-// existing rootfs. Synchronous (the caller — typically
-// kickSnapshotRebuild — provides its own goroutine + timeout).
-// Exported because future phases (snapshot rotation in PR 6-D,
-// operator-triggered repair via an API endpoint) will call it
-// directly.
+// existing rootfs, under the template's snapshot lock. Synchronous; the
+// caller provides the goroutine and the timeout. The background path,
+// kickSnapshotRebuild, calls rebuildTemplateSnapshotLocked through
+// withTemplateSnapshotLock instead, so its timeout starts once it holds the
+// lock; this entry point is for a caller that wants to wait on the
+// rebuild directly.
 //
 // Precondition: template must exist and be in status=unhealthy.
 // (ready_no_snapshot rebuilds need a different entry point — they
@@ -451,10 +498,16 @@ func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
 // kickTemplateBuild semantics so operators see a uniform state
 // machine on the dashboard.
 func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string) error {
+	defer s.lockTemplateSnapshot(templateID)()
+	return s.rebuildTemplateSnapshotLocked(ctx, templateID)
+}
+
+// rebuildTemplateSnapshotLocked is RebuildTemplateSnapshot for a caller that
+// holds the template's snapshot lock.
+func (s *Service) rebuildTemplateSnapshotLocked(ctx context.Context, templateID string) error {
 	if s.templateSnapshotter == nil || s.templateCIDAllocator == nil {
 		return errors.New("snapshot rebuild requires snapshotter + cid allocator wiring")
 	}
-	defer s.lockTemplateSnapshot(templateID)()
 	template, err := s.store.GetTemplate(ctx, templateID)
 	if err != nil {
 		return fmt.Errorf("get template: %w", err)

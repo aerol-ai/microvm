@@ -331,6 +331,10 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusSnapshotting, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: status update to snapshotting failed", "template_id", id, "error", uerr)
 		}
+		// The build's timeout started with the build, not here: this lock
+		// waits only if the id was deleted and created again while a save
+		// of the old template still runs, which is rare enough not to need
+		// withTemplateSnapshotLock's fresh clock.
 		unlockSnapshot := s.lockTemplateSnapshot(id)
 		snap, snapErr := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
 			TemplateID:    id,
