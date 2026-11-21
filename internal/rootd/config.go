@@ -97,6 +97,19 @@ type Config struct {
 	// Network is the helper's CNI (network.go); sandboxes' namespaces go
 	// in Policy.NetnsDir.
 	Network NetworkConfig
+	// Firewall is the host firewall's settings (firewall.go).
+	Firewall FirewallConfig
+}
+
+// FirewallConfig is the helper's own copy of the host firewall's settings,
+// under sandboxd's names.
+type FirewallConfig struct {
+	// Backend is SB_NETRULES_BACKEND ("netlink", the default, or
+	// "iptables").
+	Backend string
+	// Interconnect is SB_SANDBOX_INTERCONNECT: sandboxes on the node may
+	// reach each other.
+	Interconnect bool
 }
 
 // sharedNetnsDirs are the folders iproute2, systemd units and CNI tools
@@ -227,6 +240,13 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if privileged && enterprise {
 		return Config{}, errors.New("SB_CONTAINER_PRIVILEGED must be false when SB_ENTERPRISE_MODE=true")
 	}
+	interconnect, err := envBool(getenv, "SB_SANDBOX_INTERCONNECT")
+	if err != nil {
+		return Config{}, err
+	}
+	if interconnect && enterprise {
+		return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
+	}
 	limits, err := limitsFromEnv(getenv)
 	if err != nil {
 		return Config{}, err
@@ -334,6 +354,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			ConfPath:  cniConf,
 			Subnet:    strings.TrimSpace(getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		},
+		Firewall: FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect},
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

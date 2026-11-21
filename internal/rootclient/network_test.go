@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
@@ -61,6 +62,17 @@ func (m *memNet) Remove(_ context.Context, _, path, _ string) error {
 }
 
 func (m *memNet) DisableIPv6(string) error { return nil }
+func (m *memNet) Bridge() string           { return "aerolvm0" }
+func (m *memNet) Leaseholder(ip netip.Addr) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for path, st := range m.ns {
+		if len(st.IPv4) > 0 && st.IPv4[0] == ip.String() {
+			return filepath.Base(path), true, nil
+		}
+	}
+	return "", false, nil
+}
 
 // netCalls is every network call, with the feature each needs.
 var netCalls = []struct {

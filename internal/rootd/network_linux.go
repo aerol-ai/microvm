@@ -41,6 +41,10 @@ type kernelNetwork struct {
 	confDir, confName string
 	conflist          cni.ConflistOptions
 	owner             uint32
+	// leases is host-local's folder of address leases for this network:
+	// one file per address, naming the container id (the netns name)
+	// that holds it until CNI DEL.
+	leases string
 }
 
 // openNetwork checks the helper's network layout and opens it. Every
@@ -97,6 +101,9 @@ func openNetwork(cfg Config) (NetworkHost, error) {
 	}
 	ipam, err := ipamType(n.ConfPath)
 	if err != nil {
+		return nil, err
+	}
+	if k.leases, err = leaseFolder(n.ConfPath); err != nil {
 		return nil, err
 	}
 	for _, plugin := range []string{"bridge", ipam} {
@@ -292,6 +299,89 @@ func checkPlugin(pfd int, dir, name string, owner uint32) error {
 	}
 	return checkRootFile(&st, filepath.Join(dir, name), owner)
 }
+
+// defaultLeaseDir is host-local's data folder when the config names none.
+const defaultLeaseDir = "/var/lib/cni/networks"
+
+// leaseFolder is host-local's lease folder for the config's network:
+// <ipam.dataDir or the default>/<network name>.
+func leaseFolder(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read CNI config %s: %w", path, err)
+	}
+	type plugin struct {
+		IPAM struct {
+			DataDir string `json:"dataDir"`
+		} `json:"ipam"`
+	}
+	var conf struct {
+		plugin
+		Name    string   `json:"name"`
+		Plugins []plugin `json:"plugins"`
+	}
+	if err := json.Unmarshal(raw, &conf); err != nil {
+		return "", fmt.Errorf("parse CNI config %s: %w", path, err)
+	}
+	p := conf.plugin
+	if len(conf.Plugins) > 0 {
+		p = conf.Plugins[0]
+	}
+	dir := p.IPAM.DataDir
+	if dir == "" {
+		dir = defaultLeaseDir
+	}
+	if conf.Name == "" || strings.ContainsAny(conf.Name, "/\x00") || conf.Name == "." || conf.Name == ".." ||
+		!filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return "", fmt.Errorf("CNI config %s: network name %q or IPAM data folder %q is not one the helper reads leases from", path, conf.Name, dir)
+	}
+	return filepath.Join(dir, conf.Name), nil
+}
+
+// maxLeaseFile bounds a lease file: a container id and an interface name.
+const maxLeaseFile = 512
+
+// Leaseholder reads host-local's lease for ip, through a folder that must
+// be root's alone (only the plugin, run by root, writes it). No folder yet
+// (no ADD has run) or no file is no lease.
+func (k *kernelNetwork) Leaseholder(ip netip.Addr) (string, bool, error) {
+	dfd, err := walkFolder(k.leases, false, func(at string, st *unix.Stat_t, last bool) error {
+		return rootfolder.CheckFolder(at, uint32(st.Mode), st.Uid, k.owner, !last)
+	})
+	if errors.Is(err, unix.ENOENT) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lease folder %s: %w", k.leases, err)
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	fd, err := unix.Openat(dfd, ip.String(), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lease of %s: %w", ip, err)
+	}
+	f := os.NewFile(uintptr(fd), ip.String())
+	defer f.Close()
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return "", false, err
+	}
+	if err := checkRootFile(&st, filepath.Join(k.leases, ip.String()), k.owner); err != nil {
+		return "", false, err
+	}
+	buf := make([]byte, maxLeaseFile)
+	n, _ := f.Read(buf)
+	id, _, _ := strings.Cut(string(buf[:n]), "\n")
+	id = strings.TrimRight(id, "\r")
+	if id == "" {
+		return "", false, nil
+	}
+	return id, true, nil
+}
+
+func (k *kernelNetwork) Bridge() string { return k.bridge }
 
 // ipamType is the IPAM plugin the config's bridge plugin runs.
 func ipamType(path string) (string, error) {

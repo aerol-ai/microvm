@@ -510,6 +510,17 @@ func (s *stubNetwork) Remove(_ context.Context, _, p, _ string) error {
 	return nil
 }
 func (s *stubNetwork) DisableIPv6(string) error { return nil }
+func (s *stubNetwork) Bridge() string           { return "aerolvm0" }
+func (s *stubNetwork) Leaseholder(ip netip.Addr) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for p, st := range s.ns {
+		if len(st.IPv4) > 0 && st.IPv4[0] == ip.String() {
+			return filepath.Base(p), true, nil
+		}
+	}
+	return "", false, nil
+}
 
 // TestRun_SplitMode: sandboxd boots in privilege mode split against the
 // helper's own server: it waits for the helper, takes the sandboxes'

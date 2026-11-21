@@ -103,10 +103,21 @@ type Info struct {
 	HelperVersion string
 	API           uint32
 	Features      []string
+	// Parts are the parts of PrepareSandbox and ReleaseSandbox the helper
+	// serves (rootdpb.Parts).
+	Parts []string
 }
 
 // Has reports whether the helper serves feature.
 func (i Info) Has(feature string) bool { return slices.Contains(i.Features, feature) }
+
+// HasPart reports whether the helper serves part of PrepareSandbox and
+// ReleaseSandbox.
+func (i Info) HasPart(part string) bool { return slices.Contains(i.Parts, part) }
+
+func infoOf(resp *rootdpb.VersionResponse) Info {
+	return Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures(), Parts: resp.GetParts()}
+}
 
 // UnsupportedError is a call or a helper this agent cannot use.
 type UnsupportedError struct {
@@ -327,7 +338,7 @@ func (c *Client) run(ctx context.Context, a *attempt, cur *session, rpc rootdpb.
 	case err != nil:
 		err = c.unavailable(err)
 	case resp.GetApi() < rootdpb.MinHelperAPI:
-		err = &UnsupportedError{Helper: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}}
+		err = &UnsupportedError{Helper: infoOf(resp)}
 	}
 	var ue *UnsupportedError
 	if errors.As(err, &ue) {
@@ -355,7 +366,7 @@ func (c *Client) run(ctx context.Context, a *attempt, cur *session, rpc rootdpb.
 		gen = 0
 	}
 	c.sess.Store(&session{conn: a.conn, rpc: rpc, gen: gen,
-		info: Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures()}})
+		info: infoOf(resp)})
 	c.ready.Store(true)
 }
 
@@ -397,10 +408,10 @@ func (c *Client) require(ctx context.Context, feature string) (*session, error) 
 	return nil, &UnsupportedError{Feature: feature, Helper: s.info}
 }
 
-// EnsureHost asks the helper to set the host up for sandboxes. No helper
-// serves it yet, so it returns an UnsupportedError.
+// EnsureHost is EnsureHostFirewall for a caller that needs no more than
+// whether it worked.
 func (c *Client) EnsureHost(ctx context.Context) error {
-	_, err := call(ctx, c, rootdpb.FeatureEnsureHost, &rootdpb.EnsureHostRequest{}, rootdpb.RootHelperClient.EnsureHost)
+	_, err := c.EnsureHostFirewall(ctx)
 	return err
 }
 
@@ -554,6 +565,20 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 //     CNI contract, the NAT teardown and the connection tracking flush go
 //     by identity, and a missing namespace is success.
 //   - DisableNetnsIPv6 writes fixed sysctl values; NetnsAddrs is a read.
+//
+// The firewall calls (M1 PR 5) each make a rule present or absent, by
+// the address it is for:
+//   - EnsureHost makes sure of the chains, the block sets, the forwarding
+//     sysctls and the IPv6 fence; SetNodeGuard and SetEgressFloor replace
+//     a whole list with the one sent.
+//   - SandboxRules checks for a rule before it adds one, and a missing one
+//     is no error to remove. One answer is lost by a retry: whether the
+//     block-all rule was new (inserted). The retry answers "already
+//     there", so the agent leaves the block in place when the sandbox's
+//     own block is lifted: a sandbox stays more closed, never more open.
+//   - PrepareSandbox is RealizeNetns and SandboxRules in one call, with
+//     the same answers to a repeat; ReleaseSandbox is "make sure it is
+//     gone" for both.
 var retrySafe = map[string]bool{
 	rootdpb.FeatureEnsureHost:           true,
 	rootdpb.FeatureEnsureHostFiles:      true,
@@ -566,6 +591,11 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureRemoveNetns:          true,
 	rootdpb.FeatureDisableNetnsIPv6:     true,
 	rootdpb.FeatureNetnsAddrs:           true,
+	rootdpb.FeatureSetNodeGuard:         true,
+	rootdpb.FeatureSetEgressFloor:       true,
+	rootdpb.FeatureSandboxRules:         true,
+	rootdpb.FeaturePrepareSandbox:       true,
+	rootdpb.FeatureReleaseSandbox:       true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -652,6 +682,14 @@ var networkCalls = map[string]bool{
 	rootdpb.FeatureRemoveNetns:       true,
 	rootdpb.FeatureDisableNetnsIPv6:  true,
 	rootdpb.FeatureNetnsAddrs:        true,
+	// The firewall's calls wait on the xtables lock, and the two per-create
+	// calls on CNI too.
+	rootdpb.FeatureEnsureHost:     true,
+	rootdpb.FeatureSetNodeGuard:   true,
+	rootdpb.FeatureSetEgressFloor: true,
+	rootdpb.FeatureSandboxRules:   true,
+	rootdpb.FeaturePrepareSandbox: true,
+	rootdpb.FeatureReleaseSandbox: true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal

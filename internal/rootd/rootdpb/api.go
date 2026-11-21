@@ -39,7 +39,29 @@ const (
 	FeatureRemoveNetns          = "RemoveNetns"
 	FeatureDisableNetnsIPv6     = "DisableNetnsIPv6"
 	FeatureNetnsAddrs           = "NetnsAddrs"
+	FeatureSetNodeGuard         = "SetNodeGuard"
+	FeatureSetEgressFloor       = "SetEgressFloor"
+	FeatureSandboxRules         = "SandboxRules"
+	FeaturePrepareSandbox       = "PrepareSandbox"
+	FeatureReleaseSandbox       = "ReleaseSandbox"
 )
+
+// The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
+// A part joins a later release by name; a helper refuses a request that
+// lists a part, or sets a field, it does not know, and the agent sends a
+// part only when the handshake listed it, so a part is never skipped
+// without a word on either side of a version skew.
+const (
+	// PartNetns: the slot's namespace (realized by PrepareSandbox, removed
+	// by ReleaseSandbox).
+	PartNetns = "netns"
+	// PartFirewall: the create's host rules (PrepareSandbox), every rule
+	// for the address (ReleaseSandbox).
+	PartFirewall = "firewall"
+)
+
+// Parts lists every part name above.
+func Parts() []string { return []string{PartNetns, PartFirewall} }
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
 // handles, its own and the gate's. A failed call that carries it is the
@@ -52,7 +74,8 @@ const AnsweredTrailer = "aerolvm-rootd-answered"
 func Features() []string {
 	return []string{FeatureEnsureHost, FeatureEnsureHostFiles, FeatureEnsureTaskFIFOs,
 		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles,
-		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs}
+		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs,
+		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

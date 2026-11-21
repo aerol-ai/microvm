@@ -117,6 +117,10 @@ type Options struct {
 	// (openNetwork); with no Config.Network either, the helper serves no
 	// network call.
 	Network NetworkHost
+	// Firewall does the firewall calls' kernel work. Nil: the helper's
+	// own, opened on the first firewall call (openFirewall). The firewall
+	// needs the network: with none, the helper serves no firewall call.
+	Firewall FirewallHost
 }
 
 // Server is the helper's socket and gRPC server.
@@ -133,6 +137,7 @@ type Server struct {
 	// net serves the network calls and the gate's namespace check; nil
 	// with no network configuration.
 	net *network
+	fw  *firewall
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -188,7 +193,9 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.srv = grpc.NewServer(sopts...)
 	locks := &keyedLocks{}
 	s.net = newNetwork(cfg, opts.Network, locks)
-	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks, net: s.net})
+	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
+	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
+		net: s.net, fw: s.fw})
 	return s, nil
 }
 
@@ -278,6 +285,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		// waits, in both cases above, for GracefulStop, which returns only
 		// after every handler has.
 		s.files.close()
+		s.fw.close()
 	})
 }
 
@@ -382,8 +390,10 @@ type helper struct {
 	onRefusal RefusalFunc
 	locks     *keyedLocks
 	// net serves the network calls; nil when this helper has no network
-	// configuration (tests), and then it lists none of them.
+	// configuration (tests), and then it lists none of them. fw serves the
+	// firewall calls and PrepareSandbox and ReleaseSandbox; nil with net.
 	net *network
+	fw  *firewall
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -393,14 +403,62 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.net != nil {
 		served = append(served, networkFeatures...)
 	}
-	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served}, nil
+	if h.fw != nil {
+		served = append(served, firewallFeatures...)
+		served = append(served, rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
+	}
+	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.fw.servedParts()}, nil
 }
 
 // containerKey is the per-object lock key of a container's files (D11).
 func containerKey(id string) string { return "container/" + id }
 
-func (helper) EnsureHost(context.Context, *rootdpb.EnsureHostRequest) (*rootdpb.EnsureHostResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "root helper %s: EnsureHost is not built yet", version.Version)
+func (h helper) EnsureHost(ctx context.Context, _ *rootdpb.EnsureHostRequest) (*rootdpb.EnsureHostResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeatureEnsureHost)
+	}
+	resp, err := h.fw.ensureHost(ctx)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureHost_FullMethodName, resp, err)
+}
+
+func (h helper) SetNodeGuard(ctx context.Context, req *rootdpb.SetNodeGuardRequest) (*rootdpb.SetNodeGuardResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeatureSetNodeGuard)
+	}
+	resp, err := h.fw.setNodeGuard(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SetNodeGuard_FullMethodName, resp, err)
+}
+
+func (h helper) SetEgressFloor(ctx context.Context, req *rootdpb.SetEgressFloorRequest) (*rootdpb.SetEgressFloorResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeatureSetEgressFloor)
+	}
+	resp, err := h.fw.setFloor(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SetEgressFloor_FullMethodName, resp, err)
+}
+
+func (h helper) SandboxRules(ctx context.Context, req *rootdpb.SandboxRulesRequest) (*rootdpb.SandboxRulesResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeatureSandboxRules)
+	}
+	resp, err := h.fw.sandboxRules(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SandboxRules_FullMethodName, resp, err)
+}
+
+func (h helper) PrepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeaturePrepareSandbox)
+	}
+	resp, err := h.fw.prepare(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_PrepareSandbox_FullMethodName, resp, err)
+}
+
+func (h helper) ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) (*rootdpb.ReleaseSandboxResponse, error) {
+	if h.fw == nil {
+		return nil, noNetwork(rootdpb.FeatureReleaseSandbox)
+	}
+	resp, err := h.fw.release(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_ReleaseSandbox_FullMethodName, resp, err)
 }
 
 func (h helper) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {

@@ -116,6 +116,12 @@ type NetworkHost interface {
 	Remove(ctx context.Context, name, path, ip string) error
 	// DisableIPv6 turns IPv6 off inside the namespace at path.
 	DisableIPv6(path string) error
+	// Bridge is the Linux bridge the CNI config attaches sandboxes to.
+	Bridge() string
+	// Leaseholder is the slot (netns name, the CNI container id) the
+	// helper's CNI leased ip to, from the IPAM plugin's own record; ok is
+	// false when nobody holds it.
+	Leaseholder(ip netip.Addr) (name string, ok bool, err error)
 }
 
 // network serves the network calls. Its host is opened on the first call,
@@ -296,6 +302,12 @@ func (n *network) realize(ctx context.Context, req *rootdpb.RealizeNetnsRequest)
 		return nil, err
 	}
 	defer unlock()
+	return n.realizeLocked(ctx, h, name, path)
+}
+
+// realizeLocked is realize for a caller that holds a turn and name's lock
+// and has checked the name (PrepareSandbox too).
+func (n *network) realizeLocked(ctx context.Context, h NetworkHost, name, path string) (*rootdpb.RealizeNetnsResponse, error) {
 	st, err := inspect(h, name, path)
 	if err != nil {
 		return nil, err

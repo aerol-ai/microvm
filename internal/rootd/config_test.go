@@ -74,7 +74,8 @@ func TestConfigFromEnv(t *testing.T) {
 			AgentReady: "/run/sandboxd/docker/ready",
 		},
 		// sandboxd's own CNI settings, read under the same names.
-		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
+		Network:  NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
+		Firewall: FirewallConfig{Backend: "netlink"},
 	}
 	for _, tc := range []struct {
 		name string
@@ -120,6 +121,9 @@ func TestConfigFromEnv(t *testing.T) {
 			"SB_CONTAINERD_BRIDGE_SUBNET":  " 10.200.0.0/16 ",
 		}, func(c *Config) {
 			c.Network = NetworkConfig{PluginDir: "/usr/lib/cni", ConfPath: "/etc/aerolvm/cni/sandboxes.conflist", Subnet: "10.200.0.0/16"}
+		}},
+		{"firewall", map[string]string{"SB_NETRULES_BACKEND": " IPTables ", "SB_SANDBOX_INTERCONNECT": "true"}, func(c *Config) {
+			c.Firewall = FirewallConfig{Backend: "iptables", Interconnect: true}
 		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
@@ -202,6 +206,8 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"privileged in enterprise mode", map[string]string{"SB_CONTAINER_PRIVILEGED": "1", "SB_ENTERPRISE_MODE": "true"}, nil, "SB_ENTERPRISE_MODE"},
 		{"a bool that does not parse", map[string]string{"SB_CONTAINER_PRIVILEGED": "yes please"}, nil, "SB_CONTAINER_PRIVILEGED"},
 		{"enterprise that does not parse", map[string]string{"SB_ENTERPRISE_MODE": "maybe"}, nil, "SB_ENTERPRISE_MODE"},
+		{"interconnect that does not parse", map[string]string{"SB_SANDBOX_INTERCONNECT": "sometimes"}, nil, "SB_SANDBOX_INTERCONNECT"},
+		{"interconnect in enterprise mode", map[string]string{"SB_SANDBOX_INTERCONNECT": "true", "SB_ENTERPRISE_MODE": "true"}, nil, "SB_SANDBOX_INTERCONNECT"},
 		{"memory that does not parse", map[string]string{"SB_HOST_MEMORY_MB": "lots"}, nil, "SB_HOST_MEMORY_MB"},
 		{"cpus that do not parse", map[string]string{"SB_HOST_CPU_CORES": "1.5"}, nil, "SB_HOST_CPU_CORES"},
 		{"pids that do not parse", map[string]string{"SB_SANDBOX_PIDS_LIMIT": "x"}, nil, "SB_SANDBOX_PIDS_LIMIT"},
