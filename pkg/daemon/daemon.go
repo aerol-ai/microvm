@@ -1106,7 +1106,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// dockerd path passes nil and NewServer falls back to the docker client.
 	var apiBuilder *cntr.ImageBuilder
 	if ctdWiring != nil {
-		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger))
+		build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
+		// Logs, here at start, what would otherwise fail every build later,
+		// and clears build folders a previous run left (in the background).
+		_ = build.CheckContextUnpacker()
+		_ = build.SweepBuildDirs()
+		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, build)
 	}
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
