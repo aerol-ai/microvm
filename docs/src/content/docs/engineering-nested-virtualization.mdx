@@ -87,7 +87,7 @@ A server with nested virtualization on works the other way round: it re-saves an
 
 ## What changes for you
 
-**If you run code in sandboxes:** nothing, unless that code starts VMs. If it does, it now behaves as on a computer with no virtualization support: an emulator falls back to slow software mode, or stops with an error that hardware acceleration is missing.
+**If you run code in sandboxes:** nothing, unless that code starts VMs. If it does, it now behaves as on a computer with no virtualization support: an emulator falls back to slow software mode, or stops with an error that hardware acceleration is missing. A VM inside a sandbox also needs a sandbox kernel built with KVM support, whatever this setting says.
 
 **If you run AerolVM servers:**
 
@@ -96,11 +96,11 @@ A server with nested virtualization on works the other way round: it re-saves an
 - If you use the warm pool (sandboxes booted ahead of time), it skips a template until its new save is done, so sandboxes from that template start slower until then. We have not measured by how much.
 - If a save fails, the log says `template snapshot not saved again`, and the server tries again at its next start. Until then, new sandboxes from that template can still start inner VMs. Only the log shows this.
 - Sandboxes that existed at upgrade time, and sandboxes started from a template before it was saved again, keep their CPU until you delete and recreate them. Each time one starts again after a stop, the log names it and `aerolvm_firecracker_nested_virt_kept_starts_total` counts it. AerolVM does not list the ones that never stop; the check in [Check it from your code](#check-it-from-your-code) finds them one at a time.
-- We have tested all of this against a stand-in for Firecracker, not yet on Intel and AMD hardware. Run that check on your own servers after the upgrade.
+- We checked the CPU config and the setting on an Intel bare-metal server (AWS c5.metal): `VMX = false` by default, `VMX = true` with the setting on. We have not run it on AMD hardware yet. Run that check on your own servers after the upgrade.
 
 ## Turning it back on
 
-If your sandboxes need to run VMs, add this line to the server's environment file (`/etc/sandboxd/sandboxd.env` on a server set up with `install.sh`) and restart `sandboxd`:
+If your sandboxes need to run VMs, and their kernel is built with KVM support, add this line to the server's environment file (`/etc/sandboxd/sandboxd.env` on a server set up with `install.sh`) and restart `sandboxd`:
 
 ```bash
 SB_FIRECRACKER_NESTED_VIRT=true
@@ -119,7 +119,7 @@ options kvm_amd nested=0
 
 ## Check it from your code
 
-Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virtualization hidden, neither `vmx` nor `svm` appears there, so this prints `0`:
+Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested virtualization hidden, it reports the feature as `false`. On Intel, the VMX line is in leaf 1; on AMD, look for `SVM: secure virtual machine` in leaf `0x80000001` instead. The example installs the tool, so it needs an x86 server and a Debian or Ubuntu image that can reach its package mirror:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -129,8 +129,8 @@ Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virt
     const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
     const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "firecracker" });
-    const result = await sandbox.exec("grep -cwE 'vmx|svm' /proc/cpuinfo || true");
-    console.log(result.stdout); // 0: the sandbox cannot start a VM
+    const result = await sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
+    console.log(result.stdout); // VMX: virtual machine extensions = false
 
     await sandbox.destroy();
     ```
@@ -142,8 +142,8 @@ Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virt
     client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
 
     sandbox = client.create(image="ubuntu:22.04", runtime="firecracker")
-    result = sandbox.exec("grep -cwE 'vmx|svm' /proc/cpuinfo || true")
-    print(result["stdout"])  # 0: the sandbox cannot start a VM
+    result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
+    print(result["stdout"])  # VMX: virtual machine extensions = false
 
     sandbox.destroy()
     ```
@@ -164,11 +164,11 @@ Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virt
     }
     defer sandbox.Destroy(ctx)
 
-    result, err := sandbox.ExecCommand(ctx, "grep -cwE 'vmx|svm' /proc/cpuinfo || true")
+    result, err := sandbox.ExecCommand(ctx, "apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Print(result.Stdout) // 0: the sandbox cannot start a VM
+    fmt.Print(result.Stdout) // VMX: virtual machine extensions = false
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -182,8 +182,8 @@ Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virt
         runtime: Some("firecracker".into()),
         ..Default::default()
     })?;
-    let result = sandbox.exec("grep -cwE 'vmx|svm' /proc/cpuinfo || true")?;
-    print!("{}", result.stdout); // 0: the sandbox cannot start a VM
+    let result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")?;
+    print!("{}", result.stdout); // VMX: virtual machine extensions = false
 
     sandbox.destroy()?;
     ```
@@ -195,15 +195,17 @@ Code in a sandbox can read its own CPU menu in `/proc/cpuinfo`. With nested virt
     Sandbox sandbox = client.create(
         new CreateOptions().setImage("ubuntu:22.04").setRuntime("firecracker")
     );
-    ExecResult result = sandbox.exec("grep -cwE 'vmx|svm' /proc/cpuinfo || true");
-    System.out.print(result.stdout); // 0: the sandbox cannot start a VM
+    ExecResult result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
+    System.out.print(result.stdout); // VMX: virtual machine extensions = false
 
     sandbox.destroy();
     ```
   </TabItem>
 </Tabs>
 
-On a server with `SB_FIRECRACKER_NESTED_VIRT=true` and a kernel that allows nested virtualization, the same code prints a number above 0. Run it against a sandbox from before the upgrade to see whether it still has the feature.
+On an Intel server with `SB_FIRECRACKER_NESTED_VIRT=true` and a kernel that allows nested virtualization, the same code prints `= true`. On AMD the VMX line always says `false`; check the SVM line instead (we have not tested this on AMD yet). Run it against a sandbox from before the upgrade to see whether it still has the feature.
+
+Don't use `/proc/cpuinfo` for this. On the Intel server we tested, a sandbox kernel built without KVM support left `vmx` out of it even when the CPU offered the feature, so it read the same both ways.
 
 ## Tests that keep it this way
 
