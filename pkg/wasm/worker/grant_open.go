@@ -115,7 +115,7 @@ func walkOpen(path string, p GrantPolicy, strict bool) (*os.File, error) {
 		} else {
 			flags |= unix.O_DIRECTORY
 		}
-		next, err := unix.Openat(fd, part, flags, 0)
+		next, err := openatRetry(fd, part, flags)
 		_ = unix.Close(fd)
 		if err != nil {
 			return nil, &os.PathError{Op: "open", Path: name, Err: err}
@@ -182,4 +182,16 @@ const posixACLAccess = "system.posix_acl_access"
 var hasAccessACL = func(fd int) bool {
 	n, err := unix.Fgetxattr(fd, posixACLAccess, nil)
 	return err == nil && n > 0
+}
+
+// openatRetry is openat, tried again when a signal interrupts it (the Go
+// runtime's own preemption signal can, while an open waits on a slow
+// mount), as os.Open does. The caller's timeout still bounds the wait.
+func openatRetry(dirfd int, name string, flags int) (int, error) {
+	for {
+		fd, err := unix.Openat(dirfd, name, flags, 0)
+		if err != unix.EINTR {
+			return fd, err
+		}
+	}
 }
