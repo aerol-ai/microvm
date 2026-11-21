@@ -288,7 +288,10 @@ type Service struct {
 	// templateRebuildWG tracks in-flight snapshot rebuilds so their filesystem
 	// work can be joined before the templates directory is torn down.
 	templateRebuildWG sync.WaitGroup
-	testAuditFetcher  cluster.AuditPeerFetcher
+	// templateSnapshotLocks holds a *sync.Mutex per template id, taken
+	// around each VM that saves a template's snapshot (lockTemplateSnapshot).
+	templateSnapshotLocks sync.Map
+	testAuditFetcher      cluster.AuditPeerFetcher
 	// nodeRetirements caches the operator storage-destruction attestations
 	// consulted by the delete-outbox pass. See node_storage_retirement.go.
 	nodeRetirementMu sync.Mutex

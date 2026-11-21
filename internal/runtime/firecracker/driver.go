@@ -155,6 +155,12 @@ type Driver struct {
 	clients  map[string]VMMClient // sandbox-id -> API client
 	vmms     map[string]VMMHandle // sandbox-id -> VMM handle (for Destroy)
 	guestCID map[string]uint32    // sandbox-id -> CID baked into the running guest
+	// nestedVirt is each running VM's nested-virtualization record, what
+	// its stop snapshot saves (nested_virt.go).
+	nestedVirt map[string]firecracker.NestedVirt
+	// staleTemplates holds the ids of templates already logged as saved
+	// under the other nested-virtualization setting (noteStaleTemplate).
+	staleTemplates sync.Map
 	// frozenAdopted is every VM adopted while the ownership lease had it
 	// frozen: its adoption steps that need the VM to answer (resuming a
 	// paused VM, thawing the guest's disk) run once it is thawed
@@ -282,6 +288,10 @@ type Config struct {
 	// binary so templates built from stock OCI images can be snapshotted
 	// after the same toolbox readiness handshake.
 	ToolboxBinaryPath string
+	// NestedVirt lets guests see the CPU's virtualization extensions.
+	// Off, every VM this node boots hides them (nested_virt.go). Mirrors
+	// internal/config.Config.FirecrackerNestedVirt.
+	NestedVirt bool
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -307,6 +317,7 @@ func FromDaemonConfig(c config.Config) Config {
 		PostResumeTimeout:    c.FirecrackerSnapshotPostResumeTimeout,
 		ToolboxBinaryPath:    c.ToolboxBinaryPath,
 		VMMCgroupParent:      c.HostProcessCgroupParent,
+		NestedVirt:           c.FirecrackerNestedVirt,
 	}
 }
 
@@ -328,6 +339,7 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		vmms:     make(map[string]VMMHandle),
 		guestCID: make(map[string]uint32),
 
+		nestedVirt:    make(map[string]firecracker.NestedVirt),
 		frozenAdopted: make(map[string]frozenAdoption),
 	}
 	// Default spawn function wires the real vmm. Tests overwrite via
@@ -450,6 +462,10 @@ type TemplateResolution struct {
 	// error rather than failing mid-PATCH — Firecracker cannot add a
 	// virtio-blk device post-load, only PATCH an existing one's path.
 	HasOverlay bool
+	// SnapshotNestedVirt is the SB_FIRECRACKER_NESTED_VIRT setting the
+	// snapshot's VM booted under, which each clone inherits
+	// (nested_virt.go).
+	SnapshotNestedVirt firecracker.NestedVirt
 }
 
 // methodNotImplemented produces the canonical "not yet implemented" error
@@ -588,6 +604,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
 		}
+		d.noteStaleTemplate(earlySnap)
 	}
 	warmStart := time.Now()
 	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
@@ -983,7 +1000,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// half-built state (the deferred closures run on panic).
 	released = true
 	tapRemoved = false // sandbox-owned now; Destroy will remove
-	d.register(allocID, client, handle, handshakeCID, true)
+	// A cold boot got this node's setting (configureVMM); a clone has the
+	// CPU its template was saved with.
+	vmNestedVirt := d.hostNestedVirt()
+	if snapshotLoadPath {
+		vmNestedVirt = snapshotInfo.SnapshotNestedVirt
+	}
+	d.register(allocID, client, handle, handshakeCID, true, vmNestedVirt)
 
 	return &models.SandboxRuntimeState{
 		SandboxID: allocID,
@@ -1017,6 +1040,9 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 		TrackDirtyPages: true,
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutMachineConfig: %w", err)
+	}
+	if err := d.configureGuestCPU(ctx, client); err != nil {
+		return fmt.Errorf("firecracker runtime: %w", err)
 	}
 	// In jailer mode firecracker is chrooted into the runDir, so every file
 	// path handed to its API must be chroot-relative and the file must live

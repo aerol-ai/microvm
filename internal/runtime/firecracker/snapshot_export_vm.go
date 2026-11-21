@@ -253,6 +253,10 @@ func (d *Driver) configureExportHelper(ctx context.Context, client VMMClient, ru
 	if err := client.PutMachineConfig(ctx, firecracker.MachineConfig{VcpuCount: 1, MemSizeMib: exportHelperMemMiB}); err != nil {
 		return fmt.Errorf("export VM: machine config: %w", err)
 	}
+	// The helper reads a sandbox's disk, which the user wrote.
+	if err := d.configureGuestCPU(ctx, client); err != nil {
+		return fmt.Errorf("export VM: %w", err)
+	}
 	kernel, err := d.chrootFilePath(runDir, d.cfg.KernelImage, kernelFileName)
 	if err != nil {
 		return fmt.Errorf("export VM: stage kernel: %w", err)

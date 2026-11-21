@@ -320,7 +320,9 @@ func (d *Driver) tryAcquireWarm(
 	// to follow the sandbox. The pid is unchanged — same firecracker
 	// process. The run dir stays the pool's.
 	d.rssUnregister(slot.ID)
-	d.register(sandboxID, client, wrapped, slot.VsockCID, false)
+	// The pool warms only templates whose record matches this node (the
+	// daemon's template lister), so the VM booted with this node's setting.
+	d.register(sandboxID, client, wrapped, slot.VsockCID, false, d.hostNestedVirt())
 
 	committed = true
 	// A create served by a paused VMM from the pool is warm (O1).

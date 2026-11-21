@@ -96,6 +96,10 @@ type TemplateSnapshotResult struct {
 	MemorySizeBytes int64
 	StateSizeBytes  int64
 	Checksum        string
+	// NestedVirt is the SB_FIRECRACKER_NESTED_VIRT setting the snapshot's
+	// VM booted under (pkg/firecracker.NestedVirt), recorded on the row
+	// with the checksum.
+	NestedVirt string
 }
 
 // TemplateSnapshotter is the seam the template service uses to capture
@@ -327,6 +331,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		if uerr := s.setTemplateStatus(ctx, id, models.TemplateStatusSnapshotting, rootfsOut, "", rootfsSizeBytes); uerr != nil {
 			s.logger.Warn("template build: status update to snapshotting failed", "template_id", id, "error", uerr)
 		}
+		unlockSnapshot := s.lockTemplateSnapshot(id)
 		snap, snapErr := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
 			TemplateID:    id,
 			RootfsPath:    rootfsOut,
@@ -336,6 +341,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			MemoryMB:      s.cfg.FirecrackerTemplateMemoryMB,
 			VCPU:          s.cfg.FirecrackerTemplateVCPU,
 		})
+		unlockSnapshot()
 		if snapErr != nil {
 			// Snapshot phase failed but rootfs is fine. Release the CID
 			// so the next snapshot attempt (after a manual recovery)
@@ -366,7 +372,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 		// the placeholder logic keep has_overlay=0 via the column
 		// default, and the runtime rejects an overlay request against
 		// them with a clear "rebuild template" error.
-		if uerr := s.store.UpdateTemplateSnapshotReady(ctx, id, memOut, stateOut, snapshotSize, snap.Checksum, cid, true); uerr != nil {
+		if uerr := s.store.UpdateTemplateSnapshotReady(ctx, id, memOut, stateOut, snapshotSize, snap.Checksum, cid, true, snap.NestedVirt); uerr != nil {
 			s.logger.Warn("template build: snapshot ready update failed", "template_id", id, "error", uerr)
 			// Don't try to roll back — the on-disk artifacts are valid,
 			// the row is just stale. Operators can re-trigger the build.
@@ -389,6 +395,7 @@ func (s *Service) kickTemplateBuild(template *models.Template) {
 			SourceImage:      template.Image,
 			SnapshotChecksum: snap.Checksum,
 			VsockCID:         cid,
+			NestedVirt:       snap.NestedVirt,
 			CreatedAt:        time.Now().UTC(),
 		}); mErr != nil {
 			s.logger.Warn("template build: manifest write failed", "template_id", id, "error", mErr)
@@ -405,6 +412,7 @@ type templateManifest struct {
 	SourceImage      string    `json:"source_image"`
 	SnapshotChecksum string    `json:"snapshot_checksum"`
 	VsockCID         uint32    `json:"vsock_cid"`
+	NestedVirt       string    `json:"nested_virt,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
