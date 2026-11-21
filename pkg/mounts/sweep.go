@@ -59,41 +59,11 @@ func killFUSEProcessesInRoot(logger *slog.Logger, dir, procRoot string) {
 	}
 }
 
-// unmountTree walks dir and umount(s) every directory that appears to be a
-// mountpoint (its st_dev differs from its parent's). Lazy umount as a fallback.
+// unmountTree umounts every mount point at or under dir (mountPointsUnder),
+// deepest first, with a lazy umount as the fallback. It does not walk into
+// a mount: that would list the storage itself.
 func unmountTree(logger *slog.Logger, dir string) {
-	parent := filepath.Dir(dir)
-	parentDev := pathDevOf(parent)
-
-	// Unmount deepest paths first so parents become unmountable.
-	type entry struct {
-		path string
-		dev  uint64
-	}
-	var found []entry
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		dev := pathDevOf(path)
-		if dev != 0 && dev != parentDev {
-			found = append(found, entry{path: path, dev: dev})
-		}
-		return nil
-	})
-
-	for i := len(found) - 1; i >= 0; i-- {
-		path := found[i].path
-		if err := sweepUmount(path); err == nil {
-			continue
-		}
-		if err := sweepLazyUmount(path); err != nil {
-			logger.Warn("mounts sweep: umount failed", "path", path, "error", err)
-		}
-	}
+	unmountPoints(logger, mountPointsUnder(dir))
 }
 
 var (
