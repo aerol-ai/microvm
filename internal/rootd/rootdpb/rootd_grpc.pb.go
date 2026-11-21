@@ -43,6 +43,11 @@ const (
 	RootHelper_RemoveNetns_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/RemoveNetns"
 	RootHelper_DisableNetnsIPv6_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/DisableNetnsIPv6"
 	RootHelper_NetnsAddrs_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/NetnsAddrs"
+	RootHelper_SetNodeGuard_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/SetNodeGuard"
+	RootHelper_SetEgressFloor_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/SetEgressFloor"
+	RootHelper_SandboxRules_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/SandboxRules"
+	RootHelper_PrepareSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/PrepareSandbox"
+	RootHelper_ReleaseSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/ReleaseSandbox"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -52,10 +57,12 @@ type RootHelperClient interface {
 	// Version says which helper this is and what it serves. Every helper
 	// serves it, so it is the agent's handshake.
 	Version(ctx context.Context, in *VersionRequest, opts ...grpc.CallOption) (*VersionResponse, error)
-	// EnsureHost makes sure the host is set up for sandboxes: sysctls,
-	// br_netfilter, the base firewall tables, node guard, floor and IPv6
-	// fence. Not built yet: the helper answers Unimplemented and leaves it
-	// out of Version's features.
+	// EnsureHost makes sure the host's firewall is set up for sandboxes:
+	// bridged traffic through netfilter, the sandboxes' rule chain and its
+	// block sets, and the IPv6 fence on the sandboxes' bridge, all from the
+	// helper's own settings. It starts the helper's own timer that puts them,
+	// and the node guard and floor, back if something takes them away, and
+	// answers whether the IPv6 fence covers the sandboxes now.
 	EnsureHost(ctx context.Context, in *EnsureHostRequest, opts ...grpc.CallOption) (*EnsureHostResponse, error)
 	// EnsureHostFiles makes sure a container's hostname, hosts and
 	// resolv.conf files (and the egress CA, when asked) exist with this
@@ -94,6 +101,23 @@ type RootHelperClient interface {
 	// NetnsAddrs says whether a namespace exists and lists its IPv4
 	// addresses, loopback aside: the address a task started there has.
 	NetnsAddrs(ctx context.Context, in *NetnsAddrsRequest, opts ...grpc.CallOption) (*NetnsAddrsResponse, error)
+	// SetNodeGuard makes sure the node guard (the node closed to the
+	// sandboxes' range) holds, with these ports open, and puts it back if
+	// something took it away.
+	SetNodeGuard(ctx context.Context, in *SetNodeGuardRequest, opts ...grpc.CallOption) (*SetNodeGuardResponse, error)
+	// SetEgressFloor makes sure the node-wide deny floor holds these
+	// networks, plus the cloud metadata endpoints the helper always adds.
+	SetEgressFloor(ctx context.Context, in *SetEgressFloorRequest, opts ...grpc.CallOption) (*SetEgressFloorResponse, error)
+	// SandboxRules changes one sandbox address's rules.
+	SandboxRules(ctx context.Context, in *SandboxRulesRequest, opts ...grpc.CallOption) (*SandboxRulesResponse, error)
+	// PrepareSandbox does a create's root work in one call: each part the
+	// request lists (see VersionResponse.parts). A helper refuses a request
+	// that carries a part, or a field, it does not know, so nothing is ever
+	// skipped without a word.
+	PrepareSandbox(ctx context.Context, in *PrepareSandboxRequest, opts ...grpc.CallOption) (*PrepareSandboxResponse, error)
+	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
+	// its namespace and attachment.
+	ReleaseSandbox(ctx context.Context, in *ReleaseSandboxRequest, opts ...grpc.CallOption) (*ReleaseSandboxResponse, error)
 }
 
 type rootHelperClient struct {
@@ -224,6 +248,56 @@ func (c *rootHelperClient) NetnsAddrs(ctx context.Context, in *NetnsAddrsRequest
 	return out, nil
 }
 
+func (c *rootHelperClient) SetNodeGuard(ctx context.Context, in *SetNodeGuardRequest, opts ...grpc.CallOption) (*SetNodeGuardResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetNodeGuardResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SetNodeGuard_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SetEgressFloor(ctx context.Context, in *SetEgressFloorRequest, opts ...grpc.CallOption) (*SetEgressFloorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetEgressFloorResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SetEgressFloor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SandboxRules(ctx context.Context, in *SandboxRulesRequest, opts ...grpc.CallOption) (*SandboxRulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxRulesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SandboxRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) PrepareSandbox(ctx context.Context, in *PrepareSandboxRequest, opts ...grpc.CallOption) (*PrepareSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareSandboxResponse)
+	err := c.cc.Invoke(ctx, RootHelper_PrepareSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) ReleaseSandbox(ctx context.Context, in *ReleaseSandboxRequest, opts ...grpc.CallOption) (*ReleaseSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseSandboxResponse)
+	err := c.cc.Invoke(ctx, RootHelper_ReleaseSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -231,10 +305,12 @@ type RootHelperServer interface {
 	// Version says which helper this is and what it serves. Every helper
 	// serves it, so it is the agent's handshake.
 	Version(context.Context, *VersionRequest) (*VersionResponse, error)
-	// EnsureHost makes sure the host is set up for sandboxes: sysctls,
-	// br_netfilter, the base firewall tables, node guard, floor and IPv6
-	// fence. Not built yet: the helper answers Unimplemented and leaves it
-	// out of Version's features.
+	// EnsureHost makes sure the host's firewall is set up for sandboxes:
+	// bridged traffic through netfilter, the sandboxes' rule chain and its
+	// block sets, and the IPv6 fence on the sandboxes' bridge, all from the
+	// helper's own settings. It starts the helper's own timer that puts them,
+	// and the node guard and floor, back if something takes them away, and
+	// answers whether the IPv6 fence covers the sandboxes now.
 	EnsureHost(context.Context, *EnsureHostRequest) (*EnsureHostResponse, error)
 	// EnsureHostFiles makes sure a container's hostname, hosts and
 	// resolv.conf files (and the egress CA, when asked) exist with this
@@ -273,6 +349,23 @@ type RootHelperServer interface {
 	// NetnsAddrs says whether a namespace exists and lists its IPv4
 	// addresses, loopback aside: the address a task started there has.
 	NetnsAddrs(context.Context, *NetnsAddrsRequest) (*NetnsAddrsResponse, error)
+	// SetNodeGuard makes sure the node guard (the node closed to the
+	// sandboxes' range) holds, with these ports open, and puts it back if
+	// something took it away.
+	SetNodeGuard(context.Context, *SetNodeGuardRequest) (*SetNodeGuardResponse, error)
+	// SetEgressFloor makes sure the node-wide deny floor holds these
+	// networks, plus the cloud metadata endpoints the helper always adds.
+	SetEgressFloor(context.Context, *SetEgressFloorRequest) (*SetEgressFloorResponse, error)
+	// SandboxRules changes one sandbox address's rules.
+	SandboxRules(context.Context, *SandboxRulesRequest) (*SandboxRulesResponse, error)
+	// PrepareSandbox does a create's root work in one call: each part the
+	// request lists (see VersionResponse.parts). A helper refuses a request
+	// that carries a part, or a field, it does not know, so nothing is ever
+	// skipped without a word.
+	PrepareSandbox(context.Context, *PrepareSandboxRequest) (*PrepareSandboxResponse, error)
+	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
+	// its namespace and attachment.
+	ReleaseSandbox(context.Context, *ReleaseSandboxRequest) (*ReleaseSandboxResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -318,6 +411,21 @@ func (UnimplementedRootHelperServer) DisableNetnsIPv6(context.Context, *DisableN
 }
 func (UnimplementedRootHelperServer) NetnsAddrs(context.Context, *NetnsAddrsRequest) (*NetnsAddrsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NetnsAddrs not implemented")
+}
+func (UnimplementedRootHelperServer) SetNodeGuard(context.Context, *SetNodeGuardRequest) (*SetNodeGuardResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetNodeGuard not implemented")
+}
+func (UnimplementedRootHelperServer) SetEgressFloor(context.Context, *SetEgressFloorRequest) (*SetEgressFloorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetEgressFloor not implemented")
+}
+func (UnimplementedRootHelperServer) SandboxRules(context.Context, *SandboxRulesRequest) (*SandboxRulesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SandboxRules not implemented")
+}
+func (UnimplementedRootHelperServer) PrepareSandbox(context.Context, *PrepareSandboxRequest) (*PrepareSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareSandbox not implemented")
+}
+func (UnimplementedRootHelperServer) ReleaseSandbox(context.Context, *ReleaseSandboxRequest) (*ReleaseSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseSandbox not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -556,6 +664,96 @@ func _RootHelper_NetnsAddrs_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_SetNodeGuard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNodeGuardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SetNodeGuard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SetNodeGuard_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SetNodeGuard(ctx, req.(*SetNodeGuardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SetEgressFloor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetEgressFloorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SetEgressFloor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SetEgressFloor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SetEgressFloor(ctx, req.(*SetEgressFloorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SandboxRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SandboxRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SandboxRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SandboxRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SandboxRules(ctx, req.(*SandboxRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_PrepareSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).PrepareSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_PrepareSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).PrepareSandbox(ctx, req.(*PrepareSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_ReleaseSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).ReleaseSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_ReleaseSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).ReleaseSandbox(ctx, req.(*ReleaseSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -610,6 +808,26 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "NetnsAddrs",
 			Handler:    _RootHelper_NetnsAddrs_Handler,
+		},
+		{
+			MethodName: "SetNodeGuard",
+			Handler:    _RootHelper_SetNodeGuard_Handler,
+		},
+		{
+			MethodName: "SetEgressFloor",
+			Handler:    _RootHelper_SetEgressFloor_Handler,
+		},
+		{
+			MethodName: "SandboxRules",
+			Handler:    _RootHelper_SandboxRules_Handler,
+		},
+		{
+			MethodName: "PrepareSandbox",
+			Handler:    _RootHelper_PrepareSandbox_Handler,
+		},
+		{
+			MethodName: "ReleaseSandbox",
+			Handler:    _RootHelper_ReleaseSandbox_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

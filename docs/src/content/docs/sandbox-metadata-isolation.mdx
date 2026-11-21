@@ -117,6 +117,8 @@ The **deny floor** is a separate, small chain of drop rules. Its name is `AEROLV
 - the address ranges the operator always blocks (`deny_cidrs`);
 - every sandbox network on the server, unless the operator allows sandboxes to talk to each other. See [Between sandboxes](/engineering-network-defenses/#between-sandboxes).
 
+When the floor changes, the new floor is built in a second chain with the same name plus `-B` (and back again on the next change). Only then does the jump move to it, so a sandbox is never without a floor.
+
 The first rule of each runtime's chain is a jump to its floor. A **jump** sends the packet through another chain first. Every other rule goes below it: each sandbox's own allow and block rules, and the rules that let sandbox traffic out at all.
 
 ```mermaid

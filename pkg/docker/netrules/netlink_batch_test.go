@@ -30,6 +30,8 @@ type chainNFT struct {
 	getErr       error
 	flushErr     error
 	delErr       error
+	// afterFlush runs after each commit that landed, with f.mu held.
+	afterFlush func()
 }
 
 func newChainNFT() *chainNFT {
@@ -110,10 +112,20 @@ func (f *chainNFT) AddRule(r *nftables.Rule) *nftables.Rule {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queued = append(f.queued, func() error {
+		rules := f.chains[r.Chain.Name]
+		at := len(rules)
+		if r.Position != 0 {
+			// Added after the rule Position names, as nft does.
+			i := slices.IndexFunc(rules, func(x *nftables.Rule) bool { return x.Handle == r.Position })
+			if i < 0 {
+				return syscall.ENOENT
+			}
+			at = i + 1
+		}
 		f.next++
 		cp := *r
 		cp.Handle = f.next
-		f.chains[r.Chain.Name] = append(f.chains[r.Chain.Name], &cp)
+		f.chains[r.Chain.Name] = slices.Insert(rules, at, &cp)
 		return nil
 	})
 	return r
@@ -161,6 +173,9 @@ func (f *chainNFT) Flush() error {
 			f.chains, f.next = saved, next
 			return fmt.Errorf("conn.Receive: %w", err)
 		}
+	}
+	if f.afterFlush != nil {
+		f.afterFlush()
 	}
 	return nil
 }

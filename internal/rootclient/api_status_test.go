@@ -49,7 +49,7 @@ func sock(t *testing.T) string {
 // client is the agent's client with the test process standing in for root.
 func client(t *testing.T, sock string, timeout time.Duration) *rootclient.Client {
 	t.Helper()
-	c := rootclient.New(rootclient.Config{Socket: sock, Timeout: timeout, HelperUID: uint32(os.Getuid())})
+	c := rootclient.New(rootclient.Config{Socket: sock, Timeout: timeout, NetworkTimeout: timeout, HelperUID: uint32(os.Getuid())})
 	t.Cleanup(func() { _ = c.Close() })
 	return c
 }

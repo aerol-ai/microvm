@@ -83,7 +83,12 @@ func TestKernelFloor(t *testing.T) {
 	floor := []netip.Prefix{netip.MustParsePrefix("10.211.0.0/24")}
 	for _, backend := range []string{BackendNetlink, BackendExec} {
 		t.Run(backend, func(t *testing.T) {
-			_ = exec.Command("iptables", "-F", FloorChainFor(subnet)).Run()
+			// The last subtest's floor chains (both slots), so the baseline
+			// is open whichever slot it left in use.
+			for _, c := range []string{FloorChainFor(subnet), floorSlotB(FloorChainFor(subnet))} {
+				_ = exec.Command("iptables", "-D", ChainAerolvmUser, "-j", c).Run()
+				_ = exec.Command("iptables", "-F", c).Run()
+			}
 			mgr, err := NewWithOptions(true, backend, ChainAerolvmUser)
 			if err != nil {
 				t.Fatal(err)
@@ -100,14 +105,17 @@ func TestKernelFloor(t *testing.T) {
 			if canReach() {
 				t.Fatal("the floor must drop forwarded traffic from the sandbox subnet")
 			}
+			// The chain in use: a change fills the other slot and moves the
+			// jump, so damage aimed at the floor must aim at this one.
+			active := func() string { c, _ := mgr.floorChain.Load().(string); return c }
 			// Something takes the floor away (a host firewall reload): the
 			// re-assert puts it back, and a floor in place is left alone.
 			for _, damage := range []struct {
 				name string
 				do   func()
 			}{
-				{"chain and jump deleted", func() { deleteFloorChain(t, ChainAerolvmUser, FloorChainFor(subnet)) }},
-				{"chain flushed", func() { run(t, "iptables", "-F", FloorChainFor(subnet)) }},
+				{"chain and jump deleted", func() { deleteFloorChain(t, ChainAerolvmUser, active()) }},
+				{"chain flushed", func() { run(t, "iptables", "-F", active()) }},
 			} {
 				damage.do()
 				if !waitReach() {
@@ -123,15 +131,27 @@ func TestKernelFloor(t *testing.T) {
 					t.Fatalf("%s: a whole floor must not be rewritten: repaired=%v err=%v", damage.name, repaired, err)
 				}
 			}
+			// A change never opens the path: while the floor is replaced
+			// again and again (the new one built in the other slot, then the
+			// jump moved), no packet to the floored address gets past the
+			// filter table. A witness after it counts the ones that do.
+			floorChangeKeepsDropping(t, mgr, subnet, floor, sbxNS)
 			// Replacing is whole-chain: a second set with the same entry
 			// leaves the same two rules (the entry, and the subnet to itself
 			// while sandboxes are isolated from each other), not four.
 			if err := mgr.SetFloor(subnet, floor); err != nil {
 				t.Fatal(err)
 			}
-			out, _ := exec.Command("iptables", "-S", FloorChainFor(subnet)).CombinedOutput()
+			out, _ := exec.Command("iptables", "-S", active()).CombinedOutput()
 			if n := strings.Count(string(out), "-j DROP"); n != 2 {
 				t.Fatalf("floor rules after a repeat = %d:\n%s", n, out)
+			}
+			// One jump to a floor slot, first in the user chain: the old
+			// slot's jump went with the change.
+			user, _ := exec.Command("iptables", "-S", ChainAerolvmUser).CombinedOutput()
+			if n := strings.Count(string(user), "-j "+FloorChainFor(subnet)); n != 1 ||
+				!strings.HasPrefix(strings.Split(string(user), "\n")[1], "-A "+ChainAerolvmUser+" -j "+active()) {
+				t.Fatalf("user chain after a repeat (%d floor jumps):\n%s", n, user)
 			}
 			if err := mgr.SetFloor(subnet, nil); err != nil {
 				t.Fatal(err)
@@ -140,6 +160,53 @@ func TestKernelFloor(t *testing.T) {
 				t.Fatal("clearing the floor must restore forwarding")
 			}
 		})
+	}
+}
+
+// floorChangeKeepsDropping replaces subnet's floor in a loop (two lists
+// that both hold floor) while the sandbox knocks on 10.211.0.2, and fails
+// if a knock got past the filter table.
+func floorChangeKeepsDropping(t *testing.T, mgr *Manager, subnet netip.Prefix, floor []netip.Prefix, sbxNS string) {
+	t.Helper()
+	for _, cmd := range []string{"add table inet flwit", "add chain inet flwit wit { type filter hook forward priority 10 ; }",
+		"add rule inet flwit wit ip daddr 10.211.0.2 counter"} {
+		run(t, append([]string{"nft"}, strings.Fields(cmd)...)...)
+	}
+	defer func() { _ = exec.Command("nft", "delete", "table", "inet", "flwit").Run() }()
+	var lists [2][]netip.Prefix
+	for n := range lists {
+		lists[n] = append([]netip.Prefix(nil), floor...)
+		for i := range 256 {
+			lists[n] = append(lists[n], netip.PrefixFrom(netip.AddrFrom4([4]byte{byte(11 + n), byte(i), 0, 0}), 16))
+		}
+	}
+	stop, done := make(chan struct{}), make(chan int)
+	go func() {
+		n := 0
+		for {
+			select {
+			case <-stop:
+				done <- n
+				return
+			default:
+			}
+			if err := mgr.SetFloor(subnet, lists[n%2]); err != nil {
+				t.Errorf("floor change %d: %v", n, err)
+			}
+			n++
+		}
+	}()
+	_ = exec.Command("ip", "netns", "exec", sbxNS, "bash", "-c", fmt.Sprintf(
+		"end=$((SECONDS+3)); while [ $SECONDS -lt $end ]; do timeout 0.05 bash -c 'exec 3<>/dev/tcp/10.211.0.2/%s' 2>/dev/null; done", kSbxPort)).Run()
+	close(stop)
+	changes := <-done
+	out, _ := exec.Command("nft", "list", "chain", "inet", "flwit", "wit").CombinedOutput()
+	t.Logf("%d floor changes; witness: %s", changes, strings.Join(strings.Fields(string(out)), " "))
+	if changes < 2 || !strings.Contains(string(out), "counter packets 0 ") {
+		t.Fatalf("a floor change let traffic to a floored address through (%d changes):\n%s", changes, out)
+	}
+	if err := mgr.SetFloor(subnet, floor); err != nil {
+		t.Fatal(err)
 	}
 }
 

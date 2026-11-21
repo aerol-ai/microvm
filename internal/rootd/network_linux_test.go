@@ -892,3 +892,45 @@ func BenchmarkNetnsBound(b *testing.B) {
 		}
 	}
 }
+
+// TestLeaseFiles: the IPAM plugin's lease folder, read without rights. A
+// slot's address is found by its name; a file that is no address, or an
+// address outside the subnet, is passed over; a lease file others can
+// write is refused; no folder yet is no lease.
+func TestLeaseFiles(t *testing.T) {
+	dir := t.TempDir()
+	k := &kernelNetwork{leases: filepath.Join(dir, "none"), owner: uint32(os.Geteuid()), subnet: netip.MustParsePrefix("10.77.0.0/16")}
+	if _, ok, err := k.LeaseOf("sb-1"); ok || err != nil {
+		t.Fatalf("no folder: %v %v", ok, err)
+	}
+	if _, ok, err := k.Leaseholder(netip.MustParseAddr("10.77.0.5")); ok || err != nil {
+		t.Fatalf("no folder: %v %v", ok, err)
+	}
+	k.leases = dir
+	for name, body := range map[string]string{
+		"10.77.0.5":          "sb-a\r\neth0\n",
+		"10.77.0.6":          "sb-b\neth0\n",
+		"10.99.0.7":          "sb-c\neth0\n", // another subnet's
+		"last_reserved_ip.0": "10.77.0.6",
+		"lock":               "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, want := range map[string]string{"sb-a": "10.77.0.5", "sb-b": "10.77.0.6", "sb-c": "", "sb-none": ""} {
+		a, ok, err := k.LeaseOf(name)
+		if err != nil || ok != (want != "") || (ok && a.String() != want) {
+			t.Fatalf("LeaseOf(%s) = %v %v %v; want %q", name, a, ok, err, want)
+		}
+	}
+	if holder, ok, err := k.Leaseholder(netip.MustParseAddr("10.77.0.6")); holder != "sb-b" || !ok || err != nil {
+		t.Fatalf("Leaseholder = %q %v %v", holder, ok, err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "10.77.0.6"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := k.LeaseOf("sb-b"); err == nil {
+		t.Fatal("a lease file others can write was read")
+	}
+}

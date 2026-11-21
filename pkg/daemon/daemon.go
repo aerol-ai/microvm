@@ -223,14 +223,19 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// manager with the containerd driver, their cleanup/heal would read+write
 	// the wrong chain and leak stale DOCKER-USER rules. The containerd driver
 	// gets its own AEROLVM-USER manager in wireContainerEngine.
-	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainDockerUser)
+	//
+	// Privilege mode split runs no Docker sandboxes (checkPrivilegeMode),
+	// and sandboxd has no rights to change the kernel's rules: the root
+	// helper keeps the containerd firewall, and this manager stays off.
+	split := cfg.PrivilegeMode == privmode.Split
+	rules, err := netrules.NewWithOptions(cfg.EnableNetworkRules && !split, cfg.NetrulesBackend, netrules.ChainDockerUser)
 	if err != nil {
 		return fmt.Errorf("create netrules manager: %w", err)
 	}
 	if rules.Enabled() {
 		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
 	}
-	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled())
+	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled() || (split && cfg.EnableNetworkRules))
 	if prepareBlockSets(rules, netrules.ChainDockerUser, logger) {
 		defer startBlockSetReassert(ctx, rules, logger)()
 	}
@@ -812,7 +817,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
 	// the API serves, so no container or Firecracker sandbox is created
 	// without it; while it is not installed those creates are refused.
-	wireIPv6Fence(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
+	if ctdWiring != nil && ctdWiring.fence != nil {
+		// Privilege mode split: the helper keeps the fence on its bridge.
+		ctdWiring.fence.wire(ctx, svc, ipv6FenceTick)
+	} else {
+		wireIPv6Fence(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
+	}
 
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming

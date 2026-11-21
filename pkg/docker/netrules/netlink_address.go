@@ -5,6 +5,7 @@ package netrules
 import (
 	"errors"
 	"fmt"
+	"github.com/google/nftables"
 	"net"
 
 	"github.com/google/nftables/expr"
@@ -24,11 +25,7 @@ func (b *netlinkBackend) ClearAddressRules(chains []string, ip string) error {
 }
 
 func (b *netlinkBackend) clearAddressOnce(chains []string, ip string) error {
-	conn, err := b.newConn()
-	if err != nil {
-		return err
-	}
-	n := 0
+	var del []*nftables.Rule
 	for _, chain := range chains {
 		tbl, ch, err := lookupTableChain("filter", chain)
 		if err != nil {
@@ -46,26 +43,41 @@ func (b *netlinkBackend) clearAddressOnce(chains []string, ip string) error {
 			return fmt.Errorf("nft get %s rules: %w", chain, err)
 		}
 		for _, r := range rules {
-			if !ruleKeyedBy(r.Exprs, ip) {
-				continue
+			if ruleKeyedBy(r.Exprs, ip) {
+				del = append(del, r)
 			}
+		}
+	}
+	return b.deleteRules(del)
+}
+
+// deleteRules deletes rules in transactions of at most netlinkChunk rules
+// (one netlink message carries a few hundred; an address with a big
+// policy has more). A rule gone since it was listed is errBatchStale, for
+// the caller's retry from a fresh listing.
+func (b *netlinkBackend) deleteRules(rules []*nftables.Rule) error {
+	for start := 0; start < len(rules); start += netlinkChunk {
+		conn, err := b.newConn()
+		if err != nil {
+			return err
+		}
+		for _, r := range rules[start:min(start+netlinkChunk, len(rules))] {
 			if err := conn.DelRule(r); err != nil {
 				return fmt.Errorf("nft del rule: %w", err)
 			}
-			n++
 		}
-	}
-	if n == 0 {
-		return nil
-	}
-	if err := conn.Flush(); err != nil {
-		if isNetlinkNotExist(err) {
-			return fmt.Errorf("%w: nft flush del: %v", errBatchStale, err)
+		if err := conn.Flush(); err != nil {
+			if isNetlinkNotExist(err) {
+				return fmt.Errorf("%w: nft flush del: %v", errBatchStale, err)
+			}
+			return fmt.Errorf("nft flush del: %w", err)
 		}
-		return fmt.Errorf("nft flush del: %w", err)
 	}
 	return nil
 }
+
+// netlinkChunk is how many rule changes one transaction carries.
+const netlinkChunk = 128
 
 // ruleKeyedBy reports whether a rule is keyed by ip: its source is ip (a
 // /32), or it has no source and its destination is ip. A subnet source or

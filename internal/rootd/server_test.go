@@ -64,7 +64,17 @@ func testConfig(t testing.TB) Config {
 		SocketGID: os.Getgid(),
 		AgentUID:  uint32(os.Getuid()),
 		Policy:    testPolicy(),
+		// The helper's own node port list, as ConfigFromEnv's defaults.
+		Firewall: FirewallConfig{NodePorts: testNodePorts()},
 	}, dir)
+}
+
+func testNodePorts() []rootpolicy.NodePort {
+	p, err := nodePortsFromEnv(func(string) string { return "" }, false, false)
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // withFiles puts the helper's folders for the files it makes under base,
@@ -204,7 +214,8 @@ func TestVersion(t *testing.T) {
 	// EnsureHost is a placeholder, so it is never served; a helper with
 	// no network configuration (this rig) serves no network call either.
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
-		return f == rootdpb.FeatureEnsureHost || slices.Contains(networkFeatures, f)
+		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) ||
+			f == rootdpb.FeaturePrepareSandbox || f == rootdpb.FeatureReleaseSandbox
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -215,21 +226,30 @@ func TestVersion(t *testing.T) {
 	t.Run("with a network", func(t *testing.T) {
 		r := newRig(t, func(_ *Config, o *Options) { o.Network = newFakeNet() })
 		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
-		want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool { return f == rootdpb.FeatureEnsureHost })
-		if err != nil || !slices.Equal(resp.GetFeatures(), want) {
-			t.Fatalf("features %v (%v), want %v", resp.GetFeatures(), err, want)
+		served := []string{rootdpb.FeatureEnsureHostFiles, rootdpb.FeatureEnsureTaskFIFOs, rootdpb.FeatureEnsureRunscConfig,
+			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
+		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
+		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
+			t.Fatalf("features %v parts %v (%v), want %v and every part", resp.GetFeatures(), resp.GetParts(), err, served)
+		}
+		got := slices.Sorted(slices.Values(resp.GetFeatures()))
+		if all := slices.Sorted(slices.Values(rootdpb.Features())); !slices.Equal(got, all) {
+			t.Fatalf("a helper with a network serves %v, every call is %v", got, all)
 		}
 	})
 }
 
-func TestEnsureHostIsAPlaceholder(t *testing.T) {
+// TestEnsureHostNeedsANetwork: a helper with no network configuration
+// (only tests build one) serves no host firewall: Unimplemented, not a
+// refusal.
+func TestEnsureHostNeedsANetwork(t *testing.T) {
 	r := newRig(t, nil)
 	_, err := rootdpb.NewRootHelperClient(r.conn).EnsureHost(callCtx(t), &rootdpb.EnsureHostRequest{})
-	if status.Code(err) != codes.Unimplemented || !strings.Contains(err.Error(), "not built yet") {
+	if status.Code(err) != codes.Unimplemented || !strings.Contains(err.Error(), "CNI configuration") {
 		t.Fatalf("EnsureHost = %v, want Unimplemented", err)
 	}
 	if len(r.refused()) != 0 {
-		t.Fatal("a placeholder is not a refusal")
+		t.Fatal("a call this helper lacks is not a refusal")
 	}
 }
 

@@ -86,7 +86,9 @@ func TestAPIConstants(t *testing.T) {
 		RootHelper_EnsureRunscConfig_FullMethodName, RootHelper_EnsureReadySocket_FullMethodName,
 		RootHelper_RemoveContainerFiles_FullMethodName, RootHelper_EnsureHostNetwork_FullMethodName,
 		RootHelper_RealizeNetns_FullMethodName, RootHelper_RemoveNetns_FullMethodName,
-		RootHelper_DisableNetnsIPv6_FullMethodName, RootHelper_NetnsAddrs_FullMethodName} {
+		RootHelper_DisableNetnsIPv6_FullMethodName, RootHelper_NetnsAddrs_FullMethodName,
+		RootHelper_SetNodeGuard_FullMethodName, RootHelper_SetEgressFloor_FullMethodName, RootHelper_SandboxRules_FullMethodName,
+		RootHelper_PrepareSandbox_FullMethodName, RootHelper_ReleaseSandbox_FullMethodName} {
 		if !strings.HasPrefix(full, ServicePrefix) {
 			t.Errorf("%s is not under %s", full, ServicePrefix)
 		}
@@ -106,9 +108,9 @@ func TestAPIConstants(t *testing.T) {
 func TestWireIsAppendOnly(t *testing.T) {
 	want := map[protoreflect.FullName][]string{
 		"aerolvm.rootd.v1.VersionRequest":     {"agent_version=1:string", "agent_api=2:uint32"},
-		"aerolvm.rootd.v1.VersionResponse":    {"helper_version=1:string", "api=2:uint32", "features=3:repeated string"},
+		"aerolvm.rootd.v1.VersionResponse":    {"helper_version=1:string", "api=2:uint32", "features=3:repeated string", "parts=4:repeated string"},
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
-		"aerolvm.rootd.v1.EnsureHostResponse": nil,
+		"aerolvm.rootd.v1.EnsureHostResponse": {"ipv6_fence_error=1:string"},
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
 		"aerolvm.rootd.v1.HelperUnsupported":  {"reason=1:string"},
 		"aerolvm.rootd.v1.HelperRefused":      {"reason=1:string"},
@@ -134,6 +136,18 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.DisableNetnsIPv6Response":     nil,
 		"aerolvm.rootd.v1.NetnsAddrsRequest":            {"netns_name=1:string"},
 		"aerolvm.rootd.v1.NetnsAddrsResponse":           {"exists=1:bool", "ipv4=2:repeated string"},
+		"aerolvm.rootd.v1.NodePort":                     {"proto=1:string", "port=2:uint32", "dst=3:string"},
+		"aerolvm.rootd.v1.SetNodeGuardRequest":          {"allow=1:repeated message"},
+		"aerolvm.rootd.v1.SetNodeGuardResponse":         {"repaired=1:bool"},
+		"aerolvm.rootd.v1.SetEgressFloorRequest":        {"cidrs=1:repeated string"},
+		"aerolvm.rootd.v1.SetEgressFloorResponse":       {"repaired=1:bool"},
+		"aerolvm.rootd.v1.SandboxRulesRequest":          {"container_ip=1:string", "op=2:enum", "allow_cidrs=3:repeated string", "deny_cidrs=4:repeated string"},
+		"aerolvm.rootd.v1.SandboxRulesResponse":         {"inserted=1:bool"},
+		"aerolvm.rootd.v1.SandboxFirewall":              {"block_all_egress=1:bool", "allow_cidrs=2:repeated string", "deny_cidrs=3:repeated string"},
+		"aerolvm.rootd.v1.PrepareSandboxRequest":        {"netns_name=1:string", "parts=2:repeated string", "container_ip=3:string", "firewall=4:message"},
+		"aerolvm.rootd.v1.PrepareSandboxResponse":       {"netns_path=1:string", "container_ip=2:string", "block_inserted=3:bool"},
+		"aerolvm.rootd.v1.ReleaseSandboxRequest":        {"netns_name=1:string", "container_ip=2:string", "parts=3:repeated string"},
+		"aerolvm.rootd.v1.ReleaseSandboxResponse":       nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -159,6 +173,10 @@ func TestWireIsAppendOnly(t *testing.T) {
 	// Enum values are wire numbers too.
 	wantEnums := map[protoreflect.FullName][]string{
 		"aerolvm.rootd.v1.RunscConfig": {"RUNSC_CONFIG_UNSPECIFIED=0", "RUNSC_CONFIG_DEFAULT=1", "RUNSC_CONFIG_RESTORE=2"},
+		"aerolvm.rootd.v1.SandboxRulesOp": {"SANDBOX_RULES_OP_UNSPECIFIED=0", "SANDBOX_RULES_OP_BLOCK_EGRESS=1", "SANDBOX_RULES_OP_LIFT_BLOCK_EGRESS=2",
+			"SANDBOX_RULES_OP_CLEAR_BLOCK_EGRESS=3", "SANDBOX_RULES_OP_BLOCK_INGRESS=4", "SANDBOX_RULES_OP_CLEAR_BLOCK_INGRESS=5",
+			"SANDBOX_RULES_OP_APPLY_EGRESS_POLICY=6", "SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY=7", "SANDBOX_RULES_OP_HOLD_EGRESS=8",
+			"SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS=9"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {

@@ -75,6 +75,9 @@ func TestConfigFromEnv(t *testing.T) {
 		},
 		// sandboxd's own CNI settings, read under the same names.
 		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
+		Firewall: FirewallConfig{Backend: "netlink", NodePorts: []rootpolicy.NodePort{
+			{Proto: "udp", Port: 53054}, {Proto: "tcp", Port: 53054}, {Proto: "tcp", Port: 15080},
+			{Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -121,6 +124,9 @@ func TestConfigFromEnv(t *testing.T) {
 		}, func(c *Config) {
 			c.Network = NetworkConfig{PluginDir: "/usr/lib/cni", ConfPath: "/etc/aerolvm/cni/sandboxes.conflist", Subnet: "10.200.0.0/16"}
 		}},
+		{"firewall", map[string]string{"SB_NETRULES_BACKEND": " IPTables ", "SB_SANDBOX_INTERCONNECT": "true"}, func(c *Config) {
+			c.Firewall.Backend, c.Firewall.Interconnect = "iptables", true
+		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
 			"SB_HOST_CPU_CORES":     "3",
@@ -130,6 +136,8 @@ func TestConfigFromEnv(t *testing.T) {
 		}},
 		{"privileged, not in enterprise mode", map[string]string{"SB_CONTAINER_PRIVILEGED": "true", "SB_ENTERPRISE_MODE": "false"}, func(c *Config) {
 			c.Policy.Privileged = true
+			// No egress gateway runs with privileged containers.
+			c.Firewall.NodePorts = []rootpolicy.NodePort{{Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}
 		}},
 		{"paths written untidily are used clean", map[string]string{
 			"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/",
@@ -202,6 +210,8 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"privileged in enterprise mode", map[string]string{"SB_CONTAINER_PRIVILEGED": "1", "SB_ENTERPRISE_MODE": "true"}, nil, "SB_ENTERPRISE_MODE"},
 		{"a bool that does not parse", map[string]string{"SB_CONTAINER_PRIVILEGED": "yes please"}, nil, "SB_CONTAINER_PRIVILEGED"},
 		{"enterprise that does not parse", map[string]string{"SB_ENTERPRISE_MODE": "maybe"}, nil, "SB_ENTERPRISE_MODE"},
+		{"interconnect that does not parse", map[string]string{"SB_SANDBOX_INTERCONNECT": "sometimes"}, nil, "SB_SANDBOX_INTERCONNECT"},
+		{"interconnect in enterprise mode", map[string]string{"SB_SANDBOX_INTERCONNECT": "true", "SB_ENTERPRISE_MODE": "true"}, nil, "SB_SANDBOX_INTERCONNECT"},
 		{"memory that does not parse", map[string]string{"SB_HOST_MEMORY_MB": "lots"}, nil, "SB_HOST_MEMORY_MB"},
 		{"cpus that do not parse", map[string]string{"SB_HOST_CPU_CORES": "1.5"}, nil, "SB_HOST_CPU_CORES"},
 		{"pids that do not parse", map[string]string{"SB_SANDBOX_PIDS_LIMIT": "x"}, nil, "SB_SANDBOX_PIDS_LIMIT"},
@@ -407,5 +417,73 @@ func TestListenFails(t *testing.T) {
 				t.Fatalf("half-made sockets left: %v", leftovers)
 			}
 		})
+	}
+}
+
+// TestNodePortsFromEnv (PR 5 reviews): the node ports sandboxes may ever
+// reach come from the helper's own settings, by single mode's rules
+// (Service.SandboxNodeAllowlist): the gateway's ports when it runs, 80 and
+// 443 on an ingress node with Caddy that leaves them open, the operator's
+// ports, and DNS never as a setting.
+func TestNodePortsFromEnv(t *testing.T) {
+	np := func(proto string, port uint32) rootpolicy.NodePort {
+		return rootpolicy.NodePort{Proto: proto, Port: port}
+	}
+	gateway := []rootpolicy.NodePort{np("udp", 5353), np("tcp", 5353), np("tcp", 8080)}
+	web := []rootpolicy.NodePort{np("tcp", 80), np("tcp", 443)}
+	for _, tc := range []struct {
+		name       string
+		env        map[string]string
+		privileged bool
+		want, not  []rootpolicy.NodePort
+	}{
+		{"defaults: a mixed node, the gateway on", nil, false, append(append([]rootpolicy.NodePort{}, gateway...), web...), []rootpolicy.NodePort{np("udp", 53), np("tcp", 53)}},
+		{"the gateway off", map[string]string{"SB_EGRESS_FQDN_ENABLED": "false"}, false, web, gateway},
+		{"privileged containers (no gateway)", nil, true, web, gateway},
+		{"sandboxes kept off the node's ingress", map[string]string{"SB_SANDBOX_NODE_INGRESS": "false"}, false, gateway, web},
+		{"no Caddy", map[string]string{"SB_ENABLE_CADDY": "false"}, false, gateway, web},
+		{"a worker node", map[string]string{"SB_NODE_ROLE": "worker"}, false, gateway, web},
+		{"a worker and ingress node", map[string]string{"SB_NODE_ROLE": "worker, ingress"}, false, append(append([]rootpolicy.NodePort{}, gateway...), web...), nil},
+		{"the operator's ports", map[string]string{"SB_SANDBOX_NODE_PORTS_ALLOW": "9000, 9001/udp", "SB_NODE_ROLE": "worker"}, false,
+			append([]rootpolicy.NodePort{np("tcp", 9000), np("udp", 9001)}, gateway...), web},
+	} {
+		e := map[string]string{"SB_EGRESS_DNS_PORT": "5353", "SB_EGRESS_PROXY_PORT": "8080"}
+		for k, v := range tc.env {
+			e[k] = v
+		}
+		got, err := nodePortsFromEnv(env(e), false, tc.privileged)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		for _, w := range tc.want {
+			if !slices.Contains(got, w) {
+				t.Errorf("%s: %v lacks %v", tc.name, got, w)
+			}
+		}
+		for _, n := range tc.not {
+			if slices.Contains(got, n) {
+				t.Errorf("%s: %v holds %v", tc.name, got, n)
+			}
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: %v, want exactly %v", tc.name, got, tc.want)
+		}
+	}
+	for _, bad := range []map[string]string{
+		{"SB_SANDBOX_NODE_PORTS_ALLOW": "x"},
+		{"SB_SANDBOX_NODE_PORTS_ALLOW": "80/sctp"},
+		{"SB_EGRESS_DNS_PORT": "lots"},
+		{"SB_EGRESS_PROXY_PORT": "lots"},
+		{"SB_EGRESS_FQDN_ENABLED": "maybe"},
+		{"SB_ENABLE_CADDY": "maybe"},
+		{"SB_SANDBOX_NODE_INGRESS": "maybe"},
+		{"SB_NODE_ROLE": "worker,gateway"},
+	} {
+		if _, err := nodePortsFromEnv(env(bad), false, false); err == nil {
+			t.Errorf("%v passed", bad)
+		}
+	}
+	if _, err := nodePortsFromEnv(env(map[string]string{"SB_SANDBOX_NODE_PORTS_ALLOW": "9000"}), true, false); err == nil {
+		t.Fatal("an operator's node ports passed in enterprise mode")
 	}
 }

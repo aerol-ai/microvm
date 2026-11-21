@@ -62,7 +62,9 @@ func TestSetFloor(t *testing.T) {
 	if be.countMatching(own) != 3 || be.countMatching("192.168.7.0/24") != 1 || be.countMatching("-d|172.17.0.0/16") != 1 {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
-	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(own) != 1 || be.flushes != 3 {
+	// A replace fills the other chain, then empties the old one: two
+	// flushes (PR 5 review: no moment without a floor).
+	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(own) != 1 || be.flushes != 4 {
 		t.Fatalf("clearing the operator's floor keeps the isolation rule: %v %v", err, be.rules)
 	}
 	SetSandboxInterconnect(true)
@@ -123,8 +125,8 @@ func TestReassertFloor(t *testing.T) {
 			be.mu.Lock()
 			defer be.mu.Unlock()
 			be.rules = slices.DeleteFunc(be.rules, func(r string) bool { return r == imdsDrop })
-		}, wantRepaired: true, wantFlushes: 1},
-		{name: "chain flushed", damage: func(be *existsErrBackend) { _ = be.FlushChain(chain) }, wantRepaired: true, wantFlushes: 1},
+		}, wantRepaired: true, wantFlushes: 2},
+		{name: "chain flushed", damage: func(be *existsErrBackend) { _ = be.FlushChain(chain) }, wantRepaired: true, wantFlushes: 2},
 		{name: "jump cannot be put back", damage: func(be *existsErrBackend) { be.jumpErr = errors.New("chain gone") }, wantErr: true},
 		{name: "rules cannot be checked", damage: func(be *existsErrBackend) { be.err = errors.New("netlink: socket closed") }, wantErr: true},
 	}
@@ -276,7 +278,11 @@ func TestFloorJumpStaysFirst(t *testing.T) {
 	if err := m.SetFloor(subnet, floor); err != nil {
 		t.Fatal(err)
 	}
-	if be.first(chain) != jump || strings.Count(strings.Join(be.chains[chain], "\n"), jump) != 1 {
+	// The floor went into the subnet's other chain, whose jump is first;
+	// the older daemon's jump is gone.
+	old := jump
+	jump = "-j " + floorSlotB(FloorChainFor(subnet))
+	if be.first(chain) != jump || slices.Contains(be.chains[chain], old) || strings.Count(strings.Join(be.chains[chain], "\n"), jump) != 1 {
 		t.Fatalf("after SetFloor the chain is %q", be.chains[chain])
 	}
 	// After the floor: every kind of rule lands below the jump.
@@ -360,8 +366,14 @@ func TestFloorsOfTwoRuntimesCoexist(t *testing.T) {
 func TestFloorsDropAcrossRuntimes(t *testing.T) {
 	bridge := netip.MustParsePrefix("10.88.0.0/16")
 	taps := netip.MustParsePrefix("172.16.0.0/16")
+	// In the subnet's floor chain in use, either of its two.
 	drop := func(from, to netip.Prefix) string {
-		return "filter|" + FloorChainFor(from) + "|-s|" + from.String() + "|-d|" + to.String() + "|-j|DROP"
+		return "|-s|" + from.String() + "|-d|" + to.String() + "|-j|DROP"
+	}
+	has := func(rules []string, want string) bool {
+		return slices.ContainsFunc(rules, func(r string) bool {
+			return strings.HasSuffix(r, want) && strings.HasPrefix(r, "filter|AEROLVM-FLOOR-")
+		})
 	}
 	for _, order := range []string{"containers first", "guests first"} {
 		t.Run(order, func(t *testing.T) {
@@ -383,7 +395,7 @@ func TestFloorsDropAcrossRuntimes(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, want := range []string{drop(bridge, taps), drop(bridge, bridge), drop(taps, bridge), drop(taps, taps)} {
-				if !slices.Contains(be.rules, want) {
+				if !has(be.rules, want) {
 					t.Errorf("missing %s in %v", want, be.rules)
 				}
 			}
@@ -392,7 +404,7 @@ func TestFloorsDropAcrossRuntimes(t *testing.T) {
 			if err := containers.SetFloor(bridge, []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
 				t.Fatal(err)
 			}
-			if !slices.Contains(be.rules, drop(taps, bridge)) || !slices.Contains(be.rules, drop(bridge, taps)) {
+			if !has(be.rules, drop(taps, bridge)) || !has(be.rules, drop(bridge, taps)) {
 				t.Fatalf("a re-render dropped the cross-runtime rules: %v", be.rules)
 			}
 		})

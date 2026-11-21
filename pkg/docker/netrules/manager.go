@@ -616,11 +616,28 @@ func (m *Manager) deletePolicyRule(spec ...string) error {
 // Exists fallback confirms absence without teaching ruleNotExist new strings.
 // That Exists path is exactly the manager.go:13 memorialized adopt-breakage
 // bug on a new backend.
+// maxDupSweep bounds deleteUntilGone's sweep of duplicate rules: a chain
+// never holds this many copies of one rule.
+const maxDupSweep = 64
+
 func (m *Manager) deleteUntilGone(table, chain string, spec ...string) error {
-	for {
+	for swept := 0; ; swept++ {
 		err := m.ipt.Delete(table, chain, spec...)
 		if err == nil {
-			continue // swept one, retry (dup-sweep intact)
+			if swept < maxDupSweep {
+				continue // swept one, retry (dup-sweep intact)
+			}
+			// A backend that keeps answering success for a rule that is
+			// gone would spin here for good: past any real number of
+			// duplicates, ask whether the rule is still there.
+			ex, e := m.ipt.Exists(table, chain, spec...)
+			if e == nil && !ex {
+				return nil
+			}
+			if e != nil {
+				return e
+			}
+			return fmt.Errorf("netrules: %s %s still holds %v after %d deletes", table, chain, spec, swept+1)
 		}
 		if ruleNotExist(err) {
 			return nil // exec path: recognized, UNCHANGED cost
