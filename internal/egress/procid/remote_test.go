@@ -93,3 +93,44 @@ func TestRemoteBadRequest(t *testing.T) {
 		t.Fatalf("response = %q", buf[:n])
 	}
 }
+
+// TestRemoteLookupThroughMatch (M1 PR 5b): with Match set (the root
+// helper, in privilege mode split), the server sends it only the paths the
+// sandbox's rules list, each once, and passes its answers on.
+func TestRemoteLookupThroughMatch(t *testing.T) {
+	local, remote := netip.MustParseAddrPort("10.88.0.5:40000"), netip.MustParseAddrPort("1.2.3.4:443")
+	var sent [][]string
+	answer := func(pid int, l, r netip.AddrPort, paths []string) ([]string, error) {
+		if pid != 100 || l != local || r != remote {
+			t.Errorf("asked %d %s %s", pid, l, r)
+		}
+		sent = append(sent, paths)
+		switch paths[0] {
+		case "/gone":
+			return nil, ErrNotFound
+		case "/broken":
+			return nil, errors.New("helper down")
+		}
+		return paths[:1], nil
+	}
+	allowed := []string{"/usr/bin/git", "/usr/bin/curl", "/gone", "/broken"}
+	c := serve(t, &Server{Match: answer, Authorize: func(string) (int, []string, error) { return 100, allowed, nil }})
+	is, err := c.Match("sb", local, remote, []string{"/usr/bin/git", "/usr/local/bin/pip", "/usr/bin/git", "/usr/bin/curl"})
+	if err != nil || !is("/usr/bin/git") || is("/usr/bin/curl") || is("/usr/local/bin/pip") {
+		t.Fatalf("Match = %v", err)
+	}
+	if !slices.Equal(sent[0], []string{"/usr/bin/git", "/usr/bin/curl"}) {
+		t.Fatalf("sent %v", sent[0])
+	}
+	if _, err := c.Match("sb", local, remote, []string{"/gone"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("gone = %v", err)
+	}
+	if _, err := c.Match("sb", local, remote, []string{"/broken"}); err == nil {
+		t.Fatal("a failed lookup matched")
+	}
+	// Nothing the rules list: nothing is asked.
+	n := len(sent)
+	if is, err := c.Match("sb", local, remote, []string{"/usr/local/bin/pip"}); err != nil || is("/usr/local/bin/pip") || len(sent) != n {
+		t.Fatalf("unlisted = %v, asked %d times", err, len(sent)-n)
+	}
+}

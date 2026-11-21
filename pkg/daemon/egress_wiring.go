@@ -41,7 +41,11 @@ func dockerBridgeSource(cfg config.Config, c *docker.Client) bridgeSource {
 // supervised (SuperviseEgressGateway, started for every worker by
 // wireEgressProfiles): retried every few seconds while down, and lazily on
 // the first gateway-mode create.
-func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, dockerNet bridgeSource, logger *slog.Logger) {
+//
+// In privilege mode split (helper set) the self-test's probe network and
+// the executable lookups go through the root helper (split_egress.go), and
+// the forwarding sysctls are the helper's (EnsureHostNetwork).
+func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, dockerNet bridgeSource, logger *slog.Logger, helper egressHelper) {
 	if !cfg.EgressFQDNEnabled || goruntime.GOOS != "linux" || !cfg.IsWorker() {
 		return
 	}
@@ -68,14 +72,20 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 	}
 	// Bridged sandbox-to-sandbox traffic must pass the netfilter hooks for
 	// the redirect to see it (CEO D18); the self-test then confirms it.
-	if err := ensureForwardingSysctls(); err != nil {
-		logger.Warn("egress: bridge netfilter not enabled; the gateway self-test will fail", "error", err)
+	if helper == nil {
+		if err := ensureForwardingSysctls(); err != nil {
+			logger.Warn("egress: bridge netfilter not enabled; the gateway self-test will fail", "error", err)
+		}
 	}
 	svc.SetEgressGateway(egress.NewClient(cfg.EgressGatewaySocket), bridges)
-	if err := startEgressProcid(ctx, cfg, svc, logger); err != nil {
+	if err := startEgressProcid(ctx, cfg, svc, logger, helper); err != nil {
 		logger.Warn("egress: executable lookups unavailable; per-binary rule flows are refused", "error", err)
 	}
-	svc.SetEgressSelfTest(egress.NewProbeNet())
+	if helper != nil {
+		svc.SetEgressSelfTest(helperProbeNet{h: helper})
+	} else {
+		svc.SetEgressSelfTest(egress.NewProbeNet())
+	}
 }
 
 // wireEgressProfiles starts the re-apply pass for named egress profiles

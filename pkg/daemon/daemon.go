@@ -847,7 +847,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.EgressBlockPrivateByDefault {
 		svc.EnableBlockPrivateByDefault()
 	}
-	wireEgressGateway(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger)
+	var gatewayHelper egressHelper
+	if helper != nil {
+		gatewayHelper = helper
+	}
+	wireEgressGateway(ctx, cfg, svc, dockerBridgeSource(cfg, dockerClient), logger, gatewayHelper)
 	// After the gateway is wired: whether its ports are open depends on it.
 	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)

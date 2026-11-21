@@ -65,7 +65,13 @@ func gatewayIDs(name string) (uint32, int, error) {
 // and each answer is held to the named sandbox's own process and rule paths
 // (Service.EgressProcidAuthorize). Without the user or the socket, the
 // rules' flows are refused (binary_unknown), never admitted.
-func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Service, logger *slog.Logger) error {
+//
+// In privilege mode split (helper set) the root helper answers the lookups
+// (MatchProcess). sandboxd has no right to give the socket to the
+// gateway's group there, so the socket is open to every local user
+// instead: the peer check, which answers the gateway's uid alone, is what
+// keeps others out, as it is in single mode.
+func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Service, logger *slog.Logger, helper egressHelper) error {
 	if cfg.EgressProcidSocket == "" {
 		return nil
 	}
@@ -82,11 +88,14 @@ func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Serv
 	if err != nil {
 		return err
 	}
-	if err := os.Chown(path, os.Geteuid(), gid); err != nil {
+	mode := os.FileMode(0o660)
+	if helper != nil {
+		mode = 0o666
+	} else if err := os.Chown(path, os.Geteuid(), gid); err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("egress procid socket: %w", err)
 	}
-	if err := os.Chmod(path, 0o660); err != nil {
+	if err := os.Chmod(path, mode); err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("egress procid socket: %w", err)
 	}
@@ -95,6 +104,9 @@ func startEgressProcid(ctx context.Context, cfg config.Config, svc *service.Serv
 		Authorize: func(id string) (int, []string, error) {
 			return svc.EgressProcidAuthorize(ctx, id)
 		},
+	}
+	if helper != nil {
+		srv.Match = helperMatch(helper)
 	}
 	go func() {
 		if err := srv.Serve(ln); err != nil {
