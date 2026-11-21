@@ -8,10 +8,13 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
 func defaultStdioChecker() StdioChecker { return hostPaths{owner: 0} }
 func defaultBindChecker() BindChecker   { return hostPaths{owner: 0} }
+func defaultReadChecker() ReadChecker   { return hostPaths{owner: 0} }
 
 // hostPaths checks the host paths the shim and runc will open as root.
 // It walks each path from / one name at a time with openat2, refusing any
@@ -66,17 +69,10 @@ func walkHostPath(p string, folder func(at string, st *unix.Stat_t) error, leaf 
 }
 
 // folderOK: a folder owned by root (or owner) that no one else can write,
-// or a sticky one, where no one else can rename what root put there.
+// or a sticky one, where no one else can rename what root put there. The
+// rule is rootpolicy.CheckFolder, which the helper's socket uses too.
 func (h hostPaths) folderOK(at string, st *unix.Stat_t, sticky bool) error {
-	switch {
-	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
-		return fmt.Errorf("%s is not a folder", at)
-	case st.Uid != 0 && st.Uid != h.owner:
-		return fmt.Errorf("folder %s belongs to uid %d", at, st.Uid)
-	case st.Mode&0o022 != 0 && !(sticky && st.Mode&unix.S_ISVTX != 0):
-		return fmt.Errorf("folder %s can be written by others (mode %o)", at, st.Mode&0o7777)
-	}
-	return nil
+	return rootpolicy.CheckFolder(at, st.Mode, st.Uid, h.owner, sticky)
 }
 
 // CheckStdio accepts a FIFO owned by root, reached through folders only
@@ -122,6 +118,35 @@ func (h hostPaths) CheckBind(root, src string) error {
 	})
 	if err != nil {
 		return bindViolation(src, "%v", err)
+	}
+	return nil
+}
+
+// CheckRead accepts a file or folder root will read because the agent
+// named it (a runsc config, a restore image): reached with no link on the
+// way, through folders only root can change, and itself root's and
+// writable by no one else. A runsc config the agent could write names the
+// binary runsc runs as root (review H2), so the name being on the policy's
+// list is not enough.
+func (h hostPaths) CheckRead(r rootpolicy.RootRead) error {
+	err := walkHostPath(r.Path, func(at string, st *unix.Stat_t) error { return h.folderOK(at, st, true) },
+		func(st *unix.Stat_t) error {
+			switch kind := st.Mode & unix.S_IFMT; {
+			case r.Folder && kind != unix.S_IFDIR:
+				return fmt.Errorf("not a folder (mode %o)", st.Mode)
+			case !r.Folder && kind != unix.S_IFREG:
+				return fmt.Errorf("not a regular file (mode %o)", st.Mode)
+			case !r.Folder && st.Nlink > 1:
+				return fmt.Errorf("the file has %d hard links", st.Nlink)
+			case st.Uid != 0 && st.Uid != h.owner:
+				return fmt.Errorf("it belongs to uid %d", st.Uid)
+			case st.Mode&0o022 != 0:
+				return fmt.Errorf("others can write it (mode %o)", st.Mode&0o7777)
+			}
+			return nil
+		})
+	if err != nil {
+		return readViolation(r, "%v", err)
 	}
 	return nil
 }

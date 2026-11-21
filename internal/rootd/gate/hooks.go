@@ -29,6 +29,15 @@ type BindChecker interface {
 	CheckBind(root, src string) error
 }
 
+// ReadChecker checks, on disk, a path root reads because a container
+// record names it (rootpolicy.ContainerRootReads): the runsc config, which
+// names the binary runsc runs and can turn on host networking, and a
+// restore image. CheckContainer checks the name; a name in the right folder
+// is only as good as who can write that folder.
+type ReadChecker interface {
+	CheckRead(r rootpolicy.RootRead) error
+}
+
 // NetnsBinding says whether a named network namespace is the one the helper
 // made for a container. The netns pool moves into the helper in T2; until it
 // is wired, Config.NetnsBinding is nil and only the name's form is checked
@@ -77,6 +86,24 @@ func (g *Gate) checkBinds(c rootpolicy.Container) error {
 		}
 	}
 	return nil
+}
+
+// checkReads walks every path c makes root read on disk.
+func (g *Gate) checkReads(c rootpolicy.Container) error {
+	reads, err := rootpolicy.ContainerRootReads(c)
+	if err != nil {
+		return err
+	}
+	for _, r := range reads {
+		if err := g.reads.CheckRead(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readViolation(r rootpolicy.RootRead, format string, args ...any) error {
+	return &rootpolicy.Violation{Rule: r.Rule, Detail: fmt.Sprintf("%q, which root reads: ", r.Path) + fmt.Sprintf(format, args...)}
 }
 
 func bindViolation(src, format string, args ...any) error {

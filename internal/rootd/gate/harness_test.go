@@ -146,6 +146,7 @@ type rig struct {
 	dial     func(context.Context, string) (net.Conn, error)
 	stdio    *acceptStdio
 	binds    *acceptBinds
+	reads    *acceptReads
 	mu       sync.Mutex
 	refusals []Refusal
 }
@@ -197,13 +198,27 @@ func (a *acceptBinds) CheckBind(root, src string) error {
 	return nil
 }
 
-// newRig builds the rig. The gate's on-disk stdio and bind checks accept
-// every path unless an option says otherwise.
+// acceptReads stands in for the on-disk check of paths root reads
+// (hostpath_linux_test.go has the real one) and records what it was asked.
+type acceptReads struct {
+	mu   sync.Mutex
+	seen []rootpolicy.RootRead
+}
+
+func (a *acceptReads) CheckRead(r rootpolicy.RootRead) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.seen = append(a.seen, r)
+	return nil
+}
+
+// newRig builds the rig. The gate's on-disk stdio, bind and read checks
+// accept every path unless an option says otherwise.
 func newRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) *rig {
 	t.Helper()
-	r := &rig{t: t, fake: &fakeContainerd{}, stdio: &acceptStdio{}, binds: &acceptBinds{}}
+	r := &rig{t: t, fake: &fakeContainerd{}, stdio: &acceptStdio{}, binds: &acceptBinds{}, reads: &acceptReads{}}
 	_, upDial := bufServer(t, grpc.UnknownServiceHandler(r.fake.handle))
-	cfg := Config{Policy: p, Upstream: bufConn(t, upDial), Stdio: r.stdio, Binds: r.binds, OnRefusal: func(_ context.Context, ref Refusal) {
+	cfg := Config{Policy: p, Upstream: bufConn(t, upDial), Stdio: r.stdio, Binds: r.binds, Reads: r.reads, OnRefusal: func(_ context.Context, ref Refusal) {
 		r.mu.Lock()
 		r.refusals = append(r.refusals, ref)
 		r.mu.Unlock()
