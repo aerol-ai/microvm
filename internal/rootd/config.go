@@ -110,6 +110,15 @@ type FirewallConfig struct {
 	// Interconnect is SB_SANDBOX_INTERCONNECT: sandboxes on the node may
 	// reach each other.
 	Interconnect bool
+	// NodePorts are the node ports sandboxes may ever reach (PR 5 review,
+	// plan §3.3): the helper owns the node guard's inputs, and the agent
+	// may only narrow them. From the helper's own environment, the names
+	// sandboxd reads too: DNS (53, on any node address), the egress
+	// gateway's DNS and proxy ports (SB_EGRESS_DNS_PORT, 53054;
+	// SB_EGRESS_PROXY_PORT, 15080), the public web ports, and the
+	// operator's SB_SANDBOX_NODE_PORTS_ALLOW (refused in enterprise mode,
+	// as sandboxd refuses it).
+	NodePorts []rootpolicy.NodePort
 }
 
 // sharedNetnsDirs are the folders iproute2, systemd units and CNI tools
@@ -247,6 +256,10 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if interconnect && enterprise {
 		return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
 	}
+	nodePorts, err := nodePortsFromEnv(getenv, enterprise)
+	if err != nil {
+		return Config{}, err
+	}
 	limits, err := limitsFromEnv(getenv)
 	if err != nil {
 		return Config{}, err
@@ -354,7 +367,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			ConfPath:  cniConf,
 			Subnet:    strings.TrimSpace(getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		},
-		Firewall: FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect},
+		Firewall: FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -508,4 +521,45 @@ func gatewayUID(v string) (uint32, bool) {
 	}
 	n, err := lookupUser(v)
 	return n, err == nil
+}
+
+// nodePortsFromEnv is FirewallConfig.NodePorts.
+func nodePortsFromEnv(getenv func(string) string, enterprise bool) ([]rootpolicy.NodePort, error) {
+	dns, err := envInt(getenv, "SB_EGRESS_DNS_PORT", 53054)
+	if err != nil {
+		return nil, err
+	}
+	proxy, err := envInt(getenv, "SB_EGRESS_PROXY_PORT", 15080)
+	if err != nil {
+		return nil, err
+	}
+	out := []rootpolicy.NodePort{{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 53}, {Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}
+	for _, p := range []struct {
+		proto string
+		port  int
+	}{{"udp", dns}, {"tcp", dns}, {"tcp", proxy}} {
+		if p.port > 0 && p.port <= 65535 {
+			out = append(out, rootpolicy.NodePort{Proto: p.proto, Port: uint32(p.port)})
+		}
+	}
+	raw := strings.TrimSpace(getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
+	if raw != "" && enterprise {
+		return nil, errors.New("SB_SANDBOX_NODE_PORTS_ALLOW must be empty when SB_ENTERPRISE_MODE=true")
+	}
+	for _, f := range strings.Split(raw, ",") {
+		f = strings.ToLower(strings.TrimSpace(f))
+		if f == "" {
+			continue
+		}
+		port, proto, _ := strings.Cut(f, "/")
+		if proto == "" {
+			proto = "tcp"
+		}
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 || (proto != "tcp" && proto != "udp") {
+			return nil, fmt.Errorf("SB_SANDBOX_NODE_PORTS_ALLOW entry %q: want a port 1-65535, optionally /tcp or /udp", f)
+		}
+		out = append(out, rootpolicy.NodePort{Proto: proto, Port: uint32(n)})
+	}
+	return rootpolicy.CheckNodePorts(out)
 }

@@ -80,6 +80,19 @@ func (m *memRules) chain(table, name string) error {
 	return nil
 }
 
+// ClearCommented: every rule keyed by ip with the comment goes.
+func (m *memRules) ClearCommented(chains []string, ip, comment string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range chains {
+		k := m.key("filter", c)
+		m.rules[k] = slices.DeleteFunc(m.rules[k], func(r string) bool {
+			return strings.HasPrefix(r, "-s "+ip+" ") && strings.Contains(r, "--comment "+comment+" ")
+		})
+	}
+	return nil
+}
+
 func (m *memRules) holds(sub string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -148,7 +161,7 @@ func TestKernelFirewallLogic(t *testing.T) {
 		rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_INGRESS,
 		rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_HOLD_EGRESS, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY,
 	} {
-		if _, err := k.Rules(op, ip, []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}); err != nil {
+		if _, err := k.Rules(context.Background(), op, ip, []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}); err != nil {
 			t.Fatalf("%v: %v", op, err)
 		}
 	}
@@ -160,11 +173,11 @@ func TestKernelFirewallLogic(t *testing.T) {
 		rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_BLOCK_INGRESS, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS,
 		rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY,
 	} {
-		if _, err := k.Rules(op, ip, []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}); err != nil {
+		if _, err := k.Rules(context.Background(), op, ip, []string{"1.2.3.4/32"}, []string{"10.0.0.0/8"}); err != nil {
 			t.Fatalf("%v: %v", op, err)
 		}
 	}
-	if _, err := k.Rules(rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_UNSPECIFIED, ip, nil, nil); err == nil {
+	if _, err := k.Rules(context.Background(), rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_UNSPECIFIED, ip, nil, nil); err == nil {
 		t.Fatal("an unknown op passed")
 	}
 	if err := k.ClearAddress(ip); err != nil {

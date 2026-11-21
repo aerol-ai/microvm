@@ -122,6 +122,9 @@ type NetworkHost interface {
 	// helper's CNI leased ip to, from the IPAM plugin's own record; ok is
 	// false when nobody holds it.
 	Leaseholder(ip netip.Addr) (name string, ok bool, err error)
+	// LeaseOf is the address the helper's CNI leased to the slot name;
+	// ok is false when it holds none.
+	LeaseOf(name string) (ip netip.Addr, ok bool, err error)
 }
 
 // network serves the network calls. Its host is opened on the first call,

@@ -63,6 +63,17 @@ func (m *memNet) Remove(_ context.Context, _, path, _ string) error {
 
 func (m *memNet) DisableIPv6(string) error { return nil }
 func (m *memNet) Bridge() string           { return "aerolvm0" }
+func (m *memNet) LeaseOf(name string) (netip.Addr, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for path, st := range m.ns {
+		if filepath.Base(path) == name && len(st.IPv4) > 0 {
+			return netip.MustParseAddr(st.IPv4[0]), true, nil
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
 func (m *memNet) Leaseholder(ip netip.Addr) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

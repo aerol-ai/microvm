@@ -44,6 +44,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
@@ -188,7 +189,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		grpc.MaxConcurrentStreams(maxStreams),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
 		grpc.UnknownServiceHandler(s.route),
-		grpc.ChainUnaryInterceptor(answeredUnary),
+		grpc.ChainUnaryInterceptor(answeredUnary, knownFieldsOnly),
 		grpc.ChainStreamInterceptor(answeredStream, s.endOnDrain))
 	s.srv = grpc.NewServer(sopts...)
 	locks := &keyedLocks{}
@@ -346,6 +347,27 @@ var answered = metadata.Pairs(rootdpb.AnsweredTrailer, "1")
 
 func answeredUnary(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
 	_ = grpc.SetTrailer(ctx, answered)
+	return h(ctx, req)
+}
+
+// knownFieldsOnly refuses, for every call of the helper's own API, a
+// request that carries a field this helper does not know (PR 5 review):
+// protobuf keeps such a field and acts on nothing, so a newer agent's
+// narrowing (a port on a policy, a source on a node port) would be dropped
+// without a word and the call would do more than asked. Unimplemented is
+// what the agent reads as "this helper is older". One interceptor, so a
+// new call cannot forget it. Version is the exception: the handshake is a
+// read, and is how a newer agent learns the helper is older.
+func knownFieldsOnly(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+	if m, ok := req.(proto.Message); ok && info.FullMethod != rootdpb.RootHelper_Version_FullMethodName {
+		if err := noUnknownFields(m); err != nil {
+			var fe *fileError
+			if errors.As(err, &fe) {
+				return nil, status.Error(fe.code, fe.msg)
+			}
+			return nil, err
+		}
+	}
 	return h(ctx, req)
 }
 

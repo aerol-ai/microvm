@@ -54,7 +54,9 @@ type FirewallHost interface {
 	SetNodeGuard(allow []rootpolicy.NodePort) (repaired bool, err error)
 	SetFloor(cidrs []netip.Prefix) (repaired bool, err error)
 	// Rules changes one address's rules; inserted is a block's report.
-	Rules(op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (inserted bool, err error)
+	// The policy ops replace the address's whole policy, and stop between
+	// writes once ctx ends.
+	Rules(ctx context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (inserted bool, err error)
 	// ClearAddress removes every rule kept for ip.
 	ClearAddress(ip string) error
 }
@@ -109,6 +111,47 @@ type firewall struct {
 	timerOnce sync.Once
 	stopOnce  sync.Once
 	stop      chan struct{}
+
+	budget policyBudget
+}
+
+// The rule budget of egress policies (PR 5 review): an address's policy is
+// replaced, never added to, and holds at most rootpolicy.MaxPolicyCIDRs
+// entries; the node's policies together hold at most maxNodePolicyRules.
+// Each rule makes every later write into the chain cost more, so a node
+// past this is refused new policy, ResourceExhausted, until some go.
+const maxNodePolicyRules = 32768
+
+// policyBudget counts the policy rules this helper put on each address.
+type policyBudget struct {
+	mu    sync.Mutex
+	byIP  map[string]int
+	total int
+}
+
+// reserve records ip's policy as n rules, replacing what it had, or
+// refuses when the node's policies would hold too many.
+func (b *policyBudget) reserve(ip string, n int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.byIP == nil {
+		b.byIP = map[string]int{}
+	}
+	total := b.total - b.byIP[ip] + n
+	if total > maxNodePolicyRules {
+		return &fileError{code: codes.ResourceExhausted,
+			msg: fmt.Sprintf("root helper: the node's egress policies would hold %d rules; at most %d", total, maxNodePolicyRules)}
+	}
+	b.total, b.byIP[ip] = total, n
+	return nil
+}
+
+// release forgets ip's policy.
+func (b *policyBudget) release(ip string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.total -= b.byIP[ip]
+	delete(b.byIP, ip)
 }
 
 func newFirewall(cfg Config, net *network, injected FirewallHost, locks *keyedLocks) *firewall {
@@ -200,6 +243,12 @@ func (f *firewall) setNodeGuard(ctx context.Context, req *rootdpb.SetNodeGuardRe
 	if err != nil {
 		return nil, refusedRule(codes.InvalidArgument, err)
 	}
+	// The agent may narrow the helper's own list, never widen it (PR 5
+	// review): every port it sends must be one the helper's settings
+	// list, on every node address or on the one the agent names.
+	if err := rootpolicy.CheckNodePortsWithin(allow, f.whole.Firewall.NodePorts); err != nil {
+		return nil, refusedRule(codes.PermissionDenied, err)
+	}
 	h, _, err := f.opened()
 	if err != nil {
 		return nil, err
@@ -265,8 +314,12 @@ func address(n NetworkHost, ip string, write bool, holder string) (string, error
 	return ip, nil
 }
 
-// policyLists checks an egress policy's two lists.
+// policyLists checks an egress policy's two lists, and their size
+// together.
 func policyLists(allow, deny []string) ([]string, []string, error) {
+	if n := len(allow) + len(deny); n > rootpolicy.MaxPolicyCIDRs {
+		return nil, nil, refusedRule(codes.InvalidArgument, rootpolicy.TooManyPolicyCIDRs(n))
+	}
 	a, err := rootpolicy.CheckRuleCIDRs(allow)
 	if err != nil {
 		return nil, nil, refusedRule(codes.InvalidArgument, err)
@@ -316,7 +369,15 @@ func (f *firewall) sandboxRules(ctx context.Context, req *rootdpb.SandboxRulesRe
 	if err != nil {
 		return nil, err
 	}
-	inserted, err := h.Rules(op, ip, allow, deny)
+	if op == rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY {
+		if err := f.budget.reserve(ip, len(allow)+len(deny)+1); err != nil {
+			return nil, err
+		}
+	}
+	inserted, err := h.Rules(ctx, op, ip, allow, deny)
+	if op == rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY && err == nil {
+		f.budget.release(ip)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("root helper: %v on %s: %w", op, ip, err)
 	}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -69,9 +70,37 @@ func ruleset(t *testing.T) string {
 		if err != nil {
 			t.Fatalf("%v: %v: %s", cmd, err, b)
 		}
-		out.Write(b)
+		// Not iptables-save's "# Generated/Completed on <time>" lines,
+		// which change with the clock.
+		for _, l := range strings.SplitAfter(string(b), "\n") {
+			if !strings.HasPrefix(l, "#") {
+				out.WriteString(l)
+			}
+		}
 	}
 	return out.String()
+}
+
+// lineDiff is the lines only one of a and b has, marked - and +.
+func lineDiff(a, b string) string {
+	count := map[string]int{}
+	for _, l := range strings.Split(a, "\n") {
+		count[l]++
+	}
+	for _, l := range strings.Split(b, "\n") {
+		count[l]--
+	}
+	var out []string
+	for l, n := range count {
+		switch {
+		case n > 0:
+			out = append(out, "- "+l)
+		case n < 0:
+			out = append(out, "+ "+l)
+		}
+	}
+	slices.Sort(out)
+	return strings.Join(out, "\n")
 }
 
 // TestKernelFirewallCalls runs on each rules backend: the production one
@@ -141,8 +170,8 @@ func kernelFirewallCalls(t *testing.T, backend string) {
 	unheld := netip.AddrFrom4([4]byte{b4[0], b4[1], 200, 200}).String()
 	_, err = c.SandboxRules(ctx, &rootdpb.SandboxRulesRequest{ContainerIp: unheld, Op: rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS})
 	wantRefusal(t, r, err, codes.PermissionDenied, string(rootpolicy.RuleLease))
-	if ruleset(t) != before {
-		t.Fatal("a refused call changed the ruleset")
+	if after := ruleset(t); after != before {
+		t.Fatalf("a refused call changed the ruleset:\n%s", lineDiff(before, after))
 	}
 
 	// The release takes every rule of the address away, then the slot.

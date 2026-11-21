@@ -156,13 +156,20 @@ func (f *firewall) prepare(ctx context.Context, req *rootdpb.PrepareSandboxReque
 			return nil, err
 		}
 	}
-	inserted, err := f.applyCreateRules(h, ip, fw.GetBlockAllEgress(), allow, deny)
+	inserted, err := f.applyCreateRules(ctx, h, ip, fw.GetBlockAllEgress(), allow, deny)
 	if err != nil {
 		// Leave nothing half done: the rules this call put in go, and so
 		// does a namespace it realized; the agent's create rolls back.
 		undo := h.ClearAddress(ip)
-		if parts[rootdpb.PartNetns] {
-			undo = errors.Join(undo, n.Remove(ctx, name, path, ip))
+		if undo == nil {
+			f.budget.release(ip)
+		}
+		// The namespace goes only once its address's rules have (PR 5
+		// review): CNI DEL frees the address, and the next slot to get it
+		// would get these rules with it. A slot whose clear failed stays,
+		// and the agent's undo releases it again.
+		if parts[rootdpb.PartNetns] && undo == nil {
+			undo = n.Remove(ctx, name, path, ip)
 		}
 		return nil, errors.Join(fmt.Errorf("root helper: the create's rules on %s: %w", ip, err), undo)
 	}
@@ -172,16 +179,19 @@ func (f *firewall) prepare(ctx context.Context, req *rootdpb.PrepareSandboxReque
 
 // applyCreateRules puts a create's rules on ip: block-all, then the CIDR
 // lists, as the agent's driver does in single mode.
-func (f *firewall) applyCreateRules(h FirewallHost, ip string, blockAll bool, allow, deny []string) (bool, error) {
+func (f *firewall) applyCreateRules(ctx context.Context, h FirewallHost, ip string, blockAll bool, allow, deny []string) (bool, error) {
 	var inserted bool
 	if blockAll {
 		var err error
-		if inserted, err = h.Rules(rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS, ip, nil, nil); err != nil {
+		if inserted, err = h.Rules(ctx, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS, ip, nil, nil); err != nil {
 			return false, err
 		}
 	}
 	if len(allow) > 0 || len(deny) > 0 {
-		if _, err := h.Rules(rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY, ip, allow, deny); err != nil {
+		if err := f.budget.reserve(ip, len(allow)+len(deny)+1); err != nil {
+			return inserted, err
+		}
+		if _, err := h.Rules(ctx, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY, ip, allow, deny); err != nil {
 			return inserted, err
 		}
 	}
@@ -232,11 +242,27 @@ func (f *firewall) release(ctx context.Context, req *rootdpb.ReleaseSandboxReque
 			return nil, err
 		}
 	}
-	if parts[rootdpb.PartFirewall] && ip == "" {
-		// The agent does not know the address (a build it gave up on):
-		// the one the slot's own namespace holds is the slot's. None: no
-		// rules were put on one.
-		ip = sandboxAddress(n.Subnet(), st.IPv4)
+	if parts[rootdpb.PartNetns] {
+		// The slot's own address, not the one the agent names (PR 5
+		// review): the namespace's, or for gVisor, which takes the address
+		// out of the kernel's view, the one the helper's CNI leased to this
+		// slot. CNI DEL frees that address, so its rules must go first,
+		// whatever the agent sent. The agent's is used only when the slot
+		// has none to show (a namespace already gone), and then only an
+		// address no other slot holds (checked below).
+		own := sandboxAddress(n.Subnet(), st.IPv4)
+		if own == "" {
+			a, ok, err := n.LeaseOf(name)
+			if err != nil {
+				return nil, fmt.Errorf("root helper: lease of %s: %w", name, err)
+			}
+			if ok {
+				own = a.String()
+			}
+		}
+		if own != "" {
+			ip = own
+		}
 	}
 	if ip != "" {
 		unlock4, err := f.locks.lock(ctx, addrKey(ip))
@@ -254,6 +280,7 @@ func (f *firewall) release(ctx context.Context, req *rootdpb.ReleaseSandboxReque
 		if err := h.ClearAddress(ip); err != nil {
 			return nil, fmt.Errorf("root helper: clear the rules of %s: %w", ip, err)
 		}
+		f.budget.release(ip)
 	}
 	if parts[rootdpb.PartNetns] {
 		if err := n.Remove(ctx, name, path, ip); err != nil {

@@ -91,7 +91,7 @@ func (m *memFirewall) SetFloor(cidrs []netip.Prefix) (bool, error) {
 	m.calls = append(m.calls, fmt.Sprintf("floor %v", cidrs))
 	return false, nil
 }
-func (m *memFirewall) Rules(op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
+func (m *memFirewall) Rules(_ context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
 	m.calls = append(m.calls, fmt.Sprintf("%v %s %v %v", op, ip, allow, deny))
 	return true, nil
 }

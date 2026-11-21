@@ -60,7 +60,7 @@ func (f *fakeFirewall) SetFloor(cidrs []netip.Prefix) (bool, error) {
 	return false, f.fail["floor"]
 }
 
-func (f *fakeFirewall) Rules(op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
+func (f *fakeFirewall) Rules(_ context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
 	f.record(fmt.Sprintf("%s %s %v %v", op, ip, allow, deny))
 	if err := f.fail[op.String()]; err != nil {
 		return false, err
@@ -230,8 +230,9 @@ func TestPrepareSandboxUndo(t *testing.T) {
 }
 
 // TestReleaseSandbox: the rules go before CNI DEL frees the address, so the
-// address's next holder never loses its rules to this call; a slot whose
-// address is another slot's is refused.
+// address's next holder never loses its rules to this call. With the netns
+// part the address is the slot's own (PR 5 review): one the agent names
+// wrongly, another slot's included, is never cleared in its place.
 func TestReleaseSandbox(t *testing.T) {
 	r, c, fn, fw := sandboxRig(t)
 	ctx := callCtx(t)
@@ -242,12 +243,13 @@ func TestReleaseSandbox(t *testing.T) {
 	if _, err := c.RealizeNetns(ctx, &rootdpb.RealizeNetnsRequest{NetnsName: "sb-2"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := c.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: "10.88.0.3", Parts: both})
+	// The firewall part alone still answers for the address it names.
+	_, err := c.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: "10.88.0.3", Parts: []string{rootdpb.PartFirewall}})
 	wantRefusal(t, r, err, codes.PermissionDenied, string(rootpolicy.RuleLease))
 	_, err = c.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", Parts: []string{rootdpb.PartFirewall}})
 	wantRefusal(t, r, err, codes.InvalidArgument, ReasonBadRequest)
 	fw.calls, fn.calls = nil, nil
-	if _, err := c.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: "10.88.0.2", Parts: both}); err != nil {
+	if _, err := c.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: "10.88.0.3", Parts: both}); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(fw.recorded(), []string{"clear 10.88.0.2"}) || !slices.Equal(fn.recorded(), []string{"remove sb-1 10.88.0.2"}) {

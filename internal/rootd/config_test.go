@@ -74,8 +74,10 @@ func TestConfigFromEnv(t *testing.T) {
 			AgentReady: "/run/sandboxd/docker/ready",
 		},
 		// sandboxd's own CNI settings, read under the same names.
-		Network:  NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
-		Firewall: FirewallConfig{Backend: "netlink"},
+		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
+		Firewall: FirewallConfig{Backend: "netlink", NodePorts: []rootpolicy.NodePort{
+			{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 53}, {Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443},
+			{Proto: "udp", Port: 53054}, {Proto: "tcp", Port: 53054}, {Proto: "tcp", Port: 15080}}},
 	}
 	for _, tc := range []struct {
 		name string
@@ -123,7 +125,7 @@ func TestConfigFromEnv(t *testing.T) {
 			c.Network = NetworkConfig{PluginDir: "/usr/lib/cni", ConfPath: "/etc/aerolvm/cni/sandboxes.conflist", Subnet: "10.200.0.0/16"}
 		}},
 		{"firewall", map[string]string{"SB_NETRULES_BACKEND": " IPTables ", "SB_SANDBOX_INTERCONNECT": "true"}, func(c *Config) {
-			c.Firewall = FirewallConfig{Backend: "iptables", Interconnect: true}
+			c.Firewall.Backend, c.Firewall.Interconnect = "iptables", true
 		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
@@ -410,5 +412,30 @@ func TestListenFails(t *testing.T) {
 				t.Fatalf("half-made sockets left: %v", leftovers)
 			}
 		})
+	}
+}
+
+// TestNodePortsFromEnv (PR 5 review): the node ports sandboxes may ever
+// reach come from the helper's own settings.
+func TestNodePortsFromEnv(t *testing.T) {
+	got, err := nodePortsFromEnv(env(map[string]string{"SB_EGRESS_DNS_PORT": "5353", "SB_EGRESS_PROXY_PORT": "8080",
+		"SB_SANDBOX_NODE_PORTS_ALLOW": "9000, 9001/udp"}), false)
+	if err != nil || !slices.Contains(got, rootpolicy.NodePort{Proto: "udp", Port: 5353}) ||
+		!slices.Contains(got, rootpolicy.NodePort{Proto: "tcp", Port: 8080}) || !slices.Contains(got, rootpolicy.NodePort{Proto: "udp", Port: 9001}) ||
+		!slices.Contains(got, rootpolicy.NodePort{Proto: "tcp", Port: 9000}) || slices.Contains(got, rootpolicy.NodePort{Proto: "tcp", Port: 10250}) {
+		t.Fatalf("%v %v", got, err)
+	}
+	for _, bad := range []map[string]string{
+		{"SB_SANDBOX_NODE_PORTS_ALLOW": "x"},
+		{"SB_SANDBOX_NODE_PORTS_ALLOW": "80/sctp"},
+		{"SB_EGRESS_DNS_PORT": "lots"},
+		{"SB_EGRESS_PROXY_PORT": "lots"},
+	} {
+		if _, err := nodePortsFromEnv(env(bad), false); err == nil {
+			t.Errorf("%v passed", bad)
+		}
+	}
+	if _, err := nodePortsFromEnv(env(map[string]string{"SB_SANDBOX_NODE_PORTS_ALLOW": "9000"}), true); err == nil {
+		t.Fatal("an operator's node ports passed in enterprise mode")
 	}
 }

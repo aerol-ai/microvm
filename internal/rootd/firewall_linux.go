@@ -61,7 +61,25 @@ func openFirewall(cfg Config, n NetworkHost) (FirewallHost, error) {
 	bridge := n.Bridge()
 	fence := ipv6fence.NewSupervisor(newFenceBackend(), slog.New(slog.DiscardHandler), ipv6fence.Source{Runtime: fenceRuntime,
 		Spec: func(context.Context) (ipv6fence.Spec, error) { return ipv6fence.Spec{Bridges: []string{bridge}}, nil }})
-	return &kernelFirewall{rules: m, fence: fence, subnet: n.Subnet()}, nil
+	k := &kernelFirewall{rules: m, fence: fence, subnet: n.Subnet()}
+	// Before any rule call (PR 5 review): a helper that starts on a kernel
+	// an earlier helper filled knows nothing of what is there. Its chain,
+	// its block sets and its own floor (the cloud metadata endpoints, the
+	// floor of its own environment, and the sandboxes' range when they may
+	// not reach each other) go in first, so every sandbox rule from here on
+	// lands below the floor's jump, and a release finds the address in the
+	// block sets it reads. Without them no rule call is served: the open
+	// fails, and the next call tries again.
+	if err := m.EnsureChain(); err != nil {
+		return nil, fmt.Errorf("the sandboxes' chain: %w", err)
+	}
+	// Block sets are an optimization: without them netrules keeps
+	// per-address rules, which stay correct.
+	_ = m.PrepareBlockSets()
+	if _, err := k.SetFloor(nil); err != nil {
+		return nil, fmt.Errorf("the egress floor: %w", err)
+	}
+	return k, nil
 }
 
 // ensureSysctls turns bridged traffic through netfilter on; tests replace
@@ -72,13 +90,12 @@ func (k *kernelFirewall) EnsureHost(ctx context.Context) (error, error) {
 	if err := ensureSysctls(); err != nil {
 		return nil, err
 	}
-	if err := k.rules.EnsureChain(); err != nil {
+	// The chain and the block sets went in when the firewall opened; this
+	// puts back whatever has gone since.
+	if err := k.rules.ReassertChain(); err != nil {
 		return nil, fmt.Errorf("the sandboxes' chain: %w", err)
 	}
-	// Block sets are an optimization for block-all: without them netrules
-	// keeps per-address rules, so a failure here is no failure of the call
-	// (sandboxd logs and goes on in single mode too).
-	_ = k.rules.PrepareBlockSets()
+	_, _ = k.rules.ReassertBlockSets()
 	k.fence.Sync(ctx, true)
 	return k.fence.Ready(fenceRuntime), nil
 }
@@ -128,7 +145,7 @@ func (k *kernelFirewall) SetFloor(cidrs []netip.Prefix) (bool, error) {
 	return false, nil
 }
 
-func (k *kernelFirewall) Rules(op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
+func (k *kernelFirewall) Rules(ctx context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
 	m := k.rules
 	switch op {
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS:
@@ -142,9 +159,12 @@ func (k *kernelFirewall) Rules(op rootdpb.SandboxRulesOp, ip string, allow, deny
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_BLOCK_INGRESS:
 		return false, m.ClearBlockAllIngress(ip)
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY:
-		return false, m.ApplyEgressPolicy(ip, allow, deny)
+		// A replace, never an add (PR 5 review): lists sent one after
+		// another never pile up on an address, whatever an earlier helper
+		// left there.
+		return false, m.ReplaceEgressPolicy(ctx, ip, allow, deny)
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY:
-		return false, m.ClearEgressPolicy(ip, allow, deny)
+		return false, m.ClearEgressPolicyOf(ip)
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_HOLD_EGRESS:
 		return false, m.HoldEgress(ip)
 	case rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS:

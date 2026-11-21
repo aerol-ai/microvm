@@ -104,3 +104,19 @@ func FuzzCheckNodePorts(f *testing.F) {
 		}
 	})
 }
+
+// TestCheckNodePortsWithin (PR 5 review): the agent narrows the helper's
+// list, never widens it.
+func TestCheckNodePortsWithin(t *testing.T) {
+	bound := []NodePort{{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 15080}, {Proto: "tcp", Port: 9000, Dst: "10.0.1.5"}}
+	for _, ok := range [][]NodePort{nil, {{Proto: "udp", Port: 53}}, {{Proto: "udp", Port: 53, Dst: "10.0.1.9"}}, {{Proto: "tcp", Port: 9000, Dst: "10.0.1.5"}}} {
+		if err := CheckNodePortsWithin(ok, bound); err != nil {
+			t.Errorf("%v: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]NodePort{{{Proto: "tcp", Port: 10250}}, {{Proto: "tcp", Port: 53}}, {{Proto: "tcp", Port: 9000}}, {{Proto: "tcp", Port: 9000, Dst: "10.0.1.6"}}} {
+		if RuleOf(CheckNodePortsWithin(bad, bound)) != RuleNodePort {
+			t.Errorf("%v passed", bad)
+		}
+	}
+}

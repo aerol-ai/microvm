@@ -64,7 +64,17 @@ func testConfig(t testing.TB) Config {
 		SocketGID: os.Getgid(),
 		AgentUID:  uint32(os.Getuid()),
 		Policy:    testPolicy(),
+		// The helper's own node port list, as ConfigFromEnv's defaults.
+		Firewall: FirewallConfig{NodePorts: testNodePorts()},
 	}, dir)
+}
+
+func testNodePorts() []rootpolicy.NodePort {
+	p, err := nodePortsFromEnv(func(string) string { return "" }, false)
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // withFiles puts the helper's folders for the files it makes under base,

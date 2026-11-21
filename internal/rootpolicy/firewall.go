@@ -19,7 +19,16 @@ const (
 	MaxRuleCIDRs  = 4096
 	MaxNodePorts  = 256
 	MaxFloorCIDRs = 4096
+	// MaxPolicyCIDRs bounds one address's egress policy, both lists
+	// together (PR 5 review): the helper replaces a policy, so this is
+	// also what one address can hold.
+	MaxPolicyCIDRs = 1024
 )
+
+// TooManyPolicyCIDRs is the refusal of a policy past MaxPolicyCIDRs.
+func TooManyPolicyCIDRs(n int) error {
+	return violate(RuleCIDR, "%d CIDRs in one policy; at most %d", n, MaxPolicyCIDRs)
+}
 
 // CheckRuleCIDRs parses a sandbox's egress policy list: each entry a
 // network or an address ("10.0.0.0/8", "1.2.3.4"), with no space, zone or
@@ -115,4 +124,23 @@ func CheckNodePorts(list []NodePort) ([]NodePort, error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// CheckNodePortsWithin: each entry of list is one of bound, the root
+// helper's own list, or a narrowing of one (the same port and protocol,
+// on one address where bound allows every address).
+func CheckNodePortsWithin(list, bound []NodePort) error {
+	for _, p := range list {
+		covered := false
+		for _, b := range bound {
+			if b.Proto == p.Proto && b.Port == p.Port && (b.Dst == "" || b.Dst == p.Dst) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return violate(RuleNodePort, "node port %s/%d is not one the root helper's settings allow sandboxes to reach", p.Proto, p.Port)
+		}
+	}
+	return nil
 }

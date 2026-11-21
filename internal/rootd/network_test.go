@@ -51,6 +51,20 @@ func (f *fakeNet) Leaseholder(ip netip.Addr) (string, bool, error) {
 	return name, ok, nil
 }
 
+func (f *fakeNet) LeaseOf(name string) (netip.Addr, bool, error) {
+	if err := f.failing("leaseof"); err != nil {
+		return netip.Addr{}, false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for ip, n := range f.leases {
+		if n == name {
+			return netip.MustParseAddr(ip), true, nil
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
 func (f *fakeNet) record(s string) {
 	f.mu.Lock()
 	f.calls = append(f.calls, s)

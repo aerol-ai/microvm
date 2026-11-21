@@ -524,6 +524,17 @@ func (s *stubNetwork) Remove(_ context.Context, _, p, _ string) error {
 }
 func (s *stubNetwork) DisableIPv6(string) error { return nil }
 func (s *stubNetwork) Bridge() string           { return "aerolvm0" }
+func (s *stubNetwork) LeaseOf(name string) (netip.Addr, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for path, st := range s.ns {
+		if filepath.Base(path) == name && len(st.IPv4) > 0 {
+			return netip.MustParseAddr(st.IPv4[0]), true, nil
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
 func (s *stubNetwork) Leaseholder(ip netip.Addr) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

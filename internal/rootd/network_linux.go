@@ -345,34 +345,84 @@ const maxLeaseFile = 512
 // be root's alone (only the plugin, run by root, writes it). No folder yet
 // (no ADD has run) or no file is no lease.
 func (k *kernelNetwork) Leaseholder(ip netip.Addr) (string, bool, error) {
+	dfd, err := k.openLeases()
+	if dfd < 0 || err != nil {
+		return "", false, err
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	return k.readLease(dfd, ip.String())
+}
+
+// LeaseOf finds the address leased to the slot name: the IPAM plugin keeps
+// one file per address, so each is read (a node's leases, a few thousand
+// small files at most, on a release that has no other way to know).
+func (k *kernelNetwork) LeaseOf(name string) (netip.Addr, bool, error) {
+	dfd, err := k.openLeases()
+	if dfd < 0 || err != nil {
+		return netip.Addr{}, false, err
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	rfd, err := unix.Openat(dfd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return netip.Addr{}, false, fmt.Errorf("lease folder %s: %w", k.leases, err)
+	}
+	dir := os.NewFile(uintptr(rfd), k.leases)
+	defer dir.Close()
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		return netip.Addr{}, false, fmt.Errorf("lease folder %s: %w", k.leases, err)
+	}
+	for _, f := range names {
+		a, err := netip.ParseAddr(f)
+		if err != nil || !k.subnet.Contains(a) {
+			continue
+		}
+		holder, ok, err := k.readLease(dfd, f)
+		if err != nil {
+			return netip.Addr{}, false, err
+		}
+		if ok && holder == name {
+			return a, true, nil
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
+// openLeases opens the lease folder through checked folders; -1 and no
+// error when it is not there yet (no lease was ever given).
+func (k *kernelNetwork) openLeases() (int, error) {
 	dfd, err := walkFolder(k.leases, false, func(at string, st *unix.Stat_t, last bool) error {
 		return rootfolder.CheckFolder(at, uint32(st.Mode), st.Uid, k.owner, !last)
 	})
 	if errors.Is(err, unix.ENOENT) {
-		return "", false, nil
+		return -1, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("lease folder %s: %w", k.leases, err)
+		return -1, fmt.Errorf("lease folder %s: %w", k.leases, err)
 	}
-	defer func() { _ = unix.Close(dfd) }()
-	fd, err := unix.Openat(dfd, ip.String(), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	return dfd, nil
+}
+
+// readLease reads the holder of the lease file f in the lease folder dfd.
+func (k *kernelNetwork) readLease(dfd int, f string) (string, bool, error) {
+	fd, err := unix.Openat(dfd, f, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("lease of %s: %w", ip, err)
+		return "", false, fmt.Errorf("lease of %s: %w", f, err)
 	}
-	f := os.NewFile(uintptr(fd), ip.String())
-	defer f.Close()
+	file := os.NewFile(uintptr(fd), f)
+	defer file.Close()
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return "", false, err
 	}
-	if err := checkRootFile(&st, filepath.Join(k.leases, ip.String()), k.owner); err != nil {
+	if err := checkRootFile(&st, filepath.Join(k.leases, f), k.owner); err != nil {
 		return "", false, err
 	}
 	buf := make([]byte, maxLeaseFile)
-	n, _ := f.Read(buf)
+	n, _ := file.Read(buf)
 	id, _, _ := strings.Cut(string(buf[:n]), "\n")
 	id = strings.TrimRight(id, "\r")
 	if id == "" {
