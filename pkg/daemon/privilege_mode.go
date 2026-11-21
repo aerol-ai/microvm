@@ -58,6 +58,11 @@ func checkPrivilegeMode(cfg config.Config) error {
 	if cfg.GvisorCheckpointMoves {
 		gaps = append(gaps, privmode.StepMoves)
 	}
+	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
+		// The kernel forwarder writes iptables rules at boot, and again to
+		// roll back after a boot that engaged it (hostPortForwarderFor).
+		gaps = append(gaps, privmode.StepHostPorts)
+	}
 	return privmode.NotYet("start sandboxd", gaps...)
 }
 

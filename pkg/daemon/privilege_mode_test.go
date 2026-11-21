@@ -67,6 +67,10 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"V8 isolates", func(c *config.Config) { c.EnableIsolate = true }, "V8", []privmode.Step{privmode.StepHostProcesses}},
 		{"Firecracker", func(c *config.Config) { c.EnableFirecracker = true }, "Firecracker", []privmode.Step{privmode.StepHostProcesses}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
+		{"ingress proxy routing", func(c *config.Config) { c.IngressProxyRouting = true }, "host-port forwarding", []privmode.Step{privmode.StepHostPorts}},
+		{"a rollback of ingress proxy routing", func(c *config.Config) {
+			c.DBPath = filepath.Join(engagedMarkerDir(t), "state.db")
+		}, "host-port forwarding", []privmode.Step{privmode.StepHostPorts}},
 		{"several at once, each named", func(c *config.Config) { c.EnableNetworkRules, c.EnableWasm = true, true }, "WASM",
 			[]privmode.Step{privmode.StepFirewall, privmode.StepHostProcesses}},
 	} {
@@ -89,6 +93,18 @@ func TestCheckPrivilegeMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// engagedMarkerDir is a data folder whose marker says the last boot
+// engaged ingress proxy routing.
+func engagedMarkerDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := config.Config{DBPath: filepath.Join(dir, "state.db")}
+	if err := writeBypassMarker(ingressRoutingMarkerPath(cfg), true); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestMountsOffFor(t *testing.T) {
