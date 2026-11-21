@@ -170,6 +170,8 @@ type vmmClientFactory func(socketPath string) VMMClient
 // boot paths respectively.
 type VMMClient interface {
 	PutMachineConfig(ctx context.Context, cfg firecracker.MachineConfig) error
+	// PutCPUConfig is the nested-virtualization seam (nested_virt.go).
+	PutCPUConfig(ctx context.Context, cfg firecracker.CPUConfig) error
 	PutBootSource(ctx context.Context, src firecracker.BootSource) error
 	PutDrive(ctx context.Context, driveID string, drv firecracker.Drive) error
 	PutNetworkInterface(ctx context.Context, ifaceID string, iface firecracker.NetworkInterface) error

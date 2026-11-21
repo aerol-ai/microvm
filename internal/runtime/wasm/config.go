@@ -54,6 +54,10 @@ type Config struct {
 	// InterpIdleTTL stops an idle context's interpreter; 0 means
 	// defaultInterpIdleTTL. SB_WASM_INTERP_IDLE_TTL.
 	InterpIdleTTL time.Duration
+	// UploadSpoolDir is where toolbox uploads too big for memory spill
+	// (config.UploadSpoolDir). "" keeps every upload in memory and refuses
+	// one that does not fit.
+	UploadSpoolDir string
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -76,5 +80,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		SessionLogBudget:         cfg.WasmSessionLogBudget,
 		InterpMaxContexts:        cfg.WasmInterpMaxContexts,
 		InterpIdleTTL:            cfg.WasmInterpIdleTTL,
+		UploadSpoolDir:           cfg.UploadSpoolDir(),
 	}
 }
