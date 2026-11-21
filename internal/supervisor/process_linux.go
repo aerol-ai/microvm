@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -84,3 +85,96 @@ func Terminate(pid int) { _ = syscall.Kill(pid, syscall.SIGTERM) }
 func LowerOwnOOMScore() error {
 	return os.WriteFile("/proc/self/oom_score_adj", []byte(strconv.Itoa(-999)), 0o644)
 }
+
+// StartHelper starts the root helper at bin, in the cgroup at dir (its own,
+// HelperGroup; none when dir is empty, for tests), with env and with files
+// as descriptors 3 and up. Its output is this container's.
+//
+// The reaper collects it like any child, so it is followed by pidfd, not
+// pid: the pidfd says when it ended whoever reaped it, and a signal sent
+// through it reaches only it. Once reaped, its pid may go to a sandbox's
+// process, which a signal by pid would then kill.
+func StartHelper(dir, bin string, env []string, files []*os.File) (Child, error) {
+	pidfd := -1
+	attr := &syscall.SysProcAttr{PidFD: &pidfd}
+	if dir != "" {
+		fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
+		}
+		defer unix.Close(fd)
+		attr.UseCgroupFD, attr.CgroupFD = true, fd
+	}
+	cmd := exec.Command(bin)
+	cmd.Env, cmd.ExtraFiles, cmd.SysProcAttr = env, files, attr
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	if pidfd < 0 {
+		// A kernel with no pidfd (before 5.3) cannot be followed safely.
+		_ = cmd.Process.Kill()
+		_ = cmd.Process.Release()
+		return nil, errNoPidfd
+	}
+	_ = cmd.Process.Release()
+	return newPidfdChild(pidfd), nil
+}
+
+var errNoPidfd = errors.New("this kernel gives no pidfd; the root helper needs Linux 5.3 or newer")
+
+// pidfdChild is a child followed by its pidfd.
+type pidfdChild struct {
+	mu   sync.Mutex
+	fd   int // -1 once the child has exited and the pidfd is closed
+	done chan struct{}
+}
+
+func newPidfdChild(fd int) *pidfdChild {
+	c := &pidfdChild{fd: fd, done: make(chan struct{})}
+	go c.wait()
+	return c
+}
+
+// wait polls the pidfd, which reads as ready once the process has exited.
+func (c *pidfdChild) wait() {
+	fds := []unix.PollFd{{Fd: int32(c.fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(fds, -1)
+		if errors.Is(err, unix.EINTR) || (err == nil && n == 0) {
+			continue
+		}
+		break // ready, or the pidfd is unusable: either way it is over
+	}
+	c.mu.Lock()
+	_ = unix.Close(c.fd)
+	c.fd = -1
+	close(c.done)
+	c.mu.Unlock()
+}
+
+func (c *pidfdChild) Signal(sig syscall.Signal) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fd < 0 {
+		return os.ErrProcessDone
+	}
+	return unix.PidfdSendSignal(c.fd, sig, nil, 0)
+}
+
+func (c *pidfdChild) Done() <-chan struct{} { return c.done }
+
+// openPidfd holds pid by pidfd (Linux 5.3), for HelperGroup's kill by hand.
+func openPidfd(pid int) (pidHandle, error) {
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return nil, err
+	}
+	return pidfd(fd), nil
+}
+
+// pidfd is a process's pidfd; the kernel sets close-on-exec on it.
+type pidfd int
+
+func (p pidfd) Kill() error  { return unix.PidfdSendSignal(int(p), unix.SIGKILL, nil, 0) }
+func (p pidfd) Close() error { return unix.Close(int(p)) }

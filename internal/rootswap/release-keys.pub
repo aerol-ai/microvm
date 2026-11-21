@@ -1,0 +1,9 @@
+The release public keys the runtime supervisor trusts to sign the root helper
+(internal/rootswap). Each is an ed25519 key as a PEM "PUBLIC KEY" block, the
+output of `aerolvm-rootd-sign -genkey` or `openssl pkey -pubout`. Text outside
+the blocks is ignored. Any key listed here can sign a helper that runs as root
+on every node whose runtime image is built from this file, so a change here is
+reviewed like a change to the supervisor itself, and it reaches running nodes
+only with a new runtime image.
+
+No key is listed yet: until one is, the supervisor refuses every staged helper.

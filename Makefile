@@ -1,7 +1,7 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd build-rootd rootd-proto rootd-proto-check images k8s-dev k8s-dev-down docs-install docs-dev docs-build clean \
+.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd build-rootd sign-rootd rootd-proto rootd-proto-check images k8s-dev k8s-dev-down docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
@@ -82,6 +82,22 @@ build-toolboxd:
 build-rootd:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=0 $(GO) build -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o $(BIN_DIR)/aerolvm-rootd ./cmd/aerolvm-rootd
+
+# A signed root helper for the runtime supervisor's swap (internal/rootswap,
+# eng review D4): builds it as a release does, with ROOTD_VERSION linked
+# in, and writes bin/aerolvm-rootd.manifest and .sig with the private key
+# in ROOTD_SIGNING_KEY (make one with
+# `go run ./cmd/aerolvm-rootd-sign -genkey <file>`). The supervisor runs it
+# only if the runtime image holds the matching public key
+# (internal/rootswap/release-keys.pub). ROOTD_VERSION must be a release
+# version (vX.Y.Z or vX.Y.Z-pre): `git describe` of an untagged commit is
+# not one.
+ROOTD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+sign-rootd:
+	@test -n "$(ROOTD_SIGNING_KEY)" || { echo "set ROOTD_SIGNING_KEY to the release private key file"; exit 1; }
+	mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=$(ROOTD_VERSION)" -o $(BIN_DIR)/aerolvm-rootd ./cmd/aerolvm-rootd
+	$(GO) run ./cmd/aerolvm-rootd-sign -key "$(ROOTD_SIGNING_KEY)" -version "$(ROOTD_VERSION)" $(BIN_DIR)/aerolvm-rootd
 
 # The root helper's gRPC code, from internal/rootd/rootdpb/rootd.proto.
 # Needs protoc (any version: gen.sh drops the line naming it). make test

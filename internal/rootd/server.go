@@ -12,6 +12,15 @@
 // Calls run in parallel, each on the goroutine gRPC gives it; the server
 // holds no lock around a call (eng review D11).
 //
+// Under the runtime supervisor the socket is the supervisor's, passed down
+// (Options.Listener), and one helper hands it to the next on a signed swap
+// (eng review D4). The handover is exclusive (outside review O6): Shutdown
+// stops accepting and lets every call in flight finish, and the
+// supervisor starts the next helper only once this one, and every process
+// it started, has exited (its cgroup is empty, internal/supervisor
+// HelperGroup), so two helpers never serve at once and a late call from
+// the old one cannot undo the new one's work for the same sandbox.
+//
 // Nothing runs this yet: cmd/aerolvm-rootd is the binary, and the agent
 // moves onto it in a later PR (task T4).
 package rootd
@@ -95,6 +104,11 @@ type Options struct {
 	Peer egress.PeerCheck
 	// OnRefusal hears every connection the peer check refuses. Nil logs it.
 	OnRefusal RefusalFunc
+	// Listener, when set, is the socket to serve: the supervisor's,
+	// inherited (rootswap.InheritedListener). The server then neither
+	// makes the socket nor removes it: the supervisor keeps it, and the
+	// next helper serves it. Nil: the server makes its own (listen).
+	Listener *net.UnixListener
 }
 
 // Server is the helper's socket and gRPC server.
@@ -104,10 +118,16 @@ type Server struct {
 	files      *files
 	srv        *grpc.Server
 	ln         *net.UnixListener
-	sock       os.FileInfo // the socket file this server made
+	sock       os.FileInfo // the socket file this server made; nil when inherited
 	containerd grpc.StreamHandler
 	onRefusal  RefusalFunc
 	stopOnce   sync.Once
+
+	// endless are the cancels of calls in flight that only their caller
+	// ends (endlessCalls); draining is set once Shutdown began.
+	endlessMu sync.Mutex
+	endless   map[*grpc.ServerStream]context.CancelFunc
+	draining  bool
 }
 
 // New makes the socket and the server. Serve starts serving.
@@ -129,7 +149,8 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		}
 		peer = egress.UnixPeerCheck([]uint32{cfg.AgentUID}, cfg.AgentCgroup)
 	}
-	s := &Server{cfg: cfg, log: log, containerd: opts.Containerd, onRefusal: opts.OnRefusal}
+	s := &Server{cfg: cfg, log: log, containerd: opts.Containerd, onRefusal: opts.OnRefusal,
+		endless: map[*grpc.ServerStream]context.CancelFunc{}}
 	if s.onRefusal == nil {
 		s.onRefusal = LogRefusal(log)
 	}
@@ -139,17 +160,19 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	ln, sock, err := listen(cfg.Socket, cfg.SocketGID)
-	if err != nil {
-		f.close()
-		return nil, err
+	ln, sock := opts.Listener, os.FileInfo(nil)
+	if ln == nil {
+		if ln, sock, err = listen(cfg.Socket, cfg.SocketGID); err != nil {
+			f.close()
+			return nil, err
+		}
 	}
 	s.files, s.ln, s.sock = f, ln, sock
 	sopts := append(slices.Clone(opts.ServerOptions),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
 		grpc.UnknownServiceHandler(s.route),
 		grpc.ChainUnaryInterceptor(answeredUnary),
-		grpc.ChainStreamInterceptor(answeredStream))
+		grpc.ChainStreamInterceptor(answeredStream, s.endOnDrain))
 	s.srv = grpc.NewServer(sopts...)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal})
 	return s, nil
@@ -165,11 +188,14 @@ func (s *Server) Serve() error {
 }
 
 // Shutdown stops taking connections and waits for calls in flight until
-// ctx ends, then cuts the rest: a stream that never ends by itself, such as
-// containerd's event subscription, would otherwise hold it forever. It
-// removes the socket if it is still the one this server made.
+// ctx ends, then cuts the rest. Calls that only their caller ends
+// (containerd's event subscription) are ended first, at once: waiting for
+// them would hold every swap to its deadline while the agent's other
+// calls wait for the next helper. It removes the socket if it is one this
+// server made.
 func (s *Server) Shutdown(ctx context.Context) {
 	s.stopOnce.Do(func() {
+		s.endEndless()
 		done := make(chan struct{})
 		go func() {
 			s.srv.GracefulStop()
@@ -182,8 +208,10 @@ func (s *Server) Shutdown(ctx context.Context) {
 			<-done
 		}
 		_ = s.ln.Close() // Serve may never have run, and only it closes the listener
-		if cur, err := os.Lstat(s.cfg.Socket); err == nil && os.SameFile(cur, s.sock) {
-			_ = os.Remove(s.cfg.Socket)
+		if s.sock != nil {
+			if cur, err := os.Lstat(s.cfg.Socket); err == nil && os.SameFile(cur, s.sock) {
+				_ = os.Remove(s.cfg.Socket)
+			}
 		}
 		// No call is left running to use the folders closed here: done
 		// waits, in both cases above, for GracefulStop, which returns only
@@ -191,6 +219,56 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.files.close()
 	})
 }
+
+// endlessCalls end only when their caller ends them: the agent's
+// containerd event subscription. Ending one is safe for the helper: it is
+// a read, and the agent subscribes again, to the next helper. Unlike a
+// containerd restart, containerd keeps sending events while the agent has
+// no subscription, and none is replayed, so the agent must check its
+// tasks' states once it has subscribed again (its split-mode wiring).
+var endlessCalls = map[string]bool{"/containerd.services.events.v1.Events/Subscribe": true}
+
+// endOnDrain gives each endless call a cancel that Shutdown uses, and
+// turns one away once Shutdown has begun.
+func (s *Server) endOnDrain(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, h grpc.StreamHandler) error {
+	if !endlessCalls[info.FullMethod] {
+		return h(srv, ss)
+	}
+	ctx, cancel := context.WithCancel(ss.Context())
+	defer cancel()
+	key := &ss
+	s.endlessMu.Lock()
+	if s.draining {
+		s.endlessMu.Unlock()
+		return status.Error(codes.Unavailable, "root helper is stopping")
+	}
+	s.endless[key] = cancel
+	s.endlessMu.Unlock()
+	defer func() {
+		s.endlessMu.Lock()
+		delete(s.endless, key)
+		s.endlessMu.Unlock()
+	}()
+	return h(srv, contextStream{ServerStream: ss, ctx: ctx})
+}
+
+// endEndless ends every endless call in flight, and any that starts after.
+func (s *Server) endEndless() {
+	s.endlessMu.Lock()
+	defer s.endlessMu.Unlock()
+	s.draining = true
+	for _, cancel := range s.endless {
+		cancel()
+	}
+}
+
+// contextStream is a stream with a context of the server's own.
+type contextStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (c contextStream) Context() context.Context { return c.ctx }
 
 // answered is the trailer that says this server handled the call
 // (rootdpb.AnsweredTrailer), so the agent can tell containerd's own

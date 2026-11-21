@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/rootswap"
 )
 
 // Settings come from the environment (SettingsFromEnv).
@@ -45,6 +48,18 @@ type Settings struct {
 	// through /proc/<pid>/root, this container's view, before a create
 	// answers (SB_MOUNTS_RUNTIME_PID_FILE).
 	PIDFile string
+	// RootdStageDir is where the agent stages the signed root helper
+	// (SB_ROOTD_STAGE_DIR, helper.go). Empty: the supervisor runs no
+	// helper, as before M1.
+	RootdStageDir string
+	// RootdBinDir is the supervisor's own folder for the verified copies
+	// it runs (SB_ROOTD_BIN_DIR): root's alone, in this container.
+	RootdBinDir string
+	// RootdSocket and RootdSocketGroup are the helper's socket and its
+	// group, read from the helper's own settings (SB_ROOTD_SOCKET,
+	// SB_ROOTD_SOCKET_GROUP): the supervisor makes the socket and hands
+	// it to each helper it runs.
+	RootdSocket, RootdSocketGroup string
 }
 
 // leaseCheckInterval paces the LeaseGuard: well under sandboxd's own
@@ -53,8 +68,8 @@ type Settings struct {
 const leaseCheckInterval = 500 * time.Millisecond
 
 // SettingsFromEnv reads SB_CONTAINERD_BINARY, SB_CONTAINERD_CONFIG,
-// SB_CGROUP_PARENT_FILE, SB_NETNS_DIR and SB_OWNERSHIP_LEASE_FILE, with the
-// runtime image's defaults.
+// SB_CGROUP_PARENT_FILE, SB_NETNS_DIR, SB_OWNERSHIP_LEASE_FILE and the
+// root helper's SB_ROOTD_* settings, with the runtime image's defaults.
 func SettingsFromEnv() Settings {
 	get := func(k, def string) string {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -71,6 +86,10 @@ func SettingsFromEnv() Settings {
 		IsolateJailDir:   get("SB_ISOLATE_JAIL_DIR", ""),
 		MountsDir:        get("SB_MOUNTS_DIR", ""),
 		PIDFile:          get("SB_RUNTIME_PID_FILE", ""),
+		RootdStageDir:    get("SB_ROOTD_STAGE_DIR", ""),
+		RootdBinDir:      get("SB_ROOTD_BIN_DIR", defaultRootdBinDir),
+		RootdSocket:      get("SB_ROOTD_SOCKET", defaultRootdSocket),
+		RootdSocketGroup: get("SB_ROOTD_SOCKET_GROUP", defaultRootdSocketGroup),
 	}
 }
 
@@ -88,6 +107,14 @@ type OS struct {
 	Reap         func(watched *atomic.Int64, exited chan<- int, log *slog.Logger)
 	// DefaultConfig prints containerd's default configuration.
 	DefaultConfig func(binary string) ([]byte, error)
+	// StartHelper starts the root helper at bin in the cgroup at dir.
+	StartHelper func(dir, bin string, env []string, files []*os.File) (Child, error)
+	// HelperGroup is the root helper's own cgroup at dir.
+	HelperGroup func(dir string) HelperGroup
+	// ReleaseKeys are the release keys built into the runtime image.
+	ReleaseKeys func() ([]ed25519.PublicKey, error)
+	// Environ is the supervisor's environment, which the helper gets.
+	Environ func() []string
 }
 
 // RealOS is the machine.
@@ -111,11 +138,23 @@ func RealOS() OS {
 		DefaultConfig: func(binary string) ([]byte, error) {
 			return exec.Command(binary, "config", "default").Output()
 		},
+		StartHelper: StartHelper,
+		HelperGroup: NewHelperGroup,
+		ReleaseKeys: rootswap.ReleaseKeys,
+		Environ:     os.Environ,
 	}
 }
 
-// Run sets the container up and keeps containerd running until ctx ends.
+// Run sets the container up and keeps containerd running until ctx ends,
+// and the root helper too when the agent stages one (helper.go).
 func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
+	var helper *HelperKeeper
+	if s.RootdStageDir != "" {
+		var err error
+		if helper, err = newHelperKeeper(s, sys.ReleaseKeys, log); err != nil {
+			return fmt.Errorf("root helper: %w", err)
+		}
+	}
 	if mi, err := sys.ReadFile("/proc/self/mountinfo"); err == nil && CgroupReadOnly(mi, sys.CgroupRoot) {
 		// A container that is not privileged gets the cgroup mount
 		// read-only (spike S7); its own CAP_SYS_ADMIN may remount it. In a
@@ -172,6 +211,26 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 		close(guardDone)
 	}
 
+	helperDone := make(chan struct{})
+	if helper != nil {
+		// The helper goes in a group of its own inside the runtime's,
+		// never above a sandbox: its restarts stop none of them, and the
+		// keeper kills all it started without touching containerd.
+		dir := l.HelperDir()
+		helper.Group = sys.HelperGroup(dir)
+		helper.Start = func(bin string, env []string, files []*os.File) (Child, error) {
+			return sys.StartHelper(dir, bin, env, files)
+		}
+		helper.Env = helperEnv(sys.Environ(), shape.Parent)
+		go func() {
+			defer close(helperDone)
+			helper.Run(ctx)
+		}()
+		log.Info("supervisor: running the signed root helper the agent stages", "stage", s.RootdStageDir, "socket", s.RootdSocket)
+	} else {
+		close(helperDone)
+	}
+
 	var watched atomic.Int64
 	exited := make(chan int, 1)
 	go sys.Reap(&watched, exited, log)
@@ -192,6 +251,7 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	}
 	k.Run(ctx)
 	<-guardDone
+	<-helperDone
 	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
 	if s.IsolateJailDir != "" || s.MountsDir != "" {
 		if raw, err := sys.ReadFile("/proc/self/mountinfo"); err != nil {
