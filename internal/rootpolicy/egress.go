@@ -24,9 +24,12 @@ func CheckProbeSlot(slot uint32) error {
 	return nil
 }
 
-// Bounds on one executable lookup: a rule set lists a few dozen paths.
+// Bounds on one executable lookup. The gateway asks about every binary a
+// sandbox's rules list, and a rule set may list 512 (egresspolicy's 32
+// rules, 16 binaries each), so the lookup takes as many: fewer and split
+// mode would refuse a per-program flow that single mode answers.
 const (
-	MaxMatchPaths = 64
+	MaxMatchPaths = 512
 	maxMatchPath  = 1024
 )
 
