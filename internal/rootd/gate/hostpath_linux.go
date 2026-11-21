@@ -95,17 +95,27 @@ func (h hostPaths) CheckStdio(p string) error {
 }
 
 // CheckBind accepts a bind source that is a regular file with one link, a
-// folder, or a socket (a sandbox's ready socket), reached with no link on
-// the way. Every folder from root down to the source must be owned by root
-// and writable by no one else, sticky or not: then the agent cannot swap
-// the source for a link between this check and runc's mount. Folders
-// above root follow the FIFO rule.
-func (h hostPaths) CheckBind(root, src string) error {
+// socket (a sandbox's ready socket), or, where folder allows it, a folder,
+// reached with no link on the way. Every folder from root down to the
+// source must be owned by root and writable by no one else, sticky or
+// not: then the agent cannot swap the source for a link between this check
+// and runc's mount. Folders above root follow the FIFO rule.
+//
+// A folder is refused unless folder says so (rootpolicy.BindRootFor: only
+// the external mounts). A folder bound into a sandbox, which runs as uid 0,
+// is one it can write, and so swap names in, unless it is bound read-only;
+// the helper's folders must stay root's alone.
+func (h hostPaths) CheckBind(root, src string, folder bool) error {
 	err := walkHostPath(src, func(at string, st *unix.Stat_t) error {
 		return h.folderOK(at, st, !(at == root || strings.HasPrefix(at, root+"/")))
 	}, func(st *unix.Stat_t) error {
 		switch st.Mode & unix.S_IFMT {
-		case unix.S_IFDIR, unix.S_IFSOCK:
+		case unix.S_IFDIR:
+			if !folder {
+				return fmt.Errorf("a folder, where only a file may be bound")
+			}
+			return nil
+		case unix.S_IFSOCK:
 			return nil
 		case unix.S_IFREG:
 			if st.Nlink > 1 {

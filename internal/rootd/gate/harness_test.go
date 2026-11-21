@@ -191,7 +191,7 @@ type acceptBinds struct {
 	seen [][2]string
 }
 
-func (a *acceptBinds) CheckBind(root, src string) error {
+func (a *acceptBinds) CheckBind(root, src string, _ bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.seen = append(a.seen, [2]string{root, src})

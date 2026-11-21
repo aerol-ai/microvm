@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -16,15 +17,20 @@ import (
 )
 
 // Defaults for the socket and its peer (plans/security-gaps-m1-m4.md §3.3).
-// The folders the agent fills default to sandboxd's own defaults
+// The agent's own folders default to sandboxd's own defaults
 // (internal/config), so a helper beside an agent with default settings
-// needs none either. The files root itself reads or runs default to the
-// helper's own folders, which the agent cannot write (review H2).
+// needs none either. Every file root opens because a container names it
+// (host files, ready socket names, FIFOs, runsc configs, moves) defaults
+// to the helper's own folders, which the agent cannot write (review H2,
+// files.go).
 const (
 	// DefaultSocket sits in a folder of the helper's own: the socket's
 	// folder must be root's alone (listen), and /run/aerolvm, where it was
 	// first meant to go, is an emptyDir every worker container can write.
-	DefaultSocket      = "/run/aerolvm-rootd/root.sock"
+	// The folder holds the socket alone: no sandbox may bind anything in
+	// it (ForbiddenRoots), while the ready socket names beside it in
+	// /run/aerolvm-rootd/ready are binds.
+	DefaultSocket      = "/run/aerolvm-rootd/sock/root.sock"
 	DefaultSocketGroup = "aerolvm"
 	// DefaultAgentUID is a uid nothing else in AerolVM runs as. The peer
 	// check goes by uid, so the agent's must be its own: 65532 is the
@@ -44,6 +50,7 @@ const (
 	defaultDBPath           = "/var/lib/sandboxd/state.db"
 	defaultToolbox          = "/usr/local/bin/toolboxd"
 	defaultFIFODir          = "/run/aerolvm-rootd/fifo"
+	defaultReadyDir         = "/run/aerolvm-rootd/ready"
 	defaultPidsLimit        = 4096
 	// sandboxd's defaults for the users its jails run as.
 	defaultJailUID = 1000
@@ -76,7 +83,66 @@ type Config struct {
 	ContainerdSocket string
 	// Policy is what the containerd gate checks every write against.
 	Policy rootpolicy.Policy
+	// Files is where the helper makes the files runc, runsc and the shim
+	// open as root (files.go). The FIFOs go in Policy.FIFODir.
+	Files FileDirs
 }
+
+// FileDirs are the helper's own folders for the files it makes for
+// containers. Each must be root's alone: the agent can rename anything in a
+// folder it can write, so a file root opens there could be swapped for a
+// link between the gate's check and root's open.
+type FileDirs struct {
+	// Hosts holds each container's host files, in <Hosts>/<id>. A helper
+	// file root of the policy.
+	Hosts string
+	// Ready holds a name for each container's ready socket, in
+	// <Ready>/<id>. A helper file root of the policy.
+	Ready string
+	// Runsc holds the runsc shim configs, the policy's RunscConfigPaths.
+	Runsc string
+	// AgentReady is where the agent binds its ready sockets (sandboxd's
+	// DockerReadySocketDir). The helper hard-links each socket from here
+	// into Ready, so both must be on one filesystem.
+	AgentReady string
+}
+
+// validate checks the folders and that the policy lets the gate accept
+// what the helper makes in them. socketDir is the helper's socket folder.
+func (d FileDirs) validate(p rootpolicy.Policy, socketDir string) error {
+	folders := []struct{ name, dir string }{{"hosts", d.Hosts}, {"ready", d.Ready}, {"runsc", d.Runsc}, {"agent ready", d.AgentReady}}
+	for _, f := range folders {
+		if !filepath.IsAbs(f.dir) || filepath.Clean(f.dir) != f.dir || f.dir == "/" {
+			return fmt.Errorf("root helper: %s folder %q: want a clean absolute folder other than /", f.name, f.dir)
+		}
+	}
+	// Each folder has one job and one rule: what a sandbox may bind (hosts,
+	// ready), what root reads (runsc, moves), FIFOs, the socket, and the
+	// agent's own. One inside another would put the first's files under
+	// the second's rule: a ready folder holding the runsc folder would let
+	// a spec bind a runsc config.
+	folders = append(folders, []struct{ name, dir string }{{"moves", p.MovesDir}, {"FIFO", p.FIFODir}, {"socket", socketDir}}...)
+	for i, a := range folders {
+		for _, b := range folders[i+1:] {
+			if a.dir == b.dir || strings.HasPrefix(a.dir, b.dir+"/") || strings.HasPrefix(b.dir, a.dir+"/") {
+				return fmt.Errorf("root helper: the %s folder %s and the %s folder %s overlap", a.name, a.dir, b.name, b.dir)
+			}
+		}
+	}
+	for _, root := range []string{d.Hosts, d.Ready} {
+		if !slices.Contains(p.HelperFileRoots, root) {
+			return fmt.Errorf("root helper: the policy's helper file roots %v lack %s, where the helper makes binds", p.HelperFileRoots, root)
+		}
+	}
+	for _, path := range []string{d.runscPath(runscDefaultFile), d.runscPath(runscRestoreFile)} {
+		if !slices.Contains(p.RunscConfigPaths, path) {
+			return fmt.Errorf("root helper: the policy's runsc configs %v lack %s, which the helper writes", p.RunscConfigPaths, path)
+		}
+	}
+	return nil
+}
+
+func (d FileDirs) runscPath(name string) string { return filepath.Join(d.Runsc, name) }
 
 // Validate checks the parts of the config the server uses. ConfigFromEnv
 // also refuses a root agent; tests that run as root may not.
@@ -90,7 +156,7 @@ func (c Config) Validate() error {
 	if err := c.Policy.Validate(); err != nil {
 		return fmt.Errorf("root helper: %w", err)
 	}
-	return nil
+	return c.Files.validate(c.Policy, filepath.Dir(c.Socket))
 }
 
 // maxMemoryMB keeps the node's memory in bytes within an int64.
@@ -161,20 +227,28 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	}
 	socket := path("SB_ROOTD_SOCKET", DefaultSocket)
 	containerdSocket := path("SB_CONTAINERD_SOCKET", defaultContainerdSocket)
-	// The agent's containerd driver keeps its per-sandbox host files under
-	// its run dir (internal/runtime/containerd hosts.go);
-	// TestHelperPolicyMatchesDriverLayout there pins the names.
+	// The agent's own folders: the helper makes nothing root opens in
+	// them. TestHelperPolicyMatchesDriverLayout in
+	// internal/runtime/containerd pins the names.
 	runDir := path("SB_CONTAINERD_RUN_DIR", defaultRunDir)
 	mountsRoot := path("SB_MOUNTS_ROOT", defaultMountsRoot)
 	credDir := path("SB_MOUNTS_CRED_DIR", defaultCredDir)
 	dataDir := filepath.Dir(path("SB_DB_PATH", defaultDBPath))
 	stateDir := path("SB_ROOTD_STATE_DIR", DefaultStateDir)
 	fifoDir := path("SB_ROOTD_FIFO_DIR", defaultFIFODir)
+	readyDir := path("SB_ROOTD_READY_DIR", defaultReadyDir)
 	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
 	netnsDir := path("SB_NETNS_DIR", defaultNetnsDir)
 	if pathErr != nil {
 		return Config{}, pathErr
+	}
+	dirs := FileDirs{
+		Hosts: filepath.Join(stateDir, "hosts"),
+		Ready: readyDir,
+		Runsc: filepath.Join(stateDir, "runsc"),
+		// sandboxd's config.DockerReadySocketDir.
+		AgentReady: filepath.Join(credDir, "docker", "ready"),
 	}
 	// The agent owns its folders and can rename anything below them, a
 	// folder root made included, so nothing root trusts may sit there.
@@ -182,6 +256,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		{"SB_ROOTD_SOCKET", filepath.Dir(socket)},
 		{"SB_ROOTD_STATE_DIR", stateDir},
 		{"SB_ROOTD_FIFO_DIR", fifoDir},
+		{"SB_ROOTD_READY_DIR", readyDir},
 	} {
 		for _, a := range []string{runDir, mountsRoot, credDir, dataDir} {
 			if h.dir == a || strings.HasPrefix(h.dir, a+"/") {
@@ -200,28 +275,31 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			Snapshotter:     "overlayfs",
 			SnapshotterRoot: snapshotterRoot,
 			NetnsDir:        netnsDir,
-			CgroupParent:    strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
-			BindRoots: []string{
-				filepath.Join(runDir, "hosts"),
-				mountsRoot,
-				// config.DockerReadySocketDir and the egress CA beside the
-				// database (internal/service/egress_inspect.go).
-				filepath.Join(credDir, "docker", "ready"),
-				filepath.Join(dataDir, "egress-ca"),
-			},
-			BindFiles: []string{toolbox},
+			// From the helper's own environment only. On Kubernetes the
+			// supervisor works the parent out and must hand it to the
+			// helper itself: the copy it leaves for the agent in
+			// /run/aerolvm/cgroup-parent sits in a folder every worker
+			// container can write (review L6).
+			CgroupParent: strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
+			// Binds come from the external mounts, which move to the
+			// helper with its mount calls, and from the files the helper
+			// makes in its own folders (host files, the egress CA among
+			// them, and ready socket names), one read-only file each. The
+			// agent's run dir, ready dir and database folder are no bind
+			// roots: the agent can swap anything in them.
+			BindRoots:       []string{mountsRoot},
+			BindFiles:       []string{toolbox},
+			HelperFileRoots: []string{dirs.Hosts, dirs.Ready},
 			// The two sockets that are as good as root: this helper's and
 			// containerd's.
-			ForbiddenRoots: []string{filepath.Dir(socket), filepath.Dir(containerdSocket)},
-			MovesDir:       filepath.Join(stateDir, "moves"),
-			FIFODir:        fifoDir,
-			RunscConfigPaths: []string{
-				filepath.Join(stateDir, "runsc", "config.toml"),
-				filepath.Join(stateDir, "runsc", "restore.toml"),
-			},
-			Privileged: privileged,
-			Limits:     limits,
+			ForbiddenRoots:   []string{filepath.Dir(socket), filepath.Dir(containerdSocket)},
+			MovesDir:         filepath.Join(stateDir, "moves"),
+			FIFODir:          fifoDir,
+			RunscConfigPaths: []string{dirs.runscPath(runscDefaultFile), dirs.runscPath(runscRestoreFile)},
+			Privileged:       privileged,
+			Limits:           limits,
 		},
+		Files: dirs,
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

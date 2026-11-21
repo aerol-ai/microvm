@@ -33,9 +33,11 @@ func socketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) (*rig, 
 	if dir, err = filepath.EvalSymlinks(dir); err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(dir, "root.sock")
+	// The socket's folder holds the socket alone; the helper's other
+	// folders sit beside it (rootd.FileDirs).
+	sock := filepath.Join(dir, "sock", "root.sock")
 	srv, err := rootd.New(
-		rootd.Config{Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()), Policy: p},
+		helperConfig(rootd.Config{Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()), Policy: p}, dir),
 		rootd.Options{
 			Containerd:    r.gate.Handle,
 			ServerOptions: r.gate.ServerOptions(),
@@ -55,6 +57,24 @@ func socketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) (*rig, 
 	r.dial = agent.DialContainerd
 	r.conn = bufConn(t, r.dial)
 	return r, agent
+}
+
+// helperConfig lays the helper's own folders out under base, as
+// rootd.ConfigFromEnv lays them out under its state and run folders, and
+// adds them to the helper's copy of the policy.
+func helperConfig(c rootd.Config, base string) rootd.Config {
+	c.Files = rootd.FileDirs{
+		Hosts:      filepath.Join(base, "state", "hosts"),
+		Ready:      filepath.Join(base, "run", "ready"),
+		Runsc:      filepath.Join(base, "state", "runsc"),
+		AgentReady: filepath.Join(base, "agent", "ready"),
+	}
+	p := c.Policy
+	p.FIFODir = filepath.Join(base, "run", "fifo")
+	p.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
+	p.RunscConfigPaths = []string{filepath.Join(c.Files.Runsc, "config.toml"), filepath.Join(c.Files.Runsc, "restore.toml")}
+	c.Policy = p
+	return c
 }
 
 func newSocketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) *rig {

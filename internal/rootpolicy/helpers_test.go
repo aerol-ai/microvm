@@ -27,6 +27,9 @@ const (
 	testMoves    = testRunDir + "/moves"
 	testRunscCfg = testRunDir + "/runsc/config.toml"
 	testRestore  = testRunDir + "/runsc/restore.toml"
+	// The root helper's own folders of per-container files.
+	testHelperHosts = "/var/lib/aerolvm-rootd/hosts"
+	testHelperReady = "/run/aerolvm-rootd/ready"
 )
 
 // testPolicy is the helper's policy for an agent with the default paths.
@@ -38,6 +41,7 @@ func testPolicy() Policy {
 		NetnsDir:         "/run/netns",
 		BindRoots:        []string{testRunDir + "/hosts", testReady, testMounts},
 		BindFiles:        []string{testToolbox},
+		HelperFileRoots:  []string{testHelperHosts, testHelperReady},
 		ForbiddenRoots:   []string{"/run/aerolvm/sock", "/run/containerd"},
 		MovesDir:         testMoves,
 		FIFODir:          testFIFO,

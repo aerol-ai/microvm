@@ -16,7 +16,7 @@ func (offLinux) CheckStdio(p string) error {
 	return stdioViolation(p, "stdio paths are checked only on Linux")
 }
 
-func (offLinux) CheckBind(_, src string) error {
+func (offLinux) CheckBind(_, src string, _ bool) error {
 	return bindViolation(src, "bind sources are checked only on Linux")
 }
 

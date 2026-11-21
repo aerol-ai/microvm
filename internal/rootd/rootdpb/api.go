@@ -21,7 +21,12 @@ const ServicePrefix = "/aerolvm.rootd."
 // The features a helper can list in VersionResponse.features: each is the
 // short name of a RootHelper call.
 const (
-	FeatureEnsureHost = "EnsureHost"
+	FeatureEnsureHost           = "EnsureHost"
+	FeatureEnsureHostFiles      = "EnsureHostFiles"
+	FeatureEnsureTaskFIFOs      = "EnsureTaskFIFOs"
+	FeatureEnsureRunscConfig    = "EnsureRunscConfig"
+	FeatureEnsureReadySocket    = "EnsureReadySocket"
+	FeatureRemoveContainerFiles = "RemoveContainerFiles"
 )
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
@@ -30,6 +35,12 @@ const (
 // without it failed between the agent and the helper. The agent's client
 // marks only the second kind as the helper unavailable.
 const AnsweredTrailer = "aerolvm-rootd-answered"
+
+// Features lists every feature name above, for tests that must cover each.
+func Features() []string {
+	return []string{FeatureEnsureHost, FeatureEnsureHostFiles, FeatureEnsureTaskFIFOs,
+		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles}
+}
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.
 // internal/rootclient exports it as ErrUnavailable; it lives here so the

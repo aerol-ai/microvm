@@ -51,7 +51,7 @@ import (
 
 const (
 	// DefaultSocket is where the helper listens (internal/rootd).
-	DefaultSocket = "/run/aerolvm-rootd/root.sock"
+	DefaultSocket = "/run/aerolvm-rootd/sock/root.sock"
 	// DefaultTimeout bounds one connect, one handshake, and a typed call
 	// whose context has no deadline. The helper is a local process;
 	// anything slower is a helper that is stuck.
@@ -349,14 +349,73 @@ func (c *Client) require(ctx context.Context, feature string) (*session, error) 
 // EnsureHost asks the helper to set the host up for sandboxes. No helper
 // serves it yet, so it returns an UnsupportedError.
 func (c *Client) EnsureHost(ctx context.Context) error {
-	s, err := c.require(ctx, rootdpb.FeatureEnsureHost)
+	_, err := call(ctx, c, rootdpb.FeatureEnsureHost, &rootdpb.EnsureHostRequest{}, rootdpb.RootHelperClient.EnsureHost)
+	return err
+}
+
+// The calls below have the helper make the files runc, runsc and the
+// containerd shim open as root, in folders only root can write
+// (internal/rootd files.go). Each answers with the paths the agent puts in
+// its specs; the agent never names a path itself. A value the helper
+// refuses comes back as InvalidArgument or PermissionDenied, as the
+// helper's own status.
+
+// EnsureHostFiles has the helper write a container's hostname, hosts and
+// resolv.conf files, and the egress CA when the request has one.
+func (c *Client) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {
+	return call(ctx, c, rootdpb.FeatureEnsureHostFiles, req, rootdpb.RootHelperClient.EnsureHostFiles)
+}
+
+// EnsureTaskFIFOs has the helper make fresh stdout and stderr FIFOs for a
+// container's next task. Call it once per task, before opening them: a
+// second call replaces them, and a reader of the first pair would then
+// never see the task's output. Re-attaching to a running task opens the
+// FIFOs it has, without this call.
+func (c *Client) EnsureTaskFIFOs(ctx context.Context, containerID string) (*rootdpb.EnsureTaskFIFOsResponse, error) {
+	return call(ctx, c, rootdpb.FeatureEnsureTaskFIFOs, &rootdpb.EnsureTaskFIFOsRequest{ContainerId: containerID}, rootdpb.RootHelperClient.EnsureTaskFIFOs)
+}
+
+// EnsureRunscConfig has the helper write one of its runsc shim configs and
+// returns its path, for the runsc runtime options' ConfigPath.
+func (c *Client) EnsureRunscConfig(ctx context.Context, config rootdpb.RunscConfig) (string, error) {
+	resp, err := call(ctx, c, rootdpb.FeatureEnsureRunscConfig, &rootdpb.EnsureRunscConfigRequest{Config: config}, rootdpb.RootHelperClient.EnsureRunscConfig)
+	return resp.GetPath(), err
+}
+
+// EnsureReadySocket names, in the helper's folder, the ready socket the
+// agent has bound for a container in its own ready folder (pkg/docker:
+// <id>.<nonce>.sock, or <id>.sock for a park socket when nonce is empty),
+// and returns that name for the spec's bind. Call it again after binding
+// the socket again.
+func (c *Client) EnsureReadySocket(ctx context.Context, containerID, nonce string) (string, error) {
+	resp, err := call(ctx, c, rootdpb.FeatureEnsureReadySocket, &rootdpb.EnsureReadySocketRequest{ContainerId: containerID, Nonce: nonce}, rootdpb.RootHelperClient.EnsureReadySocket)
+	return resp.GetPath(), err
+}
+
+// RemoveContainerFiles has the helper remove everything it made for a
+// container. Gone already counts as done.
+func (c *Client) RemoveContainerFiles(ctx context.Context, containerID string) error {
+	_, err := call(ctx, c, rootdpb.FeatureRemoveContainerFiles, &rootdpb.RemoveContainerFilesRequest{ContainerId: containerID}, rootdpb.RootHelperClient.RemoveContainerFiles)
+	return err
+}
+
+// call runs one typed call: refused here, before it is sent, when the
+// helper lacks it; bounded by the client's timeout when ctx has no
+// deadline; and with the client's errors (ErrUnavailable, ErrUnsupported).
+func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req,
+	rpc func(rootdpb.RootHelperClient, context.Context, Req, ...grpc.CallOption) (Resp, error)) (Resp, error) {
+	var zero Resp
+	s, err := c.require(ctx, feature)
 	if err != nil {
-		return err
+		return zero, err
 	}
 	cctx, cancel := c.callContext(ctx)
 	defer cancel()
-	_, err = s.rpc.EnsureHost(cctx, &rootdpb.EnsureHostRequest{})
-	return c.callErr(ctx, s, rootdpb.FeatureEnsureHost, err)
+	resp, err := rpc(s.rpc, cctx, req)
+	if err := c.callErr(ctx, s, feature, err); err != nil {
+		return zero, err
+	}
+	return resp, nil
 }
 
 // callContext bounds a typed call by the client's timeout when the caller
