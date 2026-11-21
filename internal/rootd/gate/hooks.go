@@ -70,15 +70,6 @@ func (g *Gate) checkNetns(ctx context.Context, id, name string) error {
 	return nil
 }
 
-// checkBinds walks every bind source of c on disk.
-func (g *Gate) checkBinds(c rootpolicy.Container) error {
-	sources, err := rootpolicy.SpecBindSources(c)
-	if err != nil {
-		return err
-	}
-	return g.checkBindSources(sources)
-}
-
 // checkBindSources walks each bind source on disk.
 func (g *Gate) checkBindSources(sources []string) error {
 	for _, src := range sources {
