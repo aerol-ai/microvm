@@ -289,6 +289,10 @@ reads it for the internal zone, its copy of the floor and the proxy.
   changes), the gateway's `deny_floor` set, and the WASM and isolate dial
   guards. Check the host copies with `sudo iptables -S | grep AEROLVM-FLOOR-`:
   a node running containers and Firecracker guests has one chain for each.
+  Each subnet has two floor chains, `AEROLVM-FLOOR-<8 hex>` and
+  `AEROLVM-FLOOR-<8 hex>-B`: a change fills the one not in use and then
+  moves the jump to it, so there is never a moment without a floor. The
+  one the user chain jumps to is the live floor; the other is empty.
   A plain `AEROLVM-FLOOR` chain is an older daemon's, emptied at boot.
   The cloud metadata endpoints are on the floor with or without a file.
   The `aerolvm_egress_floor_ready` expvar is 1 per runtime that has the

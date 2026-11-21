@@ -44,7 +44,8 @@ func IsEgressFloorNotReady(err error) bool {
 
 // FloorChain is one sandbox subnet's egress deny floor as a node's host
 // firewall holds it (pkg/docker/netrules floor.go): the AEROLVM-FLOOR-<8 hex>
-// chain, the subnet whose traffic it drops, the destinations it drops, and
+// chain, or its twin AEROLVM-FLOOR-<8 hex>-B (a floor change fills the
+// chain not in use and moves the jump to it), the subnet whose traffic it drops, the destinations it drops, and
 // the user chains (DOCKER-USER, AEROLVM-USER, AEROLVM-FC) whose first rule
 // jumps to it.
 type FloorChain struct {
@@ -65,7 +66,7 @@ func (f *FloorChain) Drops(dst netip.Addr) bool {
 }
 
 var (
-	floorChainName = `AEROLVM-FLOOR-[0-9a-f]{8}`
+	floorChainName = `AEROLVM-FLOOR-[0-9a-f]{8}(?:-B)?`
 	// iptables-save, nft-backed or legacy.
 	iptFloorDropRe = regexp.MustCompile(`^-A (` + floorChainName + `) -s (\S+) -d (\S+) -j DROP$`)
 	iptRuleRe      = regexp.MustCompile(`^-A (\S+) (.*)$`)
