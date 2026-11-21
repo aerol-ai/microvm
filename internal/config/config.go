@@ -2335,6 +2335,29 @@ func (p PlatformVolumesConfig) Validate() error {
 		return fmt.Errorf("SB_PLATFORM_VOLUMES_BACKEND must be %q or %q, got %q",
 			PlatformVolumesBackendS3, PlatformVolumesBackendNFS, p.Backend)
 	}
+	return p.validateMountOptions()
+}
+
+// validateMountOptions holds the options a platform volume's mount is built
+// with to the same mount-tool allow lists as a caller's mount
+// (models.MountSpec.ValidateToolOptions). They are checked here, once, so
+// a bad value stops the daemon naming the setting, rather than failing
+// every create with a 400 the caller cannot fix; the create path then
+// skips platform volumes' mounts. Both backends' values are checked when
+// set: a volume keeps the backend it was made on.
+func (p PlatformVolumesConfig) validateMountOptions() error {
+	for _, c := range []struct {
+		env  string
+		spec models.MountSpec
+	}{
+		{"SB_PLATFORM_VOLUMES_NFS_OPTIONS", models.MountSpec{Type: models.MountTypeNFS, Options: map[string]string{"opts": p.NFSOptions}}},
+		{"SB_PLATFORM_VOLUMES_S3_REGION", models.MountSpec{Type: models.MountTypeS3, Options: map[string]string{"region": p.S3Region}}},
+		{"SB_PLATFORM_VOLUMES_S3_ENDPOINT", models.MountSpec{Type: models.MountTypeS3, Options: map[string]string{"endpoint": p.S3Endpoint}}},
+	} {
+		if err := c.spec.ValidateToolOptions(); err != nil {
+			return fmt.Errorf("%s: %w", c.env, err)
+		}
+	}
 	return nil
 }
 
