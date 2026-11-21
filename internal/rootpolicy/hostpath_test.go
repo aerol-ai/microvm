@@ -10,6 +10,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// POSIX mode bits for the cases below (rootfolder.CheckFolder reads them).
+const (
+	modeFolder = 0o040000
+	modeSticky = 0o1000
+)
+
 func TestCheckFolder(t *testing.T) {
 	const owner = 1000
 	for _, tc := range []struct {
