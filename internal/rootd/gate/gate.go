@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 
 	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -142,6 +143,10 @@ func (g *Gate) ServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.UnknownServiceHandler(g.Handle),
 		grpc.ForceServerCodecV2(frameCodec{}),
+		// Every create sends a burst of short calls; a worker per CPU
+		// serves them on goroutines whose stacks have already grown, where
+		// gRPC would start a new goroutine for each.
+		grpc.NumStreamWorkers(uint32(runtime.GOMAXPROCS(0))),
 		grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 		grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
 	}
