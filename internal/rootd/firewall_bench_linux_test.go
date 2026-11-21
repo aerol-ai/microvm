@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -298,12 +299,48 @@ func TestKernelCreateBudget(t *testing.T) {
 	ctx := context.Background()
 	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 	type series struct{ single, split, inside []float64 }
-	var cold, warm series
+	var cold, warm, floor series
 	var loads []float64
+	// A floor change: an operator floor of budgetFloorSize ranges, two
+	// lists in turn so each change rewrites the chain. Single mode's floor
+	// is on a subnet of its own (one manager per subnet, as on a node).
+	var floorLists [2][]netip.Prefix
+	for i := range floorLists {
+		for j := range budgetFloorSize {
+			floorLists[i] = append(floorLists[i], netip.PrefixFrom(netip.AddrFrom4([4]byte{byte(11 + i), byte(j), 0, 0}), 16))
+		}
+	}
+	singleFloorSubnet := netip.MustParsePrefix("10.251.0.0/24")
 	n := 0
 	for r := range rounds {
 		loads = append(loads, budgetLoad())
-		var cs, cp, ci, ws, wp, wi []float64
+		var cs, cp, ci, ws, wp, wi, fs, fp, fi []float64
+		for k := range per {
+			for _, split := range [][]bool{{false, true}, {true, false}}[(r+k)%2] {
+				list := floorLists[(n+k)%2]
+				t0 := time.Now()
+				var err error
+				if split {
+					strs := make([]string, len(list))
+					for i, p := range list {
+						strs[i] = p.String()
+					}
+					_, err = f.c.SetEgressFloor(ctx, strs)
+				} else {
+					err = f.m.SetFloor(singleFloorSubnet, list)
+				}
+				d := time.Since(t0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if split {
+					fp, fi = append(fp, ms(d)), append(fi, ms(time.Duration(handler.Load())))
+				} else {
+					fs = append(fs, ms(d))
+				}
+			}
+		}
+		floor.single, floor.split, floor.inside = append(floor.single, budgetMedian(fs)), append(floor.split, budgetMedian(fp)), append(floor.inside, budgetMedian(fi))
 		for k := range per {
 			for _, split := range [][]bool{{false, true}, {true, false}}[(r+k)%2] {
 				n++
@@ -359,13 +396,17 @@ func TestKernelCreateBudget(t *testing.T) {
 	for _, s := range []struct {
 		name string
 		s    series
-	}{{"cold create (namespace, CNI, block-all, policy)", cold}, {"warm create (block-all, policy)", warm}} {
+	}{{"cold create (namespace, CNI, block-all, policy)", cold}, {"warm create (block-all, policy)", warm},
+		{fmt.Sprintf("floor change (%d ranges)", budgetFloorSize), floor}} {
 		t.Logf("%s: %s", s.name, budgetPaired(s.s.single, s.s.split))
 		t.Logf("  inside the helper's call vs single: %s", budgetPaired(s.s.single, s.s.inside))
 		t.Logf("  the client's round trip (split - inside): %s", budgetPaired(s.s.inside, s.s.split))
 	}
 	t.Logf("load average (1 min) over the rounds: %.2f to %.2f", slices.Min(loads), slices.Max(loads))
 }
+
+// budgetFloorSize is the operator floor's size in the floor-change series.
+const budgetFloorSize = 64
 
 func budgetMedian(v []float64) float64 {
 	s := slices.Clone(v)
