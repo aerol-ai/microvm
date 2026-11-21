@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
 	"time"
 
@@ -34,7 +33,9 @@ func socketRig(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) (*rig, 
 	if dir, err = filepath.EvalSymlinks(dir); err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(dir, "root.sock")
+	// The socket's folder holds the socket alone; the helper's other
+	// folders sit beside it (rootd.FileDirs).
+	sock := filepath.Join(dir, "sock", "root.sock")
 	srv, err := rootd.New(
 		helperConfig(rootd.Config{Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()), Policy: p}, dir),
 		rootd.Options{
@@ -70,7 +71,7 @@ func helperConfig(c rootd.Config, base string) rootd.Config {
 	}
 	p := c.Policy
 	p.FIFODir = filepath.Join(base, "run", "fifo")
-	p.BindRoots = append(slices.Clone(p.BindRoots), c.Files.Hosts, c.Files.Ready)
+	p.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
 	p.RunscConfigPaths = []string{filepath.Join(c.Files.Runsc, "config.toml"), filepath.Join(c.Files.Runsc, "restore.toml")}
 	c.Policy = p
 	return c

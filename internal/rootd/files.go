@@ -3,7 +3,6 @@ package rootd
 import (
 	"bytes"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -37,6 +37,12 @@ import (
 //	<Policy.FIFODir>/<id>/{stdout,stderr}  FIFOs, 0640 to the agent's group
 //	<Files.Runsc>/{config.toml,restore.toml}  0644
 //
+// The ready folders are 0700: the agent's own ready folder is what keeps
+// other users off its socket, and the helper's link gives that socket a
+// second name, which only root (runc, the gate) needs to reach. The FIFO
+// folders are 0750 to the agent's group, which opens the FIFOs; others
+// have no business there either.
+//
 // The folders are opened once, at start, one name at a time with no link
 // followed (openFolder), and every later step goes through those open
 // folders, never a path: create a temporary name, set its mode, rename it
@@ -47,17 +53,25 @@ import (
 // answer is the paths the agent puts in its specs, which the gate then
 // accepts because they sit in these folders.
 
-// File names in a container's folders.
+// File names in a container's folders. The ones a spec binds are
+// rootpolicy's, which the gate accepts by name.
 const (
-	hostnameFile     = "hostname"
-	hostsFile        = "hosts"
-	resolvConfFile   = "resolv.conf"
-	egressCAFile     = "egress-ca.pem"
+	hostnameFile     = rootpolicy.HostnameFile
+	hostsFile        = rootpolicy.HostsFile
+	resolvConfFile   = rootpolicy.ResolvConfFile
+	egressCAFile     = rootpolicy.EgressCAFile
 	stdoutFIFO       = "stdout"
 	stderrFIFO       = "stderr"
-	parkSocketName   = "ready.sock"
 	runscDefaultFile = "config.toml"
 	runscRestoreFile = "restore.toml"
+)
+
+// Folder modes. A container's host files folder is open to all, as the
+// files in it are; the others are closed (see above).
+const (
+	hostsFolderMode = 0o755
+	readyFolderMode = 0o700
+	fifoFolderMode  = 0o750
 )
 
 // Bounds on what one request may ask for. Root writes the files, so a
@@ -66,12 +80,14 @@ const (
 	maxNameLen       = 253 // a DNS name
 	maxHostEntries   = 64
 	maxNamesPerEntry = 16
-	maxNameservers   = 16
-	maxSearch        = 32
-	maxOptions       = 32
-	maxOptionLen     = 64
 	maxEgressCADER   = 64 << 10
-	maxNonceLen      = 64
+	// The resolver settings: past these the rest is dropped, not refused
+	// (renderResolvConf). Resolvers read far fewer: glibc and musl use
+	// the first three nameservers.
+	maxNameservers  = 64
+	maxSearch       = 64
+	maxOptions      = 64
+	maxResolverWord = 253
 )
 
 // Reasons the helper's own calls refuse a request. Like the gate's, each
@@ -146,6 +162,24 @@ func openFiles(cfg Config) (*files, error) {
 		}
 		*d.fd = fd
 	}
+	// Closed whatever made them, or an older helper: through the open
+	// handles, never a path.
+	for _, d := range []struct {
+		fd   int
+		dir  string
+		mode uint32
+		gid  int
+	}{{f.ready, f.dirs.Ready, readyFolderMode, -1}, {f.fifo, f.fifoDir, fifoFolderMode, f.gid}} {
+		if err := setFolderMode(d.fd, d.mode, d.gid); err != nil {
+			f.close()
+			return nil, fmt.Errorf("root helper: folder %s: %w", d.dir, err)
+		}
+	}
+	// A crash between a runsc config's temporary file and its rename
+	// leaves that file in the shared runsc folder for good (a container's
+	// own folder goes with RemoveContainerFiles). Clear those now. Best
+	// effort: a leftover is harmless, so it never stops the helper.
+	sweepTmpNames(f.runsc, runscDefaultFile, runscRestoreFile)
 	return f, nil
 }
 
@@ -172,15 +206,12 @@ func (f *files) ensureHostFiles(req *rootdpb.EnsureHostFilesRequest) (*rootdpb.E
 	if err != nil {
 		return nil, err
 	}
-	resolv, err := renderResolvConf(req)
-	if err != nil {
-		return nil, err
-	}
+	resolv := renderResolvConf(req)
 	ca, err := renderEgressCA(req.GetEgressCaDer())
 	if err != nil {
 		return nil, err
 	}
-	dfd, err := f.ensureFolder(f.hosts, id)
+	dfd, err := f.ensureFolder(f.hosts, id, hostsFolderMode, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +254,7 @@ func (f *files) ensureTaskFIFOs(req *rootdpb.EnsureTaskFIFOsRequest) (*rootdpb.E
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
-	dfd, err := f.ensureFolder(f.fifo, id)
+	dfd, err := f.ensureFolder(f.fifo, id, fifoFolderMode, f.gid)
 	if err != nil {
 		return nil, err
 	}
@@ -312,19 +343,19 @@ func (f *files) ensureReadySocket(req *rootdpb.EnsureReadySocketRequest) (*rootd
 	}
 	// pkg/docker's names: <id>.<nonce>.sock for a create, <id>.sock for a
 	// warm-pool slot's park socket.
-	agentName, name := id+".sock", parkSocketName
+	agentName, name := id+".sock", rootpolicy.ReadySocketFile(nonce)
 	if nonce != "" {
-		if err := checkNonce(nonce); err != nil {
-			return nil, err
+		if err := rootpolicy.CheckReadyNonce(nonce); err != nil {
+			return nil, badRequest("%v", err)
 		}
-		agentName, name = id+"."+nonce+".sock", nonce+".sock"
+		agentName = id + "." + nonce + ".sock"
 	}
 	afd, err := openPath(f.dirs.AgentReady)
 	if err != nil {
 		return nil, &fileError{code: codes.FailedPrecondition, msg: fmt.Sprintf("root helper: the agent's ready folder: %v", err)}
 	}
 	defer func() { _ = unix.Close(afd) }()
-	dfd, err := f.ensureFolder(f.ready, id)
+	dfd, err := f.ensureFolder(f.ready, id, readyFolderMode, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -387,34 +418,80 @@ func (f *files) removeContainerFiles(req *rootdpb.RemoveContainerFilesRequest) (
 }
 
 // ensureFolder makes sure <base>/<id> is a folder of root's that no one
-// else can write, and opens it. Only root writes base, so a link or a file
-// at that name was never this code's; it is refused, not followed.
-func (f *files) ensureFolder(base int, id string) (int, error) {
-	switch err := unix.Mkdirat(base, id, 0o755); {
-	case err == nil:
-		// The agent must reach a FIFO folder to open its FIFOs, whatever
-		// this process's umask. fchmodat follows a link at id, and needs
-		// not refuse one: id is the folder just made, in a folder no one
-		// else can change.
-		if err := unix.Fchmodat(base, id, 0o755, 0); err != nil {
-			return -1, fmt.Errorf("root helper: folder %s: %w", id, err)
-		}
-	case !errors.Is(err, unix.EEXIST):
+// else can write, with mode mode (and group gid, when not -1), and opens
+// it. Only root writes base, so a link or a file at that name was never
+// this code's; it is refused, not followed. The mode is set through the
+// opened folder, after the check, whatever this process's umask: the agent
+// must reach a FIFO folder to open its FIFOs, and no one else a ready one.
+func (f *files) ensureFolder(base int, id string, mode uint32, gid int) (int, error) {
+	if err := unix.Mkdirat(base, id, mode); err != nil && !errors.Is(err, unix.EEXIST) {
 		return -1, fmt.Errorf("root helper: folder %s: %w", id, err)
 	}
 	fd, err := unix.Openat(base, id, folderFlags, 0)
 	if err != nil {
 		return -1, fmt.Errorf("root helper: folder %s: %w", id, err)
 	}
+	// Checked before its mode is set: a folder someone else can write is
+	// refused, never closed after the fact, as what it holds may be theirs.
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err == nil {
+	err = unix.Fstat(fd, &st)
+	if err == nil {
 		err = rootpolicy.CheckFolder(id, uint32(st.Mode), st.Uid, f.owner, false)
+	}
+	if err == nil {
+		err = setFolderMode(fd, mode, gid)
 	}
 	if err != nil {
 		_ = unix.Close(fd)
-		return -1, fmt.Errorf("root helper: %w", err)
+		return -1, fmt.Errorf("root helper: folder %s: %w", id, err)
 	}
 	return fd, nil
+}
+
+// setFolderMode gives the open folder fd mode, and group gid when gid is
+// not -1, unless it has them already. It goes through fd, never a path: an
+// O_PATH handle (Linux) cannot be chmodded, so it opens "." through it,
+// which is the same folder.
+func setFolderMode(fd int, mode uint32, gid int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if uint32(st.Mode)&0o7777 == mode && (gid < 0 || int(st.Gid) == gid) {
+		return nil
+	}
+	dfd, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = unix.Close(dfd) }()
+	if gid >= 0 && int(st.Gid) != gid {
+		// Before the chmod: a change of group can clear mode bits.
+		if err := unix.Fchown(dfd, -1, gid); err != nil {
+			return err
+		}
+	}
+	return unix.Fchmod(dfd, mode)
+}
+
+// sweepTmpNames removes the temporary names tmpName gave the files names in
+// the folder fd, which only a crash leaves behind. Errors are ignored: the
+// caller treats this as best effort.
+func sweepTmpNames(fd int, names ...string) {
+	dfd, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return
+	}
+	dir := os.NewFile(uintptr(dfd), ".")
+	defer func() { _ = dir.Close() }()
+	found, _ := dir.Readdirnames(-1)
+	for _, n := range found {
+		for _, name := range names {
+			if isTmpName(n, name) {
+				_ = unix.Unlinkat(dfd, n, 0)
+			}
+		}
+	}
 }
 
 // writeFile makes sure name in dfd holds body, mode mode, root's. A file
@@ -521,17 +598,6 @@ func checkID(id string) error {
 	return nil
 }
 
-// checkNonce: a ready socket's nonce goes into a file name.
-func checkNonce(n string) error {
-	if len(n) > maxNonceLen {
-		return badRequest("ready nonce is longer than %d", maxNonceLen)
-	}
-	if _, err := hex.DecodeString(n); err != nil || strings.ToLower(n) != n {
-		return badRequest("ready nonce %q is not lower-case hex", n)
-	}
-	return nil
-}
-
 // checkName allows a host or domain name: letters, digits, '-', '_' and
 // '.', which covers every sandbox and slot ID. Nothing else reaches a
 // file, a newline least of all.
@@ -584,51 +650,59 @@ func renderHosts(entries []*rootdpb.HostEntry) ([]byte, error) {
 
 // renderResolvConf renders through internal/runtime/resolvconf, the same
 // renderer the agent uses for a resolv.conf of its own.
-func renderResolvConf(req *rootdpb.EnsureHostFilesRequest) ([]byte, error) {
-	var c resolvconf.Config
-	if n := len(req.GetNameservers()); n > maxNameservers {
-		return nil, badRequest("%d nameservers; at most %d", n, maxNameservers)
+//
+// The resolver settings are the host's resolv.conf as the agent read it
+// (resolvconf.Parse), which the driver copies as it finds it today: an odd
+// word there is the host's, not a sign of drift or a broken agent, so it
+// must not fail a create or raise a refusal. A value the helper cannot
+// write safely is dropped, and what it keeps is written as the agent sent
+// it, so the file is the driver's byte for byte. Safe is what cannot start
+// a line of its own or become two words: a nameserver that parses as an
+// address with no zone, and words with no space or control character.
+func renderResolvConf(req *rootdpb.EnsureHostFilesRequest) []byte {
+	c := resolvconf.Config{
+		Nameservers: keepFirst(req.GetNameservers(), maxNameservers, isNameserver),
+		Search:      keepFirst(req.GetSearch(), maxSearch, isResolverWord),
+		Options:     keepFirst(req.GetDnsOptions(), maxOptions, isResolverWord),
 	}
-	for _, ns := range req.GetNameservers() {
-		a, err := checkAddr("nameserver", ns)
-		if err != nil {
-			return nil, err
-		}
-		c.Nameservers = append(c.Nameservers, a)
-	}
-	if n := len(req.GetSearch()); n > maxSearch {
-		return nil, badRequest("%d search domains; at most %d", n, maxSearch)
-	}
-	for _, d := range req.GetSearch() {
-		name, err := checkName("search domain", d)
-		if err != nil {
-			return nil, err
-		}
-		c.Search = append(c.Search, name)
-	}
-	if n := len(req.GetDnsOptions()); n > maxOptions {
-		return nil, badRequest("%d resolver options; at most %d", n, maxOptions)
-	}
-	for _, o := range req.GetDnsOptions() {
-		if err := checkOption(o); err != nil {
-			return nil, err
-		}
-		c.Options = append(c.Options, o)
-	}
-	return []byte(c.Render()), nil
+	return []byte(c.Render())
 }
 
-// checkOption allows a resolver option such as ndots:2 or edns0.
-func checkOption(o string) error {
-	if o == "" || len(o) > maxOptionLen {
-		return badRequest("resolver option %q: want 1 to %d characters", o, maxOptionLen)
-	}
-	for _, r := range o {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':') {
-			return badRequest("resolver option %q: invalid character %q", o, r)
+// keepFirst keeps the first max values ok accepts.
+func keepFirst(in []string, max int, ok func(string) bool) []string {
+	var out []string
+	for _, s := range in {
+		if len(out) == max {
+			break
+		}
+		if ok(s) {
+			out = append(out, s)
 		}
 	}
-	return nil
+	return out
+}
+
+// isNameserver allows an IP address with no zone. netip's grammar for one
+// has no space or control character, so the agent's own spelling of it
+// ("2001:DB8::1") is safe to write as it is.
+func isNameserver(s string) bool {
+	a, err := netip.ParseAddr(s)
+	return err == nil && a.Zone() == ""
+}
+
+// isResolverWord allows one word of a search or options line: 1 to
+// maxResolverWord bytes, none of them a space or a control character, a
+// newline least of all.
+func isResolverWord(s string) bool {
+	if s == "" || len(s) > maxResolverWord {
+		return false
+	}
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // renderEgressCA writes the node's egress CA as PEM, from a certificate

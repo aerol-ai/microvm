@@ -29,7 +29,9 @@ import (
 )
 
 // sockPath is a socket path short enough for sun_path (104 bytes on
-// macOS), which t.TempDir's often is not.
+// macOS), which t.TempDir's often is not. The socket's folder holds the
+// socket alone, as the helper requires; realHelper lays the helper's other
+// folders out beside it.
 func sockPath(t *testing.T) string {
 	t.Helper()
 	d, err := os.MkdirTemp("", "rc")
@@ -41,7 +43,10 @@ func sockPath(t *testing.T) string {
 	if d, err = filepath.EvalSymlinks(d); err != nil {
 		t.Fatal(err)
 	}
-	return filepath.Join(d, "root.sock")
+	if err := os.Mkdir(filepath.Join(d, "s"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(d, "s", "root.sock")
 }
 
 // fakeHelper is a helper of any version: it answers Version with resp and
@@ -410,7 +415,7 @@ func helperFiles(t *testing.T, c *rootd.Config, base string) {
 		AgentReady: filepath.Join(base, "agent", "ready"),
 	}
 	c.Policy.FIFODir = filepath.Join(base, "run", "fifo")
-	c.Policy.BindRoots = append(c.Policy.BindRoots, c.Files.Hosts, c.Files.Ready)
+	c.Policy.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
 	c.Policy.RunscConfigPaths = []string{filepath.Join(c.Files.Runsc, "config.toml"), filepath.Join(c.Files.Runsc, "restore.toml")}
 }
 
@@ -442,7 +447,7 @@ func realHelper(t *testing.T, sock string, mutate func(*rootd.Options)) *rootd.S
 			Limits: rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
 		},
 	}
-	helperFiles(t, &cfg, filepath.Dir(sock))
+	helperFiles(t, &cfg, filepath.Dir(filepath.Dir(sock)))
 	srv, err := rootd.New(cfg, opts, nil)
 	if err != nil {
 		t.Fatal(err)

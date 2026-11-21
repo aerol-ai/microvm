@@ -78,7 +78,7 @@ func withFiles(c Config, base string) Config {
 		AgentReady: filepath.Join(base, "agent", "ready"),
 	}
 	c.Policy.FIFODir = filepath.Join(base, "run", "fifo")
-	c.Policy.BindRoots = append(c.Policy.BindRoots, c.Files.Hosts, c.Files.Ready)
+	c.Policy.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
 	c.Policy.RunscConfigPaths = []string{c.Files.runscPath(runscDefaultFile), c.Files.runscPath(runscRestoreFile)}
 	return c
 }
@@ -359,8 +359,18 @@ func TestNewRefuses(t *testing.T) {
 			c.Socket = filepath.Join(f, "root.sock")
 		}, "socket folder"},
 		{"no folders for the files", func(c *Config, _ *Options) { c.Files = FileDirs{} }, "hosts folder"},
-		{"a hosts folder that is not a bind root", func(c *Config, _ *Options) { c.Policy.BindRoots = c.Policy.BindRoots[1:] }, "bind roots"},
+		{"a hosts folder that is not a helper file root", func(c *Config, _ *Options) { c.Policy.HelperFileRoots = c.Policy.HelperFileRoots[1:] }, "helper file roots"},
 		{"runsc configs the policy does not name", func(c *Config, _ *Options) { c.Policy.RunscConfigPaths = []string{"/x/config.toml"} }, "runsc configs"},
+		// Each of the helper's folders has its own rule; none may hold
+		// another.
+		{"a ready folder holding the runsc folder", func(c *Config, _ *Options) {
+			c.Files.Ready = filepath.Dir(c.Files.Runsc)
+			c.Policy.HelperFileRoots = []string{c.Files.Ready}
+		}, "overlaps the runsc config"},
+		{"the socket in the ready folder", func(c *Config, _ *Options) { c.Socket = filepath.Join(c.Files.Ready, "s", "root.sock") }, "overlap"},
+		{"the agent's ready folder in the helper's", func(c *Config, _ *Options) { c.Files.AgentReady = filepath.Join(c.Files.Ready, "agent") }, "overlap"},
+		{"the moves folder in the runsc folder", func(c *Config, _ *Options) { c.Policy.MovesDir = filepath.Join(c.Files.Runsc, "moves") }, "overlap"},
+		{"the FIFO folder in the hosts folder", func(c *Config, _ *Options) { c.Policy.FIFODir = filepath.Join(c.Files.Hosts, "fifo") }, "overlap"},
 		// A layout someone else can write stops the helper before any agent
 		// reaches it, and leaves no socket.
 		{"a hosts folder others can write", func(c *Config, _ *Options) {

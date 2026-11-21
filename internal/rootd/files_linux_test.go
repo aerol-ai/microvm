@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 )
 
 // TestReadySocketSwapRace: the agent swaps the name in its ready folder
@@ -183,9 +185,129 @@ func TestFilesOwnedByRoot(t *testing.T) {
 	if st := statOf(t, fifos.GetStdoutPath()); st.Uid != 0 || st.Gid != 4242 || st.Mode&0o777 != 0o640 {
 		t.Fatalf("stdout FIFO owned %d:%d mode %o", st.Uid, st.Gid, st.Mode&0o777)
 	}
-	for _, dir := range []string{filepath.Join(r.cfg.Files.Hosts, testCID), filepath.Join(r.cfg.Policy.FIFODir, testCID)} {
-		if st := statOf(t, dir); st.Uid != 0 || st.Mode&0o777 != 0o755 {
-			t.Fatalf("%s owned by %d, mode %o", dir, st.Uid, st.Mode&0o777)
+	for _, tc := range []struct {
+		dir       string
+		gid, mode uint32
+	}{
+		{filepath.Join(r.cfg.Files.Hosts, testCID), 0, 0o755},
+		// The agent's group reaches its FIFOs; no one else does.
+		{r.cfg.Policy.FIFODir, 4242, 0o750},
+		{filepath.Join(r.cfg.Policy.FIFODir, testCID), 4242, 0o750},
+	} {
+		if st := statOf(t, tc.dir); st.Uid != 0 || st.Gid != tc.gid || st.Mode&0o7777 != tc.mode {
+			t.Fatalf("%s owned by %d:%d, mode %o; want 0:%d, %o", tc.dir, st.Uid, st.Gid, st.Mode&0o7777, tc.gid, tc.mode)
 		}
 	}
+}
+
+// dialEnv makes this test binary a dialer: TestReadyDialChild connects to
+// the socket it names and says what happened.
+const dialEnv = "AEROLVM_ROOTD_TEST_DIAL"
+
+// TestReadyNameClosedToOtherUsers: as root, another user can no more reach
+// the agent's ready socket through the helper's name for it than through
+// the agent's own name. The agent's 0700 ready folder keeps others off
+// its socket (pkg/docker), and the helper's folders on the way to its
+// name are root's alone: only root (runc, the gate) needs that name.
+func TestReadyNameClosedToOtherUsers(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to run a dial as another user")
+	}
+	const agent, other = 65531, 1000
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newRig(t, func(c *Config, _ *Options) { c.AgentUID = agent })
+	// Every folder above the two ready folders lets others through, so the
+	// ready folders alone decide. Only the test's own are changed.
+	base := filepath.Dir(filepath.Dir(r.cfg.Files.AgentReady))
+	for p := filepath.Dir(base); p != "/"; p = filepath.Dir(p) {
+		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm()&0o001 == 0 {
+			t.Skipf("%s is closed to other users, so this test would prove nothing", p)
+		}
+	}
+	for _, p := range []string{base, filepath.Dir(r.cfg.Files.Ready), filepath.Dir(r.cfg.Files.AgentReady)} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bin := filepath.Join(base, "rootd.test")
+	copyFile(t, exe, bin)
+	// The agent's ready folder as pkg/docker makes it: 0700, the agent's.
+	if err := os.MkdirAll(r.cfg.Files.AgentReady, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(r.cfg.Files.AgentReady, agent, agent); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := dockerpkg.NewReadyListener(r.cfg.Files.AgentReady, testCID, "token", "0a1b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if err := os.Lchown(ln.HostSocketPath(), agent, agent); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.srv.files.ensureReadySocket(&rootdpb.EnsureReadySocketRequest{ContainerId: testCID, Nonce: "0a1b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := func(uid uint32, sock string) string {
+		t.Helper()
+		cmd := exec.Command(bin, "-test.run=^TestReadyDialChild$")
+		cmd.Env = append(os.Environ(), dialEnv+"="+sock)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid, Groups: []uint32{}}}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("dial as %d: %v\n%s", uid, err, out)
+		}
+		for _, l := range strings.Split(string(out), "\n") {
+			if v, ok := strings.CutPrefix(l, "result: "); ok {
+				return v
+			}
+		}
+		t.Fatalf("dial as %d said nothing:\n%s", uid, out)
+		return ""
+	}
+	for _, tc := range []struct {
+		name string
+		uid  uint32
+		sock string
+		want string
+	}{
+		{"another user, the agent's name", other, ln.HostSocketPath(), "permission denied"},
+		{"another user, the helper's name", other, resp.GetPath(), "permission denied"},
+		{"the agent, its own name", agent, ln.HostSocketPath(), "connected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dial(tc.uid, tc.sock); !strings.Contains(got, tc.want) {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// Root, as runc and the gate, still reaches the helper's name.
+	c, err := net.Dial("unix", resp.GetPath())
+	if err != nil {
+		t.Fatalf("root cannot reach the helper's name: %v", err)
+	}
+	_ = c.Close()
+}
+
+// TestReadyDialChild is the dialing side of TestReadyNameClosedToOtherUsers.
+func TestReadyDialChild(t *testing.T) {
+	sock := os.Getenv(dialEnv)
+	if sock == "" {
+		t.Skip("runs only as TestReadyNameClosedToOtherUsers's child")
+	}
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		os.Stdout.WriteString("result: " + err.Error() + "\n")
+		return
+	}
+	_ = c.Close()
+	os.Stdout.WriteString("result: connected\n")
 }

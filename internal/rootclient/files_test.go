@@ -51,7 +51,7 @@ var fileCalls = []struct {
 func TestFileCallsWithTheRealHelper(t *testing.T) {
 	sock := sockPath(t)
 	realHelper(t, sock, nil)
-	base := filepath.Dir(sock) // where realHelper lays the helper's folders out
+	base := filepath.Dir(filepath.Dir(sock)) // where realHelper lays the helper's folders out
 	c := newClient(t, sock)
 	ctx := ctxT(t)
 

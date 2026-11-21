@@ -99,7 +99,7 @@ func (h helperFiles) container(t *testing.T, resolv, hosts, ready, runsc string)
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Type: "bind", Source: resolv, Destination: "/etc/resolv.conf", Options: []string{"rbind", "ro"}},
 		{Type: "bind", Source: hosts, Destination: "/etc/hosts", Options: []string{"rbind", "ro"}},
-		{Type: "bind", Source: ready, Destination: "/run/aerol/ready.sock", Options: []string{"rbind"}},
+		{Type: "bind", Source: ready, Destination: "/run/aerol/ready.sock", Options: []string{"rbind", "ro"}},
 	}
 	c := goodContainer(t)
 	c.Spec = specAny(t, s)
@@ -132,6 +132,64 @@ func TestGateAcceptsTheHelpersFiles(t *testing.T) {
 	if _, err := r.invoke(nsCtx(), tCreate, &tasksapi.CreateTaskRequest{ContainerID: testID, Rootfs: overlayRootfs(),
 		Stdout: h.fifos.GetStdoutPath(), Stderr: h.fifos.GetStderrPath()}); err != nil {
 		t.Fatalf("the helper's own FIFOs refused: %v", err)
+	}
+}
+
+// TestGateBindsOnlyTheHelpersFiles: from the helper's own folders a spec
+// binds only a read-only file the helper made, <root>/<id>/<name>. Those
+// folders are root's alone, which is what keeps a name in them from being
+// swapped for a link before runc's mount; a sandbox runs as uid 0, so a
+// bind of one of them, or a writable bind of a file in them, would undo
+// that. Each is refused at Containers.Create and again at Tasks.Create,
+// with the real on-disk checks.
+func TestGateBindsOnlyTheHelpersFiles(t *testing.T) {
+	h := makeHelperFiles(t)
+	hostsDir, readyDir := filepath.Dir(h.hosts.GetResolvConfPath()), filepath.Dir(h.ready)
+	ro, rw := []string{"rbind", "ro"}, []string{"rbind", "rw"}
+	for _, tc := range []struct {
+		name string
+		src  string
+		opts []string
+		ok   bool
+	}{
+		{"resolv.conf, read-only", h.hosts.GetResolvConfPath(), ro, true},
+		{"the ready socket, read-only", h.ready, ro, true},
+		{"a container's host files folder", hostsDir, rw, false},
+		{"a container's host files folder, read-only", hostsDir, ro, false},
+		{"a container's ready folder", readyDir, rw, false},
+		{"resolv.conf, read-write", h.hosts.GetResolvConfPath(), rw, false},
+		{"the ready socket, writable", h.ready, []string{"rbind"}, false},
+		{"the helper's hosts folder", h.cfg.Files.Hosts, ro, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := goodSpec(t)
+			s.Mounts = []specs.Mount{
+				{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+				{Type: "bind", Source: tc.src, Destination: "/x", Options: tc.opts},
+			}
+			c := goodContainer(t)
+			c.Spec = specAny(t, s)
+			r := h.gateRig(t, h.policy)
+			_, err := r.invoke(nsCtx(), cCreate, &containersapi.CreateContainerRequest{Container: c})
+			if tc.ok && err != nil {
+				t.Fatalf("Containers.Create refused the helper's own file: %v", err)
+			}
+			if !tc.ok {
+				r.wantRefused(err, cCreate, string(rootpolicy.RuleMount))
+			}
+			// A record containerd already holds is checked again when its
+			// task is made, where runc mounts the binds.
+			r = h.gateRig(t, h.policy)
+			r.storedContainer(c)
+			_, err = r.invoke(nsCtx(), tCreate, &tasksapi.CreateTaskRequest{ContainerID: testID, Rootfs: overlayRootfs(),
+				Stdout: h.fifos.GetStdoutPath(), Stderr: h.fifos.GetStderrPath()})
+			if tc.ok && err != nil {
+				t.Fatalf("Tasks.Create refused the helper's own file: %v", err)
+			}
+			if !tc.ok {
+				r.wantRefused(err, tCreate, string(rootpolicy.RuleMount))
+			}
+		})
 	}
 }
 

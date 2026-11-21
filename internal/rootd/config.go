@@ -93,11 +93,11 @@ type Config struct {
 // folder it can write, so a file root opens there could be swapped for a
 // link between the gate's check and root's open.
 type FileDirs struct {
-	// Hosts holds each container's host files, in <Hosts>/<id>. A bind
-	// root of the policy.
+	// Hosts holds each container's host files, in <Hosts>/<id>. A helper
+	// file root of the policy.
 	Hosts string
 	// Ready holds a name for each container's ready socket, in
-	// <Ready>/<id>. A bind root of the policy.
+	// <Ready>/<id>. A helper file root of the policy.
 	Ready string
 	// Runsc holds the runsc shim configs, the policy's RunscConfigPaths.
 	Runsc string
@@ -108,16 +108,30 @@ type FileDirs struct {
 }
 
 // validate checks the folders and that the policy lets the gate accept
-// what the helper makes in them.
-func (d FileDirs) validate(p rootpolicy.Policy) error {
-	for _, f := range []struct{ name, dir string }{{"hosts", d.Hosts}, {"ready", d.Ready}, {"runsc", d.Runsc}, {"agent ready", d.AgentReady}} {
+// what the helper makes in them. socketDir is the helper's socket folder.
+func (d FileDirs) validate(p rootpolicy.Policy, socketDir string) error {
+	folders := []struct{ name, dir string }{{"hosts", d.Hosts}, {"ready", d.Ready}, {"runsc", d.Runsc}, {"agent ready", d.AgentReady}}
+	for _, f := range folders {
 		if !filepath.IsAbs(f.dir) || filepath.Clean(f.dir) != f.dir || f.dir == "/" {
 			return fmt.Errorf("root helper: %s folder %q: want a clean absolute folder other than /", f.name, f.dir)
 		}
 	}
+	// Each folder has one job and one rule: what a sandbox may bind (hosts,
+	// ready), what root reads (runsc, moves), FIFOs, the socket, and the
+	// agent's own. One inside another would put the first's files under
+	// the second's rule: a ready folder holding the runsc folder would let
+	// a spec bind a runsc config.
+	folders = append(folders, []struct{ name, dir string }{{"moves", p.MovesDir}, {"FIFO", p.FIFODir}, {"socket", socketDir}}...)
+	for i, a := range folders {
+		for _, b := range folders[i+1:] {
+			if a.dir == b.dir || strings.HasPrefix(a.dir, b.dir+"/") || strings.HasPrefix(b.dir, a.dir+"/") {
+				return fmt.Errorf("root helper: the %s folder %s and the %s folder %s overlap", a.name, a.dir, b.name, b.dir)
+			}
+		}
+	}
 	for _, root := range []string{d.Hosts, d.Ready} {
-		if !slices.Contains(p.BindRoots, root) {
-			return fmt.Errorf("root helper: the policy's bind roots %v lack %s, where the helper makes binds", p.BindRoots, root)
+		if !slices.Contains(p.HelperFileRoots, root) {
+			return fmt.Errorf("root helper: the policy's helper file roots %v lack %s, where the helper makes binds", p.HelperFileRoots, root)
 		}
 	}
 	for _, path := range []string{d.runscPath(runscDefaultFile), d.runscPath(runscRestoreFile)} {
@@ -142,7 +156,7 @@ func (c Config) Validate() error {
 	if err := c.Policy.Validate(); err != nil {
 		return fmt.Errorf("root helper: %w", err)
 	}
-	return c.Files.validate(c.Policy)
+	return c.Files.validate(c.Policy, filepath.Dir(c.Socket))
 }
 
 // maxMemoryMB keeps the node's memory in bytes within an int64.
@@ -267,13 +281,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			// /run/aerolvm/cgroup-parent sits in a folder every worker
 			// container can write (review L6).
 			CgroupParent: strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
-			// Binds come from the helper's own folders (host files, the
-			// egress CA among them, and ready socket names), and from the
-			// external mounts, which move to the helper with its mount
-			// calls. The agent's run dir, ready dir and database folder
-			// are no bind roots: the agent can swap anything in them.
-			BindRoots: []string{dirs.Hosts, mountsRoot, dirs.Ready},
-			BindFiles: []string{toolbox},
+			// Binds come from the external mounts, which move to the
+			// helper with its mount calls, and from the files the helper
+			// makes in its own folders (host files, the egress CA among
+			// them, and ready socket names), one read-only file each. The
+			// agent's run dir, ready dir and database folder are no bind
+			// roots: the agent can swap anything in them.
+			BindRoots:       []string{mountsRoot},
+			BindFiles:       []string{toolbox},
+			HelperFileRoots: []string{dirs.Hosts, dirs.Ready},
 			// The two sockets that are as good as root: this helper's and
 			// containerd's.
 			ForbiddenRoots:   []string{filepath.Dir(socket), filepath.Dir(containerdSocket)},

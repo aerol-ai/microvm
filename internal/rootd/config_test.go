@@ -45,14 +45,15 @@ func TestConfigFromEnv(t *testing.T) {
 			Snapshotter:     "overlayfs",
 			SnapshotterRoot: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
 			NetnsDir:        "/run/netns",
-			// Binds come from the helper's own folders, never from the
-			// agent's run dir, ready dir or database folder (T2b).
-			BindRoots: []string{
+			// Binds come from the external mounts and the helper's own
+			// files, never from the agent's run dir, ready dir or
+			// database folder (T2b).
+			BindRoots: []string{"/var/lib/sandboxd/mounts"},
+			BindFiles: []string{"/usr/local/bin/toolboxd"},
+			HelperFileRoots: []string{
 				"/var/lib/aerolvm-rootd/hosts",
-				"/var/lib/sandboxd/mounts",
 				"/run/aerolvm-rootd/ready",
 			},
-			BindFiles:      []string{"/usr/local/bin/toolboxd"},
 			ForbiddenRoots: []string{"/run/aerolvm-rootd/sock", "/run/containerd"},
 			// What root reads on the agent's word lives in the helper's
 			// own folders, never the agent's (review H2).
@@ -105,7 +106,7 @@ func TestConfigFromEnv(t *testing.T) {
 		}, func(c *Config) {
 			p := &c.Policy
 			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/var/run/netns"
-			p.BindRoots = []string{"/data/rootd/hosts", "/data/mounts", "/run/rootd-ready"}
+			p.BindRoots, p.HelperFileRoots = []string{"/data/mounts"}, []string{"/data/rootd/hosts", "/run/rootd-ready"}
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
@@ -137,11 +138,44 @@ func TestConfigFromEnv(t *testing.T) {
 			}
 			want := defaults
 			want.Policy.BindRoots = slices.Clone(defaults.Policy.BindRoots)
+			want.Policy.HelperFileRoots = slices.Clone(defaults.Policy.HelperFileRoots)
 			tc.want(&want)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("config\n got %+v\nwant %+v", got, want)
 			}
 		})
+	}
+}
+
+// TestHelperPolicyBindsOnlyItsFiles: from its own folders the helper's
+// policy binds one file the helper makes, <root>/<id>/<name>, and nothing
+// else: not a container's folder, nothing deeper, no other name. Those
+// folders are root's alone; a bind of one would hand it to a sandbox.
+func TestHelperPolicyBindsOnlyItsFiles(t *testing.T) {
+	stubHost(t, 1024, nil)
+	cfg, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": strconv.Itoa(os.Getgid())}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts, ready := cfg.Files.Hosts, cfg.Files.Ready
+	for src, ok := range map[string]bool{
+		hosts + "/sb-1/resolv.conf":   true,
+		hosts + "/sb-1/egress-ca.pem": true,
+		ready + "/sb-1/0a1b.sock":     true,
+		ready + "/park-1/ready.sock":  true,
+		// The external mounts are folders, as today.
+		"/var/lib/sandboxd/mounts/sb-1/0": true,
+
+		hosts + "/sb-1":                           false,
+		ready + "/sb-1":                           false,
+		hosts + "/sb-1/sub/resolv.conf":           false,
+		hosts + "/sb-1/.resolv.conf.0123456789ab": false,
+		ready + "/sb-1/x.sock":                    false,
+		hosts + "/sb-1/passwd":                    false,
+	} {
+		if err := rootpolicy.CheckBindSource(cfg.Policy, src); (err == nil) != ok {
+			t.Errorf("CheckBindSource(%s) = %v, want ok=%v", src, err, ok)
+		}
 	}
 }
 
@@ -188,6 +222,14 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		// The socket's folder is no bind root's: the ready names are binds.
 		{"ready names beside the socket", map[string]string{"SB_ROOTD_READY_DIR": "/run/aerolvm-rootd/sock/ready", "SB_HOST_MEMORY_MB": "1"}, nil, "forbidden"},
 		{"a relative ready folder", map[string]string{"SB_ROOTD_READY_DIR": "ready", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_READY_DIR"},
+		// The helper's folders never hold one another: a folder a spec
+		// binds from must not hold what root reads, the FIFOs or the socket.
+		{"ready names in the state folder", map[string]string{"SB_ROOTD_READY_DIR": "/var/lib/aerolvm-rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
+		{"ready names around the FIFOs and the socket", map[string]string{"SB_ROOTD_READY_DIR": "/run/aerolvm-rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
+		{"FIFOs in the ready folder", map[string]string{"SB_ROOTD_FIFO_DIR": "/run/aerolvm-rootd/ready/fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
+		{"FIFOs in the hosts folder", map[string]string{"SB_ROOTD_FIFO_DIR": "/var/lib/aerolvm-rootd/hosts/fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
+		{"the state folder in the ready folder", map[string]string{"SB_ROOTD_STATE_DIR": "/run/aerolvm-rootd/ready/state", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
+		{"FIFOs beside the runsc configs", map[string]string{"SB_ROOTD_FIFO_DIR": "/var/lib/aerolvm-rootd/runsc", "SB_HOST_MEMORY_MB": "1"}, nil, "overlap"},
 		{"the socket in the agent's mounts", map[string]string{"SB_ROOTD_SOCKET": "/var/lib/sandboxd/mounts/root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
 		// Review N6: the same folder written another way is the same folder.
 		{"the agent's run dir with a trailing slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_CONTAINERD_RUN_DIR": "/srv/ctr/", "SB_ROOTD_STATE_DIR": "/srv/ctr/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},

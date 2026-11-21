@@ -179,37 +179,113 @@ func TestEnsureHostFiles(t *testing.T) {
 	}
 }
 
+// resolvShapes are host resolv.conf files as nodes have them, the odd ones
+// included: the driver copies each today (resolvconf.Generate), so the
+// helper must write each, byte for byte, and never refuse one. The same
+// table is in internal/runtime/containerd (TestHelperResolvConfShapes).
+var resolvShapes = map[string]string{
+	"comments and a stub":        "# host\nnameserver 127.0.0.53\nnameserver 10.0.0.2\nsearch a.example b.example\noptions ndots:2 timeout:1\n",
+	"systemd-resolved stub":      "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch ec2.internal\n",
+	"kubernetes pod":             "search ns.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n",
+	"IPv6":                       "nameserver fd00::53\nnameserver 2001:db8::1\n",
+	"IPv6 in capitals":           "nameserver 2001:DB8::1\n",
+	"IPv4-mapped IPv6":           "nameserver ::ffff:10.0.0.2\n",
+	"options with values":        "options timeout:2 attempts:3 rotate\nnameserver 10.0.0.2\n",
+	"a comment after search":     "search corp.example # set by dhcp\nnameserver 10.0.0.2\n",
+	"a search domain not ASCII":  "search ex\u00e4mple.com\nnameserver 10.0.0.2\n",
+	"more nameservers than read": strings.Repeat("nameserver 10.0.0.2\n", 17),
+	"only loopback":              "nameserver 127.0.0.1\nnameserver ::1\n",
+}
+
 // TestHostFilesMatchResolvconf: what the agent reads from the host's
 // resolv.conf (resolvconf.Parse), sent as typed values, comes back from
-// the helper as the very file the driver writes today (Generate).
+// the helper as the very file the driver writes today (Generate), for
+// every shape in resolvShapes, with no refusal.
 func TestHostFilesMatchResolvconf(t *testing.T) {
 	r := newRig(t, nil)
-	host := filepath.Join(t.TempDir(), "resolv.conf")
-	if err := os.WriteFile(host, []byte("# host\nnameserver 127.0.0.53\nnameserver 10.0.0.2\nsearch a.example b.example\noptions ndots:2 timeout:1\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for name, body := range resolvShapes {
+		t.Run(name, func(t *testing.T) {
+			host := filepath.Join(t.TempDir(), "resolv.conf")
+			if err := os.WriteFile(host, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := resolvconf.Parse(host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := helperClient(r).EnsureHostFiles(callCtx(t), &rootdpb.EnsureHostFilesRequest{
+				ContainerId: testCID, Hostname: testCID, Hosts: localhostEntries(),
+				Nameservers: parsed.Nameservers, Search: parsed.Search, DnsOptions: parsed.Options,
+			})
+			if err != nil {
+				t.Fatalf("the helper refused a host's resolv.conf the driver copies: %v", err)
+			}
+			want, err := resolvconf.Generate(host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFile(t, resp.GetResolvConfPath(), 0o644, want)
+		})
 	}
-	parsed, err := resolvconf.Parse(host)
-	if err != nil {
-		t.Fatal(err)
+	if ref := r.refused(); len(ref) != 0 {
+		t.Fatalf("refusals %v", ref)
 	}
-	resp, err := helperClient(r).EnsureHostFiles(callCtx(t), &rootdpb.EnsureHostFilesRequest{
-		ContainerId: testCID, Hostname: testCID, Hosts: localhostEntries(),
-		Nameservers: parsed.Nameservers, Search: parsed.Search, DnsOptions: parsed.Options,
-	})
-	if err != nil {
-		t.Fatal(err)
+}
+
+// TestResolverValuesDropped: a resolver value the helper cannot write
+// safely is dropped, not written and not refused: the values come from the
+// host's resolv.conf, so an odd one is no sign of a broken agent. Nothing
+// in one starts a line of its own, and every line is one of the three
+// kinds the helper writes.
+func TestResolverValuesDropped(t *testing.T) {
+	many := func(n int, s string) []string { return slices.Repeat([]string{s}, n) }
+	for _, tc := range []struct {
+		name                string
+		ns, search, options []string
+		want                string
+	}{
+		{"a nameserver that is not an address", []string{"10.0.0.2\noptions x", "10.0.0.3"}, nil, nil, "nameserver 10.0.0.3\n"},
+		{"a nameserver with a zone", []string{"fe80::1%eth0\nnameserver 6.6.6.6", "10.0.0.3"}, nil, nil, "nameserver 10.0.0.3\n"},
+		{"a nameserver with a space", []string{" 10.0.0.2", "10.0.0.3"}, nil, nil, "nameserver 10.0.0.3\n"},
+		{"more nameservers than the bound", many(maxNameservers+1, "10.0.0.2"), nil, nil, strings.Repeat("nameserver 10.0.0.2\n", maxNameservers)},
+		{"a search word with a newline", nil, []string{"a\nnameserver 6.6.6.6", "b.example"}, nil, "search b.example\n"},
+		{"a search word with a space", nil, []string{"a b", "c"}, nil, "search c\n"},
+		{"a search word with a tab", nil, []string{"a\tb", "c"}, nil, "search c\n"},
+		{"a search word with a NUL", nil, []string{"a\x00", "c"}, nil, "search c\n"},
+		{"a search word with a line separator", nil, []string{"a\u2028nameserver", "c"}, nil, "search c\n"},
+		{"a search word too long", nil, []string{strings.Repeat("a", maxResolverWord+1), "c"}, nil, "search c\n"},
+		{"more search words than the bound", nil, many(maxSearch+1, "x"), nil, "search " + strings.Join(many(maxSearch, "x"), " ") + "\n"},
+		{"an empty option", nil, nil, []string{"", "edns0"}, "options edns0\n"},
+		{"an option with a newline", nil, nil, []string{"ndots:1\nnameserver 6.6.6.6"}, ""},
+		{"an option with a carriage return", nil, nil, []string{"ndots:1\rnameserver", "rotate"}, "options rotate\n"},
+		{"more options than the bound", nil, nil, many(maxOptions+1, "edns0"), "options " + strings.Join(many(maxOptions, "edns0"), " ") + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, nil)
+			resp, err := helperClient(r).EnsureHostFiles(callCtx(t), &rootdpb.EnsureHostFilesRequest{
+				ContainerId: testCID, Hostname: testCID, Nameservers: tc.ns, Search: tc.search, DnsOptions: tc.options,
+			})
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			if ref := r.refused(); len(ref) != 0 {
+				t.Fatalf("refusals %v", ref)
+			}
+			wantFile(t, resp.GetResolvConfPath(), 0o644, tc.want)
+			for _, line := range strings.Split(strings.TrimSuffix(tc.want, "\n"), "\n") {
+				if line != "" && !strings.HasPrefix(line, "search ") && !strings.HasPrefix(line, "options ") && !strings.HasPrefix(line, "nameserver ") {
+					t.Fatalf("line %q", line)
+				}
+			}
+		})
 	}
-	want, err := resolvconf.Generate(host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantFile(t, resp.GetResolvConfPath(), 0o644, want)
 }
 
 // TestFileCallsRefuse: every value the helper checks, failing its check.
 // Each is refused before anything is written, as a refusal the helper
 // reports, and an ID shaped like a path never reaches one: the helper
-// builds every path itself.
+// builds every path itself. Resolver values are not refused but dropped
+// (TestResolverValuesDropped).
 func TestFileCallsRefuse(t *testing.T) {
 	notCA := testCert(t, false)
 	good := func() *rootdpb.EnsureHostFilesRequest {
@@ -244,13 +320,6 @@ func TestFileCallsRefuse(t *testing.T) {
 		{"too many hosts lines", host(func(r *rootdpb.EnsureHostFilesRequest) {
 			r.Hosts = slices.Repeat([]*rootdpb.HostEntry{{Address: "10.0.0.1", Names: []string{"x"}}}, 65)
 		})},
-		{"a nameserver that is not an address", host(func(r *rootdpb.EnsureHostFilesRequest) { r.Nameservers = []string{"10.0.0.2\noptions x"} })},
-		{"too many nameservers", host(func(r *rootdpb.EnsureHostFilesRequest) { r.Nameservers = many(17, "10.0.0.2") })},
-		{"a search domain with a space", host(func(r *rootdpb.EnsureHostFilesRequest) { r.Search = []string{"a b"} })},
-		{"too many search domains", host(func(r *rootdpb.EnsureHostFilesRequest) { r.Search = many(33, "x") })},
-		{"an empty option", host(func(r *rootdpb.EnsureHostFilesRequest) { r.DnsOptions = []string{""} })},
-		{"an option with a newline", host(func(r *rootdpb.EnsureHostFilesRequest) { r.DnsOptions = []string{"ndots:1\nnameserver"} })},
-		{"too many options", host(func(r *rootdpb.EnsureHostFilesRequest) { r.DnsOptions = many(33, "edns0") })},
 		{"an egress CA that does not parse", host(func(r *rootdpb.EnsureHostFilesRequest) { r.EgressCaDer = []byte("-----BEGIN") })},
 		{"an egress CA that is no CA", host(func(r *rootdpb.EnsureHostFilesRequest) { r.EgressCaDer = notCA.Raw })},
 		{"an egress CA too big", host(func(r *rootdpb.EnsureHostFilesRequest) { r.EgressCaDer = make([]byte, 64<<10+1) })},
@@ -629,6 +698,157 @@ func TestRemoveContainerFiles(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(dir, testCID)); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("%s/%s is still there: %v", dir, testCID, err)
 		}
+	}
+}
+
+// TestHelperFoldersClosed: the helper's ready folders are root's alone
+// (0700), and its FIFO folders root's and the agent's group's (0750),
+// however open they were left before the helper started. The agent's own
+// ready folder is what keeps other users off its socket; the helper's name
+// for that socket must not open a second way in (TestReadyNameClosedToOtherUsers
+// has the dial, as root).
+func TestHelperFoldersClosed(t *testing.T) {
+	r := newRig(t, func(c *Config, _ *Options) {
+		for _, d := range []string{c.Files.Ready, filepath.Join(c.Files.Ready, "sb-2"), c.Policy.FIFODir} {
+			mkdir(d)
+			if err := os.Chmod(d, 0o755); err != nil {
+				panic(err)
+			}
+		}
+	})
+	c := helperClient(r)
+	for _, id := range []string{testCID, "sb-2"} {
+		agentSocket(t, r.cfg, id, "0a1b")
+		if _, err := c.EnsureReadySocket(callCtx(t), &rootdpb.EnsureReadySocketRequest{ContainerId: id, Nonce: "0a1b"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.EnsureTaskFIFOs(callCtx(t), &rootdpb.EnsureTaskFIFOsRequest{ContainerId: testCID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.EnsureHostFiles(callCtx(t), &rootdpb.EnsureHostFilesRequest{ContainerId: testCID, Hostname: testCID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		dir  string
+		mode fs.FileMode
+		gid  int
+	}{
+		{r.cfg.Files.Ready, 0o700, -1},
+		{filepath.Join(r.cfg.Files.Ready, testCID), 0o700, -1},
+		{filepath.Join(r.cfg.Files.Ready, "sb-2"), 0o700, -1},
+		{r.cfg.Policy.FIFODir, 0o750, r.cfg.SocketGID},
+		{filepath.Join(r.cfg.Policy.FIFODir, testCID), 0o750, r.cfg.SocketGID},
+		// The host files are for everyone, as the agent's are today.
+		{filepath.Join(r.cfg.Files.Hosts, testCID), 0o755, -1},
+	} {
+		fi, err := os.Lstat(tc.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := fi.Sys().(*syscall.Stat_t); fi.Mode().Perm() != tc.mode || (tc.gid >= 0 && int(st.Gid) != tc.gid) {
+			t.Errorf("%s: mode %v group %d, want %v group %d", tc.dir, fi.Mode().Perm(), st.Gid, tc.mode, tc.gid)
+		}
+	}
+}
+
+// TestStartClearsRunscLeftovers: a runsc config's temporary file that a
+// crash left in the shared runsc folder is gone once the helper starts.
+// Anything that is not such a name stays.
+func TestStartClearsRunscLeftovers(t *testing.T) {
+	keep := []string{".config.toml.0123", ".config.toml.0123456789abcdeg", ".hosts.0123456789abcdef", "notes"}
+	r := newRig(t, func(c *Config, _ *Options) {
+		mkdir(c.Files.Runsc)
+		for _, n := range append([]string{".config.toml.0123456789abcdef", ".restore.toml.fedcba9876543210"}, keep...) {
+			if err := os.WriteFile(filepath.Join(c.Files.Runsc, n), []byte("x"), 0o600); err != nil {
+				panic(err)
+			}
+		}
+	})
+	entries, err := os.ReadDir(r.cfg.Files.Runsc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	slices.Sort(got)
+	want := slices.Sorted(slices.Values(keep))
+	if !slices.Equal(got, want) {
+		t.Fatalf("the runsc folder holds %v, want %v", got, want)
+	}
+}
+
+// TestFolderHelpersFail: setFolderMode reports what it could not do, and
+// sweepTmpNames, which is best effort, gives up quietly.
+func TestFolderHelpersFail(t *testing.T) {
+	if err := setFolderMode(-1, 0o700, -1); err == nil {
+		t.Fatal("a closed folder took a mode")
+	}
+	sweepTmpNames(-1, runscDefaultFile)
+	if os.Geteuid() == 0 {
+		return // root may do all of the below
+	}
+	dir := shortDir(t)
+	fd, err := openFolder(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	// Not ours to give: a group this user is not in.
+	if err := setFolderMode(fd, 0o750, 1<<30); err == nil {
+		t.Fatal("a folder took a group this user is not in")
+	}
+	// A folder this user cannot open for reading.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := setFolderMode(fd, 0o750, -1); err == nil {
+		t.Fatal("a folder this user cannot read took a mode")
+	}
+}
+
+// TestContainerFolderOthersCanWrite: a container's folder someone else can
+// write is refused, not closed after the fact: what it holds may already
+// be theirs. On a host only root writes the base folder, so it means
+// something is wrong; the call fails and writes nothing there.
+func TestContainerFolderOthersCanWrite(t *testing.T) {
+	r := newRig(t, nil)
+	dir := filepath.Join(r.cfg.Files.Hosts, testCID)
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	_, err := helperClient(r).EnsureHostFiles(callCtx(t), &rootdpb.EnsureHostFilesRequest{ContainerId: testCID, Hostname: testCID})
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "written by others") {
+		t.Fatalf("err %v, want the helper's own failure", err)
+	}
+	if names, _ := os.ReadDir(dir); len(names) != 0 {
+		t.Fatalf("files written into a folder others can write: %v", names)
+	}
+	if fi, _ := os.Lstat(dir); fi.Mode().Perm() != 0o777 {
+		t.Fatalf("the folder's mode was changed to %v", fi.Mode().Perm())
+	}
+}
+
+// TestNewNeedsTheAgentsGroup: the helper gives its FIFO folder to the
+// agent's group at start; one it cannot give stops it.
+func TestNewNeedsTheAgentsGroup(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can give any group")
+	}
+	cfg := testConfig(t)
+	cfg.SocketGID = 1 << 30
+	_, err := New(cfg, Options{Containerd: (&stubContainerd{}).handle, Peer: func(net.Conn) error { return nil }}, nil)
+	if err == nil || !strings.Contains(err.Error(), cfg.Policy.FIFODir) {
+		t.Fatalf("New = %v, want an error naming %s", err, cfg.Policy.FIFODir)
+	}
+	if _, err := os.Lstat(cfg.Socket); err == nil {
+		t.Fatal("a refused helper left its socket")
 	}
 }
 

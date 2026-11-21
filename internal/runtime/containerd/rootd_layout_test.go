@@ -64,7 +64,7 @@ func TestHelperPolicyMatchesDriverLayout(t *testing.T) {
 	if hc.Files.AgentReady != cfg.ReadyDir {
 		t.Fatalf("the helper links ready sockets from %s; the driver binds them in %s", hc.Files.AgentReady, cfg.ReadyDir)
 	}
-	if _, ok := rootpolicy.BindRootFor(p, filepath.Join(sc.MountsRootPath, "sb-1", "0")); !ok {
+	if _, folder, ok := rootpolicy.BindRootFor(p, filepath.Join(sc.MountsRootPath, "sb-1", "0")); !ok || !folder {
 		t.Errorf("the helper's bind roots %v do not hold the external mounts under %s", p.BindRoots, sc.MountsRootPath)
 	}
 	if !slices.Contains(p.BindFiles, cfg.ToolboxBinaryPath) {
@@ -87,7 +87,7 @@ func TestHelperPolicyMatchesDriverLayout(t *testing.T) {
 		filepath.Join(cfg.ReadyDir, "sb-1.nonce.sock"),
 		filepath.Join(cfg.ReadyDir, "park-1.sock"),
 	} {
-		if root, ok := rootpolicy.BindRootFor(p, src); ok {
+		if root, _, ok := rootpolicy.BindRootFor(p, src); ok {
 			t.Errorf("the helper's policy binds the agent's own %s (from %s)", src, root)
 		}
 	}
@@ -96,12 +96,19 @@ func TestHelperPolicyMatchesDriverLayout(t *testing.T) {
 			t.Errorf("the helper trusts the agent's own %s", own)
 		}
 	}
+	// The helper's own files pass, as files; its folders never do.
 	for _, src := range []string{
 		filepath.Join(hc.Files.Hosts, "sb-1", "resolv.conf"),
-		filepath.Join(hc.Files.Ready, "sb-1", "nonce.sock"),
+		filepath.Join(hc.Files.Ready, "sb-1", "0a1b.sock"),
+		filepath.Join(hc.Files.Ready, "sb-1", "ready.sock"),
 	} {
-		if _, ok := rootpolicy.BindRootFor(p, src); !ok {
-			t.Errorf("the helper's policy refuses its own %s", src)
+		if _, folder, ok := rootpolicy.BindRootFor(p, src); !ok || folder || rootpolicy.CheckBindSource(p, src) != nil {
+			t.Errorf("the helper's policy refuses its own %s, or takes it for a folder", src)
+		}
+	}
+	for _, src := range []string{filepath.Join(hc.Files.Hosts, "sb-1"), filepath.Join(hc.Files.Ready, "sb-1")} {
+		if rootpolicy.CheckBindSource(p, src) == nil {
+			t.Errorf("the helper's policy binds its own folder %s", src)
 		}
 	}
 }

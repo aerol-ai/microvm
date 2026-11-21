@@ -410,7 +410,7 @@ func TestContainerdsOwnUnavailablePassesThrough(t *testing.T) {
 		Runsc: filepath.Join(base, "state", "runsc"), AgentReady: filepath.Join(base, "agent", "ready"),
 	}
 	cfg.Policy.FIFODir = filepath.Join(base, "run", "fifo")
-	cfg.Policy.BindRoots = []string{cfg.Files.Hosts, cfg.Files.Ready}
+	cfg.Policy.HelperFileRoots = []string{cfg.Files.Hosts, cfg.Files.Ready}
 	cfg.Policy.RunscConfigPaths = []string{filepath.Join(cfg.Files.Runsc, "config.toml"), filepath.Join(cfg.Files.Runsc, "restore.toml")}
 	srv, err := rootd.New(cfg, rootd.Options{
 		Containerd: func(_ any, ss grpc.ServerStream) error {

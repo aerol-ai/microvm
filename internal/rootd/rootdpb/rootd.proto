@@ -33,8 +33,10 @@ service RootHelper {
   // never swap one for a link between the gate's check and root's open.
   // The agent sends typed values; the helper checks them, writes the files
   // itself and answers with the paths to put in specs. No request names a
-  // path or carries a file root would trust. Each call is safe to retry
-  // and to repeat: "make sure this exists" or "make sure this is gone".
+  // path or carries a file root would trust. Each call is safe to retry.
+  // All but EnsureTaskFIFOs are also safe to repeat: "make sure this
+  // exists" or "make sure this is gone". EnsureTaskFIFOs makes fresh FIFOs
+  // each time, so a repeat replaces the pair a reader may hold.
 
   // EnsureHostFiles makes sure a container's hostname, hosts and
   // resolv.conf files (and the egress CA, when asked) exist with this

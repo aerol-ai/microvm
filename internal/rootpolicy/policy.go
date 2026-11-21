@@ -163,11 +163,18 @@ type Policy struct {
 	// means containerd's default, /<Namespace>.
 	CgroupParent string
 	// BindRoots: a bind mount's source must be strictly inside one of
-	// these folders (host files, ready sockets, external mounts, the
-	// egress CA).
+	// these folders (the external mounts), and may be a folder there.
 	BindRoots []string
 	// BindFiles: or be exactly one of these files (the toolbox binary).
 	BindFiles []string
+	// HelperFileRoots: or be one file the root helper made in one of its
+	// own folders (its host files and ready socket names, internal/rootd),
+	// exactly <root>/<container id>/<name>, bound read-only. Only root can
+	// write these folders, and that is what keeps a name in them from
+	// being swapped for a link before runc's mount; a sandbox runs as uid
+	// 0, so no bind may give it one of them, or a file in them, to write
+	// (checkHelperFile).
+	HelperFileRoots []string
 	// ForbiddenRoots are never a bind source and never contain one, on top
 	// of /, /proc, /sys and /dev: the sockets folders (the helper's own,
 	// containerd's).
@@ -239,12 +246,17 @@ func (p Policy) Validate() error {
 			return fmt.Errorf("policy forbidden root %q: want a clean absolute folder other than /", r)
 		}
 	}
-	for _, r := range p.BindRoots {
-		if !cleanAbs(r) || r == "/" {
-			return fmt.Errorf("policy bind root %q: want a clean absolute folder other than /", r)
-		}
-		if f, ok := p.forbiddenFor(r); ok {
-			return fmt.Errorf("policy bind root %q is inside forbidden %s", r, f)
+	for _, roots := range []struct {
+		what  string
+		roots []string
+	}{{"bind root", p.BindRoots}, {"helper file root", p.HelperFileRoots}} {
+		for _, r := range roots.roots {
+			if !cleanAbs(r) || r == "/" {
+				return fmt.Errorf("policy %s %q: want a clean absolute folder other than /", roots.what, r)
+			}
+			if f, ok := p.forbiddenFor(r); ok {
+				return fmt.Errorf("policy %s %q is inside forbidden %s", roots.what, r, f)
+			}
 		}
 	}
 	for _, f := range p.BindFiles {
@@ -259,6 +271,9 @@ func (p Policy) Validate() error {
 		if !cleanAbs(c) || c == "/" {
 			return fmt.Errorf("policy runsc config %q: want a clean absolute path", c)
 		}
+	}
+	if err := p.validateOverlaps(); err != nil {
+		return err
 	}
 	if p.Limits.MemoryBytes <= 0 || p.Limits.Pids <= 0 || !(p.Limits.CPUs > 0) {
 		return fmt.Errorf("policy limits %+v: memory, pids and CPUs are all required", p.Limits)

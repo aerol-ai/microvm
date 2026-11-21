@@ -129,17 +129,23 @@ func TestReview2ProcSpellingsAndLegitOptions(t *testing.T) {
 func TestBindRootFor(t *testing.T) {
 	p := testPolicy()
 	p.BindRoots = append(p.BindRoots, testMounts+"/nested")
-	for src, want := range map[string]string{
-		testToolbox:                            "/usr/local/lib/aerolvm",
-		testRunDir + "/hosts/sb-1/resolv.conf": testRunDir + "/hosts",
-		testMounts + "/sb-1/0":                 testMounts,
-		testMounts + "/nested/x":               testMounts + "/nested",
-		"/etc/shadow":                          "",
-		testMounts:                             "",
+	for _, tc := range []struct {
+		src, root string
+		folder    bool
+	}{
+		{testToolbox, "/usr/local/lib/aerolvm", false},
+		{testRunDir + "/hosts/sb-1/resolv.conf", testRunDir + "/hosts", true},
+		{testMounts + "/sb-1/0", testMounts, true},
+		{testMounts + "/nested/x", testMounts + "/nested", true},
+		// A helper's file is a file: never a folder from its roots.
+		{testHelperHosts + "/sb-1/resolv.conf", testHelperHosts, false},
+		{testHelperReady + "/sb-1/0a1b.sock", testHelperReady, false},
+		{"/etc/shadow", "", false},
+		{testMounts, "", false},
 	} {
-		got, ok := BindRootFor(p, src)
-		if got != want || ok != (want != "") {
-			t.Errorf("BindRootFor(%q) = %q, %v; want %q", src, got, ok, want)
+		root, folder, ok := BindRootFor(p, tc.src)
+		if root != tc.root || folder != tc.folder || ok != (tc.root != "") {
+			t.Errorf("BindRootFor(%q) = %q, %v, %v; want %q, %v", tc.src, root, folder, ok, tc.root, tc.folder)
 		}
 	}
 }

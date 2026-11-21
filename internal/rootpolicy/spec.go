@@ -168,6 +168,12 @@ func checkSpecMount(p Policy, i int, m specs.Mount) error {
 				return violate(RuleMount, "%s bind option %q is not one the envelope uses", where, o)
 			}
 		}
+		// A bind of one of the helper's files is read-only: a sandbox
+		// that could write it could change what root left there. A
+		// read-only bind of a socket still connects.
+		if _, ok := p.helperFileRootFor(m.Source); ok && (!slices.Contains(m.Options, "ro") || slices.Contains(m.Options, "rw")) {
+			return violate(RuleMount, "%s binds the helper's file %q; it must be read-only", where, m.Source)
+		}
 		return nil
 	}
 	if !slices.Contains(pseudoMountTypes, m.Type) {
@@ -198,8 +204,9 @@ func checkSpecMount(p Policy, i int, m specs.Mount) error {
 // CheckBindSource checks the host side of a bind mount: the source, not only
 // where it lands (Kata's CVE-2026-77176 came from checking the destination
 // alone). It must be a clean absolute path that is one of the policy's bind
-// files or strictly inside one of its bind roots, and never /, /proc, /sys,
-// /dev or a sockets folder.
+// files, strictly inside one of its bind roots, or one file the helper made
+// in a helper file root (checkHelperFile), and never /, /proc, /sys, /dev or
+// a sockets folder.
 func CheckBindSource(p Policy, src string) error {
 	if !cleanAbs(src) {
 		return violate(RuleMount, "bind source %q is not a clean absolute path", src)
@@ -210,6 +217,11 @@ func CheckBindSource(p Policy, src string) error {
 	if f, ok := p.forbiddenFor(src); ok {
 		return violate(RuleMount, "bind source %q is inside %s", src, f)
 	}
+	// Validate keeps the helper file roots apart from the other sources,
+	// so a source in one meets that root's rule alone.
+	if root, ok := p.helperFileRootFor(src); ok {
+		return checkHelperFile(root, src)
+	}
 	if slices.Contains(p.BindFiles, src) || withinAny(src, p.BindRoots) {
 		return nil
 	}
@@ -217,21 +229,26 @@ func CheckBindSource(p Policy, src string) error {
 }
 
 // BindRootFor returns the folder a bind source is checked from on disk: the
-// bind root it is inside (the deepest, if roots nest), or a bind file's own
-// folder. This check is on the text alone; runc follows links in a source,
-// so the gate also walks each source on disk (gate.BindChecker), and every
-// folder from this root down must be one only root can write.
-func BindRootFor(p Policy, src string) (string, bool) {
+// bind root or helper file root it is inside (the deepest, if bind roots
+// nest), or a bind file's own folder. folder says whether the source may be
+// a folder: only inside a bind root (the external mounts). A bind file and
+// a helper's file are files. This check is on the text alone; runc follows
+// links in a source, so the gate also walks each source on disk
+// (gate.BindChecker), and every folder from this root down must be one only
+// root can write.
+func BindRootFor(p Policy, src string) (root string, folder, ok bool) {
 	if slices.Contains(p.BindFiles, src) {
-		return path.Dir(src), true
+		return path.Dir(src), false, true
 	}
-	root := ""
+	if r, ok := p.helperFileRootFor(src); ok {
+		return r, false, true
+	}
 	for _, r := range p.BindRoots {
 		if within(src, r) && len(r) > len(root) {
 			root = r
 		}
 	}
-	return root, root != ""
+	return root, root != "", root != ""
 }
 
 // SpecBindSources returns the host paths a container's spec binds in, as

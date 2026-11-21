@@ -43,9 +43,15 @@ func TestBindChecker(t *testing.T) {
 		name  string
 		setup func(t *testing.T, root string) string // returns the source
 		ok    bool
+		// folder: the source may be a folder (a bind root's, the external
+		// mounts); otherwise only a file or socket is (a helper's file).
+		folder bool
 	}{
-		{"a regular file", func(t *testing.T, root string) string { return filepath.Join(root, testID, "resolv.conf") }, true},
-		{"a folder", func(t *testing.T, root string) string { return filepath.Join(root, testID) }, true},
+		{"a regular file", func(t *testing.T, root string) string { return filepath.Join(root, testID, "resolv.conf") }, true, false},
+		{"a folder where folders may be bound", func(t *testing.T, root string) string { return filepath.Join(root, testID) }, true, true},
+		// A folder bound into a sandbox (uid 0) is one it can write, so a
+		// helper file root accepts only the files in it.
+		{"a folder where only a file may be bound", func(t *testing.T, root string) string { return filepath.Join(root, testID) }, false, false},
 		{"a socket (the ready socket)", func(t *testing.T, root string) string {
 			// A short path: a socket's name has a length limit.
 			dir, err := os.MkdirTemp("/tmp", "b")
@@ -59,7 +65,7 @@ func TestBindChecker(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = l.Close() })
 			return filepath.Join(dir, "r.sock")
-		}, true},
+		}, true, false},
 		// Round 2 finding 1: the agent turns its host file into a link to /,
 		// and runc follows it, binding the host's whole filesystem in.
 		{"a link to /", func(t *testing.T, root string) string {
@@ -71,34 +77,34 @@ func TestBindChecker(t *testing.T) {
 				t.Fatal(err)
 			}
 			return p
-		}, false},
+		}, false, false},
 		{"a link to a file in the root", func(t *testing.T, root string) string {
 			p := filepath.Join(root, testID, "hosts")
 			if err := os.Symlink(filepath.Join(root, testID, "resolv.conf"), p); err != nil {
 				t.Fatal(err)
 			}
 			return p
-		}, false},
+		}, false, false},
 		{"a path through a linked folder", func(t *testing.T, root string) string {
 			if err := os.Symlink("/etc", filepath.Join(root, "sb-2")); err != nil {
 				t.Fatal(err)
 			}
 			return filepath.Join(root, "sb-2", "passwd")
-		}, false},
+		}, false, false},
 		{"a hard-linked file", func(t *testing.T, root string) string {
 			p := filepath.Join(root, testID, "resolv.conf")
 			if err := os.Link(p, filepath.Join(root, testID, "second-name")); err != nil {
 				t.Fatal(err)
 			}
 			return p
-		}, false},
+		}, false, false},
 		{"a FIFO", func(t *testing.T, root string) string {
 			p := filepath.Join(root, testID, "fifo")
 			if err := mkfifo(p); err != nil {
 				t.Fatal(err)
 			}
 			return p
-		}, false},
+		}, false, false},
 		// Round 2 finding 1(b): a folder the agent can write lets it swap
 		// the file after the check, so it is refused outright.
 		{"a root others can write", func(t *testing.T, root string) string {
@@ -106,21 +112,21 @@ func TestBindChecker(t *testing.T) {
 				t.Fatal(err)
 			}
 			return filepath.Join(root, testID, "resolv.conf")
-		}, false},
+		}, false, false},
 		{"a group-writable sandbox folder", func(t *testing.T, root string) string {
 			if err := os.Chmod(filepath.Join(root, testID), 0o775); err != nil {
 				t.Fatal(err)
 			}
 			return filepath.Join(root, testID, "resolv.conf")
-		}, false},
+		}, false, false},
 		{"a sticky world-writable folder under the root", func(t *testing.T, root string) string {
 			if err := chmodRaw(filepath.Join(root, testID), 0o1777); err != nil {
 				t.Fatal(err)
 			}
 			return filepath.Join(root, testID, "resolv.conf")
-		}, false},
-		{"missing", func(t *testing.T, root string) string { return filepath.Join(root, testID, "nope") }, false},
-		{"unclean", func(t *testing.T, root string) string { return root + "/" + testID + "/../" + testID + "/resolv.conf" }, false},
+		}, false, false},
+		{"missing", func(t *testing.T, root string) string { return filepath.Join(root, testID, "nope") }, false, false},
+		{"unclean", func(t *testing.T, root string) string { return root + "/" + testID + "/../" + testID + "/resolv.conf" }, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, c := hostsTree(t)
@@ -129,7 +135,7 @@ func TestBindChecker(t *testing.T) {
 			if tc.name == "a socket (the ready socket)" {
 				bindRoot = filepath.Dir(src)
 			}
-			err := c.CheckBind(bindRoot, src)
+			err := c.CheckBind(bindRoot, src, tc.folder)
 			if tc.ok {
 				if err != nil {
 					t.Fatalf("refused: %v", err)
@@ -153,13 +159,13 @@ func TestBindCheckerOwners(t *testing.T) {
 		if err := os.Lchown(filepath.Join(root, testID), 65532, 65532); err != nil {
 			t.Fatal(err)
 		}
-		if err := c.CheckBind(root, filepath.Join(root, testID, "resolv.conf")); rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
+		if err := c.CheckBind(root, filepath.Join(root, testID, "resolv.conf"), false); rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
 			t.Fatalf("err %v", err)
 		}
 	})
 	t.Run("root's tree passes the default checker", func(t *testing.T) {
 		root, _ := hostsTree(t)
-		if err := defaultBindChecker().CheckBind(root, filepath.Join(root, testID, "resolv.conf")); err != nil {
+		if err := defaultBindChecker().CheckBind(root, filepath.Join(root, testID, "resolv.conf"), false); err != nil {
 			t.Fatal(err)
 		}
 	})

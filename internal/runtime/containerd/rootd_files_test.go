@@ -39,7 +39,7 @@ func startHelper(t *testing.T) *rootclient.Client {
 		Policy: rootpolicy.Policy{
 			Namespace: "aerolvm", Snapshotter: "overlayfs", SnapshotterRoot: "/var/lib/containerd/snap",
 			NetnsDir: "/run/netns", MovesDir: filepath.Join(dir, "state", "moves"), FIFODir: filepath.Join(dir, "run", "fifo"),
-			BindRoots:        []string{files.Hosts, files.Ready},
+			HelperFileRoots:  []string{files.Hosts, files.Ready},
 			RunscConfigPaths: []string{filepath.Join(files.Runsc, "config.toml"), filepath.Join(files.Runsc, "restore.toml")},
 			Limits:           rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
 		},
@@ -105,6 +105,53 @@ func TestHelperHostFilesMatchTheDriver(t *testing.T) {
 		if a, b := readString(t, pair[0]), readString(t, pair[1]); a != b {
 			t.Errorf("%s: the driver writes %q, the helper %q", filepath.Base(pair[0]), a, b)
 		}
+	}
+}
+
+// TestHelperResolvConfShapes: for host resolv.conf files as nodes have
+// them, the odd ones included, the helper writes what this driver writes
+// today (prepareSandboxHostFiles copies resolvconf.Generate of the host's
+// file), byte for byte, from the values T4 sends (resolvconf.Parse of the
+// same file). None is refused: a refusal would fail the create in split
+// mode and raise the helper's alarm for a broken agent over a host file.
+func TestHelperResolvConfShapes(t *testing.T) {
+	helper := startHelper(t)
+	for name, body := range map[string]string{
+		"systemd-resolved stub":      "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch ec2.internal\n",
+		"kubernetes pod":             "search ns.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n",
+		"IPv6":                       "nameserver fd00::53\nnameserver 2001:db8::1\n",
+		"IPv6 in capitals":           "nameserver 2001:DB8::1\n",
+		"IPv4-mapped IPv6":           "nameserver ::ffff:10.0.0.2\n",
+		"options with values":        "options timeout:2 attempts:3 rotate\nnameserver 10.0.0.2\n",
+		"a comment after search":     "search corp.example # set by dhcp\nnameserver 10.0.0.2\n",
+		"a search domain not ASCII":  "search ex\u00e4mple.com\nnameserver 10.0.0.2\n",
+		"more nameservers than read": strings.Repeat("nameserver 10.0.0.2\n", 17),
+		"comments and loopback only": "# generated\n; old\nnameserver 127.0.0.1\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			host := filepath.Join(t.TempDir(), "resolv.conf")
+			if err := os.WriteFile(host, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			driver, err := resolvconf.Generate(host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dns, err := resolvconf.Parse(host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := helper.EnsureHostFiles(context.Background(), &rootdpb.EnsureHostFilesRequest{
+				ContainerId: "sb-1", Hostname: "sb-1",
+				Nameservers: dns.Nameservers, Search: dns.Search, DnsOptions: dns.Options,
+			})
+			if err != nil {
+				t.Fatalf("the helper refused a host file the driver copies: %v", err)
+			}
+			if got := readString(t, resp.GetResolvConfPath()); got != driver {
+				t.Errorf("the driver writes %q, the helper %q", driver, got)
+			}
+		})
 	}
 }
 

@@ -170,3 +170,13 @@ func tmpName(name string) (string, error) {
 	}
 	return "." + name + "." + hex.EncodeToString(b[:]), nil
 }
+
+// isTmpName reports whether n is a name tmpName gives name.
+func isTmpName(n, name string) bool {
+	h, ok := strings.CutPrefix(n, "."+name+".")
+	if !ok || len(h) != 16 || strings.ToLower(h) != h {
+		return false
+	}
+	_, err := hex.DecodeString(h)
+	return err == nil
+}

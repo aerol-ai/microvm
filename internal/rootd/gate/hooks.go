@@ -24,9 +24,10 @@ type StdioChecker interface {
 // check walks the path without following links, and requires every folder
 // from the root down to be root's alone, so the agent cannot swap the
 // source between the check and the mount (plan T2: the helper writes those
-// files).
+// files). folder says whether the source may be a folder (BindRootFor's
+// answer): a helper's file or a bind file must not be.
 type BindChecker interface {
-	CheckBind(root, src string) error
+	CheckBind(root, src string, folder bool) error
 }
 
 // ReadChecker checks, on disk, a path root reads because a container
@@ -77,11 +78,11 @@ func (g *Gate) checkBinds(c rootpolicy.Container) error {
 		return err
 	}
 	for _, src := range sources {
-		root, ok := rootpolicy.BindRootFor(g.policy, src)
+		root, folder, ok := rootpolicy.BindRootFor(g.policy, src)
 		if !ok { // CheckContainer has refused this already; stay closed anyway
 			return bindViolation(src, "outside every bind root")
 		}
-		if err := g.binds.CheckBind(root, src); err != nil {
+		if err := g.binds.CheckBind(root, src, folder); err != nil {
 			return err
 		}
 	}
