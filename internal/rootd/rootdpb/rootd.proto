@@ -123,6 +123,13 @@ service RootHelper {
   // ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
   // its namespace and attachment.
   rpc ReleaseSandbox(ReleaseSandboxRequest) returns (ReleaseSandboxResponse);
+
+  // The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
+  // drives and removes the gateway self-test's probe network on the
+  // helper's own bridge; MatchProcess answers which of a sandbox's listed
+  // executables holds one connection (per-binary egress rules).
+  rpc BridgeProbe(BridgeProbeRequest) returns (BridgeProbeResponse);
+  rpc MatchProcess(MatchProcessRequest) returns (MatchProcessResponse);
 }
 
 message VersionRequest {
@@ -405,3 +412,51 @@ message ReleaseSandboxRequest {
 }
 
 message ReleaseSandboxResponse {}
+
+// BridgeProbeOp is one step of the gateway self-test's probe network, as
+// sandboxd runs it in single mode (egress.ProbeNet).
+enum BridgeProbeOp {
+  BRIDGE_PROBE_OP_UNSPECIFIED = 0;
+  // Build the probe network: a namespace joined to the bridge by a veth,
+  // with the slot's reserved link-local source address.
+  BRIDGE_PROBE_OP_SETUP = 1;
+  // Send one DNS query and open one TCP connection from inside it.
+  BRIDGE_PROBE_OP_SEND = 2;
+  // Remove it.
+  BRIDGE_PROBE_OP_CLOSE = 3;
+}
+
+message BridgeProbeRequest {
+  BridgeProbeOp op = 1;
+  // The probe slot: the helper derives the probe's names and its source
+  // address (169.254.250.<slot+1>) from it, and always probes its own
+  // bridge, from its own CNI config.
+  uint32 slot = 2;
+}
+
+message BridgeProbeResponse {
+  // SETUP: the bridge has no link yet (no sandbox has been attached).
+  bool bridge_absent = 1;
+  // SETUP: the bridge cannot pass the redirect (IPv6 on it, or bridged
+  // traffic not going through netfilter); the reason.
+  string not_ready = 2;
+  // SEND: what failed sending, if anything (the gateway's view decides).
+  string send_error = 3;
+}
+
+message MatchProcessRequest {
+  // The sandbox's process, as sandboxd's record of the sandbox names it.
+  uint32 pid = 1;
+  // The connection, seen from inside the sandbox: ip:port each.
+  string local = 2;
+  string remote = 3;
+  // The executables the sandbox's own rules list.
+  repeated string paths = 4;
+}
+
+message MatchProcessResponse {
+  // The listed paths whose process holds the connection.
+  repeated string matched = 1;
+  // No process holds it (it closed, or the sandbox cannot be traced).
+  bool not_found = 2;
+}

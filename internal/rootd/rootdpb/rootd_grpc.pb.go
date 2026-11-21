@@ -48,6 +48,8 @@ const (
 	RootHelper_SandboxRules_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/SandboxRules"
 	RootHelper_PrepareSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/PrepareSandbox"
 	RootHelper_ReleaseSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/ReleaseSandbox"
+	RootHelper_BridgeProbe_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/BridgeProbe"
+	RootHelper_MatchProcess_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/MatchProcess"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -118,6 +120,12 @@ type RootHelperClient interface {
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
 	// its namespace and attachment.
 	ReleaseSandbox(ctx context.Context, in *ReleaseSandboxRequest, opts ...grpc.CallOption) (*ReleaseSandboxResponse, error)
+	// The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
+	// drives and removes the gateway self-test's probe network on the
+	// helper's own bridge; MatchProcess answers which of a sandbox's listed
+	// executables holds one connection (per-binary egress rules).
+	BridgeProbe(ctx context.Context, in *BridgeProbeRequest, opts ...grpc.CallOption) (*BridgeProbeResponse, error)
+	MatchProcess(ctx context.Context, in *MatchProcessRequest, opts ...grpc.CallOption) (*MatchProcessResponse, error)
 }
 
 type rootHelperClient struct {
@@ -298,6 +306,26 @@ func (c *rootHelperClient) ReleaseSandbox(ctx context.Context, in *ReleaseSandbo
 	return out, nil
 }
 
+func (c *rootHelperClient) BridgeProbe(ctx context.Context, in *BridgeProbeRequest, opts ...grpc.CallOption) (*BridgeProbeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BridgeProbeResponse)
+	err := c.cc.Invoke(ctx, RootHelper_BridgeProbe_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) MatchProcess(ctx context.Context, in *MatchProcessRequest, opts ...grpc.CallOption) (*MatchProcessResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MatchProcessResponse)
+	err := c.cc.Invoke(ctx, RootHelper_MatchProcess_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -366,6 +394,12 @@ type RootHelperServer interface {
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
 	// its namespace and attachment.
 	ReleaseSandbox(context.Context, *ReleaseSandboxRequest) (*ReleaseSandboxResponse, error)
+	// The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
+	// drives and removes the gateway self-test's probe network on the
+	// helper's own bridge; MatchProcess answers which of a sandbox's listed
+	// executables holds one connection (per-binary egress rules).
+	BridgeProbe(context.Context, *BridgeProbeRequest) (*BridgeProbeResponse, error)
+	MatchProcess(context.Context, *MatchProcessRequest) (*MatchProcessResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -426,6 +460,12 @@ func (UnimplementedRootHelperServer) PrepareSandbox(context.Context, *PrepareSan
 }
 func (UnimplementedRootHelperServer) ReleaseSandbox(context.Context, *ReleaseSandboxRequest) (*ReleaseSandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseSandbox not implemented")
+}
+func (UnimplementedRootHelperServer) BridgeProbe(context.Context, *BridgeProbeRequest) (*BridgeProbeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BridgeProbe not implemented")
+}
+func (UnimplementedRootHelperServer) MatchProcess(context.Context, *MatchProcessRequest) (*MatchProcessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MatchProcess not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -754,6 +794,42 @@ func _RootHelper_ReleaseSandbox_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_BridgeProbe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BridgeProbeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).BridgeProbe(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_BridgeProbe_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).BridgeProbe(ctx, req.(*BridgeProbeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_MatchProcess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MatchProcessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).MatchProcess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_MatchProcess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).MatchProcess(ctx, req.(*MatchProcessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -828,6 +904,14 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseSandbox",
 			Handler:    _RootHelper_ReleaseSandbox_Handler,
+		},
+		{
+			MethodName: "BridgeProbe",
+			Handler:    _RootHelper_BridgeProbe_Handler,
+		},
+		{
+			MethodName: "MatchProcess",
+			Handler:    _RootHelper_MatchProcess_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

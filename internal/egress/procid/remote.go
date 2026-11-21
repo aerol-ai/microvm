@@ -97,6 +97,11 @@ type Server struct {
 	Authorize Authorizer
 	// Resolver reads procfs; the zero value is the host's.
 	Resolver Resolver
+	// Match, when set, answers instead of Resolver: which of paths the
+	// process pid's sandbox holds the connection with. In privilege mode
+	// split sandboxd cannot read a sandbox's procfs, and the root helper
+	// answers (rootclient.MatchProcess).
+	Match func(pid int, local, remote netip.AddrPort, paths []string) (matched []string, err error)
 }
 
 // Serve answers one request per connection until ln is closed.
@@ -138,6 +143,26 @@ func (s *Server) answer(req Request) Response {
 	pid, allowed, err := s.Authorize(req.SandboxID)
 	if err != nil {
 		return Response{Error: err.Error()}
+	}
+	if s.Match != nil {
+		// Only what the sandbox's own rules list is ever sent.
+		var asked []string
+		for _, p := range req.Paths {
+			if slices.Contains(allowed, p) && !slices.Contains(asked, p) {
+				asked = append(asked, p)
+			}
+		}
+		if len(asked) == 0 {
+			return Response{}
+		}
+		matched, err := s.Match(pid, req.Local, req.Remote, asked)
+		if errors.Is(err, ErrNotFound) {
+			return Response{NotFound: true}
+		}
+		if err != nil {
+			return Response{Error: err.Error()}
+		}
+		return Response{Matched: matched}
 	}
 	is, err := s.Resolver.Matcher(pid, req.Local, req.Remote)
 	if errors.Is(err, ErrNotFound) {

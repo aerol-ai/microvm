@@ -41,7 +41,7 @@ func TestStartEgressProcid(t *testing.T) {
 	svc := service.New(config.Config{}, testLogger(), openTestStore(t), nil, nil, nil, nil, nil, nil)
 	cfg := config.Config{EgressProcidSocket: sock, EgressGatewayUser: "aerolvm-egress"}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := startEgressProcid(ctx, cfg, svc, log); err != nil {
+	if err := startEgressProcid(ctx, cfg, svc, log, nil); err != nil {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(sock)
@@ -52,11 +52,11 @@ func TestStartEgressProcid(t *testing.T) {
 		t.Fatal("a sandbox without per-binary rules must be refused")
 	}
 
-	if err := startEgressProcid(ctx, config.Config{}, svc, log); err != nil {
+	if err := startEgressProcid(ctx, config.Config{}, svc, log, nil); err != nil {
 		t.Fatal("no socket configured is off, not an error")
 	}
 	lookupGatewayUser = func(string) (*user.User, error) { return nil, errors.New("unknown user") }
-	if err := startEgressProcid(ctx, cfg, svc, log); err == nil {
+	if err := startEgressProcid(ctx, cfg, svc, log, nil); err == nil {
 		t.Fatal("a missing gateway user must be reported")
 	}
 }
@@ -131,14 +131,14 @@ func TestStartEgressProcidNumericUser(t *testing.T) {
 	svc := service.New(config.Config{}, testLogger(), openTestStore(t), nil, nil, nil, nil, nil, nil)
 	gid := os.Getgid() // a group this process may chown to
 	cfg := config.Config{EgressProcidSocket: sock, EgressGatewayUser: fmt.Sprintf("%d:%d", os.Getuid(), gid)}
-	if err := startEgressProcid(ctx, cfg, svc, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+	if err := startEgressProcid(ctx, cfg, svc, slog.New(slog.NewTextHandler(io.Discard, nil)), nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(sock); err != nil {
 		t.Fatal(err)
 	}
 	cfg.EgressGatewayUser = "1:x"
-	if err := startEgressProcid(ctx, cfg, svc, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil || !strings.Contains(err.Error(), `egress gateway user "1:x"`) {
+	if err := startEgressProcid(ctx, cfg, svc, slog.New(slog.NewTextHandler(io.Discard, nil)), nil); err == nil || !strings.Contains(err.Error(), `egress gateway user "1:x"`) {
 		t.Fatalf("err = %v", err)
 	}
 }

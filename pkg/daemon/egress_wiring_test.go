@@ -36,7 +36,7 @@ func TestWireEgressGatewaySkips(t *testing.T) {
 		{EgressFQDNEnabled: false},
 		{EgressFQDNEnabled: true, ContainerPrivileged: true},
 	} {
-		wireEgressGateway(context.Background(), cfg, nil, nil, log)
+		wireEgressGateway(context.Background(), cfg, nil, nil, log, nil)
 	}
 }
 

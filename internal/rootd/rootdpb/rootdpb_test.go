@@ -148,6 +148,10 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.PrepareSandboxResponse":       {"netns_path=1:string", "container_ip=2:string", "block_inserted=3:bool"},
 		"aerolvm.rootd.v1.ReleaseSandboxRequest":        {"netns_name=1:string", "container_ip=2:string", "parts=3:repeated string"},
 		"aerolvm.rootd.v1.ReleaseSandboxResponse":       nil,
+		"aerolvm.rootd.v1.BridgeProbeRequest":           {"op=1:enum", "slot=2:uint32"},
+		"aerolvm.rootd.v1.BridgeProbeResponse":          {"bridge_absent=1:bool", "not_ready=2:string", "send_error=3:string"},
+		"aerolvm.rootd.v1.MatchProcessRequest":          {"pid=1:uint32", "local=2:string", "remote=3:string", "paths=4:repeated string"},
+		"aerolvm.rootd.v1.MatchProcessResponse":         {"matched=1:repeated string", "not_found=2:bool"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -177,6 +181,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 			"SANDBOX_RULES_OP_CLEAR_BLOCK_EGRESS=3", "SANDBOX_RULES_OP_BLOCK_INGRESS=4", "SANDBOX_RULES_OP_CLEAR_BLOCK_INGRESS=5",
 			"SANDBOX_RULES_OP_APPLY_EGRESS_POLICY=6", "SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY=7", "SANDBOX_RULES_OP_HOLD_EGRESS=8",
 			"SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS=9"},
+		"aerolvm.rootd.v1.BridgeProbeOp": {"BRIDGE_PROBE_OP_UNSPECIFIED=0", "BRIDGE_PROBE_OP_SETUP=1", "BRIDGE_PROBE_OP_SEND=2",
+			"BRIDGE_PROBE_OP_CLOSE=3"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {
@@ -482,13 +488,19 @@ func TestCallName(t *testing.T) {
 func TestRequestsNameNoPaths(t *testing.T) {
 	msgs := File_rootd_proto.Messages()
 	bytesOK := map[protoreflect.FullName]bool{"aerolvm.rootd.v1.EnsureHostFilesRequest.egress_ca_der": true}
+	// MatchProcess's paths are executables a sandbox's own rules list. The
+	// helper never opens one on the host's tree: each is resolved inside
+	// the sandbox's root (openat2 RESOLVE_IN_ROOT under /proc/<pid>/root)
+	// and only compared, by file identity, with what the sandbox's
+	// processes run (internal/egress/procid).
+	pathOK := map[protoreflect.FullName]bool{"aerolvm.rootd.v1.MatchProcessRequest.paths": true}
 	var check func(m protoreflect.MessageDescriptor)
 	check = func(m protoreflect.MessageDescriptor) {
 		for i := range m.Fields().Len() {
 			f := m.Fields().Get(i)
 			name := strings.ToLower(string(f.Name()))
 			for _, bad := range []string{"path", "dir", "file", "folder", "content", "toml", "body"} {
-				if strings.Contains(name, bad) {
+				if strings.Contains(name, bad) && !pathOK[f.FullName()] {
 					t.Errorf("%s: a request field named like a path or a file's content", f.FullName())
 				}
 			}

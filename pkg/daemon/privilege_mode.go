@@ -27,8 +27,10 @@ import (
 // nothing here runs. split runs sandboxd with no rights; the root helper
 // does its root work, which is built one step at a time (M1 PRs 4 to 9).
 // So far the helper does the containerd engine's network (namespaces, CNI,
-// the forwarding sysctls, the CNI config) and its host firewall (every
-// sandbox rule, the node guard, the deny floor, the IPv6 fence). Root work
+// the forwarding sysctls, the CNI config), its host firewall (every
+// sandbox rule, the node guard, the deny floor, the IPv6 fence), and the
+// hostname gateway's host side (the self-test's probe network, the
+// executable lookups). Root work
 // it does not do yet is refused by name, at start for what sandboxd does
 // at boot, at the call for the rest, and never done as root instead.
 
@@ -51,11 +53,9 @@ func checkPrivilegeMode(cfg config.Config) error {
 	}
 	var gaps []privmode.Step
 	// The host firewall (SB_ENABLE_NETWORK_RULES) and enterprise mode's
-	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go); the
-	// hostname gateway's host side is not yet.
-	if cfg.EgressFQDNEnabled {
-		gaps = append(gaps, privmode.StepFQDNGateway)
-	}
+	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go), and the
+	// hostname gateway's host side (SB_EGRESS_FQDN_ENABLED) from PR 5b
+	// (split_egress.go).
 	if cfg.ContainerdPoolEnabled {
 		gaps = append(gaps, privmode.StepWarmPool)
 	}

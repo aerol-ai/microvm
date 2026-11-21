@@ -49,6 +49,9 @@ const (
 	RuleCIDR     Rule = "cidr"
 	RuleNodePort Rule = "node_port"
 	RuleLease    Rule = "lease"
+	// The root helper's calls for the hostname egress gateway (egress.go).
+	RuleProbe        Rule = "probe"
+	RuleProcessMatch Rule = "process_match"
 )
 
 // Violation is a refused request: which rule, and what about the request
