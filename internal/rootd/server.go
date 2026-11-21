@@ -122,6 +122,9 @@ type Options struct {
 	// own, opened on the first firewall call (openFirewall). The firewall
 	// needs the network: with none, the helper serves no firewall call.
 	Firewall FirewallHost
+	// Egress does the hostname gateway's host side (egress.go). Nil: the
+	// helper's own. Like the firewall, it needs the network.
+	Egress EgressHost
 }
 
 // Server is the helper's socket and gRPC server.
@@ -196,7 +199,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
-		net: s.net, fw: s.fw})
+		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks)})
 	return s, nil
 }
 
@@ -416,6 +419,8 @@ type helper struct {
 	// firewall calls and PrepareSandbox and ReleaseSandbox; nil with net.
 	net *network
 	fw  *firewall
+	// eg serves the hostname gateway's calls; nil with net.
+	eg *egressCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -428,6 +433,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.fw != nil {
 		served = append(served, firewallFeatures...)
 		served = append(served, rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
+	}
+	if h.eg != nil {
+		served = append(served, egressFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.fw.servedParts()}, nil
 }
@@ -481,6 +489,22 @@ func (h helper) ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxR
 	}
 	resp, err := h.fw.release(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_ReleaseSandbox_FullMethodName, resp, err)
+}
+
+func (h helper) BridgeProbe(ctx context.Context, req *rootdpb.BridgeProbeRequest) (*rootdpb.BridgeProbeResponse, error) {
+	if h.eg == nil {
+		return nil, noNetwork(rootdpb.FeatureBridgeProbe)
+	}
+	resp, err := h.eg.bridgeProbe(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_BridgeProbe_FullMethodName, resp, err)
+}
+
+func (h helper) MatchProcess(ctx context.Context, req *rootdpb.MatchProcessRequest) (*rootdpb.MatchProcessResponse, error) {
+	if h.eg == nil {
+		return nil, noNetwork(rootdpb.FeatureMatchProcess)
+	}
+	resp, err := h.eg.matchProcess(req)
+	return answer(ctx, h, rootdpb.RootHelper_MatchProcess_FullMethodName, resp, err)
 }
 
 func (h helper) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {

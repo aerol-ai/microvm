@@ -214,7 +214,7 @@ func TestVersion(t *testing.T) {
 	// EnsureHost is a placeholder, so it is never served; a helper with
 	// no network configuration (this rig) serves no network call either.
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
-		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) ||
+		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
 			f == rootdpb.FeaturePrepareSandbox || f == rootdpb.FeatureReleaseSandbox
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
@@ -229,6 +229,7 @@ func TestVersion(t *testing.T) {
 		served := []string{rootdpb.FeatureEnsureHostFiles, rootdpb.FeatureEnsureTaskFIFOs, rootdpb.FeatureEnsureRunscConfig,
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
+		served = append(served, egressFeatures...)
 		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
 			t.Fatalf("features %v parts %v (%v), want %v and every part", resp.GetFeatures(), resp.GetParts(), err, served)
 		}

@@ -579,6 +579,11 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 //   - PrepareSandbox is RealizeNetns and SandboxRules in one call, with
 //     the same answers to a repeat; ReleaseSandbox is "make sure it is
 //     gone" for both.
+//
+// The hostname gateway's calls (M1 PR 5b): BridgeProbe's set-up replaces
+// what its slot had, its send sends one more probe (the gateway counts
+// flows seen, not their number), and its close is "make sure it is
+// gone"; MatchProcess is a read.
 var retrySafe = map[string]bool{
 	rootdpb.FeatureEnsureHost:           true,
 	rootdpb.FeatureEnsureHostFiles:      true,
@@ -596,6 +601,8 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureSandboxRules:         true,
 	rootdpb.FeaturePrepareSandbox:       true,
 	rootdpb.FeatureReleaseSandbox:       true,
+	rootdpb.FeatureBridgeProbe:          true,
+	rootdpb.FeatureMatchProcess:         true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
