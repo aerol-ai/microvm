@@ -245,11 +245,7 @@ type vethRunner struct {
 
 func (r *vethRunner) Add(_ context.Context, path, id string) (cni.Result, error) {
 	n := r.next.Add(1)
-	host := fmt.Sprintf("vh%s%d", id[len(id)-min(len(id), 6):], n)
-	if len(host) > 15 {
-		host = host[:15]
-	}
-	peer := fmt.Sprintf("vp%d", n)
+	host, peer := vethNames(id, n)
 	if err := netlink.LinkAdd(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: host}, PeerName: peer}); err != nil {
 		return cni.Result{}, err
 	}
@@ -293,6 +289,18 @@ func (r *vethRunner) Add(_ context.Context, path, id string) (cni.Result, error)
 	r.hosts[id] = host
 	r.mu.Unlock()
 	return cni.Result{IP4: ip}, nil
+}
+
+// vethNames names an ADD's pair. The counter comes first and ends at the
+// dash, so two ADDs of one runner never share a name whatever their ids
+// and order; the id's tail only helps a reader. (The tail then the counter
+// clashed: "b-41" first and "b-4" eleventh both made "vhb-411".)
+func vethNames(id string, n int32) (host, peer string) {
+	host = fmt.Sprintf("vh%d-%s", n, id[len(id)-min(len(id), 6):])
+	if len(host) > 15 { // IFNAMSIZ less the NUL
+		host = host[:15]
+	}
+	return host, fmt.Sprintf("vp%d", n)
 }
 
 func (r *vethRunner) Del(_ context.Context, _, id string) error {
@@ -444,6 +452,32 @@ func hostLinksKept(t testing.TB) {
 			}
 		}
 	})
+}
+
+// TestVethNamesNeverClash: the stand-in CNI's names differ for any two
+// ADDs of one runner, whatever ids a burst uses and whatever order its
+// goroutines take the counter in, and fit a link name.
+func TestVethNamesNeverClash(t *testing.T) {
+	hosts, peers := map[string]int32{}, map[string]int32{}
+	ids := []string{"b-0", "a-much-longer-sandbox-id-0"}
+	for i := range 200 {
+		ids = append(ids, fmt.Sprintf("b-%d", i), fmt.Sprintf("sb-%d", i))
+	}
+	for n := int32(1); n <= 400; n++ {
+		for _, id := range ids {
+			host, peer := vethNames(id, n)
+			if len(host) > 15 || len(peer) > 15 {
+				t.Fatalf("vethNames(%q, %d) = %q, %q: longer than a link name", id, n, host, peer)
+			}
+			if m, ok := hosts[host]; ok && m != n {
+				t.Fatalf("host name %q made by ADDs %d and %d", host, m, n)
+			}
+			if m, ok := peers[peer]; ok && m != n {
+				t.Fatalf("peer name %q made by ADDs %d and %d", peer, m, n)
+			}
+			hosts[host], peers[peer] = n, n
+		}
+	}
 }
 
 // TestKernelInspect: the kernel's own view decides what is a sandbox's.
