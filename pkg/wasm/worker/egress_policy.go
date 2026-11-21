@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress/operator"
@@ -163,6 +166,11 @@ func installOperatorGuard(m *NetMediator) {
 	if w.Current() == nil {
 		m.SetDialGuard(egresspolicy.DialGuard{Strict: true})
 	}
+	// A worker reads the file first as root (runWorker builds its mediator
+	// before the drop), then polls it as the worker uid. A change it is not
+	// allowed to read leaves it not knowing the file in force: strict, as
+	// at a start without one, until it can read it again.
+	w.OnUnreadable(func(error) { m.SetDialGuard(egresspolicy.DialGuard{Strict: true}) })
 	ctx, cancel := context.WithCancel(context.Background())
 	done, interval := make(chan struct{}), operatorPoll
 	m.mu.Lock()
@@ -241,17 +249,126 @@ func loadWorkerGuards() error {
 		return fmt.Errorf("wasm worker: %w", err)
 	}
 	if path := strings.TrimSpace(os.Getenv(egresspolicy.FloorFileEnv)); path != "" {
-		floorWatchOnce.Do(func() {
-			// No logger, as for the operator file: sandboxd watches the
-			// same file and logs a bad one once per node.
-			go egresspolicy.WatchFloorFile(context.Background(), path, operatorPoll, nil, nil)
-		})
+		startWorkerFloorWatch(path)
 	}
 	return nil
 }
 
-// floorWatchOnce starts one floor-file watch per worker process.
-var floorWatchOnce sync.Once
+// floorWatch is the one floor-file watch of a worker process.
+var floorWatch struct {
+	sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// startWorkerFloorWatch starts the watch once per process. The file is
+// opened now, before the worker drops its privileges: after, it may be one
+// only root can read (watchWorkerFloor).
+func startWorkerFloorWatch(path string) {
+	floorWatch.Lock()
+	defer floorWatch.Unlock()
+	if floorWatch.cancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	floorWatch.cancel, floorWatch.done = cancel, done
+	r := openFloorReader(path)
+	go func() {
+		defer close(done)
+		watchWorkerFloor(ctx, r, operatorPoll)
+	}()
+}
+
+// stopWorkerFloorWatch ends the watch, so a test's file can go away
+// without the worker failing closed on every later test.
+func stopWorkerFloorWatch() {
+	floorWatch.Lock()
+	defer floorWatch.Unlock()
+	if floorWatch.cancel != nil {
+		floorWatch.cancel()
+		<-floorWatch.done
+		floorWatch.cancel, floorWatch.done = nil, nil
+	}
+	egresspolicy.SetFileFloorUnknown(false)
+}
+
+// floorReader reads the floor file for a worker that may have dropped its
+// privileges since it started. The path first, as every other reader of the
+// file does; when the worker may not read it there, the descriptor it
+// opened at start, which follows an edit made in place but not a file
+// replaced by another (a rename, a ConfigMap update): that one it cannot
+// see, so it reports the floor unknown.
+type floorReader struct {
+	path string
+	held *os.File
+}
+
+func openFloorReader(path string) *floorReader {
+	r := &floorReader{path: path}
+	if f, err := os.Open(path); err == nil {
+		r.held = f
+	}
+	return r
+}
+
+func (r *floorReader) read() ([]byte, error) {
+	raw, err := os.ReadFile(r.path)
+	if err == nil || r.held == nil {
+		return raw, err
+	}
+	st, serr := r.held.Stat()
+	if serr != nil {
+		return nil, err
+	}
+	if replaced(st) {
+		return nil, fmt.Errorf("%w; the file read at start was replaced", err)
+	}
+	return io.ReadAll(io.NewSectionReader(r.held, 0, st.Size()))
+}
+
+// watchWorkerFloor is egresspolicy.WatchFloorFile for a worker, which must
+// fail closed: a floor it cannot read any more refuses every destination
+// until it can (egresspolicy.SetFileFloorUnknown), where sandboxd, which
+// always can, keeps the last addresses. An edit that does not parse keeps
+// the addresses in force, as everywhere. No logger, as for the operator
+// file: sandboxd watches the same file and logs a bad one once per node.
+func watchWorkerFloor(ctx context.Context, r *floorReader, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		syncWorkerFloor(r)
+	}
+}
+
+// replaced reports whether the file st describes has no name left: the
+// path now names another file, or none.
+func replaced(st os.FileInfo) bool {
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	return ok && sys.Nlink == 0
+}
+
+func syncWorkerFloor(r *floorReader) {
+	raw, err := r.read()
+	if err != nil {
+		egresspolicy.SetFileFloorUnknown(true)
+		return
+	}
+	got, err := egresspolicy.ParseFloorFile(r.path, raw)
+	egresspolicy.SetFileFloorUnknown(false)
+	if err != nil || slices.Equal(got, egresspolicy.FileFloor()) {
+		return
+	}
+	egresspolicy.SetFileFloor(got)
+}
 
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
 	m.mu.RLock()

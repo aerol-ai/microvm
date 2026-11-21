@@ -1030,7 +1030,8 @@ func TestAdoptParkedLoadAndLabelErrors(t *testing.T) {
 		t.Fatal("want load error")
 	}
 
-	tr.containers["park-2"] = &fakeContainer{id: "park-2", labelsErr: errors.New("labels fail")}
+	// adoptParked reads the labels from the record LoadContainer fetched.
+	tr.containers["park-2"] = &fakeContainer{id: "park-2", infoErr: errors.New("labels fail")}
 	_, err = d.adoptParked(context.Background(), models.CreateSandboxRequest{}, "sb2", "tok", &containerdpool.ParkedSlot{
 		ID: "park-2", ContainerID: "park-2", Handle: &fakeHandle{alive: true},
 	})
@@ -2544,7 +2545,7 @@ func TestAdoptParkedSetLabelsError(t *testing.T) {
 	tr := newFakeTransport()
 	tr.containers["park-lbl"] = &fakeContainer{
 		id: "park-lbl", labels: map[string]string{poolParkLabelKey: poolParkLabelValue},
-		labelsErr: errors.New("labels fail"),
+		infoErr: errors.New("labels fail"),
 	}
 	d := newTestDriver(t)
 	d.SetClient(NewTestClient("aerolvm", tr))

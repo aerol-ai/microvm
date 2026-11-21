@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -90,7 +89,7 @@ func (m *MultiInstanceEngine) LoadModule(ctx context.Context, path string) error
 	defer m.mu.Unlock()
 	m.lastLoad = LoadTimings{}
 	readStart := time.Now()
-	b, err := os.ReadFile(path)
+	b, err := ReadHostFile(path)
 	if err != nil {
 		return err
 	}

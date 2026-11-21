@@ -51,6 +51,23 @@ type Driver struct {
 	workerCgroup   *hostproc.Cgroup
 	pendingWorkers map[string]worker.FoundWorker
 
+	// The shared compile cache (sharedcache.go): precompile is the trusted
+	// compile step and sharedState single-flights it per module digest;
+	// different modules compile at once, each in a staging folder of its
+	// own, which stageSweep clears of a crashed run's once per process.
+	precompile  precompileFunc
+	sharedMu    sync.Mutex
+	sharedState map[string]*sharedCompile
+	stageSweep  sync.Once
+
+	// The warm slots' compile caches (SlotCompileCache): swept of slots
+	// that are gone at most once per slotCacheSweepEvery.
+	slotSweepMu sync.Mutex
+	slotSweepAt time.Time
+
+	// legacyLogged holds the sandboxes legacyRoot has spoken for.
+	legacyLogged sync.Map
+
 	// hostDirsReady latches once ensureHostDirs has made the driver's own
 	// dirs under the run dir; hostDirsMu single-flights the first call.
 	hostDirsReady atomic.Bool
@@ -80,6 +97,7 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		cfg:             cfg,
 		logger:          logger,
 		newWorkerClient: defaultWorkerClientFactory,
+		precompile:      worker.Precompile,
 		byID:            make(map[string]*sandboxInstance),
 		uploads:         multipartspool.New(cfg.UploadSpoolDir),
 	}

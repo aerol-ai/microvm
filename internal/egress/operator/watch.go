@@ -29,6 +29,33 @@ type Watcher struct {
 	bootErr  error
 	log      *slog.Logger
 	onChange func(*Operator)
+	// onUnreadable and unreadable: OnUnreadable.
+	onUnreadable atomic.Pointer[func(error)]
+	unreadable   atomic.Bool
+}
+
+// OnUnreadable registers fn to run once when the file can no longer be
+// read (no permission: a WASM worker that dropped its privileges, polling a
+// file only root may read). An invalid edit keeps the last good file; a
+// file this process cannot read at all leaves it not knowing what is in
+// force, and a caller that must fail closed does that in fn. The next good
+// load is applied (onChange) even if the file did not change.
+func (w *Watcher) OnUnreadable(fn func(error)) {
+	if w == nil || fn == nil {
+		return
+	}
+	w.onUnreadable.Store(&fn)
+}
+
+// noteRead records whether a read failed for want of permission and tells
+// OnUnreadable's fn when that starts.
+func (w *Watcher) noteRead(err error) {
+	if err == nil || !errors.Is(err, fs.ErrPermission) {
+		return
+	}
+	if fn := w.onUnreadable.Load(); fn != nil && !w.unreadable.Swap(true) {
+		(*fn)(err)
+	}
 }
 
 // NewWatcher loads path once. An empty path means no operator file (nil
@@ -75,19 +102,22 @@ func (w *Watcher) Reload() error {
 	st, err := os.Stat(w.path)
 	if err != nil {
 		w.failures.Add(1)
+		w.noteRead(err)
 		return err
 	}
 	w.tried.Store(st.ModTime().UnixNano())
 	op, err := Load(w.path)
 	if err != nil {
 		w.failures.Add(1)
+		w.noteRead(err)
 		if w.log != nil {
 			w.log.Error("egress operator file invalid; keeping the last good one", "path", w.path, "error", err)
 		}
 		return err
 	}
 	prev := w.cur.Swap(op)
-	if w.onChange != nil && (prev == nil || prev.Hash() != op.Hash()) {
+	recovered := w.unreadable.Swap(false)
+	if w.onChange != nil && (prev == nil || prev.Hash() != op.Hash() || recovered) {
 		w.onChange(op)
 	}
 	return nil
@@ -106,7 +136,11 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			st, err := os.Stat(w.path)
-			if err != nil || st.ModTime().UnixNano() == w.tried.Load() {
+			if err != nil {
+				w.noteRead(err)
+				continue
+			}
+			if st.ModTime().UnixNano() == w.tried.Load() && !w.unreadable.Load() {
 				continue
 			}
 			_ = w.Reload()

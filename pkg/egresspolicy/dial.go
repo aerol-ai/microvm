@@ -187,6 +187,9 @@ func (g DialGuard) CheckFloor(addr netip.AddrPort) error {
 	if pfx, ok := inExtra(&fileFloor, ip); ok {
 		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
 	}
+	if fileFloorUnknown.Load() {
+		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: "floor file unreadable"}
+	}
 	if pfx, ok := firstContaining(g.DenyFloor, ip); ok {
 		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
 	}

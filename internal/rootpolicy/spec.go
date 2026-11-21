@@ -9,7 +9,9 @@ import (
 	"path"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/contrib/seccomp"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -40,6 +42,42 @@ func CheckSpecJSON(p Policy, containerID string, raw []byte) error {
 		return err
 	}
 	return CheckSpec(p, containerID, s)
+}
+
+// SpecFacts is what a spec that passed CheckSpec tells the gate to check
+// on disk: its bind sources, its restore image and the network namespace
+// it joins. It is read from the same decode as the check, so the check and
+// the disk walk cannot read the bytes two ways. It never changes once
+// made, so one value may be shared between calls.
+type SpecFacts struct {
+	bindSources []string
+	restore     string
+	netns       string
+}
+
+// CheckSpecFacts decodes raw once, checks it for containerID (CheckSpec)
+// and returns its facts. It is a pure function of p, containerID and the
+// bytes of raw: that is what lets the gate keep its answer for the same
+// three (gate.specMemo).
+func CheckSpecFacts(p Policy, containerID string, raw []byte) (*SpecFacts, error) {
+	s, err := DecodeSpec(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := CheckSpec(p, containerID, s); err != nil {
+		return nil, err
+	}
+	return &SpecFacts{bindSources: bindSourcesOf(s), restore: s.Annotations[RestoreAnnotation], netns: netnsOf(s)}, nil
+}
+
+// Size is about how many bytes f holds, so a memo of facts can bound what
+// it keeps: a spec may bind in as many paths as fit in a message.
+func (f *SpecFacts) Size() int {
+	n := len(f.restore) + len(f.netns)
+	for _, s := range f.bindSources {
+		n += len(s) + 16 // the string header
+	}
+	return n
 }
 
 // CheckSpec checks an OCI spec against the envelope. containerID, when set,
@@ -258,13 +296,17 @@ func SpecBindSources(c Container) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return bindSourcesOf(s), nil
+}
+
+func bindSourcesOf(s *specs.Spec) []string {
 	var out []string
 	for _, m := range s.Mounts {
 		if m.Type == "bind" || slices.Contains(m.Options, "bind") || slices.Contains(m.Options, "rbind") {
 			out = append(out, m.Source)
 		}
 	}
-	return out, nil
+	return out
 }
 
 func checkAnnotations(p Policy, ann map[string]string) error {
@@ -501,20 +543,57 @@ func checkSeccomp(p Policy, s *specs.Spec) error {
 		}
 		return violate(RuleSeccomp, "the spec has no seccomp profile")
 	}
-	// The default profile depends only on the bounding capabilities.
-	probe := &specs.Spec{Process: &specs.Process{Capabilities: &specs.LinuxCapabilities{}}}
+	var bounding []string
 	if s.Process != nil && s.Process.Capabilities != nil {
-		probe.Process.Capabilities.Bounding = s.Process.Capabilities.Bounding
+		bounding = s.Process.Capabilities.Bounding
 	}
-	want := seccomp.DefaultProfile(probe)
 	// Compared as JSON, the form runc reads: an empty list and a missing
 	// one are the same profile.
 	haveJSON, _ := json.Marshal(have)
-	wantJSON, _ := json.Marshal(want)
-	if !bytes.Equal(haveJSON, wantJSON) {
+	if !bytes.Equal(haveJSON, defaultProfileJSON(bounding)) {
 		return violate(RuleSeccomp, "the seccomp profile is not containerd's default profile for this spec")
 	}
 	return nil
+}
+
+// defaultProfiles keeps the JSON of containerd's default seccomp profile
+// for the few bounding sets specs carry; building and encoding the profile
+// was a good part of every container check. The profile depends only on
+// the bounding set, the build's architecture and the running kernel's
+// version, which containerd reads once per process, so one set's JSON never
+// changes. The key spells out each name's length, so two different sets
+// never share one. Bounded, and emptied when full: a caller sending ever
+// new sets costs the memo its hits, never a wrong answer.
+var defaultProfiles = struct {
+	sync.Mutex
+	json map[string][]byte
+}{json: map[string][]byte{}}
+
+const maxDefaultProfiles = 8
+
+func defaultProfileJSON(bounding []string) []byte {
+	var key strings.Builder
+	for _, c := range bounding {
+		key.WriteString(strconv.Itoa(len(c)))
+		key.WriteByte(':')
+		key.WriteString(c)
+	}
+	k := key.String()
+	defaultProfiles.Lock()
+	b, ok := defaultProfiles.json[k]
+	defaultProfiles.Unlock()
+	if ok {
+		return b
+	}
+	probe := &specs.Spec{Process: &specs.Process{Capabilities: &specs.LinuxCapabilities{Bounding: bounding}}}
+	b, _ = json.Marshal(seccomp.DefaultProfile(probe))
+	defaultProfiles.Lock()
+	if len(defaultProfiles.json) >= maxDefaultProfiles {
+		clear(defaultProfiles.json)
+	}
+	defaultProfiles.json[k] = b
+	defaultProfiles.Unlock()
+	return b
 }
 
 func sortedKeys[V any](m map[string]V) []string {

@@ -319,6 +319,12 @@ func TestStartIngressProxyRoutingRefusals(t *testing.T) {
 			o.ProbeTimeout = time.Nanosecond
 			s.cfg.RouteDNSAddr = "127.0.0.1:1"
 		},
+		// The responder binds and answers (the harness gives it a free
+		// port), but the timeout has passed before the first probe: no
+		// probe may run past ProbeTimeout, so that one gets no time.
+		"probe after the timeout": func(_ *Service, o *IngressRoutingOptions) {
+			o.ProbeTimeout = time.Nanosecond
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

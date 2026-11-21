@@ -24,6 +24,17 @@ const (
 	LockFileName = "secrets.jsonl.lock"
 	// SpillFileName is the overflow buffer the daemon's writer drains.
 	SpillFileName = "secrets.spill.jsonl"
+	// WorkerSpillDirName is the folder in the audit directory where WASM
+	// workers spill, never the audit directory itself, where the evidence
+	// file lives. It is root's: a worker kept root spills into it (its own
+	// SpillFileName and LockFileName), and each worker that runs as its own
+	// uid gets a folder of its own inside it, the only place it may write.
+	// The daemon's writer drains them like its own spill.
+	WorkerSpillDirName = "wasm-spill"
+	// WorkerSpillRetiredPrefix renames a worker's folder once the worker is
+	// gone but its records are not drained yet: the drain removes the
+	// folder when it has taken them, and no new worker gets that name.
+	WorkerSpillRetiredPrefix = "gone-"
 )
 
 // ErrNoSpillPath reports a SpillFile with no destination.
@@ -46,6 +57,37 @@ func WithFileLock(lockPath string, fn func() error) error {
 	}
 	defer func() { _ = unlock(lf) }()
 	return fn()
+}
+
+// ErrLockBusy: someone else holds the lock, and the caller would not wait.
+var ErrLockBusy = errors.New("audit lock is held by another process")
+
+// WithExistingFileLock is WithFileLock for a lock in a folder someone less
+// trusted writes (the WASM workers' spill folder): it never creates the
+// lock, which would leave it root's and shut the workers out of it, and
+// never follows a link to one. It never waits for the lock either: a held
+// lock is ErrLockBusy, since the holder may be a worker that keeps it on
+// purpose. ok is false when there is no lock to take.
+func WithExistingFileLock(lockPath string, fn func() error) (ok bool, err error) {
+	if lockPath == "" {
+		return false, errors.New("audit lock path is unset")
+	}
+	lf, err := os.OpenFile(lockPath, os.O_RDONLY|openNoFollow, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer lf.Close()
+	if st, err := lf.Stat(); err != nil || !st.Mode().IsRegular() {
+		return false, fmt.Errorf("audit lock %s is not a regular file", lockPath)
+	}
+	if err := tryLockExclusive(lf); err != nil {
+		return false, err
+	}
+	defer func() { _ = unlock(lf) }()
+	return true, fn()
 }
 
 // SpillFile is one audit directory's overflow buffer.

@@ -42,7 +42,9 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		StreamReadLimit: d.cfg.StreamMaxMessageBytes,
 		// The code interpreter's python.wasm instances are runs too.
 		Interpreters: sandboxInterpreters{driver: d, id: sandboxID},
-		UploadSpool:  d.uploads,
+		// Uploads are the guest's files: its worker's uid owns them.
+		Owner:       toolhost.Owner{UID: d.cfg.Worker.UID, GID: d.cfg.Worker.GID},
+		UploadSpool: d.uploads,
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV

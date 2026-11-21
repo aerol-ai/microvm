@@ -19,6 +19,7 @@ var (
 	runDaemon              = daemon.Run
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
+	runWasmPrecompileCLI   = worker.RunPrecompileCLI
 	runIsolateJailShim     = isolate.RunJailShim
 	runContextUnpack       = cntr.RunContextUnpack
 	runEgressGatewayCLI    = gatewayd.RunCLI
@@ -126,6 +127,17 @@ func main() {
 		return
 	}
 
+	// Trusted compile step: compiles an operator module into the shared WASM
+	// compile cache that every owner's workers read (pkg/wasm/worker,
+	// RunPrecompileCLI). Spawned by sandboxd only, with operator modules only.
+	if len(os.Args) >= 2 && os.Args[1] == worker.PrecompileFlag {
+		if err := runWasmPrecompileCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
 	// Build-context unpacker: the daemon re-exec'd as a uid with no rights to
 	// unpack one image-build context tar from stdin into the folder on fd 3
 	// (internal/runtime/containerd/buildkit_unpack_linux.go), so a bug in the
@@ -185,7 +197,7 @@ func isDaemonArgv(argv []string) bool {
 	case isVersionArg(a), isNodeCommand(a),
 		a == upgradeSubcommand, a == hostSubcommand, a == keySubcommand,
 		a == backupSubcommand, a == restoreSubcommand, a == recoverQuorumSubcommand,
-		a == "--wasm-worker", a == "--wasm-resident-host", a == pkcs11.HelperFlag,
+		a == "--wasm-worker", a == "--wasm-resident-host", a == worker.PrecompileFlag, a == pkcs11.HelperFlag,
 		a == isolate.JailShimFlag, a == cntr.ContextUnpackFlag, a == gatewayd.Subcommand:
 		return false
 	}

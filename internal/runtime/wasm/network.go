@@ -250,11 +250,22 @@ func (g *networkGateway) serveHTTP(sandboxID string, guestPort int, w http.Respo
 	cw := &byteCountWriter{ResponseWriter: w, counter: &usage.bytesOut}
 	if err := proxy(sandboxID, guestPort, cw, r); err != nil {
 		status := http.StatusBadGateway
-		if errors.Is(err, ErrGuestNotListening) {
+		if errors.Is(err, ErrGuestNotListening) || errors.Is(err, ErrGuestBusy) {
 			status = http.StatusServiceUnavailable
 		}
 		http.Error(cw, err.Error(), status)
 	}
+}
+
+// guestCounters are the sandbox's usage counters, for what sandboxd relays
+// to its guest on a worker's behalf (ProxyHTTPDialed): the same ones its
+// worker's counts are added to, so the totals do not change with who
+// relays.
+func (g *networkGateway) guestCounters(sandboxID string) (in, out *atomic.Int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	u := g.usageForLocked(sandboxID)
+	return &u.bytesIn, &u.bytesOut
 }
 
 func (g *networkGateway) usageForLocked(sandboxID string) *sandboxNetUsage {

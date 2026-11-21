@@ -31,7 +31,25 @@ const workerAuditCapabilityTTL = 365 * 24 * time.Hour
 // pool is non-nil only when SB_WASM_POOL_ENABLED=true; the caller should Close
 // it on daemon shutdown.
 func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store) *wasmpool.Pool {
-	driver := wasmruntime.New(wasmruntime.FromDaemonConfig(cfg), logger)
+	// Workers drop to their own uid, without root's powers, before they run
+	// a module (pkg/wasm/worker/confine.go); the driver hands them what they
+	// need on the host and nothing else.
+	confine := worker.ConfinementFor(cfg.WasmWorkerDropPrivs, cfg.WasmWorkerUID, cfg.WasmWorkerGID)
+	logWasmWorkerConfinement(logger, cfg, confine)
+	driverCfg := wasmruntime.FromDaemonConfig(cfg)
+	driverCfg.Worker = confine
+	driverCfg.CompileCacheDir = effectiveWasmCompileCacheDir(cfg)
+	// Before any worker starts: what the worker uid may reach on the node,
+	// and the gate that refuses a dropped worker while that is not in place.
+	driverCfg.GuestListenHost = wireWasmWorkerFence(ctx, cfg, confine, logger)
+	driver := wasmruntime.New(driverCfg, logger)
+	// Sandboxes still on a root worker because their s3/rclone mounts were
+	// started before workers dropped (recreate them to finish the upgrade).
+	if expvar.Get("aerolvm_wasm_workers_legacy_root") == nil {
+		expvar.Publish("aerolvm_wasm_workers_legacy_root", expvar.Func(func() any {
+			return driver.LegacyRootWorkers()
+		}))
+	}
 	// One ModuleResolver chokepoint shared by the runtime driver (create-time
 	// resolution) and the service (CreateWasmModule registration), so allowlist
 	// + validation + content-addressed pull happen in exactly one place.
@@ -43,6 +61,14 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		resolver.Allowlist[h] = struct{}{}
 	}
 	resolver.PullTimeout = cfg.WasmPullTimeout
+	// The trusted folders the paths sandboxd passes to workers live under:
+	// each is opened from its folder one name at a time, never following a
+	// link, and refused through a folder a worker could write
+	// (worker.GrantPolicy).
+	worker.SetGrantPolicy(worker.GrantPolicy{
+		Roots:  []string{cfg.WasmRunDir, cfg.WasmModulesDir, resolver.CacheDir, cfg.MountsRootPath, effectiveWasmCompileCacheDir(cfg)},
+		Worker: confine,
+	})
 	resolver.Auth = wasmmod.ModuleAuth{
 		Username: cfg.WasmRegistryUsername,
 		PATPath:  cfg.WasmRegistryPATPath,
@@ -56,7 +82,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// pending/failed/foreign row falls through to a 404 rather than booting a
 	// half-staged or someone else's artifact.
 	resolver.CatalogueLookup = svc.ResolveOwnedWasmModule
-	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
+	supervisor := worker.NewSupervisor(worker.Confine(worker.DefaultSpawner, confine))
 	// Workers run in their own cgroup, outside sandboxd's unit, so a
 	// restart or an upgrade does not stop them (pkg/hostproc); the next
 	// sandboxd takes them over below. Off by itself where cgroup v2 is not
@@ -81,7 +107,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// driver's residentHostEnabled() stays false and every create takes the
 	// per-sandbox path. See plans/wasm-resident-module-host.md.
 	if cfg.WasmResidentHostEnabled {
-		residentSupervisor := worker.NewSupervisor(worker.DefaultResidentSpawner)
+		residentSupervisor := worker.NewSupervisor(worker.Confine(worker.DefaultResidentSpawner, confine))
 		residentSupervisor.SetCgroup(workerCgroup)
 		driver.SetResidentHostSupervisor(residentSupervisor)
 	}
@@ -100,11 +126,13 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		_ = os.Setenv("AEROL_WASM_ENGINE", eng)
 	}
 	_ = os.Setenv(worker.ListenFallbackEnv, strconv.FormatBool(cfg.WasmWasmtimeListenFallback))
+	// The cache root stays root's: each owner's workers get a cache of
+	// their own under it (the driver's compileCacheFor), so no tenant's
+	// worker writes compiled code another tenant's worker loads. Workers
+	// from before (adopted) keep the node-wide cache they were started with.
 	if dir := effectiveWasmCompileCacheDir(cfg); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			logger.Warn("wasm compile cache dir not created", "dir", dir, "error", err)
-		} else {
-			_ = os.Setenv("AEROL_WASM_COMPILE_CACHE_DIR", dir)
 		}
 	}
 
@@ -122,6 +150,7 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		pool.SetDefaultMemoryMB(cfg.WasmDefaultMemoryMB)
 		spawner := wasmpool.NewSupervisorSpawner(supervisor)
 		spawner.MemoryMB = cfg.WasmDefaultMemoryMB
+		spawner.CompileCache = driver.SlotCompileCache
 		driver.SetWarmPool(pool)
 		// Registration-time NoteModule (the API twin of seedStandardModules
 		// below): POST /v1/wasm-modules marks the resolved digest as a refill
@@ -158,12 +187,18 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// cold compile. Backgrounded (compiling ~25MB modules is slow) so it never
 	// blocks daemon boot (hard rule 2 / pr-review.md §2). No-op unless the flag
 	// is set and a resident supervisor was wired above.
+	standardRefs := make([]string, 0, len(cfg.WasmStandardModules))
+	for alias := range cfg.WasmStandardModules {
+		standardRefs = append(standardRefs, alias)
+	}
+	// Each standard module goes into the shared compile cache (a trusted
+	// compile, in the background, skipped when the sandboxd before a
+	// restart did it), so the prewarm and every owner's first create read
+	// it back instead of compiling it; its resident host comes up right
+	// after its own compile, not after every module's.
+	go driver.PrepareStandardModules(ctx, standardRefs, cfg.WasmResidentHostEnabled)
 	if cfg.WasmResidentHostEnabled {
-		refs := make([]string, 0, len(cfg.WasmStandardModules))
-		for alias := range cfg.WasmStandardModules {
-			refs = append(refs, alias)
-		}
-		go driver.PrewarmResidentHosts(ctx, refs)
+		refs := standardRefs
 		logger.Info("wasm resident host prewarm scheduled", "modules", len(refs))
 		// Idle-TTL reaper: reclaim a resident host's RAM once it has held zero
 		// instances for the TTL (pre-warmed standard-module hosts are pinned and
@@ -270,5 +305,19 @@ func seedStandardModules(ctx context.Context, resolver *wasmmod.ModuleResolver, 
 		}
 		pool.NoteModule(resolved.Digest, resolved.Path)
 		logger.Info("wasm warm pool seeded standard module", "alias", alias, "digest", resolved.Digest)
+	}
+}
+
+// logWasmWorkerConfinement says once at boot how WASM workers run: dropped
+// to their own uid, or as sandboxd, and why.
+func logWasmWorkerConfinement(logger *slog.Logger, cfg config.Config, c worker.Confinement) {
+	switch {
+	case c.Enabled():
+		logger.Info("wasm workers drop privileges before running a module",
+			"uid", c.UID, "gid", c.GID, "no_new_privs", true, "seccomp", true, "own_pid_namespace", true)
+	case !cfg.WasmWorkerDropPrivs:
+		logger.Warn("wasm workers run with sandboxd's privileges: SB_WASM_WORKER_DROP_PRIVS=false")
+	default:
+		logger.Info("wasm workers run with sandboxd's privileges: sandboxd is not root on Linux, so there are none to drop")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -96,7 +97,29 @@ func (e *wazeroEngine) initRuntime(ctx context.Context, memoryMB int) error {
 	return nil
 }
 
+// compileCacheDir is the worker's own compile cache, set once at start
+// (SetCompileCacheDir). It wins over AEROL_WASM_COMPILE_CACHE_DIR, which
+// only workers from before per-owner caches (and tests) still carry.
+var compileCacheDir atomic.Pointer[string]
+
+// SetCompileCacheDir makes every runtime this process builds from now on
+// cache compiled modules in dir. A worker sets it once, before it serves,
+// to the cache sandboxd chose for the owner whose code it runs: a cache
+// shared across owners would let one tenant's worker plant native code
+// that another tenant's worker then loads. "" clears it.
+func SetCompileCacheDir(dir string) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		compileCacheDir.Store(nil)
+		return
+	}
+	compileCacheDir.Store(&dir)
+}
+
 func wazeroCompileCacheDir() string {
+	if dir := compileCacheDir.Load(); dir != nil {
+		return *dir
+	}
 	return strings.TrimSpace(os.Getenv("AEROL_WASM_COMPILE_CACHE_DIR"))
 }
 
@@ -114,6 +137,14 @@ func newBaseRuntime(ctx context.Context, pages uint32) (wazero.Runtime, error) {
 // compiled). The single-instance engine watches its guest's descriptors
 // through them (fdWatchFactory); nil adds none.
 func newBaseRuntimeWatched(ctx context.Context, pages uint32, watch experimental.FunctionListenerFactory) (wazero.Runtime, error) {
+	return newRuntimeWithCache(ctx, pages, watch, wazeroCompileCacheDir())
+}
+
+// newRuntimeWithCache is newBaseRuntimeWatched with the cache named: the
+// one runtime configuration every compile shares, so a module compiled by
+// PrecompileModule is a cache hit for a worker (wazero keys an entry by the
+// module's bytes and this configuration).
+func newRuntimeWithCache(ctx context.Context, pages uint32, watch experimental.FunctionListenerFactory, cacheDir string) (wazero.Runtime, error) {
 	// Guests are untrusted. WithCloseOnContextDone is wazero's supported
 	// concurrent Module.Close path: cancellation/deadlines can preempt
 	// CPU-bound guest code rather than pinning an OS thread indefinitely.
@@ -127,7 +158,7 @@ func newBaseRuntimeWatched(ctx context.Context, pages uint32, watch experimental
 	if pages > 0 {
 		cfg = cfg.WithMemoryLimitPages(pages)
 	}
-	if dir := wazeroCompileCacheDir(); dir != "" {
+	if dir := cacheDir; dir != "" {
 		cache, err := wazero.NewCompilationCacheWithDir(dir)
 		if err != nil {
 			return nil, fmt.Errorf("compilation cache: %w", err)
@@ -195,7 +226,7 @@ func (e *wazeroEngine) LoadModule(ctx context.Context, path string, opts LoadOpt
 	}
 	e.lastLoad.RuntimeInit = time.Since(initStart)
 	readStart := time.Now()
-	b, err := os.ReadFile(path)
+	b, err := ReadHostFile(path)
 	if err != nil {
 		return err
 	}
@@ -739,4 +770,30 @@ func (e *wazeroEngine) Close(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// PrecompileModule compiles the module at path into the compile cache at
+// cacheDir with the runtime configuration workers use, so a worker that
+// later compiles the same bytes finds it there. sandboxd runs it in a
+// process of its own for operator modules only (worker.RunPrecompileCLI):
+// a step that runs no tenant code, on input the operator staged. A module
+// already in the cache only reads it back.
+func PrecompileModule(ctx context.Context, cacheDir, path string) error {
+	if strings.TrimSpace(cacheDir) == "" {
+		return fmt.Errorf("precompile: no cache dir")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	r, err := newRuntimeWithCache(ctx, 0, nil, cacheDir)
+	if err != nil {
+		return err
+	}
+	defer r.Close(ctx)
+	compiled, err := compileModule(r, ctx, b)
+	if err != nil {
+		return fmt.Errorf("precompile %s: %w", path, err)
+	}
+	return compiled.Close(ctx)
 }

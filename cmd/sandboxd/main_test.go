@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"io"
 	"log/slog"
 	"os"
@@ -349,5 +350,35 @@ func TestMainPKCS11Helper(t *testing.T) {
 	_, _ = io.Copy(&stderr, r)
 	if exitCode != 1 || !strings.Contains(stderr.String(), "no token") {
 		t.Fatalf("helper failure: exit %d stderr %q", exitCode, stderr.String())
+	}
+}
+
+// The trusted compile step dispatches to its CLI and exits 1 on failure.
+func TestMainWasmPrecompile(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	origRun := runWasmPrecompileCLI
+	t.Cleanup(func() { runWasmPrecompileCLI = origRun })
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	for _, fail := range []bool{false, true} {
+		os.Args = []string{"sandboxd", worker.PrecompileFlag, "/cache", "/m.wasm"}
+		var got []string
+		runWasmPrecompileCLI = func(args []string) error {
+			got = args
+			if fail {
+				return errors.New("precompile boom")
+			}
+			return nil
+		}
+		code := -1
+		osExit = func(c int) { code = c }
+		main()
+		if len(got) != 2 || got[0] != "/cache" || got[1] != "/m.wasm" {
+			t.Fatalf("precompile args = %v", got)
+		}
+		if fail && code != 1 || !fail && code != -1 {
+			t.Fatalf("fail=%v exit = %d", fail, code)
+		}
 	}
 }

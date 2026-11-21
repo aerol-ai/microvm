@@ -32,7 +32,7 @@ func TestAtomicWriteFileCreateTempError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	err = atomicWriteFile(root, "nonexistent-directory-123456789/file.txt", errorFile{})
+	err = atomicWriteFile(root, "nonexistent-directory-123456789/file.txt", errorFile{}, Owner{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -46,7 +46,7 @@ func TestAtomicWriteFileCopyError(t *testing.T) {
 	}
 	defer root.Close()
 
-	err = atomicWriteFile(root, "testfile.txt", errorFile{})
+	err = atomicWriteFile(root, "testfile.txt", errorFile{}, Owner{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

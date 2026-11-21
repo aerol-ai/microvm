@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -12,8 +14,23 @@ import (
 
 const wasmLoopbackIP = "127.0.0.1"
 
+// guestListenHost is where this release's workers bind guest listeners
+// (Config.GuestListenHost). Workers of an older release bind on
+// wasmLoopbackIP: they run as root, which the worker fence leaves alone.
+func (d *Driver) guestListenHost() string {
+	if h := d.cfg.GuestListenHost; h != "" {
+		return h
+	}
+	return wasmLoopbackIP
+}
+
 type sandboxInstance struct {
-	sandboxID    string
+	sandboxID string
+	// ownerRef picks the compile cache the sandbox's own workers use
+	// (compileCacheFor).
+	ownerRef string
+	// legacyRoot keeps the sandbox's worker root (Driver.legacyRoot).
+	legacyRoot   bool
 	moduleRef    string
 	modulePath   string
 	moduleSize   int64
@@ -51,7 +68,13 @@ type sandboxInstance struct {
 	// once each re-instantiated the guest and raced on these fields.
 	// listenMu guards them and is never held across a worker call, so a
 	// proxied request never waits on a sync.
-	listenSync         sync.Mutex
+	listenSync sync.Mutex
+	// guestHTTPInFlight counts the exposed-port requests relayed to the
+	// guest right now (guestHTTPProxy caps it).
+	guestHTTPInFlight atomic.Int32
+	// checkpointMu serializes the sandbox's checkpoints over its one
+	// staging folder (stageCheckpoint).
+	checkpointMu       sync.Mutex
 	listenMu           sync.Mutex
 	resolvedListenPort int
 	listenPorts        map[int]int
@@ -164,7 +187,36 @@ func (d *Driver) ensureHostDirs() error {
 			return fmt.Errorf("wasm runtime: %w", err)
 		}
 	}
+	if d.workerOwns() {
+		if err := closeRunDir(d.cfg.RunDir); err != nil {
+			return fmt.Errorf("wasm runtime: %w", err)
+		}
+	}
 	d.hostDirsReady.Store(true)
+	return nil
+}
+
+// closeRunDir keeps the run dir this process's (root's) and 0700. Every
+// sandbox's /work in it belongs to the worker uid, which all workers share,
+// so only a run dir no worker may enter keeps one tenant's worker out of
+// another's /work. The packaging makes it so (sandboxd.service, the chart),
+// but a run dir an operator chose, or one that was there before, may be
+// 0755. One that is not ours is refused: a chmod would not keep its owner
+// out.
+func closeRunDir(dir string) error {
+	st, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("run dir %s is not a directory", dir)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok && int(sys.Uid) != os.Geteuid() {
+		return fmt.Errorf("run dir %s belongs to uid %d, not this process: workers could reach each other's /work through it", dir, sys.Uid)
+	}
+	if st.Mode().Perm() != 0o700 {
+		return os.Chmod(dir, 0o700)
+	}
 	return nil
 }
 

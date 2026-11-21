@@ -114,7 +114,12 @@ func (s *Service) StartAuditIngestServer(ctx context.Context) error {
 	actualPort := ln.Addr().(*net.TCPAddr).Port
 	spillDir := ""
 	if dataDir := secretAuditDataDir(s.cfg.DBPath); dataDir != "" {
-		spillDir = filepath.Join(dataDir, "audit")
+		spillDir = filepath.Join(dataDir, "audit", auditlog.WorkerSpillDirName)
+		if err := s.prepareWorkerSpillDir(spillDir); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("wasm worker audit spill folder not ready; a worker's spilled egress records are dropped (counted)", "dir", spillDir, "error", err)
+			}
+		}
 	}
 	_ = os.Setenv("SB_AUDIT_INGEST_PORT", strconv.Itoa(actualPort))
 	if spillDir != "" {
@@ -432,4 +437,21 @@ func newAuditIngestToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// prepareWorkerSpillDir makes the folder WASM workers spill egress records
+// into when the ingest is down (auditlog.WorkerSpillDirName): inside the
+// audit directory, so the drain moves a segment out of a worker's reach in
+// one rename, but never the audit directory itself. It stays root's (0700):
+// each worker that drops its privileges gets a folder of its own inside it
+// (pkg/wasm/worker privateSpill), so no worker reads, changes or removes
+// another's records; a worker kept root spills into it directly.
+func (s *Service) prepareWorkerSpillDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Lchown(dir, os.Geteuid(), os.Getegid()); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
 }
