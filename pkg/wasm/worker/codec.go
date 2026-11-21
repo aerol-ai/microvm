@@ -86,11 +86,17 @@ func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
 	return err
 }
 
+// readFrame reads a frame that carries no descriptors. It reads with
+// read(2) only: descriptors a sender attached anyway are dropped by the
+// kernel, never held here (a worker's reply is untrusted input).
 func readFrame(r io.Reader) (Envelope, error) {
-	env, files, err := readFrameFiles(r)
-	closeFiles(files)
+	env, _, err := readFrameFrom(r.Read, r.Read, nil)
 	return env, err
 }
+
+// errTooManyFDs fails a frame that carried more descriptors than any
+// message needs (maxFrameFiles).
+var errTooManyFDs = fmt.Errorf("frame carries more than %d descriptors", maxFrameFiles)
 
 // readFrameFiles reads one frame and the descriptors that came with it,
 // named by env.FDPaths. Descriptors that do not match the names one for
@@ -104,19 +110,36 @@ func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
 	var fds []int
 	truncated := false
 	oob := make([]byte, syscall.CmsgSpace(maxFrameFiles*4))
+	tooMany := false
 	read := func(b []byte) (int, error) {
 		n, oobn, flags, _, err := uc.ReadMsgUnix(b, oob)
 		if oobn > 0 {
 			got, perr := parseRights(oob[:oobn])
-			fds = append(fds, got...)
+			if len(fds)+len(got) > maxFrameFiles {
+				// The header may take a few reads, each with its own
+				// descriptors: never hold more than one message's worth.
+				for _, fd := range got {
+					_ = syscall.Close(fd)
+				}
+				tooMany = true
+			} else {
+				fds = append(fds, got...)
+			}
 			truncated = truncated || perr != nil
 		}
 		truncated = truncated || flags&syscall.MSG_CTRUNC != 0
+		if tooMany && err == nil {
+			err = errTooManyFDs
+		}
 		return n, err
 	}
 	// Descriptors arrive with the header (writeFrameFiles); the body is
-	// read with read(2), which the race detector sees (see there).
+	// read with read(2), which the race detector sees (see there), and
+	// which drops any descriptor sent with it.
 	env, files, err := readFrameFrom(read, uc.Read, func() []int { return fds })
+	if err == nil && tooMany {
+		err = errTooManyFDs
+	}
 	if err != nil {
 		closeFiles(files)
 		return env, nil, err
@@ -214,15 +237,15 @@ func closeFiles(files []*os.File) {
 // as grants (wasmengine.GrantHostPath), so the engine reaches those paths
 // through them. A module belongs to the worker; everything else to the
 // sandbox the message names, whose stop releases it in a resident host.
-// A proxy_http carries a connected socket instead (guest_conn.go): that is
-// returned to the caller, never granted as a path.
-func readGrantedFrame(conn net.Conn) (Envelope, []*os.File, error) {
+// A proxy_http carries none: any sent with one are closed.
+func readGrantedFrame(conn net.Conn) (Envelope, error) {
 	env, files, err := readFrameFiles(conn)
 	if err != nil {
-		return env, nil, err
+		return env, err
 	}
 	if env.Type == MsgProxyHTTP {
-		return env, files, nil
+		closeFiles(files)
+		return env, nil
 	}
 	scope := env.SandboxID
 	if env.Type == MsgLoadModule {
@@ -231,5 +254,5 @@ func readGrantedFrame(conn net.Conn) (Envelope, []*os.File, error) {
 	for i, f := range files {
 		wasmengine.GrantHostPath(scope, env.FDPaths[i], f)
 	}
-	return env, nil, nil
+	return env, nil
 }

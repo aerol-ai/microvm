@@ -172,10 +172,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 	}
 
 	for {
-		env, conns, err := readGrantedFrame(conn)
-		// A resident host serves no guest HTTP: a connection sent along is
-		// closed unused.
-		closeFiles(conns)
+		env, err := readGrantedFrame(conn)
 		if err != nil {
 			return err
 		}

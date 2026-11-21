@@ -4,6 +4,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -63,34 +64,63 @@ func workerOn(t *testing.T, s *Server) *Client {
 func portOf(ln net.Listener) int { return ln.Addr().(*net.TCPAddr).Port }
 
 // The whole host-dialed path: the worker hands over its listening socket,
-// sandboxd connects to it and passes the connection back, and the worker
-// proxies the request over it and counts its bytes.
+// sandboxd connects to it and relays the request itself, counting the
+// bytes as the worker would have. The worker's own counters stay at zero:
+// it never touched the request.
 func TestProxyHTTPDialedEndToEnd(t *testing.T) {
 	ln, served := guestServer(t, "tcp", "127.0.0.1:0")
 	eng := &fakeMultiListenEngine{listeners: []wasmengine.WASIListener{{GuestPort: 8080, HostPort: portOf(ln)}}, accepted: map[int]bool{8080: true}}
 	s := &Server{eng: eng, lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1"}}
 	client := workerOn(t, s)
 
+	var in, out atomic.Int64
 	req := httptest.NewRequest(http.MethodPost, "http://gateway/x", strings.NewReader("hello"))
 	rec := httptest.NewRecorder()
-	if err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, rec, req); err != nil {
+	if err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, &in, &out, rec, req); err != nil {
 		t.Fatal(err)
 	}
 	if rec.Code != http.StatusOK || rec.Body.String() != "guest got hello" || served.Load() != 1 {
 		t.Fatalf("status %d body %q served %d", rec.Code, rec.Body.String(), served.Load())
 	}
-	if u := s.netUsageFor("sb"); u.bytesIn.Load() == 0 || u.bytesOut.Load() == 0 {
-		t.Fatalf("usage not counted: in %d out %d", u.bytesIn.Load(), u.bytesOut.Load())
+	// The same totals the worker's proxy counts: the request body and what
+	// came back from the guest in, what went to the guest and the response
+	// body out.
+	var win, wout atomic.Int64
+	wrec := httptest.NewRecorder()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// The worker's listener is still non-blocking (its copy was passed
-	// without Fd): the guest keeps accepting.
+	if err := proxyOverConn(t.Context(), conn, ln.Addr().String(), &win, &wout, wrec, httptest.NewRequest(http.MethodPost, "http://gateway/x", strings.NewReader("hello"))); err != nil {
+		t.Fatal(err)
+	}
+	if in.Load() == 0 || out.Load() == 0 || in.Load() != win.Load() || out.Load() != wout.Load() {
+		t.Fatalf("counted in %d out %d, a worker counts in %d out %d", in.Load(), out.Load(), win.Load(), wout.Load())
+	}
+	if u := s.netUsageFor("sb"); u.bytesIn.Load() != 0 || u.bytesOut.Load() != 0 {
+		t.Fatalf("the worker counted a request it never relayed: in %d out %d", u.bytesIn.Load(), u.bytesOut.Load())
+	}
+	// sandboxd keeps none of the worker's descriptors.
+	before := openFDCount(t)
 	for range 3 {
 		rec := httptest.NewRecorder()
-		if err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, rec, httptest.NewRequest(http.MethodGet, "/", nil)); err != nil || rec.Code != http.StatusOK {
+		if err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, &in, &out, rec, httptest.NewRequest(http.MethodGet, "/", nil)); err != nil || rec.Code != http.StatusOK {
 			t.Fatalf("again: %v %d", err, rec.Code)
 		}
 	}
+	if after := openFDCount(t); after > before+2 {
+		t.Fatalf("descriptors %d -> %d after three requests", before, after)
+	}
+}
+
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond) // let closed connections settle
+	names, err := fdNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(names)
 }
 
 // sandboxd connects only to a listener it checked: one bound to the guest
@@ -110,7 +140,7 @@ func TestProxyHTTPDialedRefusesListeners(t *testing.T) {
 		{"another host", "127.0.97.1", []int{portOf(ln)}, "not the guest listen host"},
 		{"a host that is not an address", "localhost", []int{portOf(ln)}, "guest listen host"},
 	} {
-		err := client.ProxyHTTPDialed("sb", 8080, tc.host, tc.ports, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+		err := client.ProxyHTTPDialed("sb", 8080, tc.host, tc.ports, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v", tc.name, err)
 		}
@@ -182,70 +212,10 @@ func TestCheckGuestListener(t *testing.T) {
 	}
 }
 
-// The worker uses a connection sandboxd passed only when it leads to the
-// listener the request would go to now; one that leads anywhere else is
-// closed unused, and the request is refused.
-func TestWorkerRefusesConnectionToAnotherListener(t *testing.T) {
-	mine, minesServed := guestServer(t, "tcp", "127.0.0.1:0")
-	other, othersServed := guestServer(t, "tcp", "127.0.0.1:0")
-	eng := &fakeMultiListenEngine{listeners: []wasmengine.WASIListener{{GuestPort: 8080, HostPort: portOf(mine)}}, accepted: map[int]bool{8080: true}}
-	client := workerOn(t, &Server{eng: eng, lastCaps: wasmengine.Capabilities{WASIListenHost: "127.0.0.1"}})
-
-	send := func(conns ...net.Conn) Envelope {
-		t.Helper()
-		uc, err := net.Dial("unix", client.socketPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer uc.Close()
-		var files []*os.File
-		var names []string
-		for _, c := range conns {
-			f, err := c.(*net.TCPConn).File()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer f.Close()
-			files = append(files, f)
-			names = append(names, guestConnFDName)
-		}
-		body := mustPayload(t, proxyHTTPPayload{GuestPort: 8080, Method: http.MethodGet, RequestURI: "/"})
-		if err := writeFrameFiles(uc, Envelope{Type: MsgProxyHTTP, SandboxID: "sb", Payload: body, FDPaths: names}, files); err != nil {
-			t.Fatal(err)
-		}
-		reply, err := readFrame(uc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return reply
-	}
-	dial := func(ln net.Listener) net.Conn {
-		c, err := net.Dial("tcp", ln.Addr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = c.Close() })
-		return c
-	}
-	if reply := send(dial(other)); reply.Type != MsgError || !strings.Contains(string(reply.Payload), "leads to") {
-		t.Fatalf("a connection to another listener: %s %s", reply.Type, reply.Payload)
-	}
-	if reply := send(dial(mine), dial(mine)); reply.Type != MsgError || !strings.Contains(string(reply.Payload), "want one") {
-		t.Fatalf("two connections: %s %s", reply.Type, reply.Payload)
-	}
-	if reply := send(dial(mine)); reply.Type != MsgProxyHTTPResult {
-		t.Fatalf("its own listener: %s %s", reply.Type, reply.Payload)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if othersServed.Load() != 0 || minesServed.Load() != 1 {
-		t.Fatalf("served: other %d, mine %d", othersServed.Load(), minesServed.Load())
-	}
-}
-
 // With no live listener, guest_listener is refused and nothing connects.
 func TestGuestListenerNotListening(t *testing.T) {
 	client := workerOn(t, &Server{eng: &fakeMultiListenEngine{}})
-	err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{1}, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	err := client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{1}, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	if err == nil || !strings.Contains(err.Error(), "not listening") {
 		t.Fatalf("no listener: %v", err)
 	}
@@ -254,7 +224,7 @@ func TestGuestListenerNotListening(t *testing.T) {
 	port := portOf(ln)
 	_ = ln.Close()
 	client = workerOn(t, &Server{eng: &fakeMultiListenEngine{listeners: []wasmengine.WASIListener{{GuestPort: 8080, HostPort: port}}}})
-	err = client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{port}, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	err = client.ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{port}, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
 	if err == nil || !strings.Contains(err.Error(), "no listening socket") {
 		t.Fatalf("closed listener: %v", err)
 	}
@@ -273,7 +243,7 @@ func TestGuestListenerNotListening(t *testing.T) {
 // request without a connection to any guest.
 func TestProxyHTTPDialedTransportErrors(t *testing.T) {
 	c := NewClient(filepath.Join(t.TempDir(), "none.sock"))
-	if err := c.ProxyHTTPDialed("sb", 8080, "127.0.0.1", nil, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil)); err == nil {
+	if err := c.ProxyHTTPDialed("sb", 8080, "127.0.0.1", nil, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil)); err == nil {
 		t.Fatal("no worker")
 	}
 	c.dial = func(string) (net.Conn, error) {
@@ -281,7 +251,154 @@ func TestProxyHTTPDialedTransportErrors(t *testing.T) {
 		go func() { _, _ = readFrame(b); _ = b.Close() }()
 		return a, nil
 	}
-	if err := c.ProxyHTTPDialed("sb", 8080, "127.0.0.1", nil, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil)); err == nil {
+	if err := c.ProxyHTTPDialed("sb", 8080, "127.0.0.1", nil, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil)); err == nil {
 		t.Fatal("a worker that hung up")
+	}
+}
+
+// hostileWorker answers guest_listener with listener attached, then
+// records what else sandboxd sends on that connection.
+func hostileWorker(t *testing.T, listener net.Listener, onListener func(*os.File)) (sock string, later chan []*os.File) {
+	t.Helper()
+	sock = filepath.Join(t.TempDir(), "w.sock")
+	ul, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ul.Close() })
+	later = make(chan []*os.File, 64)
+	go func() {
+		for {
+			c, err := ul.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if env, _, err := readFrameFiles(c); err != nil || env.Type != MsgGuestListener {
+					return
+				}
+				lf, err := listener.(*net.TCPListener).File()
+				if err != nil {
+					return
+				}
+				if onListener != nil {
+					onListener(lf)
+				}
+				body, _ := encodePayload(guestListenerResult{Host: "127.0.0.1", Port: portOf(listener)})
+				_ = writeFrameFiles(c, Envelope{Type: MsgOK, Payload: body, FDPaths: []string{guestListenerFDName}}, []*os.File{lf})
+				_ = lf.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				_, files, _ := readFrameFiles(c)
+				later <- files
+			}(c)
+		}
+	}()
+	return sock, later
+}
+
+// sandboxd never hands a worker a socket it made: nft matches packets by
+// the uid of the process that made the socket, so a root socket in a
+// worker's hands would be root's to the fence wherever the worker pointed
+// it. After guest_listener, sandboxd sends nothing more; it serves the
+// request itself.
+func TestProxyHTTPDialedHandsTheWorkerNoSocket(t *testing.T) {
+	ln, served := guestServer(t, "tcp", "127.0.0.1:0")
+	sock, later := hostileWorker(t, ln, nil)
+	rec := httptest.NewRecorder()
+	if err := NewClient(sock).ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, new(atomic.Int64), new(atomic.Int64), rec, httptest.NewRequest(http.MethodGet, "/", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || served.Load() != 1 {
+		t.Fatalf("status %d served %d", rec.Code, served.Load())
+	}
+	if files := <-later; len(files) != 0 {
+		closeFiles(files)
+		t.Fatalf("sandboxd sent the worker %d descriptors after guest_listener", len(files))
+	}
+}
+
+// A worker that sets SO_LINGER on the listener it hands over, and drops
+// its own copy so sandboxd's close is the last, holds no sandboxd thread:
+// a listening socket's close never waits for data, and sandboxd hands out
+// nothing else to linger on.
+func TestProxyHTTPDialedHostileLingerReturns(t *testing.T) {
+	ln, _ := guestServer(t, "tcp", "127.0.0.1:0")
+	sock, _ := hostileWorker(t, ln, func(f *os.File) {
+		if fd, err := rawFD(f); err == nil {
+			_ = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{Onoff: 1, Linger: 3600})
+		}
+	})
+	const n = 20
+	done := make(chan error, n)
+	for range n {
+		go func() {
+			done <- NewClient(sock).ProxyHTTPDialed("sb", 8080, "127.0.0.1", []int{portOf(ln)}, new(atomic.Int64), new(atomic.Int64), httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+		}()
+	}
+	for i := range n {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("call %d: %v", i, err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%d of %d calls still blocked after 15s", n-i, n)
+		}
+	}
+}
+
+// One reply can make sandboxd hold no more than one message's worth of a
+// worker's descriptors: readFrame (every reply but guest_listener) reads
+// with read(2), so the kernel drops any sent; readFrameFiles fails a frame
+// that carries more than maxFrameFiles.
+func TestFrameDescriptorFlood(t *testing.T) {
+	flood := func(t *testing.T, read func(net.Conn)) int {
+		pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sandboxd, _ := net.FileConn(os.NewFile(uintptr(pair[0]), "sandboxd"))
+		t.Cleanup(func() { _ = sandboxd.Close() })
+		worker := pair[1]
+		t.Cleanup(func() { _ = unix.Close(worker) })
+		devnull, err := os.Open(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = devnull.Close() })
+		fds := make([]int, 32)
+		for i := range fds {
+			fds[i] = int(devnull.Fd())
+		}
+		base := openFDCount(t)
+		var hdr [4]byte
+		hdr[1] = 0x10 // a 1 MiB frame that never ends
+		_ = unix.Sendmsg(worker, hdr[:1], unix.UnixRights(fds...), nil, 0)
+		_ = unix.Sendmsg(worker, hdr[1:2], unix.UnixRights(fds...), nil, 0)
+		_ = unix.Sendmsg(worker, hdr[2:], unix.UnixRights(fds...), nil, 0)
+		for range 200 {
+			if err := unix.Sendmsg(worker, []byte{' '}, unix.UnixRights(fds...), nil, 0); err != nil {
+				break
+			}
+		}
+		go read(sandboxd)
+		time.Sleep(300 * time.Millisecond)
+		return openFDCount(t) - base
+	}
+	if held := flood(t, func(c net.Conn) { _, _ = readFrame(c) }); held > 0 {
+		t.Fatalf("readFrame holds %d descriptors of an unfinished reply", held)
+	}
+	errs := make(chan error, 1)
+	if held := flood(t, func(c net.Conn) { _, _, err := readFrameFiles(c); errs <- err }); held > maxFrameFiles {
+		t.Fatalf("readFrameFiles holds %d descriptors (cap %d)", held, maxFrameFiles)
+	}
+	select {
+	case err := <-errs:
+		if !errors.Is(err, errTooManyFDs) {
+			t.Fatalf("readFrameFiles = %v, want errTooManyFDs", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("readFrameFiles kept reading a frame with too many descriptors")
 	}
 }

@@ -3,6 +3,7 @@ package workerfence
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -71,13 +73,12 @@ func TestPlan(t *testing.T) {
 		got[i] = r.Comment()
 	}
 	want := []string{
-		"uid 61000 accept reply 127.0.0.0/8",
-		"uid 61000 accept reply ::1/128",
-		"uid 61000 accept tcp 127.0.0.1/32 nat (audit ingest)",
+		"uid 61000 accept reply 127.0.97.1 -> 127.0.0.0/8",
+		"uid 61000 accept tcp 127.0.0.1/32 nat port 4100 (audit ingest)",
 		"uid 61000 accept tcp 127.0.0.1/32 port 4100 (audit ingest)",
-		"uid 61000 accept udp 10.0.0.2/32 nat (name server)",
+		"uid 61000 accept udp 10.0.0.2/32 nat port 53 (name server)",
 		"uid 61000 accept udp 10.0.0.2/32 port 53 (name server)",
-		"uid 61000 accept udp 127.0.0.53/32 nat (name server)",
+		"uid 61000 accept udp 127.0.0.53/32 nat port 53 (name server)",
 		"uid 61000 accept udp 127.0.0.53/32 port 53 (name server)",
 	}
 	for _, p := range Blocked() {
@@ -86,12 +87,15 @@ func TestPlan(t *testing.T) {
 	want = append(want, "uid 61000 drop 10.96.0.1/32",
 		"uid 61000 accept local tcp port 80 (node port)",
 		"uid 61000 accept local tcp port 443 (node port)",
-		"uid 61000 drop local")
+		"uid 61000 drop local",
+		"uid 61000 drop broadcast")
 	if !slices.Equal(got, want) {
 		t.Fatalf("plan =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	if strings.Contains(Key(rules), "127.0.97.1") {
-		t.Fatal("the guest listen address is an exception again: workers must not open connections to guest listeners")
+	for _, r := range rules {
+		if r.Kind != KindReply && r.Accepts() && r.Prefix.Contains(netip.MustParseAddr(GuestListenHost)) {
+			t.Fatalf("%s: workers must not open connections to guest listeners", r.Comment())
+		}
 	}
 	for _, r := range rules {
 		if r.Accepts() != strings.Contains(r.Comment(), "accept") {
@@ -172,8 +176,8 @@ func TestFenceEnsureLatch(t *testing.T) {
 		t.Fatalf("failed install = %v, ready=%v", err, f2.Ready())
 	}
 	_ = f2.Ensure()
-	// Each attempt tries the plan with fib, then with the node's addresses.
-	if be2.applies != 4 {
+	// A refusal that is not a missing expression does not fall back.
+	if be2.applies != 2 {
 		t.Fatalf("a failed install was not retried: %d", be2.applies)
 	}
 	be2.applyErr = nil
@@ -253,10 +257,11 @@ func TestRuleComment(t *testing.T) {
 		want string
 	}{
 		{Rule{UID: 7, Prefix: netip.MustParsePrefix("fe80::/10")}, "uid 7 drop fe80::/10"},
-		{Rule{UID: 7, Kind: KindReply, Prefix: netip.MustParsePrefix("::1/128")}, "uid 7 accept reply ::1/128"},
+		{Rule{UID: 7, Kind: KindReply, From: netip.MustParseAddr("127.0.97.1"), Prefix: netip.MustParsePrefix("127.0.0.0/8")}, "uid 7 accept reply 127.0.97.1 -> 127.0.0.0/8"},
 		{Rule{UID: 7, Kind: KindAllow, Proto: "udp", Prefix: netip.MustParsePrefix("::1/128"), PortLo: 53, PortHi: 53}, "uid 7 accept udp ::1/128 port 53"},
 		{Rule{UID: 7, Kind: KindAllow, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 1, PortHi: 9, Why: "w"}, "uid 7 accept tcp 127.0.0.1/32 ports 1-9 (w)"},
-		{Rule{UID: 7, Kind: KindAllowNAT, Proto: "udp", Prefix: netip.MustParsePrefix("127.0.0.11/32"), Why: "dns"}, "uid 7 accept udp 127.0.0.11/32 nat (dns)"},
+		{Rule{UID: 7, Kind: KindAllowNAT, Proto: "udp", Prefix: netip.MustParsePrefix("127.0.0.11/32"), PortLo: 53, PortHi: 53, Why: "dns"}, "uid 7 accept udp 127.0.0.11/32 nat port 53 (dns)"},
+		{Rule{UID: 7, Kind: KindBroadcastDrop}, "uid 7 drop broadcast"},
 		{Rule{UID: 7, Kind: KindLocalPort, PortLo: 443, PortHi: 443}, "uid 7 accept local tcp port 443"},
 		{Rule{UID: 7, Kind: KindLocalDrop}, "uid 7 drop local"},
 	} {
@@ -294,63 +299,115 @@ func contextWithCancel() (context.Context, context.CancelFunc) {
 }
 
 // Without nft fib, the node's addresses are listed: the same node ports
-// open on each, then a drop per address, after the floor.
+// open on each, then a drop per address and per IPv4 subnet broadcast,
+// after the floor.
 func TestPlanNoFib(t *testing.T) {
-	addr := netip.MustParseAddr
-	rules, err := Plan(Spec{UID: 7, NodePorts: []uint16{443}, NoFib: true, Local: []netip.Addr{
-		addr("10.0.0.5"), addr("::ffff:10.0.0.5"), addr("127.0.0.1"), addr("fe80::1"), addr("2001:db8::5"), {},
+	pfx := netip.MustParsePrefix
+	rules, err := Plan(Spec{UID: 7, NodePorts: []uint16{443}, NoFib: true, Local: []netip.Prefix{
+		pfx("10.0.0.5/24"), pfx("::ffff:10.0.0.5/120"), pfx("127.0.0.1/8"), pfx("fe80::1/64"), pfx("2001:db8::5/64"), pfx("192.168.9.9/32"), {},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	key := Key(rules)
-	tail := "uid 7 accept tcp 10.0.0.5/32 port 443 (node port); uid 7 accept tcp 2001:db8::5/128 port 443 (node port); " +
-		"uid 7 drop 10.0.0.5/32 (node address); uid 7 drop 2001:db8::5/128 (node address)"
+	tail := "uid 7 accept tcp 10.0.0.5/32 port 443 (node port); uid 7 accept tcp 192.168.9.9/32 port 443 (node port); uid 7 accept tcp 2001:db8::5/128 port 443 (node port); " +
+		"uid 7 drop 10.0.0.5/32 (node address); uid 7 drop 192.168.9.9/32 (node address); uid 7 drop 2001:db8::5/128 (node address); uid 7 drop 10.0.0.255/32 (node broadcast)"
 	if !strings.HasSuffix(key, tail) || usesFib(rules) {
 		t.Fatalf("plan = %s", key)
 	}
 	if fib, _ := Plan(Spec{UID: 7}); !usesFib(fib) {
 		t.Fatal("a plan with fib does not use it")
 	}
+	for _, tc := range []struct {
+		p    string
+		want string
+	}{
+		{"172.17.0.2/16", "172.17.255.255"},
+		{"10.1.2.3/30", "10.1.2.3"},
+		{"10.1.2.3/31", ""},
+		{"2001:db8::1/64", ""},
+		{"0.0.0.0/0", ""},
+	} {
+		got, ok := broadcastOf(pfx(tc.p))
+		if (tc.want == "") == ok || ok && got.String() != tc.want {
+			t.Errorf("broadcastOf(%s) = %v %v, want %q", tc.p, got, ok, tc.want)
+		}
+	}
 }
 
 // fibless refuses any install that needs nft fib, as a kernel without the
-// module does.
-type fibless struct{ fakeBackend }
+// module does (the kernel answers ENOENT for an expression it lacks).
+type fibless struct {
+	fakeBackend
+	fibOK bool
+}
 
 func (f *fibless) Apply(rules []Rule) error {
-	if usesFib(rules) {
+	if usesFib(rules) && !f.fibOK {
 		f.mu.Lock()
 		f.applies++
 		f.mu.Unlock()
-		return errors.New("netlink receive: no such file or directory")
+		return fmt.Errorf("install: conn.Receive: netlink receive: %w", syscall.ENOENT)
 	}
 	return f.fakeBackend.Apply(rules)
 }
 
 // On a kernel without nft fib the fence still goes in, listing the node's
-// addresses, and stays that way on later syncs; a failure that is not fib
-// keeps its own error.
+// addresses; each sync tries fib again (a refused batch changes nothing)
+// and re-installs the listed plan only when an address changed; once fib
+// works, the fence uses it. A failure that is not a missing expression
+// keeps its own error and never falls back.
 func TestFenceFallsBackWithoutFib(t *testing.T) {
 	be := &fibless{}
-	local := []netip.Addr{netip.MustParseAddr("10.0.0.5")}
+	local := []netip.Prefix{netip.MustParsePrefix("10.0.0.5/24")}
 	f := New(be, func() (Spec, error) { return Spec{UID: 61000, NodePorts: []uint16{443}, Local: local}, nil }, quiet())
+	clock := time.Unix(1000, 0)
+	f.now = func() time.Time { return clock }
 	if err := f.Ensure(); err != nil || !f.Ready() || !f.noFib {
 		t.Fatalf("fallback: %v ready=%v noFib=%v", err, f.Ready(), f.noFib)
 	}
-	if k := Key(be.last); !strings.Contains(k, "drop 10.0.0.5/32 (node address)") || usesFib(be.last) {
+	if k := Key(be.last); !strings.Contains(k, "drop 10.0.0.5/32 (node address)") || !strings.Contains(k, "drop 10.0.0.255/32 (node broadcast)") || usesFib(be.last) {
 		t.Fatalf("installed = %s", k)
 	}
-	// A new address is picked up by the next sync, without trying fib again.
+	// Nothing changed: fib is tried again; the listed plan is not
+	// re-installed.
 	applies := be.applies
-	local = append(local, netip.MustParseAddr("10.0.0.6"))
-	if err := f.Sync(); err != nil || be.applies != applies+1 || !strings.Contains(Key(be.last), "10.0.0.6/32 (node address)") {
-		t.Fatalf("new address: %v applies %d->%d", err, applies, be.applies)
+	if err := f.Sync(); err != nil || be.applies != applies+1 {
+		t.Fatalf("idle sync: %v applies %d->%d", err, applies, be.applies)
+	}
+	// A new address is picked up by the next sync.
+	local = append(local, netip.MustParsePrefix("10.0.0.6/24"))
+	if err := f.Sync(); err != nil || !strings.Contains(Key(be.last), "10.0.0.6/32 (node address)") {
+		t.Fatalf("new address: %v", err)
+	}
+	// The listed plan is checked on the reassert schedule and put back.
+	_ = be.Remove()
+	clock = clock.Add(ReassertInterval)
+	if err := f.Sync(); err != nil || !be.inKernel {
+		t.Fatalf("repair without fib: %v", err)
+	}
+	// A failed check closes the gate.
+	be.checkErr = errors.New("netlink busy")
+	clock = clock.Add(ReassertInterval)
+	if err := f.Sync(); err == nil || f.Ready() {
+		t.Fatal("a failed check left the gate open")
+	}
+	be.checkErr = nil
+	// The kernel gained fib: the fence uses it from the next sync on.
+	be.fibOK = true
+	if err := f.Sync(); err != nil || f.noFib || !usesFib(be.last) {
+		t.Fatalf("fib back: %v noFib=%v", err, f.noFib)
 	}
 
 	bad := &fakeBackend{applyErr: errors.New("netlink: operation not permitted")}
 	f2 := New(bad, func() (Spec, error) { return Spec{UID: 61000}, nil }, quiet())
-	if err := f2.Ensure(); err == nil || !strings.Contains(err.Error(), "operation not permitted") || f2.noFib || bad.applies != 2 {
+	if err := f2.Ensure(); err == nil || !strings.Contains(err.Error(), "operation not permitted") || f2.noFib || bad.applies != 1 {
 		t.Fatalf("not fib: %v noFib=%v applies=%d", err, f2.noFib, bad.applies)
+	}
+	// fib missing, and the listed plan refused too: the first error stands.
+	worse := &fibless{fakeBackend: fakeBackend{applyErr: errors.New("busy")}}
+	f3 := New(worse, func() (Spec, error) { return Spec{UID: 61000}, nil }, quiet())
+	if err := f3.Ensure(); err == nil || !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("both refused: %v", err)
 	}
 }

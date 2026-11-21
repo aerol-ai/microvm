@@ -113,19 +113,26 @@ func workerFenceSpec(cfg config.Config, c worker.Confinement) workerfence.Spec {
 	return spec
 }
 
-// localAddrs are the node's own addresses, which the fence lists itself on
-// a kernel without nft fib. A failed read lists none: the fib rules, where
+// localAddrs are the node's own addresses with their prefix lengths, which
+// the fence lists itself (with each subnet's broadcast address) on a
+// kernel without nft fib. A failed read lists none: the fib rules, where
 // the kernel has them, need no list.
-func localAddrs() []netip.Addr {
+func localAddrs() []netip.Prefix {
 	addrs, err := nodeInterfaceAddrs()
 	if err != nil {
 		return nil
 	}
-	var out []netip.Addr
+	var out []netip.Prefix
 	for _, a := range addrs {
 		if n, ok := a.(*net.IPNet); ok {
-			if ip, ok := netip.AddrFromSlice(n.IP); ok {
-				out = append(out, ip.Unmap())
+			ip, ok := netip.AddrFromSlice(n.IP)
+			ones, _ := n.Mask.Size()
+			if ok {
+				ip = ip.Unmap()
+				if ip.Is4() && ones > 32 {
+					ones -= 96
+				}
+				out = append(out, netip.PrefixFrom(ip, ones))
 			}
 		}
 	}

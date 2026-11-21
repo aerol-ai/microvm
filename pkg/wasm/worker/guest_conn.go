@@ -6,22 +6,26 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"os"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// Only root opens connections to a guest's listeners. All workers share one
-// uid, so the worker fence (internal/network/workerfence) cannot tell a
-// worker reaching its own guest from one reaching another tenant's guest:
-// it lets the worker uid answer connections on loopback and open none.
-// sandboxd therefore makes each exposed-port connection itself:
+// Only root opens connections to a guest's listeners, and the worker never
+// holds one of them. All workers share one uid, so the worker fence
+// (internal/network/workerfence) cannot tell a worker reaching its own
+// guest from one reaching another tenant's guest: it lets the worker uid
+// answer connections on the guest listen host and open none on loopback.
+// sandboxd therefore serves each exposed-port request itself:
 //
 //  1. sandboxd sends guest_listener; the worker answers with the listening
 //     socket the request goes to (listenerFor) attached.
@@ -31,10 +35,14 @@ import (
 //     hand the connection to, and a worker can only attach a socket it
 //     holds: so the connection lands on that worker's own listener, never
 //     on another tenant's or on a service of the node, whatever port the
-//     worker named.
-//  3. sandboxd sends proxy_http with the connected socket attached; the
-//     worker checks, under its lock, that it leads to the listener of the
-//     instance it runs now, and proxies the request over it.
+//     worker named. sandboxd closes the listening socket at once and never
+//     accepts on it.
+//  3. sandboxd sends the request over that connection and relays the
+//     answer (proxyOverConn), counting the bytes as the worker counted
+//     them. The connection stays sandboxd's: the fence matches packets by
+//     the uid of the process that made the socket, so a root socket handed
+//     to a worker would be root's to the fence wherever the worker pointed
+//     it.
 //
 // A worker from an older release answers guest_listener as a message it
 // does not know; sandboxd then sends a plain proxy_http and that worker
@@ -53,20 +61,22 @@ type guestListenerResult struct {
 	Port int    `json:"port"`
 }
 
-// FD names of the sockets these messages carry (Envelope.FDPaths). They
-// are never paths: readGrantedFrame keeps sockets out of the grants.
-const (
-	guestListenerFDName = "guest-listener"
-	guestConnFDName     = "guest-conn"
-)
+// guestListenerFDName names the listening socket a guest_listener reply
+// carries (Envelope.FDPaths).
+const guestListenerFDName = "guest-listener"
 
 // ErrHostDialUnsupported: the worker predates host-dialed guest
 // connections. The caller sends a plain ProxyHTTP instead.
 var ErrHostDialUnsupported = errors.New("wasm worker does not take guest connections from sandboxd")
 
-// errGuestConnRequired refuses a proxy_http without a connection in a
-// worker that dropped its privileges: it may not open one itself.
-var errGuestConnRequired = errors.New("wasm guest HTTP: this worker takes its guest connections from sandboxd and opens none itself")
+// errGuestConnRequired refuses a proxy_http in a worker that dropped its
+// privileges: sandboxd serves its guest's HTTP itself (ProxyHTTPDialed),
+// and the worker may not open a connection to its listener.
+var errGuestConnRequired = errors.New("wasm guest HTTP: sandboxd connects to this worker's guest itself; the worker opens no connection to it")
+
+// guestListenerTimeout bounds sandboxd's guest_listener exchange with a
+// worker: one lookup under the worker's lock and one small reply.
+var guestListenerTimeout = 5 * time.Second
 
 // guestDialTimeout bounds sandboxd's connect to a guest listener. It is on
 // loopback, so it either completes at once or the listener's backlog is
@@ -198,46 +208,6 @@ func (s *Server) serveGuestListener(conn net.Conn, env Envelope) error {
 	return writeFrameFiles(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body, FDPaths: []string{guestListenerFDName}}, []*os.File{f})
 }
 
-// proxyGuestHTTPOn serves one proxied request over the connection sandboxd
-// opened (f). It is used only when it leads to the listener the request
-// would go to now: the instance may have been replaced since sandboxd asked
-// for it, and that listener's port may then be another sandbox's.
-func (s *Server) proxyGuestHTTPOn(ctx context.Context, sandboxID string, p proxyHTTPPayload, f *os.File) (proxyHTTPResultPayload, error) {
-	nc, err := net.FileConn(f)
-	_ = f.Close()
-	if err != nil {
-		return proxyHTTPResultPayload{}, fmt.Errorf("guest connection: %w", err)
-	}
-	addr, err := s.guestHTTPTarget(p.GuestPort)
-	if err == nil {
-		err = sameTCPAddr(nc.RemoteAddr(), addr)
-	}
-	if err != nil {
-		_ = nc.Close()
-		return proxyHTTPResultPayload{}, err
-	}
-	// The transport closes it once the response is read; a request that
-	// fails before it dials leaves it to this.
-	defer nc.Close()
-	return s.proxyGuestHTTPPayloadVia(ctx, sandboxID, p, addr, oneConnDialer(nc))
-}
-
-// sameTCPAddr checks that a connection's peer is want ("host:port").
-func sameTCPAddr(got net.Addr, want string) error {
-	tcp, ok := got.(*net.TCPAddr)
-	if !ok {
-		return fmt.Errorf("guest connection is not TCP (%v)", got)
-	}
-	wantAP, err := netip.ParseAddrPort(want)
-	if err != nil {
-		return err
-	}
-	if tcp.AddrPort().Addr().Unmap() != wantAP.Addr().Unmap() || tcp.AddrPort().Port() != wantAP.Port() {
-		return fmt.Errorf("%w: the connection leads to %s, the instance listens on %s", errGuestNotListening, tcp, want)
-	}
-	return nil
-}
-
 // oneConnDialer hands out conn once: the reverse proxy's only connection
 // (keep-alives are off), so nothing can make it dial anything else.
 func oneConnDialer(conn net.Conn) func(context.Context) (net.Conn, error) {
@@ -251,90 +221,82 @@ func oneConnDialer(conn net.Conn) func(context.Context) (net.Conn, error) {
 	}
 }
 
-// ProxyHTTPDialed forwards one HTTP request to the guest, connecting to
-// its listener from this process (see the top of this file). host is where
-// the driver had the worker bind its listeners; ports are the listener
-// ports the driver knows for this sandbox: a listener anywhere else is
-// refused. ErrHostDialUnsupported means the worker is from an older
-// release, and nothing was sent to the guest.
-func (c *Client) ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, w http.ResponseWriter, r *http.Request) error {
+// ProxyHTTPDialed serves one HTTP request to the guest from this process
+// (see the top of this file): it asks the worker for the listener, checks
+// it, connects to it and relays the request and the answer itself. host is
+// where the driver had the worker bind its listeners; ports are the
+// listener ports the driver knows for this sandbox: a listener anywhere
+// else is refused. in and out take the bytes the worker would have counted
+// for the request (proxyOverConn). ErrHostDialUnsupported means the worker
+// is from an older release, and nothing was sent to the guest.
+func (c *Client) ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, in, out *atomic.Int64, w http.ResponseWriter, r *http.Request) error {
+	guest, addr, err := c.dialGuest(sandboxID, guestPort, host, ports)
+	if err != nil {
+		return err
+	}
+	defer guest.Close()
+	return proxyOverConn(r.Context(), guest, addr, in, out, w, r)
+}
+
+// dialGuest runs the guest_listener exchange and returns sandboxd's own
+// connection to the listener the worker named. The worker connection is
+// done with by then, and every descriptor it sent is closed.
+func (c *Client) dialGuest(sandboxID string, guestPort int, host string, ports []int) (net.Conn, string, error) {
 	conn, err := c.dial(c.socketPath)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(guestListenerTimeout))
 	body, err := encodePayload(guestListenerPayload{GuestPort: guestPort})
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	if err := writeFrame(conn, Envelope{Type: MsgGuestListener, SandboxID: sandboxID, Payload: body}); err != nil {
-		return err
+		return nil, "", err
 	}
 	reply, files, err := readFrameFiles(conn)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	guest, err := connectGuest(reply, files, host, ports)
-	closeFiles(files)
-	if err != nil {
-		// ErrHostDialUnsupported included: the request body is still
-		// unread, for the caller's plain ProxyHTTP.
-		return err
-	}
-	connFile, err := guest.File()
-	_ = guest.Close()
-	if err != nil {
-		return fmt.Errorf("guest connection: %w", err)
-	}
-	defer connFile.Close()
-	payload, err := buildProxyHTTPPayload(guestPort, r)
-	if err != nil {
-		return err
-	}
-	if body, err = encodePayload(payload); err != nil {
-		return err
-	}
-	if err := writeFrameFiles(conn, Envelope{Type: MsgProxyHTTP, SandboxID: sandboxID, Payload: body, FDPaths: []string{guestConnFDName}}, []*os.File{connFile}); err != nil {
-		return err
-	}
-	result, err := readFrame(conn)
-	if err != nil {
-		return err
-	}
-	return finishProxyHTTP(result, w)
+	// connectGuest closes the listener right after it connects.
+	return connectGuest(reply, files, host, ports)
 }
 
 // connectGuest checks the worker's guest_listener reply and connects to
-// the listener it carries while holding it.
-func connectGuest(reply Envelope, files []*os.File, host string, ports []int) (*net.TCPConn, error) {
+// the listener it carries while holding it; then it closes every
+// descriptor of the reply, the listener first among them, so sandboxd
+// holds none of the worker's sockets beyond this call.
+func connectGuest(reply Envelope, files []*os.File, host string, ports []int) (net.Conn, string, error) {
+	defer closeFiles(files)
 	switch reply.Type {
 	case MsgOK:
 	case MsgInvokeResult:
-		return nil, ErrHostDialUnsupported
+		return nil, "", ErrHostDialUnsupported
 	case MsgError:
 		var p errorPayload
 		if err := decodePayload(reply.Payload, &p); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if strings.Contains(p.Message, "not supported in resident-host mode") || p.Message == ErrHostDialUnsupported.Error() {
-			return nil, fmt.Errorf("%w: %s", ErrHostDialUnsupported, p.Message)
+			return nil, "", fmt.Errorf("%w: %s", ErrHostDialUnsupported, p.Message)
 		}
-		return nil, errors.New(p.Message)
+		return nil, "", errors.New(p.Message)
 	default:
-		return nil, fmt.Errorf("unexpected reply type %q", reply.Type)
+		return nil, "", fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
 	if len(files) != 1 || len(reply.FDPaths) != 1 || reply.FDPaths[0] != guestListenerFDName {
-		return nil, errors.New("guest listener: the worker attached no listening socket")
+		return nil, "", errors.New("guest listener: the worker attached no listening socket")
 	}
 	addr, err := checkGuestListener(files[0], host, ports)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	nc, err := net.DialTimeout("tcp", addr.String(), guestDialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("connect to guest listener %s: %w", addr, err)
+		return nil, "", fmt.Errorf("connect to guest listener %s: %w", addr, err)
 	}
-	return nc.(*net.TCPConn), nil
+	return nc, addr.String(), nil
 }
 
 // checkGuestListener checks the socket a worker attached before sandboxd
@@ -395,6 +357,53 @@ func finishProxyHTTP(reply Envelope, w http.ResponseWriter) error {
 		return err
 	}
 	writeProxyHTTPResult(w, result)
+	return nil
+}
+
+// proxyOverConn relays r to the guest listener at addr over conn, its
+// only connection, and the answer back to w. It counts what a worker
+// counts for a proxied request, so a sandbox's usage is the same whichever
+// side relays it: the request body and every byte read from the guest
+// into in, every byte written to the guest and the response body into out.
+func proxyOverConn(ctx context.Context, conn net.Conn, addr string, in, out *atomic.Int64, w http.ResponseWriter, r *http.Request) error {
+	target, err := url.Parse("http://" + addr)
+	if err != nil {
+		return err
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, proxyErr error) {
+		http.Error(rw, proxyErr.Error(), http.StatusBadGateway)
+	}
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		req.Host = target.Host
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.Body != nil {
+			resp.Body = &countReadCloser{ReadCloser: resp.Body, counter: out}
+		}
+		return nil
+	}
+	dial := oneConnDialer(conn)
+	proxy.Transport = &http.Transport{
+		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
+			c, err := dial(dctx)
+			if err != nil {
+				return nil, err
+			}
+			return &countConn{Conn: c, in: in, out: out}, nil
+		},
+		DisableKeepAlives: true,
+	}
+	req := r.WithContext(ctx)
+	// No X-Forwarded-For of sandboxd's own: the request reaches the guest
+	// as it reached it through the worker.
+	req.RemoteAddr = ""
+	if req.Body != nil {
+		req.Body = &countReadCloser{ReadCloser: req.Body, counter: in}
+	}
+	proxy.ServeHTTP(w, req)
 	return nil
 }
 

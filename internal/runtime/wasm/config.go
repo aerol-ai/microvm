@@ -65,9 +65,13 @@ type Config struct {
 	// GuestListenHost is the loopback address workers bind the guests'
 	// listeners on; empty, 127.0.0.1. pkg/daemon sets it while the WASM
 	// worker fence is on (workerfence.GuestListenHost): the fence lets the
-	// worker uid reach that address, where its own guest listens, and no
+	// worker uid answer root's connections from that address, and from no
 	// other loopback one.
 	GuestListenHost string
+	// GuestHTTPMaxInFlight caps the exposed-port requests relayed to one
+	// sandbox at once (guestHTTPProxy); 0 means defaultGuestHTTPMaxInFlight.
+	// SB_WASM_GUEST_HTTP_MAX_INFLIGHT.
+	GuestHTTPMaxInFlight int
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -82,6 +86,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ResidentHostMaxInstances: cfg.WasmResidentHostMaxInstances,
 		ResidentHostIdleTTL:      cfg.WasmResidentHostIdleTTL,
 		MaxStreamsPerSandbox:     cfg.WasmMaxStreamsPerSandbox,
+		GuestHTTPMaxInFlight:     cfg.WasmGuestHTTPMaxInFlight,
 		StreamMaxMessageBytes:    cfg.WasmStreamMaxMessageBytes,
 		CodeRunModules:           cfg.WasmCodeRunModules,
 		SessionLogBytes:          cfg.WasmSessionLogBytes,

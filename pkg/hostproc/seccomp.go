@@ -100,13 +100,16 @@ type SeccompArgEq struct {
 //   - AllowIfAny allows Syscall when every test of one of its entries holds
 //     and refuses it otherwise: how a WASM worker keeps socket for the
 //     address families it uses and no other.
+//   - DenyIfEq refuses Syscall when every test holds and allows it
+//     otherwise: how a WASM worker keeps setsockopt but not SO_LINGER.
 //
-// Deny is the result of a call the rule refuses; 0 means the policy's
-// RuleDeny.
+// A rule has exactly one of the three. Deny is the result of a call the
+// rule refuses; 0 means the policy's RuleDeny.
 type SeccompArgRule struct {
 	Syscall    string
 	DenyIfAll  []SeccompArgMask
 	AllowIfAny [][]SeccompArgEq
+	DenyIfEq   []SeccompArgEq
 	Deny       uint32
 }
 
@@ -253,6 +256,10 @@ func BuildSeccomp(arch uint32, table map[string]int, p SeccompPolicy) ([]SockFil
 			prog = append(prog, allowIfAnyBlock(uint32(nr), r.AllowIfAny, deny)...)
 			continue
 		}
+		if len(r.DenyIfEq) > 0 {
+			prog = append(prog, denyIfEqBlock(uint32(nr), r.DenyIfEq, deny)...)
+			continue
+		}
 		k := len(r.DenyIfAll)
 		// Block: jeq nr | k × (ld arg; and mask; jeq 0 → allow) | ret deny | ret allow
 		prog = append(prog, bpfJump(bpfJMP|bpfJEQ|bpfK, uint32(nr), 0, uint8(3*k+2)))
@@ -284,13 +291,26 @@ const maxAllowIfAnyBlock = 255
 // checkArgRule refuses a rule the builder cannot encode, or one that would
 // mean something other than it says.
 func checkArgRule(r SeccompArgRule) error {
+	kinds := 0
+	for _, n := range []int{len(r.DenyIfAll), len(r.AllowIfAny), len(r.DenyIfEq)} {
+		if n > 0 {
+			kinds++
+		}
+	}
 	switch {
-	case len(r.DenyIfAll) == 0 && len(r.AllowIfAny) == 0:
+	case kinds == 0:
 		return fmt.Errorf("seccomp: arg rule for %q has no tests", r.Syscall)
-	case len(r.DenyIfAll) > 0 && len(r.AllowIfAny) > 0:
-		return fmt.Errorf("seccomp: arg rule for %q both allows and denies by argument", r.Syscall)
+	case kinds > 1:
+		return fmt.Errorf("seccomp: arg rule for %q mixes kinds of tests", r.Syscall)
 	case len(r.DenyIfAll) > 6:
 		return fmt.Errorf("seccomp: arg rule for %q has %d masks (max 6)", r.Syscall, len(r.DenyIfAll))
+	case len(r.DenyIfEq) > 6:
+		return fmt.Errorf("seccomp: arg rule for %q has %d tests (max 6)", r.Syscall, len(r.DenyIfEq))
+	}
+	for _, eq := range r.DenyIfEq {
+		if eq.Arg < 0 || eq.Arg > 5 {
+			return fmt.Errorf("seccomp: arg rule for %q: invalid test %+v", r.Syscall, eq)
+		}
 	}
 	for _, m := range r.DenyIfAll {
 		if m.Arg < 0 || m.Arg > 5 || m.Mask == 0 {
@@ -334,4 +354,22 @@ func allowIfAnyBlock(nr uint32, entries [][]SeccompArgEq, deny uint32) []SockFil
 	}
 	body = append(body, bpfStmt(bpfRET|bpfK, deny))
 	return append([]SockFilter{bpfJump(bpfJMP|bpfJEQ|bpfK, nr, 0, uint8(len(body)))}, body...)
+}
+
+// denyIfEqBlock is a DenyIfEq rule:
+//
+//	jeq nr (else past the block)
+//	k × (ld arg; jeq value, else to ret allow)
+//	ret deny
+//	ret allow
+func denyIfEqBlock(nr uint32, tests []SeccompArgEq, deny uint32) []SockFilter {
+	k := len(tests)
+	out := []SockFilter{bpfJump(bpfJMP|bpfJEQ|bpfK, nr, 0, uint8(2*k+2))}
+	for j, eq := range tests {
+		out = append(out,
+			bpfStmt(bpfLD|bpfW|bpfABS, uint32(seccompDataArgs+8*eq.Arg)),
+			bpfJump(bpfJMP|bpfJEQ|bpfK, eq.Value, 0, uint8(2*k-2*j-1)),
+		)
+	}
+	return append(out, bpfStmt(bpfRET|bpfK, deny), bpfStmt(bpfRET|bpfK, SeccompRetAllow))
 }

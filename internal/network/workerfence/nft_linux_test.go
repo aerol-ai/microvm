@@ -40,13 +40,16 @@ func kinds(exprs []expr.Any) []string {
 		case *expr.Meta:
 			out[i] = map[expr.MetaKey]string{expr.MetaKeySKUID: "skuid", expr.MetaKeyNFPROTO: "nfproto", expr.MetaKeyL4PROTO: "l4proto"}[e.Key]
 		case *expr.Ct:
-			out[i] = map[expr.CtKey]string{expr.CtKeyDIRECTION: "ct-direction", expr.CtKeySTATUS: "ct-status"}[e.Key]
+			out[i] = map[expr.CtKey]string{expr.CtKeyDIRECTION: "ct-direction", expr.CtKeySTATUS: "ct-status", expr.CtKeyDST: "ct-orig-daddr", expr.CtKeyPROTODST: "ct-orig-dport"}[e.Key]
 		case *expr.Fib:
 			if e.FlagDADDR && e.ResultADDRTYPE {
 				out[i] = "fib-daddr-type"
 			}
 		case *expr.Payload:
 			out[i] = map[expr.PayloadBase]string{expr.PayloadBaseNetworkHeader: "daddr", expr.PayloadBaseTransportHeader: "dport"}[e.Base]
+			if e.Base == expr.PayloadBaseNetworkHeader && e.Offset == 12 {
+				out[i] = "saddr"
+			}
 		case *expr.Bitwise:
 			out[i] = "mask"
 		case *expr.Cmp:
@@ -91,10 +94,16 @@ func TestRuleExprs(t *testing.T) {
 					t.Fatalf("daddr = %+v", p)
 				}
 			}},
-		{"reply v4", Rule{UID: 61000, Kind: KindReply, Prefix: pfx("127.0.0.0/8")},
-			"skuid cmp nfproto cmp ct-direction cmp daddr mask cmp counter accept", func(t *testing.T, e []expr.Any) {
+		{"reply from the guest listen host", Rule{UID: 61000, Kind: KindReply, From: netip.MustParseAddr("127.0.97.1"), Prefix: pfx("127.0.0.0/8")},
+			"skuid cmp nfproto cmp ct-direction cmp saddr cmp daddr mask cmp counter accept", func(t *testing.T, e []expr.Any) {
 				if c := e[5].(*expr.Cmp); !bytes.Equal(c.Data, []byte{1}) {
 					t.Fatalf("direction = %v, want reply (1)", c.Data)
+				}
+				if p := e[6].(*expr.Payload); p.Offset != 12 || p.Len != 4 {
+					t.Fatalf("saddr load = %+v", p)
+				}
+				if c := e[7].(*expr.Cmp); !bytes.Equal(c.Data, []byte{127, 0, 97, 1}) {
+					t.Fatalf("saddr = %v", c.Data)
 				}
 			}},
 		{"one port", Rule{UID: 61000, Kind: KindAllow, Proto: "tcp", Prefix: pfx("127.0.0.1/32"), PortLo: 4100, PortHi: 4100},
@@ -112,15 +121,35 @@ func TestRuleExprs(t *testing.T) {
 					t.Fatal("range not lo..hi")
 				}
 			}},
-		{"nat'd", Rule{UID: 61000, Kind: KindAllowNAT, Proto: "udp", Prefix: pfx("127.0.0.11/32")},
-			"skuid cmp nfproto cmp l4proto cmp ct-status mask cmp daddr cmp counter accept", func(t *testing.T, e []expr.Any) {
+		{"nat'd, by the original destination", Rule{UID: 61000, Kind: KindAllowNAT, Proto: "udp", Prefix: pfx("127.0.0.11/32"), PortLo: 53, PortHi: 53},
+			"skuid cmp nfproto cmp l4proto cmp ct-status mask cmp ct-orig-daddr cmp ct-orig-dport cmp counter accept", func(t *testing.T, e []expr.Any) {
 				if b := e[7].(*expr.Bitwise); !bytes.Equal(b.Mask, binaryutil.NativeEndian.PutUint32(1<<5)) {
 					t.Fatalf("status mask = %x, want IPS_DST_NAT", b.Mask)
 				}
 				if c := e[8].(*expr.Cmp); c.Op != expr.CmpOpNeq {
 					t.Fatalf("status cmp = %+v", c)
 				}
+				if ct := e[9].(*expr.Ct); ct.Direction != 0 {
+					t.Fatalf("daddr direction %d, want original", ct.Direction)
+				}
+				// The address's own 4 bytes, as nft writes it.
+				if c := e[10].(*expr.Cmp); !bytes.Equal(c.Data, []byte{127, 0, 0, 11}) {
+					t.Fatalf("original daddr = %v", c.Data)
+				}
+				if ct := e[11].(*expr.Ct); ct.Direction != 0 {
+					t.Fatalf("dport direction %d, want original", ct.Direction)
+				}
+				if c := e[12].(*expr.Cmp); !bytes.Equal(c.Data, []byte{0, 53}) {
+					t.Fatalf("original dport = %v", c.Data)
+				}
 			}},
+		{"nat'd v6 range", Rule{UID: 61000, Kind: KindAllowNAT, Proto: "tcp", Prefix: pfx("::1/128"), PortLo: 53, PortHi: 54},
+			"skuid cmp nfproto cmp l4proto cmp ct-status mask cmp ct-orig-daddr cmp ct-orig-dport cmp cmp counter accept", nil},
+		{"broadcast drop", Rule{UID: 61000, Kind: KindBroadcastDrop}, "skuid cmp fib-daddr-type cmp counter drop", func(t *testing.T, e []expr.Any) {
+			if c := e[3].(*expr.Cmp); !bytes.Equal(c.Data, binaryutil.NativeEndian.PutUint32(unix.RTN_BROADCAST)) {
+				t.Fatalf("fib type = %v, want broadcast", c.Data)
+			}
+		}},
 		{"node port", Rule{UID: 61000, Kind: KindLocalPort, PortLo: 443, PortHi: 443},
 			"skuid cmp l4proto cmp fib-daddr-type cmp dport cmp counter accept", func(t *testing.T, e []expr.Any) {
 				if c := e[5].(*expr.Cmp); !bytes.Equal(c.Data, binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)) {
@@ -149,6 +178,9 @@ func TestRuleExprs(t *testing.T) {
 		{UID: 1, Kind: KindAllow, Proto: "sctp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: 1, PortHi: 1},
 		{UID: 1, Kind: KindAllow, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32")},
 		{UID: 1, Kind: KindLocalPort},
+		{UID: 1, Kind: KindAllowNAT, Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32")},
+		{UID: 1, Kind: KindReply, Prefix: netip.MustParsePrefix("127.0.0.0/8")},
+		{UID: 1, Kind: KindReply, From: netip.MustParseAddr("127.0.97.1"), Prefix: netip.MustParsePrefix("::1/128")},
 		{UID: 1, Kind: RuleKind(99), Prefix: netip.MustParsePrefix("127.0.0.1/32")},
 	} {
 		if _, err := ruleExprs(bad); err == nil {
@@ -268,7 +300,7 @@ func TestApplyAndRemove(t *testing.T) {
 // fakeKernel answers check with the table Apply builds.
 type fakeKernel struct {
 	chains   []*nftables.Chain
-	rules    []*nftables.Rule
+	comments []string
 	listErr  error
 	rulesErr error
 }
@@ -277,8 +309,8 @@ func (k *fakeKernel) ListChainsOfTableFamily(nftables.TableFamily) ([]*nftables.
 	return k.chains, k.listErr
 }
 
-func (k *fakeKernel) GetRules(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error) {
-	return k.rules, k.rulesErr
+func (k *fakeKernel) RuleComments() ([]string, error) {
+	return k.comments, k.rulesErr
 }
 
 func installedKernel(t *testing.T, rules []Rule) *fakeKernel {
@@ -286,11 +318,10 @@ func installedKernel(t *testing.T, rules []Rule) *fakeKernel {
 	// Another table's chain of the same name is not ours.
 	k := &fakeKernel{chains: []*nftables.Chain{{Name: ChainName, Table: &nftables.Table{Name: "filter"}}, chain(table())}}
 	for _, r := range rules {
-		exprs, err := ruleExprs(r)
-		if err != nil {
+		if _, err := ruleExprs(r); err != nil {
 			t.Fatal(err)
 		}
-		k.rules = append(k.rules, &nftables.Rule{Exprs: exprs, UserData: userdata.AppendString(nil, userdata.TypeComment, r.Comment())})
+		k.comments = append(k.comments, r.Comment())
 	}
 	return k
 }
@@ -302,15 +333,13 @@ func TestCheck(t *testing.T) {
 	}
 	for name, tamper := range map[string]func(k *fakeKernel){
 		"table flushed":                   func(k *fakeKernel) { k.chains = k.chains[:1] },
-		"rule deleted":                    func(k *fakeKernel) { k.rules = k.rules[1:] },
-		"accept inserted above the drops": func(k *fakeKernel) { k.rules = append([]*nftables.Rule{{}}, k.rules[:len(k.rules)-1]...) },
-		"rule rewritten": func(k *fakeKernel) {
-			k.rules[len(k.rules)-1].UserData = userdata.AppendString(nil, userdata.TypeComment, "something else")
-		},
-		"chain moved to another hook": func(k *fakeKernel) { k.chains[1].Hooknum = nftables.ChainHookInput },
-		"chain back before conntrack": func(k *fakeKernel) { k.chains[1].Priority = nftables.ChainPriorityRaw },
-		"chain lost its hook":         func(k *fakeKernel) { k.chains[1].Hooknum = nil },
-		"chain policy drop":           func(k *fakeKernel) { drop := nftables.ChainPolicyDrop; k.chains[1].Policy = &drop },
+		"rule deleted":                    func(k *fakeKernel) { k.comments = k.comments[1:] },
+		"accept inserted above the drops": func(k *fakeKernel) { k.comments = append([]string{""}, k.comments[:len(k.comments)-1]...) },
+		"rule rewritten":                  func(k *fakeKernel) { k.comments[len(k.comments)-1] = "something else" },
+		"chain moved to another hook":     func(k *fakeKernel) { k.chains[1].Hooknum = nftables.ChainHookInput },
+		"chain back before conntrack":     func(k *fakeKernel) { k.chains[1].Priority = nftables.ChainPriorityRaw },
+		"chain lost its hook":             func(k *fakeKernel) { k.chains[1].Hooknum = nil },
+		"chain policy drop":               func(k *fakeKernel) { drop := nftables.ChainPolicyDrop; k.chains[1].Policy = &drop },
 	} {
 		k := installedKernel(t, rules)
 		tamper(k)
@@ -347,5 +376,53 @@ func TestChainAfterConntrack(t *testing.T) {
 	c := chain(table())
 	if *c.Priority != *nftables.ChainPriorityFilter || *c.Hooknum != *nftables.ChainHookOutput {
 		t.Fatalf("chain hook %v priority %v", *c.Hooknum, *c.Priority)
+	}
+}
+
+// Check reads the rule comments straight off a netlink rule dump, without
+// the library's expression parsing (which cannot read back a ct
+// expression with a direction), keeping only the fence chain's rules.
+func TestRuleComments(t *testing.T) {
+	rule := func(tbl, ch, comment string) netlink.Message {
+		attrs := []netlink.Attribute{
+			{Type: unix.NFTA_RULE_TABLE, Data: append([]byte(tbl), 0)},
+			{Type: unix.NFTA_RULE_CHAIN, Data: append([]byte(ch), 0)},
+		}
+		if comment != "" {
+			attrs = append(attrs, netlink.Attribute{Type: unix.NFTA_RULE_USERDATA, Data: userdata.AppendString(nil, userdata.TypeComment, comment)})
+		}
+		b, err := netlink.MarshalAttributes(attrs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return netlink.Message{Data: append([]byte{unix.NFPROTO_INET, 0, 0, 0}, b...)}
+	}
+	var asked netlink.Message
+	r := nftReader{dump: func(req netlink.Message) ([]netlink.Message, error) {
+		asked = req
+		return []netlink.Message{
+			rule(TableName, ChainName, "uid 1 drop 127.0.0.0/8"),
+			rule("other", ChainName, "not ours"),
+			rule(TableName, ChainName, ""),
+			{Data: []byte{1}}, // too short to be a rule
+			rule(TableName, ChainName, "uid 1 drop local"),
+		}, nil
+	}}
+	got, err := r.RuleComments()
+	if err != nil || strings.Join(got, "|") != "uid 1 drop 127.0.0.0/8||uid 1 drop local" {
+		t.Fatalf("comments = %q, %v", got, err)
+	}
+	if uint16(asked.Header.Type) != unix.NFNL_SUBSYS_NFTABLES<<8|unix.NFT_MSG_GETRULE || asked.Header.Flags&netlink.Dump == 0 || !bytes.Contains(asked.Data, []byte(TableName)) {
+		t.Fatalf("request = %+v", asked)
+	}
+	r.dump = func(netlink.Message) ([]netlink.Message, error) { return nil, errors.New("netlink busy") }
+	if _, err := r.RuleComments(); err == nil {
+		t.Fatal("a failed dump passed")
+	}
+	r.dump = func(netlink.Message) ([]netlink.Message, error) {
+		return []netlink.Message{{Data: []byte{1, 0, 0, 0, 0xff, 0xff}}}, nil
+	}
+	if _, err := r.RuleComments(); err == nil {
+		t.Fatal("a garbled dump passed")
 	}
 }

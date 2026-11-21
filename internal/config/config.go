@@ -834,6 +834,12 @@ type Config struct {
 	// answers HTTP 429. Values above the worker's ceiling (32) count as 32.
 	// Default 4. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
+	// WasmGuestHTTPMaxInFlight caps the requests to one WASM sandbox's
+	// exposed ports that sandboxd relays at once; past it the gateway
+	// answers 503 at once. Each one holds a sandboxd goroutine and a
+	// connection to the guest for as long as the guest takes to answer.
+	// 0 or less means the default, 64. SB_WASM_GUEST_HTTP_MAX_INFLIGHT.
+	WasmGuestHTTPMaxInFlight int
 	// WasmStreamMaxMessageBytes caps one client message on a WASM exec
 	// stream (a stdin chunk or a control frame). The stream is served by
 	// sandboxd, which reads each message whole. Default 1 MiB.
@@ -2748,6 +2754,7 @@ func load(keyTool bool) (Config, error) {
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
 		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 4),
+		WasmGuestHTTPMaxInFlight:  getEnvInt("SB_WASM_GUEST_HTTP_MAX_INFLIGHT", 64),
 		WasmStreamMaxMessageBytes: getEnvInt64("SB_WASM_STREAM_MAX_MESSAGE_BYTES", 1<<20),
 		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),

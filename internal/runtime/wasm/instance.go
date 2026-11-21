@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -68,6 +69,9 @@ type sandboxInstance struct {
 	// listenMu guards them and is never held across a worker call, so a
 	// proxied request never waits on a sync.
 	listenSync sync.Mutex
+	// guestHTTPInFlight counts the exposed-port requests relayed to the
+	// guest right now (guestHTTPProxy caps it).
+	guestHTTPInFlight atomic.Int32
 	// checkpointMu serializes the sandbox's checkpoints over its one
 	// staging folder (stageCheckpoint).
 	checkpointMu       sync.Mutex

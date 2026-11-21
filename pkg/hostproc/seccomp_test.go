@@ -288,10 +288,13 @@ func TestSeccompAllowIfAny(t *testing.T) {
 	}
 
 	for name, r := range map[string]SeccompArgRule{
-		"both kinds":  {Syscall: "socket", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 1}}, AllowIfAny: [][]SeccompArgEq{{{Arg: 0, Value: 2}}}},
-		"empty entry": {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{}}},
-		"bad arg":     {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{{Arg: 6, Value: 2}}}},
-		"seven tests": {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{make([]SeccompArgEq, 7)}},
+		"deny-eq and allow-any": {Syscall: "socket", DenyIfEq: []SeccompArgEq{{Arg: 0, Value: 1}}, AllowIfAny: [][]SeccompArgEq{{{Arg: 0, Value: 2}}}},
+		"deny-eq bad arg":       {Syscall: "socket", DenyIfEq: []SeccompArgEq{{Arg: 9, Value: 1}}},
+		"deny-eq seven":         {Syscall: "socket", DenyIfEq: make([]SeccompArgEq, 7)},
+		"both kinds":            {Syscall: "socket", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 1}}, AllowIfAny: [][]SeccompArgEq{{{Arg: 0, Value: 2}}}},
+		"empty entry":           {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{}}},
+		"bad arg":               {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{{Arg: 6, Value: 2}}}},
+		"seven tests":           {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{make([]SeccompArgEq, 7)}},
 		"too long": {Syscall: "socket", AllowIfAny: func() [][]SeccompArgEq {
 			e := make([][]SeccompArgEq, 90)
 			for i := range e {
@@ -304,5 +307,36 @@ func TestSeccompAllowIfAny(t *testing.T) {
 		if _, _, err := BuildSeccomp(AuditArchX86_64, table, SeccompPolicy{Allow: []string{"socket"}, Rules: []SeccompArgRule{r}}); err == nil {
 			t.Errorf("%s: rule accepted", name)
 		}
+	}
+}
+
+// DenyIfEq refuses a call only when every listed argument matches:
+// setsockopt keeps every option but SO_LINGER at SOL_SOCKET.
+func TestSeccompDenyIfEq(t *testing.T) {
+	table := map[string]int{"setsockopt": 54, "read": 0}
+	prog, _, err := BuildSeccomp(AuditArchAARCH64, table, SeccompPolicy{
+		Allow:   []string{"read", "setsockopt"},
+		Rules:   []SeccompArgRule{{Syscall: "setsockopt", DenyIfEq: []SeccompArgEq{{Arg: 1, Value: 1}, {Arg: 2, Value: 13}}, Deny: SeccompRetErrno(1)}},
+		Default: SeccompRetKillProcess,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []uint32
+		want uint32
+	}{
+		{"SO_LINGER", []uint32{3, 1, 13}, SeccompRetErrno(1)},
+		{"SO_REUSEADDR", []uint32{3, 1, 2}, SeccompRetAllow},
+		{"TCP_NODELAY", []uint32{3, 6, 1}, SeccompRetAllow},
+		{"level 13", []uint32{3, 13, 13}, SeccompRetAllow},
+	} {
+		if got := runBPF(t, prog, AuditArchAARCH64, 54, tc.args...); got != tc.want {
+			t.Errorf("%s: %#x, want %#x", tc.name, got, tc.want)
+		}
+	}
+	if got := runBPF(t, prog, AuditArchAARCH64, 0); got != SeccompRetAllow {
+		t.Errorf("read: %#x", got)
 	}
 }

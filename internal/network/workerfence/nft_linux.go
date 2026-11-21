@@ -10,6 +10,7 @@ import (
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"github.com/google/nftables/userdata"
+	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -62,21 +63,24 @@ func chain(t *nftables.Table) *nftables.Chain {
 
 // Values the rules compare against.
 const (
-	ctDirReply = 1      // IP_CT_DIR_REPLY
-	ipsDstNAT  = 1 << 5 // IPS_DST_NAT in ct status
-	rtnLocal   = 2      // RTN_LOCAL, a fib address type
+	ctDirOriginal = 0      // IP_CT_DIR_ORIGINAL
+	ctDirReply    = 1      // IP_CT_DIR_REPLY
+	ipsDstNAT     = 1 << 5 // IPS_DST_NAT in ct status
+	rtnLocal      = 2      // RTN_LOCAL, a fib address type
+	rtnBroadcast  = 3      // RTN_BROADCAST
 )
 
 // ruleExprs is, for one rule (every rule starts with meta skuid <uid>: the
-// uid of the socket that sent the packet, which every packet a process
-// sends from its own sockets carries on the output hook):
+// uid of the process that made the socket the packet leaves from, which is
+// why sandboxd never hands a worker a socket of its own):
 //
-//	KindDrop:      meta nfproto <f> <ip|ip6> daddr <prefix> counter drop
-//	KindReply:     meta nfproto <f> ct direction reply <ip|ip6> daddr <prefix> counter accept
-//	KindAllow:     meta nfproto <f> meta l4proto <p> <ip|ip6> daddr <addr> th dport <lo>[-<hi>] counter accept
-//	KindAllowNAT:  meta nfproto <f> meta l4proto <p> ct status dnat <ip|ip6> daddr <addr> counter accept
-//	KindLocalPort: meta l4proto tcp fib daddr type local th dport <port> counter accept
-//	KindLocalDrop: fib daddr type local counter drop
+//	KindDrop:          meta nfproto <f> <ip|ip6> daddr <prefix> counter drop
+//	KindReply:         meta nfproto ipv4 ct direction reply ip saddr <from> ip daddr <prefix> counter accept
+//	KindAllow:         meta nfproto <f> meta l4proto <p> <ip|ip6> daddr <addr> th dport <lo>[-<hi>] counter accept
+//	KindAllowNAT:      meta nfproto <f> meta l4proto <p> ct status dnat ct original daddr <addr> ct original proto-dst <lo>[-<hi>] counter accept
+//	KindLocalPort:     meta l4proto tcp fib daddr type local th dport <port> counter accept
+//	KindLocalDrop:     fib daddr type local counter drop
+//	KindBroadcastDrop: fib daddr type broadcast counter drop
 func ruleExprs(r Rule) ([]expr.Any, error) {
 	if r.UID <= 0 {
 		return nil, fmt.Errorf("rule %q: no uid", r.Comment())
@@ -92,13 +96,15 @@ func ruleExprs(r Rule) ([]expr.Any, error) {
 	tail := []expr.Any{&expr.Counter{}, &expr.Verdict{Kind: verdict}}
 	switch r.Kind {
 	case KindLocalDrop:
-		return append(append(exprs, localExprs()...), tail...), nil
+		return append(append(exprs, fibTypeExprs(rtnLocal)...), tail...), nil
+	case KindBroadcastDrop:
+		return append(append(exprs, fibTypeExprs(rtnBroadcast)...), tail...), nil
 	case KindLocalPort:
 		if r.PortLo == 0 {
 			return nil, fmt.Errorf("rule %q: port", r.Comment())
 		}
 		exprs = append(exprs, l4Exprs("tcp")...)
-		exprs = append(exprs, localExprs()...)
+		exprs = append(exprs, fibTypeExprs(rtnLocal)...)
 		exprs = append(exprs, portExprs(r.PortLo, r.PortLo)...)
 		return append(exprs, tail...), nil
 	case KindDrop, KindReply, KindAllow, KindAllowNAT:
@@ -113,15 +119,24 @@ func ruleExprs(r Rule) ([]expr.Any, error) {
 	if p.Addr().Is6() {
 		family, offset = unix.NFPROTO_IPV6, 24
 	}
+	if (r.Kind == KindAllow || r.Kind == KindAllowNAT) && (r.PortLo == 0 || r.PortHi < r.PortLo) {
+		return nil, fmt.Errorf("rule %q: ports", r.Comment())
+	}
 	exprs = append(exprs,
 		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}},
 	)
 	switch r.Kind {
 	case KindReply:
+		if !r.From.Is4() || family != unix.NFPROTO_IPV4 {
+			return nil, fmt.Errorf("rule %q: a reply rule needs an IPv4 source and destination", r.Comment())
+		}
+		from := r.From.As4()
 		exprs = append(exprs,
 			&expr.Ct{Register: 1, Key: expr.CtKeyDIRECTION},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{ctDirReply}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 12, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: from[:]},
 		)
 	case KindAllow, KindAllowNAT:
 		l4 := l4Exprs(r.Proto)
@@ -130,12 +145,7 @@ func ruleExprs(r Rule) ([]expr.Any, error) {
 		}
 		exprs = append(exprs, l4...)
 		if r.Kind == KindAllowNAT {
-			exprs = append(exprs,
-				&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
-				&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
-					Mask: binaryutil.NativeEndian.PutUint32(ipsDstNAT), Xor: make([]byte, 4)},
-				&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)},
-			)
+			return append(append(exprs, natOriginalExprs(p, r.PortLo, r.PortHi)...), tail...), nil
 		}
 	}
 	addr := p.Addr().AsSlice()
@@ -145,12 +155,34 @@ func ruleExprs(r Rule) ([]expr.Any, error) {
 	}
 	exprs = append(exprs, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: addr})
 	if r.Kind == KindAllow {
-		if r.PortLo == 0 || r.PortHi < r.PortLo {
-			return nil, fmt.Errorf("rule %q: ports", r.Comment())
-		}
 		exprs = append(exprs, portExprs(r.PortLo, r.PortHi)...)
 	}
 	return append(exprs, tail...), nil
+}
+
+// natOriginalExprs matches a connection a NAT rule changed (ct status
+// dnat) whose original destination, before NAT, was the one address p on
+// lo..hi. In an inet table the conntrack address loads 16 bytes, an IPv4
+// one in the first 4 (the rest zero): the compare reads only the
+// address's own bytes, which is also how nft writes the rule, so nft
+// prints it (nft's own printer overruns on a 16-byte IPv4 compare).
+func natOriginalExprs(p netip.Prefix, lo, hi uint16) []expr.Any {
+	out := []expr.Any{
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+			Mask: binaryutil.NativeEndian.PutUint32(ipsDstNAT), Xor: make([]byte, 4)},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)},
+		&expr.Ct{Register: 1, Key: expr.CtKeyDST, Direction: ctDirOriginal},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: p.Addr().AsSlice()},
+		&expr.Ct{Register: 1, Key: expr.CtKeyPROTODST, Direction: ctDirOriginal},
+	}
+	if lo == hi {
+		return append(out, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(lo)})
+	}
+	return append(out,
+		&expr.Cmp{Op: expr.CmpOpGte, Register: 1, Data: binaryutil.BigEndian.PutUint16(lo)},
+		&expr.Cmp{Op: expr.CmpOpLte, Register: 1, Data: binaryutil.BigEndian.PutUint16(hi)},
+	)
 }
 
 // l4Exprs matches the transport protocol; nil for one the fence does not
@@ -166,12 +198,13 @@ func l4Exprs(proto string) []expr.Any {
 	}
 }
 
-// localExprs matches a destination that is one of the node's own
-// addresses, as the kernel's routing tables say now.
-func localExprs() []expr.Any {
+// fibTypeExprs matches a destination of the given address type (one of
+// the node's own addresses, or one of its broadcast addresses), as the
+// kernel's routing tables say now.
+func fibTypeExprs(rtn uint32) []expr.Any {
 	return []expr.Any{
 		&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(rtnLocal)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(rtn)},
 	}
 }
 
@@ -227,11 +260,81 @@ func (NFTBackend) Apply(rules []Rule) error {
 	return nil
 }
 
-// kernelReader is the slice of *nftables.Conn Check reads with; tests hand
-// check a fake kernel.
+// kernelReader is what Check reads: the inet chains, and the comments of
+// the fence chain's rules in order. Tests hand check a fake kernel.
 type kernelReader interface {
 	ListChainsOfTableFamily(family nftables.TableFamily) ([]*nftables.Chain, error)
-	GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error)
+	RuleComments() ([]string, error)
+}
+
+// nftReader reads chains through the nftables library and rule comments
+// straight off a netlink rule dump: the library cannot read back a ct
+// expression with a direction (the kernel writes the direction as one
+// byte, the library wants four), and the comments are all Check compares.
+type nftReader struct {
+	*nftables.Conn
+	dump func(netlink.Message) ([]netlink.Message, error)
+}
+
+func (r nftReader) RuleComments() ([]string, error) {
+	attrs, err := netlink.MarshalAttributes([]netlink.Attribute{
+		{Type: unix.NFTA_RULE_TABLE, Data: append([]byte(TableName), 0)},
+		{Type: unix.NFTA_RULE_CHAIN, Data: append([]byte(ChainName), 0)},
+	})
+	if err != nil {
+		return nil, err
+	}
+	msgs, err := r.dump(netlink.Message{
+		Header: netlink.Header{Type: netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES<<8 | unix.NFT_MSG_GETRULE), Flags: netlink.Request | netlink.Dump},
+		Data:   append([]byte{unix.NFPROTO_INET, unix.NFNETLINK_V0, 0, 0}, attrs...),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseRuleComments(msgs)
+}
+
+// parseRuleComments takes each rule's comment out of a rule dump, keeping
+// only the fence chain's rules (an older kernel may not filter the dump).
+func parseRuleComments(msgs []netlink.Message) ([]string, error) {
+	var out []string
+	for _, m := range msgs {
+		if len(m.Data) < 4 {
+			continue
+		}
+		ad, err := netlink.NewAttributeDecoder(m.Data[4:])
+		if err != nil {
+			return nil, err
+		}
+		var tbl, ch, comment string
+		for ad.Next() {
+			switch ad.Type() {
+			case unix.NFTA_RULE_TABLE:
+				tbl = ad.String()
+			case unix.NFTA_RULE_CHAIN:
+				ch = ad.String()
+			case unix.NFTA_RULE_USERDATA:
+				comment, _ = userdata.GetString(ad.Bytes(), userdata.TypeComment)
+			}
+		}
+		if err := ad.Err(); err != nil {
+			return nil, err
+		}
+		if tbl == TableName && ch == ChainName {
+			out = append(out, comment)
+		}
+	}
+	return out, nil
+}
+
+// dialDump runs one netlink dump on a netfilter socket of its own.
+var dialDump = func(req netlink.Message) ([]netlink.Message, error) {
+	c, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	return c.Execute(req)
 }
 
 // Check implements Backend: the chain on its hook and priority, holding
@@ -241,7 +344,7 @@ func (NFTBackend) Check(rules []Rule) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return check(c, rules)
+	return check(nftReader{Conn: c, dump: dialDump}, rules)
 }
 
 func check(c kernelReader, rules []Rule) (bool, error) {
@@ -260,15 +363,15 @@ func check(c kernelReader, rules []Rule) (bool, error) {
 		got.Policy != nil && *got.Policy != *want.Policy {
 		return false, nil
 	}
-	kernel, err := c.GetRules(table(), got)
+	kernel, err := c.RuleComments()
 	if err != nil {
 		return false, fmt.Errorf("list rules: %w", err)
 	}
 	if len(kernel) != len(rules) {
 		return false, nil
 	}
-	for i, r := range kernel {
-		if comment, _ := userdata.GetString(r.UserData, userdata.TypeComment); comment != rules[i].Comment() {
+	for i, comment := range kernel {
+		if comment != rules[i].Comment() {
 			return false, nil
 		}
 	}

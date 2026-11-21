@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -54,6 +55,20 @@ func (d *Driver) SyncGuestListenPorts(ctx context.Context, sandboxID string, por
 // HTTP gateway answers it with 503.
 var ErrGuestNotListening = errors.New("wasm guest is not listening for HTTP")
 
+// ErrGuestBusy: the sandbox already has as many exposed-port requests in
+// flight as Config.GuestHTTPMaxInFlight allows. The gateway answers 503.
+var ErrGuestBusy = errors.New("wasm guest has too many HTTP requests in flight")
+
+// defaultGuestHTTPMaxInFlight is GuestHTTPMaxInFlight's default.
+const defaultGuestHTTPMaxInFlight = 64
+
+func (d *Driver) guestHTTPMaxInFlight() int32 {
+	if n := d.cfg.GuestHTTPMaxInFlight; n > 0 {
+		return int32(min(n, 1<<20))
+	}
+	return defaultGuestHTTPMaxInFlight
+}
+
 func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	inst, err := d.instance(sandboxID)
 	if err != nil {
@@ -76,12 +91,23 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 	default:
 		return fmt.Errorf("%w on port %d of sandbox %q", ErrGuestNotListening, guestPort, sandboxID)
 	}
+	// Each request in flight holds a goroutine here and a connection to
+	// the guest for as long as the guest takes: a sandbox gets only so
+	// many at once.
+	if n := inst.guestHTTPInFlight.Add(1); n > d.guestHTTPMaxInFlight() {
+		inst.guestHTTPInFlight.Add(-1)
+		return fmt.Errorf("%w (sandbox %q)", ErrGuestBusy, sandboxID)
+	}
+	defer inst.guestHTTPInFlight.Add(-1)
 	client := d.newWorkerClient(inst.socketPath)
 	if hc, ok := client.(hostDialProxyClient); ok && !st.legacy {
-		// This release's worker takes the connection to its guest from
-		// here (only root opens connections to guest listeners); the
+		// This release's worker only names its guest's listener: sandboxd
+		// connects to it and relays the request itself (only root opens
+		// connections to guest listeners, and no worker holds one). The
 		// listener must be one of the ports this sandbox's state names.
-		err := hc.ProxyHTTPDialed(sandboxID, proxyPort, d.guestListenHost(), st.listenerPorts(), w, r)
+		// The bytes go to the sandbox's usage, as the worker counted them.
+		in, out := d.net.guestCounters(sandboxID)
+		err := hc.ProxyHTTPDialed(sandboxID, proxyPort, d.guestListenHost(), st.listenerPorts(), in, out, w, r)
 		if !errors.Is(err, worker.ErrHostDialUnsupported) {
 			return err
 		}
@@ -91,10 +117,9 @@ func (d *Driver) guestHTTPProxy(sandboxID string, guestPort int, w http.Response
 	return client.ProxyHTTP(sandboxID, proxyPort, w, r)
 }
 
-// hostDialProxyClient is a worker client that connects to the guest's
-// listener itself and hands the worker the connection
-// (worker.Client.ProxyHTTPDialed). Optional, so test fakes without it take
-// the plain ProxyHTTP path.
+// hostDialProxyClient is a worker client that relays a request to the
+// guest's listener from sandboxd (worker.Client.ProxyHTTPDialed).
+// Optional, so test fakes without it take the plain ProxyHTTP path.
 type hostDialProxyClient interface {
-	ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, w http.ResponseWriter, r *http.Request) error
+	ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, in, out *atomic.Int64, w http.ResponseWriter, r *http.Request) error
 }

@@ -43,12 +43,16 @@ func newBenchDriver(t *testing.T, cfg wasm.Config, e *env, resolver *wasmmod.Mod
 	if confine.Enabled() && os.Getenv("BENCH_NO_FENCE") != "1" {
 		// No exception for the guest listeners: only root connects to them.
 		fence := workerfence.New(workerfence.NewBackend(), func() (workerfence.Spec, error) {
-			var local []netip.Addr
+			var local []netip.Prefix
 			addrs, _ := net.InterfaceAddrs()
 			for _, a := range addrs {
 				if n, ok := a.(*net.IPNet); ok {
 					if ip, ok := netip.AddrFromSlice(n.IP); ok {
-						local = append(local, ip.Unmap())
+						ones, _ := n.Mask.Size()
+						if ip = ip.Unmap(); ip.Is4() && ones > 32 {
+							ones -= 96
+						}
+						local = append(local, netip.PrefixFrom(ip, ones))
 					}
 				}
 			}

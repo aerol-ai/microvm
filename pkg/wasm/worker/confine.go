@@ -457,8 +457,11 @@ var workerSeccompAllow = []string{
 	"copy_file_range", "sendfile", "splice", "tee",
 	// Sockets: the worker's own, the guest's mediated ones, DNS, and the
 	// audit ingest on loopback. socket is narrowed by family
-	// (workerSocketFamilies).
-	"socket", "socketpair", "connect", "bind", "listen", "accept", "accept4",
+	// (workerSocketFamilies) and setsockopt loses SO_LINGER. No
+	// socketpair: nothing in the worker makes one (Go's runtime and
+	// os/exec use pipes), and a datagram pair could send to the node's
+	// abstract Unix sockets.
+	"socket", "connect", "bind", "listen", "accept", "accept4",
 	"sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "sendto", "recvfrom", "shutdown",
 	"getsockname", "getpeername", "getsockopt", "setsockopt",
 	// Memory, including the compiler's executable pages.
@@ -528,6 +531,8 @@ const (
 	linuxAFInet6      = 10
 	linuxAFNetlink    = 16
 	linuxNetlinkRoute = 0
+	linuxSOLSocket    = 1
+	linuxSOLinger     = 13
 )
 
 // workerSocketFamilies are the sockets a worker may make once it has
@@ -560,6 +565,11 @@ func workerSeccompPolicy() hostproc.SeccompPolicy {
 		Rules: []hostproc.SeccompArgRule{
 			{Syscall: "clone", DenyIfAll: []hostproc.SeccompArgMask{{Arg: 0, Mask: cloneNamespaceFlags}}},
 			{Syscall: "socket", AllowIfAny: workerSocketFamilies, Deny: hostproc.SeccompRetErrno(errnoEAFNOSUPPORT)},
+			// SO_LINGER makes the last close of a socket wait for its
+			// unsent data; a worker could set it on a socket whose last
+			// close falls to sandboxd and hold sandboxd's threads. Go's
+			// net package and the engines never set it.
+			{Syscall: "setsockopt", DenyIfEq: []hostproc.SeccompArgEq{{Arg: 1, Value: linuxSOLSocket}, {Arg: 2, Value: linuxSOLinger}}, Deny: hostproc.SeccompRetErrno(errnoEPERM)},
 		},
 		RuleDeny: hostproc.SeccompRetKillProcess,
 		Default:  hostproc.SeccompRetErrno(errnoEPERM),

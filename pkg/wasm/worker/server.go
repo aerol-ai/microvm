@@ -252,7 +252,7 @@ func (s *Server) Serve(conn net.Conn) error {
 	}
 
 	for {
-		env, conns, err := readGrantedFrame(conn)
+		env, err := readGrantedFrame(conn)
 		if err != nil {
 			return err
 		}
@@ -260,7 +260,6 @@ func (s *Server) Serve(conn net.Conn) error {
 		// they bind the holder.
 		if env.Type != MsgInstantiate && env.Type != MsgRestore {
 			if refused := s.refuseForeign(env); refused != nil {
-				closeFiles(conns)
 				if werr := replyErr(env.SandboxID, refused); werr != nil {
 					return werr
 				}
@@ -725,22 +724,12 @@ func (s *Server) Serve(conn net.Conn) error {
 		case MsgProxyHTTP:
 			var p proxyHTTPPayload
 			if err := decodePayload(env.Payload, &p); err != nil {
-				closeFiles(conns)
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}
 				continue
 			}
-			var result proxyHTTPResultPayload
-			switch len(conns) {
-			case 0:
-				result, err = s.proxyGuestHTTPFromPayload(ctx, env.SandboxID, p)
-			case 1:
-				result, err = s.proxyGuestHTTPOn(ctx, env.SandboxID, p, conns[0])
-			default:
-				closeFiles(conns)
-				err = fmt.Errorf("proxy_http carries %d connections, want one", len(conns))
-			}
+			result, err := s.proxyGuestHTTPFromPayload(ctx, env.SandboxID, p)
 			if err != nil {
 				if replyErr(env.SandboxID, err) != nil {
 					return err

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -144,16 +145,25 @@ func installFence(t *testing.T) (workerfence.Backend, []workerfence.Rule) {
 	}
 	rec := &recordingBackend{Backend: workerfence.NewBackend()}
 	fence := workerfence.New(rec, func() (workerfence.Spec, error) {
-		var local []netip.Addr
+		var local []netip.Prefix
 		addrs, _ := net.InterfaceAddrs()
 		for _, a := range addrs {
 			if n, ok := a.(*net.IPNet); ok {
 				if ip, ok := netip.AddrFromSlice(n.IP); ok {
-					local = append(local, ip.Unmap())
+					ones, _ := n.Mask.Size()
+					if ip = ip.Unmap(); ip.Is4() && ones > 32 {
+						ones -= 96
+					}
+					local = append(local, netip.PrefixFrom(ip, ones))
 				}
 			}
 		}
-		return workerfence.Spec{UID: e2eWorkerUID, Local: local}, nil
+		// One exception, as the audit ingest and a name server are, so its
+		// rules (the NAT'd one reads the conntrack original tuple) go into
+		// the real kernel too.
+		return workerfence.Spec{UID: e2eWorkerUID, Local: local, Allow: []workerfence.Allow{
+			{Proto: "udp", Prefix: netip.MustParsePrefix(natTestAddr + "/32"), PortLo: 53, PortHi: 53, Why: "name server"},
+		}}, nil
 	}, nil)
 	if err := fence.Ensure(); err != nil {
 		t.Fatalf("install the fence (needs nf_tables and CAP_NET_ADMIN, as sandboxd has): %v", err)
@@ -380,7 +390,7 @@ func TestConfinedWorkerProxiesHTTP(t *testing.T) {
 	var body string
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		rec := httptest.NewRecorder()
-		err := client.ProxyHTTPDialed(sb, 8080, workerfence.GuestListenHost, ports, rec, httptest.NewRequest(http.MethodGet, "http://gateway/port", nil))
+		err := client.ProxyHTTPDialed(sb, 8080, workerfence.GuestListenHost, ports, new(atomic.Int64), new(atomic.Int64), rec, httptest.NewRequest(http.MethodGet, "http://gateway/port", nil))
 		if err == nil && rec.Code == http.StatusOK {
 			body = rec.Body.String()
 			break
@@ -392,7 +402,7 @@ func TestConfinedWorkerProxiesHTTP(t *testing.T) {
 	}
 	// The plain proxy_http asks the worker to dial: a confined one refuses.
 	err = client.ProxyHTTP(sb, 8080, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://gateway/port", nil))
-	if err == nil || !strings.Contains(err.Error(), "opens none itself") {
+	if err == nil || !strings.Contains(err.Error(), "opens no connection to it") {
 		t.Fatalf("plain proxy_http on a confined worker = %v", err)
 	}
 }

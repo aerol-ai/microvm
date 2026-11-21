@@ -14,19 +14,28 @@
 // One nftables table, inet TableName, with one base chain on the output
 // hook. For packets a socket of the worker uid sends, in order:
 //
-//  1. replies on loopback connections someone else opened are let through
-//     (ct direction reply). Only root opens connections to a guest's
-//     listener (sandboxd's readiness check and its exposed-port proxy); a
-//     worker never opens one, so no worker can reach another tenant's
-//     listener, whatever address it binds.
+//  1. replies from the guest listen host (GuestListenHost) on loopback
+//     connections someone else opened are let through (ct direction
+//     reply). Only root opens connections to a guest's listener
+//     (sandboxd's readiness check and its exposed-port proxy); a worker
+//     never opens one, so no worker can reach another tenant's listener,
+//     whatever address it binds. Replies from any other loopback address
+//     are dropped, so a worker that binds a port a node service uses on
+//     127.0.0.1 (while that service restarts) cannot answer its clients.
 //  2. a short list of exceptions the workers need (Allow): the audit
 //     ingest, a name server, an upstream proxy, each one address and port.
 //  3. drops for every range no egress policy can open (Blocked plus the
 //     deny floor, Spec.Floor).
 //  4. the node ports guests may reach on the node's own addresses
-//     (Spec.NodePorts), then a drop for every other local address (fib
-//     daddr type local: the node IP and every address the node has, kept
-//     current by the kernel).
+//     (Spec.NodePorts), then a drop for every other local address and
+//     for the node's broadcast addresses (fib daddr type local and
+//     broadcast: the node IP and every address the node has, kept current
+//     by the kernel).
+//
+// nft's meta skuid is the uid of the process that made the socket, not of
+// the one using it: a socket another uid made and handed to a worker is
+// that uid's to the fence. So sandboxd never hands a worker a socket it
+// made (pkg/wasm/worker guest_conn.go).
 //
 // Each Apply replaces the table in one netlink transaction; Check reads it
 // back so the Fence can put back a table a firewall reload took away. The
@@ -44,6 +53,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -57,10 +67,9 @@ const ChainName = "output"
 
 // GuestListenHost is where workers bind the guests' listeners while the
 // fence is on, instead of 127.0.0.1. Only root connects to them (sandboxd's
-// readiness check and its exposed-port proxy, which hands the connected
-// socket to the worker); the fence lets the worker uid answer those
-// connections and nothing else on loopback. A separate address still
-// keeps the listeners apart from services bound to 127.0.0.1. Every 127/8
+// readiness check and its exposed-port proxy, which relays each request
+// itself); the fence lets the worker uid answer those connections from
+// this address only, and send nothing else on loopback. Every 127/8
 // address is local on Linux: nothing has to configure it.
 const GuestListenHost = "127.0.97.1"
 
@@ -107,9 +116,10 @@ func withPrefixes(out, add []netip.Prefix) []netip.Prefix {
 	return out
 }
 
-// loopback are the ranges whose replies the worker uid may send (rule 1 of
-// the chain).
-var loopback = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
+// replyTo is where the worker uid may send replies from the guest listen
+// host (rule 1 of the chain). Guest listeners are IPv4 only, so there is
+// no IPv6 reply rule.
+var replyTo = netip.MustParsePrefix("127.0.0.0/8")
 
 // Allow is one exception: proto ("tcp" or "udp") to Prefix, on ports
 // PortLo..PortHi. Why names it in the rule's comment.
@@ -138,11 +148,12 @@ type Spec struct {
 	// non-loopback addresses (egresspolicy.NodeAllowedPorts: Caddy's 80 and
 	// 443 on an ingress node, SB_SANDBOX_NODE_PORTS_ALLOW).
 	NodePorts []uint16
-	// Local are the node's own addresses, read when the plan is made. The
-	// chain finds them itself (nft fib) where the kernel can; NoFib, set by
-	// the Fence for a kernel without nft fib, has Plan list Local instead,
-	// so the list is as fresh as the last sync.
-	Local []netip.Addr
+	// Local are the node's own addresses with their prefix lengths, read
+	// when the plan is made. The chain finds them itself (nft fib) where
+	// the kernel can; NoFib, set by the Fence for a kernel without nft fib,
+	// has Plan list each address and its subnet's broadcast address
+	// instead, so the list is as fresh as the last sync.
+	Local []netip.Prefix
 	NoFib bool
 }
 
@@ -152,15 +163,17 @@ type RuleKind uint8
 const (
 	// KindDrop drops the uid's packets to Prefix.
 	KindDrop RuleKind = iota
-	// KindReply accepts the uid's replies to Prefix on connections someone
-	// else opened.
+	// KindReply accepts the uid's replies from From to Prefix on
+	// connections someone else opened.
 	KindReply
 	// KindAllow accepts Proto to the one address Prefix on PortLo..PortHi.
 	KindAllow
-	// KindAllowNAT accepts Proto to Prefix on a connection a NAT rule sent
-	// there: a resolver behind a port redirect (Docker's embedded DNS turns
-	// 127.0.0.11:53 into 127.0.0.11:<port>) still answers the worker. Only
-	// the operator's NAT rules can make one; the worker cannot.
+	// KindAllowNAT accepts Proto on a connection the worker opened to the
+	// one address Prefix on PortLo..PortHi that a NAT rule then sent
+	// elsewhere: a resolver behind a port redirect (Docker's embedded DNS
+	// turns 127.0.0.11:53 into 127.0.0.11:<port>) still answers the
+	// worker. It matches the connection's original destination, so a NAT
+	// rule that lands other traffic on an allowed address opens nothing.
 	KindAllowNAT
 	// KindLocalPort accepts TCP to any of the node's own addresses on
 	// PortLo (a node port guests may reach).
@@ -168,13 +181,18 @@ const (
 	// KindLocalDrop drops the uid's packets to any of the node's own
 	// addresses.
 	KindLocalDrop
+	// KindBroadcastDrop drops the uid's packets to any of the node's
+	// broadcast addresses (a subnet broadcast reaches the node's own UDP
+	// services).
+	KindBroadcastDrop
 )
 
 // Rule is one rule of the chain, in order.
 type Rule struct {
 	UID    int
 	Kind   RuleKind
-	Proto  string // KindAllow, KindAllowNAT: "tcp" or "udp"
+	From   netip.Addr // KindReply: the source address
+	Proto  string     // KindAllow, KindAllowNAT: "tcp" or "udp"
 	Prefix netip.Prefix
 	PortLo uint16
 	PortHi uint16
@@ -182,7 +200,9 @@ type Rule struct {
 }
 
 // Accepts reports whether the rule lets its packets through.
-func (r Rule) Accepts() bool { return r.Kind != KindDrop && r.Kind != KindLocalDrop }
+func (r Rule) Accepts() bool {
+	return r.Kind != KindDrop && r.Kind != KindLocalDrop && r.Kind != KindBroadcastDrop
+}
 
 // Comment is the rule's nft comment; Check compares the kernel's rules by it.
 func (r Rule) Comment() string {
@@ -192,12 +212,13 @@ func (r Rule) Comment() string {
 	case KindDrop:
 		b.WriteString("drop " + r.Prefix.String())
 	case KindReply:
-		b.WriteString("accept reply " + r.Prefix.String())
+		b.WriteString("accept reply " + r.From.String() + " -> " + r.Prefix.String())
 	case KindAllow, KindAllowNAT:
 		b.WriteString("accept " + r.Proto + " " + r.Prefix.String())
 		if r.Kind == KindAllowNAT {
 			b.WriteString(" nat")
-		} else if r.PortLo == r.PortHi {
+		}
+		if r.PortLo == r.PortHi {
 			fmt.Fprintf(&b, " port %d", r.PortLo)
 		} else {
 			fmt.Fprintf(&b, " ports %d-%d", r.PortLo, r.PortHi)
@@ -206,6 +227,8 @@ func (r Rule) Comment() string {
 		fmt.Fprintf(&b, "accept local tcp port %d", r.PortLo)
 	case KindLocalDrop:
 		b.WriteString("drop local")
+	case KindBroadcastDrop:
+		b.WriteString("drop broadcast")
 	}
 	if r.Why != "" {
 		b.WriteString(" (" + r.Why + ")")
@@ -222,10 +245,7 @@ func Plan(spec Spec) ([]Rule, error) {
 	if spec.UID <= 0 {
 		return nil, fmt.Errorf("wasm worker fence: uid %d is not a worker uid", spec.UID)
 	}
-	var out []Rule
-	for _, p := range loopback {
-		out = append(out, Rule{UID: spec.UID, Kind: KindReply, Prefix: p})
-	}
+	out := []Rule{{UID: spec.UID, Kind: KindReply, From: netip.MustParseAddr(GuestListenHost), Prefix: replyTo}}
 	var allows []Rule
 	for _, a := range spec.Allow {
 		if a.Proto != "tcp" && a.Proto != "udp" || !a.Prefix.IsValid() || a.Prefix.Bits() != a.Prefix.Addr().BitLen() || a.PortLo == 0 || a.PortHi < a.PortLo {
@@ -234,7 +254,7 @@ func Plan(spec Spec) ([]Rule, error) {
 		p := netip.PrefixFrom(a.Prefix.Addr().Unmap(), a.Prefix.Addr().Unmap().BitLen())
 		allows = append(allows,
 			Rule{UID: spec.UID, Kind: KindAllow, Proto: a.Proto, Prefix: p, PortLo: a.PortLo, PortHi: a.PortHi, Why: a.Why},
-			Rule{UID: spec.UID, Kind: KindAllowNAT, Proto: a.Proto, Prefix: p, Why: a.Why})
+			Rule{UID: spec.UID, Kind: KindAllowNAT, Proto: a.Proto, Prefix: p, PortLo: a.PortLo, PortHi: a.PortHi, Why: a.Why})
 	}
 	slices.SortFunc(allows, func(a, b Rule) int { return strings.Compare(a.Comment(), b.Comment()) })
 	out = append(out, slices.CompactFunc(allows, func(a, b Rule) bool { return a.Comment() == b.Comment() })...)
@@ -250,23 +270,30 @@ func Plan(spec Spec) ([]Rule, error) {
 	for _, port := range ports {
 		out = append(out, Rule{UID: spec.UID, Kind: KindLocalPort, PortLo: port, PortHi: port, Why: "node port"})
 	}
-	return append(out, Rule{UID: spec.UID, Kind: KindLocalDrop}), nil
+	return append(out, Rule{UID: spec.UID, Kind: KindLocalDrop}, Rule{UID: spec.UID, Kind: KindBroadcastDrop}), nil
 }
 
-// localByAddress is the node-port and node-address part of the chain for a
-// kernel without nft fib: the same rules, one per address of spec.Local
-// (loopback and link-local are dropped above already).
+// localByAddress is the node-port, node-address and broadcast part of the
+// chain for a kernel without nft fib: the same rules, one per address of
+// spec.Local (loopback and link-local are dropped above already), and a
+// drop for each IPv4 subnet's broadcast address.
 func localByAddress(spec Spec, ports []uint16) []Rule {
-	var addrs []netip.Prefix
-	for _, a := range spec.Local {
-		a = a.Unmap()
-		if !a.IsValid() || a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
+	var addrs, bcasts []netip.Prefix
+	for _, l := range spec.Local {
+		a := l.Addr().Unmap()
+		if !l.IsValid() || a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
 			continue
 		}
 		addrs = append(addrs, netip.PrefixFrom(a, a.BitLen()))
+		if b, ok := broadcastOf(netip.PrefixFrom(a, l.Bits())); ok {
+			bcasts = append(bcasts, netip.PrefixFrom(b, 32))
+		}
 	}
-	slices.SortFunc(addrs, func(a, b netip.Prefix) int { return a.Addr().Compare(b.Addr()) })
-	addrs = slices.Compact(addrs)
+	sortAddrs := func(ps []netip.Prefix) []netip.Prefix {
+		slices.SortFunc(ps, func(a, b netip.Prefix) int { return a.Addr().Compare(b.Addr()) })
+		return slices.Compact(ps)
+	}
+	addrs, bcasts = sortAddrs(addrs), sortAddrs(bcasts)
 	var out []Rule
 	for _, port := range ports {
 		for _, p := range addrs {
@@ -276,12 +303,38 @@ func localByAddress(spec Spec, ports []uint16) []Rule {
 	for _, p := range addrs {
 		out = append(out, Rule{UID: spec.UID, Kind: KindDrop, Prefix: p, Why: "node address"})
 	}
+	for _, p := range bcasts {
+		out = append(out, Rule{UID: spec.UID, Kind: KindDrop, Prefix: p, Why: "node broadcast"})
+	}
 	return out
+}
+
+// broadcastOf is an IPv4 subnet's broadcast address; none for IPv6, or for
+// a /31 or /32, which have none.
+func broadcastOf(p netip.Prefix) (netip.Addr, bool) {
+	if !p.Addr().Is4() || p.Bits() > 30 || p.Bits() < 1 {
+		return netip.Addr{}, false
+	}
+	b := p.Addr().As4()
+	host := ^uint32(0) >> p.Bits()
+	for i := range 4 {
+		b[i] |= byte(host >> (24 - 8*i))
+	}
+	return netip.AddrFrom4(b), true
 }
 
 // usesFib reports whether rules need the kernel's nft fib.
 func usesFib(rules []Rule) bool {
-	return slices.ContainsFunc(rules, func(r Rule) bool { return r.Kind == KindLocalPort || r.Kind == KindLocalDrop })
+	return slices.ContainsFunc(rules, func(r Rule) bool {
+		return r.Kind == KindLocalPort || r.Kind == KindLocalDrop || r.Kind == KindBroadcastDrop
+	})
+}
+
+// missingExpr reports an install the kernel refused for an expression it
+// does not have (the module is absent): the only failure that falls back
+// to listing the node's addresses.
+func missingExpr(err error) bool {
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.EOPNOTSUPP)
 }
 
 // Key is a stable string for a plan, for change checks and logs.
@@ -385,7 +438,9 @@ func (f *Fence) syncLocked(force bool) error {
 	spec, err := f.plan()
 	var rules []Rule
 	if err == nil {
-		spec.NoFib = f.noFib
+		// Always the plan with nft fib first: a kernel that lacked it may
+		// have it now (the module was loaded), and fib follows the node's
+		// addresses at once where a listed plan is a sync behind.
 		rules, err = Plan(spec)
 	}
 	key := Key(rules)
@@ -394,8 +449,12 @@ func (f *Fence) syncLocked(force bool) error {
 	case err != nil:
 	case force || !f.ok.Load() || key != f.applied:
 		err = f.be.Apply(rules)
-		if err != nil && usesFib(rules) {
-			rules, key, err = f.applyWithoutFib(spec, err)
+		switch {
+		case err == nil && f.noFib:
+			f.noFib = false
+			f.logger.Info("wasm worker fence: the kernel has nft fib now; the fence follows the node's addresses itself again", "table", "inet "+TableName)
+		case err != nil && usesFib(rules) && missingExpr(err):
+			rules, key, repaired, err = f.syncWithoutFib(spec, err, force, now)
 		}
 	case now.Sub(f.checkedAt) >= f.reassert:
 		var in bool
@@ -433,25 +492,42 @@ func (f *Fence) syncLocked(force bool) error {
 	return nil
 }
 
-// applyWithoutFib retries an install that failed with the node's own
-// addresses listed instead of found by nft fib, which some kernels lack
-// (the fib expression is a module of its own). When that goes in, the
-// kernel has no fib, and later plans list the addresses too; when it does
-// not, fib was not the problem and the first error stands. The caller
-// holds mu.
-func (f *Fence) applyWithoutFib(spec Spec, first error) ([]Rule, string, error) {
+// syncWithoutFib is the sync for a kernel that refused the plan with nft
+// fib (the fib expression is a module of its own, and some kernels lack
+// it): the same plan with the node's own addresses listed. It is applied
+// when it differs from what is in (an address came or went), and checked
+// on the reassert schedule otherwise. When it cannot go in either, fib was
+// not the problem and the first error stands. The caller holds mu.
+func (f *Fence) syncWithoutFib(spec Spec, first error, force bool, now time.Time) ([]Rule, string, bool, error) {
 	spec.NoFib = true
 	rules, err := Plan(spec)
-	if err == nil {
-		err = f.be.Apply(rules)
-	}
 	if err != nil {
-		return nil, "", first
+		return nil, "", false, first
+	}
+	key := Key(rules)
+	repaired := false
+	switch {
+	case force || !f.ok.Load() || key != f.applied:
+		if err := f.be.Apply(rules); err != nil {
+			return nil, "", false, first
+		}
+	case now.Sub(f.checkedAt) >= f.reassert:
+		in, cerr := f.be.Check(rules)
+		if cerr == nil && !in {
+			cerr = f.be.Apply(rules)
+			repaired = cerr == nil
+		}
+		f.checkedAt = now
+		if cerr != nil {
+			return nil, "", false, cerr
+		}
+	}
+	if !f.noFib {
+		f.logger.Warn("wasm worker fence: this kernel has no nft fib; the fence lists the node's own addresses itself, refreshed on every sync",
+			"table", "inet "+TableName, "fib_error", first)
 	}
 	f.noFib = true
-	f.logger.Warn("wasm worker fence: this kernel has no nft fib; the fence lists the node's own addresses itself, refreshed on every sync",
-		"table", "inet "+TableName, "fib_error", first)
-	return rules, Key(rules), nil
+	return rules, key, repaired, nil
 }
 
 // Nameservers are the addresses of resolv.conf's nameserver lines, the

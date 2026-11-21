@@ -16,8 +16,8 @@
 //	go test -tags wasmbench -run TestCreateLatency -v ./internal/runtime/wasm/wasmbench
 //
 // BENCH_RUNS sets the runs per case (default 20), BENCH_OUT a JSON file for
-// the results, and BENCH_ONLY=i stops after (i) and prints the driver's
-// create stages. To compare with another tree, copy this folder there and
+// the results, BENCH_ONLY=i stops after (i) and prints the driver's create
+// stages, and BENCH_ONLY=ii stops after (ii) (for many short A/B rounds). To compare with another tree, copy this folder there and
 // rewrite setup_test.go for that tree: it is the only file that differs,
 // so the numbers compare.
 package wasmbench_test
@@ -201,6 +201,11 @@ func TestCreateLatency(t *testing.T) {
 		second = append(second, node.create(t, "new-owner-0", fmt.Sprintf("sb-ii-%d", k)))
 	}
 	results = append(results, summarize("i_resident_new_owner", first), summarize("ii_resident_same_bucket", second))
+	if os.Getenv("BENCH_ONLY") == "ii" {
+		// Only (i) and (ii): for many short A/B rounds against another tree.
+		writeResults(t, results)
+		return
+	}
 	if os.Getenv("BENCH_ONLY") == "i" {
 		for _, r := range results[:1] {
 			t.Logf("%-26s runs=%d p50=%.1fms p95=%.1fms", r.Scenario, r.Runs, r.P50ms, r.P95ms)
@@ -272,6 +277,12 @@ func TestCreateLatency(t *testing.T) {
 	}
 	results = append(results, summarize("v_concurrent8_each", each), summarize("v_concurrent8_wall", wall))
 
+	writeResults(t, results)
+}
+
+// writeResults logs results and writes them to BENCH_OUT when it is set.
+func writeResults(t *testing.T, results []result) {
+	t.Helper()
 	for _, r := range results {
 		t.Logf("%-26s runs=%d p50=%.1fms p95=%.1fms", r.Scenario, r.Runs, r.P50ms, r.P95ms)
 	}

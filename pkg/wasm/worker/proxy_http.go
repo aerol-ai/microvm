@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -45,8 +44,8 @@ func (s *Server) guestHTTPTarget(guestPort int) (string, error) {
 }
 
 // proxyGuestHTTP serves a request by dialing the guest's listener from the
-// worker: only a worker that kept root does that (a worker that dropped its
-// privileges takes the connection from sandboxd, proxyGuestHTTPOn).
+// worker: only a worker that kept root does that. For a worker that dropped
+// its privileges sandboxd serves the request itself (ProxyHTTPDialed).
 func (s *Server) proxyGuestHTTP(ctx context.Context, sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	if workerConfined() {
 		return errGuestConnRequired
@@ -55,65 +54,24 @@ func (s *Server) proxyGuestHTTP(ctx context.Context, sandboxID string, guestPort
 	if err != nil {
 		return err
 	}
-	return s.proxyGuestHTTPVia(ctx, sandboxID, addr, func(dctx context.Context) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(dctx, "tcp", addr)
-	}, w, r)
-}
-
-// proxyGuestHTTPVia proxies r to the guest listener at addr over the
-// connection dial makes, counting its bytes as the sandbox's.
-func (s *Server) proxyGuestHTTPVia(ctx context.Context, sandboxID, addr string, dial func(context.Context) (net.Conn, error), w http.ResponseWriter, r *http.Request) error {
-	target, err := url.Parse("http://" + addr)
-	if err != nil {
+	if _, err := url.Parse("http://" + addr); err != nil {
 		return err
 	}
-
-	usage := s.netUsageFor(sandboxID)
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-		http.Error(rw, proxyErr.Error(), http.StatusBadGateway)
-	}
-	origDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = target.Host
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		if resp.Body != nil {
-			resp.Body = &countReadCloser{ReadCloser: resp.Body, counter: &usage.bytesOut}
-		}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		// As the reverse proxy answered a failed dial before.
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return nil
 	}
-	proxy.Transport = &http.Transport{
-		DialContext: func(dctx context.Context, _, _ string) (net.Conn, error) {
-			conn, dialErr := dial(dctx)
-			if dialErr != nil {
-				return nil, dialErr
-			}
-			return &countConn{Conn: conn, in: &usage.bytesIn, out: &usage.bytesOut}, nil
-		},
-		DisableKeepAlives: true,
-	}
-
-	if r.Body != nil {
-		r.Body = &countReadCloser{ReadCloser: r.Body, counter: &usage.bytesIn}
-	}
-	proxy.ServeHTTP(w, r.WithContext(ctx))
-	return nil
+	defer conn.Close()
+	usage := s.netUsageFor(sandboxID)
+	return proxyOverConn(ctx, conn, addr, &usage.bytesIn, &usage.bytesOut, w, r)
 }
 
 func (s *Server) proxyGuestHTTPFromPayload(ctx context.Context, sandboxID string, p proxyHTTPPayload) (proxyHTTPResultPayload, error) {
 	return s.proxyPayload(ctx, p, func(w http.ResponseWriter, req *http.Request) error {
 		return s.proxyGuestHTTP(ctx, sandboxID, p.GuestPort, w, req)
-	})
-}
-
-// proxyGuestHTTPPayloadVia is proxyGuestHTTPFromPayload over the
-// connection dial makes.
-func (s *Server) proxyGuestHTTPPayloadVia(ctx context.Context, sandboxID string, p proxyHTTPPayload, addr string, dial func(context.Context) (net.Conn, error)) (proxyHTTPResultPayload, error) {
-	return s.proxyPayload(ctx, p, func(w http.ResponseWriter, req *http.Request) error {
-		return s.proxyGuestHTTPVia(ctx, sandboxID, addr, dial, w, req)
 	})
 }
 

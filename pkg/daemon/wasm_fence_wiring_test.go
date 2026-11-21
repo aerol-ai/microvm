@@ -84,8 +84,8 @@ func TestWireWasmWorkerFence(t *testing.T) {
 	if host != workerfence.GuestListenHost || stub.applies != 1 || spawnThroughGate() != nil {
 		t.Fatalf("on: host=%q applies=%d", host, stub.applies)
 	}
-	if k := workerfence.Key(stub.rules); !strings.Contains(k, "uid 61000 accept reply 127.0.0.0/8") || !strings.Contains(k, "uid 61000 drop 127.0.0.0/8") ||
-		!strings.Contains(k, "uid 61000 drop local") || strings.Contains(k, workerfence.GuestListenHost) {
+	if k := workerfence.Key(stub.rules); !strings.Contains(k, "uid 61000 accept reply 127.0.97.1 -> 127.0.0.0/8") || !strings.Contains(k, "uid 61000 drop 127.0.0.0/8") ||
+		!strings.Contains(k, "uid 61000 drop local") || strings.Contains(k, "accept tcp "+workerfence.GuestListenHost) {
 		t.Fatalf("rules = %s", k)
 	}
 
@@ -156,7 +156,7 @@ func TestWorkerFenceSpec(t *testing.T) {
 			t.Errorf("plan lacks %q: %s", want, key)
 		}
 	}
-	if strings.Contains(key, workerfence.GuestListenHost) {
+	if strings.Contains(key, "accept tcp "+workerfence.GuestListenHost) {
 		t.Errorf("guest listeners got an exception: %s", key)
 	}
 
@@ -197,7 +197,7 @@ func TestLocalAddrs(t *testing.T) {
 	nodeInterfaceAddrs = func() ([]net.Addr, error) {
 		return []net.Addr{&net.IPNet{IP: net.ParseIP("10.0.0.5"), Mask: net.CIDRMask(24, 32)}, &net.IPAddr{IP: net.ParseIP("10.0.0.9")}, &net.IPNet{IP: net.IP{1}}}, nil
 	}
-	if got := localAddrs(); len(got) != 1 || got[0] != netip.MustParseAddr("10.0.0.5") {
+	if got := localAddrs(); len(got) != 1 || got[0] != netip.MustParsePrefix("10.0.0.5/24") {
 		t.Fatalf("local = %v", got)
 	}
 	nodeInterfaceAddrs = func() ([]net.Addr, error) { return nil, errors.New("netlink") }

@@ -49,6 +49,15 @@ func TestEnsureWorkDir(t *testing.T) {
 	if !d.workerOwns() {
 		t.Fatal("worker confinement not seen")
 	}
+	// A new /work, its parent missing too: made and handed over without a
+	// walk.
+	fresh := filepath.Join(t.TempDir(), "run2", "sb-new")
+	if err := d.ensureWorkDir(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(fresh); err != nil || !st.IsDir() || ownerOf(t, fresh) != selfWorker().UID {
+		t.Fatalf("new work dir = %v, %v", st, err)
+	}
 	// A path that cannot be a dir.
 	file := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(file, nil, 0o600); err != nil {

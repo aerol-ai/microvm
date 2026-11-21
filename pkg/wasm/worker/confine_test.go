@@ -229,8 +229,14 @@ func TestWorkerSeccompPolicy(t *testing.T) {
 	if p.Actions["clone3"] != hostproc.SeccompRetErrno(errnoENOSYS) || p.Default != hostproc.SeccompRetErrno(errnoEPERM) || p.RuleDeny != hostproc.SeccompRetKillProcess {
 		t.Fatalf("clone3/default/rule deny = %#x %#x %#x", p.Actions["clone3"], p.Default, p.RuleDeny)
 	}
-	if len(p.Rules) != 2 || p.Rules[0].Syscall != "clone" || p.Rules[0].DenyIfAll[0].Mask&0x10000000 == 0 {
+	if len(p.Rules) != 3 || p.Rules[0].Syscall != "clone" || p.Rules[0].DenyIfAll[0].Mask&0x10000000 == 0 {
 		t.Fatalf("clone rule = %+v", p.Rules)
+	}
+	if r := p.Rules[2]; r.Syscall != "setsockopt" || len(r.DenyIfEq) != 2 || r.DenyIfEq[1].Value != linuxSOLinger || r.Deny != hostproc.SeccompRetErrno(errnoEPERM) {
+		t.Fatalf("setsockopt rule = %+v", r)
+	}
+	if allowed["socketpair"] {
+		t.Fatal("socketpair allowed")
 	}
 	// socket keeps IPv4, IPv6 and route netlink only; anything else fails
 	// with EAFNOSUPPORT, not a kill (the Go runtime probes families).

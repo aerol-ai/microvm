@@ -33,29 +33,9 @@ func TestConnectGuestReplies(t *testing.T) {
 		{"odd reply", Envelope{Type: MsgPong}, false, "unexpected reply"},
 		{"no socket", Envelope{Type: MsgOK}, false, "no listening socket"},
 	} {
-		_, err := connectGuest(tc.reply, nil, "127.0.0.1", []int{1})
+		_, _, err := connectGuest(tc.reply, nil, "127.0.0.1", []int{1})
 		if err == nil || errors.Is(err, ErrHostDialUnsupported) != tc.unsupported || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err = %v", tc.name, err)
-		}
-	}
-}
-
-func TestSameTCPAddr(t *testing.T) {
-	tcp := &net.TCPAddr{IP: net.ParseIP("127.0.97.1"), Port: 40000}
-	if err := sameTCPAddr(tcp, "127.0.97.1:40000"); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		got  net.Addr
-		want string
-	}{
-		{&net.UnixAddr{Name: "x", Net: "unix"}, "127.0.97.1:40000"},
-		{tcp, "not an address"},
-		{tcp, "127.0.97.1:40001"},
-		{tcp, "127.0.0.1:40000"},
-	} {
-		if err := sameTCPAddr(tc.got, tc.want); err == nil {
-			t.Errorf("sameTCPAddr(%v, %s) passed", tc.got, tc.want)
 		}
 	}
 }
@@ -118,12 +98,12 @@ func TestGuestListenerUnsupportedHere(t *testing.T) {
 	t.Cleanup(func() { hostDialSupported = prev })
 	s := &Server{eng: &fakeMultiListenEngine{}}
 	reply := serveOnce(t, s, Envelope{Type: MsgGuestListener, SandboxID: "sb", Payload: mustPayload(t, guestListenerPayload{GuestPort: 8080})})
-	if _, err := connectGuest(reply, nil, "127.0.0.1", nil); !errors.Is(err, ErrHostDialUnsupported) {
+	if _, _, err := connectGuest(reply, nil, "127.0.0.1", nil); !errors.Is(err, ErrHostDialUnsupported) {
 		t.Fatalf("reply %s: %v", reply.Type, err)
 	}
 	// A payload that does not decode is an error, not a fallback.
 	reply = serveOnce(t, s, Envelope{Type: MsgGuestListener, SandboxID: "sb", Payload: []byte("{")})
-	if _, err := connectGuest(reply, nil, "127.0.0.1", nil); err == nil || errors.Is(err, ErrHostDialUnsupported) {
+	if _, _, err := connectGuest(reply, nil, "127.0.0.1", nil); err == nil || errors.Is(err, ErrHostDialUnsupported) {
 		t.Fatalf("bad payload: %v", err)
 	}
 }

@@ -43,11 +43,22 @@ func (d *Driver) workerOwns() bool { return d.cfg.Worker.Enabled() }
 // in it) is handed over whole, once: after that, what the guest writes is
 // the worker's already and what the toolbox writes it chowns as it goes.
 func (d *Driver) ensureWorkDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
 	if !d.workerOwns() {
-		return nil
+		return os.MkdirAll(dir, 0o700)
+	}
+	// A create's /work is new and empty: making it and handing it over
+	// are two calls on the create path, no walk.
+	err := os.Mkdir(dir, 0o700)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err = os.MkdirAll(filepath.Dir(dir), 0o700); err == nil {
+			err = os.Mkdir(dir, 0o700)
+		}
+	}
+	if err == nil {
+		return os.Lchown(dir, d.cfg.Worker.UID, d.cfg.Worker.GID)
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return err
 	}
 	st, err := os.Lstat(dir)
 	if err != nil {
