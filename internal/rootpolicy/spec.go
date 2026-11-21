@@ -13,6 +13,8 @@ import (
 
 	"github.com/containerd/containerd/v2/contrib/seccomp"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/aerol-ai/microvm/internal/ownerlease"
 )
 
 // DecodeSpec reads the spec bytes exactly as runc and runsc will: containerd
@@ -428,6 +430,11 @@ func checkCgroup(p Policy, containerID, cg string) error {
 	leaf := path.Base(cg)
 	if err := ValidateID(leaf); err != nil {
 		return violate(RuleCgroup, "cgroups path %q: %v", cg, err)
+	}
+	// A machinery group beside the sandboxes (containerd's _runtime, a
+	// host-process runtime's aerolvm-*) is never a sandbox's.
+	if ownerlease.ReservedGroup(leaf) {
+		return violate(RuleCgroup, "cgroups path %q is a group the sandboxes' parent keeps for AerolVM's own processes", cg)
 	}
 	if containerID != "" && leaf != containerID {
 		return violate(RuleCgroup, "cgroups path %q is not the container's own (%s)", cg, containerID)

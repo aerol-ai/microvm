@@ -89,9 +89,26 @@ func TestValidRef(t *testing.T) {
 		// nor the VMs' group itself, which would freeze every VM.
 		"aerolvm-vmm/sb-a36d11bff9ff6787": true, "aerolvm-vmm": false,
 		"aerolvm-vmm/": false, "aerolvm-vmm/..": false, "aerolvm-vmm/a/b": false, "aerolvm-wasm/sb-a": false,
+		// The machinery's groups are never a sandbox's: "_runtime" holds
+		// containerd, every shim and the root helper; the host-process
+		// runtimes' groups hold many sandboxes at once.
+		"_runtime": false, "_runtime/aerolvm-rootd": false, "_x": false, "aerolvm-wasm": false,
+		"aerolvm-mounts": false, "aerolvm-isolate": false, "aerolvm-vmm/_runtime": false, "aerolvm-vmm/aerolvm-wasm": false,
+		"sb_runtime": true, "aerol-netns-3": true, "park-0a1b": true,
 	} {
 		if got := ValidRef(ref); got != want {
 			t.Errorf("ValidRef(%q) = %v, want %v", ref, got, want)
+		}
+	}
+}
+
+func TestReservedGroup(t *testing.T) {
+	for name, want := range map[string]bool{
+		"_runtime": true, "_": true, "aerolvm-vmm": true, "aerolvm-wasm": true, "aerolvm-": true,
+		"sb-a36d11bff9ff6787": false, "aerol-netns-0": false, "park-01": false, "aerolvm": false, "x_": false, "": false,
+	} {
+		if got := ReservedGroup(name); got != want {
+			t.Errorf("ReservedGroup(%q) = %v, want %v", name, got, want)
 		}
 	}
 }

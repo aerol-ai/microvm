@@ -57,14 +57,16 @@ func (l Lease) Remaining() time.Duration {
 // sandboxes' cgroup parent: one path element (a container's group), or one
 // element under a host-process runtime's group (a Firecracker VM's,
 // "aerolvm-vmm/<sandbox>"), so a file that names "../supervisor" can never
-// make the reader freeze anything else.
+// make the reader freeze anything else. A name ReservedGroup keeps for
+// the machinery is never a sandbox's: "_runtime" would freeze containerd,
+// every shim and the root helper.
 func ValidRef(ref string) bool {
 	group, child, nested := strings.Cut(ref, "/")
 	if nested {
-		return HostGroups[group] && validElem(child)
+		return HostGroups[group] && sandboxElem(child)
 	}
 	// A host group itself holds every VM: naming it would freeze them all.
-	return validElem(ref) && !HostGroups[ref]
+	return sandboxElem(ref) && !HostGroups[ref]
 }
 
 // HostGroups are the groups, directly under the sandboxes' cgroup parent,
@@ -72,9 +74,32 @@ func ValidRef(ref string) bool {
 // starts each VM in aerolvm-vmm/<sandbox> (internal/runtime/firecracker).
 var HostGroups = map[string]bool{"aerolvm-vmm": true}
 
+// ReservedGroup reports whether name, one group directly under the
+// sandboxes' cgroup parent, is one AerolVM keeps for its own processes
+// rather than one sandbox's:
+//
+//   - a name starting with "_": the worker pod's supervisor puts
+//     containerd, and so every shim and the root helper, in "_runtime"
+//     (internal/supervisor);
+//   - a name starting with "aerolvm-": the host-process runtimes' groups,
+//     each holding many sandboxes or their helpers ("aerolvm-vmm",
+//     "aerolvm-wasm", "aerolvm-isolate", "aerolvm-mounts").
+//
+// No sandbox, warm-pool slot or parked container takes either form
+// ("sb-", "aerol-netns-", "park-"), so refusing them costs no real name,
+// and a name that would put a sandbox, a freeze or an out-of-memory
+// setting on the machinery is never taken for a sandbox's.
+func ReservedGroup(name string) bool {
+	return strings.HasPrefix(name, "_") || strings.HasPrefix(name, "aerolvm-")
+}
+
 func validElem(e string) bool {
 	return e != "" && e != "." && e != ".." && !strings.ContainsAny(e, "/\x00")
 }
+
+// sandboxElem is one sandbox's group name: a single element that no
+// machinery group takes.
+func sandboxElem(e string) bool { return validElem(e) && !ReservedGroup(e) }
 
 // Write replaces the file at path with l in one rename, so a reader sees
 // the old lease or the new one, never part of one.

@@ -321,6 +321,15 @@ func TestCheckSpecWithoutContainerID(t *testing.T) {
 	if err := CheckSpec(p, testID, s); err != nil {
 		t.Fatalf("cgroup under a configured parent: %v", err)
 	}
+	// M1 PR 6: a spec checked without its container still never lands in
+	// a group the parent keeps for the machinery (containerd's _runtime,
+	// the host-process runtimes' aerolvm-*), the gap a sandbox named
+	// "_runtime" would have opened.
+	for _, leaf := range []string{"_runtime", "aerolvm-wasm", "aerolvm-vmm"} {
+		r := baselineSpec(t)
+		r.Linux.CgroupsPath = "/kubepods/aerolvm/" + leaf
+		wantRule(t, CheckSpec(p, "", r), RuleCgroup)
+	}
 	// No capabilities at all; the default profile then allows fewer
 	// syscalls (no chroot without CAP_SYS_CHROOT), and must be that one.
 	s.Process.Capabilities = nil
