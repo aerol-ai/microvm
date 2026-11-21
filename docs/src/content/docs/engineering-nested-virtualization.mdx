@@ -119,7 +119,7 @@ options kvm_amd nested=0
 
 ## Check it from your code
 
-Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested virtualization hidden, it reports the feature as `false`. On Intel, the VMX line is in leaf 1; on AMD, look for `SVM: secure virtual machine` in leaf `0x80000001` instead. The example installs the tool, so it needs a Debian or Ubuntu image that can reach its package mirror:
+Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested virtualization hidden, it reports the feature as `false`. On Intel, the VMX line is in leaf 1; on AMD, look for `SVM: secure virtual machine` in leaf `0x80000001` instead. The example installs the tool, so it needs an x86 server and a Debian or Ubuntu image that can reach its package mirror:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -129,7 +129,7 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
     const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
     const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "firecracker" });
-    const result = await sandbox.exec("apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
+    const result = await sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
     console.log(result.stdout); // VMX: virtual machine extensions = false
 
     await sandbox.destroy();
@@ -142,7 +142,7 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
     client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
 
     sandbox = client.create(image="ubuntu:22.04", runtime="firecracker")
-    result = sandbox.exec("apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
+    result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
     print(result["stdout"])  # VMX: virtual machine extensions = false
 
     sandbox.destroy()
@@ -164,7 +164,7 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
     }
     defer sandbox.Destroy(ctx)
 
-    result, err := sandbox.ExecCommand(ctx, "apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
+    result, err := sandbox.ExecCommand(ctx, "apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")
     if err != nil {
         log.Fatal(err)
     }
@@ -182,7 +182,7 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
         runtime: Some("firecracker".into()),
         ..Default::default()
     })?;
-    let result = sandbox.exec("apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")?;
+    let result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'")?;
     print!("{}", result.stdout); // VMX: virtual machine extensions = false
 
     sandbox.destroy()?;
@@ -195,7 +195,7 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
     Sandbox sandbox = client.create(
         new CreateOptions().setImage("ubuntu:22.04").setRuntime("firecracker")
     );
-    ExecResult result = sandbox.exec("apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
+    ExecResult result = sandbox.exec("apt-get update -qq && apt-get install -y -qq cpuid >/dev/null && cpuid -1 -l 1 | grep 'VMX: virtual machine extensions'");
     System.out.print(result.stdout); // VMX: virtual machine extensions = false
 
     sandbox.destroy();
@@ -203,9 +203,9 @@ Code in a sandbox can read its own CPU menu with the `cpuid` tool. With nested v
   </TabItem>
 </Tabs>
 
-On a server with `SB_FIRECRACKER_NESTED_VIRT=true` and a kernel that allows nested virtualization, the same code prints `= true`. Run it against a sandbox from before the upgrade to see whether it still has the feature.
+On an Intel server with `SB_FIRECRACKER_NESTED_VIRT=true` and a kernel that allows nested virtualization, the same code prints `= true`. On AMD the VMX line always says `false`; check the SVM line instead (we have not tested this on AMD yet). Run it against a sandbox from before the upgrade to see whether it still has the feature.
 
-Don't use `/proc/cpuinfo` for this. A sandbox kernel built without KVM support leaves `vmx` out of it even when the CPU offers the feature, so it reads the same both ways.
+Don't use `/proc/cpuinfo` for this. On the Intel server we tested, a sandbox kernel built without KVM support left `vmx` out of it even when the CPU offered the feature, so it read the same both ways.
 
 ## Tests that keep it this way
 
