@@ -51,24 +51,21 @@ type NetnsBinding interface {
 	Bound(ctx context.Context, netns, containerID string) (bool, error)
 }
 
-// checkNetns asks the binding, when there is one, about the namespace c
-// joins. A lookup that fails fails the call, unforwarded: it is not a
-// refusal, since nothing says the request was hostile.
-func (g *Gate) checkNetns(ctx context.Context, c rootpolicy.Container) error {
-	if g.netns == nil {
+// checkNetns asks the binding, when there is one, about the namespace name
+// (rootpolicy.ContainerNetns) that container id joins. A lookup that fails
+// fails the call, unforwarded: it is not a refusal, since nothing says the
+// request was hostile.
+func (g *Gate) checkNetns(ctx context.Context, id, name string) error {
+	if g.netns == nil || name == "" {
 		return nil
 	}
-	name, err := rootpolicy.ContainerNetns(c)
-	if err != nil || name == "" {
-		return err
-	}
-	bound, err := g.netns.Bound(ctx, name, c.ID)
+	bound, err := g.netns.Bound(ctx, name, id)
 	if err != nil {
 		return fmt.Errorf("containerd gate: which sandbox owns network namespace %s: %w", name, err)
 	}
 	if !bound {
 		return &rootpolicy.Violation{Rule: rootpolicy.RuleHostNamespace,
-			Detail: fmt.Sprintf("network namespace %q is not the one the helper made for %s", name, c.ID)}
+			Detail: fmt.Sprintf("network namespace %q is not the one the helper made for %s", name, id)}
 	}
 	return nil
 }
@@ -79,6 +76,11 @@ func (g *Gate) checkBinds(c rootpolicy.Container) error {
 	if err != nil {
 		return err
 	}
+	return g.checkBindSources(sources)
+}
+
+// checkBindSources walks each bind source on disk.
+func (g *Gate) checkBindSources(sources []string) error {
 	for _, src := range sources {
 		root, folder, ok := rootpolicy.BindRootFor(g.policy, src)
 		if !ok { // CheckContainer has refused this already; stay closed anyway
@@ -91,12 +93,9 @@ func (g *Gate) checkBinds(c rootpolicy.Container) error {
 	return nil
 }
 
-// checkReads walks every path c makes root read on disk.
-func (g *Gate) checkReads(c rootpolicy.Container) error {
-	reads, err := rootpolicy.ContainerRootReads(c)
-	if err != nil {
-		return err
-	}
+// checkRootReads walks each path a container makes root read on disk
+// (rootpolicy.ContainerRootReads).
+func (g *Gate) checkRootReads(reads []rootpolicy.RootRead) error {
 	for _, r := range reads {
 		if err := g.reads.CheckRead(r); err != nil {
 			return err

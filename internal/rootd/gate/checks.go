@@ -30,18 +30,40 @@ func checkContainerCreate(ctx context.Context, g *Gate, req proto.Message) error
 }
 
 // checkContainer runs every check on a container record: the rules, its
-// bind sources on disk, and its network namespace's owner.
+// bind sources and the paths it makes root read on disk, and its network
+// namespace's owner. The spec is decoded at most once, and not at all when
+// the memo holds the answer for these exact bytes (specmemo.go); the
+// on-disk checks run every time.
 func (g *Gate) checkContainer(ctx context.Context, c rootpolicy.Container) error {
-	if err := rootpolicy.CheckContainer(g.policy, c); err != nil {
+	checked, err := rootpolicy.CheckContainerWith(g.policy, c, g.specCheck())
+	if err != nil {
 		return err
 	}
-	if err := g.checkBinds(c); err != nil {
+	if err := g.checkBindSources(checked.BindSources); err != nil {
 		return err
 	}
-	if err := g.checkReads(c); err != nil {
+	if err := g.checkRootReads(checked.RootReads); err != nil {
 		return err
 	}
-	return g.checkNetns(ctx, c)
+	return g.checkNetns(ctx, c.ID, checked.Netns)
+}
+
+// specCheck is the memo's check, or nil (rootpolicy's own) for a gate made
+// without New.
+func (g *Gate) specCheck() rootpolicy.SpecCheck {
+	if g.specs == nil {
+		return nil
+	}
+	return g.specs.check
+}
+
+// checkContainerDelete passes every delete (the walk has checked its one
+// field) and drops the container's spec from the memo.
+func checkContainerDelete(_ context.Context, g *Gate, req proto.Message) error {
+	if g.specs != nil {
+		g.specs.drop(req.(*containersapi.DeleteContainerRequest).GetID())
+	}
+	return nil
 }
 
 // checkContainerUpdate allows a relabel and nothing else. The field mask

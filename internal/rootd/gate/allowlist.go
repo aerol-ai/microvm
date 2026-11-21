@@ -92,7 +92,7 @@ var allowlist = []method{
 		why: "NewContainer: every create and warm-pool park"},
 	{name: "/containerd.services.containers.v1.Containers/Update", write: true, check: checkContainerUpdate, newReq: req[containersapi.UpdateContainerRequest](), newResp: req[containersapi.UpdateContainerResponse](),
 		why: "container.SetLabels: warm-pool adoption relabels the parked container"},
-	{name: "/containerd.services.containers.v1.Containers/Delete", write: true, newReq: req[containersapi.DeleteContainerRequest](), newResp: req[emptypb.Empty](),
+	{name: "/containerd.services.containers.v1.Containers/Delete", write: true, check: checkContainerDelete, newReq: req[containersapi.DeleteContainerRequest](), newResp: req[emptypb.Empty](),
 		why: "container.Delete: destroy, failed-create undo, parked slot teardown"},
 	{name: "/containerd.services.tasks.v1.Tasks/Create", write: true, check: checkTaskCreate, newReq: req[tasksapi.CreateTaskRequest](), newResp: req[tasksapi.CreateTaskResponse](),
 		why: "container.NewTask: create, start, park"},

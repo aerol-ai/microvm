@@ -18,8 +18,11 @@
 // (rootdpb.HelperRefused), from which the agent's client writes the audit
 // event and counts the metric the alert reads.
 //
-// Calls run in parallel; the gate holds no lock and no state of its own
-// (eng review D11). Nothing here is wired into sandboxd or the helper yet.
+// Calls run in parallel (eng review D11). The gate's one piece of state is
+// a bounded memo of spec checks a create has already paid for
+// (specmemo.go), keyed on the exact bytes checked; it never decides a
+// check that was not made in full for those bytes. Nothing here is wired
+// into sandboxd or the helper yet.
 package gate
 
 import (
@@ -102,6 +105,8 @@ type Gate struct {
 	binds     BindChecker
 	reads     ReadChecker
 	netns     NetnsBinding
+	// specs remembers which spec bytes passed for which container.
+	specs *specMemo
 }
 
 // New checks the policy and returns a gate.
@@ -112,8 +117,12 @@ func New(cfg Config) (*Gate, error) {
 	if cfg.Upstream == nil {
 		return nil, errors.New("containerd gate: a connection to containerd is required")
 	}
-	g := &Gate{policy: cfg.Policy, upstream: cfg.Upstream, onRefusal: cfg.OnRefusal,
-		stdio: cfg.Stdio, binds: cfg.Binds, reads: cfg.Reads, netns: cfg.NetnsBinding}
+	// The gate's own copy: the memo's answers hold for the policy they
+	// were made under, so no caller may change it after New.
+	p := cfg.Policy.Clone()
+	g := &Gate{policy: p, upstream: cfg.Upstream, onRefusal: cfg.OnRefusal,
+		stdio: cfg.Stdio, binds: cfg.Binds, reads: cfg.Reads, netns: cfg.NetnsBinding,
+		specs: newSpecMemo(p, memoEntries, memoEntryBytes)}
 	if g.stdio == nil {
 		g.stdio = defaultStdioChecker()
 	}
