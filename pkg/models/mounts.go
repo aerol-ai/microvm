@@ -301,8 +301,11 @@ func validateSource(t MountType, source string) error {
 			}
 		}
 	case MountTypeRclone:
-		// Format: remote:path (rclone's own syntax). Refuse a bare local path.
-		if strings.HasPrefix(source, "/") || strings.HasPrefix(source, "./") {
+		// Format: remote:path or :backend:path (rclone's own syntax).
+		// Anything rclone would read as a local path (/x, ./x, ../x, a
+		// bare name) is refused here; which backend and options the
+		// remote uses is ValidateToolOptions' rule.
+		if _, ok := parseRcloneRemote(source); !ok {
 			return fmt.Errorf("rclone source must be a configured remote, not a local path: %q", source)
 		}
 	}

@@ -399,6 +399,17 @@ func (a *Admitter) SetOwnsSandboxes(owns bool) {
 	a.ownsNoSandboxes.Store(!owns)
 }
 
+// SupportedRuntimes returns a copy of the runtimes this host advertises.
+// GET /v1/runtimes on a single node reads it; Snapshot would also work but
+// walks every reservation under the admission lock that creates wait on.
+// host is fixed at New, so this needs no lock.
+func (a *Admitter) SupportedRuntimes() []string {
+	if a == nil {
+		return nil
+	}
+	return append([]string(nil), a.host.SupportedRuntimes...)
+}
+
 // ParkReclaimer gives up to slots warm-pool slots back to the admitter and
 // returns how many it released. It must release each slot's park:<slot-id>
 // reservation before returning (container teardown may finish later), and it

@@ -98,10 +98,12 @@ func TestRefill_SpawnsUpToDepth(t *testing.T) {
 	spawner := &fakeSpawner{}
 	lister := &fakeLister{templates: []TemplateWarmInput{{
 		TemplateID:         "tpl-a",
+		RootfsPath:         "/srv/tpl-a/rootfs.ext4",
 		SnapshotMemoryPath: "/srv/tpl-a/mem",
 		SnapshotStatePath:  "/srv/tpl-a/state",
 		SnapshotChecksum:   "sha256:aaa|sha256:bbb",
 		VsockCID:           42,
+		HasOverlay:         true,
 	}}}
 	var busy atomic.Bool
 	p.runRefillOnce(ctx, lister, spawner, 5*time.Second, &busy)
@@ -109,6 +111,23 @@ func TestRefill_SpawnsUpToDepth(t *testing.T) {
 	// 3 spawns expected — the pool was empty, depth=3.
 	if got := len(spawner.Calls()); got != 3 {
 		t.Fatalf("Spawn call count = %d, want 3", got)
+	}
+	// Every input reaches the spawner, the rootfs included: LoadSnapshot
+	// opens it as the snapshot's root drive, and a warm spawn without it
+	// fails on every jailed host.
+	want := SnapshotInputs{
+		TemplateID:         "tpl-a",
+		RootfsPath:         "/srv/tpl-a/rootfs.ext4",
+		SnapshotMemoryPath: "/srv/tpl-a/mem",
+		SnapshotStatePath:  "/srv/tpl-a/state",
+		SnapshotChecksum:   "sha256:aaa|sha256:bbb",
+		VsockCID:           42,
+		HasOverlay:         true,
+	}
+	for i, got := range spawner.Calls() {
+		if got != want {
+			t.Fatalf("Spawn call %d inputs = %+v, want %+v", i, got, want)
+		}
 	}
 	stats, err := p.Stats(ctx, "tpl-a")
 	if err != nil {

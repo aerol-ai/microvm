@@ -10,9 +10,11 @@ description: Add an external-storage mount adapter (S3, NFS, SSHFS, rclone, etc.
 Mount inputs run on the host, **outside** the microVM isolation boundary, as the daemon user:
 
 - `source` is passed to mount-tool commands
-- `options.opts` (NFS) is passed verbatim
-- `options.extra_args` (S3) is passed verbatim
+- `options.opts` (NFS) is passed as mount's `-o` list, through an allow list
+- `options.extra_args` (S3) is split into mount-s3's argv, through an allow list
 - mount-tool flags generally
+
+The allow lists live in `pkg/models/mount_options.go` (`MountSpec.ValidateToolOptions`); rclone's backend and option lists are in `mount_options_rclone.go`. `extra_args` and `opts` are refused on any type that has no list, so a new adapter that copies caller input into argv or a config file must add one there. A flag, backend or option joins a list only if it names no host path, opens no listener or outbound stream, picks no credential or config source, and runs nothing. The service checks the lists on every path that runs a mount tool (create, rebuild, start, reconcile, adopt); see `internal/service/mount_tool_options.go`.
 
 **The current assumption is "PAT holder == host operator".** PAT holders are trusted as if they had shell on the host. Their mount input is already-trusted by the threat model.
 

@@ -175,6 +175,7 @@ var routePermissions = map[string]string{
 	"GET /v1/js-bundles":                                      "sandbox.read",
 	"GET /v1/js-bundles/{id}":                                 "sandbox.read",
 	"GET /v1/metrics":                                         "metrics.read",
+	"GET /v1/runtimes":                                        "sandbox.read",
 	"GET /v1/sandboxes":                                       apihttp.ReadOrSecretsTag,
 	"GET /v1/sandboxes/{id}":                                  apihttp.ReadOrSecretsTag,
 	"GET /v1/sandboxes/{id}/audit":                            "audit.read",

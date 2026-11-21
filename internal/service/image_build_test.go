@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -141,6 +142,9 @@ func TestBuildImageErrors(t *testing.T) {
 		{"cache check fails", config.Config{}, &fakeBuilder{existsErr: errors.New("daemon down")}, BuildImageRequest{Dockerfile: "FROM a\nRUN true"}, ErrBuildFailed},
 		{"build fails", config.Config{}, &fakeBuilder{buildErr: errors.New("exit 1")}, BuildImageRequest{Dockerfile: "FROM a\nRUN true"}, ErrBuildFailed},
 		{"build times out", config.Config{}, &fakeBuilder{buildErr: context.DeadlineExceeded}, BuildImageRequest{Dockerfile: "FROM a\nRUN true"}, ErrBuildTimeout},
+		// Privilege mode split refuses builds (pkg/daemon imageBuilderFor):
+		// the 501 survives, never a 502.
+		{"node refuses builds", config.Config{}, &fakeBuilder{buildErr: fmt.Errorf("privilege mode split: %w", models.ErrRuntimeNotImplemented)}, BuildImageRequest{Dockerfile: "FROM a\nRUN true"}, models.ErrRuntimeNotImplemented},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var builder ImageBuilder

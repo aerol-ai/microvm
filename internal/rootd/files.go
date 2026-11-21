@@ -543,10 +543,14 @@ func (f *files) sameFile(dfd int, name string, body []byte, mode uint32) bool {
 		uint32(st.Mode)&0o7777 != mode || st.Uid != f.owner || st.Size != int64(len(body)) {
 		return false
 	}
-	// One byte more than body: a file that grew since the stat is not body.
-	got := make([]byte, len(body)+1)
-	n, err := io.ReadFull(file, got)
-	return (err == io.EOF || err == io.ErrUnexpectedEOF) && bytes.Equal(got[:n], body)
+	got := make([]byte, len(body))
+	if _, err := io.ReadFull(file, got); err != nil || !bytes.Equal(got, body) {
+		return false
+	}
+	// A file that grew since the stat is not body.
+	var more [1]byte
+	n, err := file.Read(more[:])
+	return n == 0 && err == io.EOF
 }
 
 // removeFolder removes <base>/<id> and the files in it. Only root writes

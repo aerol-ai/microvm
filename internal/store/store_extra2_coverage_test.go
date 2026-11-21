@@ -91,7 +91,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = st.RemoveCustomDomain(ctx, "sb-list", "domain.com")
 
 	// Complex updates
-	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-update", "mem", "state", 100, "chk", 123, true)
+	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-update", "mem", "state", 100, "chk", 123, true, "")
 	_ = st.CompleteIdempotentRequest(ctx, "req-2", "fp2", "target", time.Now(), time.Minute)
 	_ = st.UpdateStatus(ctx, "sb-list", models.SandboxStatus("running"), "err")
 	_ = st.UpdateRuntime(ctx, "sb-list", "cid", "cip", "url")

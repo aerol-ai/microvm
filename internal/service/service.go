@@ -288,7 +288,13 @@ type Service struct {
 	// templateRebuildWG tracks in-flight snapshot rebuilds so their filesystem
 	// work can be joined before the templates directory is torn down.
 	templateRebuildWG sync.WaitGroup
-	testAuditFetcher  cluster.AuditPeerFetcher
+	// templateSnapshotLocks holds a lock per template id while anyone holds
+	// or waits on it, taken around each VM that saves a template's
+	// snapshot (lockTemplateSnapshot). templateSnapshotLocksMu guards the
+	// map and each entry's refs.
+	templateSnapshotLocksMu sync.Mutex
+	templateSnapshotLocks   map[string]*templateSnapshotLock
+	testAuditFetcher        cluster.AuditPeerFetcher
 	// nodeRetirements caches the operator storage-destruction attestations
 	// consulted by the delete-outbox pass. See node_storage_retirement.go.
 	nodeRetirementMu sync.Mutex
@@ -576,6 +582,10 @@ type Service struct {
 	warmPoolApplied  string
 	warmPoolKick     chan struct{}
 	warmPoolKickOnce sync.Once
+
+	// runtimeOffers caches the cluster's runtime offers for GET
+	// /v1/runtimes (runtimes.go).
+	runtimeOffers runtimeOffersCache
 
 	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
 	// index the request path reads; apiTokenMirror is the token copy on a
@@ -913,6 +923,10 @@ type Service struct {
 	// testVolumeMeta, when non-nil, replaces volumeMeta() so reclaim / attach
 	// failure arms can be forced without a store wrapper. Nil in production.
 	testVolumeMeta volumeMetaStore
+	// testRunningMounts, when non-nil, replaces the mount manager where a
+	// restart takes over a running sandbox's mounts (runningMounts), so a
+	// test sees which way reestablishRunningMounts went. Nil in production.
+	testRunningMounts runningMountSet
 	// testForceFleetSuspendErr, when non-nil, replaces SetFleetSuspended's
 	// result in StopByOwner so the non-NotFound error arm is reachable.
 	// Nil in production.
@@ -2081,8 +2095,10 @@ func failoverCreatedAtFrom(ctx context.Context) time.Time {
 // validateCreateMounts applies the mount policy to a create request. The
 // placement rule (credentials must be in Credentials, never in Source or
 // Options, which are replicated in the clear) is enforced on new requests and
-// only logged on a stored-spec replay — see storedSpecReplayKey.
-func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string) error {
+// only logged on a stored-spec replay — see storedSpecReplayKey. platform is
+// the attachments resolvePlatformVolumes made for this create (nil when it
+// made none).
+func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.MountSpec, sandboxID string, platform []models.VolumeAttachment) error {
 	if len(mounts) > models.MaxMountsPerSandbox {
 		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
 	}
@@ -2121,6 +2137,17 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	}
 	if err := validateUniqueMountTargets(mounts); err != nil {
 		return err
+	}
+	// The mount-tool allow lists hold on every create, a replay included:
+	// unlike a misplaced credential, a refused flag is only harmless if it
+	// never runs. They are for the caller's mounts: platform names the
+	// mounts this create made from platform volumes, and a rebuild's mounts
+	// are all platform volumes built here (rebuildSpecWithoutHostPowers
+	// refuses any other), both from configuration daemon start checked.
+	if !isRebuiltSpec(ctx) {
+		if err := s.checkCallerMountTools(ctx, sandboxID, mounts, platform); err != nil {
+			return err
+		}
 	}
 	// A node that cannot keep a mount where the sandbox is built (a
 	// Kubernetes worker pod with external storage off, F13) refuses here,
@@ -2553,7 +2580,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
+	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride, platformAttachments); err != nil {
 		return nil, err
 	}
 
@@ -4026,7 +4053,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 			return nil, loadErr
 		}
 		if len(specs) > 0 {
-			if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+			if err := s.reestablishMounts(ctx, id, specs); err != nil {
 				return nil, fmt.Errorf("reestablish mounts: %w", err)
 			}
 			wasmRehydrateBinds = s.mounts.HostBindsFor(id)
@@ -4071,7 +4098,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 		return nil, err
 	}
 	if len(specs) > 0 {
-		if err := s.mounts.Reestablish(ctx, id, specs); err != nil {
+		if err := s.reestablishMounts(ctx, id, specs); err != nil {
 			releaseAdmission()
 			return nil, fmt.Errorf("reestablish mounts: %w", err)
 		}
@@ -7367,11 +7394,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.syncAllowedPorts(ctx, sandbox)
 			// Re-establish host-side mounts for running sandboxes after a
 			// sandboxd restart. Idempotent — only mounts that aren't already
-			// tracked are spawned.
+			// tracked are spawned. A stored spec the allow lists refuse is
+			// kept as it runs or torn down, never run again
+			// (reestablishRunningMounts).
 			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
 			} else if len(specs) > 0 {
-				if err := s.mounts.Reestablish(ctx, sandbox.ID, specs); err != nil {
+				if err := s.reestablishRunningMounts(ctx, sandbox.ID, specs); err != nil {
 					s.logger.Warn("reestablish mounts", "sandbox_id", sandbox.ID, "error", err)
 				}
 			}
