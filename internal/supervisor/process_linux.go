@@ -86,9 +86,9 @@ func LowerOwnOOMScore() error {
 	return os.WriteFile("/proc/self/oom_score_adj", []byte(strconv.Itoa(-999)), 0o644)
 }
 
-// StartHelper starts the root helper at bin, in the cgroup at dir (none
-// when dir is empty, for tests), with env and with files as descriptors 3
-// and up. Its output is this container's.
+// StartHelper starts the root helper at bin, in the cgroup at dir (its own,
+// HelperGroup; none when dir is empty, for tests), with env and with files
+// as descriptors 3 and up. Its output is this container's.
 //
 // The reaper collects it like any child, so it is followed by pidfd, not
 // pid: the pidfd says when it ended whoever reaped it, and a signal sent
@@ -163,3 +163,18 @@ func (c *pidfdChild) Signal(sig syscall.Signal) error {
 }
 
 func (c *pidfdChild) Done() <-chan struct{} { return c.done }
+
+// openPidfd holds pid by pidfd (Linux 5.3), for HelperGroup's kill by hand.
+func openPidfd(pid int) (pidHandle, error) {
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return nil, err
+	}
+	return pidfd(fd), nil
+}
+
+// pidfd is a process's pidfd; the kernel sets close-on-exec on it.
+type pidfd int
+
+func (p pidfd) Kill() error  { return unix.PidfdSendSignal(int(p), unix.SIGKILL, nil, 0) }
+func (p pidfd) Close() error { return unix.Close(int(p)) }

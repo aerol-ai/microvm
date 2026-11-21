@@ -40,18 +40,28 @@ import (
 // helper. To swap, it verifies the new helper while the old one serves,
 // then stops the old one (SIGTERM: stop accepting, finish every call in
 // flight, end the event subscriptions; the helper's own deadline cuts the
-// rest) and waits for it to exit, killing it after KillAfter, and only
-// then starts the new one on the same socket. The two never run at once,
-// so a late call from the old helper cannot undo the new one's work for a
-// sandbox (D11's per-sandbox order holds across the swap). An agent that
-// connects meanwhile waits in the socket's backlog; one whose call was cut
-// tries it again (internal/rootclient).
+// rest) and waits for it to exit, killing it after KillAfter. The helper's
+// exit is not the end of what it started: a CNI plugin, and the IPAM plugin
+// that one runs, outlive a helper that crashed or was killed, or that cut
+// the call they ran for. So every helper runs in a cgroup of its own
+// (HelperGroup), and a helper has stopped only once that group is empty:
+// the keeper kills whatever is left in it and waits until the kernel says
+// it holds no process. Only then does the new one start, on the same
+// socket. The two, and all each started, never run at once, so a late
+// call from the old helper cannot undo the new one's work for a sandbox
+// (D11's per-sandbox order holds across the swap), and no part of a call
+// the agent sends again to the new helper (internal/rootclient retrySafe)
+// can run after it. An agent that connects meanwhile waits in the socket's
+// backlog; one whose call was cut tries it again. A group that will not
+// empty is logged as an error and tried again with a growing wait: no
+// helper starts beside what is left.
 //
 // Rollback: a new helper that exits, or does not say it serves within
 // ReadyWait, is stopped and the old copy runs again; that staged helper is
 // tried again only after RetryFailed. A helper that dies after it served
-// is started again from the same copy, with a growing wait. Sandboxes
-// never depend on the helper being up: none is its child.
+// is started again from the same copy, with a growing wait; what it left
+// in its group is killed at once. Sandboxes never depend on the helper
+// being up: none is its child.
 type HelperKeeper struct {
 	// StageDir is the agent's staged folder; BinDir is the supervisor's
 	// own, for verified copies.
@@ -63,8 +73,11 @@ type HelperKeeper struct {
 	// Keys are the release keys built into the runtime image.
 	Keys []ed25519.PublicKey
 	// Start runs the helper copy at bin with env, and files as its
-	// descriptors 3 and up.
+	// descriptors 3 and up, in Group's cgroup.
 	Start func(bin string, env []string, files []*os.File) (Child, error)
+	// Group is the cgroup every helper runs in. No helper starts until it
+	// is empty; nil only in tests that have none.
+	Group HelperGroup
 	// Env is every helper's environment; the handover's names are added.
 	Env []string
 	Log *slog.Logger
@@ -97,7 +110,8 @@ type Child interface {
 	// Signal sends sig to the process, and never to one that took its pid
 	// after it exited.
 	Signal(sig syscall.Signal) error
-	// Done is closed once the process has exited.
+	// Done is closed once the process has exited: the process alone, not
+	// what it started (HelperGroup).
 	Done() <-chan struct{}
 }
 
@@ -155,6 +169,7 @@ func (h *HelperKeeper) Run(ctx context.Context) {
 			if h.child != nil {
 				h.stop(h.child)
 			}
+			h.closeGroup()
 			h.closeSocket()
 			return
 		case <-exited:
@@ -164,10 +179,13 @@ func (h *HelperKeeper) Run(ctx context.Context) {
 			h.Log.Warn("supervisor: the root helper exited; sandboxes keep running; starting it again",
 				"version", h.cur.Manifest.Version, "in", backoff)
 			h.child = nil
+			// What it started may still run, with no helper to answer
+			// for it: kill it now, not after the restart's wait.
+			h.clear(ctx)
 		case <-restart:
 			restart = nil
 			if h.child == nil {
-				h.child = h.startServing(h.cur)
+				h.child = h.startServing(ctx, h.cur)
 			}
 		case <-tick.C:
 			if next := h.look(); next != nil {
@@ -255,13 +273,14 @@ func (h *HelperKeeper) once(msg string, err error) {
 	}
 }
 
-// swap moves to next: the helper that runs is stopped and has exited
-// before next starts (exclusive handover). With a helper to go back to,
-// next must say it serves within ReadyWait, or the old copy runs again.
+// swap moves to next: the helper that runs is stopped, and it and all it
+// started have exited, before next starts (exclusive handover). With a
+// helper to go back to, next must say it serves within ReadyWait, or the
+// old copy runs again.
 func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 	prev := h.cur
 	if prev == nil {
-		h.cur, h.child = next, h.startServing(next)
+		h.cur, h.child = next, h.startServing(ctx, next)
 		return
 	}
 	if h.child != nil {
@@ -269,7 +288,7 @@ func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 		h.stop(h.child)
 		h.child = nil
 	}
-	child, ready, err := h.start(next)
+	child, ready, err := h.start(ctx, next)
 	if err == nil {
 		err = h.waitReady(ctx, child, ready)
 	}
@@ -296,7 +315,7 @@ func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 			if prev.Path != next.Path {
 				_ = prev.Remove()
 			}
-			h.child = h.startServing(next)
+			h.child = h.startServing(ctx, next)
 			return
 		}
 	}
@@ -307,15 +326,17 @@ func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 	if prev.Path != next.Path {
 		_ = next.Remove()
 	}
-	h.child = h.startServing(prev)
+	h.child = h.startServing(ctx, prev)
 }
 
 // startServing starts inst and logs when it serves. nil: it did not start;
 // Run starts it again after a wait.
-func (h *HelperKeeper) startServing(inst *rootswap.Installed) Child {
-	child, ready, err := h.start(inst)
+func (h *HelperKeeper) startServing(ctx context.Context, inst *rootswap.Installed) Child {
+	child, ready, err := h.start(ctx, inst)
 	if err != nil {
-		h.Log.Error("supervisor: could not start the root helper", "version", inst.Manifest.Version, "error", err)
+		if ctx.Err() == nil {
+			h.Log.Error("supervisor: could not start the root helper", "version", inst.Manifest.Version, "error", err)
+		}
 		return nil
 	}
 	go func() {
@@ -350,8 +371,13 @@ func (r *readyPipe) served(wait time.Duration) bool {
 }
 
 // start runs inst with the socket and a ready pipe, which tells once the
-// helper writes its byte or the pipe closes without it.
-func (h *HelperKeeper) start(inst *rootswap.Installed) (Child, *readyPipe, error) {
+// helper writes its byte or the pipe closes without it. It is the one
+// place a helper starts, so it is where the group is checked empty: on a
+// swap, a rollback, a restart after a crash and the first start alike.
+func (h *HelperKeeper) start(ctx context.Context, inst *rootswap.Installed) (Child, *readyPipe, error) {
+	if !h.clear(ctx) {
+		return nil, nil, ctx.Err()
+	}
 	if h.sock == nil {
 		ln, fi, err := rootfolder.Listen(h.Socket, h.SocketGID)
 		if err != nil {
@@ -418,7 +444,8 @@ func (h *HelperKeeper) waitReady(ctx context.Context, child Child, ready *readyP
 
 // stop drains a helper and waits until it has exited, killing it after
 // KillAfter. It never returns while the helper runs: the next one must
-// not serve beside it.
+// not serve beside it. What the helper started may still run; start
+// empties the group before the next one.
 func (h *HelperKeeper) stop(c Child) {
 	_ = c.Signal(syscall.SIGTERM)
 	timer := time.NewTimer(h.KillAfter)
@@ -431,6 +458,48 @@ func (h *HelperKeeper) stop(c Child) {
 	h.Log.Warn("supervisor: the root helper did not stop in time; killing it", "after", h.KillAfter)
 	_ = c.Signal(syscall.SIGKILL)
 	<-c.Done()
+}
+
+// clear returns once the helpers' group is empty (HelperGroup.Empty): no
+// helper may start while anything the last one started still runs. A
+// group that will not empty is an error, logged on every try, and tried
+// again with a growing wait. false: ctx ended first.
+func (h *HelperKeeper) clear(ctx context.Context) bool {
+	if h.Group == nil {
+		return true
+	}
+	wait := h.MinBackoff
+	for {
+		err := h.Group.Empty()
+		if err == nil {
+			return true
+		}
+		h.Log.Error("supervisor: the root helper's cgroup still holds what the last helper started; no helper starts beside it; trying again",
+			"error", err, "in", wait)
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
+		}
+		wait = min(wait*2, h.MaxBackoff)
+	}
+}
+
+// closeGroup empties the helpers' group as the supervisor stops, with one
+// bounded try, and removes it.
+func (h *HelperKeeper) closeGroup() {
+	if h.Group == nil {
+		return
+	}
+	if err := h.Group.Empty(); err != nil {
+		h.Log.Error("supervisor: could not empty the root helper's cgroup as it stops", "error", err)
+		return
+	}
+	if err := h.Group.Remove(); err != nil {
+		h.Log.Warn("supervisor: could not remove the root helper's cgroup", "error", err)
+	}
 }
 
 // closeSocket closes the supervisor's copy and removes the socket file,

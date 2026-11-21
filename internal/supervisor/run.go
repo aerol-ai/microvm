@@ -109,6 +109,8 @@ type OS struct {
 	DefaultConfig func(binary string) ([]byte, error)
 	// StartHelper starts the root helper at bin in the cgroup at dir.
 	StartHelper func(dir, bin string, env []string, files []*os.File) (Child, error)
+	// HelperGroup is the root helper's own cgroup at dir.
+	HelperGroup func(dir string) HelperGroup
 	// ReleaseKeys are the release keys built into the runtime image.
 	ReleaseKeys func() ([]ed25519.PublicKey, error)
 	// Environ is the supervisor's environment, which the helper gets.
@@ -137,6 +139,7 @@ func RealOS() OS {
 			return exec.Command(binary, "config", "default").Output()
 		},
 		StartHelper: StartHelper,
+		HelperGroup: NewHelperGroup,
 		ReleaseKeys: rootswap.ReleaseKeys,
 		Environ:     os.Environ,
 	}
@@ -210,10 +213,13 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 
 	helperDone := make(chan struct{})
 	if helper != nil {
-		// The helper goes in the runtime's own group, beside containerd,
-		// never above a sandbox: its restarts stop none of them.
+		// The helper goes in a group of its own inside the runtime's,
+		// never above a sandbox: its restarts stop none of them, and the
+		// keeper kills all it started without touching containerd.
+		dir := l.HelperDir()
+		helper.Group = sys.HelperGroup(dir)
 		helper.Start = func(bin string, env []string, files []*os.File) (Child, error) {
-			return sys.StartHelper(l.RuntimeDir(), bin, env, files)
+			return sys.StartHelper(dir, bin, env, files)
 		}
 		helper.Env = helperEnv(sys.Environ(), shape.Parent)
 		go func() {

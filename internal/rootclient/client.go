@@ -464,10 +464,13 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 //
 // A dropped call may or may not have run. Two things make running it
 // again safe. The helper drops connections only when it stops, and the
-// supervisor starts the next helper only once the old one has exited
-// (exclusive handover, outside review O6), so the first try can never run
-// after the second. And each call below leaves the same result when run
-// twice: "make sure this exists" or "make sure this is gone".
+// supervisor starts the next helper only once the old one's whole cgroup
+// is empty: the helper and every process it started, such as a CNI plugin
+// and the IPAM plugin that one runs, have exited (exclusive handover,
+// outside review O6; internal/supervisor HelperGroup). So no part of the
+// first try can run after the second. And each call below leaves the same
+// result when run twice: "make sure this exists" or "make sure this is
+// gone".
 //
 // EnsureTaskFIFOs is the one that makes something new each time: fresh
 // FIFOs, renamed over the last pair. A second run replaces a pair only

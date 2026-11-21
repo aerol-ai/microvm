@@ -461,9 +461,10 @@ func TestStagedFileReplacedAfterTheCheck(t *testing.T) {
 }
 
 // TestRunStartsTheStagedHelper: Run with a staged folder set starts the
-// helper in the runtime's own group, with the cgroup parent it worked out,
-// and stops it with the supervisor; with no release key built in it does
-// not start at all.
+// helper in its own group inside the runtime's, emptied first, never in
+// containerd's, with the cgroup parent it worked out; it stops it with the
+// supervisor, then empties and removes the group. With no release key
+// built in it does not start at all.
 func TestRunStartsTheStagedHelper(t *testing.T) {
 	l := fakeCgroup(t, "/kubepods/pod1/ctr", "12884901888", "1")
 	dir := shortDir(t)
@@ -479,9 +480,10 @@ func TestRunStartsTheStagedHelper(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var mu sync.Mutex
-	var startedIn string
+	var startedIn, containerdIn, groupDir string
 	var env []string
 	var child *fakeChild
+	group := &countGroup{}
 	sys := OS{
 		CgroupRoot: l.Root,
 		ReadFile: func(p string) ([]byte, error) {
@@ -492,11 +494,23 @@ func TestRunStartsTheStagedHelper(t *testing.T) {
 		},
 		LowerOOM:     func() error { return nil },
 		BecomeReaper: func() error { return nil },
-		StartInGroup: func(string, []string) (int, error) { return 4242, nil },
-		Terminate:    func(int) {},
-		Unmount:      func(string) error { return nil },
-		Reap:         func(*atomic.Int64, chan<- int, *slog.Logger) {},
+		StartInGroup: func(d string, _ []string) (int, error) {
+			mu.Lock()
+			containerdIn = d
+			mu.Unlock()
+			return 4242, nil
+		},
+		Terminate: func(int) {},
+		Unmount:   func(string) error { return nil },
+		Reap:      func(*atomic.Int64, chan<- int, *slog.Logger) {},
+		HelperGroup: func(d string) HelperGroup {
+			groupDir = d
+			return group
+		},
 		StartHelper: func(d, bin string, e []string, files []*os.File) (Child, error) {
+			if group.empties.Load() == 0 {
+				t.Error("the helper started before its group was emptied")
+			}
 			w, err := dupFile(files[1])
 			if err != nil {
 				return nil, err
@@ -524,8 +538,15 @@ func TestRunStartsTheStagedHelper(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if startedIn != l.RuntimeDir() {
-		t.Fatalf("helper started in %s, want %s", startedIn, l.RuntimeDir())
+	if want := filepath.Join(l.RuntimeDir(), "aerolvm-rootd"); startedIn != want || groupDir != want {
+		t.Fatalf("helper started in %s, its group %s; want both %s", startedIn, groupDir, want)
+	}
+	if containerdIn != l.RuntimeDir() {
+		t.Fatalf("containerd started in %s, want the runtime's own group %s", containerdIn, l.RuntimeDir())
+	}
+	if group.empties.Load() < 2 || group.removes.Load() != 1 {
+		t.Fatalf("group emptied %d times and removed %d, want before the start and at the stop, then removed once",
+			group.empties.Load(), group.removes.Load())
 	}
 	if !slicesContains(env, "SB_CONTAINERD_CGROUP_PARENT=/kubepods/pod1/ctr/sandboxes") || slicesContains(env, "SB_CONTAINERD_CGROUP_PARENT=/stale") {
 		t.Fatalf("helper env %v", env)
@@ -539,6 +560,12 @@ func TestRunStartsTheStagedHelper(t *testing.T) {
 		t.Fatalf("Run with no release key = %v", err)
 	}
 }
+
+// countGroup is a HelperGroup that is always empty and counts its calls.
+type countGroup struct{ empties, removes atomic.Int64 }
+
+func (g *countGroup) Empty() error  { g.empties.Add(1); return nil }
+func (g *countGroup) Remove() error { g.removes.Add(1); return nil }
 
 func slicesContains(list []string, s string) bool {
 	for _, v := range list {

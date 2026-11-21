@@ -16,9 +16,10 @@
 // (Options.Listener), and one helper hands it to the next on a signed swap
 // (eng review D4). The handover is exclusive (outside review O6): Shutdown
 // stops accepting and lets every call in flight finish, and the
-// supervisor starts the next helper only once this one has exited, so two
-// helpers never serve at once and a late call from the old one cannot undo
-// the new one's work for the same sandbox.
+// supervisor starts the next helper only once this one, and every process
+// it started, has exited (its cgroup is empty, internal/supervisor
+// HelperGroup), so two helpers never serve at once and a late call from
+// the old one cannot undo the new one's work for the same sandbox.
 //
 // Nothing runs this yet: cmd/aerolvm-rootd is the binary, and the agent
 // moves onto it in a later PR (task T4).

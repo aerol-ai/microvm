@@ -618,7 +618,7 @@ func TestEnsureConfigAndRealOS(t *testing.T) {
 		t.Fatal("a config under a file was written")
 	}
 	sys := RealOS()
-	if sys.CgroupRoot != CgroupRoot || sys.ReadFile == nil || sys.Remount == nil || sys.StartInGroup == nil || sys.Reap == nil {
+	if sys.CgroupRoot != CgroupRoot || sys.ReadFile == nil || sys.Remount == nil || sys.StartInGroup == nil || sys.Reap == nil || sys.HelperGroup == nil {
 		t.Fatal("RealOS is incomplete")
 	}
 	if _, err := sys.DefaultConfig(filepath.Join(dir, "no-such-containerd")); err == nil {

@@ -126,7 +126,8 @@ func (r *releaser) signFor(body []byte, version, goos, goarch string, priv ed255
 }
 
 // fakeChild is a helper process. It exits on the signals in exitOn, and
-// counts as alive until it exits.
+// counts as alive until it exits. What it leaves in its group (leave)
+// runs on after it exits, until the group is emptied.
 type fakeChild struct {
 	bin    string
 	exitOn []syscall.Signal
@@ -134,8 +135,23 @@ type fakeChild struct {
 
 	mu      sync.Mutex
 	signals []syscall.Signal
+	left    bool // a process it started still runs in the group
 	done    chan struct{}
 	once    sync.Once
+}
+
+// leave starts a process in the helper's group that outlives the helper,
+// as a CNI plugin's IPAM plugin does.
+func (c *fakeChild) leave() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.left = true
+}
+
+func (c *fakeChild) leftover() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.left
 }
 
 func (c *fakeChild) Signal(sig syscall.Signal) error {
@@ -194,6 +210,46 @@ type keeperRig struct {
 	overlap  string
 	startErr func(n int) error
 	behave   func(n int, c *fakeChild)
+	// The helpers' group (rigGroup): Empty's calls, the nth failing when
+	// emptyErr says so, and Remove's.
+	empties, removes int
+	emptyErr         func(n int) error
+	removeErr        error
+}
+
+// rigGroup is the helpers' cgroup in a keeperRig: what a helper left
+// stays in it until Empty kills it, unless emptyErr says it cannot.
+type rigGroup struct{ r *keeperRig }
+
+func (g rigGroup) Empty() error {
+	r := g.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := r.empties
+	r.empties++
+	for _, c := range r.children {
+		if !c.exited() {
+			r.overlap = fmt.Sprintf("emptied the group while %s ran", c.bin)
+		}
+	}
+	if r.emptyErr != nil {
+		if err := r.emptyErr(n); err != nil {
+			return err
+		}
+	}
+	for _, c := range r.children {
+		c.mu.Lock()
+		c.left = false
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+func (g rigGroup) Remove() error {
+	g.r.mu.Lock()
+	defer g.r.mu.Unlock()
+	g.r.removes++
+	return g.r.removeErr
 }
 
 func newKeeperRig(t *testing.T, tune func(k *HelperKeeper)) *keeperRig {
@@ -209,6 +265,7 @@ func newKeeperRig(t *testing.T, tune func(k *HelperKeeper)) *keeperRig {
 		RetryFailed: time.Hour, MinBackoff: 5 * time.Millisecond, MaxBackoff: 20 * time.Millisecond, HealthyAfter: time.Hour,
 	}
 	r.k.Start = r.start
+	r.k.Group = rigGroup{r}
 	if tune != nil {
 		tune(r.k)
 	}
@@ -222,6 +279,9 @@ func (r *keeperRig) start(bin string, env []string, files []*os.File) (Child, er
 	for _, c := range r.children {
 		if !c.exited() {
 			r.overlap = fmt.Sprintf("start %d (%s) while %s still ran", n, bin, c.bin)
+		}
+		if c.leftover() {
+			r.overlap = fmt.Sprintf("start %d (%s) while what %s started still ran", n, bin, c.bin)
 		}
 	}
 	if r.startErr != nil {

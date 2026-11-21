@@ -18,3 +18,4 @@ func Terminate(int)                                                   {}
 func Unmount(string) error                                            { return errNeedsLinux }
 func LowerOwnOOMScore() error                                         { return errNeedsLinux }
 func StartHelper(string, string, []string, []*os.File) (Child, error) { return nil, errNeedsLinux }
+func openPidfd(int) (pidHandle, error)                                { return nil, errNeedsLinux }
