@@ -21,6 +21,9 @@ type containerdEngineWiring struct {
 	driver       *cntr.Driver
 	logger       *slog.Logger
 	stopReassert func()
+	// fence is the root helper's IPv6 fence in privilege mode split, for
+	// the create gate (nil in single mode: wireIPv6Fence's supervisor).
+	fence *helperFence
 }
 
 func (w *containerdEngineWiring) Stop() {

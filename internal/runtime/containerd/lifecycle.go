@@ -105,12 +105,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// failure cleanup below.
 		earlyRules, addressReported bool
 	)
+	// builtRules: the namespace build put the request's rules on
+	// prepaidIP already (privilege mode split, a cold create: one helper
+	// call for both; BuildRules).
+	var builtRules *BuildRules
 	if d.cfg.NativeNetnsPool && d.netns != nil {
-		netnsPath, prepaidIP, err = d.netns.Provision(ctx, sandboxID)
+		pctx, rules := d.buildRulesFor(ctx, req)
+		netnsPath, prepaidIP, err = d.netns.Provision(pctx, sandboxID)
 		if err != nil {
 			return nil, fmt.Errorf("provision netns: %w", err)
 		}
 		netnsProvisioned = true
+		if rules.Applied() {
+			builtRules, earlyRules = rules, true
+		}
 		// The containerd_netns stage is the handoff's to record: only it
 		// knows a warm claim (hit) from an inline build (miss), and it times
 		// both (netns.RuntimeHandoff.Provision). This used to record a fixed
@@ -356,12 +364,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// an orphan whose Destroy clears these rules.
 	if ip := strings.TrimSpace(prepaidIP); ip != "" {
 		earlyRules = true
-		netrulesStart := time.Now()
-		if err := d.applyCreateNetRules(ip, req); err != nil {
-			return nil, err
-		}
-		if hasCreateNetRules(req) {
-			createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
+		if builtRules == nil {
+			netrulesStart := time.Now()
+			if err := d.applyCreateNetRules(ctx, netnsPath, ip, req); err != nil {
+				return nil, err
+			}
+			if hasCreateNetRules(req) {
+				createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
+			}
 		}
 		addressReported = true
 		sbruntime.NotifyAddressKnown(ctx, ip)
@@ -803,8 +813,10 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	}
 	destroyErr := d.destroyContainer(ctx, sandbox)
 	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
-	_ = d.ClearNetworkRules(sandbox.ContainerIP)
-	_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+	if !d.clearsOnRelease() || d.netns == nil {
+		_ = d.ClearNetworkRules(sandbox.ContainerIP)
+		_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+	}
 	if d.netns != nil {
 		_ = d.netns.Release(ctx, sandbox.ID)
 	}

@@ -123,6 +123,9 @@ func wireNetnsPool(ctx context.Context, cfg config.Config, logger *slog.Logger, 
 	var exists netns.NetnsExists
 	if helper != nil {
 		h := newHelperNetnsHost(helper, subnet, logger)
+		if fw, ok := helper.(firewallHelper); ok && splitFirewallOn(cfg) {
+			h.fw = fw
+		}
 		host, exists = h, h.exists
 	} else {
 		inProcess, err := inProcessNetnsHost(cfg, subnet)

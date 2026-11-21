@@ -32,10 +32,37 @@ type fakeNet struct {
 	hold   chan struct{}     // Realize waits on it when set
 	active atomic.Int32      // Realize/Remove calls running now
 	peak   atomic.Int32
+	leases map[string]string // address -> the slot CNI leased it to
 }
 
 func newFakeNet() *fakeNet {
-	return &fakeNet{ns: map[string]NetnsState{}, fail: map[string]error{}, ipFor: map[string]string{}}
+	return &fakeNet{ns: map[string]NetnsState{}, fail: map[string]error{}, ipFor: map[string]string{}, leases: map[string]string{}}
+}
+
+func (f *fakeNet) Bridge() string { return "aerolvm0" }
+
+func (f *fakeNet) Leaseholder(ip netip.Addr) (string, bool, error) {
+	if err := f.failing("lease"); err != nil {
+		return "", false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name, ok := f.leases[ip.String()]
+	return name, ok, nil
+}
+
+func (f *fakeNet) LeaseOf(name string) (netip.Addr, bool, error) {
+	if err := f.failing("leaseof"); err != nil {
+		return netip.Addr{}, false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for ip, n := range f.leases {
+		if n == name {
+			return netip.MustParseAddr(ip), true, nil
+		}
+	}
+	return netip.Addr{}, false, nil
 }
 
 func (f *fakeNet) record(s string) {
@@ -106,6 +133,7 @@ func (f *fakeNet) Realize(_ context.Context, name, path string) (string, error) 
 		ip = fmt.Sprintf("10.88.0.%d", f.next+1)
 	}
 	f.ns[path] = NetnsState{Exists: true, IPv4: []string{ip}}
+	f.leases[ip] = name
 	return ip, nil
 }
 
@@ -117,6 +145,11 @@ func (f *fakeNet) Remove(_ context.Context, name, path, ip string) error {
 	}
 	f.mu.Lock()
 	delete(f.ns, path)
+	for ip, n := range f.leases {
+		if n == name {
+			delete(f.leases, ip)
+		}
+	}
 	f.mu.Unlock()
 	return nil
 }

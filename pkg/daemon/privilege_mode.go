@@ -14,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/netns"
 	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootclient"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -25,10 +26,11 @@ import (
 // single, the default and the mode when the setting is absent, is today's:
 // nothing here runs. split runs sandboxd with no rights; the root helper
 // does its root work, which is built one step at a time (M1 PRs 4 to 9).
-// So far the helper does the containerd engine's network: namespaces, CNI,
-// the forwarding sysctls and the CNI config. Root work it does not do yet
-// is refused by name, at start for what sandboxd does at boot, at the call
-// for the rest, and never done as root instead.
+// So far the helper does the containerd engine's network (namespaces, CNI,
+// the forwarding sysctls, the CNI config) and its host firewall (every
+// sandbox rule, the node guard, the deny floor, the IPv6 fence). Root work
+// it does not do yet is refused by name, at start for what sandboxd does
+// at boot, at the call for the rest, and never done as root instead.
 
 // checkPrivilegeMode refuses, at start, a split-mode node this build cannot
 // run. Two needs last: split is the containerd engine only (Docker's
@@ -48,8 +50,11 @@ func checkPrivilegeMode(cfg config.Config) error {
 			"the root helper makes every sandbox's network namespace for the pool")
 	}
 	var gaps []privmode.Step
-	if cfg.EnableNetworkRules || cfg.EgressFQDNEnabled || cfg.EnterpriseMode {
-		gaps = append(gaps, privmode.StepFirewall)
+	// The host firewall (SB_ENABLE_NETWORK_RULES) and enterprise mode's
+	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go); the
+	// hostname gateway's host side is not yet.
+	if cfg.EgressFQDNEnabled {
+		gaps = append(gaps, privmode.StepFQDNGateway)
 	}
 	if cfg.ContainerdPoolEnabled {
 		gaps = append(gaps, privmode.StepWarmPool)
@@ -168,8 +173,15 @@ type netnsHelper interface {
 // one helper call, the namespace named by the same identity the in-process
 // Host keys it by (netns.Slot.NetnsName). It also answers the pool's two
 // optional steps, DisableIPv6 and IPv4Addrs, and its exists check.
+//
+// With the host firewall on (fw set, M1 PR 5), a cold create's build takes
+// the create's rules with it (cntr.BuildRules): one PrepareSandbox for the
+// namespace and the rules, so the address is never without them. And a
+// release is one ReleaseSandbox: the address's rules go, then the
+// namespace, in the helper, before CNI DEL frees the address.
 type helperNetnsHost struct {
 	h      netnsHelper
+	fw     firewallHelper
 	subnet netip.Prefix
 	log    *slog.Logger
 }
@@ -182,41 +194,73 @@ func newHelperNetnsHost(h netnsHelper, subnet string, log *slog.Logger) *helperN
 // Realize answers a namespace the helper built, or leaves none behind
 // (PR 4 review). A build the agent gave up on (its deadline, a cancel, a
 // dropped answer) or that failed inside the helper may have left a part:
-// a namespace, an address lease. The pool records nothing for a failed
-// build, and a create's slot goes back to the free list under another
-// name, so nothing would ever name it again; it is removed here, under
-// the name it was built under. The helper takes that name's lock, so the
-// removal runs only once the build has stopped. A build the helper never
-// ran (refused, too old, at its limit of calls) has nothing to remove.
+// a namespace, an address lease, the create's rules. The pool records
+// nothing for a failed build, and a create's slot goes back to the free
+// list under another name, so nothing would ever name it again; it is
+// removed here, under the name it was built under. The helper takes that
+// name's lock, so the removal runs only once the build has stopped. A
+// build the helper never ran (refused, too old, at its limit of calls)
+// has nothing to remove.
 func (n *helperNetnsHost) Realize(ctx context.Context, slot netns.Slot) (string, string, error) {
 	if strings.TrimSpace(slot.SandboxID) == "" {
 		return "", "", errors.New("netns host: sandbox_id is required")
 	}
 	name := slot.NetnsName()
-	path, ip, err := n.h.RealizeNetns(ctx, name)
+	path, ip, err := n.build(ctx, name)
 	if err == nil || !mayHaveRun(err) {
 		return path, ip, err
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), helperNetworkTimeout)
 	defer cancel()
-	if rerr := n.h.RemoveNetns(rctx, name, ""); rerr != nil {
+	// The address is the helper's to find, in the namespace: the build's
+	// answer never came. Its rules, when the build carried some, go too.
+	parts := []string{rootdpb.PartNetns}
+	if n.fw != nil && cntr.BuildRulesFrom(ctx) != nil {
+		parts = append(parts, rootdpb.PartFirewall)
+	}
+	if rerr := n.release(rctx, name, "", parts); rerr != nil {
 		n.log.Warn("containerd netns build failed and its leftovers could not be removed; a create of the same sandbox ID clears them",
 			"slot_id", slot.SlotID, "netns", name, "build_error", err, "error", rerr)
 	}
 	return "", "", err
 }
 
-// mayHaveRun: a failed helper call that the helper may have run, in part.
-func mayHaveRun(err error) bool {
-	var refused *rootclient.RefusedError
-	return !errors.As(err, &refused) && !errors.Is(err, rootclient.ErrUnsupported) && !errors.Is(err, rootclient.ErrBusy)
+// build is RealizeNetns, or PrepareSandbox with the create's rules when the
+// create carries them (cntr.BuildRules): one call for both.
+func (n *helperNetnsHost) build(ctx context.Context, name string) (string, string, error) {
+	rules := cntr.BuildRulesFrom(ctx)
+	if n.fw == nil || rules == nil {
+		return n.h.RealizeNetns(ctx, name)
+	}
+	resp, err := n.fw.PrepareSandbox(ctx, &rootdpb.PrepareSandboxRequest{NetnsName: name,
+		Parts:    []string{rootdpb.PartNetns, rootdpb.PartFirewall},
+		Firewall: &rootdpb.SandboxFirewall{BlockAllEgress: rules.BlockAll, AllowCidrs: rules.Allow, DenyCidrs: rules.Deny}})
+	if err != nil {
+		return "", "", err
+	}
+	rules.MarkApplied()
+	return resp.GetNetnsPath(), resp.GetContainerIp(), nil
+}
+
+// release removes a slot: ReleaseSandbox with the firewall on, which
+// clears the address's rules first; RemoveNetns otherwise.
+func (n *helperNetnsHost) release(ctx context.Context, name, ip string, parts []string) error {
+	if n.fw == nil {
+		return n.h.RemoveNetns(ctx, name, ip)
+	}
+	return n.fw.ReleaseSandbox(ctx, &rootdpb.ReleaseSandboxRequest{NetnsName: name, ContainerIp: ip, Parts: parts})
 }
 
 // Remove sends the address the pool recorded only when it is a sandbox
 // address in the range: the helper refuses any other, and a refusal is a
 // security event, which a stale row (a backup from another machine) is
 // not. Without it the helper still removes the namespace, its attachment
-// and its lease; only that address's connection tracking is left.
+// and its lease; only that address's connection tracking (and rules, which
+// an address outside the range never had) are left.
+//
+// An address the helper's CNI has since leased to another slot is that
+// slot's now, with that slot's rules: the helper refuses to clear them, and
+// the slot is removed without its address (a stale row again).
 func (n *helperNetnsHost) Remove(ctx context.Context, slot netns.Slot) error {
 	name := slot.NetnsName()
 	if name == "" {
@@ -230,7 +274,15 @@ func (n *helperNetnsHost) Remove(ctx context.Context, slot netns.Slot) error {
 			ip = ""
 		}
 	}
-	return n.h.RemoveNetns(ctx, name, ip)
+	parts := []string{rootdpb.PartNetns, rootdpb.PartFirewall}
+	err := n.release(ctx, name, ip, parts)
+	if err != nil && n.fw != nil && ip != "" && isLeaseRefusal(err) {
+		// The helper finds the slot's own address in its namespace.
+		n.log.Warn("containerd netns teardown: the recorded address is another slot's now; releasing the slot by its own",
+			"slot_id", slot.SlotID, "netns", name, "container_ip", ip)
+		return n.release(ctx, name, "", parts)
+	}
+	return err
 }
 
 func (n *helperNetnsHost) DisableIPv6(ctx context.Context, slot netns.Slot) error {
@@ -258,6 +310,12 @@ func (n *helperNetnsHost) exists(path string) bool {
 	}
 	ok, _, err := n.h.NetnsAddrs(context.Background(), filepath.Base(path))
 	return ok || err != nil
+}
+
+// mayHaveRun: a failed helper call that the helper may have run, in part.
+func mayHaveRun(err error) bool {
+	var refused *rootclient.RefusedError
+	return !errors.As(err, &refused) && !errors.Is(err, rootclient.ErrUnsupported) && !errors.Is(err, rootclient.ErrBusy)
 }
 
 // imageBuilderFor is the image builder the API gets on the containerd

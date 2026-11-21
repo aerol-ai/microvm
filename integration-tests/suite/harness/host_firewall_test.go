@@ -213,3 +213,23 @@ func TestParseFloorChains(t *testing.T) {
 		t.Fatalf("an unparsable source made a chain: %v", got)
 	}
 }
+
+// TestParseFloorChainsFindsTheSwappedFloor (PR 5 review 2): after a floor
+// change the live floor is the subnet's -B chain (and the other one is
+// empty); the harness finds it, jumped first, from either listing.
+func TestParseFloorChainsFindsTheSwappedFloor(t *testing.T) {
+	for name, dump := range map[string]string{
+		"iptables-save": "*filter\n:AEROLVM-FLOOR-198bf064 - [0:0]\n:AEROLVM-FLOOR-198bf064-B - [0:0]\n" +
+			"-A AEROLVM-USER -j AEROLVM-FLOOR-198bf064-B\n-A AEROLVM-USER -s 10.79.0.0/16 -j ACCEPT\n" +
+			"-A AEROLVM-FLOOR-198bf064-B -s 10.79.0.0/16 -d 169.254.169.254/32 -j DROP\nCOMMIT\n",
+		"nft": "table ip filter {\n\tchain AEROLVM-USER {\n\t\tjump AEROLVM-FLOOR-198bf064-B\n\t\tip saddr 10.79.0.0/16 accept\n\t}\n" +
+			"\tchain AEROLVM-FLOOR-198bf064 {\n\t}\n" +
+			"\tchain AEROLVM-FLOOR-198bf064-B {\n\t\tip saddr 10.79.0.0/16 ip daddr 169.254.169.254 drop\n\t}\n}\n",
+	} {
+		chains := ParseFloorChains(dump)
+		c, ok := FloorFor(chains, netip.MustParseAddr("10.79.0.5"))
+		if !ok || c.Name != "AEROLVM-FLOOR-198bf064-B" || !c.Drops(netip.MustParseAddr("169.254.169.254")) || !slices.Equal(c.TopOf, []string{"AEROLVM-USER"}) {
+			t.Fatalf("%s: the live floor chain AEROLVM-FLOOR-198bf064-B = %+v %v (chains %+v)", name, c, ok, chains)
+		}
+	}
+}

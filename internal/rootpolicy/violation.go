@@ -45,6 +45,10 @@ const (
 	// The root helper's network calls (network.go).
 	RuleNetns   Rule = "netns"
 	RuleAddress Rule = "address"
+	// The root helper's firewall calls (firewall.go).
+	RuleCIDR     Rule = "cidr"
+	RuleNodePort Rule = "node_port"
+	RuleLease    Rule = "lease"
 )
 
 // Violation is a refused request: which rule, and what about the request

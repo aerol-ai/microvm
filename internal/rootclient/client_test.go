@@ -444,6 +444,7 @@ func realHelper(t testing.TB, sock string, mutate func(*rootd.Options)) *rootd.S
 	}
 	cfg := rootd.Config{
 		Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
+		Firewall: rootd.FirewallConfig{NodePorts: []rootpolicy.NodePort{{Proto: "tcp", Port: 15080}}},
 		Policy: rootpolicy.Policy{
 			Namespace: "aerolvm", Snapshotter: "overlayfs", SnapshotterRoot: "/var/lib/containerd/snap",
 			NetnsDir: "/run/netns", MovesDir: "/var/lib/sandboxd/containerd/moves",

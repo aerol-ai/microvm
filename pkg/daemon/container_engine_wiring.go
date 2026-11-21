@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -54,28 +55,52 @@ func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slo
 			return nil, fmt.Errorf("containerd cgroup parent: %w", err)
 		}
 	}
-	// Dedicated AEROLVM-USER manager for the containerd driver so its rules
-	// never collide with the docker driver's DOCKER-USER rules on a
-	// mixed-engine (migrating) host. EnsureChain bootstraps the chain and
-	// FORWARD jump; CNI-backed container networking is Phase 2 (§4).
-	ctdRules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainAerolvmUser)
-	if err != nil {
-		return nil, fmt.Errorf("create containerd netrules manager: %w", err)
-	}
-	// dockerd sets FORWARD policy to DROP and only ACCEPTs docker0; our aerolvm0
-	// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
-	// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
-	ctdRules.SetBridgeSubnet(containerdBridgeSubnet(cfg))
-	if err := ctdRules.EnsureChain(); err != nil {
-		return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
-	}
-	prepareBlockSets(ctdRules, netrules.ChainAerolvmUser, logger)
-	reassertStop := startChainReassert(ctx, ctdRules, logger)
-	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
-	var netHelper netnsHelper
+	var (
+		driver       *cntr.Driver
+		netHelper    netnsHelper
+		fence        *helperFence
+		reassertStop = func() {}
+	)
 	if helper != nil {
+		// Privilege mode split: the helper keeps the host firewall (M1 PR
+		// 5): its chains, block sets and IPv6 fence, from its own config
+		// and on its own re-assert timer, and every rule the driver asks
+		// for. Nothing here touches the kernel.
+		driver = cntr.New(cntr.FromDaemonConfig(cfg), nil, logger)
 		driver.SetRootHelper(helper)
 		netHelper = helper
+		if splitHostStepOn(cfg) {
+			fw, ok := helper.(firewallHelper)
+			if !ok {
+				return nil, errors.New("privilege mode split: this root helper client has no firewall calls")
+			}
+			var err error
+			if fence, err = bootSplitFirewall(ctx, fw, logger); err != nil {
+				return nil, err
+			}
+			if splitFirewallOn(cfg) {
+				driver.SetHostFirewall(newHelperFirewall(fw, containerdBridgeSubnet(cfg)))
+			}
+		}
+	} else {
+		// Dedicated AEROLVM-USER manager for the containerd driver so its rules
+		// never collide with the docker driver's DOCKER-USER rules on a
+		// mixed-engine (migrating) host. EnsureChain bootstraps the chain and
+		// FORWARD jump; CNI-backed container networking is Phase 2 (§4).
+		ctdRules, err := netrules.NewWithOptions(cfg.EnableNetworkRules, cfg.NetrulesBackend, netrules.ChainAerolvmUser)
+		if err != nil {
+			return nil, fmt.Errorf("create containerd netrules manager: %w", err)
+		}
+		// dockerd sets FORWARD policy to DROP and only ACCEPTs docker0; our aerolvm0
+		// bridge needs its own FORWARD ACCEPTs or all sandbox egress + peer traffic
+		// is dropped. EnsureChain installs them (below per-IP DROPs) for this subnet.
+		ctdRules.SetBridgeSubnet(containerdBridgeSubnet(cfg))
+		if err := ctdRules.EnsureChain(); err != nil {
+			return nil, fmt.Errorf("bootstrap AEROLVM-USER chain: %w", err)
+		}
+		prepareBlockSets(ctdRules, netrules.ChainAerolvmUser, logger)
+		reassertStop = startChainReassert(ctx, ctdRules, logger)
+		driver = cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
 	}
 	// Same cluster-PAT pull credential the docker client got in Run (see
 	// configureAOCRPullAuth in daemon.go). Installed here, before the warm pool
@@ -94,7 +119,7 @@ func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slo
 		"netrules_chain", netrules.ChainAerolvmUser,
 	)
 	cntr.PublishEngineTag(models.ContainerEngineContainerd)
-	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger, stopReassert: reassertStop}, nil
+	return &containerdEngineWiring{netns: netnsPool, warm: warmPool, driver: driver, logger: logger, stopReassert: reassertStop, fence: fence}, nil
 }
 
 // chainReassertInterval is the AEROLVM-USER re-assert cadence. Tests shrink it

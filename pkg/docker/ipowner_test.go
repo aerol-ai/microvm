@@ -163,9 +163,11 @@ func TestSetEgressFloorUsesTheSandboxSubnet(t *testing.T) {
 		t.Fatalf("no IPv4 subnet: %v", err)
 	}
 	// The re-assert goes to the manager: the recorder never reports the
-	// floor's DROPs as present, so it is rewritten.
+	// floor's DROPs as present, so it is rewritten. A rewrite fills the
+	// subnet's other floor chain and then empties the old one (the A/B
+	// swap): two flushes.
 	flushed := be.flushed
-	if repaired, err := c.ReassertEgressFloor(context.Background()); !repaired || err != nil || be.flushed != flushed+1 {
+	if repaired, err := c.ReassertEgressFloor(context.Background()); !repaired || err != nil || be.flushed != flushed+2 {
 		t.Fatalf("re-assert: repaired=%v err=%v flushes %d -> %d", repaired, err, flushed, be.flushed)
 	}
 }

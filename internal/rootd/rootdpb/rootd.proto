@@ -22,10 +22,12 @@ service RootHelper {
   // serves it, so it is the agent's handshake.
   rpc Version(VersionRequest) returns (VersionResponse);
 
-  // EnsureHost makes sure the host is set up for sandboxes: sysctls,
-  // br_netfilter, the base firewall tables, node guard, floor and IPv6
-  // fence. Not built yet: the helper answers Unimplemented and leaves it
-  // out of Version's features.
+  // EnsureHost makes sure the host's firewall is set up for sandboxes:
+  // bridged traffic through netfilter, the sandboxes' rule chain and its
+  // block sets, and the IPv6 fence on the sandboxes' bridge, all from the
+  // helper's own settings. It starts the helper's own timer that puts them,
+  // and the node guard and floor, back if something takes them away, and
+  // answers whether the IPv6 fence covers the sandboxes now.
   rpc EnsureHost(EnsureHostRequest) returns (EnsureHostResponse);
 
   // The calls below make the files runc, runsc and the containerd shim
@@ -93,6 +95,34 @@ service RootHelper {
   // NetnsAddrs says whether a namespace exists and lists its IPv4
   // addresses, loopback aside: the address a task started there has.
   rpc NetnsAddrs(NetnsAddrsRequest) returns (NetnsAddrsResponse);
+
+  // The calls below are the host firewall for sandboxes. The agent sends
+  // typed values: an address, a sandbox's egress CIDRs, the node ports
+  // sandboxes may reach, the node's extra deny floor. The helper checks
+  // each, renders every rule itself and touches only rules AerolVM keeps
+  // for sandbox addresses. Each call is safe to retry and to repeat.
+
+  // SetNodeGuard makes sure the node guard (the node closed to the
+  // sandboxes' range) holds, with these ports open, and puts it back if
+  // something took it away.
+  rpc SetNodeGuard(SetNodeGuardRequest) returns (SetNodeGuardResponse);
+
+  // SetEgressFloor makes sure the node-wide deny floor holds these
+  // networks, plus the cloud metadata endpoints the helper always adds.
+  rpc SetEgressFloor(SetEgressFloorRequest) returns (SetEgressFloorResponse);
+
+  // SandboxRules changes one sandbox address's rules.
+  rpc SandboxRules(SandboxRulesRequest) returns (SandboxRulesResponse);
+
+  // PrepareSandbox does a create's root work in one call: each part the
+  // request lists (see VersionResponse.parts). A helper refuses a request
+  // that carries a part, or a field, it does not know, so nothing is ever
+  // skipped without a word.
+  rpc PrepareSandbox(PrepareSandboxRequest) returns (PrepareSandboxResponse);
+
+  // ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
+  // its namespace and attachment.
+  rpc ReleaseSandbox(ReleaseSandboxRequest) returns (ReleaseSandboxResponse);
 }
 
 message VersionRequest {
@@ -112,11 +142,18 @@ message VersionResponse {
   // A call can be in the service yet missing here (a placeholder, or a
   // VM-only call on Kubernetes); the agent goes by this list.
   repeated string features = 3;
+  // The parts of PrepareSandbox and ReleaseSandbox this helper serves
+  // ("netns", "firewall"). The agent sends a part only when it is listed.
+  repeated string parts = 4;
 }
 
 message EnsureHostRequest {}
 
-message EnsureHostResponse {}
+message EnsureHostResponse {
+  // Why the IPv6 fence does not cover the sandboxes' bridge now; empty
+  // when it does.
+  string ipv6_fence_error = 1;
+}
 
 // HostEntry is one line of a container's hosts file.
 message HostEntry {
@@ -273,3 +310,98 @@ message NetnsAddrsResponse {
   // Its IPv4 addresses, loopback aside, in the kernel's link order.
   repeated string ipv4 = 2;
 }
+
+// NodePort is one port on the node that sandboxes may reach.
+message NodePort {
+  // "tcp" or "udp".
+  string proto = 1;
+  uint32 port = 2;
+  // One node address (IPv4), or empty for every address.
+  string dst = 3;
+}
+
+message SetNodeGuardRequest {
+  repeated NodePort allow = 1;
+}
+
+message SetNodeGuardResponse {
+  // The guard was missing and was put back.
+  bool repaired = 1;
+}
+
+message SetEgressFloorRequest {
+  // The node's extra deny floor: networks or addresses, IPv4 or IPv6.
+  repeated string cidrs = 1;
+}
+
+message SetEgressFloorResponse {
+  bool repaired = 1;
+}
+
+// SandboxRulesOp is one change to a sandbox address's rules.
+enum SandboxRulesOp {
+  SANDBOX_RULES_OP_UNSPECIFIED = 0;
+  SANDBOX_RULES_OP_BLOCK_EGRESS = 1;
+  SANDBOX_RULES_OP_LIFT_BLOCK_EGRESS = 2;
+  SANDBOX_RULES_OP_CLEAR_BLOCK_EGRESS = 3;
+  SANDBOX_RULES_OP_BLOCK_INGRESS = 4;
+  SANDBOX_RULES_OP_CLEAR_BLOCK_INGRESS = 5;
+  SANDBOX_RULES_OP_APPLY_EGRESS_POLICY = 6;
+  SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY = 7;
+  SANDBOX_RULES_OP_HOLD_EGRESS = 8;
+  SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS = 9;
+}
+
+message SandboxRulesRequest {
+  // The sandbox's address: one the helper's CNI leased to a sandbox for a
+  // change that restricts or opens traffic; any sandbox address for a
+  // clear.
+  string container_ip = 1;
+  SandboxRulesOp op = 2;
+  // The egress policy's networks, for the two policy ops.
+  repeated string allow_cidrs = 3;
+  repeated string deny_cidrs = 4;
+}
+
+message SandboxRulesResponse {
+  // For a block: the rule was not there and was put in.
+  bool inserted = 1;
+}
+
+// SandboxFirewall is a create's host rules.
+message SandboxFirewall {
+  bool block_all_egress = 1;
+  repeated string allow_cidrs = 2;
+  repeated string deny_cidrs = 3;
+}
+
+message PrepareSandboxRequest {
+  // The netns-pool slot the sandbox gets.
+  string netns_name = 1;
+  // Every part this request carries.
+  repeated string parts = 2;
+  // The slot's address, as the pool recorded it, when the request has no
+  // netns part (a warm slot, already realized).
+  string container_ip = 3;
+  // Part "firewall".
+  SandboxFirewall firewall = 4;
+}
+
+message PrepareSandboxResponse {
+  // Part "netns": the namespace and the address CNI gave it.
+  string netns_path = 1;
+  string container_ip = 2;
+  // Part "firewall": a block-all rule was put in (not already there).
+  bool block_inserted = 3;
+}
+
+message ReleaseSandboxRequest {
+  string netns_name = 1;
+  // The address the pool recorded for the slot; empty when none was.
+  string container_ip = 2;
+  // Every part this request carries: "firewall" clears every rule AerolVM
+  // keeps for the address, "netns" removes the namespace.
+  repeated string parts = 3;
+}
+
+message ReleaseSandboxResponse {}
