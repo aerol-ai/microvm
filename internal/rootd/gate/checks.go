@@ -7,6 +7,7 @@ import (
 
 	containersapi "github.com/containerd/containerd/api/services/containers/v1"
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
+	eventsapi "github.com/containerd/containerd/api/services/events/v1"
 	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
 	tasksapi "github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/api/types"
@@ -30,18 +31,49 @@ func checkContainerCreate(ctx context.Context, g *Gate, req proto.Message) error
 }
 
 // checkContainer runs every check on a container record: the rules, its
-// bind sources on disk, and its network namespace's owner.
+// bind sources and the paths it makes root read on disk, and its network
+// namespace's owner. The spec is decoded at most once, and not at all when
+// the memo holds the answer for these exact bytes (specmemo.go); the
+// on-disk checks run every time.
 func (g *Gate) checkContainer(ctx context.Context, c rootpolicy.Container) error {
-	if err := rootpolicy.CheckContainer(g.policy, c); err != nil {
+	checked, err := rootpolicy.CheckContainerWith(g.policy, c, g.specCheck())
+	if err != nil {
 		return err
 	}
-	if err := g.checkBinds(c); err != nil {
+	if err := g.checkBindSources(checked.BindSources); err != nil {
 		return err
 	}
-	if err := g.checkReads(c); err != nil {
+	if err := g.checkRootReads(checked.RootReads); err != nil {
 		return err
 	}
-	return g.checkNetns(ctx, c)
+	return g.checkNetns(ctx, c.ID, checked.Netns)
+}
+
+// specCheck is the memo's check, or nil (rootpolicy's own) for a gate made
+// without New.
+func (g *Gate) specCheck() rootpolicy.SpecCheck {
+	if g.specs == nil {
+		return nil
+	}
+	return g.specs.check
+}
+
+// checkContainerDelete passes every delete (the walk has checked its one
+// field) and drops the container's spec from the memo.
+func checkContainerDelete(_ context.Context, g *Gate, req proto.Message) error {
+	if g.specs != nil {
+		g.specs.drop(req.(*containersapi.DeleteContainerRequest).GetID())
+	}
+	return nil
+}
+
+// containerDeleteEnded drops the container's spec again once containerd has
+// answered the delete: a Tasks.Create checked while containerd was deleting
+// read the record still stored, and may have kept its answer.
+func containerDeleteEnded(g *Gate, req any) {
+	if g.specs != nil {
+		g.specs.drop(req.(*containersapi.DeleteContainerRequest).GetID())
+	}
 }
 
 // checkContainerUpdate allows a relabel and nothing else. The field mask
@@ -130,6 +162,27 @@ func checkTaskUpdate(_ context.Context, g *Gate, req proto.Message) error {
 	r := req.(*tasksapi.UpdateTaskRequest)
 	res := r.GetResources()
 	return rootpolicy.CheckTaskUpdate(g.policy, res.GetTypeUrl(), res.GetValue(), r.GetAnnotations())
+}
+
+// checkEventsSubscribe narrows a subscription to the agent's namespace
+// (rootpolicy.ScopeEventFilters): containerd's Subscribe sends every
+// namespace's events that match the filters. The request containerd gets
+// is the narrowed one.
+func checkEventsSubscribe(_ context.Context, g *Gate, req proto.Message) error {
+	r := req.(*eventsapi.SubscribeRequest)
+	fs, err := rootpolicy.ScopeEventFilters(g.policy, r.GetFilters())
+	if err != nil {
+		return err
+	}
+	r.Filters = fs
+	return nil
+}
+
+// keepNamespaceEvent forwards an event only from the agent's namespace.
+// The narrowed filters already ask containerd for no other; this holds
+// even if containerd sent one anyway.
+func keepNamespaceEvent(g *Gate, resp proto.Message) bool {
+	return resp.(*types.Envelope).GetNamespace() == g.policy.Namespace
 }
 
 func checkSnapshotter(_ context.Context, g *Gate, req proto.Message) error {

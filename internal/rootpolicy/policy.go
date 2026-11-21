@@ -281,6 +281,21 @@ func (p Policy) Validate() error {
 	return nil
 }
 
+// Clone returns p with lists of its own, so a change to the caller's copy
+// cannot reach a checker that keeps answers made under p (the gate's spec
+// memo).
+func (p Policy) Clone() Policy {
+	p.BindRoots = slices.Clone(p.BindRoots)
+	p.BindFiles = slices.Clone(p.BindFiles)
+	p.HelperFileRoots = slices.Clone(p.HelperFileRoots)
+	p.ForbiddenRoots = slices.Clone(p.ForbiddenRoots)
+	p.RunscConfigPaths = slices.Clone(p.RunscConfigPaths)
+	p.RuncBinaryNames = slices.Clone(p.RuncBinaryNames)
+	p.RuncRoots = slices.Clone(p.RuncRoots)
+	p.RuncShimCgroups = slices.Clone(p.RuncShimCgroups)
+	return p
+}
+
 // cgroupParent is the parent every sandbox's cgroup must sit directly under.
 func (p Policy) cgroupParent() string {
 	if p.CgroupParent != "" {

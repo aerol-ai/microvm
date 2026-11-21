@@ -37,26 +37,9 @@ type RootRead struct {
 // from. CheckContainer checks their names; the gate checks each on disk,
 // since a name in the right folder is only as good as that folder.
 func ContainerRootReads(c Container) ([]RootRead, error) {
-	var out []RootRead
-	switch {
-	case c.Runtime.Name == RuntimeRunsc:
-		var o runtimeoptions.Options
-		if err := decodeOptions(c.Runtime, &o); err != nil {
-			return nil, err
-		}
-		if p := o.GetConfigPath(); p != "" {
-			out = append(out, RootRead{Path: p, Rule: RuleRuntimeOptions})
-		}
-	case c.Runtime.Name == RuntimeRunc && (c.Runtime.OptionsTypeURL != "" || len(c.Runtime.Options) > 0):
-		var o runcoptions.Options
-		if err := decodeOptions(c.Runtime, &o); err != nil {
-			return nil, err
-		}
-		for _, p := range []string{o.GetCriuImagePath(), o.GetCriuWorkPath()} {
-			if p != "" {
-				out = append(out, RootRead{Path: p, Folder: true, Rule: RuleCheckpoint})
-			}
-		}
+	out, err := runtimeRootReads(c.Runtime)
+	if err != nil {
+		return nil, err
 	}
 	s, err := DecodeSpec(c.Spec)
 	if err != nil {
@@ -64,6 +47,32 @@ func ContainerRootReads(c Container) ([]RootRead, error) {
 	}
 	if p := s.Annotations[RestoreAnnotation]; p != "" {
 		out = append(out, RootRead{Path: p, Folder: true, Rule: RuleCheckpoint})
+	}
+	return out, nil
+}
+
+// runtimeRootReads is the runtime options' part of ContainerRootReads.
+func runtimeRootReads(r Runtime) ([]RootRead, error) {
+	var out []RootRead
+	switch {
+	case r.Name == RuntimeRunsc:
+		var o runtimeoptions.Options
+		if err := decodeOptions(r, &o); err != nil {
+			return nil, err
+		}
+		if p := o.GetConfigPath(); p != "" {
+			out = append(out, RootRead{Path: p, Rule: RuleRuntimeOptions})
+		}
+	case r.Name == RuntimeRunc && (r.OptionsTypeURL != "" || len(r.Options) > 0):
+		var o runcoptions.Options
+		if err := decodeOptions(r, &o); err != nil {
+			return nil, err
+		}
+		for _, p := range []string{o.GetCriuImagePath(), o.GetCriuWorkPath()} {
+			if p != "" {
+				out = append(out, RootRead{Path: p, Folder: true, Rule: RuleCheckpoint})
+			}
+		}
 	}
 	return out, nil
 }
