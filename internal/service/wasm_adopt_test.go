@@ -24,12 +24,13 @@ type adoptingWasmRuntime struct {
 	restoreOK map[string]bool
 	keep      map[string]bool
 	adopted   []string
+	binds     map[string][]mounts.ContainerBind // the mounts each adopted instance got
 	restored  []string
 	envSeen   map[string]map[string]string
 	finished  int
 }
 
-func (r *adoptingWasmRuntime) AdoptSandbox(_ context.Context, sb *models.Sandbox, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *adoptingWasmRuntime) AdoptSandbox(_ context.Context, sb *models.Sandbox, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.envSeen == nil {
@@ -40,6 +41,10 @@ func (r *adoptingWasmRuntime) AdoptSandbox(_ context.Context, sb *models.Sandbox
 		return nil, wasmruntime.ErrNotAdopted
 	}
 	r.adopted = append(r.adopted, sb.ID)
+	if r.binds == nil {
+		r.binds = map[string][]mounts.ContainerBind{}
+	}
+	r.binds[sb.ID] = binds
 	return &models.SandboxRuntimeState{SandboxID: sb.ID, Status: models.SandboxStatusStarted}, nil
 }
 

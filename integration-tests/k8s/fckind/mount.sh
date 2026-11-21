@@ -7,11 +7,14 @@
 # default, so a create with a mount is refused (501 mounts_unavailable) and
 # the pod keeps its process namespace unshared. Turned on
 # (worker.externalStorage.enabled), a gVisor sandbox gets an rclone mount
-# of a folder in the agent container (rclone's local backend, standing in
-# for a remote store, as OV-E2 did). What it writes must reach the store,
-# keep reaching it across an agent restart (the helper runs in the runtime
-# container's group and the next agent adopts it), and the pod's end must
-# leave no mount on the machine.
+# of an s3 remote on a MinIO pod the proof starts (../minio-store.sh).
+# sandboxd refuses rclone's local backend, which stood in for a remote
+# store here before. What it writes must reach the store, keep reaching it
+# across an agent restart (the helper runs in the runtime container's group
+# and the next agent adopts it), and the pod's end must leave no mount on
+# the machine.
+# shellcheck source-path=SCRIPTDIR source=../minio-store.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../minio-store.sh"
 proof_mount() {
   local k="kubectl --context kind-aerolvm -n aerolvm" pod=aerolvm-0 port=21294 pf="" tok id out body
   tok=$($k get secret -o json | python3 -c 'import json,sys,base64
@@ -29,7 +32,12 @@ for s in json.load(sys.stdin)["items"]:
   }
   fwdm || { say "RESULT FAIL: mount: the API never answered"; return; }
   api() { curl -sS -m 300 -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "$@"; }
-  body=$(python3 -c 'import json; print(json.dumps({"runtime": "gvisor", "image": "alpine:3.20", "mounts": [{"type": "rclone", "source": "store:/var/lib/sandboxd/ext-store", "target": "/mnt/ext", "credentials": {"rclone_conf": "[store]\ntype = local\n"}}]}))')
+  # The store, in the release's namespace, outside the worker pod.
+  # shellcheck disable=SC2086 # $k is a command and its flags
+  minio_store_up $k || { say "RESULT FAIL: mount: the test MinIO did not start"; return; }
+  say "store: MinIO at $MINIO_IP, bucket $MINIO_BUCKET"
+  body=$(python3 -c 'import json, sys; print(json.dumps({"runtime": "gvisor", "image": "alpine:3.20", "mounts": [{"type": "rclone", "source": sys.argv[1], "target": "/mnt/ext", "credentials": {"rclone_conf": sys.argv[2]}}]}))' \
+    "store:$MINIO_BUCKET" "$MINIO_RCLONE_CONF")
   # Off by default: the namespace stays unshared, so the edge container
   # cannot read the pod's command lines, and a mount is refused rather
   # than served from the worker's own disk.
@@ -42,8 +50,11 @@ for s in json.load(sys.stdin)["items"]:
   else
     say "RESULT FAIL: mount: off by default, shareProcessNamespace=${share0:-unset}, create answered: $(tr '\n' ' ' <<<"$out" | head -c 200)"
   fi
+  # The worker's egress policy shuts private addresses, MinIO's among them:
+  # it is opened the way an operator opens a private object store
+  # (networkPolicy.extraEgressCIDRs).
   helm --kube-context kind-aerolvm upgrade aerolvm charts/aerolvm -n aerolvm --reuse-values \
-    --set worker.externalStorage.enabled=true >/dev/null
+    --set worker.externalStorage.enabled=true --set "networkPolicy.extraEgressCIDRs={$MINIO_IP/32}" >/dev/null
   $k delete pod $pod --wait=true --timeout=180s >/dev/null 2>&1
   local share1="" ready1=""
   for _ in $(seq 1 150); do
@@ -60,10 +71,10 @@ for s in json.load(sys.stdin)["items"]:
   # The writer makes one file a second: rclone uploads a file 5 s after its
   # last use, so a file appended to every second never reached the store
   # while it was written (the first run's 0 lines).
-  storelines() { $k exec $pod -c agent -- sh -c 'ls /var/lib/sandboxd/ext-store 2>/dev/null | grep -c "^log-"' 2>/dev/null | tr -d ' \r'; }
+  storelines() { minio_mc ls "store/$MINIO_BUCKET/" 2>/dev/null | grep -c ' log-'; }
   helper() { $k exec $pod -c agent -- sh -c 'for p in $(pgrep -f "^rclone mount"); do echo "pid $p cgroup $(sed -n "s/^0:://p" /proc/$p/cgroup)"; done' 2>&1 | tr '\n' ' '; }
   say "mount tools in the agent image: $($k exec $pod -c agent -- sh -c 'for t in rclone sshfs mount-s3 fusermount3 mount.nfs; do command -v $t >/dev/null && printf "%s " $t || printf "MISSING-%s " $t; done' 2>&1)"
-  $k exec $pod -c agent -- sh -c 'mkdir -p /var/lib/sandboxd/ext-store && echo seed-ok > /var/lib/sandboxd/ext-store/seed.txt'
+  echo seed-ok | minio_mc pipe "store/$MINIO_BUCKET/seed.txt" >/dev/null
   out=$(api -X POST http://127.0.0.1:$port/v1/sandboxes -d "$body")
   id=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("id",""))' "$out" 2>/dev/null)
   say "mount create: $(head -c 300 <<<"$out")"
@@ -141,5 +152,6 @@ print("/spec/template/spec/containers/%d/volumeMounts/%d/mountPropagation" % (ci
   else
     say "RESULT FAIL: mount: without propagation the create answered: $(head -c 200 <<<"$out")"
   fi
+  minio_store_down
   kill $pf 2>/dev/null
 }
