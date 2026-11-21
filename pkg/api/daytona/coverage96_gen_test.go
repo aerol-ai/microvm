@@ -3,8 +3,8 @@ package daytona
 
 import (
 	"context"
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"reflect"
@@ -103,7 +103,7 @@ func cover96_ptr_handlers(recv *handlers) {
 		recv.updateIdleLifecycle(zero96[http.ResponseWriter](), zero96[*http.Request](), zero96[bool]())
 	}) // handlers.go:748
 	cover96Call(func() {
-		recv.uploadSingleFile(cover96Ctx(), zero96[string](), zero96[string](), zero96[*multipart.FileHeader]())
+		recv.uploadSingleFile(cover96Ctx(), zero96[string](), zero96[string](), zero96[*multipartspool.FileHeader]())
 	}) // toolbox.go:283
 }
 

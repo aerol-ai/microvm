@@ -102,6 +102,7 @@ func seedReadyTemplate(t *testing.T, st *store.Store, templatesDir, id string) *
 		SnapshotChecksum:   "sha256:dead|sha256:beef",
 		SnapshotVsockCID:   42,
 		HasSnapshot:        true,
+		HasOverlay:         true,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
