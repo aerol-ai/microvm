@@ -39,7 +39,8 @@ const templatePushColumns = `id, image, status, rootfs_path, rootfs_size_bytes, 
 	last_error, created_at, updated_at, ready_at,
 	snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 	snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-	has_overlay, push_state, push_error, registry_ref, push_digest`
+	has_overlay, push_state, push_error, registry_ref, push_digest,
+	snapshot_nested_virt, snapshot_nested_virt_checksum`
 
 // snapshotPushQueued is the queue predicate, as two terms. The first is
 // the literal WHERE of idx_sandbox_snapshots_push_queue, so SQLite can prove

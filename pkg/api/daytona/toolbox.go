@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -235,17 +236,21 @@ func (h *handlers) bulkUpload(w http.ResponseWriter, r *http.Request, sandboxID 
 	// Cap the whole upload so a client cannot fill the daemon's memory or
 	// temp disk during the request (S11).
 	r.Body = http.MaxBytesReader(w, r.Body, maxBulkUploadBytes)
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
+	// Parts past 64 MiB spill to a private folder for this request, never
+	// the host's shared temp folder (plans/security-gaps-m1-m4.md Q4).
+	form, err := h.deps.UploadSpool.ReadForm(r, 64<<20)
+	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	type uploadFile struct {
 		path string
-		file *multipart.FileHeader
+		file *multipartspool.FileHeader
 	}
 	files := map[string]*uploadFile{}
-	for key, values := range r.MultipartForm.Value {
+	for key, values := range form.Value {
 		match := bulkUploadField.FindStringSubmatch(key)
 		if len(match) != 3 || match[2] != "path" || len(values) == 0 {
 			continue
@@ -257,7 +262,7 @@ func (h *handlers) bulkUpload(w http.ResponseWriter, r *http.Request, sandboxID 
 		}
 		entry.path = strings.TrimSpace(values[0])
 	}
-	for key, values := range r.MultipartForm.File {
+	for key, values := range form.File {
 		match := bulkUploadField.FindStringSubmatch(key)
 		if len(match) != 3 || match[2] != "file" || len(values) == 0 {
 			continue
@@ -359,7 +364,7 @@ func downloadPartDisposition(name, targetPath string) string {
 	return fmt.Sprintf(`form-data; name=%q; filename="%s"`, name, downloadPartQuoter.Replace(targetPath))
 }
 
-func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath string, fileHeader *multipart.FileHeader) error {
+func (h *handlers) uploadSingleFile(ctx context.Context, sandboxID, targetPath string, fileHeader *multipartspool.FileHeader) error {
 	file, err := fileHeader.Open()
 	if err != nil {
 		return err

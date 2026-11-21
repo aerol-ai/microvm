@@ -356,6 +356,8 @@ type fakeClient struct {
 	mu sync.Mutex
 
 	mc       *firecracker.MachineConfig
+	cpu      *firecracker.CPUConfig
+	cpuErr   error
 	bs       *firecracker.BootSource
 	drives   map[string]firecracker.Drive
 	nics     map[string]firecracker.NetworkInterface
@@ -379,6 +381,9 @@ type fakeClient struct {
 	// placeholder.
 	drivePatches   map[string]firecracker.DrivePatch
 	networkPatches map[string]firecracker.NetworkInterfacePatch
+	// patchDriveHook runs on each PatchDrive, outside the lock; its error
+	// fails the call (Firecracker reopens the drive's file on a PATCH).
+	patchDriveHook func(id string, patch firecracker.DrivePatch) error
 
 	// restOrder captures every PUT / Action / PatchVM / Snapshot call in the order
 	// the driver issued them. Order is load-bearing for firecracker:
@@ -417,6 +422,14 @@ func (c *fakeClient) PutMachineConfig(_ context.Context, cfg firecracker.Machine
 	c.mc = &cfg
 	c.restOrder = append(c.restOrder, "PutMachineConfig")
 	return c.machineErr
+}
+
+func (c *fakeClient) PutCPUConfig(_ context.Context, cfg firecracker.CPUConfig) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cpu = &cfg
+	c.restOrder = append(c.restOrder, "PutCPUConfig")
+	return c.cpuErr
 }
 
 func (c *fakeClient) PutBootSource(_ context.Context, src firecracker.BootSource) error {
@@ -524,10 +537,17 @@ func (c *fakeClient) LoadSnapshot(_ context.Context, req firecracker.SnapshotLoa
 
 func (c *fakeClient) PatchDrive(_ context.Context, id string, patch firecracker.DrivePatch) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.drivePatches[id] = patch
 	c.restOrder = append(c.restOrder, "PatchDrive:"+id)
-	return c.drivePatchErr
+	err := c.drivePatchErr
+	hook := c.patchDriveHook
+	c.mu.Unlock()
+	if hook != nil {
+		if hErr := hook(id, patch); hErr != nil {
+			return hErr
+		}
+	}
+	return err
 }
 
 func (c *fakeClient) PatchNetworkInterface(_ context.Context, id string, patch firecracker.NetworkInterfacePatch) error {
@@ -894,6 +914,10 @@ type fakeTemplateResolver struct {
 	snapshotChecksum   string
 	snapshotVsockCID   uint32
 	resolveErr         error
+	// snapshotNestedVirt is the record the template reports when
+	// snapshotNestedVirtSet; otherwise "off", the fixture node's setting.
+	snapshotNestedVirt    firecracker.NestedVirt
+	snapshotNestedVirtSet bool
 }
 
 func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (*TemplateResolution, error) {
@@ -913,7 +937,15 @@ func (r *fakeTemplateResolver) Resolve(_ context.Context, id string) (*TemplateR
 		SnapshotStatePath:  r.snapshotStatePath,
 		SnapshotChecksum:   r.snapshotChecksum,
 		SnapshotVsockCID:   r.snapshotVsockCID,
+		SnapshotNestedVirt: r.nestedVirt(),
 	}, nil
+}
+
+func (r *fakeTemplateResolver) nestedVirt() firecracker.NestedVirt {
+	if r.snapshotNestedVirtSet {
+		return r.snapshotNestedVirt
+	}
+	return firecracker.NestedVirtOff
 }
 
 // TestCreate_TemplateHit is the Phase 2 fast-path: req.TemplateID set,

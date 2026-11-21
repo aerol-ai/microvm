@@ -96,6 +96,10 @@ type vmmRecord struct {
 	// OwnsRunDir: Destroy removes the run dir. A VM taken from the warm
 	// pool leaves its run dir to the pool, as warmDestroyHandle does.
 	OwnsRunDir bool `json:"owns_run_dir"`
+	// NestedVirt is the VM's nested-virtualization record (nested_virt.go),
+	// which its stop snapshot saves. Empty in a record from a release before
+	// it: unknown.
+	NestedVirt firecracker.NestedVirt `json:"nested_virt,omitempty"`
 }
 
 func (d *Driver) vmmRecordDir() string {
@@ -109,15 +113,16 @@ func (d *Driver) vmmRecordDir() string {
 // reads, the RSS sampler, and the record a restarted sandboxd adopts it
 // from. The maps come first, so a sampler tick never sees a pid the rest of
 // the driver does not know.
-func (d *Driver) register(sandboxID string, client VMMClient, handle VMMHandle, guestCID uint32, ownsRunDir bool) {
+func (d *Driver) register(sandboxID string, client VMMClient, handle VMMHandle, guestCID uint32, ownsRunDir bool, nestedVirt firecracker.NestedVirt) {
 	d.mu.Lock()
 	d.clients[sandboxID] = client
 	d.vmms[sandboxID] = handle
 	d.guestCID[sandboxID] = guestCID
+	d.nestedVirt[sandboxID] = nestedVirt
 	d.mu.Unlock()
 	d.rssRegister(sandboxID, handle.Pid())
 	d.placeVMM(sandboxID, handle.Pid())
-	if err := d.writeVMMRecord(sandboxID, handle, guestCID, ownsRunDir); err != nil {
+	if err := d.writeVMMRecord(sandboxID, handle, guestCID, ownsRunDir, nestedVirt); err != nil {
 		d.logger.Warn("firecracker: running VM not recorded; a sandboxd restart will stop it",
 			"sandbox_id", sandboxID, "error", err)
 	}
@@ -217,6 +222,7 @@ func (d *Driver) unregister(sandboxID string) (VMMHandle, bool) {
 	delete(d.clients, sandboxID)
 	delete(d.vmms, sandboxID)
 	delete(d.guestCID, sandboxID)
+	delete(d.nestedVirt, sandboxID)
 	delete(d.frozenAdopted, sandboxID)
 	d.mu.Unlock()
 	d.rssUnregister(sandboxID)
@@ -224,7 +230,7 @@ func (d *Driver) unregister(sandboxID string) (VMMHandle, bool) {
 	return handle, ok
 }
 
-func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uint32, ownsRunDir bool) error {
+func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uint32, ownsRunDir bool, nestedVirt firecracker.NestedVirt) error {
 	dir := d.vmmRecordDir()
 	pid := handle.Pid()
 	if dir == "" || pid <= 0 {
@@ -244,7 +250,7 @@ func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uin
 	return writeRecordFile(dir, vmmRecord{
 		SandboxID: sandboxID, PID: pid, StartTicks: ticks, BootID: boot,
 		APISocket: handle.APISocket(), RunDir: handle.RunDir(), VsockCID: guestCID,
-		OwnsRunDir: ownsRunDir,
+		OwnsRunDir: ownsRunDir, NestedVirt: nestedVirt,
 	})
 }
 
@@ -431,6 +437,7 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 	d.clients[rec.SandboxID] = client
 	d.vmms[rec.SandboxID] = handle
 	d.guestCID[rec.SandboxID] = rec.VsockCID
+	d.nestedVirt[rec.SandboxID] = rec.NestedVirt
 	if frozen {
 		d.frozenAdopted[rec.SandboxID] = frozenAdoption{client: client, runDir: rec.RunDir, cid: rec.VsockCID}
 	}

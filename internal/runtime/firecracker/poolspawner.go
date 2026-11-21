@@ -51,6 +51,7 @@ func (s *PoolSpawner) Spawn(ctx context.Context, slotID string, inputs vmmpool.S
 	handle, err := s.driver.WarmSpawn(ctx, WarmSpawnRequest{
 		SlotID:             slotID,
 		TemplateID:         inputs.TemplateID,
+		RootfsPath:         inputs.RootfsPath,
 		SnapshotMemoryPath: inputs.SnapshotMemoryPath,
 		SnapshotStatePath:  inputs.SnapshotStatePath,
 		SnapshotChecksum:   inputs.SnapshotChecksum,
