@@ -253,7 +253,11 @@ func (d *Driver) configureExportHelper(ctx context.Context, client VMMClient, ru
 	if err := client.PutMachineConfig(ctx, firecracker.MachineConfig{VcpuCount: 1, MemSizeMib: exportHelperMemMiB}); err != nil {
 		return fmt.Errorf("export VM: machine config: %w", err)
 	}
-	kernel, err := d.chrootFilePath(runDir, d.cfg.KernelImage, kernelFileName)
+	// The helper reads a sandbox's disk, which the user wrote.
+	if err := d.configureGuestCPU(ctx, client); err != nil {
+		return fmt.Errorf("export VM: %w", err)
+	}
+	kernel, err := d.chrootSharedFile(runDir, d.cfg.KernelImage, kernelFileName)
 	if err != nil {
 		return fmt.Errorf("export VM: stage kernel: %w", err)
 	}
@@ -263,7 +267,7 @@ func (d *Driver) configureExportHelper(ctx context.Context, client VMMClient, ru
 	}); err != nil {
 		return fmt.Errorf("export VM: boot source: %w", err)
 	}
-	root, err := d.chrootFilePath(runDir, helperImage, rootfsFileName)
+	root, err := d.chrootSharedFile(runDir, helperImage, rootfsFileName)
 	if err != nil {
 		return fmt.Errorf("export VM: stage its image: %w", err)
 	}
