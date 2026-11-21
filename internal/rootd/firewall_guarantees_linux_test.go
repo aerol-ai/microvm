@@ -661,8 +661,11 @@ func TestKernelPolicyWriteStopsAtDeadline(t *testing.T) {
 			if later > at {
 				t.Fatalf("the helper kept writing for a call its caller abandoned (%d -> %d rules)", at, later)
 			}
-			// The release clears what did land.
-			if _, err := c.SandboxRules(callCtx(t), &rootdpb.SandboxRulesRequest{ContainerIp: ip,
+			// The release clears what did land (on exec, rule by rule, as in
+			// single mode: seconds for a big policy on a busy machine).
+			cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer ccancel()
+			if _, err := c.SandboxRules(cctx, &rootdpb.SandboxRulesRequest{ContainerIp: ip,
 				Op: rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_CLEAR_EGRESS_POLICY}); err != nil {
 				t.Fatal(err)
 			}

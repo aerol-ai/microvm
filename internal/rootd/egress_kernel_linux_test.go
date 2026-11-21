@@ -26,8 +26,18 @@ func TestKernelBridgeProbe(t *testing.T) {
 	if err := hostnet.EnsureForwardingSysctls(); err != nil {
 		t.Skipf("bridge netfilter: %v", err)
 	}
-	// Up, as the CNI bridge plugin leaves it: a route through a bridge
-	// that is down cannot be added.
+	r := newRig(t, func(c *Config, o *Options) {
+		c.Policy.NetnsDir = k.netnsDir
+		o.Network = k
+	})
+	c := rootdpb.NewRootHelperClient(r.conn)
+	ctx := callCtx(t)
+	// A sandbox on the bridge (with the real CNI plugins, its first ADD
+	// makes the bridge), and the bridge up, as the plugin leaves it: a
+	// route through a bridge that is down cannot be added.
+	if _, err := c.RealizeNetns(ctx, &rootdpb.RealizeNetnsRequest{NetnsName: "sb-probe"}); err != nil {
+		t.Fatal(err)
+	}
 	br, err := netlink.LinkByName(k.bridge)
 	if err != nil {
 		t.Fatal(err)
@@ -35,12 +45,6 @@ func TestKernelBridgeProbe(t *testing.T) {
 	if err := netlink.LinkSetUp(br); err != nil {
 		t.Fatal(err)
 	}
-	r := newRig(t, func(c *Config, o *Options) {
-		c.Policy.NetnsDir = k.netnsDir
-		o.Network = k
-	})
-	c := rootdpb.NewRootHelperClient(r.conn)
-	ctx := callCtx(t)
 	setup, err := c.BridgeProbe(ctx, &rootdpb.BridgeProbeRequest{Op: rootdpb.BridgeProbeOp_BRIDGE_PROBE_OP_SETUP, Slot: 3})
 	if err != nil || setup.GetBridgeAbsent() || setup.GetNotReady() != "" {
 		t.Fatalf("set-up = %v, %v", setup, err)
