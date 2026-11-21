@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -86,10 +87,9 @@ var allowInterconnect atomic.Bool
 func SetSandboxInterconnect(allow bool) { allowInterconnect.Store(allow) }
 
 // SetFloor replaces the node-wide deny floor for sandboxes on subnet. An
-// empty cidrs list clears the operator's part. The flush and refill are
-// separate steps, so the floor is briefly empty while it is replaced; the
-// egress gateway's own copy of the floor (its deny_floor set) stays in
-// place throughout. A subnet seen for the first time also re-renders every
+// empty cidrs list clears the operator's part. The new floor is built in
+// the subnet's other floor chain and the jump moved to it, so the old one
+// keeps dropping until the new one is whole (renderFloor). A subnet seen for the first time also re-renders every
 // other runtime's floor, so each drops traffic to it.
 func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	if !m.Enabled() || !subnet.IsValid() {
@@ -125,20 +125,63 @@ func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	return nil
 }
 
-// renderFloor writes one floor chain: its manager's user chain jumps to it
-// first, then DROPs from its subnet to each operator floor address and,
-// with interconnect off, to every sandbox subnet registered on the node
-// (its own included). Caller holds floorMu.
+// jumpBackend finds and removes a parent chain's jumps to a child chain (a
+// bare jump is no rulespec the netlink translator renders, so a backend
+// that has its own way says so).
+type jumpBackend interface {
+	HasJump(parent, child string) (bool, error)
+	DeleteJump(parent, child string) error
+}
+
+func hasJump(m *Manager, parent, child string) (bool, error) {
+	if jb, ok := m.ipt.(jumpBackend); ok {
+		return jb.HasJump(parent, child)
+	}
+	return m.ipt.Exists("filter", parent, "-j", child)
+}
+
+func deleteJump(m *Manager, parent, child string) error {
+	if jb, ok := m.ipt.(jumpBackend); ok {
+		return jb.DeleteJump(parent, child)
+	}
+	return m.deleteUntilGone("filter", parent, "-j", child)
+}
+
+// floorSlotB is the second of a subnet's two floor chains: a floor is
+// replaced by filling the chain not in use and moving the user chain's
+// jump to it (PR 5 review), as the node guard swaps its chains, so there
+// is no moment without a floor, the cloud metadata endpoints included. The
+// first is FloorChainFor itself, the chain every earlier daemon filled.
+func floorSlotB(chain string) string { return chain + "-B" }
+
+// activeFloor is the subnet's floor chain the user chain jumps to now: the
+// one this manager last filled, else the one the kernel's user chain
+// jumps to (a process that started on a kernel an earlier one filled), or
+// "" when there is none yet.
+func activeFloor(e *floorEntry, chain string) string {
+	if cur, _ := e.m.floorChain.Load().(string); cur == chain || cur == floorSlotB(chain) {
+		return cur
+	}
+	for _, c := range []string{floorSlotB(chain), chain} {
+		if ok, err := hasJump(e.m, e.m.filterChain(), c); err == nil && ok {
+			return c
+		}
+	}
+	return ""
+}
+
+// renderFloor writes one subnet's floor: DROPs from its subnet to each
+// operator floor address and, with interconnect off, to every sandbox
+// subnet registered on the node (its own included), into the chain not in
+// use; then the user chain's first rule becomes the jump to it, and the
+// old chain's jump goes and the old chain is emptied. chain is the
+// subnet's FloorChainFor. Caller holds floorMu.
 func renderFloor(chain string, e *floorEntry) error {
 	m, fb := e.m, e.fb
-	// Before the jump goes in: a rule inserted from here on lands below it.
-	m.floorChain.Store(chain)
-	m.floorFirst.Store(true)
-	if err := fb.EnsureJumpChain(m.filterChain(), chain); err != nil {
-		return fmt.Errorf("egress floor chain: %w", err)
-	}
-	if err := fb.FlushChain(chain); err != nil {
-		return fmt.Errorf("flush egress floor: %w", err)
+	prev := activeFloor(e, chain)
+	next := chain
+	if prev == chain {
+		next = floorSlotB(chain)
 	}
 	// The shared chain an older daemon filled: nothing writes it any more,
 	// so emptying it cannot remove a floor this daemon installed. Absent on
@@ -146,11 +189,34 @@ func renderFloor(chain string, e *floorEntry) error {
 	if !m.legacyFloorEmptied.Swap(true) {
 		_ = fb.FlushChain(ChainAerolvmFloor)
 	}
+	if boot, ok := m.ipt.(bootstrapBackend); ok {
+		if err := boot.EnsureUserChain(next); err != nil {
+			return fmt.Errorf("egress floor chain: %w", err)
+		}
+	}
+	if err := fb.FlushChain(next); err != nil {
+		return fmt.Errorf("flush egress floor: %w", err)
+	}
 	src := e.subnet.String()
 	for _, dst := range floorDsts(e) {
-		if err := m.ipt.Insert("filter", chain, 1, floorDropSpec(src, dst)...); err != nil {
+		if err := m.ipt.Insert("filter", next, 1, floorDropSpec(src, dst)...); err != nil {
 			return fmt.Errorf("egress floor rule %s: %w", dst, err)
 		}
+	}
+	// Before the jump goes in: a rule inserted from here on lands below it.
+	m.floorChain.Store(next)
+	m.floorFirst.Store(true)
+	if err := fb.EnsureJumpChain(m.filterChain(), next); err != nil {
+		return fmt.Errorf("egress floor chain: %w", err)
+	}
+	if prev != "" {
+		if err := deleteJump(m, m.filterChain(), prev); err != nil {
+			return fmt.Errorf("egress floor: remove the jump to %s: %w", prev, err)
+		}
+		// Nothing jumps to prev any more, so this is tidying, not safety:
+		// prev may be gone already (a host firewall reload deleted it),
+		// and the next change flushes it before filling it anyway.
+		_ = fb.FlushChain(prev)
 	}
 	return nil
 }
@@ -198,10 +264,11 @@ func (m *Manager) ReassertFloor() (repaired bool, err error) {
 	if m == nil || !m.Enabled() {
 		return false, nil
 	}
-	chain, _ := m.floorChain.Load().(string)
-	if chain == "" {
+	active, _ := m.floorChain.Load().(string)
+	if active == "" {
 		return false, nil
 	}
+	chain := strings.TrimSuffix(active, "-B")
 	floorMu.Lock()
 	defer floorMu.Unlock()
 	e := floors[chain]
@@ -211,12 +278,12 @@ func (m *Manager) ReassertFloor() (repaired bool, err error) {
 	// Creates the chain if it is gone, so the checks below can name it (a
 	// check against a missing chain is an error, not a "no"), and keeps the
 	// jump first in the user chain.
-	if err := e.fb.EnsureJumpChain(e.m.filterChain(), chain); err != nil {
+	if err := e.fb.EnsureJumpChain(e.m.filterChain(), active); err != nil {
 		return false, fmt.Errorf("egress floor chain: %w", err)
 	}
 	src := e.subnet.String()
 	for _, dst := range floorDsts(e) {
-		ok, err := e.m.ipt.Exists("filter", chain, floorDropSpec(src, dst)...)
+		ok, err := e.m.ipt.Exists("filter", active, floorDropSpec(src, dst)...)
 		if err != nil {
 			return false, fmt.Errorf("egress floor: check the rule for %s: %w", dst, err)
 		}
