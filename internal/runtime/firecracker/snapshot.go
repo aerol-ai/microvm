@@ -228,11 +228,11 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	if err := d.configureGuestCPU(ctx, client); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: %w", err)
 	}
-	kernelAPIPath, err := d.chrootFilePath(handle.RunDir(), d.cfg.KernelImage, kernelFileName)
+	kernelAPIPath, err := d.chrootSharedFile(handle.RunDir(), d.cfg.KernelImage, kernelFileName)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: stage kernel: %w", err)
 	}
-	rootfsAPIPath, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName)
+	rootfsAPIPath, err := d.chrootSharedFile(handle.RunDir(), rootfsPath, rootfsFileName)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: stage rootfs for API: %w", err)
 	}
