@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -688,6 +689,36 @@ func TestNewDefaultsSupportedRuntimes(t *testing.T) {
 	snap := a.Snapshot()
 	if len(snap.SupportedRuntimes) != 1 || snap.SupportedRuntimes[0] != "docker" {
 		t.Fatalf("expected default [docker], got %v", snap.SupportedRuntimes)
+	}
+}
+
+// TestSupportedRuntimesAccessor: GET /v1/runtimes on a single node reads the
+// admitter's list without a Snapshot. It is the list Snapshot reports, the
+// docker default included, and a copy the caller cannot change it through.
+func TestSupportedRuntimesAccessor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		host []string
+		want []string
+	}{
+		{"defaulted", nil, []string{"docker"}},
+		{"declared", []string{"docker", "gvisor", "firecracker"}, []string{"docker", "gvisor", "firecracker"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 100, SupportedRuntimes: tc.host}, Limits{}, nil)
+			got := a.SupportedRuntimes()
+			if !slices.Equal(got, tc.want) || !slices.Equal(got, a.Snapshot().SupportedRuntimes) {
+				t.Fatalf("SupportedRuntimes = %v, want %v (snapshot %v)", got, tc.want, a.Snapshot().SupportedRuntimes)
+			}
+			got[0] = "changed"
+			if a.SupportedRuntimes()[0] != tc.want[0] {
+				t.Fatal("the returned slice aliases the admitter's list")
+			}
+		})
+	}
+	var nilAdmitter *Admitter
+	if got := nilAdmitter.SupportedRuntimes(); got != nil {
+		t.Fatalf("nil admitter = %v, want nil", got)
 	}
 }
 

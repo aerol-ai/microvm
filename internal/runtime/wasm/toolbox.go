@@ -42,6 +42,7 @@ func (d *Driver) ServeToolbox(_ context.Context, sandboxID, token string, w http
 		StreamReadLimit: d.cfg.StreamMaxMessageBytes,
 		// The code interpreter's python.wasm instances are runs too.
 		Interpreters: sandboxInterpreters{driver: d, id: sandboxID},
+		UploadSpool:  d.uploads,
 	}
 	if inst.durability == models.DurabilityDurable && d.stateKV != nil {
 		cfg.StateKV = d.stateKV

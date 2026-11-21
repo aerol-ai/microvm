@@ -40,14 +40,14 @@ func TestWarmSpawn_ValidationAndRollbackWarns(t *testing.T) {
 
 	f := newDriverFixture(t)
 	f.driver.cfg.KernelImage = ""
-	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{SlotID: "slot-1", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 3}); err == nil {
+	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{SlotID: "slot-1", RootfsPath: "r", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 3}); err == nil {
 		t.Fatal("expected missing kernel error")
 	}
 
 	f.driver.cfg.KernelImage = f.kernel
 	f.pool.nextErr = os.ErrPermission
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-bad", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 3,
+		SlotID: "slot-bad", RootfsPath: "r", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 3,
 	}); err == nil {
 		t.Fatal("expected tap allocate error")
 	}
@@ -56,9 +56,11 @@ func TestWarmSpawn_ValidationAndRollbackWarns(t *testing.T) {
 func TestWarmSpawn_TapEnsureFailureReleasesSlot(t *testing.T) {
 	f := newDriverFixture(t)
 	f.tapHost.ensureErr = os.ErrPermission
-	mem, state, sum := writeVerifyCacheFiles(t, t.TempDir(), "m", "s")
+	tplDir := t.TempDir()
+	mem, state, sum := writeVerifyCacheFiles(t, tplDir, "m", "s")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-tap-err", SnapshotMemoryPath: mem, SnapshotStatePath: state,
+		SlotID: "slot-tap-err", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state,
 		SnapshotChecksum: sum, VsockCID: 10,
 	}); err == nil || !strings.Contains(err.Error(), "tap host ensure") {
 		t.Fatalf("tap ensure: got %v", err)
@@ -67,14 +69,16 @@ func TestWarmSpawn_TapEnsureFailureReleasesSlot(t *testing.T) {
 
 func TestWarmSpawn_OverlayAndFailurePaths(t *testing.T) {
 	f := newDriverFixture(t)
-	mem, state, sum := writeVerifyCacheFiles(t, t.TempDir(), "m", "s")
+	tplDir := t.TempDir()
+	mem, state, sum := writeVerifyCacheFiles(t, tplDir, "m", "s")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	f.driver.cfg.SnapshotVerifyOnLoad = true
 	notifier := &recordingHealthNotifier{}
 	f.driver.SetTemplateHealthNotifier(notifier)
 	f.driver.snapshotVerifier = func(_, _, _ string) error { return models.ErrSnapshotCorrupt }
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID: "slot-corrupt", TemplateID: "tpl-bad",
-		SnapshotMemoryPath: mem, SnapshotStatePath: state, SnapshotChecksum: sum, VsockCID: 10,
+		RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, SnapshotChecksum: sum, VsockCID: 10,
 	}); err == nil || !strings.Contains(err.Error(), "snapshot integrity") {
 		t.Fatalf("corrupt verify: got %v", err)
 	}
@@ -85,7 +89,7 @@ func TestWarmSpawn_OverlayAndFailurePaths(t *testing.T) {
 	f.driver.snapshotVerifier = nil
 	f.vmm.startErr = os.ErrPermission
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-start", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 10,
+		SlotID: "slot-start", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 10,
 	}); err == nil || !strings.Contains(err.Error(), "vmm start") {
 		t.Fatalf("start error: got %v", err)
 	}
@@ -93,7 +97,7 @@ func TestWarmSpawn_OverlayAndFailurePaths(t *testing.T) {
 	f.vmm.startErr = nil
 	f.vmm.waitErr = os.ErrDeadlineExceeded
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-wait", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 11,
+		SlotID: "slot-wait", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 11,
 	}); err == nil || !strings.Contains(err.Error(), "wait api socket") {
 		t.Fatalf("wait error: got %v", err)
 	}
@@ -101,7 +105,7 @@ func TestWarmSpawn_OverlayAndFailurePaths(t *testing.T) {
 	f.vmm.waitErr = nil
 	f.client.snapshotLoadErr = os.ErrPermission
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-load", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 12, HasOverlay: true,
+		SlotID: "slot-load", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 12, HasOverlay: true,
 	}); err == nil || !strings.Contains(err.Error(), "LoadSnapshot") {
 		t.Fatalf("load error: got %v", err)
 	}
@@ -109,11 +113,13 @@ func TestWarmSpawn_OverlayAndFailurePaths(t *testing.T) {
 
 func TestWarmSpawn_TapRemoveOnErrorWarn(t *testing.T) {
 	f := newDriverFixture(t)
-	mem, state, _ := writeVerifyCacheFiles(t, t.TempDir(), "m", "s")
+	tplDir := t.TempDir()
+	mem, state, _ := writeVerifyCacheFiles(t, tplDir, "m", "s")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	f.tapHost.removeErr = os.ErrPermission
 	f.vmm.startErr = os.ErrPermission
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-tap-rm", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 20,
+		SlotID: "slot-tap-rm", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 20,
 	}); err == nil {
 		t.Fatal("expected start failure")
 	}
@@ -121,7 +127,7 @@ func TestWarmSpawn_TapRemoveOnErrorWarn(t *testing.T) {
 
 func TestWarmSpawn_MissingPoolAndTapHost(t *testing.T) {
 	d := New(Config{KernelImage: "/k"}, nil)
-	req := WarmSpawnRequest{SlotID: "slot-miss", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 10}
+	req := WarmSpawnRequest{SlotID: "slot-miss", RootfsPath: "r", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 10}
 	if _, err := d.WarmSpawn(context.Background(), req); err == nil || !strings.Contains(err.Error(), "TAP pool not registered") {
 		t.Fatalf("missing pool: got %v", err)
 	}
@@ -133,12 +139,14 @@ func TestWarmSpawn_MissingPoolAndTapHost(t *testing.T) {
 
 func TestWarmSpawn_SpawnFailureCleansUp(t *testing.T) {
 	f := newDriverFixture(t)
-	mem, state, _ := writeVerifyCacheFiles(t, t.TempDir(), "m", "s")
+	tplDir := t.TempDir()
+	mem, state, _ := writeVerifyCacheFiles(t, tplDir, "m", "s")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	f.driver.SetSpawner(func(Config, string) (VMMHandle, error) {
 		return nil, os.ErrPermission
 	})
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-spawn-fail", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 10,
+		SlotID: "slot-spawn-fail", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 10,
 	}); err == nil || !strings.Contains(err.Error(), "spawn handle") {
 		t.Fatalf("spawn fail: got %v", err)
 	}
@@ -168,11 +176,13 @@ func TestWarmHandle_ShutdownTapAndPoolWarn(t *testing.T) {
 
 func TestWarmSpawn_TapEnsureFailurePoolReleaseWarn(t *testing.T) {
 	f := newDriverFixture(t)
-	mem, state, _ := writeVerifyCacheFiles(t, t.TempDir(), "m", "s")
+	tplDir := t.TempDir()
+	mem, state, _ := writeVerifyCacheFiles(t, tplDir, "m", "s")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	f.tapHost.ensureErr = os.ErrPermission
 	f.pool.relErr = os.ErrPermission
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
-		SlotID: "slot-rel-warn", SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 21,
+		SlotID: "slot-rel-warn", RootfsPath: rootfs, SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 21,
 	}); err == nil || !strings.Contains(err.Error(), "tap host ensure") {
 		t.Fatalf("tap ensure: got %v", err)
 	}

@@ -24,6 +24,7 @@ func TestSnapshotTemplate_RESTErrors_Extra(t *testing.T) {
 		errStr string
 	}{
 		{"PutMachineConfig", func(c *fakeClient) { c.machineErr = os.ErrPermission }, "PutMachineConfig"},
+		{"PutCPUConfig", func(c *fakeClient) { c.cpuErr = os.ErrPermission }, "PutCPUConfig"},
 		{"PutBootSource", func(c *fakeClient) { c.bootErr = os.ErrPermission }, "PutBootSource"},
 		{"PutDrive root", func(c *fakeClient) { c.driveErr = os.ErrPermission }, "PutDrive root"},
 		{"PutNetworkInterface", func(c *fakeClient) { c.nicErr = os.ErrPermission }, "PutNetworkInterface"},

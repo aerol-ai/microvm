@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -62,33 +63,29 @@ func TestTryAcquireWarm_ExtraCoverage(t *testing.T) {
 		}
 	})
 
-	// Rootfs copy error
-	t.Run("RootfsCopyErr", func(t *testing.T) {
+	// The slot's staged rootfs is gone: the claim fails before any PATCH
+	// and hands the slot back, rather than resuming a VM whose root drive
+	// Firecracker cannot reopen.
+	t.Run("SlotRootfsMissing", func(t *testing.T) {
 		f := newDriverFixture(t)
-		stageWarmFixture(t, f)
-		// we pass a bad rootfs path so copy fails
-		tplDir := t.TempDir()
-		rootfs := filepath.Join(tplDir, "rootfs.ext4")
-		snapMem := filepath.Join(tplDir, "snapshot.memory")
-		snapState := filepath.Join(tplDir, "snapshot.state")
-		os.WriteFile(snapMem, []byte("MEM"), 0600)
-		os.WriteFile(snapState, []byte("STATE"), 0600)
-
-		f.driver.SetTemplateResolver(&fakeTemplateResolver{
-			rootfsPath:         rootfs, // doesn't exist
-			hasSnapshot:        true,
-			hasOverlay:         false,
-			snapshotMemoryPath: snapMem,
-			snapshotStatePath:  snapState,
-			snapshotVsockCID:   200,
-		})
+		pool, handle := stageWarmFixture(t, f)
+		stageWarmTemplate(t, f, false)
+		if err := os.Remove(filepath.Join(handle.runDir, rootfsFileName)); err != nil {
+			t.Fatal(err)
+		}
 
 		_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 			Image:      "alpine:3.20",
 			TemplateID: "tpl-warm",
 		}, "sb-test", "tok", nil)
-		if err == nil {
-			t.Errorf("expected rootfs copy error, got nil")
+		if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), "warm slot rootfs") {
+			t.Fatalf("expected a warm slot rootfs error, got %v", err)
+		}
+		if len(f.client.drivePatches) != 0 || len(f.client.vmStates) != 0 {
+			t.Fatalf("drive patches %v, vm states %v; want none", f.client.drivePatches, f.client.vmStates)
+		}
+		if len(pool.releaseCalls) != 1 || handle.shutdowns != 1 {
+			t.Fatalf("pool releases %v, handle shutdowns %d; want the slot released and its VM shut down", pool.releaseCalls, handle.shutdowns)
 		}
 	})
 

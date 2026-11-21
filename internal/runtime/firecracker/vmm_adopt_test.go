@@ -216,15 +216,17 @@ func TestRegisterRecordsTheVMForTheNextSandboxd(t *testing.T) {
 	stubVMMHost(t)
 	d, _, _ := adoptDriver(t)
 	handle := &fakeVMM{pid: 4242, apiSocket: "/run/vm/api.sock", runDir: filepath.Join(d.cfg.RunDir, "sb-a")}
-	d.register("sb-a", newFakeClient(), handle, 9, true)
+	d.register("sb-a", newFakeClient(), handle, 9, true, firecracker.NestedVirtOff)
 
 	rec, ok := readRecord(t, d, "sb-a")
 	want := vmmRecord{SandboxID: "sb-a", PID: 4242, StartTicks: 42420, BootID: "boot-1",
-		APISocket: "/run/vm/api.sock", RunDir: handle.runDir, VsockCID: 9, OwnsRunDir: true}
+		APISocket: "/run/vm/api.sock", RunDir: handle.runDir, VsockCID: 9, OwnsRunDir: true,
+		NestedVirt: firecracker.NestedVirtOff}
 	if !ok || rec != want {
 		t.Fatalf("record = %+v (present %v), want %+v", rec, ok, want)
 	}
-	if d.vmms["sb-a"] != handle || d.guestCID["sb-a"] != 9 || d.clients["sb-a"] == nil {
+	if d.vmms["sb-a"] != handle || d.guestCID["sb-a"] != 9 || d.clients["sb-a"] == nil ||
+		d.nestedVirt["sb-a"] != firecracker.NestedVirtOff {
 		t.Fatal("register did not fill the driver's maps")
 	}
 
@@ -235,7 +237,7 @@ func TestRegisterRecordsTheVMForTheNextSandboxd(t *testing.T) {
 	if _, ok := readRecord(t, d, "sb-a"); ok {
 		t.Fatal("unregister left the record")
 	}
-	if len(d.vmms)+len(d.clients)+len(d.guestCID) != 0 {
+	if len(d.vmms)+len(d.clients)+len(d.guestCID)+len(d.nestedVirt) != 0 {
 		t.Fatal("unregister left driver state")
 	}
 	if _, had := d.unregister("sb-a"); had {
@@ -272,7 +274,7 @@ func TestRegisterWithoutARecord(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			d.register("sb-b", newFakeClient(), &fakeVMM{pid: tc.pid}, 3, true)
+			d.register("sb-b", newFakeClient(), &fakeVMM{pid: tc.pid}, 3, true, firecracker.NestedVirtOff)
 			if d.vmms["sb-b"] == nil {
 				t.Fatal("the VM was not registered")
 			}
