@@ -516,3 +516,33 @@ func TestTemplateSnapshotLockTableEmptiesAndExcludes(t *testing.T) {
 		t.Fatalf("lock table has %d entries after everyone unlocked, want 0", left)
 	}
 }
+
+// A template snapshotted before the overlay placeholder holds its root
+// drive read-write; the driver stages template rootfs files read-only, so
+// it is saved again at start on any architecture, whatever its nested
+// virtualization record.
+func TestResaveSavesPreOverlayTemplatesAgain(t *testing.T) {
+	setTemplateGOARCH(t, "arm64")
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	old := seedReadyTemplate(t, st, templatesDir, "tpl-pre-overlay")
+	if err := st.UpdateTemplateSnapshotReady(ctx, old.ID, old.SnapshotMemoryPath, old.SnapshotStatePath,
+		old.SnapshotSizeBytes, old.SnapshotChecksum, old.SnapshotVsockCID, false, "off"); err != nil {
+		t.Fatal(err)
+	}
+	seedTemplateSavedWith(t, st, templatesDir, "tpl-current", "off")
+	snapper := &fakeTemplateSnapshotter{done: make(chan struct{}, 2), nestedVirt: "off"}
+	svc.SetTemplateSnapshotter(snapper)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+	if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+		t.Fatal("saves did not finish")
+	}
+	if snapper.calls != 1 {
+		t.Fatalf("%d saves, want 1 (the pre-overlay template only)", snapper.calls)
+	}
+	got, _ := st.GetTemplate(ctx, old.ID)
+	if got.Status != models.TemplateStatusReady || !got.HasOverlay || got.SnapshotMemoryPath == old.SnapshotMemoryPath {
+		t.Fatalf("pre-overlay template after the sweep: %+v; want ready, has_overlay, a new snapshot", got)
+	}
+}

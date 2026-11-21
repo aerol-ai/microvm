@@ -215,7 +215,7 @@ func (d *Driver) tryAcquireWarm(
 	if err := linkOrCopyRootfs(snap.RootfsPath, warmRootfsPath); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs: %w", err)
 	}
-	warmRootfsAPIPath, err := d.chrootFilePath(slot.RunDir, warmRootfsPath, rootfsFileName)
+	warmRootfsAPIPath, err := d.chrootSharedFile(slot.RunDir, warmRootfsPath, rootfsFileName)
 	if err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs for API: %w", err)
 	}

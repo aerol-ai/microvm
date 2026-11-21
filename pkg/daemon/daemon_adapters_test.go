@@ -444,10 +444,18 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 		mustCreateTemplate(&models.Template{
 			ID: "tpl-nv-" + saved, Image: "alpine", Status: models.TemplateStatusReady,
 			RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now,
-			HasSnapshot: true, SnapshotMemoryPath: "/tmp/m", SnapshotStatePath: "/tmp/s", SnapshotChecksum: "c-" + saved,
+			HasSnapshot: true, HasOverlay: true, SnapshotMemoryPath: "/tmp/m", SnapshotStatePath: "/tmp/s", SnapshotChecksum: "c-" + saved,
 			SnapshotNestedVirt: saved,
 		})
 	}
+	// Snapshotted before the overlay placeholder: its root drive is saved
+	// read-write and would not load; never warmed.
+	mustCreateTemplate(&models.Template{
+		ID: "tpl-pre-overlay", Image: "alpine", Status: models.TemplateStatusReady,
+		RootfsPath: "/tmp/rootfs.ext4", CreatedAt: now, UpdatedAt: now,
+		HasSnapshot: true, HasOverlay: false, SnapshotMemoryPath: "/tmp/m", SnapshotStatePath: "/tmp/s", SnapshotChecksum: "c-old",
+		SnapshotNestedVirt: "off",
+	})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-path", Image: "alpine", Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now, HasSnapshot: true})
 	mustCreateTemplate(&models.Template{ID: "tpl-no-snap", Image: "alpine", Status: models.TemplateStatusReadyNoSnapshot, CreatedAt: now, UpdatedAt: now, HasSnapshot: false})
 	mustCreateTemplate(&models.Template{ID: "tpl-pending", Image: "alpine", Status: models.TemplateStatusPending, CreatedAt: now, UpdatedAt: now, HasSnapshot: true, SnapshotMemoryPath: "/tmp/x", SnapshotStatePath: "/tmp/y"})
