@@ -124,6 +124,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     label: 'Runtimes',
     category: NavigationCategory.RUNTIMES,
     entries: [
+      link('/choose-isolation', '- Choose a runtime'),
       link('/container-sandbox', '- Containers (Docker)'),
       link('/gpu-sandboxes', '- GPU'),
       link('/gvisor-sandbox', '- gVisor'),
@@ -223,6 +224,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-security-overview', '- Security, end to end'),
       link('/engineering-trust-boundary', '- Where secrets live'),
       link('/engineering-isolation', '- How sandboxes are isolated'),
+      link('/engineering-nested-virtualization', '- No VMs inside sandboxes'),
       link('/engineering-sandbox-filesystem', '- What a sandbox sees on disk'),
       link('/engineering-network-defenses', '- Fencing the network'),
       link('/engineering-secret-handling', '- Keeping API keys out'),

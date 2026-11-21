@@ -38,6 +38,10 @@ type sandboxSnapshotManifest struct {
 	// in manifests written before this field existed, all by releases whose
 	// agent cannot freeze.
 	GuestFlush guestFlush `json:"guest_flush,omitempty"`
+	// NestedVirt is the setting the saved VM booted under (nested_virt.go);
+	// Start restores that CPU. Empty in manifests written before it:
+	// unknown, which counts as on.
+	NestedVirt firecracker.NestedVirt `json:"nested_virt,omitempty"`
 }
 
 // guestFlush is how the guest's freeze_fs before a Stop went.
@@ -322,6 +326,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		HasOverlay:       hasOverlay,
 		CreatedAt:        time.Now().UTC(),
 		GuestFlush:       flush,
+		NestedVirt:       d.vmNestedVirt(sandboxID),
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -535,7 +540,8 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
-	d.register(sandboxID, client, handle, manifest.VsockCID, true)
+	d.register(sandboxID, client, handle, manifest.VsockCID, true, manifest.NestedVirt)
+	d.noteKeptNestedVirt(sandboxID, manifest.NestedVirt)
 
 	tapCommitted = true
 	committed = true

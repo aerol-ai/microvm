@@ -214,6 +214,9 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"the agent as the jails' default user", map[string]string{"SB_ROOTD_AGENT_UID": "1000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
 		{"the agent as the jailer", map[string]string{"SB_ROOTD_AGENT_UID": "2000", "SB_JAILER_UID": "2000", "SB_ISOLATE_JAIL_UID": "3000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_JAILER_UID"},
 		{"a jail uid that does not parse", map[string]string{"SB_ISOLATE_JAIL_UID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
+		// 2^32 + 65531 would wrap to the agent's uid in a plain conversion.
+		{"a jail uid past uid_t", map[string]string{"SB_ROOTD_AGENT_UID": "65531", "SB_JAILER_UID": "4295032827", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_JAILER_UID=4295032827: not a uid"},
+		{"a negative jail uid", map[string]string{"SB_ISOLATE_JAIL_UID": "-1", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID=-1: not a uid"},
 		// Review H2: what root reads must not sit where the agent writes.
 		{"runsc configs in the agent's run dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd/containerd/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
 		{"the helper's state in the agent's data dir", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/sandboxd", "SB_HOST_MEMORY_MB": "1"}, nil, "which the agent writes"},

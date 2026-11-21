@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,24 @@ func TestLoadContainerEngine(t *testing.T) {
 		}
 		if cfg.ContainerdRunDir != DefaultContainerdRunDir {
 			t.Fatalf("run dir = %q, want %q", cfg.ContainerdRunDir, DefaultContainerdRunDir)
+		}
+		if cfg.ContainerdBuildContextIDBase != DefaultBuildContextIDBase {
+			t.Fatalf("build context id base = %d, want %d", cfg.ContainerdBuildContextIDBase, DefaultBuildContextIDBase)
+		}
+	})
+
+	t.Run("build context id range is configurable, edges included", func(t *testing.T) {
+		for _, base := range []string{"65536", "4294967231", "3000000000"} {
+			t.Setenv("SB_PAT_TOKEN", "operator-pat")
+			t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+			t.Setenv("SB_CONTAINERD_BUILD_CONTEXT_ID_BASE", base)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("base %s: Load: %v", base, err)
+			}
+			if got := strconv.Itoa(cfg.ContainerdBuildContextIDBase); got != base {
+				t.Fatalf("build context id base = %s, want %s", got, base)
+			}
 		}
 	})
 

@@ -450,12 +450,64 @@ func bootstrapBuildkitUnit(t *testing.T) string {
 	if end < 0 {
 		t.Fatal("the bootstrap's buildkit.service heredoc has no end")
 	}
-	socket, namespace, _ := bootstrapContainerdDefaults(t)
-	unit := strings.NewReplacer("${containerd_cfg.socket}", socket, "${containerd_cfg.namespace}", namespace).Replace(body[:end+1])
+	socket, namespace, cniDir := bootstrapContainerdDefaults(t)
+	unit := strings.NewReplacer("${containerd_cfg.socket}", socket, "${containerd_cfg.namespace}", namespace,
+		"${containerd_cfg.cni_plugin_dir}", cniDir).Replace(body[:end+1])
 	if strings.ContainsAny(unit, "$%") {
 		t.Fatalf("the bootstrap's unit has template syntax this test does not render:\n%s", unit)
 	}
 	return unit
+}
+
+// hostNetBuildkitUnit is the buildkit.service install.sh and the bootstrap
+// wrote before build steps moved to the sandboxes' CNI network: what an
+// existing node still has until a re-run rewrites it.
+const hostNetBuildkitUnit = `[Unit]
+Description=BuildKit (aerolvm containerd worker)
+Requires=containerd.service
+After=containerd.service
+
+[Service]
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=/run/containerd/containerd.sock --containerd-worker-namespace=aerolvm --containerd-worker-net=host
+Restart=on-failure
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// TestBuildkitStepsUseTheSandboxNetwork: build steps must never run on the
+// host's network, where they would reach node-local services and the cloud
+// metadata service around every sandbox firewall rule. Both writers of
+// buildkit.service put them on sandboxd's own CNI conflist, wait for it, and
+// move a node off the old host-network unit.
+func TestBuildkitStepsUseTheSandboxNetwork(t *testing.T) {
+	unit := bootstrapBuildkitUnit(t)
+	for _, want := range []string{
+		"--containerd-worker-net=cni",
+		"--containerd-cni-config-path=/etc/cni/net.d/aerolvm.conflist",
+		"ExecStartPre=/usr/bin/test -s /etc/cni/net.d/aerolvm.conflist",
+		"After=containerd.service sandboxd.service",
+		"StartLimitIntervalSec=0",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("the bootstrap's buildkit.service lacks %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, "--containerd-worker-net=host") {
+		t.Errorf("the bootstrap's buildkit.service still runs build steps on the host network:\n%s", unit)
+	}
+	tpl := readRepoFile(t, "Terraform", "templates", "bootstrap.sh.tftpl")
+	for _, want := range []string{
+		`grep -q 'Description=BuildKit (aerolvm containerd worker)' /etc/systemd/system/buildkit.service`,
+		`grep -q -- '--containerd-worker-net=host' /etc/systemd/system/buildkit.service`,
+		`if [ ! -f /etc/systemd/system/buildkit.service ] || [ -n "$${bk_restart}" ]; then`,
+		"sudo systemctl restart buildkit.service",
+	} {
+		if !strings.Contains(tpl, want) {
+			t.Errorf("the bootstrap no longer moves an old host-network unit: missing %q", want)
+		}
+	}
 }
 
 // TestInstallBuildkitMatchesTheBootstrap: a Terraform node runs install.sh
@@ -523,7 +575,10 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 		// ours, when set, is the release a buildkitd already in
 		// BUILDKIT_BIN_DIR reports (the path install.sh and the bootstrap
 		// use), with the bootstrap's unit beside it.
-		ours        string
+		ours string
+		// oldUnit, when set, replaces the unit written beside ours: what an
+		// earlier installer or bootstrap left there.
+		oldUnit     string
 		want, never []string
 		wantErr     string
 	}{
@@ -540,7 +595,17 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 		{name: "ours at an older release: stopped, replaced, started", ours: "v0.17.2", served: map[string][]byte{origin: tarball},
 			want: []string{"GET " + origin, "systemctl stop buildkit.service", "systemctl enable --now buildkit.service"}, never: []string{"daemon-reload"}},
 		{name: "ours at the pinned release: nothing downloaded or stopped", ours: version,
-			want: []string{"systemctl enable --now buildkit.service"}, never: []string{"GET ", "systemctl stop", "daemon-reload"}},
+			want: []string{"systemctl enable --now buildkit.service"}, never: []string{"GET ", "systemctl stop", "daemon-reload", "systemctl restart"}},
+		// Before v0.7.8 the unit ran build steps on the host's network. A
+		// re-run rewrites our own such unit and restarts BuildKit.
+		{name: "ours with the host-network unit: rewritten and restarted", ours: version, oldUnit: hostNetBuildkitUnit,
+			want:  []string{"systemctl daemon-reload", "systemctl enable --now buildkit.service", "systemctl restart buildkit.service"},
+			never: []string{"GET ", "systemctl stop"}},
+		// A host-network unit that is not ours (another Description) is the
+		// operator's: left alone, not restarted.
+		{name: "an operator's host-network unit is kept", ours: version,
+			oldUnit: strings.Replace(hostNetBuildkitUnit, "BuildKit (aerolvm containerd worker)", "BuildKit (ours, by hand)", 1),
+			want:    []string{"systemctl enable --now buildkit.service"}, never: []string{"daemon-reload", "systemctl restart"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -577,7 +642,11 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 					t.Fatal(err)
 				}
 				mustWrite(t, filepath.Join(bin, "buildctl"), "old buildctl\n")
-				mustWrite(t, unit, want)
+				if tc.oldUnit != "" {
+					mustWrite(t, unit, tc.oldUnit)
+				} else {
+					mustWrite(t, unit, want)
+				}
 			}
 			log := filepath.Join(dir, "calls.log")
 			script := "set -euo pipefail\nPATH='" + tools + "'\nLOG='" + log + "'\nSERVE='" + serve + "'\nTMPDIR='" + dir + "'\n" +
@@ -586,7 +655,7 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 				"uname() { echo x86_64; }\nsystemctl() { echo \"systemctl $*\" >>\"$LOG\"; }\n" +
 				fetchStubs + installShPinsDefaults(t, src) + fetchFuncs(t, src) +
 				extractShellFunc(t, src, "install_buildkit") + extractShellFunc(t, src, "buildkit_unit") +
-				extractShellFunc(t, src, "buildkit_version_at") +
+				extractShellFunc(t, src, "buildkit_version_at") + extractShellFunc(t, src, "buildkit_unit_is_ours_on_host_net") +
 				"install_buildkit\necho DONE\n"
 			cmd := exec.Command("bash", "-c", script)
 			var out, errOut strings.Builder
@@ -622,6 +691,13 @@ func TestInstallBuildkitMatchesTheBootstrap(t *testing.T) {
 			case tc.ours == version:
 				if got, _ := os.ReadFile(filepath.Join(bin, "buildctl")); string(got) != "old buildctl\n" {
 					t.Errorf("BuildKit at the pinned release was replaced: buildctl is now %q", got)
+				}
+				wantUnit := want
+				if tc.oldUnit != "" && !strings.Contains(tc.oldUnit, "BuildKit (aerolvm containerd worker)") {
+					wantUnit = tc.oldUnit // the operator's unit is kept as it was
+				}
+				if string(gotUnit) != wantUnit {
+					t.Errorf("unit after the run:\n%s\nwant:\n%s", gotUnit, wantUnit)
 				}
 			case tc.ours != "":
 				for name, body := range map[string]string{"buildkitd": "buildkitd", "buildctl": "buildctl"} {

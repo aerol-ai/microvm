@@ -25,6 +25,7 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, "snapshot.memory")
 	snapState := filepath.Join(tplDir, "snapshot.state")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	if err := os.WriteFile(snapMem, []byte("MEM"), 0o600); err != nil {
 		t.Fatalf("write snap mem: %v", err)
 	}
@@ -35,6 +36,7 @@ func TestWarmSpawn_HappyPath(t *testing.T) {
 	handle, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-001",
 		TemplateID:         "tpl-snap",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,
@@ -124,6 +126,7 @@ func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, sandboxSnapshotMemoryFileName)
 	snapState := filepath.Join(tplDir, sandboxSnapshotStateFileName)
+	rootfs := writeTemplateRootfs(t, tplDir)
 	for _, path := range []string{snapMem, snapState} {
 		if err := os.WriteFile(path, []byte("snapshot-"+filepath.Base(path)), 0o600); err != nil {
 			t.Fatalf("write %s: %v", path, err)
@@ -137,6 +140,7 @@ func TestWarmSpawn_JailerStagesSnapshotLoadPaths(t *testing.T) {
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-jail",
 		TemplateID:         "tpl-snap",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,
@@ -174,6 +178,7 @@ func TestWarmSpawn_CleansUpOnLoadFailure(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, "snapshot.memory")
 	snapState := filepath.Join(tplDir, "snapshot.state")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	if err := os.WriteFile(snapMem, []byte("MEM"), 0o600); err != nil {
 		t.Fatalf("write snap mem: %v", err)
 	}
@@ -184,6 +189,7 @@ func TestWarmSpawn_CleansUpOnLoadFailure(t *testing.T) {
 	_, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-fail",
 		TemplateID:         "tpl-snap",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,
@@ -232,8 +238,11 @@ func TestWarmSpawn_ValidatesInputs(t *testing.T) {
 		req  WarmSpawnRequest
 	}{
 		{"empty slot id", WarmSpawnRequest{SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 5}},
-		{"missing snapshot paths", WarmSpawnRequest{SlotID: "sb", VsockCID: 5}},
-		{"reserved vsock cid", WarmSpawnRequest{SlotID: "sb", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 2}},
+		{"missing snapshot paths", WarmSpawnRequest{SlotID: "sb", RootfsPath: "r", VsockCID: 5}},
+		// The snapshot's root drive is backed by the template rootfs, so a
+		// slot without it could never load.
+		{"missing template rootfs path", WarmSpawnRequest{SlotID: "sb", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 5}},
+		{"reserved vsock cid", WarmSpawnRequest{SlotID: "sb", RootfsPath: "r", SnapshotMemoryPath: "m", SnapshotStatePath: "s", VsockCID: 2}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -256,6 +265,7 @@ func TestPoolSpawner_DelegatesToWarmSpawn(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, "snapshot.memory")
 	snapState := filepath.Join(tplDir, "snapshot.state")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	if err := os.WriteFile(snapMem, []byte("MEM"), 0o600); err != nil {
 		t.Fatalf("write snap mem: %v", err)
 	}
@@ -275,6 +285,7 @@ func TestPoolSpawner_DelegatesToWarmSpawn(t *testing.T) {
 	adapter := NewPoolSpawner(f.driver)
 	handle, err := adapter.Spawn(context.Background(), "vmms-adapt-001", vmmpool.SnapshotInputs{
 		TemplateID:         "tpl-snap",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		VsockCID:           200,

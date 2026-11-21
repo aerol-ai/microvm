@@ -21,6 +21,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
@@ -139,6 +140,9 @@ type Server struct {
 	e2bTemplateMapJSON      string
 	e2bClientID             string
 	runloopBlueprintMapJSON string
+	// uploadSpool takes the facades' multipart parts too big for memory,
+	// in a folder of the daemon's own (config.UploadSpoolDir).
+	uploadSpool *multipartspool.Spool
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -204,6 +208,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
 		e2bClientID:             cfg.E2BClientID,
 		runloopBlueprintMapJSON: cfg.RunloopBlueprintMapJSON,
+		uploadSpool:             multipartspool.New(cfg.UploadSpoolDir()),
 		mux:                     http.NewServeMux(),
 		authDenied:              newAuthDeniedLimiter(),
 	}
@@ -285,6 +290,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		ContainerEngine: s.containerEngine,
 		DefaultImage:    s.daytonaDefaultImage,
 		ListGate:        s.listGate,
+		UploadSpool:     s.uploadSpool,
 	})
 
 	e2b.RegisterRoutes(mux, e2b.Deps{
@@ -304,6 +310,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:            s.audit,
 		BlueprintMapJSON: s.runloopBlueprintMapJSON,
 		ListGate:         s.listGate,
+		UploadSpool:      s.uploadSpool,
 	})
 
 	apiv1.RegisterRoutes(mux, apiv1.Deps{
