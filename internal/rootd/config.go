@@ -256,7 +256,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if interconnect && enterprise {
 		return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
 	}
-	nodePorts, err := nodePortsFromEnv(getenv, enterprise)
+	nodePorts, err := nodePortsFromEnv(getenv, enterprise, privileged)
 	if err != nil {
 		return Config{}, err
 	}
@@ -523,8 +523,44 @@ func gatewayUID(v string) (uint32, bool) {
 	return n, err == nil
 }
 
-// nodePortsFromEnv is FirewallConfig.NodePorts.
-func nodePortsFromEnv(getenv func(string) string, enterprise bool) ([]rootpolicy.NodePort, error) {
+// ingressRole reports whether SB_NODE_ROLE gives this node the ingress
+// role, read as sandboxd reads it: empty is "mixed", which includes it.
+func ingressRole(raw string) (bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return true, nil
+	}
+	ingress := false
+	for _, f := range strings.Split(raw, ",") {
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case "ingress", "mixed":
+			ingress = true
+		case "server", "worker":
+		default:
+			return false, fmt.Errorf("SB_NODE_ROLE=%q: want server, worker, ingress or mixed, comma-separated", raw)
+		}
+	}
+	return ingress, nil
+}
+
+// envBoolDefault is envBool with a default for an unset name.
+func envBoolDefault(getenv func(string) string, k string, def bool) (bool, error) {
+	if strings.TrimSpace(getenv(k)) == "" {
+		return def, nil
+	}
+	return envBool(getenv, k)
+}
+
+// nodePortsFromEnv is FirewallConfig.NodePorts, built as sandboxd's
+// single mode builds what sandboxes may reach on their node
+// (Service.SandboxNodeAllowlist), from the same settings (PR 5 review 2):
+// the egress gateway's ports only when the gateway runs
+// (SB_EGRESS_FQDN_ENABLED, never with SB_CONTAINER_PRIVILEGED); 80 and 443
+// only on an ingress node with Caddy that leaves them open to sandboxes
+// (SB_NODE_ROLE, SB_ENABLE_CADDY, SB_SANDBOX_NODE_INGRESS); and the
+// operator's SB_SANDBOX_NODE_PORTS_ALLOW. DNS is no setting: it is open
+// only to the resolvers sandboxes are handed that are this node's own,
+// read when the agent sets the guard (nodeDNSPorts).
+func nodePortsFromEnv(getenv func(string) string, enterprise, privileged bool) ([]rootpolicy.NodePort, error) {
 	dns, err := envInt(getenv, "SB_EGRESS_DNS_PORT", 53054)
 	if err != nil {
 		return nil, err
@@ -533,14 +569,35 @@ func nodePortsFromEnv(getenv func(string) string, enterprise bool) ([]rootpolicy
 	if err != nil {
 		return nil, err
 	}
-	out := []rootpolicy.NodePort{{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 53}, {Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}
-	for _, p := range []struct {
-		proto string
-		port  int
-	}{{"udp", dns}, {"tcp", dns}, {"tcp", proxy}} {
-		if p.port > 0 && p.port <= 65535 {
-			out = append(out, rootpolicy.NodePort{Proto: p.proto, Port: uint32(p.port)})
+	gateway, err := envBoolDefault(getenv, "SB_EGRESS_FQDN_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	caddy, err := envBoolDefault(getenv, "SB_ENABLE_CADDY", true)
+	if err != nil {
+		return nil, err
+	}
+	nodeIngress, err := envBoolDefault(getenv, "SB_SANDBOX_NODE_INGRESS", true)
+	if err != nil {
+		return nil, err
+	}
+	ingress, err := ingressRole(getenv("SB_NODE_ROLE"))
+	if err != nil {
+		return nil, err
+	}
+	var out []rootpolicy.NodePort
+	if gateway && !privileged {
+		for _, p := range []struct {
+			proto string
+			port  int
+		}{{"udp", dns}, {"tcp", dns}, {"tcp", proxy}} {
+			if p.port > 0 && p.port <= 65535 {
+				out = append(out, rootpolicy.NodePort{Proto: p.proto, Port: uint32(p.port)})
+			}
 		}
+	}
+	if ingress && caddy && nodeIngress {
+		out = append(out, rootpolicy.NodePort{Proto: "tcp", Port: 80}, rootpolicy.NodePort{Proto: "tcp", Port: 443})
 	}
 	raw := strings.TrimSpace(getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
 	if raw != "" && enterprise {

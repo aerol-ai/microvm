@@ -3,6 +3,7 @@ package rootd
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"slices"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
+	"github.com/aerol-ai/microvm/internal/runtime/resolvconf"
 )
 
 // The helper's firewall calls (plans/security-gaps-m1-m4.md §3.3,
@@ -245,8 +247,11 @@ func (f *firewall) setNodeGuard(ctx context.Context, req *rootdpb.SetNodeGuardRe
 	}
 	// The agent may narrow the helper's own list, never widen it (PR 5
 	// review): every port it sends must be one the helper's settings
-	// list, on every node address or on the one the agent names.
-	if err := rootpolicy.CheckNodePortsWithin(allow, f.whole.Firewall.NodePorts); err != nil {
+	// list, on every node address or on the one the agent names; DNS only
+	// on the node's own resolvers that sandboxes are handed, read now, as
+	// they change.
+	bound := append(slices.Clone(f.whole.Firewall.NodePorts), nodeDNSPorts()...)
+	if err := rootpolicy.CheckNodePortsWithin(allow, bound); err != nil {
 		return nil, refusedRule(codes.PermissionDenied, err)
 	}
 	h, _, err := f.opened()
@@ -390,4 +395,36 @@ func (f *firewall) servedParts() []string {
 		return nil
 	}
 	return slices.Clone(rootdpb.Parts())
+}
+
+// nodeDNSPorts are DNS's node ports (udp and tcp 53), each on one of this
+// node's own addresses that a resolver file sandboxes are handed names
+// (resolvconf.Generate copies the host's into containerd sandboxes), as
+// Service.SandboxNodeAllowlist opens them. A var for tests.
+var nodeDNSPorts = func() []rootpolicy.NodePort {
+	local := map[netip.Addr]bool{}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok {
+				if ip, ok := netip.AddrFromSlice(n.IP); ok && ip.Unmap().Is4() && !ip.Unmap().IsLoopback() {
+					local[ip.Unmap()] = true
+				}
+			}
+		}
+	}
+	var out []rootpolicy.NodePort
+	for _, path := range []string{resolvconf.HostPath, resolvconf.SystemdUpstreamPath} {
+		for _, ns := range resolvconf.Nameservers(path) {
+			if !ns.Is4() || !local[ns] {
+				continue
+			}
+			for _, proto := range []string{"udp", "tcp"} {
+				p := rootpolicy.NodePort{Proto: proto, Port: 53, Dst: ns.String()}
+				if !slices.Contains(out, p) {
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
 }

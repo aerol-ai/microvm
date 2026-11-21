@@ -76,7 +76,16 @@ func openFirewall(cfg Config, n NetworkHost) (FirewallHost, error) {
 	// Block sets are an optimization: without them netrules keeps
 	// per-address rules, which stay correct.
 	_ = m.PrepareBlockSets()
-	if _, err := k.SetFloor(nil); err != nil {
+	// The floor keeps everything it drops now (PR 5 review 2): an earlier
+	// helper's floor holds the operator's deny ranges, which this helper
+	// learns only when the agent next sends them. Until then its floor is
+	// its own fixed part and whatever the live one drops, a superset of
+	// both; the agent's list then replaces it.
+	live, err := m.LiveFloor(n.Subnet())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := k.SetFloor(live); err != nil {
 		return nil, fmt.Errorf("the egress floor: %w", err)
 	}
 	return k, nil

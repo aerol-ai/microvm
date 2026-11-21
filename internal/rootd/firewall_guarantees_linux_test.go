@@ -110,6 +110,33 @@ func (p *posRules) ClearCommented(chains []string, ip, comment string) error {
 	return nil
 }
 
+// ReplaceBlock is both kernel backends' policy swap: the address's rules
+// with the comment are exactly specs at pos afterwards, the new ones in
+// before the old ones out.
+func (p *posRules) ReplaceBlock(_ context.Context, chain string, pos int, ip, comment string, specs [][]string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	mine := func(r string) bool {
+		return strings.HasPrefix(r, "-s "+ip+" ") && strings.Contains(r, "--comment "+comment+" ")
+	}
+	var have []string
+	for _, r := range p.rules[chain] {
+		if mine(r) {
+			have = append(have, r)
+		}
+	}
+	add := make([]string, len(specs))
+	for i, sp := range specs {
+		add[i] = strings.Join(sp, " ")
+	}
+	if slices.Equal(have, add) {
+		return nil
+	}
+	kept := slices.DeleteFunc(slices.Clone(p.rules[chain]), mine)
+	p.rules[chain] = slices.Insert(kept, min(max(pos-1, 0), len(kept)), add...)
+	return nil
+}
+
 func (p *posRules) touch(chain string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -644,4 +671,189 @@ func TestKernelPolicyWriteStopsAtDeadline(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FloorDrops is both kernel backends' floor read: the DROPs from src.
+func (p *posRules) FloorDrops(chain string, src netip.Prefix) ([]netip.Prefix, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []netip.Prefix
+	for _, r := range p.rules[chain] {
+		f := strings.Fields(r)
+		if len(f) == 6 && f[0] == "-s" && f[1] == src.String() && f[2] == "-d" && f[5] == "DROP" {
+			out = append(out, netip.MustParsePrefix(f[3]))
+		}
+	}
+	return out, nil
+}
+
+// A helper that starts on a kernel an earlier helper filled keeps what the
+// live floor drops, the operator's ranges included, until the agent sends
+// the floor again (PR 5 review 2): a restart never opens a denied range.
+func TestFloorKeptAcrossHelperRestart(t *testing.T) {
+	rules := newPosRules()
+	denied := "-s 10.88.0.0/16 -d 203.0.113.0/24 -j DROP"
+	floorOf := func() []string {
+		user := rules.chain(netrules.ChainDockerUser)
+		if len(user) == 0 {
+			return nil
+		}
+		return rules.chain(strings.TrimPrefix(user[0], "-j "))
+	}
+	h1 := openWith(t, rules)
+	if _, err := h1.SetFloor([]netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(floorOf(), denied) {
+		t.Fatalf("helper 1's floor %q", floorOf())
+	}
+	// The restart: helper 2 opens on the same kernel, before the agent has
+	// sent it anything.
+	h2 := openWith(t, rules)
+	if got := floorOf(); !slices.Contains(got, denied) || !slices.Contains(got, "-s 10.88.0.0/16 -d 169.254.169.254/32 -j DROP") {
+		t.Fatalf("after the restart the floor drops %q", got)
+	}
+	// The agent sends the floor: its list replaces the kept one.
+	if _, err := h2.SetFloor(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := floorOf(); slices.Contains(got, denied) {
+		t.Fatalf("the agent's floor did not replace the kept one: %q", got)
+	}
+}
+
+// TestKernelHelperRestartKeepsTheFloor: the same on the real kernel, by
+// packets: a sandbox that could not reach a denied range before a helper
+// restart cannot after it either. Backend from FWREV_BACKEND.
+func TestKernelHelperRestartKeepsTheFloor(t *testing.T) {
+	needRoot(t)
+	if os.Getenv("AEROL_KT_CNI_DIR") == "" {
+		t.Skip("needs the real CNI plugins (a routed sandbox)")
+	}
+	backend := os.Getenv("FWREV_BACKEND")
+	if backend == "" {
+		backend = "netlink"
+	}
+	k := reviewKernelNet(t)
+	r1, c1 := reviewHelper(t, k, backend)
+	ctx := callCtx(t)
+	if _, err := c1.EnsureHost(ctx, &rootdpb.EnsureHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c1.SetEgressFloor(ctx, &rootdpb.SetEgressFloorRequest{Cidrs: []string{"203.0.113.0/24"}}); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := c1.RealizeNetns(ctx, &rootdpb.RealizeNetnsRequest{NetnsName: "sb-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	witness := witnessTo(t, "203.0.113.9")
+	knockFrom(sb.GetNetnsPath(), "203.0.113.9", time.Second)
+	before := witness()
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	r1.srv.Shutdown(sctx)
+	cancel()
+	_, c2 := reviewHelper(t, k, backend)
+	if _, err := c2.EnsureHost(callCtx(t), &rootdpb.EnsureHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	knockFrom(sb.GetNetnsPath(), "203.0.113.9", time.Second)
+	after := witness()
+	t.Logf("packets to a denied range past the filter table: %d with helper 1, %d after the restart", before, after)
+	if after > before {
+		t.Fatalf("after a helper restart the sandbox reached a range the floor denies (%d -> %d packets)", before, after)
+	}
+	if _, err := c2.SetEgressFloor(callCtx(t), &rootdpb.SetEgressFloorRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.ReleaseSandbox(callCtx(t), &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: sb.GetContainerIp(),
+		Parts: []string{rootdpb.PartNetns, rootdpb.PartFirewall}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestKernelPolicyChangeNeverOpens: a sandbox's allowlist changed by a
+// call that gives up half way leaves it with a whole policy, old or new,
+// on either backend: its packets to an address both lists leave out never
+// get through (PR 5 review 2). Backend from FWREV_BACKEND.
+func TestKernelPolicyChangeNeverOpens(t *testing.T) {
+	needRoot(t)
+	if os.Getenv("AEROL_KT_CNI_DIR") == "" {
+		t.Skip("needs the real CNI plugins (a routed sandbox)")
+	}
+	backend := os.Getenv("FWREV_BACKEND")
+	if backend == "" {
+		backend = "netlink"
+	}
+	k := reviewKernelNet(t)
+	_, c := reviewHelper(t, k, backend)
+	ctx := callCtx(t)
+	if _, err := c.EnsureHost(ctx, &rootdpb.EnsureHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	list := func(salt int) []string {
+		out := make([]string, rootpolicy.MaxPolicyCIDRs-1)
+		for i := range out {
+			out[i] = fmt.Sprintf("%d.%d.%d.0/24", 11+salt, i/256, i%256)
+		}
+		return out
+	}
+	lctx, lcancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer lcancel()
+	sb, err := c.PrepareSandbox(lctx, &rootdpb.PrepareSandboxRequest{NetnsName: "sb-1", Parts: []string{rootdpb.PartNetns, rootdpb.PartFirewall},
+		Firewall: &rootdpb.SandboxFirewall{AllowCidrs: list(0)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := sb.GetContainerIp()
+	count := func() int {
+		return strings.Count(shell(t, "iptables", "-w", "-S", netrules.ChainAerolvmUser), "-s "+ip+"/32")
+	}
+	witness := witnessTo(t, "203.0.113.9")
+	for i, deadline := range []time.Duration{5 * time.Millisecond, 50 * time.Millisecond, 500 * time.Millisecond} {
+		// Knock all through the change, and after it.
+		done := make(chan struct{})
+		go func() { knockFrom(sb.GetNetnsPath(), "203.0.113.9", 2*time.Second); close(done) }()
+		dctx, cancel := context.WithTimeout(context.Background(), deadline)
+		_, err = c.SandboxRules(dctx, &rootdpb.SandboxRulesRequest{ContainerIp: ip,
+			Op: rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_APPLY_EGRESS_POLICY, AllowCidrs: list(i + 1)})
+		cancel()
+		<-done
+		n := count()
+		t.Logf("change with a %v deadline: %v; %d policy rules; packets past the filter table: %d", deadline, status.Code(err), n, witness())
+		if n == 0 || witness() > 0 {
+			t.Fatalf("a policy change cut short left %s with %d policy rules, and %d packets to an address no list allows got through", ip, n, witness())
+		}
+	}
+	// The exec backend deletes a big policy rule by rule, as in single mode.
+	if _, err := c.ReleaseSandbox(lctx, &rootdpb.ReleaseSandboxRequest{NetnsName: "sb-1", ContainerIp: ip,
+		Parts: []string{rootdpb.PartNetns, rootdpb.PartFirewall}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// witnessTo counts packets to dst that left the filter table's FORWARD
+// alive (a forward chain after it).
+func witnessTo(t *testing.T, dst string) func() int {
+	for _, cmd := range []string{"add table inet fwgw", "add chain inet fwgw wit { type filter hook forward priority 10 ; }",
+		"add rule inet fwgw wit ip daddr " + dst + " counter"} {
+		shell(t, "nft", strings.Fields(cmd)...)
+	}
+	t.Cleanup(func() { _ = exec.Command("nft", "delete", "table", "inet", "fwgw").Run() })
+	return func() int {
+		out := shell(t, "nft", "list", "chain", "inet", "fwgw", "wit")
+		_, after, ok := strings.Cut(out, "counter packets ")
+		if !ok {
+			return -1
+		}
+		n, _ := strconv.Atoi(strings.Fields(after)[0])
+		return n
+	}
+}
+
+// knockFrom opens TCP connections to dst:80 from inside the namespace at
+// nsPath for d.
+func knockFrom(nsPath, dst string, d time.Duration) {
+	_ = exec.Command("nsenter", "--net="+nsPath, "--", "bash", "-c",
+		fmt.Sprintf("end=$((SECONDS+%d)); while [ $SECONDS -lt $end ]; do timeout 0.05 bash -c 'exec 3<>/dev/tcp/%s/80' 2>/dev/null; done", int(d.Seconds()), dst)).Run()
 }

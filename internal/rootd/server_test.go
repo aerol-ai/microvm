@@ -70,7 +70,7 @@ func testConfig(t testing.TB) Config {
 }
 
 func testNodePorts() []rootpolicy.NodePort {
-	p, err := nodePortsFromEnv(func(string) string { return "" }, false)
+	p, err := nodePortsFromEnv(func(string) string { return "" }, false, false)
 	if err != nil {
 		panic(err)
 	}

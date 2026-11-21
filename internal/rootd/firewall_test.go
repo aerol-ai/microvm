@@ -20,6 +20,7 @@ func TestFirewallHostCalls(t *testing.T) {
 	orig := reassertEvery
 	reassertEvery = 5 * time.Millisecond
 	t.Cleanup(func() { reassertEvery = orig })
+	withNodeDNS(t, "10.0.1.5")
 	r, c, _, fw := sandboxRig(t)
 	ctx := callCtx(t)
 	fw.fence = errors.New("no table")
@@ -156,5 +157,46 @@ func TestFirewallNotOpen(t *testing.T) {
 	}
 	if v, _ := nc.Version(ctx, &rootdpb.VersionRequest{}); len(v.GetParts()) != 0 {
 		t.Fatalf("a helper with no network lists parts %v", v.GetParts())
+	}
+}
+
+// withNodeDNS makes ns this node's own resolver handed to sandboxes, for
+// the test.
+func withNodeDNS(t *testing.T, ns string) {
+	orig := nodeDNSPorts
+	nodeDNSPorts = func() []rootpolicy.NodePort {
+		return []rootpolicy.NodePort{{Proto: "udp", Port: 53, Dst: ns}, {Proto: "tcp", Port: 53, Dst: ns}}
+	}
+	t.Cleanup(func() { nodeDNSPorts = orig })
+}
+
+// TestNodeGuardBoundIsSingleModes (PR 5 review 2): the agent may open on
+// the node only what single mode would: DNS only on the node's own
+// resolvers that sandboxes are handed, 80 and 443 only where the helper's
+// settings give them; a wider guard is refused, and nothing is written.
+func TestNodeGuardBoundIsSingleModes(t *testing.T) {
+	withNodeDNS(t, "10.0.1.5")
+	e := map[string]string{"SB_SANDBOX_NODE_INGRESS": "false"}
+	ports, err := nodePortsFromEnv(func(k string) string { return e[k] }, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn, fw := newFakeNet(), newFakeFirewall()
+	r := newRig(t, func(c *Config, o *Options) { o.Network, o.Firewall = fn, fw; c.Firewall.NodePorts = ports })
+	c := rootdpb.NewRootHelperClient(r.conn)
+	for _, p := range []*rootdpb.NodePort{
+		{Proto: "tcp", Port: 443}, {Proto: "tcp", Port: 80},
+		{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 53}, // on every node address
+		{Proto: "udp", Port: 53, Dst: "10.0.1.6"}, // an address that is no resolver
+	} {
+		_, err := c.SetNodeGuard(callCtx(t), &rootdpb.SetNodeGuardRequest{Allow: []*rootdpb.NodePort{p}})
+		wantRefusal(t, r, err, codes.PermissionDenied, string(rootpolicy.RuleNodePort))
+	}
+	if _, err := c.SetNodeGuard(callCtx(t), &rootdpb.SetNodeGuardRequest{Allow: []*rootdpb.NodePort{
+		{Proto: "udp", Port: 53, Dst: "10.0.1.5"}, {Proto: "tcp", Port: 53, Dst: "10.0.1.5"}, {Proto: "tcp", Port: 15080}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fw.recorded(); len(got) != 1 {
+		t.Fatalf("calls %q, want the one allowed guard", got)
 	}
 }

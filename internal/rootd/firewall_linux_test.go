@@ -93,6 +93,20 @@ func (m *memRules) ClearCommented(chains []string, ip, comment string) error {
 	return nil
 }
 
+// ReplaceBlock: the address's rules with the comment become specs.
+func (m *memRules) ReplaceBlock(_ context.Context, chain string, _ int, ip, comment string, specs [][]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := m.key("filter", chain)
+	m.rules[k] = slices.DeleteFunc(m.rules[k], func(r string) bool {
+		return strings.HasPrefix(r, "-s "+ip+" ") && strings.Contains(r, "--comment "+comment+" ")
+	})
+	for _, sp := range specs {
+		m.rules[k] = append(m.rules[k], strings.Join(sp, " "))
+	}
+	return nil
+}
+
 func (m *memRules) holds(sub string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
