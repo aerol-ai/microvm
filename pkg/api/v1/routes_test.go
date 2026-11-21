@@ -33,6 +33,7 @@ func TestRegisterRoutesAllUseV1Prefix(t *testing.T) {
 		path   string
 	}{
 		{method: http.MethodGet, path: "/v1/capacity"},
+		{method: http.MethodGet, path: "/v1/runtimes"},
 		{method: http.MethodGet, path: "/v1/sandboxes"},
 		{method: http.MethodGet, path: "/v1/sandboxes/abc"},
 		{method: http.MethodGet, path: "/v1/cluster/sandbox-index"},

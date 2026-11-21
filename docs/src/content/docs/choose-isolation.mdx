@@ -1,0 +1,245 @@
+---
+title: Choose a runtime
+description: Compare every way AerolVM can wall off a sandbox, and pick the right one for each sandbox you create.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A runtime is the technology that keeps a sandbox apart from the server and from other sandboxes. AerolVM offers five of them today. They trade start time and density (how many sandboxes fit on one server) against how strong the wall is.
+
+You pick the runtime for each sandbox when you create it. One server, or one cluster, can run several runtimes side by side. Your server operator decides which ones are turned on.
+
+## Pick in one minute
+
+- **Most work: a container** (`docker`). It runs any container image and is on by default. Use it for code you mostly trust.
+- **Untrusted code, same images: gVisor** (`gvisor`). It adds its own kernel layer, so code never talks to the server's kernel directly. It runs on any Linux server.
+- **The strongest wall: Firecracker** (`firecracker`). Each sandbox is a small virtual machine with its own kernel. It needs a server with hardware virtualization (`/dev/kvm`).
+- **Many tiny, fast sandboxes: WebAssembly** (`wasm`). It runs one compiled program, with no Linux inside.
+- **JavaScript web handlers: V8 isolate** (`isolate`). It runs a small `fetch` handler and starts in a few milliseconds.
+
+## Compare the runtimes
+
+### How they keep sandboxes apart
+
+| Runtime | `runtime` value | What keeps sandboxes apart | Start time on the server (median) | Density |
+|---|---|---|---|---|
+| [Container](/container-sandbox/) | `docker` | Linux namespaces and cgroups. The sandbox **shares** the server's kernel. | About 189 ms. About 31 ms from a warm pool. | Uses memory only as it needs it. A waiting warm-pool sandbox on containerd uses about 13 MB. |
+| [gVisor](/gvisor-sandbox/) | `gvisor` | A container, plus gVisor's own kernel in user space. Only a few filtered calls reach the server's kernel. | About 284 ms. About 34 ms from a warm pool. | Like a container, plus gVisor's kernel inside each sandbox. |
+| [Firecracker](/firecracker-sandbox/) | `firecracker` | A microVM with its own Linux kernel. The CPU's hardware virtualization (KVM) enforces the wall. | About 34 ms from a [template](/firecracker-templates/). 10 to 60 seconds from a plain image. | Each VM takes its full `memoryMB` when it starts. Clones of one template share the memory pages they have not changed. |
+| [WebAssembly](/wasm-sandbox/) | `wasm` | The WebAssembly engine. The module makes no system calls of its own; the server opens its network connections. | About 22 ms. | No operating system inside. Most sandboxes of one owner and module share one host process. |
+| [V8 isolate](/isolate-sandbox/) | `isolate` | A V8 isolate with its own memory, inside a jailed `workerd` process. Each tenant gets its own process. | About 4 ms, once the tenant's `workerd` process is running. | Many sandboxes of one tenant share one `workerd` process. |
+
+The start times come from our AWS test servers. Each runtime was measured on a different server type, so treat them as a rough guide. They do not include network travel time from your app. See [Performance benchmark](/performance-benchmark/) for how we measure.
+
+### What each one can do
+
+| Runtime | Save and restore | Warm pool |
+|---|---|---|
+| Container | Save its files as a [snapshot](/images-and-snapshots/#snapshots). | Yes, off by default. See [Warm pools](/warm-pools/). |
+| gVisor | No snapshots yet: gVisor keeps a sandbox's file changes in its own layer, and saving them to an image is not proven. Use a container or Firecracker sandbox when you need one. On Kubernetes, it moves to a new machine with its memory when a machine is replaced. | Yes, when gVisor is the server's default runtime. Off by default. |
+| Firecracker | Save its disk as a snapshot. Stop saves the whole VM, memory too. A template saves a booted VM. On Kubernetes, it moves with its memory. | Templates give fast starts. A pool of paused VMs exists, but is off by default. |
+| WebAssembly | With `durability: "passivatable"`, a clean server shutdown saves its memory and state to disk. | Yes, on by default: warm workers for each module. |
+| V8 isolate | None. The code bundle is the whole sandbox. | Yes, on by default: blank `workerd` processes wait for a tenant's first create. |
+
+### What each one runs
+
+| Runtime | Runs | GPU |
+|---|---|---|
+| Container | Any container image. | Yes. See [GPU](/gpu-sandboxes/). |
+| gVisor | Most container images. A few Linux features are missing. | No |
+| Firecracker | Any container image, turned into a VM disk. | No |
+| WebAssembly | One WASI module (`moduleRef`), such as a standard `python` module. No shell. | No |
+| V8 isolate | One JavaScript or TypeScript `fetch` handler (`moduleRef`). No shell, no files. | No |
+
+### Where each one runs
+
+| Runtime | Server it needs | On Kubernetes | How an operator turns it on |
+|---|---|---|---|
+| Container | Any Linux server. Also Docker on a Mac for local work. | Yes, on by default (runc). | On by default. |
+| gVisor | Any Linux server with cgroup v2 and systemd. | Yes, on by default. | Installer: `--with-gvisor`. Terraform: `with_gvisor = true` on a worker. |
+| Firecracker | A server with `/dev/kvm`: bare metal (such as AWS `c5.metal`) or a VM with nested virtualization. | Yes, with `worker.firecracker.enabled`. On EKS, use metal or an m7i, c7i, r7i, m8i, c8i or r8i node with nested virtualization on. | Installer: `--with-firecracker`. Terraform: `with_firecracker = true` and a bare-metal `instance_type`. |
+| WebAssembly | Any server. | Yes, with `worker.wasm.enabled`. | `SB_ENABLE_WASM=true`. On a cluster, `wasm.enabled: true` in `config/cluster.yml`. |
+| V8 isolate | Any server. | Yes, with `worker.isolate.enabled`. | Installer: `--with-isolate`. Terraform: `with_isolate = true` on a worker. |
+
+More options are planned. This page lists only what you can use today.
+
+## Pick a runtime for one sandbox
+
+Set `runtime` when you create the sandbox. Leave it out to get the server's default, which is `docker` unless your operator changed it.
+
+This example creates a gVisor sandbox. Change `"gvisor"` to `"docker"` or `"firecracker"` for those runtimes. The rest of the code stays the same.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      runtime: "gvisor", // or "docker", "firecracker"
+    });
+    const result = await sandbox.exec("uname -a");
+    console.log(result.stdout);
+
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    sandbox = client.create(
+        image="python:3.12-slim",
+        runtime="gvisor",  # or "docker", "firecracker"
+    )
+    result = sandbox.exec("uname -a")
+    print(result["stdout"])
+
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:   "python:3.12-slim",
+        Runtime: sdktypes.RuntimeGvisor, // or RuntimeDocker, RuntimeFirecracker
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sandbox.Destroy(ctx)
+
+    result, err := sandbox.ExecCommand(ctx, "uname -a")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        runtime: Some("gvisor".into()), // or "docker", "firecracker"
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("uname -a")?;
+    print!("{}", result.stdout);
+
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12-slim")
+            .setRuntime("gvisor") // or "docker", "firecracker"
+    );
+    ExecResult result = sandbox.exec("uname -a");
+    System.out.print(result.stdout);
+
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+### WebAssembly and V8 isolate
+
+These two do not start from a container image. They run a module, so you also pass `moduleRef`. This example runs the standard `python` WebAssembly module. For an isolate, set `runtime` to `"isolate"` and pass your bundle's reference instead (see [V8 isolate](/isolate-sandbox/#step-3-create-a-sandbox-and-call-it)).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "python", // the TypeScript SDK requires image: use the module name
+      moduleRef: "python",
+      runtime: "wasm",
+    });
+    console.log(sandbox.id);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="python",  # the Python SDK requires image: use the module name
+        module_ref="python",
+        runtime="wasm",
+    )
+    print(sandbox.id)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef: "python",
+        Runtime:   sdktypes.RuntimeWasm,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.ID)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        module_ref: Some("python".into()),
+        runtime: Some("wasm".into()),
+        ..Default::default()
+    })?;
+    println!("{}", sandbox.data.id);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions().setModuleRef("python").setRuntime("wasm")
+    );
+    System.out.println(sandbox.id);
+    ```
+  </TabItem>
+</Tabs>
+
+## When the runtime is not available
+
+A server runs only the runtimes its operator turned on. If you ask for one it does not run, the create fails and nothing is started. The error names the problem, for example:
+
+- `runtime "gvisor" not supported on this host`
+- `runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true`
+
+On a cluster, AerolVM sends each sandbox only to a worker that can run its runtime.
+
+## Good to know
+
+- **A runtime is fixed for the life of a sandbox.** To change it, create a new sandbox.
+- **`kata` is a reserved name.** A create that asks for it fails with `runtime not yet implemented on this build`.
+- **The API calls containers `docker`,** whether the server runs Docker or containerd underneath. See [Docker or containerd](/container-sandbox/#docker-or-containerd).
+
+## For server operators
+
+- **The default runtime.** `SB_CONTAINER_RUNTIME` sets what a create gets when it names none (`docker` unless you change it). On Kubernetes, use `worker.defaultRuntime`: `docker` (runc) or `gvisor`. The container warm pool keeps sandboxes ready in this runtime.
+- **One kind of runtime per node pool.** On Kubernetes cluster mode, set `runtimes` on a worker pool, such as `[gvisor]`, to limit what its workers run. See [Helm values](/kubernetes/values/#worker-pools).
+- **Install flags and settings.** See [Installer options](/getting-started/installer-options/#add-more-kinds-of-sandbox) for one server, and [Cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional) for Terraform.
+
+## Next steps
+
+- [How sandboxes are isolated](/engineering-isolation/): the full security design behind each wall.
+- [Runtime layers](/engineering-runtime-layers/): why AerolVM drives Firecracker itself, and how the runtimes relate.
+- [Warm pools](/warm-pools/): keep container sandboxes ready for your images.
+- [Firecracker templates](/firecracker-templates/): start microVMs in milliseconds.

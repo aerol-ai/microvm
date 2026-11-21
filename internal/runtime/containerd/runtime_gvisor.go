@@ -8,15 +8,17 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
 // runscShimName is the containerd runtime handler for gVisor (runsc).
-const runscShimName = "io.containerd.runsc.v1"
+const runscShimName = rootpolicy.RuntimeRunsc
 
 // runscOptionsTypeUrl is the discriminator the runsc shim requires INSIDE
 // runtimeoptions.Options (its TypeUrl field, not the protobuf Any URL); the
 // shim rejects any other value with "unsupported option type".
-const runscOptionsTypeUrl = "io.containerd.runsc.v1.options"
+const runscOptionsTypeUrl = rootpolicy.RunscOptionsTypeURL
 
 func containerdRuntimeName(ociRuntime string) string {
 	if ociRuntime == "runsc" {
@@ -59,8 +61,8 @@ func (d *Driver) runscRuntimeOpts(restore bool) (interface{}, error) {
 // by the first cluster-3-mixed-gvisor bench; reproduces with plain ctr too).
 // Every AerolVM sandbox is one container == one gvisor sandbox, so declaring
 // it a sandbox container is semantically exact.
-const criContainerTypeAnnotation = "io.kubernetes.cri.container-type"
-const criContainerTypeSandbox = "sandbox"
+const criContainerTypeAnnotation = rootpolicy.CRIContainerTypeAnnotation
+const criContainerTypeSandbox = rootpolicy.CRIContainerTypeSandbox
 
 // runscSandboxAnnotationOpt returns the spec opt every runsc container needs.
 func runscSandboxAnnotationOpt() oci.SpecOpts {

@@ -99,6 +99,27 @@ var newerSchemaMigrations = []schemaMigration{
 		}
 		return nil
 	}},
+	// 15: the SB_FIRECRACKER_NESTED_VIRT setting each template's snapshot
+	// VM booted under ("off", "on"; see pkg/firecracker.NestedVirt), and the
+	// snapshot checksum it was recorded with. A snapshot load restores the
+	// CPU flags the VM saved, so a node loads a template's snapshot only
+	// where the setting matches. Added columns only: the previous release
+	// ignores them, and their default "" is what every older row means
+	// (saved before the setting existed). Safe at open, no backfill. The
+	// checksum covers a rollback: the previous release re-saves a snapshot
+	// without touching either column, the checksums then differ, and
+	// scanTemplate reads the record as unknown.
+	{number: 15, name: "template_snapshot_nested_virt", n1Safe: true, applyTx: func(ctx context.Context, tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE firecracker_templates ADD COLUMN snapshot_nested_virt TEXT NOT NULL DEFAULT '';`,
+			`ALTER TABLE firecracker_templates ADD COLUMN snapshot_nested_virt_checksum TEXT NOT NULL DEFAULT '';`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // ErrSchemaFromNewerRelease is Open's error for a database on which a newer

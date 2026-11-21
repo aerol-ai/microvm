@@ -288,7 +288,13 @@ type Service struct {
 	// templateRebuildWG tracks in-flight snapshot rebuilds so their filesystem
 	// work can be joined before the templates directory is torn down.
 	templateRebuildWG sync.WaitGroup
-	testAuditFetcher  cluster.AuditPeerFetcher
+	// templateSnapshotLocks holds a lock per template id while anyone holds
+	// or waits on it, taken around each VM that saves a template's
+	// snapshot (lockTemplateSnapshot). templateSnapshotLocksMu guards the
+	// map and each entry's refs.
+	templateSnapshotLocksMu sync.Mutex
+	templateSnapshotLocks   map[string]*templateSnapshotLock
+	testAuditFetcher        cluster.AuditPeerFetcher
 	// nodeRetirements caches the operator storage-destruction attestations
 	// consulted by the delete-outbox pass. See node_storage_retirement.go.
 	nodeRetirementMu sync.Mutex
@@ -576,6 +582,10 @@ type Service struct {
 	warmPoolApplied  string
 	warmPoolKick     chan struct{}
 	warmPoolKickOnce sync.Once
+
+	// runtimeOffers caches the cluster's runtime offers for GET
+	// /v1/runtimes (runtimes.go).
+	runtimeOffers runtimeOffersCache
 
 	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
 	// index the request path reads; apiTokenMirror is the token copy on a

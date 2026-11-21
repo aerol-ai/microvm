@@ -220,7 +220,7 @@ func TestDestroyCleansUpAFrozenWarmVM(t *testing.T) {
 	t.Cleanup(func() { _ = proc.Process.Kill() })
 	spawned := &warmSpawned{pid: proc.Process.Pid}
 	d := New(Config{}, nil)
-	d.register("sb-warm", newFakeClient(), &warmDestroyHandle{spawned: spawned}, 9, false)
+	d.register("sb-warm", newFakeClient(), &warmDestroyHandle{spawned: spawned}, 9, false, firecracker.NestedVirtOff)
 
 	if err := d.Destroy(context.Background(), &models.Sandbox{ID: "sb-warm"}); err != nil {
 		t.Fatal(err)
