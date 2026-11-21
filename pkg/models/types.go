@@ -1983,6 +1983,11 @@ type Template struct {
 	// post-load — only PATCH an existing one's backing path. Operators
 	// rebuild the template via POST /v1/templates to upgrade.
 	HasOverlay bool `json:"has_overlay"`
+	// SnapshotNestedVirt is the SB_FIRECRACKER_NESTED_VIRT setting the
+	// snapshot's VM booted under: "off", "on", or "" for a snapshot saved
+	// before the setting was recorded (pkg/firecracker.NestedVirt). Server
+	// side only.
+	SnapshotNestedVirt string `json:"-"`
 	// PushState reflects the AOCR-push lifecycle for this template's
 	// artifacts (Phase 6 PR 6-B.1). See the TemplatePushState* constants.
 	// When push is disabled (or this is a warm-upgrade row) the value is

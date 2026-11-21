@@ -45,6 +45,10 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotTemplate: %v", err)
 	}
+	if result.NestedVirt != string(firecracker.NestedVirtOff) || f.client.cpu == nil {
+		t.Fatalf("SnapshotTemplate recorded %q (cpu config %v); every clone restores this VM's CPU, so it must hide nested virtualization and say so",
+			result.NestedVirt, f.client.cpu)
+	}
 
 	// REST wire ordering — firecracker rejects out-of-order requests on
 	// real hardware. The fakeClient permits anything, so this is the
@@ -52,6 +56,7 @@ func TestSnapshotTemplate_HappyPath(t *testing.T) {
 	// through sendVsockOp, which is best-effort and not on this client.
 	want := []string{
 		"PutMachineConfig",
+		"PutCPUConfig",
 		"PutBootSource",
 		"PutDrive:" + rootDriveID,
 		"PutDrive:" + overlayDriveID,

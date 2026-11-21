@@ -255,7 +255,7 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	_, _ = st.GetTemplate(ctx, "missing")
 	_, _ = st.ListTemplates(ctx)
 	_ = st.UpdateTemplateStatus(ctx, "tpl-1", models.TemplateStatus("ready"), "err", "build_log", 0)
-	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-1", "img", "snap", 100, "rootfs", 0, false)
+	_ = st.UpdateTemplateSnapshotReady(ctx, "tpl-1", "img", "snap", 100, "rootfs", 0, false, "")
 	_ = st.UpdateTemplateSnapshotFailed(ctx, "tpl-1", "error")
 	_, _ = st.MarkTemplateUnhealthy(ctx, "tpl-1", "error")
 	_, _ = st.MarkTemplatePushPending(ctx, "tpl-1")

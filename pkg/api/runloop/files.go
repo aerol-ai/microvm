@@ -203,25 +203,23 @@ func (h *handlers) writeFileContents(w http.ResponseWriter, r *http.Request, dev
 
 // uploadFile takes the SDK's multipart form (fields `path` and `file`).
 // Nothing pins the part order — `file` may come before `path` — so the
-// form is parsed whole rather than streamed; parts past 32 MiB spool to
-// temp files instead of memory.
+// form is parsed whole rather than streamed; parts past 32 MiB spool to a
+// private folder for this request, never the host's shared temp folder
+// (plans/security-gaps-m1-m4.md Q4).
 func (h *handlers) uploadFile(w http.ResponseWriter, r *http.Request, devboxID string) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	form, err := h.deps.UploadSpool.ReadForm(r, 32<<20)
+	if err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
 		return
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
+	defer func() { _ = form.RemoveAll() }()
 	target, err := h.resolvePath(r.Context(), devboxID, r.FormValue("path"))
 	if err != nil {
 		h.writeToolboxError(w, err)
 		return
 	}
-	file, header, err := r.FormFile("file")
+	file, header, err := form.FormFile("file")
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "file is required")
 		return
