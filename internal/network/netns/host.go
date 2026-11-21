@@ -12,6 +12,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/network/hostnet"
+	"github.com/aerol-ai/microvm/internal/network/nsbuild"
 	"github.com/aerol-ai/microvm/internal/store"
 )
 
@@ -56,50 +57,16 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 		return "", "", err
 	}
 	// One name for the netns AND the CNI container id; Remove derives the same
-	// name back from the recorded path (Slot.netnsName).
-	name := slot.netnsName()
-	// Create a REAL network namespace, not just a directory: the CNI plugin and
-	// the containerd shim both open this path as a netns. createNetns bind-
-	// mounts a fresh netns at <root>/<name>; a plain mkdir'd directory makes
-	// CNI ADD fail with a bare "exit status 1" (the plugin cannot enter a dir).
-	if err := h.createNetns(ctx, name); err != nil {
-		return "", "", fmt.Errorf("netns host: create netns %s: %w", name, err)
-	}
-	// A fresh netns has loopback DOWN, and the CNI runner invokes only the bridge
-	// plugin (cni.resolve reduces the conflist to plugins[0]), so nothing brings
-	// lo up. Without this, 127.0.0.1 / localhost TCP inside the sandbox times out
-	// even though a service binds 0.0.0.0 — breaking any app that dials localhost
-	// (postgres, redis, dev servers, multi-process apps). Do it before CNI ADD so
-	// the namespace is fully usable the instant the container attaches; roll back
-	// the netns on failure, mirroring the CNI ADD path below.
-	if err := h.bringLoopbackUp(ctx, name); err != nil {
-		_ = h.deleteNetns(ctx, name)
-		return "", "", fmt.Errorf("netns host: loopback up %s: %w", name, err)
-	}
-	path := filepath.Join(root, name)
-	// IPv6 off before the sandbox's interface exists: "default" is what the
-	// veth CNI ADD creates in here starts with, so it never gets a
-	// link-local address a neighbour on the bridge could reach (every host
-	// rule between sandboxes is IPv4). Prewarmed slots come through here
-	// too.
-	if err := disableIPv6InNetns(path); err != nil {
-		_ = h.deleteNetns(ctx, name)
-		return "", "", fmt.Errorf("netns host: disable ipv6 in %s: %w", name, err)
-	}
-	res, err := h.Runner.Add(ctx, path, name)
-	if err != nil {
-		_ = h.deleteNetns(ctx, name)
-		return "", "", fmt.Errorf("netns host: cni add: %w", err)
-	}
-	// And again after: IPAM turns IPv6 back on for an interface it gives an
-	// IPv6 address (an operator conflist with a v6 range). "all" switches
-	// it off on every interface there. The ADD succeeded, so a failure
-	// here undoes all of it, as Remove would.
-	if err := disableIPv6InNetns(path); err != nil {
-		rmErr := h.Remove(ctx, Slot{SlotID: slot.SlotID, SandboxID: slot.SandboxID, NetnsPath: path, ContainerIP: res.IP4})
-		return "", "", errors.Join(fmt.Errorf("netns host: disable ipv6 in %s after cni add: %w", name, err), rmErr)
-	}
-	return path, res.IP4, nil
+	// name back from the recorded path (Slot.netnsName). The steps are
+	// nsbuild's, which the root helper runs too (privilege mode split).
+	return h.steps().Realize(ctx, slot.netnsName())
+}
+
+// steps are the build and teardown steps with this Host's own (test
+// seams included).
+func (h *Host) steps() nsbuild.Steps {
+	return nsbuild.Steps{Runner: h.Runner, Root: h.netnsRoot(), Create: h.createNetns,
+		LoopbackUp: h.bringLoopbackUp, Delete: h.deleteNetns, DisableIPv6: disableIPv6InNetns}
 }
 
 // disableIPv6InNetns turns IPv6 off inside a sandbox netns. A var because
@@ -181,19 +148,7 @@ func (h *Host) Remove(ctx context.Context, slot Slot) error {
 	if path == "" {
 		path = filepath.Join(h.netnsRoot(), name)
 	}
-	delErr := h.Runner.Del(ctx, path, name)
-	// The bridge plugin's DEL removes the masquerade chain only for addresses
-	// it still finds on the container interface. gVisor (runsc, network=sandbox)
-	// moves the address into its own netstack and deletes it from that
-	// interface at start, so for every gVisor sandbox DEL finds nothing and the
-	// chain plus its POSTROUTING jump stay behind. Tear them down by identity.
-	var masqErr error
-	if t, ok := h.Runner.(cni.IPMasqTeardown); ok {
-		masqErr = t.TeardownIPMasq(ctx, name, slot.ContainerIP)
-	}
-	_ = hostnet.FlushConntrackForIP(slot.ContainerIP)
-	rmErr := h.deleteNetns(ctx, name)
-	return errors.Join(delErr, masqErr, rmErr)
+	return h.steps().Remove(ctx, name, path, slot.ContainerIP)
 }
 
 func (h *Host) netnsPathFor(name string) string {

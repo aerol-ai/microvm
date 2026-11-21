@@ -298,7 +298,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 
 	containerIP := strings.TrimSpace(prepaidIP)
 	if containerIP == "" {
-		containerIP, err = containerIPv4FromTaskFn(ctx, task)
+		containerIP, err = d.taskAddress(ctx, task)
 		if err != nil {
 			return nil, err
 		}

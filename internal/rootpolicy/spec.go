@@ -473,12 +473,11 @@ func checkNamespaces(p Policy, nss []specs.LinuxNamespace) error {
 
 // CheckNetnsPath allows a network namespace only at <NetnsDir>/<name>, where
 // name is a valid sandbox or slot ID: the namespaces the netns pool makes.
-// It checks the form only: any named namespace there passes, another
-// sandbox's or a CNI pod's included. Binding a namespace to its sandbox is
-// the gate's NetnsBinding, once the helper owns the netns pool (T2). Until
-// then a broken agent can put one sandbox in another's namespace, which
-// gains it no root: it already reaches every sandbox on its node
-// (plans/security-gaps-m1-m4.md, R9).
+// It checks the form only. That the namespace there is one the helper
+// made is the gate's NetnsBinding; which sandbox's it is stays the agent
+// pool's to say, so a broken agent can put one sandbox in another's
+// namespace, which gains it no root: it already reaches every sandbox on
+// its node (plans/security-gaps-m1-m4.md, R9).
 func CheckNetnsPath(p Policy, nsPath string) error {
 	if !cleanAbs(nsPath) || path.Dir(nsPath) != p.NetnsDir {
 		return violate(RuleHostNamespace, "network namespace %q is not directly under %s", nsPath, p.NetnsDir)

@@ -298,3 +298,39 @@ func TestRun(t *testing.T) {
 		t.Fatalf("run = %v", err)
 	}
 }
+
+// TestNetnsBindingWaitsForTheServer: the gate is built before the server
+// it asks; until the server is set, no namespace is vouched for.
+func TestNetnsBindingWaitsForTheServer(t *testing.T) {
+	var b netnsBinding
+	if ok, err := b.Bound(context.Background(), "aerol-netns-0", "sb-1"); ok || err == nil {
+		t.Fatalf("an unset binding = %v, %v", ok, err)
+	}
+	env := helperEnv(t, shortDir(t), "aerolvm")
+	// No CNI plugins, wherever the test runs (a node with /opt/cni/bin
+	// would open the network, and vouch for nothing without an error).
+	noCNI := filepath.Join(t.TempDir(), "no-cni")
+	cfg, err := rootd.ConfigFromEnv(func(k string) string {
+		if k == "SB_CONTAINERD_CNI_PLUGIN_DIR" {
+			return noCNI
+		}
+		return env(k)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := rootd.New(cfg, rootd.Options{
+		Containerd: func(any, grpc.ServerStream) error { return nil },
+		Peer:       egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	b.srv.Store(srv)
+	// This server has no network configuration, so it vouches for nothing,
+	// and says why.
+	if ok, err := b.Bound(context.Background(), "aerol-netns-0", "sb-1"); ok || err == nil || !strings.Contains(err.Error(), "network") {
+		t.Fatalf("a set binding = %v, %v", ok, err)
+	}
+}

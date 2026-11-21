@@ -13,11 +13,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -109,12 +111,14 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func
 	defer func() { _ = upstream.Close() }()
 	// One callback hears the gate's refusals and the peer check's.
 	refused := rootd.LogRefusal(log)
+	binding := &netnsBinding{}
 	g, err := gate.New(gate.Config{
 		Policy:   cfg.Policy,
 		Upstream: upstream,
 		OnRefusal: func(ctx context.Context, r gate.Refusal) {
 			refused(ctx, rootd.Refusal(r))
 		},
+		NetnsBinding: binding,
 	})
 	if err != nil {
 		return err
@@ -127,6 +131,7 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func
 	if err != nil {
 		return err
 	}
+	binding.srv.Store(srv)
 	stop := func() {
 		sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
@@ -179,4 +184,18 @@ func verifyNamespace(ctx context.Context, g *gate.Gate, log *slog.Logger) error 
 		case <-time.After(containerdRetry):
 		}
 	}
+}
+
+// netnsBinding is the gate's namespace check, which the server answers
+// (rootd.Server.NetnsBound). The server is built around the gate's
+// handler, so the gate is made first and pointed at the server once it
+// exists; no call reaches the gate before Serve.
+type netnsBinding struct{ srv atomic.Pointer[rootd.Server] }
+
+func (b *netnsBinding) Bound(ctx context.Context, name, containerID string) (bool, error) {
+	s := b.srv.Load()
+	if s == nil {
+		return false, errors.New("the root helper is still starting")
+	}
+	return s.NetnsBound(ctx, name, containerID)
 }

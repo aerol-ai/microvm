@@ -256,6 +256,12 @@ func (s *Service) buildContext(ctx context.Context) (context.Context, context.Ca
 }
 
 func buildError(step string, err error) error {
+	// A node that cannot build at all (privilege mode split refuses builds
+	// by name) keeps its 501 and its reason: a 502 would read as a passing
+	// fault a client should retry.
+	if errors.Is(err, models.ErrRuntimeNotImplemented) {
+		return fmt.Errorf("%s: %w", step, err)
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %s: %v", ErrBuildTimeout, step, err)
 	}

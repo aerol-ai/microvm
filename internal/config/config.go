@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
@@ -44,6 +45,10 @@ const (
 // Referenced by both Load() and the containerd driver's FromDaemonConfig so
 // the default cannot drift between the two layers.
 const DefaultContainerdRunDir = "/var/lib/sandboxd/containerd"
+
+// DefaultRootdSocket is the root helper's socket (internal/rootclient's
+// DefaultSocket, which pkg/daemon's tests pin it to).
+const DefaultRootdSocket = "/run/aerolvm-rootd/sock/root.sock"
 
 // Build-context unpackers (internal/runtime/containerd, plans/
 // security-gaps-m1-m4.md §3.4 Q3) each run as their own uid and gid, the
@@ -233,6 +238,15 @@ type Config struct {
 	// ContainerEngine selects the host daemon that realizes OCI sandboxes
 	// (dockerd vs native containerd). SB_CONTAINER_ENGINE; default docker.
 	ContainerEngine string
+	// PrivilegeMode is single (sandboxd does its root work itself, as root)
+	// or split (sandboxd runs with no rights and the root helper does it,
+	// plans/security-gaps-m1-m4.md D22). SB_PRIVILEGE_MODE; absent is
+	// single, so an agent upgraded in place onto a node set up before the
+	// setting keeps today's mode (D5).
+	PrivilegeMode privmode.Mode
+	// RootdSocket is the root helper's socket in split mode
+	// (SB_ROOTD_SOCKET, the name the helper reads too).
+	RootdSocket string
 	// ContainerdSocket is the containerd gRPC socket used when
 	// ContainerEngine=containerd. SB_CONTAINERD_SOCKET.
 	ContainerdSocket string
@@ -2466,6 +2480,7 @@ func load(keyTool bool) (Config, error) {
 		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
+		RootdSocket:                       getEnv("SB_ROOTD_SOCKET", DefaultRootdSocket),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
@@ -3072,6 +3087,12 @@ func load(keyTool bool) (Config, error) {
 			cfg.Runtime, models.RuntimeDocker)
 	}
 
+	if cfg.PrivilegeMode, err = privmode.Parse(os.Getenv("SB_PRIVILEGE_MODE")); err != nil {
+		return Config{}, err
+	}
+	if !filepath.IsAbs(cfg.RootdSocket) {
+		return Config{}, fmt.Errorf("SB_ROOTD_SOCKET must be an absolute path, got %q", cfg.RootdSocket)
+	}
 	resolvedEngine, err := models.ResolveContainerEngine(cfg.ContainerEngine)
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_ENGINE: %w", err)

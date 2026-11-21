@@ -227,7 +227,7 @@ func TestSettingsFromEnv(t *testing.T) {
 	t.Setenv("SB_CGROUP_PARENT_FILE", "")
 	t.Setenv("SB_OWNERSHIP_LEASE_FILE", "")
 	s := SettingsFromEnv()
-	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" || s.NetnsDir != "/run/netns" || s.LeaseFile != "" {
+	if s.ContainerdBinary != "containerd" || s.ContainerdConfig != "/etc/c.toml" || s.ParentFile != "/run/aerolvm/cgroup-parent" || s.NetnsDir != "/run/netns" || s.RootdNetnsDir != "/run/aerolvm-rootd/netns" || s.LeaseFile != "" {
 		t.Fatalf("%+v", s)
 	}
 	t.Setenv("SB_OWNERSHIP_LEASE_FILE", "/run/aerolvm/ownership-lease")
@@ -354,7 +354,11 @@ func TestRun(t *testing.T) {
 	for _, n := range []string{"aerol-netns-0", "aerol-netns-1"} {
 		_ = os.WriteFile(filepath.Join(netns, n), nil, 0o644)
 	}
-	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns,
+	// The root helper's own folder (privilege mode split).
+	rootdNetns := filepath.Join(dir, "rootd-netns")
+	_ = os.MkdirAll(rootdNetns, 0o700)
+	_ = os.WriteFile(filepath.Join(rootdNetns, "aerol-netns-2"), nil, 0o644)
+	s := Settings{ContainerdBinary: "/opt/containerd", ContainerdConfig: filepath.Join(dir, "etc", "config.toml"), ParentFile: filepath.Join(dir, "run", "cgroup-parent"), NetnsDir: netns, RootdNetnsDir: rootdNetns,
 		LeaseFile: filepath.Join(dir, "ownership-lease"), IsolateJailDir: "/var/lib/sandboxd/isolate-jail",
 		MountsDir: "/var/lib/sandboxd/mounts", PIDFile: filepath.Join(dir, "run", "runtime.pid")}
 	// A lease that already ran out, fencing one sandbox: the guard Run
@@ -440,8 +444,8 @@ func TestRun(t *testing.T) {
 	if !strings.Contains(logs.String(), "could not lower its own OOM score") {
 		t.Fatal("a failed OOM score change was not logged")
 	}
-	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1,run,0" {
-		t.Fatalf("unmounted %v, want both namespaces, the V8 jail's tmpfs and the sandbox's storage after containerd stopped (findings F8, F13)", unmounted)
+	if strings.Join(unmounted, ",") != "aerol-netns-0,aerol-netns-1,aerol-netns-2,run,0" {
+		t.Fatalf("unmounted %v, want the agent's and the helper's namespaces, the V8 jail's tmpfs and the sandbox's storage after containerd stopped (findings F8, F13)", unmounted)
 	}
 	// sandboxd checks an external mount through this pid's view (F13).
 	if read(t, s.PIDFile) != strconv.Itoa(os.Getpid()) {

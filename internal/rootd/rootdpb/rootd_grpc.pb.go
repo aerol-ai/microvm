@@ -38,6 +38,11 @@ const (
 	RootHelper_EnsureRunscConfig_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureRunscConfig"
 	RootHelper_EnsureReadySocket_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureReadySocket"
 	RootHelper_RemoveContainerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/RemoveContainerFiles"
+	RootHelper_EnsureHostNetwork_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureHostNetwork"
+	RootHelper_RealizeNetns_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/RealizeNetns"
+	RootHelper_RemoveNetns_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/RemoveNetns"
+	RootHelper_DisableNetnsIPv6_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/DisableNetnsIPv6"
+	RootHelper_NetnsAddrs_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/NetnsAddrs"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -72,6 +77,23 @@ type RootHelperClient interface {
 	// RemoveContainerFiles makes sure everything the helper made for a
 	// container is gone: host files, FIFOs and ready socket names.
 	RemoveContainerFiles(ctx context.Context, in *RemoveContainerFilesRequest, opts ...grpc.CallOption) (*RemoveContainerFilesResponse, error)
+	// EnsureHostNetwork makes sure the host is ready for sandbox networks:
+	// IP forwarding on, and the helper's CNI config written when absent. It
+	// answers with the sandboxes' address range that config hands out.
+	EnsureHostNetwork(ctx context.Context, in *EnsureHostNetworkRequest, opts ...grpc.CallOption) (*EnsureHostNetworkResponse, error)
+	// RealizeNetns makes sure a sandbox's network namespace exists, with
+	// loopback up, IPv6 off and an address on the sandboxes' bridge, and
+	// answers with its path and address. A namespace already realized is
+	// answered as it is.
+	RealizeNetns(ctx context.Context, in *RealizeNetnsRequest, opts ...grpc.CallOption) (*RealizeNetnsResponse, error)
+	// RemoveNetns makes sure a sandbox's network namespace is gone, with its
+	// CNI attachment, address lease, NAT chain and connection tracking.
+	RemoveNetns(ctx context.Context, in *RemoveNetnsRequest, opts ...grpc.CallOption) (*RemoveNetnsResponse, error)
+	// DisableNetnsIPv6 makes sure IPv6 is off inside a realized namespace.
+	DisableNetnsIPv6(ctx context.Context, in *DisableNetnsIPv6Request, opts ...grpc.CallOption) (*DisableNetnsIPv6Response, error)
+	// NetnsAddrs says whether a namespace exists and lists its IPv4
+	// addresses, loopback aside: the address a task started there has.
+	NetnsAddrs(ctx context.Context, in *NetnsAddrsRequest, opts ...grpc.CallOption) (*NetnsAddrsResponse, error)
 }
 
 type rootHelperClient struct {
@@ -152,6 +174,56 @@ func (c *rootHelperClient) RemoveContainerFiles(ctx context.Context, in *RemoveC
 	return out, nil
 }
 
+func (c *rootHelperClient) EnsureHostNetwork(ctx context.Context, in *EnsureHostNetworkRequest, opts ...grpc.CallOption) (*EnsureHostNetworkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureHostNetworkResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) RealizeNetns(ctx context.Context, in *RealizeNetnsRequest, opts ...grpc.CallOption) (*RealizeNetnsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RealizeNetnsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_RealizeNetns_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) RemoveNetns(ctx context.Context, in *RemoveNetnsRequest, opts ...grpc.CallOption) (*RemoveNetnsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveNetnsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_RemoveNetns_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) DisableNetnsIPv6(ctx context.Context, in *DisableNetnsIPv6Request, opts ...grpc.CallOption) (*DisableNetnsIPv6Response, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisableNetnsIPv6Response)
+	err := c.cc.Invoke(ctx, RootHelper_DisableNetnsIPv6_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) NetnsAddrs(ctx context.Context, in *NetnsAddrsRequest, opts ...grpc.CallOption) (*NetnsAddrsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NetnsAddrsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_NetnsAddrs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -184,6 +256,23 @@ type RootHelperServer interface {
 	// RemoveContainerFiles makes sure everything the helper made for a
 	// container is gone: host files, FIFOs and ready socket names.
 	RemoveContainerFiles(context.Context, *RemoveContainerFilesRequest) (*RemoveContainerFilesResponse, error)
+	// EnsureHostNetwork makes sure the host is ready for sandbox networks:
+	// IP forwarding on, and the helper's CNI config written when absent. It
+	// answers with the sandboxes' address range that config hands out.
+	EnsureHostNetwork(context.Context, *EnsureHostNetworkRequest) (*EnsureHostNetworkResponse, error)
+	// RealizeNetns makes sure a sandbox's network namespace exists, with
+	// loopback up, IPv6 off and an address on the sandboxes' bridge, and
+	// answers with its path and address. A namespace already realized is
+	// answered as it is.
+	RealizeNetns(context.Context, *RealizeNetnsRequest) (*RealizeNetnsResponse, error)
+	// RemoveNetns makes sure a sandbox's network namespace is gone, with its
+	// CNI attachment, address lease, NAT chain and connection tracking.
+	RemoveNetns(context.Context, *RemoveNetnsRequest) (*RemoveNetnsResponse, error)
+	// DisableNetnsIPv6 makes sure IPv6 is off inside a realized namespace.
+	DisableNetnsIPv6(context.Context, *DisableNetnsIPv6Request) (*DisableNetnsIPv6Response, error)
+	// NetnsAddrs says whether a namespace exists and lists its IPv4
+	// addresses, loopback aside: the address a task started there has.
+	NetnsAddrs(context.Context, *NetnsAddrsRequest) (*NetnsAddrsResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -214,6 +303,21 @@ func (UnimplementedRootHelperServer) EnsureReadySocket(context.Context, *EnsureR
 }
 func (UnimplementedRootHelperServer) RemoveContainerFiles(context.Context, *RemoveContainerFilesRequest) (*RemoveContainerFilesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveContainerFiles not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureHostNetwork(context.Context, *EnsureHostNetworkRequest) (*EnsureHostNetworkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureHostNetwork not implemented")
+}
+func (UnimplementedRootHelperServer) RealizeNetns(context.Context, *RealizeNetnsRequest) (*RealizeNetnsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RealizeNetns not implemented")
+}
+func (UnimplementedRootHelperServer) RemoveNetns(context.Context, *RemoveNetnsRequest) (*RemoveNetnsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveNetns not implemented")
+}
+func (UnimplementedRootHelperServer) DisableNetnsIPv6(context.Context, *DisableNetnsIPv6Request) (*DisableNetnsIPv6Response, error) {
+	return nil, status.Error(codes.Unimplemented, "method DisableNetnsIPv6 not implemented")
+}
+func (UnimplementedRootHelperServer) NetnsAddrs(context.Context, *NetnsAddrsRequest) (*NetnsAddrsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method NetnsAddrs not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -362,6 +466,96 @@ func _RootHelper_RemoveContainerFiles_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_EnsureHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureHostNetwork(ctx, req.(*EnsureHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_RealizeNetns_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RealizeNetnsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).RealizeNetns(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_RealizeNetns_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).RealizeNetns(ctx, req.(*RealizeNetnsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_RemoveNetns_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveNetnsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).RemoveNetns(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_RemoveNetns_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).RemoveNetns(ctx, req.(*RemoveNetnsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_DisableNetnsIPv6_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableNetnsIPv6Request)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).DisableNetnsIPv6(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_DisableNetnsIPv6_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).DisableNetnsIPv6(ctx, req.(*DisableNetnsIPv6Request))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_NetnsAddrs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NetnsAddrsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).NetnsAddrs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_NetnsAddrs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).NetnsAddrs(ctx, req.(*NetnsAddrsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -396,6 +590,26 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveContainerFiles",
 			Handler:    _RootHelper_RemoveContainerFiles_Handler,
+		},
+		{
+			MethodName: "EnsureHostNetwork",
+			Handler:    _RootHelper_EnsureHostNetwork_Handler,
+		},
+		{
+			MethodName: "RealizeNetns",
+			Handler:    _RootHelper_RealizeNetns_Handler,
+		},
+		{
+			MethodName: "RemoveNetns",
+			Handler:    _RootHelper_RemoveNetns_Handler,
+		},
+		{
+			MethodName: "DisableNetnsIPv6",
+			Handler:    _RootHelper_DisableNetnsIPv6_Handler,
+		},
+		{
+			MethodName: "NetnsAddrs",
+			Handler:    _RootHelper_NetnsAddrs_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
