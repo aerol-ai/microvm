@@ -38,6 +38,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
@@ -518,6 +519,10 @@ func TestStreams(t *testing.T) {
 		}
 		if refs := r.refused(); len(refs) != 1 || refs[0].Reason != ReasonUnknownField {
 			t.Fatalf("refusals %+v", refs)
+		}
+		// A refusal mid-stream is answered like one on the first message.
+		if reason, ok := rootdpb.RefusalReason(err); !ok || reason != ReasonUnknownField {
+			t.Fatalf("the answer's refusal reason is %q, %v", reason, ok)
 		}
 		// The first message was forwarded; the refusal cancels the call,
 		// which may beat containerd to reading it. The hostile message and

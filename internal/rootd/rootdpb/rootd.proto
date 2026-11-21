@@ -180,3 +180,16 @@ message HelperUnavailable {}
 message HelperUnsupported {
   string reason = 1;
 }
+
+// HelperRefused marks a call the helper or its containerd gate refused
+// because the request broke the helper's rules (eng review D9). Unlike the
+// two marks above it crosses the socket: the helper adds it to the refused
+// call's status, with the status's usual code. The agent only sends what
+// its own code built, so a refusal means drift or a broken agent, and the
+// agent's client records each one (internal/rootclient). In Go it is an
+// error that matches ErrHelperRefused.
+message HelperRefused {
+  // The rule's short, fixed code ("method_not_allowed", "mount"), fit for
+  // a metric label.
+  string reason = 1;
+}

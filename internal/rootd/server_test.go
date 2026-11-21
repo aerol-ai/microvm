@@ -481,14 +481,23 @@ func TestShutdown(t *testing.T) {
 	})
 }
 
+// TestLogRefusal: the helper's own line names the call in the agent's
+// short form and in full, the reason and the detail, and counts refusals
+// since start across every source that shares the one callback.
 func TestLogRefusal(t *testing.T) {
 	var buf bytes.Buffer
-	LogRefusal(slog.New(slog.NewTextHandler(&buf, nil)))(context.Background(),
-		Refusal{Method: "/containerd.services.tasks.v1.Tasks/Exec", Reason: "method_not_allowed", Detail: "no"})
-	for _, want := range []string{"level=ERROR", "Tasks/Exec", "method_not_allowed"} {
+	log := LogRefusal(slog.New(slog.NewTextHandler(&buf, nil)))
+	log(context.Background(), Refusal{Method: "/containerd.services.tasks.v1.Tasks/Exec", Reason: "method_not_allowed", Detail: "no"})
+	for _, want := range []string{"level=ERROR", "call=Tasks.Exec", "method=/containerd.services.tasks.v1.Tasks/Exec",
+		"reason=method_not_allowed", "detail=no", "refusals_since_start=1"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("log %q lacks %q", buf.String(), want)
 		}
+	}
+	buf.Reset()
+	log(context.Background(), Refusal{Method: MethodConnect, Reason: ReasonPeer, Detail: "uid 1000"})
+	if line := buf.String(); !strings.Contains(line, "call=connect") || !strings.Contains(line, "refusals_since_start=2") {
+		t.Fatalf("second line %q", line)
 	}
 }
 

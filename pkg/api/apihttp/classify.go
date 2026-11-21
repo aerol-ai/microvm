@@ -107,6 +107,16 @@ func truncate(message string) string {
 // home so v1, Daytona, E2B and Runloop cannot drift (plan D1).
 func Classify(err error) Classification {
 	switch {
+	// The node's root helper (internal/rootclient) refused a call this node
+	// made (plans/security-gaps-m1-m4.md §3.3, eng review D9). The agent
+	// only sends what its own code built, so this is drift or a compromised
+	// agent, never the caller's request: a 500, not the 400 catch-all, and
+	// not the 503 of a helper that is down, since a retry meets the same
+	// refusal. It comes first so no sentinel wrapped with it can turn it
+	// into anything else. The call and the reason go to the audit record,
+	// the metric and this node's log, never to the caller.
+	case errors.Is(err, rootclient.ErrRefused):
+		return Classification{Status: http.StatusInternalServerError, Message: "internal error: the node's root helper refused a call this node made", Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, store.ErrNotFound):
 		return Classification{Status: http.StatusNotFound, Message: "sandbox not found", Kind: ErrKindNotFound}
 	// A keyed create whose Idempotency-Key was used with a different request.
