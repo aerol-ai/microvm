@@ -152,6 +152,9 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.BridgeProbeResponse":          {"bridge_absent=1:bool", "not_ready=2:string", "send_error=3:string"},
 		"aerolvm.rootd.v1.MatchProcessRequest":          {"pid=1:uint32", "local=2:string", "remote=3:string", "paths=4:repeated string"},
 		"aerolvm.rootd.v1.MatchProcessResponse":         {"matched=1:repeated string", "not_found=2:bool"},
+		"aerolvm.rootd.v1.HostPortForward":              {"host_port=1:uint32", "kind=2:enum", "address=3:string", "port=4:uint32"},
+		"aerolvm.rootd.v1.HostPortRequest":              {"op=1:enum", "forwards=2:repeated message", "host_port=3:uint32"},
+		"aerolvm.rootd.v1.HostPortResponse":             {"skipped=1:repeated uint32"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -183,6 +186,10 @@ func TestWireIsAppendOnly(t *testing.T) {
 			"SANDBOX_RULES_OP_CLEAR_HOLD_EGRESS=9"},
 		"aerolvm.rootd.v1.BridgeProbeOp": {"BRIDGE_PROBE_OP_UNSPECIFIED=0", "BRIDGE_PROBE_OP_SETUP=1", "BRIDGE_PROBE_OP_SEND=2",
 			"BRIDGE_PROBE_OP_CLOSE=3"},
+		"aerolvm.rootd.v1.HostPortOp": {"HOST_PORT_OP_UNSPECIFIED=0", "HOST_PORT_OP_SET=1", "HOST_PORT_OP_REMOVE=2",
+			"HOST_PORT_OP_RECONCILE=3"},
+		"aerolvm.rootd.v1.HostPortKind": {"HOST_PORT_KIND_UNSPECIFIED=0", "HOST_PORT_KIND_SANDBOX=1", "HOST_PORT_KIND_PEER=2",
+			"HOST_PORT_KIND_REDIRECT=3"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {

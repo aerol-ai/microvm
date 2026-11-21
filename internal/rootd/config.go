@@ -99,6 +99,12 @@ type Config struct {
 	Network NetworkConfig
 	// Firewall is the host firewall's settings (firewall.go).
 	Firewall FirewallConfig
+	// HostPorts bound raw-TCP host-port forwarding (hostports.go), under
+	// sandboxd's names: the host-port range (SB_L4_PORT_RANGE_START,
+	// SB_L4_PORT_RANGE_END; 22000 to 23000) and sandboxd's redirect
+	// listener (SB_HOSTPORT_REDIRECT_PORT, 21215). The helper's own copy:
+	// the agent cannot widen what a forward may take.
+	HostPorts rootpolicy.HostPortBounds
 }
 
 // FirewallConfig is the helper's own copy of the host firewall's settings,
@@ -264,6 +270,10 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	hostPorts, err := hostPortsFromEnv(getenv)
+	if err != nil {
+		return Config{}, err
+	}
 
 	// Every path is cleaned before it is compared or used: /srv/ctr/ and
 	// /srv/ctr name one folder, and a prefix test on the raw text would
@@ -367,12 +377,34 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			ConfPath:  cniConf,
 			Subnet:    strings.TrimSpace(getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		},
-		Firewall: FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
+		Firewall:  FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
+		HostPorts: hostPorts,
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// hostPortsFromEnv is Config.HostPorts, checked as sandboxd checks the
+// range (it refuses to start on a bad one too). The redirect port is
+// checked when a forward uses it.
+func hostPortsFromEnv(getenv func(string) string) (rootpolicy.HostPortBounds, error) {
+	var b rootpolicy.HostPortBounds
+	var err error
+	if b.RangeStart, err = envInt(getenv, "SB_L4_PORT_RANGE_START", 22000); err != nil {
+		return b, err
+	}
+	if b.RangeEnd, err = envInt(getenv, "SB_L4_PORT_RANGE_END", 23000); err != nil {
+		return b, err
+	}
+	if b.RedirectPort, err = envInt(getenv, "SB_HOSTPORT_REDIRECT_PORT", 21215); err != nil {
+		return b, err
+	}
+	if err := b.Check(); err != nil {
+		return b, fmt.Errorf("SB_L4_PORT_RANGE_START/END: %w", err)
+	}
+	return b, nil
 }
 
 // limitsFromEnv bounds one sandbox by the node: no sandbox can use more

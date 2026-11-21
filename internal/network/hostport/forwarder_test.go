@@ -563,3 +563,104 @@ func TestForwarderPruneUnassertedAfterBootReassert(t *testing.T) {
 		t.Fatal("want the chain bootstrap error")
 	}
 }
+
+// TestForwarderSetActsOnTheKernelNotMemory: Set, the root helper's Ensure
+// and Remove, replaces and removes a host port's rules that another
+// process wrote (an earlier helper), which this one has no memory of. An
+// unchanged target deletes nothing; a removal flushes the port's tracked
+// connections even when nothing was left; other ports are left alone.
+func TestForwarderSetActsOnTheKernelNotMemory(t *testing.T) {
+	m := newMem()
+	old := New(m, nil)
+	if err := old.Ensure(22000, dnat("10.0.0.5:5432", false)); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Ensure(22001, dnat("10.1.0.9:22001", true)); err != nil {
+		t.Fatal(err)
+	}
+	fl := &flushLog{}
+	f := New(m, fl.flush) // a restarted helper
+	for _, tc := range []struct {
+		name    string
+		hp      int
+		t       *Target
+		deletes int
+		want    string // in the NAT chain afterwards; "" for none of hp's
+		flushed bool
+	}{
+		{"a changed target replaces the old one", 22000, &Target{Kind: Redirect, RedirectPort: 21215}, 2, "REDIRECT --to-ports 21215", false},
+		{"the same target deletes nothing", 22000, &Target{Kind: Redirect, RedirectPort: 21215}, 0, "REDIRECT --to-ports 21215", false},
+		{"a removal of another process's port", 22001, nil, 3, "", true},
+		{"a removal of a port with nothing left", 22001, nil, 0, "", true},
+	} {
+		before, flushes := m.deletes, len(fl.ports)
+		if err := f.Set(tc.hp, tc.t); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := m.deletes - before; got != tc.deletes {
+			t.Fatalf("%s: %d deletes, want %d", tc.name, got, tc.deletes)
+		}
+		var mine []string
+		for _, r := range m.rules("nat", ChainNAT) {
+			if strings.Contains(r, commentPrefix+"22000") && tc.hp == 22000 || strings.Contains(r, commentPrefix+"22001") && tc.hp == 22001 {
+				mine = append(mine, r)
+			}
+		}
+		if tc.want == "" && len(mine) != 0 || tc.want != "" && (len(mine) != 1 || !strings.Contains(mine[0], tc.want)) {
+			t.Fatalf("%s: hp %d's NAT rules %q", tc.name, tc.hp, mine)
+		}
+		if (len(fl.ports) > flushes) != tc.flushed {
+			t.Fatalf("%s: flushed %v", tc.name, fl.ports)
+		}
+	}
+	if ports := f.Ports(); len(ports) != 1 || ports[0] != 22000 {
+		t.Fatalf("in memory: %v", ports)
+	}
+	// Refusals and failures.
+	if err := f.Set(0, nil); err == nil {
+		t.Fatal("host port 0 accepted")
+	}
+	if err := f.Set(22002, &Target{Kind: Redirect}); err == nil {
+		t.Fatal("a redirect with no port accepted")
+	}
+	// The kernel is read once per process: later Sets, of any port, list
+	// nothing.
+	m.failOn = "List"
+	if err := f.Set(22009, &Target{Kind: Redirect, RedirectPort: 21215}); err != nil {
+		t.Fatalf("a second Set listed the kernel: %v", err)
+	}
+	m.failOn = ""
+	// A new process: its first Set reads the kernel, and a listing or a
+	// delete failure shows.
+	if err := old.Ensure(22006, dnat("10.0.0.5:5432", false)); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		op string
+		hp int
+	}{{"List", 22007}, {"Delete", 22006}, {"Append", 22008}} {
+		m.failOn = tc.op
+		if err := New(m, nil).Set(tc.hp, &Target{Kind: DNAT, Addr: netip.MustParseAddrPort("10.0.0.6:80")}); err == nil {
+			t.Fatalf("%s failure hidden", tc.op)
+		}
+	}
+	m.failOn = ""
+	// A reconcile settles every foreign rule: a Set after it reads nothing.
+	g := New(m, nil)
+	if err := g.Reconcile(map[int]Target{22000: {Kind: Redirect, RedirectPort: 21215}}); err != nil {
+		t.Fatal(err)
+	}
+	m.failOn = "List"
+	if err := g.Set(22010, &Target{Kind: Redirect, RedirectPort: 21215}); err != nil {
+		t.Fatalf("a Set after a reconcile listed the kernel: %v", err)
+	}
+	m.failOn = ""
+	bad := New(m, func(int) error { return errors.New("conntrack") })
+	if err := bad.Set(22003, nil); err == nil {
+		t.Fatal("flush failure hidden")
+	}
+	m.failOn = "ChainExists"
+	if err := New(m, nil).Set(22000, nil); err == nil {
+		t.Fatal("chain bootstrap failure hidden")
+	}
+}

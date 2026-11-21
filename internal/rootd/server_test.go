@@ -65,7 +65,8 @@ func testConfig(t testing.TB) Config {
 		AgentUID:  uint32(os.Getuid()),
 		Policy:    testPolicy(),
 		// The helper's own node port list, as ConfigFromEnv's defaults.
-		Firewall: FirewallConfig{NodePorts: testNodePorts()},
+		Firewall:  FirewallConfig{NodePorts: testNodePorts()},
+		HostPorts: rootpolicy.HostPortBounds{RangeStart: 22000, RangeEnd: 23000, RedirectPort: 21215},
 	}, dir)
 }
 
@@ -215,7 +216,7 @@ func TestVersion(t *testing.T) {
 	// no network configuration (this rig) serves no network call either.
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
 		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
-			f == rootdpb.FeaturePrepareSandbox || f == rootdpb.FeatureReleaseSandbox
+			slices.Contains(hostPortFeatures, f) || f == rootdpb.FeaturePrepareSandbox || f == rootdpb.FeatureReleaseSandbox
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -229,7 +230,7 @@ func TestVersion(t *testing.T) {
 		served := []string{rootdpb.FeatureEnsureHostFiles, rootdpb.FeatureEnsureTaskFIFOs, rootdpb.FeatureEnsureRunscConfig,
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
-		served = append(served, egressFeatures...)
+		served = append(append(served, egressFeatures...), hostPortFeatures...)
 		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
 			t.Fatalf("features %v parts %v (%v), want %v and every part", resp.GetFeatures(), resp.GetParts(), err, served)
 		}

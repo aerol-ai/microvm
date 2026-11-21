@@ -125,6 +125,9 @@ type Options struct {
 	// Egress does the hostname gateway's host side (egress.go). Nil: the
 	// helper's own. Like the firewall, it needs the network.
 	Egress EgressHost
+	// HostPorts does raw-TCP host-port forwarding (hostports.go). Nil: the
+	// helper's own, opened on the first call. It needs the network too.
+	HostPorts HostPortHost
 }
 
 // Server is the helper's socket and gRPC server.
@@ -199,7 +202,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
-		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks)})
+		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks)})
 	return s, nil
 }
 
@@ -419,8 +422,10 @@ type helper struct {
 	// firewall calls and PrepareSandbox and ReleaseSandbox; nil with net.
 	net *network
 	fw  *firewall
-	// eg serves the hostname gateway's calls; nil with net.
+	// eg serves the hostname gateway's calls, hp host-port forwarding;
+	// each nil with net.
 	eg *egressCalls
+	hp *hostPortCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -436,6 +441,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.eg != nil {
 		served = append(served, egressFeatures...)
+	}
+	if h.hp != nil {
+		served = append(served, hostPortFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.fw.servedParts()}, nil
 }
@@ -505,6 +513,14 @@ func (h helper) MatchProcess(ctx context.Context, req *rootdpb.MatchProcessReque
 	}
 	resp, err := h.eg.matchProcess(req)
 	return answer(ctx, h, rootdpb.RootHelper_MatchProcess_FullMethodName, resp, err)
+}
+
+func (h helper) HostPort(ctx context.Context, req *rootdpb.HostPortRequest) (*rootdpb.HostPortResponse, error) {
+	if h.hp == nil {
+		return nil, noNetwork(rootdpb.FeatureHostPort)
+	}
+	resp, err := h.hp.hostPort(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_HostPort_FullMethodName, resp, err)
 }
 
 func (h helper) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {
