@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/toolboxwire"
 	"github.com/aerol-ai/microvm/internal/version"
 )
@@ -24,6 +25,7 @@ type Host struct {
 	liveness  toolboxwire.Liveness
 	interp    Interpreters
 	owner     Owner
+	uploads   *multipartspool.Spool
 
 	streamReadLimit int64
 	streamWriteWait time.Duration
@@ -62,6 +64,11 @@ type Config struct {
 	// Owner, or the guest could not change or remove it. Zero leaves
 	// files as sandboxd made them (workers run as sandboxd).
 	Owner Owner
+	// UploadSpool takes upload parts too big for memory, in a private
+	// folder per request: this host runs in sandboxd, so the stdlib's
+	// default would put them in the host's shared temp folder. Nil keeps
+	// every part in memory and refuses an upload that does not fit.
+	UploadSpool *multipartspool.Spool
 }
 
 // Owner is a uid/gid pair; the zero value is nobody in particular.
@@ -85,6 +92,7 @@ func New(cfg Config) *Host {
 		liveness:  cfg.StreamLiveness,
 		interp:    cfg.Interpreters,
 		owner:     cfg.Owner,
+		uploads:   cfg.UploadSpool,
 
 		streamReadLimit: cfg.StreamReadLimit,
 		streamWriteWait: cfg.StreamWriteWait,

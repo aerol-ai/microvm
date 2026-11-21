@@ -44,6 +44,7 @@ func TestWarmSpawn_CorruptSnapshotNotifiesAndCleans(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, "snapshot.memory")
 	snapState := filepath.Join(tplDir, "snapshot.state")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	memBytes := []byte("MEM-ORIGINAL")
 	stateBytes := []byte("STATE-ORIGINAL")
 	if err := os.WriteFile(snapMem, memBytes, 0o600); err != nil {
@@ -66,6 +67,7 @@ func TestWarmSpawn_CorruptSnapshotNotifiesAndCleans(t *testing.T) {
 	_, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-corrupt",
 		TemplateID:         "tpl-corrupt-warm",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		SnapshotChecksum:   combined,
@@ -122,6 +124,7 @@ func TestWarmSpawn_CorruptionNoNotifierStillReturnsError(t *testing.T) {
 	tplDir := t.TempDir()
 	snapMem := filepath.Join(tplDir, "snapshot.memory")
 	snapState := filepath.Join(tplDir, "snapshot.state")
+	rootfs := writeTemplateRootfs(t, tplDir)
 	if err := os.WriteFile(snapMem, []byte("a"), 0o600); err != nil {
 		t.Fatalf("write snap mem: %v", err)
 	}
@@ -132,6 +135,7 @@ func TestWarmSpawn_CorruptionNoNotifierStillReturnsError(t *testing.T) {
 	_, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-nonotify",
 		TemplateID:         "tpl-no-notifier",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: snapMem,
 		SnapshotStatePath:  snapState,
 		// Deliberately wrong checksum.

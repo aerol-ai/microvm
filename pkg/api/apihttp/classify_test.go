@@ -13,7 +13,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
+	"google.golang.org/grpc/codes"
+
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/rootclient"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -72,6 +77,20 @@ func TestClassify(t *testing.T) {
 		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		// The root helper: down, or older than the agent (M1). Both clear
+		// on their own (a restart, the staged helper's swap), so 503.
+		{"root helper unavailable", fmt.Errorf("%w at /run/aerolvm/root.sock: connection refused", rootclient.ErrUnavailable), http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		{"root helper lacks a call", &rootclient.UnsupportedError{Feature: "EnsureHost", Helper: rootclient.Info{HelperVersion: "v0.7.7", API: 1}}, http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		// A refusal by the helper or its gate (eng review D9): drift or a
+		// compromised agent, so 500, never the 400 catch-all its
+		// InvalidArgument or PermissionDenied would get, and never a 503,
+		// even joined with one: a retry meets the same refusal.
+		{"root helper refused its own call", &rootclient.RefusedError{Refusal: rootclient.Refusal{Call: "RootHelper.EnsureHostFiles", Reason: "bad_request"},
+			Err: rootdpb.Refused(codes.InvalidArgument, "bad_request", "root helper: hostname too long")}, http.StatusInternalServerError, 0, "", ErrKindOther},
+		{"root gate refused, as containerd's client rebuilds it", errors.Join(fmt.Errorf("aerolvm root gate refused: %w", errdefs.ErrPermissionDenied), &rootdpb.HelperRefused{Reason: "mount"}),
+			http.StatusInternalServerError, 0, "", ErrKindOther},
+		{"refused, with the helper unavailable too", errors.Join(&rootclient.RefusedError{Err: rootdpb.Refused(codes.PermissionDenied, "x", "y")}, rootclient.ErrUnavailable, store.ErrNotFound),
+			http.StatusInternalServerError, 0, "", ErrKindOther},
 		{"snapshot of a running firecracker sandbox", fmt.Errorf("stop the sandbox before taking a snapshot of it: %w", models.ErrSnapshotSourceNotReady), http.StatusConflict, 0, "", ErrKindOther},
 		// The service's refusal matches both sentinels; it keeps its code.
 		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
@@ -171,6 +190,30 @@ func TestClassifyImagePullUnavailableIsLogged(t *testing.T) {
 	err := fmt.Errorf("%w: failed to resolve reference %q: 429 Too Many Requests", models.ErrImagePullUnavailable, "r.example/a:1")
 	if c := Classify(err); !c.Log || c.LogLevel != slog.LevelWarn {
 		t.Fatalf("Classify(%v) logs=%v at %v, want a warning", err, c.Log, c.LogLevel)
+	}
+}
+
+// A root helper refusal is a 500 with fixed text and no Retry-After: the
+// call, the reason and the gate's detail (which can name a path from the
+// spec) stay in the node's log, the audit record and the metric, logged as
+// an error.
+func TestWriteStoreAwareErrorRootRefusal(t *testing.T) {
+	err := fmt.Errorf("create sandbox: %w", &rootclient.RefusedError{
+		Refusal: rootclient.Refusal{Call: "Containers.Create", Reason: "mount"},
+		Err:     rootdpb.Refused(codes.PermissionDenied, "mount", "aerolvm root gate refused: bind source \"/etc/shadow-x\""),
+	})
+	rec := httptest.NewRecorder()
+	WriteStoreAwareError(nil, rec, err)
+	if rec.Code != http.StatusInternalServerError || rec.Header().Get("Retry-After") != "" {
+		t.Fatalf("status %d, Retry-After %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	for _, leak := range []string{"shadow-x", "Containers.Create", "mount"} {
+		if strings.Contains(rec.Body.String(), leak) {
+			t.Fatalf("the body %s names %q", rec.Body.String(), leak)
+		}
+	}
+	if c := Classify(err); !c.Log || c.LogLevel != slog.LevelError {
+		t.Fatalf("logs=%v at %v, want an error", c.Log, c.LogLevel)
 	}
 }
 

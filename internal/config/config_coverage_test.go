@@ -409,6 +409,32 @@ func TestLoad_Coverage95ValidationBranches(t *testing.T) {
 			want: "SB_CONTAINERD_NAMESPACE is required",
 		},
 		{
+			// Root, or any host account, would share an unpacker's uid.
+			name: "containerd_build_context_id_base_root",
+			env: map[string]string{
+				"SB_CONTAINER_ENGINE":                 "containerd",
+				"SB_CONTAINERD_BUILD_CONTEXT_ID_BASE": "0",
+			},
+			want: "SB_CONTAINERD_BUILD_CONTEXT_ID_BASE must be between 65536 and 4294967231",
+		},
+		{
+			name: "containerd_build_context_id_base_nobody",
+			env: map[string]string{
+				"SB_CONTAINER_ENGINE":                 "containerd",
+				"SB_CONTAINERD_BUILD_CONTEXT_ID_BASE": "65534",
+			},
+			want: "got 65534",
+		},
+		{
+			// The last id would be (uid_t)-1.
+			name: "containerd_build_context_id_base_too_big",
+			env: map[string]string{
+				"SB_CONTAINER_ENGINE":                 "containerd",
+				"SB_CONTAINERD_BUILD_CONTEXT_ID_BASE": "4294967232",
+			},
+			want: "got 4294967232",
+		},
+		{
 			name: "serverless_ingress_addr_cleared",
 			env: map[string]string{
 				"SB_ENABLE_SERVERLESS":     "true",

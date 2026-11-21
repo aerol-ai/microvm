@@ -123,9 +123,15 @@ func TestFromDaemonConfig(t *testing.T) {
 		WasmMaxSessionsPerSandbox: 11,
 		WasmSessionCommandsKept:   12,
 		WasmSessionLogBudget:      13,
+		DBPath:                    "/var/lib/sandboxd/state.db",
 	})
 	if cfg.RunDir != "/run" || cfg.ModulesDir != "/mods" || cfg.DefaultMemoryMB != 128 {
 		t.Fatalf("cfg = %+v", cfg)
+	}
+	// Toolbox uploads spill next to the database, not into the run dir
+	// (a tmpfs) or the shared temp folder.
+	if cfg.UploadSpoolDir != "/var/lib/sandboxd/upload-spool" || New(cfg, nil).uploads.Dir() != cfg.UploadSpoolDir {
+		t.Fatalf("upload spool = %q", cfg.UploadSpoolDir)
 	}
 	if cfg.MaxStreamsPerSandbox != 3 || cfg.StreamMaxMessageBytes != 4096 || cfg.CodeRunModules["python"] != "python" {
 		t.Fatalf("stream settings = %+v", cfg)

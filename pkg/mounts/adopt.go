@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -241,7 +242,17 @@ func (m *Manager) adoptOne(ctx context.Context, sandboxID string, index int, spe
 	}
 	bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
 	if plan.IsKernelMount {
-		return state, bind // nothing runs; the kernel holds the mount
+		// Nothing runs; the kernel holds the mount. A mount made before
+		// the NFS adapter forced nosuid,nodev may lack them, so set them
+		// on the host mount now; if that fails it is not adopted, and the
+		// caller clears it and mounts afresh with them. A container
+		// already bound to it keeps its own bind's flags until the
+		// sandbox next starts and binds again.
+		if err := remountNosuidNodev(hostPath); err != nil {
+			m.logger.Warn("mounts: could not set nosuid,nodev on an adopted kernel mount; mounting it afresh", "sandbox_id", sandboxID, "index", index, "error", err)
+			return nil, ContainerBind{}
+		}
+		return state, bind
 	}
 	// The helper runs either the plan as it is now (with the consumer's
 	// options) or, started before the consumer existed, the bare plan.
@@ -273,6 +284,15 @@ func (m *Manager) adoptOne(ctx context.Context, sandboxID string, index int, spe
 	go m.superviseExit(state)
 	m.logger.Info("mounts: adopted running mount helper", "sandbox_id", sandboxID, "index", index, "type", string(spec.Type), "pid", match.pid)
 	return state, bind
+}
+
+// remountNosuidNodev sets nosuid and nodev on the mount at path, keeping
+// its other options. A var so tests need no real mount.
+var remountNosuidNodev = func(path string) error {
+	if out, err := exec.Command("mount", "-o", "remount,nosuid,nodev", "--", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("remount %s: %w (%s)", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // clearStaleMount readies mount index of sandboxID to be mounted afresh: it

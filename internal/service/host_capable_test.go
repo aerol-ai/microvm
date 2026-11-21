@@ -83,7 +83,7 @@ func TestHostCapableGates(t *testing.T) {
 
 			// Gate 1: raw host-side mounts (service.go validateCreateMounts).
 			svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-			err := svc.validateCreateMounts(tc.ctx, raw, "sb-mount")
+			err := svc.validateCreateMounts(tc.ctx, raw, "sb-mount", nil)
 			if tc.host != (err == nil) || (!tc.host && !errors.Is(err, models.ErrMountOperatorOnly)) {
 				t.Errorf("raw mount: err = %v, host %v", err, tc.host)
 			}

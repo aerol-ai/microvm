@@ -76,6 +76,10 @@ type Config struct {
 	// sandbox at once (guestHTTPProxy); 0 means defaultGuestHTTPMaxInFlight.
 	// SB_WASM_GUEST_HTTP_MAX_INFLIGHT.
 	GuestHTTPMaxInFlight int
+	// UploadSpoolDir is where toolbox uploads too big for memory spill
+	// (config.UploadSpoolDir). "" keeps every upload in memory and refuses
+	// one that does not fit.
+	UploadSpoolDir string
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -100,5 +104,6 @@ func FromDaemonConfig(cfg config.Config) Config {
 		SessionLogBudget:         cfg.WasmSessionLogBudget,
 		InterpMaxContexts:        cfg.WasmInterpMaxContexts,
 		InterpIdleTTL:            cfg.WasmInterpIdleTTL,
+		UploadSpoolDir:           cfg.UploadSpoolDir(),
 	}
 }

@@ -45,10 +45,10 @@ func TestCreateSandboxRefusesMountsWhenTheNodeCannotServeThem(t *testing.T) {
 	}
 
 	bad := []models.MountSpec{{Type: models.MountTypeS3, Source: "s3://bucket", Target: "/proc"}}
-	if err := svc.validateCreateMounts(ctx, bad, "sb-bad"); err == nil || errors.Is(err, mounts.ErrMountsUnavailable) {
+	if err := svc.validateCreateMounts(ctx, bad, "sb-bad", nil); err == nil || errors.Is(err, mounts.ErrMountsUnavailable) {
 		t.Fatalf("a wrong request = %v, want the caller's own error first", err)
 	}
-	if err := svc.validateCreateMounts(ctx, nil, "sb-none"); err != nil {
+	if err := svc.validateCreateMounts(ctx, nil, "sb-none", nil); err != nil {
 		t.Fatalf("a create without mounts = %v, want nil", err)
 	}
 

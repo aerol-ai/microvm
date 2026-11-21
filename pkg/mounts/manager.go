@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -91,6 +90,9 @@ type mountState struct {
 	lastCrash  time.Time
 	supervised bool
 	disabled   bool // true after we've given up restarting
+	// kept is a mount KeepLive took over as it ran: its spec is refused,
+	// so its tool is never started again, not even to restart it.
+	kept bool
 
 	// proc is a tool a previous sandboxd started and this one adopted
 	// (adoptOne); cmd is nil while it runs. A restart starts cmd instead.
@@ -276,10 +278,11 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		for _, s := range established {
 			_ = m.tearDownState(s)
 		}
-		// The id was validated at entry; the prefix check keeps this
-		// RemoveAll inside rootDir on its own.
-		if dir := filepath.Clean(filepath.Join(m.rootDir, sandboxID)); strings.HasPrefix(dir, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
-			_ = os.RemoveAll(dir)
+		// clearMountDir also takes down a mount the loop had not reached
+		// (in adopt mode, a live one a previous sandboxd left) before it
+		// removes anything.
+		if dir, ok := m.mountFolder(sandboxID); ok {
+			_ = m.clearMountDir(dir)
 		}
 		return nil, failed
 	}
@@ -290,7 +293,10 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 	return binds, nil
 }
 
-// UnmountAll tears down every mount for a sandbox. Always best-effort.
+// UnmountAll tears down every mount for a sandbox. Always best-effort. The
+// mount folder goes last, through clearMountDir: a mount this process does
+// not track (one a previous sandboxd left) or one whose unmount failed is
+// unmounted first, and the folder is never removed through a mount.
 func (m *Manager) UnmountAll(sandboxID string) error {
 	m.mu.Lock()
 	states := m.state[sandboxID]
@@ -303,7 +309,12 @@ func (m *Manager) UnmountAll(sandboxID string) error {
 			firstErr = err
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(m.rootDir, sandboxID)); err != nil && firstErr == nil {
+	// No folder was ever made for an id mountSet would refuse.
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return firstErr
+	}
+	if err := m.clearMountDir(dir); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -446,14 +457,134 @@ func (m *Manager) beginMount(ctx context.Context, id string) (release func(), er
 	}, nil
 }
 
-// cleanupOrphanDir kills FUSE processes attached to anything under dir,
-// unmounts every leaf, and removes the tree. Best-effort; logs failures.
+// cleanupOrphanDir kills FUSE processes attached to anything under dir
+// (a helper may be alive with nothing mounted yet), then clears dir like
+// any mount folder: unmounted first, never removed through a mount.
+// Best-effort; logs failures.
 func (m *Manager) cleanupOrphanDir(dir string) {
 	killFUSEProcessesFor(m.logger, dir)
-	unmountTree(m.logger, dir)
-	if err := os.RemoveAll(dir); err != nil {
+	if err := m.clearMountDir(dir); err != nil {
 		m.logger.Warn("mounts sweep: remove failed", "path", dir, "error", err)
 	}
+}
+
+// Discard tears down every mount of sandboxID and mounts nothing: the ones
+// this process tracks, and whatever a previous sandboxd left serving them
+// (a helper still running, a kernel mount still in place). The service
+// calls it when it refuses to run a sandbox's stored mounts again, so a
+// refused helper does not keep running after a restart. The untracked part
+// is claimed the way Sweep claims an orphan, so a MountAll in flight for
+// the ID keeps its directory: Discard leaves it to that call. Either way
+// the folder goes through clearMountDir, never through a live mount. It
+// reports whether there was anything to tear down, so a caller that runs
+// on every reconcile pass reports a teardown once.
+func (m *Manager) Discard(sandboxID string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	_, tracked := m.state[sandboxID]
+	m.mu.Unlock()
+	if tracked {
+		_ = m.UnmountAll(sandboxID)
+		return true
+	}
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return false
+	}
+	done, _ := m.claimOrphan(sandboxID)
+	if done == nil {
+		return false
+	}
+	defer m.releaseOrphan(sandboxID, done)
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	m.logger.Info("mounts: discarding refused mounts", "sandbox_id", sandboxID, "path", dir)
+	m.cleanupOrphanDir(dir)
+	return true
+}
+
+// KeepReport is what KeepLive did with a sandbox's mounts.
+type KeepReport struct {
+	// Kept lists the mounts (by index) taken over as they ran. Gone lists
+	// the ones nothing served, or that could not be taken over as they
+	// were; they are cleared and stay unmounted.
+	Kept, Gone []int
+	// Already is true when this process already owned the sandbox's
+	// mounts (a later reconcile pass); KeepLive then did nothing.
+	Already bool
+}
+
+// KeepLive takes over the mounts a previous sandboxd left serving
+// sandboxID, as they run, and starts nothing: no mount is made afresh, and
+// a kept tool that exits is not restarted (mountState.kept). The service
+// calls it for a sandbox still running across a restart whose stored
+// specs the allow lists now refuse but which may stay while they run
+// (models.MountSpec.ValidateRunningToolOptions): tearing the mount down
+// would break the sandbox's storage and stop nothing that matters, and
+// mounting it again would run the refused spec once more. A mount that
+// cannot be taken over as it is (not live, a helper running other
+// arguments, a kernel mount that will not take nosuid,nodev) is cleared as
+// Reestablish clears one before mounting afresh, and left unmounted. The
+// set is tracked like any other, even when nothing was kept, so Sweep
+// leaves it alone, a later pass does nothing, and stop or Discard tears
+// down what was kept. Like mountSet, it owns the folder while it works.
+func (m *Manager) KeepLive(ctx context.Context, sandboxID string, mounts []models.MountSpec) (KeepReport, error) {
+	if m == nil || len(mounts) == 0 {
+		return KeepReport{}, nil
+	}
+	if err := models.ValidateSandboxID(sandboxID); err != nil {
+		return KeepReport{}, fmt.Errorf("mount: %w", err)
+	}
+	release, err := m.beginMount(ctx, sandboxID)
+	if err != nil {
+		return KeepReport{}, fmt.Errorf("mount: %w", err)
+	}
+	defer release()
+	m.mu.Lock()
+	_, tracked := m.state[sandboxID]
+	busy := m.mounting[sandboxID] > 1
+	m.mu.Unlock()
+	if tracked {
+		return KeepReport{Already: true}, nil
+	}
+	if busy {
+		return KeepReport{}, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
+	}
+	var report KeepReport
+	kept := make([]*mountState, 0, len(mounts))
+	var helpers []helperProcess
+	dir, _ := m.mountFolder(sandboxID)
+	_, statErr := os.Stat(dir)
+	if statErr == nil {
+		helpers = m.listHelperProcesses()
+	}
+	for i, spec := range mounts {
+		var state *mountState
+		if statErr == nil {
+			// ctx says whose mounts these are (consumerFrom), as for any
+			// adopted mount.
+			state, _ = m.adoptOne(ctx, sandboxID, i, spec, helpers)
+		}
+		if state == nil {
+			if statErr == nil {
+				m.clearStaleMount(sandboxID, i, helpers)
+			}
+			report.Gone = append(report.Gone, i)
+			continue
+		}
+		// Set before the state is stored under mu, which is where
+		// superviseExit reads it.
+		state.kept = true
+		kept = append(kept, state)
+		report.Kept = append(report.Kept, i)
+	}
+	m.mu.Lock()
+	m.state[sandboxID] = kept
+	m.mu.Unlock()
+	return report, nil
 }
 
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
@@ -601,6 +732,14 @@ func (m *Manager) superviseExit(state *mountState) {
 		return
 	}
 	if state.disabled {
+		return
+	}
+	if state.kept {
+		// Restarting it would run the refused spec again.
+		state.disabled = true
+		m.logger.Warn("mounts: a kept mount's tool exited; it is not started again, as its stored options are refused",
+			"sandbox_id", state.sandboxID, "index", state.index, "type", string(state.spec.Type), "error", err)
+		_ = unmountPath(state.hostPath)
 		return
 	}
 

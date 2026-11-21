@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
@@ -81,6 +82,10 @@ type Driver struct {
 	codeRunPaths map[string]string
 
 	rehydrate sync.Map // sandboxID -> *sync.Mutex single-flight gates
+
+	// uploads is the toolbox upload spool (cfg.UploadSpoolDir). It lives
+	// here, not on the per-request toolhost, so its folder is made once.
+	uploads *multipartspool.Spool
 }
 
 // New constructs a WASM driver. The zero value is not usable.
@@ -94,6 +99,7 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 		newWorkerClient: defaultWorkerClientFactory,
 		precompile:      worker.Precompile,
 		byID:            make(map[string]*sandboxInstance),
+		uploads:         multipartspool.New(cfg.UploadSpoolDir),
 	}
 	d.net = newNetworkGateway()
 	d.net.SetHTTPProxy(d.guestHTTPProxy)

@@ -53,8 +53,9 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		argv = append(argv, "--read-only")
 	}
 	if extra := spec.Options["extra_args"]; extra != "" {
-		// Whitespace-split; we trust the operator's image policy here. Each
-		// token becomes its own argv entry to avoid shell interpretation.
+		// Whitespace-split, each word its own argv entry, so no shell reads
+		// it. Which flags may appear is the allow list in
+		// MountSpec.ValidateToolOptions, enforced when a create is admitted.
 		argv = append(argv, strings.Fields(extra)...)
 	}
 	argv = append(argv, "--", bucket, hostTarget)

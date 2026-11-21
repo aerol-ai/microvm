@@ -263,3 +263,116 @@ func TestKeyCustodyAlertRules(t *testing.T) {
 		t.Fatalf("key-custody alerts missing: %v", missing)
 	}
 }
+
+// TestRootHelperRefusalAlertRule lints the root helper group
+// (plans/security-gaps-m1-m4.md §3.3, eng review D9): the one alert pages
+// at once on any refusal, it is complete, the metric it reads is
+// registered in the Go tree, it groups by the positional key/key2 an
+// expvar map exports (call and reason), it keeps the clause that fires on
+// a counter's first refusal, and its runbook_url lands on a heading of
+// setup/runbooks/secrets-and-audit.md. promtool proves the expression in
+// TestRootHelperRefusalAlertFires.
+func TestRootHelperRefusalAlertRule(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "setup", "prometheus", "sandboxd-alerts.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules ruleFile
+	if err := yaml.Unmarshal(raw, &rules); err != nil {
+		t.Fatalf("sandboxd-alerts.yml does not parse: %v", err)
+	}
+	runbook, err := os.ReadFile(filepath.Join(root, "setup", "runbooks", "secrets-and-audit.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchors := map[string]bool{}
+	for _, line := range strings.Split(string(runbook), "\n") {
+		for _, prefix := range []string{"## ", "### "} {
+			if heading, ok := strings.CutPrefix(line, prefix); ok {
+				anchors[githubAnchor(heading)] = true
+			}
+		}
+	}
+	registered := goMetricLiterals(t, root)
+	metricRE := regexp.MustCompile(`aerolvm_[a-z0-9_]+`)
+	byRE := regexp.MustCompile(`by \(([^)]*)\)`)
+	const runbookURL = "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#"
+
+	var found int
+	for _, g := range rules.Groups {
+		if g.Name != "sandboxd.root-helper" {
+			continue
+		}
+		for _, r := range g.Rules {
+			if r.Alert != "SandboxdRootHelperRefusal" {
+				t.Errorf("unexpected alert %q in the root helper group", r.Alert)
+				continue
+			}
+			found++
+			// One refusal is a page: no waiting, and the top severity.
+			if r.For != "0m" || r.Labels["severity"] != "critical" || r.Labels["component"] != "root-helper" ||
+				r.Annotations["summary"] == "" || r.Annotations["description"] == "" {
+				t.Errorf("incomplete or delayed rule %+v", r)
+			}
+			anchor, ok := strings.CutPrefix(r.Annotations["runbook_url"], runbookURL)
+			if !ok || !anchors[anchor] {
+				t.Errorf("runbook_url %q is not a heading of secrets-and-audit.md", r.Annotations["runbook_url"])
+			}
+			names := metricRE.FindAllString(r.Expr, -1)
+			if len(names) == 0 {
+				t.Errorf("the expression reads no aerolvm_ metric: %s", r.Expr)
+			}
+			for _, name := range names {
+				if name != "aerolvm_rootd_refusals_total" || !registered[name] {
+					t.Errorf("queries %s; want aerolvm_rootd_refusals_total, registered in the Go tree", name)
+				}
+			}
+			for _, m := range byRE.FindAllStringSubmatch(r.Expr, -1) {
+				for _, label := range strings.Split(m[1], ",") {
+					if l := strings.TrimSpace(label); l != "instance" && l != "key" && l != "key2" {
+						t.Errorf("groups by %q; sandboxd exports key/key2 only", l)
+					}
+				}
+			}
+			// increase() sees no rise on a series' first sample, and a
+			// refusal's series is born at 1: without this clause the first
+			// refusal on a node, usually the only one, never fires.
+			if !strings.Contains(r.Expr, "unless aerolvm_rootd_refusals_total offset 5m") {
+				t.Errorf("the expression lost its first-refusal clause: %s", r.Expr)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("SandboxdRootHelperRefusal found %d times in group sandboxd.root-helper, want 1", found)
+	}
+}
+
+// TestRootHelperRefusalAlertFires runs promtool's unit tests for the alert
+// (testdata/sandboxd-rootd-refusals.test.yaml): a node's first refusal, a
+// later one and one after a sandboxd restart each fire, and a flat counter
+// does not. Like the chart's promtool checks it needs promtool on PATH (or
+// PROMTOOL), and skips without it unless AEROLVM_CHART_TOOLS=require.
+func TestRootHelperRefusalAlertFires(t *testing.T) {
+	root := repoRoot(t)
+	promtool := chartTool(t, "PROMTOOL", "promtool")
+	if _, err := runTool(t, root, promtool, "test", "rules", filepath.Join(root, "setup", "prometheus", "testdata", "sandboxd-rootd-refusals.test.yaml")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// githubAnchor is the fragment GitHub gives a markdown heading: lower
+// case, spaces to hyphens, and every other character but letters, digits,
+// hyphens and underscores dropped.
+func githubAnchor(heading string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(heading)) {
+		switch {
+		case r == ' ':
+			b.WriteByte('-')
+		case r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}

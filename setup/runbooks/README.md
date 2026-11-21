@@ -15,7 +15,7 @@ Use them during incidents and during scheduled drills:
 | [slo-breach.md](slo-breach.md) | Any sandboxd SLO alert fires and the first response is not obvious. |
 | [containerd-engine-coexistence.md](containerd-engine-coexistence.md) | Flipping or coexisting dockerd and native containerd engines. |
 | [isolate-workerd-upgrade.md](isolate-workerd-upgrade.md) | Upgrading (or rolling back) the version-pinned workerd binary for the V8-isolate runtime. |
-| [secrets-and-audit.md](secrets-and-audit.md) | Secret audit drops, fan-out failures, provider canary, and `GET /v1/sandboxes/{id}/audit`. |
+| [secrets-and-audit.md](secrets-and-audit.md) | Secret audit drops, fan-out failures, provider canary, `GET /v1/sandboxes/{id}/audit`, and a `SandboxdRootHelperRefusal` from the root helper. |
 | [egress-gateway.md](egress-gateway.md) | A `SandboxdEgress*` alert fires, or hostname-filtered creates answer `503 egress_gateway_unavailable`. |
 | [cluster-ingress-topology.md](cluster-ingress-topology.md) | `SandboxdClusterTopologyViolation`: more than 10 ingress nodes without a shard-aware router, or mixed roles above 10 nodes. |
 | [identity-and-access.md](identity-and-access.md) | A `SandboxdBreakGlassPATUse`, `SandboxdPATScopeDrift` or `SandboxdIdentity*` alert fires; rotating the PAT or the scrape token; turning on `SB_PAT_SCOPE=host`; a PROXY-protocol mismatch breaks HTTPS. |
