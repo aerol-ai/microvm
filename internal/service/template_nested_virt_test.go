@@ -426,7 +426,9 @@ func TestTemplateSaveTimeoutStartsOnceTheLockIsHeld(t *testing.T) {
 	setTemplateGOARCH(t, "amd64")
 	ctx := context.Background()
 	svc, st, templatesDir := newHealthHarness(t)
-	svc.cfg.FirecrackerTemplateBuildTimeout = 100 * time.Millisecond
+	// Long enough for a rebuild's own store writes under a loaded CI
+	// runner; the lock is held half as long again, past it.
+	svc.cfg.FirecrackerTemplateBuildTimeout = time.Second
 	seedReadyTemplate(t, st, templatesDir, "tpl-rebuild")
 	seedReadyTemplate(t, st, templatesDir, "tpl-resave")
 	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 4), nestedVirt: "off"})
@@ -438,7 +440,7 @@ func TestTemplateSaveTimeoutStartsOnceTheLockIsHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
-	time.Sleep(250 * time.Millisecond) // longer than the timeout
+	time.Sleep(1500 * time.Millisecond) // longer than the timeout
 	unlockRebuild()
 	unlockResave()
 	if !svc.WaitForTemplateRebuilds(10 * time.Second) {
