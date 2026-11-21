@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -57,13 +58,27 @@ const (
 // RefusalFunc hears every refusal. Calls arrive in parallel.
 type RefusalFunc func(ctx context.Context, r Refusal)
 
-// LogRefusal logs each refusal. A refusal should never happen, since the
-// agent only sends what its own code built, so each one means drift or a
-// compromised agent (eng review D9). The audit event, the metric and the
-// alert come with task T5.
+// LogRefusal logs each refusal: the helper's own record of it. A refusal
+// should never happen, since the agent only sends what its own code built,
+// so each one means drift or a compromised agent (eng review D9).
+//
+// The agent records every refusal it is answered with (internal/rootclient:
+// an audit event, and aerolvm_rootd_refusals_total, which the alert reads),
+// but an agent someone controls can drop its own record, and answer its
+// caller as it likes. This line it cannot touch: the helper writes it as
+// root to its own output, which is the runtime container's log on
+// Kubernetes (the supervisor starts the helper there and passes its output
+// on) and the aerolvm-rootd unit's journal on a VM, both out of the
+// agent's reach. It is also the only record of a peer refusal, a process
+// other than the agent, which the agent never hears of.
+// refusals_since_start lets the latest line alone say how many there were;
+// there is no listener to read a counter from, on purpose (no new root
+// surface).
 func LogRefusal(log *slog.Logger) RefusalFunc {
+	var count atomic.Uint64
 	return func(_ context.Context, r Refusal) {
-		log.Error("root helper refused", "call", r.Method, "reason", r.Reason, "detail", r.Detail)
+		log.Error("root helper refused", "call", rootdpb.CallName(r.Method), "method", r.Method, "reason", r.Reason,
+			"detail", r.Detail, "refusals_since_start", count.Add(1))
 	}
 }
 
@@ -265,8 +280,9 @@ func (h helper) RemoveContainerFiles(ctx context.Context, req *rootdpb.RemoveCon
 
 // answer turns a call's error into its status. A refused request is
 // reported (the agent only sends what its own code built, so each refusal
-// means drift or a broken agent) and keeps its own code; any other failure
-// is the helper's, logged here and answered Internal.
+// means drift or a broken agent) and keeps its own code, with its reason
+// as a rootdpb.HelperRefused detail for the agent to record; any other
+// failure is the helper's, logged here and answered Internal.
 func answer[T any](ctx context.Context, h helper, method string, resp T, err error) (T, error) {
 	var zero T
 	var fe *fileError
@@ -274,10 +290,11 @@ func answer[T any](ctx context.Context, h helper, method string, resp T, err err
 	case err == nil:
 		return resp, nil
 	case errors.As(err, &fe):
-		if fe.reason != "" {
-			h.onRefusal(ctx, Refusal{Method: method, Reason: fe.reason, Detail: fe.msg})
+		if fe.reason == "" {
+			return zero, status.Error(fe.code, fe.msg)
 		}
-		return zero, status.Error(fe.code, fe.msg)
+		h.onRefusal(ctx, Refusal{Method: method, Reason: fe.reason, Detail: fe.msg})
+		return zero, rootdpb.Refused(fe.code, fe.reason, fe.msg)
 	}
 	h.log.Error("root helper: call failed", "call", method, "error", err)
 	return zero, status.Error(codes.Internal, err.Error())

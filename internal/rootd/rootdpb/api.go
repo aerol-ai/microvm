@@ -1,6 +1,13 @@
 package rootdpb
 
-import "errors"
+import (
+	"errors"
+	"regexp"
+	"strings"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
 
 // APIVersion is the newest API level this build speaks, as the agent and
 // as the helper. Bump it at most once per release, and only in a release
@@ -69,3 +76,72 @@ func (d *HelperUnsupported) Error() string {
 
 // Is matches ErrHelperUnsupported.
 func (*HelperUnsupported) Is(target error) bool { return target == ErrHelperUnsupported }
+
+// ErrHelperRefused: the helper or its containerd gate refused the call; it
+// broke the helper's rules. internal/rootclient exports it as ErrRefused.
+var ErrHelperRefused = errors.New("root helper refused the call")
+
+// Error names the reason, so the error containerd's client rebuilds from
+// the status still says which rule.
+func (d *HelperRefused) Error() string {
+	if d.GetReason() == "" {
+		return ErrHelperRefused.Error()
+	}
+	return ErrHelperRefused.Error() + " (" + d.GetReason() + ")"
+}
+
+// Is matches ErrHelperRefused.
+func (*HelperRefused) Is(target error) bool { return target == ErrHelperRefused }
+
+// Refused is the status the helper answers a refused call with: code and
+// msg as before, and a HelperRefused detail carrying reason, which is how
+// the agent's client tells a refusal from any other failure. msg is for
+// logs; reason is what the agent counts and audits.
+func Refused(code codes.Code, reason, msg string) error {
+	st := status.New(code, msg)
+	if withDetail, err := st.WithDetails(&HelperRefused{Reason: reason}); err == nil {
+		st = withDetail
+	}
+	return st.Err()
+}
+
+// RefusalReason reads a refusal's reason from err's status: ok only when
+// the status carries a HelperRefused detail, which only the helper adds.
+func RefusalReason(err error) (reason string, ok bool) {
+	st, isStatus := status.FromError(err)
+	if !isStatus {
+		return "", false
+	}
+	for _, d := range st.Details() {
+		if r, isRefused := d.(*HelperRefused); isRefused {
+			return r.GetReason(), true
+		}
+	}
+	return "", false
+}
+
+// CallName is the short name of a gRPC method, "Service.Method"
+// ("/containerd.services.tasks.v1.Tasks/Create" is "Tasks.Create"), the
+// form the plan names calls in. A refusal's metric label and audit record
+// use it, so it must stay one of a fixed set: a method that is not
+// /<package>.<Service>/<Method> with plain identifiers is "other", and a
+// bare word ("connect", rootd.MethodConnect) stays itself.
+func CallName(fullMethod string) string {
+	if word.MatchString(fullMethod) {
+		return fullMethod
+	}
+	svc, method, ok := strings.Cut(strings.TrimPrefix(fullMethod, "/"), "/")
+	svc = svc[strings.LastIndexByte(svc, '.')+1:]
+	if !ok || !strings.HasPrefix(fullMethod, "/") || !ident.MatchString(svc) || !ident.MatchString(method) {
+		return CallOther
+	}
+	return svc + "." + method
+}
+
+// CallOther is CallName's answer for a method it cannot name.
+const CallOther = "other"
+
+var (
+	word  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	ident = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,63}$`)
+)

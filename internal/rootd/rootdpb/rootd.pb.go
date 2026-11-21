@@ -954,6 +954,59 @@ func (x *HelperUnsupported) GetReason() string {
 	return ""
 }
 
+// HelperRefused marks a call the helper or its containerd gate refused
+// because the request broke the helper's rules (eng review D9). Unlike the
+// two marks above it crosses the socket: the helper adds it to the refused
+// call's status, with the status's usual code. The agent only sends what
+// its own code built, so a refusal means drift or a broken agent, and the
+// agent's client records each one (internal/rootclient). In Go it is an
+// error that matches ErrHelperRefused.
+type HelperRefused struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The rule's short, fixed code ("method_not_allowed", "mount"), fit for
+	// a metric label.
+	Reason        string `protobuf:"bytes,1,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HelperRefused) Reset() {
+	*x = HelperRefused{}
+	mi := &file_rootd_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HelperRefused) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HelperRefused) ProtoMessage() {}
+
+func (x *HelperRefused) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HelperRefused.ProtoReflect.Descriptor instead.
+func (*HelperRefused) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *HelperRefused) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 var File_rootd_proto protoreflect.FileDescriptor
 
 const file_rootd_proto_rawDesc = "" +
@@ -1007,6 +1060,8 @@ const file_rootd_proto_rawDesc = "" +
 	"\x1cRemoveContainerFilesResponse\"\x13\n" +
 	"\x11HelperUnavailable\"+\n" +
 	"\x11HelperUnsupported\x12\x16\n" +
+	"\x06reason\x18\x01 \x01(\tR\x06reason\"'\n" +
+	"\rHelperRefused\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason*_\n" +
 	"\vRunscConfig\x12\x1c\n" +
 	"\x18RUNSC_CONFIG_UNSPECIFIED\x10\x00\x12\x18\n" +
@@ -1036,7 +1091,7 @@ func file_rootd_proto_rawDescGZIP() []byte {
 }
 
 var file_rootd_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_rootd_proto_goTypes = []any{
 	(RunscConfig)(0),                     // 0: aerolvm.rootd.v1.RunscConfig
 	(*VersionRequest)(nil),               // 1: aerolvm.rootd.v1.VersionRequest
@@ -1056,6 +1111,7 @@ var file_rootd_proto_goTypes = []any{
 	(*RemoveContainerFilesResponse)(nil), // 15: aerolvm.rootd.v1.RemoveContainerFilesResponse
 	(*HelperUnavailable)(nil),            // 16: aerolvm.rootd.v1.HelperUnavailable
 	(*HelperUnsupported)(nil),            // 17: aerolvm.rootd.v1.HelperUnsupported
+	(*HelperRefused)(nil),                // 18: aerolvm.rootd.v1.HelperRefused
 }
 var file_rootd_proto_depIdxs = []int32{
 	5,  // 0: aerolvm.rootd.v1.EnsureHostFilesRequest.hosts:type_name -> aerolvm.rootd.v1.HostEntry
@@ -1092,7 +1148,7 @@ func file_rootd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rootd_proto_rawDesc), len(file_rootd_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   17,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -109,6 +109,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.EnsureHostResponse": nil,
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
 		"aerolvm.rootd.v1.HelperUnsupported":  {"reason=1:string"},
+		"aerolvm.rootd.v1.HelperRefused":      {"reason=1:string"},
 		"aerolvm.rootd.v1.HostEntry":          {"address=1:string", "names=2:repeated string"},
 		"aerolvm.rootd.v1.EnsureHostFilesRequest": {"container_id=1:string", "hostname=2:string", "hosts=3:repeated message",
 			"nameservers=4:repeated string", "search=5:repeated string", "dns_options=6:repeated string", "egress_ca_der=7:bytes"},
@@ -353,6 +354,90 @@ func TestHelperUnsupportedIsTheError(t *testing.T) {
 	var nilDetail *HelperUnsupported
 	if nilDetail.GetReason() != "" {
 		t.Fatal("nil getter")
+	}
+}
+
+// TestHelperRefusedIsTheError: the helper's refusal detail is an error
+// matching ErrHelperRefused and nothing else, so containerd's client keeps
+// it when it rebuilds an error from the status, and it is never read as
+// the helper being down or too old.
+func TestHelperRefusedIsTheError(t *testing.T) {
+	var d error = &HelperRefused{Reason: "mount"}
+	if !errors.Is(d, ErrHelperRefused) || errors.Is(d, ErrHelperUnavailable) || errors.Is(d, ErrHelperUnsupported) {
+		t.Fatalf("detail %v does not match ErrHelperRefused alone", d)
+	}
+	if d.Error() != "root helper refused the call (mount)" || (&HelperRefused{}).Error() != ErrHelperRefused.Error() {
+		t.Fatalf("Error() = %q", d.Error())
+	}
+}
+
+// TestRefusedCarriesTheReason: Refused keeps the code and the message, and
+// its reason comes back out after the status crosses a connection; a
+// status without the detail, or an error that is no status, is no refusal.
+func TestRefusedCarriesTheReason(t *testing.T) {
+	err := Refused(codes.InvalidArgument, "bad_request", "root helper: hostname too long")
+	// What the agent's side gets: the status rebuilt from its wire form.
+	back := status.ErrorProto(status.Convert(err).Proto())
+	if status.Code(back) != codes.InvalidArgument || status.Convert(back).Message() != "root helper: hostname too long" {
+		t.Fatalf("status = %v", back)
+	}
+	for _, tc := range []struct {
+		name   string
+		err    error
+		reason string
+		ok     bool
+	}{
+		{"refused", back, "bad_request", true},
+		{"wrapped", fmt.Errorf("ensure host files: %w", back), "bad_request", true},
+		{"a refusal with no reason", Refused(codes.PermissionDenied, "", "x"), "", true},
+		{"a plain status", status.Error(codes.PermissionDenied, "aerolvm root gate refused"), "", false},
+		{"helper unavailable", mustDetail(t, codes.Unavailable, &HelperUnavailable{}), "", false},
+		{"not a status", errors.New("refused"), "", false},
+		{"nil", nil, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, ok := RefusalReason(tc.err)
+			if reason != tc.reason || ok != tc.ok {
+				t.Fatalf("RefusalReason = %q, %v; want %q, %v", reason, ok, tc.reason, tc.ok)
+			}
+		})
+	}
+}
+
+func mustDetail(t *testing.T, code codes.Code, d *HelperUnavailable) error {
+	t.Helper()
+	st, err := status.New(code, "down").WithDetails(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Err()
+}
+
+// TestCallName: the short name is Service.Method for every call the agent
+// makes, and anything that is not a plain gRPC method name is "other", so
+// the metric label stays a fixed set whatever arrives.
+func TestCallName(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"/containerd.services.tasks.v1.Tasks/Create", "Tasks.Create"},
+		{"/containerd.services.diff.v1.Diff/Apply", "Diff.Apply"},
+		{RootHelper_EnsureHostFiles_FullMethodName, "RootHelper.EnsureHostFiles"},
+		{"/grpc.health.v1.Health/Check", "Health.Check"},
+		{"/Tasks/Create", "Tasks.Create"},
+		{"connect", "connect"},
+		{"peer_not_allowed", "peer_not_allowed"},
+		{"", CallOther},
+		{"Tasks/Create", CallOther},
+		{"/containerd.services.tasks.v1.Tasks", CallOther},
+		{"/a.B/C/D", CallOther},
+		{"/a.B/", CallOther},
+		{"/a.B/C D", CallOther},
+		{"/a.B/" + strings.Repeat("x", 65), CallOther},
+		{"/a.9B/C", CallOther},
+		{"Connect", CallOther},
+	} {
+		if got := CallName(tc.in); got != tc.want {
+			t.Errorf("CallName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

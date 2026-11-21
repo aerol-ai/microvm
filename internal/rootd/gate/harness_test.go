@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
@@ -265,6 +266,10 @@ func (r *rig) wantRefused(err error, method, reason string) {
 	}
 	if st := status.Convert(err).Message(); !strings.Contains(st, method) || !strings.Contains(st, reason) {
 		r.t.Fatalf("error %q does not name the method and reason", st)
+	}
+	// The agent's client reads the reason off the answer (eng review D9).
+	if got, ok := rootdpb.RefusalReason(err); !ok || got != reason {
+		r.t.Fatalf("the answer's refusal reason is %q, %v; want %s", got, ok, reason)
 	}
 	for _, c := range r.fake.seen() {
 		if c.method == method {

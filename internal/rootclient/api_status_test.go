@@ -385,6 +385,33 @@ func TestTooOldHelperOnContainerdPathIsUnsupported(t *testing.T) {
 // helper unavailable. This needs the helper's real server, which marks
 // every call it answers.
 func TestContainerdsOwnUnavailablePassesThrough(t *testing.T) {
+	p, cfg := helperConfig(t)
+	srv, err := rootd.New(cfg, rootd.Options{
+		Containerd: func(_ any, ss grpc.ServerStream) error {
+			_ = ss.RecvMsg(&emptypb.Empty{})
+			return status.Error(codes.Unavailable, "snapshotter overlayfs not loaded")
+		},
+		Peer: egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve() }()
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+
+	_, err = containerd(t, client(t, p, time.Second)).ContainerService().List(ctx5(t))
+	if errors.Is(err, rootclient.ErrUnavailable) || !errdefs.IsUnavailable(err) || !strings.Contains(err.Error(), "snapshotter overlayfs not loaded") {
+		t.Fatalf("Containers.List = %v; Is helper unavailable %v; want containerd's own Unavailable", err, errors.Is(err, rootclient.ErrUnavailable))
+	}
+	if strings.Contains(apihttp.Classify(err).Message, "root helper") {
+		t.Fatalf("the API blames the helper: %q", apihttp.Classify(err).Message)
+	}
+}
+
+// helperConfig is a helper's config on a fresh socket, with the helper's
+// own folders, which every helper needs.
+func helperConfig(t *testing.T) (string, rootd.Config) {
+	t.Helper()
 	p := sock(t)
 	dir, err := filepath.EvalSymlinks(filepath.Dir(p))
 	if err != nil {
@@ -412,26 +439,7 @@ func TestContainerdsOwnUnavailablePassesThrough(t *testing.T) {
 	cfg.Policy.FIFODir = filepath.Join(base, "run", "fifo")
 	cfg.Policy.HelperFileRoots = []string{cfg.Files.Hosts, cfg.Files.Ready}
 	cfg.Policy.RunscConfigPaths = []string{filepath.Join(cfg.Files.Runsc, "config.toml"), filepath.Join(cfg.Files.Runsc, "restore.toml")}
-	srv, err := rootd.New(cfg, rootd.Options{
-		Containerd: func(_ any, ss grpc.ServerStream) error {
-			_ = ss.RecvMsg(&emptypb.Empty{})
-			return status.Error(codes.Unavailable, "snapshotter overlayfs not loaded")
-		},
-		Peer: egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = srv.Serve() }()
-	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-
-	_, err = containerd(t, client(t, p, time.Second)).ContainerService().List(ctx5(t))
-	if errors.Is(err, rootclient.ErrUnavailable) || !errdefs.IsUnavailable(err) || !strings.Contains(err.Error(), "snapshotter overlayfs not loaded") {
-		t.Fatalf("Containers.List = %v; Is helper unavailable %v; want containerd's own Unavailable", err, errors.Is(err, rootclient.ErrUnavailable))
-	}
-	if strings.Contains(apihttp.Classify(err).Message, "root helper") {
-		t.Fatalf("the API blames the helper: %q", apihttp.Classify(err).Message)
-	}
+	return p, cfg
 }
 
 // TestDeadlinesOnContainerdPathAre503 is review N3: a deadline that runs

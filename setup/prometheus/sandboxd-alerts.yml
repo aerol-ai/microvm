@@ -1151,3 +1151,29 @@ groups:
           summary: "servers do not sign sandbox tokens yet, though every server could"
           description: "Nodes still sign sandbox tokens with the shared server key. `aerolvm upgrade signing` names the members that hold it back. Upgrade or delete them, or start server signing anyway (`aerolvm upgrade signing start`)."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-upgrades.md#server-signing-held"
+
+  # The root helper (aerolvm-rootd, plans/security-gaps-m1-m4.md §3.3, eng
+  # review D9). sandboxd counts every call the helper or its containerd
+  # gate refused; aerolvm_rootd_refusals_total is an expvar map, so the call
+  # is the positional "key" label and the reason "key2".
+  - name: sandboxd.root-helper
+    interval: 30s
+    rules:
+      # sandboxd only sends the helper what its own code built, and that
+      # passes, so a single refusal is drift between the two or someone
+      # asking for root through a sandboxd they control. A series is born
+      # at 1 on its first refusal, where increase() sees no rise, so the
+      # second clause fires on a series that did not exist 5 minutes ago.
+      - alert: SandboxdRootHelperRefusal
+        expr: |
+          sum by (instance, key, key2) (increase(aerolvm_rootd_refusals_total[5m])) > 0
+          or
+          count by (instance, key, key2) (aerolvm_rootd_refusals_total unless aerolvm_rootd_refusals_total offset 5m)
+        for: 0m
+        labels:
+          severity: critical
+          component: root-helper
+        annotations:
+          summary: "the root helper refused a call from sandboxd"
+          description: "{{ $labels.instance }}: the root helper refused {{ $labels.key }} ({{ $labels.key2 }}) in the last 5 minutes. sandboxd only sends what its own code built, so this is drift between sandboxd and the helper, or a compromised sandboxd. The create failed with a 500. Treat it as a security incident until drift is ruled out."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal"
