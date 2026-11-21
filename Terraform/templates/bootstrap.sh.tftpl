@@ -1402,6 +1402,47 @@ if [ "${container_engine}" = "containerd" ]; then
   # containerd worker only (no oci worker), pinned to the aerolvm namespace + our
   # containerd socket so builds share the driver's image store. Host networking
   # for RUN steps avoids needing a separate buildkit CNI config.
+%{ if one_line_join ~}
+  # Build steps (RUN) join the sandboxes' own CNI network (the aerolvm0
+  # bridge in /etc/cni/net.d/aerolvm.conflist, which sandboxd writes when it
+  # starts), so they get the sandboxes' egress floor and node guard instead
+  # of the host's network; install.sh's buildkit_unit says why in full. A
+  # unit an earlier bootstrap wrote with host networking is rewritten and
+  # restarted; any other buildkit.service is the operator's and is kept.
+  # Only the one-line join path: the old path must render as v0.6.13 did,
+  # or Terraform replaces every node of an existing cluster.
+  bk_restart=""
+  if [ -f /etc/systemd/system/buildkit.service ] \
+    && grep -q 'Description=BuildKit (aerolvm containerd worker)' /etc/systemd/system/buildkit.service \
+    && grep -q -- '--containerd-worker-net=host' /etc/systemd/system/buildkit.service; then
+    echo "[bootstrap] moving BuildKit build steps off the host network"
+    bk_restart=1
+  fi
+  if [ ! -f /etc/systemd/system/buildkit.service ] || [ -n "$${bk_restart}" ]; then
+    sudo tee /etc/systemd/system/buildkit.service >/dev/null <<UNIT
+[Unit]
+Description=BuildKit (aerolvm containerd worker)
+Requires=containerd.service
+After=containerd.service sandboxd.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStartPre=/usr/bin/test -s /etc/cni/net.d/aerolvm.conflist
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=${containerd_cfg.socket} --containerd-worker-namespace=${containerd_cfg.namespace} --containerd-worker-net=cni --containerd-cni-config-path=/etc/cni/net.d/aerolvm.conflist --containerd-cni-binary-dir=${containerd_cfg.cni_plugin_dir}
+Restart=on-failure
+RestartSec=5
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl enable --now buildkit.service || echo "[bootstrap] warning: buildkit.service failed to start" >&2
+  if [ -n "$${bk_restart}" ]; then
+    sudo systemctl restart buildkit.service || echo "[bootstrap] warning: buildkit.service failed to restart" >&2
+  fi
+%{ else ~}
   if [ ! -f /etc/systemd/system/buildkit.service ]; then
     sudo tee /etc/systemd/system/buildkit.service >/dev/null <<UNIT
 [Unit]
@@ -1420,6 +1461,7 @@ UNIT
     sudo systemctl daemon-reload
   fi
   sudo systemctl enable --now buildkit.service || echo "[bootstrap] warning: buildkit.service failed to start" >&2
+%{ endif ~}
 fi
 
 sudo systemctl restart sandboxd

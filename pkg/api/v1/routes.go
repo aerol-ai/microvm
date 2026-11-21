@@ -146,6 +146,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("DELETE "+PathPrefix+"/tokens/{id}", d.Route(controlplane.PermTokenWrite, http.HandlerFunc(h.revokeToken)))
 	// A server reads each owner's capacity as itself (capacity leases).
 	mux.Handle("GET "+PathPrefix+"/capacity", d.RouteForNodes(permRead, nodeGrantAny, http.HandlerFunc(h.capacity)))
+	// Which runtimes this deployment offers (plans/security-gaps-m1-m4.md
+	// §11). Answered from capacity this node already holds; never forwarded.
+	mux.Handle("GET "+PathPrefix+"/runtimes", d.Route(permRead, http.HandlerFunc(h.listRuntimes)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Route(permFleet, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Route(permWrite, http.HandlerFunc(h.clusterBuildImageWrap)))
 

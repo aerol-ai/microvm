@@ -108,6 +108,15 @@ func (c *Client) PutMachineConfig(ctx context.Context, cfg MachineConfig) error 
 	return c.do(ctx, http.MethodPut, "/machine-config", cfg, nil)
 }
 
+// PutCPUConfig sets a custom CPU template for every vCPU. Pre-boot only,
+// and only on a fresh VMM: a snapshot load restores the CPU its VM was
+// saved with. Send it after PutMachineConfig: Firecracker applies whichever
+// of machine-config's cpu_template and this came last, and a PUT
+// /machine-config resets cpu_template to none.
+func (c *Client) PutCPUConfig(ctx context.Context, cfg CPUConfig) error {
+	return c.do(ctx, http.MethodPut, "/cpu-config", cfg, nil)
+}
+
 // PutBootSource declares the kernel image and command line for a cold-boot
 // VMM. Not used on snapshot-load — the kernel is in the memory file there.
 func (c *Client) PutBootSource(ctx context.Context, src BootSource) error {

@@ -807,9 +807,33 @@ the skip.
   seconds to start cold, etcd writes per sandbox, 110 pods per machine); rule
   K5 does not hold in that mode; egress control needs a new home, because
   there is no worker firewall.
-- **Effort:** design first, human M / CC S. **Priority:** P2.
-- **Depends on:** spike S9's result. Trigger: a bank refuses privileged pods
-  and S9 fails on its machine image.
+- **Effort:** the design is now item M4 in `plans/security-gaps-m1-m4.md` §6
+  (eng-reviewed 2026-11-19: toolboxd trusts its worker over mTLS with no
+  secret in the pod spec, D8; a lease fence before any recreate, D17);
+  build human M / CC S. **Priority:** P2.
+- **Depends on:** spike S9's result (it failed on EKS 1.36, §8.7). Trigger:
+  a bank refuses privileged pods.
+
+---
+
+## Worker machines prove what they booted: NitroTPM node attestation (Kubernetes, P3)
+
+- **What:** build an attestable EKS worker AMI (Amazon Linux 2023 with KIWI
+  NG, UEFI, NitroTPM) and make the join flow ask for a NitroTPM attestation
+  document whose PCR4, PCR7 and PCR12 match an approved AMI before a worker
+  gets its node certificate. Item M3c in `plans/security-gaps-m1-m4.md` §5.2.
+- **Why:** today a worker proves who it is with a ServiceAccount token,
+  TokenReview and mTLS (`plans/kubernetes-v2-architecture.md` §15.2), not
+  with hardware. The capability matrix lists "no hardware attestation" as
+  part of the row where AerolVM trails AWS Nitro Sandboxes.
+- **Pros:** a stolen join token or a tampered machine image cannot join a
+  cell; pairs with M3's guest attestation.
+- **Cons:** we must build, sign and ship our own worker AMI; the EC2 pages
+  say nothing about the EKS-optimized AMI or Bottlerocket; NitroTPM state is
+  not kept in EBS snapshots.
+- **Effort:** human L / CC M. **Priority:** P3.
+- **Depends on:** nothing technical. Trigger: a buyer asks for node
+  attestation (eng review D18, 2026-11-19).
 
 ---
 
