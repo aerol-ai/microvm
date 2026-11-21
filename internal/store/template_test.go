@@ -953,3 +953,57 @@ func TestTemplateNestedVirtMigration(t *testing.T) {
 		t.Fatalf("migration 15 on a database without templates = %v, want its error", err)
 	}
 }
+
+// SwapTemplateSnapshot moves a ready template to a new snapshot only while
+// the row still holds the one being replaced, and the record moves with
+// the checksum it was written for.
+func TestSwapTemplateSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+	tpl := &models.Template{
+		ID: "tpl-swap", Image: "docker://alpine:3.19", Status: models.TemplateStatusReady,
+		CreatedAt: now, UpdatedAt: now, HasSnapshot: true, RootfsPath: "/t/rootfs.ext4",
+		SnapshotMemoryPath: "/t/snapshot.memory", SnapshotStatePath: "/t/snapshot.state",
+		SnapshotChecksum: "sha256:old|sha256:old",
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatal(err)
+	}
+
+	// The row moved on: another checksum, then another status.
+	if ok, err := st.SwapTemplateSnapshot(ctx, tpl.ID, "sha256:other|sha256:other", "/t/m2", "/t/s2", 9, "sha256:new|sha256:new", 7, "off"); ok || err != nil {
+		t.Fatalf("swap against a changed checksum = %v, %v; want false, nil", ok, err)
+	}
+	if ok, err := st.SwapTemplateSnapshot(ctx, "tpl-missing", tpl.SnapshotChecksum, "/t/m2", "/t/s2", 9, "c", 7, "off"); ok || err != nil {
+		t.Fatalf("swap of a missing template = %v, %v; want false, nil", ok, err)
+	}
+
+	ok, err := st.SwapTemplateSnapshot(ctx, tpl.ID, tpl.SnapshotChecksum, "/t/snapshot.x.memory", "/t/snapshot.x.state", 9, "sha256:new|sha256:new", 7, "off")
+	if !ok || err != nil {
+		t.Fatalf("swap = %v, %v", ok, err)
+	}
+	got, err := st.GetTemplate(ctx, tpl.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != models.TemplateStatusReady || !got.HasSnapshot || !got.HasOverlay ||
+		got.SnapshotMemoryPath != "/t/snapshot.x.memory" || got.SnapshotStatePath != "/t/snapshot.x.state" ||
+		got.SnapshotChecksum != "sha256:new|sha256:new" || got.SnapshotVsockCID != 7 || got.SnapshotSizeBytes != 9 ||
+		got.SnapshotNestedVirt != "off" {
+		t.Fatalf("after the swap: %+v", got)
+	}
+
+	if _, err := st.MarkTemplateUnhealthy(ctx, tpl.ID, "rebuild"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := st.SwapTemplateSnapshot(ctx, tpl.ID, "sha256:new|sha256:new", "/t/m3", "/t/s3", 9, "c3", 7, "off"); ok {
+		t.Fatal("swapped a template that is no longer ready")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SwapTemplateSnapshot(ctx, tpl.ID, "x", "/m", "/s", 1, "c", 1, "off"); err == nil {
+		t.Fatal("a closed store swapped without an error")
+	}
+}

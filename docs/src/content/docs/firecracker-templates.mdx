@@ -317,7 +317,7 @@ A rebuild makes a new snapshot from the disk the template already has. Rebuild w
 - the snapshot is damaged and you want it fixed before the next create;
 - the server's kernel was upgraded. A rebuild picks up the change.
 
-The server also rebuilds a template on its own when its snapshot was saved under a different `SB_FIRECRACKER_NESTED_VIRT` setting than the server's, such as every template saved before this setting existed. It does this when it starts. Until the rebuild ends, sandboxes from that template start from its disk, which takes seconds instead of milliseconds.
+The server also saves a template's snapshot again on its own when it was saved under a different `SB_FIRECRACKER_NESTED_VIRT` setting than the server's, such as every template saved before v0.7.8. It does this after it starts, one template at a time. The template stays `ready` the whole time: until its new snapshot is in place, new sandboxes from it start from the old one, with the CPU features it was saved with. If a save fails, the template keeps its old snapshot and the server tries again at its next start.
 
 A rebuild does not pick up a new toolbox (the helper program inside each sandbox). The toolbox is copied onto the template's disk when the template is created, and a rebuild reuses that disk. After a toolbox upgrade, delete the template and create it again.
 

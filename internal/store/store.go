@@ -4971,6 +4971,46 @@ func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, st
 	return nil
 }
 
+// SwapTemplateSnapshot points a ready template at a new snapshot (new
+// files, its checksum and nested-virtualization record) in one UPDATE,
+// only while the row still holds the snapshot the new one replaces: status
+// ready, has_snapshot=1 and snapshot_checksum oldChecksum. The new snapshot
+// is saved under new file names first, so a running clone keeps the files
+// it loaded, and a create that already read the row loads the old snapshot
+// whole. Every snapshot capture includes the overlay placeholder, so
+// has_overlay becomes 1, as UpdateTemplateSnapshotReady's callers set it.
+// Returns false, with no error, when the row moved on (a rebuild, a
+// delete, another swap); the caller then drops the new files.
+func (s *Store) SwapTemplateSnapshot(ctx context.Context, id, oldChecksum, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32, nestedVirt string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE firecracker_templates
+		SET snapshot_memory_path = ?, snapshot_state_path = ?, snapshot_size_bytes = ?,
+			snapshot_checksum = ?, snapshot_vsock_cid = ?, has_overlay = 1,
+			snapshot_nested_virt = ?, snapshot_nested_virt_checksum = ?, updated_at = ?
+		WHERE id = ? AND status = ? AND has_snapshot = 1 AND snapshot_checksum = ?
+	`,
+		strings.TrimSpace(memPath),
+		strings.TrimSpace(statePath),
+		sizeBytes,
+		strings.TrimSpace(checksum),
+		vsockCID,
+		strings.TrimSpace(nestedVirt),
+		strings.TrimSpace(checksum),
+		time.Now().UTC(),
+		strings.TrimSpace(id),
+		string(models.TemplateStatusReady),
+		strings.TrimSpace(oldChecksum),
+	)
+	if err != nil {
+		return false, fmt.Errorf("swap template snapshot: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("swap template snapshot rows affected: %w", err)
+	}
+	return affected == 1, nil
+}
+
 // UpdateTemplateSnapshotFailed records the snapshot-phase error and flips
 // status to ready_no_snapshot. The rootfs columns are untouched — the
 // caller has already populated them via UpdateTemplateStatus during the

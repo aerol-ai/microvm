@@ -158,6 +158,9 @@ type Driver struct {
 	// nestedVirt is each running VM's nested-virtualization record, what
 	// its stop snapshot saves (nested_virt.go).
 	nestedVirt map[string]firecracker.NestedVirt
+	// staleTemplates holds the ids of templates already logged as saved
+	// under the other nested-virtualization setting (noteStaleTemplate).
+	staleTemplates sync.Map
 	// frozenAdopted is every VM adopted while the ownership lease had it
 	// frozen: its adoption steps that need the VM to answer (resuming a
 	// paused VM, thawing the guest's disk) run once it is thawed
@@ -460,9 +463,8 @@ type TemplateResolution struct {
 	// virtio-blk device post-load, only PATCH an existing one's path.
 	HasOverlay bool
 	// SnapshotNestedVirt is the SB_FIRECRACKER_NESTED_VIRT setting the
-	// snapshot's VM booted under. Create loads the snapshot only when it
-	// matches this node's; otherwise it cold-boots the rootfs and asks the
-	// service to save the snapshot again (nested_virt.go).
+	// snapshot's VM booted under, which each clone inherits
+	// (nested_virt.go).
 	SnapshotNestedVirt firecracker.NestedVirt
 }
 
@@ -602,19 +604,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
 		}
-		// A snapshot saved under another nested-virtualization setting
-		// would restore that setting's CPU. Cold-boot the rootfs instead
-		// (neither the warm pool nor the snapshot-load path takes a
-		// resolution without a snapshot), and have the service save the
-		// snapshot again: one store write, on the first such create, after
-		// which the template reads has_snapshot=0 until the rebuild ends.
-		if reason := d.templateNestedVirtMismatch(earlySnap); reason != "" {
-			d.logger.Warn("firecracker create: template snapshot not loaded", "template_id", req.TemplateID, "reason", reason)
-			d.notifyCorrupt(ctx, req.TemplateID, reason)
-			cold := *earlySnap
-			cold.HasSnapshot = false
-			earlySnap = &cold
-		}
+		d.noteStaleTemplate(earlySnap)
 	}
 	warmStart := time.Now()
 	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
@@ -1010,9 +1000,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// half-built state (the deferred closures run on panic).
 	released = true
 	tapRemoved = false // sandbox-owned now; Destroy will remove
-	// A cold boot got this node's setting (configureVMM), and a snapshot
-	// load only a template that matches it (templateNestedVirtMismatch).
-	d.register(allocID, client, handle, handshakeCID, true, d.hostNestedVirt())
+	// A cold boot got this node's setting (configureVMM); a clone has the
+	// CPU its template was saved with.
+	vmNestedVirt := d.hostNestedVirt()
+	if snapshotLoadPath {
+		vmNestedVirt = snapshotInfo.SnapshotNestedVirt
+	}
+	d.register(allocID, client, handle, handshakeCID, true, vmNestedVirt)
 
 	return &models.SandboxRuntimeState{
 		SandboxID: allocID,

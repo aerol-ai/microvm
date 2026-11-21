@@ -118,10 +118,12 @@ func templateFixture(t *testing.T, saved firecracker.NestedVirt) (*driverFixture
 	return f, notifier
 }
 
-// A template snapshot saved under another setting would restore that
-// setting's CPU: Create cold-boots the template's rootfs with this node's
-// setting instead, and asks the service to save the snapshot again.
-func TestTemplateSnapshotSavedUnderAnotherSettingColdBoots(t *testing.T) {
+// A template saved under the other setting still loads: cold-booting it
+// would stage the template's shared rootfs as the clone's writable disk.
+// The clone inherits the template's record (so its stop snapshot says what
+// CPU it has), the driver asks for nothing (the service saves such
+// templates again at start), and the template is logged once.
+func TestTemplateSavedUnderAnotherSettingStillLoads(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		saved       firecracker.NestedVirt
@@ -139,29 +141,25 @@ func TestTemplateSnapshotSavedUnderAnotherSettingColdBoots(t *testing.T) {
 			}, "sb-tpl-nv", "tok", nil); err != nil {
 				t.Fatalf("Create: %v", err)
 			}
-			if f.client.snapshotLoad != nil {
-				t.Fatal("the snapshot was loaded")
+			if f.client.snapshotLoad == nil || f.client.cpu != nil {
+				t.Fatalf("loaded=%v cpu config=%v; want the snapshot loaded and no CPU config", f.client.snapshotLoad != nil, f.client.cpu)
 			}
-			if indexOf(f.client.restOrder, "Action:"+firecracker.ActionInstanceStart) < 0 {
-				t.Fatalf("no cold boot: %v", f.client.restOrder)
+			if got := f.driver.vmNestedVirt("sb-tpl-nv"); got != tc.saved {
+				t.Fatalf("clone record = %q, want the template's %q", got, tc.saved)
 			}
-			if hidden := f.client.cpu != nil; hidden == tc.nodeAllowed {
-				t.Fatalf("CPU config sent = %v on a node with nested virt allowed = %v", hidden, tc.nodeAllowed)
+			if _, logged := f.driver.staleTemplates.Load("tpl-nv"); !logged {
+				t.Fatal("the stale template was not logged")
 			}
-			if got, want := f.driver.vmNestedVirt("sb-tpl-nv"), firecracker.NestedVirtSetting(tc.nodeAllowed); got != want {
-				t.Fatalf("VM record = %q, want %q", got, want)
-			}
-			calls := notifier.snapshot()
-			if len(calls) != 1 || calls[0].templateID != "tpl-nv" || !strings.Contains(calls[0].reason, "nested virtualization") {
-				t.Fatalf("notifier calls = %+v, want one rebuild request for tpl-nv", calls)
+			if calls := notifier.snapshot(); len(calls) != 0 {
+				t.Fatalf("the driver marked the template: %+v", calls)
 			}
 		})
 	}
 }
 
-// A template saved under this node's setting loads, and no rebuild is
-// asked for. On a node that allows nested virtualization, a snapshot saved
-// before the record booted with it visible, so it matches too.
+// A template saved under this node's setting loads quietly, and its clone
+// has its record. On a node that allows nested virtualization, a snapshot
+// saved before the record booted with it visible, so it matches too.
 func TestTemplateSnapshotSavedUnderThisSettingLoads(t *testing.T) {
 	for _, tc := range []struct {
 		saved       firecracker.NestedVirt
@@ -171,17 +169,46 @@ func TestTemplateSnapshotSavedUnderThisSettingLoads(t *testing.T) {
 		{firecracker.NestedVirtOn, true},
 		{firecracker.NestedVirtUnknown, true},
 	} {
-		f, notifier := templateFixture(t, tc.saved)
+		f, _ := templateFixture(t, tc.saved)
 		f.driver.cfg.NestedVirt = tc.nodeAllowed
 		if _, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
 			Image: "alpine:3.20", CPU: 1, MemoryMB: 128, DiskGB: 1, TemplateID: "tpl-nv",
 		}, "sb-tpl-ok", "tok", nil); err != nil {
 			t.Fatalf("saved %q, node allows %v: Create: %v", tc.saved, tc.nodeAllowed, err)
 		}
-		if f.client.snapshotLoad == nil || f.client.cpu != nil || len(notifier.snapshot()) != 0 {
-			t.Fatalf("saved %q, node allows %v: loaded=%v cpu=%v notified=%v", tc.saved, tc.nodeAllowed,
-				f.client.snapshotLoad != nil, f.client.cpu, notifier.snapshot())
+		_, logged := f.driver.staleTemplates.Load("tpl-nv")
+		if f.client.snapshotLoad == nil || f.client.cpu != nil || logged || f.driver.vmNestedVirt("sb-tpl-ok") != tc.saved {
+			t.Fatalf("saved %q, node allows %v: loaded=%v cpu=%v logged=%v record=%q", tc.saved, tc.nodeAllowed,
+				f.client.snapshotLoad != nil, f.client.cpu, logged, f.driver.vmNestedVirt("sb-tpl-ok"))
 		}
+	}
+}
+
+// On arm64 there is nothing to hide: no CPU config, no stale-template log,
+// no kept-start count, and moves are never refused for it.
+func TestNestedVirtOnArm64ChecksNothing(t *testing.T) {
+	hostArch = "arm64"
+	t.Cleanup(func() { hostArch = "amd64" })
+	ctx := context.Background()
+
+	f, _ := templateFixture(t, firecracker.NestedVirtUnknown)
+	if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{
+		Image: "alpine:3.20", CPU: 1, MemoryMB: 128, DiskGB: 1, TemplateID: "tpl-nv",
+	}, "sb-arm", "tok", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, logged := f.driver.staleTemplates.Load("tpl-nv"); logged || f.client.cpu != nil {
+		t.Fatalf("arm64 logged a stale template (%v) or sent a CPU config (%v)", logged, f.client.cpu)
+	}
+	before := nestedVirtKeptStarts.Value()
+	f.driver.noteKeptNestedVirt("sb-arm", firecracker.NestedVirtOn)
+	if nestedVirtKeptStarts.Value() != before {
+		t.Fatal("arm64 counted a kept start")
+	}
+
+	on := exportBundle(t, "sb-arm-mv", firecracker.NestedVirtOn)
+	if err := newDriverFixture(t).driver.ImportSandboxSnapshot(ctx, "sb-arm-mv", bytes.NewReader(on)); err != nil {
+		t.Fatalf("arm64 refused a move: %v", err)
 	}
 }
 
@@ -246,11 +273,13 @@ func TestStoppedSandboxKeepsItsNestedVirt(t *testing.T) {
 		t.Fatalf("its next stop recorded %q; the VM still has the CPU it was saved with", m.NestedVirt)
 	}
 
-	// A node that allows nested virtualization counts nothing.
+	// A node that allows nested virtualization counts nothing, not even a
+	// sandbox saved with it hidden.
 	f.driver.cfg.NestedVirt = true
 	if _, err := f.driver.StartWithIdentity(ctx, "sb-keep", "sb-keep", "tok"); err != nil {
 		t.Fatal(err)
 	}
+	f.driver.noteKeptNestedVirt("sb-off", firecracker.NestedVirtOff)
 	if nestedVirtKeptStarts.Value() != before+1 {
 		t.Fatal("a node that allows nested virtualization counted a kept start")
 	}
@@ -340,10 +369,15 @@ func TestNestedVirtLabel(t *testing.T) {
 		t.Fatalf("label of on = %q", got)
 	}
 	d := New(Config{}, nil)
-	if reason := d.templateNestedVirtMismatch(nil); reason != "" {
-		t.Fatalf("no template: %q", reason)
+	d.noteStaleTemplate(nil)
+	d.noteStaleTemplate(&TemplateResolution{TemplateID: "tpl-cold", HasSnapshot: false})
+	if _, logged := d.staleTemplates.Load("tpl-cold"); logged {
+		t.Fatal("a template with no snapshot was logged as stale")
 	}
-	if reason := d.templateNestedVirtMismatch(&TemplateResolution{HasSnapshot: false}); reason != "" {
-		t.Fatalf("a template with no snapshot: %q", reason)
+	stale := &TemplateResolution{TemplateID: "tpl-twice", HasSnapshot: true}
+	d.noteStaleTemplate(stale)
+	d.noteStaleTemplate(stale)
+	if _, logged := d.staleTemplates.Load("tpl-twice"); !logged {
+		t.Fatal("a stale template was not logged")
 	}
 }

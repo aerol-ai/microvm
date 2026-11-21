@@ -41,6 +41,14 @@ func (n NestedVirt) Matches(nodeAllowed bool) bool {
 	return n == NestedVirtOff
 }
 
+// NestedVirtApplies reports whether nested virtualization can be hidden,
+// or needs to be, on a host of this GOARCH: amd64 only. On arm64 Firecracker
+// never asks KVM for EL2, so no guest there can run a VM of its own,
+// whatever its record says, and records are not checked.
+func NestedVirtApplies(goarch string) bool {
+	return goarch == "amd64"
+}
+
 // HideNestedVirt is the CPU config that hides the CPU's virtualization
 // extensions from the guest: Intel VMX (CPUID leaf 0x1, ECX bit 5) and AMD
 // SVM (leaf 0x80000001, ECX bit 2). KVM lets a guest turn either on only

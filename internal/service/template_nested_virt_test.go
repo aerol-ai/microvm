@@ -2,6 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,23 +15,54 @@ import (
 
 // seedTemplateSavedWith is seedReadyTemplate with the snapshot's
 // nested-virtualization record ("" leaves it unknown).
-func seedTemplateSavedWith(t *testing.T, st *store.Store, templatesDir, id, saved string) {
+func seedTemplateSavedWith(t *testing.T, st *store.Store, templatesDir, id, saved string) *models.Template {
 	t.Helper()
 	tpl := seedReadyTemplate(t, st, templatesDir, id)
 	if saved == "" {
-		return
+		return tpl
 	}
 	if err := st.UpdateTemplateSnapshotReady(context.Background(), id, tpl.SnapshotMemoryPath, tpl.SnapshotStatePath,
 		tpl.SnapshotSizeBytes, tpl.SnapshotChecksum, tpl.SnapshotVsockCID, true, saved); err != nil {
 		t.Fatal(err)
 	}
+	got, err := st.GetTemplate(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// serialSnapshotter wraps the fake snapshotter, records the most saves that
+// ran at once, and runs hook (if set) in the middle of each save.
+type serialSnapshotter struct {
+	inner          *fakeTemplateSnapshotter
+	inFlight, most atomic.Int32
+	hook           func(req TemplateSnapshotRequest)
+}
+
+func (s *serialSnapshotter) SnapshotTemplate(ctx context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
+	n := s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
+	for {
+		m := s.most.Load()
+		if n <= m || s.most.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	time.Sleep(5 * time.Millisecond)
+	if s.hook != nil {
+		s.hook(req)
+	}
+	return s.inner.SnapshotTemplate(ctx, req)
 }
 
 // At start, every ready template saved under another setting than this
-// node's is saved again with this node's, and the rest are left alone: a
-// snapshot saved with it matches, and a template with no ready snapshot has
-// nothing to load.
+// node's is saved again, one at a time, to new files, and stays ready the
+// whole time; the rest are left alone. The next start removes the files the
+// rows no longer name.
 func TestResaveTemplateSnapshotsForNestedVirtAtStart(t *testing.T) {
+	templateGOARCH = "amd64"
+	t.Cleanup(func() { templateGOARCH = "amd64" })
 	for _, tc := range []struct {
 		name        string
 		nodeAllowed bool
@@ -41,8 +76,9 @@ func TestResaveTemplateSnapshotsForNestedVirtAtStart(t *testing.T) {
 			ctx := context.Background()
 			svc, st, templatesDir := newHealthHarness(t)
 			svc.cfg.FirecrackerNestedVirt = tc.nodeAllowed
+			before := map[string]*models.Template{}
 			for id, saved := range map[string]string{"tpl-unknown": "", "tpl-on": "on", "tpl-off": "off"} {
-				seedTemplateSavedWith(t, st, templatesDir, id, saved)
+				before[id] = seedTemplateSavedWith(t, st, templatesDir, id, saved)
 			}
 			seedReadyTemplate(t, st, templatesDir, "tpl-unhealthy")
 			if _, err := st.MarkTemplateUnhealthy(ctx, "tpl-unhealthy", "being rebuilt"); err != nil {
@@ -57,55 +93,205 @@ func TestResaveTemplateSnapshotsForNestedVirtAtStart(t *testing.T) {
 			if tc.nodeAllowed {
 				want = "on"
 			}
-			snapper := &fakeTemplateSnapshotter{done: make(chan struct{}, 8), nestedVirt: want}
+			// Mid-save, every template is still ready and still has its old
+			// snapshot: creates keep loading it.
+			var notReady atomic.Int32
+			snapper := &serialSnapshotter{inner: &fakeTemplateSnapshotter{done: make(chan struct{}, 8), nestedVirt: want}}
+			snapper.hook = func(req TemplateSnapshotRequest) {
+				got, err := st.GetTemplate(ctx, req.TemplateID)
+				if err != nil || got.Status != models.TemplateStatusReady || !got.HasSnapshot ||
+					got.SnapshotMemoryPath != before[req.TemplateID].SnapshotMemoryPath {
+					notReady.Add(1)
+				}
+			}
 			svc.SetTemplateSnapshotter(snapper)
 			svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
 
 			svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
 			if !svc.WaitForTemplateRebuilds(10 * time.Second) {
-				t.Fatal("rebuilds did not finish")
+				t.Fatal("saves did not finish")
 			}
-			if snapper.calls != len(tc.resaved) {
-				t.Fatalf("snapshotter ran %d times, want %d", snapper.calls, len(tc.resaved))
+			if snapper.inner.calls != len(tc.resaved) || snapper.most.Load() > 1 || notReady.Load() != 0 {
+				t.Fatalf("saves: %d (want %d), at most %d at once (want 1), %d saw the template out of service",
+					snapper.inner.calls, len(tc.resaved), snapper.most.Load(), notReady.Load())
 			}
 			for _, id := range tc.resaved {
 				got, err := st.GetTemplate(ctx, id)
-				if err != nil || got.Status != models.TemplateStatusReady || !got.HasSnapshot || got.SnapshotNestedVirt != want {
-					t.Fatalf("%s after the sweep = %+v, %v; want ready, saved again with %q", id, got, err, want)
+				if err != nil || got.Status != models.TemplateStatusReady || !got.HasSnapshot || got.SnapshotNestedVirt != want ||
+					got.SnapshotMemoryPath == before[id].SnapshotMemoryPath || got.SnapshotStatePath == before[id].SnapshotStatePath {
+					t.Fatalf("%s after the save = %+v, %v; want ready, new files, saved with %q", id, got, err, want)
+				}
+				for _, p := range []string{got.SnapshotMemoryPath, got.SnapshotStatePath, before[id].SnapshotMemoryPath} {
+					if _, err := os.Stat(p); err != nil {
+						t.Fatalf("%s: %s missing after the save: %v (a running clone may still use the old file)", id, p, err)
+					}
 				}
 			}
 			for _, id := range tc.kept {
-				got, _ := st.GetTemplate(ctx, id)
-				if got.Status != models.TemplateStatusReady || got.UpdatedAt.After(got.CreatedAt.Add(time.Minute)) {
-					t.Fatalf("%s was touched: %+v", id, got)
+				if got, _ := st.GetTemplate(ctx, id); got.SnapshotMemoryPath != before[id].SnapshotMemoryPath {
+					t.Fatalf("%s was saved again: %+v", id, got)
 				}
 			}
 			for id, status := range map[string]models.TemplateStatus{
 				"tpl-unhealthy": models.TemplateStatusUnhealthy, "tpl-no-snapshot": models.TemplateStatusReadyNoSnapshot,
 			} {
 				if got, _ := st.GetTemplate(ctx, id); got.Status != status {
-					t.Fatalf("%s moved to %s; the sweep moves only ready rows", id, got.Status)
+					t.Fatalf("%s moved to %s; the sweep only reads ready rows", id, got.Status)
+				}
+			}
+
+			// The next start removes the old snapshot files, and nothing else.
+			svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+			if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+				t.Fatal("second start did not settle")
+			}
+			if snapper.inner.calls != len(tc.resaved) {
+				t.Fatalf("the second start saved again: %d saves", snapper.inner.calls)
+			}
+			for _, id := range tc.resaved {
+				got, _ := st.GetTemplate(ctx, id)
+				if _, err := os.Stat(before[id].SnapshotMemoryPath); !os.IsNotExist(err) {
+					t.Fatalf("%s: the old memory file is still there: %v", id, err)
+				}
+				for _, p := range []string{got.SnapshotMemoryPath, got.SnapshotStatePath, got.RootfsPath} {
+					if _, err := os.Stat(p); err != nil {
+						t.Fatalf("%s: %s was removed: %v", id, p, err)
+					}
 				}
 			}
 		})
 	}
 }
 
-// Without the snapshot pipeline there is nothing to rebuild with, so the
-// sweep leaves every template as it is; a store it cannot list is logged.
-func TestResaveTemplateSnapshotsForNestedVirtAtStartEdges(t *testing.T) {
+// A save drops its files and leaves the row alone when the template moved
+// on meanwhile, and when the snapshotter fails; the template keeps its old
+// snapshot either way, for the next start to try again.
+func TestResaveTemplateSnapshotLeavesTheTemplateAsItWas(t *testing.T) {
+	templateGOARCH = "amd64"
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		set  func(st *store.Store, s *serialSnapshotter)
+		want error
+	}{
+		{"moved on", func(st *store.Store, s *serialSnapshotter) {
+			s.hook = func(req TemplateSnapshotRequest) {
+				if err := st.UpdateTemplateSnapshotReady(ctx, req.TemplateID, "/elsewhere.memory", "/elsewhere.state", 1,
+					"sha256:rebuilt|sha256:rebuilt", 42, true, ""); err != nil {
+					t.Error(err)
+				}
+			}
+		}, errTemplateMovedOn},
+		{"snapshotter fails", func(_ *store.Store, s *serialSnapshotter) { s.inner.err = errors.New("vmm boot timeout") }, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, st, templatesDir := newHealthHarness(t)
+			tpl := seedReadyTemplate(t, st, templatesDir, "tpl-race")
+			snapper := &serialSnapshotter{inner: &fakeTemplateSnapshotter{done: make(chan struct{}, 1), nestedVirt: "off"}}
+			tc.set(st, snapper)
+			svc.SetTemplateSnapshotter(snapper)
+			svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+			err := svc.resaveTemplateSnapshot(ctx, tpl)
+			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) {
+				t.Fatalf("resave = %v, want an error (%v)", err, tc.want)
+			}
+			entries, _ := os.ReadDir(filepath.Dir(tpl.RootfsPath))
+			for _, e := range entries {
+				if isTemplateSnapshotFile(e.Name()) && e.Name() != snapshotMemoryFilename && e.Name() != snapshotStateFilename {
+					t.Fatalf("a dropped save left %s", e.Name())
+				}
+			}
+			if got, _ := st.GetTemplate(ctx, tpl.ID); got.Status != models.TemplateStatusReady || !got.HasSnapshot {
+				t.Fatalf("the template left service: %+v", got)
+			}
+		})
+	}
+
+	svc, st, templatesDir := newHealthHarness(t)
+	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-no-cid")
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{allocateErr: errors.New("cid exhausted")})
+	if err := svc.resaveTemplateSnapshot(ctx, tpl); err == nil {
+		t.Fatal("a save with no CID returned no error")
+	}
+}
+
+// A failed save is logged and the next template still gets its turn.
+func TestResaveTemplateSnapshotsContinuesAfterAFailure(t *testing.T) {
+	templateGOARCH = "amd64"
 	ctx := context.Background()
 	svc, st, templatesDir := newHealthHarness(t)
-	seedReadyTemplate(t, st, templatesDir, "tpl-unknown")
+	seedReadyTemplate(t, st, templatesDir, "tpl-a")
+	seedReadyTemplate(t, st, templatesDir, "tpl-b")
+	var calls atomic.Int32
+	snapper := &serialSnapshotter{inner: &fakeTemplateSnapshotter{done: make(chan struct{}, 2), nestedVirt: "off"}}
+	snapper.hook = func(TemplateSnapshotRequest) {
+		if calls.Add(1) == 1 {
+			snapper.inner.mu.Lock()
+			snapper.inner.err = errors.New("first save fails")
+			snapper.inner.mu.Unlock()
+			return
+		}
+		snapper.inner.mu.Lock()
+		snapper.inner.err = nil
+		snapper.inner.mu.Unlock()
+	}
+	svc.SetTemplateSnapshotter(snapper)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
 	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
-	if got, _ := st.GetTemplate(ctx, "tpl-unknown"); got.Status != models.TemplateStatusReady || !got.HasSnapshot {
+	if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+		t.Fatal("saves did not finish")
+	}
+	saved := 0
+	for _, id := range []string{"tpl-a", "tpl-b"} {
+		if got, _ := st.GetTemplate(ctx, id); got.SnapshotNestedVirt == "off" {
+			saved++
+		}
+	}
+	if calls.Load() != 2 || saved != 1 {
+		t.Fatalf("saves tried %d, done %d; want 2 tried, 1 done", calls.Load(), saved)
+	}
+}
+
+// Where nothing is hidden (arm64), no template is saved again; without the
+// snapshot pipeline nothing happens at all; a store that cannot list is
+// logged.
+func TestResaveTemplateSnapshotsForNestedVirtAtStartEdges(t *testing.T) {
+	ctx := context.Background()
+	templateGOARCH = "arm64"
+	t.Cleanup(func() { templateGOARCH = "amd64" })
+	svc, st, templatesDir := newHealthHarness(t)
+	seedReadyTemplate(t, st, templatesDir, "tpl-unknown")
+	snapper := &fakeTemplateSnapshotter{done: make(chan struct{}, 1)}
+	svc.SetTemplateSnapshotter(snapper)
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+	if !svc.WaitForTemplateRebuilds(10*time.Second) || snapper.calls != 0 {
+		t.Fatalf("arm64 saved %d templates again", snapper.calls)
+	}
+
+	templateGOARCH = "amd64"
+	unwired, st2, dir2 := newHealthHarness(t)
+	seedReadyTemplate(t, st2, dir2, "tpl-unknown")
+	unwired.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+	if got, _ := st2.GetTemplate(ctx, "tpl-unknown"); got.Status != models.TemplateStatusReady {
 		t.Fatalf("an unwired sweep moved the template: %+v", got)
 	}
 
-	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 1)})
-	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+}
+
+func TestIsTemplateSnapshotFile(t *testing.T) {
+	for name, want := range map[string]bool{
+		"snapshot.memory": true, "snapshot.state": true, "snapshot.k3j2.memory": true, "snapshot.k3j2.state": true,
+		"rootfs.ext4": false, "manifest.json": false, "snapshot.memory.bak": false, "snapshots": false,
+	} {
+		if got := isTemplateSnapshotFile(name); got != want {
+			t.Errorf("isTemplateSnapshotFile(%q) = %v, want %v", name, got, want)
+		}
+	}
 }

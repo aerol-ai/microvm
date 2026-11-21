@@ -22,10 +22,13 @@ import (
 //
 //   - A VM booted here (cold boot, a template's snapshot VM, the export
 //     helper) gets this node's setting.
-//   - A clone of a template snapshot gets the template's, and Create loads
-//     only a template whose record matches this node: any other cold-boots
-//     while the service saves the template's snapshot again. So a running
-//     clone on this node always has this node's setting.
+//   - A clone of a template snapshot gets the template's record. A
+//     template saved under the other setting still loads, as it did before
+//     the setting existed, and is logged: the service saves each such
+//     template again, one at a time, after the daemon starts
+//     (ResaveTemplateSnapshotsForNestedVirtAtStart), and the warm pool skips
+//     it until then. Cold-booting it instead would stage the template's
+//     shared rootfs as the clone's writable disk.
 //   - A stopped sandbox keeps the CPU it started with, whatever this node's
 //     setting: refusing it would lose the user's sandbox. Starting one that
 //     sees nested virtualization on a node that hides it is logged and
@@ -59,7 +62,7 @@ func (d *Driver) hostNestedVirt() firecracker.NestedVirt {
 // InstanceStart (Firecracker takes a CPU config only before boot, and a
 // later PUT /machine-config resets it).
 func (d *Driver) configureGuestCPU(ctx context.Context, client VMMClient) error {
-	if d.cfg.NestedVirt || hostArch != "amd64" {
+	if d.cfg.NestedVirt || !firecracker.NestedVirtApplies(hostArch) {
 		return nil
 	}
 	if err := client.PutCPUConfig(ctx, firecracker.HideNestedVirt()); err != nil {
@@ -79,7 +82,7 @@ func (d *Driver) vmNestedVirt(sandboxID string) firecracker.NestedVirt {
 // noteKeptNestedVirt logs and counts the start of a stopped sandbox whose
 // saved VM sees nested virtualization on a node that hides it.
 func (d *Driver) noteKeptNestedVirt(sandboxID string, saved firecracker.NestedVirt) {
-	if d.cfg.NestedVirt || saved == firecracker.NestedVirtOff {
+	if !firecracker.NestedVirtApplies(hostArch) || d.cfg.NestedVirt || saved == firecracker.NestedVirtOff {
 		return
 	}
 	nestedVirtKeptStarts.Add(1)
@@ -95,12 +98,17 @@ func nestedVirtLabel(n firecracker.NestedVirt) string {
 	return string(n)
 }
 
-// templateNestedVirtMismatch reports why this node must not load a
-// template's snapshot, or "" when it may.
-func (d *Driver) templateNestedVirtMismatch(snap *TemplateResolution) string {
-	if snap == nil || !snap.HasSnapshot || snap.SnapshotNestedVirt.Matches(d.cfg.NestedVirt) {
-		return ""
+// noteStaleTemplate logs, once per template and process, a clone of a
+// template whose snapshot was saved under the other setting: the clone gets
+// the template's CPU until the service saves the template again.
+func (d *Driver) noteStaleTemplate(snap *TemplateResolution) {
+	if snap == nil || !snap.HasSnapshot || !firecracker.NestedVirtApplies(hostArch) || snap.SnapshotNestedVirt.Matches(d.cfg.NestedVirt) {
+		return
 	}
-	return fmt.Sprintf("the template's snapshot was saved with nested virtualization %s, and this node (SB_FIRECRACKER_NESTED_VIRT=%t) boots VMs with it %s; its snapshot is saved again, and creates cold-boot until then",
-		nestedVirtLabel(snap.SnapshotNestedVirt), d.cfg.NestedVirt, d.hostNestedVirt())
+	if _, seen := d.staleTemplates.LoadOrStore(snap.TemplateID, true); seen {
+		return
+	}
+	d.logger.Warn("firecracker create: this template's snapshot was saved with another nested virtualization setting; its clones get that setting's CPU until the template is saved again (at daemon start)",
+		"template_id", snap.TemplateID, "saved_nested_virt", nestedVirtLabel(snap.SnapshotNestedVirt),
+		"node_nested_virt", d.hostNestedVirt())
 }

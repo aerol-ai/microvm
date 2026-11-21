@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -613,7 +614,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}
 			vmmPool.SetDefaultDepth(warmDepth)
 			fcDriver.SetWarmPool(vmmPool)
-			lister := &vmmTemplateListerAdapter{svc: svc, nestedVirt: cfg.FirecrackerNestedVirt}
+			lister := &vmmTemplateListerAdapter{svc: svc, nestedVirt: cfg.FirecrackerNestedVirt,
+				checkNestedVirt: fcapi.NestedVirtApplies(goruntime.GOARCH)}
 			spawner := fcruntime.NewPoolSpawner(fcDriver)
 			// The same adapter tears down a released slot the pool has no
 			// handle for (every slot a restart left behind), so the reap
@@ -2408,8 +2410,10 @@ type vmmTemplateListerAdapter struct {
 	svc *service.Service
 	// nestedVirt is SB_FIRECRACKER_NESTED_VIRT: a template saved under the
 	// other setting is not warmed (its snapshot would hand each clone that
-	// setting's CPU) until the service saves it again.
-	nestedVirt bool
+	// setting's CPU) until the service saves it again. checkNestedVirt is
+	// false where nothing is hidden (fcapi.NestedVirtApplies).
+	nestedVirt      bool
+	checkNestedVirt bool
 }
 
 func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([]vmmpool.TemplateWarmInput, error) {
@@ -2425,7 +2429,7 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" {
 			continue
 		}
-		if !fcapi.NestedVirt(t.SnapshotNestedVirt).Matches(a.nestedVirt) {
+		if a.checkNestedVirt && !fcapi.NestedVirt(t.SnapshotNestedVirt).Matches(a.nestedVirt) {
 			continue
 		}
 		out = append(out, vmmpool.TemplateWarmInput{

@@ -13,13 +13,18 @@ template pipeline has three stages and they fail in distinct ways:
 
 Snapshot corruption observed on the boot path flips the row to `unhealthy`
 and the rebuild path (`RebuildTemplateSnapshot`) re-runs stage 1's snapshot
-substep in the background. So does a snapshot saved under another
-`SB_FIRECRACKER_NESTED_VIRT` setting than the node's (its `snapshot_error`
-says "saved with nested virtualization"): at daemon start, or on the first
-create that meets it. After the upgrade that brings the setting, every
-template saved before it is rebuilt once; expect `aerolvm_template_unhealthy`
-to rise and fall back to 0 within a few minutes, while creates from those
-templates cold-boot.
+substep in the background. The rebuild saves to new file names, so clones
+still running on the old snapshot keep their files; the next daemon start
+removes the files a ready template no longer uses.
+
+A template whose snapshot was saved under another `SB_FIRECRACKER_NESTED_VIRT`
+setting than the node's (every template saved before v0.7.8) is saved again
+after daemon start, one at a time, without leaving `ready`: the log says
+`audit saving template snapshots again for the nested virtualization setting`,
+then `audit template snapshot saved again ...` per template. Until its turn,
+its clones get the old CPU features, and the warm pool skips it. A save that
+fails is logged (`template snapshot not saved again`) and tried again at the
+next start; `aerolvm_template_unhealthy` does not move.
 
 ## Alerts
 

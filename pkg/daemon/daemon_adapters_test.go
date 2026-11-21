@@ -421,7 +421,7 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	st := openTestStore(t)
 	logger := testLogger()
 	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
-	a := &vmmTemplateListerAdapter{svc: svc}
+	a := &vmmTemplateListerAdapter{svc: svc, checkNestedVirt: true}
 
 	now := time.Now().UTC()
 	mustCreateTemplate := func(tpl *models.Template) {
@@ -465,7 +465,7 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 
 	// A node that allows nested virtualization warms the other two, and
 	// not the one saved with it hidden.
-	allows := &vmmTemplateListerAdapter{svc: svc, nestedVirt: true}
+	allows := &vmmTemplateListerAdapter{svc: svc, nestedVirt: true, checkNestedVirt: true}
 	got, err = allows.ListWarmableTemplates(ctx)
 	if err != nil {
 		t.Fatalf("ListWarmableTemplates: %v", err)
@@ -476,6 +476,12 @@ func TestVMMTemplateListerAdapter_ListWarmableTemplates(t *testing.T) {
 	}
 	if len(got) != 2 || !ids["tpl-nv-"] || !ids["tpl-nv-on"] {
 		t.Fatalf("a node that allows nested virt warms %v, want tpl-nv- and tpl-nv-on", ids)
+	}
+
+	// Where nothing is hidden (arm64), records are not checked.
+	arm := &vmmTemplateListerAdapter{svc: svc}
+	if got, err = arm.ListWarmableTemplates(ctx); err != nil || len(got) != 3 {
+		t.Fatalf("arm64 lister warms %d templates (%v), want all 3 with snapshots", len(got), err)
 	}
 }
 

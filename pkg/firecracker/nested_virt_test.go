@@ -104,3 +104,11 @@ func TestPutCPUConfigSurfacesARefusal(t *testing.T) {
 		t.Fatal("a 400 from /cpu-config returned no error")
 	}
 }
+
+func TestNestedVirtApplies(t *testing.T) {
+	for goarch, want := range map[string]bool{"amd64": true, "arm64": false, "386": false} {
+		if got := NestedVirtApplies(goarch); got != want {
+			t.Errorf("NestedVirtApplies(%q) = %v, want %v", goarch, got, want)
+		}
+	}
+}

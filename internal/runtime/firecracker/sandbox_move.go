@@ -241,7 +241,7 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 			// Refused before the memory comes over: the sandbox stays where
 			// it is. One saved before the setting existed moves, like any
 			// sandbox that existed then (nested_virt.go).
-			if !d.cfg.NestedVirt && manifest.NestedVirt == firecracker.NestedVirtOn {
+			if !d.cfg.NestedVirt && manifest.NestedVirt == firecracker.NestedVirtOn && firecracker.NestedVirtApplies(hostArch) {
 				return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, errNestedVirtMoveRefused)
 			}
 		}
