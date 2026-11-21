@@ -87,9 +87,11 @@ func FromDaemonConfig(cfg config.Config) Config {
 
 // Driver implements runtime.ContainerRuntime against a local containerd.
 type Driver struct {
-	logger       *slog.Logger
-	cfg          Config
-	networkRules *netrules.Manager
+	logger *slog.Logger
+	cfg    Config
+	// networkRules is the host firewall: netrules in process in privilege
+	// mode single, the root helper in split (SetHostFirewall). Nil: off.
+	networkRules HostFirewall
 
 	// clientMu single-flights lazy connection establishment so a burst of
 	// concurrent first-creates dials containerd once instead of racing on the
@@ -178,13 +180,18 @@ func New(cfg Config, rules *netrules.Manager, logger *slog.Logger) *Driver {
 	if cfg.PullMaxConcurrent > 0 {
 		sem = make(chan struct{}, cfg.PullMaxConcurrent)
 	}
-	return &Driver{
-		logger:       logger,
-		cfg:          cfg,
-		networkRules: rules,
-		pullSem:      sem,
-		pullFails:    make(map[string]pullFailure),
+	d := &Driver{
+		logger:    logger,
+		cfg:       cfg,
+		pullSem:   sem,
+		pullFails: make(map[string]pullFailure),
 	}
+	// A nil *Manager must stay a nil interface: every rule method checks
+	// for no firewall with one nil check.
+	if rules != nil {
+		d.networkRules = rules
+	}
+	return d
 }
 
 // SetNetnsHandoff wires the native netns pool (Phase 2). Nil disables it.

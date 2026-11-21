@@ -50,7 +50,7 @@ type Step string
 // The steps split mode does not cover yet, each with the helper calls it
 // waits for (plan §3.5).
 const (
-	StepFirewall      Step = "firewall"
+	StepFQDNGateway   Step = "fqdn_gateway"
 	StepCgroups       Step = "cgroups"
 	StepImageUser     Step = "image_user"
 	StepDiskQuota     Step = "disk_quota"
@@ -64,7 +64,7 @@ const (
 
 // steps say what each step is, for the operator who meets the error.
 var steps = map[Step]string{
-	StepFirewall:      "the host firewall (sandbox egress and ingress rules, the hostname gateway, node guard, floor, IPv6 fence)",
+	StepFQDNGateway:   "the hostname egress gateway's host side (SB_EGRESS_FQDN_ENABLED)",
 	StepCgroups:       "sandbox cgroup settings (the out-of-memory setting, F10)",
 	StepImageUser:     "reading an image's users from its root filesystem",
 	StepDiskQuota:     "the disk quota on a sandbox's writable layer",

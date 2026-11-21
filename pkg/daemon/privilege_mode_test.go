@@ -51,6 +51,18 @@ func TestCheckPrivilegeMode(t *testing.T) {
 	if err := checkPrivilegeMode(splitConfig()); err != nil {
 		t.Fatalf("split mode with nothing the helper lacks: %v", err)
 	}
+	// M1 PR 5: the host firewall and enterprise mode's fence are the
+	// helper's now.
+	for _, set := range []func(*config.Config){
+		func(c *config.Config) { c.EnableNetworkRules = true },
+		func(c *config.Config) { c.EnterpriseMode = true },
+	} {
+		cfg := splitConfig()
+		set(&cfg)
+		if err := checkPrivilegeMode(cfg); err != nil {
+			t.Fatalf("split mode refused what the helper does: %v", err)
+		}
+	}
 	for _, tc := range []struct {
 		name string
 		set  func(*config.Config)
@@ -59,9 +71,7 @@ func TestCheckPrivilegeMode(t *testing.T) {
 	}{
 		{"the Docker engine", func(c *config.Config) { c.ContainerEngine = models.ContainerEngineDocker }, "SB_CONTAINER_ENGINE=containerd", nil},
 		{"no netns pool", func(c *config.Config) { c.ContainerdNativeNetnsPoolEnabled = false }, "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", nil},
-		{"the firewall", func(c *config.Config) { c.EnableNetworkRules = true }, "host firewall", []privmode.Step{privmode.StepFirewall}},
-		{"the hostname gateway", func(c *config.Config) { c.EgressFQDNEnabled = true }, "host firewall", []privmode.Step{privmode.StepFirewall}},
-		{"enterprise mode's fence", func(c *config.Config) { c.EnterpriseMode = true }, "host firewall", []privmode.Step{privmode.StepFirewall}},
+		{"the hostname gateway", func(c *config.Config) { c.EgressFQDNEnabled = true }, "hostname egress gateway", []privmode.Step{privmode.StepFQDNGateway}},
 		{"the warm pool", func(c *config.Config) { c.ContainerdPoolEnabled = true }, "warm pool", []privmode.Step{privmode.StepWarmPool}},
 		{"WASM", func(c *config.Config) { c.EnableWasm = true }, "WASM", []privmode.Step{privmode.StepHostProcesses}},
 		{"V8 isolates", func(c *config.Config) { c.EnableIsolate = true }, "V8", []privmode.Step{privmode.StepHostProcesses}},
@@ -71,8 +81,8 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"a rollback of ingress proxy routing", func(c *config.Config) {
 			c.DBPath = filepath.Join(engagedMarkerDir(t), "state.db")
 		}, "host-port forwarding", []privmode.Step{privmode.StepHostPorts}},
-		{"several at once, each named", func(c *config.Config) { c.EnableNetworkRules, c.EnableWasm = true, true }, "WASM",
-			[]privmode.Step{privmode.StepFirewall, privmode.StepHostProcesses}},
+		{"several at once, each named", func(c *config.Config) { c.EgressFQDNEnabled, c.EnableWasm = true, true }, "WASM",
+			[]privmode.Step{privmode.StepFQDNGateway, privmode.StepHostProcesses}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()
@@ -437,7 +447,10 @@ func TestWireContainerEngineSplit(t *testing.T) {
 }
 
 // engineHelper is the whole helper the engine wiring takes.
-type engineHelper struct{ *memHelper }
+type engineHelper struct {
+	*memHelper
+	*memFirewall
+}
 
 func (*engineHelper) Socket() string                      { return "/nonexistent/root.sock" }
 func (*engineHelper) ContainerdOptions() []cntrclient.Opt { return nil }
