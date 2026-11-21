@@ -29,6 +29,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -211,9 +212,16 @@ func (d *Driver) tryAcquireWarm(
 	// per-sandbox rebind PATCHes and PATCH /vm state=Resumed.
 	client := d.newClient(slot.APISocket)
 
+	// WarmSpawn staged the template's rootfs here before LoadSnapshot, and
+	// the paused VM has it open. It is reused, not staged again: a new link
+	// fails on the existing file, a cross-device copy would put a whole
+	// rootfs copy on the create path, and either would take the template's
+	// file as it is now rather than the one this VM was loaded against.
+	// The PATCH below still binds the root drive to it before Resume, as
+	// the cold load does.
 	warmRootfsPath := filepath.Join(slot.RunDir, rootfsFileName)
-	if err := linkOrCopyRootfs(snap.RootfsPath, warmRootfsPath); err != nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs: %w", err)
+	if _, err := os.Stat(warmRootfsPath); err != nil {
+		return nil, false, fmt.Errorf("firecracker runtime: warm slot rootfs: %w", err)
 	}
 	warmRootfsAPIPath, err := d.chrootFilePath(slot.RunDir, warmRootfsPath, rootfsFileName)
 	if err != nil {
