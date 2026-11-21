@@ -357,7 +357,7 @@ func TestPublishSharedErrors(t *testing.T) {
 	if err := os.WriteFile(file, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := New(Config{CompileCacheDir: file}, nil).compileShared(context.Background(), "/m.wasm"); err == nil {
+	if err := New(Config{CompileCacheDir: file}, nil).compileShared(context.Background(), "/m.wasm", "dm"); err == nil {
 		t.Fatal("compiled under a file")
 	}
 }

@@ -9,6 +9,8 @@
 //	(iv)  cold: an empty compile cache, resident host on
 //	(v)   eight different operator modules created at once on a fresh node
 //	      (each one's first create), resident host on
+//	(vi)  the first creates after a sandboxd restart that kept its workers
+//	      (TestCreateLatencyRestart, restart_test.go)
 //
 // It is behind the wasmbench tag (make test never runs it) and needs Linux
 // root in a container that allows new PID namespaces when workers drop:

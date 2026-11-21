@@ -1,12 +1,19 @@
 package wasm
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
@@ -34,6 +41,13 @@ import (
 // wazero keys an entry by the module's bytes, its runtime configuration
 // and the CPU, so an entry compiled from the operator's file serves any
 // worker that compiles the same bytes, whoever's sandbox it is.
+//
+// A compile is done once per node, not once per sandboxd: its last step
+// writes a marker beside the entries (sharedMarkerName), and a sandboxd
+// that finds a sound marker for a module, the one before a restart
+// having compiled it, reads the entries back instead of compiling again.
+// The marker names the compiler (wazero's version folder) and the CPU, so
+// an upgrade or another CPU compiles again.
 
 // sharedCacheName is the shared cache's folder under the cache root.
 const sharedCacheName = "shared"
@@ -45,6 +59,164 @@ const sharedStageName = ".shared-stage"
 
 // sharedCompileTimeout bounds one trusted compile.
 const sharedCompileTimeout = 10 * time.Minute
+
+// sharedMarkerPrefix starts a compile's marker in the shared cache, and
+// sharedMarkerTemp the name it is written under before its rename.
+// linkShared only links version folders, so neither reaches a worker.
+const (
+	sharedMarkerPrefix = ".compiled-"
+	sharedMarkerTemp   = ".marker-*.tmp"
+	sharedMarkerHeader = "aerolvm shared compile v1"
+	// sharedMarkerMax bounds what a marker check reads.
+	sharedMarkerMax = 64 << 10
+)
+
+// sharedMarkerName is the marker of module digest compiled by this build
+// on this CPU.
+func sharedMarkerName(digest string) string {
+	sum := sha256.Sum256([]byte(digest + "\x00" + sharedCompilerID()))
+	return sharedMarkerPrefix + hex.EncodeToString(sum[:16])
+}
+
+// sharedCompilerID is what a shared entry depends on besides the module:
+// wazero's version folder, as wazero names it from the build, and the
+// CPU features it keys entries by.
+var sharedCompilerID = sync.OnceValue(func() string {
+	return "wazero-" + wazeroVersion() + "-" + runtime.GOARCH + "-" + runtime.GOOS + " cpu=" + cpuFeatures()
+})
+
+// wazeroVersion is wazero's version as wazero reads it for its cache
+// folder: the module's version in the build, "dev" when there is none.
+func wazeroVersion() string {
+	v := ""
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, dep := range info.Deps {
+			if strings.Contains(dep.Path, "github.com/tetratelabs/wazero") {
+				v = dep.Version
+			}
+		}
+	}
+	if v == "" || v == "(devel)" {
+		return "dev"
+	}
+	return v
+}
+
+// cpuInfoPath is where cpuFeatures reads the CPU's features (tests point
+// it elsewhere).
+var cpuInfoPath = "/proc/cpuinfo"
+
+// cpuFeatures hashes the first CPU's feature line in cpuInfoPath ("flags"
+// on x86, "Features" on arm64); "" where there is none.
+func cpuFeatures() string {
+	f, err := os.Open(cpuInfoPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 16<<10), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.TrimSpace(line) == "" {
+			break // the end of the first CPU's block
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if key = strings.TrimSpace(key); ok && (key == "flags" || key == "Features") {
+			sum := sha256.Sum256([]byte(strings.TrimSpace(val)))
+			return hex.EncodeToString(sum[:8])
+		}
+	}
+	return ""
+}
+
+// sharedMarkerText is what a marker holds: the module, the compiler, and
+// each entry ("<version folder>/<name>") the compile published.
+func sharedMarkerText(digest string, entries []string) string {
+	var b strings.Builder
+	b.WriteString(sharedMarkerHeader + "\n")
+	b.WriteString("digest " + digest + "\n")
+	b.WriteString("compiler " + sharedCompilerID() + "\n")
+	for _, e := range entries {
+		b.WriteString("entry " + e + "\n")
+	}
+	return b.String()
+}
+
+// parseSharedMarker returns the entries of a marker written for digest by
+// this compiler, and false for anything else.
+func parseSharedMarker(text, digest string) ([]string, bool) {
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	if len(lines) < 4 || lines[0] != sharedMarkerHeader || lines[1] != "digest "+digest || lines[2] != "compiler "+sharedCompilerID() {
+		return nil, false
+	}
+	var entries []string
+	for _, line := range lines[3:] {
+		e, ok := strings.CutPrefix(line, "entry ")
+		version, name, ok2 := strings.Cut(e, "/")
+		if !ok || !ok2 || !plainName(version) || !plainName(name) {
+			return nil, false
+		}
+		entries = append(entries, e)
+	}
+	return entries, true
+}
+
+// plainName is one path element that names something in its folder.
+func plainName(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\x00")
+}
+
+// sharedEntries lists a sealed staging folder's entries as
+// "<version folder>/<name>".
+func sharedEntries(stage string) ([]string, error) {
+	versions, err := os.ReadDir(stage)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, v := range versions {
+		if !v.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(stage, v.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range entries {
+			if e.Type().IsRegular() {
+				out = append(out, v.Name()+"/"+e.Name())
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// writeSharedMarker writes digest's marker into shared, last, once its
+// entries are in: written under a temporary name, synced, then renamed, so
+// a marker is whole or absent.
+func writeSharedMarker(shared, digest string, entries []string) error {
+	f, err := os.CreateTemp(shared, sharedMarkerTemp)
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_, werr := f.WriteString(sharedMarkerText(digest, entries))
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, filepath.Join(shared, sharedMarkerName(digest)))
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+	}
+	return werr
+}
 
 type sharedCompile struct {
 	done chan struct{}
@@ -65,7 +237,7 @@ func (d *Driver) sharedCacheDir() string {
 // the cache: the worker then compiles into its owner's cache, as it would
 // for any other module.
 func (d *Driver) ensureSharedCompiled(ctx context.Context, resolved *wasmmod.ResolvedModule) {
-	if d.sharedCacheDir() == "" || d.precompile == nil || resolved == nil || !resolved.Operator || resolved.Digest == "" || resolved.Path == "" {
+	if d.sharedCacheDir() == "" || d.precompile == nil || !d.wazeroEngine() || resolved == nil || !resolved.Operator || resolved.Digest == "" || resolved.Path == "" {
 		return
 	}
 	d.sharedMu.Lock()
@@ -90,11 +262,23 @@ func (d *Driver) ensureSharedCompiled(ctx context.Context, resolved *wasmmod.Res
 	}
 }
 
+// wazeroEngine reports whether workers run wazero, whose compiled code the
+// shared cache holds: under wasmtime a create would wait for a compile no
+// worker reads.
+func (d *Driver) wazeroEngine() bool {
+	e := strings.ToLower(strings.TrimSpace(d.cfg.Engine))
+	return e == "" || e == "wazero"
+}
+
 func (d *Driver) runSharedCompile(st *sharedCompile, resolved *wasmmod.ResolvedModule) {
 	defer close(st.done)
+	// A sandboxd before this one compiled it: nothing to wait for.
+	if d.sharedCompiled(resolved.Digest) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), sharedCompileTimeout)
 	defer cancel()
-	err := d.compileShared(ctx, resolved.Path)
+	err := d.compileShared(ctx, resolved.Path, resolved.Digest)
 	st.err = err
 	if err != nil {
 		// Let a later create try again.
@@ -108,15 +292,23 @@ func (d *Driver) runSharedCompile(st *sharedCompile, resolved *wasmmod.ResolvedM
 }
 
 // compileShared compiles one module into a staging folder of its own,
-// seals it there and moves its entries into the shared cache. Each compile
-// has its own folder, so different modules compile at the same time (a
-// first create of one never waits on another's compile) and sealing one
-// never sees another's half-written files. A rename is atomic, so linkShared
-// only ever finds whole, sealed entries.
-func (d *Driver) compileShared(ctx context.Context, modulePath string) error {
+// seals it there and moves its entries into the shared cache, then writes
+// the module's marker. Each compile has its own folder, so different
+// modules compile at the same time (a first create of one never waits on
+// another's compile) and sealing one never sees another's half-written
+// files. A rename is atomic, so linkShared only ever finds whole, sealed
+// entries, and a marker only ever names entries already there.
+func (d *Driver) compileShared(ctx context.Context, modulePath, digest string) error {
 	shared := d.sharedCacheDir()
 	stageRoot := filepath.Join(d.cfg.CompileCacheDir, sharedStageName)
-	d.stageSweep.Do(func() { _ = os.RemoveAll(stageRoot) })
+	d.stageSweep.Do(func() {
+		_ = os.RemoveAll(stageRoot)
+		// Markers a crash left half written.
+		left, _ := filepath.Glob(filepath.Join(shared, sharedMarkerTemp))
+		for _, p := range left {
+			_ = os.Remove(p)
+		}
+	})
 	for _, dir := range []string{shared, stageRoot} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
@@ -136,7 +328,18 @@ func (d *Driver) compileShared(ctx context.Context, modulePath string) error {
 	if err := sealShared(stage); err != nil {
 		return err
 	}
-	return publishShared(stage, shared)
+	entries, err := sharedEntries(stage)
+	if err != nil {
+		return err
+	}
+	if err := publishShared(stage, shared); err != nil {
+		return err
+	}
+	if digest == "" || len(entries) == 0 {
+		// Nothing to vouch for: the next sandboxd compiles it again.
+		return nil
+	}
+	return writeSharedMarker(shared, digest, entries)
 }
 
 // publishShared moves each sealed entry of stage into the same version
@@ -239,23 +442,58 @@ func (d *Driver) linkShared(ownerDir string) {
 }
 
 // PrecompileModules compiles the operator modules refs name into the
-// shared cache. Meant to run in the background at daemon start, before
-// the resident prewarm, so neither a prewarm nor a first create compiles
-// them.
+// shared cache (PrepareStandardModules without the prewarm).
 func (d *Driver) PrecompileModules(ctx context.Context, refs []string) {
-	if d.resolver == nil || d.sharedCacheDir() == "" {
+	d.PrepareStandardModules(ctx, refs, false)
+}
+
+// startupPrepares is how many standard modules PrepareStandardModules
+// readies at once: a node's first boot compiles each, and running every
+// compile together would starve the creates that come meanwhile.
+const startupPrepares = 2
+
+// PrepareStandardModules readies the operator modules refs name at daemon
+// start, in the background: each is compiled into the shared cache (a
+// cache read when a sandboxd before this one compiled it) and, with
+// prewarm, its resident host is brought up right after its own compile,
+// not after every module's. It returns when all are done.
+func (d *Driver) PrepareStandardModules(ctx context.Context, refs []string, prewarm bool) {
+	if d.resolver == nil {
 		return
 	}
+	queue := make(chan string, len(refs))
+	seen := make(map[string]bool, len(refs))
 	for _, ref := range refs {
-		if ctx.Err() != nil {
-			return
+		if !seen[ref] {
+			seen[ref] = true
+			queue <- ref
 		}
-		resolved, err := d.resolver.Resolve(ctx, ref)
-		if err != nil {
-			continue
-		}
-		d.ensureSharedCompiled(ctx, resolved)
 	}
+	close(queue)
+	var wg sync.WaitGroup
+	for range min(startupPrepares, len(seen)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ref := range queue {
+				if ctx.Err() != nil {
+					return
+				}
+				resolved, err := d.resolver.Resolve(ctx, ref)
+				if err != nil || resolved == nil {
+					if prewarm && d.logger != nil {
+						d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", err)
+					}
+					continue
+				}
+				d.ensureSharedCompiled(ctx, resolved)
+				if prewarm {
+					d.prewarmResolved(ctx, ref, resolved)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // precompileFunc runs the trusted compile step (worker.Precompile).

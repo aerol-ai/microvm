@@ -62,6 +62,10 @@ type Config struct {
 	// CompileCacheDir is the root of the per-owner compile caches
 	// (compileCacheFor); empty, no cache.
 	CompileCacheDir string
+	// Engine is the workers' engine (SB_WASM_ENGINE): "" or "wazero", or
+	// "wasmtime". The shared compile cache holds wazero's compiled code
+	// only, so it is filled for wazero alone (sharedcache.go).
+	Engine string
 	// GuestListenHost is the loopback address workers bind the guests'
 	// listeners on; empty, 127.0.0.1. pkg/daemon sets it while the WASM
 	// worker fence is on (workerfence.GuestListenHost): the fence lets the
@@ -78,6 +82,7 @@ type Config struct {
 func FromDaemonConfig(cfg config.Config) Config {
 	return Config{
 		RunDir:                   cfg.WasmRunDir,
+		Engine:                   cfg.WasmEngine,
 		ModulesDir:               cfg.WasmModulesDir,
 		DefaultMemoryMB:          cfg.WasmDefaultMemoryMB,
 		DefaultWallTimeout:       cfg.WasmDefaultTimeout,

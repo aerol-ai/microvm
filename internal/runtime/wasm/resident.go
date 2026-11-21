@@ -188,7 +188,13 @@ func (d *Driver) releaseResidentSlot(socket string) {
 // behind the same socket is detected (D8). When reserve is true the chosen
 // host's live count is incremented (caller releases it on failure/Destroy);
 // prewarm passes false since it brings up + compiles but instantiates nothing.
-func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path string, memoryMB int, reserve bool) (*residentBucket, *residentHost, error) {
+//
+// Only a host that has to be brought up waits for the module's shared
+// compile (ensureSharedCompiled), right before it loads the module: a
+// create onto a host that is up, one adopted from the sandboxd before a
+// restart included, has the module loaded and waits for nothing.
+func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef string, resolved *wasmmod.ResolvedModule, memoryMB int, reserve bool) (*residentBucket, *residentHost, error) {
+	digest, path := resolved.Digest, resolved.Path
 	id := residentBucketID(ownerRef, digest, memoryMB)
 
 	d.residentMu.Lock()
@@ -234,6 +240,7 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 				return take(h)
 			}
 		}
+		d.ensureSharedCompiled(ctx, resolved)
 		if err := d.bringUpResidentHost(ctx, b, h, path, memoryMB); err != nil {
 			return nil, nil, err
 		}
@@ -249,6 +256,7 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 		index:  index,
 	}
 	b.hosts = append(b.hosts, h)
+	d.ensureSharedCompiled(ctx, resolved)
 	if err := d.bringUpResidentHost(ctx, b, h, path, memoryMB); err != nil {
 		return nil, nil, err
 	}
@@ -311,25 +319,38 @@ func (d *Driver) PrewarmResidentHosts(ctx context.Context, refs []string) {
 			return
 		}
 		resolved, err := d.resolver.Resolve(ctx, ref)
-		if err != nil || resolved == nil || resolved.Digest == "" {
+		if err != nil || resolved == nil {
 			if d.logger != nil {
 				d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", err)
 			}
 			continue
 		}
-		d.ensureSharedCompiled(ctx, resolved)
-		// Prewarm the operator/global bucket (empty owner) at default memory.
-		// reserve=false: prewarm compiles the module on the host but instantiates
-		// no sandbox, so it must NOT hold a live slot (Finding P1-2).
-		if _, _, err := d.ensureResidentHost(ctx, "", resolved.Digest, resolved.Path, d.cfg.DefaultMemoryMB, false); err != nil {
-			if d.logger != nil {
-				d.logger.Warn("resident prewarm failed", "ref", ref, "error", err)
-			}
-			continue
-		}
+		d.prewarmResolved(ctx, ref, resolved)
+	}
+}
+
+// prewarmResolved brings up ref's resident host (PrewarmResidentHosts).
+func (d *Driver) prewarmResolved(ctx context.Context, ref string, resolved *wasmmod.ResolvedModule) {
+	if !d.residentHostEnabled() {
+		return
+	}
+	if resolved.Digest == "" {
 		if d.logger != nil {
-			d.logger.Info("resident host prewarmed", "ref", ref, "digest", resolved.Digest, "memory_mb", d.cfg.DefaultMemoryMB)
+			d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", "no digest")
 		}
+		return
+	}
+	// Prewarm the operator/global bucket (empty owner) at default memory.
+	// reserve=false: prewarm compiles the module on the host but instantiates
+	// no sandbox, so it must NOT hold a live slot (Finding P1-2).
+	if _, _, err := d.ensureResidentHost(ctx, "", resolved, d.cfg.DefaultMemoryMB, false); err != nil {
+		if d.logger != nil {
+			d.logger.Warn("resident prewarm failed", "ref", ref, "error", err)
+		}
+		return
+	}
+	if d.logger != nil {
+		d.logger.Info("resident host prewarmed", "ref", ref, "digest", resolved.Digest, "memory_mb", d.cfg.DefaultMemoryMB)
 	}
 }
 
@@ -353,8 +374,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 		d.releaseResidentSlotFor(old)
 	}
 
-	d.ensureSharedCompiled(ctx, resolved)
-	bucket, host, err := d.ensureResidentHost(ctx, ownerRef, resolved.Digest, resolved.Path, memoryMB, true)
+	bucket, host, err := d.ensureResidentHost(ctx, ownerRef, resolved, memoryMB, true)
 	if err != nil {
 		return nil, err
 	}

@@ -191,15 +191,12 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	for alias := range cfg.WasmStandardModules {
 		standardRefs = append(standardRefs, alias)
 	}
-	// The standard modules go into the shared compile cache first (a trusted
-	// compile, in the background), so the prewarm and every owner's first
-	// create read them back instead of compiling them.
-	go func() {
-		driver.PrecompileModules(ctx, standardRefs)
-		if cfg.WasmResidentHostEnabled {
-			driver.PrewarmResidentHosts(ctx, standardRefs)
-		}
-	}()
+	// Each standard module goes into the shared compile cache (a trusted
+	// compile, in the background, skipped when the sandboxd before a
+	// restart did it), so the prewarm and every owner's first create read
+	// it back instead of compiling it; its resident host comes up right
+	// after its own compile, not after every module's.
+	go driver.PrepareStandardModules(ctx, standardRefs, cfg.WasmResidentHostEnabled)
 	if cfg.WasmResidentHostEnabled {
 		refs := standardRefs
 		logger.Info("wasm resident host prewarm scheduled", "modules", len(refs))

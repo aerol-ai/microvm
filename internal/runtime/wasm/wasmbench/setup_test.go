@@ -67,8 +67,10 @@ func newBenchDriver(t *testing.T, cfg wasm.Config, e *env, resolver *wasmmod.Mod
 	}
 	d := wasm.New(cfg, nil)
 	workers := worker.NewSupervisor(worker.Confine(worker.DefaultSpawner, confine))
+	resident := worker.NewSupervisor(worker.Confine(worker.DefaultResidentSpawner, confine))
+	useBenchCgroup(d, workers, resident)
 	d.SetWorkerSupervisor(workers)
-	d.SetResidentHostSupervisor(worker.NewSupervisor(worker.Confine(worker.DefaultResidentSpawner, confine)))
+	d.SetResidentHostSupervisor(resident)
 	return d, workers
 }
 
