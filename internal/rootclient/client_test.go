@@ -427,6 +427,12 @@ func helperFiles(t testing.TB, c *rootd.Config, base string) {
 // is egress.UnixPeerCheck for this uid: the real one on Linux.
 func realHelper(t testing.TB, sock string, mutate func(*rootd.Options)) *rootd.Server {
 	t.Helper()
+	return realHelperWith(t, sock, nil, mutate)
+}
+
+// realHelperWith is realHelper with a change to the helper's config too.
+func realHelperWith(t testing.TB, sock string, config func(*rootd.Config), mutate func(*rootd.Options)) *rootd.Server {
+	t.Helper()
 	opts := rootd.Options{
 		Containerd: func(_ any, ss grpc.ServerStream) error {
 			if name, _ := grpc.MethodFromServerStream(ss); name != "/containerd.services.version.v1.Version/Version" {
@@ -453,6 +459,9 @@ func realHelper(t testing.TB, sock string, mutate func(*rootd.Options)) *rootd.S
 		},
 	}
 	helperFiles(t, &cfg, filepath.Dir(filepath.Dir(sock)))
+	if config != nil {
+		config(&cfg)
+	}
 	srv, err := rootd.New(cfg, opts, nil)
 	if err != nil {
 		t.Fatal(err)

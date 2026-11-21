@@ -61,10 +61,14 @@ const (
 	// PartFirewall: the create's host rules (PrepareSandbox), every rule
 	// for the address (ReleaseSandbox).
 	PartFirewall = "firewall"
+	// PartCgroup: a started sandbox's group made the kernel's whole
+	// out-of-memory choice (PrepareSandbox only, and alone; M1 PR 6). The
+	// runtime removes the group with the task, so ReleaseSandbox has none.
+	PartCgroup = "cgroup"
 )
 
 // Parts lists every part name above.
-func Parts() []string { return []string{PartNetns, PartFirewall} }
+func Parts() []string { return []string{PartNetns, PartFirewall, PartCgroup} }
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
 // handles, its own and the gate's. A failed call that carries it is the

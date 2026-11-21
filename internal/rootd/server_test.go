@@ -231,12 +231,30 @@ func TestVersion(t *testing.T) {
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 		served = append(append(served, egressFeatures...), hostPortFeatures...)
-		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
-			t.Fatalf("features %v parts %v (%v), want %v and every part", resp.GetFeatures(), resp.GetParts(), err, served)
+		// No cgroup parent here: no cgroup part.
+		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall}
+		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), netParts) {
+			t.Fatalf("features %v parts %v (%v), want %v and %v", resp.GetFeatures(), resp.GetParts(), err, served, netParts)
 		}
 		got := slices.Sorted(slices.Values(resp.GetFeatures()))
 		if all := slices.Sorted(slices.Values(rootdpb.Features())); !slices.Equal(got, all) {
 			t.Fatalf("a helper with a network serves %v, every call is %v", got, all)
+		}
+	})
+	// M1 PR 6: a helper with a cgroup parent lists the cgroup part; one
+	// with a parent and no network serves PrepareSandbox for it alone.
+	t.Run("with a cgroup parent", func(t *testing.T) {
+		parent := func(c *Config, _ *Options) { c.Policy.CgroupParent = "/sandboxes" }
+		r := newRig(t, func(c *Config, o *Options) { parent(c, o); o.Network = newFakeNet() })
+		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
+		if err != nil || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
+			t.Fatalf("parts %v (%v), want every part", resp.GetParts(), err)
+		}
+		alone := newRig(t, parent)
+		resp, err = rootdpb.NewRootHelperClient(alone.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
+		if err != nil || !slices.Equal(resp.GetParts(), []string{rootdpb.PartCgroup}) ||
+			!slices.Contains(resp.GetFeatures(), rootdpb.FeaturePrepareSandbox) || slices.Contains(resp.GetFeatures(), rootdpb.FeatureReleaseSandbox) {
+			t.Fatalf("no network: features %v parts %v (%v)", resp.GetFeatures(), resp.GetParts(), err)
 		}
 	})
 }

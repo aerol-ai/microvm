@@ -578,7 +578,8 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 //     own block is lifted: a sandbox stays more closed, never more open.
 //   - PrepareSandbox is RealizeNetns and SandboxRules in one call, with
 //     the same answers to a repeat; ReleaseSandbox is "make sure it is
-//     gone" for both.
+//     gone" for both. Its cgroup part (M1 PR 6) writes the same two
+//     values to the same group each time.
 //
 // The hostname gateway's calls (M1 PR 5b): BridgeProbe's set-up replaces
 // what its slot had, its send sends one more probe (the gateway counts

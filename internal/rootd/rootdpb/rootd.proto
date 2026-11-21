@@ -117,7 +117,9 @@ service RootHelper {
   // PrepareSandbox does a create's root work in one call: each part the
   // request lists (see VersionResponse.parts). A helper refuses a request
   // that carries a part, or a field, it does not know, so nothing is ever
-  // skipped without a word.
+  // skipped without a word. The cgroup part comes alone, once the
+  // sandbox's task has started: the runtime makes its group with the task,
+  // after the namespace and rules of the create's first call.
   rpc PrepareSandbox(PrepareSandboxRequest) returns (PrepareSandboxResponse);
 
   // ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
@@ -159,7 +161,8 @@ message VersionResponse {
   // VM-only call on Kubernetes); the agent goes by this list.
   repeated string features = 3;
   // The parts of PrepareSandbox and ReleaseSandbox this helper serves
-  // ("netns", "firewall"). The agent sends a part only when it is listed.
+  // ("netns", "firewall", and PrepareSandbox's "cgroup"). The agent sends a
+  // part only when it is listed.
   repeated string parts = 4;
 }
 
@@ -391,6 +394,18 @@ message SandboxFirewall {
   repeated string deny_cidrs = 3;
 }
 
+// SandboxCgroup names a started container whose group the helper makes
+// the kernel's whole out-of-memory choice (part "cgroup"; finding F10 of
+// the Kubernetes plan): memory.oom.group 1, so one out-of-memory kill takes
+// every process in it, and OOM score 500 on each of them, so the kernel
+// picks a sandbox before the machinery (-999).
+message SandboxCgroup {
+  // The containerd container: a sandbox's or a warm-pool slot's ID. The
+  // helper builds the group's path itself, under its own cgroup parent
+  // (SB_CONTAINERD_CGROUP_PARENT); no request names a path.
+  string container_id = 1;
+}
+
 message PrepareSandboxRequest {
   // The netns-pool slot the sandbox gets.
   string netns_name = 1;
@@ -401,6 +416,9 @@ message PrepareSandboxRequest {
   string container_ip = 3;
   // Part "firewall".
   SandboxFirewall firewall = 4;
+  // Part "cgroup", which comes alone: no netns_name, container_ip or
+  // firewall with it.
+  SandboxCgroup cgroup = 5;
 }
 
 message PrepareSandboxResponse {
