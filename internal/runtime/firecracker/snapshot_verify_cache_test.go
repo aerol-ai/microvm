@@ -202,6 +202,7 @@ func TestVerifyCache_WarmSpawnShares(t *testing.T) {
 	if _, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
 		SlotID:             "vmms-warm-share",
 		TemplateID:         "tpl-share",
+		RootfsPath:         rootfs,
 		SnapshotMemoryPath: memPath,
 		SnapshotStatePath:  statePath,
 		SnapshotChecksum:   checksum,

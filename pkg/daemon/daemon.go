@@ -2431,7 +2431,9 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		if t.Status != models.TemplateStatusReady || !t.HasSnapshot {
 			continue
 		}
-		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" {
+		// The rootfs is a load input too: the snapshot's root drive is
+		// backed by it. templateResolverAdapter rejects a row without one.
+		if t.SnapshotMemoryPath == "" || t.SnapshotStatePath == "" || t.RootfsPath == "" {
 			continue
 		}
 		if a.checkNestedVirt && !fcapi.NestedVirt(t.SnapshotNestedVirt).Matches(a.nestedVirt) {
@@ -2445,6 +2447,7 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		}
 		out = append(out, vmmpool.TemplateWarmInput{
 			TemplateID:         t.ID,
+			RootfsPath:         t.RootfsPath,
 			SnapshotMemoryPath: t.SnapshotMemoryPath,
 			SnapshotStatePath:  t.SnapshotStatePath,
 			SnapshotChecksum:   t.SnapshotChecksum,
