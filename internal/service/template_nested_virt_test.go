@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -415,5 +416,82 @@ func TestRebuildRemovesTheOldSnapshotFiles(t *testing.T) {
 				t.Fatalf("rebuild %d: new file %s: %v", round, p, err)
 			}
 		}
+	}
+}
+
+// A save queued behind another save of the same template gets its whole
+// timeout: the clock starts once it holds the lock. Here the lock is held
+// for longer than the timeout; both the rebuild and the re-save still
+// finish.
+func TestTemplateSaveTimeoutStartsOnceTheLockIsHeld(t *testing.T) {
+	setTemplateGOARCH(t, "amd64")
+	ctx := context.Background()
+	svc, st, templatesDir := newHealthHarness(t)
+	svc.cfg.FirecrackerTemplateBuildTimeout = 100 * time.Millisecond
+	seedReadyTemplate(t, st, templatesDir, "tpl-rebuild")
+	seedReadyTemplate(t, st, templatesDir, "tpl-resave")
+	svc.SetTemplateSnapshotter(&fakeTemplateSnapshotter{done: make(chan struct{}, 4), nestedVirt: "off"})
+	svc.SetTemplateCIDAllocator(&fakeCIDAllocator{cid: 42})
+
+	unlockRebuild := svc.lockTemplateSnapshot("tpl-rebuild")
+	unlockResave := svc.lockTemplateSnapshot("tpl-resave")
+	if err := svc.MarkSnapshotCorrupt(ctx, "tpl-rebuild", "rotation"); err != nil {
+		t.Fatal(err)
+	}
+	svc.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
+	time.Sleep(250 * time.Millisecond) // longer than the timeout
+	unlockRebuild()
+	unlockResave()
+	if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+		t.Fatal("saves did not finish")
+	}
+	for id, want := range map[string]string{"tpl-rebuild": "", "tpl-resave": "off"} {
+		got, _ := st.GetTemplate(ctx, id)
+		if got.Status != models.TemplateStatusReady || !got.HasSnapshot {
+			t.Fatalf("%s after waiting longer than its timeout: %+v; the wait used up its time", id, got)
+		}
+		if want != "" && got.SnapshotNestedVirt != want {
+			t.Fatalf("%s record = %q, want %q", id, got.SnapshotNestedVirt, want)
+		}
+	}
+}
+
+// The lock table holds an entry only while someone holds or waits on it,
+// and callers of one template still take turns.
+func TestTemplateSnapshotLockTableEmptiesAndExcludes(t *testing.T) {
+	svc := &Service{}
+	var inside, most atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			unlock := svc.lockTemplateSnapshot(id)
+			n := inside.Add(1)
+			for {
+				m := most.Load()
+				if n <= m || most.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond)
+			inside.Add(-1)
+			unlock()
+		}("tpl-one")
+	}
+	wg.Wait()
+	if most.Load() != 1 {
+		t.Fatalf("%d callers held one template's lock at once", most.Load())
+	}
+	unlock := svc.lockTemplateSnapshot("tpl-two")
+	svc.templateSnapshotLocksMu.Lock()
+	held := len(svc.templateSnapshotLocks)
+	svc.templateSnapshotLocksMu.Unlock()
+	unlock()
+	svc.templateSnapshotLocksMu.Lock()
+	left := len(svc.templateSnapshotLocks)
+	svc.templateSnapshotLocksMu.Unlock()
+	if held != 1 || left != 0 {
+		t.Fatalf("lock table: %d entries while held (want 1), %d after (want 0)", held, left)
 	}
 }
