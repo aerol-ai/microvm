@@ -13,6 +13,15 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+// setTemplateGOARCH sets the architecture the sweep checks for one test,
+// and puts the real one back after it.
+func setTemplateGOARCH(t *testing.T, goarch string) {
+	t.Helper()
+	orig := templateGOARCH
+	templateGOARCH = goarch
+	t.Cleanup(func() { templateGOARCH = orig })
+}
+
 // seedTemplateSavedWith is seedReadyTemplate with the snapshot's
 // nested-virtualization record ("" leaves it unknown).
 func seedTemplateSavedWith(t *testing.T, st *store.Store, templatesDir, id, saved string) *models.Template {
@@ -61,8 +70,7 @@ func (s *serialSnapshotter) SnapshotTemplate(ctx context.Context, req TemplateSn
 // whole time; the rest are left alone. The next start removes the files the
 // rows no longer name.
 func TestResaveTemplateSnapshotsForNestedVirtAtStart(t *testing.T) {
-	templateGOARCH = "amd64"
-	t.Cleanup(func() { templateGOARCH = "amd64" })
+	setTemplateGOARCH(t, "amd64")
 	for _, tc := range []struct {
 		name        string
 		nodeAllowed bool
@@ -167,7 +175,7 @@ func TestResaveTemplateSnapshotsForNestedVirtAtStart(t *testing.T) {
 // on meanwhile, and when the snapshotter fails; the template keeps its old
 // snapshot either way, for the next start to try again.
 func TestResaveTemplateSnapshotLeavesTheTemplateAsItWas(t *testing.T) {
-	templateGOARCH = "amd64"
+	setTemplateGOARCH(t, "amd64")
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name string
@@ -219,7 +227,7 @@ func TestResaveTemplateSnapshotLeavesTheTemplateAsItWas(t *testing.T) {
 
 // A failed save is logged and the next template still gets its turn.
 func TestResaveTemplateSnapshotsContinuesAfterAFailure(t *testing.T) {
-	templateGOARCH = "amd64"
+	setTemplateGOARCH(t, "amd64")
 	ctx := context.Background()
 	svc, st, templatesDir := newHealthHarness(t)
 	seedReadyTemplate(t, st, templatesDir, "tpl-a")
@@ -259,8 +267,7 @@ func TestResaveTemplateSnapshotsContinuesAfterAFailure(t *testing.T) {
 // logged.
 func TestResaveTemplateSnapshotsForNestedVirtAtStartEdges(t *testing.T) {
 	ctx := context.Background()
-	templateGOARCH = "arm64"
-	t.Cleanup(func() { templateGOARCH = "amd64" })
+	setTemplateGOARCH(t, "arm64")
 	svc, st, templatesDir := newHealthHarness(t)
 	seedReadyTemplate(t, st, templatesDir, "tpl-unknown")
 	snapper := &fakeTemplateSnapshotter{done: make(chan struct{}, 1)}
@@ -271,7 +278,7 @@ func TestResaveTemplateSnapshotsForNestedVirtAtStartEdges(t *testing.T) {
 		t.Fatalf("arm64 saved %d templates again", snapper.calls)
 	}
 
-	templateGOARCH = "amd64"
+	setTemplateGOARCH(t, "amd64")
 	unwired, st2, dir2 := newHealthHarness(t)
 	seedReadyTemplate(t, st2, dir2, "tpl-unknown")
 	unwired.ResaveTemplateSnapshotsForNestedVirtAtStart(ctx)
@@ -300,7 +307,7 @@ func TestIsTemplateSnapshotFile(t *testing.T) {
 // once: both use the VM id tpl-snap-<id>, its TAP slot and its run dir.
 // The re-save, which lost the row to the rebuild, drops its files.
 func TestTemplateSnapshotVMsOfOneTemplateTakeTurns(t *testing.T) {
-	templateGOARCH = "amd64"
+	setTemplateGOARCH(t, "amd64")
 	ctx := context.Background()
 	svc, st, templatesDir := newHealthHarness(t)
 	tpl := seedReadyTemplate(t, st, templatesDir, "tpl-turns")
@@ -355,7 +362,7 @@ func TestTemplateSnapshotVMsOfOneTemplateTakeTurns(t *testing.T) {
 // A re-save reads the row again under the lock, and does nothing for a
 // template that no longer needs it.
 func TestResaveSkipsATemplateThatNoLongerNeedsIt(t *testing.T) {
-	templateGOARCH = "amd64"
+	setTemplateGOARCH(t, "amd64")
 	ctx := context.Background()
 	svc, st, templatesDir := newHealthHarness(t)
 	listed := seedReadyTemplate(t, st, templatesDir, "tpl-fixed")

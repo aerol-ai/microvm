@@ -568,8 +568,11 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 	}
 	// The old pair goes now, or each rotation would leave one more memory
 	// file. Clones still running on it keep it: their jail holds a hard
-	// link, or Firecracker keeps it mapped. Creates read has_snapshot=0
-	// since MarkTemplateUnhealthy, so none is about to open it.
+	// link, or Firecracker keeps it mapped. Creates that resolve the
+	// template from MarkTemplateUnhealthy on read has_snapshot=0; one that
+	// resolved it before and is still staging when the rebuild ends fails
+	// to open the old file (ENOENT, not corruption, so no new rebuild), and
+	// its retry gets the new snapshot.
 	for _, old := range []string{template.SnapshotMemoryPath, template.SnapshotStatePath} {
 		if old != "" && old != memOut && old != stateOut && filepath.Dir(old) == dir {
 			if rmErr := os.Remove(old); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
