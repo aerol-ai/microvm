@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 )
 
@@ -49,12 +50,12 @@ func BenchmarkGateCreateAlone(b *testing.B) {
 	b.ReportMetric(float64((percentileOf(gated, 0.5) - percentileOf(direct, 0.5)).Microseconds()), "gate-p50-us")
 }
 
-// BenchmarkGateAdoptAlone is a warm-pool adoption's containerd calls
-// (internal/runtime/containerd adoptParked: the new sandbox's ID is free,
-// then load, labels, info and relabel of the parked container), directly
-// and through the gate, as BenchmarkGateCreateAlone. A warm create makes
-// these and no container or task create, so this is the gate's share of
-// the +1 ms warm budget.
+// BenchmarkGateAdoptAlone is a warm-pool adoption's containerd calls, as
+// internal/runtime/containerd adoptParked makes them: load the parked
+// container (its labels and snapshot key come from that one read), check
+// the new sandbox's ID is free, relabel. Directly and through the gate, as
+// BenchmarkGateCreateAlone. A warm create makes these and no container or
+// task create, so this is the gate's share of the +1 ms warm budget.
 //
 //	go test -run '^$' -bench GateAdoptAlone -benchtime 2000x ./internal/rootd/gate/
 func BenchmarkGateAdoptAlone(b *testing.B) {
@@ -72,18 +73,15 @@ func BenchmarkGateAdoptAlone(b *testing.B) {
 				c = gb.gated
 			}
 			t0 := time.Now()
-			if _, err := c.LoadContainer(ctx, fmt.Sprintf("sb-new-%d-%d", i, m)); err == nil {
-				b.Fatal("the new sandbox's ID is taken")
-			}
 			ct, err := c.LoadContainer(ctx, "parked")
 			if err != nil {
 				b.Fatal(err)
 			}
-			if _, err := ct.Labels(ctx); err != nil {
+			if _, err := ct.Info(ctx, cntr.WithoutRefreshedMetadata); err != nil {
 				b.Fatal(err)
 			}
-			if _, err := ct.Info(ctx); err != nil {
-				b.Fatal(err)
+			if _, err := c.LoadContainer(ctx, fmt.Sprintf("sb-new-%d-%d", i, m)); err == nil {
+				b.Fatal("the new sandbox's ID is taken")
 			}
 			if _, err := ct.SetLabels(ctx, map[string]string{"aerolvm.sandbox_id": fmt.Sprintf("sb-new-%d-%d", i, m)}); err != nil {
 				b.Fatal(err)

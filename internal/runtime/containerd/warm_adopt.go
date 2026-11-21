@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"syscall"
 	"time"
@@ -198,9 +199,17 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if err != nil {
 		return nil, err
 	}
-	labels, err := container.Labels(ctx)
+	// LoadContainer has just read the record; its labels and snapshot key
+	// come from that read. Labels() and Info() would each read it again:
+	// in privilege mode split every read is one more trip through the
+	// root helper's gate, on the warm create's path.
+	info, err := container.Info(ctx, cntr.WithoutRefreshedMetadata)
 	if err != nil {
 		return nil, err
+	}
+	labels := maps.Clone(info.Labels)
+	if labels == nil {
+		labels = map[string]string{}
 	}
 	if sid := strings.TrimSpace(labels[sandboxIDLabelKey]); sid == sandboxID {
 		return d.adoptedRuntimeState(slot, sandboxID), nil
@@ -212,10 +221,6 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	// toolbox takes the sandbox's identity; a failure destroys the slot and
 	// the create goes cold (tryWarmAdopt), where the same limit applies.
 	if d.cfg.DiskQuota && req.DiskGB > 0 {
-		info, err := container.Info(client.withNS(ctx))
-		if err != nil {
-			return nil, err
-		}
 		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
 			return nil, err
 		}
