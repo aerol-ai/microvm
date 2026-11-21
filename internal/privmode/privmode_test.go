@@ -25,12 +25,12 @@ func TestGap(t *testing.T) {
 	if NotYet("create a sandbox") != nil {
 		t.Fatal("no step, no gap")
 	}
-	err := NotYet("create a sandbox", StepImageUser, StepCgroups, Step("later"))
+	err := NotYet("create a sandbox", StepImageUser, StepDiskQuota, Step("later"))
 	if !errors.Is(err, ErrGap) || !errors.Is(err, models.ErrRuntimeNotImplemented) || errors.Is(err, errors.New("x")) {
 		t.Fatalf("%v matches the wrong things", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"create a sandbox", "image's users", "out-of-memory", "later", "SB_PRIVILEGE_MODE=single"} {
+	for _, want := range []string{"create a sandbox", "image's users", "disk quota", "later", "SB_PRIVILEGE_MODE=single"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("%q lacks %q", msg, want)
 		}

@@ -24,7 +24,10 @@ import (
 //   - it reads a running sandbox's address from its pool namespace through
 //     the helper (taskAddress): entering a namespace takes root. A create
 //     skips the read: its address is the one the helper gave the slot
-//     (sandboxAddress). A start, an inspect or an adoption reads it.
+//     (sandboxAddress). A start, an inspect or an adoption reads it;
+//   - with a cgroup parent, it has the helper mark each started sandbox's
+//     group for F10 (M1 PR 6, CgroupMarker in cgroup_parent.go), at the
+//     points single mode writes the group's files itself.
 //
 // The netns pool's build and teardown go through the helper too, in
 // pkg/daemon's wiring. The rest of a create and a start is root work the
@@ -97,12 +100,10 @@ func (d *Driver) taskAddress(ctx context.Context, task cntr.Task) (string, error
 }
 
 // splitCreateGaps is the root work a create needs that split mode does not
-// do yet. A create in split mode fails with it before it starts.
+// do yet. A create in split mode fails with it before it starts. The
+// cgroup settings (F10) are the helper's since M1 PR 6.
 func (d *Driver) splitCreateGaps(req models.CreateSandboxRequest) error {
 	steps := []privmode.Step{privmode.StepContainerFile, privmode.StepImageUser}
-	if d.cfg.CgroupParent != "" {
-		steps = append(steps, privmode.StepCgroups)
-	}
 	if d.cfg.DiskQuota && req.DiskGB > 0 {
 		steps = append(steps, privmode.StepDiskQuota)
 	}
@@ -110,11 +111,7 @@ func (d *Driver) splitCreateGaps(req models.CreateSandboxRequest) error {
 }
 
 // splitStartGaps is the same for a start of a stopped sandbox: new host
-// files, task output and the out-of-memory setting.
+// files and task output.
 func (d *Driver) splitStartGaps() error {
-	steps := []privmode.Step{privmode.StepContainerFile}
-	if d.cfg.CgroupParent != "" {
-		steps = append(steps, privmode.StepCgroups)
-	}
-	return privmode.NotYet("start a sandbox", steps...)
+	return privmode.NotYet("start a sandbox", privmode.StepContainerFile)
 }

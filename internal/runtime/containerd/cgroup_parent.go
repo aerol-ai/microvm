@@ -15,6 +15,8 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
 // CgroupRoot is where the cgroup v2 tree is mounted. A var so tests can point
@@ -35,8 +37,9 @@ var cgroupParentControllers = []string{"cpu", "memory", "pids"}
 // with the highest score in the pod; the machinery runs at -999 (the worker's
 // supervisor sets that), so a sandbox is always chosen first. Phase 0 spike S3
 // found the opposite with the defaults: one pod-level OOM killed every
-// sandbox and sandboxd with them (finding F10).
-const sandboxOOMScoreAdj = 500
+// sandbox and sandboxd with them (finding F10). The root helper writes the
+// same value in privilege mode split (rootpolicy.SandboxOOMScoreAdj).
+const sandboxOOMScoreAdj = rootpolicy.SandboxOOMScoreAdj
 
 // cgroupSpecOpts places a container's cgroup under the configured parent, as
 // <parent>/<id>. With no parent it adds nothing, and containerd's default
@@ -76,6 +79,45 @@ func (d *Driver) SandboxCgroup(containerRef string) string {
 		return d.sandboxCgroupPath(containerRef)
 	}
 	return path.Join("/", d.cfg.Namespace, containerRef)
+}
+
+// CgroupMarker makes a started sandbox's group the kernel's whole
+// out-of-memory choice through the root helper, in privilege mode split
+// (*rootclient.Client: PrepareSandbox's cgroup part). It names the
+// container; the helper builds the group's path from its own parent.
+type CgroupMarker interface {
+	MarkSandboxCgroup(ctx context.Context, containerID string) error
+}
+
+// SetCgroupMarker puts F10's marks in the root helper's hands (privilege
+// mode split, M1 PR 6). Call it before the first create.
+func (d *Driver) SetCgroupMarker(m CgroupMarker) { d.cgroupMarker = m }
+
+// MarkOOMVictim is F10's mark of a started sandbox's group, at each point
+// markWholeOOMVictim names, in either privilege mode. Single mode (no
+// marker) writes the group's files in process, as it always has. Split
+// mode leaves the same groups alone (none, or one not under the parent)
+// and asks the helper to mark the rest, one call each; the helper marks
+// only a group directly under its parent, which is where every sandbox's
+// group is (cgroupSpecOpts, and the gate's cgroup rule).
+func (d *Driver) MarkOOMVictim(ctx context.Context, cgroupsPath string) error {
+	if d.cgroupMarker == nil {
+		return d.markWholeOOMVictim(cgroupsPath)
+	}
+	if d.cfg.CgroupParent == "" || cgroupsPath == "" {
+		return nil
+	}
+	parent, group := path.Clean(d.cfg.CgroupParent), path.Clean(cgroupsPath)
+	if !strings.HasPrefix(group, parent+"/") {
+		return nil
+	}
+	if path.Dir(group) != parent {
+		return fmt.Errorf("sandbox cgroup %s: the root helper marks only a group directly under %s", cgroupsPath, parent)
+	}
+	if err := d.cgroupMarker.MarkSandboxCgroup(ctx, path.Base(group)); err != nil {
+		return fmt.Errorf("sandbox cgroup %s: %w", cgroupsPath, err)
+	}
+	return nil
 }
 
 // markWholeOOMVictim makes a started sandbox the kernel's choice, whole,
