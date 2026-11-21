@@ -157,6 +157,9 @@ func TestJailerStagingOwnership(t *testing.T) {
 			}, "sb-own", "tok", nil); err != nil {
 				t.Fatalf("Create: %v", err)
 			}
+			if !tc.hasSnapshot && sameFile(t, filepath.Join(f.vmm.runDir, rootfsFileName), resolver.rootfsPath) {
+				t.Fatal("the cold boot's rootfs is the template's own file")
+			}
 			for name, want := range tc.want {
 				got, ok := owners.get(name)
 				if !ok || got != want {
@@ -252,6 +255,96 @@ func TestCopyRootfsPrivate(t *testing.T) {
 	} {
 		if err := copyRootfsPrivate(tc[0], tc[1]); err == nil {
 			t.Errorf("%s: no error", name)
+		}
+	}
+}
+
+// A jail left on disk by a create that crashed can already hold the
+// template's rootfs at the copy's path, as a hard link (from a snapshot
+// load) or a symlink. The copy replaces it with a file of its own and
+// never writes through it into the template.
+func TestCopyRootfsPrivateOverALeftover(t *testing.T) {
+	for _, leftover := range []string{"hard link", "symlink"} {
+		t.Run(leftover, func(t *testing.T) {
+			dir := t.TempDir()
+			template := filepath.Join(dir, "template.ext4")
+			if err := os.WriteFile(template, []byte("TEMPLATE-DATA"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			dst := filepath.Join(dir, "jail-rootfs.ext4")
+			var err error
+			if leftover == "hard link" {
+				err = os.Link(template, dst)
+			} else {
+				err = os.Symlink(template, dst)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := copyRootfsPrivate(template, dst); err != nil {
+				t.Fatalf("copy over a leftover %s: %v", leftover, err)
+			}
+			if got, _ := os.ReadFile(template); string(got) != "TEMPLATE-DATA" {
+				t.Fatalf("the copy changed the template through the leftover %s: %q", leftover, got)
+			}
+			info, err := os.Lstat(dst)
+			if err != nil || !info.Mode().IsRegular() || sameFile(t, dst, template) {
+				t.Fatalf("the copy is not a file of its own: %v %v", info, err)
+			}
+			if got, _ := os.ReadFile(dst); string(got) != "TEMPLATE-DATA" {
+				t.Fatalf("copy holds %q", got)
+			}
+		})
+	}
+}
+
+// failAfterCreate creates the real file, so cleanup can be seen, then
+// fails the write or the close.
+type failAfterCreate struct {
+	*os.File
+	writeErr, closeErr error
+}
+
+func (f *failAfterCreate) WriteAt(p []byte, off int64) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.File.WriteAt(p, off)
+}
+
+func (f *failAfterCreate) Close() error {
+	_ = f.File.Close()
+	return f.closeErr
+}
+
+// A copy that fails midway, or on close, leaves no partial file behind.
+func TestCopyRootfsPrivateRemovesAFailedCopy(t *testing.T) {
+	orig := openPrivateRootfs
+	t.Cleanup(func() { openPrivateRootfs = orig })
+	dir := t.TempDir()
+	src := filepath.Join(dir, "template.ext4")
+	if err := os.WriteFile(src, []byte("TEMPLATE-DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, fail := range map[string]failAfterCreate{
+		"write": {writeErr: errors.New("no space left on device")},
+		"close": {closeErr: errors.New("input/output error")},
+	} {
+		openPrivateRootfs = func(path string) (copyFileDest, error) {
+			f, err := orig(path)
+			if err != nil {
+				return nil, err
+			}
+			wrapped := fail
+			wrapped.File = f.(*os.File)
+			return &wrapped, nil
+		}
+		dst := filepath.Join(dir, name+".ext4")
+		if err := copyRootfsPrivate(src, dst); err == nil {
+			t.Fatalf("%s failure: no error", name)
+		}
+		if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+			t.Fatalf("%s failure left %s (%v)", name, dst, err)
 		}
 	}
 }

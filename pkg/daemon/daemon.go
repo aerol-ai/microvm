@@ -2432,6 +2432,12 @@ func (a *vmmTemplateListerAdapter) ListWarmableTemplates(ctx context.Context) ([
 		if a.checkNestedVirt && !fcapi.NestedVirt(t.SnapshotNestedVirt).Matches(a.nestedVirt) {
 			continue
 		}
+		// A snapshot from before the overlay placeholder holds the root
+		// drive read-write, and template rootfs files are staged read-only:
+		// it would not load. The service saves it again at start.
+		if !t.HasOverlay {
+			continue
+		}
 		out = append(out, vmmpool.TemplateWarmInput{
 			TemplateID:         t.ID,
 			SnapshotMemoryPath: t.SnapshotMemoryPath,

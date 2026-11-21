@@ -182,7 +182,7 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 			continue
 		}
 		s.removeUnusedTemplateSnapshotFiles(tpl)
-		if firecracker.NestedVirtApplies(templateGOARCH) && !firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(allowed) {
+		if templateNeedsResave(tpl, allowed) {
 			stale = append(stale, tpl)
 		}
 	}
@@ -213,6 +213,22 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 	}()
 }
 
+// templateNeedsResave reports whether a ready template's snapshot must be
+// saved again at start:
+//   - it was saved before the overlay placeholder (HasOverlay false). Those
+//     snapshots hold the root drive read-write, and the driver stages a
+//     template's rootfs read-only for every load (chrootSharedFile), so
+//     such a snapshot no longer loads until it is saved again, which puts
+//     the root drive read-only and adds the placeholder;
+//   - or it was saved under the other SB_FIRECRACKER_NESTED_VIRT setting
+//     (amd64 only, where the setting does something).
+func templateNeedsResave(tpl *models.Template, nestedVirtAllowed bool) bool {
+	if !tpl.HasOverlay {
+		return true
+	}
+	return firecracker.NestedVirtApplies(templateGOARCH) && !firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(nestedVirtAllowed)
+}
+
 // errTemplateMovedOn: the template changed while its snapshot was being
 // saved again (a rebuild, a delete, another save), so the new save is
 // dropped and the row is left to whoever changed it.
@@ -234,8 +250,7 @@ func (s *Service) resaveTemplateSnapshotLocked(ctx context.Context, listed *mode
 	if err != nil {
 		return fmt.Errorf("get template: %w", err)
 	}
-	if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot ||
-		firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(s.cfg.FirecrackerNestedVirt) {
+	if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot || !templateNeedsResave(tpl, s.cfg.FirecrackerNestedVirt) {
 		return errTemplateMovedOn
 	}
 	cid, err := s.templateCIDAllocator.AllocateForTemplate(ctx, tpl.ID)

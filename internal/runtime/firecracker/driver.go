@@ -699,10 +699,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// Two paths:
 	//
 	//   - Template hit (Phase 2): req.TemplateID is set and the resolver
-	//     returns the host path of a pre-built rootfs. We hard-link
-	//     (cheap, same filesystem in the canonical layout) so the
-	//     jailer chroot covers it. EXDEV → copy fallback so a
-	//     differently-mounted TemplatesDir still works. No OCI pipeline
+	//     returns the host path of a pre-built rootfs. A snapshot load
+	//     hard-links it (cheap, same filesystem in the canonical layout;
+	//     EXDEV → copy) since the snapshot attaches it read-only; a cold
+	//     boot copies it (copyRootfsPrivate), since it attaches it
+	//     read-write. No OCI pipeline
 	//     runs on this Create. This is the boot-path-latency win the
 	//     plan calls for.
 	//
@@ -1183,10 +1184,10 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
-	// Staged before LoadSnapshot, which opens the drive read-write as the
-	// jailer's uid. A hard link to the template's rootfs already has that
-	// owner, but the cross-device copy linkOrCopyRootfs falls back to is
-	// root's until chowned (the stopped-sandbox restore hit exactly this).
+	// Staged before LoadSnapshot, which reopens the drive with the mode the
+	// snapshot saved: read-only for every template snapshotted with the
+	// overlay placeholder (HasOverlay; older ones cold-boot instead, see
+	// Create). So the shared rootfs stays root's with the jailer's group.
 	rootfsAPIPath, err := d.chrootSharedFile(runDir, rootfsPath, rootfsFileName)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
@@ -2041,16 +2042,24 @@ var (
 )
 
 // copyRootfsPrivate gives a VM its own copy of a template's rootfs, for a
-// cold boot, which attaches the rootfs read-write. Only the blocks that
-// hold data are written (copySparse), so the copy takes the space of the
-// template's data, not its full size. No fsync: the copy lives as long as
-// the VM, and a host crash ends the VM anyway.
+// cold boot, which attaches the rootfs read-write, and for
+// linkOrCopyRootfs's fallback. Only the blocks that hold data are written
+// (copySparse), so the copy takes the space of the template's data, not its
+// full size. No fsync: the copy lives as long as the VM, and a host crash
+// ends the VM anyway.
+//
+// Whatever is already at dst is removed first and the copy is created with
+// O_EXCL. A jail left on disk by a create that crashed can hold a hard link
+// to the template (from a snapshot load) or a symlink there; opening it
+// with O_TRUNC would empty the template itself.
 func copyRootfsPrivate(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open template rootfs: %w", err)
 	}
 	defer in.Close()
+	// The copy goes by the file's size, so a directory or device (a size of
+	// 0 or a block count) must not be taken for a file.
 	info, err := in.Stat()
 	if err == nil && !info.Mode().IsRegular() {
 		err = fmt.Errorf("%s is not a regular file", src)
@@ -2058,9 +2067,12 @@ func copyRootfsPrivate(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("copy template rootfs: %w", err)
 	}
-	out, err := copyFileOpenDst(dst, 0o600)
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("create staged rootfs: clear %s: %w", dst, err)
+	}
+	out, err := openPrivateRootfs(dst)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
+		return fmt.Errorf("create staged rootfs: %w", err)
 	}
 	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
 		_ = out.Close()
@@ -2069,9 +2081,16 @@ func copyRootfsPrivate(src, dst string) error {
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(dst)
-		return fmt.Errorf("close %s: %w", dst, err)
+		return fmt.Errorf("close staged rootfs: %w", err)
 	}
 	return nil
+}
+
+// openPrivateRootfs creates a VM's own rootfs copy: a new file, never one
+// already there (O_EXCL also refuses a symlink in its place). Tests
+// replace it to fail the copy midway.
+var openPrivateRootfs = func(path string) (copyFileDest, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
 // linkOrCopyRootfs makes dst point at the same bytes as src. Hard-link
@@ -2103,33 +2122,5 @@ func linkOrCopyRootfs(src, dst string) error {
 		return fmt.Errorf("link template rootfs: %w", err)
 	}
 
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open template rootfs: %w", err)
-	}
-	defer in.Close()
-	// The copy goes by the file's size, so a directory or device (a size of
-	// 0 or a block count) must not be taken for a file.
-	info, err := in.Stat()
-	if err == nil && !info.Mode().IsRegular() {
-		err = fmt.Errorf("%s is not a regular file", src)
-	}
-	if err != nil {
-		return fmt.Errorf("copy template rootfs: %w", err)
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("create staged rootfs: %w", err)
-	}
-	// Sparse, like copyFile: a template's rootfs is a mostly-hole image of
-	// the sandbox's full disk size, and a plain copy writes every byte of it.
-	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
-		_ = out.Close()
-		_ = os.Remove(dst)
-		return fmt.Errorf("copy template rootfs: %w", err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close staged rootfs: %w", err)
-	}
-	return nil
+	return copyRootfsPrivate(src, dst)
 }
