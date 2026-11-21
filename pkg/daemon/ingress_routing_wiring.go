@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/hostport"
+	"github.com/aerol-ai/microvm/internal/rootclient"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -153,12 +156,36 @@ func (b *ingressRoutingBoot) writeMarker(v bool) {
 // it: the flag is on, or the previous boot engaged and the rollback must
 // remove its rules. Otherwise nil without probing iptables, so a node the
 // flag does not apply to (macOS local mode has no iptables) logs no warning
-// about a feature it is not using.
-func hostPortForwarderFor(cfg config.Config, logger *slog.Logger) service.HostPortForwarder {
+// about a feature it is not using. In privilege mode split (helper set)
+// the root helper writes the rules (splitHostPortForwarder).
+func hostPortForwarderFor(ctx context.Context, cfg config.Config, helper *rootclient.Client, logger *slog.Logger) service.HostPortForwarder {
 	if !cfg.IngressProxyRouting && !readBypassMarker(ingressRoutingMarkerPath(cfg)) {
 		return nil
 	}
+	if helper != nil {
+		return splitHostPortForwarder(ctx, helper, logger)
+	}
 	return newHostPortForwarder(logger)
+}
+
+// hostPortRequireTimeout bounds the boot's one check that the helper
+// forwards host ports (the helper was already waited for at boot).
+const hostPortRequireTimeout = 10 * time.Second
+
+// splitHostPortForwarder is the forwarder through the root helper (M1 PR
+// 5b), or nil when the helper is older and does not forward host ports:
+// the routing engage is then refused, and the node keeps per-sandbox Caddy
+// routes, which sandboxd writes without root.
+func splitHostPortForwarder(ctx context.Context, helper *rootclient.Client, logger *slog.Logger) service.HostPortForwarder {
+	rctx, cancel := context.WithTimeout(ctx, hostPortRequireTimeout)
+	defer cancel()
+	if err := helper.Require(rctx, rootdpb.FeatureHostPort); err != nil {
+		logger.Warn("the root helper does not forward host ports; ingress proxy routing stays off on this node", "error", err)
+		return nil
+	}
+	return rootclient.NewHostPortForwarder(helper, func(ports []int) {
+		logger.Warn("host ports left unforwarded: their sandboxes went while the set was made", "host_ports", ports)
+	})
 }
 
 // newHostPortForwarder returns the kernel forwarder, or nil where iptables

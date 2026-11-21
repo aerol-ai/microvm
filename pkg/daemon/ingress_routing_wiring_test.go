@@ -241,7 +241,7 @@ func TestIngressRoutingNotApplicableWithoutADomainIsQuiet(t *testing.T) {
 			}
 			rec := &levelRecorder{}
 			logger := slog.New(rec)
-			if fwd := hostPortForwarderFor(cfg, logger); fwd != nil {
+			if fwd := hostPortForwarderFor(context.Background(), cfg, nil, logger); fwd != nil {
 				t.Fatal("the host-port forwarder was built (iptables probed) on a node the flag does not apply to")
 			}
 			svc := &fakeRoutingService{}
@@ -285,7 +285,7 @@ func TestHostPortForwarderForBuildsItForARollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &levelRecorder{}
-	if fwd := hostPortForwarderFor(cfg, slog.New(rec)); fwd != nil || len(rec.at(slog.LevelDebug)) != 0 {
+	if fwd := hostPortForwarderFor(context.Background(), cfg, nil, slog.New(rec)); fwd != nil || len(rec.at(slog.LevelDebug)) != 0 {
 		t.Fatalf("marker false: forwarder %v, logs %v; want neither", fwd, rec.at(slog.LevelDebug))
 	}
 	if err := os.WriteFile(ingressRoutingMarkerPath(cfg), []byte("true\n"), 0o644); err != nil {
@@ -293,7 +293,7 @@ func TestHostPortForwarderForBuildsItForARollback(t *testing.T) {
 	}
 	// Built (or, without iptables, a warning that it could not be): either
 	// way it was attempted.
-	fwd := hostPortForwarderFor(cfg, slog.New(rec))
+	fwd := hostPortForwarderFor(context.Background(), cfg, nil, slog.New(rec))
 	if fwd == nil && len(rec.at(slog.LevelWarn)) == 0 {
 		t.Fatal("marker true: the forwarder was neither built nor attempted")
 	}

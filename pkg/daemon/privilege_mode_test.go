@@ -58,6 +58,10 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		func(c *config.Config) { c.EnableNetworkRules = true },
 		func(c *config.Config) { c.EnterpriseMode = true },
 		func(c *config.Config) { c.EgressFQDNEnabled = true },
+		// Ingress proxy routing's host ports, and the rollback of a boot
+		// that engaged it, are the helper's from PR 5b.
+		func(c *config.Config) { c.IngressProxyRouting = true },
+		func(c *config.Config) { c.DBPath = filepath.Join(engagedMarkerDir(t), "state.db") },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -78,10 +82,6 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"V8 isolates", func(c *config.Config) { c.EnableIsolate = true }, "V8", []privmode.Step{privmode.StepHostProcesses}},
 		{"Firecracker", func(c *config.Config) { c.EnableFirecracker = true }, "Firecracker", []privmode.Step{privmode.StepHostProcesses}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
-		{"ingress proxy routing", func(c *config.Config) { c.IngressProxyRouting = true }, "host-port forwarding", []privmode.Step{privmode.StepHostPorts}},
-		{"a rollback of ingress proxy routing", func(c *config.Config) {
-			c.DBPath = filepath.Join(engagedMarkerDir(t), "state.db")
-		}, "host-port forwarding", []privmode.Step{privmode.StepHostPorts}},
 		{"several at once, each named", func(c *config.Config) { c.GvisorCheckpointMoves, c.EnableWasm = true, true }, "WASM",
 			[]privmode.Step{privmode.StepHostProcesses, privmode.StepMoves}},
 	} {
