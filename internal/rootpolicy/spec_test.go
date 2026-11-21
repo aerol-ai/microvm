@@ -371,6 +371,10 @@ func TestCheckBindSource(t *testing.T) {
 		{testMounts + "/./x", false},
 		{testMounts + "//x", false},
 		{testMounts + "/x/", false},
+		{testHelperHosts + "/sb-1/resolv.conf", true},
+		{testHelperReady + "/sb-1/ready.sock", true},
+		{testHelperHosts + "/sb-1", false},
+		{testHelperReady + "/sb-1/a/ready.sock", false},
 	} {
 		err := CheckBindSource(p, tc.src)
 		if (err == nil) != tc.ok {

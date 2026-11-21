@@ -29,7 +29,9 @@ import (
 )
 
 // sockPath is a socket path short enough for sun_path (104 bytes on
-// macOS), which t.TempDir's often is not.
+// macOS), which t.TempDir's often is not. The socket's folder holds the
+// socket alone, as the helper requires; realHelper lays the helper's other
+// folders out beside it.
 func sockPath(t *testing.T) string {
 	t.Helper()
 	d, err := os.MkdirTemp("", "rc")
@@ -41,7 +43,10 @@ func sockPath(t *testing.T) string {
 	if d, err = filepath.EvalSymlinks(d); err != nil {
 		t.Fatal(err)
 	}
-	return filepath.Join(d, "root.sock")
+	if err := os.Mkdir(filepath.Join(d, "s"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(d, "s", "root.sock")
 }
 
 // fakeHelper is a helper of any version: it answers Version with resp and
@@ -399,6 +404,21 @@ func TestCallErrors(t *testing.T) {
 	}
 }
 
+// helperFiles lays the helper's own folders out under base, as
+// rootd.ConfigFromEnv lays them out under its state and run folders.
+func helperFiles(t *testing.T, c *rootd.Config, base string) {
+	t.Helper()
+	c.Files = rootd.FileDirs{
+		Hosts:      filepath.Join(base, "state", "hosts"),
+		Ready:      filepath.Join(base, "run", "ready"),
+		Runsc:      filepath.Join(base, "state", "runsc"),
+		AgentReady: filepath.Join(base, "agent", "ready"),
+	}
+	c.Policy.FIFODir = filepath.Join(base, "run", "fifo")
+	c.Policy.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
+	c.Policy.RunscConfigPaths = []string{filepath.Join(c.Files.Runsc, "config.toml"), filepath.Join(c.Files.Runsc, "restore.toml")}
+}
+
 // realHelper serves internal/rootd's server on sock, its containerd side
 // answering containerd's Version as containerd 2.1.4 would. The peer check
 // is egress.UnixPeerCheck for this uid: the real one on Linux.
@@ -423,10 +443,11 @@ func realHelper(t *testing.T, sock string, mutate func(*rootd.Options)) *rootd.S
 		Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
 		Policy: rootpolicy.Policy{
 			Namespace: "aerolvm", Snapshotter: "overlayfs", SnapshotterRoot: "/var/lib/containerd/snap",
-			NetnsDir: "/run/netns", MovesDir: "/var/lib/sandboxd/containerd/moves", FIFODir: "/run/aerolvm/fifo",
+			NetnsDir: "/run/netns", MovesDir: "/var/lib/sandboxd/containerd/moves",
 			Limits: rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
 		},
 	}
+	helperFiles(t, &cfg, filepath.Dir(filepath.Dir(sock)))
 	srv, err := rootd.New(cfg, opts, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -446,7 +467,8 @@ func TestRealHelper(t *testing.T) {
 	if err := c.Ensure(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
-	if info, _ := c.Info(); info.HelperVersion != version.Version || info.API != rootdpb.APIVersion || len(info.Features) != 0 {
+	if info, _ := c.Info(); info.HelperVersion != version.Version || info.API != rootdpb.APIVersion ||
+		!info.Has(rootdpb.FeatureEnsureHostFiles) || info.Has(rootdpb.FeatureEnsureHost) {
 		t.Fatalf("Info = %+v", info)
 	}
 	if err := c.EnsureHost(ctxT(t)); !errors.Is(err, ErrUnsupported) {

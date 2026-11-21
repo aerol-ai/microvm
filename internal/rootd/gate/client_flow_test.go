@@ -152,7 +152,7 @@ func statefulContainerd(r *rig) {
 // gate as it will dial the helper's socket.
 func agentClient(t *testing.T, r *rig) (*cntr.Client, context.Context) {
 	t.Helper()
-	client, err := cntr.New("/run/aerolvm-rootd/root.sock", cntr.WithDefaultNamespace(testNS), cntr.WithDialOpts([]grpc.DialOption{
+	client, err := cntr.New("/run/aerolvm-rootd/sock/root.sock", cntr.WithDefaultNamespace(testNS), cntr.WithDialOpts([]grpc.DialOption{
 		grpc.WithContextDialer(r.dial), grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}))
 	if err != nil {

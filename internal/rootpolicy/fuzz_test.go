@@ -22,6 +22,8 @@ func FuzzCheckSpecJSON(f *testing.F) {
 	for _, mutate := range []func(*specs.Spec){
 		func(s *specs.Spec) { s.Hooks = &specs.Hooks{Prestart: []specs.Hook{{Path: "/bin/sh"}}} },
 		func(s *specs.Spec) { s.Mounts[1].Source = "/" },
+		func(s *specs.Spec) { s.Mounts[1].Source = testHelperHosts + "/" + testID + "/resolv.conf" },
+		func(s *specs.Spec) { s.Mounts[2].Source = testHelperReady + "/" + testID + "/0a1b.sock" },
 		func(s *specs.Spec) { s.Mounts[1].Type = "tmpfs" },
 		func(s *specs.Spec) { s.Linux.Namespaces[0].Path = "/proc/1/ns/pid" },
 		func(s *specs.Spec) { s.Annotations = map[string]string{"dev.gvisor.flag.network": "host"} },
@@ -81,7 +83,9 @@ func assertEnvelope(t *testing.T, p Policy, s *specs.Spec) {
 		}
 		bind := m.Type == "bind" || slices.Contains(m.Options, "bind") || slices.Contains(m.Options, "rbind")
 		if bind {
-			assertBindSource(t, p, m.Source)
+			if assertBindSource(t, p, m.Source) && (!slices.Contains(m.Options, "ro") || slices.Contains(m.Options, "rw")) {
+				t.Fatalf("a writable bind of the helper's file %q passed", m.Source)
+			}
 		} else if strings.Contains(m.Source, "/") {
 			t.Fatalf("non-bind mount with a path source %q passed", m.Source)
 		}
@@ -143,7 +147,13 @@ func assertEnvelope(t *testing.T, p Policy, s *specs.Spec) {
 	}
 }
 
-func assertBindSource(t *testing.T, p Policy, src string) {
+// helperFile is <root>/<id>/<name> with a name the helper makes, written
+// as a pattern rather than as the checker's cuts.
+var helperFile = regexp.MustCompile(`^/[^/]+(/[^/]+)*/[A-Za-z0-9_-]{1,128}/(hostname|hosts|resolv\.conf|egress-ca\.pem|ready\.sock|([0-9a-f]{2}){1,32}\.sock)$`)
+
+// assertBindSource fails unless src is a source the envelope allows, and
+// reports whether it is a helper's file (which must be bound read-only).
+func assertBindSource(t *testing.T, p Policy, src string) (helper bool) {
 	t.Helper()
 	if unclean(src) {
 		t.Fatalf("unclean bind source %q passed", src)
@@ -153,15 +163,24 @@ func assertBindSource(t *testing.T, p Policy, src string) {
 			t.Fatalf("bind source %q in %s passed", src, bad)
 		}
 	}
+	for _, r := range p.HelperFileRoots {
+		if rest, ok := strings.CutPrefix(src, r+"/"); ok {
+			if strings.Count(rest, "/") != 1 || !helperFile.MatchString(src) {
+				t.Fatalf("bind source %q in the helper's %s is not one of its files", src, r)
+			}
+			return true
+		}
+	}
 	if slices.Contains(p.BindFiles, src) {
-		return
+		return false
 	}
 	for _, r := range p.BindRoots {
 		if strings.HasPrefix(src, r+"/") {
-			return
+			return false
 		}
 	}
 	t.Fatalf("bind source %q outside the roots passed", src)
+	return false
 }
 
 // unclean reports a path that is not absolute, or has an empty, "." or ".."
@@ -179,7 +198,8 @@ func unclean(p string) bool {
 }
 
 func FuzzCheckBindSource(f *testing.F) {
-	for _, s := range []string{testToolbox, testMounts + "/sb/0", "/", "/proc/1/root", testMounts + "/../etc", testReady + "/x.sock", "", "//", testMounts + "/./x"} {
+	for _, s := range []string{testToolbox, testMounts + "/sb/0", "/", "/proc/1/root", testMounts + "/../etc", testReady + "/x.sock", "", "//", testMounts + "/./x",
+		testHelperHosts + "/sb-1/resolv.conf", testHelperHosts + "/sb-1", testHelperReady + "/sb-1/0a1b.sock", testHelperReady + "/sb-1/x/ready.sock"} {
 		f.Add(s)
 	}
 	p := testPolicy()

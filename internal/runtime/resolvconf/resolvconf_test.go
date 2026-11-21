@@ -103,3 +103,41 @@ func TestNameservers(t *testing.T) {
 		t.Fatal("a missing file lists none")
 	}
 }
+
+// TestParseRender: Generate is Parse then Render, so a caller that hands
+// Parse's values to another process (the root helper renders the file
+// itself) gets the same bytes Generate writes.
+func TestParseRender(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	body := "search a.example b.example\noptions ndots:2 edns0\nnameserver 127.0.0.53\nnameserver 10.0.0.1\nnameserver ::1\nnameserver fd00::2\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Config{Nameservers: []string{"10.0.0.1", "fd00::2"}, Search: []string{"a.example", "b.example"}, Options: []string{"ndots:2", "edns0"}}
+	if strings.Join(c.Nameservers, ",") != strings.Join(want.Nameservers, ",") ||
+		strings.Join(c.Search, ",") != strings.Join(want.Search, ",") ||
+		strings.Join(c.Options, ",") != strings.Join(want.Options, ",") {
+		t.Fatalf("Parse = %+v, want %+v", c, want)
+	}
+	gen, err := Generate(path)
+	if err != nil || c.Render() != gen {
+		t.Fatalf("Render %q, Generate %q (%v)", c.Render(), gen, err)
+	}
+	if gen != "search a.example b.example\noptions ndots:2 edns0\nnameserver 10.0.0.1\nnameserver fd00::2\n" {
+		t.Fatalf("Generate = %q", gen)
+	}
+	if (Config{}).Render() != "" {
+		t.Fatal("an empty config renders as nothing")
+	}
+	missing, err := Parse(filepath.Join(t.TempDir(), "missing"))
+	if err != nil || missing.Render() != Fallback {
+		t.Fatalf("missing file: %+v %v", missing, err)
+	}
+	if _, err := Parse(t.TempDir()); err == nil {
+		t.Fatal("want a read error for a directory path")
+	}
+}

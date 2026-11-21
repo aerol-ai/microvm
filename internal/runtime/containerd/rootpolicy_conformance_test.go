@@ -131,15 +131,16 @@ func (r *conformanceRig) policy() rootpolicy.Policy {
 		SnapshotterRoot: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
 		NetnsDir:        "/run/netns",
 		CgroupParent:    cfg.CgroupParent,
-		BindRoots: []string{
-			filepath.Join(cfg.RunDir, "hosts"),
-			r.mountsRoot(),
-			r.egressCADir(),
-		},
-		BindFiles:      []string{cfg.ToolboxBinaryPath},
-		ForbiddenRoots: []string{"/run/aerolvm", "/run/containerd"},
-		MovesDir:       filepath.Join(cfg.RunDir, movesDirName),
-		FIFODir:        "/run/containerd/fifo",
+		BindRoots:       []string{r.mountsRoot(), r.egressCADir()},
+		// The host files sit where the helper's will (<root>/<id>/<name>)
+		// and are bound read-only, so they meet the rule for the helper's
+		// own files already. The ready sockets are still the agent's flat
+		// names; T4 moves them into the helper's folder, read-only too.
+		HelperFileRoots: []string{filepath.Join(cfg.RunDir, "hosts")},
+		BindFiles:       []string{cfg.ToolboxBinaryPath},
+		ForbiddenRoots:  []string{"/run/aerolvm", "/run/containerd"},
+		MovesDir:        filepath.Join(cfg.RunDir, movesDirName),
+		FIFODir:         "/run/containerd/fifo",
 		RunscConfigPaths: []string{
 			filepath.Join(cfg.RunDir, runscConfigRelPath),
 			filepath.Join(cfg.RunDir, runscRestoreConfigRelPath),
@@ -221,31 +222,32 @@ func TestBuilderOutputPassesRootPolicy(t *testing.T) {
 	sized.MemoryMB, sized.CPU = 512, 1.5
 	quota := runc
 	quota.DiskGB = 2
-	// policy() lists the bind roots as: host files, mounts, egress CA,
-	// ready sockets. Each keepRoots(n) drops the ones from n on.
+	// policy() lists the bind roots as: mounts, egress CA, ready sockets.
+	// Each keepRoots(n) drops the ones from n on.
 	keepRoots := func(n int) func(*rootpolicy.Policy) {
 		return func(p *rootpolicy.Policy) { p.BindRoots = p.BindRoots[:n] }
 	}
+	noHelperRoots := func(p *rootpolicy.Policy) { p.HelperFileRoots = nil }
 	otherNetnsDir := func(p *rootpolicy.Policy) { p.NetnsDir = "/var/run/netns" }
 	noRunscConfig := func(p *rootpolicy.Policy) { p.RunscConfigPaths = nil }
 	otherParent := func(p *rootpolicy.Policy) { p.CgroupParent = "/elsewhere" }
 	for _, c := range []tc{
 		{name: "runc pooled netns", req: runc, teeth: otherNetnsDir, rule: rootpolicy.RuleHostNamespace},
-		{name: "runc fresh netns", cfg: freshNetns, req: runc, teeth: keepRoots(0), rule: rootpolicy.RuleMount},
+		{name: "runc fresh netns", cfg: freshNetns, req: runc, teeth: noHelperRoots, rule: rootpolicy.RuleMount},
 		{name: "gvisor pooled netns", req: gvisor, teeth: noRunscConfig, rule: rootpolicy.RuleRuntimeOptions},
 		{name: "gvisor fresh netns", cfg: freshNetns, req: gvisor, teeth: noRunscConfig, rule: rootpolicy.RuleRuntimeOptions},
 		{name: "runc memory and cpu", req: sized, teeth: func(p *rootpolicy.Policy) { p.Snapshotter = "native" }, rule: rootpolicy.RuleSnapshotter},
-		{name: "runc external mounts", req: runc, teeth: keepRoots(1), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
+		{name: "runc external mounts", req: runc, teeth: keepRoots(0), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
 			return []mounts.ContainerBind{
 				{HostPath: filepath.Join(r.mountsRoot(), "sb", "0"), ContainerPath: "/data"},
 				{HostPath: filepath.Join(r.mountsRoot(), "sb", "1"), ContainerPath: "/ro", ReadOnly: true},
 				{ContainerPath: "/scratch", Tmpfs: true, TmpfsSize: 64 << 20},
 			}
 		}},
-		{name: "gvisor external mounts", req: gvisor, teeth: keepRoots(1), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
+		{name: "gvisor external mounts", req: gvisor, teeth: keepRoots(0), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
 			return []mounts.ContainerBind{{HostPath: filepath.Join(r.mountsRoot(), "sb", "0"), ContainerPath: "/data"}}
 		}},
-		{name: "runc egress CA", req: runc, teeth: keepRoots(2), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
+		{name: "runc egress CA", req: runc, teeth: keepRoots(1), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
 			// internal/service/egress_inspect.go: the CA, read-only, and a
 			// tmpfs for the bundle toolboxd assembles.
 			return []mounts.ContainerBind{
@@ -253,8 +255,8 @@ func TestBuilderOutputPassesRootPolicy(t *testing.T) {
 				{ContainerPath: "/etc/aerolvm/egress-bundle", Tmpfs: true},
 			}
 		}},
-		{name: "runc ready socket", cfg: readySocket, req: runc, teeth: keepRoots(3), rule: rootpolicy.RuleMount},
-		{name: "gvisor ready socket", cfg: readySocket, req: gvisor, teeth: keepRoots(3), rule: rootpolicy.RuleMount},
+		{name: "runc ready socket", cfg: readySocket, req: runc, teeth: keepRoots(2), rule: rootpolicy.RuleMount},
+		{name: "gvisor ready socket", cfg: readySocket, req: gvisor, teeth: keepRoots(2), rule: rootpolicy.RuleMount},
 		{name: "runc disk quota", cfg: func(c *Config) { c.DiskQuota = true }, req: quota, teeth: otherParent, rule: rootpolicy.RuleCgroup, setup: func(t *testing.T, _ *conformanceRig) {
 			withDiskQuotaFakes(t, fakeSnapshots{numbers: map[string]int{"sb-conf": 42}})
 		}},
@@ -265,7 +267,7 @@ func TestBuilderOutputPassesRootPolicy(t *testing.T) {
 			fakeOOMTree(t, map[string][]int{"kubepods/aerolvm/sb-conf": nil}, nil)
 		}},
 		{name: "gvisor restore from a move", req: gvisor, restore: true, teeth: func(p *rootpolicy.Policy) { p.MovesDir = "/var/lib/elsewhere" }, rule: rootpolicy.RuleCheckpoint},
-		{name: "runc warm pool park", cfg: readySocket, req: runc, park: true, teeth: keepRoots(3), rule: rootpolicy.RuleMount},
+		{name: "runc warm pool park", cfg: readySocket, req: runc, park: true, teeth: keepRoots(2), rule: rootpolicy.RuleMount},
 		{name: "gvisor warm pool park", cfg: readySocket, req: gvisor, park: true, teeth: noRunscConfig, rule: rootpolicy.RuleRuntimeOptions},
 		{name: "gvisor warm pool park with cgroup parent", cfg: func(c *Config) {
 			readySocket(c)

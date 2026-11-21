@@ -101,10 +101,21 @@ func listen(path string, gid int) (*net.UnixListener, os.FileInfo, error) {
 // and checking after would follow a link someone put on the way, and root
 // would make folders wherever it points before refusing (review N2).
 func openFolder(dir string) (int, error) {
+	owner := uint32(os.Geteuid())
+	return walkFolder(dir, true, func(at string, st *unix.Stat_t, last bool) error {
+		return rootpolicy.CheckFolder(at, uint32(st.Mode), st.Uid, owner, !last)
+	})
+}
+
+// walkFolder opens dir from / one name at a time, following no link, and
+// calls check on each folder it opened (last: dir itself). mk makes a
+// missing folder through the checked folder above it; without mk a
+// missing folder is an error, for a folder root must not make (the
+// agent's own).
+func walkFolder(dir string, mk bool, check func(at string, st *unix.Stat_t, last bool) error) (int, error) {
 	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
 		return -1, fmt.Errorf("%s: want a clean absolute path", dir)
 	}
-	owner := uint32(os.Geteuid())
 	fd, err := unix.Open("/", folderFlags, 0)
 	if err != nil {
 		return -1, fmt.Errorf("open /: %w", err)
@@ -113,14 +124,14 @@ func openFolder(dir string) (int, error) {
 	if dir != "/" {
 		parts = strings.Split(dir[1:], "/")
 	}
-	check := func(at string, last bool) error {
+	checkAt := func(at string, last bool) error {
 		var st unix.Stat_t
 		if err := unix.Fstat(fd, &st); err != nil {
 			return err
 		}
-		return rootpolicy.CheckFolder(at, uint32(st.Mode), st.Uid, owner, !last)
+		return check(at, &st, last)
 	}
-	if err := check("/", len(parts) == 0); err != nil {
+	if err := checkAt("/", len(parts) == 0); err != nil {
 		_ = unix.Close(fd)
 		return -1, err
 	}
@@ -128,7 +139,7 @@ func openFolder(dir string) (int, error) {
 	for i, name := range parts {
 		at += "/" + name
 		next, err := unix.Openat(fd, name, folderFlags, 0)
-		if errors.Is(err, unix.ENOENT) {
+		if mk && errors.Is(err, unix.ENOENT) {
 			// EEXIST is fine: the open below judges whatever is there.
 			if merr := unix.Mkdirat(fd, name, 0o755); merr != nil && !errors.Is(merr, unix.EEXIST) {
 				_ = unix.Close(fd)
@@ -141,7 +152,7 @@ func openFolder(dir string) (int, error) {
 			return -1, fmt.Errorf("open %s without following a link: %w", at, err)
 		}
 		fd = next
-		if err := check(at, i == len(parts)-1); err != nil {
+		if err := checkAt(at, i == len(parts)-1); err != nil {
 			_ = unix.Close(fd)
 			return -1, err
 		}
@@ -149,7 +160,8 @@ func openFolder(dir string) (int, error) {
 	return fd, nil
 }
 
-// tmpName is a name for the socket before its mode is set: no one else can
+// tmpName is a name for a file before it is ready (a socket before its
+// mode is set, a file before its content is written): no one else can
 // write the folder, so it only has to differ from what root left there.
 func tmpName(name string) (string, error) {
 	var b [8]byte
@@ -157,4 +169,14 @@ func tmpName(name string) (string, error) {
 		return "", err
 	}
 	return "." + name + "." + hex.EncodeToString(b[:]), nil
+}
+
+// isTmpName reports whether n is a name tmpName gives name.
+func isTmpName(n, name string) bool {
+	h, ok := strings.CutPrefix(n, "."+name+".")
+	if !ok || len(h) != 16 || strings.ToLower(h) != h {
+		return false
+	}
+	_, err := hex.DecodeString(h)
+	return err == nil
 }

@@ -1,7 +1,7 @@
 // The root helper's own API (plans/security-gaps-m1-m4.md §3.3).
 //
 // The agent, sandboxd running as a user with no rights, calls it over
-// /run/aerolvm-rootd/root.sock. containerd's own API shares that socket
+// /run/aerolvm-rootd/sock/root.sock. containerd's own API shares that socket
 // and that gRPC server, behind the gate (internal/rootd/gate), so one peer
 // check covers both (eng review D3).
 //
@@ -31,8 +31,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RootHelper_Version_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/Version"
-	RootHelper_EnsureHost_FullMethodName = "/aerolvm.rootd.v1.RootHelper/EnsureHost"
+	RootHelper_Version_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/Version"
+	RootHelper_EnsureHost_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/EnsureHost"
+	RootHelper_EnsureHostFiles_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/EnsureHostFiles"
+	RootHelper_EnsureTaskFIFOs_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/EnsureTaskFIFOs"
+	RootHelper_EnsureRunscConfig_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureRunscConfig"
+	RootHelper_EnsureReadySocket_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureReadySocket"
+	RootHelper_RemoveContainerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/RemoveContainerFiles"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -47,6 +52,26 @@ type RootHelperClient interface {
 	// fence. Not built yet: the helper answers Unimplemented and leaves it
 	// out of Version's features.
 	EnsureHost(ctx context.Context, in *EnsureHostRequest, opts ...grpc.CallOption) (*EnsureHostResponse, error)
+	// EnsureHostFiles makes sure a container's hostname, hosts and
+	// resolv.conf files (and the egress CA, when asked) exist with this
+	// content, and drops an egress CA the request no longer asks for.
+	EnsureHostFiles(ctx context.Context, in *EnsureHostFilesRequest, opts ...grpc.CallOption) (*EnsureHostFilesResponse, error)
+	// EnsureTaskFIFOs makes fresh stdout and stderr FIFOs for a container's
+	// next task, at that container's fixed paths. Call it once per task,
+	// before opening them: a task's old readers keep the old FIFOs.
+	EnsureTaskFIFOs(ctx context.Context, in *EnsureTaskFIFOsRequest, opts ...grpc.CallOption) (*EnsureTaskFIFOsResponse, error)
+	// EnsureRunscConfig makes sure one of the runsc shim configs the helper
+	// owns exists. The helper writes its whole content.
+	EnsureRunscConfig(ctx context.Context, in *EnsureRunscConfigRequest, opts ...grpc.CallOption) (*EnsureRunscConfigResponse, error)
+	// EnsureReadySocket gives the agent's ready socket for a container a
+	// name in the helper's folder, for the spec to bind. The agent binds and
+	// keeps the socket in its own ready folder, as before; the helper links
+	// that socket into its own folder and checks, after linking, that it is
+	// a socket the agent owns.
+	EnsureReadySocket(ctx context.Context, in *EnsureReadySocketRequest, opts ...grpc.CallOption) (*EnsureReadySocketResponse, error)
+	// RemoveContainerFiles makes sure everything the helper made for a
+	// container is gone: host files, FIFOs and ready socket names.
+	RemoveContainerFiles(ctx context.Context, in *RemoveContainerFilesRequest, opts ...grpc.CallOption) (*RemoveContainerFilesResponse, error)
 }
 
 type rootHelperClient struct {
@@ -77,6 +102,56 @@ func (c *rootHelperClient) EnsureHost(ctx context.Context, in *EnsureHostRequest
 	return out, nil
 }
 
+func (c *rootHelperClient) EnsureHostFiles(ctx context.Context, in *EnsureHostFilesRequest, opts ...grpc.CallOption) (*EnsureHostFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureHostFilesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureHostFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) EnsureTaskFIFOs(ctx context.Context, in *EnsureTaskFIFOsRequest, opts ...grpc.CallOption) (*EnsureTaskFIFOsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureTaskFIFOsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureTaskFIFOs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) EnsureRunscConfig(ctx context.Context, in *EnsureRunscConfigRequest, opts ...grpc.CallOption) (*EnsureRunscConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureRunscConfigResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureRunscConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) EnsureReadySocket(ctx context.Context, in *EnsureReadySocketRequest, opts ...grpc.CallOption) (*EnsureReadySocketResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureReadySocketResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureReadySocket_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) RemoveContainerFiles(ctx context.Context, in *RemoveContainerFilesRequest, opts ...grpc.CallOption) (*RemoveContainerFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveContainerFilesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_RemoveContainerFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -89,6 +164,26 @@ type RootHelperServer interface {
 	// fence. Not built yet: the helper answers Unimplemented and leaves it
 	// out of Version's features.
 	EnsureHost(context.Context, *EnsureHostRequest) (*EnsureHostResponse, error)
+	// EnsureHostFiles makes sure a container's hostname, hosts and
+	// resolv.conf files (and the egress CA, when asked) exist with this
+	// content, and drops an egress CA the request no longer asks for.
+	EnsureHostFiles(context.Context, *EnsureHostFilesRequest) (*EnsureHostFilesResponse, error)
+	// EnsureTaskFIFOs makes fresh stdout and stderr FIFOs for a container's
+	// next task, at that container's fixed paths. Call it once per task,
+	// before opening them: a task's old readers keep the old FIFOs.
+	EnsureTaskFIFOs(context.Context, *EnsureTaskFIFOsRequest) (*EnsureTaskFIFOsResponse, error)
+	// EnsureRunscConfig makes sure one of the runsc shim configs the helper
+	// owns exists. The helper writes its whole content.
+	EnsureRunscConfig(context.Context, *EnsureRunscConfigRequest) (*EnsureRunscConfigResponse, error)
+	// EnsureReadySocket gives the agent's ready socket for a container a
+	// name in the helper's folder, for the spec to bind. The agent binds and
+	// keeps the socket in its own ready folder, as before; the helper links
+	// that socket into its own folder and checks, after linking, that it is
+	// a socket the agent owns.
+	EnsureReadySocket(context.Context, *EnsureReadySocketRequest) (*EnsureReadySocketResponse, error)
+	// RemoveContainerFiles makes sure everything the helper made for a
+	// container is gone: host files, FIFOs and ready socket names.
+	RemoveContainerFiles(context.Context, *RemoveContainerFilesRequest) (*RemoveContainerFilesResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -104,6 +199,21 @@ func (UnimplementedRootHelperServer) Version(context.Context, *VersionRequest) (
 }
 func (UnimplementedRootHelperServer) EnsureHost(context.Context, *EnsureHostRequest) (*EnsureHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureHost not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureHostFiles(context.Context, *EnsureHostFilesRequest) (*EnsureHostFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureHostFiles not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureTaskFIFOs(context.Context, *EnsureTaskFIFOsRequest) (*EnsureTaskFIFOsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureTaskFIFOs not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureRunscConfig(context.Context, *EnsureRunscConfigRequest) (*EnsureRunscConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureRunscConfig not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureReadySocket(context.Context, *EnsureReadySocketRequest) (*EnsureReadySocketResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureReadySocket not implemented")
+}
+func (UnimplementedRootHelperServer) RemoveContainerFiles(context.Context, *RemoveContainerFilesRequest) (*RemoveContainerFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveContainerFiles not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -162,6 +272,96 @@ func _RootHelper_EnsureHost_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_EnsureHostFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureHostFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureHostFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureHostFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureHostFiles(ctx, req.(*EnsureHostFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_EnsureTaskFIFOs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureTaskFIFOsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureTaskFIFOs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureTaskFIFOs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureTaskFIFOs(ctx, req.(*EnsureTaskFIFOsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_EnsureRunscConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureRunscConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureRunscConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureRunscConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureRunscConfig(ctx, req.(*EnsureRunscConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_EnsureReadySocket_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureReadySocketRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureReadySocket(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureReadySocket_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureReadySocket(ctx, req.(*EnsureReadySocketRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_RemoveContainerFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveContainerFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).RemoveContainerFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_RemoveContainerFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).RemoveContainerFiles(ctx, req.(*RemoveContainerFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -176,6 +376,26 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EnsureHost",
 			Handler:    _RootHelper_EnsureHost_Handler,
+		},
+		{
+			MethodName: "EnsureHostFiles",
+			Handler:    _RootHelper_EnsureHostFiles_Handler,
+		},
+		{
+			MethodName: "EnsureTaskFIFOs",
+			Handler:    _RootHelper_EnsureTaskFIFOs_Handler,
+		},
+		{
+			MethodName: "EnsureRunscConfig",
+			Handler:    _RootHelper_EnsureRunscConfig_Handler,
+		},
+		{
+			MethodName: "EnsureReadySocket",
+			Handler:    _RootHelper_EnsureReadySocket_Handler,
+		},
+		{
+			MethodName: "RemoveContainerFiles",
+			Handler:    _RootHelper_RemoveContainerFiles_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

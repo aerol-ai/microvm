@@ -193,7 +193,7 @@ func TestEveryAllowedMethodForwards(t *testing.T) {
 // refuseBinds is a bind check that finds every source on disk wrong.
 type refuseBinds struct{}
 
-func (refuseBinds) CheckBind(_, src string) error { return bindViolation(src, "planted link") }
+func (refuseBinds) CheckBind(_, src string, _ bool) error { return bindViolation(src, "planted link") }
 
 func TestBindCheckRefusals(t *testing.T) {
 	r := newRig(t, testPolicy(), func(c *Config) { c.Binds = refuseBinds{} })

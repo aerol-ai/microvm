@@ -86,6 +86,7 @@ type Options struct {
 type Server struct {
 	cfg        Config
 	log        *slog.Logger
+	files      *files
 	srv        *grpc.Server
 	ln         *net.UnixListener
 	sock       os.FileInfo // the socket file this server made
@@ -117,18 +118,25 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	if s.onRefusal == nil {
 		s.onRefusal = LogRefusal(log)
 	}
-	ln, sock, err := listen(cfg.Socket, cfg.SocketGID)
+	// The helper's folders come before the socket: a layout someone else
+	// can write stops the helper before any agent reaches it.
+	f, err := openFiles(cfg)
 	if err != nil {
 		return nil, err
 	}
-	s.ln, s.sock = ln, sock
+	ln, sock, err := listen(cfg.Socket, cfg.SocketGID)
+	if err != nil {
+		f.close()
+		return nil, err
+	}
+	s.files, s.ln, s.sock = f, ln, sock
 	sopts := append(slices.Clone(opts.ServerOptions),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
 		grpc.UnknownServiceHandler(s.route),
 		grpc.ChainUnaryInterceptor(answeredUnary),
 		grpc.ChainStreamInterceptor(answeredStream))
 	s.srv = grpc.NewServer(sopts...)
-	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log})
+	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal})
 	return s, nil
 }
 
@@ -162,6 +170,10 @@ func (s *Server) Shutdown(ctx context.Context) {
 		if cur, err := os.Lstat(s.cfg.Socket); err == nil && os.SameFile(cur, s.sock) {
 			_ = os.Remove(s.cfg.Socket)
 		}
+		// No call is left running to use the folders closed here: done
+		// waits, in both cases above, for GracefulStop, which returns only
+		// after every handler has.
+		s.files.close()
 	})
 }
 
@@ -200,12 +212,20 @@ func (s *Server) route(srv any, ss grpc.ServerStream) error {
 
 // features is what this helper implements, as Version lists it. A call
 // joins when it is built; until then the agent refuses it before asking.
-var features []string
+var features = []string{
+	rootdpb.FeatureEnsureHostFiles,
+	rootdpb.FeatureEnsureTaskFIFOs,
+	rootdpb.FeatureEnsureRunscConfig,
+	rootdpb.FeatureEnsureReadySocket,
+	rootdpb.FeatureRemoveContainerFiles,
+}
 
 // helper is the helper's own API.
 type helper struct {
 	rootdpb.UnimplementedRootHelperServer
-	log *slog.Logger
+	log       *slog.Logger
+	files     *files
+	onRefusal RefusalFunc
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -216,4 +236,49 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 
 func (helper) EnsureHost(context.Context, *rootdpb.EnsureHostRequest) (*rootdpb.EnsureHostResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "root helper %s: EnsureHost is not built yet", version.Version)
+}
+
+func (h helper) EnsureHostFiles(ctx context.Context, req *rootdpb.EnsureHostFilesRequest) (*rootdpb.EnsureHostFilesResponse, error) {
+	resp, err := h.files.ensureHostFiles(req)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureHostFiles_FullMethodName, resp, err)
+}
+
+func (h helper) EnsureTaskFIFOs(ctx context.Context, req *rootdpb.EnsureTaskFIFOsRequest) (*rootdpb.EnsureTaskFIFOsResponse, error) {
+	resp, err := h.files.ensureTaskFIFOs(req)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureTaskFIFOs_FullMethodName, resp, err)
+}
+
+func (h helper) EnsureRunscConfig(ctx context.Context, req *rootdpb.EnsureRunscConfigRequest) (*rootdpb.EnsureRunscConfigResponse, error) {
+	resp, err := h.files.ensureRunscConfig(req)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureRunscConfig_FullMethodName, resp, err)
+}
+
+func (h helper) EnsureReadySocket(ctx context.Context, req *rootdpb.EnsureReadySocketRequest) (*rootdpb.EnsureReadySocketResponse, error) {
+	resp, err := h.files.ensureReadySocket(req)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureReadySocket_FullMethodName, resp, err)
+}
+
+func (h helper) RemoveContainerFiles(ctx context.Context, req *rootdpb.RemoveContainerFilesRequest) (*rootdpb.RemoveContainerFilesResponse, error) {
+	resp, err := h.files.removeContainerFiles(req)
+	return answer(ctx, h, rootdpb.RootHelper_RemoveContainerFiles_FullMethodName, resp, err)
+}
+
+// answer turns a call's error into its status. A refused request is
+// reported (the agent only sends what its own code built, so each refusal
+// means drift or a broken agent) and keeps its own code; any other failure
+// is the helper's, logged here and answered Internal.
+func answer[T any](ctx context.Context, h helper, method string, resp T, err error) (T, error) {
+	var zero T
+	var fe *fileError
+	switch {
+	case err == nil:
+		return resp, nil
+	case errors.As(err, &fe):
+		if fe.reason != "" {
+			h.onRefusal(ctx, Refusal{Method: method, Reason: fe.reason, Detail: fe.msg})
+		}
+		return zero, status.Error(fe.code, fe.msg)
+	}
+	h.log.Error("root helper: call failed", "call", method, "error", err)
+	return zero, status.Error(codes.Internal, err.Error())
 }
