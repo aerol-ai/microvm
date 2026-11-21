@@ -1,8 +1,9 @@
 //go:build linux
 
-package rootd
+package rootfolder
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,14 +19,14 @@ import (
 
 // raceEnv makes this test binary the agent's side of
 // TestListenSymlinkRace.
-const raceEnv = "AEROLVM_ROOTD_TEST_RACE_PARENT"
+const raceEnv = "AEROLVM_ROOTFOLDER_TEST_RACE_PARENT"
 
 // TestListenSymlinkRace is review H1's proof, kept as a regression test.
 // A compromised agent (uid 65531, in the socket's group) watches a socket
 // folder it can write, as /run/aerolvm is on Kubernetes, and swaps
 // whatever root makes there for a link to a root-only file before root
 // chgrps and chmods it. On c5dbb884e it won within a few hundred tries.
-// Now listen refuses the folder, every time, and the file stays root's.
+// Now Listen refuses the folder, every time, and the file stays root's.
 func TestListenSymlinkRace(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to run the agent as another user")
@@ -50,10 +51,10 @@ func TestListenSymlinkRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bin := filepath.Join(dir, "rootd.test")
+	bin := filepath.Join(dir, "rootfolder.test")
 	copyFile(t, exe, bin)
 	cmd := exec.Command(bin, "-test.run=^TestListenRaceAgent$")
-	cmd.Env = append(os.Environ(), raceEnv+"="+parent, "AEROLVM_ROOTD_TEST_RACE_TARGET="+target)
+	cmd.Env = append(os.Environ(), raceEnv+"="+parent, "AEROLVM_ROOTFOLDER_TEST_RACE_TARGET="+target)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: agent, Gid: agent, Groups: []uint32{group}}}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -63,10 +64,10 @@ func TestListenSymlinkRace(t *testing.T) {
 
 	sock := filepath.Join(parent, "root.sock")
 	for i := range 3000 {
-		ln, _, err := listen(sock, group)
+		ln, _, err := Listen(sock, group)
 		if err == nil {
 			_ = ln.Close()
-			t.Fatalf("try %d: listen served from a folder others can write", i+1)
+			t.Fatalf("try %d: Listen served from a folder others can write", i+1)
 		}
 		var st unix.Stat_t
 		if err := unix.Stat(target, &st); err != nil {
@@ -82,7 +83,7 @@ func TestListenSymlinkRace(t *testing.T) {
 // folder, it puts a link to the target in its place (in a private folder,
 // as c5dbb884e made, or as the socket itself).
 func TestListenRaceAgent(t *testing.T) {
-	parent, target := os.Getenv(raceEnv), os.Getenv("AEROLVM_ROOTD_TEST_RACE_TARGET")
+	parent, target := os.Getenv(raceEnv), os.Getenv("AEROLVM_ROOTFOLDER_TEST_RACE_TARGET")
 	if parent == "" {
 		t.Skip("runs only as TestListenSymlinkRace's agent")
 	}
@@ -165,15 +166,15 @@ func TestListenUnderAStickyFolder(t *testing.T) {
 	if err := unix.Chmod(parent, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	if ln, _, err := listen(filepath.Join(sockDir, "root.sock"), 4242); err == nil {
+	if ln, _, err := Listen(filepath.Join(sockDir, "root.sock"), 4242); err == nil {
 		_ = ln.Close()
-		t.Fatal("listen took a socket folder under one anyone can write")
+		t.Fatal("Listen took a socket folder under one anyone can write")
 	}
 
 	if err := unix.Chmod(parent, 0o1777); err != nil {
 		t.Fatal(err)
 	}
-	ln, _, err := listen(filepath.Join(sockDir, "root.sock"), 4242)
+	ln, _, err := Listen(filepath.Join(sockDir, "root.sock"), 4242)
 	if err != nil {
 		t.Fatalf("a sticky folder above: %v", err)
 	}
@@ -192,11 +193,30 @@ func TestListenUnderAStickyFolder(t *testing.T) {
 	if out, err := asAgent(t, "ln -s "+elsewhere+" "+parent+"/aerolvm"); err != nil {
 		t.Fatalf("agent link: %s %v", out, err)
 	}
-	if ln, _, err := listen(filepath.Join(parent, "aerolvm", "rootd", "root.sock"), 4242); err == nil {
+	if ln, _, err := Listen(filepath.Join(parent, "aerolvm", "rootd", "root.sock"), 4242); err == nil {
 		_ = ln.Close()
-		t.Fatal("listen followed the agent's link")
+		t.Fatal("Listen followed the agent's link")
 	}
 	if _, err := os.Lstat(filepath.Join(elsewhere, "rootd")); err == nil {
 		t.Fatal("root made a folder through the agent's link")
+	}
+}
+
+func copyFile(t *testing.T, from, to string) {
+	t.Helper()
+	in, err := os.Open(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(to, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

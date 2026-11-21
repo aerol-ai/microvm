@@ -4,6 +4,11 @@
 // gate, containerd's API. On Kubernetes the supervisor starts it in the
 // runtime container; on VMs it is its own unit. Neither runs it yet: the
 // agent switches to it in task T4.
+//
+// Under the supervisor it serves the socket the supervisor passed it and
+// says when it serves (internal/rootswap: the signed swap, eng review D4);
+// on its own it makes the socket itself. `aerolvm-rootd --version` prints
+// the version and API level a release signs for it.
 package main
 
 import (
@@ -22,7 +27,10 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/rootd"
 	"github.com/aerol-ai/microvm/internal/rootd/gate"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
+	"github.com/aerol-ai/microvm/internal/rootswap"
+	"github.com/aerol-ai/microvm/internal/version"
 )
 
 // shutdownGrace is how long calls in flight get to finish on SIGTERM.
@@ -34,7 +42,20 @@ const shutdownGrace = 5 * time.Second
 // helper; tests shorten them.
 var containerdRetry, containerdWait = time.Second, 5 * time.Second
 
-func main() { os.Exit(mainCode(os.Getenv, os.Stderr)) }
+func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Println(versionLine())
+		return
+	}
+	os.Exit(mainCode(os.Getenv, os.Stderr))
+}
+
+// versionLine is what --version prints: the build's version and API level,
+// which the release's signing tool checks against the manifest it signs
+// (cmd/aerolvm-rootd-sign).
+func versionLine() string {
+	return fmt.Sprintf("aerolvm-rootd %s (API %d)", version.Version, rootdpb.APIVersion)
+}
 
 // mainCode runs the helper until SIGTERM or SIGINT and returns the exit
 // code.
@@ -50,18 +71,31 @@ func mainCode(getenv func(string) string, stderr io.Writer) int {
 }
 
 // run serves until ctx ends. The policy the gate checks comes from the
-// helper's own environment, here, and from nowhere else.
+// helper's own environment, here, and from nowhere else; so does the
+// socket the supervisor passed, if it passed one.
 func run(ctx context.Context, getenv func(string) string, log *slog.Logger) error {
 	cfg, err := rootd.ConfigFromEnv(getenv)
 	if err != nil {
 		return err
 	}
-	return serve(ctx, cfg, rootd.Options{}, log)
+	ln, err := rootswap.InheritedListener(getenv)
+	if err != nil {
+		return err
+	}
+	ready := func() {
+		// A supervisor that stopped listening has given up on this helper
+		// and stops it; serving until then does no harm.
+		if err := rootswap.NotifyReady(getenv); err != nil {
+			log.Warn("root helper: could not tell the supervisor it serves", "error", err)
+		}
+	}
+	return serve(ctx, cfg, rootd.Options{Listener: ln}, ready, log)
 }
 
-// serve wires the gate into the helper's server. Of opts, only Peer is
-// the caller's (tests set it); the rest is set here.
-func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, log *slog.Logger) error {
+// serve wires the gate into the helper's server and calls ready just
+// before it serves. Of opts, only Peer and Listener are the caller's; the
+// rest is set here.
+func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func(), log *slog.Logger) error {
 	// gRPC's reconnect backoff grows to two minutes. containerd restarted
 	// by the supervisor is back in seconds, and no sandbox call works
 	// until the gate reaches it again, so retry at least every second.
@@ -108,7 +142,11 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, log *slog.
 		stop()
 		close(stopped)
 	}()
-	log.Info("root helper serving", "socket", cfg.Socket, "containerd", cfg.ContainerdSocket, "namespace", cfg.Policy.Namespace)
+	log.Info("root helper serving", "version", version.Version, "socket", cfg.Socket, "inherited", opts.Listener != nil,
+		"containerd", cfg.ContainerdSocket, "namespace", cfg.Policy.Namespace)
+	if ready != nil {
+		ready()
+	}
 	err = srv.Serve()
 	if ctx.Err() != nil {
 		// Serve returns as soon as the stop begins. Return only once it

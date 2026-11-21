@@ -16,6 +16,12 @@
 // path too: a call containerd's client makes through the helper carries
 // ErrUnavailable through containerd's own error conversion (review M1).
 //
+// A typed call whose connection dropped before the helper answered is
+// tried again, briefly (retryCall): the supervisor swaps the helper for a
+// newer one with every release (eng review D4), and the swap closes the
+// old helper's connections. Only calls safe to run twice are, which today
+// is all of them (retrySafe).
+//
 // Agent N must work with helper N-1 (eng review D5). The handshake reads
 // which calls this helper serves; a call it lacks is refused here, before
 // it is sent, with an UnsupportedError naming the call and the helper.
@@ -143,6 +149,10 @@ type session struct {
 	// may have come between the handshake and that count. A later dial
 	// means the helper may have been swapped for a newer one.
 	gen uint64
+	// stale is set when a call this helper listed comes back
+	// Unimplemented: the helper behind the connection is no longer the
+	// one that answered the handshake, so info is asked for again.
+	stale atomic.Bool
 }
 
 // attempt is a handshake in flight; callers that arrive during it share
@@ -340,15 +350,17 @@ func (c *Client) require(ctx context.Context, feature string) (*session, error) 
 	if s == nil { // closed, or dropped by a failed refresh, since Ensure
 		return nil, c.noSession()
 	}
-	if s.info.Has(feature) {
-		// Helpers only move forward (eng review D4), so a feature the
-		// helper had is still there; no need to look again.
+	if s.info.Has(feature) && !s.stale.Load() {
+		// Helpers move forward (eng review D4), so a feature the helper
+		// had is still there; no need to look again. The one way back, a
+		// supervisor's rollback, shows as a listed call that is
+		// Unimplemented (callErr), which marks the session stale.
 		return s, nil
 	}
 	// A connection lost or made since the handshake may be a newer helper
 	// (the swap closes the old one's connections): ask again before
 	// refusing, once per connection.
-	if s.gen != c.dials.Load() || s.conn.GetState() != connectivity.Ready {
+	if s.stale.Load() || s.gen != c.dials.Load() || s.conn.GetState() != connectivity.Ready {
 		if err := c.handshake(ctx, s); err != nil {
 			return nil, err
 		}
@@ -417,21 +429,123 @@ func (c *Client) RemoveContainerFiles(ctx context.Context, containerID string) e
 
 // call runs one typed call: refused here, before it is sent, when the
 // helper lacks it; bounded by the client's timeout when ctx has no
-// deadline; and with the client's errors (ErrUnavailable, ErrUnsupported).
+// deadline; tried again when its connection dropped (retryCall); and with
+// the client's errors (ErrUnavailable, ErrUnsupported).
 func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req,
 	rpc func(rootdpb.RootHelperClient, context.Context, Req, ...grpc.CallOption) (Resp, error)) (Resp, error) {
 	var zero Resp
-	s, err := c.require(ctx, feature)
-	if err != nil {
-		return zero, err
+	var firstDrop time.Time
+	for attempt := 0; ; attempt++ {
+		s, err := c.require(ctx, feature)
+		if err != nil {
+			if c.retryCall(ctx, feature, &firstDrop, attempt, droppedBefore(err)) {
+				continue
+			}
+			return zero, err
+		}
+		cctx, cancel := c.callContext(ctx)
+		var trailer metadata.MD
+		resp, err := rpc(s.rpc, cctx, req, grpc.Trailer(&trailer))
+		cancel()
+		if err == nil {
+			return resp, nil
+		}
+		if c.retryCall(ctx, feature, &firstDrop, attempt, dropped(err, trailer)) {
+			continue
+		}
+		return zero, c.callErr(ctx, s, feature, err)
 	}
-	cctx, cancel := c.callContext(ctx)
-	defer cancel()
-	resp, err := rpc(s.rpc, cctx, req)
-	if err := c.callErr(ctx, s, feature, err); err != nil {
-		return zero, err
+}
+
+// retrySafe says, for each of the helper's calls, whether one whose
+// connection dropped may be sent again. Every call has an entry
+// (TestEveryCallHasARetryRule), so a new call cannot be retried by
+// default.
+//
+// A dropped call may or may not have run. Two things make running it
+// again safe. The helper drops connections only when it stops, and the
+// supervisor starts the next helper only once the old one's whole cgroup
+// is empty: the helper and every process it started, such as a CNI plugin
+// and the IPAM plugin that one runs, have exited (exclusive handover,
+// outside review O6; internal/supervisor HelperGroup). So no part of the
+// first try can run after the second. And each call below leaves the same
+// result when run twice: "make sure this exists" or "make sure this is
+// gone".
+//
+// EnsureTaskFIFOs is the one that makes something new each time: fresh
+// FIFOs, renamed over the last pair. A second run replaces a pair only
+// the first run made, and the agent never saw that pair (the answer that
+// names it was lost), so no reader holds it and no task was given it.
+var retrySafe = map[string]bool{
+	rootdpb.FeatureEnsureHost:           true,
+	rootdpb.FeatureEnsureHostFiles:      true,
+	rootdpb.FeatureEnsureTaskFIFOs:      true,
+	rootdpb.FeatureEnsureRunscConfig:    true,
+	rootdpb.FeatureEnsureReadySocket:    true,
+	rootdpb.FeatureRemoveContainerFiles: true,
+}
+
+// Retries of a dropped call: a growing wait from retryFirstWait to
+// retryMaxWait, for at most one client timeout after the first drop (not
+// after the call began: a long call cut by a swap's drain deadline is
+// tried again too). A swap is usually over in well under a second, and a
+// connection made meanwhile waits in the socket's backlog for the next
+// helper; a helper that stays away still fails the call within about
+// twice the timeout of its drop, as a 503.
+const (
+	retryFirstWait = 20 * time.Millisecond
+	retryMaxWait   = 250 * time.Millisecond
+)
+
+// retryCall waits before the next try of a dropped call, and says whether
+// to make it: only a call safe to run twice, whose caller still waits,
+// within the retry window, on a client that is open.
+func (c *Client) retryCall(ctx context.Context, feature string, firstDrop *time.Time, attempt int, dropped bool) bool {
+	if !dropped || !retrySafe[feature] || ctx.Err() != nil || c.isClosed() {
+		return false
 	}
-	return resp, nil
+	if firstDrop.IsZero() {
+		*firstDrop = time.Now()
+	}
+	wait := min(retryFirstWait<<min(attempt, 8), retryMaxWait)
+	if time.Since(*firstDrop)+wait >= c.timeout {
+		return false
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// dropped reports whether a call failed for want of the helper, not by
+// its answer: Unavailable without the trailer the helper puts on every
+// call it handles (rootdpb.AnsweredTrailer). A refusal, or containerd's
+// own Unavailable passed on, carries it; a connection that closed under
+// the call, or could not be made, does not.
+func dropped(err error, trailer metadata.MD) bool {
+	if _, refused := rootdpb.RefusalReason(err); refused {
+		return false
+	}
+	return status.Code(err) == codes.Unavailable && len(trailer.Get(rootdpb.AnsweredTrailer)) == 0
+}
+
+// droppedBefore reports whether reaching the helper failed before the call
+// was sent: no connection, or no handshake. The handshake is Version, a
+// read, so trying again is always safe. A helper too old for the call is
+// no such failure.
+func droppedBefore(err error) bool {
+	var ue *UnsupportedError
+	return errors.Is(err, ErrUnavailable) && !errors.As(err, &ue)
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // callContext bounds a typed call by the client's timeout when the caller
@@ -465,6 +579,12 @@ func (c *Client) callErr(ctx context.Context, s *session, feature string, err er
 			return c.unavailable(err)
 		}
 	case codes.Unimplemented:
+		if s.info.Has(feature) {
+			// The handshake listed it, so another helper answers now: an
+			// older copy a supervisor went back to. Ask again on the next
+			// call rather than trust the old list until sandboxd restarts.
+			s.stale.Store(true)
+		}
 		return &UnsupportedError{Feature: feature, Helper: s.info}
 	}
 	return err

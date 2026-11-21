@@ -124,7 +124,7 @@ func serving(t *testing.T, cfg rootd.Config, logs *syncBuffer) {
 	// The test process is the agent here; on Linux this is the real
 	// SO_PEERCRED check for its uid.
 	opts := rootd.Options{Peer: egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, "")}
-	go func() { done <- serve(ctx, cfg, opts, slog.New(slog.NewTextHandler(logs, nil))) }()
+	go func() { done <- serve(ctx, cfg, opts, nil, slog.New(slog.NewTextHandler(logs, nil))) }()
 	// serve makes the helper's folders, then its socket, in the background:
 	// wait for the socket, or the first dial below races it.
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
@@ -200,7 +200,7 @@ func TestServeRefusesADefaultingNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	serveContainerd(t, cfg.ContainerdSocket, &fakeContainerd{labels: map[string]string{"containerd.io/defaults/runtime": "io.containerd.runc.v2"}})
-	err = serve(ctxT(t), cfg, rootd.Options{Peer: func(net.Conn) error { return nil }}, slog.New(slog.DiscardHandler))
+	err = serve(ctxT(t), cfg, rootd.Options{Peer: func(net.Conn) error { return nil }}, nil, slog.New(slog.DiscardHandler))
 	if rootpolicy.RuleOf(err) != rootpolicy.RuleNamespace {
 		t.Fatalf("serve = %v, want the namespace rule", err)
 	}
@@ -248,7 +248,7 @@ func TestServeWaitsForContainerd(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		if err := serve(ctx, cfg, rootd.Options{Peer: func(net.Conn) error { return nil }}, slog.New(slog.DiscardHandler)); err != nil {
+		if err := serve(ctx, cfg, rootd.Options{Peer: func(net.Conn) error { return nil }}, nil, slog.New(slog.DiscardHandler)); err != nil {
 			t.Fatalf("serve = %v, want a clean stop", err)
 		}
 	})
