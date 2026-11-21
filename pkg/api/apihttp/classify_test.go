@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -72,6 +73,10 @@ func TestClassify(t *testing.T) {
 		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		// The root helper: down, or older than the agent (M1). Both clear
+		// on their own (a restart, the staged helper's swap), so 503.
+		{"root helper unavailable", fmt.Errorf("%w at /run/aerolvm/root.sock: connection refused", rootclient.ErrUnavailable), http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		{"root helper lacks a call", &rootclient.UnsupportedError{Feature: "EnsureHost", Helper: rootclient.Info{HelperVersion: "v0.7.7", API: 1}}, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"snapshot of a running firecracker sandbox", fmt.Errorf("stop the sandbox before taking a snapshot of it: %w", models.ErrSnapshotSourceNotReady), http.StatusConflict, 0, "", ErrKindOther},
 		// The service's refusal matches both sentinels; it keeps its code.
 		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},

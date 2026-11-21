@@ -80,6 +80,11 @@ type Config struct {
 	// own: on Linux, no link on the way and root's folders only; elsewhere
 	// every bind is refused.
 	Binds BindChecker
+	// Reads checks each path a container makes root read (its runsc
+	// config, a restore image) on disk. Nil means the platform's own: on
+	// Linux, root's and reached through root's folders with no link on
+	// the way; elsewhere every such path is refused.
+	Reads ReadChecker
 	// NetnsBinding, when set, must vouch for every named network namespace
 	// a container joins. Nil checks the name's form only (see NetnsBinding).
 	NetnsBinding NetnsBinding
@@ -92,6 +97,7 @@ type Gate struct {
 	onRefusal RefusalFunc
 	stdio     StdioChecker
 	binds     BindChecker
+	reads     ReadChecker
 	netns     NetnsBinding
 }
 
@@ -104,12 +110,15 @@ func New(cfg Config) (*Gate, error) {
 		return nil, errors.New("containerd gate: a connection to containerd is required")
 	}
 	g := &Gate{policy: cfg.Policy, upstream: cfg.Upstream, onRefusal: cfg.OnRefusal,
-		stdio: cfg.Stdio, binds: cfg.Binds, netns: cfg.NetnsBinding}
+		stdio: cfg.Stdio, binds: cfg.Binds, reads: cfg.Reads, netns: cfg.NetnsBinding}
 	if g.stdio == nil {
 		g.stdio = defaultStdioChecker()
 	}
 	if g.binds == nil {
 		g.binds = defaultBindChecker()
+	}
+	if g.reads == nil {
+		g.reads = defaultReadChecker()
 	}
 	return g, nil
 }

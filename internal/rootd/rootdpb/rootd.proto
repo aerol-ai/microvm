@@ -1,0 +1,68 @@
+// The root helper's own API (plans/security-gaps-m1-m4.md §3.3).
+//
+// The agent, sandboxd running as a user with no rights, calls it over
+// /run/aerolvm-rootd/root.sock. containerd's own API shares that socket
+// and that gRPC server, behind the gate (internal/rootd/gate), so one peer
+// check covers both (eng review D3).
+//
+// Agent N must work with helper N-1 (eng review D5, D22): the helper is
+// swapped after the agent, so for a while a new agent talks to the old
+// helper. So fields and calls are only ever added, never renumbered,
+// retyped or removed, and the agent asks Version what this helper serves
+// before it relies on a call.
+
+syntax = "proto3";
+
+package aerolvm.rootd.v1;
+
+option go_package = "github.com/aerol-ai/microvm/internal/rootd/rootdpb";
+
+service RootHelper {
+  // Version says which helper this is and what it serves. Every helper
+  // serves it, so it is the agent's handshake.
+  rpc Version(VersionRequest) returns (VersionResponse);
+
+  // EnsureHost makes sure the host is set up for sandboxes: sysctls,
+  // br_netfilter, the base firewall tables, node guard, floor and IPv6
+  // fence. Not built yet: the helper answers Unimplemented and leaves it
+  // out of Version's features.
+  rpc EnsureHost(EnsureHostRequest) returns (EnsureHostResponse);
+}
+
+message VersionRequest {
+  // The agent's build version, for the helper's log.
+  string agent_version = 1;
+  // The newest API level the agent speaks.
+  uint32 agent_api = 2;
+}
+
+message VersionResponse {
+  // The helper's build version.
+  string helper_version = 1;
+  // The newest API level the helper speaks.
+  uint32 api = 2;
+  // What this helper implements: each RootHelper call it serves, by its
+  // short name ("EnsureHost"). Version is always served and not listed.
+  // A call can be in the service yet missing here (a placeholder, or a
+  // VM-only call on Kubernetes); the agent goes by this list.
+  repeated string features = 3;
+}
+
+message EnsureHostRequest {}
+
+message EnsureHostResponse {}
+
+// HelperUnavailable marks a call that failed because the agent's client
+// could not reach the helper. It never crosses the socket: the client adds
+// it to the failed call's gRPC status, because containerd's Go client
+// rebuilds every error from the status and keeps only details that are
+// errors (internal/rootclient). In Go it is an error that matches
+// ErrHelperUnavailable.
+message HelperUnavailable {}
+
+// HelperUnsupported marks, the same way, a call that failed because the
+// helper is older than the agent. reason says which helper and what to do
+// (upgrade it). In Go it is an error that matches ErrHelperUnsupported.
+message HelperUnsupported {
+  string reason = 1;
+}

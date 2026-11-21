@@ -152,7 +152,7 @@ func statefulContainerd(r *rig) {
 // gate as it will dial the helper's socket.
 func agentClient(t *testing.T, r *rig) (*cntr.Client, context.Context) {
 	t.Helper()
-	client, err := cntr.New("/run/aerolvm/root.sock", cntr.WithDefaultNamespace(testNS), cntr.WithDialOpts([]grpc.DialOption{
+	client, err := cntr.New("/run/aerolvm-rootd/root.sock", cntr.WithDefaultNamespace(testNS), cntr.WithDialOpts([]grpc.DialOption{
 		grpc.WithContextDialer(r.dial), grpc.WithTransportCredentials(insecure.NewCredentials()),
 	}))
 	if err != nil {
@@ -173,7 +173,14 @@ func withSnapshot(_ context.Context, _ *cntr.Client, c *containers.Container) er
 // code for the agent's main flows against the gate. Each call it makes
 // must be on the allowlist and pass: this is what proves the traced
 // allowlist matches the library, not only the list of names.
-func TestAgentFlowsThroughTheGate(t *testing.T) {
+func TestAgentFlowsThroughTheGate(t *testing.T) { agentFlows(t, newRig) }
+
+// rigMaker builds the agent's view of a gate: newRig in memory, or
+// newSocketRig through the root helper's socket (socket_test.go).
+type rigMaker func(t *testing.T, p rootpolicy.Policy, opts ...func(*Config)) *rig
+
+// agentFlows is TestAgentFlowsThroughTheGate's body, for any rig.
+func agentFlows(t *testing.T, newRig rigMaker) {
 	for _, rt := range []struct {
 		name string
 		opt  cntr.NewContainerOpts
@@ -290,7 +297,10 @@ func TestAgentFlowsThroughTheGate(t *testing.T) {
 
 // TestAgentClientSeesRefusals: a hostile create through the real client
 // fails with permission denied and containerd never stores it.
-func TestAgentClientSeesRefusals(t *testing.T) {
+func TestAgentClientSeesRefusals(t *testing.T) { agentRefusals(t, newRig) }
+
+// agentRefusals is TestAgentClientSeesRefusals's body, for any rig.
+func agentRefusals(t *testing.T, newRig rigMaker) {
 	r := newRig(t, testPolicy())
 	statefulContainerd(r)
 	client, ctx := agentClient(t, r)
