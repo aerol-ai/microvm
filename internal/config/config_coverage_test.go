@@ -236,6 +236,24 @@ func TestLoad_Coverage95ValidationBranches(t *testing.T) {
 			want: "SB_WASM_ENGINE=",
 		},
 		{
+			name: "wasm_worker_uid_root",
+			env: map[string]string{
+				"SB_ENABLE_WASM":     "true",
+				"SB_WASM_WORKER_UID": "0",
+			},
+			want: "SB_WASM_WORKER_UID/SB_WASM_WORKER_GID must be non-root",
+		},
+		{
+			name: "wasm_worker_uid_shared_with_isolate_jail",
+			env: map[string]string{
+				"SB_ENABLE_WASM":      "true",
+				"SB_ENABLE_ISOLATE":   "true",
+				"SB_WASM_WORKER_UID":  "1000",
+				"SB_ISOLATE_JAIL_UID": "1000",
+			},
+			want: "SB_WASM_WORKER_UID must differ from SB_ISOLATE_JAIL_UID",
+		},
+		{
 			name: "isolate_jail_uid_negative",
 			env: map[string]string{
 				"SB_ENABLE_ISOLATE":   "true",

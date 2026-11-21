@@ -95,6 +95,9 @@ type mountState struct {
 	// proc is a tool a previous sandboxd started and this one adopted
 	// (adoptOne); cmd is nil while it runs. A restart starts cmd instead.
 	proc liveProcess
+
+	// rootOnly: the tool lets only root in (ContainerBind.RootOnly).
+	rootOnly bool
 }
 
 // New constructs a Manager. The root and cred directories are created with
@@ -242,7 +245,7 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 			err   error
 		)
 		if adopt {
-			state, bind = m.adoptOne(sandboxID, i, spec, helpers)
+			state, bind = m.adoptOne(ctx, sandboxID, i, spec, helpers)
 			if state == nil {
 				m.clearStaleMount(sandboxID, i, helpers)
 			}
@@ -318,6 +321,7 @@ func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 			HostPath:      s.hostPath,
 			ContainerPath: s.spec.Target,
 			ReadOnly:      s.spec.ReadOnly,
+			RootOnly:      s.rootOnly,
 		})
 	}
 	return binds
@@ -490,6 +494,10 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	if err != nil {
 		return nil, ContainerBind{}, err
 	}
+	c, hasConsumer := consumerFrom(ctx)
+	if hasConsumer {
+		plan.Argv = consumerArgv(spec.Type, plan.Argv, c)
+	}
 
 	if plan.CredFile != "" {
 		if err := writeCredFile(plan.CredFile, plan.CredBody); err != nil {
@@ -504,6 +512,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		hostPath:  hostPath,
 		plan:      plan,
 		startedAt: time.Now().UTC(),
+		rootOnly:  !hasConsumer && fuseForRootOnly(spec.Type),
 	}
 
 	if plan.IsKernelMount {
@@ -519,7 +528,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 			return nil, ContainerBind{}, fmt.Errorf("kernel mount failed: %w (%s)", toolStartError(plan.Argv[0], runErr), string(out))
 		}
 		// Done; nothing to supervise.
-		bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
+		bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly, RootOnly: state.rootOnly}
 		return state, bind, nil
 	}
 
@@ -549,7 +558,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	state.supervised = true
 	go m.superviseExit(state)
 
-	bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
+	bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly, RootOnly: state.rootOnly}
 	return state, bind, nil
 }
 

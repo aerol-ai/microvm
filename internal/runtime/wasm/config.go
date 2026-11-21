@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // Config holds host-side WASM runtime settings.
@@ -54,6 +55,23 @@ type Config struct {
 	// InterpIdleTTL stops an idle context's interpreter; 0 means
 	// defaultInterpIdleTTL. SB_WASM_INTERP_IDLE_TTL.
 	InterpIdleTTL time.Duration
+	// Worker is the uid/gid workers drop to (workerfs.go): what the driver
+	// hands them on the host. Zero (the drop is off, or sandboxd is not
+	// root on Linux) hands them nothing.
+	Worker worker.Confinement
+	// CompileCacheDir is the root of the per-owner compile caches
+	// (compileCacheFor); empty, no cache.
+	CompileCacheDir string
+	// GuestListenHost is the loopback address workers bind the guests'
+	// listeners on; empty, 127.0.0.1. pkg/daemon sets it while the WASM
+	// worker fence is on (workerfence.GuestListenHost): the fence lets the
+	// worker uid answer root's connections from that address, and from no
+	// other loopback one.
+	GuestListenHost string
+	// GuestHTTPMaxInFlight caps the exposed-port requests relayed to one
+	// sandbox at once (guestHTTPProxy); 0 means defaultGuestHTTPMaxInFlight.
+	// SB_WASM_GUEST_HTTP_MAX_INFLIGHT.
+	GuestHTTPMaxInFlight int
 }
 
 // FromDaemonConfig projects the WASM slice of daemon config into driver config.
@@ -68,6 +86,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		ResidentHostMaxInstances: cfg.WasmResidentHostMaxInstances,
 		ResidentHostIdleTTL:      cfg.WasmResidentHostIdleTTL,
 		MaxStreamsPerSandbox:     cfg.WasmMaxStreamsPerSandbox,
+		GuestHTTPMaxInFlight:     cfg.WasmGuestHTTPMaxInFlight,
 		StreamMaxMessageBytes:    cfg.WasmStreamMaxMessageBytes,
 		CodeRunModules:           cfg.WasmCodeRunModules,
 		SessionLogBytes:          cfg.WasmSessionLogBytes,

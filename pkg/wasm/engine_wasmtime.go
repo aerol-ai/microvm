@@ -72,7 +72,7 @@ func newWasmtimeEngine(_ context.Context) (Engine, error) {
 }
 
 func (e *wasmtimeEngine) LoadModule(_ context.Context, path string, _ LoadOptions) error {
-	data, err := os.ReadFile(path)
+	data, err := ReadHostFile(path)
 	if err != nil {
 		return fmt.Errorf("read module: %w", err)
 	}
@@ -323,7 +323,11 @@ func (e *wasmtimeEngine) wasiConfig(caps Capabilities, layer *wasmtimeWasip1, st
 		if p.ReadOnly {
 			dirPerms, filePerms = wasmtime.DIR_READ, wasmtime.FILE_READ
 		}
-		if err := wasi.PreopenDir(p.HostPath, guest, dirPerms, filePerms); err != nil {
+		// wasmtime opens the directory here, while the granted
+		// descriptor WithHostPath lends is still open.
+		if err := WithHostPath(p.HostPath, func(host string) error {
+			return wasi.PreopenDir(host, guest, dirPerms, filePerms)
+		}); err != nil {
 			return fail(fmt.Errorf("preopen %s: %w", p.HostPath, err))
 		}
 	}

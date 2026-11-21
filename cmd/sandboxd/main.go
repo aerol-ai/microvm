@@ -18,6 +18,7 @@ var (
 	runDaemon              = daemon.Run
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
+	runWasmPrecompileCLI   = worker.RunPrecompileCLI
 	runIsolateJailShim     = isolate.RunJailShim
 	runEgressGatewayCLI    = gatewayd.RunCLI
 	runPKCS11Helper        = pkcs11.RunHelper
@@ -124,6 +125,17 @@ func main() {
 		return
 	}
 
+	// Trusted compile step: compiles an operator module into the shared WASM
+	// compile cache that every owner's workers read (pkg/wasm/worker,
+	// RunPrecompileCLI). Spawned by sandboxd only, with operator modules only.
+	if len(os.Args) >= 2 && os.Args[1] == worker.PrecompileFlag {
+		if err := runWasmPrecompileCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
 	// Resident-module host: one process compiles a module once and hosts many
 	// isolated sandbox instances (plans/wasm-resident-module-host.md). Spawned
 	// only when SB_WASM_RESIDENT_HOST_ENABLED routes a create here.
@@ -171,7 +183,7 @@ func isDaemonArgv(argv []string) bool {
 	case isVersionArg(a), isNodeCommand(a),
 		a == upgradeSubcommand, a == hostSubcommand, a == keySubcommand,
 		a == backupSubcommand, a == restoreSubcommand, a == recoverQuorumSubcommand,
-		a == "--wasm-worker", a == "--wasm-resident-host", a == pkcs11.HelperFlag,
+		a == "--wasm-worker", a == "--wasm-resident-host", a == worker.PrecompileFlag, a == pkcs11.HelperFlag,
 		a == isolate.JailShimFlag, a == gatewayd.Subcommand:
 		return false
 	}

@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 )
 
 // The jail is realized in two steps, because the run dir is shared between
@@ -85,7 +87,7 @@ func applyJail(cmd *exec.Cmd, j JailConfig, workerdArgs []string, realized *jail
 
 	var prog []bpfInsn
 	if j.SeccompMode != SeccompOff {
-		prog, realized.unknownSyscalls, err = buildSeccompProgram(seccompAuditArch(), seccompSyscallTable(), j.SeccompAllow, j.SeccompArgRules, j.SeccompMode)
+		prog, realized.unknownSyscalls, err = buildSeccompProgram(hostproc.SeccompArch(), hostproc.SyscallTable(), j.SeccompAllow, j.SeccompArgRules, j.SeccompMode)
 		if err != nil {
 			return err
 		}

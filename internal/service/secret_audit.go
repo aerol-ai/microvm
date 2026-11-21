@@ -11,12 +11,14 @@ import (
 	"expvar"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -98,6 +100,9 @@ const (
 var (
 	auditEventsDroppedTotal  = expvar.NewInt("aerolvm_audit_events_dropped_total")
 	auditSpillMalformedTotal = expvar.NewInt("aerolvm_audit_spill_malformed_total")
+	// auditWorkerSpillBusyTotal counts worker spill folders the drain
+	// skipped because their worker held the lock (claimSpillFrom).
+	auditWorkerSpillBusyTotal = expvar.NewInt("aerolvm_audit_worker_spill_busy_total")
 	// auditSpillUnauthenticatedTotal counts egress spill lines whose
 	// capability was missing, forged, or expired. Each becomes a gap marker;
 	// a non-zero rate on a healthy node is a worker writing under a name it
@@ -195,10 +200,20 @@ type fileAuditSink struct {
 	tipPath          string
 	spillPath        string
 	spillWorkingPath string
-	tornPath         string
-	verifiedPath     string
-	witnessTipPath   string // optional; prune reads WitnessedThrough from here
-	file             *os.File
+	// workerSpillPath is the WASM workers' spill
+	// (auditlog.WorkerSpillDirName), drained after the daemon's own.
+	workerSpillPath string
+	// workerScanEvery bounds how often the drain lists the per-worker spill
+	// folders (0: every drain); workerScanAt is the last listing and
+	// workerPending the folders it found a segment in, not yet claimed.
+	// Only drainSpill touches them, under spillMu.
+	workerScanEvery time.Duration
+	workerScanAt    time.Time
+	workerPending   []string
+	tornPath        string
+	verifiedPath    string
+	witnessTipPath  string // optional; prune reads WitnessedThrough from here
+	file            *os.File
 	// bootVerify is the boot mode; bootScan is what open verified (with the
 	// witness tip probed) so boot-time witness validation needs no second
 	// pass; bootTrusted is how many prefix bytes open accepted from the
@@ -308,6 +323,8 @@ func newFileAuditSinkFrom(auditDir string, opts fileAuditSinkOptions) (*fileAudi
 		tipPath:          filepath.Join(auditDir, "secrets.tip"),
 		spillPath:        filepath.Join(auditDir, auditlog.SpillFileName),
 		spillWorkingPath: filepath.Join(auditDir, secretAuditSpillWorking),
+		workerSpillPath:  filepath.Join(auditDir, auditlog.WorkerSpillDirName, auditlog.SpillFileName),
+		workerScanEvery:  workerSpillScanEvery,
 		tornPath:         filepath.Join(auditDir, secretAuditTornName),
 		verifiedPath:     filepath.Join(auditDir, secretAuditVerifiedName),
 		witnessTipPath:   filepath.Join(auditDir, secretAuditWitnessTipFile),
@@ -965,10 +982,169 @@ func (s *fileAuditSink) spillQueued(first SecretAuditEvent) {
 	}
 }
 
+// claimWorkerSpill moves one WASM worker spill segment into working.
+// Workers that dropped their privileges each spill into a folder of their
+// own under auditlog.WorkerSpillDirName (the worker package makes it, owned
+// by the worker uid, before the worker starts); a worker kept root spills
+// into that folder itself. Each segment is taken under its own folder's
+// lock (taken inside the audit lock; workers take only theirs), and only
+// when the worker made that lock (a worker takes it before it writes).
+//
+// A worker's folder is its own to write, so what is there is checked as
+// root would read it: a plain file with one name, before the move and again
+// after, once it sits in the audit directory where no worker can reach it
+// (a worker could swap the name in between). Anything else is removed.
+//
+// The folder a segment came from is kept beside working: a folder named for
+// a sandbox ("sb-<id>") may only carry that sandbox's records, whatever
+// capability a line presents (sanitizeSpillRecord).
+func (s *fileAuditSink) claimWorkerSpill(working string) (bool, error) {
+	if s.workerSpillPath == "" {
+		return false, nil
+	}
+	root := filepath.Dir(s.workerSpillPath)
+	if st, err := os.Lstat(root); err != nil || !st.IsDir() {
+		return false, nil
+	}
+	if claimed, err := s.claimSpillFrom(root, "", working); claimed || err != nil {
+		return claimed, err
+	}
+	if len(s.workerPending) == 0 {
+		if s.workerScanEvery > 0 && !s.workerScanAt.IsZero() && time.Since(s.workerScanAt) < s.workerScanEvery {
+			return false, nil
+		}
+		s.workerScanAt = time.Now()
+		s.workerPending = listWorkerSpills(root)
+	}
+	for len(s.workerPending) > 0 {
+		name := s.workerPending[0]
+		s.workerPending = s.workerPending[1:]
+		dir := filepath.Join(root, name)
+		claimed, err := s.claimSpillFrom(dir, name, working)
+		if err == nil && strings.HasPrefix(name, auditlog.WorkerSpillRetiredPrefix) {
+			// Its worker is gone: once its records are taken, so is the folder.
+			if _, serr := os.Lstat(filepath.Join(dir, auditlog.SpillFileName)); os.IsNotExist(serr) {
+				_ = os.Remove(filepath.Join(dir, auditlog.LockFileName))
+				_ = os.Remove(dir)
+			}
+		}
+		if claimed || err != nil {
+			return claimed, err
+		}
+	}
+	return false, nil
+}
+
+// workerSpillScanEvery is how often the drain lists the per-worker spill
+// folders. drainSpill runs before every audit event and a node keeps a
+// folder per WASM sandbox, so listing them each time would cost a stat per
+// sandbox per event. A worker spills only while the ingest is down, and
+// one listing's finds are all claimed before the next, so a second's wait
+// to start draining a new one loses nothing.
+const workerSpillScanEvery = time.Second
+
+// listWorkerSpills names the worker folders under root holding a segment,
+// and every retired one (its worker is gone), so it is removed.
+func listWorkerSpills(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, e := range entries {
+		if !e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if _, err := os.Lstat(filepath.Join(root, e.Name(), auditlog.SpillFileName)); err == nil ||
+			strings.HasPrefix(e.Name(), auditlog.WorkerSpillRetiredPrefix) {
+			found = append(found, e.Name())
+		}
+	}
+	return found
+}
+
+// claimSpillFrom moves dir's spill segment into working (claimWorkerSpill).
+func (s *fileAuditSink) claimSpillFrom(dir, label, working string) (bool, error) {
+	spill := filepath.Join(dir, auditlog.SpillFileName)
+	if _, err := os.Lstat(spill); err != nil {
+		return false, nil
+	}
+	claimed := false
+	// No lock yet means no worker has spilled: a worker takes its lock
+	// before it writes a record.
+	_, err := auditlog.WithExistingFileLock(filepath.Join(dir, auditlog.LockFileName), func() error {
+		st, err := os.Lstat(spill)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !plainSpillFile(st) || st.Size() == 0 {
+			_ = os.Remove(spill)
+			return nil
+		}
+		if err := os.WriteFile(working+spillFromSuffix, []byte(label), 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(spill, working); err != nil {
+			_ = os.Remove(working + spillFromSuffix)
+			return err
+		}
+		if st, err := os.Lstat(working); err != nil || !plainSpillFile(st) {
+			auditSpillMalformedTotal.Add(1)
+			_ = os.Remove(working)
+			_ = os.Remove(working + spillFromSuffix)
+			return nil
+		}
+		claimed = true
+		return nil
+	})
+	if errors.Is(err, auditlog.ErrLockBusy) {
+		// The drain runs on the audit writer holding spillMu and the audit
+		// lock, so it never waits for a worker's lock: a worker holds it
+		// for one append, and one that escaped its engine could hold it
+		// forever. The folder is tried again on the next listing.
+		auditWorkerSpillBusyTotal.Add(1)
+		slog.Debug("audit drain: a worker holds its spill lock; folder skipped this round", "folder", label)
+		return false, nil
+	}
+	return claimed, err
+}
+
+// spillFromSuffix names the file beside a working segment that says which
+// worker folder it came from.
+const spillFromSuffix = ".from"
+
+// spillSandbox is the sandbox a segment's folder is named for ("sb-<id>"),
+// "" when it is not one sandbox's.
+func spillSandbox(working string) string {
+	raw, err := os.ReadFile(working + spillFromSuffix)
+	if err != nil {
+		return ""
+	}
+	label := strings.TrimPrefix(strings.TrimSpace(string(raw)), auditlog.WorkerSpillRetiredPrefix)
+	id, ok := strings.CutPrefix(label, "sb-")
+	if !ok {
+		return ""
+	}
+	return id
+}
+
+// plainSpillFile is a regular file with one name.
+func plainSpillFile(st os.FileInfo) bool {
+	if !st.Mode().IsRegular() {
+		return false
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	return ok && sys.Nlink == 1
+}
+
 // drainSpill moves one immutable spill segment into the authoritative JSONL.
-// The spill file is an unauthenticated write path (WASM workers share the
-// daemon uid and the audit directory); drain sanitizes every line before it
-// is chained. It streams and group-commits the segment in bounded batches,
+// The spill file is an unauthenticated write path (WASM workers write it:
+// ones from before workers dropped their privileges in the audit
+// directory, the rest in their own folder, claimWorkerSpill); drain
+// sanitizes every line before it is chained. It streams and group-commits the segment in bounded batches,
 // then removes the segment only after every batch is durable. A crash may
 // replay a batch (event IDs make that detectable/idempotent downstream), but
 // cannot lose evidence.
@@ -990,22 +1166,31 @@ func (s *fileAuditSink) drainSpill() bool {
 			hasWork = true
 			return nil
 		}
+		// No segment is in progress, so a folder note beside working is
+		// stale (a crash between claimSpillFrom writing it and its rename):
+		// it must not bind the next segment, the daemon's own included, to
+		// that worker's sandbox.
+		if err := os.Remove(working + spillFromSuffix); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		st, err := os.Stat(s.spillPath)
-		if err != nil {
-			if os.IsNotExist(err) {
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil {
+			if st.Size() == 0 {
+				_ = os.Remove(s.spillPath)
+			} else {
+				if err := os.Rename(s.spillPath, working); err != nil {
+					return err
+				}
+				hasWork = true
 				return nil
 			}
-			return err
 		}
-		if st.Size() == 0 {
-			_ = os.Remove(s.spillPath)
-			return nil
-		}
-		if err := os.Rename(s.spillPath, working); err != nil {
-			return err
-		}
-		hasWork = true
-		return nil
+		claimed, err := s.claimWorkerSpill(working)
+		hasWork = claimed
+		return err
 	})
 	if err != nil || !hasWork {
 		return false
@@ -1013,6 +1198,7 @@ func (s *fileAuditSink) drainSpill() bool {
 
 	offsetPath := working + ".off"
 	start := loadSpillOffset(offsetPath)
+	folderSandbox := spillSandbox(working)
 	f, err := os.Open(working)
 	if err != nil {
 		return false
@@ -1064,7 +1250,7 @@ func (s *fileAuditSink) drainSpill() bool {
 						auditSpillMalformedTotal.Add(1)
 						ev = spillMalformedGap([]byte(text))
 					} else {
-						ev = s.sanitizeSpillRecord(rec, now)
+						ev = s.sanitizeSpillRecordFrom(rec, now, folderSandbox)
 					}
 					batch = append(batch, ev)
 					if len(batch) == cap(batch) && !flush() {
@@ -1085,6 +1271,7 @@ func (s *fileAuditSink) drainSpill() bool {
 	}
 	if err := s.withAuditFileLock(func() error {
 		_ = os.Remove(offsetPath)
+		_ = os.Remove(working + spillFromSuffix)
 		return os.Remove(working)
 	}); err != nil {
 		return false
@@ -1123,6 +1310,14 @@ func spillMalformedGap(seed []byte) SecretAuditEvent {
 // tip. Future timestamps are clamped so they cannot block retention; a
 // capability holder can still only backdate its own sandbox's evidence.
 func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.Time) SecretAuditEvent {
+	return s.sanitizeSpillRecordFrom(rec, now, "")
+}
+
+// sanitizeSpillRecordFrom is sanitizeSpillRecord for a segment from a worker
+// folder named for folderSandbox: an egress record there is that sandbox's
+// or none, so a worker cannot file records under another sandbox even with
+// a capability it got hold of.
+func (s *fileAuditSink) sanitizeSpillRecordFrom(rec auditlog.SpillRecord, now time.Time, folderSandbox string) SecretAuditEvent {
 	ev := rec.Event
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -1152,7 +1347,7 @@ func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.T
 			return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
 		}
 		sandboxID, incarnationID, err := s.spillVerify(rec.Capability, now)
-		if err != nil || strings.TrimSpace(sandboxID) == "" {
+		if err != nil || strings.TrimSpace(sandboxID) == "" || folderSandbox != "" && sandboxID != folderSandbox {
 			auditSpillUnauthenticatedTotal.Add(1)
 			return spillMalformedGap([]byte(ev.EventID + kind + ev.SandboxID))
 		}

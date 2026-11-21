@@ -29,6 +29,12 @@ const FloorFileEnv = "SB_EGRESS_DENY_FLOOR_FILE"
 // fileFloor is the floor file's part of the extra floor.
 var fileFloor atomic.Pointer[[]netip.Prefix]
 
+// fileFloorUnknown is set by a process that can no longer read the floor
+// file it guards with (a WASM worker that dropped its privileges and saw
+// the file replaced by one it may not read): until it reads it again,
+// every address counts as on the floor.
+var fileFloorUnknown atomic.Bool
+
 // ReadFloorFile reads and checks the floor file at path, as ParseRanges
 // checks DenyFloorEnv.
 func ReadFloorFile(path string) ([]netip.Prefix, error) {
@@ -36,8 +42,21 @@ func ReadFloorFile(path string) ([]netip.Prefix, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", FloorFileEnv, err)
 	}
+	return ParseFloorFile(path, raw)
+}
+
+// ParseFloorFile checks the floor file's content as read from path.
+func ParseFloorFile(path string, raw []byte) ([]netip.Prefix, error) {
 	return ParseRanges(FloorFileEnv+" "+path, strings.ReplaceAll(string(raw), "\n", ","))
 }
+
+// SetFileFloorUnknown makes every address count as on the floor (true)
+// until the floor file is read again (false): a guard that cannot know the
+// floor fails closed.
+func SetFileFloorUnknown(unknown bool) { fileFloorUnknown.Store(unknown) }
+
+// FileFloorUnknown reports whether SetFileFloorUnknown(true) is in force.
+func FileFloorUnknown() bool { return fileFloorUnknown.Load() }
 
 // SetFileFloor installs the floor file's addresses.
 func SetFileFloor(ps []netip.Prefix) {

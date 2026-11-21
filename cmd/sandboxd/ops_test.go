@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // opsHost is a stopped node for the backup, restore and recover-quorum
@@ -211,12 +212,13 @@ func TestOpsHostForPod(t *testing.T) {
 // fails here, not in a pod.
 func TestIsDaemonArgv(t *testing.T) {
 	known := map[string]string{
-		"upgradeSubcommand":    upgradeSubcommand,
-		"hostSubcommand":       hostSubcommand,
-		"keySubcommand":        keySubcommand,
-		"gatewayd.Subcommand":  gatewayd.Subcommand,
-		"isolate.JailShimFlag": isolate.JailShimFlag,
-		"pkcs11.HelperFlag":    pkcs11.HelperFlag,
+		"upgradeSubcommand":     upgradeSubcommand,
+		"hostSubcommand":        hostSubcommand,
+		"keySubcommand":         keySubcommand,
+		"gatewayd.Subcommand":   gatewayd.Subcommand,
+		"isolate.JailShimFlag":  isolate.JailShimFlag,
+		"pkcs11.HelperFlag":     pkcs11.HelperFlag,
+		"worker.PrecompileFlag": worker.PrecompileFlag,
 	}
 	src, err := os.ReadFile("main.go")
 	if err != nil {
