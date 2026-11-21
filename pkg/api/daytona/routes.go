@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -35,6 +36,10 @@ type Deps struct {
 	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
 	// and every facade: they cost the same fan-out.
 	ListGate *apihttp.Gate
+	// UploadSpool takes bulk-upload parts too big for memory, in a private
+	// folder per request (never the host's shared temp folder). nil keeps
+	// every part in memory and refuses an upload that does not fit.
+	UploadSpool *multipartspool.Spool
 }
 
 // Route returns h behind authenticate → authorize(perm) → audit seam

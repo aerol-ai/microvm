@@ -161,7 +161,7 @@ func TestNFSBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NFS.Build: %v", err)
 	}
-	want := []string{"mount", "-t", "nfs", "-o", "ro", "--", "10.0.0.2:/exports/data", "/mnt/nfs"}
+	want := []string{"mount", "-t", "nfs", "-o", "ro,nosuid,nodev", "--", "10.0.0.2:/exports/data", "/mnt/nfs"}
 	if !reflect.DeepEqual(plan.Argv, want) {
 		t.Fatalf("NFS argv mismatch: got=%v want=%v", plan.Argv, want)
 	}
@@ -173,8 +173,46 @@ func TestNFSBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NFS.Build with opts: %v", err)
 	}
-	if got := plan.Argv[4]; got != "rw,vers=4,ro" {
-		t.Fatalf("NFS opts = %q, want rw,vers=4,ro", got)
+	if got := plan.Argv[4]; got != "rw,vers=4,ro,nosuid,nodev" {
+		t.Fatalf("NFS opts = %q, want rw,vers=4,ro,nosuid,nodev", got)
+	}
+}
+
+// nosuid,nodev end every NFS -o list, whatever the spec says, so a set-uid
+// binary or device node on the share never acts as one on the host or in
+// the sandbox. mount takes the last of a suid/nosuid pair, so they must
+// come after the caller's options, including a stored spec's suid or dev
+// that predates the allow list.
+func TestNFSBuild_ForcesNosuidNodev(t *testing.T) {
+	cases := []struct {
+		name     string
+		opts     string
+		readOnly bool
+		want     string
+	}{
+		{"default read-write", "", false, "rw,nosuid,nodev"},
+		{"default read-only", "", true, "ro,nosuid,nodev"},
+		{"caller options", "vers=4.1,hard", false, "vers=4.1,hard,nosuid,nodev"},
+		{"stored suid,dev overridden", "suid,dev,vers=4", false, "suid,dev,vers=4,nosuid,nodev"},
+		{"stored suid read-only", "suid", true, "suid,ro,nosuid,nodev"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := models.MountSpec{Source: "10.0.0.2:/exports/data", ReadOnly: tc.readOnly}
+			if tc.opts != "" {
+				spec.Options = map[string]string{"opts": tc.opts}
+			}
+			plan, err := (NFS{}).Build("sb", 0, spec, "/mnt/nfs", "/creds")
+			if err != nil {
+				t.Fatalf("NFS.Build: %v", err)
+			}
+			if got := plan.Argv[4]; got != tc.want {
+				t.Fatalf("NFS -o = %q, want %q", got, tc.want)
+			}
+			if !strings.HasSuffix(plan.Argv[4], ","+nfsForcedOptions) {
+				t.Fatalf("NFS -o = %q must end with %q", plan.Argv[4], nfsForcedOptions)
+			}
+		})
 	}
 }
 

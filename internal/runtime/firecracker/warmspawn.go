@@ -35,8 +35,10 @@ import (
 // runtime adapter — which lives in this package — translates between
 // the two shapes).
 type WarmSpawnRequest struct {
-	SlotID             string
-	TemplateID         string
+	SlotID     string
+	TemplateID string
+	// RootfsPath is the template's rootfs, TemplateResolution.RootfsPath.
+	RootfsPath         string
 	SnapshotMemoryPath string
 	SnapshotStatePath  string
 	SnapshotChecksum   string
@@ -77,9 +79,12 @@ type WarmHandle interface {
 //  2. Allocate and realize a TAP slot under the warm slot id.
 //  3. Start the VMM process and wait for its API socket.
 //  4. Optionally verify the snapshot checksums (SnapshotVerifyOnLoad).
-//  5. LoadSnapshot with EnableDiffSnapshots=true, ResumeVM=false,
+//  5. Stage every file LoadSnapshot opens into the run dir: the
+//     snapshot memory and state, the template rootfs, and the overlay
+//     placeholder when the template has one.
+//  6. LoadSnapshot with EnableDiffSnapshots=true, ResumeVM=false,
 //     rebinding eth0 to the warm TAP via network_overrides.
-//  6. Return the handle without resuming — the Acquire code transfers
+//  7. Return the handle without resuming — the Acquire code transfers
 //     the TAP owner and resumes.
 //
 // On any failure between Start and the final return, the spawned
@@ -109,6 +114,9 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	}
 	if req.SnapshotMemoryPath == "" || req.SnapshotStatePath == "" {
 		return nil, errors.New("firecracker warm-spawn: snapshot paths are required")
+	}
+	if req.RootfsPath == "" {
+		return nil, errors.New("firecracker warm-spawn: template rootfs path is required")
 	}
 	if req.VsockCID < 3 {
 		// Same guard as the template snapshotter; a CID below 3 means
@@ -219,6 +227,22 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(handle.RunDir(), req.SnapshotMemoryPath, req.SnapshotStatePath)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+	}
+	// The snapshot's root drive names rootfs.ext4 (chroot-relative under
+	// the jailer), and LoadSnapshot opens it, so it is staged here, the
+	// way Create stages it for the cold load (Step 3, then
+	// configureVMMForLoad): linked or copied from the template, then given
+	// to the jailer's uid. A template built with an overlay drive has a
+	// read-only root drive, which PATCH /drives cannot change, so a link
+	// to the template's inode is never written through this VM; the guest
+	// writes to the overlay. The pool-hit path reuses this file: it is the
+	// rootfs the paused VM was loaded against.
+	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+	if err := linkOrCopyRootfs(req.RootfsPath, rootfsPath); err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
+	}
+	if _, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName); err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
 	}
 	if req.HasOverlay {
 		overlayPath := filepath.Join(handle.RunDir(), overlayFileName)

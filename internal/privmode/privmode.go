@@ -60,6 +60,7 @@ const (
 	StepWarmPool      Step = "warm_pool"
 	StepMoves         Step = "gvisor_moves"
 	StepHostPorts     Step = "host_ports"
+	StepBuilds        Step = "image_builds"
 )
 
 // steps say what each step is, for the operator who meets the error.
@@ -74,6 +75,7 @@ var steps = map[Step]string{
 	StepWarmPool:      "the containerd warm pool's parked sandboxes",
 	StepMoves:         "gVisor checkpoint moves",
 	StepHostPorts:     "raw-TCP host-port forwarding (ingress proxy routing, SB_INGRESS_PROXY_ROUTING)",
+	StepBuilds:        "image builds (buildkitd's root socket, and the build-context unpacker's own uids)",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

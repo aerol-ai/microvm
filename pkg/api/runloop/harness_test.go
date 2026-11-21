@@ -366,16 +366,17 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/process/session/"):
 		f.serveSession(w, r, strings.TrimPrefix(path, "/process/session/"))
 	case path == "/files/upload":
-		if err := r.ParseMultipartForm(1 << 20); err != nil {
+		// Streamed, not ParseMultipartForm: that would spill a large
+		// upload into TMPDIR, which the upload-spool tests watch.
+		data, found, err := readFilePart(r)
+		if err != nil {
 			http.Error(w, `{"error":"bad form"}`, http.StatusBadRequest)
 			return
 		}
-		file, _, err := r.FormFile("file")
-		if err != nil {
+		if !found {
 			http.Error(w, `{"error":"file is required"}`, http.StatusBadRequest)
 			return
 		}
-		data, _ := io.ReadAll(file)
 		f.mu.Lock()
 		f.files[r.URL.Query().Get("path")] = data
 		f.mu.Unlock()
@@ -393,6 +394,29 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(data)
 	default:
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	}
+}
+
+// readFilePart reads the `file` part of a toolbox upload as it streams in.
+func readFilePart(r *http.Request) (data []byte, found bool, err error) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return nil, false, err
+	}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			return data, found, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if part.FormName() == "file" && !found {
+			if data, err = io.ReadAll(part); err != nil {
+				return nil, false, err
+			}
+			found = true
+		}
 	}
 }
 

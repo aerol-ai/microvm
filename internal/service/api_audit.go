@@ -355,6 +355,12 @@ const (
 	// was away, or one nothing proves is still live.
 	systemActionClusterDeleted  = "cluster.deleted_while_away"
 	systemActionClusterUnproven = "cluster.unproven_while_away"
+	// A sandbox running across a restart whose stored mounts the allow
+	// lists refuse (mount_tool_options.go): its mounts kept as they ran
+	// until its next start, which is refused, or torn down. The reason
+	// names each refused mount and flag.
+	systemActionMountsRefusedKept    = "mounts.refused_kept"
+	systemActionMountsRefusedRemoved = "mounts.refused_removed"
 )
 
 // beginSystemAction resolves the sandbox's lifecycle and owner now, before

@@ -65,9 +65,11 @@ type TemplateLister interface {
 // TemplateWarmInput is the per-template artifact the refill loop
 // hands to the Spawner. Lifted from store.Template's snapshot fields
 // so this package stays at arm's length from the template store row
-// shape.
+// shape. RootfsPath is the template's rootfs, which LoadSnapshot opens as
+// the snapshot's root drive.
 type TemplateWarmInput struct {
 	TemplateID         string
+	RootfsPath         string
 	SnapshotMemoryPath string
 	SnapshotStatePath  string
 	SnapshotChecksum   string
@@ -299,6 +301,7 @@ func (p *Pool) spawnOne(parentCtx context.Context, tpl TemplateWarmInput, spawne
 	spawnStart := time.Now()
 	handle, err := spawner.Spawn(spawnCtx, slotID, SnapshotInputs{
 		TemplateID:         tpl.TemplateID,
+		RootfsPath:         tpl.RootfsPath,
 		SnapshotMemoryPath: tpl.SnapshotMemoryPath,
 		SnapshotStatePath:  tpl.SnapshotStatePath,
 		SnapshotChecksum:   tpl.SnapshotChecksum,

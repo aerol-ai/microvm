@@ -29,6 +29,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -574,4 +575,31 @@ func TestRun_SplitModeRefusals(t *testing.T) {
 			t.Fatalf("Run = %v, want the helper unavailable", err)
 		}
 	})
+}
+
+// TestImageBuilderFor: privilege mode split refuses an image build by name
+// (buildkitd's root socket and the unpacker's own uids are root work the
+// helper does not do yet), as a 501, and passes the rest through; single
+// mode and a node without the containerd engine are unchanged.
+func TestImageBuilderFor(t *testing.T) {
+	if b := imageBuilderFor(config.Config{PrivilegeMode: privmode.Split}, nil); b != nil {
+		t.Fatalf("no containerd engine: got %v, want no builder", b)
+	}
+	ib := cntr.NewImageBuilder(nil, nil)
+	if b := imageBuilderFor(config.Config{}, ib); b != ib {
+		t.Fatalf("single mode: got %T, want the engine's builder", b)
+	}
+	if b := imageBuilderFor(config.Config{PrivilegeMode: privmode.Single}, ib); b != ib {
+		t.Fatalf("explicit single: got %T, want the engine's builder", b)
+	}
+	b := imageBuilderFor(config.Config{PrivilegeMode: privmode.Split}, ib)
+	err := b.BuildImage(context.Background(), docker.BuildImageRequest{})
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !errors.Is(err, privmode.ErrGap) || !strings.Contains(err.Error(), "image builds") {
+		t.Fatalf("split build: %v, want a 501 naming image builds", err)
+	}
+	// Everything but the build goes to the engine's builder (RefreshTag is
+	// its no-op, so it needs no containerd).
+	if err := b.RefreshTag(context.Background(), "aerolvm/x:1"); err != nil {
+		t.Fatalf("split RefreshTag: %v", err)
+	}
 }

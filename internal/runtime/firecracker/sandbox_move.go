@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -236,6 +237,12 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 		if h.Name == sandboxSnapshotManifestName {
 			if manifest, err = readMoveManifest(path, sandboxID); err != nil {
 				return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
+			}
+			// Refused before the memory comes over: the sandbox stays where
+			// it is. One saved before the setting existed moves, like any
+			// sandbox that existed then (nested_virt.go).
+			if !d.cfg.NestedVirt && manifest.NestedVirt == firecracker.NestedVirtOn && firecracker.NestedVirtApplies(hostArch) {
+				return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, errNestedVirtMoveRefused)
 			}
 		}
 	}

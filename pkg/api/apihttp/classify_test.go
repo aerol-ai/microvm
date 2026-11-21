@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -77,6 +78,9 @@ func TestClassify(t *testing.T) {
 		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		// A split-mode node's build refusal, as the service's build path
+		// wraps it (buildError): 501, not the 502 of a failed build.
+		{"build refused by privilege mode split", fmt.Errorf("build image: %w", privmode.NotYet("build an image", privmode.StepBuilds)), http.StatusNotImplemented, 0, "", ErrKindOther},
 		// The root helper: down, or older than the agent (M1). Both clear
 		// on their own (a restart, the staged helper's swap), so 503.
 		{"root helper unavailable", fmt.Errorf("%w at /run/aerolvm/root.sock: connection refused", rootclient.ErrUnavailable), http.StatusServiceUnavailable, 5, "", ErrKindOther},

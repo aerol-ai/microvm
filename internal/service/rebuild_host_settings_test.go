@@ -142,10 +142,10 @@ func TestRebuildContextHasNoHostPowers(t *testing.T) {
 	}
 	svc := &Service{}
 	mounts := []models.MountSpec{{Type: models.MountTypeS3, Source: "b/p", Target: "/data"}}
-	if err := svc.validateCreateMounts(controlplane.ContextWithoutHostPowers(ctx), mounts, "sb"); !errors.Is(err, models.ErrMountOperatorOnly) {
+	if err := svc.validateCreateMounts(controlplane.ContextWithoutHostPowers(ctx), mounts, "sb", nil); !errors.Is(err, models.ErrMountOperatorOnly) {
 		t.Fatalf("raw mount without host powers = %v", err)
 	}
-	if err := svc.validateCreateMounts(rebuildContext(ctx), mounts, "sb"); err != nil {
+	if err := svc.validateCreateMounts(rebuildContext(ctx), mounts, "sb", nil); err != nil {
 		t.Fatalf("rebuilt mounts = %v", err)
 	}
 }

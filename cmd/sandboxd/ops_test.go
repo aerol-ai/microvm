@@ -16,6 +16,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"github.com/aerol-ai/microvm/internal/nodeops"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
@@ -211,12 +212,13 @@ func TestOpsHostForPod(t *testing.T) {
 // fails here, not in a pod.
 func TestIsDaemonArgv(t *testing.T) {
 	known := map[string]string{
-		"upgradeSubcommand":    upgradeSubcommand,
-		"hostSubcommand":       hostSubcommand,
-		"keySubcommand":        keySubcommand,
-		"gatewayd.Subcommand":  gatewayd.Subcommand,
-		"isolate.JailShimFlag": isolate.JailShimFlag,
-		"pkcs11.HelperFlag":    pkcs11.HelperFlag,
+		"upgradeSubcommand":      upgradeSubcommand,
+		"hostSubcommand":         hostSubcommand,
+		"keySubcommand":          keySubcommand,
+		"gatewayd.Subcommand":    gatewayd.Subcommand,
+		"isolate.JailShimFlag":   isolate.JailShimFlag,
+		"cntr.ContextUnpackFlag": cntr.ContextUnpackFlag,
+		"pkcs11.HelperFlag":      pkcs11.HelperFlag,
 	}
 	src, err := os.ReadFile("main.go")
 	if err != nil {

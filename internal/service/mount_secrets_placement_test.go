@@ -30,16 +30,16 @@ func TestCreateSandboxRefusesCredentialsOutsideCredentialsExceptOnReplay(t *test
 		t.Fatalf("runtime Create calls = %d, want 0", rt.createCalls)
 	}
 
-	if err := svc.validateCreateMounts(ctx, mounts, ""); err == nil {
+	if err := svc.validateCreateMounts(ctx, mounts, "", nil); err == nil {
 		t.Fatal("new request must be refused")
 	}
-	if err := svc.validateCreateMounts(contextWithStoredSpecReplay(ctx), mounts, "sb-replayed"); err != nil {
+	if err := svc.validateCreateMounts(contextWithStoredSpecReplay(ctx), mounts, "sb-replayed", nil); err != nil {
 		t.Fatalf("stored-spec replay must proceed (warn only): %v", err)
 	}
 	// Shape errors are not downgraded on replay: a spec that cannot mount at
 	// all still fails.
 	broken := []models.MountSpec{{Type: models.MountTypeS3, Target: "relative", Source: "bucket"}}
-	if err := svc.validateCreateMounts(contextWithStoredSpecReplay(ctx), broken, "sb-replayed"); err == nil {
+	if err := svc.validateCreateMounts(contextWithStoredSpecReplay(ctx), broken, "sb-replayed", nil); err == nil {
 		t.Fatal("replay must still enforce the mount shape rules")
 	}
 	if isStoredSpecReplay(ctx) || !isStoredSpecReplay(contextWithStoredSpecReplay(ctx)) {
