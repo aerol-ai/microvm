@@ -30,7 +30,10 @@ type method struct {
 	check checkFunc
 	// ended, when set, runs once a forwarded call has ended, whatever its
 	// outcome, with its first request.
-	ended        func(g *Gate, req any)
+	ended func(g *Gate, req any)
+	// keep, when set, decodes each answer of a server stream and forwards
+	// only those it passes. Without it answers go unread (frame.go).
+	keep         func(g *Gate, resp proto.Message) bool
 	clientStream bool
 	serverStream bool
 	newReq       func() proto.Message
@@ -54,7 +57,10 @@ func req[T any, PT interface {
 // Create/Update/Delete, Events.Publish/Forward, Content.Delete, the
 // Transfer, Streaming and Mounts services, and containerd 2's sandbox API.
 var allowlist = []method{
-	// --- Reads: pass through, in the agent's namespace only. ---
+	// --- Reads: pass through, in the agent's namespace only. containerd
+	// scopes each of these to the namespace in the call's metadata, which
+	// the gate pins, except Events.Subscribe, which the gate narrows
+	// itself; Version, Health and Introspection hold no namespace's data. ---
 	{name: "/containerd.services.version.v1.Version/Version", newReq: req[emptypb.Empty](), newResp: req[versionapi.VersionResponse](),
 		why: "client.go Connect: refuses a containerd outside the supported versions"},
 	{name: "/grpc.health.v1.Health/Check", newReq: req[healthapi.HealthCheckRequest](), newResp: req[healthapi.HealthCheckResponse](),
@@ -87,8 +93,9 @@ var allowlist = []method{
 		why: "NewTask's rootfs, the disk limit's writable layer, image user lookup, snapshot commit"},
 	{name: "/containerd.services.snapshots.v1.Snapshots/Usage", newReq: req[snapshotsapi.UsageRequest](), newResp: req[snapshotsapi.UsageResponse](),
 		why: "WritableLayerBytes: the disk usage metric"},
-	{name: "/containerd.services.events.v1.Events/Subscribe", serverStream: true, newReq: req[eventsapi.SubscribeRequest](), newResp: req[types.Envelope](),
-		why: "the task exit and container delete event stream (events.go)"},
+	{name: "/containerd.services.events.v1.Events/Subscribe", serverStream: true, check: checkEventsSubscribe, keep: keepNamespaceEvent,
+		newReq: req[eventsapi.SubscribeRequest](), newResp: req[types.Envelope](),
+		why: "the task exit and container delete event stream (events.go); narrowed to the agent's namespace, which containerd's Subscribe does not read"},
 
 	// --- Writes: walked field by field, then checked against rootpolicy. ---
 	{name: "/containerd.services.containers.v1.Containers/Create", write: true, check: checkContainerCreate, newReq: req[containersapi.CreateContainerRequest](), newResp: req[containersapi.CreateContainerResponse](),

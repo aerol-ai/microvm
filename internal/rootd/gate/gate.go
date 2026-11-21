@@ -205,7 +205,7 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 	} else if err := cs.CloseSend(); err != nil {
 		return err
 	}
-	if err := forwardResponses(ss, cs, m); err != nil {
+	if err := g.forwardResponses(ss, cs, m); err != nil {
 		select {
 		case r := <-refused:
 			return r // the refusal, not the cancel it caused
@@ -241,15 +241,21 @@ func (g *Gate) forwardRequests(ctx context.Context, cancel context.CancelFunc, s
 	}
 }
 
-func forwardResponses(ss grpc.ServerStream, cs grpc.ClientStream, m *method) error {
+func (g *Gate) forwardResponses(ss grpc.ServerStream, cs grpc.ClientStream, m *method) error {
 	defer func() { ss.SetTrailer(cs.Trailer()) }()
 	for {
-		resp := &frame{} // the gate reads no answer (frame.go)
+		var resp any = &frame{} // most answers go unread (frame.go)
+		if m.keep != nil {
+			resp = m.newResp()
+		}
 		if err := cs.RecvMsg(resp); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
+		}
+		if m.keep != nil && !m.keep(g, resp.(proto.Message)) {
+			continue
 		}
 		if err := ss.SendMsg(resp); err != nil {
 			return err

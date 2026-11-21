@@ -7,6 +7,7 @@ import (
 
 	containersapi "github.com/containerd/containerd/api/services/containers/v1"
 	diffapi "github.com/containerd/containerd/api/services/diff/v1"
+	eventsapi "github.com/containerd/containerd/api/services/events/v1"
 	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
 	tasksapi "github.com/containerd/containerd/api/services/tasks/v1"
 	"github.com/containerd/containerd/api/types"
@@ -161,6 +162,27 @@ func checkTaskUpdate(_ context.Context, g *Gate, req proto.Message) error {
 	r := req.(*tasksapi.UpdateTaskRequest)
 	res := r.GetResources()
 	return rootpolicy.CheckTaskUpdate(g.policy, res.GetTypeUrl(), res.GetValue(), r.GetAnnotations())
+}
+
+// checkEventsSubscribe narrows a subscription to the agent's namespace
+// (rootpolicy.ScopeEventFilters): containerd's Subscribe sends every
+// namespace's events that match the filters. The request containerd gets
+// is the narrowed one.
+func checkEventsSubscribe(_ context.Context, g *Gate, req proto.Message) error {
+	r := req.(*eventsapi.SubscribeRequest)
+	fs, err := rootpolicy.ScopeEventFilters(g.policy, r.GetFilters())
+	if err != nil {
+		return err
+	}
+	r.Filters = fs
+	return nil
+}
+
+// keepNamespaceEvent forwards an event only from the agent's namespace.
+// The narrowed filters already ask containerd for no other; this holds
+// even if containerd sent one anyway.
+func keepNamespaceEvent(g *Gate, resp proto.Message) bool {
+	return resp.(*types.Envelope).GetNamespace() == g.policy.Namespace
 }
 
 func checkSnapshotter(_ context.Context, g *Gate, req proto.Message) error {
