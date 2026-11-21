@@ -31,10 +31,22 @@ func NewClient(socketPath string) *Client {
 	}
 }
 
+// dialWorker opens sandboxd's connection to the worker at path: refused
+// for a quarantined worker, and read so that no descriptor the worker
+// sends is released on the caller's goroutine (reaper.go).
+func dialWorker(dial func(string) (net.Conn, error), path string) (net.Conn, error) {
+	if err := workerQuarantined(path); err != nil {
+		return nil, err
+	}
+	conn, err := dial(path)
+	if err != nil {
+		return nil, err
+	}
+	return wrapWorkerConn(conn, path)
+}
+
 func (c *Client) roundTrip(env Envelope, grants ...string) (Envelope, error) {
-	dial := c.dial
-	socketPath := c.socketPath
-	conn, err := dial(socketPath)
+	conn, err := dialWorker(c.dial, c.socketPath)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -52,7 +64,7 @@ func (c *Client) roundTrip(env Envelope, grants ...string) (Envelope, error) {
 // roundTripStrict is roundTrip where the paths in strict must be files
 // root owns.
 func (c *Client) roundTripStrict(env Envelope, grants, strict []string) (Envelope, error) {
-	conn, err := c.dial(c.socketPath)
+	conn, err := dialWorker(c.dial, c.socketPath)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -130,7 +142,7 @@ func (c *Client) dialContext(ctx context.Context) (net.Conn, error) {
 	socketPath := c.socketPath
 	defer close(done)
 	go func() {
-		conn, err := dial(socketPath)
+		conn, err := dialWorker(dial, socketPath)
 		select {
 		case ch <- dialResult{conn: conn, err: err}:
 		case <-done:

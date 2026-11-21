@@ -98,7 +98,7 @@ func TestCov96ResidentServeReplyWriteFailures(t *testing.T) {
 			envs := append(tc.envs, Envelope{Type: MsgHealthPing, SandboxID: "sb"})
 			conn := newCov96ScriptConn(t, tc.okFrames, envs...)
 			_ = tc.srv.Serve(conn)
-			if want := 2*tc.okFrames + 1; conn.writes != want || conn.r.Len() == 0 {
+			if want := tc.okFrames + 1; conn.writes != want || conn.r.Len() == 0 {
 				t.Fatalf("writes=%d (want %d) unread=%d; want Serve to stop at the failed reply",
 					conn.writes, want, conn.r.Len())
 			}

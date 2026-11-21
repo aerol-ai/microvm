@@ -276,16 +276,20 @@ func Plan(spec Spec) ([]Rule, error) {
 // localByAddress is the node-port, node-address and broadcast part of the
 // chain for a kernel without nft fib: the same rules, one per address of
 // spec.Local (loopback and link-local are dropped above already), and a
-// drop for each IPv4 subnet's broadcast address.
+// drop for each IPv4 subnet's broadcast address and its network address.
+// A kernel that still adds "broadcast <network>" to the local table (5.10
+// does) delivers a datagram to the network address to the node's own UDP
+// services on 0.0.0.0, as it does one to the broadcast address.
 func localByAddress(spec Spec, ports []uint16) []Rule {
-	var addrs, bcasts []netip.Prefix
+	var addrs, nets, bcasts []netip.Prefix
 	for _, l := range spec.Local {
 		a := l.Addr().Unmap()
 		if !l.IsValid() || a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
 			continue
 		}
 		addrs = append(addrs, netip.PrefixFrom(a, a.BitLen()))
-		if b, ok := broadcastOf(netip.PrefixFrom(a, l.Bits())); ok {
+		if n, b, ok := broadcastOf(netip.PrefixFrom(a, l.Bits())); ok {
+			nets = append(nets, netip.PrefixFrom(n, 32))
 			bcasts = append(bcasts, netip.PrefixFrom(b, 32))
 		}
 	}
@@ -293,7 +297,7 @@ func localByAddress(spec Spec, ports []uint16) []Rule {
 		slices.SortFunc(ps, func(a, b netip.Prefix) int { return a.Addr().Compare(b.Addr()) })
 		return slices.Compact(ps)
 	}
-	addrs, bcasts = sortAddrs(addrs), sortAddrs(bcasts)
+	addrs, nets, bcasts = sortAddrs(addrs), sortAddrs(nets), sortAddrs(bcasts)
 	var out []Rule
 	for _, port := range ports {
 		for _, p := range addrs {
@@ -303,24 +307,27 @@ func localByAddress(spec Spec, ports []uint16) []Rule {
 	for _, p := range addrs {
 		out = append(out, Rule{UID: spec.UID, Kind: KindDrop, Prefix: p, Why: "node address"})
 	}
+	for _, p := range nets {
+		out = append(out, Rule{UID: spec.UID, Kind: KindDrop, Prefix: p, Why: "node network address"})
+	}
 	for _, p := range bcasts {
 		out = append(out, Rule{UID: spec.UID, Kind: KindDrop, Prefix: p, Why: "node broadcast"})
 	}
 	return out
 }
 
-// broadcastOf is an IPv4 subnet's broadcast address; none for IPv6, or for
-// a /31 or /32, which have none.
-func broadcastOf(p netip.Prefix) (netip.Addr, bool) {
+// broadcastOf is an IPv4 subnet's network and broadcast addresses; none
+// for IPv6, or for a /31 or /32, which have neither.
+func broadcastOf(p netip.Prefix) (network, broadcast netip.Addr, ok bool) {
 	if !p.Addr().Is4() || p.Bits() > 30 || p.Bits() < 1 {
-		return netip.Addr{}, false
+		return netip.Addr{}, netip.Addr{}, false
 	}
 	b := p.Addr().As4()
 	host := ^uint32(0) >> p.Bits()
 	for i := range 4 {
 		b[i] |= byte(host >> (24 - 8*i))
 	}
-	return netip.AddrFrom4(b), true
+	return p.Masked().Addr(), netip.AddrFrom4(b), true
 }
 
 // usesFib reports whether rules need the kernel's nft fib.

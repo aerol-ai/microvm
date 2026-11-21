@@ -30,13 +30,14 @@ import (
 //  1. sandboxd sends guest_listener; the worker answers with the listening
 //     socket the request goes to (listenerFor) attached.
 //  2. sandboxd checks that socket (checkGuestListener) and connects to its
-//     address as root while it holds it. A listening socket bound to that
-//     exact address, with SO_REUSEPORT off, is the only one the kernel can
-//     hand the connection to, and a worker can only attach a socket it
-//     holds: so the connection lands on that worker's own listener, never
-//     on another tenant's or on a service of the node, whatever port the
-//     worker named. sandboxd closes the listening socket at once and never
-//     accepts on it.
+//     address as root while it holds it. A TCP listening socket bound to
+//     that exact address, on no device and with SO_REUSEPORT off, is the
+//     only one the kernel can hand the connection to, and a worker can only
+//     attach a socket it holds: so the connection lands on that worker's
+//     own listener, never on another tenant's or on a service of the node,
+//     whatever port the worker named (which is why the port list the
+//     worker reported is only a sanity check). sandboxd closes the
+//     listening socket at once and never accepts on it.
 //  3. sandboxd sends the request over that connection and relays the
 //     answer (proxyOverConn), counting the bytes as the worker counted
 //     them. The connection stays sandboxd's: the fence matches packets by
@@ -240,9 +241,9 @@ func (c *Client) ProxyHTTPDialed(sandboxID string, guestPort int, host string, p
 
 // dialGuest runs the guest_listener exchange and returns sandboxd's own
 // connection to the listener the worker named. The worker connection is
-// done with by then, and every descriptor it sent is closed.
+// done with by then, and the listener it sent is closed.
 func (c *Client) dialGuest(sandboxID string, guestPort int, host string, ports []int) (net.Conn, string, error) {
-	conn, err := c.dial(c.socketPath)
+	conn, err := dialWorker(c.dial, c.socketPath)
 	if err != nil {
 		return nil, "", err
 	}
@@ -255,20 +256,24 @@ func (c *Client) dialGuest(sandboxID string, guestPort int, host string, ports [
 	if err := writeFrame(conn, Envelope{Type: MsgGuestListener, SandboxID: sandboxID, Payload: body}); err != nil {
 		return nil, "", err
 	}
-	reply, files, err := readFrameFiles(conn)
+	// The reply's one descriptor, a socket (readGuestListenerReply refuses
+	// anything else); connectGuest closes it right after it connects.
+	reply, listener, err := readGuestListenerReply(conn)
 	if err != nil {
 		return nil, "", err
 	}
-	// connectGuest closes the listener right after it connects.
-	return connectGuest(reply, files, host, ports)
+	return connectGuest(reply, listener, host, ports)
 }
 
 // connectGuest checks the worker's guest_listener reply and connects to
-// the listener it carries while holding it; then it closes every
-// descriptor of the reply, the listener first among them, so sandboxd
-// holds none of the worker's sockets beyond this call.
-func connectGuest(reply Envelope, files []*os.File, host string, ports []int) (net.Conn, string, error) {
-	defer closeFiles(files)
+// the listener it carries while holding it; then it closes the listener,
+// so sandboxd holds none of the worker's sockets beyond this call. The
+// close does not wait: it is a socket the worker made, and workers may not
+// set SO_LINGER.
+func connectGuest(reply Envelope, listener *os.File, host string, ports []int) (net.Conn, string, error) {
+	if listener != nil {
+		defer listener.Close()
+	}
 	switch reply.Type {
 	case MsgOK:
 	case MsgInvokeResult:
@@ -285,10 +290,10 @@ func connectGuest(reply Envelope, files []*os.File, host string, ports []int) (n
 	default:
 		return nil, "", fmt.Errorf("unexpected reply type %q", reply.Type)
 	}
-	if len(files) != 1 || len(reply.FDPaths) != 1 || reply.FDPaths[0] != guestListenerFDName {
+	if listener == nil || len(reply.FDPaths) != 1 || reply.FDPaths[0] != guestListenerFDName {
 		return nil, "", errors.New("guest listener: the worker attached no listening socket")
 	}
-	addr, err := checkGuestListener(files[0], host, ports)
+	addr, err := checkGuestListener(listener, host, ports)
 	if err != nil {
 		return nil, "", err
 	}
@@ -302,8 +307,20 @@ func connectGuest(reply Envelope, files []*os.File, host string, ports []int) (n
 // checkGuestListener checks the socket a worker attached before sandboxd
 // connects to its address: a TCP socket in the listening state, bound to
 // exactly host and one of ports, with SO_REUSEPORT off (so no other socket
-// can share that address with it). While the caller holds it, it is the
-// only socket a connection to that address can reach.
+// can share that address with it) and on no device. While the caller holds
+// it, it is the only socket a connection to that address can reach.
+//
+// "TCP" is checked by family, type and protocol, not by SO_TYPE alone: an
+// SCTP listener is a SOCK_STREAM socket in the listening state too, but
+// SCTP ports are not TCP ports, so a TCP listener can hold the same port
+// beside it (another tenant's guest on the guest listen host, a node
+// service on every address), and sandboxd's connection would land there.
+// MPTCP is TCP here: an MPTCP listener listens through a TCP socket in
+// TCP's port space, and Go makes one by default when the kernel has MPTCP
+// (a worker kept root does; a confined worker's filter refuses MPTCP, and
+// Go then makes plain TCP). A listener bound to a device takes only
+// connections that arrive on that device, so sandboxd's, on loopback,
+// would go past it to a wildcard listener on the same port.
 func checkGuestListener(f *os.File, host string, ports []int) (netip.AddrPort, error) {
 	want, err := netip.ParseAddr(host)
 	if err != nil {
@@ -318,18 +335,22 @@ func checkGuestListener(f *os.File, host string, ports []int) (netip.AddrPort, e
 		ok       bool
 		reuse    int
 		reuseErr error
+		kindErr  error
 	)
 	// Control, not Fd: Fd would put the socket, which the worker's own
 	// listener shares, into blocking mode.
 	if err := rc.Control(func(fd uintptr) {
 		ap, ok = listeningAddr(int(fd))
 		reuse, reuseErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT)
+		kindErr = checkTCPListenerKind(int(fd))
 	}); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("guest listener: %w", err)
 	}
 	switch {
 	case !ok:
 		return netip.AddrPort{}, errors.New("guest listener: the attached socket is not a listening TCP socket")
+	case kindErr != nil:
+		return netip.AddrPort{}, fmt.Errorf("guest listener: %w", kindErr)
 	case reuseErr != nil || reuse != 0:
 		return netip.AddrPort{}, errors.New("guest listener: the attached socket allows SO_REUSEPORT")
 	case ap.Addr() != want.Unmap():

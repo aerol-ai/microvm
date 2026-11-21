@@ -340,3 +340,62 @@ func TestSeccompDenyIfEq(t *testing.T) {
 		t.Errorf("read: %#x", got)
 	}
 }
+
+// A masked test compares an argument with some bits cleared: how the WASM
+// worker's socket rule names a socket type whatever SOCK_NONBLOCK and
+// SOCK_CLOEXEC ride on it, while SOCK_SEQPACKET (SCTP over IPv4) or a
+// stray bit is still not SOCK_STREAM, and SCTP asked for by protocol is
+// not TCP (review round 4, F1).
+func TestSeccompMaskedArgTests(t *testing.T) {
+	table := map[string]int{"socket": 41, "setsockopt": 54}
+	const flags = 0x800 | 0x80000
+	typ := func(v uint32) SeccompArgEq { return SeccompArgEq{Arg: 1, Mask: ^uint32(flags), Value: v} }
+	prog, _, err := BuildSeccomp(AuditArchX86_64, table, SeccompPolicy{
+		Allow: []string{"socket", "setsockopt"},
+		Rules: []SeccompArgRule{
+			{Syscall: "socket", AllowIfAny: [][]SeccompArgEq{
+				{{Arg: 0, Value: 2}, typ(1), {Arg: 2, Value: 0}},
+				{{Arg: 0, Value: 2}, typ(2), {Arg: 2, Value: 17}},
+				{{Arg: 0, Value: 16}, typ(3)},
+			}, Deny: SeccompRetErrno(97)},
+			{Syscall: "setsockopt", DenyIfEq: []SeccompArgEq{{Arg: 1, Mask: 0xff, Value: 1}, {Arg: 2, Value: 13}}, Deny: SeccompRetErrno(1)},
+		},
+		Default: SeccompRetKillProcess,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		nr   int
+		args []uint32
+		want uint32
+	}{
+		{"tcp", 41, []uint32{2, 1, 0}, SeccompRetAllow},
+		{"tcp, nonblocking and close-on-exec", 41, []uint32{2, 1 | flags, 0}, SeccompRetAllow},
+		{"udp, nonblocking", 41, []uint32{2, 2 | 0x800, 17}, SeccompRetAllow},
+		{"route netlink, close-on-exec", 41, []uint32{16, 3 | 0x80000, 0}, SeccompRetAllow},
+		{"sctp by protocol", 41, []uint32{2, 1, 132}, SeccompRetErrno(97)},
+		{"sctp by seqpacket", 41, []uint32{2, 5, 0}, SeccompRetErrno(97)},
+		{"seqpacket, close-on-exec", 41, []uint32{2, 5 | 0x80000, 0}, SeccompRetErrno(97)},
+		{"stream with a stray bit", 41, []uint32{2, 1 | 0x100, 0}, SeccompRetErrno(97)},
+		{"udp asking for tcp", 41, []uint32{2, 2, 6}, SeccompRetErrno(97)},
+		{"another family", 41, []uint32{10, 1, 0}, SeccompRetErrno(97)},
+		{"SO_LINGER at a masked level", 54, []uint32{3, 0x101, 13}, SeccompRetErrno(1)},
+		{"SO_LINGER at another level", 54, []uint32{3, 6, 13}, SeccompRetAllow},
+		{"another option", 54, []uint32{3, 1, 2}, SeccompRetAllow},
+	} {
+		if got := runBPF(t, prog, AuditArchX86_64, tc.nr, tc.args...); got != tc.want {
+			t.Errorf("%s: %#x, want %#x", tc.name, got, tc.want)
+		}
+	}
+	// A masked test whose value has a bit the mask clears could never hold.
+	for name, r := range map[string]SeccompArgRule{
+		"allow-any": {Syscall: "socket", AllowIfAny: [][]SeccompArgEq{{{Arg: 1, Mask: 0xf, Value: 0x10}}}},
+		"deny-eq":   {Syscall: "socket", DenyIfEq: []SeccompArgEq{{Arg: 1, Mask: 0xf, Value: 0x10}}},
+	} {
+		if _, _, err := BuildSeccomp(AuditArchX86_64, table, SeccompPolicy{Allow: []string{"socket"}, Rules: []SeccompArgRule{r}}); err == nil {
+			t.Errorf("%s: a test that cannot hold was accepted", name)
+		}
+	}
+}

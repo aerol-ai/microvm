@@ -299,8 +299,8 @@ func contextWithCancel() (context.Context, context.CancelFunc) {
 }
 
 // Without nft fib, the node's addresses are listed: the same node ports
-// open on each, then a drop per address and per IPv4 subnet broadcast,
-// after the floor.
+// open on each, then a drop per address, per IPv4 subnet network address
+// and per IPv4 subnet broadcast, after the floor.
 func TestPlanNoFib(t *testing.T) {
 	pfx := netip.MustParsePrefix
 	rules, err := Plan(Spec{UID: 7, NodePorts: []uint16{443}, NoFib: true, Local: []netip.Prefix{
@@ -311,7 +311,8 @@ func TestPlanNoFib(t *testing.T) {
 	}
 	key := Key(rules)
 	tail := "uid 7 accept tcp 10.0.0.5/32 port 443 (node port); uid 7 accept tcp 192.168.9.9/32 port 443 (node port); uid 7 accept tcp 2001:db8::5/128 port 443 (node port); " +
-		"uid 7 drop 10.0.0.5/32 (node address); uid 7 drop 192.168.9.9/32 (node address); uid 7 drop 2001:db8::5/128 (node address); uid 7 drop 10.0.0.255/32 (node broadcast)"
+		"uid 7 drop 10.0.0.5/32 (node address); uid 7 drop 192.168.9.9/32 (node address); uid 7 drop 2001:db8::5/128 (node address); " +
+		"uid 7 drop 10.0.0.0/32 (node network address); uid 7 drop 10.0.0.255/32 (node broadcast)"
 	if !strings.HasSuffix(key, tail) || usesFib(rules) {
 		t.Fatalf("plan = %s", key)
 	}
@@ -319,18 +320,19 @@ func TestPlanNoFib(t *testing.T) {
 		t.Fatal("a plan with fib does not use it")
 	}
 	for _, tc := range []struct {
-		p    string
-		want string
+		p       string
+		network string
+		bcast   string
 	}{
-		{"172.17.0.2/16", "172.17.255.255"},
-		{"10.1.2.3/30", "10.1.2.3"},
-		{"10.1.2.3/31", ""},
-		{"2001:db8::1/64", ""},
-		{"0.0.0.0/0", ""},
+		{"172.17.0.2/16", "172.17.0.0", "172.17.255.255"},
+		{"10.1.2.3/30", "10.1.2.0", "10.1.2.3"},
+		{"10.1.2.3/31", "", ""},
+		{"2001:db8::1/64", "", ""},
+		{"0.0.0.0/0", "", ""},
 	} {
-		got, ok := broadcastOf(pfx(tc.p))
-		if (tc.want == "") == ok || ok && got.String() != tc.want {
-			t.Errorf("broadcastOf(%s) = %v %v, want %q", tc.p, got, ok, tc.want)
+		n, b, ok := broadcastOf(pfx(tc.p))
+		if (tc.bcast == "") == ok || ok && (n.String() != tc.network || b.String() != tc.bcast) {
+			t.Errorf("broadcastOf(%s) = %v %v %v, want %q %q", tc.p, n, b, ok, tc.network, tc.bcast)
 		}
 	}
 }
@@ -366,7 +368,7 @@ func TestFenceFallsBackWithoutFib(t *testing.T) {
 	if err := f.Ensure(); err != nil || !f.Ready() || !f.noFib {
 		t.Fatalf("fallback: %v ready=%v noFib=%v", err, f.Ready(), f.noFib)
 	}
-	if k := Key(be.last); !strings.Contains(k, "drop 10.0.0.5/32 (node address)") || !strings.Contains(k, "drop 10.0.0.255/32 (node broadcast)") || usesFib(be.last) {
+	if k := Key(be.last); !strings.Contains(k, "drop 10.0.0.5/32 (node address)") || !strings.Contains(k, "drop 10.0.0.0/32 (node network address)") || !strings.Contains(k, "drop 10.0.0.255/32 (node broadcast)") || usesFib(be.last) {
 		t.Fatalf("installed = %s", k)
 	}
 	// Nothing changed: fib is tried again; the listed plan is not

@@ -35,14 +35,19 @@ func DefaultSpawner(ctx context.Context, socketPath string) (*exec.Cmd, error) {
 	}
 	cmd := exec.CommandContext(ctx, exe, WorkerFlag, socketPath)
 	cmd.Env = workerEnvironment(ctx)
-	// The worker writes straight to sandboxd's stdout and stderr (the
-	// journal), never to a pipe sandboxd reads: a worker that outlives
-	// sandboxd would get SIGPIPE on its next write to a pipe whose reader
-	// is gone.
+	// The worker writes where sandboxd does (the journal), never to a pipe
+	// sandboxd reads: a worker that outlives sandboxd would get SIGPIPE on
+	// its next write to a pipe whose reader is gone. Where that is a socket
+	// the supervisor gives the worker a stream of its own at the start
+	// (hostproc.OwnOutput): a shared one a worker could shut down for
+	// sandboxd too.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
 }
+
+// workerLogIdentifier is what the journal names workers' lines with.
+const workerLogIdentifier = "sandboxd-wasm-worker"
 
 // DefaultResidentSpawner runs the current executable as a resident-module host
 // (--wasm-resident-host → RunCLIResident): one process compiles a module once
@@ -55,6 +60,7 @@ func DefaultResidentSpawner(ctx context.Context, socketPath string) (*exec.Cmd, 
 	}
 	cmd := exec.CommandContext(ctx, exe, ResidentHostFlag, socketPath)
 	cmd.Env = workerEnvironment(ctx)
+	// As DefaultSpawner's.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd, nil
@@ -133,6 +139,9 @@ type slotState struct {
 	proc       hostproc.Process
 	spawnCount int
 	done       chan struct{}
+	// quarantined: the worker broke the protocol (reaper.go). It was killed
+	// and is not restarted; the slot refuses Ensure until Stop.
+	quarantined bool
 }
 
 // alive reports whether the slot's worker is still running.
@@ -153,10 +162,12 @@ func NewSupervisor(spawn Spawner) *Supervisor {
 	if spawn == nil {
 		spawn = DefaultSpawner
 	}
-	return &Supervisor{
+	s := &Supervisor{
 		spawn: spawn,
 		slots: make(map[string]*slotState),
 	}
+	registerSupervisor(s)
+	return s
 }
 
 // SetCgroup makes every later worker start in cg, outside sandboxd's unit,
@@ -180,11 +191,24 @@ func (s *Supervisor) Ensure(ctx context.Context, sandboxID, socketPath string) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if st, ok := s.slots[sandboxID]; ok && st.alive() {
-		return nil
+	if st, ok := s.slots[sandboxID]; ok {
+		if st.quarantined {
+			return workerQuarantinedSlot(st.socketPath)
+		}
+		if st.alive() {
+			return nil
+		}
 	}
 	// No worker, or it crashed: start one.
 	return s.startLocked(ctx, sandboxID, socketPath)
+}
+
+// workerQuarantinedSlot is the error a quarantined slot answers with.
+func workerQuarantinedSlot(path string) error {
+	if err := workerQuarantined(path); err != nil {
+		return err
+	}
+	return ErrWorkerQuarantined
 }
 
 func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath string) error {
@@ -196,9 +220,23 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 		return ctx.Err()
 	default:
 	}
+	if err := workerQuarantined(socketPath); err != nil {
+		return err
+	}
 	_ = os.Remove(socketPath)
 	spawnCtx := context.WithoutCancel(ctx)
-	build := func() (*exec.Cmd, error) { return s.spawn(spawnCtx, socketPath) }
+	// Output of the worker's own where sandboxd's is a socket (the
+	// journal): sandboxd's copies of it close once the start is done.
+	var opened []*os.File
+	defer func() { closeFiles(opened) }()
+	build := func() (*exec.Cmd, error) {
+		cmd, err := s.spawn(spawnCtx, socketPath)
+		if err != nil {
+			return nil, err
+		}
+		opened = append(opened, hostproc.OwnOutput(cmd, workerLogIdentifier)...)
+		return cmd, nil
+	}
 	var cmd *exec.Cmd
 	var err error
 	if s.cgroup != nil {
@@ -246,7 +284,7 @@ func (s *Supervisor) exited(st *slotState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.slots[st.sandboxID]
-	if !ok || cur != st {
+	if !ok || cur != st || st.quarantined {
 		return
 	}
 	// Auto-respawn once after a crash — enough for D10; Phase 2 adds durability policy.
@@ -264,7 +302,7 @@ func (s *Supervisor) Adopt(sandboxID, socketPath string, proc hostproc.Process) 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st, ok := s.slots[sandboxID]; ok && st.alive() {
+	if st, ok := s.slots[sandboxID]; ok && (st.alive() || st.quarantined) {
 		return false
 	}
 	st := &slotState{
@@ -290,7 +328,8 @@ func (s *Supervisor) SpawnCount(sandboxID string) int {
 	return st.spawnCount
 }
 
-// Stop terminates the worker for sandboxID.
+// Stop terminates the worker for sandboxID. It also ends a quarantine:
+// the next Ensure starts a new worker.
 func (s *Supervisor) Stop(sandboxID string) error {
 	s.mu.Lock()
 	st, ok := s.slots[sandboxID]
@@ -301,6 +340,7 @@ func (s *Supervisor) Stop(sandboxID string) error {
 	if !ok {
 		return nil
 	}
+	defer quarantined.Delete(st.socketPath)
 	if st.proc != nil {
 		if err := st.proc.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, hostproc.ErrGone) {
 			return err
@@ -312,12 +352,36 @@ func (s *Supervisor) Stop(sandboxID string) error {
 	if st.cmd == nil || st.cmd.Process == nil {
 		return nil
 	}
-	if err := st.cmd.Process.Kill(); err != nil {
+	// Already gone (a quarantine killed it): wait for its watch all the same.
+	if err := st.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
 	<-st.done
 	st.removeSpill()
 	return nil
+}
+
+// quarantine kills the worker at path, if this supervisor runs it, and
+// keeps its slot down: no restart after the kill, and Ensure refuses it
+// until Stop (reaper.go). It does not wait for the exit.
+func (s *Supervisor) quarantine(path string) {
+	s.mu.Lock()
+	var hit []*slotState
+	for _, st := range s.slots {
+		if st.socketPath == path {
+			st.quarantined = true
+			hit = append(hit, st)
+		}
+	}
+	s.mu.Unlock()
+	for _, st := range hit {
+		switch {
+		case st.proc != nil:
+			_ = st.proc.Signal(syscall.SIGKILL)
+		case st.cmd != nil && st.cmd.Process != nil:
+			_ = st.cmd.Process.Kill()
+		}
+	}
 }
 
 // removeSpill removes the stopped worker's own spill folder, so warm-pool

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -238,22 +239,38 @@ func TestWorkerSeccompPolicy(t *testing.T) {
 	if allowed["socketpair"] {
 		t.Fatal("socketpair allowed")
 	}
-	// socket keeps IPv4, IPv6 and route netlink only; anything else fails
-	// with EAFNOSUPPORT, not a kill (the Go runtime probes families).
+	// socket keeps TCP and UDP over IPv4 and IPv6 and route netlink only,
+	// each by family, type (flags masked off) and protocol together;
+	// anything else fails with EAFNOSUPPORT, not a kill (the Go runtime
+	// probes families, and asks for MPTCP before TCP).
 	sock := p.Rules[1]
-	if sock.Syscall != "socket" || sock.Deny != hostproc.SeccompRetErrno(errnoEAFNOSUPPORT) || len(sock.AllowIfAny) != 3 {
+	if sock.Syscall != "socket" || sock.Deny != hostproc.SeccompRetErrno(errnoEAFNOSUPPORT) {
 		t.Fatalf("socket rule = %+v", sock)
 	}
-	families := map[uint32]bool{}
+	type triple struct{ family, typ, proto uint32 }
+	allowedSockets := map[triple]bool{}
 	for _, entry := range sock.AllowIfAny {
-		families[entry[0].Value] = true
-		if entry[0].Value == linuxAFNetlink && (len(entry) != 2 || entry[1] != (hostproc.SeccompArgEq{Arg: 2, Value: linuxNetlinkRoute})) {
-			t.Fatalf("netlink not narrowed to route: %+v", entry)
+		if len(entry) != 3 || entry[0].Arg != 0 || entry[0].Mask != 0 || entry[1].Arg != 1 || entry[1].Mask != ^uint32(linuxSockFlags) || entry[2].Arg != 2 || entry[2].Mask != 0 {
+			t.Fatalf("socket entry is not family, masked type and protocol: %+v", entry)
+		}
+		allowedSockets[triple{entry[0].Value, entry[1].Value, entry[2].Value}] = true
+	}
+	want := map[triple]bool{}
+	for _, f := range []uint32{linuxAFInet, linuxAFInet6} {
+		for _, tp := range []triple{{0, 1, 0}, {0, 1, 6}, {0, 2, 0}, {0, 2, 17}} {
+			want[triple{f, tp.typ, tp.proto}] = true
 		}
 	}
-	for _, f := range []uint32{1 /* AF_UNIX */, 17 /* AF_PACKET */, 38 /* AF_ALG */, 40 /* AF_VSOCK */} {
-		if families[f] {
-			t.Fatalf("family %d allowed", f)
+	want[triple{linuxAFNetlink, linuxSockRaw, linuxNetlinkRoute}] = true
+	want[triple{linuxAFNetlink, linuxSockDgram, linuxNetlinkRoute}] = true
+	if !maps.Equal(allowedSockets, want) {
+		t.Fatalf("socket allows %v, want %v", allowedSockets, want)
+	}
+	// What the review found reachable, or never needed: SCTP by protocol
+	// (132) or by SOCK_SEQPACKET, raw and ping sockets, MPTCP (262).
+	for _, bad := range []triple{{linuxAFInet, 1, 132}, {linuxAFInet, 5, 0}, {linuxAFInet6, 5, 0}, {linuxAFInet, 3, 0}, {linuxAFInet, 2, 1}, {linuxAFInet, 1, 262}, {1, 1, 0}, {17, 3, 0}} {
+		if allowedSockets[bad] {
+			t.Fatalf("socket %+v allowed", bad)
 		}
 	}
 	for _, arch := range []uint32{hostproc.AuditArchX86_64, hostproc.AuditArchAARCH64} {

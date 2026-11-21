@@ -35,15 +35,15 @@ func encodeFrame(env Envelope) ([]byte, error) {
 	return frame, nil
 }
 
+// writeFrame writes env in one write, so the reader finds header and body
+// together: sandboxd peeks at a worker's reply before it reads it
+// (workerConn), and takes a whole short frame with one peek and one read.
 func writeFrame(w io.Writer, env Envelope) error {
 	frame, err := encodeFrame(env)
 	if err != nil {
 		return err
 	}
-	if _, err := w.Write(frame[:4]); err != nil {
-		return err
-	}
-	_, err = w.Write(frame[4:])
+	_, err = w.Write(frame)
 	return err
 }
 
@@ -52,7 +52,7 @@ func writeFrame(w io.Writer, env Envelope) error {
 // files in order. A connection that cannot carry descriptors (not a Unix
 // socket) gets the frame without them, and the worker opens the paths.
 func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
-	uc, ok := w.(*net.UnixConn)
+	uc, ok := unixConnOf(w)
 	if len(files) == 0 || !ok {
 		env.FDPaths = nil
 		return writeFrame(w, env)
@@ -86,9 +86,23 @@ func writeFrameFiles(w io.Writer, env Envelope, files []*os.File) error {
 	return err
 }
 
-// readFrame reads a frame that carries no descriptors. It reads with
-// read(2) only: descriptors a sender attached anyway are dropped by the
-// kernel, never held here (a worker's reply is untrusted input).
+// unixConnOf is the Unix connection under w, sandboxd's wrapped
+// connections to workers included (workerConn).
+func unixConnOf(w io.Writer) (*net.UnixConn, bool) {
+	switch c := w.(type) {
+	case *net.UnixConn:
+		return c, true
+	case interface{ unixConn() *net.UnixConn }:
+		return c.unixConn(), true
+	}
+	return nil, false
+}
+
+// readFrame reads a frame that carries no descriptors, with r's own Read.
+// On sandboxd's connections to workers that is workerConn's, which refuses
+// a frame that carries any and leaves them queued (a worker's reply is
+// untrusted input, and dropping a descriptor can release it: reaper.go);
+// on the worker's side it is read(2), which drops any sandboxd sent.
 func readFrame(r io.Reader) (Envelope, error) {
 	env, _, err := readFrameFrom(r.Read, r.Read, nil)
 	return env, err
@@ -102,6 +116,8 @@ var errTooManyFDs = fmt.Errorf("frame carries more than %d descriptors", maxFram
 // named by env.FDPaths. Descriptors that do not match the names one for
 // one (a truncated control message, a sender bug) are all closed: the
 // worker then opens the paths itself, as it would for an older sandboxd.
+// Only a worker reads with it, so the descriptors are sandboxd's; sandboxd
+// takes a worker's one socket with readGuestListenerReply.
 func readFrameFiles(r io.Reader) (Envelope, []*os.File, error) {
 	uc, ok := r.(*net.UnixConn)
 	if !ok {

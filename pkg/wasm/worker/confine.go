@@ -339,6 +339,9 @@ func runWorker(socketPath string, srv workerServer) error {
 	if err := confineFromEnv(); err != nil {
 		return err
 	}
+	// A worker whose own log stream broke (it shut it, or journald went
+	// away) loses lines, not its sandboxes.
+	hostproc.CatchSIGPIPE()
 	return serveListener(ln, srv)
 }
 
@@ -456,11 +459,13 @@ var workerSeccompAllow = []string{
 	"dup", "dup2", "dup3", "fcntl", "ioctl",
 	"copy_file_range", "sendfile", "splice", "tee",
 	// Sockets: the worker's own, the guest's mediated ones, DNS, and the
-	// audit ingest on loopback. socket is narrowed by family
-	// (workerSocketFamilies) and setsockopt loses SO_LINGER. No
+	// audit ingest on loopback. socket is narrowed by family, type and
+	// protocol (workerSocketTypes) and setsockopt loses SO_LINGER. No
 	// socketpair: nothing in the worker makes one (Go's runtime and
 	// os/exec use pipes), and a datagram pair could send to the node's
-	// abstract Unix sockets.
+	// abstract Unix sockets. shutdown stays unruled: a worker's stdout and
+	// stderr are its own (Supervisor start, hostproc.OwnOutput), and a rule
+	// on descriptors 0-2 would guard nothing, since dup is allowed.
 	"socket", "connect", "bind", "listen", "accept", "accept4",
 	"sendmsg", "recvmsg", "sendmmsg", "recvmmsg", "sendto", "recvfrom", "shutdown",
 	"getsockname", "getpeername", "getsockopt", "setsockopt",
@@ -523,9 +528,9 @@ const (
 	errnoEAFNOSUPPORT = 97
 )
 
-// Linux address families and the netlink protocol the socket rule names
-// (the same on every Linux architecture; x/sys/unix would give the build
-// platform's values).
+// Linux address families, socket types and protocols the socket rule
+// names (the same on every Linux architecture; x/sys/unix would give the
+// build platform's values).
 const (
 	linuxAFInet       = 2
 	linuxAFInet6      = 10
@@ -533,22 +538,57 @@ const (
 	linuxNetlinkRoute = 0
 	linuxSOLSocket    = 1
 	linuxSOLinger     = 13
+
+	linuxSockStream = 1
+	linuxSockDgram  = 2
+	linuxSockRaw    = 3
+	// linuxSockFlags are SOCK_NONBLOCK and SOCK_CLOEXEC, which ride on the
+	// type argument: the rule masks them off before it compares the type.
+	linuxSockFlags  = 0x800 | 0x80000
+	linuxIPProtoTCP = 6
+	linuxIPProtoUDP = 17
 )
 
-// workerSocketFamilies are the sockets a worker may make once it has
-// dropped: IPv4 and IPv6 for the guests' mediated connections, DNS and the
-// audit ingest, and a route netlink socket, which Go's net package opens to
-// list the node's own addresses (the egress node guard refuses dials to
-// them). Every other family (AF_UNIX, AF_NETLINK for any other protocol,
-// AF_PACKET, AF_ALG, AF_VSOCK...) fails with EAFNOSUPPORT: a worker binds
-// its own Unix socket before it drops and makes none after, and the rest
-// are kernel code no worker needs. With AF_UNIX gone a worker cannot reach
-// the abstract Unix sockets of the node's network namespace either.
-var workerSocketFamilies = [][]hostproc.SeccompArgEq{
-	{{Arg: 0, Value: linuxAFInet}},
-	{{Arg: 0, Value: linuxAFInet6}},
-	{{Arg: 0, Value: linuxAFNetlink}, {Arg: 2, Value: linuxNetlinkRoute}},
-}
+// workerSocketTypes are the sockets a worker may make once it has dropped,
+// by family, type and protocol together: TCP and UDP over IPv4 and IPv6 for
+// the guests' mediated connections, DNS and the audit ingest, and a route
+// netlink socket, which Go's net package opens to list the node's own
+// addresses (the egress node guard refuses dials to them). Anything else
+// fails with EAFNOSUPPORT:
+//
+//   - other families (AF_UNIX, AF_PACKET, AF_ALG, AF_VSOCK, AF_NETLINK for
+//     any other protocol...): a worker binds its own Unix socket before it
+//     drops and makes none after, and the rest are kernel code no worker
+//     needs. With AF_UNIX gone a worker cannot reach the abstract Unix
+//     sockets of the node's network namespace either.
+//   - other types and protocols over IPv4 and IPv6: SCTP (asked for by
+//     protocol, or by SOCK_SEQPACKET with protocol 0), raw and ping
+//     sockets, UDP-Lite, and MPTCP. An SCTP listener has a port space of
+//     its own, so one bound to a TCP listener's port would make that
+//     listener look like the worker's (checkGuestListener refuses it too).
+//     Go asks for MPTCP first for every TCP listener and takes plain TCP
+//     on any error, so a worker's guest listeners are plain TCP.
+//
+// The type is compared with SOCK_NONBLOCK and SOCK_CLOEXEC masked off;
+// any other bit in it fails the compare, as the kernel would fail the call.
+var workerSocketTypes = func() [][]hostproc.SeccompArgEq {
+	typeIs := func(t uint32) hostproc.SeccompArgEq {
+		return hostproc.SeccompArgEq{Arg: 1, Mask: ^uint32(linuxSockFlags), Value: t}
+	}
+	var out [][]hostproc.SeccompArgEq
+	for _, family := range []uint32{linuxAFInet, linuxAFInet6} {
+		for _, tp := range [][2]uint32{
+			{linuxSockStream, 0}, {linuxSockStream, linuxIPProtoTCP},
+			{linuxSockDgram, 0}, {linuxSockDgram, linuxIPProtoUDP},
+		} {
+			out = append(out, []hostproc.SeccompArgEq{{Arg: 0, Value: family}, typeIs(tp[0]), {Arg: 2, Value: tp[1]}})
+		}
+	}
+	for _, tp := range []uint32{linuxSockRaw, linuxSockDgram} {
+		out = append(out, []hostproc.SeccompArgEq{{Arg: 0, Value: linuxAFNetlink}, typeIs(tp), {Arg: 2, Value: linuxNetlinkRoute}})
+	}
+	return out
+}()
 
 // workerSeccompPolicy is the worker's filter. clone3 takes its flags in
 // memory the filter cannot read, so it answers ENOSYS and the C library
@@ -564,7 +604,7 @@ func workerSeccompPolicy() hostproc.SeccompPolicy {
 		Actions: actions,
 		Rules: []hostproc.SeccompArgRule{
 			{Syscall: "clone", DenyIfAll: []hostproc.SeccompArgMask{{Arg: 0, Mask: cloneNamespaceFlags}}},
-			{Syscall: "socket", AllowIfAny: workerSocketFamilies, Deny: hostproc.SeccompRetErrno(errnoEAFNOSUPPORT)},
+			{Syscall: "socket", AllowIfAny: workerSocketTypes, Deny: hostproc.SeccompRetErrno(errnoEAFNOSUPPORT)},
 			// SO_LINGER makes the last close of a socket wait for its
 			// unsent data; a worker could set it on a socket whose last
 			// close falls to sandboxd and hold sandboxd's threads. Go's
