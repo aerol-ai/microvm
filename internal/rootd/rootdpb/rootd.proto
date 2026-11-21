@@ -62,6 +62,37 @@ service RootHelper {
   // RemoveContainerFiles makes sure everything the helper made for a
   // container is gone: host files, FIFOs and ready socket names.
   rpc RemoveContainerFiles(RemoveContainerFilesRequest) returns (RemoveContainerFilesResponse);
+
+  // The calls below are the network work of a sandbox on the containerd
+  // engine: its named network namespace, its CNI attachment to the
+  // sandboxes' bridge and its address. The agent keeps the netns pool's
+  // bookkeeping (which slot is whose, in its store) and names a namespace
+  // by its pool name; the helper builds the namespace's path itself, runs
+  // CNI with its own config and plugins, and touches only namespaces that
+  // are empty or attached to its own bridge. Each call is safe to retry
+  // and to repeat.
+
+  // EnsureHostNetwork makes sure the host is ready for sandbox networks:
+  // IP forwarding on, and the helper's CNI config written when absent. It
+  // answers with the sandboxes' address range that config hands out.
+  rpc EnsureHostNetwork(EnsureHostNetworkRequest) returns (EnsureHostNetworkResponse);
+
+  // RealizeNetns makes sure a sandbox's network namespace exists, with
+  // loopback up, IPv6 off and an address on the sandboxes' bridge, and
+  // answers with its path and address. A namespace already realized is
+  // answered as it is.
+  rpc RealizeNetns(RealizeNetnsRequest) returns (RealizeNetnsResponse);
+
+  // RemoveNetns makes sure a sandbox's network namespace is gone, with its
+  // CNI attachment, address lease, NAT chain and connection tracking.
+  rpc RemoveNetns(RemoveNetnsRequest) returns (RemoveNetnsResponse);
+
+  // DisableNetnsIPv6 makes sure IPv6 is off inside a realized namespace.
+  rpc DisableNetnsIPv6(DisableNetnsIPv6Request) returns (DisableNetnsIPv6Response);
+
+  // NetnsAddrs says whether a namespace exists and lists its IPv4
+  // addresses, loopback aside: the address a task started there has.
+  rpc NetnsAddrs(NetnsAddrsRequest) returns (NetnsAddrsResponse);
 }
 
 message VersionRequest {
@@ -192,4 +223,53 @@ message HelperRefused {
   // The rule's short, fixed code ("method_not_allowed", "mount"), fit for
   // a metric label.
   string reason = 1;
+}
+
+message EnsureHostNetworkRequest {}
+
+message EnsureHostNetworkResponse {
+  // The IPv4 range the helper's CNI config hands sandboxes, as a prefix
+  // ("10.88.0.0/16").
+  string subnet = 1;
+}
+
+message RealizeNetnsRequest {
+  // The namespace's netns-pool name: a sandbox, slot or warm-park ID. It
+  // is also the CNI container ID its address lease and NAT chain are
+  // keyed by.
+  string netns_name = 1;
+}
+
+message RealizeNetnsResponse {
+  // The namespace, for the sandbox's spec: built by the helper.
+  string netns_path = 1;
+  // The sandbox's IPv4 address on the bridge.
+  string container_ip = 2;
+}
+
+message RemoveNetnsRequest {
+  string netns_name = 1;
+  // The address the pool recorded for the namespace, whose NAT chain and
+  // connection tracking go with it. Empty when none was recorded. It must
+  // be a sandbox address in the helper's range.
+  string container_ip = 2;
+}
+
+message RemoveNetnsResponse {}
+
+message DisableNetnsIPv6Request {
+  string netns_name = 1;
+}
+
+message DisableNetnsIPv6Response {}
+
+message NetnsAddrsRequest {
+  string netns_name = 1;
+}
+
+message NetnsAddrsResponse {
+  // Whether a namespace by that name exists.
+  bool exists = 1;
+  // Its IPv4 addresses, loopback aside, in the kernel's link order.
+  repeated string ipv4 = 2;
 }

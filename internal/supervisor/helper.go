@@ -522,6 +522,7 @@ const (
 	defaultRootdSocket      = "/run/aerolvm-rootd/sock/root.sock"
 	defaultRootdSocketGroup = "aerolvm"
 	defaultRootdBinDir      = "/var/lib/aerolvm-supervisor/rootd"
+	defaultRootdNetnsDir    = "/run/aerolvm-rootd/netns"
 )
 
 // newHelperKeeper checks the helper's settings before the supervisor

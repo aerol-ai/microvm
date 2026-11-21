@@ -39,19 +39,27 @@ const (
 	// DefaultStateDir holds what root reads on the agent's word: the runsc
 	// configs and the gVisor moves folder.
 	DefaultStateDir = "/var/lib/aerolvm-rootd"
+	// DefaultNetnsDir holds the sandboxes' network namespaces in split
+	// mode: the helper's own folder, root's alone (mode 0700), never the
+	// node's shared /run/netns. Anything a name in it points at is then
+	// what the helper made, never an operator's `ip netns add`, and no
+	// other user can open the folder, to read it or to hold its lock.
+	DefaultNetnsDir = "/run/aerolvm-rootd/netns"
 
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
 	defaultNamespace        = "aerolvm"
 	defaultSnapshotterRoot  = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs"
-	defaultNetnsDir         = "/run/netns"
 	defaultRunDir           = "/var/lib/sandboxd/containerd"
 	defaultMountsRoot       = "/var/lib/sandboxd/mounts"
 	defaultCredDir          = "/run/sandboxd"
 	defaultDBPath           = "/var/lib/sandboxd/state.db"
 	defaultToolbox          = "/usr/local/bin/toolboxd"
 	defaultFIFODir          = "/run/aerolvm-rootd/fifo"
-	defaultReadyDir         = "/run/aerolvm-rootd/ready"
-	defaultPidsLimit        = 4096
+	// sandboxd's own CNI defaults (internal/config).
+	defaultCNIPluginDir = "/opt/cni/bin"
+	defaultCNIConfPath  = "/etc/cni/net.d/aerolvm.conflist"
+	defaultReadyDir     = "/run/aerolvm-rootd/ready"
+	defaultPidsLimit    = 4096
 	// sandboxd's defaults for the users its jails run as.
 	defaultJailUID = 1000
 	// nobodyUID is shared by every daemon that runs as nobody.
@@ -86,7 +94,14 @@ type Config struct {
 	// Files is where the helper makes the files runc, runsc and the shim
 	// open as root (files.go). The FIFOs go in Policy.FIFODir.
 	Files FileDirs
+	// Network is the helper's CNI (network.go); sandboxes' namespaces go
+	// in Policy.NetnsDir.
+	Network NetworkConfig
 }
+
+// sharedNetnsDirs are the folders iproute2, systemd units and CNI tools
+// share on a node; SB_ROOTD_NETNS_DIR may name none of them.
+var sharedNetnsDirs = map[string]bool{"/run/netns": true, "/var/run/netns": true}
 
 // FileDirs are the helper's own folders for the files it makes for
 // containers. Each must be root's alone: the agent can rename anything in a
@@ -155,6 +170,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.Policy.Validate(); err != nil {
 		return fmt.Errorf("root helper: %w", err)
+	}
+	if err := c.Network.validate(); err != nil {
+		return err
 	}
 	return c.Files.validate(c.Policy, filepath.Dir(c.Socket))
 }
@@ -239,9 +257,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	readyDir := path("SB_ROOTD_READY_DIR", defaultReadyDir)
 	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
-	netnsDir := path("SB_NETNS_DIR", defaultNetnsDir)
+	netnsDir := path("SB_ROOTD_NETNS_DIR", DefaultNetnsDir)
+	cniPlugins := path("SB_CONTAINERD_CNI_PLUGIN_DIR", defaultCNIPluginDir)
+	cniConf := path("SB_CONTAINERD_CNI_CONF_PATH", defaultCNIConfPath)
 	if pathErr != nil {
 		return Config{}, pathErr
+	}
+	if sharedNetnsDirs[netnsDir] {
+		return Config{}, fmt.Errorf("SB_ROOTD_NETNS_DIR: %s is the node's shared namespace folder (`ip netns`); "+
+			"the helper keeps sandboxes' namespaces in a folder of its own", netnsDir)
 	}
 	dirs := FileDirs{
 		Hosts: filepath.Join(stateDir, "hosts"),
@@ -257,6 +281,11 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		{"SB_ROOTD_STATE_DIR", stateDir},
 		{"SB_ROOTD_FIFO_DIR", fifoDir},
 		{"SB_ROOTD_READY_DIR", readyDir},
+		// Root makes sandboxes' namespaces, runs the CNI plugins and reads
+		// the CNI config that names them.
+		{"SB_ROOTD_NETNS_DIR", netnsDir},
+		{"SB_CONTAINERD_CNI_PLUGIN_DIR", cniPlugins},
+		{"SB_CONTAINERD_CNI_CONF_PATH", filepath.Dir(cniConf)},
 	} {
 		for _, a := range []string{runDir, mountsRoot, credDir, dataDir} {
 			if h.dir == a || strings.HasPrefix(h.dir, a+"/") {
@@ -300,6 +329,11 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			Limits:           limits,
 		},
 		Files: dirs,
+		Network: NetworkConfig{
+			PluginDir: cniPlugins,
+			ConfPath:  cniConf,
+			Subnet:    strings.TrimSpace(getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
+		},
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

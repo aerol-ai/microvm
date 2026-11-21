@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/aerol-ai/microvm/internal/procgroup"
 )
 
 // Result is the subset of CNI ADD output the netns pool needs.
@@ -39,6 +41,12 @@ type Config struct {
 	ConfPath string
 	// IfName is the interface created inside the netns; defaults to eth0.
 	IfName string
+	// ProcessGroup runs each plugin in a process group of its own that is
+	// killed, whole, when the call ends (internal/procgroup). The root
+	// helper sets it: the bridge plugin runs its IPAM plugin as a child,
+	// which exec.CommandContext alone would leave running after a cancel,
+	// to finish a teardown after the call's retry built the slot again.
+	ProcessGroup bool
 }
 
 // ExecRunner shells out to the CNI plugin binary referenced by ConfPath's
@@ -134,7 +142,11 @@ func (r *ExecRunner) runPlugin(ctx context.Context, cmd, netnsPath, containerID 
 	var stdout, stderr bytes.Buffer
 	invoke.Stdout = &stdout
 	invoke.Stderr = &stderr
-	if err := invoke.Run(); err != nil {
+	run := invoke.Run
+	if r.cfg.ProcessGroup {
+		run = func() error { return procgroup.Run(ctx, invoke) }
+	}
+	if err := run(); err != nil {
 		// CNI plugins report failures as a JSON error object on STDOUT (and
 		// commonly write nothing to stderr), so fall back to stdout or the real
 		// cause is lost as a bare "exit status 1".

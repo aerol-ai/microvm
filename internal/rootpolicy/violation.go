@@ -42,6 +42,9 @@ const (
 	RuleCheckpoint      Rule = "checkpoint"
 	RuleNamespace       Rule = "namespace"
 	RuleUpdate          Rule = "update"
+	// The root helper's network calls (network.go).
+	RuleNetns   Rule = "netns"
+	RuleAddress Rule = "address"
 )
 
 // Violation is a refused request: which rule, and what about the request

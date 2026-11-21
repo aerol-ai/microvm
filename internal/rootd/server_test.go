@@ -49,7 +49,7 @@ func testPolicy() rootpolicy.Policy {
 		Namespace:       "aerolvm",
 		Snapshotter:     "overlayfs",
 		SnapshotterRoot: defaultSnapshotterRoot,
-		NetnsDir:        defaultNetnsDir,
+		NetnsDir:        DefaultNetnsDir,
 		MovesDir:        defaultRunDir + "/moves",
 		FIFODir:         defaultFIFODir,
 		Limits:          rootpolicy.Limits{MemoryBytes: 1 << 30, Pids: 4096, CPUs: 2},
@@ -201,14 +201,25 @@ func TestVersion(t *testing.T) {
 	if resp.GetHelperVersion() != version.Version || resp.GetApi() != rootdpb.APIVersion {
 		t.Fatalf("Version = %v", resp)
 	}
-	// EnsureHost is a placeholder, so it is the one call not served.
-	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool { return f == rootdpb.FeatureEnsureHost })
+	// EnsureHost is a placeholder, so it is never served; a helper with
+	// no network configuration (this rig) serves no network call either.
+	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
+		return f == rootdpb.FeatureEnsureHost || slices.Contains(networkFeatures, f)
+	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
 	}
 	if m := r.containerd.methods(); len(m) != 0 {
 		t.Fatalf("the helper's own call reached containerd: %v", m)
 	}
+	t.Run("with a network", func(t *testing.T) {
+		r := newRig(t, func(_ *Config, o *Options) { o.Network = newFakeNet() })
+		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
+		want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool { return f == rootdpb.FeatureEnsureHost })
+		if err != nil || !slices.Equal(resp.GetFeatures(), want) {
+			t.Fatalf("features %v (%v), want %v", resp.GetFeatures(), err, want)
+		}
+	})
 }
 
 func TestEnsureHostIsAPlaceholder(t *testing.T) {

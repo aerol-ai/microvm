@@ -29,6 +29,10 @@ type Settings struct {
 	// NetnsDir holds the network namespaces the agent mounts for sandboxes;
 	// they are unmounted when the supervisor stops (UnmountNamespaces).
 	NetnsDir string
+	// RootdNetnsDir holds the ones the root helper mounts in privilege
+	// mode split (SB_ROOTD_NETNS_DIR, the helper's own folder), unmounted
+	// the same way.
+	RootdNetnsDir string
 	// LeaseFile is sandboxd's ownership lease (SB_OWNERSHIP_LEASE_FILE,
 	// cluster mode); empty turns the LeaseGuard off.
 	LeaseFile string
@@ -82,6 +86,7 @@ func SettingsFromEnv() Settings {
 		ContainerdConfig: get("SB_CONTAINERD_CONFIG", "/etc/containerd/config.toml"),
 		ParentFile:       get("SB_CGROUP_PARENT_FILE", "/run/aerolvm/cgroup-parent"),
 		NetnsDir:         get("SB_NETNS_DIR", "/run/netns"),
+		RootdNetnsDir:    get("SB_ROOTD_NETNS_DIR", defaultRootdNetnsDir),
 		LeaseFile:        get("SB_OWNERSHIP_LEASE_FILE", ""),
 		IsolateJailDir:   get("SB_ISOLATE_JAIL_DIR", ""),
 		MountsDir:        get("SB_MOUNTS_DIR", ""),
@@ -253,6 +258,9 @@ func Run(ctx context.Context, s Settings, sys OS, log *slog.Logger) error {
 	<-guardDone
 	<-helperDone
 	UnmountNamespaces(s.NetnsDir, sys.Unmount, log)
+	if s.RootdNetnsDir != "" && s.RootdNetnsDir != s.NetnsDir {
+		UnmountNamespaces(s.RootdNetnsDir, sys.Unmount, log)
+	}
 	if s.IsolateJailDir != "" || s.MountsDir != "" {
 		if raw, err := sys.ReadFile("/proc/self/mountinfo"); err != nil {
 			log.Warn("supervisor: could not read the mount table to unmount the pod's mounts", "error", err)

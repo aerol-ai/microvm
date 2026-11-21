@@ -149,6 +149,9 @@ func TestAnsweredFailuresAreNotRetried(t *testing.T) {
 	}{
 		{"its own Unavailable", status.Error(codes.Unavailable, "containerd is restarting"), false, nil, nil},
 		{"a refusal", rootdpb.Refused(codes.InvalidArgument, "bad_request", "no"), false, nil, ErrRefused},
+		// PR 4 review: the helper at its limit of calls answers at once;
+		// the load that caused it is still there, so no retry adds to it.
+		{"a busy helper", status.Error(codes.ResourceExhausted, "64 running and 1024 waiting"), false, nil, ErrBusy},
 		{"a timeout", nil, true, nil, ErrUnavailable},
 		{"a call with no retry rule", nil, false, func(t *testing.T) {
 			delete(retrySafe, rootdpb.FeatureEnsureHostFiles)

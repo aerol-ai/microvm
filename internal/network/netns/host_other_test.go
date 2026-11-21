@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/network/nsbuild"
 )
 
 // Off Linux the Host's own namespace steps refuse plainly instead of
@@ -18,8 +20,8 @@ func TestHostNamespaceStepsNeedLinux(t *testing.T) {
 		"loopback": h.bringLoopbackUp(ctx, "sb-1"),
 		"delete":   h.deleteNetns(ctx, "sb-1"),
 	} {
-		if !errors.Is(err, errNetnsNeedsLinux) {
-			t.Errorf("%s: %v, want %v", name, err, errNetnsNeedsLinux)
+		if !errors.Is(err, nsbuild.ErrNeedsLinux) {
+			t.Errorf("%s: %v, want %v", name, err, nsbuild.ErrNeedsLinux)
 		}
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
@@ -126,7 +127,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := checkHostProcessesOutliveAgent(cfg); err != nil {
 		return err
 	}
-	mountsOff := mountsOffReason(cfg)
+	if err := checkPrivilegeMode(cfg); err != nil {
+		return err
+	}
+	mountsOff := mountsOffFor(cfg)
 	if mountsOff != "" {
 		logger.Info("external storage is refused on this node: a create with mounts answers 501 mounts_unavailable", "reason", mountsOff)
 	}
@@ -403,15 +407,29 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc.RecordKeyCustody()
 	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
+	// Privilege mode split: the root helper does the root work (nil in
+	// single mode, which takes none of the branches below).
+	helper := newRootHelper(cfg, svc)
+	var engineHelper rootHelper
+	if helper != nil {
+		defer func() { _ = helper.Close() }()
+		engineHelper = helper
+	}
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
-		subnet, err := resolveContainerdBridgeSubnet(cfg, logger)
+		var subnet string
+		var err error
+		if helper != nil {
+			subnet, err = resolveSplitBridgeSubnet(ctx, cfg, helper, logger)
+		} else {
+			subnet, err = resolveContainerdBridgeSubnet(cfg, logger)
+		}
 		if err != nil {
 			return err
 		}
 		cfg.ContainerdBridgeSubnet = subnet
 	}
 	var ctdWiring *containerdEngineWiring
-	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
+	if ctd, err := wireContainerEngineWith(ctx, cfg, logger, svc, db, dockerClient, rules, admitter, engineHelper); err != nil {
 		return fmt.Errorf("wire container engine: %w", err)
 	} else if ctd != nil {
 		ctdWiring = ctd
@@ -1114,17 +1132,18 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
 		// Logs, here at start, what would otherwise fail every build later,
 		// and clears build folders a previous run left (in the background).
-		_ = build.CheckContextUnpacker()
-		_ = build.SweepBuildDirs()
+		// Both are root work: privilege mode split refuses builds instead
+		// (imageBuilderFor).
+		if cfg.PrivilegeMode != privmode.Split {
+			_ = build.CheckContextUnpacker()
+			_ = build.SweepBuildDirs()
+		}
 		apiBuilder = cntr.NewImageBuilder(ctdWiring.driver, build)
 	}
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	var builder service.ImageBuilder
-	if apiBuilder != nil {
-		builder = apiBuilder
-	}
+	builder := imageBuilderFor(cfg, apiBuilder)
 	// Scoped API tokens (plans/identity-and-access.md §5.4). With identity
 	// off this does nothing and NewServer drops the authenticator, so the
 	// server is byte for byte the PAT-only one (L8). With it on: a single

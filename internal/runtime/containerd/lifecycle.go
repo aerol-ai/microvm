@@ -39,6 +39,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err := validateSandboxID(sandboxID); err != nil {
 		return nil, err
 	}
+	if d.helper != nil {
+		// Privilege mode split: what the helper does not do yet fails
+		// here, before any of it is tried (privilege_split.go).
+		return nil, d.splitCreateGaps(req)
+	}
 	if err := d.ensureToolboxBinary(); err != nil {
 		return nil, err
 	}
@@ -541,6 +546,9 @@ func readoptEnv(ctx context.Context, container cntr.Container, loadEnv sbruntime
 }
 
 func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
+	if d.helper != nil {
+		return nil, d.splitStartGaps()
+	}
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
@@ -990,7 +998,16 @@ func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.Sand
 // label. The slot keeps that address for the sandbox's life. The label is
 // read only after a failed probe, so a runc sandbox pays nothing extra.
 func (d *Driver) sandboxAddress(ctx context.Context, container cntr.Container, task cntr.Task, hint string) (string, error) {
-	ip, err := containerIPv4FromTaskFn(ctx, task)
+	if h := strings.TrimSpace(hint); h != "" && d.helper != nil {
+		// Privilege mode split: the hint is the address the root helper
+		// gave the slot (RealizeNetns's answer, or the pool's record of
+		// it, which the boot reconcile checks against the kernel through
+		// the helper), and the task joined that slot's namespace. Reading
+		// it back would be one more helper call on every create for an
+		// answer the helper has just given.
+		return h, nil
+	}
+	ip, err := d.taskAddress(ctx, task)
 	if err == nil {
 		return ip, nil
 	}

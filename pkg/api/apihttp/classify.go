@@ -248,6 +248,8 @@ func Classify(err error) Classification {
 	// names the socket and gRPC's error, which are for the node's log; the
 	// unsupported text names the call and the helper's version, which tell
 	// the caller why.
+	case errors.Is(err, rootclient.ErrBusy):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 1, Message: "the node's root helper is at its limit of network calls in flight; retry shortly", Log: true, LogLevel: slog.LevelWarn}
 	case errors.Is(err, rootclient.ErrUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: "the node's root helper is unavailable; retry shortly", Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, rootclient.ErrUnsupported):
