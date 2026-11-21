@@ -18,8 +18,11 @@
 // (rootdpb.HelperRefused), from which the agent's client writes the audit
 // event and counts the metric the alert reads.
 //
-// Calls run in parallel; the gate holds no lock and no state of its own
-// (eng review D11). Nothing here is wired into sandboxd or the helper yet.
+// Calls run in parallel (eng review D11). The gate's one piece of state is
+// a bounded memo of spec checks a create has already paid for
+// (specmemo.go), keyed on the exact bytes checked; it never decides a
+// check that was not made in full for those bytes. Nothing here is wired
+// into sandboxd or the helper yet.
 package gate
 
 import (
@@ -27,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 
 	namespacesapi "github.com/containerd/containerd/api/services/namespaces/v1"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -102,6 +106,8 @@ type Gate struct {
 	binds     BindChecker
 	reads     ReadChecker
 	netns     NetnsBinding
+	// specs remembers which spec bytes passed for which container.
+	specs *specMemo
 }
 
 // New checks the policy and returns a gate.
@@ -112,8 +118,12 @@ func New(cfg Config) (*Gate, error) {
 	if cfg.Upstream == nil {
 		return nil, errors.New("containerd gate: a connection to containerd is required")
 	}
-	g := &Gate{policy: cfg.Policy, upstream: cfg.Upstream, onRefusal: cfg.OnRefusal,
-		stdio: cfg.Stdio, binds: cfg.Binds, reads: cfg.Reads, netns: cfg.NetnsBinding}
+	// The gate's own copy: the memo's answers hold for the policy they
+	// were made under, so no caller may change it after New.
+	p := cfg.Policy.Clone()
+	g := &Gate{policy: p, upstream: cfg.Upstream, onRefusal: cfg.OnRefusal,
+		stdio: cfg.Stdio, binds: cfg.Binds, reads: cfg.Reads, netns: cfg.NetnsBinding,
+		specs: newSpecMemo(p, memoEntries, memoEntryBytes)}
 	if g.stdio == nil {
 		g.stdio = defaultStdioChecker()
 	}
@@ -132,6 +142,11 @@ func New(cfg Config) (*Gate, error) {
 func (g *Gate) ServerOptions() []grpc.ServerOption {
 	return []grpc.ServerOption{
 		grpc.UnknownServiceHandler(g.Handle),
+		grpc.ForceServerCodecV2(frameCodec{}),
+		// Every create sends a burst of short calls; a worker per CPU
+		// serves them on goroutines whose stacks have already grown, where
+		// gRPC would start a new goroutine for each.
+		grpc.NumStreamWorkers(uint32(runtime.GOMAXPROCS(0))),
 		grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 		grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
 	}
@@ -140,6 +155,7 @@ func (g *Gate) ServerOptions() []grpc.ServerOption {
 var upstreamCallOptions = []grpc.CallOption{
 	grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
 	grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize),
+	grpc.ForceCodecV2(frameCodec{}),
 }
 
 // Handle serves one call: it is a grpc.StreamHandler, for unary and
@@ -159,7 +175,7 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 		return g.refuse(ctx, name, ReasonNamespace, fmt.Sprintf("the call is in containerd namespace %q, not %q", ns, g.policy.Namespace))
 	}
 	// The first message is checked before containerd hears of the call.
-	first := m.newReq()
+	first := m.request()
 	if err := ss.RecvMsg(first); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil // a stream the client closed without a message
@@ -168,6 +184,9 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 	}
 	if err := g.check(ctx, m, first); err != nil {
 		return err
+	}
+	if m.ended != nil {
+		defer m.ended(g, first)
 	}
 
 	upCtx, cancel := context.WithCancel(metadata.NewOutgoingContext(ctx, forwarded(md)))
@@ -186,7 +205,7 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 	} else if err := cs.CloseSend(); err != nil {
 		return err
 	}
-	if err := forwardResponses(ss, cs, m); err != nil {
+	if err := g.forwardResponses(ss, cs, m); err != nil {
 		select {
 		case r := <-refused:
 			return r // the refusal, not the cancel it caused
@@ -202,7 +221,7 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 // and is handed back on refused.
 func (g *Gate) forwardRequests(ctx context.Context, cancel context.CancelFunc, ss grpc.ServerStream, cs grpc.ClientStream, m *method, refused chan<- error) {
 	for {
-		r := m.newReq()
+		r := m.request()
 		if err := ss.RecvMsg(r); err != nil {
 			if errors.Is(err, io.EOF) {
 				_ = cs.CloseSend()
@@ -222,15 +241,21 @@ func (g *Gate) forwardRequests(ctx context.Context, cancel context.CancelFunc, s
 	}
 }
 
-func forwardResponses(ss grpc.ServerStream, cs grpc.ClientStream, m *method) error {
+func (g *Gate) forwardResponses(ss grpc.ServerStream, cs grpc.ClientStream, m *method) error {
 	defer func() { ss.SetTrailer(cs.Trailer()) }()
 	for {
-		resp := m.newResp()
+		var resp any = &frame{} // most answers go unread (frame.go)
+		if m.keep != nil {
+			resp = m.newResp()
+		}
 		if err := cs.RecvMsg(resp); err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
+		}
+		if m.keep != nil && !m.keep(g, resp.(proto.Message)) {
+			continue
 		}
 		if err := ss.SendMsg(resp); err != nil {
 			return err
@@ -244,7 +269,14 @@ func forwardResponses(ss grpc.ServerStream, cs grpc.ClientStream, m *method) err
 // check runs the walk (writes) and the method's rootpolicy checks on one
 // request message. Its error is the PermissionDenied the caller gets, or,
 // when a check could not run (containerd did not answer), that error.
-func (g *Gate) check(ctx context.Context, m *method, r proto.Message) error {
+func (g *Gate) check(ctx context.Context, m *method, req any) error {
+	if m.passThrough() {
+		return nil // a read the policy passes unread (frame.go)
+	}
+	r, ok := req.(proto.Message)
+	if !ok { // m.request decodes every message a check reads
+		return status.Errorf(codes.Internal, "containerd gate: %s arrived undecoded", m.name)
+	}
 	if m.write {
 		if err := walk(r.ProtoReflect()); err != nil {
 			var fe *fieldError
