@@ -1,8 +1,9 @@
 // Command aerolvm-supervisor is the first process of the Kubernetes worker
 // pod's runtime container (internal/supervisor): it shapes the container's
-// cgroup for sandboxes and keeps containerd running in it. It ships in the
-// aerolvm-runtime image, apart from sandboxd, so an AerolVM upgrade never
-// restarts the container that holds the sandboxes.
+// cgroup for sandboxes and keeps containerd running in it, and, once the
+// agent stages one, the signed root helper (SB_ROOTD_STAGE_DIR). It ships
+// in the aerolvm-runtime image, apart from sandboxd, so an AerolVM upgrade
+// never restarts the container that holds the sandboxes.
 package main
 
 import (

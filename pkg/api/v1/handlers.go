@@ -62,6 +62,19 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }
 
+// listRuntimes answers GET /v1/runtimes: every runtime name a create accepts,
+// what it can do (models.RuntimeTable), and whether this deployment offers it
+// now. It reads only capacity this node already holds (Service.RuntimeOffers)
+// and writes nothing, so a retry is free. Everyone sees names, features and
+// availability; only fleet admins see how many nodes offer each runtime,
+// under the same rule capacity applies to pool details above. Node names
+// never appear.
+func (h *handlers) listRuntimes(w http.ResponseWriter, r *http.Request) {
+	access, ok := controlplane.AccessFromContext(r.Context())
+	withNodes := ok && access.Can(controlplane.PermFleetAdmin)
+	apihttp.WriteJSON(w, http.StatusOK, models.ListRuntimes(h.deps.Service.RuntimeOffers(), withNodes))
+}
+
 func setCreateServerTiming(w http.ResponseWriter, start time.Time, timing *docker.CreateTiming, containerEngine string) {
 	parts := []string{
 		"create;dur=" + strconv.FormatFloat(float64(time.Since(start).Microseconds())/1000, 'f', 1, 64),

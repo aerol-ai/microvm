@@ -1,0 +1,195 @@
+// The root helper's own API (plans/security-gaps-m1-m4.md §3.3).
+//
+// The agent, sandboxd running as a user with no rights, calls it over
+// /run/aerolvm-rootd/sock/root.sock. containerd's own API shares that socket
+// and that gRPC server, behind the gate (internal/rootd/gate), so one peer
+// check covers both (eng review D3).
+//
+// Agent N must work with helper N-1 (eng review D5, D22): the helper is
+// swapped after the agent, so for a while a new agent talks to the old
+// helper. So fields and calls are only ever added, never renumbered,
+// retyped or removed, and the agent asks Version what this helper serves
+// before it relies on a call.
+
+syntax = "proto3";
+
+package aerolvm.rootd.v1;
+
+option go_package = "github.com/aerol-ai/microvm/internal/rootd/rootdpb";
+
+service RootHelper {
+  // Version says which helper this is and what it serves. Every helper
+  // serves it, so it is the agent's handshake.
+  rpc Version(VersionRequest) returns (VersionResponse);
+
+  // EnsureHost makes sure the host is set up for sandboxes: sysctls,
+  // br_netfilter, the base firewall tables, node guard, floor and IPv6
+  // fence. Not built yet: the helper answers Unimplemented and leaves it
+  // out of Version's features.
+  rpc EnsureHost(EnsureHostRequest) returns (EnsureHostResponse);
+
+  // The calls below make the files runc, runsc and the containerd shim
+  // later open as root: in folders only root can write, so the agent can
+  // never swap one for a link between the gate's check and root's open.
+  // The agent sends typed values; the helper checks them, writes the files
+  // itself and answers with the paths to put in specs. No request names a
+  // path or carries a file root would trust. Each call is safe to retry.
+  // All but EnsureTaskFIFOs are also safe to repeat: "make sure this
+  // exists" or "make sure this is gone". EnsureTaskFIFOs makes fresh FIFOs
+  // each time, so a repeat replaces the pair a reader may hold.
+
+  // EnsureHostFiles makes sure a container's hostname, hosts and
+  // resolv.conf files (and the egress CA, when asked) exist with this
+  // content, and drops an egress CA the request no longer asks for.
+  rpc EnsureHostFiles(EnsureHostFilesRequest) returns (EnsureHostFilesResponse);
+
+  // EnsureTaskFIFOs makes fresh stdout and stderr FIFOs for a container's
+  // next task, at that container's fixed paths. Call it once per task,
+  // before opening them: a task's old readers keep the old FIFOs.
+  rpc EnsureTaskFIFOs(EnsureTaskFIFOsRequest) returns (EnsureTaskFIFOsResponse);
+
+  // EnsureRunscConfig makes sure one of the runsc shim configs the helper
+  // owns exists. The helper writes its whole content.
+  rpc EnsureRunscConfig(EnsureRunscConfigRequest) returns (EnsureRunscConfigResponse);
+
+  // EnsureReadySocket gives the agent's ready socket for a container a
+  // name in the helper's folder, for the spec to bind. The agent binds and
+  // keeps the socket in its own ready folder, as before; the helper links
+  // that socket into its own folder and checks, after linking, that it is
+  // a socket the agent owns.
+  rpc EnsureReadySocket(EnsureReadySocketRequest) returns (EnsureReadySocketResponse);
+
+  // RemoveContainerFiles makes sure everything the helper made for a
+  // container is gone: host files, FIFOs and ready socket names.
+  rpc RemoveContainerFiles(RemoveContainerFilesRequest) returns (RemoveContainerFilesResponse);
+}
+
+message VersionRequest {
+  // The agent's build version, for the helper's log.
+  string agent_version = 1;
+  // The newest API level the agent speaks.
+  uint32 agent_api = 2;
+}
+
+message VersionResponse {
+  // The helper's build version.
+  string helper_version = 1;
+  // The newest API level the helper speaks.
+  uint32 api = 2;
+  // What this helper implements: each RootHelper call it serves, by its
+  // short name ("EnsureHost"). Version is always served and not listed.
+  // A call can be in the service yet missing here (a placeholder, or a
+  // VM-only call on Kubernetes); the agent goes by this list.
+  repeated string features = 3;
+}
+
+message EnsureHostRequest {}
+
+message EnsureHostResponse {}
+
+// HostEntry is one line of a container's hosts file.
+message HostEntry {
+  // An IPv4 or IPv6 address, without a zone.
+  string address = 1;
+  // The names for it, each a host name.
+  repeated string names = 2;
+}
+
+message EnsureHostFilesRequest {
+  // The container the files are for (a sandbox or a warm-pool slot ID).
+  string container_id = 1;
+  // The hostname file's one line.
+  string hostname = 2;
+  // The hosts file, one line each, in order.
+  repeated HostEntry hosts = 3;
+  // resolv.conf: nameserver addresses (no zones), search domains and
+  // options, rendered by internal/runtime/resolvconf.
+  repeated string nameservers = 4;
+  repeated string search = 5;
+  repeated string dns_options = 6;
+  // The node's egress TLS inspection CA certificate, DER. Empty: none.
+  bytes egress_ca_der = 7;
+}
+
+message EnsureHostFilesResponse {
+  string hostname_path = 1;
+  string hosts_path = 2;
+  string resolv_conf_path = 3;
+  // Empty when the request had no egress CA.
+  string egress_ca_path = 4;
+}
+
+message EnsureTaskFIFOsRequest {
+  string container_id = 1;
+}
+
+message EnsureTaskFIFOsResponse {
+  // Root's FIFOs, readable by the agent's group: the shim writes, the
+  // agent reads.
+  string stdout_path = 1;
+  string stderr_path = 2;
+}
+
+// RunscConfig names a runsc shim config the helper writes.
+enum RunscConfig {
+  RUNSC_CONFIG_UNSPECIFIED = 0;
+  // Every gVisor sandbox: host-uds=open, for the ready socket.
+  RUNSC_CONFIG_DEFAULT = 1;
+  // A gVisor sandbox restored from a move: the default flags, and
+  // aerolvm-runsc as the runsc the shim runs.
+  RUNSC_CONFIG_RESTORE = 2;
+}
+
+message EnsureRunscConfigRequest {
+  RunscConfig config = 1;
+}
+
+message EnsureRunscConfigResponse {
+  string path = 1;
+}
+
+message EnsureReadySocketRequest {
+  string container_id = 1;
+  // The ready socket's nonce (hex) for a create's socket, which the agent
+  // names <container_id>.<nonce>.sock; empty for a warm-pool slot's park
+  // socket, <container_id>.sock.
+  string nonce = 2;
+}
+
+message EnsureReadySocketResponse {
+  string path = 1;
+}
+
+message RemoveContainerFilesRequest {
+  string container_id = 1;
+}
+
+message RemoveContainerFilesResponse {}
+
+// HelperUnavailable marks a call that failed because the agent's client
+// could not reach the helper. It never crosses the socket: the client adds
+// it to the failed call's gRPC status, because containerd's Go client
+// rebuilds every error from the status and keeps only details that are
+// errors (internal/rootclient). In Go it is an error that matches
+// ErrHelperUnavailable.
+message HelperUnavailable {}
+
+// HelperUnsupported marks, the same way, a call that failed because the
+// helper is older than the agent. reason says which helper and what to do
+// (upgrade it). In Go it is an error that matches ErrHelperUnsupported.
+message HelperUnsupported {
+  string reason = 1;
+}
+
+// HelperRefused marks a call the helper or its containerd gate refused
+// because the request broke the helper's rules (eng review D9). Unlike the
+// two marks above it crosses the socket: the helper adds it to the refused
+// call's status, with the status's usual code. The agent only sends what
+// its own code built, so a refusal means drift or a broken agent, and the
+// agent's client records each one (internal/rootclient). In Go it is an
+// error that matches ErrHelperRefused.
+message HelperRefused {
+  // The rule's short, fixed code ("method_not_allowed", "mount"), fit for
+  // a metric label.
+  string reason = 1;
+}

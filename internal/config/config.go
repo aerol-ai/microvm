@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"net/url"
@@ -43,6 +44,27 @@ const (
 // Referenced by both Load() and the containerd driver's FromDaemonConfig so
 // the default cannot drift between the two layers.
 const DefaultContainerdRunDir = "/var/lib/sandboxd/containerd"
+
+// Build-context unpackers (internal/runtime/containerd, plans/
+// security-gaps-m1-m4.md §3.4 Q3) each run as their own uid and gid, the
+// same number, taken from BuildContextIDCount ids starting at
+// SB_CONTAINERD_BUILD_CONTEXT_ID_BASE. A uid of its own is what keeps every
+// other process on the host, other unpackers included, out of an unpacker's
+// /proc entries; a shared uid (nobody, say) does not. The default sits in the
+// range systemd leaves unused (above its container ranges, below 2^31), far
+// from login users (1000+), nobody (65534), /etc/subuid ranges (100000+)
+// and Kubernetes user-namespace pods. The ids need no account.
+const (
+	DefaultBuildContextIDBase = 2_000_000_000
+	// BuildContextIDCount is also the most unpacks that run at once on a
+	// node; more wait their turn. An unpack holds its id for milliseconds.
+	BuildContextIDCount = 64
+	// minBuildContextIDBase keeps the range above the 16-bit ids, where
+	// host accounts and nobody live.
+	minBuildContextIDBase = 65536
+	// maxBuildContextID is the highest valid id ((uid_t)-1 is "no id").
+	maxBuildContextID = math.MaxUint32 - 1
+)
 
 // NodeRole values for SB_NODE_ROLE. The role partitions which components a
 // cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
@@ -289,6 +311,12 @@ type Config struct {
 	// buildkitd at the default socket with a containerd worker on the aerolvm
 	// namespace. SB_CONTAINERD_BUILDKIT_ADDR.
 	ContainerdBuildKitAddr string
+	// ContainerdBuildContextIDBase is the first of the BuildContextIDCount
+	// uids (and gids) image builds unpack their context tars as: a root
+	// sandboxd re-execs itself as one of them, with no rights, so a bug in
+	// the unpacking cannot write to the host as root. Nothing else on the
+	// host may run as these ids. SB_CONTAINERD_BUILD_CONTEXT_ID_BASE.
+	ContainerdBuildContextIDBase int
 	// ContainerdNetnsPoolRefillInterval is the native netns pool's refill
 	// backstop tick. A claim from the warm queue wakes the refiller at
 	// once; the tick covers freed slots, failed refills and the retry of
@@ -1211,6 +1239,16 @@ type Config struct {
 	// their snapshot state; only the per-clone path is bypassed.
 	// SB_FIRECRACKER_OVERLAY_ENABLED.
 	FirecrackerOverlayEnabled bool
+	// FirecrackerNestedVirt lets Firecracker guests see the CPU's
+	// virtualization extensions (Intel VMX, AMD SVM), so a sandbox can run
+	// a VM of its own. Default false: every VM this node boots gets a CPU
+	// config that hides them, which keeps KVM's nested-virtualization code
+	// out of a guest's reach; almost no workload needs it. A node that
+	// hides them loads only template snapshots saved the same way, and
+	// rebuilds the rest; stopped sandboxes keep the CPU they started with.
+	// x86_64 only (arm64 guests get no EL2 from Firecracker).
+	// SB_FIRECRACKER_NESTED_VIRT.
+	FirecrackerNestedVirt bool
 	// FirecrackerOverlayMkfs makes the host run `mkfs.ext4 -F` on each
 	// per-sandbox overlay.ext4 right after the sparse allocation and
 	// before PutDrive/PatchDrive. Default false — the guest is normally
@@ -2442,6 +2480,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdCNIConfPath:             getEnv("SB_CONTAINERD_CNI_CONF_PATH", "/etc/cni/net.d/aerolvm.conflist"),
 		ContainerdBridgeSubnet:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
 		ContainerdBuildKitAddr:            getEnv("SB_CONTAINERD_BUILDKIT_ADDR", "unix:///run/buildkit/buildkitd.sock"),
+		ContainerdBuildContextIDBase:      getEnvInt("SB_CONTAINERD_BUILD_CONTEXT_ID_BASE", DefaultBuildContextIDBase),
 		ContainerdNetnsPoolRefillInterval: getEnvDuration("SB_CONTAINERD_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
 		ContainerdPoolEnabled:             getEnvBool("SB_CONTAINERD_POOL_ENABLED", false),
 		ContainerdPoolDepth:               getEnvInt("SB_CONTAINERD_POOL_DEPTH", 2),
@@ -2837,6 +2876,7 @@ func load(keyTool bool) (Config, error) {
 		FirecrackerSnapshotVerifyMode:       strings.ToLower(getEnv("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE", "once")),
 
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
+		FirecrackerNestedVirt:                getEnvBool("SB_FIRECRACKER_NESTED_VIRT", false),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
 		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
 
@@ -3049,6 +3089,12 @@ func load(keyTool bool) (Config, error) {
 		}
 		if strings.TrimSpace(cfg.ContainerdNamespace) == "" {
 			return Config{}, errors.New("SB_CONTAINERD_NAMESPACE is required when SB_CONTAINER_ENGINE=containerd")
+		}
+		// Low ids are host accounts (root among them): an unpacker sharing
+		// one is what the range exists to prevent. There is no opt-out.
+		if base := int64(cfg.ContainerdBuildContextIDBase); base < minBuildContextIDBase || base+BuildContextIDCount-1 > maxBuildContextID {
+			return Config{}, fmt.Errorf("SB_CONTAINERD_BUILD_CONTEXT_ID_BASE must be between %d and %d, so its %d ids sit above the host's accounts, got %d",
+				minBuildContextIDBase, int64(maxBuildContextID-BuildContextIDCount+1), BuildContextIDCount, cfg.ContainerdBuildContextIDBase)
 		}
 	}
 	if p := cfg.ContainerdCgroupParent; p != "" {
@@ -3775,6 +3821,16 @@ func (c Config) KeyRingPath() string {
 		return c.CredentialKeyRingPath
 	}
 	return c.CredentialEncryptionKeyPath + ".ring"
+}
+
+// UploadSpoolDir is where multipart uploads too big for memory spill
+// (internal/multipartspool): a folder of the daemon's own next to its
+// database, never the host's shared temp folder. "" without a DBPath.
+func (c Config) UploadSpoolDir() string {
+	if strings.TrimSpace(c.DBPath) == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(c.DBPath), "upload-spool")
 }
 
 func (c Config) ListenAddr() string {

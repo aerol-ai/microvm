@@ -10,6 +10,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cloudidentity"
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -106,6 +107,16 @@ func truncate(message string) string {
 // home so v1, Daytona, E2B and Runloop cannot drift (plan D1).
 func Classify(err error) Classification {
 	switch {
+	// The node's root helper (internal/rootclient) refused a call this node
+	// made (plans/security-gaps-m1-m4.md §3.3, eng review D9). The agent
+	// only sends what its own code built, so this is drift or a compromised
+	// agent, never the caller's request: a 500, not the 400 catch-all, and
+	// not the 503 of a helper that is down, since a retry meets the same
+	// refusal. It comes first so no sentinel wrapped with it can turn it
+	// into anything else. The call and the reason go to the audit record,
+	// the metric and this node's log, never to the caller.
+	case errors.Is(err, rootclient.ErrRefused):
+		return Classification{Status: http.StatusInternalServerError, Message: "internal error: the node's root helper refused a call this node made", Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, store.ErrNotFound):
 		return Classification{Status: http.StatusNotFound, Message: "sandbox not found", Kind: ErrKindNotFound}
 	// A keyed create whose Idempotency-Key was used with a different request.
@@ -229,6 +240,18 @@ func Classify(err error) Classification {
 	// cause (a netlink error) is for the node's log, not the caller.
 	case errors.Is(err, service.ErrIPv6FenceNotReady):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeIPv6FenceNotReady, Message: service.ErrIPv6FenceNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+
+	// The node's root helper (internal/rootclient): down, or one release
+	// older than this agent and missing a call. Both pass: the supervisor
+	// restarts a helper that died, and swaps in the one the agent staged
+	// (plans/security-gaps-m1-m4.md, eng review D4). The unavailable cause
+	// names the socket and gRPC's error, which are for the node's log; the
+	// unsupported text names the call and the helper's version, which tell
+	// the caller why.
+	case errors.Is(err, rootclient.ErrUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: "the node's root helper is unavailable; retry shortly", Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, rootclient.ErrUnsupported):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: truncate(err.Error()), Log: true, LogLevel: slog.LevelWarn}
 
 	// An option this runtime/build can't honor is 501, not 400.
 	case errors.Is(err, models.ErrRuntimeNotImplemented):

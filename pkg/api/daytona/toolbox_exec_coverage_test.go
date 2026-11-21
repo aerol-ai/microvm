@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/multipartspool"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -184,8 +185,15 @@ func newToolboxExecEnvWithConfig(t *testing.T, executeFn http.HandlerFunc, mutat
 		_ = r.ParseMultipartForm(1 << 20)
 		w.WriteHeader(http.StatusNoContent)
 	})
+	return serveToolboxFacade(t, mux, mutate, nil)
+}
 
-	toolboxServer := httptest.NewServer(mux)
+// serveToolboxFacade serves toolbox as a started sandbox's toolbox and the
+// Daytona facade in front of it, with spool as the facade's upload spool.
+func serveToolboxFacade(t *testing.T, toolbox http.Handler, mutate func(*config.Config), spool *multipartspool.Spool) (facadeURL, sandboxID string) {
+	t.Helper()
+
+	toolboxServer := httptest.NewServer(toolbox)
 	t.Cleanup(toolboxServer.Close)
 
 	host, portText, err := net.SplitHostPort(mustParseURL(t, toolboxServer.URL).Host)
@@ -249,9 +257,10 @@ func newToolboxExecEnvWithConfig(t *testing.T, executeFn http.HandlerFunc, mutat
 
 	mux2 := http.NewServeMux()
 	RegisterRoutes(mux2, Deps{
-		Service: svc,
-		Logger:  logger,
-		Auth:    func(next http.Handler) http.Handler { return next },
+		Service:     svc,
+		Logger:      logger,
+		Auth:        func(next http.Handler) http.Handler { return next },
+		UploadSpool: spool,
 	})
 	facadeServer := httptest.NewServer(mux2)
 	t.Cleanup(facadeServer.Close)

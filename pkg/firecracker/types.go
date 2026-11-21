@@ -32,6 +32,54 @@ type MachineConfig struct {
 	HugePages       string `json:"huge_pages,omitempty"`
 }
 
+// CPUConfig is the PUT /cpu-config request: a custom CPU template applied
+// to every vCPU before boot. Only the x86_64 CPUID part is modelled.
+// Firecracker treats each part as optional and refuses unknown keys, so
+// the parts we don't drive (MSRs, KVM capabilities, the aarch64 registers)
+// stay out of the type.
+type CPUConfig struct {
+	CPUIDModifiers []CPUIDLeafModifier `json:"cpuid_modifiers,omitempty"`
+}
+
+// CPUIDLeafModifier changes bits of one CPUID leaf. Leaf and Subleaf are
+// hex strings ("0x80000001"). Flags replaces the entry's KVM flags, so it
+// must be what KVM reports for the leaf: 0 for a leaf with no subleaf
+// index. Firecracker refuses a template that names a leaf KVM does not
+// report.
+type CPUIDLeafModifier struct {
+	Leaf      string                  `json:"leaf"`
+	Subleaf   string                  `json:"subleaf"`
+	Flags     uint32                  `json:"flags"`
+	Modifiers []CPUIDRegisterModifier `json:"modifiers"`
+}
+
+// CPUIDRegisterModifier changes bits of one register ("eax", "ebx",
+// "ecx" or "edx"; lowercase). Bitmap is "0b" then 32 characters, bit 31
+// first: '0' clears the bit, '1' sets it, 'x' leaves it as KVM reports it.
+// ClearBits builds one.
+type CPUIDRegisterModifier struct {
+	Register string `json:"register"`
+	Bitmap   string `json:"bitmap"`
+}
+
+// ClearBits returns the bitmap that clears the given bits (0-31) of a
+// register and leaves every other bit unchanged. A bit above 31 panics: it
+// is a programming error, and a template that silently skipped it would
+// leave the bit set.
+func ClearBits(bits ...uint) string {
+	var mask [32]byte
+	for i := range mask {
+		mask[i] = 'x'
+	}
+	for _, b := range bits {
+		if b > 31 {
+			panic("firecracker: CPUID register bit out of range")
+		}
+		mask[31-b] = '0'
+	}
+	return "0b" + string(mask[:])
+}
+
 // BootSource is the PUT /boot-source request for cold-boot VMMs. The
 // kernel_image_path must be readable by the (possibly jailer-chrooted)
 // firecracker process; the daemon resolves it ahead of time.

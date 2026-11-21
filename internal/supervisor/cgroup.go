@@ -11,6 +11,7 @@
 //	├── supervisor/        this process (memory.min = the reserve)
 //	└── sandboxes/         SB_CONTAINERD_CGROUP_PARENT (memory.max = limit - reserve)
 //	    ├── _runtime/      containerd, and so every shim and runsc helper
+//	    │   └── aerolvm-rootd/  the root helper and all it starts (HelperGroup)
 //	    └── <sandbox id>/  one per sandbox, made by sandboxd
 //
 // Each choice was forced by spike S3 (finding F10): cgroup v2 hands
@@ -41,6 +42,7 @@ const (
 	supervisorGroup = "supervisor"
 	sandboxesGroup  = "sandboxes"
 	runtimeGroup    = "_runtime"
+	helperGroup     = "aerolvm-rootd"
 
 	// The reserve kept for the machinery: a tenth of the container's limit,
 	// between 1 and 4 GiB. It only has to cover sandboxd (615 MB at 1,000
@@ -68,6 +70,10 @@ func (l Layout) Parent() string { return path.Join("/", l.Self, sandboxesGroup) 
 
 // RuntimeDir is the group containerd runs in.
 func (l Layout) RuntimeDir() string { return l.dir(sandboxesGroup, runtimeGroup) }
+
+// HelperDir is the root helper's own group, inside the runtime's
+// (HelperGroup says why it is a group of its own).
+func (l Layout) HelperDir() string { return l.dir(sandboxesGroup, runtimeGroup, helperGroup) }
 
 // SelfCgroup reads this process's cgroup v2 path from /proc/self/cgroup
 // ("0::/path"). A machine on cgroup v1 has no such line, and C7 needs v2.

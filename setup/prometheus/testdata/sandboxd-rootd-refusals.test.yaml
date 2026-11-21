@@ -1,0 +1,87 @@
+# promtool unit tests for SandboxdRootHelperRefusal (sandboxd-alerts.yml,
+# eng review D9): any refusal fires within 5 minutes, including the first
+# one ever, whose series is born at 1 where increase() sees no rise.
+# alerts_test.go runs them when promtool is on PATH.
+rule_files:
+  - ../sandboxd-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # The first refusal on a node: the series appears at 1 and stays there.
+  # It fires at once and clears once the series is 5 minutes old.
+  - interval: 1m
+    input_series:
+      - series: 'aerolvm_rootd_refusals_total{instance="w1:21212",job="sandboxd",key="Containers.Create",key2="mount"}'
+        values: '_x9 1x20'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: root-helper
+              instance: "w1:21212"
+              key: Containers.Create
+              key2: mount
+            exp_annotations:
+              summary: "the root helper refused a call from sandboxd"
+              description: "w1:21212: the root helper refused Containers.Create (mount) in the last 5 minutes. sandboxd only sends what its own code built, so this is drift between sandboxd and the helper, or a compromised sandboxd. The create failed with a 500. Treat it as a security incident until drift is ruled out."
+              runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal"
+      - eval_time: 20m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts: []
+
+  # A later refusal on a series that already exists fires through
+  # increase(); a counter that stays flat does not.
+  - interval: 1m
+    input_series:
+      - series: 'aerolvm_rootd_refusals_total{instance="w1:21212",job="sandboxd",key="Tasks.Create",key2="task_io"}'
+        values: '1x20 2x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts: []
+      - eval_time: 23m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: root-helper
+              instance: "w1:21212"
+              key: Tasks.Create
+              key2: task_io
+            exp_annotations:
+              summary: "the root helper refused a call from sandboxd"
+              description: "w1:21212: the root helper refused Tasks.Create (task_io) in the last 5 minutes. sandboxd only sends what its own code built, so this is drift between sandboxd and the helper, or a compromised sandboxd. The create failed with a 500. Treat it as a security incident until drift is ruled out."
+              runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal"
+      - eval_time: 30m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts: []
+
+  # sandboxd restarts (its counters start again) and refuses again 3
+  # minutes later: the reset counts as a rise.
+  - interval: 1m
+    input_series:
+      - series: 'aerolvm_rootd_refusals_total{instance="w1:21212",job="sandboxd",key="Diff.Apply",key2="snapshot_mount"}'
+        values: '3x10 stale _ 1x10'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: root-helper
+              instance: "w1:21212"
+              key: Diff.Apply
+              key2: snapshot_mount
+            exp_annotations:
+              summary: "the root helper refused a call from sandboxd"
+              description: "w1:21212: the root helper refused Diff.Apply (snapshot_mount) in the last 5 minutes. sandboxd only sends what its own code built, so this is drift between sandboxd and the helper, or a compromised sandboxd. The create failed with a 500. Treat it as a security incident until drift is ruled out."
+              runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal"
+      - eval_time: 25m
+        alertname: SandboxdRootHelperRefusal
+        exp_alerts: []

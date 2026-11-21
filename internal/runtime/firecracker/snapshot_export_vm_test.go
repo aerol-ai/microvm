@@ -355,6 +355,7 @@ func TestExportHelperBootFailures(t *testing.T) {
 		{"start", func(_ *driverFixture, g *exportGuest) { g.vmHook = (func(vm *fakeVMM) { vm.startErr = boom }) }, "export VM: start"},
 		{"api socket", func(_ *driverFixture, g *exportGuest) { g.vmHook = (func(vm *fakeVMM) { vm.waitErr = boom }) }, "wait api socket"},
 		{"machine config", func(_ *driverFixture, g *exportGuest) { g.clientHook = (func(c *fakeClient) { c.machineErr = boom }) }, "machine config"},
+		{"cpu config", func(_ *driverFixture, g *exportGuest) { g.clientHook = (func(c *fakeClient) { c.cpuErr = boom }) }, "export VM: PutCPUConfig"},
 		{"boot source", func(_ *driverFixture, g *exportGuest) { g.clientHook = (func(c *fakeClient) { c.bootErr = boom }) }, "boot source"},
 		{"drives", func(_ *driverFixture, g *exportGuest) { g.clientHook = (func(c *fakeClient) { c.driveErr = boom }) }, "root drive"},
 		{"vsock", func(_ *driverFixture, g *exportGuest) { g.clientHook = (func(c *fakeClient) { c.vsockErr = boom }) }, "export VM: vsock"},
