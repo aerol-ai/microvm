@@ -30,10 +30,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -74,7 +81,7 @@ func (s *Service) MarkSnapshotCorrupt(ctx context.Context, templateID, reason st
 		// of its way.
 		return nil
 	}
-	s.logger.Warn("snapshot corruption detected; template marked unhealthy, rebuild kicked",
+	s.logger.Warn("template snapshot unusable (see reason); template marked unhealthy, rebuild kicked",
 		"template_id", templateID, "reason", reason)
 	addTemplateUnhealthyGauge(1)
 	s.kickSnapshotRebuild(templateID)
@@ -132,6 +139,255 @@ func (s *Service) RekickUnhealthyTemplatesAtStart(ctx context.Context) {
 		s.logger.Warn("rekick unhealthy template after daemon restart",
 			"template_id", tpl.ID, "snapshot_error", tpl.SnapshotError)
 		s.kickSnapshotRebuild(tpl.ID)
+	}
+}
+
+// templateGOARCH is runtime.GOARCH, replaced in tests. Nested
+// virtualization is hidden, and records checked, on amd64 only
+// (firecracker.NestedVirtApplies).
+var templateGOARCH = runtime.GOARCH
+
+// ResaveTemplateSnapshotsForNestedVirtAtStart saves again, with this node's
+// SB_FIRECRACKER_NESTED_VIRT setting, every ready template whose snapshot
+// was saved under the other setting (or before the setting was recorded),
+// and every template snapshotted before the overlay placeholder, whose
+// read-write root drive no longer loads (templateNeedsResave).
+// A snapshot load restores the CPU the VM saved, so until then each clone
+// of such a template gets the old CPU, as before the setting existed; the
+// warm pool skips the template meanwhile.
+//
+// The template stays in service the whole time: resaveTemplateSnapshot
+// saves to new file names and swaps the row only if it is unchanged, so
+// creates keep loading the old snapshot until the swap, and clones already
+// running keep the files they loaded. The saves run one at a time in the
+// background, so an upgrade does not boot a VM per template at once. A
+// save that fails leaves the template as it was, and the next start tries
+// again.
+//
+// It also removes the snapshot files of ready templates that their row no
+// longer names (left by an earlier save): at start nothing loads them, as
+// the API is not serving yet and the warm pool's VMs were stopped. Call it
+// after RekickUnhealthyTemplatesAtStart; it only touches ready rows.
+func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Context) {
+	if s.templateSnapshotter == nil || s.templateCIDAllocator == nil {
+		return
+	}
+	templates, err := s.store.ListTemplates(ctx)
+	if err != nil {
+		s.logger.Warn("resave templates for nested virtualization: list failed", "error", err)
+		return
+	}
+	allowed := s.cfg.FirecrackerNestedVirt
+	var stale []*models.Template
+	for _, tpl := range templates {
+		if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot {
+			continue
+		}
+		s.removeUnusedTemplateSnapshotFiles(tpl)
+		if templateNeedsResave(tpl, allowed) {
+			stale = append(stale, tpl)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	s.logger.Info("audit saving template snapshots again for the nested virtualization setting or a pre-overlay snapshot, one at a time",
+		"count", len(stale), "nested_virt", firecracker.NestedVirtSetting(allowed))
+	timeout := s.cfg.FirecrackerTemplateBuildTimeout
+	if timeout <= 0 {
+		timeout = defaultTemplateBuildTimeout
+	}
+	s.templateRebuildWG.Add(1)
+	go func() {
+		defer s.templateRebuildWG.Done()
+		for _, tpl := range stale {
+			err := s.withTemplateSnapshotLock(tpl.ID, timeout, func(ctx context.Context) error {
+				return s.resaveTemplateSnapshotLocked(ctx, tpl)
+			})
+			if err != nil {
+				s.logger.Warn("template snapshot not saved again; it keeps its old snapshot until the next start",
+					"template_id", tpl.ID, "error", err)
+				continue
+			}
+			s.logger.Info("audit template snapshot saved again",
+				"template_id", tpl.ID, "nested_virt", firecracker.NestedVirtSetting(allowed))
+		}
+	}()
+}
+
+// templateNeedsResave reports whether a ready template's snapshot must be
+// saved again at start:
+//   - it was saved before the overlay placeholder (HasOverlay false). Those
+//     snapshots hold the root drive read-write, and the driver stages a
+//     template's rootfs read-only for every load (chrootSharedFile), so
+//     such a snapshot no longer loads until it is saved again, which puts
+//     the root drive read-only and adds the placeholder;
+//   - or it was saved under the other SB_FIRECRACKER_NESTED_VIRT setting
+//     (amd64 only, where the setting does something).
+func templateNeedsResave(tpl *models.Template, nestedVirtAllowed bool) bool {
+	if !tpl.HasOverlay {
+		return true
+	}
+	return firecracker.NestedVirtApplies(templateGOARCH) && !firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(nestedVirtAllowed)
+}
+
+// errTemplateMovedOn: the template changed while its snapshot was being
+// saved again (a rebuild, a delete, another save), so the new save is
+// dropped and the row is left to whoever changed it.
+var errTemplateMovedOn = errors.New("the template changed while its snapshot was saved again")
+
+// resaveTemplateSnapshot saves a ready template's snapshot again under this
+// node's setting without taking the template out of service.
+func (s *Service) resaveTemplateSnapshot(ctx context.Context, listed *models.Template) error {
+	defer s.lockTemplateSnapshot(listed.ID)()
+	return s.resaveTemplateSnapshotLocked(ctx, listed)
+}
+
+// resaveTemplateSnapshotLocked is resaveTemplateSnapshot for a caller that
+// holds the template's snapshot lock.
+func (s *Service) resaveTemplateSnapshotLocked(ctx context.Context, listed *models.Template) error {
+	// Read the row again under the lock: a rebuild or another save may have
+	// replaced the snapshot since the sweep listed it.
+	tpl, err := s.store.GetTemplate(ctx, listed.ID)
+	if err != nil {
+		return fmt.Errorf("get template: %w", err)
+	}
+	if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot || !templateNeedsResave(tpl, s.cfg.FirecrackerNestedVirt) {
+		return errTemplateMovedOn
+	}
+	cid, err := s.templateCIDAllocator.AllocateForTemplate(ctx, tpl.ID)
+	if err != nil {
+		return fmt.Errorf("cid allocate: %w", err)
+	}
+	memOut, stateOut := newTemplateSnapshotPaths(filepath.Dir(tpl.RootfsPath))
+	drop := func() {
+		_ = os.Remove(memOut)
+		_ = os.Remove(stateOut)
+	}
+	snap, err := s.templateSnapshotter.SnapshotTemplate(ctx, TemplateSnapshotRequest{
+		TemplateID:    tpl.ID,
+		RootfsPath:    tpl.RootfsPath,
+		OutMemoryPath: memOut,
+		OutStatePath:  stateOut,
+		GuestCID:      cid,
+		MemoryMB:      s.cfg.FirecrackerTemplateMemoryMB,
+		VCPU:          s.cfg.FirecrackerTemplateVCPU,
+	})
+	if err != nil {
+		drop()
+		return fmt.Errorf("snapshotter: %w", err)
+	}
+	swapped, err := s.store.SwapTemplateSnapshot(ctx, tpl.ID, tpl.SnapshotChecksum, memOut, stateOut,
+		snap.MemorySizeBytes+snap.StateSizeBytes, snap.Checksum, cid, snap.NestedVirt)
+	if err != nil || !swapped {
+		drop()
+		if err == nil {
+			err = errTemplateMovedOn
+		}
+		return err
+	}
+	s.MarkArtifactCatalogDirty(cluster.ArtifactKindTemplate)
+	if mErr := writeTemplateManifest(filepath.Join(filepath.Dir(tpl.RootfsPath), templateManifestFilename), templateManifest{
+		SourceImage:      tpl.Image,
+		SnapshotChecksum: snap.Checksum,
+		VsockCID:         cid,
+		NestedVirt:       snap.NestedVirt,
+		CreatedAt:        time.Now().UTC(),
+	}); mErr != nil {
+		s.logger.Warn("template snapshot save: manifest write failed", "template_id", tpl.ID, "error", mErr)
+	}
+	return nil
+}
+
+// lockTemplateSnapshot serializes the VMs that save one template's
+// snapshot (a build's, a rebuild's, a nested-virtualization re-save's).
+// They all use the VM id tpl-snap-<id>, with its TAP slot, run dir and API
+// socket, so two at once would tear each other down. Returns the unlock.
+func (s *Service) lockTemplateSnapshot(templateID string) func() {
+	s.templateSnapshotLocksMu.Lock()
+	if s.templateSnapshotLocks == nil {
+		s.templateSnapshotLocks = make(map[string]*templateSnapshotLock)
+	}
+	l := s.templateSnapshotLocks[templateID]
+	if l == nil {
+		l = &templateSnapshotLock{}
+		s.templateSnapshotLocks[templateID] = l
+	}
+	l.refs++
+	s.templateSnapshotLocksMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		s.templateSnapshotLocksMu.Lock()
+		// The entry goes with its last holder or waiter, so the map holds
+		// only templates being saved, never every id ever seen. A waiter
+		// counted in refs keeps it, so two callers never get two locks.
+		if l.refs--; l.refs == 0 {
+			delete(s.templateSnapshotLocks, templateID)
+		}
+		s.templateSnapshotLocksMu.Unlock()
+	}
+}
+
+// templateSnapshotLock is one template's lock and the number of callers
+// holding or waiting on it.
+type templateSnapshotLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// withTemplateSnapshotLock runs fn under the template's snapshot lock, with
+// a timeout that starts once the lock is held: a save that waited behind
+// another save of the same template still gets its whole time.
+func (s *Service) withTemplateSnapshotLock(templateID string, timeout time.Duration, fn func(ctx context.Context) error) error {
+	defer s.lockTemplateSnapshot(templateID)()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return fn(ctx)
+}
+
+// newTemplateSnapshotPaths names a new snapshot of a template in its
+// folder. A save to new names never changes the files a running clone
+// loaded: with the jailer, each clone's jail holds a hard link to them, and
+// Firecracker maps the memory file; writing the old name in place would
+// change the memory under every such clone.
+func newTemplateSnapshotPaths(dir string) (memPath, statePath string) {
+	gen := strconv.FormatInt(time.Now().UnixNano(), 36)
+	return filepath.Join(dir, "snapshot."+gen+".memory"), filepath.Join(dir, "snapshot."+gen+".state")
+}
+
+// isTemplateSnapshotFile reports whether a template folder's entry is a
+// snapshot file: the build's names or newTemplateSnapshotPaths's.
+func isTemplateSnapshotFile(name string) bool {
+	if name == snapshotMemoryFilename || name == snapshotStateFilename {
+		return true
+	}
+	rest, ok := strings.CutPrefix(name, "snapshot.")
+	if !ok {
+		return false
+	}
+	return strings.HasSuffix(rest, ".memory") || strings.HasSuffix(rest, ".state")
+}
+
+// removeUnusedTemplateSnapshotFiles removes the snapshot files in a ready
+// template's folder that its row no longer names.
+func (s *Service) removeUnusedTemplateSnapshotFiles(tpl *models.Template) {
+	if tpl.RootfsPath == "" || tpl.SnapshotMemoryPath == "" || tpl.SnapshotStatePath == "" {
+		return
+	}
+	dir := filepath.Dir(tpl.RootfsPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if !e.Type().IsRegular() || !isTemplateSnapshotFile(e.Name()) || path == tpl.SnapshotMemoryPath || path == tpl.SnapshotStatePath {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			s.logger.Warn("template snapshot file left over; not removed", "template_id", tpl.ID, "path", path, "error", err)
+		}
 	}
 }
 
@@ -207,9 +463,13 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 	s.templateRebuildWG.Add(1)
 	go func() {
 		defer s.templateRebuildWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		if err := s.RebuildTemplateSnapshot(ctx, templateID); err != nil {
+		// The timeout starts once the template's snapshot lock is held: a
+		// rebuild queued behind a re-save of the same template still gets
+		// its whole time.
+		err := s.withTemplateSnapshotLock(templateID, timeout, func(ctx context.Context) error {
+			return s.rebuildTemplateSnapshotLocked(ctx, templateID)
+		})
+		if err != nil {
 			s.logger.Warn("snapshot rebuild failed",
 				"template_id", templateID, "error", err)
 		}
@@ -237,11 +497,12 @@ func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
 }
 
 // RebuildTemplateSnapshot reruns the snapshot phase against an
-// existing rootfs. Synchronous (the caller — typically
-// kickSnapshotRebuild — provides its own goroutine + timeout).
-// Exported because future phases (snapshot rotation in PR 6-D,
-// operator-triggered repair via an API endpoint) will call it
-// directly.
+// existing rootfs, under the template's snapshot lock. Synchronous; the
+// caller provides the goroutine and the timeout. The background path,
+// kickSnapshotRebuild, calls rebuildTemplateSnapshotLocked through
+// withTemplateSnapshotLock instead, so its timeout starts once it holds the
+// lock; this entry point is for a caller that wants to wait on the
+// rebuild directly.
 //
 // Precondition: template must exist and be in status=unhealthy.
 // (ready_no_snapshot rebuilds need a different entry point — they
@@ -254,6 +515,13 @@ func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
 // kickTemplateBuild semantics so operators see a uniform state
 // machine on the dashboard.
 func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string) error {
+	defer s.lockTemplateSnapshot(templateID)()
+	return s.rebuildTemplateSnapshotLocked(ctx, templateID)
+}
+
+// rebuildTemplateSnapshotLocked is RebuildTemplateSnapshot for a caller that
+// holds the template's snapshot lock.
+func (s *Service) rebuildTemplateSnapshotLocked(ctx context.Context, templateID string) error {
 	if s.templateSnapshotter == nil || s.templateCIDAllocator == nil {
 		return errors.New("snapshot rebuild requires snapshotter + cid allocator wiring")
 	}
@@ -291,8 +559,10 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 	}
 
 	dir := filepath.Dir(template.RootfsPath)
-	memOut := filepath.Join(dir, snapshotMemoryFilename)
-	stateOut := filepath.Join(dir, snapshotStateFilename)
+	// New names: clones of the old snapshot may still be running on it
+	// (newTemplateSnapshotPaths). The old files go once the new snapshot is
+	// in place.
+	memOut, stateOut := newTemplateSnapshotPaths(dir)
 
 	if uerr := s.setTemplateStatus(ctx, templateID,
 		models.TemplateStatusSnapshotting, template.RootfsPath, "",
@@ -343,7 +613,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 
 	snapshotSize := snap.MemorySizeBytes + snap.StateSizeBytes
 	if uerr := s.store.UpdateTemplateSnapshotReady(ctx, templateID, memOut, stateOut,
-		snapshotSize, snap.Checksum, cid, true); uerr != nil {
+		snapshotSize, snap.Checksum, cid, true, snap.NestedVirt); uerr != nil {
 		s.logger.Warn("snapshot rebuild: snapshot ready update failed",
 			"template_id", templateID, "error", uerr)
 		return fmt.Errorf("snapshot ready update: %w", uerr)
@@ -360,10 +630,26 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		SourceImage:      template.Image,
 		SnapshotChecksum: snap.Checksum,
 		VsockCID:         cid,
+		NestedVirt:       snap.NestedVirt,
 		CreatedAt:        time.Now().UTC(),
 	}); mErr != nil {
 		s.logger.Warn("snapshot rebuild: manifest write failed",
 			"template_id", templateID, "error", mErr)
+	}
+	// The old pair goes now, or each rotation would leave one more memory
+	// file. Clones still running on it keep it: their jail holds a hard
+	// link, or Firecracker keeps it mapped. Creates that resolve the
+	// template from MarkTemplateUnhealthy on read has_snapshot=0; one that
+	// resolved it before and is still staging when the rebuild ends fails
+	// to open the old file (ENOENT, not corruption, so no new rebuild), and
+	// its retry gets the new snapshot.
+	for _, old := range []string{template.SnapshotMemoryPath, template.SnapshotStatePath} {
+		if old != "" && old != memOut && old != stateOut && filepath.Dir(old) == dir {
+			if rmErr := os.Remove(old); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				s.logger.Warn("snapshot rebuild: old snapshot file not removed; the next start removes it",
+					"template_id", templateID, "path", old, "error", rmErr)
+			}
+		}
 	}
 	s.logger.Info("audit snapshot rebuild finished",
 		"template_id", templateID,

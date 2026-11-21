@@ -426,6 +426,11 @@ func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
 		if err != nil {
 			return err
 		}
+		// A value outside uid_t would wrap in the conversion and be compared
+		// as some other uid.
+		if n < 0 || n > math.MaxUint32 {
+			return fmt.Errorf("%s=%d: not a uid", k, n)
+		}
 		if uint32(n) == uid {
 			who = append(who, k)
 		}

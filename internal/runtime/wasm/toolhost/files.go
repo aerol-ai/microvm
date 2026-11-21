@@ -16,10 +16,14 @@ import (
 func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 	const maxBytes = 256 * 1024 * 1024
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	if err := r.ParseMultipartForm(64 << 20); err != nil {
+	// Parts past 64 MiB spill to a private folder for this request, never
+	// the host's shared temp folder (plans/security-gaps-m1-m4.md Q4).
+	form, err := h.uploads.ReadForm(r, 64<<20)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	targetPath := strings.TrimSpace(r.FormValue("path"))
 	if targetPath == "" {
@@ -41,7 +45,7 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer root.Close()
 
-	file, header, err := r.FormFile("file")
+	file, header, err := form.FormFile("file")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "file is required")
 		return

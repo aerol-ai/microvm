@@ -56,6 +56,16 @@ func TestNewServerFallsBackToDockerBuilder(t *testing.T) {
 	}
 }
 
+// The facades' upload spool sits next to the database (Q4), so a large
+// Daytona or Runloop upload never spills into the shared temp folder.
+func TestNewServerUploadSpoolNextToDatabase(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	server := NewServer(discardLogger(), nil, nil, nil, config.Config{DBPath: dbPath}, "pat", nil)
+	if got, want := server.uploadSpool.Dir(), filepath.Join(filepath.Dir(dbPath), "upload-spool"); got != want {
+		t.Fatalf("upload spool = %q, want %q", got, want)
+	}
+}
+
 func TestRequireE2BAuthAcceptsUserToken(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	validator := stubValidator{

@@ -3821,33 +3821,66 @@ install_buildkit() {
 		install -m 0755 "${tmp_dir}/bin/buildctl" "${BUILDKIT_BIN_DIR}/buildctl"
 		echo "Installed buildkitd and buildctl ${BUILDKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
 	fi
+	# Our own older unit ran build steps on the host's network: replace it
+	# and restart, so a re-run moves an existing node to the sandbox network.
+	local restart="false"
+	if [[ -f "$BUILDKIT_UNIT_FILE" ]] && buildkit_unit_is_ours_on_host_net "$BUILDKIT_UNIT_FILE"; then
+		echo "Moving BuildKit build steps off the host network"
+		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		systemctl daemon-reload
+		restart="true"
+	fi
 	if [[ ! -f "$BUILDKIT_UNIT_FILE" ]]; then
 		buildkit_unit > "$BUILDKIT_UNIT_FILE"
 		systemctl daemon-reload
 	fi
 	systemctl enable --now buildkit.service || echo "warning: buildkit.service failed to start" >&2
+	if [[ "$restart" == "true" ]]; then
+		systemctl restart buildkit.service || echo "warning: buildkit.service failed to restart" >&2
+	fi
 }
 
 # buildkit_unit prints the bootstrap's buildkit.service, rendered with the
-# socket and namespace this installer writes into sandboxd.env (and
-# Terraform's defaults): the containerd worker only, in the aerolvm namespace,
-# so builds land in the image store the driver runs from. Host networking
-# for RUN steps avoids a separate BuildKit CNI config.
+# socket, namespace and CNI plugin dir this installer writes into
+# sandboxd.env (and Terraform's defaults): the containerd worker only, in the
+# aerolvm namespace, so builds land in the image store the driver runs from.
+#
+# Build steps (RUN) join the sandboxes' own CNI network, the aerolvm0 bridge
+# that sandboxd describes in /etc/cni/net.d/aerolvm.conflist. So each step
+# gets its own network namespace and the same host firewall a sandbox gets:
+# the egress floor (cloud metadata and the operator's floor addresses) and
+# the node guard (no node ports). sandboxd writes that conflist when it
+# starts, so the unit waits for it: ExecStartPre fails until the file is
+# there, and Restart retries every 5 s with no start limit.
 buildkit_unit() {
 	cat <<'UNIT'
 [Unit]
 Description=BuildKit (aerolvm containerd worker)
 Requires=containerd.service
-After=containerd.service
+After=containerd.service sandboxd.service
+StartLimitIntervalSec=0
 
 [Service]
-ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=/run/containerd/containerd.sock --containerd-worker-namespace=aerolvm --containerd-worker-net=host
+ExecStartPre=/usr/bin/test -s /etc/cni/net.d/aerolvm.conflist
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true --containerd-worker-addr=/run/containerd/containerd.sock --containerd-worker-namespace=aerolvm --containerd-worker-net=cni --containerd-cni-config-path=/etc/cni/net.d/aerolvm.conflist --containerd-cni-binary-dir=/opt/cni/bin
 Restart=on-failure
+RestartSec=5
 Delegate=yes
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
+
+# buildkit_unit_is_ours_on_host_net reports whether the unit at $1 is one an
+# earlier installer or bootstrap wrote (its Description) that still runs
+# build steps on the host's network. Only that unit is replaced on upgrade;
+# any other buildkit.service is the operator's and is left alone. Bash
+# pattern matching only, no external tools.
+buildkit_unit_is_ours_on_host_net() {
+	local body
+	body="$(<"$1")"
+	[[ "$body" == *"Description=BuildKit (aerolvm containerd worker)"* && "$body" == *"--containerd-worker-net=host"* ]]
 }
 
 register_gvisor_runtime() {

@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -273,10 +272,11 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 		for _, s := range established {
 			_ = m.tearDownState(s)
 		}
-		// The id was validated at entry; the prefix check keeps this
-		// RemoveAll inside rootDir on its own.
-		if dir := filepath.Clean(filepath.Join(m.rootDir, sandboxID)); strings.HasPrefix(dir, filepath.Clean(m.rootDir)+string(filepath.Separator)) {
-			_ = os.RemoveAll(dir)
+		// clearMountDir also takes down a mount the loop had not reached
+		// (in adopt mode, a live one a previous sandboxd left) before it
+		// removes anything.
+		if dir, ok := m.mountFolder(sandboxID); ok {
+			_ = m.clearMountDir(dir)
 		}
 		return nil, failed
 	}
@@ -287,7 +287,10 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 	return binds, nil
 }
 
-// UnmountAll tears down every mount for a sandbox. Always best-effort.
+// UnmountAll tears down every mount for a sandbox. Always best-effort. The
+// mount folder goes last, through clearMountDir: a mount this process does
+// not track (one a previous sandboxd left) or one whose unmount failed is
+// unmounted first, and the folder is never removed through a mount.
 func (m *Manager) UnmountAll(sandboxID string) error {
 	m.mu.Lock()
 	states := m.state[sandboxID]
@@ -300,7 +303,12 @@ func (m *Manager) UnmountAll(sandboxID string) error {
 			firstErr = err
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(m.rootDir, sandboxID)); err != nil && firstErr == nil {
+	// No folder was ever made for an id mountSet would refuse.
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return firstErr
+	}
+	if err := m.clearMountDir(dir); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -442,12 +450,13 @@ func (m *Manager) beginMount(ctx context.Context, id string) (release func(), er
 	}, nil
 }
 
-// cleanupOrphanDir kills FUSE processes attached to anything under dir,
-// unmounts every leaf, and removes the tree. Best-effort; logs failures.
+// cleanupOrphanDir kills FUSE processes attached to anything under dir
+// (a helper may be alive with nothing mounted yet), then clears dir like
+// any mount folder: unmounted first, never removed through a mount.
+// Best-effort; logs failures.
 func (m *Manager) cleanupOrphanDir(dir string) {
 	killFUSEProcessesFor(m.logger, dir)
-	unmountTree(m.logger, dir)
-	if err := os.RemoveAll(dir); err != nil {
+	if err := m.clearMountDir(dir); err != nil {
 		m.logger.Warn("mounts sweep: remove failed", "path", dir, "error", err)
 	}
 }
