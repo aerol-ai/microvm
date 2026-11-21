@@ -3,10 +3,15 @@ package containerd
 import (
 	"github.com/containerd/containerd/v2/contrib/seccomp"
 	"github.com/containerd/containerd/v2/pkg/oci"
+
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
 // securitySpecOpts assembles the default non-privileged security envelope
 // matching dockerd's runc defaults as closely as contrib/seccomp allows.
+// The data (capabilities, masked and read-only paths) comes from
+// internal/rootpolicy, which the root helper's containerd gate checks every
+// spec against, so the builder and the checker cannot drift apart.
 func securitySpecOpts() []oci.SpecOpts {
 	return []oci.SpecOpts{
 		seccomp.WithDefaultProfile(),
@@ -20,57 +25,12 @@ func securitySpecOpts() []oci.SpecOpts {
 	}
 }
 
-func defaultCapabilities() []string {
-	return []string{
-		"CAP_AUDIT_WRITE",
-		"CAP_CHOWN",
-		"CAP_DAC_OVERRIDE",
-		"CAP_FOWNER",
-		"CAP_FSETID",
-		"CAP_KILL",
-		"CAP_MKNOD",
-		"CAP_NET_BIND_SERVICE",
-		"CAP_SETFCAP",
-		"CAP_SETGID",
-		"CAP_SETPCAP",
-		"CAP_SETUID",
-		"CAP_SYS_CHROOT",
-	}
-}
+func defaultCapabilities() []string { return rootpolicy.SandboxCapabilities() }
 
-// droppedCapabilities are removed from every non-privileged sandbox.
-// CAP_NET_RAW lets a sandbox craft packets with a neighbour's source IP, which
-// would defeat every per-IP egress rule and poison the egress gateway's
-// source-IP identity (plans/egress-domain-filtering.md P0-2, CEO D8). Without
-// NET_RAW or NET_ADMIN the kernel enforces the configured source address.
-// ping and other raw-socket tools stop working inside sandboxes.
-func droppedCapabilities() []string {
-	return []string{"CAP_NET_RAW"}
-}
+// droppedCapabilities are removed from every non-privileged sandbox; see
+// rootpolicy.DroppedCapabilities for why CAP_NET_RAW is one.
+func droppedCapabilities() []string { return rootpolicy.DroppedCapabilities() }
 
-func defaultMaskedPaths() []string {
-	return []string{
-		"/proc/acpi",
-		"/proc/asound",
-		"/proc/kcore",
-		"/proc/keys",
-		"/proc/latency_stats",
-		"/proc/timer_list",
-		"/proc/timer_stats",
-		"/proc/sched_debug",
-		"/proc/scsi",
-		"/sys/firmware",
-		"/sys/devices/virtual/powercap",
-	}
-}
+func defaultMaskedPaths() []string { return rootpolicy.MaskedPaths() }
 
-func defaultReadonlyPaths() []string {
-	return []string{
-		"/proc/asound",
-		"/proc/bus",
-		"/proc/fs",
-		"/proc/irq",
-		"/proc/sys",
-		"/proc/sysrq-trigger",
-	}
-}
+func defaultReadonlyPaths() []string { return rootpolicy.ReadonlyPaths() }
