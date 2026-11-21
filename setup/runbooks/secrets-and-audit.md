@@ -91,6 +91,7 @@ only `ca.crt`, `node.crt`, and `node.key`.
 | `SandboxdKeyRevoked` | The customer's key store revoked the key; the node stopped | [Key revoked](#key-revoked) |
 | `SandboxdKeyVersionRetiredInUse` | Rows are on a key version the key store no longer decrypts | [Re-enable the version](#retired-key-version-in-use) |
 | `SandboxdKeyStoreThrottling` | The key store throttles over 5% of calls | [Raise its limit](#key-store-throttling) |
+| `SandboxdRootHelperRefusal` | The root helper refused a call from sandboxd: drift between the two, or a compromised sandboxd asking for root | Read the helper's own log on that node, then compare versions: [root helper refusal](#root-helper-refusal-sandboxdroothelperrefusal) |
 
 ## Audit export connectors
 
@@ -991,6 +992,55 @@ Notes:
   daemon-side destination attribution only — not guest secret-use proof.
   Byte totals remain on the netstats / controlplane path; per-destination
   bytes are not claimed. Disable with `SB_EGRESS_ATTRIBUTION_ENABLED=false`.
+
+## Root helper refusal (`SandboxdRootHelperRefusal`)
+
+The root helper (`aerolvm-rootd`) does root's work for sandboxd. It checks
+every request against fixed rules before it acts. sandboxd only sends
+requests its own code built, and those pass. So a refusal means one of two
+things:
+
+- **Drift.** sandboxd and the helper disagree about the rules, for example
+  after an upgrade that did not finish.
+- **A compromised sandboxd** that is asking for root.
+
+Treat it as a security incident until you rule out drift. The create that
+hit the refusal failed with a `500`. Nothing reached containerd or root.
+
+What the node records:
+
+- **sandboxd's audit log** gets a `rootd_refusal` record with the call
+  (`destination: call=Tasks.Create`), the reason and the node. It names no
+  sandbox and no path.
+- **`aerolvm_rootd_refusals_total{key=<call>,key2=<reason>}`** counts each
+  refusal. This alert reads it.
+- **The helper's own log** gets a `root helper refused` line with the call,
+  the reason, what broke the rule and `refusals_since_start`. The helper
+  writes it as root: in the worker pod's `runtime` container log on
+  Kubernetes, and in the `aerolvm-rootd` unit's journal on a VM.
+
+The first two belong to sandboxd, so a sandboxd someone controls can skip
+them. It cannot change the helper's line. A process that is not sandboxd
+and tries the helper's socket is refused with `peer_not_allowed`
+(`call=connect`); that refusal shows up only in the helper's log.
+
+What to check first:
+
+1. **Read the helper's log on that node** for the same window:
+   `kubectl logs <worker pod> -c runtime | grep 'root helper refused'`, or
+   `journalctl -u aerolvm-rootd | grep 'root helper refused'`. Leave out
+   `call=connect`. If the helper logged more refusals than sandboxd's metric
+   and audit log show, sandboxd is hiding them: take the node out of
+   service now.
+2. **Compare versions.** The helper logs `root helper: agent handshake` with
+   both versions. Two different releases point to drift: finish the upgrade
+   on that node.
+3. **Look at the reason.** With both on one release, sandboxd's own code
+   never sends a refused request. A reason such as `method_not_allowed` or
+   `unknown_field` there is an attack, not a bug, until shown otherwise.
+4. **If it is not drift,** decommission the node and keep the helper's log,
+   sandboxd's log and the audit records. A broken sandboxd reaches every
+   sandbox on its node and their secrets, but not root on the machine.
 
 ## Drill template
 

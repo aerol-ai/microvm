@@ -99,11 +99,11 @@ func TestFileCallsWithTheRealHelper(t *testing.T) {
 		}
 	}
 
-	// The helper's refusal of a value comes back as its own status, not as
-	// a helper that is down.
+	// The helper's refusal of a value comes back as a refusal over its own
+	// status, not as a helper that is down.
 	_, err = c.EnsureTaskFIFOs(ctx, "../etc")
-	if status.Code(err) != codes.InvalidArgument || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
-		t.Fatalf("a refused ID = %v, want the helper's InvalidArgument", err)
+	if status.Code(err) != codes.InvalidArgument || !errors.Is(err, ErrRefused) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Fatalf("a refused ID = %v, want ErrRefused over the helper's InvalidArgument", err)
 	}
 }
 

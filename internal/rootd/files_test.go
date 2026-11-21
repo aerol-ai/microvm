@@ -366,6 +366,10 @@ func TestFileCallsRefuse(t *testing.T) {
 			if ref := r.refused(); len(ref) != 1 || ref[0].Reason != ReasonBadRequest || !strings.HasPrefix(ref[0].Method, rootdpb.ServicePrefix) {
 				t.Fatalf("refusals %v, want one %s", ref, ReasonBadRequest)
 			}
+			// The agent reads the reason off the answer (eng review D9).
+			if reason, ok := rootdpb.RefusalReason(err); !ok || reason != ReasonBadRequest {
+				t.Fatalf("the answer's refusal reason is %q, %v; want %s", reason, ok, ReasonBadRequest)
+			}
 			if after := helperTree(t, r.cfg); !slices.Equal(before, after) {
 				t.Fatalf("a refused call changed the helper's folders: %v -> %v", before, after)
 			}
@@ -592,6 +596,9 @@ func TestReadySocketPlantsRefused(t *testing.T) {
 			if ref := r.refused(); len(ref) != 1 || ref[0].Reason != ReasonNotAgentSocket {
 				t.Fatalf("refusals %v", ref)
 			}
+			if reason, ok := rootdpb.RefusalReason(err); !ok || reason != ReasonNotAgentSocket {
+				t.Fatalf("the answer's refusal reason is %q, %v; want %s", reason, ok, ReasonNotAgentSocket)
+			}
 			names, _ := os.ReadDir(filepath.Join(r.cfg.Files.Ready, testCID))
 			if len(names) != 0 {
 				t.Fatalf("the helper's ready folder holds %v after a refusal", names)
@@ -607,7 +614,7 @@ func TestEnsureReadySocketFails(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err := helperClient(r).EnsureReadySocket(callCtx(t), &rootdpb.EnsureReadySocketRequest{ContainerId: testCID})
-		if status.Code(err) != codes.NotFound || len(r.refused()) != 0 {
+		if _, refused := rootdpb.RefusalReason(err); status.Code(err) != codes.NotFound || len(r.refused()) != 0 || refused {
 			t.Fatalf("err %v, refusals %v; want NotFound, no refusal (a bug, not an attack)", err, r.refused())
 		}
 	})

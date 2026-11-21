@@ -378,7 +378,10 @@ func TestCallErrors(t *testing.T) {
 		{"ok", nil, nil, codes.OK},
 		{"unimplemented after all", status.Error(codes.Unimplemented, "no"), ErrUnsupported, codes.Unknown},
 		{"unavailable", status.Error(codes.Unavailable, "restarting"), ErrUnavailable, codes.Unknown},
-		{"refused", status.Error(codes.PermissionDenied, "aerolvm root helper refused"), nil, codes.PermissionDenied},
+		{"refused", rootdpb.Refused(codes.PermissionDenied, "not_agent_socket", "aerolvm root helper refused"), ErrRefused, codes.Unknown},
+		// A PermissionDenied without the helper's refusal mark is passed
+		// on as it is: only the helper's own mark makes a refusal.
+		{"denied, unmarked", status.Error(codes.PermissionDenied, "denied"), nil, codes.PermissionDenied},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sock := sockPath(t)

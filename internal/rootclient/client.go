@@ -20,6 +20,10 @@
 // which calls this helper serves; a call it lacks is refused here, before
 // it is sent, with an UnsupportedError naming the call and the helper.
 //
+// A call the helper or its gate refuses, on either path, comes back as an
+// error matching ErrRefused, which the API turns into a 500, and is
+// counted and handed to Config.OnRefusal (refusal.go, eng review D9).
+//
 // Nothing uses this yet; the agent moves onto it in task T4.
 package rootclient
 
@@ -117,6 +121,17 @@ type Config struct {
 	// bind the socket's path otherwise gets every containerd spec the agent
 	// sends and answers for the helper (review M3).
 	HelperUID uint32
+	// OnRefusal hears every call the helper or its gate refuses, on the
+	// helper's own calls and on containerd's (refusal.go). sandboxd sets it
+	// to (*service.Service).RecordRootRefusal, which writes the audit
+	// record; task T4 wires it where the daemon builds this client, after
+	// the service exists:
+	//
+	//	rootclient.New(rootclient.Config{..., OnRefusal: svc.RecordRootRefusal})
+	//
+	// Nil records no audit event. The client counts every refusal in
+	// aerolvm_rootd_refusals_total either way.
+	OnRefusal RefusalFunc
 }
 
 // session is one connection to the helper and what its handshake said.
@@ -144,6 +159,7 @@ type Client struct {
 	timeout      time.Duration
 	agentVersion string
 	peer         egress.PeerCheck
+	onRefusal    RefusalFunc
 
 	ready    atomic.Bool // latch: a handshake succeeded on the current session
 	mu       sync.Mutex  // single flight: guards inflight, closed and session swaps
@@ -160,7 +176,7 @@ type Client struct {
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
 	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, agentVersion: cfg.AgentVersion,
-		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, "")}
+		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal}
 	if c.socket == "" {
 		c.socket = DefaultSocket
 	}
@@ -357,8 +373,8 @@ func (c *Client) EnsureHost(ctx context.Context) error {
 // containerd shim open as root, in folders only root can write
 // (internal/rootd files.go). Each answers with the paths the agent puts in
 // its specs; the agent never names a path itself. A value the helper
-// refuses comes back as InvalidArgument or PermissionDenied, as the
-// helper's own status.
+// refuses comes back as a RefusedError, which unwraps to the helper's
+// InvalidArgument or PermissionDenied.
 
 // EnsureHostFiles has the helper write a container's hostname, hosts and
 // resolv.conf files, and the egress CA when the request has one.
@@ -428,12 +444,17 @@ func (c *Client) callContext(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, c.timeout)
 }
 
-// callErr turns a typed call's gRPC error into the client's own. A helper
-// that went away, did not answer in time, or whose connection this client
-// closed under the call (a failed re-handshake) is ErrUnavailable; a call
-// it turns out not to have is an UnsupportedError. A cancel that is the
-// caller's own, and anything else the helper answered, comes back as it is.
+// callErr turns a typed call's gRPC error into the client's own. A refusal
+// (the helper's HelperRefused detail) is recorded and is a RefusedError. A
+// helper that went away, did not answer in time, or whose connection this
+// client closed under the call (a failed re-handshake) is ErrUnavailable;
+// a call it turns out not to have is an UnsupportedError. A cancel that is
+// the caller's own, and anything else the helper answered, comes back as
+// it is.
 func (c *Client) callErr(ctx context.Context, s *session, feature string, err error) error {
+	if reason, ok := rootdpb.RefusalReason(err); ok {
+		return &RefusedError{Refusal: c.refused(ctx, ownMethod(feature), reason), Err: err}
+	}
 	switch status.Code(err) {
 	case codes.OK:
 		return nil
@@ -511,21 +532,25 @@ func (c *Client) ContainerdOptions() []cntr.Opt {
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			var trailer metadata.MD
 			err := invoker(ctx, method, req, reply, cc, append(opts, grpc.Trailer(&trailer))...)
-			return c.markFailure(err, trailer)
+			return c.markFailure(ctx, method, err, trailer, nil)
 		}),
 		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 			s, err := streamer(ctx, desc, cc, method, opts...)
 			if err != nil {
-				return nil, c.markFailure(err, nil)
+				return nil, c.markFailure(ctx, method, err, nil, nil)
 			}
-			return markedStream{s, c}, nil
+			return &markedStream{ClientStream: s, c: c, method: method}, nil
 		}),
 	})}
 }
 
-// markFailure marks a containerd call that failed for want of the helper,
-// so the API answers it as it answers the helper's own calls:
+// markFailure marks a containerd call that the helper refused, or that
+// failed for want of the helper, so the API answers it as it answers the
+// helper's own calls:
 //
+//   - a refusal (the gate's HelperRefused detail): recorded once (reported
+//     dedups a stream's repeated receives) and ErrRefused, never
+//     ErrUnavailable: the helper answered, and a retry meets it again;
 //   - a helper older than this agent (the dialer's handshake said so, in
 //     the error or in c.tooOld): ErrUnsupported, with the reason, "upgrade
 //     the helper" (review N5);
@@ -541,7 +566,7 @@ func (c *Client) ContainerdOptions() []cntr.Opt {
 // status (rootdpb.HelperUnavailable or HelperUnsupported), for the calls
 // containerd converts, and in the chain of the error returned, for the
 // calls it hands back as they are (review M1).
-func (c *Client) markFailure(err error, trailer metadata.MD) error {
+func (c *Client) markFailure(ctx context.Context, method string, err error, trailer metadata.MD, reported *atomic.Bool) error {
 	var already *marked
 	if err == nil || errors.As(err, &already) {
 		return err
@@ -549,6 +574,15 @@ func (c *Client) markFailure(err error, trailer metadata.MD) error {
 	st, ok := status.FromError(err)
 	if !ok {
 		return err
+	}
+	if reason, refused := rootdpb.RefusalReason(err); refused {
+		if reported == nil || reported.CompareAndSwap(false, true) {
+			c.refused(ctx, method, reason)
+		}
+		// The status keeps the helper's detail, which is an error matching
+		// ErrRefused, so the error containerd's client rebuilds from it
+		// still matches.
+		return &marked{st: st, is: ErrRefused}
 	}
 	ue, unreached := (*UnsupportedError)(nil), st.Code() == codes.Unavailable && len(trailer.Get(rootdpb.AnsweredTrailer)) == 0
 	if !errors.As(err, &ue) && unreached {
@@ -581,23 +615,29 @@ func (e *marked) GRPCStatus() *status.Status { return e.st }
 func (e *marked) Is(target error) bool       { return target == e.is }
 
 // markedStream marks the errors of a streaming call (an event
-// subscription, a container list) as markFailure does. The trailer is read
-// only after a receive failed, when gRPC has it; a failed send is the
-// connection's.
+// subscription, a container list, a content write) as markFailure does.
+// The trailer is read only after a receive failed, when gRPC has it; a
+// failed send is the connection's.
 type markedStream struct {
 	grpc.ClientStream
-	c *Client
+	c      *Client
+	method string
+	// reported holds a refusal to one record: gRPC answers every receive
+	// after a failed one with the same status.
+	reported atomic.Bool
 }
 
-func (s markedStream) RecvMsg(m any) error {
+func (s *markedStream) RecvMsg(m any) error {
 	err := s.ClientStream.RecvMsg(m)
 	if err == nil || errors.Is(err, io.EOF) {
 		return err
 	}
-	return s.c.markFailure(err, s.Trailer())
+	return s.c.markFailure(s.Context(), s.method, err, s.Trailer(), &s.reported)
 }
 
-func (s markedStream) SendMsg(m any) error { return s.c.markFailure(s.ClientStream.SendMsg(m), nil) }
+func (s *markedStream) SendMsg(m any) error {
+	return s.c.markFailure(s.Context(), s.method, s.ClientStream.SendMsg(m), nil, &s.reported)
+}
 
 func connectParams(timeout time.Duration) grpc.ConnectParams {
 	bc := backoff.DefaultConfig

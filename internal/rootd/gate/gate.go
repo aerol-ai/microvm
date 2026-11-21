@@ -13,8 +13,10 @@
 // A refusal should never happen: the agent only sends what its own builder
 // made, and the builder's output passes (the conformance test in
 // internal/runtime/containerd). So a refusal means drift or a compromised
-// agent, and each one goes to the OnRefusal callback for an audit event, a
-// metric and an alert (eng review D9).
+// agent (eng review D9). Each one goes to the OnRefusal callback, the
+// helper's own record, and its answer carries the reason
+// (rootdpb.HelperRefused), from which the agent's client writes the audit
+// event and counts the metric the alert reads.
 //
 // Calls run in parallel; the gate holds no lock and no state of its own
 // (eng review D11). Nothing here is wired into sandboxd or the helper yet.
@@ -36,6 +38,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
@@ -262,11 +265,14 @@ func (g *Gate) check(ctx context.Context, m *method, r proto.Message) error {
 	return err
 }
 
+// refuse reports a refusal and answers it. The answer carries the reason
+// as a rootdpb.HelperRefused detail, which is how the agent's client tells
+// a refusal from containerd's own errors and records it (eng review D9).
 func (g *Gate) refuse(ctx context.Context, method, reason, detail string) error {
 	if g.onRefusal != nil {
 		g.onRefusal(ctx, Refusal{Method: method, Reason: reason, Detail: detail})
 	}
-	return status.Errorf(codes.PermissionDenied, "aerolvm root gate refused %s (%s): %s", method, reason, detail)
+	return rootdpb.Refused(codes.PermissionDenied, reason, fmt.Sprintf("aerolvm root gate refused %s (%s): %s", method, reason, detail))
 }
 
 // forwarded is the metadata containerd reads: the namespace (already
