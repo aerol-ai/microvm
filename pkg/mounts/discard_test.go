@@ -13,17 +13,20 @@ import (
 	"github.com/aerol-ai/microvm/pkg/mounts/adapters"
 )
 
-// Discard is how the service refuses a sandbox's stored mounts on start or
-// restart: tracked mounts are torn down, and whatever a previous sandboxd
-// left in the sandbox's directory is cleared, the way Sweep clears an
-// orphan, so a refused helper stops serving.
+// Discard is how the service refuses a sandbox's stored mounts on start, and
+// tears down a running sandbox's after a restart when they may not run on:
+// tracked mounts are torn down, and whatever a previous sandboxd left in
+// the sandbox's directory is cleared, the way Sweep clears an orphan, so a
+// refused helper stops serving. It reports whether there was anything.
 func TestDiscard(t *testing.T) {
 	t.Run("tracked mounts", func(t *testing.T) {
 		m := newTestManager(t, map[models.MountType]adapters.Adapter{models.MountTypeNFS: fakeAdapter{}})
 		if _, err := m.MountAll(t.Context(), "sb-tracked", []models.MountSpec{{Type: models.MountTypeNFS, Target: "/n"}}); err != nil {
 			t.Fatalf("MountAll: %v", err)
 		}
-		m.Discard("sb-tracked")
+		if !m.Discard("sb-tracked") {
+			t.Fatal("Discard reported nothing torn down")
+		}
 		if binds := m.HostBindsFor("sb-tracked"); len(binds) != 0 {
 			t.Fatalf("still tracked: %v", binds)
 		}
@@ -40,7 +43,9 @@ func TestDiscard(t *testing.T) {
 		if err := os.MkdirAll(left, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		m.Discard("sb-left")
+		if !m.Discard("sb-left") {
+			t.Fatal("Discard reported nothing torn down")
+		}
 		if _, err := os.Stat(filepath.Dir(left)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("directory left: %v", err)
 		}
@@ -64,7 +69,9 @@ func TestDiscard(t *testing.T) {
 		}
 		fakeMountTable(t, hostPath)
 		stubUmount(t, func(string) bool { return false })
-		m.Discard("sb-stuck")
+		if !m.Discard("sb-stuck") {
+			t.Fatal("Discard reported nothing torn down")
+		}
 		if _, err := os.Stat(kept); err != nil {
 			t.Fatalf("Discard deleted through a live mount: %v", err)
 		}
@@ -84,7 +91,9 @@ func TestDiscard(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer release()
-		m.Discard("sb-busy")
+		if m.Discard("sb-busy") {
+			t.Fatal("Discard reported a teardown it left to the MountAll")
+		}
 		if _, err := os.Stat(dir); err != nil {
 			t.Fatalf("removed a directory a MountAll owns: %v", err)
 		}
@@ -92,17 +101,23 @@ func TestDiscard(t *testing.T) {
 
 	t.Run("nothing there, a bad id, no manager", func(t *testing.T) {
 		m := newTestManager(t, nil)
-		m.Discard("sb-none")
+		if m.Discard("sb-none") {
+			t.Fatal("Discard reported a teardown with nothing there")
+		}
 		outside := filepath.Join(filepath.Dir(m.rootDir), "keep")
 		if err := os.MkdirAll(outside, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		m.Discard("../keep")
+		if m.Discard("../keep") {
+			t.Fatal("Discard reported a teardown for a '..' id")
+		}
 		if _, err := os.Stat(outside); err != nil {
 			t.Fatalf("a '..' id reached outside the root: %v", err)
 		}
 		var none *Manager
-		none.Discard("sb-x")
+		if none.Discard("sb-x") {
+			t.Fatal("a nil manager reported a teardown")
+		}
 	})
 }
 

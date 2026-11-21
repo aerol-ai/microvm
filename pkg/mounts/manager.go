@@ -90,6 +90,9 @@ type mountState struct {
 	lastCrash  time.Time
 	supervised bool
 	disabled   bool // true after we've given up restarting
+	// kept is a mount KeepLive took over as it ran: its spec is refused,
+	// so its tool is never started again, not even to restart it.
+	kept bool
 
 	// proc is a tool a previous sandboxd started and this one adopted
 	// (adoptOne); cmd is nil while it runs. A restart starts cmd instead.
@@ -468,32 +471,114 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 // refused helper does not keep running after a restart. The untracked part
 // is claimed the way Sweep claims an orphan, so a MountAll in flight for
 // the ID keeps its directory: Discard leaves it to that call. Either way
-// the folder goes through clearMountDir, never through a live mount.
-func (m *Manager) Discard(sandboxID string) {
+// the folder goes through clearMountDir, never through a live mount. It
+// reports whether there was anything to tear down, so a caller that runs
+// on every reconcile pass reports a teardown once.
+func (m *Manager) Discard(sandboxID string) bool {
 	if m == nil {
-		return
+		return false
 	}
 	m.mu.Lock()
 	_, tracked := m.state[sandboxID]
 	m.mu.Unlock()
 	if tracked {
 		_ = m.UnmountAll(sandboxID)
-		return
+		return true
 	}
 	dir, ok := m.mountFolder(sandboxID)
 	if !ok {
-		return
+		return false
 	}
 	done, _ := m.claimOrphan(sandboxID)
 	if done == nil {
-		return
+		return false
 	}
 	defer m.releaseOrphan(sandboxID, done)
 	if _, err := os.Stat(dir); err != nil {
-		return
+		return false
 	}
 	m.logger.Info("mounts: discarding refused mounts", "sandbox_id", sandboxID, "path", dir)
 	m.cleanupOrphanDir(dir)
+	return true
+}
+
+// KeepReport is what KeepLive did with a sandbox's mounts.
+type KeepReport struct {
+	// Kept lists the mounts (by index) taken over as they ran. Gone lists
+	// the ones nothing served, or that could not be taken over as they
+	// were; they are cleared and stay unmounted.
+	Kept, Gone []int
+	// Already is true when this process already owned the sandbox's
+	// mounts (a later reconcile pass); KeepLive then did nothing.
+	Already bool
+}
+
+// KeepLive takes over the mounts a previous sandboxd left serving
+// sandboxID, as they run, and starts nothing: no mount is made afresh, and
+// a kept tool that exits is not restarted (mountState.kept). The service
+// calls it for a sandbox still running across a restart whose stored
+// specs the allow lists now refuse but which may stay while they run
+// (models.MountSpec.ValidateRunningToolOptions): tearing the mount down
+// would break the sandbox's storage and stop nothing that matters, and
+// mounting it again would run the refused spec once more. A mount that
+// cannot be taken over as it is (not live, a helper running other
+// arguments, a kernel mount that will not take nosuid,nodev) is cleared as
+// Reestablish clears one before mounting afresh, and left unmounted. The
+// set is tracked like any other, even when nothing was kept, so Sweep
+// leaves it alone, a later pass does nothing, and stop or Discard tears
+// down what was kept. Like mountSet, it owns the folder while it works.
+func (m *Manager) KeepLive(ctx context.Context, sandboxID string, mounts []models.MountSpec) (KeepReport, error) {
+	if m == nil || len(mounts) == 0 {
+		return KeepReport{}, nil
+	}
+	if err := models.ValidateSandboxID(sandboxID); err != nil {
+		return KeepReport{}, fmt.Errorf("mount: %w", err)
+	}
+	release, err := m.beginMount(ctx, sandboxID)
+	if err != nil {
+		return KeepReport{}, fmt.Errorf("mount: %w", err)
+	}
+	defer release()
+	m.mu.Lock()
+	_, tracked := m.state[sandboxID]
+	busy := m.mounting[sandboxID] > 1
+	m.mu.Unlock()
+	if tracked {
+		return KeepReport{Already: true}, nil
+	}
+	if busy {
+		return KeepReport{}, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
+	}
+	var report KeepReport
+	kept := make([]*mountState, 0, len(mounts))
+	var helpers []helperProcess
+	dir, _ := m.mountFolder(sandboxID)
+	_, statErr := os.Stat(dir)
+	if statErr == nil {
+		helpers = m.listHelperProcesses()
+	}
+	for i, spec := range mounts {
+		var state *mountState
+		if statErr == nil {
+			state, _ = m.adoptOne(sandboxID, i, spec, helpers)
+		}
+		if state == nil {
+			if statErr == nil {
+				m.clearStaleMount(sandboxID, i, helpers)
+			}
+			report.Gone = append(report.Gone, i)
+			continue
+		}
+		// Set before the state is stored under mu, which is where
+		// superviseExit reads it.
+		state.kept = true
+		kept = append(kept, state)
+		report.Kept = append(report.Kept, i)
+	}
+	m.mu.Lock()
+	m.state[sandboxID] = kept
+	m.mu.Unlock()
+	return report, nil
 }
 
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
@@ -636,6 +721,14 @@ func (m *Manager) superviseExit(state *mountState) {
 		return
 	}
 	if state.disabled {
+		return
+	}
+	if state.kept {
+		// Restarting it would run the refused spec again.
+		state.disabled = true
+		m.logger.Warn("mounts: a kept mount's tool exited; it is not started again, as its stored options are refused",
+			"sandbox_id", state.sandboxID, "index", state.index, "type", string(state.spec.Type), "error", err)
+		_ = unmountPath(state.hostPath)
 		return
 	}
 

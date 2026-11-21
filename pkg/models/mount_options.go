@@ -3,6 +3,7 @@ package models
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"slices"
 	"strings"
@@ -37,6 +38,7 @@ const (
 	mountArgEnum                      // one of a fixed list of words
 	mountArgToken                     // a plain name: a region, a KMS key ARN
 	mountArgURL                       // an http or https URL
+	mountArgWord                      // any word not starting with -: only on the kept lists
 )
 
 // mountArg says what value one allowed flag takes. For mountArgUint, words
@@ -144,6 +146,60 @@ var mountNFSOptions = func() map[string]mountArg {
 	return opts
 }()
 
+// A sandbox still running when sandboxd restarts (the upgrade that brought
+// these lists in, say) may hold a mount whose stored spec the lists now
+// refuse. Its tool is already running, so tearing it down only breaks the
+// sandbox's storage; the service keeps it as it runs and refuses the spec
+// at the sandbox's next start (internal/service/mount_tool_options.go).
+// That holds only for a refused flag that does no harm while the tool goes
+// on running: the kept lists below, default deny like the lists above. Any
+// other refusal means the running tool itself keeps reaching into the
+// server (a folder it serves or writes, a command it runs again, the
+// server's own credentials or network identity), and the mount is torn
+// down. Every rclone refusal is one: rclone's lists are only about the
+// storage the running tool reaches, and it re-reads key files and re-runs
+// ssh on every reconnect.
+
+// mountS3KeptFlags may stay in a running mount-s3's extra_args.
+var mountS3KeptFlags = map[string]mountArg{
+	// mount-s3 keeps its block cache in a folder it makes for itself under
+	// this one, with names it chooses.
+	"--cache":          {kind: mountArgWord},
+	"--max-cache-size": {kind: mountArgUint},
+	// How much it logs. With no --log-directory (refused, and not kept) the
+	// output is the helper log sandboxd keeps and trims.
+	"--debug": {}, "-d": {}, "--debug-crt": {}, "--log-metrics": {}, "--no-log": {},
+	// Acts only when the mount ends.
+	"--auto-unmount": {},
+}
+
+// mountNFSKeptOptions may stay in a running NFS mount's opts. The kernel
+// holds the mount and no tool runs. suid and dev (defaults has both) are
+// cleared on the host mount when it is taken over (mounts.adoptOne
+// remounts it nosuid,nodev, and one that will not take them is not kept);
+// the sandbox's bind keeps its flags until the next start, which these
+// options never reach. bg, fg, auto and noauto only steer mounting, which
+// is done; nouser is mount's default (only root unmounts); fsc uses the
+// kernel's own cache, whose folder the operator set.
+var mountNFSKeptOptions = []string{"defaults", "suid", "dev", "bg", "fg", "fsc", "auto", "noauto", "nouser"}
+
+var (
+	mountS3RunningFlags    = mergeMountArgs(mountS3Flags, mountS3KeptFlags)
+	mountNFSRunningOptions = mergeMountArgs(mountNFSOptions, func() map[string]mountArg {
+		kept := make(map[string]mountArg, len(mountNFSKeptOptions))
+		for _, o := range mountNFSKeptOptions {
+			kept[o] = mountArg{}
+		}
+		return kept
+	}())
+)
+
+func mergeMountArgs(a, b map[string]mountArg) map[string]mountArg {
+	out := maps.Clone(a)
+	maps.Copy(out, b)
+	return out
+}
+
 // mountValueOptions are the options keys an adapter passes as the value of
 // a flag it sets itself (--region, --endpoint-url, --vfs-cache-mode=). Such
 // a value cannot become a flag of its own there; checking it gives the
@@ -176,29 +232,53 @@ const mountOptionsDocs = `see "Which flags are accepted" in the external storage
 // caller pasted.
 //
 // The service holds every path that runs a mount tool to it: create, a
-// failover rebuild, start, and the reconcile after a restart, which
-// refuses a spec stored before the lists existed rather than run it again
-// (internal/service/mount_tool_options.go). Platform volumes' mounts are
-// the operator's, checked once at daemon start instead
+// failover rebuild, start, and the reconcile and WASM adopt after a
+// restart, which never run a refused spec again: a mount still running
+// is kept or torn down (ValidateRunningToolOptions), and the next start is
+// refused (internal/service/mount_tool_options.go). Platform volumes'
+// mounts are the operator's, checked once at daemon start instead
 // (config.PlatformVolumesConfig.Validate).
 func (m *MountSpec) ValidateToolOptions() error {
+	return m.validateToolOptions(false)
+}
+
+// ValidateRunningToolOptions is the check a mount gets that is already
+// running, with a spec ValidateToolOptions refuses, when sandboxd restarts.
+// It passes when every refused flag is on the kept lists
+// (mountS3KeptFlags, mountNFSKeptOptions), so the running mount may stay
+// as it is until the sandbox next starts; an error names the first flag
+// that may not, and the mount is torn down. extra_args and opts on a type
+// whose tool does not read them pass: they never reached a tool.
+func (m *MountSpec) ValidateRunningToolOptions() error {
+	return m.validateToolOptions(true)
+}
+
+func (m *MountSpec) validateToolOptions(running bool) error {
 	if m == nil {
 		return errors.New("mount is nil")
 	}
+	s3Flags, nfsOpts := mountS3Flags, mountNFSOptions
+	if running {
+		s3Flags, nfsOpts = mountS3RunningFlags, mountNFSRunningOptions
+	}
 	if extra := m.Options["extra_args"]; strings.TrimSpace(extra) != "" {
-		if m.Type != MountTypeS3 {
+		switch {
+		case m.Type == MountTypeS3:
+			if err := validateS3ExtraArgs(extra, s3Flags); err != nil {
+				return err
+			}
+		case !running:
 			return fmt.Errorf("options.extra_args is read only by s3 mounts, not %s", m.Type)
-		}
-		if err := validateS3ExtraArgs(extra); err != nil {
-			return err
 		}
 	}
 	if opts := m.Options["opts"]; opts != "" {
-		if m.Type != MountTypeNFS {
+		switch {
+		case m.Type == MountTypeNFS:
+			if err := validateNFSOpts(opts, nfsOpts); err != nil {
+				return err
+			}
+		case !running:
 			return fmt.Errorf("options.opts is read only by nfs mounts, not %s", m.Type)
-		}
-		if err := validateNFSOpts(opts); err != nil {
-			return err
 		}
 	}
 	for _, o := range mountValueOptions[m.Type] {
@@ -216,8 +296,9 @@ func (m *MountSpec) ValidateToolOptions() error {
 
 // validateS3ExtraArgs walks extra_args the way the S3 adapter splits it
 // (whitespace) and mount-s3 parses it: --flag, --flag=value, or --flag
-// followed by its value as the next word.
-func validateS3ExtraArgs(extra string) error {
+// followed by its value as the next word. flags is mountS3Flags, or
+// mountS3RunningFlags for a running mount.
+func validateS3ExtraArgs(extra string, flags map[string]mountArg) error {
 	words := strings.Fields(extra)
 	for i := 0; i < len(words); i++ {
 		if !strings.HasPrefix(words[i], "-") {
@@ -226,7 +307,7 @@ func validateS3ExtraArgs(extra string) error {
 		// Short flags (-l, -d) and a bare "--" are not in the table, so
 		// they are refused here too.
 		name, value, hasValue := strings.Cut(words[i], "=")
-		arg, ok := mountS3Flags[name]
+		arg, ok := flags[name]
 		if !ok {
 			return fmt.Errorf("options.extra_args flag %q is not allowed for s3 mounts: mount-s3 runs on the server, so only flags that tune the mount are accepted (%s)", name, mountOptionsDocs)
 		}
@@ -253,8 +334,9 @@ func validateS3ExtraArgs(extra string) error {
 // validateNFSOpts checks the comma-separated -o list. The adapter hands
 // the string to mount unchanged, so whitespace and quotes are refused
 // outright: mount would read a quoted value as one value even across a
-// comma, and that is how a second option hides inside the first.
-func validateNFSOpts(opts string) error {
+// comma, and that is how a second option hides inside the first. options
+// is mountNFSOptions, or mountNFSRunningOptions for a running mount.
+func validateNFSOpts(opts string, options map[string]mountArg) error {
 	if strings.ContainsFunc(opts, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || r == '"' || r == '\'' }) {
 		return errors.New("options.opts must not contain spaces or quotes: give NFS options as name or name=value, separated by commas")
 	}
@@ -263,7 +345,7 @@ func validateNFSOpts(opts string) error {
 			continue // mount skips an empty entry, as in a trailing comma
 		}
 		name, value, hasValue := strings.Cut(entry, "=")
-		arg, ok := mountNFSOptions[name]
+		arg, ok := options[name]
 		if !ok {
 			return fmt.Errorf("options.opts entry %q is not allowed for nfs mounts: mount runs on the server, so only NFS tuning options are accepted (%s)", name, mountOptionsDocs)
 		}
@@ -319,6 +401,11 @@ func (a mountArg) check(v string) string {
 			return ""
 		}
 		return "takes an http or https URL with no user name or password"
+	case mountArgWord:
+		if v != "" && !strings.HasPrefix(v, "-") {
+			return ""
+		}
+		return "takes a value that does not start with -"
 	default:
 		return "takes no value"
 	}

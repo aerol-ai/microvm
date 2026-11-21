@@ -913,6 +913,10 @@ type Service struct {
 	// testVolumeMeta, when non-nil, replaces volumeMeta() so reclaim / attach
 	// failure arms can be forced without a store wrapper. Nil in production.
 	testVolumeMeta volumeMetaStore
+	// testRunningMounts, when non-nil, replaces the mount manager where a
+	// restart takes over a running sandbox's mounts (runningMounts), so a
+	// test sees which way reestablishRunningMounts went. Nil in production.
+	testRunningMounts runningMountSet
 	// testForceFleetSuspendErr, when non-nil, replaces SetFleetSuspended's
 	// result in StopByOwner so the non-NotFound error arm is reachable.
 	// Nil in production.
@@ -7380,11 +7384,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.syncAllowedPorts(ctx, sandbox)
 			// Re-establish host-side mounts for running sandboxes after a
 			// sandboxd restart. Idempotent — only mounts that aren't already
-			// tracked are spawned.
+			// tracked are spawned. A stored spec the allow lists refuse is
+			// kept as it runs or torn down, never run again
+			// (reestablishRunningMounts).
 			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
 			} else if len(specs) > 0 {
-				if err := s.reestablishMounts(ctx, sandbox.ID, specs); err != nil {
+				if err := s.reestablishRunningMounts(ctx, sandbox.ID, specs); err != nil {
 					s.logger.Warn("reestablish mounts", "sandbox_id", sandbox.ID, "error", err)
 				}
 			}
