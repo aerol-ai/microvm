@@ -149,6 +149,10 @@ type session struct {
 	// may have come between the handshake and that count. A later dial
 	// means the helper may have been swapped for a newer one.
 	gen uint64
+	// stale is set when a call this helper listed comes back
+	// Unimplemented: the helper behind the connection is no longer the
+	// one that answered the handshake, so info is asked for again.
+	stale atomic.Bool
 }
 
 // attempt is a handshake in flight; callers that arrive during it share
@@ -346,15 +350,17 @@ func (c *Client) require(ctx context.Context, feature string) (*session, error) 
 	if s == nil { // closed, or dropped by a failed refresh, since Ensure
 		return nil, c.noSession()
 	}
-	if s.info.Has(feature) {
-		// Helpers only move forward (eng review D4), so a feature the
-		// helper had is still there; no need to look again.
+	if s.info.Has(feature) && !s.stale.Load() {
+		// Helpers move forward (eng review D4), so a feature the helper
+		// had is still there; no need to look again. The one way back, a
+		// supervisor's rollback, shows as a listed call that is
+		// Unimplemented (callErr), which marks the session stale.
 		return s, nil
 	}
 	// A connection lost or made since the handshake may be a newer helper
 	// (the swap closes the old one's connections): ask again before
 	// refusing, once per connection.
-	if s.gen != c.dials.Load() || s.conn.GetState() != connectivity.Ready {
+	if s.stale.Load() || s.gen != c.dials.Load() || s.conn.GetState() != connectivity.Ready {
 		if err := c.handshake(ctx, s); err != nil {
 			return nil, err
 		}
@@ -570,6 +576,12 @@ func (c *Client) callErr(ctx context.Context, s *session, feature string, err er
 			return c.unavailable(err)
 		}
 	case codes.Unimplemented:
+		if s.info.Has(feature) {
+			// The handshake listed it, so another helper answers now: an
+			// older copy a supervisor went back to. Ask again on the next
+			// call rather than trust the old list until sandboxd restarts.
+			s.stale.Store(true)
+		}
 		return &UnsupportedError{Feature: feature, Helper: s.info}
 	}
 	return err

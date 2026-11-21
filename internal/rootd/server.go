@@ -220,9 +220,11 @@ func (s *Server) Shutdown(ctx context.Context) {
 }
 
 // endlessCalls end only when their caller ends them: the agent's
-// containerd event subscription. Ending one is safe: it is a read, and the
-// agent subscribes again, to the next helper, as it does after containerd
-// restarts.
+// containerd event subscription. Ending one is safe for the helper: it is
+// a read, and the agent subscribes again, to the next helper. Unlike a
+// containerd restart, containerd keeps sending events while the agent has
+// no subscription, and none is replayed, so the agent must check its
+// tasks' states once it has subscribed again (its split-mode wiring).
 var endlessCalls = map[string]bool{"/containerd.services.events.v1.Events/Subscribe": true}
 
 // endOnDrain gives each endless call a cancel that Shutdown uses, and

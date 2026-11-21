@@ -468,6 +468,82 @@ func TestHelperRollback(t *testing.T) {
 	}
 }
 
+// TestHelperThatServedIsKept: a new helper that says it serves, however
+// late, has taken the agent's calls and told it what it offers, so the
+// supervisor never goes back to the older copy after that: it starts the
+// newer one again instead (review T3-1).
+func TestHelperThatServedIsKept(t *testing.T) {
+	const wait = 40 * time.Millisecond
+	for _, tc := range []struct {
+		name   string
+		behave func(c *fakeChild)
+	}{
+		{"says it serves while it is being stopped", func(c *fakeChild) {
+			c.mu.Lock()
+			c.exitOn = nil
+			c.mu.Unlock()
+			for !slices.Contains(c.got(), syscall.SIGTERM) {
+				time.Sleep(time.Millisecond)
+			}
+			c.serve()
+			c.exit()
+		}},
+		{"serves, then exits at once", func(c *fakeChild) {
+			c.serve()
+			c.exit()
+		}},
+		{"says it serves as the wait runs out", func(c *fakeChild) {
+			// Like the real helper, it finishes starting before it
+			// handles SIGTERM, then drains and exits.
+			c.mu.Lock()
+			c.exitOn = []syscall.Signal{syscall.SIGKILL}
+			c.mu.Unlock()
+			time.Sleep(wait)
+			c.serve()
+			for !slices.Contains(c.got(), syscall.SIGTERM) {
+				select {
+				case <-c.done:
+					return
+				case <-time.After(time.Millisecond):
+				}
+			}
+			c.exit()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < 10; i++ {
+				r := newKeeperRig(t, func(k *HelperKeeper) { k.ReadyWait = wait })
+				r.behave = func(n int, c *fakeChild) {
+					if n == 1 {
+						tc.behave(c)
+						return
+					}
+					c.serve()
+				}
+				r.rel.stage([]byte("helper v1"), "v1.0.0")
+				r.run()
+				first := r.waitStarts(1)[0]
+				r.rel.stage([]byte("helper v2"), "v1.0.1")
+				second := r.waitStarts(2)[1]
+				// Long enough for a rollback, a restart, or both.
+				time.Sleep(4 * wait)
+				for n, c := range r.starts()[2:] {
+					if c.bin == first.bin {
+						t.Fatalf("start %d ran v1's copy again after v2 said it serves; logs:\n%s", n+2, r.logs.String())
+					}
+					if c.bin != second.bin {
+						t.Fatalf("start %d ran %s, want v2's copy %s", n+2, c.bin, second.bin)
+					}
+				}
+				if strings.Contains(r.logs.String(), "the old one runs again") {
+					t.Fatalf("rolled back; logs:\n%s", r.logs.String())
+				}
+				r.stop()
+			}
+		})
+	}
+}
+
 // TestHelperRetriesAFailedSwapLater: after RetryFailed the same staged
 // helper is tried again, and this time it runs.
 func TestHelperRetriesAFailedSwapLater(t *testing.T) {

@@ -3,6 +3,7 @@ package rootclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -77,7 +78,7 @@ func newOwnedSocket(t *testing.T) ownedSocket {
 
 // serve runs h on a copy of the socket; the trailer interceptor marks
 // every answer as the helper's, as rootd's server does.
-func (o ownedSocket) serve(t *testing.T, h *swapHelper) *grpc.Server {
+func (o ownedSocket) serve(t *testing.T, h rootdpb.RootHelperServer) *grpc.Server {
 	t.Helper()
 	ln, err := net.FileListener(o.f)
 	if err != nil {
@@ -277,3 +278,59 @@ type wrapErr struct{ err error }
 
 func (e *wrapErr) Error() string { return e.err.Error() }
 func (e *wrapErr) Unwrap() error { return e.err }
+
+// olderHelper is an older copy a supervisor went back to: it lacks
+// EnsureHostFiles, and says so in its handshake.
+type olderHelper struct {
+	rootdpb.UnimplementedRootHelperServer
+}
+
+func (olderHelper) Version(context.Context, *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
+	var feats []string
+	for _, f := range rootdpb.Features() {
+		if f != rootdpb.FeatureEnsureHostFiles {
+			feats = append(feats, f)
+		}
+	}
+	return &rootdpb.VersionResponse{HelperVersion: "older", Api: rootdpb.APIVersion, Features: feats}, nil
+}
+
+// TestRollbackIsSeenOnTheNextCall: a newer helper answered the handshake,
+// then the supervisor went back to an older copy. A call the newer one
+// listed comes back Unimplemented; the next call asks the helper again,
+// so the client names the helper that runs, not the one it remembers, and
+// it picks the newer helper up again when that one returns.
+func TestRollbackIsSeenOnTheNextCall(t *testing.T) {
+	sock := newOwnedSocket(t)
+	newerSrv := sock.serve(t, &swapHelper{name: "newer"})
+	c := New(Config{Socket: sock.path, Timeout: 2 * time.Second, HelperUID: uint32(os.Getuid())})
+	t.Cleanup(func() { _ = c.Close() })
+	req := &rootdpb.EnsureHostFilesRequest{ContainerId: "sb-1"}
+	if _, err := c.EnsureHostFiles(ctxT(t), req); err != nil {
+		t.Fatalf("on the newer helper: %v", err)
+	}
+	newerSrv.Stop()
+	olderSrv := sock.serve(t, olderHelper{})
+
+	var ue *UnsupportedError
+	if _, err := c.EnsureHostFiles(ctxT(t), req); !errors.As(err, &ue) {
+		t.Fatalf("first call on the older helper: %v, want an UnsupportedError", err)
+	}
+	_, err := c.EnsureHostFiles(ctxT(t), req)
+	if !errors.As(err, &ue) || ue.Helper.HelperVersion != "older" {
+		t.Fatalf("second call on the older helper: %v, want an UnsupportedError naming the older helper", err)
+	}
+	if info, _ := c.Info(); info.HelperVersion != "older" {
+		t.Fatalf("the client still believes helper %q runs", info.HelperVersion)
+	}
+
+	olderSrv.Stop()
+	sock.serve(t, &swapHelper{name: "newer"})
+	eventually(t, func() error {
+		resp, err := c.EnsureHostFiles(ctxT(t), req)
+		if err == nil && resp.GetHostnamePath() != "newer" {
+			err = fmt.Errorf("answered by %q", resp.GetHostnamePath())
+		}
+		return err
+	})
+}

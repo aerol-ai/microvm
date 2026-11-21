@@ -283,11 +283,25 @@ func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 		}
 		return
 	}
-	h.Log.Error("supervisor: the new root helper did not start; the old one runs again",
-		"version", next.Manifest.Version, "old", prev.Manifest.Version, "error", err, "retry_in", h.RetryFailed)
 	if child != nil {
 		h.stop(child)
+		// A helper that said it serves, however late, has taken calls
+		// from the backlog and told the agent what it offers. Going back
+		// to the older copy now would take calls away from an agent that
+		// has used them, so the newer copy is kept and started again.
+		if ready.served(h.ReadyWait) {
+			h.Log.Warn("supervisor: the new root helper served late and was stopped; starting it again, not the old one",
+				"version", next.Manifest.Version, "old", prev.Manifest.Version, "error", err)
+			h.cur = next
+			if prev.Path != next.Path {
+				_ = prev.Remove()
+			}
+			h.child = h.startServing(next)
+			return
+		}
 	}
+	h.Log.Error("supervisor: the new root helper did not start; the old one runs again",
+		"version", next.Manifest.Version, "old", prev.Manifest.Version, "error", err, "retry_in", h.RetryFailed)
 	h.failedSHA, h.retryAt = next.Manifest.SHA256, time.Now().Add(h.RetryFailed)
 	h.judged = ""
 	if prev.Path != next.Path {
@@ -305,16 +319,39 @@ func (h *HelperKeeper) startServing(inst *rootswap.Installed) Child {
 		return nil
 	}
 	go func() {
-		if <-ready {
+		<-ready.done
+		if ready.ok {
 			h.Log.Info("supervisor: the root helper serves", "version", inst.Manifest.Version, "copy", inst.Path)
 		}
 	}()
 	return child
 }
 
-// start runs inst with the socket and a ready pipe. ready gets true once
-// the helper writes its byte, false if the pipe closes without it.
-func (h *HelperKeeper) start(inst *rootswap.Installed) (Child, <-chan bool, error) {
+// readyPipe is a helper's ready pipe, read once: done closes when the
+// helper wrote its byte (ok) or the pipe closed without it. Unlike a
+// channel's single value, every reader sees the outcome.
+type readyPipe struct {
+	done chan struct{}
+	ok   bool // set before done closes
+}
+
+// served says whether the helper wrote its byte, waiting up to wait for
+// the outcome. Called once the helper has exited, when its end of the
+// pipe is closed and the outcome follows at once.
+func (r *readyPipe) served(wait time.Duration) bool {
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-r.done:
+		return r.ok
+	case <-t.C:
+		return false
+	}
+}
+
+// start runs inst with the socket and a ready pipe, which tells once the
+// helper writes its byte or the pipe closes without it.
+func (h *HelperKeeper) start(inst *rootswap.Installed) (Child, *readyPipe, error) {
 	if h.sock == nil {
 		ln, fi, err := rootfolder.Listen(h.Socket, h.SocketGID)
 		if err != nil {
@@ -339,29 +376,40 @@ func (h *HelperKeeper) start(inst *rootswap.Installed) (Child, <-chan bool, erro
 		return nil, nil, err
 	}
 	h.started = time.Now()
-	ready := make(chan bool, 1)
+	ready := &readyPipe{done: make(chan struct{})}
 	go func() {
 		defer r.Close()
 		var b [1]byte
 		n, _ := r.Read(b[:])
-		ready <- n == 1
+		ready.ok = n == 1
+		close(ready.done)
 	}()
 	h.Log.Info("supervisor: started the root helper", "version", inst.Manifest.Version, "api", inst.Manifest.API, "copy", inst.Path)
 	return child, ready, nil
 }
 
-func (h *HelperKeeper) waitReady(ctx context.Context, child Child, ready <-chan bool) error {
+// waitReady waits for a new helper to say it serves. A byte that lands as
+// the wait runs out still counts: select picks at random among ready
+// cases, and the helper serves from the moment it writes it.
+func (h *HelperKeeper) waitReady(ctx context.Context, child Child, ready *readyPipe) error {
 	timer := time.NewTimer(h.ReadyWait)
 	defer timer.Stop()
 	select {
-	case ok := <-ready:
-		if ok {
+	case <-ready.done:
+		if ready.ok {
 			return nil
 		}
 		return errors.New("it exited before it served")
 	case <-child.Done():
 		return errors.New("it exited before it served")
 	case <-timer.C:
+		select {
+		case <-ready.done:
+			if ready.ok {
+				return nil
+			}
+		default:
+		}
 		return fmt.Errorf("it did not serve within %v", h.ReadyWait)
 	case <-ctx.Done():
 		return ctx.Err()
