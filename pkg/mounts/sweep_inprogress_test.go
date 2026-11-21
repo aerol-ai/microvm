@@ -151,10 +151,14 @@ func TestMountAllWaitsForSweepOfSameID(t *testing.T) {
 	}
 
 	// Hold the sweep inside its cleanup of id: the leftover looks like a
-	// mountpoint, and its umount blocks until released.
+	// mountpoint until its umount, which blocks until released.
 	oldDev, oldUmount := pathDevOf, sweepUmount
+	var unmounted sync.Mutex
+	mounted := true
 	pathDevOf = func(path string) uint64 {
-		if path == leftover {
+		unmounted.Lock()
+		defer unmounted.Unlock()
+		if path == leftover && mounted {
 			return 42
 		}
 		return oldDev(path)
@@ -164,6 +168,9 @@ func TestMountAllWaitsForSweepOfSameID(t *testing.T) {
 	sweepUmount = func(string) error {
 		close(inCleanup)
 		<-releaseSweep
+		unmounted.Lock()
+		mounted = false
+		unmounted.Unlock()
 		return nil
 	}
 	t.Cleanup(func() { pathDevOf, sweepUmount = oldDev, oldUmount })
