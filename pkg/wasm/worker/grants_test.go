@@ -337,35 +337,3 @@ func TestWorkerFloorFailsClosed(t *testing.T) {
 	stopWorkerFloorWatch()
 	stopWorkerFloorWatch()
 }
-
-// An open that hangs (a stalled network mount) is given up on, and the
-// file it opens later is closed.
-func TestOpenGrantTimesOut(t *testing.T) {
-	dir := t.TempDir()
-	fifo := filepath.Join(dir, "fifo")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// A FIFO opened without O_NONBLOCK would block; openGrant's does not,
-	// so stand in a hang with a zero timeout instead.
-	// With no time at all the open may or may not win; either way nothing
-	// leaks.
-	if f, err := openGrant(dir, 0, false); err != nil && err != errGrantTimeout {
-		t.Fatalf("zero timeout = %v", err)
-	} else if f != nil {
-		_ = f.Close()
-	}
-	if _, err := openGrant(fifo, time.Second, false); err == nil {
-		t.Fatal("a FIFO was opened for a grant")
-	}
-	f, err := openGrant(dir, time.Second, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
-	prev := grantOpenTimeout
-	grantOpenTimeout = 0
-	t.Cleanup(func() { grantOpenTimeout = prev })
-	files, _ := openGrants([]string{dir})
-	closeFiles(files)
-}

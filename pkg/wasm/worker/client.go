@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -509,31 +510,81 @@ var grantOpenTimeout = 2 * time.Second
 
 var errGrantTimeout = errors.New("open timed out")
 
+// grantOpener is the open openGrant bounds (tests stand in a hung one).
+var grantOpener = openGrantPath
+
+// An open that outlives its timeout keeps running, and holds one of
+// sandboxd's threads until the mount answers. A sandbox's messages name
+// its mounts again and again (every exec, instantiate, set-capability and
+// restore), so a path whose open is stuck is not opened again until that
+// open returns: the message goes without the grant at once. And no more
+// than maxGrantOpens opens run at once, stuck ones included, so stalled
+// mounts can hold that many threads at most, far below the Go runtime's
+// limit, at which the process dies. Past it, messages go without grants.
+var (
+	grantOpensMu  sync.Mutex
+	grantRunning  int
+	grantStuck    = map[string]struct{}{}
+	maxGrantOpens = 512
+)
+
+var (
+	errGrantStuck = errors.New("an earlier open of this path has not returned")
+	errGrantBusy  = errors.New("too many opens in flight")
+)
+
 // openGrant opens path for a grant (openGrantPath), giving up after
 // timeout. O_NONBLOCK keeps a FIFO from hanging the open; the type check
 // then refuses it.
 func openGrant(path string, timeout time.Duration, strict bool) (*os.File, error) {
+	grantOpensMu.Lock()
+	if _, stuck := grantStuck[path]; stuck {
+		grantOpensMu.Unlock()
+		return nil, errGrantStuck
+	}
+	if grantRunning >= maxGrantOpens {
+		grantOpensMu.Unlock()
+		return nil, errGrantBusy
+	}
+	grantRunning++
+	grantOpensMu.Unlock()
 	type result struct {
 		f   *os.File
 		err error
 	}
 	done := make(chan result, 1)
 	go func() {
-		f, err := openGrantPath(path, strict)
+		f, err := grantOpener(path, strict)
 		done <- result{f, err}
 	}()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
 	case r := <-done:
+		grantOpenDone(path, false)
 		return r.f, r.err
 	case <-t.C:
-		// Close it if the open ever returns.
+		grantOpensMu.Lock()
+		grantStuck[path] = struct{}{}
+		grantOpensMu.Unlock()
+		// Close it if the open ever returns; the path may be opened again
+		// from then on.
 		go func() {
 			if r := <-done; r.f != nil {
 				_ = r.f.Close()
 			}
+			grantOpenDone(path, true)
 		}()
 		return nil, errGrantTimeout
 	}
+}
+
+// grantOpenDone ends an open openGrant started.
+func grantOpenDone(path string, stuck bool) {
+	grantOpensMu.Lock()
+	grantRunning--
+	if stuck {
+		delete(grantStuck, path)
+	}
+	grantOpensMu.Unlock()
 }
