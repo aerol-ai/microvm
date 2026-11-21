@@ -33,8 +33,13 @@ import (
 // build time. The pool's Slot row will pick it up via RecordLoaded so
 // the runtime driver dials the right CID when it claims the slot for
 // a sandbox.
+//
+// RootfsPath is the template's rootfs. The snapshot state names a root
+// drive backed by it, and Firecracker opens that file during LoadSnapshot,
+// so the spawner has to put it where the VMM can see it first.
 type SnapshotInputs struct {
 	TemplateID         string
+	RootfsPath         string
 	SnapshotMemoryPath string
 	SnapshotStatePath  string
 	SnapshotChecksum   string

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 )
@@ -265,6 +266,31 @@ func TestMainIsolateJailShimDispatch(t *testing.T) {
 	main()
 	if exitCode != 125 {
 		t.Fatalf("shim failure exit = %d, want 125", exitCode)
+	}
+}
+
+// The build-context unpacker gets its own arguments and exits 1 on failure,
+// with the cause on stderr for the parent to report.
+func TestMainContextUnpackDispatch(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", cntr.ContextUnpackFlag, "--max-entries", "1"}
+	origUnpack := runContextUnpack
+	t.Cleanup(func() { runContextUnpack = origUnpack })
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	for _, tc := range []struct {
+		err      error
+		wantCode int
+	}{{nil, -1}, {errors.New("unpack boom"), 1}} {
+		var got []string
+		runContextUnpack = func(args []string) error { got = args; return tc.err }
+		code := -1
+		osExit = func(c int) { code = c }
+		main()
+		if strings.Join(got, " ") != "--max-entries 1" || code != tc.wantCode {
+			t.Fatalf("err=%v: args=%q exit=%d want %d", tc.err, got, code, tc.wantCode)
+		}
 	}
 }
 

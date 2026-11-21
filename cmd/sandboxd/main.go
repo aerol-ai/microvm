@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
+	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
@@ -19,6 +20,7 @@ var (
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
 	runIsolateJailShim     = isolate.RunJailShim
+	runContextUnpack       = cntr.RunContextUnpack
 	runEgressGatewayCLI    = gatewayd.RunCLI
 	runPKCS11Helper        = pkcs11.RunHelper
 	osExit                 = os.Exit
@@ -124,6 +126,18 @@ func main() {
 		return
 	}
 
+	// Build-context unpacker: the daemon re-exec'd as a uid with no rights to
+	// unpack one image-build context tar from stdin into the folder on fd 3
+	// (internal/runtime/containerd/buildkit_unpack_linux.go), so a bug in the
+	// unpacking cannot write to the host as root.
+	if len(os.Args) >= 2 && os.Args[1] == cntr.ContextUnpackFlag {
+		if err := runContextUnpack(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
 	// Resident-module host: one process compiles a module once and hosts many
 	// isolated sandbox instances (plans/wasm-resident-module-host.md). Spawned
 	// only when SB_WASM_RESIDENT_HOST_ENABLED routes a create here.
@@ -172,7 +186,7 @@ func isDaemonArgv(argv []string) bool {
 		a == upgradeSubcommand, a == hostSubcommand, a == keySubcommand,
 		a == backupSubcommand, a == restoreSubcommand, a == recoverQuorumSubcommand,
 		a == "--wasm-worker", a == "--wasm-resident-host", a == pkcs11.HelperFlag,
-		a == isolate.JailShimFlag, a == gatewayd.Subcommand:
+		a == isolate.JailShimFlag, a == cntr.ContextUnpackFlag, a == gatewayd.Subcommand:
 		return false
 	}
 	return true

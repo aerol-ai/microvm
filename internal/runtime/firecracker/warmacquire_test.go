@@ -97,6 +97,11 @@ func stageWarmFixture(t *testing.T, f *driverFixture) (*fakeWarmPool, *fakeSpawn
 	if err := os.WriteFile(apiSocket, []byte{}, 0o600); err != nil {
 		t.Fatalf("write fake api socket: %v", err)
 	}
+	// WarmSpawn stages the template's rootfs into the slot before
+	// LoadSnapshot; the claim reuses it.
+	if err := os.WriteFile(filepath.Join(runDir, rootfsFileName), []byte("ROOTFS"), 0o644); err != nil {
+		t.Fatalf("write warm slot rootfs: %v", err)
+	}
 	handle := &fakeSpawnedHandle{apiSocket: apiSocket, runDir: runDir}
 	slot := &vmmpool.Slot{
 		ID:         "vmms-warm-fixture",
