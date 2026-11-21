@@ -306,7 +306,16 @@ func TestNetnsBindingWaitsForTheServer(t *testing.T) {
 	if ok, err := b.Bound(context.Background(), "aerol-netns-0", "sb-1"); ok || err == nil {
 		t.Fatalf("an unset binding = %v, %v", ok, err)
 	}
-	cfg, err := rootd.ConfigFromEnv(helperEnv(t, shortDir(t), "aerolvm"))
+	env := helperEnv(t, shortDir(t), "aerolvm")
+	// No CNI plugins, wherever the test runs (a node with /opt/cni/bin
+	// would open the network, and vouch for nothing without an error).
+	noCNI := filepath.Join(t.TempDir(), "no-cni")
+	cfg, err := rootd.ConfigFromEnv(func(k string) string {
+		if k == "SB_CONTAINERD_CNI_PLUGIN_DIR" {
+			return noCNI
+		}
+		return env(k)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
