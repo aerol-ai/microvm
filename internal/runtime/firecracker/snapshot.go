@@ -52,6 +52,9 @@ type TemplateSnapshotResult struct {
 	MemorySizeBytes int64
 	StateSizeBytes  int64
 	Checksum        string
+	// NestedVirt is the SB_FIRECRACKER_NESTED_VIRT setting the snapshot's
+	// VM booted under; the service records it with the checksum.
+	NestedVirt string
 }
 
 // snapshotVMMIDPrefix scopes the synthetic sandbox ID used for the
@@ -220,11 +223,16 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: PutMachineConfig: %w", err)
 	}
-	kernelAPIPath, err := d.chrootFilePath(handle.RunDir(), d.cfg.KernelImage, kernelFileName)
+	// Every clone restores this VM's CPU, so the snapshot gets this
+	// node's setting, and the result records it.
+	if err := d.configureGuestCPU(ctx, client); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: %w", err)
+	}
+	kernelAPIPath, err := d.chrootSharedFile(handle.RunDir(), d.cfg.KernelImage, kernelFileName)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: stage kernel: %w", err)
 	}
-	rootfsAPIPath, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName)
+	rootfsAPIPath, err := d.chrootSharedFile(handle.RunDir(), rootfsPath, rootfsFileName)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: stage rootfs for API: %w", err)
 	}
@@ -377,6 +385,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 		MemorySizeBytes: memSize,
 		StateSizeBytes:  stateSize,
 		Checksum:        formatSnapshotChecksum(memDigest, stateDigest),
+		NestedVirt:      string(d.hostNestedVirt()),
 	}, nil
 }
 
