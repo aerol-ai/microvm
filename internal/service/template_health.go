@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -74,7 +75,7 @@ func (s *Service) MarkSnapshotCorrupt(ctx context.Context, templateID, reason st
 		// of its way.
 		return nil
 	}
-	s.logger.Warn("snapshot corruption detected; template marked unhealthy, rebuild kicked",
+	s.logger.Warn("template snapshot unusable (see reason); template marked unhealthy, rebuild kicked",
 		"template_id", templateID, "reason", reason)
 	addTemplateUnhealthyGauge(1)
 	s.kickSnapshotRebuild(templateID)
@@ -132,6 +133,52 @@ func (s *Service) RekickUnhealthyTemplatesAtStart(ctx context.Context) {
 		s.logger.Warn("rekick unhealthy template after daemon restart",
 			"template_id", tpl.ID, "snapshot_error", tpl.SnapshotError)
 		s.kickSnapshotRebuild(tpl.ID)
+	}
+}
+
+// ResaveTemplateSnapshotsForNestedVirtAtStart marks unhealthy, and so
+// rebuilds, every ready template whose snapshot was saved under another
+// SB_FIRECRACKER_NESTED_VIRT setting than this node's. A snapshot load
+// restores the CPU flags the VM saved, so such a snapshot would hand every
+// clone the other setting; the driver refuses to load one, and this saves
+// each again before the warm pool or a create meets it. Until a rebuild
+// finishes, creates cold-boot the template's rootfs (has_snapshot=0), with
+// this node's setting.
+//
+// After an upgrade that brings the setting, every template saved before it
+// is rebuilt once: the rebuilds run at once, like RekickUnhealthy-
+// TemplatesAtStart's. Call it after that one, so a template is never
+// kicked twice: this only moves rows that are ready. Logs and returns on a
+// store error, like RekickUnhealthyTemplatesAtStart.
+func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Context) {
+	if s.templateSnapshotter == nil || s.templateCIDAllocator == nil {
+		return
+	}
+	templates, err := s.store.ListTemplates(ctx)
+	if err != nil {
+		s.logger.Warn("resave templates for nested virtualization: list failed", "error", err)
+		return
+	}
+	allowed := s.cfg.FirecrackerNestedVirt
+	resaved := 0
+	for _, tpl := range templates {
+		saved := firecracker.NestedVirt(tpl.SnapshotNestedVirt)
+		if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot || saved.Matches(allowed) {
+			continue
+		}
+		label := string(saved)
+		if label == "" {
+			label = "unknown (saved before the setting was recorded)"
+		}
+		reason := fmt.Sprintf("snapshot saved with nested virtualization %s; this node boots VMs with it %s (SB_FIRECRACKER_NESTED_VIRT=%t)",
+			label, firecracker.NestedVirtSetting(allowed), allowed)
+		if err := s.MarkSnapshotCorrupt(ctx, tpl.ID, reason); err == nil {
+			resaved++
+		}
+	}
+	if resaved > 0 {
+		s.logger.Info("audit template snapshots saved again for the nested virtualization setting",
+			"count", resaved, "nested_virt", firecracker.NestedVirtSetting(allowed))
 	}
 }
 
@@ -343,7 +390,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 
 	snapshotSize := snap.MemorySizeBytes + snap.StateSizeBytes
 	if uerr := s.store.UpdateTemplateSnapshotReady(ctx, templateID, memOut, stateOut,
-		snapshotSize, snap.Checksum, cid, true); uerr != nil {
+		snapshotSize, snap.Checksum, cid, true, snap.NestedVirt); uerr != nil {
 		s.logger.Warn("snapshot rebuild: snapshot ready update failed",
 			"template_id", templateID, "error", uerr)
 		return fmt.Errorf("snapshot ready update: %w", uerr)
@@ -360,6 +407,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		SourceImage:      template.Image,
 		SnapshotChecksum: snap.Checksum,
 		VsockCID:         cid,
+		NestedVirt:       snap.NestedVirt,
 		CreatedAt:        time.Now().UTC(),
 	}); mErr != nil {
 		s.logger.Warn("snapshot rebuild: manifest write failed",

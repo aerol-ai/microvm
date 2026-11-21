@@ -4791,8 +4791,9 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		id,
 		image,
@@ -4816,6 +4817,8 @@ func (s *Store) CreateTemplate(ctx context.Context, template *models.Template) e
 		template.PushError,
 		strings.TrimSpace(template.RegistryRef),
 		strings.TrimSpace(template.PushDigest),
+		strings.TrimSpace(template.SnapshotNestedVirt),
+		strings.TrimSpace(template.SnapshotChecksum),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -4832,7 +4835,8 @@ func (s *Store) GetTemplate(ctx context.Context, id string) (*models.Template, e
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		WHERE id = ?
 	`, strings.TrimSpace(id))
@@ -4852,7 +4856,8 @@ func (s *Store) ListTemplates(ctx context.Context) ([]*models.Template, error) {
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		ORDER BY created_at DESC, id ASC
 	`)
@@ -4928,14 +4933,18 @@ func (s *Store) UpdateTemplateStatus(ctx context.Context, id string, status mode
 // for every PR-B-built template (the snapshot capture path always
 // includes the overlay placeholder); kept as a parameter so a future
 // "snapshot without overlay" build profile (e.g. a tiny boot-only
-// template) does not require a schema change.
-func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32, hasOverlay bool) error {
+// template) does not require a schema change. nestedVirt is the
+// SB_FIRECRACKER_NESTED_VIRT setting the snapshot's VM booted under
+// (pkg/firecracker.NestedVirt): a load restores the CPU it saved, so a node
+// loads the snapshot only where it matches.
+func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, statePath string, sizeBytes int64, checksum string, vsockCID uint32, hasOverlay bool, nestedVirt string) error {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE firecracker_templates
 		SET status = ?, snapshot_memory_path = ?, snapshot_state_path = ?,
 			snapshot_size_bytes = ?, snapshot_checksum = ?, snapshot_vsock_cid = ?,
 			snapshot_error = '', has_snapshot = 1, has_overlay = ?,
+			snapshot_nested_virt = ?, snapshot_nested_virt_checksum = ?,
 			updated_at = ?, ready_at = COALESCE(?, ready_at)
 		WHERE id = ?
 	`,
@@ -4946,6 +4955,8 @@ func (s *Store) UpdateTemplateSnapshotReady(ctx context.Context, id, memPath, st
 		strings.TrimSpace(checksum),
 		vsockCID,
 		boolToInt(hasOverlay),
+		strings.TrimSpace(nestedVirt),
+		strings.TrimSpace(checksum),
 		now,
 		now,
 		strings.TrimSpace(id),
@@ -5081,7 +5092,8 @@ func (s *Store) ListTemplatesPendingPush(ctx context.Context) ([]*models.Templat
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		WHERE (push_state IN ('pending', 'error')
 			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?)))
@@ -5129,7 +5141,8 @@ func (s *Store) ListUnhealthyTemplates(ctx context.Context) ([]*models.Template,
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		WHERE status = ?
 		ORDER BY created_at ASC, id ASC
@@ -5168,7 +5181,8 @@ func (s *Store) ListTemplatesReadyBefore(ctx context.Context, cutoff time.Time) 
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		WHERE status = ?
 		  AND ready_at IS NOT NULL
@@ -5311,7 +5325,8 @@ func (s *Store) ListGCEligibleTemplates(ctx context.Context, olderThan time.Time
 			last_error, created_at, updated_at, ready_at,
 			snapshot_memory_path, snapshot_state_path, snapshot_size_bytes,
 			snapshot_checksum, snapshot_vsock_cid, snapshot_error, has_snapshot,
-			has_overlay, push_state, push_error, registry_ref, push_digest
+			has_overlay, push_state, push_error, registry_ref, push_digest,
+			snapshot_nested_virt, snapshot_nested_virt_checksum
 		FROM firecracker_templates
 		WHERE status NOT IN (?, ?, ?) AND updated_at < ? AND id NOT IN (
 			SELECT template_id FROM sandboxes WHERE template_id <> ''
@@ -6367,6 +6382,7 @@ func scanTemplate(scanner interface {
 	var readyAt sql.NullTime
 	var hasSnapshot int
 	var hasOverlay int
+	var nestedVirtChecksum string
 	err := scanner.Scan(
 		&template.ID,
 		&template.Image,
@@ -6390,9 +6406,18 @@ func scanTemplate(scanner interface {
 		&template.PushError,
 		&template.RegistryRef,
 		&template.PushDigest,
+		&template.SnapshotNestedVirt,
+		&nestedVirtChecksum,
 	)
 	if err != nil {
 		return nil, err
+	}
+	// The record holds only for the snapshot it was written with. A release
+	// before the column re-saves a snapshot without touching it (a rollback,
+	// then a rebuild), and that snapshot booted however that release booted
+	// VMs: unknown.
+	if nestedVirtChecksum != template.SnapshotChecksum {
+		template.SnapshotNestedVirt = ""
 	}
 	template.CreatedAt = template.CreatedAt.UTC()
 	template.UpdatedAt = template.UpdatedAt.UTC()

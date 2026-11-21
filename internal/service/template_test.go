@@ -564,6 +564,8 @@ type fakeTemplateSnapshotter struct {
 	err     error
 	done    chan struct{}
 	block   chan struct{}
+	// nestedVirt is the record the snapshot comes back with.
+	nestedVirt string
 }
 
 func (f *fakeTemplateSnapshotter) SnapshotTemplate(_ context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
@@ -594,6 +596,7 @@ func (f *fakeTemplateSnapshotter) SnapshotTemplate(_ context.Context, req Templa
 		MemorySizeBytes: 6,
 		StateSizeBytes:  5,
 		Checksum:        "sha256:dead|sha256:beef",
+		NestedVirt:      f.nestedVirt,
 	}, nil
 }
 

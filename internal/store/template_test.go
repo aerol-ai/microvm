@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -321,7 +323,7 @@ func TestUpdateTemplateSnapshotReady(t *testing.T) {
 	if err := st.UpdateTemplateSnapshotReady(ctx, tpl.ID,
 		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.memory",
 		"/var/lib/aerolvm/templates/tpl-snap-ok/snapshot.state",
-		1<<24, "sha256:deadbeef|sha256:cafef00d", 42, true,
+		1<<24, "sha256:deadbeef|sha256:cafef00d", 42, true, "off",
 	); err != nil {
 		t.Fatalf("UpdateTemplateSnapshotReady: %v", err)
 	}
@@ -858,5 +860,96 @@ func TestListTemplatesReadyBefore_EmptyStore(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("got %d rows on empty store, want 0", len(rows))
+	}
+}
+
+// The nested-virt record (migration 15) round-trips through every write
+// path, and holds only for the snapshot it was written with: a release
+// before the column re-saves a snapshot without touching it, and the
+// snapshot it leaves booted however that release booted VMs.
+func TestTemplateSnapshotNestedVirtRecord(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	pulled := &models.Template{
+		ID: "tpl-nv-pulled", Image: "docker://alpine:3.19", Status: models.TemplateStatusReady,
+		CreatedAt: now, UpdatedAt: now, HasSnapshot: true,
+		SnapshotChecksum: "sha256:aa|sha256:bb", SnapshotNestedVirt: "off",
+	}
+	if err := st.CreateTemplate(ctx, pulled); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if got, _ := st.GetTemplate(ctx, pulled.ID); got == nil || got.SnapshotNestedVirt != "off" {
+		t.Fatalf("CreateTemplate then GetTemplate: record = %+v, want off", got)
+	}
+
+	built := &models.Template{
+		ID: "tpl-nv-built", Image: "docker://alpine:3.19", Status: models.TemplateStatusSnapshotting,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := st.CreateTemplate(ctx, built); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+	if got, _ := st.GetTemplate(ctx, built.ID); got.SnapshotNestedVirt != "" {
+		t.Fatalf("a template with no snapshot yet has record %q, want empty", got.SnapshotNestedVirt)
+	}
+	if err := st.UpdateTemplateSnapshotReady(ctx, built.ID, "/m", "/s", 1, "sha256:cc|sha256:dd", 7, true, "on"); err != nil {
+		t.Fatalf("UpdateTemplateSnapshotReady: %v", err)
+	}
+	list, err := st.ListTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplates: %v", err)
+	}
+	seen := map[string]string{}
+	for _, tpl := range list {
+		seen[tpl.ID] = tpl.SnapshotNestedVirt
+	}
+	if seen[built.ID] != "on" || seen[pulled.ID] != "off" {
+		t.Fatalf("ListTemplates records = %v", seen)
+	}
+
+	// What the previous release's UpdateTemplateSnapshotReady writes: a new
+	// checksum, and nothing about nested virtualization.
+	if _, err := st.db.ExecContext(ctx, `UPDATE firecracker_templates SET snapshot_checksum = ? WHERE id = ?`,
+		"sha256:ee|sha256:ff", pulled.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetTemplate(ctx, pulled.ID); got.SnapshotNestedVirt != "" {
+		t.Fatalf("a snapshot re-saved without the record still reads %q, want unknown", got.SnapshotNestedVirt)
+	}
+}
+
+// Migration 15 runs again harmlessly (a database whose schema_migrations
+// record was lost keeps its columns), and reports any other error.
+func TestTemplateNestedVirtMigration(t *testing.T) {
+	var m15 *schemaMigration
+	for i := range newerSchemaMigrations {
+		if newerSchemaMigrations[i].number == 15 {
+			m15 = &newerSchemaMigrations[i]
+		}
+	}
+	if m15 == nil || !m15.n1Safe || m15.applyTx == nil {
+		t.Fatalf("migration 15 = %+v, want an n1Safe applyTx migration", m15)
+	}
+	ctx := context.Background()
+	st := newTestStore(t)
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m15.applyTx(ctx, tx); err != nil {
+		t.Fatalf("migration 15 on a database that has the columns: %v", err)
+	}
+	_ = tx.Rollback()
+
+	db := rawDB(t, filepath.Join(t.TempDir(), "no-templates.db"))
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := m15.applyTx(ctx, tx); err == nil || strings.Contains(err.Error(), "duplicate column name") {
+		t.Fatalf("migration 15 on a database without templates = %v, want its error", err)
 	}
 }

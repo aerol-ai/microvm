@@ -13,7 +13,13 @@ template pipeline has three stages and they fail in distinct ways:
 
 Snapshot corruption observed on the boot path flips the row to `unhealthy`
 and the rebuild path (`RebuildTemplateSnapshot`) re-runs stage 1's snapshot
-substep in the background.
+substep in the background. So does a snapshot saved under another
+`SB_FIRECRACKER_NESTED_VIRT` setting than the node's (its `snapshot_error`
+says "saved with nested virtualization"): at daemon start, or on the first
+create that meets it. After the upgrade that brings the setting, every
+template saved before it is rebuilt once; expect `aerolvm_template_unhealthy`
+to rise and fall back to 0 within a few minutes, while creates from those
+templates cold-boot.
 
 ## Alerts
 
