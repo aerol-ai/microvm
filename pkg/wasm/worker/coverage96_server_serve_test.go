@@ -33,8 +33,8 @@ func newCov96ScriptConn(t *testing.T, okFrames int, envs ...Envelope) *cov96Scri
 			t.Fatal(err)
 		}
 	}
-	// writeFrame issues a header write and a body write per frame.
-	return &cov96ScriptConn{r: bytes.NewReader(buf.Bytes()), okWrites: 2 * okFrames}
+	// writeFrame writes each frame in one write.
+	return &cov96ScriptConn{r: bytes.NewReader(buf.Bytes()), okWrites: okFrames}
 }
 
 func (c *cov96ScriptConn) Read(p []byte) (int, error) { return c.r.Read(p) }

@@ -31,6 +31,9 @@ type interpTestDriver struct {
 func newInterpTestDriver(t *testing.T, cfg Config) *interpTestDriver {
 	t.Helper()
 	cfg.RunDir = t.TempDir()
+	// A passivate writes mem.snap under the modules dir: keep it in the
+	// test's own folder.
+	cfg.ModulesDir = t.TempDir()
 	d := New(cfg, nil)
 	e := &interpTestDriver{d: d, client: &fakeStreamingClient{}}
 	d.SetWorkerClientFactory(func(string) WorkerClient { return e.client })

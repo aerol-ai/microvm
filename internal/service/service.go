@@ -4053,7 +4053,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 			return nil, loadErr
 		}
 		if len(specs) > 0 {
-			if err := s.reestablishMounts(ctx, id, specs); err != nil {
+			if err := s.reestablishMounts(s.wasmMountCtx(ctx), id, specs); err != nil {
 				return nil, fmt.Errorf("reestablish mounts: %w", err)
 			}
 			wasmRehydrateBinds = s.mounts.HostBindsFor(id)
@@ -4098,7 +4098,7 @@ func (s *Service) startSandboxLocked(ctx context.Context, id string, cause start
 		return nil, err
 	}
 	if len(specs) > 0 {
-		if err := s.reestablishMounts(ctx, id, specs); err != nil {
+		if err := s.reestablishMounts(s.mountCtxFor(ctx, sandbox), id, specs); err != nil {
 			releaseAdmission()
 			return nil, fmt.Errorf("reestablish mounts: %w", err)
 		}
@@ -7400,7 +7400,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if specs, err := s.loadMounts(ctx, sandbox.ID); err != nil {
 				s.logger.Warn("load mounts during reconcile", "sandbox_id", sandbox.ID, "error", err)
 			} else if len(specs) > 0 {
-				if err := s.reestablishRunningMounts(ctx, sandbox.ID, specs); err != nil {
+				if err := s.reestablishRunningMounts(s.mountCtxFor(ctx, sandbox), sandbox.ID, specs); err != nil {
 					s.logger.Warn("reestablish mounts", "sandbox_id", sandbox.ID, "error", err)
 				}
 			}

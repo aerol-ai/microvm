@@ -29,6 +29,7 @@ type listenPortsWorkerClient struct {
 	fallback  string
 	nextPort  int
 	sets      [][]int
+	hosts     []string
 	queries   int
 	invokes   int
 	proxied   []int
@@ -68,7 +69,7 @@ func (c *listenPortsWorkerClient) ListenPorts(string) (worker.ListenPorts, error
 	return c.report(), nil
 }
 
-func (c *listenPortsWorkerClient) SetListenPorts(_ string, ports []int, _ string) (worker.ListenPorts, error) {
+func (c *listenPortsWorkerClient) SetListenPorts(_ string, ports []int, host string) (worker.ListenPorts, error) {
 	if c.inFlight.Add(1) > 1 {
 		c.overlap.Store(true)
 	}
@@ -77,6 +78,7 @@ func (c *listenPortsWorkerClient) SetListenPorts(_ string, ports []int, _ string
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sets = append(c.sets, append([]int(nil), ports...))
+	c.hosts = append(c.hosts, host)
 	if c.setErr != nil {
 		return worker.ListenPorts{}, c.setErr
 	}
@@ -476,4 +478,23 @@ func TestDriverServesEachExposedPortOnItsOwnListener(t *testing.T) {
 		t.Fatalf("listeners changed on a re-sync: %v -> %v", before.ports, after.ports)
 	}
 	get(9090)
+}
+
+// Guest listeners bind on the driver's guest listen host: 127.0.0.1 by
+// default, the WASM worker fence's address when pkg/daemon sets one, and
+// the driver waits for the listener on that same address.
+func TestGuestListenersBindOnTheGuestListenHost(t *testing.T) {
+	for _, tc := range []struct{ cfg, want string }{{"", "127.0.0.1"}, {"127.0.97.1", "127.0.97.1"}} {
+		c := &listenPortsWorkerClient{engine: "wazero"}
+		d := newListenPortsDriver(t, c)
+		d.cfg.GuestListenHost = tc.cfg
+		var waited string
+		d.waitListenReady = func(host string, _ int) error { waited = host; return nil }
+		if err := d.SyncGuestListenPorts(context.Background(), "sb-ports", []int{8080}); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.hosts) != 1 || c.hosts[0] != tc.want || waited != tc.want {
+			t.Fatalf("config %q: bound on %v, waited on %q; want %q", tc.cfg, c.hosts, waited, tc.want)
+		}
+	}
 }

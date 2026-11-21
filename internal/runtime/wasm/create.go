@@ -72,7 +72,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// into a shared compile-once/instantiate-many host instead of spawning a
 	// per-sandbox worker + compiling. Everything below is the untouched
 	// per-sandbox path used when the flag is off (the default).
-	if d.residentHostEnabled() && !createWantsPublicExpose(req) && resolved.Digest != "" {
+	legacyRoot := d.legacyRoot(sandboxID, hostMounts)
+	if d.residentHostEnabled() && !createWantsPublicExpose(req) && resolved.Digest != "" && !legacyRoot {
 		return d.createOnResidentHost(ctx, req, sandboxID, ref, resolved, memoryMB, hostMounts, timing)
 	}
 
@@ -90,7 +91,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	workDir := d.sandboxDir(sandboxID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
 	}
 
@@ -103,6 +104,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	inst := &sandboxInstance{
 		sandboxID:    sandboxID,
+		ownerRef:     ownerRefFromCreateCtx(ctx),
+		legacyRoot:   legacyRoot,
 		moduleRef:    ref,
 		modulePath:   resolved.Path,
 		moduleSize:   resolved.SizeBytes,
@@ -142,11 +145,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	client := d.newWorkerClient(socketPath)
 	if warmSlot == nil {
 		spawnStart := time.Now()
-		if err := d.supervisor.Ensure(ctx, sandboxID, socketPath); err != nil {
+		// An operator module is compiled once into the shared cache, before
+		// the worker that loads it starts, so that worker reads it back.
+		d.ensureSharedCompiled(ctx, resolved)
+		if err := d.supervisor.Ensure(d.workerStartCtx(ctx, sandboxID, inst.ownerRef, inst.legacyRoot), sandboxID, socketPath); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("start worker: %w", err)
 		}
-		if err := d.waitWorker(ctx, client, sandboxID); err != nil {
+		if err := d.waitWorker(ctx, client, sandboxID, workerReady(d.supervisor, sandboxID)); err != nil {
 			cleanup()
 			return nil, err
 		}
@@ -168,7 +174,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			recordLoadSubStages(timing, loadTimings)
 		}
 	} else {
-		if err := d.waitWorker(ctx, client, sandboxID); err != nil {
+		// A warm slot's worker serves already (the pool waited for it).
+		if err := d.waitWorker(ctx, client, sandboxID, nil); err != nil {
 			cleanup()
 			return nil, err
 		}
@@ -285,7 +292,14 @@ func (d *Driver) runtimeState(inst *sandboxInstance) *models.SandboxRuntimeState
 	}
 }
 
-func (d *Driver) waitWorker(ctx context.Context, client WorkerClient, sandboxID string) error {
+// waitWorker pings the worker until it answers, within ctx's deadline.
+// ready, when not nil, is the worker's own signal that it serves
+// (worker.Supervisor.Ready): it ends one wait between pings early, so a
+// fresh worker is used as soon as it serves rather than at the next poll
+// step. It is only a hint: the worker is used once a ping answers, and a
+// worker that signals without serving, or never signals, is polled as
+// before.
+func (d *Driver) waitWorker(ctx context.Context, client WorkerClient, sandboxID string, ready <-chan struct{}) error {
 	deadline := ctxDeadline(ctx)
 	attempt := 0
 	for {
@@ -295,7 +309,25 @@ func (d *Driver) waitWorker(ctx context.Context, client WorkerClient, sandboxID 
 		if ctxDone(ctx, deadline) {
 			return fmt.Errorf("worker not ready: %w", ctx.Err())
 		}
-		sleepBrief(ctx, attempt)
+		if pollSleep(ctx, attempt, ready) {
+			ready = nil
+		}
 		attempt++
 	}
+}
+
+// workerReadySignaler is a supervisor that hands out a started worker's
+// ready signal (worker.Supervisor). Optional, so test fakes without it
+// are polled.
+type workerReadySignaler interface {
+	Ready(key string) <-chan struct{}
+}
+
+// workerReady is sup's ready signal for the worker under key; nil (poll
+// only) when sup gives none.
+func workerReady(sup WorkerSupervisor, key string) <-chan struct{} {
+	if r, ok := sup.(workerReadySignaler); ok {
+		return r.Ready(key)
+	}
+	return nil
 }

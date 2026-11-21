@@ -27,9 +27,9 @@ func (c gatedStopClient) wait() {
 
 func (c gatedStopClient) StopInstance(string) error { c.wait(); return nil }
 
-func (c gatedStopClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
+func (c gatedStopClient) Checkpoint(_ context.Context, _ string, outDir string, _ wasmengine.SnapshotConfig) error {
 	c.wait()
-	return nil
+	return fakeSnapshotWrite(outDir)
 }
 
 // gatedStartClient is a streaming fake whose StartExec waits for the test,

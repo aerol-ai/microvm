@@ -31,14 +31,13 @@ func (e errReader) Read(p []byte) (n int, err error) {
 }
 
 func TestCodec(t *testing.T) {
-	// Test writeFrame header error
+	// Test writeFrame error (the frame goes in one write)
 	if err := writeFrame(errWriter{}, Envelope{Type: MsgOK}); err == nil {
-		t.Fatal("expected error on writeFrame header")
+		t.Fatal("expected error on writeFrame")
 	}
-
-	// Test writeFrame body error
-	if err := writeFrame(&errWriterAfter{}, Envelope{Type: MsgOK}); err == nil {
-		t.Fatal("expected error on writeFrame body")
+	w := &errWriterAfter{}
+	if err := writeFrame(w, Envelope{Type: MsgOK}); err != nil || w.writes != 1 {
+		t.Fatalf("writeFrame took %d writes: %v", w.writes, err)
 	}
 
 	// Test readFrame header error

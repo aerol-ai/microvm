@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
@@ -187,7 +188,13 @@ func (d *Driver) releaseResidentSlot(socket string) {
 // behind the same socket is detected (D8). When reserve is true the chosen
 // host's live count is incremented (caller releases it on failure/Destroy);
 // prewarm passes false since it brings up + compiles but instantiates nothing.
-func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path string, memoryMB int, reserve bool) (*residentBucket, *residentHost, error) {
+//
+// Only a host that has to be brought up waits for the module's shared
+// compile (ensureSharedCompiled), right before it loads the module: a
+// create onto a host that is up, one adopted from the sandboxd before a
+// restart included, has the module loaded and waits for nothing.
+func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef string, resolved *wasmmod.ResolvedModule, memoryMB int, reserve bool) (*residentBucket, *residentHost, error) {
+	digest, path := resolved.Digest, resolved.Path
 	id := residentBucketID(ownerRef, digest, memoryMB)
 
 	d.residentMu.Lock()
@@ -233,6 +240,7 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 				return take(h)
 			}
 		}
+		d.ensureSharedCompiled(ctx, resolved)
 		if err := d.bringUpResidentHost(ctx, b, h, path, memoryMB); err != nil {
 			return nil, nil, err
 		}
@@ -248,6 +256,7 @@ func (d *Driver) ensureResidentHost(ctx context.Context, ownerRef, digest, path 
 		index:  index,
 	}
 	b.hosts = append(b.hosts, h)
+	d.ensureSharedCompiled(ctx, resolved)
 	if err := d.bringUpResidentHost(ctx, b, h, path, memoryMB); err != nil {
 		return nil, nil, err
 	}
@@ -281,11 +290,12 @@ func (d *Driver) bringUpResidentHost(ctx context.Context, b *residentBucket, h *
 		return fmt.Errorf("mkdir resident dir: %w", err)
 	}
 	key := d.residentHostKey(b.id, h.index)
-	if err := d.residentSupervisor.Ensure(ctx, key, h.socket); err != nil {
+	cache := worker.WithCompileCache(ctx, d.compileCacheNamed(residentCacheName(b.id)))
+	if err := d.residentSupervisor.Ensure(cache, key, h.socket); err != nil {
 		return fmt.Errorf("start resident host: %w", err)
 	}
 	client := d.newWorkerClient(h.socket)
-	if err := d.waitWorker(ctx, client, key); err != nil {
+	if err := d.waitWorker(ctx, client, key, workerReady(d.residentSupervisor, key)); err != nil {
 		return err
 	}
 	if _, err := client.LoadModule(key, path, memoryMB); err != nil {
@@ -309,24 +319,38 @@ func (d *Driver) PrewarmResidentHosts(ctx context.Context, refs []string) {
 			return
 		}
 		resolved, err := d.resolver.Resolve(ctx, ref)
-		if err != nil || resolved == nil || resolved.Digest == "" {
+		if err != nil || resolved == nil {
 			if d.logger != nil {
 				d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", err)
 			}
 			continue
 		}
-		// Prewarm the operator/global bucket (empty owner) at default memory.
-		// reserve=false: prewarm compiles the module on the host but instantiates
-		// no sandbox, so it must NOT hold a live slot (Finding P1-2).
-		if _, _, err := d.ensureResidentHost(ctx, "", resolved.Digest, resolved.Path, d.cfg.DefaultMemoryMB, false); err != nil {
-			if d.logger != nil {
-				d.logger.Warn("resident prewarm failed", "ref", ref, "error", err)
-			}
-			continue
-		}
+		d.prewarmResolved(ctx, ref, resolved)
+	}
+}
+
+// prewarmResolved brings up ref's resident host (PrewarmResidentHosts).
+func (d *Driver) prewarmResolved(ctx context.Context, ref string, resolved *wasmmod.ResolvedModule) {
+	if !d.residentHostEnabled() {
+		return
+	}
+	if resolved.Digest == "" {
 		if d.logger != nil {
-			d.logger.Info("resident host prewarmed", "ref", ref, "digest", resolved.Digest, "memory_mb", d.cfg.DefaultMemoryMB)
+			d.logger.Warn("resident prewarm skipped: ref did not resolve", "ref", ref, "error", "no digest")
 		}
+		return
+	}
+	// Prewarm the operator/global bucket (empty owner) at default memory.
+	// reserve=false: prewarm compiles the module on the host but instantiates
+	// no sandbox, so it must NOT hold a live slot (Finding P1-2).
+	if _, _, err := d.ensureResidentHost(ctx, "", resolved, d.cfg.DefaultMemoryMB, false); err != nil {
+		if d.logger != nil {
+			d.logger.Warn("resident prewarm failed", "ref", ref, "error", err)
+		}
+		return
+	}
+	if d.logger != nil {
+		d.logger.Info("resident host prewarmed", "ref", ref, "digest", resolved.Digest, "memory_mb", d.cfg.DefaultMemoryMB)
 	}
 }
 
@@ -350,13 +374,13 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 		d.releaseResidentSlotFor(old)
 	}
 
-	bucket, host, err := d.ensureResidentHost(ctx, ownerRef, resolved.Digest, resolved.Path, memoryMB, true)
+	bucket, host, err := d.ensureResidentHost(ctx, ownerRef, resolved, memoryMB, true)
 	if err != nil {
 		return nil, err
 	}
 
 	workDir := d.sandboxDir(sandboxID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		// Release the slot ensureResidentHost just reserved (Finding P1-2).
 		d.releaseResidentSlot(host.socket)
 		return nil, fmt.Errorf("mkdir sandbox dir: %w", err)
@@ -365,6 +389,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	workerKey := d.residentHostKey(bucket.id, host.index)
 	inst := &sandboxInstance{
 		sandboxID:        sandboxID,
+		ownerRef:         ownerRef,
 		moduleRef:        ref,
 		modulePath:       resolved.Path,
 		moduleSize:       resolved.SizeBytes,
@@ -460,10 +485,10 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 
 	// 1) Bring up the dedicated cold worker + compile + instantiate (listener
 	//    disabled; the caller's syncGuestListenPort enables it right after).
-	if err := d.supervisor.Ensure(ctx, inst.sandboxID, coldSocket); err != nil {
+	if err := d.supervisor.Ensure(d.workerStartCtx(ctx, inst.sandboxID, inst.ownerRef, inst.legacyRoot), inst.sandboxID, coldSocket); err != nil {
 		return fmt.Errorf("start cold worker: %w", err)
 	}
-	if err := d.waitWorker(ctx, client, inst.sandboxID); err != nil {
+	if err := d.waitWorker(ctx, client, inst.sandboxID, workerReady(d.supervisor, inst.sandboxID)); err != nil {
 		_ = d.supervisor.Stop(inst.sandboxID)
 		return err
 	}

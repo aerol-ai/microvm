@@ -162,7 +162,13 @@ func ensureWorkerEgressPool() {
 	})
 }
 
+// workerEgressSpillDir is where this worker spills: the folder sandboxd
+// named, as the worker reaches it after dropping its privileges
+// (openWorkerDirs).
 func workerEgressSpillDir() string {
+	if via := spillDirOverride.Load(); via != nil {
+		return *via
+	}
 	return strings.TrimSpace(os.Getenv("SB_AUDIT_SPILL_DIR"))
 }
 
