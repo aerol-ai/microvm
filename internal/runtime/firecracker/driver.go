@@ -699,10 +699,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// Two paths:
 	//
 	//   - Template hit (Phase 2): req.TemplateID is set and the resolver
-	//     returns the host path of a pre-built rootfs. We hard-link
-	//     (cheap, same filesystem in the canonical layout) so the
-	//     jailer chroot covers it. EXDEV → copy fallback so a
-	//     differently-mounted TemplatesDir still works. No OCI pipeline
+	//     returns the host path of a pre-built rootfs. A snapshot load
+	//     hard-links it (cheap, same filesystem in the canonical layout;
+	//     EXDEV → copy) since the snapshot attaches it read-only; a cold
+	//     boot copies it (copyRootfsPrivate), since it attaches it
+	//     read-write. No OCI pipeline
 	//     runs on this Create. This is the boot-path-latency win the
 	//     plan calls for.
 	//
@@ -733,7 +734,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// Re-resolving would double the template-store I/O on every
 		// snapshot-load Create.
 		src := earlySnap
-		if err := linkOrCopyRootfs(src.RootfsPath, rootfsPath); err != nil {
+		// A snapshot load attaches the template's rootfs read-only (the
+		// snapshot holds the drive that way), so every clone shares one
+		// file. A cold boot attaches it read-write, so it gets a copy of
+		// its own: a link would let the guest write into the template that
+		// every later sandbox starts from.
+		stage := linkOrCopyRootfs
+		if !src.HasSnapshot {
+			stage = copyRootfsPrivate
+		}
+		if err := stage(src.RootfsPath, rootfsPath); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: template stage: %w", err)
 		}
 		if src.HasSnapshot {
@@ -1053,7 +1063,7 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 	// failed with "kernel file cannot be opened: No such file or directory" the
 	// moment the OCI rootfs build started succeeding.)
 	runDir := filepath.Dir(rootfsPath)
-	kernelAPIPath, err := d.chrootFilePath(runDir, d.cfg.KernelImage, kernelFileName)
+	kernelAPIPath, err := d.chrootSharedFile(runDir, d.cfg.KernelImage, kernelFileName)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage kernel: %w", err)
 	}
@@ -1174,11 +1184,13 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
 	}
-	// Staged before LoadSnapshot, which opens the drive read-write as the
-	// jailer's uid. A hard link to the template's rootfs already has that
-	// owner, but the cross-device copy linkOrCopyRootfs falls back to is
-	// root's until chowned (the stopped-sandbox restore hit exactly this).
-	rootfsAPIPath, err := d.chrootFilePath(runDir, rootfsPath, rootfsFileName)
+	// Staged before LoadSnapshot, which reopens the drive with the mode the
+	// snapshot saved: read-only for every template snapshotted with the
+	// overlay placeholder (HasOverlay). An older snapshot saved it
+	// read-write, so its load fails here (closed) until the service saves
+	// it again at start (templateNeedsResave). The shared rootfs stays
+	// root's with the jailer's group.
+	rootfsAPIPath, err := d.chrootSharedFile(runDir, rootfsPath, rootfsFileName)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)
 	}
@@ -1231,11 +1243,11 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 }
 
 func (d *Driver) stageSnapshotLoadPaths(runDir, memoryPath, statePath string) (memoryAPIPath, stateAPIPath string, err error) {
-	memoryAPIPath, err = d.chrootFilePath(runDir, memoryPath, sandboxSnapshotMemoryFileName)
+	memoryAPIPath, err = d.chrootSharedFile(runDir, memoryPath, sandboxSnapshotMemoryFileName)
 	if err != nil {
 		return "", "", fmt.Errorf("stage snapshot memory: %w", err)
 	}
-	stateAPIPath, err = d.chrootFilePath(runDir, statePath, sandboxSnapshotStateFileName)
+	stateAPIPath, err = d.chrootSharedFile(runDir, statePath, sandboxSnapshotStateFileName)
 	if err != nil {
 		return "", "", fmt.Errorf("stage snapshot state: %w", err)
 	}
@@ -1949,14 +1961,16 @@ func (d *Driver) PushAllowedPorts(_ context.Context, _, _ string, _ []int) error
 // nothing is staged.
 //
 // The staged file is then chowned to JailerUID:JailerGID. The jailer drops
-// privilege to that uid/gid before firecracker opens the drives, and the root
-// drive is opened read-write (not read_only), so a root-owned rootfs.ext4 — the
+// privilege to that uid/gid before firecracker opens the drives, and a
+// writable drive is opened read-write, so a root-owned rootfs.ext4 — the
 // shape mkfs/the OCI builder produces — fails with "Permission denied (os error
-// 13)". The kernel happens to work without this because boot-source opens it
-// read-only, but we chown uniformly so every chroot file is owned by the
-// process that will open it. All sandboxes share one jailer uid/gid, so
-// chowning a hardlinked shared template/kernel inode to that uid is consistent
-// across sandboxes.
+// 13)".
+//
+// chrootFilePath is for a file this one VM owns: its own rootfs or overlay,
+// a disk copy. A file several VMs share and only read (the kernel, a
+// template's rootfs and snapshot) goes through chrootSharedFile instead:
+// every VM runs as the one jailer uid, and a shared inode that uid owned
+// could be rewritten by any VM's firecracker process, for every VM after it.
 func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error) {
 	if !d.cfg.UseJailer {
 		return srcAbs, nil
@@ -1977,11 +1991,108 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 	// keeps the direct-spawn-shaped tests green while still chowning on every
 	// real production host (which runs the jailer as a dedicated uid/gid).
 	if d.cfg.JailerUID != 0 || d.cfg.JailerGID != 0 {
-		if err := os.Chown(dst, d.cfg.JailerUID, d.cfg.JailerGID); err != nil {
+		if err := chownStaged(dst, d.cfg.JailerUID, d.cfg.JailerGID); err != nil {
 			return "", fmt.Errorf("chown %s to jailer %d:%d: %w", destName, d.cfg.JailerUID, d.cfg.JailerGID, err)
 		}
 	}
 	return destName, nil
+}
+
+// chrootSharedFile stages a file many VMs share and only read: the kernel,
+// a template's rootfs (a snapshot load and the template's own snapshot VM
+// attach it read-only), a snapshot's memory and state, the export helper's
+// image. Like chrootFilePath it links (or copies) the file into the
+// chroot, but the file stays root's: it gets the jailer's group and mode
+// 0640, so every VM's firecracker can read it and none can write it. A
+// file an earlier release chowned to the jailer uid is given back to root
+// here.
+func (d *Driver) chrootSharedFile(runDir, srcAbs, destName string) (string, error) {
+	if !d.cfg.UseJailer {
+		return srcAbs, nil
+	}
+	dst := filepath.Join(runDir, destName)
+	if srcAbs != dst {
+		_ = os.Remove(dst)
+		if err := linkOrCopyRootfs(srcAbs, dst); err != nil {
+			return "", err
+		}
+	}
+	// No privilege drop (uid and gid 0): root reads it as it is, as in
+	// chrootFilePath. The jailer needs root, so sandboxd runs as root
+	// wherever it drops privilege, and gives the file to root; a sandboxd
+	// that is not root (a test) can only set the group.
+	if d.cfg.JailerUID != 0 || d.cfg.JailerGID != 0 {
+		owner := -1
+		if stagerIsRoot() {
+			owner = 0
+		}
+		if err := chownStaged(dst, owner, d.cfg.JailerGID); err != nil {
+			return "", fmt.Errorf("chown %s to root:%d: %w", destName, d.cfg.JailerGID, err)
+		}
+		if err := os.Chmod(dst, 0o640); err != nil {
+			return "", fmt.Errorf("chmod %s: %w", destName, err)
+		}
+	}
+	return destName, nil
+}
+
+// chownStaged is os.Chown and stagerIsRoot reports whether sandboxd runs as
+// root; tests replace both, since only root may give a file to root.
+var (
+	chownStaged  = os.Chown
+	stagerIsRoot = func() bool { return os.Geteuid() == 0 }
+)
+
+// copyRootfsPrivate gives a VM its own copy of a template's rootfs, for a
+// cold boot, which attaches the rootfs read-write, and for
+// linkOrCopyRootfs's fallback. Only the blocks that hold data are written
+// (copySparse), so the copy takes the space of the template's data, not its
+// full size. No fsync: the copy lives as long as the VM, and a host crash
+// ends the VM anyway.
+//
+// Whatever is already at dst is removed first and the copy is created with
+// O_EXCL. A jail left on disk by a create that crashed can hold a hard link
+// to the template (from a snapshot load) or a symlink there; opening it
+// with O_TRUNC would empty the template itself.
+func copyRootfsPrivate(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open template rootfs: %w", err)
+	}
+	defer in.Close()
+	// The copy goes by the file's size, so a directory or device (a size of
+	// 0 or a block count) must not be taken for a file.
+	info, err := in.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = fmt.Errorf("%s is not a regular file", src)
+	}
+	if err != nil {
+		return fmt.Errorf("copy template rootfs: %w", err)
+	}
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("create staged rootfs: clear %s: %w", dst, err)
+	}
+	out, err := openPrivateRootfs(dst)
+	if err != nil {
+		return fmt.Errorf("create staged rootfs: %w", err)
+	}
+	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("copy template rootfs: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return fmt.Errorf("close staged rootfs: %w", err)
+	}
+	return nil
+}
+
+// openPrivateRootfs creates a VM's own rootfs copy: a new file, never one
+// already there (O_EXCL also refuses a symlink in its place). Tests
+// replace it to fail the copy midway.
+var openPrivateRootfs = func(path string) (copyFileDest, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 }
 
 // linkOrCopyRootfs makes dst point at the same bytes as src. Hard-link
@@ -1992,13 +2103,10 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 // works. The dst directory must already exist (the jailer/vmm setup
 // path creates the runDir before Create reaches this helper).
 //
-// Per-sandbox writes don't go through this file — Phase 2 has no
-// per-sandbox overlay yet, so the template rootfs is treated as the
-// canonical disk. Phase 3 adds the overlay drive and the template
-// rootfs becomes read-only in the guest. Until then, in-VM writes
-// modify the host-side inode the link points at; the Phase 2 service
-// rejects deletion-while-referenced so a guest can't pull the rootfs
-// out from under another guest.
+// A link shares the template's inode, so it is only for a VM that opens
+// the file read-only (a snapshot load, the template's own snapshot VM, a
+// warm VM). A cold boot, which writes its root disk, uses
+// copyRootfsPrivate.
 // linkRootfsFn is os.Link in production; tests swap it to force the EXDEV
 // copy fallback without needing two real mount points.
 var linkRootfsFn = os.Link
@@ -2016,33 +2124,5 @@ func linkOrCopyRootfs(src, dst string) error {
 		return fmt.Errorf("link template rootfs: %w", err)
 	}
 
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open template rootfs: %w", err)
-	}
-	defer in.Close()
-	// The copy goes by the file's size, so a directory or device (a size of
-	// 0 or a block count) must not be taken for a file.
-	info, err := in.Stat()
-	if err == nil && !info.Mode().IsRegular() {
-		err = fmt.Errorf("%s is not a regular file", src)
-	}
-	if err != nil {
-		return fmt.Errorf("copy template rootfs: %w", err)
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("create staged rootfs: %w", err)
-	}
-	// Sparse, like copyFile: a template's rootfs is a mostly-hole image of
-	// the sandbox's full disk size, and a plain copy writes every byte of it.
-	if err := copySparse(out, in, dataRanges(in, info.Size()), info.Size()); err != nil {
-		_ = out.Close()
-		_ = os.Remove(dst)
-		return fmt.Errorf("copy template rootfs: %w", err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close staged rootfs: %w", err)
-	}
-	return nil
+	return copyRootfsPrivate(src, dst)
 }

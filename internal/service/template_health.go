@@ -149,7 +149,9 @@ var templateGOARCH = runtime.GOARCH
 
 // ResaveTemplateSnapshotsForNestedVirtAtStart saves again, with this node's
 // SB_FIRECRACKER_NESTED_VIRT setting, every ready template whose snapshot
-// was saved under the other setting (or before the setting was recorded).
+// was saved under the other setting (or before the setting was recorded),
+// and every template snapshotted before the overlay placeholder, whose
+// read-write root drive no longer loads (templateNeedsResave).
 // A snapshot load restores the CPU the VM saved, so until then each clone
 // of such a template gets the old CPU, as before the setting existed; the
 // warm pool skips the template meanwhile.
@@ -182,14 +184,14 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 			continue
 		}
 		s.removeUnusedTemplateSnapshotFiles(tpl)
-		if firecracker.NestedVirtApplies(templateGOARCH) && !firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(allowed) {
+		if templateNeedsResave(tpl, allowed) {
 			stale = append(stale, tpl)
 		}
 	}
 	if len(stale) == 0 {
 		return
 	}
-	s.logger.Info("audit saving template snapshots again for the nested virtualization setting, one at a time",
+	s.logger.Info("audit saving template snapshots again for the nested virtualization setting or a pre-overlay snapshot, one at a time",
 		"count", len(stale), "nested_virt", firecracker.NestedVirtSetting(allowed))
 	timeout := s.cfg.FirecrackerTemplateBuildTimeout
 	if timeout <= 0 {
@@ -207,10 +209,26 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 					"template_id", tpl.ID, "error", err)
 				continue
 			}
-			s.logger.Info("audit template snapshot saved again for the nested virtualization setting",
+			s.logger.Info("audit template snapshot saved again",
 				"template_id", tpl.ID, "nested_virt", firecracker.NestedVirtSetting(allowed))
 		}
 	}()
+}
+
+// templateNeedsResave reports whether a ready template's snapshot must be
+// saved again at start:
+//   - it was saved before the overlay placeholder (HasOverlay false). Those
+//     snapshots hold the root drive read-write, and the driver stages a
+//     template's rootfs read-only for every load (chrootSharedFile), so
+//     such a snapshot no longer loads until it is saved again, which puts
+//     the root drive read-only and adds the placeholder;
+//   - or it was saved under the other SB_FIRECRACKER_NESTED_VIRT setting
+//     (amd64 only, where the setting does something).
+func templateNeedsResave(tpl *models.Template, nestedVirtAllowed bool) bool {
+	if !tpl.HasOverlay {
+		return true
+	}
+	return firecracker.NestedVirtApplies(templateGOARCH) && !firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(nestedVirtAllowed)
 }
 
 // errTemplateMovedOn: the template changed while its snapshot was being
@@ -234,8 +252,7 @@ func (s *Service) resaveTemplateSnapshotLocked(ctx context.Context, listed *mode
 	if err != nil {
 		return fmt.Errorf("get template: %w", err)
 	}
-	if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot ||
-		firecracker.NestedVirt(tpl.SnapshotNestedVirt).Matches(s.cfg.FirecrackerNestedVirt) {
+	if tpl.Status != models.TemplateStatusReady || !tpl.HasSnapshot || !templateNeedsResave(tpl, s.cfg.FirecrackerNestedVirt) {
 		return errTemplateMovedOn
 	}
 	cid, err := s.templateCIDAllocator.AllocateForTemplate(ctx, tpl.ID)
