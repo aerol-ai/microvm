@@ -1186,8 +1186,10 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 	}
 	// Staged before LoadSnapshot, which reopens the drive with the mode the
 	// snapshot saved: read-only for every template snapshotted with the
-	// overlay placeholder (HasOverlay; older ones cold-boot instead, see
-	// Create). So the shared rootfs stays root's with the jailer's group.
+	// overlay placeholder (HasOverlay). An older snapshot saved it
+	// read-write, so its load fails here (closed) until the service saves
+	// it again at start (templateNeedsResave). The shared rootfs stays
+	// root's with the jailer's group.
 	rootfsAPIPath, err := d.chrootSharedFile(runDir, rootfsPath, rootfsFileName)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot rootfs: %w", err)

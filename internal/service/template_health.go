@@ -149,7 +149,9 @@ var templateGOARCH = runtime.GOARCH
 
 // ResaveTemplateSnapshotsForNestedVirtAtStart saves again, with this node's
 // SB_FIRECRACKER_NESTED_VIRT setting, every ready template whose snapshot
-// was saved under the other setting (or before the setting was recorded).
+// was saved under the other setting (or before the setting was recorded),
+// and every template snapshotted before the overlay placeholder, whose
+// read-write root drive no longer loads (templateNeedsResave).
 // A snapshot load restores the CPU the VM saved, so until then each clone
 // of such a template gets the old CPU, as before the setting existed; the
 // warm pool skips the template meanwhile.
@@ -189,7 +191,7 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 	if len(stale) == 0 {
 		return
 	}
-	s.logger.Info("audit saving template snapshots again for the nested virtualization setting, one at a time",
+	s.logger.Info("audit saving template snapshots again for the nested virtualization setting or a pre-overlay snapshot, one at a time",
 		"count", len(stale), "nested_virt", firecracker.NestedVirtSetting(allowed))
 	timeout := s.cfg.FirecrackerTemplateBuildTimeout
 	if timeout <= 0 {
@@ -207,7 +209,7 @@ func (s *Service) ResaveTemplateSnapshotsForNestedVirtAtStart(ctx context.Contex
 					"template_id", tpl.ID, "error", err)
 				continue
 			}
-			s.logger.Info("audit template snapshot saved again for the nested virtualization setting",
+			s.logger.Info("audit template snapshot saved again",
 				"template_id", tpl.ID, "nested_virt", firecracker.NestedVirtSetting(allowed))
 		}
 	}()
