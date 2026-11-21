@@ -185,6 +185,9 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 	if err := g.check(ctx, m, first); err != nil {
 		return err
 	}
+	if m.ended != nil {
+		defer m.ended(g, first)
+	}
 
 	upCtx, cancel := context.WithCancel(metadata.NewOutgoingContext(ctx, forwarded(md)))
 	defer cancel()

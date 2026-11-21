@@ -66,6 +66,15 @@ func checkContainerDelete(_ context.Context, g *Gate, req proto.Message) error {
 	return nil
 }
 
+// containerDeleteEnded drops the container's spec again once containerd has
+// answered the delete: a Tasks.Create checked while containerd was deleting
+// read the record still stored, and may have kept its answer.
+func containerDeleteEnded(g *Gate, req any) {
+	if g.specs != nil {
+		g.specs.drop(req.(*containersapi.DeleteContainerRequest).GetID())
+	}
+}
+
 // checkContainerUpdate allows a relabel and nothing else. The field mask
 // already limits what containerd applies; a request that carries a spec or
 // runtime anyway is still not one the agent builds.

@@ -37,11 +37,16 @@ import (
 //     each check.
 //
 // Only passes are kept; a refused spec is decoded again each time, as
-// before. A Containers.Delete drops the ID's entry, and a check that began
-// before any delete does not put its answer in after it, so an entry never
-// outlives a delete of its container. None of that is needed for a right
-// answer (the bytes decide a hit); it keeps memory to the containers that
-// exist.
+// before. A Containers.Delete drops the ID's entry twice: when the gate
+// checks the delete, and again once containerd has answered it, since a
+// Tasks.Create checked in between still reads the stored container. Each
+// drop starts a new generation for that ID, and a check of the ID that was
+// decoding across a drop keeps its answer out. So once a delete the gate
+// forwarded has ended, the memo holds nothing for that container until a
+// later check reads it from containerd again. A delete touches only its own
+// ID: deleting other containers, or ones that do not exist, keeps no other
+// check's answer out. None of this is needed for a right answer (the bytes
+// decide a hit); it keeps memory to the containers that exist.
 type specMemo struct {
 	policy     rootpolicy.Policy
 	maxEntries int
@@ -50,9 +55,18 @@ type specMemo struct {
 	mu    sync.Mutex
 	byID  map[string]*list.Element
 	order *list.List // of *memoEntry, most recently used first
-	// drops counts deletes. A check notes it when it misses and puts its
-	// answer in only if no delete came in between.
-	drops uint64
+	// inflight holds, per ID, the checks of it that missed and are
+	// decoding, and the generation they started in. An entry lives only
+	// while such a check runs, so there are never more than calls in
+	// flight.
+	inflight map[string]*pending
+	// gens numbers generations; none is used twice.
+	gens uint64
+}
+
+type pending struct {
+	gen     uint64
+	running int
 }
 
 type memoEntry struct {
@@ -75,7 +89,7 @@ const (
 
 func newSpecMemo(p rootpolicy.Policy, maxEntries, maxBytes int) *specMemo {
 	return &specMemo{policy: p, maxEntries: maxEntries, maxBytes: maxBytes,
-		byID: map[string]*list.Element{}, order: list.New()}
+		byID: map[string]*list.Element{}, order: list.New(), inflight: map[string]*pending{}}
 }
 
 // check is a rootpolicy.SpecCheck: rootpolicy.CheckSpecFacts with the
@@ -83,39 +97,66 @@ func newSpecMemo(p rootpolicy.Policy, maxEntries, maxBytes int) *specMemo {
 // these exact bytes.
 func (m *specMemo) check(id string, raw []byte) (*rootpolicy.SpecFacts, error) {
 	sum := sha256.Sum256(raw)
-	facts, drops := m.get(id, sum)
+	facts, gen := m.get(id, sum)
 	if facts != nil {
 		return facts, nil
 	}
 	facts, err := rootpolicy.CheckSpecFacts(m.policy, id, raw)
 	if err != nil {
+		m.abandon(id)
 		return nil, err
 	}
-	m.put(id, sum, facts, drops)
+	m.put(id, sum, facts, gen)
 	return facts, nil
 }
 
-// get returns id's facts when they were made from bytes with this sum, and
-// the delete count a put of a new answer must still match.
+// get returns id's facts when they were made from bytes with this sum. On
+// a miss it counts the caller as decoding id, and returns the generation a
+// put of its answer must still match. A miss must end in put or abandon.
 func (m *specMemo) get(id string, sum [sha256.Size]byte) (*rootpolicy.SpecFacts, uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	el, ok := m.byID[id]
-	if !ok || el.Value.(*memoEntry).sum != sum {
-		return nil, m.drops
+	if el, ok := m.byID[id]; ok && el.Value.(*memoEntry).sum == sum {
+		m.order.MoveToFront(el)
+		return el.Value.(*memoEntry).facts, 0
 	}
-	m.order.MoveToFront(el)
-	return el.Value.(*memoEntry).facts, m.drops
+	p := m.inflight[id]
+	if p == nil {
+		m.gens++
+		p = &pending{gen: m.gens}
+		m.inflight[id] = p
+	}
+	p.running++
+	return nil, p.gen
 }
 
-func (m *specMemo) put(id string, sum [sha256.Size]byte, facts *rootpolicy.SpecFacts, drops uint64) {
-	if len(id)+facts.Size() > m.maxBytes {
-		return
+// done ends a check of id that missed, and says whether no delete of id
+// came in while it ran. The caller holds mu.
+func (m *specMemo) done(id string, gen uint64) bool {
+	p := m.inflight[id]
+	if p == nil {
+		return false
 	}
+	if p.running--; p.running == 0 {
+		delete(m.inflight, id)
+	}
+	return p.gen == gen
+}
+
+// abandon ends a check of id that missed and has nothing to keep.
+func (m *specMemo) abandon(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.drops != drops {
-		return // a delete came in while this check ran
+	m.done(id, 0)
+}
+
+// put ends a check of id that missed, keeping its answer unless a delete
+// of id came in while it ran.
+func (m *specMemo) put(id string, sum [sha256.Size]byte, facts *rootpolicy.SpecFacts, gen uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.done(id, gen) || len(id)+facts.Size() > m.maxBytes {
+		return
 	}
 	if el, ok := m.byID[id]; ok {
 		e := el.Value.(*memoEntry)
@@ -131,11 +172,15 @@ func (m *specMemo) put(id string, sum [sha256.Size]byte, facts *rootpolicy.SpecF
 	}
 }
 
-// drop forgets id's entry: its container is being deleted.
+// drop forgets id's entry, and starts a new generation for the checks of
+// id now decoding: its container is being, or has been, deleted.
 func (m *specMemo) drop(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.drops++
+	if p := m.inflight[id]; p != nil {
+		m.gens++
+		p.gen = m.gens
+	}
 	if el, ok := m.byID[id]; ok {
 		m.order.Remove(el)
 		delete(m.byID, id)

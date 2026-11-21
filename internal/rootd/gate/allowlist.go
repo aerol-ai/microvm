@@ -27,7 +27,10 @@ type method struct {
 	write bool
 	// check, when set, runs the method's rootpolicy checks on a request
 	// that passed the walk.
-	check        checkFunc
+	check checkFunc
+	// ended, when set, runs once a forwarded call has ended, whatever its
+	// outcome, with its first request.
+	ended        func(g *Gate, req any)
 	clientStream bool
 	serverStream bool
 	newReq       func() proto.Message
@@ -92,7 +95,7 @@ var allowlist = []method{
 		why: "NewContainer: every create and warm-pool park"},
 	{name: "/containerd.services.containers.v1.Containers/Update", write: true, check: checkContainerUpdate, newReq: req[containersapi.UpdateContainerRequest](), newResp: req[containersapi.UpdateContainerResponse](),
 		why: "container.SetLabels: warm-pool adoption relabels the parked container"},
-	{name: "/containerd.services.containers.v1.Containers/Delete", write: true, check: checkContainerDelete, newReq: req[containersapi.DeleteContainerRequest](), newResp: req[emptypb.Empty](),
+	{name: "/containerd.services.containers.v1.Containers/Delete", write: true, check: checkContainerDelete, ended: containerDeleteEnded, newReq: req[containersapi.DeleteContainerRequest](), newResp: req[emptypb.Empty](),
 		why: "container.Delete: destroy, failed-create undo, parked slot teardown"},
 	{name: "/containerd.services.tasks.v1.Tasks/Create", write: true, check: checkTaskCreate, newReq: req[tasksapi.CreateTaskRequest](), newResp: req[tasksapi.CreateTaskResponse](),
 		why: "container.NewTask: create, start, park"},
