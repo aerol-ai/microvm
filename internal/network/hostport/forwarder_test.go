@@ -664,3 +664,50 @@ func TestForwarderSetActsOnTheKernelNotMemory(t *testing.T) {
 		t.Fatal("chain bootstrap failure hidden")
 	}
 }
+
+// failNthDelete fails the n-th Delete once (a transient iptables error).
+type failNthDelete struct {
+	*memBackend
+	mu sync.Mutex
+	n  int
+}
+
+func (b *failNthDelete) Delete(table, chain string, spec ...string) error {
+	b.mu.Lock()
+	b.n--
+	fail := b.n == 0
+	b.mu.Unlock()
+	if fail {
+		return errors.New("transient delete failure")
+	}
+	return b.memBackend.Delete(table, chain, spec...)
+}
+
+// TestForwarderSetRetriesAfterAPartialDelete (PR 5b review): a Set that
+// fails half way through an earlier process's rules leaves only the rules
+// still there; the retry removes them, instead of failing on one already
+// gone until a whole reconcile.
+func TestForwarderSetRetriesAfterAPartialDelete(t *testing.T) {
+	m := newMem()
+	old := New(m, nil) // an earlier helper process
+	if err := old.Ensure(22001, dnat("10.1.0.9:22001", true)); err != nil {
+		t.Fatal(err)
+	}
+	f := New(&failNthDelete{memBackend: m, n: 2}, nil) // the restarted helper
+	if err := f.Set(22001, nil); err == nil {
+		t.Fatal("the injected delete failure was hidden")
+	}
+	if err := f.Set(22001, nil); err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	for _, c := range []struct{ table, chain string }{{"nat", ChainNAT}, {"nat", ChainPost}, {"filter", ChainFwd}} {
+		for _, r := range m.rules(c.table, c.chain) {
+			if strings.Contains(r, commentPrefix+"22001") {
+				t.Fatalf("a rule of 22001 is left: %s %s", c.chain, r)
+			}
+		}
+	}
+	if err := f.Set(22001, &Target{Kind: Redirect, RedirectPort: 21215}); err != nil {
+		t.Fatalf("an expose of the same port: %v", err)
+	}
+}

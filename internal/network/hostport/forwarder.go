@@ -332,11 +332,15 @@ func (f *Forwarder) Set(hp int, t *Target) error {
 		f.mu.Unlock()
 		return err
 	}
-	for _, r := range f.foreign[hp] {
+	// Each rule is forgotten as it goes, so a delete that fails half way
+	// leaves only the rules still there for the retry to delete.
+	for rules := f.foreign[hp]; len(rules) > 0; rules = rules[1:] {
+		r := rules[0]
 		if t != nil && ruleMatches(r.chain, r.spec, hp, *t) {
 			continue
 		}
 		if err := f.b.Delete(r.table, r.chain, r.spec...); err != nil {
+			f.foreign[hp] = rules
 			f.mu.Unlock()
 			return fmt.Errorf("hostport: delete %s/%s hp=%d: %w", r.table, r.chain, hp, err)
 		}
