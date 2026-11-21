@@ -998,6 +998,15 @@ func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.Sand
 // label. The slot keeps that address for the sandbox's life. The label is
 // read only after a failed probe, so a runc sandbox pays nothing extra.
 func (d *Driver) sandboxAddress(ctx context.Context, container cntr.Container, task cntr.Task, hint string) (string, error) {
+	if h := strings.TrimSpace(hint); h != "" && d.helper != nil {
+		// Privilege mode split: the hint is the address the root helper
+		// gave the slot (RealizeNetns's answer, or the pool's record of
+		// it, which the boot reconcile checks against the kernel through
+		// the helper), and the task joined that slot's namespace. Reading
+		// it back would be one more helper call on every create for an
+		// answer the helper has just given.
+		return h, nil
+	}
 	ip, err := d.taskAddress(ctx, task)
 	if err == nil {
 		return ip, nil

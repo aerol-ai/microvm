@@ -152,12 +152,22 @@ func TestSplitTaskAddress(t *testing.T) {
 	if _, err := d.taskAddress(ctx, &specTask{netns: "/run/netns/aerol-netns-4"}); err == nil {
 		t.Fatal("a helper error was swallowed")
 	}
-	// The create path's fallback still holds: the address the slot was
-	// given stands in when the namespace no longer shows one.
+	// A create knows its slot's address, the one the helper gave it, and
+	// asks nothing more of the helper; without one (a start, an inspect,
+	// an adoption) the address is read through the helper, and a failed
+	// read falls back as before.
 	h.err = nil
-	state, err := d.runtimeStateAfterStart(ctx, nil, &specTask{netns: "/run/netns/gvisor"}, "sb", "10.88.0.44")
-	if err != nil || state.ContainerIP != "10.88.0.44" {
-		t.Fatalf("state %+v, %v", state, err)
+	asked := len(h.asked)
+	state, err := d.runtimeStateAfterStart(ctx, nil, &specTask{netns: "/run/netns/aerol-netns-4"}, "sb", "10.88.0.44")
+	if err != nil || state.ContainerIP != "10.88.0.44" || len(h.asked) != asked {
+		t.Fatalf("a create: state %+v, %v; helper asked %v", state, err, h.asked[asked:])
+	}
+	state, err = d.runtimeStateAfterStart(ctx, nil, &specTask{netns: "/run/netns/aerol-netns-4"}, "sb", "")
+	if err != nil || state.ContainerIP != "10.88.0.9" || len(h.asked) != asked+1 {
+		t.Fatalf("a start: state %+v, %v", state, err)
+	}
+	if _, err := d.runtimeStateAfterStart(ctx, nil, &specTask{netns: "/run/netns/gvisor"}, "sb", ""); err == nil {
+		t.Fatal("a gVisor start with no address and no hint got one")
 	}
 }
 

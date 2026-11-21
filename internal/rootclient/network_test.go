@@ -144,19 +144,18 @@ func TestNetworkCallsHelperDown(t *testing.T) {
 	}
 }
 
-// createCalls are the helper calls this PR puts on a cold create in
-// privilege mode split: the namespace build (a warm-queue miss) and the
-// address read after the task starts. A warm hit makes only the second.
+// createCalls are the helper calls a cold create makes in privilege mode
+// split: the namespace build (a warm-queue miss). The address it answers
+// is the one the driver reports, with no read after the task starts
+// (containerd sandboxAddress), and a warm hit makes none.
 func createCalls(ctx context.Context, c *Client, name string) error {
-	if _, _, err := c.RealizeNetns(ctx, name); err != nil {
-		return err
-	}
-	_, _, err := c.NetnsAddrs(ctx, name)
+	_, _, err := c.RealizeNetns(ctx, name)
 	return err
 }
 
 // inProcess is today's path for the same work, single mode: the steps
-// run in sandboxd itself, with no socket between.
+// run in sandboxd itself, with no socket between, and the driver reads the
+// address back after the task starts.
 func inProcess(m *memNet, name string) error {
 	path := "/run/netns/" + name
 	if _, err := m.Realize(context.Background(), name, path); err != nil {
@@ -199,10 +198,10 @@ func burst(n int, one func(i int) error) ([]time.Duration, error) {
 }
 
 // BenchmarkCreate100 is the 100-parallel-create benchmark (plan §3.7, eng
-// review D11): 100 creates at once, each making this PR's helper calls
-// (RealizeNetns, NetnsAddrs) through the real client and the helper's real
-// server, against the same 100 creates doing the same work in process, as
-// single mode does. The work itself is a fixed stand-in (work), so the gap
+// review D11): 100 cold creates at once, each making its helper call
+// (RealizeNetns) through the real client and the helper's real server,
+// against the same 100 creates doing the same work in process, as single
+// mode does. The work itself is a fixed stand-in (work), so the gap
 // between the two is the socket, the handshake latch, the per-sandbox
 // lock and the helper's checks. It reports p50 and p99 of each, and of
 // the first create after the helper starts (the handshake included).
@@ -249,11 +248,11 @@ func BenchmarkCreate100(b *testing.B) {
 	b.ReportMetric(float64(percentile(first, 0.5).Microseconds()), "first-p50-us")
 }
 
-// BenchmarkCreateCalls is one create's helper calls with nothing else
-// running (plan §3.7 boot-path numbers): RealizeNetns and NetnsAddrs
-// through the real client and server, the stand-in work set to none, so
-// ns/op is the cost the split adds to a cold create (a warm hit makes
-// only NetnsAddrs; BenchmarkAddrsCall).
+// BenchmarkCreateCalls is one cold create's helper call with nothing else
+// running (plan §3.7 boot-path numbers): RealizeNetns through the real
+// client and server, the stand-in work set to none, so ns/op is the cost
+// the split adds to a cold create. A warm hit makes no call;
+// BenchmarkAddrsCall is the read a start or an inspect makes.
 func BenchmarkCreateCalls(b *testing.B) {
 	sock := sockPath(b)
 	realHelper(b, sock, func(o *rootd.Options) { o.Network = newMemNet() })
@@ -270,7 +269,7 @@ func BenchmarkCreateCalls(b *testing.B) {
 	}
 }
 
-// BenchmarkAddrsCall is a warm create's one helper call.
+// BenchmarkAddrsCall is the address read a start or an inspect makes.
 func BenchmarkAddrsCall(b *testing.B) {
 	sock := sockPath(b)
 	realHelper(b, sock, func(o *rootd.Options) { o.Network = newMemNet() })

@@ -557,18 +557,16 @@ func burstOf(n int, one func(i int) error) ([]time.Duration, error) {
 	return out, errors.Join(errs...)
 }
 
-// BenchmarkKernelCreate100: 100 creates at once, each building a real
-// network namespace, attaching it (the real plugins with AEROL_KT_CNI_DIR,
-// else vethRunner) and reading its address back, in three ways:
+// BenchmarkKernelCreate100: 100 cold creates at once, each building a real
+// network namespace and attaching it (the real plugins with
+// AEROL_KT_CNI_DIR, else vethRunner), in two ways:
 //
-//   - single: in process, as netns.Host and the driver's probe do today;
-//   - single-inspect: in process, but with the helper's own read
-//     (ownership check included), to split the cost of that read from the
-//     socket's;
-//   - split: through the helper's socket (rootclient's RealizeNetns, then
-//     NetnsAddrs).
+//   - single: in process, as netns.Host does today, and the driver's
+//     address read after the task starts;
+//   - split: through the helper's socket (rootclient's RealizeNetns), whose
+//     answer is the address the driver reports, with no read after.
 //
-// The order of the three turns each round, so none always runs first.
+// The order turns each round, so neither always runs first.
 // Reports p50 and p99 of each, and of the first create on a fresh client
 // (the handshake included).
 //
@@ -605,7 +603,6 @@ func BenchmarkKernelCreate100(b *testing.B) {
 		got  []time.Duration
 	}{
 		{"single", inProcess(func(p string) error { _, err := hostnet.NetnsIPv4Addrs(p); return err }), nil},
-		{"single-inspect", inProcess(func(p string) error { _, err := k.Inspect(p); return err }), nil},
 		{"split", func(i int) func(j int) error {
 			c := rootclient.New(rootclient.Config{Socket: r.cfg.Socket, Timeout: 60 * time.Second, HelperUID: uint32(os.Geteuid())})
 			b.Cleanup(func() { _ = c.Close() })
@@ -613,16 +610,9 @@ func BenchmarkKernelCreate100(b *testing.B) {
 			if _, _, err := c.RealizeNetns(ctx, fmt.Sprintf("f%d", i)); err != nil {
 				b.Fatal(err)
 			}
-			if _, _, err := c.NetnsAddrs(ctx, fmt.Sprintf("f%d", i)); err != nil {
-				b.Fatal(err)
-			}
 			first = append(first, time.Since(t0))
 			return func(j int) error {
-				name := fmt.Sprintf("p%d-%d", i, j)
-				if _, _, err := c.RealizeNetns(ctx, name); err != nil {
-					return err
-				}
-				_, _, err := c.NetnsAddrs(ctx, name)
+				_, _, err := c.RealizeNetns(ctx, fmt.Sprintf("p%d-%d", i, j))
 				return err
 			}
 		}, nil},
@@ -668,13 +658,8 @@ func BenchmarkKernelCreateOne(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-				} else {
-					if _, _, err := c.RealizeNetns(ctx, name); err != nil {
-						b.Fatal(err)
-					}
-					if _, _, err := c.NetnsAddrs(ctx, name); err != nil {
-						b.Fatal(err)
-					}
+				} else if _, _, err := c.RealizeNetns(ctx, name); err != nil {
+					b.Fatal(err)
 				}
 				b.StopTimer()
 				_ = k.Remove(ctx, name, filepath.Join(k.netnsDir, name), "")

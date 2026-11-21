@@ -22,7 +22,9 @@ import (
 //     answers containerd's API (rootclient.ContainerdOptions): sandboxd can
 //     no longer open containerd's own socket;
 //   - it reads a running sandbox's address from its pool namespace through
-//     the helper (taskAddress): entering a namespace takes root.
+//     the helper (taskAddress): entering a namespace takes root. A create
+//     skips the read: its address is the one the helper gave the slot
+//     (sandboxAddress). A start, an inspect or an adoption reads it.
 //
 // The netns pool's build and teardown go through the helper too, in
 // pkg/daemon's wiring. The rest of a create and a start is root work the
