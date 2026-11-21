@@ -117,6 +117,9 @@ type Driver struct {
 
 	warmPool WarmPool
 	netns    NetnsHandoff
+	// helper is the root helper in privilege mode split
+	// (privilege_split.go); nil in single mode.
+	helper RootHelper
 
 	// startLocks serializes starts of one container: a start deletes the
 	// stopped task, binds the container's park socket and creates a new
@@ -203,7 +206,13 @@ func (d *Driver) ensureClient() (*Client, error) {
 	if d.client != nil {
 		return d.client, nil
 	}
-	c, err := connectFn(d.cfg.Socket, d.cfg.Namespace)
+	var c *Client
+	var err error
+	if d.helper != nil {
+		c, err = connectHelperFn(d.helper, d.cfg.Namespace)
+	} else {
+		c, err = connectFn(d.cfg.Socket, d.cfg.Namespace)
+	}
 	if err != nil {
 		return nil, err
 	}

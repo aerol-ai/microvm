@@ -50,8 +50,11 @@ const (
 	defaultDBPath           = "/var/lib/sandboxd/state.db"
 	defaultToolbox          = "/usr/local/bin/toolboxd"
 	defaultFIFODir          = "/run/aerolvm-rootd/fifo"
-	defaultReadyDir         = "/run/aerolvm-rootd/ready"
-	defaultPidsLimit        = 4096
+	// sandboxd's own CNI defaults (internal/config).
+	defaultCNIPluginDir = "/opt/cni/bin"
+	defaultCNIConfPath  = "/etc/cni/net.d/aerolvm.conflist"
+	defaultReadyDir     = "/run/aerolvm-rootd/ready"
+	defaultPidsLimit    = 4096
 	// sandboxd's defaults for the users its jails run as.
 	defaultJailUID = 1000
 	// nobodyUID is shared by every daemon that runs as nobody.
@@ -86,6 +89,9 @@ type Config struct {
 	// Files is where the helper makes the files runc, runsc and the shim
 	// open as root (files.go). The FIFOs go in Policy.FIFODir.
 	Files FileDirs
+	// Network is the helper's CNI (network.go); sandboxes' namespaces go
+	// in Policy.NetnsDir.
+	Network NetworkConfig
 }
 
 // FileDirs are the helper's own folders for the files it makes for
@@ -155,6 +161,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.Policy.Validate(); err != nil {
 		return fmt.Errorf("root helper: %w", err)
+	}
+	if err := c.Network.validate(); err != nil {
+		return err
 	}
 	return c.Files.validate(c.Policy, filepath.Dir(c.Socket))
 }
@@ -240,6 +249,8 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
 	netnsDir := path("SB_NETNS_DIR", defaultNetnsDir)
+	cniPlugins := path("SB_CONTAINERD_CNI_PLUGIN_DIR", defaultCNIPluginDir)
+	cniConf := path("SB_CONTAINERD_CNI_CONF_PATH", defaultCNIConfPath)
 	if pathErr != nil {
 		return Config{}, pathErr
 	}
@@ -257,6 +268,11 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		{"SB_ROOTD_STATE_DIR", stateDir},
 		{"SB_ROOTD_FIFO_DIR", fifoDir},
 		{"SB_ROOTD_READY_DIR", readyDir},
+		// Root makes sandboxes' namespaces, runs the CNI plugins and reads
+		// the CNI config that names them.
+		{"SB_NETNS_DIR", netnsDir},
+		{"SB_CONTAINERD_CNI_PLUGIN_DIR", cniPlugins},
+		{"SB_CONTAINERD_CNI_CONF_PATH", filepath.Dir(cniConf)},
 	} {
 		for _, a := range []string{runDir, mountsRoot, credDir, dataDir} {
 			if h.dir == a || strings.HasPrefix(h.dir, a+"/") {
@@ -300,6 +316,11 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			Limits:           limits,
 		},
 		Files: dirs,
+		Network: NetworkConfig{
+			PluginDir: cniPlugins,
+			ConfPath:  cniConf,
+			Subnet:    strings.TrimSpace(getenv("SB_CONTAINERD_BRIDGE_SUBNET")),
+		},
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

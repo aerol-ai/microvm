@@ -34,6 +34,11 @@ const (
 	FeatureEnsureRunscConfig    = "EnsureRunscConfig"
 	FeatureEnsureReadySocket    = "EnsureReadySocket"
 	FeatureRemoveContainerFiles = "RemoveContainerFiles"
+	FeatureEnsureHostNetwork    = "EnsureHostNetwork"
+	FeatureRealizeNetns         = "RealizeNetns"
+	FeatureRemoveNetns          = "RemoveNetns"
+	FeatureDisableNetnsIPv6     = "DisableNetnsIPv6"
+	FeatureNetnsAddrs           = "NetnsAddrs"
 )
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
@@ -46,7 +51,8 @@ const AnsweredTrailer = "aerolvm-rootd-answered"
 // Features lists every feature name above, for tests that must cover each.
 func Features() []string {
 	return []string{FeatureEnsureHost, FeatureEnsureHostFiles, FeatureEnsureTaskFIFOs,
-		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles}
+		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles,
+		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

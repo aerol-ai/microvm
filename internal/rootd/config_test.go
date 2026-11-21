@@ -73,6 +73,8 @@ func TestConfigFromEnv(t *testing.T) {
 			Runsc:      "/var/lib/aerolvm-rootd/runsc",
 			AgentReady: "/run/sandboxd/docker/ready",
 		},
+		// sandboxd's own CNI settings, read under the same names.
+		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
 	}
 	for _, tc := range []struct {
 		name string
@@ -111,6 +113,13 @@ func TestConfigFromEnv(t *testing.T) {
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
 			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready"}
+		}},
+		{"network", map[string]string{
+			"SB_CONTAINERD_CNI_PLUGIN_DIR": "/usr/lib/cni",
+			"SB_CONTAINERD_CNI_CONF_PATH":  "/etc/aerolvm/cni/sandboxes.conflist",
+			"SB_CONTAINERD_BRIDGE_SUBNET":  " 10.200.0.0/16 ",
+		}, func(c *Config) {
+			c.Network = NetworkConfig{PluginDir: "/usr/lib/cni", ConfPath: "/etc/aerolvm/cni/sandboxes.conflist", Subnet: "10.200.0.0/16"}
 		}},
 		{"node limits", map[string]string{
 			"SB_HOST_MEMORY_MB":     "1024",
@@ -202,6 +211,15 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"a relative socket", map[string]string{"SB_ROOTD_SOCKET": "root.sock", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_SOCKET"},
 		{"a relative netns folder", map[string]string{"SB_NETNS_DIR": "netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_NETNS_DIR"},
 		{"a relative agent run dir", map[string]string{"SB_CONTAINERD_RUN_DIR": "data/ctr", "SB_HOST_MEMORY_MB": "1"}, nil, "want an absolute path"},
+		{"a relative CNI plugin folder", map[string]string{"SB_CONTAINERD_CNI_PLUGIN_DIR": "cni/bin", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_PLUGIN_DIR"},
+		{"a sandbox range that is no network", map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "10.88.0.1/16", "SB_HOST_MEMORY_MB": "1"}, nil, "sandbox range"},
+		{"an IPv6 sandbox range", map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "fd00::/64", "SB_HOST_MEMORY_MB": "1"}, nil, "sandbox range"},
+		{"a sandbox range too small", map[string]string{"SB_CONTAINERD_BRIDGE_SUBNET": "10.88.0.0/28", "SB_HOST_MEMORY_MB": "1"}, nil, "sandbox range"},
+		// The agent writes its own folders; root must not run or trust
+		// anything in them.
+		{"the netns folder in the agent's", map[string]string{"SB_NETNS_DIR": "/var/lib/sandboxd/netns", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_NETNS_DIR"},
+		{"CNI plugins in the agent's folder", map[string]string{"SB_CONTAINERD_CNI_PLUGIN_DIR": "/run/sandboxd/cni", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_PLUGIN_DIR"},
+		{"the CNI config in the agent's folder", map[string]string{"SB_CONTAINERD_CNI_CONF_PATH": "/var/lib/sandboxd/cni/a.conflist", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_CONTAINERD_CNI_CONF_PATH"},
 		{"more memory than an int64 of bytes", map[string]string{"SB_HOST_MEMORY_MB": "9007199254740992"}, nil, "more than a machine can have"},
 		// Review H3: the peer check goes by uid, so the agent's must be its
 		// own.

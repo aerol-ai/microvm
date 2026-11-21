@@ -135,6 +135,10 @@ type Slot struct {
 // adopting sandbox. The recorded path is the only part that never changes,
 // so once it exists it wins; before it is recorded (crash between ADD and
 // the store write), the row's owner is still the realize-time name.
+// NetnsName is netnsName for callers outside the pool: the root helper's
+// network calls name a namespace by it (privilege mode split).
+func (s Slot) NetnsName() string { return s.netnsName() }
+
 func (s Slot) netnsName() string {
 	if p := strings.TrimSpace(s.NetnsPath); p != "" {
 		return filepath.Base(p)

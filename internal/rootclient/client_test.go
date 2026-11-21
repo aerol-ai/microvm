@@ -32,7 +32,7 @@ import (
 // macOS), which t.TempDir's often is not. The socket's folder holds the
 // socket alone, as the helper requires; realHelper lays the helper's other
 // folders out beside it.
-func sockPath(t *testing.T) string {
+func sockPath(t testing.TB) string {
 	t.Helper()
 	d, err := os.MkdirTemp("", "rc")
 	if err != nil {
@@ -409,7 +409,7 @@ func TestCallErrors(t *testing.T) {
 
 // helperFiles lays the helper's own folders out under base, as
 // rootd.ConfigFromEnv lays them out under its state and run folders.
-func helperFiles(t *testing.T, c *rootd.Config, base string) {
+func helperFiles(t testing.TB, c *rootd.Config, base string) {
 	t.Helper()
 	c.Files = rootd.FileDirs{
 		Hosts:      filepath.Join(base, "state", "hosts"),
@@ -425,7 +425,7 @@ func helperFiles(t *testing.T, c *rootd.Config, base string) {
 // realHelper serves internal/rootd's server on sock, its containerd side
 // answering containerd's Version as containerd 2.1.4 would. The peer check
 // is egress.UnixPeerCheck for this uid: the real one on Linux.
-func realHelper(t *testing.T, sock string, mutate func(*rootd.Options)) *rootd.Server {
+func realHelper(t testing.TB, sock string, mutate func(*rootd.Options)) *rootd.Server {
 	t.Helper()
 	opts := rootd.Options{
 		Containerd: func(_ any, ss grpc.ServerStream) error {
