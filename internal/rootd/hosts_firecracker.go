@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,10 @@ func (f *firecrackerHosts) openJail(id string) (stage, root *os.File, err error)
 	if err != nil {
 		return nil, nil, err
 	}
+	agent := int64(f.cfg.AgentUID)
+	if agent > math.MaxInt32 {
+		return nil, nil, fmt.Errorf("root helper: agent uid %d is past %d", agent, math.MaxInt32)
+	}
 	for _, d := range []string{filepath.Dir(dir), dir} {
 		fd, err := openFolder(d)
 		if err != nil {
@@ -102,7 +107,7 @@ func (f *firecrackerHosts) openJail(id string) (stage, root *os.File, err error)
 		err = fchmodAny(fd, 0o711)
 		if d == dir {
 			if err == nil {
-				stage, err = f.subFolder(fd, "stage", int(f.cfg.AgentUID), f.agentGID, 0o700)
+				stage, err = f.subFolder(fd, "stage", int(agent), f.agentGID, 0o700)
 			}
 			if err == nil {
 				root, err = f.subFolder(fd, "root", f.cfg.UID, f.agentGID, 0o2750)
@@ -184,7 +189,7 @@ func (f *firecrackerHosts) stageDisk(stage, root int, name string) error {
 	fd, err := unix.Openat(stage, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if errors.Is(err, unix.ENOENT) {
 		var st unix.Stat_t
-		if unix.Fstatat(root, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Uid == uint32(f.cfg.UID) && st.Mode&unix.S_IFMT == unix.S_IFREG {
+		if unix.Fstatat(root, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && int64(st.Uid) == int64(f.cfg.UID) && st.Mode&unix.S_IFMT == unix.S_IFREG {
 			return nil // moved by an earlier call
 		}
 		return badRequest("root helper: Firecracker disk %s is not in the stage folder", name)

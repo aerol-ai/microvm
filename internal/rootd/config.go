@@ -251,7 +251,14 @@ func (c *FirecrackerHostsConfig) validate() error {
 	if _, _, _, err := rootpolicy.FirecrackerJail(c.ChrootBase, "sb-0"); err != nil {
 		return fmt.Errorf("root helper: SB_JAILER_CHROOT_BASE: %w", err)
 	}
-	if c.UID <= 0 || c.GID <= 0 || uint32(c.UID) == c.AgentUID {
+	// Compared as int64, so no setting wraps onto root or the agent;
+	// (uid_t)-1 and past is no user at all. The agent's uid goes to the
+	// kernel as an int, which is 32 bits on a 32-bit build.
+	if int64(c.UID) >= math.MaxUint32 || int64(c.GID) >= math.MaxUint32 || c.AgentUID > math.MaxInt32 {
+		return fmt.Errorf("root helper: jailer user %d:%d, agent %d: want ids below %d, and an agent uid up to %d",
+			c.UID, c.GID, c.AgentUID, uint32(math.MaxUint32), math.MaxInt32)
+	}
+	if c.UID <= 0 || c.GID <= 0 || int64(c.UID) == int64(c.AgentUID) {
 		return fmt.Errorf("root helper: jailer user %d:%d must be neither root nor the agent", c.UID, c.GID)
 	}
 	if c.SocketWait <= 0 {

@@ -2,6 +2,7 @@ package rootd
 
 import (
 	"fmt"
+	"math"
 	"os/exec"
 	"syscall"
 
@@ -32,9 +33,13 @@ func chmodPath(fd, gid int, mode uint32) error {
 // what it stats it sees as root's, so mkfs.ext4 -d writes the agent's
 // files as root's.
 func makeFilesystemAttr(cmd *exec.Cmd, uid uint32, gid int) error {
+	host := int64(uid)
+	if host > math.MaxInt32 || host < 1 {
+		return fmt.Errorf("root helper: agent uid %d: want 1 to %d", host, math.MaxInt32)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags:                 syscall.CLONE_NEWUSER,
-		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: int(uid), Size: 1}},
+		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: int(host), Size: 1}},
 		GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: gid, Size: 1}},
 		GidMappingsEnableSetgroups: true,
 		Credential:                 &syscall.Credential{Uid: 0, Gid: 0, Groups: []uint32{}},

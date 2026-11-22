@@ -310,3 +310,17 @@ func TestJailerShimUmask(t *testing.T) {
 		t.Fatal("a relative jailer")
 	}
 }
+
+// TestMakeFilesystemAttrBoundsTheUID: a uid that would not fit an int on a
+// 32-bit build maps no user namespace.
+func TestMakeFilesystemAttrBoundsTheUID(t *testing.T) {
+	if err := makeFilesystemAttr(exec.Command("true"), 1<<31, 990); err == nil {
+		t.Fatal("a uid past MaxInt32")
+	}
+	if err := makeFilesystemAttr(exec.Command("true"), 0, 990); err == nil {
+		t.Fatal("root's uid")
+	}
+	if err := makeFilesystemAttr(exec.Command("true"), 65531, 990); err != nil {
+		t.Fatal(err)
+	}
+}

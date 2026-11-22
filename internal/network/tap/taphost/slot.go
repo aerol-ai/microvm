@@ -48,7 +48,9 @@ func SlotAt(baseCIDR string, poolSize, index int) (Slot, error) {
 	if 4*poolSize > 1<<(32-p.Bits()) {
 		return Slot{}, fmt.Errorf("tap slot: base %s holds fewer than %d slots", baseCIDR, poolSize)
 	}
-	if index < 0 || index >= poolSize {
+	// MaxPoolSize also bounds index on its own, before it narrows to a
+	// uint32 below.
+	if index < 0 || index >= poolSize || index >= MaxPoolSize {
 		return Slot{}, fmt.Errorf("tap slot: index %d is outside the pool of %d", index, poolSize)
 	}
 	base := p.Masked().Addr().As4()
