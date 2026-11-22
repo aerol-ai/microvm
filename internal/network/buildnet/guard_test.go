@@ -10,7 +10,7 @@ import (
 )
 
 func guardConfig() GuardConfig {
-	return GuardConfig{Netns: "/run/aerolvm-buildkit/rootlesskit/netns",
+	return GuardConfig{Netns: "/run/aerolvm-buildkit/rootlesskit/netns", IPv6: true,
 		Steps: netip.MustParsePrefix(StepRange), Uplink: netip.MustParsePrefix(UplinkRange),
 		Own: []netip.Addr{netip.MustParseAddr("10.88.0.2"), netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("fd00::2")}}
 }
@@ -31,6 +31,8 @@ func TestStepGuardCommands(t *testing.T) {
 		got = append(got, strings.Join(c[2:], " "))
 	}
 	want := []string{
+		"sysctl -qw net.ipv6.conf.all.disable_ipv6=1",
+		"sysctl -qw net.ipv6.conf.default.disable_ipv6=1",
 		"sysctl -qw net.ipv4.conf.all.rp_filter=1",
 		"sysctl -qw net.ipv4.conf.default.rp_filter=1",
 		"iptables -w -I INPUT -s 198.18.0.0/16 -j DROP",
@@ -125,5 +127,27 @@ func TestDetachedNetns(t *testing.T) {
 	t.Setenv("ROOTLESSKIT_STATE_DIR", "/run/aerolvm-buildkit/rootlesskit")
 	if got := DetachedNetns(); got != "/run/aerolvm-buildkit/rootlesskit/netns" {
 		t.Fatalf("DetachedNetns = %q", got)
+	}
+}
+
+// IPv6 is turned off in the steps' namespace, on every link it has and every
+// link made later (review of #1398): the drop rules are IPv4, and a step
+// reached a listener there over IPv6 link-local. A kernel without IPv6 has
+// nothing to turn off, and the guard must not fail on it.
+func TestStepGuardTurnsIPv6Off(t *testing.T) {
+	cfg := guardConfig()
+	cmds, err := StepGuardCommands(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cmds[0][2:], " "); got != "sysctl -qw net.ipv6.conf.all.disable_ipv6=1" {
+		t.Fatalf("first command %q, want IPv6 off before any link is made", got)
+	}
+	cfg.IPv6 = false
+	cmds, _ = StepGuardCommands(cfg)
+	for _, c := range cmds {
+		if strings.Contains(strings.Join(c, " "), "ipv6") {
+			t.Fatalf("a host without IPv6 got %q", c)
+		}
 	}
 }

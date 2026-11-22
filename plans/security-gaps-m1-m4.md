@@ -516,7 +516,9 @@ Each is small and stands alone. Together they shrink the root surface now.
       build-network guard` runs inside RootlessKit before buildkitd and
       drops what a step sends to another step, to that namespace, to
       RootlessKit's own network or to `aerolvm.build`'s addresses, with
-      strict reverse-path filtering. Proven live with the reviewer's
+      strict reverse-path filtering and IPv6 off in that namespace (the
+      rules are IPv4; a second review found a step reaching it over IPv6
+      link-local). Proven live with the reviewer's
       two-build probe. RootlessKit is 0750 to the build user's group, so
       its AppArmor user-namespace grant is the build user's alone; split
       mode on VMs (PR 10) must give the agent the socket by other means

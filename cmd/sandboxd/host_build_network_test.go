@@ -154,8 +154,11 @@ type guardSeams struct {
 func stubGuard(t *testing.T) *guardSeams {
 	t.Helper()
 	s := &guardSeams{execErr: errors.New("exec stub")}
-	og, oo, oe, ol := buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook
-	t.Cleanup(func() { buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook = og, oo, oe, ol })
+	og, oo, oe, ol, o6 := buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook, buildNetworkIPv6
+	t.Cleanup(func() {
+		buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook, buildNetworkIPv6 = og, oo, oe, ol, o6
+	})
+	buildNetworkIPv6 = func() bool { return true }
 	buildNetworkOwn = func() ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr("10.88.0.2")}, s.ownErr }
 	buildNetworkGuard = func(_ context.Context, cfg buildnet.GuardConfig) error {
 		s.order = append(s.order, "guard")
@@ -185,7 +188,7 @@ func TestHostBuildNetworkGuard(t *testing.T) {
 		t.Fatalf("order %v, want the guard before the exec", s.order)
 	}
 	if s.cfg.Netns != "/run/aerolvm-buildkit/rootlesskit/netns" || s.cfg.Steps.String() != buildnet.StepRange ||
-		s.cfg.Uplink.String() != buildnet.UplinkRange || len(s.cfg.Own) != 1 {
+		s.cfg.Uplink.String() != buildnet.UplinkRange || len(s.cfg.Own) != 1 || !s.cfg.IPv6 {
 		t.Fatalf("guard config %+v", s.cfg)
 	}
 	if s.execPath != "/usr/local/bin/buildkitd" || strings.Join(s.execArgs, " ") != "buildkitd --config /etc/aerolvm-buildkit/buildkitd.toml" {

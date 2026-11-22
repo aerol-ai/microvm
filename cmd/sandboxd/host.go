@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/network/buildnet"
 	"github.com/aerol-ai/microvm/internal/network/cni"
+	"github.com/aerol-ai/microvm/internal/network/hostnet"
 	"github.com/aerol-ai/microvm/internal/network/netns"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/scripts"
@@ -120,6 +121,7 @@ var (
 	buildNetworkDown   = buildnet.Down
 	buildNetworkGuard  = buildnet.ApplyStepGuard
 	buildNetworkOwn    = buildnet.OwnAddrs
+	buildNetworkIPv6   = hostnet.HostHasIPv6
 	buildNetworkExec   = syscall.Exec
 	buildNetworkLook   = exec.LookPath
 )
@@ -222,7 +224,7 @@ func runBuildNetworkGuard(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "sandboxd host build-network guard: this namespace's addresses: %v\n", err)
 		return 1
 	}
-	cfg := buildnet.GuardConfig{Netns: *netnsPath, Steps: stepRange, Uplink: uplinkRange, Own: own}
+	cfg := buildnet.GuardConfig{Netns: *netnsPath, Steps: stepRange, Uplink: uplinkRange, Own: own, IPv6: buildNetworkIPv6()}
 	if err := buildNetworkGuard(context.Background(), cfg); err != nil {
 		fmt.Fprintf(stderr, "sandboxd host build-network guard: %v\n", err)
 		return 1

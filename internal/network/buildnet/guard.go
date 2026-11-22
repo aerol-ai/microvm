@@ -26,7 +26,10 @@ import (
 //   - RootlessKit's own network (UplinkRange: its gateway and DNS);
 //   - the aerolvm.build namespace's own addresses, where buildkitd and
 //     RootlessKit run;
-//   - and an address a step does not own (strict reverse-path filtering).
+//   - an address a step does not own (strict reverse-path filtering);
+//   - and IPv6, turned off on every link of the namespace: the drop rules
+//     are IPv4, and a step reached a listener there over IPv6 link-local
+//     (review of #1398).
 //
 // Everything else leaves through aerolvm.build onto the sandboxes' bridge,
 // where the host firewall's sandbox rules apply.
@@ -52,6 +55,9 @@ type GuardConfig struct {
 	// Own are the addresses of the namespace buildkitd runs in
 	// (aerolvm.build); OwnAddrs reads them.
 	Own []netip.Addr
+	// IPv6 is whether the kernel has IPv6 to turn off
+	// (hostnet.HostHasIPv6); without it there is nothing to turn off.
+	IPv6 bool
 	// run runs one command; nil is exec.
 	run func(ctx context.Context, name string, args ...string) error
 }
@@ -80,7 +86,13 @@ func StepGuardCommands(cfg GuardConfig) ([][]string, error) {
 		}
 		return append(c, "-j", "DROP")
 	}
-	cmds := [][]string{
+	var cmds [][]string
+	if cfg.IPv6 {
+		// First, so no link BuildKit makes later ever has IPv6: "default"
+		// is what a new link starts with, "all" turns off the links there.
+		cmds = append(cmds, sysctl("net.ipv6.conf.all.disable_ipv6"), sysctl("net.ipv6.conf.default.disable_ipv6"))
+	}
+	cmds = append(cmds,
 		// A step sends only from its own address: strict reverse-path
 		// filtering on every link, those made later included.
 		sysctl("net.ipv4.conf.all.rp_filter"),
@@ -88,7 +100,7 @@ func StepGuardCommands(cfg GuardConfig) ([][]string, error) {
 		drop("INPUT", ""),
 		drop("FORWARD", steps.String()),
 		drop("FORWARD", uplink.String()),
-	}
+	)
 	for _, a := range cfg.Own {
 		if a.Is4() && !a.IsLoopback() {
 			cmds = append(cmds, drop("FORWARD", netip.PrefixFrom(a, 32).String()))
