@@ -173,8 +173,8 @@ func openFiles(cfg Config) (*files, error) {
 		return nil, err
 	}
 	if cfg.Files.ImageRoot != "" {
-		// Made root's alone here; only ever mounted on in a thread's own
-		// mount namespace (imageuser_linux.go).
+		// Made root's alone here, and kept empty: the bottom layer of
+		// every read of an image's users (imageuser_linux.go).
 		fd, err := openFolder(cfg.Files.ImageRoot)
 		if err != nil {
 			return nil, fmt.Errorf("root helper: folder %s: %w", cfg.Files.ImageRoot, err)

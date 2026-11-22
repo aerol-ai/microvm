@@ -430,7 +430,7 @@ func splitUserFixture(t *testing.T, files map[string]string) string {
 // root: what the kernel's read returns for those layers, an absolute link
 // resolved inside the root (RESOLVE_IN_ROOT).
 func fixtureReader(root string) rootd.ImageFileReader {
-	return func(context.Context, string, string, []string) (rootd.UserFiles, error) {
+	return func(string, string, []string) (rootd.UserFiles, error) {
 		var f rootd.UserFiles
 		for name, uf := range map[string]*rootd.UserFile{"etc/passwd": &f.Passwd, "etc/group": &f.Group} {
 			if target, err := os.Readlink(filepath.Join(root, name)); err == nil && filepath.IsAbs(target) {

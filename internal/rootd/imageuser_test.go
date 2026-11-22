@@ -86,23 +86,38 @@ type fakeImages struct {
 	mu    sync.Mutex
 	files map[string]UserFiles // by strings.Join(layers, ":")
 	reads []string
-	block bool
+	// block, when set, holds every read until it is closed: a read stuck
+	// in the kernel, which no context ends.
+	block chan struct{}
+	// running counts reads under way.
+	running int
 }
 
-func (f *fakeImages) read(ctx context.Context, snapshotsDir, mountpoint string, layers []string) (UserFiles, error) {
+func (f *fakeImages) read(snapshotsDir, emptyDir string, layers []string) (UserFiles, error) {
 	f.mu.Lock()
 	key := strings.Join(layers, ":")
 	f.reads = append(f.reads, key)
 	files, block := f.files[key], f.block
+	f.running++
 	f.mu.Unlock()
-	if snapshotsDir != snapRoot || mountpoint == "" {
-		return UserFiles{}, fmt.Errorf("read at %s, mounting on %q", snapshotsDir, mountpoint)
+	defer func() {
+		f.mu.Lock()
+		f.running--
+		f.mu.Unlock()
+	}()
+	if snapshotsDir != snapRoot || emptyDir == "" {
+		return UserFiles{}, fmt.Errorf("read at %s over %q", snapshotsDir, emptyDir)
 	}
-	if block {
-		<-ctx.Done()
-		return UserFiles{}, ctx.Err()
+	if block != nil {
+		<-block
 	}
 	return files, nil
+}
+
+func (f *fakeImages) inFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running
 }
 
 func (f *fakeImages) count() int {
@@ -297,8 +312,10 @@ func TestImageUserImageFaults(t *testing.T) {
 	orig := imageUserTimeout
 	imageUserTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { imageUserTimeout = orig })
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
 	images.mu.Lock()
-	images.block = true
+	images.block = release
 	images.mu.Unlock()
 	start := time.Now()
 	_, err := c.PrepareSandbox(callCtx(t), userReq("sb-1", "someone-else"))
@@ -505,5 +522,47 @@ func TestContainerPartsTogether(t *testing.T) {
 	}
 	if _, err := helperClient(plain).PrepareSandbox(callCtx(t), userReq("sb-1", "app")); status.Code(err) != codes.Unimplemented {
 		t.Fatalf("image user on a helper without it: %v", err)
+	}
+}
+
+// TestImageUserReadHoldsItsTurn (#1400 review): a read that outlives its
+// caller (stuck in the kernel) keeps its turn until it ends, so stuck
+// reads never run past the bound; a later create waits for a turn, times
+// out without starting another read, and gets one once the stuck read
+// ends.
+func TestImageUserReadHoldsItsTurn(t *testing.T) {
+	origReads, origTimeout := imageUserReads, imageUserTimeout
+	imageUserReads, imageUserTimeout = make(chan struct{}, 1), 50*time.Millisecond
+	t.Cleanup(func() { imageUserReads, imageUserTimeout = origReads, origTimeout })
+	r, snaps, images, _ := snapRig(t)
+	c := helperClient(r)
+	snaps.set("sb-2", fakeSnap{info: SnapshotInfo{Kind: "active", Parent: "sha256:bbbb"}, mounts: activeMounts(8, 7, 6)})
+	release := make(chan struct{})
+	images.mu.Lock()
+	images.files[layer(7)+":"+layer(6)] = UserFiles{Passwd: file(testPasswd)}
+	images.block = release
+	images.mu.Unlock()
+	if _, err := c.PrepareSandbox(callCtx(t), userReq("sb-1", "app")); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a stuck read: %v", err)
+	}
+	// The stuck read still runs, and holds the one turn.
+	if _, err := c.PrepareSandbox(callCtx(t), userReq("sb-2", "app")); status.Code(err) != codes.FailedPrecondition ||
+		!strings.Contains(err.Error(), "waiting for a turn") {
+		t.Fatalf("a second read while the first is stuck: %v", err)
+	}
+	if n := images.count(); n != 1 {
+		t.Fatalf("%d reads started past the bound of one", n)
+	}
+	images.mu.Lock()
+	images.block = nil
+	images.mu.Unlock()
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for images.inFlight() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	imageUserTimeout = 5 * time.Second
+	if _, err := c.PrepareSandbox(callCtx(t), userReq("sb-2", "app")); err != nil {
+		t.Fatalf("a read once the stuck one ended: %v", err)
 	}
 }

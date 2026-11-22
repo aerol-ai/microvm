@@ -3,7 +3,6 @@
 package rootd
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,83 +133,127 @@ func TestReadInRoot(t *testing.T) {
 	}
 }
 
-// TestReadImageFilesKernel: the real read, as root: the image's layers are
-// mounted read-only in a mount namespace of the reading thread's own, the
-// upper layer's files over the lower's, and the mount is never in the
-// host's mount table, during or after. A FIFO passwd in a layer does not
-// hold the read. One layer is bound, not overlaid.
+// TestReadImageFilesKernel: the real read, as root. The image's layers are
+// mounted detached: the upper layer's files over the lower's, and one
+// layer alone over the empty folder; read-only, nosuid, nodev and noexec
+// by the mount's own flags. While the read holds the mount, no mount table
+// has it: neither the process's nor the reading thread's lists its id,
+// where both list a mount the test makes (so the check does see a mount),
+// and the reading thread is in the process's mount namespace. A FIFO
+// passwd does not hold the read. A layer outside the snapshots folder or
+// reached through a link is refused, and so is a bottom folder that is
+// not empty.
 func TestReadImageFilesKernel(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root (mounts)")
 	}
-	snaps := filepath.Join(t.TempDir(), "snapshots")
-	l1, l2 := filepath.Join(snaps, "1", "fs"), filepath.Join(snaps, "2", "fs")
-	within(t, l1, map[string]string{"etc/passwd": "base:x:1:1::/:/bin/sh\n", "etc/group": "base:x:1:\n"})
-	within(t, l2, map[string]string{"etc/passwd": "app:x:1000:1000::/:/bin/sh\n", "usr/bin/x": "x"})
-	mp := filepath.Join(t.TempDir(), "imageroot")
-	if err := os.Mkdir(mp, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	f, err := readImageFiles(context.Background(), snaps, mp, []string{l2, l1})
+	snaps, l1, l2, empty := imageLayers(t)
+	pin := filepath.Join(t.TempDir(), "pin")
+	pinID := mountTmpfs(t, pin)
+	processNS, err := os.Readlink(mainThread("ns/mnt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(f.Passwd.Body) != "app:x:1000:1000::/:/bin/sh\n" || string(f.Group.Body) != "base:x:1:\n" {
-		t.Fatalf("passwd %q group %q", f.Passwd.Body, f.Group.Body)
+	type seen struct {
+		idErr, fsErr       error
+		mnt                uint64
+		fs                 unix.Statfs_t
+		inSelf, inThread   bool
+		pinSelf, pinThread bool
+		ns                 string
 	}
-	mounts, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		t.Fatal(err)
+	var got []seen
+	imageMountedHook = func(mfd int) {
+		var s seen
+		s.mnt, s.idErr = mountIDOf(mfd)
+		s.fsErr = unix.Fstatfs(mfd, &s.fs)
+		s.inSelf, s.inThread = inTable("/proc/self/mountinfo", s.mnt), inTable("/proc/thread-self/mountinfo", s.mnt)
+		s.pinSelf, s.pinThread = inTable("/proc/self/mountinfo", pinID), inTable("/proc/thread-self/mountinfo", pinID)
+		s.ns, _ = os.Readlink("/proc/thread-self/ns/mnt")
+		got = append(got, s)
 	}
-	if strings.Contains(string(mounts), mp) {
-		t.Fatal("the image's mount reached the host's mount table")
-	}
-	// One layer: bound read-only.
-	if f, err := readImageFiles(context.Background(), snaps, mp, []string{l1}); err != nil || string(f.Passwd.Body) != "base:x:1:1::/:/bin/sh\n" {
-		t.Fatalf("one layer: %+v, %v", f, err)
+	t.Cleanup(func() { imageMountedHook = nil })
+	for _, tc := range []struct {
+		name          string
+		layers        []string
+		passwd, group string
+	}{
+		{"two layers", []string{l2, l1}, "app:x:1000:1000::/:/bin/sh\n", "base:x:1:\n"},
+		{"one layer", []string{l1}, "base:x:1:1::/:/bin/sh\n", "base:x:1:\n"},
+	} {
+		got = nil
+		f, err := readImageFiles(snaps, empty, tc.layers)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if string(f.Passwd.Body) != tc.passwd || string(f.Group.Body) != tc.group {
+			t.Fatalf("%s: passwd %q group %q", tc.name, f.Passwd.Body, f.Group.Body)
+		}
+		if len(got) != 1 || got[0].idErr != nil || got[0].fsErr != nil {
+			t.Fatalf("%s: mounted %d times: %+v", tc.name, len(got), got)
+		}
+		s := got[0]
+		const want = unix.ST_RDONLY | unix.ST_NOSUID | unix.ST_NODEV | unix.ST_NOEXEC
+		if s.fs.Type != unix.OVERLAYFS_SUPER_MAGIC || s.fs.Flags&want != want {
+			t.Fatalf("%s: the image's mount is type %#x with flags %#x, want overlay with %#x", tc.name, s.fs.Type, s.fs.Flags, want)
+		}
+		if !s.pinSelf || !s.pinThread {
+			t.Fatalf("%s: the tables lack the test's own mount %d (process %v, thread %v)", tc.name, pinID, s.pinSelf, s.pinThread)
+		}
+		if s.inSelf || s.inThread {
+			t.Fatalf("%s: the image's mount %d is in a mount table (process %v, thread %v)", tc.name, s.mnt, s.inSelf, s.inThread)
+		}
+		if s.ns != processNS {
+			t.Fatalf("%s: the read ran in mount namespace %s, not the process's %s", tc.name, s.ns, processNS)
+		}
 	}
 	// No layer: no files, nothing mounted.
-	if f, err := readImageFiles(context.Background(), snaps, mp, nil); err != nil || f.Passwd.Present {
-		t.Fatalf("no layer: %+v, %v", f, err)
+	got = nil
+	if f, err := readImageFiles(snaps, empty, nil); err != nil || f.Passwd.Present || len(got) != 0 {
+		t.Fatalf("no layer: %+v, %v, %d mounts", f, err, len(got))
 	}
-	// A FIFO in the upper layer.
+	// A FIFO in the upper layer is refused, never waited on.
 	if err := os.Remove(filepath.Join(l2, "etc", "passwd")); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Mkfifo(filepath.Join(l2, "etc", "passwd"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	f, err = readImageFiles(ctx, snaps, mp, []string{l2, l1})
-	if err != nil || f.Passwd.Bad == "" {
-		t.Fatalf("a FIFO Passwd: %+v, %v", f, err)
+	type read struct {
+		f   UserFiles
+		err error
 	}
-	// The mount is read-only and noexec: proved by the flags, read inside
-	// the thread's namespace while it is mounted.
-	flags := make(chan string, 1)
-	imageMountedHook = func() {
-		raw, _ := os.ReadFile("/proc/thread-self/mountinfo")
-		for _, line := range strings.Split(string(raw), "\n") {
-			if strings.Contains(line, " "+mp+" ") {
-				flags <- line
-				return
-			}
+	done := make(chan read, 1)
+	go func() {
+		f, err := readImageFiles(snaps, empty, []string{l2, l1})
+		done <- read{f, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil || r.f.Passwd.Bad == "" {
+			t.Fatalf("a FIFO Passwd: %+v, %v", r.f.Passwd, r.err)
 		}
-		flags <- ""
+	case <-time.After(5 * time.Second):
+		t.Fatal("a FIFO Passwd held the read")
 	}
-	t.Cleanup(func() { imageMountedHook = nil })
-	if _, err := readImageFiles(context.Background(), snaps, mp, []string{l2, l1}); err != nil {
+	// Refused: a layer outside the snapshots folder; a layer reached
+	// through a link, even one under the folder; a bottom folder that
+	// holds a file, which would show through.
+	outside := t.TempDir()
+	within(t, outside, map[string]string{"fs/etc/passwd": "evil:x:0:0::/:/bin/sh\n"})
+	if err := os.Symlink(outside, filepath.Join(snaps, "3")); err != nil {
 		t.Fatal(err)
 	}
-	line := <-flags
-	for _, want := range []string{"ro", "nosuid", "nodev", "noexec"} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("the image's mount %q lacks %s", line, want)
+	for name, layers := range map[string][]string{
+		"outside":        {l1, "/etc"},
+		"through a link": {filepath.Join(snaps, "3", "fs"), l1},
+	} {
+		if _, err := readImageFiles(snaps, empty, layers); err == nil {
+			t.Fatalf("a layer %s was mounted", name)
 		}
 	}
-	// A layer outside the snapshots folder is never mounted.
-	if _, err := readImageFiles(context.Background(), snaps, mp, []string{l2, "/etc"}); err == nil {
-		t.Fatal("mounted a folder outside the snapshots")
+	within(t, empty, map[string]string{"etc/passwd": "stray:x:0:0::/:/bin/sh\n"})
+	if _, err := readImageFiles(snaps, empty, []string{l1}); err == nil || !strings.Contains(err.Error(), "holds etc") {
+		t.Fatalf("a bottom folder that is not empty: %v", err)
 	}
 }

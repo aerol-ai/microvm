@@ -30,10 +30,11 @@ import (
 //   - Only the image's layers are read, never the container's writable
 //     layer (rootpolicy.ImageLayers), each a layer folder under the
 //     snapshotter's root.
-//   - They are mounted read-only, nosuid, nodev and noexec, in a mount
-//     namespace of one thread's own, which ends with the read: the mount
-//     is never seen on the host, and is gone even if the helper dies
-//     (imageuser_linux.go).
+//   - They are mounted read-only, nosuid, nodev and noexec, as a detached
+//     mount (the kernel's fsopen and fsmount): attached to no folder of any
+//     mount namespace, never seen on the host, and gone when its file
+//     descriptor closes, even if the helper dies. Nothing changes
+//     namespace or working folder (imageuser_linux.go).
 //   - The two files are opened inside the mounted root, so no link in the
 //     image reaches a host file (openat2 RESOLVE_IN_ROOT); a file that is
 //     not a regular one is never read (a FIFO must not hold the helper),
@@ -57,8 +58,10 @@ import (
 // group files (pkg/oci maxUserFileBytes).
 const maxUserFileBytes = 10 << 20
 
-// imageUserTimeout bounds one read of an image's files; imageUserReads
-// bounds how many run at once (each holds a thread of its own).
+// imageUserTimeout bounds how long a create waits for one read of an
+// image's files; imageUserReads bounds how many reads run at once. A read
+// holds its turn until it ends, even after its caller stopped waiting, so
+// reads stuck in the kernel can never pile up past the bound.
 var (
 	imageUserTimeout = 5 * time.Second
 	imageUserReads   = make(chan struct{}, 8)
@@ -80,9 +83,10 @@ type UserFile struct {
 type UserFiles struct{ Passwd, Group UserFile }
 
 // ImageFileReader reads an image's user files from its layer folders, top
-// first (Options.ReadImageFiles). The helper's own mounts them in a
-// private mount namespace (imageuser_linux.go); tests read a tree.
-type ImageFileReader func(ctx context.Context, snapshotsDir, mountpoint string, layers []string) (UserFiles, error)
+// first, with emptyDir, an empty folder of the helper's, as the bottom
+// layer (Options.ReadImageFiles). The helper's own mounts them detached
+// (imageuser_linux.go); tests read a tree.
+type ImageFileReader func(snapshotsDir, emptyDir string, layers []string) (UserFiles, error)
 
 // userCache keeps resolved image users; a fixed bound, cleared when full.
 type userCache struct {
@@ -130,17 +134,32 @@ func (c *containerCalls) imageUser(ctx context.Context, id, user string) (*rootd
 	}
 	rctx, cancel := context.WithTimeout(ctx, imageUserTimeout)
 	defer cancel()
+	reads := imageUserReads
 	select {
-	case imageUserReads <- struct{}{}:
+	case reads <- struct{}{}:
 	case <-rctx.Done():
 		return nil, imageUserErr("waiting for a turn to read the image's users: %v", rctx.Err())
 	}
-	files, err := c.readImageFiles(rctx, c.snapshotsDir, c.mountpoint, layers)
-	<-imageUserReads
-	if err != nil {
-		return nil, imageUserErr("read the image's users: %v", err)
+	type result struct {
+		files UserFiles
+		err   error
 	}
-	a, err := resolveImageUser(ctx, files, user)
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-reads }()
+		files, err := c.readImageFiles(c.snapshotsDir, c.emptyDir, layers)
+		done <- result{files, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-rctx.Done():
+		return nil, imageUserErr("read the image's users: %v", rctx.Err())
+	}
+	if r.err != nil {
+		return nil, imageUserErr("read the image's users: %v", r.err)
+	}
+	a, err := resolveImageUser(ctx, r.files, user)
 	if err != nil {
 		return nil, imageUserErr("%v", err)
 	}

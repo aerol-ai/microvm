@@ -3,105 +3,145 @@
 package rootd
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
 // readImageFiles reads an image's /etc/passwd and /etc/group from its
-// layer folders (top first) on a thread of its own: the thread takes a
-// mount namespace of its own, mounts the layers read-only there, reads,
-// and ends with the goroutine, its namespace and mount with it. A read
-// that outlives ctx is left to end on its own; the call returns at once.
-func readImageFiles(ctx context.Context, snapshotsDir, mountpoint string, layers []string) (UserFiles, error) {
+// layer folders (top first) through a detached mount: the kernel's mount
+// API (fsopen, fsconfig, fsmount) builds a read-only, nosuid, nodev,
+// noexec overlay of the layers and hands back a file descriptor for its
+// root, attached to no folder of any mount namespace. Nothing changes
+// namespace or folder: no thread, and not the process, so nothing is left
+// in a private namespace afterwards, and nothing copies the helper's mount
+// table (the cost grew with every sandbox's mounts, #1400 review). The
+// mount goes when its descriptor closes, the helper's death included.
+//
+// Each layer is opened under the snapshots folder with no link followed
+// and named to the overlay by its open descriptor (/proc/self/fd/N), so a
+// name is never looked up twice, and an image of many layers fits the
+// kernel's one page of options. emptyDir, the helper's own empty folder,
+// is the bottom layer: an overlay with no upper folder wants two lower
+// ones on older kernels, and an empty one changes nothing in the view.
+//
+// The caller bounds the time (imageUser); this runs on whatever thread.
+func readImageFiles(snapshotsDir, emptyDir string, layers []string) (UserFiles, error) {
 	if len(layers) == 0 {
 		// A snapshot with no parent has no image layer: no files.
 		return UserFiles{}, nil
 	}
-	type result struct {
-		f   UserFiles
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		// Never unlocked: once the thread has a mount namespace of its own
-		// it must not run anything else, and the runtime ends a thread
-		// whose goroutine exits locked.
-		runtime.LockOSThread()
-		f, err := readInPrivateMounts(snapshotsDir, mountpoint, layers)
-		ch <- result{f, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.f, r.err
-	case <-ctx.Done():
-		return UserFiles{}, ctx.Err()
-	}
-}
-
-// readInPrivateMounts runs on a locked thread. unshare(CLONE_NEWNS) gives
-// the thread its own copy of the mount table (and its own working folder,
-// CLONE_FS), and making every mount in it private keeps the mount below
-// from reaching the host's.
-func readInPrivateMounts(snapshotsDir, mountpoint string, layers []string) (UserFiles, error) {
-	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
-		return UserFiles{}, fmt.Errorf("a private mount namespace: %w", err)
-	}
-	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-		return UserFiles{}, fmt.Errorf("make the private namespace's mounts private: %w", err)
-	}
-	const flags = unix.MS_RDONLY | unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC
-	if len(layers) == 1 {
-		// overlayfs wants two lower folders when it has no upper one; a
-		// single layer is its own folder, bound.
-		if err := unix.Mount(layers[0], mountpoint, "", unix.MS_BIND, ""); err != nil {
-			return UserFiles{}, fmt.Errorf("bind the image's layer: %w", err)
-		}
-		defer func() { _ = unix.Unmount(mountpoint, unix.MNT_DETACH) }()
-		if err := unix.Mount("", mountpoint, "", unix.MS_BIND|unix.MS_REMOUNT|flags, ""); err != nil {
-			return UserFiles{}, fmt.Errorf("make the image's layer read-only: %w", err)
-		}
-	} else {
-		// The layers by their names under the snapshots folder, from
-		// there (this thread's own working folder): the kernel takes one
-		// page of mount options, which an image's full paths can fill.
-		rel := make([]string, len(layers))
-		for i, l := range layers {
-			r, err := filepath.Rel(snapshotsDir, l)
-			if err != nil || strings.HasPrefix(r, "..") {
-				return UserFiles{}, fmt.Errorf("layer %s is not under %s", l, snapshotsDir)
-			}
-			rel[i] = r
-		}
-		if err := unix.Chdir(snapshotsDir); err != nil {
-			return UserFiles{}, err
-		}
-		if err := unix.Mount("overlay", mountpoint, "overlay", flags, "lowerdir="+strings.Join(rel, ":")); err != nil {
-			return UserFiles{}, fmt.Errorf("mount the image's layers: %w", err)
-		}
-		defer func() { _ = unix.Unmount(mountpoint, unix.MNT_DETACH) }()
-	}
-	if imageMountedHook != nil {
-		imageMountedHook()
-	}
-	root, err := unix.Open(mountpoint, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	mfd, err := mountImage(snapshotsDir, emptyDir, layers)
 	if err != nil {
 		return UserFiles{}, err
 	}
-	defer func() { _ = unix.Close(root) }()
-	return UserFiles{Passwd: readInRoot(root, "etc/passwd"), Group: readInRoot(root, "etc/group")}, nil
+	defer func() { _ = unix.Close(mfd) }()
+	if imageMountedHook != nil {
+		imageMountedHook(mfd)
+	}
+	return UserFiles{Passwd: readInRoot(mfd, "etc/passwd"), Group: readInRoot(mfd, "etc/group")}, nil
 }
 
-// imageMountedHook runs on the reading thread once the image is mounted;
+// imageMountAttrs are the detached mount's flags.
+const imageMountAttrs = unix.MOUNT_ATTR_RDONLY | unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOEXEC
+
+// mountImage builds the detached overlay of layers over emptyDir and
+// returns its root's descriptor.
+func mountImage(snapshotsDir, emptyDir string, layers []string) (int, error) {
+	sfd, err := unix.Open(snapshotsDir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("snapshots folder: %w", err)
+	}
+	defer func() { _ = unix.Close(sfd) }()
+	var fds []int
+	defer func() {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+	}()
+	beneath := &unix.OpenHow{Flags: unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS}
+	var lower []string
+	for _, l := range layers {
+		rel, err := filepath.Rel(snapshotsDir, l)
+		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+			return -1, fmt.Errorf("layer %s is not under %s", l, snapshotsDir)
+		}
+		fd, err := unix.Openat2(sfd, rel, beneath)
+		if err != nil {
+			return -1, fmt.Errorf("layer %s: %w", l, err)
+		}
+		fds = append(fds, fd)
+		lower = append(lower, "/proc/self/fd/"+strconv.Itoa(fd))
+	}
+	efd, err := unix.Open(emptyDir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, fmt.Errorf("the empty bottom layer: %w", err)
+	}
+	fds = append(fds, efd)
+	if err := isEmpty(efd); err != nil {
+		return -1, fmt.Errorf("the empty bottom layer %s: %w", emptyDir, err)
+	}
+	lower = append(lower, "/proc/self/fd/"+strconv.Itoa(efd))
+
+	fsfd, err := unix.Fsopen("overlay", unix.FSOPEN_CLOEXEC)
+	if err != nil {
+		return -1, fmt.Errorf("fsopen overlay: %w", err)
+	}
+	defer func() { _ = unix.Close(fsfd) }()
+	if err := unix.FsconfigSetString(fsfd, "lowerdir", strings.Join(lower, ":")); err != nil {
+		return -1, fmt.Errorf("overlay lowerdir: %w%s", err, fsLog(fsfd))
+	}
+	if err := unix.FsconfigCreate(fsfd); err != nil {
+		return -1, fmt.Errorf("overlay: %w%s", err, fsLog(fsfd))
+	}
+	mfd, err := unix.Fsmount(fsfd, unix.FSMOUNT_CLOEXEC, imageMountAttrs)
+	if err != nil {
+		return -1, fmt.Errorf("fsmount: %w%s", err, fsLog(fsfd))
+	}
+	return mfd, nil
+}
+
+// isEmpty checks the bottom layer holds nothing: a file there would show
+// through in every image that lacks it. One getdents call.
+func isEmpty(fd int) error {
+	buf := make([]byte, 4096)
+	n, err := unix.Getdents(fd, buf)
+	if err != nil {
+		return err
+	}
+	if _, _, names := unix.ParseDirent(buf[:n], -1, nil); len(names) > 0 {
+		return fmt.Errorf("holds %s", names[0])
+	}
+	return nil
+}
+
+// fsLog reads what the kernel said about a failed fsconfig or fsmount,
+// for the error: a few lines at most.
+func fsLog(fsfd int) string {
+	var msgs []string
+	buf := make([]byte, 512)
+	for range 4 {
+		n, err := unix.Read(fsfd, buf)
+		if err != nil || n <= 0 {
+			break
+		}
+		msgs = append(msgs, strings.TrimSpace(string(buf[:n])))
+	}
+	if len(msgs) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(msgs, "; ") + ")"
+}
+
+// imageMountedHook runs once the image is mounted, with the mount's root;
 // tests read the mount's flags there.
-var imageMountedHook func()
+var imageMountedHook func(mfd int)
 
 // readInRoot opens name inside the root folder root, as the image sees
 // it: every link, absolute ones too, resolves inside root, and never off

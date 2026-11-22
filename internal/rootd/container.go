@@ -50,10 +50,11 @@ type containerCalls struct {
 	// neither snapshot part (tests that give it none).
 	snaps SnapshotReader
 	// readImageFiles reads an image's user files (imageuser_linux.go),
-	// mounting at mountpoint, a folder of the helper's own.
+	// with emptyDir, an empty folder of the helper's own, as the bottom
+	// layer.
 	readImageFiles ImageFileReader
 	snapshotsDir   string
-	mountpoint     string
+	emptyDir       string
 	users          userCache
 	quota          QuotaOps
 	ready          quotaReady
@@ -61,7 +62,7 @@ type containerCalls struct {
 
 func newContainerCalls(cfg Config, opts Options) *containerCalls {
 	c := &containerCalls{policy: cfg.Policy, snaps: opts.Snapshots, readImageFiles: opts.ReadImageFiles, quota: opts.Quota,
-		snapshotsDir: filepath.Join(cfg.Policy.SnapshotterRoot, "snapshots"), mountpoint: cfg.Files.ImageRoot}
+		snapshotsDir: filepath.Join(cfg.Policy.SnapshotterRoot, "snapshots"), emptyDir: cfg.Files.ImageRoot}
 	if c.readImageFiles == nil {
 		c.readImageFiles = readImageFiles
 	}

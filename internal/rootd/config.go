@@ -156,9 +156,9 @@ type FileDirs struct {
 	// folder the agent writes (SB_ROOTD_TOOLBOX_SOURCE); the helper copies
 	// it to Toolbox.
 	ToolboxSource string
-	// ImageRoot is an empty folder of the helper's where it mounts an
-	// image's layers to read its users (imageuser_linux.go), each time in
-	// a mount namespace of its own, so the host never sees the mount.
+	// ImageRoot is an empty folder of the helper's: the bottom layer of
+	// every read of an image's users (imageuser_linux.go), whose overlay
+	// wants two lower folders on older kernels. Nothing is mounted on it.
 	ImageRoot string
 }
 
