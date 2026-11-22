@@ -579,7 +579,11 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 //   - PrepareSandbox is RealizeNetns and SandboxRules in one call, with
 //     the same answers to a repeat; ReleaseSandbox is "make sure it is
 //     gone" for both. Its cgroup part (M1 PR 6) writes the same two
-//     values to the same group each time.
+//     values to the same group each time. Its files part (M1 PR 7) is the
+//     file calls above in one: the same host files, ready socket name,
+//     runsc config and toolbox each time, and fresh FIFOs, as
+//     EnsureTaskFIFOs makes them; ReleaseSandbox's files part is
+//     RemoveContainerFiles.
 //
 // The hostname gateway's calls (M1 PR 5b): BridgeProbe's set-up replaces
 // what its slot had, its send sends one more probe (the gateway counts

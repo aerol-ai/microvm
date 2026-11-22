@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
+
+	"github.com/aerol-ai/microvm/internal/xfsquota"
 )
 
 // DiskGB on the containerd engine (C27, spike S8). Each sandbox's writable
@@ -33,7 +35,7 @@ import (
 // place rather than cleared on destroy.
 
 // projectQuota is the XFS project-quota surface the limit needs
-// (disk_quota_linux.go). Tests substitute a fake.
+// (internal/xfsquota). Tests substitute a fake.
 type projectQuota interface {
 	// Enforced returns nil when dir's filesystem enforces project quotas.
 	Enforced(dir string) error
@@ -45,6 +47,10 @@ type projectQuota interface {
 }
 
 var diskQuotaOps projectQuota = xfsProjectQuota{}
+
+// xfsProjectQuota is the kernel's XFS project quotas (internal/xfsquota),
+// which the root helper's disk_quota part drives in split mode too.
+type xfsProjectQuota = xfsquota.Ops
 
 // snapshotMounter is the snapshotter surface that names a snapshot's
 // directories. Tests inject a fake.

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 
 	"golang.org/x/sys/unix"
@@ -98,6 +99,9 @@ const (
 	// ReasonNotAgentSocket: what the agent's ready folder holds under a
 	// container's name is not a socket the agent owns.
 	ReasonNotAgentSocket = "not_agent_socket"
+	// ReasonBadToolbox: the agent's toolbox binary is not a regular file
+	// of the agent's, of a sane size (toolbox.go).
+	ReasonBadToolbox = "bad_toolbox"
 )
 
 // runscFlags are the runsc flags every gVisor sandbox gets. [runsc_config]
@@ -137,8 +141,15 @@ type files struct {
 	agentUID uint32
 	// owner is root, or the test's own user, as for the socket's folder.
 	owner uint32
-	// The helper's folders, open for the server's whole life.
-	hosts, ready, fifo, runsc int
+	// The helper's folders, open for the server's whole life. toolbox is
+	// -1 unless the helper copies the agent's toolbox (toolbox.go).
+	hosts, ready, fifo, runsc, toolbox int
+
+	// toolboxMu orders the toolbox copies; toolboxLast is the source the
+	// copy was made from, once toolboxCopied.
+	toolboxMu     sync.Mutex
+	toolboxLast   toolboxStamp
+	toolboxCopied bool
 }
 
 // openFiles makes the helper's folders where missing and opens each.
@@ -147,11 +158,30 @@ type files struct {
 // swapped in.
 func openFiles(cfg Config) (*files, error) {
 	f := &files{dirs: cfg.Files, fifoDir: cfg.Policy.FIFODir, gid: cfg.SocketGID, agentUID: cfg.AgentUID,
-		owner: uint32(os.Geteuid()), hosts: -1, ready: -1, fifo: -1, runsc: -1}
-	for _, d := range []struct {
+		owner: uint32(os.Geteuid()), hosts: -1, ready: -1, fifo: -1, runsc: -1, toolbox: -1}
+	folders := []struct {
 		dir string
 		fd  *int
-	}{{f.dirs.Hosts, &f.hosts}, {f.dirs.Ready, &f.ready}, {f.fifoDir, &f.fifo}, {f.dirs.Runsc, &f.runsc}} {
+	}{{f.dirs.Hosts, &f.hosts}, {f.dirs.Ready, &f.ready}, {f.fifoDir, &f.fifo}, {f.dirs.Runsc, &f.runsc}}
+	if f.dirs.ToolboxSource != "" {
+		folders = append(folders, struct {
+			dir string
+			fd  *int
+		}{filepath.Dir(f.dirs.Toolbox), &f.toolbox})
+	}
+	if err := checkLinkCapability(cfg.AgentUID); err != nil {
+		return nil, err
+	}
+	if cfg.Files.ImageRoot != "" {
+		// Made root's alone here, and kept empty: the bottom layer of
+		// every read of an image's users (imageuser_linux.go).
+		fd, err := openFolder(cfg.Files.ImageRoot)
+		if err != nil {
+			return nil, fmt.Errorf("root helper: folder %s: %w", cfg.Files.ImageRoot, err)
+		}
+		_ = unix.Close(fd)
+	}
+	for _, d := range folders {
 		// openFolder makes a missing folder through the checked folder
 		// above it: making the path first would follow a link someone put
 		// on the way (review N2).
@@ -180,11 +210,14 @@ func openFiles(cfg Config) (*files, error) {
 	// own folder goes with RemoveContainerFiles). Clear those now. Best
 	// effort: a leftover is harmless, so it never stops the helper.
 	sweepTmpNames(f.runsc, runscDefaultFile, runscRestoreFile)
+	if f.toolbox >= 0 {
+		sweepTmpNames(f.toolbox, toolboxFile)
+	}
 	return f, nil
 }
 
 func (f *files) close() {
-	for _, fd := range []*int{&f.hosts, &f.ready, &f.fifo, &f.runsc} {
+	for _, fd := range []*int{&f.hosts, &f.ready, &f.fifo, &f.runsc, &f.toolbox} {
 		if *fd >= 0 {
 			_ = unix.Close(*fd)
 			*fd = -1

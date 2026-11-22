@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -41,7 +42,7 @@ func TestMarkSandboxCgroup(t *testing.T) {
 	c := New(Config{Socket: sock, HelperUID: uint32(os.Getuid()), OnRefusal: func(_ context.Context, r Refusal) { refusals = append(refusals, r) }})
 	t.Cleanup(func() { _ = c.Close() })
 	ctx := ctxT(t)
-	if parts, err := c.Parts(ctx); err != nil || len(parts) != 1 || parts[0] != rootdpb.PartCgroup {
+	if parts, err := c.Parts(ctx); err != nil || !slices.Equal(parts, []string{rootdpb.PartCgroup, rootdpb.PartFiles}) {
 		t.Fatalf("Parts = %v, %v", parts, err)
 	}
 	if err := c.MarkSandboxCgroup(ctx, "sb-1"); err != nil {

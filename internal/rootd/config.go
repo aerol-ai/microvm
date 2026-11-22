@@ -148,6 +148,18 @@ type FileDirs struct {
 	// DockerReadySocketDir). The helper hard-links each socket from here
 	// into Ready, so both must be on one filesystem.
 	AgentReady string
+	// Toolbox is the toolbox binary specs bind (toolbox.go), one of the
+	// policy's bind files: the operator's, or the helper's own copy of
+	// ToolboxSource, in a folder of the helper's.
+	Toolbox string
+	// ToolboxSource, when set, is the agent's copy of toolboxd, in a
+	// folder the agent writes (SB_ROOTD_TOOLBOX_SOURCE); the helper copies
+	// it to Toolbox.
+	ToolboxSource string
+	// ImageRoot is an empty folder of the helper's: the bottom layer of
+	// every read of an image's users (imageuser_linux.go), whose overlay
+	// wants two lower folders on older kernels. Nothing is mounted on it.
+	ImageRoot string
 }
 
 // validate checks the folders and that the policy lets the gate accept
@@ -180,6 +192,34 @@ func (d FileDirs) validate(p rootpolicy.Policy, socketDir string) error {
 	for _, path := range []string{d.runscPath(runscDefaultFile), d.runscPath(runscRestoreFile)} {
 		if !slices.Contains(p.RunscConfigPaths, path) {
 			return fmt.Errorf("root helper: the policy's runsc configs %v lack %s, which the helper writes", p.RunscConfigPaths, path)
+		}
+	}
+	if d.ImageRoot != "" {
+		if !filepath.IsAbs(d.ImageRoot) || filepath.Clean(d.ImageRoot) != d.ImageRoot || d.ImageRoot == "/" {
+			return fmt.Errorf("root helper: image root %q: want a clean absolute folder other than /", d.ImageRoot)
+		}
+		for _, f := range folders {
+			if d.ImageRoot == f.dir || strings.HasPrefix(d.ImageRoot, f.dir+"/") || strings.HasPrefix(f.dir, d.ImageRoot+"/") {
+				return fmt.Errorf("root helper: the image root %s and the %s folder %s overlap", d.ImageRoot, f.name, f.dir)
+			}
+		}
+	}
+	if d.Toolbox != "" && !slices.Contains(p.BindFiles, d.Toolbox) {
+		return fmt.Errorf("root helper: the policy's bind files %v lack the toolbox binary %s", p.BindFiles, d.Toolbox)
+	}
+	if d.ToolboxSource != "" {
+		if d.Toolbox == "" || filepath.Base(d.Toolbox) != toolboxFile {
+			return fmt.Errorf("root helper: the toolbox copy %q must be a %s in a folder of the helper's", d.Toolbox, toolboxFile)
+		}
+		if !filepath.IsAbs(d.ToolboxSource) || filepath.Clean(d.ToolboxSource) != d.ToolboxSource {
+			return fmt.Errorf("root helper: toolbox source %q: want a clean absolute path", d.ToolboxSource)
+		}
+		// The copy's folder holds the copy alone, so no other folder of the
+		// helper's may hold it or sit in it.
+		for _, f := range folders {
+			if dir := filepath.Dir(d.Toolbox); dir == f.dir || strings.HasPrefix(dir, f.dir+"/") || strings.HasPrefix(f.dir, dir+"/") {
+				return fmt.Errorf("root helper: the toolbox copy's folder %s and the %s folder %s overlap", dir, f.name, f.dir)
+			}
 		}
 	}
 	return nil
@@ -299,6 +339,13 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	fifoDir := path("SB_ROOTD_FIFO_DIR", defaultFIFODir)
 	readyDir := path("SB_ROOTD_READY_DIR", defaultReadyDir)
 	toolbox := path("SB_TOOLBOX_BINARY_PATH", defaultToolbox)
+	toolboxSource := ""
+	if strings.TrimSpace(getenv("SB_ROOTD_TOOLBOX_SOURCE")) != "" {
+		// The agent's copy, which the helper copies into its state folder;
+		// specs bind the helper's copy (toolbox.go).
+		toolboxSource = path("SB_ROOTD_TOOLBOX_SOURCE", "")
+		toolbox = filepath.Join(stateDir, "toolbox", toolboxFile)
+	}
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
 	netnsDir := path("SB_ROOTD_NETNS_DIR", DefaultNetnsDir)
 	cniPlugins := path("SB_CONTAINERD_CNI_PLUGIN_DIR", defaultCNIPluginDir)
@@ -315,7 +362,10 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		Ready: readyDir,
 		Runsc: filepath.Join(stateDir, "runsc"),
 		// sandboxd's config.DockerReadySocketDir.
-		AgentReady: filepath.Join(credDir, "docker", "ready"),
+		AgentReady:    filepath.Join(credDir, "docker", "ready"),
+		Toolbox:       toolbox,
+		ToolboxSource: toolboxSource,
+		ImageRoot:     filepath.Join(stateDir, "imageroot"),
 	}
 	// The agent owns its folders and can rename anything below them, a
 	// folder root made included, so nothing root trusts may sit there.

@@ -224,6 +224,12 @@ type fakeContainer struct {
 	attachFIFOs *cio.FIFOSet
 	// runtime is the container's shim, as containerd records it.
 	runtime containers.RuntimeInfo
+	// taskIO is the IO creator the last NewTask was given; with runIO set,
+	// NewTask calls it, as containerd's client does, and keeps its IO in
+	// tio.
+	taskIO cio.Creator
+	runIO  bool
+	tio    cio.IO
 }
 
 func (c *fakeContainer) ID() string { return c.id }
@@ -265,7 +271,15 @@ func (c *fakeContainer) Delete(context.Context, ...cntr.DeleteOpts) error {
 	}
 	return nil
 }
-func (c *fakeContainer) NewTask(context.Context, cio.Creator, ...cntr.NewTaskOpts) (cntr.Task, error) {
+func (c *fakeContainer) NewTask(_ context.Context, creator cio.Creator, _ ...cntr.NewTaskOpts) (cntr.Task, error) {
+	c.taskIO = creator
+	if c.runIO && creator != nil {
+		tio, err := creator(c.id)
+		if err != nil {
+			return nil, err
+		}
+		c.tio = tio
+	}
 	if c.newTaskErr != nil {
 		return nil, c.newTaskErr
 	}
