@@ -518,6 +518,8 @@ func FuzzIngestBuildArchive(f *testing.F) {
 // per input is too slow to explore with.
 type memIngester struct {
 	blobs map[digest.Digest][]byte
+	// written counts every byte handed to a writer, committed or not.
+	written int64
 }
 
 func (m *memIngester) Writer(_ context.Context, opts ...content.WriterOpt) (content.Writer, error) {
@@ -539,10 +541,13 @@ type memWriter struct {
 	buf bytes.Buffer
 }
 
-func (w *memWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
-func (w *memWriter) Close() error                { return nil }
-func (w *memWriter) Digest() digest.Digest       { return digest.FromBytes(w.buf.Bytes()) }
-func (w *memWriter) Truncate(int64) error        { return errors.New("not supported") }
+func (w *memWriter) Write(p []byte) (int, error) {
+	w.m.written += int64(len(p))
+	return w.buf.Write(p)
+}
+func (w *memWriter) Close() error          { return nil }
+func (w *memWriter) Digest() digest.Digest { return digest.FromBytes(w.buf.Bytes()) }
+func (w *memWriter) Truncate(int64) error  { return errors.New("not supported") }
 func (w *memWriter) Status() (content.Status, error) {
 	return content.Status{Ref: w.ref, Offset: int64(w.buf.Len())}, nil
 }

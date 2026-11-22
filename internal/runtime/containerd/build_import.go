@@ -34,8 +34,12 @@ import (
 // untrusted input. ingestBuildArchive reads it under these rules:
 //   - only an OCI image layout: oci-layout, index.json and blobs/sha256/<hex>,
 //     the three folders above them, and nothing else (no Docker
-//     manifest.json, no links, no devices);
-//   - at most maxBytes read in all, and small caps on the two JSON files;
+//     manifest.json, no links, no devices, no sparse files: a sparse entry
+//     describes any size of zeros in a few bytes);
+//   - at most maxBytes, both read and declared by the entries' headers, at
+//     most maxBuildArchiveEntries entries, small caps on the two JSON files,
+//     and maxBuildManifestBytes on each manifest, index and config, which
+//     are read whole (checked by their descriptors' sizes, before reading);
 //   - every blob's bytes hash to the name it carries, even when containerd
 //     already holds that content: a build names only content it supplies,
 //     so it can never pick up another image's layer by its digest;
@@ -47,6 +51,14 @@ import (
 const (
 	maxBuildLayoutBytes = 4 << 10
 	maxBuildIndexBytes  = 1 << 20
+	// maxBuildManifestBytes caps each manifest, index and config, which
+	// are read whole into memory: the size a registry pull allows a
+	// manifest (containerd's remotes, 4 MiB).
+	maxBuildManifestBytes = 4 << 20
+	// maxBuildArchiveEntries caps the entries an archive may hold. Each
+	// blob is a containerd write (through the gate in split mode), and
+	// containerd's own image walk stops at 10,000 children.
+	maxBuildArchiveEntries = 10000
 )
 
 // errBuildArchiveTooLarge is returned once an archive passes its bound.
@@ -122,6 +134,8 @@ func ingestBuildArchive(ctx context.Context, cs content.Ingester, archive io.Rea
 	tr := tar.NewReader(&boundedReader{r: archive, left: maxBytes})
 	blobs := map[digest.Digest]int64{}
 	var layout, index []byte
+	var entries int
+	var declared int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -129,6 +143,9 @@ func ingestBuildArchive(ctx context.Context, cs content.Ingester, archive io.Rea
 		}
 		if err != nil {
 			return ocispec.Descriptor{}, nil, fmt.Errorf("read the build's image archive: %w", err)
+		}
+		if entries++; entries > maxBuildArchiveEntries {
+			return ocispec.Descriptor{}, nil, fmt.Errorf("the build's image archive has more than %d entries", maxBuildArchiveEntries)
 		}
 		name := strings.TrimPrefix(hdr.Name, "./")
 		switch hdr.Typeflag {
@@ -138,6 +155,15 @@ func ingestBuildArchive(ctx context.Context, cs content.Ingester, archive io.Rea
 			}
 			continue
 		case tar.TypeReg:
+			// The size a header declares is what an entry becomes; a sparse
+			// one declares far more than the archive carries.
+			if isSparse(hdr) {
+				return ocispec.Descriptor{}, nil, fmt.Errorf("the build's image archive entry %.64q is a sparse file", hdr.Name)
+			}
+			if hdr.Size < 0 || hdr.Size > maxBytes-declared {
+				return ocispec.Descriptor{}, nil, fmt.Errorf("%w: its entries declare more than %d bytes", errBuildArchiveTooLarge, maxBytes)
+			}
+			declared += hdr.Size
 		default:
 			return ocispec.Descriptor{}, nil, fmt.Errorf("the build's image archive entry %.64q is not a file or folder", hdr.Name)
 		}
@@ -214,6 +240,9 @@ func buildArchiveTarget(layout, index []byte, blobs map[digest.Digest]int64) (oc
 	if !ok || size != m.Size {
 		return ocispec.Descriptor{}, fmt.Errorf("the build's image %s is not in its archive at size %d", m.Digest, m.Size)
 	}
+	if err := checkReadWholeSize(m); err != nil {
+		return ocispec.Descriptor{}, err
+	}
 	return ocispec.Descriptor{MediaType: m.MediaType, Digest: m.Digest, Size: m.Size}, nil
 }
 
@@ -226,6 +255,11 @@ func labelBuildImage(ctx context.Context, cs content.Store, target ocispec.Descr
 		return images.Children(ctx, cs, desc)
 	})
 	var walk images.HandlerFunc = func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		// Checked before anything reads it: a manifest or index is read
+		// whole here, a config by the unpack.
+		if err := checkReadWholeSize(desc); err != nil {
+			return nil, err
+		}
 		children, err := images.FilterPlatforms(carried, platforms.Default())(ctx, desc)
 		if err != nil {
 			return nil, err
@@ -241,6 +275,30 @@ func labelBuildImage(ctx context.Context, cs content.Store, target ocispec.Descr
 		return fmt.Errorf("build import: %w", err)
 	}
 	return nil
+}
+
+// checkReadWholeSize refuses a blob that is read whole into memory (every
+// one but a layer: manifests, indexes, configs) over maxBuildManifestBytes.
+func checkReadWholeSize(desc ocispec.Descriptor) error {
+	if images.IsLayerType(desc.MediaType) || desc.Size <= maxBuildManifestBytes {
+		return nil
+	}
+	return fmt.Errorf("the build's image names %s (%.64s) of %d bytes, more than the %d a manifest, index or config may be",
+		desc.Digest, desc.MediaType, desc.Size, maxBuildManifestBytes)
+}
+
+// isSparse reports whether a tar header describes a sparse file, in GNU's
+// old format or as PAX GNU.sparse.* records.
+func isSparse(hdr *tar.Header) bool {
+	if hdr.Typeflag == tar.TypeGNUSparse {
+		return true
+	}
+	for k := range hdr.PAXRecords {
+		if strings.HasPrefix(k, "GNU.sparse.") {
+			return true
+		}
+	}
+	return false
 }
 
 // blobDigest is the sha256 digest a blob's file name in the archive
