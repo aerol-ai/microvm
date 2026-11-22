@@ -22,7 +22,12 @@ func TestUploadSharedWithGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A uid sandboxd cannot chown to: Share must not try.
-	h := New(Config{SandboxID: "sb", WorkDir: dir, Owner: Owner{UID: 4242424, GID: os.Getgid(), Share: true}})
+	gid := os.Getgid()
+	if gid == 0 {
+		// Root's gid 0 is no owner at all; root may share with any group.
+		gid = 4242
+	}
+	h := New(Config{SandboxID: "sb", WorkDir: dir, Owner: Owner{UID: 4242424, GID: gid, Share: true}})
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
 	_ = w.WriteField("path", "/a/b/f.txt")

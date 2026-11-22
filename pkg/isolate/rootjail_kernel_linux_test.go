@@ -48,7 +48,7 @@ func TestRootJailOnTheKernel(t *testing.T) {
 		uid, gid int
 		mode     uint32
 	}{
-		run:                                    {65531, 1001, unix.S_ISGID | 0o770},
+		run:                                    {65531, 1001, unix.S_ISGID | unix.S_ISVTX | 0o770},
 		filepath.Join(base, "tenant-a", "tmp"): {1000, 1001, 0o700},
 	} {
 		var st unix.Stat_t

@@ -737,3 +737,19 @@ func TestHostKindNames(t *testing.T) {
 		t.Fatal("a helper with no host calls serves kinds")
 	}
 }
+
+// TestHostsRefusalMakesNoGroup: a request the kind's own checks refuse (a
+// WASM cache up the tree, a setting off the list) leaves no group behind:
+// the kind checks before the helper makes anything.
+func TestHostsRefusalMakesNoGroup(t *testing.T) {
+	r, kernel, l := hostsRig(t)
+	l.fail["command"] = badRequest("root helper: refused by the kind")
+	if _, err := hostClient(r).SpawnHost(callCtx(t), &rootdpb.SpawnHostRequest{Kind: workerd, Id: "g"}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("spawn = %v", err)
+	}
+	kernel.mu.Lock()
+	defer kernel.mu.Unlock()
+	if len(kernel.groups) != 0 || len(kernel.started) != 0 {
+		t.Fatalf("a refused request made groups %v, started %v", kernel.groups, kernel.started)
+	}
+}

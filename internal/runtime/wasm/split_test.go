@@ -21,7 +21,7 @@ const helperSockets = "/run/aerolvm-rootd/wasm"
 func splitDriver(t *testing.T) (*Driver, *adoptingSupervisor, *adoptingSupervisor, map[string]*socketClient) {
 	d, per, res, clients := adoptDriver(t, true)
 	d.cfg.HelperSockets = helperSockets
-	d.cfg.Worker = worker.Confinement{UID: 61000, GID: os.Getgid()}
+	d.cfg.Worker = worker.Confinement{UID: 61000, GID: shareGID()}
 	d.workerCgroup = nil
 	return d, per, res, clients
 }
@@ -104,7 +104,7 @@ func TestSplitHandsFoldersToTheGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode()&os.ModeSetgid == 0 || st.Mode().Perm() != 0o770 || int(st.Sys().(*syscall.Stat_t).Gid) != os.Getgid() {
+	if st.Mode()&os.ModeSetgid == 0 || st.Mode().Perm() != 0o770 || int(st.Sys().(*syscall.Stat_t).Gid) != shareGID() {
 		t.Fatalf("work dir %v gid %d", st.Mode(), st.Sys().(*syscall.Stat_t).Gid)
 	}
 	// A /work that is there already is handed over the same way.
@@ -185,4 +185,13 @@ func TestSplitRecordRoutes(t *testing.T) {
 			t.Errorf("%s: %v, want %v", name, got, tc.want)
 		}
 	}
+}
+
+// shareGID is a group this test may give a folder to: its own, or, as
+// root, whose gid 0 turns the worker's confinement off, another.
+func shareGID() int {
+	if g := os.Getgid(); g != 0 {
+		return g
+	}
+	return 4242
 }
