@@ -148,21 +148,6 @@ func addOffset(base net.IP, delta uint32) net.IP {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
-// Slot is the Pool-level view of an allocated network slot. Mirrors
-// store.FirecrackerTapSlot but lives in this package so callers (the
-// Firecracker driver) depend on the policy layer's type, not the
-// store's. SandboxID is always non-empty here — a Slot returned by the
-// pool is always claimed. GuestMAC is an optional host-neighbor override
-// used by snapshot restores whose guest NIC MAC is frozen in snapshot state.
-type Slot struct {
-	TapName  string
-	CIDR     string
-	HostIP   string
-	GuestIP  string
-	VsockCID uint32
-	GuestMAC string
-}
-
 // Allocate claims a slot for sandboxID. Idempotent (re-Allocate for the
 // same sandbox returns the existing slot, not a new one). Returns
 // store.ErrNoFreeFirecrackerTapSlot when the pool is exhausted — the

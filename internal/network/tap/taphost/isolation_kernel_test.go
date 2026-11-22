@@ -1,6 +1,6 @@
 //go:build linux && kerneltest
 
-package tap
+package taphost
 
 // Guest isolation on a real kernel, as root:
 //
