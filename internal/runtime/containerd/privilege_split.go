@@ -30,7 +30,9 @@ import (
 //     points single mode writes the group's files itself;
 //   - it has the helper make the files root opens because a container
 //     names them, in the helper's own folders, and remove them with the
-//     container (M1 PR 7, split_files.go).
+//     container (M1 PR 7, split_files.go); and, in a create's same call,
+//     limit the writable layer and resolve the image's user from the
+//     image's own files (split_create.go).
 //
 // The netns pool's build and teardown go through the helper too, in
 // pkg/daemon's wiring. The rest of a create and a start is root work the
@@ -107,14 +109,16 @@ func (d *Driver) taskAddress(ctx context.Context, task cntr.Task) (string, error
 
 // splitCreateGaps is the root work a create needs that split mode does not
 // do yet. A create in split mode fails with it before it starts. The
-// cgroup settings (F10) are the helper's since M1 PR 6, the container
-// files since M1 PR 7, when the helper client has container parts.
+// cgroup settings (F10) are the helper's since M1 PR 6; the container
+// files, the image's user and the disk limit since M1 PR 7, when the
+// helper client has container parts. A helper too old for one of those
+// parts fails the create at its call instead (rootclient: the handshake's
+// parts), before anything is made.
 func (d *Driver) splitCreateGaps(req models.CreateSandboxRequest) error {
-	var steps []privmode.Step
-	if d.parts == nil {
-		steps = append(steps, privmode.StepContainerFile)
+	if d.parts != nil {
+		return nil
 	}
-	steps = append(steps, privmode.StepImageUser)
+	steps := []privmode.Step{privmode.StepContainerFile, privmode.StepImageUser}
 	if d.cfg.DiskQuota && req.DiskGB > 0 {
 		steps = append(steps, privmode.StepDiskQuota)
 	}

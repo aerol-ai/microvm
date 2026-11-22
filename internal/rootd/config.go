@@ -156,6 +156,10 @@ type FileDirs struct {
 	// folder the agent writes (SB_ROOTD_TOOLBOX_SOURCE); the helper copies
 	// it to Toolbox.
 	ToolboxSource string
+	// ImageRoot is an empty folder of the helper's: the bottom layer of
+	// every read of an image's users (imageuser_linux.go), whose overlay
+	// wants two lower folders on older kernels. Nothing is mounted on it.
+	ImageRoot string
 }
 
 // validate checks the folders and that the policy lets the gate accept
@@ -188,6 +192,16 @@ func (d FileDirs) validate(p rootpolicy.Policy, socketDir string) error {
 	for _, path := range []string{d.runscPath(runscDefaultFile), d.runscPath(runscRestoreFile)} {
 		if !slices.Contains(p.RunscConfigPaths, path) {
 			return fmt.Errorf("root helper: the policy's runsc configs %v lack %s, which the helper writes", p.RunscConfigPaths, path)
+		}
+	}
+	if d.ImageRoot != "" {
+		if !filepath.IsAbs(d.ImageRoot) || filepath.Clean(d.ImageRoot) != d.ImageRoot || d.ImageRoot == "/" {
+			return fmt.Errorf("root helper: image root %q: want a clean absolute folder other than /", d.ImageRoot)
+		}
+		for _, f := range folders {
+			if d.ImageRoot == f.dir || strings.HasPrefix(d.ImageRoot, f.dir+"/") || strings.HasPrefix(f.dir, d.ImageRoot+"/") {
+				return fmt.Errorf("root helper: the image root %s and the %s folder %s overlap", d.ImageRoot, f.name, f.dir)
+			}
 		}
 	}
 	if d.Toolbox != "" && !slices.Contains(p.BindFiles, d.Toolbox) {
@@ -351,6 +365,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		AgentReady:    filepath.Join(credDir, "docker", "ready"),
 		Toolbox:       toolbox,
 		ToolboxSource: toolboxSource,
+		ImageRoot:     filepath.Join(stateDir, "imageroot"),
 	}
 	// The agent owns its folders and can rename anything below them, a
 	// folder root made included, so nothing root trusts may sit there.

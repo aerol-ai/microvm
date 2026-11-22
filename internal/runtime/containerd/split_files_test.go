@@ -35,8 +35,10 @@ type fakeParts struct {
 	releases   []*rootdpb.ReleaseSandboxRequest
 	prepareErr error
 	releaseErr error
-	// drop leaves one path out of the answer.
-	drop string
+	// drop leaves one path out of the answer; noUser leaves out the
+	// image's user.
+	drop   string
+	noUser bool
 	// during runs inside each prepare, as the helper would see the host.
 	during func(*rootdpb.PrepareSandboxRequest)
 }
@@ -83,7 +85,11 @@ func (p *fakeParts) PrepareSandbox(_ context.Context, req *rootdpb.PrepareSandbo
 	case "ready":
 		f.ReadySocketPath = ""
 	}
-	return &rootdpb.PrepareSandboxResponse{Files: f}, nil
+	resp := &rootdpb.PrepareSandboxResponse{Files: f}
+	if req.GetImageUser() != nil && !p.noUser {
+		resp.ImageUser = &rootdpb.ImageUserAnswer{Uid: 1000, Gid: 1000, AdditionalGids: []uint32{1000, 10}}
+	}
+	return resp, nil
 }
 
 func (p *fakeParts) ReleaseSandbox(_ context.Context, req *rootdpb.ReleaseSandboxRequest) error {
@@ -293,8 +299,8 @@ func TestSplitDestroyReleasesHelperFiles(t *testing.T) {
 }
 
 // TestSplitGapsWithContainerParts: with the helper's container parts a
-// split start names no gap, and a split create no longer names the
-// container files; without them both still do.
+// split start and a split create name no gap (M1 PR 7); without them both
+// still do.
 func TestSplitGapsWithContainerParts(t *testing.T) {
 	d := newTestDriver(t)
 	d.SetRootHelper(newPartsHelper(t))
@@ -302,11 +308,14 @@ func TestSplitGapsWithContainerParts(t *testing.T) {
 		t.Fatal("a start with container parts has a gap")
 	}
 	var g *privmode.Gap
-	err := d.splitCreateGaps(models.CreateSandboxRequest{})
-	if !errors.As(err, &g) || slices.Contains(g.Steps, privmode.StepContainerFile) || !slices.Contains(g.Steps, privmode.StepImageUser) {
+	d.cfg.DiskQuota = true
+	if err := d.splitCreateGaps(models.CreateSandboxRequest{DiskGB: 3}); err != nil {
 		t.Fatalf("create gaps %v", err)
 	}
 	d.SetRootHelper(&fakeHelper{})
+	if err := d.splitCreateGaps(models.CreateSandboxRequest{DiskGB: 3}); !errors.As(err, &g) || len(g.Steps) != 3 {
+		t.Fatalf("create gaps without parts %v", err)
+	}
 	if !errors.As(d.splitStartGaps(), &g) || !slices.Equal(g.Steps, []privmode.Step{privmode.StepContainerFile}) {
 		t.Fatalf("start gaps without parts %v", d.splitStartGaps())
 	}

@@ -442,10 +442,12 @@ func TestWireContainerEngineSplit(t *testing.T) {
 	if w.netns == nil {
 		t.Fatal("no netns pool")
 	}
-	// The driver is in split mode: a create names its gaps.
+	// The driver is in split mode, with the helper's container parts (M1
+	// PR 7): a create names no gap, and goes on to its own checks (this
+	// test's config has no toolbox binary).
 	_, err = w.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine"}, "sb-1", "t", nil)
-	if !errors.Is(err, privmode.ErrGap) {
-		t.Fatalf("Create = %v, want a Gap", err)
+	if errors.Is(err, privmode.ErrGap) || err == nil || !strings.Contains(err.Error(), "SB_TOOLBOX_BINARY_PATH") {
+		t.Fatalf("Create = %v, want past the gaps", err)
 	}
 	// F10's marks go to the helper (M1 PR 6), by container: the cgroup
 	// tree below holds the parent alone, so a mark written in process

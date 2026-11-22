@@ -150,9 +150,12 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.ContainerSetup": {"naming=1:message", "task_fifos=2:bool", "ready_nonce=3:string", "runsc_config=4:enum", "toolbox=5:bool"},
 		"aerolvm.rootd.v1.SandboxFilePaths": {"hostname_path=1:string", "hosts_path=2:string", "resolv_conf_path=3:string",
 			"stdout_path=4:string", "stderr_path=5:string", "ready_socket_path=6:string", "runsc_config_path=7:string", "toolbox_path=8:string"},
+		"aerolvm.rootd.v1.ImageUser":       {"user=1:string"},
+		"aerolvm.rootd.v1.ImageUserAnswer": {"uid=1:uint32", "gid=2:uint32", "additional_gids=3:repeated uint32"},
+		"aerolvm.rootd.v1.DiskQuota":       {"bytes=1:uint64"},
 		"aerolvm.rootd.v1.PrepareSandboxRequest": {"netns_name=1:string", "parts=2:repeated string", "container_ip=3:string", "firewall=4:message", "cgroup=5:message",
-			"container_id=6:string", "setup=7:message"},
-		"aerolvm.rootd.v1.PrepareSandboxResponse": {"netns_path=1:string", "container_ip=2:string", "block_inserted=3:bool", "files=4:message"},
+			"container_id=6:string", "setup=7:message", "image_user=8:message", "disk_quota=9:message"},
+		"aerolvm.rootd.v1.PrepareSandboxResponse": {"netns_path=1:string", "container_ip=2:string", "block_inserted=3:bool", "files=4:message", "image_user=5:message"},
 		"aerolvm.rootd.v1.ReleaseSandboxRequest":  {"netns_name=1:string", "container_ip=2:string", "parts=3:repeated string", "container_id=4:string"},
 		"aerolvm.rootd.v1.ReleaseSandboxResponse": nil,
 		"aerolvm.rootd.v1.BridgeProbeRequest":     {"op=1:enum", "slot=2:uint32"},
@@ -351,6 +354,8 @@ func fillMessage(m protoreflect.Message) {
 			v = protoreflect.ValueOfBytes([]byte{1})
 		case protoreflect.Uint32Kind:
 			v = protoreflect.ValueOfUint32(1)
+		case protoreflect.Uint64Kind:
+			v = protoreflect.ValueOfUint64(1)
 		case protoreflect.BoolKind:
 			v = protoreflect.ValueOfBool(true)
 		case protoreflect.EnumKind:

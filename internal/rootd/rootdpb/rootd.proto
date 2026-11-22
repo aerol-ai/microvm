@@ -458,6 +458,32 @@ message SandboxFilePaths {
   string toolbox_path = 8;
 }
 
+// ImageUser asks which user a container's image runs as (part
+// "image_user"): its config's USER, resolved against the image's own
+// /etc/passwd and /etc/group as containerd's oci.WithImageConfig does.
+// The image is the one in the container's root filesystem snapshot, whose
+// key is the container's ID; the helper reads it from containerd itself.
+message ImageUser {
+  // The image config's USER; empty when it names none.
+  string user = 1;
+}
+
+// ImageUserAnswer is what an image's user resolves to, for the spec's
+// process: what oci.WithImageConfig would set.
+message ImageUserAnswer {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  repeated uint32 additional_gids = 3;
+}
+
+// DiskQuota asks for a hard limit on a container's writable layer (part
+// "disk_quota"): an XFS project of its own, from AerolVM's fixed range,
+// over the snapshot's own folder. The helper finds the folder from
+// containerd's answer for the container's snapshot.
+message DiskQuota {
+  uint64 bytes = 1;
+}
+
 message PrepareSandboxRequest {
   // The netns-pool slot the sandbox gets.
   string netns_name = 1;
@@ -477,6 +503,10 @@ message PrepareSandboxRequest {
   string container_id = 6;
   // Part "files".
   ContainerSetup setup = 7;
+  // Part "image_user".
+  ImageUser image_user = 8;
+  // Part "disk_quota".
+  DiskQuota disk_quota = 9;
 }
 
 message PrepareSandboxResponse {
@@ -487,6 +517,8 @@ message PrepareSandboxResponse {
   bool block_inserted = 3;
   // Part "files".
   SandboxFilePaths files = 4;
+  // Part "image_user".
+  ImageUserAnswer image_user = 5;
 }
 
 message ReleaseSandboxRequest {

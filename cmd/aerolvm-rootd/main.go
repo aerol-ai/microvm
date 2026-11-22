@@ -132,6 +132,12 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func
 	if opts.Containers == nil {
 		opts.Containers = containerdContainers{c: containersapi.NewContainersClient(upstream), ns: cfg.Policy.Namespace}
 	}
+	if opts.Snapshots == nil {
+		// The container's parts that read its snapshot (image_user,
+		// disk_quota) read it from containerd here, in the helper's own
+		// namespace and under its own snapshotter.
+		opts.Snapshots = rootd.ContainerdSnapshots(upstream, cfg.Policy.Namespace, cfg.Policy.Snapshotter)
+	}
 	srv, err := rootd.New(cfg, opts, log)
 	if err != nil {
 		return err

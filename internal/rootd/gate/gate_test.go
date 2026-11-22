@@ -289,6 +289,18 @@ func TestNamespaceIsPinned(t *testing.T) {
 	const get = "/containerd.services.namespaces.v1.Namespaces/Get"
 	_, err := r.invoke(nsCtx(), get, &namespacesapi.GetNamespaceRequest{Name: "k8s.io"})
 	r.wantRefused(err, get, string(rootpolicy.RuleNamespace))
+	// The agent's own namespace given twice, as containerd's Go client
+	// sends it when a namespaced context is namespaced again: containerd
+	// reads either as the same, so it passes (M1 PR 7, the first live
+	// split create).
+	twice := metadata.AppendToOutgoingContext(context.Background(), namespaces.GRPCHeader, testNS, namespaces.GRPCHeader, testNS)
+	if _, err := r.invoke(twice, list, &containersapi.ListContainersRequest{}); err != nil {
+		t.Fatalf("the agent's namespace twice: %v", err)
+	}
+	twice = namespaces.WithNamespace(namespaces.WithNamespace(context.Background(), testNS), testNS)
+	if _, err := r.invoke(twice, list, &containersapi.ListContainersRequest{}); err != nil {
+		t.Fatalf("a context namespaced twice: %v", err)
+	}
 }
 
 // TestOnlyContainerdMetadataForwarded: the namespace and lease reach

@@ -2,9 +2,11 @@ package rootd
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc/codes"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
@@ -21,19 +23,62 @@ import (
 // Part "files" is the T2b calls (files.go) in one part: the host files,
 // fresh task FIFOs, the name of the agent's ready socket, the runsc config
 // the container's runtime options name, and the toolbox binary the spec
-// binds. Every value is checked before any file is written, so a refused
-// request changes nothing. ReleaseSandbox's "files" part removes them all.
+// binds. Part "image_user" (imageuser.go) resolves the user the image runs
+// as, and part "disk_quota" (quota.go) limits the writable layer; both read
+// the container's snapshot from containerd. Every value is checked before
+// anything is made, so a refused request changes nothing. A create sends
+// all three in one call, once its snapshot exists and before its container
+// does; a start sends files; a resize sends disk_quota.
+// ReleaseSandbox's "files" part removes the files.
 //
 // D11: one container's calls run in order under its lock (containerKey),
 // the same lock the T2b calls take.
 
-// containerParts are the parts that name a container. A request with one
-// of them carries only them.
-var containerParts = []string{rootdpb.PartFiles}
+// allContainerParts are the parts that name a container. A request with
+// one of them carries only them.
+var allContainerParts = []string{rootdpb.PartFiles, rootdpb.PartImageUser, rootdpb.PartDiskQuota}
 
 // hasContainerPart reports whether parts lists a container's part.
 func hasContainerPart(parts []string) bool {
-	return slices.ContainsFunc(parts, func(p string) bool { return slices.Contains(containerParts, p) })
+	return slices.ContainsFunc(parts, func(p string) bool { return slices.Contains(allContainerParts, p) })
+}
+
+// containerCalls serves the container's parts that read its snapshot.
+type containerCalls struct {
+	policy rootpolicy.Policy
+	// snaps reads containerd's snapshots; nil, and then the helper serves
+	// neither snapshot part (tests that give it none).
+	snaps SnapshotReader
+	// readImageFiles reads an image's user files (imageuser_linux.go),
+	// with emptyDir, an empty folder of the helper's own, as the bottom
+	// layer.
+	readImageFiles ImageFileReader
+	snapshotsDir   string
+	emptyDir       string
+	users          userCache
+	quota          QuotaOps
+	ready          quotaReady
+}
+
+func newContainerCalls(cfg Config, opts Options) *containerCalls {
+	c := &containerCalls{policy: cfg.Policy, snaps: opts.Snapshots, readImageFiles: opts.ReadImageFiles, quota: opts.Quota,
+		snapshotsDir: filepath.Join(cfg.Policy.SnapshotterRoot, "snapshots"), emptyDir: cfg.Files.ImageRoot}
+	if c.readImageFiles == nil {
+		c.readImageFiles = readImageFiles
+	}
+	if c.quota == nil {
+		c.quota = defaultQuota
+	}
+	return c
+}
+
+// served are the container's parts this helper serves: files always, the
+// snapshot's two with a snapshot reader.
+func (c *containerCalls) served() []string {
+	if c == nil || c.snaps == nil {
+		return []string{rootdpb.PartFiles}
+	}
+	return slices.Clone(allContainerParts)
 }
 
 // prepareContainer serves PrepareSandbox's container parts.
@@ -46,34 +91,63 @@ func (h helper) prepareContainer(ctx context.Context, req *rootdpb.PrepareSandbo
 		return nil, err
 	}
 	for p := range parts {
-		if !slices.Contains(containerParts, p) {
+		if !slices.Contains(allContainerParts, p) {
 			return nil, badRequest("root helper: part %q does not come with a container's parts", p)
 		}
 	}
 	if req.GetNetnsName() != "" || req.GetContainerIp() != "" || req.GetFirewall() != nil || req.GetCgroup() != nil {
 		return nil, badRequest("root helper: a container's parts come alone, named by container_id")
 	}
-	if req.GetSetup() != nil && !parts[rootdpb.PartFiles] {
-		return nil, badRequest("root helper: a container setup sent without the files part")
+	for _, f := range []struct {
+		part string
+		set  bool
+	}{{rootdpb.PartFiles, req.GetSetup() != nil}, {rootdpb.PartImageUser, req.GetImageUser() != nil}, {rootdpb.PartDiskQuota, req.GetDiskQuota() != nil}} {
+		if f.set != parts[f.part] {
+			return nil, badRequest("root helper: part %s and its values come together", f.part)
+		}
 	}
 	id := req.GetContainerId()
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
-	plan, err := h.files.checkSetup(req.GetSetup())
-	if err != nil {
-		return nil, err
+	var plan setupPlan
+	if parts[rootdpb.PartFiles] {
+		if plan, err = h.files.checkSetup(req.GetSetup()); err != nil {
+			return nil, err
+		}
+	}
+	user := req.GetImageUser().GetUser()
+	if err := rootpolicy.CheckImageUser(user); err != nil {
+		return nil, refusedRule(codes.InvalidArgument, err)
+	}
+	if parts[rootdpb.PartDiskQuota] {
+		if err := rootpolicy.CheckQuotaBytes(req.GetDiskQuota().GetBytes()); err != nil {
+			return nil, refusedRule(codes.InvalidArgument, err)
+		}
 	}
 	unlock, err := h.locks.lock(ctx, containerKey(id))
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	paths, err := h.files.setup(id, plan)
-	if err != nil {
-		return nil, err
+	resp := &rootdpb.PrepareSandboxResponse{}
+	// The limit first: nothing has run in the layer yet.
+	if parts[rootdpb.PartDiskQuota] {
+		if err := h.ct.diskQuota(ctx, id, req.GetDiskQuota().GetBytes()); err != nil {
+			return nil, err
+		}
 	}
-	return &rootdpb.PrepareSandboxResponse{Files: paths}, nil
+	if parts[rootdpb.PartImageUser] {
+		if resp.ImageUser, err = h.ct.imageUser(ctx, id, user); err != nil {
+			return nil, err
+		}
+	}
+	if parts[rootdpb.PartFiles] {
+		if resp.Files, err = h.files.setup(id, plan); err != nil {
+			return nil, err
+		}
+	}
+	return resp, nil
 }
 
 // releaseContainer serves ReleaseSandbox's files part: everything the
@@ -85,7 +159,7 @@ func (h helper) releaseContainer(ctx context.Context, req *rootdpb.ReleaseSandbo
 	if _, err := partsOf(req.GetParts(), h.servedParts()); err != nil {
 		return nil, err
 	}
-	if len(req.GetParts()) != 1 || req.GetNetnsName() != "" || req.GetContainerIp() != "" {
+	if !slices.Equal(req.GetParts(), []string{rootdpb.PartFiles}) || req.GetNetnsName() != "" || req.GetContainerIp() != "" {
 		return nil, badRequest("root helper: ReleaseSandbox's files part comes alone, named by container_id")
 	}
 	id := req.GetContainerId()

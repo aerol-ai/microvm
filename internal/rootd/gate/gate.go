@@ -158,6 +158,26 @@ var upstreamCallOptions = []grpc.CallOption{
 	grpc.ForceCodecV2(frameCodec{}),
 }
 
+// inPolicyNamespace reports whether a call's namespace header names the
+// policy's namespace. containerd's Go client repeats the header when a
+// namespace is put on a context that has one already (namespaces.
+// WithNamespace joins the two), which the agent's driver does, and
+// containerd reads the first value. So a header given more than once
+// passes only when every value is the policy's: whichever one containerd
+// reads, it is the same (M1 PR 7: the first split create, against real
+// containerd, met it).
+func inPolicyNamespace(p rootpolicy.Policy, ns []string) bool {
+	if len(ns) == 0 {
+		return false
+	}
+	for _, v := range ns {
+		if rootpolicy.CheckNamespace(p, v) != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // Handle serves one call: it is a grpc.StreamHandler, for unary and
 // streaming methods alike.
 func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
@@ -171,7 +191,7 @@ func (g *Gate) Handle(_ any, ss grpc.ServerStream) error {
 		return g.refuse(ctx, name, ReasonMethod, "the method is not one the agent uses")
 	}
 	md, _ := metadata.FromIncomingContext(ctx)
-	if ns := md.Get(namespaces.GRPCHeader); len(ns) != 1 || rootpolicy.CheckNamespace(g.policy, ns[0]) != nil {
+	if ns := md.Get(namespaces.GRPCHeader); !inPolicyNamespace(g.policy, ns) {
 		return g.refuse(ctx, name, ReasonNamespace, fmt.Sprintf("the call is in containerd namespace %q, not %q", ns, g.policy.Namespace))
 	}
 	// The first message is checked before containerd hears of the call.

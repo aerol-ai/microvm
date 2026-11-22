@@ -92,6 +92,7 @@ func withFiles(c Config, base string) Config {
 	// The operator's toolbox binary (a VM's layout): specs bind it as it
 	// is. TestToolboxCopy covers the copy the chart's layout needs.
 	c.Files.Toolbox = filepath.Join(base, "opt", "toolboxd")
+	c.Files.ImageRoot = filepath.Join(base, "state", "imageroot")
 	c.Policy.BindFiles = []string{c.Files.Toolbox}
 	c.Policy.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
 	c.Policy.RunscConfigPaths = []string{c.Files.runscPath(runscDefaultFile), c.Files.runscPath(runscRestoreFile)}
@@ -251,7 +252,8 @@ func TestVersion(t *testing.T) {
 	// container's files part (M1 PR 7), and ReleaseSandbox for the latter.
 	t.Run("with a cgroup parent", func(t *testing.T) {
 		parent := func(c *Config, _ *Options) { c.Policy.CgroupParent = "/sandboxes" }
-		r := newRig(t, func(c *Config, o *Options) { parent(c, o); o.Network = newFakeNet() })
+		// With containerd's snapshots too (M1 PR 7): every part.
+		r := newRig(t, func(c *Config, o *Options) { parent(c, o); o.Network, o.Snapshots = newFakeNet(), newFakeSnapshots() })
 		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
 		if err != nil || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
 			t.Fatalf("parts %v (%v), want every part", resp.GetParts(), err)
