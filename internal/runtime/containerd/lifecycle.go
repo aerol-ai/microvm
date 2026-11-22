@@ -13,12 +13,15 @@ import (
 
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
 	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	"github.com/aerol-ai/microvm/internal/privmode"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
@@ -557,7 +560,9 @@ func readoptEnv(ctx context.Context, container cntr.Container, loadEnv sbruntime
 
 func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
 	if d.helper != nil {
-		return nil, d.splitStartGaps()
+		if err := d.splitStartGaps(); err != nil {
+			return nil, err
+		}
 	}
 	client, err := d.ensureClient()
 	if err != nil {
@@ -588,9 +593,13 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		return nil, fmt.Errorf("load container spec: %w", err)
 	}
 	// The task about to be created bind-mounts every host file the spec
-	// names; one that went missing would fail it in runc.
-	if err := d.ensureSpecHostFiles(spec, sandboxID); err != nil {
-		return nil, fmt.Errorf("container host files: %w", err)
+	// names; one that went missing would fail it in runc. In split mode
+	// they are the helper's, which the start's files call makes sure of
+	// (splitStartFiles).
+	if d.helper == nil {
+		if err := d.ensureSpecHostFiles(spec, sandboxID); err != nil {
+			return nil, fmt.Errorf("container host files: %w", err)
+		}
 	}
 	parked, err := d.parkedRestartListener(spec, sandboxID, toolboxToken)
 	if err != nil {
@@ -612,7 +621,29 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	// the host disk — the exact hazard Create's taskLogIO guards against.
 	// Released on return like Create's: once the task's IO exists, its copy
 	// goroutines keep the file and close it when the task goes.
-	logIO, closeLog, err := d.taskLogIO(logPath)
+	var (
+		logIO    cio.Creator
+		closeLog func()
+	)
+	if d.helper != nil {
+		// Privilege mode split: the helper makes the container's files
+		// again (split_files.go): fresh FIFOs, the ready socket's new name,
+		// and the host files and toolbox, left as they are when unchanged.
+		if parked != nil {
+			return nil, privmode.NotYet("start a warm-pool container", privmode.StepWarmPool)
+		}
+		rl, nonce := d.splitReadyResume(spec)
+		if rl != nil {
+			defer func() { _ = rl.Close() }()
+		}
+		files, ferr := d.helperFiles(ctx, containerRef, nonce, rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED)
+		if ferr != nil {
+			return nil, ferr
+		}
+		logIO, closeLog, err = d.taskLogIOAt(logPath, files)
+	} else {
+		logIO, closeLog, err = d.taskLogIO(logPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -628,7 +659,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	// the socket (or the warm pool that widens it) off, and without the file
 	// runc refuses the task. recreateResumeReadySocket is a no-op for a spec
 	// with no ready mount.
-	if parked == nil {
+	if parked == nil && d.helper == nil {
 		if rl := d.recreateResumeReadySocket(spec); rl != nil {
 			defer func() { _ = rl.Close() }()
 		}
@@ -824,10 +855,13 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	// A warm-adopted sandbox's container keeps its park id, and so do its
 	// host files, task log and park socket; a cold one's container id is
 	// the sandbox id. Both keys are cleared: the sandbox id also covers
-	// host files an older build renamed to it on adopt.
+	// host files an older build renamed to it on adopt. In split mode the
+	// helper removes what it made, by the same keys.
 	d.removeContainerFiles(sandbox.ID)
+	d.releaseHelperFiles(ctx, sandbox.ID)
 	if ref := strings.TrimSpace(sandbox.ContainerID); ref != "" && ref != sandbox.ID {
 		d.removeContainerFiles(ref)
+		d.releaseHelperFiles(ctx, ref)
 	}
 	return destroyErr
 }

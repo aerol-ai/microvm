@@ -27,7 +27,10 @@ import (
 //     (sandboxAddress). A start, an inspect or an adoption reads it;
 //   - with a cgroup parent, it has the helper mark each started sandbox's
 //     group for F10 (M1 PR 6, CgroupMarker in cgroup_parent.go), at the
-//     points single mode writes the group's files itself.
+//     points single mode writes the group's files itself;
+//   - it has the helper make the files root opens because a container
+//     names them, in the helper's own folders, and remove them with the
+//     container (M1 PR 7, split_files.go).
 //
 // The netns pool's build and teardown go through the helper too, in
 // pkg/daemon's wiring. The rest of a create and a start is root work the
@@ -45,11 +48,14 @@ type RootHelper interface {
 }
 
 // SetRootHelper puts the driver in privilege mode split. Call it before
-// the first call that reaches containerd.
+// the first call that reaches containerd. A helper client with container
+// parts (ContainerParts) makes the containers' files too; one without
+// leaves creates and starts refused for want of them.
 func (d *Driver) SetRootHelper(h RootHelper) {
 	d.clientMu.Lock()
 	defer d.clientMu.Unlock()
 	d.helper = h
+	d.parts, _ = h.(ContainerParts)
 }
 
 // connectHelperFn connects to containerd through the helper's gate; tests
@@ -101,9 +107,14 @@ func (d *Driver) taskAddress(ctx context.Context, task cntr.Task) (string, error
 
 // splitCreateGaps is the root work a create needs that split mode does not
 // do yet. A create in split mode fails with it before it starts. The
-// cgroup settings (F10) are the helper's since M1 PR 6.
+// cgroup settings (F10) are the helper's since M1 PR 6, the container
+// files since M1 PR 7, when the helper client has container parts.
 func (d *Driver) splitCreateGaps(req models.CreateSandboxRequest) error {
-	steps := []privmode.Step{privmode.StepContainerFile, privmode.StepImageUser}
+	var steps []privmode.Step
+	if d.parts == nil {
+		steps = append(steps, privmode.StepContainerFile)
+	}
+	steps = append(steps, privmode.StepImageUser)
 	if d.cfg.DiskQuota && req.DiskGB > 0 {
 		steps = append(steps, privmode.StepDiskQuota)
 	}
@@ -113,5 +124,8 @@ func (d *Driver) splitCreateGaps(req models.CreateSandboxRequest) error {
 // splitStartGaps is the same for a start of a stopped sandbox: new host
 // files and task output.
 func (d *Driver) splitStartGaps() error {
+	if d.parts != nil {
+		return nil
+	}
 	return privmode.NotYet("start a sandbox", privmode.StepContainerFile)
 }

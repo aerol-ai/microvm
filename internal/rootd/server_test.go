@@ -89,6 +89,10 @@ func withFiles(c Config, base string) Config {
 		AgentReady: filepath.Join(base, "agent", "ready"),
 	}
 	c.Policy.FIFODir = filepath.Join(base, "run", "fifo")
+	// The operator's toolbox binary (a VM's layout): specs bind it as it
+	// is. TestToolboxCopy covers the copy the chart's layout needs.
+	c.Files.Toolbox = filepath.Join(base, "opt", "toolboxd")
+	c.Policy.BindFiles = []string{c.Files.Toolbox}
 	c.Policy.HelperFileRoots = []string{c.Files.Hosts, c.Files.Ready}
 	c.Policy.RunscConfigPaths = []string{c.Files.runscPath(runscDefaultFile), c.Files.runscPath(runscRestoreFile)}
 	return c
@@ -216,7 +220,7 @@ func TestVersion(t *testing.T) {
 	// no network configuration (this rig) serves no network call either.
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
 		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
-			slices.Contains(hostPortFeatures, f) || f == rootdpb.FeaturePrepareSandbox || f == rootdpb.FeatureReleaseSandbox
+			slices.Contains(hostPortFeatures, f)
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -231,8 +235,9 @@ func TestVersion(t *testing.T) {
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 		served = append(append(served, egressFeatures...), hostPortFeatures...)
-		// No cgroup parent here: no cgroup part.
-		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall}
+		// No cgroup parent here: no cgroup part. Every helper serves the
+		// container's files part (M1 PR 7).
+		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall, rootdpb.PartFiles}
 		if err != nil || !slices.Equal(resp.GetFeatures(), served) || !slices.Equal(resp.GetParts(), netParts) {
 			t.Fatalf("features %v parts %v (%v), want %v and %v", resp.GetFeatures(), resp.GetParts(), err, served, netParts)
 		}
@@ -242,7 +247,8 @@ func TestVersion(t *testing.T) {
 		}
 	})
 	// M1 PR 6: a helper with a cgroup parent lists the cgroup part; one
-	// with a parent and no network serves PrepareSandbox for it alone.
+	// with a parent and no network serves PrepareSandbox for it and for the
+	// container's files part (M1 PR 7), and ReleaseSandbox for the latter.
 	t.Run("with a cgroup parent", func(t *testing.T) {
 		parent := func(c *Config, _ *Options) { c.Policy.CgroupParent = "/sandboxes" }
 		r := newRig(t, func(c *Config, o *Options) { parent(c, o); o.Network = newFakeNet() })
@@ -252,8 +258,8 @@ func TestVersion(t *testing.T) {
 		}
 		alone := newRig(t, parent)
 		resp, err = rootdpb.NewRootHelperClient(alone.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
-		if err != nil || !slices.Equal(resp.GetParts(), []string{rootdpb.PartCgroup}) ||
-			!slices.Contains(resp.GetFeatures(), rootdpb.FeaturePrepareSandbox) || slices.Contains(resp.GetFeatures(), rootdpb.FeatureReleaseSandbox) {
+		if err != nil || !slices.Equal(resp.GetParts(), []string{rootdpb.PartCgroup, rootdpb.PartFiles}) ||
+			!slices.Contains(resp.GetFeatures(), rootdpb.FeaturePrepareSandbox) || !slices.Contains(resp.GetFeatures(), rootdpb.FeatureReleaseSandbox) {
 			t.Fatalf("no network: features %v parts %v (%v)", resp.GetFeatures(), resp.GetParts(), err)
 		}
 	})

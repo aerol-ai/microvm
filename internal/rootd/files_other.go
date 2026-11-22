@@ -13,3 +13,7 @@ import (
 func mkfifoAt(_ int, dir, name string, mode uint32) error {
 	return unix.Mkfifo(filepath.Join(dir, name), mode)
 }
+
+// checkLinkCapability: off Linux only tests run the helper, as the agent's
+// own user.
+func checkLinkCapability(uint32) error { return nil }

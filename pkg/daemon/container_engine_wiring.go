@@ -34,12 +34,14 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 
 // rootHelper is the root helper as the containerd engine uses it in
 // privilege mode split (*rootclient.Client): containerd through its gate,
-// its network calls, and the cgroup part that marks each started
-// sandbox's group (F10).
+// its network calls, the cgroup part that marks each started sandbox's
+// group (F10), and the container's parts that make and remove the files
+// root opens for it (M1 PR 7).
 type rootHelper interface {
 	cntr.RootHelper
 	netnsHelper
 	cntr.CgroupMarker
+	cntr.ContainerParts
 }
 
 // wireContainerEngineWith is wireContainerEngine with the root helper in

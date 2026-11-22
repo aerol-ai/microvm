@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -310,4 +311,62 @@ func TestReadyDialChild(t *testing.T) {
 	}
 	_ = c.Close()
 	os.Stdout.WriteString("result: connected\n")
+}
+
+// TestCheckLinkCapability (M1 PR 7, T2b review): a helper that must link
+// the agent's ready sockets under fs.protected_hardlinks starts only with
+// CAP_FOWNER; one that runs as the agent's own user, or on a node with the
+// sysctl off, needs none.
+func TestCheckLinkCapability(t *testing.T) {
+	origPath, origCap, origEUID := protectedHardlinksPath, hasEffectiveCap, geteuid
+	t.Cleanup(func() { protectedHardlinksPath, hasEffectiveCap, geteuid = origPath, origCap, origEUID })
+	sysctl := filepath.Join(t.TempDir(), "protected_hardlinks")
+	protectedHardlinksPath = sysctl
+	const agent = 65531
+	for _, tc := range []struct {
+		name    string
+		euid    int
+		value   string // "" for a sysctl that cannot be read
+		agent   uint32
+		has     bool
+		capErr  error
+		wantErr string
+	}{
+		{"root, protected, with CAP_FOWNER", 0, "1", agent, true, nil, ""},
+		{"root, protected, without CAP_FOWNER", 0, "1\n", agent, false, nil, "CAP_FOWNER"},
+		{"root, capabilities unreadable", 0, "1", agent, false, errors.New("capget: EPERM"), "capget"},
+		{"root, not protected", 0, "0\n", agent, false, nil, ""},
+		{"root, no such sysctl", 0, "", agent, false, nil, ""},
+		{"the helper is the agent's own user", agent, "1", agent, false, nil, ""},
+		// A test's helper, not root, with another user as the agent, on a
+		// kernel whose sysctl it can read (CI runners): it starts (#1399
+		// review, B1).
+		{"not root, another user as the agent", 1000, "1", agent, false, nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			geteuid = func() int { return tc.euid }
+			_ = os.Remove(sysctl)
+			if tc.value != "" {
+				if err := os.WriteFile(sysctl, []byte(tc.value), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			hasEffectiveCap = func(c int) (bool, error) {
+				if c != unix.CAP_FOWNER {
+					t.Fatalf("asked for capability %d", c)
+				}
+				return tc.has, tc.capErr
+			}
+			err := checkLinkCapability(tc.agent)
+			if (tc.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("err %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+	// The real reading: root has CAP_FOWNER; another user has not.
+	hasEffectiveCap = origCap
+	ok, err := hasEffectiveCap(unix.CAP_FOWNER)
+	if err != nil || ok != (os.Geteuid() == 0) {
+		t.Fatalf("CAP_FOWNER = %v, %v as uid %d", ok, err, os.Geteuid())
+	}
 }
