@@ -106,7 +106,7 @@ func CheckSpec(p Policy, containerID string, s *specs.Spec) error {
 	// host's, writable; a second sysfs shows firmware and powercap.
 	seen := map[string]bool{}
 	for i, m := range s.Mounts {
-		if err := checkSpecMount(p, i, m); err != nil {
+		if err := checkSpecMount(p, containerID, i, m); err != nil {
 			return err
 		}
 		if at, ok := singleMounts[m.Type]; ok {
@@ -186,7 +186,7 @@ const alphanumeric = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV
 // singleMounts are the kernel filesystems a spec may mount once, and where.
 var singleMounts = map[string]string{"proc": "/proc", "sysfs": "/sys"}
 
-func checkSpecMount(p Policy, i int, m specs.Mount) error {
+func checkSpecMount(p Policy, containerID string, i int, m specs.Mount) error {
 	where := fmt.Sprintf("mounts[%d]", i)
 	if err := onlyFields(&m, where, "Destination", "Type", "Source", "Options"); err != nil {
 		return err
@@ -202,6 +202,11 @@ func checkSpecMount(p Policy, i int, m specs.Mount) error {
 		}
 		if err := CheckBindSource(p, m.Source); err != nil {
 			return err
+		}
+		if p.MountsRoot != "" && within(m.Source, p.MountsRoot) {
+			if err := CheckMountBind(p.MountsRoot, containerID, m.Source); err != nil {
+				return err
+			}
 		}
 		for _, o := range m.Options {
 			if !slices.Contains(bindMountOptions, o) {

@@ -40,6 +40,23 @@ type Adapter interface {
 	Build(sandboxID string, index int, spec models.MountSpec, hostTarget, credDir string) (Plan, error)
 }
 
+// credentialKeys are the credentials each adapter reads, and nothing else
+// does: the S3 profile's three keys, the SSH key, the rclone config. NFS
+// reads none.
+var credentialKeys = map[models.MountType][]string{
+	models.MountTypeS3:     {"access_key_id", "secret_access_key", "session_token"},
+	models.MountTypeSSHFS:  {"private_key_pem"},
+	models.MountTypeRclone: {"rclone_conf"},
+}
+
+// CredentialKeys lists the credentials an adapter of type t reads. In
+// privilege mode split the agent sends the root helper only these, and the
+// helper refuses any other (internal/rootpolicy CheckExternalMounts): a
+// secret no tool reads has no reason to reach root.
+func CredentialKeys(t models.MountType) []string {
+	return append([]string(nil), credentialKeys[t]...)
+}
+
 // Adapters returns the default adapter map keyed by mount type.
 func Adapters() map[models.MountType]Adapter {
 	return map[models.MountType]Adapter{
