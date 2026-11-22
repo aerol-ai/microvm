@@ -48,6 +48,15 @@
     - "../../config/secrets.yml"
 
   vars:
+    # Privilege mode (config/cluster.yml privilege_mode, plans/security-gaps-
+    # m1-m4.md M1 PR 10). A node's mode is install.sh's to set, never this
+    # play's: a switch makes users, writes both units, installs the signed
+    # root helper and moves files' owners. This play checks each node runs
+    # the mode cluster.yml names, and in split gives the files it writes for
+    # sandboxd (the secrets folder, the shared SSH host key) to sandboxd's
+    # user, which reads them. It never writes SB_PRIVILEGE_MODE.
+    sandboxd_privilege_mode: "{{ privilege_mode | default('single') }}"
+    sandboxd_file_owner: "{{ 'sandboxd' if sandboxd_privilege_mode == 'split' else 'root' }}"
     sandboxd_ops_env:
       SB_OTEL_METRICS_ENABLED: "{{ ((otel.metrics_enabled | bool) or (otel.metrics_endpoint | length > 0)) | string | lower }}"
       SB_OTEL_METRICS_ENDPOINT: "{{ otel.metrics_endpoint }}"
@@ -196,6 +205,49 @@
     - name: Pick env file to manage
       ansible.builtin.set_fact:
         sandboxd_ops_env_file: "{{ sandboxd_cluster_env_file if sandboxd_cluster_env.stat.exists else sandboxd_env_file }}"
+
+    - name: Refuse an unknown privilege_mode
+      ansible.builtin.assert:
+        that:
+          - sandboxd_privilege_mode in ['single', 'split']
+        fail_msg: "privilege_mode in config/cluster.yml must be single or split, got {{ sandboxd_privilege_mode }}."
+
+    # The root helper does not start these yet (M1 PR 9): sandboxd refuses
+    # to boot with them in split mode. Checked here so the restart handler
+    # never takes a healthy node down into a refused boot.
+    - name: Refuse runtimes privilege mode split does not run yet
+      when: sandboxd_privilege_mode == 'split'
+      ansible.builtin.assert:
+        that:
+          - not (firecracker.enabled | default(false) | bool)
+          - not (wasm.enabled | default(false) | bool)
+          - not (containerd.pool.enabled | default(false) | bool)
+        fail_msg: >-
+          privilege_mode: split does not run Firecracker, WASM or the
+          containerd warm pool yet; set firecracker.enabled, wasm.enabled and
+          containerd.pool.enabled to false in config/cluster.yml, or keep
+          privilege_mode: single.
+
+    - name: Read the privilege mode this node runs in
+      ansible.builtin.shell: >-
+        sed -n 's/^SB_PRIVILEGE_MODE=//p' {{ sandboxd_env_file | quote }} | tail -n 1
+      register: sandboxd_current_privilege_mode
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Refuse a node whose privilege mode is not cluster.yml's
+      vars:
+        sandboxd_node_privilege_mode: "{{ sandboxd_current_privilege_mode.stdout | default('') | trim | default('single', true) }}"
+      ansible.builtin.assert:
+        that:
+          - sandboxd_node_privilege_mode == sandboxd_privilege_mode
+        fail_msg: >-
+          {{ inventory_hostname }} runs in privilege mode {{ sandboxd_node_privilege_mode }}
+          and config/cluster.yml asks for {{ sandboxd_privilege_mode }}. Switch it with
+          install.sh --privilege-mode {{ sandboxd_privilege_mode }} on the node (it makes
+          the users, both units and the root helper, and moves the files' owners), then
+          run this play again.
 
     # SB_NODE_ID is identity: the Raft member id and the node:<id> certificate
     # SAN in a cluster, and the witness key on every node. Read the value the
@@ -367,8 +419,8 @@
         path: "{{ sandboxd_secrets_dir }}"
         state: directory
         mode: "0700"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
 
     # Firecracker host-side install. Runs only when firecracker.enabled is
     # true in config/cluster.yml. Arch is detected from uname -m so operators
@@ -629,8 +681,8 @@
         content: "{{ aocr.upstream_wrap_key }}\n"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       no_log: true
       notify: Apply sandboxd ops config
 
@@ -642,8 +694,8 @@
         src: "{{ sandboxd_upstream_wrap_key_src }}"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config
 
     # Cluster PAT for auto-import (Phase 4 F21). Same two-mode pattern.
@@ -653,8 +705,8 @@
         content: "{{ aocr.cluster_pat }}\n"
         dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       no_log: true
       notify: Apply sandboxd ops config
 
@@ -666,8 +718,8 @@
         src: "{{ sandboxd_auto_import_cluster_pat_src }}"
         dest: "{{ sandboxd_auto_import_cluster_pat_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config
 
     # Shared SSH host key (UC-22). Same two-mode pattern as the secrets above:
@@ -682,8 +734,8 @@
         path: "{{ sandboxd_ssh_host_key_path | dirname }}"
         state: directory
         mode: "0700"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
 
     - name: Install shared SSH host key (from config/secrets.yml)
       when: (ssh | default({})).host_key | default('') | length > 0
@@ -691,8 +743,8 @@
         content: "{{ (ssh | default({})).host_key }}\n"
         dest: "{{ sandboxd_ssh_host_key_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       no_log: true
       notify: Apply sandboxd ops config
 
@@ -704,8 +756,8 @@
         src: "{{ sandboxd_ssh_host_key_src }}"
         dest: "{{ sandboxd_ssh_host_key_path }}"
         mode: "0600"
-        owner: root
-        group: root
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config
 
     # CNI plugins for containerd native netns (plans/containerd-engine.md Phase 5).
