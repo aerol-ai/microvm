@@ -2492,7 +2492,9 @@ EOF
 	fi
 	# Rootless BuildKit (plans/security-gaps-m1-m4.md PR 10b): builds go to
 	# the rootless buildkitd, and sandboxd imports each one into containerd.
-	if [[ "$BUILDKIT_ROOTLESS" == "true" ]]; then
+	# Defaulted: the env-file render tests run this function under set -u
+	# without the flag parsing that sets it.
+	if [[ "${BUILDKIT_ROOTLESS:-false}" == "true" ]]; then
 		echo "SB_CONTAINERD_BUILDKIT_ROOTLESS=true" >> /etc/sandboxd/sandboxd.env
 	fi
 	# The S3 audit witness (plans/open-audit-witness.md) is documented here and
