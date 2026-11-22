@@ -318,27 +318,33 @@ func TestReadyDialChild(t *testing.T) {
 // CAP_FOWNER; one that runs as the agent's own user, or on a node with the
 // sysctl off, needs none.
 func TestCheckLinkCapability(t *testing.T) {
-	origPath, origCap := protectedHardlinksPath, hasEffectiveCap
-	t.Cleanup(func() { protectedHardlinksPath, hasEffectiveCap = origPath, origCap })
+	origPath, origCap, origEUID := protectedHardlinksPath, hasEffectiveCap, geteuid
+	t.Cleanup(func() { protectedHardlinksPath, hasEffectiveCap, geteuid = origPath, origCap, origEUID })
 	sysctl := filepath.Join(t.TempDir(), "protected_hardlinks")
 	protectedHardlinksPath = sysctl
-	other := uint32(os.Geteuid()) + 1
+	const agent = 65531
 	for _, tc := range []struct {
 		name    string
+		euid    int
 		value   string // "" for a sysctl that cannot be read
 		agent   uint32
 		has     bool
 		capErr  error
 		wantErr string
 	}{
-		{"protected, with CAP_FOWNER", "1", other, true, nil, ""},
-		{"protected, without CAP_FOWNER", "1\n", other, false, nil, "CAP_FOWNER"},
-		{"capabilities unreadable", "1", other, false, errors.New("capget: EPERM"), "capget"},
-		{"not protected", "0\n", other, false, nil, ""},
-		{"no such sysctl", "", other, false, nil, ""},
-		{"the helper is the agent's own user", "1", uint32(os.Geteuid()), false, nil, ""},
+		{"root, protected, with CAP_FOWNER", 0, "1", agent, true, nil, ""},
+		{"root, protected, without CAP_FOWNER", 0, "1\n", agent, false, nil, "CAP_FOWNER"},
+		{"root, capabilities unreadable", 0, "1", agent, false, errors.New("capget: EPERM"), "capget"},
+		{"root, not protected", 0, "0\n", agent, false, nil, ""},
+		{"root, no such sysctl", 0, "", agent, false, nil, ""},
+		{"the helper is the agent's own user", agent, "1", agent, false, nil, ""},
+		// A test's helper, not root, with another user as the agent, on a
+		// kernel whose sysctl it can read (CI runners): it starts (#1399
+		// review, B1).
+		{"not root, another user as the agent", 1000, "1", agent, false, nil, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			geteuid = func() int { return tc.euid }
 			_ = os.Remove(sysctl)
 			if tc.value != "" {
 				if err := os.WriteFile(sysctl, []byte(tc.value), 0o644); err != nil {
