@@ -496,12 +496,33 @@ Each is small and stands alone. Together they shrink the root surface now.
       `SB_CONTAINERD_BUILDKIT_ROOTLESS` unset is on in split (the only
       way split builds; split with it off fails boot) and off in single,
       so single keeps today's root buildkitd (D22, R18). Single can opt
-      in.
+      in: install.sh `--buildkit-rootless`, or `containerd.buildkit_rootless`
+      in `config/cluster.yml` for Terraform.
     - **One thing rootless BuildKit cannot do:** see containerd's images.
       Every `FROM` comes from a registry, so an operator's build from an
       image only the node has (a snapshot, an earlier build) needs the root
       BuildKit. Tenant builds already refuse such images. Follow-up: hand
       such a base to BuildKit as an OCI layout context.
+    - **The network is a namespace on the sandboxes' bridge.** Rootless
+      buildkitd joins `aerolvm.build`, which a root oneshot unit builds with
+      sandboxd's CNI config (`sandboxd host build-network up`), so pulls and
+      steps leave with a sandbox address and get the floor and the node
+      guard with no new host rule. Steps live behind RootlessKit
+      (`--detach-netns`), not on the sandboxes' bridge, so the host's drop
+      between sandbox addresses never sees step-to-step traffic. Review of
+      #1398 (F4) found BuildKit's own bridge let one build's step reach
+      another's: each step now gets a point-to-point link of its own (CNI
+      `ptp`, so no shared segment to spoof on), and `sandboxd host
+      build-network guard` runs inside RootlessKit before buildkitd and
+      drops what a step sends to another step, to that namespace, to
+      RootlessKit's own network or to `aerolvm.build`'s addresses, with
+      strict reverse-path filtering and IPv6 off in that namespace (the
+      rules are IPv4; a second review found a step reaching it over IPv6
+      link-local). Proven live with the reviewer's
+      two-build probe. RootlessKit is 0750 to the build user's group, so
+      its AppArmor user-namespace grant is the build user's alone; split
+      mode on VMs (PR 10) must give the agent the socket by other means
+      than that group. Ansible sets no BuildKit up, so it is unchanged.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts

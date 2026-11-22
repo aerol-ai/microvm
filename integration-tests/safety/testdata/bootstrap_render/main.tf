@@ -167,7 +167,7 @@ locals {
     docker_pool_cfg = { enabled = "x", depth = "x", images = "x", max_images = "x", idle_ttl = "x", refill_interval = "x" }
     docker_netns_pool_cfg = { enabled = "x", depth = "x", pause_image = "x", refill_interval = "x" }
     container_engine = "x"
-    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x" }
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x", buildkit_rootless = "false" }
     containerd_pool_cfg = { enabled = "false", depth = "x", images = "x", max_images = "x", idle_ttl = "x", refill_interval = "x" }
     one_line_join = false
     blank = false
@@ -370,6 +370,17 @@ output "joiner_join_worker" {
     one_line_join = true
     pat_token     = ""
     join_token    = "aaaaaa.00000000000000000000000000000000"
+  }))
+}
+
+# containerd.buildkit_rootless in cluster.yml (plans/security-gaps-m1-m4.md
+# PR 10b): install.sh --buildkit-rootless, on the one-line join path only.
+output "joiner_join_buildkit_rootless" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    one_line_join  = true
+    join_token     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "x", buildkit_rootless = "true" }
   }))
 }
 
