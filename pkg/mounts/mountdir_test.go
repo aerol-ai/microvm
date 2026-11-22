@@ -2,7 +2,9 @@ package mounts
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -342,5 +344,71 @@ func TestMountFolder(t *testing.T) {
 		if got != c.want || ok != c.wantOK {
 			t.Errorf("mountFolder(%q) = %q, %v; want %q, %v", c.id, got, ok, c.want, c.wantOK)
 		}
+	}
+}
+
+// TestMountPoint: a mount point is rootDir/<id>/<index> for every id
+// mountSet accepts, the same path a plain join gives, and none for an id it
+// refuses (hostPath then gives "").
+func TestMountPoint(t *testing.T) {
+	root := t.TempDir()
+	m := &Manager{rootDir: root + string(filepath.Separator) + "." + string(filepath.Separator)}
+	for _, c := range []struct {
+		id     string
+		index  int
+		want   string
+		wantOK bool
+	}{
+		{"sb-1234abcd", 0, filepath.Join(root, "sb-1234abcd", "0"), true},
+		{"caller_chosen-ID", 7, filepath.Join(root, "caller_chosen-ID", "7"), true},
+		{"", 0, "", false},
+		{"..", 0, "", false},
+		{"../escape", 1, "", false},
+		{"a/b", 0, "", false},
+		{"/etc", 0, "", false},
+		{strings.Repeat("a", 129), 0, "", false},
+	} {
+		got, ok := m.mountPoint(c.id, c.index)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("mountPoint(%q, %d) = %q, %v; want %q, %v", c.id, c.index, got, ok, c.want, c.wantOK)
+		}
+		if h := m.hostPath(c.id, c.index); h != c.want {
+			t.Errorf("hostPath(%q, %d) = %q, want %q", c.id, c.index, h, c.want)
+		}
+	}
+}
+
+// TestMakeMountFolderStaysInRoot: the Manager makes folders only below its
+// mounts folder, in both modes; a path elsewhere is refused and not made.
+func TestMakeMountFolderStaysInRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "mounts")
+	for _, tools := range []*ToolUser{nil, {UID: 1, GID: 1}} {
+		m := &Manager{rootDir: root, tools: tools}
+		for _, p := range []string{root, base, filepath.Join(base, "elsewhere"), root + "/../elsewhere", root + "x/sb-1", "/etc/aerolvm-test-never"} {
+			if err := m.makeMountFolder(p); !errors.Is(err, ErrToolFolder) {
+				t.Fatalf("tools %v: makeMountFolder(%q) = %v, want a refusal", tools != nil, p, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(base, "elsewhere")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("a folder outside the mounts folder was made: %v", err)
+		}
+	}
+	m := &Manager{rootDir: root}
+	if err := m.makeMountFolder(filepath.Join(root, "sb-1", "0")); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(filepath.Join(root, "sb-1", "0")); err != nil || !st.IsDir() {
+		t.Fatalf("the mount point was not made: %v", err)
+	}
+}
+
+// TestMountOneRefusesABadID: mountOne builds no path for an id mountSet
+// would refuse.
+func TestMountOneRefusesABadID(t *testing.T) {
+	m := &Manager{rootDir: t.TempDir(), adapters: map[models.MountType]adapters.Adapter{models.MountTypeNFS: adapters.Adapters()[models.MountTypeNFS]}}
+	_, _, err := m.mountOne(context.Background(), "../escape", 0, models.MountSpec{Type: models.MountTypeNFS, Source: "h:/x", Target: "/x"})
+	if err == nil || !strings.Contains(err.Error(), "no mount point") {
+		t.Fatalf("mountOne with a bad id = %v", err)
 	}
 }

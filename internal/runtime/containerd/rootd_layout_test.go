@@ -64,15 +64,24 @@ func TestHelperPolicyMatchesDriverLayout(t *testing.T) {
 	if hc.Files.AgentReady != cfg.ReadyDir {
 		t.Fatalf("the helper links ready sockets from %s; the driver binds them in %s", hc.Files.AgentReady, cfg.ReadyDir)
 	}
-	if _, folder, ok := rootpolicy.BindRootFor(p, filepath.Join(sc.MountsRootPath, "sb-1", "0")); !ok || !folder {
-		t.Errorf("the helper's bind roots %v do not hold the external mounts under %s", p.BindRoots, sc.MountsRootPath)
+	// External mounts are the helper's (M1 PR 8): in its own mounts
+	// folder, which the binds it answers name, never the agent's
+	// SB_MOUNTS_ROOT, which the agent can write.
+	if hc.Mounts != nil && hc.Mounts.Root != p.MountsRoot {
+		t.Errorf("the helper mounts in %s, its policy binds from %s", hc.Mounts.Root, p.MountsRoot)
+	}
+	if _, folder, ok := rootpolicy.BindRootFor(p, filepath.Join(p.MountsRoot, "sb-1", "0")); !ok || !folder {
+		t.Errorf("the helper's bind roots %v do not hold its external mounts under %s", p.BindRoots, p.MountsRoot)
+	}
+	if _, _, ok := rootpolicy.BindRootFor(p, filepath.Join(sc.MountsRootPath, "sb-1", "0")); ok {
+		t.Errorf("the helper's policy binds the agent's own mounts root %s", sc.MountsRootPath)
 	}
 	if !slices.Contains(p.BindFiles, cfg.ToolboxBinaryPath) {
 		t.Errorf("bind files %v lack the toolbox %s", p.BindFiles, cfg.ToolboxBinaryPath)
 	}
 
 	agentDirs := []string{cfg.RunDir, filepath.Dir(sc.DBPath), sc.MountsRootPath, sc.MountsCredentialsRuntimeDir, cfg.ReadyDir}
-	rootOpens := append([]string{p.MovesDir, p.FIFODir, filepath.Dir(hc.Socket), hc.Files.Hosts, hc.Files.Ready, hc.Files.Runsc}, p.RunscConfigPaths...)
+	rootOpens := append([]string{p.MovesDir, p.FIFODir, filepath.Dir(hc.Socket), hc.Files.Hosts, hc.Files.Ready, hc.Files.Runsc, p.MountsRoot}, p.RunscConfigPaths...)
 	for _, r := range rootOpens {
 		for _, a := range agentDirs {
 			if r == a || strings.HasPrefix(r, a+"/") {

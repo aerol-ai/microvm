@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -19,12 +20,14 @@ import (
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // Privilege mode (internal/privmode, plans/security-gaps-m1-m4.md D5, D22).
 // single, the default and the mode when the setting is absent, is today's:
 // nothing here runs. split runs sandboxd with no rights; the root helper
 // does its root work, which is built one step at a time (M1 PRs 4 to 9).
+// External storage mounts are the helper's from M1 PR 8 (newMountManager).
 // So far the helper does the containerd engine's network (namespaces, CNI,
 // the forwarding sysctls, the CNI config), its host firewall (every
 // sandbox rule, the node guard, the deny floor, the IPv6 fence), and the
@@ -71,14 +74,37 @@ func checkPrivilegeMode(cfg config.Config) error {
 }
 
 // mountsOffFor is why this node refuses external storage, or "". In split
-// mode the helper does not mount yet, so every create with a mount is
-// refused with that reason (501 mounts_unavailable), and the node serves
-// the rest.
+// mode the root helper mounts (M1 PR 8), in the runtime's own mount
+// namespace, so F13's pod checks (mountsOffReason) have nothing to check;
+// a helper that serves no mounts (no mount user) is refused at the call,
+// by name (rootclient.Mounts.Ready).
 func mountsOffFor(cfg config.Config) string {
 	if cfg.PrivilegeMode == privmode.Split {
-		return privmode.NotYet("mount external storage", privmode.StepMounts).Error()
+		return ""
 	}
 	return mountsOffReason(cfg)
+}
+
+// newMountManager is the service's mount manager: sandboxd's own in single
+// mode, and in split mode one that sends every call to the root helper,
+// which it learns of through the returned setter once the helper's client
+// exists (the client hears refusals through the service, which takes the
+// manager). The setter does nothing in single mode.
+func newMountManager(cfg config.Config, logger *slog.Logger, off string) (*mounts.Manager, func(*rootclient.Client), error) {
+	if cfg.PrivilegeMode != privmode.Split {
+		m, err := mounts.New(logger, mounts.Config{
+			RootDir:        cfg.MountsRootPath,
+			CredDir:        cfg.MountsCredentialsRuntimeDir,
+			WaitTimeout:    cfg.MountWaitTimeout,
+			CgroupRoot:     cfg.HostProcessCgroupRoot(),
+			RuntimePIDFile: cfg.MountsRuntimePIDFile,
+			Unavailable:    off,
+		})
+		return m, func(*rootclient.Client) {}, err
+	}
+	var helper atomic.Pointer[rootclient.Client]
+	m, err := mounts.NewRemote(logger, rootclient.Mounts{Client: helper.Load}, off)
+	return m, func(c *rootclient.Client) { helper.Store(c) }, err
 }
 
 // newRootHelper is the agent's client of the helper in split mode, nil in

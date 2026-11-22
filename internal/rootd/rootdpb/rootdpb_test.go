@@ -165,6 +165,15 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.HostPortForward":        {"host_port=1:uint32", "kind=2:enum", "address=3:string", "port=4:uint32"},
 		"aerolvm.rootd.v1.HostPortRequest":        {"op=1:enum", "forwards=2:repeated message", "host_port=3:uint32"},
 		"aerolvm.rootd.v1.HostPortResponse":       {"skipped=1:repeated uint32"},
+		"aerolvm.rootd.v1.ExternalMount": {"type=1:string", "target=2:string", "source=3:string", "options=4:map",
+			"read_only=5:bool", "credentials=6:map"},
+		"aerolvm.rootd.v1.MountExternalRequest":        {"sandbox_id=1:string", "mode=2:enum", "mounts=3:repeated message"},
+		"aerolvm.rootd.v1.MountBind":                   {"host_path=1:string", "target=2:string", "read_only=3:bool"},
+		"aerolvm.rootd.v1.MountExternalResponse":       {"binds=1:repeated message", "kept=2:repeated uint32", "gone=3:repeated uint32", "already=4:bool"},
+		"aerolvm.rootd.v1.UnmountExternalRequest":      {"sandbox_id=1:string", "discard=2:bool"},
+		"aerolvm.rootd.v1.UnmountExternalResponse":     {"had=1:bool"},
+		"aerolvm.rootd.v1.SweepExternalMountsRequest":  {"keep=1:repeated string"},
+		"aerolvm.rootd.v1.SweepExternalMountsResponse": nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -176,7 +185,10 @@ func TestWireIsAppendOnly(t *testing.T) {
 		for j := range m.Fields().Len() {
 			f := m.Fields().Get(j)
 			kind := f.Kind().String()
-			if f.IsList() {
+			switch {
+			case f.IsMap():
+				kind = "map"
+			case f.IsList():
 				kind = "repeated " + kind
 			}
 			got = append(got, fmt.Sprintf("%s=%d:%s", f.Name(), f.Number(), kind))
@@ -200,6 +212,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 			"HOST_PORT_OP_RECONCILE=3"},
 		"aerolvm.rootd.v1.HostPortKind": {"HOST_PORT_KIND_UNSPECIFIED=0", "HOST_PORT_KIND_SANDBOX=1", "HOST_PORT_KIND_PEER=2",
 			"HOST_PORT_KIND_REDIRECT=3"},
+		"aerolvm.rootd.v1.MountExternalMode": {"MOUNT_EXTERNAL_MODE_UNSPECIFIED=0", "MOUNT_EXTERNAL_MODE_CREATE=1",
+			"MOUNT_EXTERNAL_MODE_REESTABLISH=2", "MOUNT_EXTERNAL_MODE_KEEP_LIVE=3"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {
@@ -346,6 +360,10 @@ func fillMessage(m protoreflect.Message) {
 	fields := m.Descriptor().Fields()
 	for i := range fields.Len() {
 		fd := fields.Get(i)
+		if fd.IsMap() { // the mount calls' options and credentials
+			m.Mutable(fd).Map().Set(protoreflect.ValueOfString("x").MapKey(), protoreflect.ValueOfString("x"))
+			continue
+		}
 		var v protoreflect.Value
 		switch fd.Kind() {
 		case protoreflect.StringKind:

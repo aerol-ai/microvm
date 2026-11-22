@@ -2738,7 +2738,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	withheld := withheldKeys(&req)
 	driverReq.Env = withholdEnv(driverReq.Env, withheld)
 
+	mountStart := time.Now()
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
+	if len(req.Mounts) > 0 {
+		// The mount set's own time: in privilege mode split, the root
+		// helper's call and the tools it waits for.
+		createtiming.From(ctx).RecordStage("svc_mounts", time.Since(mountStart))
+	}
 	if err != nil {
 		releaseAdmission()
 		return nil, fmt.Errorf("mount external storage: %w", err)

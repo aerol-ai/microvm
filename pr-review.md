@@ -65,7 +65,9 @@ Since v0.6.8 (identity and access) the open-source build has non-operator caller
 
 `source` and `options` are also **replicated in the clear** inside a cluster (Raft placement spec and recovery store, via `RedactClusterSecrets`); only `credentials` is sealed. `models.MountSpec.Validate` refuses credential-shaped names in `options` keys, `extra_args` flags, NFS `opts` entries, and rclone connection-string parameters in `source`, so a secret cannot ride a replicated field by accident.
 
-Still open: the mount helpers themselves are not sandboxed (dedicated low-priv user, network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM), and `source` scheme / control-character validation is not hardened. Until that lands, raw mounts stay operator-only rather than allowlisted for tenants.
+In privilege mode split (M1 PR 8) the root helper runs the mounts, not sandboxd: it checks each spec again itself (`rootpolicy.CheckExternalMounts`), builds every mount point and argument, makes FUSE mounts itself, and runs each FUSE tool as a dedicated user (`SB_ROOTD_MOUNT_USER`) with no-new-privs, no capabilities, no environment of the node's and its credentials in a memfd or a key file of its own (`pkg/mounts/tools.go`). Single mode is unchanged.
+
+Still open: the mount helpers are not sandboxed beyond that (all tools share one user; no network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM), and `source` scheme / control-character validation is not hardened. Until that lands, raw mounts stay operator-only rather than allowlisted for tenants.
 
 **Reviewer asks:** does this PR let a non-host-capable caller reach a host-side mount or module input — a new field, a new resolver path, or a gate that asks `!scoped` instead of `hostCapable`? Does it add a mount option or source form that can carry a credential? If so, it must go through `credentials`. A new `hostCapable` call site needs a reviewed row in `reviewedHostCapableUses` (`internal/service/owner_scope_callsites_test.go`).
 

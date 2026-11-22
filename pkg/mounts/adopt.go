@@ -59,6 +59,9 @@ type helperProcess struct {
 	pid  int
 	ppid int // 0 when unknown
 	argv []string
+	// mark is an isolated tool's mount marker (toolMarkEnv), read only
+	// in isolated mode.
+	mark string
 }
 
 // listHelperProcesses lists the processes a helper could be: the members of
@@ -76,7 +79,16 @@ func (m *Manager) listHelperProcesses() []helperProcess {
 		if err != nil || len(argv) == 0 || argv[0] == "" {
 			continue // gone, or a kernel thread
 		}
-		out = append(out, helperProcess{pid: pid, ppid: readPPID(pid), argv: argv})
+		h := helperProcess{pid: pid, ppid: readPPID(pid), argv: argv}
+		if m.tools != nil {
+			// Only the tools' own user's processes are tools: adoption
+			// and clearStaleMount never take or stop anyone else's.
+			if !runsAs(procRoot, pid, m.tools.UID) {
+				continue
+			}
+			h.mark = readMark(pid)
+		}
+		out = append(out, h)
 	}
 	return out
 }
@@ -241,6 +253,9 @@ func (m *Manager) adoptOne(ctx context.Context, sandboxID string, index int, spe
 		startedAt: time.Now().UTC(),
 	}
 	bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
+	if m.tools != nil && !plan.IsKernelMount {
+		return m.adoptTool(sandboxID, index, spec, hostPath, plan, helpers)
+	}
 	if plan.IsKernelMount {
 		// Nothing runs; the kernel holds the mount. A mount made before
 		// the NFS adapter forced nosuid,nodev may lack them, so set them
@@ -302,7 +317,7 @@ var remountNosuidNodev = func(path string) error {
 func (m *Manager) clearStaleMount(sandboxID string, index int, helpers []helperProcess) {
 	hostPath := m.hostPath(sandboxID, index)
 	for _, h := range helpers {
-		if h.argv[len(h.argv)-1] != hostPath {
+		if h.argv[len(h.argv)-1] != hostPath && (h.mark == "" || h.mark != hostPath) {
 			continue
 		}
 		proc, err := openHelperProcess(h.pid, h.argv)
@@ -332,8 +347,14 @@ func watchLiveExit(p liveProcess) *procExit {
 }
 
 // killGroup signals a helper's process group (its FUSE children, such as
-// sshfs's ssh). A var so tests never signal a real group.
-var killGroup = func(pgid int, sig syscall.Signal) { _ = syscall.Kill(-pgid, sig) }
+// sshfs's ssh) while the helper leads it (leadsOwnGroup): a helper that
+// moved to another group has only itself signalled. A var so tests never
+// signal a real group.
+var killGroup = func(pgid int, sig syscall.Signal) {
+	if leadsOwnGroup(pgid) {
+		_ = syscall.Kill(-pgid, sig)
+	}
+}
 
 // adoptedKillGrace is how long an adopted helper gets to exit on SIGTERM.
 var adoptedKillGrace = 3 * time.Second
@@ -356,9 +377,12 @@ func killLiveProcess(p liveProcess) {
 	_ = p.Close()
 }
 
-// hostPath is where mount index of sandboxID is mounted on the host.
+// hostPath is where mount index of sandboxID is mounted on the host
+// (mountPoint), or "" for an id mountSet would refuse: every caller has
+// that id through mountSet's check already.
 func (m *Manager) hostPath(sandboxID string, index int) string {
-	return filepath.Join(m.rootDir, sandboxID, strconv.Itoa(index))
+	p, _ := m.mountPoint(sandboxID, index)
+	return p
 }
 
 // helperLogPath is the log file of mount index's helper, beside the mount

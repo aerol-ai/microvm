@@ -49,6 +49,33 @@ func (m *Manager) mountFolder(sandboxID string) (string, bool) {
 	return dir, true
 }
 
+// mountPoint is mount index of sandboxID's host path, rootDir/<id>/<index>,
+// or false for an id mountSet would refuse: mountFolder, then the index's
+// folder, cleaned and seen to stay in it, the check code scanning counts.
+func (m *Manager) mountPoint(sandboxID string, index int) (string, bool) {
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return "", false
+	}
+	p := filepath.Clean(filepath.Join(dir, strconv.Itoa(index)))
+	if !strings.HasPrefix(p, dir+string(filepath.Separator)) {
+		return "", false
+	}
+	return p, true
+}
+
+// inMountsRoot is path cleaned, or false when it is not below rootDir. A
+// folder the Manager makes is below rootDir by construction; this is the
+// check code scanning sees right before the file calls.
+func (m *Manager) inMountsRoot(path string) (string, bool) {
+	root := filepath.Clean(m.rootDir)
+	p := filepath.Clean(path)
+	if !strings.HasPrefix(p, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return p, true
+}
+
 // clearMountDir removes dir, one sandbox's mount folder, once nothing is
 // mounted under it. Anything that still is gets its helpers stopped and is
 // unmounted, deepest first; one that will not go keeps dir in place. A dir
@@ -59,7 +86,7 @@ func (m *Manager) clearMountDir(dir string) error {
 		return nil
 	}
 	if points := mountPointsUnder(dir); len(points) > 0 {
-		killFUSEProcessesFor(m.logger, dir)
+		m.killToolsFor(dir)
 		unmountPoints(m.logger, points)
 		if left := mountPointsUnder(dir); len(left) > 0 {
 			err := fmt.Errorf("mount folder %s: %w at %s; left in place", dir, errStillMounted, strings.Join(left, ", "))
@@ -67,7 +94,11 @@ func (m *Manager) clearMountDir(dir string) error {
 			return err
 		}
 	}
-	return removeOnDevice(dir)
+	if err := removeOnDevice(dir); err != nil {
+		return err
+	}
+	m.clearToolFiles(filepath.Base(dir))
+	return nil
 }
 
 // mountPointsUnder lists the mount points at or under dir, deepest first:

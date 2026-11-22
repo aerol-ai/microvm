@@ -51,6 +51,9 @@ const (
 	RootHelper_BridgeProbe_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/BridgeProbe"
 	RootHelper_MatchProcess_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/MatchProcess"
 	RootHelper_HostPort_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/HostPort"
+	RootHelper_MountExternal_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/MountExternal"
+	RootHelper_UnmountExternal_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/UnmountExternal"
+	RootHelper_SweepExternalMounts_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SweepExternalMounts"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -140,6 +143,16 @@ type RootHelperClient interface {
 	// hands them only to a leased sandbox address, another node's host port,
 	// or sandboxd's own listener.
 	HostPort(ctx context.Context, in *HostPortRequest, opts ...grpc.CallOption) (*HostPortResponse, error)
+	// MountExternal makes sure a sandbox's mounts serve, and answers with
+	// their mount points for the container's binds.
+	MountExternal(ctx context.Context, in *MountExternalRequest, opts ...grpc.CallOption) (*MountExternalResponse, error)
+	// UnmountExternal makes sure a sandbox's mounts are gone: its tools
+	// stopped, its mounts unmounted, its folder, key files and caches
+	// removed.
+	UnmountExternal(ctx context.Context, in *UnmountExternalRequest, opts ...grpc.CallOption) (*UnmountExternalResponse, error)
+	// SweepExternalMounts removes the mounts of every sandbox the request
+	// does not keep, except those a call is working on.
+	SweepExternalMounts(ctx context.Context, in *SweepExternalMountsRequest, opts ...grpc.CallOption) (*SweepExternalMountsResponse, error)
 }
 
 type rootHelperClient struct {
@@ -350,6 +363,36 @@ func (c *rootHelperClient) HostPort(ctx context.Context, in *HostPortRequest, op
 	return out, nil
 }
 
+func (c *rootHelperClient) MountExternal(ctx context.Context, in *MountExternalRequest, opts ...grpc.CallOption) (*MountExternalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MountExternalResponse)
+	err := c.cc.Invoke(ctx, RootHelper_MountExternal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) UnmountExternal(ctx context.Context, in *UnmountExternalRequest, opts ...grpc.CallOption) (*UnmountExternalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnmountExternalResponse)
+	err := c.cc.Invoke(ctx, RootHelper_UnmountExternal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SweepExternalMounts(ctx context.Context, in *SweepExternalMountsRequest, opts ...grpc.CallOption) (*SweepExternalMountsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SweepExternalMountsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SweepExternalMounts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -437,6 +480,16 @@ type RootHelperServer interface {
 	// hands them only to a leased sandbox address, another node's host port,
 	// or sandboxd's own listener.
 	HostPort(context.Context, *HostPortRequest) (*HostPortResponse, error)
+	// MountExternal makes sure a sandbox's mounts serve, and answers with
+	// their mount points for the container's binds.
+	MountExternal(context.Context, *MountExternalRequest) (*MountExternalResponse, error)
+	// UnmountExternal makes sure a sandbox's mounts are gone: its tools
+	// stopped, its mounts unmounted, its folder, key files and caches
+	// removed.
+	UnmountExternal(context.Context, *UnmountExternalRequest) (*UnmountExternalResponse, error)
+	// SweepExternalMounts removes the mounts of every sandbox the request
+	// does not keep, except those a call is working on.
+	SweepExternalMounts(context.Context, *SweepExternalMountsRequest) (*SweepExternalMountsResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -506,6 +559,15 @@ func (UnimplementedRootHelperServer) MatchProcess(context.Context, *MatchProcess
 }
 func (UnimplementedRootHelperServer) HostPort(context.Context, *HostPortRequest) (*HostPortResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method HostPort not implemented")
+}
+func (UnimplementedRootHelperServer) MountExternal(context.Context, *MountExternalRequest) (*MountExternalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MountExternal not implemented")
+}
+func (UnimplementedRootHelperServer) UnmountExternal(context.Context, *UnmountExternalRequest) (*UnmountExternalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UnmountExternal not implemented")
+}
+func (UnimplementedRootHelperServer) SweepExternalMounts(context.Context, *SweepExternalMountsRequest) (*SweepExternalMountsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SweepExternalMounts not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -888,6 +950,60 @@ func _RootHelper_HostPort_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_MountExternal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MountExternalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).MountExternal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_MountExternal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).MountExternal(ctx, req.(*MountExternalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_UnmountExternal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnmountExternalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).UnmountExternal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_UnmountExternal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).UnmountExternal(ctx, req.(*UnmountExternalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SweepExternalMounts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SweepExternalMountsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SweepExternalMounts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SweepExternalMounts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SweepExternalMounts(ctx, req.(*SweepExternalMountsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -974,6 +1090,18 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "HostPort",
 			Handler:    _RootHelper_HostPort_Handler,
+		},
+		{
+			MethodName: "MountExternal",
+			Handler:    _RootHelper_MountExternal_Handler,
+		},
+		{
+			MethodName: "UnmountExternal",
+			Handler:    _RootHelper_UnmountExternal_Handler,
+		},
+		{
+			MethodName: "SweepExternalMounts",
+			Handler:    _RootHelper_SweepExternalMounts_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

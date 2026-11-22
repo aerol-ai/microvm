@@ -158,8 +158,12 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func
 		stop()
 		close(stopped)
 	}()
+	mountsAs := "off: no mount user (SB_ROOTD_MOUNT_USER)"
+	if cfg.Mounts != nil {
+		mountsAs = fmt.Sprintf("in %s, tools as uid %d", cfg.Mounts.Root, cfg.Mounts.UID)
+	}
 	log.Info("root helper serving", "version", version.Version, "socket", cfg.Socket, "inherited", opts.Listener != nil,
-		"containerd", cfg.ContainerdSocket, "namespace", cfg.Policy.Namespace)
+		"containerd", cfg.ContainerdSocket, "namespace", cfg.Policy.Namespace, "external_mounts", mountsAs)
 	if ready != nil {
 		ready()
 	}

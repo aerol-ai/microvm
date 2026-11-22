@@ -331,6 +331,67 @@ func (HostPortKind) EnumDescriptor() ([]byte, []int) {
 	return file_rootd_proto_rawDescGZIP(), []int{4}
 }
 
+// MountExternalMode is what MountExternal does with mounts that already
+// serve, as pkg/mounts.Manager's calls of the same names do.
+type MountExternalMode int32
+
+const (
+	MountExternalMode_MOUNT_EXTERNAL_MODE_UNSPECIFIED MountExternalMode = 0
+	// A create's: refused when the sandbox's mounts are established.
+	MountExternalMode_MOUNT_EXTERNAL_MODE_CREATE MountExternalMode = 1
+	// A start's or a reconcile's: take over what still serves as it runs,
+	// and mount the rest.
+	MountExternalMode_MOUNT_EXTERNAL_MODE_REESTABLISH MountExternalMode = 2
+	// A running sandbox whose stored options the allow lists now refuse
+	// (pkg/mounts.Manager.KeepLive): take over what still serves, as it
+	// runs, and start nothing. Its specs are checked against the lists a
+	// running mount may keep.
+	MountExternalMode_MOUNT_EXTERNAL_MODE_KEEP_LIVE MountExternalMode = 3
+)
+
+// Enum value maps for MountExternalMode.
+var (
+	MountExternalMode_name = map[int32]string{
+		0: "MOUNT_EXTERNAL_MODE_UNSPECIFIED",
+		1: "MOUNT_EXTERNAL_MODE_CREATE",
+		2: "MOUNT_EXTERNAL_MODE_REESTABLISH",
+		3: "MOUNT_EXTERNAL_MODE_KEEP_LIVE",
+	}
+	MountExternalMode_value = map[string]int32{
+		"MOUNT_EXTERNAL_MODE_UNSPECIFIED": 0,
+		"MOUNT_EXTERNAL_MODE_CREATE":      1,
+		"MOUNT_EXTERNAL_MODE_REESTABLISH": 2,
+		"MOUNT_EXTERNAL_MODE_KEEP_LIVE":   3,
+	}
+)
+
+func (x MountExternalMode) Enum() *MountExternalMode {
+	p := new(MountExternalMode)
+	*p = x
+	return p
+}
+
+func (x MountExternalMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MountExternalMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_rootd_proto_enumTypes[5].Descriptor()
+}
+
+func (MountExternalMode) Type() protoreflect.EnumType {
+	return &file_rootd_proto_enumTypes[5]
+}
+
+func (x MountExternalMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MountExternalMode.Descriptor instead.
+func (MountExternalMode) EnumDescriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{5}
+}
+
 type VersionRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The agent's build version, for the helper's log.
@@ -3360,6 +3421,474 @@ func (x *HostPortResponse) GetSkipped() []uint32 {
 	return nil
 }
 
+// ExternalMount is one mount spec (pkg/models.MountSpec).
+type ExternalMount struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Type  string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	// Where the mount lands inside the sandbox.
+	Target   string            `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+	Source   string            `protobuf:"bytes,3,opt,name=source,proto3" json:"source,omitempty"`
+	Options  map[string]string `protobuf:"bytes,4,rep,name=options,proto3" json:"options,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ReadOnly bool              `protobuf:"varint,5,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	// The keys the type's tool reads, and no other. The helper hands them
+	// to the tool as a sealed in-memory file (s3, rclone) or a key file of
+	// the tool's own (sshfs); never on a command line, in an environment or
+	// in a log. They are not sealed again for the helper: the socket is
+	// root's and the agent's, and the agent, which holds the node's cipher,
+	// already reads them in the clear (plan eng review R9).
+	Credentials   map[string]string `protobuf:"bytes,6,rep,name=credentials,proto3" json:"credentials,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExternalMount) Reset() {
+	*x = ExternalMount{}
+	mi := &file_rootd_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExternalMount) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExternalMount) ProtoMessage() {}
+
+func (x *ExternalMount) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExternalMount.ProtoReflect.Descriptor instead.
+func (*ExternalMount) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *ExternalMount) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *ExternalMount) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
+}
+
+func (x *ExternalMount) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *ExternalMount) GetOptions() map[string]string {
+	if x != nil {
+		return x.Options
+	}
+	return nil
+}
+
+func (x *ExternalMount) GetReadOnly() bool {
+	if x != nil {
+		return x.ReadOnly
+	}
+	return false
+}
+
+func (x *ExternalMount) GetCredentials() map[string]string {
+	if x != nil {
+		return x.Credentials
+	}
+	return nil
+}
+
+type MountExternalRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	Mode      MountExternalMode      `protobuf:"varint,2,opt,name=mode,proto3,enum=aerolvm.rootd.v1.MountExternalMode" json:"mode,omitempty"`
+	// In the sandbox's order: a mount's index is its place here.
+	Mounts        []*ExternalMount `protobuf:"bytes,3,rep,name=mounts,proto3" json:"mounts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MountExternalRequest) Reset() {
+	*x = MountExternalRequest{}
+	mi := &file_rootd_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MountExternalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MountExternalRequest) ProtoMessage() {}
+
+func (x *MountExternalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MountExternalRequest.ProtoReflect.Descriptor instead.
+func (*MountExternalRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *MountExternalRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *MountExternalRequest) GetMode() MountExternalMode {
+	if x != nil {
+		return x.Mode
+	}
+	return MountExternalMode_MOUNT_EXTERNAL_MODE_UNSPECIFIED
+}
+
+func (x *MountExternalRequest) GetMounts() []*ExternalMount {
+	if x != nil {
+		return x.Mounts
+	}
+	return nil
+}
+
+// MountBind is one mount's bind into the sandbox.
+type MountBind struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The mount point, built by the helper: <mounts folder>/<sandbox>/<index>.
+	HostPath      string `protobuf:"bytes,1,opt,name=host_path,json=hostPath,proto3" json:"host_path,omitempty"`
+	Target        string `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"`
+	ReadOnly      bool   `protobuf:"varint,3,opt,name=read_only,json=readOnly,proto3" json:"read_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MountBind) Reset() {
+	*x = MountBind{}
+	mi := &file_rootd_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MountBind) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MountBind) ProtoMessage() {}
+
+func (x *MountBind) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MountBind.ProtoReflect.Descriptor instead.
+func (*MountBind) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *MountBind) GetHostPath() string {
+	if x != nil {
+		return x.HostPath
+	}
+	return ""
+}
+
+func (x *MountBind) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
+}
+
+func (x *MountBind) GetReadOnly() bool {
+	if x != nil {
+		return x.ReadOnly
+	}
+	return false
+}
+
+type MountExternalResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// CREATE and REESTABLISH: every mount's bind, in the request's order.
+	// KEEP_LIVE: the kept mounts' binds.
+	Binds []*MountBind `protobuf:"bytes,1,rep,name=binds,proto3" json:"binds,omitempty"`
+	// KEEP_LIVE: the mounts taken over (by index), and those that were not
+	// served and stay unmounted.
+	Kept []uint32 `protobuf:"varint,2,rep,packed,name=kept,proto3" json:"kept,omitempty"`
+	Gone []uint32 `protobuf:"varint,3,rep,packed,name=gone,proto3" json:"gone,omitempty"`
+	// KEEP_LIVE: the helper already held the sandbox's mounts.
+	Already       bool `protobuf:"varint,4,opt,name=already,proto3" json:"already,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MountExternalResponse) Reset() {
+	*x = MountExternalResponse{}
+	mi := &file_rootd_proto_msgTypes[57]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MountExternalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MountExternalResponse) ProtoMessage() {}
+
+func (x *MountExternalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[57]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MountExternalResponse.ProtoReflect.Descriptor instead.
+func (*MountExternalResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{57}
+}
+
+func (x *MountExternalResponse) GetBinds() []*MountBind {
+	if x != nil {
+		return x.Binds
+	}
+	return nil
+}
+
+func (x *MountExternalResponse) GetKept() []uint32 {
+	if x != nil {
+		return x.Kept
+	}
+	return nil
+}
+
+func (x *MountExternalResponse) GetGone() []uint32 {
+	if x != nil {
+		return x.Gone
+	}
+	return nil
+}
+
+func (x *MountExternalResponse) GetAlready() bool {
+	if x != nil {
+		return x.Already
+	}
+	return false
+}
+
+type UnmountExternalRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	// Discard (pkg/mounts.Manager.Discard): leave a mount set another call
+	// is making alone.
+	Discard       bool `protobuf:"varint,2,opt,name=discard,proto3" json:"discard,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnmountExternalRequest) Reset() {
+	*x = UnmountExternalRequest{}
+	mi := &file_rootd_proto_msgTypes[58]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnmountExternalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnmountExternalRequest) ProtoMessage() {}
+
+func (x *UnmountExternalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[58]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnmountExternalRequest.ProtoReflect.Descriptor instead.
+func (*UnmountExternalRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{58}
+}
+
+func (x *UnmountExternalRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *UnmountExternalRequest) GetDiscard() bool {
+	if x != nil {
+		return x.Discard
+	}
+	return false
+}
+
+type UnmountExternalResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Discard: there was something to tear down.
+	Had           bool `protobuf:"varint,1,opt,name=had,proto3" json:"had,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnmountExternalResponse) Reset() {
+	*x = UnmountExternalResponse{}
+	mi := &file_rootd_proto_msgTypes[59]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnmountExternalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnmountExternalResponse) ProtoMessage() {}
+
+func (x *UnmountExternalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[59]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnmountExternalResponse.ProtoReflect.Descriptor instead.
+func (*UnmountExternalResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{59}
+}
+
+func (x *UnmountExternalResponse) GetHad() bool {
+	if x != nil {
+		return x.Had
+	}
+	return false
+}
+
+type SweepExternalMountsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The sandboxes whose mounts stay.
+	Keep          []string `protobuf:"bytes,1,rep,name=keep,proto3" json:"keep,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SweepExternalMountsRequest) Reset() {
+	*x = SweepExternalMountsRequest{}
+	mi := &file_rootd_proto_msgTypes[60]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SweepExternalMountsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SweepExternalMountsRequest) ProtoMessage() {}
+
+func (x *SweepExternalMountsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[60]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SweepExternalMountsRequest.ProtoReflect.Descriptor instead.
+func (*SweepExternalMountsRequest) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{60}
+}
+
+func (x *SweepExternalMountsRequest) GetKeep() []string {
+	if x != nil {
+		return x.Keep
+	}
+	return nil
+}
+
+type SweepExternalMountsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SweepExternalMountsResponse) Reset() {
+	*x = SweepExternalMountsResponse{}
+	mi := &file_rootd_proto_msgTypes[61]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SweepExternalMountsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SweepExternalMountsResponse) ProtoMessage() {}
+
+func (x *SweepExternalMountsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[61]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SweepExternalMountsResponse.ProtoReflect.Descriptor instead.
+func (*SweepExternalMountsResponse) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{61}
+}
+
 var File_rootd_proto protoreflect.FileDescriptor
 
 const file_rootd_proto_rawDesc = "" +
@@ -3562,7 +4091,43 @@ const file_rootd_proto_rawDesc = "" +
 	"\bforwards\x18\x02 \x03(\v2!.aerolvm.rootd.v1.HostPortForwardR\bforwards\x12\x1b\n" +
 	"\thost_port\x18\x03 \x01(\rR\bhostPort\",\n" +
 	"\x10HostPortResponse\x12\x18\n" +
-	"\askipped\x18\x01 \x03(\rR\askipped*_\n" +
+	"\askipped\x18\x01 \x03(\rR\askipped\"\x88\x03\n" +
+	"\rExternalMount\x12\x12\n" +
+	"\x04type\x18\x01 \x01(\tR\x04type\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\x12\x16\n" +
+	"\x06source\x18\x03 \x01(\tR\x06source\x12F\n" +
+	"\aoptions\x18\x04 \x03(\v2,.aerolvm.rootd.v1.ExternalMount.OptionsEntryR\aoptions\x12\x1b\n" +
+	"\tread_only\x18\x05 \x01(\bR\breadOnly\x12R\n" +
+	"\vcredentials\x18\x06 \x03(\v20.aerolvm.rootd.v1.ExternalMount.CredentialsEntryR\vcredentials\x1a:\n" +
+	"\fOptionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10CredentialsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa7\x01\n" +
+	"\x14MountExternalRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x127\n" +
+	"\x04mode\x18\x02 \x01(\x0e2#.aerolvm.rootd.v1.MountExternalModeR\x04mode\x127\n" +
+	"\x06mounts\x18\x03 \x03(\v2\x1f.aerolvm.rootd.v1.ExternalMountR\x06mounts\"]\n" +
+	"\tMountBind\x12\x1b\n" +
+	"\thost_path\x18\x01 \x01(\tR\bhostPath\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target\x12\x1b\n" +
+	"\tread_only\x18\x03 \x01(\bR\breadOnly\"\x8c\x01\n" +
+	"\x15MountExternalResponse\x121\n" +
+	"\x05binds\x18\x01 \x03(\v2\x1b.aerolvm.rootd.v1.MountBindR\x05binds\x12\x12\n" +
+	"\x04kept\x18\x02 \x03(\rR\x04kept\x12\x12\n" +
+	"\x04gone\x18\x03 \x03(\rR\x04gone\x12\x18\n" +
+	"\aalready\x18\x04 \x01(\bR\aalready\"Q\n" +
+	"\x16UnmountExternalRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x18\n" +
+	"\adiscard\x18\x02 \x01(\bR\adiscard\"+\n" +
+	"\x17UnmountExternalResponse\x12\x10\n" +
+	"\x03had\x18\x01 \x01(\bR\x03had\"0\n" +
+	"\x1aSweepExternalMountsRequest\x12\x12\n" +
+	"\x04keep\x18\x01 \x03(\tR\x04keep\"\x1d\n" +
+	"\x1bSweepExternalMountsResponse*_\n" +
 	"\vRunscConfig\x12\x1c\n" +
 	"\x18RUNSC_CONFIG_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14RUNSC_CONFIG_DEFAULT\x10\x01\x12\x18\n" +
@@ -3593,7 +4158,12 @@ const file_rootd_proto_rawDesc = "" +
 	"\x1aHOST_PORT_KIND_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16HOST_PORT_KIND_SANDBOX\x10\x01\x12\x17\n" +
 	"\x13HOST_PORT_KIND_PEER\x10\x02\x12\x1b\n" +
-	"\x17HOST_PORT_KIND_REDIRECT\x10\x032\xc0\x0f\n" +
+	"\x17HOST_PORT_KIND_REDIRECT\x10\x03*\xa0\x01\n" +
+	"\x11MountExternalMode\x12#\n" +
+	"\x1fMOUNT_EXTERNAL_MODE_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aMOUNT_EXTERNAL_MODE_CREATE\x10\x01\x12#\n" +
+	"\x1fMOUNT_EXTERNAL_MODE_REESTABLISH\x10\x02\x12!\n" +
+	"\x1dMOUNT_EXTERNAL_MODE_KEEP_LIVE\x10\x032\xfe\x11\n" +
 	"\n" +
 	"RootHelper\x12N\n" +
 	"\aVersion\x12 .aerolvm.rootd.v1.VersionRequest\x1a!.aerolvm.rootd.v1.VersionResponse\x12W\n" +
@@ -3617,7 +4187,10 @@ const file_rootd_proto_rawDesc = "" +
 	"\x0eReleaseSandbox\x12'.aerolvm.rootd.v1.ReleaseSandboxRequest\x1a(.aerolvm.rootd.v1.ReleaseSandboxResponse\x12Z\n" +
 	"\vBridgeProbe\x12$.aerolvm.rootd.v1.BridgeProbeRequest\x1a%.aerolvm.rootd.v1.BridgeProbeResponse\x12]\n" +
 	"\fMatchProcess\x12%.aerolvm.rootd.v1.MatchProcessRequest\x1a&.aerolvm.rootd.v1.MatchProcessResponse\x12Q\n" +
-	"\bHostPort\x12!.aerolvm.rootd.v1.HostPortRequest\x1a\".aerolvm.rootd.v1.HostPortResponseB4Z2github.com/aerol-ai/microvm/internal/rootd/rootdpbb\x06proto3"
+	"\bHostPort\x12!.aerolvm.rootd.v1.HostPortRequest\x1a\".aerolvm.rootd.v1.HostPortResponse\x12`\n" +
+	"\rMountExternal\x12&.aerolvm.rootd.v1.MountExternalRequest\x1a'.aerolvm.rootd.v1.MountExternalResponse\x12f\n" +
+	"\x0fUnmountExternal\x12(.aerolvm.rootd.v1.UnmountExternalRequest\x1a).aerolvm.rootd.v1.UnmountExternalResponse\x12r\n" +
+	"\x13SweepExternalMounts\x12,.aerolvm.rootd.v1.SweepExternalMountsRequest\x1a-.aerolvm.rootd.v1.SweepExternalMountsResponseB4Z2github.com/aerol-ai/microvm/internal/rootd/rootdpbb\x06proto3"
 
 var (
 	file_rootd_proto_rawDescOnce sync.Once
@@ -3631,133 +4204,155 @@ func file_rootd_proto_rawDescGZIP() []byte {
 	return file_rootd_proto_rawDescData
 }
 
-var file_rootd_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
+var file_rootd_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 64)
 var file_rootd_proto_goTypes = []any{
 	(RunscConfig)(0),                     // 0: aerolvm.rootd.v1.RunscConfig
 	(SandboxRulesOp)(0),                  // 1: aerolvm.rootd.v1.SandboxRulesOp
 	(BridgeProbeOp)(0),                   // 2: aerolvm.rootd.v1.BridgeProbeOp
 	(HostPortOp)(0),                      // 3: aerolvm.rootd.v1.HostPortOp
 	(HostPortKind)(0),                    // 4: aerolvm.rootd.v1.HostPortKind
-	(*VersionRequest)(nil),               // 5: aerolvm.rootd.v1.VersionRequest
-	(*VersionResponse)(nil),              // 6: aerolvm.rootd.v1.VersionResponse
-	(*EnsureHostRequest)(nil),            // 7: aerolvm.rootd.v1.EnsureHostRequest
-	(*EnsureHostResponse)(nil),           // 8: aerolvm.rootd.v1.EnsureHostResponse
-	(*HostEntry)(nil),                    // 9: aerolvm.rootd.v1.HostEntry
-	(*EnsureHostFilesRequest)(nil),       // 10: aerolvm.rootd.v1.EnsureHostFilesRequest
-	(*EnsureHostFilesResponse)(nil),      // 11: aerolvm.rootd.v1.EnsureHostFilesResponse
-	(*EnsureTaskFIFOsRequest)(nil),       // 12: aerolvm.rootd.v1.EnsureTaskFIFOsRequest
-	(*EnsureTaskFIFOsResponse)(nil),      // 13: aerolvm.rootd.v1.EnsureTaskFIFOsResponse
-	(*EnsureRunscConfigRequest)(nil),     // 14: aerolvm.rootd.v1.EnsureRunscConfigRequest
-	(*EnsureRunscConfigResponse)(nil),    // 15: aerolvm.rootd.v1.EnsureRunscConfigResponse
-	(*EnsureReadySocketRequest)(nil),     // 16: aerolvm.rootd.v1.EnsureReadySocketRequest
-	(*EnsureReadySocketResponse)(nil),    // 17: aerolvm.rootd.v1.EnsureReadySocketResponse
-	(*RemoveContainerFilesRequest)(nil),  // 18: aerolvm.rootd.v1.RemoveContainerFilesRequest
-	(*RemoveContainerFilesResponse)(nil), // 19: aerolvm.rootd.v1.RemoveContainerFilesResponse
-	(*HelperUnavailable)(nil),            // 20: aerolvm.rootd.v1.HelperUnavailable
-	(*HelperUnsupported)(nil),            // 21: aerolvm.rootd.v1.HelperUnsupported
-	(*HelperRefused)(nil),                // 22: aerolvm.rootd.v1.HelperRefused
-	(*EnsureHostNetworkRequest)(nil),     // 23: aerolvm.rootd.v1.EnsureHostNetworkRequest
-	(*EnsureHostNetworkResponse)(nil),    // 24: aerolvm.rootd.v1.EnsureHostNetworkResponse
-	(*RealizeNetnsRequest)(nil),          // 25: aerolvm.rootd.v1.RealizeNetnsRequest
-	(*RealizeNetnsResponse)(nil),         // 26: aerolvm.rootd.v1.RealizeNetnsResponse
-	(*RemoveNetnsRequest)(nil),           // 27: aerolvm.rootd.v1.RemoveNetnsRequest
-	(*RemoveNetnsResponse)(nil),          // 28: aerolvm.rootd.v1.RemoveNetnsResponse
-	(*DisableNetnsIPv6Request)(nil),      // 29: aerolvm.rootd.v1.DisableNetnsIPv6Request
-	(*DisableNetnsIPv6Response)(nil),     // 30: aerolvm.rootd.v1.DisableNetnsIPv6Response
-	(*NetnsAddrsRequest)(nil),            // 31: aerolvm.rootd.v1.NetnsAddrsRequest
-	(*NetnsAddrsResponse)(nil),           // 32: aerolvm.rootd.v1.NetnsAddrsResponse
-	(*NodePort)(nil),                     // 33: aerolvm.rootd.v1.NodePort
-	(*SetNodeGuardRequest)(nil),          // 34: aerolvm.rootd.v1.SetNodeGuardRequest
-	(*SetNodeGuardResponse)(nil),         // 35: aerolvm.rootd.v1.SetNodeGuardResponse
-	(*SetEgressFloorRequest)(nil),        // 36: aerolvm.rootd.v1.SetEgressFloorRequest
-	(*SetEgressFloorResponse)(nil),       // 37: aerolvm.rootd.v1.SetEgressFloorResponse
-	(*SandboxRulesRequest)(nil),          // 38: aerolvm.rootd.v1.SandboxRulesRequest
-	(*SandboxRulesResponse)(nil),         // 39: aerolvm.rootd.v1.SandboxRulesResponse
-	(*SandboxFirewall)(nil),              // 40: aerolvm.rootd.v1.SandboxFirewall
-	(*SandboxCgroup)(nil),                // 41: aerolvm.rootd.v1.SandboxCgroup
-	(*HostNaming)(nil),                   // 42: aerolvm.rootd.v1.HostNaming
-	(*ContainerSetup)(nil),               // 43: aerolvm.rootd.v1.ContainerSetup
-	(*SandboxFilePaths)(nil),             // 44: aerolvm.rootd.v1.SandboxFilePaths
-	(*ImageUser)(nil),                    // 45: aerolvm.rootd.v1.ImageUser
-	(*ImageUserAnswer)(nil),              // 46: aerolvm.rootd.v1.ImageUserAnswer
-	(*DiskQuota)(nil),                    // 47: aerolvm.rootd.v1.DiskQuota
-	(*PrepareSandboxRequest)(nil),        // 48: aerolvm.rootd.v1.PrepareSandboxRequest
-	(*PrepareSandboxResponse)(nil),       // 49: aerolvm.rootd.v1.PrepareSandboxResponse
-	(*ReleaseSandboxRequest)(nil),        // 50: aerolvm.rootd.v1.ReleaseSandboxRequest
-	(*ReleaseSandboxResponse)(nil),       // 51: aerolvm.rootd.v1.ReleaseSandboxResponse
-	(*BridgeProbeRequest)(nil),           // 52: aerolvm.rootd.v1.BridgeProbeRequest
-	(*BridgeProbeResponse)(nil),          // 53: aerolvm.rootd.v1.BridgeProbeResponse
-	(*MatchProcessRequest)(nil),          // 54: aerolvm.rootd.v1.MatchProcessRequest
-	(*MatchProcessResponse)(nil),         // 55: aerolvm.rootd.v1.MatchProcessResponse
-	(*HostPortForward)(nil),              // 56: aerolvm.rootd.v1.HostPortForward
-	(*HostPortRequest)(nil),              // 57: aerolvm.rootd.v1.HostPortRequest
-	(*HostPortResponse)(nil),             // 58: aerolvm.rootd.v1.HostPortResponse
+	(MountExternalMode)(0),               // 5: aerolvm.rootd.v1.MountExternalMode
+	(*VersionRequest)(nil),               // 6: aerolvm.rootd.v1.VersionRequest
+	(*VersionResponse)(nil),              // 7: aerolvm.rootd.v1.VersionResponse
+	(*EnsureHostRequest)(nil),            // 8: aerolvm.rootd.v1.EnsureHostRequest
+	(*EnsureHostResponse)(nil),           // 9: aerolvm.rootd.v1.EnsureHostResponse
+	(*HostEntry)(nil),                    // 10: aerolvm.rootd.v1.HostEntry
+	(*EnsureHostFilesRequest)(nil),       // 11: aerolvm.rootd.v1.EnsureHostFilesRequest
+	(*EnsureHostFilesResponse)(nil),      // 12: aerolvm.rootd.v1.EnsureHostFilesResponse
+	(*EnsureTaskFIFOsRequest)(nil),       // 13: aerolvm.rootd.v1.EnsureTaskFIFOsRequest
+	(*EnsureTaskFIFOsResponse)(nil),      // 14: aerolvm.rootd.v1.EnsureTaskFIFOsResponse
+	(*EnsureRunscConfigRequest)(nil),     // 15: aerolvm.rootd.v1.EnsureRunscConfigRequest
+	(*EnsureRunscConfigResponse)(nil),    // 16: aerolvm.rootd.v1.EnsureRunscConfigResponse
+	(*EnsureReadySocketRequest)(nil),     // 17: aerolvm.rootd.v1.EnsureReadySocketRequest
+	(*EnsureReadySocketResponse)(nil),    // 18: aerolvm.rootd.v1.EnsureReadySocketResponse
+	(*RemoveContainerFilesRequest)(nil),  // 19: aerolvm.rootd.v1.RemoveContainerFilesRequest
+	(*RemoveContainerFilesResponse)(nil), // 20: aerolvm.rootd.v1.RemoveContainerFilesResponse
+	(*HelperUnavailable)(nil),            // 21: aerolvm.rootd.v1.HelperUnavailable
+	(*HelperUnsupported)(nil),            // 22: aerolvm.rootd.v1.HelperUnsupported
+	(*HelperRefused)(nil),                // 23: aerolvm.rootd.v1.HelperRefused
+	(*EnsureHostNetworkRequest)(nil),     // 24: aerolvm.rootd.v1.EnsureHostNetworkRequest
+	(*EnsureHostNetworkResponse)(nil),    // 25: aerolvm.rootd.v1.EnsureHostNetworkResponse
+	(*RealizeNetnsRequest)(nil),          // 26: aerolvm.rootd.v1.RealizeNetnsRequest
+	(*RealizeNetnsResponse)(nil),         // 27: aerolvm.rootd.v1.RealizeNetnsResponse
+	(*RemoveNetnsRequest)(nil),           // 28: aerolvm.rootd.v1.RemoveNetnsRequest
+	(*RemoveNetnsResponse)(nil),          // 29: aerolvm.rootd.v1.RemoveNetnsResponse
+	(*DisableNetnsIPv6Request)(nil),      // 30: aerolvm.rootd.v1.DisableNetnsIPv6Request
+	(*DisableNetnsIPv6Response)(nil),     // 31: aerolvm.rootd.v1.DisableNetnsIPv6Response
+	(*NetnsAddrsRequest)(nil),            // 32: aerolvm.rootd.v1.NetnsAddrsRequest
+	(*NetnsAddrsResponse)(nil),           // 33: aerolvm.rootd.v1.NetnsAddrsResponse
+	(*NodePort)(nil),                     // 34: aerolvm.rootd.v1.NodePort
+	(*SetNodeGuardRequest)(nil),          // 35: aerolvm.rootd.v1.SetNodeGuardRequest
+	(*SetNodeGuardResponse)(nil),         // 36: aerolvm.rootd.v1.SetNodeGuardResponse
+	(*SetEgressFloorRequest)(nil),        // 37: aerolvm.rootd.v1.SetEgressFloorRequest
+	(*SetEgressFloorResponse)(nil),       // 38: aerolvm.rootd.v1.SetEgressFloorResponse
+	(*SandboxRulesRequest)(nil),          // 39: aerolvm.rootd.v1.SandboxRulesRequest
+	(*SandboxRulesResponse)(nil),         // 40: aerolvm.rootd.v1.SandboxRulesResponse
+	(*SandboxFirewall)(nil),              // 41: aerolvm.rootd.v1.SandboxFirewall
+	(*SandboxCgroup)(nil),                // 42: aerolvm.rootd.v1.SandboxCgroup
+	(*HostNaming)(nil),                   // 43: aerolvm.rootd.v1.HostNaming
+	(*ContainerSetup)(nil),               // 44: aerolvm.rootd.v1.ContainerSetup
+	(*SandboxFilePaths)(nil),             // 45: aerolvm.rootd.v1.SandboxFilePaths
+	(*ImageUser)(nil),                    // 46: aerolvm.rootd.v1.ImageUser
+	(*ImageUserAnswer)(nil),              // 47: aerolvm.rootd.v1.ImageUserAnswer
+	(*DiskQuota)(nil),                    // 48: aerolvm.rootd.v1.DiskQuota
+	(*PrepareSandboxRequest)(nil),        // 49: aerolvm.rootd.v1.PrepareSandboxRequest
+	(*PrepareSandboxResponse)(nil),       // 50: aerolvm.rootd.v1.PrepareSandboxResponse
+	(*ReleaseSandboxRequest)(nil),        // 51: aerolvm.rootd.v1.ReleaseSandboxRequest
+	(*ReleaseSandboxResponse)(nil),       // 52: aerolvm.rootd.v1.ReleaseSandboxResponse
+	(*BridgeProbeRequest)(nil),           // 53: aerolvm.rootd.v1.BridgeProbeRequest
+	(*BridgeProbeResponse)(nil),          // 54: aerolvm.rootd.v1.BridgeProbeResponse
+	(*MatchProcessRequest)(nil),          // 55: aerolvm.rootd.v1.MatchProcessRequest
+	(*MatchProcessResponse)(nil),         // 56: aerolvm.rootd.v1.MatchProcessResponse
+	(*HostPortForward)(nil),              // 57: aerolvm.rootd.v1.HostPortForward
+	(*HostPortRequest)(nil),              // 58: aerolvm.rootd.v1.HostPortRequest
+	(*HostPortResponse)(nil),             // 59: aerolvm.rootd.v1.HostPortResponse
+	(*ExternalMount)(nil),                // 60: aerolvm.rootd.v1.ExternalMount
+	(*MountExternalRequest)(nil),         // 61: aerolvm.rootd.v1.MountExternalRequest
+	(*MountBind)(nil),                    // 62: aerolvm.rootd.v1.MountBind
+	(*MountExternalResponse)(nil),        // 63: aerolvm.rootd.v1.MountExternalResponse
+	(*UnmountExternalRequest)(nil),       // 64: aerolvm.rootd.v1.UnmountExternalRequest
+	(*UnmountExternalResponse)(nil),      // 65: aerolvm.rootd.v1.UnmountExternalResponse
+	(*SweepExternalMountsRequest)(nil),   // 66: aerolvm.rootd.v1.SweepExternalMountsRequest
+	(*SweepExternalMountsResponse)(nil),  // 67: aerolvm.rootd.v1.SweepExternalMountsResponse
+	nil,                                  // 68: aerolvm.rootd.v1.ExternalMount.OptionsEntry
+	nil,                                  // 69: aerolvm.rootd.v1.ExternalMount.CredentialsEntry
 }
 var file_rootd_proto_depIdxs = []int32{
-	9,  // 0: aerolvm.rootd.v1.EnsureHostFilesRequest.hosts:type_name -> aerolvm.rootd.v1.HostEntry
+	10, // 0: aerolvm.rootd.v1.EnsureHostFilesRequest.hosts:type_name -> aerolvm.rootd.v1.HostEntry
 	0,  // 1: aerolvm.rootd.v1.EnsureRunscConfigRequest.config:type_name -> aerolvm.rootd.v1.RunscConfig
-	33, // 2: aerolvm.rootd.v1.SetNodeGuardRequest.allow:type_name -> aerolvm.rootd.v1.NodePort
+	34, // 2: aerolvm.rootd.v1.SetNodeGuardRequest.allow:type_name -> aerolvm.rootd.v1.NodePort
 	1,  // 3: aerolvm.rootd.v1.SandboxRulesRequest.op:type_name -> aerolvm.rootd.v1.SandboxRulesOp
-	9,  // 4: aerolvm.rootd.v1.HostNaming.hosts:type_name -> aerolvm.rootd.v1.HostEntry
-	42, // 5: aerolvm.rootd.v1.ContainerSetup.naming:type_name -> aerolvm.rootd.v1.HostNaming
+	10, // 4: aerolvm.rootd.v1.HostNaming.hosts:type_name -> aerolvm.rootd.v1.HostEntry
+	43, // 5: aerolvm.rootd.v1.ContainerSetup.naming:type_name -> aerolvm.rootd.v1.HostNaming
 	0,  // 6: aerolvm.rootd.v1.ContainerSetup.runsc_config:type_name -> aerolvm.rootd.v1.RunscConfig
-	40, // 7: aerolvm.rootd.v1.PrepareSandboxRequest.firewall:type_name -> aerolvm.rootd.v1.SandboxFirewall
-	41, // 8: aerolvm.rootd.v1.PrepareSandboxRequest.cgroup:type_name -> aerolvm.rootd.v1.SandboxCgroup
-	43, // 9: aerolvm.rootd.v1.PrepareSandboxRequest.setup:type_name -> aerolvm.rootd.v1.ContainerSetup
-	45, // 10: aerolvm.rootd.v1.PrepareSandboxRequest.image_user:type_name -> aerolvm.rootd.v1.ImageUser
-	47, // 11: aerolvm.rootd.v1.PrepareSandboxRequest.disk_quota:type_name -> aerolvm.rootd.v1.DiskQuota
-	44, // 12: aerolvm.rootd.v1.PrepareSandboxResponse.files:type_name -> aerolvm.rootd.v1.SandboxFilePaths
-	46, // 13: aerolvm.rootd.v1.PrepareSandboxResponse.image_user:type_name -> aerolvm.rootd.v1.ImageUserAnswer
+	41, // 7: aerolvm.rootd.v1.PrepareSandboxRequest.firewall:type_name -> aerolvm.rootd.v1.SandboxFirewall
+	42, // 8: aerolvm.rootd.v1.PrepareSandboxRequest.cgroup:type_name -> aerolvm.rootd.v1.SandboxCgroup
+	44, // 9: aerolvm.rootd.v1.PrepareSandboxRequest.setup:type_name -> aerolvm.rootd.v1.ContainerSetup
+	46, // 10: aerolvm.rootd.v1.PrepareSandboxRequest.image_user:type_name -> aerolvm.rootd.v1.ImageUser
+	48, // 11: aerolvm.rootd.v1.PrepareSandboxRequest.disk_quota:type_name -> aerolvm.rootd.v1.DiskQuota
+	45, // 12: aerolvm.rootd.v1.PrepareSandboxResponse.files:type_name -> aerolvm.rootd.v1.SandboxFilePaths
+	47, // 13: aerolvm.rootd.v1.PrepareSandboxResponse.image_user:type_name -> aerolvm.rootd.v1.ImageUserAnswer
 	2,  // 14: aerolvm.rootd.v1.BridgeProbeRequest.op:type_name -> aerolvm.rootd.v1.BridgeProbeOp
 	4,  // 15: aerolvm.rootd.v1.HostPortForward.kind:type_name -> aerolvm.rootd.v1.HostPortKind
 	3,  // 16: aerolvm.rootd.v1.HostPortRequest.op:type_name -> aerolvm.rootd.v1.HostPortOp
-	56, // 17: aerolvm.rootd.v1.HostPortRequest.forwards:type_name -> aerolvm.rootd.v1.HostPortForward
-	5,  // 18: aerolvm.rootd.v1.RootHelper.Version:input_type -> aerolvm.rootd.v1.VersionRequest
-	7,  // 19: aerolvm.rootd.v1.RootHelper.EnsureHost:input_type -> aerolvm.rootd.v1.EnsureHostRequest
-	10, // 20: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:input_type -> aerolvm.rootd.v1.EnsureHostFilesRequest
-	12, // 21: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:input_type -> aerolvm.rootd.v1.EnsureTaskFIFOsRequest
-	14, // 22: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:input_type -> aerolvm.rootd.v1.EnsureRunscConfigRequest
-	16, // 23: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:input_type -> aerolvm.rootd.v1.EnsureReadySocketRequest
-	18, // 24: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:input_type -> aerolvm.rootd.v1.RemoveContainerFilesRequest
-	23, // 25: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:input_type -> aerolvm.rootd.v1.EnsureHostNetworkRequest
-	25, // 26: aerolvm.rootd.v1.RootHelper.RealizeNetns:input_type -> aerolvm.rootd.v1.RealizeNetnsRequest
-	27, // 27: aerolvm.rootd.v1.RootHelper.RemoveNetns:input_type -> aerolvm.rootd.v1.RemoveNetnsRequest
-	29, // 28: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:input_type -> aerolvm.rootd.v1.DisableNetnsIPv6Request
-	31, // 29: aerolvm.rootd.v1.RootHelper.NetnsAddrs:input_type -> aerolvm.rootd.v1.NetnsAddrsRequest
-	34, // 30: aerolvm.rootd.v1.RootHelper.SetNodeGuard:input_type -> aerolvm.rootd.v1.SetNodeGuardRequest
-	36, // 31: aerolvm.rootd.v1.RootHelper.SetEgressFloor:input_type -> aerolvm.rootd.v1.SetEgressFloorRequest
-	38, // 32: aerolvm.rootd.v1.RootHelper.SandboxRules:input_type -> aerolvm.rootd.v1.SandboxRulesRequest
-	48, // 33: aerolvm.rootd.v1.RootHelper.PrepareSandbox:input_type -> aerolvm.rootd.v1.PrepareSandboxRequest
-	50, // 34: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:input_type -> aerolvm.rootd.v1.ReleaseSandboxRequest
-	52, // 35: aerolvm.rootd.v1.RootHelper.BridgeProbe:input_type -> aerolvm.rootd.v1.BridgeProbeRequest
-	54, // 36: aerolvm.rootd.v1.RootHelper.MatchProcess:input_type -> aerolvm.rootd.v1.MatchProcessRequest
-	57, // 37: aerolvm.rootd.v1.RootHelper.HostPort:input_type -> aerolvm.rootd.v1.HostPortRequest
-	6,  // 38: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
-	8,  // 39: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
-	11, // 40: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
-	13, // 41: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
-	15, // 42: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
-	17, // 43: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
-	19, // 44: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
-	24, // 45: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:output_type -> aerolvm.rootd.v1.EnsureHostNetworkResponse
-	26, // 46: aerolvm.rootd.v1.RootHelper.RealizeNetns:output_type -> aerolvm.rootd.v1.RealizeNetnsResponse
-	28, // 47: aerolvm.rootd.v1.RootHelper.RemoveNetns:output_type -> aerolvm.rootd.v1.RemoveNetnsResponse
-	30, // 48: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:output_type -> aerolvm.rootd.v1.DisableNetnsIPv6Response
-	32, // 49: aerolvm.rootd.v1.RootHelper.NetnsAddrs:output_type -> aerolvm.rootd.v1.NetnsAddrsResponse
-	35, // 50: aerolvm.rootd.v1.RootHelper.SetNodeGuard:output_type -> aerolvm.rootd.v1.SetNodeGuardResponse
-	37, // 51: aerolvm.rootd.v1.RootHelper.SetEgressFloor:output_type -> aerolvm.rootd.v1.SetEgressFloorResponse
-	39, // 52: aerolvm.rootd.v1.RootHelper.SandboxRules:output_type -> aerolvm.rootd.v1.SandboxRulesResponse
-	49, // 53: aerolvm.rootd.v1.RootHelper.PrepareSandbox:output_type -> aerolvm.rootd.v1.PrepareSandboxResponse
-	51, // 54: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:output_type -> aerolvm.rootd.v1.ReleaseSandboxResponse
-	53, // 55: aerolvm.rootd.v1.RootHelper.BridgeProbe:output_type -> aerolvm.rootd.v1.BridgeProbeResponse
-	55, // 56: aerolvm.rootd.v1.RootHelper.MatchProcess:output_type -> aerolvm.rootd.v1.MatchProcessResponse
-	58, // 57: aerolvm.rootd.v1.RootHelper.HostPort:output_type -> aerolvm.rootd.v1.HostPortResponse
-	38, // [38:58] is the sub-list for method output_type
-	18, // [18:38] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	57, // 17: aerolvm.rootd.v1.HostPortRequest.forwards:type_name -> aerolvm.rootd.v1.HostPortForward
+	68, // 18: aerolvm.rootd.v1.ExternalMount.options:type_name -> aerolvm.rootd.v1.ExternalMount.OptionsEntry
+	69, // 19: aerolvm.rootd.v1.ExternalMount.credentials:type_name -> aerolvm.rootd.v1.ExternalMount.CredentialsEntry
+	5,  // 20: aerolvm.rootd.v1.MountExternalRequest.mode:type_name -> aerolvm.rootd.v1.MountExternalMode
+	60, // 21: aerolvm.rootd.v1.MountExternalRequest.mounts:type_name -> aerolvm.rootd.v1.ExternalMount
+	62, // 22: aerolvm.rootd.v1.MountExternalResponse.binds:type_name -> aerolvm.rootd.v1.MountBind
+	6,  // 23: aerolvm.rootd.v1.RootHelper.Version:input_type -> aerolvm.rootd.v1.VersionRequest
+	8,  // 24: aerolvm.rootd.v1.RootHelper.EnsureHost:input_type -> aerolvm.rootd.v1.EnsureHostRequest
+	11, // 25: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:input_type -> aerolvm.rootd.v1.EnsureHostFilesRequest
+	13, // 26: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:input_type -> aerolvm.rootd.v1.EnsureTaskFIFOsRequest
+	15, // 27: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:input_type -> aerolvm.rootd.v1.EnsureRunscConfigRequest
+	17, // 28: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:input_type -> aerolvm.rootd.v1.EnsureReadySocketRequest
+	19, // 29: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:input_type -> aerolvm.rootd.v1.RemoveContainerFilesRequest
+	24, // 30: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:input_type -> aerolvm.rootd.v1.EnsureHostNetworkRequest
+	26, // 31: aerolvm.rootd.v1.RootHelper.RealizeNetns:input_type -> aerolvm.rootd.v1.RealizeNetnsRequest
+	28, // 32: aerolvm.rootd.v1.RootHelper.RemoveNetns:input_type -> aerolvm.rootd.v1.RemoveNetnsRequest
+	30, // 33: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:input_type -> aerolvm.rootd.v1.DisableNetnsIPv6Request
+	32, // 34: aerolvm.rootd.v1.RootHelper.NetnsAddrs:input_type -> aerolvm.rootd.v1.NetnsAddrsRequest
+	35, // 35: aerolvm.rootd.v1.RootHelper.SetNodeGuard:input_type -> aerolvm.rootd.v1.SetNodeGuardRequest
+	37, // 36: aerolvm.rootd.v1.RootHelper.SetEgressFloor:input_type -> aerolvm.rootd.v1.SetEgressFloorRequest
+	39, // 37: aerolvm.rootd.v1.RootHelper.SandboxRules:input_type -> aerolvm.rootd.v1.SandboxRulesRequest
+	49, // 38: aerolvm.rootd.v1.RootHelper.PrepareSandbox:input_type -> aerolvm.rootd.v1.PrepareSandboxRequest
+	51, // 39: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:input_type -> aerolvm.rootd.v1.ReleaseSandboxRequest
+	53, // 40: aerolvm.rootd.v1.RootHelper.BridgeProbe:input_type -> aerolvm.rootd.v1.BridgeProbeRequest
+	55, // 41: aerolvm.rootd.v1.RootHelper.MatchProcess:input_type -> aerolvm.rootd.v1.MatchProcessRequest
+	58, // 42: aerolvm.rootd.v1.RootHelper.HostPort:input_type -> aerolvm.rootd.v1.HostPortRequest
+	61, // 43: aerolvm.rootd.v1.RootHelper.MountExternal:input_type -> aerolvm.rootd.v1.MountExternalRequest
+	64, // 44: aerolvm.rootd.v1.RootHelper.UnmountExternal:input_type -> aerolvm.rootd.v1.UnmountExternalRequest
+	66, // 45: aerolvm.rootd.v1.RootHelper.SweepExternalMounts:input_type -> aerolvm.rootd.v1.SweepExternalMountsRequest
+	7,  // 46: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
+	9,  // 47: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
+	12, // 48: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
+	14, // 49: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
+	16, // 50: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
+	18, // 51: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
+	20, // 52: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
+	25, // 53: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:output_type -> aerolvm.rootd.v1.EnsureHostNetworkResponse
+	27, // 54: aerolvm.rootd.v1.RootHelper.RealizeNetns:output_type -> aerolvm.rootd.v1.RealizeNetnsResponse
+	29, // 55: aerolvm.rootd.v1.RootHelper.RemoveNetns:output_type -> aerolvm.rootd.v1.RemoveNetnsResponse
+	31, // 56: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:output_type -> aerolvm.rootd.v1.DisableNetnsIPv6Response
+	33, // 57: aerolvm.rootd.v1.RootHelper.NetnsAddrs:output_type -> aerolvm.rootd.v1.NetnsAddrsResponse
+	36, // 58: aerolvm.rootd.v1.RootHelper.SetNodeGuard:output_type -> aerolvm.rootd.v1.SetNodeGuardResponse
+	38, // 59: aerolvm.rootd.v1.RootHelper.SetEgressFloor:output_type -> aerolvm.rootd.v1.SetEgressFloorResponse
+	40, // 60: aerolvm.rootd.v1.RootHelper.SandboxRules:output_type -> aerolvm.rootd.v1.SandboxRulesResponse
+	50, // 61: aerolvm.rootd.v1.RootHelper.PrepareSandbox:output_type -> aerolvm.rootd.v1.PrepareSandboxResponse
+	52, // 62: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:output_type -> aerolvm.rootd.v1.ReleaseSandboxResponse
+	54, // 63: aerolvm.rootd.v1.RootHelper.BridgeProbe:output_type -> aerolvm.rootd.v1.BridgeProbeResponse
+	56, // 64: aerolvm.rootd.v1.RootHelper.MatchProcess:output_type -> aerolvm.rootd.v1.MatchProcessResponse
+	59, // 65: aerolvm.rootd.v1.RootHelper.HostPort:output_type -> aerolvm.rootd.v1.HostPortResponse
+	63, // 66: aerolvm.rootd.v1.RootHelper.MountExternal:output_type -> aerolvm.rootd.v1.MountExternalResponse
+	65, // 67: aerolvm.rootd.v1.RootHelper.UnmountExternal:output_type -> aerolvm.rootd.v1.UnmountExternalResponse
+	67, // 68: aerolvm.rootd.v1.RootHelper.SweepExternalMounts:output_type -> aerolvm.rootd.v1.SweepExternalMountsResponse
+	46, // [46:69] is the sub-list for method output_type
+	23, // [23:46] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_rootd_proto_init() }
@@ -3770,8 +4365,8 @@ func file_rootd_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rootd_proto_rawDesc), len(file_rootd_proto_rawDesc)),
-			NumEnums:      5,
-			NumMessages:   54,
+			NumEnums:      6,
+			NumMessages:   64,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -121,7 +121,12 @@ func TestMountsOffFor(t *testing.T) {
 	if got := mountsOffFor(config.Config{}); got != "" {
 		t.Fatalf("single mode on a VM: %q", got)
 	}
-	if got := mountsOffFor(splitConfig()); !strings.Contains(got, "external storage") || !strings.Contains(got, "SB_PRIVILEGE_MODE=single") {
+	// Split mode mounts through the root helper (M1 PR 8): no refusal at
+	// boot, and the pod checks of F13 do not apply (the helper mounts in
+	// the runtime's own namespace).
+	split := splitConfig()
+	split.HostProcessCgroupParent = "/kubepods/pod1/sandboxes"
+	if got := mountsOffFor(split); got != "" {
 		t.Fatalf("split mode: %q", got)
 	}
 }

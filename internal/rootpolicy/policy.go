@@ -165,6 +165,11 @@ type Policy struct {
 	// BindRoots: a bind mount's source must be strictly inside one of
 	// these folders (the external mounts), and may be a folder there.
 	BindRoots []string
+	// MountsRoot, when set, is the bind root that holds the external
+	// mounts (the root helper's, M1 PR 8): a bind from inside it must be
+	// one of the container's own mount points, <MountsRoot>/<container
+	// ID>/<index> (CheckMountBind). It must be one of BindRoots.
+	MountsRoot string
 	// BindFiles: or be exactly one of these files (the toolbox binary).
 	BindFiles []string
 	// HelperFileRoots: or be one file the root helper made in one of its
@@ -258,6 +263,9 @@ func (p Policy) Validate() error {
 				return fmt.Errorf("policy %s %q is inside forbidden %s", roots.what, r, f)
 			}
 		}
+	}
+	if p.MountsRoot != "" && !slices.Contains(p.BindRoots, p.MountsRoot) {
+		return fmt.Errorf("policy mounts root %q is not one of the bind roots %v", p.MountsRoot, p.BindRoots)
 	}
 	for _, f := range p.BindFiles {
 		if !cleanAbs(f) || f == "/" {

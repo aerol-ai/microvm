@@ -34,7 +34,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 
 	t.Run("missing_proc_root", func(t *testing.T) {
 		// ReadDir fails → early return, no panic.
-		killFUSEProcessesInRoot(logger, targetDir, "/nonexistent/proc/root")
+		killFUSEProcessesInRoot(logger, targetDir, "/nonexistent/proc/root", nil)
 	})
 
 	t.Run("skips_non_dir_entry", func(t *testing.T) {
@@ -43,7 +43,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(procRoot, "123"), []byte("data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("skips_non_numeric_dir", func(t *testing.T) {
@@ -51,7 +51,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		if err := os.Mkdir(filepath.Join(procRoot, "notapid"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("skips_pid_dir_without_cmdline", func(t *testing.T) {
@@ -60,7 +60,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		// No cmdline file → ReadFile fails → skipped.
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("skips_non_matching_cmdline", func(t *testing.T) {
@@ -72,7 +72,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(pidDir, "cmdline"), []byte("/other/path\x00arg"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("dir_already_has_trailing_slash", func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Use a non-existent PID so Kill is a no-op (ESRCH ignored).
-		killFUSEProcessesInRoot(logger, dirWithSlash, procRoot)
+		killFUSEProcessesInRoot(logger, dirWithSlash, procRoot, nil)
 	})
 
 	t.Run("matches_contains_nonexistent_pid", func(t *testing.T) {
@@ -103,7 +103,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(pidDir, "cmdline"), []byte(targetDir+"/subdir\x00"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("matches_has_suffix_nonexistent_pid", func(t *testing.T) {
@@ -118,7 +118,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(pidDir, "cmdline"), []byte("rclone mount"+targetDir), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 	})
 
 	t.Run("kills_real_subprocess_pgid_path", func(t *testing.T) {
@@ -140,7 +140,7 @@ func TestKillFUSEProcessesInRoot(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		killFUSEProcessesInRoot(logger, targetDir, procRoot)
+		killFUSEProcessesInRoot(logger, targetDir, procRoot, nil)
 
 		// Wait confirms the process was killed (not still running).
 		_ = cmd.Wait()
