@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -23,10 +24,17 @@ import (
 const DefaultBuildKitAddr = "unix:///run/buildkit/buildkitd.sock"
 
 // BuildKitBuilder builds images for the containerd engine by shelling out to
-// `buildctl` against a local buildkitd whose containerd worker writes into the
-// aerolvm namespace. It satisfies the same ImageBuilder seam as the dockerd
-// build path (BuildImage(ctx, docker.BuildImageRequest)), so the v1/daytona
-// build handlers work unchanged once the engine-gate is lifted.
+// `buildctl` against a local buildkitd. It satisfies the same ImageBuilder
+// seam as the dockerd build path (BuildImage(ctx, docker.BuildImageRequest)),
+// so the v1/daytona build handlers work unchanged once the engine-gate is
+// lifted. Two kinds of buildkitd:
+//   - root, with a containerd worker that writes the image straight into the
+//     aerolvm namespace (today's, and the default in privilege mode single);
+//   - rootless (WithArchiveImport, SB_CONTAINERD_BUILDKIT_ROOTLESS): BuildKit's
+//     rootless mode with its OCI worker, which cannot reach containerd. The
+//     build streams an OCI archive to buildctl's stdout, and the driver
+//     imports it (Driver.ImportBuildArchive), through the root helper's gate
+//     in privilege mode split.
 //
 // buildctl is used instead of the moby/buildkit Go client to avoid pulling
 // buildkit's large dependency tree into the daemon; buildctl ships alongside
@@ -38,7 +46,26 @@ type BuildKitBuilder struct {
 	// contextIDs hands each context unpack its own uid and gid (see
 	// unpackContext).
 	contextIDs *contextIDPool
+	// archive, when set, imports a rootless build's OCI archive, at most
+	// maxImageBytes of it.
+	archive       buildArchiveImporter
+	maxImageBytes int64
 }
+
+// buildArchiveImporter imports a rootless build's OCI archive (*Driver).
+type buildArchiveImporter interface {
+	ImportBuildArchive(ctx context.Context, ref string, archive io.Reader, maxBytes int64, finished func() error) error
+}
+
+// maxBuildTrailer is how much buildctl may still write once the archive's
+// end-of-archive blocks have been read: tar writers pad to a record (10 KiB
+// by default) at most. More means the output is not one archive.
+const maxBuildTrailer = 64 << 10
+
+// buildctlWaitDelay bounds how long Wait waits for buildctl's pipes once
+// buildctl has exited or been stopped: anything it left running that holds
+// them must not hold the build up. A var so tests can shorten it.
+var buildctlWaitDelay = 5 * time.Second
 
 // buildDirPrefix names every build's temp folder; SweepBuildDirs looks for it.
 const buildDirPrefix = "aerolvm-buildkit-"
@@ -75,6 +102,19 @@ func (b *BuildKitBuilder) WithContextIDBase(base int) *BuildKitBuilder {
 	b.contextIDs = sharedContextIDPool(base, base, config.BuildContextIDCount)
 	return b
 }
+
+// WithArchiveImport makes the builder drive a rootless buildkitd: each build
+// exports an OCI archive on buildctl's stdout, which imp reads, at most
+// maxBytes of it, and names as the build's tag.
+func (b *BuildKitBuilder) WithArchiveImport(imp buildArchiveImporter, maxBytes int64) *BuildKitBuilder {
+	b.archive = imp
+	b.maxImageBytes = maxBytes
+	return b
+}
+
+// ImportsArchives reports whether this builder drives a rootless buildkitd
+// (WithArchiveImport).
+func (b *BuildKitBuilder) ImportsArchives() bool { return b.archive != nil }
 
 // CheckContextUnpacker looks, once at daemon start, for what would make every
 // build with a context fail: the unpacker runs sandboxd as an id that owns
@@ -176,15 +216,21 @@ func (b *BuildKitBuilder) BuildImage(ctx context.Context, req docker.BuildImageR
 		return fmt.Errorf("build image: write dockerfile: %w", err)
 	}
 
-	// unpack=true realizes the image's layers in the snapshotter so a subsequent
-	// WithNewSnapshot create can use it without an extra pull/unpack.
+	// A root buildkitd's containerd worker names the image itself, and
+	// unpack=true realizes its layers in the snapshotter so a subsequent
+	// WithNewSnapshot create can use it without an extra pull/unpack. A
+	// rootless one hands the image over as an OCI archive on stdout.
+	output := "type=image,name=" + tag + ",unpack=true"
+	if b.archive != nil {
+		output = "type=oci,dest=-"
+	}
 	args := []string{
 		"--addr", b.addr,
 		"build",
 		"--frontend", "dockerfile.v0",
 		"--local", "context=" + contextDir,
 		"--local", "dockerfile=" + contextDir,
-		"--output", "type=image,name=" + tag + ",unpack=true",
+		"--output", output,
 	}
 	if req.ForcePull {
 		// Resolve FROM, COPY --from and ONBUILD images from their registry,
@@ -192,17 +238,76 @@ func (b *BuildKitBuilder) BuildImage(ctx context.Context, req docker.BuildImageR
 		// docker.BuildImageRequest.ForcePull).
 		args = append(args, "--opt", "image-resolve-mode=pull")
 	}
-	cmd := exec.CommandContext(ctx, b.buildct, args...)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, b.buildct, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if req.OnLog != nil {
 		// buildctl writes progress to stderr; tee it to the caller's log sink.
 		cmd.Stderr = io.MultiWriter(&stderr, logLineWriter(req.OnLog))
 	}
+	if b.archive != nil {
+		return b.importBuild(runCtx, cancel, cmd, tag, &stderr)
+	}
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("buildctl build %s: %w: %s", tag, err, strings.TrimSpace(stderr.String()))
+		return buildctlError(tag, err, &stderr)
 	}
 	return nil
+}
+
+// importBuild runs a rootless build and imports the OCI archive buildctl
+// streams on its stdout. The image is named only once buildctl has exited
+// cleanly (the importer's finished step). When the import fails first,
+// buildctl is stopped; if it had already failed on its own (a RUN step, a
+// pull), its error is the one reported, since it says why.
+func (b *BuildKitBuilder) importBuild(ctx context.Context, cancel context.CancelFunc, cmd *exec.Cmd, tag string, stderr *bytes.Buffer) error {
+	cmd.WaitDelay = buildctlWaitDelay
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("buildctl build %s: %w", tag, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("buildctl build %s: %w", tag, err)
+	}
+	waited := false
+	var waitErr error
+	wait := func() error {
+		if !waited {
+			waited = true
+			waitErr = cmd.Wait()
+		}
+		return waitErr
+	}
+	finished := func() error {
+		n, err := io.Copy(io.Discard, io.LimitReader(out, maxBuildTrailer+1))
+		if err == nil && n > maxBuildTrailer {
+			err = fmt.Errorf("buildctl build %s: its output goes on past the end of the image archive", tag)
+		}
+		if err != nil {
+			cancel()
+			_ = wait()
+			return err
+		}
+		if err := wait(); err != nil {
+			return buildctlError(tag, err, stderr)
+		}
+		return nil
+	}
+	err = b.archive.ImportBuildArchive(ctx, tag, out, b.maxImageBytes, finished)
+	if err == nil || waited {
+		return err
+	}
+	cancel()
+	if werr := wait(); werr != nil && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() > 0 {
+		return buildctlError(tag, werr, stderr)
+	}
+	return fmt.Errorf("buildctl build %s: import the image: %w", tag, err)
+}
+
+// buildctlError is a failed buildctl run, with what it wrote to stderr.
+func buildctlError(tag string, err error, stderr *bytes.Buffer) error {
+	return fmt.Errorf("buildctl build %s: %w: %s", tag, err, strings.TrimSpace(stderr.String()))
 }
 
 // ImageBuilder is the full image-builder surface the v1 / daytona build
