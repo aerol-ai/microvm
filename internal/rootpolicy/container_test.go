@@ -190,6 +190,14 @@ func TestValidateID(t *testing.T) {
 		"_runtime": `starts with "_"`,
 		"_":        `starts with "_"`,
 		"sb_x":     "",
+		// The host-process runtimes' groups beside the sandboxes, refused
+		// in single mode too (the containerd driver's validateSandboxID).
+		"aerolvm-wasm":    `"aerolvm-"`,
+		"aerolvm-vmm":     `"aerolvm-"`,
+		"aerolvm-":        `"aerolvm-"`,
+		"aerol-netns-1":   "",
+		"sb-aerolvm-wasm": "",
+		"AerolVM-wasm":    "",
 	} {
 		err := ValidateID(id)
 		if want == "" {
