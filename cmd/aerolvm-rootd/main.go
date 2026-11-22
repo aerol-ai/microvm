@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	containersapi "github.com/containerd/containerd/api/services/containers/v1"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
@@ -127,6 +129,9 @@ func serve(ctx context.Context, cfg rootd.Config, opts rootd.Options, ready func
 	// after containerd is up. Until Serve, an agent's handshake waits and
 	// times out (503), which is true: there is no containerd yet.
 	opts.Containerd, opts.ServerOptions, opts.OnRefusal = g.Handle, g.ServerOptions(), refused
+	if opts.Containers == nil {
+		opts.Containers = containerdContainers{c: containersapi.NewContainersClient(upstream), ns: cfg.Policy.Namespace}
+	}
 	srv, err := rootd.New(cfg, opts, log)
 	if err != nil {
 		return err
@@ -183,6 +188,32 @@ func verifyNamespace(ctx context.Context, g *gate.Gate, log *slog.Logger) error 
 			return nil
 		case <-time.After(containerdRetry):
 		}
+	}
+}
+
+// containerdContainers lists containerd's containers in the helper's
+// namespace, for the sweep of gone containers' files (rootd sweep.go). It
+// streams the list: a node's specs together can pass a message's size.
+type containerdContainers struct {
+	c  containersapi.ContainersClient
+	ns string
+}
+
+func (l containerdContainers) ContainerIDs(ctx context.Context) (map[string]bool, error) {
+	stream, err := l.c.ListStream(namespaces.WithNamespace(ctx, l.ns), &containersapi.ListContainersRequest{})
+	if err != nil {
+		return nil, err
+	}
+	ids := map[string]bool{}
+	for {
+		m, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		ids[m.GetContainer().GetID()] = true
 	}
 }
 

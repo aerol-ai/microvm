@@ -65,10 +65,15 @@ const (
 	// out-of-memory choice (PrepareSandbox only, and alone; M1 PR 6). The
 	// runtime removes the group with the task, so ReleaseSandbox has none.
 	PartCgroup = "cgroup"
+	// PartFiles: the files root opens for a container, in the helper's own
+	// folders (PrepareSandbox, before the container is made and before
+	// each start), and their removal (ReleaseSandbox, alone). Named by the
+	// request's container_id; M1 PR 7.
+	PartFiles = "files"
 )
 
 // Parts lists every part name above.
-func Parts() []string { return []string{PartNetns, PartFirewall, PartCgroup} }
+func Parts() []string { return []string{PartNetns, PartFirewall, PartCgroup, PartFiles} }
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
 // handles, its own and the gate's. A failed call that carries it is the
