@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
@@ -149,8 +151,34 @@ func (f *files) checkSetup(s *rootdpb.ContainerSetup) (setupPlan, error) {
 // setup makes what a checked files part asks for, for container id, in the
 // helper's own folders, and answers with the paths. The caller holds the
 // container's lock.
+//
+// The two steps that can refuse on what they find (the toolbox, which
+// must be a regular file of the agent's; the ready socket, which must be
+// the agent's socket) come first, before anything of the container is
+// written, so a refused part leaves nothing behind: the ready step's own
+// folder goes again when the refusal leaves it empty. A failure after
+// them (the disk full) can leave files the call made; the agent's undo
+// releases them (ReleaseSandbox's files part), and the helper's sweep
+// takes them if the agent never comes back.
 func (f *files) setup(id string, p setupPlan) (*rootdpb.SandboxFilePaths, error) {
 	out := &rootdpb.SandboxFilePaths{}
+	if p.toolbox {
+		path, err := f.toolboxPath()
+		if err != nil {
+			return nil, err
+		}
+		out.ToolboxPath = path
+	}
+	if p.readyNonce != "" {
+		r, err := f.ensureReadySocket(&rootdpb.EnsureReadySocketRequest{ContainerId: id, Nonce: p.readyNonce})
+		if err != nil {
+			// The folder this call may have made, if it holds nothing: a
+			// folder with an earlier start's name in it fails ENOTEMPTY.
+			_ = unix.Unlinkat(f.ready, id, unix.AT_REMOVEDIR)
+			return nil, err
+		}
+		out.ReadySocketPath = r.GetPath()
+	}
 	if p.naming != nil {
 		p.naming.ContainerId = id
 		r, err := f.ensureHostFiles(p.naming)
@@ -166,26 +194,12 @@ func (f *files) setup(id string, p setupPlan) (*rootdpb.SandboxFilePaths, error)
 		}
 		out.StdoutPath, out.StderrPath = r.GetStdoutPath(), r.GetStderrPath()
 	}
-	if p.readyNonce != "" {
-		r, err := f.ensureReadySocket(&rootdpb.EnsureReadySocketRequest{ContainerId: id, Nonce: p.readyNonce})
-		if err != nil {
-			return nil, err
-		}
-		out.ReadySocketPath = r.GetPath()
-	}
 	if p.runsc != rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED {
 		r, err := f.ensureRunscConfig(&rootdpb.EnsureRunscConfigRequest{Config: p.runsc})
 		if err != nil {
 			return nil, err
 		}
 		out.RunscConfigPath = r.GetPath()
-	}
-	if p.toolbox {
-		path, err := f.toolboxPath()
-		if err != nil {
-			return nil, err
-		}
-		out.ToolboxPath = path
 	}
 	return out, nil
 }

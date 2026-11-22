@@ -656,3 +656,70 @@ func TestToolboxConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestFilesPartRefusalLeavesNothing (#1399 review): the steps that can
+// refuse on what they find, the toolbox and the ready socket, run before
+// anything of the container is written, so a refused files part leaves
+// the helper's folders as they were; a ready folder that already held an
+// earlier start's name keeps it.
+func TestFilesPartRefusalLeavesNothing(t *testing.T) {
+	t.Run("the ready socket is not the agent's", func(t *testing.T) {
+		r := newRig(t, nil)
+		if err := os.MkdirAll(r.cfg.Files.AgentReady, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(r.cfg.Files.AgentReady, testCID+"."+testNonce+".sock"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before := helperTree(t, r.cfg)
+		_, err := helperClient(r).PrepareSandbox(callCtx(t), filesReq(testCID))
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("err %v", err)
+		}
+		if after := helperTree(t, r.cfg); !slices.Equal(before, after) {
+			t.Fatalf("a refused part left files: %v -> %v", before, after)
+		}
+	})
+	t.Run("the toolbox is refused", func(t *testing.T) {
+		base := shortDir(t)
+		src := filepath.Join(base, "agent", "toolboxd")
+		r := newRig(t, func(c *Config, _ *Options) {
+			c.Files.ToolboxSource, c.Files.Toolbox = src, filepath.Join(base, "state", "toolbox", toolboxFile)
+			c.Policy.BindFiles = []string{c.Files.Toolbox}
+		})
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("/etc/passwd", src); err != nil {
+			t.Fatal(err)
+		}
+		agentSocket(t, r.cfg, testCID, testNonce)
+		before := helperTree(t, r.cfg)
+		_, err := helperClient(r).PrepareSandbox(callCtx(t), filesReq(testCID))
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("err %v", err)
+		}
+		if after := helperTree(t, r.cfg); !slices.Equal(before, after) {
+			t.Fatalf("a refused part left files: %v -> %v", before, after)
+		}
+	})
+	t.Run("an earlier start's name stays", func(t *testing.T) {
+		r := newRig(t, nil)
+		agentSocket(t, r.cfg, testCID, testNonce)
+		if _, err := helperClient(r).PrepareSandbox(callCtx(t), filesReq(testCID)); err != nil {
+			t.Fatal(err)
+		}
+		// The next start's socket under another nonce is a plain file.
+		req := filesReq(testCID)
+		req.Setup.ReadyNonce = "cd34"
+		if err := os.WriteFile(filepath.Join(r.cfg.Files.AgentReady, testCID+".cd34.sock"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := helperClient(r).PrepareSandbox(callCtx(t), req); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("err %v", err)
+		}
+		if _, err := os.Lstat(filepath.Join(r.cfg.Files.Ready, testCID, testNonce+".sock")); err != nil {
+			t.Fatalf("the earlier name went: %v", err)
+		}
+	})
+}
