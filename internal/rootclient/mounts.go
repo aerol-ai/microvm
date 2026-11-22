@@ -44,6 +44,9 @@ func (c *Client) SweepExternalMounts(ctx context.Context, keep []string) error {
 // function so the daemon can set it once the client exists, is the helper.
 type Mounts struct {
 	Client func() *Client
+	// Policy is the operator's settings the checks read: the agent's own
+	// copy (config.MountToolPolicy), which must say what the helper's says.
+	Policy models.MountToolPolicy
 }
 
 var _ mounts.Remote = Mounts{}
@@ -101,7 +104,7 @@ func (m Mounts) Mount(ctx context.Context, sandboxID string, mode mounts.RemoteM
 		wire[i] = &rootdpb.ExternalMount{Type: string(s.Type), Target: s.Target, Source: s.Source,
 			Options: s.Options, ReadOnly: s.ReadOnly, Credentials: s.Credentials}
 	}
-	if err := rootpolicy.CheckExternalMounts(sent, mode == mounts.RemoteKeepLive); err != nil {
+	if err := rootpolicy.CheckExternalMounts(sent, mode == mounts.RemoteKeepLive, m.Policy); err != nil {
 		return mounts.RemoteResult{}, fmt.Errorf("mount: %w", err)
 	}
 	resp, err := c.MountExternal(ctx, &rootdpb.MountExternalRequest{SandboxId: sandboxID, Mode: wireMode, Mounts: wire})

@@ -74,10 +74,11 @@ const (
 
 // mountCalls serves the mount calls; nil when this helper serves none.
 type mountCalls struct {
-	mgr   MountManager
-	locks *keyedLocks
-	limit *callLimit
-	log   *slog.Logger
+	mgr    MountManager
+	policy models.MountToolPolicy
+	locks  *keyedLocks
+	limit  *callLimit
+	log    *slog.Logger
 }
 
 var mountFeatures = []string{rootdpb.FeatureMountExternal, rootdpb.FeatureUnmountExternal, rootdpb.FeatureSweepExternalMounts}
@@ -104,7 +105,11 @@ func newMountCalls(cfg Config, opts Options, locks *keyedLocks, log *slog.Logger
 		}
 		mgr = real
 	}
-	return &mountCalls{mgr: mgr, locks: locks, log: log, limit: newCallLimit(maxMountCalls, maxMountWaiting)}, nil
+	var policy models.MountToolPolicy
+	if cfg.Mounts != nil {
+		policy.NodeCredentials = cfg.Mounts.NodeCredentials
+	}
+	return &mountCalls{mgr: mgr, policy: policy, locks: locks, log: log, limit: newCallLimit(maxMountCalls, maxMountWaiting)}, nil
 }
 
 func (c *mountCalls) close() {
@@ -130,7 +135,7 @@ func (c *mountCalls) mountExternal(ctx context.Context, req *rootdpb.MountExtern
 		return nil, badRequest("root helper: mount mode %v is not one the helper does", mode)
 	}
 	specs := specsOf(req.GetMounts())
-	if err := rootpolicy.CheckExternalMounts(specs, mode == rootdpb.MountExternalMode_MOUNT_EXTERNAL_MODE_KEEP_LIVE); err != nil {
+	if err := rootpolicy.CheckExternalMounts(specs, mode == rootdpb.MountExternalMode_MOUNT_EXTERNAL_MODE_KEEP_LIVE, c.policy); err != nil {
 		return nil, refusedRule(codes.InvalidArgument, err)
 	}
 	release, err := c.limit.enter(ctx)

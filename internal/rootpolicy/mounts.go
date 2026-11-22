@@ -44,8 +44,9 @@ func CheckMountSandboxID(id string) error {
 
 // CheckExternalMounts checks a sandbox's mount set. running is a mount set
 // kept as it runs: its tool options are held to the lists a running mount
-// may keep. Nothing is started for such a set.
-func CheckExternalMounts(specs []models.MountSpec, running bool) error {
+// may keep. Nothing is started for such a set. p is the operator's
+// settings, from the checker's own configuration.
+func CheckExternalMounts(specs []models.MountSpec, running bool, p models.MountToolPolicy) error {
 	if len(specs) == 0 {
 		return violate(RuleExternalMount, "no mounts")
 	}
@@ -53,7 +54,7 @@ func CheckExternalMounts(specs []models.MountSpec, running bool) error {
 		return violate(RuleExternalMount, "%d mounts; a sandbox has at most %d", len(specs), models.MaxMountsPerSandbox)
 	}
 	for i := range specs {
-		if err := CheckExternalMount(&specs[i], running); err != nil {
+		if err := CheckExternalMount(&specs[i], running, p); err != nil {
 			return violate(RuleExternalMount, "mount %d: %v", i, err)
 		}
 	}
@@ -62,7 +63,14 @@ func CheckExternalMounts(specs []models.MountSpec, running bool) error {
 
 // CheckExternalMount checks one mount. Its errors name fields and flags,
 // never a credential's value.
-func CheckExternalMount(m *models.MountSpec, running bool) error {
+//
+// One rule is the helper's alone: an s3 mount with no access keys, which
+// would take the credentials of wherever mount-s3 runs. The helper's tools
+// get no environment of the node's, so that is the instance metadata: the
+// node's own IAM role. Refused unless the operator allows node credentials
+// (or the mount asks for none, --no-sign-request). rclone's ways to the
+// node's identity are the allow lists' (ValidateToolOptionsFor).
+func CheckExternalMount(m *models.MountSpec, running bool, p models.MountToolPolicy) error {
 	if m == nil {
 		return violate(RuleExternalMount, "mount is nil")
 	}
@@ -72,12 +80,17 @@ func CheckExternalMount(m *models.MountSpec, running bool) error {
 	if err := m.Validate(""); err != nil {
 		return violate(RuleExternalMount, "%v", err)
 	}
-	check := m.ValidateToolOptions
+	check := m.ValidateToolOptionsFor
 	if running {
-		check = m.ValidateRunningToolOptions
+		check = m.ValidateRunningToolOptionsFor
 	}
-	if err := check(); err != nil {
+	if err := check(p); err != nil {
 		return violate(RuleExternalMount, "%v", err)
+	}
+	if m.Type == models.MountTypeS3 && !p.NodeCredentials && !adapters.S3StaticCredentials(m.Credentials) &&
+		!slices.Contains(strings.Fields(m.Options["extra_args"]), "--no-sign-request") {
+		return violate(RuleExternalMount, "an s3 mount with no access keys would use this node's own credentials (its instance metadata); "+
+			"give it access keys, ask for none with --no-sign-request, or have the operator allow node credentials (SB_MOUNTS_ALLOW_NODE_CREDENTIALS)")
 	}
 	keys := adapters.CredentialKeys(m.Type)
 	for _, k := range sortedKeys(m.Credentials) {

@@ -130,6 +130,10 @@ type MountsConfig struct {
 	CgroupRoot string
 	// WaitTimeout bounds one mount's start (SB_MOUNT_WAIT_TIMEOUT).
 	WaitTimeout time.Duration
+	// NodeCredentials lets a mount use the node's own cloud identity
+	// (SB_MOUNTS_ALLOW_NODE_CREDENTIALS, models.MountToolPolicy), read from
+	// the helper's own environment: the agent cannot turn it on for root.
+	NodeCredentials bool
 }
 
 // DefaultMountUser is the mount tools' user: the installer and the runtime
@@ -679,8 +683,12 @@ func mountsFromEnv(getenv func(string) string, agentUID uint32, root, credDir, c
 	if parent != "" {
 		cgroupRoot = filepath.Join(defaultCgroupRoot, parent)
 	}
+	nodeCreds, err := envBool(getenv, "SB_MOUNTS_ALLOW_NODE_CREDENTIALS")
+	if err != nil {
+		return nil, err
+	}
 	return &MountsConfig{Root: root, CredDir: credDir, CacheDir: cacheDir, UID: uid, GID: gid,
-		CgroupRoot: cgroupRoot, WaitTimeout: wait}, nil
+		CgroupRoot: cgroupRoot, WaitTimeout: wait, NodeCredentials: nodeCreds}, nil
 }
 
 // mountUser reads SB_ROOTD_MOUNT_USER: a user name, a uid, or uid:gid.

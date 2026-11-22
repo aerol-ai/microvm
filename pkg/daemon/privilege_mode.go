@@ -103,7 +103,7 @@ func newMountManager(cfg config.Config, logger *slog.Logger, off string) (*mount
 		return m, func(*rootclient.Client) {}, err
 	}
 	var helper atomic.Pointer[rootclient.Client]
-	m, err := mounts.NewRemote(logger, rootclient.Mounts{Client: helper.Load}, off)
+	m, err := mounts.NewRemote(logger, rootclient.Mounts{Client: helper.Load, Policy: cfg.MountToolPolicy()}, off)
 	return m, func(c *rootclient.Client) { helper.Store(c) }, err
 }
 

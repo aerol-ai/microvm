@@ -673,7 +673,15 @@ type Config struct {
 	// is checked visible there before a create answers, and the create fails
 	// otherwise (pkg/mounts, finding F13). Empty on a VM, where sandboxd and
 	// the runtime share one mount namespace. SB_MOUNTS_RUNTIME_PID_FILE.
-	MountsRuntimePIDFile       string
+	MountsRuntimePIDFile string
+	// MountsAllowNodeCredentials lets a mount use the node's own cloud
+	// identity (models.MountToolPolicy.NodeCredentials): rclone's env_auth,
+	// use_msi and use_az, an Oracle instance principal, and in privilege
+	// mode split an s3 mount with no access keys. Off by default, so a
+	// tenant's mount can never act as the node's IAM role. The root helper
+	// reads the same name from its own environment, and both must say the
+	// same. SB_MOUNTS_ALLOW_NODE_CREDENTIALS.
+	MountsAllowNodeCredentials bool
 	PlatformVolumes            PlatformVolumesConfig
 	LogLevel                   string
 	ShutdownTimeout            time.Duration
@@ -2616,6 +2624,7 @@ func load(keyTool bool) (Config, error) {
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
 		MountsRuntimePIDFile:              strings.TrimSpace(os.Getenv("SB_MOUNTS_RUNTIME_PID_FILE")),
+		MountsAllowNodeCredentials:        getEnvBool("SB_MOUNTS_ALLOW_NODE_CREDENTIALS", false),
 		PlatformVolumes: PlatformVolumesConfig{
 			Enabled:            getEnvBool("SB_PLATFORM_VOLUMES_ENABLED", false),
 			Backend:            strings.ToLower(strings.TrimSpace(getEnv("SB_PLATFORM_VOLUMES_BACKEND", PlatformVolumesBackendS3))),
@@ -3998,6 +4007,12 @@ func (c Config) HostProcessCgroupRoot() string {
 		return ""
 	}
 	return filepath.Join(cgroupV2Mount, c.HostProcessCgroupParent)
+}
+
+// MountToolPolicy is the operator's settings the mount-tool allow lists
+// read (models.MountToolPolicy).
+func (c Config) MountToolPolicy() models.MountToolPolicy {
+	return models.MountToolPolicy{NodeCredentials: c.MountsAllowNodeCredentials}
 }
 
 // RunsHostProcessSandboxes reports whether this node starts sandboxes as

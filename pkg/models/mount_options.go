@@ -239,7 +239,30 @@ const mountOptionsDocs = `see "Which flags are accepted" in the external storage
 // mounts are the operator's, checked once at daemon start instead
 // (config.PlatformVolumesConfig.Validate).
 func (m *MountSpec) ValidateToolOptions() error {
-	return m.validateToolOptions(false)
+	return m.validateToolOptions(false, MountToolPolicy{})
+}
+
+// MountToolPolicy is the operator's settings the allow lists read. The
+// zero value is the default: the strictest.
+type MountToolPolicy struct {
+	// NodeCredentials lets a mount use the node's own cloud identity
+	// (SB_MOUNTS_ALLOW_NODE_CREDENTIALS): rclone's env_auth, use_msi and
+	// use_az, an Oracle instance principal (rcloneNodeCredential). Off, a
+	// mount reaches storage only with the credentials its spec carries, so
+	// a tenant's mount can never act as the node's IAM role.
+	NodeCredentials bool
+}
+
+// ValidateToolOptionsFor is ValidateToolOptions under the operator's
+// settings.
+func (m *MountSpec) ValidateToolOptionsFor(p MountToolPolicy) error {
+	return m.validateToolOptions(false, p)
+}
+
+// ValidateRunningToolOptionsFor is ValidateRunningToolOptions under the
+// operator's settings.
+func (m *MountSpec) ValidateRunningToolOptionsFor(p MountToolPolicy) error {
+	return m.validateToolOptions(true, p)
 }
 
 // ValidateRunningToolOptions is the check a mount gets that is already
@@ -250,10 +273,10 @@ func (m *MountSpec) ValidateToolOptions() error {
 // that may not, and the mount is torn down. extra_args and opts on a type
 // whose tool does not read them pass: they never reached a tool.
 func (m *MountSpec) ValidateRunningToolOptions() error {
-	return m.validateToolOptions(true)
+	return m.validateToolOptions(true, MountToolPolicy{})
 }
 
-func (m *MountSpec) validateToolOptions(running bool) error {
+func (m *MountSpec) validateToolOptions(running bool, p MountToolPolicy) error {
 	if m == nil {
 		return errors.New("mount is nil")
 	}
@@ -289,7 +312,7 @@ func (m *MountSpec) validateToolOptions(running bool) error {
 		}
 	}
 	if m.Type == MountTypeRclone {
-		return validateRclone(m.Source, m.Credentials["rclone_conf"])
+		return validateRclone(m.Source, m.Credentials["rclone_conf"], p)
 	}
 	return nil
 }
