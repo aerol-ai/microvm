@@ -52,8 +52,6 @@ type Step string
 const (
 	StepImageUser       Step = "image_user"
 	StepDiskQuota       Step = "disk_quota"
-	StepHostProcesses   Step = "host_processes"
-	StepWasmHosts       Step = "wasm_hosts"
 	StepWasmCheckpoints Step = "wasm_checkpoints"
 	StepWasmWarmPool    Step = "wasm_warm_pool"
 	StepWasmMounts      Step = "wasm_mounts"
@@ -67,8 +65,6 @@ const (
 var steps = map[Step]string{
 	StepImageUser:       "reading an image's users from its root filesystem",
 	StepDiskQuota:       "the disk quota on a sandbox's writable layer",
-	StepHostProcesses:   "the WASM, V8-isolate and Firecracker runtimes' host processes",
-	StepWasmHosts:       "the WASM runtime's workers and resident hosts",
 	StepWasmCheckpoints: "WASM checkpoints, which the worker writes as its own user and sandboxd must take back",
 	StepWasmWarmPool:    "the WASM warm pool's slots (SB_WASM_POOL_ENABLED with SB_WASM_RESIDENT_HOST_ENABLED off)",
 	StepWasmMounts:      "a WASM sandbox's external mounts, which its worker opens through sandboxd, and sandboxd cannot open the root helper's mount points",
