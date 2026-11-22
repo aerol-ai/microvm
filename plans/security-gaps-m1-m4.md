@@ -481,6 +481,48 @@ Each is small and stands alone. Together they shrink the root surface now.
     gate's allowed transfer import. The agent then holds no root-level socket
     on VM installs either. (Today buildkitd runs as root with direct
     containerd access, outside the gate.)
+    **What building it taught us (T6, 2026-11-22).**
+    - **The import is the client's, not the transfer service.** Like a
+      pull (T1), the agent reads the archive itself and sends content
+      writes, labels, an image record and an unpack, which the gate
+      already checks. The transfer and streaming services stay refused:
+      through them containerd would read an archive written by the
+      process that ran tenant build steps, as root. The agent's reader
+      takes only an OCI layout, a bounded size
+      (`SB_CONTAINERD_BUILD_MAX_IMAGE_BYTES`, 16 GiB), one image, the
+      build's own tag as its name, and checks every blob's bytes against
+      its name even when containerd already has that content.
+    - **A setting, following the privilege mode.**
+      `SB_CONTAINERD_BUILDKIT_ROOTLESS` unset is on in split (the only
+      way split builds; split with it off fails boot) and off in single,
+      so single keeps today's root buildkitd (D22, R18). Single can opt
+      in: install.sh `--buildkit-rootless`, or `containerd.buildkit_rootless`
+      in `config/cluster.yml` for Terraform.
+    - **One thing rootless BuildKit cannot do:** see containerd's images.
+      Every `FROM` comes from a registry, so an operator's build from an
+      image only the node has (a snapshot, an earlier build) needs the root
+      BuildKit. Tenant builds already refuse such images. Follow-up: hand
+      such a base to BuildKit as an OCI layout context.
+    - **The network is a namespace on the sandboxes' bridge.** Rootless
+      buildkitd joins `aerolvm.build`, which a root oneshot unit builds with
+      sandboxd's CNI config (`sandboxd host build-network up`), so pulls and
+      steps leave with a sandbox address and get the floor and the node
+      guard with no new host rule. Steps live behind RootlessKit
+      (`--detach-netns`), not on the sandboxes' bridge, so the host's drop
+      between sandbox addresses never sees step-to-step traffic. Review of
+      #1398 (F4) found BuildKit's own bridge let one build's step reach
+      another's: each step now gets a point-to-point link of its own (CNI
+      `ptp`, so no shared segment to spoof on), and `sandboxd host
+      build-network guard` runs inside RootlessKit before buildkitd and
+      drops what a step sends to another step, to that namespace, to
+      RootlessKit's own network or to `aerolvm.build`'s addresses, with
+      strict reverse-path filtering and IPv6 off in that namespace (the
+      rules are IPv4; a second review found a step reaching it over IPv6
+      link-local). Proven live with the reviewer's
+      two-build probe. RootlessKit is 0750 to the build user's group, so
+      its AppArmor user-namespace grant is the build user's alone; split
+      mode on VMs (PR 10) must give the agent the socket by other means
+      than that group. Ansible sets no BuildKit up, so it is unchanged.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts

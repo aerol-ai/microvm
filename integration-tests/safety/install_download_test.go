@@ -319,8 +319,8 @@ func downloadPins(t *testing.T) []pinRow {
 // deps/<project>/<version>/<file> on the mirror.
 func TestDownloadPinsAreWellFormed(t *testing.T) {
 	rows := downloadPins(t)
-	if len(rows) < 12 {
-		t.Fatalf("download_pins lists %d files; want caddy, workerd, firecracker, cni-plugins and buildkit", len(rows))
+	if len(rows) < 14 {
+		t.Fatalf("download_pins lists %d files; want caddy, workerd, firecracker, cni-plugins, buildkit and rootlesskit", len(rows))
 	}
 	hexSHA := regexp.MustCompile(`^[0-9a-f]{64}$`)
 	safe := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)

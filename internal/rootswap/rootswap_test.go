@@ -274,11 +274,16 @@ func TestParseKeys(t *testing.T) {
 }
 
 // TestReleaseKeys: the built-in key file always parses, so a bad key
-// committed there fails here and not on a node.
+// committed there fails here and not on a node. It also holds at least one
+// key: with none, the supervisor refuses every staged helper (ReasonNoKey),
+// so an edit that drops the last key would quietly turn the signed swap off.
 func TestReleaseKeys(t *testing.T) {
 	keys, err := ReleaseKeys()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(keys) == 0 {
+		t.Fatal("release-keys.pub lists no key: every staged helper would be refused")
 	}
 	t.Logf("%d release key(s) built in", len(keys))
 }

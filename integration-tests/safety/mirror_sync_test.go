@@ -443,6 +443,8 @@ func TestMirrorSyncDepsPlanCoversTheMirrorLayout(t *testing.T) {
 		"deps/caddy/v2.11.9/caddy_2.11.9_checksums.txt",
 		"deps/buildkit/v0.34.2/buildkit-v0.34.2.linux-amd64.tar.gz (sha256 b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13)",
 		"deps/buildkit/v0.34.2/buildkit-v0.34.2.linux-arm64.tar.gz (sha256 a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3)",
+		"deps/rootlesskit/v3.3.0/rootlesskit-x86_64.tar.gz (sha256 0e757c8f80510d764df8c9a5f169805580b48d02329f0a200900e261ecec27ed)",
+		"deps/rootlesskit/v3.3.0/rootlesskit-aarch64.tar.gz (sha256 7a159e79ef3e65e1f2702ab89537bb79de67b433428328b9626cf75786dbe43a)",
 		"deps/workerd/v1.20260717.1/workerd-linux-64.gz",
 		"deps/firecracker/v1.15.1/firecracker-v1.15.1-x86_64.tgz",
 		"deps/firecracker/v1.15.1/firecracker-v1.15.1-x86_64 ",

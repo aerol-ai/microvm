@@ -317,6 +317,11 @@ locals {
     namespace                 = try(local.cluster_ops.containerd.namespace, "aerolvm")
     cni_plugin_dir            = try(local.cluster_ops.containerd.cni_plugin_dir, "/opt/cni/bin")
     native_netns_pool_enabled = try(local.cluster_ops.containerd.native_netns_pool_enabled, true) ? "true" : "false"
+    # Rootless BuildKit (plans/security-gaps-m1-m4.md PR 10b): the bootstrap
+    # passes install.sh --buildkit-rootless on the one-line join path only,
+    # and renders nothing for false, so turning it on is what changes a
+    # node's user data (and replaces it), never this default.
+    buildkit_rootless = try(local.cluster_ops.containerd.buildkit_rootless, false) ? "true" : "false"
   }
 
   # containerd warm container pool (park + adopt), from cluster.yml's
@@ -351,6 +356,14 @@ locals {
 # config/cluster.yml became the source of those fields.
 resource "terraform_data" "validate_cluster_ops" {
   lifecycle {
+    precondition {
+      condition = (
+        local.containerd_cfg.buildkit_rootless != "true"
+        || (var.one_line_join && local.container_engine == "containerd")
+      )
+      error_message = "containerd.buildkit_rootless in config/cluster.yml needs container_engine: containerd and one_line_join = true: rootless BuildKit builds images for the containerd engine, and only the one-line join path's bootstrap passes install.sh --buildkit-rootless."
+    }
+
     precondition {
       condition     = length(distinct([for name, arch in local.node_arch : arch])) == 1
       error_message = "All nodes in a cluster must share one CPU architecture; mixed x86/arm64 clusters are unsupported (see plans/arm64-firecracker-hosts.md)."

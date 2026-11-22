@@ -1132,16 +1132,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	// On the containerd engine, image builds run through buildkitd (buildctl)
-	// against the aerolvm namespace instead of the dockerd builder. Wire the
-	// composite builder so /images/build + snapshot-from-Dockerfile work; the
-	// dockerd path passes nil and NewServer falls back to the docker client.
+	// instead of the dockerd builder. Wire the composite builder so
+	// /images/build + snapshot-from-Dockerfile work; the dockerd path passes
+	// nil and NewServer falls back to the docker client.
 	var apiBuilder *cntr.ImageBuilder
 	if ctdWiring != nil {
-		build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
+		build := buildKitBuilderFor(cfg, ctdWiring.driver, logger)
+		if build.ImportsArchives() {
+			logger.Info("image builds use rootless BuildKit; sandboxd imports each build's OCI archive",
+				"buildkit_addr", cfg.ContainerdBuildKitAddr, "max_image_bytes", cfg.ContainerdBuildMaxImageBytes)
+		}
 		// Logs, here at start, what would otherwise fail every build later,
 		// and clears build folders a previous run left (in the background).
-		// Both are root work: privilege mode split refuses builds instead
-		// (imageBuilderFor).
+		// Both are root work: in privilege mode split sandboxd is not root,
+		// so it unpacks build contexts in process, as itself.
 		if cfg.PrivilegeMode != privmode.Split {
 			_ = build.CheckContextUnpacker()
 			_ = build.SweepBuildDirs()
@@ -1151,7 +1155,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	builder := imageBuilderFor(cfg, apiBuilder)
+	builder := imageBuilderFor(apiBuilder)
 	// Scoped API tokens (plans/identity-and-access.md §5.4). With identity
 	// off this does nothing and NewServer drops the authenticator, so the
 	// server is byte for byte the PAT-only one (L8). With it on: a single
