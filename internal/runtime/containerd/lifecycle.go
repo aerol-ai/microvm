@@ -45,7 +45,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if d.helper != nil {
 		// Privilege mode split: what the helper does not do yet fails
 		// here, before any of it is tried (privilege_split.go).
-		return nil, d.splitCreateGaps(req)
+		if err := d.splitCreateGaps(req); err != nil {
+			return nil, err
+		}
 	}
 	if err := d.ensureToolboxBinary(); err != nil {
 		return nil, err
@@ -150,6 +152,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		logCloser func()
 		hostFiles *sandboxHostFiles
 		leaseID   string
+		// split is what a split create's one helper call made
+		// (split_create.go); nil in single mode.
+		split *splitCreate
 	)
 	defer func() {
 		if logCloser != nil {
@@ -167,6 +172,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// rule cleared after the slot is free could be the next owner's);
 		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
+		if split != nil {
+			// Split mode: the helper's files for the container go too.
+			d.releaseHelperFiles(ctx, sandboxID)
+		}
 		if snapshotLeft {
 			if err := d.removeOrphanSnapshot(ctx, client, sandboxID); err != nil {
 				d.logger.Warn("containerd: failed create's snapshot not removed; the next create of the id removes it as a leftover",
@@ -221,20 +230,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
-	hostFiles, err = prepareSandboxHostFiles(d.cfg.RunDir, sandboxID)
-	if err != nil {
-		return nil, err
-	}
-
-	envValues := buildEnv(req, sandboxID, toolboxToken, d.cfg.ToolboxPort)
-	userCommand := req.ContainerCommand
-	if len(userCommand) == 0 {
-		userCommand, err = imageDefaultCommand(ctx, client, image)
-		if err != nil {
-			return nil, fmt.Errorf("read image command: %w", err)
-		}
-	}
-
 	var readyListener *dockerpkg.ReadyListener
 	var readySocketCreated bool
 	var keepReadySocket bool
@@ -251,14 +246,58 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
+	if d.helper != nil {
+		// Privilege mode split: the container's snapshot, its files, its
+		// disk limit and the image's user, in one helper call
+		// (split_create.go). From here a failure removes the snapshot.
+		parts := createParts{OCIRuntime: ociRuntime, Restore: restore}
+		if d.cfg.DiskQuota && req.DiskGB > 0 {
+			parts.DiskBytes = uint64(req.DiskGB) << 30
+		}
+		prepStart := time.Now()
+		split, err = d.prepareSplitCreate(ctx, client, image, sandboxID, toolboxToken, parts)
+		createtiming.From(ctx).RecordStage("containerd_split_prepare", time.Since(prepStart))
+		if errors.Is(err, errSplitSnapshotExists) {
+			lostRace = true
+			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer split.release(ctx)
+		snapshotLeft = true
+		readyListener, readySocketCreated = split.ready, split.ready != nil
+		hostFiles = helperHostFiles(split.files)
+	} else {
+		hostFiles, err = prepareSandboxHostFiles(d.cfg.RunDir, sandboxID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	envValues := buildEnv(req, sandboxID, toolboxToken, d.cfg.ToolboxPort)
+	userCommand := req.ContainerCommand
+	if len(userCommand) == 0 && split != nil {
+		userCommand = imageCommandOf(split.config)
+	} else if len(userCommand) == 0 {
+		userCommand, err = imageDefaultCommand(ctx, client, image)
+		if err != nil {
+			return nil, fmt.Errorf("read image command: %w", err)
+		}
+	}
+
 	// Assemble the COMPLETE spec-opts slice before handing it to
 	// cntr.WithNewSpec. A variadic spread captures the slice at the call site;
 	// appending security/resource/ready opts afterward would silently drop
 	// them (append reallocates, leaving the WithNewSpec closure bound to the
 	// old backing array) — every non-privileged sandbox would then run with no
 	// seccomp, no NoNewPrivileges, no cap trim, and no cgroup limits.
+	imageConfig := oci.WithImageConfig(image)
+	if split != nil {
+		imageConfig = withImageConfigAnswer(split.config, split.user)
+	}
 	specOpts := []oci.SpecOpts{
-		oci.WithImageConfig(image),
+		imageConfig,
 		oci.WithProcessArgs(append([]string{d.cfg.ToolboxMountPath}, userCommand...)...),
 		oci.WithHostname(sandboxID),
 	}
@@ -275,7 +314,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	specOpts = append(specOpts, withSandboxIPv6Off())
 	specOpts = append(specOpts, d.cgroupSpecOpts(sandboxID)...)
-	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
+	mountCfg := d.cfg
+	if split != nil {
+		// The toolbox binary the helper answered: root's own copy, or the
+		// operator's (rootd toolbox.go).
+		mountCfg.ToolboxBinaryPath = split.files.GetToolboxPath()
+	}
+	mountSpecs := buildMounts(mountCfg, hostFiles, hostMounts)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
@@ -288,7 +333,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
-	if d.cfg.ReadyEnabled {
+	if split != nil && readyListener != nil {
+		// Bound before the helper's call, which named it in its folder.
+		envValues = append(envValues, readyListener.EnvVars()...)
+		mountSpecs = append(mountSpecs, readyMount(split.files.GetReadySocketPath()))
+	} else if d.cfg.ReadyEnabled && split == nil {
 		readyListener, err = d.setupReadySocket(&envValues, &mountSpecs, sandboxID, toolboxToken)
 		if err != nil {
 			return nil, err
@@ -318,13 +367,23 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		containerLabels[imageLeaseLabelKey] = leaseID
 	}
 
+	snapshotOpt := cntr.WithNewSnapshot(sandboxID, image)
+	createCtx := ctx
+	if split != nil {
+		// The snapshot is there, under the split create's own lease.
+		snapshotOpt, createCtx = withPreparedSnapshot(sandboxID), split.leaseCtx
+	}
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
-		cntr.WithNewSnapshot(sandboxID, image),
+		snapshotOpt,
 		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(containerLabels),
 	}
-	if ociRuntime != "" {
+	if ociRuntime != "" && split != nil {
+		if opt := runtimeContainerOptAt(ociRuntime, split.files.GetRunscConfigPath()); opt != nil {
+			containerOpts = append(containerOpts, opt)
+		}
+	} else if ociRuntime != "" {
 		opt, err := d.runtimeContainerOptFor(ociRuntime, restore)
 		if err != nil {
 			return nil, err
@@ -335,15 +394,18 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	createStart := time.Now()
-	container, err = client.NewContainer(ctx, sandboxID, containerOpts...)
+	container, err = client.NewContainer(createCtx, sandboxID, containerOpts...)
 	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
+		if errdefs.IsAlreadyExists(err) && split == nil {
 			lostRace = true
 			return nil, fmt.Errorf("%w: sandbox container already exists", dockerpkg.ErrSandboxContainerExists)
 		}
 		snapshotLeft = true
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// The container holds the snapshot now.
+	snapshotLeft = false
+	split.release(ctx)
 	// containerd_create keeps its old span (NewContainer through NewTask), so
 	// it compares with every report before it; containerd_container and
 	// containerd_task are its two parts.
@@ -351,7 +413,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// The disk limit goes on the empty writable layer before anything runs
 	// in it. A failure is the create's: the container (and with it the
 	// snapshot) goes in the rollback above.
-	if d.cfg.DiskQuota && req.DiskGB > 0 {
+	// Split mode set it in the helper's call, on the empty snapshot.
+	if d.cfg.DiskQuota && req.DiskGB > 0 && split == nil {
 		quotaStart := time.Now()
 		if err := d.limitWritableLayer(ctx, client, sandboxID, req.DiskGB); err != nil {
 			return nil, err
@@ -385,7 +448,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, err
 	}
-	logIO, closeLog, err := d.taskLogIO(logPath)
+	var logIO cio.Creator
+	var closeLog func()
+	if split != nil {
+		logIO, closeLog, err = d.taskLogIOAt(logPath, split.files)
+	} else {
+		logIO, closeLog, err = d.taskLogIO(logPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1136,7 +1205,11 @@ func (d *Driver) Resize(ctx context.Context, containerRef string, req models.Res
 		if err != nil {
 			return fmt.Errorf("resize disk: %w", err)
 		}
-		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
+		if d.helper != nil {
+			if err := d.splitResizeDisk(ctx, container, info.SnapshotKey, req.DiskGB); err != nil {
+				return err
+			}
+		} else if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
 			return err
 		}
 	}

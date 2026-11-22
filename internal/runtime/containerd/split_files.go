@@ -69,6 +69,14 @@ var hostNamingFn = hostNaming
 // runsc names the runsc config its runtime options use (UNSPECIFIED for
 // runc). Host files, fresh FIFOs and the toolbox are always asked for.
 func (d *Driver) helperFiles(ctx context.Context, containerID, readyNonce string, runsc rootdpb.RunscConfig) (*rootdpb.SandboxFilePaths, error) {
+	resp, err := d.containerCall(ctx, containerID, readyNonce, runsc, nil)
+	return resp.GetFiles(), err
+}
+
+// containerCall is the one call of a create or a start: the files part,
+// and what more adds (a create's image_user and disk_quota parts).
+func (d *Driver) containerCall(ctx context.Context, containerID, readyNonce string, runsc rootdpb.RunscConfig,
+	more func(*rootdpb.PrepareSandboxRequest)) (*rootdpb.PrepareSandboxResponse, error) {
 	if d.parts == nil {
 		return nil, errors.New("containerd: privilege mode split needs the root helper's container parts")
 	}
@@ -76,8 +84,12 @@ func (d *Driver) helperFiles(ctx context.Context, containerID, readyNonce string
 	if err != nil {
 		return nil, err
 	}
-	resp, err := d.parts.PrepareSandbox(ctx, &rootdpb.PrepareSandboxRequest{Parts: []string{rootdpb.PartFiles}, ContainerId: containerID,
-		Setup: &rootdpb.ContainerSetup{Naming: naming, TaskFifos: true, ReadyNonce: readyNonce, RunscConfig: runsc, Toolbox: true}})
+	req := &rootdpb.PrepareSandboxRequest{Parts: []string{rootdpb.PartFiles}, ContainerId: containerID,
+		Setup: &rootdpb.ContainerSetup{Naming: naming, TaskFifos: true, ReadyNonce: readyNonce, RunscConfig: runsc, Toolbox: true}}
+	if more != nil {
+		more(req)
+	}
+	resp, err := d.parts.PrepareSandbox(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("root helper: container files: %w", err)
 	}
@@ -89,7 +101,7 @@ func (d *Driver) helperFiles(ctx context.Context, containerID, readyNonce string
 	if missing {
 		return nil, fmt.Errorf("root helper: container files: the answer lacks a path asked for (%v)", f)
 	}
-	return f, nil
+	return resp, nil
 }
 
 // releaseHelperFiles has the helper remove everything it made for a
