@@ -70,17 +70,34 @@ func fillCredMemfd(fd int, body []byte, uid, gid uint32) error {
 
 // startNoNewPrivs starts cmd from a thread with no-new-privs set, which
 // the child inherits: Go's SysProcAttr cannot set it between fork and
-// exec. The goroutine never unlocks its thread, so the thread ends with
-// it and the flag never reaches another goroutine of the helper.
+// exec. The goroutine never unlocks its thread, so Go ends the thread with
+// it and the flag never reaches another goroutine of the helper. Go ends
+// every such thread but the main one, which it parks for good instead; the
+// main thread's flag is also what /proc/<pid>/status shows for the whole
+// process. So the flag is never set on the main thread (startOffMainThread).
 func startNoNewPrivs(cmd *exec.Cmd) error {
 	errc := make(chan error, 1)
-	go func() {
-		runtime.LockOSThread()
-		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-			errc <- fmt.Errorf("no-new-privs: %w", err)
-			return
-		}
-		errc <- cmd.Start()
-	}()
+	go startOffMainThread(cmd, errc)
 	return <-errc
+}
+
+// startOffMainThread is startNoNewPrivs's goroutine. When it lands on the
+// main thread, it holds that thread while a second goroutine does the
+// start: a locked thread runs no other goroutine, so the second one runs
+// on another thread. Then it unlocks the main thread, which it left as it
+// found it.
+func startOffMainThread(cmd *exec.Cmd, errc chan<- error) {
+	runtime.LockOSThread()
+	if unix.Gettid() == unix.Getpid() {
+		inner := make(chan error, 1)
+		go startOffMainThread(cmd, inner)
+		errc <- <-inner
+		runtime.UnlockOSThread()
+		return
+	}
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		errc <- fmt.Errorf("no-new-privs: %w", err)
+		return
+	}
+	errc <- cmd.Start()
 }

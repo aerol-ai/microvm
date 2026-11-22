@@ -167,3 +167,26 @@ func TestOpenFuseFD(t *testing.T) {
 		t.Fatal("a mount at a missing path passed")
 	}
 }
+
+// TestStartNoNewPrivsNeverOnTheMainThread: no start sets no-new-privs on
+// the main thread, which Go would keep parked with it for good and whose
+// flag /proc/<pid>/status shows for the whole process. Many starts: with
+// the main goroutine waiting in the test runner, the main thread is often
+// the one a new goroutine lands on.
+func TestStartNoNewPrivsNeverOnTheMainThread(t *testing.T) {
+	pid := os.Getpid()
+	main := filepath.Join("/proc", strconv.Itoa(pid), "task", strconv.Itoa(pid), "status")
+	if statusField(t, main, "NoNewPrivs") != "0" {
+		t.Skip("the test runs with no-new-privs itself")
+	}
+	for i := 0; i < 50; i++ {
+		cmd := exec.Command("true")
+		if err := startNoNewPrivs(cmd); err != nil {
+			t.Fatal(err)
+		}
+		_ = cmd.Wait()
+		if got := statusField(t, main, "NoNewPrivs"); got != "0" {
+			t.Fatalf("start %d left no-new-privs on the main thread (NoNewPrivs %s)", i+1, got)
+		}
+	}
+}
