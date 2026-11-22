@@ -118,10 +118,13 @@ type RootHelperClient interface {
 	// that carries a part, or a field, it does not know, so nothing is ever
 	// skipped without a word. The cgroup part comes alone, once the
 	// sandbox's task has started: the runtime makes its group with the task,
-	// after the namespace and rules of the create's first call.
+	// after the namespace and rules of the create's first call. The
+	// container's parts (files) come together, named by container_id, just
+	// before the container is made, and again before each start.
 	PrepareSandbox(ctx context.Context, in *PrepareSandboxRequest, opts ...grpc.CallOption) (*PrepareSandboxResponse, error)
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
-	// its namespace and attachment.
+	// its namespace and attachment. Its files part, alone and named by
+	// container_id, removes everything the helper made for the container.
 	ReleaseSandbox(ctx context.Context, in *ReleaseSandboxRequest, opts ...grpc.CallOption) (*ReleaseSandboxResponse, error)
 	// The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
 	// drives and removes the gateway self-test's probe network on the
@@ -412,10 +415,13 @@ type RootHelperServer interface {
 	// that carries a part, or a field, it does not know, so nothing is ever
 	// skipped without a word. The cgroup part comes alone, once the
 	// sandbox's task has started: the runtime makes its group with the task,
-	// after the namespace and rules of the create's first call.
+	// after the namespace and rules of the create's first call. The
+	// container's parts (files) come together, named by container_id, just
+	// before the container is made, and again before each start.
 	PrepareSandbox(context.Context, *PrepareSandboxRequest) (*PrepareSandboxResponse, error)
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
-	// its namespace and attachment.
+	// its namespace and attachment. Its files part, alone and named by
+	// container_id, removes everything the helper made for the container.
 	ReleaseSandbox(context.Context, *ReleaseSandboxRequest) (*ReleaseSandboxResponse, error)
 	// The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
 	// drives and removes the gateway self-test's probe network on the

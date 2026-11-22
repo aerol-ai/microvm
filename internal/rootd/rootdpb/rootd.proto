@@ -119,11 +119,14 @@ service RootHelper {
   // that carries a part, or a field, it does not know, so nothing is ever
   // skipped without a word. The cgroup part comes alone, once the
   // sandbox's task has started: the runtime makes its group with the task,
-  // after the namespace and rules of the create's first call.
+  // after the namespace and rules of the create's first call. The
+  // container's parts (files) come together, named by container_id, just
+  // before the container is made, and again before each start.
   rpc PrepareSandbox(PrepareSandboxRequest) returns (PrepareSandboxResponse);
 
   // ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
-  // its namespace and attachment.
+  // its namespace and attachment. Its files part, alone and named by
+  // container_id, removes everything the helper made for the container.
   rpc ReleaseSandbox(ReleaseSandboxRequest) returns (ReleaseSandboxResponse);
 
   // The hostname egress gateway's host side (M1 PR 5b). BridgeProbe builds,
@@ -161,8 +164,8 @@ message VersionResponse {
   // VM-only call on Kubernetes); the agent goes by this list.
   repeated string features = 3;
   // The parts of PrepareSandbox and ReleaseSandbox this helper serves
-  // ("netns", "firewall", and PrepareSandbox's "cgroup"). The agent sends a
-  // part only when it is listed.
+  // ("netns", "firewall", "files", and PrepareSandbox's "cgroup"). The
+  // agent sends a part only when it is listed.
   repeated string parts = 4;
 }
 
@@ -406,6 +409,81 @@ message SandboxCgroup {
   string container_id = 1;
 }
 
+// HostNaming is what a container's hostname, hosts and resolv.conf files
+// hold, as EnsureHostFiles writes them.
+message HostNaming {
+  // The hostname file's one line.
+  string hostname = 1;
+  // The hosts file, one line each, in order.
+  repeated HostEntry hosts = 2;
+  // resolv.conf: nameserver addresses (no zones), search domains and
+  // options, rendered by internal/runtime/resolvconf.
+  repeated string nameservers = 3;
+  repeated string search = 4;
+  repeated string dns_options = 5;
+}
+
+// ContainerSetup asks for the files runc, runsc and the containerd shim
+// open as root because a container names them (part "files"): what
+// EnsureHostFiles, EnsureTaskFIFOs, EnsureReadySocket and EnsureRunscConfig
+// make, in one part of a create's or a start's call. The agent sends typed
+// values; the helper makes each file in its own folders and answers with
+// the paths for the spec and the task.
+message ContainerSetup {
+  // The host files' values. Absent: none written.
+  HostNaming naming = 1;
+  // Fresh stdout and stderr FIFOs for the container's next task.
+  bool task_fifos = 2;
+  // The nonce of the ready socket the agent bound for this container
+  // (<container_id>.<nonce>.sock in its ready folder); empty: none.
+  string ready_nonce = 3;
+  // The runsc shim config the container's runtime options name;
+  // UNSPECIFIED: none.
+  RunscConfig runsc_config = 4;
+  // The toolbox binary the spec binds into the sandbox: the helper's
+  // root-owned copy of the agent's, or the operator's own.
+  bool toolbox = 5;
+}
+
+// SandboxFilePaths are the paths of what a files part made; each is empty
+// when the part did not ask for it.
+message SandboxFilePaths {
+  string hostname_path = 1;
+  string hosts_path = 2;
+  string resolv_conf_path = 3;
+  string stdout_path = 4;
+  string stderr_path = 5;
+  string ready_socket_path = 6;
+  string runsc_config_path = 7;
+  string toolbox_path = 8;
+}
+
+// ImageUser asks which user a container's image runs as (part
+// "image_user"): its config's USER, resolved against the image's own
+// /etc/passwd and /etc/group as containerd's oci.WithImageConfig does.
+// The image is the one in the container's root filesystem snapshot, whose
+// key is the container's ID; the helper reads it from containerd itself.
+message ImageUser {
+  // The image config's USER; empty when it names none.
+  string user = 1;
+}
+
+// ImageUserAnswer is what an image's user resolves to, for the spec's
+// process: what oci.WithImageConfig would set.
+message ImageUserAnswer {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  repeated uint32 additional_gids = 3;
+}
+
+// DiskQuota asks for a hard limit on a container's writable layer (part
+// "disk_quota"): an XFS project of its own, from AerolVM's fixed range,
+// over the snapshot's own folder. The helper finds the folder from
+// containerd's answer for the container's snapshot.
+message DiskQuota {
+  uint64 bytes = 1;
+}
+
 message PrepareSandboxRequest {
   // The netns-pool slot the sandbox gets.
   string netns_name = 1;
@@ -419,6 +497,16 @@ message PrepareSandboxRequest {
   // Part "cgroup", which comes alone: no netns_name, container_ip or
   // firewall with it.
   SandboxCgroup cgroup = 5;
+  // The container the container's parts are for: a sandbox's or a
+  // warm-pool slot's ID. Those parts come together, with no netns_name,
+  // container_ip, firewall or cgroup.
+  string container_id = 6;
+  // Part "files".
+  ContainerSetup setup = 7;
+  // Part "image_user".
+  ImageUser image_user = 8;
+  // Part "disk_quota".
+  DiskQuota disk_quota = 9;
 }
 
 message PrepareSandboxResponse {
@@ -427,6 +515,10 @@ message PrepareSandboxResponse {
   string container_ip = 2;
   // Part "firewall": a block-all rule was put in (not already there).
   bool block_inserted = 3;
+  // Part "files".
+  SandboxFilePaths files = 4;
+  // Part "image_user".
+  ImageUserAnswer image_user = 5;
 }
 
 message ReleaseSandboxRequest {
@@ -434,8 +526,11 @@ message ReleaseSandboxRequest {
   // The address the pool recorded for the slot; empty when none was.
   string container_ip = 2;
   // Every part this request carries: "firewall" clears every rule AerolVM
-  // keeps for the address, "netns" removes the namespace.
+  // keeps for the address, "netns" removes the namespace, and "files",
+  // which comes alone, removes the container's files.
   repeated string parts = 3;
+  // Part "files": the container whose files go.
+  string container_id = 4;
 }
 
 message ReleaseSandboxResponse {}

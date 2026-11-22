@@ -65,10 +65,25 @@ const (
 	// out-of-memory choice (PrepareSandbox only, and alone; M1 PR 6). The
 	// runtime removes the group with the task, so ReleaseSandbox has none.
 	PartCgroup = "cgroup"
+	// PartFiles: the files root opens for a container, in the helper's own
+	// folders (PrepareSandbox, before the container is made and before
+	// each start), and their removal (ReleaseSandbox, alone). Named by the
+	// request's container_id; M1 PR 7.
+	PartFiles = "files"
+	// PartImageUser: the user a container's image runs as, read from the
+	// image's own files in the container's snapshot (PrepareSandbox, with
+	// the container's other parts; M1 PR 7).
+	PartImageUser = "image_user"
+	// PartDiskQuota: a hard limit on a container's writable layer
+	// (PrepareSandbox, with the container's other parts, or alone for a
+	// resize; M1 PR 7).
+	PartDiskQuota = "disk_quota"
 )
 
 // Parts lists every part name above.
-func Parts() []string { return []string{PartNetns, PartFirewall, PartCgroup} }
+func Parts() []string {
+	return []string{PartNetns, PartFirewall, PartCgroup, PartFiles, PartImageUser, PartDiskQuota}
+}
 
 // AnsweredTrailer is the trailer the helper's server puts on every call it
 // handles, its own and the gate's. A failed call that carries it is the

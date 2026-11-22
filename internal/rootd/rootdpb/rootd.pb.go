@@ -397,8 +397,8 @@ type VersionResponse struct {
 	// VM-only call on Kubernetes); the agent goes by this list.
 	Features []string `protobuf:"bytes,3,rep,name=features,proto3" json:"features,omitempty"`
 	// The parts of PrepareSandbox and ReleaseSandbox this helper serves
-	// ("netns", "firewall", and PrepareSandbox's "cgroup"). The agent sends a
-	// part only when it is listed.
+	// ("netns", "firewall", "files", and PrepareSandbox's "cgroup"). The
+	// agent sends a part only when it is listed.
 	Parts         []string `protobuf:"bytes,4,rep,name=parts,proto3" json:"parts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2196,6 +2196,440 @@ func (x *SandboxCgroup) GetContainerId() string {
 	return ""
 }
 
+// HostNaming is what a container's hostname, hosts and resolv.conf files
+// hold, as EnsureHostFiles writes them.
+type HostNaming struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The hostname file's one line.
+	Hostname string `protobuf:"bytes,1,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	// The hosts file, one line each, in order.
+	Hosts []*HostEntry `protobuf:"bytes,2,rep,name=hosts,proto3" json:"hosts,omitempty"`
+	// resolv.conf: nameserver addresses (no zones), search domains and
+	// options, rendered by internal/runtime/resolvconf.
+	Nameservers   []string `protobuf:"bytes,3,rep,name=nameservers,proto3" json:"nameservers,omitempty"`
+	Search        []string `protobuf:"bytes,4,rep,name=search,proto3" json:"search,omitempty"`
+	DnsOptions    []string `protobuf:"bytes,5,rep,name=dns_options,json=dnsOptions,proto3" json:"dns_options,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HostNaming) Reset() {
+	*x = HostNaming{}
+	mi := &file_rootd_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostNaming) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostNaming) ProtoMessage() {}
+
+func (x *HostNaming) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostNaming.ProtoReflect.Descriptor instead.
+func (*HostNaming) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *HostNaming) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
+func (x *HostNaming) GetHosts() []*HostEntry {
+	if x != nil {
+		return x.Hosts
+	}
+	return nil
+}
+
+func (x *HostNaming) GetNameservers() []string {
+	if x != nil {
+		return x.Nameservers
+	}
+	return nil
+}
+
+func (x *HostNaming) GetSearch() []string {
+	if x != nil {
+		return x.Search
+	}
+	return nil
+}
+
+func (x *HostNaming) GetDnsOptions() []string {
+	if x != nil {
+		return x.DnsOptions
+	}
+	return nil
+}
+
+// ContainerSetup asks for the files runc, runsc and the containerd shim
+// open as root because a container names them (part "files"): what
+// EnsureHostFiles, EnsureTaskFIFOs, EnsureReadySocket and EnsureRunscConfig
+// make, in one part of a create's or a start's call. The agent sends typed
+// values; the helper makes each file in its own folders and answers with
+// the paths for the spec and the task.
+type ContainerSetup struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The host files' values. Absent: none written.
+	Naming *HostNaming `protobuf:"bytes,1,opt,name=naming,proto3" json:"naming,omitempty"`
+	// Fresh stdout and stderr FIFOs for the container's next task.
+	TaskFifos bool `protobuf:"varint,2,opt,name=task_fifos,json=taskFifos,proto3" json:"task_fifos,omitempty"`
+	// The nonce of the ready socket the agent bound for this container
+	// (<container_id>.<nonce>.sock in its ready folder); empty: none.
+	ReadyNonce string `protobuf:"bytes,3,opt,name=ready_nonce,json=readyNonce,proto3" json:"ready_nonce,omitempty"`
+	// The runsc shim config the container's runtime options name;
+	// UNSPECIFIED: none.
+	RunscConfig RunscConfig `protobuf:"varint,4,opt,name=runsc_config,json=runscConfig,proto3,enum=aerolvm.rootd.v1.RunscConfig" json:"runsc_config,omitempty"`
+	// The toolbox binary the spec binds into the sandbox: the helper's
+	// root-owned copy of the agent's, or the operator's own.
+	Toolbox       bool `protobuf:"varint,5,opt,name=toolbox,proto3" json:"toolbox,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ContainerSetup) Reset() {
+	*x = ContainerSetup{}
+	mi := &file_rootd_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ContainerSetup) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ContainerSetup) ProtoMessage() {}
+
+func (x *ContainerSetup) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ContainerSetup.ProtoReflect.Descriptor instead.
+func (*ContainerSetup) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *ContainerSetup) GetNaming() *HostNaming {
+	if x != nil {
+		return x.Naming
+	}
+	return nil
+}
+
+func (x *ContainerSetup) GetTaskFifos() bool {
+	if x != nil {
+		return x.TaskFifos
+	}
+	return false
+}
+
+func (x *ContainerSetup) GetReadyNonce() string {
+	if x != nil {
+		return x.ReadyNonce
+	}
+	return ""
+}
+
+func (x *ContainerSetup) GetRunscConfig() RunscConfig {
+	if x != nil {
+		return x.RunscConfig
+	}
+	return RunscConfig_RUNSC_CONFIG_UNSPECIFIED
+}
+
+func (x *ContainerSetup) GetToolbox() bool {
+	if x != nil {
+		return x.Toolbox
+	}
+	return false
+}
+
+// SandboxFilePaths are the paths of what a files part made; each is empty
+// when the part did not ask for it.
+type SandboxFilePaths struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	HostnamePath    string                 `protobuf:"bytes,1,opt,name=hostname_path,json=hostnamePath,proto3" json:"hostname_path,omitempty"`
+	HostsPath       string                 `protobuf:"bytes,2,opt,name=hosts_path,json=hostsPath,proto3" json:"hosts_path,omitempty"`
+	ResolvConfPath  string                 `protobuf:"bytes,3,opt,name=resolv_conf_path,json=resolvConfPath,proto3" json:"resolv_conf_path,omitempty"`
+	StdoutPath      string                 `protobuf:"bytes,4,opt,name=stdout_path,json=stdoutPath,proto3" json:"stdout_path,omitempty"`
+	StderrPath      string                 `protobuf:"bytes,5,opt,name=stderr_path,json=stderrPath,proto3" json:"stderr_path,omitempty"`
+	ReadySocketPath string                 `protobuf:"bytes,6,opt,name=ready_socket_path,json=readySocketPath,proto3" json:"ready_socket_path,omitempty"`
+	RunscConfigPath string                 `protobuf:"bytes,7,opt,name=runsc_config_path,json=runscConfigPath,proto3" json:"runsc_config_path,omitempty"`
+	ToolboxPath     string                 `protobuf:"bytes,8,opt,name=toolbox_path,json=toolboxPath,proto3" json:"toolbox_path,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *SandboxFilePaths) Reset() {
+	*x = SandboxFilePaths{}
+	mi := &file_rootd_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxFilePaths) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxFilePaths) ProtoMessage() {}
+
+func (x *SandboxFilePaths) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxFilePaths.ProtoReflect.Descriptor instead.
+func (*SandboxFilePaths) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *SandboxFilePaths) GetHostnamePath() string {
+	if x != nil {
+		return x.HostnamePath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetHostsPath() string {
+	if x != nil {
+		return x.HostsPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetResolvConfPath() string {
+	if x != nil {
+		return x.ResolvConfPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetStdoutPath() string {
+	if x != nil {
+		return x.StdoutPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetStderrPath() string {
+	if x != nil {
+		return x.StderrPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetReadySocketPath() string {
+	if x != nil {
+		return x.ReadySocketPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetRunscConfigPath() string {
+	if x != nil {
+		return x.RunscConfigPath
+	}
+	return ""
+}
+
+func (x *SandboxFilePaths) GetToolboxPath() string {
+	if x != nil {
+		return x.ToolboxPath
+	}
+	return ""
+}
+
+// ImageUser asks which user a container's image runs as (part
+// "image_user"): its config's USER, resolved against the image's own
+// /etc/passwd and /etc/group as containerd's oci.WithImageConfig does.
+// The image is the one in the container's root filesystem snapshot, whose
+// key is the container's ID; the helper reads it from containerd itself.
+type ImageUser struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The image config's USER; empty when it names none.
+	User          string `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImageUser) Reset() {
+	*x = ImageUser{}
+	mi := &file_rootd_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImageUser) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImageUser) ProtoMessage() {}
+
+func (x *ImageUser) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImageUser.ProtoReflect.Descriptor instead.
+func (*ImageUser) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *ImageUser) GetUser() string {
+	if x != nil {
+		return x.User
+	}
+	return ""
+}
+
+// ImageUserAnswer is what an image's user resolves to, for the spec's
+// process: what oci.WithImageConfig would set.
+type ImageUserAnswer struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Uid            uint32                 `protobuf:"varint,1,opt,name=uid,proto3" json:"uid,omitempty"`
+	Gid            uint32                 `protobuf:"varint,2,opt,name=gid,proto3" json:"gid,omitempty"`
+	AdditionalGids []uint32               `protobuf:"varint,3,rep,packed,name=additional_gids,json=additionalGids,proto3" json:"additional_gids,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ImageUserAnswer) Reset() {
+	*x = ImageUserAnswer{}
+	mi := &file_rootd_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImageUserAnswer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImageUserAnswer) ProtoMessage() {}
+
+func (x *ImageUserAnswer) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImageUserAnswer.ProtoReflect.Descriptor instead.
+func (*ImageUserAnswer) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *ImageUserAnswer) GetUid() uint32 {
+	if x != nil {
+		return x.Uid
+	}
+	return 0
+}
+
+func (x *ImageUserAnswer) GetGid() uint32 {
+	if x != nil {
+		return x.Gid
+	}
+	return 0
+}
+
+func (x *ImageUserAnswer) GetAdditionalGids() []uint32 {
+	if x != nil {
+		return x.AdditionalGids
+	}
+	return nil
+}
+
+// DiskQuota asks for a hard limit on a container's writable layer (part
+// "disk_quota"): an XFS project of its own, from AerolVM's fixed range,
+// over the snapshot's own folder. The helper finds the folder from
+// containerd's answer for the container's snapshot.
+type DiskQuota struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Bytes         uint64                 `protobuf:"varint,1,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DiskQuota) Reset() {
+	*x = DiskQuota{}
+	mi := &file_rootd_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiskQuota) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskQuota) ProtoMessage() {}
+
+func (x *DiskQuota) ProtoReflect() protoreflect.Message {
+	mi := &file_rootd_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskQuota.ProtoReflect.Descriptor instead.
+func (*DiskQuota) Descriptor() ([]byte, []int) {
+	return file_rootd_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *DiskQuota) GetBytes() uint64 {
+	if x != nil {
+		return x.Bytes
+	}
+	return 0
+}
+
 type PrepareSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The netns-pool slot the sandbox gets.
@@ -2209,14 +2643,24 @@ type PrepareSandboxRequest struct {
 	Firewall *SandboxFirewall `protobuf:"bytes,4,opt,name=firewall,proto3" json:"firewall,omitempty"`
 	// Part "cgroup", which comes alone: no netns_name, container_ip or
 	// firewall with it.
-	Cgroup        *SandboxCgroup `protobuf:"bytes,5,opt,name=cgroup,proto3" json:"cgroup,omitempty"`
+	Cgroup *SandboxCgroup `protobuf:"bytes,5,opt,name=cgroup,proto3" json:"cgroup,omitempty"`
+	// The container the container's parts are for: a sandbox's or a
+	// warm-pool slot's ID. Those parts come together, with no netns_name,
+	// container_ip, firewall or cgroup.
+	ContainerId string `protobuf:"bytes,6,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	// Part "files".
+	Setup *ContainerSetup `protobuf:"bytes,7,opt,name=setup,proto3" json:"setup,omitempty"`
+	// Part "image_user".
+	ImageUser *ImageUser `protobuf:"bytes,8,opt,name=image_user,json=imageUser,proto3" json:"image_user,omitempty"`
+	// Part "disk_quota".
+	DiskQuota     *DiskQuota `protobuf:"bytes,9,opt,name=disk_quota,json=diskQuota,proto3" json:"disk_quota,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PrepareSandboxRequest) Reset() {
 	*x = PrepareSandboxRequest{}
-	mi := &file_rootd_proto_msgTypes[37]
+	mi := &file_rootd_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2228,7 +2672,7 @@ func (x *PrepareSandboxRequest) String() string {
 func (*PrepareSandboxRequest) ProtoMessage() {}
 
 func (x *PrepareSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[37]
+	mi := &file_rootd_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2241,7 +2685,7 @@ func (x *PrepareSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareSandboxRequest.ProtoReflect.Descriptor instead.
 func (*PrepareSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{37}
+	return file_rootd_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *PrepareSandboxRequest) GetNetnsName() string {
@@ -2279,6 +2723,34 @@ func (x *PrepareSandboxRequest) GetCgroup() *SandboxCgroup {
 	return nil
 }
 
+func (x *PrepareSandboxRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *PrepareSandboxRequest) GetSetup() *ContainerSetup {
+	if x != nil {
+		return x.Setup
+	}
+	return nil
+}
+
+func (x *PrepareSandboxRequest) GetImageUser() *ImageUser {
+	if x != nil {
+		return x.ImageUser
+	}
+	return nil
+}
+
+func (x *PrepareSandboxRequest) GetDiskQuota() *DiskQuota {
+	if x != nil {
+		return x.DiskQuota
+	}
+	return nil
+}
+
 type PrepareSandboxResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Part "netns": the namespace and the address CNI gave it.
@@ -2286,13 +2758,17 @@ type PrepareSandboxResponse struct {
 	ContainerIp string `protobuf:"bytes,2,opt,name=container_ip,json=containerIp,proto3" json:"container_ip,omitempty"`
 	// Part "firewall": a block-all rule was put in (not already there).
 	BlockInserted bool `protobuf:"varint,3,opt,name=block_inserted,json=blockInserted,proto3" json:"block_inserted,omitempty"`
+	// Part "files".
+	Files *SandboxFilePaths `protobuf:"bytes,4,opt,name=files,proto3" json:"files,omitempty"`
+	// Part "image_user".
+	ImageUser     *ImageUserAnswer `protobuf:"bytes,5,opt,name=image_user,json=imageUser,proto3" json:"image_user,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PrepareSandboxResponse) Reset() {
 	*x = PrepareSandboxResponse{}
-	mi := &file_rootd_proto_msgTypes[38]
+	mi := &file_rootd_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2304,7 +2780,7 @@ func (x *PrepareSandboxResponse) String() string {
 func (*PrepareSandboxResponse) ProtoMessage() {}
 
 func (x *PrepareSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[38]
+	mi := &file_rootd_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2317,7 +2793,7 @@ func (x *PrepareSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareSandboxResponse.ProtoReflect.Descriptor instead.
 func (*PrepareSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{38}
+	return file_rootd_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *PrepareSandboxResponse) GetNetnsPath() string {
@@ -2341,21 +2817,38 @@ func (x *PrepareSandboxResponse) GetBlockInserted() bool {
 	return false
 }
 
+func (x *PrepareSandboxResponse) GetFiles() *SandboxFilePaths {
+	if x != nil {
+		return x.Files
+	}
+	return nil
+}
+
+func (x *PrepareSandboxResponse) GetImageUser() *ImageUserAnswer {
+	if x != nil {
+		return x.ImageUser
+	}
+	return nil
+}
+
 type ReleaseSandboxRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	NetnsName string                 `protobuf:"bytes,1,opt,name=netns_name,json=netnsName,proto3" json:"netns_name,omitempty"`
 	// The address the pool recorded for the slot; empty when none was.
 	ContainerIp string `protobuf:"bytes,2,opt,name=container_ip,json=containerIp,proto3" json:"container_ip,omitempty"`
 	// Every part this request carries: "firewall" clears every rule AerolVM
-	// keeps for the address, "netns" removes the namespace.
-	Parts         []string `protobuf:"bytes,3,rep,name=parts,proto3" json:"parts,omitempty"`
+	// keeps for the address, "netns" removes the namespace, and "files",
+	// which comes alone, removes the container's files.
+	Parts []string `protobuf:"bytes,3,rep,name=parts,proto3" json:"parts,omitempty"`
+	// Part "files": the container whose files go.
+	ContainerId   string `protobuf:"bytes,4,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReleaseSandboxRequest) Reset() {
 	*x = ReleaseSandboxRequest{}
-	mi := &file_rootd_proto_msgTypes[39]
+	mi := &file_rootd_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2367,7 +2860,7 @@ func (x *ReleaseSandboxRequest) String() string {
 func (*ReleaseSandboxRequest) ProtoMessage() {}
 
 func (x *ReleaseSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[39]
+	mi := &file_rootd_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2380,7 +2873,7 @@ func (x *ReleaseSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{39}
+	return file_rootd_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *ReleaseSandboxRequest) GetNetnsName() string {
@@ -2404,6 +2897,13 @@ func (x *ReleaseSandboxRequest) GetParts() []string {
 	return nil
 }
 
+func (x *ReleaseSandboxRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
 type ReleaseSandboxResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2412,7 +2912,7 @@ type ReleaseSandboxResponse struct {
 
 func (x *ReleaseSandboxResponse) Reset() {
 	*x = ReleaseSandboxResponse{}
-	mi := &file_rootd_proto_msgTypes[40]
+	mi := &file_rootd_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2424,7 +2924,7 @@ func (x *ReleaseSandboxResponse) String() string {
 func (*ReleaseSandboxResponse) ProtoMessage() {}
 
 func (x *ReleaseSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[40]
+	mi := &file_rootd_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2437,7 +2937,7 @@ func (x *ReleaseSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseSandboxResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{40}
+	return file_rootd_proto_rawDescGZIP(), []int{46}
 }
 
 type BridgeProbeRequest struct {
@@ -2453,7 +2953,7 @@ type BridgeProbeRequest struct {
 
 func (x *BridgeProbeRequest) Reset() {
 	*x = BridgeProbeRequest{}
-	mi := &file_rootd_proto_msgTypes[41]
+	mi := &file_rootd_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2465,7 +2965,7 @@ func (x *BridgeProbeRequest) String() string {
 func (*BridgeProbeRequest) ProtoMessage() {}
 
 func (x *BridgeProbeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[41]
+	mi := &file_rootd_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2478,7 +2978,7 @@ func (x *BridgeProbeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BridgeProbeRequest.ProtoReflect.Descriptor instead.
 func (*BridgeProbeRequest) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{41}
+	return file_rootd_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *BridgeProbeRequest) GetOp() BridgeProbeOp {
@@ -2510,7 +3010,7 @@ type BridgeProbeResponse struct {
 
 func (x *BridgeProbeResponse) Reset() {
 	*x = BridgeProbeResponse{}
-	mi := &file_rootd_proto_msgTypes[42]
+	mi := &file_rootd_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2522,7 +3022,7 @@ func (x *BridgeProbeResponse) String() string {
 func (*BridgeProbeResponse) ProtoMessage() {}
 
 func (x *BridgeProbeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[42]
+	mi := &file_rootd_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2535,7 +3035,7 @@ func (x *BridgeProbeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BridgeProbeResponse.ProtoReflect.Descriptor instead.
 func (*BridgeProbeResponse) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{42}
+	return file_rootd_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *BridgeProbeResponse) GetBridgeAbsent() bool {
@@ -2574,7 +3074,7 @@ type MatchProcessRequest struct {
 
 func (x *MatchProcessRequest) Reset() {
 	*x = MatchProcessRequest{}
-	mi := &file_rootd_proto_msgTypes[43]
+	mi := &file_rootd_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2586,7 +3086,7 @@ func (x *MatchProcessRequest) String() string {
 func (*MatchProcessRequest) ProtoMessage() {}
 
 func (x *MatchProcessRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[43]
+	mi := &file_rootd_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2599,7 +3099,7 @@ func (x *MatchProcessRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MatchProcessRequest.ProtoReflect.Descriptor instead.
 func (*MatchProcessRequest) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{43}
+	return file_rootd_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *MatchProcessRequest) GetPid() uint32 {
@@ -2642,7 +3142,7 @@ type MatchProcessResponse struct {
 
 func (x *MatchProcessResponse) Reset() {
 	*x = MatchProcessResponse{}
-	mi := &file_rootd_proto_msgTypes[44]
+	mi := &file_rootd_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2654,7 +3154,7 @@ func (x *MatchProcessResponse) String() string {
 func (*MatchProcessResponse) ProtoMessage() {}
 
 func (x *MatchProcessResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[44]
+	mi := &file_rootd_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2667,7 +3167,7 @@ func (x *MatchProcessResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MatchProcessResponse.ProtoReflect.Descriptor instead.
 func (*MatchProcessResponse) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{44}
+	return file_rootd_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *MatchProcessResponse) GetMatched() []string {
@@ -2696,7 +3196,7 @@ type HostPortForward struct {
 
 func (x *HostPortForward) Reset() {
 	*x = HostPortForward{}
-	mi := &file_rootd_proto_msgTypes[45]
+	mi := &file_rootd_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2708,7 +3208,7 @@ func (x *HostPortForward) String() string {
 func (*HostPortForward) ProtoMessage() {}
 
 func (x *HostPortForward) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[45]
+	mi := &file_rootd_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2721,7 +3221,7 @@ func (x *HostPortForward) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostPortForward.ProtoReflect.Descriptor instead.
 func (*HostPortForward) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{45}
+	return file_rootd_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *HostPortForward) GetHostPort() uint32 {
@@ -2765,7 +3265,7 @@ type HostPortRequest struct {
 
 func (x *HostPortRequest) Reset() {
 	*x = HostPortRequest{}
-	mi := &file_rootd_proto_msgTypes[46]
+	mi := &file_rootd_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2777,7 +3277,7 @@ func (x *HostPortRequest) String() string {
 func (*HostPortRequest) ProtoMessage() {}
 
 func (x *HostPortRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[46]
+	mi := &file_rootd_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2790,7 +3290,7 @@ func (x *HostPortRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostPortRequest.ProtoReflect.Descriptor instead.
 func (*HostPortRequest) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{46}
+	return file_rootd_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *HostPortRequest) GetOp() HostPortOp {
@@ -2825,7 +3325,7 @@ type HostPortResponse struct {
 
 func (x *HostPortResponse) Reset() {
 	*x = HostPortResponse{}
-	mi := &file_rootd_proto_msgTypes[47]
+	mi := &file_rootd_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2837,7 +3337,7 @@ func (x *HostPortResponse) String() string {
 func (*HostPortResponse) ProtoMessage() {}
 
 func (x *HostPortResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_rootd_proto_msgTypes[47]
+	mi := &file_rootd_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2850,7 +3350,7 @@ func (x *HostPortResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostPortResponse.ProtoReflect.Descriptor instead.
 func (*HostPortResponse) Descriptor() ([]byte, []int) {
-	return file_rootd_proto_rawDescGZIP(), []int{47}
+	return file_rootd_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *HostPortResponse) GetSkipped() []uint32 {
@@ -2971,24 +3471,70 @@ const file_rootd_proto_rawDesc = "" +
 	"\n" +
 	"deny_cidrs\x18\x03 \x03(\tR\tdenyCidrs\"2\n" +
 	"\rSandboxCgroup\x12!\n" +
-	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\xe7\x01\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\xb6\x01\n" +
+	"\n" +
+	"HostNaming\x12\x1a\n" +
+	"\bhostname\x18\x01 \x01(\tR\bhostname\x121\n" +
+	"\x05hosts\x18\x02 \x03(\v2\x1b.aerolvm.rootd.v1.HostEntryR\x05hosts\x12 \n" +
+	"\vnameservers\x18\x03 \x03(\tR\vnameservers\x12\x16\n" +
+	"\x06search\x18\x04 \x03(\tR\x06search\x12\x1f\n" +
+	"\vdns_options\x18\x05 \x03(\tR\n" +
+	"dnsOptions\"\xe2\x01\n" +
+	"\x0eContainerSetup\x124\n" +
+	"\x06naming\x18\x01 \x01(\v2\x1c.aerolvm.rootd.v1.HostNamingR\x06naming\x12\x1d\n" +
+	"\n" +
+	"task_fifos\x18\x02 \x01(\bR\ttaskFifos\x12\x1f\n" +
+	"\vready_nonce\x18\x03 \x01(\tR\n" +
+	"readyNonce\x12@\n" +
+	"\frunsc_config\x18\x04 \x01(\x0e2\x1d.aerolvm.rootd.v1.RunscConfigR\vrunscConfig\x12\x18\n" +
+	"\atoolbox\x18\x05 \x01(\bR\atoolbox\"\xbd\x02\n" +
+	"\x10SandboxFilePaths\x12#\n" +
+	"\rhostname_path\x18\x01 \x01(\tR\fhostnamePath\x12\x1d\n" +
+	"\n" +
+	"hosts_path\x18\x02 \x01(\tR\thostsPath\x12(\n" +
+	"\x10resolv_conf_path\x18\x03 \x01(\tR\x0eresolvConfPath\x12\x1f\n" +
+	"\vstdout_path\x18\x04 \x01(\tR\n" +
+	"stdoutPath\x12\x1f\n" +
+	"\vstderr_path\x18\x05 \x01(\tR\n" +
+	"stderrPath\x12*\n" +
+	"\x11ready_socket_path\x18\x06 \x01(\tR\x0freadySocketPath\x12*\n" +
+	"\x11runsc_config_path\x18\a \x01(\tR\x0frunscConfigPath\x12!\n" +
+	"\ftoolbox_path\x18\b \x01(\tR\vtoolboxPath\"\x1f\n" +
+	"\tImageUser\x12\x12\n" +
+	"\x04user\x18\x01 \x01(\tR\x04user\"^\n" +
+	"\x0fImageUserAnswer\x12\x10\n" +
+	"\x03uid\x18\x01 \x01(\rR\x03uid\x12\x10\n" +
+	"\x03gid\x18\x02 \x01(\rR\x03gid\x12'\n" +
+	"\x0fadditional_gids\x18\x03 \x03(\rR\x0eadditionalGids\"!\n" +
+	"\tDiskQuota\x12\x14\n" +
+	"\x05bytes\x18\x01 \x01(\x04R\x05bytes\"\xba\x03\n" +
 	"\x15PrepareSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"netns_name\x18\x01 \x01(\tR\tnetnsName\x12\x14\n" +
 	"\x05parts\x18\x02 \x03(\tR\x05parts\x12!\n" +
 	"\fcontainer_ip\x18\x03 \x01(\tR\vcontainerIp\x12=\n" +
 	"\bfirewall\x18\x04 \x01(\v2!.aerolvm.rootd.v1.SandboxFirewallR\bfirewall\x127\n" +
-	"\x06cgroup\x18\x05 \x01(\v2\x1f.aerolvm.rootd.v1.SandboxCgroupR\x06cgroup\"\x81\x01\n" +
+	"\x06cgroup\x18\x05 \x01(\v2\x1f.aerolvm.rootd.v1.SandboxCgroupR\x06cgroup\x12!\n" +
+	"\fcontainer_id\x18\x06 \x01(\tR\vcontainerId\x126\n" +
+	"\x05setup\x18\a \x01(\v2 .aerolvm.rootd.v1.ContainerSetupR\x05setup\x12:\n" +
+	"\n" +
+	"image_user\x18\b \x01(\v2\x1b.aerolvm.rootd.v1.ImageUserR\timageUser\x12:\n" +
+	"\n" +
+	"disk_quota\x18\t \x01(\v2\x1b.aerolvm.rootd.v1.DiskQuotaR\tdiskQuota\"\xfd\x01\n" +
 	"\x16PrepareSandboxResponse\x12\x1d\n" +
 	"\n" +
 	"netns_path\x18\x01 \x01(\tR\tnetnsPath\x12!\n" +
 	"\fcontainer_ip\x18\x02 \x01(\tR\vcontainerIp\x12%\n" +
-	"\x0eblock_inserted\x18\x03 \x01(\bR\rblockInserted\"o\n" +
+	"\x0eblock_inserted\x18\x03 \x01(\bR\rblockInserted\x128\n" +
+	"\x05files\x18\x04 \x01(\v2\".aerolvm.rootd.v1.SandboxFilePathsR\x05files\x12@\n" +
+	"\n" +
+	"image_user\x18\x05 \x01(\v2!.aerolvm.rootd.v1.ImageUserAnswerR\timageUser\"\x92\x01\n" +
 	"\x15ReleaseSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"netns_name\x18\x01 \x01(\tR\tnetnsName\x12!\n" +
 	"\fcontainer_ip\x18\x02 \x01(\tR\vcontainerIp\x12\x14\n" +
-	"\x05parts\x18\x03 \x03(\tR\x05parts\"\x18\n" +
+	"\x05parts\x18\x03 \x03(\tR\x05parts\x12!\n" +
+	"\fcontainer_id\x18\x04 \x01(\tR\vcontainerId\"\x18\n" +
 	"\x16ReleaseSandboxResponse\"Y\n" +
 	"\x12BridgeProbeRequest\x12/\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x1f.aerolvm.rootd.v1.BridgeProbeOpR\x02op\x12\x12\n" +
@@ -3086,7 +3632,7 @@ func file_rootd_proto_rawDescGZIP() []byte {
 }
 
 var file_rootd_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 48)
+var file_rootd_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
 var file_rootd_proto_goTypes = []any{
 	(RunscConfig)(0),                     // 0: aerolvm.rootd.v1.RunscConfig
 	(SandboxRulesOp)(0),                  // 1: aerolvm.rootd.v1.SandboxRulesOp
@@ -3130,74 +3676,88 @@ var file_rootd_proto_goTypes = []any{
 	(*SandboxRulesResponse)(nil),         // 39: aerolvm.rootd.v1.SandboxRulesResponse
 	(*SandboxFirewall)(nil),              // 40: aerolvm.rootd.v1.SandboxFirewall
 	(*SandboxCgroup)(nil),                // 41: aerolvm.rootd.v1.SandboxCgroup
-	(*PrepareSandboxRequest)(nil),        // 42: aerolvm.rootd.v1.PrepareSandboxRequest
-	(*PrepareSandboxResponse)(nil),       // 43: aerolvm.rootd.v1.PrepareSandboxResponse
-	(*ReleaseSandboxRequest)(nil),        // 44: aerolvm.rootd.v1.ReleaseSandboxRequest
-	(*ReleaseSandboxResponse)(nil),       // 45: aerolvm.rootd.v1.ReleaseSandboxResponse
-	(*BridgeProbeRequest)(nil),           // 46: aerolvm.rootd.v1.BridgeProbeRequest
-	(*BridgeProbeResponse)(nil),          // 47: aerolvm.rootd.v1.BridgeProbeResponse
-	(*MatchProcessRequest)(nil),          // 48: aerolvm.rootd.v1.MatchProcessRequest
-	(*MatchProcessResponse)(nil),         // 49: aerolvm.rootd.v1.MatchProcessResponse
-	(*HostPortForward)(nil),              // 50: aerolvm.rootd.v1.HostPortForward
-	(*HostPortRequest)(nil),              // 51: aerolvm.rootd.v1.HostPortRequest
-	(*HostPortResponse)(nil),             // 52: aerolvm.rootd.v1.HostPortResponse
+	(*HostNaming)(nil),                   // 42: aerolvm.rootd.v1.HostNaming
+	(*ContainerSetup)(nil),               // 43: aerolvm.rootd.v1.ContainerSetup
+	(*SandboxFilePaths)(nil),             // 44: aerolvm.rootd.v1.SandboxFilePaths
+	(*ImageUser)(nil),                    // 45: aerolvm.rootd.v1.ImageUser
+	(*ImageUserAnswer)(nil),              // 46: aerolvm.rootd.v1.ImageUserAnswer
+	(*DiskQuota)(nil),                    // 47: aerolvm.rootd.v1.DiskQuota
+	(*PrepareSandboxRequest)(nil),        // 48: aerolvm.rootd.v1.PrepareSandboxRequest
+	(*PrepareSandboxResponse)(nil),       // 49: aerolvm.rootd.v1.PrepareSandboxResponse
+	(*ReleaseSandboxRequest)(nil),        // 50: aerolvm.rootd.v1.ReleaseSandboxRequest
+	(*ReleaseSandboxResponse)(nil),       // 51: aerolvm.rootd.v1.ReleaseSandboxResponse
+	(*BridgeProbeRequest)(nil),           // 52: aerolvm.rootd.v1.BridgeProbeRequest
+	(*BridgeProbeResponse)(nil),          // 53: aerolvm.rootd.v1.BridgeProbeResponse
+	(*MatchProcessRequest)(nil),          // 54: aerolvm.rootd.v1.MatchProcessRequest
+	(*MatchProcessResponse)(nil),         // 55: aerolvm.rootd.v1.MatchProcessResponse
+	(*HostPortForward)(nil),              // 56: aerolvm.rootd.v1.HostPortForward
+	(*HostPortRequest)(nil),              // 57: aerolvm.rootd.v1.HostPortRequest
+	(*HostPortResponse)(nil),             // 58: aerolvm.rootd.v1.HostPortResponse
 }
 var file_rootd_proto_depIdxs = []int32{
 	9,  // 0: aerolvm.rootd.v1.EnsureHostFilesRequest.hosts:type_name -> aerolvm.rootd.v1.HostEntry
 	0,  // 1: aerolvm.rootd.v1.EnsureRunscConfigRequest.config:type_name -> aerolvm.rootd.v1.RunscConfig
 	33, // 2: aerolvm.rootd.v1.SetNodeGuardRequest.allow:type_name -> aerolvm.rootd.v1.NodePort
 	1,  // 3: aerolvm.rootd.v1.SandboxRulesRequest.op:type_name -> aerolvm.rootd.v1.SandboxRulesOp
-	40, // 4: aerolvm.rootd.v1.PrepareSandboxRequest.firewall:type_name -> aerolvm.rootd.v1.SandboxFirewall
-	41, // 5: aerolvm.rootd.v1.PrepareSandboxRequest.cgroup:type_name -> aerolvm.rootd.v1.SandboxCgroup
-	2,  // 6: aerolvm.rootd.v1.BridgeProbeRequest.op:type_name -> aerolvm.rootd.v1.BridgeProbeOp
-	4,  // 7: aerolvm.rootd.v1.HostPortForward.kind:type_name -> aerolvm.rootd.v1.HostPortKind
-	3,  // 8: aerolvm.rootd.v1.HostPortRequest.op:type_name -> aerolvm.rootd.v1.HostPortOp
-	50, // 9: aerolvm.rootd.v1.HostPortRequest.forwards:type_name -> aerolvm.rootd.v1.HostPortForward
-	5,  // 10: aerolvm.rootd.v1.RootHelper.Version:input_type -> aerolvm.rootd.v1.VersionRequest
-	7,  // 11: aerolvm.rootd.v1.RootHelper.EnsureHost:input_type -> aerolvm.rootd.v1.EnsureHostRequest
-	10, // 12: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:input_type -> aerolvm.rootd.v1.EnsureHostFilesRequest
-	12, // 13: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:input_type -> aerolvm.rootd.v1.EnsureTaskFIFOsRequest
-	14, // 14: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:input_type -> aerolvm.rootd.v1.EnsureRunscConfigRequest
-	16, // 15: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:input_type -> aerolvm.rootd.v1.EnsureReadySocketRequest
-	18, // 16: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:input_type -> aerolvm.rootd.v1.RemoveContainerFilesRequest
-	23, // 17: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:input_type -> aerolvm.rootd.v1.EnsureHostNetworkRequest
-	25, // 18: aerolvm.rootd.v1.RootHelper.RealizeNetns:input_type -> aerolvm.rootd.v1.RealizeNetnsRequest
-	27, // 19: aerolvm.rootd.v1.RootHelper.RemoveNetns:input_type -> aerolvm.rootd.v1.RemoveNetnsRequest
-	29, // 20: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:input_type -> aerolvm.rootd.v1.DisableNetnsIPv6Request
-	31, // 21: aerolvm.rootd.v1.RootHelper.NetnsAddrs:input_type -> aerolvm.rootd.v1.NetnsAddrsRequest
-	34, // 22: aerolvm.rootd.v1.RootHelper.SetNodeGuard:input_type -> aerolvm.rootd.v1.SetNodeGuardRequest
-	36, // 23: aerolvm.rootd.v1.RootHelper.SetEgressFloor:input_type -> aerolvm.rootd.v1.SetEgressFloorRequest
-	38, // 24: aerolvm.rootd.v1.RootHelper.SandboxRules:input_type -> aerolvm.rootd.v1.SandboxRulesRequest
-	42, // 25: aerolvm.rootd.v1.RootHelper.PrepareSandbox:input_type -> aerolvm.rootd.v1.PrepareSandboxRequest
-	44, // 26: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:input_type -> aerolvm.rootd.v1.ReleaseSandboxRequest
-	46, // 27: aerolvm.rootd.v1.RootHelper.BridgeProbe:input_type -> aerolvm.rootd.v1.BridgeProbeRequest
-	48, // 28: aerolvm.rootd.v1.RootHelper.MatchProcess:input_type -> aerolvm.rootd.v1.MatchProcessRequest
-	51, // 29: aerolvm.rootd.v1.RootHelper.HostPort:input_type -> aerolvm.rootd.v1.HostPortRequest
-	6,  // 30: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
-	8,  // 31: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
-	11, // 32: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
-	13, // 33: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
-	15, // 34: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
-	17, // 35: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
-	19, // 36: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
-	24, // 37: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:output_type -> aerolvm.rootd.v1.EnsureHostNetworkResponse
-	26, // 38: aerolvm.rootd.v1.RootHelper.RealizeNetns:output_type -> aerolvm.rootd.v1.RealizeNetnsResponse
-	28, // 39: aerolvm.rootd.v1.RootHelper.RemoveNetns:output_type -> aerolvm.rootd.v1.RemoveNetnsResponse
-	30, // 40: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:output_type -> aerolvm.rootd.v1.DisableNetnsIPv6Response
-	32, // 41: aerolvm.rootd.v1.RootHelper.NetnsAddrs:output_type -> aerolvm.rootd.v1.NetnsAddrsResponse
-	35, // 42: aerolvm.rootd.v1.RootHelper.SetNodeGuard:output_type -> aerolvm.rootd.v1.SetNodeGuardResponse
-	37, // 43: aerolvm.rootd.v1.RootHelper.SetEgressFloor:output_type -> aerolvm.rootd.v1.SetEgressFloorResponse
-	39, // 44: aerolvm.rootd.v1.RootHelper.SandboxRules:output_type -> aerolvm.rootd.v1.SandboxRulesResponse
-	43, // 45: aerolvm.rootd.v1.RootHelper.PrepareSandbox:output_type -> aerolvm.rootd.v1.PrepareSandboxResponse
-	45, // 46: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:output_type -> aerolvm.rootd.v1.ReleaseSandboxResponse
-	47, // 47: aerolvm.rootd.v1.RootHelper.BridgeProbe:output_type -> aerolvm.rootd.v1.BridgeProbeResponse
-	49, // 48: aerolvm.rootd.v1.RootHelper.MatchProcess:output_type -> aerolvm.rootd.v1.MatchProcessResponse
-	52, // 49: aerolvm.rootd.v1.RootHelper.HostPort:output_type -> aerolvm.rootd.v1.HostPortResponse
-	30, // [30:50] is the sub-list for method output_type
-	10, // [10:30] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	9,  // 4: aerolvm.rootd.v1.HostNaming.hosts:type_name -> aerolvm.rootd.v1.HostEntry
+	42, // 5: aerolvm.rootd.v1.ContainerSetup.naming:type_name -> aerolvm.rootd.v1.HostNaming
+	0,  // 6: aerolvm.rootd.v1.ContainerSetup.runsc_config:type_name -> aerolvm.rootd.v1.RunscConfig
+	40, // 7: aerolvm.rootd.v1.PrepareSandboxRequest.firewall:type_name -> aerolvm.rootd.v1.SandboxFirewall
+	41, // 8: aerolvm.rootd.v1.PrepareSandboxRequest.cgroup:type_name -> aerolvm.rootd.v1.SandboxCgroup
+	43, // 9: aerolvm.rootd.v1.PrepareSandboxRequest.setup:type_name -> aerolvm.rootd.v1.ContainerSetup
+	45, // 10: aerolvm.rootd.v1.PrepareSandboxRequest.image_user:type_name -> aerolvm.rootd.v1.ImageUser
+	47, // 11: aerolvm.rootd.v1.PrepareSandboxRequest.disk_quota:type_name -> aerolvm.rootd.v1.DiskQuota
+	44, // 12: aerolvm.rootd.v1.PrepareSandboxResponse.files:type_name -> aerolvm.rootd.v1.SandboxFilePaths
+	46, // 13: aerolvm.rootd.v1.PrepareSandboxResponse.image_user:type_name -> aerolvm.rootd.v1.ImageUserAnswer
+	2,  // 14: aerolvm.rootd.v1.BridgeProbeRequest.op:type_name -> aerolvm.rootd.v1.BridgeProbeOp
+	4,  // 15: aerolvm.rootd.v1.HostPortForward.kind:type_name -> aerolvm.rootd.v1.HostPortKind
+	3,  // 16: aerolvm.rootd.v1.HostPortRequest.op:type_name -> aerolvm.rootd.v1.HostPortOp
+	56, // 17: aerolvm.rootd.v1.HostPortRequest.forwards:type_name -> aerolvm.rootd.v1.HostPortForward
+	5,  // 18: aerolvm.rootd.v1.RootHelper.Version:input_type -> aerolvm.rootd.v1.VersionRequest
+	7,  // 19: aerolvm.rootd.v1.RootHelper.EnsureHost:input_type -> aerolvm.rootd.v1.EnsureHostRequest
+	10, // 20: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:input_type -> aerolvm.rootd.v1.EnsureHostFilesRequest
+	12, // 21: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:input_type -> aerolvm.rootd.v1.EnsureTaskFIFOsRequest
+	14, // 22: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:input_type -> aerolvm.rootd.v1.EnsureRunscConfigRequest
+	16, // 23: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:input_type -> aerolvm.rootd.v1.EnsureReadySocketRequest
+	18, // 24: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:input_type -> aerolvm.rootd.v1.RemoveContainerFilesRequest
+	23, // 25: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:input_type -> aerolvm.rootd.v1.EnsureHostNetworkRequest
+	25, // 26: aerolvm.rootd.v1.RootHelper.RealizeNetns:input_type -> aerolvm.rootd.v1.RealizeNetnsRequest
+	27, // 27: aerolvm.rootd.v1.RootHelper.RemoveNetns:input_type -> aerolvm.rootd.v1.RemoveNetnsRequest
+	29, // 28: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:input_type -> aerolvm.rootd.v1.DisableNetnsIPv6Request
+	31, // 29: aerolvm.rootd.v1.RootHelper.NetnsAddrs:input_type -> aerolvm.rootd.v1.NetnsAddrsRequest
+	34, // 30: aerolvm.rootd.v1.RootHelper.SetNodeGuard:input_type -> aerolvm.rootd.v1.SetNodeGuardRequest
+	36, // 31: aerolvm.rootd.v1.RootHelper.SetEgressFloor:input_type -> aerolvm.rootd.v1.SetEgressFloorRequest
+	38, // 32: aerolvm.rootd.v1.RootHelper.SandboxRules:input_type -> aerolvm.rootd.v1.SandboxRulesRequest
+	48, // 33: aerolvm.rootd.v1.RootHelper.PrepareSandbox:input_type -> aerolvm.rootd.v1.PrepareSandboxRequest
+	50, // 34: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:input_type -> aerolvm.rootd.v1.ReleaseSandboxRequest
+	52, // 35: aerolvm.rootd.v1.RootHelper.BridgeProbe:input_type -> aerolvm.rootd.v1.BridgeProbeRequest
+	54, // 36: aerolvm.rootd.v1.RootHelper.MatchProcess:input_type -> aerolvm.rootd.v1.MatchProcessRequest
+	57, // 37: aerolvm.rootd.v1.RootHelper.HostPort:input_type -> aerolvm.rootd.v1.HostPortRequest
+	6,  // 38: aerolvm.rootd.v1.RootHelper.Version:output_type -> aerolvm.rootd.v1.VersionResponse
+	8,  // 39: aerolvm.rootd.v1.RootHelper.EnsureHost:output_type -> aerolvm.rootd.v1.EnsureHostResponse
+	11, // 40: aerolvm.rootd.v1.RootHelper.EnsureHostFiles:output_type -> aerolvm.rootd.v1.EnsureHostFilesResponse
+	13, // 41: aerolvm.rootd.v1.RootHelper.EnsureTaskFIFOs:output_type -> aerolvm.rootd.v1.EnsureTaskFIFOsResponse
+	15, // 42: aerolvm.rootd.v1.RootHelper.EnsureRunscConfig:output_type -> aerolvm.rootd.v1.EnsureRunscConfigResponse
+	17, // 43: aerolvm.rootd.v1.RootHelper.EnsureReadySocket:output_type -> aerolvm.rootd.v1.EnsureReadySocketResponse
+	19, // 44: aerolvm.rootd.v1.RootHelper.RemoveContainerFiles:output_type -> aerolvm.rootd.v1.RemoveContainerFilesResponse
+	24, // 45: aerolvm.rootd.v1.RootHelper.EnsureHostNetwork:output_type -> aerolvm.rootd.v1.EnsureHostNetworkResponse
+	26, // 46: aerolvm.rootd.v1.RootHelper.RealizeNetns:output_type -> aerolvm.rootd.v1.RealizeNetnsResponse
+	28, // 47: aerolvm.rootd.v1.RootHelper.RemoveNetns:output_type -> aerolvm.rootd.v1.RemoveNetnsResponse
+	30, // 48: aerolvm.rootd.v1.RootHelper.DisableNetnsIPv6:output_type -> aerolvm.rootd.v1.DisableNetnsIPv6Response
+	32, // 49: aerolvm.rootd.v1.RootHelper.NetnsAddrs:output_type -> aerolvm.rootd.v1.NetnsAddrsResponse
+	35, // 50: aerolvm.rootd.v1.RootHelper.SetNodeGuard:output_type -> aerolvm.rootd.v1.SetNodeGuardResponse
+	37, // 51: aerolvm.rootd.v1.RootHelper.SetEgressFloor:output_type -> aerolvm.rootd.v1.SetEgressFloorResponse
+	39, // 52: aerolvm.rootd.v1.RootHelper.SandboxRules:output_type -> aerolvm.rootd.v1.SandboxRulesResponse
+	49, // 53: aerolvm.rootd.v1.RootHelper.PrepareSandbox:output_type -> aerolvm.rootd.v1.PrepareSandboxResponse
+	51, // 54: aerolvm.rootd.v1.RootHelper.ReleaseSandbox:output_type -> aerolvm.rootd.v1.ReleaseSandboxResponse
+	53, // 55: aerolvm.rootd.v1.RootHelper.BridgeProbe:output_type -> aerolvm.rootd.v1.BridgeProbeResponse
+	55, // 56: aerolvm.rootd.v1.RootHelper.MatchProcess:output_type -> aerolvm.rootd.v1.MatchProcessResponse
+	58, // 57: aerolvm.rootd.v1.RootHelper.HostPort:output_type -> aerolvm.rootd.v1.HostPortResponse
+	38, // [38:58] is the sub-list for method output_type
+	18, // [18:38] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_rootd_proto_init() }
@@ -3211,7 +3771,7 @@ func file_rootd_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_rootd_proto_rawDesc), len(file_rootd_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   48,
+			NumMessages:   54,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -72,6 +72,8 @@ func TestConfigFromEnv(t *testing.T) {
 			Ready:      "/run/aerolvm-rootd/ready",
 			Runsc:      "/var/lib/aerolvm-rootd/runsc",
 			AgentReady: "/run/sandboxd/docker/ready",
+			Toolbox:    "/usr/local/bin/toolboxd",
+			ImageRoot:  "/var/lib/aerolvm-rootd/imageroot",
 		},
 		// sandboxd's own CNI settings, read under the same names.
 		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
@@ -117,7 +119,17 @@ func TestConfigFromEnv(t *testing.T) {
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
-			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready"}
+			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready",
+				Toolbox: "/opt/aerolvm/toolboxd", ImageRoot: "/data/rootd/imageroot"}
+		}},
+		// M1 PR 7: the agent's toolbox copy sits in a folder it writes (the
+		// chart's); the helper keeps its own copy, which specs bind.
+		{"toolbox copied from the agent", map[string]string{
+			"SB_TOOLBOX_BINARY_PATH":  "/opt/aerolvm/toolbox/toolboxd",
+			"SB_ROOTD_TOOLBOX_SOURCE": "/opt/aerolvm/toolbox/toolboxd",
+		}, func(c *Config) {
+			c.Policy.BindFiles = []string{"/var/lib/aerolvm-rootd/toolbox/toolboxd"}
+			c.Files.Toolbox, c.Files.ToolboxSource = "/var/lib/aerolvm-rootd/toolbox/toolboxd", "/opt/aerolvm/toolbox/toolboxd"
 		}},
 		{"network", map[string]string{
 			"SB_CONTAINERD_CNI_PLUGIN_DIR": "/usr/lib/cni",

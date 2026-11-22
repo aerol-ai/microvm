@@ -120,8 +120,13 @@ type Driver struct {
 	warmPool WarmPool
 	netns    NetnsHandoff
 	// helper is the root helper in privilege mode split
-	// (privilege_split.go); nil in single mode.
+	// (privilege_split.go); nil in single mode. parts is its container
+	// parts (split_files.go), when the helper client has them.
 	helper RootHelper
+	parts  ContainerParts
+	// imageUsers caches what the helper resolved images' users to
+	// (split_create.go).
+	imageUsers imageUserCache
 	// cgroupMarker marks a started sandbox's group for F10 through the
 	// root helper in privilege mode split (SetCgroupMarker); nil in single
 	// mode, which writes the group's files itself.

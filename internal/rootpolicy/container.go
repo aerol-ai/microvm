@@ -11,6 +11,8 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/aerol-ai/microvm/internal/ownerlease"
 )
 
 // Container is the part of a containerd container record the envelope
@@ -254,10 +256,13 @@ func oneOf(name string, allowed []string) func(string) error {
 // a cgroup, a network namespace). The ID can arrive attacker-controlled
 // (the X-Cluster-Create-ID header), so a "../" in it must never reach a path.
 //
-// An ID may not start with "_" either: a sandbox's cgroup is
-// <parent>/<id>, and the worker pod's supervisor keeps containerd, every
-// shim and the root helper in <parent>/_runtime (ownerlease.ReservedGroup).
-// No generated ID takes that form ("sb-", "aerol-netns-", "park-").
+// An ID may not take a name the sandboxes' cgroup parent keeps for the
+// machinery either (ownerlease.ReservedGroup): a sandbox's cgroup is
+// <parent>/<id>, the worker pod's supervisor keeps containerd, every shim
+// and the root helper in <parent>/_runtime, and the host-process runtimes
+// keep theirs in <parent>/aerolvm-*. The rule is the same in both privilege
+// modes, so a sandbox that single mode creates is one split mode can also
+// run. No generated ID takes either form ("sb-", "aerol-netns-", "park-").
 func ValidateID(id string) error {
 	if id == "" {
 		return violate(RuleID, "sandbox ID is required")
@@ -265,8 +270,8 @@ func ValidateID(id string) error {
 	if len(id) > 128 {
 		return violate(RuleID, "sandbox ID exceeds 128 chars (%d)", len(id))
 	}
-	if id[0] == '_' {
-		return violate(RuleID, "sandbox ID %q starts with \"_\", which the sandboxes' cgroup parent keeps for the machinery (_runtime)", id)
+	if ownerlease.ReservedGroup(id) {
+		return violate(RuleID, "sandbox ID %q starts with \"_\" or \"aerolvm-\", which the sandboxes' cgroup parent keeps for AerolVM's own processes", id)
 	}
 	for _, r := range id {
 		switch {

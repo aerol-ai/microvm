@@ -132,6 +132,16 @@ type Options struct {
 	// cgroup part (cgroup.go) works in. Empty: the kernel's own. Tests
 	// point them at a tree of plain files.
 	CgroupRoot, ProcRoot string
+	// Containers lists containerd's containers, for the sweep of gone
+	// containers' files (sweep.go). Nil: no sweep.
+	Containers ContainerLister
+	// Snapshots reads containerd's snapshots for the image_user and
+	// disk_quota parts (snapshot.go). Nil: the helper serves neither.
+	Snapshots SnapshotReader
+	// ReadImageFiles and Quota stand in for the kernel in tests
+	// (imageuser.go, quota.go). Nil: the helper's own.
+	ReadImageFiles ImageFileReader
+	Quota          QuotaOps
 }
 
 // Server is the helper's socket and gRPC server.
@@ -149,6 +159,11 @@ type Server struct {
 	// with no network configuration.
 	net *network
 	fw  *firewall
+	// locks are the per-object locks every call takes (D11); stopSweep
+	// ends the sweep of gone containers' files and waits for it, before
+	// Shutdown closes the folders it works in.
+	locks     *keyedLocks
+	stopSweep func()
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -203,11 +218,21 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		grpc.ChainStreamInterceptor(answeredStream, s.endOnDrain))
 	s.srv = grpc.NewServer(sopts...)
 	locks := &keyedLocks{}
+	s.locks, s.stopSweep = locks, func() {}
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks)})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts)})
+	if opts.Containers != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		s.stopSweep = func() { cancel(); <-done }
+		go func() {
+			defer close(done)
+			s.sweepLoop(ctx, opts.Containers)
+		}()
+	}
 	return s, nil
 }
 
@@ -275,6 +300,7 @@ func (s *Server) Serve() error {
 // server made.
 func (s *Server) Shutdown(ctx context.Context) {
 	s.stopOnce.Do(func() {
+		s.stopSweep()
 		s.endEndless()
 		done := make(chan struct{})
 		go func() {
@@ -434,6 +460,8 @@ type helper struct {
 	// cg serves PrepareSandbox's cgroup part; nil when this helper has no
 	// cgroup parent.
 	cg *sandboxCgroups
+	// ct serves the container's parts that read its snapshot.
+	ct *containerCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -445,10 +473,10 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.fw != nil {
 		served = append(served, firewallFeatures...)
-		served = append(served, rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
-	} else if h.cg != nil {
-		served = append(served, rootdpb.FeaturePrepareSandbox)
 	}
+	// Every helper serves the container's files part (M1 PR 7), so every
+	// helper serves the two calls that carry parts.
+	served = append(served, rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 	if h.eg != nil {
 		served = append(served, egressFeatures...)
 	}
@@ -459,13 +487,14 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 }
 
 // servedParts are the parts of PrepareSandbox and ReleaseSandbox this
-// helper serves: the firewall's, and the cgroup part with a cgroup parent.
+// helper serves: the firewall's, the cgroup part with a cgroup parent, and
+// the container's parts, which every helper serves.
 func (h helper) servedParts() []string {
 	parts := h.fw.servedParts()
 	if h.cg != nil {
 		parts = append(parts, rootdpb.PartCgroup)
 	}
-	return parts
+	return append(parts, h.ct.served()...)
 }
 
 // containerKey is the per-object lock key of a container's files (D11).
@@ -504,22 +533,29 @@ func (h helper) SandboxRules(ctx context.Context, req *rootdpb.SandboxRulesReque
 }
 
 func (h helper) PrepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error) {
-	if h.fw == nil && h.cg == nil {
-		return nil, noNetwork(rootdpb.FeaturePrepareSandbox)
-	}
 	resp, err := h.prepareSandbox(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_PrepareSandbox_FullMethodName, resp, err)
 }
 
 // prepareSandbox hands a request with the cgroup part to its own handler,
-// alone (cgroup.go), and every other to the firewall's.
+// alone (cgroup.go), one with a container's parts to theirs (container.go),
+// and every other to the firewall's.
 func (h helper) prepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error) {
+	if hasContainerPart(req.GetParts()) && !slices.Contains(req.GetParts(), rootdpb.PartCgroup) {
+		return h.prepareContainer(ctx, req)
+	}
+	if req.GetContainerId() != "" || req.GetSetup() != nil {
+		if err := noUnknownFields(req); err != nil {
+			return nil, err
+		}
+		return nil, badRequest("root helper: a container named without a container's part")
+	}
 	if !slices.Contains(req.GetParts(), rootdpb.PartCgroup) {
 		if req.GetCgroup() != nil {
 			return nil, badRequest("root helper: a cgroup sent without the cgroup part")
 		}
 		if h.fw == nil {
-			return nil, errSkew("root helper: this helper serves PrepareSandbox's cgroup part only; it has no network configuration")
+			return nil, errSkew("root helper: this helper has no network configuration, so it serves no netns or firewall part")
 		}
 		return h.fw.prepare(ctx, req)
 	}
@@ -536,11 +572,29 @@ func (h helper) prepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxR
 }
 
 func (h helper) ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) (*rootdpb.ReleaseSandboxResponse, error) {
-	if h.fw == nil {
-		return nil, noNetwork(rootdpb.FeatureReleaseSandbox)
-	}
-	resp, err := h.fw.release(ctx, req)
+	resp, err := h.releaseSandbox(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_ReleaseSandbox_FullMethodName, resp, err)
+}
+
+// releaseSandbox hands the files part to its own handler (container.go),
+// alone, and every other request to the firewall's.
+func (h helper) releaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) (*rootdpb.ReleaseSandboxResponse, error) {
+	if slices.Contains(req.GetParts(), rootdpb.PartFiles) {
+		return h.releaseContainer(ctx, req)
+	}
+	if req.GetContainerId() != "" {
+		if err := noUnknownFields(req); err != nil {
+			return nil, err
+		}
+		return nil, badRequest("root helper: a container named without the files part")
+	}
+	if h.fw == nil {
+		if err := noUnknownFields(req); err != nil {
+			return nil, err
+		}
+		return nil, errSkew("root helper: this helper serves ReleaseSandbox's files part only; it has no network configuration")
+	}
+	return h.fw.release(ctx, req)
 }
 
 func (h helper) BridgeProbe(ctx context.Context, req *rootdpb.BridgeProbeRequest) (*rootdpb.BridgeProbeResponse, error) {

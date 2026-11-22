@@ -140,7 +140,7 @@ func TestFirewallNotOpen(t *testing.T) {
 		t.Fatalf("the second open: %v (%d opens)", err, opens)
 	}
 	v, err := c.Version(ctx, &rootdpb.VersionRequest{})
-	if err != nil || !slices.Equal(v.GetParts(), []string{rootdpb.PartNetns, rootdpb.PartFirewall}) || !slices.Contains(v.GetFeatures(), rootdpb.FeaturePrepareSandbox) {
+	if err != nil || !slices.Equal(v.GetParts(), []string{rootdpb.PartNetns, rootdpb.PartFirewall, rootdpb.PartFiles}) || !slices.Contains(v.GetFeatures(), rootdpb.FeaturePrepareSandbox) {
 		t.Fatalf("Version = %v, %v", v, err)
 	}
 	none := newRig(t, nil)
@@ -155,8 +155,8 @@ func TestFirewallNotOpen(t *testing.T) {
 	} {
 		wantCode(t, call(), codes.Unimplemented)
 	}
-	if v, _ := nc.Version(ctx, &rootdpb.VersionRequest{}); len(v.GetParts()) != 0 {
-		t.Fatalf("a helper with no network lists parts %v", v.GetParts())
+	if v, _ := nc.Version(ctx, &rootdpb.VersionRequest{}); !slices.Equal(v.GetParts(), []string{rootdpb.PartFiles}) {
+		t.Fatalf("a helper with no network lists parts %v, want the container's files part alone", v.GetParts())
 	}
 }
 
