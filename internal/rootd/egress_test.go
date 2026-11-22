@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
@@ -25,6 +28,8 @@ type fakeEgress struct {
 	fail     error
 	cgroups  map[int][]string // pid -> what each read of its cgroup says, in turn
 	matched  []string
+	// block, when set, holds every lookup until it is closed.
+	block chan struct{}
 }
 
 func (f *fakeEgress) rec(format string, args ...any) {
@@ -70,6 +75,12 @@ func (f *fakeEgress) ProcCgroup(pid int) (string, error) {
 
 func (f *fakeEgress) Match(m rootpolicy.ProcessMatch) ([]string, bool, error) {
 	f.rec("match %d %s %s %v", m.PID, m.Local, m.Remote, m.Paths)
+	f.mu.Lock()
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	if f.fail != nil {
 		return nil, false, f.fail
 	}
@@ -169,6 +180,55 @@ func TestMatchProcess(t *testing.T) {
 	newer.ProtoReflect().SetUnknown(protowire.AppendVarint(protowire.AppendTag(nil, 99, protowire.VarintType), 1))
 	_, err = c.MatchProcess(ctx, newer)
 	wantCode(t, err, codes.Unimplemented)
+}
+
+// TestMatchProcessIsBounded: a lookup the kernel makes slow (a sandbox with
+// many processes and sockets) answers within matchTimeout, and the lookups
+// running at once, given up on or not, and those waiting stay within their
+// bounds; past them a call is answered at once. On the base a slow lookup
+// held its call for as long as the agent waited, and nothing bounded how
+// many ran.
+func TestMatchProcessIsBounded(t *testing.T) {
+	prevCalls, prevWait, prevTimeout := maxMatchCalls, maxMatchWaiting, matchTimeout
+	maxMatchCalls, maxMatchWaiting, matchTimeout = 2, 1, 100*time.Millisecond
+	t.Cleanup(func() { maxMatchCalls, maxMatchWaiting, matchTimeout = prevCalls, prevWait, prevTimeout })
+	_, c, fe := egressRig(t)
+	fe.block = make(chan struct{})
+	t.Cleanup(func() { close(fe.block) })
+	req := func(pid uint32) *rootdpb.MatchProcessRequest {
+		fe.mu.Lock()
+		fe.cgroups[int(pid)] = []string{"0::/aerolvm/sb-1", "0::/aerolvm/sb-1"}
+		fe.mu.Unlock()
+		return &rootdpb.MatchProcessRequest{Pid: pid, Local: "10.88.0.5:40000", Remote: "1.2.3.4:443", Paths: []string{"/bin/sh"}}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := c.MatchProcess(ctx, req(100))
+	if took := time.Since(start); status.Code(err) != codes.Aborted || took > 2*time.Second {
+		t.Fatalf("a slow lookup = %v after %v, want Aborted after about %v", err, took, matchTimeout)
+	}
+	// The given-up lookup still holds its turn: one more may run, one may
+	// wait, and the next is turned away at once.
+	errs := make(chan error, 2)
+	for _, pid := range []uint32{101, 102} {
+		go func() {
+			_, err := c.MatchProcess(ctx, req(pid))
+			errs <- err
+		}()
+	}
+	waitFor(t, func() bool { return len(fe.recorded()) >= 2 })
+	time.Sleep(20 * time.Millisecond) // the third is now waiting for a turn
+	start = time.Now()
+	_, err = c.MatchProcess(ctx, req(103))
+	if status.Code(err) != codes.ResourceExhausted || time.Since(start) > time.Second || !strings.Contains(err.Error(), "executable lookups") {
+		t.Fatalf("past the bound = %v after %v", err, time.Since(start))
+	}
+	for range 2 {
+		if err := <-errs; status.Code(err) != codes.Aborted {
+			t.Fatalf("a lookup within the bound = %v", err)
+		}
+	}
 }
 
 func TestEgressCallsWithoutANetwork(t *testing.T) {

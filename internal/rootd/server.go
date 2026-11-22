@@ -629,7 +629,7 @@ func (h helper) MatchProcess(ctx context.Context, req *rootdpb.MatchProcessReque
 	if h.eg == nil {
 		return nil, noNetwork(rootdpb.FeatureMatchProcess)
 	}
-	resp, err := h.eg.matchProcess(req)
+	resp, err := h.eg.matchProcess(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_MatchProcess_FullMethodName, resp, err)
 }
 
