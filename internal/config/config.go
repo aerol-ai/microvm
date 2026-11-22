@@ -77,6 +77,15 @@ const (
 	maxBuildContextID = math.MaxUint32 - 1
 )
 
+// Rootless BuildKit (plans/security-gaps-m1-m4.md §3.5 PR 10b, eng review
+// D14). DefaultBuildKitRootlessAddr is where install.sh's rootless
+// buildkit.service listens; DefaultBuildMaxImageBytes bounds the OCI archive
+// one rootless build hands sandboxd.
+const (
+	DefaultBuildKitRootlessAddr       = "unix:///run/aerolvm-buildkit/buildkitd.sock"
+	DefaultBuildMaxImageBytes   int64 = 16 << 30
+)
+
 // NodeRole values for SB_NODE_ROLE. The role partitions which components a
 // cluster-mode daemon runs (Raft voter promotion, sandbox worker work, public
 // ingress reconciler). Default is NodeRoleMixed — every node runs every
@@ -337,6 +346,20 @@ type Config struct {
 	// the unpacking cannot write to the host as root. Nothing else on the
 	// host may run as these ids. SB_CONTAINERD_BUILD_CONTEXT_ID_BASE.
 	ContainerdBuildContextIDBase int
+	// ContainerdBuildKitRootless sends image builds to a rootless buildkitd
+	// (BuildKit's rootless mode, OCI worker). The build is exported as an
+	// OCI archive, which sandboxd imports into containerd itself: through
+	// the root helper's gate in privilege mode split, so sandboxd holds no
+	// root-level socket. Off is today's buildkitd, root, whose containerd
+	// worker writes the image straight into the store.
+	// SB_CONTAINERD_BUILDKIT_ROOTLESS; absent follows the privilege mode:
+	// on in split, the only way split builds, and off in single (eng review
+	// D22: single is today's mode). Split with it set false fails boot.
+	ContainerdBuildKitRootless bool
+	// ContainerdBuildMaxImageBytes bounds the OCI archive one rootless build
+	// exports: sandboxd stops reading, and the build fails, past it.
+	// SB_CONTAINERD_BUILD_MAX_IMAGE_BYTES; default 16 GiB.
+	ContainerdBuildMaxImageBytes int64
 	// ContainerdNetnsPoolRefillInterval is the native netns pool's refill
 	// backstop tick. A claim from the warm queue wakes the refiller at
 	// once; the tick covers freed slots, failed refills and the retry of
@@ -3121,6 +3144,9 @@ func load(keyTool bool) (Config, error) {
 	if cfg.PrivilegeMode, err = privmode.Parse(os.Getenv("SB_PRIVILEGE_MODE")); err != nil {
 		return Config{}, err
 	}
+	if err := resolveBuildKitMode(&cfg); err != nil {
+		return Config{}, err
+	}
 	if !filepath.IsAbs(cfg.RootdSocket) {
 		return Config{}, fmt.Errorf("SB_ROOTD_SOCKET must be an absolute path, got %q", cfg.RootdSocket)
 	}
@@ -4309,6 +4335,41 @@ func loadDiskFloorRatio() (float64, error) {
 		return 0, fmt.Errorf("SB_DISK_FLOOR_RATIO must be 0 (off) or a fraction below 1 such as 0.10, got %q", raw)
 	}
 	return ratio, nil
+}
+
+// resolveBuildKitMode reads SB_CONTAINERD_BUILDKIT_ROOTLESS and
+// SB_CONTAINERD_BUILD_MAX_IMAGE_BYTES against the privilege mode already
+// parsed. Neither guesses at a value it cannot read: the first decides
+// whether a root-level socket stays in sandboxd's hands. A rootless node
+// whose SB_CONTAINERD_BUILDKIT_ADDR is unset talks to install.sh's rootless
+// socket.
+func resolveBuildKitMode(cfg *Config) error {
+	raw := strings.TrimSpace(os.Getenv("SB_CONTAINERD_BUILDKIT_ROOTLESS"))
+	if raw == "" {
+		cfg.ContainerdBuildKitRootless = cfg.PrivilegeMode == privmode.Split
+	} else {
+		on, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("SB_CONTAINERD_BUILDKIT_ROOTLESS=%q: want true or false", raw)
+		}
+		if !on && cfg.PrivilegeMode == privmode.Split {
+			return errors.New("SB_PRIVILEGE_MODE=split builds images only with rootless BuildKit " +
+				"(SB_CONTAINERD_BUILDKIT_ROOTLESS=true): a root buildkitd writes into containerd past the root helper's gate")
+		}
+		cfg.ContainerdBuildKitRootless = on
+	}
+	if cfg.ContainerdBuildKitRootless && strings.TrimSpace(os.Getenv("SB_CONTAINERD_BUILDKIT_ADDR")) == "" {
+		cfg.ContainerdBuildKitAddr = DefaultBuildKitRootlessAddr
+	}
+	cfg.ContainerdBuildMaxImageBytes = DefaultBuildMaxImageBytes
+	if raw := strings.TrimSpace(os.Getenv("SB_CONTAINERD_BUILD_MAX_IMAGE_BYTES")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("SB_CONTAINERD_BUILD_MAX_IMAGE_BYTES must be a positive number of bytes, got %q", raw)
+		}
+		cfg.ContainerdBuildMaxImageBytes = n
+	}
+	return nil
 }
 
 // validateBridgeSubnet checks SB_CONTAINERD_BRIDGE_SUBNET when set: an IPv4
