@@ -65,6 +65,9 @@ type rootlessRig struct {
 	// rkSHA is the pin the run checks RootlessKit's tarball against: the
 	// real stand-in's, whatever rk is changed to after.
 	rkSHA string
+	// mode is install.sh's --privilege-mode for the run; empty leaves
+	// PRIVILEGE_MODE unset, as on a node from before the flag.
+	mode string
 }
 
 func newRootlessRig(t *testing.T) *rootlessRig {
@@ -133,7 +136,7 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 		"APPARMOR_USERNS_KNOB='" + filepath.Join(r.dir, "no-knob") + "'\n" +
 		"BUILDKIT_ROOTLESS_CONFIG_DIR='" + r.cfgDir + "'\nSANDBOXD_ENV_DIR='" + r.envDir + "'\n" +
 		"BUILDKIT_BUILD_USER=aerolvm-build\nBUILDKIT_ROOTLESS_STATE_DIR=/var/lib/aerolvm-buildkit\nBUILDKIT_SUBID_RANGE=2100000000-2100065535\n" +
-		"INSTALL_PREFIX=/usr/local/bin\nBUILDKIT_ROOTLESS='" + flag + "'\nAPT_UPDATED=true\n" +
+		"INSTALL_PREFIX=/usr/local/bin\nBUILDKIT_ROOTLESS='" + flag + "'\nAPT_UPDATED=true\nSANDBOXD_USER=sandboxd\n" +
 		"BUILDKIT_SHA256_AMD64='" + sha256Hex(r.tarball) + "'\nROOTLESSKIT_SHA256_X86_64='" + r.rkSHA + "'\n" +
 		"uname() { echo x86_64; }\n" +
 		"systemctl() { echo \"systemctl $*\" >>\"$LOG\"; }\n" +
@@ -150,8 +153,11 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 	for _, fn := range []string{"install_buildkit", "install_buildkit_rootless", "buildkit_unit", "buildkit_rootless_unit",
 		"build_net_unit", "buildkit_version_at", "rootlesskit_version_at", "buildkit_unit_is_ours_on_host_net",
 		"buildkit_unit_is_ours_rootless", "ensure_buildkit_build_user", "ensure_rootlesskit_apparmor",
-		"buildkit_steps_conflist", "buildkit_rootless_config", "node_env_value"} {
+		"buildkit_steps_conflist", "buildkit_rootless_config", "node_env_value", "buildkit_split_dropin"} {
 		script += extractShellFunc(t, src, fn)
+	}
+	if r.mode != "" {
+		script += "PRIVILEGE_MODE='" + r.mode + "'\n"
 	}
 	script += "install_buildkit\necho DONE\n"
 	cmd := exec.Command("bash", "-c", script)
@@ -394,5 +400,77 @@ func TestRootlessKitAppArmorProfile(t *testing.T) {
 		if calls, _ := os.ReadFile(log); strings.TrimSpace(string(calls)) != "apparmor_parser -r "+profile {
 			t.Errorf("apparmor_parser calls %q", calls)
 		}
+	}
+}
+
+// Privilege mode split (M1 PR 10): sandboxd's user reaches rootless
+// BuildKit's socket by an ACL that a drop-in sets as root, never by joining
+// aerolvm-build, whose members may run RootlessKit and make user
+// namespaces. The rootless unit itself is the same in both modes.
+func TestInstallBuildkitRootlessSplitACL(t *testing.T) {
+	r := newRootlessRig(t)
+	if _, _, err := r.run(t, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	single, _ := os.ReadFile(r.unit)
+	dropin := r.unit + ".d/privilege-split.conf"
+	if _, err := os.Stat(dropin); err == nil {
+		t.Fatal("single mode wrote the split drop-in")
+	}
+	src := installShSource(t)
+	mustWrite(t, filepath.Join(r.bin, "buildkitd"), "#!/bin/sh\necho 'buildkitd github.com/moby/buildkit "+installShVarSafety(t, src, "BUILDKIT_VERSION")+" 0123abcd'\n")
+
+	r.mode = "split"
+	calls, _, err := r.run(t, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkCalls(t, calls, []string{"systemctl daemon-reload", "systemctl restart --no-block buildkit.service"}, []string{"GET ", "aerolvm-build sandboxd", "usermod -aG"})
+	if got, _ := os.ReadFile(r.unit); string(got) != string(single) {
+		t.Fatalf("split changed the rootless unit itself:\n%s", got)
+	}
+	got, err := os.ReadFile(dropin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{
+		"ExecStartPre=-+/usr/bin/setfacl -m u:sandboxd:x /run/aerolvm-buildkit",
+		// systemd reads $$ as $: the shell sees $((i+1)) and $i.
+		"ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=$$((i+1)); [ $$i -lt 600 ] || exit 1; sleep 0.2; done; exec /usr/bin/setfacl -m u:sandboxd:rw /run/aerolvm-buildkit/buildkitd.sock'",
+	} {
+		if !strings.Contains(string(got), w+"\n") {
+			t.Errorf("drop-in lacks %q:\n%s", w, got)
+		}
+	}
+	// Again: nothing changed, nothing restarts.
+	calls, _, err = r.run(t, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkCalls(t, calls, nil, []string{"daemon-reload", "systemctl restart"})
+
+	// Back to single: the drop-in goes, and BuildKit restarts without it.
+	r.mode = "single"
+	calls, _, err = r.run(t, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkCalls(t, calls, []string{"systemctl daemon-reload", "systemctl restart --no-block buildkit.service"}, nil)
+	if _, err := os.Stat(dropin); err == nil {
+		t.Fatal("the split drop-in outlived the switch back to single")
+	}
+
+	// From split straight to the root BuildKit: the drop-in, which names
+	// the rootless socket's folder, goes too.
+	r.mode = "split"
+	if _, _, err := r.run(t, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.mode = ""
+	if _, _, err := r.run(t, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dropin); err == nil {
+		t.Fatal("the split drop-in outlived --no-buildkit-rootless")
 	}
 }
