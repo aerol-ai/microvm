@@ -295,6 +295,22 @@ jobs:
           go build -trimpath -ldflags "$LDFLAGS" -o dist/aerolvm-supervisor_${{ matrix.suffix }} ./cmd/aerolvm-supervisor
           chmod 0755 dist/aerolvm-supervisor_${{ matrix.suffix }}
 
+      # The root helper (cmd/aerolvm-rootd, plans/security-gaps-m1-m4.md M1),
+      # which install.sh --privilege-mode split installs on a VM. Static, like
+      # toolboxd. The sign-rootd job signs it; a VM installs it only when
+      # that signature checks against internal/rootswap/release-keys.pub.
+      - name: Build aerolvm-rootd (Linux amd64 and arm64)
+        if: matrix.goos == 'linux' && (matrix.goarch == 'amd64' || matrix.goarch == 'arm64')
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "$LDFLAGS" -o dist/aerolvm-rootd_${{ matrix.suffix }} ./cmd/aerolvm-rootd
+          chmod 0755 dist/aerolvm-rootd_${{ matrix.suffix }}
+
       # The Kubernetes operator (operator/, its own Go module, P2); the
       # images job packs it into aerolvm-operator. Static.
       - name: Build aerolvm-operator (Linux amd64 and arm64)
@@ -563,9 +579,82 @@ jobs:
           subject-digest: ${{ env.CHART_DIGEST }}
           push-to-registry: true
 
+  # The root helper's signature (internal/rootswap; cmd/aerolvm-rootd-sign;
+  # plans/security-gaps-m1-m4.md §3.3 "Upgrades"). A VM in privilege mode
+  # split installs aerolvm-rootd only when its manifest is signed by a key
+  # built into sandboxd (internal/rootswap/release-keys.pub). The private key
+  # is the secret AEROLVM_ROOTD_SIGNING_KEY of the `release` environment,
+  # which only this job reads, so the publish job, its actions and its token
+  # never see it. Without the secret (a fork, or before the owner set it up)
+  # the signing step is skipped and the release ships the helper unsigned,
+  # which install.sh --privilege-mode split refuses; nothing else changes.
+  sign-rootd:
+    name: Sign the root helper
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      ROOTD_SIGNING_KEY: ${{ secrets.AEROLVM_ROOTD_SIGNING_KEY }}
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag reaches the signed manifest.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download the root helper builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-linux_{amd64,arm64}
+          merge-multiple: true
+          path: dist
+
+      # The signing tool runs the amd64 helper first and signs only if it
+      # reports this release, then writes <binary>.manifest and .sig. The
+      # check after it is the one a VM makes, against the public keys in
+      # this tree: a key that does not match fails the release here.
+      - name: Sign aerolvm-rootd
+        if: env.ROOTD_SIGNING_KEY != ''
+        run: |
+          key="$RUNNER_TEMP/rootd-signing.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$ROOTD_SIGNING_KEY" > "$key")
+          go run ./cmd/aerolvm-rootd-sign -key "$key" -version "$VERSION" dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64
+          go run ./cmd/aerolvm-rootd-sign -verify internal/rootswap/release-keys.pub dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64
+          mkdir -p signed
+          cp dist/aerolvm-rootd_linux_*.manifest dist/aerolvm-rootd_linux_*.sig signed/
+
+      - name: Say the root helper is unsigned
+        if: env.ROOTD_SIGNING_KEY == ''
+        run: echo "::warning::AEROLVM_ROOTD_SIGNING_KEY is not set for the release environment, so this release's aerolvm-rootd is unsigned and install.sh --privilege-mode split refuses it."
+
+      - name: Upload the signatures
+        if: env.ROOTD_SIGNING_KEY != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-rootd-signatures
+          path: signed/
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: [hold-latest, build, cli]
+    needs: [hold-latest, build, cli, sign-rootd]
     runs-on: ubuntu-latest
     permissions:
       attestations: write
