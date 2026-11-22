@@ -80,6 +80,9 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wazero" },
 		// A warm pool the resident host makes moot is never wired.
 		func(c *config.Config) { wasmSplit(c); c.WasmPoolEnabled = true },
+		// M1 PR 9b: Firecracker VMs, through the helper's jailer, on a
+		// node whose network rules are off.
+		func(c *config.Config) { c.EnableFirecracker, c.UseJailer = true, true },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -105,10 +108,19 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// The helper jails every group it runs: an unjailed one is single
 		// mode only, for good.
 		{"V8 isolates unjailed", func(c *config.Config) { c.EnableIsolate = true }, "SB_ISOLATE_USE_JAIL=true", nil},
-		{"Firecracker", func(c *config.Config) { c.EnableFirecracker = true }, "Firecracker", []privmode.Step{privmode.StepFirecracker}},
+		// The helper runs every VM through its jailer: an unjailed one is
+		// single mode only.
+		{"Firecracker unjailed", func(c *config.Config) { c.EnableFirecracker = true }, "SB_FIRECRACKER_USE_JAILER=true", nil},
+		{"Firecracker with network rules", func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true },
+			"Firecracker guests' firewall", []privmode.Step{privmode.StepFirecrackerGuestRules}},
+		{"the warm VM pool", func(c *config.Config) {
+			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
+		},
+			"warm VM pool", []privmode.Step{privmode.StepFirecrackerSnapshots}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
-		{"several at once, each named", func(c *config.Config) { c.GvisorCheckpointMoves, c.EnableFirecracker = true, true }, "Firecracker",
-			[]privmode.Step{privmode.StepFirecracker, privmode.StepMoves}},
+		{"several at once, each named", func(c *config.Config) {
+			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true, true
+		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerGuestRules, privmode.StepMoves}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()

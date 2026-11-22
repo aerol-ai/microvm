@@ -634,3 +634,36 @@ func TestBuild_DefaultTag(t *testing.T) {
 		t.Fatalf("unexpected oci-meta: %q", meta)
 	}
 }
+
+// TestBuild_MkfsSeam: with Config.Mkfs set (privilege mode split), the
+// image is made through it, with the unpacked rootfs, the output and the
+// size the pipeline worked out, and mkfs.ext4 is not run here.
+func TestBuild_MkfsSeam(t *testing.T) {
+	cfg, _ := happyConfig(t)
+	cfg.Mkfs4Bin = writeFake(t, t.TempDir(), "mkfs.ext4", "echo ran >&2; exit 1")
+	var gotSrc, gotOut string
+	var gotSize int
+	cfg.Mkfs = func(_ context.Context, src, out string, size int) error {
+		gotSrc, gotOut, gotSize = src, out, size
+		return os.WriteFile(out, []byte("image"), 0o600)
+	}
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "rootfs.ext4")
+	res, err := b.Build(context.Background(), BuildRequest{ImageRef: "docker://alpine", OutPath: out, MinSizeMiB: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.CleanupDir() }()
+	if gotOut != out || filepath.Base(gotSrc) != "rootfs" || gotSize != 300 {
+		t.Fatalf("seam got %q %q %d", gotSrc, gotOut, gotSize)
+	}
+	cfg.Mkfs = func(context.Context, string, string, int) error { return os.ErrPermission }
+	b, _ = New(cfg)
+	if _, err := b.Build(context.Background(), BuildRequest{ImageRef: "docker://alpine", OutPath: out}); err == nil ||
+		!strings.Contains(err.Error(), "mkfs.ext4") {
+		t.Fatalf("a seam that fails: %v", err)
+	}
+}

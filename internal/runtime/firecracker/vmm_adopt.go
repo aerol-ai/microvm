@@ -138,7 +138,8 @@ func (d *Driver) register(sandboxID string, client VMMClient, handle VMMHandle, 
 // the ownership lease cannot freeze it: logged, and Freeze answers
 // ErrCannotFreeze for it.
 func (d *Driver) placeVMM(sandboxID string, pid int) {
-	if pid <= 0 {
+	if pid <= 0 || d.split != nil {
+		// In split mode the root helper starts each VM in its own group.
 		return
 	}
 	if err := moveVMMToCgroup(pid, sandboxID); err != nil && !errors.Is(err, errVMMAdoptionUnsupported) {
@@ -164,6 +165,14 @@ func (d *Driver) FenceReady(sandboxID string) error {
 	if !ok || h == nil || h.Pid() <= 0 {
 		return nil
 	}
+	if d.split != nil {
+		// In split mode the VM runs under the root helper, and sandboxd
+		// cannot freeze it (Freeze): the lease could not hold it while the
+		// cluster recreated it elsewhere, so a recreate-policy VM is not
+		// let run here.
+		return fmt.Errorf("firecracker VM %s runs under the root helper, which sandboxd's ownership lease cannot freeze: %w",
+			sandboxID, sbruntime.ErrCannotFreeze)
+	}
 	child, in, err := vmmGroupOfPID(h.Pid())
 	if err != nil {
 		return fmt.Errorf("firecracker VM %s: cannot tell which cgroup it runs in: %w", sandboxID, err)
@@ -187,12 +196,19 @@ func (d *Driver) FenceReady(sandboxID string) error {
 // same group with sandboxd down (FenceGroup). A VM with no group of its own
 // answers sbruntime.ErrCannotFreeze.
 func (d *Driver) Freeze(_ context.Context, sandboxID string) error {
+	if d.split != nil {
+		// The VM's group is root's: the lease stops the VM instead.
+		return fmt.Errorf("firecracker VM %s runs under the root helper: %w", sandboxID, sbruntime.ErrCannotFreeze)
+	}
 	return setVMMGroupFrozen(sandboxID, true)
 }
 
 // Thaw lets a frozen VM run on, and finishes its adoption if it was
 // adopted frozen.
 func (d *Driver) Thaw(_ context.Context, sandboxID string) error {
+	if d.split != nil {
+		return nil // never frozen (Freeze)
+	}
 	if err := setVMMGroupFrozen(sandboxID, false); err != nil {
 		return err
 	}
@@ -379,7 +395,11 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 		if args, err := processCmdline(pid); err != nil || len(args) == 0 || filepath.Base(args[0]) != "firecracker" {
 			continue
 		}
-		if err := killStrayVMM(pid); err != nil {
+		kill := killStrayVMM
+		if d.split != nil {
+			kill = func(pid int) error { return d.splitKillStray(ctx, pid) }
+		}
+		if err := kill(pid); err != nil {
 			d.logger.Warn("firecracker adopt: leftover VM not killed", "pid", pid, "error", err)
 			continue
 		}
@@ -394,7 +414,13 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 // adoptVM registers the VM rec describes if its sandbox should run, and
 // kills it otherwise. It reports whether the VM was adopted.
 func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) bool {
-	proc, err := openProcess(rec.PID, rec.StartTicks)
+	var proc liveProcess
+	var err error
+	if d.split != nil {
+		proc, err = d.splitOpenProcess(ctx, rec.SandboxID, rec.PID, rec.StartTicks)
+	} else {
+		proc, err = openProcess(rec.PID, rec.StartTicks)
+	}
 	if err != nil {
 		// The VM ended while sandboxd was down; reconcile handles its
 		// sandbox like any other whose VM is gone.
