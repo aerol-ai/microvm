@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/hostport"
+	"github.com/aerol-ai/microvm/internal/rootclient"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	"github.com/aerol-ai/microvm/pkg/caddy"
@@ -69,6 +72,13 @@ func startIngressRouting(ctx context.Context, cfg config.Config, svc routingServ
 	if !cfg.IsWorker() && !cfg.IsIngress() {
 		return b // a pure server node serves no sandbox traffic
 	}
+	engageFwd := fwd
+	if _, unserved := fwd.(unservedForwarder); unserved {
+		// No forwarder to engage with; the refusal below still rolls back
+		// an earlier boot's routing, which fails while the helper cannot
+		// remove its rules, and is retried next boot.
+		engageFwd = nil
+	}
 	routing, err := svc.StartIngressProxyRouting(ctx, service.IngressRoutingOptions{
 		Static: caddy.StaticRouteSpec{
 			RouteDNSAddr: cfg.RouteDNSAddr,
@@ -76,7 +86,7 @@ func startIngressRouting(ctx context.Context, cfg config.Config, svc routingServ
 			ToolboxPort:  cfg.ToolboxPort,
 			LocalIP:      "127.0.0.1",
 		},
-		Forwarder:    fwd,
+		Forwarder:    engageFwd,
 		RedirectAddr: fmt.Sprintf(":%d", cfg.HostPortRedirectPort),
 	})
 	if err != nil {
@@ -153,13 +163,54 @@ func (b *ingressRoutingBoot) writeMarker(v bool) {
 // it: the flag is on, or the previous boot engaged and the rollback must
 // remove its rules. Otherwise nil without probing iptables, so a node the
 // flag does not apply to (macOS local mode has no iptables) logs no warning
-// about a feature it is not using.
-func hostPortForwarderFor(cfg config.Config, logger *slog.Logger) service.HostPortForwarder {
+// about a feature it is not using. In privilege mode split (helper set)
+// the root helper writes the rules (splitHostPortForwarder).
+func hostPortForwarderFor(ctx context.Context, cfg config.Config, helper *rootclient.Client, logger *slog.Logger) service.HostPortForwarder {
 	if !cfg.IngressProxyRouting && !readBypassMarker(ingressRoutingMarkerPath(cfg)) {
 		return nil
 	}
+	if helper != nil {
+		return splitHostPortForwarder(ctx, cfg, helper, logger)
+	}
 	return newHostPortForwarder(logger)
 }
+
+// hostPortRequireTimeout bounds the boot's one check that the helper
+// forwards host ports (the helper was already waited for at boot).
+const hostPortRequireTimeout = 10 * time.Second
+
+// splitHostPortForwarder is the forwarder through the root helper (M1 PR
+// 5b). When the helper does not forward host ports (one release back, or
+// not answering in time), the routing engage is refused and the node keeps
+// per-sandbox Caddy routes, which sandboxd writes without root. If a
+// previous boot engaged routing, its rules may be in the kernel: the
+// forwarder is then unservedForwarder, whose every call fails, so the
+// rollback fails, the marker stays, and the next boot retries it. A
+// rollback is never recorded as done while rules may remain.
+func splitHostPortForwarder(ctx context.Context, cfg config.Config, helper *rootclient.Client, logger *slog.Logger) service.HostPortForwarder {
+	rctx, cancel := context.WithTimeout(ctx, hostPortRequireTimeout)
+	defer cancel()
+	if err := helper.Require(rctx, rootdpb.FeatureHostPort); err != nil {
+		logger.Warn("the root helper does not forward host ports; ingress proxy routing stays off on this node", "error", err)
+		if readBypassMarker(ingressRoutingMarkerPath(cfg)) {
+			return unservedForwarder{fmt.Errorf("the root helper does not forward host ports, so the kernel rules an earlier boot wrote cannot be removed yet: %w", err)}
+		}
+		return nil
+	}
+	return rootclient.NewHostPortForwarder(helper, func(ports []int) {
+		logger.Warn("host ports left unforwarded: their sandboxes went while the set was made", "host_ports", ports)
+	})
+}
+
+// unservedForwarder stands in for a forwarder the helper does not serve
+// while an earlier boot's rules may be in the kernel: every call fails
+// with why. startIngressRouting never engages routing with it.
+type unservedForwarder struct{ err error }
+
+func (u unservedForwarder) Ensure(int, hostport.Target) error       { return u.err }
+func (u unservedForwarder) Remove(int) error                        { return u.err }
+func (u unservedForwarder) PruneUnasserted() error                  { return u.err }
+func (u unservedForwarder) Reconcile(map[int]hostport.Target) error { return u.err }
 
 // newHostPortForwarder returns the kernel forwarder, or nil where iptables
 // is unavailable. It returns an interface, never a typed nil, so the

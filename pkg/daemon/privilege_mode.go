@@ -53,9 +53,10 @@ func checkPrivilegeMode(cfg config.Config) error {
 	}
 	var gaps []privmode.Step
 	// The host firewall (SB_ENABLE_NETWORK_RULES) and enterprise mode's
-	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go), and the
-	// hostname gateway's host side (SB_EGRESS_FQDN_ENABLED) from PR 5b
-	// (split_egress.go).
+	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go); the
+	// hostname gateway's host side (SB_EGRESS_FQDN_ENABLED, split_egress.go)
+	// and ingress proxy routing's host ports (SB_INGRESS_PROXY_ROUTING,
+	// splitHostPortForwarder) from PR 5b.
 	if cfg.ContainerdPoolEnabled {
 		gaps = append(gaps, privmode.StepWarmPool)
 	}
@@ -64,11 +65,6 @@ func checkPrivilegeMode(cfg config.Config) error {
 	}
 	if cfg.GvisorCheckpointMoves {
 		gaps = append(gaps, privmode.StepMoves)
-	}
-	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
-		// The kernel forwarder writes iptables rules at boot, and again to
-		// roll back after a boot that engaged it (hostPortForwarderFor).
-		gaps = append(gaps, privmode.StepHostPorts)
 	}
 	return privmode.NotYet("start sandboxd", gaps...)
 }

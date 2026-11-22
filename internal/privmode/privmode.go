@@ -58,7 +58,6 @@ const (
 	StepContainerFile Step = "container_files"
 	StepWarmPool      Step = "warm_pool"
 	StepMoves         Step = "gvisor_moves"
-	StepHostPorts     Step = "host_ports"
 	StepBuilds        Step = "image_builds"
 )
 
@@ -72,7 +71,6 @@ var steps = map[Step]string{
 	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
 	StepWarmPool:      "the containerd warm pool's parked sandboxes",
 	StepMoves:         "gVisor checkpoint moves",
-	StepHostPorts:     "raw-TCP host-port forwarding (ingress proxy routing, SB_INGRESS_PROXY_ROUTING)",
 	StepBuilds:        "image builds (buildkitd's root socket, and the build-context unpacker's own uids)",
 }
 

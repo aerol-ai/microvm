@@ -50,6 +50,7 @@ const (
 	RootHelper_ReleaseSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/ReleaseSandbox"
 	RootHelper_BridgeProbe_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/BridgeProbe"
 	RootHelper_MatchProcess_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/MatchProcess"
+	RootHelper_HostPort_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/HostPort"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -126,6 +127,14 @@ type RootHelperClient interface {
 	// executables holds one connection (per-binary egress rules).
 	BridgeProbe(ctx context.Context, in *BridgeProbeRequest, opts ...grpc.CallOption) (*BridgeProbeResponse, error)
 	MatchProcess(ctx context.Context, in *MatchProcessRequest, opts ...grpc.CallOption) (*MatchProcessResponse, error)
+	// HostPort forwards raw-TCP host ports of this node in the kernel, for
+	// ingress proxy routing (plans/ingress-proxy-routing.md §3.5; M1 PR 5b),
+	// as sandboxd's hostport.Forwarder does in privilege mode single: sets
+	// one port's forward, removes one, or makes the node's set exactly a
+	// list. The helper takes only ports of its own host-port range, and
+	// hands them only to a leased sandbox address, another node's host port,
+	// or sandboxd's own listener.
+	HostPort(ctx context.Context, in *HostPortRequest, opts ...grpc.CallOption) (*HostPortResponse, error)
 }
 
 type rootHelperClient struct {
@@ -326,6 +335,16 @@ func (c *rootHelperClient) MatchProcess(ctx context.Context, in *MatchProcessReq
 	return out, nil
 }
 
+func (c *rootHelperClient) HostPort(ctx context.Context, in *HostPortRequest, opts ...grpc.CallOption) (*HostPortResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostPortResponse)
+	err := c.cc.Invoke(ctx, RootHelper_HostPort_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -400,6 +419,14 @@ type RootHelperServer interface {
 	// executables holds one connection (per-binary egress rules).
 	BridgeProbe(context.Context, *BridgeProbeRequest) (*BridgeProbeResponse, error)
 	MatchProcess(context.Context, *MatchProcessRequest) (*MatchProcessResponse, error)
+	// HostPort forwards raw-TCP host ports of this node in the kernel, for
+	// ingress proxy routing (plans/ingress-proxy-routing.md §3.5; M1 PR 5b),
+	// as sandboxd's hostport.Forwarder does in privilege mode single: sets
+	// one port's forward, removes one, or makes the node's set exactly a
+	// list. The helper takes only ports of its own host-port range, and
+	// hands them only to a leased sandbox address, another node's host port,
+	// or sandboxd's own listener.
+	HostPort(context.Context, *HostPortRequest) (*HostPortResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -466,6 +493,9 @@ func (UnimplementedRootHelperServer) BridgeProbe(context.Context, *BridgeProbeRe
 }
 func (UnimplementedRootHelperServer) MatchProcess(context.Context, *MatchProcessRequest) (*MatchProcessResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MatchProcess not implemented")
+}
+func (UnimplementedRootHelperServer) HostPort(context.Context, *HostPortRequest) (*HostPortResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method HostPort not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -830,6 +860,24 @@ func _RootHelper_MatchProcess_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_HostPort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HostPortRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).HostPort(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_HostPort_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).HostPort(ctx, req.(*HostPortRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -912,6 +960,10 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MatchProcess",
 			Handler:    _RootHelper_MatchProcess_Handler,
+		},
+		{
+			MethodName: "HostPort",
+			Handler:    _RootHelper_HostPort_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

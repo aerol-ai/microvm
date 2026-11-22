@@ -583,7 +583,9 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 // The hostname gateway's calls (M1 PR 5b): BridgeProbe's set-up replaces
 // what its slot had, its send sends one more probe (the gateway counts
 // flows seen, not their number), and its close is "make sure it is
-// gone"; MatchProcess is a read.
+// gone"; MatchProcess is a read. HostPort sets a port's forward, removes
+// it, or makes the node's set exact: each "make it so", whatever the
+// first attempt did.
 var retrySafe = map[string]bool{
 	rootdpb.FeatureEnsureHost:           true,
 	rootdpb.FeatureEnsureHostFiles:      true,
@@ -603,6 +605,7 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureReleaseSandbox:       true,
 	rootdpb.FeatureBridgeProbe:          true,
 	rootdpb.FeatureMatchProcess:         true,
+	rootdpb.FeatureHostPort:             true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -697,6 +700,9 @@ var networkCalls = map[string]bool{
 	rootdpb.FeatureSandboxRules:   true,
 	rootdpb.FeaturePrepareSandbox: true,
 	rootdpb.FeatureReleaseSandbox: true,
+	// Host-port forwarding waits on the xtables lock, and a node's whole
+	// set (up to its range's ports) is written rule by rule.
+	rootdpb.FeatureHostPort: true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal

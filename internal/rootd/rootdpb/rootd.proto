@@ -130,6 +130,15 @@ service RootHelper {
   // executables holds one connection (per-binary egress rules).
   rpc BridgeProbe(BridgeProbeRequest) returns (BridgeProbeResponse);
   rpc MatchProcess(MatchProcessRequest) returns (MatchProcessResponse);
+
+  // HostPort forwards raw-TCP host ports of this node in the kernel, for
+  // ingress proxy routing (plans/ingress-proxy-routing.md §3.5; M1 PR 5b),
+  // as sandboxd's hostport.Forwarder does in privilege mode single: sets
+  // one port's forward, removes one, or makes the node's set exactly a
+  // list. The helper takes only ports of its own host-port range, and
+  // hands them only to a leased sandbox address, another node's host port,
+  // or sandboxd's own listener.
+  rpc HostPort(HostPortRequest) returns (HostPortResponse);
 }
 
 message VersionRequest {
@@ -459,4 +468,51 @@ message MatchProcessResponse {
   repeated string matched = 1;
   // No process holds it (it closed, or the sandbox cannot be traced).
   bool not_found = 2;
+}
+
+enum HostPortOp {
+  HOST_PORT_OP_UNSPECIFIED = 0;
+  // Make one port's forward exactly forwards[0], whatever forwarded it
+  // before (an earlier helper's rules included).
+  HOST_PORT_OP_SET = 1;
+  // Stop forwarding host_port and cut its tracked connections.
+  HOST_PORT_OP_REMOVE = 2;
+  // Make the node's forwards exactly forwards (none: no forwarding).
+  HOST_PORT_OP_RECONCILE = 3;
+}
+
+// HostPortKind is where a host port is handed on; each has its own rule.
+enum HostPortKind {
+  HOST_PORT_KIND_UNSPECIFIED = 0;
+  // A sandbox on this node: DNAT to address:port, an address the helper's
+  // CNI leased to a slot.
+  HOST_PORT_KIND_SANDBOX = 1;
+  // A sandbox's owner node (an ingress node's hop): DNAT to another
+  // node's address and host port, masqueraded so the owner replies here.
+  HOST_PORT_KIND_PEER = 2;
+  // sandboxd's own listener (a stopped sandbox's wake, a WASM or isolate
+  // mediator): REDIRECT to port, which must be the helper's
+  // SB_HOSTPORT_REDIRECT_PORT. No address.
+  HOST_PORT_KIND_REDIRECT = 3;
+}
+
+message HostPortForward {
+  uint32 host_port = 1;
+  HostPortKind kind = 2;
+  string address = 3;
+  uint32 port = 4;
+}
+
+message HostPortRequest {
+  HostPortOp op = 1;
+  // SET: one. RECONCILE: the whole set, each host port once.
+  repeated HostPortForward forwards = 2;
+  // REMOVE: the port.
+  uint32 host_port = 3;
+}
+
+message HostPortResponse {
+  // RECONCILE: the host ports not forwarded because their sandbox address
+  // is no longer leased (the sandbox went while the list was made).
+  repeated uint32 skipped = 1;
 }

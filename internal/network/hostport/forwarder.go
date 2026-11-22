@@ -119,6 +119,10 @@ type Forwarder struct {
 
 	mu    sync.Mutex
 	rules map[int]Target
+	// foreign are the rules of ours another process wrote, by host port,
+	// read once by the first Set (foreignRead); Reconcile settles them all.
+	foreign     map[int][]foreignRule
+	foreignRead bool
 }
 
 func New(b Backend, flush ConntrackFlusher) *Forwarder {
@@ -300,6 +304,104 @@ func (f *Forwarder) deleteRulesLocked(hp int, t Target) error {
 	return nil
 }
 
+// Set makes host port hp's rules in the kernel exactly t's, or none when
+// t is nil, whatever process wrote them. With t nil it also flushes hp's
+// tracked connections, as Remove does, so an unexpose cuts access. It is
+// the root helper's Ensure and Remove (privilege mode split): a helper
+// that restarts keeps no memory of the rules, and must still replace or
+// remove what an earlier helper process left, which Ensure and Remove,
+// trusting memory, would not. So the first Set reads the three chains
+// once and keeps the rules this process did not write, by host port
+// (foreign); a Set of such a port removes those that do not match t. Every
+// other Set is Ensure or Remove at their cost: the helper is the one
+// writer, and calls Set one at a time.
+func (f *Forwarder) Set(hp int, t *Target) error {
+	if hp <= 0 || hp > 65535 {
+		return fmt.Errorf("hostport: invalid host port %d", hp)
+	}
+	if t != nil {
+		if err := t.valid(); err != nil {
+			return err
+		}
+	}
+	if err := f.ensureChains(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	if err := f.readForeignLocked(); err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	// Each rule is forgotten as it goes, so a delete that fails half way
+	// leaves only the rules still there for the retry to delete.
+	for rules := f.foreign[hp]; len(rules) > 0; rules = rules[1:] {
+		r := rules[0]
+		if t != nil && ruleMatches(r.chain, r.spec, hp, *t) {
+			continue
+		}
+		if err := f.b.Delete(r.table, r.chain, r.spec...); err != nil {
+			f.foreign[hp] = rules
+			f.mu.Unlock()
+			return fmt.Errorf("hostport: delete %s/%s hp=%d: %w", r.table, r.chain, hp, err)
+		}
+	}
+	delete(f.foreign, hp)
+	cur, known := f.rules[hp]
+	if known && (t == nil || cur != *t) {
+		if err := f.deleteRulesLocked(hp, cur); err != nil {
+			f.mu.Unlock()
+			return err
+		}
+		delete(f.rules, hp)
+	}
+	if t != nil {
+		err := f.ensureRulesLocked(hp, *t)
+		if err == nil {
+			f.rules[hp] = *t
+		}
+		f.mu.Unlock()
+		return err
+	}
+	f.mu.Unlock()
+	if f.flush != nil {
+		if err := f.flush(hp); err != nil {
+			return fmt.Errorf("hostport: flush conntrack hp=%d: %w", hp, err)
+		}
+	}
+	return nil
+}
+
+// foreignRule is one rule of ours (by its comment) in the kernel that this
+// process did not write.
+type foreignRule struct {
+	table, chain string
+	spec         []string
+}
+
+// readForeignLocked reads the three chains once per process: every rule of
+// ours for a port this process has not written is foreign. Caller holds
+// f.mu.
+func (f *Forwarder) readForeignLocked() error {
+	if f.foreignRead {
+		return nil
+	}
+	foreign := map[int][]foreignRule{}
+	for _, c := range []struct{ table, chain string }{{"nat", ChainNAT}, {"nat", ChainPost}, {"filter", ChainFwd}} {
+		rules, err := f.b.List(c.table, c.chain)
+		if err != nil {
+			return fmt.Errorf("hostport: list %s/%s: %w", c.table, c.chain, err)
+		}
+		for _, r := range rules {
+			spec, hp, ours := parseRule(r, c.chain)
+			if _, mine := f.rules[hp]; ours && !mine {
+				foreign[hp] = append(foreign[hp], foreignRule{c.table, c.chain, spec})
+			}
+		}
+	}
+	f.foreign, f.foreignRead = foreign, true
+	return nil
+}
+
 // Remove stops forwarding hp and flushes its tracked connections, so an
 // unexpose actually cuts access. It is idempotent.
 func (f *Forwarder) Remove(hp int) error {
@@ -403,6 +505,8 @@ func (f *Forwarder) reconcileLocked(desired map[int]Target) error {
 		next[hp] = t
 	}
 	f.rules = next
+	// The kernel now holds exactly desired: nothing foreign is left.
+	f.foreign, f.foreignRead = nil, true
 	if f.flush != nil {
 		ports := make([]int, 0, len(stale))
 		for hp := range stale {

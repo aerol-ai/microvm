@@ -78,6 +78,8 @@ func TestConfigFromEnv(t *testing.T) {
 		Firewall: FirewallConfig{Backend: "netlink", NodePorts: []rootpolicy.NodePort{
 			{Proto: "udp", Port: 53054}, {Proto: "tcp", Port: 53054}, {Proto: "tcp", Port: 15080},
 			{Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}},
+		// sandboxd's host-port range and redirect listener, its defaults.
+		HostPorts: rootpolicy.HostPortBounds{RangeStart: 22000, RangeEnd: 23000, RedirectPort: 21215},
 	}
 	for _, tc := range []struct {
 		name string
@@ -485,5 +487,27 @@ func TestNodePortsFromEnv(t *testing.T) {
 	}
 	if _, err := nodePortsFromEnv(env(map[string]string{"SB_SANDBOX_NODE_PORTS_ALLOW": "9000"}), true, false); err == nil {
 		t.Fatal("an operator's node ports passed in enterprise mode")
+	}
+}
+
+// TestHostPortsFromEnv: the helper reads the host-port range and the
+// redirect listener under sandboxd's names, and refuses a range sandboxd
+// would refuse.
+func TestHostPortsFromEnv(t *testing.T) {
+	env := func(kv map[string]string) func(string) string { return func(k string) string { return kv[k] } }
+	b, err := hostPortsFromEnv(env(map[string]string{"SB_L4_PORT_RANGE_START": "30000", "SB_L4_PORT_RANGE_END": "30100", "SB_HOSTPORT_REDIRECT_PORT": "29999"}))
+	if err != nil || b != (rootpolicy.HostPortBounds{RangeStart: 30000, RangeEnd: 30100, RedirectPort: 29999}) {
+		t.Fatalf("= %+v %v", b, err)
+	}
+	for _, bad := range []map[string]string{
+		{"SB_L4_PORT_RANGE_START": "80"},
+		{"SB_L4_PORT_RANGE_START": "24000"},
+		{"SB_L4_PORT_RANGE_END": "x"},
+		{"SB_L4_PORT_RANGE_START": "x"},
+		{"SB_HOSTPORT_REDIRECT_PORT": "x"},
+	} {
+		if _, err := hostPortsFromEnv(env(bad)); err == nil {
+			t.Errorf("%v passed", bad)
+		}
 	}
 }

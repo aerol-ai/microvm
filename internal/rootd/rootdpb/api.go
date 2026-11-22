@@ -46,6 +46,7 @@ const (
 	FeatureReleaseSandbox       = "ReleaseSandbox"
 	FeatureBridgeProbe          = "BridgeProbe"
 	FeatureMatchProcess         = "MatchProcess"
+	FeatureHostPort             = "HostPort"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -78,7 +79,7 @@ func Features() []string {
 		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles,
 		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs,
 		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox,
-		FeatureBridgeProbe, FeatureMatchProcess}
+		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.
