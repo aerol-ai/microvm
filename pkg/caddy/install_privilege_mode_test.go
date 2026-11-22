@@ -316,7 +316,11 @@ func TestInstallPrivilegeModeSplit(t *testing.T) {
 	}
 
 	// Back to single: today's unit, byte for byte; the helper and its
-	// drop-ins gone; sandboxd's files back to root.
+	// drop-ins gone; sandboxd's files back to root. What the root sandboxd
+	// would act on by path at its first boot, and sandboxd's user could
+	// write in split, goes first: a record planted in single mode's
+	// upgrade folder, the runtime folders, every link.
+	r.write("varlib/upgrade/planted.json", "{}", 0o600)
 	r.resetLog()
 	out, err = r.run(r.env("SANDBOXD_ACTIVE=true"), append(r.splitRelease("helper v0.7.9\n"), "--privilege-mode", "single")...)
 	if err != nil {
@@ -333,11 +337,28 @@ func TestInstallPrivilegeModeSplit(t *testing.T) {
 		}
 	}
 	calls = r.calls()
-	r.inOrder(calls, "systemctl stop sandboxd", "find "+r.path("varlib")+" -xdev -uid 990 -exec chown -h root {} +",
+	r.inOrder(calls, "systemctl stop sandboxd", "find "+r.path("varlib/upgrade")+" -xdev -delete",
+		"find "+r.path("run")+" -xdev -delete", "find "+r.path("varlib")+" -xdev -type l -delete",
+		"find "+r.path("varlib")+" -xdev -uid 990 -exec chown -h root {} +",
 		"systemctl disable --now aerolvm-rootd.service", "systemctl daemon-reload", "systemctl restart sandboxd")
 	if !strings.Contains(r.read("sandboxd/sandboxd.env"), "SB_CONTAINERD_BUILDKIT_ROOTLESS=true") || strings.Contains(r.read("sandboxd/sandboxd.env"), "SB_PRIVILEGE_MODE") {
 		t.Errorf("sandboxd.env after the switch back:\n%s", r.read("sandboxd/sandboxd.env"))
 	}
+}
+
+// A switch from single to split removes single mode's upgrade folder: split
+// never reads it, and in split it sits in the folder sandboxd's user owns
+// (M1 PR 10 review). A fresh split install has none to remove.
+func TestInstallPrivilegeModeSwitchForgetsTheUpgradeFolder(t *testing.T) {
+	r := newRunRig(t)
+	r.stubEngineSteps()
+	r.write("sandboxd/sandboxd.env", "SB_PAT_TOKEN=kept-pat\nSB_CONTAINER_ENGINE=containerd\n", 0o600)
+	r.write("varlib/upgrade/op.json", "{}", 0o600)
+	args := append(r.splitRelease("helper v0.7.8\n"), "--with-containerd-engine", "--privilege-mode", "split")
+	if out, err := r.run(r.env("SANDBOXD_ACTIVE=true"), args...); err != nil {
+		t.Fatalf("install.sh: %v\n%s", err, out)
+	}
+	r.inOrder(r.calls(), "find "+r.path("varlib/upgrade")+" -xdev -delete", "systemctl stop sandboxd", "systemctl enable --now aerolvm-rootd")
 }
 
 // Single, the default, writes what install.sh wrote before privilege mode

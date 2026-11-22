@@ -434,9 +434,9 @@ func TestInstallBuildkitRootlessSplitACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, w := range []string{
-		"ExecStartPre=-+/usr/bin/setfacl -m u:sandboxd:x /run/aerolvm-buildkit",
+		"ExecStartPre=-+/usr/bin/setfacl -P -m u:sandboxd:x /run/aerolvm-buildkit",
 		// systemd reads $$ as $: the shell sees $((i+1)) and $i.
-		"ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=$$((i+1)); [ $$i -lt 600 ] || exit 1; sleep 0.2; done; exec /usr/bin/setfacl -m u:sandboxd:rw /run/aerolvm-buildkit/buildkitd.sock'",
+		"ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=$$((i+1)); [ $$i -lt 600 ] || exit 1; sleep 0.2; done; exec /usr/bin/setfacl -P -m u:sandboxd:rw /run/aerolvm-buildkit/buildkitd.sock'",
 	} {
 		if !strings.Contains(string(got), w+"\n") {
 			t.Errorf("drop-in lacks %q:\n%s", w, got)

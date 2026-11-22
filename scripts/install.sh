@@ -4433,6 +4433,22 @@ setup_privilege_mode() {
 	install -d -m 0755 "$ROOTD_BIN_DIR"
 	if [[ "$PREVIOUS_PRIVILEGE_MODE" != "split" && -f "$SANDBOXD_ENV_FILE" ]]; then
 		echo "Switching this node to privilege mode split: sandboxd will run as the $SANDBOXD_USER user, and its files become that user's when it next starts. Running sandboxes keep running."
+		forget_single_upgrade_folder
+	fi
+}
+
+# forget_single_upgrade_folder removes single mode's upgrade folder, beside
+# the database, on a switch of mode either way. Split never uses it (its
+# upgrades stage in SPLIT_UPGRADE_STATE_DIR, root's own), and it sits in
+# the folder sandboxd's user owns in split: a record or backup left there
+# must never reach the root sandboxd's boot recovery after a switch back.
+# find, not rm -r: it deletes a link in place of the folder as a link, and
+# stays on this file system.
+forget_single_upgrade_folder() {
+	local dir="/var/lib/sandboxd/upgrade"
+	if [[ -e "$dir" || -L "$dir" ]]; then
+		echo "Removing single mode's upgrade records (${dir}): the other mode never reads them"
+		find "$dir" -xdev -delete
 	fi
 }
 
@@ -4695,8 +4711,11 @@ EOF
 # buildkit_split_dropin prints the rootless buildkit.service drop-in of
 # split: sandboxd's user may enter BuildKit's runtime folder and use its
 # socket, by an ACL on each, set as root. It never joins the build user's
-# group, which may run RootlessKit and so make user namespaces. buildkitd
-# makes its socket after it starts, so the socket's ACL waits for it, two
+# group, which may run RootlessKit and so make user namespaces. setfacl -P
+# skips a symbolic link: the build user owns that folder and could leave a
+# link where the socket goes, and root must never add an ACL to what a link
+# names. buildkitd makes its socket after it starts, so the socket's ACL
+# waits for it, two
 # minutes at most. A file system with no ACLs (setup_privilege_mode warns)
 # leaves BuildKit running and sandboxd's builds refused, never BuildKit
 # restarting in a loop: hence "-", which systemd reads as "a failure here
@@ -4708,8 +4727,8 @@ buildkit_split_dropin() {
 # install.sh --privilege-mode split: sandboxd's user reaches BuildKit's
 # socket by an ACL, not by the build user's group.
 [Service]
-ExecStartPre=-+$setfacl -m u:$SANDBOXD_USER:x /run/aerolvm-buildkit
-ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=\$\$((i+1)); [ \$\$i -lt 600 ] || exit 1; sleep 0.2; done; exec $setfacl -m u:$SANDBOXD_USER:rw /run/aerolvm-buildkit/buildkitd.sock'
+ExecStartPre=-+$setfacl -P -m u:$SANDBOXD_USER:x /run/aerolvm-buildkit
+ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=\$\$((i+1)); [ \$\$i -lt 600 ] || exit 1; sleep 0.2; done; exec $setfacl -P -m u:$SANDBOXD_USER:rw /run/aerolvm-buildkit/buildkitd.sock'
 EOF
 }
 
@@ -4746,7 +4765,23 @@ leave_split_mode() {
 	[[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]] || return 0
 	echo "Switching this node back to privilege mode single: sandboxd runs as root again"
 	systemctl stop sandboxd 2>/dev/null || true
-	local uid gid d
+	# What the root sandboxd would act on by path at its first boot, and
+	# sandboxd's user could write in split, goes first: the upgrade folder
+	# (boot recovery reads its records), the runtime folders (sockets and
+	# folders are made again at start), and every symbolic link in the
+	# data and certificate folders (sandboxd makes none there itself).
+	forget_single_upgrade_folder
+	local d
+	for d in /run/sandboxd /run/sandboxd-public "$SPLIT_PROCID_DIR"; do
+		if [[ -e "$d" || -L "$d" ]]; then
+			find "$d" -xdev -delete
+		fi
+	done
+	for d in /var/lib/sandboxd /etc/sandboxd/tls /etc/sandboxd/cluster-ca; do
+		[[ -d "$d" && ! -L "$d" ]] || continue
+		find "$d" -xdev -type l -delete
+	done
+	local uid gid
 	uid="$(id -u "$SANDBOXD_USER" 2>/dev/null || true)"
 	gid="$(id -g "$SANDBOXD_USER" 2>/dev/null || true)"
 	if [[ -n "$uid" && "$uid" != "0" ]]; then

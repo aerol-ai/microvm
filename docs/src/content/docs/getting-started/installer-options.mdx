@@ -205,13 +205,19 @@ What the installer sets up in split mode:
 - The helper in `/usr/local/lib/aerolvm-rootd`. The installer puts it there only after the new `sandboxd` checks its release signature against the keys built into `sandboxd`, and installs its own checked copy. A helper that fails the check stops the install. A server built with `--build-from-source` gets the helper built from the same code, with no signature.
 - `aerolvm-rootd.service`, which runs the helper as root. Its own settings are in `/etc/sandboxd/rootd.env`, readable only by root.
 - A new `sandboxd.service`: it runs as `sandboxd`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes` and `PrivateTmp=yes`, and it may write only to `/var/lib/sandboxd`, `/run/sandboxd` and the cluster's certificate folders. It starts after the helper and needs it.
-- Before each start, the helper's program gives the `sandboxd` user every file that root left in the server's folders. The first start after the switch does this for the whole data folder. Later starts fix only the files that root tools wrote since, such as `sandboxd join`. It never follows a link, never changes another user's file, and never enters a mounted file system.
+- Before each start, the helper's program gives the `sandboxd` user every file that root left in the server's folders. The first start after the switch does this for the whole data folder. Later starts fix only the files that root tools wrote since, such as `sandboxd join`. It never follows a link and never changes another user's file. It does not go into a mount: it skips a folder the kernel marks as the top of a mount (Linux 5.8 and later, which also catches a bind mount from the same disk) or that sits on another disk.
 - Small systemd drop-ins named `privilege-split.conf`, so the server can reach the egress gateway and the rootless BuildKit socket. BuildKit's socket gets an ACL (an extra permission entry for one user) for the `sandboxd` user. The user never joins the `aerolvm-build` group. ACLs on `/run` need a kernel built with tmpfs ACLs, as Ubuntu's and Amazon Linux's are. On a kernel without them the installer warns you: sandboxes still work, but image builds fail.
 - `SB_PRIVILEGE_MODE=split` in `sandboxd.env`, with Docker turned off for the server (`SB_DOCKER_ENABLED=false`).
 
 Upgrades work as before when you run the installer again or `sudo sandboxd upgrade node`. The upgrade installs a new helper only after the same signature check, and only if it is not older than the one running. Upgrades over the API (`aerolvm upgrade apply`) are off on a split server (`SB_REMOTE_UPGRADE=false`), because starting the upgrader needs root.
 
 Running sandboxes keep running when you switch a server to split mode, when the server restarts, and when the helper restarts. `--privilege-mode single` switches back: the server's files go back to root, the helper stops, and the server runs as root again. The users and the helper's program stay on the server for a later switch.
+
+A switch either way removes the old upgrade records in `/var/lib/sandboxd/upgrade`. Split mode never uses them, and the server, running without root, could have written them. A switch back to single also removes the server's runtime folders in `/run` (it makes them again when it starts) and every symbolic link in its data folders, before the root server starts.
+
+<Aside type="caution">
+Switching back to single gives root the server's database as the server wrote it in split mode. If you think the server was broken into, rebuild the machine instead of switching it back.
+</Aside>
 
 ### Turn on Firecracker
 
