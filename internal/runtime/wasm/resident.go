@@ -1,6 +1,8 @@
 package wasm
 
 import (
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
+
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -114,6 +116,9 @@ func shortHash(s string) string {
 }
 
 func (d *Driver) residentSocketPath(bucketID string, index int) string {
+	if d.split() {
+		return d.helperSocket(rootpolicy.HostWasmResident, d.residentHostKey(bucketID, index))
+	}
 	if index <= 0 {
 		return filepath.Join(d.cfg.RunDir, "resident", bucketID+".sock")
 	}
@@ -286,8 +291,11 @@ func (d *Driver) healthCheckResidentHost(ctx context.Context, h *residentHost, _
 }
 
 func (d *Driver) bringUpResidentHost(ctx context.Context, b *residentBucket, h *residentHost, path string, memoryMB int) error {
-	if err := os.MkdirAll(filepath.Dir(h.socket), 0o700); err != nil {
-		return fmt.Errorf("mkdir resident dir: %w", err)
+	// In split mode the socket's folder is the root helper's own.
+	if !d.split() {
+		if err := os.MkdirAll(filepath.Dir(h.socket), 0o700); err != nil {
+			return fmt.Errorf("mkdir resident dir: %w", err)
+		}
 	}
 	key := d.residentHostKey(b.id, h.index)
 	cache := worker.WithCompileCache(ctx, d.compileCacheNamed(residentCacheName(b.id)))

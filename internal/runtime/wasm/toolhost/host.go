@@ -75,6 +75,11 @@ type Config struct {
 type Owner struct {
 	UID int
 	GID int
+	// Share hands what this host writes to the group alone: its folders
+	// 2770, its files 0660, the group the workdir's setgid gives them.
+	// Privilege mode split: sandboxd is not root and cannot give a file to
+	// the worker's uid, and is in the worker's group.
+	Share bool
 }
 
 func (o Owner) set() bool { return o.UID > 0 && o.GID > 0 }

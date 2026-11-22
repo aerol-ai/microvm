@@ -1,6 +1,8 @@
 package wasm
 
 import (
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
+
 	"fmt"
 	"os"
 	"path/filepath"
@@ -153,6 +155,9 @@ const legacyWorkerSocketName = "worker.sock"
 // without a run dir or for an id that is not a sandbox id, which could name
 // a path outside the dir.
 func (d *Driver) workerSocketPath(sandboxID string) string {
+	if d.split() {
+		return d.helperSocket(rootpolicy.HostWasmWorker, sandboxID)
+	}
 	if d.cfg.RunDir == "" || models.ValidateSandboxID(sandboxID) != nil {
 		return ""
 	}

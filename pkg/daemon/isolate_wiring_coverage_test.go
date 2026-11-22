@@ -24,7 +24,7 @@ func TestCoverage95IsolateBundleStoreError(t *testing.T) {
 		EnableIsolate:      true,
 		IsolateRunDir:      badDir,
 		IsolateWorkerdPath: "/nonexistent-workerd",
-	}, testLogger(), nil)
+	}, testLogger(), nil, nil)
 	if err == nil {
 		t.Fatal("want bundle store error")
 	}
@@ -65,7 +65,7 @@ func TestCoverage95IsolateWarmPoolWiring(t *testing.T) {
 		IsolatePoolEnabled:        true,
 		IsolatePoolDepthDefault:   1,
 		IsolatePoolRefillInterval: time.Hour,
-	}, testLogger(), svc)
+	}, testLogger(), svc, nil)
 	if err != nil {
 		t.Fatalf("wireIsolateRuntime: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestIsolateJailBootstrapFailsClosedAtBoot(t *testing.T) {
 		IsolateWorkerdPath: "/nonexistent-workerd", IsolateJailChrootBase: filepath.Join(t.TempDir(), "jail"),
 		IsolateJailUID: 1001, IsolateJailGID: 1001, IsolateSeccompMode: "enforce",
 	}
-	_, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc)
+	_, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc, nil)
 	if err == nil {
 		t.Fatal("jail-on boot succeeded on a host that cannot realize the jail")
 	}
@@ -99,12 +99,12 @@ func TestIsolateJailBootstrapFailsClosedAtBoot(t *testing.T) {
 	}
 	// A shim that cannot be located is also a boot failure.
 	isolateShimPath = func() (string, error) { return "", errors.New("no exe") }
-	if _, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc); err == nil || !strings.Contains(err.Error(), "jail shim") {
+	if _, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc, nil); err == nil || !strings.Contains(err.Error(), "jail shim") {
 		t.Fatalf("missing shim err = %v", err)
 	}
 	// Jail off: the same config boots (workerd missing only bites at create).
 	cfg.IsolateUseJail = false
-	if _, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc); err != nil {
+	if _, err := wireIsolateRuntime(context.Background(), cfg, testLogger(), svc, nil); err != nil {
 		t.Fatalf("jail-off boot: %v", err)
 	}
 }

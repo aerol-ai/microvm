@@ -29,7 +29,11 @@ func (d *Driver) sharedLinkInto(src, ownerDir, version string) error {
 	}
 	defer unix.Close(ownerFD)
 	if err := unix.Mkdirat(ownerFD, version, 0o700); err == nil {
-		if d.workerOwns() {
+		if d.split() {
+			if err := shareAt(ownerFD, version, d.cfg.Worker.GID); err != nil {
+				return err
+			}
+		} else if d.workerOwns() {
 			if err := unix.Fchownat(ownerFD, version, d.cfg.Worker.UID, d.cfg.Worker.GID, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 				return err
 			}
@@ -112,4 +116,20 @@ func (d *Driver) sharedCompiled(digest string) bool {
 		}
 	}
 	return true
+}
+
+// shareAt gives the folder name in dirFD to the worker's group, setgid and
+// 0770 (split.go handToWorker), through the folder itself, opened with no
+// link followed: the worker can write dirFD's folder, and could put a link
+// at the name between the make and the change.
+func shareAt(dirFD int, name string, gid int) error {
+	fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := unix.Fchown(fd, -1, gid); err != nil {
+		return err
+	}
+	return unix.Fchmod(fd, unix.S_ISGID|0o770)
 }

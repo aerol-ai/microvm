@@ -23,7 +23,7 @@ func TestWireIsolateRuntime(t *testing.T) {
 		IsolateWorkerdPath:      "/usr/local/bin/workerd",
 		IsolateRunDir:           t.TempDir(),
 		IsolateGroupGranularity: config.IsolateGroupPerTenant,
-	}, testLogger(), svc)
+	}, testLogger(), svc, nil)
 	if err != nil {
 		t.Fatalf("wireIsolateRuntime: %v", err)
 	}

@@ -90,3 +90,57 @@ func TestHostSupervisorJailedRunDirLivesInsideChroot(t *testing.T) {
 		t.Fatalf("run dir contract not applied by the supervisor: %v", err)
 	}
 }
+
+// recordingLauncher is the root helper (privilege mode split) as the
+// supervisor hands it to each host; its Prepare fails so nothing starts.
+type recordingLauncher struct {
+	pkgisolate.JailLauncher
+	prepared []string
+	groups   []string
+	stopped  []string
+}
+
+func (l *recordingLauncher) Prepare(_ context.Context, group string) (string, error) {
+	l.prepared = append(l.prepared, group)
+	return "", context.Canceled
+}
+
+func (l *recordingLauncher) Groups(context.Context) ([]string, error) { return l.groups, nil }
+
+func (l *recordingLauncher) Stop(_ context.Context, group string) error {
+	l.stopped = append(l.stopped, group)
+	return nil
+}
+
+// TestHostSupervisorHandsGroupsToTheLauncher: in split mode every group
+// goes to the launcher, which also gets the group's pids bound; and boot
+// sweeps what it holds through it, never the cgroup or chroot folders.
+func TestHostSupervisorHandsGroupsToTheLauncher(t *testing.T) {
+	l := &recordingLauncher{groups: []string{"left"}}
+	cfg := Config{WorkerdPath: "/usr/local/bin/workerd", RunDir: t.TempDir(), UseJail: true, JailChrootBase: "/srv/isolate-jail",
+		JailUID: 1000, JailGID: 1000, JailPidsMax: 77, JailCgroupRoot: "/nonexistent/cgroup", Launcher: l}
+	sup := newWorkerdSupervisor(cfg, nil)
+	if sup.launchedPids(77) != 77 {
+		t.Fatal("a launched group lost its pids bound")
+	}
+	spec, err := BuildJailSpec(cfg, "acme", 0.5, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sup.SpawnGroup(context.Background(), spec); err == nil || !strings.Contains(err.Error(), "prepare group acme") {
+		t.Fatalf("SpawnGroup = %v", err)
+	}
+	if len(l.prepared) != 1 || l.prepared[0] != "acme" {
+		t.Fatalf("launcher prepared %v", l.prepared)
+	}
+	if adopted := sup.AdoptGroups(context.Background()); len(adopted) != 0 {
+		t.Fatalf("adopted %v", adopted)
+	}
+	if len(l.stopped) != 1 || l.stopped[0] != "left" {
+		t.Fatalf("boot sweep stopped %v", l.stopped)
+	}
+	// Single mode passes no pids at spawn, as before.
+	if newWorkerdSupervisor(Config{}, nil).launchedPids(77) != 0 {
+		t.Fatal("single mode's spawn changed")
+	}
+}

@@ -202,7 +202,12 @@ func mkdirAllOwned(root *os.Root, rel string, owner Owner) error {
 		if err != nil {
 			return err
 		}
-		if err := root.Lchown(dir, owner.UID, owner.GID); err != nil {
+		if owner.Share {
+			err = root.Chmod(dir, os.ModeSetgid|0o770)
+		} else {
+			err = root.Lchown(dir, owner.UID, owner.GID)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -230,11 +235,15 @@ func atomicWriteFile(root *os.Root, rel string, src multipart.File, owner Owner)
 		cleanup()
 		return err
 	}
-	if err := root.Chmod(tmpName, 0o644); err != nil {
+	mode := os.FileMode(0o644)
+	if owner.Share {
+		mode = 0o660
+	}
+	if err := root.Chmod(tmpName, mode); err != nil {
 		cleanup()
 		return err
 	}
-	if owner.set() {
+	if owner.set() && !owner.Share {
 		if err := root.Lchown(tmpName, owner.UID, owner.GID); err != nil {
 			cleanup()
 			return err

@@ -8,8 +8,12 @@ import (
 	"slices"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// errWasmMountsInSplit refuses a WASM sandbox's mounts in split mode.
+var errWasmMountsInSplit = privmode.NotYet("mount external storage for a WASM sandbox", privmode.StepWasmMounts)
 
 // Remote mounts (privilege mode split, M1 PR 8): sandboxd has no rights,
 // and the root helper (internal/rootd) runs the mount work in a Manager of
@@ -74,9 +78,12 @@ func (m *Manager) remoteMount(ctx context.Context, sandboxID string, mode Remote
 		return RemoteResult{}, fmt.Errorf("mount: %w", err)
 	}
 	if _, ok := consumerFrom(ctx); ok {
-		// Split mode runs no WASM sandbox (the helper does not start host
-		// processes yet), so no consumer can reach here.
-		return RemoteResult{}, errors.New("mount: the root helper serves no WASM consumer")
+		// A consumer is a WASM worker (M1 PR 9 runs them in split mode).
+		// It reaches a mount through sandboxd, which opens the mount's root
+		// for it (worker grants), and in split mode sandboxd cannot open
+		// the helper's mount points: refused here, before the helper
+		// mounts anything, as the node's setting (501).
+		return RemoteResult{}, errWasmMountsInSplit
 	}
 	res, err := m.remote.Mount(ctx, sandboxID, mode, specs)
 	if err != nil {

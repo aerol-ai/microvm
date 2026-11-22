@@ -124,6 +124,29 @@ type Supervisor struct {
 	mu     sync.Mutex
 	cgroup *hostproc.Cgroup
 	slots  map[string]*slotState
+	// launcher starts workers in another process instead of spawn
+	// (SetLauncher).
+	launcher HostLauncher
+}
+
+// HostLauncher starts a worker in another process: the root helper, in
+// privilege mode split (plans/security-gaps-m1-m4.md, M1 PR 9), which
+// starts and holds every worker as the worker user, on a socket it binds
+// for sandboxd's group (rootpolicy.WasmHostSocket). The worker it answers
+// has said it serves; the supervisor holds it as it holds one an earlier
+// sandboxd started (Adopt): stopped and watched through the Process.
+type HostLauncher interface {
+	// Launch makes sure the worker for key runs on socketPath, with the
+	// compile cache cacheDir ("" for none).
+	Launch(ctx context.Context, key, socketPath, cacheDir string) (hostproc.Process, error)
+}
+
+// SetLauncher makes every later worker start through l. Workers it starts
+// outlive sandboxd: they are the helper's.
+func (s *Supervisor) SetLauncher(l HostLauncher) {
+	s.mu.Lock()
+	s.launcher = l
+	s.mu.Unlock()
 }
 
 type slotState struct {
@@ -192,9 +215,9 @@ func (s *Supervisor) SetCgroup(cg *hostproc.Cgroup) {
 // Survives reports whether workers this supervisor starts outlive sandboxd.
 func (s *Supervisor) Survives() bool {
 	s.mu.Lock()
-	cg := s.cgroup
+	cg, l := s.cgroup, s.launcher
 	s.mu.Unlock()
-	return cg != nil && cg.Active()
+	return l != nil || cg != nil && cg.Active()
 }
 
 // Ensure starts (or restarts) the worker for sandboxID at socketPath.
@@ -233,6 +256,9 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 	}
 	if err := workerQuarantined(socketPath); err != nil {
 		return err
+	}
+	if s.launcher != nil {
+		return s.launchLocked(ctx, sandboxID, socketPath)
 	}
 	_ = os.Remove(socketPath)
 	spawnCtx := context.WithoutCancel(ctx)
@@ -297,6 +323,25 @@ func (s *Supervisor) startLocked(ctx context.Context, sandboxID, socketPath stri
 	}
 	s.slots[sandboxID] = st
 	go s.watch(st)
+	return nil
+}
+
+// launchLocked is startLocked through the launcher.
+func (s *Supervisor) launchLocked(ctx context.Context, key, socketPath string) error {
+	spec := specFrom(ctx)
+	proc, err := s.launcher.Launch(context.WithoutCancel(ctx), key, socketPath, spec.cacheDir)
+	if err != nil {
+		return err
+	}
+	// The launcher answers once the worker serves: ping it now.
+	ready := make(chan struct{})
+	close(ready)
+	st := &slotState{sandboxID: key, socketPath: socketPath, spec: spec, proc: proc, done: make(chan struct{}), ready: ready, spawnCount: 1}
+	if prev, ok := s.slots[key]; ok {
+		st.spawnCount = prev.spawnCount + 1
+	}
+	s.slots[key] = st
+	go s.watchAdopted(st)
 	return nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/observability"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -32,6 +33,13 @@ func (s *Service) mountCtxFor(ctx context.Context, sandbox *models.Sandbox) cont
 
 func (s *Service) wasmMountCtx(ctx context.Context) context.Context {
 	c := worker.ConfinementFor(s.cfg.WasmWorkerDropPrivs, s.cfg.WasmWorkerUID, s.cfg.WasmWorkerGID)
+	if s.cfg.PrivilegeMode == privmode.Split && s.cfg.WasmWorkerDropPrivs {
+		// In split mode sandboxd is not root, yet every worker drops to the
+		// worker user: the root helper starts it (M1 PR 9). Naming that
+		// consumer is what makes the helper-backed mount manager refuse the
+		// mounts before mounting anything (pkg/mounts remoteMount).
+		c = worker.Confinement{UID: s.cfg.WasmWorkerUID, GID: s.cfg.WasmWorkerGID}
+	}
 	if !c.Enabled() {
 		return ctx
 	}

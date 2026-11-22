@@ -241,13 +241,17 @@ func adoptHost(ctx context.Context, base HostConfig, rec hostRecord, boot string
 		removeRecordAt(base.RecordDir, rec.GroupKey)
 		return nil, err
 	}
-	if rec.Jailed {
+	if rec.Jailed && cfg.Launcher == nil {
 		h.jail = recordedJail(rec)
 	}
 	fail := func(err error) (*Host, error) {
 		h.removeRecord()
 		_ = h.stopServers()
-		if terr := h.jail.teardown(); terr != nil && h.logger != nil {
+		terr := h.jail.teardown()
+		if cfg.Launcher != nil {
+			terr = h.stopLaunched(nil)
+		}
+		if terr != nil && h.logger != nil {
 			h.logger.Warn("isolate adopt: leftover jail not removed", "group", rec.GroupKey, "error", terr)
 		}
 		return nil, err
@@ -255,11 +259,21 @@ func adoptHost(ctx context.Context, base HostConfig, rec hostRecord, boot string
 	if bootErr != nil || rec.BootID != boot {
 		return fail(fmt.Errorf("recorded on another boot"))
 	}
-	proc, err := openHostProcess(rec.PID, rec.StartTicks)
+	open := func() (hostproc.Process, error) { return openHostProcess(rec.PID, rec.StartTicks) }
+	if cfg.Launcher != nil {
+		open = func() (hostproc.Process, error) {
+			return cfg.Launcher.Open(ctx, rec.GroupKey, rec.PID, rec.StartTicks)
+		}
+	}
+	proc, err := open()
 	if err != nil {
 		return fail(err)
 	}
 	kill := func(err error) (*Host, error) {
+		if cfg.Launcher != nil {
+			_ = proc.Close()
+			return fail(err) // fail has the launcher stop it
+		}
 		_ = proc.Signal(syscall.SIGKILL)
 		<-proc.Done()
 		_ = proc.Close()
@@ -348,6 +362,10 @@ type Leftovers struct {
 	// KeepPIDs their workerd processes.
 	Keep     map[string]bool
 	KeepPIDs map[int]bool
+	// Launcher, when set, holds the jailed groups instead (privilege mode
+	// split): every group it holds that Keep does not is stopped through
+	// it, and the cgroup and chroot folders above are never touched.
+	Launcher JailLauncher
 }
 
 // Host seams for the sweep, replaced in tests.
@@ -367,6 +385,9 @@ var (
 // reused by a new group must find nothing in its way. It returns how many
 // processes it killed.
 func SweepLeftovers(l Leftovers) int {
+	if l.Launcher != nil {
+		return sweepLaunched(l)
+	}
 	killed := 0
 	if l.HostsCgroup != nil {
 		pids, _ := l.HostsCgroup.PIDs()
@@ -419,6 +440,27 @@ func killPIDs(pids []int, keep map[int]bool) int {
 		<-p.Done()
 		_ = p.Close()
 		n++
+	}
+	return n
+}
+
+// sweepLaunched is SweepLeftovers through a launcher: it stops every group
+// the launcher holds that no adopted host owns, and counts them.
+func sweepLaunched(l Leftovers) int {
+	ctx, cancel := context.WithTimeout(context.Background(), launcherCallWait)
+	defer cancel()
+	groups, err := l.Launcher.Groups(ctx)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, g := range groups {
+		if l.Keep[g] || validateLoaderID(g) != nil {
+			continue
+		}
+		if l.Launcher.Stop(ctx, g) == nil {
+			n++
+		}
 	}
 	return n
 }

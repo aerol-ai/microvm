@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/network/workerfence"
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -30,18 +32,40 @@ const workerAuditCapabilityTTL = 365 * 24 * time.Hour
 // wireWasmRuntime constructs the WASM driver and optional warm pool. The returned
 // pool is non-nil only when SB_WASM_POOL_ENABLED=true; the caller should Close
 // it on daemon shutdown.
-func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store) *wasmpool.Pool {
+//
+// hosts is the root helper in privilege mode split, nil in single: there
+// the helper starts and holds every worker as the worker user, and keeps
+// that user's fence; this sandboxd, which is not root, shares the guests'
+// files with it by group (wasmruntime split.go).
+func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, st *store.Store, hosts hostHelper) *wasmpool.Pool {
 	// Workers drop to their own uid, without root's powers, before they run
 	// a module (pkg/wasm/worker/confine.go); the driver hands them what they
 	// need on the host and nothing else.
 	confine := worker.ConfinementFor(cfg.WasmWorkerDropPrivs, cfg.WasmWorkerUID, cfg.WasmWorkerGID)
-	logWasmWorkerConfinement(logger, cfg, confine)
+	if hosts != nil {
+		// The helper drops every worker (checkPrivilegeMode refuses a node
+		// that turned the drop off).
+		confine = worker.Confinement{UID: cfg.WasmWorkerUID, GID: cfg.WasmWorkerGID}
+		logger.Info("wasm workers run as their own uid, started by the root helper", "uid", confine.UID, "gid", confine.GID,
+			"sockets", cfg.RootdWasmSocketDir)
+	} else {
+		logWasmWorkerConfinement(logger, cfg, confine)
+	}
 	driverCfg := wasmruntime.FromDaemonConfig(cfg)
 	driverCfg.Worker = confine
 	driverCfg.CompileCacheDir = effectiveWasmCompileCacheDir(cfg)
 	// Before any worker starts: what the worker uid may reach on the node,
 	// and the gate that refuses a dropped worker while that is not in place.
-	driverCfg.GuestListenHost = wireWasmWorkerFence(ctx, cfg, confine, logger)
+	// In split the helper keeps the fence and refuses a worker without it.
+	if hosts != nil {
+		driverCfg.HelperSockets = cfg.RootdWasmSocketDir
+		worker.SetConfineGate(nil)
+		if cfg.EnableNetworkRules || cfg.EnterpriseMode {
+			driverCfg.GuestListenHost = workerfence.GuestListenHost
+		}
+	} else {
+		driverCfg.GuestListenHost = wireWasmWorkerFence(ctx, cfg, confine, logger)
+	}
 	driver := wasmruntime.New(driverCfg, logger)
 	// Sandboxes still on a root worker because their s3/rclone mounts were
 	// started before workers dropped (recreate them to finish the upgrade).
@@ -83,19 +107,27 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// half-staged or someone else's artifact.
 	resolver.CatalogueLookup = svc.ResolveOwnedWasmModule
 	supervisor := worker.NewSupervisor(worker.Confine(worker.DefaultSpawner, confine))
-	// Workers run in their own cgroup, outside sandboxd's unit, so a
-	// restart or an upgrade does not stop them (pkg/hostproc); the next
-	// sandboxd takes them over below. Off by itself where cgroup v2 is not
-	// usable, and then workers die with sandboxd as before. In a worker pod
-	// the cgroup is under the runtime container's sandboxes group (C14).
-	workerCgroup := hostproc.NewCgroup(logger, cfg.HostProcessCgroupRoot(), wasmWorkerCgroup, "WASM workers")
-	if cfg.HostProcessCgroupParent != "" {
-		// In the pod, not the agent container's log pipes: a worker
-		// holding them would hold the container's stop (C14).
-		workerCgroup.SetLogFile(filepath.Join(cfg.WasmRunDir, "workers.log"))
+	var workerCgroup *hostproc.Cgroup
+	if hosts != nil {
+		// The helper's own cgroup for them, outside both processes.
+		supervisor.SetLauncher(splitWasmLauncher{h: hosts, kind: rootdpb.HostKind_HOST_KIND_WASM_WORKER, cacheRoot: driverCfg.CompileCacheDir})
+		driver.SetWorkerLister(splitWasmWorkers(hosts, cfg.RootdWasmSocketDir, logger))
+	} else {
+		// Workers run in their own cgroup, outside sandboxd's unit, so a
+		// restart or an upgrade does not stop them (pkg/hostproc); the next
+		// sandboxd takes them over below. Off by itself where cgroup v2 is
+		// not usable, and then workers die with sandboxd as before. In a
+		// worker pod the cgroup is under the runtime container's sandboxes
+		// group (C14).
+		workerCgroup = hostproc.NewCgroup(logger, cfg.HostProcessCgroupRoot(), wasmWorkerCgroup, "WASM workers")
+		if cfg.HostProcessCgroupParent != "" {
+			// In the pod, not the agent container's log pipes: a worker
+			// holding them would hold the container's stop (C14).
+			workerCgroup.SetLogFile(filepath.Join(cfg.WasmRunDir, "workers.log"))
+		}
+		supervisor.SetCgroup(workerCgroup)
+		driver.SetWorkerCgroup(workerCgroup)
 	}
-	supervisor.SetCgroup(workerCgroup)
-	driver.SetWorkerCgroup(workerCgroup)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)
 	driver.SetAuditCapabilityIssuer(func(sandboxID string) (string, string, error) {
@@ -108,7 +140,11 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// per-sandbox path. See plans/wasm-resident-module-host.md.
 	if cfg.WasmResidentHostEnabled {
 		residentSupervisor := worker.NewSupervisor(worker.Confine(worker.DefaultResidentSpawner, confine))
-		residentSupervisor.SetCgroup(workerCgroup)
+		if hosts != nil {
+			residentSupervisor.SetLauncher(splitWasmLauncher{h: hosts, kind: rootdpb.HostKind_HOST_KIND_WASM_RESIDENT, cacheRoot: driverCfg.CompileCacheDir})
+		} else {
+			residentSupervisor.SetCgroup(workerCgroup)
+		}
 		driver.SetResidentHostSupervisor(residentSupervisor)
 	}
 	if st != nil {
