@@ -3,8 +3,11 @@
 package xfsquota
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -210,5 +213,85 @@ func TestOpsOnAFakeKernel(t *testing.T) {
 	}
 	if err := q.Limit(dir, 1<<30+7, 3<<30); err != nil || k.limits[1<<30+7] != 3<<30 {
 		t.Fatalf("Limit = %v, %v", err, k.limits)
+	}
+}
+
+// TestAssignStaysOnWhatItOpened (#1400 review): Assign works from the
+// folders it opened, never from a path looked up again. The fake kernel
+// changes the tree in the middle of the walk (a folder gets a new name,
+// and its old name a link elsewhere); the walk goes on in the folder it
+// opened, under its new name, and sets nothing outside dir.
+func TestAssignStaysOnWhatItOpened(t *testing.T) {
+	base := t.TempDir()
+	layer := filepath.Join(base, "snapshots", "7")
+	a := filepath.Join(layer, "fs", "a")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a, "kept"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(base, "other")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(elsewhere, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var set []string
+	changed := false
+	orig := sysIoctlFsxattr
+	t.Cleanup(func() { sysIoctlFsxattr = orig })
+	sysIoctlFsxattr = func(fd int, req uintptr, x *fsxattr) error {
+		if req != fsIocFssetxattr {
+			return nil
+		}
+		p, _ := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		set = append(set, p)
+		if p == a && !changed {
+			changed = true
+			if err := os.Rename(a, a+".real"); err != nil {
+				return err
+			}
+			return os.Symlink(elsewhere, a)
+		}
+		return nil
+	}
+	if err := (Ops{}).Assign(layer, 1<<30+7); err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatalf("the walk never set the folder's project: %v", set)
+	}
+	for _, p := range set {
+		if p != layer && !strings.HasPrefix(p, layer+"/") {
+			t.Errorf("set a project on %s, outside %s", p, layer)
+		}
+	}
+	if !slices.Contains(set, filepath.Join(a+".real", "kept")) {
+		t.Errorf("the walk did not go on in the folder it opened: %v", set)
+	}
+}
+
+// TestAssignDepth: the walk holds one open folder per level, so it stops
+// past maxDepth with an error rather than run out of descriptors, as a
+// walk by path stopped at PATH_MAX.
+func TestAssignDepth(t *testing.T) {
+	k := &fakeKernel{attrs: map[uint64]fsxattr{}, limits: map[uint32]uint64{}}
+	k.install(t)
+	orig := maxDepth
+	t.Cleanup(func() { maxDepth = orig })
+	dir := filepath.Join(t.TempDir(), "7")
+	if err := os.MkdirAll(filepath.Join(dir, "a", "b", "c", "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	maxDepth = 3
+	if err := (Ops{}).Assign(dir, 1<<30+7); err == nil || !strings.Contains(err.Error(), "deeper than 3") {
+		t.Fatalf("a tree four deep with a bound of three: %v", err)
+	}
+	maxDepth = 4
+	k.attrs = map[uint64]fsxattr{}
+	if err := (Ops{}).Assign(dir, 1<<30+7); err != nil {
+		t.Fatalf("a tree four deep with a bound of four: %v", err)
 	}
 }
