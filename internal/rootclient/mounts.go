@@ -39,6 +39,13 @@ func (c *Client) SweepExternalMounts(ctx context.Context, keep []string) error {
 	return err
 }
 
+// ReclaimVolume asks the helper to delete a deleted platform volume's files
+// on its NFS export.
+func (c *Client) ReclaimVolume(ctx context.Context, source string) error {
+	_, err := call(ctx, c, rootdpb.FeatureReclaimVolume, &rootdpb.ReclaimVolumeRequest{Source: source}, rootdpb.RootHelperClient.ReclaimVolume)
+	return err
+}
+
 // Mounts is the agent's side of the mount calls: pkg/mounts' Remote, which
 // the Manager of privilege mode split runs every call through. Client, a
 // function so the daemon can set it once the client exists, is the helper.

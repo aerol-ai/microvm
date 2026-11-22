@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -30,6 +32,7 @@ import (
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
 // The agent and the helper agree on where the helper listens.
@@ -690,5 +693,66 @@ func TestBuildKitBuilderFor(t *testing.T) {
 				t.Fatalf("ImportsArchives = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+type recordReclaim struct{ calls []string }
+
+func (r *recordReclaim) Reclaim(_ context.Context, kind, source string) error {
+	r.calls = append(r.calls, kind+" "+source)
+	return nil
+}
+
+func (r *recordReclaim) ReclaimVolume(_ context.Context, source string) error {
+	r.calls = append(r.calls, "helper "+source)
+	return nil
+}
+
+// In split mode an NFS volume's files are the helper's to delete; an S3
+// one's stay sandboxd's (the aws CLI needs no rights). Single mode keeps
+// its own reclaimer.
+func TestVolumeReclaimerFor(t *testing.T) {
+	own := &recordReclaim{}
+	if got := volumeReclaimerFor(config.Config{}, own, nil); got != own {
+		t.Fatal("single mode")
+	}
+	if got := volumeReclaimerFor(splitConfig(), own, nil); got != own {
+		t.Fatal("split mode before a helper client")
+	}
+	if got := volumeReclaimerFor(splitConfig(), own, rootclient.New(rootclient.Config{})); got == service.VolumeReclaimer(own) {
+		t.Fatal("split mode kept sandboxd's reclaimer for NFS")
+	}
+	r := splitReclaimer{own: own, helper: own}
+	_ = r.Reclaim(context.Background(), volumes.BackendNFS, "h:/e/t/v")
+	_ = r.Reclaim(context.Background(), volumes.BackendS3, "b/p/t/v")
+	if !slices.Equal(own.calls, []string{"helper h:/e/t/v", "s3 b/p/t/v"}) {
+		t.Fatalf("calls %v", own.calls)
+	}
+}
+
+// newMountManager: sandboxd's own manager in single mode; in split mode one
+// that sends every call to the helper, set once the client exists.
+func TestNewMountManager(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dir := t.TempDir()
+	m, set, err := newMountManager(config.Config{MountsRootPath: filepath.Join(dir, "m"), MountsCredentialsRuntimeDir: filepath.Join(dir, "c")}, logger, "")
+	if err != nil || m == nil {
+		t.Fatal(err)
+	}
+	set(nil)
+	m.Close()
+	sm, set, err := newMountManager(splitConfig(), logger, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No client yet: a mount set fails as the helper unavailable, and
+	// nothing is made in sandboxd's own folders.
+	specs := []models.MountSpec{{Type: models.MountTypeNFS, Target: "/d", Source: "h:/e"}}
+	if _, err := sm.MountAll(context.Background(), "sb-1", specs); !errors.Is(err, rootclient.ErrUnavailable) {
+		t.Fatalf("before the client: %v", err)
+	}
+	set(rootclient.New(rootclient.Config{Socket: filepath.Join(dir, "none.sock"), Timeout: 100 * time.Millisecond}))
+	if _, err := sm.MountAll(context.Background(), "sb-1", specs); !errors.Is(err, rootclient.ErrUnavailable) {
+		t.Fatalf("no helper on the socket: %v", err)
 	}
 }

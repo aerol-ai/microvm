@@ -233,6 +233,35 @@ func removeOnDevice(dir string) error {
 	return removeDirOnDevice(dir, pathDevOf(dir))
 }
 
+// EmptyOnDevice removes everything in dir that is on dir's own device,
+// and leaves dir: it never follows a link and never walks into a folder on
+// another device, which is a mount (an NFS export's automounted
+// submount, say) and not dir's. The root helper's platform volume reclaim
+// empties a volume's folder with it.
+func EmptyOnDevice(dir string) error {
+	dev := pathDevOf(dir)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			err = removeDirOnDevice(p, dev)
+		} else {
+			err = os.Remove(p)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func removeDirOnDevice(dir string, dev uint64) error {
 	if d := pathDevOf(dir); d != dev {
 		return fmt.Errorf("mount folder %s: %w (another device under it); left in place", dir, errStillMounted)

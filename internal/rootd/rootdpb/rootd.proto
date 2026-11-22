@@ -166,6 +166,14 @@ service RootHelper {
   // SweepExternalMounts removes the mounts of every sandbox the request
   // does not keep, except those a call is working on.
   rpc SweepExternalMounts(SweepExternalMountsRequest) returns (SweepExternalMountsResponse);
+
+  // ReclaimVolume deletes a deleted platform volume's files on the NFS
+  // export of the helper's own settings (SB_PLATFORM_VOLUMES_NFS_*): it
+  // mounts the volume's folder in a scratch folder of its own, nosuid,
+  // nodev and noexec, empties it without crossing into another mount or
+  // following a link, and unmounts it. The source must be one volume's
+  // folder of that export, <server>:/<export>/<scope>/<name>.
+  rpc ReclaimVolume(ReclaimVolumeRequest) returns (ReclaimVolumeResponse);
 }
 
 message VersionRequest {
@@ -730,3 +738,10 @@ message SweepExternalMountsRequest {
 }
 
 message SweepExternalMountsResponse {}
+
+message ReclaimVolumeRequest {
+  // The volume's NFS source as it was stored: <server>:/<export>/<scope>/<name>.
+  string source = 1;
+}
+
+message ReclaimVolumeResponse {}

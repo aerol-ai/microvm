@@ -51,6 +51,8 @@ const (
 	FeatureMountExternal       = "MountExternal"
 	FeatureUnmountExternal     = "UnmountExternal"
 	FeatureSweepExternalMounts = "SweepExternalMounts"
+	// Platform volume reclaim on NFS (M1 PR 8).
+	FeatureReclaimVolume = "ReclaimVolume"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -103,7 +105,7 @@ func Features() []string {
 		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs,
 		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox,
 		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort,
-		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts}
+		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

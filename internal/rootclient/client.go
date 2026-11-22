@@ -634,6 +634,8 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureBridgeProbe:          true,
 	rootdpb.FeatureMatchProcess:         true,
 	rootdpb.FeatureHostPort:             true,
+	// The volume's folder emptied again is the same empty folder.
+	rootdpb.FeatureReclaimVolume: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -742,6 +744,8 @@ var mountCalls = map[string]bool{
 	rootdpb.FeatureMountExternal:       true,
 	rootdpb.FeatureUnmountExternal:     true,
 	rootdpb.FeatureSweepExternalMounts: true,
+	// An NFS mount, a delete of a volume's files, an unmount.
+	rootdpb.FeatureReclaimVolume: true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal

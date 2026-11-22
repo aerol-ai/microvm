@@ -15,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/gvisorpids"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // Defaults for the socket and its peer (plans/security-gaps-m1-m4.md §3.3).
@@ -103,6 +104,9 @@ type Config struct {
 	// Mounts is external storage (mounts.go); nil when this node has no
 	// mount user, and the helper serves no mount call.
 	Mounts *MountsConfig
+	// Reclaim is platform volume reclaim on NFS (reclaim.go); nil unless
+	// the node's platform volumes are on NFS.
+	Reclaim *ReclaimConfig
 	// HostPorts bound raw-TCP host-port forwarding (hostports.go), under
 	// sandboxd's names: the host-port range (SB_L4_PORT_RANGE_START,
 	// SB_L4_PORT_RANGE_END; 22000 to 23000) and sandboxd's redirect
@@ -514,6 +518,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if cfg.Mounts, err = mountsFromEnv(getenv, uid, mountsDir, mountCredDir, filepath.Join(stateDir, "mountcache")); err != nil {
 		return Config{}, err
 	}
+	if cfg.Reclaim, err = reclaimFromEnv(getenv, filepath.Join(stateDir, "reclaim")); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -640,6 +647,28 @@ func lookupGroup(s string) (int, error) {
 		return 0, fmt.Errorf("group %s has gid %q", s, g.Gid)
 	}
 	return int(n), nil
+}
+
+// reclaimFromEnv is Config.Reclaim, from sandboxd's own names for the
+// platform volume backend, checked as sandboxd checks them at start
+// (config.PlatformVolumesConfig.Validate): the server and export set, the
+// options on the NFS allow list.
+func reclaimFromEnv(getenv func(string) string, scratch string) (*ReclaimConfig, error) {
+	on, err := envBool(getenv, "SB_PLATFORM_VOLUMES_ENABLED")
+	if err != nil || !on || !strings.EqualFold(strings.TrimSpace(getenv("SB_PLATFORM_VOLUMES_BACKEND")), "nfs") {
+		return nil, err
+	}
+	server := strings.TrimSpace(getenv("SB_PLATFORM_VOLUMES_NFS_SERVER"))
+	export := strings.TrimSpace(getenv("SB_PLATFORM_VOLUMES_NFS_EXPORT"))
+	if server == "" || strings.ContainsAny(server, ":/ ") || strings.Trim(export, "/") == "" {
+		return nil, errors.New("SB_PLATFORM_VOLUMES_NFS_SERVER and SB_PLATFORM_VOLUMES_NFS_EXPORT: want a server name or address and an export path")
+	}
+	opts := strings.TrimSpace(getenv("SB_PLATFORM_VOLUMES_NFS_OPTIONS"))
+	spec := models.MountSpec{Type: models.MountTypeNFS, Options: map[string]string{"opts": opts}}
+	if err := spec.ValidateToolOptions(); err != nil {
+		return nil, fmt.Errorf("SB_PLATFORM_VOLUMES_NFS_OPTIONS: %w", err)
+	}
+	return &ReclaimConfig{Export: rootpolicy.NFSExport{Server: server, Export: export}, Options: opts, ScratchDir: scratch}, nil
 }
 
 // DefaultMountCredDir holds sshfs's key files: on /run, never on disk.

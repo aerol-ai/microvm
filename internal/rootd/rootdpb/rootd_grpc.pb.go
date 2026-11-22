@@ -54,6 +54,7 @@ const (
 	RootHelper_MountExternal_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/MountExternal"
 	RootHelper_UnmountExternal_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/UnmountExternal"
 	RootHelper_SweepExternalMounts_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SweepExternalMounts"
+	RootHelper_ReclaimVolume_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/ReclaimVolume"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -153,6 +154,13 @@ type RootHelperClient interface {
 	// SweepExternalMounts removes the mounts of every sandbox the request
 	// does not keep, except those a call is working on.
 	SweepExternalMounts(ctx context.Context, in *SweepExternalMountsRequest, opts ...grpc.CallOption) (*SweepExternalMountsResponse, error)
+	// ReclaimVolume deletes a deleted platform volume's files on the NFS
+	// export of the helper's own settings (SB_PLATFORM_VOLUMES_NFS_*): it
+	// mounts the volume's folder in a scratch folder of its own, nosuid,
+	// nodev and noexec, empties it without crossing into another mount or
+	// following a link, and unmounts it. The source must be one volume's
+	// folder of that export, <server>:/<export>/<scope>/<name>.
+	ReclaimVolume(ctx context.Context, in *ReclaimVolumeRequest, opts ...grpc.CallOption) (*ReclaimVolumeResponse, error)
 }
 
 type rootHelperClient struct {
@@ -393,6 +401,16 @@ func (c *rootHelperClient) SweepExternalMounts(ctx context.Context, in *SweepExt
 	return out, nil
 }
 
+func (c *rootHelperClient) ReclaimVolume(ctx context.Context, in *ReclaimVolumeRequest, opts ...grpc.CallOption) (*ReclaimVolumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReclaimVolumeResponse)
+	err := c.cc.Invoke(ctx, RootHelper_ReclaimVolume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -490,6 +508,13 @@ type RootHelperServer interface {
 	// SweepExternalMounts removes the mounts of every sandbox the request
 	// does not keep, except those a call is working on.
 	SweepExternalMounts(context.Context, *SweepExternalMountsRequest) (*SweepExternalMountsResponse, error)
+	// ReclaimVolume deletes a deleted platform volume's files on the NFS
+	// export of the helper's own settings (SB_PLATFORM_VOLUMES_NFS_*): it
+	// mounts the volume's folder in a scratch folder of its own, nosuid,
+	// nodev and noexec, empties it without crossing into another mount or
+	// following a link, and unmounts it. The source must be one volume's
+	// folder of that export, <server>:/<export>/<scope>/<name>.
+	ReclaimVolume(context.Context, *ReclaimVolumeRequest) (*ReclaimVolumeResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -568,6 +593,9 @@ func (UnimplementedRootHelperServer) UnmountExternal(context.Context, *UnmountEx
 }
 func (UnimplementedRootHelperServer) SweepExternalMounts(context.Context, *SweepExternalMountsRequest) (*SweepExternalMountsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SweepExternalMounts not implemented")
+}
+func (UnimplementedRootHelperServer) ReclaimVolume(context.Context, *ReclaimVolumeRequest) (*ReclaimVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReclaimVolume not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1004,6 +1032,24 @@ func _RootHelper_SweepExternalMounts_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_ReclaimVolume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReclaimVolumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).ReclaimVolume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_ReclaimVolume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).ReclaimVolume(ctx, req.(*ReclaimVolumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1102,6 +1148,10 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SweepExternalMounts",
 			Handler:    _RootHelper_SweepExternalMounts_Handler,
+		},
+		{
+			MethodName: "ReclaimVolume",
+			Handler:    _RootHelper_ReclaimVolume_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

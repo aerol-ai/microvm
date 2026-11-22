@@ -44,6 +44,8 @@ type Reclaimer struct {
 	// mountRoot is the parent dir transient NFS mounts are created under. The
 	// daemon points this at a private, root-owned scratch dir.
 	mountRoot string
+	// empty removes everything in the mounted folder; emptyDir unless set.
+	empty func(dir string) error
 }
 
 // Runner executes one external command with extraEnv appended to its
@@ -55,7 +57,14 @@ type Runner func(ctx context.Context, extraEnv []string, name string, args ...st
 // NewReclaimer builds a Reclaimer for the operator's configured backend. region
 // / endpoint live on the Backend so S3 deletes hit the same store the mounts do.
 func NewReclaimer(backend Backend, mountRoot string, run Runner) *Reclaimer {
-	return &Reclaimer{backend: backend, run: run, mountRoot: strings.TrimSpace(mountRoot)}
+	return &Reclaimer{backend: backend, run: run, mountRoot: strings.TrimSpace(mountRoot), empty: emptyDir}
+}
+
+// WithEmpty sets how the mounted folder is emptied (the root helper's, which
+// never crosses into another mount, internal/rootd).
+func (r *Reclaimer) WithEmpty(empty func(dir string) error) *Reclaimer {
+	r.empty = empty
+	return r
 }
 
 // Reclaim deletes the data at source for the given backend kind. It is
@@ -123,7 +132,9 @@ func (r *Reclaimer) reclaimNFS(ctx context.Context, source string) error {
 	if err != nil {
 		return fmt.Errorf("reclaim nfs: scratch dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmp) }()
+	// Remove, not RemoveAll: after a failed unmount tmp is still the
+	// export, and a walk would delete what is on it.
+	defer func() { _ = os.Remove(tmp) }()
 
 	mountArgs := []string{"-t", "nfs"}
 	if opts := strings.TrimSpace(r.backend.NFSOptions); opts != "" {
@@ -135,7 +146,11 @@ func (r *Reclaimer) reclaimNFS(ctx context.Context, source string) error {
 	}
 
 	// Empty the mounted subtree rather than removing the mountpoint itself.
-	rmErr := emptyDir(tmp)
+	empty := r.empty
+	if empty == nil {
+		empty = emptyDir
+	}
+	rmErr := empty(tmp)
 
 	if err := r.run(ctx, nil, "umount", tmp); err != nil {
 		// A failed unmount is worse than a failed delete (leaked mount), so it

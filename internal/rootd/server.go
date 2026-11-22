@@ -215,6 +215,12 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		f.close()
 		return nil, err
 	}
+	rc, err := newReclaimCalls(cfg, locks, log)
+	if err != nil {
+		f.close()
+		mc.close()
+		return nil, err
+	}
 	ln, sock := opts.Listener, os.FileInfo(nil)
 	if ln == nil {
 		if ln, sock, err = listen(cfg.Socket, cfg.SocketGID); err != nil {
@@ -237,7 +243,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -479,6 +485,8 @@ type helper struct {
 	ct *containerCalls
 	// mc serves the external mounts; nil when this helper has none.
 	mc *mountCalls
+	// rc serves platform volume reclaim on NFS; nil without that backend.
+	rc *reclaimCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -502,6 +510,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.mc != nil {
 		served = append(served, mountFeatures...)
+	}
+	if h.rc != nil {
+		served = append(served, rootdpb.FeatureReclaimVolume)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts()}, nil
 }
@@ -748,6 +759,14 @@ func (h helper) SweepExternalMounts(ctx context.Context, req *rootdpb.SweepExter
 	}
 	resp, err := h.mc.sweep(req)
 	return answer(ctx, h, rootdpb.RootHelper_SweepExternalMounts_FullMethodName, resp, err)
+}
+
+func (h helper) ReclaimVolume(ctx context.Context, req *rootdpb.ReclaimVolumeRequest) (*rootdpb.ReclaimVolumeResponse, error) {
+	if h.rc == nil {
+		return nil, status.Errorf(codes.Unimplemented, "root helper %s: ReclaimVolume needs platform volumes on NFS (SB_PLATFORM_VOLUMES_BACKEND=nfs) in its own settings", version.Version)
+	}
+	resp, err := h.rc.reclaim(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_ReclaimVolume_FullMethodName, resp, err)
 }
 
 // noMounts answers a mount call on a helper with no mount user, as one it
