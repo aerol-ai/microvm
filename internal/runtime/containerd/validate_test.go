@@ -17,6 +17,13 @@ func TestValidateSandboxID(t *testing.T) {
 		{"slash rejected", "sb/evil", true},
 		{"dot rejected", "sb.evil", true},
 		{"too long rejected", strings.Repeat("a", 129), true},
+		// Names the sandboxes' cgroup parent keeps for AerolVM's own
+		// processes: containerd's group and the host-process runtimes'.
+		{"machinery group _runtime rejected", "_runtime", true},
+		{"host runtime group aerolvm-wasm rejected", "aerolvm-wasm", true},
+		{"host runtime group aerolvm-vmm rejected", "aerolvm-vmm", true},
+		{"netns pool slot ok", "aerol-netns-7", false},
+		{"parked slot ok", "park-1", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
