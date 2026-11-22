@@ -944,16 +944,20 @@ func waitForMount(hostPath string, timeout time.Duration, exited <-chan struct{}
 	}
 }
 
-// killMount sends SIGTERM to the process group, waits briefly, then SIGKILL.
+// killMountGrace is how long a tool gets to exit on SIGTERM. A var for tests.
+var killMountGrace = 3 * time.Second
+
+// killMount sends SIGTERM to the tool and the process group it was started
+// as the leader of, waits briefly, then SIGKILL. The group is the tool's
+// pid, never the group it reports now: a tool that moved to another group
+// would have that group signalled instead.
 func killMount(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 1 {
 		return nil
 	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err != nil {
-		pgid = cmd.Process.Pid
-	}
+	pgid := cmd.Process.Pid
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	_ = cmd.Process.Signal(syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
 		_, _ = cmd.Process.Wait()
@@ -961,8 +965,9 @@ func killMount(cmd *exec.Cmd) error {
 	}()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(killMountGrace):
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Process.Signal(syscall.SIGKILL)
 		<-done
 	}
 	return nil

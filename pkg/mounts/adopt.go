@@ -81,6 +81,11 @@ func (m *Manager) listHelperProcesses() []helperProcess {
 		}
 		h := helperProcess{pid: pid, ppid: readPPID(pid), argv: argv}
 		if m.tools != nil {
+			// Only the tools' own user's processes are tools: adoption
+			// and clearStaleMount never take or stop anyone else's.
+			if !runsAs(procRoot, pid, m.tools.UID) {
+				continue
+			}
 			h.mark = readMark(pid)
 		}
 		out = append(out, h)
@@ -342,8 +347,14 @@ func watchLiveExit(p liveProcess) *procExit {
 }
 
 // killGroup signals a helper's process group (its FUSE children, such as
-// sshfs's ssh). A var so tests never signal a real group.
-var killGroup = func(pgid int, sig syscall.Signal) { _ = syscall.Kill(-pgid, sig) }
+// sshfs's ssh) while the helper leads it (leadsOwnGroup): a helper that
+// moved to another group has only itself signalled. A var so tests never
+// signal a real group.
+var killGroup = func(pgid int, sig syscall.Signal) {
+	if leadsOwnGroup(pgid) {
+		_ = syscall.Kill(-pgid, sig)
+	}
+}
 
 // adoptedKillGrace is how long an adopted helper gets to exit on SIGTERM.
 var adoptedKillGrace = 3 * time.Second

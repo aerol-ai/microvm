@@ -31,7 +31,8 @@ import (
 //     mounts or unmounts anything, so it needs no setuid fusermount and
 //     runs with no-new-privs.
 //   - It starts as Tools.UID and Tools.GID with no other groups, no
-//     capabilities and no-new-privs, in the helpers' cgroup, with an
+//     capabilities and no-new-privs, as the leader of a session of its
+//     own (toolProcAttr), in the helpers' cgroup, with an
 //     environment of its own: PATH, a HOME that does not exist, its
 //     mount's marker and what the adapter sets. Nothing of the helper's
 //     environment reaches it, so no credential the node keeps there does.
@@ -269,8 +270,7 @@ func (m *Manager) startTool(s *mountState) (*exec.Cmd, *helperOutput, *procExit,
 		cmd.Dir = "/"
 		cmd.Stdout, cmd.Stderr = logFile, logFile
 		cmd.ExtraFiles = files
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true,
-			Credential: &syscall.Credential{Uid: t.UID, Gid: t.GID, Groups: []uint32{}}}
+		cmd.SysProcAttr = toolProcAttr(t)
 		return cmd
 	}
 	cmd := newCmd()
@@ -294,6 +294,16 @@ func (m *Manager) startTool(s *mountState) (*exec.Cmd, *helperOutput, *procExit,
 		return nil, nil, nil, toolStartError(s.plan.Argv[0], err)
 	}
 	return cmd, out, watchExit(cmd), nil
+}
+
+// toolProcAttr is how an isolated tool starts: as the tools' user with no
+// other groups, as the leader of a new session. A session leader cannot
+// move to another process group, and its children can join only groups of
+// its own session, so the tool's group (which teardown signals) holds the
+// tool and its children alone.
+func toolProcAttr(t *ToolUser) *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setsid: true,
+		Credential: &syscall.Credential{Uid: t.UID, Gid: t.GID, Groups: []uint32{}}}
 }
 
 // restartTool starts a mount's tool again after it exited: an isolated
@@ -464,43 +474,47 @@ func readMark(pid int) string {
 }
 
 // killToolsFor stops every tool serving a path under dir: by its command
-// line (killFUSEProcessesFor), and in isolated mode by its marker.
+// line (killFUSEProcessesFor), and in isolated mode by its marker. In
+// isolated mode both stop only processes of the tools' own user.
 func (m *Manager) killToolsFor(dir string) {
-	killFUSEProcessesFor(m.logger, dir)
-	if m.tools != nil {
-		killMarkedInRoot(m.logger, dir, procRoot)
+	if m.tools == nil {
+		killFUSEProcessesFor(m.logger, dir, nil)
+		return
 	}
+	uid := m.tools.UID
+	killFUSEProcessesFor(m.logger, dir, &uid)
+	killMarkedInRoot(m.logger, dir, procRoot, uid)
 }
 
-// killMarkedInRoot SIGKILLs the process group of every process whose mount
-// marker is dir or a path under it.
-func killMarkedInRoot(logger *slog.Logger, dir, root string) {
+// killMarkedInRoot SIGKILLs every process of the tools' user (uid) whose
+// mount marker is dir or a path under it (signalListed: the process, and
+// its group only when it leads one of its own). The marker is the tool's
+// own environment, which the tool can change, so the user is what makes a
+// process one of the tools'.
+func killMarkedInRoot(logger *slog.Logger, dir, root string, uid uint32) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
 	}
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 0 || !e.IsDir() {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(root, e.Name(), "environ"))
+	marked := func(pid int) bool {
+		raw, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "environ"))
 		if err != nil {
-			continue
+			return false
 		}
 		for _, kv := range strings.Split(string(raw), "\x00") {
-			mark, ok := strings.CutPrefix(kv, toolMarkEnv+"=")
-			if !ok || (mark != dir && !strings.HasPrefix(mark, dir+"/")) {
-				continue
+			if mark, ok := strings.CutPrefix(kv, toolMarkEnv+"="); ok && (mark == dir || strings.HasPrefix(mark, dir+"/")) {
+				return true
 			}
-			logger.Info("mounts: killing mount tool", "pid", pid, "dir", dir)
-			if pgid, perr := syscall.Getpgid(pid); perr == nil {
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			} else {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-			break
 		}
+		return false
+	}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 || !e.IsDir() || !marked(pid) || !runsAs(root, pid, uid) {
+			continue
+		}
+		logger.Info("mounts: killing mount tool", "pid", pid, "dir", dir)
+		_ = signalListed(pid, syscall.SIGKILL, func() bool { return marked(pid) && runsAs(root, pid, uid) })
 	}
 }
 

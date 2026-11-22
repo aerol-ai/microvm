@@ -94,3 +94,31 @@ func (p *pidfdProcess) Close() error {
 	<-p.done
 	return unix.Close(p.fd)
 }
+
+// signalListed sends sig to pid, a process found by listing /proc, if still
+// holds once a pidfd holds it, and to its group when it leads one of its
+// own (leadsOwnGroup). The pidfd is checked live after still, so still read
+// that very process, and the signal itself goes through the pidfd.
+func signalListed(pid int, sig syscall.Signal, still func() bool) error {
+	if pid <= 1 {
+		return errProcessGone
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ENOSYS) {
+		return signalListedPlain(pid, sig, still) // a kernel older than 5.3
+	}
+	if err != nil {
+		return errProcessGone
+	}
+	defer unix.Close(fd)
+	if !still() || unix.PidfdSendSignal(fd, 0, nil, 0) != nil {
+		return errProcessGone
+	}
+	if leadsOwnGroup(pid) {
+		_ = unix.Kill(-pid, sig)
+	}
+	if err := unix.PidfdSendSignal(fd, sig, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return err
+	}
+	return nil
+}

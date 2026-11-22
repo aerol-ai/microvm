@@ -34,6 +34,9 @@ func fakeProc(t *testing.T, root string, pid int, argv ...string) {
 	if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The tools' user in isolated-mode tests (testToolUID); single mode
+	// reads no status.
+	writeStatusUID(t, root, pid, testToolUID())
 }
 
 func withProcRoot(t *testing.T, root string) {

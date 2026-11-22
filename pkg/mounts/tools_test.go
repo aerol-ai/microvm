@@ -222,7 +222,7 @@ func TestMountToolLifecycle(t *testing.T) {
 	}
 	for i, cmd := range started {
 		// The stand-in cleared Credential to run; the rest is as started.
-		if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid || cmd.Dir != "/" {
+		if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setsid || cmd.Dir != "/" {
 			t.Fatalf("tool %d attrs %+v", i, cmd.SysProcAttr)
 		}
 		want := 1 // the FUSE descriptor
@@ -551,10 +551,40 @@ func mustBuild(t *testing.T, spec models.MountSpec, host, credDir string) adapte
 	return plan
 }
 
+// writeStatusUID writes a stand-in /proc/<pid>/status: real, effective,
+// saved and filesystem uid all uid.
+func writeStatusUID(t *testing.T, root string, pid int, uid uint32) {
+	t.Helper()
+	u := strconv.FormatUint(uint64(uid), 10)
+	body := "Name:\tx\nUid:\t" + u + "\t" + u + "\t" + u + "\t" + u + "\nGid:\t0\t0\t0\t0\n"
+	if err := os.WriteFile(filepath.Join(root, strconv.Itoa(pid), "status"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func writeEnviron(t *testing.T, root string, pid int, env ...string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(root, strconv.Itoa(pid), "environ"), []byte(strings.Join(env, "\x00")+"\x00"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestToolStartsInItsOwnSession: an isolated tool starts as the leader of
+// a session of its own, so it cannot move to another process group, and
+// teardown's signal to its group reaches only it and its children.
+func TestToolStartsInItsOwnSession(t *testing.T) {
+	r := newToolRig(t)
+	if _, err := r.m.MountAll(context.Background(), "sb-1", toolSpecs()[:1]); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.m.UnmountAll("sb-1") })
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.started) != 1 {
+		t.Fatalf("%d starts", len(r.started))
+	}
+	if a := r.started[0].SysProcAttr; !a.Setsid || a.Setpgid {
+		t.Fatalf("the tool starts with Setsid %v Setpgid %v, want a session of its own", a.Setsid, a.Setpgid)
 	}
 }
 
@@ -573,12 +603,15 @@ func TestKillMarked(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	uid := uint32(os.Getuid())
 	fakeProc(t, proc, tool.Process.Pid, "mount-s3")
 	writeEnviron(t, proc, tool.Process.Pid, "PATH=/bin", toolMarkEnv+"=/m/sb-1/0")
+	writeStatusUID(t, proc, tool.Process.Pid, uid)
 	fakeProc(t, proc, other.Process.Pid, "mount-s3")
 	writeEnviron(t, proc, other.Process.Pid, toolMarkEnv+"=/m/sb-10/0")
+	writeStatusUID(t, proc, other.Process.Pid, uid)
 	fakeProc(t, proc, 1, "init") // no environ: skipped
-	killMarkedInRoot(slog.New(slog.NewTextHandler(io.Discard, nil)), "/m/sb-1", proc)
+	killMarkedInRoot(slog.New(slog.NewTextHandler(io.Discard, nil)), "/m/sb-1", proc, uid)
 	done := make(chan error, 1)
 	go func() { done <- tool.Wait() }()
 	select {
