@@ -34,10 +34,12 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 
 // rootHelper is the root helper as the containerd engine uses it in
 // privilege mode split (*rootclient.Client): containerd through its gate,
-// and its network calls.
+// its network calls, and the cgroup part that marks each started
+// sandbox's group (F10).
 type rootHelper interface {
 	cntr.RootHelper
 	netnsHelper
+	cntr.CgroupMarker
 }
 
 // wireContainerEngineWith is wireContainerEngine with the root helper in
@@ -68,6 +70,10 @@ func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slo
 		// for. Nothing here touches the kernel.
 		driver = cntr.New(cntr.FromDaemonConfig(cfg), nil, logger)
 		driver.SetRootHelper(helper)
+		// F10's marks (M1 PR 6): the helper writes each started sandbox's
+		// group settings, which sandboxd cannot without root. With no
+		// cgroup parent the driver asks for none.
+		driver.SetCgroupMarker(helper)
 		netHelper = helper
 		if splitHostStepOn(cfg) {
 			fw, ok := helper.(firewallHelper)

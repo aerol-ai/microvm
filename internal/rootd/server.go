@@ -128,6 +128,10 @@ type Options struct {
 	// HostPorts does raw-TCP host-port forwarding (hostports.go). Nil: the
 	// helper's own, opened on the first call. It needs the network too.
 	HostPorts HostPortHost
+	// CgroupRoot and ProcRoot are the cgroup v2 mount and /proc the
+	// cgroup part (cgroup.go) works in. Empty: the kernel's own. Tests
+	// point them at a tree of plain files.
+	CgroupRoot, ProcRoot string
 }
 
 // Server is the helper's socket and gRPC server.
@@ -202,7 +206,8 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
-		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks)})
+		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
+		cg: newSandboxCgroups(cfg, opts, locks)})
 	return s, nil
 }
 
@@ -426,6 +431,9 @@ type helper struct {
 	// each nil with net.
 	eg *egressCalls
 	hp *hostPortCalls
+	// cg serves PrepareSandbox's cgroup part; nil when this helper has no
+	// cgroup parent.
+	cg *sandboxCgroups
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -438,6 +446,8 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.fw != nil {
 		served = append(served, firewallFeatures...)
 		served = append(served, rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
+	} else if h.cg != nil {
+		served = append(served, rootdpb.FeaturePrepareSandbox)
 	}
 	if h.eg != nil {
 		served = append(served, egressFeatures...)
@@ -445,7 +455,17 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.hp != nil {
 		served = append(served, hostPortFeatures...)
 	}
-	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.fw.servedParts()}, nil
+	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts()}, nil
+}
+
+// servedParts are the parts of PrepareSandbox and ReleaseSandbox this
+// helper serves: the firewall's, and the cgroup part with a cgroup parent.
+func (h helper) servedParts() []string {
+	parts := h.fw.servedParts()
+	if h.cg != nil {
+		parts = append(parts, rootdpb.PartCgroup)
+	}
+	return parts
 }
 
 // containerKey is the per-object lock key of a container's files (D11).
@@ -484,11 +504,35 @@ func (h helper) SandboxRules(ctx context.Context, req *rootdpb.SandboxRulesReque
 }
 
 func (h helper) PrepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error) {
-	if h.fw == nil {
+	if h.fw == nil && h.cg == nil {
 		return nil, noNetwork(rootdpb.FeaturePrepareSandbox)
 	}
-	resp, err := h.fw.prepare(ctx, req)
+	resp, err := h.prepareSandbox(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_PrepareSandbox_FullMethodName, resp, err)
+}
+
+// prepareSandbox hands a request with the cgroup part to its own handler,
+// alone (cgroup.go), and every other to the firewall's.
+func (h helper) prepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error) {
+	if !slices.Contains(req.GetParts(), rootdpb.PartCgroup) {
+		if req.GetCgroup() != nil {
+			return nil, badRequest("root helper: a cgroup sent without the cgroup part")
+		}
+		if h.fw == nil {
+			return nil, errSkew("root helper: this helper serves PrepareSandbox's cgroup part only; it has no network configuration")
+		}
+		return h.fw.prepare(ctx, req)
+	}
+	if err := noUnknownFields(req); err != nil {
+		return nil, err
+	}
+	if _, err := partsOf(req.GetParts(), h.servedParts()); err != nil {
+		return nil, err
+	}
+	if len(req.GetParts()) > 1 {
+		return nil, badRequest("root helper: the cgroup part comes alone: a sandbox's group is made with its task, after its namespace and rules")
+	}
+	return h.cg.prepare(ctx, req)
 }
 
 func (h helper) ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) (*rootdpb.ReleaseSandboxResponse, error) {

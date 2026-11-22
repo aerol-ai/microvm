@@ -389,12 +389,12 @@ func (f *firewall) sandboxRules(ctx context.Context, req *rootdpb.SandboxRulesRe
 	return &rootdpb.SandboxRulesResponse{Inserted: inserted}, nil
 }
 
-// servedParts are the parts this helper serves, as Version lists them.
+// servedParts are the firewall's parts: the namespace and the rules.
 func (f *firewall) servedParts() []string {
 	if f == nil {
 		return nil
 	}
-	return slices.Clone(rootdpb.Parts())
+	return []string{rootdpb.PartNetns, rootdpb.PartFirewall}
 }
 
 // nodeDNSPorts are DNS's node ports (udp and tcp 53), each on one of this

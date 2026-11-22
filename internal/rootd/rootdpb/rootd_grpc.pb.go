@@ -116,7 +116,9 @@ type RootHelperClient interface {
 	// PrepareSandbox does a create's root work in one call: each part the
 	// request lists (see VersionResponse.parts). A helper refuses a request
 	// that carries a part, or a field, it does not know, so nothing is ever
-	// skipped without a word.
+	// skipped without a word. The cgroup part comes alone, once the
+	// sandbox's task has started: the runtime makes its group with the task,
+	// after the namespace and rules of the create's first call.
 	PrepareSandbox(ctx context.Context, in *PrepareSandboxRequest, opts ...grpc.CallOption) (*PrepareSandboxResponse, error)
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
 	// its namespace and attachment.
@@ -408,7 +410,9 @@ type RootHelperServer interface {
 	// PrepareSandbox does a create's root work in one call: each part the
 	// request lists (see VersionResponse.parts). A helper refuses a request
 	// that carries a part, or a field, it does not know, so nothing is ever
-	// skipped without a word.
+	// skipped without a word. The cgroup part comes alone, once the
+	// sandbox's task has started: the runtime makes its group with the task,
+	// after the namespace and rules of the create's first call.
 	PrepareSandbox(context.Context, *PrepareSandboxRequest) (*PrepareSandboxResponse, error)
 	// ReleaseSandbox undoes PrepareSandbox: the address's rules first, then
 	// its namespace and attachment.

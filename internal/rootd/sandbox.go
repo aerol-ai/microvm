@@ -19,7 +19,9 @@ import (
 // note "one helper call per create"). Each is made of parts, and each part
 // keeps its own rules and refusal reasons: netns (network.go: the name
 // rule, kernel ownership) and firewall (firewall.go: the address and lease
-// rules, the CIDR rule).
+// rules, the CIDR rule). PrepareSandbox's cgroup part (cgroup.go, M1 PR 6)
+// has its own handler: it comes alone, once the sandbox's task has
+// started, so it never meets the two others in one request.
 //
 // Version skew (agent N with helper N-1, eng review D5) must never drop a
 // part without a word. Protobuf keeps a field it does not know and acts on
@@ -201,6 +203,9 @@ func (f *firewall) applyCreateRules(ctx context.Context, h FirewallHost, ip stri
 func (f *firewall) release(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) (*rootdpb.ReleaseSandboxResponse, error) {
 	if err := noUnknownFields(req); err != nil {
 		return nil, err
+	}
+	if slices.Contains(req.GetParts(), rootdpb.PartCgroup) {
+		return nil, badRequest("root helper: ReleaseSandbox has no cgroup part: the runtime removes a sandbox's group with its task")
 	}
 	parts, err := partsOf(req.GetParts(), f.servedParts())
 	if err != nil {

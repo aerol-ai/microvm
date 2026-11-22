@@ -122,6 +122,10 @@ type Driver struct {
 	// helper is the root helper in privilege mode split
 	// (privilege_split.go); nil in single mode.
 	helper RootHelper
+	// cgroupMarker marks a started sandbox's group for F10 through the
+	// root helper in privilege mode split (SetCgroupMarker); nil in single
+	// mode, which writes the group's files itself.
+	cgroupMarker CgroupMarker
 
 	// startLocks serializes starts of one container: a start deletes the
 	// stopped task, binds the container's park socket and creates a new

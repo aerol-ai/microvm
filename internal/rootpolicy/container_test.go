@@ -186,6 +186,10 @@ func TestValidateID(t *testing.T) {
 		"a/b":                    "invalid character",
 		"..":                     "invalid character",
 		"sb 1":                   "invalid character",
+		// containerd's group under the sandboxes' parent, and its kind.
+		"_runtime": `starts with "_"`,
+		"_":        `starts with "_"`,
+		"sb_x":     "",
 	} {
 		err := ValidateID(id)
 		if want == "" {

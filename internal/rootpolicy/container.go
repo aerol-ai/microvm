@@ -253,12 +253,20 @@ func oneOf(name string, allowed []string) func(string) error {
 // charset before anything builds a host path from it (a host files folder,
 // a cgroup, a network namespace). The ID can arrive attacker-controlled
 // (the X-Cluster-Create-ID header), so a "../" in it must never reach a path.
+//
+// An ID may not start with "_" either: a sandbox's cgroup is
+// <parent>/<id>, and the worker pod's supervisor keeps containerd, every
+// shim and the root helper in <parent>/_runtime (ownerlease.ReservedGroup).
+// No generated ID takes that form ("sb-", "aerol-netns-", "park-").
 func ValidateID(id string) error {
 	if id == "" {
 		return violate(RuleID, "sandbox ID is required")
 	}
 	if len(id) > 128 {
 		return violate(RuleID, "sandbox ID exceeds 128 chars (%d)", len(id))
+	}
+	if id[0] == '_' {
+		return violate(RuleID, "sandbox ID %q starts with \"_\", which the sandboxes' cgroup parent keeps for the machinery (_runtime)", id)
 	}
 	for _, r := range id {
 		switch {

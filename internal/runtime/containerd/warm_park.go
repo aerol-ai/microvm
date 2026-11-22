@@ -279,7 +279,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		return nil, fmt.Errorf("park start: %w", err)
 	}
 	if d.cfg.CgroupParent != "" {
-		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(slotID)); err != nil {
+		if err := d.MarkOOMVictim(ctx, d.sandboxCgroupPath(slotID)); err != nil {
 			return nil, fmt.Errorf("park: %w", err)
 		}
 	}
@@ -291,7 +291,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	}
 	// Again, for processes gVisor started after task.Start returned.
 	if d.cfg.CgroupParent != "" {
-		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(slotID)); err != nil {
+		if err := d.MarkOOMVictim(ctx, d.sandboxCgroupPath(slotID)); err != nil {
 			return nil, fmt.Errorf("park: %w", err)
 		}
 	}

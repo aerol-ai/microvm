@@ -140,7 +140,7 @@ func TestFirewallNotOpen(t *testing.T) {
 		t.Fatalf("the second open: %v (%d opens)", err, opens)
 	}
 	v, err := c.Version(ctx, &rootdpb.VersionRequest{})
-	if err != nil || !slices.Equal(v.GetParts(), rootdpb.Parts()) || !slices.Contains(v.GetFeatures(), rootdpb.FeaturePrepareSandbox) {
+	if err != nil || !slices.Equal(v.GetParts(), []string{rootdpb.PartNetns, rootdpb.PartFirewall}) || !slices.Contains(v.GetFeatures(), rootdpb.FeaturePrepareSandbox) {
 		t.Fatalf("Version = %v, %v", v, err)
 	}
 	none := newRig(t, nil)

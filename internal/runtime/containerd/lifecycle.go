@@ -400,7 +400,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("start task: %w", err)
 	}
 	if d.cfg.CgroupParent != "" {
-		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+		if err := d.MarkOOMVictim(ctx, d.sandboxCgroupPath(sandboxID)); err != nil {
 			return nil, err
 		}
 	}
@@ -442,7 +442,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// processes after task.Start returns, and the pass above can miss them
 	// (4 of 7,021 gvisor_sentry processes in a 1,000-sandbox run).
 	if d.cfg.CgroupParent != "" {
-		if err := d.markWholeOOMVictim(d.sandboxCgroupPath(sandboxID)); err != nil {
+		if err := d.MarkOOMVictim(ctx, d.sandboxCgroupPath(sandboxID)); err != nil {
 			return nil, err
 		}
 	}
@@ -647,7 +647,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	}
 	// A restart makes the task's cgroup anew; mark it again (F10).
 	if spec != nil && spec.Linux != nil {
-		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+		if err := d.MarkOOMVictim(ctx, spec.Linux.CgroupsPath); err != nil {
 			_ = task.Kill(ctx, syscall.SIGKILL)
 			_, _ = task.Delete(ctx, cntr.WithProcessKill)
 			return nil, err
@@ -671,7 +671,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	}
 	// Again, for processes gVisor started after task.Start returned.
 	if spec != nil && spec.Linux != nil {
-		if err := d.markWholeOOMVictim(spec.Linux.CgroupsPath); err != nil {
+		if err := d.MarkOOMVictim(ctx, spec.Linux.CgroupsPath); err != nil {
 			_ = task.Kill(ctx, syscall.SIGKILL)
 			_, _ = task.Delete(ctx, cntr.WithProcessKill)
 			return nil, err

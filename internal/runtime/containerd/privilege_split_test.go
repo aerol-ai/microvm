@@ -192,9 +192,11 @@ func TestSplitCreateAndStartNameTheirGaps(t *testing.T) {
 	if !errors.As(err, &g) || len(g.Steps) != 2 {
 		t.Fatalf("steps %+v", g)
 	}
+	// The cgroup settings (F10) are the helper's since M1 PR 6: a cgroup
+	// parent adds no gap.
 	d.cfg.CgroupParent, d.cfg.DiskQuota = "/kubepods/pod1/sandboxes", true
 	_, err = d.Create(ctx, models.CreateSandboxRequest{Image: "alpine", DiskGB: 5}, "sb-1", "tok", nil)
-	if !errors.As(err, &g) || len(g.Steps) != 4 || !strings.Contains(err.Error(), "disk quota") || !strings.Contains(err.Error(), "out-of-memory") {
+	if !errors.As(err, &g) || len(g.Steps) != 3 || !strings.Contains(err.Error(), "disk quota") || strings.Contains(err.Error(), "out-of-memory") {
 		t.Fatalf("Create = %v", err)
 	}
 	// The ID is still checked first: a hostile one never reaches the gap.
@@ -205,7 +207,7 @@ func TestSplitCreateAndStartNameTheirGaps(t *testing.T) {
 		func() error { _, err := d.Start(ctx, "sb-1"); return err },
 		func() error { _, err := d.StartWithIdentityEnv(ctx, "sb-1", "sb-1", "tok", nil); return err },
 	} {
-		if err := start(); !errors.As(err, &g) || !strings.Contains(err.Error(), "start a sandbox") || len(g.Steps) != 2 {
+		if err := start(); !errors.As(err, &g) || !strings.Contains(err.Error(), "start a sandbox") || len(g.Steps) != 1 {
 			t.Fatalf("Start = %v", err)
 		}
 	}

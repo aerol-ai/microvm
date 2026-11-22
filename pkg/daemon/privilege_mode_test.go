@@ -212,6 +212,8 @@ type memHelper struct {
 	removed []string
 	err     error
 	next    int
+	// marked are the containers whose groups the driver asked to mark.
+	marked []string
 }
 
 func newMemHelper() *memHelper { return &memHelper{ns: map[string]string{}} }
@@ -445,6 +447,35 @@ func TestWireContainerEngineSplit(t *testing.T) {
 	if !errors.Is(err, privmode.ErrGap) {
 		t.Fatalf("Create = %v, want a Gap", err)
 	}
+	// F10's marks go to the helper (M1 PR 6), by container: the cgroup
+	// tree below holds the parent alone, so a mark written in process
+	// would fail.
+	root := t.TempDir()
+	for f, v := range map[string]string{"cgroup.controllers": "cpu memory pids", "sandboxes/cgroup.subtree_control": "cpu memory pids"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, f)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, f), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig := cntr.CgroupRoot
+	cntr.CgroupRoot = root
+	t.Cleanup(func() { cntr.CgroupRoot = orig })
+	cfg.ContainerdCgroupParent = "/sandboxes"
+	w2, err := wireContainerEngineWith(ctx, cfg, testLogger(), svc, st, nil, nil, nil, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w2.Stop)
+	if err := w2.driver.MarkOOMVictim(ctx, "/sandboxes/sb-1"); err != nil {
+		t.Fatal(err)
+	}
+	h.memHelper.mu.Lock()
+	defer h.memHelper.mu.Unlock()
+	if !slices.Equal(h.memHelper.marked, []string{"sb-1"}) {
+		t.Fatalf("marked %v", h.memHelper.marked)
+	}
 }
 
 // engineHelper is the whole helper the engine wiring takes.
@@ -455,6 +486,15 @@ type engineHelper struct {
 
 func (*engineHelper) Socket() string                      { return "/nonexistent/root.sock" }
 func (*engineHelper) ContainerdOptions() []cntrclient.Opt { return nil }
+
+// MarkSandboxCgroup records each container the driver asks the helper to
+// mark.
+func (h *engineHelper) MarkSandboxCgroup(_ context.Context, id string) error {
+	h.memHelper.mu.Lock()
+	defer h.memHelper.mu.Unlock()
+	h.memHelper.marked = append(h.memHelper.marked, id)
+	return nil
+}
 
 // splitHelper serves the helper's real server for a split-mode boot: its
 // network in memory, containerd's version answered as the gate would.
