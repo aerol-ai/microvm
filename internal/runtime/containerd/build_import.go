@@ -38,8 +38,14 @@ import (
 //     describes any size of zeros in a few bytes);
 //   - at most maxBytes, both read and declared by the entries' headers, at
 //     most maxBuildArchiveEntries entries, small caps on the two JSON files,
-//     and maxBuildManifestBytes on each manifest, index and config, which
-//     are read whole (checked by their descriptors' sizes, before reading);
+//     and maxBuildManifestBytes on each blob that is read whole: the image
+//     the index names, each manifest or index an index names, and each
+//     manifest's config. Those are checked by their place in the image, not
+//     by the media type their descriptor claims (containerd's unpack reads
+//     a manifest's config whole whatever it is called), and by the
+//     descriptor's size, before reading. Each must also be of the kind its
+//     place holds: an index names manifests or indexes, a manifest names an
+//     image config and layers;
 //   - every blob's bytes hash to the name it carries, even when containerd
 //     already holds that content: a build names only content it supplies,
 //     so it can never pick up another image's layer by its digest;
@@ -240,7 +246,7 @@ func buildArchiveTarget(layout, index []byte, blobs map[digest.Digest]int64) (oc
 	if !ok || size != m.Size {
 		return ocispec.Descriptor{}, fmt.Errorf("the build's image %s is not in its archive at size %d", m.Digest, m.Size)
 	}
-	if err := checkReadWholeSize(m); err != nil {
+	if err := checkReadWholeSize("the image", m); err != nil {
 		return ocispec.Descriptor{}, err
 	}
 	return ocispec.Descriptor{MediaType: m.MediaType, Digest: m.Digest, Size: m.Size}, nil
@@ -249,17 +255,14 @@ func buildArchiveTarget(layout, index []byte, blobs map[digest.Digest]int64) (oc
 // labelBuildImage walks the image from target, for this host's platform,
 // and labels each manifest and index with its children, as a pull does, so
 // containerd's garbage collector keeps them once the import's lease ends.
-// Every child must be a blob the archive carried.
+// Every child must be a blob the archive carried, of the kind its place in
+// the image holds, and no larger than maxBuildManifestBytes where it is
+// read whole (buildChildren).
 func labelBuildImage(ctx context.Context, cs content.Store, target ocispec.Descriptor, blobs map[digest.Digest]int64) error {
 	carried := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		return images.Children(ctx, cs, desc)
+		return buildChildren(ctx, cs, desc)
 	})
 	var walk images.HandlerFunc = func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-		// Checked before anything reads it: a manifest or index is read
-		// whole here, a config by the unpack.
-		if err := checkReadWholeSize(desc); err != nil {
-			return nil, err
-		}
 		children, err := images.FilterPlatforms(carried, platforms.Default())(ctx, desc)
 		if err != nil {
 			return nil, err
@@ -267,6 +270,16 @@ func labelBuildImage(ctx context.Context, cs content.Store, target ocispec.Descr
 		for _, c := range children {
 			if size, ok := blobs[c.Digest]; !ok || size != c.Size {
 				return nil, fmt.Errorf("the build's image names %s (size %d), which its archive does not carry", c.Digest, c.Size)
+			}
+			// An index's entries are read whole next (here and by the
+			// unpack), as manifests or indexes.
+			if isIndexType(desc.MediaType) {
+				if !isIndexType(c.MediaType) && !isManifestType(c.MediaType) {
+					return nil, fmt.Errorf("the build's image index names %s as %.64q, not a manifest or index", c.Digest, c.MediaType)
+				}
+				if err := checkReadWholeSize("an index entry", c); err != nil {
+					return nil, err
+				}
 			}
 		}
 		return children, nil
@@ -277,14 +290,57 @@ func labelBuildImage(ctx context.Context, cs content.Store, target ocispec.Descr
 	return nil
 }
 
-// checkReadWholeSize refuses a blob that is read whole into memory (every
-// one but a layer: manifests, indexes, configs) over maxBuildManifestBytes.
-func checkReadWholeSize(desc ocispec.Descriptor) error {
-	if images.IsLayerType(desc.MediaType) || desc.Size <= maxBuildManifestBytes {
+// buildChildren is images.Children with the checks a place in the image
+// needs. An index's or a manifest's own size was checked where it was named
+// (buildArchiveTarget, or its parent's walk), before this reads it whole. A
+// manifest's config must be an image config, small, since the unpack reads
+// it whole; its layers must be layers, since the unpack streams them as
+// such. Configs and layers have no children.
+func buildChildren(ctx context.Context, cs content.Provider, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+	switch {
+	case isIndexType(desc.MediaType):
+		return images.Children(ctx, cs, desc)
+	case isManifestType(desc.MediaType):
+		raw, err := content.ReadBlob(ctx, cs, desc)
+		if err != nil {
+			return nil, err
+		}
+		var m ocispec.Manifest
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("the build's manifest %s: %w", desc.Digest, err)
+		}
+		if m.Config.MediaType != ocispec.MediaTypeImageConfig && m.Config.MediaType != images.MediaTypeDockerSchema2Config {
+			return nil, fmt.Errorf("the build's manifest %s names its config %s as %.64q, not an image config", desc.Digest, m.Config.Digest, m.Config.MediaType)
+		}
+		if err := checkReadWholeSize("a config", m.Config); err != nil {
+			return nil, err
+		}
+		for _, l := range m.Layers {
+			if !images.IsLayerType(l.MediaType) {
+				return nil, fmt.Errorf("the build's manifest %s names %s as a layer of type %.64q, not a layer type", desc.Digest, l.Digest, l.MediaType)
+			}
+		}
+		return append([]ocispec.Descriptor{m.Config}, m.Layers...), nil
+	}
+	return nil, nil
+}
+
+func isIndexType(mt string) bool {
+	return mt == ocispec.MediaTypeImageIndex || mt == images.MediaTypeDockerSchema2ManifestList
+}
+
+func isManifestType(mt string) bool {
+	return mt == ocispec.MediaTypeImageManifest || mt == images.MediaTypeDockerSchema2Manifest
+}
+
+// checkReadWholeSize refuses a blob read whole into memory (the place it
+// holds: the image, an index entry, a config) over maxBuildManifestBytes.
+func checkReadWholeSize(place string, desc ocispec.Descriptor) error {
+	if desc.Size <= maxBuildManifestBytes {
 		return nil
 	}
-	return fmt.Errorf("the build's image names %s (%.64s) of %d bytes, more than the %d a manifest, index or config may be",
-		desc.Digest, desc.MediaType, desc.Size, maxBuildManifestBytes)
+	return fmt.Errorf("the build's image names %s, %s, of %d bytes, more than the %d a manifest, index or config may be",
+		desc.Digest, place, desc.Size, maxBuildManifestBytes)
 }
 
 // isSparse reports whether a tar header describes a sparse file, in GNU's

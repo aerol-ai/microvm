@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -209,5 +211,86 @@ func TestIngestBuildArchiveCapsEntries(t *testing.T) {
 	}
 	if len(cs.blobs) != maxBuildArchiveEntries {
 		t.Fatalf("%d blobs written, want the read to stop at the cap (%d)", len(cs.blobs), maxBuildArchiveEntries)
+	}
+}
+
+// A blob is read whole by its place in the image, whatever its media type
+// says (review of #1397, F2b): containerd's unpack reads the manifest's
+// config whole (image.RootFS) even when its descriptor calls it a layer,
+// and follows an index's entries as manifests. So the config must be a
+// config, small; an index's entries must be manifests or indexes, small;
+// and a manifest's layers must be layers.
+func TestImportBuildArchiveChecksBlobsByTheirPlace(t *testing.T) {
+	img := newOCIImage(t)
+	layout := archiveEntry{name: "oci-layout", typ: tar.TypeReg, body: []byte(`{"imageLayoutVersion":"1.0.0"}`)}
+	big := func(b []byte) []byte { // still valid JSON, one byte over the cap
+		return append(append([]byte{}, b...), bytes.Repeat([]byte(" "), maxBuildManifestBytes+1-len(b))...)
+	}
+	desc := func(mt string, b []byte) ocispec.Descriptor {
+		return ocispec.Descriptor{MediaType: mt, Digest: digest.FromBytes(b), Size: int64(len(b))}
+	}
+	manifest := func(config ocispec.Descriptor, layers ...ocispec.Descriptor) []byte {
+		m, _ := json.Marshal(ocispec.Manifest{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: ocispec.MediaTypeImageManifest, Config: config, Layers: layers})
+		return m
+	}
+	archive := func(target ocispec.Descriptor, blobs ...[]byte) []archiveEntry {
+		var e []archiveEntry
+		for _, b := range blobs {
+			e = append(e, blobEntry(b))
+		}
+		return append(e, archiveEntry{name: "index.json", typ: tar.TypeReg, body: indexOf(target)}, layout)
+	}
+	p := platforms.DefaultSpec()
+
+	// The reviewer's PoC: the config, past the cap, called a layer.
+	bigConfig := big(img.config)
+	m1 := manifest(desc(ocispec.MediaTypeImageLayerGzip, bigConfig), img.layerD)
+	// A small config that is not an image config at all.
+	m2 := manifest(desc("application/vnd.example.not-a-config", img.config), img.layerD)
+	// A layer that is not a layer.
+	m3 := manifest(img.configD, desc(ocispec.MediaTypeImageConfig, img.layer))
+	// An index whose entry for this platform, past the cap, calls itself a
+	// layer, and one whose entry is a config.
+	bigManifest := big(img.manifest)
+	asLayer := desc(ocispec.MediaTypeImageLayerGzip, bigManifest)
+	asLayer.Platform = &p
+	idx1 := indexOf(asLayer)
+	asConfig := desc(ocispec.MediaTypeImageConfig, img.manifest)
+	asConfig.Platform = &p
+	idx2 := indexOf(asConfig)
+
+	for _, tc := range []struct {
+		name    string
+		entries []archiveEntry
+		want    string
+	}{
+		{"a config past the cap called a layer", archive(desc(ocispec.MediaTypeImageManifest, m1), bigConfig, img.layer, m1), "config"},
+		{"a config that is no image config", archive(desc(ocispec.MediaTypeImageManifest, m2), img.config, img.layer, m2), "config"},
+		{"a layer that is no layer", archive(desc(ocispec.MediaTypeImageManifest, m3), img.config, img.layer, m3), "layer"},
+		{"an index entry past the cap called a layer", archive(desc(ocispec.MediaTypeImageIndex, idx1), img.config, img.layer, bigManifest, idx1), "index"},
+		{"an index entry that is a config", archive(desc(ocispec.MediaTypeImageIndex, idx2), img.config, img.layer, img.manifest, idx2), "index"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, backend, _, _ := buildImportFixture(t)
+			err := d.ImportBuildArchive(context.Background(), builtTag, bytes.NewReader(tarOf(t, tc.entries)), 1<<30, nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want it refused naming the %s", err, tc.want)
+			}
+			if backend.createdArg.Name != "" || backend.unpacked {
+				t.Fatal("named or unpacked")
+			}
+		})
+	}
+	// Docker's media types are the same places: an image in Docker's
+	// format still imports.
+	dm, _ := json.Marshal(struct {
+		SchemaVersion int                  `json:"schemaVersion"`
+		MediaType     string               `json:"mediaType"`
+		Config        ocispec.Descriptor   `json:"config"`
+		Layers        []ocispec.Descriptor `json:"layers"`
+	}{2, images.MediaTypeDockerSchema2Manifest, desc(images.MediaTypeDockerSchema2Config, img.config), []ocispec.Descriptor{desc(images.MediaTypeDockerSchema2LayerGzip, img.layer)}})
+	d, backend, _, _ := buildImportFixture(t)
+	if err := d.ImportBuildArchive(context.Background(), builtTag, bytes.NewReader(tarOf(t, archive(desc(images.MediaTypeDockerSchema2Manifest, dm), img.config, img.layer, dm))), 1<<30, nil); err != nil || backend.createdArg.Name != builtTag {
+		t.Fatalf("a Docker-format image: %v", err)
 	}
 }
