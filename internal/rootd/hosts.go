@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -167,15 +168,20 @@ func (h *hostCalls) limitsOf(l hostLauncher, req *rootdpb.HostLimits) (rootpolic
 }
 
 // running answers the first process in a host's group, 0 when it holds
-// none.
-func (h *hostCalls) running(group string) (pid int, ticks uint64, err error) {
+// none. A pid is at most pid_max (2^22), so a number past MaxInt32 in
+// cgroup.procs is not one and is skipped; the bound also lets the wire's
+// uint32 take it without a wrap.
+func (h *hostCalls) running(group string) (pid uint32, ticks uint64, err error) {
 	procs, err := h.kernel.Procs(group)
 	if err != nil {
 		return 0, 0, err
 	}
 	for _, p := range procs {
+		if p <= 0 || p > math.MaxInt32 {
+			continue
+		}
 		if t, err := h.kernel.StartTicks(p); err == nil {
-			return p, t, nil
+			return uint32(p), t, nil
 		}
 	}
 	return 0, 0, nil
@@ -223,7 +229,7 @@ func (h *hostCalls) spawnHost(ctx context.Context, req *rootdpb.SpawnHostRequest
 	if pid, ticks, err := h.running(group); err != nil {
 		return nil, err
 	} else if pid > 0 {
-		return &rootdpb.SpawnHostResponse{Pid: uint32(pid), StartTicks: ticks, Already: true, Socket: l.socket(id)}, nil
+		return &rootdpb.SpawnHostResponse{Pid: pid, StartTicks: ticks, Already: true, Socket: l.socket(id)}, nil
 	}
 	// The kind's own checks come first, so a refused request leaves no
 	// group behind.
@@ -372,7 +378,7 @@ func (h *hostCalls) listHosts(req *rootdpb.ListHostsRequest) (*rootdpb.ListHosts
 		if err != nil {
 			return nil, err
 		}
-		resp.Hosts = append(resp.Hosts, &rootdpb.RunningHost{Kind: kindOfName(hk.kind), Id: hk.id, Pid: uint32(pid), StartTicks: ticks})
+		resp.Hosts = append(resp.Hosts, &rootdpb.RunningHost{Kind: kindOfName(hk.kind), Id: hk.id, Pid: pid, StartTicks: ticks})
 	}
 	return resp, nil
 }

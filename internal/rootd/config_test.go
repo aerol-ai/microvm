@@ -3,6 +3,7 @@ package rootd
 import (
 	"errors"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"os/user"
@@ -311,6 +312,14 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"a V8 seccomp mode no jail has", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_SECCOMP_MODE": "loose", "SB_HOST_MEMORY_MB": "1"}, nil, "seccomp mode"},
 		{"the V8 jail as the agent", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ROOTD_AGENT_UID": "4000", "SB_ISOLATE_JAIL_UID": "4000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
 		{"a host-process cgroup parent at the root", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_HOST_PROCESS_CGROUP_PARENT": "/", "SB_HOST_MEMORY_MB": "1"}, nil, "host-process cgroup parent"},
+		// The V8 jail takes the agent's uid as an int.
+		{"a V8 agent uid past MaxInt32", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ROOTD_AGENT_UID": "2147483648", "SB_HOST_MEMORY_MB": "1"}, nil, "the V8 jail takes uids up to"},
+		// A worker id past uid_t would wrap: 4294967296 onto root, and
+		// 4295032827 onto the agent (65531). The uids stop at the shared uid
+		// check; the gid at the hosts' own (TestHostsConfigRefusesWrappingIDs).
+		{"a WASM worker uid that wraps onto root", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_UID": "4294967296", "SB_HOST_MEMORY_MB": "1"}, nil, "not a uid"},
+		{"a WASM worker uid that wraps onto the agent", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_UID": "4295032827", "SB_HOST_MEMORY_MB": "1"}, nil, "not a uid"},
+		{"a WASM worker gid that wraps", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_GID": "4294967296", "SB_HOST_MEMORY_MB": "1"}, nil, "want ids below"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubHost(t, 0, tc.host)
@@ -322,6 +331,39 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 				t.Fatalf("ConfigFromEnv = %v, want an error naming %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestHostsConfigRefusesWrappingIDs: the hosts' own check compares the
+// WASM worker's ids with the agent's as int64, so a value past uid_t, set
+// in code or through the environment, never wraps onto root or the agent.
+func TestHostsConfigRefusesWrappingIDs(t *testing.T) {
+	good := func() HostsConfig {
+		return HostsConfig{LogPath: "/var/lib/aerolvm-rootd/hosts.log", Wasm: &WasmHostsConfig{
+			Binary: "/usr/local/bin/aerolvm-rootd", UID: 61000, GID: 61000, SocketDir: DefaultWasmSocketDir,
+			AgentUID: 65531, ReadyWait: time.Second}}
+	}
+	if err := good().validate(); err != nil {
+		t.Fatalf("a good config: %v", err)
+	}
+	var big int64 = math.MaxUint32
+	for _, tc := range []struct {
+		name     string
+		uid, gid int64
+		want     string
+	}{
+		{"uid (uid_t)-1", big, 61000, "want ids below"},
+		{"uid wrapping onto root", big + 1, 61000, "want ids below"},
+		{"uid wrapping onto the agent", big + 1 + 65531, 61000, "want ids below"},
+		{"gid (gid_t)-1", 61000, big, "want ids below"},
+		{"uid the agent's", 65531, 61000, "neither root nor the agent"},
+		{"uid root", 0, 61000, "neither root nor the agent"},
+	} {
+		h := good()
+		h.Wasm.UID, h.Wasm.GID = int(tc.uid), int(tc.gid)
+		if err := h.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
+		}
 	}
 }
 

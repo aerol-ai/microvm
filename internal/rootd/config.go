@@ -183,7 +183,12 @@ func (h HostsConfig) validate() error {
 		if w.CacheRoot != "" && (!filepath.IsAbs(w.CacheRoot) || filepath.Clean(w.CacheRoot) != w.CacheRoot) {
 			return fmt.Errorf("root helper: WASM compile cache root %q: want a clean absolute path", w.CacheRoot)
 		}
-		if w.UID <= 0 || w.GID <= 0 || uint32(w.UID) == w.AgentUID {
+		// Compared as int64, so no setting wraps onto root or the agent;
+		// (uid_t)-1 and past is no user at all.
+		if int64(w.UID) >= math.MaxUint32 || int64(w.GID) >= math.MaxUint32 {
+			return fmt.Errorf("root helper: WASM worker user %d:%d: want ids below %d", w.UID, w.GID, uint32(math.MaxUint32))
+		}
+		if w.UID <= 0 || w.GID <= 0 || int64(w.UID) == int64(w.AgentUID) {
 			return fmt.Errorf("root helper: WASM worker user %d:%d must be neither root nor the agent", w.UID, w.GID)
 		}
 		if w.ReadyWait <= 0 {
@@ -687,6 +692,11 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 	shim, err := selfExecutable()
 	if err != nil {
 		return h, fmt.Errorf("root helper: its own binary, the V8 jail's shim: %w", err)
+	}
+	// The jail takes the agent's uid as an int, which is 32 bits on a
+	// 32-bit build.
+	if agentUID > math.MaxInt32 {
+		return h, fmt.Errorf("SB_ROOTD_AGENT_UID=%d: the V8 jail takes uids up to %d", agentUID, math.MaxInt32)
 	}
 	base := path("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail")
 	for _, a := range agentDirs {

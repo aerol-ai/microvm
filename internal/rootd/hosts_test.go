@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -500,6 +501,35 @@ func TestHostsPrepareKeepsARunningHost(t *testing.T) {
 	}
 	if calls := l.seen(); !slices.Contains(calls, "prepare g1 running=true") {
 		t.Fatalf("prepare did not hear the host runs: %v", calls)
+	}
+}
+
+// TestHostsRunningSkipsNonPids: a number in cgroup.procs below 1 or past
+// MaxInt32 is no pid, so running skips it and the wire's uint32 never
+// takes a wrapped one. The fake pids are never signalled: this test makes
+// no rig, whose cleanup kills what its groups hold.
+func TestHostsRunningSkipsNonPids(t *testing.T) {
+	k := newFakeHostKernel()
+	h := &hostCalls{kernel: k}
+	group := rootpolicy.HostGroup(rootpolicy.HostWorkerd, "g")
+	past := int64(math.MaxInt32)
+	past++
+	wraps := past + 4242 // uint32 of it is 4242
+	k.groups[group] = []int{-1, 0, int(past), int(wraps), 4242}
+	for _, p := range k.groups[group] {
+		k.ticks[p] = 7
+	}
+	if pid, ticks, err := h.running(group); err != nil || pid != 4242 || ticks != 7 {
+		t.Fatalf("running = %d, %d, %v; want 4242, 7", pid, ticks, err)
+	}
+	k.groups[group] = []int{int(wraps)}
+	if pid, _, err := h.running(group); err != nil || pid != 0 {
+		t.Fatalf("only a number past MaxInt32: running = %d, %v; want none", pid, err)
+	}
+	k.groups[group] = []int{math.MaxInt32}
+	k.ticks[math.MaxInt32] = 9
+	if pid, ticks, err := h.running(group); err != nil || pid != math.MaxInt32 || ticks != 9 {
+		t.Fatalf("MaxInt32 itself: running = %d, %d, %v; want it", pid, ticks, err)
 	}
 }
 
