@@ -52,7 +52,6 @@ type Step string
 const (
 	StepImageUser     Step = "image_user"
 	StepDiskQuota     Step = "disk_quota"
-	StepMounts        Step = "external_mounts"
 	StepHostProcesses Step = "host_processes"
 	StepContainerFile Step = "container_files"
 	StepWarmPool      Step = "warm_pool"
@@ -64,7 +63,6 @@ const (
 var steps = map[Step]string{
 	StepImageUser:     "reading an image's users from its root filesystem",
 	StepDiskQuota:     "the disk quota on a sandbox's writable layer",
-	StepMounts:        "external storage mounts",
 	StepHostProcesses: "the WASM, V8-isolate and Firecracker runtimes' host processes",
 	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
 	StepWarmPool:      "the containerd warm pool's parked sandboxes",

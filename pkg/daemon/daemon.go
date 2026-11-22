@@ -44,7 +44,6 @@ import (
 	fcapi "github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
@@ -269,15 +268,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// worker pod, the runtime container's group, so an agent restart leaves
 	// them serving); in a split pod each mount is checked visible to the
 	// runtime before a create answers, and a pod set up without external
-	// storage refuses it (F13).
-	mountManager, err := mounts.New(logger, mounts.Config{
-		RootDir:        cfg.MountsRootPath,
-		CredDir:        cfg.MountsCredentialsRuntimeDir,
-		WaitTimeout:    cfg.MountWaitTimeout,
-		CgroupRoot:     cfg.HostProcessCgroupRoot(),
-		RuntimePIDFile: cfg.MountsRuntimePIDFile,
-		Unavailable:    mountsOff,
-	})
+	// storage refuses it (F13). In privilege mode split the root helper
+	// mounts, and this manager sends it each call (splitMountManager).
+	mountManager, setMountHelper, err := newMountManager(cfg, logger, mountsOff)
 	if err != nil {
 		return fmt.Errorf("initialize mount manager: %w", err)
 	}
@@ -420,6 +413,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		defer func() { _ = helper.Close() }()
 		engineHelper = helper
 	}
+	setMountHelper(helper)
 	if cfg.ContainerEngine == models.ContainerEngineContainerd {
 		var subnet string
 		var err error
