@@ -11,12 +11,31 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 	"go.opentelemetry.io/otel/attribute"
 )
 
 func (s *Service) isWasmSandbox(sandbox *models.Sandbox) bool {
 	return sandbox != nil && sandbox.Runtime == models.RuntimeWasm
+}
+
+// mountCtxFor makes the mounts started under ctx usable by the sandbox's
+// WASM worker, which drops to its own uid (mounts.Consumer). Other
+// runtimes' mounts are used by root, as they always were.
+func (s *Service) mountCtxFor(ctx context.Context, sandbox *models.Sandbox) context.Context {
+	if !s.isWasmSandbox(sandbox) {
+		return ctx
+	}
+	return s.wasmMountCtx(ctx)
+}
+
+func (s *Service) wasmMountCtx(ctx context.Context) context.Context {
+	c := worker.ConfinementFor(s.cfg.WasmWorkerDropPrivs, s.cfg.WasmWorkerUID, s.cfg.WasmWorkerGID)
+	if !c.Enabled() {
+		return ctx
+	}
+	return mounts.WithConsumer(ctx, mounts.Consumer{UID: c.UID, GID: c.GID})
 }
 
 // createWasmSandbox is the WASM runtime create path (plans/wasm-runtime.md).
@@ -141,7 +160,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			return nil, sealErr
 		}
 		var mountErr error
-		binds, mountErr = s.mounts.MountAll(ctx, sandboxID, req.Mounts)
+		binds, mountErr = s.mounts.MountAll(s.wasmMountCtx(ctx), sandboxID, req.Mounts)
 		if mountErr != nil {
 			releaseAdmission()
 			return nil, fmt.Errorf("mount external storage: %w", mountErr)

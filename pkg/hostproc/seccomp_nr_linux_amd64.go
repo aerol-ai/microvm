@@ -1,17 +1,18 @@
 //go:build linux && amd64
 
-package isolate
+package hostproc
 
 import "golang.org/x/sys/unix"
 
-func seccompAuditArch() uint32 { return auditArchX86_64 }
+// SeccompArch is the audit architecture BuildSeccomp checks on this host.
+func SeccompArch() uint32 { return AuditArchX86_64 }
 
-// seccompSyscallTable maps the names the driver's allowlist may use onto
-// x86-64 numbers. Names are resolved at spawn, so a name missing here is
+// SyscallTable maps the names the seccomp policies may use onto x86-64
+// numbers. Names are resolved at spawn, so a name missing here is
 // reported once and skipped rather than failing the build; a name present
 // here but absent from the kernel headers is a compile error, which is the
 // point of spelling them as unix.SYS_* constants.
-func seccompSyscallTable() map[string]int {
+func SyscallTable() map[string]int {
 	return map[string]int{
 		"read": unix.SYS_READ, "write": unix.SYS_WRITE, "readv": unix.SYS_READV, "writev": unix.SYS_WRITEV,
 		"pread64": unix.SYS_PREAD64, "pwrite64": unix.SYS_PWRITE64, "close": unix.SYS_CLOSE, "lseek": unix.SYS_LSEEK,
@@ -62,5 +63,33 @@ func seccompSyscallTable() map[string]int {
 		"uname": unix.SYS_UNAME, "sysinfo": unix.SYS_SYSINFO, "setpriority": unix.SYS_SETPRIORITY, "getpriority": unix.SYS_GETPRIORITY,
 		"prlimit64": unix.SYS_PRLIMIT64, "getrlimit": unix.SYS_GETRLIMIT, "getcpu": unix.SYS_GETCPU,
 		"execve": unix.SYS_EXECVE,
+		// The WASM worker's extras: Go's file copies and links, and the
+		// legacy names its *at calls replace (same operations, never more).
+		"accept": unix.SYS_ACCEPT, "copy_file_range": unix.SYS_COPY_FILE_RANGE,
+		"sendfile": unix.SYS_SENDFILE, "splice": unix.SYS_SPLICE, "tee": unix.SYS_TEE,
+		"linkat": unix.SYS_LINKAT, "symlinkat": unix.SYS_SYMLINKAT, "fchmod": unix.SYS_FCHMOD, "fchmodat": unix.SYS_FCHMODAT,
+		"openat2": unix.SYS_OPENAT2, "unlink": unix.SYS_UNLINK, "rmdir": unix.SYS_RMDIR, "rename": unix.SYS_RENAME,
+		"mkdir": unix.SYS_MKDIR, "link": unix.SYS_LINK, "symlink": unix.SYS_SYMLINK, "chmod": unix.SYS_CHMOD,
+		// Named only to be refused (kill lists and fallbacks).
+		"ptrace": unix.SYS_PTRACE, "process_vm_readv": unix.SYS_PROCESS_VM_READV, "process_vm_writev": unix.SYS_PROCESS_VM_WRITEV,
+		"mount": unix.SYS_MOUNT, "umount2": unix.SYS_UMOUNT2, "pivot_root": unix.SYS_PIVOT_ROOT, "chroot": unix.SYS_CHROOT,
+		"setns": unix.SYS_SETNS, "unshare": unix.SYS_UNSHARE, "init_module": unix.SYS_INIT_MODULE,
+		"finit_module": unix.SYS_FINIT_MODULE, "delete_module": unix.SYS_DELETE_MODULE, "kexec_load": unix.SYS_KEXEC_LOAD,
+		"kexec_file_load": unix.SYS_KEXEC_FILE_LOAD, "open_by_handle_at": unix.SYS_OPEN_BY_HANDLE_AT,
+		"name_to_handle_at": unix.SYS_NAME_TO_HANDLE_AT, "perf_event_open": unix.SYS_PERF_EVENT_OPEN, "bpf": unix.SYS_BPF,
+		"userfaultfd": unix.SYS_USERFAULTFD, "keyctl": unix.SYS_KEYCTL, "add_key": unix.SYS_ADD_KEY,
+		"request_key": unix.SYS_REQUEST_KEY, "reboot": unix.SYS_REBOOT, "swapon": unix.SYS_SWAPON, "swapoff": unix.SYS_SWAPOFF,
+		"sethostname": unix.SYS_SETHOSTNAME, "setdomainname": unix.SYS_SETDOMAINNAME, "iopl": unix.SYS_IOPL,
+		"ioperm": unix.SYS_IOPERM, "quotactl": unix.SYS_QUOTACTL, "fsopen": unix.SYS_FSOPEN, "fsconfig": unix.SYS_FSCONFIG,
+		"fsmount": unix.SYS_FSMOUNT, "fspick": unix.SYS_FSPICK, "move_mount": unix.SYS_MOVE_MOUNT, "open_tree": unix.SYS_OPEN_TREE,
+		"mount_setattr": unix.SYS_MOUNT_SETATTR, "execveat": unix.SYS_EXECVEAT, "setuid": unix.SYS_SETUID,
+		"setgid": unix.SYS_SETGID, "setresuid": unix.SYS_SETRESUID, "setresgid": unix.SYS_SETRESGID,
+		"setreuid": unix.SYS_SETREUID, "setregid": unix.SYS_SETREGID, "setgroups": unix.SYS_SETGROUPS,
+		"setfsuid": unix.SYS_SETFSUID, "setfsgid": unix.SYS_SETFSGID, "capset": unix.SYS_CAPSET,
+		"io_uring_setup": unix.SYS_IO_URING_SETUP, "io_uring_enter": unix.SYS_IO_URING_ENTER,
+		"io_uring_register": unix.SYS_IO_URING_REGISTER, "acct": unix.SYS_ACCT, "settimeofday": unix.SYS_SETTIMEOFDAY,
+		"clock_settime": unix.SYS_CLOCK_SETTIME, "clock_adjtime": unix.SYS_CLOCK_ADJTIME, "adjtimex": unix.SYS_ADJTIMEX,
+		"pidfd_getfd": unix.SYS_PIDFD_GETFD, "seccomp": unix.SYS_SECCOMP, "syslog": unix.SYS_SYSLOG,
+		"mknod": unix.SYS_MKNOD, "mknodat": unix.SYS_MKNODAT,
 	}
 }

@@ -111,7 +111,7 @@ func cover96_funcs() {
 	cover96Call(func() { ServeSocketPathResident(zero96[string]()) })              // resident_server.go:387
 	cover96Call(func() { installDefaultEgressObserver(zero96[*NetMediator]()) })   // egress_audit.go:103
 	cover96Call(func() { postWorkerEgressAudit(zero96[egressAuditJob]()) })        // egress_audit.go:211
-	cover96Call(func() { workerEnvironment() })                                    // supervisor.go:49
+	cover96Call(func() { workerEnvironment(context.Background()) })                // supervisor.go:49
 	cover96Call(func() { writeFrame(zero96[io.Writer](), zero96[Envelope]()) })    // codec.go:12
 }
 

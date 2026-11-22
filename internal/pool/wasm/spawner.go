@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -19,6 +20,10 @@ type SupervisorSpawner struct {
 	Supervisor *worker.Supervisor
 	PingWait   time.Duration
 	MemoryMB   int
+	// CompileCache, when set, names the compile cache for the worker of the
+	// slot whose folder it is given (the WASM driver's SlotCompileCache).
+	// Without one the worker compiles every module from scratch.
+	CompileCache func(slotDir string) string
 }
 
 // NewSupervisorSpawner constructs a spawner backed by worker.Supervisor.
@@ -37,11 +42,19 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 	if memoryMB <= 0 {
 		memoryMB = s.MemoryMB
 	}
+	if s.CompileCache != nil {
+		if dir := s.CompileCache(filepath.Dir(socketPath)); dir != "" {
+			ctx = worker.WithCompileCache(ctx, dir)
+		}
+	}
 	if err := s.Supervisor.Ensure(ctx, slotID, socketPath); err != nil {
 		return fmt.Errorf("ensure worker: %w", err)
 	}
 	client := worker.NewClient(socketPath)
 	deadline := time.Now().Add(s.PingWait)
+	// The worker's ready signal wakes the wait early, once; it is polled as
+	// before when it does not signal (worker.Supervisor.Ready).
+	ready := s.Supervisor.Ready(slotID)
 	attempt := 0
 	for {
 		if err := client.Ping(slotID); err == nil {
@@ -53,7 +66,9 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 		if time.Now().After(deadline) {
 			return fmt.Errorf("worker not ready at %s", socketPath)
 		}
-		worker.ReadyPollSleep(ctx, attempt)
+		if worker.ReadyPollSleepOr(ctx, attempt, ready) {
+			ready = nil
+		}
 		attempt++
 	}
 	if _, err := client.LoadModule(slotID, modulePath, memoryMB); err != nil {

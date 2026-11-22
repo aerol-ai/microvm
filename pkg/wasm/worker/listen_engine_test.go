@@ -28,7 +28,7 @@ func TestLoadedEngineName(t *testing.T) {
 // environment.
 func TestWorkerEnvironmentCarriesListenFallback(t *testing.T) {
 	t.Setenv(ListenFallbackEnv, "false")
-	if !slices.Contains(workerEnvironment(), ListenFallbackEnv+"=false") {
+	if !slices.Contains(workerEnvironment(nil), ListenFallbackEnv+"=false") {
 		t.Fatalf("worker environment lacks %s", ListenFallbackEnv)
 	}
 }

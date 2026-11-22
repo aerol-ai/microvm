@@ -16,10 +16,13 @@ import (
 
 // Server holds one wazero engine per worker process (D11: one module per worker).
 type Server struct {
-	mu            sync.Mutex
-	eng           wasmengine.Engine
-	lastCaps      wasmengine.Capabilities
-	net           *NetMediator
+	mu       sync.Mutex
+	eng      wasmengine.Engine
+	lastCaps wasmengine.Capabilities
+	// net is the dial mediator, built once by mediator(): connections are
+	// served at once, and some messages reach it without mu.
+	net           atomic.Pointer[NetMediator]
+	netOnce       sync.Once
 	auditMu       sync.RWMutex
 	auditBindings map[string]egressAuditBinding
 	// workerNet accumulates guest-side IO proxy bytes until MsgNetstatsTick
@@ -104,23 +107,21 @@ func (s *Server) netUsageFor(sandboxID string) *workerNetUsage {
 }
 
 func (s *Server) mediator() *NetMediator {
-	if s.net == nil {
-		s.net = newNetMediator()
+	s.netOnce.Do(func() {
+		m := newNetMediator()
 		// Worker process: append egress destinations to the daemon's audit JSONL
 		// (cannot import internal/service). Dial-path only; never create.
-		installDefaultEgressObserver(s.net, s.auditBinding)
-		installOperatorGuard(s.net)
-	}
-	return s.net
+		installDefaultEgressObserver(m, s.auditBinding)
+		installOperatorGuard(m)
+		s.net.Store(m)
+	})
+	return s.net.Load()
 }
 
 // close stops the mediator's operator-file poll and every stream with the worker.
 func (s *Server) close() {
 	s.streams.closeAll()
-	s.mu.Lock()
-	m := s.net
-	s.mu.Unlock()
-	m.stopOperatorWatch()
+	s.net.Load().stopOperatorWatch()
 }
 
 // serverStreamHost adapts Server to the shared stream code, taking s.mu for
@@ -251,7 +252,7 @@ func (s *Server) Serve(conn net.Conn) error {
 	}
 
 	for {
-		env, err := readFrame(conn)
+		env, err := readGrantedFrame(conn)
 		if err != nil {
 			return err
 		}
@@ -521,7 +522,10 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			capture.Config = p.Meta
-			if err := wasmengine.WriteSnapshotDir(p.OutDir, capture); err != nil {
+			// Through the directory sandboxd granted for the checkpoint.
+			if err := wasmengine.WithHostPath(p.OutDir, func(out string) error {
+				return wasmengine.WriteSnapshotDir(out, capture)
+			}); err != nil {
 				if replyErr(env.SandboxID, err) != nil {
 					return err
 				}
@@ -743,6 +747,10 @@ func (s *Server) Serve(conn net.Conn) error {
 			if err := s.serveListenPorts(ctx, conn, env); err != nil {
 				return err
 			}
+		case MsgGuestListener:
+			if err := s.serveGuestListener(conn, env); err != nil {
+				return err
+			}
 		case MsgNetstatsTick:
 			sandboxID := strings.TrimSpace(env.SandboxID)
 			u := s.netUsageFor(sandboxID)
@@ -788,13 +796,5 @@ func ServeSocketPath(socketPath string) error {
 	defer ln.Close()
 	srv := &Server{}
 	defer srv.close()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go func(c net.Conn) {
-			_ = srv.Serve(c)
-		}(conn)
-	}
+	return serveListener(ln, srv)
 }

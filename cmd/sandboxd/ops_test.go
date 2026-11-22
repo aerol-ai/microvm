@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // opsHost is a stopped node for the backup, restore and recover-quorum
@@ -219,6 +220,7 @@ func TestIsDaemonArgv(t *testing.T) {
 		"isolate.JailShimFlag":   isolate.JailShimFlag,
 		"cntr.ContextUnpackFlag": cntr.ContextUnpackFlag,
 		"pkcs11.HelperFlag":      pkcs11.HelperFlag,
+		"worker.PrecompileFlag":  worker.PrecompileFlag,
 	}
 	src, err := os.ReadFile("main.go")
 	if err != nil {

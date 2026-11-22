@@ -3,6 +3,7 @@
 package gate
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"os"
@@ -190,7 +191,7 @@ func TestRuncPlantRefused(t *testing.T) {
 	s.Mounts = []specs.Mount{{Type: "bind", Source: hosts + "/" + testID + "/resolv.conf", Destination: "/host", Options: []string{"rbind", "rw"}}}
 	c := goodContainer(t)
 	c.Spec = specAny(t, s)
-	err = g.checkBinds(policyContainer(c))
+	err = g.checkContainer(context.Background(), policyContainer(c))
 	if rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
 		t.Fatalf("the gate let the planted bind through: %v", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -67,7 +66,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	}
 
 	workDir := d.sandboxDir(sandbox.ID)
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := d.ensureWorkDir(workDir); err != nil {
 		return nil, err
 	}
 	socketPath, err := d.ownWorkerSocket(sandbox.ID)
@@ -76,11 +75,12 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	}
 	workerKey := sandbox.ID
 
-	if err := d.supervisor.Ensure(ctx, workerKey, socketPath); err != nil {
+	legacyRoot := d.legacyRoot(sandbox.ID, hostMounts)
+	if err := d.supervisor.Ensure(d.workerStartCtx(ctx, sandbox.ID, sandbox.OwnerRef, legacyRoot), workerKey, socketPath); err != nil {
 		return nil, fmt.Errorf("start worker: %w", err)
 	}
 	client := d.newWorkerClient(socketPath)
-	if err := d.waitWorker(ctx, client, sandbox.ID); err != nil {
+	if err := d.waitWorker(ctx, client, sandbox.ID, workerReady(d.supervisor, workerKey)); err != nil {
 		return nil, err
 	}
 	spawnCount := 0
@@ -118,6 +118,8 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 
 	inst := &sandboxInstance{
 		sandboxID:        sandbox.ID,
+		ownerRef:         sandbox.OwnerRef,
+		legacyRoot:       legacyRoot,
 		moduleRef:        moduleRef,
 		modulePath:       modulePath,
 		moduleDigest:     moduleDigest,

@@ -1,6 +1,7 @@
 package mounts
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -216,7 +217,7 @@ var probeMount = func(hostPath string) mountProbe {
 
 // adoptOne takes over mount index of sandboxID when it is still served. It
 // returns nil when it is not, and the caller mounts it afresh.
-func (m *Manager) adoptOne(sandboxID string, index int, spec models.MountSpec, helpers []helperProcess) (*mountState, ContainerBind) {
+func (m *Manager) adoptOne(ctx context.Context, sandboxID string, index int, spec models.MountSpec, helpers []helperProcess) (*mountState, ContainerBind) {
 	adapter, ok := m.adapters[spec.Type]
 	if !ok {
 		return nil, ContainerBind{}
@@ -253,7 +254,22 @@ func (m *Manager) adoptOne(sandboxID string, index int, spec models.MountSpec, h
 		}
 		return state, bind
 	}
-	match := helperFor(helpers, plan.Argv)
+	// The helper runs either the plan as it is now (with the consumer's
+	// options) or, started before the consumer existed, the bare plan.
+	// Either is taken over as it runs: a live mount is never restarted.
+	c, hasConsumer := consumerFrom(ctx)
+	match := (*helperProcess)(nil)
+	if hasConsumer {
+		withConsumer := consumerArgv(spec.Type, slices.Clone(plan.Argv), c)
+		if match = helperFor(helpers, withConsumer); match != nil {
+			state.plan.Argv = withConsumer
+		}
+	}
+	if match == nil {
+		match = helperFor(helpers, plan.Argv)
+		state.rootOnly = fuseForRootOnly(spec.Type)
+		bind.RootOnly = state.rootOnly
+	}
 	if match == nil {
 		return nil, ContainerBind{}
 	}

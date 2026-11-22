@@ -30,8 +30,8 @@ func (c *stubWorkerNetstatsClient) Exec(string, wasmengine.Capabilities, string)
 	return wasmengine.RunResult{}, nil
 }
 func (c *stubWorkerNetstatsClient) StopInstance(string) error { return nil }
-func (c *stubWorkerNetstatsClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
-	return nil
+func (c *stubWorkerNetstatsClient) Checkpoint(_ context.Context, _ string, outDir string, _ wasmengine.SnapshotConfig) error {
+	return fakeSnapshotWrite(outDir)
 }
 func (c *stubWorkerNetstatsClient) Restore(string, string, wasmengine.Capabilities) error {
 	return nil

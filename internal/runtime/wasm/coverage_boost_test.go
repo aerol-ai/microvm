@@ -293,7 +293,7 @@ func TestEnsureResidentHostBringUpNotReadyHost(t *testing.T) {
 	d.residentBuckets[bucketID] = b
 	d.residentMu.Unlock()
 
-	if _, _, err := d.ensureResidentHost(context.Background(), "", "deadbeef", wasmmod.WriteMinimalWasm(t, d.cfg.ModulesDir, "demo.wasm"), d.cfg.DefaultMemoryMB, false); err != nil {
+	if _, _, err := d.ensureResidentHost(context.Background(), "", &wasmmod.ResolvedModule{Digest: "deadbeef", Path: wasmmod.WriteMinimalWasm(t, d.cfg.ModulesDir, "demo.wasm")}, d.cfg.DefaultMemoryMB, false); err != nil {
 		t.Fatalf("ensure not-ready host: %v", err)
 	}
 	if resident.ensureCalls != 1 {
@@ -347,7 +347,7 @@ func TestPrewarmResidentHostsContextCancel(t *testing.T) {
 func TestCreateOnResidentHostMkdirFailure(t *testing.T) {
 	d, _, _, _ := residentTestDriver(t, true)
 	resolved := &wasmmod.ResolvedModule{Path: wasmmod.WriteMinimalWasm(t, d.cfg.ModulesDir, "demo.wasm"), Digest: "deadbeef"}
-	if _, _, err := d.ensureResidentHost(context.Background(), "", resolved.Digest, resolved.Path, 64, false); err != nil {
+	if _, _, err := d.ensureResidentHost(context.Background(), "", resolved, 64, false); err != nil {
 		t.Fatalf("prewarm host: %v", err)
 	}
 	// Corrupt RunDir after the shared host exists so only the per-sandbox mkdir fails.

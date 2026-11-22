@@ -64,8 +64,22 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 		CloneGeneration: token,
 	}
 
+	// The worker writes into a staging folder of its own; mem.snap is
+	// published from it only once it is root's and checked
+	// (promoteCheckpoint).
+	inst.checkpointMu.Lock()
+	defer inst.checkpointMu.Unlock()
 	client := d.newWorkerClient(inst.socketPath)
-	if err := client.Checkpoint(ctx, sandbox.ID, outDir, meta); err != nil {
+	staged, err := d.stageCheckpoint(outDir)
+	if err == nil {
+		err = client.Checkpoint(ctx, sandbox.ID, staged, meta)
+		if err == nil {
+			err = d.promoteCheckpoint(staged, outDir)
+		} else {
+			_ = os.RemoveAll(filepath.Dir(staged))
+		}
+	}
+	if err != nil {
 		workerKey := inst.workerKey
 		if workerKey == "" {
 			workerKey = sandbox.ID

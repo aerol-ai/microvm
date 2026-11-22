@@ -44,6 +44,7 @@ type recordingWorkerClient struct {
 	stopped         bool
 	instantiateCaps []wasmengine.Capabilities
 	resolvedPort    int
+	checkpointErr   error
 }
 
 func (c *recordingWorkerClient) Ping(string) error { return nil }
@@ -66,8 +67,20 @@ func (c *recordingWorkerClient) StopInstance(string) error {
 	c.stopped = true
 	return nil
 }
-func (c *recordingWorkerClient) Checkpoint(context.Context, string, string, wasmengine.SnapshotConfig) error {
-	return nil
+func (c *recordingWorkerClient) Checkpoint(_ context.Context, _ string, outDir string, _ wasmengine.SnapshotConfig) error {
+	if c.checkpointErr != nil {
+		return c.checkpointErr
+	}
+	return fakeSnapshotWrite(outDir)
+}
+
+// fakeSnapshotWrite stands in for a worker's checkpoint: a mem.snap folder
+// of plain files at outDir, which the driver then publishes.
+func fakeSnapshotWrite(outDir string) error {
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(outDir, "config.json"), []byte("{}"), 0o600)
 }
 func (c *recordingWorkerClient) Restore(string, string, wasmengine.Capabilities) error { return nil }
 func (c *recordingWorkerClient) SetCapability(string, wasmengine.Capabilities) error   { return nil }

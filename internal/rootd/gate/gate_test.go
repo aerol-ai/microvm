@@ -205,18 +205,25 @@ func TestBindCheckRefusals(t *testing.T) {
 	r.storedContainer(goodContainer(t))
 	_, err = r.invoke(nsCtx(), task, &tasksapi.CreateTaskRequest{ContainerID: testID, Rootfs: overlayRootfs()})
 	r.wantRefused(err, task, string(rootpolicy.RuleMount))
-	// A source outside every root never reaches the disk check.
-	g := &Gate{policy: testPolicy(), binds: refuseBinds{}}
+	// The same, on the gate's own path: the container check, then the
+	// disk walk of each bind source.
+	g := &Gate{policy: testPolicy(), binds: refuseBinds{}, reads: &acceptReads{}}
 	c := policyContainer(goodContainer(t))
-	if err := g.checkBinds(c); rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
+	if err := g.checkContainer(context.Background(), c); rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
 		t.Fatalf("err %v", err)
 	}
+	// A source outside every root never reaches the disk check.
+	asked := &acceptBinds{}
+	g.binds = asked
 	g.policy.BindRoots, g.policy.BindFiles = nil, nil
-	if err := g.checkBinds(c); err == nil || rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
+	if err := g.checkBindSources([]string{testToolbox}); err == nil || rootpolicy.RuleOf(err) != rootpolicy.RuleMount {
 		t.Fatalf("a source outside every root: %v", err)
 	}
+	if len(asked.seen) != 0 {
+		t.Fatalf("the disk check was asked about %v", asked.seen)
+	}
 	c.Spec = []byte("{")
-	if err := g.checkBinds(c); rootpolicy.RuleOf(err) != rootpolicy.RuleSpec {
+	if err := g.checkContainer(context.Background(), c); rootpolicy.RuleOf(err) != rootpolicy.RuleSpec {
 		t.Fatalf("bad spec: %v", err)
 	}
 }

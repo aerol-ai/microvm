@@ -14,6 +14,13 @@ type ContainerBind struct {
 	// can write whatever user it runs as, without touching the host's disk.
 	Tmpfs     bool
 	TmpfsSize int64
+	// RootOnly marks an s3 or rclone mount whose tool lets only root in: it
+	// was started for no consumer (Consumer), for instance by a sandboxd
+	// from before WASM workers dropped their privileges and taken over as
+	// it was. A WASM sandbox with one keeps a root worker until it is
+	// recreated: a live mount is never restarted under it, since rclone may
+	// hold writes it has not flushed.
+	RootOnly bool
 }
 
 // TmpfsOptions returns the mount options for a Tmpfs bind.
