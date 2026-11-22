@@ -497,6 +497,11 @@ Each is small and stands alone. Together they shrink the root surface now.
       way split builds; split with it off fails boot) and off in single,
       so single keeps today's root buildkitd (D22, R18). Single can opt
       in.
+    - **One thing rootless BuildKit cannot do:** see containerd's images.
+      Every `FROM` comes from a registry, so an operator's build from an
+      image only the node has (a snapshot, an earlier build) needs the root
+      BuildKit. Tenant builds already refuse such images. Follow-up: hand
+      such a base to BuildKit as an OCI layout context.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts

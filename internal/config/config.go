@@ -355,6 +355,9 @@ type Config struct {
 	// SB_CONTAINERD_BUILDKIT_ROOTLESS; absent follows the privilege mode:
 	// on in split, the only way split builds, and off in single (eng review
 	// D22: single is today's mode). Split with it set false fails boot.
+	// A rootless buildkitd sees none of containerd's images: every FROM
+	// comes from its registry, so a build from an image only this node has
+	// (a snapshot, an earlier build) needs the root buildkitd.
 	ContainerdBuildKitRootless bool
 	// ContainerdBuildMaxImageBytes bounds the OCI archive one rootless build
 	// exports: sandboxd stops reading, and the build fails, past it.
