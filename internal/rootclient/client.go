@@ -75,6 +75,11 @@ const (
 	// 2 s of DefaultTimeout, 90 of 100 parallel builds failed while the
 	// helper still finished them).
 	DefaultNetworkTimeout = time.Minute
+	// DefaultMountTimeout bounds a mount call whose context has no
+	// deadline. A mount set waits for each of up to eight tools to serve
+	// (SB_MOUNT_WAIT_TIMEOUT each, 30 s by default), and an unmount or a
+	// sweep stops tools and unmounts, a few seconds each.
+	DefaultMountTimeout = 5 * time.Minute
 	// maxReconnectDelay caps gRPC's reconnect backoff. Its default grows to
 	// two minutes, and containerd's client to ten seconds; a helper that
 	// restarts (a crash, or the signed swap of eng review D4) is back in
@@ -149,6 +154,9 @@ type Config struct {
 	// NetworkTimeout bounds a network call (networkCalls) whose context
 	// has no deadline. Zero means DefaultNetworkTimeout.
 	NetworkTimeout time.Duration
+	// MountTimeout bounds a mount call (mountCalls) whose context has no
+	// deadline. Zero means DefaultMountTimeout.
+	MountTimeout time.Duration
 	// AgentVersion goes into the handshake, for the helper's log. Empty
 	// means this build's version.
 	AgentVersion string
@@ -198,6 +206,7 @@ type Client struct {
 	socket       string
 	timeout      time.Duration
 	netTimeout   time.Duration
+	mountTimeout time.Duration
 	agentVersion string
 	peer         egress.PeerCheck
 	onRefusal    RefusalFunc
@@ -216,7 +225,7 @@ type Client struct {
 
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
-	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, netTimeout: cfg.NetworkTimeout, agentVersion: cfg.AgentVersion,
+	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, netTimeout: cfg.NetworkTimeout, mountTimeout: cfg.MountTimeout, agentVersion: cfg.AgentVersion,
 		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal}
 	if c.socket == "" {
 		c.socket = DefaultSocket
@@ -226,6 +235,9 @@ func New(cfg Config) *Client {
 	}
 	if c.netTimeout <= 0 {
 		c.netTimeout = DefaultNetworkTimeout
+	}
+	if c.mountTimeout <= 0 {
+		c.mountTimeout = DefaultMountTimeout
 	}
 	if c.agentVersion == "" {
 		c.agentVersion = version.Version
@@ -591,7 +603,18 @@ func call[Req, Resp any](ctx context.Context, c *Client, feature string, req Req
 // gone"; MatchProcess is a read. HostPort sets a port's forward, removes
 // it, or makes the node's set exact: each "make it so", whatever the
 // first attempt did.
+//
+// The mount calls (M1 PR 8): UnmountExternal is "make sure it is gone",
+// and SweepExternalMounts removes what no sandbox keeps; both are safe to
+// run again. MountExternal is not tried again: a create's set refuses a
+// sandbox whose mounts serve, so a second try of one the first made would
+// fail it, and a dropped create is rolled back by the service's
+// UnmountAll (or the next sweep) like any failed one. A start's or a
+// reconcile's set is tried again by the next reconcile pass.
 var retrySafe = map[string]bool{
+	rootdpb.FeatureMountExternal:        false,
+	rootdpb.FeatureUnmountExternal:      true,
+	rootdpb.FeatureSweepExternalMounts:  true,
 	rootdpb.FeatureEnsureHost:           true,
 	rootdpb.FeatureEnsureHostFiles:      true,
 	rootdpb.FeatureEnsureTaskFIFOs:      true,
@@ -686,6 +709,9 @@ func (c *Client) callContext(ctx context.Context, feature string) (context.Conte
 	if networkCalls[feature] {
 		return context.WithTimeout(ctx, c.netTimeout)
 	}
+	if mountCalls[feature] {
+		return context.WithTimeout(ctx, c.mountTimeout)
+	}
 	return context.WithTimeout(ctx, c.timeout)
 }
 
@@ -708,6 +734,14 @@ var networkCalls = map[string]bool{
 	// Host-port forwarding waits on the xtables lock, and a node's whole
 	// set (up to its range's ports) is written rule by rule.
 	rootdpb.FeatureHostPort: true,
+}
+
+// mountCalls are the calls bounded by the mount timeout: they wait for
+// mount tools to serve, or stop them.
+var mountCalls = map[string]bool{
+	rootdpb.FeatureMountExternal:       true,
+	rootdpb.FeatureUnmountExternal:     true,
+	rootdpb.FeatureSweepExternalMounts: true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal

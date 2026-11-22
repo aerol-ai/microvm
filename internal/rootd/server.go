@@ -142,6 +142,9 @@ type Options struct {
 	// (imageuser.go, quota.go). Nil: the helper's own.
 	ReadImageFiles ImageFileReader
 	Quota          QuotaOps
+	// Mounts does the external mounts (mounts.go). Nil: the helper's own,
+	// from Config.Mounts; with neither, the helper serves no mount call.
+	Mounts MountManager
 }
 
 // Server is the helper's socket and gRPC server.
@@ -164,6 +167,8 @@ type Server struct {
 	// Shutdown closes the folders it works in.
 	locks     *keyedLocks
 	stopSweep func()
+	// mounts serves the external mounts; nil when this helper has none.
+	mounts *mountCalls
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -202,14 +207,24 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The mount folders too: the Manager makes them and checks each is
+	// the helper's own.
+	locks := &keyedLocks{}
+	mc, err := newMountCalls(cfg, opts, locks, log)
+	if err != nil {
+		f.close()
+		return nil, err
+	}
 	ln, sock := opts.Listener, os.FileInfo(nil)
 	if ln == nil {
 		if ln, sock, err = listen(cfg.Socket, cfg.SocketGID); err != nil {
 			f.close()
+			mc.close()
 			return nil, err
 		}
 	}
 	s.files, s.ln, s.sock = f, ln, sock
+	s.mounts = mc
 	sopts := append(slices.Clone(opts.ServerOptions),
 		grpc.MaxConcurrentStreams(maxStreams),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
@@ -217,13 +232,12 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		grpc.ChainUnaryInterceptor(answeredUnary, knownFieldsOnly),
 		grpc.ChainStreamInterceptor(answeredStream, s.endOnDrain))
 	s.srv = grpc.NewServer(sopts...)
-	locks := &keyedLocks{}
 	s.locks, s.stopSweep = locks, func() {}
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts)})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -324,6 +338,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		// after every handler has.
 		s.files.close()
 		s.fw.close()
+		s.mounts.close()
 	})
 }
 
@@ -462,6 +477,8 @@ type helper struct {
 	cg *sandboxCgroups
 	// ct serves the container's parts that read its snapshot.
 	ct *containerCalls
+	// mc serves the external mounts; nil when this helper has none.
+	mc *mountCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -482,6 +499,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.hp != nil {
 		served = append(served, hostPortFeatures...)
+	}
+	if h.mc != nil {
+		served = append(served, mountFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts()}, nil
 }
@@ -704,6 +724,36 @@ func (h helper) NetnsAddrs(ctx context.Context, req *rootdpb.NetnsAddrsRequest) 
 	}
 	resp, err := h.net.addrs(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_NetnsAddrs_FullMethodName, resp, err)
+}
+
+func (h helper) MountExternal(ctx context.Context, req *rootdpb.MountExternalRequest) (*rootdpb.MountExternalResponse, error) {
+	if h.mc == nil {
+		return nil, noMounts(rootdpb.FeatureMountExternal)
+	}
+	resp, err := h.mc.mountExternal(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_MountExternal_FullMethodName, resp, err)
+}
+
+func (h helper) UnmountExternal(ctx context.Context, req *rootdpb.UnmountExternalRequest) (*rootdpb.UnmountExternalResponse, error) {
+	if h.mc == nil {
+		return nil, noMounts(rootdpb.FeatureUnmountExternal)
+	}
+	resp, err := h.mc.unmountExternal(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_UnmountExternal_FullMethodName, resp, err)
+}
+
+func (h helper) SweepExternalMounts(ctx context.Context, req *rootdpb.SweepExternalMountsRequest) (*rootdpb.SweepExternalMountsResponse, error) {
+	if h.mc == nil {
+		return nil, noMounts(rootdpb.FeatureSweepExternalMounts)
+	}
+	resp, err := h.mc.sweep(req)
+	return answer(ctx, h, rootdpb.RootHelper_SweepExternalMounts_FullMethodName, resp, err)
+}
+
+// noMounts answers a mount call on a helper with no mount user, as one it
+// lacks, which is what Version told the agent.
+func noMounts(call string) error {
+	return status.Errorf(codes.Unimplemented, "root helper %s: %s needs a mount user (SB_ROOTD_MOUNT_USER) this node does not have", version.Version, call)
 }
 
 // noNetwork answers a network call on a helper with no network

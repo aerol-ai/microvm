@@ -47,6 +47,10 @@ const (
 	FeatureBridgeProbe          = "BridgeProbe"
 	FeatureMatchProcess         = "MatchProcess"
 	FeatureHostPort             = "HostPort"
+	// External storage mounts (M1 PR 8).
+	FeatureMountExternal       = "MountExternal"
+	FeatureUnmountExternal     = "UnmountExternal"
+	FeatureSweepExternalMounts = "SweepExternalMounts"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -98,7 +102,8 @@ func Features() []string {
 		FeatureEnsureRunscConfig, FeatureEnsureReadySocket, FeatureRemoveContainerFiles,
 		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs,
 		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox,
-		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort}
+		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort,
+		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

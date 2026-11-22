@@ -45,11 +45,13 @@ func TestConfigFromEnv(t *testing.T) {
 			Snapshotter:     "overlayfs",
 			SnapshotterRoot: "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs",
 			NetnsDir:        DefaultNetnsDir,
-			// Binds come from the external mounts and the helper's own
-			// files, never from the agent's run dir, ready dir or
-			// database folder (T2b).
-			BindRoots: []string{"/var/lib/sandboxd/mounts"},
-			BindFiles: []string{"/usr/local/bin/toolboxd"},
+			// Binds come from the external mounts the helper makes, in
+			// its own folder, and the helper's own files, never from the
+			// agent's run dir, ready dir, mounts root or database folder
+			// (T2b, M1 PR 8).
+			BindRoots:  []string{"/var/lib/aerolvm-rootd/mounts"},
+			MountsRoot: "/var/lib/aerolvm-rootd/mounts",
+			BindFiles:  []string{"/usr/local/bin/toolboxd"},
 			HelperFileRoots: []string{
 				"/var/lib/aerolvm-rootd/hosts",
 				"/run/aerolvm-rootd/ready",
@@ -115,7 +117,8 @@ func TestConfigFromEnv(t *testing.T) {
 		}, func(c *Config) {
 			p := &c.Policy
 			p.Namespace, p.CgroupParent, p.SnapshotterRoot, p.NetnsDir = "tenant-a", "/aerolvm.slice", "/data/containerd/snap", "/run/rootd-netns"
-			p.BindRoots, p.HelperFileRoots = []string{"/data/mounts"}, []string{"/data/rootd/hosts", "/run/rootd-ready"}
+			p.BindRoots, p.HelperFileRoots = []string{"/data/rootd/mounts"}, []string{"/data/rootd/hosts", "/run/rootd-ready"}
+			p.MountsRoot = "/data/rootd/mounts"
 			p.BindFiles = []string{"/opt/aerolvm/toolboxd"}
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
@@ -194,8 +197,10 @@ func TestHelperPolicyBindsOnlyItsFiles(t *testing.T) {
 		hosts + "/sb-1/egress-ca.pem": true,
 		ready + "/sb-1/0a1b.sock":     true,
 		ready + "/park-1/ready.sock":  true,
-		// The external mounts are folders, as today.
-		"/var/lib/sandboxd/mounts/sb-1/0": true,
+		// The external mounts are folders, in the helper's own folder,
+		// never the agent's mounts root.
+		"/var/lib/aerolvm-rootd/mounts/sb-1/0": true,
+		"/var/lib/sandboxd/mounts/sb-1/0":      false,
 
 		hosts + "/sb-1":                           false,
 		ready + "/sb-1":                           false,

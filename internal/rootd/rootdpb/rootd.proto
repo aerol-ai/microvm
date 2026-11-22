@@ -144,6 +144,28 @@ service RootHelper {
   // hands them only to a leased sandbox address, another node's host port,
   // or sandboxd's own listener.
   rpc HostPort(HostPortRequest) returns (HostPortResponse);
+
+  // The calls below are a sandbox's external storage mounts (M1 PR 8), as
+  // sandboxd's mount manager does them in privilege mode single
+  // (pkg/mounts). The agent sends the sandbox's mount specs; the helper
+  // checks each itself (internal/rootpolicy CheckExternalMounts), builds
+  // every mount point (<mounts folder>/<sandbox>/<index>) and every tool
+  // argument itself, mounts NFS shares with nosuid and nodev, and runs each
+  // FUSE tool as its own normal user with no-new-privs, on a FUSE mount it
+  // made. No request names a host path.
+
+  // MountExternal makes sure a sandbox's mounts serve, and answers with
+  // their mount points for the container's binds.
+  rpc MountExternal(MountExternalRequest) returns (MountExternalResponse);
+
+  // UnmountExternal makes sure a sandbox's mounts are gone: its tools
+  // stopped, its mounts unmounted, its folder, key files and caches
+  // removed.
+  rpc UnmountExternal(UnmountExternalRequest) returns (UnmountExternalResponse);
+
+  // SweepExternalMounts removes the mounts of every sandbox the request
+  // does not keep, except those a call is working on.
+  rpc SweepExternalMounts(SweepExternalMountsRequest) returns (SweepExternalMountsResponse);
 }
 
 message VersionRequest {
@@ -629,3 +651,82 @@ message HostPortResponse {
   // is no longer leased (the sandbox went while the list was made).
   repeated uint32 skipped = 1;
 }
+
+// MountExternalMode is what MountExternal does with mounts that already
+// serve, as pkg/mounts.Manager's calls of the same names do.
+enum MountExternalMode {
+  MOUNT_EXTERNAL_MODE_UNSPECIFIED = 0;
+  // A create's: refused when the sandbox's mounts are established.
+  MOUNT_EXTERNAL_MODE_CREATE = 1;
+  // A start's or a reconcile's: take over what still serves as it runs,
+  // and mount the rest.
+  MOUNT_EXTERNAL_MODE_REESTABLISH = 2;
+  // A running sandbox whose stored options the allow lists now refuse
+  // (pkg/mounts.Manager.KeepLive): take over what still serves, as it
+  // runs, and start nothing. Its specs are checked against the lists a
+  // running mount may keep.
+  MOUNT_EXTERNAL_MODE_KEEP_LIVE = 3;
+}
+
+// ExternalMount is one mount spec (pkg/models.MountSpec).
+message ExternalMount {
+  string type = 1;
+  // Where the mount lands inside the sandbox.
+  string target = 2;
+  string source = 3;
+  map<string, string> options = 4;
+  bool read_only = 5;
+  // The keys the type's tool reads, and no other. The helper hands them
+  // to the tool as a sealed in-memory file (s3, rclone) or a key file of
+  // the tool's own (sshfs); never on a command line, in an environment or
+  // in a log. They are not sealed again for the helper: the socket is
+  // root's and the agent's, and the agent, which holds the node's cipher,
+  // already reads them in the clear (plan eng review R9).
+  map<string, string> credentials = 6;
+}
+
+message MountExternalRequest {
+  string sandbox_id = 1;
+  MountExternalMode mode = 2;
+  // In the sandbox's order: a mount's index is its place here.
+  repeated ExternalMount mounts = 3;
+}
+
+// MountBind is one mount's bind into the sandbox.
+message MountBind {
+  // The mount point, built by the helper: <mounts folder>/<sandbox>/<index>.
+  string host_path = 1;
+  string target = 2;
+  bool read_only = 3;
+}
+
+message MountExternalResponse {
+  // CREATE and REESTABLISH: every mount's bind, in the request's order.
+  // KEEP_LIVE: the kept mounts' binds.
+  repeated MountBind binds = 1;
+  // KEEP_LIVE: the mounts taken over (by index), and those that were not
+  // served and stay unmounted.
+  repeated uint32 kept = 2;
+  repeated uint32 gone = 3;
+  // KEEP_LIVE: the helper already held the sandbox's mounts.
+  bool already = 4;
+}
+
+message UnmountExternalRequest {
+  string sandbox_id = 1;
+  // Discard (pkg/mounts.Manager.Discard): leave a mount set another call
+  // is making alone.
+  bool discard = 2;
+}
+
+message UnmountExternalResponse {
+  // Discard: there was something to tear down.
+  bool had = 1;
+}
+
+message SweepExternalMountsRequest {
+  // The sandboxes whose mounts stay.
+  repeated string keep = 1;
+}
+
+message SweepExternalMountsResponse {}

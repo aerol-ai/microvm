@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -99,6 +100,9 @@ type Config struct {
 	Network NetworkConfig
 	// Firewall is the host firewall's settings (firewall.go).
 	Firewall FirewallConfig
+	// Mounts is external storage (mounts.go); nil when this node has no
+	// mount user, and the helper serves no mount call.
+	Mounts *MountsConfig
 	// HostPorts bound raw-TCP host-port forwarding (hostports.go), under
 	// sandboxd's names: the host-port range (SB_L4_PORT_RANGE_START,
 	// SB_L4_PORT_RANGE_END; 22000 to 23000) and sandboxd's redirect
@@ -106,6 +110,31 @@ type Config struct {
 	// the agent cannot widen what a forward may take.
 	HostPorts rootpolicy.HostPortBounds
 }
+
+// MountsConfig is where and as whom the helper mounts external storage
+// (mounts.go, pkg/mounts tools.go). Each folder is the helper's own.
+type MountsConfig struct {
+	// Root is the mounts folder (SB_ROOTD_MOUNTS_DIR): every mount point
+	// is <Root>/<sandbox>/<index>, and it is the policy's MountsRoot.
+	Root string
+	// CredDir holds sshfs's key files (SB_ROOTD_MOUNT_CRED_DIR): on /run,
+	// so no key is ever written to disk.
+	CredDir string
+	// CacheDir holds rclone's write caches.
+	CacheDir string
+	// UID and GID are the mount tools' own user (SB_ROOTD_MOUNT_USER).
+	UID, GID uint32
+	// CgroupRoot is where the tools' cgroup is made, as sandboxd makes it
+	// (SB_HOST_PROCESS_CGROUP_PARENT, by default SB_CONTAINERD_CGROUP_PARENT,
+	// under the cgroup v2 root); empty: the cgroup v2 root.
+	CgroupRoot string
+	// WaitTimeout bounds one mount's start (SB_MOUNT_WAIT_TIMEOUT).
+	WaitTimeout time.Duration
+}
+
+// DefaultMountUser is the mount tools' user: the installer and the runtime
+// image make it. sshfs's ssh needs a passwd entry for the uid it runs as.
+const DefaultMountUser = "aerolvm-mounts"
 
 // FirewallConfig is the helper's own copy of the host firewall's settings,
 // under sandboxd's names.
@@ -242,7 +271,46 @@ func (c Config) Validate() error {
 	if err := c.Network.validate(); err != nil {
 		return err
 	}
-	return c.Files.validate(c.Policy, filepath.Dir(c.Socket))
+	if err := c.Files.validate(c.Policy, filepath.Dir(c.Socket)); err != nil {
+		return err
+	}
+	return c.Mounts.validate(c)
+}
+
+// validate checks the mount folders: the policy's mounts root, and none
+// inside another of the helper's folders or holding one (each folder has
+// one job and one rule, as FileDirs.validate says).
+func (m *MountsConfig) validate(c Config) error {
+	if m == nil {
+		return nil
+	}
+	if m.Root != c.Policy.MountsRoot {
+		return fmt.Errorf("root helper: the mounts folder %q is not the policy's mounts root %q", m.Root, c.Policy.MountsRoot)
+	}
+	if m.UID == 0 || m.GID == 0 || m.WaitTimeout <= 0 {
+		return fmt.Errorf("root helper: mount user %d:%d, wait %v: want a user and group other than root's, and a wait", m.UID, m.GID, m.WaitTimeout)
+	}
+	mine := []struct{ name, dir string }{{"mounts", m.Root}, {"mount key", m.CredDir}, {"mount cache", m.CacheDir}}
+	others := []struct{ name, dir string }{{"hosts", c.Files.Hosts}, {"ready", c.Files.Ready}, {"runsc", c.Files.Runsc},
+		{"agent ready", c.Files.AgentReady}, {"image root", c.Files.ImageRoot}, {"moves", c.Policy.MovesDir},
+		{"FIFO", c.Policy.FIFODir}, {"socket", filepath.Dir(c.Socket)}}
+	if c.Files.Toolbox != "" {
+		others = append(others, struct{ name, dir string }{"toolbox", filepath.Dir(c.Files.Toolbox)})
+	}
+	for i, a := range mine {
+		if !filepath.IsAbs(a.dir) || filepath.Clean(a.dir) != a.dir || a.dir == "/" {
+			return fmt.Errorf("root helper: %s folder %q: want a clean absolute folder other than /", a.name, a.dir)
+		}
+		for _, b := range append(slices.Clone(mine[i+1:]), others...) {
+			if b.dir == "" {
+				continue
+			}
+			if a.dir == b.dir || strings.HasPrefix(a.dir, b.dir+"/") || strings.HasPrefix(b.dir, a.dir+"/") {
+				return fmt.Errorf("root helper: the %s folder %s and the %s folder %s overlap", a.name, a.dir, b.name, b.dir)
+			}
+		}
+	}
+	return nil
 }
 
 // maxMemoryMB keeps the node's memory in bytes within an int64.
@@ -346,6 +414,10 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		toolboxSource = path("SB_ROOTD_TOOLBOX_SOURCE", "")
 		toolbox = filepath.Join(stateDir, "toolbox", toolboxFile)
 	}
+	// External mounts (mounts.go): the helper's own folders, never the
+	// agent's SB_MOUNTS_ROOT, which the agent can write.
+	mountsDir := path("SB_ROOTD_MOUNTS_DIR", filepath.Join(stateDir, "mounts"))
+	mountCredDir := path("SB_ROOTD_MOUNT_CRED_DIR", DefaultMountCredDir)
 	snapshotterRoot := path("SB_ROOTD_SNAPSHOTTER_ROOT", defaultSnapshotterRoot)
 	netnsDir := path("SB_ROOTD_NETNS_DIR", DefaultNetnsDir)
 	cniPlugins := path("SB_CONTAINERD_CNI_PLUGIN_DIR", defaultCNIPluginDir)
@@ -374,6 +446,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		{"SB_ROOTD_STATE_DIR", stateDir},
 		{"SB_ROOTD_FIFO_DIR", fifoDir},
 		{"SB_ROOTD_READY_DIR", readyDir},
+		// Root mounts external storage and writes mount keys here.
+		{"SB_ROOTD_MOUNTS_DIR", mountsDir},
+		{"SB_ROOTD_MOUNT_CRED_DIR", mountCredDir},
 		// Root makes sandboxes' namespaces, runs the CNI plugins and reads
 		// the CNI config that names them.
 		{"SB_ROOTD_NETNS_DIR", netnsDir},
@@ -403,13 +478,15 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 			// /run/aerolvm/cgroup-parent sits in a folder every worker
 			// container can write (review L6).
 			CgroupParent: strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")),
-			// Binds come from the external mounts, which move to the
-			// helper with its mount calls, and from the files the helper
+			// Binds come from the external mounts, which the helper makes
+			// in its own mounts folder (a container binds only its own
+			// mount points, MountsRoot), and from the files the helper
 			// makes in its own folders (host files, the egress CA among
 			// them, and ready socket names), one read-only file each. The
-			// agent's run dir, ready dir and database folder are no bind
-			// roots: the agent can swap anything in them.
-			BindRoots:       []string{mountsRoot},
+			// agent's run dir, ready dir, mounts root and database folder
+			// are no bind roots: the agent can swap anything in them.
+			BindRoots:       []string{mountsDir},
+			MountsRoot:      mountsDir,
 			BindFiles:       []string{toolbox},
 			HelperFileRoots: []string{dirs.Hosts, dirs.Ready},
 			// The two sockets that are as good as root: this helper's and
@@ -429,6 +506,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		},
 		Firewall:  FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
 		HostPorts: hostPorts,
+	}
+	if cfg.Mounts, err = mountsFromEnv(getenv, uid, mountsDir, mountCredDir, filepath.Join(stateDir, "mountcache")); err != nil {
+		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -558,12 +638,106 @@ func lookupGroup(s string) (int, error) {
 	return int(n), nil
 }
 
+// DefaultMountCredDir holds sshfs's key files: on /run, never on disk.
+const DefaultMountCredDir = "/run/aerolvm-rootd/mountcreds"
+
+// mountsFromEnv is Config.Mounts: nil when SB_ROOTD_MOUNT_USER is unset and
+// this node has no DefaultMountUser, so the helper serves no mount call
+// and the agent refuses mounts by name. A set value that does not resolve,
+// or names a uid another process here runs as, is an error: the tools'
+// user must be one nothing else is.
+func mountsFromEnv(getenv func(string) string, agentUID uint32, root, credDir, cacheDir string) (*MountsConfig, error) {
+	uid, gid, ok, err := mountUser(strings.TrimSpace(getenv("SB_ROOTD_MOUNT_USER")))
+	if err != nil || !ok {
+		return nil, err
+	}
+	if uid == 0 || gid == 0 {
+		return nil, errors.New("SB_ROOTD_MOUNT_USER: mount tools must not run as root or in root's group")
+	}
+	if uid == agentUID {
+		return nil, fmt.Errorf("SB_ROOTD_MOUNT_USER: uid %d is the agent's; mount tools need a user of their own", uid)
+	}
+	who, err := uidSharedWith(getenv, uid)
+	if err != nil {
+		return nil, err
+	}
+	if len(who) > 0 {
+		return nil, fmt.Errorf("SB_ROOTD_MOUNT_USER: uid %d is also the uid of %s; mount tools need a user of their own", uid, strings.Join(who, " and "))
+	}
+	wait := 30 * time.Second
+	if v := strings.TrimSpace(getenv("SB_MOUNT_WAIT_TIMEOUT")); v != "" {
+		if wait, err = time.ParseDuration(v); err != nil || wait <= 0 {
+			return nil, fmt.Errorf("SB_MOUNT_WAIT_TIMEOUT=%q: want a duration above 0", v)
+		}
+	}
+	// sandboxd's own rule (config.HostProcessCgroupRoot).
+	cgroupRoot := ""
+	parent := strings.TrimSpace(getenv("SB_HOST_PROCESS_CGROUP_PARENT"))
+	if parent == "" {
+		parent = strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT"))
+	}
+	if parent != "" {
+		cgroupRoot = filepath.Join(defaultCgroupRoot, parent)
+	}
+	return &MountsConfig{Root: root, CredDir: credDir, CacheDir: cacheDir, UID: uid, GID: gid,
+		CgroupRoot: cgroupRoot, WaitTimeout: wait}, nil
+}
+
+// mountUser reads SB_ROOTD_MOUNT_USER: a user name, a uid, or uid:gid.
+// ok is false when the value is unset and this node has no default user.
+func mountUser(raw string) (uid, gid uint32, ok bool, err error) {
+	set := raw != ""
+	if !set {
+		raw = DefaultMountUser
+	}
+	uidText, gidText, hasGID := strings.Cut(raw, ":")
+	if n, perr := strconv.ParseUint(uidText, 10, 32); perr == nil {
+		uid, gid = uint32(n), uint32(n)
+		if hasGID {
+			g, perr := strconv.ParseUint(gidText, 10, 32)
+			if perr != nil {
+				return 0, 0, false, fmt.Errorf("SB_ROOTD_MOUNT_USER=%q: want a user name, a uid or uid:gid", raw)
+			}
+			gid = uint32(g)
+		}
+		return uid, gid, true, nil
+	}
+	if hasGID {
+		return 0, 0, false, fmt.Errorf("SB_ROOTD_MOUNT_USER=%q: want a user name, a uid or uid:gid", raw)
+	}
+	u, err := user.Lookup(raw)
+	if err != nil {
+		if !set {
+			return 0, 0, false, nil
+		}
+		return 0, 0, false, fmt.Errorf("SB_ROOTD_MOUNT_USER: %w", err)
+	}
+	n, err1 := strconv.ParseUint(u.Uid, 10, 32)
+	g, err2 := strconv.ParseUint(u.Gid, 10, 32)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false, fmt.Errorf("SB_ROOTD_MOUNT_USER: user %s has uid %q and gid %q", raw, u.Uid, u.Gid)
+	}
+	return uint32(n), uint32(g), true, nil
+}
+
 // checkAgentUIDIsItsOwn refuses an agent uid another AerolVM process runs
 // as: those this config names, and 65532, which the chart and images use
 // for several. The peer check goes by uid, so on a shared uid that other
 // process, which may parse tenant traffic (the egress gateway does), would
 // pass for the agent (review H3).
 func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
+	who, err := uidSharedWith(getenv, uid)
+	if err != nil {
+		return err
+	}
+	if len(who) > 0 {
+		return fmt.Errorf("SB_ROOTD_AGENT_UID: uid %d is also the uid of %s; the agent needs one of its own", uid, strings.Join(who, " and "))
+	}
+	return nil
+}
+
+// uidSharedWith names the other AerolVM processes that run as uid.
+func uidSharedWith(getenv func(string) string, uid uint32) ([]string, error) {
 	var who []string
 	switch uid {
 	case nobodyUID:
@@ -574,12 +748,12 @@ func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
 	for _, k := range []string{"SB_ISOLATE_JAIL_UID", "SB_JAILER_UID"} {
 		n, err := envInt(getenv, k, defaultJailUID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// A value outside uid_t would wrap in the conversion and be compared
 		// as some other uid.
 		if n < 0 || n > math.MaxUint32 {
-			return fmt.Errorf("%s=%d: not a uid", k, n)
+			return nil, fmt.Errorf("%s=%d: not a uid", k, n)
 		}
 		if uint32(n) == uid {
 			who = append(who, k)
@@ -588,10 +762,7 @@ func checkAgentUIDIsItsOwn(getenv func(string) string, uid uint32) error {
 	if gw, ok := gatewayUID(strings.TrimSpace(getenv("SB_EGRESS_GATEWAY_USER"))); ok && gw == uid {
 		who = append(who, "SB_EGRESS_GATEWAY_USER")
 	}
-	if len(who) > 0 {
-		return fmt.Errorf("SB_ROOTD_AGENT_UID: uid %d is also the uid of %s; the agent needs one of its own", uid, strings.Join(who, " and "))
-	}
-	return nil
+	return who, nil
 }
 
 // gatewayUID reads SB_EGRESS_GATEWAY_USER as sandboxd does: "uid",

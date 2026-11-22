@@ -132,6 +132,9 @@ func (r *conformanceRig) policy() rootpolicy.Policy {
 		NetnsDir:        "/run/netns",
 		CgroupParent:    cfg.CgroupParent,
 		BindRoots:       []string{r.mountsRoot(), r.egressCADir()},
+		// The helper's mounts folder (M1 PR 8): a container binds only its
+		// own mount points from it.
+		MountsRoot: r.mountsRoot(),
 		// The host files sit where the helper's will (<root>/<id>/<name>)
 		// and are bound read-only, so they meet the rule for the helper's
 		// own files already. The ready sockets are still the agent's flat
@@ -239,13 +242,13 @@ func TestBuilderOutputPassesRootPolicy(t *testing.T) {
 		{name: "runc memory and cpu", req: sized, teeth: func(p *rootpolicy.Policy) { p.Snapshotter = "native" }, rule: rootpolicy.RuleSnapshotter},
 		{name: "runc external mounts", req: runc, teeth: keepRoots(0), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
 			return []mounts.ContainerBind{
-				{HostPath: filepath.Join(r.mountsRoot(), "sb", "0"), ContainerPath: "/data"},
-				{HostPath: filepath.Join(r.mountsRoot(), "sb", "1"), ContainerPath: "/ro", ReadOnly: true},
+				{HostPath: filepath.Join(r.mountsRoot(), "sb-conf", "0"), ContainerPath: "/data"},
+				{HostPath: filepath.Join(r.mountsRoot(), "sb-conf", "1"), ContainerPath: "/ro", ReadOnly: true},
 				{ContainerPath: "/scratch", Tmpfs: true, TmpfsSize: 64 << 20},
 			}
 		}},
 		{name: "gvisor external mounts", req: gvisor, teeth: keepRoots(0), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
-			return []mounts.ContainerBind{{HostPath: filepath.Join(r.mountsRoot(), "sb", "0"), ContainerPath: "/data"}}
+			return []mounts.ContainerBind{{HostPath: filepath.Join(r.mountsRoot(), "sb-conf", "0"), ContainerPath: "/data"}}
 		}},
 		{name: "runc egress CA", req: runc, teeth: keepRoots(1), rule: rootpolicy.RuleMount, binds: func(r *conformanceRig) []mounts.ContainerBind {
 			// internal/service/egress_inspect.go: the CA, read-only, and a
