@@ -311,7 +311,7 @@ func TestBootRecoveryOfASingleNodeRollbackRestore(t *testing.T) {
 			}
 			addNote(t, r.paths.DBPath, "written by v0.6.12")
 			crashAt(t, r, Request{Version: "v0.6.11", Rollback: true}, tc.point, "")
-			results, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+			results, err := Recover(context.Background(), r.paths, r.host, r.out)
 			if err != nil || len(results) != 1 || results[0].Err != nil {
 				t.Fatalf("recover = %+v, %v\n%s", results, err, r.out)
 			}
@@ -352,7 +352,7 @@ func TestBootRecoveryAfterOneWayMigrationsOnASingleNode(t *testing.T) {
 			r := newRig(t, old)
 			singleNodeDB(t, r, tc.env)
 			crashAt(t, r, r.from(newWithOneWay("UNHEALTHY")), "reverting", "")
-			results, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+			results, err := Recover(context.Background(), r.paths, r.host, r.out)
 			if err != nil || len(results) != 1 || results[0].Err != nil || results[0].Result != ResultRevertedAtBoot {
 				t.Fatalf("recover = %+v, %v\n%s", results, err, r.out)
 			}
@@ -407,10 +407,18 @@ func TestClusterModeOn(t *testing.T) {
 func TestOneWayCompareFailureKeepsTheClusterRule(t *testing.T) {
 	r := newRig(t, newRelease("v0.6.11"))
 	st := &State{SingleNode: true}
-	if got := r.u.singleNodeOneWaySince(context.Background(), st, "", r.paths.DBPath); got != nil {
+	if got := r.u.singleNodeOneWaySince(context.Background(), st, filepath.Join(r.paths.StateDir, "op.state.db"), r.paths.DBPath); got != nil {
 		t.Fatalf("a text file compared: %v", got)
 	}
 	if !strings.Contains(r.out.String(), "could not compare the database") {
+		t.Fatalf("no warning:\n%s", r.out)
+	}
+	// A backup named outside the upgrade folder is never read.
+	r.out.Reset()
+	if got := r.u.singleNodeOneWaySince(context.Background(), st, r.paths.DBPath, r.paths.DBPath); got != nil {
+		t.Fatalf("a backup outside the upgrade folder was read: %v", got)
+	}
+	if !strings.Contains(r.out.String(), "is not a database backup in the upgrade folder") {
 		t.Fatalf("no warning:\n%s", r.out)
 	}
 	if _, err := oneWaySince(context.Background(), r.paths.DBPath, filepath.Join(t.TempDir(), "missing.db")); err == nil {

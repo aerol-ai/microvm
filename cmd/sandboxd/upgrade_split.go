@@ -72,9 +72,15 @@ func runUpgradeRecover(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "sandboxd upgrade recover: %v\n", err)
 		return 1
 	}
+	// In privilege mode split, a folder sandboxd's user can write is never
+	// read as root: its records would name the files root copies.
+	if err := paths.CheckStateDir(); err != nil {
+		fmt.Fprintf(stderr, "sandboxd upgrade recover: %v\n", err)
+		return 1
+	}
 	ctx, cancel := upgradeSignalContext()
 	defer cancel()
-	results, err := recoverUpgrades(ctx, paths.StateDir, newUpgradeHost(), stdout)
+	results, err := recoverUpgrades(ctx, paths, newUpgradeHost(), stdout)
 	if err != nil {
 		fmt.Fprintf(stderr, "sandboxd upgrade recover: %v\n", err)
 		return 1

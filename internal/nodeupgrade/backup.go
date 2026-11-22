@@ -3,6 +3,7 @@ package nodeupgrade
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,10 +57,47 @@ func sqliteBackup(ctx context.Context, dbPath, dest string) error {
 	return nil
 }
 
+// checkBackupPath refuses a backup that is not one of the upgrade's own: a
+// regular file named <op>.state.db directly in the upgrade folder. The
+// path comes from an op's record, and a record is a file on disk, so it
+// is never trusted to name a file somewhere else. The last name is not
+// followed (Lstat): a link there is refused, not read.
+func checkBackupPath(stateDir, backup string) error {
+	if err := checkBackupPlace(stateDir, backup); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(filepath.Clean(backup))
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (mode %s)", backup, fi.Mode())
+	}
+	return nil
+}
+
+// checkBackupPlace is checkBackupPath's rule for the name alone: an
+// <op>.state.db directly in the upgrade folder.
+func checkBackupPlace(stateDir, backup string) error {
+	clean := filepath.Clean(backup)
+	if !filepath.IsAbs(clean) || filepath.Dir(clean) != filepath.Clean(stateDir) || !strings.HasSuffix(filepath.Base(clean), backupSuffix) {
+		return fmt.Errorf("%q is not a database backup in the upgrade folder %s", backup, stateDir)
+	}
+	return nil
+}
+
 // restoreBackup puts a backup back as the database. The old WAL and
 // shared-memory files go first: left beside the restored file, SQLite would
-// replay the failed boot's frames onto it.
-func restoreBackup(backup, dbPath string) error {
+// replay the failed boot's frames onto it. The backup must be one of the
+// upgrade folder's own (checkBackupPath); the database path is the node's,
+// from its settings, never from a record.
+func restoreBackup(stateDir, backup, dbPath string) error {
+	if err := checkBackupPath(stateDir, backup); err != nil {
+		return err
+	}
+	if strings.TrimSpace(dbPath) == "" {
+		return errors.New("no database path to restore to")
+	}
 	mode := os.FileMode(0o600)
 	if st, err := os.Stat(dbPath); err == nil {
 		mode = st.Mode().Perm()

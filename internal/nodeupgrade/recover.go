@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // RecoverResult is what boot recovery did with one unfinished op.
@@ -27,7 +28,15 @@ type RecoverResult struct {
 // backup only on a single node, when the files going back could not open
 // the database otherwise (oneway.go); in a cluster it cannot tell what the
 // new binary's boot work already did.
-func Recover(ctx context.Context, stateDir string, host Host, out io.Writer) ([]RecoverResult, error) {
+//
+// p is this node's own layout, from its settings: the upgrade folder, the
+// database and the installed files. A record is a file on disk, so the
+// paths in it are never trusted: the database restored is p.DBPath, a
+// backup must sit in p.StateDir (checkBackupPath), and a record that names
+// a file anywhere but where this node installs that file is left alone
+// (checkRecordPaths).
+func Recover(ctx context.Context, p Paths, host Host, out io.Writer) ([]RecoverResult, error) {
+	stateDir := p.StateDir
 	if _, err := os.Stat(stateDir); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -47,7 +56,7 @@ func Recover(ctx context.Context, stateDir string, host Host, out io.Writer) ([]
 	if err != nil {
 		return nil, err
 	}
-	u := &Upgrader{Paths: Paths{StateDir: stateDir}, Host: host, Out: out}
+	u := &Upgrader{Paths: p, Host: host, Out: out}
 	var results []RecoverResult
 	for _, st := range states {
 		if st.terminal() {
@@ -67,6 +76,12 @@ func Recover(ctx context.Context, stateDir string, host Host, out io.Writer) ([]
 // live daemon.
 func (u *Upgrader) resolve(ctx context.Context, st *State, dbSafe bool) (bool, error) {
 	phase := st.Phase
+	if err := u.checkRecordPaths(st); err != nil {
+		st.Phase, st.Result = PhaseFailed, ResultFailed
+		st.Error = "left as it is: " + err.Error()
+		u.logf("upgrade op %s: %v; its files are left as they are", st.Op, err)
+		return false, errors.Join(err, u.save(st))
+	}
 	var problems []error
 	revertedSandboxd := false
 	if phase != PhaseRevert && allNewInPlace(st) {
@@ -130,14 +145,14 @@ func (u *Upgrader) resolve(ctx context.Context, st *State, dbSafe bool) (bool, e
 		// upgrade moved the node on, must never bring a stale backup back.
 		restore := st.RestoreStarted
 		if !restore && !st.Rollback && !st.BackupRestored && st.BackupPath != "" {
-			restore = len(u.singleNodeOneWaySince(ctx, st, st.BackupPath, st.DBPath)) > 0
+			restore = len(u.singleNodeOneWaySince(ctx, st, st.BackupPath, u.Paths.DBPath)) > 0
 		}
 		if restore && !dbSafe {
 			u.logf("warning: upgrade op %s: sandboxd is running, so its database backup %s was not put back; restart sandboxd to settle it at boot", st.Op, st.BackupPath)
 			restore = false
 		}
-		if restore && st.BackupPath != "" && st.DBPath != "" && onOpsPrevSandboxd(st) {
-			if err := restoreBackup(st.BackupPath, st.DBPath); err != nil {
+		if restore && st.BackupPath != "" && u.Paths.DBPath != "" && onOpsPrevSandboxd(st) {
+			if err := restoreBackup(u.Paths.StateDir, st.BackupPath, u.Paths.DBPath); err != nil {
 				problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
 			} else {
 				st.BackupRestored, st.RestoreStarted = true, false
@@ -224,4 +239,40 @@ func allNewInPlace(st *State) bool {
 		}
 	}
 	return true
+}
+
+// rolePath is where this node installs the file of role, or "" when
+// it installs none (no Caddy, no root helper).
+func (u *Upgrader) rolePath(role string) string {
+	switch role {
+	case roleSandboxd:
+		return u.Paths.Sandboxd
+	case roleToolboxd:
+		return u.Paths.Toolboxd
+	case roleCaddy:
+		return u.Paths.Caddy
+	case roleRootd, roleRootdManifest, roleRootdSig:
+		if u.Paths.RootdDir == "" {
+			return ""
+		}
+		return filepath.Join(u.Paths.RootdDir, role)
+	}
+	return ""
+}
+
+// checkRecordPaths refuses a record that names, for any file it changed,
+// another path than the one this node installs that file at. Settling an
+// op copies files over those paths as root, so the record is held to the
+// node's own layout, never taken at its word.
+func (u *Upgrader) checkRecordPaths(st *State) error {
+	for _, f := range st.Files {
+		if f.Path == "" {
+			continue
+		}
+		want := u.rolePath(f.Role)
+		if want == "" || filepath.Clean(f.Path) != filepath.Clean(want) {
+			return fmt.Errorf("the record names %s for %s, and this node installs %s at %q", f.Path, f.Role, f.Role, want)
+		}
+	}
+	return nil
 }

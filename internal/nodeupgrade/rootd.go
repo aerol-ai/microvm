@@ -225,6 +225,16 @@ func within(path, dir string) bool {
 	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
 }
 
+// CheckStateDir refuses, on a privilege mode split node, an upgrade folder
+// inside sandboxd's data folder (errSplitStateDir). Every command that acts
+// on the upgrade folder as root checks it: the upgrade, and boot recovery.
+func (p Paths) CheckStateDir() error {
+	if p.Split && within(p.StateDir, filepath.Dir(p.DBPath)) {
+		return errSplitStateDir
+	}
+	return nil
+}
+
 // errSplitStateDir refuses an upgrade on a privilege mode split node whose
 // upgrade folder is inside sandboxd's data folder: sandboxd's user can
 // write there, and root installs from it.

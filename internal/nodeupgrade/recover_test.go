@@ -86,7 +86,7 @@ func TestBootRecoveryAfterACrashAtEveryStep(t *testing.T) {
 			}
 			crashAt(t, r, req, tc.point, mid)
 
-			results, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+			results, err := Recover(context.Background(), r.paths, r.host, r.out)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,13 +135,13 @@ func TestBootRecoveryAfterACrashAtEveryStep(t *testing.T) {
 // ops, and does nothing on a node that never upgraded.
 func TestRecoverLeavesWhatIsNotItsToTouch(t *testing.T) {
 	r := newRig(t, newRelease("v0.6.11"))
-	if res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out); err != nil || res != nil {
+	if res, err := Recover(context.Background(), r.paths, r.host, r.out); err != nil || res != nil {
 		t.Fatalf("no state directory: %v, %v", res, err)
 	}
 	if _, err := r.u.Run(context.Background(), r.from(newRelease("v0.6.12"))); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out); err != nil || len(res) != 0 {
+	if res, err := Recover(context.Background(), r.paths, r.host, r.out); err != nil || len(res) != 0 {
 		t.Fatalf("a finished op was touched: %v, %v", res, err)
 	}
 	unfinished := &State{Format: stateFormat, Op: "op-live", Version: "v0.6.13", Phase: PhaseSwapping}
@@ -152,13 +152,13 @@ func TestRecoverLeavesWhatIsNotItsToTouch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out); err != nil || res != nil {
+	if res, err := Recover(context.Background(), r.paths, r.host, r.out); err != nil || res != nil {
 		t.Fatalf("an op whose upgrader holds the lock was touched: %v, %v", res, err)
 	}
 	held.release()
 	// A record that does not parse is skipped, not fatal.
 	writeFile(t, statePath(r.paths.StateDir, "op-junk"), []byte("{"))
-	res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+	res, err := Recover(context.Background(), r.paths, r.host, r.out)
 	if err != nil || len(res) != 1 || res[0].Op != "op-live" {
 		t.Fatalf("after the lock: %+v, %v", res, err)
 	}
@@ -180,7 +180,7 @@ func TestRecoverCompletesPendingWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.host.fail["restart "+gatewayUnit] = errors.New("gateway down")
-	res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+	res, err := Recover(context.Background(), r.paths, r.host, r.out)
 	if err != nil || len(res) != 1 {
 		t.Fatalf("%v, %v", res, err)
 	}
@@ -215,7 +215,7 @@ func TestRecoverReportsAPrevItCannotTrust(t *testing.T) {
 	if err := st.save(r.paths.StateDir, r.now); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+	res, err := Recover(context.Background(), r.paths, r.host, r.out)
 	if err != nil || len(res) != 1 {
 		t.Fatalf("%v, %v", res, err)
 	}

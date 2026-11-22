@@ -36,8 +36,8 @@ func TestRunUpgradeRecover(t *testing.T) {
 		{name: "an unknown flag", args: []string{"--op", "x"}, code: 2, out: "flag provided but not defined"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			recoverUpgrades = func(_ context.Context, stateDir string, _ nodeupgrade.Host, _ io.Writer) ([]nodeupgrade.RecoverResult, error) {
-				dir = stateDir
+			recoverUpgrades = func(_ context.Context, p nodeupgrade.Paths, _ nodeupgrade.Host, _ io.Writer) ([]nodeupgrade.RecoverResult, error) {
+				dir = p.StateDir
 				return tc.results, tc.err
 			}
 			var out bytes.Buffer

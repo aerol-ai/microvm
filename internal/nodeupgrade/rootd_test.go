@@ -377,7 +377,7 @@ func TestWithin(t *testing.T) {
 func TestRestoreBackupFollowsNoLink(t *testing.T) {
 	dir := realDir(t)
 	db := filepath.Join(dir, "state.db")
-	backup := filepath.Join(dir, "backup.db")
+	backup := filepath.Join(dir, "op.state.db")
 	target := filepath.Join(dir, "root-file")
 	writeFile(t, db, []byte("new"))
 	writeFile(t, backup, []byte("old"))
@@ -385,7 +385,7 @@ func TestRestoreBackupFollowsNoLink(t *testing.T) {
 	if err := os.Symlink(target, db+".restore"); err != nil {
 		t.Fatal(err)
 	}
-	if err := restoreBackup(backup, db); err != nil {
+	if err := restoreBackup(dir, backup, db); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, target); got != "root's" {

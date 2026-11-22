@@ -195,8 +195,8 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 	if err := u.preflight(); err != nil {
 		return u.failEarly(st, err)
 	}
-	if u.Paths.Split && within(u.Paths.StateDir, filepath.Dir(u.Paths.DBPath)) {
-		return u.failEarly(st, errSplitStateDir)
+	if err := u.Paths.CheckStateDir(); err != nil {
+		return u.failEarly(st, err)
 	}
 	stageDir := filepath.Join(u.Paths.StateDir, req.Version)
 	if err := u.checkSpace(st, stageDir, false); err != nil {
@@ -788,7 +788,7 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		if err := u.save(st); err != nil {
 			return u.revert(st, err, p)
 		}
-		if err := restoreBackup(st.RestoreBackup, u.Paths.DBPath); err != nil {
+		if err := restoreBackup(u.Paths.StateDir, st.RestoreBackup, u.Paths.DBPath); err != nil {
 			return u.revert(st, fmt.Errorf("put back the database backup %s: %w", st.RestoreBackup, err), p)
 		}
 		u.at("restored")
@@ -990,7 +990,7 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 		f.Swapped = false
 	}
 	if restoreDB {
-		if err := restoreBackup(st.BackupPath, u.Paths.DBPath); err != nil {
+		if err := restoreBackup(u.Paths.StateDir, st.BackupPath, u.Paths.DBPath); err != nil {
 			problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
 		} else {
 			st.BackupRestored, st.RestoreStarted = true, false
