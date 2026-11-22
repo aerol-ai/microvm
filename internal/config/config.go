@@ -262,6 +262,10 @@ type Config struct {
 	// RootdSocket is the root helper's socket in split mode
 	// (SB_ROOTD_SOCKET, the name the helper reads too).
 	RootdSocket string
+	// RootdWasmSocketDir is the root helper's folder for the WASM hosts'
+	// sockets in split mode (SB_ROOTD_WASM_SOCKET_DIR, the name the helper
+	// reads too): sandboxd dials each host there.
+	RootdWasmSocketDir string
 	// ContainerdSocket is the containerd gRPC socket used when
 	// ContainerEngine=containerd. SB_CONTAINERD_SOCKET.
 	ContainerdSocket string
@@ -2542,6 +2546,7 @@ func load(keyTool bool) (Config, error) {
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		RootdSocket:                       getEnv("SB_ROOTD_SOCKET", DefaultRootdSocket),
+		RootdWasmSocketDir:                getEnv("SB_ROOTD_WASM_SOCKET_DIR", "/run/aerolvm-rootd/wasm"),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
@@ -3158,6 +3163,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if err := resolveBuildKitMode(&cfg); err != nil {
 		return Config{}, err
+	}
+	if !filepath.IsAbs(cfg.RootdWasmSocketDir) {
+		return Config{}, fmt.Errorf("SB_ROOTD_WASM_SOCKET_DIR must be an absolute path, got %q", cfg.RootdWasmSocketDir)
 	}
 	if !filepath.IsAbs(cfg.RootdSocket) {
 		return Config{}, fmt.Errorf("SB_ROOTD_SOCKET must be an absolute path, got %q", cfg.RootdSocket)

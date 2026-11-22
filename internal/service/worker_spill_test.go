@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +13,10 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -274,7 +278,32 @@ func TestMountCtxFor(t *testing.T) {
 	if s.wasmMountCtx(ctx) != ctx {
 		t.Fatal("a consumer with the drop off")
 	}
+	// Split mode: sandboxd is not root, but the helper drops every worker,
+	// so a WASM sandbox's mounts name that consumer (and the helper-backed
+	// mount manager refuses them, 501, before mounting anything).
+	s.cfg.PrivilegeMode, s.cfg.WasmWorkerDropPrivs = privmode.Split, true
+	m, err := mounts.NewRemote(slog.New(slog.DiscardHandler), refusingRemote{t}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.MountAll(s.mountCtxFor(ctx, &models.Sandbox{Runtime: models.RuntimeWasm}), "sb-1",
+		[]models.MountSpec{{Type: models.MountTypeNFS, Source: "127.0.0.1:/e", Target: "/mnt"}})
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("a WASM sandbox's mounts in split mode: %v, want a 501", err)
+	}
 }
+
+// refusingRemote fails the test if a mount reaches the helper.
+type refusingRemote struct{ t *testing.T }
+
+func (r refusingRemote) Mount(context.Context, string, mounts.RemoteMode, []models.MountSpec) (mounts.RemoteResult, error) {
+	r.t.Fatal("a WASM sandbox's mount reached the root helper")
+	return mounts.RemoteResult{}, nil
+}
+
+func (refusingRemote) Unmount(context.Context, string, bool) (bool, error) { return false, nil }
+func (refusingRemote) Sweep(context.Context, []string) error               { return nil }
+func (refusingRemote) Ready() error                                        { return nil }
 
 // A worker holding its spill lock never stalls the drain: the drain runs on
 // the audit writer holding spillMu and the audit lock, so it skips that

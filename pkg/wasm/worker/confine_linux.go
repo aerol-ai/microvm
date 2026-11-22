@@ -54,3 +54,6 @@ func setOwnPIDNamespace(cmd *exec.Cmd) {
 	}
 	cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWPID
 }
+
+// setShareUmask keeps the group's read and write on what the worker makes.
+func setShareUmask() { syscall.Umask(0o007) }

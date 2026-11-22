@@ -19,3 +19,6 @@ func applyConfinement(Confinement) error {
 
 // setOwnPIDNamespace has no PID namespaces to use off Linux.
 func setOwnPIDNamespace(*exec.Cmd) {}
+
+// setShareUmask: workers share with their group only on Linux.
+func setShareUmask() {}

@@ -1353,7 +1353,7 @@ func TestCoverage95MoreWiringAndRunBranches(t *testing.T) {
 			WasmResidentHostEnabled: true,
 			WasmStandardModules:     map[string]string{"python": "python.wasm"},
 			WasmResidentHostIdleTTL: time.Millisecond,
-		}, testLogger(), svc, st)
+		}, testLogger(), svc, st, nil)
 		if pool != nil {
 			pool.Close()
 		}

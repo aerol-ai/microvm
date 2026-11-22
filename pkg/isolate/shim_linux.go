@@ -38,6 +38,9 @@ func RunJailShim(args []string) error {
 	if err := unix.Chdir(spec.Cwd); err != nil {
 		return fmt.Errorf("isolate jail shim: chdir %s: %w", spec.Cwd, err)
 	}
+	if spec.Umask != nil {
+		unix.Umask(int(*spec.Umask))
+	}
 	if err := hostproc.DropPrivileges(spec.UID, spec.GID); err != nil {
 		return fmt.Errorf("isolate jail shim: %w", err)
 	}

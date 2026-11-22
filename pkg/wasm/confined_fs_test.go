@@ -687,3 +687,32 @@ func TestInstantiateReleasingReleasesMounts(t *testing.T) {
 		t.Fatalf("released %d times with no mounts", none)
 	}
 }
+
+// TestConfinedFSSharesWithGroup: with group sharing on (privilege mode
+// split), what the guest makes is the group's to read and write too, and a
+// chmod keeps the group's bits.
+func TestConfinedFSSharesWithGroup(t *testing.T) {
+	t.Cleanup(func() { sharedWithGroup.Store(false) })
+	ShareFilesWithGroup()
+	old := syscall.Umask(0o007)
+	t.Cleanup(func() { syscall.Umask(old) })
+	dir := t.TempDir()
+	c := newConfinedFS(dir, false)
+	f, errno := c.OpenFile("/f", experimentalsys.O_CREAT|experimentalsys.O_WRONLY, 0o600)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	f.Close()
+	if errno := c.Mkdir("/d", 0o700); errno != 0 {
+		t.Fatal(errno)
+	}
+	if errno := c.Chmod("/f", 0o600); errno != 0 {
+		t.Fatal(errno)
+	}
+	for name, want := range map[string]fs.FileMode{"f": 0o660, "d": 0o770} {
+		st, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || st.Mode().Perm() != want {
+			t.Errorf("%s mode %v (%v), want %o", name, st.Mode().Perm(), err, want)
+		}
+	}
+}

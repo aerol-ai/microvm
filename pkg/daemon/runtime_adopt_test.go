@@ -40,7 +40,7 @@ func TestWireIsolateRuntimeKeepsAStartedRow(t *testing.T) {
 		IsolateWorkerdPath:      "/usr/local/bin/workerd",
 		IsolateRunDir:           t.TempDir(),
 		IsolateGroupGranularity: config.IsolateGroupPerTenant,
-	}, slog.New(slog.NewTextHandler(&logged, nil)), svc)
+	}, slog.New(slog.NewTextHandler(&logged, nil)), svc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

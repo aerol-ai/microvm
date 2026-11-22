@@ -8,6 +8,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -37,6 +38,10 @@ func TestCheckHostProcessesOutliveAgent(t *testing.T) {
 		{name: "gVisor only: not checked", cfg: worker(func(c *config.Config) { c.EnableWasm = false }), owns: true},
 		{name: "no cgroup parent (VM or plain container): not checked", cfg: worker(func(c *config.Config) { c.HostProcessCgroupParent = "" }), owns: true},
 		{name: "not a worker: not checked", cfg: worker(func(c *config.Config) { c.NodeRole = config.NodeRoleServer }), owns: true},
+		// M1 PR 9: in privilege mode split the root helper starts the hosts,
+		// in the runtime container; the agent container's end never reaches
+		// them.
+		{name: "split: the helper's hosts outlive the agent", cfg: worker(func(c *config.Config) { c.EnableWasm, c.EnableIsolate, c.PrivilegeMode = false, true, privmode.Split }), owns: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			old := ownsPIDNamespace

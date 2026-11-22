@@ -218,10 +218,12 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("Version = %v", resp)
 	}
 	// EnsureHost is a placeholder, so it is never served; a helper with
-	// no network configuration (this rig) serves no network call either.
+	// no network configuration (this rig) serves no network call either,
+	// and one whose settings name no host kind no host call.
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
 		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
-			slices.Contains(hostPortFeatures, f) || slices.Contains(mountFeatures, f) || f == rootdpb.FeatureReclaimVolume
+			slices.Contains(hostPortFeatures, f) || slices.Contains(mountFeatures, f) || f == rootdpb.FeatureReclaimVolume ||
+			slices.Contains(hostFeatures, f)
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -230,16 +232,18 @@ func TestVersion(t *testing.T) {
 		t.Fatalf("the helper's own call reached containerd: %v", m)
 	}
 	t.Run("with a network", func(t *testing.T) {
+		// With mounts, reclaim and a host kind too (M1 PRs 8 and 9): every call.
 		r := newRig(t, func(c *Config, o *Options) {
 			o.Network, o.Mounts = newFakeNet(), &fakeMounts{}
 			c.Reclaim = &ReclaimConfig{Export: rootpolicy.NFSExport{Server: "h", Export: "/e"}, ScratchDir: filepath.Join(t.TempDir(), "r")}
+			c.Hosts = testHostsConfig(t)
 		})
 		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
 		served := []string{rootdpb.FeatureEnsureHostFiles, rootdpb.FeatureEnsureTaskFIFOs, rootdpb.FeatureEnsureRunscConfig,
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 		served = append(append(append(served, egressFeatures...), hostPortFeatures...), mountFeatures...)
-		served = append(served, rootdpb.FeatureReclaimVolume)
+		served = append(append(served, rootdpb.FeatureReclaimVolume), hostFeatures...)
 		// No cgroup parent here: no cgroup part. Every helper serves the
 		// container's files part (M1 PR 7).
 		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall, rootdpb.PartFiles}

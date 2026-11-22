@@ -21,9 +21,18 @@ import (
 // (pkg/jsbundle content-addressed store), its workerd group supervisor
 // (pkg/isolate), the blank-host warm pool, idle-TTL reaper, and bundle GC
 // (plans/isolate-runtime.md Phase 2 leftovers + Phase 3).
-func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service) (*isolateruntime.Driver, error) {
+//
+// hosts is the root helper in privilege mode split, nil in single: there
+// the helper builds every group's jail and runs its workerd
+// (splitWorkerdLauncher), and this sandboxd, which has no rights, never
+// does.
+func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service, hosts hostHelper) (*isolateruntime.Driver, error) {
 	isoCfg := isolateruntime.FromDaemonConfig(cfg)
-	if cfg.IsolateUseJail {
+	if hosts != nil {
+		// The helper builds the jail's base tree on its first group, from
+		// its own settings, and refuses an unjailed group.
+		isoCfg.Launcher = splitWorkerdLauncher{h: hosts}
+	} else if cfg.IsolateUseJail {
 		// Bootstrap belongs at daemon start: a jail that cannot be realized
 		// here must fail boot, not the first tenant's create. The base tree
 		// (workerd + its shared libraries + /dev nodes) is built once and
@@ -106,7 +115,7 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 	// realizable here" (platform). When jail is requested but not realizable,
 	// isolate creates FAIL CLOSED — say so loudly rather than logging a bare
 	// jail=true that implies confinement the host can't provide.
-	jailRealizable := pkgisolate.JailRealizable()
+	jailRealizable := pkgisolate.JailRealizable() || hosts != nil
 	if cfg.IsolateUseJail && !jailRealizable {
 		logger.Warn("isolate jail requested but not realizable on this host; isolate creates will FAIL CLOSED — set SB_ISOLATE_USE_JAIL=false to run unconfined (accepting the risk) or deploy on Linux",
 			"platform_can_jail", jailRealizable,
@@ -118,6 +127,7 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		"group_granularity", cfg.IsolateGroupGranularity,
 		"jail_requested", cfg.IsolateUseJail,
 		"jail_realizable", jailRealizable,
+		"jail_by_root_helper", hosts != nil,
 		"jail_chroot_base", cfg.IsolateJailChrootBase,
 		"jail_cgroup_root", cfg.IsolateJailCgroupRoot,
 		"seccomp_mode", cfg.IsolateSeccompMode,

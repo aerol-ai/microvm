@@ -111,6 +111,14 @@ type Info struct {
 	// Parts are the parts of PrepareSandbox and ReleaseSandbox the helper
 	// serves (rootdpb.Parts).
 	Parts []string
+	// Hosts are the host kinds the host-process calls serve
+	// (rootdpb.HostKindName).
+	Hosts []string
+}
+
+// HasHost reports whether the helper serves host kind k.
+func (i Info) HasHost(k rootdpb.HostKind) bool {
+	return rootdpb.HostKindName(k) != "" && slices.Contains(i.Hosts, rootdpb.HostKindName(k))
 }
 
 // Has reports whether the helper serves feature.
@@ -121,7 +129,8 @@ func (i Info) Has(feature string) bool { return slices.Contains(i.Features, feat
 func (i Info) HasPart(part string) bool { return slices.Contains(i.Parts, part) }
 
 func infoOf(resp *rootdpb.VersionResponse) Info {
-	return Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures(), Parts: resp.GetParts()}
+	return Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures(), Parts: resp.GetParts(),
+		Hosts: resp.GetHosts()}
 }
 
 // UnsupportedError is a call or a helper this agent cannot use.
@@ -176,6 +185,10 @@ type Config struct {
 	// Nil records no audit event. The client counts every refusal in
 	// aerolvm_rootd_refusals_total either way.
 	OnRefusal RefusalFunc
+	// HostWatchInterval is how often the client asks the helper which of
+	// the host processes it holds still run (hosts.go). Zero means
+	// DefaultHostWatchInterval.
+	HostWatchInterval time.Duration
 }
 
 // session is one connection to the helper and what its handshake said.
@@ -221,12 +234,19 @@ type Client struct {
 	// old, else nil. gRPC passes a dialer's error on as text only, so this
 	// is how a containerd call the dialer refused learns why (review N5).
 	tooOld atomic.Pointer[UnsupportedError]
+	// hosts watches the host processes this agent holds (hosts.go), every
+	// hostEvery.
+	hosts     hostWatch
+	hostEvery time.Duration
 }
 
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
 	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, netTimeout: cfg.NetworkTimeout, mountTimeout: cfg.MountTimeout, agentVersion: cfg.AgentVersion,
-		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal}
+		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal, hostEvery: cfg.HostWatchInterval}
+	if c.hostEvery <= 0 {
+		c.hostEvery = DefaultHostWatchInterval
+	}
 	if c.socket == "" {
 		c.socket = DefaultSocket
 	}
@@ -636,6 +656,16 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureHostPort:             true,
 	// The volume's folder emptied again is the same empty folder.
 	rootdpb.FeatureReclaimVolume: true,
+	// The host-process calls (M1 PR 9) are "make sure this is so" by a
+	// host's kind and id, read back from the kernel: PrepareHost answers a
+	// whole jail as it is; SpawnHost answers a host that runs as it is, so
+	// a second run starts nothing; StopHost and SetHostLimits leave the
+	// same state twice; ListHosts is a read.
+	rootdpb.FeaturePrepareHost:   true,
+	rootdpb.FeatureSpawnHost:     true,
+	rootdpb.FeatureStopHost:      true,
+	rootdpb.FeatureListHosts:     true,
+	rootdpb.FeatureSetHostLimits: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -736,6 +766,12 @@ var networkCalls = map[string]bool{
 	// Host-port forwarding waits on the xtables lock, and a node's whole
 	// set (up to its range's ports) is written rule by rule.
 	rootdpb.FeatureHostPort: true,
+	// A V8 group's first PrepareHost builds the jail's base tree (copies
+	// workerd and its libraries); a StopHost waits for a host's processes
+	// to exit and removes its jail.
+	rootdpb.FeaturePrepareHost: true,
+	rootdpb.FeatureSpawnHost:   true,
+	rootdpb.FeatureStopHost:    true,
 }
 
 // mountCalls are the calls bounded by the mount timeout: they wait for

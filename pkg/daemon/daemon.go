@@ -666,7 +666,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	if cfg.EnableWasm && cfg.IsWorker() {
-		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc, db)
+		var hosts hostHelper
+		if helper != nil {
+			hosts = helper
+		}
+		wasmPool := wireWasmRuntime(ctx, cfg, logger, svc, db, hosts)
 		if wasmPool != nil {
 			defer func() {
 				if drained := wasmPool.Close(); drained > 0 {
@@ -681,7 +685,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	var isolateDriver *isolateruntime.Driver
 	if cfg.EnableIsolate && cfg.IsWorker() {
 		var err error
-		isolateDriver, err = wireIsolateRuntime(ctx, cfg, logger, svc)
+		var hosts hostHelper
+		if helper != nil {
+			hosts = helper
+		}
+		isolateDriver, err = wireIsolateRuntime(ctx, cfg, logger, svc, hosts)
 		if err != nil {
 			return fmt.Errorf("wire isolate runtime: %w", err)
 		}

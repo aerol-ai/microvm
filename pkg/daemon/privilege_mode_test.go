@@ -47,7 +47,16 @@ func splitConfig() config.Config {
 	return config.Config{PrivilegeMode: privmode.Split, ContainerEngine: models.ContainerEngineContainerd, ContainerdNativeNetnsPoolEnabled: true}
 }
 
+// wasmSplit is split mode with WASM on as the helper runs it: workers
+// dropped, on wazero, sandboxd in the worker group, the resident host on.
+func wasmSplit(c *config.Config) {
+	c.EnableWasm, c.WasmWorkerDropPrivs, c.WasmWorkerUID, c.WasmWorkerGID, c.WasmResidentHostEnabled = true, true, 61000, 61000, true
+}
+
 func TestCheckPrivilegeMode(t *testing.T) {
+	old := agentGroups
+	agentGroups = func() ([]int, error) { return []int{20, 61000}, nil }
+	t.Cleanup(func() { agentGroups = old })
 	if err := checkPrivilegeMode(config.Config{PrivilegeMode: privmode.Single, ContainerEngine: models.ContainerEngineDocker, EnableNetworkRules: true}); err != nil {
 		t.Fatalf("single mode: %v", err)
 	}
@@ -64,6 +73,13 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// that engaged it, are the helper's from PR 5b.
 		func(c *config.Config) { c.IngressProxyRouting = true },
 		func(c *config.Config) { c.DBPath = filepath.Join(engagedMarkerDir(t), "state.db") },
+		// M1 PR 9: V8 isolate groups, jailed by the helper, and WASM
+		// workers and resident hosts, started by it.
+		func(c *config.Config) { c.EnableIsolate, c.IsolateUseJail = true, true },
+		wasmSplit,
+		func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wazero" },
+		// A warm pool the resident host makes moot is never wired.
+		func(c *config.Config) { wasmSplit(c); c.WasmPoolEnabled = true },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -80,12 +96,19 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"the Docker engine", func(c *config.Config) { c.ContainerEngine = models.ContainerEngineDocker }, "SB_CONTAINER_ENGINE=containerd", nil},
 		{"no netns pool", func(c *config.Config) { c.ContainerdNativeNetnsPoolEnabled = false }, "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", nil},
 		{"the warm pool", func(c *config.Config) { c.ContainerdPoolEnabled = true }, "warm pool", []privmode.Step{privmode.StepWarmPool}},
-		{"WASM", func(c *config.Config) { c.EnableWasm = true }, "WASM", []privmode.Step{privmode.StepHostProcesses}},
-		{"V8 isolates", func(c *config.Config) { c.EnableIsolate = true }, "V8", []privmode.Step{privmode.StepHostProcesses}},
-		{"Firecracker", func(c *config.Config) { c.EnableFirecracker = true }, "Firecracker", []privmode.Step{privmode.StepHostProcesses}},
+		{"WASM workers kept root", func(c *config.Config) { wasmSplit(c); c.WasmWorkerDropPrivs = false }, "SB_WASM_WORKER_DROP_PRIVS", nil},
+		{"WASM on wasmtime", func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wasmtime" }, "SB_WASM_ENGINE=wasmtime", nil},
+		{"WASM workers as sandboxd", func(c *config.Config) { wasmSplit(c); c.WasmWorkerUID = os.Getuid() }, "sandboxd's own uid", nil},
+		{"sandboxd outside the worker group", func(c *config.Config) { wasmSplit(c); c.WasmWorkerGID = 4242 }, "member of the WASM worker group", nil},
+		{"the WASM warm pool", func(c *config.Config) { wasmSplit(c); c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true }, "WASM warm pool",
+			[]privmode.Step{privmode.StepWasmWarmPool}},
+		// The helper jails every group it runs: an unjailed one is single
+		// mode only, for good.
+		{"V8 isolates unjailed", func(c *config.Config) { c.EnableIsolate = true }, "SB_ISOLATE_USE_JAIL=true", nil},
+		{"Firecracker", func(c *config.Config) { c.EnableFirecracker = true }, "Firecracker", []privmode.Step{privmode.StepFirecracker}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
-		{"several at once, each named", func(c *config.Config) { c.GvisorCheckpointMoves, c.EnableWasm = true, true }, "WASM",
-			[]privmode.Step{privmode.StepHostProcesses, privmode.StepMoves}},
+		{"several at once, each named", func(c *config.Config) { c.GvisorCheckpointMoves, c.EnableFirecracker = true, true }, "Firecracker",
+			[]privmode.Step{privmode.StepFirecracker, privmode.StepMoves}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()

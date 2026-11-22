@@ -250,7 +250,7 @@ func (d *Driver) recordRoutesValid(sandboxID string, rec instanceRecord, legacy 
 	}
 	switch {
 	case rec.Resident:
-		bucketID, index, ok := parseResidentSocket(d.cfg.RunDir, rec.Socket)
+		bucketID, index, ok := d.parseResidentSocket(rec.Socket)
 		return ok && !rec.WarmPool && rec.WorkerKey == d.residentHostKey(bucketID, index)
 	case rec.WarmPool:
 		slotID, ok := wasmpool.SlotFromSocket(d.cfg.RunDir, rec.Socket)
@@ -307,10 +307,14 @@ type AdoptReport struct {
 // manage it.
 func (d *Driver) AdoptWorkers(ctx context.Context) AdoptReport {
 	var report AdoptReport
-	if d.workerCgroup == nil {
+	find := func() ([]worker.FoundWorker, error) { return findWorkers(d.workerCgroup) }
+	switch {
+	case d.workerLister != nil:
+		find = func() ([]worker.FoundWorker, error) { return d.workerLister(ctx) }
+	case d.workerCgroup == nil:
 		return report
 	}
-	found, err := findWorkers(d.workerCgroup)
+	found, err := find()
 	if err != nil {
 		if d.logger != nil {
 			d.logger.Warn("wasm adopt: workers' cgroup unreadable; running workers are not taken over", "error", err)
@@ -335,7 +339,7 @@ func (d *Driver) AdoptWorkers(ctx context.Context) AdoptReport {
 			}
 			report.ResidentHosts++
 		default:
-			if !strings.HasPrefix(f.Socket, filepath.Clean(d.cfg.RunDir)+string(filepath.Separator)) {
+			if !strings.HasPrefix(f.Socket, filepath.Clean(d.socketsHome())+string(filepath.Separator)) {
 				stop(f, "socket outside the run dir")
 				continue
 			}
@@ -361,7 +365,7 @@ func (d *Driver) adoptResidentHost(ctx context.Context, f worker.FoundWorker) st
 	if !d.residentHostEnabled() {
 		return "resident hosts are off"
 	}
-	bucketID, index, ok := parseResidentSocket(d.cfg.RunDir, f.Socket)
+	bucketID, index, ok := d.parseResidentSocket(f.Socket)
 	if !ok {
 		return "not a resident host socket"
 	}
