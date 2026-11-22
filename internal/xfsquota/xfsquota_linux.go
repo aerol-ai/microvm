@@ -1,6 +1,6 @@
 //go:build linux
 
-package containerd
+package xfsquota
 
 import (
 	"errors"
@@ -16,7 +16,7 @@ import (
 // golang.org/x/sys has the quotactl_fd number but none of the XFS quota
 // types or the fsxattr ioctls, so they are spelled out here from
 // include/uapi/linux/fs.h and include/uapi/linux/dqblk_xfs.h. The struct
-// sizes are checked in disk_quota_linux_test.go. quotactl_fd (Linux 5.14)
+// sizes are checked in xfsquota_linux_test.go. quotactl_fd (Linux 5.14)
 // takes any open file on the filesystem instead of its block device, so
 // there is no device to find, and no mount table to misread (the trap S8
 // hit with xfs_quota and a path).
@@ -103,7 +103,9 @@ type fsQuotaStatv struct {
 
 func qcmd(cmd, typ uint32) uint32 { return cmd<<8 | typ&0xff }
 
-type xfsProjectQuota struct{}
+// Ops drives XFS project quotas through quotactl_fd and the fsxattr
+// ioctls (package doc).
+type Ops struct{}
 
 // quotactlFd runs one quotactl_fd command on the filesystem holding dir.
 func quotactlFd(dir string, cmd, id uint32, addr unsafe.Pointer) error {
@@ -112,14 +114,30 @@ func quotactlFd(dir string, cmd, id uint32, addr unsafe.Pointer) error {
 		return err
 	}
 	defer unix.Close(fd)
-	_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL_FD, uintptr(fd), uintptr(cmd), uintptr(id), uintptr(addr), 0, 0)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return sysQuotactlFd(fd, cmd, id, addr)
 }
 
-func (xfsProjectQuota) Enforced(dir string) error {
+// The two kernel calls, which tests replace to drive the code without an
+// XFS volume.
+var (
+	sysQuotactlFd = func(fd int, cmd, id uint32, addr unsafe.Pointer) error {
+		_, _, errno := unix.Syscall6(unix.SYS_QUOTACTL_FD, uintptr(fd), uintptr(cmd), uintptr(id), uintptr(addr), 0, 0)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+	sysIoctlFsxattr = func(fd int, req uintptr, x *fsxattr) error {
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), req, uintptr(unsafe.Pointer(x)))
+		runtime.KeepAlive(x)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+)
+
+func (Ops) Enforced(dir string) error {
 	st := fsQuotaStatv{Version: fsQStatVVersion1}
 	err := quotactlFd(dir, qcmd(qXGetQStatV, prjQuota), 0, unsafe.Pointer(&st))
 	runtime.KeepAlive(&st)
@@ -132,7 +150,7 @@ func (xfsProjectQuota) Enforced(dir string) error {
 	return nil
 }
 
-func (xfsProjectQuota) Limit(dir string, id uint32, bytes uint64) error {
+func (Ops) Limit(dir string, id uint32, bytes uint64) error {
 	q := fsDiskQuota{
 		Version:      fsDquotVersion,
 		Flags:        fsProjQuotaFlag,
@@ -154,8 +172,8 @@ func (xfsProjectQuota) Limit(dir string, id uint32, bytes uint64) error {
 // A root already in id and inheriting is skipped: Assign is the only thing
 // that sets it, after the walk below has covered the files before it (a
 // retry, or a resize of a sandbox created with its limit).
-func (xfsProjectQuota) Assign(dir string, id uint32) error {
-	if done, err := inProject(dir, id); err != nil || done {
+func (Ops) Assign(dir string, id uint32) error {
+	if done, err := InProject(dir, id); err != nil || done {
 		return err
 	}
 	return filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
@@ -185,8 +203,8 @@ func (xfsProjectQuota) Assign(dir string, id uint32) error {
 	})
 }
 
-// inProject reports whether dir is in project id and passes it on.
-func inProject(dir string, id uint32) (bool, error) {
+// InProject reports whether dir is in project id and passes it on.
+func InProject(dir string, id uint32) (bool, error) {
 	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return false, err
@@ -214,11 +232,4 @@ func setProject(fd int, id uint32, dir bool) error {
 	return nil
 }
 
-func ioctlFsxattr(fd int, req uintptr, x *fsxattr) error {
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), req, uintptr(unsafe.Pointer(x)))
-	runtime.KeepAlive(x)
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
+func ioctlFsxattr(fd int, req uintptr, x *fsxattr) error { return sysIoctlFsxattr(fd, req, x) }

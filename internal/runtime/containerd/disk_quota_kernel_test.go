@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/xfsquota"
 )
 
 func kernelQuotaRoot(t *testing.T) string {
@@ -88,8 +90,8 @@ func TestKernelDiskQuota(t *testing.T) {
 		t.Fatalf("Assign: %v", err)
 	}
 	for _, d := range []string{snap, dir, filepath.Join(snap, "work")} {
-		if done, err := inProject(d, id); err != nil || !done {
-			t.Fatalf("inProject(%s) = %v %v", d, done, err)
+		if done, err := xfsquota.InProject(d, id); err != nil || !done {
+			t.Fatalf("xfsquota.InProject(%s) = %v %v", d, done, err)
 		}
 	}
 	if err := q.Assign(snap, id); err != nil { // the second time is a no-op
