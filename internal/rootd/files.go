@@ -172,6 +172,15 @@ func openFiles(cfg Config) (*files, error) {
 	if err := checkLinkCapability(cfg.AgentUID); err != nil {
 		return nil, err
 	}
+	if cfg.Files.ImageRoot != "" {
+		// Made root's alone here; only ever mounted on in a thread's own
+		// mount namespace (imageuser_linux.go).
+		fd, err := openFolder(cfg.Files.ImageRoot)
+		if err != nil {
+			return nil, fmt.Errorf("root helper: folder %s: %w", cfg.Files.ImageRoot, err)
+		}
+		_ = unix.Close(fd)
+	}
 	for _, d := range folders {
 		// openFolder makes a missing folder through the checked folder
 		// above it: making the path first would follow a link someone put

@@ -135,6 +135,13 @@ type Options struct {
 	// Containers lists containerd's containers, for the sweep of gone
 	// containers' files (sweep.go). Nil: no sweep.
 	Containers ContainerLister
+	// Snapshots reads containerd's snapshots for the image_user and
+	// disk_quota parts (snapshot.go). Nil: the helper serves neither.
+	Snapshots SnapshotReader
+	// ReadImageFiles and Quota stand in for the kernel in tests
+	// (imageuser.go, quota.go). Nil: the helper's own.
+	ReadImageFiles ImageFileReader
+	Quota          QuotaOps
 }
 
 // Server is the helper's socket and gRPC server.
@@ -216,7 +223,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks)})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts)})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -453,6 +460,8 @@ type helper struct {
 	// cg serves PrepareSandbox's cgroup part; nil when this helper has no
 	// cgroup parent.
 	cg *sandboxCgroups
+	// ct serves the container's parts that read its snapshot.
+	ct *containerCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -485,7 +494,7 @@ func (h helper) servedParts() []string {
 	if h.cg != nil {
 		parts = append(parts, rootdpb.PartCgroup)
 	}
-	return append(parts, containerParts...)
+	return append(parts, h.ct.served()...)
 }
 
 // containerKey is the per-object lock key of a container's files (D11).

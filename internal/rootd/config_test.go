@@ -73,6 +73,7 @@ func TestConfigFromEnv(t *testing.T) {
 			Runsc:      "/var/lib/aerolvm-rootd/runsc",
 			AgentReady: "/run/sandboxd/docker/ready",
 			Toolbox:    "/usr/local/bin/toolboxd",
+			ImageRoot:  "/var/lib/aerolvm-rootd/imageroot",
 		},
 		// sandboxd's own CNI settings, read under the same names.
 		Network: NetworkConfig{PluginDir: "/opt/cni/bin", ConfPath: "/etc/cni/net.d/aerolvm.conflist"},
@@ -119,7 +120,7 @@ func TestConfigFromEnv(t *testing.T) {
 			p.MovesDir, p.FIFODir = "/data/rootd/moves", "/run/rootd-io"
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
 			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready",
-				Toolbox: "/opt/aerolvm/toolboxd"}
+				Toolbox: "/opt/aerolvm/toolboxd", ImageRoot: "/data/rootd/imageroot"}
 		}},
 		// M1 PR 7: the agent's toolbox copy sits in a folder it writes (the
 		// chart's); the helper keeps its own copy, which specs bind.
