@@ -62,7 +62,8 @@ old files are put back. Run as root.
 
 Exit status: 0 when the node runs <version> (or already did), 1 when the
 upgrade failed (the previous files are back), 2 for a usage error.
-`
+
+` + upgradeSplitUsage
 
 // Seams for tests: the machine the command acts on.
 var (
@@ -98,7 +99,7 @@ func parseUpgradeArgs(args []string) (req nodeupgrade.Request, envFile, output s
 				return req, "", "", flag.ErrHelp
 			}
 		}
-		return req, "", "", errors.New("the only upgrade command is `sandboxd upgrade node`")
+		return req, "", "", errors.New("the upgrade commands are `sandboxd upgrade node`, `recover` and `root-helper`")
 	}
 	sums := shaFlags{}
 	fs := flag.NewFlagSet("sandboxd upgrade node", flag.ContinueOnError)
@@ -146,6 +147,14 @@ func parseUpgradeArgs(args []string) (req nodeupgrade.Request, envFile, output s
 // runUpgradeCLI runs `sandboxd upgrade` with the args after it and returns
 // the exit status.
 func runUpgradeCLI(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case upgradeRecoverCommand:
+			return runUpgradeRecover(args[1:], stdout, stderr)
+		case upgradeRootHelperCommand:
+			return runUpgradeRootHelper(args[1:], stdout, stderr)
+		}
+	}
 	req, envFile, output, err := parseUpgradeArgs(args)
 	if errors.Is(err, flag.ErrHelp) {
 		fmt.Fprint(stdout, upgradeUsage)

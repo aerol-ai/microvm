@@ -9,6 +9,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -33,7 +34,16 @@ var (
 // It returns an error only when it put the sandboxd binary itself back:
 // this process is then the newer binary, and exiting lets systemd start
 // the previous one. Any other problem is logged; it must not stop a boot.
+//
+// In privilege mode split sandboxd has no right to swap root's binaries,
+// and the upgrade folder is root's own (SB_UPGRADE_STATE_DIR):
+// sandboxd.service runs `sandboxd upgrade recover` as root before sandboxd
+// starts instead (M1 PR 10), so nothing is done here.
 func recoverInterruptedUpgrade(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	if cfg.PrivilegeMode == privmode.Split {
+		logger.Debug("privilege mode split: an interrupted upgrade is settled as root before sandboxd starts (sandboxd upgrade recover)")
+		return nil
+	}
 	out := &slogLines{logger: logger.With("component", "upgrade-recovery")}
 	results, err := recoverUpgrades(ctx, nodeupgrade.StateDirFor(cfg.DBPath), newUpgradeRecoveryHost(), out)
 	out.flush()

@@ -17,6 +17,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/internal/privmode"
 )
 
 func sha(s string) string {
@@ -75,6 +76,20 @@ func TestRecoverInterruptedUpgrade(t *testing.T) {
 				t.Fatalf("progress lines were not logged:\n%s", logs.String())
 			}
 		})
+	}
+}
+
+// In privilege mode split sandboxd cannot swap root's files back:
+// sandboxd.service settles an interrupted upgrade as root before sandboxd
+// starts (`sandboxd upgrade recover`, M1 PR 10), and sandboxd leaves it.
+func TestRecoverInterruptedUpgradeSplit(t *testing.T) {
+	stubRecovery(t, func(context.Context, string, nodeupgrade.Host, io.Writer) ([]nodeupgrade.RecoverResult, error) {
+		t.Fatal("sandboxd ran upgrade recovery in privilege mode split")
+		return nil, nil
+	})
+	cfg := config.Config{DBPath: filepath.Join(t.TempDir(), "state.db"), PrivilegeMode: privmode.Split}
+	if err := recoverInterruptedUpgrade(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
 	}
 }
 

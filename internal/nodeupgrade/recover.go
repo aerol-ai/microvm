@@ -84,6 +84,13 @@ func (u *Upgrader) resolve(ctx context.Context, st *State, dbSafe bool) (bool, e
 				st.GatewayRestarted = true
 			}
 		}
+		if st.RootdRestart && !st.RootdRestarted {
+			if err := u.Host.RestartUnit(ctx, rootdUnit); err != nil {
+				problems = append(problems, err)
+			} else {
+				st.RootdRestarted = true
+			}
+		}
 		if st.HostApply == HostApplyPending {
 			u.logf("warning: upgrade op %s finished at boot without its host setup; run `sudo sandboxd host apply` and restart sandboxd", st.Op)
 		}
@@ -146,6 +153,11 @@ func (u *Upgrader) resolve(ctx context.Context, st *State, dbSafe bool) (bool, e
 		}
 		if st.CaddyRestarted {
 			if err := u.Host.RestartUnit(ctx, caddyUnit); err != nil {
+				problems = append(problems, err)
+			}
+		}
+		if st.RootdRestarted {
+			if err := u.Host.RestartUnit(ctx, rootdUnit); err != nil {
 				problems = append(problems, err)
 			}
 		}

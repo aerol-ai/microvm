@@ -58,26 +58,46 @@ func Fingerprint(stageDir string) (string, error) {
 // ReadStaged reads the staged manifest and signature and checks them
 // (Verify). Nothing of the binary is read.
 func ReadStaged(stageDir string, keys []ed25519.PublicKey) (Manifest, error) {
+	s, err := ReadStagedSigned(stageDir, keys)
+	return s.Manifest, err
+}
+
+// Signed is a staged manifest that passed Verify, with the exact bytes the
+// signature covers: a VM keeps them beside the helper it installs, so the
+// next upgrade knows the running helper's version (CheckNewer) from signed
+// bytes too.
+type Signed struct {
+	Manifest  Manifest
+	Raw       []byte
+	Signature []byte
+}
+
+// ReadStagedSigned is ReadStaged, keeping the bytes it checked.
+func ReadStagedSigned(stageDir string, keys []ed25519.PublicKey) (Signed, error) {
 	dfd, err := openStage(stageDir)
 	if err != nil {
-		return Manifest{}, err
+		return Signed{}, err
 	}
 	defer func() { _ = unix.Close(dfd) }()
 	sig, err := readSmall(dfd, SignatureName, maxSignatureSize)
 	switch {
 	case errors.Is(err, unix.ENOENT):
-		return Manifest{}, refuse(ReasonUnsigned, "no %s is staged", SignatureName)
+		return Signed{}, refuse(ReasonUnsigned, "no %s is staged", SignatureName)
 	case err != nil:
-		return Manifest{}, err
+		return Signed{}, err
 	}
 	manifest, err := readSmall(dfd, ManifestName, maxManifestSize)
 	switch {
 	case errors.Is(err, unix.ENOENT):
-		return Manifest{}, refuse(ReasonBadManifest, "no %s is staged", ManifestName)
+		return Signed{}, refuse(ReasonBadManifest, "no %s is staged", ManifestName)
 	case err != nil:
-		return Manifest{}, err
+		return Signed{}, err
 	}
-	return Verify(keys, manifest, sig)
+	m, err := Verify(keys, manifest, sig)
+	if err != nil {
+		return Signed{}, err
+	}
+	return Signed{Manifest: m, Raw: manifest, Signature: sig}, nil
 }
 
 // readSmall reads a small staged file: a regular file, not a link, no

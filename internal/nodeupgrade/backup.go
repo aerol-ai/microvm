@@ -64,8 +64,15 @@ func restoreBackup(backup, dbPath string) error {
 	if st, err := os.Stat(dbPath); err == nil {
 		mode = st.Mode().Perm()
 	}
+	// The database's folder is sandboxd's, and in privilege mode split
+	// sandboxd's user can write it: a link left at the temporary name must
+	// not make root write the backup wherever it points. So the name is
+	// cleared and made afresh, never followed (O_EXCL, O_NOFOLLOW).
 	tmp := dbPath + ".restore"
-	if err := copyFile(backup, tmp, mode); err != nil {
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := copyFileExcl(backup, tmp, mode); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
