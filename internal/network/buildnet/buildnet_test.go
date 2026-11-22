@@ -214,3 +214,35 @@ func TestConfigDefaults(t *testing.T) {
 		t.Fatalf("DefaultResolvConf = %q: install.sh's unit binds this path", DefaultResolvConf)
 	}
 }
+
+// writeResolvConf: the host's own resolv.conf by default, and a write that
+// cannot finish fails Up rather than leaving a partial file.
+func TestWriteResolvConf(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeResolvConf(Config{ResolvConf: filepath.Join(dir, "a", "resolv.conf")}); err != nil {
+		t.Fatalf("from the host's resolv.conf: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "a", "resolv.conf")); err != nil || !strings.Contains(string(body), "nameserver ") {
+		t.Fatalf("resolv.conf %q, %v", body, err)
+	}
+	// A folder where the file goes: the rename fails, nothing is left over.
+	taken := filepath.Join(dir, "b", "resolv.conf")
+	if err := os.MkdirAll(filepath.Join(taken, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeResolvConf(Config{ResolvConf: taken}); err == nil {
+		t.Fatal("a resolv.conf path that is a folder was written")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "b", ".resolv.conf-*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
+	}
+	if os.Geteuid() != 0 {
+		ro := filepath.Join(dir, "ro")
+		if err := os.Mkdir(ro, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeResolvConf(Config{ResolvConf: filepath.Join(ro, "resolv.conf")}); err == nil {
+			t.Fatal("a read-only folder took the file")
+		}
+	}
+}
