@@ -26,10 +26,11 @@ func TestReleaseWorkflowSignsTheRootHelper(t *testing.T) {
 		"-o dist/aerolvm-rootd_${{ matrix.suffix }} ./cmd/aerolvm-rootd",
 		"  sign-rootd:\n",
 		"    environment: release\n",
-		"      ROOTD_SIGNING_KEY: ${{ secrets.AEROLVM_ROOTD_SIGNING_KEY }}\n",
-		"        if: env.ROOTD_SIGNING_KEY != ''\n",
-		`go run ./cmd/aerolvm-rootd-sign -key "$key" -version "$VERSION" dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64`,
-		"go run ./cmd/aerolvm-rootd-sign -verify internal/rootswap/release-keys.pub dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64",
+		"      HAVE_ROOTD_SIGNING_KEY: ${{ secrets.AEROLVM_ROOTD_SIGNING_KEY != '' }}\n",
+		"        if: env.HAVE_ROOTD_SIGNING_KEY == 'true'\n",
+		`"$RUNNER_TEMP/aerolvm-rootd-sign" -check-version "$VERSION" dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64`,
+		`"$RUNNER_TEMP/aerolvm-rootd-sign" -key "$key" -version "$VERSION" -no-exec dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64`,
+		`"$RUNNER_TEMP/aerolvm-rootd-sign" -verify internal/rootswap/release-keys.pub dist/aerolvm-rootd_linux_amd64 dist/aerolvm-rootd_linux_arm64`,
 		"name: dist-rootd-signatures",
 		"needs: [hold-latest, build, cli, sign-rootd]",
 	} {
@@ -37,9 +38,43 @@ func TestReleaseWorkflowSignsTheRootHelper(t *testing.T) {
 			t.Errorf("release.yml lacks %q", want)
 		}
 	}
-	// The key is the signing job's alone: no other job names the secret.
-	if n := strings.Count(wf, "secrets.AEROLVM_ROOTD_SIGNING_KEY"); n != 1 {
-		t.Errorf("release.yml names the signing key %d times; only sign-rootd may read it", n)
+	// The key's value reaches one step's environment alone (the job's
+	// environment only says whether it is set), that step runs no built
+	// binary, the version is checked before it, and the key file is
+	// removed whatever happens.
+	value := "ROOTD_SIGNING_KEY: ${{ secrets.AEROLVM_ROOTD_SIGNING_KEY }}"
+	if n := strings.Count(wf, value); n != 1 || !strings.Contains(wf, "        env:\n          "+value+"\n") {
+		t.Errorf("the signing key's value appears %d times, or not as one step's env", n)
+	}
+	if n := strings.Count(wf, "secrets.AEROLVM_ROOTD_SIGNING_KEY"); n != 2 {
+		t.Errorf("release.yml names the signing key %d times; only sign-rootd may", n)
+	}
+	sign := regexp.MustCompile(`(?s)- name: Sign aerolvm-rootd\n.*?\n\n`).FindString(wf)
+	if sign == "" || !strings.Contains(sign, "-no-exec") || strings.Contains(sign, "go run") || strings.Contains(sign, "go build") {
+		t.Errorf("the signing step must run only the signer, with -no-exec:\n%s", sign)
+	}
+	signAt := strings.Index(wf, "- name: Sign aerolvm-rootd")
+	cleanup := strings.Index(wf, "- name: Remove the signing key file\n        if: always()\n")
+	if signAt < 0 || cleanup < 0 || cleanup < signAt {
+		t.Errorf("want an always() key removal (%d) after the signing step (%d)", cleanup, signAt)
+	}
+	// The helper runs (its --version) only in check-rootd, a job with no
+	// environment and no secret, on a runner of its own. sign-rootd waits
+	// for it, runs no helper, and builds the signer with no restored cache.
+	checkJob := job(wf, "check-rootd")
+	signJob := job(wf, "sign-rootd")
+	if !strings.Contains(checkJob, "-check-version") || strings.Contains(checkJob, "environment:") || strings.Contains(checkJob, "secrets.") {
+		t.Errorf("check-rootd must run -check-version with no environment and no secret:\n%s", checkJob)
+	}
+	for _, bad := range []string{"-check-version", "--version", "cache: true"} {
+		if strings.Contains(signJob, bad) {
+			t.Errorf("sign-rootd has %q: it must run no helper and restore no cache", bad)
+		}
+	}
+	for _, want := range []string{"needs: [build, check-rootd]\n", "cache: false\n"} {
+		if !strings.Contains(signJob, want) {
+			t.Errorf("sign-rootd lacks %q", want)
+		}
 	}
 	// The helper is built for the platforms the release signs.
 	build := regexp.MustCompile(`(?s)- name: Build aerolvm-rootd \(Linux amd64 and arm64\)\n\s+if: (matrix\.goos == 'linux' && \(matrix\.goarch == 'amd64' \|\| matrix\.goarch == 'arm64'\))`)
@@ -65,4 +100,18 @@ func TestReleaseWorkflowSignsTheRootHelper(t *testing.T) {
 			t.Errorf("install.sh lacks %q", want)
 		}
 	}
+}
+
+// job returns one job of a workflow: from its "  <name>:" line to the next
+// job's.
+func job(wf, name string) string {
+	start := strings.Index(wf, "\n  "+name+":\n")
+	if start < 0 {
+		return ""
+	}
+	rest := wf[start+1:]
+	if next := regexp.MustCompile(`\n  [a-z0-9-]+:\n`).FindStringIndex(rest[1:]); next != nil {
+		return rest[:next[0]+1]
+	}
+	return rest
 }
