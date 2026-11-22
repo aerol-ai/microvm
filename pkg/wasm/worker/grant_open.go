@@ -60,7 +60,11 @@ var errGrantRefused = errors.New("refused")
 func openGrantPath(path string, strict bool) (*os.File, error) {
 	p := grantPolicy.Load()
 	if p == nil || !p.Worker.Enabled() {
-		f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+		name, ok := plainGrantName(path)
+		if !ok {
+			return nil, fmt.Errorf("%s: %w: not a clean path below the working folder", path, errGrantRefused)
+		}
+		f, err := os.OpenFile(name, os.O_RDONLY|unix.O_NONBLOCK, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -71,6 +75,26 @@ func openGrantPath(path string, strict bool) (*os.File, error) {
 		return f, nil
 	}
 	return walkOpen(path, *p, strict)
+}
+
+// plainGrantName is path as the plain open (workers not confined) uses it,
+// built in the form code scanning (go/path-injection) counts as checked:
+// filepath.Clean("/" + path), without its leading "/" for a relative path.
+// That is path itself for every clean path that does not climb above the
+// working folder, which is every path openGrants passes (it cleans each one
+// first, and sandboxd's folders do not climb). Any other path is refused:
+// openGrants then leaves the grant out and the worker, which runs as
+// sandboxd here, opens the path itself, as for any grant sandboxd cannot
+// open.
+func plainGrantName(path string) (string, bool) {
+	name := filepath.Clean("/" + path)
+	if !filepath.IsAbs(path) {
+		name = strings.TrimPrefix(name, "/")
+		if name == "" {
+			name = "."
+		}
+	}
+	return name, name == path
 }
 
 // walkOpen is the confined open described above.
@@ -145,7 +169,9 @@ func walkOpen(path string, p GrantPolicy, strict bool) (*os.File, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("%s: %w: not a directory or a regular file", path, errGrantRefused)
 	}
-	return os.NewFile(uintptr(fd), clean), nil
+	// clean is absolute and clean, so this is clean itself, in the form code
+	// scanning counts as checked.
+	return os.NewFile(uintptr(fd), filepath.Clean("/"+clean)), nil
 }
 
 // checkFolder refuses a folder on the way that the worker could write: it

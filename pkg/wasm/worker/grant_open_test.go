@@ -180,3 +180,100 @@ func TestWorkerWritable(t *testing.T) {
 		t.Fatal("a group- or world-writable folder counted as safe")
 	}
 }
+
+// TestPlainGrantName: the plain open's name is the path itself for every
+// clean path that does not climb above the working folder, absolute or
+// relative, ".." inside a name included; anything else is refused.
+func TestPlainGrantName(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		ok   bool
+	}{
+		{"/", true},
+		{"/var/lib/sandboxd/wasm/modules/app.wasm", true},
+		{"/srv/v1..2/app.wasm", true},
+		{"/srv/..hidden", true},
+		{"modules/app.wasm", true},
+		{"mods/v1..2/app.wasm", true},
+		{".", true},
+		{"..", false},
+		{"../x", false},
+		{"../../srv/app.wasm", false},
+		{"/srv/../etc", false}, // not clean: openGrants cleans first
+		{"a/./b", false},
+		{"a//b", false},
+		{"/srv/", false},
+		{"", false},
+	} {
+		name, ok := plainGrantName(tc.path)
+		if ok != tc.ok || ok && name != tc.path {
+			t.Errorf("plainGrantName(%q) = %q, %v; want ok %v and the path itself", tc.path, name, ok, tc.ok)
+		}
+	}
+}
+
+// TestOpenGrantPathPlain: with workers not confined, a clean path opens as
+// it always did, by the same name; a relative path that climbs above the
+// working folder is refused, and openGrants leaves it out (the worker then
+// opens it itself).
+func TestOpenGrantPathPlain(t *testing.T) {
+	withGrantPolicy(t, GrantPolicy{})
+	dir := t.TempDir()
+	file := filepath.Join(dir, "m.wasm")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{file, dir, "grant_open.go"} { // the last relative to the test's folder
+		f, err := openGrantPath(p, false)
+		if err != nil {
+			t.Fatalf("open %q: %v", p, err)
+		}
+		if f.Name() != p {
+			t.Errorf("open %q named %q", p, f.Name())
+		}
+		_ = f.Close()
+	}
+	climb := filepath.Join("..", filepath.Base(mustGetwd(t)), "grant_open.go")
+	if _, err := os.Stat(climb); err != nil {
+		t.Fatalf("the climbing path should name a real file: %v", err)
+	}
+	if _, err := openGrantPath(climb, false); !errors.Is(err, errGrantRefused) {
+		t.Fatalf("open %q = %v, want a refusal", climb, err)
+	}
+	files, names := openGrants([]string{file, climb})
+	defer closeFiles(files)
+	if len(files) != 1 || len(names) != 1 || names[0] != file {
+		t.Fatalf("granted %v", names)
+	}
+}
+
+// TestOpenGrantPathConfinedName: the confined walk names the file it opens
+// by the clean path, as before.
+func TestOpenGrantPathConfinedName(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "m.wasm")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withGrantPolicy(t, GrantPolicy{Roots: []string{root}, Worker: grantWorker})
+	f, err := openGrantPath(file+"/", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if f.Name() != file {
+		t.Fatalf("named %q, want %q", f.Name(), file)
+	}
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wd
+}
