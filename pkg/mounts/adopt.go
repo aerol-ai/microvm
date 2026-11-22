@@ -59,6 +59,9 @@ type helperProcess struct {
 	pid  int
 	ppid int // 0 when unknown
 	argv []string
+	// mark is an isolated tool's mount marker (toolMarkEnv), read only
+	// in isolated mode.
+	mark string
 }
 
 // listHelperProcesses lists the processes a helper could be: the members of
@@ -76,7 +79,11 @@ func (m *Manager) listHelperProcesses() []helperProcess {
 		if err != nil || len(argv) == 0 || argv[0] == "" {
 			continue // gone, or a kernel thread
 		}
-		out = append(out, helperProcess{pid: pid, ppid: readPPID(pid), argv: argv})
+		h := helperProcess{pid: pid, ppid: readPPID(pid), argv: argv}
+		if m.tools != nil {
+			h.mark = readMark(pid)
+		}
+		out = append(out, h)
 	}
 	return out
 }
@@ -241,6 +248,9 @@ func (m *Manager) adoptOne(ctx context.Context, sandboxID string, index int, spe
 		startedAt: time.Now().UTC(),
 	}
 	bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
+	if m.tools != nil && !plan.IsKernelMount {
+		return m.adoptTool(sandboxID, index, spec, hostPath, plan, helpers)
+	}
 	if plan.IsKernelMount {
 		// Nothing runs; the kernel holds the mount. A mount made before
 		// the NFS adapter forced nosuid,nodev may lack them, so set them
@@ -302,7 +312,7 @@ var remountNosuidNodev = func(path string) error {
 func (m *Manager) clearStaleMount(sandboxID string, index int, helpers []helperProcess) {
 	hostPath := m.hostPath(sandboxID, index)
 	for _, h := range helpers {
-		if h.argv[len(h.argv)-1] != hostPath {
+		if h.argv[len(h.argv)-1] != hostPath && (h.mark == "" || h.mark != hostPath) {
 			continue
 		}
 		proc, err := openHelperProcess(h.pid, h.argv)

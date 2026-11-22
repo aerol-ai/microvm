@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -48,6 +49,11 @@ type Config struct {
 	// ErrMountsUnavailable before anything starts: served anyway, the
 	// sandbox would write to local disk instead of the store.
 	Unavailable string
+	// Tools, when set, runs every FUSE tool as this normal user, on a FUSE
+	// mount the Manager makes itself (tools.go). The root helper sets it in
+	// privilege mode split; sandboxd's own Manager in single mode does not.
+	// CredDir then holds sshfs's key files and is made mode 0711.
+	Tools *ToolUser
 }
 
 // Manager owns mount processes for every active sandbox.
@@ -74,6 +80,13 @@ type Manager struct {
 	runtimePIDFile string
 	// unavailable is Config.Unavailable (Available).
 	unavailable string
+	// tools is Config.Tools (tools.go); nil in single mode.
+	tools *ToolUser
+
+	// remote, in privilege mode split, does every call in the root helper
+	// (remote.go; NewRemote); remoteBinds are its last answers' binds.
+	remote      Remote
+	remoteBinds map[string][]ContainerBind
 }
 
 type mountState struct {
@@ -100,6 +113,10 @@ type mountState struct {
 
 	// rootOnly: the tool lets only root in (ContainerBind.RootOnly).
 	rootOnly bool
+
+	// tool is an isolated tool's own (tools.go); nil for a kernel mount
+	// and in single mode.
+	tool *toolRun
 }
 
 // New constructs a Manager. The root and cred directories are created with
@@ -131,6 +148,11 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	if err := os.MkdirAll(cfg.CredDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create credentials dir: %w", err)
 	}
+	if t := cfg.Tools; t != nil {
+		if err := prepareToolDirs(cfg.RootDir, cfg.CredDir, t); err != nil {
+			return nil, err
+		}
+	}
 
 	return &Manager{
 		logger:      logger,
@@ -146,6 +168,7 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 
 		runtimePIDFile: cfg.RuntimePIDFile,
 		unavailable:    cfg.Unavailable,
+		tools:          cfg.Tools,
 	}, nil
 }
 
@@ -157,10 +180,15 @@ var ErrMountsUnavailable = errors.New("external storage is not available on this
 // Available reports whether this node serves external storage, and if not,
 // why. The service asks before a create does any work; mountSet asks again.
 func (m *Manager) Available() error {
-	if m.unavailable == "" {
-		return nil
+	if m.unavailable != "" {
+		return fmt.Errorf("%w: %s", ErrMountsUnavailable, m.unavailable)
 	}
-	return fmt.Errorf("%w: %s", ErrMountsUnavailable, m.unavailable)
+	if m.remote != nil {
+		if err := m.remote.Ready(); err != nil {
+			return fmt.Errorf("%w: %v", ErrMountsUnavailable, err)
+		}
+	}
+	return nil
 }
 
 // Close stops the supervisor. Existing mounts are left in place so an
@@ -198,6 +226,14 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 	if err := m.Available(); err != nil {
 		return nil, err
 	}
+	if m.remote != nil {
+		mode := RemoteCreate
+		if adopt {
+			mode = RemoteReestablish
+		}
+		res, err := m.remoteMount(ctx, sandboxID, mode, mounts)
+		return res.Binds, err
+	}
 	// sandboxID is a path component for every host dir and bind below. Validate
 	// it here as well as at the create entry: the mount manager must be
 	// self-protecting so a '..' id can never escape rootDir (host-dir creation,
@@ -228,7 +264,7 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 			adopt = false
 		}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := m.makeMountFolder(dir); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
 
@@ -298,6 +334,10 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 // not track (one a previous sandboxd left) or one whose unmount failed is
 // unmounted first, and the folder is never removed through a mount.
 func (m *Manager) UnmountAll(sandboxID string) error {
+	if m.remote != nil {
+		_, err := m.remoteUnmount(sandboxID, false)
+		return err
+	}
 	m.mu.Lock()
 	states := m.state[sandboxID]
 	delete(m.state, sandboxID)
@@ -325,6 +365,9 @@ func (m *Manager) UnmountAll(sandboxID string) error {
 func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.remote != nil {
+		return slices.Clone(m.remoteBinds[sandboxID])
+	}
 	states := m.state[sandboxID]
 	binds := make([]ContainerBind, 0, len(states))
 	for _, s := range states {
@@ -351,6 +394,10 @@ func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 // without this sweep those mounts pile up forever. Directories the manager
 // owns in-process (tracked, or with a MountAll in flight) are never swept.
 func (m *Manager) Sweep(keep map[string]struct{}) {
+	if m.remote != nil {
+		m.remoteSweep(keep)
+		return
+	}
 	entries, err := os.ReadDir(m.rootDir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -462,7 +509,7 @@ func (m *Manager) beginMount(ctx context.Context, id string) (release func(), er
 // any mount folder: unmounted first, never removed through a mount.
 // Best-effort; logs failures.
 func (m *Manager) cleanupOrphanDir(dir string) {
-	killFUSEProcessesFor(m.logger, dir)
+	m.killToolsFor(dir)
 	if err := m.clearMountDir(dir); err != nil {
 		m.logger.Warn("mounts sweep: remove failed", "path", dir, "error", err)
 	}
@@ -481,6 +528,13 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 func (m *Manager) Discard(sandboxID string) bool {
 	if m == nil {
 		return false
+	}
+	if m.remote != nil {
+		had, err := m.remoteUnmount(sandboxID, true)
+		if err != nil {
+			m.logger.Warn("mounts: the root helper could not discard a sandbox's mounts", "sandbox_id", sandboxID, "error", err)
+		}
+		return had
 	}
 	m.mu.Lock()
 	_, tracked := m.state[sandboxID]
@@ -534,6 +588,10 @@ type KeepReport struct {
 func (m *Manager) KeepLive(ctx context.Context, sandboxID string, mounts []models.MountSpec) (KeepReport, error) {
 	if m == nil || len(mounts) == 0 {
 		return KeepReport{}, nil
+	}
+	if m.remote != nil {
+		res, err := m.remoteMount(ctx, sandboxID, RemoteKeepLive, mounts)
+		return res.Report, err
 	}
 	if err := models.ValidateSandboxID(sandboxID); err != nil {
 		return KeepReport{}, fmt.Errorf("mount: %w", err)
@@ -593,6 +651,12 @@ func (m *Manager) KeepLive(ctx context.Context, sandboxID string, mounts []model
 // For a sandbox this process does not track yet (the first pass after a
 // sandboxd restart) it adopts the helpers still serving its mounts.
 func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []models.MountSpec) error {
+	if m.remote != nil {
+		// The helper keeps the set: what serves is taken over, the rest
+		// mounted (mountSet with adopt).
+		_, err := m.mountSet(ctx, sandboxID, mounts, true)
+		return err
+	}
 	m.mu.Lock()
 	already, present := m.state[sandboxID]
 	m.mu.Unlock()
@@ -617,13 +681,16 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	}
 
 	hostPath := m.hostPath(sandboxID, index)
-	if err := os.MkdirAll(hostPath, 0o700); err != nil {
+	if err := m.makeMountFolder(hostPath); err != nil {
 		return nil, ContainerBind{}, fmt.Errorf("create host path: %w", err)
 	}
 
 	plan, err := adapter.Build(sandboxID, index, spec, hostPath, m.credDir)
 	if err != nil {
 		return nil, ContainerBind{}, err
+	}
+	if m.tools != nil && !plan.IsKernelMount {
+		return m.mountTool(ctx, sandboxID, index, spec, hostPath, plan)
 	}
 	c, hasConsumer := consumerFrom(ctx)
 	if hasConsumer {
@@ -765,11 +832,8 @@ func (m *Manager) superviseExit(state *mountState) {
 		return
 	}
 
-	// Best-effort restart. Re-create cred file if needed.
-	if state.plan.CredFile != "" {
-		_ = writeCredFile(state.plan.CredFile, state.plan.CredBody)
-	}
-	cmd, out, exit, err := m.spawnHelper(state.plan, m.helperLogPath(state.sandboxID, state.index))
+	// Best-effort restart, with its cred file made again if it has one.
+	cmd, out, exit, err := m.restartTool(state)
 	if err != nil {
 		state.disabled = true
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
@@ -798,6 +862,7 @@ func (m *Manager) tearDownState(s *mountState) error {
 	if s.plan.CredFile != "" {
 		_ = os.Remove(s.plan.CredFile)
 	}
+	m.cleanupTool(s)
 	return nil
 }
 

@@ -59,7 +59,7 @@ func (m *Manager) clearMountDir(dir string) error {
 		return nil
 	}
 	if points := mountPointsUnder(dir); len(points) > 0 {
-		killFUSEProcessesFor(m.logger, dir)
+		m.killToolsFor(dir)
 		unmountPoints(m.logger, points)
 		if left := mountPointsUnder(dir); len(left) > 0 {
 			err := fmt.Errorf("mount folder %s: %w at %s; left in place", dir, errStillMounted, strings.Join(left, ", "))
@@ -67,7 +67,11 @@ func (m *Manager) clearMountDir(dir string) error {
 			return err
 		}
 	}
-	return removeOnDevice(dir)
+	if err := removeOnDevice(dir); err != nil {
+		return err
+	}
+	m.clearToolFiles(filepath.Base(dir))
+	return nil
 }
 
 // mountPointsUnder lists the mount points at or under dir, deepest first:
