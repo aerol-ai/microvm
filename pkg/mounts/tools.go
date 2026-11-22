@@ -102,15 +102,41 @@ var ErrToolFolder = errors.New("not a folder of the mount manager's own")
 // toolSubtype is the FUSE subtype of a type's tool, as the mount table
 // shows it (fuse.<subtype>).
 func toolSubtype(t models.MountType) string {
-	switch t {
-	case models.MountTypeS3:
-		return "mount-s3"
-	case models.MountTypeSSHFS:
-		return "sshfs"
-	case models.MountTypeRclone:
-		return "rclone"
+	if bin, ok := toolBinary(t); ok {
+		return bin
 	}
 	return string(t)
+}
+
+// toolBinary is the program a type's isolated tool runs, from this fixed
+// set: the command a tool starts is never taken from a plan, which also
+// carries the request's values (go/command-injection).
+func toolBinary(t models.MountType) (string, bool) {
+	switch t {
+	case models.MountTypeS3:
+		return "mount-s3", true
+	case models.MountTypeSSHFS:
+		return "sshfs", true
+	case models.MountTypeRclone:
+		return "rclone", true
+	}
+	return "", false
+}
+
+// toolCacheFolder is rclone's write cache for mount index of sandboxID,
+// <Tools.CacheDir>/<id>-<index>, or false for an id mountSet would refuse:
+// the id's pattern, then the path cleaned and seen to stay in the cache
+// folder, the check code scanning counts (go/path-injection).
+func (m *Manager) toolCacheFolder(sandboxID string, index int) (string, bool) {
+	if models.ValidateSandboxID(sandboxID) != nil {
+		return "", false
+	}
+	root := filepath.Clean(m.tools.CacheDir)
+	dir := filepath.Clean(filepath.Join(root, fmt.Sprintf("%s-%d", sandboxID, index)))
+	if !strings.HasPrefix(dir, root+string(filepath.Separator)) {
+		return "", false
+	}
+	return dir, true
 }
 
 // toolPlan turns an adapter's plan for a FUSE tool into the one an isolated
@@ -123,6 +149,9 @@ func (m *Manager) toolPlan(sandboxID string, index int, t models.MountType, plan
 	n := len(argv)
 	if n < 2 || argv[n-1] != hostPath || !slices.Contains(argv, "--") {
 		return adapters.Plan{}, run, fmt.Errorf("%s: the tool's command does not end with its mount point", argvName(argv))
+	}
+	if bin, ok := toolBinary(t); ok && argv[0] != bin {
+		return adapters.Plan{}, run, fmt.Errorf("%s: a %s mount runs %s", argvName(argv), t, bin)
 	}
 	argv[n-1] = toolFuseFD
 	out := adapters.Plan{CredFile: plan.CredFile, CredBody: plan.CredBody}
@@ -168,7 +197,11 @@ func (m *Manager) toolPlan(sandboxID string, index int, t models.MountType, plan
 			return adapters.Plan{}, run, errors.New("rclone: the tool's command is not rclone mount")
 		}
 		argv[1] = "mount2"
-		run.cacheDir = filepath.Join(m.tools.CacheDir, fmt.Sprintf("%s-%d", sandboxID, index))
+		cache, ok := m.toolCacheFolder(sandboxID, index)
+		if !ok {
+			return adapters.Plan{}, run, fmt.Errorf("rclone: no cache folder for sandbox %q", sandboxID)
+		}
+		run.cacheDir = cache
 		argv = beforeOptionsEnd(argv, "--allow-non-empty", "--cache-dir="+run.cacheDir)
 	}
 	out.Argv, out.Env = argv, env
@@ -233,6 +266,10 @@ func (m *Manager) mountTool(ctx context.Context, sandboxID string, index int, sp
 // the tool, and a stat of a mount whose tool died fails instead of waiting.
 func (m *Manager) startTool(s *mountState) (*exec.Cmd, *helperOutput, *procExit, error) {
 	t := m.tools
+	bin, ok := toolBinary(s.spec.Type)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("mount type %q runs no FUSE tool", s.spec.Type)
+	}
 	if s.tool.cacheDir != "" {
 		if err := ensureToolCache(s.tool.cacheDir, t.UID, t.GID); err != nil {
 			return nil, nil, nil, err
@@ -265,7 +302,7 @@ func (m *Manager) startTool(s *mountState) (*exec.Cmd, *helperOutput, *procExit,
 	}
 	defer logFile.Close()
 	newCmd := func() *exec.Cmd {
-		cmd := exec.Command(s.plan.Argv[0], s.plan.Argv[1:]...)
+		cmd := exec.Command(bin, s.plan.Argv[1:]...)
 		cmd.Env = s.plan.Env
 		cmd.Dir = "/"
 		cmd.Stdout, cmd.Stderr = logFile, logFile
@@ -549,10 +586,14 @@ func prepareToolDirs(root, credDir string, t *ToolUser) error {
 // makeMountFolder makes a folder a mount point sits in, or the point
 // itself: in isolated mode one of the Manager's own (ensureToolFolder).
 func (m *Manager) makeMountFolder(path string) error {
-	if m.tools == nil {
-		return os.MkdirAll(path, 0o700)
+	p, ok := m.inMountsRoot(path)
+	if !ok {
+		return fmt.Errorf("%s: %w (not below the mounts folder)", path, ErrToolFolder)
 	}
-	return ensureToolFolder(path, 0o700)
+	if m.tools == nil {
+		return os.MkdirAll(p, 0o700)
+	}
+	return ensureToolFolder(p, 0o700)
 }
 
 // adoptTool is adoptOne for an isolated tool: the one process whose marker

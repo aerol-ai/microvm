@@ -377,9 +377,12 @@ func killLiveProcess(p liveProcess) {
 	_ = p.Close()
 }
 
-// hostPath is where mount index of sandboxID is mounted on the host.
+// hostPath is where mount index of sandboxID is mounted on the host
+// (mountPoint), or "" for an id mountSet would refuse: every caller has
+// that id through mountSet's check already.
 func (m *Manager) hostPath(sandboxID string, index int) string {
-	return filepath.Join(m.rootDir, sandboxID, strconv.Itoa(index))
+	p, _ := m.mountPoint(sandboxID, index)
+	return p
 }
 
 // helperLogPath is the log file of mount index's helper, beside the mount

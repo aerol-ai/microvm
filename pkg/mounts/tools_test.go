@@ -714,3 +714,64 @@ func toolStateOf(m *Manager, id string) *mountState {
 	}
 	return nil
 }
+
+// TestToolCacheFolder: rclone's cache is <CacheDir>/<id>-<index> for every
+// id mountSet accepts, and none for an id it refuses.
+func TestToolCacheFolder(t *testing.T) {
+	cache := t.TempDir()
+	m := &Manager{tools: &ToolUser{UID: 1, GID: 1, CacheDir: cache + "/./"}}
+	for _, c := range []struct {
+		id     string
+		want   string
+		wantOK bool
+	}{
+		{"sb-1", filepath.Join(cache, "sb-1-2"), true},
+		{"", "", false},
+		{"..", "", false},
+		{"../x", "", false},
+		{"a/b", "", false},
+		{strings.Repeat("a", 129), "", false},
+	} {
+		got, ok := m.toolCacheFolder(c.id, 2)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("toolCacheFolder(%q) = %q, %v; want %q, %v", c.id, got, ok, c.want, c.wantOK)
+		}
+	}
+	host := filepath.Join(t.TempDir(), "x", "0")
+	plan := adapters.Plan{Argv: []string{"rclone", "mount", "--", "r:b", host}}
+	if _, _, err := m.toolPlan("../x", 0, models.MountTypeRclone, plan, host); err == nil || !strings.Contains(err.Error(), "no cache folder") {
+		t.Fatalf("toolPlan with a bad id = %v", err)
+	}
+}
+
+// TestToolBinary: an isolated tool runs one of three fixed programs; a plan
+// whose program is not its type's is refused, and a type with no tool
+// starts nothing.
+func TestToolBinary(t *testing.T) {
+	for typ, want := range map[models.MountType]string{models.MountTypeS3: "mount-s3", models.MountTypeSSHFS: "sshfs", models.MountTypeRclone: "rclone"} {
+		if got, ok := toolBinary(typ); !ok || got != want {
+			t.Errorf("toolBinary(%s) = %q, %v", typ, got, ok)
+		}
+		if toolSubtype(typ) != want {
+			t.Errorf("toolSubtype(%s) = %q", typ, toolSubtype(typ))
+		}
+	}
+	if _, ok := toolBinary(models.MountTypeNFS); ok || toolSubtype(models.MountTypeNFS) != "nfs" {
+		t.Fatal("nfs runs no FUSE tool")
+	}
+	r := newToolRig(t)
+	host := r.m.hostPath("sb-1", 0)
+	plan := adapters.Plan{Argv: []string{"/tmp/other", "--", "s3://b", host}}
+	if _, _, err := r.m.toolPlan("sb-1", 0, models.MountTypeS3, plan, host); err == nil || !strings.Contains(err.Error(), "runs mount-s3") {
+		t.Fatalf("a plan running another program = %v", err)
+	}
+	s := &mountState{sandboxID: "sb-1", spec: models.MountSpec{Type: models.MountTypeNFS}, hostPath: host, tool: &toolRun{}}
+	if _, _, _, err := r.m.startTool(s); err == nil || !strings.Contains(err.Error(), "runs no FUSE tool") {
+		t.Fatalf("startTool for nfs = %v", err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.started) != 0 || len(r.fuse) != 0 {
+		t.Fatalf("started %d fuse %v", len(r.started), r.fuse)
+	}
+}

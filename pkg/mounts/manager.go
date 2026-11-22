@@ -257,7 +257,10 @@ func (m *Manager) mountSet(ctx context.Context, sandboxID string, mounts []model
 	if taken {
 		return nil, fmt.Errorf("mount %s: %w", sandboxID, ErrMountsEstablished)
 	}
-	dir := filepath.Join(m.rootDir, sandboxID)
+	dir, ok := m.mountFolder(sandboxID)
+	if !ok {
+		return nil, fmt.Errorf("mount: no mount folder for sandbox %q", sandboxID)
+	}
 	if adopt {
 		// No directory, nothing a previous sandboxd could have left.
 		if _, err := os.Stat(dir); err != nil {
@@ -680,7 +683,10 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		return nil, ContainerBind{}, fmt.Errorf("no adapter for type %q", spec.Type)
 	}
 
-	hostPath := m.hostPath(sandboxID, index)
+	hostPath, ok := m.mountPoint(sandboxID, index)
+	if !ok {
+		return nil, ContainerBind{}, fmt.Errorf("no mount point for sandbox %q", sandboxID)
+	}
 	if err := m.makeMountFolder(hostPath); err != nil {
 		return nil, ContainerBind{}, fmt.Errorf("create host path: %w", err)
 	}
