@@ -525,6 +525,33 @@ Each is small and stands alone. Together they shrink the root surface now.
       than that group. Ansible sets no BuildKit up, so it is unchanged.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
+    **What building it taught us (PR 10, 2026-11-23).**
+    - **`install.sh --privilege-mode split|single`**, saved in node.json
+      like every setting; Terraform's `privilege_mode` in
+      `config/cluster.yml` passes it on the one-line join path; Ansible
+      checks each node runs that mode and never switches one (a switch
+      makes users, writes units, installs the helper, moves owners).
+    - **The ownership move runs before every sandboxd start, not once.**
+      Root tools keep writing into the agent's folders after the switch
+      (`sandboxd init` and `join`, `key wrap`, the upgrader's database
+      restore). `aerolvm-rootd agent-folders`, as root in the unit
+      (`ExecStartPre=+`), gives the agent what root owns there: no link
+      followed, no mount entered, other users' files and hard-linked files
+      left alone. After the first start it only reads. The way back is the
+      installer's, since single runs no helper.
+    - **The upgrader's folder moves out of the agent's.** Beside the
+      database the agent could swap a staged binary between its check and
+      its install (root runs `sandboxd` in install.sh). Split sets
+      `SB_UPGRADE_STATE_DIR` to a folder of root's; `sandboxd upgrade
+      recover` runs as root before sandboxd starts; upgrades over the API
+      are off until the helper's `ApplyUpgrade` exists.
+    - **The node upgrade checks the helper with the supervisor's code**
+      (`internal/rootswap`): signed manifest, this release, not older,
+      the checked copy installed. release.yml signs in a job of its own,
+      from a `release` environment secret, skipped without it.
+    - **Two sockets needed more than the group:** the egress gateway's
+      control socket (its peer uid, `SB_EGRESS_PEER_UIDS`) and rootless
+      BuildKit's (an ACL for the agent, never the build user's group).
 11. Chart: the agent container as described in 3.3; drop the two-way mounts
     and `shareProcessNamespace`; turn external storage on by default.
     The operator rolls workers to the new template node by node through
