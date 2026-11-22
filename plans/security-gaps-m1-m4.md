@@ -506,10 +506,21 @@ Each is small and stands alone. Together they shrink the root surface now.
     - **The network is a namespace on the sandboxes' bridge.** Rootless
       buildkitd joins `aerolvm.build`, which a root oneshot unit builds with
       sandboxd's CNI config (`sandboxd host build-network up`), so pulls and
-      steps leave with a sandbox address and get the floor, the node guard
-      and the drop between sandbox ranges with no new rule. Steps keep a
-      namespace each: RootlessKit's `--detach-netns` with BuildKit's bridge
-      network. Ansible sets no BuildKit up, so it is unchanged.
+      steps leave with a sandbox address and get the floor and the node
+      guard with no new host rule. Steps live behind RootlessKit
+      (`--detach-netns`), not on the sandboxes' bridge, so the host's drop
+      between sandbox addresses never sees step-to-step traffic. Review of
+      #1398 (F4) found BuildKit's own bridge let one build's step reach
+      another's: each step now gets a point-to-point link of its own (CNI
+      `ptp`, so no shared segment to spoof on), and `sandboxd host
+      build-network guard` runs inside RootlessKit before buildkitd and
+      drops what a step sends to another step, to that namespace, to
+      RootlessKit's own network or to `aerolvm.build`'s addresses, with
+      strict reverse-path filtering. Proven live with the reviewer's
+      two-build probe. RootlessKit is 0750 to the build user's group, so
+      its AppArmor user-namespace grant is the build user's alone; split
+      mode on VMs (PR 10) must give the agent the socket by other means
+      than that group. Ansible sets no BuildKit up, so it is unchanged.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts
