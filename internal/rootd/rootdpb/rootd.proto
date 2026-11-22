@@ -174,6 +174,38 @@ service RootHelper {
   // following a link, and unmounts it. The source must be one volume's
   // folder of that export, <server>:/<export>/<scope>/<name>.
   rpc ReclaimVolume(ReclaimVolumeRequest) returns (ReclaimVolumeResponse);
+
+  // The calls below are the host-process runtimes' root work (M1 PR 9):
+  // V8-isolate group hosts (workerd in its jail), WASM workers and resident
+  // hosts. Each host is a process the helper starts in a cgroup of its own,
+  // under the helper's own host-process parent, so it outlives both the
+  // agent and the helper. The agent names a host by its kind and its id;
+  // the helper checks both (internal/rootpolicy), builds every path, picks
+  // the binary from its own settings, never from a request, and starts the
+  // host as a user with no rights. Each call is safe to retry and to
+  // repeat: "make sure this is so".
+
+  // PrepareHost makes sure what a host needs before its process starts
+  // exists: a V8 group's jail (its chroot, linked from the helper's base
+  // tree, with a run folder the agent writes its config and sockets into).
+  rpc PrepareHost(PrepareHostRequest) returns (PrepareHostResponse);
+
+  // SpawnHost makes sure a host runs, and answers with its process. A host
+  // that already runs is answered as it is.
+  rpc SpawnHost(SpawnHostRequest) returns (SpawnHostResponse);
+
+  // StopHost makes sure a host is gone: every process in its group killed,
+  // and what PrepareHost and SpawnHost made removed.
+  rpc StopHost(StopHostRequest) returns (StopHostResponse);
+
+  // ListHosts lists the hosts the helper holds anything for, read from the
+  // kernel: those whose process runs, and those left with none (pid 0),
+  // for the agent's sweep.
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+
+  // SetHostLimits changes a running host's limits (a warm V8 group host a
+  // tenant claims takes that tenant's).
+  rpc SetHostLimits(SetHostLimitsRequest) returns (SetHostLimitsResponse);
 }
 
 message VersionRequest {
@@ -197,6 +229,10 @@ message VersionResponse {
   // ("netns", "firewall", "files", and PrepareSandbox's "cgroup"). The
   // agent sends a part only when it is listed.
   repeated string parts = 4;
+  // The host kinds the host-process calls serve ("workerd",
+  // "wasm_worker", "wasm_resident"; rootdpb.HostKindName). The agent asks
+  // for a kind only when it is listed.
+  repeated string hosts = 5;
 }
 
 message EnsureHostRequest {}
@@ -745,3 +781,110 @@ message ReclaimVolumeRequest {
 }
 
 message ReclaimVolumeResponse {}
+
+// HostKind is what a host process is. The helper serves a kind only when
+// its settings name what that kind runs.
+enum HostKind {
+  HOST_KIND_UNSPECIFIED = 0;
+  // A V8-isolate group: workerd, in a jail the helper builds, as the jail
+  // user. The id is the group key.
+  HOST_KIND_WORKERD = 1;
+  // A WASM worker: one sandbox's module, or one warm-pool slot's. The id
+  // is the sandbox or slot.
+  HOST_KIND_WASM_WORKER = 2;
+  // A WASM resident host: many sandboxes of one module. The id is the
+  // host's key.
+  HOST_KIND_WASM_RESIDENT = 3;
+}
+
+// HostLimits are a host's cgroup limits. Zero on an axis is no limit, which
+// only an unclaimed warm host has.
+message HostLimits {
+  // CPU, in thousandths of a CPU.
+  uint32 cpu_millis = 1;
+  uint64 memory_mb = 2;
+  uint32 pids = 3;
+}
+
+message PrepareHostRequest {
+  HostKind kind = 1;
+  string id = 2;
+}
+
+message PrepareHostResponse {
+  // WORKERD: the group's run folder, built by the helper inside its jail,
+  // which the agent writes the group's config and binds its sockets in.
+  string run_dir = 1;
+}
+
+// WasmHostSpec is what a WASM host is started with. The helper builds every
+// folder and file the host opens as root from its own settings; the agent
+// names only a cache and the worker settings it computes at run time.
+message WasmHostSpec {
+  // The compile cache the host may write (one owner's, or one warm slot's),
+  // as a name under the cache root: "operator", "owner-<hash>",
+  // "slots/<hash>/cache". Empty: no cache.
+  string cache = 1;
+  // Worker settings sandboxd computes at run time (the audit ingest's port,
+  // the node ports guests may reach, the private ranges), each NAME=value
+  // by its environment name. The helper takes only names from its own
+  // list, none of them a path.
+  repeated string env = 2;
+}
+
+message SpawnHostRequest {
+  HostKind kind = 1;
+  string id = 2;
+  // WORKERD.
+  HostLimits limits = 3;
+  // WASM_WORKER and WASM_RESIDENT.
+  WasmHostSpec wasm = 4;
+}
+
+message SpawnHostResponse {
+  uint32 pid = 1;
+  // When the process started, in clock ticks after boot: with the pid, it
+  // names the process for good.
+  uint64 start_ticks = 2;
+  // The host already ran; nothing was started.
+  bool already = 3;
+  // WASM_WORKER and WASM_RESIDENT: the socket the host serves, which the
+  // helper made in its own folder for the agent's group alone.
+  string socket = 4;
+}
+
+message StopHostRequest {
+  HostKind kind = 1;
+  string id = 2;
+}
+
+message StopHostResponse {
+  // There was something to stop or remove.
+  bool had = 1;
+}
+
+message ListHostsRequest {
+  // UNSPECIFIED lists every kind this helper serves.
+  HostKind kind = 1;
+}
+
+// RunningHost is one host the helper holds anything for. pid is 0 when its
+// process is gone and only its group or jail is left.
+message RunningHost {
+  HostKind kind = 1;
+  string id = 2;
+  uint32 pid = 3;
+  uint64 start_ticks = 4;
+}
+
+message ListHostsResponse {
+  repeated RunningHost hosts = 1;
+}
+
+message SetHostLimitsRequest {
+  HostKind kind = 1;
+  string id = 2;
+  HostLimits limits = 3;
+}
+
+message SetHostLimitsResponse {}

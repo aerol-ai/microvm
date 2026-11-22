@@ -55,6 +55,11 @@ type jailShimSpec struct {
 	Argv    []string  `json:"argv"` // inside the chroot
 	Env     []string  `json:"env,omitempty"`
 	Seccomp []bpfInsn `json:"seccomp,omitempty"` // empty = no filter (SeccompOff)
+	// Umask, when set, is workerd's file mode mask. Only the root helper
+	// sets it (privilege mode split, rootjail.go): there the agent is not
+	// root and reaches workerd's control socket by its mode. Unset keeps
+	// the mask the shim inherited.
+	Umask *uint32 `json:"umask,omitempty"`
 }
 
 // jailShimSpecEnv carries the spec to the shim.
@@ -75,6 +80,9 @@ func (s jailShimSpec) validate() error {
 	}
 	if len(s.Argv) == 0 || s.Argv[0] == "" || s.Argv[0][0] != '/' {
 		return errors.New("isolate jail shim: argv[0] must be an absolute path inside the chroot")
+	}
+	if s.Umask != nil && *s.Umask > 0o777 {
+		return fmt.Errorf("isolate jail shim: umask %o is not a mode mask", *s.Umask)
 	}
 	if len(s.Seccomp) > hostproc.MaxSeccompInsns {
 		return fmt.Errorf("isolate jail shim: seccomp program too long (%d)", len(s.Seccomp))

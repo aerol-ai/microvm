@@ -35,6 +35,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/internal/rootswap"
 	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/isolate"
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // shutdownGrace is how long calls in flight get to finish on SIGTERM.
@@ -51,7 +53,51 @@ func main() {
 		fmt.Println(versionLine())
 		return
 	}
+	if len(os.Args) == 3 && (os.Args[1] == worker.WorkerFlag || os.Args[1] == worker.ResidentHostFlag) {
+		// A WASM worker or resident host (M1 PR 9): the helper starts its
+		// own binary for one (rootd hosts_wasmhost.go). It starts as root,
+		// opens what the helper handed it, and drops to the worker user
+		// with its seccomp filter before it reads a message.
+		os.Exit(wasmHostCode(os.Args[1], os.Args[2:], os.Stderr))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == isolate.JailShimFlag {
+		// The V8 jail's shim (M1 PR 9): the helper starts its own binary
+		// for it (rootd hosts_workerd.go), so the binary root runs is the
+		// signed helper, never one the agent named. It chroots, drops to
+		// the jail user, installs the filter and runs workerd.
+		os.Exit(shimCode(os.Args[2:], os.Stderr))
+	}
 	os.Exit(mainCode(os.Getenv, os.Stderr))
+}
+
+// runJailShim is isolate.RunJailShim; tests stand one in.
+var runJailShim = isolate.RunJailShim
+
+// runWasmWorker and runWasmResident are the WASM hosts' entry points;
+// tests stand them in.
+var runWasmWorker, runWasmResident = worker.RunCLI, worker.RunCLIResident
+
+// wasmHostCode runs a WASM host until it ends and returns its exit code.
+func wasmHostCode(flag string, args []string, stderr io.Writer) int {
+	run := runWasmWorker
+	if flag == worker.ResidentHostFlag {
+		run = runWasmResident
+	}
+	if err := run(args); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+// shimCode runs the jail's shim. It returns only on a failure, which it
+// reports with a code of its own, as sandboxd's shim does.
+func shimCode(args []string, stderr io.Writer) int {
+	if err := runJailShim(args); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 125
+	}
+	return 0
 }
 
 // versionLine is what --version prints: the build's version and API level,

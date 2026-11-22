@@ -18,6 +18,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+
+	"github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -290,6 +292,21 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"the agent's mounts with a doubled slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_MOUNTS_ROOT": "/srv//mounts", "SB_ROOTD_STATE_DIR": "/srv/mounts/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
 		{"FIFOs through a dot", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_ROOTD_FIFO_DIR": "/data/./fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
 		{"the helper's state reached by climbing out", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/../sandboxd/x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
+		// M1 PR 9: the V8 group hosts. The helper jails every group, from
+		// its own settings, in a chroot base the agent cannot write.
+		{"V8 unjailed", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_USE_JAIL": "false", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_USE_JAIL=false"},
+		{"V8 that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "si", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ENABLE_ISOLATE"},
+		{"V8 jail that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_USE_JAIL": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_USE_JAIL"},
+		{"V8 jail gid that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_GID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_GID"},
+		{"V8 jitless that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JITLESS": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JITLESS"},
+		{"V8 pids that do not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_PIDS_MAX": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_PIDS_MAX"},
+		{"V8 groups with no pids limit", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_PIDS_MAX": "0", "SB_HOST_MEMORY_MB": "1"}, nil, "above 0"},
+		{"the V8 chroots in the agent's folder", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_CHROOT_BASE": "/var/lib/sandboxd/jail", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_CHROOT_BASE"},
+		{"a relative V8 chroot base", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_CHROOT_BASE": "jail", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_CHROOT_BASE"},
+		{"a relative workerd", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_WORKERD_PATH": "workerd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_WORKERD_PATH"},
+		{"a V8 seccomp mode no jail has", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_SECCOMP_MODE": "loose", "SB_HOST_MEMORY_MB": "1"}, nil, "seccomp mode"},
+		{"the V8 jail as the agent", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ROOTD_AGENT_UID": "4000", "SB_ISOLATE_JAIL_UID": "4000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
+		{"a host-process cgroup parent at the root", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_HOST_PROCESS_CGROUP_PARENT": "/", "SB_HOST_MEMORY_MB": "1"}, nil, "host-process cgroup parent"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubHost(t, 0, tc.host)
@@ -526,5 +543,49 @@ func TestHostPortsFromEnv(t *testing.T) {
 		if _, err := hostPortsFromEnv(env(bad)); err == nil {
 			t.Errorf("%v passed", bad)
 		}
+	}
+}
+
+// TestHostsFromEnv: with SB_ENABLE_ISOLATE the helper serves V8 group
+// hosts, jailed from its own settings under sandboxd's names, with its own
+// binary as the shim; without it, none.
+func TestHostsFromEnv(t *testing.T) {
+	gid := strconv.Itoa(os.Getgid())
+	stubHost(t, 1024, nil)
+	old := selfExecutable
+	selfExecutable = func() (string, error) { return "/usr/local/bin/aerolvm-rootd", nil }
+	t.Cleanup(func() { selfExecutable = old })
+	cfg, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid}))
+	if err != nil || cfg.Hosts.any() || cfg.Hosts != (HostsConfig{}) {
+		t.Fatalf("no host kind: %+v, %v", cfg.Hosts, err)
+	}
+	cfg, err = ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true",
+		"SB_CONTAINERD_CGROUP_PARENT": "/kubepods/pod1/sandboxes", "SB_ISOLATE_JAIL_UID": "2000", "SB_ISOLATE_JAIL_GID": "2001",
+		"SB_ISOLATE_JITLESS": "true", "SB_ISOLATE_SECCOMP_MODE": "AUDIT", "SB_ISOLATE_JAIL_PIDS_MAX": "300"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := HostsConfig{
+		CgroupParent: "/kubepods/pod1/sandboxes",
+		LogPath:      "/var/lib/aerolvm-rootd/hosts.log",
+		Workerd: &WorkerdHostsConfig{
+			Jail: isolate.RootJail{ChrootBase: "/srv/isolate-jail", WorkerdPath: "/usr/local/bin/workerd", UID: 2000, GID: 2001,
+				AgentUID: DefaultAgentUID, Jitless: true, SeccompMode: isolate.SeccompAudit, ShimPath: "/usr/local/bin/aerolvm-rootd"},
+			PidsMax: 300,
+		},
+	}
+	if cfg.Hosts.CgroupParent != want.CgroupParent || cfg.Hosts.LogPath != want.LogPath || *cfg.Hosts.Workerd != *want.Workerd {
+		t.Fatalf("hosts %+v %+v, want %+v %+v", cfg.Hosts, cfg.Hosts.Workerd, want, want.Workerd)
+	}
+	// The host-process parent may be its own.
+	cfg, err = ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true",
+		"SB_CONTAINERD_CGROUP_PARENT": "/a", "SB_HOST_PROCESS_CGROUP_PARENT": "/b"}))
+	if err != nil || cfg.Hosts.CgroupParent != "/b" {
+		t.Fatalf("parent %q, %v", cfg.Hosts.CgroupParent, err)
+	}
+	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
+	if _, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true"})); err == nil ||
+		!strings.Contains(err.Error(), "shim") {
+		t.Fatalf("no binary of its own: %v", err)
 	}
 }

@@ -55,6 +55,8 @@ func TestMountsFromEnv(t *testing.T) {
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "65534"}, "nobody"},
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "65532"}, "egress gateway"},
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "1000"}, "SB_ISOLATE_JAIL_UID"},
+		{map[string]string{"SB_ROOTD_MOUNT_USER": "61000"}, "SB_WASM_WORKER_UID"},
+		{map[string]string{"SB_ROOTD_MOUNT_USER": "62000", "SB_WASM_WORKER_UID": "62000"}, "SB_WASM_WORKER_UID"},
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "65520:x"}, "uid:gid"},
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "name:65520"}, "uid:gid"},
 		{map[string]string{"SB_ROOTD_MOUNT_USER": "no-such-user-aerolvm"}, "SB_ROOTD_MOUNT_USER"},
@@ -92,6 +94,10 @@ func TestConfigFromEnvMounts(t *testing.T) {
 		{map[string]string{"SB_ROOTD_MOUNTS_DIR": "mounts"}, "want an absolute path"},
 		{map[string]string{"SB_ROOTD_MOUNTS_DIR": "/var/lib/aerolvm-rootd/hosts/m"}, "overlap"},
 		{map[string]string{"SB_ROOTD_MOUNT_CRED_DIR": "/run/aerolvm-rootd/fifo/k"}, "overlap"},
+		// The host processes' folders (M1 PR 9): root links and removes V8
+		// jails in one and binds WASM sockets in the other.
+		{map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_CHROOT_BASE": "/var/lib/aerolvm-rootd/mounts/jail"}, "overlap"},
+		{map[string]string{"SB_ENABLE_WASM": "true", "SB_ROOTD_WASM_SOCKET_DIR": "/var/lib/aerolvm-rootd/mountcache"}, "overlap"},
 	} {
 		e := map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ROOTD_MOUNT_USER": "65520", "SB_HOST_MEMORY_MB": "1"}
 		for k, v := range tc.env {

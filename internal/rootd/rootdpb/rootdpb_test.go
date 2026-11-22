@@ -107,8 +107,9 @@ func TestAPIConstants(t *testing.T) {
 // is a wire break, and a new field fails until its row is added.
 func TestWireIsAppendOnly(t *testing.T) {
 	want := map[protoreflect.FullName][]string{
-		"aerolvm.rootd.v1.VersionRequest":     {"agent_version=1:string", "agent_api=2:uint32"},
-		"aerolvm.rootd.v1.VersionResponse":    {"helper_version=1:string", "api=2:uint32", "features=3:repeated string", "parts=4:repeated string"},
+		"aerolvm.rootd.v1.VersionRequest": {"agent_version=1:string", "agent_api=2:uint32"},
+		"aerolvm.rootd.v1.VersionResponse": {"helper_version=1:string", "api=2:uint32", "features=3:repeated string", "parts=4:repeated string",
+			"hosts=5:repeated string"},
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
 		"aerolvm.rootd.v1.EnsureHostResponse": {"ipv6_fence_error=1:string"},
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
@@ -176,6 +177,19 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.SweepExternalMountsResponse": nil,
 		"aerolvm.rootd.v1.ReclaimVolumeRequest":        {"source=1:string"},
 		"aerolvm.rootd.v1.ReclaimVolumeResponse":       nil,
+		"aerolvm.rootd.v1.HostLimits":                  {"cpu_millis=1:uint32", "memory_mb=2:uint64", "pids=3:uint32"},
+		"aerolvm.rootd.v1.PrepareHostRequest":          {"kind=1:enum", "id=2:string"},
+		"aerolvm.rootd.v1.PrepareHostResponse":         {"run_dir=1:string"},
+		"aerolvm.rootd.v1.WasmHostSpec":                {"cache=1:string", "env=2:repeated string"},
+		"aerolvm.rootd.v1.SpawnHostRequest":            {"kind=1:enum", "id=2:string", "limits=3:message", "wasm=4:message"},
+		"aerolvm.rootd.v1.SpawnHostResponse":           {"pid=1:uint32", "start_ticks=2:uint64", "already=3:bool", "socket=4:string"},
+		"aerolvm.rootd.v1.StopHostRequest":             {"kind=1:enum", "id=2:string"},
+		"aerolvm.rootd.v1.StopHostResponse":            {"had=1:bool"},
+		"aerolvm.rootd.v1.ListHostsRequest":            {"kind=1:enum"},
+		"aerolvm.rootd.v1.RunningHost":                 {"kind=1:enum", "id=2:string", "pid=3:uint32", "start_ticks=4:uint64"},
+		"aerolvm.rootd.v1.ListHostsResponse":           {"hosts=1:repeated message"},
+		"aerolvm.rootd.v1.SetHostLimitsRequest":        {"kind=1:enum", "id=2:string", "limits=3:message"},
+		"aerolvm.rootd.v1.SetHostLimitsResponse":       nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -216,6 +230,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 			"HOST_PORT_KIND_REDIRECT=3"},
 		"aerolvm.rootd.v1.MountExternalMode": {"MOUNT_EXTERNAL_MODE_UNSPECIFIED=0", "MOUNT_EXTERNAL_MODE_CREATE=1",
 			"MOUNT_EXTERNAL_MODE_REESTABLISH=2", "MOUNT_EXTERNAL_MODE_KEEP_LIVE=3"},
+		"aerolvm.rootd.v1.HostKind": {"HOST_KIND_UNSPECIFIED=0", "HOST_KIND_WORKERD=1", "HOST_KIND_WASM_WORKER=2",
+			"HOST_KIND_WASM_RESIDENT=3"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {

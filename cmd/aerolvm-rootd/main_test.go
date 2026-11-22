@@ -27,6 +27,8 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
+
+	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
 // fakeContainerd answers the two calls the helper and these tests make:
@@ -332,5 +334,39 @@ func TestNetnsBindingWaitsForTheServer(t *testing.T) {
 	// and says why.
 	if ok, err := b.Bound(context.Background(), "aerol-netns-0", "sb-1"); ok || err == nil || !strings.Contains(err.Error(), "network") {
 		t.Fatalf("a set binding = %v, %v", ok, err)
+	}
+}
+
+// TestShimCode: the helper's own binary is the V8 jail's shim (M1 PR 9);
+// a shim that fails reports why, with its own exit code.
+func TestShimCode(t *testing.T) {
+	old := runJailShim
+	t.Cleanup(func() { runJailShim = old })
+	var got []string
+	runJailShim = func(args []string) error { got = args; return nil }
+	var out bytes.Buffer
+	if code := shimCode([]string{"x"}, &out); code != 0 || len(got) != 1 || got[0] != "x" {
+		t.Fatalf("shimCode = %d with %v", code, got)
+	}
+	runJailShim = func([]string) error { return errors.New("chroot: denied") }
+	if code := shimCode(nil, &out); code != 125 || !strings.Contains(out.String(), "chroot: denied") {
+		t.Fatalf("shimCode = %d, output %q", code, out.String())
+	}
+}
+
+// TestWasmHostCode: the helper's own binary is the WASM hosts' too.
+func TestWasmHostCode(t *testing.T) {
+	ow, or := runWasmWorker, runWasmResident
+	t.Cleanup(func() { runWasmWorker, runWasmResident = ow, or })
+	var ran string
+	runWasmWorker = func(a []string) error { ran = "worker " + a[0]; return nil }
+	runWasmResident = func(a []string) error { ran = "resident " + a[0]; return errors.New("bind: in use") }
+	var out bytes.Buffer
+	if code := wasmHostCode(worker.WorkerFlag, []string{"/s/w.sock"}, &out); code != 0 || ran != "worker /s/w.sock" {
+		t.Fatalf("worker: %d %q", code, ran)
+	}
+	if code := wasmHostCode(worker.ResidentHostFlag, []string{"/s/r.sock"}, &out); code != 1 || ran != "resident /s/r.sock" ||
+		!strings.Contains(out.String(), "bind: in use") {
+		t.Fatalf("resident: %d %q %q", code, ran, out.String())
 	}
 }

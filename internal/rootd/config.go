@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -14,7 +15,9 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/gvisorpids"
+	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -64,6 +67,13 @@ const (
 	defaultPidsLimit    = 4096
 	// sandboxd's defaults for the users its jails run as.
 	defaultJailUID = 1000
+	// sandboxd's WASM worker user (config.DefaultWasmWorkerID) and modules
+	// folder.
+	defaultWasmWorkerID   = 61000
+	defaultWasmModulesDir = "/var/lib/sandboxd/wasm/modules"
+	// DefaultWasmSocketDir holds the WASM hosts' sockets: a folder of the
+	// helper's, beside its own socket's, for the agent's group alone.
+	DefaultWasmSocketDir = "/run/aerolvm-rootd/wasm"
 	// nobodyUID is shared by every daemon that runs as nobody.
 	nobodyUID = 65534
 	// imageUID is what the chart and the images run the egress gateway
@@ -113,6 +123,74 @@ type Config struct {
 	// listener (SB_HOSTPORT_REDIRECT_PORT, 21215). The helper's own copy:
 	// the agent cannot widen what a forward may take.
 	HostPorts rootpolicy.HostPortBounds
+	// Hosts are the host-process runtimes' settings (hosts.go).
+	Hosts HostsConfig
+}
+
+// HostsConfig is what the helper starts host processes with (M1 PR 9),
+// from its own environment, under sandboxd's names.
+type HostsConfig struct {
+	// CgroupParent is the cgroup every host's group goes under, relative to
+	// the cgroup mount, as sandboxd's SB_HOST_PROCESS_CGROUP_PARENT
+	// (defaulting to SB_CONTAINERD_CGROUP_PARENT): "" is the mount itself.
+	CgroupParent string
+	// LogPath is the file host processes write to, in the helper's state
+	// folder.
+	LogPath string
+	// Workerd runs V8-isolate group hosts; nil when this node runs none
+	// (SB_ENABLE_ISOLATE).
+	Workerd *WorkerdHostsConfig
+	// Wasm runs WASM workers and resident hosts; nil when this node runs
+	// none (SB_ENABLE_WASM).
+	Wasm *WasmHostsConfig
+}
+
+// WorkerdHostsConfig is the V8 group hosts' jail.
+type WorkerdHostsConfig struct {
+	Jail isolate.RootJail
+	// PidsMax is SB_ISOLATE_JAIL_PIDS_MAX: every group's pids limit, at
+	// most.
+	PidsMax uint32
+}
+
+// any reports whether the helper serves a host kind.
+func (h HostsConfig) any() bool { return h.Workerd != nil || h.Wasm != nil }
+
+func (h HostsConfig) validate() error {
+	if !h.any() {
+		return nil
+	}
+	if p := h.CgroupParent; p != "" && (!filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/") {
+		return fmt.Errorf("root helper: host-process cgroup parent %q: want a clean absolute cgroup path below the root", p)
+	}
+	if !filepath.IsAbs(h.LogPath) || filepath.Clean(h.LogPath) != h.LogPath {
+		return fmt.Errorf("root helper: hosts' log %q: want a clean absolute path", h.LogPath)
+	}
+	if w := h.Workerd; w != nil {
+		if err := w.Jail.Validate(); err != nil {
+			return fmt.Errorf("root helper: %w", err)
+		}
+		if w.PidsMax == 0 {
+			return errors.New("root helper: SB_ISOLATE_JAIL_PIDS_MAX must be above 0: the V8 jail lets workerd make threads")
+		}
+	}
+	if w := h.Wasm; w != nil {
+		for name, p := range map[string]string{"binary": w.Binary, "socket folder": w.SocketDir} {
+			if !filepath.IsAbs(p) || filepath.Clean(p) != p || p == "/" {
+				return fmt.Errorf("root helper: WASM host %s %q: want a clean absolute path other than /", name, p)
+			}
+		}
+		if w.CacheRoot != "" && (!filepath.IsAbs(w.CacheRoot) || filepath.Clean(w.CacheRoot) != w.CacheRoot) {
+			return fmt.Errorf("root helper: WASM compile cache root %q: want a clean absolute path", w.CacheRoot)
+		}
+		if w.UID <= 0 || w.GID <= 0 || uint32(w.UID) == w.AgentUID {
+			return fmt.Errorf("root helper: WASM worker user %d:%d must be neither root nor the agent", w.UID, w.GID)
+		}
+		if w.ReadyWait <= 0 {
+			return errors.New("root helper: WASM hosts need a ready wait")
+		}
+	}
+	return nil
 }
 
 // MountsConfig is where and as whom the helper mounts external storage
@@ -279,6 +357,9 @@ func (c Config) Validate() error {
 	if err := c.Network.validate(); err != nil {
 		return err
 	}
+	if err := c.Hosts.validate(); err != nil {
+		return err
+	}
 	if err := c.Files.validate(c.Policy, filepath.Dir(c.Socket)); err != nil {
 		return err
 	}
@@ -304,6 +385,14 @@ func (m *MountsConfig) validate(c Config) error {
 		{"FIFO", c.Policy.FIFODir}, {"socket", filepath.Dir(c.Socket)}}
 	if c.Files.Toolbox != "" {
 		others = append(others, struct{ name, dir string }{"toolbox", filepath.Dir(c.Files.Toolbox)})
+	}
+	// Root links, mounts and removes in the V8 jails' tree, and binds the
+	// WASM hosts' sockets in their folder (M1 PR 9).
+	if w := c.Hosts.Workerd; w != nil {
+		others = append(others, struct{ name, dir string }{"V8 jail", w.Jail.ChrootBase})
+	}
+	if w := c.Hosts.Wasm; w != nil {
+		others = append(others, struct{ name, dir string }{"WASM socket", w.SocketDir})
 	}
 	for i, a := range mine {
 		if !filepath.IsAbs(a.dir) || filepath.Clean(a.dir) != a.dir || a.dir == "/" {
@@ -521,10 +610,185 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	if cfg.Reclaim, err = reclaimFromEnv(getenv, filepath.Join(stateDir, "reclaim")); err != nil {
 		return Config{}, err
 	}
+	if cfg.Hosts, err = hostsFromEnv(getenv, path, stateDir, uid, gid, enterprise, nodePorts, []string{runDir, mountsRoot, credDir, dataDir}); err != nil {
+		return Config{}, err
+	}
+	if pathErr != nil {
+		return Config{}, pathErr
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// selfExecutable is the helper's own binary, the V8 jail's shim; tests
+// stand one in.
+var selfExecutable = os.Executable
+
+// hostsFromEnv is Config.Hosts, read under sandboxd's names so the operator
+// sets one value for both. The V8 jail's chroot base must not be inside a
+// folder the agent writes: root links, mounts and removes in it.
+func hostsFromEnv(getenv func(string) string, path func(k, def string) string, stateDir string, agentUID uint32, agentGID int,
+	enterprise bool, nodePorts []rootpolicy.NodePort, agentDirs []string) (HostsConfig, error) {
+	get := func(k, def string) string {
+		if v := strings.TrimSpace(getenv(k)); v != "" {
+			return v
+		}
+		return def
+	}
+	var h HostsConfig
+	isolateOn, err := envBool(getenv, "SB_ENABLE_ISOLATE")
+	if err != nil {
+		return h, err
+	}
+	wasmOn, err := envBool(getenv, "SB_ENABLE_WASM")
+	if err != nil || (!isolateOn && !wasmOn) {
+		return h, err
+	}
+	h.CgroupParent = get("SB_HOST_PROCESS_CGROUP_PARENT", strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")))
+	h.LogPath = filepath.Join(stateDir, "hosts.log")
+	if wasmOn {
+		if h.Wasm, err = wasmHostsFromEnv(getenv, path, agentUID, agentGID, enterprise, nodePorts, agentDirs); err != nil {
+			return h, err
+		}
+	}
+	if !isolateOn {
+		return h, nil
+	}
+	jailOn, err := envBoolDefault(getenv, "SB_ISOLATE_USE_JAIL", true)
+	if err != nil {
+		return h, err
+	}
+	if !jailOn {
+		// Unjailed, workerd would run as root; the helper starts no host
+		// as root.
+		return h, errors.New("SB_ISOLATE_USE_JAIL=false: the root helper runs every V8 group in its jail; an unjailed group is privilege mode single only")
+	}
+	jailUID, err := envInt(getenv, "SB_ISOLATE_JAIL_UID", defaultJailUID)
+	if err != nil {
+		return h, err
+	}
+	jailGID, err := envInt(getenv, "SB_ISOLATE_JAIL_GID", defaultJailUID)
+	if err != nil {
+		return h, err
+	}
+	jitless, err := envBool(getenv, "SB_ISOLATE_JITLESS")
+	if err != nil {
+		return h, err
+	}
+	pids, err := envInt(getenv, "SB_ISOLATE_JAIL_PIDS_MAX", 512)
+	if err != nil {
+		return h, err
+	}
+	if pids <= 0 || pids > math.MaxUint32 {
+		return h, fmt.Errorf("SB_ISOLATE_JAIL_PIDS_MAX=%d: want a limit above 0", pids)
+	}
+	shim, err := selfExecutable()
+	if err != nil {
+		return h, fmt.Errorf("root helper: its own binary, the V8 jail's shim: %w", err)
+	}
+	base := path("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail")
+	for _, a := range agentDirs {
+		if base == a || strings.HasPrefix(base, a+"/") {
+			return h, fmt.Errorf("SB_ISOLATE_JAIL_CHROOT_BASE: %s is inside %s, which the agent writes", base, a)
+		}
+	}
+	h.Workerd = &WorkerdHostsConfig{
+		Jail: isolate.RootJail{
+			ChrootBase:  base,
+			WorkerdPath: path("SB_ISOLATE_WORKERD_PATH", "/usr/local/bin/workerd"),
+			UID:         jailUID,
+			GID:         jailGID,
+			AgentUID:    int(agentUID),
+			Jitless:     jitless,
+			SeccompMode: strings.ToLower(get("SB_ISOLATE_SECCOMP_MODE", isolate.SeccompEnforce)),
+			ShimPath:    filepath.Clean(shim),
+		},
+		PidsMax: uint32(pids),
+	}
+	return h, nil
+}
+
+// wasmHostsFromEnv is the WASM hosts' settings, under sandboxd's names.
+func wasmHostsFromEnv(getenv func(string) string, path func(k, def string) string, agentUID uint32, agentGID int,
+	enterprise bool, nodePorts []rootpolicy.NodePort, agentDirs []string) (*WasmHostsConfig, error) {
+	uid, err := envInt(getenv, "SB_WASM_WORKER_UID", defaultWasmWorkerID)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := envInt(getenv, "SB_WASM_WORKER_GID", defaultWasmWorkerID)
+	if err != nil {
+		return nil, err
+	}
+	jail, err := envInt(getenv, "SB_ISOLATE_JAIL_UID", defaultJailUID)
+	if err != nil {
+		return nil, err
+	}
+	if uid == jail {
+		return nil, fmt.Errorf("SB_WASM_WORKER_UID=%d is the V8 jail's too: a worker could signal and read a jailed workerd", uid)
+	}
+	rules, err := envBoolDefault(getenv, "SB_ENABLE_NETWORK_RULES", true)
+	if err != nil {
+		return nil, err
+	}
+	shim, err := selfExecutable()
+	if err != nil {
+		return nil, fmt.Errorf("root helper: its own binary, the WASM hosts': %w", err)
+	}
+	socketDir := path("SB_ROOTD_WASM_SOCKET_DIR", DefaultWasmSocketDir)
+	for _, a := range agentDirs {
+		if socketDir == a || strings.HasPrefix(socketDir, a+"/") {
+			return nil, fmt.Errorf("SB_ROOTD_WASM_SOCKET_DIR: %s is inside %s, which the agent writes", socketDir, a)
+		}
+	}
+	w := &WasmHostsConfig{
+		Binary: filepath.Clean(shim), UID: uid, GID: gid, SocketDir: socketDir, SocketGID: agentGID,
+		CacheRoot: wasmCacheRoot(getenv, path), AgentUID: agentUID, ReadyWait: 10 * time.Second,
+		Fence: rules || enterprise, OperatorFile: strings.TrimSpace(getenv("SB_EGRESS_OPERATOR_FILE")),
+	}
+	for _, name := range []string{"PATH", "TMPDIR", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+		"SB_EGRESS_OPERATOR_FILE", egresspolicy.FloorFileEnv} {
+		if v := strings.TrimSpace(getenv(name)); v != "" {
+			w.Env = append(w.Env, name+"="+v)
+		}
+	}
+	for _, p := range nodePorts {
+		if p.Proto == "tcp" && p.Dst == "" && !slices.Contains(w.NodePorts, uint16(p.Port)) {
+			w.NodePorts = append(w.NodePorts, uint16(p.Port))
+		}
+	}
+	return w, nil
+}
+
+// wasmCacheRoot is the WASM compile cache root as sandboxd works it out
+// (pkg/daemon effectiveWasmCompileCacheDir): SB_WASM_COMPILE_CACHE_DIR when
+// set (empty: none), else SB_WASM_CACHE_DIR, or SB_WASM_MODULES_DIR/cache,
+// then wazero-compile.
+func wasmCacheRoot(getenv func(string) string, path func(k, def string) string) string {
+	if v, set := lookupEnv(getenv, "SB_WASM_COMPILE_CACHE_DIR"); set {
+		if strings.TrimSpace(v) == "" {
+			return ""
+		}
+		return path("SB_WASM_COMPILE_CACHE_DIR", "")
+	}
+	cache := strings.TrimSpace(getenv("SB_WASM_CACHE_DIR"))
+	if cache == "" {
+		cache = filepath.Join(path("SB_WASM_MODULES_DIR", defaultWasmModulesDir), "cache")
+	} else {
+		cache = path("SB_WASM_CACHE_DIR", "")
+	}
+	return filepath.Join(cache, "wazero-compile")
+}
+
+// lookupEnv tells an unset name from an empty one, where getenv is the
+// process's own; a test's map has no unset names it set empty.
+var lookupEnv = func(getenv func(string) string, k string) (string, bool) {
+	v := getenv(k)
+	if v != "" {
+		return v, true
+	}
+	return os.LookupEnv(k)
 }
 
 // hostPortsFromEnv is Config.HostPorts, checked as sandboxd checks the
@@ -782,8 +1046,14 @@ func uidSharedWith(getenv func(string) string, uid uint32) ([]string, error) {
 	case imageUID:
 		who = append(who, "the egress gateway, edge and the operator in the chart and images")
 	}
-	for _, k := range []string{"SB_ISOLATE_JAIL_UID", "SB_JAILER_UID"} {
-		n, err := envInt(getenv, k, defaultJailUID)
+	// The WASM worker runs guests' code; in split mode the helper starts it
+	// (M1 PR 9), so it shares no uid with the agent or the mount tools.
+	for _, id := range []struct {
+		k   string
+		def int
+	}{{"SB_ISOLATE_JAIL_UID", defaultJailUID}, {"SB_JAILER_UID", defaultJailUID}, {"SB_WASM_WORKER_UID", defaultWasmWorkerID}} {
+		k := id.k
+		n, err := envInt(getenv, k, id.def)
 		if err != nil {
 			return nil, err
 		}

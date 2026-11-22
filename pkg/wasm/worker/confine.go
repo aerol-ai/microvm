@@ -48,6 +48,19 @@ const (
 	// cacheDirEnv is the compile cache of the owner whose code the worker
 	// runs (WithCompileCache).
 	cacheDirEnv = "AEROL_WASM_WORKER_CACHE_DIR"
+	// ListenFDEnv names the descriptor of a socket the worker serves,
+	// already bound, instead of the path it is given: the root helper
+	// binds a worker's socket in a folder of its own, for sandboxd's
+	// group alone (privilege mode split, M1 PR 9).
+	ListenFDEnv = "AEROL_WASM_WORKER_LISTEN_FD"
+	// ConfineEnv and CacheDirEnv are confineEnv and cacheDirEnv, for a
+	// spawner outside this package (the root helper).
+	ConfineEnv  = confineEnv
+	CacheDirEnv = cacheDirEnv
+	// ShareGroupEnv, "1", has the worker make what the guest writes
+	// readable and writable by its group, which sandboxd is in when it is
+	// not root (privilege mode split; pkg/wasm ShareFilesWithGroup).
+	ShareGroupEnv = "AEROL_WASM_WORKER_SHARE_GROUP"
 )
 
 // Confinement is the uid/gid workers drop to. The zero value confines
@@ -337,7 +350,8 @@ func runWorker(socketPath string, srv workerServer) error {
 	if err := loadWorkerGuards(); err != nil {
 		return err
 	}
-	ln, err := listenWorker(socketPath)
+	shareFromEnv()
+	ln, err := listenFromEnv(socketPath)
 	if err != nil {
 		return err
 	}
@@ -355,6 +369,47 @@ func runWorker(socketPath string, srv workerServer) error {
 	signalReady(ready)
 	ready = nil
 	return serveListener(ln, srv)
+}
+
+// shareFromEnv turns group sharing on when the spawner asked for it, with
+// the mask that keeps the group's bits on what the worker makes.
+func shareFromEnv() {
+	if os.Getenv(ShareGroupEnv) != "1" {
+		return
+	}
+	_ = os.Unsetenv(ShareGroupEnv)
+	shareFiles()
+	setShareUmask()
+}
+
+// shareFiles turns the engine's group sharing on; tests stand it in, as it
+// is the whole process's.
+var shareFiles = wasmengine.ShareFilesWithGroup
+
+// listenFromEnv serves the socket the spawner bound and handed over
+// (ListenFDEnv), or binds socketPath as before. A handed descriptor must be
+// a listening Unix socket.
+func listenFromEnv(socketPath string) (net.Listener, error) {
+	raw := strings.TrimSpace(os.Getenv(ListenFDEnv))
+	if raw == "" {
+		return listenWorker(socketPath)
+	}
+	_ = os.Unsetenv(ListenFDEnv)
+	fd, err := strconv.Atoi(raw)
+	if err != nil || fd < 3 {
+		return nil, fmt.Errorf("wasm worker: %s=%q is not a descriptor", ListenFDEnv, raw)
+	}
+	f := os.NewFile(uintptr(fd), "worker-socket")
+	defer f.Close()
+	ln, err := net.FileListener(f)
+	if err != nil {
+		return nil, fmt.Errorf("wasm worker: %s: %w", ListenFDEnv, err)
+	}
+	if _, ok := ln.(*net.UnixListener); !ok {
+		_ = ln.Close()
+		return nil, fmt.Errorf("wasm worker: %s is not a Unix socket", ListenFDEnv)
+	}
+	return ln, nil
 }
 
 // listenWorker binds the worker's socket. A var so tests can end a
