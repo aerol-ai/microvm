@@ -18,7 +18,6 @@ import (
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -30,9 +29,11 @@ import (
 // the forwarding sysctls, the CNI config), its host firewall (every
 // sandbox rule, the node guard, the deny floor, the IPv6 fence), and the
 // hostname gateway's host side (the self-test's probe network, the
-// executable lookups). Root work
-// it does not do yet is refused by name, at start for what sandboxd does
-// at boot, at the call for the rest, and never done as root instead.
+// executable lookups). Image builds need no helper call: buildkitd runs
+// rootless, and sandboxd imports each build through the gate
+// (buildKitBuilderFor). Root work it does not do yet is refused by name,
+// at start for what sandboxd does at boot, at the call for the rest, and
+// never done as root instead.
 
 // checkPrivilegeMode refuses, at start, a split-mode node this build cannot
 // run. Two needs last: split is the containerd engine only (Docker's
@@ -314,26 +315,28 @@ func mayHaveRun(err error) bool {
 	return !errors.As(err, &refused) && !errors.Is(err, rootclient.ErrUnsupported) && !errors.Is(err, rootclient.ErrBusy)
 }
 
+// buildKitBuilderFor is the containerd engine's BuildKit builder. With
+// SB_CONTAINERD_BUILDKIT_ROOTLESS (always so in privilege mode split,
+// config refuses split without it) buildkitd is rootless and cannot reach
+// containerd: each build comes back as an OCI archive the driver imports,
+// through the root helper's gate in split mode, so sandboxd holds no
+// root-level socket for builds (plan PR 10b, eng review D14). Otherwise it
+// is today's root buildkitd, whose containerd worker writes the image.
+func buildKitBuilderFor(cfg config.Config, driver *cntr.Driver, logger *slog.Logger) *cntr.BuildKitBuilder {
+	build := cntr.NewBuildKitBuilder(cfg.ContainerdBuildKitAddr, "", logger).WithContextIDBase(cfg.ContainerdBuildContextIDBase)
+	if cfg.ContainerdBuildKitRootless {
+		build = build.WithArchiveImport(driver, cfg.ContainerdBuildMaxImageBytes)
+	}
+	return build
+}
+
 // imageBuilderFor is the image builder the API gets on the containerd
-// engine (nil without one). In privilege mode split a build is refused by
-// name: buildkitd's socket is root's and writes into containerd past the
-// gate, and the build-context unpacker runs as uids of its own, root work
-// the helper does not do yet (plan PR 10b). Image reads, pushes and
-// removals keep working: they go through the driver's containerd client,
-// which split mode points at the gate.
-func imageBuilderFor(cfg config.Config, b *cntr.ImageBuilder) service.ImageBuilder {
+// engine, nil without one (a nil *cntr.ImageBuilder must not become a
+// non-nil interface). Image reads, pushes and removals go through the
+// driver's containerd client, which split mode points at the gate.
+func imageBuilderFor(b *cntr.ImageBuilder) service.ImageBuilder {
 	if b == nil {
 		return nil
 	}
-	if cfg.PrivilegeMode == privmode.Split {
-		return splitImageBuilder{b}
-	}
 	return b
-}
-
-// splitImageBuilder refuses builds and passes everything else through.
-type splitImageBuilder struct{ service.ImageBuilder }
-
-func (splitImageBuilder) BuildImage(context.Context, docker.BuildImageRequest) error {
-	return privmode.NotYet("build an image", privmode.StepBuilds)
 }
