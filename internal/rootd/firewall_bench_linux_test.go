@@ -59,6 +59,13 @@ type firewallBench struct {
 
 func newFirewallBench(tb testing.TB, sopts ...grpc.ServerOption) *firewallBench {
 	tb.Helper()
+	return newFirewallBenchWith(tb, nil, sopts...)
+}
+
+// newFirewallBenchWith is newFirewallBench with a change to the helper's
+// config (the cgroup budget sets its cgroup parent).
+func newFirewallBenchWith(tb testing.TB, config func(*Config), sopts ...grpc.ServerOption) *firewallBench {
+	tb.Helper()
 	k, _ := kernelRig(tb)
 	if os.Getenv("AEROL_KT_CNI_DIR") == "" {
 		k.leases = filepath.Join(tb.TempDir(), "leases")
@@ -74,6 +81,9 @@ func newFirewallBench(tb testing.TB, sopts ...grpc.ServerOption) *firewallBench 
 		c.Firewall.Backend = "netlink"
 		o.Network = k
 		o.ServerOptions = append(o.ServerOptions, sopts...)
+		if config != nil {
+			config(c)
+		}
 	})
 	m, err := newRulesManager("netlink")
 	if err != nil {
