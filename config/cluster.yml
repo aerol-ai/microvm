@@ -138,6 +138,14 @@ containerd:
   namespace: "aerolvm"
   cni_plugin_dir: "/opt/cni/bin"
   native_netns_pool_enabled: true
+  # Rootless BuildKit (plans/security-gaps-m1-m4.md PR 10b): image builds run
+  # in BuildKit's rootless mode as the aerolvm-build user, in a network
+  # namespace on the sandboxes' bridge, and sandboxd imports each build into
+  # containerd itself, so it holds no root-level BuildKit socket. Off keeps
+  # today's root buildkitd. Terraform passes install.sh --buildkit-rootless
+  # (one-line join path only); turning it on replaces each node. Ansible does
+  # not set BuildKit up.
+  buildkit_rootless: false
   # Warm container pool (park + adopt) for the containerd engine; same shape
   # and defaults as docker.pool above. Off by default so turning it on is an
   # operator's choice: a waiting container costs about 13 MB (2.4 MB in its

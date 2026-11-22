@@ -496,12 +496,20 @@ Each is small and stands alone. Together they shrink the root surface now.
       `SB_CONTAINERD_BUILDKIT_ROOTLESS` unset is on in split (the only
       way split builds; split with it off fails boot) and off in single,
       so single keeps today's root buildkitd (D22, R18). Single can opt
-      in.
+      in: install.sh `--buildkit-rootless`, or `containerd.buildkit_rootless`
+      in `config/cluster.yml` for Terraform.
     - **One thing rootless BuildKit cannot do:** see containerd's images.
       Every `FROM` comes from a registry, so an operator's build from an
       image only the node has (a snapshot, an earlier build) needs the root
       BuildKit. Tenant builds already refuse such images. Follow-up: hand
       such a base to BuildKit as an OCI layout context.
+    - **The network is a namespace on the sandboxes' bridge.** Rootless
+      buildkitd joins `aerolvm.build`, which a root oneshot unit builds with
+      sandboxd's CNI config (`sandboxd host build-network up`), so pulls and
+      steps leave with a sandbox address and get the floor, the node guard
+      and the drop between sandbox ranges with no new rule. Steps keep a
+      namespace each: RootlessKit's `--detach-netns` with BuildKit's bridge
+      network. Ansible sets no BuildKit up, so it is unchanged.
 10. VMs: the two units, `install.sh`, Ansible, Terraform bootstrap, and the
     one-time ownership move.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts

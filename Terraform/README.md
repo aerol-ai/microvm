@@ -309,6 +309,18 @@ phases:
    node: OTEL metrics settings and image-pull storm controls. The bootstrap
    then restarts sandboxd once so those env vars are active immediately.
 
+### Rootless BuildKit
+
+Set `containerd.buildkit_rootless: true` in `config/cluster.yml` to run image
+builds in BuildKit's rootless mode: `buildkitd` runs as the `aerolvm-build`
+user in a network namespace on the sandbox network, and sandboxd adds each
+build to containerd itself. The bootstrap passes `install.sh
+--buildkit-rootless`, which sets it up (see `docs/src/content/docs/getting-started/installer-options.mdx`).
+It needs `container_engine: containerd` and `one_line_join = true`; the plan
+fails without them. Off (the default) renders the bootstrap exactly as
+before. Turning it on changes each node's user data, so Terraform replaces
+the nodes.
+
 ### Download mirror
 
 The bootstrap downloads `install.sh`, the cluster scripts, and on containerd

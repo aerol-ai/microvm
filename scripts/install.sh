@@ -61,6 +61,7 @@ KVM_DEVICE="/dev/kvm"
 WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
+BUILDKIT_ROOTLESS="false"
 LOCAL_MODE="false"
 # --cli-only installs just the aerolvm agent CLI: no daemon, Docker or root.
 CLI_ONLY="false"
@@ -183,6 +184,17 @@ SANDBOXD_CONFIG_BEFORE=""
 # the Terraform bootstrap uses (tests point them elsewhere).
 BUILDKIT_BIN_DIR="/usr/local/bin"
 BUILDKIT_UNIT_FILE="/etc/systemd/system/buildkit.service"
+# Rootless BuildKit (--buildkit-rootless): the unit that builds its network
+# namespace, the user buildkitd runs as and that user's state folder, the
+# user's subordinate ids (one 65536 range above systemd's container ranges,
+# below 2^31 and away from SB_CONTAINERD_BUILD_CONTEXT_ID_BASE's 64 ids), and
+# RootlessKit's AppArmor profile (tests point them elsewhere).
+BUILD_NET_UNIT_FILE="/etc/systemd/system/aerolvm-build-net.service"
+BUILDKIT_BUILD_USER="aerolvm-build"
+BUILDKIT_ROOTLESS_STATE_DIR="/var/lib/aerolvm-buildkit"
+BUILDKIT_SUBID_RANGE="2100000000-2100065535"
+ROOTLESSKIT_APPARMOR_PROFILE="/etc/apparmor.d/aerolvm-rootlesskit"
+APPARMOR_USERNS_KNOB="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
 # Where upgrade_containerd_engine_tools reads the node's engine settings.
 SANDBOXD_ENV_DIR="/etc/sandboxd"
 
@@ -293,6 +305,9 @@ CNI_PLUGINS_SHA256_ARM64="56171987d3947707c3563db2f4001bccaf50fd63468611b9f3cbec
 BUILDKIT_VERSION="v0.34.2"
 BUILDKIT_SHA256_AMD64="b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13"
 BUILDKIT_SHA256_ARM64="a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3"
+ROOTLESSKIT_VERSION="v3.3.0"
+ROOTLESSKIT_SHA256_X86_64="0e757c8f80510d764df8c9a5f169805580b48d02329f0a200900e261ecec27ed"
+ROOTLESSKIT_SHA256_AARCH64="7a159e79ef3e65e1f2702ab89537bb79de67b433428328b9626cf75786dbe43a"
 
 # download_pins prints one line per file the mirror holds:
 #   <project> <version> <file> <sha256> <origin>
@@ -306,6 +321,7 @@ download_pins() {
 	local fc="https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}"
 	local cni="https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGINS_VERSION}"
 	local buildkit="https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}"
+	local rootlesskit="https://github.com/rootless-containers/rootlesskit/releases/download/${ROOTLESSKIT_VERSION}"
 	local v="$CADDY_VERSION"
 	echo "caddy v${v} caddy_${v}_linux_amd64.deb ${CADDY_PACKAGE_SHA256_AMD64} ${caddy}/caddy_${v}_linux_amd64.deb"
 	echo "caddy v${v} caddy_${v}_linux_arm64.deb ${CADDY_PACKAGE_SHA256_ARM64} ${caddy}/caddy_${v}_linux_arm64.deb"
@@ -326,6 +342,9 @@ download_pins() {
 	v="$BUILDKIT_VERSION"
 	echo "buildkit ${v} buildkit-${v}.linux-amd64.tar.gz ${BUILDKIT_SHA256_AMD64} ${buildkit}/buildkit-${v}.linux-amd64.tar.gz"
 	echo "buildkit ${v} buildkit-${v}.linux-arm64.tar.gz ${BUILDKIT_SHA256_ARM64} ${buildkit}/buildkit-${v}.linux-arm64.tar.gz"
+	v="$ROOTLESSKIT_VERSION"
+	echo "rootlesskit ${v} rootlesskit-x86_64.tar.gz ${ROOTLESSKIT_SHA256_X86_64} ${rootlesskit}/rootlesskit-x86_64.tar.gz"
+	echo "rootlesskit ${v} rootlesskit-aarch64.tar.gz ${ROOTLESSKIT_SHA256_AARCH64} ${rootlesskit}/rootlesskit-aarch64.tar.gz"
 	# Upstream's own checksum files, kept beside the files on the mirror for
 	# anyone checking by hand. install.sh does not read them, so their
 	# hashes need bumping only when CADDY_VERSION,
@@ -442,6 +461,18 @@ Options:
                                socket (usually /run/containerd/containerd.sock).
                                Server install only: refused with --local and
                                --cli-only.
+  --buildkit-rootless          Run BuildKit rootless (BuildKit's rootless
+                               mode, OCI worker) as the aerolvm-build user,
+                               in its own network namespace on the
+                               sandboxes' bridge, so build steps get the
+                               sandboxes' firewall rules. sandboxd imports
+                               each build into containerd itself, and
+                               holds no root-level BuildKit socket. Installs
+                               RootlessKit (SHA-256 pinned) and the uidmap
+                               package, and writes
+                               SB_CONTAINERD_BUILDKIT_ROOTLESS=true. Needs
+                               the containerd engine. --no-buildkit-rootless
+                               goes back to the root BuildKit.
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
                                Skips the download step and registers this
                                binary instead. Only consulted with
@@ -986,6 +1017,7 @@ NODE_SETTINGS=(
 	WITH_GVISOR:--with-gvisor:bool
 	RUNSC_PATH:--runsc-path:string
 	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
+	BUILDKIT_ROOTLESS:--buildkit-rootless:bool
 	WITH_ISOLATE:--with-isolate:bool
 	WORKERD_PATH:--workerd-path:string
 	WITH_FIRECRACKER:--with-firecracker:bool
@@ -1122,6 +1154,7 @@ migrate_node_settings() {
 	[[ "$(env_file_value "$env" SB_ENABLE_ISOLATE)" == "true" ]] && saved_setting with_isolate true
 	saved_setting workerd_path "$(env_file_value "$env" SB_ISOLATE_WORKERD_PATH)"
 	[[ "$(env_file_value "$env" SB_CONTAINER_ENGINE)" == "containerd" ]] && saved_setting with_containerd_engine true
+	[[ "$(env_file_value "$env" SB_CONTAINERD_BUILDKIT_ROOTLESS)" == "true" ]] && saved_setting buildkit_rootless true
 	[[ "$(env_file_value "$env" SB_CREDENTIAL_KEY_CUSTODY)" == "wrapped" ]] && saved_setting key_custody wrapped
 	# Cloudflare is the only DNS provider install.sh supports, and it writes
 	# the provider's token to /etc/default/caddy only when one is set.
@@ -1552,6 +1585,14 @@ while [[ $# -gt 0 ]]; do
 			WITH_CONTAINERD_ENGINE="true"
 			shift
 			;;
+		--buildkit-rootless)
+			BUILDKIT_ROOTLESS="true"
+			shift
+			;;
+		--no-buildkit-rootless)
+			BUILDKIT_ROOTLESS="false"
+			shift
+			;;
 		--runsc-path)
 			RUNSC_PATH="$2"
 			shift 2
@@ -1719,6 +1760,10 @@ fi
 # --local the flag used to be ignored and the node silently ran Docker.
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
 	echo "--with-containerd-engine sets up a server node; it does not work with --cli-only or --local" >&2
+	exit 1
+fi
+if [[ "$BUILDKIT_ROOTLESS" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true") ]]; then
+	echo "--buildkit-rootless sets up a server node's BuildKit; it does not work with --cli-only or --local" >&2
 	exit 1
 fi
 # Release files from the mirror are checked against a checksums.txt from the
@@ -2443,6 +2488,11 @@ SB_CONTAINERD_NAMESPACE=aerolvm
 SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/cni/bin
 SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true
 EOF
+	fi
+	# Rootless BuildKit (plans/security-gaps-m1-m4.md PR 10b): builds go to
+	# the rootless buildkitd, and sandboxd imports each one into containerd.
+	if [[ "$BUILDKIT_ROOTLESS" == "true" ]]; then
+		echo "SB_CONTAINERD_BUILDKIT_ROOTLESS=true" >> /etc/sandboxd/sandboxd.env
 	fi
 	# The S3 audit witness (plans/open-audit-witness.md) is documented here and
 	# never configured. It needs an Object Lock bucket, and the lock mode,
@@ -3777,6 +3827,10 @@ upgrade_containerd_engine_tools() {
 # bootstrap does not pass --with-containerd-engine, so on a Terraform node
 # its own step still does the install.)
 install_buildkit() {
+	if [[ "${BUILDKIT_ROOTLESS:-false}" == "true" ]]; then
+		install_buildkit_rootless
+		return
+	fi
 	# Three cases. No buildkitd at all: install it. Ours (BUILDKIT_BIN_DIR,
 	# the path this installer and the Terraform bootstrap use) at another
 	# version: replace it, so a re-run moves an older node to the pinned
@@ -3823,10 +3877,18 @@ install_buildkit() {
 	fi
 	# Our own older unit ran build steps on the host's network: replace it
 	# and restart, so a re-run moves an existing node to the sandbox network.
+	# Our rootless unit (--no-buildkit-rootless): back to the root one, and
+	# the rootless BuildKit's network unit is stopped.
 	local restart="false"
 	if [[ -f "$BUILDKIT_UNIT_FILE" ]] && buildkit_unit_is_ours_on_host_net "$BUILDKIT_UNIT_FILE"; then
 		echo "Moving BuildKit build steps off the host network"
 		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		systemctl daemon-reload
+		restart="true"
+	elif [[ -f "$BUILDKIT_UNIT_FILE" ]] && buildkit_unit_is_ours_rootless "$BUILDKIT_UNIT_FILE"; then
+		echo "Moving BuildKit back from rootless to root (--no-buildkit-rootless)"
+		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		systemctl disable --now aerolvm-build-net.service || true
 		systemctl daemon-reload
 		restart="true"
 	fi
@@ -3881,6 +3943,230 @@ buildkit_unit_is_ours_on_host_net() {
 	local body
 	body="$(<"$1")"
 	[[ "$body" == *"Description=BuildKit (aerolvm containerd worker)"* && "$body" == *"--containerd-worker-net=host"* ]]
+}
+
+# buildkit_unit_is_ours_rootless reports whether the unit at $1 is the
+# rootless one this installer writes (buildkit_rootless_unit).
+buildkit_unit_is_ours_rootless() {
+	local body
+	body="$(<"$1")"
+	[[ "$body" == *"Description=BuildKit (aerolvm rootless)"* ]]
+}
+
+# install_buildkit_rootless sets up BuildKit's rootless mode
+# (plans/security-gaps-m1-m4.md PR 10b, eng review D14): buildkitd runs as
+# the aerolvm-build user inside a user namespace RootlessKit makes, with the
+# OCI worker, so it never touches containerd; sandboxd imports each build's
+# OCI archive itself (SB_CONTAINERD_BUILDKIT_ROOTLESS). Its network is the
+# aerolvm.build namespace on the sandboxes' bridge (build_net_unit), so its
+# pulls and build steps get the sandboxes' firewall rules. Every download is
+# checked against the pins above. A buildkit.service that is neither of
+# ours is the operator's and is kept.
+install_buildkit_rootless() {
+	local arch rk_arch
+	case "$(uname -m)" in
+		x86_64|amd64)   arch="amd64"; rk_arch="x86_64" ;;
+		aarch64|arm64)  arch="arm64"; rk_arch="aarch64" ;;
+		*)
+			echo "--buildkit-rootless: unsupported architecture $(uname -m) for BuildKit" >&2
+			exit 1
+			;;
+	esac
+	# newuidmap/newgidmap map the build user's subordinate ids into its
+	# user namespace; BuildKit's bridge network runs iptables inside it.
+	if ! command -v newuidmap >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
+		if [[ "${APT_UPDATED:-false}" != "true" ]]; then
+			apt-get update
+			APT_UPDATED="true"
+		fi
+		apt-get install -y uidmap iptables
+	fi
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+	trap "rm -rf '$tmp_dir'" RETURN
+	# The release's buildkitd and buildctl, as for root BuildKit, plus the
+	# runc and the CNI plugins its rootless bridge network runs.
+	local bk_bins=(buildkitd buildctl buildkit-runc buildkit-cni-bridge buildkit-cni-host-local buildkit-cni-loopback buildkit-cni-firewall)
+	local have="" b need="false"
+	[[ -x "${BUILDKIT_BIN_DIR}/buildkitd" ]] && have="$(buildkit_version_at "${BUILDKIT_BIN_DIR}/buildkitd")"
+	[[ "$have" == "$BUILDKIT_VERSION" ]] || need="true"
+	for b in "${bk_bins[@]}"; do
+		[[ -x "${BUILDKIT_BIN_DIR}/${b}" ]] || need="true"
+	done
+	if [[ "$need" == "true" ]]; then
+		local file="buildkit-${BUILDKIT_VERSION}.linux-${arch}.tar.gz"
+		echo "Downloading BuildKit ${BUILDKIT_VERSION} (${arch}) for rootless mode"
+		if ! fetch_pinned "${tmp_dir}/${file}" buildkit "$file"; then
+			echo "--buildkit-rootless: failed to download ${file}, or it failed its checksum" >&2
+			exit 1
+		fi
+		tar -xzf "${tmp_dir}/${file}" -C "$tmp_dir"
+		systemctl stop buildkit.service 2>/dev/null || true
+		for b in "${bk_bins[@]}"; do
+			install -m 0755 "${tmp_dir}/bin/${b}" "${BUILDKIT_BIN_DIR}/${b}"
+		done
+		echo "Installed BuildKit ${BUILDKIT_VERSION} (${bk_bins[*]}) to ${BUILDKIT_BIN_DIR}"
+	fi
+	if [[ "$(rootlesskit_version_at "${BUILDKIT_BIN_DIR}/rootlesskit")" != "${ROOTLESSKIT_VERSION#v}" ]]; then
+		local rk="rootlesskit-${rk_arch}.tar.gz"
+		echo "Downloading RootlessKit ${ROOTLESSKIT_VERSION} (${rk_arch})"
+		if ! fetch_pinned "${tmp_dir}/${rk}" rootlesskit "$rk"; then
+			echo "--buildkit-rootless: failed to download ${rk}, or it failed its checksum" >&2
+			exit 1
+		fi
+		mkdir -p "${tmp_dir}/rk"
+		tar -xzf "${tmp_dir}/${rk}" -C "${tmp_dir}/rk"
+		install -m 0755 "${tmp_dir}/rk/rootlesskit" "${BUILDKIT_BIN_DIR}/rootlesskit"
+		echo "Installed RootlessKit ${ROOTLESSKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
+	fi
+	ensure_buildkit_build_user
+	ensure_rootlesskit_apparmor
+	# buildkitd's own state, and the CNI state of its bridge network, which
+	# the unit binds over /var/lib/cni (the build user cannot write the
+	# host's, and must not see the sandboxes' leases).
+	install -d -m 0755 /var/lib/cni
+	install -d -m 0700 -o "$BUILDKIT_BUILD_USER" -g "$BUILDKIT_BUILD_USER" \
+		"$BUILDKIT_ROOTLESS_STATE_DIR" "${BUILDKIT_ROOTLESS_STATE_DIR}/cni"
+	local restart="false" body
+	body="$(build_net_unit)"
+	if [[ ! -f "$BUILD_NET_UNIT_FILE" || "$(<"$BUILD_NET_UNIT_FILE")" != "$body" ]]; then
+		printf '%s\n' "$body" > "$BUILD_NET_UNIT_FILE"
+		restart="true"
+	fi
+	body="$(buildkit_rootless_unit)"
+	if [[ ! -f "$BUILDKIT_UNIT_FILE" ]] || buildkit_unit_is_ours_rootless "$BUILDKIT_UNIT_FILE" ||
+		[[ "$(<"$BUILDKIT_UNIT_FILE")" == *"Description=BuildKit (aerolvm containerd worker)"* ]]; then
+		if [[ ! -f "$BUILDKIT_UNIT_FILE" || "$(<"$BUILDKIT_UNIT_FILE")" != "$body" ]]; then
+			[[ -f "$BUILDKIT_UNIT_FILE" ]] && echo "Moving BuildKit to rootless mode"
+			printf '%s\n' "$body" > "$BUILDKIT_UNIT_FILE"
+			restart="true"
+		fi
+	else
+		echo "warning: ${BUILDKIT_UNIT_FILE} is not one this installer wrote; leaving it. Rootless BuildKit needs install.sh's unit." >&2
+	fi
+	if [[ "$restart" == "true" ]]; then
+		systemctl daemon-reload
+	fi
+	# --no-block: the network unit waits for sandboxd's CNI config, which
+	# appears when sandboxd starts, later in this run.
+	systemctl enable --now --no-block aerolvm-build-net.service buildkit.service ||
+		echo "warning: rootless BuildKit failed to start" >&2
+	if [[ "$restart" == "true" ]]; then
+		systemctl restart --no-block buildkit.service || echo "warning: buildkit.service failed to restart" >&2
+	fi
+}
+
+# rootlesskit_version_at prints the release of a rootlesskit binary
+# ("rootlesskit version 3.3.0"), or nothing.
+rootlesskit_version_at() {
+	"$1" --version 2>/dev/null | awk 'NR == 1 { print $3 }' || true
+}
+
+# ensure_buildkit_build_user makes the system user rootless BuildKit runs
+# as, with no login and no home of its own, and its subordinate uid and gid
+# range: build steps run as ids from it, never as a host account. A range
+# the user already has is kept.
+ensure_buildkit_build_user() {
+	if ! id -u "$BUILDKIT_BUILD_USER" >/dev/null 2>&1; then
+		useradd --system --user-group --no-create-home --home-dir "$BUILDKIT_ROOTLESS_STATE_DIR" \
+			--shell /usr/sbin/nologin "$BUILDKIT_BUILD_USER"
+	fi
+	if ! grep -q "^${BUILDKIT_BUILD_USER}:" /etc/subuid 2>/dev/null; then
+		usermod --add-subuids "$BUILDKIT_SUBID_RANGE" "$BUILDKIT_BUILD_USER"
+	fi
+	if ! grep -q "^${BUILDKIT_BUILD_USER}:" /etc/subgid 2>/dev/null; then
+		usermod --add-subgids "$BUILDKIT_SUBID_RANGE" "$BUILDKIT_BUILD_USER"
+	fi
+}
+
+# ensure_rootlesskit_apparmor lets RootlessKit make its user namespace on a
+# host that allows that only to programs with an AppArmor profile (Ubuntu
+# 23.10 and later: kernel.apparmor_restrict_unprivileged_userns=1). The
+# profile names RootlessKit alone, so the restriction stays on for every
+# other program.
+ensure_rootlesskit_apparmor() {
+	local knob="$APPARMOR_USERNS_KNOB"
+	[[ -r "$knob" && "$(<"$knob")" == "1" ]] || return 0
+	command -v apparmor_parser >/dev/null 2>&1 || return 0
+	{
+		echo 'abi <abi/4.0>,'
+		echo 'include <tunables/global>'
+		echo
+		echo "profile aerolvm-rootlesskit ${BUILDKIT_BIN_DIR}/rootlesskit flags=(unconfined) {"
+		echo '  userns,'
+		echo
+		echo '  include if exists <local/aerolvm-rootlesskit>'
+		echo '}'
+	} > "$ROOTLESSKIT_APPARMOR_PROFILE"
+	apparmor_parser -r "$ROOTLESSKIT_APPARMOR_PROFILE" || echo "warning: could not load ${ROOTLESSKIT_APPARMOR_PROFILE}; rootless BuildKit may fail to start" >&2
+}
+
+# build_net_unit prints aerolvm-build-net.service: root, once per boot, it
+# makes the aerolvm.build network namespace on the sandboxes' bridge with
+# sandboxd's own CNI config (sandboxd host build-network up). sandboxd (or,
+# in privilege mode split, the root helper) writes that config when it
+# starts, so the unit waits for it, retrying every 5 s with no start limit.
+# Stopping it removes the namespace; buildkit.service stops with it.
+build_net_unit() {
+	cat <<UNIT
+[Unit]
+Description=AerolVM rootless BuildKit network (aerolvm.build)
+After=sandboxd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/sandboxd/sandboxd.env
+EnvironmentFile=-/etc/sandboxd/cluster.env
+ExecStartPre=/bin/sh -c 'test -s "\$\${SB_CONTAINERD_CNI_CONF_PATH:-/etc/cni/net.d/aerolvm.conflist}"'
+ExecStart=${INSTALL_PREFIX}/sandboxd host build-network up
+ExecStop=${INSTALL_PREFIX}/sandboxd host build-network down
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# buildkit_rootless_unit prints the rootless buildkit.service. buildkitd
+# runs as the build user in RootlessKit's user namespace, OCI worker only,
+# in the aerolvm.build namespace (NetworkNamespacePath): its pulls leave
+# from there, and each build step gets a namespace of its own on BuildKit's
+# bridge, inside RootlessKit's detached namespace, whose traffic leaves
+# through aerolvm.build too. It reads the host's upstream resolvers (a
+# loopback stub is not reachable from the namespace) and keeps its CNI state
+# in its own folder. Its socket is 0660 to the build user's group. Until the
+# namespace is there the start fails and is retried every 5 s; restarting
+# the network unit restarts it (PartOf).
+buildkit_rootless_unit() {
+	cat <<UNIT
+[Unit]
+Description=BuildKit (aerolvm rootless)
+Wants=aerolvm-build-net.service
+After=aerolvm-build-net.service
+PartOf=aerolvm-build-net.service
+StartLimitIntervalSec=0
+
+[Service]
+User=${BUILDKIT_BUILD_USER}
+Group=${BUILDKIT_BUILD_USER}
+Environment=XDG_RUNTIME_DIR=/run/aerolvm-buildkit
+RuntimeDirectory=aerolvm-buildkit
+RuntimeDirectoryMode=0750
+NetworkNamespacePath=/run/netns/aerolvm.build
+BindReadOnlyPaths=/run/aerolvm-build-net/resolv.conf:/etc/resolv.conf
+BindPaths=${BUILDKIT_ROOTLESS_STATE_DIR}/cni:/var/lib/cni
+ExecStart=${BUILDKIT_BIN_DIR}/rootlesskit --state-dir=/run/aerolvm-buildkit/rootlesskit --net=gvisor-tap-vsock --detach-netns --copy-up=/etc ${BUILDKIT_BIN_DIR}/buildkitd --addr unix:///run/aerolvm-buildkit/buildkitd.sock --root ${BUILDKIT_ROOTLESS_STATE_DIR} --oci-worker=true --containerd-worker=false --oci-worker-net=bridge
+Restart=on-failure
+RestartSec=5
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 }
 
 register_gvisor_runtime() {
@@ -4339,6 +4625,10 @@ if [[ "$WITH_FIRECRACKER" == "true" ]]; then
 fi
 if [[ "$WITH_CONTAINERD_ENGINE" == "true" ]]; then
 	install_cni_plugins
+	install_buildkit
+elif [[ "$BUILDKIT_ROOTLESS" == "true" ]]; then
+	# The Terraform bootstrap sets the containerd engine itself, after this
+	# script, and installs the CNI plugins; it finds BuildKit here.
 	install_buildkit
 else
 	upgrade_containerd_engine_tools

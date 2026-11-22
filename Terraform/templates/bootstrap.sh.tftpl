@@ -266,6 +266,14 @@ INSTALL_ARGS+=(--with-gvisor)
 %{ if with_isolate ~}
 INSTALL_ARGS+=(--with-isolate)
 %{ endif ~}
+%{ if one_line_join ~}
+%{ if containerd_cfg.buildkit_rootless == "true" ~}
+# Rootless BuildKit (config/cluster.yml containerd.buildkit_rootless,
+# plans/security-gaps-m1-m4.md PR 10b): install.sh sets it up, and the
+# BuildKit step below then finds buildkitd and its unit already there.
+INSTALL_ARGS+=(--buildkit-rootless)
+%{ endif ~}
+%{ endif ~}
 %{ if ingress_proxy_routing == true ~}
 INSTALL_ARGS+=(--ingress-proxy-routing)
 %{ endif ~}
