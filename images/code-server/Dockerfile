@@ -12,7 +12,7 @@
 #
 # The base image is pinned by digest, so a re-pushed tag cannot change what
 # we build. Dependabot moves the tag and the digest together.
-FROM codercom/code-server:4.145.2@sha256:09565f9e07f5624554e295e8bab0e2fec4a7c533eb3cff459ed6596a4d3d7c1c
+FROM codercom/code-server:4.145.2-39@sha256:f1598017dc620b44b27cd2517ba8be0de9e95a2275b97163eb3484364cde5785
 
 USER root
 RUN rm -f /etc/sudoers.d/nopasswd \
