@@ -55,6 +55,11 @@ const (
 	RootHelper_UnmountExternal_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/UnmountExternal"
 	RootHelper_SweepExternalMounts_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SweepExternalMounts"
 	RootHelper_ReclaimVolume_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/ReclaimVolume"
+	RootHelper_PrepareHost_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/PrepareHost"
+	RootHelper_SpawnHost_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/SpawnHost"
+	RootHelper_StopHost_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/StopHost"
+	RootHelper_ListHosts_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/ListHosts"
+	RootHelper_SetHostLimits_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/SetHostLimits"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -161,6 +166,23 @@ type RootHelperClient interface {
 	// following a link, and unmounts it. The source must be one volume's
 	// folder of that export, <server>:/<export>/<scope>/<name>.
 	ReclaimVolume(ctx context.Context, in *ReclaimVolumeRequest, opts ...grpc.CallOption) (*ReclaimVolumeResponse, error)
+	// PrepareHost makes sure what a host needs before its process starts
+	// exists: a V8 group's jail (its chroot, linked from the helper's base
+	// tree, with a run folder the agent writes its config and sockets into).
+	PrepareHost(ctx context.Context, in *PrepareHostRequest, opts ...grpc.CallOption) (*PrepareHostResponse, error)
+	// SpawnHost makes sure a host runs, and answers with its process. A host
+	// that already runs is answered as it is.
+	SpawnHost(ctx context.Context, in *SpawnHostRequest, opts ...grpc.CallOption) (*SpawnHostResponse, error)
+	// StopHost makes sure a host is gone: every process in its group killed,
+	// and what PrepareHost and SpawnHost made removed.
+	StopHost(ctx context.Context, in *StopHostRequest, opts ...grpc.CallOption) (*StopHostResponse, error)
+	// ListHosts lists the hosts the helper holds anything for, read from the
+	// kernel: those whose process runs, and those left with none (pid 0),
+	// for the agent's sweep.
+	ListHosts(ctx context.Context, in *ListHostsRequest, opts ...grpc.CallOption) (*ListHostsResponse, error)
+	// SetHostLimits changes a running host's limits (a warm V8 group host a
+	// tenant claims takes that tenant's).
+	SetHostLimits(ctx context.Context, in *SetHostLimitsRequest, opts ...grpc.CallOption) (*SetHostLimitsResponse, error)
 }
 
 type rootHelperClient struct {
@@ -411,6 +433,56 @@ func (c *rootHelperClient) ReclaimVolume(ctx context.Context, in *ReclaimVolumeR
 	return out, nil
 }
 
+func (c *rootHelperClient) PrepareHost(ctx context.Context, in *PrepareHostRequest, opts ...grpc.CallOption) (*PrepareHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareHostResponse)
+	err := c.cc.Invoke(ctx, RootHelper_PrepareHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SpawnHost(ctx context.Context, in *SpawnHostRequest, opts ...grpc.CallOption) (*SpawnHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SpawnHostResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SpawnHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) StopHost(ctx context.Context, in *StopHostRequest, opts ...grpc.CallOption) (*StopHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopHostResponse)
+	err := c.cc.Invoke(ctx, RootHelper_StopHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) ListHosts(ctx context.Context, in *ListHostsRequest, opts ...grpc.CallOption) (*ListHostsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHostsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_ListHosts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SetHostLimits(ctx context.Context, in *SetHostLimitsRequest, opts ...grpc.CallOption) (*SetHostLimitsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetHostLimitsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SetHostLimits_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -515,6 +587,23 @@ type RootHelperServer interface {
 	// following a link, and unmounts it. The source must be one volume's
 	// folder of that export, <server>:/<export>/<scope>/<name>.
 	ReclaimVolume(context.Context, *ReclaimVolumeRequest) (*ReclaimVolumeResponse, error)
+	// PrepareHost makes sure what a host needs before its process starts
+	// exists: a V8 group's jail (its chroot, linked from the helper's base
+	// tree, with a run folder the agent writes its config and sockets into).
+	PrepareHost(context.Context, *PrepareHostRequest) (*PrepareHostResponse, error)
+	// SpawnHost makes sure a host runs, and answers with its process. A host
+	// that already runs is answered as it is.
+	SpawnHost(context.Context, *SpawnHostRequest) (*SpawnHostResponse, error)
+	// StopHost makes sure a host is gone: every process in its group killed,
+	// and what PrepareHost and SpawnHost made removed.
+	StopHost(context.Context, *StopHostRequest) (*StopHostResponse, error)
+	// ListHosts lists the hosts the helper holds anything for, read from the
+	// kernel: those whose process runs, and those left with none (pid 0),
+	// for the agent's sweep.
+	ListHosts(context.Context, *ListHostsRequest) (*ListHostsResponse, error)
+	// SetHostLimits changes a running host's limits (a warm V8 group host a
+	// tenant claims takes that tenant's).
+	SetHostLimits(context.Context, *SetHostLimitsRequest) (*SetHostLimitsResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -596,6 +685,21 @@ func (UnimplementedRootHelperServer) SweepExternalMounts(context.Context, *Sweep
 }
 func (UnimplementedRootHelperServer) ReclaimVolume(context.Context, *ReclaimVolumeRequest) (*ReclaimVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReclaimVolume not implemented")
+}
+func (UnimplementedRootHelperServer) PrepareHost(context.Context, *PrepareHostRequest) (*PrepareHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareHost not implemented")
+}
+func (UnimplementedRootHelperServer) SpawnHost(context.Context, *SpawnHostRequest) (*SpawnHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SpawnHost not implemented")
+}
+func (UnimplementedRootHelperServer) StopHost(context.Context, *StopHostRequest) (*StopHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopHost not implemented")
+}
+func (UnimplementedRootHelperServer) ListHosts(context.Context, *ListHostsRequest) (*ListHostsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHosts not implemented")
+}
+func (UnimplementedRootHelperServer) SetHostLimits(context.Context, *SetHostLimitsRequest) (*SetHostLimitsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetHostLimits not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1050,6 +1154,96 @@ func _RootHelper_ReclaimVolume_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_PrepareHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).PrepareHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_PrepareHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).PrepareHost(ctx, req.(*PrepareHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SpawnHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SpawnHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SpawnHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SpawnHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SpawnHost(ctx, req.(*SpawnHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_StopHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).StopHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_StopHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).StopHost(ctx, req.(*StopHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_ListHosts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHostsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).ListHosts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_ListHosts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).ListHosts(ctx, req.(*ListHostsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SetHostLimits_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetHostLimitsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SetHostLimits(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SetHostLimits_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SetHostLimits(ctx, req.(*SetHostLimitsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1152,6 +1346,26 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReclaimVolume",
 			Handler:    _RootHelper_ReclaimVolume_Handler,
+		},
+		{
+			MethodName: "PrepareHost",
+			Handler:    _RootHelper_PrepareHost_Handler,
+		},
+		{
+			MethodName: "SpawnHost",
+			Handler:    _RootHelper_SpawnHost_Handler,
+		},
+		{
+			MethodName: "StopHost",
+			Handler:    _RootHelper_StopHost_Handler,
+		},
+		{
+			MethodName: "ListHosts",
+			Handler:    _RootHelper_ListHosts_Handler,
+		},
+		{
+			MethodName: "SetHostLimits",
+			Handler:    _RootHelper_SetHostLimits_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

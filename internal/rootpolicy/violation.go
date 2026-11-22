@@ -54,6 +54,9 @@ const (
 	RuleProcessMatch Rule = "process_match"
 	// The root helper's raw-TCP host-port forwarding (hostport.go).
 	RuleHostPort Rule = "host_port"
+	// The root helper's host-process calls (hosts.go).
+	RuleHost       Rule = "host"
+	RuleHostLimits Rule = "host_limits"
 )
 
 // Violation is a refused request: which rule, and what about the request

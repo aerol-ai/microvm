@@ -30,7 +30,7 @@ func TestWireWasmRuntime_Basic(t *testing.T) {
 		WasmRunDir:     runDir,
 		WasmModulesDir: modulesDir,
 		WasmEngine:     "wazero",
-	}, testLogger(), svc, st)
+	}, testLogger(), svc, st, nil)
 	if pool != nil {
 		t.Fatalf("wireWasmRuntime without pool enabled = %v, want nil", pool)
 	}
@@ -65,7 +65,7 @@ func TestWireWasmRuntime_CatalogueLookupCallback(t *testing.T) {
 		WasmEngine:              "wasmtime",
 		WasmStateKVWritesPerSec: 5,
 		WasmStateKVBurst:        10,
-	}, testLogger(), svc, st)
+	}, testLogger(), svc, st, nil)
 	if resolver == nil || resolver.CatalogueLookup == nil {
 		t.Fatal("expected wired catalogue lookup callback")
 	}
@@ -97,7 +97,7 @@ func TestWireWasmRuntime_CatalogueLookupNotReady(t *testing.T) {
 
 	_ = wireWasmRuntime(ctx, config.Config{
 		WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir(),
-	}, testLogger(), svc, st)
+	}, testLogger(), svc, st, nil)
 	if _, _, ok := resolver.CatalogueLookup(ctx, "pending-1"); ok {
 		t.Fatal("pending catalogue row must not resolve")
 	}
@@ -126,7 +126,7 @@ func TestWireWasmRuntime_CatalogueLookupPerOwner(t *testing.T) {
 	var resolver *wasmmod.ModuleResolver
 	wasmWiringTestHook = func(r *wasmmod.ModuleResolver) { resolver = r }
 	t.Cleanup(func() { wasmWiringTestHook = nil })
-	_ = wireWasmRuntime(ctx, config.Config{WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir()}, testLogger(), svc, st)
+	_ = wireWasmRuntime(ctx, config.Config{WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir()}, testLogger(), svc, st, nil)
 
 	tenant := func(owner string) context.Context {
 		return controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: owner}})
@@ -191,7 +191,7 @@ func TestWireWasmRuntime_WithPoolAndCatalogue(t *testing.T) {
 		WasmStateKVBurst:        20,
 	}
 
-	pool := wireWasmRuntime(ctx, cfg, testLogger(), svc, st)
+	pool := wireWasmRuntime(ctx, cfg, testLogger(), svc, st, nil)
 	if pool == nil {
 		t.Fatal("wireWasmRuntime with pool enabled = nil, want pool")
 	}
@@ -234,7 +234,7 @@ func TestWireWasmRuntime_RegistrationNotesWarmPool(t *testing.T) {
 		WasmPoolEnabled:        true,
 		WasmPoolDepthDefault:   1,
 		WasmPoolRefillInterval: time.Hour, // keep the refill loop quiet
-	}, testLogger(), svc, st)
+	}, testLogger(), svc, st, nil)
 	if pool == nil {
 		t.Fatal("expected non-nil pool")
 	}
@@ -265,7 +265,7 @@ func TestWireWasmRuntime_NilStoreSkipsCatalogue(t *testing.T) {
 		WasmPoolEnabled:        true,
 		WasmPoolDepthDefault:   1,
 		WasmPoolRefillInterval: time.Hour,
-	}, testLogger(), svc, nil)
+	}, testLogger(), svc, nil, nil)
 	if pool == nil {
 		t.Fatal("expected non-nil pool")
 	}

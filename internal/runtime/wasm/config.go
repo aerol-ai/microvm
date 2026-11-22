@@ -62,6 +62,11 @@ type Config struct {
 	// CompileCacheDir is the root of the per-owner compile caches
 	// (compileCacheFor); empty, no cache.
 	CompileCacheDir string
+	// HelperSockets, when set, is the root helper's folder for the WASM
+	// hosts' sockets (privilege mode split, M1 PR 9; split.go). The helper
+	// starts every worker and resident host there, and this sandboxd, which
+	// is not root, shares the guests' files with the worker user by group.
+	HelperSockets string
 	// Engine is the workers' engine (SB_WASM_ENGINE): "" or "wazero", or
 	// "wasmtime". The shared compile cache holds wazero's compiled code
 	// only, so it is filled for wazero alone (sharedcache.go).

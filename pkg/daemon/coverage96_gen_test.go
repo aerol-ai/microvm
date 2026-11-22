@@ -128,10 +128,10 @@ func cover96_funcs() {
 		wireDockerWarmPool(cover96Ctx(), zero96[config.Config](), zero96[*slog.Logger](), zero96[*docker.Client](), zero96[*capacity.Admitter]())
 	}) // docker_warm_wiring.go:15
 	cover96Call(func() {
-		wireIsolateRuntime(cover96Ctx(), zero96[config.Config](), zero96[*slog.Logger](), zero96[*service.Service]())
+		wireIsolateRuntime(cover96Ctx(), zero96[config.Config](), zero96[*slog.Logger](), zero96[*service.Service](), nil)
 	}) // isolate_wiring.go:23
 	cover96Call(func() {
-		wireWasmRuntime(cover96Ctx(), zero96[config.Config](), zero96[*slog.Logger](), zero96[*service.Service](), zero96[*store.Store]())
+		wireWasmRuntime(cover96Ctx(), zero96[config.Config](), zero96[*slog.Logger](), zero96[*service.Service](), zero96[*store.Store](), nil)
 	}) // wasm_wiring.go:31
 }
 

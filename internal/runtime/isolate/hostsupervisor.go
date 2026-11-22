@@ -37,6 +37,9 @@ type workerdSupervisor struct {
 	egressObserver pkgisolate.EgressObserver
 	denialObserver pkgisolate.EgressDenialObserver
 	learnObserver  pkgisolate.LearnObserver
+	// launcher realizes jails and runs workerd in privilege mode split
+	// (Config.Launcher); nil in single.
+	launcher pkgisolate.JailLauncher
 }
 
 // SetLearnObserver installs learn-mode recording on every group host.
@@ -77,6 +80,7 @@ func newWorkerdSupervisor(cfg Config, logger *slog.Logger) *workerdSupervisor {
 		jailChrootBase: cfg.JailChrootBase,
 		logger:         logger,
 		hostsCgroup:    hostsCgroup,
+		launcher:       cfg.Launcher,
 	}
 }
 
@@ -126,6 +130,7 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 		Logger:         s.logger,
 		RecordDir:      s.recordDir(),
 		Cgroup:         s.hostsCgroup,
+		Launcher:       s.launcher,
 		// When UseJail is set, the host MUST realize this spec or fail closed.
 		Jail: pkgisolate.JailConfig{
 			Require:         s.useJail,
@@ -136,6 +141,7 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 			CgroupName:      spec.CgroupName,
 			CPUQuota:        spec.CPUQuota,
 			MemoryLimitMB:   spec.MemoryLimitMB,
+			PidsMax:         s.launchedPids(spec.PidsMax),
 			Jitless:         spec.Jitless,
 			SeccompMode:     spec.SeccompMode,
 			SeccompAllow:    spec.SeccompAllowlistFor(),
@@ -181,6 +187,7 @@ func (s *workerdSupervisor) AdoptGroups(ctx context.Context) []AdoptedGroup {
 		Logger:      s.logger,
 		RecordDir:   s.recordDir(),
 		Cgroup:      s.hostsCgroup,
+		Launcher:    s.launcher,
 	})
 	out := make([]AdoptedGroup, 0, len(adopted))
 	keep := make(map[string]bool, len(adopted))
@@ -193,8 +200,8 @@ func (s *workerdSupervisor) AdoptGroups(ctx context.Context) []AdoptedGroup {
 		}
 		out = append(out, AdoptedGroup{Key: a.Host.GroupKey(), Host: &hostAdapter{Host: a.Host}, Loaded: a.Loaded})
 	}
-	leftovers := pkgisolate.Leftovers{HostsCgroup: s.hostsCgroup, Keep: keep, KeepPIDs: keepPIDs}
-	if s.useJail {
+	leftovers := pkgisolate.Leftovers{HostsCgroup: s.hostsCgroup, Keep: keep, KeepPIDs: keepPIDs, Launcher: s.launcher}
+	if s.useJail && s.launcher == nil {
 		leftovers.JailCgroupRoot, leftovers.JailChrootBase = s.jailCgroupRoot, s.jailChrootBase
 	}
 	if killed := sweepLeftovers(leftovers); killed > 0 {
@@ -227,4 +234,14 @@ func toHostEgressPolicy(p EgressPolicy) pkgisolate.EgressPolicy {
 		Rules:    p.Rules,
 		Secrets:  p.Secrets,
 	}
+}
+
+// launchedPids is the pids limit a launched group starts with: the spec's,
+// which the helper bounds by its own. Single mode passes none here, as it
+// always has: its router applies the caps a claim brings.
+func (s *workerdSupervisor) launchedPids(pids int) int {
+	if s.launcher == nil {
+		return 0
+	}
+	return pids
 }

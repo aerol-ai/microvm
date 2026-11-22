@@ -58,7 +58,7 @@ func TestCoverage95LiftSnapshotPushBuildFailures(t *testing.T) {
 		WasmCompileCacheDir: blocked,
 		WasmModulesDir:      t.TempDir(),
 		WasmRunDir:          t.TempDir(),
-	}, logger, svc, nil)
+	}, logger, svc, nil, nil)
 
 	// Enabled manager + failing bootstrap backend exercises the re-assert
 	// warn path without needing Linux iptables.

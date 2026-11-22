@@ -140,9 +140,12 @@ func TestRemoteManagerFailures(t *testing.T) {
 		t.Fatal("Discard")
 	}
 	m.Sweep(nil) // logged
+	// A WASM worker's mounts: refused before the helper mounts anything, as
+	// the node's setting (501), not a failure.
+	calls := len(f.calls)
 	if _, err := m.MountAll(WithConsumer(context.Background(), Consumer{UID: 9, GID: 9}), "sb-1", remoteSpecs()); err == nil ||
-		!strings.Contains(err.Error(), "WASM") {
-		t.Fatalf("consumer: %v", err)
+		!strings.Contains(err.Error(), "WASM") || !errors.Is(err, models.ErrRuntimeNotImplemented) || len(f.calls) != calls {
+		t.Fatalf("consumer: %v (helper calls %d, were %d)", err, len(f.calls), calls)
 	}
 
 	off := newRemoteManager(t, &fakeRemote{}, "the node says no")

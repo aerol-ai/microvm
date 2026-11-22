@@ -3,6 +3,7 @@ package rootd
 import (
 	"errors"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"os/user"
@@ -14,10 +15,13 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+
+	"github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -264,6 +268,9 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"the agent as the egress gateway, uid:gid", map[string]string{"SB_ROOTD_AGENT_UID": "4000", "SB_EGRESS_GATEWAY_USER": "4000:4001", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_EGRESS_GATEWAY_USER"},
 		{"the agent as the jails' default user", map[string]string{"SB_ROOTD_AGENT_UID": "1000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
 		{"the agent as the jailer", map[string]string{"SB_ROOTD_AGENT_UID": "2000", "SB_JAILER_UID": "2000", "SB_ISOLATE_JAIL_UID": "3000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_JAILER_UID"},
+		// WASM workers run guests' code as their own user (M1 PR 9).
+		{"the agent as the WASM worker", map[string]string{"SB_ROOTD_AGENT_UID": "61000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_WASM_WORKER_UID"},
+		{"a WASM worker uid that does not parse", map[string]string{"SB_WASM_WORKER_UID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_WASM_WORKER_UID"},
 		{"a jail uid that does not parse", map[string]string{"SB_ISOLATE_JAIL_UID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
 		// 2^32 + 65531 would wrap to the agent's uid in a plain conversion.
 		{"a jail uid past uid_t", map[string]string{"SB_ROOTD_AGENT_UID": "65531", "SB_JAILER_UID": "4295032827", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_JAILER_UID=4295032827: not a uid"},
@@ -290,6 +297,29 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 		{"the agent's mounts with a doubled slash", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_MOUNTS_ROOT": "/srv//mounts", "SB_ROOTD_STATE_DIR": "/srv/mounts/rootd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
 		{"FIFOs through a dot", map[string]string{"SB_DB_PATH": "/data/state.db", "SB_ROOTD_FIFO_DIR": "/data/./fifo", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_FIFO_DIR"},
 		{"the helper's state reached by climbing out", map[string]string{"SB_ROOTD_STATE_DIR": "/var/lib/aerolvm-rootd/../sandboxd/x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ROOTD_STATE_DIR"},
+		// M1 PR 9: the V8 group hosts. The helper jails every group, from
+		// its own settings, in a chroot base the agent cannot write.
+		{"V8 unjailed", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_USE_JAIL": "false", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_USE_JAIL=false"},
+		{"V8 that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "si", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ENABLE_ISOLATE"},
+		{"V8 jail that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_USE_JAIL": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_USE_JAIL"},
+		{"V8 jail gid that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_GID": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_GID"},
+		{"V8 jitless that does not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JITLESS": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JITLESS"},
+		{"V8 pids that do not parse", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_PIDS_MAX": "x", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_PIDS_MAX"},
+		{"V8 groups with no pids limit", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_PIDS_MAX": "0", "SB_HOST_MEMORY_MB": "1"}, nil, "above 0"},
+		{"the V8 chroots in the agent's folder", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_CHROOT_BASE": "/var/lib/sandboxd/jail", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_CHROOT_BASE"},
+		{"a relative V8 chroot base", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_JAIL_CHROOT_BASE": "jail", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_CHROOT_BASE"},
+		{"a relative workerd", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_WORKERD_PATH": "workerd", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_WORKERD_PATH"},
+		{"a V8 seccomp mode no jail has", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ISOLATE_SECCOMP_MODE": "loose", "SB_HOST_MEMORY_MB": "1"}, nil, "seccomp mode"},
+		{"the V8 jail as the agent", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ROOTD_AGENT_UID": "4000", "SB_ISOLATE_JAIL_UID": "4000", "SB_HOST_MEMORY_MB": "1"}, nil, "SB_ISOLATE_JAIL_UID"},
+		{"a host-process cgroup parent at the root", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_HOST_PROCESS_CGROUP_PARENT": "/", "SB_HOST_MEMORY_MB": "1"}, nil, "host-process cgroup parent"},
+		// The V8 jail takes the agent's uid as an int.
+		{"a V8 agent uid past MaxInt32", map[string]string{"SB_ENABLE_ISOLATE": "true", "SB_ROOTD_AGENT_UID": "2147483648", "SB_HOST_MEMORY_MB": "1"}, nil, "the V8 jail takes uids up to"},
+		// A worker id past uid_t would wrap: 4294967296 onto root, and
+		// 4295032827 onto the agent (65531). The uids stop at the shared uid
+		// check; the gid at the hosts' own (TestHostsConfigRefusesWrappingIDs).
+		{"a WASM worker uid that wraps onto root", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_UID": "4294967296", "SB_HOST_MEMORY_MB": "1"}, nil, "not a uid"},
+		{"a WASM worker uid that wraps onto the agent", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_UID": "4295032827", "SB_HOST_MEMORY_MB": "1"}, nil, "not a uid"},
+		{"a WASM worker gid that wraps", map[string]string{"SB_ENABLE_WASM": "true", "SB_WASM_WORKER_GID": "4294967296", "SB_HOST_MEMORY_MB": "1"}, nil, "want ids below"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stubHost(t, 0, tc.host)
@@ -301,6 +331,39 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 				t.Fatalf("ConfigFromEnv = %v, want an error naming %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestHostsConfigRefusesWrappingIDs: the hosts' own check compares the
+// WASM worker's ids with the agent's as int64, so a value past uid_t, set
+// in code or through the environment, never wraps onto root or the agent.
+func TestHostsConfigRefusesWrappingIDs(t *testing.T) {
+	good := func() HostsConfig {
+		return HostsConfig{LogPath: "/var/lib/aerolvm-rootd/hosts.log", Wasm: &WasmHostsConfig{
+			Binary: "/usr/local/bin/aerolvm-rootd", UID: 61000, GID: 61000, SocketDir: DefaultWasmSocketDir,
+			AgentUID: 65531, ReadyWait: time.Second}}
+	}
+	if err := good().validate(); err != nil {
+		t.Fatalf("a good config: %v", err)
+	}
+	var big int64 = math.MaxUint32
+	for _, tc := range []struct {
+		name     string
+		uid, gid int64
+		want     string
+	}{
+		{"uid (uid_t)-1", big, 61000, "want ids below"},
+		{"uid wrapping onto root", big + 1, 61000, "want ids below"},
+		{"uid wrapping onto the agent", big + 1 + 65531, 61000, "want ids below"},
+		{"gid (gid_t)-1", 61000, big, "want ids below"},
+		{"uid the agent's", 65531, 61000, "neither root nor the agent"},
+		{"uid root", 0, 61000, "neither root nor the agent"},
+	} {
+		h := good()
+		h.Wasm.UID, h.Wasm.GID = int(tc.uid), int(tc.gid)
+		if err := h.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
+		}
 	}
 }
 
@@ -526,5 +589,146 @@ func TestHostPortsFromEnv(t *testing.T) {
 		if _, err := hostPortsFromEnv(env(bad)); err == nil {
 			t.Errorf("%v passed", bad)
 		}
+	}
+}
+
+// TestHostsFromEnv: with SB_ENABLE_ISOLATE the helper serves V8 group
+// hosts, jailed from its own settings under sandboxd's names, with its own
+// binary as the shim; without it, none.
+func TestHostsFromEnv(t *testing.T) {
+	gid := strconv.Itoa(os.Getgid())
+	stubHost(t, 1024, nil)
+	old := selfExecutable
+	selfExecutable = func() (string, error) { return "/usr/local/bin/aerolvm-rootd", nil }
+	t.Cleanup(func() { selfExecutable = old })
+	cfg, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid}))
+	if err != nil || cfg.Hosts.any() || cfg.Hosts != (HostsConfig{}) {
+		t.Fatalf("no host kind: %+v, %v", cfg.Hosts, err)
+	}
+	cfg, err = ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true",
+		"SB_CONTAINERD_CGROUP_PARENT": "/kubepods/pod1/sandboxes", "SB_ISOLATE_JAIL_UID": "2000", "SB_ISOLATE_JAIL_GID": "2001",
+		"SB_ISOLATE_JITLESS": "true", "SB_ISOLATE_SECCOMP_MODE": "AUDIT", "SB_ISOLATE_JAIL_PIDS_MAX": "300"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := HostsConfig{
+		CgroupParent: "/kubepods/pod1/sandboxes",
+		LogPath:      "/var/lib/aerolvm-rootd/hosts.log",
+		Workerd: &WorkerdHostsConfig{
+			Jail: isolate.RootJail{ChrootBase: "/srv/isolate-jail", WorkerdPath: "/usr/local/bin/workerd", UID: 2000, GID: 2001,
+				AgentUID: DefaultAgentUID, Jitless: true, SeccompMode: isolate.SeccompAudit, ShimPath: "/usr/local/bin/aerolvm-rootd"},
+			PidsMax: 300,
+		},
+	}
+	if cfg.Hosts.CgroupParent != want.CgroupParent || cfg.Hosts.LogPath != want.LogPath || *cfg.Hosts.Workerd != *want.Workerd {
+		t.Fatalf("hosts %+v %+v, want %+v %+v", cfg.Hosts, cfg.Hosts.Workerd, want, want.Workerd)
+	}
+	// The host-process parent may be its own.
+	cfg, err = ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true",
+		"SB_CONTAINERD_CGROUP_PARENT": "/a", "SB_HOST_PROCESS_CGROUP_PARENT": "/b"}))
+	if err != nil || cfg.Hosts.CgroupParent != "/b" {
+		t.Fatalf("parent %q, %v", cfg.Hosts.CgroupParent, err)
+	}
+	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
+	if _, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true"})); err == nil ||
+		!strings.Contains(err.Error(), "shim") {
+		t.Fatalf("no binary of its own: %v", err)
+	}
+}
+
+// TestWasmHostsFromEnv: the WASM hosts' settings come from the helper's own
+// environment, under sandboxd's names. The worker may not share the V8
+// jail's user, and the hosts' sockets may not sit in a folder the agent
+// writes (root binds them there).
+func TestWasmHostsFromEnv(t *testing.T) {
+	old := selfExecutable
+	selfExecutable = func() (string, error) { return "/usr/local/bin/aerolvm-rootd", nil }
+	t.Cleanup(func() { selfExecutable = old })
+	path := func(m map[string]string) func(k, def string) string {
+		return func(k, def string) string {
+			if v := strings.TrimSpace(m[k]); v != "" {
+				return filepath.Clean(v)
+			}
+			return filepath.Clean(def)
+		}
+	}
+	agentDirs := []string{"/var/lib/sandboxd", "/run/sandboxd"}
+	ports := []rootpolicy.NodePort{{Proto: "tcp", Port: 8080}, {Proto: "udp", Port: 53}, {Proto: "tcp", Port: 9090, Dst: "10.0.0.1"}, {Proto: "tcp", Port: 8080}}
+	read := func(m map[string]string, enterprise bool) (*WasmHostsConfig, error) {
+		return wasmHostsFromEnv(env(m), path(m), 65531, 990, enterprise, ports, agentDirs)
+	}
+
+	w, err := read(map[string]string{"PATH": "/usr/bin", "LANG": "C.UTF-8", "SB_EGRESS_OPERATOR_FILE": " /etc/aerolvm/operator.yaml ",
+		"LD_PRELOAD": "/tmp/x.so"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &WasmHostsConfig{Binary: "/usr/local/bin/aerolvm-rootd", UID: 61000, GID: 61000, SocketDir: DefaultWasmSocketDir, SocketGID: 990,
+		CacheRoot: "/var/lib/sandboxd/wasm/modules/cache/wazero-compile", AgentUID: 65531, ReadyWait: 10 * time.Second, Fence: true,
+		OperatorFile: "/etc/aerolvm/operator.yaml",
+		Env:          []string{"PATH=/usr/bin", "LANG=C.UTF-8", "SB_EGRESS_OPERATOR_FILE=/etc/aerolvm/operator.yaml"},
+		NodePorts:    []uint16{8080}}
+	if !reflect.DeepEqual(w, want) {
+		t.Fatalf("defaults:\n got %+v\nwant %+v", w, want)
+	}
+
+	// The fence: network rules on by default; enterprise mode keeps it on.
+	for _, tc := range []struct {
+		rules      string
+		enterprise bool
+		fence      bool
+	}{{"false", false, false}, {"false", true, true}, {"true", false, true}} {
+		w, err := read(map[string]string{"SB_ENABLE_NETWORK_RULES": tc.rules}, tc.enterprise)
+		if err != nil || w.Fence != tc.fence {
+			t.Errorf("rules %s enterprise %v: fence %v, %v; want %v", tc.rules, tc.enterprise, w != nil && w.Fence, err, tc.fence)
+		}
+	}
+
+	// The compile cache root, worked out as sandboxd does.
+	for _, tc := range []struct {
+		m    map[string]string
+		want string
+	}{
+		{map[string]string{"SB_WASM_COMPILE_CACHE_DIR": "/c/"}, "/c"},
+		{map[string]string{"SB_WASM_CACHE_DIR": "/d"}, "/d/wazero-compile"},
+		{map[string]string{"SB_WASM_MODULES_DIR": "/m"}, "/m/cache/wazero-compile"},
+		{map[string]string{"SB_WASM_CACHE_DIR": "/d", "SB_WASM_COMPILE_CACHE_DIR": "/c"}, "/c"},
+	} {
+		if w, err := read(tc.m, false); err != nil || w.CacheRoot != tc.want {
+			t.Errorf("%v: cache root %q, %v; want %q", tc.m, w.CacheRoot, err, tc.want)
+		}
+	}
+	// Set and empty: no compile cache at all.
+	t.Setenv("SB_WASM_COMPILE_CACHE_DIR", "")
+	if w, err := read(map[string]string{}, false); err != nil || w.CacheRoot != "" {
+		t.Errorf("compile cache set empty: %q, %v; want none", w.CacheRoot, err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		m    map[string]string
+		want string
+	}{
+		{"the worker is the V8 jail's user", map[string]string{"SB_WASM_WORKER_UID": "1000"}, "V8 jail's too"},
+		{"the V8 jail is the worker's user", map[string]string{"SB_ISOLATE_JAIL_UID": "61000"}, "V8 jail's too"},
+		{"sockets in the agent's folder", map[string]string{"SB_ROOTD_WASM_SOCKET_DIR": "/run/sandboxd/wasm"}, "which the agent writes"},
+		{"sockets as the agent's folder", map[string]string{"SB_ROOTD_WASM_SOCKET_DIR": "/var/lib/sandboxd"}, "which the agent writes"},
+		{"a worker uid that is no number", map[string]string{"SB_WASM_WORKER_UID": "aerolvm-wasm"}, "SB_WASM_WORKER_UID"},
+		{"a worker gid that is no number", map[string]string{"SB_WASM_WORKER_GID": "x"}, "SB_WASM_WORKER_GID"},
+		{"a jail uid that is no number", map[string]string{"SB_ISOLATE_JAIL_UID": "x"}, "SB_ISOLATE_JAIL_UID"},
+		{"network rules that are no bool", map[string]string{"SB_ENABLE_NETWORK_RULES": "maybe"}, "SB_ENABLE_NETWORK_RULES"},
+	} {
+		if _, err := read(tc.m, false); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
+		}
+	}
+	// A socket folder beside the agent's, sharing only a name's start, is fine.
+	if _, err := read(map[string]string{"SB_ROOTD_WASM_SOCKET_DIR": "/run/sandboxd-helper"}, false); err != nil {
+		t.Errorf("a folder beside the agent's: %v", err)
+	}
+
+	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
+	if _, err := read(map[string]string{}, false); err == nil || !strings.Contains(err.Error(), "WASM hosts'") {
+		t.Fatalf("no binary of its own: %v", err)
 	}
 }

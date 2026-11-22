@@ -87,73 +87,36 @@ func wireWasmWorkerFence(ctx context.Context, cfg config.Config, c worker.Confin
 // CIDRS and the floor file), and the node ports are the ones guests may
 // still reach on the node's own addresses.
 func workerFenceSpec(cfg config.Config, c worker.Confinement) workerfence.Spec {
-	spec := workerfence.Spec{UID: c.UID, NodePorts: egresspolicy.NodeAllowedPorts()}
+	in := workerfence.NodeInputs{UID: c.UID, NodePorts: egresspolicy.NodeAllowedPorts(), Local: localAddrs()}
 	if port, err := strconv.ParseUint(strings.TrimSpace(os.Getenv("SB_AUDIT_INGEST_PORT")), 10, 16); err == nil && port > 0 {
-		spec.Allow = append(spec.Allow, workerfence.Allow{Proto: "tcp", Prefix: netip.MustParsePrefix("127.0.0.1/32"), PortLo: uint16(port), PortHi: uint16(port), Why: "audit ingest"})
+		in.AuditPort = uint16(port)
 	}
 	if raw, err := os.ReadFile(resolvConfPath); err == nil {
-		for _, ns := range workerfence.Nameservers(raw) {
-			for _, proto := range []string{"udp", "tcp"} {
-				spec.Allow = append(spec.Allow, workerfence.Allow{Proto: proto, Prefix: netip.PrefixFrom(ns, ns.BitLen()), PortLo: 53, PortHi: 53, Why: "name server"})
-			}
-		}
+		in.ResolvConf = raw
 	}
 	var op *operator.Operator
 	if path := strings.TrimSpace(cfg.EgressOperatorFile); path != "" {
 		if loaded, err := operator.Load(path); err == nil {
 			op = loaded
-			spec.Allow = append(spec.Allow, upstreamAllows(op.Upstream())...)
+			if up := op.Upstream(); up != nil {
+				in.Upstream = up.URL
+			}
 		}
 	}
 	// A nil operator's floor is the metadata endpoints and the node's
 	// extra floor; the floor file's ranges are this process's current copy
 	// (wireEgressFloorFile keeps it).
-	spec.Floor = append(op.DenyFloor(), egresspolicy.FileFloor()...)
-	spec.Local = localAddrs()
-	return spec
+	in.Floor = append(op.DenyFloor(), egresspolicy.FileFloor()...)
+	return workerfence.NodeSpec(in)
 }
 
-// localAddrs are the node's own addresses with their prefix lengths, which
-// the fence lists itself (with each subnet's broadcast address) on a
-// kernel without nft fib. A failed read lists none: the fib rules, where
-// the kernel has them, need no list.
-func localAddrs() []netip.Prefix {
-	addrs, err := nodeInterfaceAddrs()
-	if err != nil {
-		return nil
-	}
-	var out []netip.Prefix
-	for _, a := range addrs {
-		if n, ok := a.(*net.IPNet); ok {
-			ip, ok := netip.AddrFromSlice(n.IP)
-			ones, _ := n.Mask.Size()
-			if ok {
-				ip = ip.Unmap()
-				if ip.Is4() && ones > 32 {
-					ones -= 96
-				}
-				out = append(out, netip.PrefixFrom(ip, ones))
-			}
-		}
-	}
-	return out
-}
+// localAddrs are the node's own addresses (workerfence.LocalAddrs).
+func localAddrs() []netip.Prefix { return workerfence.LocalAddrs(nodeInterfaceAddrs) }
 
 // upstreamAllows lets the worker uid reach the operator's upstream proxy.
 func upstreamAllows(up *operator.UpstreamProxy) []workerfence.Allow {
-	if up == nil || up.URL == nil {
+	if up == nil {
 		return nil
 	}
-	port, err := strconv.ParseUint(up.URL.Port(), 10, 16)
-	if err != nil || port == 0 {
-		port = 80
-		if strings.EqualFold(up.URL.Scheme, "https") {
-			port = 443
-		}
-	}
-	var out []workerfence.Allow
-	for _, a := range workerfence.HostAddrs(up.URL.Hostname()) {
-		out = append(out, workerfence.Allow{Proto: "tcp", Prefix: netip.PrefixFrom(a, a.BitLen()), PortLo: uint16(port), PortHi: uint16(port), Why: "upstream proxy"})
-	}
-	return out
+	return workerfence.UpstreamAllows(up.URL)
 }

@@ -55,10 +55,14 @@ func (d *Driver) ensureWorkDir(dir string) error {
 		}
 	}
 	if err == nil {
-		return os.Lchown(dir, d.cfg.Worker.UID, d.cfg.Worker.GID)
+		return d.handToWorker(dir)
 	}
 	if !errors.Is(err, fs.ErrExist) {
 		return err
+	}
+	if d.split() {
+		// sandboxd made it: the worker's group may already have it.
+		return d.handToWorker(dir)
 	}
 	st, err := os.Lstat(dir)
 	if err != nil {
@@ -334,7 +338,7 @@ func (d *Driver) prepareCompileCache(dir string) string {
 		return ""
 	}
 	if d.workerOwns() {
-		if err := os.Chown(dir, d.cfg.Worker.UID, d.cfg.Worker.GID); err != nil {
+		if err := d.handToWorker(dir); err != nil {
 			d.logger.Warn("wasm compile cache not handed to the worker uid; workers compile without it", "dir", dir, "error", err)
 			return ""
 		}

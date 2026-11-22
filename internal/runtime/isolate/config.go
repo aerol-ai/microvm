@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 // Group granularity values, mirrored from internal/config so the driver does
@@ -55,6 +56,10 @@ type Config struct {
 	// EgressPoolSize is the per-group egress-slot pool size (§4): the cap on
 	// concurrently-egressing sandboxes in a group. Zero → pkg/isolate default.
 	EgressPoolSize int
+	// Launcher, when set, realizes every group's jail and runs its workerd
+	// (the root helper, privilege mode split; pkg/isolate JailLauncher):
+	// this sandboxd has no rights to do either. UseJail must be on.
+	Launcher pkgisolate.JailLauncher
 }
 
 // FromDaemonConfig projects the isolate slice of daemon config into driver config.

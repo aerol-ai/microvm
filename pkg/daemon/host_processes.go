@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 )
 
@@ -23,8 +24,13 @@ var ownsPIDNamespace = hostproc.OwnsPIDNamespace
 // pod (SB_HOST_PROCESS_CGROUP_PARENT, by default SB_CONTAINERD_CGROUP_PARENT):
 // on a VM PID 1 is systemd, and in a plain container a restart restarts
 // everything anyway.
+//
+// In privilege mode split the root helper starts these hosts, in the
+// runtime container, so the agent container's end never reaches them; the
+// runtimes the helper does not start yet are refused there anyway
+// (checkPrivilegeMode).
 func checkHostProcessesOutliveAgent(cfg config.Config) error {
-	if cfg.HostProcessCgroupParent == "" || !cfg.RunsHostProcessSandboxes() {
+	if cfg.HostProcessCgroupParent == "" || !cfg.RunsHostProcessSandboxes() || cfg.PrivilegeMode == privmode.Split {
 		return nil
 	}
 	owns, err := ownsPIDNamespace()

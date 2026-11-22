@@ -47,7 +47,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/network/workerfence"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -145,6 +147,14 @@ type Options struct {
 	// Mounts does the external mounts (mounts.go). Nil: the helper's own,
 	// from Config.Mounts; with neither, the helper serves no mount call.
 	Mounts MountManager
+	// HostKernel does the host-process calls' cgroup and process work
+	// (hosts.go). Nil: the kernel's, under Config.Hosts.CgroupParent.
+	HostKernel HostKernel
+	// WorkerFence keeps the WASM worker user's fence (hosts_wasm.go). Nil:
+	// the kernel's nft.
+	WorkerFence workerfence.Backend
+	// hostLaunchers stand in for the kinds' own parts in tests.
+	hostLaunchers map[rootpolicy.HostKind]hostLauncher
 }
 
 // Server is the helper's socket and gRPC server.
@@ -169,6 +179,9 @@ type Server struct {
 	stopSweep func()
 	// mounts serves the external mounts; nil when this helper has none.
 	mounts *mountCalls
+	// hosts serves the host-process calls; nil when the helper serves no
+	// host kind.
+	hosts *hostCalls
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -241,9 +254,10 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.locks, s.stopSweep = locks, func() {}
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
+	s.hosts = newHostCalls(cfg, opts, locks, log)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -345,6 +359,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.files.close()
 		s.fw.close()
 		s.mounts.close()
+		s.hosts.close()
 	})
 }
 
@@ -487,6 +502,9 @@ type helper struct {
 	mc *mountCalls
 	// rc serves platform volume reclaim on NFS; nil without that backend.
 	rc *reclaimCalls
+	// hc serves the host-process calls; nil when this helper serves no
+	// host kind.
+	hc *hostCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -514,7 +532,11 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.rc != nil {
 		served = append(served, rootdpb.FeatureReclaimVolume)
 	}
-	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts()}, nil
+	if h.hc != nil {
+		served = append(served, hostFeatures...)
+	}
+	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
+		Hosts: h.hc.servedKinds()}, nil
 }
 
 // servedParts are the parts of PrepareSandbox and ReleaseSandbox this
@@ -773,6 +795,46 @@ func (h helper) ReclaimVolume(ctx context.Context, req *rootdpb.ReclaimVolumeReq
 // lacks, which is what Version told the agent.
 func noMounts(call string) error {
 	return status.Errorf(codes.Unimplemented, "root helper %s: %s needs a mount user (SB_ROOTD_MOUNT_USER) this node does not have", version.Version, call)
+}
+
+func (h helper) PrepareHost(ctx context.Context, req *rootdpb.PrepareHostRequest) (*rootdpb.PrepareHostResponse, error) {
+	if h.hc == nil {
+		return nil, noHosts(rootdpb.FeaturePrepareHost)
+	}
+	resp, err := h.hc.prepareHost(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_PrepareHost_FullMethodName, resp, err)
+}
+
+func (h helper) SpawnHost(ctx context.Context, req *rootdpb.SpawnHostRequest) (*rootdpb.SpawnHostResponse, error) {
+	if h.hc == nil {
+		return nil, noHosts(rootdpb.FeatureSpawnHost)
+	}
+	resp, err := h.hc.spawnHost(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SpawnHost_FullMethodName, resp, err)
+}
+
+func (h helper) StopHost(ctx context.Context, req *rootdpb.StopHostRequest) (*rootdpb.StopHostResponse, error) {
+	if h.hc == nil {
+		return nil, noHosts(rootdpb.FeatureStopHost)
+	}
+	resp, err := h.hc.stopHost(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_StopHost_FullMethodName, resp, err)
+}
+
+func (h helper) ListHosts(ctx context.Context, req *rootdpb.ListHostsRequest) (*rootdpb.ListHostsResponse, error) {
+	if h.hc == nil {
+		return nil, noHosts(rootdpb.FeatureListHosts)
+	}
+	resp, err := h.hc.listHosts(req)
+	return answer(ctx, h, rootdpb.RootHelper_ListHosts_FullMethodName, resp, err)
+}
+
+func (h helper) SetHostLimits(ctx context.Context, req *rootdpb.SetHostLimitsRequest) (*rootdpb.SetHostLimitsResponse, error) {
+	if h.hc == nil {
+		return nil, noHosts(rootdpb.FeatureSetHostLimits)
+	}
+	resp, err := h.hc.setHostLimits(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SetHostLimits_FullMethodName, resp, err)
 }
 
 // noNetwork answers a network call on a helper with no network

@@ -170,6 +170,7 @@ func (c *confinedFS) OpenFile(p string, flag experimentalsys.Oflag, perm fs.File
 			return nil, experimentalsys.ELOOP
 		}
 	}
+	perm = sharedFileMode(perm)
 	f, err := root.OpenFile(name, toOSOpenFlag(flag), perm)
 	if err != nil {
 		return nil, rootErrno(err)
@@ -226,7 +227,7 @@ func (c *confinedFS) Mkdir(p string, perm fs.FileMode) experimentalsys.Errno {
 	if errno != 0 {
 		return errno
 	}
-	errno = rootErrno(root.Mkdir(rootName(p), perm))
+	errno = rootErrno(root.Mkdir(rootName(p), sharedDirMode(perm)))
 	// Same mapping as wazero's DirFS: a missing parent is ENOENT to WASI.
 	if errno == experimentalsys.ENOTDIR {
 		errno = experimentalsys.ENOENT
@@ -243,6 +244,9 @@ func (c *confinedFS) Chmod(p string, perm fs.FileMode) experimentalsys.Errno {
 	root, errno := c.openRoot()
 	if errno != 0 {
 		return errno
+	}
+	if sharedWithGroup.Load() {
+		perm = sharedFileMode(perm)
 	}
 	return rootErrno(root.Chmod(rootName(p), perm))
 }

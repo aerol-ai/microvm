@@ -3,6 +3,7 @@ package isolate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -56,6 +57,10 @@ type HostConfig struct {
 	// so a sandboxd restart does not stop it. A jailed workerd has its
 	// group's own cgroup instead. Nil: start in place.
 	Cgroup *hostproc.Cgroup
+	// Launcher, when set, realizes the jail and runs workerd (the root
+	// helper, privilege mode split; launcher.go). Jail.Require must be set
+	// with it: the launcher always jails.
+	Launcher JailLauncher
 }
 
 // Host owns one workerd process for an isolate group and the Go-side
@@ -186,6 +191,9 @@ func NewHost(cfg HostConfig) (*Host, error) {
 	if strings.TrimSpace(cfg.RunDir) == "" {
 		return nil, fmt.Errorf("isolate: run dir is required")
 	}
+	if cfg.Launcher != nil && !cfg.Jail.Require {
+		return nil, fmt.Errorf("isolate: a launched group host is always jailed (Jail.Require)")
+	}
 	if cfg.Jail.Require && cfg.Jail.ChrootDir != "" {
 		// Both sides must name the same inodes: workerd binds sockets at
 		// /run/... inside its root, the Go side dials <chroot>/run/... on the
@@ -275,6 +283,9 @@ func (h *Host) LoadedCount() int {
 // the Phase-3 attributed egress server on their unix sockets, spawns workerd,
 // and waits until the control socket answers.
 func (h *Host) Start(ctx context.Context) error {
+	if h.cfg.Launcher != nil {
+		return h.startLaunched(ctx)
+	}
 	// Fail-closed jail gate: if confinement is REQUIRED but this platform can't
 	// realize it (or the spec is incomplete), refuse to spawn rather than run
 	// untrusted tenant JS unconfined while the operator believes it is jailed.
@@ -570,12 +581,18 @@ func (h *Host) Stop() error {
 			<-exited
 		}
 	}
-	if proc != nil {
+	var launchErr error
+	switch {
+	case h.cfg.Launcher != nil:
+		// The launcher kills workerd, waits for it and removes the jail,
+		// whatever started it: this sandboxd, or the one before.
+		launchErr = h.stopLaunched(proc)
+	case proc != nil:
 		_ = proc.Signal(syscall.SIGKILL)
 		<-proc.Done()
 		_ = proc.Close()
 	}
-	err := h.stopServers()
+	err := errors.Join(h.stopServers(), launchErr)
 	if jail != nil {
 		// After the process: the kernel refuses to remove a populated cgroup,
 		// and the run dir inside the chroot holds the sockets we just closed.
@@ -590,6 +607,11 @@ func (h *Host) Stop() error {
 // starts unlimited and takes the claiming tenant's caps here. No-op when the
 // host is not jailed (there is no cgroup to write).
 func (h *Host) ApplyCaps(cpu float64, memMB int, pidsMax int) error {
+	if h.cfg.Launcher != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), launcherCallWait)
+		defer cancel()
+		return h.cfg.Launcher.SetLimits(ctx, h.cfg.GroupKey, Limits{CPU: cpu, MemoryMB: memMB, Pids: pidsMax})
+	}
 	h.mu.RLock()
 	jail := h.jail
 	h.mu.RUnlock()
@@ -617,6 +639,9 @@ func (h *Host) inJail(hostPath string) string {
 func (h *Host) grantJailAccess(paths ...string) error {
 	if !h.cfg.Jail.Require {
 		return nil
+	}
+	if h.cfg.Launcher != nil {
+		return h.shareWithJail(paths...)
 	}
 	for _, p := range paths {
 		if p == "" {

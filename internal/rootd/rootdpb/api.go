@@ -53,6 +53,13 @@ const (
 	FeatureSweepExternalMounts = "SweepExternalMounts"
 	// Platform volume reclaim on NFS (M1 PR 8).
 	FeatureReclaimVolume = "ReclaimVolume"
+
+	// Host processes (M1 PR 9).
+	FeaturePrepareHost   = "PrepareHost"
+	FeatureSpawnHost     = "SpawnHost"
+	FeatureStopHost      = "StopHost"
+	FeatureListHosts     = "ListHosts"
+	FeatureSetHostLimits = "SetHostLimits"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -105,7 +112,27 @@ func Features() []string {
 		FeatureEnsureHostNetwork, FeatureRealizeNetns, FeatureRemoveNetns, FeatureDisableNetnsIPv6, FeatureNetnsAddrs,
 		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox,
 		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort,
-		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume}
+		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume,
+		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits}
+}
+
+// HostKindName is a host kind's name in VersionResponse.hosts, "" for
+// UNSPECIFIED and for a kind this build does not know.
+func HostKindName(k HostKind) string {
+	switch k {
+	case HostKind_HOST_KIND_WORKERD:
+		return "workerd"
+	case HostKind_HOST_KIND_WASM_WORKER:
+		return "wasm_worker"
+	case HostKind_HOST_KIND_WASM_RESIDENT:
+		return "wasm_resident"
+	}
+	return ""
+}
+
+// HostKinds lists every host kind this build knows.
+func HostKinds() []HostKind {
+	return []HostKind{HostKind_HOST_KIND_WORKERD, HostKind_HOST_KIND_WASM_WORKER, HostKind_HOST_KIND_WASM_RESIDENT}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

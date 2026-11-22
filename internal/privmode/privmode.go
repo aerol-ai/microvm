@@ -50,22 +50,28 @@ type Step string
 // The steps split mode does not cover yet, each with the helper calls it
 // waits for (plan §3.5).
 const (
-	StepImageUser     Step = "image_user"
-	StepDiskQuota     Step = "disk_quota"
-	StepHostProcesses Step = "host_processes"
-	StepContainerFile Step = "container_files"
-	StepWarmPool      Step = "warm_pool"
-	StepMoves         Step = "gvisor_moves"
+	StepImageUser       Step = "image_user"
+	StepDiskQuota       Step = "disk_quota"
+	StepWasmCheckpoints Step = "wasm_checkpoints"
+	StepWasmWarmPool    Step = "wasm_warm_pool"
+	StepWasmMounts      Step = "wasm_mounts"
+	StepFirecracker     Step = "firecracker"
+	StepContainerFile   Step = "container_files"
+	StepWarmPool        Step = "warm_pool"
+	StepMoves           Step = "gvisor_moves"
 )
 
 // steps say what each step is, for the operator who meets the error.
 var steps = map[Step]string{
-	StepImageUser:     "reading an image's users from its root filesystem",
-	StepDiskQuota:     "the disk quota on a sandbox's writable layer",
-	StepHostProcesses: "the WASM, V8-isolate and Firecracker runtimes' host processes",
-	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
-	StepWarmPool:      "the containerd warm pool's parked sandboxes",
-	StepMoves:         "gVisor checkpoint moves",
+	StepImageUser:       "reading an image's users from its root filesystem",
+	StepDiskQuota:       "the disk quota on a sandbox's writable layer",
+	StepWasmCheckpoints: "WASM checkpoints, which the worker writes as its own user and sandboxd must take back",
+	StepWasmWarmPool:    "the WASM warm pool's slots (SB_WASM_POOL_ENABLED with SB_WASM_RESIDENT_HOST_ENABLED off)",
+	StepWasmMounts:      "a WASM sandbox's external mounts, which its worker opens through sandboxd, and sandboxd cannot open the root helper's mount points",
+	StepFirecracker:     "the Firecracker runtime's VMs (the jailer, their chroots, TAP devices and NAT)",
+	StepContainerFile:   "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
+	StepWarmPool:        "the containerd warm pool's parked sandboxes",
+	StepMoves:           "gVisor checkpoint moves",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

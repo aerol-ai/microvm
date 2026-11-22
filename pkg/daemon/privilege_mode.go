@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -65,13 +67,60 @@ func checkPrivilegeMode(cfg config.Config) error {
 	if cfg.ContainerdPoolEnabled {
 		gaps = append(gaps, privmode.StepWarmPool)
 	}
-	if cfg.EnableWasm || cfg.EnableIsolate || cfg.EnableFirecracker {
-		gaps = append(gaps, privmode.StepHostProcesses)
+	// V8 isolate groups are the helper's from M1 PR 9 (split_hosts.go): it
+	// builds each group's jail and runs workerd; it jails every group, so
+	// an unjailed one is single mode only.
+	if cfg.EnableIsolate && !cfg.IsolateUseJail {
+		return errors.New("SB_PRIVILEGE_MODE=split runs every V8 isolate group in the root helper's jail: " +
+			"set SB_ISOLATE_USE_JAIL=true, or run this node in privilege mode single")
+	}
+	// WASM workers and resident hosts are the helper's from M1 PR 9 too
+	// (split_hosts.go), shared with sandboxd by the worker user's group.
+	if cfg.EnableWasm {
+		if err := checkSplitWasm(cfg); err != nil {
+			return err
+		}
+		if warmPoolEffectivelyEnabled(cfg) {
+			gaps = append(gaps, privmode.StepWasmWarmPool)
+		}
+	}
+	if cfg.EnableFirecracker {
+		gaps = append(gaps, privmode.StepFirecracker)
 	}
 	if cfg.GvisorCheckpointMoves {
 		gaps = append(gaps, privmode.StepMoves)
 	}
 	return privmode.NotYet("start sandboxd", gaps...)
+}
+
+// agentGroups are this process's supplementary groups; tests stand them in.
+var agentGroups = os.Getgroups
+
+// checkSplitWasm refuses, at start, a split node whose WASM workers the
+// helper could not run as it must: dropped to the worker user, on the
+// engine its own binary has, and sharing files with a sandboxd in the
+// worker user's group.
+func checkSplitWasm(cfg config.Config) error {
+	if !cfg.WasmWorkerDropPrivs {
+		return errors.New("SB_PRIVILEGE_MODE=split runs every WASM worker as the worker user (SB_WASM_WORKER_UID): " +
+			"SB_WASM_WORKER_DROP_PRIVS=false is privilege mode single only")
+	}
+	if eng := strings.ToLower(strings.TrimSpace(cfg.WasmEngine)); eng != "" && eng != "wazero" {
+		return fmt.Errorf("SB_PRIVILEGE_MODE=split runs WASM workers on the root helper's own binary, which has the wazero engine only; "+
+			"SB_WASM_ENGINE=%s is privilege mode single only", cfg.WasmEngine)
+	}
+	if cfg.WasmWorkerUID == os.Getuid() {
+		return fmt.Errorf("SB_WASM_WORKER_UID=%d is sandboxd's own uid: a worker's escape would be sandboxd", cfg.WasmWorkerUID)
+	}
+	groups, err := agentGroups()
+	if err != nil {
+		return fmt.Errorf("privilege mode split: read sandboxd's groups: %w", err)
+	}
+	if !slices.Contains(groups, cfg.WasmWorkerGID) {
+		return fmt.Errorf("SB_PRIVILEGE_MODE=split shares each WASM sandbox's files with its worker by group: "+
+			"sandboxd must be a member of the WASM worker group (SB_WASM_WORKER_GID=%d)", cfg.WasmWorkerGID)
+	}
+	return nil
 }
 
 // mountsOffFor is why this node refuses external storage, or "". In split

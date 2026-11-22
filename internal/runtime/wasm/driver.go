@@ -50,6 +50,9 @@ type Driver struct {
 	// guards it.
 	workerCgroup   *hostproc.Cgroup
 	pendingWorkers map[string]worker.FoundWorker
+	// workerLister lists the running workers in privilege mode split,
+	// where the root helper holds them (SetWorkerLister).
+	workerLister func(context.Context) ([]worker.FoundWorker, error)
 
 	// The shared compile cache (sharedcache.go): precompile is the trusted
 	// compile step and sharedState single-flights it per module digest;
