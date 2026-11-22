@@ -536,15 +536,24 @@ Each is small and stands alone. Together they shrink the root surface now.
       (`sandboxd init` and `join`, `key wrap`, the upgrader's database
       restore). `aerolvm-rootd agent-folders`, as root in the unit
       (`ExecStartPre=+`), gives the agent what root owns there: no link
-      followed, no mount entered, other users' files and hard-linked files
-      left alone. After the first start it only reads. The way back is the
-      installer's, since single runs no helper.
+      followed (one handle per entry, the owner read and changed through
+      it), no mount entered (statx's mount-root mark, or a new device),
+      other users' files and hard-linked files left alone. After the first
+      start it only reads. The way back is the installer's, since single
+      runs no helper: it first removes what the root agent would act on by
+      path at boot and the agent could write (the upgrade records, the
+      runtime folders, every link). The database stays, so switching back
+      trusts what the agent wrote: a node thought broken into is rebuilt.
     - **The upgrader's folder moves out of the agent's.** Beside the
       database the agent could swap a staged binary between its check and
       its install (root runs `sandboxd` in install.sh). Split sets
       `SB_UPGRADE_STATE_DIR` to a folder of root's; `sandboxd upgrade
-      recover` runs as root before sandboxd starts; upgrades over the API
-      are off until the helper's `ApplyUpgrade` exists.
+      recover` runs as root before sandboxd starts, and refuses an upgrade
+      folder inside the agent's; upgrades over the API are off until the
+      helper's `ApplyUpgrade` exists. Boot recovery takes no path from a
+      record: the database is the node's own, a backup must be the upgrade
+      folder's own, and a record naming files outside the node's layout is
+      left alone. A switch of mode removes single mode's upgrade folder.
     - **The node upgrade checks the helper with the supervisor's code**
       (`internal/rootswap`): signed manifest, this release, not older,
       the checked copy installed. release.yml signs in a job of its own,
