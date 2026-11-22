@@ -144,3 +144,44 @@ func TestReclaimRejectsUnknownAndEmpty(t *testing.T) {
 		t.Fatal("expected empty-source error")
 	}
 }
+
+// A failed unmount leaves the scratch folder as the export: the folder is
+// removed only when empty, never walked, so nothing on the export goes.
+// Before, a RemoveAll deleted what the export held there.
+func TestReclaimNFSFailedUnmountWalksNothing(t *testing.T) {
+	root := t.TempDir()
+	var mountedAt string
+	runner := func(_ context.Context, _ []string, name string, args ...string) error {
+		if name == "mount" {
+			mountedAt = args[len(args)-1]
+			return nil
+		}
+		// What lands on the export after the emptying, while the unmount
+		// fails: it must survive.
+		if err := os.WriteFile(filepath.Join(mountedAt, "late.txt"), []byte("x"), 0o644); err != nil {
+			return err
+		}
+		return errors.New("umount: target is busy")
+	}
+	r := NewReclaimer(Backend{Kind: BackendNFS}, root, runner)
+	if err := r.Reclaim(context.Background(), BackendNFS, "h:/export/t-a/data"); err == nil || !strings.Contains(err.Error(), "umount") {
+		t.Fatalf("Reclaim = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mountedAt, "late.txt")); err != nil {
+		t.Fatalf("the export's file went with the scratch folder: %v", err)
+	}
+}
+
+// WithEmpty: the root helper's reclaimer empties with its own function.
+func TestReclaimNFSWithEmpty(t *testing.T) {
+	var emptied string
+	r := NewReclaimer(Backend{Kind: BackendNFS}, t.TempDir(), recordingRunner(&[]recordedCmd{}, nil)).
+		WithEmpty(func(dir string) error { emptied = dir; return nil })
+	if err := r.Reclaim(context.Background(), BackendNFS, "h:/e/t/v"); err != nil || emptied == "" {
+		t.Fatalf("Reclaim = %v, emptied %q", err, emptied)
+	}
+	bare := &Reclaimer{backend: Backend{Kind: BackendNFS}, mountRoot: t.TempDir(), run: recordingRunner(&[]recordedCmd{}, nil)}
+	if err := bare.Reclaim(context.Background(), BackendNFS, "h:/e/t/v"); err != nil {
+		t.Fatalf("a reclaimer with no emptier: %v", err)
+	}
+}

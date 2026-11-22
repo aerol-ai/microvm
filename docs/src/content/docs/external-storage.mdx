@@ -132,7 +132,13 @@ Files your code writes to `/workspace` go straight to the bucket, and stay there
 | `sshfs` | A folder on any server you can reach with SSH | `user@host:/path` | `private_key_pem` (required) |
 | `rclone` | Remote storage that rclone supports, such as Google Drive or Azure. See [which rclone storage is accepted](#which-rclone-storage-is-accepted). | `remote:path`, where `remote` is a section of `rclone_conf`, or `:backend:path` | `rclone_conf` (the text of an `rclone.conf` file) |
 
-With no S3 credentials, the server uses its own AWS access, such as a cloud machine role, if it has one.
+### Mounts that would use the server's own cloud login
+
+Give each mount its own keys. Some settings make the mount program sign in with the server's own cloud login instead, such as the cloud machine role of the server it runs on. The server limits them:
+
+- **rclone settings that use the server's login are refused.** These are `env_auth`, `use_msi` and `use_az` (unless set to `false`), the `msi_*` settings (`msi_object_id`, `msi_client_id`, `msi_mi_res_id` and `msi_endpoint`), and Oracle's `provider` values `env_auth`, `instance_principal_auth`, `workload_identity_auth` and `resource_principal_auth`. This holds in `rclone_conf` and in `source`, in both privilege modes. Put the storage's own keys in `rclone_conf` instead.
+- **An S3 mount with no credentials depends on the privilege mode.** In the default mode (`single`), it uses the server's own AWS access, such as a cloud machine role, if it has one. This is the same as before. In privilege mode `split` (`SB_PRIVILEGE_MODE=split`), it is refused. Give it `access_key_id` and `secret_access_key`. For a public bucket, add `--no-sign-request` to `extra_args` instead.
+- **The operator can allow both.** Set `SB_MOUNTS_ALLOW_NODE_CREDENTIALS=true` and restart. It is `false` by default. `sandboxd` reads it. In privilege mode `split`, the root helper reads it from its own settings too, so set it for both. Turn it on only if everyone with an API token may use the server's cloud login.
 
 ## Mount options
 
@@ -184,7 +190,7 @@ In `extra_args`, write a flag as `--flag value` or `--flag=value`. Short forms s
 - **Every NFS mount gets `nosuid,nodev`,** whatever `opts` says. A program on the share cannot gain extra rights, and a device file on it does not work.
 - **`extra_args` is for S3 mounts only, and `opts` for NFS mounts only.** The server refuses them on other types. SSH and rclone mounts take no extra flags.
 - **The same rules apply when a sandbox starts again.** A sandbox made before a flag was refused does not start with it: the start fails with an error that names the mount and the flag. Create the sandbox again without that flag.
-- **A sandbox that is running when the server restarts keeps its mount, if the refused flag is harmless while the mount runs.** Those flags are `--cache`, `--max-cache-size`, `--debug`, `-d`, `--debug-crt`, `--log-metrics`, `--no-log` and `--auto-unmount` for S3, and `defaults`, `suid`, `dev`, `bg`, `fg`, `fsc`, `auto`, `noauto` and `nouser` for NFS. The mount runs on as it was, but nothing restarts it if it stops, and the sandbox's next start fails as above. Any other refused flag, and any refused rclone setting, makes the server unmount the storage right away. That sandbox keeps running without it. Either way the server logs it and writes an audit record (`mounts.refused_kept` or `mounts.refused_removed`) that names the sandbox and the flag.
+- **A sandbox that is running when the server restarts keeps its mount, if the refused flag is harmless while the mount runs.** Those flags are `--cache`, `--max-cache-size`, `--debug`, `-d`, `--debug-crt`, `--log-metrics`, `--no-log` and `--auto-unmount` for S3, and `defaults`, `suid`, `dev`, `bg`, `fg`, `fsc`, `auto`, `noauto` and `nouser` for NFS. The mount runs on as it was, but nothing restarts it if it stops, and the sandbox's next start fails as above. Any other refused flag, any refused rclone setting, and a `--cache` folder that is not a full path, is `/`, or is in one of the server's system folders (such as `/etc`, `/usr`, `/var/lib` or `/run`) makes the server unmount the storage right away. That sandbox keeps running without it. Either way the server logs it and writes an audit record (`mounts.refused_kept` or `mounts.refused_removed`) that names the sandbox and the flag.
 
 ### Which rclone storage is accepted
 

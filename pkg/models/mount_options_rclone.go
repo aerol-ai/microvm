@@ -58,13 +58,49 @@ func rcloneOptionRefusal(name string) string {
 	return ""
 }
 
+// rcloneNodeCredential reports whether an option makes rclone take the
+// node's own cloud identity: from the environment rclone runs in or from
+// the instance metadata service (the node's IAM role, managed identity or
+// instance principal), or the node's own Azure CLI login. With such an
+// option a tenant's mount acts as the node. A false value of a switch
+// (env_auth = false, which rclone config writes by default) takes nothing.
+// Allowed only by the operator (MountToolPolicy.NodeCredentials).
+func rcloneNodeCredential(name, value string, hasValue bool) bool {
+	n := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "-", "_")
+	v := strings.ToLower(strings.Trim(strings.TrimSpace(value), `"'`))
+	switch n {
+	case "env_auth", "use_msi", "use_az":
+		return !hasValue || !slices.Contains([]string{"false", "f", "0", "no", "off", ""}, v)
+	case "msi_object_id", "msi_client_id", "msi_mi_res_id", "msi_endpoint":
+		// Which managed identity of the node's to take.
+		return hasValue && v != ""
+	case "provider":
+		// oracleobjectstorage's identity sources; every other backend's
+		// provider is a vendor name.
+		return slices.Contains([]string{"env_auth", "instance_principal_auth", "workload_identity_auth", "resource_principal_auth"}, v)
+	}
+	return false
+}
+
+// rcloneNodeCredentialError refuses one, naming where and the setting.
+func rcloneNodeCredentialError(where, name string) error {
+	return fmt.Errorf("%s %q makes rclone use this node's own cloud credentials (its environment, instance metadata or managed identity); "+
+		"give the mount its own credentials, or have the operator allow node credentials (SB_MOUNTS_ALLOW_NODE_CREDENTIALS)", where, name)
+}
+
 // rcloneRemote is the remote part of rclone's remote:path as rclone reads
 // it: a configured remote's name, or a backend made on the fly
 // (":backend"), then ",name=value" overrides of its options.
 type rcloneRemote struct {
 	name     string
 	onTheFly bool
-	params   []string // override names; values are never needed
+	params   []rcloneParam
+}
+
+// rcloneParam is one ",name=value" override.
+type rcloneParam struct {
+	name, value string
+	hasValue    bool
 }
 
 // parseRcloneRemote reads the remote part of s. ok is false when s has
@@ -109,11 +145,11 @@ scan:
 		return out, false
 	}
 	for _, p := range parts[1:] {
-		name, _, _ := strings.Cut(p, "=")
+		name, value, hasValue := strings.Cut(p, "=")
 		if strings.TrimSpace(name) == "" {
 			return out, false
 		}
-		out.params = append(out.params, name)
+		out.params = append(out.params, rcloneParam{name: name, value: value, hasValue: hasValue})
 	}
 	return out, true
 }
@@ -201,7 +237,7 @@ func rcloneBackendError(where, backend string) error {
 
 // validateRclone holds an rclone mount's source and every section of its
 // rclone_conf to the rules above.
-func validateRclone(source, conf string) error {
+func validateRclone(source, conf string, p MountToolPolicy) error {
 	remote, ok := parseRcloneRemote(source)
 	if !ok {
 		return errors.New("rclone source must look like remote:path, with remote a section of credentials.rclone_conf, or :backend:path")
@@ -217,11 +253,11 @@ func validateRclone(source, conf string) error {
 	} else if !slices.ContainsFunc(sections, func(s rcloneSection) bool { return s.name == remote.name }) {
 		return fmt.Errorf("rclone source remote %q is not a section of credentials.rclone_conf", remote.name)
 	}
-	if err := checkRcloneParams("rclone source", remote.params); err != nil {
+	if err := checkRcloneParams("rclone source", remote.params, p); err != nil {
 		return err
 	}
 	for _, sec := range sections {
-		if err := checkRcloneSection(sec, sections); err != nil {
+		if err := checkRcloneSection(sec, sections, p); err != nil {
 			return err
 		}
 	}
@@ -231,20 +267,23 @@ func validateRclone(source, conf string) error {
 // checkRcloneParams refuses connection-string overrides. type, remote and
 // upstreams are refused outright there: they would swap the backend, or
 // the remote a wrapper wraps, for one this check never saw.
-func checkRcloneParams(where string, params []string) error {
+func checkRcloneParams(where string, params []rcloneParam, policy MountToolPolicy) error {
 	for _, p := range params {
-		n := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(p)), "-", "_")
+		n := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(p.name)), "-", "_")
 		if n == "type" || n == "remote" || n == "upstreams" {
-			return fmt.Errorf("%s parameter %q is not allowed: set it in credentials.rclone_conf instead", where, p)
+			return fmt.Errorf("%s parameter %q is not allowed: set it in credentials.rclone_conf instead", where, p.name)
 		}
-		if reason := rcloneOptionRefusal(p); reason != "" {
-			return fmt.Errorf("%s parameter %q is not allowed: it %s", where, p, reason)
+		if reason := rcloneOptionRefusal(p.name); reason != "" {
+			return fmt.Errorf("%s parameter %q is not allowed: it %s", where, p.name, reason)
+		}
+		if !policy.NodeCredentials && rcloneNodeCredential(p.name, p.value, p.hasValue) {
+			return rcloneNodeCredentialError(where+" parameter", p.name)
 		}
 	}
 	return nil
 }
 
-func checkRcloneSection(sec rcloneSection, all []rcloneSection) error {
+func checkRcloneSection(sec rcloneSection, all []rcloneSection, p MountToolPolicy) error {
 	where := fmt.Sprintf("credentials.rclone_conf section %q", sec.name)
 	backend := strings.ToLower(strings.TrimSpace(sec.options["type"]))
 	switch {
@@ -263,7 +302,7 @@ func checkRcloneSection(sec rcloneSection, all []rcloneSection) error {
 		} else if !slices.ContainsFunc(all, func(s rcloneSection) bool { return s.name == wrapped.name }) {
 			return fmt.Errorf("%s wraps remote %q, which is not a section of credentials.rclone_conf", where, wrapped.name)
 		}
-		if err := checkRcloneParams(where+" remote", wrapped.params); err != nil {
+		if err := checkRcloneParams(where+" remote", wrapped.params, p); err != nil {
 			return err
 		}
 	default:
@@ -272,6 +311,9 @@ func checkRcloneSection(sec rcloneSection, all []rcloneSection) error {
 	for _, key := range sec.keys {
 		if reason := rcloneOptionRefusal(key); reason != "" {
 			return fmt.Errorf("%s option %q is not allowed: it %s", where, key, reason)
+		}
+		if !p.NodeCredentials && rcloneNodeCredential(key, sec.options[key], true) {
+			return rcloneNodeCredentialError(where+" option", key)
 		}
 	}
 	return nil

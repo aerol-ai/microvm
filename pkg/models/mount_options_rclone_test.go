@@ -1,6 +1,7 @@
 package models
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -12,7 +13,8 @@ import (
 // rclone_conf section) are held to an allow list of remote-storage backends
 // and a refusal list of options.
 func TestValidateToolOptionsRclone(t *testing.T) {
-	const s3conf = "[remote]\ntype = s3\nprovider = AWS\nenv_auth = true\n"
+	// env_auth = false is what rclone config writes by default.
+	const s3conf = "[remote]\ntype = s3\nprovider = AWS\nenv_auth = false\naccess_key_id = AK\nsecret_access_key = SK\n"
 	rc := func(source, conf string) MountSpec {
 		m := MountSpec{Type: MountTypeRclone, Source: source, Target: "/d"}
 		if conf != "" {
@@ -27,7 +29,7 @@ func TestValidateToolOptionsRclone(t *testing.T) {
 	}{
 		{"configured s3 remote", rc("remote:bucket/prefix", s3conf)},
 		{"remote override", rc("remote,region=eu-west-1:bucket", s3conf)},
-		{"on the fly s3", rc(":s3,provider=AWS,env_auth=true:bucket", "")},
+		{"on the fly s3", rc(":s3,provider=AWS,env_auth=false:bucket", "")},
 		{"on the fly gcs prefix", rc(":gcs:bucket", "")},
 		{"quoted override value", rc(`remote,endpoint="https://s3.example:9000":bucket`, s3conf)},
 		{"sftp with inline key", rc("box:data", "[box]\ntype = sftp\nhost = files.example\nuser = me\nkey_pem = -----BEGIN KEY-----\n")},
@@ -36,7 +38,7 @@ func TestValidateToolOptionsRclone(t *testing.T) {
 		{"colon separator and comments", rc("remote:b", "# made by rclone config\n; another comment\n[remote]\ntype: s3\n\nregion: us-east-1\n")},
 		{"crypt over a section", rc("secret:", s3conf+"[secret]\ntype = crypt\nremote = remote:bucket/enc\npassword = obscured\n")},
 		{"alias chain", rc("a:", s3conf+"[b]\ntype = crypt\nremote = remote:x\n[a]\ntype = alias\nremote = b:\n")},
-		{"wrapper over on the fly backend", rc("c:", "[c]\ntype = chunker\nremote = :s3,env_auth=true:bucket\n")},
+		{"wrapper over on the fly backend", rc("c:", "[c]\ntype = chunker\nremote = :s3,provider=Minio:bucket\n")},
 		{"unused second section", rc("remote:b", s3conf+"[web]\ntype = webdav\nurl = https://dav.example\n")},
 	}
 	for _, tc := range accepted {
@@ -134,19 +136,19 @@ func TestValidateRcloneSourceShape(t *testing.T) {
 		if err := m.Validate(""); err == nil || !strings.Contains(err.Error(), "rclone source must be a configured remote") {
 			t.Errorf("Validate(%q) = %v, want the local-path refusal", src, err)
 		}
-		if err := validateRclone(src, "[remote]\ntype = s3\n"); err == nil || !strings.Contains(err.Error(), "rclone source must look like remote:path") {
+		if err := validateRclone(src, "[remote]\ntype = s3\n", MountToolPolicy{}); err == nil || !strings.Contains(err.Error(), "rclone source must look like remote:path") {
 			t.Errorf("validateRclone(%q) = %v", src, err)
 		}
 	}
 	for src, want := range map[string]rcloneRemote{
 		"remote:path":                   {name: "remote"},
-		":s3,provider=AWS:bucket":       {name: "s3", onTheFly: true, params: []string{"provider"}},
-		`r,a="x:y,z",b='q''s':p`:        {name: "r", params: []string{"a", "b"}},
-		"r,flag:p":                      {name: "r", params: []string{"flag"}},
+		":s3,provider=AWS:bucket":       {name: "s3", onTheFly: true, params: []rcloneParam{{"provider", "AWS", true}}},
+		`r,a="x:y,z",b='q''s':p`:        {name: "r", params: []rcloneParam{{"a", `"x:y,z"`, true}, {"b", `'q''s'`, true}}},
+		"r,flag:p":                      {name: "r", params: []rcloneParam{{"flag", "", false}}},
 		"  name.with+at@-dash_1:x/y:z ": {name: "name.with+at@-dash_1"},
 	} {
 		got, ok := parseRcloneRemote(src)
-		if !ok || got.name != want.name || got.onTheFly != want.onTheFly || strings.Join(got.params, ",") != strings.Join(want.params, ",") {
+		if !ok || got.name != want.name || got.onTheFly != want.onTheFly || !slices.Equal(got.params, want.params) {
 			t.Errorf("parseRcloneRemote(%q) = %+v %v, want %+v", src, got, ok, want)
 		}
 	}
@@ -172,5 +174,78 @@ func TestRcloneListsLeaveOutHostBackends(t *testing.T) {
 		if want == "" && got != "" || want != "" && !strings.Contains(got, want) {
 			t.Errorf("rcloneOptionRefusal(%q) = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// TestRcloneNodeCredentials: an option that makes rclone take the node's
+// own cloud identity (its environment, instance metadata, managed identity
+// or Azure CLI login) is refused in rclone_conf and in the source, unless
+// the operator allows node credentials. On the base these passed: a
+// tenant's mount could act as the node's IAM role.
+func TestRcloneNodeCredentials(t *testing.T) {
+	rc := func(source, conf string) MountSpec {
+		m := MountSpec{Type: MountTypeRclone, Source: source, Target: "/d"}
+		if conf != "" {
+			m.Credentials = map[string]string{"rclone_conf": conf}
+		}
+		return m
+	}
+	nodeCreds := []struct {
+		name string
+		m    MountSpec
+		want string
+	}{
+		{"s3 env_auth", rc("r:b", "[r]\ntype = s3\nprovider = AWS\nenv_auth = true\n"), `option "env_auth"`},
+		{"s3 env_auth with no value", rc("r:b", "[r]\ntype = s3\nenv_auth\n"), "is not key = value"},
+		{"gcs env_auth", rc("g:b", "[g]\ntype = gcs\nenv_auth = 1\n"), `option "env_auth"`},
+		{"azure managed identity", rc("a:c", "[a]\ntype = azureblob\naccount = acct\nuse_msi = true\n"), `option "use_msi"`},
+		{"azure managed identity by id", rc("a:c", "[a]\ntype = azureblob\nmsi_client_id = 0000\n"), `option "msi_client_id"`},
+		{"azure cli login", rc("a:c", "[a]\ntype = azureblob\naccount = acct\nuse_az = true\n"), `option "use_az"`},
+		{"oracle instance principal", rc("o:b", "[o]\ntype = oracleobjectstorage\nprovider = instance_principal_auth\n"), `option "provider"`},
+		{"swift environment", rc("s:c", "[s]\ntype = swift\nenv_auth = true\n"), `option "env_auth"`},
+		{"on the fly env_auth", rc(":s3,provider=AWS,env_auth=true:bucket", ""), `parameter "env_auth"`},
+		{"on the fly env_auth, no value", rc(":s3,env_auth:bucket", ""), `parameter "env_auth"`},
+		{"override on a configured remote", rc("r,env_auth=true:b", "[r]\ntype = s3\n"), `parameter "env_auth"`},
+		{"wrapper over an on the fly env_auth", rc("c:", "[c]\ntype = chunker\nremote = :s3,env_auth='true':bucket\n"), `remote parameter "env_auth"`},
+	}
+	for _, tc := range nodeCreds {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.m.ValidateToolOptions()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateToolOptions = %v, want %q", err, tc.want)
+			}
+			if strings.Contains(tc.want, "key = value") {
+				return
+			}
+			if !strings.Contains(err.Error(), "SB_MOUNTS_ALLOW_NODE_CREDENTIALS") {
+				t.Fatalf("the refusal does not name the setting: %v", err)
+			}
+			// A running mount is torn down too: the running tool keeps
+			// acting as the node.
+			if err := tc.m.ValidateRunningToolOptions(); err == nil {
+				t.Fatal("a running mount kept the node's identity")
+			}
+			// The operator's setting allows it.
+			allowed := MountToolPolicy{NodeCredentials: true}
+			if err := tc.m.ValidateToolOptionsFor(allowed); err != nil {
+				t.Fatalf("allowed by the operator: %v", err)
+			}
+			if err := tc.m.ValidateRunningToolOptionsFor(allowed); err != nil {
+				t.Fatalf("running, allowed by the operator: %v", err)
+			}
+		})
+	}
+	// A switch set off takes nothing from the node.
+	for _, conf := range []string{
+		"[r]\ntype = s3\nenv_auth = false\n", "[r]\ntype = s3\nenv_auth = 0\n", "[r]\ntype = azureblob\nuse_msi = False\n",
+		"[r]\ntype = s3\nprovider = Minio\n", "[r]\ntype = azureblob\nmsi_client_id =\n",
+	} {
+		m := rc("r:b", conf)
+		if err := m.ValidateToolOptions(); err != nil {
+			t.Errorf("%q: %v", conf, err)
+		}
+	}
+	if m := rc(":s3,env_auth=false:bucket", ""); m.ValidateToolOptions() != nil {
+		t.Errorf("on the fly env_auth=false: %v", m.ValidateToolOptions())
 	}
 }

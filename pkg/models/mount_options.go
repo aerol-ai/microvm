@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 	"unicode"
@@ -32,13 +33,14 @@ import (
 type mountArgKind int
 
 const (
-	mountArgNone  mountArgKind = iota // a bare flag: --allow-delete, nolock
-	mountArgUint                      // decimal digits: --uid 1000, timeo=600
-	mountArgOctal                     // a file mode: --dir-mode 0755
-	mountArgEnum                      // one of a fixed list of words
-	mountArgToken                     // a plain name: a region, a KMS key ARN
-	mountArgURL                       // an http or https URL
-	mountArgWord                      // any word not starting with -: only on the kept lists
+	mountArgNone      mountArgKind = iota // a bare flag: --allow-delete, nolock
+	mountArgUint                          // decimal digits: --uid 1000, timeo=600
+	mountArgOctal                         // a file mode: --dir-mode 0755
+	mountArgEnum                          // one of a fixed list of words
+	mountArgToken                         // a plain name: a region, a KMS key ARN
+	mountArgURL                           // an http or https URL
+	mountArgWord                          // any word not starting with -: only on the kept lists
+	mountArgKeptCache                     // a kept --cache folder: see mountS3KeptFlags
 )
 
 // mountArg says what value one allowed flag takes. For mountArgUint, words
@@ -161,10 +163,25 @@ var mountNFSOptions = func() map[string]mountArg {
 // ssh on every reconnect.
 
 // mountS3KeptFlags may stay in a running mount-s3's extra_args.
+//
+// --cache is kept, though it names a host folder the running tool writes
+// to, because of how such a spec came to be and what keeping it does.
+// Raw mounts have been operator-only from the start (ErrMountOperatorOnly),
+// so the folder was the operator's choice, made before the allow lists
+// existed. mount-s3 writes only inside a folder it makes under that one,
+// with names it picks, and removes it when it exits; the tool is already
+// running, so keeping it starts no new writer, while tearing it down
+// breaks the sandbox's storage; and the sandbox's next start is refused.
+// What keeping cannot excuse is a folder where any write is a harm: one of
+// the node's system or AerolVM folders, or one that is not a clean
+// absolute path. Those are refused here too (mountArgKeptCache), and the
+// mount is torn down at the restart. In privilege mode split no spec keeps
+// it at all: the root helper's tools run as a user of their own, and the
+// helper keeps only what this list allows.
 var mountS3KeptFlags = map[string]mountArg{
 	// mount-s3 keeps its block cache in a folder it makes for itself under
 	// this one, with names it chooses.
-	"--cache":          {kind: mountArgWord},
+	"--cache":          {kind: mountArgKeptCache},
 	"--max-cache-size": {kind: mountArgUint},
 	// How much it logs. With no --log-directory (refused, and not kept) the
 	// output is the helper log sandboxd keeps and trims.
@@ -239,7 +256,30 @@ const mountOptionsDocs = `see "Which flags are accepted" in the external storage
 // mounts are the operator's, checked once at daemon start instead
 // (config.PlatformVolumesConfig.Validate).
 func (m *MountSpec) ValidateToolOptions() error {
-	return m.validateToolOptions(false)
+	return m.validateToolOptions(false, MountToolPolicy{})
+}
+
+// MountToolPolicy is the operator's settings the allow lists read. The
+// zero value is the default: the strictest.
+type MountToolPolicy struct {
+	// NodeCredentials lets a mount use the node's own cloud identity
+	// (SB_MOUNTS_ALLOW_NODE_CREDENTIALS): rclone's env_auth, use_msi and
+	// use_az, an Oracle instance principal (rcloneNodeCredential). Off, a
+	// mount reaches storage only with the credentials its spec carries, so
+	// a tenant's mount can never act as the node's IAM role.
+	NodeCredentials bool
+}
+
+// ValidateToolOptionsFor is ValidateToolOptions under the operator's
+// settings.
+func (m *MountSpec) ValidateToolOptionsFor(p MountToolPolicy) error {
+	return m.validateToolOptions(false, p)
+}
+
+// ValidateRunningToolOptionsFor is ValidateRunningToolOptions under the
+// operator's settings.
+func (m *MountSpec) ValidateRunningToolOptionsFor(p MountToolPolicy) error {
+	return m.validateToolOptions(true, p)
 }
 
 // ValidateRunningToolOptions is the check a mount gets that is already
@@ -250,10 +290,10 @@ func (m *MountSpec) ValidateToolOptions() error {
 // that may not, and the mount is torn down. extra_args and opts on a type
 // whose tool does not read them pass: they never reached a tool.
 func (m *MountSpec) ValidateRunningToolOptions() error {
-	return m.validateToolOptions(true)
+	return m.validateToolOptions(true, MountToolPolicy{})
 }
 
-func (m *MountSpec) validateToolOptions(running bool) error {
+func (m *MountSpec) validateToolOptions(running bool, p MountToolPolicy) error {
 	if m == nil {
 		return errors.New("mount is nil")
 	}
@@ -289,7 +329,7 @@ func (m *MountSpec) validateToolOptions(running bool) error {
 		}
 	}
 	if m.Type == MountTypeRclone {
-		return validateRclone(m.Source, m.Credentials["rclone_conf"])
+		return validateRclone(m.Source, m.Credentials["rclone_conf"], p)
 	}
 	return nil
 }
@@ -406,9 +446,32 @@ func (a mountArg) check(v string) string {
 			return ""
 		}
 		return "takes a value that does not start with -"
+	case mountArgKeptCache:
+		return keptCacheRefusal(v)
 	default:
 		return "takes no value"
 	}
+}
+
+// keptCacheSystemFolders are the node's own folders: a cache folder in one
+// of them, or one of them itself, is a write where any write may harm the
+// node (its configuration, its programs, its runtime state, sandboxd's,
+// containerd's and the kubelet's data under /var/lib, its logs).
+var keptCacheSystemFolders = []string{"/proc", "/sys", "/dev", "/etc", "/boot", "/usr", "/bin", "/sbin", "/lib", "/lib32",
+	"/lib64", "/run", "/var/run", "/root", "/var/lib", "/var/log"}
+
+// keptCacheRefusal says why v may not stay a running mount-s3's --cache
+// folder, or "" when it may (mountS3KeptFlags).
+func keptCacheRefusal(v string) string {
+	if v == "" || !path.IsAbs(v) || path.Clean(v) != v || v == "/" || strings.ContainsFunc(v, unicode.IsControl) {
+		return "takes a clean absolute folder other than /"
+	}
+	for _, sys := range keptCacheSystemFolders {
+		if v == sys || strings.HasPrefix(v, sys+"/") {
+			return "names a folder of the node's own system (" + sys + ")"
+		}
+	}
+	return ""
 }
 
 func isASCIIDigits(s string) bool {

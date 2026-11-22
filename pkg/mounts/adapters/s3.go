@@ -80,6 +80,12 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	}, nil
 }
 
+// S3StaticCredentials reports whether an s3 mount's credentials carry
+// static keys; without them mount-s3 takes the credentials of wherever it
+// runs (the environment, the instance metadata), which in privilege mode
+// split is the node's own identity (internal/rootpolicy CheckExternalMount).
+func S3StaticCredentials(creds map[string]string) bool { return hasS3Credentials(creds) }
+
 // hasS3Credentials reports whether the spec carries static keys. An access key
 // alone (or with a secret) means the operator wants the sandbox profile; an
 // empty map means fall back to the ambient credential chain.

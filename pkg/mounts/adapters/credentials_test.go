@@ -28,3 +28,22 @@ func TestCredentialKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestS3StaticCredentials: an access key id or a secret means the mount's
+// own profile; a session token alone, or blanks, is no key.
+func TestS3StaticCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		creds map[string]string
+		want  bool
+	}{
+		{map[string]string{"access_key_id": "a"}, true},
+		{map[string]string{"secret_access_key": "s"}, true},
+		{map[string]string{"session_token": "t"}, false},
+		{map[string]string{"access_key_id": " "}, false},
+		{nil, false},
+	} {
+		if got := S3StaticCredentials(tc.creds); got != tc.want {
+			t.Errorf("%v: %v", tc.creds, got)
+		}
+	}
+}

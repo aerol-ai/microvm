@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
 // Privilege mode (internal/privmode, plans/security-gaps-m1-m4.md D5, D22).
@@ -103,7 +104,7 @@ func newMountManager(cfg config.Config, logger *slog.Logger, off string) (*mount
 		return m, func(*rootclient.Client) {}, err
 	}
 	var helper atomic.Pointer[rootclient.Client]
-	m, err := mounts.NewRemote(logger, rootclient.Mounts{Client: helper.Load}, off)
+	m, err := mounts.NewRemote(logger, rootclient.Mounts{Client: helper.Load, Policy: cfg.MountToolPolicy()}, off)
 	return m, func(c *rootclient.Client) { helper.Store(c) }, err
 }
 
@@ -354,6 +355,34 @@ func buildKitBuilderFor(cfg config.Config, driver *cntr.Driver, logger *slog.Log
 		build = build.WithArchiveImport(driver, cfg.ContainerdBuildMaxImageBytes)
 	}
 	return build
+}
+
+// volumeHelper is the helper's platform volume reclaim (*rootclient.Client).
+type volumeHelper interface {
+	ReclaimVolume(ctx context.Context, source string) error
+}
+
+// volumeReclaimerFor is the platform volume reclaimer: sandboxd's own in
+// single mode. In split mode an NFS volume's files are the helper's to
+// delete (a mount and a delete as root, of the helper's own export), and an
+// S3 one's stay sandboxd's: the aws CLI needs no rights.
+func volumeReclaimerFor(cfg config.Config, own service.VolumeReclaimer, helper *rootclient.Client) service.VolumeReclaimer {
+	if cfg.PrivilegeMode != privmode.Split || helper == nil {
+		return own
+	}
+	return splitReclaimer{own: own, helper: helper}
+}
+
+type splitReclaimer struct {
+	own    service.VolumeReclaimer
+	helper volumeHelper
+}
+
+func (r splitReclaimer) Reclaim(ctx context.Context, kind, source string) error {
+	if kind == volumes.BackendNFS {
+		return r.helper.ReclaimVolume(ctx, source)
+	}
+	return r.own.Reclaim(ctx, kind, source)
 }
 
 // imageBuilderFor is the image builder the API gets on the containerd

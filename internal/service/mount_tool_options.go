@@ -58,7 +58,7 @@ func (s *Service) runningMounts() runningMountSet {
 func (s *Service) checkCallerMountTools(ctx context.Context, sandboxID string, specs []models.MountSpec, platform []models.VolumeAttachment) error {
 	isPlatform := s.platformMountTest(ctx, sandboxID, platform)
 	for i := range specs {
-		err := specs[i].ValidateToolOptions()
+		err := specs[i].ValidateToolOptionsFor(s.cfg.MountToolPolicy())
 		if err == nil {
 			continue
 		}
@@ -182,7 +182,7 @@ func (s *Service) reestablishRunningMounts(ctx context.Context, id string, specs
 func (s *Service) runningMountRefusals(ctx context.Context, id string, specs []models.MountSpec) (refused, unsafe []string, err error) {
 	isPlatform := s.platformMountTest(ctx, id, nil)
 	for i := range specs {
-		listErr := specs[i].ValidateToolOptions()
+		listErr := specs[i].ValidateToolOptionsFor(s.cfg.MountToolPolicy())
 		if listErr == nil {
 			continue
 		}
@@ -194,7 +194,7 @@ func (s *Service) runningMountRefusals(ctx context.Context, id string, specs []m
 			continue
 		}
 		refused = append(refused, fmt.Sprintf("mount %d: %v", i, listErr))
-		if runErr := specs[i].ValidateRunningToolOptions(); runErr != nil {
+		if runErr := specs[i].ValidateRunningToolOptionsFor(s.cfg.MountToolPolicy()); runErr != nil {
 			unsafe = append(unsafe, fmt.Sprintf("mount %d: %v", i, runErr))
 		}
 	}

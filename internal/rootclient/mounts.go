@@ -39,11 +39,21 @@ func (c *Client) SweepExternalMounts(ctx context.Context, keep []string) error {
 	return err
 }
 
+// ReclaimVolume asks the helper to delete a deleted platform volume's files
+// on its NFS export.
+func (c *Client) ReclaimVolume(ctx context.Context, source string) error {
+	_, err := call(ctx, c, rootdpb.FeatureReclaimVolume, &rootdpb.ReclaimVolumeRequest{Source: source}, rootdpb.RootHelperClient.ReclaimVolume)
+	return err
+}
+
 // Mounts is the agent's side of the mount calls: pkg/mounts' Remote, which
 // the Manager of privilege mode split runs every call through. Client, a
 // function so the daemon can set it once the client exists, is the helper.
 type Mounts struct {
 	Client func() *Client
+	// Policy is the operator's settings the checks read: the agent's own
+	// copy (config.MountToolPolicy), which must say what the helper's says.
+	Policy models.MountToolPolicy
 }
 
 var _ mounts.Remote = Mounts{}
@@ -101,7 +111,7 @@ func (m Mounts) Mount(ctx context.Context, sandboxID string, mode mounts.RemoteM
 		wire[i] = &rootdpb.ExternalMount{Type: string(s.Type), Target: s.Target, Source: s.Source,
 			Options: s.Options, ReadOnly: s.ReadOnly, Credentials: s.Credentials}
 	}
-	if err := rootpolicy.CheckExternalMounts(sent, mode == mounts.RemoteKeepLive); err != nil {
+	if err := rootpolicy.CheckExternalMounts(sent, mode == mounts.RemoteKeepLive, m.Policy); err != nil {
 		return mounts.RemoteResult{}, fmt.Errorf("mount: %w", err)
 	}
 	resp, err := c.MountExternal(ctx, &rootdpb.MountExternalRequest{SandboxId: sandboxID, Mode: wireMode, Mounts: wire})

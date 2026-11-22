@@ -31,7 +31,7 @@ func goodMounts() map[string]models.MountSpec {
 
 func TestCheckExternalMounts(t *testing.T) {
 	for name, m := range goodMounts() {
-		if err := CheckExternalMounts([]models.MountSpec{m}, false); err != nil {
+		if err := CheckExternalMounts([]models.MountSpec{m}, false, models.MountToolPolicy{}); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -39,7 +39,7 @@ func TestCheckExternalMounts(t *testing.T) {
 	for _, m := range goodMounts() {
 		all = append(all, m)
 	}
-	if err := CheckExternalMounts(all, false); err != nil {
+	if err := CheckExternalMounts(all, false, models.MountToolPolicy{}); err != nil {
 		t.Fatalf("a set of each: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestCheckExternalMounts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := cloneMount(goodMounts()[tc.base])
 			tc.mutate(&m)
-			err := CheckExternalMounts([]models.MountSpec{m}, false)
+			err := CheckExternalMounts([]models.MountSpec{m}, false, models.MountToolPolicy{})
 			if RuleOf(err) != RuleExternalMount {
 				t.Fatalf("got %v, want a %s refusal", err, RuleExternalMount)
 			}
@@ -85,17 +85,17 @@ func TestCheckExternalMounts(t *testing.T) {
 		})
 	}
 
-	if err := CheckExternalMounts(nil, false); RuleOf(err) != RuleExternalMount {
+	if err := CheckExternalMounts(nil, false, models.MountToolPolicy{}); RuleOf(err) != RuleExternalMount {
 		t.Fatalf("no mounts: %v", err)
 	}
 	many := make([]models.MountSpec, models.MaxMountsPerSandbox+1)
 	for i := range many {
 		many[i] = goodMounts()["nfs"]
 	}
-	if err := CheckExternalMounts(many, false); RuleOf(err) != RuleExternalMount {
+	if err := CheckExternalMounts(many, false, models.MountToolPolicy{}); RuleOf(err) != RuleExternalMount {
 		t.Fatalf("too many: %v", err)
 	}
-	if err := CheckExternalMount(nil, false); RuleOf(err) != RuleExternalMount {
+	if err := CheckExternalMount(nil, false, models.MountToolPolicy{}); RuleOf(err) != RuleExternalMount {
 		t.Fatalf("nil: %v", err)
 	}
 	if got := printable(strings.Repeat("k", 40) + "\n"); strings.Contains(got, "\n") || len(got) > 40 {
@@ -108,15 +108,41 @@ func TestCheckExternalMounts(t *testing.T) {
 func TestCheckExternalMountsRunning(t *testing.T) {
 	m := cloneMount(goodMounts()["s3"])
 	m.Options["extra_args"] = "--debug --max-cache-size 100"
-	if err := CheckExternalMounts([]models.MountSpec{m}, false); err == nil {
+	if err := CheckExternalMounts([]models.MountSpec{m}, false, models.MountToolPolicy{}); err == nil {
 		t.Fatal("a create with kept-only flags passed")
 	}
-	if err := CheckExternalMounts([]models.MountSpec{m}, true); err != nil {
+	if err := CheckExternalMounts([]models.MountSpec{m}, true, models.MountToolPolicy{}); err != nil {
 		t.Fatalf("a running mount with kept flags: %v", err)
 	}
 	m.Options["extra_args"] = "--log-directory=/etc"
-	if err := CheckExternalMounts([]models.MountSpec{m}, true); RuleOf(err) != RuleExternalMount {
+	if err := CheckExternalMounts([]models.MountSpec{m}, true, models.MountToolPolicy{}); RuleOf(err) != RuleExternalMount {
 		t.Fatalf("a running mount with a flag that reaches the host: %v", err)
+	}
+}
+
+// In privilege mode split an s3 mount with no keys would act as the node
+// (the helper's tools have no environment of the node's, which leaves the
+// instance metadata); rclone's own ways to the node are the allow lists'.
+// The operator's setting allows both.
+func TestCheckExternalMountsNodeCredentials(t *testing.T) {
+	keyless := cloneMount(goodMounts()["s3"])
+	keyless.Credentials = nil
+	envAuth := models.MountSpec{Type: models.MountTypeRclone, Target: "/rc", Source: ":s3,provider=AWS,env_auth=true:bucket"}
+	msi := models.MountSpec{Type: models.MountTypeRclone, Target: "/rc", Source: "a:c",
+		Credentials: map[string]string{"rclone_conf": "[a]\ntype = azureblob\naccount = x\nuse_msi = true\n"}}
+	for name, m := range map[string]models.MountSpec{"s3 with no keys": keyless, "rclone env_auth": envAuth, "rclone use_msi": msi} {
+		err := CheckExternalMounts([]models.MountSpec{m}, false, models.MountToolPolicy{})
+		if RuleOf(err) != RuleExternalMount || !strings.Contains(err.Error(), "SB_MOUNTS_ALLOW_NODE_CREDENTIALS") {
+			t.Errorf("%s: %v", name, err)
+		}
+		if err := CheckExternalMounts([]models.MountSpec{m}, false, models.MountToolPolicy{NodeCredentials: true}); err != nil {
+			t.Errorf("%s, allowed: %v", name, err)
+		}
+	}
+	anon := keyless
+	anon.Options = map[string]string{"extra_args": "--no-sign-request --force-path-style"}
+	if err := CheckExternalMounts([]models.MountSpec{anon}, false, models.MountToolPolicy{}); err != nil {
+		t.Fatalf("an anonymous s3 mount: %v", err)
 	}
 }
 
@@ -238,7 +264,7 @@ func FuzzCheckExternalMount(f *testing.F) {
 				m.Options[k] = v
 			}
 		}
-		err := CheckExternalMount(&m, false)
+		err := CheckExternalMount(&m, false, models.MountToolPolicy{})
 		secret := len(credVal) >= 12 && !strings.Contains(typ+target+source+opts+extra+region+credKey, credVal)
 		if err != nil {
 			if RuleOf(err) != RuleExternalMount {

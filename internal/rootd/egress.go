@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"time"
 
 	"google.golang.org/grpc/codes"
 
@@ -57,7 +58,25 @@ type egressCalls struct {
 	policy rootpolicy.Policy
 	host   EgressHost
 	locks  *keyedLocks
+	// matches bounds the executable lookups at once (MatchProcess).
+	matches *callLimit
 }
+
+// An executable lookup walks a sandbox's processes and their open sockets
+// in /proc, which a sandbox can make long (many processes, many sockets),
+// and the agent asks once per connection a per-binary rule sees. So the
+// helper bounds both how many run at once, and how many wait, past which
+// a call is answered ResourceExhausted at once, and how long one call
+// waits for its lookup: past matchTimeout it answers DeadlineExceeded, and
+// the lookup goes on alone, still holding its turn until it ends, so
+// lookups given up on never pile up past the bound. The gateway treats an
+// unanswered lookup as no match.
+// They are vars so tests can make them small.
+var (
+	maxMatchCalls   = 16
+	maxMatchWaiting = 256
+	matchTimeout    = 2 * time.Second
+)
 
 func newEgressCalls(cfg Config, net *network, injected EgressHost, locks *keyedLocks) *egressCalls {
 	if net == nil {
@@ -67,7 +86,7 @@ func newEgressCalls(cfg Config, net *network, injected EgressHost, locks *keyedL
 	if h == nil {
 		h = newEgressHost()
 	}
-	return &egressCalls{net: net, policy: cfg.Policy, host: h, locks: locks}
+	return &egressCalls{net: net, policy: cfg.Policy, host: h, locks: locks, matches: newCallLimit(maxMatchCalls, maxMatchWaiting)}
 }
 
 var egressFeatures = []string{rootdpb.FeatureBridgeProbe, rootdpb.FeatureMatchProcess}
@@ -121,7 +140,7 @@ func (e *egressCalls) bridgeProbe(ctx context.Context, req *rootdpb.BridgeProbeR
 	return resp, nil
 }
 
-func (e *egressCalls) matchProcess(req *rootdpb.MatchProcessRequest) (*rootdpb.MatchProcessResponse, error) {
+func (e *egressCalls) matchProcess(ctx context.Context, req *rootdpb.MatchProcessRequest) (*rootdpb.MatchProcessResponse, error) {
 	if err := noUnknownFields(req); err != nil {
 		return nil, err
 	}
@@ -148,7 +167,7 @@ func (e *egressCalls) matchProcess(req *rootdpb.MatchProcessRequest) (*rootdpb.M
 	if ok, err := sandboxed(); err != nil || !ok {
 		return &rootdpb.MatchProcessResponse{NotFound: true}, err
 	}
-	matched, notFound, err := e.host.Match(m)
+	matched, notFound, err := e.boundedMatch(ctx, m)
 	if err != nil {
 		return nil, fmt.Errorf("root helper: executable lookup for process %d: %w", m.PID, err)
 	}
@@ -156,4 +175,48 @@ func (e *egressCalls) matchProcess(req *rootdpb.MatchProcessRequest) (*rootdpb.M
 		return &rootdpb.MatchProcessResponse{NotFound: true}, err
 	}
 	return &rootdpb.MatchProcessResponse{Matched: matched, NotFound: notFound}, nil
+}
+
+// matchAnswer is one lookup's result.
+type matchAnswer struct {
+	matched  []string
+	notFound bool
+	err      error
+}
+
+// boundedMatch runs one lookup within the bounds above. matchTimeout
+// bounds the whole call: the wait for a turn and the lookup.
+func (e *egressCalls) boundedMatch(ctx context.Context, m rootpolicy.ProcessMatch) ([]string, bool, error) {
+	tctx, cancel := context.WithTimeout(ctx, matchTimeout)
+	defer cancel()
+	slow := func() error {
+		return &fileError{code: codes.Aborted,
+			msg: fmt.Sprintf("root helper: the executable lookup for process %d took longer than %v", m.PID, matchTimeout)}
+	}
+	release, err := e.matches.enter(tctx)
+	if err != nil {
+		var fe *fileError
+		switch {
+		case errors.As(err, &fe) && fe.code == codes.ResourceExhausted:
+			fe.msg = fmt.Sprintf("root helper: %d executable lookups running and %d waiting; try again shortly", maxMatchCalls, maxMatchWaiting)
+		case ctx.Err() == nil:
+			err = slow()
+		}
+		return nil, false, err
+	}
+	done := make(chan matchAnswer, 1)
+	go func() {
+		defer release()
+		matched, notFound, err := e.host.Match(m)
+		done <- matchAnswer{matched, notFound, err}
+	}()
+	select {
+	case a := <-done:
+		return a.matched, a.notFound, a.err
+	case <-tctx.Done():
+		if ctx.Err() != nil {
+			return nil, false, ctxError(ctx)
+		}
+		return nil, false, slow()
+	}
 }

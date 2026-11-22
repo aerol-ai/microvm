@@ -57,7 +57,13 @@ func TestE2EBrokenAgentMounts(t *testing.T) {
 		{"an extra_arg off the list", req("sb-e2e", s3("--log-directory=/etc", nil)), codes.InvalidArgument, extMount},
 		{"a cache folder of the caller's choosing", req("sb-e2e", s3("--cache /etc", nil)), codes.InvalidArgument, extMount},
 		{"a credential in the arguments", req("sb-e2e", s3("--secret-access-key="+secret, nil)), codes.InvalidArgument, extMount},
-		{"a credential no tool reads", req("sb-e2e", s3("", map[string]string{"web_identity_token": secret})), codes.InvalidArgument, extMount},
+		{"a credential no tool reads", req("sb-e2e", s3("", map[string]string{"access_key_id": "k", "secret_access_key": "s", "web_identity_token": secret})),
+			codes.InvalidArgument, extMount},
+		{"an s3 mount with no keys (the node's own role)", req("sb-e2e", s3("--force-path-style", nil)), codes.InvalidArgument, extMount},
+		{"rclone env_auth (the node's own role)", req("sb-e2e", &rootdpb.ExternalMount{Type: "rclone", Target: "/rc", Source: ":s3,provider=AWS,env_auth=true:bkt"}),
+			codes.InvalidArgument, extMount},
+		{"rclone_conf use_msi", req("sb-e2e", &rootdpb.ExternalMount{Type: "rclone", Target: "/rc", Source: "a:c",
+			Credentials: map[string]string{"rclone_conf": "[a]\ntype = azureblob\naccount = x\nuse_msi = true\n"}}), codes.InvalidArgument, extMount},
 		{"rclone's local backend", req("sb-e2e", &rootdpb.ExternalMount{Type: "rclone", Target: "/rc", Source: ":local:/etc",
 			Credentials: map[string]string{"rclone_conf": "[x]\ntype = s3\n"}}), codes.InvalidArgument, extMount},
 		{"a mode the helper does not know", &rootdpb.MountExternalRequest{SandboxId: "sb-e2e", Mode: 42, Mounts: []*rootdpb.ExternalMount{nfs("vers=4.2")}},
@@ -101,4 +107,29 @@ func TestE2EBrokenAgentMounts(t *testing.T) {
 			t.Fatalf("sweep: %v", err)
 		}
 	})
+}
+
+// TestE2EReclaimVolume asks a live helper whose own settings put platform
+// volumes on the box's NFS export to reclaim one volume's folder
+// (AEROL_E2E_RECLAIM_SOURCE), then to reclaim folders that are not one
+// volume's. The box checks the folder is empty, its link's target and its
+// neighbour untouched.
+func TestE2EReclaimVolume(t *testing.T) {
+	sock, src := os.Getenv("AEROL_E2E_HELPER_SOCKET"), os.Getenv("AEROL_E2E_RECLAIM_SOURCE")
+	if sock == "" || src == "" {
+		t.Skip("a live run: set AEROL_E2E_HELPER_SOCKET and AEROL_E2E_RECLAIM_SOURCE")
+	}
+	c := rootdpb.NewRootHelperClient(dialSocket(t, sock))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if _, err := c.ReclaimVolume(ctx, &rootdpb.ReclaimVolumeRequest{Source: src}); err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	server, dir, _ := strings.Cut(src, ":")
+	for _, bad := range []string{server + ":/", server + ":" + dir[:strings.LastIndex(dir, "/")], src + "/../../..", "10.66.6.6:" + dir} {
+		_, err := c.ReclaimVolume(ctx, &rootdpb.ReclaimVolumeRequest{Source: bad})
+		if r, ok := rootdpb.RefusalReason(err); !ok || r != string(rootpolicy.RuleReclaim) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
 }

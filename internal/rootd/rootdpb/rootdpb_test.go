@@ -174,6 +174,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.UnmountExternalResponse":     {"had=1:bool"},
 		"aerolvm.rootd.v1.SweepExternalMountsRequest":  {"keep=1:repeated string"},
 		"aerolvm.rootd.v1.SweepExternalMountsResponse": nil,
+		"aerolvm.rootd.v1.ReclaimVolumeRequest":        {"source=1:string"},
+		"aerolvm.rootd.v1.ReclaimVolumeResponse":       nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {

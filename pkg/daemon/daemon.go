@@ -1033,13 +1033,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			// ensure it exists (root-owned) so the first reclaim doesn't fail on a
 			// missing scratch dir. Best-effort: a failure here only disables NFS
 			// byte reclaim, not the metadata delete path.
-			if pv.Backend == config.PlatformVolumesBackendNFS && pv.ReclaimMountRoot != "" {
+			if pv.Backend == config.PlatformVolumesBackendNFS && pv.ReclaimMountRoot != "" && cfg.PrivilegeMode != privmode.Split {
 				if err := os.MkdirAll(pv.ReclaimMountRoot, 0o700); err != nil {
 					logger.Warn("platform volume reclaim scratch dir create failed",
 						"path", pv.ReclaimMountRoot, "error", err)
 				}
 			}
-			svc.SetVolumeReclaimer(volumes.NewReclaimer(volumes.Backend{
+			svc.SetVolumeReclaimer(volumeReclaimerFor(cfg, volumes.NewReclaimer(volumes.Backend{
 				Kind:              pv.Backend,
 				S3Bucket:          pv.S3Bucket,
 				S3Prefix:          pv.S3Prefix,
@@ -1050,7 +1050,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				NFSServer:         pv.NFSServer,
 				NFSExport:         pv.NFSExport,
 				NFSOptions:        pv.NFSOptions,
-			}, pv.ReclaimMountRoot, volumes.ExecRunner))
+			}, pv.ReclaimMountRoot, volumes.ExecRunner), helper))
 			svc.StartVolumeReclaim(ctx)
 		}
 		startAutoImportReconciler(ctx, logger, cfg, db, svc)
