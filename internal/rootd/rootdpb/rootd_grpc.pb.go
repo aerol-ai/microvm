@@ -60,6 +60,9 @@ const (
 	RootHelper_StopHost_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/StopHost"
 	RootHelper_ListHosts_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/ListHosts"
 	RootHelper_SetHostLimits_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/SetHostLimits"
+	RootHelper_EnsureTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/EnsureTap"
+	RootHelper_RemoveTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/RemoveTap"
+	RootHelper_MakeFilesystem_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/MakeFilesystem"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -183,6 +186,21 @@ type RootHelperClient interface {
 	// SetHostLimits changes a running host's limits (a warm V8 group host a
 	// tenant claims takes that tenant's).
 	SetHostLimits(ctx context.Context, in *SetHostLimitsRequest, opts ...grpc.CallOption) (*SetHostLimitsResponse, error)
+	// EnsureTap makes sure one of the TAP pool's devices is up: made for the
+	// jailer's user, with the host's address of its slot, strict reverse
+	// path filtering, IPv6 off and the guest's neighbor entry. The helper
+	// works the slot's addresses out from the name and its own TAP base; on
+	// its first TAP it also puts in the guests' NAT and isolation.
+	EnsureTap(ctx context.Context, in *EnsureTapRequest, opts ...grpc.CallOption) (*EnsureTapResponse, error)
+	// RemoveTap makes sure one of the pool's TAP devices is gone.
+	RemoveTap(ctx context.Context, in *RemoveTapRequest, opts ...grpc.CallOption) (*RemoveTapResponse, error)
+	// MakeFilesystem makes an ext4 filesystem in one of a VM's disk files, in
+	// its jail's stage folder: the root disk, from a folder of the agent's,
+	// or the overlay disk, empty. mkfs.ext4 runs as the agent's own user,
+	// seen as root in a user namespace of its own, so the files come out
+	// owned by root as in privilege mode single and it can read and write
+	// nothing the agent could not.
+	MakeFilesystem(ctx context.Context, in *MakeFilesystemRequest, opts ...grpc.CallOption) (*MakeFilesystemResponse, error)
 }
 
 type rootHelperClient struct {
@@ -483,6 +501,36 @@ func (c *rootHelperClient) SetHostLimits(ctx context.Context, in *SetHostLimitsR
 	return out, nil
 }
 
+func (c *rootHelperClient) EnsureTap(ctx context.Context, in *EnsureTapRequest, opts ...grpc.CallOption) (*EnsureTapResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureTapResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureTap_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) RemoveTap(ctx context.Context, in *RemoveTapRequest, opts ...grpc.CallOption) (*RemoveTapResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveTapResponse)
+	err := c.cc.Invoke(ctx, RootHelper_RemoveTap_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) MakeFilesystem(ctx context.Context, in *MakeFilesystemRequest, opts ...grpc.CallOption) (*MakeFilesystemResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MakeFilesystemResponse)
+	err := c.cc.Invoke(ctx, RootHelper_MakeFilesystem_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -604,6 +652,21 @@ type RootHelperServer interface {
 	// SetHostLimits changes a running host's limits (a warm V8 group host a
 	// tenant claims takes that tenant's).
 	SetHostLimits(context.Context, *SetHostLimitsRequest) (*SetHostLimitsResponse, error)
+	// EnsureTap makes sure one of the TAP pool's devices is up: made for the
+	// jailer's user, with the host's address of its slot, strict reverse
+	// path filtering, IPv6 off and the guest's neighbor entry. The helper
+	// works the slot's addresses out from the name and its own TAP base; on
+	// its first TAP it also puts in the guests' NAT and isolation.
+	EnsureTap(context.Context, *EnsureTapRequest) (*EnsureTapResponse, error)
+	// RemoveTap makes sure one of the pool's TAP devices is gone.
+	RemoveTap(context.Context, *RemoveTapRequest) (*RemoveTapResponse, error)
+	// MakeFilesystem makes an ext4 filesystem in one of a VM's disk files, in
+	// its jail's stage folder: the root disk, from a folder of the agent's,
+	// or the overlay disk, empty. mkfs.ext4 runs as the agent's own user,
+	// seen as root in a user namespace of its own, so the files come out
+	// owned by root as in privilege mode single and it can read and write
+	// nothing the agent could not.
+	MakeFilesystem(context.Context, *MakeFilesystemRequest) (*MakeFilesystemResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -700,6 +763,15 @@ func (UnimplementedRootHelperServer) ListHosts(context.Context, *ListHostsReques
 }
 func (UnimplementedRootHelperServer) SetHostLimits(context.Context, *SetHostLimitsRequest) (*SetHostLimitsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetHostLimits not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureTap(context.Context, *EnsureTapRequest) (*EnsureTapResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureTap not implemented")
+}
+func (UnimplementedRootHelperServer) RemoveTap(context.Context, *RemoveTapRequest) (*RemoveTapResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveTap not implemented")
+}
+func (UnimplementedRootHelperServer) MakeFilesystem(context.Context, *MakeFilesystemRequest) (*MakeFilesystemResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MakeFilesystem not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1244,6 +1316,60 @@ func _RootHelper_SetHostLimits_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_EnsureTap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureTapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureTap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureTap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureTap(ctx, req.(*EnsureTapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_RemoveTap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveTapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).RemoveTap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_RemoveTap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).RemoveTap(ctx, req.(*RemoveTapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_MakeFilesystem_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MakeFilesystemRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).MakeFilesystem(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_MakeFilesystem_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).MakeFilesystem(ctx, req.(*MakeFilesystemRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1366,6 +1492,18 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetHostLimits",
 			Handler:    _RootHelper_SetHostLimits_Handler,
+		},
+		{
+			MethodName: "EnsureTap",
+			Handler:    _RootHelper_EnsureTap_Handler,
+		},
+		{
+			MethodName: "RemoveTap",
+			Handler:    _RootHelper_RemoveTap_Handler,
+		},
+		{
+			MethodName: "MakeFilesystem",
+			Handler:    _RootHelper_MakeFilesystem_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

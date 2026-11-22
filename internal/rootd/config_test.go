@@ -3,6 +3,7 @@ package rootd
 import (
 	"errors"
 	"io/fs"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -730,5 +731,108 @@ func TestWasmHostsFromEnv(t *testing.T) {
 	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
 	if _, err := read(map[string]string{}, false); err == nil || !strings.Contains(err.Error(), "WASM hosts'") {
 		t.Fatalf("no binary of its own: %v", err)
+	}
+}
+
+// TestFirecrackerHostsFromEnv: the Firecracker VMs' settings come from the
+// helper's own environment, under sandboxd's names. The helper always
+// runs the jailer, and its chroot base is never a folder the agent writes.
+func TestFirecrackerHostsFromEnv(t *testing.T) {
+	old := selfExecutable
+	selfExecutable = func() (string, error) { return "/usr/local/bin/aerolvm-rootd", nil }
+	t.Cleanup(func() { selfExecutable = old })
+	path := func(m map[string]string) func(k, def string) string {
+		return func(k, def string) string {
+			if v := strings.TrimSpace(m[k]); v != "" {
+				return filepath.Clean(v)
+			}
+			return filepath.Clean(def)
+		}
+	}
+	agentDirs := []string{"/var/lib/sandboxd", "/run/sandboxd"}
+	read := func(m map[string]string) (*FirecrackerHostsConfig, error) {
+		if _, set := m["SB_FIRECRACKER_KERNEL"]; !set {
+			m = maps.Clone(m)
+			if m == nil {
+				m = map[string]string{}
+			}
+			m["SB_FIRECRACKER_KERNEL"] = "/var/lib/aerolvm-rootd/vmlinux"
+		}
+		return firecrackerHostsFromEnv(env(m), path(m), 65531, agentDirs)
+	}
+	c, err := read(map[string]string{"SB_FIRECRACKER_KERNEL": "/var/lib/aerolvm-rootd/vmlinux", "SB_JAILER_UID": "1500",
+		"SB_JAILER_GID": "1501", "SB_FIRECRACKER_IP_BINARY": "/usr/sbin/ip"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := FirecrackerHostsConfig{JailerBinary: "/usr/local/bin/jailer", FirecrackerBinary: "/usr/local/bin/firecracker",
+		ChrootBase: "/srv/jailer", UID: 1500, GID: 1501, Kernel: "/var/lib/aerolvm-rootd/vmlinux", Mkfs4Bin: "/sbin/mkfs.ext4",
+		Shim: "/usr/local/bin/aerolvm-rootd", AgentUID: 65531, SocketWait: 5 * time.Second, IPBinary: "/usr/sbin/ip",
+		TapBase: "172.16.0.0/20", TapPoolSize: 256}
+	if *c != want {
+		t.Fatalf("\n got %+v\nwant %+v", *c, want)
+	}
+	if err := c.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		m    map[string]string
+		want string
+	}{
+		{"no jailer", map[string]string{"SB_FIRECRACKER_USE_JAILER": "false"}, "jailer"},
+		{"a chroot base in the agent's folder", map[string]string{"SB_JAILER_CHROOT_BASE": "/var/lib/sandboxd/jail"}, "which the agent writes"},
+		{"a jailer uid that is no number", map[string]string{"SB_JAILER_UID": "x"}, "SB_JAILER_UID"},
+		{"a jailer gid that is no number", map[string]string{"SB_JAILER_GID": "x"}, "SB_JAILER_GID"},
+		{"a pool size that is no number", map[string]string{"SB_FIRECRACKER_TAP_POOL_SIZE": "x"}, "SB_FIRECRACKER_TAP_POOL_SIZE"},
+		{"a jailer flag that is no bool", map[string]string{"SB_FIRECRACKER_USE_JAILER": "maybe"}, "SB_FIRECRACKER_USE_JAILER"},
+		{"a kernel in the agent's folder (sandboxd's default)", map[string]string{"SB_FIRECRACKER_KERNEL": ""}, "SB_FIRECRACKER_KERNEL"},
+	} {
+		if _, err := read(tc.m); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
+		}
+	}
+	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
+	if _, err := read(nil); err == nil || !strings.Contains(err.Error(), "shim") {
+		t.Fatalf("no binary of its own: %v", err)
+	}
+}
+
+func TestFirecrackerHostsValidate(t *testing.T) {
+	good := FirecrackerHostsConfig{JailerBinary: "/j", FirecrackerBinary: "/f", ChrootBase: "/srv/jailer", UID: 1500, GID: 1500,
+		Kernel: "/k", Mkfs4Bin: "/m", Shim: "/s", AgentUID: 65531, SocketWait: time.Second, TapBase: "172.16.0.0/20", TapPoolSize: 256}
+	for _, tc := range []struct {
+		name string
+		edit func(*FirecrackerHostsConfig)
+	}{
+		{"a relative jailer", func(c *FirecrackerHostsConfig) { c.JailerBinary = "jailer" }},
+		{"a relative ip", func(c *FirecrackerHostsConfig) { c.IPBinary = "ip" }},
+		{"a chroot base of /", func(c *FirecrackerHostsConfig) { c.ChrootBase = "/" }},
+		{"a root jailer", func(c *FirecrackerHostsConfig) { c.UID = 0 }},
+		{"the agent as the jailer", func(c *FirecrackerHostsConfig) { c.UID = 65531 }},
+		{"no socket wait", func(c *FirecrackerHostsConfig) { c.SocketWait = 0 }},
+		{"a TAP base too small", func(c *FirecrackerHostsConfig) { c.TapBase = "172.16.0.0/28" }},
+	} {
+		c := good
+		tc.edit(&c)
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: no error", tc.name)
+		}
+	}
+	// The jailer shares no user with the V8 jail or the WASM worker.
+	h := HostsConfig{LogPath: "/var/lib/aerolvm-rootd/hosts.log", Firecracker: &good,
+		Workerd: &WorkerdHostsConfig{Jail: testHostsConfig(t).Workerd.Jail, PidsMax: 512}}
+	h.Workerd.Jail.UID = good.UID
+	if err := h.validate(); err == nil || !strings.Contains(err.Error(), "V8 jail") {
+		t.Errorf("the jailer as the V8 jail's user: %v", err)
+	}
+	h.Workerd = nil
+	h.Wasm = &WasmHostsConfig{Binary: "/b", UID: good.UID, GID: 61000, SocketDir: "/run/w", AgentUID: 65531, ReadyWait: time.Second}
+	if err := h.validate(); err == nil || !strings.Contains(err.Error(), "WASM worker") {
+		t.Errorf("the jailer as the WASM worker: %v", err)
+	}
+	h.Wasm = nil
+	if err := h.validate(); err != nil {
+		t.Errorf("Firecracker alone: %v", err)
 	}
 }

@@ -206,6 +206,29 @@ service RootHelper {
   // SetHostLimits changes a running host's limits (a warm V8 group host a
   // tenant claims takes that tenant's).
   rpc SetHostLimits(SetHostLimitsRequest) returns (SetHostLimitsResponse);
+
+  // The calls below are the Firecracker runtime's network and disk work
+  // (M1 PR 9b). A VM itself is a host of kind FIRECRACKER: PrepareHost
+  // builds its jail and moves the disks the agent built into it, SpawnHost
+  // runs the jailer, StopHost kills the VM and removes its jail.
+
+  // EnsureTap makes sure one of the TAP pool's devices is up: made for the
+  // jailer's user, with the host's address of its slot, strict reverse
+  // path filtering, IPv6 off and the guest's neighbor entry. The helper
+  // works the slot's addresses out from the name and its own TAP base; on
+  // its first TAP it also puts in the guests' NAT and isolation.
+  rpc EnsureTap(EnsureTapRequest) returns (EnsureTapResponse);
+
+  // RemoveTap makes sure one of the pool's TAP devices is gone.
+  rpc RemoveTap(RemoveTapRequest) returns (RemoveTapResponse);
+
+  // MakeFilesystem makes an ext4 filesystem in one of a VM's disk files, in
+  // its jail's stage folder: the root disk, from a folder of the agent's,
+  // or the overlay disk, empty. mkfs.ext4 runs as the agent's own user,
+  // seen as root in a user namespace of its own, so the files come out
+  // owned by root as in privilege mode single and it can read and write
+  // nothing the agent could not.
+  rpc MakeFilesystem(MakeFilesystemRequest) returns (MakeFilesystemResponse);
 }
 
 message VersionRequest {
@@ -795,6 +818,9 @@ enum HostKind {
   // A WASM resident host: many sandboxes of one module. The id is the
   // host's key.
   HOST_KIND_WASM_RESIDENT = 3;
+  // A Firecracker VM, run by the jailer as the jailer's user. The id is
+  // the sandbox ID (M1 PR 9b).
+  HOST_KIND_FIRECRACKER = 4;
 }
 
 // HostLimits are a host's cgroup limits. Zero on an axis is no limit, which
@@ -809,12 +835,27 @@ message HostLimits {
 message PrepareHostRequest {
   HostKind kind = 1;
   string id = 2;
+  // FIRECRACKER only.
+  FirecrackerHostSpec firecracker = 3;
 }
 
 message PrepareHostResponse {
   // WORKERD: the group's run folder, built by the helper inside its jail,
   // which the agent writes the group's config and binds its sockets in.
+  // FIRECRACKER: the jailer's chroot, where the VM's sockets appear.
   string run_dir = 1;
+  // FIRECRACKER: the folder of the agent's own the VM's disks are built
+  // in, beside the chroot.
+  string stage_dir = 2;
+}
+
+// FirecrackerHostSpec is what PrepareHost moves into a VM's jail.
+message FirecrackerHostSpec {
+  // Disk files the agent built in the stage folder ("rootfs.ext4",
+  // "overlay.ext4") to move into the chroot for the jailer's user. Each
+  // must be the agent's own file, with one name; the helper links it in
+  // and gives it to the jailer's user.
+  repeated string stage = 1;
 }
 
 // WasmHostSpec is what a WASM host is started with. The helper builds every
@@ -888,3 +929,37 @@ message SetHostLimitsRequest {
 }
 
 message SetHostLimitsResponse {}
+
+message EnsureTapRequest {
+  // The device's name: fctap<slot index>.
+  string name = 1;
+}
+
+message EnsureTapResponse {
+  // The slot's addresses, as the helper worked them out, for the agent to
+  // check against its own pool.
+  string cidr = 1;
+  string host_ip = 2;
+  string guest_ip = 3;
+  uint32 vsock_cid = 4;
+}
+
+message RemoveTapRequest {
+  string name = 1;
+}
+
+message RemoveTapResponse {}
+
+message MakeFilesystemRequest {
+  // The VM's sandbox ID and the disk file in its stage folder
+  // ("rootfs.ext4", "overlay.ext4").
+  string id = 1;
+  string name = 2;
+  // A folder whose files become the filesystem's (mkfs.ext4 -d); empty
+  // for an empty filesystem in a file the agent made (the overlay).
+  string source = 3;
+  // The filesystem's size in MiB, with a source.
+  uint64 size_mib = 4;
+}
+
+message MakeFilesystemResponse {}

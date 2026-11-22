@@ -75,7 +75,7 @@ type HostKernel interface {
 type hostLauncher interface {
 	// prepare does PrepareHost's work, under the host's lock. running says
 	// whether the host's group still holds a process.
-	prepare(id string, running bool) (*rootdpb.PrepareHostResponse, error)
+	prepare(id string, running bool, req *rootdpb.PrepareHostRequest) (*rootdpb.PrepareHostResponse, error)
 	// command builds the host's process. done runs once it has started,
 	// or failed to (closing what the command was handed).
 	command(ctx context.Context, id string, req *rootdpb.SpawnHostRequest) (cmd *exec.Cmd, done func(), err error)
@@ -115,6 +115,15 @@ func (h *hostCalls) close() {
 	if h != nil {
 		h.fence.close()
 	}
+}
+
+// firecracker is the Firecracker launcher, nil when the helper runs none.
+func (h *hostCalls) firecracker() *firecrackerHosts {
+	if h == nil {
+		return nil
+	}
+	f, _ := h.launcher[rootpolicy.HostFirecracker].(*firecrackerHosts)
+	return f
 }
 
 // hostKindOf maps the wire's kind onto the rules', "" for one this build
@@ -192,6 +201,9 @@ func (h *hostCalls) prepareHost(ctx context.Context, req *rootdpb.PrepareHostReq
 	if err != nil {
 		return nil, err
 	}
+	if req.GetFirecracker() != nil && kind != rootpolicy.HostFirecracker {
+		return nil, badRequest("root helper: a Firecracker spec for a %s host", kind)
+	}
 	unlock, err := h.locks.lock(ctx, hostKey(kind, req.GetId()))
 	if err != nil {
 		return nil, err
@@ -201,7 +213,7 @@ func (h *hostCalls) prepareHost(ctx context.Context, req *rootdpb.PrepareHostReq
 	if err != nil {
 		return nil, err
 	}
-	return l.prepare(req.GetId(), pid > 0)
+	return l.prepare(req.GetId(), pid > 0, req)
 }
 
 func (h *hostCalls) spawnHost(ctx context.Context, req *rootdpb.SpawnHostRequest) (*rootdpb.SpawnHostResponse, error) {
@@ -317,6 +329,7 @@ var kindGroups = map[rootpolicy.HostKind]string{
 	rootpolicy.HostWorkerd:      rootpolicy.WorkerdHostsGroup,
 	rootpolicy.HostWasmWorker:   rootpolicy.WasmHostsGroup,
 	rootpolicy.HostWasmResident: rootpolicy.WasmHostsGroup,
+	rootpolicy.HostFirecracker:  rootpolicy.FirecrackerHostsGroup,
 }
 
 func (h *hostCalls) listHosts(req *rootdpb.ListHostsRequest) (*rootdpb.ListHostsResponse, error) {
@@ -455,6 +468,9 @@ func newHostCalls(cfg Config, opts Options, locks *keyedLocks, log *slog.Logger)
 		h.fence = newWasmFence(w, be, log)
 		h.launcher[rootpolicy.HostWasmWorker] = newWasmHosts(w, rootpolicy.HostWasmWorker, h.fence, cfg.Hosts.LogPath)
 		h.launcher[rootpolicy.HostWasmResident] = newWasmHosts(w, rootpolicy.HostWasmResident, h.fence, cfg.Hosts.LogPath)
+	}
+	if fc := cfg.Hosts.Firecracker; fc != nil {
+		h.launcher[rootpolicy.HostFirecracker] = newFirecrackerHosts(fc, cfg.Hosts.LogPath, cfg.SocketGID)
 	}
 	for kind, l := range opts.hostLaunchers {
 		h.launcher[kind] = l

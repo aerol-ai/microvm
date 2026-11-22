@@ -67,7 +67,25 @@ func main() {
 		// the jail user, installs the filter and runs workerd.
 		os.Exit(shimCode(os.Args[2:], os.Stderr))
 	}
+	if len(os.Args) >= 3 && os.Args[1] == rootd.FirecrackerJailerExecFlag {
+		// The jailer's shim (M1 PR 9b): the helper starts its own binary,
+		// which sets firecracker's umask and becomes the jailer the
+		// helper's settings name (rootd hosts_firecracker.go).
+		os.Exit(jailerShimCode(os.Args[2:], os.Stderr))
+	}
 	os.Exit(mainCode(os.Getenv, os.Stderr))
+}
+
+// runJailerShim is rootd.RunFirecrackerJailerShim; tests stand one in.
+var runJailerShim = rootd.RunFirecrackerJailerShim
+
+// jailerShimCode becomes the jailer, or answers 125 with why it could not.
+func jailerShimCode(args []string, stderr io.Writer) int {
+	if err := runJailerShim(args); err != nil {
+		fmt.Fprintf(stderr, "aerolvm-rootd: %v\n", err)
+		return 125
+	}
+	return 0
 }
 
 // runJailShim is isolate.RunJailShim; tests stand one in.

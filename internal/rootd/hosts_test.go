@@ -183,7 +183,7 @@ func (l *fakeLauncher) seen() []string {
 	return slices.Clone(l.calls)
 }
 
-func (l *fakeLauncher) prepare(id string, running bool) (*rootdpb.PrepareHostResponse, error) {
+func (l *fakeLauncher) prepare(id string, running bool, _ *rootdpb.PrepareHostRequest) (*rootdpb.PrepareHostResponse, error) {
 	l.note(fmt.Sprintf("prepare %s running=%v", id, running))
 	if err := l.fail["prepare"]; err != nil {
 		return nil, err

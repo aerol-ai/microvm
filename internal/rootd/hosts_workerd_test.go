@@ -26,7 +26,7 @@ func TestWorkerdHosts(t *testing.T) {
 	w.checkBase = func(string) error { checks++; return nil }
 
 	// A running group whose jail is not whole is refused, not torn down.
-	_, err := w.prepare("g1", true)
+	_, err := w.prepare("g1", true, nil)
 	var fe *fileError
 	if !errors.As(err, &fe) || fe.code != codes.FailedPrecondition {
 		t.Fatalf("prepare of a running group with no jail = %v", err)
@@ -40,7 +40,7 @@ func TestWorkerdHosts(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(left, "run", "config.capnp"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.prepare("g1", false); err == nil && os.Geteuid() != 0 {
+	if _, err := w.prepare("g1", false, nil); err == nil && os.Geteuid() != 0 {
 		t.Fatal("a jail was made with no kernel to make it")
 	}
 	if _, err := os.Stat(filepath.Join(left, "run", "config.capnp")); !os.IsNotExist(err) {
@@ -49,19 +49,19 @@ func TestWorkerdHosts(t *testing.T) {
 	if builds != 1 || checks != 1 {
 		t.Fatalf("base built %d times, checked %d", builds, checks)
 	}
-	_, _ = w.prepare("g2", false)
+	_, _ = w.prepare("g2", false, nil)
 	if builds != 1 {
 		t.Fatal("the base was built again")
 	}
 	// A base that is not the helper's alone, or does not build, stops it.
 	w2 := newWorkerdHosts(cfg.Workerd, cfg.LogPath)
 	w2.checkBase = func(string) error { return errors.New("others can write it") }
-	if _, err := w2.prepare("g1", false); err == nil {
+	if _, err := w2.prepare("g1", false, nil); err == nil {
 		t.Fatal("a base others can write was used")
 	}
 	w2.checkBase = func(string) error { return nil }
 	w2.prepareBase = func() error { return errors.New("ldd: not found") }
-	if _, err := w2.prepare("g1", false); err == nil {
+	if _, err := w2.prepare("g1", false, nil); err == nil {
 		t.Fatal("a base that did not build was used")
 	}
 	// No command for a group with no whole jail.
