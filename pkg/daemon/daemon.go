@@ -42,6 +42,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	fcapi "github.com/aerol-ai/microvm/pkg/firecracker"
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/oci"
@@ -88,6 +89,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// cancellable child below, which a failed listener also cancels.
 	stop := ctx
 	defer func() { err = bootStopped(stop, err, logger) }()
+	// First: a log line to a stdout or stderr someone shut (journald's
+	// stream, which a process sandboxd started may share) must fail, not
+	// stop the daemon.
+	hostproc.CatchSIGPIPE()
 
 	cfg, err := config.Load()
 	if err != nil {

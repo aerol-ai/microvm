@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/hostproc"
 )
 
 // The jail's pure parts — the seccomp program, the chroot tree, the cgroup
@@ -22,139 +24,41 @@ var fakeSyscallTable = map[string]int{
 	"read": 0, "write": 1, "close": 3, "mmap": 9, "mprotect": 10, "execve": 59, "exit_group": 231, "openat": 257,
 }
 
-func TestSeccompProgramShape(t *testing.T) {
-	prog, unknown, err := buildSeccompProgram(auditArchX86_64, fakeSyscallTable,
-		[]string{"read", "write", "write", "nope", "mprotect", "mmap"},
-		[]SeccompArgRule{
-			{Syscall: "mprotect", DenyIfAll: []SeccompArgMask{{Arg: 2, Mask: 0x4}}},
-			{Syscall: "mmap", DenyIfAll: []SeccompArgMask{{Arg: 2, Mask: 0x4}, {Arg: 3, Mask: 0x20}}},
-		}, SeccompEnforce)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(unknown) != 1 || unknown[0] != "nope" {
-		t.Fatalf("unknown = %v, want [nope]", unknown)
-	}
-	// Header: load arch, compare, kill; load nr; x32 guard (2).
-	if prog[0] != bpfStmt(bpfLD|bpfW|bpfABS, seccompDataArch) || prog[1] != bpfJump(bpfJMP|bpfJEQ|bpfK, auditArchX86_64, 1, 0) || prog[2].K != seccompRetKillProcess {
-		t.Fatalf("arch check = %+v", prog[:3])
-	}
-	if prog[3] != bpfStmt(bpfLD|bpfW|bpfABS, seccompDataNR) || prog[4] != bpfJump(bpfJMP|bpfJGE|bpfK, x32SyscallBit, 0, 1) || prog[5].K != seccompRetKillProcess {
-		t.Fatalf("x32 guard = %+v", prog[3:6])
-	}
-	// Plain allows, ascending, deduplicated: read(0), write(1).
-	if prog[6] != bpfJump(bpfJMP|bpfJEQ|bpfK, 0, 0, 1) || prog[7].K != seccompRetAllow || prog[8] != bpfJump(bpfJMP|bpfJEQ|bpfK, 1, 0, 1) || prog[9].K != seccompRetAllow {
-		t.Fatalf("plain allows = %+v", prog[6:10])
-	}
-	// Rules in name order: mmap (2 masks) then mprotect (1 mask).
-	i := 10
-	if prog[i] != bpfJump(bpfJMP|bpfJEQ|bpfK, 9, 0, 8) {
-		t.Fatalf("mmap gate = %+v", prog[i])
-	}
-	// mask 0: ld arg2; and 0x4; jeq 0 → allow (jt = 3*2-0-2 = 4)
-	if prog[i+1] != bpfStmt(bpfLD|bpfW|bpfABS, seccompDataArgs+16) || prog[i+2] != bpfStmt(bpfALU|bpfAND|bpfK, 0x4) || prog[i+3] != bpfJump(bpfJMP|bpfJEQ|bpfK, 0, 4, 0) {
-		t.Fatalf("mmap check 0 = %+v", prog[i+1:i+4])
-	}
-	// mask 1: ld arg3; and 0x20; jeq 0 → allow (jt = 1)
-	if prog[i+4] != bpfStmt(bpfLD|bpfW|bpfABS, seccompDataArgs+24) || prog[i+5] != bpfStmt(bpfALU|bpfAND|bpfK, 0x20) || prog[i+6] != bpfJump(bpfJMP|bpfJEQ|bpfK, 0, 1, 0) {
-		t.Fatalf("mmap check 1 = %+v", prog[i+4:i+7])
-	}
-	if prog[i+7].K != seccompRetKillProcess || prog[i+8].K != seccompRetAllow {
-		t.Fatalf("mmap tail = %+v", prog[i+7:i+9])
-	}
-	// Both jumps land on the same ALLOW: from check0's jeq (i+3) +1+4 = i+8; from check1's jeq (i+6) +1+1 = i+8.
-	i += 9
-	if prog[i] != bpfJump(bpfJMP|bpfJEQ|bpfK, 10, 0, 5) || prog[i+3] != bpfJump(bpfJMP|bpfJEQ|bpfK, 0, 1, 0) || prog[i+4].K != seccompRetKillProcess || prog[i+5].K != seccompRetAllow {
-		t.Fatalf("mprotect block = %+v", prog[i:i+6])
-	}
-	if last := prog[len(prog)-1]; last.K != seccompRetKillProcess {
-		t.Fatalf("default = %+v", last)
-	}
-	// Audit mode logs instead of killing, but a foreign arch still dies.
-	audit, _, err := buildSeccompProgram(auditArchAARCH64, fakeSyscallTable, []string{"read"}, nil, SeccompAudit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if audit[2].K != seccompRetKillProcess || audit[len(audit)-1].K != seccompRetLog {
-		t.Fatalf("audit program = arch-kill %#x default %#x", audit[2].K, audit[len(audit)-1].K)
-	}
-	// aarch64 has no x32 guard.
-	if audit[4] != bpfJump(bpfJMP|bpfJEQ|bpfK, 0, 0, 1) {
-		t.Fatalf("aarch64 first allow = %+v (x32 guard must be absent)", audit[4])
-	}
-}
-
-func TestSeccompProgramRejectsBadRules(t *testing.T) {
-	for name, rules := range map[string][]SeccompArgRule{
-		"no masks":       {{Syscall: "read"}},
-		"bad arg":        {{Syscall: "read", DenyIfAll: []SeccompArgMask{{Arg: 6, Mask: 1}}}},
-		"zero mask":      {{Syscall: "read", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 0}}}},
-		"duplicate rule": {{Syscall: "read", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 1}}}, {Syscall: "read", DenyIfAll: []SeccompArgMask{{Arg: 1, Mask: 1}}}},
-		"too many masks": {{Syscall: "read", DenyIfAll: make([]SeccompArgMask, 7)}},
+// The builder itself is tested in pkg/hostproc; the jail adds only its
+// modes, which pick the fall-through result.
+func TestSeccompProgramModes(t *testing.T) {
+	rules := []SeccompArgRule{{Syscall: "mprotect", DenyIfAll: []SeccompArgMask{{Arg: 2, Mask: 0x4}}}}
+	for _, tc := range []struct {
+		mode string
+		want uint32
+	}{
+		{SeccompEnforce, hostproc.SeccompRetKillProcess},
+		{"", hostproc.SeccompRetKillProcess},
+		{SeccompAudit, hostproc.SeccompRetLog},
 	} {
-		if _, _, err := buildSeccompProgram(auditArchX86_64, fakeSyscallTable, []string{"read"}, rules, SeccompEnforce); err == nil {
-			t.Fatalf("%s: accepted", name)
+		prog, unknown, err := buildSeccompProgram(hostproc.AuditArchX86_64, fakeSyscallTable, []string{"read", "nope", "mprotect"}, rules, tc.mode)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.mode, err)
+		}
+		if len(unknown) != 1 || unknown[0] != "nope" {
+			t.Fatalf("%q: unknown = %v", tc.mode, unknown)
+		}
+		if last := prog[len(prog)-1]; last.K != tc.want {
+			t.Fatalf("%q: default = %#x, want %#x", tc.mode, last.K, tc.want)
+		}
+		// The mprotect rule refuses with the mode's result too.
+		if deny := prog[len(prog)-3]; deny.K != tc.want {
+			t.Fatalf("%q: rule deny = %#x, want %#x", tc.mode, deny.K, tc.want)
 		}
 	}
-	if _, _, err := buildSeccompProgram(auditArchX86_64, fakeSyscallTable, []string{"read"}, nil, "sometimes"); err == nil {
+	if _, _, err := buildSeccompProgram(hostproc.AuditArchX86_64, fakeSyscallTable, []string{"read"}, nil, "sometimes"); err == nil {
 		t.Fatal("unknown mode accepted")
-	}
-	// A rule for a syscall this arch lacks is reported, not fatal.
-	_, unknown, err := buildSeccompProgram(auditArchX86_64, fakeSyscallTable, nil, []SeccompArgRule{{Syscall: "ghost", DenyIfAll: []SeccompArgMask{{Arg: 0, Mask: 1}}}}, SeccompEnforce)
-	if err != nil || len(unknown) != 1 || unknown[0] != "ghost" {
-		t.Fatalf("ghost rule: unknown=%v err=%v", unknown, err)
-	}
-	// The kernel's length ceiling.
-	big := make(map[string]int, 3000)
-	names := make([]string, 0, 3000)
-	for i := range 3000 {
-		n := "s" + strings.Repeat("x", i%7) + string(rune('a'+i%26)) + strings.Repeat("y", i/26)
-		big[n] = i
-		names = append(names, n)
-	}
-	if _, _, err := buildSeccompProgram(auditArchX86_64, big, names, nil, SeccompEnforce); err == nil {
-		t.Fatal("oversized program accepted")
-	}
-	nrs, unknown := resolveSyscalls([]string{"close", "read", "read", "zzz"}, fakeSyscallTable)
-	if len(nrs) != 2 || nrs[0] != 0 || nrs[1] != 3 || len(unknown) != 1 {
-		t.Fatalf("resolve = %v %v", nrs, unknown)
-	}
-}
-
-// Every name the driver's default profile uses resolves on both Linux
-// architectures we ship, except the legacy x86-64-only calls, which must be
-// absent on arm64 exactly (not misspelled into oblivion on both).
-func TestSeccompSyscallTablesAgree(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		if seccompSyscallTable() != nil || seccompAuditArch() != 0 {
-			t.Fatal("non-linux must have no table")
-		}
-		t.Skip("architecture tables are compiled on linux only")
-	}
-	table := seccompSyscallTable()
-	if len(table) < 120 {
-		t.Fatalf("table has %d entries", len(table))
-	}
-	for _, must := range []string{"read", "mmap", "mprotect", "clone3", "set_tid_address", "execve", "epoll_pwait", "getrandom", "rseq", "futex", "exit_group"} {
-		if _, ok := table[must]; !ok {
-			t.Fatalf("%s missing from the %s table", must, runtime.GOARCH)
-		}
-	}
-	legacy := []string{"open", "stat", "poll", "select", "dup2", "pipe", "eventfd", "getdents", "readlink", "access", "epoll_wait", "arch_prctl", "lstat"}
-	for _, name := range legacy {
-		_, ok := table[name]
-		if runtime.GOARCH == "amd64" && !ok {
-			t.Fatalf("legacy %s missing on amd64", name)
-		}
-		if runtime.GOARCH == "arm64" && ok {
-			t.Fatalf("legacy %s present on arm64", name)
-		}
 	}
 }
 
 func TestJailShimSpecRoundTripAndValidation(t *testing.T) {
 	spec := jailShimSpec{Chroot: "/srv/j/acme", Cwd: "/run", UID: 1001, GID: 1001, Argv: []string{"/workerd", "serve"}, Env: []string{"HOME=/run"},
-		Seccomp: []bpfInsn{bpfStmt(bpfRET|bpfK, seccompRetAllow)}}
+		Seccomp: []bpfInsn{{Code: 0x06, K: hostproc.SeccompRetAllow}}}
 	raw, err := encodeJailShimSpec(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +67,7 @@ func TestJailShimSpecRoundTripAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Chroot != spec.Chroot || got.UID != 1001 || got.Argv[1] != "serve" || len(got.Seccomp) != 1 || got.Seccomp[0].K != seccompRetAllow {
+	if got.Chroot != spec.Chroot || got.UID != 1001 || got.Argv[1] != "serve" || len(got.Seccomp) != 1 || got.Seccomp[0].K != hostproc.SeccompRetAllow {
 		t.Fatalf("round trip = %+v", got)
 	}
 	for name, bad := range map[string]jailShimSpec{
@@ -173,7 +77,7 @@ func TestJailShimSpecRoundTripAndValidation(t *testing.T) {
 		"root gid":        {Chroot: "/s", Cwd: "/run", UID: 1, GID: 0, Argv: []string{"/w"}},
 		"no argv":         {Chroot: "/s", Cwd: "/run", UID: 1, GID: 1},
 		"relative argv":   {Chroot: "/s", Cwd: "/run", UID: 1, GID: 1, Argv: []string{"workerd"}},
-		"huge program":    {Chroot: "/s", Cwd: "/run", UID: 1, GID: 1, Argv: []string{"/w"}, Seccomp: make([]bpfInsn, bpfMaxInsns+1)},
+		"huge program":    {Chroot: "/s", Cwd: "/run", UID: 1, GID: 1, Argv: []string{"/w"}, Seccomp: make([]bpfInsn, hostproc.MaxSeccompInsns+1)},
 	} {
 		if _, err := encodeJailShimSpec(bad); err == nil {
 			t.Fatalf("%s: accepted", name)

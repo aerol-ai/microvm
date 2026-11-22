@@ -2,6 +2,7 @@ package mounts
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -330,7 +331,7 @@ func TestAdoptOneRefuses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			withProbeMount(t, tt.probe)
-			state, bind := m.adoptOne("sb-a", 0, tt.spec, tt.helpers)
+			state, bind := m.adoptOne(context.Background(), "sb-a", 0, tt.spec, tt.helpers)
 			if (state != nil) != tt.adopted {
 				t.Fatalf("adopted = %v, want %v", state != nil, tt.adopted)
 			}

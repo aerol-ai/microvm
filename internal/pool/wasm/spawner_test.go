@@ -204,3 +204,30 @@ func TestSupervisorSpawnerShutdownWithSupervisor(t *testing.T) {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }
+
+// A warm slot's worker gets the compile cache made for its slot's folder
+// (the WASM driver's SlotCompileCache), never one other slots share.
+func TestSupervisorSpawnerSlotCompileCache(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cache func(string) string
+		want  bool
+	}{
+		{"no hook", nil, false},
+		{"hook without a cache", func(string) string { return "" }, false},
+		{"slot cache", func(slotDir string) string { return filepath.Join(slotDir, "cache") }, true},
+	} {
+		slotDir := t.TempDir()
+		var got string
+		sup := worker.NewSupervisor(func(ctx context.Context, _ string) (*exec.Cmd, error) {
+			got = worker.CompileCacheOf(ctx)
+			return nil, errSpawnFail
+		})
+		ss := NewSupervisorSpawner(sup)
+		ss.CompileCache = tc.cache
+		_ = ss.Warm(context.Background(), "slot1", filepath.Join(slotDir, "worker.sock"), "/mod.wasm", 0)
+		if want := filepath.Join(slotDir, "cache"); (got == want) != tc.want || !tc.want && got != "" {
+			t.Fatalf("%s: worker cache = %q", tc.name, got)
+		}
+	}
+}

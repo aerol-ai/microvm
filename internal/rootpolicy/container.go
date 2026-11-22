@@ -43,6 +43,60 @@ type Runtime struct {
 // CheckContainer checks a container record as Containers.Create would store
 // it: its ID, labels, snapshotter, runtime and OCI spec.
 func CheckContainer(p Policy, c Container) error {
+	_, err := CheckContainerWith(p, c, nil)
+	return err
+}
+
+// Checked is what the gate checks on disk for a container CheckContainer
+// passed: the paths runc binds in, the paths root reads, and the network
+// namespace it joins. All of it comes from the decode the check read.
+type Checked struct {
+	// BindSources are SpecBindSources.
+	BindSources []string
+	// RootReads are ContainerRootReads.
+	RootReads []RootRead
+	// Netns is ContainerNetns.
+	Netns string
+}
+
+// SpecCheck checks a container's spec bytes for its ID and returns the
+// spec's facts. CheckSpecFacts is the check; anything put in its place (the
+// gate's memo) must answer exactly as CheckSpecFacts would for those bytes.
+type SpecCheck func(containerID string, raw []byte) (*SpecFacts, error)
+
+// CheckContainerWith is CheckContainer, and on a pass what the gate then
+// checks on disk. The spec is decoded once. spec, when set, stands in for
+// CheckSpecFacts(p, ...); nil means CheckSpecFacts itself.
+func CheckContainerWith(p Policy, c Container, spec SpecCheck) (Checked, error) {
+	if err := checkContainerRecord(p, c); err != nil {
+		return Checked{}, err
+	}
+	var facts *SpecFacts
+	var err error
+	if spec != nil {
+		facts, err = spec(c.ID, c.Spec)
+	} else {
+		facts, err = CheckSpecFacts(p, c.ID, c.Spec)
+	}
+	if err != nil {
+		return Checked{}, err
+	}
+	if facts == nil { // fail closed on a stand-in that answers nothing
+		return Checked{}, violate(RuleSpec, "the spec check gave no answer")
+	}
+	reads, err := runtimeRootReads(c.Runtime)
+	if err != nil {
+		return Checked{}, err
+	}
+	if facts.restore != "" {
+		reads = append(reads, RootRead{Path: facts.restore, Folder: true, Rule: RuleCheckpoint})
+	}
+	// A copy: the facts may be shared, and the caller owns what it gets.
+	return Checked{BindSources: slices.Clone(facts.bindSources), RootReads: reads, Netns: facts.netns}, nil
+}
+
+// checkContainerRecord is CheckContainer without the spec, which comes last.
+func checkContainerRecord(p Policy, c Container) error {
 	if err := ValidateID(c.ID); err != nil {
 		return err
 	}
@@ -64,7 +118,7 @@ func CheckContainer(p Policy, c Container) error {
 	if c.SpecTypeURL != SpecTypeURL {
 		return violate(RuleSpec, "spec type %q is not the OCI runtime spec (%s)", c.SpecTypeURL, SpecTypeURL)
 	}
-	return CheckSpecJSON(p, c.ID, c.Spec)
+	return nil
 }
 
 // reservedLabelPrefix is containerd's own label space on containers. Its
@@ -236,15 +290,19 @@ func ContainerNetns(c Container) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return netnsOf(s), nil
+}
+
+func netnsOf(s *specs.Spec) string {
 	if s.Linux == nil {
-		return "", nil
+		return ""
 	}
 	for _, ns := range s.Linux.Namespaces {
 		if ns.Type == specs.NetworkNamespace && ns.Path != "" {
-			return path.Base(ns.Path), nil
+			return path.Base(ns.Path)
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // CheckNamespace allows only the agent's own containerd namespace.

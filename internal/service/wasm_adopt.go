@@ -132,8 +132,9 @@ func (s *Service) adoptWasmSandbox(ctx context.Context, adopter wasmAdopter, sb 
 		return wasmSkipped
 	} else if len(specs) > 0 && s.mounts != nil {
 		// The sandbox is still running: a refused stored mount is kept or
-		// torn down, never run again (reestablishRunningMounts).
-		if err := s.reestablishRunningMounts(withAuditSubsystem(ctx, auditSubsystemBootRestore), sb.ID, specs); err != nil {
+		// torn down, never run again (reestablishRunningMounts). Its mounts
+		// are its worker's (wasmMountCtx), as when they were first made.
+		if err := s.reestablishRunningMounts(withAuditSubsystem(s.wasmMountCtx(ctx), auditSubsystemBootRestore), sb.ID, specs); err != nil {
 			s.logger.Warn("wasm adopt: mounts not re-established; sandbox left to reconcile", "sandbox_id", sb.ID, "error", err)
 			return wasmSkipped
 		}

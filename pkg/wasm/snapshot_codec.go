@@ -143,9 +143,11 @@ func WriteSnapshotDir(dst string, cap SnapshotCapture) error {
 	return nil
 }
 
-// ReadSnapshotDir loads and validates a mem.snap directory.
+// ReadSnapshotDir loads and validates a mem.snap directory. Its files are
+// read through the descriptors sandboxd granted for them when it did
+// (SnapshotFiles), so a worker needs no access to where they live.
 func ReadSnapshotDir(dir string, runningEngine string) (SnapshotRestoreInput, error) {
-	cfgBytes, err := os.ReadFile(filepath.Join(dir, configFileName))
+	cfgBytes, err := ReadHostFile(filepath.Join(dir, configFileName))
 	if err != nil {
 		return SnapshotRestoreInput{}, snapshotCorrupt(fmt.Errorf("read config: %w", err))
 	}
@@ -162,7 +164,7 @@ func ReadSnapshotDir(dir string, runningEngine string) (SnapshotRestoreInput, er
 	if cfg.Engine != runningEngine {
 		return SnapshotRestoreInput{}, snapshotCorruptf("engine mismatch: artifact=%s running=%s", cfg.Engine, runningEngine)
 	}
-	memZ, err := os.ReadFile(filepath.Join(dir, memoryFileName))
+	memZ, err := ReadHostFile(filepath.Join(dir, memoryFileName))
 	if err != nil {
 		return SnapshotRestoreInput{}, snapshotCorrupt(fmt.Errorf("read memory layer: %w", err))
 	}
@@ -173,11 +175,11 @@ func ReadSnapshotDir(dir string, runningEngine string) (SnapshotRestoreInput, er
 	if got := checksumPrefixed(mem); got != strings.TrimSpace(cfg.MemoryChecksum) {
 		return SnapshotRestoreInput{}, snapshotCorruptf("memory checksum mismatch")
 	}
-	globals, err := os.ReadFile(filepath.Join(dir, globalsFileName))
+	globals, err := ReadHostFile(filepath.Join(dir, globalsFileName))
 	if err != nil {
 		return SnapshotRestoreInput{}, snapshotCorrupt(fmt.Errorf("read globals: %w", err))
 	}
-	wasi, err := os.ReadFile(filepath.Join(dir, wasiStateFileName))
+	wasi, err := ReadHostFile(filepath.Join(dir, wasiStateFileName))
 	if err != nil {
 		return SnapshotRestoreInput{}, snapshotCorrupt(fmt.Errorf("read wasi state: %w", err))
 	}
@@ -258,6 +260,17 @@ func snapshotCorrupt(err error) error {
 
 func snapshotCorruptf(format string, args ...any) error {
 	return snapshotCorrupt(fmt.Errorf(format, args...))
+}
+
+// SnapshotFiles names the files a mem.snap directory at dir holds: what
+// sandboxd opens and grants a worker for a restore.
+func SnapshotFiles(dir string) []string {
+	return []string{
+		filepath.Join(dir, configFileName),
+		filepath.Join(dir, memoryFileName),
+		filepath.Join(dir, globalsFileName),
+		filepath.Join(dir, wasiStateFileName),
+	}
 }
 
 // SnapshotMediaTypes documents the v1 layer media types for AOCR push.

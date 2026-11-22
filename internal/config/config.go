@@ -46,6 +46,12 @@ const (
 // the default cannot drift between the two layers.
 const DefaultContainerdRunDir = "/var/lib/sandboxd/containerd"
 
+// DefaultWasmWorkerID is the uid and gid WASM workers drop to by default:
+// in the gap between what adduser hands out (to 59999) and systemd's
+// dynamic users (from 61184), below container subordinate ids (from
+// 100000), and not Kubernetes' 65532.
+const DefaultWasmWorkerID = 61000
+
 // DefaultRootdSocket is the root helper's socket (internal/rootclient's
 // DefaultSocket, which pkg/daemon's tests pin it to).
 const DefaultRootdSocket = "/run/aerolvm-rootd/sock/root.sock"
@@ -870,6 +876,12 @@ type Config struct {
 	// answers HTTP 429. Values above the worker's ceiling (32) count as 32.
 	// Default 4. SB_WASM_MAX_STREAMS_PER_SANDBOX.
 	WasmMaxStreamsPerSandbox int
+	// WasmGuestHTTPMaxInFlight caps the requests to one WASM sandbox's
+	// exposed ports that sandboxd relays at once; past it the gateway
+	// answers 503 at once. Each one holds a sandboxd goroutine and a
+	// connection to the guest for as long as the guest takes to answer.
+	// 0 or less means the default, 64. SB_WASM_GUEST_HTTP_MAX_INFLIGHT.
+	WasmGuestHTTPMaxInFlight int
 	// WasmStreamMaxMessageBytes caps one client message on a WASM exec
 	// stream (a stdin chunk or a control frame). The stream is served by
 	// sandboxd, which reads each message whole. Default 1 MiB.
@@ -1048,6 +1060,21 @@ type Config struct {
 	// drops to inside the jail. SB_ISOLATE_JAIL_UID / SB_ISOLATE_JAIL_GID.
 	IsolateJailUID int
 	IsolateJailGID int
+	// WasmWorkerDropPrivs makes every WASM worker and resident host drop to
+	// WasmWorkerUID/GID, set no_new_privs and install a seccomp filter
+	// before it runs a module, each in a PID namespace of its own
+	// (pkg/wasm/worker/confine.go): an escape from the WASM engine is then
+	// not root on the host. Default true. Applies only where sandboxd runs
+	// as root on Linux; false is the escape hatch (workers then run as
+	// sandboxd). SB_WASM_WORKER_DROP_PRIVS.
+	WasmWorkerDropPrivs bool
+	// WasmWorkerUID / WasmWorkerGID are what WASM workers drop to: a uid of
+	// their own, outside the ranges useradd, systemd's dynamic users and
+	// container subordinate ids hand out, and never the isolate jail's, so
+	// no other process on the node shares it. SB_WASM_WORKER_UID /
+	// SB_WASM_WORKER_GID.
+	WasmWorkerUID int
+	WasmWorkerGID int
 	// IsolateJailCgroupRoot is the parent cgroup (v2) for per-group cgroups
 	// (cpu.max / memory.max from the group's caps). SB_ISOLATE_JAIL_CGROUP_ROOT.
 	IsolateJailCgroupRoot string
@@ -2804,6 +2831,7 @@ func load(keyTool bool) (Config, error) {
 		WasmPullTimeout:           getEnvDuration("SB_WASM_PULL_TIMEOUT", 60*time.Second),
 		WasmStandardModules:       parseWasmStandardModules(getEnv("SB_WASM_STANDARD_MODULES", "")),
 		WasmMaxStreamsPerSandbox:  getEnvInt("SB_WASM_MAX_STREAMS_PER_SANDBOX", 4),
+		WasmGuestHTTPMaxInFlight:  getEnvInt("SB_WASM_GUEST_HTTP_MAX_INFLIGHT", 64),
 		WasmStreamMaxMessageBytes: getEnvInt64("SB_WASM_STREAM_MAX_MESSAGE_BYTES", 1<<20),
 		WasmSessionLogBytes:       getEnvInt("SB_WASM_SESSION_LOG_BYTES", 1<<20),
 		WasmMaxSessionsPerSandbox: getEnvInt("SB_WASM_MAX_SESSIONS_PER_SANDBOX", 16),
@@ -2851,6 +2879,9 @@ func load(keyTool bool) (Config, error) {
 		IsolateJailChrootBase:        getEnv("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail"),
 		IsolateJailUID:               getEnvInt("SB_ISOLATE_JAIL_UID", 1000),
 		IsolateJailGID:               getEnvInt("SB_ISOLATE_JAIL_GID", 1000),
+		WasmWorkerDropPrivs:          getEnvBool("SB_WASM_WORKER_DROP_PRIVS", true),
+		WasmWorkerUID:                getEnvInt("SB_WASM_WORKER_UID", DefaultWasmWorkerID),
+		WasmWorkerGID:                getEnvInt("SB_WASM_WORKER_GID", DefaultWasmWorkerID),
 		IsolateJitless:               getEnvBool("SB_ISOLATE_JITLESS", false),
 		IsolateJailCgroupRoot:        getEnv("SB_ISOLATE_JAIL_CGROUP_ROOT", "/sys/fs/cgroup/aerolvm-isolate"),
 		IsolateJailPidsMax:           getEnvInt("SB_ISOLATE_JAIL_PIDS_MAX", 512),
@@ -3210,6 +3241,17 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.WasmDefaultMemoryMB < 0 {
 			return Config{}, errors.New("SB_WASM_DEFAULT_MEMORY_MB must be >= 0")
+		}
+		if cfg.WasmWorkerDropPrivs {
+			// Dropping to uid/gid 0 is not dropping privileges.
+			if cfg.WasmWorkerUID <= 0 || cfg.WasmWorkerGID <= 0 {
+				return Config{}, fmt.Errorf("SB_WASM_WORKER_UID/SB_WASM_WORKER_GID must be non-root (> 0) when SB_WASM_WORKER_DROP_PRIVS=true (got %d/%d)", cfg.WasmWorkerUID, cfg.WasmWorkerGID)
+			}
+			// A uid shared with workerd would let an escape from either
+			// runtime signal or read the other's processes and files.
+			if cfg.EnableIsolate && cfg.IsolateUseJail && cfg.WasmWorkerUID == cfg.IsolateJailUID {
+				return Config{}, fmt.Errorf("SB_WASM_WORKER_UID must differ from SB_ISOLATE_JAIL_UID (both %d)", cfg.WasmWorkerUID)
+			}
 		}
 		if cfg.WasmCheckpointMaxParallel < 0 {
 			return Config{}, errors.New("SB_WASM_CHECKPOINT_MAX_PARALLEL must be >= 0")
@@ -3662,6 +3704,11 @@ func load(keyTool bool) (Config, error) {
 		// jailed (chroot + cgroup + privilege drop + enforcing seccomp). The
 		// jail-off and audit/off filter modes exist for bring-up and
 		// diagnosis, not for the hardened posture.
+		// A WASM worker runs tenant modules; one that keeps root makes an
+		// engine escape a host takeover.
+		if cfg.EnableWasm && !cfg.WasmWorkerDropPrivs {
+			return Config{}, errors.New("SB_WASM_WORKER_DROP_PRIVS must be true when SB_ENTERPRISE_MODE=true and SB_ENABLE_WASM=true (an escape from the WASM engine must not be root)")
+		}
 		if cfg.EnableIsolate && !cfg.IsolateUseJail {
 			return Config{}, errors.New("SB_ISOLATE_USE_JAIL must be true when SB_ENTERPRISE_MODE=true and SB_ENABLE_ISOLATE=true (the workerd jail is the cross-tenant boundary)")
 		}

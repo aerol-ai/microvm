@@ -2,8 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -26,15 +32,27 @@ func NewClient(socketPath string) *Client {
 	}
 }
 
-func (c *Client) roundTrip(env Envelope) (Envelope, error) {
-	dial := c.dial
-	socketPath := c.socketPath
-	conn, err := dial(socketPath)
+// dialWorker opens sandboxd's connection to the worker at path: refused
+// for a quarantined worker, and read so that no descriptor the worker
+// sends is released on the caller's goroutine (reaper.go).
+func dialWorker(dial func(string) (net.Conn, error), path string) (net.Conn, error) {
+	if err := workerQuarantined(path); err != nil {
+		return nil, err
+	}
+	conn, err := dial(path)
+	if err != nil {
+		return nil, err
+	}
+	return wrapWorkerConn(conn, path)
+}
+
+func (c *Client) roundTrip(env Envelope, grants ...string) (Envelope, error) {
+	conn, err := dialWorker(c.dial, c.socketPath)
 	if err != nil {
 		return Envelope{}, err
 	}
 	defer conn.Close()
-	if err := writeFrame(conn, env); err != nil {
+	if err := writeGranted(conn, env, grants); err != nil {
 		return Envelope{}, err
 	}
 	reply, err := readFrame(conn)
@@ -44,7 +62,21 @@ func (c *Client) roundTrip(env Envelope) (Envelope, error) {
 	return reply, nil
 }
 
-func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, error) {
+// roundTripStrict is roundTrip where the paths in strict must be files
+// root owns.
+func (c *Client) roundTripStrict(env Envelope, grants, strict []string) (Envelope, error) {
+	conn, err := dialWorker(c.dial, c.socketPath)
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer conn.Close()
+	if err := writeGrantedFiles(conn, env, grants, strict); err != nil {
+		return Envelope{}, err
+	}
+	return readFrame(conn)
+}
+
+func (c *Client) roundTripContext(ctx context.Context, env Envelope, grants ...string) (Envelope, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -56,7 +88,7 @@ func (c *Client) roundTripContext(ctx context.Context, env Envelope) (Envelope, 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	if err := writeFrame(conn, env); err != nil {
+	if err := writeGranted(conn, env, grants); err != nil {
 		if ctxErr := contextErr(ctx); ctxErr != nil {
 			return Envelope{}, ctxErr
 		}
@@ -111,7 +143,7 @@ func (c *Client) dialContext(ctx context.Context) (net.Conn, error) {
 	socketPath := c.socketPath
 	defer close(done)
 	go func() {
-		conn, err := dial(socketPath)
+		conn, err := dialWorker(dial, socketPath)
 		select {
 		case ch <- dialResult{conn: conn, err: err}:
 		case <-done:
@@ -215,7 +247,7 @@ func (c *Client) LoadModule(sandboxID, path string, memoryMB int) (wasmengine.Lo
 	if err != nil {
 		return wasmengine.LoadTimings{}, err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgLoadModule, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTrip(Envelope{Type: MsgLoadModule, SandboxID: sandboxID, Payload: body}, path)
 	if err != nil {
 		return wasmengine.LoadTimings{}, err
 	}
@@ -236,7 +268,7 @@ func (c *Client) Instantiate(sandboxID string, caps wasmengine.Capabilities) err
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgInstantiate, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTrip(Envelope{Type: MsgInstantiate, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
 	if err != nil {
 		return err
 	}
@@ -249,7 +281,7 @@ func (c *Client) Exec(sandboxID string, caps wasmengine.Capabilities, export str
 	if err != nil {
 		return wasmengine.RunResult{}, err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgExec, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTrip(Envelope{Type: MsgExec, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
 	if err != nil {
 		return wasmengine.RunResult{}, err
 	}
@@ -288,13 +320,14 @@ func (c *Client) Invoke(sandboxID, export string) error {
 	return c.expectOK(reply)
 }
 
-// Checkpoint writes a mem.snap artifact to outDir.
+// Checkpoint writes a mem.snap artifact to outDir. The worker is granted
+// outDir's parent, where it writes the artifact and its temporary copy.
 func (c *Client) Checkpoint(ctx context.Context, sandboxID, outDir string, meta wasmengine.SnapshotConfig) error {
 	body, err := encodePayload(checkpointPayload{OutDir: outDir, Meta: meta})
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgCheckpoint, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTripContext(ctx, Envelope{Type: MsgCheckpoint, SandboxID: sandboxID, Payload: body}, filepath.Dir(outDir))
 	if err != nil {
 		return err
 	}
@@ -302,12 +335,14 @@ func (c *Client) Checkpoint(ctx context.Context, sandboxID, outDir string, meta 
 }
 
 // Restore loads a mem.snap artifact from dir into the active worker engine.
+// The worker is granted the artifact's files, never their directory.
 func (c *Client) Restore(sandboxID, dir string, caps wasmengine.Capabilities) error {
 	body, err := encodePayload(restorePayload{Dir: dir, Caps: caps})
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgRestore, SandboxID: sandboxID, Payload: body})
+	files := wasmengine.SnapshotFiles(dir)
+	reply, err := c.roundTripStrict(Envelope{Type: MsgRestore, SandboxID: sandboxID, Payload: body}, append(preopenPaths(caps), files...), files)
 	if err != nil {
 		return err
 	}
@@ -320,7 +355,7 @@ func (c *Client) SetCapability(sandboxID string, caps wasmengine.Capabilities) e
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgSetCapability, SandboxID: sandboxID, Payload: body})
+	reply, err := c.roundTrip(Envelope{Type: MsgSetCapability, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
 	if err != nil {
 		return err
 	}
@@ -409,4 +444,147 @@ func (c *Client) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bo
 func (c *Client) TriggerPanic(sandboxID string) error {
 	_, err := c.roundTrip(Envelope{Type: MsgTriggerPanic, SandboxID: sandboxID})
 	return err
+}
+
+// preopenPaths are the host directories caps maps into the guest: what a
+// message that (re)instantiates the guest grants the worker.
+func preopenPaths(caps wasmengine.Capabilities) []string {
+	paths := make([]string, 0, len(caps.Preopens))
+	for _, p := range caps.Preopens {
+		paths = append(paths, p.HostPath)
+	}
+	return paths
+}
+
+// writeGranted writes env with an open descriptor for each of paths
+// attached (writeFrameFiles). sandboxd opens them as root; a path it cannot
+// open, or that is neither a directory nor a regular file, is left out and
+// the worker opens it itself, failing where it would have failed anyway.
+// The descriptors are closed once sent: the worker has its own copies.
+func writeGranted(conn net.Conn, env Envelope, paths []string) error {
+	return writeGrantedFiles(conn, env, paths, nil)
+}
+
+// writeGrantedFiles is writeGranted where the paths in strict must be files
+// root owns (snapshot files: openGrantPath).
+func writeGrantedFiles(conn net.Conn, env Envelope, paths, strict []string) error {
+	files, names := openGrantsStrict(paths, strict)
+	defer closeFiles(files)
+	env.FDPaths = names
+	return writeFrameFiles(conn, env, files)
+}
+
+func openGrants(paths []string) ([]*os.File, []string) {
+	return openGrantsStrict(paths, nil)
+}
+
+func openGrantsStrict(paths, strict []string) ([]*os.File, []string) {
+	var files []*os.File
+	var names []string
+	seen := map[string]struct{}{}
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" || len(files) == maxFrameFiles {
+			continue
+		}
+		path = filepath.Clean(path)
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		f, err := openGrant(path, grantOpenTimeout, slices.Contains(strict, path))
+		if err != nil {
+			continue
+		}
+		files = append(files, f)
+		names = append(names, path)
+	}
+	return files, names
+}
+
+// grantOpenTimeout bounds one open in openGrants. A mount folder on a
+// stalled network mount can hang an open; the message then goes without
+// that grant (the worker fails to reach the mount, which is stalled
+// anyway) rather than hold up the sandboxd request that sends it.
+var grantOpenTimeout = 2 * time.Second
+
+var errGrantTimeout = errors.New("open timed out")
+
+// grantOpener is the open openGrant bounds (tests stand in a hung one).
+var grantOpener = openGrantPath
+
+// An open that outlives its timeout keeps running, and holds one of
+// sandboxd's threads until the mount answers. A sandbox's messages name
+// its mounts again and again (every exec, instantiate, set-capability and
+// restore), so a path whose open is stuck is not opened again until that
+// open returns: the message goes without the grant at once. And no more
+// than maxGrantOpens opens run at once, stuck ones included, so stalled
+// mounts can hold that many threads at most, far below the Go runtime's
+// limit, at which the process dies. Past it, messages go without grants.
+var (
+	grantOpensMu  sync.Mutex
+	grantRunning  int
+	grantStuck    = map[string]struct{}{}
+	maxGrantOpens = 512
+)
+
+var (
+	errGrantStuck = errors.New("an earlier open of this path has not returned")
+	errGrantBusy  = errors.New("too many opens in flight")
+)
+
+// openGrant opens path for a grant (openGrantPath), giving up after
+// timeout. O_NONBLOCK keeps a FIFO from hanging the open; the type check
+// then refuses it.
+func openGrant(path string, timeout time.Duration, strict bool) (*os.File, error) {
+	grantOpensMu.Lock()
+	if _, stuck := grantStuck[path]; stuck {
+		grantOpensMu.Unlock()
+		return nil, errGrantStuck
+	}
+	if grantRunning >= maxGrantOpens {
+		grantOpensMu.Unlock()
+		return nil, errGrantBusy
+	}
+	grantRunning++
+	grantOpensMu.Unlock()
+	type result struct {
+		f   *os.File
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		f, err := grantOpener(path, strict)
+		done <- result{f, err}
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		grantOpenDone(path, false)
+		return r.f, r.err
+	case <-t.C:
+		grantOpensMu.Lock()
+		grantStuck[path] = struct{}{}
+		grantOpensMu.Unlock()
+		// Close it if the open ever returns; the path may be opened again
+		// from then on.
+		go func() {
+			if r := <-done; r.f != nil {
+				_ = r.f.Close()
+			}
+			grantOpenDone(path, true)
+		}()
+		return nil, errGrantTimeout
+	}
+}
+
+// grantOpenDone ends an open openGrant started.
+func grantOpenDone(path string, stuck bool) {
+	grantOpensMu.Lock()
+	grantRunning--
+	if stuck {
+		delete(grantStuck, path)
+	}
+	grantOpensMu.Unlock()
 }

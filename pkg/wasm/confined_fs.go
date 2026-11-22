@@ -64,7 +64,12 @@ func (c *confinedFS) openRoot() (*os.Root, experimentalsys.Errno) {
 		return nil, experimentalsys.EBADF
 	}
 	if c.root == nil {
-		r, err := os.OpenRoot(c.dir)
+		var r *os.Root
+		err := WithHostPath(c.dir, func(dir string) error {
+			var err error
+			r, err = os.OpenRoot(dir)
+			return err
+		})
 		if err != nil {
 			return nil, experimentalsys.UnwrapOSError(err)
 		}

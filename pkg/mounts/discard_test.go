@@ -2,6 +2,7 @@ package mounts
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"os"
@@ -139,7 +140,7 @@ func TestAdoptKernelMountRemountsNosuidNodev(t *testing.T) {
 	spec := models.MountSpec{Type: models.MountTypeNFS, Source: "h:/e", Target: "/nfs"}
 	hostPath := m.hostPath("sb-k", 0)
 
-	if state, _ := m.adoptOne("sb-k", 0, spec, nil); state == nil {
+	if state, _ := m.adoptOne(context.Background(), "sb-k", 0, spec, nil); state == nil {
 		t.Fatal("a live kernel mount was not adopted")
 	}
 	if len(remounted) != 1 || remounted[0] != hostPath {
@@ -147,7 +148,7 @@ func TestAdoptKernelMountRemountsNosuidNodev(t *testing.T) {
 	}
 
 	remountErr = errors.New("mount: permission denied")
-	if state, _ := m.adoptOne("sb-k", 0, spec, nil); state != nil {
+	if state, _ := m.adoptOne(context.Background(), "sb-k", 0, spec, nil); state != nil {
 		t.Fatal("adopted a kernel mount whose nosuid,nodev could not be set")
 	}
 	if !strings.Contains(logs.String(), "could not set nosuid,nodev") {

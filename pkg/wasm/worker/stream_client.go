@@ -79,7 +79,9 @@ func (c *Client) StartExec(ctx context.Context, sandboxID string, p ExecStartPay
 		_ = conn.SetDeadline(deadline)
 	}
 	reply, err := func() (Envelope, error) {
-		if err := writeFrame(conn, Envelope{Type: MsgExecStart, SandboxID: sandboxID, Payload: body}); err != nil {
+		// The run's /work and mounts, and a language runtime module.
+		grants := append(preopenPaths(p.Caps), p.ModulePath)
+		if err := writeGranted(conn, Envelope{Type: MsgExecStart, SandboxID: sandboxID, Payload: body}, grants); err != nil {
 			return Envelope{}, err
 		}
 		return readFrame(conn)

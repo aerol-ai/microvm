@@ -3,6 +3,7 @@ package wasm
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -170,6 +171,11 @@ func (a workerClientAdapter) FollowEntrypoint(ctx context.Context, sandboxID str
 
 func (a workerClientAdapter) ProxyHTTP(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error {
 	return a.client.ProxyHTTP(sandboxID, guestPort, w, r)
+}
+
+// ProxyHTTPDialed is the host-dialed proxy (hostDialProxyClient).
+func (a workerClientAdapter) ProxyHTTPDialed(sandboxID string, guestPort int, host string, ports []int, in, out *atomic.Int64, w http.ResponseWriter, r *http.Request) error {
+	return a.client.ProxyHTTPDialed(sandboxID, guestPort, host, ports, in, out, w, r)
 }
 
 // SetListenPorts and ListenPorts give a guest one listener per exposed
