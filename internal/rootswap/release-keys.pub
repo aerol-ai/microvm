@@ -6,4 +6,9 @@ on every node whose runtime image is built from this file, so a change here is
 reviewed like a change to the supervisor itself, and it reaches running nodes
 only with a new runtime image.
 
-No key is listed yet: until one is, the supervisor refuses every staged helper.
+AerolVM release key 1 (made 2026-11-22). The private key stays offline with
+the repo owner; it reaches CI only as a release secret.
+
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAMgf89eeSq2QP6k8liLcrPQNQRaAXrQtHZ6zsOIayM2k=
+-----END PUBLIC KEY-----
