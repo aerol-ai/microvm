@@ -308,7 +308,7 @@ func TestRunHostCLI(t *testing.T) {
 		code int
 		want string
 	}{
-		{nil, 2, "the only command is"},
+		{nil, 2, "the commands are"},
 		{[]string{"apply", "extra"}, 2, `unexpected argument "extra"`},
 		{[]string{"apply", "--bogus"}, 2, "flag provided but not defined"},
 	} {
