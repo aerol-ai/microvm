@@ -6,8 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 
 	"github.com/aerol-ai/microvm/internal/network/buildnet"
 	"github.com/aerol-ai/microvm/internal/network/cni"
@@ -26,6 +29,7 @@ const hostSubcommand = "host"
 
 const hostUsage = `usage: sandboxd host apply [--env-file <path>] [--node-json <path>]
        sandboxd host build-network up|down [--cni-conf <path>] [--cni-plugin-dir <dir>] [--resolv-conf <path>]
+       sandboxd host build-network guard [--steps <cidr>] [--uplink <cidr>] -- <command> [args...]
 
 apply re-renders this node's configuration (sandboxd.env, the Caddyfile,
 the systemd units) from node.json with the install.sh built into this
@@ -36,7 +40,9 @@ sandboxd to use the new settings.
 build-network up makes rootless BuildKit's network namespace (aerolvm.build)
 on the sandboxes' bridge, or keeps the one there, and writes its
 resolv.conf; down removes it. install.sh's aerolvm-build-net.service runs
-it. The CNI settings default to SB_CONTAINERD_CNI_CONF_PATH and
+it. guard runs inside RootlessKit, before buildkitd: it closes the build
+steps' namespace so a step reaches neither another step nor anything on
+this node, then runs the command. The CNI settings default to SB_CONTAINERD_CNI_CONF_PATH and
 SB_CONTAINERD_CNI_PLUGIN_DIR, as sandboxd reads them.
 
 Run as root.
@@ -112,10 +118,17 @@ var (
 	buildNetworkSubnet = cni.BridgeSubnet
 	buildNetworkUp     = buildnet.Up
 	buildNetworkDown   = buildnet.Down
+	buildNetworkGuard  = buildnet.ApplyStepGuard
+	buildNetworkOwn    = buildnet.OwnAddrs
+	buildNetworkExec   = syscall.Exec
+	buildNetworkLook   = exec.LookPath
 )
 
 // runBuildNetworkCLI runs `sandboxd host build-network up|down`.
 func runBuildNetworkCLI(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "guard" {
+		return runBuildNetworkGuard(args[1:], stdout, stderr)
+	}
 	if len(args) == 0 || (args[0] != "up" && args[0] != "down") {
 		for _, a := range args {
 			if a == "-h" || a == "--help" || a == "help" {
@@ -123,7 +136,7 @@ func runBuildNetworkCLI(args []string, stdout, stderr io.Writer) int {
 				return 0
 			}
 		}
-		fmt.Fprintf(stderr, "sandboxd host build-network: want up or down\n%s", hostUsage)
+		fmt.Fprintf(stderr, "sandboxd host build-network: want up, down or guard\n%s", hostUsage)
 		return 2
 	}
 	verb := args[0]
@@ -174,6 +187,54 @@ func runBuildNetworkCLI(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "build network %s %s: %s, address %s\n", buildnet.Name, state, res.Path, res.IP)
 	return 0
+}
+
+// runBuildNetworkGuard runs `sandboxd host build-network guard -- cmd...`:
+// the step guard, then cmd in its place (exec), so buildkitd starts only
+// once the steps' namespace is closed. It returns only on a failure.
+func runBuildNetworkGuard(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sandboxd host build-network guard", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	steps := fs.String("steps", buildnet.StepRange, "")
+	uplink := fs.String("uplink", buildnet.UplinkRange, "")
+	netnsPath := fs.String("netns", buildnet.DetachedNetns(), "")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, hostUsage)
+			return 0
+		}
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: %v\n%s", err, hostUsage)
+		return 2
+	}
+	cmd := fs.Args()
+	if len(cmd) == 0 {
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: name the command to run after it (-- buildkitd ...)\n%s", hostUsage)
+		return 2
+	}
+	stepRange, err1 := netip.ParsePrefix(*steps)
+	uplinkRange, err2 := netip.ParsePrefix(*uplink)
+	if err := errors.Join(err1, err2); err != nil {
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: %v\n", err)
+		return 2
+	}
+	own, err := buildNetworkOwn()
+	if err != nil {
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: this namespace's addresses: %v\n", err)
+		return 1
+	}
+	cfg := buildnet.GuardConfig{Netns: *netnsPath, Steps: stepRange, Uplink: uplinkRange, Own: own}
+	if err := buildNetworkGuard(context.Background(), cfg); err != nil {
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: %v\n", err)
+		return 1
+	}
+	path, err := buildNetworkLook(cmd[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "sandboxd host build-network guard: %v\n", err)
+		return 1
+	}
+	err = buildNetworkExec(path, cmd, os.Environ())
+	fmt.Fprintf(stderr, "sandboxd host build-network guard: run %s: %v\n", cmd[0], err)
+	return 1
 }
 
 func envOr(key, fallback string) string {

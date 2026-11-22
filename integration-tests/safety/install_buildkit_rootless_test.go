@@ -4,12 +4,15 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/network/buildnet"
 )
 
 // Rootless BuildKit (install.sh --buildkit-rootless, plans/security-gaps-
@@ -48,15 +51,17 @@ func tarGz(t *testing.T, files map[string]string) []byte {
 }
 
 // rootlessBuildkitBins are what the rootless path installs from the
-// BuildKit release: the root path's two plus runc and the bridge network's
-// CNI plugins.
-var rootlessBuildkitBins = []string{"buildctl", "buildkit-cni-bridge", "buildkit-cni-firewall", "buildkit-cni-host-local",
-	"buildkit-cni-loopback", "buildkit-runc", "buildkitd"}
+// BuildKit release: the root path's two plus the runc its OCI worker runs.
+// Steps' links come from the node's own CNI plugins.
+var rootlessBuildkitBins = []string{"buildctl", "buildkit-runc", "buildkitd"}
 
 type rootlessRig struct {
 	dir, bin, unit, netUnit, profile, log string
-	tarball, rk                           []byte
-	origin, rkOrigin                      string
+	// cfgDir holds rootless buildkitd's config and its steps' CNI config;
+	// envDir the node's sandboxd.env.
+	cfgDir, envDir   string
+	tarball, rk      []byte
+	origin, rkOrigin string
 	// rkSHA is the pin the run checks RootlessKit's tarball against: the
 	// real stand-in's, whatever rk is changed to after.
 	rkSHA string
@@ -71,7 +76,12 @@ func newRootlessRig(t *testing.T) *rootlessRig {
 	r.netUnit = filepath.Join(r.dir, "aerolvm-build-net.service")
 	r.profile = filepath.Join(r.dir, "aerolvm-rootlesskit")
 	r.log = filepath.Join(r.dir, "calls.log")
+	r.cfgDir = filepath.Join(r.dir, "etc-aerolvm-buildkit")
+	r.envDir = filepath.Join(r.dir, "etc-sandboxd")
 	mustMkdir(t, r.bin)
+	mustMkdir(t, r.cfgDir)
+	mustMkdir(t, r.envDir)
+	mustWrite(t, filepath.Join(r.envDir, "sandboxd.env"), "SB_CONTAINER_ENGINE=containerd\nSB_CONTAINERD_CNI_PLUGIN_DIR=/opt/cni/custom\n")
 	files := map[string]string{}
 	for _, b := range rootlessBuildkitBins {
 		files["bin/"+b] = b
@@ -100,7 +110,7 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"mktemp", "rm", "tar", "gzip", "cat", "tr", "shasum", "sha256sum", "awk", "mkdir", "grep", "sh"} {
+	for _, name := range []string{"mktemp", "rm", "tar", "gzip", "cat", "tr", "shasum", "sha256sum", "awk", "mkdir", "grep", "sh", "tail"} {
 		if p, err := exec.LookPath(name); err == nil {
 			_ = os.Symlink(p, filepath.Join(tools, name))
 		}
@@ -121,6 +131,7 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 		"DOWNLOAD_MIRROR='" + testMirror + "'\nBUILDKIT_BIN_DIR='" + r.bin + "'\nBUILDKIT_UNIT_FILE='" + r.unit + "'\n" +
 		"BUILD_NET_UNIT_FILE='" + r.netUnit + "'\nROOTLESSKIT_APPARMOR_PROFILE='" + r.profile + "'\n" +
 		"APPARMOR_USERNS_KNOB='" + filepath.Join(r.dir, "no-knob") + "'\n" +
+		"BUILDKIT_ROOTLESS_CONFIG_DIR='" + r.cfgDir + "'\nSANDBOXD_ENV_DIR='" + r.envDir + "'\n" +
 		"BUILDKIT_BUILD_USER=aerolvm-build\nBUILDKIT_ROOTLESS_STATE_DIR=/var/lib/aerolvm-buildkit\nBUILDKIT_SUBID_RANGE=2100000000-2100065535\n" +
 		"INSTALL_PREFIX=/usr/local/bin\nBUILDKIT_ROOTLESS='" + flag + "'\nAPT_UPDATED=true\n" +
 		"BUILDKIT_SHA256_AMD64='" + sha256Hex(r.tarball) + "'\nROOTLESSKIT_SHA256_X86_64='" + r.rkSHA + "'\n" +
@@ -130,11 +141,16 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 		"useradd() { echo \"useradd $*\" >>\"$LOG\"; }\n" +
 		"usermod() { echo \"usermod $*\" >>\"$LOG\"; }\n" +
 		"id() { return 1; }\n" +
-		"install() { if [[ \"$1\" == -d ]]; then echo \"install $*\" >>\"$LOG\"; else '" + realInstall + "' \"$@\"; fi; }\n" +
+		"chown() { echo \"chown $*\" >>\"$LOG\"; }\n" +
+		"chmod() { echo \"chmod $*\" >>\"$LOG\"; }\n" +
+		// install(1) records every call; -d only records (it would chown to
+		// the build user), and a file install runs without its owner.
+		"install() { echo \"install $*\" >>\"$LOG\"; [[ \"$1\" == -d ]] && return 0; local a=(); while (($#)); do case \"$1\" in -o|-g) shift 2 ;; *) a+=(\"$1\"); shift ;; esac; done; '" + realInstall + "' \"${a[@]}\"; }\n" +
 		fetchStubs + installShPinsDefaults(t, src) + fetchFuncs(t, src)
 	for _, fn := range []string{"install_buildkit", "install_buildkit_rootless", "buildkit_unit", "buildkit_rootless_unit",
 		"build_net_unit", "buildkit_version_at", "rootlesskit_version_at", "buildkit_unit_is_ours_on_host_net",
-		"buildkit_unit_is_ours_rootless", "ensure_buildkit_build_user", "ensure_rootlesskit_apparmor"} {
+		"buildkit_unit_is_ours_rootless", "ensure_buildkit_build_user", "ensure_rootlesskit_apparmor",
+		"buildkit_steps_conflist", "buildkit_rootless_config", "node_env_value"} {
 		script += extractShellFunc(t, src, fn)
 	}
 	script += "install_buildkit\necho DONE\n"
@@ -157,11 +173,16 @@ func TestInstallBuildkitRootlessFreshNode(t *testing.T) {
 		t.Fatalf("install_buildkit: %v", err)
 	}
 	checkCalls(t, calls, []string{
-		"GET " + r.origin, "GET " + r.rkOrigin,
+		// The user first: RootlessKit is installed for its group.
 		"useradd --system --user-group --no-create-home --home-dir /var/lib/aerolvm-buildkit --shell /usr/sbin/nologin aerolvm-build",
 		"usermod --add-subuids 2100000000-2100065535 aerolvm-build",
 		"usermod --add-subgids 2100000000-2100065535 aerolvm-build",
-		"install -d -m 0755 /var/lib/cni",
+		"GET " + r.origin, "GET " + r.rkOrigin,
+		// RootlessKit for root and the build user only (review F5).
+		"install -m 0750 -o root -g aerolvm-build",
+		"chown root:aerolvm-build " + r.bin + "/rootlesskit",
+		"chmod 0750 " + r.bin + "/rootlesskit",
+		"install -d -m 0755 /var/lib/cni " + r.cfgDir,
 		"install -d -m 0700 -o aerolvm-build -g aerolvm-build /var/lib/aerolvm-buildkit /var/lib/aerolvm-buildkit/cni",
 		"systemctl daemon-reload",
 		"systemctl enable --now --no-block aerolvm-build-net.service buildkit.service",
@@ -185,18 +206,42 @@ func TestInstallBuildkitRootlessFreshNode(t *testing.T) {
 		"BindReadOnlyPaths=/run/aerolvm-build-net/resolv.conf:/etc/resolv.conf",
 		"BindPaths=/var/lib/aerolvm-buildkit/cni:/var/lib/cni",
 		"PartOf=aerolvm-build-net.service",
-		r.bin + "/rootlesskit --state-dir=/run/aerolvm-buildkit/rootlesskit --net=gvisor-tap-vsock --detach-netns --copy-up=/etc " + r.bin + "/buildkitd",
+		// The step guard runs first, inside RootlessKit, then buildkitd.
+		r.bin + "/rootlesskit --state-dir=/run/aerolvm-buildkit/rootlesskit --net=gvisor-tap-vsock --cidr=" + buildnet.UplinkRange +
+			" --detach-netns --copy-up=/etc /usr/local/bin/sandboxd host build-network guard -- " + r.bin + "/buildkitd --config " + r.cfgDir + "/buildkitd.toml",
 		"--addr unix:///run/aerolvm-buildkit/buildkitd.sock",
-		"--oci-worker=true --containerd-worker=false --oci-worker-net=bridge",
 	} {
 		if !strings.Contains(string(unit), w) {
 			t.Errorf("buildkit.service lacks %q:\n%s", w, unit)
 		}
 	}
-	// No root-level socket, no containerd: the rootless unit names neither.
-	for _, never := range []string{"containerd.sock", "--containerd-worker=true", "User=root"} {
+	// No root-level socket, no containerd, no shared bridge for steps.
+	for _, never := range []string{"containerd.sock", "--containerd-worker=true", "User=root", "--oci-worker-net=bridge"} {
 		if strings.Contains(string(unit), never) {
 			t.Errorf("buildkit.service has %q:\n%s", never, unit)
+		}
+	}
+	// Each step a point-to-point link of its own, in the guard's range; no
+	// bridge for steps to share.
+	conflist, _ := os.ReadFile(filepath.Join(r.cfgDir, "steps.conflist"))
+	var cl struct {
+		Plugins []struct {
+			Type string `json:"type"`
+			IPAM struct {
+				Ranges [][]struct {
+					Subnet string `json:"subnet"`
+				} `json:"ranges"`
+			} `json:"ipam"`
+		} `json:"plugins"`
+	}
+	if err := json.Unmarshal(conflist, &cl); err != nil || len(cl.Plugins) != 2 || cl.Plugins[0].Type != "loopback" || cl.Plugins[1].Type != "ptp" ||
+		cl.Plugins[1].IPAM.Ranges[0][0].Subnet != buildnet.StepRange {
+		t.Errorf("steps.conflist %s (%v): want loopback then ptp on %s", conflist, err, buildnet.StepRange)
+	}
+	cfg, _ := os.ReadFile(filepath.Join(r.cfgDir, "buildkitd.toml"))
+	for _, w := range []string{`networkMode = "cni"`, `cniConfigPath = "` + r.cfgDir + `/steps.conflist"`, `cniBinaryPath = "/opt/cni/custom"`, "[worker.containerd]\n  enabled = false"} {
+		if !strings.Contains(string(cfg), w) {
+			t.Errorf("buildkitd.toml lacks %q:\n%s", w, cfg)
 		}
 	}
 	net, _ := os.ReadFile(r.netUnit)

@@ -101,8 +101,8 @@ func TestHostBuildNetworkErrors(t *testing.T) {
 		code int
 		want string
 	}{
-		{"no verb", []string{"build-network"}, nil, 2, "want up or down"},
-		{"an unknown verb", []string{"build-network", "sideways"}, nil, 2, "want up or down"},
+		{"no verb", []string{"build-network"}, nil, 2, "want up, down or guard"},
+		{"an unknown verb", []string{"build-network", "sideways"}, nil, 2, "want up, down or guard"},
 		{"an unknown flag", []string{"build-network", "up", "--bogus"}, nil, 2, "flag provided but not defined"},
 		{"an extra argument", []string{"build-network", "down", "now"}, nil, 2, `unexpected argument "now"`},
 		{"no CNI runner", []string{"build-network", "up"}, func(s *buildNetworkSeams) { s.hostErr = boom }, 1, "boom"},
@@ -137,5 +137,95 @@ func TestBuildNetworkHostSeam(t *testing.T) {
 	}
 	if _, ok := h.(*netns.Host); !ok {
 		t.Fatalf("host %T", h)
+	}
+}
+
+// guardSeams records the guard subcommand's calls: the guard, then the
+// exec that replaces the process.
+type guardSeams struct {
+	cfg              buildnet.GuardConfig
+	order            []string
+	ownErr, guardErr error
+	lookErr, execErr error
+	execPath         string
+	execArgs         []string
+}
+
+func stubGuard(t *testing.T) *guardSeams {
+	t.Helper()
+	s := &guardSeams{execErr: errors.New("exec stub")}
+	og, oo, oe, ol := buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook
+	t.Cleanup(func() { buildNetworkGuard, buildNetworkOwn, buildNetworkExec, buildNetworkLook = og, oo, oe, ol })
+	buildNetworkOwn = func() ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr("10.88.0.2")}, s.ownErr }
+	buildNetworkGuard = func(_ context.Context, cfg buildnet.GuardConfig) error {
+		s.order = append(s.order, "guard")
+		s.cfg = cfg
+		return s.guardErr
+	}
+	buildNetworkLook = func(name string) (string, error) { return "/usr/local/bin/" + name, s.lookErr }
+	buildNetworkExec = func(path string, argv, _ []string) error {
+		s.order = append(s.order, "exec")
+		s.execPath, s.execArgs = path, argv
+		return s.execErr
+	}
+	return s
+}
+
+// guard closes the steps' namespace first and only then replaces itself
+// with buildkitd, so buildkitd never runs with the namespace open.
+func TestHostBuildNetworkGuard(t *testing.T) {
+	s := stubGuard(t)
+	t.Setenv("ROOTLESSKIT_STATE_DIR", "/run/aerolvm-buildkit/rootlesskit")
+	var stderr bytes.Buffer
+	code := runHostCLI([]string{"build-network", "guard", "--", "buildkitd", "--config", "/etc/aerolvm-buildkit/buildkitd.toml"}, io.Discard, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "exec stub") {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if strings.Join(s.order, ",") != "guard,exec" {
+		t.Fatalf("order %v, want the guard before the exec", s.order)
+	}
+	if s.cfg.Netns != "/run/aerolvm-buildkit/rootlesskit/netns" || s.cfg.Steps.String() != buildnet.StepRange ||
+		s.cfg.Uplink.String() != buildnet.UplinkRange || len(s.cfg.Own) != 1 {
+		t.Fatalf("guard config %+v", s.cfg)
+	}
+	if s.execPath != "/usr/local/bin/buildkitd" || strings.Join(s.execArgs, " ") != "buildkitd --config /etc/aerolvm-buildkit/buildkitd.toml" {
+		t.Fatalf("exec %q %q", s.execPath, s.execArgs)
+	}
+}
+
+func TestHostBuildNetworkGuardErrors(t *testing.T) {
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name string
+		args []string
+		set  func(*guardSeams)
+		code int
+		want string
+		exec bool
+	}{
+		{"no command", []string{"build-network", "guard"}, nil, 2, "name the command", false},
+		{"a bad range", []string{"build-network", "guard", "--steps", "nope", "--", "buildkitd"}, nil, 2, "nope", false},
+		{"an unknown flag", []string{"build-network", "guard", "--bogus", "--", "buildkitd"}, nil, 2, "flag provided but not defined", false},
+		{"no addresses", []string{"build-network", "guard", "--", "buildkitd"}, func(s *guardSeams) { s.ownErr = boom }, 1, "boom", false},
+		{"the guard fails", []string{"build-network", "guard", "--", "buildkitd"}, func(s *guardSeams) { s.guardErr = boom }, 1, "boom", false},
+		{"no such command", []string{"build-network", "guard", "--", "buildkitd"}, func(s *guardSeams) { s.lookErr = boom }, 1, "boom", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := stubGuard(t)
+			if tc.set != nil {
+				tc.set(s)
+			}
+			var stderr bytes.Buffer
+			if code := runHostCLI(tc.args, io.Discard, &stderr); code != tc.code || !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("exit %d, %s; want %d, %q", code, stderr.String(), tc.code, tc.want)
+			}
+			if got := len(s.order) > 0 && s.order[len(s.order)-1] == "exec"; got != tc.exec {
+				t.Fatalf("exec ran: %v, want %v", got, tc.exec)
+			}
+		})
+	}
+	var stdout bytes.Buffer
+	if code := runHostCLI([]string{"build-network", "guard", "-h"}, &stdout, io.Discard); code != 0 || !strings.Contains(stdout.String(), "build-network guard") {
+		t.Fatalf("help: exit %d", code)
 	}
 }

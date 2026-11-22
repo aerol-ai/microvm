@@ -193,6 +193,7 @@ BUILD_NET_UNIT_FILE="/etc/systemd/system/aerolvm-build-net.service"
 BUILDKIT_BUILD_USER="aerolvm-build"
 BUILDKIT_ROOTLESS_STATE_DIR="/var/lib/aerolvm-buildkit"
 BUILDKIT_SUBID_RANGE="2100000000-2100065535"
+BUILDKIT_ROOTLESS_CONFIG_DIR="/etc/aerolvm-buildkit"
 ROOTLESSKIT_APPARMOR_PROFILE="/etc/apparmor.d/aerolvm-rootlesskit"
 APPARMOR_USERNS_KNOB="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
 # Where upgrade_containerd_engine_tools reads the node's engine settings.
@@ -3959,9 +3960,12 @@ buildkit_unit_is_ours_rootless() {
 # OCI worker, so it never touches containerd; sandboxd imports each build's
 # OCI archive itself (SB_CONTAINERD_BUILDKIT_ROOTLESS). Its network is the
 # aerolvm.build namespace on the sandboxes' bridge (build_net_unit), so its
-# pulls and build steps get the sandboxes' firewall rules. Every download is
-# checked against the pins above. A buildkit.service that is neither of
-# ours is the operator's and is kept.
+# pulls and build steps get the sandboxes' firewall rules. Each build step
+# gets a point-to-point link of its own (the CNI ptp plugin,
+# buildkit_steps_conflist), and `sandboxd host build-network guard` closes
+# the steps' namespace before buildkitd starts, so no step reaches another
+# step or this node. Every download is checked against the pins above. A
+# buildkit.service that is neither of ours is the operator's and is kept.
 install_buildkit_rootless() {
 	local arch rk_arch
 	case "$(uname -m)" in
@@ -3973,7 +3977,8 @@ install_buildkit_rootless() {
 			;;
 	esac
 	# newuidmap/newgidmap map the build user's subordinate ids into its
-	# user namespace; BuildKit's bridge network runs iptables inside it.
+	# user namespace; the step guard and the ptp plugin's NAT run iptables
+	# inside it.
 	if ! command -v newuidmap >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
 		if [[ "${APT_UPDATED:-false}" != "true" ]]; then
 			apt-get update
@@ -3985,9 +3990,12 @@ install_buildkit_rootless() {
 	tmp_dir="$(mktemp -d)"
 	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
 	trap "rm -rf '$tmp_dir'" RETURN
+	# The build user first: RootlessKit is installed for its group alone.
+	ensure_buildkit_build_user
 	# The release's buildkitd and buildctl, as for root BuildKit, plus the
-	# runc and the CNI plugins its rootless bridge network runs.
-	local bk_bins=(buildkitd buildctl buildkit-runc buildkit-cni-bridge buildkit-cni-host-local buildkit-cni-loopback buildkit-cni-firewall)
+	# runc its OCI worker runs. Build steps' links come from the node's own
+	# CNI plugins (loopback, ptp, host-local).
+	local bk_bins=(buildkitd buildctl buildkit-runc)
 	local have="" b need="false"
 	[[ -x "${BUILDKIT_BIN_DIR}/buildkitd" ]] && have="$(buildkit_version_at "${BUILDKIT_BIN_DIR}/buildkitd")"
 	[[ "$have" == "$BUILDKIT_VERSION" ]] || need="true"
@@ -4017,18 +4025,39 @@ install_buildkit_rootless() {
 		fi
 		mkdir -p "${tmp_dir}/rk"
 		tar -xzf "${tmp_dir}/${rk}" -C "${tmp_dir}/rk"
-		install -m 0755 "${tmp_dir}/rk/rootlesskit" "${BUILDKIT_BIN_DIR}/rootlesskit"
+		install -m 0750 -o root -g "$BUILDKIT_BUILD_USER" "${tmp_dir}/rk/rootlesskit" "${BUILDKIT_BIN_DIR}/rootlesskit"
 		echo "Installed RootlessKit ${ROOTLESSKIT_VERSION} to ${BUILDKIT_BIN_DIR}"
 	fi
-	ensure_buildkit_build_user
+	# Only root and the build user may run RootlessKit: the AppArmor
+	# profile below lets whoever runs it make user namespaces, and every
+	# other user stays under the host's restriction. Set on every run, so a
+	# RootlessKit installed by an earlier run (0755) is narrowed too.
+	chown "root:${BUILDKIT_BUILD_USER}" "${BUILDKIT_BIN_DIR}/rootlesskit"
+	chmod 0750 "${BUILDKIT_BIN_DIR}/rootlesskit"
 	ensure_rootlesskit_apparmor
-	# buildkitd's own state, and the CNI state of its bridge network, which
+	# buildkitd's own state, and the CNI state of its steps' links, which
 	# the unit binds over /var/lib/cni (the build user cannot write the
 	# host's, and must not see the sandboxes' leases).
-	install -d -m 0755 /var/lib/cni
+	install -d -m 0755 /var/lib/cni "$BUILDKIT_ROOTLESS_CONFIG_DIR"
 	install -d -m 0700 -o "$BUILDKIT_BUILD_USER" -g "$BUILDKIT_BUILD_USER" \
 		"$BUILDKIT_ROOTLESS_STATE_DIR" "${BUILDKIT_ROOTLESS_STATE_DIR}/cni"
+	local cni_dir
+	cni_dir="$(node_env_value SB_CONTAINERD_CNI_PLUGIN_DIR)"
+	cni_dir="${cni_dir:-/opt/cni/bin}"
+	if [[ ! -x "${cni_dir}/ptp" ]]; then
+		echo "warning: ${cni_dir}/ptp is not there yet; rootless BuildKit starts once the CNI plugins are installed" >&2
+	fi
 	local restart="false" body
+	body="$(buildkit_steps_conflist)"
+	if [[ ! -f "${BUILDKIT_ROOTLESS_CONFIG_DIR}/steps.conflist" || "$(<"${BUILDKIT_ROOTLESS_CONFIG_DIR}/steps.conflist")" != "$body" ]]; then
+		printf '%s\n' "$body" > "${BUILDKIT_ROOTLESS_CONFIG_DIR}/steps.conflist"
+		restart="true"
+	fi
+	body="$(buildkit_rootless_config "$cni_dir")"
+	if [[ ! -f "${BUILDKIT_ROOTLESS_CONFIG_DIR}/buildkitd.toml" || "$(<"${BUILDKIT_ROOTLESS_CONFIG_DIR}/buildkitd.toml")" != "$body" ]]; then
+		printf '%s\n' "$body" > "${BUILDKIT_ROOTLESS_CONFIG_DIR}/buildkitd.toml"
+		restart="true"
+	fi
 	body="$(build_net_unit)"
 	if [[ ! -f "$BUILD_NET_UNIT_FILE" || "$(<"$BUILD_NET_UNIT_FILE")" != "$body" ]]; then
 		printf '%s\n' "$body" > "$BUILD_NET_UNIT_FILE"
@@ -4055,6 +4084,32 @@ install_buildkit_rootless() {
 	if [[ "$restart" == "true" ]]; then
 		systemctl restart --no-block buildkit.service || echo "warning: buildkit.service failed to restart" >&2
 	fi
+}
+
+# buildkit_steps_conflist prints the CNI config rootless BuildKit's build
+# steps get: a point-to-point link each (ptp), from 198.18.0.0/16
+# (buildnet.StepRange), with NAT out through RootlessKit. No bridge: no step
+# shares a segment with another, so none can spoof another's address.
+buildkit_steps_conflist() {
+	cat <<'CONF'
+{"cniVersion":"1.0.0","name":"aerolvm-build-steps","plugins":[{"type":"loopback"},{"type":"ptp","ipMasq":true,"ipam":{"type":"host-local","ranges":[[{"subnet":"198.18.0.0/16"}]],"routes":[{"dst":"0.0.0.0/0"}]}}]}
+CONF
+}
+
+# buildkit_rootless_config prints rootless buildkitd's config: the OCI
+# worker only, its steps on buildkit_steps_conflist with the CNI plugins in
+# $1. A file, not flags: buildkitd v0.34.2's --oci-cni-config-path flag is
+# read under another name and has no effect.
+buildkit_rootless_config() {
+	cat <<TOML
+[worker.oci]
+  enabled = true
+  networkMode = "cni"
+  cniConfigPath = "${BUILDKIT_ROOTLESS_CONFIG_DIR}/steps.conflist"
+  cniBinaryPath = "$1"
+[worker.containerd]
+  enabled = false
+TOML
 }
 
 # rootlesskit_version_at prints the release of a rootlesskit binary
@@ -4134,13 +4189,17 @@ UNIT
 # buildkit_rootless_unit prints the rootless buildkit.service. buildkitd
 # runs as the build user in RootlessKit's user namespace, OCI worker only,
 # in the aerolvm.build namespace (NetworkNamespacePath): its pulls leave
-# from there, and each build step gets a namespace of its own on BuildKit's
-# bridge, inside RootlessKit's detached namespace, whose traffic leaves
-# through aerolvm.build too. It reads the host's upstream resolvers (a
-# loopback stub is not reachable from the namespace) and keeps its CNI state
-# in its own folder. Its socket is 0660 to the build user's group. Until the
-# namespace is there the start fails and is retried every 5 s; restarting
-# the network unit restarts it (PartOf).
+# from there. Each build step gets a namespace and a point-to-point link of
+# its own inside RootlessKit's detached namespace (on 198.19.0.0/24,
+# buildnet.UplinkRange), whose traffic leaves through aerolvm.build too.
+# `sandboxd host build-network guard` runs first, as RootlessKit's child,
+# and closes that namespace: no step reaches another step, the namespace
+# itself, RootlessKit's network or aerolvm.build's own addresses, or sends
+# from an address that is not its own. buildkitd reads the host's upstream
+# resolvers (a loopback stub is not reachable from the namespace) and keeps
+# its CNI state in its own folder. Its socket is 0660 to the build user's
+# group. Until the namespace is there the start fails and is retried every
+# 5 s; restarting the network unit restarts it (PartOf).
 buildkit_rootless_unit() {
 	cat <<UNIT
 [Unit]
@@ -4159,7 +4218,7 @@ RuntimeDirectoryMode=0750
 NetworkNamespacePath=/run/netns/aerolvm.build
 BindReadOnlyPaths=/run/aerolvm-build-net/resolv.conf:/etc/resolv.conf
 BindPaths=${BUILDKIT_ROOTLESS_STATE_DIR}/cni:/var/lib/cni
-ExecStart=${BUILDKIT_BIN_DIR}/rootlesskit --state-dir=/run/aerolvm-buildkit/rootlesskit --net=gvisor-tap-vsock --detach-netns --copy-up=/etc ${BUILDKIT_BIN_DIR}/buildkitd --addr unix:///run/aerolvm-buildkit/buildkitd.sock --root ${BUILDKIT_ROOTLESS_STATE_DIR} --oci-worker=true --containerd-worker=false --oci-worker-net=bridge
+ExecStart=${BUILDKIT_BIN_DIR}/rootlesskit --state-dir=/run/aerolvm-buildkit/rootlesskit --net=gvisor-tap-vsock --cidr=198.19.0.0/24 --detach-netns --copy-up=/etc ${INSTALL_PREFIX}/sandboxd host build-network guard -- ${BUILDKIT_BIN_DIR}/buildkitd --config ${BUILDKIT_ROOTLESS_CONFIG_DIR}/buildkitd.toml --addr unix:///run/aerolvm-buildkit/buildkitd.sock --root ${BUILDKIT_ROOTLESS_STATE_DIR}
 Restart=on-failure
 RestartSec=5
 Delegate=yes

@@ -3,14 +3,16 @@
 // sandboxes' bridge, with one address from the sandboxes' range, that the
 // rootless buildkit.service joins (systemd NetworkNamespacePath).
 //
-// Everything a build sends, its base-image pulls and its RUN steps alike,
-// leaves through that namespace's veth on the sandboxes' bridge. So the host
-// firewall rules every sandbox address gets apply to it unchanged: the egress
-// floor (cloud metadata and the operator's floor addresses), the node guard
-// (no node ports), and the drop between sandbox ranges. No firewall rule is
-// written for it. RUN steps still get a namespace each: rootless BuildKit's
-// bridge network, inside RootlessKit's own namespace, whose outbound
-// traffic leaves through this one.
+// Everything a build sends to the outside, its base-image pulls and its RUN
+// steps alike, leaves through that namespace's veth on the sandboxes'
+// bridge. So the host firewall rules every sandbox address gets apply to it
+// unchanged: the egress floor (cloud metadata and the operator's floor
+// addresses), the node guard (no node ports), and the drop between the
+// sandboxes' addresses, this namespace's included. No host firewall rule is
+// written for it. Build steps do not meet each other on that bridge: they
+// live behind RootlessKit, one point-to-point link each, and the step guard
+// (guard.go) keeps them from each other, from RootlessKit's own network and
+// from this namespace's addresses.
 //
 // It is built by a root oneshot unit (install.sh's aerolvm-build-net
 // service, `sandboxd host build-network up`), never by sandboxd: the
