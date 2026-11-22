@@ -323,8 +323,19 @@ func TestMountSpecValidateRunningToolOptions(t *testing.T) {
 		{"s3 bind", extra("--bind eth1"), `flag "--bind" is not allowed`},
 		{"s3 unknown", extra("--future-flag"), `flag "--future-flag" is not allowed`},
 		{"s3 cache without a folder", extra("--cache"), `flag "--cache" needs a value`},
-		{"s3 cache folder is a flag", extra("--cache --log-directory=/etc"), `flag "--cache" takes a value that does not start with -`},
+		{"s3 cache folder is a flag", extra("--cache --log-directory=/etc"), `flag "--cache" takes a clean absolute folder other than /`},
 		{"s3 cache size not a number", extra("--cache /c --max-cache-size big"), `flag "--max-cache-size" takes a whole number`},
+		// A kept cache folder where any write harms the node: before
+		// this, each was kept (mountArgWord took any word).
+		{"s3 cache in /etc", extra("--cache /etc"), `flag "--cache" names a folder of the node's own system (/etc)`},
+		{"s3 cache under /etc", extra("--cache=/etc/cron.d"), `(/etc)`},
+		{"s3 cache in sandboxd's data", extra("--cache /var/lib/sandboxd/mounts"), `(/var/lib)`},
+		{"s3 cache in containerd's data", extra("--cache /var/lib/containerd"), `(/var/lib)`},
+		{"s3 cache in /run", extra("--cache /run/aerolvm-rootd"), `(/run)`},
+		{"s3 cache in root's home", extra("--cache /root/.cache"), `(/root)`},
+		{"s3 cache at /", extra("--cache /"), "takes a clean absolute folder other than /"},
+		{"s3 cache relative", extra("--cache cache"), "takes a clean absolute folder other than /"},
+		{"s3 cache not clean", extra("--cache /var/cache/../../etc"), "takes a clean absolute folder other than /"},
 		{"s3 region option", MountSpec{Type: MountTypeS3, Source: "b", Target: "/d", Options: map[string]string{"region": "-x"}}, "options.region takes a plain name"},
 		// The kernel serves a server folder or file, or the mount acts
 		// with labels or identities the server holds.
