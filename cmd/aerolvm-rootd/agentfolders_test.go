@@ -44,7 +44,7 @@ func TestAgentFoldersCode(t *testing.T) {
 			}
 		})
 	}
-	if strings.Join(got.Dirs, ",") != "/etc/sandboxd/tls,/run/sandboxd,/var/lib/sandboxd" || got.UID != 65531 {
+	if strings.Join(got.Dirs, ",") != "/etc/sandboxd/cluster-ca,/etc/sandboxd/tls,/run/sandboxd,/var/lib/sandboxd" || got.UID != 65531 {
 		t.Fatalf("walked %+v", got)
 	}
 

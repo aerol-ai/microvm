@@ -44,6 +44,18 @@ func TestKernelGiveToAgent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unix.Unmount(mnt, unix.MNT_DETACH) })
 	write(t, filepath.Join(mnt, "remote.txt"), "remote")
+	// A bind mount from the same disk: the same device number, so only
+	// the kernel's mount-root attribute shows it is a mount (review).
+	elsewhere := filepath.Join(base, "elsewhere")
+	write(t, filepath.Join(elsewhere, "root-only.txt"), "root's")
+	bind := filepath.Join(data, "mounts", "sb-2", "0")
+	if err := os.MkdirAll(bind, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mount(elsewhere, bind, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(bind, unix.MNT_DETACH) })
 
 	res, err := GiveToAgent(AgentFolders{Dirs: []string{data}, UID: agent, GID: agentGroup})
 	if err != nil {
@@ -68,13 +80,15 @@ func TestKernelGiveToAgent(t *testing.T) {
 		filepath.Join(base, "shadow"):                    0,
 		filepath.Join(mnt, "remote.txt"):                 0,
 		mnt:                                              0,
+		elsewhere:                                        0,
+		filepath.Join(elsewhere, "root-only.txt"):        0,
 	} {
 		if u, _ := owner(p); u != want {
 			t.Errorf("%s is uid %d, want %d", p, u, want)
 		}
 	}
-	if res.SkippedLinks != 1 || res.SkippedMounts != 1 {
-		t.Errorf("result %+v, want 1 skipped link and 1 skipped mount", res)
+	if res.SkippedLinks != 1 || res.SkippedMounts != 2 {
+		t.Errorf("result %+v, want 1 skipped link and 2 skipped mounts", res)
 	}
 	// Again: nothing of root's is left to move.
 	again, err := GiveToAgent(AgentFolders{Dirs: []string{data}, UID: agent, GID: agentGroup})

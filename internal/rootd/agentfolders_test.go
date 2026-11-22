@@ -39,9 +39,9 @@ func TestAgentFoldersFromEnv(t *testing.T) {
 		uid, gid uint32
 		err      string
 	}{
-		{name: "sandboxd's defaults", who: "sandboxd", want: []string{"/run/sandboxd", "/var/lib/sandboxd"}, uid: 65531, gid: 65530},
-		{name: "a uid with a name", who: "65531", want: []string{"/run/sandboxd", "/var/lib/sandboxd"}, uid: 65531, gid: 65530},
-		{name: "a uid with no name: its own group", who: "70000", want: []string{"/run/sandboxd", "/var/lib/sandboxd"}, uid: 70000, gid: 70000},
+		{name: "sandboxd's defaults", who: "sandboxd", want: []string{"/etc/sandboxd/cluster-ca", "/run/sandboxd", "/var/lib/sandboxd"}, uid: 65531, gid: 65530},
+		{name: "a uid with a name", who: "65531", want: []string{"/etc/sandboxd/cluster-ca", "/run/sandboxd", "/var/lib/sandboxd"}, uid: 65531, gid: 65530},
+		{name: "a uid with no name: its own group", who: "70000", want: []string{"/etc/sandboxd/cluster-ca", "/run/sandboxd", "/var/lib/sandboxd"}, uid: 70000, gid: 70000},
 		{name: "cluster files and a Raft disk", who: "sandboxd", env: map[string]string{
 			"SB_CLUSTER_TLS_DIR": "/etc/sandboxd/tls", "SB_CLUSTER_CA_DIR": "/etc/sandboxd/cluster-ca/",
 			"SB_RAFT_DATA_DIR": "/var/lib/sandboxd/raft", "SB_RAFT_WAL_DIR": "/srv/raft-wal",
@@ -49,7 +49,8 @@ func TestAgentFoldersFromEnv(t *testing.T) {
 		{name: "moved folders", who: "sandboxd", env: map[string]string{
 			"SB_DB_PATH": "/data/sb/state.db", "SB_MOUNTS_ROOT": "/data/mounts", "SB_CONTAINERD_RUN_DIR": "/data/sb/ctr",
 			"SB_MOUNTS_CRED_DIR": "/run/sb",
-		}, want: []string{"/data/mounts", "/data/sb", "/run/sb"}, uid: 65531, gid: 65530},
+			"SB_CLUSTER_CA_DIR":  "/data/ca",
+		}, want: []string{"/data/ca", "/data/mounts", "/data/sb", "/run/sb"}, uid: 65531, gid: 65530},
 		{name: "the data folder would be /", who: "sandboxd", env: map[string]string{"SB_DB_PATH": "/state.db"}, err: "holds more than sandboxd's files"},
 		{name: "a system folder", who: "sandboxd", env: map[string]string{"SB_RAFT_WAL_DIR": "/var/lib"}, err: "holds more than"},
 		{name: "the node's settings", who: "sandboxd", env: map[string]string{"SB_CLUSTER_TLS_DIR": "/etc/sandboxd"}, err: "holds more than"},
@@ -58,6 +59,7 @@ func TestAgentFoldersFromEnv(t *testing.T) {
 		{name: "the upgrader's", who: "sandboxd", env: map[string]string{"SB_RAFT_WAL_DIR": "/var/lib/aerolvm-upgrade"}, err: "root helper's"},
 		{name: "a relative path", who: "sandboxd", env: map[string]string{"SB_MOUNTS_ROOT": "mounts"}, err: "want an absolute path"},
 		{name: "root", who: "0", err: "must not be root"},
+		{name: "a uid past MaxInt32", who: "2147483648", err: "is past 2147483647"},
 		{name: "no user", who: " ", err: "name the agent's user"},
 		{name: "an unknown user", who: "nobody-here", err: "user nobody-here"},
 	} {
@@ -76,6 +78,22 @@ func TestAgentFoldersFromEnv(t *testing.T) {
 				t.Fatalf("got %v %d:%d, want %v %d:%d", f.Dirs, f.UID, f.GID, tc.want, tc.uid, tc.gid)
 			}
 		})
+	}
+}
+
+// A cluster server keeps its CA store where sandboxd's settings default it,
+// /etc/sandboxd/cluster-ca, when they leave SB_CLUSTER_CA_DIR unset, as
+// nodejoin does: `sandboxd init` writes ca.key there as root, and the
+// agent signs joins and renewals with it, so the move must give it over
+// (M1 PR 10 review).
+func TestAgentFoldersIncludeTheDefaultCAStore(t *testing.T) {
+	env := map[string]string{"SB_ENABLE_CLUSTER": "true", "SB_CLUSTER_TLS_DIR": "/etc/sandboxd/tls"}
+	f, err := AgentFoldersFromEnv(func(k string) string { return env[k] }, "65531")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(f.Dirs, "/etc/sandboxd/cluster-ca") || !slices.Contains(f.Dirs, "/etc/sandboxd/tls") {
+		t.Fatalf("folders moved: %v", f.Dirs)
 	}
 }
 
@@ -223,6 +241,17 @@ func TestGiveToAgentRefuses(t *testing.T) {
 	}
 }
 
+func TestOwnerIDs(t *testing.T) {
+	if u, g, err := ownerIDs(65531, 61000); err != nil || u != 65531 || g != 61000 {
+		t.Fatalf("%d %d %v", u, g, err)
+	}
+	for _, ids := range [][2]uint32{{1 << 31, 1}, {1, 1 << 31}, {^uint32(0), 0}} {
+		if _, _, err := ownerIDs(ids[0], ids[1]); err == nil {
+			t.Errorf("%v passed", ids)
+		}
+	}
+}
+
 func TestGroupFor(t *testing.T) {
 	if got := groupFor(0, 65531); got != 65531 {
 		t.Fatalf("root's group: %d", got)
@@ -240,6 +269,15 @@ func TestAgentIDs(t *testing.T) {
 	}
 	lookupUserName = func(string) (*user.User, error) { return &user.User{Uid: "5", Gid: "y"}, nil }
 	if _, _, err := agentIDs("bad"); err == nil || !strings.Contains(err.Error(), "has gid") {
+		t.Fatalf("err = %v", err)
+	}
+	// fchown takes an int: an id past MaxInt32 is refused, not wrapped.
+	lookupUserName = func(string) (*user.User, error) { return &user.User{Uid: "4294967295", Gid: "1"}, nil }
+	if _, _, err := agentIDs("big"); err == nil || !strings.Contains(err.Error(), "not one from 1 to 2147483647") {
+		t.Fatalf("err = %v", err)
+	}
+	lookupUserName = func(string) (*user.User, error) { return &user.User{Uid: "5", Gid: "2147483648"}, nil }
+	if _, _, err := agentIDs("big"); err == nil || !strings.Contains(err.Error(), "not one from 0 to 2147483647") {
 		t.Fatalf("err = %v", err)
 	}
 	lookupUserName = func(string) (*user.User, error) { return nil, errors.New("no") }

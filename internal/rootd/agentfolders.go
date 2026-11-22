@@ -3,6 +3,7 @@ package rootd
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -31,10 +32,20 @@ import (
 // move, and the walk only reads.
 //
 // It changes only what root owns. Files of other users (the WASM worker's,
-// uid 61000; a V8 jail's) keep their owner. It follows no link, never
-// enters another file system (an external storage mount, a tmpfs), and
-// leaves a file with more than one name alone: with a second name in a
-// folder only root can reach, a chown here would hand that file over too.
+// uid 61000; a V8 jail's) keep their owner. It follows no link: each entry
+// is opened without following one (O_PATH|O_NOFOLLOW on Linux), its owner,
+// kind and link count are read from that handle, and the chown goes
+// through the same handle, so a name swapped between the look and the
+// change changes nothing else. It does not enter a mount: an entry that is
+// the root of a mount (statx's STATX_ATTR_MOUNT_ROOT, Linux 5.8 and later,
+// which also sees a bind mount from the same disk) or on another device is
+// skipped. And it leaves a file with more than one name alone: with a
+// second name in a folder only root can reach, a chown here would hand
+// that file over too.
+
+// defaultClusterCADir is sandboxd's default CA store (internal/config
+// SB_CLUSTER_CA_DIR).
+const defaultClusterCADir = "/etc/sandboxd/cluster-ca"
 
 // AgentFolders are the folders the ownership move walks, and whose they
 // become.
@@ -131,7 +142,11 @@ func AgentFoldersFromEnv(getenv func(string) string, who string) (AgentFolders, 
 		{"SB_RAFT_DATA_DIR", strings.TrimSpace(getenv("SB_RAFT_DATA_DIR"))},
 		{"SB_RAFT_WAL_DIR", strings.TrimSpace(getenv("SB_RAFT_WAL_DIR"))},
 		{"SB_CLUSTER_TLS_DIR", strings.TrimSpace(getenv("SB_CLUSTER_TLS_DIR"))},
-		{"SB_CLUSTER_CA_DIR", strings.TrimSpace(getenv("SB_CLUSTER_CA_DIR"))},
+		// The CA store has sandboxd's default (internal/config), which
+		// `sandboxd init` writes ca.key into as root, and which nodejoin
+		// leaves out of cluster.env. A node with no cluster has no such
+		// folder, and the walk skips it.
+		{"SB_CLUSTER_CA_DIR", get("SB_CLUSTER_CA_DIR", defaultClusterCADir)},
 	} {
 		if err := add(d.name, d.dir); err != nil {
 			return AgentFolders{}, err
@@ -164,20 +179,25 @@ func agentIDs(who string) (uint32, uint32, error) {
 	}
 	var u *user.User
 	var err error
-	if n, perr := strconv.ParseUint(who, 10, 32); perr == nil {
+	// Ids past MaxInt32 are refused: fchown takes an int, and on a 32-bit
+	// build a larger uid_t would wrap into a negative id.
+	if n, perr := strconv.ParseUint(who, 10, 64); perr == nil {
+		if n > math.MaxInt32 {
+			return 0, 0, fmt.Errorf("agent folders: uid %d is past %d", n, math.MaxInt32)
+		}
 		if u, err = lookupUserID(who); err != nil {
 			return uint32(n), uint32(n), nil
 		}
 	} else if u, err = lookupUserName(who); err != nil {
 		return 0, 0, fmt.Errorf("agent folders: user %s: %w", who, err)
 	}
-	uid, err := strconv.ParseUint(u.Uid, 10, 32)
-	if err != nil {
-		return 0, 0, fmt.Errorf("agent folders: user %s has uid %q", who, u.Uid)
+	uid, err := strconv.ParseUint(u.Uid, 10, 64)
+	if err != nil || uid > math.MaxInt32 {
+		return 0, 0, fmt.Errorf("agent folders: user %s has uid %q, not one from 1 to %d", who, u.Uid, math.MaxInt32)
 	}
-	gid, err := strconv.ParseUint(u.Gid, 10, 32)
-	if err != nil {
-		return 0, 0, fmt.Errorf("agent folders: user %s has gid %q", who, u.Gid)
+	gid, err := strconv.ParseUint(u.Gid, 10, 64)
+	if err != nil || gid > math.MaxInt32 {
+		return 0, 0, fmt.Errorf("agent folders: user %s has gid %q, not one from 0 to %d", who, u.Gid, math.MaxInt32)
 	}
 	return uint32(uid), uint32(gid), nil
 }
@@ -245,12 +265,33 @@ func giveFolder(fd int, dir string, f AgentFolders, res *AgentFolderResult) erro
 	}
 	res.Walked++
 	if st.Uid == movedFromUID {
-		if err := unix.Fchown(rfd, int(f.UID), int(groupFor(st.Gid, f.GID))); err != nil {
+		uid, gid, err := ownerIDs(f.UID, groupFor(st.Gid, f.GID))
+		if err == nil {
+			err = unix.Fchown(rfd, uid, gid)
+		}
+		if err != nil {
 			return fmt.Errorf("agent folders: chown %s: %w", dir, err)
 		}
 		res.Changed++
 	}
 	return walkInto(rfd, dir, uint64(st.Dev), f, res, 0)
+}
+
+// ownerIDs is uid and gid as fchown takes them, an int each: at most
+// MaxInt32, which agentIDs already holds them to.
+func ownerIDs(uid, gid uint32) (int, int, error) {
+	if uid > math.MaxInt32 || gid > math.MaxInt32 {
+		return 0, 0, fmt.Errorf("owner %d:%d is past %d", uid, gid, math.MaxInt32)
+	}
+	return int(uid), int(gid), nil
+}
+
+// entry is one name in a folder the walk holds open, looked at once.
+type entry struct {
+	dfd  int    // the folder
+	name string // its name there
+	fd   int    // a handle on the entry itself, or -1 (agentfolders_other.go)
+	st   unix.Stat_t
 }
 
 // groupFor is the group a file of root's gets: the agent's for root's
@@ -272,60 +313,63 @@ func walkInto(fd int, at string, dev uint64, f AgentFolders, res *AgentFolderRes
 		return fmt.Errorf("agent folders: list %s: %w", at, err)
 	}
 	for _, name := range names {
-		path := at + "/" + name
-		var st unix.Stat_t
-		if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				continue // removed while the walk ran
-			}
-			return fmt.Errorf("agent folders: %s: %w", path, err)
-		}
-		res.Walked++
-		typ := st.Mode & unix.S_IFMT
-		switch {
-		case typ == unix.S_IFLNK:
-			continue
-		case uint64(st.Dev) != dev:
-			// Another file system: its own root decides.
-			res.SkippedMounts++
-			continue
-		case typ != unix.S_IFDIR && st.Nlink > 1:
-			res.SkippedLinks++
-			continue
-		}
-		if st.Uid == movedFromUID {
-			if err := unix.Fchownat(fd, name, int(f.UID), int(groupFor(st.Gid, f.GID)), unix.AT_SYMLINK_NOFOLLOW); err != nil {
-				if errors.Is(err, unix.ENOENT) {
-					continue
-				}
-				return fmt.Errorf("agent folders: chown %s: %w", path, err)
-			}
-			res.Changed++
-		}
-		if typ != unix.S_IFDIR {
-			continue
-		}
-		sub, err := unix.Openat(fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				continue
-			}
-			return fmt.Errorf("agent folders: open %s: %w", path, err)
-		}
-		// The folder opened must be the one just looked at: one the
-		// agent swapped in meanwhile is walked on the next start.
-		var sst unix.Stat_t
-		if err := unix.Fstat(sub, &sst); err != nil || uint64(sst.Dev) != dev || sst.Ino != st.Ino {
-			_ = unix.Close(sub)
-			continue
-		}
-		err = walkInto(sub, path, dev, f, res, depth+1)
-		_ = unix.Close(sub)
-		if err != nil {
+		if err := giveEntry(fd, name, at+"/"+name, dev, f, res, depth); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// giveEntry gives the agent one entry of the open folder fd, if root owns
+// it, and walks into it if it is a folder. Everything is decided and done
+// through one handle on the entry (openEntry), never by its name again.
+func giveEntry(fd int, name, path string, dev uint64, f AgentFolders, res *AgentFolderResult, depth int) error {
+	e, err := openEntry(fd, name)
+	if errors.Is(err, unix.ENOENT) {
+		return nil // removed while the walk ran
+	}
+	if err != nil {
+		return fmt.Errorf("agent folders: %s: %w", path, err)
+	}
+	defer e.close()
+	res.Walked++
+	typ := e.st.Mode & unix.S_IFMT
+	if typ == unix.S_IFLNK {
+		return nil
+	}
+	if uint64(e.st.Dev) != dev || e.mountRoot() {
+		// A mount: its own root decides.
+		res.SkippedMounts++
+		return nil
+	}
+	if typ != unix.S_IFDIR && e.st.Nlink > 1 {
+		res.SkippedLinks++
+		return nil
+	}
+	if e.st.Uid == movedFromUID {
+		if err := e.chown(f.UID, groupFor(e.st.Gid, f.GID)); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				return nil
+			}
+			return fmt.Errorf("agent folders: chown %s: %w", path, err)
+		}
+		res.Changed++
+	}
+	if typ != unix.S_IFDIR {
+		return nil
+	}
+	sub, err := e.openDir(dev)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return fmt.Errorf("agent folders: open %s: %w", path, err)
+	}
+	if sub < 0 {
+		return nil // swapped since it was looked at: the next start walks it
+	}
+	defer func() { _ = unix.Close(sub) }()
+	return walkInto(sub, path, dev, f, res, depth+1)
 }
 
 // readNames lists the open folder fd. The listing reads a duplicate of fd,
