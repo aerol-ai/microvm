@@ -75,7 +75,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if path := os.Getenv(egresspolicy.FloorFileEnv); path != "" {
 		go egresspolicy.WatchFloorFile(ctx, path, operatorPoll, log, func() { d.RefreshFloor(w.Current()) })
 	}
-	ln, err := socketListener(cfg.SocketPath)
+	ln, err := socketListener(cfg.SocketPath, cfg.PeerUIDs...)
 	if err != nil {
 		return err
 	}
@@ -85,8 +85,8 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 // socketListener prefers a systemd-activated socket (the unit creates it
 // root-owned 0600, which the unprivileged gateway can't do itself, S5) and
-// falls back to creating one at path.
-func socketListener(path string) (net.Listener, error) {
+// falls back to creating one at path, with socketMode(peers).
+func socketListener(path string, peers ...uint32) (net.Listener, error) {
 	if pid, _ := strconv.Atoi(os.Getenv("LISTEN_PID")); pid == os.Getpid() {
 		if n, _ := strconv.Atoi(os.Getenv("LISTEN_FDS")); n >= 1 {
 			f := os.NewFile(3, "aerolvm-egress.socket")
@@ -111,11 +111,30 @@ func socketListener(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("egress gateway: listen %s: %w", path, err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(path, socketMode(peers)); err != nil {
 		_ = ln.Close()
 		return nil, err
 	}
 	return ln, nil
+}
+
+// socketMode is the mode of a socket the gateway makes itself: 0600, which
+// only its own user and root can open, unless the peers it answers
+// (SB_EGRESS_PEER_UIDS) include another user. In privilege mode split
+// sandboxd is not root (uid 65531 in the worker pod), and the gateway, not
+// root either, cannot give the socket to that user. The socket is then open
+// to every local user, and the peer check, which answers the listed uids
+// alone, keeps the others out, as sandboxd's own executable-lookup socket
+// does in split (pkg/daemon startEgressProcid). On a VM systemd makes the
+// socket for sandboxd's user, and this path is not taken.
+func socketMode(peers []uint32) os.FileMode {
+	self := uint32(os.Getuid())
+	for _, p := range peers {
+		if p != 0 && p != self {
+			return 0o666
+		}
+	}
+	return 0o600
 }
 
 // RunCLI is the `sandboxd egress-gateway` entrypoint.

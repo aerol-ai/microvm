@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -63,10 +64,11 @@ const (
 const (
 	k8sRuleFound         = "AerolVM pods found"
 	k8sRuleSigned        = "images signed by the AerolVM release workflow"
-	k8sRuleNoHostMounts  = "no folders mounted from the machine"
+	k8sRuleNoHostMounts  = "no folders mounted from the machine, except a split agent's read-only cgroup tree"
 	k8sRuleNoAPI         = "no Kubernetes API credential in the pods"
 	k8sRuleNoDNSToken    = "no DNS provider token in the pods"
 	k8sRulePrivileged    = "privileged containers only in the worker pods' runtime and agent"
+	k8sRulePrivilegeMode = "each worker pool's privilege mode"
 	k8sRuleWorkerNS      = "the worker namespace's Pod Security label is privileged"
 	k8sRuleReleaseNS     = "the release namespace enforces restricted Pod Security"
 	k8sRuleEgress        = "a NetworkPolicy limits the worker pods' egress"
@@ -80,7 +82,7 @@ const (
 
 // k8sVerifyRules is every rule, in the order verify reports them.
 var k8sVerifyRules = []string{
-	k8sRuleFound, k8sRuleSigned, k8sRuleNoHostMounts, k8sRuleNoAPI, k8sRuleNoDNSToken, k8sRulePrivileged,
+	k8sRuleFound, k8sRuleSigned, k8sRuleNoHostMounts, k8sRuleNoAPI, k8sRuleNoDNSToken, k8sRulePrivileged, k8sRulePrivilegeMode,
 	k8sRuleWorkerNS, k8sRuleReleaseNS, k8sRuleEgress, k8sRuleIngress, k8sRuleServerIngress, k8sRuleIMDS, k8sRoutesAccepted,
 	k8sLinksPassthrough, k8sRuleProbe,
 }
@@ -190,6 +192,52 @@ type k8sContainer struct {
 	SecurityContext *struct {
 		Privileged *bool `json:"privileged"`
 	} `json:"securityContext"`
+	VolumeMounts []struct {
+		Name      string `json:"name"`
+		MountPath string `json:"mountPath"`
+		ReadOnly  bool   `json:"readOnly"`
+	} `json:"volumeMounts"`
+}
+
+// k8sSplitCgroupView reports whether volume is the one machine folder a
+// worker in privilege mode split mounts: /sys/fs/cgroup, read only, at the
+// same path, in its agent alone, which is not privileged
+// (charts/aerolvm/templates/_workerpod.tpl). The agent's own cgroup
+// namespace shows only its own group; it reads its sandboxes' limits and
+// usage there, and cannot write a cgroup file.
+func (p k8sPod) k8sSplitCgroupView(volume, path string) bool {
+	if path != "/sys/fs/cgroup" || p.Metadata.Labels[k8sComponent] != "worker" {
+		return false
+	}
+	mounted := false
+	for _, c := range p.all() {
+		for _, m := range c.VolumeMounts {
+			if m.Name != volume {
+				continue
+			}
+			if c.Name != "agent" || c.privileged() || !m.ReadOnly || m.MountPath != path {
+				return false
+			}
+			mounted = true
+		}
+	}
+	return mounted
+}
+
+// k8sPrivilegeMode is the worker pod's privilege mode: its agent's
+// SB_PRIVILEGE_MODE, and single without one (D5).
+func (p k8sPod) k8sPrivilegeMode() string {
+	for _, c := range p.Spec.Containers {
+		if c.Name != "agent" {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == "SB_PRIVILEGE_MODE" && e.Value == "split" {
+				return "split"
+			}
+		}
+	}
+	return "single"
 }
 
 func (c k8sContainer) privileged() bool {
@@ -397,7 +445,7 @@ func k8sVerify(ctx context.Context, env k8sEnv, o k8sVerifyOptions) []k8sCheck {
 	checks := []k8sCheck{{Name: found, Result: k8sPass, Detail: strconv.Itoa(len(pods)) + " pod(s)"}}
 	checks = append(checks, k8sImagesSigned(ctx, env, pods, o.skipSignatures))
 	checks = append(checks, k8sNoHostMounts(pods), k8sNoAPIRights(pods, o.namespace), k8sNoDNSToken(pods))
-	checks = append(checks, k8sPrivileged(pods, o.workerNamespace))
+	checks = append(checks, k8sPrivileged(pods, o.workerNamespace), k8sPrivilegeModes(pods))
 	checks = append(checks, k8sPodSecurity(ctx, env, o)...)
 	checks = append(checks, k8sEgressPolicy(ctx, env, pods))
 	if o.workerNamespace != o.namespace {
@@ -475,10 +523,14 @@ func k8sImagesSigned(ctx context.Context, env k8sEnv, pods []k8sPod, skip bool) 
 
 func k8sNoHostMounts(pods []k8sPod) k8sCheck {
 	const name = k8sRuleNoHostMounts
-	var found []string
+	var found, views []string
 	for _, p := range pods {
 		for _, v := range p.Spec.Volumes {
-			if v.HostPath != nil {
+			switch {
+			case v.HostPath == nil:
+			case p.k8sSplitCgroupView(v.Name, v.HostPath.Path):
+				views = append(views, p.Metadata.Name)
+			default:
 				found = append(found, fmt.Sprintf("%s: %s (%s)", p.Metadata.Name, v.Name, v.HostPath.Path))
 			}
 		}
@@ -486,7 +538,44 @@ func k8sNoHostMounts(pods []k8sPod) k8sCheck {
 	if len(found) > 0 {
 		return k8sCheck{Name: name, Result: k8sFail, Detail: strings.Join(found, "; ")}
 	}
+	if len(views) > 0 {
+		return k8sCheck{Name: name, Result: k8sPass, Detail: "/sys/fs/cgroup read only in the agent of " + strings.Join(views, ", ")}
+	}
 	return k8sCheck{Name: name, Result: k8sPass}
+}
+
+// k8sPrivilegeModes reports each worker pool's privilege mode (plan §11,
+// eng review D23): how many of its workers run single and how many split.
+// Both in one pool is the normal state while a switch rolls through it
+// (D5, D22), so it never fails; a single-mode install's worker has no
+// pool.
+func k8sPrivilegeModes(pods []k8sPod) k8sCheck {
+	const name = k8sRulePrivilegeMode
+	counts := map[string]map[string]int{}
+	for _, p := range pods {
+		if p.Metadata.Labels[k8sComponent] != "worker" {
+			continue
+		}
+		pool := cmp.Or(p.Metadata.Labels["aerolvm.io/pool"], "(single mode)")
+		if counts[pool] == nil {
+			counts[pool] = map[string]int{}
+		}
+		counts[pool][p.k8sPrivilegeMode()]++
+	}
+	if len(counts) == 0 {
+		return k8sCheck{Name: name, Result: k8sSkip, Detail: "no worker pods"}
+	}
+	var parts []string
+	for _, pool := range slices.Sorted(maps.Keys(counts)) {
+		var modes []string
+		for _, mode := range []string{"split", "single"} {
+			if n := counts[pool][mode]; n > 0 {
+				modes = append(modes, fmt.Sprintf("%s %d", mode, n))
+			}
+		}
+		parts = append(parts, pool+": "+strings.Join(modes, ", "))
+	}
+	return k8sCheck{Name: name, Result: k8sPass, Detail: strings.Join(parts, "; ")}
 }
 
 // k8sNoAPIRights checks no pod holds a Kubernetes API credential, except

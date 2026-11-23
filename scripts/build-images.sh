@@ -10,7 +10,10 @@
 # --dist holds the release build's files, named as release.yml names them:
 # sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>,
 # caddy_linux_<arch> and aerolvm-operator_linux_<arch>, for each platform. Third-party pins and base images
-# come from packaging/images/versions.env.
+# come from packaging/images/versions.env. The aerolvm image also takes
+# aerolvm-rootd_linux_<arch>, the root helper, with its .manifest and .sig
+# when the release signed it (sign-rootd); an unsigned helper ships alone,
+# and privilege mode split's supervisor refuses to run it.
 #
 # With --push the images go to the registry with an SBOM and SLSA provenance
 # attached, and each image's digest is written to <metadata-dir>/<image>.json
@@ -59,6 +62,20 @@ for platform in ${platforms//,/ }; do
     [[ -f "$src" ]] || { echo "build-images: missing $src" >&2; exit 1; }
     install -m 0755 "$src" "$ctx/$arch/$bin"
   done
+  if [[ ",$images," == *,aerolvm,* ]]; then
+    # The root helper under the fixed names the supervisor reads
+    # (internal/rootswap), the signature only when there is one.
+    src="$dist/aerolvm-rootd_linux_${arch}"
+    [[ -f "$src" ]] || { echo "build-images: missing $src" >&2; exit 1; }
+    mkdir -p "$ctx/$arch/rootd"
+    install -m 0755 "$src" "$ctx/$arch/rootd/aerolvm-rootd"
+    if [[ -f "$src.manifest" && -f "$src.sig" ]]; then
+      install -m 0644 "$src.manifest" "$ctx/$arch/rootd/aerolvm-rootd.manifest"
+      install -m 0644 "$src.sig" "$ctx/$arch/rootd/aerolvm-rootd.sig"
+    else
+      echo "build-images: $src is not signed; privilege mode split will refuse it" >&2
+    fi
+  fi
 done
 
 args=(--build-arg "VERSION=$version" --build-arg "REVISION=$(git -C "$root" rev-parse HEAD)")

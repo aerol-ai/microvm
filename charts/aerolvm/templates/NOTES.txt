@@ -99,6 +99,7 @@ did to turn it on, the server pods at the least. The operator no longer
 renews its own API token, and once that expires (within 30 days) it can
 reach no server still in enterprise mode.
 {{- end }}
+{{- include "aerolvm.privilegeModeNotes" . }}
 
 Health: every AerolNode says Serving; a worker that says Failed names the
 machine check it failed. Check the install against the security evidence pack
@@ -135,6 +136,7 @@ AerolVM is starting in {{ .Release.Namespace }} ({{ .Values.mode }} mode).
 {{- end }}
 
    kubectl -n {{ .Release.Namespace }} get secret {{ include "aerolvm.tokenSecret" . }} -o jsonpath='{.data.SB_PAT_TOKEN}' | base64 -d
+{{- include "aerolvm.privilegeModeNotes" . }}
 
 Health: `kubectl -n {{ .Release.Namespace }} get pod {{ include "aerolvm.name" . }}-0` shows {{ if .Values.edge.enabled }}4/4{{ else }}3/3{{ end }} READY
 when sandboxd serves; `aerolvm health` (the CLI) reports the same through the API.

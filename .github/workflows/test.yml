@@ -177,9 +177,16 @@ jobs:
               - 'scripts/build-images.sh'
               - 'scripts/k8s-dev.sh'
               - 'scripts/k8s-smoke.sh'
+              - 'integration-tests/k8s/split.sh'
+              - 'integration-tests/k8s/minio-store.sh'
               - 'cmd/aerolvm/k8s*.go'
               - 'cmd/aerolvm-supervisor/**'
               - 'internal/supervisor/**'
+              # The chart's privilegeMode refusals follow sandboxd's.
+              - 'pkg/daemon/privilege_mode.go'
+              - 'pkg/daemon/chart_split_test.go'
+              - 'internal/privmode/**'
+              - 'internal/rootd/config.go'
               - 'pkg/caddy/cert_reload*.go'
               - 'pkg/daemon/tls_cert_watch*.go'
               # The chart's monitoring checks (P6, P9).
@@ -908,6 +915,7 @@ jobs:
         run: |
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
+          scripts/chart-pod-templates.sh --set privilegeMode=split > "$RUNNER_TEMP/pod-templates-split.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set identity.tokenMaxTTL=2160h \
             --set-string identity.file.content='version: 1' > "$RUNNER_TEMP/pod-templates-identity.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set enterprise.enabled=true \
@@ -943,6 +951,7 @@ jobs:
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
+          AEROLVM_POD_TEMPLATES_SPLIT: ${{ runner.temp }}/pod-templates-split.yaml
           AEROLVM_POD_TEMPLATES_IDENTITY: ${{ runner.temp }}/pod-templates-identity.yaml
           AEROLVM_POD_TEMPLATES_ENTERPRISE: ${{ runner.temp }}/pod-templates-enterprise.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
@@ -961,7 +970,7 @@ jobs:
     needs: paths
     if: needs.paths.outputs.kubernetes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1074,6 +1083,15 @@ jobs:
           AEROLVM_CHART_TOOLS: require
         run: go test -count=1 -run '^TestKubernetesChart' -v ./setup/prometheus/
 
+      # privilegeMode (plans/security-gaps-m1-m4.md M1 PR 11): the chart
+      # refuses each value split cannot run yet, as sandboxd does at start;
+      # a split worker renders what sandboxd and its root helper start
+      # with; single renders none of it.
+      - name: Check the chart's privilege mode against sandboxd
+        env:
+          AEROLVM_CHART_TOOLS: require
+        run: go test -count=1 -run '^TestChart' -v ./pkg/daemon/
+
       # kind's nodes share this runner's kernel, which has no br_netfilter
       # loaded; sandboxd refuses to start without it, since sandbox
       # isolation on the bridge would fail open (Kubernetes v2 finding F2).
@@ -1093,6 +1111,23 @@ jobs:
 
       - name: Smoke test with the edge
         run: scripts/k8s-smoke.sh
+
+      # Privilege mode split (plans/security-gaps-m1-m4.md M1 PR 11): the
+      # same install with the agent unprivileged and a root helper signed
+      # by a throwaway key, then the smoke test and every split check.
+      - name: Install split mode with the edge on kind
+        run: AEROL_K8S_EDGE=1 AEROL_K8S_PRIVILEGE_MODE=split make k8s-dev
+
+      - name: Smoke test in split mode
+        run: scripts/k8s-smoke.sh
+
+      # The smoke test ended by deleting the worker pod; the StatefulSet
+      # makes it again, in split mode.
+      - name: Split mode checks
+        run: |
+          for _ in $(seq 1 60); do kubectl -n aerolvm get pod aerolvm-0 >/dev/null 2>&1 && break; sleep 2; done
+          kubectl -n aerolvm wait --for=condition=Ready pod/aerolvm-0 --timeout=5m
+          integration-tests/k8s/split.sh
 
       - name: Worker logs
         if: failure()

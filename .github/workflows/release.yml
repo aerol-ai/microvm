@@ -429,10 +429,12 @@ jobs:
   # amd64 and arm64, pushed to ghcr.io/aerol-ai with an SBOM and SLSA
   # provenance attached by buildx, signed keyless with cosign, and attested
   # with GitHub's provenance as the release files are. RELEASE-VERIFICATION.md
-  # says how to check them.
+  # says how to check them. The aerolvm image carries the root helper and,
+  # from sign-rootd, its signature: privilege mode split's supervisor runs
+  # only a signed helper (plans/security-gaps-m1-m4.md M1 PR 11).
   images:
     name: Images
-    needs: build
+    needs: [build, sign-rootd]
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -450,6 +452,15 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dist-linux_{amd64,arm64}
+          merge-multiple: true
+          path: dist
+
+      # Absent when the release environment has no signing key: the image
+      # then ships the helper unsigned, which split mode refuses.
+      - name: Download the root helper's signatures
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: dist-rootd-*
           merge-multiple: true
           path: dist
 

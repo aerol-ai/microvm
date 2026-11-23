@@ -221,6 +221,40 @@ func TestWriteParentFile(t *testing.T) {
 	}
 }
 
+// The parent file sits in a folder other containers can write (in privilege
+// mode single, every container that mounts /run/aerolvm). The supervisor is
+// root: it must follow no link left there, at its temporary name or at the
+// file's own, and the file it leaves is a plain file others can read.
+func TestWriteParentFileFollowsNoLink(t *testing.T) {
+	shared := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(victim, []byte("kept\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(shared, "cgroup-parent")
+	for _, link := range []string{f + ".tmp", f} {
+		if err := os.Symlink(victim, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteParentFile(f, "/k/sandboxes"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != "kept\n" {
+		t.Fatalf("a file a link named was written: %q", got)
+	}
+	st, err := os.Lstat(f)
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm() != 0o644 || read(t, f) != "/k/sandboxes" {
+		t.Fatalf("parent file %v %v", st, err)
+	}
+	entries, _ := os.ReadDir(shared)
+	for _, e := range entries {
+		if e.Name() != "cgroup-parent" && e.Name() != "cgroup-parent.tmp" {
+			t.Errorf("left behind %s", e.Name())
+		}
+	}
+}
+
 func TestSettingsFromEnv(t *testing.T) {
 	t.Setenv("SB_CONTAINERD_BINARY", "")
 	t.Setenv("SB_CONTAINERD_CONFIG", " /etc/c.toml ")

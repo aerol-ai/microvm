@@ -128,6 +128,53 @@ func TestReleaseWorkflowShipsKubernetesImages(t *testing.T) {
 	}
 }
 
+// Privilege mode split on Kubernetes (plans/security-gaps-m1-m4.md M1 PR
+// 11): the agent image carries the root helper and its signature under the
+// names the supervisor reads, the images job waits for the signature, and
+// the runtime image carries every tool the helper runs as root, so the
+// helper never runs a program from a folder the agent can write.
+func TestImagesCarryTheRootHelperAndItsTools(t *testing.T) {
+	root := repoRoot(t)
+	read := func(parts ...string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(append([]string{root}, parts...)...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	images := job(read(".github", "workflows", "release.yml"), "images")
+	for _, want := range []string{"needs: [build, sign-rootd]\n", "pattern: dist-rootd-*\n"} {
+		if !strings.Contains(images, want) {
+			t.Errorf("release.yml's images job lacks %q", want)
+		}
+	}
+	script := read("scripts", "build-images.sh")
+	for _, want := range []string{
+		`src="$dist/aerolvm-rootd_linux_${arch}"`,
+		`"$ctx/$arch/rootd/aerolvm-rootd"`,
+		`"$ctx/$arch/rootd/aerolvm-rootd.manifest"`,
+		`"$ctx/$arch/rootd/aerolvm-rootd.sig"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("build-images.sh lacks %q", want)
+		}
+	}
+	if !strings.Contains(read("packaging", "images", "aerolvm.Dockerfile"), "COPY ${TARGETARCH}/rootd/ /opt/aerolvm/rootd/\n") {
+		t.Error("the agent image no longer carries the root helper in /opt/aerolvm/rootd")
+	}
+	runtime := read("packaging", "images", "runtime.Dockerfile")
+	for _, want := range []string{
+		"install -m 0755 cni/bridge cni/host-local /tools/cni/",
+		"COPY --from=fetch /tools/cni/ /opt/aerolvm/cni/",
+		"iproute2 iptables nftables fuse3 sshfs rclone nfs-common /tmp/mount-s3.deb",
+	} {
+		if !strings.Contains(runtime, want) {
+			t.Errorf("runtime.Dockerfile lacks %q", want)
+		}
+	}
+}
+
 // The agent image and scripts/install.sh --with-isolate ship the same
 // workerd release: a VM and a pod running one AerolVM version run one V8.
 func TestWorkerdPinMatchesInstallScript(t *testing.T) {

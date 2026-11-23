@@ -19,8 +19,10 @@ The full record is the chart's **evidence pack**, [`EVIDENCE.md`](https://github
 | Worker: `preflight`, `setup`, `edge` | uid 65532 (`setup` as root with every capability dropped) | None | None |
 | Worker: `egress` | Drops to uid 65532 | `NET_ADMIN` and `NET_BIND_SERVICE` | None |
 | Worker: **`runtime`, `agent`** | root | **privileged** | None |
+| Worker: `agent` with `privilegeMode: split` | uid 65531 | None: no capabilities, read-only root, `RuntimeDefault` seccomp | None |
+| Worker: `split-folders` (first, split only) | root | `CAP_CHOWN` only, read-only root, `RuntimeDefault` seccomp | None |
 
-Servers, gateways and the operator run under the `restricted` Pod Security level. The worker pod's `runtime` and `agent` containers are the one exception.
+Servers, gateways and the operator run under the `restricted` Pod Security level. The worker pod's `runtime` and `agent` containers are the one exception. With [privilege mode split](#privilege-mode), only `runtime` is.
 
 ### Why the worker is privileged
 
@@ -35,7 +37,7 @@ To contain it:
 
 - In cluster mode, workers run in their own namespace, the only one labelled `privileged`. The chart makes it. In single mode, give the pod a namespace of its own.
 - In cluster mode, worker machines run nothing else: the worker pool's taint keeps other pods off. In single mode, keep other workloads off its node if you can.
-- The worker pod mounts no folder from the node and does not share its network or PID namespace.
+- The worker pod mounts no folder from the node and does not share its network or PID namespace. In [split](#privilege-mode), the `agent` reads `/sys/fs/cgroup`, read only.
 - No worker container holds a Kubernetes API credential.
 - The node's cloud identity is out of reach: the IMDS hop limit is 1 ([below](#the-metadata-service)).
 
@@ -46,6 +48,7 @@ If you run Kyverno or Gatekeeper pod-security policies, exempt the worker pods (
 | `runtime`, `agent` | `privileged` |
 | `egress` | Running as root and the added capabilities `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`. It starts as root only to drop to uid 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`. |
 | `setup` (init, cluster mode) | Running as root. It has every capability dropped and a read-only root. |
+| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of three of the pod's own folders, then exits. |
 
 ### The operator's rights
 
@@ -60,6 +63,44 @@ The chart's `templates/operator.yaml` names every one:
 - **Not:** `pods/exec`, any other namespace, or any RBAC object.
 
 During a cluster-mode `helm upgrade`, a short Job also runs with rights to get and update the two AerolVM CRDs, by name, and nothing else. Helm deletes it, with its role, when it succeeds. If it fails, its pod stays: delete it once fixed, or `aerolvm k8s verify` counts it as a pod holding an API credential.
+
+## Privilege mode
+
+The `agent` container runs `sandboxd`, which reads every API request. By default (`privilegeMode: single`) it is privileged, because it also does the root work for each sandbox.
+
+With `privilegeMode: split`, the `agent` has no rights at all. A small root helper, `aerolvm-rootd`, does the root work instead. It runs in the `runtime` container, which is privileged anyway. The `agent` asks it over one socket, and the helper checks every request before it acts.
+
+| | `single` (default) | `split` |
+|---|---|---|
+| `agent` runs as | root, privileged | uid 65531, no capabilities, read-only root, `RuntimeDefault` seccomp |
+| Network namespaces, firewall rules, cgroups, external mounts | made by `agent` | made by the root helper |
+| containerd | `agent` holds its socket | `agent` reaches it only through the helper, which checks each write |
+| Two-way mount propagation, shared process namespace | yes (and more with external storage) | none |
+| Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone, to read sandbox memory and CPU |
+| External storage | off by default | on by default |
+
+The helper ships in the `aerolvm` image with a signature. The `agent` copies it to a folder the `runtime` container reads. The `runtime` container runs it only when a release key built into the `aerolvm-runtime` image signed it, and never an older one than it runs now.
+
+No root process writes in a folder the `agent` can write. Every folder the `agent` writes is mounted read only in the `runtime` container, or not at all. The one shared folder belongs to root, and the `agent` writes only in a folder of its own inside it. A short first container, `split-folders`, sets those owners before anything else starts.
+
+Turn it on at install:
+
+```bash
+helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --set privilegeMode=split
+```
+
+A worker gets its mode when its pod is made. To move a running install, see [Switch the privilege mode](/kubernetes/operations/#switch-the-privilege-mode).
+
+Split does not run these yet. The chart refuses each one by name, so `helm install` fails instead of a worker that never starts:
+
+- Firecracker (`worker.firecracker.enabled`)
+- WASM and V8-isolate sandboxes (`worker.wasm.enabled`, `worker.isolate.enabled`)
+- gVisor moves with memory (`worker.gvisor.checkpointMoves`; it defaults to off in split)
+- The kubectl API's warm pools (`cluster.agentSandboxAPI.enabled`)
+
+`privilegeMode: auto` picks `split` for a new install, unless one of these is on. An upgrade with `auto` keeps the mode the workers have now. `helm template` cannot see the cluster, so set the mode itself when a GitOps tool renders the chart.
+
+`aerolvm k8s verify` reports each worker pool's mode ([below](#check-a-live-install)).
 
 ## How a pod joins the cluster
 
@@ -198,13 +239,15 @@ aerolvm k8s verify --namespace aerolvm
 It exits 1 if any rule fails:
 
 - every image is signed by the AerolVM release workflow (needs `cosign` v3+);
-- no pod mounts a folder from the node, holds a Kubernetes API credential (except the operator), or holds a DNS provider token;
+- no pod mounts a folder from the node (except a split `agent`'s read-only `/sys/fs/cgroup`), holds a Kubernetes API credential (except the operator), or holds a DNS provider token;
 - only the worker pods' `runtime` and `agent` containers are privileged;
 - the worker namespace is labelled `privileged`, and the release namespace enforces `restricted` (cluster mode);
 - NetworkPolicies limit the workers' egress, and who reaches the workers and servers;
 - on AWS, worker machines allow IMDSv2 only, with a hop limit of 1;
 - with `gatewayRef`, your Gateway accepted every AerolVM route, and the sandbox-link listener passes TLS through;
 - a runc and a gVisor sandbox cannot reach the worker, another pod, or the Kubernetes API.
+
+It also prints each worker pool's [privilege mode](#privilege-mode): how many workers run `split` and how many `single`. Both in one pool is normal while you switch, so this line never fails.
 
 The IMDS check reads the machines with your own `aws` CLI and credentials (`ec2:DescribeInstances`). Without them, or off AWS, it prints `SKIP` and the run can still pass.
 

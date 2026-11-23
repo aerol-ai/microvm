@@ -41,6 +41,46 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
+// The supervisor (root) reads the lease from a folder sandboxd can write:
+// it follows no link at the file's name, waits on no pipe, reads no
+// device, folder or file past the bound.
+func TestReadTakesOnlyARegularFile(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good")
+	if err := Write(good, Lease{ConfirmedUnixMs: 1, WrittenUnixMs: 1, LeaseMs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	pipe := filepath.Join(dir, "pipe")
+	if err := mkfifo(pipe); err != nil {
+		t.Skipf("no FIFO here: %v", err)
+	}
+	big := filepath.Join(dir, "big")
+	if err := os.WriteFile(big, make([]byte, maxLeaseBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for name, p := range map[string]string{"a link": link, "a pipe": pipe, "a folder": dir, "a file past the bound": big} {
+			if _, err := Read(p); err == nil || errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s: %v, want a refusal", name, err)
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Read waited on a pipe")
+	}
+	if _, err := Read(good); err != nil {
+		t.Fatalf("a regular lease: %v", err)
+	}
+}
+
 func TestReadFailures(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Read(filepath.Join(dir, "missing")); !errors.Is(err, os.ErrNotExist) {
