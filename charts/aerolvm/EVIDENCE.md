@@ -121,6 +121,64 @@ of capabilities, masked and read-only kernel paths, and no new privileges.
 The chart never turns on `SB_CONTAINER_PRIVILEGED`, which would remove that
 envelope.
 
+### Privilege mode split: an `agent` with no rights
+
+`privilegeMode: split` (default `single`) takes the rights away from the
+container that reads every API request. The root work moves to a small root
+helper, `aerolvm-rootd`, in the `runtime` container, which is privileged in
+both modes. The `agent` asks it over one Unix socket; the helper lets in only
+the agent's uid, and checks every request against fixed rules before it acts
+(containerd writes included: the `agent` reaches containerd only through the
+helper).
+
+| Container | `single` | `split` |
+|---|---|---|
+| `agent` | root, **privileged**; mounts containerd's root and socket, `/run/netns` two-way | user 65531; no capabilities; no privilege escalation; read-only root disk; `RuntimeDefault` seccomp; no containerd root or socket; no `/run/netns` |
+| `runtime` | root, privileged | root, privileged; also runs the root helper, only from a copy whose signature a release key built into the `aerolvm-runtime` image checks |
+| Pod | two-way mounts; one process namespace with external storage, WASM, V8 or Firecracker | no two-way mount; no shared process namespace |
+| Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone: it reads its sandboxes' memory and CPU there, and cannot write a cgroup file |
+| External storage | off by default | on by default: the helper runs the mount tools as their own user, in the `runtime` container |
+
+What split does not run yet, refused by name at `helm install`: Firecracker,
+WASM and V8-isolate sandboxes, gVisor moves with memory, and the kubectl
+API's warm pools.
+
+What is proven so far, and how:
+
+- **The chart.** `single` renders byte for byte what the chart rendered
+  before (a diff over 15 value sets). Tests in the AerolVM repository check
+  that each refused value matches a refusal `sandboxd` itself makes at
+  start, that a new refusal in `sandboxd` fails the build until the chart
+  refuses it too, that a split worker renders a pod `sandboxd` starts in,
+  and that the helper reads the same settings the agent does.
+- **The helper and the gate.** The broken-agent suite in the repository
+  sends the helper and the containerd gate the requests a compromised agent
+  would, and checks each is refused (plan §3.6).
+- **On kind** (`integration-tests/k8s/split.sh`, on Docker Desktop, kernel
+  5.10, 2026-11-23): the `agent` runs as uid 65531 with no capability and
+  cannot write its root disk; it has no containerd root, socket or
+  `/run/netns`; the pod has no two-way mount and no shared process
+  namespace; the helper runs from the supervisor's verified copy. runc and
+  gVisor sandboxes run commands and take files in and out, and cannot
+  reach the worker's ports or the Kubernetes API. No-network, address and
+  hostname allow lists hold. An rclone mount of a MinIO bucket reaches its
+  gVisor sandbox, with rclone running as the mount tools' own user in the
+  `runtime` container. After an `agent` restart and then a helper restart,
+  every sandbox still answers, new ones start, and the mount keeps writing.
+  `aerolvm k8s verify` passes and reports the worker in split. Deleting the
+  pod with sandboxes running took 7 seconds and left nothing on the
+  machine. With `privilegeMode: auto`, an upgrade kept each mode, a new
+  install rendered split, and a running pod kept its mode until it was made
+  again. With the edge on, the smoke test passed in split (HTTPS API,
+  sandbox link, certificate renewal with no restart), and a raw TCP port
+  answered from another pod. Single mode's smoke test passed on the same
+  images. Docker Desktop's kernel (5.10) cannot show memory pressure (F10)
+  or real create latency (N1); those are the EKS drill's.
+- **Not yet proven:** one live EKS run (sandboxes kept across an agent
+  swap; external storage across it; no namespace left after a pod delete;
+  memory pressure kills one sandbox, never the machinery; create latency
+  before and after). The chart's default stays `single` until it passes.
+
 ## 3. Identity
 
 - **A new pod proves who it is before it gets a join token.** Kubernetes

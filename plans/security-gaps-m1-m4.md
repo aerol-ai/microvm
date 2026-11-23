@@ -565,6 +565,99 @@ Each is small and stands alone. Together they shrink the root surface now.
     and `shareProcessNamespace`; turn external storage on by default.
     The operator rolls workers to the new template node by node through
     decommission; the dual-mode agent (D5) covers pods still on the old one.
+    **What building it taught us (PR 11, 2026-11-23).**
+    - **The chart value is `privilegeMode: single | split | auto`, and the
+      default stays `single`** until the EKS drill (D10). `single` renders
+      byte for byte what the chart rendered before. `auto` is the later
+      default: a new install gets `split` unless a value needs `single`;
+      an upgrade keeps the mode the release's worker template has now
+      (Helm `lookup` of the single-mode StatefulSet or cluster mode's
+      pod-templates ConfigMap; a template with no `SB_PRIVILEGE_MODE` is
+      `single`, and an upgrade that cannot read it keeps `single`). The
+      flip is then one line in `values.yaml` (`single` to `auto`).
+      `helm template` cannot read the cluster and renders `auto` as a new
+      install, so GitOps users set the mode itself; the docs say so.
+    - **The agent's uid is 65531, not 65532.** The helper refuses 65532 by
+      number (review H3): edge, egress and the operator share it, and the
+      peer check goes by uid. 65531 is the helper's default.
+    - **The fallback is the setting, not the socket.** The agent does not
+      look for the helper's socket (D5's first idea); it reads
+      `SB_PRIVILEGE_MODE`, absent meaning `single`. A pod made from an
+      older template has no such setting, so an in-place agent upgrade
+      onto it runs `single`, which is what D5 needs.
+    - **Nothing staged the helper.** `rootswap.Stage` had no caller and the
+      agent image carried no helper. The agent image now ships
+      `aerolvm-rootd` with its signed manifest and signature (the release's
+      images job waits for `sign-rootd`), and the agent's start command
+      copies the three files to the staging folder before `sandboxd`
+      starts. Re-staging the same release swaps nothing (the keeper skips
+      a manifest equal to the running one).
+    - **The helper's tools live in the runtime image.** It runs the CNI
+      plugins, iptables and the mount tools as root, so they cannot come
+      from a folder the agent writes. The runtime image grows from about
+      364 MB to 561 MB, and a bump of one of those tools is now a runtime
+      image change, which a split worker takes only through a decommission.
+      The mount tools' user is made by the runtime container's start
+      command, and only when external storage is on: the helper serves
+      mounts only when that user exists, which keeps an off switch.
+    - **One shared folder.** The helper hard-links each ready socket the
+      agent makes into a folder of its own, and a link cannot cross mounts.
+      So one emptyDir, `/run/aerolvm-rootd/shared`, holds the helper's
+      socket, ready sockets and task FIFOs and the agent's run folder
+      (`SB_MOUNTS_CRED_DIR`). The kubelet makes an emptyDir open to all,
+      which the helper refuses (internal/rootfolder), so the runtime
+      container's start command makes it root's (0750, the agent's group)
+      and clears what was left in it before the supervisor starts.
+    - **The agent cannot see its sandboxes' cgroups.** A container that is
+      not privileged gets its own cgroup namespace, and the sandboxes'
+      group is the runtime container's. Capacity sizing (C7), the live
+      memory probe and usage metrics (C20) read it, and `sandboxd` would
+      not start. The split agent mounts the machine's `/sys/fs/cgroup`
+      read only; `aerolvm k8s verify` allows exactly that mount and nothing
+      wider. Owner decision (below): a helper call that reads these files
+      would remove the mount.
+    - **The disk floor reads the sandbox volume through one empty folder on
+      it** (a read-only `subPath`), as the agent no longer mounts
+      containerd's root.
+    - **The egress gateway lets in uid 65531** (`SB_EGRESS_PEER_UIDS`).
+    - **What split refuses at `helm install`** (aerolvm.splitGaps): the
+      daemon's gaps (Firecracker, gVisor moves, the containerd warm pool,
+      which the kubectl API's warm pools use) and, for this chart only,
+      WASM and V8 isolates. Those run in split on VMs (PR 9a); a split
+      worker pod still needs the deny floor stamped into the runtime
+      container (the operator stamps it into the agent and egress only),
+      the WASM socket folder on the shared folder, the V8 jail's base
+      outside the agent's folders, and a live check of host adoption
+      without a shared process namespace. gVisor moves default to off in
+      split and on in single. pkg/daemon's chart tests read
+      `checkPrivilegeMode`'s source, so a new daemon gap fails CI until
+      the chart refuses it too.
+    - **Switching a running install** is a decommission per worker in
+      cluster mode and a pod delete in single mode (the NOTES and the Operate
+      page say how). A state volume that outlives the pod keeps files the
+      root agent wrote, which the split agent cannot open: the switch
+      starts from a new volume.
+    - **Kind found three more things** the offline tests could not: the
+      agent may not change the mode of an emptyDir's own folder
+      (`/run/sandboxd`), the helper refuses the CNI records' emptyDir
+      until root closes it, and the egress gateway made its control socket
+      0600 for its own uid, so a split agent could not dial it (the gateway
+      now opens it when it answers another uid, as sandboxd's lookup socket
+      does). Reading the code found a fourth: in enterprise mode the split
+      agent must be in the edge's group to hand it the public API socket.
+    - **Proven on kind** (Docker Desktop, kernel 5.10;
+      `integration-tests/k8s/split.sh`): the pod's shape, runc and gVisor,
+      files, the worker's ports and the Kubernetes API closed, no-network,
+      address and hostname allow lists, an rclone mount, an agent restart
+      and a helper restart with every sandbox kept, `aerolvm k8s verify`,
+      a pod delete with nothing left behind, `auto` on upgrade and install,
+      the edge (HTTPS API, sandbox links, a certificate renewal, a raw TCP
+      port) in split, and single mode's smoke test on the new images. CI's
+      kubernetes job now runs split on kind too. Not on kind: memory
+      pressure (F10) and create latency (N1), which need a real node; the
+      cluster-mode mixed fleet (one kind node cannot hold three servers,
+      three gateways and two workers beside the other local clusters); and
+      a 6.12 kernel. Those are the EKS drill's.
 12. Docs, `EVIDENCE.md` and the capability matrix.
 
 ### 3.6 Tests

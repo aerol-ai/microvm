@@ -235,13 +235,15 @@ aerolvm k8s verify --namespace aerolvm
 It exits 1 if any rule fails:
 
 - every image is signed by the AerolVM release workflow (needs `cosign` v3+);
-- no pod mounts a folder from the node, holds a Kubernetes API credential (except the operator), or holds a DNS provider token;
+- no pod mounts a folder from the node (except a split `agent`'s read-only `/sys/fs/cgroup`), holds a Kubernetes API credential (except the operator), or holds a DNS provider token;
 - only the worker pods' `runtime` and `agent` containers are privileged;
 - the worker namespace is labelled `privileged`, and the release namespace enforces `restricted` (cluster mode);
 - NetworkPolicies limit the workers' egress, and who reaches the workers and servers;
 - on AWS, worker machines allow IMDSv2 only, with a hop limit of 1;
 - with `gatewayRef`, your Gateway accepted every AerolVM route, and the sandbox-link listener passes TLS through;
 - a runc and a gVisor sandbox cannot reach the worker, another pod, or the Kubernetes API.
+
+It also prints each worker pool's [privilege mode](#privilege-mode): how many workers run `split` and how many `single`. Both in one pool is normal while you switch, so this line never fails.
 
 The IMDS check reads the machines with your own `aws` CLI and credentials (`ec2:DescribeInstances`). Without them, or off AWS, it prints `SKIP` and the run can still pass.
 
