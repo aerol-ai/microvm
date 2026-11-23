@@ -74,16 +74,6 @@ func chartGapRows() []chartGapRow {
 			chart: "worker.extraEnv.SB_CONTAINERD_POOL_ENABLED", env: "SB_CONTAINERD_POOL_ENABLED", set: pool, step: privmode.StepWarmPool},
 		{name: "gVisor moves in extraEnv", flags: []string{"--set", "worker.gvisor.checkpointMoves=false", "--set", "worker.extraEnv.SB_GVISOR_CHECKPOINT_MOVES=true"},
 			chart: "worker.extraEnv.SB_GVISOR_CHECKPOINT_MOVES", env: "SB_GVISOR_CHECKPOINT_MOVES", set: moves, step: privmode.StepMoves},
-		// WASM is refused whole on a split worker pod (a Kubernetes row
-		// below), which covers its warm pool without the resident host.
-		{name: "the WASM warm pool", flags: []string{"--set", "worker.wasm.enabled=true",
-			"--set", "worker.extraEnv.SB_WASM_POOL_ENABLED=true", "--set", "worker.extraEnv.SB_WASM_RESIDENT_HOST_ENABLED=false"},
-			chart: "worker.wasm.enabled", env: "SB_WASM_RESIDENT_HOST_ENABLED",
-			set: func(c *config.Config, v string) {
-				wasmSplit(c)
-				c.WasmPoolEnabled, c.WasmResidentHostEnabled = true, isTrue(v)
-			},
-			step: privmode.StepWasmWarmPool},
 		{name: "the Docker engine", flags: []string{"--set", "worker.extraEnv.SB_CONTAINER_ENGINE=docker"},
 			chart: "worker.extraEnv.SB_CONTAINER_ENGINE", env: "SB_CONTAINER_ENGINE",
 			set: func(c *config.Config, v string) { c.ContainerEngine = v }, want: "SB_CONTAINER_ENGINE=containerd"},
@@ -91,6 +81,8 @@ func chartGapRows() []chartGapRow {
 			chart: "worker.extraEnv.SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", env: "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED",
 			set: func(c *config.Config, v string) { c.ContainerdNativeNetnsPoolEnabled = isTrue(v) }, want: "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED"},
 		// Kubernetes rows: split on the daemon, not yet in the worker pod.
+		// sandboxd runs WASM's warm pool, checkpoints and external mounts
+		// in split (M1 PR 15); the worker pod's WASM wiring is still to do.
 		{name: "WASM", flags: []string{"--set", "worker.wasm.enabled=true"}, chart: "worker.wasm.enabled"},
 		{name: "V8 isolates", flags: []string{"--set", "worker.isolate.enabled=true"}, chart: "worker.isolate.enabled"},
 		{name: "a helper setting in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ROOTD_AGENT_UID=1"}, chart: "worker.extraEnv.SB_ROOTD_AGENT_UID"},

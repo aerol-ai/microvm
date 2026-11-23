@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -132,7 +131,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	cleanup := func() {
 		_ = d.supervisor.Stop(workerKey)
 		if warmSlot != nil {
-			_ = os.RemoveAll(filepath.Dir(warmSlot.SocketPath))
+			if dir := warmSlot.Folder(); dir != "" {
+				_ = os.RemoveAll(dir)
+			}
 		} else {
 			_ = os.Remove(socketPath)
 		}

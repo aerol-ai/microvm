@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -259,7 +258,9 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		_ = d.supervisor.Stop(workerKey)
 	}
 	if inst != nil && inst.fromWarmPool && inst.socketPath != "" {
-		_ = os.RemoveAll(filepath.Dir(inst.socketPath))
+		if dir := d.warmSlotFolder(inst); dir != "" {
+			_ = os.RemoveAll(dir)
+		}
 	}
 	workDir := d.sandboxDir(sandboxID)
 	if inst != nil && inst.workDir != "" {

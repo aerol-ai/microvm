@@ -143,6 +143,15 @@ func (l splitWasmLauncher) Launch(ctx context.Context, key, socketPath, cacheDir
 	return l.h.HoldHost(l.kind, key, int(resp.GetPid()), resp.GetStartTicks()), nil
 }
 
+// splitSlotSocket is the socket of a WASM warm-pool slot's worker in split
+// mode: a WASM worker host of the helper's, named by the slot's id, which
+// the helper serves in socketDir (rootpolicy.WasmHostSocket).
+func splitSlotSocket(socketDir string) func(slotID string) (string, error) {
+	return func(slotID string) (string, error) {
+		return rootpolicy.WasmHostSocket(socketDir, rootpolicy.HostWasmWorker, slotID)
+	}
+}
+
 // splitWasmWorkers lists the WASM hosts the helper holds, for boot adoption
 // (wasmruntime Driver.SetWorkerLister): each running one held, by the
 // socket the helper serves it on. One whose process is gone is removed.

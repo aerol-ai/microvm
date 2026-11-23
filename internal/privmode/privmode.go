@@ -52,7 +52,6 @@ type Step string
 const (
 	StepImageUser           Step = "image_user"
 	StepDiskQuota           Step = "disk_quota"
-	StepWasmWarmPool        Step = "wasm_warm_pool"
 	StepWasmMounts          Step = "wasm_mounts"
 	StepFirecrackerWarmPool Step = "firecracker_warm_pool"
 	StepFirecrackerImages   Step = "firecracker_images"
@@ -63,10 +62,9 @@ const (
 
 // steps say what each step is, for the operator who meets the error.
 var steps = map[Step]string{
-	StepImageUser:    "reading an image's users from its root filesystem",
-	StepDiskQuota:    "the disk quota on a sandbox's writable layer",
-	StepWasmWarmPool: "the WASM warm pool's slots (SB_WASM_POOL_ENABLED with SB_WASM_RESIDENT_HOST_ENABLED off)",
-	StepWasmMounts:   "a WASM sandbox's external mounts, which its worker opens through sandboxd, and sandboxd cannot open the root helper's mount points",
+	StepImageUser:  "reading an image's users from its root filesystem",
+	StepDiskQuota:  "the disk quota on a sandbox's writable layer",
+	StepWasmMounts: "a WASM sandbox's external mounts, which its worker opens through sandboxd, and sandboxd cannot open the root helper's mount points",
 	StepFirecrackerWarmPool: "the Firecracker warm VM pool (SB_FIRECRACKER_VMM_POOL_ENABLED), whose paused VMs run under their slot's ID " +
 		"until a sandbox claims them",
 	StepFirecrackerImages: "a Firecracker sandbox's disk saved as a container image, which a second VM reads",

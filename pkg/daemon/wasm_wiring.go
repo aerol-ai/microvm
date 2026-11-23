@@ -182,6 +182,12 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	var pool *wasmpool.Pool
 	if warmPoolEffectivelyEnabled(cfg) {
 		pool = wasmpool.New(cfg.WasmRunDir, logger)
+		if hosts != nil {
+			// Each slot's worker is a WASM worker host of the helper's,
+			// named by the slot's id, on the socket the helper serves it on
+			// (splitWasmLauncher); the slot's folder stays sandboxd's.
+			pool.SetSocketFor(splitSlotSocket(cfg.RootdWasmSocketDir))
+		}
 		pool.SetDefaultDepth(cfg.WasmPoolDepthDefault)
 		pool.SetDefaultMemoryMB(cfg.WasmDefaultMemoryMB)
 		spawner := wasmpool.NewSupervisorSpawner(supervisor)

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
@@ -63,6 +64,42 @@ func (d *Driver) parseResidentSocket(socket string) (string, int, bool) {
 	}
 	// The name after "r-" is single mode's resident socket name.
 	return parseResidentSocket(d.cfg.RunDir, filepath.Join(d.cfg.RunDir, "resident", name))
+}
+
+// slotFromSocket reads a warm-pool slot's id back from its worker's socket.
+// In single mode the socket is in the slot's folder (wasmpool
+// SlotFromSocket). In split the root helper serves it, w-<slot id>.sock in
+// its folder (the pool's SetSocketFor): only a slot id's shape is a slot's,
+// so no sandbox's own worker passes for one.
+func (d *Driver) slotFromSocket(socket string) (string, bool) {
+	if !d.split() {
+		return wasmpool.SlotFromSocket(d.cfg.RunDir, socket)
+	}
+	name, ok := strings.CutPrefix(filepath.Base(socket), "w-")
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(name, ".sock")
+	if !ok || !wasmpool.IsSlotID(id) || d.helperSocket(rootpolicy.HostWasmWorker, id) != socket {
+		return "", false
+	}
+	return id, true
+}
+
+// warmSlotFolder is the folder of the warm-pool slot an instance took,
+// removed with the sandbox: its socket's folder in single mode; in split,
+// where the socket is the helper's, the slot's own folder, found again by
+// its id and the module's digest (wasmpool SlotDirIn). "" when the socket
+// names no slot.
+func (d *Driver) warmSlotFolder(inst *sandboxInstance) string {
+	if !d.split() {
+		return filepath.Dir(inst.socketPath)
+	}
+	id, ok := d.slotFromSocket(inst.socketPath)
+	if !ok || inst.moduleDigest == "" {
+		return ""
+	}
+	return wasmpool.SlotDirIn(d.cfg.RunDir, inst.moduleDigest, id)
 }
 
 // handToWorker gives a folder sandboxd made to the worker: to its uid in

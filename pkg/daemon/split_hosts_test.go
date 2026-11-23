@@ -259,3 +259,28 @@ func TestWireWasmRuntimeSplit(t *testing.T) {
 		t.Fatalf("boot adoption did not ask the helper: %v", f.calls)
 	}
 }
+
+// TestWireWasmWarmPoolSplit: in privilege mode split the WASM warm pool is
+// wired (M1 PR 15), each slot's worker on the helper's socket for the
+// slot's id.
+func TestWireWasmWarmPoolSplit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := openTestStore(t)
+	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	pool := wireWasmRuntime(ctx, config.Config{
+		WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir(), WasmEngine: "wazero", WasmPoolEnabled: true, WasmPoolDepthDefault: 1,
+		WasmWorkerUID: 61000, WasmWorkerGID: 61000, RootdWasmSocketDir: "/run/aerolvm-rootd/wasm",
+	}, testLogger(), svc, st, &fakeHostHelper{})
+	if pool == nil {
+		t.Fatal("no warm pool in split")
+	}
+	defer pool.Close()
+	sock := splitSlotSocket("/run/aerolvm-rootd/wasm")
+	if got, err := sock("pool-0123456789abcdef"); err != nil || got != "/run/aerolvm-rootd/wasm/w-pool-0123456789abcdef.sock" {
+		t.Fatalf("slot socket %q %v", got, err)
+	}
+	if _, err := sock("../x"); err == nil {
+		t.Fatal("a socket for a bad slot id")
+	}
+}
