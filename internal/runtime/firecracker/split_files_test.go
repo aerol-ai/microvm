@@ -166,7 +166,7 @@ func TestSplitStopFailures(t *testing.T) {
 func TestSplitTemplateSnapshot(t *testing.T) {
 	f := newFakeSplit(t)
 	d, client, _, _ := splitDriver(t, f)
-	dir := t.TempDir()
+	dir := templateFolder(t, d, "t1")
 	disk := filepath.Join(dir, rootfsFileName)
 	if err := os.WriteFile(disk, []byte("ext4"), 0o600); err != nil {
 		t.Fatal(err)
@@ -197,6 +197,27 @@ func TestSplitTemplateSnapshot(t *testing.T) {
 	if _, err := os.Stat(disk); err != nil {
 		t.Fatalf("the template's disk is gone: %v", err)
 	}
+	// A snapshot to be copied anywhere but sandboxd's own folders is
+	// refused before the helper hands anything out.
+	n := len(f.seen())
+	_, err = d.SnapshotTemplate(context.Background(), TemplateSnapshotRequest{TemplateID: "t1", RootfsPath: disk,
+		OutMemoryPath: filepath.Join(t.TempDir(), "snapshot.memory"), OutStatePath: filepath.Join(dir, "snapshot.state"), GuestCID: 9, MemoryMB: 128, VCPU: 1})
+	if err == nil || !strings.Contains(err.Error(), "own folders") {
+		t.Fatalf("a snapshot copied out elsewhere: %v", err)
+	}
+	if got := f.seen()[n:]; slices.Contains(got, "hand-out tpl-snap-t1 saved.memory,saved.state") {
+		t.Fatalf("handed out for a refused copy: %v", got)
+	}
+}
+
+// templateFolder is template id's folder under the driver's TemplatesDir.
+func templateFolder(t *testing.T, d *Driver, id string) string {
+	t.Helper()
+	dir := filepath.Join(d.cfg.TemplatesDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 // TestSplitTemplateDisk: a template's disk is built in its snapshot VM's
@@ -204,7 +225,7 @@ func TestSplitTemplateSnapshot(t *testing.T) {
 func TestSplitTemplateDisk(t *testing.T) {
 	f := newFakeSplit(t)
 	d, _, _, _ := splitDriver(t, f)
-	out := filepath.Join(t.TempDir(), rootfsFileName)
+	out := filepath.Join(templateFolder(t, d, "t2"), rootfsFileName)
 	_, stage := f.jail(snapshotVMMIDPrefix + "t2")
 	err := d.SplitTemplateDisk(context.Background(), "t2", out, func(stageOut string) error {
 		if stageOut != filepath.Join(stage, rootfsFileName) {
@@ -226,6 +247,17 @@ func TestSplitTemplateDisk(t *testing.T) {
 	}
 	if err := d.SplitTemplateDisk(context.Background(), "a.b", out, nil); err == nil {
 		t.Fatal("a template id that is no VM id")
+	}
+	// A disk to be moved anywhere but sandboxd's own folders: refused
+	// before the jail is made.
+	n := len(f.seen())
+	for _, bad := range []string{filepath.Join(t.TempDir(), rootfsFileName), filepath.Join(d.cfg.TemplatesDir, "..", "x", rootfsFileName)} {
+		if err := d.SplitTemplateDisk(context.Background(), "t2", bad, nil); err == nil || !strings.Contains(err.Error(), "own folders") {
+			t.Fatalf("a disk moved to %s: %v", bad, err)
+		}
+	}
+	if got := f.seen()[n:]; len(got) != 0 {
+		t.Fatalf("helper calls for a refused disk: %v", got)
 	}
 	if err := New(Config{}, nil).SplitTemplateDisk(context.Background(), "t2", out, nil); err == nil {
 		t.Fatal("SplitTemplateDisk in single mode")
@@ -275,12 +307,50 @@ func TestSplitShareAndCopyOut(t *testing.T) {
 	if err := d.splitShare(ctx, stage, sharedFile{rootfsFileName, src}); err == nil || !strings.Contains(err.Error(), "refused") {
 		t.Fatalf("a refused share: %v", err)
 	}
+	// A copy to anywhere but sandboxd's own folders: refused before the
+	// helper hands anything out.
+	n = len(f.seen())
+	if err := d.splitCopyOut(ctx, root, chrootFile{rootfsFileName, filepath.Join(t.TempDir(), "x")}); err == nil || !strings.Contains(err.Error(), "own folders") {
+		t.Fatalf("a copy out of sandboxd's folders: %v", err)
+	}
+	if got := f.seen()[n:]; len(got) != 0 {
+		t.Fatalf("helper calls for a refused copy: %v", got)
+	}
 	f.outErr = errors.New("refused: host")
-	if err := d.splitCopyOut(ctx, root, chrootFile{rootfsFileName, filepath.Join(t.TempDir(), "x")}); err == nil {
-		t.Fatal("a refused hand-out")
+	if err := d.splitCopyOut(ctx, root, chrootFile{rootfsFileName, filepath.Join(d.cfg.RunDir, "x")}); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("a refused hand-out: %v", err)
 	}
 	if err := d.splitCopyOut(ctx, "/elsewhere", chrootFile{rootfsFileName, "x"}); err == nil {
 		t.Fatal("a hand-out outside a jail")
+	}
+}
+
+// TestOwnPath: a path counts as sandboxd's own only when, cleaned, it lies
+// inside TemplatesDir or RunDir; never the folder itself, a sibling that
+// shares its name's start, or a path that climbs out with "..".
+func TestOwnPath(t *testing.T) {
+	tpl, run := t.TempDir(), t.TempDir()
+	d := New(Config{TemplatesDir: tpl + string(filepath.Separator), RunDir: " " + run + " "}, nil)
+	for _, tc := range []struct {
+		name, p, want string
+	}{
+		{"a template's file", filepath.Join(tpl, "t1", "snapshot.memory"), filepath.Join(tpl, "t1", "snapshot.memory")},
+		{"a sandbox snapshot's file", run + "/_sandboxes/sb-1.tmp/./snapshot.memory", filepath.Join(run, "_sandboxes", "sb-1.tmp", "snapshot.memory")},
+		{"climbs out", tpl + "/t1/../../etc/shadow", ""},
+		{"the folder itself", tpl, ""},
+		{"a sibling folder", tpl + "-x/snapshot.memory", ""},
+		{"elsewhere", "/etc/shadow", ""},
+		{"relative", "t1/snapshot.memory", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := d.ownPath(tc.p)
+			if got != tc.want || (err == nil) != (tc.want != "") {
+				t.Fatalf("ownPath(%q) = %q, %v; want %q", tc.p, got, err, tc.want)
+			}
+		})
+	}
+	if _, err := New(Config{}, nil).ownPath(filepath.Join(tpl, "x")); err == nil {
+		t.Fatal("a driver with no folders owns a path")
 	}
 }
 

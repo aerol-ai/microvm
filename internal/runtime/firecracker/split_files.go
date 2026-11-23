@@ -128,18 +128,44 @@ func (d *Driver) splitCopyOut(ctx context.Context, runDir string, files ...chroo
 		return err
 	}
 	names := make([]string, 0, len(files))
+	dsts := make([]string, 0, len(files))
 	for _, f := range files {
-		names = append(names, f.name)
+		dst, err := d.ownPath(f.dst)
+		if err != nil {
+			return err
+		}
+		names, dsts = append(names, f.name), append(dsts, dst)
 	}
 	if err := d.split.HandOutFirecrackerFiles(ctx, id, names...); err != nil {
 		return fmt.Errorf("root helper: hand out %s: %w", strings.Join(names, ", "), err)
 	}
-	for _, f := range files {
-		if err := copyFromChroot(filepath.Join(root, f.name), f.dst); err != nil {
+	for i, name := range names {
+		if err := copyFromChroot(filepath.Join(root, name), dsts[i]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// ownPath is p, cleaned, when it lies in one of the driver's own folders
+// (TemplatesDir, RunDir): sandboxd copies or moves a VM's file out only
+// into them. The paths that reach here are built from a sandbox's or a
+// template's ID, which the API checked already. The check sits next to
+// the file calls so it holds for every caller, and in the form code
+// scanning (go/path-injection) trusts: a cleaned path seen to keep a
+// fixed folder as its prefix.
+func (d *Driver) ownPath(p string) (string, error) {
+	clean := filepath.Clean(p)
+	for _, root := range []string{d.cfg.TemplatesDir, d.cfg.RunDir} {
+		if root = strings.TrimSpace(root); root == "" {
+			continue
+		}
+		root = filepath.Clean(root)
+		if strings.HasPrefix(clean, root+string(filepath.Separator)) {
+			return clean, nil
+		}
+	}
+	return "", fmt.Errorf("firecracker runtime: %s is not in sandboxd's own folders", p)
 }
 
 // copyFromChroot copies a file the helper handed out of a VM's chroot to
@@ -215,6 +241,10 @@ func (d *Driver) SplitTemplateDisk(ctx context.Context, templateID, out string, 
 	}
 	id := snapshotVMMIDPrefix + templateID
 	if err := validateSandboxID(id); err != nil {
+		return fmt.Errorf("firecracker template disk: %w", err)
+	}
+	out, err := d.ownPath(out)
+	if err != nil {
 		return fmt.Errorf("firecracker template disk: %w", err)
 	}
 	_, stage, err := d.split.PrepareFirecracker(ctx, id)

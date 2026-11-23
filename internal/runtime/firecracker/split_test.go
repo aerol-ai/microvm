@@ -178,7 +178,7 @@ func (f *fakeSplit) MakeFilesystem(_ context.Context, id, name, source string, s
 func splitDriver(t *testing.T, f *fakeSplit) (*Driver, *fakeClient, *fakeVsockDialer, *fakeRootfs) {
 	t.Helper()
 	client, vsock, rootfs := newFakeClient(), newFakeVsockDialer(), &fakeRootfs{}
-	d := New(Config{KernelImage: "/var/lib/aerolvm-rootd/vmlinux", RunDir: t.TempDir(), UseJailer: true,
+	d := New(Config{KernelImage: "/var/lib/aerolvm-rootd/vmlinux", RunDir: t.TempDir(), TemplatesDir: t.TempDir(), UseJailer: true,
 		JailerChrootBase: f.base, OverlayEnabled: true, OverlayMkfs: true, Mkfs4Bin: "/sbin/mkfs.ext4", JailerUID: 1500, JailerGID: 1500}, nil)
 	d.SetPool(newFakePool())
 	d.SetRootfsBuilder(rootfs)
