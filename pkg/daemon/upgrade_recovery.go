@@ -5,10 +5,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/version"
 )
 
@@ -33,9 +37,18 @@ var (
 // It returns an error only when it put the sandboxd binary itself back:
 // this process is then the newer binary, and exiting lets systemd start
 // the previous one. Any other problem is logged; it must not stop a boot.
+//
+// In privilege mode split sandboxd has no right to swap root's binaries,
+// and the upgrade folder is root's own (SB_UPGRADE_STATE_DIR):
+// sandboxd.service runs `sandboxd upgrade recover` as root before sandboxd
+// starts instead (M1 PR 10), so nothing is done here.
 func recoverInterruptedUpgrade(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	if cfg.PrivilegeMode == privmode.Split {
+		logger.Debug("privilege mode split: an interrupted upgrade is settled as root before sandboxd starts (sandboxd upgrade recover)")
+		return nil
+	}
 	out := &slogLines{logger: logger.With("component", "upgrade-recovery")}
-	results, err := recoverUpgrades(ctx, nodeupgrade.StateDirFor(cfg.DBPath), newUpgradeRecoveryHost(), out)
+	results, err := recoverUpgrades(ctx, upgradeRecoveryPaths(cfg), newUpgradeRecoveryHost(), out)
 	out.flush()
 	if err != nil {
 		logger.Warn("could not check for an interrupted upgrade", "error", err)
@@ -52,6 +65,28 @@ func recoverInterruptedUpgrade(ctx context.Context, cfg config.Config, logger *s
 		}
 	}
 	return nil
+}
+
+// resolveRecoveryPaths is how the upgrader finds this node's installed files
+// (a seam for tests): from the env file and the process's environment, as
+// `sandboxd upgrade node` finds them.
+var resolveRecoveryPaths = func() (nodeupgrade.Paths, error) {
+	return nodeupgrade.ResolvePaths(nodeupgrade.DefaultEnvFile, os.Getenv, func() (string, error) { return exec.LookPath("caddy") })
+}
+
+// upgradeRecoveryPaths is the layout boot recovery holds an op's record to:
+// the database and the upgrade folder from this sandboxd's own settings,
+// and the installed files where the upgrader puts them. Recovery takes no
+// path from the record itself (nodeupgrade.Recover). Without the env file
+// the installed files are the ones beside toolboxd, the upgrader's rule.
+func upgradeRecoveryPaths(cfg config.Config) nodeupgrade.Paths {
+	p, err := resolveRecoveryPaths()
+	if err != nil {
+		p = nodeupgrade.Paths{Toolboxd: cfg.ToolboxBinaryPath, Sandboxd: filepath.Join(filepath.Dir(cfg.ToolboxBinaryPath), "sandboxd")}
+	}
+	p.DBPath = cfg.DBPath
+	p.StateDir = nodeupgrade.StateDirFor(cfg.DBPath)
+	return p
 }
 
 // markStoreOpened writes the boot marker the upgrader reads (§6.3 step

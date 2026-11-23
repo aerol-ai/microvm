@@ -133,6 +133,18 @@ docker:
 # --with-containerd-engine. Terraform/Ansible install the CNI plugins under
 # /opt/cni/bin when this is containerd.
 container_engine: "containerd" # containerd (default) | docker
+# Privilege mode (plans/security-gaps-m1-m4.md M1 PR 10): "single" (default)
+# runs sandboxd as root, as before. "split" runs it as the sandboxd user with
+# no rights, and aerolvm-rootd.service, the root helper, does its root work.
+# Split needs container_engine: containerd, turns on rootless BuildKit, and
+# does not run Firecracker, V8 isolates, WASM or the containerd warm pool yet
+# (wasm.enabled and containerd.pool.enabled must be false, and no node may
+# set with_firecracker or with_isolate). Terraform
+# passes install.sh --with-containerd-engine --privilege-mode split on the
+# one-line join path only; changing it replaces each node. Ansible checks
+# each node runs the mode this file names (a switch is install.sh's job:
+# users, units, the helper, the files' owners).
+privilege_mode: "single" # single (default) | split
 containerd:
   socket: "/run/containerd/containerd.sock"
   namespace: "aerolvm"

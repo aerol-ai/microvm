@@ -90,6 +90,11 @@ type State struct {
 	CaddyRestarted   bool `json:"caddy_restarted,omitempty"`
 	GatewayRestart   bool `json:"gateway_restart,omitempty"`
 	GatewayRestarted bool `json:"gateway_restarted,omitempty"`
+	// RootdRestart is set when the swap installs a new root helper while
+	// aerolvm-rootd.service runs (privilege mode split, rootd.go); the
+	// restart leaves every sandbox running.
+	RootdRestart   bool `json:"rootd_restart,omitempty"`
+	RootdRestarted bool `json:"rootd_restarted,omitempty"`
 	// GatewayProtocol is the protocol the running gateway spoke, 0 when no
 	// gateway ran or it could not be asked.
 	GatewayProtocol int       `json:"gateway_protocol,omitempty"`
@@ -115,6 +120,9 @@ type FileState struct {
 	// source is where staging reads it from: a local file (--from, or a
 	// *.prev for a rollback) or "" to download.
 	source string
+	// verified is the root helper's checked copy in root's own folder
+	// (rootswap.Install): the swap installs it, never the staged file.
+	verified string
 }
 
 func (s *State) terminal() bool { return s.Phase == PhaseDone || s.Phase == PhaseFailed }

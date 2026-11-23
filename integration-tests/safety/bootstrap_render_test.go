@@ -83,6 +83,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
 		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank", "joiner_join_worker",
 		"joiner_download_mirror", "joiner_join_download_mirror", "joiner_join_buildkit_rootless",
+		"joiner_join_privilege_split", "joiner_privilege_split_oldpath",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -186,6 +187,8 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 				"joiner_join_worker": {"join 'https://x:7003'", `--token "$JOIN_TOKEN"`},
 				// Rootless BuildKit (PR 10b): install.sh sets it up.
 				"joiner_join_buildkit_rootless": {"join 'https://x:7003'", "INSTALL_ARGS+=(--buildkit-rootless)"},
+				// Privilege mode split (M1 PR 10): install.sh sets it up.
+				"joiner_join_privilege_split": {"join 'https://x:7003'", "INSTALL_ARGS+=(--with-containerd-engine --privilege-mode split)"},
 			}
 			for _, want := range joinMode[branch] {
 				if !strings.Contains(out, want) {
@@ -196,6 +199,11 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			// rootless BuildKit; every other render is unchanged by it.
 			if branch != "joiner_join_buildkit_rootless" && strings.Contains(out, "--buildkit-rootless") {
 				t.Errorf("rendered %s bootstrap passes --buildkit-rootless", branch)
+			}
+			// Only privilege_mode: split asks for split, and only on the
+			// one-line join path.
+			if branch != "joiner_join_privilege_split" && strings.Contains(out, "--privilege-mode") {
+				t.Errorf("rendered %s bootstrap passes --privilege-mode", branch)
 			}
 			// A one-line worker or ingress joiner never carries the PAT.
 			if branch == "joiner_join_worker" && strings.Contains(out, "--pat-token") {

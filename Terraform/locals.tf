@@ -322,6 +322,11 @@ locals {
     # and renders nothing for false, so turning it on is what changes a
     # node's user data (and replaces it), never this default.
     buildkit_rootless = try(local.cluster_ops.containerd.buildkit_rootless, false) ? "true" : "false"
+    # Privilege mode (cluster.yml privilege_mode, M1 PR 10). Kept with the
+    # containerd settings because split runs only the containerd engine, so
+    # the bootstrap reads it from the map it already gets. Like
+    # buildkit_rootless, "single" renders nothing new.
+    privilege_mode = try(local.cluster_ops.privilege_mode, "single")
   }
 
   # containerd warm container pool (park + adopt), from cluster.yml's
@@ -356,6 +361,23 @@ locals {
 # config/cluster.yml became the source of those fields.
 resource "terraform_data" "validate_cluster_ops" {
   lifecycle {
+    precondition {
+      condition     = contains(["single", "split"], local.containerd_cfg.privilege_mode)
+      error_message = "privilege_mode in config/cluster.yml must be single or split."
+    }
+
+    precondition {
+      condition = (
+        local.containerd_cfg.privilege_mode != "split"
+        || (
+          var.one_line_join && local.container_engine == "containerd" && local.wasm_cfg.enabled != "true"
+          && local.containerd_pool_cfg.enabled != "true"
+          && alltrue([for name, n in local.nodes_resolved : !n.with_firecracker && !n.with_isolate])
+        )
+      )
+      error_message = "privilege_mode: split in config/cluster.yml needs container_engine: containerd, one_line_join = true (only that bootstrap passes install.sh --privilege-mode split), wasm.enabled: false, containerd.pool.enabled: false, and no node with with_firecracker or with_isolate: the root helper does not run their host processes or the warm pool's parked sandboxes yet."
+    }
+
     precondition {
       condition = (
         local.containerd_cfg.buildkit_rootless != "true"

@@ -174,7 +174,7 @@ func TestSQLiteBackupAndRestore(t *testing.T) {
 	}
 	_ = db.Close()
 	writeFile(t, dbPath+"-wal", []byte("frames of the failed boot"))
-	if err := restoreBackup(backup, dbPath); err != nil {
+	if err := restoreBackup(dir, backup, dbPath); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(dbPath + "-wal"); !os.IsNotExist(err) {
@@ -186,7 +186,7 @@ func TestSQLiteBackupAndRestore(t *testing.T) {
 	if err := sqliteBackup(context.Background(), filepath.Join(dir, "missing", "x.db"), filepath.Join(dir, "y")); err == nil {
 		t.Fatal("backed up a database that does not exist")
 	}
-	if err := restoreBackup(filepath.Join(dir, "missing"), dbPath); err == nil {
+	if err := restoreBackup(dir, filepath.Join(dir, "missing.state.db"), dbPath); err == nil {
 		t.Fatal("restored a backup that does not exist")
 	}
 	if got := dbBytes(dbPath); got == 0 {

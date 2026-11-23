@@ -33,7 +33,7 @@ func TestRunSettlesAnAbandonedOpFirst(t *testing.T) {
 		t.Fatalf("abandoned op = %+v\n%s", settled, r.out)
 	}
 	// A later boot finds nothing to do, so it cannot undo the new op.
-	if res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out); err != nil || len(res) != 0 {
+	if res, err := Recover(context.Background(), r.paths, r.host, r.out); err != nil || len(res) != 0 {
 		t.Fatalf("recover after = %+v %v", res, err)
 	}
 	r.assertInstalled(later, later.caddy)
@@ -63,7 +63,7 @@ func TestLateSettleNeverRestoresAStaleBackup(t *testing.T) {
 	if err := os.WriteFile(statePath(r.paths.StateDir, stale.Op), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Recover(context.Background(), r.paths.StateDir, r.host, r.out)
+	res, err := Recover(context.Background(), r.paths, r.host, r.out)
 	if err != nil || len(res) != 1 {
 		t.Fatalf("recover = %+v %v", res, err)
 	}

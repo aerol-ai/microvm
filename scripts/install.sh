@@ -13,6 +13,12 @@ VERSION="latest"
 SANDBOXD_URL=""
 TOOLBOXD_URL=""
 CHECKSUMS_URL=""
+# The root helper of --privilege-mode split, looked for beside sandboxd
+# (resolve_release_urls), with its .manifest and .sig.
+ROOTD_URL=""
+# install_root_helper sets it when a new helper landed: the running one
+# restarts onto it.
+ROOTD_CHANGED="false"
 IDLE_TIMEOUT_MIN="0"
 DNS_PROVIDER=""
 DNS_API_TOKEN=""
@@ -62,6 +68,11 @@ WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
 BUILDKIT_ROOTLESS="false"
+# Privilege mode (plans/security-gaps-m1-m4.md D22, M1 PR 10): "single" is
+# today's sandboxd, root, doing its root work itself. "split" runs sandboxd
+# as the sandboxd user with no rights, and aerolvm-rootd.service, the root
+# helper, does the root work over a unix socket (see setup_privilege_mode).
+PRIVILEGE_MODE="single"
 LOCAL_MODE="false"
 # --cli-only installs just the aerolvm agent CLI: no daemon, Docker or root.
 CLI_ONLY="false"
@@ -198,6 +209,30 @@ ROOTLESSKIT_APPARMOR_PROFILE="/etc/apparmor.d/aerolvm-rootlesskit"
 APPARMOR_USERNS_KNOB="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
 # Where upgrade_containerd_engine_tools reads the node's engine settings.
 SANDBOXD_ENV_DIR="/etc/sandboxd"
+# Privilege mode split (--privilege-mode split). The users: sandboxd (uid
+# 65531, the uid the root helper expects by default, rootd.DefaultAgentUID;
+# 65532 is the egress gateway's and the images', 65534 nobody's), the mount
+# tools' user, the helper socket's group, and the WASM workers' group (gid
+# 61000, config.DefaultWasmWorkerID): sandboxd shares their work folders by
+# group. The helper's binary sits in a folder of root's, outside the install
+# prefix (nodeupgrade.DefaultRootdDir); the upgrade folder moves out of
+# sandboxd's data folder, which sandboxd's user then owns. Tests point them
+# elsewhere.
+SANDBOXD_USER="sandboxd"
+SANDBOXD_UID="65531"
+ROOTD_SOCKET_GROUP="aerolvm"
+ROOTD_MOUNT_USER="aerolvm-mounts"
+WASM_WORKER_GROUP="aerolvm-wasm"
+WASM_WORKER_GID="61000"
+ROOTD_BIN_DIR="/usr/local/lib/aerolvm-rootd"
+ROOTD_UNIT_FILE="/etc/systemd/system/aerolvm-rootd.service"
+ROOTD_ENV_FILE="/etc/sandboxd/rootd.env"
+ROOTD_SOCKET="/run/aerolvm-rootd/sock/root.sock"
+SPLIT_UPGRADE_STATE_DIR="/var/lib/aerolvm-upgrade"
+SPLIT_PROCID_DIR="/run/aerolvm-procid"
+# The privilege mode this node ran in before this run, read from sandboxd.env
+# (setup_privilege_mode): a change is a switch, which moves files' owners.
+PREVIOUS_PRIVILEGE_MODE=""
 
 # --- BEGIN DOWNLOAD PINS ------------------------------------------------------
 # Every pinned third-party download, with its SHA-256. A file is installed
@@ -474,6 +509,19 @@ Options:
                                SB_CONTAINERD_BUILDKIT_ROOTLESS=true. Needs
                                the containerd engine. --no-buildkit-rootless
                                goes back to the root BuildKit.
+  --privilege-mode <single|split>
+                               single (default) runs sandboxd as root, as
+                               before. split runs sandboxd as the sandboxd
+                               user with no rights (no capabilities,
+                               NoNewPrivileges, a read-only system) and
+                               aerolvm-rootd.service, the root helper, does
+                               its root work. Needs --with-containerd-engine;
+                               turns on --buildkit-rootless. Installs the
+                               helper only once its release signature checks.
+                               Not yet with --with-isolate or
+                               --with-firecracker. Switching an existing node
+                               keeps its sandboxes; --privilege-mode single
+                               goes back.
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
                                Skips the download step and registers this
                                binary instead. Only consulted with
@@ -734,6 +782,9 @@ resolve_release_urls() {
 	# added; for an explicit --sandboxd-url it is looked for in the same
 	# place. Only the upgrader hand-off reads it.
 	RELEASE_JSON_URL="${RELEASE_JSON_URL:-${SANDBOXD_URL%/*}/release.json}"
+	# The root helper (--privilege-mode split) and its signed manifest sit
+	# beside sandboxd too. Only a split node downloads them.
+	ROOTD_URL="${ROOTD_URL:-${SANDBOXD_URL%/*}/aerolvm-rootd_${platform}}"
 }
 
 download_asset() {
@@ -1019,6 +1070,7 @@ NODE_SETTINGS=(
 	RUNSC_PATH:--runsc-path:string
 	WITH_CONTAINERD_ENGINE:--with-containerd-engine:bool
 	BUILDKIT_ROOTLESS:--buildkit-rootless:bool
+	PRIVILEGE_MODE:--privilege-mode:string
 	WITH_ISOLATE:--with-isolate:bool
 	WORKERD_PATH:--workerd-path:string
 	WITH_FIRECRACKER:--with-firecracker:bool
@@ -1156,6 +1208,7 @@ migrate_node_settings() {
 	saved_setting workerd_path "$(env_file_value "$env" SB_ISOLATE_WORKERD_PATH)"
 	[[ "$(env_file_value "$env" SB_CONTAINER_ENGINE)" == "containerd" ]] && saved_setting with_containerd_engine true
 	[[ "$(env_file_value "$env" SB_CONTAINERD_BUILDKIT_ROOTLESS)" == "true" ]] && saved_setting buildkit_rootless true
+	[[ "$(env_file_value "$env" SB_PRIVILEGE_MODE)" == "split" ]] && saved_setting privilege_mode split
 	[[ "$(env_file_value "$env" SB_CREDENTIAL_KEY_CUSTODY)" == "wrapped" ]] && saved_setting key_custody wrapped
 	# Cloudflare is the only DNS provider install.sh supports, and it writes
 	# the provider's token to /etc/default/caddy only when one is set.
@@ -1235,6 +1288,42 @@ load_saved_node_settings() {
 		SAVED_SECRET_PROVIDER_LINES="$(grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SANDBOXD_ENV_FILE" || true)"
 	fi
 	return 0
+}
+
+# check_privilege_mode checks --privilege-mode once the flags and the saved
+# settings are in (plans/security-gaps-m1-m4.md M1 PR 10). Split runs only
+# what the root helper does today: the containerd engine (Docker's socket is
+# as good as root, and nothing gates it), builds through rootless BuildKit
+# alone (a root buildkitd writes into containerd past the helper's gate, so
+# split turns --buildkit-rootless on), and no V8 isolates or Firecracker
+# yet (their host processes are M1 PR 9). sandboxd refuses each of these at
+# start too; refusing here stops a node that would never come up.
+check_privilege_mode() {
+	case "$PRIVILEGE_MODE" in
+	single | split) ;;
+	*)
+		echo "--privilege-mode must be single or split, got '$PRIVILEGE_MODE'" >&2
+		exit 1
+		;;
+	esac
+	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
+	if [[ "$CLI_ONLY" == "true" || "$LOCAL_MODE" == "true" || "$(uname -s)" != "Linux" ]]; then
+		echo "--privilege-mode split sets up a Linux server node; it does not work with --cli-only or --local (a local install runs Docker, whose socket is as good as root)" >&2
+		exit 1
+	fi
+	if [[ "$WITH_CONTAINERD_ENGINE" != "true" ]]; then
+		echo "--privilege-mode split needs --with-containerd-engine: Docker's socket is as good as root, and nothing gates it" >&2
+		exit 1
+	fi
+	if [[ "$WITH_FIRECRACKER" == "true" || "$WITH_ISOLATE" == "true" ]]; then
+		echo "--privilege-mode split does not run --with-firecracker or --with-isolate yet: the root helper does not start their host processes. Leave them off, or keep --privilege-mode single" >&2
+		exit 1
+	fi
+	if flag_given --no-buildkit-rootless; then
+		echo "--privilege-mode split builds images only with rootless BuildKit; drop --no-buildkit-rootless" >&2
+		exit 1
+	fi
+	BUILDKIT_ROOTLESS="true"
 }
 
 # secret_provider_lines prints the key-store settings write_environment
@@ -1594,6 +1683,10 @@ while [[ $# -gt 0 ]]; do
 			BUILDKIT_ROOTLESS="false"
 			shift
 			;;
+		--privilege-mode)
+			PRIVILEGE_MODE="$2"
+			shift 2
+			;;
 		--runsc-path)
 			RUNSC_PATH="$2"
 			shift 2
@@ -1767,6 +1860,7 @@ if [[ "$BUILDKIT_ROOTLESS" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" 
 	echo "--buildkit-rootless sets up a server node's BuildKit; it does not work with --cli-only or --local" >&2
 	exit 1
 fi
+check_privilege_mode
 # Release files from the mirror are checked against a checksums.txt from the
 # same mirror, so only TLS keeps a network attacker from swapping both.
 case "$DOWNLOAD_MIRROR" in
@@ -2347,6 +2441,9 @@ install_binaries() {
 		fi
 		install -m 0755 ./bin/sandboxd "$INSTALL_PREFIX/sandboxd"
 		install -m 0755 ./bin/toolboxd "$TOOLBOX_BINARY_PATH"
+		if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
+			install_root_helper_from_source
+		fi
 	else
 		local tmp_dir
 		local sandboxd_asset
@@ -2358,7 +2455,23 @@ install_binaries() {
 
 		download_asset "$SANDBOXD_URL" "$tmp_dir/$sandboxd_asset"
 		download_asset "$TOOLBOXD_URL" "$tmp_dir/$toolboxd_asset"
-		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset"
+		local rootd_assets=() a
+		if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
+			rootd_assets=("$(basename "${ROOTD_URL%%\?*}")")
+			rootd_assets+=("${rootd_assets[0]}.manifest" "${rootd_assets[0]}.sig")
+			for a in "${rootd_assets[@]}"; do
+				if ! download_asset "${ROOTD_URL%/*}/$a" "$tmp_dir/$a"; then
+					echo "--privilege-mode split: the release has no $a; it needs a release that ships the signed root helper" >&2
+					exit 1
+				fi
+			done
+		fi
+		verify_downloads "$tmp_dir" "$sandboxd_asset" "$toolboxd_asset" ${rootd_assets[@]+"${rootd_assets[@]}"}
+		if [[ ${#rootd_assets[@]} -gt 0 ]]; then
+			# Before the hand-off moves sandboxd away: the new sandboxd checks
+			# the helper's signature.
+			install_root_helper "$tmp_dir/$sandboxd_asset" "$tmp_dir" "${rootd_assets[0]}"
+		fi
 
 		if [[ "$UPGRADER_HANDOFF" == "true" ]]; then
 			# hand_off_to_upgrader installs them.
@@ -2496,6 +2609,9 @@ EOF
 	# without the flag parsing that sets it.
 	if [[ "${BUILDKIT_ROOTLESS:-false}" == "true" ]]; then
 		echo "SB_CONTAINERD_BUILDKIT_ROOTLESS=true" >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
+		split_environment >> /etc/sandboxd/sandboxd.env
 	fi
 	# The S3 audit witness (plans/open-audit-witness.md) is documented here and
 	# never configured. It needs an Object Lock bucket, and the lock mode,
@@ -2879,6 +2995,13 @@ EOF
 }
 
 write_systemd_unit() {
+	# Privilege mode split has a unit of its own; single writes exactly
+	# what it always did. Defaulted: the unit render tests run this under
+	# set -u without the flag parsing that sets it.
+	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
+		split_sandboxd_unit > /etc/systemd/system/sandboxd.service
+		return 0
+	fi
 	cat > /etc/systemd/system/sandboxd.service <<EOF
 [Unit]
 Description=AerolVM daemon
@@ -3107,6 +3230,9 @@ apply_config_only() {
 		write_node_settings
 		write_local_systemd_unit
 	else
+		if [[ "$PRIVILEGE_MODE" == "split" ]]; then
+			resolve_split_ids
+		fi
 		write_environment
 		write_node_settings
 		prepare_key_custody
@@ -3115,6 +3241,11 @@ apply_config_only() {
 		write_route_dns_resolver
 		write_caddyfile
 		write_systemd_unit
+		# A switch of mode moves files' owners and starts or stops the
+		# helper: a full install.sh run does that, never this one.
+		if [[ "$PRIVILEGE_MODE" == "split" ]]; then
+			write_privilege_mode_units
+		fi
 	fi
 	write_egress_gateway_units
 	write_healthcheck_script
@@ -3891,6 +4022,8 @@ install_buildkit() {
 	elif [[ -f "$BUILDKIT_UNIT_FILE" ]] && buildkit_unit_is_ours_rootless "$BUILDKIT_UNIT_FILE"; then
 		echo "Moving BuildKit back from rootless to root (--no-buildkit-rootless)"
 		buildkit_unit > "$BUILDKIT_UNIT_FILE"
+		# The split mode ACL drop-in names the rootless socket's folder.
+		rm -f "${BUILDKIT_UNIT_FILE}.d/privilege-split.conf"
 		systemctl disable --now aerolvm-build-net.service || true
 		systemctl daemon-reload
 		restart="true"
@@ -4076,6 +4209,20 @@ install_buildkit_rootless() {
 	else
 		echo "warning: ${BUILDKIT_UNIT_FILE} is not one this installer wrote; leaving it. Rootless BuildKit needs install.sh's unit." >&2
 	fi
+	# Privilege mode split: sandboxd's user reaches the socket by an ACL
+	# (buildkit_split_dropin). Single has no drop-in.
+	local dropin="${BUILDKIT_UNIT_FILE}.d/privilege-split.conf"
+	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
+		body="$(buildkit_split_dropin)"
+		if [[ ! -f "$dropin" || "$(<"$dropin")" != "$body" ]]; then
+			mkdir -p "${dropin%/*}"
+			printf '%s\n' "$body" > "$dropin"
+			restart="true"
+		fi
+	elif [[ -f "$dropin" ]]; then
+		rm -f "$dropin"
+		restart="true"
+	fi
 	if [[ "$restart" == "true" ]]; then
 		systemctl daemon-reload
 	fi
@@ -4228,6 +4375,448 @@ Delegate=yes
 [Install]
 WantedBy=multi-user.target
 UNIT
+}
+
+# --- Privilege mode split (plans/security-gaps-m1-m4.md M1 PR 10) ----------
+#
+# sandboxd runs as the sandboxd user with no rights: no capabilities,
+# NoNewPrivileges, a read-only system, and write access only to its own
+# folders (split_sandboxd_unit). aerolvm-rootd.service, the root helper,
+# does its root work over a unix socket (rootd_unit). What else changes:
+#   - users: sandboxd (65531), aerolvm-mounts (the mount tools'), the
+#     helper socket's group aerolvm, the WASM workers' group (gid 61000);
+#   - the helper's binary in ROOTD_BIN_DIR, installed only once the new
+#     sandboxd checked its release signature (install_root_helper);
+#   - files root made in sandboxd's folders become sandboxd's before every
+#     start (`aerolvm-rootd agent-folders` in the unit), and go back to
+#     root on a switch back to single (leave_split_mode);
+#   - drop-ins (privilege-split.conf) let sandboxd reach the egress
+#     gateway's control socket and rootless BuildKit's socket, by owner
+#     and by an ACL, never by joining the build user's group.
+# Single mode writes exactly the files it wrote before.
+
+# privilege_split_dropin is the drop-in name for a unit's split-mode lines.
+privilege_split_dropin() {
+	echo "/etc/systemd/system/$1.d/privilege-split.conf"
+}
+
+# setup_privilege_mode notes the mode this node ran in and, for split,
+# makes the users, the folders and the ACL tool split needs. Before
+# install_buildkit: the BuildKit drop-in names sandboxd's user.
+setup_privilege_mode() {
+	SPLIT_CONFIG_BEFORE="$(split_fingerprint)"
+	PREVIOUS_PRIVILEGE_MODE="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PRIVILEGE_MODE)"
+	PREVIOUS_PRIVILEGE_MODE="${PREVIOUS_PRIVILEGE_MODE:-single}"
+	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
+	if ! command -v setfacl >/dev/null 2>&1; then
+		if [[ "${APT_UPDATED:-false}" != "true" ]]; then
+			apt-get update
+			APT_UPDATED="true"
+		fi
+		apt-get install -y acl
+	fi
+	ensure_split_users
+	# sandboxd reaches rootless BuildKit's socket by an ACL on /run
+	# (buildkit_split_dropin). A kernel built without tmpfs ACLs refuses
+	# it, and then image builds fail; say so now rather than at a build.
+	local probe
+	if probe="$(mktemp -p /run aerolvm-acl.XXXXXX 2>/dev/null)"; then
+		if ! setfacl -m "u:${SANDBOXD_USER}:r" "$probe" 2>/dev/null; then
+			echo "warning: /run takes no ACLs on this kernel (CONFIG_TMPFS_POSIX_ACL), so sandboxd cannot reach rootless BuildKit's socket: image builds will fail in privilege mode split. Sandboxes are not affected." >&2
+		fi
+		rm -f "$probe"
+	fi
+	# Root's alone: the upgrader stages binaries here, and root installs
+	# them (SB_UPGRADE_STATE_DIR).
+	install -d -m 0700 "$SPLIT_UPGRADE_STATE_DIR"
+	chmod 0700 "$SPLIT_UPGRADE_STATE_DIR"
+	install -d -m 0755 "$ROOTD_BIN_DIR"
+	if [[ "$PREVIOUS_PRIVILEGE_MODE" != "split" && -f "$SANDBOXD_ENV_FILE" ]]; then
+		echo "Switching this node to privilege mode split: sandboxd will run as the $SANDBOXD_USER user, and its files become that user's when it next starts. Running sandboxes keep running."
+		forget_single_upgrade_folder
+	fi
+}
+
+# forget_single_upgrade_folder removes single mode's upgrade folder, beside
+# the database, on a switch of mode either way. Split never uses it (its
+# upgrades stage in SPLIT_UPGRADE_STATE_DIR, root's own), and it sits in
+# the folder sandboxd's user owns in split: a record or backup left there
+# must never reach the root sandboxd's boot recovery after a switch back.
+# find, not rm -r: it deletes a link in place of the folder as a link, and
+# stays on this file system.
+forget_single_upgrade_folder() {
+	local dir="/var/lib/sandboxd/upgrade"
+	if [[ -e "$dir" || -L "$dir" ]]; then
+		echo "Removing single mode's upgrade records (${dir}): the other mode never reads them"
+		find "$dir" -xdev -delete
+	fi
+}
+
+# ensure_split_users makes the users and groups split mode runs as. An
+# existing sandboxd user keeps its uid when that uid is its own.
+ensure_split_users() {
+	local name
+	if ! getent group "$ROOTD_SOCKET_GROUP" >/dev/null 2>&1; then
+		groupadd --system "$ROOTD_SOCKET_GROUP"
+	fi
+	if ! getent group "$WASM_WORKER_GID" >/dev/null 2>&1; then
+		groupadd --system --gid "$WASM_WORKER_GID" "$WASM_WORKER_GROUP"
+	fi
+	name="$(getent group "$WASM_WORKER_GID" 2>/dev/null | cut -d: -f1 || true)"
+	[[ -n "$name" ]] && WASM_WORKER_GROUP="$name"
+	if ! getent passwd "$SANDBOXD_USER" >/dev/null 2>&1; then
+		name="$(getent passwd "$SANDBOXD_UID" 2>/dev/null | cut -d: -f1 || true)"
+		if [[ -n "$name" ]]; then
+			echo "--privilege-mode split: uid $SANDBOXD_UID, which sandboxd runs as, already belongs to the user $name" >&2
+			exit 1
+		fi
+		useradd --system --uid "$SANDBOXD_UID" --user-group --no-create-home --home-dir /var/lib/sandboxd \
+			--shell /usr/sbin/nologin "$SANDBOXD_USER"
+	fi
+	SANDBOXD_UID="$(id -u "$SANDBOXD_USER")"
+	# The root helper lets one uid in; others' uids would let them in too.
+	case "$SANDBOXD_UID" in
+	0 | 1000 | "$WASM_WORKER_GID" | 65532 | 65534)
+		echo "--privilege-mode split: the user $SANDBOXD_USER has uid $SANDBOXD_UID, which other processes run as; it needs a uid of its own" >&2
+		exit 1
+		;;
+	esac
+	if ! getent passwd "$ROOTD_MOUNT_USER" >/dev/null 2>&1; then
+		useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$ROOTD_MOUNT_USER"
+	fi
+}
+
+# resolve_split_ids reads the ids ensure_split_users made, for a run that
+# makes no user (--config-only): a node switched to split by a full run.
+resolve_split_ids() {
+	local name
+	if ! SANDBOXD_UID="$(id -u "$SANDBOXD_USER" 2>/dev/null)" || [[ ! -x "$ROOTD_BIN_DIR/aerolvm-rootd" ]]; then
+		echo "--config-only renders privilege mode split for a node a full install.sh --privilege-mode split set up (its users and root helper); run that first" >&2
+		exit 1
+	fi
+	name="$(getent group "$WASM_WORKER_GID" 2>/dev/null | cut -d: -f1 || true)"
+	[[ -n "$name" ]] && WASM_WORKER_GROUP="$name"
+	return 0
+}
+
+# install_root_helper installs the root helper the release signed. The
+# downloaded files go under rootswap's names into a folder of root's, and
+# the new sandboxd ($1) checks the manifest against the release keys built
+# into it and installs only its own checked copy (`sandboxd upgrade
+# root-helper`: the check `sandboxd upgrade node` makes, in the same Go
+# code). A helper newer than this release's is kept: helpers only add
+# calls, and an older one is never installed over it.
+install_root_helper() {
+	local sandboxd_bin="$1" dir="$2" asset="$3" stage out
+	stage="$dir/rootd-stage"
+	install -d -m 0700 "$stage"
+	install -m 0644 "$dir/$asset" "$stage/aerolvm-rootd"
+	install -m 0644 "$dir/$asset.manifest" "$stage/aerolvm-rootd.manifest"
+	install -m 0644 "$dir/$asset.sig" "$stage/aerolvm-rootd.sig"
+	chmod 0755 "$sandboxd_bin"
+	if ! out="$("$sandboxd_bin" upgrade root-helper --from "$stage" --dir "$ROOTD_BIN_DIR" --env-file "$SANDBOXD_ENV_FILE" 2>&1)"; then
+		if [[ "$out" == *"refused (older)"* ]]; then
+			echo "warning: keeping the newer root helper already in $ROOTD_BIN_DIR ($out)" >&2
+			return 0
+		fi
+		printf '%s\n' "$out" >&2
+		echo "--privilege-mode split: the root helper failed its signature check; nothing was installed" >&2
+		exit 1
+	fi
+	printf '%s\n' "$out"
+	if [[ "$out" == *"installed root helper"* ]]; then
+		ROOTD_CHANGED="true"
+	fi
+	return 0
+}
+
+# install_root_helper_from_source installs the helper built from this
+# checkout (--build-from-source). It has no release signature: whoever
+# builds from source trusts the checkout, as for sandboxd itself. Any signed
+# manifest beside the old helper goes, so it is never taken for this one's.
+install_root_helper_from_source() {
+	local dst="$ROOTD_BIN_DIR/aerolvm-rootd" before=""
+	make build-rootd
+	install -d -m 0755 "$ROOTD_BIN_DIR"
+	[[ -f "$dst" ]] && before="$(sha256_of "$dst")"
+	echo "Installing the root helper built from this checkout; a source build carries no release signature"
+	install -m 0755 ./bin/aerolvm-rootd "$dst"
+	rm -f "$dst.manifest" "$dst.sig"
+	if [[ "$(sha256_of "$dst")" != "$before" ]]; then
+		ROOTD_CHANGED="true"
+	fi
+}
+
+# split_environment prints the sandboxd.env lines of split mode.
+split_environment() {
+	cat <<EOF
+
+# Privilege mode split (plans/security-gaps-m1-m4.md M1 PR 10): sandboxd
+# runs as the $SANDBOXD_USER user with no rights, and aerolvm-rootd.service,
+# the root helper, does its root work over its socket. Docker is off for
+# sandboxd: its socket is as good as root. Upgrades over the API need root
+# to start the upgrader, so they are off; run sudo sandboxd upgrade node or
+# install.sh. The upgrader's folder is root's own, and the egress gateway's
+# executable lookups use a folder sandboxd can make a socket in.
+SB_PRIVILEGE_MODE=split
+SB_ROOTD_SOCKET=$ROOTD_SOCKET
+SB_DOCKER_ENABLED=false
+SB_REMOTE_UPGRADE=false
+SB_UPGRADE_STATE_DIR=$SPLIT_UPGRADE_STATE_DIR
+SB_ROOTD_BIN_DIR=$ROOTD_BIN_DIR
+SB_EGRESS_PROCID_SOCKET=$SPLIT_PROCID_DIR/egress-procid.sock
+EOF
+}
+
+# write_rootd_env writes the root helper's own settings. sandboxd.env and
+# cluster.env load first, so the helper reads every setting sandboxd shares
+# with it under the same name (the containerd socket and namespace, the CNI
+# folders, the host-port range); these are the helper's alone. Root's file:
+# nothing sandboxd writes can change the helper's policy.
+write_rootd_env() {
+	local uid="${SANDBOXD_UID}"
+	mkdir -p "$(dirname "$ROOTD_ENV_FILE")"
+	cat > "$ROOTD_ENV_FILE" <<EOF
+# The root helper's own settings (install.sh --privilege-mode split).
+# The agent it serves: only this uid, in sandboxd.service, may use the socket.
+SB_ROOTD_AGENT_UID=$uid
+SB_ROOTD_AGENT_CGROUP=sandboxd.service
+SB_ROOTD_SOCKET_GROUP=$ROOTD_SOCKET_GROUP
+# External storage: the mount tools run as this user, never as root.
+SB_ROOTD_MOUNT_USER=$ROOTD_MOUNT_USER
+EOF
+	chmod 0600 "$ROOTD_ENV_FILE"
+}
+
+# split_sandboxd_unit prints sandboxd.service for split mode: the plan's
+# hardening (§3.3 "VMs"), started after the root helper and with it. As
+# root, before sandboxd starts ("+"): settle an upgrade the machine lost
+# half way (the upgrader's files are root's), give sandboxd the files root
+# left in its folders, and make the folder for the egress gateway's lookup
+# socket. RuntimeDirectory makes /run/sandboxd sandboxd's and keeps it
+# across restarts: the sandboxes' files there outlive a sandboxd restart.
+split_sandboxd_unit() {
+	local groups="$ROOTD_SOCKET_GROUP $WASM_WORKER_GROUP" runtime="sandboxd"
+	# --pat-scope host: sandboxd gives Caddy its public API socket by group.
+	if [[ "${PAT_SCOPE:-any}" == "host" ]]; then
+		groups+=" caddy"
+		runtime+=" sandboxd-public"
+	fi
+	cat <<EOF
+[Unit]
+Description=AerolVM daemon (privilege mode split)
+After=aerolvm-rootd.service containerd.service caddy.service network-online.target
+Wants=network-online.target
+Requires=aerolvm-rootd.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=$SANDBOXD_USER
+Group=$SANDBOXD_USER
+SupplementaryGroups=$groups
+EnvironmentFile=/etc/sandboxd/sandboxd.env
+ExecStartPre=-+$INSTALL_PREFIX/sandboxd upgrade recover --env-file /etc/sandboxd/sandboxd.env
+ExecStartPre=+$ROOTD_BIN_DIR/aerolvm-rootd agent-folders --user $SANDBOXD_USER
+ExecStartPre=+/usr/bin/install -d -m 0755 -o $SANDBOXD_USER -g $SANDBOXD_USER $SPLIT_PROCID_DIR
+ExecStartPre=/bin/mkdir -p /var/lib/sandboxd/mounts
+ExecStartPre=/bin/chmod 0700 /var/lib/sandboxd/mounts
+ExecStart=$INSTALL_PREFIX/sandboxd
+RuntimeDirectory=$runtime
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/sandboxd -$SPLIT_PROCID_DIR -/etc/sandboxd/tls -/etc/sandboxd/cluster-ca
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+# Stopping sandboxd stops what runs in its cgroup: sandboxd alone. Every
+# sandbox, mount tool and host process lives in a cgroup of its own.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# rootd_unit prints aerolvm-rootd.service: the root helper, root, before
+# sandboxd. It reads sandboxd's settings and its own (write_rootd_env). It
+# is no sandbox's parent: containerd's shims, the mount tools and host
+# processes run in cgroups of their own, so a helper restart or crash
+# stops no sandbox. systemd restarts it at once; sandboxd retries the calls
+# that failed meanwhile (each is idempotent). Restarting it by hand also
+# restarts sandboxd (Requires= in sandboxd.service), which no sandbox needs
+# either.
+rootd_unit() {
+	cat <<EOF
+[Unit]
+Description=AerolVM root helper (aerolvm-rootd)
+After=containerd.service network-online.target
+Wants=network-online.target
+Before=sandboxd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sandboxd/sandboxd.env
+EnvironmentFile=-/etc/sandboxd/cluster.env
+EnvironmentFile=$ROOTD_ENV_FILE
+ExecStart=$ROOTD_BIN_DIR/aerolvm-rootd
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# gateway_split_dropins writes, for split, the egress gateway's drop-ins:
+# the control socket becomes sandboxd's user's, and the gateway takes that
+# uid (SB_EGRESS_PEER_UIDS) and dials sandboxd's lookup socket where split
+# makes it. Single removes them, so the units are today's again.
+gateway_split_dropins() {
+	local sock svc
+	sock="$(privilege_split_dropin aerolvm-egress-gateway.socket)"
+	svc="$(privilege_split_dropin aerolvm-egress-gateway.service)"
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]]; then
+		rm -f "$sock" "$svc"
+		return 0
+	fi
+	mkdir -p "${sock%/*}" "${svc%/*}"
+	cat > "$sock" <<EOF
+# install.sh --privilege-mode split: sandboxd is not root, so the control
+# socket is its user's. The gateway checks the peer's uid and cgroup too.
+[Socket]
+SocketUser=$SANDBOXD_USER
+SocketGroup=$SANDBOXD_USER
+EOF
+	cat > "$svc" <<EOF
+# install.sh --privilege-mode split: the gateway takes sandboxd's uid as its
+# peer, and dials sandboxd's executable-lookup socket in split's folder.
+[Service]
+Environment=SB_EGRESS_PEER_UIDS=$SANDBOXD_UID
+Environment=SB_EGRESS_PROCID_SOCKET=$SPLIT_PROCID_DIR/egress-procid.sock
+EOF
+}
+
+# buildkit_split_dropin prints the rootless buildkit.service drop-in of
+# split: sandboxd's user may enter BuildKit's runtime folder and use its
+# socket, by an ACL on each, set as root. It never joins the build user's
+# group, which may run RootlessKit and so make user namespaces. setfacl -P
+# skips a symbolic link: the build user owns that folder and could leave a
+# link where the socket goes, and root must never add an ACL to what a link
+# names. buildkitd makes its socket after it starts, so the socket's ACL
+# waits for it, two
+# minutes at most. A file system with no ACLs (setup_privilege_mode warns)
+# leaves BuildKit running and sandboxd's builds refused, never BuildKit
+# restarting in a loop: hence "-", which systemd reads as "a failure here
+# does not fail the start".
+buildkit_split_dropin() {
+	local setfacl
+	setfacl="$(command -v setfacl 2>/dev/null || echo /usr/bin/setfacl)"
+	cat <<EOF
+# install.sh --privilege-mode split: sandboxd's user reaches BuildKit's
+# socket by an ACL, not by the build user's group.
+[Service]
+ExecStartPre=-+$setfacl -P -m u:$SANDBOXD_USER:x /run/aerolvm-buildkit
+ExecStartPost=-+/bin/sh -c 'i=0; while [ ! -S /run/aerolvm-buildkit/buildkitd.sock ]; do i=\$\$((i+1)); [ \$\$i -lt 600 ] || exit 1; sleep 0.2; done; exec $setfacl -P -m u:$SANDBOXD_USER:rw /run/aerolvm-buildkit/buildkitd.sock'
+EOF
+}
+
+# write_privilege_mode_units writes the root helper's unit and env for
+# split, or removes ours for single (leave_split_mode stops it first).
+write_privilege_mode_units() {
+	gateway_split_dropins
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]]; then
+		if [[ -f "$ROOTD_UNIT_FILE" ]] && grep -qxF "Description=AerolVM root helper (aerolvm-rootd)" "$ROOTD_UNIT_FILE"; then
+			rm -f "$ROOTD_UNIT_FILE" "$ROOTD_ENV_FILE"
+		fi
+		return 0
+	fi
+	write_rootd_env
+	rootd_unit > "$ROOTD_UNIT_FILE"
+}
+
+# split_fingerprint identifies the files the root helper and the egress
+# gateway were started from, besides sandboxd's own: a run that changed one
+# restarts that service.
+split_fingerprint() {
+	{ cat "$ROOTD_UNIT_FILE" "$ROOTD_ENV_FILE" /etc/systemd/system/aerolvm-egress-gateway.socket \
+		"$(privilege_split_dropin aerolvm-egress-gateway.socket)" "$(privilege_split_dropin aerolvm-egress-gateway.service)" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+}
+
+# leave_split_mode is the way back to single (--privilege-mode single on a
+# split node): sandboxd stops, every file in its folders that sandboxd's
+# user owns becomes root's again (other users' files keep their owner, and
+# no other file system is entered), and the root helper stops. Its binary
+# stays in ROOTD_BIN_DIR for a later switch; the users stay too. Running
+# sandboxes keep running, and the root sandboxd that starts next takes them
+# over.
+leave_split_mode() {
+	[[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]] || return 0
+	echo "Switching this node back to privilege mode single: sandboxd runs as root again"
+	systemctl stop sandboxd 2>/dev/null || true
+	# What the root sandboxd would act on by path at its first boot, and
+	# sandboxd's user could write in split, goes first: the upgrade folder
+	# (boot recovery reads its records), the runtime folders (sockets and
+	# folders are made again at start), and every symbolic link in the
+	# data and certificate folders (sandboxd makes none there itself).
+	forget_single_upgrade_folder
+	local d
+	for d in /run/sandboxd /run/sandboxd-public "$SPLIT_PROCID_DIR"; do
+		if [[ -e "$d" || -L "$d" ]]; then
+			find "$d" -xdev -delete
+		fi
+	done
+	for d in /var/lib/sandboxd /etc/sandboxd/tls /etc/sandboxd/cluster-ca; do
+		[[ -d "$d" && ! -L "$d" ]] || continue
+		find "$d" -xdev -type l -delete
+	done
+	local uid gid
+	uid="$(id -u "$SANDBOXD_USER" 2>/dev/null || true)"
+	gid="$(id -g "$SANDBOXD_USER" 2>/dev/null || true)"
+	if [[ -n "$uid" && "$uid" != "0" ]]; then
+		for d in /var/lib/sandboxd /run/sandboxd /run/sandboxd-public /etc/sandboxd/tls /etc/sandboxd/cluster-ca; do
+			[[ -d "$d" && ! -L "$d" ]] || continue
+			find "$d" -xdev -uid "$uid" -exec chown -h root {} +
+			find "$d" -xdev -gid "$gid" -exec chgrp -h root {} +
+		done
+	fi
+	systemctl disable --now aerolvm-rootd.service 2>/dev/null || true
+}
+
+# restart_split_services restarts what split mode's files changed: the
+# egress gateway when its socket's owner changed (a mode switch), and the
+# root helper when its binary, unit or settings changed. The helper starts
+# before sandboxd; a restart stops no sandbox.
+restart_split_services() {
+	if [[ "$(split_fingerprint)" != "${SPLIT_CONFIG_BEFORE:-}" ]] && systemctl is-active --quiet aerolvm-egress-gateway.socket 2>/dev/null; then
+		echo "The egress gateway's socket changed owner; restarting the gateway"
+		systemctl stop aerolvm-egress-gateway.service aerolvm-egress-gateway.socket || true
+	fi
+	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
+	# A switch from single: the root sandboxd stops before the helper
+	# starts, so the two never keep the host's firewall at once. Sandboxes
+	# keep running; the restart below brings sandboxd back as its user.
+	if [[ "$PREVIOUS_PRIVILEGE_MODE" != "split" ]] && systemctl is-active --quiet sandboxd 2>/dev/null; then
+		systemctl stop sandboxd
+	fi
+	if systemctl is-active --quiet aerolvm-rootd 2>/dev/null; then
+		if [[ "$ROOTD_CHANGED" == "true" || "$(split_fingerprint)" != "${SPLIT_CONFIG_BEFORE:-}" ]]; then
+			echo "Restarting the root helper onto its new binary or settings; sandboxes keep running"
+			systemctl restart aerolvm-rootd
+		fi
+	fi
+	systemctl enable --now aerolvm-rootd
 }
 
 register_gvisor_runtime() {
@@ -4675,6 +5264,8 @@ if [[ "$WITH_FIRECRACKER" == "true" ]]; then
 	firecracker_preflight
 fi
 install_packages
+# Before install_buildkit, whose split drop-in names sandboxd's user.
+setup_privilege_mode
 if [[ "$WITH_GVISOR" == "true" ]]; then
 	register_gvisor_runtime
 fi
@@ -4717,11 +5308,14 @@ write_caddy_systemd_dropin
 write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
+leave_split_mode
+write_privilege_mode_units
 write_egress_gateway_units
 write_healthcheck_script
 write_healthcheck_units
 
 systemctl daemon-reload
+restart_split_services
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
 hand_off_to_upgrader
 if [[ "$NO_START" == "true" ]]; then

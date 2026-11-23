@@ -75,6 +75,14 @@ type Paths struct {
 	GatewaySocket string
 	// ReleaseURL is the download base when a request has no --from.
 	ReleaseURL string
+	// Split is a node in privilege mode split (SB_PRIVILEGE_MODE): sandboxd
+	// runs as a user with no rights, so its data folder is no place for
+	// root's upgrade files (errSplitStateDir).
+	Split bool
+	// RootdDir holds the root helper and its signed manifest on a split
+	// node (SB_ROOTD_BIN_DIR, DefaultRootdDir); empty on a single node,
+	// which runs no helper.
+	RootdDir string
 }
 
 // StateDirFor is the upgrade state directory for a database path: the
@@ -135,10 +143,17 @@ func ResolvePaths(envFile string, getenv func(string) string, lookCaddy func() (
 	}
 	dbPath := get("SB_DB_PATH", defaultDBPath)
 	toolboxd := get("SB_TOOLBOX_BINARY_PATH", defaultToolboxd)
+	// In privilege mode split the upgrade folder is root's own
+	// (SB_UPGRADE_STATE_DIR, which install.sh sets): beside the database
+	// it would sit in a folder sandboxd's user can write.
+	stateDir := get("SB_UPGRADE_STATE_DIR", StateDirFor(dbPath))
+	if !filepath.IsAbs(stateDir) {
+		return Paths{}, fmt.Errorf("SB_UPGRADE_STATE_DIR=%q: want an absolute path", stateDir)
+	}
 	p := Paths{
 		EnvFile:  envFile,
 		NodeJSON: filepath.Join(filepath.Dir(envFile), "node.json"),
-		StateDir: StateDirFor(dbPath),
+		StateDir: filepath.Clean(stateDir),
 		DBPath:   dbPath,
 		// install.sh puts both binaries in --install-prefix.
 		Sandboxd:      filepath.Join(filepath.Dir(toolboxd), "sandboxd"),
@@ -148,6 +163,10 @@ func ResolvePaths(envFile string, getenv func(string) string, lookCaddy func() (
 		HealthURL:     "http://127.0.0.1:" + get("SB_API_PORT", "21212") + "/health",
 		GatewaySocket: get("SB_EGRESS_GATEWAY_SOCKET", defaultGateway),
 		ReleaseURL:    strings.TrimRight(get("SB_RELEASE_URL", DefaultReleaseURL), "/"),
+	}
+	if strings.EqualFold(get("SB_PRIVILEGE_MODE", ""), "split") {
+		p.Split = true
+		p.RootdDir = filepath.Clean(get("SB_ROOTD_BIN_DIR", DefaultRootdDir))
 	}
 	if !strings.EqualFold(get("SB_ENABLE_CADDY", "true"), "false") {
 		p.Caddy = defaultCaddy

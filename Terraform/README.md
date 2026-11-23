@@ -321,6 +321,21 @@ fails without them. Off (the default) renders the bootstrap exactly as
 before. Turning it on changes each node's user data, so Terraform replaces
 the nodes.
 
+### Privilege mode split
+
+Set `privilege_mode: "split"` in `config/cluster.yml` to run sandboxd as the
+`sandboxd` user with no rights, while `aerolvm-rootd.service`, the root helper,
+does its root work (plans/security-gaps-m1-m4.md M1 PR 10). The bootstrap
+passes `install.sh --with-containerd-engine --privilege-mode split`, which
+installs the signed helper and both units (see
+`docs/src/content/docs/getting-started/installer-options.mdx`, "Run the server
+without root"). It needs `container_engine: containerd` and
+`one_line_join = true`, and it does not run Firecracker, V8 isolates or WASM
+yet: the plan fails when `wasm.enabled` is true or a node sets
+`with_firecracker` or `with_isolate`. `single` (the default) renders the
+bootstrap exactly as before. Changing it changes each node's user data, so
+Terraform replaces the nodes.
+
 ### Download mirror
 
 The bootstrap downloads `install.sh`, the cluster scripts, and on containerd

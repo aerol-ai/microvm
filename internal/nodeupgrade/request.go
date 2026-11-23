@@ -24,7 +24,10 @@ const (
 	roleRelease  = release.FileName
 )
 
-var swapOrder = []string{roleToolboxd, roleCaddy, roleSandboxd}
+// The root helper's files go after Caddy and before sandboxd: manifest and
+// signature first, so the binary they name lands last of the three
+// (rootd.go).
+var swapOrder = []string{roleToolboxd, roleCaddy, roleRootdManifest, roleRootdSig, roleRootd, roleSandboxd}
 
 // Request is one `sandboxd upgrade node` invocation.
 type Request struct {
@@ -140,6 +143,9 @@ func (r *Request) validate(goos, goarch string) ([]fileSpec, error) {
 			return nil, usageErr("--sha256 names no %s file; an upgrade carries sandboxd and toolboxd", need)
 		}
 	}
+	if err := checkRootdSet(seen); err != nil {
+		return nil, err
+	}
 	return specs, nil
 }
 
@@ -150,9 +156,12 @@ func roleOf(asset, goos, goarch string) (string, error) {
 	if asset == roleRelease {
 		return roleRelease, nil
 	}
+	if role, ok, err := rootdRoleOf(asset, goos, goarch); ok {
+		return role, err
+	}
 	m := assetRe.FindStringSubmatch(asset)
 	if m == nil {
-		return "", usageErr("--sha256 %s: not a release file (sandboxd, toolboxd, caddy or release.json, optionally _linux_<arch>)", asset)
+		return "", usageErr("--sha256 %s: not a release file (sandboxd, toolboxd, caddy, aerolvm-rootd and its .manifest and .sig, or release.json, optionally _linux_<arch>)", asset)
 	}
 	if m[2] != "" {
 		if m[2] != goos || !archMatches(m[3], goarch) {

@@ -55,6 +55,9 @@ func newRunRig(t *testing.T) *runRig {
 		"/var/lib/sandboxd", dir+"/varlib",
 		"/run/sandboxd", dir+"/run",
 		"/srv/isolate-jail", dir+"/srv-isolate",
+		// Privilege mode split's root folders (M1 PR 10).
+		"/usr/local/lib/aerolvm-rootd", dir+"/rootd-bin",
+		"/var/lib/aerolvm-upgrade", dir+"/upgrade-root",
 		`CGROUP_ROOT="/sys/fs/cgroup"`, `CGROUP_ROOT="`+dir+`/cgroup"`,
 		"SANDBOXD_READY_TRIES=60", "SANDBOXD_READY_TRIES=1",
 		"$EUID", "$FAKE_EUID",

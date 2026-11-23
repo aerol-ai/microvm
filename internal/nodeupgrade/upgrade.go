@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/rootswap"
 	"github.com/aerol-ai/microvm/pkg/release"
 )
 
@@ -194,6 +195,9 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 	if err := u.preflight(); err != nil {
 		return u.failEarly(st, err)
 	}
+	if err := u.Paths.CheckStateDir(); err != nil {
+		return u.failEarly(st, err)
+	}
 	stageDir := filepath.Join(u.Paths.StateDir, req.Version)
 	if err := u.checkSpace(st, stageDir, false); err != nil {
 		return u.failEarly(st, err)
@@ -211,6 +215,9 @@ func (u *Upgrader) Run(ctx context.Context, req Request) (*State, error) {
 		return u.failEarly(st, err)
 	}
 	if err := u.checkStagedVersion(ctx, st, stageDir); err != nil {
+		return u.failEarly(st, err)
+	}
+	if err := u.checkRootHelper(ctx, st, stageDir, req); err != nil {
 		return u.failEarly(st, err)
 	}
 	if err := u.checkSpace(st, stageDir, true); err != nil {
@@ -246,6 +253,7 @@ func finishedErr(st *State) error {
 
 // failEarly ends an op that failed before anything on the node changed.
 func (u *Upgrader) failEarly(st *State, cause error) (*State, error) {
+	u.sweepRootd()
 	st.Phase, st.Result, st.Error = PhaseFailed, ResultFailed, cause.Error()
 	if err := u.save(st); err != nil {
 		return st, errors.Join(cause, err)
@@ -274,6 +282,12 @@ func (u *Upgrader) fileSet(req Request, specs []fileSpec) ([]FileState, *State, 
 				continue
 			}
 			f.Path = u.Paths.Caddy
+		case roleRootd, roleRootdManifest, roleRootdSig:
+			if u.Paths.RootdDir == "" {
+				u.logf("skipping %s: this node runs no root helper (privilege mode single)", s.asset)
+				continue
+			}
+			f.Path = filepath.Join(u.Paths.RootdDir, s.role)
 		}
 		if req.From != "" {
 			f.source = filepath.Join(req.From, s.asset)
@@ -480,13 +494,13 @@ func estimateSize(f FileState) uint64 {
 // it only when the hash matches. A file already staged with the right hash
 // is reused, so a retry skips the download (§6.7).
 func (u *Upgrader) stage(ctx context.Context, f *FileState, stageDir, version string) error {
-	dst := filepath.Join(stageDir, f.Asset)
+	dst := u.stagedPath(stageDir, f)
 	if got, _ := fileSHA256(dst); got == f.SHA256 {
 		f.Size = fileSize(dst)
 		u.logf("%s: already staged", f.Asset)
 		return nil
 	}
-	if err := os.MkdirAll(stageDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
 	var (
@@ -506,7 +520,7 @@ func (u *Upgrader) stage(ctx context.Context, f *FileState, stageDir, version st
 	}
 	defer r.Close()
 	mode := os.FileMode(0o755)
-	if f.Role == roleRelease {
+	if f.Role == roleRelease || f.Role == roleRootdManifest || f.Role == roleRootdSig {
 		mode = 0o644
 	}
 	part := dst + ".part"
@@ -527,8 +541,62 @@ func (u *Upgrader) stage(ctx context.Context, f *FileState, stageDir, version st
 	return nil
 }
 
+// stagedPath is where a file is staged. The root helper's three files are
+// staged under rootswap's fixed names in a folder of their own, which
+// rootswap reads; its binary is installed from the checked copy once there
+// is one.
 func (u *Upgrader) stagedPath(stageDir string, f *FileState) string {
+	if isRootdRole(f.Role) {
+		if f.verified != "" {
+			return f.verified
+		}
+		return filepath.Join(rootdStageDir(stageDir), f.Role)
+	}
 	return filepath.Join(stageDir, f.Asset)
+}
+
+// rootdStageDir is the folder the root helper's files are staged in.
+func rootdStageDir(stageDir string) string { return filepath.Join(stageDir, "rootd") }
+
+// checkRootHelper checks a staged root helper before anything stops: its
+// manifest signed with a release key, for this platform, for the
+// requested version and, unless this is a rollback, no older than the
+// running helper; then rootswap.Install copies it into the helper's own
+// folder and checks the copy, which is what the swap installs.
+func (u *Upgrader) checkRootHelper(ctx context.Context, st *State, stageDir string, req Request) error {
+	bin := st.file(roleRootd)
+	if bin == nil {
+		return nil
+	}
+	changed := false
+	for _, r := range []string{roleRootd, roleRootdManifest, roleRootdSig} {
+		if f := st.file(r); f != nil && f.Changed {
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	inst, signed, err := verifyRootHelper(rootdStageDir(stageDir), u.Paths.RootdDir, req.Rollback)
+	if err != nil {
+		return err
+	}
+	if signed.Manifest.Version != st.Version {
+		_ = inst.Remove()
+		return fmt.Errorf("root helper: the staged helper is %s, not %s", signed.Manifest.Version, st.Version)
+	}
+	bin.verified = inst.Path
+	st.RootdRestart = u.Host.UnitActive(ctx, rootdUnit)
+	u.logf("root helper %s: signature checked; copied into %s", signed.Manifest.Version, u.Paths.RootdDir)
+	return nil
+}
+
+// sweepRootd removes the checked copies of the helper an op made and did
+// not install.
+func (u *Upgrader) sweepRootd() {
+	if u.Paths.RootdDir != "" {
+		_ = rootswap.Sweep(u.Paths.RootdDir)
+	}
 }
 
 // readMeta parses the staged release.json, if the request carried one, and
@@ -720,7 +788,7 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		if err := u.save(st); err != nil {
 			return u.revert(st, err, p)
 		}
-		if err := restoreBackup(st.RestoreBackup, u.Paths.DBPath); err != nil {
+		if err := restoreBackup(u.Paths.StateDir, st.RestoreBackup, u.Paths.DBPath); err != nil {
 			return u.revert(st, fmt.Errorf("put back the database backup %s: %w", st.RestoreBackup, err), p)
 		}
 		u.at("restored")
@@ -738,6 +806,9 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		}
 		if err := swapIn(u.stagedPath(stageDir, f), f.Path); err != nil {
 			return u.revert(st, err, p)
+		}
+		if f.Role == roleRootdManifest || f.Role == roleRootdSig {
+			_ = os.Chmod(f.Path, 0o644) // data, not a program
 		}
 		u.at("swapped-unrecorded:" + role)
 		f.Swapped = true
@@ -776,6 +847,14 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		st.CaddyRestarted = true
 		u.logf("restarted caddy")
 	}
+	if st.RootdRestart {
+		// Every sandbox keeps running: the helper is no sandbox's parent.
+		if err := u.Host.RestartUnit(ctx, rootdUnit); err != nil {
+			return u.revert(st, err, p)
+		}
+		st.RootdRestarted = true
+		u.logf("restarted the root helper")
+	}
 
 	if st.WasActive {
 		st.Phase = PhaseStarting
@@ -810,6 +889,7 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 	// The staged files are installed now; the *.prev copies and the backup
 	// are what a rollback needs.
 	_ = os.RemoveAll(stageDir)
+	u.sweepRootd()
 	pruneBackups(u.Paths.StateDir)
 	return st, nil
 }
@@ -910,7 +990,7 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 		f.Swapped = false
 	}
 	if restoreDB {
-		if err := restoreBackup(st.BackupPath, u.Paths.DBPath); err != nil {
+		if err := restoreBackup(u.Paths.StateDir, st.BackupPath, u.Paths.DBPath); err != nil {
 			problems = append(problems, fmt.Errorf("restore %s: %w", st.BackupPath, err))
 		} else {
 			st.BackupRestored, st.RestoreStarted = true, false
@@ -927,6 +1007,12 @@ func (u *Upgrader) revert(st *State, cause error, p progress) (*State, error) {
 			problems = append(problems, err)
 		}
 	}
+	if st.RootdRestarted {
+		if err := u.Host.RestartUnit(ctx, rootdUnit); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	u.sweepRootd()
 	if p.stopped {
 		if err := u.Host.RestartUnit(ctx, sandboxdUnit); err != nil {
 			problems = append(problems, err)

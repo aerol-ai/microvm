@@ -354,9 +354,45 @@ func TestUsage(t *testing.T) {
 		{"-key", "k"},
 		{"-verify", "k"},
 		{"-genkey", "k", "extra"},
+		{"-check-version", "v1.0.0"},
+		{"-verify", "k", "-no-exec", "b"},
+		{"-check-version", "v1.0.0", "-no-exec", "b"},
+		{"-genkey", "k", "-no-exec"},
+		{"-check-version", "v1.0.0", "-key", "k", "b"},
 	} {
 		if code, _, _ := run(args...); code != 2 {
 			t.Errorf("%v: exit %d, want 2", args, code)
 		}
+	}
+}
+
+// The release checks the helper's version in a step with no key, then
+// signs with -no-exec, so no helper binary ever runs while the key is on
+// disk or in the environment (M1 PR 10 review).
+func TestCheckVersionThenSignWithoutRunning(t *testing.T) {
+	bin := helperBinary(t)
+	if code, out, errs := run("-check-version", testVersion, bin); code != 0 || !strings.Contains(out, "version ok") {
+		t.Fatalf("-check-version: %d %s %s", code, out, errs)
+	}
+	if code, _, errs := run("-check-version", "v1.2.3", bin); code != 1 || !strings.Contains(errs, "would misname it") {
+		t.Fatalf("-check-version with the wrong release: %d %s", code, errs)
+	}
+	keyFile, pubFile := newKey(t)
+	// Without -no-exec the signer runs the binary and refuses the wrong
+	// release. With it, nothing runs: the same wrong release is signed,
+	// which shows the binary was never started (the earlier check is what
+	// holds the version).
+	if code, _, errs := run("-key", keyFile, "-version", "v1.2.3", bin); code != 1 || !strings.Contains(errs, "would misname it") {
+		t.Fatalf("sign, running the binary: %d %s", code, errs)
+	}
+	code, out, errs := run("-key", keyFile, "-version", "v1.2.3", "-no-exec", bin)
+	if code != 0 || !strings.Contains(out, "not run (-no-exec)") {
+		t.Fatalf("sign -no-exec: %d %s %s", code, out, errs)
+	}
+	if code, _, errs := run("-verify", pubFile, bin); code != 0 {
+		t.Fatalf("verify: %d %s", code, errs)
+	}
+	if code, _, _ := run("-check-version", testVersion, filepath.Join(t.TempDir(), "missing")); code != 1 {
+		t.Fatal("-check-version of a missing file passed")
 	}
 }

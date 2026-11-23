@@ -9,6 +9,11 @@
 // says when it serves (internal/rootswap: the signed swap, eng review D4);
 // on its own it makes the socket itself. `aerolvm-rootd --version` prints
 // the version and API level a release signs for it.
+//
+// `aerolvm-rootd agent-folders --user <user>` is a one-shot, not the
+// server: on a VM in privilege mode split, sandboxd.service runs it as root
+// just before sandboxd starts, and it gives the agent the files root left
+// in the agent's folders (rootd.GiveToAgent, M1 PR 10).
 package main
 
 import (
@@ -52,6 +57,9 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Println(versionLine())
 		return
+	}
+	if len(os.Args) >= 2 && os.Args[1] == agentFoldersCommand {
+		os.Exit(agentFoldersCode(os.Args[2:], os.Getenv, os.Stderr))
 	}
 	if len(os.Args) == 3 && (os.Args[1] == worker.WorkerFlag || os.Args[1] == worker.ResidentHostFlag) {
 		// A WASM worker or resident host (M1 PR 9): the helper starts its
