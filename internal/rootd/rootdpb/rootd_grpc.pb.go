@@ -63,6 +63,10 @@ const (
 	RootHelper_EnsureTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/EnsureTap"
 	RootHelper_RemoveTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/RemoveTap"
 	RootHelper_MakeFilesystem_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/MakeFilesystem"
+	RootHelper_EnsureGuestFirewall_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/EnsureGuestFirewall"
+	RootHelper_SetGuestNodeGuard_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/SetGuestNodeGuard"
+	RootHelper_SetGuestEgressFloor_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SetGuestEgressFloor"
+	RootHelper_GuestRules_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/GuestRules"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -201,6 +205,20 @@ type RootHelperClient interface {
 	// owned by root as in privilege mode single and it can read and write
 	// nothing the agent could not.
 	MakeFilesystem(ctx context.Context, in *MakeFilesystemRequest, opts ...grpc.CallOption) (*MakeFilesystemResponse, error)
+	// EnsureGuestFirewall makes sure the guests' firewall is set up: the
+	// guests' NAT and isolation (as EnsureTap puts them in), their rule chain
+	// and block sets, and the floor. It starts the helper's own timer that
+	// puts them back if something takes them away.
+	EnsureGuestFirewall(ctx context.Context, in *EnsureGuestFirewallRequest, opts ...grpc.CallOption) (*EnsureGuestFirewallResponse, error)
+	// SetGuestNodeGuard makes sure the node guard holds for the TAP base,
+	// with these ports open. The ports are the ones SetNodeGuard takes.
+	SetGuestNodeGuard(ctx context.Context, in *SetNodeGuardRequest, opts ...grpc.CallOption) (*SetNodeGuardResponse, error)
+	// SetGuestEgressFloor makes sure the deny floor for the TAP base holds
+	// these networks, plus the cloud metadata endpoints the helper always
+	// adds.
+	SetGuestEgressFloor(ctx context.Context, in *SetEgressFloorRequest, opts ...grpc.CallOption) (*SetEgressFloorResponse, error)
+	// GuestRules changes one guest address's rules.
+	GuestRules(ctx context.Context, in *GuestRulesRequest, opts ...grpc.CallOption) (*GuestRulesResponse, error)
 }
 
 type rootHelperClient struct {
@@ -531,6 +549,46 @@ func (c *rootHelperClient) MakeFilesystem(ctx context.Context, in *MakeFilesyste
 	return out, nil
 }
 
+func (c *rootHelperClient) EnsureGuestFirewall(ctx context.Context, in *EnsureGuestFirewallRequest, opts ...grpc.CallOption) (*EnsureGuestFirewallResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnsureGuestFirewallResponse)
+	err := c.cc.Invoke(ctx, RootHelper_EnsureGuestFirewall_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SetGuestNodeGuard(ctx context.Context, in *SetNodeGuardRequest, opts ...grpc.CallOption) (*SetNodeGuardResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetNodeGuardResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SetGuestNodeGuard_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) SetGuestEgressFloor(ctx context.Context, in *SetEgressFloorRequest, opts ...grpc.CallOption) (*SetEgressFloorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetEgressFloorResponse)
+	err := c.cc.Invoke(ctx, RootHelper_SetGuestEgressFloor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) GuestRules(ctx context.Context, in *GuestRulesRequest, opts ...grpc.CallOption) (*GuestRulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GuestRulesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_GuestRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -667,6 +725,20 @@ type RootHelperServer interface {
 	// owned by root as in privilege mode single and it can read and write
 	// nothing the agent could not.
 	MakeFilesystem(context.Context, *MakeFilesystemRequest) (*MakeFilesystemResponse, error)
+	// EnsureGuestFirewall makes sure the guests' firewall is set up: the
+	// guests' NAT and isolation (as EnsureTap puts them in), their rule chain
+	// and block sets, and the floor. It starts the helper's own timer that
+	// puts them back if something takes them away.
+	EnsureGuestFirewall(context.Context, *EnsureGuestFirewallRequest) (*EnsureGuestFirewallResponse, error)
+	// SetGuestNodeGuard makes sure the node guard holds for the TAP base,
+	// with these ports open. The ports are the ones SetNodeGuard takes.
+	SetGuestNodeGuard(context.Context, *SetNodeGuardRequest) (*SetNodeGuardResponse, error)
+	// SetGuestEgressFloor makes sure the deny floor for the TAP base holds
+	// these networks, plus the cloud metadata endpoints the helper always
+	// adds.
+	SetGuestEgressFloor(context.Context, *SetEgressFloorRequest) (*SetEgressFloorResponse, error)
+	// GuestRules changes one guest address's rules.
+	GuestRules(context.Context, *GuestRulesRequest) (*GuestRulesResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -772,6 +844,18 @@ func (UnimplementedRootHelperServer) RemoveTap(context.Context, *RemoveTapReques
 }
 func (UnimplementedRootHelperServer) MakeFilesystem(context.Context, *MakeFilesystemRequest) (*MakeFilesystemResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MakeFilesystem not implemented")
+}
+func (UnimplementedRootHelperServer) EnsureGuestFirewall(context.Context, *EnsureGuestFirewallRequest) (*EnsureGuestFirewallResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureGuestFirewall not implemented")
+}
+func (UnimplementedRootHelperServer) SetGuestNodeGuard(context.Context, *SetNodeGuardRequest) (*SetNodeGuardResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetGuestNodeGuard not implemented")
+}
+func (UnimplementedRootHelperServer) SetGuestEgressFloor(context.Context, *SetEgressFloorRequest) (*SetEgressFloorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetGuestEgressFloor not implemented")
+}
+func (UnimplementedRootHelperServer) GuestRules(context.Context, *GuestRulesRequest) (*GuestRulesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GuestRules not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1370,6 +1454,78 @@ func _RootHelper_MakeFilesystem_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_EnsureGuestFirewall_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureGuestFirewallRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).EnsureGuestFirewall(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_EnsureGuestFirewall_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).EnsureGuestFirewall(ctx, req.(*EnsureGuestFirewallRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SetGuestNodeGuard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNodeGuardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SetGuestNodeGuard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SetGuestNodeGuard_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SetGuestNodeGuard(ctx, req.(*SetNodeGuardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_SetGuestEgressFloor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetEgressFloorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).SetGuestEgressFloor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_SetGuestEgressFloor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).SetGuestEgressFloor(ctx, req.(*SetEgressFloorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_GuestRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GuestRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).GuestRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_GuestRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).GuestRules(ctx, req.(*GuestRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1504,6 +1660,22 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "MakeFilesystem",
 			Handler:    _RootHelper_MakeFilesystem_Handler,
+		},
+		{
+			MethodName: "EnsureGuestFirewall",
+			Handler:    _RootHelper_EnsureGuestFirewall_Handler,
+		},
+		{
+			MethodName: "SetGuestNodeGuard",
+			Handler:    _RootHelper_SetGuestNodeGuard_Handler,
+		},
+		{
+			MethodName: "SetGuestEgressFloor",
+			Handler:    _RootHelper_SetGuestEgressFloor_Handler,
+		},
+		{
+			MethodName: "GuestRules",
+			Handler:    _RootHelper_GuestRules_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

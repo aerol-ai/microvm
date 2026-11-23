@@ -55,6 +55,10 @@ type FirewallHost interface {
 	Reassert(ctx context.Context)
 	SetNodeGuard(allow []rootpolicy.NodePort) (repaired bool, err error)
 	SetFloor(cidrs []netip.Prefix) (repaired bool, err error)
+	// GuestFence is the IPv6 fence's state on the Firecracker guests' TAPs
+	// (M1 PR 14): covered is false when the fence does not cover them (a
+	// helper that serves no Firecracker, and the guests' own firewall).
+	GuestFence() (covered bool, state error)
 	// Rules changes one address's rules; inserted is a block's report.
 	// The policy ops replace the address's whole policy, and stop between
 	// writes once ctx ends.
@@ -99,11 +103,16 @@ var openFirewallFn = openFirewall
 
 // firewall serves the firewall calls. Like network, it opens on its first
 // call (latch and single flight), after the network it needs (the bridge
-// and its range come from the CNI config).
+// and its range come from the CNI config). The Firecracker guests' firewall
+// (guestfw.go) is one too, with no network: its range is the helper's own
+// TAP base.
 type firewall struct {
 	net   *network
 	whole Config
 	locks *keyedLocks
+	// key starts the lock keys of the host-wide steps: "host/" for the
+	// sandboxes' firewall, "guest/" for the guests'.
+	key string
 
 	ready atomic.Bool
 	mu    sync.Mutex
@@ -160,17 +169,22 @@ func newFirewall(cfg Config, net *network, injected FirewallHost, locks *keyedLo
 	if net == nil {
 		return nil
 	}
-	f := &firewall{net: net, whole: cfg, locks: locks, host: injected, open: openFirewallFn, stop: make(chan struct{})}
+	f := &firewall{net: net, whole: cfg, locks: locks, key: "host/", host: injected, open: openFirewallFn, stop: make(chan struct{})}
 	if injected != nil {
 		f.ready.Store(true)
 	}
 	return f
 }
 
+// opened is the firewall's host, and the network it needs; a firewall
+// with no network (the guests') gets none.
 func (f *firewall) opened() (FirewallHost, NetworkHost, error) {
-	n, err := f.net.opened()
-	if err != nil {
-		return nil, nil, err
+	var n NetworkHost
+	if f.net != nil {
+		var err error
+		if n, err = f.net.opened(); err != nil {
+			return nil, nil, err
+		}
 	}
 	if f.ready.Load() {
 		return f.host, n, nil
@@ -219,7 +233,7 @@ func (f *firewall) ensureHost(ctx context.Context) (*rootdpb.EnsureHostResponse,
 	if err != nil {
 		return nil, err
 	}
-	unlock, err := f.locks.lock(ctx, "host/firewall")
+	unlock, err := f.locks.lock(ctx, f.key+"firewall")
 	if err != nil {
 		return nil, err
 	}
@@ -232,6 +246,13 @@ func (f *firewall) ensureHost(ctx context.Context) (*rootdpb.EnsureHostResponse,
 	resp := &rootdpb.EnsureHostResponse{}
 	if fence != nil {
 		resp.Ipv6FenceError = fence.Error()
+	}
+	// One fence covers the bridge and, on a helper that serves
+	// Firecracker, every TAP: both are one nft table, put in whole.
+	covered, guests := h.GuestFence()
+	resp.FencesFirecracker = covered
+	if covered && guests != nil {
+		resp.FirecrackerIpv6FenceError = guests.Error()
 	}
 	return resp, nil
 }
@@ -258,7 +279,7 @@ func (f *firewall) setNodeGuard(ctx context.Context, req *rootdpb.SetNodeGuardRe
 	if err != nil {
 		return nil, err
 	}
-	unlock2, err := f.locks.lock(ctx, "host/node-guard")
+	unlock2, err := f.locks.lock(ctx, f.key+"node-guard")
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +300,7 @@ func (f *firewall) setFloor(ctx context.Context, req *rootdpb.SetEgressFloorRequ
 	if err != nil {
 		return nil, err
 	}
-	unlock3, err := f.locks.lock(ctx, "host/floor")
+	unlock3, err := f.locks.lock(ctx, f.key+"floor")
 	if err != nil {
 		return nil, err
 	}

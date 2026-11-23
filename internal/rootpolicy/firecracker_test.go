@@ -78,3 +78,43 @@ func TestCheckFilesystemSize(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckGuestAddress (M1 PR 14): a guest's rules are keyed by the guest
+// end of one of the pool's /30s, and by nothing else: never a TAP's host
+// end, a /30's network or broadcast address, an address past the pool or
+// outside the base, nor anything that is not a plain IPv4 address.
+func TestCheckGuestAddress(t *testing.T) {
+	for _, tc := range []struct {
+		ip   string
+		want string
+	}{{"172.16.0.2", "fctap0"}, {"172.16.0.14", "fctap3"}, {"172.16.3.254", "fctap255"}} {
+		s, err := CheckGuestAddress("172.16.0.0/20", 256, tc.ip)
+		if err != nil || s.TapName != tc.want || s.GuestIP != tc.ip {
+			t.Errorf("CheckGuestAddress(%s) = %+v, %v; want %s", tc.ip, s, err, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		name, base string
+		size       int
+		ip         string
+	}{
+		{"a TAP's host end", "172.16.0.0/20", 256, "172.16.0.13"},
+		{"a /30's network address", "172.16.0.0/20", 256, "172.16.0.12"},
+		{"a /30's broadcast address", "172.16.0.0/20", 256, "172.16.0.15"},
+		{"past the pool", "172.16.0.0/20", 256, "172.16.4.2"},
+		{"past a small pool", "172.16.0.0/20", 4, "172.16.0.18"},
+		{"outside the base", "172.16.0.0/20", 256, "10.88.0.2"},
+		{"the node", "172.16.0.0/20", 256, "127.0.0.1"},
+		{"IPv6", "172.16.0.0/20", 256, "fe80::2"},
+		{"a zone", "172.16.0.0/20", 256, "172.16.0.2%eth0"},
+		{"a network", "172.16.0.0/20", 256, "172.16.0.2/32"},
+		{"rule text", "172.16.0.0/20", 256, "172.16.0.2 -j ACCEPT"},
+		{"empty", "172.16.0.0/20", 256, ""},
+		{"a bad base", "172.16.0.9/20", 256, "172.16.0.2"},
+		{"no pool", "172.16.0.0/20", 0, "172.16.0.2"},
+	} {
+		if _, err := CheckGuestAddress(tc.base, tc.size, tc.ip); err == nil || RuleOf(err) != RuleAddress {
+			t.Errorf("%s: CheckGuestAddress(%q, %d, %q) = %v, want a %s refusal", tc.name, tc.base, tc.size, tc.ip, err, RuleAddress)
+		}
+	}
+}
