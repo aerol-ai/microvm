@@ -163,7 +163,7 @@ func (c *wasmMountCalls) grant(ctx context.Context, req *rootdpb.GrantWasmMounts
 	default:
 		return nil, &fileError{code: codes.Unavailable, msg: fmt.Sprintf("root helper: lend to %s host %s: %v", kind, req.GetHostId(), err)}
 	}
-	c.log.Debug("root helper: lent mounts to a WASM host", "sandbox_id", id, "kind", kind, "host", req.GetHostId(), "mounts", len(files))
+	c.log.Info("root helper: lent mounts to a WASM host", "sandbox_id", id, "kind", kind, "host", req.GetHostId(), "mounts", len(files))
 	return &rootdpb.GrantWasmMountsResponse{Granted: uint32(len(files))}, nil
 }
 
