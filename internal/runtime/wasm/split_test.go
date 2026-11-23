@@ -8,9 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
-	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -121,26 +119,6 @@ func TestSplitHandsFoldersToTheGroup(t *testing.T) {
 	d.cfg.Worker.GID = 4242424
 	if err := d.handToWorker(work); err == nil && os.Geteuid() != 0 {
 		t.Fatal("a folder went to a group sandboxd is not in")
-	}
-}
-
-func TestSplitRefusesCheckpoints(t *testing.T) {
-	d, _, _, _ := splitDriver(t)
-	_, _, err := d.CheckpointSandbox(context.Background(), &models.Sandbox{ID: "sb-1"})
-	if !errors.Is(err, privmode.ErrGap) || !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("checkpoint in split = %v", err)
-	}
-	for _, dur := range []string{models.DurabilityDurable, models.DurabilityPassivatable} {
-		if err := d.splitCreateGap(models.CreateSandboxRequest{Durability: dur}); !errors.Is(err, privmode.ErrGap) {
-			t.Fatalf("%s create in split = %v", dur, err)
-		}
-	}
-	if err := d.splitCreateGap(models.CreateSandboxRequest{}); err != nil {
-		t.Fatal(err)
-	}
-	single, _, _, _ := adoptDriver(t, true)
-	if single.splitCheckpointGap() != nil || single.splitCreateGap(models.CreateSandboxRequest{Durability: models.DurabilityDurable}) != nil {
-		t.Fatal("single mode refuses checkpoints")
 	}
 }
 

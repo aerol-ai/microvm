@@ -36,6 +36,16 @@ const (
 	maxSnapshotMemoryBytes = 1 << 30
 )
 
+// MaxSnapshotFileBytes bounds one file of a snapshot a worker wrote: the
+// memory a snapshot may hold, which its compressed copy never exceeds by
+// more than its frame headers, and room for those. sandboxd copies no
+// larger file out of a worker's checkpoint (privilege mode split).
+const MaxSnapshotFileBytes = maxSnapshotMemoryBytes + 1<<20
+
+// chmodSnapshotDir shares a snapshot's folder with the group; tests stand
+// in a failing one.
+var chmodSnapshotDir = os.Chmod
+
 // SnapshotConfig is the v1 config descriptor (§4.8.1).
 type SnapshotConfig struct {
 	SchemaVersion     int                `json:"schema_version"`
@@ -113,25 +123,34 @@ func WriteSnapshotDir(dst string, cap SnapshotCapture) error {
 		return err
 	}
 	cleanup := func() { _ = os.RemoveAll(tmp) }
+	// In privilege mode split sandboxd is not root: it reads the snapshot
+	// as a member of the worker's group, and copies it out
+	// (shared_group.go). MkdirTemp makes the folder 0700 whatever the mode.
+	if sharedWithGroup.Load() {
+		if err := chmodSnapshotDir(tmp, sharedDirMode(0o700)); err != nil {
+			cleanup()
+			return err
+		}
+	}
 
 	cfgBytes, err := json.MarshalIndent(cap.Config, "", "  ")
 	if err != nil {
 		cleanup()
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, configFileName), cfgBytes, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, configFileName), cfgBytes, sharedFileMode(0o600)); err != nil {
 		cleanup()
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, memoryFileName), memZ, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, memoryFileName), memZ, sharedFileMode(0o600)); err != nil {
 		cleanup()
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, globalsFileName), cap.Globals, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, globalsFileName), cap.Globals, sharedFileMode(0o600)); err != nil {
 		cleanup()
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, wasiStateFileName), cap.WASIState, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, wasiStateFileName), cap.WASIState, sharedFileMode(0o600)); err != nil {
 		cleanup()
 		return err
 	}

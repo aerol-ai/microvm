@@ -33,9 +33,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
 	}
-	if err := d.splitCreateGap(req); err != nil {
-		return nil, err
-	}
 	if d.supervisor == nil {
 		return nil, fmt.Errorf("wasm runtime: worker supervisor not configured: %w", models.ErrRuntimeNotImplemented)
 	}

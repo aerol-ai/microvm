@@ -6,9 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
-	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -25,8 +23,9 @@ import (
 // worker gets its own /work only as an open folder.
 //
 // What a worker writes for sandboxd to read back as its own, a checkpoint
-// (pause, passivation, a move), stays the worker user's file, which
-// sandboxd cannot take back: those wait for a later step, and answer 501.
+// (passivation, a move, a snapshot), stays the worker user's file, which
+// sandboxd cannot take back: sandboxd copies it out instead
+// (split_checkpoint_unix.go, M1 PR 15).
 
 // split reports whether the root helper holds the workers.
 func (d *Driver) split() bool { return d.cfg.HelperSockets != "" }
@@ -77,28 +76,6 @@ func (d *Driver) handToWorker(dir string) error {
 		return err
 	}
 	return os.Chmod(dir, os.ModeSetgid|0o770)
-}
-
-// errSplitCheckpoint is what split mode cannot do for WASM yet.
-var errSplitCheckpoint = privmode.NotYet("checkpoint a WASM sandbox (pause, passivation, a move, a snapshot)", privmode.StepWasmCheckpoints)
-
-// splitCheckpointGap refuses a checkpoint in split mode: the worker writes
-// it as its own user, and sandboxd cannot take it back to read as its own.
-func (d *Driver) splitCheckpointGap() error {
-	if d.split() {
-		return errSplitCheckpoint
-	}
-	return nil
-}
-
-// splitCreateGap refuses, in split mode, a create that would need a
-// checkpoint later: a durable or passivatable sandbox is checkpointed when
-// sandboxd stops.
-func (d *Driver) splitCreateGap(req models.CreateSandboxRequest) error {
-	if d.split() && (req.Durability == models.DurabilityDurable || req.Durability == models.DurabilityPassivatable) {
-		return errSplitCheckpoint
-	}
-	return nil
 }
 
 // SetWorkerLister makes boot adoption list the running workers through
