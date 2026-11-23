@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -187,8 +188,11 @@ func TestK8sVerifyPasses(t *testing.T) {
 	}
 	// No Gateway API in this cluster, so no route checks; one namespace, so
 	// no release namespace check.
-	if len(checks) != 11 {
-		t.Fatalf("%d checks, want 11: %+v", len(checks), checks)
+	if len(checks) != 12 {
+		t.Fatalf("%d checks, want 12: %+v", len(checks), checks)
+	}
+	if got := k8sResults(checks)[k8sRulePrivilegeMode]; got != "pass: (single mode): single 1" {
+		t.Fatalf("privilege mode = %q", got)
 	}
 	if strings.Join(f.signed, ",") != "ghcr.io/aerol-ai/aerolvm-runtime:v1,ghcr.io/aerol-ai/aerolvm:v1" {
 		t.Fatalf("signatures checked for %v, want each image once", f.signed)
@@ -213,6 +217,70 @@ func TestK8sVerifyPasses(t *testing.T) {
 	// No sandbox has IPv6, and a pod with no address yet has nothing to try.
 	if strings.Contains(f.commands[0], "fd00::") || strings.Contains(f.commands[0], " :53") {
 		t.Errorf("an IPv6 or empty address was probed: %s", f.commands[0])
+	}
+}
+
+// A worker in privilege mode split (plans/security-gaps-m1-m4.md M1 PR 11)
+// mounts one machine folder: /sys/fs/cgroup, read only, in its agent
+// alone, which is not privileged. Any other shape of that mount is a host
+// folder like any other. The privilege mode is reported per pool, mixed
+// pools included: they are the normal state while a switch rolls through.
+func TestK8sVerifySplitWorker(t *testing.T) {
+	const view = `{"name":"host-cgroup","hostPath":{"path":"/sys/fs/cgroup"}}`
+	split := func(agentMount, runtimeMount string, privileged bool) string {
+		s := strings.Replace(k8sGoodPods, `{"name":"netns","emptyDir":{}}`, view, 1)
+		s = strings.Replace(s, `"securityContext":{"privileged":true},
+       "env":[`, fmt.Sprintf(`"securityContext":{"privileged":%t},"volumeMounts":[%s],
+       "env":[{"name":"SB_PRIVILEGE_MODE","value":"split"},`, privileged, agentMount), 1)
+		if runtimeMount != "" {
+			s = strings.Replace(s, `"securityContext":{"privileged":true}},`, `"securityContext":{"privileged":true},"volumeMounts":[`+runtimeMount+`]},`, 1)
+		}
+		return s
+	}
+	const ro = `{"name":"host-cgroup","mountPath":"/sys/fs/cgroup","readOnly":true}`
+	for _, tc := range []struct {
+		name, pods, mounts, mode string
+	}{
+		{"the split agent's view", split(ro, "", false), "pass: /sys/fs/cgroup read only in the agent of aerolvm-0", "pass: (single mode): split 1"},
+		{"written to", split(`{"name":"host-cgroup","mountPath":"/sys/fs/cgroup"}`, "", false), "fail: aerolvm-0: host-cgroup (/sys/fs/cgroup)", ""},
+		{"elsewhere", split(`{"name":"host-cgroup","mountPath":"/host","readOnly":true}`, "", false), "fail: aerolvm-0: host-cgroup", ""},
+		{"a privileged agent", split(ro, "", true), "fail: aerolvm-0: host-cgroup", ""},
+		{"the runtime too", split(ro, ro, false), "fail: aerolvm-0: host-cgroup", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := goodK8s()
+			f.pods = tc.pods
+			got := k8sResults(k8sVerify(context.Background(), f.env(), k8sOpts))
+			if !strings.HasPrefix(got[k8sRuleNoHostMounts], tc.mounts) {
+				t.Errorf("host mounts = %q, want %q", got[k8sRuleNoHostMounts], tc.mounts)
+			}
+			if tc.mode != "" && got[k8sRulePrivilegeMode] != tc.mode {
+				t.Errorf("privilege mode = %q, want %q", got[k8sRulePrivilegeMode], tc.mode)
+			}
+		})
+	}
+	worker := func(name, pool, mode string) k8sPod {
+		var p k8sPod
+		p.Metadata.Name = name
+		p.Metadata.Labels = map[string]string{k8sComponent: "worker", "aerolvm.io/pool": pool}
+		c := k8sContainer{Name: "agent"}
+		if mode != "" {
+			c.Env = append(c.Env, struct {
+				Name  string `json:"name"`
+				Value string `json:"value"`
+			}{"SB_PRIVILEGE_MODE", mode})
+		}
+		p.Spec.Containers = []k8sContainer{c}
+		return p
+	}
+	var server k8sPod
+	server.Metadata.Labels = map[string]string{k8sComponent: "server"}
+	got := k8sPrivilegeModes([]k8sPod{worker("a", "gpu", "split"), worker("b", "general", "split"), worker("c", "general", ""), server, worker("d", "general", "single")})
+	if got.Result != k8sPass || got.Detail != "general: split 1, single 2; gpu: split 1" {
+		t.Errorf("mixed pools = %+v", got)
+	}
+	if got := k8sPrivilegeModes([]k8sPod{server}); got.Result != k8sSkip {
+		t.Errorf("no workers = %+v", got)
 	}
 }
 
@@ -246,7 +314,7 @@ func TestK8sVerifyFailures(t *testing.T) {
 		{name: "not JSON", f: &fakeK8s{pods: `nope`}, check: "AerolVM pods found", want: "fail: kubectl output"},
 		{name: "a host folder", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `{"name":"netns","emptyDir":{}}`, `{"name":"netns","hostPath":{"path":"/run/netns"}}`, 1)
-		})}, check: "no folders mounted from the machine", want: "fail: aerolvm-0: netns (/run/netns)"},
+		})}, check: k8sRuleNoHostMounts, want: "fail: aerolvm-0: netns (/run/netns)"},
 		{name: "the token mounted", f: &fakeK8s{pods: podsWith(func(s string) string {
 			return strings.Replace(s, `"automountServiceAccountToken":false,`, ``, 1)
 		})}, check: "no Kubernetes API credential in the pods", want: "fail: aerolvm-0: automountServiceAccountToken is not false"},
@@ -429,7 +497,7 @@ func TestK8sVerifyClusterModePasses(t *testing.T) {
 		}
 	}
 	got := k8sResults(checks)
-	if len(checks) != 16 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
+	if len(checks) != 17 || got[k8sReleaseNSCheck] == "" || got[k8sRoutesAccepted] == "" || got[k8sLinksPassthrough] == "" {
 		t.Fatalf("%d checks: %+v", len(checks), checks)
 	}
 	for check, want := range map[string]string{
@@ -607,7 +675,7 @@ func TestK8sVerifyCommand(t *testing.T) {
 		Checks []k8sCheck `json:"checks"`
 	}
 	h.jsonOut(&out)
-	if !out.OK || len(out.Checks) != 11 || strings.Contains(h.stderr.String(), "warning") {
+	if !out.OK || len(out.Checks) != 12 || strings.Contains(h.stderr.String(), "warning") {
 		t.Fatalf("%+v %s", out, h.stderr.String())
 	}
 

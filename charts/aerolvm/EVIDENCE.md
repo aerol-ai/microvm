@@ -321,10 +321,11 @@ Gateway rules run when the chart made Gateway API routes
 <!-- verify-rules:start -->
 - AerolVM pods found
 - images signed by the AerolVM release workflow
-- no folders mounted from the machine
+- no folders mounted from the machine, except a split agent's read-only cgroup tree
 - no Kubernetes API credential in the pods
 - no DNS provider token in the pods
 - privileged containers only in the worker pods' runtime and agent
+- each worker pool's privilege mode
 - the worker namespace's Pod Security label is privileged
 - the release namespace enforces restricted Pod Security
 - a NetworkPolicy limits the worker pods' egress
