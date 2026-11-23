@@ -10,6 +10,7 @@ import (
 	"time"
 
 	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/errdefs"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
@@ -195,18 +196,20 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 		return nil, err
 	}
 
-	container, err := client.LoadContainer(ctx, slot.ContainerID)
+	// In privilege mode split every read of containerd is one more trip
+	// through the root helper's gate, on the warm create's path, so a split
+	// claim reads once (splitClaimRead): the slot's record and the check
+	// that the sandbox is not there yet, in one list.
+	var read claimRead
+	if d.helper != nil {
+		read, err = splitClaimRead(ctx, client, sandboxID, slot.ContainerID)
+	} else {
+		read, err = loadClaimedSlot(ctx, client, slot.ContainerID)
+	}
 	if err != nil {
 		return nil, err
 	}
-	// LoadContainer has just read the record; its labels and snapshot key
-	// come from that read. Labels() and Info() would each read it again:
-	// in privilege mode split every read is one more trip through the
-	// root helper's gate, on the warm create's path.
-	info, err := container.Info(ctx, cntr.WithoutRefreshedMetadata)
-	if err != nil {
-		return nil, err
-	}
+	container, info := read.container, read.info
 	labels := maps.Clone(info.Labels)
 	if labels == nil {
 		labels = map[string]string{}
@@ -214,8 +217,11 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if sid := strings.TrimSpace(labels[sandboxIDLabelKey]); sid == sandboxID {
 		return d.adoptedRuntimeState(slot, sandboxID), nil
 	}
-	if err := d.assertSandboxNotExists(ctx, client, sandboxID, slot.ContainerID); err != nil {
-		return nil, err
+	if d.helper == nil {
+		read.exists = d.assertSandboxNotExists(ctx, client, sandboxID, slot.ContainerID)
+	}
+	if read.exists != nil {
+		return nil, read.exists
 	}
 	// The slot's writable layer gets the request's disk limit before the
 	// toolbox takes the sandbox's identity; a failure destroys the slot and
@@ -311,6 +317,65 @@ func (d *Driver) assertSandboxNotExists(ctx context.Context, client *Client, san
 		return dockerpkg.ErrSandboxContainerExists
 	}
 	return nil
+}
+
+// claimRead is what a warm claim reads of containerd: the claimed slot's
+// container and record, and exists, the answer to whether a container of
+// the sandbox is there already (assertSandboxNotExists's), which the claim
+// weighs once it has seen whether the slot is this sandbox's already.
+type claimRead struct {
+	container cntr.Container
+	info      containers.Container
+	exists    error
+}
+
+// loadClaimedSlot is single mode's read of the claimed slot: its labels
+// and snapshot key come from the load's own read (Labels and Info would
+// each read it again). The existence check is the claim's own reads.
+func loadClaimedSlot(ctx context.Context, client *Client, slotID string) (claimRead, error) {
+	container, err := client.LoadContainer(ctx, slotID)
+	if err != nil {
+		return claimRead{}, err
+	}
+	info, err := container.Info(ctx, cntr.WithoutRefreshedMetadata)
+	if err != nil {
+		return claimRead{}, err
+	}
+	return claimRead{container: container, info: info}, nil
+}
+
+// splitClaimRead is a split claim's one read of containerd, in place of
+// single mode's three (loadClaimedSlot and assertSandboxNotExists's two):
+// containerd answers a list with several filters with what matches any of
+// them, and the records come with the list. So one list gives the claimed
+// slot, a container named after the sandbox and any that carries its ID
+// as a label. A slot containerd no longer has is NotFound, as
+// LoadContainer answers.
+func splitClaimRead(ctx context.Context, client *Client, sandboxID, slotID string) (claimRead, error) {
+	found, err := client.ListContainers(ctx, "id=="+slotID, "id=="+sandboxID, "labels."+sandboxIDLabelKey+"=="+sandboxID)
+	if err != nil {
+		return claimRead{}, err
+	}
+	var read claimRead
+	for _, c := range found {
+		info, err := c.Info(ctx, cntr.WithoutRefreshedMetadata)
+		if err != nil {
+			return claimRead{}, err
+		}
+		switch {
+		case c.ID() == slotID:
+			read.container, read.info = c, info
+		case c.ID() == sandboxID && IsParkedContainerLabels(info.Labels):
+			// A parked slot named after the sandbox carries no sandbox
+			// ID: as assertSandboxNotExists, it is no sandbox.
+		default:
+			read.exists = dockerpkg.ErrSandboxContainerExists
+		}
+	}
+	if read.container == nil {
+		return claimRead{}, fmt.Errorf("container %q: %w", slotID, errdefs.ErrNotFound)
+	}
+	return read, nil
 }
 
 func (d *Driver) findContainerBySandboxID(ctx context.Context, client *Client, sandboxID string) (cntr.Container, error) {

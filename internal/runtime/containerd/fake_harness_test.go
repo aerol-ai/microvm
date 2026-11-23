@@ -128,21 +128,31 @@ func (f *fakeTransport) listContainers(ctx context.Context, filters ...string) (
 	return out, nil
 }
 
-// fakeLabelFiltersMatch applies containerd's `labels.<key>==<value>` filters,
-// the only kind the driver uses to look a container up by sandbox id. Other
-// filters (`labels.<key>`, existence) match every container, as before.
+// fakeLabelFiltersMatch applies containerd's `labels.<key>==<value>` and
+// `id==<id>` filters, the kinds the driver uses to look a container up by
+// sandbox id. As containerd does, a container matches when any filter
+// matches it. Other filters (`labels.<key>`, existence) match every
+// container, as before.
 func fakeLabelFiltersMatch(ctx context.Context, c *fakeContainer, filters []string) bool {
+	if len(filters) == 0 {
+		return true
+	}
 	for _, f := range filters {
-		key, want, ok := strings.Cut(strings.TrimPrefix(f, "labels."), "==")
-		if !ok || !strings.HasPrefix(f, "labels.") {
+		if id, ok := strings.CutPrefix(f, "id=="); ok {
+			if c.id == id {
+				return true
+			}
 			continue
 		}
-		labels, err := c.Labels(ctx)
-		if err != nil || labels[key] != want {
-			return false
+		key, want, ok := strings.Cut(strings.TrimPrefix(f, "labels."), "==")
+		if !ok || !strings.HasPrefix(f, "labels.") {
+			return true
+		}
+		if labels, err := c.Labels(ctx); err == nil && labels[key] == want {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func (f *fakeTransport) subscribe(ctx context.Context, _ ...string) (<-chan *events.Envelope, <-chan error) {

@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/errdefs"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/proto"
 
@@ -353,10 +355,26 @@ func TestSplitWarmClaimRestartAndTeardown(t *testing.T) {
 	pool.RecordLoaded(slot)
 	r.d.SetWarmPool(pool)
 	env := map[string]string{"GREETING": "hello"}
+	// The claim reads containerd once, a list: it loads no container
+	// (splitClaimRead).
+	var loaded []string
+	r.tr.loadContainerFn = func(_ context.Context, id string) (cntr.Container, error) {
+		loaded = append(loaded, id)
+		r.tr.mu.Lock()
+		defer r.tr.mu.Unlock()
+		if c, ok := r.tr.containers[id]; ok {
+			return c, nil
+		}
+		return nil, errdefs.ErrNotFound
+	}
 	state, err := r.d.Create(ctx, models.CreateSandboxRequest{Image: "cfg:test", Runtime: models.RuntimeDocker, Env: env, DiskGB: 4}, "sb-c1", "sb-token", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(loaded) != 0 {
+		t.Fatalf("the split claim loaded %v", loaded)
+	}
+	r.tr.loadContainerFn = nil
 	r.d.SetWarmPool(nil)
 	if state.AdoptedParkID != "park-c1" || state.ContainerID != "park-c1" {
 		t.Fatalf("state %+v", state)
@@ -541,4 +559,96 @@ func TestSplitParkSocketThroughTheRealHelper(t *testing.T) {
 type realParkHelper struct {
 	*fakeHelper
 	ParkSockets
+}
+
+// TestSplitClaimReadsOnce: a split claim reads containerd once, a list,
+// and gets single mode's answers from it for every shape of containerd's
+// records: the claimed slot's record, and whether a container of the
+// sandbox is there already. No container is loaded.
+func TestSplitClaimReadsOnce(t *testing.T) {
+	park := map[string]string{poolParkLabelKey: poolParkLabelValue}
+	adopted := func(sb string) map[string]string { return map[string]string{sandboxIDLabelKey: sb} }
+	slot := func(labels map[string]string) *fakeContainer {
+		return &fakeContainer{id: "park-a", labels: labels, snapshotKey: "park-a"}
+	}
+	for _, tc := range []struct {
+		name   string
+		cs     []*fakeContainer
+		exists bool
+	}{
+		{"only parked slots", []*fakeContainer{slot(park), {id: "park-c", labels: park}}, false},
+		{"a cold container of the sandbox", []*fakeContainer{slot(park), {id: "sb-1", labels: adopted("sb-1")}}, true},
+		{"a container named after it, unlabelled", []*fakeContainer{slot(park), {id: "sb-1"}}, true},
+		{"a parked slot named after it", []*fakeContainer{slot(park), {id: "sb-1", labels: park}}, false},
+		{"another slot adopted for it", []*fakeContainer{slot(park), {id: "park-b", labels: adopted("sb-1")}}, true},
+		{"the claimed slot itself, adopted for it already", []*fakeContainer{slot(adopted("sb-1"))}, false},
+		{"another sandbox's container", []*fakeContainer{slot(park), {id: "sb-2", labels: adopted("sb-2")}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newFakeTransport()
+			for _, c := range tc.cs {
+				tr.containers[c.id] = c
+			}
+			client := NewTestClient("aerolvm", tr)
+			d := newTestDriver(t)
+			single := d.assertSandboxNotExists(context.Background(), client, "sb-1", "park-a")
+			want, err := loadClaimedSlot(context.Background(), client, "park-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr.loadContainerFn = func(context.Context, string) (cntr.Container, error) {
+				t.Fatal("the split claim loaded a container")
+				return nil, nil
+			}
+			read, err := splitClaimRead(context.Background(), client, "sb-1", "park-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (read.exists != nil) != tc.exists || (single != nil) != tc.exists {
+				t.Fatalf("split %v, single %v; want exists=%v", read.exists, single, tc.exists)
+			}
+			if tc.exists && !errors.Is(read.exists, dockerpkg.ErrSandboxContainerExists) {
+				t.Fatalf("split %v", read.exists)
+			}
+			if read.container.ID() != "park-a" || read.info.SnapshotKey != want.info.SnapshotKey || !maps.Equal(read.info.Labels, want.info.Labels) {
+				t.Fatalf("split read the slot as %+v, single as %+v", read.info, want.info)
+			}
+		})
+	}
+	tr := newFakeTransport()
+	client := NewTestClient("aerolvm", tr)
+	if _, err := splitClaimRead(context.Background(), client, "sb-1", "park-a"); !errdefs.IsNotFound(err) {
+		t.Fatalf("a slot containerd does not have: %v", err)
+	}
+	tr.listErr = errors.New("gate refused the call")
+	if _, err := splitClaimRead(context.Background(), client, "sb-1", "park-a"); err == nil {
+		t.Fatal("a failed list passed")
+	}
+	tr = newFakeTransport()
+	tr.containers["park-a"] = &fakeContainer{id: "park-a", infoErr: errors.New("gone")}
+	if _, err := splitClaimRead(context.Background(), NewTestClient("aerolvm", tr), "sb-1", "park-a"); err == nil {
+		t.Fatal("an unreadable record passed")
+	}
+	if _, err := loadClaimedSlot(context.Background(), NewTestClient("aerolvm", tr), "park-a"); err == nil {
+		t.Fatal("single mode's read of an unreadable record passed")
+	}
+}
+
+// TestSplitClaimRefusesAnExistingSandbox: a split claim for a sandbox that
+// has a container already adopts nothing, and says so.
+func TestSplitClaimRefusesAnExistingSandbox(t *testing.T) {
+	r, _, _, _ := splitRestartRig(t)
+	slot := r.park("park-x1")
+	r.tr.containers["sb-x1"] = &fakeContainer{id: "sb-x1", labels: map[string]string{sandboxIDLabelKey: "sb-x1"}}
+	_, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "cfg:test"}, "sb-x1", "tok", slot)
+	if !errors.Is(err, dockerpkg.ErrSandboxContainerExists) {
+		t.Fatalf("err %v", err)
+	}
+	if got := r.lastAdopt(); got.SandboxID != "" {
+		t.Fatalf("the toolbox was adopted: %+v", got)
+	}
+	delete(r.tr.containers, "park-x1")
+	if _, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "cfg:test"}, "sb-x2", "tok", slot); !errdefs.IsNotFound(err) {
+		t.Fatalf("a slot that is gone: %v", err)
+	}
 }
