@@ -35,7 +35,8 @@ import (
 // the forwarding sysctls, the CNI config), its host firewall (every
 // sandbox rule, the node guard, the deny floor, the IPv6 fence), and the
 // hostname gateway's host side (the self-test's probe network, the
-// executable lookups). Image builds need no helper call: buildkitd runs
+// executable lookups); and Firecracker's VMs, TAPs and guests' firewall
+// (M1 PRs 9b and 14). Image builds need no helper call: buildkitd runs
 // rootless, and sandboxd imports each build through the gate
 // (buildKitBuilderFor). Root work it does not do yet is refused by name,
 // at start for what sandboxd does at boot, at the call for the rest, and
@@ -85,19 +86,17 @@ func checkPrivilegeMode(cfg config.Config) error {
 		}
 	}
 	// Firecracker VMs are the helper's from M1 PR 9b (split_firecracker.go):
-	// it runs the jailer, makes each VM's jail, TAP and filesystems. It
-	// always runs the jailer, and it does not yet keep the guests'
-	// firewall or a VM's memory and state files.
+	// it runs the jailer, makes each VM's jail, TAP and filesystems, keeps
+	// the guests' firewall (M1 PR 14) and hands a VM's memory and state
+	// files across (M1 PR 14b). It always runs the jailer, and it does not
+	// run the warm VM pool yet.
 	if cfg.EnableFirecracker {
 		if !cfg.UseJailer {
 			return errors.New("SB_PRIVILEGE_MODE=split runs every Firecracker VM through the root helper's jailer: " +
 				"set SB_FIRECRACKER_USE_JAILER=true, or run this node in privilege mode single")
 		}
-		if cfg.EnableNetworkRules {
-			gaps = append(gaps, privmode.StepFirecrackerGuestRules)
-		}
 		if cfg.FirecrackerVMMPoolEnabled {
-			gaps = append(gaps, privmode.StepFirecrackerSnapshots)
+			gaps = append(gaps, privmode.StepFirecrackerWarmPool)
 		}
 	}
 	if cfg.GvisorCheckpointMoves {

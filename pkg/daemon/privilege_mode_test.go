@@ -83,6 +83,9 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// M1 PR 9b: Firecracker VMs, through the helper's jailer, on a
 		// node whose network rules are off.
 		func(c *config.Config) { c.EnableFirecracker, c.UseJailer = true, true },
+		// M1 PR 14: and with them on, the guests' firewall is the helper's.
+		func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true },
+		func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnterpriseMode = true, true, true },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -111,16 +114,14 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// The helper runs every VM through its jailer: an unjailed one is
 		// single mode only.
 		{"Firecracker unjailed", func(c *config.Config) { c.EnableFirecracker = true }, "SB_FIRECRACKER_USE_JAILER=true", nil},
-		{"Firecracker with network rules", func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true },
-			"Firecracker guests' firewall", []privmode.Step{privmode.StepFirecrackerGuestRules}},
 		{"the warm VM pool", func(c *config.Config) {
 			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
 		},
-			"warm VM pool", []privmode.Step{privmode.StepFirecrackerSnapshots}},
+			"warm VM pool", []privmode.Step{privmode.StepFirecrackerWarmPool}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
 		{"several at once, each named", func(c *config.Config) {
-			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true, true
-		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerGuestRules, privmode.StepMoves}},
+			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true, true
+		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool, privmode.StepMoves}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()

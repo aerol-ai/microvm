@@ -12,6 +12,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/network/hostnet"
 	"github.com/aerol-ai/microvm/internal/network/ipv6fence"
+	"github.com/aerol-ai/microvm/internal/network/tap/taphost"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
@@ -22,13 +23,22 @@ import (
 // engine's bridge (split mode is the containerd engine only).
 const fenceRuntime = "containerd"
 
+// fenceGuestRuntime is the fence's source for the Firecracker guests' TAPs,
+// which a helper that serves Firecracker keeps too (M1 PR 14), as sandboxd's
+// own fence does in privilege mode single (pkg/daemon ipv6FenceSources).
+const fenceGuestRuntime = "firecracker"
+
 // kernelFirewall is the helper's FirewallHost: netrules (AEROLVM-USER and
 // AEROLVM-INPUT, the block sets, the node guard and the floor) and the IPv6
-// fence, as sandboxd runs them in single mode.
+// fence, as sandboxd runs them in single mode. The guests' firewall
+// (AEROLVM-FC on the TAP base) is one too, with no fence of its own: the
+// sandboxes' fence covers the TAPs.
 type kernelFirewall struct {
 	rules  *netrules.Manager
 	fence  *ipv6fence.Supervisor
 	subnet netip.Prefix
+	// guests: the fence covers the Firecracker TAPs too.
+	guests bool
 
 	// The node guard's and floor's last lists: a list that did not change
 	// is re-asserted, not installed again.
@@ -59,9 +69,16 @@ func openFirewall(cfg Config, n NetworkHost) (FirewallHost, error) {
 	}
 	m.SetBridgeSubnet(n.Subnet().String())
 	bridge := n.Bridge()
-	fence := ipv6fence.NewSupervisor(newFenceBackend(), slog.New(slog.DiscardHandler), ipv6fence.Source{Runtime: fenceRuntime,
-		Spec: func(context.Context) (ipv6fence.Spec, error) { return ipv6fence.Spec{Bridges: []string{bridge}}, nil }})
-	k := &kernelFirewall{rules: m, fence: fence, subnet: n.Subnet()}
+	sources := []ipv6fence.Source{{Runtime: fenceRuntime,
+		Spec: func(context.Context) (ipv6fence.Spec, error) { return ipv6fence.Spec{Bridges: []string{bridge}}, nil }}}
+	guests := cfg.Hosts.Firecracker != nil
+	if guests {
+		sources = append(sources, ipv6fence.Source{Runtime: fenceGuestRuntime, Spec: func(context.Context) (ipv6fence.Spec, error) {
+			return ipv6fence.Spec{Links: []string{taphost.NamePrefix + "*"}}, nil
+		}})
+	}
+	fence := ipv6fence.NewSupervisor(newFenceBackend(), slog.New(slog.DiscardHandler), sources...)
+	k := &kernelFirewall{rules: m, fence: fence, subnet: n.Subnet(), guests: guests}
 	// Before any rule call (PR 5 review): a helper that starts on a kernel
 	// an earlier helper filled knows nothing of what is there. Its chain,
 	// its block sets and its own floor (the cloud metadata endpoints, the
@@ -105,6 +122,9 @@ func (k *kernelFirewall) EnsureHost(ctx context.Context) (error, error) {
 		return nil, fmt.Errorf("the sandboxes' chain: %w", err)
 	}
 	_, _ = k.rules.ReassertBlockSets()
+	if k.fence == nil {
+		return nil, nil
+	}
 	k.fence.Sync(ctx, true)
 	return k.fence.Ready(fenceRuntime), nil
 }
@@ -114,7 +134,55 @@ func (k *kernelFirewall) Reassert(ctx context.Context) {
 	_, _ = k.rules.ReassertBlockSets()
 	_, _ = k.rules.ReassertNodeGuard()
 	_, _ = k.rules.ReassertFloor()
-	k.fence.Sync(ctx, false)
+	if k.fence != nil {
+		k.fence.Sync(ctx, false)
+	}
+}
+
+func (k *kernelFirewall) GuestFence() (bool, error) {
+	if !k.guests || k.fence == nil {
+		return false, nil
+	}
+	return true, k.fence.Ready(fenceGuestRuntime)
+}
+
+// newGuestRulesManager builds the guests' netrules manager, on single
+// mode's chain for them; tests replace it with one over a fake backend.
+var newGuestRulesManager = func(backend string) (*netrules.Manager, error) {
+	return netrules.NewWithOptions(true, backend, netrules.ChainAerolvmFC)
+}
+
+// openGuestFirewall opens the Firecracker guests' firewall (M1 PR 14), as
+// sandboxd's wireFirecrackerEgress does in privilege mode single: the
+// AEROLVM-FC chain with its accepts for the helper's own TAP base, its
+// block sets, and a floor for that base. As openFirewall does, it puts the
+// chain and the floor in before any rule call, keeping what a live floor
+// already drops.
+func openGuestFirewall(cfg Config, fc *FirecrackerHostsConfig) (FirewallHost, error) {
+	base, err := netip.ParsePrefix(fc.TapBase)
+	if err != nil {
+		return nil, fmt.Errorf("TAP base %q: %w", fc.TapBase, err)
+	}
+	base = base.Masked()
+	netrules.SetSandboxInterconnect(cfg.Firewall.Interconnect)
+	m, err := newGuestRulesManager(cfg.Firewall.Backend)
+	if err != nil {
+		return nil, fmt.Errorf("netrules: %w", err)
+	}
+	m.SetBridgeSubnet(base.String())
+	if err := m.EnsureChain(); err != nil {
+		return nil, fmt.Errorf("the guests' chain: %w", err)
+	}
+	_ = m.PrepareBlockSets()
+	k := &kernelFirewall{rules: m, subnet: base}
+	live, err := m.LiveFloor(base)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := k.SetFloor(live); err != nil {
+		return nil, fmt.Errorf("the guests' egress floor: %w", err)
+	}
+	return k, nil
 }
 
 func (k *kernelFirewall) SetNodeGuard(allow []rootpolicy.NodePort) (bool, error) {

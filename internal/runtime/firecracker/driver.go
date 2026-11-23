@@ -610,9 +610,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
 		}
 		d.noteStaleTemplate(earlySnap)
-		if earlySnap.HasSnapshot && d.split != nil {
-			return nil, fmt.Errorf("firecracker runtime: template %q: %w", req.TemplateID, errSplitSnapshots)
-		}
 	}
 	warmStart := time.Now()
 	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
@@ -900,7 +897,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 	if snapshotLoadPath && snapshotInfo != nil && snapshotInfo.HasOverlay && overlayPath == "" {
-		overlayPath = filepath.Join(handle.RunDir(), overlayFileName)
+		overlayPath = filepath.Join(stageDirOf(handle), overlayFileName)
 		if err := allocateSparse(overlayPath, overlayPlaceholderBytes); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: overlay placeholder alloc: %w", err)
 		}
@@ -934,6 +931,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if snapshotLoadPath {
 		if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: patch VM Resumed: %w", err)
+		}
+		// Split mode: the helper gives the vsock socket, bound at the
+		// load, to sandboxd's group.
+		if err := shareSockets(ctx, handle); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: share the VM's sockets: %w", err)
 		}
 	} else {
 		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
@@ -1192,6 +1194,14 @@ func (d *Driver) configureVMMForLoad(ctx context.Context, client VMMClient, snap
 		timing.RecordStage("fc_load", time.Since(loadStart))
 	}()
 	runDir := filepath.Dir(rootfsPath)
+	if d.split != nil {
+		// The three read-only files in one helper call: the load's fast
+		// path pays one round trip for them.
+		if err := d.splitShare(ctx, runDir, sharedFile{sandboxSnapshotMemoryFileName, snap.SnapshotMemoryPath},
+			sharedFile{sandboxSnapshotStateFileName, snap.SnapshotStatePath}, sharedFile{rootfsFileName, rootfsPath}); err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
+		}
+	}
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, snap.SnapshotMemoryPath, snap.SnapshotStatePath)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
@@ -1512,9 +1522,6 @@ func ociImageRefFor(ref string) string {
 // running; a restore needs StartWithIdentity, which the service always uses
 // (runtime.IdentityStarter).
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
-	if err := d.splitGap(); err != nil {
-		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
-	}
 	return d.startFromSandboxSnapshot(ctx, sandboxID, "")
 }
 
@@ -1529,9 +1536,6 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 	if containerRef != sandboxID {
 		return nil, fmt.Errorf("firecracker runtime: start %q: runtime reference does not name sandbox %q", containerRef, sandboxID)
 	}
-	if err := d.splitGap(); err != nil {
-		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
-	}
 	return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
 }
 
@@ -1541,9 +1545,6 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 // and vsock identity; Destroy releases that allocation and deletes the
 // snapshot.
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
-	if err := d.splitGap(); err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
-	}
 	// A snapshot of the running VM may have its filesystem frozen; stopping
 	// now would save the VM frozen. Wait for the thaw.
 	release, err := d.gate.lock(ctx, sandboxID)
@@ -1994,7 +1995,7 @@ func (d *Driver) PushAllowedPorts(_ context.Context, _, _ string, _ []int) error
 // could be rewritten by any VM's firecracker process, for every VM after it.
 func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error) {
 	if d.split != nil {
-		return d.splitStage(srcAbs, destName, false)
+		return d.splitStage(runDir, srcAbs, destName, false)
 	}
 	if !d.cfg.UseJailer {
 		return srcAbs, nil
@@ -2032,7 +2033,7 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 // here.
 func (d *Driver) chrootSharedFile(runDir, srcAbs, destName string) (string, error) {
 	if d.split != nil {
-		return d.splitStage(srcAbs, destName, true)
+		return d.splitStage(runDir, srcAbs, destName, true)
 	}
 	if !d.cfg.UseJailer {
 		return srcAbs, nil

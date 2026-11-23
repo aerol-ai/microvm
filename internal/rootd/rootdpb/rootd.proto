@@ -229,6 +229,60 @@ service RootHelper {
   // owned by root as in privilege mode single and it can read and write
   // nothing the agent could not.
   rpc MakeFilesystem(MakeFilesystemRequest) returns (MakeFilesystemResponse);
+
+  // The calls below are the Firecracker guests' firewall (M1 PR 14), as
+  // sandboxd keeps it in privilege mode single: the guests' own rule chain
+  // on the helper's TAP base, its block sets, the node guard and the deny
+  // floor for that base, and each guest's rules. The agent sends typed
+  // values, as for the containerd firewall above: a guest's address, its
+  // egress CIDRs, the node ports guests may reach, the node's extra deny
+  // floor. The helper checks each, renders every rule itself, and touches
+  // only the guests' own chains. Each call is safe to retry and to repeat.
+
+  // EnsureGuestFirewall makes sure the guests' firewall is set up: the
+  // guests' NAT and isolation (as EnsureTap puts them in), their rule chain
+  // and block sets, and the floor. It starts the helper's own timer that
+  // puts them back if something takes them away.
+  rpc EnsureGuestFirewall(EnsureGuestFirewallRequest) returns (EnsureGuestFirewallResponse);
+
+  // SetGuestNodeGuard makes sure the node guard holds for the TAP base,
+  // with these ports open. The ports are the ones SetNodeGuard takes.
+  rpc SetGuestNodeGuard(SetNodeGuardRequest) returns (SetNodeGuardResponse);
+
+  // SetGuestEgressFloor makes sure the deny floor for the TAP base holds
+  // these networks, plus the cloud metadata endpoints the helper always
+  // adds.
+  rpc SetGuestEgressFloor(SetEgressFloorRequest) returns (SetEgressFloorResponse);
+
+  // GuestRules changes one guest address's rules.
+  rpc GuestRules(GuestRulesRequest) returns (GuestRulesResponse);
+
+  // The calls below hand a Firecracker VM's memory and state files and its
+  // disks between the agent and the VM's chroot (M1 PR 14b), for stop,
+  // start, template snapshots and snapshot loads. The agent names a VM by
+  // its sandbox ID and each file by one of a few fixed names; the helper
+  // opens every file once, with no link followed, through a handle on a
+  // folder it checked, and changes only that file's group and mode. It
+  // never gives a file to another owner, and never makes one the agent or
+  // the jailer's user can write that the other reads as trusted. Each call
+  // is safe to retry and to repeat.
+
+  // ShareFirecrackerFiles links files the agent built in the VM's stage
+  // folder into its chroot, read-only for the jailer's user: a snapshot's
+  // memory and state, and a template's root disk, which a snapshot load
+  // attaches read-only. Each must be the agent's own regular file; it
+  // stays the agent's, with the jailer's group and mode 0640. The VM's
+  // process must run (a chroot is made again from nothing before it
+  // starts).
+  rpc ShareFirecrackerFiles(FirecrackerFilesRequest) returns (FirecrackerFilesResponse);
+
+  // HandOutFirecrackerFiles lets the agent's group read files in the VM's
+  // chroot that the VM made or writes: a snapshot's memory and state, its
+  // disks. Each must be a regular file of the jailer's user with one name
+  // (or one the helper shared, which is the agent's already); the helper
+  // sets its group to the agent's and its mode to 0640. The agent copies
+  // it out, with checks of its own.
+  rpc HandOutFirecrackerFiles(FirecrackerFilesRequest) returns (FirecrackerFilesResponse);
 }
 
 message VersionRequest {
@@ -264,6 +318,13 @@ message EnsureHostResponse {
   // Why the IPv6 fence does not cover the sandboxes' bridge now; empty
   // when it does.
   string ipv6_fence_error = 1;
+  // The fence covers the Firecracker guests' TAPs too: set by a helper
+  // that serves Firecracker (M1 PR 14). An older helper fences the bridge
+  // alone, and the agent then refuses Firecracker creates.
+  bool fences_firecracker = 2;
+  // Why the IPv6 fence does not cover the guests' TAPs now; empty when it
+  // does. Meaningful only with fences_firecracker.
+  string firecracker_ipv6_fence_error = 3;
 }
 
 // HostEntry is one line of a container's hosts file.
@@ -933,6 +994,12 @@ message SetHostLimitsResponse {}
 message EnsureTapRequest {
   // The device's name: fctap<slot index>.
   string name = 1;
+  // A snapshot's guest vsock CID (M1 PR 14b), when the VM restores one:
+  // the guest keeps the MAC the snapshot froze, which the helper works
+  // out from this CID for the TAP's neighbor entry. 0: the slot's own.
+  // The agent sends it only to a helper that lists
+  // ShareFirecrackerFiles.
+  uint32 guest_cid = 2;
 }
 
 message EnsureTapResponse {
@@ -963,3 +1030,32 @@ message MakeFilesystemRequest {
 }
 
 message MakeFilesystemResponse {}
+
+message EnsureGuestFirewallRequest {}
+
+message EnsureGuestFirewallResponse {}
+
+message GuestRulesRequest {
+  // The guest's address: the guest end of one of the TAP pool's slots, as
+  // the helper lays the pool out from its own TAP base.
+  string guest_ip = 1;
+  SandboxRulesOp op = 2;
+  // The egress policy's networks, for the two policy ops.
+  repeated string allow_cidrs = 3;
+  repeated string deny_cidrs = 4;
+}
+
+message GuestRulesResponse {
+  // For a block: the rule was not there and was put in.
+  bool inserted = 1;
+}
+
+message FirecrackerFilesRequest {
+  // The VM's sandbox ID.
+  string id = 1;
+  // The files, by name: "snapshot.memory", "snapshot.state",
+  // "rootfs.ext4", "overlay.ext4" (each call takes the names it allows).
+  repeated string names = 2;
+}
+
+message FirecrackerFilesResponse {}

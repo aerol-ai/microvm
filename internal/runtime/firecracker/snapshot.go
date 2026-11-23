@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -77,9 +78,6 @@ const snapshotVMMIDPrefix = "tpl-snap-"
 // snapshot at all because the integrity check at load time would
 // rightly reject it but the row would be marked has_snapshot=true.
 func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
-	if err := d.splitGap(); err != nil {
-		return nil, fmt.Errorf("firecracker runtime: template snapshot: %w", err)
-	}
 	// Same seam preconditions as Create. SnapshotTemplate shares the
 	// pool, tapHost, and vsockDial dependencies — the rootfs builder
 	// is the only seam Create needs that snapshot does not (the rootfs
@@ -173,7 +171,14 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// Step 3: stage the template's rootfs into the VMM's runDir. The
 	// jailer chroot covers the runDir, so the rootfs MUST live inside
 	// it; hard-link first, copy on EXDEV.
-	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+	rootfsPath := filepath.Join(stageDirOf(handle), rootfsFileName)
+	if d.split != nil {
+		// The stage folder outlives a crashed build (only the chroot is
+		// made again); a name left there would stop the link.
+		if err := os.Remove(rootfsPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("firecracker snapshot: clear the stage folder: %w", err)
+		}
+	}
 	if err := linkOrCopyRootfs(req.RootfsPath, rootfsPath); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: rootfs stage: %w", err)
 	}
@@ -268,7 +273,7 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// is intentionally tiny — only the device shape is captured into
 	// the snapshot state; the placeholder file is discarded with the
 	// staging runDir at Step 12.
-	placeholderPath := filepath.Join(handle.RunDir(), overlayFileName)
+	placeholderPath := filepath.Join(stageDirOf(handle), overlayFileName)
 	if err := allocateSparse(placeholderPath, overlayPlaceholderBytes); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: overlay placeholder: %w", err)
 	}
@@ -301,6 +306,11 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 	// Step 7: boot.
 	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
 		return nil, fmt.Errorf("firecracker snapshot: action InstanceStart: %w", err)
+	}
+	// Split mode: the helper gives the vsock socket, bound at the start,
+	// to sandboxd's group.
+	if err := shareSockets(ctx, handle); err != nil {
+		return nil, fmt.Errorf("firecracker snapshot: share the VM's sockets: %w", err)
 	}
 
 	// Step 8: wait for the in-guest toolbox. Same handshake Create does
@@ -503,6 +513,13 @@ func (d *Driver) createSnapshotArtifacts(ctx context.Context, client VMMClient, 
 		_ = os.Remove(memHostPath)
 		_ = os.Remove(stateHostPath)
 	}
+	if d.split != nil {
+		// A VM started from a snapshot has its saved memory and state
+		// shared in under the usual names, sandboxd's and read-only to it,
+		// and sandboxd cannot remove names in the chroot: firecracker
+		// writes the new snapshot under names of its own.
+		memAPIPath, stateAPIPath = rootpolicy.FirecrackerSavedMemory, rootpolicy.FirecrackerSavedState
+	}
 
 	if err := client.CreateSnapshot(ctx, firecracker.SnapshotCreate{
 		SnapshotType: "Full",
@@ -513,6 +530,12 @@ func (d *Driver) createSnapshotArtifacts(ctx context.Context, client VMMClient, 
 	}
 	if !d.cfg.UseJailer {
 		return nil
+	}
+	if d.split != nil {
+		// firecracker wrote both as the jailer's user: the helper lets
+		// sandboxd read them, and sandboxd copies them out.
+		return d.splitCopyOut(ctx, runDir, chrootFile{rootpolicy.FirecrackerSavedMemory, outMemPath},
+			chrootFile{rootpolicy.FirecrackerSavedState, outStatePath})
 	}
 	if err := copyFile(memHostPath, outMemPath); err != nil {
 		return fmt.Errorf("copy snapshot memory out of jailer chroot: %w", err)

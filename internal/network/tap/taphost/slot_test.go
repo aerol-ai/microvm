@@ -60,3 +60,11 @@ func TestParseIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestMACFromCID(t *testing.T) {
+	for cid, want := range map[uint32]string{3: "02:00:00:00:00:03", 258: "02:00:00:00:01:02", 1<<24 - 1: "02:00:00:ff:ff:ff"} {
+		if got := MACFromCID(cid); got != want {
+			t.Errorf("MACFromCID(%d) = %s, want %s", cid, got, want)
+		}
+	}
+}

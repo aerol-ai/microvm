@@ -673,6 +673,16 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureEnsureTap:      true,
 	rootdpb.FeatureRemoveTap:      true,
 	rootdpb.FeatureMakeFilesystem: true,
+	// The guests' firewall (M1 PR 14) is the containerd firewall's calls
+	// on the guests' chain, with the same answers to a repeat.
+	rootdpb.FeatureEnsureGuestFirewall: true,
+	rootdpb.FeatureSetGuestNodeGuard:   true,
+	rootdpb.FeatureSetGuestEgressFloor: true,
+	rootdpb.FeatureGuestRules:          true,
+	// A VM's snapshot files (M1 PR 14b): a share answers a file it moved
+	// already as done, and a hand-out sets the same group and mode again.
+	rootdpb.FeatureShareFirecrackerFiles:   true,
+	rootdpb.FeatureHandOutFirecrackerFiles: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -783,6 +793,11 @@ var networkCalls = map[string]bool{
 	// lock).
 	rootdpb.FeatureEnsureTap: true,
 	rootdpb.FeatureRemoveTap: true,
+	// The guests' firewall waits on the xtables lock, as the sandboxes' does.
+	rootdpb.FeatureEnsureGuestFirewall: true,
+	rootdpb.FeatureSetGuestNodeGuard:   true,
+	rootdpb.FeatureSetGuestEgressFloor: true,
+	rootdpb.FeatureGuestRules:          true,
 }
 
 // mountCalls are the calls bounded by the mount timeout: they wait for

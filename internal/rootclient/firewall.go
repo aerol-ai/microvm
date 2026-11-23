@@ -18,8 +18,28 @@ import (
 // fence. fence is why the fence is not in place yet, or "" once it is; the
 // agent holds creates while it is not (service.ErrIPv6FenceNotReady).
 func (c *Client) EnsureHostFirewall(ctx context.Context) (fence string, err error) {
+	f, err := c.EnsureHostFences(ctx)
+	return f.Containerd, err
+}
+
+// Fences is the IPv6 fence's state, as the helper's host step answers it:
+// Containerd is why the fence does not cover the sandboxes' bridge yet,
+// "" once it does; Firecracker is the same for the guests' TAPs, and
+// counts only when CoversFirecracker says the fence takes them in (a
+// helper that serves Firecracker, M1 PR 14). An older helper fences the
+// bridge alone.
+type Fences struct {
+	Containerd        string
+	Firecracker       string
+	CoversFirecracker bool
+}
+
+// EnsureHostFences is EnsureHostFirewall with the fence's state on the
+// Firecracker TAPs too.
+func (c *Client) EnsureHostFences(ctx context.Context) (Fences, error) {
 	resp, err := call(ctx, c, rootdpb.FeatureEnsureHost, &rootdpb.EnsureHostRequest{}, rootdpb.RootHelperClient.EnsureHost)
-	return resp.GetIpv6FenceError(), err
+	return Fences{Containerd: resp.GetIpv6FenceError(), Firecracker: resp.GetFirecrackerIpv6FenceError(),
+		CoversFirecracker: resp.GetFencesFirecracker()}, err
 }
 
 // SetNodeGuard sets the node ports sandboxes may reach on the node; every

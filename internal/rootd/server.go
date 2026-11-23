@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -125,6 +126,11 @@ type Options struct {
 	// own, opened on the first firewall call (openFirewall). The firewall
 	// needs the network: with none, the helper serves no firewall call.
 	Firewall FirewallHost
+	// GuestFirewall does the Firecracker guests' firewall's kernel work
+	// (guestfw.go). Nil: the helper's own, opened on the first guest
+	// firewall call (openGuestFirewall). It needs Firecracker in the
+	// helper's settings, not the network.
+	GuestFirewall FirewallHost
 	// Egress does the hostname gateway's host side (egress.go). Nil: the
 	// helper's own. Like the firewall, it needs the network.
 	Egress EgressHost
@@ -163,6 +169,10 @@ type Options struct {
 	TapSysctls func() error
 	// hostLaunchers stand in for the kinds' own parts in tests.
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
+	// reassertEvery paces both firewalls' re-assert timers. Zero:
+	// defaultReassertEvery. Tests make it short; it is fixed once the
+	// server is built, as each timer's goroutine reads it.
+	reassertEvery time.Duration
 }
 
 // Server is the helper's socket and gRPC server.
@@ -190,8 +200,10 @@ type Server struct {
 	// hosts serves the host-process calls; nil when the helper serves no
 	// host kind.
 	hosts *hostCalls
-	// taps serves the Firecracker TAP calls; nil without Firecracker.
+	// taps serves the Firecracker TAP calls, gf the guests' firewall;
+	// each nil without Firecracker.
 	taps *tapCalls
+	gf   *guestFirewall
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -263,14 +275,15 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.srv = grpc.NewServer(sopts...)
 	s.locks, s.stopSweep = locks, func() {}
 	s.net = newNetwork(cfg, opts.Network, locks)
-	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
+	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks, opts.reassertEvery)
 	s.hosts = newHostCalls(cfg, opts, locks, log)
 	if fc := cfg.Hosts.Firecracker; fc != nil {
 		s.taps = newTapCalls(fc, opts, locks, log)
 	}
+	s.gf = newGuestFirewall(cfg, s.taps, opts.GuestFirewall, locks, opts.reassertEvery)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps, gf: s.gf})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -374,6 +387,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.mounts.close()
 		s.hosts.close()
 		s.taps.close()
+		s.gf.close()
 	})
 }
 
@@ -519,8 +533,10 @@ type helper struct {
 	// hc serves the host-process calls; nil when this helper serves no
 	// host kind.
 	hc *hostCalls
-	// tc serves the Firecracker TAP calls; nil without Firecracker.
+	// tc serves the Firecracker TAP calls, gf the guests' firewall; each
+	// nil without Firecracker.
 	tc *tapCalls
+	gf *guestFirewall
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -553,6 +569,12 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.tc != nil {
 		served = append(served, tapFeatures...)
+	}
+	if h.gf != nil {
+		served = append(served, guestFeatures...)
+	}
+	if h.hc.firecracker() != nil {
+		served = append(served, firecrackerFileFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
 		Hosts: h.hc.servedKinds()}, nil
@@ -879,6 +901,54 @@ func (h helper) MakeFilesystem(ctx context.Context, req *rootdpb.MakeFilesystemR
 	}
 	resp, err := fc.makeFilesystem(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_MakeFilesystem_FullMethodName, resp, err)
+}
+
+func (h helper) EnsureGuestFirewall(ctx context.Context, _ *rootdpb.EnsureGuestFirewallRequest) (*rootdpb.EnsureGuestFirewallResponse, error) {
+	if h.gf == nil {
+		return nil, noFirecracker(rootdpb.FeatureEnsureGuestFirewall)
+	}
+	resp, err := h.gf.ensure(ctx)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureGuestFirewall_FullMethodName, resp, err)
+}
+
+func (h helper) SetGuestNodeGuard(ctx context.Context, req *rootdpb.SetNodeGuardRequest) (*rootdpb.SetNodeGuardResponse, error) {
+	if h.gf == nil {
+		return nil, noFirecracker(rootdpb.FeatureSetGuestNodeGuard)
+	}
+	resp, err := h.gf.setNodeGuard(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SetGuestNodeGuard_FullMethodName, resp, err)
+}
+
+func (h helper) SetGuestEgressFloor(ctx context.Context, req *rootdpb.SetEgressFloorRequest) (*rootdpb.SetEgressFloorResponse, error) {
+	if h.gf == nil {
+		return nil, noFirecracker(rootdpb.FeatureSetGuestEgressFloor)
+	}
+	resp, err := h.gf.setFloor(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_SetGuestEgressFloor_FullMethodName, resp, err)
+}
+
+func (h helper) GuestRules(ctx context.Context, req *rootdpb.GuestRulesRequest) (*rootdpb.GuestRulesResponse, error) {
+	if h.gf == nil {
+		return nil, noFirecracker(rootdpb.FeatureGuestRules)
+	}
+	resp, err := h.gf.rules(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_GuestRules_FullMethodName, resp, err)
+}
+
+func (h helper) ShareFirecrackerFiles(ctx context.Context, req *rootdpb.FirecrackerFilesRequest) (*rootdpb.FirecrackerFilesResponse, error) {
+	if h.hc.firecracker() == nil {
+		return nil, noFirecracker(rootdpb.FeatureShareFirecrackerFiles)
+	}
+	resp, err := h.hc.shareFirecrackerFiles(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_ShareFirecrackerFiles_FullMethodName, resp, err)
+}
+
+func (h helper) HandOutFirecrackerFiles(ctx context.Context, req *rootdpb.FirecrackerFilesRequest) (*rootdpb.FirecrackerFilesResponse, error) {
+	if h.hc.firecracker() == nil {
+		return nil, noFirecracker(rootdpb.FeatureHandOutFirecrackerFiles)
+	}
+	resp, err := h.hc.handOutFirecrackerFiles(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_HandOutFirecrackerFiles_FullMethodName, resp, err)
 }
 
 // noFirecracker answers a Firecracker call on a helper whose settings run
