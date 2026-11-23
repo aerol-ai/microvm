@@ -128,6 +128,9 @@ containers:
         find "$shared" -mindepth 1 -maxdepth 1 ! -name agent -exec rm -rf {} +
         if [ -L "$shared/agent" ] || { [ -e "$shared/agent" ] && [ ! -d "$shared/agent" ]; }; then rm -rf "$shared/agent"; fi
         install -d -o 65531 -g 65531 -m 0700 "$shared/agent"
+        # The CNI plugins' address records: the helper trusts that folder
+        # only when no one else can write it either.
+        chmod 0755 /var/lib/cni
         chown 65531:65531 /var/lib/sandboxd
         {{- if $splitMounts }}
         if ! getent passwd aerolvm-mounts >/dev/null; then
@@ -306,8 +309,15 @@ containers:
         # by rename: running sandboxes keep the copy they started with.
         cp /usr/local/bin/toolboxd /opt/aerolvm/toolbox/.toolboxd.new
         mv -f /opt/aerolvm/toolbox/.toolboxd.new /opt/aerolvm/toolbox/toolboxd
+        {{- if $split }}
+        # /run/sandboxd is the volume's own folder, root's; only this
+        # container mounts it in split.
+        mkdir -p /var/lib/sandboxd/mounts
+        chmod 0700 /var/lib/sandboxd/mounts
+        {{- else }}
         mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
         chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+        {{- end }}
         {{- if $root.Values.edge.enabled }}
         # Caddy's admin API first, as systemd orders the two on a VM:
         # sandboxd sets caddy-l4 up on :443 when it starts, and after a
