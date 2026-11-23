@@ -48,15 +48,17 @@ func SlotAt(baseCIDR string, poolSize, index int) (Slot, error) {
 	if 4*poolSize > 1<<(32-p.Bits()) {
 		return Slot{}, fmt.Errorf("tap slot: base %s holds fewer than %d slots", baseCIDR, poolSize)
 	}
-	// MaxPoolSize also bounds index on its own, before it narrows to a
-	// uint32 below.
+	// MaxPoolSize also bounds index on its own, and index narrows to a
+	// uint32 right after it, outside the closure below: code scanning
+	// (go/incorrect-integer-conversion) carries no bound into a closure.
 	if index < 0 || index >= poolSize || index >= MaxPoolSize {
 		return Slot{}, fmt.Errorf("tap slot: index %d is outside the pool of %d", index, poolSize)
 	}
+	slot := uint32(index)
 	base := p.Masked().Addr().As4()
 	v := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
 	at := func(delta uint32) netip.Addr {
-		n := v + 4*uint32(index) + delta
+		n := v + 4*slot + delta
 		return netip.AddrFrom4([4]byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)})
 	}
 	return Slot{
@@ -64,7 +66,7 @@ func SlotAt(baseCIDR string, poolSize, index int) (Slot, error) {
 		CIDR:     at(0).String() + "/30",
 		HostIP:   at(1).String(),
 		GuestIP:  at(2).String(),
-		VsockCID: firstVsockCID + uint32(index),
+		VsockCID: firstVsockCID + slot,
 	}, nil
 }
 
@@ -81,9 +83,20 @@ func IndexOf(name string, poolSize int) (int, bool) {
 			return 0, false
 		}
 	}
-	n, err := strconv.Atoi(digits)
-	if err != nil || n >= poolSize || poolSize > MaxPoolSize {
+	n, ok := parseIndex(digits)
+	if !ok || n >= poolSize || poolSize > MaxPoolSize {
 		return 0, false
 	}
 	return n, true
+}
+
+// parseIndex reads a TAP index's decimal digits into at most 16 bits. Every
+// index is below MaxPoolSize, so the bound refuses no pool's TAP; it is the
+// parse's own, so the index plainly fits the uint32 SlotAt narrows it to.
+func parseIndex(digits string) (int, bool) {
+	n, err := strconv.ParseUint(digits, 10, 16)
+	if err != nil {
+		return 0, false
+	}
+	return int(n), true
 }

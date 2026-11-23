@@ -45,3 +45,18 @@ func TestIndexOf(t *testing.T) {
 		t.Error("a pool past the cap")
 	}
 }
+
+// TestParseIndex: an index's digits parse into 16 bits at most, so none
+// can wrap when SlotAt narrows it.
+func TestParseIndex(t *testing.T) {
+	for digits, want := range map[string]int{"0": 0, "9999": 9999, "65535": 65535} {
+		if got, ok := parseIndex(digits); !ok || got != want {
+			t.Errorf("parseIndex(%q) = %d %v, want %d", digits, got, ok, want)
+		}
+	}
+	for _, digits := range []string{"65536", "99999", "4294967296", "-1", "+1", "", "1_0"} {
+		if got, ok := parseIndex(digits); ok {
+			t.Errorf("parseIndex(%q) = %d, want none", digits, got)
+		}
+	}
+}
