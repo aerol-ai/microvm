@@ -90,6 +90,26 @@ func (m Mounts) Ready() error {
 	return fmt.Errorf("the root helper %s serves no external storage mounts (its node has no mount user, SB_ROOTD_MOUNT_USER, or the helper is older than this agent)", info.HelperVersion)
 }
 
+// WasmReady says why the helper cannot lend a WASM sandbox's mount points
+// to its worker: one whose handshake lists no GrantWasmMounts (older than
+// this agent, or with no WASM hosts or no mount user in its settings). It
+// shakes hands first if it must, so a mount is never made for a worker
+// that could not be lent it. A helper that lacks the call is the node's
+// setup, answered as a node without external storage (501); one that does
+// not answer is unavailable (503), as for any call.
+func (m Mounts) WasmReady(ctx context.Context) error {
+	c := m.client()
+	if c == nil {
+		return errNoClient
+	}
+	err := c.Require(ctx, rootdpb.FeatureGrantWasmMounts)
+	var unsupported *UnsupportedError
+	if errors.As(err, &unsupported) {
+		return fmt.Errorf("%w: %v", mounts.ErrMountsUnavailable, err)
+	}
+	return err
+}
+
 // Mount checks specs with the helper's own rules before it sends them
 // (rootpolicy.CheckExternalMounts): what this agent would send and the
 // helper refuse is the caller's error, answered as one, never sent to

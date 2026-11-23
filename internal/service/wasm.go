@@ -36,8 +36,9 @@ func (s *Service) wasmMountCtx(ctx context.Context) context.Context {
 	if s.cfg.PrivilegeMode == privmode.Split && s.cfg.WasmWorkerDropPrivs {
 		// In split mode sandboxd is not root, yet every worker drops to the
 		// worker user: the root helper starts it (M1 PR 9). Naming that
-		// consumer is what makes the helper-backed mount manager refuse the
-		// mounts before mounting anything (pkg/mounts remoteMount).
+		// consumer is what makes the helper-backed mount manager check,
+		// before mounting anything, that the helper lends mount points to
+		// WASM hosts (pkg/mounts remoteMount, M1 PR 15).
 		c = worker.Confinement{UID: s.cfg.WasmWorkerUID, GID: s.cfg.WasmWorkerGID}
 	}
 	if !c.Enabled() {

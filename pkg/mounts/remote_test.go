@@ -3,6 +3,7 @@ package mounts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -15,12 +16,13 @@ import (
 
 // fakeRemote is the root helper's mount calls, in memory.
 type fakeRemote struct {
-	mu    sync.Mutex
-	calls []string
-	keep  []string
-	err   error
-	ready error
-	had   bool
+	mu        sync.Mutex
+	calls     []string
+	keep      []string
+	err       error
+	ready     error
+	wasmReady error
+	had       bool
 }
 
 func (f *fakeRemote) Mount(_ context.Context, id string, mode RemoteMode, specs []models.MountSpec) (RemoteResult, error) {
@@ -60,6 +62,13 @@ func (f *fakeRemote) Sweep(_ context.Context, keep []string) error {
 }
 
 func (f *fakeRemote) Ready() error { return f.ready }
+
+func (f *fakeRemote) WasmReady(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "WasmReady")
+	return f.wasmReady
+}
 
 func remoteSpecs() []models.MountSpec {
 	return []models.MountSpec{{Type: models.MountTypeNFS, Target: "/share", Source: "h:/e"}}
@@ -127,6 +136,35 @@ func TestRemoteManager(t *testing.T) {
 	m.Close()
 }
 
+// TestRemoteWasmMounts: in split mode a WASM sandbox's mounts are made by
+// the helper once it says it lends mount points to WASM hosts, and every
+// mount point it answers is marked lent: sandboxd never opens one (M1 PR
+// 15). A container's mount points are marked so too; its runtime binds
+// them as before.
+func TestRemoteWasmMounts(t *testing.T) {
+	f := &fakeRemote{}
+	m := newRemoteManager(t, f, "")
+	ctx := WithConsumer(context.Background(), Consumer{UID: 9, GID: 9})
+	binds, err := m.MountAll(ctx, "sb-1", remoteSpecs())
+	if err != nil || len(binds) != 1 || !binds[0].Lent {
+		t.Fatalf("%+v %v", binds, err)
+	}
+	if got := m.HostBindsFor("sb-1"); len(got) != 1 || !got[0].Lent {
+		t.Fatalf("HostBindsFor %+v", got)
+	}
+	if r, err := m.KeepLive(ctx, "sb-1", remoteSpecs()); err != nil || len(r.Kept) != 1 || !m.HostBindsFor("sb-1")[0].Lent {
+		t.Fatalf("KeepLive %+v %v", r, err)
+	}
+	if !slices.Equal(f.calls, []string{"WasmReady", "Mount sb-1 +", "WasmReady", "Mount sb-1 +++"}) {
+		t.Fatalf("calls %v", f.calls)
+	}
+	// A container's: no WASM check.
+	f.calls = nil
+	if binds, err := m.MountAll(context.Background(), "sb-2", remoteSpecs()); err != nil || !binds[0].Lent || slices.Contains(f.calls, "WasmReady") {
+		t.Fatalf("container %+v %v %v", binds, err, f.calls)
+	}
+}
+
 func TestRemoteManagerFailures(t *testing.T) {
 	f := &fakeRemote{err: errors.New("helper down")}
 	m := newRemoteManager(t, f, "")
@@ -140,12 +178,13 @@ func TestRemoteManagerFailures(t *testing.T) {
 		t.Fatal("Discard")
 	}
 	m.Sweep(nil) // logged
-	// A WASM worker's mounts: refused before the helper mounts anything, as
-	// the node's setting (501), not a failure.
+	// A WASM worker's mounts on a helper that lends none to WASM hosts:
+	// refused before the helper mounts anything, with the helper's reason.
+	f.wasmReady = fmt.Errorf("%w: no loans", ErrMountsUnavailable)
 	calls := len(f.calls)
-	if _, err := m.MountAll(WithConsumer(context.Background(), Consumer{UID: 9, GID: 9}), "sb-1", remoteSpecs()); err == nil ||
-		!strings.Contains(err.Error(), "WASM") || !errors.Is(err, models.ErrRuntimeNotImplemented) || len(f.calls) != calls {
-		t.Fatalf("consumer: %v (helper calls %d, were %d)", err, len(f.calls), calls)
+	if _, err := m.MountAll(WithConsumer(context.Background(), Consumer{UID: 9, GID: 9}), "sb-1", remoteSpecs()); !errors.Is(err, ErrMountsUnavailable) ||
+		len(f.calls) != calls+1 || f.calls[calls] != "WasmReady" {
+		t.Fatalf("consumer: %v (helper calls %v)", err, f.calls[calls:])
 	}
 
 	off := newRemoteManager(t, &fakeRemote{}, "the node says no")

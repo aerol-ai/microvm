@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
 // lendHelper serves GrantWasmMounts, when it lists it, recording each
@@ -41,7 +42,7 @@ func serveLend(t *testing.T, sock string, l *lendHelper) {
 
 // TestGrantWasmMountsClient: the agent asks the helper to lend a sandbox's
 // mount points to the host that serves it, by kind and id, and a helper
-// that lacks the call is told apart.
+// that lacks the call is told apart, as a node without the feature.
 func TestGrantWasmMountsClient(t *testing.T) {
 	sock := sockPath(t)
 	l := &lendHelper{fakeHelper: *helperAt(rootdpb.APIVersion, rootdpb.FeatureGrantWasmMounts, rootdpb.FeatureMountExternal)}
@@ -56,6 +57,9 @@ func TestGrantWasmMountsClient(t *testing.T) {
 		l.reqs[0].GetHostId() != "o0123456789abcdef-b" {
 		t.Fatalf("requests %v", l.reqs)
 	}
+	if err := (Mounts{Client: func() *Client { return c }}).WasmReady(ctx); err != nil {
+		t.Fatalf("WasmReady: %v", err)
+	}
 
 	// A helper one release back, with mounts and no loans.
 	old := sockPath(t)
@@ -63,5 +67,18 @@ func TestGrantWasmMountsClient(t *testing.T) {
 	oc := newClient(t, old)
 	if _, err := oc.GrantWasmMounts(ctx, "sb-1", rootdpb.HostKind_HOST_KIND_WASM_WORKER, "sb-1"); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("an older helper: %v", err)
+	}
+	err = (Mounts{Client: func() *Client { return oc }}).WasmReady(ctx)
+	if !errors.Is(err, mounts.ErrMountsUnavailable) {
+		t.Fatalf("WasmReady on an older helper: %v", err)
+	}
+	// No client yet: unavailable, never a node setting.
+	if err := (Mounts{}).WasmReady(ctx); !errors.Is(err, ErrUnavailable) || errors.Is(err, mounts.ErrMountsUnavailable) {
+		t.Fatalf("no client: %v", err)
+	}
+	// A helper that is down: unavailable too.
+	down := newClient(t, sockPath(t)+".none")
+	if err := (Mounts{Client: func() *Client { return down }}).WasmReady(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a helper that is down: %v", err)
 	}
 }

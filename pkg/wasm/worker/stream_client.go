@@ -61,6 +61,10 @@ func (c *Client) StartExec(ctx context.Context, sandboxID string, p ExecStartPay
 	if err != nil {
 		return nil, err
 	}
+	grants, lent := lentGrants(p.Caps, preopenPaths(p.Caps))
+	if err := c.lend(ctx, lent, sandboxID); err != nil {
+		return nil, err
+	}
 	conn, err := c.dialContext(ctx)
 	if err != nil {
 		return nil, err
@@ -80,7 +84,7 @@ func (c *Client) StartExec(ctx context.Context, sandboxID string, p ExecStartPay
 	}
 	reply, err := func() (Envelope, error) {
 		// The run's /work and mounts, and a language runtime module.
-		grants := append(preopenPaths(p.Caps), p.ModulePath)
+		grants := append(grants, p.ModulePath)
 		if err := writeGranted(conn, Envelope{Type: MsgExecStart, SandboxID: sandboxID, Payload: body}, grants); err != nil {
 			return Envelope{}, err
 		}

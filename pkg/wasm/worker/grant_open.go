@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,11 @@ type GrantPolicy struct {
 	// Worker is the uid/gid workers drop to. Without it, workers run as
 	// sandboxd and paths are opened as they always were.
 	Worker Confinement
+	// Lend has the root helper lend the worker serving socket the folders
+	// it keeps for sandboxID: in privilege mode split, the sandbox's mount
+	// points, which sandboxd cannot reach (lend.go). Nil in single mode,
+	// where no folder is lent.
+	Lend func(ctx context.Context, sandboxID, socket string) error
 }
 
 var grantPolicy atomic.Pointer[GrantPolicy]

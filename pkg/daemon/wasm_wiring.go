@@ -89,10 +89,16 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// each is opened from its folder one name at a time, never following a
 	// link, and refused through a folder a worker could write
 	// (worker.GrantPolicy).
-	worker.SetGrantPolicy(worker.GrantPolicy{
+	grants := worker.GrantPolicy{
 		Roots:  []string{cfg.WasmRunDir, cfg.WasmModulesDir, resolver.CacheDir, cfg.MountsRootPath, effectiveWasmCompileCacheDir(cfg)},
 		Worker: confine,
-	})
+	}
+	if lender, ok := hosts.(mountLender); ok {
+		// A sandbox's external mounts are the helper's: it lends their
+		// mount points to the worker (M1 PR 15).
+		grants.Lend = splitMountLender(lender, cfg.RootdWasmSocketDir)
+	}
+	worker.SetGrantPolicy(grants)
 	resolver.Auth = wasmmod.ModuleAuth{
 		Username: cfg.WasmRegistryUsername,
 		PATPath:  cfg.WasmRegistryPATPath,

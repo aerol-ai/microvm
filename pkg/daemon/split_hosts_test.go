@@ -64,7 +64,41 @@ func (f *fakeHostHelper) OpenHost(_ context.Context, _ rootdpb.HostKind, id stri
 	return f.held, f.err
 }
 
+func (f *fakeHostHelper) GrantWasmMounts(_ context.Context, sandboxID string, kind rootdpb.HostKind, hostID string) (int, error) {
+	f.note("lend " + sandboxID + " " + rootdpb.HostKindName(kind) + " " + hostID)
+	return 1, f.err
+}
+
 func fmtU(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// TestSplitMountLender: sandboxd names the host to lend a sandbox's mounts
+// to by the socket it dials, which must be one the helper serves a WASM
+// host on.
+func TestSplitMountLender(t *testing.T) {
+	f := &fakeHostHelper{}
+	lend := splitMountLender(f, "/run/aerolvm-rootd/wasm")
+	ctx := context.Background()
+	for _, sock := range []string{"/run/aerolvm-rootd/wasm/w-sb-1.sock", "/run/aerolvm-rootd/wasm/r-o0123456789abcdef-b.sock"} {
+		if err := lend(ctx, "sb-1", sock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !slices.Equal(f.calls, []string{"lend sb-1 wasm_worker sb-1", "lend sb-1 wasm_resident o0123456789abcdef-b"}) {
+		t.Fatalf("calls %v", f.calls)
+	}
+	for _, bad := range []string{"/var/lib/sandboxd/wasm/run/sockets/sb-1.sock", "/run/aerolvm-rootd/wasm/w-../x.sock", "/run/aerolvm-rootd/wasm/x.sock"} {
+		if err := lend(ctx, "sb-1", bad); err == nil {
+			t.Errorf("lent through %s", bad)
+		}
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("calls %v", f.calls)
+	}
+	f.err = errors.New("helper down")
+	if err := lend(ctx, "sb-1", "/run/aerolvm-rootd/wasm/w-sb-1.sock"); !errors.Is(err, f.err) {
+		t.Fatalf("lend = %v", err)
+	}
+}
 
 func TestSplitWorkerdLauncher(t *testing.T) {
 	ctx := context.Background()
