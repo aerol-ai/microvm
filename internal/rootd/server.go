@@ -573,6 +573,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	if h.gf != nil {
 		served = append(served, guestFeatures...)
 	}
+	if h.hc.firecracker() != nil {
+		served = append(served, firecrackerFileFeatures...)
+	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
 		Hosts: h.hc.servedKinds()}, nil
 }
@@ -930,6 +933,22 @@ func (h helper) GuestRules(ctx context.Context, req *rootdpb.GuestRulesRequest) 
 	}
 	resp, err := h.gf.rules(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_GuestRules_FullMethodName, resp, err)
+}
+
+func (h helper) ShareFirecrackerFiles(ctx context.Context, req *rootdpb.FirecrackerFilesRequest) (*rootdpb.FirecrackerFilesResponse, error) {
+	if h.hc.firecracker() == nil {
+		return nil, noFirecracker(rootdpb.FeatureShareFirecrackerFiles)
+	}
+	resp, err := h.hc.shareFirecrackerFiles(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_ShareFirecrackerFiles_FullMethodName, resp, err)
+}
+
+func (h helper) HandOutFirecrackerFiles(ctx context.Context, req *rootdpb.FirecrackerFilesRequest) (*rootdpb.FirecrackerFilesResponse, error) {
+	if h.hc.firecracker() == nil {
+		return nil, noFirecracker(rootdpb.FeatureHandOutFirecrackerFiles)
+	}
+	resp, err := h.hc.handOutFirecrackerFiles(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_HandOutFirecrackerFiles_FullMethodName, resp, err)
 }
 
 // noFirecracker answers a Firecracker call on a helper whose settings run

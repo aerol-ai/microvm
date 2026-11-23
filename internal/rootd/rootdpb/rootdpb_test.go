@@ -181,7 +181,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.PrepareHostRequest":          {"kind=1:enum", "id=2:string", "firecracker=3:message"},
 		"aerolvm.rootd.v1.PrepareHostResponse":         {"run_dir=1:string", "stage_dir=2:string"},
 		"aerolvm.rootd.v1.FirecrackerHostSpec":         {"stage=1:repeated string"},
-		"aerolvm.rootd.v1.EnsureTapRequest":            {"name=1:string"},
+		"aerolvm.rootd.v1.EnsureTapRequest":            {"name=1:string", "guest_cid=2:uint32"},
 		"aerolvm.rootd.v1.EnsureTapResponse":           {"cidr=1:string", "host_ip=2:string", "guest_ip=3:string", "vsock_cid=4:uint32"},
 		"aerolvm.rootd.v1.RemoveTapRequest":            {"name=1:string"},
 		"aerolvm.rootd.v1.RemoveTapResponse":           nil,
@@ -201,6 +201,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.EnsureGuestFirewallResponse": nil,
 		"aerolvm.rootd.v1.GuestRulesRequest":           {"guest_ip=1:string", "op=2:enum", "allow_cidrs=3:repeated string", "deny_cidrs=4:repeated string"},
 		"aerolvm.rootd.v1.GuestRulesResponse":          {"inserted=1:bool"},
+		"aerolvm.rootd.v1.FirecrackerFilesRequest":     {"id=1:string", "names=2:repeated string"},
+		"aerolvm.rootd.v1.FirecrackerFilesResponse":    nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {

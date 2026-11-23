@@ -31,42 +31,44 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RootHelper_Version_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/Version"
-	RootHelper_EnsureHost_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/EnsureHost"
-	RootHelper_EnsureHostFiles_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/EnsureHostFiles"
-	RootHelper_EnsureTaskFIFOs_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/EnsureTaskFIFOs"
-	RootHelper_EnsureRunscConfig_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureRunscConfig"
-	RootHelper_EnsureReadySocket_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureReadySocket"
-	RootHelper_RemoveContainerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/RemoveContainerFiles"
-	RootHelper_EnsureHostNetwork_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/EnsureHostNetwork"
-	RootHelper_RealizeNetns_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/RealizeNetns"
-	RootHelper_RemoveNetns_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/RemoveNetns"
-	RootHelper_DisableNetnsIPv6_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/DisableNetnsIPv6"
-	RootHelper_NetnsAddrs_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/NetnsAddrs"
-	RootHelper_SetNodeGuard_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/SetNodeGuard"
-	RootHelper_SetEgressFloor_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/SetEgressFloor"
-	RootHelper_SandboxRules_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/SandboxRules"
-	RootHelper_PrepareSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/PrepareSandbox"
-	RootHelper_ReleaseSandbox_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/ReleaseSandbox"
-	RootHelper_BridgeProbe_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/BridgeProbe"
-	RootHelper_MatchProcess_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/MatchProcess"
-	RootHelper_HostPort_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/HostPort"
-	RootHelper_MountExternal_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/MountExternal"
-	RootHelper_UnmountExternal_FullMethodName      = "/aerolvm.rootd.v1.RootHelper/UnmountExternal"
-	RootHelper_SweepExternalMounts_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SweepExternalMounts"
-	RootHelper_ReclaimVolume_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/ReclaimVolume"
-	RootHelper_PrepareHost_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/PrepareHost"
-	RootHelper_SpawnHost_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/SpawnHost"
-	RootHelper_StopHost_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/StopHost"
-	RootHelper_ListHosts_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/ListHosts"
-	RootHelper_SetHostLimits_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/SetHostLimits"
-	RootHelper_EnsureTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/EnsureTap"
-	RootHelper_RemoveTap_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/RemoveTap"
-	RootHelper_MakeFilesystem_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/MakeFilesystem"
-	RootHelper_EnsureGuestFirewall_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/EnsureGuestFirewall"
-	RootHelper_SetGuestNodeGuard_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/SetGuestNodeGuard"
-	RootHelper_SetGuestEgressFloor_FullMethodName  = "/aerolvm.rootd.v1.RootHelper/SetGuestEgressFloor"
-	RootHelper_GuestRules_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/GuestRules"
+	RootHelper_Version_FullMethodName                 = "/aerolvm.rootd.v1.RootHelper/Version"
+	RootHelper_EnsureHost_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/EnsureHost"
+	RootHelper_EnsureHostFiles_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/EnsureHostFiles"
+	RootHelper_EnsureTaskFIFOs_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/EnsureTaskFIFOs"
+	RootHelper_EnsureRunscConfig_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/EnsureRunscConfig"
+	RootHelper_EnsureReadySocket_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/EnsureReadySocket"
+	RootHelper_RemoveContainerFiles_FullMethodName    = "/aerolvm.rootd.v1.RootHelper/RemoveContainerFiles"
+	RootHelper_EnsureHostNetwork_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/EnsureHostNetwork"
+	RootHelper_RealizeNetns_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/RealizeNetns"
+	RootHelper_RemoveNetns_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/RemoveNetns"
+	RootHelper_DisableNetnsIPv6_FullMethodName        = "/aerolvm.rootd.v1.RootHelper/DisableNetnsIPv6"
+	RootHelper_NetnsAddrs_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/NetnsAddrs"
+	RootHelper_SetNodeGuard_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/SetNodeGuard"
+	RootHelper_SetEgressFloor_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/SetEgressFloor"
+	RootHelper_SandboxRules_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/SandboxRules"
+	RootHelper_PrepareSandbox_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/PrepareSandbox"
+	RootHelper_ReleaseSandbox_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/ReleaseSandbox"
+	RootHelper_BridgeProbe_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/BridgeProbe"
+	RootHelper_MatchProcess_FullMethodName            = "/aerolvm.rootd.v1.RootHelper/MatchProcess"
+	RootHelper_HostPort_FullMethodName                = "/aerolvm.rootd.v1.RootHelper/HostPort"
+	RootHelper_MountExternal_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/MountExternal"
+	RootHelper_UnmountExternal_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/UnmountExternal"
+	RootHelper_SweepExternalMounts_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/SweepExternalMounts"
+	RootHelper_ReclaimVolume_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/ReclaimVolume"
+	RootHelper_PrepareHost_FullMethodName             = "/aerolvm.rootd.v1.RootHelper/PrepareHost"
+	RootHelper_SpawnHost_FullMethodName               = "/aerolvm.rootd.v1.RootHelper/SpawnHost"
+	RootHelper_StopHost_FullMethodName                = "/aerolvm.rootd.v1.RootHelper/StopHost"
+	RootHelper_ListHosts_FullMethodName               = "/aerolvm.rootd.v1.RootHelper/ListHosts"
+	RootHelper_SetHostLimits_FullMethodName           = "/aerolvm.rootd.v1.RootHelper/SetHostLimits"
+	RootHelper_EnsureTap_FullMethodName               = "/aerolvm.rootd.v1.RootHelper/EnsureTap"
+	RootHelper_RemoveTap_FullMethodName               = "/aerolvm.rootd.v1.RootHelper/RemoveTap"
+	RootHelper_MakeFilesystem_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/MakeFilesystem"
+	RootHelper_EnsureGuestFirewall_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/EnsureGuestFirewall"
+	RootHelper_SetGuestNodeGuard_FullMethodName       = "/aerolvm.rootd.v1.RootHelper/SetGuestNodeGuard"
+	RootHelper_SetGuestEgressFloor_FullMethodName     = "/aerolvm.rootd.v1.RootHelper/SetGuestEgressFloor"
+	RootHelper_GuestRules_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/GuestRules"
+	RootHelper_ShareFirecrackerFiles_FullMethodName   = "/aerolvm.rootd.v1.RootHelper/ShareFirecrackerFiles"
+	RootHelper_HandOutFirecrackerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/HandOutFirecrackerFiles"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -219,6 +221,21 @@ type RootHelperClient interface {
 	SetGuestEgressFloor(ctx context.Context, in *SetEgressFloorRequest, opts ...grpc.CallOption) (*SetEgressFloorResponse, error)
 	// GuestRules changes one guest address's rules.
 	GuestRules(ctx context.Context, in *GuestRulesRequest, opts ...grpc.CallOption) (*GuestRulesResponse, error)
+	// ShareFirecrackerFiles links files the agent built in the VM's stage
+	// folder into its chroot, read-only for the jailer's user: a snapshot's
+	// memory and state, and a template's root disk, which a snapshot load
+	// attaches read-only. Each must be the agent's own regular file; it
+	// stays the agent's, with the jailer's group and mode 0640. The VM's
+	// process must run (a chroot is made again from nothing before it
+	// starts).
+	ShareFirecrackerFiles(ctx context.Context, in *FirecrackerFilesRequest, opts ...grpc.CallOption) (*FirecrackerFilesResponse, error)
+	// HandOutFirecrackerFiles lets the agent's group read files in the VM's
+	// chroot that the VM made or writes: a snapshot's memory and state, its
+	// disks. Each must be a regular file of the jailer's user with one name
+	// (or one the helper shared, which is the agent's already); the helper
+	// sets its group to the agent's and its mode to 0640. The agent copies
+	// it out, with checks of its own.
+	HandOutFirecrackerFiles(ctx context.Context, in *FirecrackerFilesRequest, opts ...grpc.CallOption) (*FirecrackerFilesResponse, error)
 }
 
 type rootHelperClient struct {
@@ -589,6 +606,26 @@ func (c *rootHelperClient) GuestRules(ctx context.Context, in *GuestRulesRequest
 	return out, nil
 }
 
+func (c *rootHelperClient) ShareFirecrackerFiles(ctx context.Context, in *FirecrackerFilesRequest, opts ...grpc.CallOption) (*FirecrackerFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirecrackerFilesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_ShareFirecrackerFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) HandOutFirecrackerFiles(ctx context.Context, in *FirecrackerFilesRequest, opts ...grpc.CallOption) (*FirecrackerFilesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FirecrackerFilesResponse)
+	err := c.cc.Invoke(ctx, RootHelper_HandOutFirecrackerFiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -739,6 +776,21 @@ type RootHelperServer interface {
 	SetGuestEgressFloor(context.Context, *SetEgressFloorRequest) (*SetEgressFloorResponse, error)
 	// GuestRules changes one guest address's rules.
 	GuestRules(context.Context, *GuestRulesRequest) (*GuestRulesResponse, error)
+	// ShareFirecrackerFiles links files the agent built in the VM's stage
+	// folder into its chroot, read-only for the jailer's user: a snapshot's
+	// memory and state, and a template's root disk, which a snapshot load
+	// attaches read-only. Each must be the agent's own regular file; it
+	// stays the agent's, with the jailer's group and mode 0640. The VM's
+	// process must run (a chroot is made again from nothing before it
+	// starts).
+	ShareFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error)
+	// HandOutFirecrackerFiles lets the agent's group read files in the VM's
+	// chroot that the VM made or writes: a snapshot's memory and state, its
+	// disks. Each must be a regular file of the jailer's user with one name
+	// (or one the helper shared, which is the agent's already); the helper
+	// sets its group to the agent's and its mode to 0640. The agent copies
+	// it out, with checks of its own.
+	HandOutFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -856,6 +908,12 @@ func (UnimplementedRootHelperServer) SetGuestEgressFloor(context.Context, *SetEg
 }
 func (UnimplementedRootHelperServer) GuestRules(context.Context, *GuestRulesRequest) (*GuestRulesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GuestRules not implemented")
+}
+func (UnimplementedRootHelperServer) ShareFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ShareFirecrackerFiles not implemented")
+}
+func (UnimplementedRootHelperServer) HandOutFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method HandOutFirecrackerFiles not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1526,6 +1584,42 @@ func _RootHelper_GuestRules_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_ShareFirecrackerFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirecrackerFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).ShareFirecrackerFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_ShareFirecrackerFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).ShareFirecrackerFiles(ctx, req.(*FirecrackerFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_HandOutFirecrackerFiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FirecrackerFilesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).HandOutFirecrackerFiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_HandOutFirecrackerFiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).HandOutFirecrackerFiles(ctx, req.(*FirecrackerFilesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1676,6 +1770,14 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GuestRules",
 			Handler:    _RootHelper_GuestRules_Handler,
+		},
+		{
+			MethodName: "ShareFirecrackerFiles",
+			Handler:    _RootHelper_ShareFirecrackerFiles_Handler,
+		},
+		{
+			MethodName: "HandOutFirecrackerFiles",
+			Handler:    _RootHelper_HandOutFirecrackerFiles_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

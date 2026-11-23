@@ -223,7 +223,8 @@ func TestVersion(t *testing.T) {
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
 		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
 			slices.Contains(hostPortFeatures, f) || slices.Contains(mountFeatures, f) || f == rootdpb.FeatureReclaimVolume ||
-			slices.Contains(hostFeatures, f) || slices.Contains(tapFeatures, f) || slices.Contains(guestFeatures, f)
+			slices.Contains(hostFeatures, f) || slices.Contains(tapFeatures, f) || slices.Contains(guestFeatures, f) ||
+			slices.Contains(firecrackerFileFeatures, f)
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -247,6 +248,7 @@ func TestVersion(t *testing.T) {
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 		served = append(append(append(served, egressFeatures...), hostPortFeatures...), mountFeatures...)
 		served = append(append(append(append(served, rootdpb.FeatureReclaimVolume), hostFeatures...), tapFeatures...), guestFeatures...)
+		served = append(served, firecrackerFileFeatures...)
 		// No cgroup parent here: no cgroup part. Every helper serves the
 		// container's files part (M1 PR 7).
 		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall, rootdpb.PartFiles}
