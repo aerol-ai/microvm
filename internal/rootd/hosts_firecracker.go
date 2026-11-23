@@ -35,11 +35,20 @@ import (
 // put there could send root's write anywhere. PrepareHost moves each disk
 // the agent built from stage/ into root/ (a link of the very file it
 // checked: the agent's own, with one name) and gives it to the jailer's
-// user; the kernel is the helper's own file. The firecracker process runs
-// with umask 027 in a setgid chroot, so what it makes there comes out the
-// agent's group's to read, never to write; the helper gives the API socket
-// to that group once it is bound, and PrepareHost on a running VM gives
-// both sockets.
+// user; the kernel is the helper's own file.
+//
+// Nor does a used chroot meet the jailer again. firecracker runs as the
+// jailer's user, who owns root/, and could leave a link there: the jailer
+// copies firecracker in by its name, as root, and would write through it.
+// So whenever no process runs in the VM's group, PrepareHost and
+// SpawnHost make root/ again from nothing (openJail's fresh); a running
+// VM's jail is never touched. stage/ is kept: it is the agent's, and
+// nothing in it reaches the chroot but a disk stageDisk checked.
+//
+// The firecracker process runs with umask 027 in a setgid chroot, so what
+// it makes there comes out the agent's group's to read, never to write;
+// the helper gives the API socket to that group once it is bound, and
+// PrepareHost on a running VM gives both sockets.
 type firecrackerHosts struct {
 	cfg *FirecrackerHostsConfig
 	// log is the hosts' output file; agentGID the agent's group.
@@ -88,8 +97,9 @@ func (f *firecrackerHosts) jail(id string) (dir, root, stage string, err error) 
 // openJail opens (making what is missing) the VM's jail folder and its
 // two folders, each owned and moded as the jail's layout says: the
 // folders above, root's alone; stage/, the agent's; root/, the jailer's
-// user's with the agent's group.
-func (f *firecrackerHosts) openJail(id string) (stage, root *os.File, err error) {
+// user's with the agent's group. fresh removes root/ and all it holds
+// first, for a VM with no process in its group (freshChroot).
+func (f *firecrackerHosts) openJail(id string, fresh bool) (stage, root *os.File, err error) {
 	dir, _, _, err := f.jail(id)
 	if err != nil {
 		return nil, nil, err
@@ -109,6 +119,9 @@ func (f *firecrackerHosts) openJail(id string) (stage, root *os.File, err error)
 			if err == nil {
 				stage, err = f.subFolder(fd, "stage", int(agent), f.agentGID, 0o700)
 			}
+			if err == nil && fresh {
+				err = freshChroot(dir)
+			}
 			if err == nil {
 				root, err = f.subFolder(fd, "root", f.cfg.UID, f.agentGID, 0o2750)
 			}
@@ -122,6 +135,18 @@ func (f *firecrackerHosts) openJail(id string) (stage, root *os.File, err error)
 		}
 	}
 	return stage, root, nil
+}
+
+// freshChroot removes a stopped VM's chroot, dir/root, and all it holds.
+// The folders down to dir are root's alone (openJail has just opened and
+// checked them), and os.RemoveAll opens nothing below dir through a link,
+// so the jailer's user can send the removal nowhere else. openJail then
+// makes root/ again, empty.
+func freshChroot(dir string) error {
+	if err := os.RemoveAll(filepath.Join(dir, "root")); err != nil {
+		return fmt.Errorf("remove the used chroot: %w", err)
+	}
+	return nil
 }
 
 // subFolder makes (when missing) and opens the folder name in the jail
@@ -156,7 +181,9 @@ func (f *firecrackerHosts) prepare(id string, running bool, req *rootdpb.Prepare
 	if err != nil {
 		return nil, err
 	}
-	stage, root, err := f.openJail(id)
+	// A VM whose group is empty gets a chroot made again from nothing; a
+	// running VM's is left as it is.
+	stage, root, err := f.openJail(id, !running)
 	if err != nil {
 		return nil, err
 	}
@@ -345,19 +372,28 @@ func (f *firecrackerHosts) shareSocket(root int, name string) error {
 	return chmodPath(fd, f.agentGID, 0o660)
 }
 
+// command runs only when no process runs in the VM's group (spawnHost
+// checks under the VM's lock), so the jailer always gets a chroot made
+// again from nothing, with the helper's kernel and no name a VM before it
+// left there: not even an old API socket, which firecracker will not bind
+// over.
 func (f *firecrackerHosts) command(_ context.Context, id string, _ *rootdpb.SpawnHostRequest) (*exec.Cmd, func(), error) {
-	stage, root, err := f.openJail(id)
+	dir, _, _, err := f.jail(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	fd, err := openFolderNoMake(dir)
+	if err != nil {
+		return nil, nil, &fileError{code: codes.FailedPrecondition, msg: fmt.Sprintf("root helper: Firecracker VM %s has no jail; PrepareHost first", id)}
+	}
+	_ = unix.Close(fd)
+	stage, root, err := f.openJail(id, true)
 	if err != nil {
 		return nil, nil, err
 	}
 	_ = stage.Close()
 	defer root.Close()
-	var st unix.Stat_t
-	if err := unix.Fstatat(int(root.Fd()), rootpolicy.FirecrackerKernel, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return nil, nil, &fileError{code: codes.FailedPrecondition, msg: fmt.Sprintf("root helper: Firecracker VM %s has no kernel in its jail; PrepareHost first", id)}
-	}
-	// firecracker will not bind over an old socket.
-	if err := unix.Unlinkat(int(root.Fd()), firecrackerAPISocket, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+	if err := f.stageKernel(int(root.Fd())); err != nil {
 		return nil, nil, err
 	}
 	out, err := hostLog(f.log)
@@ -414,7 +450,7 @@ func (f *firecrackerHosts) started(ctx context.Context, cmd *exec.Cmd) error {
 		if err == nil {
 			// The jailer owns the chroot it set up: give its folder back
 			// to the agent's group to pass through, then the socket.
-			stage, root, jerr := f.openJail(id)
+			stage, root, jerr := f.openJail(id, false)
 			if jerr != nil {
 				return jerr
 			}
@@ -528,7 +564,7 @@ func (f *firecrackerHosts) makeFilesystem(ctx context.Context, req *rootdpb.Make
 		}
 		args = []string{"-F", ""}
 	}
-	stage, root, err := f.openJail(req.GetId())
+	stage, root, err := f.openJail(req.GetId(), false)
 	if err != nil {
 		return nil, err
 	}

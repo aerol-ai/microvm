@@ -170,6 +170,83 @@ func TestFirecrackerJailOnTheKernel(t *testing.T) {
 	}
 }
 
+// TestFirecrackerJailIsMadeFreshOnTheKernel is TestFirecrackerJailIsMadeFresh
+// with the real owners. What the jailer's user left in a stopped VM's
+// chroot (its link at firecracker's name to a file of root's, a folder of
+// its own closed to everyone) is gone after PrepareHost and after
+// SpawnHost. The new chroot is the jailer's user's with the agent's group
+// again, and the jailer's copy, as root, writes no file of root's.
+func TestFirecrackerJailIsMadeFreshOnTheKernel(t *testing.T) {
+	f := kernelFirecracker(t)
+	if _, err := f.prepare("sb-f", false, &rootdpb.PrepareHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(f.cfg.ChrootBase, "firecracker", "sb-f", "root")
+	victim := filepath.Join(f.cfg.ChrootBase, "victim")
+	if err := os.WriteFile(victim, []byte("ORIG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	leave := func() {
+		t.Helper()
+		link, run := filepath.Join(root, "firecracker"), filepath.Join(root, "run")
+		_ = os.Remove(link)
+		if err := os.Symlink(victim, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(run, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(run, "x"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{link, run, filepath.Join(run, "x")} {
+			if err := os.Lchown(p, kJailerUID, kJailerGID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(run, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(step string) {
+		t.Helper()
+		for _, name := range []string{"firecracker", "run"} {
+			if _, err := os.Lstat(filepath.Join(root, name)); !os.IsNotExist(err) {
+				t.Errorf("%s: %s is left in the chroot (%v)", step, name, err)
+			}
+		}
+		if uid, gid, mode := statOwner(t, root); uid != kJailerUID || gid != kAgentGID || mode != os.ModeDir|os.ModeSetgid|0o750 {
+			t.Errorf("%s: the new chroot is %d:%d %v", step, uid, gid, mode)
+		}
+		if uid, gid, mode := statOwner(t, filepath.Join(root, rootpolicy.FirecrackerKernel)); uid != 0 || gid != kJailerGID || mode != 0o640 {
+			t.Errorf("%s: the kernel is %d:%d %v", step, uid, gid, mode)
+		}
+		// The jailer's copy of firecracker, as root, by its name.
+		if err := os.WriteFile(filepath.Join(root, "firecracker"), []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(victim)
+		if uid, _, mode := statOwner(t, victim); err != nil || string(b) != "ORIG" || uid != 0 || mode != 0o600 {
+			t.Fatalf("%s: root's file was written through the link: %q %d %v %v", step, b, uid, mode, err)
+		}
+	}
+	leave()
+	if _, err := f.prepare("sb-f", false, &rootdpb.PrepareHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	check("PrepareHost")
+	leave()
+	_, done, err := f.command(context.Background(), "sb-f", &rootdpb.SpawnHostRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done()
+	check("SpawnHost")
+	if err := f.teardown("sb-f"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestMakeFilesystemInAUserNamespace: mkfs.ext4 runs as the agent seen as
 // root. The image's files are root's, the image is the agent's, and a file
 // the agent cannot read stops it.

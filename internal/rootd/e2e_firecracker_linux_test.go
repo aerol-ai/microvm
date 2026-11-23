@@ -56,10 +56,6 @@ func TestE2EFirecracker(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(prep.GetRunDir(), "planted"), nil, 0o600); err == nil {
 		t.Fatal("the agent wrote in the chroot")
 	}
-	if _, err := c.PrepareHost(ctx, &rootdpb.PrepareHostRequest{Kind: fc, Id: id,
-		Firecracker: &rootdpb.FirecrackerHostSpec{Stage: []string{rootpolicy.FirecrackerOverlay}}}); err != nil {
-		t.Fatalf("stage the overlay: %v", err)
-	}
 
 	// The jailer runs firecracker; the agent dials its API socket.
 	sp, err := c.SpawnHost(ctx, &rootdpb.SpawnHostRequest{Kind: fc, Id: id})
@@ -88,6 +84,16 @@ func TestE2EFirecracker(t *testing.T) {
 	list, err := c.ListHosts(ctx, &rootdpb.ListHostsRequest{Kind: fc})
 	if err != nil || len(list.GetHosts()) != 1 || list.GetHosts()[0].GetPid() != sp.GetPid() {
 		t.Fatalf("ListHosts: %v %v", list, err)
+	}
+
+	// The overlay moves into the chroot once firecracker runs, as the
+	// driver moves it (configureVMM, after the start).
+	if _, err := c.PrepareHost(ctx, &rootdpb.PrepareHostRequest{Kind: fc, Id: id,
+		Firecracker: &rootdpb.FirecrackerHostSpec{Stage: []string{rootpolicy.FirecrackerOverlay}}}); err != nil {
+		t.Fatalf("stage the overlay: %v", err)
+	}
+	if fi, err := os.Lstat(filepath.Join(prep.GetRunDir(), rootpolicy.FirecrackerOverlay)); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("the overlay in the chroot: %v %v", fi, err)
 	}
 
 	// Nothing the jailer or firecracker made in the chroot is the agent's
@@ -163,9 +169,9 @@ func TestE2EFirecracker(t *testing.T) {
 }
 
 // TestE2EFirecrackerSpawnTiming is one round of a VM's start in split mode,
-// timed, as the agent: the jail, the overlay's filesystem, its move into
-// the chroot, the jailer and firecracker up to its API socket, and the
-// stop (AEROL_E2E_FC_TIMING). The box pairs it with
+// timed, as the agent, in the driver's order: the jail, the jailer and
+// firecracker up to its API socket, the overlay's filesystem, its move into
+// the chroot, and the stop (AEROL_E2E_FC_TIMING). The box pairs it with
 // TestFirecrackerSingleModeSpawnTiming, single mode's same work as root.
 func TestE2EFirecrackerSpawnTiming(t *testing.T) {
 	sock := os.Getenv("AEROL_E2E_HELPER_SOCKET")
@@ -184,6 +190,10 @@ func TestE2EFirecrackerSpawnTiming(t *testing.T) {
 		t.Fatal(err)
 	}
 	tPrep := lap()
+	if _, err := c.SpawnHost(ctx, &rootdpb.SpawnHostRequest{Kind: fc, Id: id}); err != nil {
+		t.Fatal(err)
+	}
+	tSpawn := lap()
 	ov := filepath.Join(prep.GetStageDir(), rootpolicy.FirecrackerOverlay)
 	if err := os.WriteFile(ov, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -200,14 +210,78 @@ func TestE2EFirecrackerSpawnTiming(t *testing.T) {
 		t.Fatal(err)
 	}
 	tStage := lap()
-	if _, err := c.SpawnHost(ctx, &rootdpb.SpawnHostRequest{Kind: fc, Id: id}); err != nil {
-		t.Fatal(err)
-	}
-	tSpawn := lap()
 	if _, err := c.StopHost(ctx, &rootdpb.StopHostRequest{Kind: fc, Id: id}); err != nil {
 		t.Fatal(err)
 	}
 	tStop := lap()
 	ms := func(d time.Duration) string { return fmt.Sprintf("%.3f", float64(d.Microseconds())/1000) }
 	fmt.Printf("timing\tsplit\tjail=%s\tmkfs=%s\tstage=%s\tspawn=%s\tstop=%s\n", ms(tPrep), ms(tMkfs), ms(tStage), ms(tSpawn), ms(tStop))
+}
+
+// TestE2EFirecrackerReusedJail: a VM whose firecracker died keeps its jail
+// until StopHost, and the next SpawnHost must not hand the jailer what that
+// firecracker left in its chroot (the review of #1423: the real jailer
+// copies firecracker in through a link left at its name, as root). Two
+// steps around the box's own part, as root:
+//   - AEROL_E2E_FC_REUSE=start starts the VM.
+//   - The box kills firecracker. As the jailer's user, it leaves a link at
+//     <chroot>/firecracker to a file of root's, and a file of its own.
+//   - AEROL_E2E_FC_REUSE=again starts the VM again with no PrepareHost
+//     first, checks the chroot and the API, and stops the VM. The box
+//     then checks root's file.
+func TestE2EFirecrackerReusedJail(t *testing.T) {
+	sock, step := os.Getenv("AEROL_E2E_HELPER_SOCKET"), os.Getenv("AEROL_E2E_FC_REUSE")
+	if sock == "" || step == "" {
+		t.Skip("a live run: set AEROL_E2E_HELPER_SOCKET and AEROL_E2E_FC_REUSE")
+	}
+	c := rootdpb.NewRootHelperClient(dialSocket(t, sock))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	const fc = rootdpb.HostKind_HOST_KIND_FIRECRACKER
+	id := "sb-e2e-reuse"
+	if step == "start" {
+		if _, err := c.PrepareHost(ctx, &rootdpb.PrepareHostRequest{Kind: fc, Id: id}); err != nil {
+			t.Fatal(err)
+		}
+		sp, err := c.SpawnHost(ctx, &rootdpb.SpawnHostRequest{Kind: fc, Id: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Printf("e2e-fc-reuse: firecracker pid %d\n", sp.GetPid())
+		return
+	}
+	sp, err := c.SpawnHost(ctx, &rootdpb.SpawnHostRequest{Kind: fc, Id: id})
+	if err != nil {
+		t.Fatalf("SpawnHost on the used jail: %v", err)
+	}
+	if sp.GetAlready() {
+		t.Fatal("the first firecracker still runs")
+	}
+	// Running now: PrepareHost leaves the jail as it is, and names it.
+	prep, err := c.PrepareHost(ctx, &rootdpb.PrepareHostRequest{Kind: fc, Id: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := prep.GetRunDir()
+	if _, err := os.Lstat(filepath.Join(root, "left-by-firecracker")); !os.IsNotExist(err) {
+		t.Errorf("the first firecracker's file is in the new chroot: %v", err)
+	}
+	if fi, err := os.Lstat(filepath.Join(root, "firecracker")); err != nil || !fi.Mode().IsRegular() {
+		t.Errorf("firecracker in the chroot is %v %v, want the jailer's copy", fi, err)
+	}
+	hc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(root, "api.socket"))
+	}}}
+	resp, err := hc.Get("http://localhost/")
+	if err != nil {
+		t.Fatalf("the agent dials the new firecracker's API: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("firecracker's API answered %d", resp.StatusCode)
+	}
+	if _, err := c.StopHost(ctx, &rootdpb.StopHostRequest{Kind: fc, Id: id}); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("e2e-fc-reuse: ok")
 }

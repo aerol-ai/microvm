@@ -154,8 +154,9 @@ func TestFirecrackerPrepare(t *testing.T) {
 	if !slices.Contains(cl.got, "file:"+itoa(f.cfg.UID)+":"+itoa(f.cfg.GID)) {
 		t.Fatalf("disks not given to the jailer: %v", cl.got)
 	}
-	// Again: already moved, nothing to do.
-	if _, err := f.prepare("sb-1", false, spec); err != nil {
+	// Again while the VM runs (the disks move in after the jailer has
+	// started firecracker): already moved, nothing to do.
+	if _, err := f.prepare("sb-1", true, spec); err != nil {
 		t.Fatalf("a second prepare: %v", err)
 	}
 }
@@ -246,7 +247,7 @@ func TestFirecrackerKernelIsRoots(t *testing.T) {
 func TestFirecrackerCommand(t *testing.T) {
 	f, _ := newTestFirecracker(t)
 	if _, _, err := f.command(context.Background(), "sb-3", &rootdpb.SpawnHostRequest{}); status.Code(errOf(err)) != codes.FailedPrecondition {
-		t.Fatalf("a VM with no kernel in its jail: %v", err)
+		t.Fatalf("a VM with no jail: %v", err)
 	}
 	if _, err := f.prepare("sb-3", false, &rootdpb.PrepareHostRequest{}); err != nil {
 		t.Fatal(err)
@@ -268,11 +269,112 @@ func TestFirecrackerCommand(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(root, "api.socket")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("an old API socket left: %v", err)
 	}
+	if _, err := os.Lstat(filepath.Join(root, rootpolicy.FirecrackerKernel)); err != nil {
+		t.Fatalf("no kernel in the chroot the jailer gets: %v", err)
+	}
+	// A kernel the helper may not trust stops the spawn too.
+	f.checkKernel = func(string) error { return errors.New("folder belongs to uid 65531") }
+	if _, _, err := f.command(context.Background(), "sb-3", &rootdpb.SpawnHostRequest{}); err == nil || !strings.Contains(err.Error(), "65531") {
+		t.Fatalf("a kernel in the agent's folder: %v", err)
+	}
+	f.checkKernel = func(string) error { return nil }
+	if _, _, err := f.command(context.Background(), "../x", &rootdpb.SpawnHostRequest{}); err == nil {
+		t.Fatal("a jail up the tree")
+	}
 	if firecrackerIDOf(cmd) != "sb-3" || firecrackerIDOf(exec.Command("x")) != "" {
 		t.Fatal("firecrackerIDOf")
 	}
 	if _, ok := f.limits(rootpolicy.HostLimits{Pids: 1}); ok || f.socket("sb-3") != "" {
 		t.Fatal("a VM takes no limits and serves no socket of the helper's")
+	}
+}
+
+// TestFirecrackerJailIsMadeFresh: a VM with no process in its group gets
+// its chroot made again from nothing, by PrepareHost and by SpawnHost.
+// firecracker runs as the jailer's user, who owns the chroot, so it could
+// leave a link at the name the jailer copies firecracker to, as root (the
+// review of #1423, with the real jailer v1.10.1). Here the jailer's copy
+// lands in the new chroot, and the file the link named is left as it was.
+// The agent's stage folder is kept, and a running VM's chroot is never
+// touched.
+func TestFirecrackerJailIsMadeFresh(t *testing.T) {
+	f, _ := newTestFirecracker(t)
+	if _, err := f.prepare("sb-7", false, &rootdpb.PrepareHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(f.cfg.ChrootBase, "firecracker", "sb-7")
+	root, stage := filepath.Join(dir, "root"), filepath.Join(dir, "stage")
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("ORIG"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// What a VM's firecracker could leave in its chroot.
+	left := []string{"firecracker", "dev", "left"}
+	leave := func() {
+		t.Helper()
+		_ = os.Remove(filepath.Join(root, "firecracker"))
+		if err := os.Symlink(victim, filepath.Join(root, "firecracker")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Dir(victim), filepath.Join(root, "dev")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "left"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := func(step string) {
+		t.Helper()
+		for _, name := range left {
+			if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("%s: %s is left in the chroot (%v)", step, name, err)
+			}
+		}
+		if _, err := os.Lstat(filepath.Join(root, rootpolicy.FirecrackerKernel)); err != nil {
+			t.Errorf("%s: no kernel in the new chroot: %v", step, err)
+		}
+		// The jailer's first write in its chroot: firecracker, by its name,
+		// following whatever is there.
+		if err := os.WriteFile(filepath.Join(root, "firecracker"), []byte("ELF"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(victim); err != nil || string(b) != "ORIG" {
+			t.Fatalf("%s: the jailer wrote through a link left in the chroot: %q %v", step, b, err)
+		}
+	}
+	stageFile(t, stage, rootpolicy.FirecrackerOverlay)
+
+	leave()
+	if _, err := f.prepare("sb-7", false, &rootdpb.PrepareHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	fresh("PrepareHost")
+
+	// SpawnHost on a VM whose firecracker died, with no PrepareHost first.
+	leave()
+	if _, done, err := f.command(context.Background(), "sb-7", &rootdpb.SpawnHostRequest{}); err != nil {
+		t.Fatal(err)
+	} else {
+		done()
+	}
+	fresh("SpawnHost")
+
+	// The agent's disk waited in its stage folder, and moves into the new
+	// chroot once firecracker runs.
+	spec := &rootdpb.PrepareHostRequest{Firecracker: &rootdpb.FirecrackerHostSpec{Stage: []string{rootpolicy.FirecrackerOverlay}}}
+	if _, err := f.prepare("sb-7", true, spec); err != nil {
+		t.Fatalf("stage the overlay: %v", err)
+	}
+
+	// A running VM's chroot is left as it is.
+	leave()
+	if _, err := f.prepare("sb-7", true, &rootdpb.PrepareHostRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(left, rootpolicy.FirecrackerOverlay) {
+		if _, err := os.Lstat(filepath.Join(root, name)); err != nil {
+			t.Errorf("a running VM's %s was removed: %v", name, err)
+		}
 	}
 }
 
