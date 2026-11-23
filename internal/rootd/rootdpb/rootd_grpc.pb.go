@@ -69,6 +69,7 @@ const (
 	RootHelper_GuestRules_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/GuestRules"
 	RootHelper_ShareFirecrackerFiles_FullMethodName   = "/aerolvm.rootd.v1.RootHelper/ShareFirecrackerFiles"
 	RootHelper_HandOutFirecrackerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/HandOutFirecrackerFiles"
+	RootHelper_GrantWasmMounts_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/GrantWasmMounts"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -236,6 +237,18 @@ type RootHelperClient interface {
 	// sets its group to the agent's and its mode to 0640. The agent copies
 	// it out, with checks of its own.
 	HandOutFirecrackerFiles(ctx context.Context, in *FirecrackerFilesRequest, opts ...grpc.CallOption) (*FirecrackerFilesResponse, error)
+	// GrantWasmMounts lends a WASM sandbox's external mounts to the WASM
+	// host that serves it (M1 PR 15). A WASM guest reaches a mount through
+	// its mount point, opened and passed to its host as a folder. In
+	// privilege mode single sandboxd does that as root; in split it cannot
+	// reach the helper's mount points, so the helper does. The agent names
+	// the sandbox and the host, never a path: the helper asks the host, on
+	// the socket it serves the host on, whether it holds that sandbox, and
+	// only then opens each of the sandbox's mount points it holds itself,
+	// by the path it built, without entering the mount, and passes them
+	// over the same socket. Safe to retry and to repeat: a later loan
+	// replaces an earlier one.
+	GrantWasmMounts(ctx context.Context, in *GrantWasmMountsRequest, opts ...grpc.CallOption) (*GrantWasmMountsResponse, error)
 }
 
 type rootHelperClient struct {
@@ -626,6 +639,16 @@ func (c *rootHelperClient) HandOutFirecrackerFiles(ctx context.Context, in *Fire
 	return out, nil
 }
 
+func (c *rootHelperClient) GrantWasmMounts(ctx context.Context, in *GrantWasmMountsRequest, opts ...grpc.CallOption) (*GrantWasmMountsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GrantWasmMountsResponse)
+	err := c.cc.Invoke(ctx, RootHelper_GrantWasmMounts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -791,6 +814,18 @@ type RootHelperServer interface {
 	// sets its group to the agent's and its mode to 0640. The agent copies
 	// it out, with checks of its own.
 	HandOutFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error)
+	// GrantWasmMounts lends a WASM sandbox's external mounts to the WASM
+	// host that serves it (M1 PR 15). A WASM guest reaches a mount through
+	// its mount point, opened and passed to its host as a folder. In
+	// privilege mode single sandboxd does that as root; in split it cannot
+	// reach the helper's mount points, so the helper does. The agent names
+	// the sandbox and the host, never a path: the helper asks the host, on
+	// the socket it serves the host on, whether it holds that sandbox, and
+	// only then opens each of the sandbox's mount points it holds itself,
+	// by the path it built, without entering the mount, and passes them
+	// over the same socket. Safe to retry and to repeat: a later loan
+	// replaces an earlier one.
+	GrantWasmMounts(context.Context, *GrantWasmMountsRequest) (*GrantWasmMountsResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -914,6 +949,9 @@ func (UnimplementedRootHelperServer) ShareFirecrackerFiles(context.Context, *Fir
 }
 func (UnimplementedRootHelperServer) HandOutFirecrackerFiles(context.Context, *FirecrackerFilesRequest) (*FirecrackerFilesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method HandOutFirecrackerFiles not implemented")
+}
+func (UnimplementedRootHelperServer) GrantWasmMounts(context.Context, *GrantWasmMountsRequest) (*GrantWasmMountsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GrantWasmMounts not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1620,6 +1658,24 @@ func _RootHelper_HandOutFirecrackerFiles_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_GrantWasmMounts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GrantWasmMountsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).GrantWasmMounts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_GrantWasmMounts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).GrantWasmMounts(ctx, req.(*GrantWasmMountsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1778,6 +1834,10 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "HandOutFirecrackerFiles",
 			Handler:    _RootHelper_HandOutFirecrackerFiles_Handler,
+		},
+		{
+			MethodName: "GrantWasmMounts",
+			Handler:    _RootHelper_GrantWasmMounts_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

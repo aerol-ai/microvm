@@ -39,6 +39,14 @@ func (c *Client) SweepExternalMounts(ctx context.Context, keep []string) error {
 	return err
 }
 
+// GrantWasmMounts asks the helper to lend sandboxID's mount points to the
+// WASM host of kind and id that serves it, and answers how many it lent.
+func (c *Client) GrantWasmMounts(ctx context.Context, sandboxID string, kind rootdpb.HostKind, hostID string) (int, error) {
+	resp, err := call(ctx, c, rootdpb.FeatureGrantWasmMounts,
+		&rootdpb.GrantWasmMountsRequest{SandboxId: sandboxID, Kind: kind, HostId: hostID}, rootdpb.RootHelperClient.GrantWasmMounts)
+	return int(resp.GetGranted()), err
+}
+
 // ReclaimVolume asks the helper to delete a deleted platform volume's files
 // on its NFS export.
 func (c *Client) ReclaimVolume(ctx context.Context, source string) error {

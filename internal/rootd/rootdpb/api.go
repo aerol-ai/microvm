@@ -75,6 +75,9 @@ const (
 	// A Firecracker VM's memory and state files and its disks (M1 PR 14b).
 	FeatureShareFirecrackerFiles   = "ShareFirecrackerFiles"
 	FeatureHandOutFirecrackerFiles = "HandOutFirecrackerFiles"
+
+	// A WASM sandbox's external mounts, lent to its host (M1 PR 15).
+	FeatureGrantWasmMounts = "GrantWasmMounts"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -131,7 +134,8 @@ func Features() []string {
 		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits,
 		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem,
 		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules,
-		FeatureShareFirecrackerFiles, FeatureHandOutFirecrackerFiles}
+		FeatureShareFirecrackerFiles, FeatureHandOutFirecrackerFiles,
+		FeatureGrantWasmMounts}
 }
 
 // HostKindName is a host kind's name in VersionResponse.hosts, "" for

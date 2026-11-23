@@ -683,6 +683,9 @@ var retrySafe = map[string]bool{
 	// already as done, and a hand-out sets the same group and mode again.
 	rootdpb.FeatureShareFirecrackerFiles:   true,
 	rootdpb.FeatureHandOutFirecrackerFiles: true,
+	// A WASM sandbox's mount points lent again (M1 PR 15) replace the
+	// host's earlier loan of the same folders.
+	rootdpb.FeatureGrantWasmMounts: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
