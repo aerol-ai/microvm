@@ -64,6 +64,10 @@ echo "k8s-dev: building linux/$arch binaries" >&2
 # is refused when the agent in it reports another (readysock_park.go).
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
+# The root helper the agent image carries (privilege mode split). A local
+# build is unsigned, and a split worker's supervisor refuses it.
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$dist/aerolvm-rootd_linux_$arch" ./cmd/aerolvm-rootd
+rm -f "$dist/aerolvm-rootd_linux_$arch.manifest" "$dist/aerolvm-rootd_linux_$arch.sig"
 if [[ "$mode" == cluster ]]; then
   # The operator is its own Go module (operator/).
   (cd operator && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-operator_linux_$arch" ./cmd/aerolvm-operator)
