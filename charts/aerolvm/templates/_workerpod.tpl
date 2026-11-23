@@ -48,6 +48,15 @@ securityContext:
   sysctls:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
 {{- end }}
+{{- if and $split ($root.Values.enterprise | default dict).enabled }}
+{{- if not $root.Values.edge.enabled }}
+securityContext:
+{{- end }}
+  # Enterprise mode: sandboxd gives the edge its public API socket by group
+  # (SB_PUBLIC_API_SOCKET_GROUP), and a split agent, not root, can hand a
+  # file only to a group it is in.
+  supplementalGroups: [65532]
+{{- end }}
 terminationGracePeriodSeconds: 30
 {{- if $cluster }}
 # The worker is the last pod the kubelet removes (§8.1). Its machine,

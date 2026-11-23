@@ -206,8 +206,11 @@ func TestChartRefusesWhatSplitRefuses(t *testing.T) {
 func TestChartSplitWorkerStarts(t *testing.T) {
 	helm := chartHelm(t)
 	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
+	enterprise := append(slices.Clone(chartClusterFlags), "--set", "identity.enabled=true", "--set", "enterprise.enabled=true",
+		"--set", "audit.witness.bucket=w", "--set", "audit.export.backend=s3", "--set", "audit.export.s3.bucket=a")
 	for name, flags := range map[string][]string{
 		"single": nil, "single edge": edge, "cluster": chartClusterFlags, "cluster edge": append(slices.Clone(chartClusterFlags), edge...),
+		"enterprise": enterprise, "enterprise edge": append(slices.Clone(enterprise), edge...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
@@ -240,6 +243,15 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 			}
 			if runtime["SB_ROOTD_AGENT_UID"] != "65531" || runtime["SB_ROOTD_SOCKET"] != env["SB_ROOTD_SOCKET"] {
 				t.Errorf("the helper serves uid %q on %q; the agent dials %q", runtime["SB_ROOTD_AGENT_UID"], runtime["SB_ROOTD_SOCKET"], env["SB_ROOTD_SOCKET"])
+			}
+			// Enterprise mode's public API socket goes to the edge's group,
+			// which a split agent, not root, can give a file only when it is
+			// in that group.
+			if g := env["SB_PUBLIC_API_SOCKET_GROUP"]; g != "" {
+				groups, _ := dig(workerSpec(t, out), "securityContext")["supplementalGroups"].([]any)
+				if !slices.ContainsFunc(groups, func(v any) bool { return fmt.Sprint(v) == g }) {
+					t.Errorf("SB_PUBLIC_API_SOCKET_GROUP=%s, but the pod's supplementalGroups are %v", g, groups)
+				}
 			}
 		})
 	}
@@ -328,6 +340,32 @@ func renderChart(helm string, args ...string) (string, error) {
 // pod: the single-mode StatefulSet's, or cluster mode's worker template.
 func workerEnv(t *testing.T, rendered, container string) map[string]string {
 	t.Helper()
+	spec := workerSpec(t, rendered)
+	cs, _ := spec["containers"].([]any)
+	for _, c := range cs {
+		m, _ := c.(map[string]any)
+		if m["name"] != container {
+			continue
+		}
+		env := map[string]string{}
+		list, _ := m["env"].([]any)
+		for _, e := range list {
+			kv, _ := e.(map[string]any)
+			if name, ok := kv["name"].(string); ok {
+				if v, ok := kv["value"]; ok {
+					env[name] = fmt.Sprint(v)
+				}
+			}
+		}
+		return env
+	}
+	t.Fatalf("the worker pod has no %s container", container)
+	return nil
+}
+
+// workerSpec is the rendered worker pod's spec.
+func workerSpec(t *testing.T, rendered string) map[string]any {
+	t.Helper()
 	var spec map[string]any
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
 	for {
@@ -356,26 +394,7 @@ func workerEnv(t *testing.T, rendered, container string) map[string]string {
 	if spec == nil {
 		t.Fatal("rendered no worker pod")
 	}
-	cs, _ := spec["containers"].([]any)
-	for _, c := range cs {
-		m, _ := c.(map[string]any)
-		if m["name"] != container {
-			continue
-		}
-		env := map[string]string{}
-		list, _ := m["env"].([]any)
-		for _, e := range list {
-			kv, _ := e.(map[string]any)
-			if name, ok := kv["name"].(string); ok {
-				if v, ok := kv["value"]; ok {
-					env[name] = fmt.Sprint(v)
-				}
-			}
-		}
-		return env
-	}
-	t.Fatalf("the worker pod has no %s container", container)
-	return nil
+	return spec
 }
 
 func dig(m map[string]any, keys ...string) map[string]any {
