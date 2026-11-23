@@ -114,7 +114,7 @@ rootd-proto-check: rootd-proto
 # The Kubernetes images (aerolvm, aerolvm-runtime, aerolvm-edge) from Linux
 # binaries already in $(IMAGES_DIST), named as the release names them
 # (sandboxd_linux_<arch>, toolboxd_linux_<arch>, aerolvm-supervisor_linux_<arch>,
-# caddy_linux_<arch>). Loads this machine's platform into the local Docker;
+# aerolvm-rootd_linux_<arch>, caddy_linux_<arch>). Loads this machine's platform into the local Docker;
 # the release builds both CPU types and pushes (scripts/build-images.sh).
 IMAGES_DIST ?= dist
 IMAGES_VERSION ?= dev

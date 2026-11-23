@@ -18,6 +18,18 @@
 #   AEROL_K8S_IDENTITY=1 ...       # with API tokens on every node
 #                                  # (identity.enabled): a pod reads it when
 #                                  # it is made, so set it at the install
+#   AEROL_K8S_PRIVILEGE_MODE=split ...
+#                                  # workers in privilege mode split
+#                                  # (privilegeMode): the agent has no
+#                                  # rights and a signed root helper does
+#                                  # the root work. A local build has no
+#                                  # release signature, so this signs the
+#                                  # helper with a throwaway key made in
+#                                  # dist/k8s-dev and builds the runtime
+#                                  # image's supervisor to trust that key
+#                                  # alone (go build -overlay on
+#                                  # internal/rootswap/release-keys.pub).
+#                                  # Never push these images.
 #
 # Needs Docker, kind, kubectl and Helm 3.8 or later (HELM names another).
 # sandboxd links glibc, so it is compiled in a golang container; toolboxd, the
@@ -40,8 +52,14 @@ identity_flags=()
 # AerolCluster's version is a release tag, and the operator upgrades any
 # node that reports another (AEROL_K8S_VERSION=v0.0.0-dev.2 builds a
 # second version to upgrade to).
+privilege="${AEROL_K8S_PRIVILEGE_MODE:-single}"
+case "$privilege" in single|split) ;; *) echo "k8s-dev: AEROL_K8S_PRIVILEGE_MODE is single or split, got $privilege" >&2; exit 2 ;; esac
+privilege_flags=()
+[[ "$privilege" == split ]] && privilege_flags=(--set privilegeMode=split)
+# A signed helper carries a release version (internal/rootswap), so split
+# builds one too.
 tag="dev"
-[[ "$mode" == cluster ]] && tag="${AEROL_K8S_VERSION:-v0.0.0-dev.1}"
+[[ "$mode" == cluster || "$privilege" == split ]] && tag="${AEROL_K8S_VERSION:-v0.0.0-dev.1}"
 ldflags="-X github.com/aerol-ai/microvm/internal/version.Version=$tag"
 helm="${HELM:-helm}"
 # cert-manager for the edge's certificate, pinned by checksum like Helm and
@@ -64,6 +82,23 @@ echo "k8s-dev: building linux/$arch binaries" >&2
 # is refused when the agent in it reports another (readysock_park.go).
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$dist/toolboxd_linux_$arch" ./cmd/toolboxd
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
+# The root helper the agent image carries (privilege mode split). A local
+# build is unsigned, and a split worker's supervisor refuses it.
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$dist/aerolvm-rootd_linux_$arch" ./cmd/aerolvm-rootd
+rm -f "$dist/aerolvm-rootd_linux_$arch.manifest" "$dist/aerolvm-rootd_linux_$arch.sig"
+if [[ "$privilege" == split ]]; then
+  # A throwaway key, kept in dist/k8s-dev so a rebuild signs with the same
+  # one; the supervisor built here trusts it alone, in place of the release
+  # keys. The signer runs nothing it signs (-no-exec).
+  go build -trimpath -o "$dist/aerolvm-rootd-sign" ./cmd/aerolvm-rootd-sign
+  if [[ ! -s "$dist/rootd-dev.pub" ]]; then
+    "$dist/aerolvm-rootd-sign" -genkey "$dist/rootd-dev.key" > "$dist/rootd-dev.pub"
+  fi
+  "$dist/aerolvm-rootd-sign" -key "$dist/rootd-dev.key" -version "$tag" -no-exec "$dist/aerolvm-rootd_linux_$arch"
+  printf '{"Replace":{"%s":"%s"}}\n' "$root/internal/rootswap/release-keys.pub" "$dist/rootd-dev.pub" > "$dist/rootd-dev-overlay.json"
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -overlay "$dist/rootd-dev-overlay.json" \
+    -o "$dist/aerolvm-supervisor_linux_$arch" ./cmd/aerolvm-supervisor
+fi
 if [[ "$mode" == cluster ]]; then
   # The operator is its own Go module (operator/).
   (cd operator && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$dist/aerolvm-operator_linux_$arch" ./cmd/aerolvm-operator)
@@ -196,7 +231,8 @@ VALUES
   kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kubernetes.io/enforce=restricted --overwrite >/dev/null
   "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
     -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never \
-    ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"}
+    ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"} \
+    ${privilege_flags[@]+"${privilege_flags[@]}"}
   # The operator replaces nothing a new image changes on its own: restart it
   # so a rebuilt operator runs.
   kubectl --context "kind-$cluster" -n "$namespace" rollout restart deployment/aerolvm-operator >/dev/null
@@ -222,7 +258,8 @@ kubectl --context "kind-$cluster" label namespace "$namespace" pod-security.kube
 existing=0
 kubectl --context "kind-$cluster" -n "$namespace" get pod aerolvm-0 >/dev/null 2>&1 && existing=1
 "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
-  --set image.tag=dev --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"}
+  --set image.tag="$tag" --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"} \
+  ${privilege_flags[@]+"${privilege_flags[@]}"}
 if [[ "$existing" == 1 ]]; then
   kubectl --context "kind-$cluster" -n "$namespace" delete pod aerolvm-0 --wait=true --timeout=2m >/dev/null
 fi

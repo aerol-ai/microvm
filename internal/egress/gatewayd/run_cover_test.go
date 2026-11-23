@@ -20,6 +20,38 @@ import (
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
+// The socket the gateway makes itself is its own user's (0600) while it
+// answers only root and itself. When it answers another user, sandboxd in
+// privilege mode split, it is open to every local user, and the peer check
+// keeps the others out.
+func TestSocketListenerMode(t *testing.T) {
+	self := uint32(os.Getuid())
+	for _, tc := range []struct {
+		peers []uint32
+		want  os.FileMode
+	}{
+		{nil, 0o600}, {[]uint32{0}, 0o600}, {[]uint32{self}, 0o600}, {[]uint32{0, self}, 0o600},
+		{[]uint32{65531}, 0o666}, {[]uint32{0, 65531}, 0o666},
+	} {
+		if self == 65531 {
+			t.Skip("the test runs as uid 65531")
+		}
+		path := filepath.Join(t.TempDir(), "gw.sock")
+		ln, err := socketListener(path, tc.peers...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(path)
+		_ = ln.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.Mode().Perm(); got != tc.want {
+			t.Errorf("peers %v: mode %o, want %o", tc.peers, got, tc.want)
+		}
+	}
+}
+
 func TestSocketListenerFailures(t *testing.T) {
 	t.Setenv("LISTEN_PID", strconv.Itoa(os.Getpid()+1))
 	t.Setenv("LISTEN_FDS", "1")

@@ -8,6 +8,13 @@
 # with SB_ENABLE_FIRECRACKER) firecracker, its jailer, a guest kernel and
 # the tools that turn an image into a VM's disk (skopeo, umoci, mkfs.ext4).
 #
+# It also carries the root helper, aerolvm-rootd, in /opt/aerolvm/rootd,
+# with its signed manifest and signature when the release signed it
+# (plans/security-gaps-m1-m4.md §3.3 "Upgrades"). In privilege mode split
+# the agent copies the three files to a folder the runtime container's
+# supervisor watches; the supervisor runs the helper only when a release
+# key built into the supervisor signed it. Nothing here runs it.
+#
 # Built by scripts/build-images.sh: the context holds <arch>/sandboxd and
 # <arch>/toolboxd from the release build, and versions.env's pins arrive as
 # build args. sandboxd links glibc, so the base is a Debian with a newer one
@@ -135,6 +142,9 @@ COPY --from=fetch /out/fc/firecracker /out/fc/jailer /out/runsc /usr/local/bin/
 # hide it: the chart points SB_FIRECRACKER_KERNEL here.
 COPY --from=fetch /out/fc/vmlinux /out/fc/vmlinux.config /opt/aerolvm/firecracker/
 COPY ${TARGETARCH}/sandboxd ${TARGETARCH}/toolboxd /usr/local/bin/
+# The root helper and, for a signed release, aerolvm-rootd.manifest and
+# aerolvm-rootd.sig (scripts/build-images.sh puts them in rootd/).
+COPY ${TARGETARCH}/rootd/ /opt/aerolvm/rootd/
 ENV SB_TOOLBOX_BINARY_PATH=/usr/local/bin/toolboxd \
     SB_CONTAINERD_CNI_PLUGIN_DIR=/opt/aerolvm/cni
 ENTRYPOINT ["/usr/local/bin/sandboxd"]

@@ -57,6 +57,11 @@ spec:
               export GOFLAGS=-buildvcs=false GOCACHE=/gocache
               CGO_ENABLED=0 go build -trimpath -o "$out/toolboxd" ./cmd/toolboxd
               CGO_ENABLED=0 go build -trimpath -o "$out/aerolvm-supervisor" ./cmd/aerolvm-supervisor
+              # The root helper the agent image carries, unsigned: a
+              # privilege mode split worker refuses it (single runs none).
+              mkdir -p "$out/rootd"
+              CGO_ENABLED=0 go build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=@@TAG@@" \
+                -o "$out/rootd/aerolvm-rootd" ./cmd/aerolvm-rootd
               (cd operator && CGO_ENABLED=0 go build -trimpath -o "$out/aerolvm-operator" ./cmd/aerolvm-operator)
               CGO_ENABLED=1 go build -trimpath -ldflags "-X github.com/aerol-ai/microvm/internal/version.Version=@@TAG@@" \
                 -o "$out/sandboxd" ./cmd/sandboxd

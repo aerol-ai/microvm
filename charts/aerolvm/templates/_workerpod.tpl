@@ -18,6 +18,16 @@ serviceAccountName: {{ . }}
 {{- end }}
 enableServiceLinks: false
 {{- $externalStorage := $root.Values.worker.externalStorage.enabled }}
+{{- /* privilegeMode (_privilegemode.tpl). In split the agent has no
+rights and the root helper in the runtime container does the root work:
+external storage is the helper's (on unless set false), and none of single
+mode's F13 pieces below are rendered. A split worker uses no two-way mount
+and no shared process namespace. */}}
+{{- $split := eq (include "aerolvm.privilegeMode" $root) "split" }}
+{{- $splitMounts := and $split (ne (toString $externalStorage) "false") }}
+{{- $moves := $root.Values.worker.gvisor.checkpointMoves }}
+{{- if kindIs "invalid" $moves }}{{ $moves = not $split }}{{ end }}
+{{- if $split }}{{ $externalStorage = false }}{{ end }}
 {{- if or $externalStorage $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled $root.Values.worker.firecracker.enabled }}
 # One process namespace for the pod, only when something needs it: WASM,
 # V8-isolate and Firecracker sandboxes, and external-storage mount helpers,
@@ -37,6 +47,15 @@ shareProcessNamespace: true
 securityContext:
   sysctls:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
+{{- end }}
+{{- if and $split ($root.Values.enterprise | default dict).enabled }}
+{{- if not $root.Values.edge.enabled }}
+securityContext:
+{{- end }}
+  # Enterprise mode: sandboxd gives the edge its public API socket by group
+  # (SB_PUBLIC_API_SOCKET_GROUP), and a split agent, not root, can hand a
+  # file only to a group it is in.
+  supplementalGroups: [65532]
 {{- end }}
 terminationGracePeriodSeconds: 30
 {{- if $cluster }}
@@ -82,6 +101,45 @@ initContainers:
     resources:
       requests: { cpu: 100m, memory: 64Mi }
       limits: { cpu: 100m, memory: 64Mi }
+  {{- if $split }}
+  # Privilege mode split: the folders root and the agent share get their
+  # owners before either runs, so no root process later acts in a folder
+  # the agent can write. The kubelet makes an emptyDir open to everyone, and
+  # the root helper trusts a folder only when no one else can write it
+  # (internal/rootfolder): the shared folder becomes root's, open to the
+  # agent's group, with one folder of the agent's own inside; the CNI
+  # records' folder becomes root's alone; sandboxd's state volume becomes
+  # the agent's. As root with one right, CAP_CHOWN, and nothing else.
+  - name: split-folders
+    image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
+    imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        set -eu
+        chown 0:65531 /run/aerolvm-rootd/shared
+        chmod 0750 /run/aerolvm-rootd/shared
+        install -d -o 65531 -g 65531 -m 0700 /run/aerolvm-rootd/shared/agent
+        chmod 0755 /var/lib/cni
+        chown 65531:65531 /var/lib/sandboxd
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+        add: ["CHOWN"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests: { cpu: 100m, memory: 64Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+    volumeMounts:
+      - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
+      - { name: cni-state, mountPath: /var/lib/cni }
+      - { name: state, mountPath: /var/lib/sandboxd }
+  {{- end }}
 containers:
   - name: runtime
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
@@ -90,6 +148,24 @@ containers:
     # No liveness probe: restarting this container ends every sandbox.
     securityContext:
       privileged: true
+    {{- if $split }}
+    # Privilege mode split: the supervisor also runs the root helper (the
+    # split-folders init container set the shared folders up). The mount
+    # tools' user is made here, in this container's own files, when
+    # external storage is on: the helper serves mounts only when that user
+    # exists.
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        set -eu
+        {{- if $splitMounts }}
+        if ! getent passwd aerolvm-mounts >/dev/null; then
+          groupadd --system --gid 65530 aerolvm-mounts
+          useradd --system --uid 65530 --gid 65530 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin aerolvm-mounts
+        fi
+        {{- end }}
+        exec /usr/local/bin/aerolvm-supervisor
+    {{- end }}
     resources:
       {{- toYaml $root.Values.worker.runtime.resources | nindent 6 }}
     env:
@@ -111,18 +187,92 @@ containers:
       # The V8 jail's mounts, unmounted when the pod ends (as netns, F8).
       - { name: SB_ISOLATE_JAIL_DIR, value: /var/lib/sandboxd/isolate-jail }
       {{- end }}
+      {{- if $split }}
+      # The root helper (privilege mode split; internal/supervisor
+      # helper.go). The supervisor runs it only from a copy of what the
+      # agent stages, signed by a release key built into the supervisor,
+      # and passes it the socket. The folders the agent opens (the socket's,
+      # ready sockets, task output) are on the shared folder; its others
+      # are its own, in this container, where the agent cannot reach.
+      - { name: SB_ROOTD_STAGE_DIR, value: /run/aerolvm-rootd-stage }
+      # The sandboxes' cgroup parent, which the supervisor writes, goes to
+      # a folder of this container's that the agent reads only: no root
+      # process here writes in a folder the agent can write.
+      - { name: SB_CGROUP_PARENT_FILE, value: /run/aerolvm-runtime/cgroup-parent }
+      - { name: SB_ROOTD_SOCKET, value: /run/aerolvm-rootd/shared/sock/root.sock }
+      - { name: SB_ROOTD_SOCKET_GROUP, value: "65531" }
+      - { name: SB_ROOTD_AGENT_UID, value: "65531" }
+      - { name: SB_ROOTD_READY_DIR, value: /run/aerolvm-rootd/shared/ready }
+      - { name: SB_ROOTD_FIFO_DIR, value: /run/aerolvm-rootd/shared/fifo }
+      # toolboxd comes from the agent's image, which matches the agent's
+      # version: the helper keeps a copy of its own and specs bind that.
+      - { name: SB_ROOTD_TOOLBOX_SOURCE, value: /opt/aerolvm/toolbox/toolboxd }
+      {{- if $splitMounts }}
+      - { name: SB_ROOTD_MOUNT_USER, value: aerolvm-mounts }
+      {{- end }}
+      - { name: SB_CONTAINERD_CNI_PLUGIN_DIR, value: /opt/aerolvm/cni }
+      # Settings sandboxd reads too, with the same value: the helper checks
+      # what the agent asks for against its own copy.
+      - { name: SB_MOUNTS_CRED_DIR, value: /run/aerolvm-rootd/shared/agent }
+      - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
+      - { name: SB_DB_PATH, value: /var/lib/sandboxd/state.db }
+      - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
+      - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }
+      - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
+      - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
+      {{- if $root.Values.edge.enabled }}
+      - { name: SB_ENABLE_CADDY, value: "true" }
+      - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
+      {{- else }}
+      - { name: SB_ENABLE_CADDY, value: "false" }
+      {{- end }}
+      {{- if ($root.Values.enterprise | default dict).enabled }}
+      - { name: SB_ENTERPRISE_MODE, value: "true" }
+      {{- end }}
+      {{- with include "aerolvm.egressRangeEnv" $root | trim }}{{ . | nindent 6 }}{{ end }}
+      {{- range $k, $v := $root.Values.worker.extraEnv }}
+      - { name: {{ $k }}, value: {{ $v | quote }} }
+      {{- end }}
+      {{- end }}
     volumeMounts:
       - { name: containerd, mountPath: /var/lib/containerd }
+      {{- if $split }}
+      # Privilege mode split: every folder the agent writes is read only
+      # here (its run folder, where it writes the ownership lease the
+      # supervisor reads, and the folder it copies toolboxd to), or not
+      # mounted at all (its state volume). The one exception is the shared
+      # folder below, whose top is root's: the agent writes only in its own
+      # folder there, which root never writes in.
+      - { name: run-containerd, mountPath: /run/containerd }
+      - { name: run-aerolvm, mountPath: /run/aerolvm, readOnly: true }
+      - { name: run-runtime, mountPath: /run/aerolvm-runtime }
+      - { name: toolbox, mountPath: /opt/aerolvm/toolbox, readOnly: true }
+      {{- else }}
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-containerd, mountPath: /run/containerd }
       - { name: run-aerolvm, mountPath: /run/aerolvm }
       - { name: run-sandboxd, mountPath: /run/sandboxd }
       - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
+      {{- end }}
+      {{- if $split }}
+      # The helper's socket, ready sockets and task output, which the agent
+      # opens, and the agent's own run folder, on one filesystem: the
+      # helper links each ready socket the agent makes, and a link cannot
+      # cross mounts. The folder the agent stages the helper in, read here
+      # only. The CNI plugins' address records, which outlive a helper
+      # restart (one lost would give a running sandbox's address again).
+      # Namespaces and mounts the helper makes stay in this container's
+      # own mounts: no two-way propagation, so none reaches the machine.
+      - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
+      - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage, readOnly: true }
+      - { name: cni-state, mountPath: /var/lib/cni }
+      {{- else }}
       # The network namespaces the agent makes, where containerd starts
       # sandboxes in them. Bidirectional, so the supervisor's unmount
       # when the pod ends reaches the machine; left mounted there, they
       # keep the pod in Terminating (finding F8).
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+      {{- end }}
       {{- if $root.Values.worker.isolate.enabled }}
       # The V8 jail's chroots, here only to unmount their tmpfs mounts
       # when the pod ends.
@@ -140,11 +290,52 @@ containers:
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
     securityContext:
+      {{- if $split }}
+      # Privilege mode split (plans/security-gaps-m1-m4.md §3.3): no rights
+      # at all. 65531 is the agent's own uid: the root helper lets in only
+      # that uid, and refuses 65532, which edge, egress and the operator
+      # share (review H3). Writes go to its volumes alone.
+      runAsUser: 65531
+      runAsGroup: 65531
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+      {{- else }}
       privileged: true
+      {{- end }}
     command: ["/bin/bash", "-c"]
     args:
       - |
         set -eu
+        {{- if $split }}
+        # The cgroup the runtime container set up for sandboxes, in its
+        # folder this container reads only. containerd is reached only
+        # through the root helper's socket.
+        for _ in $(seq 1 120); do
+          [ -s /run/aerolvm-runtime/cgroup-parent ] && break
+          sleep 1
+        done
+        [ -s /run/aerolvm-runtime/cgroup-parent ] || { echo "agent: the runtime container did not start" >&2; exit 1; }
+        SB_CONTAINERD_CGROUP_PARENT="$(cat /run/aerolvm-runtime/cgroup-parent)"
+        export SB_CONTAINERD_CGROUP_PARENT
+        # The root helper from this image, staged for the runtime
+        # container's supervisor. It runs a helper only when a release
+        # key built into it signed the helper, and never an older one
+        # (internal/rootswap): what is staged here is trusted by nothing.
+        # Each file is written whole under another name, then renamed.
+        stage=/run/aerolvm-rootd-stage
+        for f in aerolvm-rootd aerolvm-rootd.sig aerolvm-rootd.manifest; do
+          [ -f "/opt/aerolvm/rootd/$f" ] || { echo "agent: privilege mode split needs a signed root helper, and this image has no /opt/aerolvm/rootd/$f" >&2; exit 1; }
+          cp "/opt/aerolvm/rootd/$f" "$stage/.$f.new"
+        done
+        for f in aerolvm-rootd aerolvm-rootd.sig aerolvm-rootd.manifest; do
+          mv -f "$stage/.$f.new" "$stage/$f"
+        done
+        {{- else }}
         # The runtime container's containerd socket and the cgroup it
         # set up for sandboxes, both on shared folders.
         for _ in $(seq 1 120); do
@@ -154,13 +345,21 @@ containers:
         [ -s /run/aerolvm/cgroup-parent ] || { echo "agent: the runtime container did not start" >&2; exit 1; }
         SB_CONTAINERD_CGROUP_PARENT="$(cat /run/aerolvm/cgroup-parent)"
         export SB_CONTAINERD_CGROUP_PARENT
+        {{- end }}
         # containerd bind-mounts toolboxd into each sandbox from the
         # runtime container, so it must be on a shared folder. Replaced
         # by rename: running sandboxes keep the copy they started with.
         cp /usr/local/bin/toolboxd /opt/aerolvm/toolbox/.toolboxd.new
         mv -f /opt/aerolvm/toolbox/.toolboxd.new /opt/aerolvm/toolbox/toolboxd
+        {{- if $split }}
+        # /run/sandboxd is the volume's own folder, root's; only this
+        # container mounts it in split.
+        mkdir -p /var/lib/sandboxd/mounts
+        chmod 0700 /var/lib/sandboxd/mounts
+        {{- else }}
         mkdir -p /var/lib/sandboxd/mounts /run/sandboxd
         chmod 0700 /var/lib/sandboxd/mounts /run/sandboxd
+        {{- end }}
         {{- if $root.Values.edge.enabled }}
         # Caddy's admin API first, as systemd orders the two on a VM:
         # sandboxd sets caddy-l4 up on :443 when it starts, and after a
@@ -229,7 +428,21 @@ containers:
       {{- end }}
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_MOUNTS_ROOT, value: /var/lib/sandboxd/mounts }
+      {{- if $split }}
+      # Privilege mode split: sandboxd's run folder, where it makes each
+      # sandbox's ready socket, sits on the folder it shares with the root
+      # helper, which links the socket into a folder of its own (a link
+      # stays on one filesystem). The helper is reached on its socket
+      # there, and containerd through it.
+      - { name: SB_MOUNTS_CRED_DIR, value: /run/aerolvm-rootd/shared/agent }
+      - { name: SB_PRIVILEGE_MODE, value: split }
+      - { name: SB_ROOTD_SOCKET, value: /run/aerolvm-rootd/shared/sock/root.sock }
+      # The disk floor reads the sandbox volume's free space through an
+      # empty folder on it: containerd's root is not mounted here.
+      - { name: SB_DISK_FLOOR_PATH, value: /var/lib/aerolvm-disk }
+      {{- else }}
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
+      {{- end }}
       {{- if $externalStorage }}
       # The runtime container's pid: a create answers only once each
       # external mount shows there, where runsc builds the sandbox (F13).
@@ -271,7 +484,7 @@ containers:
       - { name: SB_JAILER_GID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
       {{- end }}
       # The runtime image's aerolvm-runsc restores a moved gVisor sandbox.
-      - { name: SB_GVISOR_CHECKPOINT_MOVES, value: {{ $root.Values.worker.gvisor.checkpointMoves | quote }} }
+      - { name: SB_GVISOR_CHECKPOINT_MOVES, value: {{ $moves | quote }} }
       - { name: SB_CONTAINER_ENGINE, value: containerd }
       - { name: SB_CONTAINERD_SOCKET, value: /run/containerd/containerd.sock }
       - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }
@@ -322,11 +535,21 @@ containers:
     resources:
       {{- toYaml $root.Values.worker.agent.resources | nindent 6 }}
     volumeMounts:
+      {{- if $split }}
+      # Privilege mode split: no containerd root, no containerd socket, no
+      # network namespace folder. The root helper reads an image's users
+      # (ResolveImageUser) and makes namespaces; containerd is reached
+      # through the helper's gate. Of containerd's volume, one empty folder,
+      # read only, so the disk floor can see how full it is.
+      - { name: containerd, mountPath: /var/lib/aerolvm-disk, subPath: aerolvm-disk-floor, readOnly: true }
+      - { name: state, mountPath: /var/lib/sandboxd }
+      {{- else }}
       # containerd's root too: containerd's client library, inside
       # sandboxd, mounts an image's snapshot to read its users (S2).
       - { name: containerd, mountPath: /var/lib/containerd }
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-containerd, mountPath: /run/containerd }
+      {{- end }}
       - { name: run-aerolvm, mountPath: /run/aerolvm }
       - { name: run-sandboxd, mountPath: /run/sandboxd }
       - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
@@ -338,6 +561,22 @@ containers:
       {{- end }}
       {{- with include "aerolvm.identityFileMount" $root }}{{ . | nindent 6 }}{{ end }}
       {{- with include "aerolvm.auditMount" $root }}{{ . | nindent 6 }}{{ end }}
+      {{- if $split }}
+      # The folder sandboxd shares with the root helper (the helper's
+      # socket, ready sockets, task output), the folder it stages the
+      # helper in, and a writable /tmp: its own disk is read only. The
+      # runtime container's folder for the cgroup parent, read only.
+      - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
+      - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage }
+      - { name: tmp, mountPath: /tmp }
+      - { name: run-runtime, mountPath: /run/aerolvm-runtime, readOnly: true }
+      # The machine's cgroup tree, read only: sandboxd sizes its capacity
+      # from the sandboxes' cgroup and reads each one's usage (C7, C20).
+      # Its own cgroup namespace shows only its own group. It cannot
+      # write here (cgroup files are root's), and changes go through the
+      # helper, which writes each sandbox's settings.
+      - { name: host-cgroup, mountPath: /sys/fs/cgroup, readOnly: true }
+      {{- else }}
       # The CNI host-local plugin's record of the addresses it gave
       # out. In the container's own filesystem it was lost on an agent
       # restart, and the next warm slot got a running sandbox's
@@ -345,6 +584,7 @@ containers:
       - { name: cni-state, mountPath: /var/lib/cni }
       # Kubernetes allows Bidirectional only in privileged containers.
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
+      {{- end }}
       {{- if $root.Values.worker.isolate.enabled }}
       # The V8 jail's chroots. Each group's run and tmp folders get a
       # tmpfs; Bidirectional, so a restarted agent finds them and takes
@@ -412,6 +652,11 @@ containers:
       - egress-gateway
     env:
       - { name: SB_EGRESS_PEER_CGROUP, value: none }
+      {{- if $split }}
+      # sandboxd's uid in privilege mode split: only it may use the
+      # gateway's control socket (root is no longer sandboxd).
+      - { name: SB_EGRESS_PEER_UIDS, value: "65531" }
+      {{- end }}
       - { name: SB_EGRESS_STATE_DIR, value: /var/lib/aerolvm-egress }
       # The gateway dials for sandboxes itself, so it must refuse the
       # same addresses sandboxd's firewall does (C24).
@@ -448,7 +693,16 @@ volumes:
         - { key: {{ $root.Values.worker.registryCA.key | default "ca.crt" | quote }}, path: registry-ca.crt }
   {{- end }}
   - { name: cni-state, emptyDir: {} }
+  {{- if $split }}
+  - { name: rootd-shared, emptyDir: {} }
+  - { name: run-runtime, emptyDir: {} }
+  - { name: rootd-stage, emptyDir: {} }
+  - { name: tmp, emptyDir: {} }
+  - name: host-cgroup
+    hostPath: { path: /sys/fs/cgroup, type: Directory }
+  {{- else }}
   - { name: netns, emptyDir: {} }
+  {{- end }}
   {{- if $externalStorage }}
   - { name: mounts, emptyDir: {} }
   {{- end }}
