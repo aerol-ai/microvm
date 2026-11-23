@@ -671,7 +671,7 @@ containers:
       # gateway's control socket (root is no longer sandboxd). The socket
       # is made in this container's own folder: the agent writes
       # /run/aerolvm, and the gateway makes the socket and sets its mode
-      # by name.
+      # by name. The gateway refuses a folder another user can write.
       - { name: SB_EGRESS_PEER_UIDS, value: "65531" }
       - { name: SB_EGRESS_GATEWAY_SOCKET, value: /run/aerolvm-egress/egress-gateway.sock }
       {{- end }}

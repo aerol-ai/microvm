@@ -104,6 +104,12 @@ func socketListener(path string, peers ...uint32) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
+	mode := socketMode(peers)
+	if mode != 0o600 {
+		if err := ownFolder(filepath.Dir(path)); err != nil {
+			return nil, err
+		}
+	}
 	_ = os.Remove(path)
 	old := syscall.Umask(0o077)
 	ln, err := net.Listen("unix", path)
@@ -111,11 +117,35 @@ func socketListener(path string, peers ...uint32) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("egress gateway: listen %s: %w", path, err)
 	}
-	if err := os.Chmod(path, socketMode(peers)); err != nil {
+	if err := os.Chmod(path, mode); err != nil {
 		_ = ln.Close()
 		return nil, err
 	}
 	return ln, nil
+}
+
+// ownFolder checks the folder for a socket open to every user: a real
+// folder, not a link, owned by this user or root, that no one else can
+// write. The gateway removes, binds and sets the mode of its socket by
+// name, and the user it opens the socket for (sandboxd's, in privilege
+// mode split) must not be able to put another file at that name in
+// between. The chart gives a split worker's gateway a folder of its own
+// for this (/run/aerolvm-egress), which the agent mounts read only.
+func ownFolder(dir string) error {
+	st, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("egress gateway: socket folder: %w", err)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	switch {
+	case !st.IsDir():
+		return fmt.Errorf("egress gateway: socket folder %s is not a folder", dir)
+	case !ok || (sys.Uid != 0 && sys.Uid != uint32(os.Getuid())):
+		return fmt.Errorf("egress gateway: socket folder %s belongs to another user", dir)
+	case st.Mode().Perm()&0o022 != 0:
+		return fmt.Errorf("egress gateway: other users can write socket folder %s (mode %o); the socket it opens to them needs a folder they cannot write", dir, st.Mode().Perm())
+	}
+	return nil
 }
 
 // socketMode is the mode of a socket the gateway makes itself: 0600, which
