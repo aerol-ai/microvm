@@ -98,8 +98,11 @@ TestChartRefusesWhatSplitRefuses keeps this list and the daemon's in step. */ -}
 {{- /* strconv.ParseBool's words, which sandboxd reads switches with. */ -}}
 {{- $true := list "1" "t" "T" "TRUE" "true" "True" -}}
 {{- $false := list "0" "f" "F" "FALSE" "false" "False" -}}
+{{- /* Firecracker: sandboxd refuses it in split while the helper does not
+keep the guests' firewall or VM snapshots (privmode's firecracker steps),
+and this chart does not wire it into a split worker pod yet. */}}
 {{- if $w.firecracker.enabled }}
-- worker.firecracker.enabled is true: the root helper does not run Firecracker VMs yet. Set it to false.
+- worker.firecracker.enabled is true: this chart does not run Firecracker in a split worker pod yet. Set it to false.
 {{- end }}
 {{- if $w.gvisor.checkpointMoves }}
 - worker.gvisor.checkpointMoves is true: the root helper does not take gVisor checkpoints for moves yet. Set it to false; a decommission then rebuilds or stops a gVisor sandbox as its failover policy says.

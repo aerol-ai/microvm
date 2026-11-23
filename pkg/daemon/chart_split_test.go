@@ -65,18 +65,13 @@ func chartGapRows() []chartGapRow {
 	}
 	moves := set(func(c *config.Config, on bool) { c.GvisorCheckpointMoves = on })
 	pool := set(func(c *config.Config, on bool) { c.ContainerdPoolEnabled = on })
-	fc := set(func(c *config.Config, on bool) { c.EnableFirecracker = on })
-	return []chartGapRow{
-		{name: "Firecracker", flags: []string{"--set", "worker.firecracker.enabled=true"}, chart: "worker.firecracker.enabled",
-			env: "SB_ENABLE_FIRECRACKER", set: fc, step: privmode.StepFirecracker},
+	return append(firecrackerGapRows(), []chartGapRow{
 		{name: "gVisor moves", flags: []string{"--set", "worker.gvisor.checkpointMoves=true"}, chart: "worker.gvisor.checkpointMoves",
 			env: "SB_GVISOR_CHECKPOINT_MOVES", set: moves, step: privmode.StepMoves},
 		{name: "the agent-sandbox API's warm pools", flags: append(slices.Clone(chartClusterFlags), "--set", "cluster.agentSandboxAPI.enabled=true"),
 			chart: "cluster.agentSandboxAPI.enabled", env: "SB_CONTAINERD_POOL_ENABLED", set: pool, step: privmode.StepWarmPool},
 		{name: "the warm pool in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_CONTAINERD_POOL_ENABLED=true"},
 			chart: "worker.extraEnv.SB_CONTAINERD_POOL_ENABLED", env: "SB_CONTAINERD_POOL_ENABLED", set: pool, step: privmode.StepWarmPool},
-		{name: "Firecracker in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_FIRECRACKER=true"},
-			chart: "worker.extraEnv.SB_ENABLE_FIRECRACKER", env: "SB_ENABLE_FIRECRACKER", set: fc, step: privmode.StepFirecracker},
 		{name: "gVisor moves in extraEnv", flags: []string{"--set", "worker.gvisor.checkpointMoves=false", "--set", "worker.extraEnv.SB_GVISOR_CHECKPOINT_MOVES=true"},
 			chart: "worker.extraEnv.SB_GVISOR_CHECKPOINT_MOVES", env: "SB_GVISOR_CHECKPOINT_MOVES", set: moves, step: privmode.StepMoves},
 		// WASM is refused whole on a split worker pod (a Kubernetes row
@@ -99,6 +94,41 @@ func chartGapRows() []chartGapRow {
 		{name: "WASM", flags: []string{"--set", "worker.wasm.enabled=true"}, chart: "worker.wasm.enabled"},
 		{name: "V8 isolates", flags: []string{"--set", "worker.isolate.enabled=true"}, chart: "worker.isolate.enabled"},
 		{name: "a helper setting in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ROOTD_AGENT_UID=1"}, chart: "worker.extraEnv.SB_ROOTD_AGENT_UID"},
+	}...)
+}
+
+// firecrackerGapRows are the chart's Firecracker refusals. The chart refuses
+// worker.firecracker.enabled whole in split: it does not wire Firecracker
+// into a split worker pod, and no live run has proven it. The daemon's own
+// gaps are narrower (M1 PR 9b): a worker with the host firewall on (the
+// chart always turns it on) waits for the guests' firewall, and one with
+// the VM pool waits for VM snapshots. Those steps are being renamed and
+// split (#1425, #1426): when they land, change only the step names here.
+func firecrackerGapRows() []chartGapRow {
+	const fcOn = "worker.firecracker.enabled=true"
+	// fc is a split worker with Firecracker on as the chart renders it:
+	// through the jailer, with the host firewall on.
+	fc := func(more func(*config.Config, string)) func(*config.Config, string) {
+		return func(c *config.Config, v string) {
+			c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true
+			if more != nil {
+				more(c, v)
+			}
+		}
+	}
+	guestRules := privmode.StepFirecrackerGuestRules
+	vmPool := privmode.StepFirecrackerSnapshots
+	return []chartGapRow{
+		{name: "Firecracker", flags: []string{"--set", fcOn}, chart: "worker.firecracker.enabled",
+			env: "SB_ENABLE_FIRECRACKER", set: fc(nil), step: guestRules},
+		{name: "Firecracker in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_FIRECRACKER=true"},
+			chart: "worker.extraEnv.SB_ENABLE_FIRECRACKER", env: "SB_ENABLE_FIRECRACKER", set: fc(nil), step: guestRules},
+		{name: "Firecracker's VM pool", flags: []string{"--set", fcOn, "--set", "worker.extraEnv.SB_FIRECRACKER_VMM_POOL_ENABLED=true"},
+			chart: "worker.firecracker.enabled", env: "SB_FIRECRACKER_VMM_POOL_ENABLED",
+			set: fc(func(c *config.Config, v string) { c.FirecrackerVMMPoolEnabled = isTrue(v) }), step: vmPool},
+		{name: "Firecracker without the jailer", flags: []string{"--set", fcOn, "--set", "worker.extraEnv.SB_FIRECRACKER_USE_JAILER=false"},
+			chart: "worker.firecracker.enabled", env: "SB_FIRECRACKER_USE_JAILER",
+			set: fc(func(c *config.Config, v string) { c.UseJailer = isTrue(v) }), want: "SB_FIRECRACKER_USE_JAILER=true"},
 	}
 }
 
@@ -110,6 +140,7 @@ func TestChartRefusalsCoverEveryDaemonGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	byName := privmodeSteps(t)
 	var steps []privmode.Step
 	for _, d := range f.Decls {
 		fn, ok := d.(*ast.FuncDecl)
@@ -123,7 +154,11 @@ func TestChartRefusalsCoverEveryDaemonGap(t *testing.T) {
 			}
 			// privmode.Step* constants; privmode.Step alone is the type.
 			if x, isIdent := sel.X.(*ast.Ident); isIdent && x.Name == "privmode" && strings.HasPrefix(sel.Sel.Name, "Step") && sel.Sel.Name != "Step" {
-				steps = append(steps, chartStepByName(t, sel.Sel.Name))
+				s, ok := byName[sel.Sel.Name]
+				if !ok {
+					t.Fatalf("privmode.%s is not a Step constant in internal/privmode/privmode.go", sel.Sel.Name)
+				}
+				steps = append(steps, s)
 			}
 			return true
 		})
@@ -143,20 +178,37 @@ func TestChartRefusalsCoverEveryDaemonGap(t *testing.T) {
 	}
 }
 
-// chartStepByName maps a privmode constant's name to its value.
-func chartStepByName(t *testing.T, name string) privmode.Step {
+// privmodeSteps maps each privmode Step constant's name to its value, read
+// from internal/privmode/privmode.go, so a step added or renamed there
+// needs no change here.
+func privmodeSteps(t *testing.T) map[string]privmode.Step {
 	t.Helper()
-	all := map[string]privmode.Step{
-		"StepImageUser": privmode.StepImageUser, "StepDiskQuota": privmode.StepDiskQuota,
-		"StepWasmCheckpoints": privmode.StepWasmCheckpoints, "StepWasmWarmPool": privmode.StepWasmWarmPool,
-		"StepWasmMounts": privmode.StepWasmMounts, "StepFirecracker": privmode.StepFirecracker,
-		"StepContainerFile": privmode.StepContainerFile, "StepWarmPool": privmode.StepWarmPool, "StepMoves": privmode.StepMoves,
+	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "..", "internal", "privmode", "privmode.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	s, ok := all[name]
-	if !ok {
-		t.Fatalf("privmode.%s is new: add it to chartStepByName", name)
+	out := map[string]privmode.Step{}
+	for _, d := range f.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if typ, isIdent := vs.Type.(*ast.Ident); !ok || !isIdent || typ.Name != "Step" {
+				continue
+			}
+			for i, name := range vs.Names {
+				if lit, isLit := vs.Values[i].(*ast.BasicLit); isLit && lit.Kind == token.STRING {
+					out[name.Name] = privmode.Step(strings.Trim(lit.Value, `"`))
+				}
+			}
+		}
 	}
-	return s
+	if len(out) == 0 {
+		t.Fatal("read no Step constant from internal/privmode/privmode.go")
+	}
+	return out
 }
 
 // Each row's value fails `helm template` with privilegeMode split, naming
