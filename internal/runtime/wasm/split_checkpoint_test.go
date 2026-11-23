@@ -5,7 +5,9 @@ package wasm
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -342,6 +344,47 @@ func TestSplitCheckpointRoundTrip(t *testing.T) {
 	if _, err := d.RehydrateSandbox(ctx, &models.Sandbox{ID: "s2", ModuleRef: "demo.wasm", ModuleDigest: "abc123",
 		CheckpointPath: path, CloneGeneration: "a-newer-generation"}, nil); !errors.Is(err, models.ErrSnapshotFenced) {
 		t.Fatalf("a stale checkpoint: %v", err)
+	}
+}
+
+// BenchmarkPromoteCheckpoint is the cost of publishing a staged checkpoint:
+// single mode's take-back by owner against split mode's copy, for a
+// snapshot whose memory does not compress (the copy's worst case).
+func BenchmarkPromoteCheckpoint(b *testing.B) {
+	for _, size := range []int{1 << 20, 16 << 20} {
+		memory := make([]byte, size)
+		if _, err := cryptorand.Read(memory); err != nil {
+			b.Fatal(err)
+		}
+		for _, mode := range []string{"single", "split"} {
+			b.Run(fmt.Sprintf("%s/%dMiB", mode, size>>20), func(b *testing.B) {
+				// As root, single mode hands the stage to a worker uid and
+				// takes it back by owner, as on a node.
+				uid := os.Getuid()
+				if uid == 0 {
+					uid = 61000
+				}
+				d := New(Config{ModulesDir: b.TempDir(), Worker: worker.Confinement{UID: uid, GID: os.Getgid()}}, nil)
+				if mode == "split" {
+					d.cfg.HelperSockets, d.cfg.Worker.GID = helperSockets, shareGID()
+				}
+				final := d.checkpointDir("sb-1")
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					staged, err := d.stageCheckpoint(final)
+					if err == nil {
+						err = wasmengine.WriteSnapshotDir(staged, wasmengine.SnapshotCapture{Memory: memory})
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					b.StartTimer()
+					if err := d.promoteCheckpoint(staged, final); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
 	}
 }
 
