@@ -274,7 +274,7 @@ func TestWasmHostTeardownAndPresent(t *testing.T) {
 	if err := w.teardown("../x"); err == nil {
 		t.Fatal("a teardown up the tree")
 	}
-	if p, l := w.prepare("sb-1", false); p == nil || l != nil {
+	if p, l := w.prepare("sb-1", false, nil); p == nil || l != nil {
 		t.Fatalf("prepare = %v, %v", p, l)
 	}
 	if _, ok := w.limits(rootpolicy.HostLimits{}); ok {

@@ -66,6 +66,9 @@ import (
 type Driver struct {
 	cfg    Config
 	logger *slog.Logger
+	// split is the root helper in privilege mode split (split.go); nil in
+	// single mode, which this leaves as it was.
+	split SplitHelper
 	// netRules is the per-guest-IP host firewall (egress Phase 4); nil
 	// keeps every network-rule method unimplemented.
 	netRules  NetRules
@@ -531,7 +534,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: KernelImage not configured (SB_FIRECRACKER_KERNEL): %w",
 			models.ErrRuntimeNotImplemented)
 	}
-	if _, err := os.Stat(d.cfg.KernelImage); err != nil {
+	// In privilege mode split the kernel is the root helper's: it checks
+	// the file and puts it in every jail itself.
+	if _, err := os.Stat(d.cfg.KernelImage); err != nil && d.split == nil {
 		return nil, fmt.Errorf("firecracker runtime: kernel %q unreachable: %w",
 			d.cfg.KernelImage, err)
 	}
@@ -605,6 +610,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("firecracker runtime: template %q resolve: %w", req.TemplateID, err)
 		}
 		d.noteStaleTemplate(earlySnap)
+		if earlySnap.HasSnapshot && d.split != nil {
+			return nil, fmt.Errorf("firecracker runtime: template %q: %w", req.TemplateID, errSplitSnapshots)
+		}
 	}
 	warmStart := time.Now()
 	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
@@ -710,7 +718,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	//   - Ad-hoc (Phase 1): no TemplateID; run the OCI pipeline as
 	//     before. Builds rootfs straight into the runDir so the jailer
 	//     chroot already covers it.
-	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+	rootfsPath := filepath.Join(stageDirOf(handle), rootfsFileName)
 	// Snapshot-load path is opt-in per template. When the resolver returns
 	// HasSnapshot=true we skip configureVMM + InstanceStart and instead
 	// issue LoadSnapshot + Resume on the same paused VMM. The pool slot
@@ -878,7 +886,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// directly; default off — see pr-review.md §2 boot-path latency.
 	var overlayPath string
 	if req.OverlaySizeGB > 0 {
-		overlayPath = filepath.Join(handle.RunDir(), overlayFileName)
+		overlayPath = filepath.Join(stageDirOf(handle), overlayFileName)
 		if err := allocateSparse(overlayPath, int64(req.OverlaySizeGB)<<30); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: overlay alloc: %w", err)
 		}
@@ -886,9 +894,8 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			if d.cfg.Mkfs4Bin == "" {
 				return nil, fmt.Errorf("firecracker runtime: SB_FIRECRACKER_OVERLAY_MKFS=true but SB_FIRECRACKER_MKFS_BIN is unset")
 			}
-			cmd := exec.CommandContext(ctx, d.cfg.Mkfs4Bin, "-F", overlayPath)
-			if out, mErr := cmd.CombinedOutput(); mErr != nil {
-				return nil, fmt.Errorf("firecracker runtime: mkfs.ext4 overlay: %w (stderr: %s)", mErr, strings.TrimSpace(string(out)))
+			if mErr := d.makeOverlayFS(ctx, overlayPath); mErr != nil {
+				return nil, fmt.Errorf("firecracker runtime: mkfs.ext4 overlay: %w", mErr)
 			}
 		}
 	}
@@ -931,6 +938,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	} else {
 		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: action InstanceStart: %w", err)
+		}
+		// Split mode: the helper gives the vsock socket, bound at the
+		// start, to sandboxd's group.
+		if err := shareSockets(ctx, handle); err != nil {
+			return nil, fmt.Errorf("firecracker runtime: share the VM's sockets: %w", err)
 		}
 	}
 	timing.RecordStage("fc_resume", time.Since(resumeStart))
@@ -1500,6 +1512,9 @@ func ociImageRefFor(ref string) string {
 // running; a restore needs StartWithIdentity, which the service always uses
 // (runtime.IdentityStarter).
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
+	if err := d.splitGap(); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
 	return d.startFromSandboxSnapshot(ctx, sandboxID, "")
 }
 
@@ -1514,6 +1529,9 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 	if containerRef != sandboxID {
 		return nil, fmt.Errorf("firecracker runtime: start %q: runtime reference does not name sandbox %q", containerRef, sandboxID)
 	}
+	if err := d.splitGap(); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
 	return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
 }
 
@@ -1523,6 +1541,9 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 // and vsock identity; Destroy releases that allocation and deletes the
 // snapshot.
 func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
+	if err := d.splitGap(); err != nil {
+		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
+	}
 	// A snapshot of the running VM may have its filesystem frozen; stopping
 	// now would save the VM frozen. Wait for the thaw.
 	release, err := d.gate.lock(ctx, sandboxID)
@@ -1972,6 +1993,9 @@ func (d *Driver) PushAllowedPorts(_ context.Context, _, _ string, _ []int) error
 // every VM runs as the one jailer uid, and a shared inode that uid owned
 // could be rewritten by any VM's firecracker process, for every VM after it.
 func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error) {
+	if d.split != nil {
+		return d.splitStage(srcAbs, destName, false)
+	}
 	if !d.cfg.UseJailer {
 		return srcAbs, nil
 	}
@@ -2007,6 +2031,9 @@ func (d *Driver) chrootFilePath(runDir, srcAbs, destName string) (string, error)
 // file an earlier release chowned to the jailer uid is given back to root
 // here.
 func (d *Driver) chrootSharedFile(runDir, srcAbs, destName string) (string, error) {
+	if d.split != nil {
+		return d.splitStage(srcAbs, destName, true)
+	}
 	if !d.cfg.UseJailer {
 		return srcAbs, nil
 	}
@@ -2125,4 +2152,13 @@ func linkOrCopyRootfs(src, dst string) error {
 	}
 
 	return copyRootfsPrivate(src, dst)
+}
+
+// runOverlayMkfs formats an overlay file as ext4 with mkfs.ext4 -F (single
+// mode, as root).
+func runOverlayMkfs(ctx context.Context, mkfs, path string) error {
+	if out, err := exec.CommandContext(ctx, mkfs, "-F", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

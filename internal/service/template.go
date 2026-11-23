@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -160,6 +161,11 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	}
 	if s.templateBuilder == nil {
 		return nil, errors.New("template builder is not configured")
+	}
+	if s.cfg.PrivilegeMode == privmode.Split {
+		// A template is a VM's snapshot, and in split mode sandboxd could
+		// not read the files firecracker writes for it (M1 PR 9b).
+		return nil, privmode.NotYet("build a Firecracker template", privmode.StepFirecrackerSnapshots)
 	}
 	image := strings.TrimSpace(req.Image)
 	if image == "" {

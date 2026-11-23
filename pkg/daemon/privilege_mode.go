@@ -84,8 +84,21 @@ func checkPrivilegeMode(cfg config.Config) error {
 			gaps = append(gaps, privmode.StepWasmWarmPool)
 		}
 	}
+	// Firecracker VMs are the helper's from M1 PR 9b (split_firecracker.go):
+	// it runs the jailer, makes each VM's jail, TAP and filesystems. It
+	// always runs the jailer, and it does not yet keep the guests'
+	// firewall or a VM's memory and state files.
 	if cfg.EnableFirecracker {
-		gaps = append(gaps, privmode.StepFirecracker)
+		if !cfg.UseJailer {
+			return errors.New("SB_PRIVILEGE_MODE=split runs every Firecracker VM through the root helper's jailer: " +
+				"set SB_FIRECRACKER_USE_JAILER=true, or run this node in privilege mode single")
+		}
+		if cfg.EnableNetworkRules {
+			gaps = append(gaps, privmode.StepFirecrackerGuestRules)
+		}
+		if cfg.FirecrackerVMMPoolEnabled {
+			gaps = append(gaps, privmode.StepFirecrackerSnapshots)
+		}
 	}
 	if cfg.GvisorCheckpointMoves {
 		gaps = append(gaps, privmode.StepMoves)

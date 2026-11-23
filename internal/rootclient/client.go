@@ -666,6 +666,13 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureStopHost:      true,
 	rootdpb.FeatureListHosts:     true,
 	rootdpb.FeatureSetHostLimits: true,
+	// Firecracker's (M1 PR 9b): EnsureTap and RemoveTap leave one device
+	// as it should be, by name; MakeFilesystem writes the same empty
+	// filesystem, or the same folder's files, into a file in the stage
+	// folder again.
+	rootdpb.FeatureEnsureTap:      true,
+	rootdpb.FeatureRemoveTap:      true,
+	rootdpb.FeatureMakeFilesystem: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -772,6 +779,10 @@ var networkCalls = map[string]bool{
 	rootdpb.FeaturePrepareHost: true,
 	rootdpb.FeatureSpawnHost:   true,
 	rootdpb.FeatureStopHost:    true,
+	// A TAP's first call puts in the guests' NAT and isolation (the xtables
+	// lock).
+	rootdpb.FeatureEnsureTap: true,
+	rootdpb.FeatureRemoveTap: true,
 }
 
 // mountCalls are the calls bounded by the mount timeout: they wait for
@@ -782,6 +793,8 @@ var mountCalls = map[string]bool{
 	rootdpb.FeatureSweepExternalMounts: true,
 	// An NFS mount, a delete of a volume's files, an unmount.
 	rootdpb.FeatureReclaimVolume: true,
+	// mkfs.ext4 of a VM's root disk copies the image's files in.
+	rootdpb.FeatureMakeFilesystem: true,
 }
 
 // callErr turns a typed call's gRPC error into the client's own. A refusal

@@ -27,7 +27,7 @@ func TestWorkerdJailIsMadeFresh(t *testing.T) {
 	}
 	w := newWorkerdHosts(&WorkerdHostsConfig{Jail: isolate.RootJail{ChrootBase: base, WorkerdPath: self, UID: 1000, GID: 1000,
 		AgentUID: 65531, SeccompMode: isolate.SeccompEnforce, ShimPath: self}, PidsMax: 64}, filepath.Join(t.TempDir(), "hosts.log"))
-	resp, err := w.prepare("g1", false)
+	resp, err := w.prepare("g1", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestWorkerdJailIsMadeFresh(t *testing.T) {
 	if err := os.WriteFile(left, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.prepare("g1", false); err != nil {
+	if _, err := w.prepare("g1", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(left); !os.IsNotExist(err) {
@@ -46,7 +46,7 @@ func TestWorkerdJailIsMadeFresh(t *testing.T) {
 	if err := os.WriteFile(left, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.prepare("g1", true); err != nil {
+	if _, err := w.prepare("g1", true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(left); err != nil {

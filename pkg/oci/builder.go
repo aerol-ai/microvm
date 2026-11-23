@@ -72,6 +72,12 @@ type Config struct {
 	// Mkfs4Bin: path to `mkfs.ext4` (from e2fsprogs). Builds the
 	// single-file ext4 image from the unpacked rootfs.
 	Mkfs4Bin string
+	// Mkfs, when set, makes the ext4 image in place of running Mkfs4Bin
+	// here: source is the unpacked rootfs, out the image, sizeMiB its
+	// size. Privilege mode split sets it (M1 PR 9b): sandboxd is not root,
+	// so the root helper runs mkfs.ext4 as sandboxd's user seen as root, and
+	// the image's files come out root's as they do here.
+	Mkfs func(ctx context.Context, source, out string, sizeMiB int) error
 	// WorkDir: the parent directory under which per-build staging trees
 	// live. Each Builder.Build call creates a fresh subdirectory here.
 	// Should be on a filesystem with at least 2x the largest image size
@@ -414,6 +420,12 @@ func (b *Builder) runMkfs(ctx context.Context, rootfsSrc, outPath string, minSiz
 	sizeMiB, err := ext4SizeMiB(rootfsSrc, minSizeMiB)
 	if err != nil {
 		return fmt.Errorf("oci: size rootfs %s: %w", rootfsSrc, err)
+	}
+	if b.cfg.Mkfs != nil {
+		if err := b.cfg.Mkfs(ctx, rootfsSrc, outPath, sizeMiB); err != nil {
+			return fmt.Errorf("oci: mkfs.ext4: %w", err)
+		}
+		return nil
 	}
 	args := []string{
 		"-d", rootfsSrc,

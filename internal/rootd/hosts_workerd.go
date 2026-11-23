@@ -68,7 +68,7 @@ func (w *workerdHosts) ensureBase() error {
 	return nil
 }
 
-func (w *workerdHosts) prepare(id string, running bool) (*rootdpb.PrepareHostResponse, error) {
+func (w *workerdHosts) prepare(id string, running bool, _ *rootdpb.PrepareHostRequest) (*rootdpb.PrepareHostResponse, error) {
 	if running {
 		// A group that still runs keeps its jail; one whose jail is not
 		// whole is not torn down under it.

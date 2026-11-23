@@ -57,6 +57,9 @@ const (
 	// The root helper's host-process calls (hosts.go).
 	RuleHost       Rule = "host"
 	RuleHostLimits Rule = "host_limits"
+	// RuleTap: a TAP device that is not one of the Firecracker TAP pool's
+	// (M1 PR 9b).
+	RuleTap Rule = "tap"
 )
 
 // Violation is a refused request: which rule, and what about the request

@@ -47,6 +47,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/network/tap/taphost"
 	"github.com/aerol-ai/microvm/internal/network/workerfence"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
@@ -153,6 +154,13 @@ type Options struct {
 	// WorkerFence keeps the WASM worker user's fence (hosts_wasm.go). Nil:
 	// the kernel's nft.
 	WorkerFence workerfence.Backend
+	// TapDevices makes and removes the Firecracker guests' TAPs (taps.go);
+	// TapTables is their NAT's and isolation's iptables. Nil: the kernel's.
+	TapDevices TapDevices
+	TapTables  func() (taphost.IsolationBackend, error)
+	// TapSysctls turns forwarding on before the first TAP. Nil:
+	// hostnet.EnsureForwardingSysctls.
+	TapSysctls func() error
 	// hostLaunchers stand in for the kinds' own parts in tests.
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
 }
@@ -182,6 +190,8 @@ type Server struct {
 	// hosts serves the host-process calls; nil when the helper serves no
 	// host kind.
 	hosts *hostCalls
+	// taps serves the Firecracker TAP calls; nil without Firecracker.
+	taps *tapCalls
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -255,9 +265,12 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.net = newNetwork(cfg, opts.Network, locks)
 	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
 	s.hosts = newHostCalls(cfg, opts, locks, log)
+	if fc := cfg.Hosts.Firecracker; fc != nil {
+		s.taps = newTapCalls(fc, opts, locks, log)
+	}
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
-		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts})
+		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -360,6 +373,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.fw.close()
 		s.mounts.close()
 		s.hosts.close()
+		s.taps.close()
 	})
 }
 
@@ -505,6 +519,8 @@ type helper struct {
 	// hc serves the host-process calls; nil when this helper serves no
 	// host kind.
 	hc *hostCalls
+	// tc serves the Firecracker TAP calls; nil without Firecracker.
+	tc *tapCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -534,6 +550,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.hc != nil {
 		served = append(served, hostFeatures...)
+	}
+	if h.tc != nil {
+		served = append(served, tapFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
 		Hosts: h.hc.servedKinds()}, nil
@@ -835,6 +854,37 @@ func (h helper) SetHostLimits(ctx context.Context, req *rootdpb.SetHostLimitsReq
 	}
 	resp, err := h.hc.setHostLimits(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_SetHostLimits_FullMethodName, resp, err)
+}
+
+func (h helper) EnsureTap(ctx context.Context, req *rootdpb.EnsureTapRequest) (*rootdpb.EnsureTapResponse, error) {
+	if h.tc == nil {
+		return nil, noFirecracker(rootdpb.FeatureEnsureTap)
+	}
+	resp, err := h.tc.ensureTap(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_EnsureTap_FullMethodName, resp, err)
+}
+
+func (h helper) RemoveTap(ctx context.Context, req *rootdpb.RemoveTapRequest) (*rootdpb.RemoveTapResponse, error) {
+	if h.tc == nil {
+		return nil, noFirecracker(rootdpb.FeatureRemoveTap)
+	}
+	resp, err := h.tc.removeTap(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_RemoveTap_FullMethodName, resp, err)
+}
+
+func (h helper) MakeFilesystem(ctx context.Context, req *rootdpb.MakeFilesystemRequest) (*rootdpb.MakeFilesystemResponse, error) {
+	fc := h.hc.firecracker()
+	if fc == nil {
+		return nil, noFirecracker(rootdpb.FeatureMakeFilesystem)
+	}
+	resp, err := fc.makeFilesystem(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_MakeFilesystem_FullMethodName, resp, err)
+}
+
+// noFirecracker answers a Firecracker call on a helper whose settings run
+// no Firecracker, as one it lacks, which is what Version told the agent.
+func noFirecracker(call string) error {
+	return status.Errorf(codes.Unimplemented, "root helper %s: %s needs Firecracker (SB_ENABLE_FIRECRACKER) in its own settings", version.Version, call)
 }
 
 // noNetwork answers a network call on a helper with no network

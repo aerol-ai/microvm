@@ -509,12 +509,21 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// binary paths when EnableFirecracker=true; pkg/oci.New stat-
 		// checks them again at construction so a typo'd path crashes
 		// the daemon at boot rather than on first Create.
-		ociBuilder, err := oci.New(oci.Config{
+		var fcDriver *fcruntime.Driver
+		ociCfg := oci.Config{
 			SkopeoBin: cfg.FirecrackerSkopeoBin,
 			UmociBin:  cfg.FirecrackerUmociBin,
 			Mkfs4Bin:  cfg.FirecrackerMkfs4Bin,
 			WorkDir:   filepath.Join(cfg.FirecrackerRunDir, "oci-work"),
-		})
+		}
+		if helper != nil {
+			// Privilege mode split (M1 PR 9b): the root helper makes the
+			// VM's root disk, as sandboxd's own user seen as root.
+			ociCfg.Mkfs = func(ctx context.Context, src, out string, sizeMiB int) error {
+				return fcDriver.SplitMkfs(ctx, src, out, sizeMiB)
+			}
+		}
+		ociBuilder, err := oci.New(ociCfg)
 		if err != nil {
 			return fmt.Errorf("firecracker oci builder init: %w", err)
 		}
@@ -529,7 +538,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		logger.Info("firecracker rss sampler started",
 			"interval", cfg.FirecrackerRSSSamplerInterval,
 			"watermark_ratio", cfg.FirecrackerRSSWatermarkRatio)
-		fcDriver := fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
+		fcDriver = fcruntime.New(fcruntime.FromDaemonConfig(cfg), logger)
 		fcDriver.SetPool(&firecrackerPoolAdapter{inner: pool})
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: firecrackerTapHost(cfg)})
@@ -541,10 +550,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			fcDriver.SetImageStore(store)
 		}
 		configureAOCRPullAuth(logger, cfg, "firecracker", fcDriver)
-		// Not fatal: a node that booted before this keeps booting. Without
-		// it the guests have no NAT and the driver no firewall, so the
-		// service keeps refusing their egress options (501).
-		if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
+		if helper != nil {
+			// Privilege mode split (M1 PR 9b): the root helper runs the
+			// jailer, makes each VM's jail, TAP and filesystems, and puts
+			// in the guests' NAT and isolation at the first TAP. The
+			// guests' own firewall is not the helper's yet: split mode
+			// starts only with network rules off (checkPrivilegeMode), as
+			// single mode runs then.
+			fcDriver.SetSplit(splitFirecracker{h: helper})
+			logger.Info("firecracker VMs run through the root helper (privilege mode split)",
+				"chroot_base", cfg.JailerChrootBase, "jailer_uid", cfg.JailerUID)
+		} else if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
+			// Not fatal: a node that booted before this keeps booting.
+			// Without it the guests have no NAT and the driver no firewall,
+			// so the service keeps refusing their egress options (501).
 			logger.Error("firecracker egress: guests get no NAT or egress policies", "error", err)
 		} else {
 			defer stopFCEgress()

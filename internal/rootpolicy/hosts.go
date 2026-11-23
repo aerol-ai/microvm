@@ -28,6 +28,8 @@ const (
 	HostWorkerd      HostKind = "workerd"
 	HostWasmWorker   HostKind = "wasm_worker"
 	HostWasmResident HostKind = "wasm_resident"
+	// HostFirecracker is one Firecracker VM, run by the jailer (M1 PR 9b).
+	HostFirecracker HostKind = "firecracker"
 )
 
 // The groups each kind's hosts start in, one level under the helper's
@@ -37,6 +39,10 @@ const (
 const (
 	WorkerdHostsGroup = "aerolvm-isolate"
 	WasmHostsGroup    = "aerolvm-wasm"
+	// FirecrackerHostsGroup is the VMs' group in privilege mode single
+	// too (internal/runtime/firecracker vmmCgroupDir): a VM is in
+	// aerolvm-vmm/<sandbox ID> whoever started it.
+	FirecrackerHostsGroup = "aerolvm-vmm"
 )
 
 // groupKeyPattern is a V8 isolate group key, as the isolate driver makes
@@ -47,8 +53,9 @@ var groupKeyPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 // CheckHostID refuses an id that is not one plain name of kind's shape:
 //
 //   - a V8 group key: the isolate driver's own pattern, with no "..";
-//   - a WASM worker's or resident host's key: a sandbox ID's shape
-//     (ValidateID: letters, digits, '-' and '_', at most 128).
+//   - a WASM worker's or resident host's key, or a Firecracker VM's
+//     sandbox ID: a sandbox ID's shape (ValidateID: letters, digits, '-'
+//     and '_', at most 128).
 func CheckHostID(kind HostKind, id string) error {
 	switch kind {
 	case HostWorkerd:
@@ -56,7 +63,7 @@ func CheckHostID(kind HostKind, id string) error {
 			return violate(RuleHost, "V8 group key %q: want %s with no \"..\"", id, groupKeyPattern)
 		}
 		return nil
-	case HostWasmWorker, HostWasmResident:
+	case HostWasmWorker, HostWasmResident, HostFirecracker:
 		if err := ValidateID(id); err != nil {
 			return violate(RuleHost, "%s id: %v", kind, err)
 		}
@@ -77,6 +84,8 @@ func HostGroup(kind HostKind, id string) string {
 		return path.Join(WasmHostsGroup, "w-"+id)
 	case HostWasmResident:
 		return path.Join(WasmHostsGroup, "r-"+id)
+	case HostFirecracker:
+		return path.Join(FirecrackerHostsGroup, id)
 	}
 	return ""
 }
@@ -93,6 +102,8 @@ func HostOfGroup(group string) (HostKind, string, bool) {
 	switch parent {
 	case WorkerdHostsGroup:
 		kind = HostWorkerd
+	case FirecrackerHostsGroup:
+		kind = HostFirecracker
 	case WasmHostsGroup:
 		var ok bool
 		if id, ok = strings.CutPrefix(name, "w-"); ok {

@@ -370,3 +370,19 @@ func TestWasmHostCode(t *testing.T) {
 		t.Fatalf("resident: %d %q %q", code, ran, out.String())
 	}
 }
+
+// TestJailerShimCode: the helper's own binary is the jailer's shim too.
+func TestJailerShimCode(t *testing.T) {
+	old := runJailerShim
+	t.Cleanup(func() { runJailerShim = old })
+	var got []string
+	runJailerShim = func(args []string) error { got = args; return nil }
+	var out bytes.Buffer
+	if code := jailerShimCode([]string{"/usr/local/bin/jailer", "--id", "sb-1"}, &out); code != 0 || len(got) != 3 {
+		t.Fatalf("jailerShimCode = %d with %v", code, got)
+	}
+	runJailerShim = func([]string) error { return errors.New("exec: denied") }
+	if code := jailerShimCode(nil, &out); code != 125 || !strings.Contains(out.String(), "exec: denied") {
+		t.Fatalf("jailerShimCode = %d, output %q", code, out.String())
+	}
+}
