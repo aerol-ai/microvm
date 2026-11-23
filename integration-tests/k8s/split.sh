@@ -10,7 +10,9 @@
 # 1 if any failed:
 #   shape     the agent runs as uid 65531 with no capabilities and a read-only
 #             root, has no containerd root, socket or /run/netns, and reaches
-#             the helper's socket; the pod has no two-way mount and no shared
+#             the helper's socket; the egress gateway's socket is in a folder
+#             the agent cannot write, and the egress container reads
+#             /run/aerolvm only; the pod has no two-way mount and no shared
 #             process namespace; the runtime container runs the signed helper
 #   sandboxes a runc and a gVisor sandbox: create, exec, a file copied in and
 #             out, the worker's ports and the Kubernetes API refused (C24)
@@ -94,6 +96,8 @@ step_shape() {
   check "shape: the agent cannot write its root disk" bash -c '! kubectl --context "kind-$1" -n "$2" exec "$3" -c agent -- touch /root-write-test 2>/dev/null' _ "$cluster" "$namespace" "$pod"
   check "shape: no containerd root, socket or /run/netns in the agent" agent sh -c '! test -e /var/lib/containerd && ! test -e /run/containerd/containerd.sock && ! test -e /run/netns'
   check "shape: the agent reaches the helper's socket" agent test -S /run/aerolvm-rootd/shared/sock/root.sock
+  check "shape: the agent sees the egress gateway's socket, in a folder it cannot write" agent sh -c 'test -S "$SB_EGRESS_GATEWAY_SOCKET" && ! touch "$(dirname "$SB_EGRESS_GATEWAY_SOCKET")/agent-write-test" 2>/dev/null'
+  check "shape: the egress container, which starts as root, reads /run/aerolvm only" bash -c '! kubectl --context "kind-$1" -n "$2" exec "$3" -c egress -- touch /run/aerolvm/egress-write-test 2>/dev/null' _ "$cluster" "$namespace" "$pod"
   check "shape: no two-way mount, no shared process namespace" bash -c '! kubectl --context "kind-$1" -n "$2" get pod "$3" -o json | grep -q -e Bidirectional -e "\"shareProcessNamespace\": true"' _ "$cluster" "$namespace" "$pod"
   local hp
   hp="$(helper_pid)"
