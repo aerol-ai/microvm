@@ -99,11 +99,11 @@ func chartGapRows() []chartGapRow {
 
 // firecrackerGapRows are the chart's Firecracker refusals. The chart refuses
 // worker.firecracker.enabled whole in split: it does not wire Firecracker
-// into a split worker pod, and no live run has proven it. The daemon's own
-// gaps are narrower (M1 PR 9b): a worker with the host firewall on (the
-// chart always turns it on) waits for the guests' firewall, and one with
-// the VM pool waits for VM snapshots. Those steps are being renamed and
-// split (#1425, #1426): when they land, change only the step names here.
+// into a split worker pod, and no live run has proven it, so the first two
+// rows are the chart's alone. sandboxd's own refusals are narrower (M1 PRs
+// 9b, #1425, #1426): a worker with the VM pool waits for the helper's warm
+// pool step, and one without the jailer is never split. When a privmode
+// step is renamed again, change only the step name here.
 func firecrackerGapRows() []chartGapRow {
 	const fcOn = "worker.firecracker.enabled=true"
 	// fc is a split worker with Firecracker on as the chart renders it:
@@ -116,13 +116,11 @@ func firecrackerGapRows() []chartGapRow {
 			}
 		}
 	}
-	guestRules := privmode.StepFirecrackerGuestRules
-	vmPool := privmode.StepFirecrackerSnapshots
+	vmPool := privmode.StepFirecrackerWarmPool
 	return []chartGapRow{
-		{name: "Firecracker", flags: []string{"--set", fcOn}, chart: "worker.firecracker.enabled",
-			env: "SB_ENABLE_FIRECRACKER", set: fc(nil), step: guestRules},
+		{name: "Firecracker", flags: []string{"--set", fcOn}, chart: "worker.firecracker.enabled"},
 		{name: "Firecracker in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_FIRECRACKER=true"},
-			chart: "worker.extraEnv.SB_ENABLE_FIRECRACKER", env: "SB_ENABLE_FIRECRACKER", set: fc(nil), step: guestRules},
+			chart: "worker.extraEnv.SB_ENABLE_FIRECRACKER"},
 		{name: "Firecracker's VM pool", flags: []string{"--set", fcOn, "--set", "worker.extraEnv.SB_FIRECRACKER_VMM_POOL_ENABLED=true"},
 			chart: "worker.firecracker.enabled", env: "SB_FIRECRACKER_VMM_POOL_ENABLED",
 			set: fc(func(c *config.Config, v string) { c.FirecrackerVMMPoolEnabled = isTrue(v) }), step: vmPool},

@@ -161,10 +161,9 @@ volume, other than the shared folder below.
 
 What split does not run yet, refused by name at `helm install`: Firecracker,
 WASM and V8-isolate sandboxes, gVisor moves with memory, and the kubectl
-API's warm pools. `sandboxd` itself runs Firecracker in split since M1 PR
-9b, except with the host firewall on (the chart always turns it on) or the
-VM pool; the chart also does not wire Firecracker into a split pod, and no
-live run has proven it.
+API's warm pools. `sandboxd` itself runs Firecracker in split, except with
+its VM pool; the chart refuses it because it does not wire Firecracker into
+a split pod yet, and no live run has proven it there.
 
 What is proven so far, and how:
 
