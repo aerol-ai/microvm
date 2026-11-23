@@ -48,7 +48,7 @@ If you run Kyverno or Gatekeeper pod-security policies, exempt the worker pods (
 | `runtime`, `agent` | `privileged` |
 | `egress` | Running as root and the added capabilities `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`. It starts as root only to drop to uid 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`. |
 | `setup` (init, cluster mode) | Running as root. It has every capability dropped and a read-only root. |
-| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of three of the pod's own folders, then exits. |
+| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of four of the pod's own folders, then exits. |
 
 ### The operator's rights
 
@@ -95,8 +95,8 @@ Split does not run these yet. The chart refuses each one by name, so `helm insta
 
 - Firecracker (`worker.firecracker.enabled`)
 - WASM and V8-isolate sandboxes (`worker.wasm.enabled`, `worker.isolate.enabled`)
-- gVisor moves with memory (`worker.gvisor.checkpointMoves`; it defaults to off in split)
-- The kubectl API's warm pools (`cluster.agentSandboxAPI.enabled`)
+
+Split does run the container warm pool, the kubectl API's warm pools, and gVisor moves with memory. `worker.gvisor.checkpointMoves` is off by default in split; set it to `true` to turn moves on. A gVisor sandbox moves only to a worker of the same privilege mode. While you switch modes, a move to a worker of the other mode is refused before anything is saved, and the sandbox keeps running where it is.
 
 `privilegeMode: auto` picks `split` for a new install, unless one of these is on. An upgrade with `auto` keeps the mode the workers have now. `helm template` cannot see the cluster, so set the mode itself when a GitOps tool renders the chart.
 

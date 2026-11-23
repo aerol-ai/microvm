@@ -108,8 +108,9 @@ initContainers:
   # the root helper trusts a folder only when no one else can write it
   # (internal/rootfolder): the shared folder becomes root's, open to the
   # agent's group, with one folder of the agent's own inside; the CNI
-  # records' folder becomes root's alone; sandboxd's state volume becomes
-  # the agent's. As root with one right, CAP_CHOWN, and nothing else.
+  # records' folder and the helper's moves folder become root's alone;
+  # sandboxd's state volume becomes the agent's. As root with one right,
+  # CAP_CHOWN, and nothing else.
   - name: split-folders
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -121,6 +122,8 @@ initContainers:
         chmod 0750 /run/aerolvm-rootd/shared
         install -d -o 65531 -g 65531 -m 0700 /run/aerolvm-rootd/shared/agent
         chmod 0755 /var/lib/cni
+        chown 0:0 /var/lib/aerolvm-rootd-moves
+        chmod 0700 /var/lib/aerolvm-rootd-moves
         chown 65531:65531 /var/lib/sandboxd
     securityContext:
       runAsUser: 0
@@ -138,6 +141,7 @@ initContainers:
     volumeMounts:
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: cni-state, mountPath: /var/lib/cni }
+      - { name: containerd, mountPath: /var/lib/aerolvm-rootd-moves, subPath: aerolvm-rootd-moves }
       - { name: state, mountPath: /var/lib/sandboxd }
   {{- end }}
 containers:
@@ -269,6 +273,11 @@ containers:
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage, readOnly: true }
       - { name: cni-state, mountPath: /var/lib/cni }
+      # The helper's gVisor moves: a checkpoint or a staged bundle is about
+      # a sandbox's memory in size, so it goes on the sandboxes' own disk,
+      # where the agent's disk floor counts it, not on this container's.
+      # A folder of containerd's volume, root's alone (split-folders).
+      - { name: containerd, mountPath: /var/lib/aerolvm-rootd/moves, subPath: aerolvm-rootd-moves }
       {{- else }}
       # The network namespaces the agent makes, where containerd starts
       # sandboxes in them. Bidirectional, so the supervisor's unmount

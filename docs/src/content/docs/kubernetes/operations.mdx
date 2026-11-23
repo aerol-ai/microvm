@@ -96,7 +96,7 @@ helm show crds oci://ghcr.io/aerol-ai/charts/aerolvm --version <version> | kubec
 
 A worker gets its mode when its pod is made. A normal upgrade swaps only the `agent` image in place, so it never changes a worker's mode, and a worker made before this setting stays `single`. To switch:
 
-1. **Change the value** with `helm upgrade`, for example `--set privilegeMode=split`. Split refuses Firecracker, WASM, V8 isolates, gVisor moves and the kubectl API's warm pools; turn those off first, or the upgrade fails and names each one. New workers now get the new mode. Running workers keep theirs, and keep working.
+1. **Change the value** with `helm upgrade`, for example `--set privilegeMode=split`. Split refuses Firecracker, WASM and V8 isolates; turn those off first, or the upgrade fails and names each one. New workers now get the new mode. Running workers keep theirs, and keep working.
 2. **Move the workers over one at a time.** In cluster mode, cordon one worker's machine. The operator [decommissions](#replace-a-machine) that worker, its sandboxes move or stop as their failover policy says, and a new worker takes its place in the new mode. Wait until the new worker's `AerolNode` says `Serving`, then do the next.
 3. **Check.** `aerolvm k8s verify` lists each pool's workers by mode. A pool with both is normal while you switch.
 

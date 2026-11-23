@@ -104,19 +104,16 @@ into a split worker pod yet, and no live run has proven it there. */}}
 {{- if $w.firecracker.enabled }}
 - worker.firecracker.enabled is true: this chart does not run Firecracker in a split worker pod yet. Set it to false.
 {{- end }}
-{{- if $w.gvisor.checkpointMoves }}
-- worker.gvisor.checkpointMoves is true: the root helper does not take gVisor checkpoints for moves yet. Set it to false; a decommission then rebuilds or stops a gVisor sandbox as its failover policy says.
-{{- end }}
-{{- if and (eq .Values.mode "cluster") .Values.cluster.agentSandboxAPI.enabled }}
-- cluster.agentSandboxAPI.enabled is true: its warm pools park sandboxes in the containerd warm pool, which split does not run yet. Set it to false.
-{{- end }}
+{{- /* gVisor moves, and the containerd warm pool that
+cluster.agentSandboxAPI's warm pools park in, are the root helper's from
+M1 PR 13: no refusal. */}}
 {{- if $w.wasm.enabled }}
 - worker.wasm.enabled is true: this chart does not wire WASM sandboxes into a split worker pod yet. Set it to false.
 {{- end }}
 {{- if $w.isolate.enabled }}
 - worker.isolate.enabled is true: this chart does not wire V8-isolate sandboxes into a split worker pod yet. Set it to false.
 {{- end }}
-{{- range $k := list "SB_CONTAINERD_POOL_ENABLED" "SB_ENABLE_FIRECRACKER" "SB_GVISOR_CHECKPOINT_MOVES" "SB_ENABLE_WASM" "SB_ENABLE_ISOLATE" }}
+{{- range $k := list "SB_ENABLE_FIRECRACKER" "SB_ENABLE_WASM" "SB_ENABLE_ISOLATE" }}
 {{- if and (hasKey $env $k) (has (index $env $k | toString | trim) $true) }}
 - worker.extraEnv.{{ $k }} turns on what split does not run yet. Remove it.
 {{- end }}
@@ -129,8 +126,10 @@ into a split worker pod yet, and no live run has proven it there. */}}
 {{- if and (hasKey $env "SB_CONTAINER_ENGINE") (ne (index $env "SB_CONTAINER_ENGINE" | toString | trim | lower) "containerd") }}
 - worker.extraEnv.SB_CONTAINER_ENGINE names another engine: split runs the containerd engine only. Remove it.
 {{- end }}
+{{- /* The helper's move limits are the one exception: the chart does not
+set them, and worker.extraEnv reaches the helper's container too. */}}
 {{- range $k, $_ := $env }}
-{{- if or (hasPrefix "SB_ROOTD_" $k) (eq $k "SB_MOUNTS_CRED_DIR") }}
+{{- if and (or (hasPrefix "SB_ROOTD_" $k) (eq $k "SB_MOUNTS_CRED_DIR")) (not (has $k (list "SB_ROOTD_MOVE_MAX_BYTES" "SB_ROOTD_MOVE_MAX_STAGED"))) }}
 - worker.extraEnv.{{ $k }}: the chart sets it in split, where the agent and the root helper share folders. Remove it.
 {{- end }}
 {{- end }}

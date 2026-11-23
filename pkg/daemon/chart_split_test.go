@@ -20,6 +20,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/privmode"
+	"github.com/aerol-ai/microvm/internal/rootd"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -245,9 +246,16 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
 	enterprise := append(slices.Clone(chartClusterFlags), "--set", "identity.enabled=true", "--set", "enterprise.enabled=true",
 		"--set", "audit.witness.bucket=w", "--set", "audit.export.backend=s3", "--set", "audit.export.s3.bucket=a")
+	// M1 PR 13: gVisor moves, the containerd warm pool, the agent-sandbox
+	// API's warm pools that park in it, and the helper's move limits.
+	moves := []string{"--set", "worker.gvisor.checkpointMoves=true", "--set", "worker.extraEnv.SB_CONTAINERD_POOL_ENABLED=true",
+		"--set", "worker.extraEnv.SB_ROOTD_MOVE_MAX_BYTES=1073741824", "--set", "worker.extraEnv.SB_ROOTD_MOVE_MAX_STAGED=2"}
 	for name, flags := range map[string][]string{
 		"single": nil, "single edge": edge, "cluster": chartClusterFlags, "cluster edge": append(slices.Clone(chartClusterFlags), edge...),
 		"enterprise": enterprise, "enterprise edge": append(slices.Clone(enterprise), edge...),
+		"moves and warm pool": moves,
+		"cluster agent-sandbox API": append(slices.Clone(chartClusterFlags), "--set", "cluster.agentSandboxAPI.enabled=true",
+			"--set", "worker.gvisor.checkpointMoves=true"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
@@ -291,6 +299,72 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// gVisor moves in split (M1 PR 13): the helper reads the switch from its own
+// environment, off by default in split as before and on when set, and its
+// moves folder is a folder of containerd's volume, which split-folders makes
+// root's alone before the helper checks it. A helper setting other than the
+// move limits stays refused in worker.extraEnv.
+func TestChartSplitMoves(t *testing.T) {
+	helm := chartHelm(t)
+	movesDir := filepath.Join(rootd.DefaultStateDir, "moves")
+	for _, tc := range []struct {
+		name  string
+		flags []string
+		want  string
+	}{
+		{"default", nil, "false"},
+		{"on", []string{"--set", "worker.gvisor.checkpointMoves=true"}, "true"},
+		{"cluster, on", append(slices.Clone(chartClusterFlags), "--set", "worker.gvisor.checkpointMoves=true"), "true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, tc.flags...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent, runtime := workerEnv(t, out, "agent"), workerEnv(t, out, "runtime")
+			if agent["SB_GVISOR_CHECKPOINT_MOVES"] != tc.want || runtime["SB_GVISOR_CHECKPOINT_MOVES"] != tc.want {
+				t.Fatalf("SB_GVISOR_CHECKPOINT_MOVES: agent %q, helper %q, want %q", agent["SB_GVISOR_CHECKPOINT_MOVES"],
+					runtime["SB_GVISOR_CHECKPOINT_MOVES"], tc.want)
+			}
+			spec := workerSpec(t, out)
+			mount := func(list, name, path string) map[string]any {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					if m["name"] != name {
+						continue
+					}
+					vms, _ := m["volumeMounts"].([]any)
+					for _, v := range vms {
+						if vm, _ := v.(map[string]any); vm["mountPath"] == path {
+							return vm
+						}
+					}
+				}
+				return nil
+			}
+			helper := mount("containers", "runtime", movesDir)
+			if helper == nil || helper["name"] != "containerd" || helper["subPath"] == nil || helper["readOnly"] == true {
+				t.Fatalf("the helper's moves folder %s is mounted as %v, want a writable folder of containerd's volume", movesDir, helper)
+			}
+			init := mount("initContainers", "split-folders", "/var/lib/aerolvm-rootd-moves")
+			if init == nil || init["name"] != "containerd" || init["subPath"] != helper["subPath"] {
+				t.Fatalf("split-folders mounts the moves folder as %v, the helper as %v", init, helper)
+			}
+			if !strings.Contains(out, "chown 0:0 /var/lib/aerolvm-rootd-moves") || !strings.Contains(out, "chmod 0700 /var/lib/aerolvm-rootd-moves") {
+				t.Error("split-folders does not make the moves folder root's alone")
+			}
+			if mount("containers", "agent", movesDir) != nil {
+				t.Error("the agent mounts the helper's moves folder")
+			}
+		})
+	}
+	_, err := renderChart(helm, "--set", "privilegeMode=split", "--set", "worker.extraEnv.SB_ROOTD_RUNSC=/tmp/runsc")
+	if err == nil || !strings.Contains(err.Error(), "worker.extraEnv.SB_ROOTD_RUNSC") {
+		t.Fatalf("split with SB_ROOTD_RUNSC in extraEnv: err = %v, want a refusal naming it", err)
 	}
 }
 

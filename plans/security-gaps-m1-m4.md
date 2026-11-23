@@ -613,9 +613,18 @@ Each is small and stands alone. Together they shrink the root surface now.
       N1 numbers.
     - **The helper takes moves from its own settings.** It serves the move
       calls only with `SB_GVISOR_CHECKPOINT_MOVES` on in its own
-      environment, so the chart (PR 11) passes that setting to the runtime
-      container too, and drops its split refusals of the warm pool, of
-      gVisor moves and of the agent-sandbox API's warm pools.
+      environment, so the chart (PR 11, which merged first) passes that
+      setting to the runtime container too, and drops its split refusals
+      of the warm pool, of gVisor moves and of the agent-sandbox API's
+      warm pools. Moves stay off by default in split, as before.
+    - **A checkpoint belongs on the sandboxes' disk.** It is about a
+      sandbox's memory in size. In the chart the helper's moves folder is a
+      folder of containerd's volume, so a move cannot fill the runtime
+      container's own disk, and the agent's disk floor counts it. The
+      helper trusts a folder only when no one else can write it, and the
+      chart cannot know how the kubelet makes it (an emptyDir is open to
+      everyone), so the split-folders init container makes it root's, mode
+      0700, before the helper checks it.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts
     and `shareProcessNamespace`; turn external storage on by default.
     The operator rolls workers to the new template node by node through
