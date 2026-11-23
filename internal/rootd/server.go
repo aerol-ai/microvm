@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -168,6 +169,10 @@ type Options struct {
 	TapSysctls func() error
 	// hostLaunchers stand in for the kinds' own parts in tests.
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
+	// reassertEvery paces both firewalls' re-assert timers. Zero:
+	// defaultReassertEvery. Tests make it short; it is fixed once the
+	// server is built, as each timer's goroutine reads it.
+	reassertEvery time.Duration
 }
 
 // Server is the helper's socket and gRPC server.
@@ -270,12 +275,12 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	s.srv = grpc.NewServer(sopts...)
 	s.locks, s.stopSweep = locks, func() {}
 	s.net = newNetwork(cfg, opts.Network, locks)
-	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks)
+	s.fw = newFirewall(cfg, s.net, opts.Firewall, locks, opts.reassertEvery)
 	s.hosts = newHostCalls(cfg, opts, locks, log)
 	if fc := cfg.Hosts.Firecracker; fc != nil {
 		s.taps = newTapCalls(fc, opts, locks, log)
 	}
-	s.gf = newGuestFirewall(cfg, s.taps, opts.GuestFirewall, locks)
+	s.gf = newGuestFirewall(cfg, s.taps, opts.GuestFirewall, locks, opts.reassertEvery)
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
 		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps, gf: s.gf})

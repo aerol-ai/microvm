@@ -94,9 +94,19 @@ var policyOps = map[rootdpb.SandboxRulesOp]bool{
 var firewallFeatures = []string{rootdpb.FeatureEnsureHost, rootdpb.FeatureSetNodeGuard, rootdpb.FeatureSetEgressFloor,
 	rootdpb.FeatureSandboxRules}
 
-// reassertEvery paces the helper's own timer (as sandboxd's
+// defaultReassertEvery paces the helper's own timer (as sandboxd's
 // chainReassertInterval and ipv6fence.ReassertInterval did).
-var reassertEvery = 30 * time.Second
+const defaultReassertEvery = 30 * time.Second
+
+// reassertPace is every, or defaultReassertEvery when unset. A firewall
+// keeps it from when it is built: the timer's goroutine reads it, so
+// nothing may change it after (a test included).
+func reassertPace(every time.Duration) time.Duration {
+	if every <= 0 {
+		return defaultReassertEvery
+	}
+	return every
+}
 
 // openFirewallFn opens the helper's own firewall; tests replace it.
 var openFirewallFn = openFirewall
@@ -122,6 +132,7 @@ type firewall struct {
 	timerOnce sync.Once
 	stopOnce  sync.Once
 	stop      chan struct{}
+	every     time.Duration // the timer's pace, fixed when built
 
 	budget policyBudget
 }
@@ -165,11 +176,12 @@ func (b *policyBudget) release(ip string) {
 	delete(b.byIP, ip)
 }
 
-func newFirewall(cfg Config, net *network, injected FirewallHost, locks *keyedLocks) *firewall {
+func newFirewall(cfg Config, net *network, injected FirewallHost, locks *keyedLocks, every time.Duration) *firewall {
 	if net == nil {
 		return nil
 	}
-	f := &firewall{net: net, whole: cfg, locks: locks, key: "host/", host: injected, open: openFirewallFn, stop: make(chan struct{})}
+	f := &firewall{net: net, whole: cfg, locks: locks, key: "host/", host: injected, open: openFirewallFn, stop: make(chan struct{}),
+		every: reassertPace(every)}
 	if injected != nil {
 		f.ready.Store(true)
 	}
@@ -214,7 +226,7 @@ func (f *firewall) close() {
 func (f *firewall) startTimer(h FirewallHost) {
 	f.timerOnce.Do(func() {
 		go func() {
-			t := time.NewTicker(reassertEvery)
+			t := time.NewTicker(f.every)
 			defer t.Stop()
 			for {
 				select {

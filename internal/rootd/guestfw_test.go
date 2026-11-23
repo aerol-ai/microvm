@@ -17,8 +17,9 @@ import (
 
 // guestRig serves a helper with Firecracker on, the guests' firewall a
 // fake, and the sandboxes' network and firewall fakes too, so a test can
-// tell which firewall a call reached.
-func guestRig(t *testing.T) (*rig, rootdpb.RootHelperClient, *fakeFirewall, *fakeFirewall, *fakeTables) {
+// tell which firewall a call reached. reassertEvery, when set, paces the
+// re-assert timers.
+func guestRig(t *testing.T, reassertEvery ...time.Duration) (*rig, rootdpb.RootHelperClient, *fakeFirewall, *fakeFirewall, *fakeTables) {
 	t.Helper()
 	tables, gfw, fw := &fakeTables{}, newFakeFirewall(), newFakeFirewall()
 	fc := testFirecrackerConfig(t)
@@ -30,6 +31,9 @@ func guestRig(t *testing.T) (*rig, rootdpb.RootHelperClient, *fakeFirewall, *fak
 		o.TapTables = func() (taphost.IsolationBackend, error) { return tables, nil }
 		o.TapSysctls = func() error { return nil }
 		o.Network, o.Firewall, o.GuestFirewall = newFakeNet(), fw, gfw
+		for _, every := range reassertEvery {
+			o.reassertEvery = every
+		}
 	})
 	return r, rootdpb.NewRootHelperClient(r.conn), gfw, fw, tables
 }
@@ -39,11 +43,8 @@ func guestRig(t *testing.T) (*rig, rootdpb.RootHelperClient, *fakeFirewall, *fak
 // timer; the node guard and the floor reach the guests' firewall, never
 // the sandboxes', and pass the checks the sandboxes' do.
 func TestGuestFirewallCalls(t *testing.T) {
-	orig := reassertEvery
-	reassertEvery = 5 * time.Millisecond
-	t.Cleanup(func() { reassertEvery = orig })
 	withNodeDNS(t, "10.0.1.5")
-	r, c, gfw, fw, tables := guestRig(t)
+	r, c, gfw, fw, tables := guestRig(t, 5*time.Millisecond)
 	ctx := callCtx(t)
 	if _, err := c.EnsureGuestFirewall(ctx, &rootdpb.EnsureGuestFirewallRequest{}); err != nil {
 		t.Fatal(err)

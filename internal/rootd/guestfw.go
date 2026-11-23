@@ -3,6 +3,7 @@ package rootd
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"google.golang.org/grpc/codes"
 
@@ -59,12 +60,12 @@ type guestFirewall struct {
 }
 
 // newGuestFirewall is nil when the helper serves no Firecracker.
-func newGuestFirewall(cfg Config, taps *tapCalls, injected FirewallHost, locks *keyedLocks) *guestFirewall {
+func newGuestFirewall(cfg Config, taps *tapCalls, injected FirewallHost, locks *keyedLocks, every time.Duration) *guestFirewall {
 	if taps == nil {
 		return nil
 	}
 	fc, open := taps.cfg, openGuestFirewallFn
-	f := &firewall{whole: cfg, locks: locks, key: "guest/", host: injected, stop: make(chan struct{}),
+	f := &firewall{whole: cfg, locks: locks, key: "guest/", host: injected, stop: make(chan struct{}), every: reassertPace(every),
 		open: func(c Config, _ NetworkHost) (FirewallHost, error) { return open(c, fc) }}
 	if injected != nil {
 		f.ready.Store(true)
