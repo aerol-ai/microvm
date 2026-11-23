@@ -180,6 +180,11 @@ jobs:
               - 'cmd/aerolvm/k8s*.go'
               - 'cmd/aerolvm-supervisor/**'
               - 'internal/supervisor/**'
+              # The chart's privilegeMode refusals follow sandboxd's.
+              - 'pkg/daemon/privilege_mode.go'
+              - 'pkg/daemon/chart_split_test.go'
+              - 'internal/privmode/**'
+              - 'internal/rootd/config.go'
               - 'pkg/caddy/cert_reload*.go'
               - 'pkg/daemon/tls_cert_watch*.go'
               # The chart's monitoring checks (P6, P9).
@@ -908,6 +913,7 @@ jobs:
         run: |
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
+          scripts/chart-pod-templates.sh --set privilegeMode=split > "$RUNNER_TEMP/pod-templates-split.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set identity.tokenMaxTTL=2160h \
             --set-string identity.file.content='version: 1' > "$RUNNER_TEMP/pod-templates-identity.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set enterprise.enabled=true \
@@ -943,6 +949,7 @@ jobs:
         env:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
+          AEROLVM_POD_TEMPLATES_SPLIT: ${{ runner.temp }}/pod-templates-split.yaml
           AEROLVM_POD_TEMPLATES_IDENTITY: ${{ runner.temp }}/pod-templates-identity.yaml
           AEROLVM_POD_TEMPLATES_ENTERPRISE: ${{ runner.temp }}/pod-templates-enterprise.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
@@ -1073,6 +1080,15 @@ jobs:
         env:
           AEROLVM_CHART_TOOLS: require
         run: go test -count=1 -run '^TestKubernetesChart' -v ./setup/prometheus/
+
+      # privilegeMode (plans/security-gaps-m1-m4.md M1 PR 11): the chart
+      # refuses each value split cannot run yet, as sandboxd does at start;
+      # a split worker renders what sandboxd and its root helper start
+      # with; single renders none of it.
+      - name: Check the chart's privilege mode against sandboxd
+        env:
+          AEROLVM_CHART_TOOLS: require
+        run: go test -count=1 -run '^TestChart' -v ./pkg/daemon/
 
       # kind's nodes share this runner's kernel, which has no br_netfilter
       # loaded; sandboxd refuses to start without it, since sandbox

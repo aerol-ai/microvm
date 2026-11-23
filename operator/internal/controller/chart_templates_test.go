@@ -73,11 +73,84 @@ func TestRenderedChartTemplates(t *testing.T) {
 				t.Fatalf("worker setup security = %+v", sc)
 			}
 			for _, m := range ic[1].VolumeMounts {
-				if m.Name != EtcVolume && m.Name != StateVolume && m.Name != JoinIdentityVolume {
+				// tmp: a split worker's agent has a read-only root disk and
+				// a /tmp of its own, as servers and gateways do.
+				if m.Name != EtcVolume && m.Name != StateVolume && m.Name != JoinIdentityVolume && m.Name != "tmp" {
 					t.Fatalf("worker setup mounts %s (%s)", m.Name, m.MountPath)
 				}
 			}
 		}
+	}
+}
+
+// A worker template in privilege mode split (plans/security-gaps-m1-m4.md
+// M1 PR 11) stamps into a pod whose agent has no rights: uid 65531, no
+// capability, no privilege escalation, a read-only root disk, the runtime's
+// default seccomp profile, and none of the sandbox machinery (containerd's
+// root, its socket, /run/netns, two-way mounts, a shared process
+// namespace). Its setup container runs the same way. The runtime container
+// runs the root helper. CI renders the chart with privilegeMode=split into
+// AEROLVM_POD_TEMPLATES_SPLIT; without it the test skips.
+func TestRenderedSplitWorkerTemplate(t *testing.T) {
+	path := os.Getenv("AEROLVM_POD_TEMPLATES_SPLIT")
+	if path == "" {
+		t.Skip("AEROLVM_POD_TEMPLATES_SPLIT not set: no rendered chart to check")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := yaml.Unmarshal(raw, &cm); err != nil {
+		t.Fatal(err)
+	}
+	tm, err := ParsePodTemplate(cm.Data[TemplateWorker])
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := testCluster()
+	pod, err := Stamp(tm, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-worker-0", TemplateWorker, "general", "z-a"),
+		Namespace: testNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
+		t.Error("a split worker shares one process namespace")
+	}
+	agent := pod.Spec.Containers[containerIndex(pod.Spec.Containers, AgentContainer)]
+	noRights := func(who string, sc *corev1.SecurityContext) {
+		t.Helper()
+		if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 65531 || sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot ||
+			(sc.Privileged != nil && *sc.Privileged) || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
+			sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem || sc.Capabilities == nil ||
+			len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) != 0 ||
+			sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+			t.Errorf("%s security = %+v", who, sc)
+		}
+	}
+	noRights("agent", agent.SecurityContext)
+	noRights("setup", pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].SecurityContext)
+	if envValue(agent.Env, "SB_PRIVILEGE_MODE") != "split" {
+		t.Error("the split agent lacks SB_PRIVILEGE_MODE=split")
+	}
+	for _, ctr := range pod.Spec.Containers {
+		for _, m := range ctr.VolumeMounts {
+			if m.MountPropagation != nil && *m.MountPropagation == corev1.MountPropagationBidirectional {
+				t.Errorf("%s mounts %s two-way", ctr.Name, m.MountPath)
+			}
+		}
+	}
+	for _, m := range agent.VolumeMounts {
+		switch {
+		case m.MountPath == "/var/lib/containerd", m.MountPath == "/run/containerd", m.MountPath == "/run/netns":
+			t.Errorf("the split agent mounts %s", m.MountPath)
+		case m.Name == "containerd" && (m.SubPath == "" || !m.ReadOnly):
+			t.Errorf("the split agent mounts containerd's volume beyond one empty folder, read only: %+v", m)
+		}
+	}
+	runtime := pod.Spec.Containers[containerIndex(pod.Spec.Containers, RuntimeContainer)]
+	if envValue(runtime.Env, "SB_ROOTD_STAGE_DIR") == "" || envValue(runtime.Env, "SB_ROOTD_AGENT_UID") != "65531" {
+		t.Error("the runtime container does not run the root helper for uid 65531")
 	}
 }
 

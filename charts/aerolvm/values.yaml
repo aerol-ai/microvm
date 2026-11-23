@@ -10,6 +10,28 @@
 # Phase 2). The worker block's container settings apply to every worker.
 mode: single
 
+# How much the worker's agent container (sandboxd) may do on its machine
+# (plans/security-gaps-m1-m4.md M1; docs page "Privilege mode"):
+#   single  the agent container is privileged and does the root work
+#           itself: network namespaces, firewall rules, cgroups, mounts.
+#           Every worker made before this setting runs this way.
+#   split   the agent runs as a user with no rights (uid 65531, no Linux
+#           capabilities, read-only root disk). A small root helper,
+#           aerolvm-rootd, does the root work in the runtime container and
+#           checks every request first. It ships in the agent image, signed;
+#           the runtime container runs it only when a release key signed it.
+#           External storage is on by default. Firecracker, WASM, V8
+#           isolates, gVisor moves and the agent-sandbox API's warm pools do
+#           not run in split yet: the chart refuses them by name.
+#   auto    split for a new install, unless a value needs single; an upgrade
+#           keeps the mode the workers have now. helm template cannot see
+#           the cluster and renders auto as a new install, so set the mode
+#           itself when a GitOps tool renders the chart.
+# A pod gets its mode when it is made. A change reaches each worker when the
+# worker is replaced (cluster mode: decommission it; single mode: delete the
+# pod), which ends its sandboxes. Workers in the two modes work side by side.
+privilegeMode: single
+
 image:
   registry: ghcr.io/aerol-ai
   # Empty: the chart's appVersion. Use a digest-pinned tag in production.
@@ -235,14 +257,19 @@ worker:
   # create with mounts is refused (501 mounts_unavailable), never served
   # from the worker's own disk. Platform volumes are mounts the same way,
   # so they need it too.
+  # In privilegeMode split none of that cost applies: the root helper runs
+  # the mount helpers in the runtime container, no process namespace is
+  # shared and no mount crosses containers. Empty (the default) is on in
+  # split and off in single; true or false sets it for both.
   externalStorage:
-    enabled: false
+    enabled: ~
   # A decommission moves a running gVisor sandbox to another worker with its
   # memory: its programs keep running, its open connections drop (C21).
   # false is the kill switch: such a sandbox is then rebuilt or stopped as
-  # its failover policy says.
+  # its failover policy says. Empty (the default) is on in privilegeMode
+  # single and off in split, which does not take these checkpoints yet.
   gvisor:
-    checkpointMoves: true
+    checkpointMoves: ~
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.
   # In cluster mode the operator adds the API server to the first and the
   # pod and Service ranges to the second, for every new worker; you add
