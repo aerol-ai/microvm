@@ -50,16 +50,15 @@ type Step string
 // The steps split mode does not cover yet, each with the helper calls it
 // waits for (plan §3.5).
 const (
-	StepImageUser             Step = "image_user"
-	StepDiskQuota             Step = "disk_quota"
-	StepWasmCheckpoints       Step = "wasm_checkpoints"
-	StepWasmWarmPool          Step = "wasm_warm_pool"
-	StepWasmMounts            Step = "wasm_mounts"
-	StepFirecrackerSnapshots  Step = "firecracker_snapshots"
-	StepFirecrackerGuestRules Step = "firecracker_guest_rules"
-	StepContainerFile         Step = "container_files"
-	StepWarmPool              Step = "warm_pool"
-	StepMoves                 Step = "gvisor_moves"
+	StepImageUser            Step = "image_user"
+	StepDiskQuota            Step = "disk_quota"
+	StepWasmCheckpoints      Step = "wasm_checkpoints"
+	StepWasmWarmPool         Step = "wasm_warm_pool"
+	StepWasmMounts           Step = "wasm_mounts"
+	StepFirecrackerSnapshots Step = "firecracker_snapshots"
+	StepContainerFile        Step = "container_files"
+	StepWarmPool             Step = "warm_pool"
+	StepMoves                Step = "gvisor_moves"
 )
 
 // steps say what each step is, for the operator who meets the error.
@@ -71,10 +70,9 @@ var steps = map[Step]string{
 	StepWasmMounts:      "a WASM sandbox's external mounts, which its worker opens through sandboxd, and sandboxd cannot open the root helper's mount points",
 	StepFirecrackerSnapshots: "a Firecracker VM's memory and state files (stop, start, snapshots, moves, exports, template snapshots, the warm VM pool), " +
 		"which firecracker writes as the jailer's user",
-	StepFirecrackerGuestRules: "the Firecracker guests' firewall (the egress floor, the node guard and per-guest rules on the TAP subnet)",
-	StepContainerFile:         "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
-	StepWarmPool:              "the containerd warm pool's parked sandboxes",
-	StepMoves:                 "gVisor checkpoint moves",
+	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
+	StepWarmPool:      "the containerd warm pool's parked sandboxes",
+	StepMoves:         "gVisor checkpoint moves",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

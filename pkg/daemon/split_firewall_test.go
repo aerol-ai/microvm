@@ -25,12 +25,16 @@ import (
 
 // memFirewall is the helper's firewall calls in memory: it records each.
 type memFirewall struct {
-	mu       sync.Mutex
-	calls    []string
-	fence    string
-	err      error             // every call's answer
-	release  []error           // ReleaseSandbox's answers, in turn
-	prepared map[string]string // netns name -> address PrepareSandbox gave
+	mu    sync.Mutex
+	calls []string
+	fence string
+	// guests: the fence covers the TAPs (a helper that serves
+	// Firecracker), with guestFence why not yet.
+	guests     bool
+	guestFence string
+	err        error             // every call's answer
+	release    []error           // ReleaseSandbox's answers, in turn
+	prepared   map[string]string // netns name -> address PrepareSandbox gave
 }
 
 func newMemFirewall() *memFirewall { return &memFirewall{prepared: map[string]string{}} }
@@ -47,9 +51,11 @@ func (m *memFirewall) recorded() []string {
 	return slices.Clone(m.calls)
 }
 
-func (m *memFirewall) EnsureHostFirewall(context.Context) (string, error) {
+func (m *memFirewall) EnsureHostFences(context.Context) (rootclient.Fences, error) {
 	m.record("ensure")
-	return m.fence, m.err
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return rootclient.Fences{Containerd: m.fence, Firecracker: m.guestFence, CoversFirecracker: m.guests}, m.err
 }
 
 func (m *memFirewall) SetNodeGuard(_ context.Context, allow []*rootdpb.NodePort) (bool, error) {
@@ -184,7 +190,7 @@ func TestHelperFirewall(t *testing.T) {
 // it is asked again while the fence is not in place.
 func TestHelperFence(t *testing.T) {
 	m := newMemFirewall()
-	f := newHelperFence(m, testLogger())
+	f := newHelperFence(m, testLogger(), false)
 	if err := f.Ready(models.ContainerEngineContainerd); !errors.Is(err, ipv6fence.ErrNotSynced) {
 		t.Fatalf("before a sync: %v", err)
 	}
@@ -196,7 +202,7 @@ func TestHelperFence(t *testing.T) {
 		t.Fatalf("a fence not in place: %v", err)
 	}
 	if err := f.Ready(models.RuntimeFirecracker); err == nil {
-		t.Fatal("split mode fenced Firecracker")
+		t.Fatal("a node with no Firecracker fenced Firecracker")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -227,16 +233,16 @@ func TestHelperFence(t *testing.T) {
 func TestBootSplitFirewall(t *testing.T) {
 	m := newMemFirewall()
 	m.fence = "no nft"
-	f, err := bootSplitFirewall(context.Background(), m, testLogger())
+	f, err := bootSplitFirewall(context.Background(), m, testLogger(), false)
 	if err != nil || f.Ready(models.ContainerEngineContainerd) == nil {
 		t.Fatalf("fence not in place: %v %v", f, err)
 	}
 	m.err = &rootclient.UnsupportedError{Feature: rootdpb.FeatureEnsureHost}
-	if _, err := bootSplitFirewall(context.Background(), m, testLogger()); err == nil || !strings.Contains(err.Error(), "newer helper") {
+	if _, err := bootSplitFirewall(context.Background(), m, testLogger(), false); err == nil || !strings.Contains(err.Error(), "newer helper") {
 		t.Fatalf("too old: %v", err)
 	}
 	m.err = rootclient.ErrUnavailable
-	if _, err := bootSplitFirewall(context.Background(), m, testLogger()); !errors.Is(err, rootclient.ErrUnavailable) {
+	if _, err := bootSplitFirewall(context.Background(), m, testLogger(), false); !errors.Is(err, rootclient.ErrUnavailable) {
 		t.Fatalf("unavailable: %v", err)
 	}
 }

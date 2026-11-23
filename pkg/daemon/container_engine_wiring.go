@@ -83,7 +83,7 @@ func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slo
 				return nil, errors.New("privilege mode split: this root helper client has no firewall calls")
 			}
 			var err error
-			if fence, err = bootSplitFirewall(ctx, fw, logger); err != nil {
+			if fence, err = bootSplitFirewall(ctx, fw, logger, cfg.EnableFirecracker); err != nil {
 				return nil, err
 			}
 			if splitFirewallOn(cfg) {

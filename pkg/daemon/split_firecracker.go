@@ -3,7 +3,10 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/netip"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	fcruntime "github.com/aerol-ai/microvm/internal/runtime/firecracker"
@@ -76,3 +79,67 @@ func (s splitFirecracker) MakeFilesystem(ctx context.Context, id, name, source s
 
 // the client is the helper.
 var _ firecrackerHelper = (*rootclient.Client)(nil)
+
+// The guests' firewall in privilege mode split (M1 PR 14). The driver keeps
+// calling the same NetRules methods in the same order as in single mode
+// (fcruntime.NetRules: a create's block-all or egress policy on the guest
+// address, the gateway's hold, quota blocks, the clears on destroy, the
+// floor and the node guard on the TAP base); each is one call to the
+// helper, which checks what it is sent and renders the rules on the
+// guests' chain itself.
+
+// guestFirewallHelper is the helper's guest firewall calls
+// (*rootclient.Client).
+type guestFirewallHelper interface {
+	EnsureGuestFirewall(ctx context.Context) error
+	SetGuestNodeGuard(ctx context.Context, allow []*rootdpb.NodePort) (bool, error)
+	SetGuestEgressFloor(ctx context.Context, cidrs []string) (bool, error)
+	GuestRules(ctx context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error)
+}
+
+var _ guestFirewallHelper = (*rootclient.Client)(nil)
+
+// guestRuleCalls are ruleCalls on the guests' firewall.
+type guestRuleCalls struct{ h guestFirewallHelper }
+
+func (g guestRuleCalls) SetNodeGuard(ctx context.Context, allow []*rootdpb.NodePort) (bool, error) {
+	return g.h.SetGuestNodeGuard(ctx, allow)
+}
+
+func (g guestRuleCalls) SetEgressFloor(ctx context.Context, cidrs []string) (bool, error) {
+	return g.h.SetGuestEgressFloor(ctx, cidrs)
+}
+
+func (g guestRuleCalls) SandboxRules(ctx context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error) {
+	return g.h.GuestRules(ctx, op, ip, allow, deny)
+}
+
+// newHelperGuestRules is the driver's NetRules through the helper's guest
+// firewall. The helper guards and floors its own TAP base; subnet is the
+// driver's, which the floor and guard calls carry and the helper ignores.
+func newHelperGuestRules(h guestFirewallHelper, subnet netip.Prefix) *helperFirewall {
+	return &helperFirewall{h: guestRuleCalls{h: h}, subnet: subnet.Masked()}
+}
+
+var _ fcruntime.NetRules = (*helperFirewall)(nil)
+
+// bootSplitGuestFirewall has the helper set the guests' firewall up at
+// boot, as single mode's wireFirecrackerEgress does, and answers the
+// driver's NetRules and TAP base. A call that fails stops the start (a
+// helper too old for it included: the supervisor swaps in the newer one,
+// and the next start finds it): with network rules on, no guest runs
+// without its firewall.
+func bootSplitGuestFirewall(ctx context.Context, cfg config.Config, h guestFirewallHelper) (*helperFirewall, netip.Prefix, error) {
+	subnet, err := netip.ParsePrefix(cfg.FirecrackerTapBaseCIDR)
+	if err != nil {
+		return nil, netip.Prefix{}, fmt.Errorf("firecracker egress: tap base cidr: %w", err)
+	}
+	if err := h.EnsureGuestFirewall(ctx); err != nil {
+		if errors.Is(err, rootclient.ErrUnsupported) {
+			return nil, netip.Prefix{}, fmt.Errorf("root helper: the Firecracker guests' firewall needs a newer helper "+
+				"(privilege mode split, SB_ENABLE_NETWORK_RULES): %w", err)
+		}
+		return nil, netip.Prefix{}, fmt.Errorf("root helper: set the Firecracker guests' firewall up: %w", err)
+	}
+	return newHelperGuestRules(h, subnet), subnet.Masked(), nil
+}

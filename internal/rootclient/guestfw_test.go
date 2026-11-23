@@ -62,6 +62,27 @@ func (h *guestHelper) GuestRules(_ context.Context, req *rootdpb.GuestRulesReque
 	return &rootdpb.GuestRulesResponse{Inserted: true}, nil
 }
 
+func (h *guestHelper) EnsureHost(context.Context, *rootdpb.EnsureHostRequest) (*rootdpb.EnsureHostResponse, error) {
+	return &rootdpb.EnsureHostResponse{Ipv6FenceError: "bridge", FencesFirecracker: true, FirecrackerIpv6FenceError: "taps"}, nil
+}
+
+// TestEnsureHostFences: the host step's answer carries the fence's state
+// on the bridge and on the TAPs.
+func TestEnsureHostFences(t *testing.T) {
+	h := &guestHelper{features: rootdpb.Features()}
+	sock := newOwnedSocket(t)
+	sock.serve(t, h)
+	c := New(Config{Socket: sock.path, HelperUID: uint32(os.Getuid())})
+	t.Cleanup(func() { _ = c.Close() })
+	f, err := c.EnsureHostFences(ctxT(t))
+	if err != nil || f != (Fences{Containerd: "bridge", Firecracker: "taps", CoversFirecracker: true}) {
+		t.Fatalf("EnsureHostFences = %+v, %v", f, err)
+	}
+	if fence, err := c.EnsureHostFirewall(ctxT(t)); err != nil || fence != "bridge" {
+		t.Fatalf("EnsureHostFirewall = %q, %v", fence, err)
+	}
+}
+
 // TestGuestFirewallCalls: each guest firewall call reaches the helper with
 // what it was given and brings back its answer; a refusal is a refusal.
 func TestGuestFirewallCalls(t *testing.T) {
