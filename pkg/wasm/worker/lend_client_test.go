@@ -18,7 +18,8 @@ import (
 // a streamed run. Single mode, which lends nothing, never asks.
 func TestClientLendsWhatItDoesNotOpen(t *testing.T) {
 	work := t.TempDir()
-	lent := "/var/lib/aerolvm-rootd/mounts/sb-1/0"
+	// A folder sandboxd could open: it is still never passed.
+	lent := t.TempDir()
 	caps := wasmengine.Capabilities{Preopens: []wasmengine.Preopen{{GuestPath: "/work", HostPath: work}, {GuestPath: "/data", HostPath: lent, Lent: true}}}
 	var events []string
 	var mu sync.Mutex

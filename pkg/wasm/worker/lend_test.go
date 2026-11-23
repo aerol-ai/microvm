@@ -169,8 +169,11 @@ var errAny = errors.New("any")
 
 // TestReadSmallFrame: a worker's reply to the helper is bounded.
 func TestReadSmallFrame(t *testing.T) {
-	big := make([]byte, 4)
-	binary.BigEndian.PutUint32(big, lendReplyMax+1)
+	// A whole, valid frame one byte past the bound.
+	body := []byte(`{"type":"pong"}`)
+	body = append(body, []byte(strings.Repeat(" ", lendReplyMax+1-len(body)))...)
+	big := binary.BigEndian.AppendUint32(nil, uint32(len(body)))
+	big = append(big, body...)
 	for name, raw := range map[string][]byte{
 		"too large":    big,
 		"empty":        {0, 0, 0, 0},
