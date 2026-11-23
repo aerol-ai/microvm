@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // MaxFileBytes caps one file of an upgrade. A release binary is under
@@ -90,15 +91,25 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// copyFileExcl copies src to dst, which must not exist yet, with mode, and
+// syncs it. A link at dst is never followed.
+func copyFileExcl(src, dst string, mode os.FileMode) error {
+	return copyFileFlags(src, dst, mode, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW)
+}
+
 // copyFile copies src to dst (created or truncated) with mode and syncs
 // it.
 func copyFile(src, dst string, mode os.FileMode) error {
+	return copyFileFlags(src, dst, mode, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+}
+
+func copyFileFlags(src, dst string, mode os.FileMode, flags int) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	out, err := os.OpenFile(dst, flags, mode)
 	if err != nil {
 		return err
 	}

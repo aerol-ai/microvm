@@ -34,8 +34,9 @@ type Config struct {
 	AuditBuffer        int
 	// InspectMaxBody caps an inspected request body (P3-1).
 	InspectMaxBody int64
-	// PeerUIDs and PeerCgroup gate the UDS (CEO D22). PeerCgroup is empty
-	// with SB_EGRESS_PEER_CGROUP=none (peerCgroupFromEnv).
+	// PeerUIDs and PeerCgroup gate the UDS (CEO D22). PeerUIDs is root
+	// unless SB_EGRESS_PEER_UIDS names others (peerUIDsFromEnv); PeerCgroup
+	// is empty with SB_EGRESS_PEER_CGROUP=none (peerCgroupFromEnv).
 	PeerUIDs   []uint32
 	PeerCgroup string
 	// HeartbeatInterval paces table-loss checks and heartbeat events (D17).
@@ -86,6 +87,9 @@ func FromEnv() (Config, error) {
 		OperatorFile:       strings.TrimSpace(os.Getenv("SB_EGRESS_OPERATOR_FILE")),
 	}
 	var err error
+	if cfg.PeerUIDs, err = peerUIDsFromEnv(); err != nil {
+		return cfg, err
+	}
 	if cfg.DNSPort, err = envPort("SB_EGRESS_DNS_PORT", cfg.DNSPort); err != nil {
 		return cfg, err
 	}
@@ -164,6 +168,28 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// peerUIDsFromEnv is who may use the control socket: root, sandboxd's user
+// in privilege mode single. In privilege mode split sandboxd runs as a user
+// with no rights (plans/security-gaps-m1-m4.md M1 PR 10), and install.sh
+// names that user's uid here instead (SB_EGRESS_PEER_UIDS, a comma
+// separated list). Root is then left out on purpose: no other root process
+// is sandboxd, and the cgroup check still names sandboxd's unit.
+func peerUIDsFromEnv() ([]uint32, error) {
+	v := strings.TrimSpace(os.Getenv("SB_EGRESS_PEER_UIDS"))
+	if v == "" {
+		return []uint32{0}, nil
+	}
+	var uids []uint32
+	for _, part := range strings.Split(v, ",") {
+		n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("SB_EGRESS_PEER_UIDS: want uids separated by commas, got %q", v)
+		}
+		uids = append(uids, uint32(n))
+	}
+	return uids, nil
 }
 
 // peerCgroupFromEnv is the cgroup the control socket's peer must run in:

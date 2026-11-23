@@ -15,7 +15,14 @@
 //	    own build info and the API level from this tool's rootdpb, built
 //	    from the same checkout. A binary for this machine is run with
 //	    --version first, and signed only if it reports that version and
-//	    API level.
+//	    API level. With -no-exec nothing is run: the release checks the
+//	    version with -check-version in a step of its own, before the key
+//	    exists, so no binary runs while the key is on disk or in the
+//	    environment.
+//
+//	aerolvm-rootd-sign -check-version <vX.Y.Z> <binary>...
+//	    The version check alone, with no key: each binary for this machine
+//	    must report that version and this tool's API level.
 //
 //	aerolvm-rootd-sign -verify <public keys file> <binary>...
 //	    Checks each binary against its manifest and signature, as the
@@ -52,6 +59,8 @@ var host = runtime.GOOS + "/" + runtime.GOARCH
 
 func main() { os.Exit(mainCode(os.Args[1:], os.Stdout, os.Stderr)) }
 
+const usageLine = "usage: aerolvm-rootd-sign -genkey <key file> | -key <key file> -version <vX.Y.Z> [-no-exec] <binary>... | -verify <public keys file> <binary>... | -check-version <vX.Y.Z> <binary>..."
+
 func mainCode(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("aerolvm-rootd-sign", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -59,19 +68,33 @@ func mainCode(args []string, stdout, stderr io.Writer) int {
 	keyFile := fs.String("key", "", "sign with the private key in this file (PKCS#8 PEM)")
 	ver := fs.String("version", "", "the release version the binaries were built as")
 	verify := fs.String("verify", "", "check the binaries against the public keys in this file")
+	checkVer := fs.String("check-version", "", "check that the binaries report this release version, with no key")
+	noExec := fs.Bool("no-exec", false, "sign without running the binaries (their version was checked with -check-version)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	// Exactly one mode; -no-exec goes with -key alone.
+	modes := 0
+	for _, v := range []string{*genkey, *keyFile, *verify, *checkVer} {
+		if v != "" {
+			modes++
+		}
+	}
 	var err error
 	switch {
-	case *genkey != "" && *keyFile == "" && *verify == "" && fs.NArg() == 0:
+	case modes != 1 || (*noExec && *keyFile == ""):
+		fmt.Fprintln(stderr, usageLine)
+		return 2
+	case *genkey != "" && fs.NArg() == 0:
 		err = genKey(*genkey, stdout)
-	case *keyFile != "" && *genkey == "" && *verify == "" && fs.NArg() > 0:
-		err = signAll(*keyFile, *ver, fs.Args(), stdout)
-	case *verify != "" && *genkey == "" && *keyFile == "" && fs.NArg() > 0:
+	case *keyFile != "" && fs.NArg() > 0:
+		err = signAll(*keyFile, *ver, *noExec, fs.Args(), stdout)
+	case *verify != "" && fs.NArg() > 0:
 		err = verifyAll(*verify, fs.Args(), stdout)
+	case *checkVer != "" && fs.NArg() > 0:
+		err = checkAll(*checkVer, fs.Args(), stdout)
 	default:
-		fmt.Fprintln(stderr, "usage: aerolvm-rootd-sign -genkey <key file> | -key <key file> -version <vX.Y.Z> <binary>... | -verify <public keys file> <binary>...")
+		fmt.Fprintln(stderr, usageLine)
 		return 2
 	}
 	if err != nil {
@@ -128,13 +151,13 @@ func readPrivateKey(path string) (ed25519.PrivateKey, error) {
 	return priv, nil
 }
 
-func signAll(keyFile, version string, binaries []string, stdout io.Writer) error {
+func signAll(keyFile, version string, noExec bool, binaries []string, stdout io.Writer) error {
 	priv, err := readPrivateKey(keyFile)
 	if err != nil {
 		return err
 	}
 	for _, bin := range binaries {
-		if err := signOne(priv, version, bin, stdout); err != nil {
+		if err := signOne(priv, version, bin, noExec, stdout); err != nil {
 			return fmt.Errorf("%s: %w", bin, err)
 		}
 	}
@@ -165,22 +188,49 @@ func platform(bin string) (goos, goarch string, err error) {
 	return goos, goarch, nil
 }
 
-func signOne(priv ed25519.PrivateKey, version, bin string, stdout io.Writer) error {
+// checkAll is -check-version: the version check signOne makes, with no key.
+func checkAll(version string, binaries []string, stdout io.Writer) error {
+	for _, bin := range binaries {
+		goos, goarch, err := platform(bin)
+		if err == nil {
+			err = checkVersion(bin, version, goos, goarch, stdout)
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", bin, err)
+		}
+		fmt.Fprintf(stdout, "version ok %s: %s, API %d, %s/%s\n", bin, version, rootdpb.APIVersion, goos, goarch)
+	}
+	return nil
+}
+
+// checkVersion runs a binary for this machine with --version and refuses
+// one that does not report version and this tool's API level. A binary for
+// another platform cannot run here: its version is taken from -version.
+func checkVersion(bin, version, goos, goarch string, stdout io.Writer) error {
+	want := fmt.Sprintf("aerolvm-rootd %s (API %d)", version, rootdpb.APIVersion)
+	if goos+"/"+goarch != host {
+		fmt.Fprintf(stdout, "%s: a %s/%s binary cannot run here; its version is taken from -version\n", bin, goos, goarch)
+		return nil
+	}
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		return fmt.Errorf("run --version: %w", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != want {
+		return fmt.Errorf("it reports %q; signing it as %q would misname it", got, want)
+	}
+	return nil
+}
+
+func signOne(priv ed25519.PrivateKey, version, bin string, noExec bool, stdout io.Writer) error {
 	goos, goarch, err := platform(bin)
 	if err != nil {
 		return err
 	}
-	want := fmt.Sprintf("aerolvm-rootd %s (API %d)", version, rootdpb.APIVersion)
-	if goos+"/"+goarch == host {
-		out, err := exec.Command(bin, "--version").Output()
-		if err != nil {
-			return fmt.Errorf("run --version: %w", err)
-		}
-		if got := strings.TrimSpace(string(out)); got != want {
-			return fmt.Errorf("it reports %q; signing it as %q would misname it", got, want)
-		}
-	} else {
-		fmt.Fprintf(stdout, "%s: a %s/%s binary cannot run here; its version is taken from -version\n", bin, goos, goarch)
+	if noExec {
+		fmt.Fprintf(stdout, "%s: not run (-no-exec); its version was checked before the key existed\n", bin)
+	} else if err := checkVersion(bin, version, goos, goarch, stdout); err != nil {
+		return err
 	}
 	f, err := os.Open(bin)
 	if err != nil {

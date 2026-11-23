@@ -273,6 +273,14 @@ INSTALL_ARGS+=(--with-isolate)
 # BuildKit step below then finds buildkitd and its unit already there.
 INSTALL_ARGS+=(--buildkit-rootless)
 %{ endif ~}
+%{ if containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split (config/cluster.yml privilege_mode,
+# plans/security-gaps-m1-m4.md M1 PR 10): sandboxd runs as the sandboxd user
+# with no rights, and install.sh installs the signed root helper. Split runs
+# only the containerd engine, and builds with rootless BuildKit, which
+# install.sh turns on with it.
+INSTALL_ARGS+=(--with-containerd-engine --privilege-mode split)
+%{ endif ~}
 %{ endif ~}
 %{ if ingress_proxy_routing == true ~}
 INSTALL_ARGS+=(--ingress-proxy-routing)

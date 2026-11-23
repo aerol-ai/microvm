@@ -17,6 +17,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/nodeupgrade"
+	"github.com/aerol-ai/microvm/internal/privmode"
 )
 
 func sha(s string) string {
@@ -24,7 +25,7 @@ func sha(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func stubRecovery(t *testing.T, fn func(context.Context, string, nodeupgrade.Host, io.Writer) ([]nodeupgrade.RecoverResult, error)) {
+func stubRecovery(t *testing.T, fn func(context.Context, nodeupgrade.Paths, nodeupgrade.Host, io.Writer) ([]nodeupgrade.RecoverResult, error)) {
 	t.Helper()
 	orig := recoverUpgrades
 	t.Cleanup(func() { recoverUpgrades = orig })
@@ -53,9 +54,11 @@ func TestRecoverInterruptedUpgrade(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			logs.Reset()
-			stubRecovery(t, func(_ context.Context, dir string, _ nodeupgrade.Host, out io.Writer) ([]nodeupgrade.RecoverResult, error) {
-				if dir != filepath.Join(filepath.Dir(cfg.DBPath), "upgrade") {
-					t.Fatalf("state dir = %s", dir)
+			stubRecovery(t, func(_ context.Context, p nodeupgrade.Paths, _ nodeupgrade.Host, out io.Writer) ([]nodeupgrade.RecoverResult, error) {
+				// The node's own database and upgrade folder, from its
+				// settings: never a path from a record.
+				if p.StateDir != filepath.Join(filepath.Dir(cfg.DBPath), "upgrade") || p.DBPath != cfg.DBPath {
+					t.Fatalf("paths = %+v", p)
 				}
 				_, _ = io.WriteString(out, "line one\npartial")
 				return tc.results, tc.err
@@ -78,6 +81,20 @@ func TestRecoverInterruptedUpgrade(t *testing.T) {
 	}
 }
 
+// In privilege mode split sandboxd cannot swap root's files back:
+// sandboxd.service settles an interrupted upgrade as root before sandboxd
+// starts (`sandboxd upgrade recover`, M1 PR 10), and sandboxd leaves it.
+func TestRecoverInterruptedUpgradeSplit(t *testing.T) {
+	stubRecovery(t, func(context.Context, nodeupgrade.Paths, nodeupgrade.Host, io.Writer) ([]nodeupgrade.RecoverResult, error) {
+		t.Fatal("sandboxd ran upgrade recovery in privilege mode split")
+		return nil, nil
+	})
+	cfg := config.Config{DBPath: filepath.Join(t.TempDir(), "state.db"), PrivilegeMode: privmode.Split}
+	if err := recoverInterruptedUpgrade(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A sandboxd booting after an upgrader died with the sandboxd binary
 // swapped but toolboxd not: Run puts the binary back and exits before it
 // opens the store, so systemd starts the previous binary.
@@ -91,6 +108,9 @@ func TestRunRevertsAHalfSwappedUpgradeBeforeTheStore(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// This node installs its files in dir (SB_TOOLBOX_BINARY_PATH, as on a
+	// node with --install-prefix): recovery holds the record to that layout.
+	t.Setenv("SB_TOOLBOX_BINARY_PATH", toolboxd)
 	write(sandboxd, "new sandboxd")
 	write(sandboxd+".prev", "old sandboxd")
 	write(toolboxd, "old toolboxd")
@@ -129,6 +149,26 @@ func TestRunRevertsAHalfSwappedUpgradeBeforeTheStore(t *testing.T) {
 // A normal boot writes the store-opened marker beside the database once
 // the store is open and migrated; a marker that cannot be written is only
 // logged.
+// Boot recovery's layout comes from the node's settings; without its env
+// file, the installed files are beside toolboxd.
+func TestUpgradeRecoveryPaths(t *testing.T) {
+	orig := resolveRecoveryPaths
+	t.Cleanup(func() { resolveRecoveryPaths = orig })
+	cfg := config.Config{DBPath: "/data/state.db", ToolboxBinaryPath: "/opt/aerolvm/toolboxd"}
+	resolveRecoveryPaths = func() (nodeupgrade.Paths, error) {
+		return nodeupgrade.Paths{Sandboxd: "/usr/local/bin/sandboxd", Toolboxd: "/usr/local/bin/toolboxd", DBPath: "/elsewhere/x.db", StateDir: "/elsewhere"}, nil
+	}
+	p := upgradeRecoveryPaths(cfg)
+	if p.Sandboxd != "/usr/local/bin/sandboxd" || p.DBPath != "/data/state.db" || p.StateDir != "/data/upgrade" {
+		t.Fatalf("paths %+v", p)
+	}
+	resolveRecoveryPaths = func() (nodeupgrade.Paths, error) { return nodeupgrade.Paths{}, errors.New("unreadable env file") }
+	p = upgradeRecoveryPaths(cfg)
+	if p.Sandboxd != "/opt/aerolvm/sandboxd" || p.Toolboxd != "/opt/aerolvm/toolboxd" || p.DBPath != "/data/state.db" {
+		t.Fatalf("fallback paths %+v", p)
+	}
+}
+
 func TestRunMarksTheStoreOpened(t *testing.T) {
 	paths := setBaseRunEnv(t)
 	if err := runWithAutoCancel(t, 150*time.Millisecond, nil); err != nil {

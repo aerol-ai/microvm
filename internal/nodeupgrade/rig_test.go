@@ -309,7 +309,13 @@ type rig struct {
 
 func newRig(t *testing.T, installed releaseFiles) *rig {
 	t.Helper()
-	dir := t.TempDir()
+	return newRigIn(t, t.TempDir(), installed)
+}
+
+// newRigIn is newRig in dir: the root helper's tests need a folder reached
+// with no link on the way (macOS's temp folders sit under /var, a link).
+func newRigIn(t *testing.T, dir string, installed releaseFiles) *rig {
+	t.Helper()
 	r := &rig{t: t, dir: dir, out: &bytes.Buffer{}, now: time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)}
 	r.paths = Paths{
 		EnvFile:       filepath.Join(dir, "etc", "sandboxd.env"),

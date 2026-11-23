@@ -128,6 +128,19 @@ func (u *Upgrader) singleNodeOneWaySince(ctx context.Context, st *State, backup,
 	if !st.SingleNode || dbPath == "" {
 		return nil
 	}
+	// Only one of the upgrade folder's own backups is read. A missing one
+	// reads as no migrations, as before (planRollbackRestore then says it
+	// is gone); a link or another kind of file is never opened.
+	err := checkBackupPlace(u.Paths.StateDir, backup)
+	if err == nil {
+		if fi, lerr := os.Lstat(backup); lerr == nil && !fi.Mode().IsRegular() {
+			err = fmt.Errorf("%s is not a regular file (mode %s)", backup, fi.Mode())
+		}
+	}
+	if err != nil {
+		u.logf("warning: op %s: not reading its database backup: %v", st.Op, err)
+		return nil
+	}
 	since, err := oneWaySince(ctx, backup, dbPath)
 	if err != nil {
 		u.logf("warning: could not compare the database with its backup for one-way schema migrations: %v", err)
