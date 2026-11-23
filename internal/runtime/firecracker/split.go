@@ -26,13 +26,30 @@ import (
 // cold boot otherwise runs as in single mode: the same machine config,
 // drives, network, vsock handshake, guest env and adoption.
 //
-// What split mode does not do yet answers 501 with a reason
-// (errSplitSnapshots): every path that saves or loads a VM's memory and
-// state (stop, start, a snapshot, a move, an export, a template's
-// snapshot, a snapshot load, the warm VM pool). Firecracker writes those
-// files as the jailer's user, in the chroot, and sandboxd could not take
-// them back. The ownership lease cannot freeze a VM (its group is root's):
-// Freeze answers ErrCannotFreeze, and the lease stops the VM instead.
+// A VM's memory and state files and its disks cross between sandboxd and
+// the chroot through the helper (M1 PR 14b), by group and mode alone,
+// never by a change of owner:
+//
+//   - Out (a stop, a template's snapshot): firecracker writes a snapshot
+//     in the chroot as the jailer's user. The helper lets sandboxd's group
+//     read it and the VM's disks (HandOutFirecrackerFiles), and sandboxd
+//     copies each out into a file of its own, opened with no link
+//     followed (copyFromChroot), as single mode copies them as root.
+//   - In, read-only (a start, a snapshot load, a template's snapshot): a
+//     snapshot's memory and state and a template's root disk stay
+//     sandboxd's. sandboxd links each into the stage folder and the helper
+//     links that very file into the chroot with the jailer's group reading
+//     it (ShareFirecrackerFiles), as single mode's chrootSharedFile does
+//     with root's.
+//   - In, writable (a start's disk copies, a cold boot): as the jailer's,
+//     through the stage folder, as before.
+//
+// What split mode does not do yet answers 501 with a reason: the warm VM
+// pool (errSplitWarmPool), whose paused VMs run under their slot's ID until
+// a sandbox claims them, and a disk saved as a container image
+// (errSplitImages), which a second VM reads. The ownership lease cannot
+// freeze a VM (its group is root's): Freeze answers ErrCannotFreeze, and
+// the lease stops the VM instead.
 
 // SplitHelper is the root helper's Firecracker calls, as
 // internal/rootclient makes them (pkg/daemon adapts the client).
@@ -57,6 +74,16 @@ type SplitHelper interface {
 	// MakeFilesystem makes an ext4 filesystem in the VM's stage file name:
 	// from the folder source, with sizeMiB, or empty with no source.
 	MakeFilesystem(ctx context.Context, id, name, source string, sizeMiB uint64) error
+	// EnsureSnapshotTap is EnsureTap for a VM restored from a snapshot:
+	// the TAP's neighbor gets the MAC the snapshot froze, which the helper
+	// works out from the snapshot's guest CID.
+	EnsureSnapshotTap(ctx context.Context, name string, guestCID uint32) (TapSlot, error)
+	// ShareFirecrackerFiles links files sandboxd put in the VM's stage
+	// folder into its chroot, read-only for the jailer's user.
+	ShareFirecrackerFiles(ctx context.Context, id string, names ...string) error
+	// HandOutFirecrackerFiles lets sandboxd's group read files in the
+	// VM's chroot.
+	HandOutFirecrackerFiles(ctx context.Context, id string, names ...string) error
 }
 
 // SplitProcess is a VM the helper holds: a signal ends it through the
@@ -67,9 +94,12 @@ type SplitProcess interface {
 	StartTicks() uint64
 }
 
-// errSplitSnapshots is what split mode refuses for Firecracker.
-var errSplitSnapshots = privmode.NotYet("save or load a Firecracker VM's memory and state (stop, start, a snapshot, a move, an export, a template's snapshot, the warm VM pool)",
-	privmode.StepFirecrackerSnapshots)
+// What split mode refuses for Firecracker: the warm VM pool, and a disk
+// saved as a container image.
+var (
+	errSplitWarmPool = privmode.NotYet("run the Firecracker warm VM pool", privmode.StepFirecrackerWarmPool)
+	errSplitImages   = privmode.NotYet("save a Firecracker sandbox's disk as an image", privmode.StepFirecrackerImages)
+)
 
 // SetSplit makes the driver run its VMs through the root helper h:
 // privilege mode split. It replaces the spawner and the TAP host. Call it
@@ -80,10 +110,10 @@ func (d *Driver) SetSplit(h SplitHelper) {
 	d.tapHost = splitTapHost{h: h}
 }
 
-// splitGap refuses, in split mode, what saves or loads a VM's state.
-func (d *Driver) splitGap() error {
+// splitGap refuses gap in split mode; nil in single.
+func (d *Driver) splitGap(gap error) error {
 	if d.split != nil {
-		return errSplitSnapshots
+		return gap
 	}
 	return nil
 }
@@ -170,7 +200,7 @@ func (v *splitVMM) ShareSockets(ctx context.Context) error {
 
 // Shutdown, Kill and Cleanup all end the VM through the helper, which kills
 // its group and removes its jail: in split mode a VM never restarts from
-// its jail (errSplitSnapshots).
+// its jail. A stop has copied its snapshot out first.
 func (v *splitVMM) Shutdown(ctx context.Context, _ time.Duration) error {
 	return v.stop(ctx)
 }
@@ -232,13 +262,23 @@ func (d *Driver) splitJailID(path string) (id, name string, err error) {
 	return id, name, nil
 }
 
-// splitStage moves a disk the driver built in a VM's stage folder into its
-// chroot, through the helper (chrootFilePath in split mode). A shared file
-// is the kernel, which the helper puts in every jail itself.
-func (d *Driver) splitStage(srcAbs, destName string, shared bool) (string, error) {
+// splitStage puts a file in a VM's chroot through the helper
+// (chrootFilePath and chrootSharedFile in split mode). A writable disk the
+// driver built in the VM's stage folder moves in as the jailer's. A shared
+// file goes in read-only and stays sandboxd's (splitShare); the kernel is
+// the helper's own, which it puts in every jail itself.
+func (d *Driver) splitStage(runDir, srcAbs, destName string, shared bool) (string, error) {
 	if shared {
-		if srcAbs != d.cfg.KernelImage || destName != kernelFileName {
-			return "", fmt.Errorf("firecracker runtime: %w", errSplitSnapshots)
+		if destName == kernelFileName {
+			if srcAbs != d.cfg.KernelImage {
+				return "", fmt.Errorf("firecracker runtime: the kernel %s is not the node's own (%s)", srcAbs, d.cfg.KernelImage)
+			}
+			return destName, nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), splitCallWait)
+		defer cancel()
+		if err := d.splitShare(ctx, runDir, sharedFile{destName, srcAbs}); err != nil {
+			return "", err
 		}
 		return destName, nil
 	}
@@ -302,10 +342,19 @@ func shareSockets(ctx context.Context, h VMMHandle) error {
 type splitTapHost struct{ h SplitHelper }
 
 func (t splitTapHost) Ensure(ctx context.Context, slot TapSlot) error {
+	var got TapSlot
+	var err error
 	if slot.GuestMAC != "" {
-		return fmt.Errorf("firecracker runtime: TAP %s: %w", slot.TapName, errSplitSnapshots)
+		// A snapshot's VM keeps the MAC it froze, which macFromCID made
+		// from its CID: the helper is sent the CID and works the MAC out.
+		cid, ok := cidFromMAC(slot.GuestMAC)
+		if !ok {
+			return fmt.Errorf("firecracker runtime: TAP %s: guest MAC %s is not one a guest CID makes", slot.TapName, slot.GuestMAC)
+		}
+		got, err = t.h.EnsureSnapshotTap(ctx, slot.TapName, cid)
+	} else {
+		got, err = t.h.EnsureTap(ctx, slot.TapName)
 	}
-	got, err := t.h.EnsureTap(ctx, slot.TapName)
 	if err != nil {
 		return err
 	}

@@ -3,10 +3,10 @@ package firecracker
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +29,8 @@ type fakeSplit struct {
 	stopErr  error
 	tapErr   error
 	mkfsErr  error
+	shareErr error
+	outErr   error
 	procs    map[string]*fakeSplitProc
 }
 
@@ -134,6 +136,34 @@ func (f *fakeSplit) RemoveTap(_ context.Context, name string) error {
 	return nil
 }
 
+func (f *fakeSplit) EnsureSnapshotTap(_ context.Context, name string, cid uint32) (TapSlot, error) {
+	f.note("snaptap " + name + " " + strconv.FormatUint(uint64(cid), 10))
+	s := f.slot
+	s.TapName = name
+	return s, f.tapErr
+}
+
+// ShareFirecrackerFiles moves each named file from the stage folder into
+// the chroot, as the helper links it in and drops the stage name.
+func (f *fakeSplit) ShareFirecrackerFiles(_ context.Context, id string, names ...string) error {
+	f.note("share " + id + " " + strings.Join(names, ","))
+	if f.shareErr != nil {
+		return f.shareErr
+	}
+	root, st := f.jail(id)
+	for _, name := range names {
+		if err := os.Rename(filepath.Join(st, name), filepath.Join(root, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeSplit) HandOutFirecrackerFiles(_ context.Context, id string, names ...string) error {
+	f.note("hand-out " + id + " " + strings.Join(names, ","))
+	return f.outErr
+}
+
 func (f *fakeSplit) MakeFilesystem(_ context.Context, id, name, source string, size uint64) error {
 	f.note(strings.TrimSpace("mkfs " + id + " " + name + " " + source))
 	if f.mkfsErr != nil {
@@ -236,12 +266,18 @@ func TestSplitCreateFailures(t *testing.T) {
 		!strings.Contains(err.Error(), "no space") {
 		t.Fatalf("an overlay mkfs failure: %v", err)
 	}
-	// A template's snapshot is a snapshot load: 501.
+	// A template's snapshot the helper will not share: the load stops,
+	// and the jail and the TAP go.
 	f = newFakeSplit(t)
+	f.shareErr = errors.New("refused: host")
 	d, _, _, _ = splitDriver(t, f)
-	d.SetTemplateResolver(fakeResolver{res: &TemplateResolution{RootfsPath: "/t/rootfs.ext4", HasSnapshot: true}})
-	if _, err := d.Create(ctx, models.CreateSandboxRequest{TemplateID: "tpl-1", CPU: 1, MemoryMB: 128}, "sb-d", "tok", nil); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("a snapshot load in split: %v", err)
+	d.SetTemplateResolver(fakeResolver{res: splitTemplate(t, 7)})
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{TemplateID: "tpl-1", CPU: 1, MemoryMB: 128}, "sb-d", "tok", nil); err == nil ||
+		!strings.Contains(err.Error(), "refused: host") {
+		t.Fatalf("a snapshot load the helper refused: %v", err)
+	}
+	if got := f.seen(); !slices.Contains(got, "stop sb-d") || !slices.Contains(got, "untap fctap-test") {
+		t.Fatalf("calls after a refused load: %v", got)
 	}
 }
 
@@ -251,23 +287,19 @@ func (r fakeResolver) Resolve(context.Context, string) (*TemplateResolution, err
 	return r.res, nil
 }
 
-// TestSplitRefusesSnapshots: every path that saves or loads a VM's memory
-// and state answers 501 in split mode, and the lease cannot freeze a VM.
-func TestSplitRefusesSnapshots(t *testing.T) {
+// TestSplitRefusesWarmPoolAndImages: what split mode does not run yet
+// answers 501 naming its step (M1 PR 14b), and the lease cannot freeze a
+// VM.
+func TestSplitRefusesWarmPoolAndImages(t *testing.T) {
 	d, _, _, _ := splitDriver(t, newFakeSplit(t))
 	ctx := context.Background()
-	_, err1 := d.Start(ctx, "sb-1")
-	_, err2 := d.StartWithIdentity(ctx, "sb-1", "sb-1", "tok")
-	err3 := d.Stop(ctx, "sb-1")
-	_, err4 := d.CreateSnapshot(ctx, "sb-1", "img")
-	err5 := d.ExportSandboxSnapshot(ctx, "sb-1", io.Discard)
-	err6 := d.ImportSandboxSnapshot(ctx, "sb-1", strings.NewReader(""))
-	_, err7 := d.SnapshotTemplate(ctx, TemplateSnapshotRequest{})
-	_, err8 := d.WarmSpawn(ctx, WarmSpawnRequest{})
-	for i, err := range []error{err1, err2, err3, err4, err5, err6, err7, err8} {
-		if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "jailer's user") {
-			t.Errorf("call %d: %v, want a 501 naming the step", i+1, err)
-		}
+	_, err := d.CreateSnapshot(ctx, "sb-1", "img")
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "container image") {
+		t.Errorf("CreateSnapshot: %v, want a 501 naming the step", err)
+	}
+	_, err = d.WarmSpawn(ctx, WarmSpawnRequest{})
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "warm VM pool") {
+		t.Errorf("WarmSpawn: %v, want a 501 naming the step", err)
 	}
 	if err := d.Freeze(ctx, "sb-1"); !errors.Is(err, sbruntime.ErrCannotFreeze) {
 		t.Fatalf("Freeze: %v", err)
@@ -345,9 +377,12 @@ func TestSplitStageAndMkfs(t *testing.T) {
 	if name, err := d.chrootSharedFile(stage, d.cfg.KernelImage, kernelFileName); err != nil || name != kernelFileName {
 		t.Fatalf("kernel: %q %v", name, err)
 	}
-	for _, tc := range []struct{ src, dest string }{{"/t/rootfs.ext4", rootfsFileName}, {d.cfg.KernelImage, "other"}} {
-		if _, err := d.chrootSharedFile(stage, tc.src, tc.dest); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-			t.Errorf("shared %s as %s: %v", tc.src, tc.dest, err)
+	// Another kernel, the kernel under another name, a file that is not
+	// there: none is shared.
+	for _, tc := range []struct{ src, dest string }{{"/other/vmlinux", kernelFileName}, {d.cfg.KernelImage, "other"},
+		{"/t/rootfs.ext4", rootfsFileName}} {
+		if _, err := d.chrootSharedFile(stage, tc.src, tc.dest); err == nil {
+			t.Errorf("shared %s as %s", tc.src, tc.dest)
 		}
 	}
 	if err := os.WriteFile(filepath.Join(stage, rootfsFileName), []byte("x"), 0o600); err != nil {
@@ -425,10 +460,15 @@ func TestSplitTapHost(t *testing.T) {
 	if err := h.Remove(ctx, "fctap3"); err != nil {
 		t.Fatal(err)
 	}
+	// A snapshot's frozen MAC goes to the helper as the CID it holds.
 	frozen := slot
 	frozen.GuestMAC = "02:00:00:00:00:09"
-	if err := h.Ensure(ctx, frozen); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("a snapshot's frozen MAC: %v", err)
+	if err := h.Ensure(ctx, frozen); err != nil || !slices.Contains(f.seen(), "snaptap fctap3 9") {
+		t.Fatalf("a snapshot's frozen MAC: %v %v", err, f.seen())
+	}
+	frozen.GuestMAC = "aa:bb:cc:00:00:09"
+	if err := h.Ensure(ctx, frozen); err == nil {
+		t.Fatal("a MAC no guest CID makes")
 	}
 	f.tapErr = errors.New("refused: tap")
 	if err := h.Ensure(ctx, slot); err == nil {

@@ -23,6 +23,10 @@ type firecrackerHelper interface {
 	EnsureTap(ctx context.Context, name string) (*rootdpb.EnsureTapResponse, error)
 	RemoveTap(ctx context.Context, name string) error
 	MakeFilesystem(ctx context.Context, id, name, source string, sizeMiB uint64) error
+	// A VM's snapshot files (M1 PR 14b).
+	EnsureSnapshotTap(ctx context.Context, name string, guestCID uint32) (*rootdpb.EnsureTapResponse, error)
+	ShareFirecrackerFiles(ctx context.Context, id string, names ...string) error
+	HandOutFirecrackerFiles(ctx context.Context, id string, names ...string) error
 }
 
 const firecrackerKind = rootdpb.HostKind_HOST_KIND_FIRECRACKER
@@ -61,12 +65,30 @@ func (s splitFirecracker) StopFirecracker(ctx context.Context, id string) error 
 }
 
 func (s splitFirecracker) EnsureTap(ctx context.Context, name string) (fcruntime.TapSlot, error) {
-	resp, err := s.h.EnsureTap(ctx, name)
-	if err != nil {
-		return fcruntime.TapSlot{}, err
+	return tapSlotOf(name)(s.h.EnsureTap(ctx, name))
+}
+
+func (s splitFirecracker) EnsureSnapshotTap(ctx context.Context, name string, guestCID uint32) (fcruntime.TapSlot, error) {
+	return tapSlotOf(name)(s.h.EnsureSnapshotTap(ctx, name, guestCID))
+}
+
+// tapSlotOf turns the helper's answer for TAP name into the driver's slot.
+func tapSlotOf(name string) func(*rootdpb.EnsureTapResponse, error) (fcruntime.TapSlot, error) {
+	return func(resp *rootdpb.EnsureTapResponse, err error) (fcruntime.TapSlot, error) {
+		if err != nil {
+			return fcruntime.TapSlot{}, err
+		}
+		return fcruntime.TapSlot{TapName: name, CIDR: resp.GetCidr(), HostIP: resp.GetHostIp(), GuestIP: resp.GetGuestIp(),
+			VsockCID: resp.GetVsockCid()}, nil
 	}
-	return fcruntime.TapSlot{TapName: name, CIDR: resp.GetCidr(), HostIP: resp.GetHostIp(), GuestIP: resp.GetGuestIp(),
-		VsockCID: resp.GetVsockCid()}, nil
+}
+
+func (s splitFirecracker) ShareFirecrackerFiles(ctx context.Context, id string, names ...string) error {
+	return s.h.ShareFirecrackerFiles(ctx, id, names...)
+}
+
+func (s splitFirecracker) HandOutFirecrackerFiles(ctx context.Context, id string, names ...string) error {
+	return s.h.HandOutFirecrackerFiles(ctx, id, names...)
 }
 
 func (s splitFirecracker) RemoveTap(ctx context.Context, name string) error {

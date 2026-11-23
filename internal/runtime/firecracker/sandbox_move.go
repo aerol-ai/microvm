@@ -47,9 +47,6 @@ func sandboxMoveFiles(m *sandboxSnapshotManifest) []string {
 // ExportSandboxSnapshot writes a stopped sandbox's snapshot to w as a tar
 // stream, for ImportSandboxSnapshot on another worker.
 func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w io.Writer) error {
-	if err := d.splitGap(); err != nil {
-		return fmt.Errorf("firecracker runtime: export %s: %w", sandboxID, err)
-	}
 	if err := validateSandboxID(sandboxID); err != nil {
 		return fmt.Errorf("firecracker runtime: export %s: %w", sandboxID, err)
 	}
@@ -184,9 +181,6 @@ func readSparseTable(r io.Reader, size, entry int64) ([]byteRange, error) {
 // in place; a failed import leaves nothing behind. A sandbox running here is
 // refused.
 func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r io.Reader) error {
-	if err := d.splitGap(); err != nil {
-		return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
-	}
 	if err := validateSandboxID(sandboxID); err != nil {
 		return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
 	}
