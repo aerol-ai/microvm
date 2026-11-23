@@ -9,6 +9,9 @@
 //     hold a dir preopen and a listener at the same time.
 //   - GET  /port        → in multi-port mode, the exposed port the request
 //     came in on (the port its listener serves); otherwise "single".
+//   - GET  /?file=P     → returns the contents of P, any path the guest's
+//     pre-opens reach (an external mount's); PUT /?file=P writes the body
+//     to P.
 //
 // The listener fd defaults to 3 (the bare-wasip1 convention, used when no dir
 // preopens are configured) and is overridden by AEROL_WASM_LISTEN_FD, which the
@@ -99,6 +102,26 @@ func handler(port string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/port" {
 			_, _ = w.Write([]byte(port))
+			return
+		}
+		if name := r.URL.Query().Get("file"); name != "" {
+			// A file anywhere the guest's pre-opens reach (an external
+			// mount's, say): read on GET, written with the body on PUT.
+			if r.Method == http.MethodPut {
+				body, _ := io.ReadAll(r.Body)
+				if err := os.WriteFile(name, body, 0o644); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				_, _ = w.Write([]byte("written\n"))
+				return
+			}
+			data, err := os.ReadFile(name)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write(data)
 			return
 		}
 		if name := r.URL.Query().Get("workfile"); name != "" {
