@@ -561,6 +561,61 @@ Each is small and stands alone. Together they shrink the root surface now.
     - **Two sockets needed more than the group:** the egress gateway's
       control socket (its peer uid, `SB_EGRESS_PEER_UIDS`) and rootless
       BuildKit's (an ACL for the agent, never the build user's group).
+10c. Split mode's last containerd gaps (PR 13): the containerd warm pool
+    and gVisor checkpoint moves.
+    **What building it taught us (PR 13, 2026-11-23).**
+    - **The warm pool needed no new helper call.** A park is a split
+      create (PR 7's one PrepareSandbox call), and the slot's park socket
+      gets its name in the helper's folder from EnsureReadySocket with no
+      nonce, which every helper has served since PR 7. The park socket
+      stays the agent's, so the adopt frame and the env it carries never
+      pass through the helper. A claim needs no root work beyond the
+      gate's relabel and the firewall's rules; a disk limit goes through
+      the disk_quota part, as a resize's does.
+    - **Moves are five calls at the end of the service** (CheckpointMove,
+      ExportMove, ImportMove, StagedMove, DropMove). The bundle's bytes
+      stream through the helper, which copies them into root's own files:
+      runsc reads them as root, and a file the agent still held could
+      change after the helper's check. The helper reads only the move
+      bundle format, bounds a bundle's bytes (a refusal) and the bundles
+      staged at once (busy), and the gate takes a restore only from
+      `<moves>/in/<the container's own ID>`.
+    - **A gVisor move stays within one privilege mode.** The bundle format
+      is the same, so each mode stages the other's bundle. But runsc
+      (release 20261102.0) refuses a restore whose bind options differ
+      from the checkpoint's, on by default, and the ready socket's bind is
+      read-write in single and read-only in split (the gate's rule). A
+      runsc box run shows the refusal both ways. So the checkpoint-moves
+      label now carries the mode, and the decommission leader refuses a
+      gVisor move to a target of the other mode before the source saves
+      anything. While a fleet switches from single to split, a gVisor
+      sandbox keeps its memory only if a node of its own mode takes it.
+    - **A stream needs a cancel of its own.** The client's call bound
+      hands back the caller's context unchanged when it has a deadline, so
+      cutting an import whose source failed needs a cancel the client
+      makes for the stream. A test found it.
+    - **Live, in a privileged Docker Desktop box** (kernel 5.10, arm64):
+      parks, a warm claim with env, a stop and start that sends the env
+      again, deletes, the boot purge and the drain all ran as uid 65531
+      through the helper. A gVisor sandbox moved through the helper with
+      real runsc (systrap): checkpoint 229 ms, a 2.5 MB bundle, restore
+      426 ms, and a file in its memory-backed root survived.
+    - **A warm claim's cost is its trips, so a split claim reads once.**
+      Timed call by call in the box (8 paired rounds, 100 runs each), a
+      trip through the gate costs about 0.4 ms and the firewall's lift
+      through the helper about 0.4 ms. With single mode's three reads of
+      containerd the split claim came out over the +1 ms budget; with one
+      list in their place it adds +0.72 ms p50 (bootstrap 95% CI +0.44 to
+      +0.89). End to end, on the idle box (10 paired rounds, 160 pool
+      hits), the pool stage adds +1.25 ms (CI +0.25 to +2.75) and the
+      whole create +0.51 ms (CI -1.14 to +2.09): both hold +0.72 ms, and
+      neither is tight enough to prove the budget. The EKS drill takes the
+      N1 numbers.
+    - **The helper takes moves from its own settings.** It serves the move
+      calls only with `SB_GVISOR_CHECKPOINT_MOVES` on in its own
+      environment, so the chart (PR 11) passes that setting to the runtime
+      container too, and drops its split refusals of the warm pool, of
+      gVisor moves and of the agent-sandbox API's warm pools.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts
     and `shareProcessNamespace`; turn external storage on by default.
     The operator rolls workers to the new template node by node through
