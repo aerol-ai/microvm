@@ -220,8 +220,14 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	// The slot's writable layer gets the request's disk limit before the
 	// toolbox takes the sandbox's identity; a failure destroys the slot and
 	// the create goes cold (tryWarmAdopt), where the same limit applies.
+	// In privilege mode split the helper sets it, as for a resize.
 	if d.cfg.DiskQuota && req.DiskGB > 0 {
-		if err := d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB); err != nil {
+		if d.helper != nil {
+			err = d.splitResizeDisk(ctx, container, info.SnapshotKey, req.DiskGB)
+		} else {
+			err = d.limitWritableLayer(ctx, client, info.SnapshotKey, req.DiskGB)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -363,6 +369,10 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 		_ = d.netns.Release(ctx, parkKey)
 	}
 	d.removeContainerFiles(parkKey)
+	// Privilege mode split: the helper's files for the slot (its host
+	// files, FIFOs and its name for the park socket) go too. A no-op in
+	// single mode.
+	d.releaseHelperFiles(ctx, parkKey)
 	return nil
 }
 

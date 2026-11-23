@@ -20,7 +20,6 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
@@ -670,7 +669,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			return nil, fmt.Errorf("container host files: %w", err)
 		}
 	}
-	parked, err := d.parkedRestartListener(spec, sandboxID, toolboxToken)
+	parked, err := d.parkedRestartListener(spec, containerRef, sandboxID, toolboxToken)
 	if err != nil {
 		return nil, err
 	}
@@ -698,14 +697,19 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		// Privilege mode split: the helper makes the container's files
 		// again (split_files.go): fresh FIFOs, the ready socket's new name,
 		// and the host files and toolbox, left as they are when unchanged.
+		// An adopted warm-pool container's ready socket is its park
+		// socket, which parked bound again above (split_park.go).
+		var files *rootdpb.SandboxFilePaths
+		var ferr error
 		if parked != nil {
-			return nil, privmode.NotYet("start a warm-pool container", privmode.StepWarmPool)
+			files, ferr = d.splitParkFiles(ctx, containerRef, specReadySource(spec))
+		} else {
+			rl, nonce := d.splitReadyResume(spec)
+			if rl != nil {
+				defer func() { _ = rl.Close() }()
+			}
+			files, ferr = d.helperFiles(ctx, containerRef, nonce, rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED)
 		}
-		rl, nonce := d.splitReadyResume(spec)
-		if rl != nil {
-			defer func() { _ = rl.Close() }()
-		}
-		files, ferr := d.helperFiles(ctx, containerRef, nonce, rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -786,8 +790,13 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 // The hello must carry the bootstrap token and park nonce in the spec's env,
 // and it arrives on the host socket the spec's ready mount names, which must
 // be a park socket directly in the ready dir: the listener unlinks whatever
-// is at that path before it binds.
-func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken string) (*dockerpkg.ParkedListener, error) {
+// is at that path before it binds. In privilege mode split the spec binds
+// the helper's name for the slot's park socket instead, <helper ready>/
+// <slot>/ready.sock (split_park.go), and the listener binds the slot's
+// socket in the ready dir, which the start's files call names again. The
+// slot must be the container itself (containerRef): the helper names only
+// the socket of the container it is asked for.
+func (d *Driver) parkedRestartListener(spec *specs.Spec, containerRef, sandboxID, toolboxToken string) (*dockerpkg.ParkedListener, error) {
 	if spec == nil || spec.Process == nil {
 		return nil, nil
 	}
@@ -798,14 +807,15 @@ func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken
 	if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(toolboxToken) == "" {
 		return nil, errors.New("warm-pool container: a start needs the sandbox's identity to adopt it again")
 	}
-	var source string
-	for _, m := range spec.Mounts {
-		if m.Destination == dockerpkg.GuestReadySocketPath {
-			source = filepath.Clean(m.Source)
-			break
-		}
-	}
+	source := specReadySource(spec)
 	readyDir := filepath.Clean(strings.TrimSpace(d.cfg.ReadyDir))
+	if d.helper != nil {
+		slotID := splitParkSlot(source)
+		if slotID == "" || slotID != containerRef || strings.TrimSpace(d.cfg.ReadyDir) == "" {
+			return nil, fmt.Errorf("warm-pool container %s has no park socket of its own in the root helper's folder to be adopted over (mount %q)", containerRef, source)
+		}
+		return dockerpkg.NewParkedListener(readyDir, slotID, bootstrapToken, parkNonce)
+	}
 	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
 	if source == "" || source == "." || strings.TrimSpace(d.cfg.ReadyDir) == "" || filepath.Dir(source) != readyDir ||
 		!IsParkedSandboxID(slotID) || validateSandboxID(slotID) != nil {

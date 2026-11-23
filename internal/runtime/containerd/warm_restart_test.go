@@ -478,7 +478,7 @@ func TestParkedRestartListener(t *testing.T) {
 			if tc.readyDir == "-" {
 				d.cfg.ReadyDir = ""
 			}
-			pl, err := d.parkedRestartListener(tc.spec, tc.id, tc.tok)
+			pl, err := d.parkedRestartListener(tc.spec, "park-a", tc.id, tc.tok)
 			switch tc.want {
 			case "nil":
 				if pl != nil || err != nil {

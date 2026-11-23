@@ -58,7 +58,6 @@ const (
 	StepFirecrackerWarmPool Step = "firecracker_warm_pool"
 	StepFirecrackerImages   Step = "firecracker_images"
 	StepContainerFile       Step = "container_files"
-	StepWarmPool            Step = "warm_pool"
 	StepMoves               Step = "gvisor_moves"
 )
 
@@ -73,7 +72,6 @@ var steps = map[Step]string{
 		"until a sandbox claims them",
 	StepFirecrackerImages: "a Firecracker sandbox's disk saved as a container image, which a second VM reads",
 	StepContainerFile:     "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
-	StepWarmPool:          "the containerd warm pool's parked sandboxes",
 	StepMoves:             "gVisor checkpoint moves",
 }
 

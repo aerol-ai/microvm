@@ -11,6 +11,7 @@ import (
 	"time"
 
 	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	refdocker "github.com/distribution/reference"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -118,10 +119,14 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		_ = pl.Close()
 		return nil, fmt.Errorf("park image: %w", err)
 	}
-	userCommand, err := imageDefaultCommand(ctx, client, image)
-	if err != nil {
-		_ = pl.Close()
-		return nil, fmt.Errorf("park image command: %w", err)
+	// In privilege mode split the command comes from the image config the
+	// split create reads once (prepareSplitCreate).
+	var userCommand []string
+	if d.helper == nil {
+		if userCommand, err = imageDefaultCommand(ctx, client, image); err != nil {
+			_ = pl.Close()
+			return nil, fmt.Errorf("park image command: %w", err)
+		}
 	}
 
 	var (
@@ -143,6 +148,11 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		task      cntr.Task
 		logCloser func()
 		leaseID   string
+		// split is what the park's one helper call made in privilege mode
+		// split (split_park.go); nil in single mode. snapshotLeft: the
+		// snapshot it prepared has no container to hold it yet.
+		split        *splitCreate
+		snapshotLeft bool
 	)
 	committed := false
 	defer func() {
@@ -154,6 +164,15 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		}
 		if task != nil || container != nil {
 			d.lifoTeardown(ctx, client, container, task, "", nil)
+		}
+		if split != nil {
+			uctx, cancel := undoContext(ctx)
+			defer cancel()
+			if snapshotLeft {
+				_ = removeSnapshot(uctx, client, slotID)
+			}
+			split.release(uctx)
+			d.releaseHelperFiles(uctx, slotID)
 		}
 		_ = pl.Close()
 		if netnsProvisioned && d.netns != nil {
@@ -172,15 +191,29 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	// it an adopted sandbox keeps the image's resolver (often 127.0.0.1) and
 	// gateway-mode DNS never reaches the filter's redirect (plans/
 	// egress-domain-filtering.md D14). Built at park time, off the create path.
-	hostFiles, err := prepareSandboxHostFiles(d.cfg.RunDir, slotID)
-	if err != nil {
-		return nil, fmt.Errorf("park resolv.conf: %w", err)
-	}
-	defer func() {
-		if !committed {
-			_ = os.RemoveAll(hostFiles.Dir)
+	// In privilege mode split the helper makes them, with the slot's other
+	// files, its snapshot's image user and its park socket's name, in a
+	// create's one call (split_park.go).
+	var hostFiles *sandboxHostFiles
+	if d.helper != nil {
+		split, err = d.prepareSplitCreate(ctx, client, image, slotID, bootstrapToken, createParts{OCIRuntime: ociRuntime, Park: true})
+		if err != nil {
+			return nil, fmt.Errorf("park: %w", err)
 		}
-	}()
+		snapshotLeft = true
+		userCommand = imageCommandOf(split.config)
+		hostFiles = helperHostFiles(split.files)
+	} else {
+		hostFiles, err = prepareSandboxHostFiles(d.cfg.RunDir, slotID)
+		if err != nil {
+			return nil, fmt.Errorf("park resolv.conf: %w", err)
+		}
+		defer func() {
+			if !committed {
+				_ = os.RemoveAll(hostFiles.Dir)
+			}
+		}()
+	}
 
 	envValues := []string{
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", d.cfg.ToolboxPort),
@@ -196,16 +229,25 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	}
 	sort.Strings(envValues)
 
+	toolbox, park, parkOptions := d.cfg.ToolboxBinaryPath, pl.HostSocketPath(), []string{"rbind"}
+	imageConfig := oci.WithImageConfig(image)
+	if split != nil {
+		// The helper's toolbox and its name for the park socket, read only
+		// as the gate requires of every file in its folders (readyMount);
+		// a socket still takes connections through a read-only bind.
+		toolbox, park, parkOptions = split.files.GetToolboxPath(), split.parkSocket, []string{"rbind", "ro"}
+		imageConfig = withImageConfigAnswer(split.config, split.user)
+	}
 	parkMounts := []specs.Mount{
-		{Type: "bind", Source: d.cfg.ToolboxBinaryPath, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
-		{Type: "bind", Source: pl.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
+		{Type: "bind", Source: toolbox, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
+		{Type: "bind", Source: park, Destination: dockerpkg.GuestReadySocketPath, Options: parkOptions},
 		{Type: "bind", Source: hostFiles.ResolvConf, Destination: "/etc/resolv.conf", Options: []string{"rbind", "ro"}},
 	}
 	if ociRuntime == "runsc" {
 		parkMounts = append(parkMounts, runscCgroupMount())
 	}
 	specOpts := []oci.SpecOpts{
-		oci.WithImageConfig(image),
+		imageConfig,
 		oci.WithProcessArgs(append([]string{d.cfg.ToolboxMountPath}, userCommand...)...),
 		oci.WithHostname(slotID),
 		oci.WithEnv(envValues),
@@ -240,13 +282,22 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if leaseID != "" {
 		labels[imageLeaseLabelKey] = leaseID
 	}
+	snapshotOpt, createCtx := cntr.WithNewSnapshot(slotID, image), ctx
+	if split != nil {
+		// The snapshot is there, under the split create's own lease.
+		snapshotOpt, createCtx = withPreparedSnapshot(slotID), split.leaseCtx
+	}
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
-		cntr.WithNewSnapshot(slotID, image),
+		snapshotOpt,
 		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(labels),
 	}
-	if ociRuntime != "" {
+	if ociRuntime != "" && split != nil {
+		if opt := runtimeContainerOptAt(ociRuntime, split.files.GetRunscConfigPath()); opt != nil {
+			containerOpts = append(containerOpts, opt)
+		}
+	} else if ociRuntime != "" {
 		opt, err := d.runtimeContainerOpt(ociRuntime)
 		if err != nil {
 			return nil, err
@@ -256,16 +307,27 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		}
 	}
 
-	container, err = client.NewContainer(ctx, slotID, containerOpts...)
+	container, err = client.NewContainer(createCtx, slotID, containerOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("park create: %w", err)
 	}
+	// The container holds the snapshot now.
+	snapshotLeft = false
+	split.release(ctx)
 
 	logPath, err := d.taskLogPath(slotID)
 	if err != nil {
 		return nil, err
 	}
-	logCreator, closeLog, err := d.taskLogIO(logPath)
+	var (
+		logCreator cio.Creator
+		closeLog   func()
+	)
+	if split != nil {
+		logCreator, closeLog, err = d.taskLogIOAt(logPath, split.files)
+	} else {
+		logCreator, closeLog, err = d.taskLogIO(logPath)
+	}
 	if err != nil {
 		return nil, err
 	}
