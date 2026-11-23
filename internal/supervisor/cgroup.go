@@ -197,15 +197,39 @@ func readMemoryMax(p string) (int64, error) {
 // WriteParentFile publishes the parent for the agent container, which reads
 // it from the shared folder at start. Written whole, then renamed into
 // place, so a reader never sees half a path.
+//
+// The folder is one other containers can write (in privilege mode single,
+// every container that mounts /run/aerolvm), and this process is root. So
+// the temporary file is a new one with a name no one else chose
+// (os.CreateTemp: O_CREATE|O_EXCL, which follows no link), and the rename
+// replaces whatever name is at file, a link included, without following it.
+// A link left at a fixed temporary name made root overwrite the file it
+// named.
 func WriteParentFile(file, parent string) error {
-	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+	dir := filepath.Dir(file)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, []byte(parent+"\n"), 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(file)+".*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, file)
+	name := tmp.Name()
+	_, err = tmp.WriteString(parent + "\n")
+	if err == nil {
+		// Others read it: the agent runs as another user in split.
+		err = tmp.Chmod(0o644)
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(name, file)
+	}
+	if err != nil {
+		_ = os.Remove(name)
+	}
+	return err
 }
 
 // CgroupReadOnly reports whether /proc/self/mountinfo shows the cgroup mount
