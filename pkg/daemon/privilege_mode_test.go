@@ -117,11 +117,11 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"the warm VM pool", func(c *config.Config) {
 			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
 		},
-			"warm VM pool", []privmode.Step{privmode.StepFirecrackerSnapshots}},
+			"warm VM pool", []privmode.Step{privmode.StepFirecrackerWarmPool}},
 		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
 		{"several at once, each named", func(c *config.Config) {
 			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true, true
-		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerSnapshots, privmode.StepMoves}},
+		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool, privmode.StepMoves}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()

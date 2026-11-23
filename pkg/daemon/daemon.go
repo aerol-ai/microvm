@@ -609,7 +609,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// constraints. templateResolverAdapter lets the driver look up
 		// the template's rootfs path through the service layer without
 		// the runtime package importing internal/service.
-		svc.SetTemplateBuilder(&templateBuilderAdapter{inner: ociBuilder, toolboxBinaryPath: cfg.ToolboxBinaryPath})
+		templates := &templateBuilderAdapter{inner: ociBuilder, toolboxBinaryPath: cfg.ToolboxBinaryPath}
+		if helper != nil {
+			// Privilege mode split (M1 PR 14b): the root helper makes a
+			// filesystem only in a VM's stage folder.
+			templates.split = fcDriver
+		}
+		svc.SetTemplateBuilder(templates)
 		fcDriver.SetTemplateResolver(&templateResolverAdapter{svc: svc})
 		// Phase 3 snapshot pipeline: the snapshotter is the driver
 		// itself (it owns the transient VMM seams); the CID allocator
@@ -2328,9 +2334,39 @@ func adaptTapSlot(s *tap.Slot) *fcruntime.TapSlot {
 type templateBuilderAdapter struct {
 	inner             *oci.Builder
 	toolboxBinaryPath string
+	// split builds through the root helper (privilege mode split); nil in
+	// single.
+	split templateDiskBuilder
+}
+
+// templateDiskBuilder is the Firecracker driver's split-mode template disk
+// build (fcruntime.Driver.SplitTemplateDisk).
+type templateDiskBuilder interface {
+	SplitTemplateDisk(ctx context.Context, templateID, out string, build func(stageOut string) error) error
 }
 
 func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
+	if a.split != nil {
+		// The disk is built in the template's own jail and moved to the
+		// template's folder (req.OutPath is <templates>/<id>/rootfs.ext4).
+		var res *service.TemplateBuildResult
+		err := a.split.SplitTemplateDisk(ctx, filepath.Base(filepath.Dir(req.OutPath)), req.OutPath, func(stageOut string) error {
+			in := req
+			in.OutPath = stageOut
+			var err error
+			res, err = a.build(ctx, in)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		res.RootfsPath = req.OutPath
+		return res, nil
+	}
+	return a.build(ctx, req)
+}
+
+func (a *templateBuilderAdapter) build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
 	var inject []oci.InjectFile
 	// No token, on purpose: the template's disk and snapshot are shared by
 	// every sandbox booted from it, so its agent boots token-less, serves

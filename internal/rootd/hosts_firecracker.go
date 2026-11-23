@@ -468,10 +468,16 @@ func (f *firecrackerHosts) started(ctx context.Context, cmd *exec.Cmd) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(socketPoll):
 		}
 	}
 }
+
+// socketPoll paces started's look for the API socket. firecracker binds it
+// some 10 ms after the jailer starts; a 10 ms poll then often saw it only
+// at 20 ms (M1 PR 14b's box timing), on every create and load. Each look
+// is two syscalls.
+const socketPoll = 2 * time.Millisecond
 
 // RunFirecrackerJailerShim is the helper's own binary as the jailer's shim:
 // it sets firecracker's umask (the jailer and firecracker keep the one

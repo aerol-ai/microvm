@@ -92,7 +92,7 @@ func (d *Driver) SetImageStore(s ImageStore) { d.images = s }
 // copy of its disk taken while the guest's root filesystem is frozen. Either
 // way a sparse copy is what the helper VM mounts, never the saved disk.
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, imageRef string) (string, error) {
-	if err := d.splitGap(); err != nil {
+	if err := d.splitGap(errSplitImages); err != nil {
 		return "", fmt.Errorf("firecracker runtime: snapshot %s: %w", sandboxID, err)
 	}
 	if err := validateSandboxID(sandboxID); err != nil {

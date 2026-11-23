@@ -124,6 +124,85 @@ func CheckGuestAddress(baseCIDR string, poolSize int, addr string) (taphost.Slot
 	return slot, nil
 }
 
+// A VM's snapshot is its memory and its device state
+// (internal/runtime/firecracker sandboxSnapshotMemoryFileName and
+// sandboxSnapshotStateFileName), with its disks (M1 PR 14b).
+const (
+	FirecrackerMemory = "snapshot.memory"
+	FirecrackerState  = "snapshot.state"
+	// FirecrackerSavedMemory and FirecrackerSavedState are where a VM in
+	// privilege mode split writes a new snapshot: a VM started from one has
+	// the saved memory and state shared in under the names above,
+	// read-only to it.
+	FirecrackerSavedMemory = "saved.memory"
+	FirecrackerSavedState  = "saved.state"
+)
+
+// MaxFirecrackerFileBytes bounds a file the helper hands between a VM's
+// chroot and the agent: a sandbox disk's cap, which no VM's memory reaches
+// either. The agent copies and hashes what it is handed, so a file grown
+// past this is refused rather than read.
+const MaxFirecrackerFileBytes = int64(maxFilesystemMiB) << 20
+
+// CheckFirecrackerShare refuses a file the agent may not share into a VM's
+// chroot read-only (ShareFirecrackerFiles): a snapshot's memory and state,
+// and a template's root disk, which a snapshot load attaches read-only.
+// Never the kernel, which is the helper's own, and never the overlay, which
+// the VM writes and so goes in as the jailer's (CheckFirecrackerFile).
+func CheckFirecrackerShare(name string) error {
+	switch name {
+	case FirecrackerMemory, FirecrackerState, FirecrackerRootfs:
+		return nil
+	}
+	return violate(RuleHost, "Firecracker file %q: want %s, %s or %s to share into a VM", name, FirecrackerMemory, FirecrackerState, FirecrackerRootfs)
+}
+
+// CheckFirecrackerHandOut refuses a file in a VM's chroot the helper may not
+// let the agent read (HandOutFirecrackerFiles): only a snapshot's memory and
+// state (the one firecracker saved, and the one shared in) and the two
+// disks, never the kernel or anything the jailer made.
+func CheckFirecrackerHandOut(name string) error {
+	switch name {
+	case FirecrackerSavedMemory, FirecrackerSavedState, FirecrackerMemory, FirecrackerState, FirecrackerRootfs, FirecrackerOverlay:
+		return nil
+	}
+	return violate(RuleHost, "Firecracker file %q: want %s, %s, %s, %s, %s or %s to hand out of a VM", name,
+		FirecrackerSavedMemory, FirecrackerSavedState, FirecrackerMemory, FirecrackerState, FirecrackerRootfs, FirecrackerOverlay)
+}
+
+// CheckFirecrackerNames checks a call's list of file names with check: at
+// least one, each once.
+func CheckFirecrackerNames(names []string, check func(string) error) error {
+	if len(names) == 0 {
+		return violate(RuleHost, "no Firecracker file named")
+	}
+	for i, n := range names {
+		if err := check(n); err != nil {
+			return err
+		}
+		for _, m := range names[:i] {
+			if m == n {
+				return violate(RuleHost, "Firecracker file %q named twice", n)
+			}
+		}
+	}
+	return nil
+}
+
+// maxGuestCID bounds a snapshot's guest CID: the guest's MAC holds its low
+// 24 bits (taphost.MACFromCID), so no larger CID makes a MAC of its own.
+const maxGuestCID = 1<<24 - 1
+
+// CheckSnapshotCID refuses a snapshot's guest CID the helper will not work
+// a TAP's neighbor MAC out from: the three reserved CIDs (0 to 2), or one
+// past 24 bits. Refused with RuleTap.
+func CheckSnapshotCID(cid uint32) error {
+	if cid < 3 || cid > maxGuestCID {
+		return violate(RuleTap, "snapshot guest CID %d: want 3 to %d", cid, maxGuestCID)
+	}
+	return nil
+}
+
 // maxFilesystemMiB bounds a filesystem the helper makes for the agent: a
 // filesystem image is a file of the agent's, as big as it asks, and this
 // is a sandbox disk's cap (models: a disk of at most 1024 GiB).

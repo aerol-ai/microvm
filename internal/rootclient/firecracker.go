@@ -33,6 +33,36 @@ func (c *Client) EnsureTap(ctx context.Context, name string) (*rootdpb.EnsureTap
 	return call(ctx, c, rootdpb.FeatureEnsureTap, &rootdpb.EnsureTapRequest{Name: name}, rootdpb.RootHelperClient.EnsureTap)
 }
 
+// EnsureSnapshotTap is EnsureTap for a VM restored from a snapshot (M1 PR
+// 14b): the TAP's neighbor entry gets the MAC the snapshot froze, which
+// the helper works out from the snapshot's guest CID. An older helper,
+// whose handshake does not list the snapshot calls, would refuse the
+// field: it is not sent one (UnsupportedError).
+func (c *Client) EnsureSnapshotTap(ctx context.Context, name string, guestCID uint32) (*rootdpb.EnsureTapResponse, error) {
+	if err := c.Require(ctx, rootdpb.FeatureShareFirecrackerFiles); err != nil {
+		return nil, err
+	}
+	return call(ctx, c, rootdpb.FeatureEnsureTap, &rootdpb.EnsureTapRequest{Name: name, GuestCid: guestCID}, rootdpb.RootHelperClient.EnsureTap)
+}
+
+// ShareFirecrackerFiles has the helper link files sandboxd put in a VM's
+// stage folder into its chroot, read-only for the jailer's user: a
+// snapshot's memory and state, a template's root disk. They stay sandboxd's.
+func (c *Client) ShareFirecrackerFiles(ctx context.Context, id string, names ...string) error {
+	_, err := call(ctx, c, rootdpb.FeatureShareFirecrackerFiles, &rootdpb.FirecrackerFilesRequest{Id: id, Names: names},
+		rootdpb.RootHelperClient.ShareFirecrackerFiles)
+	return err
+}
+
+// HandOutFirecrackerFiles has the helper let sandboxd's group read files in
+// a VM's chroot (a snapshot's memory and state, the VM's disks), for
+// sandboxd to copy out.
+func (c *Client) HandOutFirecrackerFiles(ctx context.Context, id string, names ...string) error {
+	_, err := call(ctx, c, rootdpb.FeatureHandOutFirecrackerFiles, &rootdpb.FirecrackerFilesRequest{Id: id, Names: names},
+		rootdpb.RootHelperClient.HandOutFirecrackerFiles)
+	return err
+}
+
 // RemoveTap has the helper make sure one of the pool's TAPs is gone.
 func (c *Client) RemoveTap(ctx context.Context, name string) error {
 	if err := c.Require(ctx, rootdpb.FeatureRemoveTap); err != nil {

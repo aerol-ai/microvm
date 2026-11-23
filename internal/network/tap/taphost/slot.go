@@ -70,6 +70,15 @@ func SlotAt(baseCIDR string, poolSize, index int) (Slot, error) {
 	}, nil
 }
 
+// MACFromCID is the guest MAC a VM with vsock CID cid is booted with, as
+// internal/runtime/firecracker macFromCID makes it (TestMACFromCID there
+// pins the two together): a locally administered unicast address that
+// holds the CID's low 24 bits. A snapshot keeps the MAC it froze, so a VM
+// restored from one needs its TAP's neighbor entry made for that MAC.
+func MACFromCID(cid uint32) string {
+	return fmt.Sprintf("02:00:00:%02x:%02x:%02x", byte(cid>>16), byte(cid>>8), byte(cid))
+}
+
 // IndexOf is the slot index a TAP name holds: NamePrefix and a decimal
 // index with no sign and no leading zero, below poolSize. Anything else is
 // not one of the pool's TAPs.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
@@ -36,6 +37,21 @@ func (f *fakeFirecrackerHelper) MakeFilesystem(_ context.Context, id, name, sour
 	return f.err
 }
 
+func (f *fakeFirecrackerHelper) EnsureSnapshotTap(_ context.Context, name string, cid uint32) (*rootdpb.EnsureTapResponse, error) {
+	f.note("snaptap " + name + " " + fmtU(uint64(cid)))
+	return f.tap, f.err
+}
+
+func (f *fakeFirecrackerHelper) ShareFirecrackerFiles(_ context.Context, id string, names ...string) error {
+	f.note("share " + id + " " + strings.Join(names, ","))
+	return f.err
+}
+
+func (f *fakeFirecrackerHelper) HandOutFirecrackerFiles(_ context.Context, id string, names ...string) error {
+	f.note("hand-out " + id + " " + strings.Join(names, ","))
+	return f.err
+}
+
 func TestSplitFirecracker(t *testing.T) {
 	ctx := context.Background()
 	f := &fakeFirecrackerHelper{tap: &rootdpb.EnsureTapResponse{Cidr: "172.16.0.4/30", HostIp: "172.16.0.5", GuestIp: "172.16.0.6", VsockCid: 4}}
@@ -64,8 +80,18 @@ func TestSplitFirecracker(t *testing.T) {
 	if err := s.MakeFilesystem(ctx, "sb-1", "overlay.ext4", "", 0); err != nil {
 		t.Fatal(err)
 	}
+	// A snapshot's TAP and its files (M1 PR 14b).
+	if snap, err := s.EnsureSnapshotTap(ctx, "fctap1", 9); err != nil || snap.GuestIP != "172.16.0.6" {
+		t.Fatalf("EnsureSnapshotTap = %+v %v", snap, err)
+	}
+	if err := s.ShareFirecrackerFiles(ctx, "sb-1", "snapshot.memory", "snapshot.state"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.HandOutFirecrackerFiles(ctx, "sb-1", "rootfs.ext4"); err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"prepare-fc sb-1 rootfs.ext4", "spawn sb-1 0/0/0", "hold sb-1", "open sb-1", "stop sb-1", "tap fctap1",
-		"untap fctap1", "mkfs sb-1 overlay.ext4  0"}
+		"untap fctap1", "mkfs sb-1 overlay.ext4  0", "snaptap fctap1 9", "share sb-1 snapshot.memory,snapshot.state", "hand-out sb-1 rootfs.ext4"}
 	if !slices.Equal(f.calls, want) {
 		t.Fatalf("calls\n got %v\nwant %v", f.calls, want)
 	}
@@ -83,5 +109,8 @@ func TestSplitFirecracker(t *testing.T) {
 	}
 	if _, err := s.EnsureTap(ctx, "fctap2"); err == nil {
 		t.Fatal("EnsureTap")
+	}
+	if _, err := s.EnsureSnapshotTap(ctx, "fctap2", 9); err == nil {
+		t.Fatal("EnsureSnapshotTap")
 	}
 }

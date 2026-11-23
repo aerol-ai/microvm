@@ -137,6 +137,15 @@ func (t *tapCalls) ensureTap(ctx context.Context, req *rootdpb.EnsureTapRequest)
 	if err != nil {
 		return nil, err
 	}
+	// A VM restored from a snapshot keeps the MAC the snapshot froze (M1
+	// PR 14b): the helper works it out from the snapshot's CID itself, so
+	// the agent names a number, never an address.
+	if cid := req.GetGuestCid(); cid != 0 {
+		if err := rootpolicy.CheckSnapshotCID(cid); err != nil {
+			return nil, refusedRule(codes.InvalidArgument, err)
+		}
+		slot.GuestMAC = taphost.MACFromCID(cid)
+	}
 	if err := t.ensureNetwork(); err != nil {
 		return nil, &fileError{code: codes.Unavailable, msg: "root helper: the Firecracker guests' NAT and isolation are not in place, so no TAP comes up: " + err.Error()}
 	}

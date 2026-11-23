@@ -118,3 +118,53 @@ func TestCheckGuestAddress(t *testing.T) {
 		}
 	}
 }
+
+// TestFirecrackerFileNames (M1 PR 14b): the files shared into a VM
+// read-only and the files handed out of one, each from its own fixed list.
+func TestFirecrackerFileNames(t *testing.T) {
+	for _, tc := range []struct {
+		check   func(string) error
+		ok, bad []string
+	}{
+		{CheckFirecrackerShare, []string{FirecrackerMemory, FirecrackerState, FirecrackerRootfs},
+			[]string{FirecrackerOverlay, FirecrackerSavedMemory, FirecrackerSavedState, FirecrackerKernel, "", "api.socket", "vsock.sock", "firecracker", "dev", "../snapshot.memory",
+				"stage/snapshot.state", "/etc/shadow", "snapshot.memory/"}},
+		{CheckFirecrackerHandOut, []string{FirecrackerSavedMemory, FirecrackerSavedState, FirecrackerMemory, FirecrackerState, FirecrackerRootfs, FirecrackerOverlay},
+			[]string{FirecrackerKernel, "", "api.socket", "vsock.sock", "firecracker", "dev/kvm", "../rootfs.ext4", "/etc/shadow", "."}},
+	} {
+		for _, n := range tc.ok {
+			if err := tc.check(n); err != nil {
+				t.Errorf("%q: %v", n, err)
+			}
+		}
+		for _, n := range tc.bad {
+			if err := tc.check(n); err == nil || RuleOf(err) != RuleHost {
+				t.Errorf("%q: %v, want a %s refusal", n, err, RuleHost)
+			}
+		}
+	}
+	if err := CheckFirecrackerNames([]string{FirecrackerMemory, FirecrackerState}, CheckFirecrackerShare); err != nil {
+		t.Fatal(err)
+	}
+	for _, names := range [][]string{nil, {FirecrackerMemory, FirecrackerMemory}, {FirecrackerMemory, FirecrackerKernel}} {
+		if err := CheckFirecrackerNames(names, CheckFirecrackerShare); err == nil || RuleOf(err) != RuleHost {
+			t.Errorf("%q: %v, want a %s refusal", names, err, RuleHost)
+		}
+	}
+	if MaxFirecrackerFileBytes != 1<<40 {
+		t.Fatalf("the cap is %d, want a disk's cap, 1 TiB", MaxFirecrackerFileBytes)
+	}
+}
+
+func TestCheckSnapshotCID(t *testing.T) {
+	for _, ok := range []uint32{3, 4, 258, 1<<24 - 1} {
+		if err := CheckSnapshotCID(ok); err != nil {
+			t.Errorf("%d: %v", ok, err)
+		}
+	}
+	for _, bad := range []uint32{0, 1, 2, 1 << 24, 1<<32 - 1} {
+		if err := CheckSnapshotCID(bad); err == nil || RuleOf(err) != RuleTap {
+			t.Errorf("%d: %v, want a %s refusal", bad, err, RuleTap)
+		}
+	}
+}

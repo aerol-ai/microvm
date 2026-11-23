@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1019,15 +1018,19 @@ func TestCreateTemplatePublishesTheCatalogueBeforeReturning(t *testing.T) {
 
 // TestCreateTemplateSplit: a template is a VM's snapshot, which split mode
 // does not take yet (M1 PR 9b): 501 before any row is written.
+// TestCreateTemplateSplit (M1 PR 14b): privilege mode split builds
+// templates as single mode does; the root helper hands the files across
+// (the driver's split seam and pkg/daemon's builder).
 func TestCreateTemplateSplit(t *testing.T) {
 	svc, st, _ := newTemplateHarness(t)
-	svc.SetTemplateBuilder(&fakeTemplateBuilder{done: make(chan struct{}, 1)})
+	b := &fakeTemplateBuilder{done: make(chan struct{}, 1)}
+	svc.SetTemplateBuilder(b)
 	svc.cfg.PrivilegeMode = privmode.Split
-	_, err := svc.CreateTemplate(context.Background(), models.CreateTemplateRequest{ID: "tpl-split", Image: "docker://alpine"})
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "template") {
+	if _, err := svc.CreateTemplate(context.Background(), models.CreateTemplateRequest{ID: "tpl-split", Image: "docker://alpine"}); err != nil {
 		t.Fatalf("CreateTemplate in split: %v", err)
 	}
-	if _, err := st.GetTemplate(context.Background(), "tpl-split"); err == nil {
-		t.Fatal("a refused template left a row")
+	if _, err := st.GetTemplate(context.Background(), "tpl-split"); err != nil {
+		t.Fatalf("no row: %v", err)
 	}
+	<-b.done
 }

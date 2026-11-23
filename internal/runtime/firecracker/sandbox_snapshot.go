@@ -294,7 +294,15 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 
 	srcRootfs := filepath.Join(handle.RunDir(), rootfsFileName)
 	tmpRootfs := filepath.Join(tmpDir, sandboxSnapshotRootfsFileName)
-	if err := copyFile(srcRootfs, tmpRootfs); err != nil {
+	copyDisk := copyFile
+	if d.split != nil {
+		// The disks are the jailer's user's in the chroot: the helper lets
+		// sandboxd read each before it is copied.
+		copyDisk = func(src, dst string) error {
+			return d.splitCopyOut(ctx, filepath.Dir(src), chrootFile{filepath.Base(src), dst})
+		}
+	}
+	if err := copyDisk(srcRootfs, tmpRootfs); err != nil {
 		return fmt.Errorf("firecracker runtime: stop %s: copy rootfs: %w", sandboxID, err)
 	}
 
@@ -303,7 +311,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 	tmpOverlay := filepath.Join(tmpDir, sandboxSnapshotOverlayFileName)
 	if _, err := os.Stat(srcOverlay); err == nil {
 		hasOverlay = true
-		if err := copyFile(srcOverlay, tmpOverlay); err != nil {
+		if err := copyDisk(srcOverlay, tmpOverlay); err != nil {
 			return fmt.Errorf("firecracker runtime: stop %s: copy overlay: %w", sandboxID, err)
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -458,13 +466,13 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 		return nil, fmt.Errorf("firecracker runtime: start %s: create runDir %s: %w", sandboxID, handle.RunDir(), err)
 	}
 
-	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+	rootfsPath := filepath.Join(stageDirOf(handle), rootfsFileName)
 	if err := copyFile(snapshotRootfs, rootfsPath); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: stage rootfs from %s: %w", sandboxID, dir, err)
 	}
 	var overlayPath string
 	if manifest.HasOverlay {
-		overlayPath = filepath.Join(handle.RunDir(), overlayFileName)
+		overlayPath = filepath.Join(stageDirOf(handle), overlayFileName)
 		if err := copyFile(snapshotOverlay, overlayPath); err != nil {
 			return nil, fmt.Errorf("firecracker runtime: start %s: stage overlay from %s: %w", sandboxID, dir, err)
 		}
@@ -498,6 +506,11 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 	client := d.newClient(handle.APISocket())
 	if err := d.configureSandboxSnapshotRestore(ctx, client, manifest, memPath, statePath, rootfsPath, slot, overlayPath); err != nil {
 		return nil, err
+	}
+	// Split mode: the helper gives the vsock socket, bound at the load,
+	// to sandboxd's group.
+	if err := shareSockets(ctx, handle); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: share the VM's sockets: %w", sandboxID, err)
 	}
 	if err := client.PatchVM(ctx, firecracker.VM{State: firecracker.VMStateResumed}); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: patch VM Resumed: %w", sandboxID, err)
@@ -555,6 +568,13 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 
 func (d *Driver) configureSandboxSnapshotRestore(ctx context.Context, client VMMClient, manifest *sandboxSnapshotManifest, memPath, statePath, rootfsPath string, slot *TapSlot, overlayPath string) error {
 	runDir := filepath.Dir(rootfsPath)
+	if d.split != nil {
+		// Both read-only files in one helper call.
+		if err := d.splitShare(ctx, runDir, sharedFile{sandboxSnapshotMemoryFileName, memPath},
+			sharedFile{sandboxSnapshotStateFileName, statePath}); err != nil {
+			return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)
+		}
+	}
 	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(runDir, memPath, statePath)
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stage snapshot load artifacts: %w", err)

@@ -71,6 +71,10 @@ const (
 	FeatureSetGuestNodeGuard   = "SetGuestNodeGuard"
 	FeatureSetGuestEgressFloor = "SetGuestEgressFloor"
 	FeatureGuestRules          = "GuestRules"
+
+	// A Firecracker VM's memory and state files and its disks (M1 PR 14b).
+	FeatureShareFirecrackerFiles   = "ShareFirecrackerFiles"
+	FeatureHandOutFirecrackerFiles = "HandOutFirecrackerFiles"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -126,7 +130,8 @@ func Features() []string {
 		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume,
 		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits,
 		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem,
-		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules}
+		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules,
+		FeatureShareFirecrackerFiles, FeatureHandOutFirecrackerFiles}
 }
 
 // HostKindName is a host kind's name in VersionResponse.hosts, "" for

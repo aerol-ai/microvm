@@ -679,6 +679,10 @@ var retrySafe = map[string]bool{
 	rootdpb.FeatureSetGuestNodeGuard:   true,
 	rootdpb.FeatureSetGuestEgressFloor: true,
 	rootdpb.FeatureGuestRules:          true,
+	// A VM's snapshot files (M1 PR 14b): a share answers a file it moved
+	// already as done, and a hand-out sets the same group and mode again.
+	rootdpb.FeatureShareFirecrackerFiles:   true,
+	rootdpb.FeatureHandOutFirecrackerFiles: true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
