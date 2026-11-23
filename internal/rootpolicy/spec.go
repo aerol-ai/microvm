@@ -116,7 +116,7 @@ func CheckSpec(p Policy, containerID string, s *specs.Spec) error {
 			seen[m.Type] = true
 		}
 	}
-	if err := checkAnnotations(p, s.Annotations); err != nil {
+	if err := checkAnnotations(p, containerID, s.Annotations); err != nil {
 		return err
 	}
 	return checkLinux(p, containerID, s)
@@ -316,7 +316,7 @@ func bindSourcesOf(s *specs.Spec) []string {
 	return out
 }
 
-func checkAnnotations(p Policy, ann map[string]string) error {
+func checkAnnotations(p Policy, containerID string, ann map[string]string) error {
 	for _, k := range sortedKeys(ann) {
 		v := ann[k]
 		switch {
@@ -325,7 +325,7 @@ func checkAnnotations(p Policy, ann map[string]string) error {
 				return violate(RuleAnnotation, "annotation %s=%q: the envelope only sets %q", k, v, CRIContainerTypeSandbox)
 			}
 		case k == RestoreAnnotation:
-			if err := CheckCheckpointPath(p, v); err != nil {
+			if err := CheckRestorePath(p, containerID, v); err != nil {
 				return err
 			}
 		case strings.HasPrefix(k, "dev.gvisor."):

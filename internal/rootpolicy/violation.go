@@ -60,6 +60,9 @@ const (
 	// RuleTap: a TAP device that is not one of the Firecracker TAP pool's
 	// (M1 PR 9b).
 	RuleTap Rule = "tap"
+	// RuleMoveBundle: a move bundle the helper does not take: not of the
+	// move bundle format, for another sandbox, or too large (M1 PR 13).
+	RuleMoveBundle Rule = "move_bundle"
 )
 
 // Violation is a refused request: which rule, and what about the request

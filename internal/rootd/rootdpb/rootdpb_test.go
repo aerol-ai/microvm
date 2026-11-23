@@ -69,6 +69,9 @@ func TestAPIConstants(t *testing.T) {
 	for _, m := range RootHelper_ServiceDesc.Methods {
 		calls = append(calls, m.MethodName)
 	}
+	for _, s := range RootHelper_ServiceDesc.Streams {
+		calls = append(calls, s.StreamName)
+	}
 	features := Features()
 	for _, f := range features {
 		if !slices.Contains(calls, f) {
@@ -93,8 +96,20 @@ func TestAPIConstants(t *testing.T) {
 			t.Errorf("%s is not under %s", full, ServicePrefix)
 		}
 	}
-	if len(RootHelper_ServiceDesc.Streams) != 0 {
-		t.Error("a streaming call needs its own entry in the checks above")
+	// The two streams (M1 PR 13): an export the helper sends, an import
+	// the agent sends. A new one needs its own entry here and in
+	// TestStreamStubsRoundTrip.
+	var streams []string
+	for _, s := range RootHelper_ServiceDesc.Streams {
+		streams = append(streams, fmt.Sprintf("%s server=%v client=%v", s.StreamName, s.ServerStreams, s.ClientStreams))
+	}
+	if want := []string{"ExportMove server=true client=false", "ImportMove server=false client=true"}; !slices.Equal(streams, want) {
+		t.Errorf("streams %v, want %v", streams, want)
+	}
+	for _, full := range []string{RootHelper_ExportMove_FullMethodName, RootHelper_ImportMove_FullMethodName} {
+		if !strings.HasPrefix(full, ServicePrefix) {
+			t.Errorf("%s is not under %s", full, ServicePrefix)
+		}
 	}
 	if MinHelperAPI < 1 || MinHelperAPI > APIVersion || APIVersion-MinHelperAPI > 1 {
 		t.Fatalf("MinHelperAPI %d, APIVersion %d: the agent must accept exactly one release back", MinHelperAPI, APIVersion)
@@ -203,6 +218,16 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.GuestRulesResponse":          {"inserted=1:bool"},
 		"aerolvm.rootd.v1.FirecrackerFilesRequest":     {"id=1:string", "names=2:repeated string"},
 		"aerolvm.rootd.v1.FirecrackerFilesResponse":    nil,
+		"aerolvm.rootd.v1.CheckpointMoveRequest":       {"sandbox_id=1:string"},
+		"aerolvm.rootd.v1.CheckpointMoveResponse":      nil,
+		"aerolvm.rootd.v1.ExportMoveRequest":           {"sandbox_id=1:string"},
+		"aerolvm.rootd.v1.MoveChunk":                   {"data=1:bytes"},
+		"aerolvm.rootd.v1.ImportMoveRequest":           {"sandbox_id=1:string", "data=2:bytes"},
+		"aerolvm.rootd.v1.ImportMoveResponse":          {"restore_path=1:string"},
+		"aerolvm.rootd.v1.StagedMoveRequest":           {"sandbox_id=1:string"},
+		"aerolvm.rootd.v1.StagedMoveResponse":          {"restore_path=1:string"},
+		"aerolvm.rootd.v1.DropMoveRequest":             {"sandbox_id=1:string", "sides=2:repeated enum"},
+		"aerolvm.rootd.v1.DropMoveResponse":            nil,
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {
@@ -245,6 +270,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 			"MOUNT_EXTERNAL_MODE_REESTABLISH=2", "MOUNT_EXTERNAL_MODE_KEEP_LIVE=3"},
 		"aerolvm.rootd.v1.HostKind": {"HOST_KIND_UNSPECIFIED=0", "HOST_KIND_WORKERD=1", "HOST_KIND_WASM_WORKER=2",
 			"HOST_KIND_WASM_RESIDENT=3", "HOST_KIND_FIRECRACKER=4"},
+		"aerolvm.rootd.v1.MoveSide": {"MOVE_SIDE_UNSPECIFIED=0", "MOVE_SIDE_OUT=1", "MOVE_SIDE_IN=2"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {
@@ -555,7 +581,16 @@ func TestCallName(t *testing.T) {
 // field that breaks this must be argued for here, not slipped in.
 func TestRequestsNameNoPaths(t *testing.T) {
 	msgs := File_rootd_proto.Messages()
-	bytesOK := map[protoreflect.FullName]bool{"aerolvm.rootd.v1.EnsureHostFilesRequest.egress_ca_der": true}
+	// An import's data is a move bundle's bytes (M1 PR 13). The helper
+	// writes them only as that format lets it (movebundle.ReadDir: a
+	// manifest for this sandbox, then exactly the regular files it names,
+	// each once, by flat names), bounded in size, in a folder of its own
+	// that only root can open. They are a sandbox's checkpoint, which runsc
+	// reads; the agent could already reach the sandbox it holds (eng
+	// review R9), and a file it could still change after the helper's
+	// check is what the copy avoids.
+	bytesOK := map[protoreflect.FullName]bool{"aerolvm.rootd.v1.EnsureHostFilesRequest.egress_ca_der": true,
+		"aerolvm.rootd.v1.ImportMoveRequest.data": true}
 	// MatchProcess's paths are executables a sandbox's own rules list. The
 	// helper never opens one on the host's tree: each is resolved inside
 	// the sandbox's root (openat2 RESOLVE_IN_ROOT under /proc/<pid>/root)
