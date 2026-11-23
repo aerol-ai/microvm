@@ -143,6 +143,35 @@ type HostsConfig struct {
 	// Wasm runs WASM workers and resident hosts; nil when this node runs
 	// none (SB_ENABLE_WASM).
 	Wasm *WasmHostsConfig
+	// Firecracker runs Firecracker VMs and their TAPs (M1 PR 9b); nil when
+	// this node runs none (SB_ENABLE_FIRECRACKER).
+	Firecracker *FirecrackerHostsConfig
+}
+
+// FirecrackerHostsConfig is how the helper runs Firecracker VMs, under
+// sandboxd's names (internal/config): the jailer and firecracker binaries,
+// the jailer's chroot base and user, the kernel every VM boots, mkfs.ext4,
+// and the TAP pool's layout. None of it comes from a request.
+type FirecrackerHostsConfig struct {
+	JailerBinary      string // SB_JAILER_BINARY
+	FirecrackerBinary string // SB_FIRECRACKER_BINARY
+	ChrootBase        string // SB_JAILER_CHROOT_BASE
+	UID, GID          int    // SB_JAILER_UID, SB_JAILER_GID
+	// Kernel is SB_FIRECRACKER_KERNEL: it must be root's, in folders only
+	// root writes (checked at the first VM).
+	Kernel   string
+	Mkfs4Bin string // SB_FIRECRACKER_MKFS_BIN
+	// Shim is the helper's own binary, which sets firecracker's umask and
+	// becomes the jailer.
+	Shim     string
+	AgentUID uint32
+	// SocketWait bounds how long a started VM has to bind its API socket.
+	SocketWait time.Duration
+	IPBinary   string // SB_FIRECRACKER_IP_BINARY; "" is ip from PATH
+	// TapBase and TapPoolSize are the TAP pool's layout
+	// (SB_FIRECRACKER_TAP_BASE_CIDR, SB_FIRECRACKER_TAP_POOL_SIZE).
+	TapBase     string
+	TapPoolSize int
 }
 
 // WorkerdHostsConfig is the V8 group hosts' jail.
@@ -154,7 +183,7 @@ type WorkerdHostsConfig struct {
 }
 
 // any reports whether the helper serves a host kind.
-func (h HostsConfig) any() bool { return h.Workerd != nil || h.Wasm != nil }
+func (h HostsConfig) any() bool { return h.Workerd != nil || h.Wasm != nil || h.Firecracker != nil }
 
 func (h HostsConfig) validate() error {
 	if !h.any() {
@@ -194,6 +223,49 @@ func (h HostsConfig) validate() error {
 		if w.ReadyWait <= 0 {
 			return errors.New("root helper: WASM hosts need a ready wait")
 		}
+	}
+	if fc := h.Firecracker; fc != nil {
+		if err := fc.validate(); err != nil {
+			return err
+		}
+		if w := h.Workerd; w != nil && w.Jail.UID == fc.UID {
+			return fmt.Errorf("root helper: SB_JAILER_UID=%d is the V8 jail's user too: a VM's escape could signal and read a jailed workerd", fc.UID)
+		}
+		if w := h.Wasm; w != nil && w.UID == fc.UID {
+			return fmt.Errorf("root helper: SB_JAILER_UID=%d is the WASM worker's user too", fc.UID)
+		}
+	}
+	return nil
+}
+
+func (c *FirecrackerHostsConfig) validate() error {
+	for name, p := range map[string]string{"jailer": c.JailerBinary, "firecracker": c.FirecrackerBinary, "kernel": c.Kernel,
+		"mkfs.ext4": c.Mkfs4Bin, "shim": c.Shim} {
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+			return fmt.Errorf("root helper: Firecracker %s %q: want a clean absolute path", name, p)
+		}
+	}
+	if c.IPBinary != "" && (!filepath.IsAbs(c.IPBinary) || filepath.Clean(c.IPBinary) != c.IPBinary) {
+		return fmt.Errorf("root helper: SB_FIRECRACKER_IP_BINARY %q: want a clean absolute path", c.IPBinary)
+	}
+	if _, _, _, err := rootpolicy.FirecrackerJail(c.ChrootBase, "sb-0"); err != nil {
+		return fmt.Errorf("root helper: SB_JAILER_CHROOT_BASE: %w", err)
+	}
+	// Compared as int64, so no setting wraps onto root or the agent;
+	// (uid_t)-1 and past is no user at all. The agent's uid goes to the
+	// kernel as an int, which is 32 bits on a 32-bit build.
+	if int64(c.UID) >= math.MaxUint32 || int64(c.GID) >= math.MaxUint32 || c.AgentUID > math.MaxInt32 {
+		return fmt.Errorf("root helper: jailer user %d:%d, agent %d: want ids below %d, and an agent uid up to %d",
+			c.UID, c.GID, c.AgentUID, uint32(math.MaxUint32), math.MaxInt32)
+	}
+	if c.UID <= 0 || c.GID <= 0 || int64(c.UID) == int64(c.AgentUID) {
+		return fmt.Errorf("root helper: jailer user %d:%d must be neither root nor the agent", c.UID, c.GID)
+	}
+	if c.SocketWait <= 0 {
+		return errors.New("root helper: Firecracker VMs need a socket wait")
+	}
+	if err := rootpolicy.CheckTapBase(c.TapBase, c.TapPoolSize); err != nil {
+		return fmt.Errorf("root helper: %w", err)
 	}
 	return nil
 }
@@ -648,13 +720,22 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 		return h, err
 	}
 	wasmOn, err := envBool(getenv, "SB_ENABLE_WASM")
-	if err != nil || (!isolateOn && !wasmOn) {
+	if err != nil {
+		return h, err
+	}
+	fcOn, err := envBool(getenv, "SB_ENABLE_FIRECRACKER")
+	if err != nil || (!isolateOn && !wasmOn && !fcOn) {
 		return h, err
 	}
 	h.CgroupParent = get("SB_HOST_PROCESS_CGROUP_PARENT", strings.TrimSpace(getenv("SB_CONTAINERD_CGROUP_PARENT")))
 	h.LogPath = filepath.Join(stateDir, "hosts.log")
 	if wasmOn {
 		if h.Wasm, err = wasmHostsFromEnv(getenv, path, agentUID, agentGID, enterprise, nodePorts, agentDirs); err != nil {
+			return h, err
+		}
+	}
+	if fcOn {
+		if h.Firecracker, err = firecrackerHostsFromEnv(getenv, path, agentUID, agentDirs); err != nil {
 			return h, err
 		}
 	}
@@ -789,6 +870,69 @@ func wasmCacheRoot(getenv func(string) string, path func(k, def string) string) 
 		cache = path("SB_WASM_CACHE_DIR", "")
 	}
 	return filepath.Join(cache, "wazero-compile")
+}
+
+// firecrackerHostsFromEnv is the Firecracker VMs' settings, under sandboxd's
+// names. The helper always runs the jailer: an unjailed VM would be root.
+// The chroot base must not be inside a folder the agent writes: root
+// makes, links and removes in it.
+func firecrackerHostsFromEnv(getenv func(string) string, path func(k, def string) string, agentUID uint32,
+	agentDirs []string) (*FirecrackerHostsConfig, error) {
+	jailer, err := envBoolDefault(getenv, "SB_FIRECRACKER_USE_JAILER", true)
+	if err != nil {
+		return nil, err
+	}
+	if !jailer {
+		return nil, errors.New("SB_FIRECRACKER_USE_JAILER=false: the root helper runs every Firecracker VM through the jailer; an unjailed VM is privilege mode single only")
+	}
+	uid, err := envInt(getenv, "SB_JAILER_UID", defaultJailUID)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := envInt(getenv, "SB_JAILER_GID", defaultJailUID)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := envInt(getenv, "SB_FIRECRACKER_TAP_POOL_SIZE", 256)
+	if err != nil {
+		return nil, err
+	}
+	shim, err := selfExecutable()
+	if err != nil {
+		return nil, fmt.Errorf("root helper: its own binary, the jailer's shim: %w", err)
+	}
+	c := &FirecrackerHostsConfig{
+		JailerBinary:      path("SB_JAILER_BINARY", "/usr/local/bin/jailer"),
+		FirecrackerBinary: path("SB_FIRECRACKER_BINARY", "/usr/local/bin/firecracker"),
+		ChrootBase:        path("SB_JAILER_CHROOT_BASE", "/srv/jailer"),
+		UID:               uid,
+		GID:               gid,
+		Kernel:            path("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
+		Mkfs4Bin:          path("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
+		Shim:              filepath.Clean(shim),
+		AgentUID:          agentUID,
+		SocketWait:        5 * time.Second,
+		TapBase:           strings.TrimSpace(getenv("SB_FIRECRACKER_TAP_BASE_CIDR")),
+		TapPoolSize:       pool,
+	}
+	if c.TapBase == "" {
+		c.TapBase = "172.16.0.0/20"
+	}
+	if v := strings.TrimSpace(getenv("SB_FIRECRACKER_IP_BINARY")); v != "" {
+		c.IPBinary = path("SB_FIRECRACKER_IP_BINARY", "")
+	}
+	for _, a := range agentDirs {
+		if c.ChrootBase == a || strings.HasPrefix(c.ChrootBase, a+"/") {
+			return nil, fmt.Errorf("SB_JAILER_CHROOT_BASE: %s is inside %s, which the agent writes", c.ChrootBase, a)
+		}
+		// Root links the kernel into every VM's jail and gives it to the
+		// jailer's group: one the agent could swap would be any file.
+		if strings.HasPrefix(c.Kernel, a+"/") {
+			return nil, fmt.Errorf("SB_FIRECRACKER_KERNEL: %s is inside %s, which the agent writes; "+
+				"put the kernel in a folder only root writes", c.Kernel, a)
+		}
+	}
+	return c, nil
 }
 
 // lookupEnv tells an unset name from an empty one, where getenv is the

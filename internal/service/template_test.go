@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -1012,5 +1014,20 @@ func TestCreateTemplatePublishesTheCatalogueBeforeReturning(t *testing.T) {
 		if got := waitForStatus(t, st, id, models.TemplateStatusReadyNoSnapshot, 5*time.Second); got == nil || got.Status != models.TemplateStatusReadyNoSnapshot {
 			t.Fatalf("background build for %s never finished: %+v", id, got)
 		}
+	}
+}
+
+// TestCreateTemplateSplit: a template is a VM's snapshot, which split mode
+// does not take yet (M1 PR 9b): 501 before any row is written.
+func TestCreateTemplateSplit(t *testing.T) {
+	svc, st, _ := newTemplateHarness(t)
+	svc.SetTemplateBuilder(&fakeTemplateBuilder{done: make(chan struct{}, 1)})
+	svc.cfg.PrivilegeMode = privmode.Split
+	_, err := svc.CreateTemplate(context.Background(), models.CreateTemplateRequest{ID: "tpl-split", Image: "docker://alpine"})
+	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "template") {
+		t.Fatalf("CreateTemplate in split: %v", err)
+	}
+	if _, err := st.GetTemplate(context.Background(), "tpl-split"); err == nil {
+		t.Fatal("a refused template left a row")
 	}
 }

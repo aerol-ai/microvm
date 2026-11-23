@@ -140,7 +140,7 @@ func checkWasmEnv(env []string) error {
 	return nil
 }
 
-func (w *wasmHosts) prepare(string, bool) (*rootdpb.PrepareHostResponse, error) {
+func (w *wasmHosts) prepare(string, bool, *rootdpb.PrepareHostRequest) (*rootdpb.PrepareHostResponse, error) {
 	return &rootdpb.PrepareHostResponse{}, nil
 }
 

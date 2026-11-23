@@ -1,4 +1,4 @@
-package tap
+package taphost
 
 // host.go implements the host-side realization of TAP slots: the actual
 // `ip link add ... type tap`, `ip addr add ...`, `ip link set ... up`

@@ -35,6 +35,11 @@ func TestCheckHostID(t *testing.T) {
 		{HostWasmWorker, "_runtime", false},
 		{HostWasmResident, "aerolvm-vmm", false},
 		{HostWasmResident, strings.Repeat("a", 129), false},
+		// A Firecracker VM: its sandbox ID.
+		{HostFirecracker, "sb-a36d11bff9ff6787", true},
+		{HostFirecracker, "../sb-1", false},
+		{HostFirecracker, "aerolvm-vmm", false},
+		{HostFirecracker, "", false},
 		// A kind no rule knows.
 		{"", "default", false},
 		{"docker", "default", false},
@@ -58,6 +63,7 @@ func TestHostGroupRoundTrip(t *testing.T) {
 		{HostWorkerd, "default", "aerolvm-isolate/default"},
 		{HostWasmWorker, "sb-1", "aerolvm-wasm/w-sb-1"},
 		{HostWasmResident, "sb-1", "aerolvm-wasm/r-sb-1"},
+		{HostFirecracker, "sb-1", "aerolvm-vmm/sb-1"},
 	} {
 		if got := HostGroup(tc.kind, tc.id); got != tc.group {
 			t.Errorf("HostGroup(%q, %q) = %q, want %q", tc.kind, tc.id, got, tc.group)
@@ -71,7 +77,7 @@ func TestHostGroupRoundTrip(t *testing.T) {
 		t.Error("a kind no rule knows has a group")
 	}
 	for _, g := range []string{"", "aerolvm-isolate", "aerolvm-isolate/.base", "aerolvm-isolate/a/b", "aerolvm-wasm/x-sb-1",
-		"aerolvm-wasm/w-../x", "aerolvm-vmm/sb-1", "_runtime/x", "aerolvm-wasm/w-"} {
+		"aerolvm-wasm/w-../x", "aerolvm-vmm/../x", "aerolvm-vmm", "aerolvm-vmm/a/b", "_runtime/x", "aerolvm-wasm/w-"} {
 		if kind, id, ok := HostOfGroup(g); ok {
 			t.Errorf("HostOfGroup(%q) = %q %q, want none", g, kind, id)
 		}
@@ -159,7 +165,7 @@ func TestWasmHostSocket(t *testing.T) {
 // FuzzHostOfGroup: whatever a group's name, reading it back never yields an
 // id that leaves the kind's group, and an id read back names that group.
 func FuzzHostOfGroup(f *testing.F) {
-	for _, s := range []string{"aerolvm-isolate/default", "aerolvm-wasm/w-sb-1", "aerolvm-wasm/r-x", "aerolvm-isolate/../x"} {
+	for _, s := range []string{"aerolvm-isolate/default", "aerolvm-wasm/w-sb-1", "aerolvm-wasm/r-x", "aerolvm-isolate/../x", "aerolvm-vmm/sb-1"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, group string) {

@@ -223,7 +223,7 @@ func TestVersion(t *testing.T) {
 	want := slices.DeleteFunc(rootdpb.Features(), func(f string) bool {
 		return slices.Contains(networkFeatures, f) || slices.Contains(firewallFeatures, f) || slices.Contains(egressFeatures, f) ||
 			slices.Contains(hostPortFeatures, f) || slices.Contains(mountFeatures, f) || f == rootdpb.FeatureReclaimVolume ||
-			slices.Contains(hostFeatures, f)
+			slices.Contains(hostFeatures, f) || slices.Contains(tapFeatures, f)
 	})
 	if !slices.Equal(resp.GetFeatures(), want) {
 		t.Fatalf("features %v, want %v", resp.GetFeatures(), want)
@@ -237,13 +237,16 @@ func TestVersion(t *testing.T) {
 			o.Network, o.Mounts = newFakeNet(), &fakeMounts{}
 			c.Reclaim = &ReclaimConfig{Export: rootpolicy.NFSExport{Server: "h", Export: "/e"}, ScratchDir: filepath.Join(t.TempDir(), "r")}
 			c.Hosts = testHostsConfig(t)
+			c.Hosts.Firecracker = testFirecrackerConfig(t)
+			c.Hosts.Firecracker.UID += 2000
+			o.TapDevices = &fakeTaps{}
 		})
 		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
 		served := []string{rootdpb.FeatureEnsureHostFiles, rootdpb.FeatureEnsureTaskFIFOs, rootdpb.FeatureEnsureRunscConfig,
 			rootdpb.FeatureEnsureReadySocket, rootdpb.FeatureRemoveContainerFiles}
 		served = append(append(append(served, networkFeatures...), firewallFeatures...), rootdpb.FeaturePrepareSandbox, rootdpb.FeatureReleaseSandbox)
 		served = append(append(append(served, egressFeatures...), hostPortFeatures...), mountFeatures...)
-		served = append(append(served, rootdpb.FeatureReclaimVolume), hostFeatures...)
+		served = append(append(append(served, rootdpb.FeatureReclaimVolume), hostFeatures...), tapFeatures...)
 		// No cgroup parent here: no cgroup part. Every helper serves the
 		// container's files part (M1 PR 7).
 		netParts := []string{rootdpb.PartNetns, rootdpb.PartFirewall, rootdpb.PartFiles}

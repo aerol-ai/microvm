@@ -1,6 +1,6 @@
 //go:build linux
 
-package tap
+package taphost
 
 import (
 	"os"

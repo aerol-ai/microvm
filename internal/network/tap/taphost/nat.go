@@ -1,4 +1,4 @@
-package tap
+package taphost
 
 import (
 	"fmt"

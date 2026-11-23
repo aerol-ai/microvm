@@ -178,8 +178,15 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.ReclaimVolumeRequest":        {"source=1:string"},
 		"aerolvm.rootd.v1.ReclaimVolumeResponse":       nil,
 		"aerolvm.rootd.v1.HostLimits":                  {"cpu_millis=1:uint32", "memory_mb=2:uint64", "pids=3:uint32"},
-		"aerolvm.rootd.v1.PrepareHostRequest":          {"kind=1:enum", "id=2:string"},
-		"aerolvm.rootd.v1.PrepareHostResponse":         {"run_dir=1:string"},
+		"aerolvm.rootd.v1.PrepareHostRequest":          {"kind=1:enum", "id=2:string", "firecracker=3:message"},
+		"aerolvm.rootd.v1.PrepareHostResponse":         {"run_dir=1:string", "stage_dir=2:string"},
+		"aerolvm.rootd.v1.FirecrackerHostSpec":         {"stage=1:repeated string"},
+		"aerolvm.rootd.v1.EnsureTapRequest":            {"name=1:string"},
+		"aerolvm.rootd.v1.EnsureTapResponse":           {"cidr=1:string", "host_ip=2:string", "guest_ip=3:string", "vsock_cid=4:uint32"},
+		"aerolvm.rootd.v1.RemoveTapRequest":            {"name=1:string"},
+		"aerolvm.rootd.v1.RemoveTapResponse":           nil,
+		"aerolvm.rootd.v1.MakeFilesystemRequest":       {"id=1:string", "name=2:string", "source=3:string", "size_mib=4:uint64"},
+		"aerolvm.rootd.v1.MakeFilesystemResponse":      nil,
 		"aerolvm.rootd.v1.WasmHostSpec":                {"cache=1:string", "env=2:repeated string"},
 		"aerolvm.rootd.v1.SpawnHostRequest":            {"kind=1:enum", "id=2:string", "limits=3:message", "wasm=4:message"},
 		"aerolvm.rootd.v1.SpawnHostResponse":           {"pid=1:uint32", "start_ticks=2:uint64", "already=3:bool", "socket=4:string"},
@@ -231,7 +238,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.MountExternalMode": {"MOUNT_EXTERNAL_MODE_UNSPECIFIED=0", "MOUNT_EXTERNAL_MODE_CREATE=1",
 			"MOUNT_EXTERNAL_MODE_REESTABLISH=2", "MOUNT_EXTERNAL_MODE_KEEP_LIVE=3"},
 		"aerolvm.rootd.v1.HostKind": {"HOST_KIND_UNSPECIFIED=0", "HOST_KIND_WORKERD=1", "HOST_KIND_WASM_WORKER=2",
-			"HOST_KIND_WASM_RESIDENT=3"},
+			"HOST_KIND_WASM_RESIDENT=3", "HOST_KIND_FIRECRACKER=4"},
 	}
 	enums := File_rootd_proto.Enums()
 	if enums.Len() != len(wantEnums) {

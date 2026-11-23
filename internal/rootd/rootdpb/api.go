@@ -60,6 +60,11 @@ const (
 	FeatureStopHost      = "StopHost"
 	FeatureListHosts     = "ListHosts"
 	FeatureSetHostLimits = "SetHostLimits"
+
+	// Firecracker's network and disks (M1 PR 9b).
+	FeatureEnsureTap      = "EnsureTap"
+	FeatureRemoveTap      = "RemoveTap"
+	FeatureMakeFilesystem = "MakeFilesystem"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -113,7 +118,8 @@ func Features() []string {
 		FeatureSetNodeGuard, FeatureSetEgressFloor, FeatureSandboxRules, FeaturePrepareSandbox, FeatureReleaseSandbox,
 		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort,
 		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume,
-		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits}
+		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits,
+		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem}
 }
 
 // HostKindName is a host kind's name in VersionResponse.hosts, "" for
@@ -126,13 +132,16 @@ func HostKindName(k HostKind) string {
 		return "wasm_worker"
 	case HostKind_HOST_KIND_WASM_RESIDENT:
 		return "wasm_resident"
+	case HostKind_HOST_KIND_FIRECRACKER:
+		return "firecracker"
 	}
 	return ""
 }
 
 // HostKinds lists every host kind this build knows.
 func HostKinds() []HostKind {
-	return []HostKind{HostKind_HOST_KIND_WORKERD, HostKind_HOST_KIND_WASM_WORKER, HostKind_HOST_KIND_WASM_RESIDENT}
+	return []HostKind{HostKind_HOST_KIND_WORKERD, HostKind_HOST_KIND_WASM_WORKER, HostKind_HOST_KIND_WASM_RESIDENT,
+		HostKind_HOST_KIND_FIRECRACKER}
 }
 
 // ErrHelperUnavailable: the helper could not be reached or did not answer.

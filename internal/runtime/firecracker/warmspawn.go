@@ -102,6 +102,9 @@ type WarmHandle interface {
 //
 //   - Issuing PATCH /vm state=Resumed and the vsock handshake.
 func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandle, error) {
+	if err := d.splitGap(); err != nil {
+		return nil, fmt.Errorf("firecracker warm-spawn: %w", err)
+	}
 	if d.cfg.KernelImage == "" {
 		return nil, fmt.Errorf("firecracker warm-spawn: KernelImage not configured (SB_FIRECRACKER_KERNEL): %w",
 			models.ErrRuntimeNotImplemented)
