@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -186,8 +187,11 @@ func (c *wasmMountCalls) mountIndex(id, hostPath string) (int, error) {
 // with no link followed. On Linux the handle is O_PATH, so the mount itself
 // is never entered.
 func openMountPoint(root, sandboxID string, index int) (*os.File, error) {
-	dir := filepath.Join(root, sandboxID)
-	if filepath.Dir(dir) != root {
+	// Cleaned, inside the mounts folder and one name below it: the check
+	// code scanning counts (go/path-injection), on top of the id's rule.
+	root = filepath.Clean(root)
+	dir := filepath.Clean(filepath.Join(root, sandboxID))
+	if !strings.HasPrefix(dir, root+string(filepath.Separator)) || filepath.Dir(dir) != root {
 		return nil, fmt.Errorf("%s is not a sandbox's folder in %s", dir, root)
 	}
 	owner := uint32(os.Geteuid())

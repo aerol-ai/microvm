@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -44,6 +45,14 @@ import (
 // copyOutCheckpoint publishes the worker's staged mem.snap at final as a
 // copy of sandboxd's own. The staging folder is removed either way.
 func (d *Driver) copyOutCheckpoint(staged, final string) error {
+	// Both are sandboxd's own paths, ModulesDir/<id>/...: cleaned and seen
+	// to stay in the modules folder, the check code scanning counts
+	// (go/path-injection).
+	modules := filepath.Clean(d.cfg.ModulesDir) + string(filepath.Separator)
+	staged, final = filepath.Clean(staged), filepath.Clean(final)
+	if !strings.HasPrefix(staged, modules) || !strings.HasPrefix(final, modules) {
+		return fmt.Errorf("%w: a checkpoint outside the modules folder", errStagedSnapshot)
+	}
 	stage := filepath.Dir(staged)
 	defer os.RemoveAll(stage)
 	// The staging folder is sandboxd's, in a folder no worker reaches, so

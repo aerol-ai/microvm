@@ -120,6 +120,10 @@ func TestSplitWarmClaimAndDestroy(t *testing.T) {
 	if got := d.warmSlotFolder(&sandboxInstance{socketPath: sock}); got != "" {
 		t.Fatalf("a slot with no digest %q", got)
 	}
+	// A record's digest that climbs out of the pool's folder names none.
+	if got := d.warmSlotFolder(&sandboxInstance{socketPath: sock, moduleDigest: "../../../x"}); got != "" {
+		t.Fatalf("a digest out of the pool %q", got)
+	}
 }
 
 // shortSockets stands in for the helper's socket folder, short enough for

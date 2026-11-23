@@ -99,7 +99,14 @@ func (d *Driver) warmSlotFolder(inst *sandboxInstance) string {
 	if !ok || inst.moduleDigest == "" {
 		return ""
 	}
-	return wasmpool.SlotDirIn(d.cfg.RunDir, inst.moduleDigest, id)
+	// The digest is the record's: cleaned and seen to stay in the pool's
+	// folder before anything is removed.
+	pool := filepath.Join(filepath.Clean(d.cfg.RunDir), "pool") + string(filepath.Separator)
+	dir := filepath.Clean(wasmpool.SlotDirIn(d.cfg.RunDir, inst.moduleDigest, id))
+	if !strings.HasPrefix(dir, pool) {
+		return ""
+	}
+	return dir
 }
 
 // handToWorker gives a folder sandboxd made to the worker: to its uid in

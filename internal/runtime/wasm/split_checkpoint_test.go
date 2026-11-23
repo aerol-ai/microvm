@@ -211,6 +211,25 @@ func TestSplitCheckpointRefusesWhatTheWorkerLeft(t *testing.T) {
 	if raw, err := os.ReadFile(secret); err != nil || string(raw) != "sandboxd's own secret" {
 		t.Fatalf("the file outside changed: %q %v", raw, err)
 	}
+	// A checkpoint path outside the modules folder is never read or
+	// written.
+	outside := filepath.Join(t.TempDir(), "sb-1")
+	writeWorkerSnapshot(t, filepath.Join(outside, checkpointStageName, "mem.snap"), []byte("elsewhere"))
+	for _, tc := range [][2]string{
+		{filepath.Join(outside, checkpointStageName, "mem.snap"), final},
+		{good, filepath.Join(outside, "mem.snap")},
+		{filepath.Join(d.cfg.ModulesDir, "..", "x", "mem.snap"), final},
+	} {
+		if err := d.copyOutCheckpoint(tc[0], tc[1]); !errors.Is(err, errStagedSnapshot) {
+			t.Fatalf("%v: %v", tc, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "mem.snap")); !os.IsNotExist(err) {
+		t.Fatalf("published outside the modules folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, checkpointStageName)); err != nil {
+		t.Fatalf("removed a folder outside the modules folder: %v", err)
+	}
 }
 
 // snapshotThen writes a real snapshot at dir and changes its config with fn.
