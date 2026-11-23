@@ -39,8 +39,10 @@ import (
 //
 // In privilege mode split the root helper does the root work of both
 // sides in its own moves folder, and the driver passes the bundle through
-// (split_moves.go). The bundle is the same format in both modes, so a
-// split node stages a single node's bundle, and the other way round.
+// (split_moves.go). The bundle is the same format in both modes, but a
+// sandbox moves only between workers of one mode: runsc restores a
+// checkpoint only under the bind options it was saved with, and the ready
+// socket's bind differs between them (cluster.CheckpointMovesLabel).
 //
 // runsc checks on restore that the new spec matches the saved one, except
 // for env, hostname, cgroup path and the mount sources: the target builds

@@ -25,8 +25,12 @@ import (
 //   - a move's stop: CheckpointMove, after the same checks as single mode
 //     (a running gVisor sandbox, not from the warm pool);
 //   - the export and the import: ExportMove and ImportMove, in the move
-//     bundle format both modes send, so a split node and a single node
-//     move sandboxes to each other;
+//     bundle format both modes send. A split node stages a single node's
+//     bundle, and the other way round, but runsc restores a checkpoint
+//     only under the bind options it was saved with, and the two modes
+//     bind the ready socket differently (read-write in single, read-only
+//     in split). So the cluster moves a gVisor sandbox only between
+//     workers of one mode (cluster.CheckpointMovesLabel);
 //   - the restore's create: StagedMove answers where the checkpoint is,
 //     for the spec's RestoreAnnotation, and the helper's restore runsc
 //     config names aerolvm-runsc (split_create.go, runscConfigFor);

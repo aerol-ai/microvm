@@ -137,10 +137,12 @@ func TestSplitMoveThroughTheRealHelper(t *testing.T) {
 	}
 }
 
-// TestSplitAndSingleMoveToEachOther: the bundle is one format, so a
+// TestSplitAndSingleStageEachOthersBundles: the bundle is one format, so a
 // single node's export stages on a split node, and a split node's on a
-// single node.
-func TestSplitAndSingleMoveToEachOther(t *testing.T) {
+// single node. runsc restores it only under the bind options it was saved
+// with, which differ between the modes, so the cluster moves a gVisor
+// sandbox only between workers of one mode (TestPlacementWantsSnapshotMove).
+func TestSplitAndSingleStageEachOthersBundles(t *testing.T) {
 	stubToolboxProbe(t)
 	ctx := context.Background()
 	helper := startMoveHelper(t)

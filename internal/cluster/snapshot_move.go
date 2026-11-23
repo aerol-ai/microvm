@@ -59,8 +59,18 @@ const (
 	// decommission deadline fits its moves).
 	checkpointMoveBudget = 60 * time.Second
 	// CheckpointMovesLabel is the label a worker that moves gVisor
-	// sandboxes with their memory carries (SB_GVISOR_CHECKPOINT_MOVES).
-	CheckpointMovesLabel = "aerolvm.io/gvisor-checkpoint-moves"
+	// sandboxes with their memory carries (SB_GVISOR_CHECKPOINT_MOVES). Its
+	// value is the worker's privilege mode: CheckpointMovesSingle or
+	// CheckpointMovesSplit. runsc restores a checkpoint only into a spec
+	// whose binds have the options the saved one had, and the two modes bind
+	// a sandbox's ready socket differently (read-write in single, read-only
+	// in split, as the root helper's gate requires), so a gVisor sandbox
+	// moves only between workers of one mode (snapshotTargetFits). A
+	// leader built before split mode reads a split worker as one that does
+	// not move them.
+	CheckpointMovesLabel  = "aerolvm.io/gvisor-checkpoint-moves"
+	CheckpointMovesSingle = "true"
+	CheckpointMovesSplit  = "split"
 )
 
 // SnapshotMoveHandler is the worker's half of a snapshot move. It is
@@ -145,7 +155,17 @@ func (c *Cluster) heartbeatCapacity(m Member) capacity.Snapshot {
 // switch off (or a build before C21) does not, and its gVisor sandboxes
 // take the next §10.5 row.
 func checkpointMover(m Member) bool {
-	return m.Capacity.Labels[CheckpointMovesLabel] == "true"
+	v := m.Capacity.Labels[CheckpointMovesLabel]
+	return v == CheckpointMovesSingle || v == CheckpointMovesSplit
+}
+
+// checkpointMode is the privilege mode m saves and restores gVisor
+// checkpoints in, by its CheckpointMovesLabel.
+func checkpointMode(m Member) string {
+	if m.Capacity.Labels[CheckpointMovesLabel] == CheckpointMovesSplit {
+		return "split"
+	}
+	return "single"
 }
 
 // snapshotTargetFits reports why target cannot restore a VM snapshotted on
@@ -156,6 +176,9 @@ func snapshotTargetFits(p Placement, source, target Member) string {
 	switch {
 	case p.Spec != nil && strings.TrimSpace(p.Spec.Runtime) == models.RuntimeGvisor && !checkpointMover(target):
 		return fmt.Sprintf("target %s does not restore gVisor checkpoints", target.NodeID)
+	case p.Spec != nil && strings.TrimSpace(p.Spec.Runtime) == models.RuntimeGvisor && checkpointMode(target) != checkpointMode(source):
+		return fmt.Sprintf("target %s restores gVisor checkpoints in privilege mode %s, the source saves them in %s", target.NodeID,
+			checkpointMode(target), checkpointMode(source))
 	case source.Arch != "" && target.Arch != source.Arch:
 		return fmt.Sprintf("target %s is %s, the source %s", target.NodeID, target.Arch, source.Arch)
 	case source.Version != "" && target.Version != source.Version:

@@ -468,6 +468,33 @@ func TestPlacementWantsSnapshotMove(t *testing.T) {
 	if why := snapshotTargetFits(gvisor, mover, mover); why != "" {
 		t.Fatalf("a target that restores them refused: %q", why)
 	}
+	// M1 PR 13: a split worker moves gVisor sandboxes too, and only to a
+	// worker of its own privilege mode (runsc restores a checkpoint only
+	// under the bind options it was saved with). Firecracker is not bound.
+	split := Member{NodeID: "c", Capacity: capacity.Snapshot{Labels: map[string]string{CheckpointMovesLabel: CheckpointMovesSplit}}}
+	if !placementWantsSnapshotMove(gvisor, split) {
+		t.Fatal("a split worker's gVisor sandbox does not move with its memory")
+	}
+	for _, tc := range []struct {
+		name           string
+		source, target Member
+		want           string
+	}{
+		{"split to split", split, split, ""},
+		{"single to split", mover, split, "restores gVisor checkpoints in privilege mode split, the source saves them in single"},
+		{"split to single", split, mover, "privilege mode single, the source saves them in split"},
+		{"split to a worker with the switch off", split, plain, "does not restore gVisor checkpoints"},
+		{"a target whose label value no build sets", mover, Member{NodeID: "d", Capacity: capacity.Snapshot{Labels: map[string]string{CheckpointMovesLabel: "yes"}}},
+			"does not restore"},
+	} {
+		why := snapshotTargetFits(gvisor, tc.source, tc.target)
+		if (tc.want == "") != (why == "") || !strings.Contains(why, tc.want) {
+			t.Errorf("%s: %q, want %q", tc.name, why, tc.want)
+		}
+	}
+	if why := snapshotTargetFits(fc(nil), split, mover); why != "" {
+		t.Fatalf("a Firecracker move bound by the privilege mode: %q", why)
+	}
 }
 
 // The snapshot actions reach a handler that has the snapshot half, and are

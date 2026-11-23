@@ -41,12 +41,12 @@ import (
 //
 // The agent names a sandbox by its ID alone and never a path. Export reads
 // the out folder as a move bundle (internal/runtime/movebundle, the same
-// format single mode sends, so a split node and a single node move
-// sandboxes to each other), and Import writes only what that format
-// carries: a manifest for this sandbox, then the regular files it names,
-// each once, by flat names. The bundle is bounded in bytes (a refusal), the
-// staged bundles in number (busy), and a bundle that is not whole is never
-// staged. The restored container's spec names <MovesDir>/in/<its own ID>,
+// format single mode sends; runsc itself restores only between workers of
+// one mode, cluster.CheckpointMovesLabel), and Import writes only what
+// that format carries: a manifest for this sandbox, then the regular files
+// it names, each once, by flat names. The bundle is bounded in bytes (a
+// refusal), the staged bundles in number (busy), and a bundle that is not
+// whole is never staged. The restored container's spec names <MovesDir>/in/<its own ID>,
 // which the gate checks (rootpolicy.CheckRestorePath).
 
 // MovesConfig is gVisor checkpoint moves' settings, from the helper's own
