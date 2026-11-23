@@ -637,6 +637,18 @@ Each is small and stands alone. Together they shrink the root surface now.
       page say how). A state volume that outlives the pod keeps files the
       root agent wrote, which the split agent cannot open: the switch
       starts from a new volume.
+    - **No root process writes in a folder the agent can write** (review
+      of #1424). The supervisor wrote the cgroup parent into `/run/aerolvm`,
+      which the agent writes too, at a fixed temporary name. Now it writes
+      to a folder of the runtime container's (`/run/aerolvm-runtime`), which
+      the agent mounts read only, by `O_EXCL` temporary file and rename; the
+      runtime container mounts every folder the agent writes read only, or
+      not at all (the state volume); the supervisor reads the ownership
+      lease as a regular file through no link; and the owners of the
+      shared folders are set by a first container, `split-folders` (root,
+      `CAP_CHOWN` only), before the agent or the helper starts. The shared
+      folder stays the one volume both write: its top is root's, and the
+      agent writes only its own folder in it. A chart test checks this.
     - **Kind found three more things** the offline tests could not: the
       agent may not change the mode of an emptyDir's own folder
       (`/run/sandboxd`), the helper refuses the CNI records' emptyDir

@@ -101,6 +101,45 @@ initContainers:
     resources:
       requests: { cpu: 100m, memory: 64Mi }
       limits: { cpu: 100m, memory: 64Mi }
+  {{- if $split }}
+  # Privilege mode split: the folders root and the agent share get their
+  # owners before either runs, so no root process later acts in a folder
+  # the agent can write. The kubelet makes an emptyDir open to everyone, and
+  # the root helper trusts a folder only when no one else can write it
+  # (internal/rootfolder): the shared folder becomes root's, open to the
+  # agent's group, with one folder of the agent's own inside; the CNI
+  # records' folder becomes root's alone; sandboxd's state volume becomes
+  # the agent's. As root with one right, CAP_CHOWN, and nothing else.
+  - name: split-folders
+    image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
+    imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        set -eu
+        chown 0:65531 /run/aerolvm-rootd/shared
+        chmod 0750 /run/aerolvm-rootd/shared
+        install -d -o 65531 -g 65531 -m 0700 /run/aerolvm-rootd/shared/agent
+        chmod 0755 /var/lib/cni
+        chown 65531:65531 /var/lib/sandboxd
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+        add: ["CHOWN"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests: { cpu: 100m, memory: 64Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+    volumeMounts:
+      - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
+      - { name: cni-state, mountPath: /var/lib/cni }
+      - { name: state, mountPath: /var/lib/sandboxd }
+  {{- end }}
 containers:
   - name: runtime
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
@@ -110,28 +149,15 @@ containers:
     securityContext:
       privileged: true
     {{- if $split }}
-    # Privilege mode split: the supervisor also runs the root helper. First
-    # the folder the agent and the helper share becomes root's: the kubelet
-    # makes an emptyDir open to everyone, and the helper trusts a folder
-    # only when no one else can write it (internal/rootfolder). The agent's
-    # group may enter it; what was left there goes, except the agent's own
-    # folder, which is made the agent's again. sandboxd's state volume is
-    # made the agent's too, and the mount tools' user when external storage
-    # is on (the helper serves mounts only when that user exists).
+    # Privilege mode split: the supervisor also runs the root helper (the
+    # split-folders init container set the shared folders up). The mount
+    # tools' user is made here, in this container's own files, when
+    # external storage is on: the helper serves mounts only when that user
+    # exists.
     command: ["/bin/sh", "-c"]
     args:
       - |
         set -eu
-        shared=/run/aerolvm-rootd/shared
-        chown 0:65531 "$shared"
-        chmod 0750 "$shared"
-        find "$shared" -mindepth 1 -maxdepth 1 ! -name agent -exec rm -rf {} +
-        if [ -L "$shared/agent" ] || { [ -e "$shared/agent" ] && [ ! -d "$shared/agent" ]; }; then rm -rf "$shared/agent"; fi
-        install -d -o 65531 -g 65531 -m 0700 "$shared/agent"
-        # The CNI plugins' address records: the helper trusts that folder
-        # only when no one else can write it either.
-        chmod 0755 /var/lib/cni
-        chown 65531:65531 /var/lib/sandboxd
         {{- if $splitMounts }}
         if ! getent passwd aerolvm-mounts >/dev/null; then
           groupadd --system --gid 65530 aerolvm-mounts
@@ -169,6 +195,10 @@ containers:
       # ready sockets, task output) are on the shared folder; its others
       # are its own, in this container, where the agent cannot reach.
       - { name: SB_ROOTD_STAGE_DIR, value: /run/aerolvm-rootd-stage }
+      # The sandboxes' cgroup parent, which the supervisor writes, goes to
+      # a folder of this container's that the agent reads only: no root
+      # process here writes in a folder the agent can write.
+      - { name: SB_CGROUP_PARENT_FILE, value: /run/aerolvm-runtime/cgroup-parent }
       - { name: SB_ROOTD_SOCKET, value: /run/aerolvm-rootd/shared/sock/root.sock }
       - { name: SB_ROOTD_SOCKET_GROUP, value: "65531" }
       - { name: SB_ROOTD_AGENT_UID, value: "65531" }
@@ -206,13 +236,24 @@ containers:
       {{- end }}
     volumeMounts:
       - { name: containerd, mountPath: /var/lib/containerd }
+      {{- if $split }}
+      # Privilege mode split: every folder the agent writes is read only
+      # here (its run folder, where it writes the ownership lease the
+      # supervisor reads, and the folder it copies toolboxd to), or not
+      # mounted at all (its state volume). The one exception is the shared
+      # folder below, whose top is root's: the agent writes only in its own
+      # folder there, which root never writes in.
+      - { name: run-containerd, mountPath: /run/containerd }
+      - { name: run-aerolvm, mountPath: /run/aerolvm, readOnly: true }
+      - { name: run-runtime, mountPath: /run/aerolvm-runtime }
+      - { name: toolbox, mountPath: /opt/aerolvm/toolbox, readOnly: true }
+      {{- else }}
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-containerd, mountPath: /run/containerd }
       - { name: run-aerolvm, mountPath: /run/aerolvm }
-      {{- if not $split }}
       - { name: run-sandboxd, mountPath: /run/sandboxd }
-      {{- end }}
       - { name: toolbox, mountPath: /opt/aerolvm/toolbox }
+      {{- end }}
       {{- if $split }}
       # The helper's socket, ready sockets and task output, which the agent
       # opens, and the agent's own run folder, on one filesystem: the
@@ -271,14 +312,15 @@ containers:
       - |
         set -eu
         {{- if $split }}
-        # The cgroup the runtime container set up for sandboxes. containerd
-        # is reached only through the root helper's socket.
+        # The cgroup the runtime container set up for sandboxes, in its
+        # folder this container reads only. containerd is reached only
+        # through the root helper's socket.
         for _ in $(seq 1 120); do
-          [ -s /run/aerolvm/cgroup-parent ] && break
+          [ -s /run/aerolvm-runtime/cgroup-parent ] && break
           sleep 1
         done
-        [ -s /run/aerolvm/cgroup-parent ] || { echo "agent: the runtime container did not start" >&2; exit 1; }
-        SB_CONTAINERD_CGROUP_PARENT="$(cat /run/aerolvm/cgroup-parent)"
+        [ -s /run/aerolvm-runtime/cgroup-parent ] || { echo "agent: the runtime container did not start" >&2; exit 1; }
+        SB_CONTAINERD_CGROUP_PARENT="$(cat /run/aerolvm-runtime/cgroup-parent)"
         export SB_CONTAINERD_CGROUP_PARENT
         # The root helper from this image, staged for the runtime
         # container's supervisor. It runs a helper only when a release
@@ -522,10 +564,12 @@ containers:
       {{- if $split }}
       # The folder sandboxd shares with the root helper (the helper's
       # socket, ready sockets, task output), the folder it stages the
-      # helper in, and a writable /tmp: its own disk is read only.
+      # helper in, and a writable /tmp: its own disk is read only. The
+      # runtime container's folder for the cgroup parent, read only.
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage }
       - { name: tmp, mountPath: /tmp }
+      - { name: run-runtime, mountPath: /run/aerolvm-runtime, readOnly: true }
       # The machine's cgroup tree, read only: sandboxd sizes its capacity
       # from the sandboxes' cgroup and reads each one's usage (C7, C20).
       # Its own cgroup namespace shows only its own group. It cannot
@@ -651,6 +695,7 @@ volumes:
   - { name: cni-state, emptyDir: {} }
   {{- if $split }}
   - { name: rootd-shared, emptyDir: {} }
+  - { name: run-runtime, emptyDir: {} }
   - { name: rootd-stage, emptyDir: {} }
   - { name: tmp, emptyDir: {} }
   - name: host-cgroup

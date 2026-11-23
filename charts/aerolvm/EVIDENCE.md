@@ -138,10 +138,33 @@ helper).
 | Pod | two-way mounts; one process namespace with external storage, WASM, V8 or Firecracker | no two-way mount; no shared process namespace |
 | Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone: it reads its sandboxes' memory and CPU there, and cannot write a cgroup file |
 | External storage | off by default | on by default: the helper runs the mount tools as their own user, in the `runtime` container |
+| Folders root writes | n/a | none the `agent` can write: see below |
+| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets three folders' owners, then exits |
+
+**Folders shared with the `agent` in split.** No root process writes in a
+folder the `agent` can write. A test in the AerolVM repository renders the
+pod and fails if the `agent` and the `runtime` container both write one
+volume, other than the shared folder below.
+
+| Volume | `agent` | `runtime` (root) | What root does there |
+|---|---|---|---|
+| `state` (sandboxd's data) | writes | not mounted | `split-folders` gives it to the agent, before the agent starts |
+| `run-aerolvm` (`/run/aerolvm`) | writes (ownership lease, its own sockets) | read only | the supervisor reads the lease: no link followed, regular files only, size bound |
+| `run-runtime` (`/run/aerolvm-runtime`) | read only | writes | the supervisor writes the cgroup parent; temporary file by `O_EXCL`, then rename |
+| `toolbox` | writes `toolboxd` | read only | the helper copies it: no link followed, a regular file the agent owns, size bound |
+| `rootd-stage` | writes the helper and its signature | read only | the supervisor copies them into a folder of its own, then checks the copy's signature |
+| `rootd-shared` (`/run/aerolvm-rootd/shared`) | writes only in its own folder, `agent/` | writes | the top is root's (0750, the agent's group); the helper makes its socket, ready sockets and task output in folders of its own there, and links ready sockets from `agent/` by handle |
+| `tmp`, `run-sandboxd` | writes | not mounted | none |
+| `cni-state` | not mounted | writes | the CNI plugins' address records |
+| containerd's volume | one empty folder, read only | writes | containerd's images and layers |
+| `host-cgroup` (machine) | read only | not mounted | none |
 
 What split does not run yet, refused by name at `helm install`: Firecracker,
 WASM and V8-isolate sandboxes, gVisor moves with memory, and the kubectl
-API's warm pools.
+API's warm pools. `sandboxd` itself runs Firecracker in split since M1 PR
+9b, except with the host firewall on (the chart always turns it on) or the
+VM pool; the chart also does not wire Firecracker into a split pod, and no
+live run has proven it.
 
 What is proven so far, and how:
 

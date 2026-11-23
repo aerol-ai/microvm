@@ -309,6 +309,64 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 	}
 }
 
+// In a split worker no root process writes in a folder the agent can write
+// (plan §3.3, "root-read paths live in root's folders"). Each volume the
+// agent mounts read-write is read-only or absent in the runtime container,
+// which runs as root, with one exception: the shared folder, whose top is
+// root's (split-folders makes it 0750 root:65531 before any container
+// runs) and in which the agent writes only its own folder. Root's one-time
+// setup runs in the split-folders init container, before the agent
+// exists. The one machine folder is the agent's read-only cgroup tree.
+func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
+	helm := chartHelm(t)
+	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
+	for name, flags := range map[string][]string{"single": edge, "cluster": append(slices.Clone(chartClusterFlags), edge...)} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := workerSpec(t, out)
+			mounts := func(list string, name string) map[string]bool {
+				rw := map[string]bool{}
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					if m["name"] != name {
+						continue
+					}
+					vms, _ := m["volumeMounts"].([]any)
+					for _, v := range vms {
+						vm, _ := v.(map[string]any)
+						ro, _ := vm["readOnly"].(bool)
+						rw[fmt.Sprint(vm["name"])] = !ro
+					}
+				}
+				return rw
+			}
+			agent, runtime := mounts("containers", "agent"), mounts("containers", "runtime")
+			for vol, agentWrites := range agent {
+				if agentWrites && runtime[vol] && vol != "rootd-shared" {
+					t.Errorf("the agent and the runtime container both write volume %s", vol)
+				}
+			}
+			if _, ok := runtime["state"]; ok {
+				t.Error("the runtime container mounts sandboxd's state volume")
+			}
+			if init := mounts("initContainers", "split-folders"); !init["rootd-shared"] || !init["state"] || !init["cni-state"] {
+				t.Errorf("split-folders mounts %v", init)
+			}
+			vols, _ := spec["volumes"].([]any)
+			for _, v := range vols {
+				vm, _ := v.(map[string]any)
+				if hp := dig(vm, "hostPath"); hp != nil && (vm["name"] != "host-cgroup" || agent["host-cgroup"] || hp["path"] != "/sys/fs/cgroup") {
+					t.Errorf("machine folder %v", vm)
+				}
+			}
+		})
+	}
+}
+
 // Single renders none of split: no setting, no helper, a privileged agent.
 func TestChartSingleHasNoSplit(t *testing.T) {
 	helm := chartHelm(t)
@@ -318,7 +376,7 @@ func TestChartSingleHasNoSplit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531"} {
+			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime"} {
 				if strings.Contains(out, bad) {
 					t.Errorf("single renders %q", bad)
 				}

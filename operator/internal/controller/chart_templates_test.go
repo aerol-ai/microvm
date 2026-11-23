@@ -130,6 +130,17 @@ func TestRenderedSplitWorkerTemplate(t *testing.T) {
 	}
 	noRights("agent", agent.SecurityContext)
 	noRights("setup", pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].SecurityContext)
+	// The shared folders get their owners before anything else runs, from
+	// root with one right (CAP_CHOWN): preflight, split-folders, setup.
+	ic := pod.Spec.InitContainers
+	if len(ic) != 3 || ic[0].Name != PreflightContainer || ic[1].Name != "split-folders" || ic[2].Name != SetupContainer {
+		t.Fatalf("split worker init containers = %v", ic)
+	}
+	if sc := ic[1].SecurityContext; sc == nil || (sc.Privileged != nil && *sc.Privileged) || sc.Capabilities == nil ||
+		len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) != 1 || sc.Capabilities.Add[0] != "CHOWN" ||
+		sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation || sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		t.Errorf("split-folders security = %+v", sc)
+	}
 	if envValue(agent.Env, "SB_PRIVILEGE_MODE") != "split" {
 		t.Error("the split agent lacks SB_PRIVILEGE_MODE=split")
 	}
