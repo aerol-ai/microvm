@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,10 +119,34 @@ func Write(path string, l Lease) error {
 	return os.Rename(tmp.Name(), path)
 }
 
+// maxLeaseBytes bounds one read. A lease lists the sandboxes it fences and
+// owns: a few hundred thousand IDs fit.
+const maxLeaseBytes = 16 << 20
+
 // Read returns the lease at path. A missing file is an error that
 // errors.Is(err, os.ErrNotExist): no lease has been written.
+//
+// The reader is the runtime container's supervisor, root, and the file is
+// sandboxd's, in a folder sandboxd can write. So Read follows no link at
+// the file's name, takes only a regular file (a pipe would block it, a
+// device would never end), and reads at most maxLeaseBytes.
 func Read(path string) (Lease, error) {
-	body, err := os.ReadFile(path)
+	f, err := openNoFollow(path)
+	if err != nil {
+		return Lease{}, err
+	}
+	defer f.Close()
+	var body []byte
+	st, err := f.Stat()
+	if err == nil && !st.Mode().IsRegular() {
+		err = fmt.Errorf("ownership lease %s: not a regular file (%s)", path, st.Mode().Type())
+	}
+	if err == nil {
+		body, err = io.ReadAll(io.LimitReader(f, maxLeaseBytes+1))
+	}
+	if err == nil && len(body) > maxLeaseBytes {
+		err = fmt.Errorf("ownership lease %s: over %d bytes", path, maxLeaseBytes)
+	}
 	if err != nil {
 		return Lease{}, err
 	}
