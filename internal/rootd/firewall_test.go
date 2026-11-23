@@ -17,11 +17,12 @@ import (
 // starts the re-assert timer; the node guard and the floor pass their
 // rules, canonical, or are refused by name.
 func TestFirewallHostCalls(t *testing.T) {
-	orig := reassertEvery
-	reassertEvery = 5 * time.Millisecond
-	t.Cleanup(func() { reassertEvery = orig })
 	withNodeDNS(t, "10.0.1.5")
-	r, c, _, fw := sandboxRig(t)
+	fw := newFakeFirewall()
+	r := newRig(t, func(_ *Config, o *Options) {
+		o.Network, o.Firewall, o.reassertEvery = newFakeNet(), fw, 5*time.Millisecond
+	})
+	c := rootdpb.NewRootHelperClient(r.conn)
 	ctx := callCtx(t)
 	fw.fence = errors.New("no table")
 	resp, err := c.EnsureHost(ctx, &rootdpb.EnsureHostRequest{})
@@ -56,6 +57,31 @@ func TestFirewallHostCalls(t *testing.T) {
 	wantCode(t, err, codes.Internal)
 	_, err = c.EnsureHost(ctx, &rootdpb.EnsureHostRequest{})
 	wantCode(t, err, codes.Internal)
+}
+
+// TestReassertPace: each firewall keeps the re-assert pace it was built
+// with (its timer's goroutine reads it, so nothing changes it after), and
+// a server built without one takes the 30 s default.
+func TestReassertPace(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		every time.Duration
+		want  time.Duration
+	}{
+		{"unset", 0, defaultReassertEvery},
+		{"below zero", -time.Second, defaultReassertEvery},
+		{"set", 5 * time.Millisecond, 5 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reassertPace(tc.every); got != tc.want {
+				t.Fatalf("reassertPace(%v) = %v, want %v", tc.every, got, tc.want)
+			}
+		})
+	}
+	r, _, _, _, _ := guestRig(t)
+	if r.srv.fw.every != defaultReassertEvery || r.srv.gf.every != defaultReassertEvery {
+		t.Fatalf("paces %v and %v, want %v", r.srv.fw.every, r.srv.gf.every, defaultReassertEvery)
+	}
 }
 
 // TestSandboxRules: each op on an address the helper's CNI leased; writes

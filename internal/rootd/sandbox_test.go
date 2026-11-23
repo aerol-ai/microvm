@@ -23,9 +23,14 @@ type fakeFirewall struct {
 	calls []string
 	fail  map[string]error // by op name, or "clear"
 	fence error
+	// guests: the fence covers the TAPs, with guestFence its state.
+	guests     bool
+	guestFence error
 	// blocked are the addresses with a block-all rule.
 	blocked map[string]bool
 }
+
+func (f *fakeFirewall) GuestFence() (bool, error) { return f.guests, f.guestFence }
 
 func newFakeFirewall() *fakeFirewall {
 	return &fakeFirewall{fail: map[string]error{}, blocked: map[string]bool{}}

@@ -82,7 +82,8 @@ func (m *memFirewall) EnsureHost(context.Context) (error, error) {
 	m.calls = append(m.calls, "ensure")
 	return nil, nil
 }
-func (m *memFirewall) Reassert(context.Context) {}
+func (m *memFirewall) Reassert(context.Context)  {}
+func (m *memFirewall) GuestFence() (bool, error) { return false, nil }
 func (m *memFirewall) SetNodeGuard(allow []rootpolicy.NodePort) (bool, error) {
 	m.calls = append(m.calls, fmt.Sprintf("guard %v", allow))
 	return true, nil

@@ -31,12 +31,18 @@ import (
 
 // firewallHelper is the helper's firewall calls (*rootclient.Client).
 type firewallHelper interface {
-	EnsureHostFirewall(ctx context.Context) (fence string, err error)
+	ruleCalls
+	EnsureHostFences(ctx context.Context) (rootclient.Fences, error)
+	PrepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error)
+	ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) error
+}
+
+// ruleCalls are the calls behind netrules' methods: the sandboxes' (the
+// helper's firewall calls) or the Firecracker guests' (guestRuleCalls).
+type ruleCalls interface {
 	SetNodeGuard(ctx context.Context, allow []*rootdpb.NodePort) (bool, error)
 	SetEgressFloor(ctx context.Context, cidrs []string) (bool, error)
 	SandboxRules(ctx context.Context, op rootdpb.SandboxRulesOp, ip string, allow, deny []string) (bool, error)
-	PrepareSandbox(ctx context.Context, req *rootdpb.PrepareSandboxRequest) (*rootdpb.PrepareSandboxResponse, error)
-	ReleaseSandbox(ctx context.Context, req *rootdpb.ReleaseSandboxRequest) error
 }
 
 // splitFirewallOn: the host firewall is on (SB_ENABLE_NETWORK_RULES), so
@@ -50,9 +56,14 @@ func splitHostStepOn(cfg config.Config) bool { return cfg.EnableNetworkRules || 
 
 // helperFirewall is cntr.HostFirewall and cntr.CreateRules through the
 // helper. The netrules methods take no context; each call is bounded by
-// the client's network timeout.
+// the client's network timeout. Over the guests' calls it is the
+// Firecracker driver's NetRules too (newHelperGuestRules).
 type helperFirewall struct {
-	h      firewallHelper
+	h ruleCalls
+	// prep is a containerd create's rules in one call; nil for the
+	// guests, whose create takes its rules one call each, as in single
+	// mode.
+	prep   firewallHelper
 	subnet netip.Prefix
 
 	// The last lists sent, which a re-assert sends again: the helper
@@ -64,7 +75,7 @@ type helperFirewall struct {
 
 func newHelperFirewall(h firewallHelper, subnet string) *helperFirewall {
 	p, _ := netip.ParsePrefix(subnet)
-	return &helperFirewall{h: h, subnet: p.Masked()}
+	return &helperFirewall{h: h, prep: h, subnet: p.Masked()}
 }
 
 var (
@@ -192,7 +203,7 @@ func (f *helperFirewall) ReassertFloor() (bool, error) {
 // ApplyCreateRules is a warm create's rules: one PrepareSandbox with the
 // firewall part alone, for the slot it claimed.
 func (f *helperFirewall) ApplyCreateRules(ctx context.Context, netnsName, ip string, blockAll bool, allow, deny []string) error {
-	_, err := f.h.PrepareSandbox(ctx, &rootdpb.PrepareSandboxRequest{NetnsName: netnsName, Parts: []string{rootdpb.PartFirewall},
+	_, err := f.prep.PrepareSandbox(ctx, &rootdpb.PrepareSandboxRequest{NetnsName: netnsName, Parts: []string{rootdpb.PartFirewall},
 		ContainerIp: ip, Firewall: &rootdpb.SandboxFirewall{BlockAllEgress: blockAll, AllowCidrs: allow, DenyCidrs: deny}})
 	return err
 }
@@ -201,47 +212,86 @@ func (f *helperFirewall) FoldsIntoBuild() bool  { return true }
 func (f *helperFirewall) ClearsOnRelease() bool { return true }
 
 // helperFence is the IPv6 fence's state as the helper reports it: the
-// helper keeps the fence on the sandboxes' bridge (and re-asserts it on
-// its own timer); the create gate asks this (service.IPv6Fence).
+// helper keeps the fence on the sandboxes' bridge and, when it serves
+// Firecracker, on every TAP (M1 PR 14), and re-asserts it on its own
+// timer; the create gate asks this (service.IPv6Fence).
 type helperFence struct {
 	h   firewallHelper
 	log *slog.Logger
+	// guests: Firecracker is on, so the fence must cover the TAPs too.
+	guests bool
 
 	mu     sync.Mutex
-	status error // nil: the fence covers the sandboxes
+	status map[string]error // by runtime; nil: the fence covers its sandboxes
 }
 
-func newHelperFence(h firewallHelper, log *slog.Logger) *helperFence {
-	return &helperFence{h: h, log: log, status: ipv6fence.ErrNotSynced}
+func newHelperFence(h firewallHelper, log *slog.Logger, guests bool) *helperFence {
+	f := &helperFence{h: h, log: log, guests: guests, status: map[string]error{models.ContainerEngineContainerd: ipv6fence.ErrNotSynced}}
+	if guests {
+		f.status[models.RuntimeFirecracker] = ipv6fence.ErrNotSynced
+	}
+	return f
 }
+
+// errGuestsUnfenced: the helper's fence leaves the Firecracker TAPs out; it
+// is older than this sandboxd, or serves no Firecracker.
+var errGuestsUnfenced = errors.New("the root helper's IPv6 fence does not cover the Firecracker TAPs: " +
+	"the helper is older than sandboxd or runs no Firecracker (SB_ENABLE_FIRECRACKER in its settings)")
 
 // sync runs the helper's host step and records the fence's state. A call
-// that failed is the error; a fence the helper could not put in place is
-// only a state, which holds creates.
+// that failed is the error, for every runtime; a fence the helper could
+// not put in place is only a state, which holds that runtime's creates.
 func (f *helperFence) sync(ctx context.Context) error {
-	fence, err := f.h.EnsureHostFirewall(ctx)
+	fences, err := f.h.EnsureHostFences(ctx)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	switch {
-	case err != nil:
-		f.status = err
-	case fence != "":
-		f.status = errors.New(fence)
-	default:
-		f.status = nil
+	if err != nil {
+		for rt := range f.status {
+			f.status[rt] = err
+		}
+		return err
 	}
-	return err
+	f.status[models.ContainerEngineContainerd] = fenceState(fences.Containerd)
+	if f.guests {
+		state := errGuestsUnfenced
+		if fences.CoversFirecracker {
+			state = fenceState(fences.Firecracker)
+		}
+		f.status[models.RuntimeFirecracker] = state
+	}
+	return nil
 }
 
-// Ready answers the create gate. Split mode runs containers alone (no
-// Firecracker), whose sandboxes are on the helper's bridge.
-func (f *helperFence) Ready(runtime string) error {
-	if runtime != models.ContainerEngineContainerd {
-		return fmt.Errorf("privilege mode split fences the containerd bridge only, not %s", runtime)
+func fenceState(why string) error {
+	if why == "" {
+		return nil
 	}
+	return errors.New(why)
+}
+
+// Ready answers the create gate. Split mode runs containers on the
+// helper's bridge and Firecracker guests on its TAPs.
+func (f *helperFence) Ready(runtime string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.status
+	state, ok := f.status[runtime]
+	if !ok {
+		return fmt.Errorf("privilege mode split fences the containerd bridge and the Firecracker TAPs only, not %s", runtime)
+	}
+	return state
+}
+
+// notReady is the first runtime whose sandboxes the fence does not cover,
+// and why; "" when it covers them all.
+func (f *helperFence) notReady() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, rt := range []string{models.ContainerEngineContainerd, models.RuntimeFirecracker} {
+		if err, ok := f.status[rt]; ok && err != nil {
+			return rt, err
+		}
+	}
+	return "", nil
 }
 
 // run asks again every tick while the fence is not in place, and every
@@ -255,15 +305,16 @@ func (f *helperFence) run(ctx context.Context, tick time.Duration) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if f.Ready(models.ContainerEngineContainerd) == nil && now.Sub(last) < ipv6fence.ReassertInterval {
+			if _, err := f.notReady(); err == nil && now.Sub(last) < ipv6fence.ReassertInterval {
 				continue
 			}
 			last = now
-			before := f.Ready(models.ContainerEngineContainerd)
+			_, before := f.notReady()
 			_ = f.sync(ctx)
-			if after := f.Ready(models.ContainerEngineContainerd); (before == nil) != (after == nil) {
+			if rt, after := f.notReady(); (before == nil) != (after == nil) {
 				if after != nil {
-					f.log.Error("privilege mode split: the root helper's IPv6 fence is not in place; containerd creates are refused until it is", "error", after)
+					f.log.Error("privilege mode split: the root helper's IPv6 fence is not in place; creates on this runtime are refused until it is",
+						"runtime", rt, "error", after)
 				} else {
 					f.log.Info("privilege mode split: the root helper's IPv6 fence is in place")
 				}
@@ -281,17 +332,19 @@ func (f *helperFence) wire(ctx context.Context, svc *service.Service, tick time.
 // bootSplitFirewall runs the helper's host step at boot, as single mode's
 // EnsureChain: a call that fails stops the start (a helper too old for it
 // included: the supervisor swaps in the newer one, and the next start
-// finds it). It answers the fence the create gate asks.
-func bootSplitFirewall(ctx context.Context, h firewallHelper, logger *slog.Logger) (*helperFence, error) {
-	fence := newHelperFence(h, logger)
+// finds it). It answers the fence the create gate asks; guests is
+// Firecracker on, whose TAPs the fence must cover too.
+func bootSplitFirewall(ctx context.Context, h firewallHelper, logger *slog.Logger, guests bool) (*helperFence, error) {
+	fence := newHelperFence(h, logger, guests)
 	if err := fence.sync(ctx); err != nil {
 		if errors.Is(err, rootclient.ErrUnsupported) {
 			return nil, fmt.Errorf("root helper: the host firewall needs a newer helper (privilege mode split, SB_ENABLE_NETWORK_RULES): %w", err)
 		}
 		return nil, fmt.Errorf("root helper: set the host firewall up: %w", err)
 	}
-	if err := fence.Ready(models.ContainerEngineContainerd); err != nil {
-		logger.Error("privilege mode split: the root helper's IPv6 fence is not in place yet; containerd creates are refused until it is", "error", err)
+	if rt, err := fence.notReady(); err != nil {
+		logger.Error("privilege mode split: the root helper's IPv6 fence is not in place yet; creates on this runtime are refused until it is",
+			"runtime", rt, "error", err)
 	}
 	return fence, nil
 }

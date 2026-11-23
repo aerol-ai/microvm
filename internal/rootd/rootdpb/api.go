@@ -65,6 +65,12 @@ const (
 	FeatureEnsureTap      = "EnsureTap"
 	FeatureRemoveTap      = "RemoveTap"
 	FeatureMakeFilesystem = "MakeFilesystem"
+
+	// The Firecracker guests' firewall (M1 PR 14).
+	FeatureEnsureGuestFirewall = "EnsureGuestFirewall"
+	FeatureSetGuestNodeGuard   = "SetGuestNodeGuard"
+	FeatureSetGuestEgressFloor = "SetGuestEgressFloor"
+	FeatureGuestRules          = "GuestRules"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -119,7 +125,8 @@ func Features() []string {
 		FeatureBridgeProbe, FeatureMatchProcess, FeatureHostPort,
 		FeatureMountExternal, FeatureUnmountExternal, FeatureSweepExternalMounts, FeatureReclaimVolume,
 		FeaturePrepareHost, FeatureSpawnHost, FeatureStopHost, FeatureListHosts, FeatureSetHostLimits,
-		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem}
+		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem,
+		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules}
 }
 
 // HostKindName is a host kind's name in VersionResponse.hosts, "" for

@@ -111,7 +111,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.VersionResponse": {"helper_version=1:string", "api=2:uint32", "features=3:repeated string", "parts=4:repeated string",
 			"hosts=5:repeated string"},
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
-		"aerolvm.rootd.v1.EnsureHostResponse": {"ipv6_fence_error=1:string"},
+		"aerolvm.rootd.v1.EnsureHostResponse": {"ipv6_fence_error=1:string", "fences_firecracker=2:bool", "firecracker_ipv6_fence_error=3:string"},
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,
 		"aerolvm.rootd.v1.HelperUnsupported":  {"reason=1:string"},
 		"aerolvm.rootd.v1.HelperRefused":      {"reason=1:string"},
@@ -197,6 +197,10 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.ListHostsResponse":           {"hosts=1:repeated message"},
 		"aerolvm.rootd.v1.SetHostLimitsRequest":        {"kind=1:enum", "id=2:string", "limits=3:message"},
 		"aerolvm.rootd.v1.SetHostLimitsResponse":       nil,
+		"aerolvm.rootd.v1.EnsureGuestFirewallRequest":  nil,
+		"aerolvm.rootd.v1.EnsureGuestFirewallResponse": nil,
+		"aerolvm.rootd.v1.GuestRulesRequest":           {"guest_ip=1:string", "op=2:enum", "allow_cidrs=3:repeated string", "deny_cidrs=4:repeated string"},
+		"aerolvm.rootd.v1.GuestRulesResponse":          {"inserted=1:bool"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {

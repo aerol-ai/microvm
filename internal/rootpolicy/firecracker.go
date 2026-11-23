@@ -83,6 +83,47 @@ func CheckTapBase(baseCIDR string, poolSize int) error {
 	return nil
 }
 
+// CheckGuestAddress is the slot whose guest address addr is, in a pool laid
+// out from baseCIDR with poolSize slots (M1 PR 14): the guest end of one of
+// the pool's /30s, never a TAP's host end, its network or broadcast
+// address, an address past the pool, or any address outside the base. The
+// guests' firewall keys every rule by this address, so a rule can never be
+// written for the node's own addresses on the TAPs or for any other
+// network. Refused with RuleAddress.
+//
+// Which slot belongs to which sandbox is the agent's bookkeeping (plan R9);
+// the helper vouches only that the address is a guest's. A stopped VM keeps
+// its slot and its rules with no TAP up, so a TAP cannot vouch for it.
+func CheckGuestAddress(baseCIDR string, poolSize int, addr string) (taphost.Slot, error) {
+	ip, err := netip.ParseAddr(addr)
+	if err != nil {
+		return taphost.Slot{}, violate(RuleAddress, "guest address %q: %v", addr, err)
+	}
+	if !ip.Is4() || ip.Zone() != "" {
+		return taphost.Slot{}, violate(RuleAddress, "guest address %q: want a plain IPv4 address", addr)
+	}
+	if err := CheckTapBase(baseCIDR, poolSize); err != nil {
+		return taphost.Slot{}, violate(RuleAddress, "no TAP pool to check guest address %s against: %v", ip, err)
+	}
+	base := netip.MustParsePrefix(baseCIDR) // CheckTapBase parsed it
+	if !base.Contains(ip) {
+		return taphost.Slot{}, violate(RuleAddress, "guest address %s is outside the TAP base %s", ip, base)
+	}
+	b, a := base.Addr().As4(), ip.As4()
+	offset := (uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3])) -
+		(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
+	// The pool's cap bounds the index before it narrows.
+	if offset%4 != 2 || offset/4 >= uint32(taphost.MaxPoolSize) {
+		return taphost.Slot{}, violate(RuleAddress, "%s is not a guest address of the TAP pool (the guest is .2 of each /30)", ip)
+	}
+	index := int(offset / 4)
+	slot, err := taphost.SlotAt(baseCIDR, poolSize, index)
+	if err != nil || slot.GuestIP != ip.String() {
+		return taphost.Slot{}, violate(RuleAddress, "guest address %s is past the TAP pool of %d slots", ip, poolSize)
+	}
+	return slot, nil
+}
+
 // maxFilesystemMiB bounds a filesystem the helper makes for the agent: a
 // filesystem image is a file of the agent's, as big as it asks, and this
 // is a sandbox disk's cap (models: a disk of at most 1024 GiB).

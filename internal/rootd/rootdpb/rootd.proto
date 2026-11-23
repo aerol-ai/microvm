@@ -229,6 +229,33 @@ service RootHelper {
   // owned by root as in privilege mode single and it can read and write
   // nothing the agent could not.
   rpc MakeFilesystem(MakeFilesystemRequest) returns (MakeFilesystemResponse);
+
+  // The calls below are the Firecracker guests' firewall (M1 PR 14), as
+  // sandboxd keeps it in privilege mode single: the guests' own rule chain
+  // on the helper's TAP base, its block sets, the node guard and the deny
+  // floor for that base, and each guest's rules. The agent sends typed
+  // values, as for the containerd firewall above: a guest's address, its
+  // egress CIDRs, the node ports guests may reach, the node's extra deny
+  // floor. The helper checks each, renders every rule itself, and touches
+  // only the guests' own chains. Each call is safe to retry and to repeat.
+
+  // EnsureGuestFirewall makes sure the guests' firewall is set up: the
+  // guests' NAT and isolation (as EnsureTap puts them in), their rule chain
+  // and block sets, and the floor. It starts the helper's own timer that
+  // puts them back if something takes them away.
+  rpc EnsureGuestFirewall(EnsureGuestFirewallRequest) returns (EnsureGuestFirewallResponse);
+
+  // SetGuestNodeGuard makes sure the node guard holds for the TAP base,
+  // with these ports open. The ports are the ones SetNodeGuard takes.
+  rpc SetGuestNodeGuard(SetNodeGuardRequest) returns (SetNodeGuardResponse);
+
+  // SetGuestEgressFloor makes sure the deny floor for the TAP base holds
+  // these networks, plus the cloud metadata endpoints the helper always
+  // adds.
+  rpc SetGuestEgressFloor(SetEgressFloorRequest) returns (SetEgressFloorResponse);
+
+  // GuestRules changes one guest address's rules.
+  rpc GuestRules(GuestRulesRequest) returns (GuestRulesResponse);
 }
 
 message VersionRequest {
@@ -264,6 +291,13 @@ message EnsureHostResponse {
   // Why the IPv6 fence does not cover the sandboxes' bridge now; empty
   // when it does.
   string ipv6_fence_error = 1;
+  // The fence covers the Firecracker guests' TAPs too: set by a helper
+  // that serves Firecracker (M1 PR 14). An older helper fences the bridge
+  // alone, and the agent then refuses Firecracker creates.
+  bool fences_firecracker = 2;
+  // Why the IPv6 fence does not cover the guests' TAPs now; empty when it
+  // does. Meaningful only with fences_firecracker.
+  string firecracker_ipv6_fence_error = 3;
 }
 
 // HostEntry is one line of a container's hosts file.
@@ -963,3 +997,22 @@ message MakeFilesystemRequest {
 }
 
 message MakeFilesystemResponse {}
+
+message EnsureGuestFirewallRequest {}
+
+message EnsureGuestFirewallResponse {}
+
+message GuestRulesRequest {
+  // The guest's address: the guest end of one of the TAP pool's slots, as
+  // the helper lays the pool out from its own TAP base.
+  string guest_ip = 1;
+  SandboxRulesOp op = 2;
+  // The egress policy's networks, for the two policy ops.
+  repeated string allow_cidrs = 3;
+  repeated string deny_cidrs = 4;
+}
+
+message GuestRulesResponse {
+  // For a block: the rule was not there and was put in.
+  bool inserted = 1;
+}

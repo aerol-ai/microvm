@@ -553,13 +553,22 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if helper != nil {
 			// Privilege mode split (M1 PR 9b): the root helper runs the
 			// jailer, makes each VM's jail, TAP and filesystems, and puts
-			// in the guests' NAT and isolation at the first TAP. The
-			// guests' own firewall is not the helper's yet: split mode
-			// starts only with network rules off (checkPrivilegeMode), as
-			// single mode runs then.
+			// in the guests' NAT and isolation at the first TAP. With
+			// network rules on it keeps the guests' firewall too (M1 PR
+			// 14): their chain, block sets, floor and node guard on its
+			// TAP base, and each guest's rules. Without them the guests
+			// get NAT and isolation alone, as in single mode.
 			fcDriver.SetSplit(splitFirecracker{h: helper})
+			if cfg.EnableNetworkRules {
+				rules, tapSubnet, err := bootSplitGuestFirewall(ctx, cfg, helper)
+				if err != nil {
+					return err
+				}
+				fcDriver.SetNetRules(rules)
+				fcDriver.SetTapSubnet(tapSubnet)
+			}
 			logger.Info("firecracker VMs run through the root helper (privilege mode split)",
-				"chroot_base", cfg.JailerChrootBase, "jailer_uid", cfg.JailerUID)
+				"chroot_base", cfg.JailerChrootBase, "jailer_uid", cfg.JailerUID, "guest_firewall", cfg.EnableNetworkRules)
 		} else if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
 			// Not fatal: a node that booted before this keeps booting.
 			// Without it the guests have no NAT and the driver no firewall,

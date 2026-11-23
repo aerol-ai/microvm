@@ -9,3 +9,8 @@ import "errors"
 func openFirewall(Config, NetworkHost) (FirewallHost, error) {
 	return nil, errors.New("the host firewall needs Linux")
 }
+
+// openGuestFirewall: so is the Firecracker guests' firewall.
+func openGuestFirewall(Config, *FirecrackerHostsConfig) (FirewallHost, error) {
+	return nil, errors.New("the Firecracker guests' firewall needs Linux")
+}
