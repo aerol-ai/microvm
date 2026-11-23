@@ -127,6 +127,9 @@ type Driver struct {
 	// parkSockets names warm-pool slots' park sockets in the helper's
 	// folder (split_park.go).
 	parkSockets ParkSockets
+	// moves takes gVisor moves' checkpoints through the helper
+	// (split_moves.go); nil in single mode and with moves off.
+	moves MoveHelper
 	// imageUsers caches what the helper resolved images' users to
 	// (split_create.go).
 	imageUsers imageUserCache

@@ -13,6 +13,7 @@ import (
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/oci"
 
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/runscwrap"
 	"github.com/aerol-ai/microvm/internal/runtime/movebundle"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
@@ -35,6 +36,11 @@ import (
 //     start becomes `runsc restore`. The sandbox takes the target network
 //     slot's address (runsc reads the namespace's interfaces again on
 //     restore; Phase 5 spike), so no address is reserved across workers.
+//
+// In privilege mode split the root helper does the root work of both
+// sides in its own moves folder, and the driver passes the bundle through
+// (split_moves.go). The bundle is the same format in both modes, so a
+// split node stages a single node's bundle, and the other way round.
 //
 // runsc checks on restore that the new spec matches the saved one, except
 // for env, hostname, cgroup path and the mount sources: the target builds
@@ -106,6 +112,18 @@ func (d *Driver) checkpointForMove(ctx context.Context, client *Client, containe
 		}
 	}
 	id := container.ID()
+	if d.helper != nil {
+		// Privilege mode split: the helper runs runsc, into its own moves
+		// folder (split_moves.go).
+		m, err := d.moveHelper()
+		if err != nil {
+			return err
+		}
+		if err := m.CheckpointMove(ctx, id); err != nil {
+			return fmt.Errorf("root helper: checkpoint %s: %w", id, err)
+		}
+		return nil
+	}
 	dir, err := d.moveDir(moveOut, id)
 	if err != nil {
 		return err
@@ -135,6 +153,17 @@ func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w 
 	if err != nil {
 		return fmt.Errorf("containerd runtime: export %s: %w", sandboxID, err)
 	}
+	if d.helper != nil {
+		// Privilege mode split: the checkpoint is in the helper's folder.
+		m, err := d.moveHelper()
+		if err == nil {
+			err = m.ExportMove(ctx, sandboxID, w)
+		}
+		if err != nil {
+			return fmt.Errorf("containerd runtime: export %s: %w", sandboxID, err)
+		}
+		return nil
+	}
 	if !runscwrap.HasCheckpoint(dir) {
 		return fmt.Errorf("containerd runtime: export %s: no checkpoint (it was not stopped for a move, or it ran since)", sandboxID)
 	}
@@ -151,6 +180,18 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 	final, err := d.moveDir(moveIn, sandboxID)
 	if err != nil {
 		return fmt.Errorf("containerd runtime: import %s: %w", sandboxID, err)
+	}
+	if d.helper != nil {
+		// Privilege mode split: the helper stages it in its own folder,
+		// and stages nothing of a bundle that is not whole.
+		m, err := d.moveHelper()
+		if err == nil {
+			_, err = m.ImportMove(ctx, sandboxID, r)
+		}
+		if err != nil {
+			return fmt.Errorf("containerd runtime: import %s: %w", sandboxID, err)
+		}
+		return nil
 	}
 	base := filepath.Dir(final)
 	if err := os.MkdirAll(base, 0o700); err != nil {
@@ -174,10 +215,17 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 }
 
 // DropImportedSnapshot removes what ImportSandboxSnapshot staged.
-func (d *Driver) DropImportedSnapshot(_ context.Context, sandboxID string) error {
+func (d *Driver) DropImportedSnapshot(ctx context.Context, sandboxID string) error {
 	dir, err := d.moveDir(moveIn, sandboxID)
 	if err != nil {
 		return err
+	}
+	if d.helper != nil {
+		m, err := d.moveHelper()
+		if err != nil {
+			return err
+		}
+		return m.DropMove(ctx, sandboxID, rootdpb.MoveSide_MOVE_SIDE_IN)
 	}
 	return os.RemoveAll(dir)
 }

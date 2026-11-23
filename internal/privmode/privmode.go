@@ -58,7 +58,6 @@ const (
 	StepFirecrackerWarmPool Step = "firecracker_warm_pool"
 	StepFirecrackerImages   Step = "firecracker_images"
 	StepContainerFile       Step = "container_files"
-	StepMoves               Step = "gvisor_moves"
 )
 
 // steps say what each step is, for the operator who meets the error.
@@ -72,7 +71,6 @@ var steps = map[Step]string{
 		"until a sandbox claims them",
 	StepFirecrackerImages: "a Firecracker sandbox's disk saved as a container image, which a second VM reads",
 	StepContainerFile:     "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
-	StepMoves:             "gVisor checkpoint moves",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

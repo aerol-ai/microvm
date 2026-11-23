@@ -98,9 +98,10 @@ func checkPrivilegeMode(cfg config.Config) error {
 			gaps = append(gaps, privmode.StepFirecrackerWarmPool)
 		}
 	}
-	if cfg.GvisorCheckpointMoves {
-		gaps = append(gaps, privmode.StepMoves)
-	}
+	// gVisor checkpoint moves (SB_GVISOR_CHECKPOINT_MOVES) are the
+	// helper's from M1 PR 13: it runs runsc checkpoint and keeps both
+	// sides' checkpoints in its own moves folder (containerd
+	// split_moves.go, rootd moves.go).
 	return privmode.NotYet("start sandboxd", gaps...)
 }
 

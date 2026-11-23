@@ -82,10 +82,17 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	// A move's recreate resumes a gVisor sandbox from the checkpoint staged
-	// here (gvisor_move.go), never from the warm pool.
+	// here (gvisor_move.go; the helper's in privilege mode split,
+	// split_moves.go), never from the warm pool.
 	restore := sbruntime.RestoreRequested(ctx)
-	if restore && (ociRuntime != "runsc" || !d.staged(sandboxID)) {
-		return nil, fmt.Errorf("containerd runtime: no gVisor checkpoint is staged for %s", sandboxID)
+	var restoreOpt oci.SpecOpts
+	if restore {
+		if ociRuntime != "runsc" {
+			return nil, errNotStaged(sandboxID)
+		}
+		if restoreOpt, err = d.restoreSpec(ctx, sandboxID); err != nil {
+			return nil, err
+		}
 	}
 
 	if d.warmPool != nil && !restore {
@@ -324,11 +331,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
 		if restore {
-			opt, err := d.restoreSpecOpt(sandboxID)
-			if err != nil {
-				return nil, err
-			}
-			specOpts = append(specOpts, opt)
+			specOpts = append(specOpts, restoreOpt)
 		}
 	}
 
@@ -544,7 +547,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if restore {
 		// Used: a later start of this container boots it, and the wrapper
 		// then passes the start through.
-		if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
+		if d.helper != nil {
+			d.splitDropMove(ctx, sandboxID, rootdpb.MoveSide_MOVE_SIDE_IN)
+		} else if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
 			_ = os.RemoveAll(dir)
 		}
 	}
@@ -645,7 +650,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		return nil, fmt.Errorf("load container: %w", err)
 	}
 	// A move's checkpoint of this sandbox is stale once it runs here again.
-	if dir, err := d.moveDir(moveOut, containerRef); err == nil {
+	// In privilege mode split it is the helper's, and only a gVisor
+	// container has one: LoadContainer has just read the record, so its
+	// runtime costs no trip through the gate (splitStaleCheckpoint).
+	if d.helper != nil {
+		d.splitStaleCheckpoint(ctx, container)
+	} else if dir, err := d.moveDir(moveOut, containerRef); err == nil {
 		_ = os.RemoveAll(dir)
 	}
 	task, err := container.Task(ctx, nil)
@@ -938,6 +948,11 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	// helper removes what it made, by the same keys.
 	d.removeContainerFiles(sandbox.ID)
 	d.releaseHelperFiles(ctx, sandbox.ID)
+	// And, in split mode, a gVisor sandbox's move checkpoints, which are
+	// the helper's too (split_moves.go).
+	if d.helper != nil && sandbox.Runtime == models.RuntimeGvisor {
+		d.splitDropMove(ctx, sandbox.ID, rootdpb.MoveSide_MOVE_SIDE_OUT, rootdpb.MoveSide_MOVE_SIDE_IN)
+	}
 	if ref := strings.TrimSpace(sandbox.ContainerID); ref != "" && ref != sandbox.ID {
 		d.removeContainerFiles(ref)
 		d.releaseHelperFiles(ctx, ref)

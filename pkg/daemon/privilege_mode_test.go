@@ -92,6 +92,8 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		func(c *config.Config) {
 			c.ContainerdPoolEnabled, c.EnableNetworkRules, c.ContainerdCgroupParent = true, true, "/kubepods/aerolvm"
 		},
+		// And gVisor checkpoint moves.
+		func(c *config.Config) { c.GvisorCheckpointMoves = true },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -123,10 +125,11 @@ func TestCheckPrivilegeMode(t *testing.T) {
 			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
 		},
 			"warm VM pool", []privmode.Step{privmode.StepFirecrackerWarmPool}},
-		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
 		{"several at once, each named", func(c *config.Config) {
+			wasmSplit(c)
+			c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true
 			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true, true
-		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool, privmode.StepMoves}},
+		}, "Firecracker", []privmode.Step{privmode.StepWasmWarmPool, privmode.StepFirecrackerWarmPool}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()
