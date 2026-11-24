@@ -171,3 +171,128 @@ func TestBackupInSplitTakesALogOnItsOwnDisk(t *testing.T) {
 		}
 	}
 }
+
+// In split the Raft log record is written by sandboxd's user, in its own
+// folder. A record naming a root-only folder, with no SB_RAFT_WAL_DIR in
+// the env files, must not make root archive that folder (a restore would
+// put it in the agent's folder): the backup refuses, and writes nothing.
+func TestBackupInSplitTakesTheLogOnlyFromTheEnv(t *testing.T) {
+	n := newNode(t, "SB_PRIVILEGE_MODE=split\nSB_NODE_ID=node-a\n")
+	makeDB(t, filepath.Join(n.lib, "state.db"), "a")
+	outside := filepath.Join(n.dir, "root-only")
+	write(t, filepath.Join(outside, "shadow"), outsideSecret)
+	write(t, filepath.Join(n.lib, "raft", "raft-stable.bolt"), "stable")
+	write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), outside+"\n")
+	out := filepath.Join(n.dir, "out", "backup.tgz")
+	_, err := Backup(context.Background(), BackupOptions{ConfigDir: n.etc, Output: out, Host: &fakeHost{}})
+	if err == nil || !strings.Contains(err.Error(), "SB_RAFT_WAL_DIR") {
+		t.Fatalf("backup with the agent's record naming %s: %v, want a refusal naming SB_RAFT_WAL_DIR", outside, err)
+	}
+	if exists(out) {
+		t.Fatal("a refused backup left an archive")
+	}
+	// Single follows the record, as before: there, sandboxd is root.
+	single := newNode(t, "SB_NODE_ID=node-a\n")
+	makeDB(t, filepath.Join(single.lib, "state.db"), "a")
+	write(t, filepath.Join(outside, "wal-meta.db"), "meta")
+	write(t, filepath.Join(single.lib, "raft", "raft-stable.bolt"), "stable")
+	write(t, filepath.Join(single.lib, "raft", raftlogdir.LocationFile), outside+"\n")
+	res := single.backup(t, BackupOptions{})
+	if files, _ := readArchive(t, res.Output); files[archiveRaft+"/raft-wal/wal-meta.db"] != "meta" {
+		t.Fatal("single no longer takes the recorded log")
+	}
+}
+
+// A file swapped for a link between the backup's look at it and its read
+// must not land in the archive under the first file's name: inside the
+// config folder (os.Root follows a link that stays in it; the open file is
+// then not the one looked at) or out of it (os.Root refuses the escape).
+func TestBackupInSplitRefusesASwapBetweenLookAndRead(t *testing.T) {
+	const otherSecret = "another file in the config folder"
+	for _, c := range []struct {
+		name   string
+		target func(n node, outside string) string
+	}{
+		// Relative: os.Root follows a link that stays inside (it refuses an
+		// absolute one), so only the same-file check stops this one.
+		{"to a file in the folder", func(_ node, _ string) string { return filepath.Join("..", "other.key") }},
+		{"to a file outside it", func(_ node, outside string) string { return filepath.Join(outside, "secret") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			n := newNode(t, "SB_PRIVILEGE_MODE=split\nSB_NODE_ID=node-a\n")
+			makeDB(t, filepath.Join(n.lib, "state.db"), "a")
+			outside := filepath.Join(n.dir, "root-only")
+			write(t, filepath.Join(outside, "secret"), outsideSecret)
+			write(t, filepath.Join(n.etc, "other.key"), otherSecret)
+			cert := filepath.Join(n.etc, "tls", "node.crt")
+			write(t, cert, "cert")
+			swapped := false
+			testHookBeforeOpen = func(name string) {
+				if name != archiveConfig+"/tls/node.crt" || swapped {
+					return
+				}
+				swapped = true
+				if err := os.Remove(cert); err != nil {
+					t.Error(err)
+				}
+				if err := os.Symlink(c.target(n, outside), cert); err != nil {
+					t.Error(err)
+				}
+			}
+			t.Cleanup(func() { testHookBeforeOpen = nil })
+			out := filepath.Join(n.dir, "out", "backup.tgz")
+			_, err := Backup(context.Background(), BackupOptions{ConfigDir: n.etc, Output: out, Host: &fakeHost{}})
+			if !swapped {
+				t.Fatal("the hook never ran: the test no longer reaches the read")
+			}
+			if err == nil {
+				files, _ := readArchive(t, out)
+				body := files[archiveConfig+"/tls/node.crt"]
+				t.Fatalf("the backup read the swapped file into node.crt (%q); want a refusal", body)
+			}
+		})
+	}
+}
+
+// A folder swapped for a link after the walk listed it, and before the walk
+// went into it, must not lead the walk out of sandboxd's folders: the walk
+// goes through an os.Root, which refuses the escape. (A file's open is
+// checked against its look as well, but a folder is read, not opened.)
+func TestBackupInSplitRefusesAFolderSwappedDuringTheWalk(t *testing.T) {
+	n := newNode(t, "SB_PRIVILEGE_MODE=split\nSB_NODE_ID=node-a\n")
+	makeDB(t, filepath.Join(n.lib, "state.db"), "a")
+	outside := filepath.Join(n.dir, "root-only")
+	write(t, filepath.Join(outside, "secret"), outsideSecret)
+	raft := filepath.Join(n.lib, "raft")
+	write(t, filepath.Join(raft, "a-first"), "listed before snapshots")
+	write(t, filepath.Join(raft, "snapshots", "1-2-3", "state.bin"), "snap")
+	swapped := false
+	testHookBeforeOpen = func(name string) {
+		if name != archiveRaft+"/a-first" || swapped {
+			return
+		}
+		swapped = true
+		snaps := filepath.Join(raft, "snapshots")
+		if err := os.RemoveAll(snaps); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(outside, snaps); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { testHookBeforeOpen = nil })
+	out := filepath.Join(n.dir, "out", "backup.tgz")
+	_, err := Backup(context.Background(), BackupOptions{ConfigDir: n.etc, Output: out, Host: &fakeHost{}})
+	if !swapped {
+		t.Fatal("the hook never ran: the test no longer reaches the walk")
+	}
+	if err != nil {
+		return
+	}
+	files, _ := readArchive(t, out)
+	for name, body := range files {
+		if strings.Contains(body, outsideSecret) {
+			t.Errorf("the walk followed the swapped folder out: %s", name)
+		}
+	}
+}

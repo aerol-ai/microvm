@@ -148,6 +148,15 @@ func (r *Resetter) Run(ctx context.Context, o ResetOptions) error {
 		r.printf("warning: %v\n", err)
 	}
 	tlsDir, caDir, raftDir := env.tlsDir(r.Paths), env.caDir(r.Paths), env.raftDir(r.Paths)
+	// Where the node's Raft log is, before anything is removed: a record
+	// that cannot be trusted stops reset with the node as it was. In
+	// privilege mode split the record is sandboxd's user's to write, so a
+	// log outside the Raft directory comes only from SB_RAFT_WAL_DIR in the
+	// env files (raftlogdir.Trusted).
+	walDir, err := raftlogdir.Trusted(raftDir, env.get("SB_RAFT_WAL_DIR"), strings.EqualFold(env.get("SB_PRIVILEGE_MODE"), "split"))
+	if err != nil {
+		return err
+	}
 	var removed []string
 	for _, path := range []string{
 		r.Paths.ClusterEnv, r.Paths.DropIn,
@@ -165,10 +174,6 @@ func (r *Resetter) Run(ctx context.Context, o ResetOptions) error {
 	// A log SB_RAFT_WAL_DIR put on a disk of its own goes too, first: left
 	// behind, the next start would find a log its Raft directory does not
 	// name, and refuse it.
-	walDir, err := raftlogdir.Recorded(raftDir)
-	if err != nil {
-		return err
-	}
 	if walDir != "" && dirHasEntries(walDir) {
 		if err := removeTree(walDir); err != nil {
 			return err

@@ -124,8 +124,11 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 	// A log SB_RAFT_WAL_DIR put on a disk of its own goes into the archive
 	// where it is by default, raft/raft-wal, and the record naming that disk
 	// stays out: archive names are fixed (see archiveLib), so a restore lands
-	// the default layout.
-	walDir, err := raftlogdir.Recorded(o.RaftDir)
+	// the default layout. In privilege mode split the record is written by
+	// sandboxd's user, so the log's folder comes only from SB_RAFT_WAL_DIR
+	// in the env files, and a record naming another is refused
+	// (raftlogdir.Trusted).
+	walDir, err := raftlogdir.Trusted(o.RaftDir, node.RaftWALDir, node.Split)
 	if err != nil {
 		return res, err
 	}
@@ -486,6 +489,10 @@ func (w *archiveWriter) splitSource(s source) error {
 	})
 }
 
+// testHookBeforeOpen, when set, runs between entry's look at a file and
+// its open: tests swap the file there.
+var testHookBeforeOpen func(name string)
+
 // fileView is how entry reads a path: by name on the host (osView), or
 // inside an os.Root (rootView), which keeps every step in its folder.
 type fileView interface {
@@ -560,6 +567,8 @@ func (w *archiveWriter) entry(v fileView, name, path, content string) error {
 	open, src := v.Open, path
 	if content != "" {
 		open, src = os.Open, content
+	} else if testHookBeforeOpen != nil {
+		testHookBeforeOpen(name)
 	}
 	f, err := open(src)
 	if err != nil {
@@ -572,6 +581,13 @@ func (w *archiveWriter) entry(v fileView, name, path, content string) error {
 	st, err := f.Stat()
 	if err != nil {
 		return err
+	}
+	// In privilege mode split the file read must be the one looked at.
+	// os.Root keeps a swap between the two inside the folder, but a swap
+	// for a link to another file there would put that file in the archive
+	// under this one's name.
+	if w.agentData != "" && content == "" && !os.SameFile(fi, st) {
+		return fmt.Errorf("%s changed between the backup's look at it and its read; run the backup again", name)
 	}
 	hdr.Size = st.Size()
 	var body io.Reader = f

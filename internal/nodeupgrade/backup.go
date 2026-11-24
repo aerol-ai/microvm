@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -55,7 +56,11 @@ func vacuumIntoChecked(ctx context.Context, dbPath, dest string) error {
 		return err
 	}
 	want := filepath.Join(dir, filepath.Base(dbPath))
-	return vacuumInto(ctx, dbPath+"?_busy_timeout=10000", dest, func(opened string) error {
+	// Read-only (mode=ro): a link swapped in after the look must not make
+	// SQLite create a file where it points (its default mode is rwc).
+	// VACUUM INTO reads the database and writes only dest.
+	dsn := "file:" + (&url.URL{Path: dbPath}).EscapedPath() + "?mode=ro&_busy_timeout=10000"
+	return vacuumInto(ctx, dsn, dest, func(opened string) error {
 		if opened != want {
 			return fmt.Errorf("the database %s opened as %s: a link in its place is refused", dbPath, opened)
 		}
