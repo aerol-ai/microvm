@@ -271,6 +271,11 @@ worker:
   # helper takes the checkpoints. A sandbox moves only to a worker of its
   # own privilege mode: while you switch modes, a move to the other mode is
   # refused before anything is saved, and the sandbox keeps running.
+  # Disk, in split: the helper keeps a move's checkpoint and the bundles
+  # staged for restores on containerd's volume (containerdVolume). Staged
+  # bundles alone can take up to SB_ROOTD_MOVE_MAX_STAGED (8) times
+  # SB_ROOTD_MOVE_MAX_BYTES (twice the machine's memory). Size the volume
+  # for that, or lower the two in worker.extraEnv.
   gvisor:
     checkpointMoves: ~
   # The cluster's own addresses (C24). Each entry is an address or a CIDR.

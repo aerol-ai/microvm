@@ -624,7 +624,16 @@ Each is small and stands alone. Together they shrink the root surface now.
       helper trusts a folder only when no one else can write it, and the
       chart cannot know how the kubelet makes it (an emptyDir is open to
       everyone), so the split-folders init container makes it root's, mode
-      0700, before the helper checks it.
+      0700, before the helper checks it. Staged bundles alone can take up
+      to SB_ROOTD_MOVE_MAX_STAGED times SB_ROOTD_MOVE_MAX_BYTES there: the
+      chart's values say to size the volume for it or lower the two.
+    - **A bound is on what is written.** The review found the bundle bound
+      counted the stream's bytes. A tar entry's size on disk is its
+      header's, so movebundle.ReadDir now takes a bound on the bytes it
+      writes, copies exactly each header's size, and refuses sparse
+      entries, which a move never sends. Single mode uses the same reader
+      with no bound, and refuses sparse entries too. runsc's options end
+      with "--" before the sandbox ID, in both modes.
 11. Chart: the agent container as described in 3.3; drop the two-way mounts
     and `shareProcessNamespace`; turn external storage on by default.
     The operator rolls workers to the new template node by node through
