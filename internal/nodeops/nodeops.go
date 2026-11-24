@@ -78,6 +78,11 @@ type Node struct {
 	Split bool
 	// EnvKey reports a non-empty SB_CREDENTIAL_ENCRYPTION_KEY.
 	EnvKey bool
+	// ClusterTLSDir and ClusterCADir are the certificate folders,
+	// SB_CLUSTER_TLS_DIR (empty when unset) and SB_CLUSTER_CA_DIR (with
+	// sandboxd's default): in privilege mode split sandboxd's user owns
+	// them.
+	ClusterTLSDir, ClusterCADir string
 	// Cluster identity; empty on a single node.
 	NodeID      string
 	NodeRole    string
@@ -98,6 +103,11 @@ func ReadNode(configDir string) (Node, error) {
 	if err != nil {
 		return Node{}, err
 	}
+	return nodeFromEnv(configDir, env), nil
+}
+
+// nodeFromEnv is ReadNode's reading of the merged env files.
+func nodeFromEnv(configDir string, env map[string]string) Node {
 	get := func(key, def string) string {
 		if v := strings.TrimSpace(env[key]); v != "" {
 			return v
@@ -121,7 +131,9 @@ func ReadNode(configDir string) (Node, error) {
 	n.RaftDir = get("SB_RAFT_DATA_DIR", filepath.Join(filepath.Dir(n.StateDB), "raft"))
 	n.KeyRing = get("SB_CREDENTIAL_KEY_RING_PATH", n.KeyFile+".ring")
 	n.RaftAddress = get("SB_RAFT_ADVERTISE_ADDR", get("SB_RAFT_BIND_ADDR", ""))
-	return n, nil
+	n.ClusterTLSDir = get("SB_CLUSTER_TLS_DIR", "")
+	n.ClusterCADir = get("SB_CLUSTER_CA_DIR", "/etc/sandboxd/cluster-ca")
+	return n
 }
 
 // readEnv merges the two env files the sandboxd unit loads.

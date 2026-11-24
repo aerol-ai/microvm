@@ -194,6 +194,7 @@ type tarEntry struct {
 	name, body, link string
 	typ              byte
 	mode             int64
+	uid              int
 }
 
 // writeTar makes an archive the way `tar -C root -czf out .` does, or a
@@ -222,7 +223,7 @@ func writeTar(t *testing.T, path string, entries ...tarEntry) {
 				mode = 0o755
 			}
 		}
-		h := &tar.Header{Name: e.name, Typeflag: typ, Mode: mode, Linkname: e.link, ModTime: time.Unix(1700000000, 0)}
+		h := &tar.Header{Name: e.name, Typeflag: typ, Mode: mode, Linkname: e.link, ModTime: time.Unix(1700000000, 0), Uid: e.uid, Gid: e.uid}
 		if typ == tar.TypeReg {
 			h.Size = int64(len(e.body))
 		}
@@ -260,11 +261,13 @@ func TestReadNode(t *testing.T) {
 				"sandboxd.env": "SB_DB_PATH=/data/state.db\nSB_API_PORT=9000\nSB_CREDENTIAL_ENCRYPTION_KEY_PATH=/k/key\n" +
 					"SB_CREDENTIAL_ENCRYPTION_KEY = \"c2VjcmV0\"\r\nSB_NODE_ROLE=Server\n# SB_NODE_ID=commented\n",
 				"cluster.env": "SB_NODE_ID=node-a\nSB_RAFT_BIND_ADDR=0.0.0.0:7000\nSB_RAFT_ADVERTISE_ADDR='10.0.0.5:7000'\n" +
-					"SB_CREDENTIAL_KEY_CUSTODY=Wrapped\nSB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH=/k/w\n",
+					"SB_CREDENTIAL_KEY_CUSTODY=Wrapped\nSB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH=/k/w\n" +
+					"SB_CLUSTER_TLS_DIR=/etc/sandboxd/tls\nSB_CLUSTER_CA_DIR=/ca\n",
 			},
 			want: Node{StateDB: "/data/state.db", RaftDir: "/data/raft", KeyFile: "/k/key", KeyRing: "/k/key.ring",
 				WrappedKey: "/k/w", Custody: "wrapped", EnvKey: true, NodeID: "node-a", NodeRole: "server",
-				RaftAddress: "10.0.0.5:7000", HealthURL: "http://127.0.0.1:9000/health"},
+				RaftAddress: "10.0.0.5:7000", HealthURL: "http://127.0.0.1:9000/health",
+				ClusterTLSDir: "/etc/sandboxd/tls", ClusterCADir: "/ca"},
 		},
 		"explicit raft dir and ring, bind address as the fallback": {
 			env: map[string]string{
@@ -288,6 +291,10 @@ func TestReadNode(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.want.ConfigDir = dir
+			if tc.want.ClusterCADir == "" {
+				// internal/config's default.
+				tc.want.ClusterCADir = "/etc/sandboxd/cluster-ca"
+			}
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("ReadNode =\n%+v\nwant\n%+v", got, tc.want)
 			}

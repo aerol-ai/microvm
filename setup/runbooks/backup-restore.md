@@ -132,6 +132,20 @@ Set `SB_RAFT_WAL_DIR` to the log's folder if they refuse yours.
    backups carried the key file keeps the node's own key file, with a
    warning: that only works for a restore in place.
 
+   The restore writes each file through the folder that holds it, and it
+   follows no symbolic link below `/etc/sandboxd` or `/var/lib/sandboxd`.
+   Those two folders may themselves be links (to another disk). If the node
+   has a link where the backup has a folder, the restore stops and says so:
+   remove the link and run it again.
+
+   In privilege mode split (on this node, or on the node you backed up), the
+   files that land in the `sandboxd` user's folders (`/var/lib/sandboxd`,
+   `tls/` and `cluster-ca/`) stay owned by root, with no group or other
+   access. The next `sandboxd` start gives them to the `sandboxd` user
+   (`aerolvm-rootd agent-folders` runs before each start). Files in root's
+   folders, such as the env files and `secrets/`, keep the owner and mode in
+   the archive.
+
 4. Verify expected files:
 
    ```bash

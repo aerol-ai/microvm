@@ -212,7 +212,7 @@ func TestRestoreReadsTheScriptsArchive(t *testing.T) {
 	write(t, filepath.Join(dst, "etc", "sandboxd", "tls", "current.crt"), "fresh")
 	var chowned []string
 	_, out, err := restore(t, RestoreOptions{Input: archive, TargetRoot: dst, euid: func() int { return 0 },
-		lchown: func(p string, _, _ int) error { chowned = append(chowned, p); return nil }})
+		chown: func(p string, _, _ int) error { chowned = append(chowned, p); return nil }})
 	if err != nil {
 		t.Fatalf("restore: %v\n%s", err, out)
 	}
