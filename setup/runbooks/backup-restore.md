@@ -57,7 +57,11 @@ In privilege mode split, `sandboxd` runs as the `sandboxd` user, which owns
 root, because it reads root's env files. It reads that user's folders without
 following any symbolic link out of them. A link is stored as a link. The
 backup also refuses a `state.db` that is a link, or that SQLite opens as
-another file, and a file that changes between its check and its read.
+another file, and a file that changes between its check and its read. It
+refuses a `state.db`, `-wal`, `-shm` or `-journal` that is not a regular
+file, and it gives up if SQLite cannot open the database within 30 seconds,
+instead of waiting forever. In split the database is read in two passes (a
+page copy, then `VACUUM INTO`), so the copy takes up to about twice as long.
 
 A Raft log on a disk of its own is taken only from `SB_RAFT_WAL_DIR` in the
 env files. The record in the Raft folder that names the log's folder is

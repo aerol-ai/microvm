@@ -205,6 +205,49 @@ func TestSplitNodeRefusesAnUpgradeFolderTheAgentCanWrite(t *testing.T) {
 	r.never("stop sandboxd")
 }
 
+// On a split node sandboxd's user owns the database's folder, so the
+// upgrade's own copy of the database (no Backup given) is
+// VacuumIntoNoFollow: the node's database is copied, and a link in its
+// place is refused before sandboxd's files are touched, not followed to
+// the file it names.
+func TestSplitUpgradeBackupFollowsNoLink(t *testing.T) {
+	for _, link := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the database", true: "a link in its place"}[link], func(t *testing.T) {
+			old := newRelease("v0.7.7")
+			r := splitRig(t, old, nil)
+			r.u.Backup = nil
+			if err := os.Remove(r.paths.DBPath); err != nil {
+				t.Fatal(err)
+			}
+			db := r.paths.DBPath
+			if link {
+				db = filepath.Join(r.dir, "root-only", "other.db")
+				if err := os.Symlink(db, r.paths.DBPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			makeWALDB(t, db, "rows")
+			st, err := r.u.Run(t.Context(), r.from(newRelease("v0.7.8")))
+			if !link {
+				if err != nil || st.BackupPath == "" {
+					t.Fatalf("upgrade: %v, backup %q\n%s", err, st.BackupPath, r.out)
+				}
+				if got := readRows(t, st.BackupPath); strings.Join(got, ",") != "rows" {
+					t.Fatalf("backup rows %v", got)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("err = %v, want the link refused\n%s", err, r.out)
+			}
+			if st.BackupPath != "" {
+				t.Fatalf("backed up through the link: %s", st.BackupPath)
+			}
+			r.assertInstalled(old, old.caddy)
+		})
+	}
+}
+
 func TestHelperFilesGoTogether(t *testing.T) {
 	req := Request{Version: "v0.7.8", SHA256: map[string]string{
 		"sandboxd_linux_amd64": strings.Repeat("a", 64), "toolboxd_linux_amd64": strings.Repeat("b", 64),

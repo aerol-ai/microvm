@@ -769,6 +769,12 @@ func (u *Upgrader) apply(ctx context.Context, st *State, stageDir string, req Re
 		backup := u.Backup
 		if backup == nil {
 			backup = sqliteBackup
+			if u.Paths.Split {
+				// sandboxd's user owns the database's folder: a link or a
+				// FIFO in its place must neither be followed nor hold the
+				// upgrade with sandboxd stopped.
+				backup = VacuumIntoNoFollow
+			}
 		}
 		start := u.now()
 		if err := backup(ctx, u.Paths.DBPath, dest); err != nil {
