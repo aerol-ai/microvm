@@ -190,6 +190,16 @@ func readEnvFile(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	vals, err := ParseEnv(raw)
+	if err != nil {
+		return nil, fmt.Errorf("env file %s: %w", path, err)
+	}
+	return vals, nil
+}
+
+// ParseEnv is readEnvFile for an env file's bytes (one inside a backup
+// archive, say).
+func ParseEnv(raw []byte) (map[string]string, error) {
 	vals := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(raw))
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
@@ -210,7 +220,7 @@ func readEnvFile(path string) (map[string]string, error) {
 		vals[k] = v
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("env file %s: %w", path, err)
+		return nil, err
 	}
 	return vals, nil
 }
