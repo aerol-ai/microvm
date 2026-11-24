@@ -48,3 +48,21 @@ func TestSplitLinkFoldersMatchTheHelper(t *testing.T) {
 		}
 	}
 }
+
+// splitProgramsFor is one tool's lines in internal/rootd's list of the
+// programs each deploy tool gives the root helper for split, which
+// internal/rootd's real-layout test checks on Ubuntu, Debian and Amazon
+// Linux: setting -> path.
+func splitProgramsFor(t *testing.T, tool string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, line := range strings.Split(readRepoFile(t, "internal", "rootd", "testdata", "split_programs.txt"), "\n") {
+		if f := strings.Fields(line); len(f) == 3 && f[0] == tool {
+			out[f[1]] = f[2]
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("internal/rootd/testdata/split_programs.txt lists nothing for %s", tool)
+	}
+	return out
+}

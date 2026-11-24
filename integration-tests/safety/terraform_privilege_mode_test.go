@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,13 +156,14 @@ func TestSplitRunsEveryRuntimeAndRefusesOnlyWhatItCannotRun(t *testing.T) {
 	raw := terraformRun(t, dir, "output", "-json")
 	var outputs map[string]struct {
 		Value struct {
-			Problems   []string        `json:"problems"`
-			KernelPath string          `json:"kernel_path"`
-			JailerUID  json.RawMessage `json:"jailer_uid"`
-			JailerGID  json.RawMessage `json:"jailer_gid"`
-			MkfsBin    string          `json:"mkfs_bin"`
-			RootFiles  []string        `json:"root_files"`
-			AgentDirs  []string        `json:"agent_dirs"`
+			Problems   []string          `json:"problems"`
+			KernelPath string            `json:"kernel_path"`
+			JailerUID  json.RawMessage   `json:"jailer_uid"`
+			JailerGID  json.RawMessage   `json:"jailer_gid"`
+			MkfsBin    string            `json:"mkfs_bin"`
+			RootFiles  []string          `json:"root_files"`
+			AgentDirs  []string          `json:"agent_dirs"`
+			Programs   map[string]string `json:"programs"`
 		} `json:"value"`
 	}
 	if err := json.Unmarshal([]byte(raw), &outputs); err != nil {
@@ -193,6 +195,14 @@ func TestSplitRunsEveryRuntimeAndRefusesOnlyWhatItCannotRun(t *testing.T) {
 			}
 			if c.mode == "split" {
 				splitRootFilesMatchTheHelper(t, got.RootFiles, got.AgentDirs, got.Problems)
+			}
+			// The defaults are what internal/rootd's list of split programs
+			// names for Terraform, which its real-layout test checks on
+			// Ubuntu, Debian and Amazon Linux.
+			if name == "split_every_runtime" {
+				if want := splitProgramsFor(t, "terraform"); !maps.Equal(got.Programs, want) {
+					t.Errorf("Terraform gives the root helper %v for split; internal/rootd/testdata/split_programs.txt lists %v", got.Programs, want)
+				}
 			}
 		})
 	}
@@ -311,6 +321,15 @@ output "jailer_gid" { value = local.firecracker_jailer_gid }
 output "mkfs_bin" { value = local.firecracker_mkfs_bin }
 output "root_files" { value = local.split_root_files }
 output "agent_dirs" { value = local.split_agent_dirs }
+# What nodes.tf hands the bootstrap for the programs the root helper runs.
+output "programs" {
+  value = { for k, v in {
+    SB_JAILER_BINARY         = var.firecracker.jailer_path
+    SB_FIRECRACKER_BINARY    = var.firecracker.binary_path
+    SB_FIRECRACKER_MKFS_BIN  = local.firecracker_mkfs_bin
+    SB_FIRECRACKER_IP_BINARY = var.firecracker.ip_binary
+  } : k => v if v != "" }
+}
 `
 	if check {
 		pre := splitPrecondition(t)

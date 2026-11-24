@@ -2,6 +2,7 @@ package safety
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,6 +185,16 @@ func TestAnsiblePrivilegeChecks(t *testing.T) {
 			// The files root runs or links (SB_FIRECRACKER_BINARY,
 			// SB_JAILER_BINARY, the kernel) against the root helper's own
 			// path rule: the checks refuse exactly when the helper would.
+			// The defaults are what internal/rootd's list of split programs
+			// names for Ansible (its env: SB_FIRECRACKER_BINARY and
+			// SB_JAILER_BINARY, the first two root files), which its
+			// real-layout test checks on Ubuntu, Debian and Amazon Linux.
+			if name == "split_every_runtime" {
+				files := strings.Split(r[2], ",")
+				if len(files) < 2 || !maps.Equal(map[string]string{"SB_FIRECRACKER_BINARY": files[0], "SB_JAILER_BINARY": files[1]}, splitProgramsFor(t, "ansible")) {
+					t.Errorf("Ansible gives the root helper %q for split; internal/rootd/testdata/split_programs.txt lists %v", files, splitProgramsFor(t, "ansible"))
+				}
+			}
 			if c.set["privilege_mode"] == "split" && slices.Contains([]string{"", aClean, aRootFiles, aLinks}, r[1]) {
 				var refused []string
 				for _, f := range strings.Split(r[2], ",") {

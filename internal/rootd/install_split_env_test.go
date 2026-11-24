@@ -2,6 +2,7 @@ package rootd
 
 import (
 	"bytes"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -172,8 +173,8 @@ func TestInstallShSplitWithIsolatesAndFirecrackerLoadsIntoTheHelper(t *testing.T
 	// rule the deploy tools share (CheckRootProgramPath), with sandboxd's
 	// folders as install.sh lays them out.
 	programs := RootPrograms(cfg)
-	if len(programs) < 4 {
-		t.Fatalf("the helper runs %v from install.sh's settings; want workerd, the jailer, firecracker and mkfs.ext4", programs)
+	if want := splitPrograms(t)["install.sh"]; !maps.Equal(programs, want) {
+		t.Fatalf("the helper runs %v from install.sh's settings; %s lists %v", programs, splitProgramsFile, want)
 	}
 	agentDirs := []string{"/var/lib/sandboxd", "/run/sandboxd", "/run/aerolvm-procid", "/etc/sandboxd/tls", "/etc/sandboxd/cluster-ca"}
 	for setting, p := range programs {

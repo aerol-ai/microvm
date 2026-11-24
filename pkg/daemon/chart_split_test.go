@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,6 +325,26 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 	}
 }
 
+// splitProgramsFor is one tool's lines in internal/rootd's list of the
+// programs the deploy tools give the root helper for split: setting -> path.
+func splitProgramsFor(t *testing.T, tool string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "rootd", "testdata", "split_programs.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if f := strings.Fields(line); len(f) == 3 && f[0] == tool {
+			out[f[1]] = f[2]
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("internal/rootd/testdata/split_programs.txt lists nothing for %s", tool)
+	}
+	return out
+}
+
 // agentImageGroups are the groups the agent image's /etc/group lists for
 // the user its /etc/passwd names uid: the groups a container running the
 // image as uid gets besides its own (containerd and CRI-O read them from
@@ -627,11 +648,11 @@ func TestChartSplitHosts(t *testing.T) {
 					agentDirs = append(agentDirs, m.path)
 				}
 			}
+			// They are what internal/rootd's list of split programs names for
+			// the chart, which its real-layout test checks on real distributions.
 			programs := rootd.RootPrograms(cfg)
-			for _, k := range []string{"SB_ISOLATE_WORKERD_PATH", "SB_ROOTD_RUNSC"} {
-				if programs[k] == "" {
-					t.Errorf("the helper runs no %s here: %v", k, programs)
-				}
+			if want := splitProgramsFor(t, "chart"); !maps.Equal(programs, want) {
+				t.Errorf("the helper runs %v from the chart's settings; internal/rootd/testdata/split_programs.txt lists %v", programs, want)
 			}
 			for k, p := range programs {
 				if err := rootd.CheckRootProgramPath(p, agentDirs); err != nil {
