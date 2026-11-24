@@ -458,8 +458,9 @@ type keyedLock struct {
 }
 
 // lock takes key's lock and returns its release, or the call's context
-// error once ctx ends first. A nil keyedLocks (a helper value built by
-// hand in a test) locks nothing.
+// error when ctx has ended by the time the lock is free: a call holds the
+// lock only with its context live. A nil keyedLocks (a helper value built
+// by hand in a test) locks nothing.
 func (k *keyedLocks) lock(ctx context.Context, key string) (unlock func(), err error) {
 	if k == nil {
 		return func() {}, nil
@@ -484,10 +485,25 @@ func (k *keyedLocks) lock(ctx context.Context, key string) (unlock func(), err e
 	}
 	select {
 	case l.ch <- struct{}{}:
-		return func() {
+		unlock := func() {
 			<-l.ch
 			leave()
-		}, nil
+		}
+		// When the lock comes free as the caller gives up, both cases are
+		// ready and select picks one at random, so a call its caller gave
+		// up on could still take the lock and run. It must not: the agent
+		// acts on the give-up. A split warm claim whose lift timed out puts
+		// the slot's block back next (splitClaimFinish); a lift that took
+		// the lock after that block would open the slot again. The agent's
+		// give-up reaches this server before its next call does, so a call
+		// whose context is still live here was not given up first. That
+		// order holds within one helper process: during a helper swap the
+		// old and the new process do not share these locks (as before).
+		if ctx.Err() != nil {
+			unlock()
+			return nil, ctxError(ctx)
+		}
+		return unlock, nil
 	case <-ctx.Done():
 		leave()
 		return nil, ctxError(ctx)

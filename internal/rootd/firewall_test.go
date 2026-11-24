@@ -1,9 +1,11 @@
 package rootd
 
 import (
+	"context"
 	"errors"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,5 +226,95 @@ func TestNodeGuardBoundIsSingleModes(t *testing.T) {
 	}
 	if got := fw.recorded(); len(got) != 1 {
 		t.Fatalf("calls %q, want the one allowed guard", got)
+	}
+}
+
+// waitWaiters waits until key's lock has n holders and waiters.
+func waitWaiters(t *testing.T, k *keyedLocks, key string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		k.mu.Lock()
+		got := 0
+		if l := k.m[key]; l != nil {
+			got = l.waiters
+		}
+		k.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock %s has %d holders and waiters, want %d", key, got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSandboxRulesGivenUpChangesNothing (#1437 review): a rules call its
+// caller gave up on while it waited for the address's lock changes
+// nothing, also when the lock comes free just as it gives up. A split
+// warm claim whose lift timed out puts the slot's block back next; the
+// lift must not land after that block and open the slot again.
+func TestSandboxRulesGivenUpChangesNothing(t *testing.T) {
+	r, c, _, fw := sandboxRig(t)
+	ctx := callCtx(t)
+	if _, err := c.RealizeNetns(ctx, &rootdpb.RealizeNetnsRequest{NetnsName: "sb-1"}); err != nil {
+		t.Fatal(err)
+	}
+	const ip = "10.88.0.2"
+	lift := &rootdpb.SandboxRulesRequest{ContainerIp: ip, Op: rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_LIFT_BLOCK_EGRESS}
+	block := &rootdpb.SandboxRulesRequest{ContainerIp: ip, Op: rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_BLOCK_EGRESS}
+	lifted := func() bool {
+		return slices.ContainsFunc(fw.recorded(), func(c string) bool {
+			return strings.HasPrefix(c, rootdpb.SandboxRulesOp_SANDBOX_RULES_OP_LIFT_BLOCK_EGRESS.String())
+		})
+	}
+	locks, key := r.srv.fw.locks, addrKey(ip)
+
+	// Another call holds the address's lock; the lift's deadline passes
+	// while it waits. Then the lock comes free and the block goes back.
+	unlock, err := locks.lock(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.SandboxRules(lctx, lift)
+		done <- err
+	}()
+	waitWaiters(t, locks, key, 2)
+	wantCode(t, <-done, codes.DeadlineExceeded)
+	waitWaiters(t, locks, key, 1) // the helper's side gave up too
+	unlock()
+	if _, err := c.SandboxRules(ctx, block); err != nil {
+		t.Fatal(err)
+	}
+	if lifted() {
+		t.Fatalf("a lift its caller gave up on ran: %q", fw.recorded())
+	}
+
+	// The lock is free as the caller gives up: both of the wait's ends
+	// are ready at once, and select alone takes the lock about half the
+	// time. Every such call must still change nothing.
+	gone, cancelGone := context.WithCancel(context.Background())
+	cancelGone()
+	for i := 0; i < 64; i++ {
+		_, err := r.srv.fw.sandboxRules(gone, lift)
+		wantCode(t, asStatus(err), codes.Canceled)
+	}
+	if lifted() {
+		t.Fatalf("a lift whose caller had gone took the free lock and ran: %q", fw.recorded())
+	}
+	if n := locks.held(); n != 0 {
+		t.Fatalf("%d locks left held", n)
+	}
+	// A call with a live context still runs: the block always goes back.
+	if _, err := c.SandboxRules(ctx, block); err != nil {
+		t.Fatal(err)
+	}
+	if got := fw.recorded(); got[len(got)-1] != "SANDBOX_RULES_OP_BLOCK_EGRESS 10.88.0.2 [] []" {
+		t.Fatalf("calls %q, want the block last", got)
 	}
 }

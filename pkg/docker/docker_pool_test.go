@@ -13,6 +13,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,6 +296,8 @@ type poolFakeDaemon struct {
 	rename       func() *http.Response
 	update       func() *http.Response
 	listJSON     func() *http.Response
+	// remove answers a container removal; nil answers 204.
+	remove       func(*http.Request) (*http.Response, error)
 	pullCalls    int
 	createBodies [][]byte
 	updateBodies [][]byte
@@ -364,6 +367,9 @@ func (d *poolFakeDaemon) transport() roundTripFunc {
 			return textResponse(http.StatusOK, ""), nil
 		case r.Method == http.MethodDelete && strings.HasPrefix(p, "/containers/"):
 			d.removeCalls++
+			if d.remove != nil {
+				return d.remove(r)
+			}
 			return textResponse(http.StatusNoContent, ""), nil
 		}
 		return textResponse(http.StatusNotFound, "no such endpoint: "+r.Method+" "+p), nil
@@ -508,6 +514,73 @@ func TestTryWarmAdoptFailureReleasesReservation(t *testing.T) {
 	if poolStage == nil || poolStage.Desc != "adopt_failed" {
 		t.Fatalf("docker_pool stage = %+v, want desc=adopt_failed", poolStage)
 	}
+}
+
+// TestTryWarmAdoptFailureTeardownOutlivesTheCreate: a client that hangs up
+// mid-adopt cancels the create's context; the failed adopt's removal still
+// runs, on a context of its own with a bound, like the engine's would
+// (a cancelled request never reaches it). When the removal fails anyway,
+// the slot goes to the pool's retry list, still charged, and the pool's
+// retry removes it and releases the reservation once.
+func TestTryWarmAdoptFailureTeardownOutlivesTheCreate(t *testing.T) {
+	key := dockerpool.KeyFromRequest(models.CreateSandboxRequest{Image: "alpine:3.20"}, models.RuntimeDocker)
+	rig := func(t *testing.T, remove func(*http.Request) (*http.Response, error)) (*Client, *poolFakeDaemon, *dockerpool.Pool, *[]string) {
+		d := &poolFakeDaemon{t: t, remove: remove}
+		c := newPoolClient(t, d, nil)
+		pool := dockerpool.New(slogDefault())
+		released := &[]string{}
+		pool.SetParkReleaser(func(slotID string) { *released = append(*released, slotID) })
+		pool.SetSpawner(&PoolSpawner{Client: c})
+		c.SetWarmPool(pool)
+		pool.RecordLoaded(&dockerpool.ParkedSlot{ID: "park-fail", ContainerID: "cid-park", ImageID: "sha256:img1", Key: key, Handle: badParkHandle{}})
+		return c, d, pool, released
+	}
+
+	t.Run("the create is cancelled", func(t *testing.T) {
+		var deadline time.Duration
+		c, d, pool, released := rig(t, func(r *http.Request) (*http.Response, error) {
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+			if dl, ok := r.Context().Deadline(); ok {
+				deadline = time.Until(dl)
+			}
+			return textResponse(http.StatusNoContent, ""), nil
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := c.tryWarmAdopt(ctx, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-1", "tok", nil, models.RuntimeDocker); err == nil {
+			t.Fatal("expected adopt failure")
+		}
+		if d.removeCalls != 1 || deadline <= 0 || deadline > claimTeardownTimeout {
+			t.Fatalf("removals %d, deadline %v: want one removal within %v", d.removeCalls, deadline, claimTeardownTimeout)
+		}
+		if n, _ := pool.PendingDestroys(); n != 0 || !slices.Equal(*released, []string{"park-fail"}) {
+			t.Fatalf("pending %d, released %v: want none pending, park-fail released once", n, *released)
+		}
+	})
+
+	t.Run("the removal fails", func(t *testing.T) {
+		var refuse atomic.Bool
+		refuse.Store(true)
+		c, d, pool, released := rig(t, func(*http.Request) (*http.Response, error) {
+			if refuse.Load() {
+				return textResponse(http.StatusInternalServerError, "engine busy"), nil
+			}
+			return textResponse(http.StatusNoContent, ""), nil
+		})
+		if _, err := c.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-1", "tok", nil, models.RuntimeDocker); err == nil {
+			t.Fatal("expected adopt failure")
+		}
+		if n, _ := pool.PendingDestroys(); n != 1 || len(*released) != 0 {
+			t.Fatalf("pending %d, released %v: want the slot kept, still charged", n, *released)
+		}
+		refuse.Store(false)
+		pool.Close() // tries each kept teardown once more, now
+		if n, _ := pool.PendingDestroys(); n != 0 || !slices.Equal(*released, []string{"park-fail"}) || d.removeCalls != 2 {
+			t.Fatalf("pending %d, released %v, removals %d: want the retry to remove it and release once", n, *released, d.removeCalls)
+		}
+	})
 }
 
 // TestTryWarmAdoptRenameConflictReturnsSlot: a duplicate-create rename
