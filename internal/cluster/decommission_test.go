@@ -468,6 +468,115 @@ func TestEvacuateNodeRetriesAPassingFailureUntilTheDeadline(t *testing.T) {
 	if err != nil || res.RemainingMovable != 0 || res.Stopped != 1 || target.countCalls("import ") != 5 {
 		t.Fatalf("pass after the deadline = %+v %v, imports %d", res, err, target.countCalls("import "))
 	}
+
+	// Uncordoned, the node keeps its sandboxes, and a later decommission
+	// of it starts fresh: the give-up does not carry over.
+	if err := c.SetNodeDrainState(ctx, c.nodeID, false); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := c.fsm.get("sb-vm")
+	if why := c.unmovableReason(c.nodeID, p); why != "" {
+		t.Fatalf("still given up after an uncordon: %q", why)
+	}
+	applyDrain(t, c, c.nodeID)
+	res, err = c.EvacuateNode(ctx, c.nodeID, EvacuateRequest{})
+	if err != nil || res.RemainingMovable != 1 || target.countCalls("import ") != 6 {
+		t.Fatalf("a later decommission = %+v %v, imports %d", res, err, target.countCalls("import "))
+	}
+}
+
+// Review of #1435: a move that outlasts the pass. The evacuate route gives
+// a pass 5 minutes, but a VM's import may take 15, and every pass past the
+// deadline tried the same first 8 sandboxes. When the pass ran out of its
+// own time, the give-up read it as a caller that went away, so the slow
+// move was never given up and the decommission never ended; one slow move
+// also held back the give-up of every other failed move in its batch. Now
+// the pass cuts its moves itself, a little before its caller's deadline,
+// judges each failed move on its own, and still stops them in the same
+// pass. Only a caller that went away is not a try.
+func TestEvacuateNodeGivesUpAMoveThatOutlastsThePass(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	for _, tc := range []struct {
+		name string
+		raft string
+		// hold is how long sb-vm's import runs; pastCtx: whatever its
+		// context says.
+		hold    time.Duration
+		pastCtx bool
+		// pass is the caller's context for the deadline pass.
+		pass       func() (context.Context, context.CancelFunc)
+		wantGiveUp bool
+	}{
+		{
+			name: "the pass's own budget cuts a slow import", raft: "ldr-bound-own", hold: time.Minute,
+			pass: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 500*time.Millisecond)
+			},
+			wantGiveUp: true,
+		},
+		{
+			name: "the evacuate route's bound ends the pass mid-move", raft: "ldr-bound-route", hold: 400 * time.Millisecond, pastCtx: true,
+			pass: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeoutCause(context.Background(), 300*time.Millisecond, ErrEvacuatePassTimeout)
+			},
+			wantGiveUp: true,
+		},
+		{
+			// The reviewer's repro: a plain deadline, a move that ignores it.
+			name: "a caller's deadline ends the pass mid-move", raft: "ldr-bound-plain", hold: 400 * time.Millisecond, pastCtx: true,
+			pass: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 300*time.Millisecond)
+			},
+			wantGiveUp: true,
+		},
+		{
+			name: "the caller goes away mid-move: not a try", raft: "ldr-bound-gone", hold: time.Minute,
+			pass: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(100*time.Millisecond, cancel)
+				return ctx, cancel
+			},
+			wantGiveUp: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, source, target, cleanup := snapshotMovePair(t, tc.raft)
+			defer cleanup()
+			// A second sandbox in the same batch, whose import fails at once.
+			placeFirecracker(t, c, "sb-fast", c.nodeID, models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 128})
+			target.importHold = map[string]time.Duration{"sb-vm": tc.hold, "sb-fast": time.Millisecond}
+			target.holdPastCtx = tc.pastCtx
+			target.importErr = errors.New("disk full")
+
+			ctx, cancel := tc.pass()
+			defer cancel()
+			start := time.Now()
+			res, err := c.EvacuateNode(ctx, c.nodeID, EvacuateRequest{StopRemaining: true})
+			if took := time.Since(start); took > 5*time.Second {
+				t.Fatalf("the pass took %s", took)
+			}
+			if !tc.wantGiveUp {
+				// Not a try: both stay movable for the next pass, nothing stopped.
+				if res.RemainingMovable != 2 || res.Stopped != 0 || len(source.stopped) != 0 {
+					t.Fatalf("pass = %+v %v, stopped %v", res, err, source.stopped)
+				}
+				return
+			}
+			if err != nil || res.RemainingMovable != 0 || res.Remaining != 2 || res.Stopped != 2 {
+				t.Fatalf("pass = %+v %v", res, err)
+			}
+			for _, id := range []string{"sb-fast", "sb-vm"} {
+				if !strings.Contains(res.Failed[id], "past the deadline") {
+					t.Fatalf("%s failed %q", id, res.Failed[id])
+				}
+			}
+			if strings.Join(source.stopped, ",") != "sb-fast,sb-vm" {
+				t.Fatalf("stopped %v, want both in the same pass", source.stopped)
+			}
+		})
+	}
 }
 
 // A gVisor checkpoint goes only to a worker of the source's privilege
@@ -595,6 +704,81 @@ func TestDecommissionMemory(t *testing.T) {
 	c.keepDecommission("n-never", nil)
 	if len(c.moves.decom) != 0 {
 		t.Fatalf("a deleted node is still remembered: %v", c.moves.decom)
+	}
+}
+
+// A pass cuts its moves at its budget, or a little before its caller's
+// deadline, keeping back at most a fifth of the caller's time.
+func TestPassMovesDeadline(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	at := func(d time.Duration) context.Context {
+		ctx, cancel := context.WithDeadline(context.Background(), now.Add(d))
+		t.Cleanup(cancel)
+		return ctx
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want time.Duration
+	}{
+		{"no caller deadline: the budget", context.Background(), evacuateMovesBudget},
+		{"the evacuate route's 5 minutes", at(5 * time.Minute), 5*time.Minute - evacuateWrapUp},
+		{"a long caller deadline: the budget", at(time.Hour), evacuateMovesBudget},
+		{"a short one keeps a fifth back", at(time.Second), 800 * time.Millisecond},
+		{"one already past", at(-time.Second), -time.Second},
+	} {
+		if got := passMovesDeadline(tc.ctx, now).Sub(now); got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPassTried(t *testing.T) {
+	live := context.Background()
+	own, cancelOwn := context.WithTimeoutCause(context.Background(), time.Nanosecond, ErrEvacuatePassTimeout)
+	defer cancelOwn()
+	plain, cancelPlain := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelPlain()
+	gone, cancelGone := context.WithCancel(context.Background())
+	cancelGone()
+	<-own.Done()
+	<-plain.Done()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want bool
+	}{
+		{"a live pass", live, true},
+		{"out of the pass's own time", own, true},
+		{"a caller's own deadline", plain, true},
+		{"a caller that went away", gone, false},
+	} {
+		if got := passTried(tc.ctx); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// An uncordon, proposed on the leader, drops what it remembers of the
+// node's decommission; nothing else does.
+func TestForgetUncordoned(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cmd    command
+		forget bool
+	}{
+		{"uncordon", command{Op: opSetNodeDrainState, NodeID: " n1 ", Drained: false}, true},
+		{"cordon", command{Op: opSetNodeDrainState, NodeID: "n1", Drained: true}, false},
+		{"another node", command{Op: opSetNodeDrainState, NodeID: "n2"}, false},
+		{"another op", command{Op: opReassign, NodeID: "n1"}, false},
+	} {
+		c := &Cluster{}
+		p := Placement{SandboxID: "sb-a", IncarnationID: "inc-1"}
+		c.markUnmovable("n1", p, "its move past the deadline failed")
+		c.forgetUncordoned(tc.cmd)
+		if forgot := c.unmovableReason("n1", p) == ""; forgot != tc.forget {
+			t.Errorf("%s: forgot %v, want %v", tc.name, forgot, tc.forget)
+		}
 	}
 }
 

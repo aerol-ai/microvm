@@ -60,11 +60,20 @@ import (
 //     leader remembers that for the decommission; a new leader asks again;
 //   - the deadline passed and its move failed: past the deadline every
 //     sandbox gets one more try, and one that fails it is stopped with the
-//     rest. Before the deadline a failure is retried every pass.
+//     rest. Before the deadline a failure is retried every pass. A move
+//     that runs out of the pass's own time (passMovesDeadline) has had its
+//     try too; only one whose caller went away has not.
 //
 // Without that, a sandbox that was counted as movable but never moved kept
 // RemainingMovable above zero, and the operator, which ends a decommission
 // past its deadline only once nothing movable is left, never ended it.
+
+// ErrEvacuatePassTimeout is the cause of a pass's context that ran out of
+// the pass's own time: its moves' budget (passMovesDeadline), or the
+// evacuate route's bound. A move cut by it had its try, so past the
+// deadline it is given up (passTried). A caller that went away
+// (context.Canceled) is not a try: the next pass tries again.
+var ErrEvacuatePassTimeout = errors.New("cluster: the evacuate pass ran out of its time")
 
 // MoveHandler is the worker's half, which the leader calls on a peer over
 // its internal route and on itself directly. *service.Service implements
@@ -119,6 +128,13 @@ const (
 	// prepareMoveTimeout bounds the target's image pull. A slower pull is
 	// left to the recreate: the move goes on without it.
 	prepareMoveTimeout = 90 * time.Second
+	// evacuateMovesBudget bounds a pass's moves when its caller sets no
+	// deadline: a little under the evacuate route's 5 minutes.
+	evacuateMovesBudget = 4*time.Minute + 30*time.Second
+	// evacuateWrapUp is what a pass keeps back from its caller's deadline
+	// after the moves, for the notice, the deadline stop and the count (at
+	// most a fifth of the time the caller gave).
+	evacuateWrapUp = 30 * time.Second
 	// moveStepTimeout bounds the release call to the source.
 	moveStepTimeout = 30 * time.Second
 	// MoveSuffix is the worker's internal move route: POST
@@ -428,7 +444,12 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 	sort.Slice(movable, func(i, j int) bool { return movable[i].p.SandboxID < movable[j].p.SandboxID })
 
 	// Moves run side by side: the slow part is each target's image pull.
+	// They get the pass's time less its wrap-up, so a move that runs long (a
+	// VM's import may take 15 minutes) is cut by the pass itself, and the
+	// notice, the deadline stop and the count still fit in this pass.
 	batch := movable[:min(limit, len(movable))]
+	mctx, cancelMoves := context.WithDeadlineCause(ctx, passMovesDeadline(ctx, time.Now()), ErrEvacuatePassTimeout)
+	defer cancelMoves()
 	type outcome struct {
 		p   Placement
 		err error
@@ -443,7 +464,7 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 			if e.kind == evacuateSnapshot {
 				move = c.moveSnapshotOne
 			}
-			results <- outcome{p: e.p, err: move(ctx, e.p, source)}
+			results <- outcome{p: e.p, err: move(mctx, e.p, source)}
 		}(e)
 	}
 	wg.Wait()
@@ -465,9 +486,10 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 			c.logger.Info("cluster: decommission: a sandbox cannot move; it stops at the deadline", "node_id", nodeID, "sandbox_id", id, "err", o.err)
 			notMoved(id, refused.Error())
 			stays(o.p)
-		case req.StopRemaining && ctx.Err() == nil:
+		case req.StopRemaining && passTried(ctx):
 			// Its last try, past the deadline, failed: it stops now with the
-			// rest. A pass cut short by its caller (ctx) is not a try.
+			// rest. Each failed move of the batch is judged on its own, so a
+			// slow one does not hold back the others.
 			why := "its move past the deadline failed: " + o.err.Error()
 			c.markUnmovable(nodeID, o.p, why)
 			decommissionMoves.Add("given_up", 1)
@@ -519,11 +541,47 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 			res.Remaining++
 		}
 	}
-	c.keepDecommission(nodeID, owned)
+	if c.fsm.isNodeDrained(nodeID) {
+		c.keepDecommission(nodeID, owned)
+	} else {
+		// Uncordoned while this pass ran: what it learned is not carried
+		// into a later decommission (forgetUncordoned).
+		c.keepDecommission(nodeID, nil)
+	}
 	res.Done = res.RemainingMovable == 0 && res.Remaining == 0
 	c.logger.Info("cluster: decommission pass", "node_id", nodeID, "moved", len(res.Moved), "failed", len(res.Failed),
 		"remaining_movable", res.RemainingMovable, "remaining", res.Remaining, "stopped", res.Stopped)
 	return res, nil
+}
+
+// passMovesDeadline is when a pass started at now cuts its moves: its
+// budget, or its caller's deadline less the wrap-up, whichever is first.
+func passMovesDeadline(ctx context.Context, now time.Time) time.Time {
+	d := now.Add(evacuateMovesBudget)
+	if dl, ok := ctx.Deadline(); ok {
+		if t := dl.Add(-min(evacuateWrapUp, max(dl.Sub(now)/5, 0))); t.Before(d) {
+			d = t
+		}
+	}
+	return d
+}
+
+// passTried reports whether a move that failed in a pass run under ctx had
+// its try: ctx is still live (the moves' own budget may have cut it), or it
+// ran out of time (ErrEvacuatePassTimeout, or any deadline: the pass's time
+// is up either way). Not when the caller went away: a cancel.
+func passTried(ctx context.Context) bool {
+	return !errors.Is(ctx.Err(), context.Canceled)
+}
+
+// forgetUncordoned drops this leader's decommission memory of a node being
+// uncordoned, so a later decommission of it starts fresh: its owners are
+// told again, and no sandbox is given up for an earlier deadline. The
+// leader calls it for every proposal it applies, its own or forwarded.
+func (c *Cluster) forgetUncordoned(cmd command) {
+	if cmd.Op == opSetNodeDrainState && !cmd.Drained {
+		c.keepDecommission(strings.TrimSpace(cmd.NodeID), nil)
+	}
 }
 
 // evacuation is how a decommission pass treats one sandbox.

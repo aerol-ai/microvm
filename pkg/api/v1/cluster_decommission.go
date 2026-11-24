@@ -17,8 +17,10 @@ import (
 const clusterEvacuateLeaderHeader = "X-Cluster-Evacuate-Leader"
 
 // evacuateTimeout bounds one pass: up to maxEvacuateMoves moves side by
-// side, each a pre-pull (cluster.prepareMoveTimeout) then a release.
-const evacuateTimeout = 5 * time.Minute
+// side, each a pre-pull (cluster.prepareMoveTimeout) then a release. The
+// pass cuts its own moves a little before it (cluster.EvacuateNode), so
+// the deadline stop still fits. A var for tests.
+var evacuateTimeout = 5 * time.Minute
 
 // clusterEvacuateNode runs one decommission pass over {id} (C9,
 // internal/cluster/decommission.go). The leader runs it; any other server
@@ -42,7 +44,9 @@ func (h *handlers) clusterEvacuateNode(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), evacuateTimeout)
+		// The bound is the pass's own time, not its caller going away: a
+		// move it cuts past the deadline had its try (ErrEvacuatePassTimeout).
+		ctx, cancel := context.WithTimeoutCause(r.Context(), evacuateTimeout, cluster.ErrEvacuatePassTimeout)
 		defer cancel()
 		res, err := ev.EvacuateNode(ctx, id, req)
 		switch {

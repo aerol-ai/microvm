@@ -36,6 +36,11 @@ type fakeSnapshotMoves struct {
 	// dropLifetimes and startLifetimes are the lifetimes each drop and
 	// start named, in order.
 	dropLifetimes, startLifetimes []string
+	// importHold holds a sandbox's import this long, or until its context
+	// ends, as an import over the network does; with holdPastCtx it holds
+	// the whole time whatever the context says.
+	importHold  map[string]time.Duration
+	holdPastCtx bool
 }
 
 func (f *fakeSnapshotMoves) note(s string) {
@@ -68,13 +73,27 @@ func (f *fakeSnapshotMoves) countCalls(prefix string) int {
 	return n
 }
 
-func (f *fakeSnapshotMoves) ImportMove(_ context.Context, id, source string, rc *MoveRecreate) error {
+func (f *fakeSnapshotMoves) ImportMove(ctx context.Context, id, source string, rc *MoveRecreate) error {
 	f.note("import " + id + " from " + source)
 	f.mu.Lock()
 	f.importRecreate = rc
+	hold := f.importHold[id]
 	f.mu.Unlock()
 	if f.duringImport != nil {
 		f.duringImport()
+	}
+	if hold > 0 {
+		t := time.NewTimer(hold)
+		defer t.Stop()
+		done := ctx.Done()
+		if f.holdPastCtx {
+			done = nil
+		}
+		select {
+		case <-t.C:
+		case <-done:
+			return ctx.Err()
+		}
 	}
 	return f.importErr
 }
