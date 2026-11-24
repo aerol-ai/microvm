@@ -77,7 +77,7 @@ namespaces.
 | `preflight` (runs first) | user 65532 | None; read-only root disk | Checks the machine: cgroup v2, kernel 5.10 or later, `br_netfilter` |
 | `setup` (runs second) | root | None: not privileged, all capabilities dropped, read-only root disk; mounts only the node's settings and state folders, and its token for the operator | Gets the node's one-time join token from the operator and writes the node's cluster files with it |
 | `runtime` | root | **privileged** | Runs AerolVM's own containerd and gVisor, which build sandboxes |
-| `agent` | root | **privileged** | Runs `sandboxd`, which makes each sandbox's network and cgroup |
+| `agent` | root; in `split`, user 65531 | **privileged**; in `split`, none ([below](#privilege-mode-split-an-agent-with-no-rights)) | Runs `sandboxd`, which reads every API request. In `single` it also makes each sandbox's network and cgroup |
 | `egress` | starts as root, drops to user 65532 | `NET_ADMIN` and `NET_BIND_SERVICE` only (it gets `SETUID`, `SETGID` and `SETPCAP` just to hand itself over); read-only root disk | The hostname-filtering egress gateway for sandboxes |
 | `edge` (with the edge on) | user 65532 | None; read-only root disk | Caddy, for HTTPS sandbox links |
 
@@ -111,7 +111,8 @@ We measured the alternatives on Amazon Linux 2023 and Bottlerocket:
   no longer give each sandbox its own CPU and memory limit.
 
 So `privileged: true` stays, limited to these two containers, in this one
-namespace, on machines that run nothing else.
+namespace, on machines that run nothing else. With `privilegeMode: split`,
+only `runtime` is privileged (below).
 
 **Inside the privileged pod, every sandbox is fenced again.** Each sandbox
 runs under gVisor by default (a second kernel between its code and the
@@ -126,10 +127,10 @@ envelope.
 `privilegeMode: split` (default `single`) takes the rights away from the
 container that reads every API request. The root work moves to a small root
 helper, `aerolvm-rootd`, in the `runtime` container, which is privileged in
-both modes. The `agent` asks it over one Unix socket; the helper lets in only
-the agent's uid, and checks every request against fixed rules before it acts
-(containerd writes included: the `agent` reaches containerd only through the
-helper).
+both modes. The `agent` asks it over one Unix socket. The helper lets in only
+the agent's uid, and checks every request against fixed rules before it acts.
+That includes containerd writes: the `agent` reaches containerd only through
+the helper.
 
 | Container | `single` | `split` |
 |---|---|---|
@@ -169,16 +170,16 @@ container starts as root.
 | `workerd` (V8 isolates) | not mounted | the `workerd` init container writes; `runtime`: read only | the helper reads `workerd`'s libraries and copies it into the jails' base |
 
 What split does not run yet, refused by name at `helm install`:
-Firecracker. `sandboxd` itself runs Firecracker in split, its VM pool
-included (M1 PR 18); the chart refuses it because it does not wire
-Firecracker into a split pod yet, and no live run has proven it there.
+Firecracker. On VM installs `sandboxd` runs Firecracker in split, its VM
+pool included. The chart refuses it because it does not wire Firecracker
+into a split pod yet, and no live run has proven it there.
 
 WASM and V8-isolate sandboxes run in split. The helper starts their hosts
 in the `runtime` container, WASM workers as their own user (61000) and
 `workerd` in its jail, so they outlive an `agent` restart with no process
 namespace shared. With WASM on, the deny floor (the Kubernetes API
 server's addresses) reaches the `runtime` container too, where the helper
-keeps the WASM workers' network fence. Since M1 PR 13 split also runs the
+keeps the WASM workers' network fence. Split also runs the
 container warm pool, the kubectl API's warm pools and gVisor moves with
 memory (`worker.gvisor.checkpointMoves` stays off by default in split). A
 gVisor sandbox moves only between workers of one privilege mode.
@@ -191,9 +192,10 @@ What is proven so far, and how:
   start, that a new refusal in `sandboxd` fails the build until the chart
   refuses it too, that a split worker renders a pod `sandboxd` starts in,
   and that the helper reads the same settings the agent does.
-- **The helper and the gate.** The broken-agent suite in the repository
-  sends the helper and the containerd gate the requests a compromised agent
-  would, and checks each is refused (plan §3.6).
+- **The helper and the gate.** Tests in the repository send the helper
+  and the containerd gate the requests a broken agent could send, and
+  check each is refused. They are listed by name in
+  [Requests the helper and the gate refuse](#requests-the-helper-and-the-gate-refuse).
 - **On kind** (`integration-tests/k8s/split.sh`, on Docker Desktop, kernel
   5.10, 2026-11-23): the `agent` runs as uid 65531 with no capability and
   cannot write its root disk; it has no containerd root, socket or
@@ -212,8 +214,8 @@ What is proven so far, and how:
   again. With the edge on, the smoke test passed in split (HTTPS API,
   sandbox link, certificate renewal with no restart), and a raw TCP port
   answered from another pod. Single mode's smoke test passed on the same
-  images. Docker Desktop's kernel (5.10) cannot show memory pressure (F10)
-  or real create latency (N1); those are the EKS drill's. Again on
+  images. Docker Desktop's kernel (5.10) cannot show memory pressure
+  or real create latency; those were left to the EKS run (below). Again on
   2026-11-24, with the egress gateway's socket in a folder of its own:
   the `agent` saw the socket there and could not write the folder, the
   `egress` container could not write `/run/aerolvm`, hostname allow lists
@@ -235,10 +237,141 @@ What is proven so far, and how:
   the token is mode 0444 (and an external-CA certificate 0404): the pod has
   no fsGroup and its containers run as different users, so Kubernetes
   makes these files root's, and only their readers mount them.
-- **Not yet proven:** one live EKS run (sandboxes kept across an agent
-  swap; external storage across it; no namespace left after a pod delete;
-  memory pressure kills one sandbox, never the machinery; create latency
-  before and after). The chart's default stays `single` until it passes.
+- **On EKS** (24 November 2026, the kit in `integration-tests/k8s/m1/`):
+  cluster mode on three `m7i.xlarge` workers with Amazon Linux 2023
+  (Linux 6.18). Each worker switched from `single` to `split` in turn,
+  by decommission, and `aerolvm k8s verify` passed at every stage: all
+  single, one split, two split, all split. What passed:
+  - the split pod's shape: the `agent` as uid 65531, with no
+    capabilities, not privileged, with no containerd, running the signed
+    helper; and the same image user in split as in single;
+  - an upgrade that swapped every `agent` in place kept every sandbox
+    running, and the newer signed helper took over;
+  - an rclone mount reached its sandbox and kept writing across that
+    upgrade and across a helper restart;
+  - a restarted helper ran alone in its cgroup;
+  - a helper signed by another key, and an older helper, were refused,
+    and the running helper stayed. An image with an unsigned helper was
+    refused by the `agent`'s start, before the supervisor saw it. So the
+    supervisor's own check for that case is proven by unit tests only;
+  - a gVisor sandbox moved from one split worker to another with its
+    memory, and a move from a single worker to a split one was refused
+    before anything was saved, with the sandbox still running;
+  - deleting a split worker pod with sandboxes running left nothing on
+    its machine;
+  - five gVisor sandboxes, each holding 3 GB on a 16 GB machine, under
+    memory pressure: the kernel stopped whole sandboxes only, never the
+    worker's own processes.
+
+  The memory test and the cross-mode move call were run by hand, because
+  the drill's own scripts had bugs; those are fixed. The run also found
+  two bugs in replacing a worker, both fixed since: a decommission that
+  never ended at its deadline, and a sandbox on a removed node that could
+  not be deleted.
+- **Not yet proven:**
+  - Firecracker in a split worker pod. The chart refuses it.
+  - A warm create inside its +1 ms budget on EKS (below).
+  - In that run, a gVisor move between two single workers. Its test
+    sandbox came from the warm pool, which moves only by recreate.
+
+  The chart's default stays `single` until the release workflow signs the
+  helper and the warm create is measured again.
+
+#### Create speed in split
+
+The time the worker reports for each create, split against single, in
+that EKS run. The budget is on the p50 (the median).
+
+| Create | `single` p50 | `split` p50 | p50 gap | Paired median difference (95% range) | Budget |
+|---|---|---|---|---|---|
+| Cold, no warm pool | 152.0 ms | 143.3 ms | -8.7 ms | -0.15 ms (-36.00 to +20.70) | +3 ms |
+| Warm, from the container warm pool | 16.7 ms | 18.0 ms | **+1.3 ms** | +0.80 ms (+0.40 to +1.60) | +1 ms |
+
+- **The warm p50 gap is over its budget.** 50 of the 120 warm rounds
+  were pool misses and were left out. A warm claim in split makes two
+  trips through the helper: one through the gate to label the
+  container with its new sandbox, and one to put the sandbox's network
+  rules in place. A change since makes both at the same time. On two test machines it
+  closed part of the gap in one run and none of it in another. The next
+  EKS run measures it.
+- **20 creates at once:** split p50 976 ms, single p50 2,210 ms. The run
+  set no budget for bursts and did not look into why split was faster.
+- **The first create after a split helper started** took 17.7 ms.
+- **WASM and V8 isolates** were timed in an earlier run, on one VM
+  (`m7i.xlarge`, Ubuntu 24.04), in single and split in turn. The budget
+  is +1 ms. The paired median differences were:
+  - a warm WASM create: +0.05 ms (95% range -0.05 to +0.20);
+  - a busy WASM mix: +0.15 ms (-2.75 to +0.40);
+  - a warm V8 create: -0.10 ms (-0.15 to -0.05).
+
+  All three meet the budget.
+
+#### Requests the helper and the gate refuse
+
+The `agent` only sends requests its own code built. The tests below act
+as a broken agent. They send the helper and the containerd gate requests
+the agent's code never builds. Each must be refused before anything
+changes.
+
+| The request | Refused by | Test |
+|---|---|---|
+| A container with an extra capability, no seccomp profile, or `NoNewPrivileges` off | The gate | `TestBrokenAgentWrites` in `internal/rootd/gate/gate_test.go` |
+| A bind mount of `/`, `/proc` or another folder outside AerolVM's own | The gate | `TestBrokenAgentWrites` |
+| An OCI hook, or a device | The gate | `TestBrokenAgentWrites` |
+| A runtime binary such as `BinaryName=/bin/sh`, a shim binary, or a runsc config file that is not the helper's own | The gate | `TestBrokenAgentWrites` |
+| The gVisor annotation `dev.gvisor.flag.network=host` | The gate | `TestBrokenAgentWrites` |
+| A network namespace path with `../`, or a namespace name that is not a sandbox's | The gate; the helper | `TestBrokenAgentWrites`; `TestNetworkCallsRefuse` in `internal/rootd/network_test.go` |
+| A cgroup outside the sandboxes' parent | The gate; the helper | `TestBrokenAgentWrites`; `TestCgroupPartBrokenAgent` in `internal/rootd/cgroup_test.go` |
+| A root filesystem, or a layer unpack (`Diff.Apply`), that writes into a host folder | The gate | `TestBrokenAgentWrites` |
+| A containerd call off the gate's list of 41, such as `Tasks.Exec` or `Tasks.Checkpoint`, or another containerd namespace | The gate | `TestUnlistedMethodsRefused`, `TestNamespaceIsPinned` in `internal/rootd/gate/gate_test.go`; `TestBrokenAgentSubscribeSeesOnlyItsNamespace` in `internal/rootd/gate/events_test.go` |
+| A request field the gate was not written for | The gate at run time; the build, after a containerd upgrade | `TestBrokenAgentWrites`; `TestFieldPins` in `internal/rootd/gate/fields_test.go` |
+| A mount option or tool argument off the allow list, a credential in an argument, rclone's `local` backend, or a mount target outside the sandbox's own | The helper | `TestMountExternalBrokenAgent` in `internal/rootd/mounts_test.go` |
+| A host process of a kind the helper does not know, an ID that is a path or an option, or limits above the node's | The helper | `TestHostsRefuseHostileRequests` in `internal/rootd/hosts_test.go`; `TestFirecrackerPrepareRefusals` in `internal/rootd/hosts_firecracker_test.go` |
+| An image user or disk quota for a snapshot that is not the container's own | The helper | `TestImageUserBrokenAgent`, `TestDiskQuotaBrokenAgent` in `internal/rootd/imageuser_test.go` |
+| A move bundle the helper must not stage, or a move call for an ID that is a path | The helper | `TestMoveBrokenAgentImports`, `TestMoveBrokenAgentCalls` in `internal/rootd/moves_test.go` |
+| A host port outside the node's range, or for an address that is not a sandbox's | The helper | `TestHostPortRefusals` in `internal/rootd/hostports_test.go` |
+| A caller that is not the agent's user, or, on a VM, not in its service's cgroup | The helper's socket | `TestPeerCheckUID`, `TestPeerCheckCgroup` in `internal/rootd/peer_linux_test.go`; `TestPeerRefusedNeverReachesAHandler` in `internal/rootd/server_test.go` |
+| A staged helper that is unsigned, signed by another key, cut short, changed after the check, or older than the one running | The supervisor; the installer | `TestInstallRefuses`, `TestReplacedAfterTheCheckChangesNothing` in `internal/rootswap/install_test.go`; `TestVerifyRefuses`, `TestCheckNewer` in `internal/rootswap/rootswap_test.go` |
+
+The other side is tested too. Every container shape the agent builds
+passes the gate (`TestBuilderOutputPassesRootPolicy` in
+`internal/runtime/containerd/rootpolicy_conformance_test.go`), and the
+shared rules are fuzzed (`internal/rootpolicy/fuzz_test.go`). The
+`TestE2EBrokenAgent` tests in `internal/rootd` send the same kinds of
+requests to a live helper with real containerd, on a Linux test machine
+(`AEROL_E2E_HELPER_SOCKET`).
+
+**Every refusal is recorded.** The call fails with `500`
+(`TestRefusalsAre500AndRecordedOnce` in
+`internal/rootclient/refusal_api_test.go`). The agent writes a
+`rootd_refusal` audit record (`TestRecordRootRefusal` in
+`internal/service/rootd_refusal_audit_test.go`). It counts the refusal
+in `aerolvm_rootd_refusals_total`, and the `SandboxdRootHelperRefusal`
+alert fires within 5 minutes (`TestRootHelperRefusalAlertRule` and, with
+`promtool` installed, `TestRootHelperRefusalAlertFires`, in
+`setup/prometheus/alerts_test.go`).
+The helper also logs each refusal itself, as root, in the `runtime`
+container's log, where the agent cannot change it. The runbook is
+`setup/runbooks/secrets-and-audit.md`, "Root helper refusal". Known gap:
+the chart's own alert rules (`monitoring/rules.yaml`) do not include this
+alert yet. The metric is scraped with the rest; load the rule from
+`setup/prometheus/sandboxd-alerts.yml` until the chart has it.
+
+#### What split does not cover
+
+- The helper, containerd, runc, gVisor's `runsc` and the Firecracker
+  jailer still run as root, and `runtime` stays privileged. A bug in them
+  is a root bug, in both modes.
+- The `agent` still holds, for its machine, each sandbox's toolbox token,
+  the key that opens their environment variables, and the node's cluster
+  certificate. So a bug in the `agent` still matters for the sandboxes on
+  that machine and their secrets. Split keeps it inside the `agent`
+  container: no root, no folder from the machine but the read-only cgroup
+  tree, and no Kubernetes API credential.
+- Escapes from a sandbox are the runtime's job (gVisor, Firecracker), not
+  split's.
+- The Docker engine has no gate in front of its socket, so a Docker node
+  (local mode) runs in `single` only.
 
 ## 3. Identity
 
@@ -359,6 +492,7 @@ with network policy turned on, or Calico or Cilium).
 |---|---|
 | Code in a sandbox escapes the sandbox | gVisor by default (a second kernel); containerd's seccomp, capability and path envelope; the create policy can allow only gVisor |
 | Something escapes to the privileged worker container | Worker machines run nothing else (taint); no host folders, network or PID; no Kubernetes API right; the machine's cloud identity is unreachable (IMDS hop limit 1) |
+| A bug in the code that reads API requests (`sandboxd`, in the `agent` container) | With `privilegeMode: split`, the `agent` has no rights. Root work goes through the signed root helper, which checks each request. containerd is reached only through its gate. Every refusal is recorded ([above](#requests-the-helper-and-the-gate-refuse)). With `single`, the `agent` is privileged |
 | A sandbox reaches your network or the cluster | AerolVM's firewall refuses private ranges, the cluster's ranges, the API server and the worker's own ports; the egress NetworkPolicy refuses the same around the whole pod; `aerolvm k8s verify` probes it from a real sandbox |
 | Another pod in the cluster reaches a worker | The worker ingress NetworkPolicy; mTLS on every node port |
 | A rogue pod joins the cluster | A join token only for a pod that TokenReview proves is that AerolVM node, on its machine; single use, 10 minutes, never stored in a Secret; mTLS certificates per node |
@@ -366,6 +500,24 @@ with network policy turned on, or Calico or Cilium).
 | Someone deletes or drains a worker pod by mistake | The operator's delete guard refuses it, also mid-move, unless every sandbox has moved or the pod is marked `aerolvm.io/force-delete=true`; the guard fails open, so a down operator never blocks repairs. A PodDisruptionBudget holds drains and node group updates until the operator has moved the sandboxes |
 | The Kubernetes API is down | Sandboxes keep running and the API keeps answering: AerolVM's control plane is its own. Only changes to the layout wait |
 | Too many sandboxes for a machine | Every sandbox is capped inside the worker pod's own CPU and memory limit; one out-of-memory event ends one sandbox, never the worker |
+
+### What each option protects against
+
+Two settings decide how sandboxes are walled off, and they guard different
+things. The runtime is the wall around each sandbox; a create picks it, and
+the create policy can limit the choice. The privilege mode is the wall
+around AerolVM's own code on the worker; the chart value `privilegeMode`
+picks it.
+
+| Option | Picked for | The wall | What it does not cover |
+|---|---|---|---|
+| Container (`docker`, runc) | Each sandbox | Linux namespaces, cgroups, containerd's default seccomp profile and a trimmed list of capabilities | A bug in the machine's kernel: the sandbox shares it |
+| gVisor (`gvisor`) | Each sandbox | A container, plus gVisor's own kernel in user space, so few system calls reach the machine's kernel | A bug in gVisor, or in the few calls it passes on |
+| Firecracker (`firecracker`) | Each sandbox | A virtual machine with its own kernel, kept apart by the CPU (KVM); Firecracker runs under the jailer as an ordinary user. Not in a split worker pod yet | A bug in KVM or Firecracker; a breakout lands in the jailed Firecracker process |
+| WebAssembly (`wasm`) | Each sandbox | The WebAssembly runtime: the module makes no system calls of its own; its worker runs as its own user (61000) with a system call filter | A bug in the runtime; there is no virtual machine or container around the worker |
+| V8 isolate (`isolate`) | Each sandbox | A V8 isolate in a jailed `workerd` process, one process per tenant | A bug in V8 or `workerd`; the jail is what is left around them |
+| `privilegeMode: single` | Each worker | None: the `agent` is privileged | A bug in `sandboxd` has the `agent`'s rights |
+| `privilegeMode: split` | Each worker | The `agent` has no rights; the root helper checks each request; containerd only through the gate | A bug in the helper, containerd, runc, `runsc` or the jailer; the `agent`'s own reach ([above](#what-split-does-not-cover)) |
 
 ## 7. Verify the images yourself
 
@@ -379,17 +531,21 @@ expect. Run images by digest, not tag.
 
 **Pod Security.** Label the release namespace `restricted`. The chart labels
 the worker namespace `privileged`. That is the one exception, and it is
-narrow: only the worker pods' `runtime` and `agent` containers are privileged.
-`aerolvm k8s verify` checks both labels and fails on any other privileged
-container.
+narrow: only the worker pods' `runtime` and `agent` containers are privileged,
+and with `privilegeMode: split` only `runtime`. `aerolvm k8s verify` checks
+both labels and fails on any other privileged container.
 
 If you also run your own pod-security policies (Kyverno, Gatekeeper), exempt
 pods labelled `app.kubernetes.io/name=aerolvm`,
 `app.kubernetes.io/component=worker`, in the worker namespace, and only these
 containers: `runtime` and `agent` for `privileged`; `egress` for running as
 root and adding `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP` (it starts as
-root only to drop to user 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`); and
-the `setup` init container for running as root (all capabilities dropped).
+root only to drop to user 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`);
+the `setup` init container for running as root (all capabilities dropped);
+and, with `privilegeMode: split`, the `split-folders` init container for
+running as root and adding `CHOWN`, and with V8 isolates on, the `workerd`
+init container for running as root (all capabilities dropped). A split
+`agent` needs no exception.
 
 **Signed images.** `examples/kyverno-signed-images.yaml` in this chart is a
 Kyverno policy that refuses any pod in the two AerolVM namespaces whose image

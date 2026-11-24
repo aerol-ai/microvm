@@ -167,6 +167,7 @@ USER app
 | HV‑15 | Limit the server token to the server with `SB_PAT_SCOPE=host` (`install.sh --pat-scope host`), after moving remote tools to named credentials | 3 | IM‑7 |
 | HV‑16 | Keep `rpcbind` off, so nothing answers on port `111`. The installer turns it off. On a server set up by an older installer, run `sudo systemctl disable --now rpcbind.socket rpcbind.service`. | All | NS‑6 |
 | HV‑17 | Set `SB_DISK_FLOOR_RATIO=0.10`. When the sandbox disk has less than 10% free, the server turns new sandboxes away with `503` instead of filling up until images, the database and every sandbox fail. If sandboxes live on their own disk, point `SB_DISK_FLOOR_PATH` at it. The bundled alert `SandboxdSandboxDiskHigh` warns at 80% used. | 2, 3 | WI‑2 |
+| HV‑18 | Run the server without root: `--privilege-mode split` with the containerd engine, or `privilegeMode: split` on Kubernetes. The code that reads API requests then has no rights. See [Run the server without root](/enterprise/privilege-mode/). On Kubernetes, split does not run Firecracker yet. | 2, 3 | WI‑7 |
 
 ### Firewall
 

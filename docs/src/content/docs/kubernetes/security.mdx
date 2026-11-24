@@ -101,6 +101,8 @@ Split does run the container warm pool, the kubectl API's warm pools, and gVisor
 
 `aerolvm k8s verify` reports each worker pool's mode ([below](#check-a-live-install)).
 
+[Run the server without root](/enterprise/privilege-mode/) covers split for every install path: what it protects against, its speed and its limits.
+
 ### WASM and V8 isolates in split
 
 Split runs [WASM](/wasm-sandbox/) and [V8 isolate](/isolate-sandbox/) sandboxes. Turn them on as in single mode, with `worker.wasm.enabled` and `worker.isolate.enabled`. The root helper starts their processes in the `runtime` container, as it does on a VM:
