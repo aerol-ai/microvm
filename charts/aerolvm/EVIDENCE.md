@@ -139,24 +139,29 @@ helper).
 | Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone: it reads its sandboxes' memory and CPU there, and cannot write a cgroup file |
 | External storage | off by default | on by default: the helper runs the mount tools as their own user, in the `runtime` container |
 | Folders root writes | n/a | none the `agent` can write: see below |
-| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets four folders' owners, then exits |
+| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets five folders' owners, then exits |
 
 **Folders shared with the `agent` in split.** No root process writes in a
-folder the `agent` can write. A test in the AerolVM repository renders the
-pod and fails if the `agent` and the `runtime` container both write one
-volume, other than the shared folder below.
+folder the `agent` can write. Three containers start as root: `runtime`,
+`egress` (until it drops to user 65532) and `split-folders`. A test in the
+AerolVM repository renders the pod and fails if any of them writes a
+volume the `agent` writes, other than the two named below, or if another
+container starts as root.
 
-| Volume | `agent` | `runtime` (root) | What root does there |
+| Volume | `agent` | Root containers | What they do there |
 |---|---|---|---|
-| `state` (sandboxd's data) | writes | not mounted | `split-folders` gives it to the agent, before the agent starts |
-| `run-aerolvm` (`/run/aerolvm`) | writes (ownership lease, its own sockets) | read only | the supervisor reads the lease: no link followed, regular files only, size bound |
-| `run-runtime` (`/run/aerolvm-runtime`) | read only | writes | the supervisor writes the cgroup parent; temporary file by `O_EXCL`, then rename |
-| `toolbox` | writes `toolboxd` | read only | the helper copies it: no link followed, a regular file the agent owns, size bound |
-| `rootd-stage` | writes the helper and its signature | read only | the supervisor copies them into a folder of its own, then checks the copy's signature |
-| `rootd-shared` (`/run/aerolvm-rootd/shared`) | writes only in its own folder, `agent/` | writes | the top is root's (0750, the agent's group); the helper makes its socket, ready sockets and task output in folders of its own there, and links ready sockets from `agent/` by handle |
+| `state` (sandboxd's data) | writes | `split-folders` writes; `runtime` and `egress`: not mounted | `split-folders` gives the volume's top folder to the agent, before the agent starts |
+| `run-aerolvm` (`/run/aerolvm`) | writes (ownership lease, its own sockets) | `runtime` and `egress`: read only | the supervisor reads the lease: no link followed, regular files only, size bound; the gateway dials sandboxd's lookup socket |
+| `run-runtime` (`/run/aerolvm-runtime`) | read only | `runtime` writes | the supervisor writes the cgroup parent; temporary file by `O_EXCL`, then rename |
+| `run-egress` (`/run/aerolvm-egress`) | read only | `split-folders` and `egress` write | `split-folders` gives the folder to the gateway's user (65532, 0755); the gateway makes its control socket there, and refuses a folder another user can write |
+| `toolbox` | writes `toolboxd` | `runtime`: read only | the helper copies it: no link followed, a regular file the agent owns, size bound |
+| `rootd-stage` | writes the helper and its signature | `runtime`: read only | the supervisor copies them into a folder of its own, then checks the copy's signature |
+| `rootd-shared` (`/run/aerolvm-rootd/shared`) | writes only in its own folder, `agent/` | `split-folders` and `runtime` write | `split-folders` makes the top root's (0750, the agent's group), then makes `agent/`; the helper makes its socket, ready sockets and task output in folders of its own there, and links ready sockets from `agent/` by handle |
 | `tmp`, `run-sandboxd` | writes | not mounted | none |
-| `cni-state` | not mounted | writes | the CNI plugins' address records |
-| containerd's volume | one empty folder, read only | writes | containerd's images and layers; in a folder of its own, root's alone (0700, set by `split-folders`), the helper's gVisor move checkpoints |
+| `cni-state` | not mounted | `split-folders` and `runtime` write | `split-folders` closes it to other users (0755); the CNI plugins' address records |
+| `run-containerd` | not mounted | `runtime` writes | containerd's socket |
+| `egress-state` | not mounted | `egress` writes | the gateway's rule snapshot and each sandbox's learn-mode record |
+| containerd's volume | one empty folder, read only | `split-folders` and `runtime` write | containerd's images and layers; in a folder of its own, `aerolvm-rootd-moves`, the helper's gVisor move checkpoints: `split-folders` makes it root's alone (0700) |
 | `host-cgroup` (machine) | read only | not mounted | none |
 
 What split does not run yet, refused by name at `helm install`: Firecracker,
@@ -198,7 +203,11 @@ What is proven so far, and how:
   sandbox link, certificate renewal with no restart), and a raw TCP port
   answered from another pod. Single mode's smoke test passed on the same
   images. Docker Desktop's kernel (5.10) cannot show memory pressure (F10)
-  or real create latency (N1); those are the EKS drill's.
+  or real create latency (N1); those are the EKS drill's. Again on
+  2026-11-24, with the egress gateway's socket in a folder of its own:
+  the `agent` saw the socket there and could not write the folder, the
+  `egress` container could not write `/run/aerolvm`, hostname allow lists
+  through the gateway held, and every other check above passed again.
 - **Not yet proven:** one live EKS run (sandboxes kept across an agent
   swap; external storage across it; no namespace left after a pod delete;
   memory pressure kills one sandbox, never the machinery; create latency

@@ -669,9 +669,9 @@ Each is small and stands alone. Together they shrink the root surface now.
       So one emptyDir, `/run/aerolvm-rootd/shared`, holds the helper's
       socket, ready sockets and task FIFOs and the agent's run folder
       (`SB_MOUNTS_CRED_DIR`). The kubelet makes an emptyDir open to all,
-      which the helper refuses (internal/rootfolder), so the runtime
-      container's start command makes it root's (0750, the agent's group)
-      and clears what was left in it before the supervisor starts.
+      which the helper refuses (internal/rootfolder), so `split-folders`
+      makes it root's (0750, the agent's group) before any other
+      container starts (see below).
     - **The agent cannot see its sandboxes' cgroups.** A container that is
       not privileged gets its own cgroup namespace, and the sandboxes'
       group is the runtime container's. Capacity sizing (C7), the live
@@ -712,7 +712,25 @@ Each is small and stands alone. Together they shrink the root surface now.
       shared folders are set by a first container, `split-folders` (root,
       `CAP_CHOWN` only), before the agent or the helper starts. The shared
       folder stays the one volume both write: its top is root's, and the
-      agent writes only its own folder in it. A chart test checks this.
+      agent writes only its own folder in it.
+      The review of #1424 then found the egress container: it starts as
+      root (and drops to 65532), and the gateway made its control socket,
+      and set its mode, by name in `/run/aerolvm`. Now the socket lives in
+      a folder of the egress container's own (`/run/aerolvm-egress`, which
+      `split-folders` gives to 65532 with mode 0755), the agent mounts that
+      folder read only and still dials the socket, and the egress container
+      mounts `/run/aerolvm` read only. The gateway refuses to make a socket
+      open to another uid in a folder another user can write. Each folder
+      each root container writes, in split:
+      - `split-folders`: the tops of `state`, `rootd-shared`, `cni-state`
+        and `run-egress` (owners and modes), and `rootd-shared/agent`,
+        made after that folder's top is root's. It runs before every other
+        container.
+      - `runtime`: `run-runtime`, `rootd-shared` (only the helper's own
+        folders), `cni-state`, `run-containerd` and containerd's volume.
+      - `egress`: `run-egress` (the control socket) and `egress-state`.
+      A chart test checks every container that starts as root, and fails
+      when a new one appears.
     - **Kind found three more things** the offline tests could not: the
       agent may not change the mode of an emptyDir's own folder
       (`/run/sandboxd`), the helper refuses the CNI records' emptyDir

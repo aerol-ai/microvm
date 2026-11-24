@@ -109,8 +109,11 @@ initContainers:
   # (internal/rootfolder): the shared folder becomes root's, open to the
   # agent's group, with one folder of the agent's own inside; the CNI
   # records' folder and the helper's moves folder become root's alone;
-  # sandboxd's state volume becomes the agent's. As root with one right,
-  # CAP_CHOWN, and nothing else.
+  # sandboxd's state volume becomes the agent's; the egress gateway's
+  # socket folder becomes the gateway user's alone (0755: the agent may
+  # dial the socket, not write there). As root with one right, CAP_CHOWN,
+  # and nothing else: root owns a folder while it sets the mode, so each
+  # step also runs again on a pod restart.
   - name: split-folders
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -125,6 +128,9 @@ initContainers:
         chown 0:0 /var/lib/aerolvm-rootd-moves
         chmod 0700 /var/lib/aerolvm-rootd-moves
         chown 65531:65531 /var/lib/sandboxd
+        chown 0:0 /run/aerolvm-egress
+        chmod 0755 /run/aerolvm-egress
+        chown 65532:65532 /run/aerolvm-egress
     securityContext:
       runAsUser: 0
       runAsNonRoot: false
@@ -143,6 +149,7 @@ initContainers:
       - { name: cni-state, mountPath: /var/lib/cni }
       - { name: containerd, mountPath: /var/lib/aerolvm-rootd-moves, subPath: aerolvm-rootd-moves }
       - { name: state, mountPath: /var/lib/sandboxd }
+      - { name: run-egress, mountPath: /run/aerolvm-egress }
   {{- end }}
 containers:
   - name: runtime
@@ -452,6 +459,9 @@ containers:
       # The disk floor reads the sandbox volume's free space through an
       # empty folder on it: containerd's root is not mounted here.
       - { name: SB_DISK_FLOOR_PATH, value: /var/lib/aerolvm-disk }
+      # The egress gateway's control socket, in the egress container's
+      # own folder, which this container reads only.
+      - { name: SB_EGRESS_GATEWAY_SOCKET, value: /run/aerolvm-egress/egress-gateway.sock }
       {{- else }}
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
       {{- end }}
@@ -577,11 +587,14 @@ containers:
       # The folder sandboxd shares with the root helper (the helper's
       # socket, ready sockets, task output), the folder it stages the
       # helper in, and a writable /tmp: its own disk is read only. The
-      # runtime container's folder for the cgroup parent, read only.
+      # runtime container's folder for the cgroup parent, and the egress
+      # container's for its control socket, read only: a socket on a
+      # read-only mount can still be dialed.
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage }
       - { name: tmp, mountPath: /tmp }
       - { name: run-runtime, mountPath: /run/aerolvm-runtime, readOnly: true }
+      - { name: run-egress, mountPath: /run/aerolvm-egress, readOnly: true }
       # The machine's cgroup tree, read only: sandboxd sizes its capacity
       # from the sandboxes' cgroup and reads each one's usage (C7, C20).
       # Its own cgroup namespace shows only its own group. It cannot
@@ -666,8 +679,12 @@ containers:
       - { name: SB_EGRESS_PEER_CGROUP, value: none }
       {{- if $split }}
       # sandboxd's uid in privilege mode split: only it may use the
-      # gateway's control socket (root is no longer sandboxd).
+      # gateway's control socket (root is no longer sandboxd). The socket
+      # is made in this container's own folder: the agent writes
+      # /run/aerolvm, and the gateway makes the socket and sets its mode
+      # by name. The gateway refuses a folder another user can write.
       - { name: SB_EGRESS_PEER_UIDS, value: "65531" }
+      - { name: SB_EGRESS_GATEWAY_SOCKET, value: /run/aerolvm-egress/egress-gateway.sock }
       {{- end }}
       - { name: SB_EGRESS_STATE_DIR, value: /var/lib/aerolvm-egress }
       # The gateway dials for sandboxes itself, so it must refuse the
@@ -683,7 +700,14 @@ containers:
     resources:
       {{- toYaml $root.Values.worker.egress.resources | nindent 6 }}
     volumeMounts:
+      {{- if $split }}
+      # sandboxd's executable-lookup socket, dialed here only; and the
+      # folder for the control socket, which split-folders gave to 65532.
+      - { name: run-aerolvm, mountPath: /run/aerolvm, readOnly: true }
+      - { name: run-egress, mountPath: /run/aerolvm-egress }
+      {{- else }}
       - { name: run-aerolvm, mountPath: /run/aerolvm }
+      {{- end }}
       - { name: egress-state, mountPath: /var/lib/aerolvm-egress }
 volumes:
   {{- with include "aerolvm.identityFileVolume" $root }}{{ . | nindent 2 }}{{ end }}
@@ -710,6 +734,7 @@ volumes:
   - { name: run-runtime, emptyDir: {} }
   - { name: rootd-stage, emptyDir: {} }
   - { name: tmp, emptyDir: {} }
+  - { name: run-egress, emptyDir: {} }
   - name: host-cgroup
     hostPath: { path: /sys/fs/cgroup, type: Directory }
   {{- else }}
