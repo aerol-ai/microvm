@@ -195,8 +195,10 @@ func rejoin(ctx context.Context, o QuorumOptions, node Node) (QuorumResult, erro
 	}
 	// A log SB_RAFT_WAL_DIR put on a disk of its own goes aside with its
 	// directory, under the same name: left in place, it is a log the new
-	// Raft directory does not name, and sandboxd refuses to start on it.
-	walDir, err := raftlogdir.Recorded(o.RaftDir)
+	// Raft directory does not name, and sandboxd refuses to start on it. In
+	// privilege mode split the record is sandboxd's user's to write, so the
+	// folder moved aside comes only from SB_RAFT_WAL_DIR (raftlogdir.Trusted).
+	walDir, err := raftlogdir.Trusted(o.RaftDir, node.RaftWALDir, node.Split)
 	if err != nil {
 		return res, err
 	}

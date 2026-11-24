@@ -544,3 +544,52 @@ func writeFile(t *testing.T, path, body string) {
 		t.Fatal(err)
 	}
 }
+
+// A split node an older play set up keeps a copy of the shared SSH host key
+// in sandboxd's folder. Were the shared key later taken out of the config,
+// SB_SSH_HOST_KEY_PATH would name that copy again, and sandboxd would serve
+// the old shared key. configure-ops.yml removes it while the shared key is
+// set (the copy is unused then), as sandboxd's user, whose folder it is.
+func TestAnsibleSplitRemovesTheOldSSHHostKeyCopy(t *testing.T) {
+	var plays []map[string]any
+	if err := yaml.Unmarshal([]byte(readRepoFile(t, "Ansible", "playbooks", "configure-ops.yml")), &plays); err != nil {
+		t.Fatal(err)
+	}
+	tasks, _ := plays[0]["tasks"].([]any)
+	found := false
+	lastSetting, flush := -1, -1
+	for i, it := range tasks {
+		task, _ := it.(map[string]any)
+		if task["notify"] == "Apply sandboxd ops config" {
+			lastSetting = i
+		}
+		if task["ansible.builtin.meta"] == "flush_handlers" {
+			flush = i
+		}
+		args, _ := task["ansible.builtin.file"].(map[string]any)
+		if args == nil || args["path"] != "{{ sandboxd_ssh_host_key_path }}" || args["state"] != "absent" {
+			continue
+		}
+		found = true
+		// After every task that changes a setting, and after the handlers
+		// have restarted sandboxd on them: a restart in between must never
+		// find the copy gone while the env still names it.
+		if !(lastSetting < flush && flush < i) {
+			t.Errorf("%q runs at task %d; the last setting is task %d and the handlers flush at %d: want settings, flush, removal",
+				task["name"], i, lastSetting, flush)
+		}
+		if task["become_user"] != "sandboxd" {
+			t.Errorf("%q removes the copy as %v, want sandboxd's user", task["name"], task["become_user"])
+		}
+		when := strings.Join(whenList(task["when"]), " | ")
+		for _, want := range []string{"sandboxd_privilege_mode == 'split'", "sandboxd_shared_ssh_host_key | bool",
+			"sandboxd_ssh_host_key_path != sandboxd_split_ssh_host_key_path"} {
+			if !strings.Contains(when, want) {
+				t.Errorf("%q runs without %q: when %s", task["name"], want, when)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("configure-ops.yml does not remove the old copy of the shared SSH host key in split")
+	}
+}

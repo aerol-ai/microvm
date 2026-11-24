@@ -272,3 +272,38 @@ func TestResetRemovesALogOnItsOwnDisk(t *testing.T) {
 		t.Fatalf("reset with a bad record = %v; want refused with the Raft directory kept", err)
 	}
 }
+
+// In split, reset deletes only the log folder SB_RAFT_WAL_DIR names: a
+// record (sandboxd's user's to write) naming another folder stops reset
+// before it removes anything.
+func TestResetInSplitTakesTheLogOnlyFromTheEnv(t *testing.T) {
+	ctx := context.Background()
+	p := testPaths(t)
+	api := newFakeLocalAPI(t)
+	var out bytes.Buffer
+	r := &Resetter{Paths: p, Host: newFakeHost(), Printer: Printer{Out: &out}, LocalAPI: api.srv.URL}
+	clusterNode(t, p, "server")
+	mustWrite(t, p.EnvFile, "SB_PRIVILEGE_MODE=split\n")
+	outside := filepath.Join(t.TempDir(), "var", "lib", "root-only")
+	mustWrite(t, filepath.Join(outside, "keep"), "root's")
+	mustWrite(t, filepath.Join(p.RaftDir, "raft-stable.bolt"), "x")
+	mustWrite(t, filepath.Join(p.RaftDir, raftlogdir.LocationFile), outside+"\n")
+	if err := r.Run(ctx, ResetOptions{Yes: true}); err == nil || !strings.Contains(err.Error(), "SB_RAFT_WAL_DIR") {
+		t.Fatalf("reset with the agent's record: %v, want a refusal", err)
+	}
+	if !exists(filepath.Join(outside, "keep")) || !exists(p.RaftDir) || !exists(p.ClusterEnv) {
+		t.Fatal("a refused reset removed something")
+	}
+
+	// The folder SB_RAFT_WAL_DIR names goes, as in single.
+	own := filepath.Join(t.TempDir(), "disk", "raft-wal")
+	mustWrite(t, p.EnvFile, "SB_PRIVILEGE_MODE=split\nSB_RAFT_WAL_DIR="+own+"\n")
+	mustWrite(t, filepath.Join(p.RaftDir, raftlogdir.LocationFile), own+"\n")
+	mustWrite(t, filepath.Join(own, "wal-meta.db"), "x")
+	if err := r.Run(ctx, ResetOptions{Yes: true}); err != nil {
+		t.Fatal(err)
+	}
+	if exists(own) || exists(p.RaftDir) {
+		t.Fatalf("the configured log survived reset:\n%s", out.String())
+	}
+}

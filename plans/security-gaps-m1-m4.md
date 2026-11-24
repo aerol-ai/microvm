@@ -642,6 +642,29 @@ Each is small and stands alone. Together they shrink the root surface now.
       agent's owner-only files inside, and the shared SSH host key goes
       there. Tests walk every split-mode Ansible task and the split
       bootstrap render for a root action on an agent path.
+    - **The follow-ups (#1440 review).** Ansible wrote the upstream wrap key
+      0600, which the loader refuses (it takes 0400 only), so private pulls
+      through the mirror got 401: fixed, and a test runs each writer's mode
+      through the real loader. install.sh's re-run on a split node no longer
+      makes the mounts folder as root, wraps a key as the agent (runuser,
+      sandboxd.env on stdin), and the healthcheck probes the liveness socket
+      as the agent. `sandboxd init` and `join` refuse to read or replace a
+      file through a link (their journal opens with O_NOFOLLOW). `sandboxd
+      backup` in split reads the agent's folders through an os.Root and
+      asks SQLite which file it opened before copying the database: SQLite
+      has no nofollow query parameter, and go-sqlite3 cannot pass the open
+      flag. A split rerun of install.sh is tested with every file command
+      logged and links planted where root used to act.
+    - **A pointer the agent writes is not root's to follow.** The Raft log
+      record (raft/raft-wal) is written in the agent's folder, and root's
+      backup, recover-quorum and reset took the log's folder from it: a
+      record naming /etc would have been archived, moved aside or deleted.
+      In split they take that folder only from SB_RAFT_WAL_DIR in root's
+      env files, read the record with O_NOFOLLOW, and refuse a record that
+      names anything else (raftlogdir.Trusted). The split database copy
+      opens read-only (mode=ro), so a lost race creates no file, and every
+      split read checks it opened the file it looked at (os.SameFile): os.Root
+      follows a relative link that stays inside, and refuses an absolute one.
     - **The helper reads `cluster.env`, so it must restart with sandboxd.**
       The bootstrap and Ansible add settings there after the helper started
       (WASM, Firecracker, platform volumes); restarting sandboxd alone left

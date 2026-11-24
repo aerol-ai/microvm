@@ -66,6 +66,14 @@ const fakeLogger = `#!/usr/bin/env bash
 printf 'logger %s\n' "$*" >>"$FAKE_LOG"
 `
 
+// fakeRunuser logs the user and runs the command, as runuser -u USER -- does.
+const fakeRunuser = `#!/usr/bin/env bash
+printf 'runuser %s\n' "$*" >>"$FAKE_LOG"
+[[ "$1" == -u && "$3" == -- ]] || exit 2
+shift 3
+exec "$@"
+`
+
 // healthcheckScript is the script install.sh writes, read out of its heredoc.
 func healthcheckScript(t *testing.T) string {
 	t.Helper()
@@ -109,6 +117,7 @@ func newWatchdogRig(t *testing.T) *watchdogRig {
 		"systemctl": fakeSystemctl,
 		"curl":      fakeCurl,
 		"logger":    fakeLogger,
+		"runuser":   fakeRunuser,
 		// ps -o etimes= -p PID: the daemon's age in seconds.
 		"ps": "#!/usr/bin/env bash\nprintf '%s\\n' \"${FAKE_AGE:-3600}\"\n",
 		// date +%s: the tick's clock.
@@ -153,6 +162,7 @@ type tick struct {
 	invocation string
 	later      string // InvocationID on every read after the first
 	jobs       string // queued jobs on the unit
+	env        []string
 }
 
 func (r *watchdogRig) tick(tk tick) string {
@@ -181,6 +191,7 @@ func (r *watchdogRig) tick(tk tick) string {
 		"FAKE_NOW="+strconv.Itoa(tk.now), "FAKE_AGE="+strconv.Itoa(tk.age),
 		"FAKE_INVOCATION="+tk.invocation, "FAKE_INVOCATION_LATER="+tk.later, "FAKE_JOBS="+tk.jobs,
 	)
+	cmd.Env = append(cmd.Env, tk.env...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		r.t.Fatalf("healthcheck exited %v:\n%s", err, out)
 	}
@@ -333,4 +344,28 @@ func TestHealthcheckFallsBackToHealthWithoutASocket(t *testing.T) {
 		mustNotCall(t, rig.tick(tick{unit: "active", now: now}), "restart sandboxd")
 	}
 	mustCall(t, rig.tick(tick{unit: "active", now: 1120}), restartCall)
+}
+
+// In privilege mode split the liveness socket is in /run/sandboxd, which
+// sandboxd's user owns and could fill with a link, so the probe runs as that
+// user and root never connects there. Single probes as root, as before.
+func TestHealthcheckProbesAsSandboxdInSplit(t *testing.T) {
+	rig := newWatchdogRig(t)
+	rig.withSocket()
+	split := []string{"SB_PRIVILEGE_MODE=split"}
+	calls := rig.tick(tick{unit: "active", live: true, now: 1000, env: split})
+	mustCall(t, calls, "runuser -u sandboxd -- test -S "+rig.socket,
+		"runuser -u sandboxd -- curl -fsS --max-time 10 --unix-socket "+rig.socket)
+	mustNotCall(t, calls, "restart sandboxd")
+	// A dead daemon still counts in split: three failed probes, then a restart.
+	for _, now := range []int{1030, 1060, 1090} {
+		mustNotCall(t, rig.tick(tick{unit: "active", now: now, env: split}), "restart sandboxd")
+	}
+	mustCall(t, rig.tick(tick{unit: "active", now: 1120, env: split}), restartCall)
+
+	single := newWatchdogRig(t)
+	single.withSocket()
+	calls = single.tick(tick{unit: "active", live: true, now: 1000})
+	mustCall(t, calls, "curl -fsS --max-time 10 --unix-socket "+single.socket)
+	mustNotCall(t, calls, "runuser")
 }
